@@ -361,3 +361,117 @@ TEST_CASE("MfaDisableOwner: no audit store wired is kAuditUnavailable and writes
     CHECK(f.sessions_of("jane") == 1);
     CHECK(f.audit_total() == 0);
 }
+
+TEST_CASE("mfa_disable_complete_detail: placeholder substitution and the append fallback",
+          "[auth][mfa][mfa_disable_owner]") {
+    using yuzu::server::mfa_disable_complete_detail;
+    SECTION("a single placeholder is replaced by the count") {
+        CHECK(mfa_disable_complete_detail("MFA cleared (sessions_ended={sessions_ended})", 3) ==
+              "MFA cleared (sessions_ended=3)");
+    }
+    SECTION("every occurrence is replaced") {
+        CHECK(mfa_disable_complete_detail("{sessions_ended} and {sessions_ended}/{sessions_ended}",
+                                          12) == "12 and 12/12");
+    }
+    SECTION("a placeholder suppresses the append") {
+        CHECK(mfa_disable_complete_detail("n={sessions_ended}", 0) == "n=0");
+    }
+    SECTION("no placeholder: empty becomes exactly sessions_ended=<n>") {
+        CHECK(mfa_disable_complete_detail("", 2) == "sessions_ended=2");
+    }
+    SECTION("no placeholder: non-empty gets the count appended after a space") {
+        CHECK(mfa_disable_complete_detail("MFA cleared via test", 2) ==
+              "MFA cleared via test sessions_ended=2");
+    }
+    SECTION("a near-miss token is not a placeholder") {
+        CHECK(mfa_disable_complete_detail("{sessions_ended", 1) == "{sessions_ended sessions_ended=1");
+        CHECK(mfa_disable_complete_detail("{Sessions_Ended}", 1) ==
+              "{Sessions_Ended} sessions_ended=1");
+    }
+    SECTION("substituted text is never re-scanned (single pass)") {
+        // Adjacent partial tokens must not combine into a new one across a substitution.
+        CHECK(mfa_disable_complete_detail("{sessions_{sessions_ended}ended}", 5) ==
+              "{sessions_5ended}");
+    }
+}
+
+TEST_CASE("MfaDisableOwner: the placeholder shapes the committed outcome row",
+          "[pg][auth][mfa][mfa_disable_owner]") {
+    MfaInfra f;
+    f.seed_enrolled("kate");
+    (void)f.session_for("kate");
+    (void)f.session_for("kate");
+
+    const auto r = f.owner.commit(
+        mkreq("kate", std::nullopt,
+              "MFA enrollment cleared via --mfa-reset CLI (os_identity=root, "
+              "sessions_ended={sessions_ended})"));
+    REQUIRE(r.result == MfaDisableResult::kOk);
+    CHECK(f.audit_detail("mfa.disabled", "kate") ==
+          "MFA enrollment cleared via --mfa-reset CLI (os_identity=root, sessions_ended=2)");
+}
+
+TEST_CASE("MfaDisableOwner: un-enrolled with end_sessions_if_not_enrolled=false leaves sessions "
+          "alone",
+          "[pg][auth][mfa][mfa_disable_owner]") {
+    MfaInfra f;
+    f.seed("liam");
+    const auto token = f.session_for("liam");
+    const auto gen = f.factor_gen("liam");
+    const auto write_gen_before = f.write_generation();
+
+    auto req = mkreq("liam", gen, "ignored when the account was not enrolled");
+    req.end_sessions_if_not_enrolled = false;
+    req.detail_if_not_enrolled = "no verified factor to clear";
+    const auto r = f.owner.commit(req);
+
+    REQUIRE(r.result == MfaDisableResult::kOk);
+    CHECK_FALSE(r.was_enrolled);
+    CHECK(r.sessions_ended == 0);
+    CHECK(f.sessions_of("liam") == 1);
+    CHECK(f.mgr.validate_session(token).has_value());
+    CHECK(f.write_generation() == write_gen_before); // no fleet-wide generation bump
+    CHECK(f.audit_total() == 1);
+    CHECK(f.audit_rows("mfa.disabled", "liam") == 1);
+    CHECK(f.audit_detail("mfa.disabled", "liam") == "no verified factor to clear");
+}
+
+TEST_CASE("MfaDisableOwner: un-enrolled with end_sessions_if_not_enrolled=true ends sessions and "
+          "bumps the generation",
+          "[pg][auth][mfa][mfa_disable_owner]") {
+    MfaInfra f;
+    f.seed("mona");
+    (void)f.session_for("mona");
+    const auto write_gen_before = f.write_generation();
+
+    auto req = mkreq("mona", std::nullopt, "cleared (sessions_ended={sessions_ended})");
+    req.end_sessions_if_not_enrolled = true;
+    req.detail_if_not_enrolled = "must not be used";
+    const auto r = f.owner.commit(req);
+
+    REQUIRE(r.result == MfaDisableResult::kOk);
+    CHECK_FALSE(r.was_enrolled);
+    CHECK(r.sessions_ended == 1);
+    CHECK(f.sessions_of("mona") == 0);
+    CHECK(f.write_generation() > write_gen_before);
+    CHECK(f.audit_detail("mfa.disabled", "mona") == "cleared (sessions_ended=1)");
+}
+
+TEST_CASE("MfaDisableOwner: an ENROLLED account ends its sessions even when the flag is false",
+          "[pg][auth][mfa][mfa_disable_owner]") {
+    MfaInfra f;
+    f.seed_enrolled("nina");
+    (void)f.session_for("nina");
+    const auto gen = f.factor_gen("nina");
+
+    auto req = mkreq("nina", gen);
+    req.end_sessions_if_not_enrolled = false;
+    req.detail_if_not_enrolled = "must not be used";
+    const auto r = f.owner.commit(req);
+
+    REQUIRE(r.result == MfaDisableResult::kOk);
+    CHECK(r.was_enrolled);
+    CHECK(r.sessions_ended == 1);
+    CHECK(f.sessions_of("nina") == 0);
+    CHECK(f.audit_detail("mfa.disabled", "nina") == "sessions_ended=1");
+}

@@ -31,17 +31,23 @@
 ///      session that somehow survived.
 ///   b. `session_sql::delete_user_sessions_in_txn`, DELETE every durable
 ///      session of the account (the ONE copy of the statement); its count is
-///      `sessions_ended` and the audit detail's `sessions_ended=N`.
+///      `sessions_ended` and feeds the audit detail. SKIPPED (with step d) when
+///      the pre-image says the account had no verified factor AND the request
+///      sets `end_sessions_if_not_enrolled = false`: cancelling an enrolment
+///      that never completed clears no usable factor, so no proof can predate it
+///      and there is nothing to protect (and no fleet-wide lock to take).
 ///   c. `AuditStore::log_in_txn`, the OUTCOME row. The caller fills the
 ///      template (`action`, `result`, principal, target, ...); the owner only
-///      completes `detail` by appending `sessions_ended=<n>`: an empty template
-///      detail becomes exactly `sessions_ended=<n>`, otherwise
-///      `<template detail> sessions_ended=<n>`. Any INSERT failure aborts the
-///      whole transaction → `kAuditUnavailable`.
+///      completes `detail`, see `mfa_disable_complete_detail` below: a
+///      `{sessions_ended}` token in the template is replaced by the count;
+///      otherwise an empty template detail becomes exactly `sessions_ended=<n>`
+///      and a non-empty one `<template detail> sessions_ended=<n>`. On the
+///      skipped-sessions path the detail is `detail_if_not_enrolled` verbatim.
+///      Any INSERT failure aborts the whole transaction → `kAuditUnavailable`.
 ///   d. `session_sql::bump_generation_in_txn`, bump
 ///      `session_meta.write_generation` LAST (same reason as the precedent:
 ///      every session create/revoke takes that row, so nothing may be waited on
-///      after it).
+///      after it). Skipped together with step b.
 ///   e. the TEST-ONLY pre-commit hook, then COMMIT.
 /// Post-commit (outside the lease): `AuditStore::count_committed` for the row.
 /// The caller then drops its own in-process session cache (a replica's
@@ -49,7 +55,10 @@
 ///
 /// LOCK ORDER (a change that inverts it can deadlock): the `auth.users` row →
 /// `session_store.sessions` rows → `audit_store.audit_events` (INSERT only) →
-/// the `session_store.session_meta` `write_generation` row → COMMIT. This is
+/// the `session_store.session_meta` `write_generation` row → COMMIT. The
+/// skipped-sessions path takes a strict prefix of that order (the `auth.users`
+/// row, then the audit INSERT; no `sessions` rows, no `session_meta` row), so it
+/// can only wait where the full path already could. This is
 /// byte-for-byte the order `CredentialChangeOwner` takes (its banner holds the
 /// acyclicity argument against every other holder, which applies unchanged:
 /// the recovery-code DELETE is `auth` schema, taken in step a with the row).
@@ -75,6 +84,7 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace yuzu::server::pg {
@@ -92,9 +102,33 @@ struct MfaDisableRequest {
     std::optional<std::int64_t> expected_factor_gen;
     /// The OUTCOME audit row. The caller fills `action`, `result` and the
     /// identity fields (principal, principal_role, target_type, target_id,
-    /// source_ip, ...); the owner only completes `detail` (see the banner).
+    /// source_ip, ...); the owner only completes `detail` (see the banner and
+    /// `mfa_disable_complete_detail`).
     AuditEvent audit_template;
+    /// true (the default, the CLI shape): the account's sessions are ended and
+    /// the session write-generation bumped whatever the pre-image says. false
+    /// (the Settings shape): when the pre-image says the account had NO verified
+    /// factor, sessions are left alone, the generation is not bumped and the
+    /// outcome row carries `detail_if_not_enrolled`. An enrolled account always
+    /// has its sessions ended.
+    bool end_sessions_if_not_enrolled{true};
+    /// A COMPLETE detail, used verbatim (no placeholder substitution, no
+    /// `sessions_ended` appended) only when the account was not enrolled AND
+    /// `end_sessions_if_not_enrolled` is false.
+    std::string detail_if_not_enrolled;
 };
+
+/// Completes an outcome row's detail from the caller's template and the number of
+/// sessions ended. Pure. Every occurrence of the literal token `{sessions_ended}`
+/// in `detail_template` is replaced by the decimal count, in ONE left-to-right
+/// pass over the template: substituted text is never re-scanned, and only the
+/// template the caller supplies is substituted. A caller that embeds an
+/// untrusted string (an OS identity) in the template must treat it as part of the
+/// template: a literal `{sessions_ended}` inside it WOULD be replaced. With no
+/// token, an empty template becomes exactly `sessions_ended=<n>` and a non-empty
+/// one `<template> sessions_ended=<n>`.
+[[nodiscard]] std::string mfa_disable_complete_detail(std::string_view detail_template,
+                                                      int sessions_ended);
 
 enum class MfaDisableResult : std::uint8_t {
     kOk,

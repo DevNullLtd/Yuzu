@@ -24,6 +24,7 @@
 #include <exception>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace yuzu::server {
@@ -33,6 +34,32 @@ namespace {
 using Result = MfaDisableResult;
 
 } // namespace
+
+std::string mfa_disable_complete_detail(std::string_view detail_template, int sessions_ended) {
+    constexpr std::string_view kToken = "{sessions_ended}";
+    const std::string count = std::to_string(sessions_ended);
+    if (detail_template.find(kToken) == std::string_view::npos) {
+        if (detail_template.empty())
+            return "sessions_ended=" + count;
+        return std::string(detail_template) + " sessions_ended=" + count;
+    }
+    // One left-to-right pass over the caller's template: the substituted count is
+    // appended to the output and never scanned again.
+    std::string out;
+    out.reserve(detail_template.size() + count.size());
+    std::size_t pos = 0;
+    while (pos < detail_template.size()) {
+        const std::size_t hit = detail_template.find(kToken, pos);
+        if (hit == std::string_view::npos) {
+            out.append(detail_template.substr(pos));
+            break;
+        }
+        out.append(detail_template.substr(pos, hit - pos));
+        out += count;
+        pos = hit + kToken.size();
+    }
+    return out;
+}
 
 MfaDisableOutcome MfaDisableOwner::commit(const MfaDisableRequest& req) const {
     MfaDisableOutcome out;
@@ -89,18 +116,26 @@ MfaDisableOutcome MfaDisableOwner::commit(const MfaDisableRequest& req) const {
             }
             was_enrolled = cleared->was_enrolled;
 
+            // An enrolment that never completed cleared no usable factor, so no
+            // proof can predate it: the caller may ask to leave sessions alone
+            // (and then no fleet-wide `session_meta` lock is taken either).
+            const bool end_sessions = was_enrolled || req.end_sessions_if_not_enrolled;
+
             // b. Every session of the account, durably (the count feeds the
             //    audit detail). The generation bump is NOT here, see d.
-            const auto deleted = session_sql::delete_user_sessions_in_txn(c, req.username, err);
-            if (!deleted)
-                return false;
-            ended = *deleted;
+            if (end_sessions) {
+                const auto deleted =
+                    session_sql::delete_user_sessions_in_txn(c, req.username, err);
+                if (!deleted)
+                    return false;
+                ended = *deleted;
+            }
 
             // c. The evidence, in the same transaction. The caller owns every
             //    field but the session count.
             AuditEvent ev = req.audit_template;
-            const std::string count = "sessions_ended=" + std::to_string(ended);
-            ev.detail = ev.detail.empty() ? count : ev.detail + " " + count;
+            ev.detail = end_sessions ? mfa_disable_complete_detail(ev.detail, ended)
+                                     : req.detail_if_not_enrolled;
             if (!audit_->log_in_txn(c, ev)) {
                 refusal = Result::kAuditUnavailable;
                 return false;
@@ -110,7 +145,7 @@ MfaDisableOutcome MfaDisableOwner::commit(const MfaDisableRequest& req) const {
             //    `session_meta` row lock is taken by every session create/revoke
             //    in the fleet, so nothing may be waited on after it but COMMIT
             //    (see CredentialChangeOwner for the incident this order closes).
-            if (!session_sql::bump_generation_in_txn(c)) {
+            if (end_sessions && !session_sql::bump_generation_in_txn(c)) {
                 err = std::string("session write-generation bump failed: ") + PQerrorMessage(c);
                 return false;
             }
