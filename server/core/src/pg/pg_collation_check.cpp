@@ -34,6 +34,18 @@ const char* to_string(CollationVerdict v) noexcept {
     return "unreadable";
 }
 
+const char* to_string(CollationGate g) noexcept {
+    switch (g) {
+    case CollationGate::Trusted:
+        return "trusted";
+    case CollationGate::Mismatch:
+        return "mismatch";
+    case CollationGate::Unproven:
+        return "unproven";
+    }
+    return "unproven";
+}
+
 void seed_collation_metrics(yuzu::MetricsRegistry& metrics) {
     for (const auto& entry : all_collation_verdicts())
         (void)metrics.counter(kCollationCheckCounter, {{"result", entry.name}});
@@ -184,9 +196,14 @@ CollationStep next_collation_state(const CollationState& prev, CollationVerdict 
 }
 
 void report_collation_check(const CollationReport& report, yuzu::MetricsRegistry* metrics,
-                            CollationState& state) noexcept {
+                            CollationState& state, std::atomic<CollationGate>* gate) noexcept {
     try {
         const CollationStep step = next_collation_state(state, report.verdict);
+        // Published first and from `step.next.last`, which an Unreadable carries over from the
+        // previous state: the gate is safety state and must not depend on the best-effort work
+        // below succeeding.
+        if (gate)
+            gate->store(gate_for(step.next.last), std::memory_order_release);
         // `state` advances LAST. The transition-only log lines (the mismatch ERROR, the unreadable
         // WARN, the clearing INFO) are decided by comparing a verdict with the previous state, so a
         // transient failure in the metric or log work below must leave the state behind: the next

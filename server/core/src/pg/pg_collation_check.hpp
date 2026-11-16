@@ -50,6 +50,7 @@
 ///     system could not report the actual one.
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <optional>
 #include <string>
@@ -133,6 +134,35 @@ struct CollationState {
     friend bool operator==(const CollationState&, const CollationState&) = default;
 };
 
+/// What a text-key keyset reader or writer may rely on, as a lock-free value. Derived from
+/// `CollationState.last` AFTER `next_collation_state` (the state that survives an Unreadable),
+/// never from the latest verdict: a verdict-derived gate would reopen on one failed check during a
+/// standing mismatch.
+///   - Trusted: the last conclusive finding was Ok or NotApplicable.
+///   - Mismatch: the last conclusive finding was Mismatch (stays so through Unreadable checks).
+///   - Unproven: no conclusive finding yet (a boot whose checks have all been unreadable).
+enum class CollationGate { Trusted, Mismatch, Unproven };
+
+/// Pure. None -> Unproven, Ok -> Trusted, NotApplicable -> Trusted, Mismatch -> Mismatch.
+[[nodiscard]] constexpr CollationGate gate_for(CollationLast last) noexcept {
+    switch (last) {
+    case CollationLast::None:
+        return CollationGate::Unproven;
+    case CollationLast::Ok:
+    case CollationLast::NotApplicable:
+        return CollationGate::Trusted;
+    case CollationLast::Mismatch:
+        return CollationGate::Mismatch;
+    }
+    return CollationGate::Unproven;
+}
+
+/// Fixed text for logs and tests: "trusted", "mismatch", "unproven".
+[[nodiscard]] const char* to_string(CollationGate g) noexcept;
+
+/// The value a published gate holds before any check has concluded: never Trusted.
+inline constexpr CollationGate kInitialCollationGate = CollationGate::Unproven;
+
 enum class GaugeAction { Leave, SetZero, SetOne, Remove };
 enum class LogAction {
     None,
@@ -181,8 +211,13 @@ inline constexpr const char* kCollationLastCompletedGauge =
 /// versions and the remedy. The gauge is absent (not zero) until a conclusive verdict sets it, and
 /// is removed again on NotApplicable. `metrics` may be null. Never throws. Not thread-safe:
 /// `state` is owned by one caller at a time (the constructor, then the recheck loop).
+///
+/// `gate`, when non-null, receives `gate_for(next.last)` with `memory_order_release` on every
+/// report, before the metric and log work (so a throw there cannot withhold it); null publishes
+/// nothing. The caller initialises the atomic to `kInitialCollationGate`.
 void report_collation_check(const CollationReport& report, yuzu::MetricsRegistry* metrics,
-                            CollationState& state) noexcept;
+                            CollationState& state,
+                            std::atomic<CollationGate>* gate = nullptr) noexcept;
 
 /// Creates `yuzu_pg_collation_check_total{result}` at 0 for every verdict in
 /// `all_collation_verdicts()`, so each result reads 0 rather than absent before it first happens

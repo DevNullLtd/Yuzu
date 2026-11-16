@@ -493,6 +493,41 @@ TEST_CASE("PgCollationRecheck against a real database: a forced Mismatch, then O
     CHECK(recheck.state() == CollationState{CollationLast::Ok, false});
 }
 
+TEST_CASE("PgCollationRecheck: ticks publish the gate from the surviving state",
+          "[pg_collation][recheck][gate]") {
+    ScriptedCheck check;
+    check.script = {CollationVerdict::Mismatch, CollationVerdict::Unreadable, CollationVerdict::Ok,
+                    CollationVerdict::Unreadable};
+    std::atomic<pg::CollationGate> gate{pg::kInitialCollationGate};
+    PgCollationRecheck recheck(check.fn(), nullptr, 1h, CollationState{}, 60s, &gate);
+    CHECK(gate.load() == pg::CollationGate::Unproven);
+    recheck.tick();
+    CHECK(gate.load() == pg::CollationGate::Mismatch);
+    recheck.tick(); // unreadable: the mismatch stands
+    CHECK(gate.load() == pg::CollationGate::Mismatch);
+    recheck.tick();
+    CHECK(gate.load() == pg::CollationGate::Trusted);
+    recheck.tick(); // unreadable after Ok: still Trusted
+    CHECK(gate.load() == pg::CollationGate::Trusted);
+}
+
+TEST_CASE("PgCollationRecheck: a null gate publishes nothing and a stopped recheck leaves it alone",
+          "[pg_collation][recheck][gate]") {
+    ScriptedCheck check;
+    check.script = {CollationVerdict::Mismatch};
+    PgCollationRecheck no_gate(check.fn(), nullptr, 1h, CollationState{});
+    REQUIRE_NOTHROW(no_gate.tick());
+    CHECK(no_gate.state().last == CollationLast::Mismatch);
+
+    std::atomic<pg::CollationGate> gate{pg::kInitialCollationGate};
+    ScriptedCheck check2;
+    check2.script = {CollationVerdict::Ok};
+    PgCollationRecheck stopped(check2.fn(), nullptr, 1h, CollationState{}, 60s, &gate);
+    stopped.request_stop();
+    stopped.tick(); // dropped: the server is going down
+    CHECK(gate.load() == pg::CollationGate::Unproven);
+}
+
 TEST_CASE("PgCollationRecheck: the state follows every report", "[pg_collation][recheck]") {
     ScriptedCheck check;
     check.script = {CollationVerdict::Mismatch, CollationVerdict::Unreadable, CollationVerdict::Ok,

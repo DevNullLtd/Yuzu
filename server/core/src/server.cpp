@@ -5586,7 +5586,7 @@ public:
                 // this call leaves in collation_state_. See pg/pg_collation_check.hpp.
                 if (pg_probe_ok)
                     pg::report_collation_check(pg::check_collation_version(*pg_pool_), &metrics_,
-                                               collation_state_);
+                                               collation_state_, &collation_gate_);
             }
         }
 
@@ -9708,7 +9708,7 @@ public:
                     pg_collation_recheck_ = std::make_unique<PgCollationRecheck>(
                         [this] { return pg::check_collation_version(*pg_pool_); }, &metrics_,
                         kCollationRecheckInterval, collation_state_,
-                        kCollationUnsettledRecheckInterval);
+                        kCollationUnsettledRecheckInterval, &collation_gate_);
                     // The repeat is optional (the start-time check has already reported), so a
                     // refusal to create its thread (a task or thread limit) degrades instead of
                     // failing the boot: the check only reports. Without the repeat the last-
@@ -24865,6 +24865,9 @@ private:
     /// every Postgres-backed store (declared later) releases its PgPool& and
     /// every ingest thread (agent_service_, declared later) has already stopped.
     std::unique_ptr<pg::PgPool> pg_pool_;
+    /// The collation gate the check publishes (lock-free). Declared right after pg_pool_ and
+    /// BEFORE every store on purpose: a store will borrow a pointer to it, so it must outlive them.
+    std::atomic<pg::CollationGate> collation_gate_{pg::kInitialCollationGate};
     detail::EventBus event_bus_;
     detail::AgentRegistry registry_;
     /// Fleet health aggregation (heartbeat status_tags -> yuzu_fleet_* gauges, and the per-device

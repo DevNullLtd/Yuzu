@@ -12,9 +12,10 @@ namespace yuzu::server {
 PgCollationRecheck::PgCollationRecheck(CheckFn check, yuzu::MetricsRegistry* metrics,
                                        std::chrono::milliseconds interval,
                                        pg::CollationState initial,
-                                       std::chrono::milliseconds unsettled_interval)
+                                       std::chrono::milliseconds unsettled_interval,
+                                       std::atomic<pg::CollationGate>* gate)
     : check_(std::move(check)), metrics_(metrics), interval_(interval),
-      unsettled_interval_(unsettled_interval), state_(initial) {}
+      unsettled_interval_(unsettled_interval), gate_(gate), state_(initial) {}
 
 PgCollationRecheck::~PgCollationRecheck() {
     stop();
@@ -43,7 +44,7 @@ void PgCollationRecheck::tick() noexcept {
         return;
     try {
         std::lock_guard<std::mutex> lk(state_mu_);
-        pg::report_collation_check(report, metrics_, state_);
+        pg::report_collation_check(report, metrics_, state_, gate_);
     } catch (...) {
         // report_collation_check does not throw; this only guards the lock.
     }

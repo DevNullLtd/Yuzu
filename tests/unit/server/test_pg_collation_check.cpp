@@ -23,6 +23,7 @@
 
 #include <libpq-fe.h>
 
+#include <atomic>
 #include <initializer_list>
 #include <chrono>
 #include <functional>
@@ -111,6 +112,62 @@ TEST_CASE("collation verdict: fixed names", "[pg_collation][decision]") {
     CHECK(std::string(to_string(CollationVerdict::NotApplicable)) == "not_applicable");
     CHECK(std::string(to_string(CollationVerdict::Mismatch)) == "mismatch");
     CHECK(std::string(to_string(CollationVerdict::Unreadable)) == "unreadable");
+}
+
+TEST_CASE("collation gate: gate_for maps every CollationLast", "[pg_collation][gate]") {
+    static_assert(gate_for(CollationLast::None) == CollationGate::Unproven);
+    static_assert(gate_for(CollationLast::Ok) == CollationGate::Trusted);
+    static_assert(gate_for(CollationLast::NotApplicable) == CollationGate::Trusted);
+    static_assert(gate_for(CollationLast::Mismatch) == CollationGate::Mismatch);
+
+    CHECK(gate_for(CollationLast::None) == CollationGate::Unproven);
+    CHECK(gate_for(CollationLast::Ok) == CollationGate::Trusted);
+    CHECK(gate_for(CollationLast::NotApplicable) == CollationGate::Trusted);
+    CHECK(gate_for(CollationLast::Mismatch) == CollationGate::Mismatch);
+    CHECK(std::string(to_string(CollationGate::Trusted)) == "trusted");
+    CHECK(std::string(to_string(CollationGate::Mismatch)) == "mismatch");
+    CHECK(std::string(to_string(CollationGate::Unproven)) == "unproven");
+}
+
+TEST_CASE("collation gate: a boot with no conclusive answer is never Trusted",
+          "[pg_collation][gate]") {
+    static_assert(kInitialCollationGate == CollationGate::Unproven);
+    std::atomic<CollationGate> gate{kInitialCollationGate};
+    CHECK(gate.load() == CollationGate::Unproven);
+}
+
+TEST_CASE("collation gate: published from the surviving state, not from the verdict",
+          "[pg_collation][gate]") {
+    const auto run = [](std::initializer_list<CollationVerdict> verdicts) {
+        std::atomic<CollationGate> gate{kInitialCollationGate};
+        CollationState state;
+        for (const auto v : verdicts)
+            report_collation_check(report(v, "a", v == CollationVerdict::Mismatch ? "b" : "a"),
+                                   nullptr, state, &gate);
+        return gate.load();
+    };
+    using V = CollationVerdict;
+    CHECK(run({V::Ok, V::Mismatch}) == CollationGate::Mismatch);
+    // An unreadable check during a standing mismatch must not reopen the gate.
+    CHECK(run({V::Mismatch, V::Unreadable}) == CollationGate::Mismatch);
+    CHECK(run({V::Mismatch, V::Unreadable, V::Unreadable}) == CollationGate::Mismatch);
+    CHECK(run({V::Mismatch, V::Unreadable, V::Ok}) == CollationGate::Trusted);
+    CHECK(run({V::Ok, V::Unreadable}) == CollationGate::Trusted);
+    CHECK(run({V::NotApplicable}) == CollationGate::Trusted);
+    CHECK(run({V::Mismatch, V::NotApplicable}) == CollationGate::Trusted);
+    // Nothing conclusive yet stays Unproven.
+    CHECK(run({V::Unreadable}) == CollationGate::Unproven);
+    CHECK(run({V::Unreadable, V::Unreadable}) == CollationGate::Unproven);
+}
+
+TEST_CASE("collation gate: publishing through a null pointer is a no-op", "[pg_collation][gate]") {
+    CollationState state;
+    REQUIRE_NOTHROW(report_collation_check(report(CollationVerdict::Mismatch, "a", "b"), nullptr,
+                                           state, nullptr));
+    CHECK(state.last == CollationLast::Mismatch);
+    // The default argument is the same no-op.
+    REQUIRE_NOTHROW(report_collation_check(report(CollationVerdict::Ok, "a", "a"), nullptr, state));
+    CHECK(state.last == CollationLast::Ok);
 }
 
 TEST_CASE("collation state machine: every (previous state, verdict) pair",
