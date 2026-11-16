@@ -23,15 +23,18 @@ Network, Scoring, Alerts**. Overview is the hub; the other tabs are the deep pag
 Conventions that apply to every tab:
 
 - **Window selector.** `24h`, `7d`, `30d` or `All` rescopes the signal views.
-  The default is `7d`. Drill-downs inherit the window you were viewing, so the
-  numbers on a drill-down match the panel you came from. Performance and
+  The default is `7d`. `All` is not a longer history than the store keeps:
+  observations are kept for 30 days by default, so `30d` and `All` match unless
+  that setting was raised. Drill-downs inherit the window you were viewing, so
+  the numbers on a drill-down match the panel you came from. Performance and
   Network are now-views and have no window.
 - **Operating-system filter.** The Catalogue has an All / Windows / Linux /
   macOS filter that rescopes coverage and scores. The Apps tab has its own
   platform chips.
 - **Honest empties.** A view with no data says so. A rate with no population
-  shows a dash, never a made-up number, and a device that cannot be heard from
-  is treated as unknown, never as healthy.
+  shows a dash, never a made-up number, and an offline device is left out of the
+  rates. A connected device whose observer is switched off or not armed is still
+  counted, as crash-free; see [fleet health](fleet-health.md#limits-and-privacy).
 - **Everything drills.** Cards and rows open the next level down: an
   application, a signal type, a device, one observation.
 
@@ -52,6 +55,11 @@ per-device app-usage route (see the map below). Conventions:
 
 - **Authentication.** Send an API token as `Authorization: Bearer <token>`.
   See [Authentication](../user-manual/rest-api.md#authentication).
+- **Permissions.** A permission named on these pages is enforced as written
+  only while RBAC enforcement is on, and it is off by default. With it off, any
+  signed-in user passes a read such as `GuaranteedState:Read`, while writes,
+  `Execution:Execute` and `Forensics:Read` need the administrator role. See
+  [RBAC](../user-manual/rbac.md#enabling-rbac).
 - **Envelope.** Success is `{"data": ..., "meta": {...}}`. Errors use the
   standard error envelope with a `correlation_id`; see
   [JSON Envelope](../user-manual/rest-api.md#json-envelope).
@@ -62,30 +70,46 @@ per-device app-usage route (see the map below). Conventions:
 - **Read-only, except the score policy.** Every route is a read except
   `PUT` and `DELETE` on the score policy and `POST` on the live-info route
   (a `POST` only because it waits for the device to answer).
-- **Degraded reads fail loudly.** When a store cannot be read the route answers
-  `503` with a `retry_after_ms` hint. It never returns a healthy-looking empty
-  result.
+- **Failed store reads.** Some routes fail loudly and some do not. The device
+  score, the catalogue, the Apps list, per-device application usage and the
+  retained application-performance reads (the picker, the fleet, group and tag
+  trends, the version-devices drill, the version comparison and one device's
+  retained history) answer `503` with a `retry_after_ms` hint. The Overview,
+  Health score, Trends, the signal rollup, scope and signal drill-down, the
+  application drill-down, the catalogue family drill-down and a device's signal
+  history do not: if their read fails they answer `200` with empty or zero
+  figures, and a single observation reads as `404`. An empty answer from those
+  is not proof of a quiet fleet. Every failed read is counted on
+  `yuzu_server_guardian_read_degrade_total`, labelled by reason and source;
+  check it before you trust a surprisingly empty answer.
 - **Audit.** Routes that name individual devices write an audit row before
   they answer, and refuse to answer (`503` with `Sec-Audit-Failed: true`) if
   that row cannot be stored. Aggregates that carry no device identity are not
   audited. Each area page lists its verbs.
 - **Service-scoped tokens.** A token scoped to one service is refused on
-  every DEX route except these. The per-device routes under
-  `/api/v1/dex/devices/{id}` accept it only for a device tagged with its own
-  service. `GET /api/v1/dex/perf/app/devices` answers with only the devices the
-  token can see. Both kinds need RBAC enforcement to be on and the service
-  owner role to hold the permission. Every other route is refused, aggregates
-  included, and so is the per-device app-usage route, because the service owner
-  role does not hold `Forensics:Read`. Every refusal is audited. The overview,
-  the signal and application drill-downs, the performance and network device
-  lists, the group and tag trends and the version comparison record it under
-  their own verb with the result `denied`. Every other refused route records
-  the standard permission-denied row. The dashboard's fragments make the same
-  checks, and the version drill uses the same gate as its route, so a
-  service-scoped token gets no fleet-wide data there either. The per-device
-  panels (device history, one observation, live performance, Top applications
-  and application history) follow the per-device rule. The Application usage
-  panel shows a permission note instead of an error.
+  every DEX route except these:
+  - The per-device routes under `/api/v1/dex/devices/{id}` accept it only for a
+    device tagged with its own service.
+  - `GET /api/v1/dex/perf/app/devices` answers with only the devices the token
+    can see.
+  - Both kinds need RBAC enforcement to be on and the service owner role to hold
+    the permission.
+  - Every other route is refused, aggregates included, and so is the per-device
+    app-usage route, because the service owner role does not hold
+    `Forensics:Read`.
+  - Every refusal on REST and MCP is audited. The overview, the signal and
+    application drill-downs, the performance and network device lists, the group
+    and tag trends and the version comparison record it under their own verb
+    with the result `denied`. Every other refused route records the standard
+    permission-denied row.
+  - The dashboard's fragments make the same checks, and the version drill uses
+    the same gate as its route, so a service-scoped token gets no fleet-wide
+    data there either. The dashboard writes the same audit rows for the views
+    that name devices, but a fragment still renders when a row cannot be
+    stored, where REST refuses to answer.
+  - The per-device panels (device history, one observation, live performance,
+    Top applications and application history) follow the per-device rule. The
+    Application usage panel shows a permission note instead of an error.
 - **Management-group grants.** A grant scoped to a management group alone does
   not pass the aggregate reads, which need a global `GuaranteedState:Read`. It
   does pass the per-device reads for devices in the group.
@@ -113,14 +137,19 @@ An agentic worker reaches the same data through MCP tools. Conventions:
   every tier too.
 - **Same model, same numbers.** A tool answers from the same read model as the
   REST route it mirrors, so the two agree figure for figure. Tool arguments
-  match the route's query parameters.
+  match the route's query parameters. The one difference is the device: the
+  per-device tools take it as `agent_id`, where the REST routes carry it in the
+  path as `{id}`.
 - **Score-policy tools.** `get_dex_score_policy` reads at every tier.
   `set_dex_score_policy` and `reset_dex_score_policy` are write tools: a
   supervised-tier token is required, and `reset_dex_score_policy` also needs
   an approval ticket. See [Apps](apps.md#the-score-policy).
 - **Audit.** A tool that names devices records the same audit verb as its REST
-  twin. Most set-and-proceed on MCP, flagging `audit_persisted: false` if the
-  row was lost; the per-device app-usage tool withholds data instead.
+  twin, with one exception: `compare_app_perf_versions` records the generic
+  `mcp.compare_app_perf_versions` row on success and uses `dex.app_perf.compare`
+  only for a refusal. Most tools set-and-proceed on MCP, flagging
+  `audit_persisted: false` if the row was lost; the per-device app-usage tool
+  withholds data instead.
 - **Service-scoped tokens.** A tool follows the same rule as the REST route
   it mirrors. A token scoped to one service is refused on every DEX tool
   except the per-device tools (`get_dex_device_score`,
@@ -151,9 +180,10 @@ disagree, they win. See [contributing](contributing.md) for the rule.
 
 Every route listed here is under `/api/v1`. "Read" means
 `GuaranteedState:Read` unless the row says otherwise. Audit statements describe
-the REST route and its MCP twin. The dashboard writes the same verb when it
-opens the same view, with two exceptions: the Overview and the application
-drill-down open without an audit row. Unless a row says
+the REST route and its MCP twin, except that `compare_app_perf_versions`
+records `mcp.compare_app_perf_versions` on success. The dashboard writes the
+same verb when it opens the same view, with two exceptions: the Overview and
+the application drill-down open without an audit row. Unless a row says
 otherwise, a service-scoped token is refused on the route and on the tool in
 the same row; see the service-scoped rule under
 [the REST API](#the-rest-api). Network discovery (the
@@ -178,7 +208,7 @@ this map; see [network](network.md).
 | One device: score and signal summary | Device drill | `GET /api/v1/dex/devices/{id}` | `get_dex_device_score` | DEX observer | Read, scoped to the device; a service-scoped token reaches only devices tagged with its own service; audited `dex.device.view` | [signals](signals.md) |
 | One device: signal history | Device drill | `GET /api/v1/dex/devices/{id}/history` | `get_dex_device_history` | DEX observer | Read, scoped to the device; a service-scoped token reaches only devices tagged with its own service; audited `dex.device.view` | [signals](signals.md) |
 | One observation in detail | Device drill, event panel | `GET /api/v1/dex/devices/{id}/observations/{event_id}` | `get_dex_observation` | DEX observer | Read, scoped to the device; a service-scoped token reaches only devices tagged with its own service; audited `dex.observation.view` | [signals](signals.md) |
-| Live uptime or process list from a device | Device page, Get live info | `POST /api/v1/dex/devices/{id}/live` | None | `os_info`, `processes` plugins | Read and `Execution:Execute`, both scoped to the device; a service-scoped token reaches only devices tagged with its own service; audited `device.live.uptime` or `device.live.processes` before dispatch | [signals](signals.md) |
+| Live uptime or process list from a device (these two kinds on REST; the device page offers more) | Device page, Get live info | `POST /api/v1/dex/devices/{id}/live` | None | `os_info`, `processes` plugins | Read and `Execution:Execute`, both scoped to the device; a service-scoped token reaches only devices tagged with its own service; audited `device.live.uptime` or `device.live.processes` before dispatch | [signals](signals.md) |
 
 ### Applications
 
@@ -198,6 +228,7 @@ this map; see [network](network.md).
 | Cohort benchmarking by tag value | Performance | `GET /api/v1/dex/perf/cohorts` | `get_dex_perf_cohorts` | Heartbeat performance tags, device tags | Read; not audited | [performance](performance.md) |
 | Compare two cohorts | Performance | `GET /api/v1/dex/perf/cohort-diff` | `get_dex_perf_cohort_diff` | Heartbeat performance tags, device tags | Read; not audited | [performance](performance.md) |
 | Devices behind a metric, a cohort or not reporting | Performance drill | `GET /api/v1/dex/perf/devices` | `list_dex_perf_devices` | Heartbeat performance tags | Read; audited `dex.perf.device.view` | [performance](performance.md) |
+| One device's live performance (dashboard only) | Device drill, device performance panel | None | None | Echo `perf` | Read and `Execution:Execute`, both scoped to the device; audited `dex.device.perf.query` | [performance](performance.md) |
 
 ### Application performance over time
 
@@ -208,8 +239,9 @@ this map; see [network](network.md).
 | Devices behind one application version | App Performance, version drill | `GET /api/v1/dex/perf/app/devices` | `list_dex_app_perf_devices` | Echo `procperf`, daily sync | Fleet read, confined to visible devices; a service-scoped token gets only the devices it can see; audited `dex.app_perf.devices.view` | [app performance](app-performance.md) |
 | Trend for one management group | App Performance | `GET /api/v1/dex/perf/group` | `get_dex_group_app_perf` | Echo `procperf`, daily sync | Read; not audited on success | [app performance](app-performance.md) |
 | Trend for one device-tag cohort | App Performance | `GET /api/v1/dex/perf/tag` | `get_dex_tag_app_perf` | Echo `procperf`, daily sync | Read; not audited on success | [app performance](app-performance.md) |
+| One device's live top applications (dashboard only) | Device drill, Top applications panel | None | None | Echo `procperf` | Read and `Execution:Execute`, both scoped to the device; audited `dex.device.procperf.query` | [app performance](app-performance.md) |
 | One device's retained per-application history | Device drill | `GET /api/v1/dex/devices/{id}/app-perf` | `get_dex_device_app_perf` | Echo `procperf`, daily sync | Read, scoped to the device; a service-scoped token reaches only devices tagged with its own service; audited `dex.device.app_perf.view` | [app performance](app-performance.md) |
-| Before and after comparison of two versions | None | `GET /api/v1/dex/perf/compare` | `compare_app_perf_versions` | Echo `procperf`, daily sync | Read; audited `dex.app_perf.compare` | [app performance](app-performance.md) |
+| Before and after comparison of two versions | `/auto` Verify stage | `GET /api/v1/dex/perf/compare` | `compare_app_perf_versions` | Echo `procperf`, daily sync | Read; audited `dex.app_perf.compare` on REST and the Verify stage, `mcp.compare_app_perf_versions` on MCP success; the Verify stage's per-machine table is audited `dex.app_perf.compare.drill` | [app performance](app-performance.md) |
 
 ### Network quality
 
@@ -227,6 +259,7 @@ this map; see [network](network.md).
 ### Alerts
 
 Alert routing and the fleet-incident thresholds are configured on the
-dashboard's Alerts tab only. There is no REST route and no MCP tool for them
-today. The events they raise reach other systems through webhooks. See
-[alerts](alerts.md).
+dashboard's Alerts tab. There is no dedicated REST route and no MCP tool for
+them; the generic configuration route accepts their keys but does not apply
+them until the next Alerts-tab save or a restart. The events they raise reach
+other systems through webhooks. See [alerts](alerts.md).

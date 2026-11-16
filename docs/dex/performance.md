@@ -43,8 +43,10 @@ heartbeat sample of each reporting device. It has no window selector.
 - **Fleet now, cohorts and device lists** come from heartbeat tags that the
   agent attaches to each heartbeat: CPU busy percentage, commit-charge
   percentage and per-IO disk latency, derived over the heartbeat interval. Windows
-  and Linux agents send them. macOS agents show as online but are absent from
-  these figures, not counted as zero. These tags are stopped by the agent's
+  agents send all three. Linux agents send CPU busy and commit-charge, leave
+  commit-charge out on a host that sets `vm.overcommit_memory` to `1`, and send
+  no disk latency. macOS agents show as online but are absent from these
+  figures, not counted as zero. These tags are stopped by the agent's
   `--dex-disable` switch.
 - **Cohorts** come from device tags, not an inventory column. Tag your devices
   (see the [asset tagging guide](../asset-tagging-guide.md)) and pick the tag key
@@ -69,11 +71,13 @@ heartbeat sample of each reporting device. It has no window selector.
 
 **On a device's drill-down**, the **device performance** panel is click to load.
 When you load it, the server runs a live, read-only Echo query on that device,
-so the raw samples stay on the device until someone asks. It needs the device
-online and the Echo sampler enabled, and it needs the `Execution:Execute`
-permission as well as `GuaranteedState:Read`; without Execute the panel shows a
-note instead. The **vs fleet and cohort** strips beside it use current heartbeat
-values and run no query.
+so the raw samples stay on the device until someone asks. The reply is held in
+the response store like any instruction result; see
+[what is kept](collectors-and-plugins.md#what-is-kept-and-for-how-long). The
+panel needs the device online and the Echo sampler enabled, and it needs the
+`Execution:Execute` permission as well as `GuaranteedState:Read`; without
+Execute it shows a note instead. The **vs fleet and cohort** strips beside it
+use current heartbeat values and run no query.
 
 A separate **Top applications** panel on the device, behind its own click,
 reads per-application usage from the device. That is covered in
@@ -128,7 +132,7 @@ device. See [surfaces](surfaces.md#the-rest-api).
   A cohort keyed by a per-device tag value with one device is that device's own
   figures. Only an empty cohort is withheld. Treat a small cohort as an
   anecdote.
-- **Names, not content.** The per-device panel reads machine-level performance,
+- **Machine-level only.** The per-device panel reads machine-level performance,
   not per-application data, so it carries no application names.
 - **Opt-in cohort export.** The Prometheus cohort export is off by default and
   is not behind the DEX read permission once enabled; see below.
@@ -153,7 +157,7 @@ list of series is in [the metrics reference](../user-manual/metrics.md#fleet-per
 | Platform | Fleet now and cohorts | Per-device performance |
 |---|---|---|
 | Windows | Yes | Yes, through the Echo sampler |
-| Linux | Yes | Yes, through the Echo sampler |
+| Linux | Yes, without disk latency | Yes, through the Echo sampler |
 | macOS | Online, but sends no performance tags | No sampler on macOS |
 
 ## Related pages

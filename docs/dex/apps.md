@@ -79,7 +79,8 @@ Open the **Scoring** tab.
 - **Policy in force** shows whether the shipped defaults or a custom policy
   apply, the revision, and the reason if a stored policy was refused.
 - **Tiers** sets the lowest displayed score of Excellent, Good and Fair; Poor is
-  everything below Fair. Tier names are 1 to 24 printable characters.
+  everything below Fair. Tier names are 1 to 24 bytes of printable ASCII, none
+  of `< > & "`.
 - **Weights** sets the four deduction weights, which sum to at most 100.
 - **Model** sets the per-device event cap, the regression ratios and the
   interval confidence level.
@@ -113,6 +114,14 @@ server; see [upgrading](../user-manual/upgrading.md).
 
 Edit a policy in three steps: read it (`GET`), change the document, send it
 back with `If-Match` set to the revision you read.
+
+A `503` on a policy write has two causes worth telling apart. "Another score
+policy write is still running" means the writer was busy: retry after the hint.
+"The write's outcome is unknown" means the commit may or may not have happened:
+`GET` the policy and compare its revision. If it is the `If-Match` revision you
+sent, the policy is as it was; if it is any other, review the policy before
+changing it again. The policy document is at most 256 KiB. A saved policy reaches
+the other servers typically within about 5 seconds.
 
 ## MCP
 

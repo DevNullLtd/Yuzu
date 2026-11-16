@@ -8,21 +8,30 @@ anything.
 
 This guide is a set of short pages, one per area. Each page covers what the
 capability is, why it is useful, which collectors and plugins feed it, and how
-to use it from the dashboard, the REST API and MCP. The detailed reference for
-each dashboard view is [DEX in the user manual](../user-manual/dex.md); this
-guide links to it rather than copying it.
+to use it from the dashboard, the REST API and MCP (Model Context Protocol). It
+is written for the administrators, helpdesk and security staff who read DEX, and
+for the engineers who script it. The detailed reference for each dashboard view
+is [DEX in the user manual](../user-manual/dex.md); this guide links to it
+rather than copying it.
 
 ## Why DEX
 
 - **Measured, not guessed.** Headline figures are real rates with their
   populations beside them, not invented scores.
-- **Honest about gaps.** A device that cannot be heard from is unknown, not
-  healthy. A platform with narrower collection reads as less observed.
-- **Edge first.** Measurement happens on the device. Only thin, device-aggregate
-  facts leave it, and user content is dropped before anything is sent.
+- **Honest about gaps.** An offline device is left out of the live figures, and
+  a platform with narrower collection reads as less observed. One gap to know
+  about: a connected device whose observer is switched off or not armed still
+  counts in the crash-free rate, because it cannot report a crash. See
+  [fleet health](fleet-health.md#limits-and-privacy).
+- **Edge first.** Measurement happens on the device. What leaves it is signal
+  observations, a few device-wide readings on each heartbeat and a once-a-day
+  summary of per-application figures for that device, and user content is
+  dropped on the device before anything is sent. The detailed Echo data stays on
+  the device until an operator asks for it.
 - **Three surfaces, one model.** Almost everything a person sees on the
-  dashboard is also available to scripts over REST and to agentic workers over
-  MCP. The [surface map](surfaces.md#the-capability-map) lists the exceptions.
+  dashboard is also available to scripts over REST and to agentic workers (AI
+  assistants and other automated clients) over MCP. The
+  [surface map](surfaces.md#the-capability-map) lists the exceptions.
 
 ## How the data flows
 
@@ -31,25 +40,40 @@ guide links to it rather than copying it.
    keeps a local warehouse of detail.
 2. Agents send signal observations, heartbeat tags and a once-a-day summary of
    per-application data to the server.
-3. The server stores observations in a read model projected from the Guardian
-   event store, aggregates the heartbeat tags each cycle, and keeps retained
-   per-application history.
+3. The server keeps observations in a table it builds from the Guardian event
+   store (the store that records device events), aggregates the heartbeat tags
+   each cycle, and keeps retained per-application history.
 4. The dashboard, the REST API and the MCP server all read those same models, so
    they agree figure for figure.
 
 [Collectors and plugins](collectors-and-plugins.md) describes step 1 in detail.
 
+## Before you start
+
+- **Agents are connected.** DEX reads what connected agents report. Performance
+  and network figures arrive on heartbeats, and the first heartbeat of a session
+  only sets a baseline for the rates, so give a new device two.
+- **You hold the permission.** `GuaranteedState:Read` covers every DEX read
+  except per-device application usage, which needs `Forensics:Read`. The
+  built-in Administrator, PlatformEngineer, Operator, ITServiceOwner and Viewer
+  roles hold `GuaranteedState:Read`, and it also covers Guardian reads. With RBAC
+  enforcement off, which is the default, any signed-in user passes
+  `GuaranteedState:Read` and `Forensics:Read` needs the administrator role; see
+  [RBAC](../user-manual/rbac.md#enabling-rbac).
+- **Data arrives in stages.** Signals appear as events happen. Application
+  performance and usage arrive with the daily sync, which sends completed days
+  only, so a new install shows nothing there until a UTC day has passed and the
+  sync has run.
+
 ## Quick start
 
-1. Make sure your account holds `GuaranteedState:Read`. Every DEX read needs it
-   except per-device application usage, which needs `Forensics:Read`.
-2. Open **DEX** in the sidebar, or go to `/dex`. Start at the Overview and click
+1. Open **DEX** in the sidebar, or go to `/dex`. Start at the Overview and click
    down.
-3. For scripts, create an API token and call a route such as
+2. For scripts, create an API token and call a route such as
    `GET /api/v1/dex/overview`. For an agentic worker, create an API token with an
    MCP tier and call a tool such as `get_dex_overview`. Worked examples are in
    [surfaces](surfaces.md).
-4. Use the [surface map](surfaces.md#the-capability-map) to find the route and
+3. Use the [surface map](surfaces.md#the-capability-map) to find the route and
    tool for any dashboard page.
 
 ## Turning collection off

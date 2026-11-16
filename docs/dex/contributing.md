@@ -15,7 +15,7 @@ page in the same change. This page says where things go and what the rules are.
 - **Map rows.** Add a row for every new REST route and MCP tool to
   [the capability map](surfaces.md#the-capability-map), under the heading
   that fits, and keep the row in step when a route or tool is renamed or
-  removed. No automated check does this for you today, so do it by hand.
+  removed. No automated check does this for you, so do it by hand.
 - **Collectors.** If a new collector or plugin feeds the area, add a section to
   [collectors and plugins](collectors-and-plugins.md) and link it from your page.
 - **Detail stays in the references.** Link to
@@ -80,9 +80,18 @@ python3 -I scripts/ci/check-personal-data.py --strict-baseline --ratchet
 python3 -I tests/test_gateway_peer_restart_advice_lint.py
 python3 -I tests/test_legacy_quarantine_plugin_removed_lexical.py
 python3 tests/test_issue_docs.py
+python3 scripts/assemble-changelog.py --check
 ```
+
+The two lexical tests scan every Markdown page under `docs/`, so they cover this
+guide as well.
 
 The personal-data check reads committed content, so run it after you commit.
 If your change touches DEX code, also run
 `python3 -I scripts/ci/check-docs-drift.py --touch <base> HEAD`, which lists the
-documentation the change must update.
+documentation the change must update. Its `dex` rule names
+`docs/user-manual/dex.md`, `docs/dex-signal-catalog.md` and
+`docs/user-manual/rest-api.md`, not `docs/dex/`, so a change that updates only
+this guide does not satisfy it. Update one of those pages as well, or put a
+`doc-coupling-exempt: dex — <why the docs are still accurate>` line in the pull
+request body.

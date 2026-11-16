@@ -49,8 +49,9 @@ Windows, Linux and macOS, and is switched off per agent with `--dex-disable`
 what the switch does and does not stop, are in
 [collectors and plugins](collectors-and-plugins.md#the-dex-observer).
 
-"Get live info" does not read stored signals. It dispatches the `os_info`
-plugin (`uptime`) or the `processes` plugin (`list_hashed`) to the device; see
+On the REST route, "Get live info" does not read stored signals. It dispatches
+the `os_info` plugin (`uptime`) or the `processes` plugin (`list_hashed`) to the
+device; see
 [collectors and plugins](collectors-and-plugins.md#plugins-a-dex-drill-dispatches).
 
 ## Using it in the dashboard
@@ -78,9 +79,12 @@ reason, symbolic name, component, metric, platform, exact time and event id.
 
 The same history is available from the device page's DEX tab.
 
-**Get live info.** On a device page, **Get live info** asks the device for its
-uptime or its running processes. Viewing a device page never dispatches
-anything on its own; the read happens only when you click. The REST route supports the two kinds named below, uptime and processes.
+**Get live info.** On a device page, **Get live info** asks the device for live
+readings. Viewing a device page never dispatches anything on its own; the read
+happens only when you click. The REST route supports two kinds, uptime and
+running processes. The device page offers more, each with its own
+`device.live.<kind>` audit verb; see
+[device management](../user-manual/device-management.md#get-live-info).
 
 ## REST
 
@@ -105,9 +109,12 @@ anything on its own; the read happens only when you click. The REST route suppor
   a `404`.
 - `POST /api/v1/dex/devices/{id}/live` takes `kind=uptime` or `kind=processes`,
   dispatches a read-only instruction to the device and waits up to about 20
-  seconds for the answer. It answers `429` when too many live queries are
-  already running, and `502`, `503` or `504` when the device cannot answer in
-  time. A device that is offline gets a `503`.
+  seconds for the answer. It answers `429` when more live queries are already
+  running than the server allows at once. It answers `502` when the instruction
+  failed on the device, the device reported an error or its output was over
+  4 MiB. It answers `503` when the device is offline or the audit row cannot be
+  stored, and in the second case nothing is sent. It answers `504` when the
+  device did not answer in time; that does not cancel the instruction.
 
 ## MCP
 
@@ -122,7 +129,9 @@ anything on its own; the read happens only when you click. The REST route suppor
 | `get_dex_device_history` | One device's signal history. |
 | `get_dex_observation` | One observation in detail. |
 
-There is no MCP tool for live info. Arguments match the REST parameters above.
+There is no MCP tool for live info. Arguments match the REST parameters above,
+except that the per-device tools take the device as `agent_id` where the REST
+routes carry it in the path as `{id}`.
 
 ## Permissions and audit
 
@@ -146,8 +155,10 @@ See [surfaces](surfaces.md#the-rest-api).
 ## Limits and privacy
 
 - **Device history is behavioural data.** A device's signal history shows which
-  applications a person runs. That is why every device-level read is permission
-  gated and audit logged.
+  applications a person runs. That is why every device-level read on REST and
+  MCP is permission gated and audit logged, and why REST refuses to answer when
+  the audit row cannot be stored. The dashboard writes the same rows but still
+  renders a view when a row cannot be stored.
 - **Data minimisation at the edge.** Extractors drop user content on the
   device before anything is sent: queried DNS names, print document names and
   owners, profile user names and image paths. What is never sent cannot leak.
@@ -159,9 +170,11 @@ See [surfaces](surfaces.md#the-rest-api).
   invisible direction or zero-width characters are printed with a visible
   marker, so two names that differ only by an invisible character never look
   the same.
-- Signals need the Guardian event store to be healthy. If the projection is
-  reset, it resumes forward only. See
-  [recovery](../user-manual/dex.md#recovery--empty-or-stale-dex-projection).
+- Signals need the Guardian event store to be healthy. The signal table is built
+  from that store and only moves forward: if it is reset, history from before
+  the reset is not rebuilt. An observation that cannot be added to it is counted
+  on `yuzu_server_guardian_proj_failures_total`, and a rising count means DEX is
+  under-counting.
 
 ## Platform coverage
 

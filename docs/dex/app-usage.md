@@ -12,21 +12,23 @@ interactive-use or foreground time.
 
 For each executable on a device the projection holds:
 
-- the first and last time it was seen, within the retention window of the
-  device's Echo store (31 days by default);
+- the first and last time it was seen, within the window Echo's usage tier keeps
+  on the device (31 days; Echo has no setting to change it);
 - the number of runs and the total run seconds over the trailing 30 days.
 
-An executable is named by its lowercase file name. There is never a full path,
-process id, command line or user name.
+An executable is named by its lowercase file name. These reads never return a
+full path, process id, command line or user name.
 
 ## Why it is useful
 
-- **Reclaim licences and attack surface.** Comparing what is installed with what
-  ran shows software nobody uses.
+- **Check one device against what is installed.** Comparing a device's installed
+  software with what ran there shows software nobody uses on that machine. The
+  read is per device and keyed by executable name, so it is not a fleet-wide
+  count.
 - **Support questions.** "Has this application run on this laptop recently, and
   when last?" gets a direct answer.
-- **A usage picture without surveillance.** The data is machine-scope run
-  history. It never says who used something.
+- **What the data holds.** It is machine-scope run history. The projection that
+  is served names executables and counts runs, and does not name users.
 
 ## What feeds it and how to enable it
 
@@ -56,8 +58,12 @@ does not mean it never ran or is not installed.
 
 `GET /api/v1/forensics/agents/{id}/app-usage` returns `{agent_id, apps[],
 collected_at}`, where each app has `exe_key`, `first_seen`, `last_seen`,
-`run_count_30d` and `total_seconds_30d`. A device that reported no rows returns
-`200` with an empty list. A degraded store returns `503`, never an empty `200`.
+`run_count_30d` and `total_seconds_30d`. `collected_at` is the collection time
+the device reported, and the answer is the last stored report at whatever age it
+is. An empty list with `collected_at` 0 means no report from the device has been
+stored; an empty list with a real `collected_at` means it reported and nothing
+had run inside its retained window. A degraded store returns `503`, never an
+empty `200`.
 
 ## MCP
 
@@ -89,13 +95,21 @@ owner role does not hold `Forensics:Read`.
 
 ## Limits and privacy
 
-- This is behavioural data about what people run. That is why access is limited
-  to the Forensics permission and every read is audited.
-- No process id, command line or user name is collected. Users appear only as
-  a count in the plugin's `summary`.
+- This is behavioural data about what people run. That is why access to these
+  reads is limited to the Forensics permission and every read is audited.
+- The app-usage reads never return a process id, command line or user name.
+  Users appear only as a count in the plugin's `summary`. The data they come
+  from is wider, on the device. Echo's process source sees process ids and the
+  owning user, and on Linux its collector also reads each command line; Windows
+  and macOS capture none. The usage tables that hold process ids and user names
+  are blocked from `echo.sql`. The process tiers and the process baseline stay
+  readable through `echo.sql` with `Infrastructure:Read`, which is not the
+  Forensics permission. They hold process names and the owning user (the
+  baseline also holds process ids) but no command line.
 - It is wall-clock run time of the process, not interactive use.
 - History starts when the usage fold started. There is no "since install" figure.
-- The panel is built from the daily report, so figures are up to a day old.
+- The panel is built from the device's last stored report, whatever its age, so
+  it can be older than a day if the device has not reported since.
 
 ## Platform coverage
 

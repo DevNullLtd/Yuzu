@@ -24,9 +24,11 @@ or enforce anything.
 - **A number a leader can quote.** The headline is a measured rate, such as
   the share of devices with no application crash in the window. It is not a
   made-up score.
-- **Honest about what it cannot see.** A device that is offline or silent is
-  unknown, not healthy. If nothing is reporting, the tile shows a dash rather
-  than a reassuring figure.
+- **Honest about what it can see.** An offline device is left out of the rates.
+  A connected device whose observer is switched off or not armed is counted in
+  them, as crash-free, because it cannot report a crash; the Apps tab shows how
+  many connected devices are armed, not armed or not reporting. If no Windows
+  agent is connected, the tile shows a dash rather than a reassuring figure.
 - **Fair across operating systems.** Each operating system carries the list of
   signals it actually collects, so a platform with narrower collection reads as
   less observed, never as healthier.
@@ -50,28 +52,34 @@ Open **DEX** in the sidebar. The Overview opens first.
 
 1. Pick a window (`24h`, `7d`, `30d` or `All`).
 2. Read the four headline tiles:
-   - **Crash-free devices** is the share of reporting Windows devices with no
+   - **Crash-free devices** is the share of connected Windows devices with no
      application crash in the window.
    - **Crashes per 1,000 device-days** normalises crash frequency by fleet size
      and window length.
    - **Devices impacted** is the number of distinct devices with a crash in
      the window.
-   - **Agents reporting** is the count of agents reporting now. It stands in
-     for "telemetry coverage", because a coverage percentage would need a fleet
-     size the server does not know.
+   - **Agents reporting** is the count of Windows agents connected now,
+     whether or not their observer is armed. It stands in for "telemetry
+     coverage", because a coverage percentage would need a fleet size the
+     server does not know.
 3. Scan the explore cards, the crashes-per-day chart, the top crashing
    applications beside the most affected devices, and the by-operating-system
    summary.
 4. Click a card, an application or a device to go deeper.
 
-The rates are computed over currently reporting Windows agents only, the
-platform with the most complete collector. Offline agents are left out of the
-denominator rather than counted as healthy.
+The rates are computed over the Windows agents connected now, the platform with
+the most complete collector. That includes a device whose observer is switched
+off (`--dex-disable`) or not armed: it cannot report a crash, so it counts as
+crash-free. Offline agents are left out of the denominator rather than counted
+as healthy. To see how many connected devices are not feeding crash data, read
+the armed, not armed and not reporting counts on the Apps tab. The
+`yuzu_fleet_agents_dex_observer_disarmed` gauge counts the not-armed ones only;
+a device started with `--dex-disable` is not in it.
 
 **Health score.** Open the **Health score** tab. The score is 100 minus
 weighted deductions, and the page lists each family's deduction and the
 weighting preset in force: Default, Stability, Productivity or Security.
-With no reporting agents the score is suppressed, never shown as 100.
+With no connected Windows agent the score is suppressed, never shown as 100.
 
 **Trends.** Open the **Trends** tab for cross-operating-system comparison
 cards (each with its live signal scope), per-family small-multiple sparklines
@@ -109,8 +117,8 @@ token is refused on all three reads. See
 
 ## Limits and privacy
 
-- The headline rates cover Windows agents that are reporting now. When no
-  agent is reporting, the rate tiles show a dash.
+- The headline rates cover the Windows agents connected now, armed or not (see
+  above). When no Windows agent is connected, the rate tiles show a dash.
 - Health score and Trends are secondary to the measured rates. Read the
   decomposition before acting on a single number.
 - Nothing here is mock data. Every figure is an aggregation or an explicit "no

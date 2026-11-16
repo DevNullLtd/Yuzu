@@ -32,11 +32,20 @@ It does **not** stop the Echo sources. Echo is a separate subsystem with its own
 per-source settings, and the Echo performance sampler, the per-application
 sampler, the per-connection network sampler and the usage fold keep running
 unless you switch each off. It also does not stop the daily sync of
-per-application performance and app usage to the server. To stop all DEX data
-leaving a device, set `--dex-disable` and switch the Echo sources off.
+per-application performance and app usage to the server. `--inventory-disable`
+(environment `YUZU_AGENT_INVENTORY_DISABLE`) does that, and it stops the whole
+daily sync, so the agent collects and sends none of its daily sources. To stop
+DEX data leaving a device, set both flags. To stop collecting it on the device
+as well, switch the Echo sources off.
+
+Switching collection off does not recall what was already captured. The
+per-application performance sync covers the last two completed days, so rows
+captured before the switch can still arrive in the next syncs. Nothing already
+on the server is deleted by any of these switches: it expires by the windows in
+[what is kept and for how long](#what-is-kept-and-for-how-long).
 
 The agent's own `--help` text for the flag mentions only the crash recorder. The
-guard sites in the agent show the wider scope given above.
+checks for the flag in the agent's code show the wider scope given above.
 
 ## The DEX observer
 
@@ -46,7 +55,7 @@ stability, device history and alerts. See [signals](signals.md).
 **Default state.** On, on Windows, Linux and macOS.
 
 **Enable and disable.** On by default. Switch off with `--dex-disable`. There is
-no per-category toggle and no server-side switch today.
+no per-category toggle and no server-side switch.
 
 **How it works.** The observer reads operating-system event sources and turns
 each event into a uniform observation (type, subject, reason, component, metric,
@@ -84,7 +93,9 @@ nothing is left out of that metric, not counted as zero.
 
 | Tags | Windows | Linux | macOS |
 |---|---|---|---|
-| Performance: CPU busy, memory commit, disk latency | Yes | Yes | No |
+| Performance: CPU busy | Yes | Yes | No |
+| Performance: memory commit | Yes | Yes, but omitted where `vm.overcommit_memory` is `1` | No |
+| Performance: disk latency | Yes | No | No |
 | Network: round-trip time | No | Yes | No |
 | Network: interval retransmit rate | Yes | Yes | No |
 | Network: device throughput | Yes | Yes | Yes |
@@ -112,7 +123,8 @@ source. The `perf` and `procperf` samplers share one interval,
 to `true` or `false` on a device or across the fleet. The action is definition
 `crossplatform.echo.configure`, needs `Infrastructure:Write`, and is gated to an
 administrator or an approval. Disabling a source stops new captures at once;
-existing rows age out on their own schedule. See
+rows already on the device age out on Echo's own tier windows, and the server's
+copies follow [what is kept](#what-is-kept-and-for-how-long). See
 [Echo configuration](../user-manual/echo.md#configuration) for every setting and
 its range.
 
@@ -125,9 +137,14 @@ its own audit verb (see [performance](performance.md) and
 through `echo.sql`; they are reachable only through the Forensics-gated
 `app_usage` reads.
 
-**Privacy.** Per-application data records process names only, never command
-lines, and redaction patterns apply to the name. Per-connection data stores only
-a coarse destination class.
+**Privacy.** On the device, per-application data records process names only,
+never command lines, and the per-connection rows are joined to the name of the
+owning process. Redaction patterns apply to the per-application names, not to
+the process source or to that owning-process name. A connection's destination is
+stored only as a coarse class. What reaches the server is described in
+[app performance](app-performance.md#what-feeds-it-and-how-to-enable-it) and
+[app usage](app-usage.md#what-feeds-it-and-how-to-enable-it): per-device,
+per-application figures keyed by application or executable name.
 
 Reference: [Echo user manual](../user-manual/echo.md) and the
 [plugin README](../../agents/plugins/echo/README.md).
@@ -144,15 +161,13 @@ the projection to the server.
 
 **Default state and switch.** The plugin is a read-only collector. It reports a
 typed reason, not an empty result, when Echo's usage source is off. Switch the
-data off with Echo's `usage_enabled`.
+data off with Echo's `usage_enabled`. The server keeps a device's last report
+until the next one replaces it or the device is decommissioned, so switching the
+source off does not remove what the server already holds.
 
-**Actions.**
-
-| Action | Definition | Answers |
-|---|---|---|
-| `summary` | `crossplatform.app_usage.summary` | Ranked totals per executable, with a health row |
-| `last_used` | `crossplatform.app_usage.last_used` | First and last seen and 30-day runs per executable |
-| `foreground` | `crossplatform.app_usage.foreground` | Always "not captured" |
+**Actions.** `summary`, `last_used` and `foreground`, with their definition ids
+and what each answers, are listed on
+[app usage](app-usage.md#using-the-plugin-directly).
 
 **Permission.** `Forensics:Read`, with an approval gate of administrator or
 approval.
@@ -163,8 +178,14 @@ Reference: [plugin README](../../agents/plugins/app_usage/README.md).
 
 ## Plugins a DEX drill dispatches
 
-"Get live info" on a device sends a read-only instruction through the normal
-dispatch path and waits for the answer. Nothing is stored by DEX.
+On the REST route, "Get live info" sends a read-only instruction through the
+normal dispatch path and waits for the answer. The route supports the two kinds
+below; the device page offers more, described in
+[device management](../user-manual/device-management.md#get-live-info). DEX
+keeps no copy of its own, but the device's reply is held in the response store
+like any instruction result, for `response_retention_days` (90 days by default).
+The device performance and Top applications panels dispatch an Echo query the
+same way, so their replies are held there too.
 
 | Kind | Plugin and action | Permission | Platforms |
 |---|---|---|---|
@@ -177,6 +198,20 @@ device to use the DEX live route; see [signals](signals.md).
 Plugin READMEs: [os_info](../../agents/plugins/os_info/README.md) and
 [processes](../../agents/plugins/processes/README.md). Other plugins, including
 `power_health`, do not feed a DEX view.
+
+## What is kept and for how long
+
+This table covers the server. On the device, Echo prunes each of its tiers on
+its own window and caps the whole database; see the
+[maintenance cycle](../user-manual/echo.md#maintenance-cycle).
+
+| Data | Kept on the server | Removed when the device is decommissioned | Switch off |
+|---|---|---|---|
+| Signal observations | 30 days by default, set by `guardian_event_retention_days` | No; they expire by that window | `--dex-disable` |
+| Per-device application performance | 31 days | Yes | Echo `procperf_enabled`; `--inventory-disable` stops the sync |
+| Fleet application trend, with no per-device rows | 180 days | Nothing to remove: it holds no device identity | As the row above |
+| Per-device app usage | The last report, until the next one replaces it | Yes | Echo `usage_enabled`; `--inventory-disable` stops the sync |
+| Replies to on-demand reads (live info, device performance, Top applications) | `response_retention_days`, 90 days by default | No; they expire by that window | Not applicable: a read runs only when someone asks |
 
 ## Related pages
 

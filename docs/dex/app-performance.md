@@ -18,9 +18,12 @@ history. Choosing an application opens its trend:
   exposed devices, failure rate and the rate against the previous version;
 - a **version-devices drill** that lists the devices behind one version row;
 - the same trend scoped to one **management group** or one **device model**
-  (a device-tag value);
-- a **before and after comparison** for an upgrade, for scripts and agentic
-  workers.
+  (a device-tag value), which reads the 31-day per-device store rather than the
+  180-day fleet trend;
+- a **before and after comparison** for an upgrade, for scripts, agentic workers
+  and the Verify stage of `/auto`
+  ([Verify](../user-manual/preflight.md#verify--before--after-performance)),
+  which also shows a per-machine table audited as `dex.app_perf.compare.drill`.
 
 The Performance tab is the live fleet-now view. App Performance is the retained
 history. They are siblings, not duplicates.
@@ -44,7 +47,8 @@ device, which records the heaviest processes by name only, never by command
 line. Each day the agent rolls the on-device hourly data up into one summary
 per application version per day and sends it to the server over the daily sync.
 The server keeps two retained stores: a fleet trend kept for 180 days and
-per-device daily summaries kept for 31 days.
+per-device daily summaries kept for 31 days. Only the fleet trend reaches back
+180 days; the group and tag trends and the comparison read the 31-day store.
 
 - It is on by default. Switch it off per device with Echo's `procperf_enabled`
   setting, which is separate from `--dex-disable`.
@@ -87,7 +91,9 @@ behind its own click:
   per version.
 - **Top applications** runs a live, read-only Echo query on the device for the
   last day of per-application data, process names only. It needs the device
-  online, `GuaranteedState:Read` and `Execution:Execute`.
+  online, `GuaranteedState:Read` and `Execution:Execute`. The reply is held in
+  the response store like any instruction result; see
+  [what is kept](collectors-and-plugins.md#what-is-kept-and-for-how-long).
 
 ## REST
 
@@ -100,17 +106,21 @@ behind its own click:
   version. Takes `app` and `version`, both required. An empty `version` means
   the unknown-version bucket. A `truncated` flag means only the highest-CPU
   devices were returned.
-- `GET /api/v1/dex/perf/group` returns the trend for one management group. Takes
-  `group_id`, `app` and optional `version`.
-- `GET /api/v1/dex/perf/tag` returns the trend for one device-tag value. Takes
-  `key` (default `model`), `value`, `app` and optional `version`. Discover valid
-  values with `GET /api/v1/dex/perf/cohorts`.
+- `GET /api/v1/dex/perf/group` returns the trend for one management group, over
+  the 31-day store. Takes `group_id`, `app` and optional `version`.
+- `GET /api/v1/dex/perf/tag` returns the trend for one device-tag value, over the
+  31-day store. Takes `key` (default `model`), `value`, `app` and optional
+  `version`. Discover valid values with `GET /api/v1/dex/perf/cohorts`.
 - `GET /api/v1/dex/devices/{id}/app-perf` returns one device's retained
   per-application history. Takes optional `app`.
 - `GET /api/v1/dex/perf/compare` compares two versions. Takes `group`, `app`,
   `baseline` and `candidate` (the two must differ) and `window`, in days on each
-  side (default 7). The answer is evidence only: the measured shift and how many
-  machines went up, stayed flat or went down, with no verdict.
+  side (default 7). A `window` outside 1 to 31 is clamped, not refused. The
+  answer is evidence only: the measured shift and how many machines went up,
+  stayed flat or went down, with no verdict. It carries two flags to read first:
+  `insufficient` means no machine ran both versions in the window, so there is
+  nothing to compare, and `truncated` means the group was larger than the read
+  allows, so the counts are unreliable.
 
 ## MCP
 
@@ -124,7 +134,9 @@ behind its own click:
 | `get_dex_device_app_perf` | One device's retained history. |
 | `compare_app_perf_versions` | Before and after comparison of two versions. |
 
-The per-device live Top applications panel is dashboard only.
+The per-device live Top applications panel is dashboard only. The per-device
+tools take the device as `agent_id`, where the REST routes carry it in the path
+as `{id}`.
 
 ## Permissions and audit
 
@@ -135,7 +147,7 @@ The per-device live Top applications panel is dashboard only.
 | Version-devices drill | `GuaranteedState:Read` through the fleet-read check, confined to the devices the caller can see | `dex.app_perf.devices.view`. REST refuses to answer if the row cannot be stored. |
 | One device's retained history | `GuaranteedState:Read`, scoped to the device | `dex.device.app_perf.view` on REST, MCP and the dashboard panel |
 | Live Top applications panel | `GuaranteedState:Read` and `Execution:Execute`, both scoped to the device | `dex.device.procperf.query`, kept separate because per-application data shows what people run |
-| Version comparison | `GuaranteedState:Read` | `dex.app_perf.compare` |
+| Version comparison | `GuaranteedState:Read` | `dex.app_perf.compare` on REST and the `/auto` Verify stage. On MCP a success is recorded as the generic `mcp.compare_app_perf_versions`, and `dex.app_perf.compare` only for a refusal. The Verify stage's per-machine table is `dex.app_perf.compare.drill`. |
 
 A service-scoped token is refused on the picker, the fleet, group and tag
 trends and the version comparison. The version-devices drill answers with only

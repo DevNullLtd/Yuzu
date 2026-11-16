@@ -45,7 +45,9 @@ not part of DEX. It is described in
   by Echo's `netqual_enabled` setting. Only a coarse destination class
   (loopback, private or public) is stored; remote addresses are dropped at the
   edge. Windows needs an elevated agent for it and macOS needs a root agent;
-  without that, the source records nothing.
+  without that, the source records nothing. To check a device, read
+  `netqual_capture_method` in the output of Echo's `status` action: `none`
+  means the agent is recording nothing.
 
 See [collectors and plugins](collectors-and-plugins.md#the-echo-plugin).
 
@@ -69,7 +71,11 @@ poor link, not which destination or application is affected.
   populations.
 - `GET /api/v1/network/devices` returns the worst-devices list. Takes `metric`
   (`rtt`, `retrans` or `throughput`), `filter=not_reporting`, `key` and
-  `cohort_value` for a tag cohort, and `limit`.
+  `cohort_value` for a tag cohort, `limit` and `cooc`. `cooc` (`device`, `app`,
+  `network_only` or `degraded`) filters to a co-occurrence band. The bands list
+  only devices flagged network-degraded, and agents do not send that flag, so
+  they return no rows; see
+  [the user manual](../user-manual/network.md#degraded-classification--co-occurrence--a-later-slice).
 
 ## MCP
 

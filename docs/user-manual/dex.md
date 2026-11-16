@@ -857,12 +857,15 @@ exported to Prometheus — reach those via the REST endpoints on demand.
 ## Turning it off
 
 DEX collection is a **deploy-time agent setting**. Start the agent with
-**`--dex-disable`** (or `YUZU_AGENT_DEX_DISABLE=1`) and that endpoint arms no
-observer and sends no DEX telemetry of any kind. **Note:** `--dex-disable` turns
-off the DEX event observer, the Windows state poll, and the heartbeat perf and
-network-quality tags (the fleet rollup above), but the Echo performance
-sampler is a separate subsystem — disable it with `perf_enabled=false` (see
-[Echo configuration](echo.md#configuration)). There is no server-side runtime
+**`--dex-disable`** (or `YUZU_AGENT_DEX_DISABLE=1`) and that endpoint stops four
+things: it arms no DEX observer (so no Windows, Linux or macOS signal collector
+runs), and it sends no observer health tags, heartbeat performance tags or
+heartbeat network-quality tags (the fleet rollup above). **Note:** Echo is a
+separate subsystem and keeps running, and so does the daily sync of
+per-application figures. The Echo performance sampler is disabled with
+`perf_enabled=false` (see [Echo configuration](echo.md#configuration)); the
+[DEX guide](../dex/collectors-and-plugins.md#what---dex-disable-stops) lists
+what each switch stops. There is no server-side runtime
 toggle today; per-category collection toggles and an individual-view kill switch
 are named roadmap items (see the enterprise-readiness plan).
 
