@@ -643,7 +643,8 @@ jobs:
           bash tests/shell/test_trusted_fork_purge.sh            # trusted-fork cache-scope purge job (#4471)
           bash tests/shell/test_check_elf_floor.sh               # Linux ELF floor gate, ADR-2003 S0 (builds fixtures with gcc)
           bash tests/shell/test_integration_port_retry.sh        # integration-test.sh lost-port-race classifier + process-ownership guard (#7538)
-          bash tests/shell/test_pr2_gates.sh CH-18 CH-20 CH-21 CH-22 CH-24  # local coverage gate: fast subset of the mock chaos harness, ~25 s (#5803; the full harness is #6116)
+          python3 tests/test_extract_run_block.py
+          bash tests/shell/test_pr2_gates.sh CH-6 CH-18 CH-20 CH-21 CH-22 CH-24 CH-25 CH-26  # coverage/perf verdicts: fast mock harness subset (#5803; full harness is #6116)
 
       # Prometheus HELP-text ASCII gate (#2128). Source-only, no build deps,
       # so it belongs on the PR fast path beside the shell gate above rather
@@ -1988,6 +1989,53 @@ jobs:
           if [[ "${rc[nonpg]:-1}" -ne 0 || "${rc[pg]:-1}" -ne 0 ]]; then
             exit 1
           fi
+
+      # Run every registered migration pilot on the full Linux debug leg.
+      # Keep the native reports and source identity even when a contract fails;
+      # only the collector's portable bundle is uploaded (raw inputs stay private).
+      - name: Contract migration evidence
+        id: contract_evidence
+        if: matrix.compiler == 'gcc-15' && matrix.build_type == 'debug'
+        env:
+          YUZU_CONTRACT_OUTPUT: ${{ runner.temp }}/contracts-${{ github.run_id }}-${{ github.run_attempt }}
+          CONTRACT_BUILD: build-linux-contracts-gcc15-debug
+          CC: ccache gcc-15
+          CXX: ccache g++-15
+          YUZU_TEST_SLOT_DIR: /tmp/yuzu-bigtam-test-slots
+          YUZU_TEST_SLOT_NAME: yuzu-bigtam-heavy
+          YUZU_TEST_SLOT_TIMEOUT_MIN: "30"
+          # The contract build dir is separate from the standard one, so a runner
+          # that has not built it yet compiles yuzu_server_tests cold; that took
+          # over 30 min at -j2 (run 43722258525). The job's 90 min limit still applies.
+          YUZU_CONTRACT_BUILD_TIMEOUT_S: "3600"
+        run: |
+          # Keep opt-in options out of the branch-shared standard build (#4851).
+          # Gateway registration is asserted, not required by a project option
+          # (#4841; pinned by tests/test_gateway_test_summary.py).
+          reconfig=""
+          [[ -d "$CONTRACT_BUILD/meson-info" ]] && reconfig="--reconfigure"
+          meson setup $reconfig "$CONTRACT_BUILD" \
+            --native-file meson/native/linux-gcc15.ini --buildtype=debug \
+            -Dcmake_prefix_path="$GITHUB_WORKSPACE/vcpkg_installed/x64-linux" \
+            -Dpkg_config_path="$GITHUB_WORKSPACE/vcpkg_installed/x64-linux/lib/pkgconfig" \
+            -Dbuild_tests=true -Dbuild_contract_tests=true
+          python3 scripts/ci/assert-gateway-tests.py "$CONTRACT_BUILD"
+          rc=0
+          bash scripts/ci/with-test-slot.sh 3 -- \
+            python3 scripts/test/contract-evidence.py run \
+              --build-dir "$CONTRACT_BUILD" \
+              --output "$YUZU_CONTRACT_OUTPUT" --jobs 2 || rc=$?
+          python3 scripts/test/contract-evidence.py bundle "$YUZU_CONTRACT_OUTPUT" "$YUZU_CONTRACT_OUTPUT.zip"
+          exit "$rc"
+
+      - name: Upload contract migration evidence
+        if: ${{ (success() || failure()) && steps.contract_evidence.outcome != 'skipped' && steps.contract_evidence.outcome != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: contract-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/contracts-${{ github.run_id }}-${{ github.run_attempt }}.zip
+          if-no-files-found: error
+          retention-days: 30
 
       # Sizes the tmpfs PGDATA cap (#4884): host RAM and the
       # persistent cluster's on-disk size after a full pg run, printed to the

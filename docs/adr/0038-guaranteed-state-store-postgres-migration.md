@@ -3,6 +3,7 @@
 - **Status:** Accepted — shipped PR #2663, merged 2026-08-08; `guaranteed_state_store.cpp` is
   PG-native (`PgPool`/`pg_exec`), zero live `sqlite3_` calls (comments only), re-verified
   2026-09-07.
+- **Owner:** Nathan Dornbrook (platform)
 - **Date:** 2026-07-31
 - **Deciders:** pg workstream, security-guardian + docs-writer review (Guardian routing per CLAUDE.md)
 - **Parents:** ADR-0006/0007/0008 (+Correction), ADR-0009, ADR-0012; conventions from the

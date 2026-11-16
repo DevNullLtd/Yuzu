@@ -140,12 +140,13 @@ refusal, but the fragment replaces its response with an HTTP 200 note (`data-den
 admission change with a real mechanism behind it, not a widening of `kServiceScopeGlobalSafe`.
 The owner disjunct (`dispatched_by == username`) is suppressed for service-scoped sessions on this
 fragment, because a service-scoped token's session username is the account that minted it and the
-disjunct would list the minter's executions outside the service scope. Known limit (#5557): on
-`GET /api/v1/executions`, `/{id}`, `/children`, MCP `get_execution_status`, MCP `list_executions`,
-legacy `/api/executions*`, the detail fragment, the SSE channel `/sse/executions/{id}` and
-`GET /api/v1/events`, a service-scoped token is still also shown
-executions its minter dispatched, outside the service scope (counters projected, but id, definition,
-status and timing visible); closing that needs dispatch-time token attribution. Separately,
+disjunct would list the minter's executions outside the service scope. Update (#5557): the same
+disjunct was live on `GET /api/v1/executions`, `/{id}`, `/children`, MCP `get_execution_status`,
+MCP `list_executions`, legacy `/api/executions*`, the detail fragment, the SSE channel
+`/sse/executions/{id}` and `GET /api/v1/events`; #5557 removed it on all of them by taking the
+ownership key from `execution_owner_key(session)`, which is empty for a service-scoped session, so a
+service-scoped token sees an execution only once an agent in its service scope has a status row for
+it (no dispatch-time token attribution). Separately,
 `require_fleet_read` applies the `ITServiceOwner` ceiling on its service axis (added by
 PR #5546, not by the fragment migration; see `docs/auth-architecture.md`, "`require_fleet_read`
 now applies the `ITServiceOwner` authority ceiling"), so the fragment inherits it; `kServiceScopeGlobalSafe`
@@ -182,6 +183,6 @@ This file is a point-in-time review dated 2026-08-18, and its history above is l
 |---|---|---|---|---|
 | 1 | `GET /mcp/v1/` | `mcp_server.cpp` (`build_get_handler`) | Denied for a service-scoped session via the file-scope `is_service_scoped_caller` / `write_service_scoped_denial` pair: `403`, JSON-RPC `-32003`, no `permission` field, audit `mcp.session.reject` `reason=service_scoped`, decided after the kill switches, `Origin`, protocol version and authentication and before the session header, `Accept` and any `StreamBudget` lease | handler-read |
 
-Asymmetry with the REST sibling, recorded on purpose. `GET /api/v1/events` is not denied to a service-scoped token: it is gated by `require_fleet_read` (`Execution:Read`), which serves a service-scoped token through its management-group and service-scope confinement (with RBAC enforcement in effect and the `ITServiceOwner` ceiling holding the pair), and it requires an `execution_id`; the known limit already recorded above for that route (#5557, the minter's own executions shown outside the service scope) applies to it. MCP `GET` is stricter than its REST sibling because it is a session-wide channel with no per-execution parameter and no per-frame confinement. A service-scoped integration that needs an event stream uses `GET /api/v1/events`. `POST /mcp/v1/` is unchanged (confined per tool by C8) and `DELETE` is not service-scope denied (it is governed by the session's principal and credential-class binding).
+Asymmetry with the REST sibling, recorded on purpose. `GET /api/v1/events` is not denied to a service-scoped token: it is gated by `require_fleet_read` (`Execution:Read`), which serves a service-scoped token through its management-group and service-scope confinement (with RBAC enforcement in effect and the `ITServiceOwner` ceiling holding the pair), and it requires an `execution_id`; the update already recorded above for that route (#5557: the minter's own executions are no longer shown outside the service scope) applies to it. MCP `GET` is stricter than its REST sibling because it is a session-wide channel with no per-execution parameter and no per-frame confinement. A service-scoped integration that needs an event stream uses `GET /api/v1/events`. `POST /mcp/v1/` is unchanged (confined per tool by C8) and `DELETE` is not service-scope denied (it is governed by the session's principal and credential-class binding).
 
 Pre-fix window: before this change a service-scoped token could open `GET /mcp/v1/` with a session id it held and receive that session's replayed frames. The window ran until the release carrying #4754; it was not measured whether any fleet issued service-scoped tokens that used the channel, and no production fleet exists to measure it on.
