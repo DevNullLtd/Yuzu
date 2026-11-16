@@ -562,7 +562,7 @@ TEST_CASE("HA WS-5: ids_missing_plugin merges the published plugin list for ids 
     }
 
     SECTION("a protective action is never withheld on inventory grounds") {
-        CHECK(r2.ids_missing_plugin("quarantine", "quarantine").empty());
+        CHECK(r2.ids_missing_plugin("firewall", "quarantine").empty());
     }
 
     SECTION("unconfigured (single replica): byte-identical to local-only") {

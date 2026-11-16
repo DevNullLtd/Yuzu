@@ -3221,7 +3221,7 @@ TEST_CASE("WS-5 plugin visibility: the directory confirms each agent on its own 
     CHECK(other.registry.ids_missing_plugin("echo", "sql") ==
           std::unordered_set<std::string>{kept});
     // A protective action is never withheld on inventory grounds, whatever the directory says.
-    CHECK(other.registry.ids_missing_plugin("quarantine", "quarantine").empty());
+    CHECK(other.registry.ids_missing_plugin("firewall", "quarantine").empty());
 }
 
 // `confirm_sessions` through the real store: ids that would break a naive array literal (quote,
