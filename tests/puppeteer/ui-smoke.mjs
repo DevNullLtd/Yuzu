@@ -3,12 +3,13 @@
 //   1. NAV CRAWL  every shell nav route answers 200 with the CSP header and no page errors,
 //                 and the discovered set matches EXPECTED (nav drift fails both ways).
 //   2. OVERFLOW   submit controls stay inside their form/dialog and the viewport (#5576).
-//   3. SCENARIOS  eight scenarios: five that each force their own precondition (#6076, add user,
+//   3. SCENARIOS  nine scenarios: five that each force their own precondition (#6076, add user,
 //                 #5840, #6074, #6749), with writes answered by a request stub so nothing is
 //                 written to the server; the DEX Apps tab (AP-3.2): a live keyboard half, then a
 //                 committed golden page served through a GET stub; a held Apps response superseded
-//                 by Overview (dex-pane-sync); and the DEX controls operated from the keyboard
-//                 (dex-keyboard).
+//                 by Overview (dex-pane-sync); the DEX controls operated from the keyboard
+//                 (dex-keyboard); and the Find software panel on /software (SAM-18): live
+//                 searches, then Load more through a GET stub.
 // One line per check; exit 1 when any check fails.
 //
 // `--selftest` needs no stack and no login: it proves the crawl, overflow and Apps-expander checks
@@ -660,6 +661,112 @@ async function scenarioEngineAudit(page) {
     (await banners()).length === 0 && w.pageErrors().length === 0, JSON.stringify(w.pageErrors()));
 }
 
+// SAM-18: the Find software panel on /software. The panel is form- and button-driven and the CSP
+// has no 'unsafe-eval', so only a run shows that a click executes. Two halves, both always run:
+//   live  an Applications search, Copy REST call (against a clipboard stub), the Java chip and back,
+//         all against the real server: each answer is a result or a real zero, never the "Inventory
+//         store unavailable" banner, so the production closures behind the fragment run on every /test
+//   stub  a first page with a Load more button and its continuation, served through GET stubs of the
+//         fragment: focus must land on the first new row's host link (data-act="fmore")
+// The stub markup carries the attributes the renderer pins in test_software_page_ui.cpp.
+const FIND = '/fragments/inventory/software/find';
+const FIND_DOWN = 'Inventory store unavailable';
+const findCell = (id, host) => '<tr><td><a class="inv-hostlink" href="/hardware/ci?id=' + id + '">' + host +
+  '</a></td><td>-</td><td>1.0</td><td>-</td><td>-</td><td>-</td><td>-</td><td>-</td></tr>';
+const findGroup = (n) => '<tr class="fs-vgrp"><td colspan="8"><span class="inv-mono">1.0</span> ' + n + ' installs on this page</td></tr>';
+const FIND_FIRST = '<div class="inv-panel"><table class="inv-tbl"><tbody>' + findGroup(1) + findCell('smoke-a1', 'smoke-host-1') +
+  '<tr class="inv-more"><td colspan="8"><button type="button" class="inv-btn pri" data-act="fmore" ' +
+  'hx-get="' + FIND + '?name=smoke-pkg&amp;kind=app&amp;cursor=smoke-c1&amp;shown=1" hx-target="closest tr" ' +
+  'hx-swap="outerHTML" hx-disabled-elt="this">Load 50 more rows</button></td></tr></tbody></table></div>';
+const FIND_MORE = findGroup(1) + findCell('smoke-a2', 'smoke-host-2') +
+  '<tr class="inv-more"><td colspan="8"><span class="inv-grey">All 2 matching rows are loaded.</span></td></tr>';
+
+// Runs `act` (a submit) and resolves with the first-page Find response of that kind it causes.
+async function findAnswer(page, kind, act) {
+  const [res] = await Promise.all([
+    at('Find response (kind=' + kind + ')', page.waitForResponse((r) => {
+      const u = new URL(r.url());
+      return u.pathname === FIND && u.searchParams.get('kind') === kind && !u.searchParams.has('cursor');
+    }, { timeout: WAIT_MS })),
+    act(),
+  ]);
+  await settled(page);
+  return res;
+}
+
+async function scenarioFindSoftware(page) {
+  const w = watch(page);
+  await trace(page);
+  await at('open /software', visit(page, '/software'));
+  // Wait for htmx to have bound the form; a submit before that is a plain page navigation.
+  await at('Find form bound by htmx', page.waitForFunction(() => {
+    const f = document.getElementById('fs-form');
+    return !!f && !!f['htmx-internal-data'];
+  }, { timeout: WAIT_MS }));
+  const results = () => page.$eval('#fs-results', (e) => e.textContent);
+
+  // live: a name no estate carries, so the answer is a real zero or whatever the stack holds.
+  await page.type('#fs-name', 'smoke-no-such-package');
+  const app = await findAnswer(page, 'app', () => page.click('#fs-form button[type="submit"]'));
+  const appText = await results();
+  const appRows = await page.$eval('#fs-results', (e) => !!e.querySelector('.fs-cards, table.inv-tbl'));
+  check('find live: an Applications search answers 200 with a result or a real zero, not the unavailable banner',
+    app.status() === 200 && (appRows || /Nothing found\./.test(appText)) && !appText.includes(FIND_DOWN),
+    JSON.stringify({ status: app.status(), appRows, text: appText.slice(0, 200) }));
+
+  await page.evaluate(() => {
+    window.__fsCopied = null;
+    Object.defineProperty(navigator, 'clipboard', { configurable: true,
+      value: { writeText: (t) => { window.__fsCopied = t; return Promise.resolve(); } } });
+  });
+  const want = await page.$eval('#fs-results [data-fs-copy]', (b) => location.origin + b.getAttribute('data-fs-copy'));
+  await page.click('#fs-results [data-fs-copy]');
+  const copied = await page.evaluate(() => window.__fsCopied);
+  check('find live: Copy REST call writes the origin plus the call line it shows', copied === want,
+    JSON.stringify({ copied, want }));
+
+  const java = await findAnswer(page, 'java', () => page.click('.inv-chip[data-fs-kind="java"]'));
+  const jv = await page.evaluate(() => ({
+    kind: document.getElementById('fs-kind').value,
+    java: document.querySelector('.inv-chip[data-fs-kind="java"]').getAttribute('aria-pressed'),
+    app: document.querySelector('.inv-chip[data-fs-kind="app"]').getAttribute('aria-pressed'),
+    text: document.getElementById('fs-results').textContent,
+  }));
+  check('find live: the Java chip moves the kind and the component search answers with its coverage note',
+    java.status() === 200 && jv.kind === 'java' && jv.java === 'true' && jv.app === 'false' &&
+    /Coverage\./.test(jv.text) && !jv.text.includes(FIND_DOWN), JSON.stringify({ ...jv, text: jv.text.slice(0, 200) }));
+  const back = await findAnswer(page, 'app', () => page.click('.inv-chip[data-fs-kind="app"]'));
+  check('find live: the Applications chip returns to the application model',
+    back.status() === 200 && (await page.$eval('#fs-kind', (n) => n.value)) === 'app' &&
+    !(await results()).includes(FIND_DOWN));
+
+  // stub: the first page offers Load more; focus must land on the first new row's host link.
+  const more = await stub(page, { path: FIND, search: 'cursor=smoke-c1', contentType: 'text/html', body: FIND_MORE });
+  const first = await stub(page, { path: FIND, search: 'name=smoke-pkg', contentType: 'text/html', body: FIND_FIRST });
+  await setValue(page, '#fs-name', 'smoke-pkg');
+  await findAnswer(page, 'app', () => page.click('#fs-form button[type="submit"]'));
+  // htmx binds swapped-in content in its settle step (20 ms after the swap); a click before that is a no-op.
+  await at('Load more bound by htmx', page.waitForFunction(() => {
+    const b = document.querySelector('#fs-results button[data-act="fmore"]');
+    return !!b && !!b['htmx-internal-data'];
+  }, { timeout: WAIT_MS }));
+  await page.click('#fs-results button[data-act="fmore"]');
+  await at('focus on the first new row\'s host link', page.waitForFunction(() => {
+    const a = document.activeElement;
+    return !!a && a.getAttribute('href') === '/hardware/ci?id=smoke-a2';
+  }, { timeout: WAIT_MS }));
+  const done = await page.$eval('#fs-results', (e) => ({ fmore: !!e.querySelector('[data-act="fmore"]'),
+    rows: e.querySelectorAll('a.inv-hostlink').length, text: e.textContent }));
+  check('find stub: Load more replaces its row with the next page and focus lands on the first new row',
+    first.calls.length === 1 && more.calls.length === 1 && !done.fmore && done.rows === 2 &&
+    done.text.includes('All 2 matching rows are loaded.'), JSON.stringify({ first: first.calls.length,
+      more: more.calls.length, done: { ...done, text: done.text.slice(-80) } }));
+
+  await quiesce(page);
+  check('find: no page error and no CSP violation through the live and stubbed legs',
+    w.errors().length === 0, JSON.stringify(w.errors()));
+}
+
 // ---- selftest ------------------------------------------------------------------------
 // A gate whose checks can pass vacuously is worse than none, so every crawl and overflow check
 // gets a positive control. A local fixture serves a fake shell (28 nav links, forms) with the
@@ -823,6 +930,7 @@ async function main() {
       ['engine-audit', scenarioEngineAudit],
       ['dex-pane-sync', scenarioDexPaneSync],
       ['dex-keyboard', scenarioDexKeyboard],
+      ['find-software', scenarioFindSoftware],
     ];
     for (const [name, fn] of scenarios) {
       const p = await browser.newPage();

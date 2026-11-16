@@ -20718,6 +20718,20 @@ private:
                 out.emplace(std::move(e.agent_id), std::move(e.hostname));
             return out;
         };
+        // agent_id -> OS string from the same 30-day roster, for the Find software panel's OS
+        // column. ponytail: a second roster read per page; fold it into hw_hostnames_fn's read if
+        // it shows.
+        auto hw_host_os_fn = [this]() -> std::unordered_map<std::string, std::string> {
+            std::unordered_map<std::string, std::string> out;
+            if (!offline_endpoint_store_)
+                return out;
+            auto roster = offline_endpoint_store_->query_stale_within(kHardwareRosterWindow)
+                              .value_or(OfflineRoster{});
+            for (auto& e : roster.rows)
+                if (!e.os.empty())
+                    out.emplace(std::move(e.agent_id), std::move(e.os));
+            return out;
+        };
         inventory_routes_ = std::make_unique<InventoryRoutes>();
         inventory_routes_->register_routes(
             *web_server_,
@@ -20786,7 +20800,50 @@ private:
                     return software_inventory_store_->source_last_seen_bulk("installed_software",
                                                                             ids);
                 },
-                .audit_fn = audit_fn});
+                .audit_fn = audit_fn,
+                // Find software panel: the REST lookups' own store reads (rest_api_v1.cpp
+                // lookup_totals_reads / resolve_range), so the panel and the REST answer agree.
+                .components_fn = [this](const SoftwareComponentQuery& q)
+                    -> std::optional<std::vector<SoftwareComponentRow>> {
+                    if (!software_inventory_store_)
+                        return std::nullopt;
+                    return software_inventory_store_->query_components(q);
+                },
+                .install_versions_fn = [this](const std::string& name,
+                                              const std::optional<std::vector<std::string>>& ids)
+                    -> std::optional<std::vector<std::string>> {
+                    if (!software_inventory_store_)
+                        return std::nullopt;
+                    return software_inventory_store_->installed_software_distinct_versions(name, ids);
+                },
+                .component_versions_fn = [this](const std::string& kind, const std::string& name,
+                                                const std::optional<std::vector<std::string>>& ids)
+                    -> std::optional<std::vector<std::string>> {
+                    if (!software_inventory_store_)
+                        return std::nullopt;
+                    return software_inventory_store_->component_versions(kind, name, ids);
+                },
+                .totals_reads = [this]() {
+                    software_list::TotalsReads io;
+                    if (!software_inventory_store_)
+                        return io; // unwired closures: the route reads it as a degrade
+                    auto* store = software_inventory_store_.get();
+                    io.catalog_meta = [store] { return store->catalog_rollup_meta(); };
+                    io.component_meta = [store] { return store->component_rollup_meta(); };
+                    io.title_totals = [store](std::string_view name) {
+                        return store->catalog_title_totals(name);
+                    };
+                    io.version_set_totals = [store](std::string_view name,
+                                                    const std::vector<std::string>& vs) {
+                        return store->installed_software_version_set_totals(name, vs);
+                    };
+                    io.component_totals = [store](std::string_view kind, std::string_view name,
+                                                  const std::optional<std::vector<std::string>>& vs) {
+                        return store->component_totals(kind, name, vs);
+                    };
+                    return io;
+                }(),
+                .host_os_fn = hw_host_os_fn});
 
         // CryptoRoutes — /crypto, /fragments/crypto/*, /api/v1/crypto/* (crypto-library
         // presence from the installed_software inventory, the Yuzu-issued certificate widgets

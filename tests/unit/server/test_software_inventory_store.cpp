@@ -4933,6 +4933,17 @@ TEST_CASE("v3: a full section replaces only its own facet and records its facet 
     CHECK(keyed[0][3] == expect_alpha.identity_key);
     CHECK(keyed[0][4] == expect_alpha.instance_key);
 
+    // The per-device read (the Installed software tab) carries the same two columns.
+    const auto dev = store.get_agent_software("agent-v3");
+    REQUIRE(dev.has_value());
+    REQUIRE(dev->size() == 3); // Alpha, Beta, libfoo ordered by (name, version)
+    CHECK((*dev)[0].name == "Alpha");
+    CHECK((*dev)[0].install_type == "installer");
+    CHECK((*dev)[0].install_location == "C:\\Apps\\Alpha");
+    CHECK((*dev)[1].name == "Beta"); // no collector location: empty, not a stale neighbour's
+    CHECK((*dev)[1].install_type == "installer");
+    CHECK((*dev)[1].install_location.empty());
+
     // Facet state: status, token, the recomputed section hash, a confirmation time.
     const auto fs = sql_rows(pool, "SELECT facet, status, token, section_hash, enabled::text, "
                                    "duration_ms, bytes_read, (last_confirmed_at > 0)::text, "

@@ -339,10 +339,11 @@ the gate drives a headless browser against the running dashboard: it crawls ever
 links to (200, the `Content-Security-Policy` header, no page error, `console.error` or HTTP status of 400 or more), cross-checks the
 discovered routes against `EXPECTED`, a hand-copied list of the nav in `app_shell.cpp`, in both
 directions, checks that submit controls stay inside their form or dialog at two viewport sizes,
-and runs eight scenarios (five that each force their own precondition, with writes answered by a
+and runs nine scenarios (five that each force their own precondition, with writes answered by a
 request stub in the browser so nothing reaches the server; the DEX Apps tab: a live keyboard half
 plus a committed golden page served through a GET stub; a held Apps response superseded by Overview;
-and the DEX controls operated from the keyboard). The gate first runs
+the DEX controls operated from the keyboard; and the Find software panel on `/software`: live
+searches plus Load more served through a GET stub). The gate first runs
 `ui-smoke.mjs --selftest`, which checks against a local fixture (no stack) that each crawl and
 layout check fails when it should, and that the Apps expander check fails on the committed golden when
 its `:has()` rules are removed; a selftest failure fails the gate.
