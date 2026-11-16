@@ -355,8 +355,11 @@ TEST_CASE("kill_switch_set_detail appends a quoted, bounded, control-stripped re
     CHECK(kill_switch_set_detail(plain, false, "incident INC-42") ==
           "enabled=false, reason=\"incident INC-42\"");
     // Protective marker first, then the reason.
-    CHECK(kill_switch_set_detail(KillSwitchScope{"firewall", "", ""}, false, "drill") ==
+    CHECK(kill_switch_set_detail(KillSwitchScope{"__guard__", "", ""}, false, "drill") ==
           "enabled=false, protective_exempt=true, reason=\"drill\"");
+    // A plugin-level firewall row is `partial` (it still gates state and rules); the reason follows.
+    CHECK(kill_switch_set_detail(KillSwitchScope{"firewall", "", ""}, false, "drill") ==
+          "enabled=false, protective_exempt=partial, reason=\"drill\"");
     // Quote and backslash cannot close the field; tab and other controls flatten to a space.
     CHECK(kill_switch_set_detail(plain, false, "a\"b\\c\td\x01" "e") ==
           "enabled=false, reason=\"a\\\"b\\\\c d e\"");
