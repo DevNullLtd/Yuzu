@@ -5465,8 +5465,9 @@ namespace {
 // window_base or read stamp ever carries the offset; it is reset straight after.
 std::atomic<std::int64_t> g_clock_offset{0};
 
-// Is this process's token elevated? The ETW cases SKIP when it is not, and FAIL when it is and
-// the session still did not open, so a broken session can never pass as "not elevated".
+// Is this process's token elevated? It feeds etw_skip_reason through require_etw_or_skip: a start
+// failure is a SKIP only for a named environment cause, so a broken session can never pass as
+// "not elevated".
 bool is_elevated() {
     HANDLE token = nullptr;
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
