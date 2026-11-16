@@ -350,8 +350,8 @@ std::string_view canonical_source_enabled(std::string_view stored_value) {
 // "true", so collection STOPS (fail closed). The bare `!= "false"` treated every
 // such value as enabled, so a source an operator paused for forensics whose
 // `_enabled` value was corrupted or tampered kept collecting — and disagreed
-// with the tri-state `status` reports. run_retention() shares the same canonical
-// gate so an "errored" source's rows are preserved, not pruned. Also the
+// with the tri-state `status` reports. Retention does NOT share this gate for an
+// "errored" source: see source_retention_exempt() (#1572). Also the
 // authoritative paused-guard for the Phase 15.An `echo.purge_source` action.
 //
 // `nullopt` = unreadable flag; source_enabled() fails closed (contract: echo_aggregator.hpp).
@@ -366,6 +366,29 @@ std::optional<bool> source_enabled_state(EchoDatabase& db, std::string_view sour
 
 bool source_enabled(EchoDatabase& db, std::string_view source) {
     return source_enabled_state(db, source).value_or(false);
+}
+
+// #1572 — retention/budget exemption. Mirrors source_enabled_state()'s read (including the
+// registry default for an absent flag). An "errored" flag is exempt ONLY when `_paused_at`
+// says the source was paused when the flag went bad (> 0) or the marker itself is unreadable
+// or malformed: a damaged hold marker never ages out a forensic hold. An absent or exactly
+// "0" marker means no pause was in force, so the normal ceiling applies.
+bool source_retention_exempt(EchoDatabase& db, std::string_view source) {
+    auto r = db.try_get_config(std::format("{}_enabled", source));
+    if (!r)
+        return true; // unreadable flag: preserve
+    const char* def = source_default_enabled(source) ? "true" : "false";
+    const auto state = canonical_source_enabled(r->value_or(def));
+    if (state == "true")
+        return false;
+    if (state == "false")
+        return true; // operator pause (or a default-off source's default)
+    auto pa = db.try_get_config(std::format("{}_paused_at", source));
+    if (!pa)
+        return true;
+    if (!pa->has_value())
+        return false; // errored, never paused
+    return **pa != "0"; // the plugin only ever writes the literal "0"; anything else is damaged
 }
 
 namespace {
@@ -708,20 +731,18 @@ void run_retention(EchoDatabase& db, int64_t now_epoch, RetentionGuardState& gua
         // queryable." Without this guard, time-based retention drains hourly
         // within 24h, daily within 31d, monthly within ~365d after disable —
         // breaking the forensic-preservation use case. See issue #539.
-        // #539/#560 — preserve rows whenever the source is NOT actively-and-
-        // validly enabled. Gating on the canonical tri-state (not `== "false"`)
-        // means a paused source ("false") AND a corrupt/tampered one ("errored")
-        // both skip retention, so the forensic window an operator paused — or one
-        // whose `_enabled` value was clobbered — is never pruned. This matches the
-        // collect-time source_enabled() gate, which also fails closed on "errored"
-        // and on a failed config read (rows preserved, never pruned, on a read error).
+        // #539/#560/#1572 — preserve rows of a paused source ("false"), an unreadable flag,
+        // and an errored flag whose `_paused_at` shows it was paused when the flag went bad
+        // (or cannot be read as 0). An errored source that was never paused is NOT exempt:
+        // collection has stopped (source_enabled() fails closed) but its rows age out under
+        // the normal ceiling, so a flag that stays bad cannot hold the warehouse forever.
         //
         // This gate stays STRICTLY AHEAD of any guard bookkeeping: a paused or
         // errored source whose rows are all past their cutoff must neither
         // delete nor decline. Declining would burn a per-table decline counter
         // (and an operator-facing warn) on a source that was never going to be
         // pruned in the first place.
-        if (!source_enabled(db, src.name)) {
+        if (source_retention_exempt(db, src.name)) {
             // Clear this source's recorded fact sets while it is skipped. An
             // entry left recorded across a pause is spent: the first pass
             // after the operator re-enables the source would delete capped
@@ -733,6 +754,10 @@ void run_retention(EchoDatabase& db, int64_t now_epoch, RetentionGuardState& gua
                 guard.last_reported.erase(std::format("{}_{}", src.name, g.suffix));
             continue;
         }
+        if (!source_enabled(db, src.name))
+            spdlog::warn("ECHO: source '{}' has an errored enable flag and was not paused; "
+                         "the retention ceiling applies to its rows",
+                         src.name);
         for (const auto& g : src.granularities) {
             // `table_name` is the name an operator sees (the guard counters and `echo status` key on
             // it); `phys` is where the rows live. A roll-up tier name is a VIEW over its `_r`
@@ -909,9 +934,9 @@ std::vector<const FoldSourceDef*> hourly_budget_sources() {
 std::vector<BudgetCandidate> hourly_budget_candidates(EchoDatabase& db, int64_t now_epoch) {
     std::vector<BudgetCandidate> out;
     for (const auto* def : hourly_budget_sources()) {
-        // A paused or errored source (or an unreadable flag) is exempt: its rows are preserved
-        // for forensics.
-        if (!source_enabled(db, def->name))
+        // A paused source (or an unreadable flag) is exempt: its rows are preserved for forensics.
+        // An errored one is too only if it was paused when its flag went bad (#1572).
+        if (source_retention_exempt(db, def->name))
             continue;
         BudgetCandidate c;
         c.table = physical_table_name(def->name, "hourly");

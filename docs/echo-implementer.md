@@ -469,14 +469,27 @@ state stores. If a customer asks for "delete echo data on uninstall",
 that is a deployment-tooling change (MSI custom action), not an Echo
 plugin change.
 
-> **Collect gate and retention share `canonical_source_enabled`.** Both
-> `source_enabled()` (`echo_aggregator.cpp`) and `run_retention()` decide a
-> source's state through it: `run_retention()` calls `source_enabled()` itself,
-> and `source_enabled()` maps the stored value through
-> `canonical_source_enabled(stored_value)`, which maps anything other than the
+> **Collect gate and retention both read `canonical_source_enabled`.**
+> `source_enabled()` (`echo_aggregator.cpp`) gates collection; retention and the
+> budget pass decide through `source_retention_exempt()`. Decision (#1572): an `errored` source that was never paused
+> (`<source>_paused_at` absent or exactly `0`) gets the normal retention
+> ceiling and budget eviction; `false`, an unreadable flag, and `errored` with
+> `paused_at` above 0, unreadable or malformed stay preserved, so a damaged hold
+> marker never ages out a forensic hold. The rule opens a release path that did
+> not exist before: a user who can write `echo_config` can release the hold on
+> an errored source by setting its flag to a bad value with `paused_at` at `0`.
+> That grants nothing a direct row delete in `echo.db` does not, and the hold on
+> a paused source holds only while its `paused_at` marker is non-zero.
+> **Accepted residual.** A source paused by an agent older than v0.12.0 carries
+> `_enabled=false` with `paused_at` absent or `0`; if its flag is later corrupted
+> to a non-canonical value, the helper cannot tell it from a fresh errored
+> never-paused source and the normal ceiling applies. Every current disable edge
+> stamps `paused_at` above 0, so the remedy is to re-issue
+> `configure <source>_enabled=false` on such a source, which stamps the marker.
+> Treating absent or `0` as a hold would undo #1572. `canonical_source_enabled(stored_value)` maps anything other than the
 > literal `"true"` to non-enabled (`"false"` → disabled, anything else →
 > `"errored"`). This is load-bearing: a value the plugin never writes fails
-> **closed** — collection stops *and* retention preserves the rows — instead of
+> **closed** — collection stops *and* retention keeps the rows of a source paused or errored while paused — instead of
 > a bare `!= "false"` that would treat a tampered/corrupt value as enabled and
 > let retention delete the paused window (#560). `source_enabled()` also fails
 > closed on a failed config read (closed database, SQL error): the registry
@@ -484,12 +497,12 @@ plugin change.
 > source, gate collection on `source_enabled(*db_, "<name>")` and do **not** add
 > a parallel `== "true"`/`== "false"` check or a raw `get_config("<src>_enabled",
 > ...)` read — every collect, retention and purge gate for every registered
-> source goes through the one helper, so the registry's `default_enabled` is
-> the only place a default lives. Collect and retention gates use
-> `source_enabled()` (an unreadable flag skips); discard, drain and purge
-> decisions use `source_enabled_state()`, which distinguishes a confirmed
-> `true`/`false` from an unreadable flag so a destructive path never acts on a
-> failed read.
+> source goes through the helpers below, so the registry's `default_enabled` is
+> the only place a default lives. The collect gate uses `source_enabled()` (an
+> unreadable flag skips); retention and the budget pass use
+> `source_retention_exempt()`; discard, drain and purge decisions use
+> `source_enabled_state()`, which distinguishes a confirmed `true`/`false` from
+> an unreadable flag so a destructive path never acts on a failed read.
 >
 > **`paused_at` is cleared on any non-`true` → `true` re-enable.**
 > `apply_source_enabled_transition` (`echo_aggregator.cpp`) canonicalises the
@@ -599,7 +612,7 @@ Routine debugging entry points:
 | "Echo isn't recording anything for source X" | `echo.status` output → `<source>_enabled` row. Then `compatibility` action to confirm OS support. Then check the agent log for "Echo plugin initialized". |
 | "Query returns 0 rows but I know the event happened" | Check the collect interval (`fast_interval` / `slow_interval`) vs the event lifetime — anything shorter than the interval is sub-resolution. |
 | "TCP collector shows a flood of `connected` events" | Almost always a restart artifact. Confirm against the agent's start time. |
-| "echo.db is huge" | `status` returns `db_size_bytes` (used pages plus the WAL, not the file size) against `db_budget_bytes`. If it's growing without bound, check that the maintenance pass (`echo.rollup`, the budget pass) is running and `budget_over_bytes`: there is no aggregation pass any more, and the tiers grow only through the folds and shrink only through retention and the byte budget; confirm the triggers registered in `init()`. A file that stays large while `db_size_bytes` is within budget is an older database waiting for its one-off `VACUUM` (`db_auto_vacuum|deferred` means a conversion was wanted and could not run: the volume lacked twice the used size free, or the `VACUUM` failed; the marker clears only when a conversion succeeds). `budget_over_bytes` above 0 has several causes: a long `echo.sql` read pinning the log (clears at the next checkpoint), an eviction pass that failed (retried next pass), a pass skipped by the retention clock guard (`retention_guard|__budget__|<n>`), an unreadable setting (`db_budget_bytes|unknown`), a catch-up still draining, or only exempt rows left (hourly rows under 48 hours, daily and monthly rows, the `usage` tables, paused or errored sources and `netconn`, `netqual`, `power`, `removable`, `registry`); see the user manual, "If `budget_over_bytes` stays above 0". |
+| "echo.db is huge" | `status` returns `db_size_bytes` (used pages plus the WAL, not the file size) against `db_budget_bytes`. If it's growing without bound, check that the maintenance pass (`echo.rollup`, the budget pass) is running and `budget_over_bytes`: there is no aggregation pass any more, and the tiers grow only through the folds and shrink only through retention and the byte budget; confirm the triggers registered in `init()`. A file that stays large while `db_size_bytes` is within budget is an older database waiting for its one-off `VACUUM` (`db_auto_vacuum|deferred` means a conversion was wanted and could not run: the volume lacked twice the used size free, or the `VACUUM` failed; the marker clears only when a conversion succeeds). `budget_over_bytes` above 0 has several causes: a long `echo.sql` read pinning the log (clears at the next checkpoint), an eviction pass that failed (retried next pass), a pass skipped by the retention clock guard (`retention_guard|__budget__|<n>`), an unreadable setting (`db_budget_bytes|unknown`), a catch-up still draining, or only exempt rows left (hourly rows under 48 hours, daily and monthly rows, the `usage` tables, paused sources (and errored ones that were paused) and `netconn`, `netqual`, `power`, `removable`, `registry`); see the user manual, "If `budget_over_bytes` stays above 0". |
 | "Schema migration failed at startup" | `agent.log` will show `EchoDatabase: migrated to schema version N` on success or the SQLite error on failure. Migrations are idempotent — fixing the underlying issue and restarting will retry. |
 
 For new-source bring-up, the smallest viable change is: add a

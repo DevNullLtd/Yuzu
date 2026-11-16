@@ -138,8 +138,8 @@ empty); `n/a` means the source does not apply to that OS. The table is read from
   other `configure` key; the deletion is the maintenance pass's, which is classified destructive. It applies to an existing `echo.db` on upgrade too (the user manual,
   "Upgrading an existing database"). Over budget, the rollup pass removes hourly rows older than
   48 hours (5 days for `procperf`), largest table first, oldest bucket first. There is no raw tier
-  to take first. Daily and monthly rows, the `usage` tables, `netqual_boot`, paused or errored
-  sources (an unreadable `<source>_enabled` counts as errored) and an unusable `db_budget_bytes`
+  to take first. Daily and monthly rows, the `usage` tables, `netqual_boot`, paused sources, sources errored while
+  paused (an unreadable `<source>_enabled` is preserved) and an unusable `db_budget_bytes`
   value (read as unknown, never as the default) are never touched. A pass is batches of 1,000 rows, each in one transaction with its
   persisted counter, and stops after 2 seconds; while still over budget each fast tick runs another
   slice. The budget is hard for eligible data pages (the pass stops only at the target) and soft for
@@ -346,7 +346,7 @@ Windows runs an ETW session on provider `Microsoft-Windows-Kernel-Process`
 <!-- BEGIN GENERATED: plugin-doc-gen inputs -->
 | Definition | Parameter | Type | Required | Default | Constraints | Description |
 |---|---|---|---|---|---|---|
-| `crossplatform.echo.configure` | `db_budget_bytes` | string | no | - | pattern: ^[0-9]+$ | Cap on what echo.db holds (used pages plus the write-ahead log), in whole bytes. Minimum 33554432 (32 MiB). Default 262144000 (250 MiB). A value below the minimum, or one that is not a whole number, is refused with an error\| line and nothing changes. When the database is over budget the maintenance pass removes hourly rows older than 48 hours (5 days for procperf), oldest first. Daily and monthly rows are never removed, nor are the usage tables, or paused or errored sources (an unreadable <source>_enabled counts as errored). Requires an agent newer than v0.15.0; an older agent ignores this key beside other keys and refuses it alone (error\|no valid configuration parameters provided). Lowering it permanently deletes the oldest eligible history within 15 minutes, before its tier's retention limit; raising it again does not restore it. |
+| `crossplatform.echo.configure` | `db_budget_bytes` | string | no | - | pattern: ^[0-9]+$ | Cap on what echo.db holds (used pages plus the write-ahead log), in whole bytes. Minimum 33554432 (32 MiB). Default 262144000 (250 MiB). A value below the minimum, or one that is not a whole number, is refused with an error\| line and nothing changes. When the database is over budget the maintenance pass removes hourly rows older than 48 hours (5 days for procperf), oldest first. Daily and monthly rows are never removed, nor are the usage tables, or paused sources, or sources errored while paused (an unreadable <source>_enabled is preserved). Requires an agent newer than v0.15.0; an older agent ignores this key beside other keys and refuses it alone (error\|no valid configuration parameters provided). Lowering it permanently deletes the oldest eligible history within 15 minutes, before its tier's retention limit; raising it again does not restore it. |
 | `crossplatform.echo.configure` | `fast_interval` | string | no | - | pattern: ^[0-9]+$ | Interval in seconds for process and network collection. Valid range: 10-3600. Default: 60. |
 | `crossplatform.echo.configure` | `slow_interval` | string | no | - | pattern: ^[0-9]+$ | Interval in seconds for service and user session collection. Valid range: 30-7200. Default: 300. |
 | `crossplatform.echo.configure` | `redaction_patterns` | string | no | - | - | JSON array of case-insensitive SUBSTRING patterns (not glob) for command-line redaction. Leading/trailing `*` are stripped; `?` and `[abc]` are literals. Any process command line containing a pattern has its cmdline replaced with "[REDACTED by Echo]". At most 256 elements of at most 256 characters each; over-cap elements are dropped at load. Default patterns: ["*password*", "*secret*", "*token*", "*api_key*", "*credential*"]. These defaults are ALWAYS MERGED IN — your patterns are ADDED to them, never replace them, so an empty or all-invalid array cannot disable the baseline redaction. |
@@ -605,6 +605,23 @@ nothing and counts nothing. A query over a retired `$<Source>_Live` name (`sql`)
 `constrained` result status, so an empty answer is not mistaken for "nothing happened"; only the status enum reaches
 the server, and the retired table's name (`retired_table:<name>`) is in the agent's command log line.
 
+**`configure` replies and failed writes.** Every setting `configure` persists is checked. A write that fails
+(a busy database) stops the call with exit code 1 and an `error|` line. When earlier settings in the same
+call had already persisted, the reply first carries `partial|applied|<key1,key2,...>` (the keys that did
+persist, in the order they were written) and the result status is `constrained` with
+`echo:configure_partial_commit`: a non-zero exit means at least one requested change did not persist, and
+`constrained` means some did. An interval (`fast_interval`, `slow_interval`, `software_interval`) listed under
+`partial|applied` is saved, but collection keeps its previous schedule until the agent restarts or that
+interval is sent again in a call that succeeds, so include it when re-sending. Nothing persisted is the
+`error|` line alone. A caller that treated exit 0 as success on a busy database now sees exit 1.
+
+**Corrupt-database quarantine is bounded.** When a corrupt `echo.db` is moved aside, only the newest three
+`echo.db.corrupt-<epoch>[-<n>]` groups (the file and its `-wal`/`-shm`/`-journal` sidecars) are kept; older
+ones are deleted at quarantine time, never the group that open just made. Deletion is best effort and per
+file: a file that cannot be removed is logged and left, the rest of its group is still removed, and it is
+tried again at the next recovery. Only exact quarantine names are touched; `.planted-` files and any other
+name are not.
+
 **Empty-result / not-yet-collected convention.** A `planned` leg (see Capture sources by OS) ships
 its schema and config key with no collector, so its `$..._*` tables stay queryable and empty,
 which means "not yet collecting", never "nothing happened". `module` is the clearest case: Windows
@@ -613,12 +630,13 @@ the Windows registry does not exist there, so it records nothing and `compatibil
 
 ### Result status
 
-Echo sets a typed `plugin_result_status` in three places: `do_snapshot` calls
+Echo sets a typed `plugin_result_status` in four places: `do_snapshot` calls
 `ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
 "echo:snapshot_skipped_sources")` when any capture source retained a stale baseline instead of
 collecting during a forced snapshot; `do_purge_source` sets the same status with
 `echo:purge_dictionary_pending` when the rows are gone but the dictionary sweep after them did not
-finish, or `echo:purge_wal_pending` when only the write-ahead-log checkpoint did not; and `do_sql` sets it with `retired_table:<name>` (several names comma-joined) when the
+finish, or `echo:purge_wal_pending` when only the write-ahead-log checkpoint did not; `do_configure` sets it with `echo:configure_partial_commit` when a later write failed after
+earlier settings in the same call had persisted; and `do_sql` sets it with `retired_table:<name>` (several names comma-joined) when the
 translated query mentions a retired `<source>_live` shim view, whose answer is always empty. No other
 action — including `status`, `query`, `rollup`, `collect_fast`/`collect_slow`, and the early `db_`
 guard that every action shares — ever calls the setter, so the agent records the default
@@ -629,6 +647,7 @@ guard that every action shares — ever calls the setter, so the agent records t
 | `CONSTRAINED` | `PARTIAL` | `echo:snapshot_skipped_sources` | `snapshot` only, when `collect_or_retain` skipped at least one enabled source this pass. |
 | `CONSTRAINED` | `PARTIAL` | `echo:purge_dictionary_pending` | `purge_source` only, when the dictionary sweep after the row delete ran out of its deadline or failed: the rows are deleted, the strings of the purged rows stay until the weekly sweep, `dictionary_pending` is `true` in the JSON line and `dict_gc_starved_total` is incremented (not when an agent stop ended the sweep). |
 | `CONSTRAINED` | `PARTIAL` | `echo:purge_wal_pending` | `purge_source` only, when the dictionary is clean but the final `TRUNCATE` checkpoint found the write-ahead log pinned by a reader, or was skipped because the agent was stopping: the rows are deleted, `wal_checkpoint_pending` is `true` in the JSON line, and the purged pages stay in the log until a later checkpoint truncates it (a rerun of the purge does). |
+| `CONSTRAINED` | `PARTIAL` | `echo:configure_partial_commit` | `configure` only, when a write failed after at least one earlier setting in the same call persisted: the reply carries `partial\|applied\|<keys>` before the `error\|` line and exits 1; nothing persisted is the `error\|` line alone with the default status. |
 | `CONSTRAINED` | `PARTIAL` | `retired_table:<name>` | `sql` only, when the translated query names a retired `<source>_live` shim view in any spelling SQLite accepts (an empty relation kept so a stored query does not error): the rows and the `__total__\|0` line are unchanged; the status is what tells a schedule or result set that the table is retired rather than empty. Only the status enum reaches the server; the name is in the agent's command log line. |
 | `UNDECLARED` (default) | `UNKNOWN` | *(empty)* | Every other action and every early-return path, including the `db_`-not-open guard. |
 | *(not a `set_result_status` call)* | *(n/a)* | `linux:netlink:remove:` | Not an action-level result status — the literal prefix of the per-row `evidence` column the Linux `removable` cursor-source writes on a normal `detached` device event (udev netlink), followed by the device name; the event itself is a successful capture, not a degraded read (`echo_removable_collector.cpp`). |
@@ -944,5 +963,5 @@ three broken legs; it is one chokepoint. See Caveats item 1.
 - Capability rows: `server/core/src/capability_decls/core_dispatch_capabilities.hpp` · `server/core/src/capability_decls/plugin_action_catalogue_a.hpp`
 - Tests: `tests/test_echo_adoption_wiring_lexical.py` · `tests/test_echo_mapdrive_pin_lexical.py` · `tests/test_echo_security_wiring_lexical.py` · `tests/test_echo_timeline_script_behaviour.py` · `tests/unit/server/test_echo_process_tree.cpp` · `tests/unit/server/test_echo_rename_migration_pg.cpp` · `tests/unit/server/test_echo_retention_tiers.cpp` · `tests/unit/server/test_echo_timeline_page.cpp` · `tests/unit/server/test_echo_timeline_render.cpp` · `tests/unit/server/test_echo_tree_routes.cpp` · `tests/unit/test_echo_aggregator.cpp` · `tests/unit/test_echo_arp.cpp` · `tests/unit/test_echo_capability_table.cpp` · `tests/unit/test_echo_capture_status.cpp` · `tests/unit/test_echo_cursor.cpp` · `tests/unit/test_echo_diff.cpp` · `tests/unit/test_echo_fold.cpp` · `tests/unit/test_echo_fold_sizing.cpp` · `tests/unit/test_echo_local_dispatcher.cpp` · `tests/unit/test_echo_mapdrive.cpp` · `tests/unit/test_echo_module_etw.cpp` · `tests/unit/test_echo_module_stream.cpp` · `tests/unit/test_echo_netconn.cpp` · `tests/unit/test_echo_netqual_nstat.cpp` · `tests/unit/test_echo_perf.cpp` · `tests/unit/test_echo_power.cpp` · `tests/unit/test_echo_proc_es.cpp` · `tests/unit/test_echo_proc_etw.cpp` · `tests/unit/test_echo_proc_perf.cpp` · `tests/unit/test_echo_registry_bam_live.cpp` · `tests/unit/test_echo_registry_source.cpp` · `tests/unit/test_echo_removable.cpp` · `tests/unit/test_echo_retention_tiers_table.cpp` · `tests/unit/test_echo_schema_registry.cpp` · `tests/unit/test_echo_service.cpp` · `tests/unit/test_echo_software.cpp` · `tests/unit/test_echo_source_health.cpp` · `tests/unit/test_echo_store.cpp` · `tests/unit/test_echo_usage.cpp` · `tests/unit/test_echo_v10_migration.cpp` · `tests/unit/test_echo_warehouse.cpp` · `tests/unit/test_echo_win_raii_guards.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/2026-10-30-echo-db-budget.added.md` · `changelog.d/2026-10-30-echo-db-budget.changed.md` · `changelog.d/2026-10-30-echo-db-budget.fixed.md` · `changelog.d/2026-11-02-echo-fold-substrate.added.md` · `changelog.d/2026-11-02-echo-fold-substrate.changed.md` · `changelog.d/2026-11-02-echo-offline-hive-baselines.added.md` · `changelog.d/5033-echo-corruption-audit-gate-per-agent.fixed.md` · `changelog.d/6386-echo-tests-windows-honesty.fixed.md` · `changelog.d/7037-echo-rollup-only-v10.changed.md` · `changelog.d/7075-echo-security-batch.security.md` · `changelog.d/7285-echo-fold-substrate-bounds.fixed.md` · `changelog.d/7286-echo-db-open-hardening.security.md` · `changelog.d/7288-echo-purge-sweep-bounds.fixed.md` · `changelog.d/7318-echo-rollup-only-server.changed.md` · `changelog.d/7371-echo-rollup-only-ui.changed.md` · `changelog.d/7371-echo-rollup-only-ui.removed.md` · `changelog.d/7420-echo-followups-mixed.changed.md` · `changelog.d/7420-echo-followups-mixed.fixed.md` · `changelog.d/7466-echo-mcp-hourly-rows.changed.md` · `changelog.d/7507-echo-drop-live-shims.removed.md`
+- Changelog: `changelog.d/1572-echo-errored-source-retention.changed.md` · `changelog.d/2026-10-30-echo-db-budget.added.md` · `changelog.d/2026-10-30-echo-db-budget.changed.md` · `changelog.d/2026-10-30-echo-db-budget.fixed.md` · `changelog.d/2026-11-02-echo-fold-substrate.added.md` · `changelog.d/2026-11-02-echo-fold-substrate.changed.md` · `changelog.d/2026-11-02-echo-offline-hive-baselines.added.md` · `changelog.d/2155-echo-corrupt-copies-bound-configure-partial.fixed.md` · `changelog.d/5033-echo-corruption-audit-gate-per-agent.fixed.md` · `changelog.d/6386-echo-tests-windows-honesty.fixed.md` · `changelog.d/7037-echo-rollup-only-v10.changed.md` · `changelog.d/7075-echo-security-batch.security.md` · `changelog.d/7285-echo-fold-substrate-bounds.fixed.md` · `changelog.d/7286-echo-db-open-hardening.security.md` · `changelog.d/7288-echo-purge-sweep-bounds.fixed.md` · `changelog.d/7318-echo-rollup-only-server.changed.md` · `changelog.d/7371-echo-rollup-only-ui.changed.md` · `changelog.d/7371-echo-rollup-only-ui.removed.md` · `changelog.d/7420-echo-followups-mixed.changed.md` · `changelog.d/7420-echo-followups-mixed.fixed.md` · `changelog.d/7466-echo-mcp-hourly-rows.changed.md` · `changelog.d/7507-echo-drop-live-shims.removed.md`
 <!-- END GENERATED -->

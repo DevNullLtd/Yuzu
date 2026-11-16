@@ -413,10 +413,11 @@ spec:
           is over budget the maintenance pass removes hourly rows older than
           48 hours (5 days for procperf), oldest first. Daily and
           monthly rows are never removed, nor are the usage tables,
-          or paused or errored sources (an unreadable <source>_enabled counts
-          as errored). Requires an agent newer than v0.15.0; an older agent
-          ignores this key beside other keys and refuses it alone
-          (error|no valid configuration parameters provided). Lowering it
+          or paused sources, or sources errored while paused (an unreadable
+          <source>_enabled is preserved). Requires an agent newer than
+          v0.15.0; an older agent ignores this key beside other keys and
+          refuses it alone (error|no valid configuration parameters
+          provided). Lowering it
           permanently deletes the oldest eligible history within 15 minutes,
           before its tier's retention limit; raising it again does not
           restore it.

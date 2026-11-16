@@ -4668,8 +4668,8 @@ private:
         if (maintenance_pass && res.exhausted) {
             spdlog::warn("ECHO: echo.db data ({} bytes) is above its {} byte target and nothing "
                          "more is eligible to evict (hourly rows under 48 h (5 d for procperf), "
-                         "daily and monthly rows, the usage tables, netqual_boot and paused or "
-                         "errored sources are never evicted)",
+                         "daily and monthly rows, the usage tables, netqual_boot and paused "
+                         "sources are never evicted)",
                          res.data_bytes_after, target);
         }
 
