@@ -857,7 +857,8 @@ bool prop_string(EVENT_RECORD* rec, const wchar_t* name, std::string& out) {
         ERROR_SUCCESS)
         return false;
     // The ETW ValueName is NUL-terminated, so the identity is taken up to the first NUL: a name
-    // holding U+0000 arrives cut here (its snapshot name keeps the NUL) and is not attributed.
+    // holding U+0000 arrives cut here while its snapshot name keeps the NUL, so it does not match
+    // its own value; the cut prefix can match a sibling value with the same prefix (a lead).
     out = name_identity(buf.data(), wcsnlen(buf.data(), size / sizeof(wchar_t)));
     return true;
 }

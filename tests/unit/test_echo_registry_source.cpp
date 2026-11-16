@@ -717,7 +717,7 @@ TEST_CASE("attribute_candidate: correlation on value name, type, size and window
     }
 }
 
-TEST_CASE("attribute_candidate: the ETW name and the snapshot name share one identity",
+TEST_CASE("attribute_candidate: names built with the one identity correlate (pure; the ETW read is a live case)",
           "[echo][registry][pure]") {
     // The Windows shell builds both sides through registry_name_utf8: the reader stores a name
     // through name_identity and the ETW callback hands the event's ValueName through the same
