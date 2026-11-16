@@ -1081,15 +1081,59 @@ TEST_CASE("build_device_ci_record tolerates appended cpu/dimm columns", "[sync][
 
 TEST_CASE("build_device_ci_record keeps the raw pipe split of the frozen v1 positions",
           "[sync][device_ci][pipe]") {
-    // The v2 projections split on an UNESCAPED pipe; the 22 v1 positions deliberately do not, because
-    // their bytes (and so the hash of every fielded device) are frozen. A disk model holding an
-    // escaped pipe is therefore still cut at it here. Switching the v1 loops to the unescaped split
-    // would change disks_summary for such a device and must be a coordinated, versioned change.
+    // The v2 projections split on an UNESCAPED pipe, and since #7040 so do the v1 cpu and dimm
+    // aggregations. The other v1 positions deliberately do not, because their bytes (and so the hash
+    // of every fielded device) are frozen. A disk model holding an escaped pipe is therefore still
+    // cut at it here. Switching the disk loop to the unescaped split would change disks_summary for
+    // such a device and must be a coordinated, versioned change.
     using yuzu::agent::build_device_ci_record;
     using yuzu::agent::CiPluginOutputs;
     CiPluginOutputs o;
     o.disks = "disk|0|Model\\|X|512|SSD|NVMe";
     CHECK(build_device_ci_record(o).disks_summary == "Model\\ X 512");
+}
+
+TEST_CASE("build_device_ci_record: a pipe inside a CPU model or DIMM locator shifts no column (#7040)",
+          "[sync][device_ci][pipe]") {
+    using yuzu::agent::build_device_ci_record;
+    using yuzu::agent::CiPluginOutputs;
+
+    SECTION("an escaped pipe in a CPU model keeps cores and threads and unescapes the model") {
+        CiPluginOutputs o;
+        o.processors = "cpu|0|Foo \\| Bar CPU|4|8|2800|-|-\ncpu|1|Foo \\| Bar CPU|4|8|2800|-|-";
+        auto r = build_device_ci_record(o);
+        CHECK(r.cpu_model == "Foo | Bar CPU");
+        CHECK(r.cpu_cores == "8");   // 4 + 4, not 0
+        CHECK(r.cpu_threads == "16"); // 8 + 8, not the core count
+    }
+
+    SECTION("an escaped pipe in a DIMM locator keeps its size in the RAM total") {
+        CiPluginOutputs o;
+        o.memory = "dimm|A \\| B|8192|DDR4|3200|-|-|-\ndimm|DIMM1|8192|DDR4|3200|-|-|-";
+        auto r = build_device_ci_record(o);
+        CHECK(r.ram_bytes == std::to_string(16384LL * 1024 * 1024)); // not 8192 MB
+    }
+
+    SECTION("a model and a locator with no pipe or backslash give the same record as before") {
+        // The frozen-seam pin: nothing here contains an escape, so the unescaped split and the
+        // raw split see the same tokens and every v1 byte, and so the hash, is unchanged.
+        CiPluginOutputs o;
+        o.processors = "cpu|0|Intel(R) Core(TM) i7-1185G7 @ 3.00GHz|4|8|3000|-|-";
+        o.memory = "dimm|ChannelA-DIMM0|16384|DDR4|3200|-|-|-\ndimm|total|unknown|unknown|0|-|-|-";
+        auto r = build_device_ci_record(o);
+        CHECK(r.cpu_model == "Intel(R) Core(TM) i7-1185G7 @ 3.00GHz");
+        CHECK(r.cpu_cores == "4");
+        CHECK(r.cpu_threads == "8");
+        CHECK(r.ram_bytes == std::to_string(16384LL * 1024 * 1024));
+    }
+
+    SECTION("a literal backslash that is not before a pipe is left alone") {
+        CiPluginOutputs o;
+        o.processors = "cpu|0|Odd\\Model|2|4|2000|-|-";
+        auto r = build_device_ci_record(o);
+        CHECK(r.cpu_model == "Odd\\Model");
+        CHECK(r.cpu_cores == "2");
+    }
 }
 
 TEST_CASE("build_device_ci_record parses + aggregates plugin outputs", "[sync][device_ci]") {

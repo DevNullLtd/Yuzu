@@ -79,6 +79,20 @@ Memory Device
     CHECK(rows[1] == "dimm|ChannelB-DIMM0|16384|DDR4|3200|-|-|-");
 }
 
+TEST_CASE("parse_dmidecode_memory: a pipe in the locator is escaped and shifts no column (#7040)",
+          "[hardware][linux][memory]") {
+    static constexpr const char* kDmi = R"(Handle 0x0024, DMI type 17, 40 bytes
+Memory Device
+	Locator: Bank|0 DIMM
+	Size: 8192 MB
+	Type: DDR4
+	Speed: 2666 MT/s
+)";
+    auto rows = parse_dmidecode_memory(kDmi);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0] == "dimm|Bank\\|0 DIMM|8192|DDR4|2666|-|-|-");
+}
+
 TEST_CASE("parse_dmidecode_memory: empty slot ('No Module Installed') is skipped",
           "[hardware][linux][memory]") {
     static constexpr const char* kDmi = R"(Handle 0x0024, DMI type 17, 40 bytes
