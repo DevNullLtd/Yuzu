@@ -379,7 +379,7 @@ Derived directly from `server/core/src/body_cap_policy.hpp`'s `kBodyCapTable` (l
 | POST | `/api/instructions/yaml` | 3076 KiB | `instruction_yaml` | † The handler checks the FORM-DECODED `yaml_source` field at 1048576 chars (`instruction_yaml.cpp:165`); 3× worst-case percent-encoding of that value, plus 4 KiB flat headroom for field-name framing and the `id` field (save only). |
 | POST | `/api/instructions/validate-yaml` | 3076 KiB | `instruction_yaml` | † Same check, same margin — see above. |
 | POST | `/fragments/instructions/yaml-preview` | 3076 KiB | `instruction_yaml` | † Same check, same margin — see above. |
-| any | `/api/v1/hardware` | 4 KiB | `hardware` | The third `requires_measurable=true` class. Only `POST .../sync` and `POST /api/v1/hardware/sync` carry a body (a short `source` enum token, and for the fan-out a scope token or an expression of at most 1,024 bytes); the bodyless `GET /api/v1/hardware` and `GET /api/v1/hardware/{id}` list/record routes share the class rather than falling to the 4 MiB catch-all. |
+| any | `/api/v1/hardware` | 4 KiB | `hardware` | The third `requires_measurable=true` class. Only `POST .../sync` and `POST /api/v1/hardware/sync` carry a body (a short `source` enum token, and for the fan-out a scope token or an expression of at most 1,024 bytes plus `confirm` and `last_synced_before`); the bodyless `GET /api/v1/hardware`, `GET /api/v1/hardware/{id}` and `GET /api/v1/hardware/sync/{execution_id}` list/record/status routes share the class rather than falling to the 4 MiB catch-all. |
 | any | `/api/v1/rbac/roles/` | 4 KiB | `rbac_role_assignment` | A2 global human role assignment — see "Fleet-Wide Role Assignment" below. `POST .../assignments` body is `{principal_type, principal_id}`, two short strings; `DELETE .../assignments/{principal_id}` carries none. Any method — the DELETE sibling shares this literal prefix once past the role-name path segment. |
 | any | `/api/v1/rbac/enforcement` | 1 KiB | `rbac_enforcement` | A1 enforcement enable/disable toggle. Body is `{"enabled": true}`, under 64 bytes even pretty-printed; 1 KiB is 16× headroom. A segment-boundary-distinct prefix from `rbac_role_assignment` above, so it needs its own row or it would fall to the 4 MiB catch-all. |
 | any | `/api/v1/guaranteed-state/policy-generation` | 1 KiB | `guardian_policy_generation` | The Guardian policy-generation raise (`POST .../raise`). Body is `{"target_generation": <integer>, "acknowledge_rule_set_replaced": true}`, under 128 bytes even pretty-printed; 1 KiB is 8× headroom. The row is any-method, so the read-only `GET .../policy-generation` resolves to the same class; it carries no body. A segment-boundary-distinct prefix from `guardian_rule_authoring` (`/api/v1/guaranteed-state/rules`), so it needs its own row or it would fall to the 4 MiB catch-all. |
@@ -602,7 +602,7 @@ existence-oracle closure exactly).
 
 ### Hardware
 
-The Hardware CI list and single-device CI record: the two read routes of the OpenAPI tag `Hardware`, followed by short entries for the on-demand syncs `POST /api/v1/hardware/{id}/sync` (one device) and `POST /api/v1/hardware/sync` (a scope or the fleet). Both read routes are audited on a served read, and with `result=failure` when the device roster could not be read.
+The Hardware CI list, the single-device CI record and the bulk CI page: the three read routes of the OpenAPI tag `Hardware`, followed by short entries for the on-demand syncs `POST /api/v1/hardware/{id}/sync` (one device) and `POST /api/v1/hardware/sync` (a scope or the fleet) and for `GET /api/v1/hardware/sync/{execution_id}` (how a fan-out run is going). All three read routes are audited on a served read, and with `result=failure` when the device roster (or, for the bulk page, the CI store) could not be read.
 
 #### `GET /api/v1/hardware`
 
@@ -618,7 +618,7 @@ The Hardware list: the device roster (identity fields as for `/devices`) plus de
 |---|---|
 | `200` | The roster was read. `ci_degraded` / `tags_degraded` are `true` when the CI or tag store could not be read, so those columns are blank rather than genuinely absent. At most the 100,000 most recently seen endpoints within the 30-day window are served; `roster_truncated` is `true` (and `roster_cap` is `100000`) when more existed, and then `total_matching`, `pagination.total`, `devices_omitted` and every `kpis` figure are lower bounds and a search that finds nothing does not prove a device is absent (confirm one with `GET /api/v1/hardware/{id}`, which reads that device exactly). A truncated list is still a `200`; the flag clears by itself when the fleet is back under the cap. While `tags_degraded` is `true`, a `tag` filter (or a tag match in `q`) sees no tags and answers an empty list. |
 | `400` | Unrecognised `sort`, `os` or `status` token, or an invalid `tag` key. |
-| `403` | Caller lacks `Inventory:Read`. |
+| `403` | Caller lacks `Inventory:Read`, or the caller is an engine principal without an explicit grant (an engine principal is refused while RBAC enforcement is off), or an MCP token whose tier does not allow `Inventory:Read`, or the caller is a service-scoped token while RBAC enforcement is off (message `service-scoped tokens require RBAC to be enabled`; the body names no `permission`, because granting `Inventory:Read` does not admit such a token), or a service-scoped token whose `ITServiceOwner` ceiling lacks `Inventory:Read`. |
 | `503` | Route misconfigured (roster provider unwired), the device roster could not be read (`retry_after_ms` set), the audit row could not be persisted, or the authorization store is unavailable (`retry_after_ms` 5000). A failed roster read is never a `200` with an empty list. |
 
 **Audit:** `inventory.devices`; `result=success` on a served page, `result=failure` (detail `hardware roster read failed`) when the roster could not be read. A persist failure on the success row fails the request closed with `503`.
@@ -641,7 +641,7 @@ One device's CI record: identity, device-CI blob, the per-section hardware recor
 |---|---|
 | `200` | The record. A degraded CI store alongside an unreadable stored identity record is still a `200` carrying `identity_state` and `ci_state` as `degraded`. |
 | `400` | Device id longer than 256 bytes or containing a byte below `0x20`. Checked after the `Inventory:Read` check and before the scope check. Registration applies the same 256-byte limit and refuses an id with a byte below `0x20` (through its enrollment check), so any id that agent registration accepts passes and a registered device is not affected. |
-| `403` | Caller lacks `Inventory:Read`. |
+| `403` | Caller lacks `Inventory:Read`, or the caller is an engine principal without an explicit grant (an engine principal is refused while RBAC enforcement is off), or an MCP token whose tier does not allow `Inventory:Read`, or the caller is a service-scoped token while RBAC enforcement is off (message `service-scoped tokens require RBAC to be enabled`; the body names no `permission`, because granting `Inventory:Read` does not admit such a token), or a service-scoped token whose `ITServiceOwner` ceiling lacks `Inventory:Read`. |
 | `404` | Not found, or outside the caller's fleet-read scope (indistinguishable by design). |
 | `503` | Route misconfigured, audit row not persisted, the authorization store unavailable (`retry_after_ms` 5000), or the device's stored record could not be read (`retry_after_ms` set) and the device was not otherwise found (CI record readable-and-absent, no software, no tags), or the record's hardware sections could not be read after the record itself was read (message `hardware sections unavailable`, `retry_after_ms` 5000; a failure at or before the record read is a `200` with `ci: null` instead). The unreadable-record case is never a `404`, and a failed sections read is never a `200` with an empty sections list (an empty list with `sections_state` `absent` is a different answer: nothing is stored). |
 
@@ -649,11 +649,154 @@ One device's CI record: identity, device-CI blob, the per-section hardware recor
 
 ---
 
+#### `GET /api/v1/hardware-ci`
+
+The bulk CI read: one keyset page of every stored device-CI record, built for a daily pull into an external CMDB (one call per page instead of one `GET /api/v1/hardware/{id}` per device). Each row carries the same `ci` object as the per-device record, without `sections`, plus the stored `content_hash` and `blob_version`.
+
+**Permission:** `Inventory:Read`, via `require_fleet_read` (admit-then-filter), the only gate on the route. The caller's scope is applied in the query itself, so a device outside it is never returned. MCP twin: `list_hardware_ci_records` (see `docs/user-manual/mcp.md`).
+
+**It reads the stored CI table, not the device roster.** `GET /api/v1/hardware` lists the devices seen in the last 30 days; this route lists every device that has a CI record, so a device that has been offline for longer than that is still returned while its record exists. A record is removed when the device's stored data is removed (decommissioning), so a retired device stays in the walk until it is decommissioned, and `ci.last_seen` is the only staleness signal. Under a database collation change that has not been repaired this is no longer reliable: a decommission can succeed without removing the record, so a decommissioned device can still be served, and a device can be stored twice (see Paging below). A record is therefore never proof that a device is still in service, and its absence is never proof that the device was removed. The route carries no online state, tags or DEX score, and no `sections` or installed software: those stay on `GET /api/v1/hardware/{id}`.
+
+**Query parameters:**
+
+| Parameter | Meaning |
+|---|---|
+| `limit` | Devices per page, `1` to `1000`, default `100`. An integer outside the range is clamped, including one too large for 64 bits (a huge positive value gives `1000`, a huge negative one `1`); text that is not a plain decimal integer (an optional leading `-` and digits) is a `400`. An empty `limit=` means "not given". |
+| `cursor` | The `next_cursor` of the previous page. Omit it for the first page. An empty `cursor=` (as the example below sends on the first page) means "not given", that is the first page. |
+| `agent_id` | Read only this device (at most 256 bytes, no byte below `0x20`). A device outside the caller's scope reads as an empty page, the same as a device with no record. A present-but-empty `agent_id=` is a `400` (`agent_id must be a non-empty string when given`), never a fleet page, so a client that takes `devices[0]` can never attach the wrong device's serial or UUID to the device it asked for; omit the parameter to read the whole fleet. The MCP tool refuses an empty `agent_id` with the same text. |
+
+A repeated parameter keeps its first value and an unknown parameter is ignored.
+
+**Response:** `{ "data": { "devices": [...], "next_cursor": "" }, "meta": { "api_version": "v1" } }`. A caller whose read is confined to a scope (a management-group or service-scoped caller) also gets `scope_basis: "authority_scoped"` inside `data`. `scope_basis` is a status, set whether or not any device lies outside the scope; a confined caller is never given a count of hidden devices, and never an out-of-scope row or id, in the body, in the cursor or in the audit row. Each device is `{ "agent_id", "hostname", "ci", "content_hash", "blob_version" }`:
+
+- `hostname` is the hostname in the CI record, which is the last daily sync (up to about a day old), not the live roster's. It is `null` when empty or the literal `unknown`.
+- `ci` has the scalar fields of `GET /api/v1/hardware/{id}` (`manufacturer` through `machine_id_source`, with the same null rules, so a record from an agent that predates the v2 record has `null` chassis, board and machine-id values).
+- `content_hash` is the stored hash of the record (`null` when none is stored). Equal to your copy means the stored record is unchanged apart from `ci.first_seen` and `ci.last_seen`; unequal means re-read. It also covers section rows this route does not return, so it can change while every field you were given is the same, and it changes when an agent moves from the v1 to the v2 record with identical scalars. `ci.first_seen` and `ci.last_seen` can change without a hash change, so read `last_seen` even when the hash matches.
+- `blob_version` is `1` for the older record and `2` for the versioned one.
+
+An example `200` body for a page of one device (the `ci` object is shortened here: a real one carries all 34 scalar keys, and the keys are in alphabetical order on the wire):
+
+```json
+{
+  "data": {
+    "devices": [
+      {
+        "agent_id": "pc-0042",
+        "blob_version": 2,
+        "ci": {
+          "first_seen": 1762300000,
+          "last_seen": 1762690000,
+          "manufacturer": "Example Corp",
+          "model": "Example 5440",
+          "ram_bytes": 17179869184,
+          "serial": "SN0042"
+        },
+        "content_hash": "9f2c4a1e7b6d3085c1a94e27d0b83f5a6c7e1d92b4a08f3e5d6c7b8a9f0e1d2c",
+        "hostname": "pc-0042.example.test"
+      }
+    ],
+    "next_cursor": "h1:73f89ce57dce020f:NzpwYy0wMDQyHw"
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+Rows are ordered by the byte value of `agent_id` (a plain byte-wise comparison, independent of the database's locale collation: `PC-1` sorts before `agent-1`, and `10` before `2`). Every `agent_id` comparison in this route's reads is byte-ordered, the single-device read (`?agent_id=`) included, so a collation change cannot make the read skip or miss a device (see Paging below for rows that writes admitted through a stale primary key: they are served as stored, so a duplicated device can appear more than once, and a page boundary on a duplicated id can hide the extra copies; at least one row per device is always served). There is no server-side "changed since" filter yet: each run re-reads every row, so use `limit=1000` for a scheduled pull. A 1000-row page is about 1.2 MB of JSON: size client timeouts and proxy body limits for that, and prefer a smaller `limit` (the MCP tool defaults to 20) for agent use.
+
+**Paging:** follow `data.next_cursor` as `cursor` until it is empty. An empty `next_cursor` means there is nothing further to read. A non-empty one is an opaque token (it holds the last device served and nothing else): do not parse it, and do not reuse it with a different `agent_id`. A cursor is not authenticated: handing a forged one to the route can only change where the walk starts within what the caller may already read. The walk is a keyset walk ordered by byte value, and every `agent_id` comparison in the page query (the cursor bound, the scope membership test, the single-device filter and the order) is spelled byte-wise, so a change to the operating system's or libc's collation rules cannot make this READ skip or miss a device (an index on that byte order makes an index scan available for each page, and the plans measured on a representative table use it; the planner decides). That is the only thing this fix protects. Writes to the same table go through the primary key, which follows the database collation, and so do the per-device reads `GET /api/v1/hardware/{id}` and MCP `get_hardware_ci` and the CI columns of the device list `GET /api/v1/hardware`. If the collation changes under the database and the indexes are not rebuilt, the effects below were measured on an emulation of such a change (a catalogue update under an existing index, 20,000 devices, one run each; the rates are an upper bound for a real operating-system upgrade, the mechanisms are what to rely on): about 6 in 10 existing devices were not found by those per-device reads (a stored device reported as missing); every full report of a device inserted a new row instead of updating its record, so the table grew from 20,000 rows to about 38,000 in four rounds; from the third round some reports were refused outright (a failed ingest for that device); this walk then served duplicate records for one device, with different content, and for some devices not the newest one; and a decommission reported success while removing the record for only about 4 devices in 10, so most decommissioned devices stayed stored and kept being served. The stored data itself is not protected. This READ is not the problem: it stays byte-ordered and serves every stored device (it can still serve a stored copy twice, and a page boundary can hide one of two copies of the same device). The control for the rest is a later change that pauses writes to this table while a mismatch stands; until it ships, the server only reports the mismatch. Every other keyset read in the server follows the database collation too. The server only reports a collation mismatch (gauge `yuzu_pg_collation_version_mismatch`, up to about an hour after the drift begins) and stops no read and no write; a pause of writes while a mismatch stands is a later control. See the collation note in [server-admin.md](server-admin.md#postgresql-collation-version) and the evidence note `docs/security-reviews/hardware-ci-bulk-read-collation-drift-2026-11-15.md`. A complete walk is not a snapshot either: a device registered or removed while the walk runs, or a change of the caller's scope between pages, can be missed or can vanish from it (a device registered behind the cursor is returned by the next walk), so confirm each device with `GET /api/v1/hardware-ci?agent_id=<id>` before acting on its absence (that read is byte-exact, so it is unaffected by a collation change). An empty confirm page means either that no record is stored for that device OR that the device is outside the credential's scope: the two are indistinguishable by design, so use a credential with global read and treat an empty confirm as "not found" (not as "deleted"). Do not use `GET /api/v1/devices/{id}` to settle it: that route reads the live session registry of the serving server process, so it answers only for a device with a live session, and a long-offline device is `404` although its record exists. Retire a configuration item only through your own decommission process, never from the absence of a device in a walk or from a `404` on `devices/{id}`. Start the walk again after a server upgrade instead of resuming a cursor from before it. Walk the pages one at a time, not in parallel, because each page leases one connection of the server's shared PostgreSQL pool (the one that also serves permission checks and audit writes), and run large walks off-peak.
+
+**Caching.** A served page (the `200`) is sent with `Cache-Control: no-store`, because the rows carry serials, UUIDs and MAC addresses; the error responses do not set it.
+
+**Scope too wide.** A caller whose scope covers more than 10,000 devices cannot be served a page without naming a device: with no `agent_id` the route answers `400`, no store read runs and the refusal is terminal (`retry_after_ms` is `null`; do not retry it). With an `agent_id` the one device is read by key and served only if the scope admits it. A caller with global read (no scope) pages through any number of devices. The `400` body is:
+
+```json
+{
+  "error": {
+    "code": 400,
+    "message": "the caller's scope covers more than 10000 devices and no agent_id was given; a credential with global read has no such limit",
+    "correlation_id": "req-18f2a1c3d-2a",
+    "retry_after_ms": null,
+    "remediation": "use a credential with global read, pass agent_id, or ask an administrator to narrow the caller's scope"
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+The limit is judged on every page, against the caller's scope at that moment. A walk that started under a scope of at most 10,000 devices therefore aborts if the scope grows past 10,000 between two pages: the next page is this `400`, and starting the walk again gives the same `400` until the scope is narrowed or a global-read credential is used.
+
+| Status | Meaning |
+|---|---|
+| `200` | A page. |
+| `400` | `limit` is not an integer; `agent_id` is empty (message `agent_id must be a non-empty string when given`), over 256 bytes or carries a byte below `0x20` (message `invalid agent_id`), or is not valid UTF-8 or carries a NUL (message `invalid parameter encoding`, which applies to `agent_id` only); `cursor` is malformed, over 2,048 bytes, is not valid UTF-8, carries a NUL, or was issued for a different `agent_id` (one message for all of these: `invalid cursor; restart from the first page`); or the caller's scope covers more than 10,000 devices and no agent_id was given (above). The scope refusal writes a best-effort `denied` audit row, so this one `400` can also carry `Sec-Audit-Failed: true` when that row did not persist; nothing is served on that path, so the `400` stands. |
+| `403` | Caller lacks `Inventory:Read`, or the caller is an engine principal without an explicit grant (an engine principal is refused while RBAC enforcement is off), or an MCP token whose tier does not allow `Inventory:Read`, or the caller is a service-scoped token while RBAC enforcement is off (message `service-scoped tokens require RBAC to be enabled`; the body names no `permission`, because granting `Inventory:Read` does not admit such a token), or a service-scoped token whose `ITServiceOwner` ceiling lacks `Inventory:Read`. |
+| `429` | The server's general per-source-address rate limit was exceeded (default 100 requests per second per source address with a burst of 100, `--rate-limit`; see [server-admin.md](server-admin.md)). The answer carries `Retry-After: 1` and `retry_after_ms` 1000. Wait and retry the same cursor. An engine principal is also held to its own per-principal limits, `--principal-rate-limit` (default 20 requests per second) and `--principal-max-concurrency` (default 16 requests in flight), which answer `429` as well; see [server-admin.md](server-admin.md). |
+| `503` | The CI provider is unwired, the CI store could not be read (`retry_after_ms` 5000), the authorization store is unavailable (`retry_after_ms` 5000), or the audit row for the page could not be persisted (the page is withheld; the response carries `Sec-Audit-Failed: true` and `retry_after_ms` 5000). A failed store read is never a `200` with an empty page. |
+
+On a `503`, wait `retry_after_ms` and retry the SAME cursor; do not restart the walk. A `503` that carries `Sec-Audit-Failed: true` means the audit store is unavailable: the answer carries `retry_after_ms` 5000, so retry the same cursor after that delay, and escalate to an operator if it persists. Do not retry a `503` forever. As client guidance (the server does not enforce it), give up and raise an alert after 5 consecutive `503` answers on the same cursor.
+
+**Credentials.** Use a dedicated API token for the pull, not a personal one, and not a service-scoped token.
+
+> **Prerequisite: this recipe requires RBAC enforcement ON.** With enforcement off (the default) role assignments are not consulted. A non-administrator cannot mint a token at all (`403`), so the only token you can mint is an administrator's, which carries administrator-equivalent authority. `AuditLog:Read` is administrator-floored while enforcement is off, so that token reads the audit log and the audit check in step 5 shows `200` whatever role you assigned. Either turn enforcement on first (step 1) or record the administrator-equivalent token as an accepted risk in your change ticket.
+
+A token carries its creator's authority and the route does not narrow it, so with RBAC enforcement off a token minted by an administrator can do whatever an administrator can. No built-in role holds only `Inventory:Read`, and a role that does cannot be created through the product yet (see "Custom Roles" in [rbac.md](rbac.md)). `Viewer` is read-only but holds `Read` on 24 securable types fleet-wide (see "System Roles" in [rbac.md](rbac.md#system-roles)), among them the audit log, security data, user management and API tokens, so a CMDB token minted under it carries all of that read access. `ForensicsAnalyst` holds four reads (`Inventory`, `Execution`, `Response` and `Forensics`, the last being the stored rows of Forensics-tier plugins), which is no audit log but is behavioural data. The two are a tradeoff, and the choice is the CMDB owner's: `Viewer` reads more broadly (audit, security and user data) and has no Forensics tier, while `ForensicsAnalyst` reads four types but carries the Forensics behavioural-PII tier. `Operator` and `PlatformEngineer` also hold `Inventory:Read`, together with execute or write rights, so they are the wrong choice for a read-only pull. Pick the role whose extra read access you can accept, and record that choice. To give an external CMDB a token with that narrowest available authority:
+
+1. Turn RBAC enforcement on (the prerequisite above). It changes access for every operator, not only the CMDB account: a user with no management-group role sees no agents once it is on. Read the production caution under "Enabling RBAC" in [rbac.md](rbac.md#enabling-rbac) and give every operator who needs device visibility a role first; then enable it with `PUT /api/v1/rbac/enforcement`, or the **Enforce roles** switch on the Users and roles page.
+2. Create a dedicated local account for the CMDB (Settings, User Management, or **Add user** on the Users and roles page).
+3. Assign it a role fleet-wide with `POST /api/v1/rbac/roles/<role>/assignments` (`<role>` is `Viewer` or `ForensicsAnalyst`, per the paragraph above). The request body and the error answers are described under [`POST /api/v1/rbac/roles/{name}/assignments`](#post-apiv1rbacrolesnameassignments).
+4. Sign in as that account and mint the token with `POST /api/v1/tokens`, which needs `ApiToken:Write`, so assign `ApiTokenManager` to the account for that one step and remove it again afterwards (`DELETE /api/v1/rbac/roles/ApiTokenManager/assignments/<account>`). A default token never expires: give it an `expires_at` (a Unix epoch in the future, for example `$(date -d '+90 days' +%s)`; macOS `date -v+90d +%s`) in the body, such as `{"name":"cmdb-hardware-ci-pull","expires_at":<epoch>}`, and put the renewal date in your change calendar (the mint route is described under `POST /api/v1/tokens`).
+5. Check the token: `GET /api/v1/me` shows who it acts as; `GET /api/v1/audit` shows how much it reads (`200` under `Viewer`, `403` under `ForensicsAnalyst`); and a call it must not make must be refused. Make that negative test with a well-formed request, so the refusal can only be the permission check: `curl -sS -o /dev/null -w '%{http_code}\n' -X POST -H "Authorization: Bearer $YUZU_TOKEN" -H 'Content-Type: application/json' -d '{"name":"probe","expires_at":'$(date -d '+1 day' +%s)'}' "$YUZU_URL/api/v1/tokens"` must print `403`. The permission check on this route runs before the body is parsed, so a `400` (a malformed or invalid body) means the token passed it, that is, it still holds `ApiToken:Write`: treat that as a failed test, not as a refusal. If the call is not refused (`201` or `400`), the minting right was not removed in step 4: if the answer was `201`, revoke the probe token it minted as well; then revoke the CMDB token (`DELETE /api/v1/tokens/{token_id}`, the id is in `GET /api/v1/tokens`), find the remaining grant with `GET /api/v1/rbac/roles/assignments` (needs `AccessReview:Read`, held by `Administrator` and `Reviewer`; look for rows whose `principal_id` is the CMDB account and whose `role_name` is not the role you chose in step 3), remove it with `DELETE /api/v1/rbac/roles/<role>/assignments/<account>`, and repeat steps 4 and 5, starting from a new temporary `ApiTokenManager` grant. Revoking and re-minting in this failure path is hygiene, because the token was minted while the minting right was still held; removing a role itself needs no new token: the token holds no copy of its creator's roles and each request resolves the creator's current roles, so a removal applies from the token's next request on that server; with more than one replica another replica follows when it next refreshes its RBAC view (see "RBAC store integrity" in [rbac.md](rbac.md)).
+
+The steps that enable enforcement, assign or remove a role and mint a token are step-up routes: an MFA-enrolled administrator on a cookie session needs a fresh MFA proof, newer than `--mfa-step-up-window-secs` (default 300 s), or the call answers `401` `MFA step-up required` (see [authentication.md](authentication.md#step-up-on-high-risk-surfaces-pr-2)); an administrator API token is never challenged. A cookie-session write must also carry an `Origin` header naming the server (see "Cookie-session writes" under Authentication above). The new CMDB account has no MFA enrolled, so under the default `--mfa-enforcement=optional` it is not challenged for the mint. An engine principal is resolved by RBAC alone: it is refused with `403` unless RBAC enforcement is on and it holds an explicit `Inventory:Read` grant (a retryable `503` when the enforcement state or the grant cannot be read), and with that grant it reads the whole fleet. An MCP token whose tier does not allow `Inventory:Read` is refused with `403` whatever its creator holds. While RBAC enforcement is off (the default) a service-scoped token is refused with `403` (`service-scoped tokens require RBAC to be enabled`), and every non-engine principal the gate admits reads the whole fleet, because confinement exists only when RBAC enforcement is on. With RBAC enforcement on, a service-scoped token is confined to its tag set and capped by the authority of the `ITServiceOwner` role, and every other non-engine principal the gate admits is confined to its own scope (an elevated session is not confined); a confined scope over 10,000 devices is refused without an `agent_id`.
+
+**Example.** Following `next_cursor` until it is empty (`$YUZU_URL` and `$YUZU_TOKEN` are placeholders):
+
+```bash
+set -euo pipefail
+cursor=""
+while :; do
+  page=$(curl -sSf -H "Authorization: Bearer $YUZU_TOKEN" \
+    --get "$YUZU_URL/api/v1/hardware-ci" \
+    --data-urlencode "limit=1000" --data-urlencode "cursor=$cursor") \
+    || { echo "page failed (cursor=$cursor)" >&2; exit 1; }
+  prev=$cursor
+  cursor=$(jq -er '.data.next_cursor | strings' <<<"$page") \
+    || { echo "page body has no next_cursor" >&2; exit 1; }
+  jq -c '.data.devices | if type == "array" then .[] | {agent_id, hash: .content_hash, serial: .ci.serial} else error("not an array") end' <<<"$page" \
+    || { echo "page body has no devices array" >&2; exit 1; }
+  [ -z "$cursor" ] && break
+  [ "$cursor" = "$prev" ] && { echo "cursor did not advance" >&2; exit 1; }
+done
+```
+
+In the example, `$YUZU_TOKEN` is part of curl's argument list, so it is visible in `ps` and `/proc` to every local user on a shared host. Where that matters, put the header in a file and pass it with `curl -H @file`, or feed the options to curl on standard input with `--config -`; the token then never appears in the argument list. Keep that file readable by its owner only (mode `0600`), because a world-readable header file puts the token back within reach of every local user.
+
+The loop exits non-zero on any non-2xx answer (`curl -f`, with `-S` so the HTTP error is printed), and also on a `200` whose body is not a page: a body without a string `next_cursor` or without a `devices` array (an intercepting proxy's error page, a truncated body), or a `next_cursor` equal to the cursor just sent. Production code must honour `retry_after_ms` and retry the SAME cursor rather than stop. Never retire or delete configuration items on the basis of a walk that did not reach an empty `next_cursor`; a partial walk proves nothing about the devices it did not reach, and even a complete walk is not a snapshot, so confirm a device with `?agent_id=<id>` before acting on its absence, and retire a configuration item only through your own decommission process (see Paging).
+
+**Audit:** `inventory.devices.ci`, one row per served page, written after the read and fail-closed: serial, system UUID, MAC and the chassis and board serials are personal data, so a page whose audit row does not persist is not served. The detail is `hardware CI records (REST): rows=<n>[ page=continuation] scope=<fleet|authority_scoped>`; it never lists device ids. The target is `Inventory`/`fleet`, or `Agent`/`<agent_id>` when `agent_id` was given. A failed store read writes the same verb with `result=failure`. A named `agent_id` outside the caller's scope writes ONE `result=denied` row (detail `hardware CI records (REST) state=agent_id outside the caller's scope`, target `Agent`/`<agent_id>`) and the answer is the same empty page as for a device with no record; a scope over 10,000 devices with no `agent_id` writes one `result=denied` row (detail `hardware CI records (REST) state=scope too wide`). Two kinds of row are fail-closed: the `success` row of a served page and the `denied` row of a named out-of-scope `agent_id` (if either does not persist, nothing is served). Two are best effort, because nothing is served on those paths and the answer is an error either way: the `denied` row of the scope refusal and the `failure` rows. A best-effort row that does not persist can mark the response `Sec-Audit-Failed: true` (the `400` of the scope refusal, or the `503` of an unreadable store; the row for an unwired provider never sets it), and the error stands. A request refused for a malformed parameter or cursor writes no row, because nothing was served. Field-level detail is in [audit-log.md](audit-log.md).
+
+---
+
 #### `POST /api/v1/hardware/sync`
 
-Requests an on-demand software-inventory sync for a device, a scope or the whole fleet (the Software page's **Sync now**). **Permission:** `Execution:Execute`, checked as a global grant: an operator whose `Execution:Execute` is limited to management groups is refused with `403` for every scope kind. The route also confines its targets to the caller's own `Execution:Execute` visible set and refuses the whole fleet (`"scope":"__all__"`) unless that set is unfiltered (`403`); with a global grant neither changes the outcome today, and both are defence in depth for when the gate becomes scope-aware. The body names the targets with exactly one of `scope` (`__all__`, `group:<id>` or a device id, up to 256 bytes) or `scope_expression` (a scope expression, up to 1,024 bytes); `source` may only be `installed_software`.
+Requests an on-demand software-inventory sync for a device, a scope or the whole fleet (the Software page's **Sync now**). **Permission:** `Execution:Execute`, checked as a global grant: an operator whose `Execution:Execute` is limited to management groups is refused with `403` for every scope kind. The route also confines its targets to the caller's own `Execution:Execute` visible set (a device the caller cannot see is silently left out and never counted). The body names the targets with exactly one of `scope` (`__all__`, `group:<id>` or a device id, up to 256 bytes) or `scope_expression` (a scope expression, up to 1,024 bytes); `source` may only be `installed_software`.
 
-A run reaches agents attached to **this server process** only. `skipped_offline` counts the devices this server process did not reach that are not too old: it has no live session for them (a disconnected device, or one attached to another server), or the send was refused by the live stream (for example a gateway-attached agent whose gateway lacks the dispatch capability). Which devices are candidates depends on the scope: a group or a single named device lists its disconnected members too, but an `__all__` or scope-expression run lists only this server's own sessions plus the shared presence record, so a device that is offline everywhere is never counted, and if the presence read is degraded an `__all__` run lists fewer devices (those attached to other servers are not listed) while a scope-expression run is refused with 503 (the scope could not be evaluated) and sends nothing. `requested` and `skipped_offline` therefore describe what this server could reach; they are not a census of the fleet. Agents below 0.13.1 are skipped and counted in `skipped_version`. At most 500 devices are reached per request (`413`). A group, scope or fleet run is limited to one per operator per 60 seconds (`429`, `Retry-After`) (an attempt refused for exceeding 500 devices, or with no live target, counts as a run; a send every device refused does not) and one at a time (`409`; the slot is a 120 s lease a later run can take over, but only while fewer than three stalled runs are alive, after which `409` persists until one of them unwinds or the server restarts), both per server process rather than cluster-wide (with several active servers each allows its own run, still bounded by the 500-device cap); a single named device is exempt. The `202` body carries counts only (`requested`, `agents_reached`, `skipped_offline`, `skipped_version`) plus `command_id`, never device ids. A server that is missing a required component answers `500` and writes a `result=failure` audit row. A browser (session-cookie) request must carry an `Origin` or `Referer` naming this site, otherwise it is refused with `403` and a `csrf.denied` audit row; API-token and MCP-token callers are exempt. Who is reached is decided at send time by the `dispatch_confined_arms` system-reserved arm, which intersects the target list with the caller's own `Execution:Execute` visible set. The MCP tool `sync_hardware_software` is the twin of this route and shares its cooldown and its single in-flight run. The request, statuses and bounds are in the OpenAPI document. **Audit:** `inventory.sync.request`, written before dispatch (see [audit-log.md](audit-log.md)).
+**Whole group and whole fleet.** A whole group (`group:<id>`) or the whole fleet (`__all__`) is refused with `400` unless the body carries `"confirm": true`. `confirm` must be a JSON boolean: a string or a number does not confirm and is itself a `400`. A single device and a scope expression never need it. The whole fleet also needs a **fleet administrator**: an unfiltered `Execution:Execute` and the global `ManagementGroup:Write` grant (the administrator role while RBAC enforcement is off). Anyone else is refused with `403`, whether or not they confirmed. Both rules are about **naming** a group or the fleet in `scope`. A `scope_expression` is the caller's own targeting: it is evaluated inside the devices their `Execution:Execute` lets them see and needs neither `confirm` nor a fleet administrator, even when it matches every one of those devices, which for an operator whose `Execution:Execute` is unfiltered is the whole fleet. Such a run is paced, cooled down and audited like any other scope run: as `inventory.sync.request` with `arm=scope` and its counts, not as `software_estate.sync.fleet_wide`. `last_synced_before` (epoch seconds, optional) asks only the devices whose last accepted installed-software report is older than that time; a device that has never reported is asked, and the devices left out are counted in `skipped_fresh`.
+
+**No device ceiling; the run is paced.** There is no limit on the number of devices. Each run is admitted against one budget of 50 reports per second per server process, shared by every run still spreading, and a run takes at most half of what is free. The agents are asked to report inside a spread of `delay_max_s` seconds (at most 86,400; `0` means now, for a run small enough to go at once). A run that cannot start because the budget is in use is refused with `429` and `Retry-After`; one that could not be spread inside 86,400 seconds at the capacity free is refused with `413`. `delay_max_s` and `estimated_completion_at` (`requested_at + delay_max_s`) are **estimates**. The budget bounds what the server asks for, not the rate at which reports arrive: an agent keeps a fire it already armed when that is sooner than the offset it was given, so a device whose own scheduled sync is due sooner reports then, as a full send. A fleet run that lands shortly before the nightly sync window can therefore turn that window's scheduled syncs into full sends at the window's own rate.
+
+**Joining and cooldown.** A request whose group, scope expression or fleet already has a run still spreading **joins** it: `202` with that run's counts, `execution_id` and `command_id`, `"joined": true`, and nothing sent. A run is shared only by callers who would be sent the same devices: the whole fleet is one run for every fleet administrator; a group is one run for callers whose `Execution:Execute` is unfiltered; a caller confined to part of a group has runs of their own and is never handed another caller's counts; a scope expression belongs to the operator who sent it and to its exact text. A request the running run does not cover (a later or absent `last_synced_before` over a filtered run) is `409` with the time left in `retry_after_ms`, as is a request that finds the same run still being started, which lasts until its frames have been sent (`retry_after_ms` 1,000): a join only ever reports a run whose frames were accepted. After a run starts, the same group, expression or fleet waits out a cooldown, 600 seconds by default (`--inventory-sync-cooldown`, `0` for none): `429` with `Retry-After`. A send that every device refused does not start the cooldown. A single named device is exempt from the spread, the join and the cooldown. At most three send loops are alive in a server process at once; a fourth is `409`.
+
+The run state, the cooldown and the budget are held in memory, per server process: they are forgotten on restart (agents keep the delays they already armed; the execution records persist), and each replica under active-active keeps its own.
+
+A run reaches agents attached to **this server process** only. `skipped_offline` counts the devices this server process did not reach that are not too old: it has no live session for them (a disconnected device, or one attached to another server), or the send was refused by the live stream (for example a gateway-attached agent whose gateway lacks the dispatch capability). Which devices are candidates depends on the scope: a group or a single named device lists its disconnected members too, but an `__all__` or scope-expression run lists only this server's own sessions plus the shared presence record, so a device that is offline everywhere is never counted, and if the presence read is degraded an `__all__` run lists fewer devices (those attached to other servers are not listed) while a scope-expression run is refused with 503 (the scope could not be evaluated) and sends nothing. `requested` and `skipped_offline` therefore describe what this server could reach; they are not a census of the fleet. Agents below 0.13.1 are skipped and counted in `skipped_version`.
+
+The `202` body carries counts only (`requested`, `agents_reached`, `skipped_offline`, `skipped_version`, `skipped_fresh`) plus `command_id`, `execution_id`, `delay_max_s`, `estimated_completion_at` and `joined`, never device ids. `execution_id` names the run's execution record (it is `null` when nothing was sent or the record could not be created); read it with `GET /api/v1/hardware/sync/{execution_id}`. A server that is missing a required component answers `500` and writes a `result=failure` audit row. A browser (session-cookie) request must carry an `Origin` or `Referer` naming this site, otherwise it is refused with `403` and a `csrf.denied` audit row; API-token and MCP-token callers are exempt. Who is reached is decided at send time by the `dispatch_confined_arms` system-reserved arm, which intersects the target list with the caller's own `Execution:Execute` visible set. The MCP tool `sync_hardware_software` calls the same engine and shares its run keys, joins, cooldown and budget. The request, statuses and bounds are in the OpenAPI document. **Audit:** `inventory.sync.request` (the whole-fleet row is written as `software_estate.sync.fleet_wide`), written before dispatch (see [audit-log.md](audit-log.md)).
+
+---
+
+#### `GET /api/v1/hardware/sync/{execution_id}`
+
+Reports how an on-demand software sync run is going, by the `execution_id` that `POST /api/v1/hardware/sync` answered with. **Permission:** `Execution:Execute`, checked as a global grant, like the POST. A caller reads the runs it started, or any sync run when its `Execution:Execute` is unfiltered; an unknown id, another operator's run and an execution that is not a sync run all answer the same `404`, so the route does not reveal which ids exist. The `200` body carries `execution_id`, `state` (the execution record's state), `targeted` (the frames the server's sessions accepted), `acknowledged` (agents that armed the sync), `failed` (agents that answered with a failure, for example because their daily-sync scheduler is not running), `dispatched_at`, `delay_max_s` and `estimated_completion_at`. An agent answers when it **arms** the sync, not when its report lands, so `acknowledged` counts requests taken up, not reports received; a count of reports per run is not reported. `delay_max_s` and `estimated_completion_at` are estimates (see above). An execution record that cannot be read is a `503` with `retry_after_ms`, never an empty `200`; a server with no execution tracking answers `503` too. No audit row is written for a read.
 
 ---
 
@@ -2108,11 +2251,17 @@ costs neither a per-record permission check nor an audit row.
 > re-applies a device's own firewall on reconnect. `last_applied_at` means a system re-dispatch of
 > the stored whitelist was accepted (`agents_reached > 0`) — NOT proof of containment (a
 > gateway-attached agent's `send_to` only queues the frame). `last_confirmed_at` is set only after
-> a follow-up `quarantine.status` read reports `state|active` — but that read is the target
+> a follow-up `firewall.quarantine_status` read reports the device's rules in force (`status|active`) — but that read is the target
 > agent's own self-report (cert-bound to its identity, not independently corroborated by any
 > network-side signal), so treat it as strong operational evidence of containment, not proof. See
 > `docs/user-manual/security-hardening.md` "Reconnect re-application (#3425)" for the full trust
-> boundary.
+> boundary. A device that was already contained under other operator exceptions keeps them: for a
+> record that was never confirmed, `last_confirmed_at` stays `0` (audit `quarantine.reapply`,
+> `allow_set_not_applied`), and the whitelist is not on the device until it is released and quarantined
+> again.
+>
+> **`status`** is `active`, or `releasing` while a release the device has not yet confirmed is in
+> progress (the record stays listed and keeps the dispatch refusal). Ended records are not listed.
 
 ---
 
@@ -2138,7 +2287,7 @@ Quarantine a device.
 
 > **Dispatch approval check (#6065).** After the scoped `Security:Execute` gate and
 > `whitelist` validation, and before the `attempt` audit row or any record is
-> written, the route runs the shared dispatch check for `quarantine.quarantine`,
+> written, the route runs the shared dispatch check for `firewall.quarantine`,
 > the same one MCP `quarantine_device` runs. REST has no approval-ticket path today, so
 > the check admits only an **administrator**: here that means an account whose account
 > role is `admin` (a live temporary JIT elevation counts as that role). Holding the RBAC
@@ -2161,7 +2310,7 @@ Quarantine a device.
 > |---|---|---|
 > | `403` | RBAC on: the caller holds `Security:Execute` globally but is not an administrator (account role `user`, no live JIT elevation) | `approval_required` |
 > | `403` | RBAC on: the caller's own `Security:Execute` grant is not global (for example it is held only through a management group, or the caller is an administrator only through a JIT elevation), **or the RBAC store could not be read** (a transient failure reads the same as a denial) | `forbidden` |
-> | `400` | The `quarantine.quarantine` pair cannot be classified | `unclassified` or `ambiguous` |
+> | `400` | The `firewall.quarantine` pair cannot be classified | `unclassified` or `ambiguous` |
 > | `403` | Other chokepoint refusals map the same way (`kill_switched`, `anonymous_operator`); neither is reachable for this pair today, because quarantine is exempt from the per-action kill switch and an unauthenticated request ends at the `401` | `kill_switched`, `anonymous_operator` |
 > | `401` | The request's second session look-up named a different principal than the first (for example a session cookie lapsed and a bearer token for another account is on the same request); written as a `quarantine.enable` row with `result=denied` and `detail` `authenticated principal changed during the request now=<second account>` (the account name has control bytes, spaces, commas, `=` and `;` replaced by `_` and is cut at 128 bytes), naming the first account as the actor | none |
 > | `500` | The dispatch check is not wired on this server (also written as a `quarantine.enable` row with `result=failure`) | none |
@@ -2209,7 +2358,7 @@ Quarantine a device.
 |---|---|---|---|
 | `agent_id` | string | Yes | Target device ID |
 | `reason` | string | No | Human-readable reason for quarantine |
-| `whitelist` | string | No | Comma-separated IPs still allowed to communicate. Validated server-side (#3425): ≤512 characters total, each token ≤45 characters and drawn from `[0-9A-Fa-f.:]` — the same charset the reconciler and MCP's `quarantine_device` retry path require before ever dispatching a stored whitelist. Rejected with `400`, not written. |
+| `whitelist` | string | No | Comma-separated bare IPv4 or IPv6 addresses (at most 32) still allowed to communicate; each is sent to the firewall plugin as an outbound and an inbound exception. Validated server-side by the one rule the reconciler and MCP's `quarantine_device` also apply before dispatching a stored whitelist: a port, a prefix length, an IPv4-mapped form, a leading-zero octet or any other token the plugin's exception grammar cannot express is refused. Rejected with `400` (`whitelist must be comma-separated IPv4 or IPv6 addresses, at most 32`), not written. |
 
 **Response (201):**
 
@@ -2240,7 +2389,7 @@ Quarantine a device.
 >
 > - A `201` here means **the record was written**, not that the device's
 >   firewall is enforcing anything **yet**. To isolate a device immediately,
->   dispatch `quarantine.quarantine` through the normal execution routes as
+>   dispatch `firewall.quarantine` through the normal execution routes as
 >   well — see [Security Hardening](security-hardening.md#device-quarantine).
 >   **As of #3425, "yet" is load-bearing: this route no longer leaves a
 >   record permanently unenforced.** `QuarantineContainmentReconciler`
@@ -2254,13 +2403,10 @@ Quarantine a device.
 >   reachable device does not stay dormant — the one exception is a stored
 >   `whitelist` the re-dispatch validator refuses. As of #3425 (`d1f71c58f`)
 >   this route validates `whitelist` at write time (`400` instead of `201`
->   for a malformed value), the same rule MCP's `quarantine_device` already
->   enforced — so a fresh write here can no longer land in this state. A
->   `validation_failed` reconcile now points at a record written via this
->   route before `d1f71c58f` shipped, or — on a fleet with pre-#3623 history
->   — one migrated from a legacy `quarantine.db` by the since-retired
->   `migrate_from_sqlite` backfill (ADR-0047, which copied `whitelist`
->   verbatim with no validation), not a fresh call. Either way, every reconcile
+>   for a malformed value), the same rule MCP's `quarantine_device`
+>   enforces — so a fresh write here cannot land in this state. A
+>   `validation_failed` reconcile points at a record written under an
+>   earlier, looser rule, not a fresh call. Either way, every reconcile
 >   attempt then counts `validation_failed` and nothing is ever dispatched.
 >   That failure is loud, not silent — the device stays in
 >   `yuzu_server_quarantine_endpoint_unconfirmed{reachability="connected"}`
@@ -2324,7 +2470,7 @@ Quarantine a device.
 > | *(absent)* | Genuinely no agent reachable — the pre-existing meaning. | *(absent)* |
 >
 > `plugin_not_found`, `kill_switched_os` and `os_gate_unreadable` are never produced for a
-> protective action (the quarantine plugin's four actions, the firewall plugin's four containment actions and `__guard__.push_rules`); see
+> protective action (the firewall plugin's four containment actions and `__guard__.push_rules`); see
 > [Upgrading](upgrading.md#behaviour-change-protective-actions-exempt-from-plugin-enablement).
 >
 > `reason` is a top-level key on the error object, not part of the A4
@@ -2352,9 +2498,9 @@ Quarantine a device.
 > result-set producers still do **not** carry this split — their own
 > response-building code was not extended to surface the richer per-arm
 > result their shared dispatch closure now carries (a separate, smaller
-> follow-up per route). The quarantine
-> plugin's own four actions (`quarantine`, `unquarantine`, `status`,
-> `whitelist`) are exempt so that release stays reachable, and so are four
+> follow-up per route). The firewall
+> plugin's four containment actions (`quarantine`, `release`,
+> `quarantine_status`, `quarantine_allow`) are exempt so that release stays reachable, and so are four
 > server-internal pushes that are not operator dispatch —
 > `echo.fleet_snapshot`, `__guard__.push_rules`, `asset_tags.sync` and
 > `__sync__.now`, a closed set counted (not per-event audited) by
@@ -2371,10 +2517,11 @@ Quarantine a device.
 
 #### `DELETE /api/v1/quarantine/{agent_id}`
 
-Release a device from quarantine. This ends the server's quarantine **record** only: it does
-**not** remove the device's firewall rules. To lift those, run the quarantine plugin's release
-instruction (`security.quarantine.release`, "Release Device from Quarantine") from the Instructions
-page or through `execute_instruction`.
+Release a device from quarantine. The route asks the device to lift its firewall rules (it sends
+`firewall.release` as the caller) and waits up to 5 seconds for the reply. The record **ends only on
+the device's confirmation** (`status|inactive`): `200` when it arrives in time, `202` otherwise. A
+record whose release is not yet confirmed reads `releasing` in the list, stays listed and keeps the
+dispatch refusal; the server's reconciler finishes the release when the device is reachable.
 
 **Permission:** `Security:Execute`, scoped per-device (see the note above)
 
@@ -2382,35 +2529,90 @@ Like `POST`, the release writes a `quarantine.disable` row with `result=attempt`
 before the change and answers `503` (`Sec-Audit-Failed: true`) without releasing
 the device if that row cannot be written.
 
+**Query parameter:** `force` (optional). `true` ends the record without the device's confirmation
+(see below); `false` or absent is the plain call; **any other value, an empty one included, is a `400`**
+(`force must be true or false`) with a `failure` audit row and no release requested or dispatched.
+
 **Dispatch approval check (#6065).** After the scoped gate, and before the `attempt` audit row
 and the release, the route runs the same dispatch approval check as `POST`, for the
-`quarantine.unquarantine` pair: a caller who cannot create a record cannot end one. The
-answers, statuses and reason labels are the table under `POST`, with the pair read as `quarantine.unquarantine` and the audit verb as `quarantine.disable`; a refusal leaves the record
+`firewall.release` pair: a caller who cannot create a record cannot end one. The
+answers, statuses and reason labels are the table under `POST`, with the pair read as `firewall.release` and the audit verb as `quarantine.disable`; a refusal leaves the record
 active, writes a `quarantine.disable` audit row with `result=denied` and `detail`
 `reason=<label> securable=<name>` (no `attempt` row), and increments
 `yuzu_server_dispatch_denied_total{reason}`. The `remediation` text names the MCP supervised
 flow, which has no release tool, so a non-administrator has no path to release through REST,
-the dashboard or MCP; an administrator releases it. Running the plugin's `unquarantine` without
-ending the record does not release the device from the server's side: the record stays active,
-the lens can keep reading the earlier confirmation, and containment is re-applied at the next
-session change, so an administrator should end the record first.
+the dashboard or MCP; an administrator releases it. A repeated `DELETE` on a releasing record
+sends the release again; it is not a `400`.
 
 The `401` for a changed principal, the `500` for an unwired audit identity writer and the
 session-stamped audit rows are exactly as for `POST` above, with the audit verb
 `quarantine.disable`.
 
-**Response:**
+**Response (`200`, the device confirmed the release, or the record was already ended and the device confirmed it):**
 
 ```json
 {
-  "data": { "released": true },
+  "data": { "released": true, "state": "released", "forced": false, "device_confirmed": true },
   "meta": { "api_version": "v1" }
 }
 ```
 
+**Response (`202`, not confirmed yet; the record stays `releasing`):**
+
+```json
+{
+  "data": { "released": false, "state": "releasing", "command_id": "..." },
+  "meta": { "api_version": "v1" }
+}
+```
+
+`202` covers every outcome short of the device's `inactive`: the device is offline, the dispatch was
+refused or threw, no reply arrived in 5 seconds, or the reply was anything else (a privilege refusal
+such as `status|refused|privilege_unavailable`, a partial release). The wait shares the 4-slot live
+in-flight budget with the DEX live route; with no slot free the release is dispatched and the answer
+is `202` without waiting.
+
+**Forced end (`?force=true`, REST only).** For a device that will not return, or one that cannot finish
+a release (a Linux host on the packaged systemd unit refuses every mutating firewall action), the
+same call with `?force=true` runs the same gates and the same release attempt, and where the plain
+call would answer `202` it ends the record at once:
+
+```json
+{
+  "data": {
+    "released": true, "state": "released", "forced": true, "device_confirmed": false,
+    "message": "Record ended without the device's confirmation. The device may still be contained.",
+    "command_id": "..."
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+A forced end **does not release the device**. The device may still be contained; the server stops
+refusing commands to it, so the operator has chosen to treat it as reachable; and the reconciler still
+owes it a release, which it reads and sends once per reconnect (`yuzu_server_quarantine_forced_release_owed`),
+and a `firewall.release` sent through any generic route reaches it at any time. A reachable device is
+still released for real: if it answers `inactive` within the wait the answer says `forced: false,
+device_confirmed: true`. The authority is the release's own (the scoped `Security:Execute` gate, the
+same-principal check and the dispatch check for `firewall.release`); no new permission or approval
+exists. Audit rows name the operator: the `attempt` row's `detail` is `force=true`, the outcome row
+`state=released reason=forced device_confirmed=false record_id=<id>`. A store failure while ending the
+record is a retryable `503` (the record stays releasing), never a `202` that hides it.
+
+**A record already ended by someone else.** When another writer ends the record between this call's
+release request and its own end (the reconciler, or a second `DELETE` for the same device), this call
+answers `200` with that record's real end. A forced call reads that end back from the store; a call
+whose own wait read `inactive` reads nothing back and answers on the device's word. A record ended on
+the device's confirmation: `forced: false, device_confirmed: true`. A forced end by the other writer
+still owes the device a release: the same body as a forced end, `forced: true, device_confirmed: false`
+and the message that the device may still be contained. A forced call that cannot read the record back
+(the read fails or the row is gone) answers the same way, never as a confirmed end. The audit row is
+`state=released record_id=<id> already_ended device_confirmed=<true|false>` and names no one: the
+writer that ended the record has its own `quarantine.disable` row with the same `record_id`.
+
 > **`400` vs `503` (ADR-0047).** Same distinction as `POST` above — `400`
-> means the device is not currently quarantined (retrying will not help);
-> `503` means a genuine store/pool failure (retrying is reasonable).
+> means the device is not currently quarantined or `force` is not `true`/`false` (retrying will not
+> help); `503` means a genuine store/pool failure (retrying is reasonable).
 
 ---
 
@@ -8473,7 +8675,7 @@ Same ETag / `Cache-Control: public, max-age=300` / `If-None-Match` → `304` con
 Settings > Developer and API (`GET /settings/developer`, administrators only; others are redirected to the dashboard) is a front for the discovery routes above, plus a load generator control. It adds no REST route and no MCP tool: its four read panels are `GET /fragments/settings/developer/api`, `.../routes`, `.../permissions` and `.../plugins` (plus `.../plugins/observed`, loaded on request), which call the same builders in process. Every fragment is administrators only, like the page, and then takes the same `Infrastructure:Read` gate as the REST twins. The role grid in the permissions panel needs `UserManagement:Read` and is otherwise replaced by a note; that check is a draw-time decision and writes no denial row for a dashboard session (a token caller keeps its denial row).
 
 - **API:** the OpenAPI document link, an **Open API reference** button that opens the `/swagger` page in a new tab, and a live count of documented operations. The count is path x method pairs in the hand-maintained OpenAPI document, not the number of registered routes, so it includes the operations marked unavailable.
-- **Routes:** the `/discover/routes` catalogue with a path/summary filter, capped at 300 rows. A route's free-text `description` is not shown. An operation the document lists but this build does not serve (the `unavailable` field of the catalogue) keeps its row and carries an **unavailable** marker with the reason, so it is not mistaken for a callable route.
+- **Routes:** the `/discover/routes` catalogue with a path/summary filter, capped at 350 rows. A route's free-text `description` is not shown. An operation the document lists but this build does not serve (the `unavailable` field of the catalogue) keeps its row and carries an **unavailable** marker with the reason, so it is not mistaken for a callable route.
 - **Permissions:** each `Securable:Operation` pair with the roles that allow it. The role grid needs `UserManagement:Read`, as on `/discover/permissions`; without it the page says so instead of listing nothing.
 - **Plugins:** the build-embedded manifests with per-OS support. The list of plugins connected devices currently report is a separate, on-request list: no connected device is not the same as no plugins.
 
@@ -11385,10 +11587,9 @@ narrow the all-OS layer but never widen it, and within the OS layer an `action@o
 }
 ```
 
-For a **protective action** (the quarantine plugin's `quarantine`/`unquarantine`/`status`/`whitelist`,
-the firewall plugin's `quarantine`/`release`/`quarantine_status`/`quarantine_allow`
+For a **protective action** (the firewall plugin's `quarantine`/`release`/`quarantine_status`/`quarantine_allow`
 and `__guard__.push_rules`) the state shown is for information only: `enabled: false` can be displayed
-while dispatch still goes ahead (see
+while dispatch still goes ahead. A plugin-level `firewall` row never stops those four and still stops `state` and `rules`, so `protective_exempt=partial` on it means 'covers a protective action', not 'gates nothing' (see
 [Security Hardening](security-hardening.md) and [Upgrading](upgrading.md)).
 
 **Errors:** `400` (invalid plugin/action/os, or `?os=` present but empty), `503` (store unavailable).

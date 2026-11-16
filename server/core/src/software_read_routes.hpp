@@ -37,16 +37,12 @@
 #include "software_changes_model.hpp"
 #include "software_hosts_model.hpp"
 #include "software_inventory_store.hpp"
+#include "software_read_api.hpp"
 
 #include <httplib.h>
 
-#include <cstdint>
 #include <functional>
-#include <memory>
-#include <optional>
 #include <string>
-#include <unordered_map>
-#include <vector>
 
 namespace yuzu::server {
 
@@ -61,35 +57,15 @@ public:
     using AuditFn = std::function<bool(const httplib::Request& req, const std::string& action,
                                        const std::string& result, const std::string& target_type,
                                        const std::string& target_id, const std::string& detail)>;
-    /// The device table's roster (the one the UI device table reads): the newest rows seen in the
-    /// last 30 days, and whether MORE existed (`truncated`, #5712). A failed read is nullopt, not an
-    /// empty roster: the hosts search decides from the roster, so it must tell "no such device"
-    /// from "the roster could not be read". A truncated roster is served and flagged
-    /// (`roster_truncated`), never refused. Where the roster only names devices, a failed or
-    /// unwired read leaves the names null.
-    using RosterFn = std::function<std::optional<OfflineRoster>()>;
-    /// The current fleet snapshot, or null before the first successful refresh.
-    using SnapshotFn = std::function<std::shared_ptr<const SoftwareFleetSnapshot>()>;
-    using NowFn = std::function<std::int64_t()>; ///< epoch seconds; empty = the system clock
-
+    /// The device table's roster, the fleet snapshot, the clock and the store reads are the
+    /// transport-neutral API's own types (software_read_api.hpp), shared with the MCP twins.
+    using RosterFn = software_read_api::RosterFn;
+    using SnapshotFn = software_read_api::SnapshotFn;
+    using NowFn = software_read_api::NowFn;
     /// The store reads, injectable so the route logic is testable without Postgres. Every member a
     /// caller leaves empty is bound to `Deps::store` at registration; with no store the routes
     /// answer 503.
-    struct Reads {
-        software_hosts::HostsReader hosts;
-        software_changes::ChangesReader changes;
-        software_catalogue::DevicesReader installs;
-        std::function<std::optional<std::unordered_map<std::string, std::int64_t>>(
-            const std::vector<std::string>&)>
-            last_seen;
-        std::function<std::optional<std::vector<FacetHealth>>(
-            const std::optional<std::vector<std::string>>&)>
-            facet_health;
-        std::function<std::optional<SoftwareSummary>(
-            std::int64_t, const std::optional<std::vector<std::string>>&)>
-            summary;
-        std::function<std::optional<CatalogRollupMeta>()> catalog_meta;
-    };
+    using Reads = software_read_api::Reads;
 
     struct Deps {
         FleetReadFn fleet_read_fn;

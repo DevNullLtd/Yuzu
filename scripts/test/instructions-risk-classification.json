@@ -8,8 +8,8 @@
     "                      safe to run against a UAT stack.",
     "  destructive       - modifies host filesystem, registry, services, or runs arbitrary",
     "                      code. NOT run by default --instructions mode.",
-    "  network-disrupt   - disconnects host network; only run inside the quarantine",
-    "                      ceremony (PR B).",
+    "  network-disrupt   - disconnects host network (the firewall containment actions);",
+    "                      opt-in only, via --risks.",
     "  interactive       - pops UI on the host; opt-in only.",
     "  forensic          - the server refuses a broadcast and requires exactly one explicit",
     "                      in-scope agent_id (dispatch_destructive_gate.hpp); the runner sends",
@@ -43,9 +43,9 @@
   ],
 
   "_overrides": {
-    "security.quarantine.isolate":            "network-disrupt",
-    "security.quarantine.release":            "network-disrupt",
-    "security.quarantine.whitelist":          "network-disrupt",
+    "security.firewall.quarantine":           "network-disrupt",
+    "security.firewall.release":              "network-disrupt",
+    "security.firewall.quarantine_allow":     "network-disrupt",
 
     "device.script_exec.exec":                "destructive",
     "device.script_exec.powershell":          "destructive",

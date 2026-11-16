@@ -45,9 +45,24 @@ class MetricsRegistry;
 
 namespace yuzu::server::pg {
 class PgPool;
-}
+struct PgMigration;
+} // namespace yuzu::server::pg
 
 namespace yuzu::server {
+
+/// The store's migration array (schema `device_inventory_store`), so a test can pin the text a
+/// migration carries (the transaction-local settings of v4) without a second copy of it.
+[[nodiscard]] const std::vector<pg::PgMigration>& device_inventory_migrations();
+
+/// The statement `DeviceInventoryStore::list_device_ci_after` runs for `q` and its bound
+/// parameters, in placeholder order. Exposed so a test can EXPLAIN the REAL statement (a copy of
+/// the text in a test would stay green with the store's spelling changed). Does not check the
+/// deny-all scope (`q.agent_ids` present and empty), which the store answers without SQL.
+struct DeviceCiKeysetStatement {
+    std::string sql;
+    std::vector<std::string> params;
+};
+[[nodiscard]] DeviceCiKeysetStatement device_ci_keyset_statement(const DeviceCiKeysetQuery& q);
 
 /// Bounds of one `list_device_ci_for` read. A struct so a test can inject a tiny chunk and an
 /// already-spent budget without the production caller naming either.
@@ -124,6 +139,23 @@ public:
     /// WHOLE read, never a partial vector and never a silent empty. Order is unspecified.
     [[nodiscard]] std::optional<std::vector<DeviceCiRecord>>
     list_device_ci_for(const std::vector<std::string>& agent_ids, DeviceCiKeyedReadLimits limits = {});
+
+    /// One KEYSET page of the stored CI rows (scalar columns plus the stored `content_hash`, no
+    /// sections), ordered by the BYTE value of `agent_id` ascending (`agent_id COLLATE "C"`, not the
+    /// database collation, so a libc/ICU change under an existing volume cannot make a walk skip
+    /// or miss a row; a duplicate row admitted by a write through a stale primary key is a
+    /// write-side residual; migration v4 builds the matching index): `agent_id > after`, then up to
+    /// `limit` rows (a `limit` `<= 0` or above the 100000-row ceiling, the store's `kListRowCap`,
+    /// reads the ceiling). `agent_id` and `agent_ids` narrow the
+    /// read in SQL; a present-empty `agent_ids` is an empty page with no SQL. The query runs in a
+    /// transaction under `SET LOCAL statement_timeout = '5s'`: a SELECT that runs past 5 s is
+    /// cancelled and that is a `std::nullopt` (the cap is per statement, not a bound on the whole
+    /// call). Reads the CI table directly, so a device is returned for as long as its row exists,
+    /// whatever its last contact. Authoritative: `std::nullopt` on a closed store, a lease timeout
+    /// or a query error, NEVER an empty page. Reads serial / UUID / MAC: any caller must sit behind
+    /// the fail-closed `inventory.devices.ci` audit and the Inventory:Read scope gate.
+    [[nodiscard]] std::optional<std::vector<DeviceCiRecord>>
+    list_device_ci_after(const DeviceCiKeysetQuery& q);
 
     /// One agent's v2 per-section statuses + list rows (cpu, dimm, disk, swap, volume,
     /// partition, topology; chassis/baseboard/machine_id carry a status only), in the

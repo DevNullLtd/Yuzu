@@ -531,6 +531,12 @@ struct Config {
     /// lease from the held-open stream budget (--max-sse-streams); this is the cap on those
     /// leases. A request over the cap is answered 503 with a retry hint.
     int inventory_export_concurrency{2};
+    /// Seconds between two on-demand software-inventory sync runs of the SAME run key (one
+    /// management group, one operator's scope expression, or the whole fleet): `POST
+    /// /api/v1/hardware/sync` and the MCP tool `sync_hardware_software`. 0 turns the gap off.
+    /// Per server process. The default equals `software_sync::kDefaultCooldownSecs` and the range
+    /// is 0..`kMaxCooldownSecs` (--inventory-sync-cooldown; server.cpp clamps it).
+    int inventory_sync_cooldown_s{600};
 
     // Fleet visualization (PR 3 of feat/viz-engine ladder)
     bool viz_disable{false}; // Kill switch: reject all /viz/fleet requests (DEP-1)
