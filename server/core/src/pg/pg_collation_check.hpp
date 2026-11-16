@@ -17,8 +17,9 @@
 /// (`check_collation_version`) that fetches them with one short bounded transaction. Neither
 /// throws. The check never stops the server: it logs the result, exports a gauge, and keeps
 /// booting whatever the verdict, because an operator must be able to start the server to fix the
-/// database. It refuses and pauses nothing; the gauge and the log are the whole of its output. It
-/// runs once at start and is repeated by `PgCollationRecheck` (hourly once a conclusive Ok or
+/// database. Besides the gauge and the log it publishes a lock-free `CollationGate` (below) that
+/// the consumers read: a Mismatch pauses device_ci writes, and any gate other than Trusted
+/// refuses the device_ci reads that walk the text key. It runs once at start and is repeated by `PgCollationRecheck` (hourly once a conclusive Ok or
 /// NotApplicable stands and the checks are readable; every minute while a Mismatch stands, no
 /// conclusive verdict exists yet, or the latest check was unreadable), so drift that appears while
 /// the server keeps running (a provider maintenance event that changes the host library) is seen,
@@ -213,8 +214,11 @@ inline constexpr const char* kCollationLastCompletedGauge =
 /// `state` is owned by one caller at a time (the constructor, then the recheck loop).
 ///
 /// `gate`, when non-null, receives `gate_for(next.last)` with `memory_order_release` on every
-/// report, before the metric and log work (so a throw there cannot withhold it); null publishes
-/// nothing. The caller initialises the atomic to `kInitialCollationGate`.
+/// CONCLUSIVE report (Ok, NotApplicable, Mismatch), before the metric and log work (so a throw
+/// there cannot withhold it). An Unreadable report never writes it: `state` advances only after
+/// that work, so it can lag the gate, and a value recomputed from it could overwrite a standing
+/// Mismatch with a stale Trusted. Null publishes nothing. The caller initialises the atomic to
+/// `kInitialCollationGate`.
 void report_collation_check(const CollationReport& report, yuzu::MetricsRegistry* metrics,
                             CollationState& state,
                             std::atomic<CollationGate>* gate = nullptr) noexcept;

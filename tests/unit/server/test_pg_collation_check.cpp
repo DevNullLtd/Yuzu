@@ -22,12 +22,15 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <libpq-fe.h>
+#include <spdlog/sinks/base_sink.h>
 
 #include <atomic>
 #include <initializer_list>
 #include <chrono>
 #include <functional>
 #include <memory>
+#include <mutex>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -59,6 +62,39 @@ bool has_series(yuzu::MetricsRegistry& m) {
     const std::string sample = std::string("\n") + kCollationMismatchGauge + " ";
     return ("\n" + text).find(sample) != std::string::npos;
 }
+
+// The seam for "the best-effort metric/log work of a report throws": the default logger is
+// swapped for one whose sink throws on every record it is asked to write, and whose error handler
+// rethrows, so the exception leaves the spdlog call inside `report_collation_check` (spdlog would
+// otherwise swallow it). Only records at or above `lvl` reach the sink, so a test picks which log
+// line throws (ERROR: the mismatch entry). `report_collation_check` is noexcept and catches it,
+// leaving `state` behind: the lagging-state condition under test.
+struct ThrowingDefaultLogger {
+    struct ThrowingSink : spdlog::sinks::base_sink<std::mutex> {
+        void sink_it_(const spdlog::details::log_msg&) override {
+            throw std::runtime_error("test sink throws");
+        }
+        void flush_() override {}
+    };
+    explicit ThrowingDefaultLogger(spdlog::level::level_enum lvl)
+        : prev_(spdlog::default_logger()) {
+        auto logger =
+            std::make_shared<spdlog::logger>("test_throwing_logger", std::make_shared<ThrowingSink>());
+        logger->set_level(lvl);
+        logger->set_error_handler(
+            [](const std::string&) { throw std::runtime_error("test error handler rethrows"); });
+        spdlog::set_default_logger(logger);
+    }
+    ~ThrowingDefaultLogger() {
+        spdlog::drop("test_throwing_logger");
+        spdlog::set_default_logger(prev_);
+    }
+    ThrowingDefaultLogger(const ThrowingDefaultLogger&) = delete;
+    ThrowingDefaultLogger& operator=(const ThrowingDefaultLogger&) = delete;
+
+private:
+    std::shared_ptr<spdlog::logger> prev_;
+};
 
 // A state reached by a conclusive verdict, optionally followed by an unreadable spell.
 CollationState st(CollationLast last, bool unreadable = false) {
@@ -158,6 +194,52 @@ TEST_CASE("collation gate: published from the surviving state, not from the verd
     // Nothing conclusive yet stays Unproven.
     CHECK(run({V::Unreadable}) == CollationGate::Unproven);
     CHECK(run({V::Unreadable, V::Unreadable}) == CollationGate::Unproven);
+}
+
+// SG-1 / ARCH-1 / CI-1. `state` advances only after the metric and log work, so a throw there
+// leaves it behind the gate. An Unreadable report recomputed from that stale state would store
+// Trusted over a standing Mismatch (writes resume). Kills: publishing the gate on an Unreadable
+// report. The pin demands Mismatch exactly, not merely "not Trusted".
+TEST_CASE("collation gate: an Unreadable report never writes the gate, so a lagging state cannot "
+          "reopen a standing Mismatch",
+          "[pg_collation][gate]") {
+    std::atomic<CollationGate> gate{kInitialCollationGate};
+    CollationState state;
+
+    SECTION("Ok, a Mismatch whose log work throws, then Unreadable: the gate stays Mismatch") {
+        report_collation_check(report(CollationVerdict::Ok, "a", "a"), nullptr, state, &gate);
+        REQUIRE(gate.load() == CollationGate::Trusted);
+        {
+            // The mismatch ERROR line is the work that throws.
+            ThrowingDefaultLogger throwing(spdlog::level::err);
+            report_collation_check(report(CollationVerdict::Mismatch, "a", "b"), nullptr, state,
+                                   &gate);
+        }
+        // The conclusive verdict was published before the throw; the state was not advanced.
+        REQUIRE(gate.load() == CollationGate::Mismatch);
+        REQUIRE(state.last == CollationLast::Ok);
+
+        report_collation_check(report(CollationVerdict::Unreadable), nullptr, state, &gate);
+        CHECK(gate.load() == CollationGate::Mismatch);
+        report_collation_check(report(CollationVerdict::Unreadable), nullptr, state, &gate);
+        CHECK(gate.load() == CollationGate::Mismatch);
+
+        // A later conclusive verdict still moves it, in both directions.
+        report_collation_check(report(CollationVerdict::Ok, "a", "a"), nullptr, state, &gate);
+        CHECK(gate.load() == CollationGate::Trusted);
+    }
+    SECTION("from a fresh state a first Unreadable leaves Unproven") {
+        report_collation_check(report(CollationVerdict::Unreadable), nullptr, state, &gate);
+        CHECK(gate.load() == CollationGate::Unproven);
+        report_collation_check(report(CollationVerdict::Unreadable), nullptr, state, &gate);
+        CHECK(gate.load() == CollationGate::Unproven);
+    }
+    SECTION("an Unreadable report leaves whatever the gate holds, whatever the state says") {
+        // The gate is not derived from `state` on an Unreadable report at all.
+        gate.store(CollationGate::Mismatch);
+        report_collation_check(report(CollationVerdict::Unreadable), nullptr, state, &gate);
+        CHECK(gate.load() == CollationGate::Mismatch);
+    }
 }
 
 TEST_CASE("collation gate: publishing through a null pointer is a no-op", "[pg_collation][gate]") {

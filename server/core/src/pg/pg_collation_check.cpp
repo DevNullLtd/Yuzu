@@ -199,10 +199,14 @@ void report_collation_check(const CollationReport& report, yuzu::MetricsRegistry
                             CollationState& state, std::atomic<CollationGate>* gate) noexcept {
     try {
         const CollationStep step = next_collation_state(state, report.verdict);
-        // Published first and from `step.next.last`, which an Unreadable carries over from the
-        // previous state: the gate is safety state and must not depend on the best-effort work
-        // below succeeding.
-        if (gate)
+        // A CONCLUSIVE verdict publishes first, before the best-effort metric and log work below,
+        // so a throw there cannot withhold it: the gate is safety state. An Unreadable report
+        // publishes NOTHING. `step.next.last` for an Unreadable is the carried-over `state.last`,
+        // and `state` lags the gate whenever the work below threw after a conclusive store (it
+        // advances last), so recomputing from it could write a stale value over a newer one (a
+        // standing Mismatch replaced by Trusted). The surviving gate value, or the boot value
+        // Unproven, is the only correct answer to "the check could not run".
+        if (gate && report.verdict != CollationVerdict::Unreadable)
             gate->store(gate_for(step.next.last), std::memory_order_release);
         // `state` advances LAST. The transition-only log lines (the mismatch ERROR, the unreadable
         // WARN, the clearing INFO) are decided by comparing a verdict with the previous state, so a
