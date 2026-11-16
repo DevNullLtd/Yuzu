@@ -39,7 +39,8 @@
  *        10,000, the rows below that mark first: a row below it was usually summarised, but the
  *        clock-gap clamp and a backfill left some out, so it folds only where the converted first
  *        tier holds no row for its bucket and keys and the bucket is newer than the tier's oldest
- *        (the budget evicted older ones while raw rows survived); a cursor source keeps its
+ *        (retention or the budget removed older ones while raw rows survived);
+ *        a cursor source keeps its
  *        single pass at the floor. The process rows past `usage_hwm_id` (the usage fold's own
  *        cursor, deleted in step 5) are
  *        also fed to the usage fold in this transaction when usage is enabled and Active (the
@@ -882,15 +883,22 @@ private:
     //     converted tier holds no row for its bucket and keys, and rows at or above it fold as
     //     they are (cursor sources are outside the held-bucket test and keep the single pass at
     //     the floor; see the last residual).
-    // Residuals, all erring toward not folding: a raw row in the range the pre-v10 byte budget
-    // evicted from the first tier (at or before its oldest bucket); a raw row whose bucket and
-    // keys the converted tier holds only because OTHER events of that bucket and keys were
-    // summarised (an event kind the old tier did not count); in finish_rollup, the rest of an
-    // upper bucket whose old range began mid-bucket after the old clock-gap clamp (boundary -
-    // max_gap; mid-bucket only for the monthly step); and cursor sources, which the held-bucket
-    // test does not cover and whose migration fold never consults the replay ring: a file that
-    // gave one a summary tier or a mark would keep the old rule with both gaps (no shipped schema
-    // gave power, removable or registry either, so no file in the field takes that path).
+    // Residuals, all erring toward not folding:
+    //   - a raw row at or before the first tier's oldest bucket (the pre-v10 build aged buckets
+    //     out oldest first: an hourly row after 24 hours, 31 days for perf and procperf, a daily
+    //     row after 31 days, its byte budget sooner on a build that had one, while raw rows,
+    //     kept by row count, survived);
+    //   - a raw row whose bucket and keys the converted tier holds although the row itself was
+    //     never summarised (a row a backfill wrote after its bucket was rolled, or an event kind
+    //     the old tier did not count; the old GROUP BY kept no row identity);
+    //   - in finish_rollup, an upper bucket the tier above already holds is never completed (the
+    //     rest of a month whose old range began mid-month after the old clock-gap clamp, boundary
+    //     - max_gap; and a finer row the step below has just added, such as a day the daily tier
+    //     lacked);
+    //   - and cursor sources, which the held-bucket test does not cover and whose migration fold
+    //     never consults the replay ring: a file that gave one a summary tier or a mark would keep
+    //     the old rule with both gaps (no shipped schema gave power, removable or registry either,
+    //     so no file in the field takes that path).
     // The old tiers carried no unique index, so a
     // re-rolled range wrote a second row and the conversion merged it: the rule never counts that
     // range twice and never completes it.
@@ -981,10 +989,10 @@ private:
     // The held-bucket test of the raw rows below a stored mark (pass 1 of fold_raw): a row folds
     // only when its first-tier bucket is NEWER than the converted tier's oldest bucket AND the
     // converted tier holds no row for its bucket and keys.
-    //   - Newer than the oldest bucket: the pre-v10 budget evicted hourly buckets oldest first
-    //     while raw rows survived, so a bucket's absence inside the evicted range does not mean
-    //     "never summarised" and folding there would double count the daily and monthly tiers.
-    //     An empty tier admits nothing.
+    //   - Newer than the oldest bucket: the pre-v10 build aged first-tier buckets out oldest
+    //     first (retention, or its byte budget) while raw rows survived, so a bucket's absence
+    //     inside the evicted range does not mean "never summarised" and folding there would
+    //     double count the daily and monthly tiers. An empty tier admits nothing.
     //   - Holds no row: asked of the converted first tier, on the key columns the old GROUP BY
     //     carried (`keys`) -- the tier's other key columns are enrichment the old pass never
     //     wrote, '' or 0 in every converted row, which a delta may now name. The tier is read as

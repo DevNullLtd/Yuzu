@@ -42,10 +42,13 @@ releases exactly the resource listed.
   retry still runs on the trigger thread and holds the locks for its duration.
 - **Failure:** a fault, crash or power loss before COMMIT leaves schema v9 and every retired table
   intact (SQLite's WAL recovery discards the unfinished transaction); the next open redoes the step.
-- **Rows not folded:** raw rows older than the first old tier's mark (`ts < mark`) are dropped with the
-  raw tables, not folded: the old roll-up already summarised them except rows a process-event backfill
-  wrote and rows its clock-gap clamp skipped, and its `GROUP BY` kept no identity to tell the two apart,
-  so folding them would double-count the first group. The count is in the migration's log line. The mark
+- **Rows below the mark:** a raw row older than the first old tier's stored mark (`ts < mark`) is
+  folded only where the converted tier holds no row for its bucket and the key columns the old
+  `GROUP BY` carried, and the bucket is newer than the tier's oldest; the others are dropped with the
+  raw tables. The old roll-up already summarised most of them, but its clock-gap clamp and a
+  process-event backfill left some out, and its `GROUP BY` kept no row identity, so the decision is
+  made per bucket and key against the converted tier, never per row. The rows read, the events folded
+  and the events skipped are in the migration's log line. The mark
   IS a clock-derived value (a persisted reading of the old pass's clock), so the DROP's cutoff is
   clock-derived and `clock-guarded-retention.md` carries a row for it: every mark is read once and
   validated (not an integer, absent for a populated tier, or ahead of the finer tier's: the migration
@@ -55,10 +58,12 @@ releases exactly the resource listed.
   converted tier with no such bucket refuses the migration with the mark named rather than fold
   every raw row on top of the upper tiers, unless the source holds no raw row and no converted
   bucket at all (a never-used source's mark bounds nothing and is ignored, logged); a sane mark is
-  used exactly as stored. Second trigger of the same residual, disclosed and not closed: a
-  migration clock set back from a SANE mark (a restored snapshot, an NTP step) makes the mark
-  untrusted by the same rule, and the clamp to the clock then folds the raw rows between the clock
-  and the mark a second time on top of the buckets that hold them.
+  the split between the tested rows and the rows folded as they are. Both former double-fold
+  triggers (a row the excursion stamped ahead of the clock; a migration clock set back from a sane
+  mark) are closed, because under a mark ahead of the clock the substitute edge only bounds where the
+  test applies, in the raw walk and through `fold_tier_from_tier_sql`'s `only_absent` in the
+  tier-to-tier finish; the residuals, all erring low, are listed at `floor_for` in
+  `echo_db_v10_migration.cpp`.
 - **Usage cursor:** the raw process rows past `usage_hwm_id` (the usage fold's own read cursor) are fed
   to `usage_fold_in` on the same handle before the cursor and `usage_lag_events` are deleted, so a
   lagging usage fold loses nothing it would have credited. The feed decision is the fold's own
@@ -70,8 +75,9 @@ releases exactly the resource listed.
   so they reach usage now or never. A usage source that is disabled or awaiting its baseline
   would not have credited them and gets nothing (the rows are counted, not fed). An Active
   lifecycle with no cursor refuses the migration; the rows past the cursor, the stored counter
-  and the rows folded are in the log line (a row past the cursor but below the roll-up floor is
-  not folded into the tiers and is in the "older than the mark" count, but usage still gets it, fed in one id-ordered walk over every row past the cursor).
+  and the rows folded are in the log line (a row past the cursor that the held-bucket test
+  leaves out of the tiers still reaches usage, fed in one id-ordered walk over every row past the
+  cursor).
 - **After COMMIT:** the connection must be in autocommit (`sqlite3_get_autocommit`); a wedged one is
   returned as an error and `open()` closes it, never publishes it.
 

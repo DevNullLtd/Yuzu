@@ -308,8 +308,10 @@ retired tables just gets the roll-up schema installed. Otherwise `migrate_to_v10
    The held-bucket rule. A raw row below the STORED mark of the source's first old tier (the
    stored figure, not the substitute floor) is folded only when (a) its bucket is strictly newer
    than the converted tier's oldest bucket and (b) the converted tier holds no row for its bucket
-   and the key columns the old `GROUP BY` carried. (a): the pre-v10 byte budget evicted hourly
-   buckets oldest first while raw rows survived, so an absent bucket inside the evicted range does
+   and the key columns the old `GROUP BY` carried. (a): the pre-v10 build aged first-tier buckets
+   out oldest first (retention: hourly rows after 24 hours, 31 days for `perf` and `procperf`,
+   daily rows after 31 days; its byte budget sooner, on a build that had one) while raw rows, kept
+   by row count, survived, so an absent bucket inside the evicted range does
    not mean "never summarised" and folding there would count the row again in the daily and
    monthly tiers; an empty tier admits nothing. (b): the tier's other key columns are enrichment
    the old pass never wrote (blank or 0 in every converted row), so they are not compared. The
@@ -320,7 +322,8 @@ retired tables just gets the roll-up schema installed. Otherwise `migrate_to_v10
    ahead of the clock sits in a converted future bucket; a migration clock set back from a SANE
    mark, a restored snapshot or an NTP step, makes the mark untrusted by the same rule and put the
    rows between the clock and the mark on top of the buckets that hold them), and it folds, once,
-   rows the old clock-gap clamp skipped and rows a process-event backfill wrote, which used to be
+   rows the old clock-gap clamp skipped and rows a process-event backfill wrote, where they pass both
+   tests, which used to be
    dropped. The tier-to-tier finish has the same two triggers and runs first, so it carries the
    rule itself: when the upper tier's mark is untrusted, a finer row at or above the floor goes up
    only into an (upper bucket, key) the upper tier does not hold (`fold_tier_from_tier_sql`'s
@@ -328,11 +331,16 @@ retired tables just gets the roll-up schema installed. Otherwise `migrate_to_v10
    rolled in full). A sane mark keeps the statement as it was. Cursor sources are outside the
    held-bucket test and keep the single pass at the floor; no shipped schema gave `power`,
    `removable` or `registry` a summary tier or a mark, so no file in the field takes that path (a
-   file that did would keep the old rule, with both gaps). Residuals, all erring toward not folding: raw rows in the range the budget
-   evicted from the first tier; a raw row of a bucket and keys the converted tier holds only
-   because other events of that bucket and keys were summarised (an event kind the old tier did not
-   count); and the rest of an upper bucket whose old range began mid-bucket after the old clock-gap
-   clamp (the monthly step only: the clamp is 62.5 days). The rule is bounded by what the migration
+   file that did would keep the old rule, with both gaps).
+   Three residuals remain, each leaving a total low and none adding a row twice: a raw row at or
+   before the oldest bucket (hour, or day) the converted tier holds is left out, because the older
+   build's retention (or its byte budget, where it had one) had already removed the buckets there
+   and their absence proves nothing; a raw row whose bucket and keys the converted tier already
+   holds is left out even when the row itself was never summarised (a backfilled row beside
+   summarised ones, or an event kind the old tier did not count), because the old summary kept no
+   row identity; and a month the monthly tier already holds is not completed (the days after a
+   mid-month start left by the old clock-gap clamp, and a day the daily tier only gains in this
+   migration). The rule is bounded by what the migration
    can read: the old tiers carried no unique index, so a re-rolled range wrote a second row and the
    conversion merged it; the rule never counts that range twice and never completes it.
    Sixteen decoders read the raw columns through `legacy_live_columns()`; a row the delta rules
