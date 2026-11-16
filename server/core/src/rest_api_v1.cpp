@@ -9213,6 +9213,11 @@ void RestApiV1::register_routes(
                 // 400 and not a retryable 503.
                 const bool bad_input =
                     result.error() == "invalid role name" || result.error() == "invalid principal";
+                if (!last_admin && !bad_input)
+                    spdlog::warn("rbac.role.unassigned store fault: user={} role={} error={}",
+                                 ::yuzu::log_key_token(principal_id),
+                                 ::yuzu::log_key_token(role_name),
+                                 ::yuzu::log_key_token(flatten_audit_text(result.error())));
                 res.status = last_admin ? 409 : bad_input ? 400 : 503;
                 // The 409 carries the store's business-rule message; a store fault
                 // returns a constant client message (the raw text, which can name

@@ -29777,6 +29777,10 @@ McpServer::HandlerFn McpServer::build_handler(
                                         "application/json");
                         return;
                     }
+                    spdlog::warn("rbac.role.unassigned store fault: user={} role={} error={}",
+                                 ::yuzu::log_key_token(principal_id),
+                                 ::yuzu::log_key_token(role_id),
+                                 ::yuzu::log_key_token(flatten_audit_text(result.error())));
                     // A store fault returns a constant client message; the raw text
                     // goes only to the audit row above.
                     res.set_content(

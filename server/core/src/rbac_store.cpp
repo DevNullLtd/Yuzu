@@ -2376,6 +2376,11 @@ RbacStore::unassign_role_detailed(const std::string& principal_type,
         // (non-empty `err`) rolled back and changed nothing.
         if (user_admin && !outcome.ok && outcome.err.empty())
             drop_local();
+        // A store fault, not a refusal: the last-Administrator refusal returned above, and a
+        // value the owner refused as not clean text is a caller mistake. Fixed literal label.
+        if (metrics_ && outcome.err != "invalid role name" && outcome.err != "invalid principal")
+            metrics_->counter("yuzu_server_rbac_lifecycle_store_failure_total", {{"op", "unassign"}})
+                .increment();
         return std::unexpected(outcome.err.empty() ? "unassign_role failed" : outcome.err);
     }
     apply_local_generation(*outcome.new_gen);

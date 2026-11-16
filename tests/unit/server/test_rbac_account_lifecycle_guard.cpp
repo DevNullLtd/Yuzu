@@ -1558,6 +1558,8 @@ TEST_CASE("unassign Administrator: a failed session lock/clear or session_meta b
     const auto before = elevation_cols(auth_db.pool(), "s10_tgt");
     const long long rg0 = rbac_write_generation(auth_db.pool());
     const long long sg0 = session_write_generation(auth_db.pool());
+    int drop_calls = 0;
+    REQUIRE(store.set_local_session_drop([&](const std::string&) { ++drop_calls; }));
 
     SECTION("the sessions table is unreachable: the row lock statement fails") {
         std::expected<yuzu::server::RbacStore::UnassignResult, std::string> res;
@@ -1586,8 +1588,25 @@ TEST_CASE("unassign Administrator: a failed session lock/clear or session_meta b
         REQUIRE_FALSE(res.has_value());
         CHECK(res.error().find("session write-generation bump failed") != std::string::npos);
     }
+    SECTION("only the elevation clear statement fails: the row lock before it passed") {
+        std::expected<yuzu::server::RbacStore::UnassignResult, std::string> res;
+        {
+            yuzu::test::SqlFault clear_gone{
+                auth_db.pool(),
+                "ALTER TABLE session_store.sessions RENAME COLUMN elevation_issued_ms TO "
+                "elevation_issued_ms_gone",
+                "ALTER TABLE session_store.sessions RENAME COLUMN elevation_issued_ms_gone TO "
+                "elevation_issued_ms"};
+            clear_gone.arm();
+            res = store.unassign_role_detailed("user", "s10_tgt", "Administrator");
+            clear_gone.repair();
+        }
+        REQUIRE_FALSE(res.has_value());
+        CHECK(res.error().find("session elevation clear failed") != std::string::npos);
+    }
     // Repaired: the grant is still there, the elevation is intact, and the RBAC generation did
-    // not move (the whole transaction rolled back).
+    // not move (the whole transaction rolled back). A statement failure never runs the callback.
+    CHECK(drop_calls == 0);
     CHECK(has_grant(auth_db.pool(), "user", "s10_tgt"));
     CHECK(elevation_cols(auth_db.pool(), "s10_tgt") == before);
     CHECK(rbac_write_generation(auth_db.pool()) == rg0);
@@ -1683,4 +1702,199 @@ TEST_CASE("unassign Administrator: the test opt-out issues no session_store SQL 
     CHECK(res->removed);
     CHECK(res->elevations_cleared == 0);
     CHECK(dropped == std::vector<std::string>{"s10_tgt"});
+}
+
+TEST_CASE("unassign Administrator: the clear needs removed==true, the Administrator role and a user "
+          "principal; a no-op unassign ends NO elevation (ruled behaviour) (S10-11)",
+          "[pg][auth_db][lifecycle_guard][session_generation][unassign_elevation]") {
+    LIFECYCLE_FIXTURE(store, auth_db);
+    yuzu::server::SessionStore sessions{auth_db.pool()};
+    REQUIRE(sessions.is_open());
+    // s10_tgt holds NO Administrator grant here; s10_adm is the one counted Administrator.
+    build_world(auth_db, store, true,
+                {{"s10_adm", Role::user, true}, {"s10_tgt", Role::user, false}});
+    make_elevated(sessions, "s10-c1", "s10_tgt");
+    const auto before = elevation_cols(auth_db.pool(), "s10_tgt");
+    const long long sg0 = session_write_generation(auth_db.pool());
+    int drop_calls = 0;
+    REQUIRE(store.set_local_session_drop([&](const std::string&) { ++drop_calls; }));
+
+    SECTION("a user who never held the grant but has an elevated session: removed=false, nothing "
+            "is cleared (a later docs change states this)") {
+        const auto res = store.unassign_role_detailed("user", "s10_tgt", "Administrator");
+        REQUIRE(res.has_value());
+        CHECK_FALSE(res->removed);
+        CHECK(res->elevations_cleared == 0);
+    }
+    SECTION("a GROUP principal of the same name holding Administrator: only the group row goes") {
+        REQUIRE(store.assign_role({"group", "s10_tgt", "Administrator"}).has_value());
+        const auto res = store.unassign_role_detailed("group", "s10_tgt", "Administrator");
+        REQUIRE(res.has_value());
+        CHECK(res->removed);
+        CHECK(res->elevations_cleared == 0);
+        CHECK_FALSE(has_grant(auth_db.pool(), "group", "s10_tgt"));
+    }
+    SECTION("an ENGINE principal of the same name holding Administrator (raw row: assign_role "
+            "refuses a built-in role for an engine): only the engine row goes") {
+        exec_raw(auth_db.pool(),
+                 "INSERT INTO rbac_store.principal_roles (principal_type, principal_id, role_name) "
+                 "VALUES ('engine', 's10_tgt', 'Administrator')");
+        REQUIRE(has_grant(auth_db.pool(), "engine", "s10_tgt"));
+        const auto res = store.unassign_role_detailed("engine", "s10_tgt", "Administrator");
+        REQUIRE(res.has_value());
+        CHECK(res->removed);
+        CHECK(res->elevations_cleared == 0);
+        CHECK_FALSE(has_grant(auth_db.pool(), "engine", "s10_tgt"));
+    }
+    // In every section the same-named USER's elevation is untouched, no session generation moved
+    // and the local drop (a user Administrator removal only) never ran.
+    CHECK(elevation_cols(auth_db.pool(), "s10_tgt") == before);
+    CHECK(session_write_generation(auth_db.pool()) == sg0);
+    CHECK(drop_calls == 0);
+}
+
+TEST_CASE("unassign Administrator: a COMMIT that fails (empty err) still runs the local-drop "
+          "callback and reports an error; a non-Administrator unassign does not (S10-12)",
+          "[pg][auth_db][lifecycle_guard][session_generation][unassign_elevation]") {
+    LIFECYCLE_FIXTURE(store, auth_db);
+    yuzu::server::SessionStore sessions{auth_db.pool()};
+    REQUIRE(sessions.is_open());
+    build_world(auth_db, store, true, {{"s10_adm", Role::user, true}, {"s10_tgt", Role::user, true}});
+    REQUIRE(store.assign_role({"user", "s10_tgt", "Viewer"}).has_value());
+    std::vector<std::string> dropped;
+    REQUIRE(store.set_local_session_drop([&](const std::string& u) { dropped.push_back(u); }));
+
+    // A deferred constraint trigger raises when the transaction COMMITs after it deleted a
+    // principal_roles row, so every statement succeeds and only the COMMIT fails: the owner
+    // reports ok=false with an EMPTY err, the same shape as a lost COMMIT acknowledgement.
+    // (Here the failed COMMIT rolls back, so the grant stays; a real lost acknowledgement may
+    // have committed, which is exactly why the store fails toward re-authentication.)
+    yuzu::test::SqlFault commit_fault{
+        auth_db.pool(),
+        "DO $do$ BEGIN "
+        "EXECUTE $f$CREATE OR REPLACE FUNCTION public.yuzu_test_commit_fault() "
+        "RETURNS trigger LANGUAGE plpgsql AS $b$ BEGIN "
+        "RAISE EXCEPTION 'yuzu_test commit fault'; END $b$$f$; "
+        "EXECUTE $f$CREATE CONSTRAINT TRIGGER yuzu_test_commit_fault AFTER DELETE ON "
+        "rbac_store.principal_roles DEFERRABLE INITIALLY DEFERRED FOR EACH ROW "
+        "EXECUTE FUNCTION public.yuzu_test_commit_fault()$f$; END $do$",
+        "DO $do$ BEGIN "
+        "DROP TRIGGER IF EXISTS yuzu_test_commit_fault ON rbac_store.principal_roles; "
+        "DROP FUNCTION IF EXISTS public.yuzu_test_commit_fault(); END $do$"};
+    commit_fault.arm();
+
+    SECTION("a user Administrator removal: the callback runs once, the result is an error") {
+        const auto res = store.unassign_role_detailed("user", "s10_tgt", "Administrator");
+        REQUIRE_FALSE(res.has_value());
+        CHECK(res.error() == "unassign_role failed");
+        CHECK(dropped == std::vector<std::string>{"s10_tgt"});
+    }
+    SECTION("a Viewer removal: the same failed COMMIT does not run the callback") {
+        const auto res = store.unassign_role_detailed("user", "s10_tgt", "Viewer");
+        REQUIRE_FALSE(res.has_value());
+        CHECK(dropped.empty());
+    }
+    commit_fault.repair();
+    // The failed COMMIT rolled back: the Administrator grant is still there.
+    CHECK(has_grant(auth_db.pool(), "user", "s10_tgt"));
+}
+
+TEST_CASE("unassign Administrator: a blocked session-row lock fails within the lifecycle lock bound, "
+          "rolls the removal back, and a retry succeeds once the lock is gone (S10-13)",
+          "[pg][auth_db][lifecycle_guard][session_generation][unassign_elevation]") {
+    yuzu::MetricsRegistry metrics;
+    LIFECYCLE_FIXTURE(seeding_store, auth_db);
+    yuzu::server::SessionStore sessions{auth_db.pool()};
+    REQUIRE(sessions.is_open());
+    build_world(auth_db, seeding_store, true,
+                {{"s10_adm", Role::user, true}, {"s10_tgt", Role::user, true}});
+    make_elevated(sessions, "s10-l1", "s10_tgt");
+    const auto before = elevation_cols(auth_db.pool(), "s10_tgt");
+    const long long rg0 = rbac_write_generation(auth_db.pool());
+    const long long sg0 = session_write_generation(auth_db.pool());
+
+    // A SHORT bound: the 2000 ms production value is pinned by the lock-timeout case above for
+    // deactivation; this case needs the bound installed on the unassign transaction and a failure
+    // far inside the pool's own 10 s lock_timeout.
+    RbacStore store{auth_db.pool(), std::chrono::milliseconds(200)};
+    REQUIRE(store.is_open());
+    store.set_metrics(&metrics);
+    int drop_calls = 0;
+    REQUIRE(store.set_local_session_drop([&](const std::string&) { ++drop_calls; }));
+    const auto unassign_faults = [&] {
+        return metrics
+            .counter("yuzu_server_rbac_lifecycle_store_failure_total", {{"op", "unassign"}})
+            .value();
+    };
+
+    yuzu::test::HeldLocks hold(auth_db.pool());
+    hold.run("SELECT token_hash FROM session_store.sessions WHERE username = 's10_tgt' "
+             "ORDER BY token_hash FOR UPDATE");
+
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto res = store.unassign_role_detailed("user", "s10_tgt", "Administrator");
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0);
+
+    REQUIRE_FALSE(res.has_value());
+    CHECK(res.error().find("session row lock failed") != std::string::npos);
+    CHECK(res.error().find("lock timeout") != std::string::npos);
+    // Bounded by the 200 ms transaction-local value (the pool's own 10 s would fail the upper bound).
+    CHECK(elapsed >= std::chrono::milliseconds(150));
+    CHECK(elapsed < std::chrono::milliseconds(5000));
+    CHECK(has_grant(auth_db.pool(), "user", "s10_tgt"));
+    CHECK(elevation_cols(auth_db.pool(), "s10_tgt") == before);
+    CHECK(rbac_write_generation(auth_db.pool()) == rg0);
+    CHECK(session_write_generation(auth_db.pool()) == sg0);
+    CHECK(drop_calls == 0);
+    CHECK(unassign_faults() == 1.0);
+
+    hold.rollback();
+    const auto again = store.unassign_role_detailed("user", "s10_tgt", "Administrator");
+    REQUIRE(again.has_value());
+    CHECK(again->removed);
+    CHECK(again->elevations_cleared == 1);
+    CHECK(drop_calls == 1);
+    CHECK(unassign_faults() == 1.0);
+}
+
+TEST_CASE("unassign: only a store fault counts yuzu_server_rbac_lifecycle_store_failure_total"
+          "{op=unassign}; a refusal, a refused value and a success do not (S10-14)",
+          "[pg][auth_db][lifecycle_guard][session_generation][unassign_elevation]") {
+    yuzu::MetricsRegistry metrics;
+    LIFECYCLE_FIXTURE(store, auth_db);
+    yuzu::server::SessionStore sessions{auth_db.pool()};
+    REQUIRE(sessions.is_open());
+    build_world(auth_db, store, true, {{"s10_adm", Role::user, true}, {"s10_tgt", Role::user, true}});
+    store.set_metrics(&metrics);
+    make_elevated(sessions, "s10-m1", "s10_tgt");
+    const auto unassign_faults = [&] {
+        return metrics
+            .counter("yuzu_server_rbac_lifecycle_store_failure_total", {{"op", "unassign"}})
+            .value();
+    };
+    CHECK(unassign_faults() == 0.0);
+
+    SECTION("a refused value (not clean text) is a caller mistake, not a store fault") {
+        const auto res = store.unassign_role_detailed("user", "s10_tgt", "Admin\nrole=Viewer");
+        REQUIRE_FALSE(res.has_value());
+        CHECK(res.error() == "invalid role name");
+        CHECK(unassign_faults() == 0.0);
+    }
+    SECTION("a statement failure that rolled back counts once") {
+        {
+            SessionWipeFault fault{auth_db.pool()};
+            fault.arm();
+            REQUIRE_FALSE(store.unassign_role_detailed("user", "s10_tgt", "Administrator").has_value());
+            fault.repair();
+        }
+        CHECK(unassign_faults() == 1.0);
+        // The repaired retry succeeds and adds nothing; the now-sole Administrator is refused
+        // (a business-rule refusal) and adds nothing either.
+        REQUIRE(store.unassign_role_detailed("user", "s10_tgt", "Administrator").has_value());
+        const auto refused = store.unassign_role_detailed("user", "s10_adm", "Administrator");
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(is_rbac_last_admin_refusal(refused.error()));
+        CHECK(unassign_faults() == 1.0);
+    }
 }

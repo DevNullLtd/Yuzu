@@ -2387,7 +2387,8 @@ public:
                           "by operation (deactivate: account removal; set_role: role write; "
                           "would_strand: the advisory pre-check, after which the request still "
                           "proceeds to the guarded write; grant_read: the SCIM "
-                          "pre-provisioning Administrator-grant read). The unwired fail-closed "
+                          "pre-provisioning Administrator-grant read; unassign: a role "
+                          "unassignment). The unwired fail-closed "
                           "arm also counts, for deactivate and set_role only. A sustained "
                           "non-zero rate means deprovisioning or role changes are being "
                           "answered with a store-unavailable error rather than judged, except "
@@ -2397,7 +2398,7 @@ public:
                           "yuzu_pg_acquire_wait_seconds, and for a stuck rbac_enabled row lock "
                           "holder.",
                           "counter");
-        for (const auto op : {"deactivate", "set_role", "would_strand", "grant_read"})
+        for (const auto op : {"deactivate", "set_role", "would_strand", "grant_read", "unassign"})
             metrics_.counter("yuzu_server_rbac_lifecycle_store_failure_total", {{"op", op}});
         // #4966: a SCIM same-request compensation (the guarded undo of a just-created or
         // just-revived account) that did NOT complete. Written beside the

@@ -2879,6 +2879,23 @@ TEST_CASE("unassign Administrator, post-commit audit failures: the unassign stay
               std::string::npos);
         CHECK(audit_count(h, kElevRevoked) == 1);
     }
+    SECTION("MCP, only the success row fails: the new row is still attempted") {
+        const std::string approval_id = h.mcp_mint_and_approve(
+            "unassign_rbac_role", {{"principal_id", "s10e_x"}, {"role", "Administrator"}});
+        h.audit_fail_result = "success";
+        auto res = h.mcp_call_tool("unassign_rbac_role", {{"principal_id", "s10e_x"},
+                                                           {"role", "Administrator"},
+                                                           {"approval_id", approval_id}});
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body, nullptr, false);
+        REQUIRE_FALSE(body.is_discarded());
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == 503);
+        CHECK(res->body.find("\"audit_persisted\":false") != std::string::npos);
+        CHECK(res->body.find("the role was unassigned but its audit record could not be persisted") !=
+              std::string::npos);
+        CHECK(audit_count(h, kElevRevoked) == 1);
+    }
     // In every case the unassign and the clear are committed: the 503 is the audit gap.
     CHECK_FALSE(holds_role(h, "s10e_x", "Administrator"));
     CHECK(h.sessions->elevated_rows("s10e_x") == 0);
