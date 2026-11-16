@@ -166,6 +166,11 @@ struct CollationState {
 ///   - Unproven: no conclusive finding yet (a boot whose checks have all been unreadable).
 enum class CollationGate { Trusted, Mismatch, Unproven };
 
+// The gate is published through `std::atomic<CollationGate>` and read on request paths: it must
+// never fall back to a lock.
+static_assert(std::atomic<CollationGate>::is_always_lock_free,
+              "the published collation gate must be a lock-free atomic");
+
 /// Pure. None -> Unproven, Ok -> Trusted, NotApplicable -> Trusted, Mismatch -> Mismatch.
 [[nodiscard]] constexpr CollationGate gate_for(CollationLast last) noexcept {
     switch (last) {
