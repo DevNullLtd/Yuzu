@@ -92,7 +92,18 @@
  *     --spark-registry-path-verify-interval via clamp_registry_path_verify().
  *     A watch whose notify handle has been renamed away from its registered path
  *     is therefore NOT detected unless the operator opted in. This file does not
- *     observe or assert Security-log behaviour.
+ *     observe or assert Security-log behaviour. The flag governs ONLY the periodic
+ *     verification opens: the failure-driven retry opens (30 s doubling to a 300 s
+ *     cap, fail_backend_locked) are unchanged by it, and on an audited key they too
+ *     can write failure-audit events. The detection bound when enabled is one
+ *     interval plus a sweep wake plus the probe's own latency, plus the admission
+ *     backoff (50 ms doubling to kRegAdmissionBackoffCap, 30 s) on each launch the
+ *     probe lane refused: a refused verification launch increments admission_attempts
+ *     and only a commit resets it, so with more than 16 watches verifying together
+ *     the bound is NOT the configured interval. The interval is a sampling period,
+ *     not a measured value; the test control
+ *     RegistryMechanismTestControls::path_verify_interval overrides it, and the
+ *     smallest operator value is kRegistryPathVerifyFloor (spark_mechanism.hpp).
  *
  * OWNERSHIP / DISPATCH PROTOCOL (plan amendment 5 - the same rules PR-B2/B3
  * apply to File/Service):
@@ -216,22 +227,6 @@ constexpr std::chrono::milliseconds kRegAdmissionBackoffCap{30'000};
 /// a 300 s cap, attempts reset on a successful establishment.
 constexpr std::chrono::milliseconds kRegBackendRetryBase{30'000};
 constexpr std::chrono::milliseconds kRegBackendRetryCap{300'000};
-/// Periodic path verification (no constant here: the interval is seeded per mechanism,
-/// see path_verify_ms_). When enabled, an idle, healthy Target-mode watch re-opens its
-/// registered PATH at that interval and checks the path still resolves to a key
-/// (#5719 item 5, #7836). The notify handle follows its KEY, not its path: when a PARENT key is renamed away the handle keeps
-/// working on the renamed tree and nothing signals, so the watch reads healthy while
-/// the registered path no longer names it. SAMPLED, so a rename is noticed up to one
-/// interval plus a sweep wake plus the probe's own latency late, and plus the
-/// admission backoff (50 ms doubling to kRegAdmissionBackoffCap, 30 s) on each launch
-/// the probe lane refused: a refused verification launch increments admission_attempts
-/// and only a commit resets it, so with more than 16 watches verifying together the
-/// bound is NOT the configured interval. A rename away and back within one interval is not noticed at all.
-/// Not a measured value; the test control
-/// RegistryMechanismTestControls::path_verify_interval overrides it. The interval is
-/// OFF (zero) unless the operator opts in at boot: the smallest non-zero value is
-/// kRegistryPathVerifyFloor (spark_mechanism.hpp), the clamp floor.
-
 constexpr std::size_t kProbeLaneCap = 16; ///< concurrent detached probe workers
 constexpr std::size_t kDrainLaneCap = 8;  ///< concurrent detached drain workers
 /// Retirements (drains launched or backlogged, not yet completed) past which
@@ -373,7 +368,7 @@ enum class WatchMode { Target, Ancestor };
 enum class ProbeState : std::uint8_t {
     Idle,     ///< nothing outstanding; `armed` says whether a notify is live
     Pending,  ///< a probe is reserved or in flight (call engaged once published)
-    Deferred, ///< a probe will be relaunched at next_retry_at
+    Deferred, ///< a probe will be relaunched at next_retry_at (`armed` can stay true, see RegWatch)
 };
 
 /// What one detached probe produced. Every OS resource it opened is owned here
@@ -530,7 +525,12 @@ struct RegWatch {
     RegKeyHandle open_key;      ///< target in Target mode, ancestor in Ancestor mode
     PTP_WAIT wait{nullptr};     ///< armed at least once => drain before destroy
     WatchMode mode{WatchMode::Target};
-    bool armed{false}; ///< a notify + wait is currently established
+    /// A notify + wait is currently established. After a Lost verification verdict
+    /// it STAYS true while the probe is Deferred for the retry: a callback for the OLD
+    /// event can still arrive when the wait is re-pointed at the retry's commit; it
+    /// clears `armed` on the fresh watch, emits one Fired and re-arms from Idle, so the
+    /// state converges (#7877 item 46).
+    bool armed{false};
     bool active{true}; ///< false once retired (unwatch / stop)
     // health (single producer: the sweeper dispatches the edges)
     bool faulted_now{false};
@@ -1154,6 +1154,7 @@ public:
         d.verify_launched = verify_launched_.load(std::memory_order_relaxed);
         d.verify_lost = verify_lost_.load(std::memory_order_relaxed);
         d.verify_undecided = verify_undecided_.load(std::memory_order_relaxed);
+        d.path_verify_ms = path_verify_ms_.load(std::memory_order_relaxed);
         return d;
     }
 

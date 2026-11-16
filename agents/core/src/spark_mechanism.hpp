@@ -21,7 +21,8 @@
  * directory is sampled on its own 5 s schedule (path_verify_interval), run by the
  * File mechanism itself and NOT coalesced onto the SparkEngine's timer wheel.
  * The Windows Registry mechanism does the same per idle, healthy Target-mode watch
- * (#7836): every 5 s it re-opens the key's path on its existing probe lane (one
+ * (#7836) WHEN ENABLED (off by default; opt-in at boot, floor 5 s): at the operator's
+ * interval it re-opens the key's path on its existing probe lane (one
  * short-lived detached worker per watched key per interval; the detection bound is
  * one interval plus a sweep wake plus the probe latency, plus the admission backoff
  * when the lane refused a launch).
@@ -352,7 +353,10 @@ make_file_mechanism(std::shared_ptr<std::atomic<std::size_t>> f3_counter);
 /// the factory below through this pure helper. Zero is off. A non-zero value below
 /// the floor is raised to it (a 1 s setting would be five times the audit volume of
 /// the documented minimum), a value above the ceiling is lowered to it, and a
-/// negative value is treated as off (the CLI validator already refuses one).
+/// negative value is treated as off (the CLI validator already refuses one). The flag
+/// governs only these periodic verification opens: the failure-driven retry opens
+/// (30 s doubling to 300 s) are unchanged by it and can write failure-audit events on
+/// an audited key.
 inline constexpr std::chrono::milliseconds kRegistryPathVerifyFloor{5'000};
 inline constexpr std::int64_t kRegistryPathVerifyMaxSeconds = 86'400;
 
@@ -806,9 +810,16 @@ struct RegistryMechanismDebugCounters {
     std::uint64_t emit_failed{0};    ///< emit() threw on submit (fire callback or sweeper)
     std::uint64_t resync_retries{0}; ///< restored resync debt re-staged by the sweeper
     std::uint64_t established_failed{0}; ///< established() threw when invoked
-    std::uint64_t verify_launched{0};    ///< periodic path verification probes actually launched
+    /// Periodic path verification probes actually launched. It also counts a
+    /// verification probe that is converted to the re-arm when a fire lands while the
+    /// verification is still Deferred or Pending (the launch path is shared, and the
+    /// probe is then the re-arm, not a judged verification): a test asserting an exact
+    /// number of opens per key must not run a fire concurrently.
+    std::uint64_t verify_launched{0};
     std::uint64_t verify_lost{0};        ///< periodic path verifications that found the path lost
     std::uint64_t verify_undecided{0};   ///< periodic path verifications that could not decide
+    /// The effective verification interval in ms (0 = off). Production default 0.
+    std::int64_t path_verify_ms{0};
     std::size_t probe_workers_active{0};
     std::size_t drain_workers_active{0};
     std::size_t live_watches{0};
