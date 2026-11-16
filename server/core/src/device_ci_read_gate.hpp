@@ -24,9 +24,10 @@
 /// because a facts read failed would be a self-inflicted outage.
 ///
 /// NULL MEANS NO GATE. A null gate pointer means "no gate was wired" and every read is served.
-/// That default exists for unit tests that build a deps object by hand. Production wiring in
-/// server.cpp must always pass `&collation_gate_` (a lexical test pins it): a closure that
-/// silently defaults to no gate would serve wrong answers with no signal.
+/// That exists for unit tests that build a deps object by hand or model no gate on purpose;
+/// `hardware_ci_page::read_page` has no default for it, so a caller must write the `nullptr`.
+/// Production wiring in server.cpp must always pass `&collation_gate_` (a lexical test pins it):
+/// a closure that silently defaulted to no gate would serve wrong answers with no signal.
 ///
 /// Pure and header-only: one acquire load of a lock-free atomic, no I/O, no lock.
 

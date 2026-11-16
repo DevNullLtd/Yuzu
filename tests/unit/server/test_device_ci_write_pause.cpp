@@ -24,7 +24,9 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <fstream>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -109,6 +111,8 @@ TEST_CASE("device_ci store with NO gate wired writes exactly as before", "[pg][d
     YUZU_REQUIRE_PG_DB_TPL(db, pause_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 2}};
     REQUIRE(pool.valid());
+    // Declared BEFORE the store that later borrows it, so it is destroyed AFTER it.
+    std::atomic<CollationGate> gate{CollationGate::Mismatch};
     DeviceInventoryStore store{pool}; // set_write_gate never called: the default
     REQUIRE(store.is_open());
     CHECK_FALSE(store.writes_deferred());
@@ -121,7 +125,6 @@ TEST_CASE("device_ci store with NO gate wired writes exactly as before", "[pg][d
     CHECK(store.delete_agent("a"));
 
     // A gate set and then withdrawn is the same as none.
-    std::atomic<CollationGate> gate{CollationGate::Mismatch};
     store.set_write_gate(&gate);
     CHECK(store.writes_deferred());
     store.set_write_gate(nullptr);
@@ -133,11 +136,12 @@ TEST_CASE("device_ci write pause: only Mismatch refuses, and refusal leaves the 
     YUZU_REQUIRE_PG_DB_TPL(db, pause_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 2}};
     REQUIRE(pool.valid());
+    // Declared BEFORE the store that borrows it, so it is destroyed AFTER it.
+    std::atomic<CollationGate> gate{CollationGate::Trusted};
     DeviceInventoryStore store{pool};
     REQUIRE(store.is_open());
     yuzu::MetricsRegistry metrics;
     store.set_metrics(&metrics);
-    std::atomic<CollationGate> gate{CollationGate::Trusted};
     store.set_write_gate(&gate);
 
     const DeviceCiRecord rec = parse_device_ci_blob(blob());
@@ -201,9 +205,10 @@ TEST_CASE("device_ci write pause logs once per pause, and again for the next one
     YUZU_REQUIRE_PG_DB_TPL(db, pause_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 2}};
     REQUIRE(pool.valid());
+    // Declared BEFORE the store that borrows it, so it is destroyed AFTER it.
+    std::atomic<CollationGate> gate{CollationGate::Mismatch};
     DeviceInventoryStore store{pool};
     REQUIRE(store.is_open());
-    std::atomic<CollationGate> gate{CollationGate::Mismatch};
     store.set_write_gate(&gate);
     const DeviceCiRecord rec = parse_device_ci_blob(blob());
     const std::string h = DeviceInventoryStore::canonical_hash(rec);
@@ -230,9 +235,10 @@ TEST_CASE("decommission cascade reports a paused device_ci removal with a distin
     YUZU_REQUIRE_PG_DB_TPL(db, pause_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 2}};
     REQUIRE(pool.valid());
+    // Declared BEFORE the store that borrows it, so it is destroyed AFTER it.
+    std::atomic<CollationGate> gate{CollationGate::Trusted};
     DeviceInventoryStore store{pool};
     REQUIRE(store.is_open());
-    std::atomic<CollationGate> gate{CollationGate::Trusted};
     store.set_write_gate(&gate);
     const DeviceCiRecord rec = parse_device_ci_blob(blob());
     REQUIRE(store.apply_device_ci("a", DeviceInventoryStore::canonical_hash(rec),
@@ -291,11 +297,12 @@ TEST_CASE("ingest seam refuses a paused fleet BEFORE parsing and reports the def
     YUZU_REQUIRE_PG_DB_TPL(db, pause_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 2}};
     REQUIRE(pool.valid());
+    // Declared BEFORE the store that borrows it, so it is destroyed AFTER it.
+    std::atomic<CollationGate> gate{CollationGate::Mismatch};
     DeviceInventoryStore store{pool};
     REQUIRE(store.is_open());
     yuzu::MetricsRegistry metrics;
     store.set_metrics(&metrics);
-    std::atomic<CollationGate> gate{CollationGate::Mismatch};
     store.set_write_gate(&gate);
 
     const auto outcome = [&](const char* label) {
@@ -356,5 +363,57 @@ TEST_CASE("ingest seam refuses a paused fleet BEFORE parsing and reports the def
         CHECK(ack.need_full_size() == 0);
         CHECK(outcome("stored") == 1.0);
         CHECK_FALSE(row_text(pool, "a").empty());
+    }
+}
+
+// qe-2 / ARCH-4. The branch of `ingest_device_ci_report` where `apply_device_ci` returns kDeferred
+// AFTER the seam's own check (a pause that races in between them) cannot be reached from outside:
+// the gate would have to flip between two adjacent statements. The mapping the seam applies to that
+// outcome is therefore ONE pure function shared by every seam, tested over every enumerator; a
+// source pin proves both seams use it. Kills: dropping kDeferred from the need_full answer (the
+// agent would believe the report was stored and not resend for up to the weekly floor), a label of
+// `error` for it, and a seam that goes back to a hand-written ternary chain.
+TEST_CASE("ingest outcome mapping: kDeferred is labelled deferred and nacked as need_full",
+          "[device_ci][collation_gate][ingest]") {
+    using yuzu::server::ingest_outcome_label;
+    using yuzu::server::ingest_outcome_needs_full;
+    struct Row {
+        InventoryIngestOutcome o;
+        const char* label;
+        bool needs_full;
+    };
+    static constexpr Row table[] = {
+        {InventoryIngestOutcome::kStored, "stored", false},
+        {InventoryIngestOutcome::kTouched, "touched", false},
+        {InventoryIngestOutcome::kNeedFull, "need_full", true},
+        {InventoryIngestOutcome::kError, "error", true},
+        {InventoryIngestOutcome::kDeferred, "deferred", true},
+    };
+    for (const Row& r : table) {
+        CHECK(std::string(ingest_outcome_label(r.o)) == r.label);
+        CHECK(ingest_outcome_needs_full(r.o) == r.needs_full);
+    }
+    // An out-of-range value nacks (the safe direction) and reads as an error.
+    const auto bogus = static_cast<InventoryIngestOutcome>(99);
+    CHECK(std::string(ingest_outcome_label(bogus)) == "error");
+    CHECK(ingest_outcome_needs_full(bogus));
+}
+
+TEST_CASE("ingest seams map the store outcome through the shared helpers, not a ternary chain",
+          "[device_ci][collation_gate][ingest]") {
+    const auto read = [](const char* name) {
+        std::ifstream in(std::string(YUZU_SERVER_SRC_DIR) + "/" + name, std::ios::binary);
+        REQUIRE(in.good());
+        std::ostringstream ss;
+        ss << in.rdbuf();
+        return ss.str();
+    };
+    for (const char* file : {"device_ci_ingestion.cpp", "inventory_ingestion.cpp"}) {
+        INFO(file);
+        const std::string text = read(file);
+        CHECK(count_of(text, "ingest_outcome_label(outcome)") == 1);
+        CHECK(count_of(text, "ingest_outcome_needs_full(outcome)") == 1);
+        // The old shape: a comparison of the outcome against an enumerator in a chain or condition.
+        CHECK(count_of(text, "outcome == InventoryIngestOutcome::") == 0);
     }
 }

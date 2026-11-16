@@ -222,13 +222,14 @@ struct ReadFailure {
 
 /// One page: decode the cursor, apply the scope as described in the file comment, check the
 /// collation gate, read. A `rq.limit` outside [1, kPageMax] is clamped into it (the parsers never
-/// produce one). `gate` is `device_ci_read_gate`'s input: null means no gate was wired and the
-/// read is served (unit tests only; production passes `&collation_gate_`, pinned by a lexical
-/// test). The gate is checked after the cursor and scope refusals, which need no read and keep
+/// produce one). `gate` is `device_ci_read_gate`'s input and has NO default: every caller states
+/// it. Null means "no gate" and the read is served (a unit test that deliberately models no gate
+/// passes an explicit `nullptr`; production passes `&collation_gate_`, pinned by a lexical test).
+/// The gate is checked after the cursor and scope refusals, which need no read and keep
 /// their own answers, and before the one store call.
 [[nodiscard]] std::expected<Page, ReadError>
 read_page(const Reader& read, const Request& rq, const authz::VisibleSet& scope,
-          const std::atomic<pg::CollationGate>* gate = nullptr);
+          const std::atomic<pg::CollationGate>* gate);
 
 /// The production binding of `Reader` is a one-line lambda in server.cpp over
 /// `DeviceInventoryStore::list_device_ci_after`; there is no binder here so this header stays

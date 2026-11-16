@@ -189,7 +189,7 @@ private:
                                                        ///< returns true iff committed
         /// Optional: consulted only after `deleter` returned false; true ⇒ the false was the
         /// store's write pause, not a failed DELETE. Null for every store without a pause.
-        std::function<bool()> write_paused;
+        std::function<bool()> write_paused{};
     };
     std::vector<Target> targets_;
 };

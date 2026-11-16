@@ -395,13 +395,10 @@ void ingest_device_ci_report(DeviceInventoryStore& store, const std::string& age
                         yuzu::Histogram::seconds_buckets_60s())
             .observe(secs);
     }
-    emit(outcome == InventoryIngestOutcome::kStored    ? "stored"
-         : outcome == InventoryIngestOutcome::kTouched ? "touched"
-         : outcome == InventoryIngestOutcome::kNeedFull ? "need_full"
-         : outcome == InventoryIngestOutcome::kDeferred ? "deferred" // pause raced in after the check
-                                                        : "error");
-    if (outcome == InventoryIngestOutcome::kNeedFull || outcome == InventoryIngestOutcome::kError ||
-        outcome == InventoryIngestOutcome::kDeferred)
+    // kDeferred here is a write pause that raced in after the seam's own check above; it is
+    // labelled `deferred` and nacked like kNeedFull/kError (shared mapping, inventory_ingest_outcome.hpp).
+    emit(ingest_outcome_label(outcome));
+    if (ingest_outcome_needs_full(outcome))
         ack.add_need_full(kSourceDeviceCi);
 }
 

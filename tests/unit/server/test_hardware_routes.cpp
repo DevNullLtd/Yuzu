@@ -64,6 +64,12 @@ InventoryDeviceRow make_row(std::string id, std::string host, std::string os, bo
 // action_descriptions) are left unwired — the Actions lens and its result poll are
 // out of scope for this file (the CI list/record + REST twins are the named gap).
 struct HwHarness {
+    // The collation gate the bulk read consults (production wires &collation_gate_). Trusted by
+    // default and mutable after construction (the route reads it per request); the constructor's
+    // `unwire_ci_gate_ctor` leaves the deps pointer null (no gate), which serves. Declared FIRST,
+    // before `routes` which borrows it, so it is destroyed after everything that holds the pointer.
+    std::atomic<pg::CollationGate> ci_gate{pg::CollationGate::Trusted};
+
     yuzu::server::test::TestRouteSink sink;
     HardwareRoutes routes;
 
@@ -86,10 +92,6 @@ struct HwHarness {
     // decided once at construction, like the other unwire flags (see below).
     yuzu::server::test::FakeCiKeysetStore ci_store;
     bool ci_page_unwired = false;
-    // The collation gate the bulk read consults (production wires &collation_gate_). Trusted by
-    // default and mutable after construction (the route reads it per request); the constructor's
-    // `unwire_ci_gate_ctor` leaves the deps pointer null (no gate), which serves.
-    std::atomic<pg::CollationGate> ci_gate{pg::CollationGate::Trusted};
 
     HardwareCiDetail ci_detail; // configurable per test; default = degraded (the struct's own default)
     std::vector<CiRead> ci_reads; // the `CiRead` argument of every ci_detail_fn call, in order

@@ -85,8 +85,6 @@ TEST_CASE("device_ci read gate: read_page refuses under Mismatch and Unproven an
         const auto page = hcp::read_page(store.reader(), {}, std::nullopt, nullptr);
         REQUIRE(page.has_value());
         CHECK(page->rows.size() == 2);
-        // the three-argument form is the same as no gate
-        CHECK(hcp::read_page(store.reader(), {}, std::nullopt).has_value());
     }
     SECTION("a scope refusal that needs no read keeps its own answer under a refusing gate") {
         g.store(CollationGate::Mismatch);
