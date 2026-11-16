@@ -162,11 +162,15 @@ public:
     /// other route reads it.
     void set_read_perm_fn(PermFn fn) { read_perm_fn_ = std::move(fn); }
 
-    /// Audit writer for a session the handler already resolved (#6079): `mfa.disable` ends the
-    /// actor's own session before it writes its row, so the request-resolving `AuditFn` would
-    /// stamp an empty principal. Same `std::function` type as `AuthRoutes::AuditAsSessionFn`;
-    /// server.cpp binds `AuthRoutes::audit_as_session_fn()`. Left unset (tests, other callers)
-    /// the handler falls back to `AuditFn`.
+    /// Audit writer for a session the handler already resolved (#6079): the Settings MFA
+    /// disable route writes its intent, denied and error rows through it (its success row is
+    /// written by `MfaDisableOwner` inside the clear's transaction, through the
+    /// `AuditEventForSessionFn` seam below), and the enrol-confirm refusal rows
+    /// (`session_not_durable`, `session_store_unavailable`) use it too, because the cookie may
+    /// be missing or stale and the request-resolving `AuditFn` would stamp an empty
+    /// principal. Same `std::function` type as `AuthRoutes::AuditAsSessionFn`; server.cpp binds
+    /// `AuthRoutes::audit_as_session_fn()`. Left unset (tests, other callers) the handler
+    /// falls back to `AuditFn`.
     using AuditAsSessionFn = std::function<bool(
         const httplib::Request&, const auth::Session&, const std::string& principal_role,
         const std::string& action, const std::string& result, const std::string& target_type,

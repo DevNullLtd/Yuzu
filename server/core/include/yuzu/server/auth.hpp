@@ -907,7 +907,10 @@ public:
     /// FAILED — the route MUST fail closed there (the elevation is still live
     /// durably; reporting success would falsely tell an incident responder the
     /// admin was revoked, governance-missed / adversarial C2). Store-less
-    /// (legacy) mode never errors.
+    /// (legacy) mode never errors. On the durable path the in-place clear of a cached
+    /// entry advances `session_cache_epoch_` in the same critical section, whether or not
+    /// the entry is cached (it removes privilege, so a cold validation holding a
+    /// pre-clear, still-elevated copy must not cache it, #8010).
     [[nodiscard]] std::expected<bool, std::string> revoke_elevation(const std::string& token);
 
     /// Clear any active JIT elevation on EVERY session of `username` (all
@@ -917,7 +920,9 @@ public:
     /// the number of sessions whose elevation was cleared. Returns `unexpected`
     /// ONLY when the durable `SessionStore` clear FAILED — the route MUST fail
     /// closed (an in-flight elevation may still be live durably; the eligibility
-    /// flip alone does not drop it). Store-less (legacy) mode never errors.
+    /// flip alone does not drop it). Store-less (legacy) mode never errors. As in
+    /// `revoke_elevation`, the durable path advances `session_cache_epoch_` in the same
+    /// critical section as the in-place clears, whether or not any session is cached.
     [[nodiscard]] std::expected<int, std::string> revoke_user_elevations(const std::string& username);
 
     /// Lazily reap a PASSIVELY-lapsed JIT elevation (residual-risk follow-up A,
@@ -1222,7 +1227,11 @@ public:
     /// lock it took, drops this process's in-memory `sessions_` entries of the
     /// account (the durable rows were already deleted in the transaction and the
     /// bumped write-generation makes every OTHER replica drop its cached copies;
-    /// this is NOT a second durable wipe). Caller must NOT hold `mu_` or any
+    /// this is NOT a second durable wipe). The same drop also runs on `kStoreUnavailable`:
+    /// the connection can be lost exactly at COMMIT after everything landed, so this
+    /// replica's cached sessions are over-invalidated (idempotent; a still-valid session
+    /// re-reads its durable row). It does NOT run for `kNotFound`, `kAuditUnavailable` or
+    /// `kFactorChanged`, where nothing was written. Caller must NOT hold `mu_` or any
     /// database lock.
     [[nodiscard]] MfaDisableOutcome commit_mfa_disable(const MfaDisableRequest& request);
 
@@ -1356,7 +1365,9 @@ public:
 
     /// True iff a durable SessionStore is attached. Lets a caller tell the store-less legacy
     /// wiring (no durable row exists to require) from a degraded read of an attached store:
-    /// `read_durable_mfa_proof` reports both as `kUnavailable`. Read-only.
+    /// `read_durable_mfa_proof` reports both as `kUnavailable`. Read-only. A test and
+    /// legacy-wiring concession: production always wires a store, so no production branch
+    /// should depend on this returning false.
     [[nodiscard]] bool has_session_store() const noexcept { return session_store_ != nullptr; }
 
     /// True iff a durable SessionStore is set AND reports open. Wired into
@@ -1822,7 +1833,11 @@ private:
 
     /// Drop the proof from this replica's cached copy of `key` (no durable write). Advances
     /// `session_cache_epoch_` in the same critical section, whether or not `key` is cached,
-    /// so a validation held across the drop does not cache its pre-drop copy (#8010).
+    /// so a validation held across the drop does not cache its pre-drop copy (#8010). It is
+    /// one of the in-place edits that move the epoch; the others are the proof re-derives
+    /// after a stamp or a post-stamp clear and the elevation clears in `revoke_elevation` and
+    /// `revoke_user_elevations`. `elevate_session`'s re-derive (a grant) and the legacy
+    /// no-store stamp tail do not.
     void drop_cached_mfa_proof(const std::string& key);
 
     /// The username of the session behind `key`: the cache first, else the durable row.
@@ -2017,10 +2032,14 @@ private:
     // Cache epoch (guarded by `mu_`): incremented in the same unique-lock critical
     // section as every `sessions_.clear()` (the generation poll), every targeted
     // erase that revokes a session (`drop_cached_session_locked`,
-    // `drop_cached_user_sessions_locked`) and every in-place edit of a cached entry's MFA
-    // proof (`drop_cached_mfa_proof` and the re-derives in `stamp_session_mfa_proof` and
-    // `post_stamp_factor_recheck`; bumped whether or not the entry is cached, #8010).
-    // Expiry and idle hygiene drops do not move it.
+    // `drop_cached_user_sessions_locked`) and every in-place edit of a cached entry that
+    // REMOVES a proof or privilege (`drop_cached_mfa_proof`, the re-derives in
+    // `stamp_session_mfa_proof` and `post_stamp_factor_recheck`, and the elevation clears in
+    // `revoke_elevation` and `revoke_user_elevations`; bumped whether or not the entry is
+    // cached, #8010). It does NOT move for: expiry and idle hygiene drops; `elevate_session`'s
+    // re-derive (a grant: a stale pre-elevation copy under-grants and self-heals at the next
+    // generation poll); `reap_expired_elevation` (clears an already-lapsed elevation only);
+    // and the legacy no-store stamp tail and test helpers (no durable cache to race).
     // `validate_session_durable` captures it under its step-1 shared lock and inserts
     // its session at the tail only if it is unchanged, so a validation that straddles
     // a clear or a revoke cannot put the session back (ADR-0012 section 4, rule 2). The

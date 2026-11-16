@@ -8121,22 +8121,41 @@ void SettingsRoutes::register_routes(
                   // a session that ends between this read and the commit still ends in the
                   // best-effort stamp's `not_stamped` outcome below, and the enrolment stands.
                   // The provisional secret is untouched on either refusal, so the same code
-                  // can be confirmed from a valid session.
+                  // can be confirmed from a valid session. An API-token (bearer) caller has no
+                  // session cookie and so no durable row: it is refused here by design, and
+                  // told so (no cookie at all) rather than that a session ended.
                   if (auth_mgr_->has_session_store()) {
                       using Source = auth::DurableMfaProof::Source;
-                      const auto durable = auth_mgr_->read_durable_mfa_proof(
-                          AuthRoutes::extract_session_cookie(req), session->username);
+                      const std::string session_cookie = AuthRoutes::extract_session_cookie(req);
+                      const auto durable =
+                          auth_mgr_->read_durable_mfa_proof(session_cookie, session->username);
                       if (durable.source != Source::kRow) {
                           const bool unavailable = durable.source == Source::kUnavailable;
                           const std::string msg =
                               unavailable
                                   ? "Session store is temporarily unavailable. Nothing was "
                                     "enrolled; retry shortly."
+                              : session_cookie.empty()
+                                  ? "This action needs a signed-in browser session. Nothing was "
+                                    "enrolled."
                                   : "Your session is no longer valid. Nothing was enrolled; "
                                     "sign in again.";
-                          audit_fn_(req, "mfa.enroll.failed", "error", "User", session->username,
-                                    unavailable ? "session_store_unavailable"
-                                                : "session_not_durable");
+                          // The session-bound writer (as the disable route's rows): the row is
+                          // attributed to the session this handler already resolved, not
+                          // re-resolved from the cookie, which is the very thing that may be
+                          // missing or stale here. Unwired (tests), `audit_fn_` is the fallback.
+                          const std::string refusal_detail = unavailable
+                                                                 ? "session_store_unavailable"
+                                                                 : "session_not_durable";
+                          if (audit_as_session_fn_)
+                              (void)audit_as_session_fn_(
+                                  req, *session,
+                                  auth::role_to_string(auth::effective_role(*session)),
+                                  "mfa.enroll.failed", "error", "User", session->username,
+                                  refusal_detail);
+                          else
+                              audit_fn_(req, "mfa.enroll.failed", "error", "User",
+                                        session->username, refusal_detail);
                           res.status = unavailable ? 503 : 401;
                           if (unavailable)
                               res.set_header("Retry-After", "5");
@@ -8508,6 +8527,9 @@ void SettingsRoutes::register_routes(
                   // Order them by the audit `id`.
                   // Returns whether the row persisted; the unwired fallback (tests, other callers)
                   // is a void writer and reports true, so only the production binding can refuse.
+                  // This writer serves the intent, denied and error rows only: the success row is
+                  // written by the owner inside the clear's transaction, through the
+                  // AuditEventForSessionFn seam below.
                   const auto audit = [&](const char* result, const std::string& detail) -> bool {
                       if (audit_as_session_fn_)
                           return audit_as_session_fn_(
@@ -8611,9 +8633,12 @@ void SettingsRoutes::register_routes(
                       break;
                   }
                   // No active row (the account went away mid-request) or a store fault: the
-                  // transaction rolled back, so the factor and the sessions are unchanged (barring
-                  // a connection lost at COMMIT, which commits all of it). The `error` row is the
-                  // caller's: the transaction wrote none.
+                  // transaction normally rolled back, so the factor and the sessions are
+                  // unchanged, but a connection lost exactly at COMMIT may have committed all of
+                  // it, so the answer says the factor may not have changed and to check its state
+                  // (and AuthManager::commit_mfa_disable has already dropped this replica's cached
+                  // sessions of the account for that case). The `error` row is the caller's: the
+                  // transaction wrote none.
                   if (!audit("error", "disable failed")) {
                       spdlog::error("mfa.disabled: MFA was not changed for '{}' and the error "
                                     "audit row failed to persist",
@@ -8623,12 +8648,14 @@ void SettingsRoutes::register_routes(
                   res.set_header("Retry-After", "5");
                   // /settings swaps no 5xx body, so the toast tells the operator on the main page.
                   res.set_header("HX-Trigger",
-                                 R"({"showToast":{"message":"Could not disable MFA; it was )"
-                                 R"(not changed. Try again.","level":"error"}})");
+                                 R"({"showToast":{"message":"Could not confirm MFA was )"
+                                 R"(disabled; it may not have been changed. Check its )"
+                                 R"(state.","level":"error"}})");
                   res.set_content(
                       render_mfa_fragment(*session, {}, {}, {}, {},
-                                          "Could not disable MFA. It was not changed; try again. "
-                                          "If you were signed out, sign in and check its state."),
+                                          "Could not disable MFA. It may not have been changed; "
+                                          "check its state and try again. If you were signed out, "
+                                          "sign in and check its state."),
                       "text/html; charset=utf-8");
               });
 }

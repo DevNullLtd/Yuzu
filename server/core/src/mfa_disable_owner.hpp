@@ -72,12 +72,14 @@
 /// BEFORE calling `commit()` (an intent that cannot be recorded stops the
 /// clear; it is evidence that a clear was requested even if the process dies
 /// mid-way) remain the CALLERS' job, as do the `denied`/`error` rows for the
-/// outcomes that wrote nothing (`kFactorChanged`, `kStoreUnavailable`).
+/// outcomes that wrote nothing (`kFactorChanged`, `kStoreUnavailable`, the latter
+/// barring a connection lost at COMMIT).
 ///
 /// Holds no in-process lock and never calls back into `AuthManager`; it borrows
 /// the pool and the audit store (both outlive it).
 
 #include "audit_store.hpp" // AuditEvent
+#include "auth_lock_bounds.hpp" // kAuthRecheckLockTimeout
 
 #include <chrono>
 #include <cstdint>
@@ -124,7 +126,9 @@ struct MfaDisableRequest {
 /// pass over the template: substituted text is never re-scanned, and only the
 /// template the caller supplies is substituted. A caller that embeds an
 /// untrusted string (an OS identity) in the template must treat it as part of the
-/// template: a literal `{sessions_ended}` inside it WOULD be replaced. With no
+/// template: a literal `{sessions_ended}` inside it WOULD be replaced (the CLI therefore
+/// neutralises `{` and `}` in the identity copy it puts in the template; that applies to the
+/// template copy only, its other rows are plain rows, not templates). With no
 /// token, an empty template becomes exactly `sessions_ended=<n>` and a non-empty
 /// one `<template> sessions_ended=<n>`.
 [[nodiscard]] std::string mfa_disable_complete_detail(std::string_view detail_template,
@@ -151,10 +155,14 @@ class MfaDisableOwner {
 public:
     /// Bounded acquire for the one lease, and the txn-scoped `lock_timeout`.
     /// MUST stay strictly below `AuthDB::recheck_role_locked`'s lock_timeout
-    /// (auth_db.cpp kWriteTimeout, 2000 ms): a same-account sign-in queued behind
-    /// a stalled disable must wait out its abort, never fail closed and sweep the
-    /// account's sessions (the same rule, and the same value, as
-    /// `CredentialChangeOwner::kWriteTimeout`).
+    /// (auth_db.cpp kWriteTimeout, 2000 ms, `kAuthRecheckLockTimeout`; the same rule, and
+    /// the same value, as `CredentialChangeOwner::kWriteTimeout`), enforced by the
+    /// static_assert below the class. The guarantee is per WAIT: `lock_timeout` bounds
+    /// each lock wait of the transaction, not the transaction as a whole, and `commit()`
+    /// makes several sequential waits (the `auth.users` row, the session rows, the audit
+    /// INSERT and the `session_meta` row), so a same-account sign-in queued behind a
+    /// stalled disable can still see its own recheck time out first and fail closed. What the
+    /// ordering does guarantee is that no single wait of this owner outlasts the recheck's.
     static constexpr std::chrono::milliseconds kWriteTimeout{1500};
 
     /// `audit` may be null (an audit-off wiring), then every `commit()` answers
@@ -187,5 +195,9 @@ private:
     AuditStore* audit_;
     std::function<void()> pre_commit_hook_for_test_;
 };
+
+static_assert(MfaDisableOwner::kWriteTimeout < kAuthRecheckLockTimeout,
+              "MfaDisableOwner::kWriteTimeout must stay strictly below AuthDB's write timeout "
+              "(kAuthRecheckLockTimeout, the recheck_role_locked lock_timeout)");
 
 } // namespace yuzu::server

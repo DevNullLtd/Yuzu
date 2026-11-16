@@ -21,6 +21,7 @@
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
 #include "acquire_retry.hpp"
+#include "auth_lock_bounds.hpp" // kAuthRecheckLockTimeout: the write budget the owners stay below
 #include "auth_db_sql_helpers.hpp" // one copy of the soft-delete / role-write statements (#4966)
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
@@ -190,9 +191,10 @@ constexpr const char* kStoreName = "auth";
 // statement / mutation paths get a little more room. Neither is unbounded —
 // unbounded `acquire()` is construction-only (used once, in the ctor).
 constexpr std::chrono::milliseconds kReadTimeout{1500};
-constexpr std::chrono::milliseconds kWriteTimeout{2000};
-// Also the lock_timeout of recheck_role_locked; CredentialChangeOwner::kWriteTimeout MUST stay
-// strictly below it (R22e).
+constexpr std::chrono::milliseconds kWriteTimeout{kAuthRecheckLockTimeout};
+// Also the lock_timeout of recheck_role_locked; CredentialChangeOwner::kWriteTimeout and
+// MfaDisableOwner::kWriteTimeout MUST both stay strictly below it (R22e). The value lives in
+// auth_lock_bounds.hpp, where a static_assert beside each owner enforces the ordering.
 
 // Bounded acquire-retry (issue #2396). The shared PG pool arms a short
 // connect-backoff breaker after a connectivity hiccup (pg_pool.cpp): for a

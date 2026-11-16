@@ -3777,9 +3777,9 @@ public:
             "clear_mfa_proof / rebind_guard / elevate / account_state, the last being the "
             "read of the account store that gates a durable local session); a validate "
             "degrade fails the request closed, and elevate / revoke (via invalidate_user) "
-            "degrades fail the privileged op closed, except "
-            "that an invalidate_user after an already-committed MFA clear leaves the "
-            "clear in place and ends partial",
+            "degrades fail the privileged op closed; the Settings MFA disable and "
+            "--mfa-reset no longer call invalidate_user and are not counted on this "
+            "series (their failures are the 503 / error audit rows)",
             "counter");
         for (auto op : {"validate", "create", "touch", "generation_refresh", "reap",
                         "invalidate_user", "invalidate", "mark_mfa", "clear_mfa_proof",

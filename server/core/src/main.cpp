@@ -1985,6 +1985,14 @@ int main(int argc, char* argv[]) {
             ev.detail = std::move(detail);
             return ev;
         };
+        // The recovery pointer every refusal below prints, byte for byte what the intent-row
+        // refusal has always printed (tests/shell/test_mfa_reset.sh and the runbook pin it). It
+        // is added as an extra stderr line AFTER each existing error line, never in place of one.
+        const auto print_fallback_pointer = [] {
+            std::cerr << "if you are locked out and cannot restore the audit store, see "
+                         "\"Fallback: direct SQL\" in the Auth Store Recovery Runbook "
+                         "(docs/ops-runbooks/auth-db-recovery.md)\n";
+        };
         if (!audit->log(make_event("attempted", std::format("MFA clear requested via --mfa-reset "
                                                             "CLI (os_identity={})",
                                                             os_user)))) {
@@ -1994,9 +2002,7 @@ int main(int argc, char* argv[]) {
                           "Runbook (docs/ops-runbooks/auth-db-recovery.md)",
                           mfa_reset_user);
             std::cerr << "error: audit store did not accept the intent row; nothing was changed\n";
-            std::cerr << "if you are locked out and cannot restore the audit store, see "
-                         "\"Fallback: direct SQL\" in the Auth Store Recovery Runbook "
-                         "(docs/ops-runbooks/auth-db-recovery.md)\n";
+            print_fallback_pointer();
             return EXIT_FAILURE;
         }
         // #6079 PR 2c: the factor clear, the end of the account's durable sessions and the
@@ -2030,12 +2036,14 @@ int main(int argc, char* argv[]) {
                                   "changed (os_identity={})",
                                   os_user));
             std::cerr << "error: session store unavailable; nothing was changed\n";
+            print_fallback_pointer();
             return EXIT_FAILURE;
         }
         // `{sessions_ended}` is the owner's substitution token. The OS identity is part of the
         // template, so a `{` or `}` in it must not be able to form one (the substitution runs
         // over the whole template): neutralise both characters in the copy the template gets.
-        // The intent row above carries the raw identity (it is not a template).
+        // The intent row above carries the raw identity (it is not a template), and so do the
+        // `error_row` rows: the neutralisation applies to the template copy only.
         std::string template_identity = os_user;
         std::replace(template_identity.begin(), template_identity.end(), '{', '_');
         std::replace(template_identity.begin(), template_identity.end(), '}', '_');
@@ -2071,6 +2079,7 @@ int main(int argc, char* argv[]) {
                                   os_user));
             std::cerr << "error: audit store did not accept the outcome row; nothing was "
                          "changed\n";
+            print_fallback_pointer();
             return EXIT_FAILURE;
         case yuzu::server::MfaDisableResult::kFactorChanged: // unreachable: no expected generation
         case yuzu::server::MfaDisableResult::kStoreUnavailable:
@@ -2084,6 +2093,7 @@ int main(int argc, char* argv[]) {
                                   os_user));
             std::cerr << "error: failed to clear MFA; nothing was changed (unless the connection "
                          "was lost at commit): check the account's status and re-run\n";
+            print_fallback_pointer();
             return EXIT_FAILURE;
         }
         spdlog::info("Break-glass: MFA cleared for '{}'. The user can now sign in with their "
