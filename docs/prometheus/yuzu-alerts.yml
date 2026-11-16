@@ -7228,22 +7228,23 @@ groups:
             failover to another core replica would otherwise reset the 15 minute clock. The
             alert clears up to about 5 minutes after the backlog drains (the window is
             left-open). No per-device view of the underlying tag exists: this gauge is a fleet
-            sum, so find the affected endpoints by searching the fleet's agent logs for "failed
-            to persist captured baseline" and for the ERROR lines logged at stop, then fix the
-            store (a full or read-only data directory, permissions, a locked kv_store.db). Fix
-            the store first. A graceful restart while the store is still failing loses the
-            staged capture, because the stop-time flush uses the same store. After the store is
-            healthy, the worker retries without a restart (backoff up to 60 s), unless the
-            agent log shows "Failed to open KV store" from boot: the store is opened once, at
-            boot, so that agent never recovers by itself, a restart after repairing the data
-            directory IS required and the captures staged in that process can no longer be
-            written. A crash or a forced kill loses the capture regardless; the next boot then captures whatever the
-            file holds at that moment, which is the gap this alert exists to expose. This covers
-            the Spark path only: persist failures on the legacy detection path are logged and are
-            not counted. Read a quiet graph together with
-            yuzu_fleet_guardian_baseline_reporting: while that is 0 (every released agent today)
-            the alert cannot fire for any reason. The 15 minute clock and the 5 minute window
-            are not tuned against fleet data; revisit them at the Spark flip.
+            sum and the alert cannot name the affected endpoints. If you ship agent logs to a
+            central store, search them for "failed to persist captured baseline" and for the
+            ERROR lines logged at stop; otherwise check the logs on the affected hosts. Then
+            fix the store (a full or read-only data directory, permissions, a locked
+            kv_store.db). Fix the store first. A graceful restart while the store is still
+            failing loses the staged capture, because the stop-time flush uses the same store.
+            After the store is healthy, the worker retries without a restart (backoff 5 s up
+            to 60 s). A crash or a forced kill loses the capture regardless; the next boot then
+            captures whatever the file holds at that moment, which is the gap this alert exists
+            to expose. An agent whose log shows "Failed to open KV store" at boot arms no
+            Guardian rules at all, so it cannot raise this alert; that is a separate fault:
+            repair the agent data directory and restart the agent. This covers the Spark path
+            only: persist failures on the legacy detection path are logged and are not counted.
+            Read a quiet graph together with yuzu_fleet_guardian_baseline_reporting: while that
+            is 0 (every released agent today) the alert cannot fire for any reason. The 15
+            minute clock and the 5 minute window are not tuned against fleet data; revisit them
+            at the Spark flip.
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/guaranteed-state.md#fleet-monitoring-of-baseline-persistence"
   # MASS-ABSENT META-ALERT — COMMENTED until the fleet is past staged rollout (gov UP-12).
   # absent() on yuzu_fleet_spark_reporting would catch "every spark-reporting agent went
