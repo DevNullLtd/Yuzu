@@ -4,6 +4,21 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 
 Running `dev` between releases? Some entries below describe changes on `dev` that are not in a release yet. For what a `git pull` of `dev` changed, run the repository script `python3 scripts/whats-new.py` (`--versions` for the version bumps, rebuild notes and Docker image bumps); see `changelog.d/README.md`.
 
+## Behaviour change: the Echo retention-paused dashboard actions authorize per device, and a caller with no grant now gets 404, not 403 (#2540)
+
+**What changed.** The dashboard Echo **Re-enable** and **Purge data** POSTs (`POST /fragments/echo/retention-paused/reenable` and `.../purge`) now authorize through the same per-device scoped-permission gate as `POST /api/v1/echo/retention-paused/purge`: `Execution:Execute` for Re-enable and `Infrastructure:Delete` for Purge, decided for the posted device and decided again after the `attempted` audit row is stored. The retention-paused frame (`GET /fragments/echo/retention-paused`) is gated by the fleet read gate and lists only the rows in the operator's scope.
+
+| Where you see it | Before | After |
+|---|---|---|
+| A caller with no grant on the pair, on either POST | `403`, audit `rbac_denied`, counter `result="denied"` | `404` "Agent not reachable." (the body an offline device gets), audit `failure` `scope_violation source=<src>`, counter `result="scope_violation"` |
+| A grant withdrawn while the `attempted` row was stored | `403` from the permission gate | `404` "Agent not reachable.", or `503` when the authorization store is unavailable; audit `permission_revoked` |
+| The scoped gate unwired, or the authorization store unavailable | not reachable | `503` "Authorization unavailable.", nothing sent; audit `denied` `scoped_gate_unavailable source=<src>`, counter `result="denied"` |
+| A holder of a global grant | needed the device to be visible through group membership | passes the POST without group-membership visibility |
+| `GET /fragments/echo/retention-paused` for a management-group-scoped reader | `403`, refused at the global `Infrastructure:Read` gate | admitted; shows only the in-scope rows |
+| `GET /fragments/echo/retention-paused` with a service-scoped token | `403` | `403` (unchanged, now explicit; audit `echo.retention_paused.view` `denied`) |
+
+**Who is affected.** SIEM and alert rules that match `rbac_denied` on `echo.source.reenable` / `echo.source.purge`, or `result="denied"` on `yuzu_echo_source_reenable_total` / `yuzu_echo_source_purge_total`, to find callers without a grant (they now arrive as `scope_violation`; `denied` now means the scoped gate was unavailable); scripts that treat the `403` on these POSTs as "no permission". The row buttons still follow the global grant, so a management-group-scoped operator sees their in-scope rows without buttons. Purge is available to them through `POST /api/v1/echo/retention-paused/purge`; Re-enable has no REST or MCP route, so they cannot reach it.
+
 ## Behaviour change: a service-scoped credential's execution visibility is limited to its service scope (#5557)
 
 **In short.** Affected: integrations that read executions with a service-scoped API token (one created with `scope_service`). To do: treat not found as "not yet" until an agent in the token's service scope has replied, poll no faster than about once every 5 seconds and stop after a timeout, or read the execution with the credential that dispatched it.
