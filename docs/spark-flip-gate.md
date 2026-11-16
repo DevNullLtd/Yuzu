@@ -934,7 +934,7 @@ flip, with a red-first test each:
   hold paragraph in `docs/user-manual/guaranteed-state.md`.
 - **F14 precondition (#4045 governance, added 2026-10-07): a fleet-visible persist-failure
   signal (gauge + alert + pin test), splitting permanent loss from retryable failures.
-  DISPOSITION (#5605, PR #<n>): the signal is SHIPPED; the begin-of-stop sentinel and the
+  DISPOSITION (#5605): the signal is SHIPPED; the begin-of-stop sentinel and the
   journal-record loss at stop are covered by the recorded risk acceptance in section 5.**
   What shipped: two agent heartbeat tags beside the existing cumulative
   `yuzu.guardian_baseline_persist_failures` (kept apart from it: that tag stays the
@@ -956,7 +956,15 @@ flip, with a red-first test each:
   stays DIAGNOSTIC-ONLY (no tag, no gauge); a stop ended by the agent's own shutdown watchdog
   (exit code 4) is still logged nowhere. The alert is dormant in production until
   `prefer_spark` is enabled (the gauge is absent fleet-wide before that), so it is shown to
-  fire only by the promtool cases today; a live-rig firing check belongs to the flip evidence.
+  fire only by the promtool cases today.
+  **Flip-evidence checklist row (#5605; a canary, before the flip):** on a `prefer_spark`
+  canary, (1) `yuzu_fleet_guardian_baseline_reporting` is above 0, (2)
+  `yuzu_fleet_guardian_baseline_tag_rejected` is 0, and (3) a forced store fault on that
+  canary makes `YuzuGuardianBaselineUnpersisted` fire and then clear once the fault is lifted
+  (allow the 15-minute `for:` to elapse, and up to about 5 minutes for the `[5m]` window to
+  run out after the backlog drains). The alert keeps the `> 0` shape on purpose (a ruled
+  decision); a series of one-scrape backlogs from different agents can hold it above 0, and
+  a promtool case documents that limit.
   Alert-at-scale revisit (recorded risk, owner Dave): the rule is `sum by (job)
   (max_over_time(...[5m])) > 0` for 15 minutes, a sum of current counts that stays above 0
   while ANY agent has a slow or failing store, so on a large fleet one flapping endpoint can
@@ -2589,8 +2597,8 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   `legacy` is the correct reading until `prefer_spark` is enabled. Not specific to #2818 (it was a general
   PR-5-readiness gap), so not filed as its own #2818-scoped issue; recorded here since several of
   this PR's own non-blocking dispositions depend on it.
-- **Baseline-persist signal emitted but unread (#4045, F14 precondition): CLOSED by #5605
-  (PR #<n>).** This was the same shape as the `yuzu.guardian_backend` gap above:
+- **Baseline-persist signal emitted but unread (#4045, F14 precondition): CLOSED by #5605.**
+  This was the same shape as the `yuzu.guardian_backend` gap above:
   `yuzu.guardian_baseline_persist_failures` was emitted on the heartbeat (Spark path only,
   cumulative, mixing retryable failures with permanent losses) but no server code read it.
   The server now rolls up that tag and two new ones (`yuzu.guardian_baseline_unpersisted`, the
@@ -2675,12 +2683,13 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   predates #5604 and is not fixed here (a pre-existing residual of the store's single
   mutex); tracked as #5642.
   **Trace decision (AC2)**: a watchdog-cut flush stays untraceable at stop time (decided by
-  the implementer, not accepted by a stakeholder; `hard_exit` forbids a log line, and a
-  KV marker would fail on the same store); the
+  the implementer; `hard_exit` forbids a log line, and a KV marker would fail on the same
+  store. AC2 itself was an implementer decision, not a stakeholder one; it is now covered by
+  the section 5 risk acceptance below); the
   evidence is exit code 4 plus the next boot's recapture lines. A recapture logs exactly
   like a first arm, so an operator should treat `file-hash-equals` rules without an authored
   `expected_hash` as possibly re-baselined after an exit-4 event. A begin-of-stop file
-  sentinel was #5605's candidate design and is NOT built: #5605 (PR #<n>) shipped the fleet
+  sentinel was #5605's candidate design and is NOT built: #5605 shipped the fleet
   signal instead and the section 5 risk acceptance below covers the sentinel's absence.
   Measured under real SQLITE_BUSY (a second connection holding `BEGIN IMMEDIATE` through
   the whole stop), production values (5 s lowered to 1 s), Linux debug build, `stop()` entry
@@ -2718,18 +2727,26 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   journal one naming the pending count and the flush stage. Every user of the shared store
   runs at the 1 s budget once `stop()` has lowered it, not only plugins' `shutdown()`
   writes: plugin actions, the sync scheduler and the license scan too.
-  **F14 precondition (journal loss): RISK ACCEPTED, owner Dave, recorded with #5605
-  (PR #<n>).** The pending-journal ERROR line is agent-local only (the heartbeat has already
+  **F14 precondition (journal loss): RISK ACCEPTED by Dave Rae, F14 sign-off owner (owner
+  ruling 2026-10-23, Ruling 28 of the #5605 kickoff; sign-off ownership confirmed 2026-11-15),
+  recorded in the acceptance comment on #5605 dated 2026-11-16. Scope: F14 only; this is not
+  a SOC 2 exception. The owner is also the author of the change, so no independent approval
+  is implied by this record.** The pending-journal ERROR line is agent-local only (the heartbeat has already
   stopped; no metric, no server row; absent if the watchdog cuts the stop; count and stage
   only, no rule ids). The fleet signal shipped by #5605 was NOT extended to journal records
   lost at stop. ACCEPTED for F14: (1) the begin-of-stop sentinel (the trace decision above:
   a watchdog-cut stop, exit code 4, stays untraceable at stop time) and (2) the loss of
-  lifecycle-journal records still pending at stop. Compensating control, partial: the
+  lifecycle-journal records still pending at stop. Compensating control, PARTIAL: the
   boot-scan tag `yuzu.guardian_baseline_rebaselined_at_boot` (gauge
-  `yuzu_fleet_guardian_baseline_rebaselined_at_boot`) shows that rules re-captured a baseline
-  at a boot, but it cannot prove that a capture was lost or that the previous stop was an
-  exit-4 (a never-captured target, a failed arm, a platform that cannot arm the file mechanism
-  and a lost capture all read the same, and it says nothing about journal records). The only
+  `yuzu_fleet_guardian_baseline_rebaselined_at_boot`) counts only a boot re-arm whose seed
+  read found NO persisted record (an Absent read). It does not see a Malformed record, a boot
+  read error or a fingerprint mismatch (a retarget), all of which also re-baseline, nor a
+  retarget whose new capture was never written before a crash (the old record still reads
+  Ok), and it says nothing about journal records. It cannot prove that a capture was lost or
+  that the previous stop was an exit-4 (a never-captured target, a failed arm and a lost
+  capture all read the same). On Linux and macOS no file mechanism arms, so such a rule reads
+  Absent at every boot and the tag is non-zero on every boot there, so it is not a baseline-loss
+  signal there and meaningful readings come from Windows agents only. The only
   stop-time trace is the agent-local ERROR lines added by PR #5645 (the #5604 stop busy
   budget), which a watchdog-cut stop does not write. **Revisit trigger: before the first
   production fleet or the first post-flip exit-4.** (The earlier wording, "Owner: to be
@@ -2774,12 +2791,12 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
 - Milestone: pre-PR-5 hardening package (#4051/#4052/#4053) + two remaining pre-PR-5 GATING items
   from the PR-2d follow-ups (the three sre observability gaps; the
   yuzu.guardian_backend server-side-reader gap, now visible via #2240), plus two items from #4045 (the fleet-visible
-  baseline-persist signal (F14 precondition, section 3a) and the missing
-  remaining-deadline wall in `stop()`); the third PR-2d follow-up, guard.errored census
+  baseline-persist signal (F14 precondition, section 3a; shipped by #5605, so no longer
+  pending) and the missing remaining-deadline wall in `stop()`); the third PR-2d follow-up, guard.errored census
   recognition (C-1), is resolved by #5667 with residuals (a)-(d) carried in the C-1 bullet
   of section 5 (#5674/#5675/#5676; the two still-open PR-2d follow-ups have no issue numbers of their
   own, tracked here; residuals (a)-(d) also gate); those two #4045 items
-  are tracked in #5605 (fleet signal: SHIPPED in PR #<n>; section 3a) and #5604 (the `stop()`
+  are tracked in #5605 (fleet signal: SHIPPED; section 3a) and #5604 (the `stop()`
   deadline; the decision closes with the stop busy budget, while the slow-I/O residual stays
   F14-gating, section 5, and the lifecycle-journal records lost at stop were a further F14
   precondition there, now recorded as an accepted risk, owner Dave, with its revisit trigger
