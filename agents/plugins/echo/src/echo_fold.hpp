@@ -292,8 +292,8 @@ private:
                     std::get<double>(cur[j]) += std::get<double>(in[j]);
                 else {
                     // Saturate: signed overflow is undefined, and a wrapped total would be
-                    // a plausible wrong number. (The SQL UPSERT promotes to REAL instead;
-                    // this sums within one batch only.)
+                    // a plausible wrong number. (The SQL UPSERT saturates at the same
+                    // bounds, so the in-memory merge and the stored row agree.)
                     auto& a = std::get<int64_t>(cur[j]);
                     const int64_t b = std::get<int64_t>(in[j]);
                     if (b > 0 && a > std::numeric_limits<int64_t>::max() - b)
