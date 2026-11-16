@@ -5412,25 +5412,25 @@ groups:
         annotations:
           summary: "Audit events failing to persist — behavioural-data routes and audit-first mutations are 503ing"
           description: >-
-            yuzu_server_audit_emit_failed_total is rising. Every REST route that uses
+            yuzu_server_audit_emit_failed_total is rising. The REST routes that use
             fail-closed audit-on-open (guardian.device.view, dex.device.view,
             dex.signal.view, dex.perf.device.view, network.device.view, inventory.devices,
-            inventory.device.ci, plus
+            inventory.device.ci, inventory.devices.ci, plus
             response.read on the v1 query, aggregate and export routes and on the
             legacy get, aggregate and export routes, plus response.forensics.read (written
             only when the rows served include a Forensics-tier plugin's) on the v1
             execution-scoped response, response get, export and visualization routes, on
             bundle collation (GET /api/v1/bundles/{id}) and on the legacy get and export
-            routes) is returning 503 and withholding PII or response
+            routes) are returning 503 and withholding PII or response
             data, so a ServiceNow / CMDB poll blackouts fleet-wide. Set-and-proceed reads, including
             crypto.libraries.* and response.forensics.read on the dashboard results fragment, the
             executions drawer, the hardware result poll, the MCP query_responses tool and
             the MCP get_bundle_result tool, keep
             serving data and do not 503: their REST routes and dashboard
             fragments set the Sec-Audit-Failed header, their MCP tools set audit_persisted:false
-            (the hardware CI tools list_hardware_ci and get_hardware_ci, which audit as
-            inventory.devices and inventory.device.ci, fail closed instead: they withhold the
-            data and answer a retryable -32603), and only the /crypto (crypto.libraries.*) pages
+            (the hardware CI tools list_hardware_ci, get_hardware_ci and list_hardware_ci_records,
+            which audit as inventory.devices, inventory.device.ci and inventory.devices.ci,
+            fail closed instead: they withhold the data and answer a retryable -32603), and only the /crypto (crypto.libraries.*) pages
             also show an on-page "Audit not recorded" notice.
             Check audit_store health (/healthz
             stores.audit) and free disk / connection saturation on the PostgreSQL
