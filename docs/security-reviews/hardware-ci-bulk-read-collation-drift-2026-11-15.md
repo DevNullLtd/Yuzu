@@ -178,6 +178,52 @@ PR 3 owns the write-side control. For this read it must:
   `mcp.md`, `server-admin.md`, the SOC 2 answer, the changelog fragment and the OpenAPI description) once
   the pause ships, because "the server only reports a mismatch and stops no write" stops being true.
 
+## PR 3 outcome
+
+PR 3 (#7730) adds the `device_ci` write pause and a read gate. This section records what it closes and
+what it leaves; it is a design outcome, not new measurement, and it does not rewrite the sections above,
+which describe the report-only state this note was written against (the Defect section and residuals 3
+and 4 say the server stops no read and no write: that stopped being true when PR 3 merged). The code is
+in `server/core/src/pg/pg_collation_check.{hpp,cpp}` (the gate), `device_inventory_store.{hpp,cpp}` and
+`device_ci_ingestion.cpp` (the write pause), `device_ci_read_gate.hpp` and `hardware_ci_page_model.*`
+(the read gate).
+
+**What it closes.** Each replica keeps a gate derived from the last conclusive collation check:
+Trusted, Mismatch (stays through checks that cannot run) or Unproven (no conclusive check since the
+process started).
+
+- Residual 1, writes: while the gate reads Mismatch, agent ingest of the device-CI source is refused
+  before the blob is parsed (acknowledged `need_full`, so the agent resends in full on its backoff; no
+  wire change), and the device-CI removal of a decommission is not attempted (reported as a failed
+  store with a distinct reason, `details.write_paused`). `ci.last_seen` stops advancing while the
+  pause stands. Unproven does not pause writes.
+- Residual 1, reads by primary key: while the gate is not Trusted, the per-device CI read (`GET
+  /api/v1/hardware/{id}`, MCP `get_hardware_ci`, the dashboard) and the roster-keyed CI columns of `GET
+  /api/v1/hardware` answer in their existing degraded state instead of reporting a stored device as
+  missing.
+- Residual 4, the gate: this read (`GET /api/v1/hardware-ci`, MCP `list_hardware_ci_records`) is
+  refused with a retryable `503` (`retry_after_ms` 60000) while the gate is not Trusted, with no
+  override flag. The keyset SQL, its `COLLATE "C"` spellings and the `device_ci_agent_id_c_idx`
+  expression are unchanged, and the cursor prefix stays `h1` (no epoch is bound into the cursor).
+
+**What stays.**
+
+- Residual 2, every other keyset read over a text key follows the database collation and is not gated.
+- Residual 3, the detection delay: a replica sees a mismatch at its next check, up to about an hour
+  after the drift begins, and decides for itself; writes in that window are not paused, and a write that
+  passed the check just before the gate flipped is not stopped. Rows duplicated before the pause began
+  are not repaired by it.
+- Other stores' text-keyed unique indexes are not gated (`endpoint_state`, whose text primary key is
+  written on every heartbeat, is a named example) and agent registration is not gated.
+- A start whose first check cannot run leaves the gate Unproven (reads refused, writes accepted) until
+  the first repeat concludes, about a minute after the repeat thread starts.
+- Unverified, carried over: that `ALTER DATABASE ... REFRESH COLLATION VERSION` cannot record a first
+  version when the database records none (measured once, on PostgreSQL 18.4), the emulation figures in
+  this note (one run), and the roster-keyed read's misses (same mechanism, not measured separately).
+
+**Owner review trigger.** The 2026-11-15 acceptance below names the merge of this change as its review
+trigger, and the owner revisits it then. Nothing in this section records a new acceptance.
+
 ## Owner acceptance of the residual
 
 The repository owner accepted residual exposures 1 to 4 (the list above, including the measured
