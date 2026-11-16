@@ -967,12 +967,19 @@ flip, with a red-first test each:
   a promtool case documents that limit.
   **Flip-time refresh item (#5605; part of the same checklist row):** at the flip, (4)
   refresh every statement that says Spark or `prefer_spark` is off, or that the gauge is
-  absent, in every released agent today. List them with `git grep -n -i "released agent"` and
-  `git grep -n "prefer_spark.*off"` over: the HELP strings in
-  `server/core/src/guardian_baseline_fleet_tags.hpp`, `docs/user-manual/metrics.md`,
-  `docs/user-manual/guaranteed-state.md`, `docs/user-manual/upgrading.md`, the alert comment
-  and description in `docs/prometheus/yuzu-alerts.yml`, and the runbook "Fleet monitoring of
-  baseline persistence". To tell which agents are on the Spark path, use the
+  absent, in every released agent today. List them with
+  `git grep -n -i "released agent" -- docs/ server/core/src/ agents/core/` and
+  `git grep -n "prefer_spark.*off" -- docs/ server/core/src/ agents/core/` over: the HELP
+  strings in `server/core/src/guardian_baseline_fleet_tags.hpp`,
+  `docs/user-manual/metrics.md`, `docs/user-manual/guaranteed-state.md`,
+  `docs/user-manual/upgrading.md`, the alert comment and description in
+  `docs/prometheus/yuzu-alerts.yml`, and the runbook "Fleet monitoring of baseline
+  persistence". The agent side has two comments that state the flag is off or defaults to
+  false: `agents/core/src/guardian_baseline_heartbeat.hpp` (the unpersisted tag is "dormant
+  (prefer_spark off ...)") and `agents/core/include/yuzu/agent/guardian_engine.hpp`
+  ("prefer_spark_ defaults false" and "live in every released agent today"); the switch
+  itself is the hardcoded `/*prefer_spark=*/false` in `agents/core/src/agent.cpp`. To tell
+  which agents are on the Spark path, use the
   `yuzu.guardian_backend` tag (`guardian_backend` on `GET /api/v1/devices`) and the `path=`
   field of the `Guardian: full_sync rebuilt` log line.
   Alert-at-scale revisit (recorded risk, owner Dave): the rule is `sum by (job)
@@ -2752,11 +2759,15 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   read found NO persisted record (an Absent read). It does not see a Malformed record, a boot
   read error or a fingerprint mismatch (a retarget), all of which also re-baseline, nor a
   retarget whose new capture was never written before a crash (the old record still reads
-  Ok), nor a capture that was never staged, and it says nothing about journal records. It cannot prove that a capture was lost or
-  that the previous stop was an exit-4 (a never-captured target, a failed arm and a lost
-  capture all read the same). On Linux and macOS no file mechanism arms, so such a rule reads
-  Absent at every boot and the tag is non-zero on every boot there, so it is not a baseline-loss
-  signal there and meaningful readings come from Windows agents only. The only
+  Ok), nor, when an older record for that target exists, a capture that was never staged
+  (with no older record the next boot reads it as Absent and the boot-scan counts it), nor a
+  malformed record that is overwritten at boot N, which reads Ok at boot N+1, nor a rule that
+  was disabled at boot and enabled later, which is never counted; and it says nothing about
+  journal records. It cannot prove that a capture was lost or that the previous stop was an
+  exit-4 (a never-captured target, a failed arm and a lost capture all read the same). On
+  Linux and macOS no file mechanism arms, so such a rule reads Absent at every boot and the
+  tag is non-zero on every boot there, so it is not a baseline-loss signal there and
+  meaningful readings come from Windows agents only. The only
   stop-time trace is the agent-local ERROR lines added by PR #5645 (the #5604 stop busy
   budget), which a watchdog-cut stop does not write. **Revisit trigger: before the first
   production fleet or the first post-flip exit-4.** (The earlier wording, "Owner: to be
