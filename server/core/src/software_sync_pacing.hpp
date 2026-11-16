@@ -44,10 +44,12 @@ inline constexpr double kMaxRunShare = 0.5;
 /// Below this free-budget share a run is not started (it would take longer than it saves).
 inline constexpr double kMinRunRate = 1.0;
 
-/// One run still spreading: the rate it was admitted at and the second its spread ends.
+/// One run still spreading: the rate it was admitted at and the second its spread ends. `id` is the
+/// caller's handle on its own entry; `admit` ignores it.
 struct ActiveRun {
     double rate{0.0};
     std::int64_t ends_at{0};
+    std::uint64_t id{0};
 };
 
 struct Admission {
@@ -65,15 +67,11 @@ struct Admission {
 /// Decide one run of `targets` devices against `active` at time `now` (epoch seconds). Runs with
 /// `ends_at <= now` are over and free their rate, whatever the caller still holds; a `now` that
 /// stepped backwards simply keeps more of them active (no negative delay or retry arises).
-/// `targets` of 0 reserves nothing. Precondition: `active` is every run the caller still holds.
+/// Preconditions: `targets >= 1` (the Runner answers an empty run before it asks), and `active` is
+/// every run the caller still holds.
 [[nodiscard]] inline Admission admit(std::span<const ActiveRun> active, std::size_t targets,
                                      std::int64_t now) {
     Admission out;
-    if (targets == 0) {
-        out.kind = Admission::Kind::Admit;
-        out.ends_at = now;
-        return out;
-    }
     double in_use = 0.0;
     std::int64_t earliest_end = 0;
     bool any_active = false;

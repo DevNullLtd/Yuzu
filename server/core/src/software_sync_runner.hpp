@@ -92,7 +92,7 @@ struct Env {
         /// untracked).
         std::function<std::string(const auth::Session&, const Selector&, std::int64_t delay_max_s)> create;
         /// Frames the registry actually accepted.
-        std::function<bool(const std::string& execution_id, std::size_t targeted)> set_targeted;
+        std::function<void(const std::string& execution_id, std::size_t targeted)> set_targeted;
         /// Close the row of a run that sent nothing (or whose send threw).
         std::function<void(const std::string& execution_id, const auth::Session&)> cancel;
     } track;
@@ -345,11 +345,7 @@ private:
                 } else if (live_sends_ >= kMaxLiveRuns) {
                     verdict = Verdict::LiveBound;
                 } else {
-                    std::vector<ActiveRun> active;
-                    active.reserve(ledger_.size());
-                    for (const auto& e : ledger_)
-                        active.push_back(e.run);
-                    adm = admit(active, plan.targets.size(), started_at);
+                    adm = admit(ledger_, plan.targets.size(), started_at);
                     if (adm.kind == Admission::Kind::Busy)
                         verdict = Verdict::Busy;
                     else if (adm.kind == Admission::Kind::TooLarge)
@@ -404,8 +400,16 @@ private:
             reservation.begin_sending_locked(planned, execution_id);
         }
 
+        const auto none_reachable = [&] {
+            close_record();
+            out.status = Status::NoneReachable;
+            out.http = 503;
+            out.message = "no selected device is reachable right now";
+            out.retry_after_ms = 30000;
+            return out;
+        };
+
         DispatchResult sent;
-        bool threw = false;
         try {
             sent = env_.dispatch(session, plan.targets, delay_max_s, execution_id);
         } catch (...) {
@@ -415,35 +419,22 @@ private:
             // The audit row is already stored. The runner cannot prove nothing was sent, so the
             // pacing reservation stays until its spread ends; the key is neither joinable nor in
             // cooldown (it was not accepted), and the answer is the retryable "nothing reachable".
-            threw = true;
             audit.note("failure", type, target_id, "dispatch_threw");
-        }
-        if (threw) {
             if (guarded)
                 reservation.forget_key(); // keep the ledger entry, drop the key's run state
-            close_record();
-            out.status = Status::NoneReachable;
-            out.http = 503;
-            out.message = "no selected device is reachable right now";
-            out.retry_after_ms = 30000;
-            return out;
+            return none_reachable();
         }
         if (sent.sent == 0) {
             // Every frame was refused: nothing will spread, so the whole reservation goes back and
             // the cooldown stays unspent.
             reservation.release_all();
-            close_record();
-            out.status = Status::NoneReachable;
-            out.http = 503;
-            out.message = "no selected device is reachable right now";
-            out.retry_after_ms = 30000;
-            return out;
+            return none_reachable();
         }
 
         // Frames the registry accepted are the run; a frame that was not accepted keeps its share
         // of the reservation until the spread ends (the budget bounds what was ASKED).
         if (!execution_id.empty() && env_.track.set_targeted)
-            (void)env_.track.set_targeted(execution_id, sent.sent);
+            env_.track.set_targeted(execution_id, sent.sent);
         const auto final_counts = finalize(plan.counts, sent.sent);
         const auto summary = summary_json(final_counts, sent.command_id, started_at, execution_id, delay_max_s);
         if (guarded) {
@@ -482,11 +473,6 @@ private:
         std::optional<std::int64_t> cooldown_from;
     };
 
-    struct LedgerEntry {
-        std::uint64_t id{0};
-        ActiveRun run;
-    };
-
     [[nodiscard]] std::int64_t now() const {
         if (env_.now)
             return env_.now();
@@ -498,7 +484,7 @@ private:
     // -- everything below runs with `mu_` held ----------------------------------------------
 
     void prune_ledger_locked(std::int64_t at) {
-        std::erase_if(ledger_, [at](const LedgerEntry& e) { return e.run.ends_at <= at; });
+        std::erase_if(ledger_, [at](const ActiveRun& e) { return e.ends_at <= at; });
     }
 
     /// Is the key's run still a run? Pending is; Running is until its send has returned AND its
@@ -609,7 +595,7 @@ private:
                          std::optional<std::int64_t> before, std::int64_t at) {
             key_ = key;
             id_ = ++r_.next_ledger_id_;
-            r_.ledger_.push_back({id_, {adm.rate, adm.ends_at}});
+            r_.ledger_.push_back({adm.rate, adm.ends_at, id_});
             r_.make_room_locked(key, at);
             KeyState& k = r_.keys_[key];
             const auto stamp = k.cooldown_from; // a returning key keeps nothing but its stamp, replaced at settle
@@ -665,7 +651,7 @@ private:
     };
 
     void erase_ledger_locked(std::uint64_t id) {
-        std::erase_if(ledger_, [id](const LedgerEntry& e) { return e.id == id; });
+        std::erase_if(ledger_, [id](const ActiveRun& e) { return e.id == id; });
     }
     void erase_key_if_mine_locked(const std::string& key, std::uint64_t id) {
         const auto it = keys_.find(key);
@@ -676,7 +662,7 @@ private:
     Env env_;
     std::mutex mu_;
     /// The pacing ledger: runs admitted and still spreading (dropped when their spread ends).
-    std::vector<LedgerEntry> ledger_;
+    std::vector<ActiveRun> ledger_;
     /// run key -> its run state and cooldown stamp, bounded at kCooldownStateCap.
     std::unordered_map<std::string, KeyState> keys_;
     std::uint64_t next_ledger_id_{0};

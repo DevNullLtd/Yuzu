@@ -65,11 +65,6 @@ TEST_CASE("sync pacing: targets within the rate give delay 0 and a one second le
         CHECK(a.rate == static_cast<double>(targets)); // it reserves what it uses, no more
         CHECK(a.ends_at == kNow + 1);
     }
-    // Nothing to send reserves nothing and does not ask for a window.
-    const auto none = ss::admit({}, 0, kNow);
-    CHECK(none.kind == Kind::Admit);
-    CHECK(none.rate == 0.0);
-    CHECK(none.delay_max_s == 0);
 }
 
 TEST_CASE("sync pacing: the admitted rates never sum past the budget across a sequence of runs",
