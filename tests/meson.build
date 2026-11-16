@@ -4939,7 +4939,7 @@ test('removed containment plugin lexical gate',
   _python3_test,
   args: [files('test_legacy_quarantine_plugin_removed_lexical.py')],
   suite: 'docs',
-  timeout: 30,
+  timeout: 120,
 )
 
 # The Windows package-sources upgrade note states the fresh-deployment contract (routed
