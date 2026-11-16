@@ -27,6 +27,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <optional>
@@ -34,6 +35,8 @@
 #include <string>
 #include <vector>
 
+using yuzu::server::LocalMfaProof;
+using yuzu::server::MfaDisableOutcome;
 using yuzu::server::MfaDisableOwner;
 using yuzu::server::MfaDisableRequest;
 using yuzu::server::MfaDisableResult;
@@ -330,6 +333,7 @@ TEST_CASE("MfaDisableOwner: a forced abort before COMMIT leaves everything untou
     (void)f.session_for("iris");
     const auto gen = f.factor_gen("iris");
     const auto codes_before = f.codes_of("iris");
+    const auto wg = f.write_generation();
 
     f.owner.set_pre_commit_hook_for_test([] { throw std::runtime_error("forced abort"); });
     const auto r = f.owner.commit(mkreq("iris", gen));
@@ -341,6 +345,70 @@ TEST_CASE("MfaDisableOwner: a forced abort before COMMIT leaves everything untou
     CHECK(f.codes_of("iris") == codes_before);
     CHECK(f.sessions_of("iris") == 1);
     CHECK(f.audit_total() == 0);
+    // The generation bump ran before the hook, inside the same transaction: it rolled back too.
+    CHECK(f.write_generation() == wg);
+}
+
+// The session write-generation bump is the LAST statement before COMMIT (step d of the banner), so
+// a fault on its table is the "fails after everything else succeeded" case: the factor clear, the
+// recovery-code delete, the session delete and the audit INSERT have all run in the transaction
+// and must all disappear with it.
+TEST_CASE("MfaDisableOwner: a faulted session_meta bump rolls the whole clear back",
+          "[pg][auth][mfa][mfa_disable_owner]") {
+    MfaInfra f;
+    f.seed_enrolled("olga");
+    const auto token = f.session_for("olga");
+    const auto gen = f.factor_gen("olga");
+    const auto codes_before = f.codes_of("olga");
+    const auto wg = f.write_generation();
+
+    yuzu::test::SqlFault fault{f.db.pool(),
+                               "ALTER TABLE session_store.session_meta RENAME TO session_meta_gone",
+                               "ALTER TABLE session_store.session_meta_gone RENAME TO session_meta"};
+    fault.arm();
+    const auto r = f.owner.commit(mkreq("olga", gen));
+    fault.repair();
+
+    CHECK(r.result == MfaDisableResult::kStoreUnavailable);
+    CHECK(f.enrolled("olga"));
+    CHECK(f.factor_gen("olga") == gen);
+    CHECK(f.codes_of("olga") == codes_before);
+    CHECK(f.sessions_of("olga") == 1);
+    CHECK(f.mgr.validate_session(token).has_value());
+    CHECK(f.audit_total() == 0);
+    CHECK(f.write_generation() == wg);
+}
+
+// The mirror: an account with no verified factor and `end_sessions_if_not_enrolled = false` takes
+// no `session_meta` lock and runs no generation bump, so the same fault is invisible to it. This
+// pins that the skipped path really skips the statement (a regression that bumped anyway would
+// fail here with kStoreUnavailable).
+TEST_CASE("MfaDisableOwner: the same session_meta fault does not touch the un-enrolled "
+          "skip-sessions path",
+          "[pg][auth][mfa][mfa_disable_owner]") {
+    MfaInfra f;
+    f.seed("pete");
+    const auto token = f.session_for("pete");
+    const auto gen = f.factor_gen("pete");
+    const auto wg = f.write_generation();
+
+    yuzu::test::SqlFault fault{f.db.pool(),
+                               "ALTER TABLE session_store.session_meta RENAME TO session_meta_gone",
+                               "ALTER TABLE session_store.session_meta_gone RENAME TO session_meta"};
+    fault.arm();
+    auto req = mkreq("pete", gen, "ignored when the account was not enrolled");
+    req.end_sessions_if_not_enrolled = false;
+    req.detail_if_not_enrolled = "no verified factor to clear";
+    const auto r = f.owner.commit(req);
+    fault.repair();
+
+    CHECK(r.result == MfaDisableResult::kOk);
+    CHECK_FALSE(r.was_enrolled);
+    CHECK(r.sessions_ended == 0);
+    CHECK(f.sessions_of("pete") == 1);
+    CHECK(f.mgr.validate_session(token).has_value());
+    CHECK(f.audit_rows("mfa.disabled", "pete") == 1);
+    CHECK(f.write_generation() == wg);
 }
 
 TEST_CASE("MfaDisableOwner: no audit store wired is kAuditUnavailable and writes nothing",
@@ -388,8 +456,11 @@ TEST_CASE("mfa_disable_complete_detail: placeholder substitution and the append 
         CHECK(mfa_disable_complete_detail("{Sessions_Ended}", 1) ==
               "{Sessions_Ended} sessions_ended=1");
     }
-    SECTION("substituted text is never re-scanned (single pass)") {
-        // Adjacent partial tokens must not combine into a new one across a substitution.
+    SECTION("a count inside a partial token leaves the partial token literal") {
+        // The substituted text is digits only, so it can never complete a token and "never
+        // re-scanned" is not observable here (a re-scanning implementation would give the same
+        // answer). What this pins: the surrounding partial tokens stay literal and exactly one
+        // substitution happens.
         CHECK(mfa_disable_complete_detail("{sessions_{sessions_ended}ended}", 5) ==
               "{sessions_5ended}");
     }
@@ -474,4 +545,185 @@ TEST_CASE("MfaDisableOwner: an ENROLLED account ends its sessions even when the 
     CHECK(r.sessions_ended == 1);
     CHECK(f.sessions_of("nina") == 0);
     CHECK(f.audit_detail("mfa.disabled", "nina") == "sessions_ended=1");
+}
+
+// Concurrency (#6079 PR 2c)
+//
+// Every case below parks a second actor on a REAL Postgres lock while the owner holds its whole
+// lock set, through the pre-commit hook (every lock in the banner's order is held there) and
+// `yuzu::test::wait_for_lock_waiter`, which observes a backend blocked on a row or advisory lock.
+// The hook never waits on the held rows themselves, only on the observation that the other
+// actor is parked, so it cannot self-deadlock; the wait is bounded (`kLockWaitDeadline`) and a
+// failing observation is reported by a CHECK after the commit, never by a throw inside the hook.
+// Worker threads are joined by `yuzu::test::Workers` on every exit path. No sleeps.
+
+namespace {
+
+/// Clears the owner's test hook on scope exit so a failing REQUIRE cannot leave a lambda that
+/// captures test locals installed on a fixture that outlives it.
+struct OwnerHookReset {
+    MfaDisableOwner& owner;
+    ~OwnerHookReset() { owner.set_pre_commit_hook_for_test(nullptr); }
+};
+
+std::int64_t db_now_ms(MfaInfra& f) {
+    return std::stoll(f.scalar("SELECT (extract(epoch from now())*1000)::bigint"));
+}
+
+} // namespace
+
+TEST_CASE("MfaDisableOwner: a proof stamp racing the clear never leaves a usable proof",
+          "[pg][auth][mfa][mfa_disable_owner][concurrency]") {
+    MfaInfra f;
+    f.seed_enrolled("pia");
+    const auto t_clear = f.session_for("pia");
+    const auto t_stamp = f.session_for("pia");
+    const auto gen = f.factor_gen("pia");
+    // An instant safely in the past on the database clock, so only the race can refuse the stamp.
+    const std::int64_t verified_ms = db_now_ms(f) - 1000;
+
+    yuzu::test::Workers workers{[] {}};
+    OwnerHookReset reset{f.owner};
+    std::atomic<bool> stamper_parked{false};
+    std::atomic<bool> stamped{true};
+    // Inside the hook the owner holds the account row, the (deleted) session rows and the
+    // session_meta row, uncommitted. A stamp of the OTHER session of the account started now
+    // queues on that session's row (the clear deleted it) until the owner commits.
+    f.owner.set_pre_commit_hook_for_test([&] {
+        workers.add([&] {
+            stamped = f.mgr.mark_session_mfa_verified(t_stamp, LocalMfaProof{gen, verified_ms});
+        });
+        stamper_parked = yuzu::test::wait_for_lock_waiter(f.db.pool());
+    });
+
+    const auto r = f.owner.commit(mkreq("pia", gen));
+    workers.join_all();
+
+    REQUIRE(r.result == MfaDisableResult::kOk);
+    CHECK(stamper_parked.load()); // the race was real: the stamp was blocked when the clear committed
+    CHECK(r.sessions_ended == 2);
+    // The stamp lost: the session it targeted was deleted by the committed clear.
+    CHECK_FALSE(stamped.load());
+    CHECK(f.sessions_of("pia") == 0);
+    CHECK_FALSE(f.mgr.validate_session(t_stamp).has_value());
+    CHECK_FALSE(f.mgr.validate_session(t_clear).has_value());
+    CHECK_FALSE(f.enrolled("pia"));
+    CHECK(f.audit_rows("mfa.disabled", "pia") == 1);
+}
+
+TEST_CASE("MfaDisableOwner: two commits at the same admitted generation clear exactly once",
+          "[pg][auth][mfa][mfa_disable_owner][concurrency]") {
+    MfaInfra f;
+    f.seed_enrolled("quin");
+    (void)f.session_for("quin");
+    (void)f.session_for("quin");
+    (void)f.session_for("quin");
+    const auto gen = f.factor_gen("quin");
+
+    yuzu::test::Workers workers{[] {}};
+    OwnerHookReset reset{f.owner};
+    std::atomic<bool> loser_parked{false};
+    // Only the winner reaches the hook (the loser is refused before it). Holding the winner there
+    // until the loser is parked on the account row makes the overlap certain, whichever thread wins.
+    f.owner.set_pre_commit_hook_for_test(
+        [&] { loser_parked = yuzu::test::wait_for_lock_waiter(f.db.pool()); });
+
+    MfaDisableOutcome outcomes[2];
+    workers.add([&] { outcomes[0] = f.owner.commit(mkreq("quin", gen)); });
+    workers.add([&] { outcomes[1] = f.owner.commit(mkreq("quin", gen)); });
+    workers.join_all();
+
+    CHECK(loser_parked.load());
+    int ok = 0, changed = 0, ended = 0;
+    for (const auto& o : outcomes) {
+        if (o.result == MfaDisableResult::kOk) {
+            ++ok;
+            ended += o.sessions_ended;
+        } else if (o.result == MfaDisableResult::kFactorChanged) {
+            ++changed;
+            CHECK(o.sessions_ended == 0);
+        }
+    }
+    CHECK(ok == 1);
+    CHECK(changed == 1);
+    CHECK(ended == 3); // the sessions were counted once, by the winner
+    CHECK_FALSE(f.enrolled("quin"));
+    CHECK(f.sessions_of("quin") == 0);
+    CHECK(f.audit_total() == 1);
+    CHECK(f.audit_rows("mfa.disabled", "quin") == 1);
+    CHECK(f.audit_detail("mfa.disabled", "quin") == "sessions_ended=3");
+}
+
+TEST_CASE("MfaDisableOwner: a stalled account row lock answers kStoreUnavailable within the write "
+          "timeout and changes nothing",
+          "[pg][auth][mfa][mfa_disable_owner][concurrency]") {
+    MfaInfra f;
+    f.seed_enrolled("rosa");
+    const auto token = f.session_for("rosa");
+    const auto gen = f.factor_gen("rosa");
+    const auto codes_before = f.codes_of("rosa");
+    const auto wg = f.write_generation();
+
+    MfaDisableOutcome r;
+    std::chrono::milliseconds elapsed{0};
+    {
+        // A second connection holds the account's row lock for the whole commit attempt.
+        yuzu::test::HeldLocks held{f.db.pool()};
+        held.run("SELECT 1 FROM auth.users WHERE username = 'rosa' FOR UPDATE");
+        const auto t0 = std::chrono::steady_clock::now();
+        r = f.owner.commit(mkreq("rosa", gen));
+        elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0);
+        held.rollback();
+    }
+
+    CHECK(r.result == MfaDisableResult::kStoreUnavailable);
+    // It waited out its own bound (the lock_timeout) and then gave up, rather than failing at once
+    // for another reason or hanging: at least half the bound, at most the bound plus a generous
+    // margin for a slow runner.
+    CHECK(elapsed >= MfaDisableOwner::kWriteTimeout / 2);
+    CHECK(elapsed < MfaDisableOwner::kWriteTimeout + std::chrono::milliseconds(5000));
+    CHECK(f.enrolled("rosa"));
+    CHECK(f.factor_gen("rosa") == gen);
+    CHECK(f.codes_of("rosa") == codes_before);
+    CHECK(f.sessions_of("rosa") == 1);
+    CHECK(f.mgr.validate_session(token).has_value());
+    CHECK(f.audit_total() == 0);
+    CHECK(f.write_generation() == wg);
+}
+
+TEST_CASE("MfaDisableOwner: a sign-in minting a session while the clear commits neither "
+          "deadlocks nor half-applies",
+          "[pg][auth][mfa][mfa_disable_owner][concurrency]") {
+    MfaInfra f;
+    f.seed_enrolled("tess");
+    const auto old_token = f.session_for("tess");
+    const auto gen = f.factor_gen("tess");
+
+    yuzu::test::Workers workers{[] {}};
+    OwnerHookReset reset{f.owner};
+    std::atomic<bool> minter_parked{false};
+    std::string minted;
+    // The mint queues on the session_meta row the owner holds (every session create bumps the
+    // write generation), so it can only finish after the commit.
+    f.owner.set_pre_commit_hook_for_test([&] {
+        workers.add([&] { minted = f.mgr.create_local_session_for_test("tess", Role::user, false); });
+        minter_parked = yuzu::test::wait_for_lock_waiter(f.db.pool());
+    });
+
+    const auto r = f.owner.commit(mkreq("tess", gen));
+    workers.join_all();
+
+    REQUIRE(r.result == MfaDisableResult::kOk);
+    CHECK(minter_parked.load());
+    // The clear counted only the session that existed when it ran.
+    CHECK(r.sessions_ended == 1);
+    CHECK_FALSE(f.enrolled("tess"));
+    CHECK_FALSE(f.mgr.validate_session(old_token).has_value());
+    // The sign-in completed after the commit (no deadlock, no lock_timeout failure), and its
+    // session is the only one the account has: whole before, whole after.
+    REQUIRE_FALSE(minted.empty());
+    CHECK(f.mgr.validate_session(minted).has_value());
+    CHECK(f.sessions_of("tess") == 1);
+    CHECK(f.audit_rows("mfa.disabled", "tess") == 1);
 }

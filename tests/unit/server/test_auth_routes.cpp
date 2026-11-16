@@ -2827,6 +2827,33 @@ TEST_CASE("AuthRoutes::audit_event_for_session_fn builds the session-bound row w
         s.principal_kind = "engine";
         CHECK(build(req, s, "user", "x.y", "ok", "User", "u").principal_class == "engine");
     }
+    SECTION("a session the engine token authenticated carries the engine class even when its "
+            "stored kind says human (the classification the server applies, not the field)") {
+        auth::Session s;
+        s.username = "engine:ci";
+        s.role = auth::Role::user;
+        s.auth_source = "engine_token";
+        s.principal_kind = "human";
+        CHECK(build(req, s, "user", "x.y", "ok", "User", "u").principal_class == "engine");
+    }
+    SECTION("a request carrying a session cookie records the digest of that cookie, not the "
+            "cookie, as the session id") {
+        auth::Session s;
+        s.username = "alice";
+        s.role = auth::Role::user;
+        const auto with_cookie = request_with_header("Cookie", "yuzu_session=audit-template-cookie");
+        const auto e = build(with_cookie, s, "admin", "mfa.disabled", "ok", "User", "alice");
+        // The same correlator `make_audit_event` stamps (the value the session store keys on).
+        CHECK_FALSE(e.session_id.empty());
+        CHECK(e.session_id == auth::AuthManager::sha256_hex("audit-template-cookie"));
+        CHECK(e.session_id != "audit-template-cookie");
+    }
+    SECTION("a request with no session cookie records no session id (never the digest of \"\")") {
+        auth::Session s;
+        s.username = "alice";
+        s.role = auth::Role::user;
+        CHECK(build(req, s, "admin", "mfa.disabled", "ok", "User", "alice").session_id.empty());
+    }
     SECTION("nothing is written: building a template does not touch the store") {
         auth::Session s;
         s.username = "alice";

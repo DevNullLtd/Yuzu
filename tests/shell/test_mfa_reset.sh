@@ -106,6 +106,22 @@ check "reset existing user -> ok/exit 0" 0 '"status":"ok"' admin
 # Missing user: error, exit 1.
 check "reset missing user -> error/exit 1" 1 'not found' ghost
 
+# The break-glass operator who is locked out is pointed at the documented direct-SQL fallback
+# whenever the reset REFUSES for a store-side reason (intent row, session store, owner failure,
+# outcome row): that is the line asserted for the refusals below. It is the SAME text on each.
+POINTER='see "Fallback: direct SQL" in the Auth Store Recovery Runbook (docs/ops-runbooks/auth-db-recovery.md)'
+# A user that does not exist is not a store failure: the fallback pointer must NOT appear (the
+# operator mistyped a name; SQL is not the remedy).
+set +e
+err="$("$BIN" --config "$TMP/yuzu-server.cfg" --data-dir "$TMP" --ca-dir "$TMP" --postgres-dsn "$CHILD_DSN" --mfa-reset ghost 2>&1)"
+got=$?
+set -e
+if [ "$got" = "1" ] && ! printf '%s' "$err" | grep -qF 'Fallback: direct SQL'; then
+  echo "ok   - a missing user is refused without the direct-SQL fallback pointer"; pass=$((pass+1))
+else
+  echo "FAIL - missing user (exit=$got want=1; pointer must be absent; out=$err)"; fail=$((fail+1))
+fi
+
 # The reset also ends the account's durable sessions (#6079). The first run above
 # created the session_store schema; seed one row each for the reset user and an
 # unrelated user, reset again, and require only the reset user's row to be gone
@@ -184,9 +200,10 @@ still_enrolled="$(sess_sql "SELECT count(*) FROM auth.users WHERE username='admi
 last_two="$(sess_sql "SELECT result FROM (SELECT id, result FROM audit_store.audit_events WHERE action='mfa.reset.breakglass' ORDER BY id DESC LIMIT 2) t ORDER BY id;" 2>&1 | tr '\n' ',' || true)"
 detail="$(sess_sql "SELECT detail FROM audit_store.audit_events WHERE action='mfa.reset.breakglass' ORDER BY id DESC LIMIT 1;" 2>&1 || true)"
 if [ "$got" = "1" ] && printf '%s' "$err" | grep -qF 'nothing was changed' \
+   && printf '%s' "$err" | grep -qF "$POINTER" \
    && [ "$still_enrolled" = "1" ] && [ "$last_two" = "attempted,error," ] \
    && printf '%s' "$detail" | grep -qF 'rolled back'; then
-  echo "ok   - a failing clear exits 1 (rolled back) and audits result=error after the intent row"; pass=$((pass+1))
+  echo "ok   - a failing clear exits 1 (rolled back), points at the direct-SQL fallback and audits result=error after the intent row"; pass=$((pass+1))
 else
   echo "FAIL - failing clear (exit=$got want=1; enrolled=$still_enrolled want 1; rows '$last_two' want 'attempted,error,'; detail=$detail; err=$err)"; fail=$((fail+1))
 fi
@@ -210,6 +227,7 @@ sess_left="$(sess_sql "SELECT count(*) FROM session_store.sessions WHERE usernam
 rows_after="$(sess_sql "SELECT count(*) FROM audit_store.audit_events WHERE action='mfa.reset.breakglass';")"
 last_result="$(sess_sql "SELECT result FROM audit_store.audit_events WHERE action='mfa.reset.breakglass' ORDER BY id DESC LIMIT 1;" 2>&1 || true)"
 if [ "$got" = "1" ] && printf '%s' "$err" | grep -qF 'error: audit store did not accept the outcome row; nothing was changed' \
+   && printf '%s' "$err" | grep -qF "$POINTER" \
    && [ "$still_enrolled" = "1" ] && [ "$sess_left" = "1" ] \
    && [ "$rows_after" = "$((rows_before + 1))" ] && [ "$last_result" = "attempted" ]; then
   echo "ok   - a failing outcome row rolls the whole clear back (exit 1, factor and session intact, only the intent row exists)"; pass=$((pass+1))
@@ -232,8 +250,9 @@ set -e
 still_enrolled="$(sess_sql "SELECT count(*) FROM auth.users WHERE username='admin' AND mfa_enrolled_at IS NOT NULL;")"
 last_two="$(sess_sql "SELECT result FROM (SELECT id, result FROM audit_store.audit_events WHERE action='mfa.reset.breakglass' ORDER BY id DESC LIMIT 2) t ORDER BY id;" 2>&1 | tr '\n' ',' || true)"
 if [ "$got" = "1" ] && printf '%s' "$err" | grep -qF 'nothing was changed' \
+   && printf '%s' "$err" | grep -qF "$POINTER" \
    && [ "$still_enrolled" = "1" ] && [ "$last_two" = "attempted,error," ]; then
-  echo "ok   - failed session delete rolls the clear back: exit 1, factor intact, result=error after the intent row"; pass=$((pass+1))
+  echo "ok   - failed session delete rolls the clear back: exit 1, fallback pointer shown, factor intact, result=error after the intent row"; pass=$((pass+1))
 else
   echo "FAIL - failed session delete (exit=$got want=1; enrolled=$still_enrolled want 1; rows '$last_two' want 'attempted,error,'; err=$err)"; fail=$((fail+1))
 fi
