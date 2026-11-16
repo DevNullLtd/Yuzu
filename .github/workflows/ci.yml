@@ -2037,7 +2037,7 @@ jobs:
           python3 scripts/ci/assert-gateway-tests.py "$CONTRACT_BUILD"
           # Compile the pilots' targets here, at the leg's full width and BEFORE
           # taking a heavy-test slot. When the collector did this compile inside
-          # the slot at -j2, the step took 6 to 50 min (one sampled run: a 996 s
+          # the slot at -j2, the step took 6 to 50 min, slot wait included (one sampled run: a 996 s
           # build and 26 s of tests), holding one of the three slots the Linux
           # test step also needs. The collector still runs its own
           # `meson compile`, which then has nothing to do: its build.log records
@@ -2051,7 +2051,7 @@ jobs:
           # The target list is the collector's own: the union of build_targets
           # in the registry. A registry it cannot read is a warning here; the
           # collector then fails on the same file.
-          contract_targets_list=$(python3 -c 'import json; d = json.load(open("tests/contracts/pilots.json")); ts = [t for r in d["contracts"] for t in r["build_targets"]]; assert all(isinstance(t, str) and t for t in ts); print(" ".join(sorted(set(ts))))') \
+          contract_targets_list=$(python3 -c 'import json; d = json.load(open("tests/contracts/pilots.json")); ts = [t for r in d["contracts"] for t in r["build_targets"]]; assert all(isinstance(t, str) and t and t[0] != "-" and not any(c.isspace() for c in t) for t in ts); print(" ".join(sorted(set(ts))))') \
             || { echo "::warning::could not read build targets from tests/contracts/pilots.json; skipping the precompile"; contract_targets_list=""; }
           read -r -a contract_targets <<< "$contract_targets_list"
           # Per-step ccache stats log: the shared cache's global counters mix

@@ -61,6 +61,10 @@ class ContractStepPrecompile(unittest.TestCase):
         slot_at = self.index_of('with-test-slot.sh')
         self.assertLess(compile_at, slot_at,
                         'the pilots must be compiled before a heavy-test slot is taken')
+        # The only guard on the compile is "there are targets".
+        self.assertRegex('\n'.join(self.lines),
+                         r'if \(\( \$\{#contract_targets\[@\]\} \)\); then\n'
+                         r'(?:[^\n]*\n){0,3}?[^\n]*meson compile -C "\$CONTRACT_BUILD"')
 
     def test_precompile_is_bounded_and_not_fatal(self):
         code = '\n'.join(self.lines)

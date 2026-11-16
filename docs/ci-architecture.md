@@ -3003,15 +3003,15 @@ for this leg only: ccache otherwise hashes the working directory for a `-g`
 compile, so the contract build directory never reused the standard build's
 objects (the two directories' compile commands are identical). The cost is
 debug info only: an object's recorded compile directory may name the other
-build directory, or another runner's workspace, and nothing in this leg reads
-it. The step prints the precompile's wall time with its own ccache hit and
+build directory, or, for a source compiled with no workspace-specific flag,
+another runner's workspace, and nothing in this leg reads it. The step prints the precompile's wall time with its own ccache hit and
 miss counts (from a per-step stats log, since the cache's global counters mix
 all four runners), and the collector's time including its slot wait. The
-job's overall ccache hit rate now also counts the precompile, so it is not
-comparable with earlier runs. The first gcc-15 debug run on each runner after
-this change rebuilds that leg cold once, because the cache keys change (each
-runner's include paths name its own workspace, so the runners do not share
-these entries).
+contract build's compiles, previously ccache misses, now mostly hit, so the
+job's overall ccache hit rate is not comparable with earlier runs. The first gcc-15 debug run on each runner after
+this change rebuilds that leg cold once, because the cache keys change (most
+sources are compiled with include paths that name the runner's own workspace,
+so the runners share few of these entries).
 
 ### Persistent runner-local test history
 
