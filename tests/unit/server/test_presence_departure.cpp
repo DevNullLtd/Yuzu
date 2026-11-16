@@ -13,6 +13,7 @@
 #include <utility>
 #include <vector>
 
+using yuzu::server::mirror_arrival_to_presence;
 using yuzu::server::mirror_departure_to_presence;
 
 namespace {
@@ -22,6 +23,11 @@ struct FakeStore {
     bool result = true;
     bool remove_if_session(std::string_view agent, std::string_view session) {
         calls.emplace_back(std::string(agent), std::string(session));
+        return result;
+    }
+    std::vector<std::pair<std::string, std::string>> arrivals;
+    bool clear_plugins_of_other_sessions(std::string_view agent, std::string_view session) {
+        arrivals.emplace_back(std::string(agent), std::string(session));
         return result;
     }
 };
@@ -47,4 +53,19 @@ TEST_CASE("mirror_departure_to_presence gates on removed_current_session", "[pre
         CHECK_FALSE(mirror_departure_to_presence(true, &store, "agent-1", "sess-1"));
         CHECK(store.calls.size() == 2);
     }
+}
+
+TEST_CASE("mirror_arrival_to_presence forwards the new session and refuses empty input",
+          "[presence]") {
+    FakeStore store;
+    CHECK_FALSE(mirror_arrival_to_presence<FakeStore>(nullptr, "a", "s")); // no store: no-op
+    CHECK_FALSE(mirror_arrival_to_presence(&store, "", "s"));
+    CHECK_FALSE(mirror_arrival_to_presence(&store, "a", ""));
+    CHECK(store.arrivals.empty());
+    CHECK(mirror_arrival_to_presence(&store, "agent-1", "sess-2"));
+    REQUIRE(store.arrivals.size() == 1);
+    CHECK(store.arrivals[0].first == "agent-1");
+    CHECK(store.arrivals[0].second == "sess-2");
+    store.result = false; // a store failure is reported, never thrown
+    CHECK_FALSE(mirror_arrival_to_presence(&store, "agent-1", "sess-2"));
 }
