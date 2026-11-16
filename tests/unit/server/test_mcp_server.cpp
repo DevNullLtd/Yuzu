@@ -33531,6 +33531,10 @@ TEST_CASE("MCP 2405: every served schema compiles and the gated set is fully cov
         {"execute_workflow",
          nlohmann::json::parse(
              R"({"workflow_id":"wf-1","agent_ids":["agent-1"],"idempotency_key":"key-0123456789"})")},
+        // SAM-35: ManagementGroup:Write is supervised-tier gated, like every management-group write.
+        {"set_software_collection_settings",
+         nlohmann::json::parse(
+             R"({"group_id":"aaaa11112222","interval_s":86400,"plugins":{"installed_apps":true}})")},
     };
 
     // Tether: the gated set derived from security rows + requires_approval()
@@ -54996,6 +55000,31 @@ TEST_CASE("MCP SAM-35 tools: an unwired store is an internal error, never an emp
         REQUIRE(body.contains("error"));
         CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
     }
+
+    // The loop above stops get/set at the unset probe and the effective read at the unset scope
+    // gate. Wire both (admitting) with the stores still null, so the answer is the store arm: the
+    // message names which arm answered, as the code alone is the same on both.
+    McpTestServer gated;
+    gated.collection_settings_probe_for_test = [](const httplib::Request&, httplib::Response&,
+                                                  const std::string&, const std::string&) {
+        return true;
+    };
+    gated.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                       const std::string&, const std::string&,
+                                       const std::string&) { return true; };
+    gated.start();
+    for (const auto& [tool, args] :
+         std::vector<std::pair<const char*, const char*>>{
+             {"get_software_collection_settings", R"({"group_id":"aaaa11112222"})"},
+             {"set_software_collection_settings",
+              R"({"group_id":"aaaa11112222","interval_s":86400,"plugins":{"installed_apps":true}})"},
+             {"get_software_host_collection_settings", R"({"agent_id":"a1"})"}}) {
+        auto body = mcp_tool_call(gated, tool, args);
+        INFO(tool << " -> " << body.dump());
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+        CHECK(body["error"]["message"] == "Collection settings store unavailable");
+    }
 }
 
 TEST_CASE("MCP SAM-35 reads: the payload equals the REST route's data object for the same input",
@@ -55103,13 +55132,19 @@ TEST_CASE("MCP SAM-35 reads: strict input is kInvalidParams and reads nothing",
         {"get_software_host", "{}"},
         {"get_software_host", R"({"agent_id":""})"},
         {"get_software_host", R"({"agent_id":"a1","limit":0})"},
+        {"get_software_host", R"({"agent_id":"a1","bogus":1})"},
+        {"get_software_host", R"({"agent_id":5})"},
         {"list_software_changes", R"({"kind":"bogus"})"},
         {"list_software_changes", R"({"since":-1})"},
         {"list_software_changes", R"({"limit":1001})"},
+        {"list_software_changes", R"({"bogus":1})"},
+        {"list_software_changes", R"({"since":"0"})"},
+        {"list_software_changes", R"({"limit":"5"})"},
         {"get_software_summary", R"({"x":1})"},
         {"get_software_plugin_health", R"({"x":1})"},
         {"list_software_collection_settings", R"({"x":1})"},
         {"get_software_host_collection_settings", R"({"agent_id":"a1","x":1})"},
+        {"get_software_host_collection_settings", R"({"agent_id":5})"},
     };
     for (const auto& [tool, args] : bad) {
         auto body = mcp_tool_call(rig.ts, tool, args);
@@ -55210,6 +55245,14 @@ struct Sam35Settings {
     yuzu::server::PluginConfigStore plugins{plugin_pool, codec};
     std::vector<int> probe_script; // consumed per probe call; empty = admit
     int probe_calls{0};
+    // The device-scoped Inventory:Read gate both surfaces share: it admits every device except
+    // the ids in scoped_refused, which it answers with its own 403, and records each call.
+    std::unordered_set<std::string> scoped_refused;
+    std::vector<std::string> scoped_seen; // "<securable>|<operation>|<agent_id>" per gate call
+    // The two seams a settings save must never reach, counted: the MCP send function and the
+    // hardware/software sync runner.
+    int dispatch_calls{0};
+    SyncToolRig sync;
     std::vector<std::string> rest_audit; // "<action>|<result>" rows the REST routes stored
     yuzu::server::SoftwareCollectionSettingsRoutes routes;
     yuzu::server::test::TestRouteSink sink;
@@ -55257,6 +55300,16 @@ struct Sam35Settings {
         };
         const auto allow = [](const httplib::Request&, httplib::Response&, const std::string&,
                               const std::string&) { return true; };
+        const auto scoped = [this](const httplib::Request&, httplib::Response& res,
+                                   const std::string& securable, const std::string& op,
+                                   const std::string& agent_id) {
+            scoped_seen.push_back(securable + "|" + op + "|" + agent_id);
+            if (!scoped_refused.contains(agent_id))
+                return true;
+            res.status = 403;
+            res.set_content(R"({"error":{"code":403}})", "application/json");
+            return false;
+        };
         routes.register_routes(
             sink, yuzu::server::SoftwareCollectionSettingsRoutes::Deps{
                       .auth_fn = [](const httplib::Request&, httplib::Response&)
@@ -55267,9 +55320,7 @@ struct Sam35Settings {
                       },
                       .perm_fn = allow,
                       .probe_perm_fn = probe,
-                      .scoped_perm_fn = [](const httplib::Request&, httplib::Response&,
-                                           const std::string&, const std::string&,
-                                           const std::string&) { return true; },
+                      .scoped_perm_fn = scoped,
                       .audit_fn = [this](const httplib::Request&, const std::string& action,
                                          const std::string& result, const std::string&,
                                          const std::string&, const std::string&) {
@@ -55282,9 +55333,20 @@ struct Sam35Settings {
                   });
         ts.collection_settings_stores_for_test = {&store, &mgmt, &plugins};
         ts.collection_settings_probe_for_test = probe;
+        ts.scoped_perm_fn_for_test = scoped; // the effective read refuses without a scope gate
+        ts.software_sync_runner_for_test = sync.runner();
     }
 
-    void start(const std::string& tier = "") { ts.start(tier); }
+    void start(const std::string& tier = "") {
+        ts.start_with_dispatch(
+            [this](const std::string&, const std::string&, const std::vector<std::string>&,
+                   const std::string&, const std::unordered_map<std::string, std::string>&,
+                   const std::string&, const yuzu::server::DispatchCaller&) {
+                ++dispatch_calls;
+                return yuzu::server::ConfinedDispatchOutcome{};
+            },
+            tier);
+    }
     std::string path(const std::string& group) const {
         return "/api/v1/inventory/software/collection-settings/" + group;
     }
@@ -55419,8 +55481,10 @@ TEST_CASE("MCP SAM-35 settings: the payloads equal the REST routes' data and err
     }
     CHECK_FALSE(rig.stored(rig.group_b));
 
-    // Saving never dispatches: no send or sync-runner seam is reachable from the tool.
-    CHECK(rig.ts.last_dispatch_plugin.empty());
+    // Saving never dispatches: the send function and the sync runner are both wired and counting,
+    // and the successful set above reached neither.
+    CHECK(rig.dispatch_calls == 0);
+    CHECK(rig.sync.dispatches == 0);
 }
 
 TEST_CASE("MCP set_software_collection_settings: the requested row precedes the store call and a "
@@ -55517,6 +55581,56 @@ TEST_CASE("MCP software collection settings: the authority mapping matches REST 
                               R"("arguments":{}}})");
     REQUIRE(listed != nullptr);
     CHECK(listed->status == 403);
+}
+
+TEST_CASE("MCP get_software_host_collection_settings: the device-scoped Inventory:Read gate "
+          "refuses an out-of-scope device with its own 403, as REST does, and admits an in-scope one",
+          "[mcp][pg][inventory][software][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(sdb, sam35_settings_tpl);
+    YUZU_REQUIRE_PG_DB_TPL(mdb, mcp_mgmt_tpl);
+    YUZU_REQUIRE_PG_DB_TPL(pdb, sam35_plugincfg_tpl);
+    Sam35Settings rig{sdb.dsn(), mdb.dsn(), pdb.dsn()};
+    rig.start();
+    rig.scoped_refused = {"agent-out"};
+    const auto mcp = [&](const std::string& agent_id) {
+        return rig.ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":9,"params":)"
+                           R"({"name":"get_software_host_collection_settings",)"
+                           R"("arguments":{"agent_id":")" +
+                           agent_id + R"("}}})");
+    };
+    const auto rest = [&](const std::string& agent_id) {
+        return rig.sink.dispatch("GET",
+                                 "/api/v1/inventory/software/hosts/" + agent_id +
+                                     "/collection-settings",
+                                 {}, "application/json");
+    };
+
+    // Out of scope: the gate's 403 on both surfaces, no success row, nothing read for the caller.
+    const auto denied_mcp = mcp("agent-out");
+    const auto denied_rest = rest("agent-out");
+    REQUIRE(denied_mcp != nullptr);
+    REQUIRE(denied_rest != nullptr);
+    CHECK(denied_mcp->status == 403);
+    CHECK(denied_rest->status == 403);
+    CHECK(denied_mcp->body.find("\"result\"") == std::string::npos);
+    CHECK(mcp_audits(rig.ts, "mcp.get_software_host_collection_settings|success") == 0);
+    CHECK(mcp_audits(rig.ts, "mcp.get_software_host_collection_settings|failure") == 0);
+
+    // In scope: the same gate admits, and both surfaces answer.
+    const auto allowed_mcp = mcp("agent-in");
+    const auto allowed_rest = rest("agent-in");
+    REQUIRE(allowed_mcp != nullptr);
+    REQUIRE(allowed_rest != nullptr);
+    CHECK(allowed_mcp->status == 200);
+    CHECK(nlohmann::json::parse(allowed_mcp->body).contains("result"));
+    CHECK(allowed_rest->status == 200);
+    CHECK(mcp_audits(rig.ts, "mcp.get_software_host_collection_settings|success") == 1);
+
+    // The gate saw Inventory / Read / the requested device, once per surface per call.
+    CHECK(rig.scoped_seen == std::vector<std::string>{"Inventory|Read|agent-out",
+                                                       "Inventory|Read|agent-out",
+                                                       "Inventory|Read|agent-in",
+                                                       "Inventory|Read|agent-in"});
 }
 
 TEST_CASE("MCP set_software_collection_settings: the supervised tier mints an approval ticket and "
