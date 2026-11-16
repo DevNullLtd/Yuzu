@@ -1738,6 +1738,55 @@ TEST_CASE("wiring: an over-cap body is refused 413 by the body cap, before the c
     CHECK(s.audit_rows().size() == 1);
 }
 
+// #2146 meets #6079: the stage order is size cap, then JSON value budget, then the chokepoint. The
+// budget case above runs on a route with NO step-up row, and the policy tests call the stage with
+// no matched route, so neither shows the budget refusing BEFORE a real step-up evaluation. A
+// kRequired route with a STALE proof is 401 with an audit row if the chokepoint ran, so only the
+// order "budget, then chokepoint" yields the 413 below, with no handler call, no audit row and no
+// gate outcome.
+TEST_CASE("wiring: a body over the JSON value budget is refused 413 before the chokepoint on a "
+          "kRequired route",
+          "[stepup][wiring][json_budget]") {
+    const auto* row = step_up_policy_for("POST", kRotatePattern);
+    REQUIRE(row != nullptr);
+    REQUIRE(row->cls == StepUpClass::kRequired);
+
+    WiringServer s;
+    s.set_session(make_session("alice", "local", Role::admin, 1h));
+
+    const std::string path = "/api/v1/tokens/abc123/rotate";
+    const auto match = resolve_body_cap("POST", path);
+    REQUIRE(match.max_json_values != kJsonValuesOff);
+    const auto flat = [](std::size_t values) {
+        std::string b = "[1";
+        for (std::size_t i = 1; i < values; ++i)
+            b += ",1";
+        return b + "]";
+    };
+    // Inside the size cap (so only the budget can refuse it) and small enough to send over loopback.
+    REQUIRE(2 * (match.max_json_values + 1) + 2 < match.max_body_bytes);
+    REQUIRE(match.max_json_values <= 1'000'000);
+
+    auto over = s.post(path, flat(match.max_json_values + 1));
+    REQUIRE(over);
+    CHECK(over->status == 413);
+    CHECK(s.rotate_handler_calls.load() == 0);
+    CHECK(s.audit_rows().empty());
+    CHECK(s.gate_count("refused", "local", "rest") == 0);
+    CHECK(s.metrics
+              .counter("yuzu_body_cap_rejected_total",
+                       {{"path_class", std::string(match.path_class)},
+                        {"reason", "over_json_values_post_read"}})
+              .value() == 1);
+
+    // The control: the same session and route with a body inside the budget IS the chokepoint's
+    // 401, so the 413 above is the budget's doing and not an artefact of the route or the session.
+    auto within = s.post(path, flat(1'000));
+    REQUIRE(within);
+    CHECK(within->status == 401);
+    CHECK(s.audit_rows().size() == 1);
+}
+
 #endif // !YUZU_TSAN_BUILD
 
 // ── server.cpp's own call sites ──────────────────────────────────────────────────────────────
