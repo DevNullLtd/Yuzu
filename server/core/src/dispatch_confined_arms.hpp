@@ -479,6 +479,12 @@ inline constexpr std::array<std::string_view, 4> kQuarantineGateOutcomes{
 ///     (gated by the type-level Execution:Execute check, a per-operator cooldown and a single
 ///     in-flight run, with WHO IS REACHED decided here by `dispatch_system_reserved_ids`, the
 ///     caller's visible-set intersection taken at send time); the 500-target cap is the Runner's.
+///   - `inventory_settings_push` delivers the effective software collection
+///     settings (`__sync__.settings`, SAM-39) to an agent whose heartbeat reports a
+///     different version. System-initiated and heartbeat-driven only: no operator
+///     reaches it. It carries a bounded document (interval, window, zone and six
+///     collector switches) that changes how the agent schedules its own inventory
+///     collection, nothing else. Not quarantine-gated, same as the other pushes.
 ///   - `guardian_push_rules` delivers Guardian baseline rules the agent may
 ///     ENFORCE, and is therefore the one exempt channel that mutates the
 ///     endpoint. It is NOT arbitrary command execution: the assertion
@@ -496,6 +502,7 @@ enum class SystemReservedPush {
     guardian_push_rules,
     asset_tags_sync,
     inventory_sync_now,
+    inventory_settings_push,
 };
 
 /// Label for one enumerator. A switch with no `default:` so a new enumerator
@@ -511,6 +518,8 @@ system_reserved_push_label(SystemReservedPush push) {
         return "asset_tags.sync";
     case SystemReservedPush::inventory_sync_now:
         return "__sync__.now";
+    case SystemReservedPush::inventory_settings_push:
+        return "__sync__.settings";
     }
     return "unknown"; // unreachable while the switch stays exhaustive
 }
@@ -518,9 +527,10 @@ system_reserved_push_label(SystemReservedPush push) {
 /// Every enumerator, so the boot pre-seed cannot fall out of step with the
 /// call sites — same reason `kQuarantineGateOutcomes` exists. An internal push
 /// that has never fired must read as zero, not as an absent series.
-inline constexpr std::array<SystemReservedPush, 4> kSystemReservedPushes{
+inline constexpr std::array<SystemReservedPush, 5> kSystemReservedPushes{
     SystemReservedPush::echo_fleet_snapshot, SystemReservedPush::guardian_push_rules,
-    SystemReservedPush::asset_tags_sync, SystemReservedPush::inventory_sync_now};
+    SystemReservedPush::asset_tags_sync, SystemReservedPush::inventory_sync_now,
+    SystemReservedPush::inventory_settings_push};
 
 /// The two outcomes a system-reserved push can have at the registry seam.
 /// `sent` means `AgentRegistry::send_to` accepted the frame (for a

@@ -249,6 +249,7 @@
 #include "device_estate_routes.hpp"
 #include "hardware_routes.hpp"
 #include "hardware_section_integrity.hpp"
+#include "collection_settings_push.hpp"
 #include "software_collection_settings_routes.hpp"
 #include "software_collection_settings_store.hpp"
 #include "software_lifecycle_store.hpp"
@@ -8774,6 +8775,120 @@ public:
             }
         }
 
+        // SAM-39: heartbeat-driven delivery of the effective software collection settings. Built
+        // here because it borrows three stores constructed above; installed on the heartbeat path
+        // before any listener opens, cleared (and reset) in stop() ahead of those stores. There is
+        // no push-on-save and no job: an agent that reports a different version in its heartbeat is
+        // sent the document that applies to it. All state is in memory and rebuilt from heartbeats.
+        if (heartbeat_ingestion_ && software_collection_settings_store_ &&
+            software_collection_settings_store_->is_open() && mgmt_group_store_ &&
+            mgmt_group_store_->is_open() && plugin_config_store_ && !startup_failed_) {
+            namespace cset = yuzu::server::collection_settings;
+            metrics_.describe("yuzu_server_inventory_settings_push_total",
+                              "Heartbeat-driven collection settings pushes by result: sent (the "
+                              "frame was accepted; for a gateway-attached agent that is a queue, "
+                              "not a delivery), undelivered (it was not), suppressed (the same "
+                              "version was already sent to the agent inside the re-push gap)",
+                              "counter");
+            for (const auto result : {"sent", "undelivered", "suppressed"})
+                metrics_.counter("yuzu_server_inventory_settings_push_total",
+                                 {{"result", result}});
+            metrics_.describe("yuzu_server_inventory_settings_push_degrade_total",
+                              "Collection settings pushes skipped because a read degraded, by "
+                              "reason: snapshot (documents, group tree or kill switches), "
+                              "membership (the agent's groups) or resolve. Nothing is sent for "
+                              "the agent and the previous snapshot keeps serving",
+                              "counter");
+            for (const auto reason : {"snapshot", "membership", "resolve"})
+                metrics_.counter("yuzu_server_inventory_settings_push_degrade_total",
+                                 {{"reason", reason}});
+            metrics_.describe("yuzu_server_inventory_settings_reconcile_exceptions_total",
+                              "Inventory settings reconcile hook calls that threw into the "
+                              "heartbeat handler (caught there, logged and counted; the rest of "
+                              "heartbeat ingestion continues)",
+                              "counter");
+            metrics_.counter("yuzu_server_inventory_settings_reconcile_exceptions_total");
+
+            cset::CollectionSettingsPusher::Deps deps;
+            deps.read_docs = [this]() -> std::optional<std::vector<cset::StoredDocument>> {
+                auto docs = software_collection_settings_store_->list_all();
+                if (!docs)
+                    return std::nullopt;
+                return std::move(*docs);
+            };
+            deps.read_tree = [this]() -> std::optional<std::vector<cset::GroupNode>> {
+                const auto groups = mgmt_group_store_->list_groups_checked();
+                if (!groups)
+                    return std::nullopt;
+                std::vector<cset::GroupNode> tree;
+                tree.reserve(groups->size());
+                for (const auto& g : *groups)
+                    tree.push_back(cset::GroupNode{g.id, g.parent_id, g.created_at});
+                return tree;
+            };
+            deps.read_killed = [this]() -> std::optional<std::map<std::string, bool>> {
+                std::map<std::string, bool> killed;
+                for (const auto p : cset::kCollectionPlugins) {
+                    const auto ks = plugin_config_store_->get_kill_switch(p, "");
+                    if (!ks) // a degraded read must never read as every collector off
+                        return std::nullopt;
+                    killed[std::string{p}] = !ks->enabled;
+                }
+                return killed;
+            };
+            deps.read_membership =
+                [this](const std::string& agent_id) -> std::optional<std::vector<std::string>> {
+                return mgmt_group_store_->get_agent_groups(agent_id);
+            };
+            deps.now = [] {
+                return std::chrono::duration_cast<std::chrono::seconds>(
+                           std::chrono::system_clock::now().time_since_epoch())
+                    .count();
+            };
+            // The Guardian-push shape: build_classified_command(system) + send_system_reserved +
+            // forward_gateway_pending, NOT dispatch_confined (`__sync__` is a protocol name no
+            // agent advertises as a plugin). `__sync__.settings` is system_reserved, so no RBAC
+            // principal is consulted.
+            deps.send = [this](const std::string& agent_id, const std::string& version,
+                               const std::string& document) -> bool {
+                const auto now_s = std::chrono::duration_cast<std::chrono::seconds>(
+                                       std::chrono::system_clock::now().time_since_epoch())
+                                       .count();
+                const std::string command_id =
+                    "__sync__-settings-" + std::to_string(now_s) + "-" +
+                    auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8));
+                auto classified = build_classified_command(
+                    yuzu::server::DispatchCaller{.system = true}, "__sync__", "settings",
+                    command_id, /*parameters=*/{{"version", version}, {"document", document}});
+                if (classified &&
+                    send_system_reserved(
+                        agent_id, *classified,
+                        yuzu::server::SystemReservedPush::inventory_settings_push)) {
+                    forward_gateway_pending(); // gateway agents are only QUEUED
+                    return true;
+                }
+                return false;
+            };
+            deps.on_degrade = [this](std::string_view reason) {
+                metrics_
+                    .counter("yuzu_server_inventory_settings_push_degrade_total",
+                             {{"reason", std::string{reason}}})
+                    .increment();
+            };
+            deps.on_result = [this](std::string_view result) {
+                metrics_
+                    .counter("yuzu_server_inventory_settings_push_total",
+                             {{"result", std::string{result}}})
+                    .increment();
+            };
+            inventory_settings_pusher_ =
+                std::make_unique<cset::CollectionSettingsPusher>(std::move(deps));
+            heartbeat_ingestion_->set_inventory_settings_reconcile_fn(
+                [this](const std::string& agent_id, const std::string& tag) {
+                    inventory_settings_pusher_->on_heartbeat(agent_id, tag);
+                });
+        }
+
         // Fleet-aggregate app-perf projection (B2) + its roll-up query owner — the
         // long-retention trend substrate, built from B1 by a daily background job.
         // AppPerfFleetStore owns the schema (fail-closed like every PG store);
@@ -11872,6 +11987,12 @@ public:
         if (heartbeat_ingestion_)
             heartbeat_ingestion_->set_quarantine_reconcile_fn(nullptr);
         quarantine_reconciler_.reset();
+        // SAM-39: same discipline - clear the heartbeat-side caller (its exclusive lock waits out
+        // an in-flight call) before dropping the pusher, which in turn goes ahead of the
+        // collection settings, management group and plugin config stores it borrows.
+        if (heartbeat_ingestion_)
+            heartbeat_ingestion_->set_inventory_settings_reconcile_fn(nullptr);
+        inventory_settings_pusher_.reset();
         // UpdateRegistry (ADR-0061) borrows pg_pool_ — same discipline: null the
         // borrowed raw pointer in agent_service_'s OTA gRPC handlers
         // (CheckForUpdate/DownloadUpdate) before dropping it, then drop before
@@ -25472,6 +25593,10 @@ private:
     // module's evaluator writes it, out-of-server).
     std::unique_ptr<ProductRegistryStore> product_registry_store_;
     std::unique_ptr<SoftwareCollectionSettingsStore> software_collection_settings_store_;
+    // SAM-39: borrows software_collection_settings_store_, mgmt_group_store_ and plugin_config_store_
+    // (declared above, so it destructs first); stop() clears its heartbeat hook and resets it first.
+    std::unique_ptr<yuzu::server::collection_settings::CollectionSettingsPusher>
+        inventory_settings_pusher_;
     // SAM-23 software lifecycle rules + host-declared facts. Declared after pg_pool_ so it
     // destructs before the pool; no route or job reads it yet (only /readyz borrows it).
     std::unique_ptr<SoftwareLifecycleStore> software_lifecycle_store_;

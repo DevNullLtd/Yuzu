@@ -61,7 +61,8 @@ struct SyncSource {
     /// and every skip-ladder cap lands at the agent's stable moment inside the
     /// window (next_window_fire) instead of the next phase slot of `interval`.
     /// Unset (the default) keeps the interval/phase-slot cadence unchanged. A
-    /// compile-time default per source: no settings channel pushes it yet.
+    /// compile-time default per source; installed_software's is replaced by the fleet settings
+    /// (SyncScheduler::apply_settings, collection_settings_agent.hpp).
     std::optional<SyncWindow> window;
 
     /// Exempt this source from the weekly forced full (kFullFloor). Only for a source whose
@@ -164,6 +165,19 @@ public:
     request_now(std::string_view sources_csv_or_all,
                 std::chrono::seconds delay_max = std::chrono::seconds{0});
 
+    /// Fleet collection settings for one source (the `__sync__.settings` reserved command): its
+    /// cadence `interval` and maintenance `window` (nullopt = no window). Thread-safe like
+    /// request_now(): it only appends to the mutex-guarded pending list (the latest request per
+    /// source wins), applied at the top of the next tick(). It never forces a sync and never sets
+    /// force_full. An unknown `source` is ignored. When the interval or the window actually
+    /// changes and the source has a FUTURE next_fire, that fire is re-placed to next_due() under
+    /// the new values (the agent's own next slot); a fire already due is left alone, and
+    /// re-applying identical values changes nothing. A multi-day interval on a windowed source is
+    /// placed by next_after_sync() (see there). The same caveat as request_now(): add_source
+    /// must not be called after the ticking thread starts.
+    void apply_settings(std::string_view source, std::chrono::seconds interval,
+                        std::optional<SyncWindow> window);
+
     /// Registered source names, in registration order (for the agent's error text, and
     /// the heartbeat thread's emit_sync_skip_tags). Like request_now(), safe from another
     /// thread only because sources_ is append-only and complete before the scheduler is
@@ -247,9 +261,19 @@ private:
     /// The next regular fire after `now_secs`: the source's window placement when it
     /// has one, else the next phase-aligned slot of its interval.
     std::int64_t next_due(std::size_t idx, std::int64_t now_secs) const;
+    /// Where a CLEAN sync at `now_secs` puts the next one. next_due() fires a windowed source
+    /// every day whatever its interval, so a windowed source whose interval is over a day is
+    /// placed at the window slot of the day one interval later: the slot is looked up from
+    /// now + interval - 12 h, the margin absorbing a DST shift (an hour either way never moves
+    /// the answer across the slot). An interval of a day or less is next_due() exactly. A skip
+    /// retry (note_skip) keeps using next_due(): a skipped run retries in the next daily window.
+    std::int64_t next_after_sync(std::size_t idx, std::int64_t now_secs) const;
+    /// Apply every pending apply_settings() request to its source (on the ticking thread).
+    void drain_settings(std::int64_t now_secs);
     /// Re-arm a LOADED source whose next_fire is more than kMaxTickSeconds in the
-    /// past (a live agent never is: it wakes at least every clamped sleep) OR more than
-    /// two days in the future (no interval plus window reaches that) to now + a stable
+    /// past (a live agent never is: it wakes at least every clamped sleep) OR further in the
+    /// future than any schedule this source could write (two days; a source whose interval is
+    /// over a day, one interval plus a day) to now + a stable
     /// offset in [0, kCatchUpWindow), and persist it. last_hash and force_full are
     /// left untouched.
     void catch_up_if_overdue(std::size_t idx, std::int64_t now_secs);
@@ -286,9 +310,17 @@ private:
 
     // request_now() (any thread) -> drain_pending() (ticking thread). {index into
     // sources_, delay_max seconds}; deduplicated on index on insert, keeping the
-    // smaller delay. The ONLY cross-thread state in this class.
+    // smaller delay. With pending_settings_ below, the ONLY cross-thread state in this class.
     std::mutex pending_mu_;
     std::vector<std::pair<std::size_t, std::int64_t>> pending_;
+
+    // apply_settings() (any thread) -> drain_settings() (ticking thread), under the same mutex.
+    struct PendingSettings {
+        std::size_t idx;
+        std::chrono::seconds interval;
+        std::optional<SyncWindow> window;
+    };
+    std::vector<PendingSettings> pending_settings_;
 };
 
 /// Publish the persisted skip state of each source as heartbeat tags

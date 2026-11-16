@@ -1,6 +1,7 @@
 #include "heartbeat_ingestion.hpp"
 
 #include "agent_registry.hpp"
+#include "collection_settings_push.hpp"
 #include "fleet_topology_store.hpp"
 #include "offline_endpoint_store.hpp"
 
@@ -141,6 +142,45 @@ void HeartbeatIngestion::ingest(const ::yuzu::agent::v1::HeartbeatRequest& hb,
                 } catch (...) {
                     count_throw();
                     spdlog::warn("[{}] Heartbeat guardian reconcile threw a non-standard "
+                                 "exception for agent={}",
+                                 via_str, ::yuzu::log_id_token(agent_id_str));
+                }
+            }
+        }
+    }
+
+    // SAM-39: inventory settings reconcile. The agent reports the version of the settings
+    // document it applied (or `none`); only that exact shape is handed on, so a malformed tag
+    // from a buggy agent is ignored. Same discipline as the quarantine hook below: the shared
+    // lock is held for the whole call, a throw is counted and logged with neutralised text, and
+    // the rest of ingestion carries on.
+    {
+        const auto& tags = hb.status_tags();
+        const auto it = tags.find("yuzu.inv_settings_version");
+        if (it != tags.end() &&
+            collection_settings::is_reportable_tag(it->second)) {
+            std::shared_lock lock(inventory_settings_reconcile_mu_);
+            if (inventory_settings_reconcile_fn_) {
+                const auto count_throw = [this]() noexcept {
+                    try {
+                        if (metrics_)
+                            metrics_
+                                ->counter("yuzu_server_inventory_settings_reconcile_exceptions_total")
+                                .increment();
+                    } catch (...) {
+                        // A lost sample only under-reports; ingestion carries on.
+                    }
+                };
+                try {
+                    inventory_settings_reconcile_fn_(agent_id_str, it->second);
+                } catch (const std::exception& e) {
+                    count_throw();
+                    spdlog::warn("[{}] Heartbeat inventory settings reconcile threw for agent={}: {}",
+                                 via_str, ::yuzu::log_id_token(agent_id_str),
+                                 ::yuzu::log_id_token(e.what()));
+                } catch (...) {
+                    count_throw();
+                    spdlog::warn("[{}] Heartbeat inventory settings reconcile threw a non-standard "
                                  "exception for agent={}",
                                  via_str, ::yuzu::log_id_token(agent_id_str));
                 }

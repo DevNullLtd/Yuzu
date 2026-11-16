@@ -367,6 +367,7 @@ agent_test_exe = executable(
     'unit/test_inventory_sync_action_table.cpp',
     'unit/test_agent_sync_command.cpp', # round-3 remediation: decide_sync_now pure-core extraction
                                           # from agent.cpp's __sync__.now reserved-command branch
+    'unit/test_collection_settings_agent.cpp', # settings command parse, golden vectors, scheduler and collector application
     'unit/test_device_ci_sync.cpp',
     'unit/test_sync_source_app_perf.cpp',
     'unit/test_win_str_utils.cpp',
@@ -2095,6 +2096,8 @@ if build_server
       'unit/server/test_software_collection_settings_store.cpp',
       # collection-settings REST routes: null-dep shapes (no PG) + [pg][routes] real AuthRoutes gate over ManagementGroupStorePg/RbacStorePg
       'unit/server/test_software_collection_settings_routes.cpp',
+      # heartbeat-driven settings push: decide_push table, snapshot and memo rules, golden vectors (fake reads, clock and send)
+      'unit/server/test_collection_settings_push.cpp',
       # SAM-33 read routes (hosts, host detail, change feed, summary, plugin health) over injected store reads: no store, no [pg]
       'unit/server/test_software_read_routes.cpp',
       'unit/server/test_software_title_dimension.cpp',

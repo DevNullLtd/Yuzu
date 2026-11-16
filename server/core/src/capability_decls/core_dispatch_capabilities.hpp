@@ -8,13 +8,13 @@
 
 /// @file core_dispatch_capabilities.hpp
 /// The ONE fragment of the command capability catalogue this package owns:
-/// the four dispatches the SERVER issues to itself rather than on a
+/// the five dispatches the SERVER issues to itself rather than on a
 /// caller's behalf. Every other `capability_decls/*.hpp` fragment (the five
 /// per-group plugin.action catalogues) belongs to a different package and is
 /// composed alongside this one only at the `CommandCapabilityRegistry`
 /// construction site — never merged into this array.
 ///
-/// The four rows, each `system_reserved = true` because none of them is
+/// The five rows, each `system_reserved = true` because none of them is
 /// reachable via an operator-attributable RBAC decision — they run on the
 /// server's own schedule/reconcile loops (or, for `__sync__.now`, behind a
 /// route that gates the operator itself and then dispatches as the system):
@@ -35,11 +35,14 @@
 ///     intersection, the 500-target cap, a per-operator cooldown and a single
 ///     in-flight run) — operator-requested inventory sync-on-demand (ADR-0016
 ///     update). Read-only: the agent re-runs a daily-sync source and reports.
+///   - `__sync__.settings` (SAM-39, heartbeat reconcile in server.cpp) — the effective software
+///     collection settings sent to an agent whose reported version differs. Mutating-but-
+///     reversible: a later push supersedes it and a replay is idempotent.
 namespace yuzu::server::capdecls {
 
 namespace detail {
 
-inline constexpr std::array<CommandCapability, 4> kCoreDispatchCapabilities{{
+inline constexpr std::array<CommandCapability, 5> kCoreDispatchCapabilities{{
     {
         .plugin = "echo",
         .action = "fleet_snapshot",
@@ -86,6 +89,22 @@ inline constexpr std::array<CommandCapability, 4> kCoreDispatchCapabilities{{
         .mutability = Mutability::None,
         .securable = "Inventory",
         .operation = authz::Operation::Read,
+        .risk_tier = authz::RiskTier::Low,
+        .system_reserved = true,
+        .execute_gate = ExecuteGate::None,
+    },
+    {
+        // Heartbeat-driven delivery of the effective software collection settings (SAM-39):
+        // the server sends the document that applies to an agent whose reported version differs.
+        // System-dispatched only; it changes how the agent schedules its own inventory
+        // collection, nothing else on the endpoint, and replaying it is idempotent (the agent
+        // compares versions). The securable/operation never admit anyone (system_reserved).
+        .plugin = "__sync__",
+        .action = "settings",
+        .dispatch_class = DispatchClass::Mutating,
+        .mutability = Mutability::Reversible,
+        .securable = "Inventory",
+        .operation = authz::Operation::Write,
         .risk_tier = authz::RiskTier::Low,
         .system_reserved = true,
         .execute_gate = ExecuteGate::None,

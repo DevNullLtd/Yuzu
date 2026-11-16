@@ -53,6 +53,7 @@ __declspec(allocate(".CRT$XCB"))
 #include "hard_exit.hpp"                 // hard_exit / kOrphanDrainGrace: the detached-collector drain barrier
 #include "log_handoff.hpp"               // drain_log_bounded: breadcrumb before that hard_exit
 #include "command_dedup_decision.hpp"            // dedup claim/replay decision core (pure, unit-tested)
+#include "collection_settings_agent.hpp"       // __sync__.settings decision core (pure, unit-tested)
 #include "sync_now_decision.hpp"               // __sync__.now decision core (pure, unit-tested)
 #include "sync_scheduler.hpp"                 // ADR-0016 daily-sync framework
 #include "sync_source_installed_software.hpp" // ADR-0016 source #1
@@ -886,6 +887,26 @@ public:
             } else {
                 spdlog::error("Failed to open KV store: {}", kv_result.error().message);
                 spdlog::warn("Plugin KV storage will be unavailable");
+            }
+        }
+
+        // 1b'. Fleet collection settings (`__sync__.settings`): load the persisted pair and apply it
+        // BEFORE any daily-sync scheduler exists, so the first tick already runs on it. The pair is
+        // re-validated exactly as a live command; one that no longer matches its version (a crash
+        // between the two KV writes, a hand edit) is discarded, the tag reads `none` and the server
+        // re-sends. Skipped under --inventory-disable: nothing there collects or applies settings.
+        if (kv_store_ && !cfg_.inventory_disable) {
+            auto stored = load_stored_settings([this](const std::string& k) {
+                return kv_store_->get(kSyncKvNamespace, k);
+            });
+            if (stored) {
+                collector_enabled_->set(stored->plugins);
+                spdlog::info("Collection settings {} restored (interval {}s{})", stored->version,
+                             stored->interval_s, stored->window ? ", windowed" : "");
+                std::lock_guard<std::mutex> lk(settings_mu_);
+                applied_settings_ = std::move(*stored);
+            } else if (stored.error() != kNoStoredSettings) {
+                spdlog::warn("Stored collection settings discarded: {}", stored.error());
             }
         }
 
@@ -2612,8 +2633,22 @@ public:
                         // rebuilt on every reconnect while a worker abandoned at its time limit may
                         // still be inside a plugin, so the single-flight flags and the outstanding
                         // count must outlive it (drain_detached_collectors_or_exit reads them).
-                        scheduler.add_source(make_installed_software_source(
-                            sync_plugins, kv_get, kv_set, collector_workers_));
+                        // `collector_enabled_` is agent-lifetime for the same reason, and the
+                        // applied fleet settings (loaded at start-up, replaced by each
+                        // `__sync__.settings`) set the cadence BEFORE the scheduler is published,
+                        // so a reconnect keeps them and nothing is re-placed here.
+                        auto installed_software_source = make_installed_software_source(
+                            sync_plugins, kv_get, kv_set, collector_workers_, {},
+                            collector_enabled_);
+                        {
+                            std::lock_guard<std::mutex> lk(settings_mu_);
+                            if (applied_settings_) {
+                                installed_software_source.interval =
+                                    std::chrono::seconds{applied_settings_->interval_s};
+                                installed_software_source.window = applied_settings_->window;
+                            }
+                        }
+                        scheduler.add_source(std::move(installed_software_source));
                         // Publish AFTER the last add_source: request_now() reads sources_
                         // without the mutex on the append-only-before-publication contract.
                         {
@@ -2771,6 +2806,12 @@ public:
                             // KV throw must never kill the heartbeat thread.
                             try {
                                 yuzu::agent::emit_plugins_failed_tag(tags, plugins_failed_);
+                                // The applied fleet collection settings: always present, `none`
+                                // until a valid pair is applied.
+                                {
+                                    std::lock_guard<std::mutex> lk(settings_mu_);
+                                    yuzu::agent::emit_settings_tags(tags, applied_settings_);
+                                }
                                 if (kv_store_) {
                                     yuzu::agent::emit_plugin_heartbeat_tags(
                                         tags, plugin_names_,
@@ -3720,8 +3761,30 @@ public:
                         // else about this command (the metrics counter below,
                         // record_command_terminal-before-write, the stream->Write)
                         // stays here, unchanged.
-                        auto decision = decide_sync_now(cmd.action(), source, delay_max_s,
-                                                         cfg_.inventory_disable, sched.get());
+                        // `settings` (fleet collection settings) is decided first, in
+                        // collection_settings_agent.hpp: it persists the pair, then hands the
+                        // cadence to the scheduler and the switches to the collector. It never
+                        // forces a sync; the wake below only re-ticks so the new cadence is
+                        // applied at once.
+                        auto decision =
+                            cmd.action() == kSettingsAction
+                                ? decide_sync_settings(
+                                      cmd.parameters(), cfg_.inventory_disable, sched != nullptr,
+                                      SettingsHooks{
+                                          [this](std::string_view key, std::string_view value) {
+                                              return kv_store_ &&
+                                                     kv_store_->set(kSyncKvNamespace, key, value);
+                                          },
+                                          [this, sched](const AgentCollectionSettings& s) {
+                                              collector_enabled_->set(s.plugins);
+                                              sched->apply_settings(
+                                                  kSettingsSyncSource,
+                                                  std::chrono::seconds{s.interval_s}, s.window);
+                                              std::lock_guard<std::mutex> lk(settings_mu_);
+                                              applied_settings_ = s;
+                                          }})
+                                : decide_sync_now(cmd.action(), source, delay_max_s,
+                                                  cfg_.inventory_disable, sched.get());
                         resp.set_status(decision.status == SyncNowDecision::Status::Success
                                              ? pb::CommandResponse::SUCCESS
                                              : pb::CommandResponse::FAILURE);
@@ -5040,6 +5103,13 @@ private:
     // (sync_source_installed_software.hpp). Agent-lifetime, NOT per-connection: see the factory
     // call and drain_detached_collectors_or_exit().
     std::shared_ptr<CollectorWorkers> collector_workers_ = std::make_shared<CollectorWorkers>();
+    // The fleet collection settings last applied (`__sync__.settings`, collection_settings_agent.hpp)
+    // and the collector switches they carry. Agent-lifetime like the workers: written by start-up
+    // and the command thread, read by the sync thread (building the source on each connection) and
+    // the heartbeat thread (the version tag). Empty = nothing applied.
+    std::mutex settings_mu_;
+    std::optional<AgentCollectionSettings> applied_settings_;
+    std::shared_ptr<CollectorEnabledSet> collector_enabled_ = std::make_shared<CollectorEnabledSet>();
 
     // PR 10 / UAT 2026-05-12 — Push-based fleet topology ingestion.
     //

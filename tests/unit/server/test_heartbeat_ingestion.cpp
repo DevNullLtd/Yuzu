@@ -34,6 +34,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using yuzu::server::HeartbeatIngestion;
@@ -313,6 +314,124 @@ TEST_CASE("HeartbeatIngestion: a throwing guardian reconcile fn does not abort i
         CHECK(cap.called);
         CHECK(cap.generation == 8);
         CHECK(quarantine_calls == 2);
+    }
+}
+
+// SAM-39: the `yuzu.inv_settings_version` tag -> inventory settings reconcile hook. Only `none`
+// or a 64-character lower-case hex version is handed on; anything else is ignored.
+namespace {
+
+::yuzu::agent::v1::HeartbeatRequest make_settings_hb(const std::string& value, bool set_tag = true) {
+    ::yuzu::agent::v1::HeartbeatRequest hb;
+    if (set_tag)
+        (*hb.mutable_status_tags())["yuzu.inv_settings_version"] = value;
+    return hb;
+}
+
+struct SettingsCapture {
+    std::vector<std::pair<std::string, std::string>> calls;
+};
+
+} // namespace
+
+TEST_CASE("HeartbeatIngestion: inventory settings reconcile fires on none and on a 64-hex version",
+          "[heartbeat_ingestion][inventory_settings]") {
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+    HeartbeatIngestion ingestion{registry, nullptr, nullptr, &metrics};
+
+    SettingsCapture cap;
+    ingestion.set_inventory_settings_reconcile_fn(
+        [&](const std::string& aid, const std::string& tag) { cap.calls.emplace_back(aid, tag); });
+
+    const std::string hex(64, 'a');
+    ingestion.ingest(make_settings_hb("none"), "agent-x", "direct");
+    ingestion.ingest(make_settings_hb(hex), "agent-y", "gateway");
+
+    REQUIRE(cap.calls.size() == 2);
+    CHECK(cap.calls[0] == std::pair<std::string, std::string>{"agent-x", "none"});
+    CHECK(cap.calls[1] == std::pair<std::string, std::string>{"agent-y", hex});
+}
+
+TEST_CASE("HeartbeatIngestion: a malformed or absent inventory settings tag is ignored",
+          "[heartbeat_ingestion][inventory_settings]") {
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+    HeartbeatIngestion ingestion{registry, nullptr, nullptr, &metrics};
+
+    SettingsCapture cap;
+    ingestion.set_inventory_settings_reconcile_fn(
+        [&](const std::string& aid, const std::string& tag) { cap.calls.emplace_back(aid, tag); });
+
+    for (const std::string bad : {std::string{}, std::string{"None"}, std::string{"NONE"},
+                                  std::string{"none "}, std::string(63, 'a'),
+                                  std::string(65, 'a'), std::string(64, 'A'),
+                                  std::string(63, 'a') + "g", std::string(64, 'a') + "\n",
+                                  std::string{"12345"}})
+        ingestion.ingest(make_settings_hb(bad), "agent-x", "direct");
+    ingestion.ingest(make_settings_hb("", /*set_tag=*/false), "agent-x", "direct");
+
+    CHECK(cap.calls.empty());
+}
+
+TEST_CASE("HeartbeatIngestion: no inventory settings reconcile fn set is a no-op",
+          "[heartbeat_ingestion][inventory_settings]") {
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+    HeartbeatIngestion ingestion{registry, nullptr, nullptr, &metrics};
+    CHECK_NOTHROW(ingestion.ingest(make_settings_hb("none"), "agent-x", "direct"));
+}
+
+TEST_CASE("HeartbeatIngestion: a throwing inventory settings reconcile does not abort ingestion "
+          "and is counted",
+          "[heartbeat_ingestion][inventory_settings]") {
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+    HeartbeatIngestion ingestion{registry, nullptr, nullptr, &metrics};
+
+    int quarantine_calls = 0;
+    ingestion.set_quarantine_reconcile_fn([&](std::string_view) { ++quarantine_calls; });
+    std::uint64_t guardian_gen = 0;
+    ingestion.set_guardian_reconcile_fn(
+        [&](std::string_view, std::uint64_t gen) { guardian_gen = gen; });
+    const auto exceptions = [&] {
+        return metrics.counter("yuzu_server_inventory_settings_reconcile_exceptions_total").value();
+    };
+
+    // One heartbeat carrying both tags: the guardian hook runs before the settings hook and the
+    // quarantine hook after it, and neither is disturbed by the throw.
+    auto hb = make_hb("9");
+    (*hb.mutable_status_tags())["yuzu.inv_settings_version"] = "none";
+
+    SECTION("std::exception") {
+        ingestion.set_inventory_settings_reconcile_fn(
+            [](const std::string&, const std::string&) { throw std::runtime_error("boom"); });
+        CHECK_NOTHROW(ingestion.ingest(hb, "agent-x", "direct"));
+        CHECK(exceptions() == 1.0);
+        CHECK(guardian_gen == 9);
+        CHECK(quarantine_calls == 1);
+    }
+    SECTION("a non-std exception") {
+        ingestion.set_inventory_settings_reconcile_fn(
+            [](const std::string&, const std::string&) { throw 42; });
+        CHECK_NOTHROW(ingestion.ingest(hb, "agent-x", "direct"));
+        CHECK(exceptions() == 1.0);
+        CHECK(quarantine_calls == 1);
+    }
+    SECTION("a hook that returns is not counted, and a throwing guardian hook is not counted here") {
+        ingestion.set_inventory_settings_reconcile_fn([](const std::string&, const std::string&) {});
+        ingestion.ingest(hb, "agent-x", "direct");
+        CHECK(exceptions() == 0.0);
+    }
+    SECTION("without a metrics registry a throwing hook is still contained") {
+        HeartbeatIngestion unmetered{registry, nullptr, nullptr, nullptr};
+        unmetered.set_inventory_settings_reconcile_fn(
+            [](const std::string&, const std::string&) { throw std::runtime_error("boom"); });
+        CHECK_NOTHROW(unmetered.ingest(hb, "agent-x", "direct"));
     }
 }
 

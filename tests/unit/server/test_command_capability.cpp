@@ -168,11 +168,11 @@ TEST_CASE("CommandCapabilityRegistry: too many sources throws rather than silent
 
 // ── core_dispatch_capabilities() ─────────────────────────────────────────
 
-TEST_CASE("capdecls::core_dispatch_capabilities: exactly the four system-initiated dispatches, "
+TEST_CASE("capdecls::core_dispatch_capabilities: exactly the five system-initiated dispatches, "
           "all system_reserved",
           "[server][dispatch][capability]") {
     auto rows = capdecls::core_dispatch_capabilities();
-    REQUIRE(rows.size() == 4);
+    REQUIRE(rows.size() == 5);
     for (const auto& row : rows)
         CHECK(row.system_reserved);
 
@@ -202,6 +202,18 @@ TEST_CASE("capdecls::core_dispatch_capabilities: exactly the four system-initiat
     CHECK(sync->operation == authz::Operation::Read);
     CHECK(sync->system_reserved);
     CHECK(sync->execute_gate == ExecuteGate::None);
+
+    // Heartbeat-driven collection settings (__sync__.settings, SAM-39): mutating but
+    // reversible, system-reserved, lands under Inventory.
+    auto settings = registry.classify("__sync__", "settings");
+    REQUIRE(settings.has_value());
+    CHECK(settings->dispatch_class == DispatchClass::Mutating);
+    CHECK(settings->mutability == Mutability::Reversible);
+    CHECK(settings->securable == "Inventory");
+    CHECK(settings->operation == authz::Operation::Write);
+    CHECK(settings->risk_tier == authz::RiskTier::Low);
+    CHECK(settings->system_reserved);
+    CHECK(settings->execute_gate == ExecuteGate::None);
 }
 
 // ── normalize_action_key ─────────────────────────────────────────────────
