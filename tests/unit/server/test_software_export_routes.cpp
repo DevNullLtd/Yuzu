@@ -9,9 +9,10 @@
  *
  * The pins: the gate decides before any read; the audit row is stored BEFORE the first chunk;
  * rows arrive in order with no duplicate at a page boundary; a confined caller streams only its
- * own rows; a wide scope that answers empty pages with non-empty cursors is followed to the empty
- * cursor; a degraded read, the deadline or a server shutdown aborts the transfer (provider returns
- * false); an unwired store or budget is a 503, never an empty 200.
+ * own rows; a wide scope whose reads hold none of the caller's rows is walked to the end, even
+ * past the page-mode OFFSET ceiling, and no store read of the walk carries an OFFSET; a degraded
+ * read, the deadline or a server shutdown aborts the transfer (provider returns false); an unwired
+ * store or budget is a 503, never an empty 200.
  *
  * Admission (ADR-0034): every stream is one lease from a REAL StreamBudget on
  * SseSurface::kSoftwareExport, and each exit path (clean end, mid-stream degrade, deadline, client
@@ -105,12 +106,16 @@ struct Harness {
     // The data and the read counters.
     std::vector<SoftwareFleetRow> installs; // kept sorted by (name, agent_id, install_id)
     // Instead of `installs`: synthesise this many rows on demand (row n has install_id n+1 and
-    // device a-<n>), so the large case never holds them in memory.
+    // device a-<n>), so the large case never holds them in memory. With `generated_in_from` >= 0
+    // the rows from that index on belong to the devices z-000, z-001, ... instead (the caller's
+    // own, see wide_scope()), and the rows before it carry the publisher LEAK-<device>.
     int generated{0};
+    int generated_in_from{-1};
     std::unordered_map<std::string, std::string> roster;
     std::vector<std::string> distinct;
     bool distinct_degrades{false};
     int install_reads{0};
+    std::int64_t max_skip_seen{0}; // the largest OFFSET any installs read was handed
     int fail_read_at{0};      // the Nth installs read answers nullopt (0 = never)
     int last_seen_calls{0};
     int fail_last_seen_at{0}; // the Nth last-poll read answers nullopt (0 = never)
@@ -118,6 +123,13 @@ struct Harness {
 
     // The injected deadline clock (monotonic seconds).
     std::int64_t clock_s{1'000};
+
+    [[nodiscard]] SoftwareFleetRow generated_row(int i) const {
+        if (generated_in_from >= 0 && i >= generated_in_from)
+            return install_row(agent_id("z", i - generated_in_from, 3), i + 1);
+        const auto id = agent_id("a", i);
+        return install_row(id, i + 1, generated_in_from >= 0 ? "LEAK-" + id : "Acme");
+    }
 
     // `global_cap` is the budget's server-wide cap (the --max-sse-streams side); `concurrency` is the
     // export cap (--inventory-export-concurrency). `wire_budget` false leaves Deps::stream_budget null.
@@ -160,14 +172,18 @@ struct Harness {
                 -> std::optional<std::vector<SoftwareFleetRow>> {
                 ++install_reads;
                 last_query = q;
+                max_skip_seen = std::max(max_skip_seen, q.skip);
                 if (fail_read_at != 0 && install_reads == fail_read_at)
                     return std::nullopt;
                 if (generated > 0) {
                     std::vector<SoftwareFleetRow> page;
-                    const auto from = q.after ? static_cast<int>(q.after->install_id) : 0;
+                    // Row n has install_id n+1, so the row after `after` is at index install_id;
+                    // `skip` passes over rows after it, like the store's OFFSET.
+                    const auto from = (q.after ? static_cast<int>(q.after->install_id) : 0) +
+                                      static_cast<int>(q.skip);
                     for (int i = from; i < generated && page.size() < static_cast<std::size_t>(q.limit);
                          ++i)
-                        page.push_back(install_row(agent_id("a", i), i + 1));
+                        page.push_back(generated_row(i));
                     return page;
                 }
                 using Key = std::tuple<std::string, std::string, std::int64_t>;
@@ -306,13 +322,19 @@ std::int64_t install_no(const std::string& line) {
 constexpr int kOut = 4'500;
 constexpr int kIn = 10;
 
-void wide_fixture(Harness& h) {
+// The caller's scope: the devices z-000..z-009 plus filler devices that own no rows, so it is wider
+// than kScopePushdownMaxIds.
+void wide_scope(Harness& h) {
     std::unordered_set<std::string> ids;
     for (int i = 0; i < kIn; ++i)
         ids.insert(agent_id("z", i, 3));
     for (int i = 0; ids.size() <= software_catalogue::kScopePushdownMaxIds; ++i)
-        ids.insert(agent_id("f", i)); // filler devices that own no rows
+        ids.insert(agent_id("f", i));
     h.scope = std::move(ids);
+}
+
+void wide_fixture(Harness& h) {
+    wide_scope(h);
     for (int i = 0; i < kOut; ++i) {
         const auto id = agent_id("a", i);
         h.installs.push_back(install_row(id, i + 1, "LEAK-" + id));
@@ -501,6 +523,95 @@ TEST_CASE("export route: under a wide scope no field of an out-of-scope row reac
         CHECK(t.body.find("own-host-z-000") != std::string::npos);
         release(*res, true);
     }
+}
+
+TEST_CASE("export route: a run of hidden rows longer than the page-mode OFFSET ceiling is walked "
+          "to a clean end, every store read at skip 0",
+          "[software_export][routes][scope]") {
+    // More consecutive out-of-scope rows than a page-mode cursor can carry: kWideScopeMaxSkip
+    // scanned rows, then one more full call of kWideScopeMaxReads reads. A walk that resumed
+    // through an OFFSET would be refused on its 27th call and cut the transfer; this one resumes
+    // from the last row it scanned. The rows are generated on demand, never held.
+    constexpr int kRun = static_cast<int>(software_catalogue::kWideScopeMaxSkip) +
+                         software_catalogue::kWideScopeMaxReads * swe::kPageRows + 1;
+    Harness h;
+    wide_scope(h);
+    h.generated_in_from = kRun; // rows 0..kRun-1 are out of scope, the next kIn are the caller's own
+    h.generated = kRun + kIn;
+    for (const int i : {0, kRun / 2, kRun - 1})
+        h.roster[agent_id("a", i)] = "leak-host-" + agent_id("a", i);
+    for (int i = 0; i < kIn; ++i)
+        h.roster[agent_id("z", i, 3)] = "own-host-" + agent_id("z", i, 3);
+
+    for (const char* format : {"jsonl", "csv"}) {
+        INFO("format=" << format);
+        h.install_reads = 0;
+        auto res = h.get(std::string("?format=") + format);
+        REQUIRE(res);
+        const auto t = drive(*res);
+        release(*res, !t.aborted);
+        REQUIRE(t.done); // a clean end, not an aborted transfer
+        CHECK_FALSE(t.aborted);
+        CHECK(h.count(format, "completed") == 1);
+        CHECK(h.count(format, "degraded") == 0);
+        CHECK(h.held() == 0);
+        // The walk really read past the run, and not one of its reads carried an OFFSET.
+        CHECK(h.install_reads > static_cast<int>(software_catalogue::kWideScopeMaxSkip) / swe::kPageRows);
+        CHECK(h.max_skip_seen == 0);
+
+        // No field of a hidden row reaches the body.
+        CHECK(t.body.find("LEAK") == std::string::npos);
+        CHECK(t.body.find("leak-host") == std::string::npos);
+        CHECK(t.body.find(agent_id("a", 0)) == std::string::npos);
+        CHECK(t.body.find(agent_id("a", kRun - 1)) == std::string::npos);
+
+        // Every in-scope row, once and in order.
+        auto lines = lines_of(t.body);
+        if (std::string_view(format) == "csv") {
+            REQUIRE_FALSE(lines.empty());
+            CHECK(lines.front() == std::string(swl::kListCsvHeader));
+            lines.erase(lines.begin());
+        }
+        REQUIRE(lines.size() == static_cast<std::size_t>(kIn));
+        for (int i = 0; i < kIn; ++i) {
+            const auto& line = lines[static_cast<std::size_t>(i)];
+            CHECK(line.find(agent_id("z", i, 3)) != std::string::npos);
+            CHECK(line.find("own-host-" + agent_id("z", i, 3)) != std::string::npos);
+            CHECK(line.find("1." + std::to_string(kRun + i + 1)) != std::string::npos);
+        }
+    }
+}
+
+TEST_CASE("export route: a wide scope that owns no row streams an empty body and ends cleanly",
+          "[software_export][routes][scope]") {
+    Harness h;
+    wide_scope(h);
+    // Two full provider calls of hidden rows and a third that ends exactly on a full read, so the
+    // walk learns the end only from the empty read after it.
+    h.generated = 2 * software_catalogue::kWideScopeMaxReads * swe::kPageRows + swe::kPageRows;
+
+    SECTION("JSONL: an empty body") {
+        auto res = h.get("?format=jsonl");
+        REQUIRE(res);
+        const auto t = drive(*res);
+        release(*res, !t.aborted);
+        CHECK(t.done);
+        CHECK_FALSE(t.aborted);
+        CHECK(t.body.empty());
+        CHECK(h.count("jsonl", "completed") == 1);
+    }
+    SECTION("CSV: the header and nothing else") {
+        auto res = h.get("?format=csv");
+        REQUIRE(res);
+        const auto t = drive(*res);
+        release(*res, !t.aborted);
+        CHECK(t.done);
+        CHECK_FALSE(t.aborted);
+        CHECK(t.body == std::string(swl::kListCsvHeader) + "\n");
+        CHECK(h.count("csv", "completed") == 1);
+    }
+    CHECK(h.max_skip_seen == 0);
+    CHECK(h.held() == 0);
 }
 
 TEST_CASE("export route: the audit row is stored before the first chunk",

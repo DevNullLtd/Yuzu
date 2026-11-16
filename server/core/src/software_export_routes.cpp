@@ -72,6 +72,11 @@ struct Stream {
     swe::ExportRequest request;
     authz::VisibleSet scope;
     detail::StreamBudget::Lease lease; ///< one worker of the one budget, held for the whole stream
+    /// Where the next store read continues strictly after: the head, then the position each step
+    /// reports. On a wide scope it names the last row SCANNED, which may be one the caller cannot
+    /// see, so it lives only here: it is never formatted into a byte, header, log line, metric
+    /// label or audit detail. Every store read is skip 0, so none uses an OFFSET.
+    swc::DevicesOps::Anchor after{};
     std::unordered_map<std::string, std::string> hostnames;
     std::int64_t deadline{0};
     bool first_chunk{true};
@@ -152,29 +157,34 @@ bool pump(Stream& st, httplib::DataSink& sink) {
         spdlog::warn("{}: stream deadline reached; aborting; cid={}", kVerb, st.cid);
         return false;
     }
-    const auto page = swl::read_list_page(st.ctx->reads.installs, st.request.list, st.scope);
-    if (!page) {
+    // No cursor is decoded on this path, so the only failure of a step is a degraded read.
+    auto step = swc::read_scoped_step<swc::DevicesOps>(st.ctx->reads.installs,
+                                                       st.request.list.base.query, st.after,
+                                                       st.scope);
+    if (!step) {
         st.outcome = Outcome::kDegraded;
         spdlog::warn("{}: installs read failed mid-stream; aborting; cid={}", kVerb, st.cid);
         return false;
     }
-    const auto facts = facts_for(st, page->rows);
+    const auto& rows = step->page.rows;
+    const auto facts = facts_for(st, rows);
     if (!facts) {
         st.outcome = Outcome::kDegraded;
         spdlog::warn("{}: last-poll read failed mid-stream; aborting; cid={}", kVerb, st.cid);
         return false;
     }
-    // A wide scope can answer an EMPTY page with a non-empty cursor: nothing to write, carry on.
-    const auto chunk = swe::format_chunk(page->rows, *facts, st.request.format, st.first_chunk);
+    // A wide scope can answer an EMPTY page that still has a position to resume from: nothing to
+    // write, carry on.
+    const auto chunk = swe::format_chunk(rows, *facts, st.request.format, st.first_chunk);
     st.first_chunk = false;
     if (!chunk.empty() && !sink.write(chunk.data(), chunk.size()))
         return false; // client gone: outcome stays kAborted
-    if (page->next_cursor.empty()) { // the ONLY end of the data
+    if (!step->resume) { // the ONLY end of the data
         st.outcome = Outcome::kCompleted;
         sink.done();
         return true;
     }
-    st.request.list.base.cursor = page->next_cursor;
+    st.after = std::move(*step->resume);
     return true;
 }
 

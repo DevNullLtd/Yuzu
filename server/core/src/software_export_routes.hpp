@@ -13,8 +13,12 @@
 /// The scope boundary, stated exactly: a scope of at most software_catalogue::kScopePushdownMaxIds
 /// devices is pushed into the store query. A wider scope is read by the server and filtered in
 /// process, so out-of-scope rows ARE read from the store but no byte of one reaches the response.
-/// Under that wider scope a page can be empty with a non-empty cursor; the stream continues from
-/// that cursor and ends only when the cursor is empty.
+/// Under that wider scope a read can hold none of the caller's rows; the stream resumes from the
+/// last row the server scanned, held in process (software_catalogue::read_scoped_step, skip 0, so
+/// no store read uses an OFFSET and a run of any length is walked) and ends only when the walk
+/// reports the end of the data. That position names a row the caller may not see: it never reaches
+/// a response byte, header, log line, metric label or audit detail, and no cursor is decoded on
+/// this route.
 ///
 /// Sequence: gate -> parse (400) -> lease (refused: 503 + a `denied` audit row, nothing streamed)
 /// -> audit (BEFORE the provider; set-and-proceed with `Sec-Audit-Failed: true` on a miss) ->

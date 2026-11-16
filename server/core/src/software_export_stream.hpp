@@ -75,8 +75,8 @@ inline constexpr std::array<std::string_view, 2> kRejectReasons{"export_concurre
 
 struct ExportRequest {
     ExportFormat format{ExportFormat::jsonl};
-    /// The parsed list request. `base.cursor` is empty and `base.query.limit` is kPageRows; the
-    /// route advances `base.cursor` itself between store reads.
+    /// The parsed list request. `base.cursor` stays empty and `base.query.limit` is kPageRows; the
+    /// route walks `base.query` in process, keeping its own resume position between store reads.
     software_list::ListRequest list;
 };
 
