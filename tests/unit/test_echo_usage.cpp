@@ -14,6 +14,7 @@
 #include "echo_usage.hpp"
 #include "echo_aggregator.hpp" // source_enabled
 #include "test_helpers.hpp"
+#include "test_log_capture.hpp"
 
 #include <sqlite3.h> // second connection: selective config-read fault injection
 
@@ -723,8 +724,14 @@ TEST_CASE("usage: enabling or disabling with an unreadable usage_generation writ
     REQUIRE(usage_ensure_baselined(t.db, 1000).has_value());
     make_config_key_unreadable(t.path, "usage_generation");
 
+    yuzu::test::LogCapture cap;
     CHECK_FALSE(usage_set_enabled(t.db, /*enabled=*/false, /*now=*/2000));
     CHECK_FALSE(usage_set_enabled(t.db, /*enabled=*/true, /*now=*/3000));
+    cap.stop();
+    // The refusal must come from the strict read, not from the config write failing at prepare.
+    const auto log = cap.text();
+    CHECK(log.find("transition refused, usage_generation is unreadable") != std::string::npos);
+    CHECK(log.find("transition failed to persist") == std::string::npos);
     CHECK(raw_cfg(t.db, "usage_generation") == "true"); // the injected row, never bumped
     CHECK(cfg(t.db, "usage_enabled").empty());          // no edge was written
     CHECK(cfg(t.db, "usage_paused_at").empty());
@@ -739,8 +746,15 @@ TEST_CASE("usage: a baseline attempt with an unreadable usage_generation stamps 
     seed_open_run(t.db, 1, "old.exe", 1000);
     make_config_key_unreadable(t.path, "usage_generation");
 
+    yuzu::test::LogCapture cap;
     const auto result = usage_ensure_baselined(t.db, /*now=*/5000);
+    cap.stop();
     CHECK_FALSE(result.has_value());
+    // The refusal must come from the strict read, not from the config write failing at prepare.
+    const auto log = cap.text();
+    CHECK(log.find("baseline attempt refused, usage_generation is unreadable") !=
+          std::string::npos);
+    CHECK(log.find("baseline attempt failed") == std::string::npos);
     CHECK(count_rows(t.db, "usage_live") == 1);
     CHECK(cfg(t.db, "usage_active_generation").empty());
     CHECK(cfg(t.db, "usage_coverage_since").empty());
