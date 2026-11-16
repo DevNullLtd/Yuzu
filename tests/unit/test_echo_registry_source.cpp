@@ -3225,6 +3225,69 @@ TEST_CASE("registry source: a failed HKEY_USERS enumeration keeps the cursor and
     CHECK(*r.t.db.get_cursor("registry").value() != cursor_before);
 }
 
+TEST_CASE("registry source: a commit that fails for three ticks then succeeds records one commit "
+          "stalled gap with the window in its key",
+          "[echo][registry][lifecycle]") {
+    auto t = make_db();
+    Fake f;
+    auto src = make_registry_cursor_source(scope1(), f.reader());
+    f.reads[kRoot] = svc(1);
+    REQUIRE(tick(t.db, *src).outcome == CursorOutcome::Baseline);
+
+    // Three ticks whose commit is refused. Each has a loss row, so it has a row to fail on.
+    std::int64_t first_failure = 0;
+    {
+        InsertTrap trap(t.path);
+        for (int i = 0; i < 3; ++i) {
+            f.clock += 10 * SEC;
+            f.loss.events_lost += 1;
+            if (i == 0)
+                first_failure = f.clock + 1000; // the fake clock steps 1000 per read; `now` is the first
+            CHECK_THROWS_AS(tick(t.db, *src), IncompleteCaptureError);
+        }
+    }
+    CHECK(ql("SELECT COUNT(*) FROM registry_live WHERE record_key LIKE 'gap:commit_stalled:%'")
+              .rows.at(0).at(0) == "0"); // nothing was committed while it failed
+
+    // The trap is gone: the next tick commits the loss it re-derived and the stall window.
+    f.clock += 10 * SEC;
+    const std::int64_t recovered = f.clock + 1000;
+    const auto before = read_cursor(t.db).tick;
+    tick(t.db, *src);
+    CHECK(read_cursor(t.db).tick == before + 1); // the status keys and cursor moved again
+    const auto stalled =
+        ql("SELECT record_key FROM registry_live WHERE record_key LIKE 'gap:commit_stalled:%'");
+    REQUIRE(stalled.rows.size() == 1);
+    CHECK(stalled.rows[0][0] ==
+          std::format("gap:commit_stalled:commit:{}:{}", first_failure, recovered));
+    CHECK(ql("SELECT COUNT(*) FROM registry_live WHERE action = 'capture_gap'")
+              .rows.at(0).at(0) == "2"); // the loss row and the stall row
+
+    // The window is consumed: a later commit adds no second stall row.
+    f.clock += 10 * SEC;
+    tick(t.db, *src);
+    CHECK(ql("SELECT COUNT(*) FROM registry_live WHERE record_key LIKE 'gap:commit_stalled:%'")
+              .rows.at(0).at(0) == "1");
+}
+
+TEST_CASE("registry source: a commit that never failed records no commit stalled gap",
+          "[echo][registry][lifecycle]") {
+    auto t = make_db();
+    Fake f;
+    auto src = make_registry_cursor_source(scope1(), f.reader());
+    f.reads[kRoot] = svc(1);
+    REQUIRE(tick(t.db, *src).outcome == CursorOutcome::Baseline);
+    for (int i = 0; i < 3; ++i) {
+        f.clock += 10 * SEC;
+        f.loss.events_lost += 1;
+        tick(t.db, *src);
+    }
+    CHECK(ql("SELECT COUNT(*) FROM registry_live WHERE action = 'capture_gap'")
+              .rows.at(0).at(0) == "3"); // the three loss rows
+    CHECK(ql("SELECT COUNT(*) FROM registry_live WHERE record_key LIKE 'gap:commit_stalled:%'")
+              .rows.at(0).at(0) == "0");
+}
+
 TEST_CASE("walk_enumeration: only the end of the list completes a walk and an error is a failed "
           "read and never a short list",
           "[echo][registry]") {

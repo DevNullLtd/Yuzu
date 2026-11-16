@@ -334,6 +334,12 @@ private:
     std::int64_t events_since_{0}; // the buffer holds nothing from before this instant (0 = n/a)
     bool was_disabled_{false};
 
+    // `now` of the first tick whose commit failed since the last commit, in the reader's
+    // clock. The next collect that commits records the window as one `commit_stalled` gap row
+    // in the same atomic commit, then clears it. In memory only: a restart during the failure
+    // loses it (the restart gap row is then the only record).
+    std::optional<std::int64_t> commit_failing_since_;
+
     std::vector<std::string> armed_roots_;
     // The last profile discovery was incomplete (warn once per transition).
     bool offline_incomplete_{false};

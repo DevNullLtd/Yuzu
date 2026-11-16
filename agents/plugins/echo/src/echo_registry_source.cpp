@@ -620,14 +620,29 @@ CursorCollectResult RegistryCursorSource::collect(EchoDatabase& db,
         age_loss_epochs(epochs, floor);
         cur.loss = std::move(epochs);
 
+        // The commit failed on an earlier tick: log-based sources replay from an unchanged
+        // cursor and lose nothing, but this source's loss accounting and held candidates are
+        // re-derived, so record the window it was stuck for. The window is in the key (cursor
+        // rule 3b), so a replay of this same commit stays the same row.
+        if (commit_failing_since_)
+            rows.push_back(registry_gap_row(
+               "commit_stalled", std::format("commit:{}:{}", *commit_failing_since_, now),
+               "gap:commit_stalled: the registry event/cursor commit failed on earlier ticks; "
+               "changes made in the window were read late and their writers may not have been "
+               "observed",
+               now, snapshot_id));
+
         const std::string new_cursor = encode_registry_cursor(cur);
         if (auto ins = db.insert_registry_events_and_cursor(rows, new_cursor, state_writes); !ins) {
             if (ins.error() == EchoDatabase::CursorInsertError::KeyCollision)
                 spdlog::critical("Echo registry: record_key COLLISION -- a persisted field is "
                                  "not deterministically re-derivable (echo_cursor.hpp rule 3a). "
                                  "Capture is STUCK and retrying cannot clear it.");
+            if (!commit_failing_since_)
+                commit_failing_since_ = now;
             throw IncompleteCaptureError("Echo registry: event/cursor commit failed");
         }
+        commit_failing_since_.reset();
         rb.active = false; // committed: the dirty flags stay consumed
         if (reader_.committed)
             reader_.committed(rows);

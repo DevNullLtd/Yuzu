@@ -220,6 +220,20 @@ path, value name, data type, data, data size, the previous type, data and size, 
 -- never `ts`, `actor_pid`, `actor_image` or `detail`. An empty or NUL-bearing `record_key`
 refuses the batch.
 
+The cursor driver (`collect_slow_impl`, `echo_plugin.cpp`) backs off a source whose ticks keep
+failing (`CursorRetry`, `echo_cursor.hpp`). After the n-th consecutive failed tick (a cursor read
+failure, `IncompleteCaptureError` or any other exception) the source is next attempted
+`slow_interval x min(2^(n-1), 12)` later, less half a tick of slack so jitter cannot cost a whole
+extra tick. The order per source is enable gate, backoff check, cursor read, collect. A skipped
+tick writes `echo|collect_<src>|0|retry_backoff`, adds the source to `skipped_sources`, and is NOT
+recorded in the health ledger; `status` shows `config|<src>_next_retry_at|<epoch>` for as long as
+it lasts. Any tick that returns ends the backoff, `CursorLost` included (the source has committed a
+re-baseline and there is nothing to re-read). The enable gate drops the record, so a pause or
+re-enable never inherits one. The state is in memory: a restart retries at once. Log-based sources
+replay from an unchanged cursor and lose nothing; `registry` re-derives its loss accounting, so its
+next committed tick after commit failures also writes one `gap:commit_stalled` row whose key carries
+the window (rule 3b), unless a restart intervened.
+
 **Event times are trusted as given.** A bucket comes from the event's own UTC stamp: no clamp, no
 counter. Accepted residual: a stamp inside the representable domain but far in the future makes a
 bucket only age-based eviction removes. The one refusal is a stamp outside 0001-01-01 ..
