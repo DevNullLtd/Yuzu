@@ -2784,6 +2784,61 @@ TEST_CASE("AuthRoutes::audit_as_session_fn stamps the session it is handed, the 
     }
 }
 
+// #6079 PR 2c: AuthRoutes::audit_event_for_session_fn builds the identity half of a session-bound
+// audit row WITHOUT writing it, for the owner that persists the row inside its own transaction.
+// The same fields audit_as_session_fn stamps: pinned here, since every route test substitutes its own.
+TEST_CASE("AuthRoutes::audit_event_for_session_fn builds the session-bound row without writing it",
+          "[pg][auth_routes][audit]") {
+    AuthRoutesFixture fix;
+    yuzu::test::PostgresTestDb audit_db{admin_gate_table_audit_tpl};
+    REQUIRE(audit_db.available());
+    pg::PgPool audit_pool{{.conninfo = audit_db.dsn(), .size = 2}};
+    AuditStore audit_store{audit_pool};
+    REQUIRE(audit_store.is_open());
+    AuthRoutes ar{fix.cfg, fix.auth_mgr, /*rbac_store=*/nullptr, fix.api_tokens.get(),
+                  &audit_store, /*mgmt_group_store=*/nullptr, /*tag_store=*/nullptr,
+                  fix.analytics.get(), fix.oidc_mu, fix.oidc_provider};
+    const auto build = ar.audit_event_for_session_fn();
+    httplib::Request req;
+    req.remote_addr = "10.1.2.3";
+    req.set_header("User-Agent", "audit-template-test/1");
+
+    SECTION("a human session: principal, the role passed in, target fields, request fields; the "
+            "detail is left for the caller") {
+        auth::Session s;
+        s.username = "alice";
+        s.role = auth::Role::user;
+        const auto e = build(req, s, "admin", "mfa.disabled", "ok", "User", "alice");
+        CHECK(e.principal == "alice");
+        CHECK(e.principal_role == "admin");
+        CHECK(e.action == "mfa.disabled");
+        CHECK(e.result == "ok");
+        CHECK(e.target_type == "User");
+        CHECK(e.target_id == "alice");
+        CHECK(e.detail.empty());
+        CHECK(e.source_ip == "10.1.2.3");
+        CHECK(e.user_agent == "audit-template-test/1");
+        CHECK(e.principal_class != "engine");
+    }
+    SECTION("an engine session carries the engine class") {
+        auth::Session s;
+        s.username = "engine:ci";
+        s.role = auth::Role::user;
+        s.principal_kind = "engine";
+        CHECK(build(req, s, "user", "x.y", "ok", "User", "u").principal_class == "engine");
+    }
+    SECTION("nothing is written: building a template does not touch the store") {
+        auth::Session s;
+        s.username = "alice";
+        (void)build(req, s, "admin", "mfa.disabled", "ok", "User", "alice");
+        AuditQuery q;
+        q.action = "mfa.disabled";
+        auto rows = audit_store.query(q);
+        REQUIRE(rows.has_value());
+        CHECK(rows->empty());
+    }
+}
+
 // The shared capture helper nests: stopping an inner capture restores the OUTER one as the default
 // logger (not null), and neither leaves its registry entry behind (a registered capture logger's
 // sink references a stream that dies with the capture).

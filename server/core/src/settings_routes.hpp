@@ -173,6 +173,20 @@ public:
         const std::string& target_id, const std::string& detail)>;
     void set_audit_as_session_fn(AuditAsSessionFn fn) { audit_as_session_fn_ = std::move(fn); }
 
+    /// The identity half of an audit row for a session the handler already resolved, built
+    /// WITHOUT writing it (#6079 PR 2c): `mfa.disable` hands it to `MfaDisableOwner` as the
+    /// outcome-row template, which the owner persists inside its own transaction. Same
+    /// `std::function` type as `AuthRoutes::AuditEventForSessionFn`; server.cpp binds
+    /// `AuthRoutes::audit_event_for_session_fn()`. Left unset the disable route answers 503 and
+    /// changes nothing (the outcome row could not be built, so the clear cannot run).
+    using AuditEventForSessionFn = std::function<AuditEvent(
+        const httplib::Request&, const auth::Session&, const std::string& principal_role,
+        const std::string& action, const std::string& result, const std::string& target_type,
+        const std::string& target_id)>;
+    void set_audit_event_for_session_fn(AuditEventForSessionFn fn) {
+        audit_event_for_session_fn_ = std::move(fn);
+    }
+
     /// The gate for POST /api/settings/mfa/recovery-codes and POST /api/settings/mfa/disable
     /// (#6079): they call it INSTEAD of `step_up_fn`, because they need the admitted factor
     /// generation, not just a verdict. server.cpp wires it from `run_in_handler_step_up` with the
@@ -470,6 +484,7 @@ private:
     }
     AuditFn audit_fn_;
     AuditAsSessionFn audit_as_session_fn_;
+    AuditEventForSessionFn audit_event_for_session_fn_;
     AuditReadFn audit_read_fn_; // #4028 — fail-closed REST audit hook, see AuditReadFn doc comment
     std::function<void()> dex_alert_apply_fn_; // F1 live-apply hook (may be empty)
     std::optional<DexScorePolicyWriteDeps> dex_score_policy_writer_; // Scoring tab; see setter

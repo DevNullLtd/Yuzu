@@ -9,6 +9,7 @@
 #include "session_store.hpp"  // HA WS-1/1a — durable operator sessions (ADR-2002 §4)
 #include "rbac_store.hpp"                // #4966: the last-Administrator guard (deactivate_account / set_local_role)
 #include "credential_change_owner.hpp" // #5342 — the one-transaction credential change
+#include "mfa_disable_owner.hpp"        // #6079 PR 2c: the one-transaction MFA factor clear
 
 #include <spdlog/spdlog.h>
 
@@ -2762,6 +2763,33 @@ AuthManager::commit_password_change(const yuzu::server::CredentialChangeRequest&
         it->second.salt_hex = request.new_salt_hex;
     }
     drop_cached_user_sessions_locked(request.username);
+    return outcome;
+}
+
+// ── MFA factor clear (#6079 PR 2c) ──────────────────────────────────────────
+
+yuzu::server::MfaDisableOutcome
+AuthManager::commit_mfa_disable(const yuzu::server::MfaDisableRequest& request) {
+    // No owner (cfg-file-only mode, or a server wired without Postgres): there is
+    // no durable factor to clear. Fail closed, never pretend; nothing is written.
+    // (A default outcome is kStoreUnavailable.)
+    if (!mfa_disable_owner_)
+        return yuzu::server::MfaDisableOutcome{};
+    // The ONE transaction (mfa_disable_owner.hpp). No mu_ is held across it, same
+    // discipline as commit_password_change.
+    auto outcome = mfa_disable_owner_->commit(request);
+    if (outcome.result != yuzu::server::MfaDisableResult::kOk)
+        return outcome;
+    // Post-commit cache work only: the durable session rows were already deleted
+    // (and the write-generation bumped) inside the transaction, so this is NOT a
+    // second durable wipe. Drop this replica's in-memory sessions of the account
+    // unless the owner skipped the session delete (an un-enrolled account under
+    // `end_sessions_if_not_enrolled = false`), where those sessions stay valid.
+    // users_ carries no MFA state, so nothing else is cached here.
+    if (outcome.was_enrolled || request.end_sessions_if_not_enrolled) {
+        std::unique_lock lock(mu_);
+        drop_cached_user_sessions_locked(request.username);
+    }
     return outcome;
 }
 

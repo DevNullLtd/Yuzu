@@ -40,6 +40,7 @@
 #include "session_store.hpp" // LocalMfaProof: the enrolment's verified {generation, instant} (#6079)
 #include "step_up_gate.hpp" // StepUpVerdict / render_step_up_refusal: the unwired factor-credential gate (#6079)
 #include "tag_store.hpp" // F2a PR3: TagStore::validate_key for the cohort export key
+#include "mfa_disable_owner.hpp" // #6079 PR 2c: MfaDisableRequest/Result (the Settings disable)
 #include "mfa_qr.hpp"
 #include "password_policy.hpp" // #5342 — the ONE local password length policy
 #include "plugin_signing_helpers.hpp"
@@ -8500,9 +8501,11 @@ void SettingsRoutes::register_routes(
                       return;
                   }
                   // Two rows per disable: an INTENT row ("attempted") written BEFORE the factor is
-                  // touched, and an OUTCOME row after. The outcome row is written AFTER the actor's
-                  // own session is deleted, so both are attributed to the session already
-                  // resolved, not re-resolved from the cookie. Order them by the audit `id`.
+                  // touched, and an OUTCOME row after (written by `MfaDisableOwner` inside the
+                  // clear's own transaction on success, by this handler for denied/error). The
+                  // outcome row is written AFTER the actor's own session is deleted, so both are
+                  // attributed to the session already resolved, not re-resolved from the cookie.
+                  // Order them by the audit `id`.
                   // Returns whether the row persisted; the unwired fallback (tests, other callers)
                   // is a void writer and reports true, so only the production binding can refuse.
                   const auto audit = [&](const char* result, const std::string& detail) -> bool {
@@ -8513,12 +8516,9 @@ void SettingsRoutes::register_routes(
                       audit_fn_(req, "mfa.disabled", result, "User", session->username, detail);
                       return true;
                   };
-                  // Fail closed on the intent row: an MFA clear that cannot be recorded does not
-                  // happen. Nothing has been cleared and no session has been ended.
-                  if (!audit("attempted", "MFA clear requested via Settings")) {
-                      spdlog::error("mfa.disabled: the audit store did not accept the intent row "
-                                    "for '{}'; MFA was NOT changed",
-                                    log_safe(session->username));
+                  // The audit-unavailable answer, shared by the intent row below and the owner's
+                  // outcome row: 503 + `Sec-Audit-Failed`, MFA untouched.
+                  const auto refuse_audit_unavailable = [&] {
                       res.status = 503;
                       res.set_header("Retry-After", "5");
                       res.set_header("Sec-Audit-Failed", "true");
@@ -8531,15 +8531,16 @@ void SettingsRoutes::register_routes(
                           render_mfa_fragment(*session, {}, {}, {}, {},
                                               "Audit store unavailable; MFA was not changed."),
                           "text/html; charset=utf-8");
+                  };
+                  // Fail closed on the intent row: an MFA clear that cannot be recorded does not
+                  // happen. Nothing has been cleared and no session has been ended.
+                  if (!audit("attempted", "MFA clear requested via Settings")) {
+                      spdlog::error("mfa.disabled: the audit store did not accept the intent row "
+                                    "for '{}'; MFA was NOT changed",
+                                    log_safe(session->username));
+                      refuse_audit_unavailable();
                       return;
                   }
-                  // The clear has no undo, so a lost OUTCOME row cannot stop it; it is logged.
-                  const auto audit_outcome = [&](const char* result, const std::string& detail) {
-                      if (!audit(result, detail))
-                          spdlog::error("mfa.disabled: MFA cleared for '{}' but the outcome audit "
-                                        "row failed to persist",
-                                        log_safe(session->username));
-                  };
                   // Same exit as logout: drop the cookie and send the browser to the landing page.
                   const auto sign_out = [&] {
                       res.set_header("Set-Cookie",
@@ -8547,68 +8548,88 @@ void SettingsRoutes::register_routes(
                       res.set_header("HX-Redirect", "/home");
                       res.set_content("", "text/plain");
                   };
-                  // The pre-image comes from the clear's own row lock, so it cannot miss an
-                  // enrolment verified in between. A failed clear leaves it unknown, which counts
-                  // as enrolled: the fail-safe is to end sessions.
+                  // #6079 PR 2c: the factor clear, the end of EVERY durable session of the account
+                  // (the caller's included: any of them may hold an MFA proof made under the factor
+                  // just cleared, so the user signs in again) and the OUTCOME audit row commit or
+                  // abort TOGETHER in `MfaDisableOwner`'s one transaction. The `attempted` row above
+                  // stays the caller's: it is written first and stops the clear if it cannot be
+                  // stored. There is no `partial` outcome any more (a clear whose sessions could
+                  // not be ended rolls back whole), and a lost outcome row now fails the clear
+                  // closed instead of being logged after the fact.
+                  if (!audit_event_for_session_fn_) {
+                      // The outcome row cannot be built, so the clear cannot run.
+                      spdlog::error("mfa.disabled: no outcome-row builder wired for '{}'; MFA was "
+                                    "NOT changed",
+                                    log_safe(session->username));
+                      refuse_audit_unavailable();
+                      return;
+                  }
+                  yuzu::server::MfaDisableRequest clear;
+                  clear.username = session->username;
+                  clear.expected_factor_gen = admission->factor_gen;
+                  // action, result and identity are the caller's; the owner completes only the
+                  // detail (empty template: `sessions_ended=<n>`, the text the success row has
+                  // always carried).
+                  clear.audit_template = audit_event_for_session_fn_(
+                      req, *session, auth::role_to_string(auth::effective_role(*session)),
+                      "mfa.disabled", "ok", "User", session->username);
+                  // Cancelling an enrolment that never completed clears no usable factor, so no
+                  // proof can predate one: nothing to end, and the row says so.
+                  clear.end_sessions_if_not_enrolled = false;
+                  clear.detail_if_not_enrolled = "no verified factor to clear";
                   if (factor_credential_barrier_)
                       factor_credential_barrier_("disable");
-                  auto r = db->mfa_disable_report(session->username, admission->factor_gen);
-                  if (!r && r.error() == AuthDBError::FactorChanged) {
+                  const auto outcome = auth_mgr_->commit_mfa_disable(clear);
+                  switch (outcome.result) {
+                  case yuzu::server::MfaDisableResult::kOk:
+                      // The outcome row is already committed with the clear.
+                      if (!outcome.was_enrolled) {
+                          res.set_content(render_mfa_fragment(*session),
+                                          "text/html; charset=utf-8");
+                          return;
+                      }
+                      sign_out();
+                      return;
+                  case yuzu::server::MfaDisableResult::kFactorChanged:
                       // The factor changed after the gate admitted this request (an enrolled
                       // account rotated, or an un-enrolled one finished enrolling): nothing was
                       // cleared and no session ends. The session may be legitimate after a
-                      // re-prove.
+                      // re-prove. The transaction wrote nothing, so the row is the caller's.
                       audit("denied", std::format("reason=factor_changed expected_gen={}",
                                                   admission->factor_gen));
                       respond_mfa_factor_changed(res, *session, "disable");
                       return;
-                  }
-                  if (!r) {
-                      // The clear may have committed with its acknowledgement lost, so the
-                      // sessions end anyway (#6079).
-                      const auto ended = auth_mgr_->invalidate_user_sessions(session->username);
-                      audit_outcome("error", "disable failed (sessions_ended=" +
-                                                 (ended.db_persisted ? std::to_string(ended.count)
-                                                                     : std::string("failed")) +
-                                                 ")");
-                      if (ended.db_persisted) {
-                          sign_out();
-                          return;
-                      }
-                      // Neither the clear nor the delete is confirmed: say the state is unknown.
-                      res.set_content(
-                          render_mfa_fragment(
-                              *session, {}, {}, {}, {},
-                              "Could not confirm MFA was disabled, and the account's sessions "
-                              "could not be ended. Its state is unknown: ask an administrator "
-                              "to check it and end the sessions."),
-                          "text/html; charset=utf-8");
+                  case yuzu::server::MfaDisableResult::kAuditUnavailable:
+                      // The outcome row could not be written, so the whole clear rolled back.
+                      spdlog::error("mfa.disabled: the audit store did not accept the outcome row "
+                                    "for '{}'; MFA was NOT changed",
+                                    log_safe(session->username));
+                      refuse_audit_unavailable();
                       return;
+                  case yuzu::server::MfaDisableResult::kNotFound:
+                  case yuzu::server::MfaDisableResult::kStoreUnavailable:
+                      break;
                   }
-                  const bool had_factor = *r;
-                  // Cancelling an enrolment that never completed clears no usable factor, so no
-                  // proof can predate one: nothing to end.
-                  if (!had_factor) {
-                      audit_outcome("ok", "no verified factor to clear");
-                      res.set_content(render_mfa_fragment(*session), "text/html; charset=utf-8");
-                      return;
+                  // No active row (the account went away mid-request) or a store fault: the
+                  // transaction rolled back, so the factor and the sessions are unchanged (barring
+                  // a connection lost at COMMIT, which commits all of it). The `error` row is the
+                  // caller's: the transaction wrote none.
+                  if (!audit("error", "disable failed")) {
+                      spdlog::error("mfa.disabled: MFA was not changed for '{}' and the error "
+                                    "audit row failed to persist",
+                                    log_safe(session->username));
                   }
-                  // End EVERY session of the account, the caller's included (#6079): any of them
-                  // may hold an MFA proof made under the factor just cleared. The user signs in
-                  // again; a kept session would be a surviving proof we could not tell apart.
-                  const auto ended = auth_mgr_->invalidate_user_sessions(session->username);
-                  if (!ended.db_persisted) {
-                      audit_outcome("partial", "sessions_ended=failed");
-                      res.set_content(
-                          render_mfa_fragment(
-                              *session, {}, {}, {}, {},
-                              "MFA was disabled, but the account's sessions could not be ended. "
-                              "Ask an administrator to end them."),
-                          "text/html; charset=utf-8");
-                      return;
-                  }
-                  audit_outcome("ok", std::format("sessions_ended={}", ended.count));
-                  sign_out();
+                  res.status = 503;
+                  res.set_header("Retry-After", "5");
+                  // /settings swaps no 5xx body, so the toast tells the operator on the main page.
+                  res.set_header("HX-Trigger",
+                                 R"({"showToast":{"message":"Could not disable MFA; it was )"
+                                 R"(not changed. Try again.","level":"error"}})");
+                  res.set_content(
+                      render_mfa_fragment(*session, {}, {}, {}, {},
+                                          "Could not disable MFA. It was not changed; try again. "
+                                          "If you were signed out, sign in and check its state."),
+                      "text/html; charset=utf-8");
               });
 }
 

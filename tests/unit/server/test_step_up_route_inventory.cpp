@@ -763,15 +763,21 @@ TEST_CASE("step-up route inventory (lexical): kRequired labels equal the in-hand
 // the rows the chokepoint evaluates with the approver window, no hatch, the local-session-only rule
 // and the admitted-generation carry. A third caller (a new route, a refactored helper) would
 // mutate a factor under a weaker gate, so it fails here until it is a kFactorCredential row too.
-// `--mfa-reset` (main.cpp) is break-glass with no session and calls `mfa_disable`, which this scan
-// does not match. LEXICAL: a call spelled `->name(` or `.name(` outside auth_db.cpp.
+// Since #6079 PR 2c the Settings disable clears the factor through `AuthManager::commit_mfa_disable`
+// (the one-transaction `MfaDisableOwner`), so that is the call matched for it; the AuthDB clears
+// (`mfa_disable_report` and `mfa_disable`) have NO production caller outside auth_db.cpp any more,
+// and are listed so one that reappears fails here. `--mfa-reset` (main.cpp) is break-glass with no
+// session: it drives the owner directly, which this member-call scan cannot see, so the companion
+// test below pins which files may include the owner's header at all. LEXICAL: a call spelled
+// `->name(` or `.name(` outside auth_db.cpp.
 TEST_CASE("step-up route inventory (lexical): only the two kFactorCredential handlers mutate a "
           "second factor",
           "[stepup][inventory][factor_credential]") {
     namespace text_scan = ::yuzu::test::source_scan;
     namespace linear = ::yuzu::test::route_scan;
-    constexpr std::array<std::string_view, 2> kMutations{"mfa_regenerate_recovery_codes",
-                                                         "mfa_disable_report"};
+    constexpr std::array<std::string_view, 4> kMutations{"mfa_regenerate_recovery_codes",
+                                                         "commit_mfa_disable", "mfa_disable_report",
+                                                         "mfa_disable"};
 
     // A call spelled `->name(` or `.name(`, spaces allowed on either side of the name; true when
     // `name` starts at `at` in `text`.
@@ -816,11 +822,53 @@ TEST_CASE("step-up route inventory (lexical): only the two kFactorCredential han
         }
     }
     INFO("calls found:\n" << join(callers));
-    // Both mutations are called, exactly once each, so the scan cannot pass vacuously.
+    // The recovery-code regeneration and the owner-backed disable are each called exactly once
+    // (the AuthDB clears are not called at all), so the scan cannot pass vacuously.
     CHECK(callers.size() == 2);
+    int regenerate = 0, disable = 0;
+    for (const auto& c : callers) {
+        if (c.ends_with(" mfa_regenerate_recovery_codes"))
+            ++regenerate;
+        if (c.ends_with(" commit_mfa_disable"))
+            ++disable;
+    }
+    CHECK(regenerate == 1);
+    CHECK(disable == 1);
     INFO("mutation call sites that are not inside a kFactorCredential handler:\n"
          << join(not_a_factor_credential_row));
     CHECK(not_a_factor_credential_row.empty());
+}
+
+// Every path that clears a second factor is accounted for (#6079 PR 2c). `MfaDisableOwner` is the
+// only code that clears one for the Settings disable and the break-glass CLI, and a class cannot be
+// used without its header: the files that include it are the owner itself, the manager that
+// delegates to it, the wiring in server.cpp, the Settings disable handler and the `--mfa-reset`
+// one-shot. A new includer is a new factor-clearing path and fails here until it is reviewed and
+// added, with its own gate, to this list.
+TEST_CASE("step-up route inventory (lexical): only the reviewed files include MfaDisableOwner",
+          "[stepup][inventory][factor_credential]") {
+    const std::set<std::string> allowed{"mfa_disable_owner.cpp", "mfa_disable_owner.hpp", "auth.cpp",
+                                        "server.cpp",            "settings_routes.cpp",    "main.cpp"};
+    const std::filesystem::path dir(YUZU_SERVER_SRC_DIR);
+    std::set<std::string> found;
+    std::vector<std::string> unexpected;
+    const auto scan_files = [&](const std::vector<std::pair<std::string, std::string>>& files) {
+        for (const auto& [file, text] : files) {
+            if (text.find("#include \"mfa_disable_owner.hpp\"") == std::string::npos)
+                continue;
+            found.insert(file);
+            if (!allowed.contains(file))
+                unexpected.push_back(file);
+        }
+    };
+    scan_files(scan::read_all_cpp_files(dir));
+    scan_files(scan::read_all_header_files(dir));
+    INFO("files including mfa_disable_owner.hpp that are not on the reviewed list:\n"
+         << join(unexpected));
+    CHECK(unexpected.empty());
+    // The scan cannot pass vacuously: the break-glass CLI and the Settings handler both include it.
+    CHECK(found.contains("main.cpp"));
+    CHECK(found.contains("settings_routes.cpp"));
 }
 
 // -- L4: the boot sweep's refusal decision -----------------------------------------------------

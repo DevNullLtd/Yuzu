@@ -59,6 +59,9 @@ class CredentialChangeOwner;    // credential_change_owner.hpp — #5342 one-tra
 class RbacStore;                // rbac_store.hpp, #4966 last-Administrator guard for account lifecycle
 struct CredentialChangeRequest; // credential_change_owner.hpp
 struct CredentialChangeOutcome; // credential_change_owner.hpp
+class MfaDisableOwner;          // mfa_disable_owner.hpp: #6079 PR 2c one-transaction MFA factor clear
+struct MfaDisableRequest;       // mfa_disable_owner.hpp
+struct MfaDisableOutcome;       // mfa_disable_owner.hpp
 } // namespace yuzu::server
 
 namespace yuzu::server::auth {
@@ -1203,6 +1206,26 @@ public:
     [[nodiscard]] CredentialChangeOutcome
     commit_password_change(const CredentialChangeRequest& request);
 
+    /// Wire the #6079 PR 2c MFA-disable query owner (server.cpp, built beside the
+    /// credential-change owner on the same pool and audit store). Null (the
+    /// default, and cfg-file-only mode) ⇒ `commit_mfa_disable` answers
+    /// `kStoreUnavailable` and writes nothing. The owner must outlive every call;
+    /// server.cpp nulls this at teardown before the owner destructs. Set during
+    /// single-threaded startup only.
+    void set_mfa_disable_owner(MfaDisableOwner* owner) noexcept { mfa_disable_owner_ = owner; }
+
+    /// The ONE local-account factor clear for the Settings disable route (#6079
+    /// PR 2c). Delegates to `MfaDisableOwner::commit`: the factor clear, every
+    /// durable session of the account and the OUTCOME audit row commit or abort
+    /// together in one transaction under the `auth.users` row lock (see
+    /// mfa_disable_owner.hpp). On `kOk` only, AFTER the commit and outside every
+    /// lock it took, drops this process's in-memory `sessions_` entries of the
+    /// account (the durable rows were already deleted in the transaction and the
+    /// bumped write-generation makes every OTHER replica drop its cached copies;
+    /// this is NOT a second durable wipe). Caller must NOT hold `mu_` or any
+    /// database lock.
+    [[nodiscard]] MfaDisableOutcome commit_mfa_disable(const MfaDisableRequest& request);
+
     /// #5274 boot signal (#5342 Gate 7): with AuthDB wired, `yuzu-server.cfg`
     /// is seed-only and the stored credential always wins. Compares every
     /// cfg-seeded `users_` entry against its `auth.users` row and, for each
@@ -1846,6 +1869,10 @@ private:
     /// #5342: the credential-change query owner (`set_credential_change_owner`).
     /// Borrowed, never owned; null ⇒ no credential writes.
     CredentialChangeOwner* credential_change_owner_{nullptr};
+
+    /// #6079 PR 2c: the MFA-disable query owner (`set_mfa_disable_owner`).
+    /// Borrowed, never owned; null ⇒ no factor clears.
+    MfaDisableOwner* mfa_disable_owner_{nullptr};
 
     /// #4966: the last-Administrator guard (`set_rbac_store`). Borrowed, never owned.
     yuzu::server::RbacStore* rbac_store_{nullptr};
