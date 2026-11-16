@@ -978,7 +978,7 @@ TEST_CASE("Echo default-on: the first disable of any source is a real transition
     CHECK(db.get_config("module_paused_at", "x") == "0");
 }
 
-TEST_CASE("Echo retention: a corrupt/errored _enabled value preserves rows, never prunes (#560)",
+TEST_CASE("Echo retention: an errored _enabled value on a paused source preserves rows (#560)",
           "[echo][retention][source-lifecycle]") {
     yuzu::echo::RetentionGuardState guard;
     // The collect-time gate (source_enabled) fails closed on a non-canonical
@@ -1000,7 +1000,9 @@ TEST_CASE("Echo retention: a corrupt/errored _enabled value preserves rows, neve
     REQUIRE(db.set_config("retention_guard_last_pass", std::to_string(t_now)));
 
     // A value the plugin never writes — canonical_source_enabled => "errored".
+    // It was paused when it went bad (paused_at > 0), so the hold survives (#1572).
     db.set_config("process_enabled", "maybe");
+    REQUIRE(db.set_config("process_paused_at", std::to_string(t_now - 100)));
     REQUIRE(canonical_source_enabled(db.get_config("process_enabled", "true")) == "errored");
     // tcp_enabled left at default => "true" (actively, validly enabled).
     run_retention(db, t_now, guard);
@@ -1009,6 +1011,79 @@ TEST_CASE("Echo retention: a corrupt/errored _enabled value preserves rows, neve
     auto tcp_remaining = row_count(db, "tcp_hourly");
     CHECK(tcp_remaining > 0); // enabled => aged normally
     CHECK(tcp_remaining < 48);
+}
+
+// Fixture for the #1572 cases: process errored with the given paused_at (nullopt = unset), tcp
+// enabled as the control. Returns the process rows left after one retention pass.
+namespace {
+int64_t errored_process_rows_after_retention(const char* tag, std::optional<std::string> paused_at) {
+    yuzu::echo::RetentionGuardState guard;
+    yuzu::test::TempDbFile tmp{std::string_view{tag}};
+    auto opened = EchoDatabase::open(tmp.path);
+    REQUIRE(opened.has_value());
+    EchoDatabase db = std::move(*opened);
+    REQUIRE(db.create_warehouse_tables());
+    const int64_t t_now = 1'735'689'600 + kHourlyCutoffSec;
+    seed_process_hourly(db, t_now);
+    seed_tcp_hourly(db, t_now);
+    REQUIRE(db.set_config("retention_guard_last_pass", std::to_string(t_now)));
+    REQUIRE(db.set_config("process_enabled", "maybe"));
+    if (paused_at)
+        REQUIRE(db.set_config("process_paused_at", *paused_at));
+    run_retention(db, t_now, guard);
+    CHECK(row_count(db, "tcp_hourly") < 48); // control: the pass ran and pruned
+    return row_count(db, "process_hourly");
+}
+} // namespace
+
+TEST_CASE("Echo retention: an errored source that was never paused loses rows past its retention",
+          "[echo][retention][source-lifecycle][issue1572]") {
+    CHECK(errored_process_rows_after_retention("yuzu_test_echo_1572_unset_", std::nullopt) < 48);
+    CHECK(errored_process_rows_after_retention("yuzu_test_echo_1572_zero_", "0") < 48);
+}
+
+TEST_CASE("Echo retention: an errored source that was paused when its flag went bad keeps its rows",
+          "[echo][retention][source-lifecycle][issue1572]") {
+    CHECK(errored_process_rows_after_retention("yuzu_test_echo_1572_paused_", "1735000000") == 48);
+}
+
+TEST_CASE("Echo retention: an errored source with a malformed paused_at keeps its rows",
+          "[echo][retention][source-lifecycle][issue1572]") {
+    for (const char* bad : {"abc", "-1", "12x", "", "99999999999999999999"})
+        CHECK(errored_process_rows_after_retention("yuzu_test_echo_1572_bad_", bad) == 48);
+}
+
+TEST_CASE("Echo retention: an errored source whose paused_at cannot be read keeps its rows",
+          "[echo][retention][source-lifecycle][fail-closed][issue1572]") {
+    yuzu::echo::RetentionGuardState guard;
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_echo_1572_unreadable_"}};
+    auto opened = EchoDatabase::open(tmp.path);
+    REQUIRE(opened.has_value());
+    EchoDatabase db = std::move(*opened);
+    REQUIRE(db.create_warehouse_tables());
+    const int64_t t_now = 1'735'689'600 + kHourlyCutoffSec;
+    seed_process_hourly(db, t_now);
+    REQUIRE(db.set_config("retention_guard_last_pass", std::to_string(t_now)));
+    REQUIRE(db.set_config("process_enabled", "maybe"));
+    make_config_key_unreadable(tmp.path, "process_paused_at");
+    REQUIRE(source_retention_exempt(db, "process"));
+    run_retention(db, t_now, guard);
+    CHECK(row_count(db, "process_hourly") == 48);
+}
+
+TEST_CASE("Echo retention: an absent flag follows the registry default, not an exemption",
+          "[echo][retention][source-lifecycle][issue1572]") {
+    // No registered source ships default-off today, so the default-off leg is exercised through
+    // source_default_enabled(): the helper must agree with it for every source with no flag.
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_echo_1572_default_"}};
+    auto opened = EchoDatabase::open(tmp.path);
+    REQUIRE(opened.has_value());
+    EchoDatabase db = std::move(*opened);
+    REQUIRE(db.create_warehouse_tables());
+    for (const auto& src : capture_sources())
+        CHECK(source_retention_exempt(db, src.name) == !source_default_enabled(src.name));
+    REQUIRE(db.set_config("tcp_enabled", "false")); // operator pause stays exempt
+    CHECK(source_retention_exempt(db, "tcp"));
 }
 
 TEST_CASE("Echo retention: an UNREADABLE enable flag preserves rows and never prunes (#560)",
@@ -1300,7 +1375,10 @@ TEST_CASE("Echo #2361: a disabled source with all-expired rows neither declines 
     seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 20);
 
     SECTION("paused") { f.db->set_config("process_enabled", "false"); }
-    SECTION("errored") { f.db->set_config("process_enabled", "maybe"); }
+    SECTION("errored while paused") {
+        f.db->set_config("process_enabled", "maybe");
+        f.db->set_config("process_paused_at", std::to_string(kT0 - 100));
+    }
 
     run_retention(*f.db, kT0, f.guard);
 
@@ -2754,13 +2832,27 @@ TEST_CASE("run_budget: paused and errored sources keep their hourly rows and an 
     // tcp paused, module errored (a value written outside the plugin), process enabled.
     REQUIRE(db.set_config("tcp_enabled", "false"));
     REQUIRE(db.set_config("module_enabled", "maybe"));
+    REQUIRE(db.set_config("module_paused_at", std::to_string(kBudgetNow - 100))); // paused first
 
     const auto res = run_budget(db, kBudgetNow, 0, kAlwaysTime);
     REQUIRE_FALSE(res.failed);
     CHECK(res.exhausted);
     CHECK(scalar(db, "SELECT COUNT(*) FROM tcp_hourly") == 3000);    // paused: untouched
-    CHECK(scalar(db, "SELECT COUNT(*) FROM module_hourly") == 2000); // errored: untouched
+    CHECK(scalar(db, "SELECT COUNT(*) FROM module_hourly") == 2000); // errored while paused
     CHECK(scalar(db, "SELECT COUNT(*) FROM process_hourly") == process_recent); // enabled: taken
+}
+
+TEST_CASE("run_budget: an errored source that was never paused is evictable (#1572)",
+          "[echo][aggregator][budget][issue1572]") {
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_budget_errored_unpaused_"};
+    auto db = open_budget_db(tmp);
+    seed_hourly_span(db, "module", 2000, kBudgetNow - 120 * 3600, kBudgetNow);
+    const int64_t recent = hourly_recent(db, "module");
+    REQUIRE(db.set_config("module_enabled", "maybe"));
+
+    const auto res = run_budget(db, kBudgetNow, 0, kAlwaysTime);
+    REQUIRE_FALSE(res.failed);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM module_hourly") == recent);
 }
 
 TEST_CASE("run_budget: the largest hourly table is taken first", "[echo][aggregator][budget]") {

@@ -384,6 +384,14 @@ bool scrub_process_baseline(EchoDatabase& db);
  */
 [[nodiscard]] bool source_enabled(EchoDatabase& db, std::string_view source);
 
+/**
+ * Retention/budget exemption (#1572): true when a source's rows must be preserved. A paused
+ * source ("false") and an unreadable flag are exempt. An "errored" flag is exempt only when
+ * `<source>_paused_at` is > 0, unreadable or malformed; absent or a fully parsed 0 means the
+ * source was never paused, so the normal retention ceiling and budget eviction apply.
+ */
+[[nodiscard]] bool source_retention_exempt(EchoDatabase& db, std::string_view source);
+
 // ── Byte budget (echo.db size cap) ────────────────────────────────────────────
 //
 // `db_budget_bytes` caps what echo.db holds: used pages plus the WAL file. The cap is HARD for
@@ -391,8 +399,8 @@ bool scrub_process_baseline(EchoDatabase& db);
 // journal_size_limit only truncates the WAL when a checkpoint resets it, and a long echo.sql
 // read on the read-only query connection can pin it, so data + WAL can sit above the budget
 // until that reader ends. Rows that are never evicted (the newest 48 h of hourly rows, 5 d for
-// per-app performance; daily and monthly rows; the usage tables and netqual_boot; paused or
-// errored sources) can hold used pages above the target. The overage is measured whenever
+// per-app performance; daily and monthly rows; the usage tables and netqual_boot; paused
+// sources and errored sources that were paused) can hold used pages above the target. The overage is measured whenever
 // `status` runs and surfaced as `budget_over_bytes`, never hidden.
 //
 // Only the HOURLY tier is ever evicted. There is no raw tier: the fold stores the roll-ups
@@ -442,7 +450,7 @@ struct BudgetPassResult {
  *
  * The oldest hourly bucket of the table holding the most rows goes first; an hourly row newer
  * than 48 h (5 d for procperf_hourly, kBudgetProcPerfHourlyFloorSec) is never eligible. Daily,
- * monthly, `usage_*` and netqual_boot are never touched. Paused and errored sources are exempt.
+ * monthly, `usage_*` and netqual_boot are never touched. Paused sources and errored-while-paused sources are exempt (source_retention_exempt).
  *
  * Each batch (kBudgetBatchRows) is one transaction that also bumps the persisted eviction
  * counter, so a crash never loses a count. `time_left` is consulted before every batch.
