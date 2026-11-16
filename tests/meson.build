@@ -1787,6 +1787,7 @@ if build_server
       'unit/server/test_device_routes.cpp',
       'unit/server/test_device_lens_routes.cpp', # ADR-0031 WS-A4 wave 2: DEX/Guardian device lenses (no public twin — outside the seam)
       'unit/server/test_hardware_list_model.cpp', # round-3: Hardware CI list/record pure model
+      'unit/server/test_bulk_ci_page_model.cpp', # bulk device-CI keyset page: params, cursor, scope walk, JSON
       'unit/server/test_quarantine_read_model.cpp', # Seam PR2: shared quarantine list JSON builder (key order, escaping)
       'unit/server/test_hardware_ui.cpp',         # round-3: Hardware CI list/record HTML fragment
       'unit/server/test_hardware_routes.cpp',     # round-3: Hardware CI list/record routes + REST twin
@@ -1909,6 +1910,9 @@ if build_server
       'unit/server/test_secret_column_registration_tripwire.cpp', # #2530 C3 — registered-column trip-wire
       'unit/server/test_key_provider.cpp',
       'unit/server/test_rest_mgmt_group_roles_floor.cpp', # #2376: the mgmt-group role graph needs the floored UserManagement:Read
+      'unit/server/test_rest_mgmt_group_audit_first.cpp', # #7074: REST group create, add member and remove member store their `attempted` audit row first
+      'unit/server/test_rest_mgmt_group_audit_real_auth.cpp', # #7074: the same routes through the production AuthRoutes + AuditStore wiring (no stub in the identity path)
+      'unit/server/test_mgmt_group_agent_known.cpp', # #6967/#7074: add member flags an unknown agent id (pure classification, no PG)
       'unit/server/test_mgmt_group_owner_gate.cpp', # owner-arm predicate: surface, token class, engine, grant rows (pure, no PG)
       'unit/server/test_rest_rbac_role_reads.cpp', # PR-0b: GET /rbac/roles + /rbac/roles/{role}/permissions fail closed (503) and 404 an unknown role
       'unit/server/test_rest_management_group_detail_degrade.cpp', # #1762 governance round-1: GET /management-groups/{id} fails closed on a degraded member read
@@ -5274,6 +5278,8 @@ test('gateway contract wrapper selftest', _python3_test,
   args: [files('test_gateway_contract.py')], suite: 'docs', timeout: 30)
 test('contract registry', _python3_test,
   args: [files('../scripts/test/contract-evidence.py'), 'check'], suite: 'docs', timeout: 30)
+test('contract evidence CI step', _python3_test,
+  args: [files('test_contract_evidence_ci_step.py')], suite: 'docs', timeout: 30)
 if get_option('build_contract_tests')
   _contract_adapter = files('../scripts/test/contract-evidence.py')
   test('contract.plugin.loader.reserved-name.reject', _python3_test,
