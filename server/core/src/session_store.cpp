@@ -23,6 +23,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <optional>
+#include <string_view>
 
 namespace yuzu::server {
 
@@ -102,18 +103,20 @@ SessionRow row_from(PGresult* res, int i) {
     row.mfa_verified_ms = to_i64(PQgetvalue(res, i, 12));
     row.elevated_until_ms = to_i64(PQgetvalue(res, i, 13));
     row.elevation_issued_ms = to_i64(PQgetvalue(res, i, 14));
+    row.mfa_factor_gen = to_i64(PQgetvalue(res, i, 15));
+    row.mfa_bind_seq = to_i64(PQgetvalue(res, i, 16));
     return row;
 }
 
 constexpr const char* kSelectCols =
     "token_hash, username, display_name, role, auth_source, oidc_sub, token_scope_service, "
     "mcp_tier, principal_kind, created_at_ms, expires_at_ms, last_activity_ms, mfa_verified_ms, "
-    "elevated_until_ms, elevation_issued_ms";
-// The 15 columns kSelectCols lists (indices 0..14 in row_from) — so find()'s
+    "elevated_until_ms, elevation_issued_ms, mfa_factor_gen, mfa_bind_seq";
+// The 17 columns kSelectCols lists (indices 0..16 in row_from); so find()'s
 // appended db_now expression lands at index kSessionRowColumns. Keep these two in
 // lockstep: a column added to kSelectCols/row_from MUST bump this, or the db_now
 // read shifts silently. find() also guards PQnfields at runtime as a backstop.
-constexpr int kSessionRowColumns = 15;
+constexpr int kSessionRowColumns = 17;
 
 // The DB clock at statement time, in wall-clock epoch-millis. `now()` is
 // transaction-start time and is STABLE within a txn, so every use inside one
@@ -121,12 +124,19 @@ constexpr int kSessionRowColumns = 15;
 // stability is what makes "author and return the same now()" exact.
 constexpr const char* kDbNowMsSql = "(extract(epoch from now())*1000)::bigint";
 
-// RETURNING clause naming the six authored time columns + db_now, in the order
-// authored_from() reads them. Shared by create/set_elevation/mark_mfa so the
-// caller always seeds its cache with the exact DB-authored values.
+// RETURNING clause naming the six authored time columns + db_now + the factor
+// generation the guard trigger left on the row, in the order authored_from() reads
+// them. Shared by create/set_elevation/mark_mfa/clear_mfa_proof so the caller always
+// seeds its cache with the exact DB-authored values. The INSERT form is unqualified
+// (the target row); the UPDATE ... FROM n form is below. Keep the two in lockstep.
 constexpr const char* kAuthoredReturning =
     "created_at_ms, expires_at_ms, last_activity_ms, mfa_verified_ms, "
-    "elevated_until_ms, elevation_issued_ms, (extract(epoch from now())*1000)::bigint";
+    "elevated_until_ms, elevation_issued_ms, (extract(epoch from now())*1000)::bigint, "
+    "mfa_factor_gen";
+// The `UPDATE session_store.sessions s ... FROM (SELECT ... AS ms) n` form.
+constexpr const char* kAuthoredReturningUpd =
+    "s.created_at_ms, s.expires_at_ms, s.last_activity_ms, s.mfa_verified_ms, "
+    "s.elevated_until_ms, s.elevation_issued_ms, n.ms, s.mfa_factor_gen";
 
 AuthoredTimes authored_from(PGresult* res, int i) {
     AuthoredTimes t;
@@ -137,31 +147,129 @@ AuthoredTimes authored_from(PGresult* res, int i) {
     t.elevated_until_ms = to_i64(PQgetvalue(res, i, 4));
     t.elevation_issued_ms = to_i64(PQgetvalue(res, i, 5));
     t.db_now_ms = to_i64(PQgetvalue(res, i, 6));
+    t.mfa_factor_gen = to_i64(PQgetvalue(res, i, 7));
     return t;
+}
+
+// Body of the rebind-guard trigger function. ONE constant shared by the migration
+// (below) and the effective-firing validation (`pg_proc.prosrc` compared by plain text
+// equality, no md5: md5() is refused on a FIPS-mode server, and AuthDB's check does the
+// same), so the two cannot drift. A write of a proof or identity column that
+// does not advance the bind sequence leaves the proof UNBOUND (factor generation 0),
+// whatever the new values.
+// FROZEN: shipped in migration v3 and pinned byte-for-byte by the boot check; changing it
+// needs a NEW migration (CREATE OR REPLACE) and an accepted (old,new) pair in the check, or
+// every migrated replica refuses to boot.
+constexpr std::string_view kRebindGuardBody =
+    "\nBEGIN\n"
+    "  IF NOT (NEW.mfa_bind_seq > OLD.mfa_bind_seq) THEN\n"
+    "    NEW.mfa_factor_gen := 0;\n"
+    "  END IF;\n"
+    "  RETURN NEW;\n"
+    "END ";
+
+std::string migration_v3_sql() {
+    // The 3 s lock_timeout is the same short cap v2 uses: while the ALTER TABLE / CREATE
+    // TRIGGER queues behind a long transaction, every new sessions query on a running peer
+    // queues behind it, so a short cap keeps that stall short. A failed attempt rolls the
+    // whole migration back and the next boot retries it.
+    return "SET LOCAL lock_timeout = '3s'; "
+           "ALTER TABLE sessions ADD COLUMN mfa_factor_gen BIGINT NOT NULL DEFAULT 0, "
+           "ADD COLUMN mfa_bind_seq BIGINT NOT NULL DEFAULT 0; "
+           "CREATE FUNCTION sessions_mfa_rebind_guard() RETURNS trigger LANGUAGE plpgsql AS $$" +
+           std::string(kRebindGuardBody) +
+           "$$; "
+           "CREATE TRIGGER sessions_mfa_rebind_guard "
+           "BEFORE UPDATE OF mfa_verified_ms, mfa_factor_gen, username, auth_source, "
+           "principal_kind "
+           "ON sessions FOR EACH ROW EXECUTE FUNCTION sessions_mfa_rebind_guard(); "
+           // ENABLE ALWAYS (tgenabled = 'A') fires under every session_replication_role;
+           // the default 'O' is skipped under 'replica', which would let a replication-
+           // role session write a bound proof past the guard.
+           "ALTER TABLE sessions ENABLE ALWAYS TRIGGER sessions_mfa_rebind_guard;";
+}
+
+enum class GuardCheck { kOk, kFailed, kInconclusive };
+
+// Is the rebind guard in force for every writer? Reads the catalog: the trigger exists,
+// is ENABLE ALWAYS ('A'), is a ROW BEFORE UPDATE trigger and nothing else (tgtype & 127 = 19: no
+// INSERT, DELETE, TRUNCATE or INSTEAD bit, as AuthDB's check) with no WHEN clause, lists EXACTLY
+// the five guarded columns (attnum equality of the sorted lists, not containment), and calls the
+// pinned function body. A missing sessions table (a rename fault, a drop) is INCONCLUSIVE rather
+// than a failure: it is not evidence about the trigger and every session query fails on it anyway.
+// When `cause` is given, an inconclusive result describes why (SQLSTATE and server message, or the
+// row count).
+GuardCheck check_rebind_guard(PGconn* conn, std::string* cause = nullptr) {
+    PgResult r = exec_params(
+        conn,
+        "SELECT COALESCE(t.tgenabled = 'A' "
+        "  AND (t.tgtype & 127) = 19 AND t.tgqual IS NULL "
+        "  AND (SELECT count(*) FROM pg_attribute a WHERE a.attrelid = c.oid "
+        "AND NOT a.attisdropped "
+        "         AND a.attname IN ('mfa_verified_ms','mfa_factor_gen','username','auth_source',"
+        "'principal_kind')) = 5 "
+        "  AND ARRAY(SELECT x FROM unnest(t.tgattr::int2[]) AS x ORDER BY x) = "
+        "      ARRAY(SELECT a.attnum FROM pg_attribute a "
+        "         WHERE a.attrelid = c.oid AND NOT a.attisdropped "
+        "           AND a.attname IN ('mfa_verified_ms','mfa_factor_gen','username','auth_source',"
+        "'principal_kind') ORDER BY a.attnum) "
+        "  AND p.proname = 'sessions_mfa_rebind_guard' AND p.pronamespace = c.relnamespace "
+        "  AND p.prolang = (SELECT oid FROM pg_language WHERE lanname = 'plpgsql') "
+        "  AND p.prosrc = $1::text, false) "
+        "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+        "LEFT JOIN pg_trigger t ON t.tgrelid = c.oid AND t.tgname = 'sessions_mfa_rebind_guard' "
+        "  AND NOT t.tgisinternal "
+        "LEFT JOIN pg_proc p ON p.oid = t.tgfoid "
+        "WHERE n.nspname = 'session_store' AND c.relname = 'sessions' AND c.relkind = 'r'",
+        std::vector<std::string>{std::string(kRebindGuardBody)});
+    if (r.status() != PGRES_TUPLES_OK) {
+        if (cause) {
+            const char* state = PQresultErrorField(r.get(), PG_DIAG_SQLSTATE);
+            std::string msg = PQerrorMessage(conn);
+            while (!msg.empty() && (msg.back() == '\n' || msg.back() == '\r'))
+                msg.pop_back();
+            *cause = std::string("catalog query failed, SQLSTATE ") + (state ? state : "none") +
+                     ": " + msg;
+        }
+        return GuardCheck::kInconclusive;
+    }
+    if (PQntuples(r.get()) != 1) {
+        if (cause)
+            *cause = "catalog query returned " + std::to_string(PQntuples(r.get())) +
+                     " rows for session_store.sessions, expected 1";
+        return GuardCheck::kInconclusive;
+    }
+    return std::string_view(PQgetvalue(r.get(), 0, 0)) == "t" ? GuardCheck::kOk
+                                                              : GuardCheck::kFailed;
+}
+
+std::int64_t steady_now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
 }
 
 const std::vector<pg::PgMigration>& migrations() {
     static const std::vector<pg::PgMigration> kMigrations = {
-        {1,
-         "CREATE TABLE sessions ("
-         "  token_hash          TEXT PRIMARY KEY,"
-         "  username            TEXT NOT NULL,"
-         "  display_name        TEXT NOT NULL DEFAULT '',"
-         "  role                TEXT NOT NULL,"
-         "  auth_source         TEXT NOT NULL DEFAULT 'local',"
-         "  oidc_sub            TEXT NOT NULL DEFAULT '',"
-         "  token_scope_service TEXT NOT NULL DEFAULT '',"
-         "  mcp_tier            TEXT NOT NULL DEFAULT '',"
-         "  principal_kind      TEXT NOT NULL DEFAULT 'human',"
-         "  created_at_ms       BIGINT NOT NULL,"
-         "  expires_at_ms       BIGINT NOT NULL,"
-         "  last_activity_ms    BIGINT NOT NULL,"
-         "  mfa_verified_ms     BIGINT NOT NULL DEFAULT 0,"
-         "  elevated_until_ms   BIGINT NOT NULL DEFAULT 0,"
-         "  elevation_issued_ms BIGINT NOT NULL DEFAULT 0);"
-         "CREATE INDEX sessions_username_idx ON sessions (username);"
-         "CREATE INDEX sessions_expires_idx ON sessions (expires_at_ms);"
-         "CREATE TABLE session_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);"},
+        {1, "CREATE TABLE sessions ("
+            "  token_hash          TEXT PRIMARY KEY,"
+            "  username            TEXT NOT NULL,"
+            "  display_name        TEXT NOT NULL DEFAULT '',"
+            "  role                TEXT NOT NULL,"
+            "  auth_source         TEXT NOT NULL DEFAULT 'local',"
+            "  oidc_sub            TEXT NOT NULL DEFAULT '',"
+            "  token_scope_service TEXT NOT NULL DEFAULT '',"
+            "  mcp_tier            TEXT NOT NULL DEFAULT '',"
+            "  principal_kind      TEXT NOT NULL DEFAULT 'human',"
+            "  created_at_ms       BIGINT NOT NULL,"
+            "  expires_at_ms       BIGINT NOT NULL,"
+            "  last_activity_ms    BIGINT NOT NULL,"
+            "  mfa_verified_ms     BIGINT NOT NULL DEFAULT 0,"
+            "  elevated_until_ms   BIGINT NOT NULL DEFAULT 0,"
+            "  elevation_issued_ms BIGINT NOT NULL DEFAULT 0);"
+            "CREATE INDEX sessions_username_idx ON sessions (username);"
+            "CREATE INDEX sessions_expires_idx ON sessions (expires_at_ms);"
+            "CREATE TABLE session_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);"},
         // v2 (#2343): the stored principal class is exactly one of two pairings: a human
         // session (any source but engine_token) or an engine session (engine_token). Token
         // sessions (api/mcp/engine tokens) are never persisted, and every persist_new_session
@@ -215,13 +323,20 @@ const std::vector<pg::PgMigration>& migrations() {
                             "ALTER TABLE sessions ADD CONSTRAINT"
                             " sessions_principal_kind_consistent CHECK (") +
                 kPrincipalPairingOk + std::string(");")},
+        // v3 (#6079): factor-generation binding of local MFA proofs. Additive columns
+        // (a legacy binary's explicit-column INSERT/SELECT is unaffected) plus the
+        // rebind guard trigger. A pre-existing row keeps generation 0 = UNBOUND, so the
+        // previous release's proofs are re-proven once.
+        {3, migration_v3_sql()},
     };
     return kMigrations;
 }
 
 } // namespace
 
-SessionStore::SessionStore(pg::PgPool& pool) : pool_(pool) {
+SessionStore::SessionStore(pg::PgPool& pool) : SessionStore(pool, MfaBindingCheck::kEnforce) {}
+
+SessionStore::SessionStore(pg::PgPool& pool, MfaBindingCheck binding_check) : pool_(pool) {
     auto lease = pool_.acquire(); // unbounded — construction ONLY
     if (!lease) {
         spdlog::error("SessionStore: no database connection at construction ({})",
@@ -232,6 +347,29 @@ SessionStore::SessionStore(pg::PgPool& pool) : pool_(pool) {
         spdlog::error("SessionStore: schema migration failed");
         return;
     }
+    // The binding is only as good as the trigger that unbinds legacy writes: refuse to
+    // open (fail closed, like a failed migration) if it is not provably in force.
+    const GuardCheck boot_check = check_rebind_guard(lease.get());
+    if (binding_check == MfaBindingCheck::kBypassForRecovery) {
+        // Host-CLI recovery one-shot (--mfa-reset): the store opens whatever the guard state so
+        // the operator can still end the account's sessions. `rebind_guard_ok_` stays false (its
+        // default) for the life of this instance, so any binding decision through it fails
+        // closed; the one-shot makes none.
+        spdlog::warn("SessionStore: recovery bypass of the rebind-guard check (guard state: {}); "
+                     "this one-shot process does not enforce session proof binding",
+                     boot_check == GuardCheck::kOk       ? "in force"
+                     : boot_check == GuardCheck::kFailed ? "missing, not ENABLE ALWAYS, or altered"
+                                                         : "unreadable");
+        open_ = true;
+        return;
+    }
+    if (boot_check != GuardCheck::kOk) {
+        spdlog::error("SessionStore: sessions_mfa_rebind_guard is missing, not ENABLE ALWAYS, "
+                      "or altered; refusing to open (local MFA binding cannot be trusted)");
+        return;
+    }
+    next_validation_steady_ms_.store(steady_now_ms() + validation_memo_ms_.load());
+    rebind_guard_ok_.store(true, std::memory_order_release);
     open_ = true;
 }
 
@@ -242,40 +380,59 @@ SessionStore::create(const SessionWriteParams& params) {
     if (params.token_hash.empty() || params.username.empty())
         return std::unexpected(Error{"token_hash and username are required"});
 
+    const LocalMfaProof& lp = params.local_mfa;
+    // Writer-error and ambiguity guards: a proof is {gen, instant} with the instant
+    // positive, a binding without an instant is a caller bug (never a silent unbound
+    // stamp), and at most one MFA option may be set.
+    if (lp.verified_ms < 0 || lp.factor_gen < 0 || (lp.factor_gen > 0 && lp.verified_ms == 0))
+        return std::unexpected(Error{"invalid local MFA proof (binding without an instant)"});
+    if (lp.verified_ms > 0 && params.mfa_verified_ms_abs != 0)
+        return std::unexpected(Error{"more than one MFA proof option set"});
+
     AuthoredTimes authored;
     std::string err;
     // created_at / expires_at / last_activity are authored from the ONE DB clock
-    // (`now()`, txn-stable); mfa_verified is now() for a local login step-up, else
-    // the passed absolute (an IdP proof time, or 0). `n.ms` is that now() reused
-    // across the INSERT and the RETURNING so the caller's cache gets exact values.
+    // (`now()`, txn-stable); mfa_verified is the carried local instant ($12) when it is
+    // not in the future of this statement's now() (a future-dated instant stores NO proof
+    // and NO binding, never a clamped age-zero one), else the passed absolute (an IdP
+    // proof time, or 0). `n.ms` is
+    // that now() reused across the INSERT and the RETURNING so the caller's cache gets
+    // exact values. The bind sequence starts at 1 and advances on a conflicting rewrite,
+    // so the rebind guard never unbinds THIS writer; a legacy INSERT omits the column.
     const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* c) -> bool {
         PgResult r = exec_params(
             c,
             ("INSERT INTO session_store.sessions ("
-            "token_hash, username, display_name, role, auth_source, oidc_sub, token_scope_service, "
-            "mcp_tier, principal_kind, created_at_ms, expires_at_ms, last_activity_ms, "
-            "mfa_verified_ms, elevated_until_ms, elevation_issued_ms) "
-            "SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9, n.ms, n.ms + $10::bigint, n.ms, "
-            "CASE WHEN $11::bool THEN n.ms ELSE $12::bigint END, 0, 0 "
-            "FROM (SELECT (extract(epoch from now())*1000)::bigint AS ms) n "
-            "ON CONFLICT (token_hash) DO UPDATE SET "
-            "username=EXCLUDED.username, display_name=EXCLUDED.display_name, role=EXCLUDED.role, "
-            "auth_source=EXCLUDED.auth_source, oidc_sub=EXCLUDED.oidc_sub, "
-            "token_scope_service=EXCLUDED.token_scope_service, mcp_tier=EXCLUDED.mcp_tier, "
-            "principal_kind=EXCLUDED.principal_kind, created_at_ms=EXCLUDED.created_at_ms, "
-            "expires_at_ms=EXCLUDED.expires_at_ms, last_activity_ms=EXCLUDED.last_activity_ms, "
-            "mfa_verified_ms=EXCLUDED.mfa_verified_ms, elevated_until_ms=EXCLUDED.elevated_until_ms, "
-            "elevation_issued_ms=EXCLUDED.elevation_issued_ms "
-            "RETURNING " +
-                std::string(kAuthoredReturning))
+             "token_hash, username, display_name, role, auth_source, oidc_sub, "
+             "token_scope_service, "
+             "mcp_tier, principal_kind, created_at_ms, expires_at_ms, last_activity_ms, "
+             "mfa_verified_ms, elevated_until_ms, elevation_issued_ms, mfa_factor_gen, "
+             "mfa_bind_seq) "
+             "SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9, n.ms, n.ms + $10::bigint, n.ms, "
+             "CASE WHEN $12::bigint > 0 THEN (CASE WHEN $12::bigint <= n.ms THEN $12::bigint "
+             "ELSE 0 END) ELSE $11::bigint END, 0, 0, "
+             "CASE WHEN $12::bigint > 0 AND $12::bigint <= n.ms THEN $13::bigint ELSE 0 END, 1 "
+             "FROM (SELECT (extract(epoch from now())*1000)::bigint AS ms) n "
+             "ON CONFLICT (token_hash) DO UPDATE SET "
+             "username=EXCLUDED.username, display_name=EXCLUDED.display_name, role=EXCLUDED.role, "
+             "auth_source=EXCLUDED.auth_source, oidc_sub=EXCLUDED.oidc_sub, "
+             "token_scope_service=EXCLUDED.token_scope_service, mcp_tier=EXCLUDED.mcp_tier, "
+             "principal_kind=EXCLUDED.principal_kind, created_at_ms=EXCLUDED.created_at_ms, "
+             "expires_at_ms=EXCLUDED.expires_at_ms, last_activity_ms=EXCLUDED.last_activity_ms, "
+             "mfa_verified_ms=EXCLUDED.mfa_verified_ms, "
+             "elevated_until_ms=EXCLUDED.elevated_until_ms, "
+             "elevation_issued_ms=EXCLUDED.elevation_issued_ms, "
+             "mfa_factor_gen=EXCLUDED.mfa_factor_gen, "
+             "mfa_bind_seq=session_store.sessions.mfa_bind_seq + 1 "
+             "RETURNING " +
+             std::string(kAuthoredReturning))
                 .c_str(),
-            std::vector<std::string>{params.token_hash, params.username, params.display_name,
-                                     params.role, params.auth_source, params.oidc_sub,
-                                     params.token_scope_service, params.mcp_tier,
-                                     params.principal_kind,
-                                     std::to_string(params.session_lifetime_ms),
-                                     params.mfa_verified_now ? "true" : "false",
-                                     std::to_string(params.mfa_verified_ms_abs)});
+            std::vector<std::string>{
+                params.token_hash, params.username, params.display_name, params.role,
+                params.auth_source, params.oidc_sub, params.token_scope_service, params.mcp_tier,
+                params.principal_kind, std::to_string(params.session_lifetime_ms),
+                std::to_string(params.mfa_verified_ms_abs), std::to_string(lp.verified_ms),
+                std::to_string(lp.factor_gen)});
         if (r.status() != PGRES_TUPLES_OK || PQntuples(r.get()) == 0) {
             err = std::string("session insert failed: ") + PQerrorMessage(c);
             return false;
@@ -346,13 +503,14 @@ SessionStore::set_elevation(const std::string& token_hash, std::int64_t elevatio
     const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* c) -> bool {
         PgResult r = exec_params(
             c,
-            "UPDATE session_store.sessions s SET "
-            "elevation_issued_ms = n.ms, "
-            "elevated_until_ms = LEAST(n.ms + $2::bigint, s.expires_at_ms) "
-            "FROM (SELECT (extract(epoch from now())*1000)::bigint AS ms) n "
-            "WHERE s.token_hash = $1 AND LEAST(n.ms + $2::bigint, s.expires_at_ms) > n.ms "
-            "RETURNING s.created_at_ms, s.expires_at_ms, s.last_activity_ms, s.mfa_verified_ms, "
-            "s.elevated_until_ms, s.elevation_issued_ms, n.ms",
+            (std::string("UPDATE session_store.sessions s SET "
+                         "elevation_issued_ms = n.ms, "
+                         "elevated_until_ms = LEAST(n.ms + $2::bigint, s.expires_at_ms) "
+                         "FROM (SELECT (extract(epoch from now())*1000)::bigint AS ms) n "
+                         "WHERE s.token_hash = $1 AND LEAST(n.ms + $2::bigint, s.expires_at_ms) "
+                         "> n.ms RETURNING ") +
+             kAuthoredReturningUpd)
+                .c_str(),
             std::vector<std::string>{token_hash, std::to_string(elevation_duration_ms)});
         if (r.status() != PGRES_TUPLES_OK) {
             err = std::string("set_elevation failed: ") + PQerrorMessage(c);
@@ -419,20 +577,34 @@ SessionStore::clear_user_elevations(const std::string& username) {
 }
 
 std::expected<std::optional<AuthoredTimes>, SessionStore::Error>
-SessionStore::mark_mfa(const std::string& token_hash) {
+SessionStore::mark_mfa(const std::string& token_hash, const LocalMfaProof& proof) {
     if (!open_)
         return std::unexpected(Error{"session store not open"});
+    // A proof needs an instant; a binding without one is a writer error, and an absent
+    // proof is clear_mfa_proof's job (never a silent clear through the stamp path).
+    if (proof.verified_ms <= 0 || proof.factor_gen < 0)
+        return std::unexpected(Error{"invalid local MFA proof (use clear_mfa_proof to remove)"});
     std::optional<AuthoredTimes> authored;
     std::string err;
+    // $2 is the carried verification instant, $3 its factor generation. An instant later
+    // than this statement's now() (the DB clock stepped back between the verification
+    // and this write) stores NO proof and NO binding: the caller sees mfa_verified_ms == 0
+    // in the result and treats it as a refusal. The bind sequence advances in the same
+    // statement so the rebind guard keeps the generation.
     const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* c) -> bool {
         PgResult r = exec_params(
             c,
-            "UPDATE session_store.sessions s SET mfa_verified_ms = n.ms "
-            "FROM (SELECT (extract(epoch from now())*1000)::bigint AS ms) n "
-            "WHERE s.token_hash = $1 "
-            "RETURNING s.created_at_ms, s.expires_at_ms, s.last_activity_ms, s.mfa_verified_ms, "
-            "s.elevated_until_ms, s.elevation_issued_ms, n.ms",
-            std::vector<std::string>{token_hash});
+            (std::string(
+                 "UPDATE session_store.sessions s SET "
+                 "mfa_verified_ms = CASE WHEN $2::bigint <= n.ms THEN $2::bigint ELSE 0 END, "
+                 "mfa_factor_gen = CASE WHEN $2::bigint <= n.ms THEN $3::bigint ELSE 0 END, "
+                 "mfa_bind_seq = s.mfa_bind_seq + 1 "
+                 "FROM (SELECT (extract(epoch from now())*1000)::bigint AS ms) n "
+                 "WHERE s.token_hash = $1 RETURNING ") +
+             kAuthoredReturningUpd)
+                .c_str(),
+            std::vector<std::string>{token_hash, std::to_string(proof.verified_ms),
+                                     std::to_string(proof.factor_gen)});
         if (r.status() != PGRES_TUPLES_OK) {
             err = std::string("mark_mfa failed: ") + PQerrorMessage(c);
             return false;
@@ -443,6 +615,35 @@ SessionStore::mark_mfa(const std::string& token_hash) {
     });
     if (!ok)
         return std::unexpected(Error{err.empty() ? "mark_mfa failed" : err});
+    return authored;
+}
+
+std::expected<std::optional<AuthoredTimes>, SessionStore::Error>
+SessionStore::clear_mfa_proof(const std::string& token_hash) {
+    if (!open_)
+        return std::unexpected(Error{"session store not open"});
+    std::optional<AuthoredTimes> authored;
+    std::string err;
+    const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* c) -> bool {
+        PgResult r = exec_params(
+            c,
+            (std::string("UPDATE session_store.sessions s SET mfa_verified_ms = 0, "
+                         "mfa_factor_gen = 0, mfa_bind_seq = s.mfa_bind_seq + 1 "
+                         "FROM (SELECT (extract(epoch from now())*1000)::bigint AS ms) n "
+                         "WHERE s.token_hash = $1 RETURNING ") +
+             kAuthoredReturningUpd)
+                .c_str(),
+            std::vector<std::string>{token_hash});
+        if (r.status() != PGRES_TUPLES_OK) {
+            err = std::string("clear_mfa_proof failed: ") + PQerrorMessage(c);
+            return false;
+        }
+        if (PQntuples(r.get()) > 0)
+            authored = authored_from(r.get(), 0);
+        return authored.has_value() ? bump_generation_in_txn(c) : true;
+    });
+    if (!ok)
+        return std::unexpected(Error{err.empty() ? "clear_mfa_proof failed" : err});
     return authored;
 }
 
@@ -478,6 +679,7 @@ SessionStore::find(const std::string& token_hash) const {
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease)
         return std::unexpected(Error{"database unavailable"});
+    const bool own_check_inconclusive = revalidate_rebind_guard_if_due(lease.get());
     // db_now_ms is the LAST column, read in the SAME atomic SELECT as the row, so
     // adjudication is against the DB clock at read time — never the replica's
     // local clock, and never a separate query that could skew (design-review N1).
@@ -496,7 +698,56 @@ SessionStore::find(const std::string& token_hash) const {
     FoundSession fs;
     fs.row = row_from(r.get(), 0);
     fs.db_now_ms = to_i64(PQgetvalue(r.get(), 0, kSessionRowColumns)); // db_now after the row cols
+    // This call's own inconclusive verdict is carried in a local, not re-read from the shared flag:
+    // a concurrent successful check may clear the flag between that verdict and this load.
+    fs.guard_unverified =
+        own_check_inconclusive || last_validation_inconclusive_.load(std::memory_order_acquire);
     return std::optional<FoundSession>{std::move(fs)};
+}
+
+bool SessionStore::revalidate_rebind_guard_if_due(PGconn* conn) const {
+    if (!rebind_guard_ok_.load(std::memory_order_acquire))
+        return false; // sticky: a failure observed once stays until restart
+    const std::int64_t now = steady_now_ms();
+    std::int64_t due = next_validation_steady_ms_.load(std::memory_order_relaxed);
+    if (now < due)
+        return false;
+    // Exactly one thread per expiry runs the catalog query; the rest proceed.
+    if (!next_validation_steady_ms_.compare_exchange_strong(
+            due, now + validation_memo_ms_.load(std::memory_order_relaxed)))
+        return false;
+    std::string cause;
+    GuardCheck verdict;
+    if (force_inconclusive_for_test_.load(std::memory_order_relaxed)) {
+        verdict = GuardCheck::kInconclusive;
+        cause = "forced by the test seam";
+    } else {
+        verdict = check_rebind_guard(conn, &cause);
+    }
+    switch (verdict) {
+    case GuardCheck::kOk:
+        last_validation_inconclusive_.store(false, std::memory_order_release);
+        return false;
+    case GuardCheck::kFailed:
+        rebind_guard_ok_.store(false, std::memory_order_release);
+        spdlog::error("SessionStore: sessions_mfa_rebind_guard is missing, not ENABLE ALWAYS, or "
+                      "altered; local MFA binding decisions now fail closed until restart");
+        return false;
+    case GuardCheck::kInconclusive:
+        // Not evidence about the trigger (query error, table unreachable): retry on the
+        // next find rather than waiting out the memo and do not latch. The row is still served,
+        // but flagged `guard_unverified` so a binding decision refuses this read. The cause is
+        // logged once per episode (on the transition), not on every retry. The memo reset is a
+        // release store so a thread that wins the CAS at 0 also sees the flag stored above.
+        if (!last_validation_inconclusive_.exchange(true, std::memory_order_acq_rel))
+            spdlog::warn("SessionStore: the rebind-guard check could not run ({}); local MFA "
+                         "binding reads are refused as unavailable until a check succeeds, "
+                         "session validation is unaffected",
+                         cause);
+        next_validation_steady_ms_.store(0, std::memory_order_release);
+        return true;
+    }
+    return false;
 }
 
 std::expected<std::uint64_t, SessionStore::Error> SessionStore::read_generation() const {
