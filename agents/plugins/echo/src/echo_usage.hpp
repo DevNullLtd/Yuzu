@@ -473,6 +473,10 @@ enum class LifecycleState {
  */
 [[nodiscard]] std::expected<bool, std::string> usage_active_in(TransactionHandle& h);
 
+/// Whether a usage_fold_in call runs the open-run sweep (expiry, cap, last-fold anchor) or leaves
+/// it to a later call. kRun is every live call.
+enum class UsageSweep { kRun, kDefer };
+
 /**
  * Fold `events` (one tick's process events) into the usage tables ON THE CALLER'S TRANSACTION
  * `h`: pair started/stopped against the open-run table (usage_live), expire and cap it,
@@ -489,9 +493,17 @@ enum class LifecycleState {
  * its usage rows commit or roll back together. Must not call any EchoDatabase method that
  * takes the database mutex (the caller holds it); every read here goes through `h`. An error
  * return poisons `h` and rolls the caller's whole transaction back.
+ *
+ * `sweep` = kDefer makes the call fold the events and nothing else: it skips the last-fold
+ * anchor read, the expiry and cap of the open runs, the anchor write and the declined counter.
+ * Only the v10 migration's chunked walk uses it, so a walk over many chunks is one logical tick
+ * judged against the anchor as it stood before the walk, and a long run whose stop lands in a
+ * later chunk is credited rather than expired at the chunk edge. That caller ends the walk with
+ * one kRun call (events empty), which does the expiry, cap and anchor write once.
  */
 [[nodiscard]] std::expected<void, std::string>
-usage_fold_in(TransactionHandle& h, int64_t now, const std::vector<ProcessEvent>& events);
+usage_fold_in(TransactionHandle& h, int64_t now, const std::vector<ProcessEvent>& events,
+              UsageSweep sweep = UsageSweep::kRun);
 
 /**
  * The per-tick sweep with no events: expire and cap the open runs, advance the last-fold

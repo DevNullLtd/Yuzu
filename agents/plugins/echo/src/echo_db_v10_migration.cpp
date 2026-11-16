@@ -1072,7 +1072,9 @@ private:
                         failure = std::format("{}: {}", def.name, e.what());
                         return false;
                     }
-                    if (const auto u = usage::usage_fold_in(h_, now_, lagged); !u) {
+                    if (const auto u =
+                            usage::usage_fold_in(h_, now_, lagged, usage::UsageSweep::kDefer);
+                        !u) {
                         failure = "usage fold of the lagged process rows: " + u.error();
                         return false;
                     }
@@ -1084,6 +1086,11 @@ private:
                 return std::unexpected(*failure);
             if (!fed)
                 return std::unexpected(h_.error());
+            // The chunks above deferred the open-run sweep, so the walk is one logical fold tick:
+            // expire and cap once, against the anchor as it stood before the walk. A failure here
+            // fails the migration and the file stays at v9.
+            if (const auto u = usage::usage_fold_in(h_, now_, {}, usage::UsageSweep::kRun); !u)
+                return std::unexpected("usage sweep after the lagged process rows: " + u.error());
         }
         return {};
     }

@@ -497,6 +497,14 @@ If `echo.db` is corrupt **and** cannot be moved aside (read-only mount, locked f
 
 `network_capture_method` is the **configured** value (which may be a value pre-staged ahead of a forthcoming kernel-event collector, or a cross-OS platform API); `network_capture_method_effective` is the mechanism **actually collecting**, which is always `polling` today — no kernel-event collector is wired yet, so every configured value currently collects via polling. The two are reported side by side so `status` can never misrepresent the active capture mechanism to a forensic analyst.
 
+### Process roll-ups stopped while usage is enabled
+
+The process roll-ups and the app-usage fold commit in one transaction, so a persistent fault in the usage fold stops both: `process_rows` in `echo.status` does not move while `usage_enabled` is `true`, and the agent log repeats a usage error on every fast tick (for example `usage_generation read failed`).
+
+An unreadable or malformed `usage_generation` is one cause. Echo fails closed on it: the usage lifecycle reads `PendingBaseline` (`config|usage_lifecycle_state` in `echo.status`), a `usage_enabled` change is refused, and no baseline is stamped, so the open usage runs are kept. To recover, repair the row by deleting it (`DELETE FROM echo_config WHERE key = 'usage_generation';`, which reads as generation 0) with the agent stopped. Usage then re-baselines on its first tick, which forgets the open usage runs; coverage restarts from that moment.
+
+A fault elsewhere in the usage fold (a damaged `usage_live` page, for example) is the same symptom with a different log line. Unless `usage_generation` is the damaged row, setting `usage_enabled` to `false` stops the fold touching usage and lets the process roll-ups resume while the fault is repaired.
+
 ## Echo dashboard page
 
 The Yuzu dashboard includes a dedicated Echo page at `/echo`, reachable from the **Echo** entry in the sidebar's **Posture** group (visible after authentication). The page is the central operator surface for Echo across the fleet. Phase 15.A delivers the retention-paused source list as the first frame; the process tree viewer and the capture sources frame sit below it. The capture sources frame locks the five core sources (process, tcp, service, user, perf), so pause or resume them with `configure`, and shows each as **paused** when the agent reports `<source>_enabled=false` and **always on** for any other reported value (an `errored` value still reads always on; the retention-paused list above flags it with its value-error badge). Ad-hoc Echo SQL is not on this page: it starts from **Result sets** (`/result-sets`), where **From Echo query** runs a SELECT on a scope and keeps the devices that answer, behind a confirm that shows the SQL.

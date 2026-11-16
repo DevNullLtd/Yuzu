@@ -339,7 +339,19 @@ retired tables just gets the roll-up schema installed. Otherwise `migrate_to_v10
    repair named (`DELETE FROM echo_config WHERE key = 'usage_active_generation';`: usage then
    re-baselines on the first tick, which deletes `usage_live`, so the open usage runs are
    forgotten and the lagged rows are not credited); a malformed `usage_lag_events`
-   (informational) is logged and the migration continues. A migrated tier
+   (informational) is logged and the migration continues. The walk defers the open-run sweep
+   (`UsageSweep::kDefer`: no anchor read, no expiry, no cap, no `usage_last_fold_ts` write) on
+   every chunk and ends with one event-less `usage_fold_in(..., UsageSweep::kRun)`, so the whole
+   walk is one logical fold tick judged against the anchor as it stood before it: a run older
+   than seven days whose stop lands in a later chunk is credited, not expired at a chunk edge.
+   The open-run set can grow inside the transaction until that closing call caps it (at most the
+   `process_live` row cap, about 105,000 rows). A failure of the closing call fails the migration
+   (`usage sweep after the lagged process rows: ...`) and the file stays at v9. Accepted
+   residuals, no code (#7124): the usage walk has no deadline of its own and decodes the lagged
+   process rows twice (tiers, then usage), bounded by that row cap and run once, at the upgrade;
+   and a stale `-wal` left by a crash can inflate the free-space demand of the first refused
+   open, whose refusal closes the connection and so checkpoints, after which the next open
+   succeeds. A migrated tier
    row carries the columns v9 did not have (`parent_name`, `abnormal_exit_count`, tcp `failed_count`
    and `listen_*`, user `disconnect_count`, removable `partition_count`) as blank or 0, so a bucket
    spanning the upgrade holds two process rows per (name, user): the migrated one with a blank
@@ -375,6 +387,19 @@ Consequences for code that reads the store:
   (`usage_fold_in` rides `fold_rows`'s `extra` hook), so there is no read marker and no lag;
   `PendingBaseline` stamps and folds nothing. A fault in either half rolls back both, and the retried
   tick folds both once.
+- **The joint transaction couples the two halves' faults (#7121, decided: kept).** A persistent
+  failure inside `usage_fold_in` (a damaged page in `usage_live`, an unreadable or malformed
+  `usage_generation`) fails the whole tick, so the process tiers record nothing while usage is
+  enabled. Nothing isolates it, by design: the consistency the joint commit buys outweighs a
+  rare, visible fault. The symptom is the process roll-up row counts (`process_rows`) not moving
+  while `usage_enabled` is true, with the fold's error in the agent log on every tick; the
+  operator recovery is in the manual's "Process roll-ups stopped while usage is enabled". If this
+  is ever decided the other way, this bullet and that manual entry are the two places to change.
+- `usage_generation` is read strictly at every site that decides on it (`usage_lifecycle_state`,
+  `usage_set_enabled`, `usage_ensure_baselined`, and the fold): an absent row is 0, an unreadable
+  or malformed value is a fault. The lifecycle then reads `PendingBaseline`, an enable or
+  disable edge is refused (`false`, nothing written) and a baseline attempt returns the error and
+  stamps nothing, so a fault is never taken for generation 0 and never deletes `usage_live`.
 - `purge_source` deletes the source's `_r` rows and `echo_fold_seen` rows and sweeps the dictionary.
 - The status counts (`<src>_rows`, `<src>_oldest_ts`) read the finest tier.
 - `is_fold_view` is case-sensitive: a query that names a view `Process_Hourly` does not reach it.

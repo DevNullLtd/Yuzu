@@ -184,6 +184,16 @@ int64_t read_config_i64_locked(TransactionHandle& h, std::string_view key) {
     return (v && *v) ? parse_i64(**v) : 0;
 }
 
+// The whole value must be an integer: an empty or partly numeric text is malformed.
+std::expected<int64_t, std::string> parse_i64_exact(std::string_view s) {
+    int64_t parsed = 0;
+    const char* const end = s.data() + s.size();
+    auto [p, ec] = std::from_chars(s.data(), end, parsed);
+    if (ec != std::errc{} || p != end)
+        return std::unexpected(std::string("malformed value"));
+    return parsed;
+}
+
 // Distinguishes a genuinely-absent key (no row -- a real, legitimate state
 // the first time a fold ever runs after baseline) from a read/parse FAILURE
 // on an existing key. read_config_i64_locked's "0 on any fault" contract
@@ -203,12 +213,23 @@ std::expected<std::optional<int64_t>, std::string> read_config_i64_strict(Transa
         return std::unexpected(v.error());
     if (!*v)
         return std::optional<int64_t>{}; // genuinely absent -- no row, not a fault
-    int64_t parsed = 0;
-    const char* const end = (*v)->data() + (*v)->size();
-    auto [p, ec] = std::from_chars((*v)->data(), end, parsed);
-    if (ec != std::errc{} || p != end)
-        return std::unexpected(std::string("malformed value"));
-    return std::optional<int64_t>(parsed);
+    const auto parsed = parse_i64_exact(**v);
+    if (!parsed)
+        return std::unexpected(parsed.error());
+    return std::optional<int64_t>(*parsed);
+}
+
+// `usage_generation` through the database's own connection, read STRICTLY like the fold reads it
+// through a handle: an absent row is 0 (the legitimate first-ever state), a failed read or a
+// malformed value is an error. The lenient get_config would collapse both faults to 0, which
+// reads a stored active generation as a mismatch or a match by accident (#7287).
+std::expected<int64_t, std::string> read_usage_generation_strict(EchoDatabase& db) {
+    const auto v = db.try_get_config("usage_generation");
+    if (!v)
+        return std::unexpected(v.error());
+    if (!*v)
+        return int64_t{0};
+    return parse_i64_exact(**v);
 }
 
 } // namespace
@@ -216,18 +237,32 @@ std::expected<std::optional<int64_t>, std::string> read_config_i64_strict(Transa
 LifecycleState usage_lifecycle_state(EchoDatabase& db) {
     if (!source_enabled(db, "usage"))
         return LifecycleState::Disabled;
-    const int64_t generation = parse_i64(db.get_config("usage_generation", "0"));
+    // An unreadable or malformed generation fails toward re-baselining, never Active: reading it as
+    // 0 would match a stored active generation of 0 and report Active over a fault (#7287).
+    const auto generation = read_usage_generation_strict(db);
+    if (!generation)
+        return LifecycleState::PendingBaseline;
     const auto active_gen_raw = db.try_get_config("usage_active_generation");
     if (!active_gen_raw.has_value() || !active_gen_raw->has_value())
         return LifecycleState::PendingBaseline; // never baselined, or a read fault --
                                                  // fail toward re-baselining, never Active
     const int64_t active_generation = parse_i64(**active_gen_raw);
-    return (active_generation == generation) ? LifecycleState::Active
-                                             : LifecycleState::PendingBaseline;
+    return (active_generation == *generation) ? LifecycleState::Active
+                                              : LifecycleState::PendingBaseline;
 }
 
 bool usage_set_enabled(EchoDatabase& db, bool enabled, int64_t now) {
-    const int64_t next_generation = parse_i64(db.get_config("usage_generation", "0")) + 1;
+    // An unreadable or malformed generation refuses the edge: bumping from a guessed 0 could land
+    // on the stored active generation and leave a stale baseline reading Active (#7287). The
+    // fold refuses in that state too; the operator repairs the row.
+    const auto current_generation = read_usage_generation_strict(db);
+    if (!current_generation) {
+        spdlog::error("Echo usage: {} transition refused, usage_generation is unreadable ({}); "
+                      "source remains at its previous state",
+                      enabled ? "enable" : "disable", current_generation.error());
+        return false;
+    }
+    const int64_t next_generation = *current_generation + 1;
     auto result = db.checked_transaction(
         [&](TransactionHandle& h) -> std::expected<void, std::string> {
             if (!h.exec(std::format(
@@ -311,10 +346,18 @@ std::expected<void, std::string> usage_ensure_baselined(EchoDatabase& db, int64_
     if (usage_lifecycle_state(db) != LifecycleState::PendingBaseline)
         return {}; // disabled, or already active under the current generation
 
-    const int64_t generation = parse_i64(db.get_config("usage_generation", "0"));
+    // PendingBaseline also covers an unreadable generation; stamping then would delete the open
+    // runs and mark a guessed generation active. Report the fault and stamp nothing (#7287).
+    const auto generation = read_usage_generation_strict(db);
+    if (!generation) {
+        spdlog::warn("Echo usage: baseline attempt refused, usage_generation is unreadable ({}); "
+                     "will retry",
+                     generation.error());
+        return std::unexpected(generation.error());
+    }
 
     auto result = db.checked_transaction(
-        [&](TransactionHandle& h) { return stamp_baseline(h, now, generation); });
+        [&](TransactionHandle& h) { return stamp_baseline(h, now, *generation); });
     if (!result.has_value())
         spdlog::warn("Echo usage: baseline attempt failed ({}); will retry", result.error());
     return result;
@@ -340,7 +383,8 @@ std::expected<bool, std::string> usage_active_in(TransactionHandle& h) {
 }
 
 std::expected<void, std::string> usage_fold_in(TransactionHandle& h, int64_t now,
-                                               const std::vector<ProcessEvent>& events) {
+                                               const std::vector<ProcessEvent>& events,
+                                               UsageSweep sweep) {
     const auto usage_on = source_on(h, "usage");
     if (!usage_on)
         return std::unexpected(usage_on.error());
@@ -435,34 +479,40 @@ std::expected<void, std::string> usage_fold_in(TransactionHandle& h, int64_t now
     // bounds is already capped (kMaxOpenRuns, 0s-duration closes credited to `expired_runs`), so
     // unconditional advance is the chosen tradeoff. `usage_expiry_declined_count` makes every
     // decline countable on a fleet-status surface.
-    const auto anchor = read_config_i64_strict(h, "usage_last_fold_ts");
+    // kDefer (the v10 migration's chunked walk): none of the sweep below runs and the anchor is
+    // neither read nor advanced, so a walk over many chunks is one logical tick judged against
+    // the anchor as it stood before it. The caller runs one kRun fold at the end (#7125).
     bool clock_plausible = false;
     bool anchor_declined = false;
-    if (!anchor.has_value()) {
-        spdlog::warn("Echo usage: declining this tick's open-run expiry sweep -- failed to read the "
-                     "last-fold anchor ({}); re-anchoring to this tick's clock",
-                     anchor.error());
-    } else if (!anchor->has_value()) {
-        // Genuinely no anchor yet -- a freshly-baselined source has no open runs to expire this
-        // early anyway, so declining costs nothing.
-    } else {
-        const int64_t prior_fold_ts = **anchor;
-        clock_plausible =
-            now >= prior_fold_ts && now - prior_fold_ts <= kMaxPlausibleFoldGapSeconds;
-        if (!clock_plausible) {
-            anchor_declined = true;
-            spdlog::warn("Echo usage: declining this tick's open-run expiry sweep -- `now` ({}) is "
-                         "implausible against the last fold's anchor ({}); re-anchoring to this "
-                         "tick's clock so an ordinary sleep/wake self-heals within ~2 ticks",
-                         now, prior_fold_ts);
+    if (sweep == UsageSweep::kRun) {
+        const auto anchor = read_config_i64_strict(h, "usage_last_fold_ts");
+        if (!anchor.has_value()) {
+            spdlog::warn("Echo usage: declining this tick's open-run expiry sweep -- failed to read "
+                         "the last-fold anchor ({}); re-anchoring to this tick's clock",
+                         anchor.error());
+        } else if (!anchor->has_value()) {
+            // Genuinely no anchor yet -- a freshly-baselined source has no open runs to expire this
+            // early anyway, so declining costs nothing.
+        } else {
+            const int64_t prior_fold_ts = **anchor;
+            clock_plausible =
+                now >= prior_fold_ts && now - prior_fold_ts <= kMaxPlausibleFoldGapSeconds;
+            if (!clock_plausible) {
+                anchor_declined = true;
+                spdlog::warn("Echo usage: declining this tick's open-run expiry sweep -- `now` ({}) "
+                             "is implausible against the last fold's anchor ({}); re-anchoring to "
+                             "this tick's clock so an ordinary sleep/wake self-heals within ~2 "
+                             "ticks",
+                             now, prior_fold_ts);
+            }
         }
-    }
-    if (clock_plausible) {
-        for (auto& c : expire_open_runs(state, now))
+        if (clock_plausible) {
+            for (auto& c : expire_open_runs(state, now))
+                closed.push_back(std::move(c));
+        }
+        for (auto& c : cap_open_runs(state))
             closed.push_back(std::move(c));
     }
-    for (auto& c : cap_open_runs(state))
-        closed.push_back(std::move(c));
 
     // ── Daily aggregate: ONE plain additive upsert per (day_ts, exe_key) -- no replay guard is
     // needed: the whole fold is inside the caller's transaction, so a retried tick finds nothing
@@ -515,7 +565,7 @@ std::expected<void, std::string> usage_fold_in(TransactionHandle& h, int64_t now
     // ── echo_config counters, in the SAME transaction ──
     // Unconditional -- see the comment above the anchor read for why a declined tick must still
     // advance this.
-    if (!upsert_config(h, "usage_last_fold_ts", std::to_string(now)))
+    if (sweep == UsageSweep::kRun && !upsert_config(h, "usage_last_fold_ts", std::to_string(now)))
         return std::unexpected(h.error());
     if (anchor_declined) {
         const int64_t prior = read_config_i64_locked(h, "usage_expiry_declined_count");
