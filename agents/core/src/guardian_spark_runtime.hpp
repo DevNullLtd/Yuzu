@@ -754,9 +754,22 @@ public:
         return staged_baseline_count_;
     }
     /// TEST-ONLY: the mirror's current value, for asserting mirror == staged_baselines_.size()
-    /// after every staging operation (the invariant the debug asserts also pin).
+    /// after every staging operation (the invariant the counted self-heal also enforces).
     [[nodiscard]] std::uint64_t staged_baseline_count_mirror_for_test() const noexcept {
         return staged_baseline_count_->load(std::memory_order_relaxed);
+    }
+    /// TEST-ONLY: how many times a read site found the mirror different from the map's real size
+    /// and repaired it (store(size())). Always 0 unless a future write site forgets the mirror;
+    /// never exposed on the wire.
+    [[nodiscard]] std::uint64_t staged_baseline_mirror_resyncs_for_test() const noexcept {
+        return staged_baseline_mirror_resyncs_.load(std::memory_order_relaxed);
+    }
+    /// TEST-ONLY: overwrite the mirror (under registry_mu_) with a value that disagrees with the
+    /// map, to drive the self-heal in snapshot_staged_baselines() and
+    /// erase_staged_baselines_if_unchanged().
+    void skew_staged_baseline_mirror_for_test(std::uint64_t value) {
+        std::lock_guard<std::mutex> lk{registry_mu_};
+        staged_baseline_count_->store(value, std::memory_order_relaxed);
     }
     /// Repeat Unknown evaluations whose guard.unhealthy was edge-suppressed (M1): a rule
     /// stuck errored is re-evaluated every convergence tick to catch recovery, but only the
@@ -2863,11 +2876,21 @@ private:
     /// #5605: mirror of staged_baselines_.size(). Written ONLY under registry_mu_, by
     /// store(staged_baselines_.size()) at the two sites that change the size (the emplace in
     /// stage_baseline_locked and the erase loop in erase_staged_baselines_if_unchanged), so it
-    /// cannot drift if a future site is instrumented only once. Read lock-free through
-    /// staged_baseline_count_source() by GuardianBaselinePersister. Set once at construction,
-    /// never reseated.
+    /// cannot drift if a future site is instrumented only once. If a future write site still
+    /// forgets it, the two read sites that hold the lock (snapshot_staged_baselines and
+    /// erase_staged_baselines_if_unchanged) repair the mismatch with store(size()) and count it
+    /// in staged_baseline_mirror_resyncs_ (one log line, never an abort; the repair is the same
+    /// in every build type). Read lock-free through staged_baseline_count_source() by
+    /// GuardianBaselinePersister. Set once at construction, never reseated.
     std::shared_ptr<std::atomic<std::uint64_t>> staged_baseline_count_ =
         std::make_shared<std::atomic<std::uint64_t>>(0);
+    /// #5605: repaired mirror/map mismatches (see staged_baseline_count_). Written under
+    /// registry_mu_; a relaxed atomic so a test accessor can read it without the lock. The log
+    /// line is emitted only on the 0 -> 1 transition.
+    mutable std::atomic<std::uint64_t> staged_baseline_mirror_resyncs_{0};
+    /// registry_mu_ held. If the mirror disagrees with staged_baselines_.size(), repair it
+    /// (store(size())), count it and log once. Never throws, never aborts.
+    void resync_staged_baseline_mirror_locked() const noexcept;
     std::atomic<int> fail_next_stage_baseline_{0}; ///< TEST-ONLY allocation-failure seam (count)
     mutable std::atomic<bool> fail_next_snapshot_{false}; ///< TEST-ONLY snapshot-throw seam
     std::atomic<bool> fail_next_unstaged_sweep_{false}; ///< TEST-ONLY sweep-throw seam

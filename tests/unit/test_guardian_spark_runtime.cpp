@@ -16255,8 +16255,8 @@ TEST_CASE("#5605 T5: the mirror equals the map size after concurrent staging, sn
                 stagers_done.store(true);
         });
     }
-    // One drainer snapshots and erases in a loop, exactly like the persister's pass. The debug
-    // asserts inside snapshot/erase also check the mirror on every iteration.
+    // One drainer snapshots and erases in a loop, exactly like the persister's pass. The counted
+    // self-heal inside snapshot/erase checks the mirror on every iteration (asserted at the end).
     std::thread drainer([&] {
         while (!stagers_done.load()) {
             const auto got = rt->snapshot_staged_baselines();
@@ -16271,4 +16271,35 @@ TEST_CASE("#5605 T5: the mirror equals the map size after concurrent staging, sn
     rt->erase_staged_baselines_if_unchanged(rt->snapshot_staged_baselines());
     check_mirror_matches(*rt);
     CHECK(rt->staged_baseline_count_mirror_for_test() == 0);
+    CHECK(rt->staged_baseline_mirror_resyncs_for_test() == 0); // no write site ever drifted
+}
+
+TEST_CASE("#5605 T6: a mirror that disagrees with the map is repaired and counted, never an abort",
+          "[spark][runtime][baseline][mirror]") {
+    auto rt = make_rt(std::make_shared<FakeReader>(), std::make_shared<FakeBackend>());
+    rt->stage_baseline_for_test("r1", "/a", "h1");
+    rt->stage_baseline_for_test("r2", "/b", "h2");
+    REQUIRE(rt->staged_baseline_mirror_resyncs_for_test() == 0);
+
+    // snapshot_staged_baselines() repairs a skewed mirror (here too high) and counts it once.
+    rt->skew_staged_baseline_mirror_for_test(7);
+    auto got = rt->snapshot_staged_baselines();
+    CHECK(got.size() == 2); // the snapshot is read from the map, not from the mirror
+    check_mirror_matches(*rt);
+    CHECK(rt->staged_baseline_count_mirror_for_test() == 2);
+    CHECK(rt->staged_baseline_mirror_resyncs_for_test() == 1);
+
+    // erase_staged_baselines_if_unchanged() repairs a skew in the other direction (too low) and
+    // increments the counter again. The second occurrence is counted; the log line is not
+    // observable from here, so only the counter is asserted.
+    rt->skew_staged_baseline_mirror_for_test(0);
+    rt->erase_staged_baselines_if_unchanged(std::span<const CapturedBaseline>{got.data(), 1});
+    check_mirror_matches(*rt);
+    CHECK(rt->staged_baseline_count_mirror_for_test() == 1);
+    CHECK(rt->staged_baseline_mirror_resyncs_for_test() == 2);
+
+    // A consistent mirror is left alone: no further count.
+    (void)rt->snapshot_staged_baselines();
+    rt->erase_staged_baselines_if_unchanged(std::span<const CapturedBaseline>{});
+    CHECK(rt->staged_baseline_mirror_resyncs_for_test() == 2);
 }
