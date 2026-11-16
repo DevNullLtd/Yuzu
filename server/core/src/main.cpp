@@ -535,8 +535,9 @@ int main(int argc, char* argv[]) {
     // MFA / TOTP — SOC 2 CC6.6. See docs/auth-mfa-design.md.
     app.add_option("--mfa-enforcement", cfg.mfa_enforcement,
                    "MFA enforcement (default: optional). \"optional\" = login never requires "
-                   "it; only an administrator can enrol, from Settings (a non-admin needs "
-                   "an enrolment sign-in window). \"admin-only\" = admins must "
+                   "it; only an administrator can enrol, from Settings, so a non-admin cannot "
+                   "enrol itself (see the runbook \"Enrolling a non-admin approver\"). "
+                   "\"admin-only\" = admins must "
                    "enrol before login completes. \"required\" = every role must enrol. "
                    "Under admin-only/required an un-enrolled login is redirected through "
                    "TOTP enrollment (POST /login/mfa/enroll) before a session is minted.")
@@ -546,9 +547,15 @@ int main(int argc, char* argv[]) {
     app.add_option("--mfa-step-up-window-secs", cfg.mfa_step_up_window_secs,
                    "Seconds after a TOTP proof that high-risk endpoints accept the session as "
                    "stepped-up (default: 300). A value <= 0 disables the stale-proof "
-                   "requirement on the 41 central step-up routes: a stale or absent proof is "
-                   "neither refused nor recorded, SAML sessions pass, and the auth store is not "
-                   "read; engine denials and unwired-store refusals still apply and are recorded")
+                   "requirement on the 39 ordinary step-up routes only: a stale or absent proof "
+                   "is neither refused nor recorded, SAML sessions pass, and the auth store is "
+                   "not read; engine denials and unwired-store refusals still apply and are "
+                   "recorded. Two route classes are NOT switched off by <= 0: approval "
+                   "approve/reject always need an enrolled factor and a proof within the "
+                   "approver window, and the two factor-credential routes (regenerate recovery "
+                   "codes, disable MFA) always need a local session with a proof inside the "
+                   "approver window. The approver window is 300 seconds when this value is <= 0, "
+                   "otherwise the smaller of this value and 300")
         ->default_val(300)
         ->envname("YUZU_MFA_STEP_UP_WINDOW_SECS");
     app.add_option("--mfa-login-pending-secs", cfg.mfa_login_pending_secs,
@@ -820,8 +827,10 @@ int main(int argc, char* argv[]) {
     // reset is audited (unlike the manual SQL break-glass it replaces). #1226.
     std::string mfa_reset_user;
     app.add_option("--mfa-reset", mfa_reset_user,
-                   "Break-glass: clear MFA enrollment for the named user, then exit "
-                   "(audited recovery from MFA lockout)");
+                   "Break-glass: clear MFA enrollment for the named user and end its sessions, "
+                   "then exit (audited recovery from MFA lockout; applies the auth and "
+                   "session_store v3 migrations, after which the previous build is not supported "
+                   "against this database)");
 
     // Break-glass arm mode (runs and exits, no server startup). Arms the
     // configured --break-glass-user for --break-glass-window-secs so it can log
@@ -1257,17 +1266,19 @@ int main(int argc, char* argv[]) {
     // disabled state at all (see approver_step_up_window in mfa_factor_state.hpp).
     if (cfg.mfa_step_up_window_secs <= 0) {
         spdlog::warn(
-            "--mfa-step-up-window-secs={} disables the stale-proof requirement on the 41 central "
-            "step-up routes (REST, dashboard and Settings routes; the three JIT-elevation routes "
-            "keep their own 300 s window). On the 41 routes a stale or absent proof is neither "
-            "refused nor "
-            "recorded (no SOC 2 CC6.6 `mfa.step_up.required` evidence row), they will NOT "
-            "re-prompt for MFA proof, SAML sessions pass, and the auth store is not read. "
-            "Engine-principal denials and unwired-auth-store refusals still apply on those "
-            "routes and are still recorded. Set to a positive value (default 300) to restore "
-            "the requirement. The approval decide routes (POST /api/approvals/{{id}}/approve and "
-            "/reject) are the exception: they also require an ENROLLED caller's proof no older "
-            "than 300s regardless of this setting.",
+            "--mfa-step-up-window-secs={} disables the stale-proof requirement on the 39 ordinary "
+            "step-up routes only (REST, dashboard and Settings routes; the three JIT-elevation "
+            "routes keep their own 300 s window). On those 39 a stale or absent proof is neither "
+            "refused nor recorded (no SOC 2 CC6.6 `mfa.step_up.required` evidence row), they will "
+            "NOT re-prompt for MFA proof, SAML sessions pass, and the auth "
+            "store is not read. Engine-principal denials and unwired-auth-store refusals still "
+            "apply on those routes and are still recorded. Set to a positive value (default 300) "
+            "to restore the requirement. Two route classes ignore the setting: the two "
+            "factor-credential routes (regenerate recovery codes, disable MFA) always require a "
+            "local session with a proof inside the approver window, and the approval decide "
+            "routes (POST /api/approvals/{{id}}/approve and /reject) always require an ENROLLED "
+            "caller's proof inside that window; the approver window is 300 s when the setting is "
+            "<= 0 and never more than 300 s.",
             cfg.mfa_step_up_window_secs);
     }
 
@@ -1657,9 +1668,18 @@ int main(int argc, char* argv[]) {
             cfg.ca_dir.empty() ? yuzu::server::auth::default_cert_dir() : cfg.ca_dir;
         auth_key_provider.emplace(key_dir);
         auth_secret_codec.emplace(*auth_key_provider);
-        auth_db = std::make_unique<yuzu::server::AuthDB>(*auth_pg_pool, *auth_secret_codec);
+        // The two host-CLI recovery one-shots open the store WITHOUT the MFA trigger refusal
+        // (#6079): an operator locked out because that check fails must still be able to clear
+        // a factor or arm the break-glass account. Every other mode, serving included, enforces
+        // it, and the serving ServerImpl builds its own stores with the default.
+        const bool recovery_oneshot = !mfa_reset_user.empty() || break_glass_arm;
+        auth_db = std::make_unique<yuzu::server::AuthDB>(
+            *auth_pg_pool, *auth_secret_codec, /*cleanup_interval_secs=*/60,
+            recovery_oneshot ? yuzu::server::MfaBindingCheck::kBypassForRecovery
+                             : yuzu::server::MfaBindingCheck::kEnforce);
         if (!auth_db->is_open()) {
-            spdlog::error("Failed to open the Postgres auth store (auth.users migration failed)");
+            spdlog::error("Failed to open the Postgres auth store (migration or MFA trigger check "
+                          "failed; see the preceding AuthDB log line)");
             return EXIT_FAILURE;
         }
         {
@@ -1996,18 +2016,22 @@ int main(int argc, char* argv[]) {
                          "status and re-run\n";
             return EXIT_FAILURE;
         }
-        // End the account's durable sessions in the same one-shot (#6079). A session that
-        // survived the reset could hold an MFA proof made under the factor just cleared; the
-        // approver gate refuses a proof older than the CURRENT enrolment, but that comparison
-        // rests on the database clock never stepping backward, and a live session also keeps
-        // a password-only account's access. Ending them leaves no such proof to compare.
-        // The delete bumps the durable generation, so every replica drops its cached copy on
-        // its next refresh. A failure here is loud and non-zero: the factor is already
-        // cleared, so the operator must end the sessions by hand.
+        // End the account's durable sessions in the same one-shot (#6079). While the
+        // generation trigger is in force a surviving proof made under the factor just cleared
+        // is already refused: it records the old factor generation and the next enrolment
+        // assigns a different one, so equality fails (no clock is involved). With the trigger
+        // ABSENT (the recovery bypass) the clear does not change the generation, so this delete
+        // is the only barrier. Either way it removes the password access a live session made under
+        // the cleared factor keeps. The delete bumps the durable generation, so
+        // every replica drops its cached copy on its next refresh. A failure here is loud and
+        // non-zero: the factor is already cleared, so the operator must end the sessions by
+        // hand.
         int sessions_ended = 0;
         bool sessions_end_failed = false;
         {
-            yuzu::server::SessionStore sessions(*auth_pg_pool);
+            // Recovery one-shot: opens without the rebind-guard refusal (it only deletes rows).
+            yuzu::server::SessionStore sessions(*auth_pg_pool,
+                                                yuzu::server::MfaBindingCheck::kBypassForRecovery);
             auto ended = sessions.is_open() ? sessions.invalidate_user(mfa_reset_user)
                                             : std::unexpected(yuzu::server::SessionStore::Error{
                                                   "session store did not open"});

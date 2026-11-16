@@ -641,14 +641,13 @@ the same route, and to `POST /api/approvals/{id}/approve` and `POST /api/approva
     request returns `401` with `meta.mfa_step_up_required: true`; the dashboard prompts for the code
     inline, and a script posts the code to `/login/mfa/stepup` and retries (see
     [Step-up on high-risk surfaces](authentication.md#step-up-on-high-risk-surfaces-pr-2)). A proof
-    made before the account's current enrolment does not count: if MFA was disabled and enrolled again,
-    enter a fresh code. If the account itself has been deleted or deactivated while you were signed in,
+    must belong to the factor enrolled now: if MFA was disabled and enrolled again, the request returns the same `401` and you enter a fresh code. If the account itself has been deleted or deactivated while you were signed in,
     the decision is refused: with step-up on (the default) the central check answers first with `401`
     `MFA step-up required`, and `403` `approver_assurance_required:account_unavailable` appears only with
     `--mfa-step-up-window-secs=0` (or when the account is removed in the middle of the request). Either way, sign in again or contact an administrator.
   - **OIDC single sign-on.** There is no local factor to check. The sign-in must have carried an MFA
     method claim (`amr`) from your identity provider, on an ID token issued within the approver window
-    (at most 300 seconds, and shorter if `--mfa-step-up-window-secs` is lower). "Fresh" here means the
+    (at most 300 seconds, and shorter if `--mfa-step-up-window-secs` is set between `1` and `299`). "Fresh" here means the
     provider issued an ID token with an MFA `amr` within the window; the MFA itself may predate the token,
     because the provider can reuse its own session. You are **not** asked for a
     second factor again when you approve; real re-authentication at approval time is a planned
@@ -708,8 +707,8 @@ the same route, and to `POST /api/approvals/{id}/approve` and `POST /api/approva
   tracked in #6098 (the SAML step-up decision is #4935).
 - **`--mfa-step-up-window-secs=0` no longer lowers approval assurance.** The setting turns the step-up
   gate off for the other step-up endpoints, but approve and reject keep their enrolled-factor and
-  300-second proof requirement. A decision made before the upgrade gains no retroactive assurance;
-  see [Upgrading](upgrading.md) for how to review those.
+  300-second proof requirement. A decision made before this control existed gains no retroactive assurance;
+  see [Upgrading](upgrading.md).
 
 **MCP clients cannot approve.** MCP callers authenticate with a bearer token and the MCP transport runs no MFA step-up, so the MCP tools
 `approve_request` and `reject_request` always return a typed refusal, whatever credential the caller used
