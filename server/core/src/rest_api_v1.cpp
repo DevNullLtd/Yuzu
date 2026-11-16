@@ -1718,10 +1718,10 @@ const std::string& openapi_spec() {
       "docs": []
     }},
     {"name": "Events", "description": "Follow a running instruction execution as a JSON event stream, and read executions, their responses and their child executions once they exist.", "x-yuzu-guide": {
-      "overview": ["An execution is one dispatch of an instruction to a set of devices. This group has a live view and a stored view. The live view is a Server-Sent Events stream for one running execution, built for agentic workers that need to react as devices report. The stored view lists executions, returns one execution with optional per-device detail, returns its responses, and lists the executions it spawned.", "Every call is confined to what the caller may see. A caller limited to some management groups sees only executions that involve a device in scope, or that they dispatched themselves, and sees counts and event detail trimmed to that scope."],
+      "overview": ["An execution is one dispatch of an instruction to a set of devices. This group has a live view and a stored view. The live view is a Server-Sent Events stream for one running execution, built for agentic workers that need to react as devices report. The stored view lists executions, returns one execution with optional per-device detail, returns its responses, and lists the executions it spawned.", "Every call is confined to what the caller may see. A caller limited to some management groups sees only executions that involve a device in scope, or that they dispatched themselves, and sees counts and event detail trimmed to that scope. A service-scoped API token is the exception: an execution its minting account dispatched is not visible to it merely because that account dispatched it, and it sees an execution only once an agent in its service scope has a status row for it."],
       "how_it_works": [{"title": "Dispatch", "text": "Dispatching an instruction creates an execution with an id. That id is the only handle the stream needs."}, {"title": "Subscribe", "text": "Call the events stream with execution_id. An execution that is missing, or outside your scope, gives the same 404. An execution that has already finished gives 410."}, {"title": "Stream", "text": "Events arrive as JSON envelopes with numeric ids. A heartbeat event keeps the connection alive while nothing else is sent."}, {"title": "Resume", "text": "After a disconnect, reconnect with since or Last-Event-ID to replay what you missed. If the buffer no longer holds those events, a replay-gap event says which ids are missing."}, {"title": "Read final state", "text": "When the execution is complete, read GET /executions/{id}, its responses and its children to get the final picture."}],
       "tables": [{"title": "Stream event types", "caption": "The last column shows what a caller confined to some management groups receives.", "columns": ["Type", "Meaning", "Confined caller"], "rows": [["agent-transition", "One device changed status", "Only devices in scope"], ["execution-progress", "Running totals for the whole execution", "Not sent"], ["execution-completed", "The execution reached a final state", "Status only"], ["heartbeat", "Liveness signal, empty data", "Sent"], ["replay-gap", "Events between missing_from and missing_to are no longer buffered", "Sent"], ["events-dropped", "This connection fell behind and events were discarded", "Sent"]]}],
-      "access": {"permissions": ["Execution:Read, via the fleet-read check, gates /events, /executions, /executions/{id} and /executions/{id}/children.", "Response:Read, via the fleet-read check, gates /executions/{id}/responses. It is a different securable from Execution:Read, so holding one does not give the other.", "Execution:Execute and then Execution:Read, via the fleet-read check, gate POST /executions/{id}/cancel and POST /executions/{id}/rerun. Neither sends anything to a device: cancel marks the stored execution cancelled, and rerun creates a pending record."], "audit": ["api.v1.events.subscribe, written on each successful subscribe, and as a denied row when the execution is missing or outside the caller's scope. If the success row cannot be saved the stream still starts and the response carries Sec-Audit-Failed: true. A rejected since writes no success row.", "execution.detail.fetch, written when the responses call succeeds and when the detail call is made with include=agents. Both fail with 503 if the row cannot be saved. The detail call also writes a denied row when it answers 404.", "execution.read, written as a denied row by the children call when a confined caller asks about an execution they cannot see.", "execution.cancel and execution.rerun, written by the cancel and rerun calls: an attempted row before the change (503 with Sec-Audit-Failed: true, and no change, if it cannot be saved), then success, denied or failure. A confined caller's denial is identical for a hidden and a nonexistent execution."], "notes": ["The execution's dispatcher is admitted to see it so that a just-dispatched execution does not look missing. This does not bypass the trimming of counts and events for a confined caller.", "A plain list, a plain detail call and a successful children call write no audit row."]},
+      "access": {"permissions": ["Execution:Read, via the fleet-read check, gates /events, /executions, /executions/{id} and /executions/{id}/children.", "Response:Read, via the fleet-read check, gates /executions/{id}/responses. It is a different securable from Execution:Read, so holding one does not give the other.", "Execution:Execute and then Execution:Read, via the fleet-read check, gate POST /executions/{id}/cancel and POST /executions/{id}/rerun. Neither sends anything to a device: cancel marks the stored execution cancelled, and rerun creates a pending record."], "audit": ["api.v1.events.subscribe, written on each successful subscribe, and as a denied row when the execution is missing or outside the caller's scope. If the success row cannot be saved the stream still starts and the response carries Sec-Audit-Failed: true. A rejected since writes no success row.", "execution.detail.fetch, written when the responses call succeeds and when the detail call is made with include=agents. Both fail with 503 if the row cannot be saved. The detail call also writes a denied row whenever it answers 404, for every caller class. A service-scoped API token that polls before an agent in its service scope has replied writes one such row per poll.", "execution.read, written as a denied row by the children call when a caller whose fleet-read scope is engaged (a management-group-confined caller or a service-scoped API token) asks about an execution they cannot see or that does not exist.", "execution.cancel and execution.rerun, written by the cancel and rerun calls: an attempted row before the change (503 with Sec-Audit-Failed: true, and no change, if it cannot be saved), then success, denied or failure. A confined caller's denial is identical for a hidden and a nonexistent execution."], "notes": ["The execution's dispatcher is admitted to see it so that a just-dispatched execution does not look missing. This does not bypass the trimming of counts and events for a confined caller. A service-scoped API token has no dispatcher admission: it sees an execution only once an agent in its service scope has a status row for it, so an execution its minting account dispatched reads as not found until an in-scope agent responds.", "A plain list, a plain detail call that succeeds and a successful children call write no audit row."]},
       "good_to_know": [{"label": "Execution id required", "text": "The stream needs execution_id, matching letters, digits, underscore and hyphen, up to 128 characters. There is no stream across all executions."}, {"label": "Replay window", "text": "Replay comes from a bounded in-memory buffer of 1000 events per execution. With neither since nor Last-Event-ID the buffer is replayed from its start. A since that is not one non-negative whole number is a 400, answered before the stream budget is used and before any success audit row is written. A Last-Event-ID header that is malformed gives no error and replays nothing, so the stream is live only."}, {"label": "Slow readers", "text": "Each connection queues up to 500 events. When it is full the oldest are discarded and an events-dropped event reports how many."}, {"label": "Stream limits", "text": "Each open stream uses a worker from the shared stream budget (--max-sse-streams). Over the limit you get 429 with retry_after_ms. A single principal may hold 16 event streams at once."}, {"label": "Paging does not page", "text": "The list returns up to limit rows with no cursor. limit defaults to 100 and is held between 1 and 500, and a limit that is not a whole number is a 400. pagination.total is the number of rows returned, and page_size always reads 50."}, {"label": "Confined view", "text": "For a confined caller, scope_expression and parameter_values read (redacted - confined view), and the agent counts include only devices in scope. Counts can run low because they only include devices that have already responded."}, {"label": "Per-device detail", "text": "include=agents adds per-device rows and a kpi summary. The match is a substring test on the include value, and this expansion is audited."}, {"label": "Responses paging", "text": "The responses call rejects offset with 400 because the order changes while an execution runs. Use limit (up to 1000) and since. Rows have a narrower shape than the general responses calls."}, {"label": "Children cap", "text": "The children call returns at most 100 executions and sets result_truncated_by_cap inside data when there were more. It has no pagination object."}, {"label": "Degraded reads", "text": "If the execution tracker or response store cannot be read, these calls answer 503 with retry_after_ms. They do not answer 404 or an empty list."}],
       "docs": ["docs/user-manual/rest-api.md", "docs/user-manual/response-store.md"]
     }},
@@ -1889,7 +1889,7 @@ const std::string& openapi_spec() {
       "overview": ["A result set is a saved list of device ids with a name, an owner, a source and an expiry. Operators build one from an inventory query, an Echo SQL query, an instruction run, or a list of ids they already hold. A later query or dispatch can then use the set as its scope with from_result_set:<id>, so each step narrows the one before it.", "Sets are private to the operator who created them. There is no RBAC securable for them and no administrator override. Another operator's set answers exactly like one that does not exist, so ids cannot be probed. Only the routes that reach into fleet data to build a set carry real permission checks.", "A set expires an hour after it is created unless it is pinned. Using a set as the scope of a dispatch pushes the expiry out again, but a scope preview does not. The record shows metadata only. The query that built the set stays on the server for re-evaluation and is not returned."],
       "how_it_works": [{"title": "Produce a set", "text": "An inventory query or a direct create fills the set at once. An Echo SQL query or an instruction run dispatches a command to agents and returns a pending set with no members yet."}, {"title": "Wait for answers", "text": "A background pass runs about every two seconds. It fills a pending set when every targeted agent has answered, or after five minutes with whatever has answered by then. Only successful replies that match the set's matcher become members."}, {"title": "Narrow further", "text": "Pass a set as parent_id when producing the next set, or use from_result_set:<id> in a scope expression. The producers that run a query limit it to the devices the earlier set holds."}, {"title": "Keep or expire", "text": "Pin a set to keep it. Unpinned sets are removed by a sweep that runs about every five minutes once their expiry has passed."}],
       "tables": [{"title": "Ways to make a set", "columns": ["Route", "What runs", "Result", "Permission"], "rows": [["POST /result-sets", "Nothing. You supply device_ids", "materialized at once", "Ownership only. Infrastructure:Read scope applies when device_ids is not empty"], ["POST /result-sets/from-inventory-query", "An inventory query on the server", "materialized at once", "Inventory:Read, management group scoped"], ["POST /result-sets/from-echo-query", "SQL sent to agents (echo sql)", "pending, filled later", "Execution:Execute"], ["POST /result-sets/from-instruction-result", "A stored instruction definition sent to agents", "pending, filled later", "Execution:Execute"], ["POST /result-sets/{id}/re-eval", "The set's own source query, run again", "new pending set", "Execution:Execute"]]}, {"title": "Limits", "columns": ["Limit", "Value", "When it is reached"], "rows": [["Default lifetime", "1 hour", "The sweep removes the set unless it is pinned"], ["Sets per owner", "10000", "Creating another set is refused"], ["Members per set", "100000", "A direct create is refused"], ["Response rows read to fill a pending set", "100000", "The set is marked failed, not filled: it reads device_count 0, agents_failed 0 and partial false, and the reason is in the server log"],["Pinned sets per owner", "50", "Pinning another set is refused"], ["Wait for a pending set", "5 minutes", "The set is filled with the replies received so far"], ["Inventory rows read", "5000", "The inventory query is refused, never cut short"], ["SQL text length", "100000 bytes", "The request is refused"], ["List page size", "50 by default, up to 500", "A whole number outside 1 to 500 falls back to 50. Anything that is not a whole number is a 400"], ["Member page size", "1000 by default, up to 10000", "A whole number outside 1 to 10000 falls back to 1000. Anything that is not a whole number is a 400"]]}],
-      "access": {"permissions": ["Execution:Execute gates from-echo-query, from-instruction-result and re-eval. The dispatch is limited to devices the caller may reach, so hidden devices are never sent the command.", "Inventory:Read, management group scoped, gates from-inventory-query. Devices outside the caller's scope are left out of the match.", "Infrastructure:Read, management group scoped, gates the members list and is applied before paging. It also gates a direct create whose device_ids list is not empty.", "Infrastructure:Write (create, pin, unpin) and Infrastructure:Delete (delete) are borrowed labels for the MCP tier check. They are not grantable RBAC permissions."], "audit": ["result_set.create, written for each create or re-eval attempt that passes validation. The outcome is success, denied or failure, and the detail carries a reason token. The success row is written after the set exists and a failed write does not undo it. A request refused at validation with a 400 (bad JSON, an oversized sql, or RESULT_SET_REEVAL_STALE_SOURCE) writes no row, except that a refusal for a NUL byte in the name, the sql, an instruction parameter or parent_id writes a result_set.create row with outcome denied and reason=field_contains_nul, and a RESULT_SET_SOURCE_NOT_SUPPORTED refusal (a Forensics-tier source) writes one with reason=forensics_source and source_kind. A 409 RESULT_SET_NOT_READY refusal (a pending or failed parent) writes no row.", "result_set.pin, result_set.unpin and result_set.delete, written on success.", "result_set.access, outcome denied, written when an id is not found or not owned by the caller.", "result_set.list, result_set.members and result_set.lineage, outcome failure only, written when the store read fails. Successful reads are not audited.", "result_set.heal, written when re-eval discards a stored query that nests too deeply.", "result_set.create.access_denied, result_set.list.access_denied and the matching verbs for detail, members, lineage, pin, unpin and delete, outcome denied, written when a service-scoped token is refused."], "notes": ["Service-scoped API tokens get a 403 on the nine routes that do not dispatch, and the error names no permission to ask for. The three routes that dispatch (from-echo-query, from-instruction-result, re-eval) rely on the Execution:Execute check instead.", "A token that carries an MCP tier is also held to that tier's policy on create, pin, unpin and delete. Plain sessions and tokens without a tier are not affected by that check.", "Every route here has an MCP twin, for example list_result_sets, create_result_set_from_echo_query and reevaluate_result_set."]},
+      "access": {"permissions": ["Execution:Execute gates from-echo-query, from-instruction-result and re-eval. The dispatch is limited to devices the caller may reach, so hidden devices are never sent the command.", "Inventory:Read, management group scoped, gates from-inventory-query. Devices outside the caller's scope are left out of the match.", "Infrastructure:Read, management group scoped, gates the members list and is applied before paging. It also gates a direct create whose device_ids list is not empty.", "Infrastructure:Write (create, pin, unpin) and Infrastructure:Delete (delete) are borrowed labels for the MCP tier check. They are not grantable RBAC permissions."], "audit": ["result_set.create, written for each create or re-eval attempt that passes validation. The outcome is success, denied or failure, and the detail carries a reason token. The success row is written after the set exists and a failed write does not undo it. A request refused at validation with a 400 (bad JSON) writes no row, except that a missing or oversized sql, or a sql over a raw capture table (RESULT_SET_REEVAL_STALE_SOURCE), on from-echo-query and re-eval writes a result_set.create row with outcome denied and reason=sql_missing, sql_too_large or stale_source (never the sql text), the same stale_source refusal of an echo.sql instruction, on from-instruction-result and on re-eval of an instruction_result set, writes one with source_kind=instruction_result, and a refusal for a NUL byte in the name, the sql, an instruction parameter or parent_id writes a result_set.create row with outcome denied and reason=field_contains_nul, and a RESULT_SET_SOURCE_NOT_SUPPORTED refusal (a Forensics-tier source) writes one with reason=forensics_source and source_kind. A 409 RESULT_SET_NOT_READY refusal (a pending or failed parent) writes no row.", "result_set.pin, result_set.unpin and result_set.delete, written on success.", "result_set.access, outcome denied, written when an id is not found or not owned by the caller.", "result_set.list, result_set.members and result_set.lineage, outcome failure only, written when the store read fails. Successful reads are not audited.", "result_set.heal, written when re-eval discards a stored query that nests too deeply.", "result_set.create.access_denied, result_set.list.access_denied and the matching verbs for detail, members, lineage, pin, unpin and delete, outcome denied, written when a service-scoped token is refused."], "notes": ["Service-scoped API tokens get a 403 on the nine routes that do not dispatch, and the error names no permission to ask for. The three routes that dispatch (from-echo-query, from-instruction-result, re-eval) rely on the Execution:Execute check instead.", "A token that carries an MCP tier is also held to that tier's policy on create, pin, unpin and delete. Plain sessions and tokens without a tier are not affected by that check.", "Every route here has an MCP twin, for example list_result_sets, create_result_set_from_echo_query and reevaluate_result_set."]},
       "good_to_know": [{"label": "Pending sets", "text": "The two dispatching producers and re-eval answer 202 with status pending and device_count 0. Poll GET /result-sets/{id} until status is materialized, or watch source_execution_id on the events stream. A direct create and an inventory query answer 201 with the finished set."}, {"label": "After a dispatch", "text": "If the store fails or the quota is hit after the command was already sent, the error message says so and carries the execution id. Do not send the request again. Look up that execution to see what happened."}, {"label": "Nobody reached", "text": "A 503 with RESULT_SET_NO_AGENTS means the command reached no agent. Targets may be unreachable, hidden from the caller, quarantined, or withheld because containment state could not be read. The response does not say which, because hidden devices must stay hidden."}, {"label": "Parent ids", "text": "On the two dispatching producers parent_id may be an rs_ id or the name of one of the caller's own sets. A direct create and the inventory query take the rs_ id only, and the id in a route path is always an rs_ id. A parent_id that is empty or not a string is rejected with 400 and never ignored."}, {"label": "Inventory query", "text": "The query reads at most 5000 inventory rows. If the read is cut short, or a record cannot be parsed, the route answers 503 and creates nothing, so a set is never narrower than the true match. With parent_id, only members of that parent are kept."}, {"label": "Re-eval", "text": "Only sets made by an Echo query or an instruction run can be re-evaluated. The result is a new set, and a named original gives it the same name with the suffix (re-eval). The original is left alone. The caller's current permission and visibility apply, so the new members can differ. It is refused with 400 if the original was built from a parent set that has since been deleted."}, {"label": "Members and counts", "text": "The members list shows only devices the caller can see, and that narrowing happens before the page limit. The device_count on the set record is not narrowed, so it can be larger than what the list returns."}, {"label": "Unknown ids on create", "text": "If any id in device_ids is unknown or hidden from the caller the whole request is refused with 400. The message names up to 20 of them. An unknown id and a hidden one look the same."}, {"label": "Fail-closed reads", "text": "List, members and lineage answer 503 with retry_after_ms 5000 when the store cannot be read. They never return an empty list for a failed read."}, {"label": "Pin and delete", "text": "A pinned set cannot be deleted until it is unpinned, and the 51st pin is refused. A delete answers 200 with deleted true, not 204."}, {"label": "Input checks", "text": "Each inventory condition is checked before the query runs: plugin, field and op must be strings, and the value must be a string, a number (with a comparison operator) or a boolean (with == or !=). A bad condition is a 400. On from-instruction-result a matcher that is present but not a JSON object, or has a malformed threshold, is a 400 and nothing is dispatched."}, {"label": "Who becomes a member", "text": "An Echo query keeps agents that returned at least one row, or every successful responder when include_empty is true. An instruction run with no matcher keeps every successful responder, and its matcher can ask for any response, a minimum number of Echo rows, or a test on one output column. A responder that failed never qualifies."}],
       "docs": ["docs/user-manual/rbac.md"]
     }},
@@ -2514,7 +2514,7 @@ const std::string& openapi_spec() {
       "get": {"operationId": "getExecutions", "summary": "List executions, fleet-confined", "tags": ["Events"], "description": "REST v1 twin of the dashboard /fragments/executions list fragment and the MCP list_executions tool; all three return the same row shape. Gated on the fleet-read check (Execution:Read), the same check the fragment uses. Rows carry the definition name (resolved + memoized per request) and a truncated last_error_detail preview alongside the existing agents_targeted/responded/success/failure split.", "parameters": [{"name": "definition_id", "in": "query", "required": false, "schema": {"type": "string"}}, {"name": "status", "in": "query", "required": false, "schema": {"type": "string"}}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 100, "maximum": 500}}], "responses": {"200": {"description": "Execution list", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}}, "content": {"application/json": {"schema": {"type": "object", "required": ["data", "pagination", "meta"], "properties": {"data": {"type": "array", "items": {"$ref": "#/components/schemas/ExecutionListRow"}}, "meta": {"$ref": "#/components/schemas/ApiMeta"}, "pagination": {"$ref": "#/components/schemas/ApiPagination"}}}}}}, "400": {"description": "Invalid numeric query parameter"}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Execution:Read)"}, "503": {"description": "Execution tracker not initialised or degraded; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
     },
     "/executions/{id}": {
-      "get": {"operationId": "getExecutionsById", "summary": "Fetch the final state of a single execution, optional per-agent expansion", "tags": ["Events"], "description": "Companion to GET /api/v1/events: when the SSE subscribe returns 410 (execution already terminal), the worker calls this endpoint to fetch the final state in one round-trip. Mirrors the dashboard /fragments/executions/{id}/detail data but JSON-shaped. Gated by the fleet-read check (Execution:Read): an execution with no agent visible to the caller 404s identically to a nonexistent one; a confined caller's counts/last_error_detail are recomputed from only their visible agents, and scope_expression/parameter_values are redacted. The execution's dispatcher is admitted to VIEW it (avoids a false 404 on a just-dispatched execution with no responses yet) but gets the same redacted projection as any other confined caller. ?include=agents adds a confined per-agent status/duration array (agent_id/status/dispatched_at/first_response_at/completed_at/exit_code/error_detail) plus a kpi object (total/succeeded/failed/p50_ms/p95_ms) to the response; this expansion IS audited (execution.detail.fetch, REST fail-closed) because it discloses raw agent identities, unlike the bare request. Response bodies are a SEPARATE route (GET .../responses) on a different securable (Response:Read), not part of this expansion. error_detail (per agent, and last_error_detail): for a command of a Forensics-tier plugin a failure message is kept only when it is a short machine token (scope:cause[:detail], for example windows:amcache:hive_locked); any other text is replaced by the fixed value forensics_error, while status and exit_code are unchanged.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}}, {"name": "include", "in": "query", "required": false, "schema": {"type": "string", "enum": ["agents"]}, "description": "When \"agents\", adds the per-agent array + kpi object described above."}], "responses": {"200": {"description": "Final execution state, optionally with agents[]/kpi", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}}, "content": {"application/json": {"schema": {"type": "object", "required": ["data", "meta"], "properties": {"data": {"$ref": "#/components/schemas/ExecutionDetail"}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}}}}}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Execution:Read)"}, "404": {"description": "Execution not found", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Execution tracker not initialised/degraded, or (when include=agents) the execution.detail.fetch audit row could not persist; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
+      "get": {"operationId": "getExecutionsById", "summary": "Fetch the final state of a single execution, optional per-agent expansion", "tags": ["Events"], "description": "Companion to GET /api/v1/events: when the SSE subscribe returns 410 (execution already terminal), the worker calls this endpoint to fetch the final state in one round-trip. Mirrors the dashboard /fragments/executions/{id}/detail data but JSON-shaped. Gated by the fleet-read check (Execution:Read): an execution with no agent visible to the caller 404s identically to a nonexistent one; a confined caller's counts/last_error_detail are recomputed from only their visible agents, and scope_expression/parameter_values are redacted. The execution's dispatcher is admitted to VIEW it (avoids a false 404 on a just-dispatched execution with no responses yet) but gets the same redacted projection as any other confined caller. A service-scoped API token has no dispatcher admission: it sees an execution only once an agent in its service scope has a status row for it, so an execution its minting account dispatched 404s until an in-scope agent responds. ?include=agents adds a confined per-agent status/duration array (agent_id/status/dispatched_at/first_response_at/completed_at/exit_code/error_detail) plus a kpi object (total/succeeded/failed/p50_ms/p95_ms) to the response; this expansion IS audited (execution.detail.fetch, REST fail-closed) because it discloses raw agent identities, unlike the bare request. Response bodies are a SEPARATE route (GET .../responses) on a different securable (Response:Read), not part of this expansion. error_detail (per agent, and last_error_detail): for a command of a Forensics-tier plugin a failure message is kept only when it is a short machine token (scope:cause[:detail], for example windows:amcache:hive_locked); any other text is replaced by the fixed value forensics_error, while status and exit_code are unchanged.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}}, {"name": "include", "in": "query", "required": false, "schema": {"type": "string", "enum": ["agents"]}, "description": "When \"agents\", adds the per-agent array + kpi object described above."}], "responses": {"200": {"description": "Final execution state, optionally with agents[]/kpi", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}}, "content": {"application/json": {"schema": {"type": "object", "required": ["data", "meta"], "properties": {"data": {"$ref": "#/components/schemas/ExecutionDetail"}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}}}}}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Execution:Read)"}, "404": {"description": "Execution not found", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Execution tracker not initialised/degraded, or (when include=agents) the execution.detail.fetch audit row could not persist; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
     },)json"
         // Split here (MSVC C2026 ~16,380-byte per-literal cap): the merge of the Forensics
         // notes (#4990) and the typed-response schemas grew this segment past the gate ceiling.
@@ -12747,6 +12747,7 @@ void RestApiV1::register_routes(
 
             yuzu::server::ExecutionScope scope_arg; // nullopt = unrestricted
             std::string username;
+            yuzu::server::ExecutionOwnerKey owner; // empty unless a confined, resolved session
             if (gate.scope) {
                 auto session = auth_fn(req, res);
                 if (!session)
@@ -12764,10 +12765,8 @@ void RestApiV1::register_routes(
                         "application/json");
                     return;
                 }
-                yuzu::server::ExecutionListScope s;
-                s.owner = username;
-                s.visible_agents.assign(gate.scope->begin(), gate.scope->end());
-                scope_arg = std::move(s);
+                owner = execution_owner_key(*session);
+                scope_arg = confined_list_scope(owner, gate.scope);
             }
 
             auto execs_opt = execution_tracker->query_executions_checked(q, scope_arg);
@@ -12820,7 +12819,7 @@ void RestApiV1::register_routes(
                     auto it = statuses_opt->find(e.id);
                     const auto& statuses =
                         it != statuses_opt->end() ? it->second : kEmptyStatuses;
-                    if (!execution_visible(e, statuses, gate.scope, username))
+                    if (!execution_visible(e, statuses, gate.scope, owner))
                         continue;
                     auto counts = confined_projection(statuses, gate.scope);
                     ExecutionListRow row;
@@ -13670,8 +13669,10 @@ void RestApiV1::register_routes(
                 for (const auto& a : agents)
                     has_visible_agent = authz::in_scope(gate.scope, a.agent_id) || has_visible_agent;
             }
+            // #5557: the ownership disjunct takes the owner KEY, never the raw username (a
+            // service-scoped session's username is its minter's).
             const bool owns_execution =
-                exec_opt && exec_opt->dispatched_by == session->username;
+                exec_opt && execution_owner_key(*session).owns(*exec_opt);
             const bool visible = !gate.scope || owns_execution || has_visible_agent;
             if (!exec_opt || !visible) {
                 // #1634 (governance Gate 4 consistency-auditor finding): a
@@ -13850,6 +13851,7 @@ void RestApiV1::register_routes(
 
             auto exec_id = req.matches[1].str();
             std::string username;
+            yuzu::server::ExecutionOwnerKey owner; // empty unless a confined, resolved session
             yuzu::server::ExecutionScope scope_arg; // nullopt = unrestricted
             if (gate.scope) {
                 auto session = auth_fn(req, res);
@@ -13876,10 +13878,8 @@ void RestApiV1::register_routes(
                 // the cap-before-scope defect where an invisible sibling
                 // could displace this caller's own visible children out of
                 // the capped window.
-                yuzu::server::ExecutionListScope s;
-                s.owner = username;
-                s.visible_agents.assign(gate.scope->begin(), gate.scope->end());
-                scope_arg = std::move(s);
+                owner = execution_owner_key(*session);
+                scope_arg = confined_list_scope(owner, gate.scope);
             }
 
             auto exec_r = execution_tracker->get_execution_checked(exec_id);
@@ -13907,7 +13907,7 @@ void RestApiV1::register_routes(
 
             const bool parent_visible =
                 exec_opt.has_value() &&
-                execution_visible(*exec_opt, parent_statuses, gate.scope, username);
+                execution_visible(*exec_opt, parent_statuses, gate.scope, owner);
             if (!exec_opt || !parent_visible) {
                 // #3789: audit ONLY under an engaged scope -- matches the
                 // legacy route's identical rationale (compliance-officer F2).
@@ -13956,7 +13956,7 @@ void RestApiV1::register_routes(
                     auto it = child_statuses_opt->find(c.id);
                     const auto& c_statuses =
                         it != child_statuses_opt->end() ? it->second : kEmptyStatuses;
-                    if (!execution_visible(c, c_statuses, gate.scope, username))
+                    if (!execution_visible(c, c_statuses, gate.scope, owner))
                         continue;
                     arr.add_raw(execution_child_row_json(c).dump());
                 }
@@ -14170,6 +14170,8 @@ void RestApiV1::register_routes(
             mreq.what = ExecutionMutation::kCancel;
             mreq.execution_id = req.matches[1].str();
             mreq.username = session->username;
+            // #5557: admission key; `username` stays the real audit identity.
+            mreq.owner = execution_owner_key(*session);
             mreq.scope = gate.scope;
             mreq.audit_context = "surface=rest-v1 cid=" + cid;
             const auto outcome = apply_execution_mutation(
@@ -14269,6 +14271,7 @@ void RestApiV1::register_routes(
             if (!session)
                 return; // auth_fn wrote the 401.
             mreq.username = session->username;
+            mreq.owner = execution_owner_key(*session); // #5557: see the cancel arm
             const auto outcome = apply_execution_mutation(
                 execution_mutation_ports, mreq,
                 [&](const std::string& action, const std::string& result,
@@ -16284,7 +16287,7 @@ void RestApiV1::register_routes(
         // SQL is sandboxed AGENT-side by EchoDatabase::execute_user_query
         // (read-only authorizer, #760/#631) — the server only length-checks.
         sink.Post("/api/v1/result-sets/from-echo-query",
-                  [auth_fn, perm_fn, rs_err, run_async](const httplib::Request& req,
+                  [auth_fn, perm_fn, audit_fn, rs_err, run_async](const httplib::Request& req,
                                                httplib::Response& res) {
                       auto session = auth_fn(req, res);
                       if (!session)
@@ -16320,17 +16323,28 @@ void RestApiV1::register_routes(
                       std::string sql =
                           (body.contains("sql") && body["sql"].is_string()) ? body.value("sql", "")
                                                                              : "";
+                      // #1162: a refused SQL is audited (the text is never put in the detail),
+                      // so a probing operator leaves a trail; a body that is not JSON still is not.
                       if (sql.empty()) {
+                          (void)detail::emit_behavioral_audit(
+                              audit_fn, req, res, "result_set.create", "denied", "ResultSet", "",
+                              "reason=sql_missing source_kind=echo_query");
                           rs_err(res, 400, "RESULT_SET_BAD_REQUEST: 'sql' is required");
                           return;
                       }
                       if (sql.size() > 100000) {
+                          (void)detail::emit_behavioral_audit(
+                              audit_fn, req, res, "result_set.create", "denied", "ResultSet", "",
+                              "reason=sql_too_large source_kind=echo_query");
                           rs_err(res, 400, "RESULT_SET_BAD_REQUEST: 'sql' exceeds 100 KiB");
                           return;
                       }
                       // Roll-up is the only Echo store: a query over a raw capture table
                       // answers with no rows, so the set would silently be empty.
                       if (yuzu::server::rs_matcher::references_raw_capture_table(sql)) {
+                          (void)detail::emit_behavioral_audit(
+                              audit_fn, req, res, "result_set.create", "denied", "ResultSet", "",
+                              "reason=stale_source source_kind=echo_query");
                           rs_err(res, 400, std::string(yuzu::server::rs_matcher::kStaleSourceMessage));
                           return;
                       }
@@ -16385,7 +16399,7 @@ void RestApiV1::register_routes(
         // (column/op/value — design §3.2, applied by the maintenance thread via
         // rs_matcher). Mirrors the Chrome-IR hash-check step (design §10).
         sink.Post("/api/v1/result-sets/from-instruction-result",
-                  [auth_fn, perm_fn, rs_err, instruction_store, run_async](const httplib::Request& req,
+                  [auth_fn, perm_fn, audit_fn, rs_err, instruction_store, run_async](const httplib::Request& req,
                                                                   httplib::Response& res) {
                       auto session = auth_fn(req, res);
                       if (!session)
@@ -16557,6 +16571,9 @@ void RestApiV1::register_routes(
                           yuzu::server::rs_matcher::instruction_reads_raw_capture_table(
                               body.value("params", nlohmann::json::object()),
                               def.parameter_schema)) {
+                          (void)detail::emit_behavioral_audit(
+                              audit_fn, req, res, "result_set.create", "denied", "ResultSet", "",
+                              "reason=stale_source source_kind=instruction_result");
                           rs_err(res, 400, std::string(yuzu::server::rs_matcher::kStaleSourceMessage));
                           return;
                       }
@@ -16751,7 +16768,11 @@ void RestApiV1::register_routes(
                               (sp.is_object() && sp.contains("sql") && sp["sql"].is_string())
                                   ? sp.value("sql", "")
                                   : "";
+                          // #1162: the three refusals below are audited like parent_gone above.
                           if (sql.empty()) {
+                              (void)detail::emit_behavioral_audit(
+                                  audit_fn, req, res, "result_set.create", "denied", "ResultSet",
+                                  id, "reason=sql_missing source_kind=echo_query");
                               rs_err(res, 400, "RESULT_SET_BAD_REQUEST: original carries no SQL");
                               return;
                           }
@@ -16762,12 +16783,18 @@ void RestApiV1::register_routes(
                           // an oversized SQL payload past the dedicated body cap that
                           // exists specifically for this field.
                           if (sql.size() > 100000) {
+                              (void)detail::emit_behavioral_audit(
+                                  audit_fn, req, res, "result_set.create", "denied", "ResultSet",
+                                  id, "reason=sql_too_large source_kind=echo_query");
                               rs_err(res, 400, "RESULT_SET_BAD_REQUEST: 'sql' exceeds 100 KiB");
                               return;
                           }
                           // A set stored over a raw capture table would re-run to an empty
                           // membership with no error: refuse it, nothing is dispatched.
                           if (yuzu::server::rs_matcher::references_raw_capture_table(sql)) {
+                              (void)detail::emit_behavioral_audit(
+                                  audit_fn, req, res, "result_set.create", "denied", "ResultSet",
+                                  id, "reason=stale_source source_kind=echo_query");
                               rs_err(res, 400, std::string(yuzu::server::rs_matcher::kStaleSourceMessage));
                               return;
                           }
@@ -16868,6 +16895,9 @@ void RestApiV1::register_routes(
                               yuzu::server::rs_matcher::instruction_reads_raw_capture_table(
                                   sp.value("params", nlohmann::json::object()),
                                   def->parameter_schema)) {
+                              (void)detail::emit_behavioral_audit(
+                                  audit_fn, req, res, "result_set.create", "denied", "ResultSet",
+                                  id, "reason=stale_source source_kind=instruction_result");
                               rs_err(res, 400, std::string(yuzu::server::rs_matcher::kStaleSourceMessage));
                               return;
                           }
@@ -22741,8 +22771,8 @@ void RestApiV1::register_routes(
             for (const auto& a : *agents_opt)
                 has_visible_agent = authz::in_scope(gate.scope, a.agent_id) || has_visible_agent;
         }
-        const bool owns_execution =
-            exec_opt && exec_opt->dispatched_by == session->username;
+        // #5557: the ownership disjunct takes the owner KEY, never the raw username.
+        const bool owns_execution = exec_opt && execution_owner_key(*session).owns(*exec_opt);
         const bool visible = !gate.scope || owns_execution || has_visible_agent;
         if (!exec_opt || !visible) {
             // Keep nonexistent and outside-scope cases caller-identical. The

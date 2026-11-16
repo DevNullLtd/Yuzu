@@ -200,6 +200,10 @@ std::optional<std::string> apply_definition_fields(const nlohmann::json& body, b
 
 } // namespace
 
+bool json_exceeds_value_budget(std::string_view body, std::size_t max_values) noexcept {
+    return json_exceeds_value_count(body, max_values);
+}
+
 std::optional<std::string> check_dispatch_identifier(std::string_view field,
                                                      std::string_view value) {
     if (value.empty() || value.size() > kMaxDefinitionDispatchIdentifierLen)
@@ -275,7 +279,7 @@ bool clear_stale_yaml_source(const InstructionDefinition& before, InstructionDef
 std::string describe_dispatch_binding_change(const InstructionDefinition& before,
                                              const InstructionDefinition& after) {
     std::string out;
-    // Free-text values (the legacy PUT, which does not bound them, can store plugin / action / concurrency_mode of any length) are
+    // Free-text values (the legacy PUT stores plugin / action / concurrency_mode unbounded) are
     // bounded for the detail, but COMPARED whole: two values equal in their first 128 bytes are
     // still a change.
     const auto shown = [](const std::string& v) {
