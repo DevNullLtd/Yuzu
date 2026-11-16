@@ -1815,6 +1815,26 @@ flip, with a red-first test each:
     - Also below: export of the File debug counters (#7658; the Registry `verify_lost` and `verify_undecided` counters
       are test-only too and should be exported alongside them, a recommendation: #7658 does not yet say so), the audit,
       EDR and SMB sign-in check of item (2), and the Gate 5 flip-time scenarios of item (4).
+    **Flip-blocking under the owner threat model (Dave, 2026-11-16, also posted on #7877).** A local administrator who
+    defeats a Registry guard IS in the Guardian threat model, so a deaf watch that reads Healthy is a security-control
+    failure (I1) at the flip, not only a lost wakeup (I3). Before any `prefer_spark` flip each of these needs code, a
+    measurement, or a fresh explicit owner decision recorded against it:
+    - #7877 item 31: a Registry parent renamed and the original path recreated within one verification interval leaves
+      the watch Healthy and deaf. Detect it before any flip (for example the held-handle name check through a
+      `DuplicateHandle` of the held `HKEY`, which the rig showed to be feasible).
+    - #7877 items 32 and 33: an undecided Registry verification keeps the old handle, and an Ancestor-mode Registry
+      watch is never verified.
+    - The File residual "renamed away and back between two samples" (the same class as item 31): not noticed.
+    - #7877 item 48: decide File's default (opt-in like Registry) or obtain the audit owner's sign-off.
+    - #7877 item 39: the Security-log measurement, for watched directories as well as Registry keys.
+    - #7876: the runtime off switch for the File and Registry mechanisms.
+    - The other E6 (dormancy) rows of this PR's ledger: every dormancy-based E6 is withdrawn at the flip PR and
+      governance re-runs; the band at the flip is the one with E6 removed (UP-1, REG-01, REG-02, REG-04 and REG-15-I2
+      derive HIGH there). `prefer_spark_` is the literal `false` at `agents/core/src/agent.cpp:959-960`, pinned by
+      `tests/test_guardian_emit_stamp_lexical.py`; editing that literal is the forcing function.
+    The opt-in Registry flag's own residual (an estate that enables it keeps the audit-eviction hazard, I2/E4,
+    unmeasured) is an owner-accepted residual deferred to item 39 and #7876, which is why "decide the interval per
+    estate" stays on the list above.
     *Provenance of the figures below.* Anything marked "author-reported" is the author's own report from the Windows
     rig (weecolin, MSVC), made before the governance round: the logs were not retained and it was not re-measured.
     Anything marked "governance-round" was produced on the same rig by the committed cases and the scripted loops and
@@ -2002,7 +2022,7 @@ flip, with a red-first test each:
     escalation.
     **Open residuals of the File fix** (none is claimed as covered): detection is sampled, so a watch can be deaf
     for up to one interval and then stays Faulted until the retry; a rename away and back between two samples is not
-    noticed; an ancestor shelter whose own parent is renamed away is not verified, and whether a rename of an
+    noticed (flip-blocking under the owner threat model, see the at-a-glance list); an ancestor shelter whose own parent is renamed away is not verified, and whether a rename of an
     ancestor of the watched directory moves the handle at all is unmeasured (the 2026-09-21 probe recorded that a
     parent rename is refused while the handle is open); a watch whose directory gives no usable file id is never
     verified (author-reported: on a FAT32 volume no verification ran and the rename went undetected; ReFS, SMB,
@@ -3984,6 +4004,45 @@ Needs its own fix + timeline, tracked separately. Only #2797's spark-branch half
   meet it. No escalation code is built.
 - Owner: Dave (repository owner), who ruled it an accepted observe-only residual. The same person authored the commits, and
   no independent adjudicator reviewed the ruling.
+- Milestone: not assigned.
+- Revisit trigger: before any `prefer_spark` flip.
+
+**#7877 items 31, 32 and 33 and the File away-and-back residual** (a Registry or File watch can read Healthy and
+stay deaf after a rename; review ids REG-04, REG-01, REG-02)
+- Detection signal: none. A watch that missed a rename reports Healthy; the Registry `verify_lost` and
+  `verify_undecided` counters are test-only (#7658).
+- Operator action: none exists beyond restarting the agent or `--spark-disable`. Not confirmed as a documented
+  runbook step.
+- Compensating control: Spark File and Registry are not live (`prefer_spark_` is false in production), so only
+  rig-flipped agents can meet them. The legacy `IGuard` path stays the live detector.
+- Owner: Dave (repository owner), who accepted these as documented residuals deferred to #7877 (item 31 for REG-04,
+  item 32 for REG-01, item 33 for REG-02). The same person authored the commits and no independent adjudicator
+  reviewed the acceptance. On 2026-11-16 the owner ruled that a local administrator defeating a Registry guard is in
+  the threat model, so each of these, and the File "renamed away and back between samples" residual, is an I1
+  (security-control failure) at the flip and flip-blocking, not only I3.
+- Milestone: not assigned.
+- Revisit trigger: before any `prefer_spark` flip.
+
+**The File verification default and the Security-log hazard** (the File twin of REG-15-I2; #7877 items 39 and 48,
+#7876; review ids XP-P4, UP-MIT-4)
+- Detection signal: none. The audit events are written to the host Security log; Yuzu does not count them.
+- Operator action: none exists beyond `--spark-disable`; the runtime off switch is owed (#7876).
+- Compensating control: not live (`prefer_spark_` is false). Disclosed in the flip-gate text above, not mitigated:
+  File verifies every watched directory every 5 s by default.
+- Owner: Dave. Owner ruling 2026-11-16: a pre-flip decision only, either File's default (opt-in like Registry) or the
+  audit owner's sign-off. No independent adjudicator.
+- Milestone: not assigned.
+- Revisit trigger: before any `prefer_spark` flip.
+
+**The opt-in Registry path verification flag** (the residual of the REG-15-I2 mitigation; #7877 item 39, #7876)
+- Detection signal: none for the Security-log eviction itself (unmeasured); the boot log line states whether the
+  verification is off or on and at what interval.
+- Operator action: leave `--spark-registry-path-verify-interval` at its default of 0 where the watched keys carry
+  auditing SACLs, and decide the interval per estate before enabling it anywhere.
+- Compensating control: the verification is OFF by default, so the default configuration does not open watched keys
+  periodically. An estate that opts in keeps the audit-eviction hazard (I2, E4; E4 is not a downgrade).
+- Owner: Dave. Owner-accepted residual (2026-11-16), deferred to item 39 and #7876; no independent adjudicator; Gate
+  7/8 did not pass on this row.
 - Milestone: not assigned.
 - Revisit trigger: before any `prefer_spark` flip.
 
