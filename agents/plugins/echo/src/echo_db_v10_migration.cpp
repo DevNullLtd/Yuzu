@@ -1304,8 +1304,8 @@ private:
 
         // Usage is fed here, apart from the tiers, in ONE id-ordered walk over every row past the
         // usage cursor whatever its ts: usage pairs a stop with its start, so a run that
-        // straddles the roll-up mark must arrive start first, and the tier walk above reads only
-        // rows at or past the mark (the old roll-up already summarised the rest into the tiers).
+        // straddles the roll-up mark must arrive start first, and the tier walk above reads rows
+        // below the stored mark only through the held-bucket test, so it cannot serve usage.
         if (def.name == "process" && usage_hwm != std::numeric_limits<int64_t>::max()) {
             const auto fed = for_each_chunk(
                 h_, def.name, *cols, std::numeric_limits<int64_t>::min(),
