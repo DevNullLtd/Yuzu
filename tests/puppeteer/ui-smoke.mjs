@@ -3,21 +3,26 @@
 //   1. NAV CRAWL  every shell nav route answers 200 with the CSP header and no page errors,
 //                 and the discovered set matches EXPECTED (nav drift fails both ways).
 //   2. OVERFLOW   submit controls stay inside their form/dialog and the viewport (#5576).
-//   3. SCENARIOS  six scenarios: five that each force their own precondition (#6076, add user,
+//   3. SCENARIOS  nine scenarios: five that each force their own precondition (#6076, add user,
 //                 #5840, #6074, #6749), with writes answered by a request stub so nothing is
-//                 written to the server, and the DEX Apps tab (AP-3.2): a live keyboard half, then
-//                 a committed golden page served through a GET stub.
+//                 written to the server; the DEX Apps tab (AP-3.2): a live keyboard half, then a
+//                 committed golden page served through a GET stub; a held Apps response superseded
+//                 by Overview (dex-pane-sync); the DEX controls operated from the keyboard
+//                 (dex-keyboard); and the Find software panel on /software (SAM-18): live
+//                 searches, then Load more through a GET stub.
 // One line per check; exit 1 when any check fails.
 //
-// `--selftest` needs no stack and no login: it proves the checks can fail, against a local
-// fixture server (see the SELFTEST section).
+// `--selftest` needs no stack and no login: it proves the crawl, overflow and Apps-expander checks
+// can fail, against a local fixture server (see the SELFTEST section). The scenarios themselves
+// need the live app: the selftest does not run them, only the expander half that also runs against
+// the committed golden. The selftest runs in CI (ui-smoke-selftest.yml); the live half runs in /test.
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   DESKTOP, NARROW, WAIT_MS, assertCsp, cfg, clearStubs, launch, login, quiesce, requestLog,
-  setValue, settled, stub, submitControlsInBounds, trace, visit, watch,
+  setValue, settled, stub, submitControlsInBounds, trace, visit, waitAborted, watch,
 } from './lib/harness.mjs';
 
 // The shell nav hrefs of server/core/src/app_shell.cpp (kOperate, kInstructionsSub, kPosture,
@@ -283,11 +288,11 @@ async function openAppsTab(page) {
   // Wait for htmx to have bound the tab (it sets its internal data when it processes the swapped
   // fragment); a click before that is a no-op and the tab never opens.
   await at('Apps tab bound by htmx', page.waitForFunction(() => {
-    const a = [...document.querySelectorAll('#guardian-detail .gp-subnav a')].find((x) => x.textContent.trim() === 'Apps');
+    const a = [...document.querySelectorAll('#guardian-detail .gp-subnav button')].find((x) => x.textContent.trim() === 'Apps');
     return !!a && !!a['htmx-internal-data'];
   }, { timeout: WAIT_MS }));
   const tab = await page.evaluateHandle(() =>
-    [...document.querySelectorAll('#guardian-detail .gp-subnav a')].find((a) => a.textContent.trim() === 'Apps'));
+    [...document.querySelectorAll('#guardian-detail .gp-subnav button')].find((a) => a.textContent.trim() === 'Apps'));
   await tab.click();
   await at('Apps fragment (#dex-apps)', page.waitForSelector('#dex-apps', { timeout: WAIT_MS }));
   await at('htmx settled', settled(page));
@@ -304,6 +309,75 @@ const versionRowDisplay = (page) => page.$eval('tbody.dx-app .dx-ver', (r) => ge
 // boxes (getClientRects is not empty), so visibility, not geometry, is the test.
 const decompositionShown = (page) => page.$eval('details.dx-score .dx-ded', (d) => d.checkVisibility());
 
+// The versions expander opens and closes from the keyboard. Each wait names itself, so a failure says
+// which transition did not happen. `waitMs` is short in the selftest, which feeds it a page whose
+// :has() rules were removed and expects the open wait to time out.
+async function checkAppsExpander(page, waitMs) {
+  const shut = await versionRowDisplay(page);
+  await page.focus('details.dx-vx > summary');
+  await page.keyboard.press('Enter');
+  await at('version rows shown after opening the expander', page.waitForFunction(
+    () => getComputedStyle(document.querySelector('tbody.dx-app .dx-ver')).display === 'table-row',
+    { timeout: waitMs }));
+  await page.keyboard.press('Enter');
+  await at('version rows hidden after closing the expander', page.waitForFunction(
+    () => getComputedStyle(document.querySelector('tbody.dx-app .dx-ver')).display === 'none',
+    { timeout: waitMs }));
+  check('dex-apps golden: the versions expander opens and closes from the keyboard', shut === 'none');
+}
+
+// #7514: what the browser exposes to assistive technology for the expander. A closed <details>
+// exposes only its summary; opened, it must expose non-empty text (the visually hidden sentence), not
+// an empty region. Read from the browser's accessibility tree over CDP (page.accessibility is not
+// relied on); the before and after subtree is printed for the PR record.
+const EXPANDER_SENTENCE = 'The version rows follow this row in the table.';
+
+async function axSubtree(page) {
+  const cdp = await page.createCDPSession();
+  try {
+    const { nodes } = await cdp.send('Accessibility.getFullAXTree');
+    const byId = new Map(nodes.map((n) => [n.nodeId, n]));
+    const label = (n) => (n.role && n.role.value) + (n.name && n.name.value ? ' "' + n.name.value + '"' : '');
+    const lines = [];
+    const walk = (n, depth) => {
+      lines.push('  '.repeat(depth) + label(n) + (n.ignored ? ' (ignored)' : ''));
+      for (const c of n.childIds || []) if (byId.has(c)) walk(byId.get(c), depth + 1);
+    };
+    // The expander is the parent of the disclosure triangle whose name is "N versions".
+    const tri = nodes.find((n) => !n.ignored && n.role && n.role.value === 'DisclosureTriangle' &&
+      n.name && /versions?$/.test(n.name.value));
+    if (tri && tri.parentId && byId.has(tri.parentId)) walk(byId.get(tri.parentId), 0);
+    const text = nodes.filter((n) => !n.ignored && n.role && n.role.value === 'StaticText' && n.name &&
+      n.name.value.includes(EXPANDER_SENTENCE)).length;
+    return { tree: lines.join('\n'), sentenceNodes: text, found: !!tri };
+  } finally {
+    await cdp.detach();
+  }
+}
+
+async function checkExpanderAccessibility(page) {
+  const closed = await axSubtree(page);
+  await page.focus('details.dx-vx > summary');
+  await page.keyboard.press('Enter');
+  await at('expander open for the accessibility read', page.waitForFunction(
+    () => document.querySelector('details.dx-vx').open, { timeout: WAIT_MS }));
+  const open = await axSubtree(page);
+  console.log('INFO dex-apps golden: accessibility tree of the expander, closed:\n' + closed.tree);
+  console.log('INFO dex-apps golden: accessibility tree of the expander, open:\n' + open.tree);
+  check('dex-apps golden: a closed expander exposes no hidden sentence', closed.found && closed.sentenceNodes === 0,
+    JSON.stringify({ found: closed.found, nodes: closed.sentenceNodes }));
+  check('dex-apps golden: the opened expander exposes non-empty text in the accessibility tree',
+    open.found && open.sentenceNodes >= 1, JSON.stringify({ found: open.found, nodes: open.sentenceNodes }));
+  await page.keyboard.press('Enter'); // leave it closed for the checks that follow
+  await at('expander closed again', page.waitForFunction(
+    () => !document.querySelector('details.dx-vx').open, { timeout: WAIT_MS }));
+}
+
+// htmx 2.0.4 binds a freshly swapped control a moment AFTER the swap settles (it stores its internal data
+// on the element), and a key press before that is a no-op. Wait for the binding before pressing Enter.
+const htmxBound = (page, selector) => page.waitForFunction(
+  (sel) => [...document.querySelectorAll(sel)].every((c) => !!c['htmx-internal-data']), { timeout: WAIT_MS }, selector);
+
 async function scenarioDexApps(page) {
   const w = watch(page);
 
@@ -314,6 +388,7 @@ async function scenarioDexApps(page) {
   const liveText = await page.$eval('#dex-apps', (e) => e.textContent);
   check('dex-apps live: the Apps tab shows the model, not the "Application stability is unavailable" panel',
     !liveText.includes('Application stability is unavailable'), liveText.slice(0, 200));
+  await htmxBound(page, '#dex-apps button.gp-chip');
   await page.evaluate(() => {
     [...document.querySelectorAll('#dex-apps button.gp-chip')].find((c) => c.textContent.trim() === 'Windows').focus();
   });
@@ -330,22 +405,15 @@ async function scenarioDexApps(page) {
   const rule = await stub(page, { path: '/fragments/dex/apps', status: 200, contentType: 'text/html', body });
   await openAppsTab(page);
   check('dex-apps golden: the stub answered the Apps request, so the page under test is the golden',
-    rule.calls.length > 0, 'stub calls: ' + rule.calls.length);
+    rule.calls.length === 1, 'stub calls: ' + rule.calls.length);
   const have = await page.evaluate(() => ({
     tog: !!document.querySelector('details.dx-vx'), sc: !!document.querySelector('details.dx-score'),
   }));
   check('dex-apps golden: the page has a versions expander and a score decomposition', have.tog && have.sc,
     JSON.stringify(have));
   if (have.tog && have.sc) {
-    const shut = await versionRowDisplay(page);
-    await page.focus('details.dx-vx > summary');
-    await page.keyboard.press('Enter');
-    await page.waitForFunction(() => getComputedStyle(document.querySelector('tbody.dx-app .dx-ver')).display === 'table-row',
-      { timeout: WAIT_MS });
-    await page.keyboard.press('Enter');
-    await page.waitForFunction(() => getComputedStyle(document.querySelector('tbody.dx-app .dx-ver')).display === 'none',
-      { timeout: WAIT_MS });
-    check('dex-apps golden: the versions expander opens and closes from the keyboard', shut === 'none');
+    await checkAppsExpander(page, WAIT_MS);
+    await checkExpanderAccessibility(page);
 
     const before = await decompositionShown(page);
     await page.focus('details.dx-score > summary');
@@ -360,7 +428,7 @@ async function scenarioDexApps(page) {
     // A 256-byte image name with no break opportunity must wrap inside the first column rather than
     // run under the Score cell (the column is fixed-width: table-layout:fixed).
     const fit = await page.evaluate(() => {
-      const a = document.querySelector('tbody.dx-app .dx-apphead td:first-child > a');
+      const a = document.querySelector('tbody.dx-app .dx-apphead td:first-child > .dx-lk');
       a.textContent = 'W'.repeat(256);
       const td = a.parentElement;
       return { scroll: td.scrollWidth, client: td.clientWidth };
@@ -373,7 +441,7 @@ async function scenarioDexApps(page) {
     // one line; the anchor is measured against its own nowrap height, so no font metric is assumed.
     await page.setViewport({ width: 1000, height: DESKTOP.height });
     const narrow = await page.evaluate(() => {
-      const a = document.querySelector('tbody.dx-app .dx-apphead td:first-child > a');
+      const a = document.querySelector('tbody.dx-app .dx-apphead td:first-child > .dx-lk');
       a.textContent = 'msedgewebview2.exe';
       const wrapped = a.offsetHeight;
       a.style.whiteSpace = 'nowrap';
@@ -388,6 +456,117 @@ async function scenarioDexApps(page) {
   await quiesce(page);
   check('dex-apps golden: no page error and no CSP violation while the stubbed page is exercised',
     w.errors().length === 0, JSON.stringify(w.errors()));
+  clearStubs(page);
+}
+
+// #7522: a slow response for a view the viewer has left must not replace the current view. The Apps
+// request is held in the browser, Overview is opened, and only then is the held response released.
+// htmx cancels the superseded request (hx-sync on the pane), so releasing it changes nothing. The
+// abort is observed (request-failed event, or htmx's abort event), so a pass proves the mechanism and
+// not merely an end state that a never-delivered response would also produce.
+async function scenarioDexPaneSync(page) {
+  const w = watch(page);
+  let release;
+  const hold = new Promise((resolve) => { release = resolve; });
+  const apps = await stub(page, {
+    path: '/fragments/dex/apps', status: 200, contentType: 'text/html',
+    body: '<div id="dex-apps">late Apps response</div>', hold,
+  });
+  await at('open /dex', visit(page, '/dex'));
+  const tab = (name) => page.evaluateHandle((n) =>
+    [...document.querySelectorAll('#guardian-detail .gp-subnav button')].find((b) => b.textContent.trim() === n), name);
+  await at('tabs bound by htmx', page.waitForFunction(() => {
+    const bs = [...document.querySelectorAll('#guardian-detail .gp-subnav button')];
+    return bs.length > 0 && bs.every((b) => !!b['htmx-internal-data']);
+  }, { timeout: WAIT_MS }));
+
+  const arrived = page.waitForRequest((r) => new URL(r.url()).pathname === '/fragments/dex/apps', { timeout: WAIT_MS });
+  await (await tab('Apps')).click();
+  await at('the Apps request reached the stub', arrived);
+  const overview = page.waitForResponse((r) => new URL(r.url()).pathname === '/fragments/dex/overview',
+    { timeout: WAIT_MS });
+  await (await tab('Overview')).click();
+  await at('the Overview response', overview);
+  await at('htmx settled', settled(page));
+  await at('Overview heading shown', page.waitForFunction(
+    () => [...document.querySelectorAll('#guardian-detail h1')].some((h) => h.textContent.trim() === 'DEX'),
+    { timeout: WAIT_MS }));
+  await at('the held Apps request observed cancelled', waitAborted(page, apps));
+  check('dex-pane-sync: the superseded Apps request was cancelled by the page', apps.aborted === true,
+    'aborted: ' + apps.aborted);
+
+  release();
+  await quiesce(page);
+  const after = await page.evaluate(() => ({
+    overview: [...document.querySelectorAll('#guardian-detail h1')].some((h) => h.textContent.trim() === 'DEX'),
+    apps: !!document.querySelector('#dex-apps'),
+  }));
+  check('dex-pane-sync: a late Apps response does not replace the Overview', after.overview && !after.apps,
+    JSON.stringify(after));
+  check('dex-pane-sync: the Apps stub saw exactly one request', apps.calls.length === 1,
+    'calls: ' + apps.calls.length);
+  // htmx itself logs these two events through console.error when hx-sync cancels the superseded request,
+  // which is exactly what this scenario provokes; any other page error or CSP violation still fails.
+  const pageErrs = w.errors().filter((e) => e !== 'htmx:afterRequest' && e !== 'htmx:sendAbort');
+  check('dex-pane-sync: no page error and no CSP violation', pageErrs.length === 0, JSON.stringify(pageErrs));
+  clearStubs(page);
+}
+
+// #7505: the DEX controls are operated with focus and Enter only, never a mouse click: the Apps tab, a
+// window chip, and (on the committed golden, so the data does not depend on the stack) an application
+// link.
+async function scenarioDexKeyboard(page) {
+  const w = watch(page);
+  await at('open /dex', visit(page, '/dex'));
+  const focusIn = (selector, text) => page.evaluate((sel, t) => {
+    const el = [...document.querySelectorAll(sel)].find((x) => x.textContent.trim() === t);
+    if (!el) throw new Error('no ' + sel + ' "' + t + '"');
+    el.focus();
+    return document.activeElement === el;
+  }, selector, text);
+  await at('Apps tab bound by htmx', page.waitForFunction(() => {
+    const b = [...document.querySelectorAll('#guardian-detail .gp-subnav button')].find((x) => x.textContent.trim() === 'Apps');
+    return !!b && !!b['htmx-internal-data'];
+  }, { timeout: WAIT_MS }));
+  check('dex-keyboard: the Apps tab takes focus', await focusIn('#guardian-detail .gp-subnav button', 'Apps'));
+  await page.keyboard.press('Enter');
+  await at('Apps fragment (#dex-apps)', page.waitForSelector('#dex-apps', { timeout: WAIT_MS }));
+  await at('htmx settled', settled(page));
+
+  await htmxBound(page, '#dex-apps button.gp-chip');
+  check('dex-keyboard: a window chip takes focus', await focusIn('#dex-apps button.gp-chip', '30d'));
+  await page.keyboard.press('Enter');
+  await at('30d chip lit', page.waitForFunction(() => {
+    const b = [...document.querySelectorAll('#dex-apps button.gp-chip')].find((c) => c.textContent.trim() === '30d');
+    return !!b && b.classList.contains('on') && b.getAttribute('aria-pressed') === 'true';
+  }, { timeout: WAIT_MS }));
+  await at('htmx settled', settled(page));
+
+  // golden: the application link, with its drill target answered by a stub so nothing depends on data.
+  const body = readFileSync(APPS_GOLDEN, 'utf8');
+  await stub(page, { path: '/fragments/dex/apps', status: 200, contentType: 'text/html', body });
+  const drill = await stub(page, { path: '/fragments/dex/app', status: 200, contentType: 'text/html',
+    body: '<div id="dex-app-stub">drill</div>' });
+  await htmxBound(page, '#guardian-detail .gp-subnav button');
+  check('dex-keyboard: the Apps tab takes focus again', await focusIn('#guardian-detail .gp-subnav button', 'Apps'));
+  await page.keyboard.press('Enter');
+  await at('golden Apps fragment', page.waitForSelector('tbody.dx-app .dx-apphead td:first-child > .dx-lk', { timeout: WAIT_MS }));
+  await at('htmx settled', settled(page));
+  await htmxBound(page, 'tbody.dx-app .dx-lk');
+  const focused = await page.evaluate(() => {
+    const el = document.querySelector('tbody.dx-app .dx-apphead td:first-child > .dx-lk');
+    el.focus();
+    return { ok: document.activeElement === el, tag: el.tagName };
+  });
+  check('dex-keyboard: the first application link is a focusable button', focused.ok && focused.tag === 'BUTTON',
+    JSON.stringify(focused));
+  await page.keyboard.press('Enter');
+  await at('application drill rendered', page.waitForSelector('#dex-app-stub', { timeout: WAIT_MS }));
+  check('dex-keyboard: Enter on the application link requested the drill-down',
+    drill.calls.length === 1 && requestLog(page).some((r) => r.path === '/fragments/dex/app'),
+    'drill calls: ' + drill.calls.length);
+  await quiesce(page);
+  check('dex-keyboard: no page error and no CSP violation', w.errors().length === 0, JSON.stringify(w.errors()));
   clearStubs(page);
 }
 
@@ -482,6 +661,112 @@ async function scenarioEngineAudit(page) {
     (await banners()).length === 0 && w.pageErrors().length === 0, JSON.stringify(w.pageErrors()));
 }
 
+// SAM-18: the Find software panel on /software. The panel is form- and button-driven and the CSP
+// has no 'unsafe-eval', so only a run shows that a click executes. Two halves, both always run:
+//   live  an Applications search, Copy REST call (against a clipboard stub), the Java chip and back,
+//         all against the real server: each answer is a result or a real zero, never the "Inventory
+//         store unavailable" banner, so the production closures behind the fragment run on every /test
+//   stub  a first page with a Load more button and its continuation, served through GET stubs of the
+//         fragment: focus must land on the first new row's host link (data-act="fmore")
+// The stub markup carries the attributes the renderer pins in test_software_page_ui.cpp.
+const FIND = '/fragments/inventory/software/find';
+const FIND_DOWN = 'Inventory store unavailable';
+const findCell = (id, host) => '<tr><td><a class="inv-hostlink" href="/hardware/ci?id=' + id + '">' + host +
+  '</a></td><td>-</td><td>1.0</td><td>-</td><td>-</td><td>-</td><td>-</td><td>-</td></tr>';
+const findGroup = (n) => '<tr class="fs-vgrp"><td colspan="8"><span class="inv-mono">1.0</span> ' + n + ' installs on this page</td></tr>';
+const FIND_FIRST = '<div class="inv-panel"><table class="inv-tbl"><tbody>' + findGroup(1) + findCell('smoke-a1', 'smoke-host-1') +
+  '<tr class="inv-more"><td colspan="8"><button type="button" class="inv-btn pri" data-act="fmore" ' +
+  'hx-get="' + FIND + '?name=smoke-pkg&amp;kind=app&amp;cursor=smoke-c1&amp;shown=1" hx-target="closest tr" ' +
+  'hx-swap="outerHTML" hx-disabled-elt="this">Load 50 more rows</button></td></tr></tbody></table></div>';
+const FIND_MORE = findGroup(1) + findCell('smoke-a2', 'smoke-host-2') +
+  '<tr class="inv-more"><td colspan="8"><span class="inv-grey">All 2 matching rows are loaded.</span></td></tr>';
+
+// Runs `act` (a submit) and resolves with the first-page Find response of that kind it causes.
+async function findAnswer(page, kind, act) {
+  const [res] = await Promise.all([
+    at('Find response (kind=' + kind + ')', page.waitForResponse((r) => {
+      const u = new URL(r.url());
+      return u.pathname === FIND && u.searchParams.get('kind') === kind && !u.searchParams.has('cursor');
+    }, { timeout: WAIT_MS })),
+    act(),
+  ]);
+  await settled(page);
+  return res;
+}
+
+async function scenarioFindSoftware(page) {
+  const w = watch(page);
+  await trace(page);
+  await at('open /software', visit(page, '/software'));
+  // Wait for htmx to have bound the form; a submit before that is a plain page navigation.
+  await at('Find form bound by htmx', page.waitForFunction(() => {
+    const f = document.getElementById('fs-form');
+    return !!f && !!f['htmx-internal-data'];
+  }, { timeout: WAIT_MS }));
+  const results = () => page.$eval('#fs-results', (e) => e.textContent);
+
+  // live: a name no estate carries, so the answer is a real zero or whatever the stack holds.
+  await page.type('#fs-name', 'smoke-no-such-package');
+  const app = await findAnswer(page, 'app', () => page.click('#fs-form button[type="submit"]'));
+  const appText = await results();
+  const appRows = await page.$eval('#fs-results', (e) => !!e.querySelector('.fs-cards, table.inv-tbl'));
+  check('find live: an Applications search answers 200 with a result or a real zero, not the unavailable banner',
+    app.status() === 200 && (appRows || /Nothing found\./.test(appText)) && !appText.includes(FIND_DOWN),
+    JSON.stringify({ status: app.status(), appRows, text: appText.slice(0, 200) }));
+
+  await page.evaluate(() => {
+    window.__fsCopied = null;
+    Object.defineProperty(navigator, 'clipboard', { configurable: true,
+      value: { writeText: (t) => { window.__fsCopied = t; return Promise.resolve(); } } });
+  });
+  const want = await page.$eval('#fs-results [data-fs-copy]', (b) => location.origin + b.getAttribute('data-fs-copy'));
+  await page.click('#fs-results [data-fs-copy]');
+  const copied = await page.evaluate(() => window.__fsCopied);
+  check('find live: Copy REST call writes the origin plus the call line it shows', copied === want,
+    JSON.stringify({ copied, want }));
+
+  const java = await findAnswer(page, 'java', () => page.click('.inv-chip[data-fs-kind="java"]'));
+  const jv = await page.evaluate(() => ({
+    kind: document.getElementById('fs-kind').value,
+    java: document.querySelector('.inv-chip[data-fs-kind="java"]').getAttribute('aria-pressed'),
+    app: document.querySelector('.inv-chip[data-fs-kind="app"]').getAttribute('aria-pressed'),
+    text: document.getElementById('fs-results').textContent,
+  }));
+  check('find live: the Java chip moves the kind and the component search answers with its coverage note',
+    java.status() === 200 && jv.kind === 'java' && jv.java === 'true' && jv.app === 'false' &&
+    /Coverage\./.test(jv.text) && !jv.text.includes(FIND_DOWN), JSON.stringify({ ...jv, text: jv.text.slice(0, 200) }));
+  const back = await findAnswer(page, 'app', () => page.click('.inv-chip[data-fs-kind="app"]'));
+  check('find live: the Applications chip returns to the application model',
+    back.status() === 200 && (await page.$eval('#fs-kind', (n) => n.value)) === 'app' &&
+    !(await results()).includes(FIND_DOWN));
+
+  // stub: the first page offers Load more; focus must land on the first new row's host link.
+  const more = await stub(page, { path: FIND, search: 'cursor=smoke-c1', contentType: 'text/html', body: FIND_MORE });
+  const first = await stub(page, { path: FIND, search: 'name=smoke-pkg', contentType: 'text/html', body: FIND_FIRST });
+  await setValue(page, '#fs-name', 'smoke-pkg');
+  await findAnswer(page, 'app', () => page.click('#fs-form button[type="submit"]'));
+  // htmx binds swapped-in content in its settle step (20 ms after the swap); a click before that is a no-op.
+  await at('Load more bound by htmx', page.waitForFunction(() => {
+    const b = document.querySelector('#fs-results button[data-act="fmore"]');
+    return !!b && !!b['htmx-internal-data'];
+  }, { timeout: WAIT_MS }));
+  await page.click('#fs-results button[data-act="fmore"]');
+  await at('focus on the first new row\'s host link', page.waitForFunction(() => {
+    const a = document.activeElement;
+    return !!a && a.getAttribute('href') === '/hardware/ci?id=smoke-a2';
+  }, { timeout: WAIT_MS }));
+  const done = await page.$eval('#fs-results', (e) => ({ fmore: !!e.querySelector('[data-act="fmore"]'),
+    rows: e.querySelectorAll('a.inv-hostlink').length, text: e.textContent }));
+  check('find stub: Load more replaces its row with the next page and focus lands on the first new row',
+    first.calls.length === 1 && more.calls.length === 1 && !done.fmore && done.rows === 2 &&
+    done.text.includes('All 2 matching rows are loaded.'), JSON.stringify({ first: first.calls.length,
+      more: more.calls.length, done: { ...done, text: done.text.slice(-80) } }));
+
+  await quiesce(page);
+  check('find: no page error and no CSP violation through the live and stubbed legs',
+    w.errors().length === 0, JSON.stringify(w.errors()));
+}
+
 // ---- selftest ------------------------------------------------------------------------
 // A gate whose checks can pass vacuously is worse than none, so every crawl and overflow check
 // gets a positive control. A local fixture serves a fake shell (28 nav links, forms) with the
@@ -505,7 +790,7 @@ const LATE_ERRORS = `<script>addEventListener('load', () => requestAnimationFram
     setTimeout(() => console.error('late console error'), 0);
     setTimeout(() => { throw new Error('late throw'); }, 0);
   })));</script>`;
-const BASE = { nav: EXPECTED, csp: CSP_OK, late: false, notFound: '' };
+const BASE = { nav: EXPECTED, csp: CSP_OK, late: false, notFound: '', stripHas: false };
 
 function fixturePage(path, v) {
   const nav = v.nav.map((h) => '<a href="' + h + '">' + h + '</a>').join('');
@@ -514,11 +799,24 @@ function fixturePage(path, v) {
     '</nav></aside>' + form + (v.late ? LATE_ERRORS : '');
 }
 
+// The committed Apps golden inside the pane mount, as the shell serves it. With `stripHas` every CSS
+// line that holds a :has() rule is removed at run time (the kAppsCss source is one rule per line), so
+// the version rows can no longer be opened by the expander: the control the check is meant to catch.
+function appsGoldenPage(stripHas) {
+  let body = readFileSync(APPS_GOLDEN, 'utf8');
+  if (stripHas) body = body.split('\n').filter((l) => !l.includes(':has(')).join('\n');
+  return '<!doctype html><title>fixture</title><div id="guardian-detail">' + body + '</div>';
+}
+
 function startFixture() {
   const fx = { v: BASE, server: null, url: '' };
   fx.server = createServer((req, res) => {
     const path = new URL(req.url, 'http://fixture').pathname;
     const { v } = fx;
+    if (path === '/apps-golden') {
+      res.writeHead(200, { 'content-type': 'text/html' }).end(appsGoldenPage(v.stripHas));
+      return;
+    }
     if (path === v.notFound) { res.writeHead(404).end('gone'); return; }
     res.writeHead(200, { 'content-type': 'text/html', ...(v.csp ? { 'content-security-policy': v.csp } : {}) });
     res.end(fixturePage(path, v));
@@ -558,6 +856,12 @@ const SELF_CASES = [
   { id: 'g', note: 'a route that answers 404',
     variant: { nav: ['/', '/gone'], notFound: '/gone' }, run: crawl,
     expect: { name: 'crawl /gone', detail: ['status 404'] } },
+  { id: 'h1', note: 'the committed Apps golden: the expander opens and closes',
+    variant: {}, run: async (p) => { await visit(p, '/apps-golden'); await checkAppsExpander(p, WAIT_MS); },
+    expect: { passing: 1 } },
+  { id: 'h2', note: 'the same golden with every :has() rule removed: the version rows never open',
+    variant: { stripHas: true }, run: async (p) => { await visit(p, '/apps-golden'); await checkAppsExpander(p, 1500); },
+    expect: { name: 'selftest h2', detail: ['version rows shown after opening the expander'] } },
 ];
 
 // '' when the recorded checks are what the case expects, else why not.
@@ -624,6 +928,9 @@ async function main() {
       ['pki', scenarioPki],
       ['dex-apps', scenarioDexApps],
       ['engine-audit', scenarioEngineAudit],
+      ['dex-pane-sync', scenarioDexPaneSync],
+      ['dex-keyboard', scenarioDexKeyboard],
+      ['find-software', scenarioFindSoftware],
     ];
     for (const [name, fn] of scenarios) {
       const p = await browser.newPage();

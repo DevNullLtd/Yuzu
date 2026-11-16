@@ -2,8 +2,9 @@
 ###############################################################################
 # install-agent-user.sh — provision the unprivileged account the Yuzu agent
 #                        runs under, plus the narrow privilege grants it
-#                        needs to operate plugins like quarantine,
-#                        services.set_start_mode, and network_actions.flush_dns.
+#                        needs to operate plugins like the firewall plugin's
+#                        containment actions, services.set_start_mode, and
+#                        network_actions.flush_dns.
 #
 # AUTHORITY
 # ─────────
@@ -88,8 +89,8 @@
 #                    On macOS this is a no-op (no setcap equivalent).
 #   --no-sudoers     Skip the sudoers file install. Useful in test
 #                    environments where you don't want any privilege
-#                    grants; the agent will still run but quarantine
-#                    and other privileged plugins will fail at dispatch
+#                    grants; the agent will still run but the firewall
+#                    containment actions and other privileged plugins will fail at dispatch
 #                    time (which the test ladder catches).
 #   --no-setcap      Skip the setcap step on Linux. Useful if you set
 #                    capabilities via a packaging tool (.deb postinst,
@@ -450,8 +451,24 @@ EOF
 
     if [[ "$PLATFORM" == "macos" ]]; then
         cat <<EOF
-# quarantine plugin — pf firewall management
-$ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl
+# firewall plugin — pf anchor containment (the narrowed argv the firewall containment actions
+# run). These lines NARROW the argv shape; they do not confine pfctl: sudo globs match
+# concatenated args, and the anchor file named by -f is agent-generated. The confinement is the
+# firewall plugin's token validation (agents/plugins/firewall/src/firewall_quarantine_parsers.hpp).
+# There is no bare /sbin/pfctl grant. The anchor name sorts first among Apple's com.apple/*
+# sub-anchors, and the release flush is -F rules / -F nat on that anchor only (never -F all:
+# that is global).
+$ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -E
+$ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -X *
+$ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -a com.apple/000.yuzu_quarantine -f *
+$ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -a com.apple/000.yuzu_quarantine -F rules
+$ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -a com.apple/000.yuzu_quarantine -F nat
+$ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -a com.apple/000.yuzu_quarantine -s rules
+$ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -a com.apple -s Anchors
+$ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -F states
+$ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -s info
+$ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -s rules
+$ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -s References
 
 # services.set_start_mode — launchd system domain
 $ACCOUNT_NAME ALL=(root) NOPASSWD: /bin/launchctl bootstrap system *
@@ -469,10 +486,19 @@ $ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/bin/security delete-certificate -t /Libr
 EOF
     else  # linux
         cat <<EOF
-# quarantine plugin — iptables / ip6tables / nftables
-$ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/iptables, /usr/sbin/iptables-save, /usr/sbin/iptables-restore
-$ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/ip6tables, /usr/sbin/ip6tables-save, /usr/sbin/ip6tables-restore
-$ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/nft
+# firewall plugin — iptables / ip6tables, the containment fallback when nft is absent. Their
+# rule text rides argv, so sudoers cannot pin them the way it pins nft and pfctl below.
+$ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/iptables
+$ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/ip6tables
+
+# firewall plugin — nftables containment (own table inet yuzu_quarantine). These lines NARROW
+# the argv shape; they do not confine nft: sudo globs match concatenated args, and the file
+# named by -f is agent-generated. The confinement is the firewall plugin's token validation
+# (agents/plugins/firewall/src/firewall_quarantine_parsers.hpp). The bare /usr/sbin/nft grant
+# that used to sit here was never called by any plugin and is replaced by these three.
+$ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/nft -f *
+$ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/nft delete table inet yuzu_quarantine
+$ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/nft list table inet yuzu_quarantine
 
 # services.set_start_mode — systemd unit lifecycle
 $ACCOUNT_NAME ALL=(root) NOPASSWD: /bin/systemctl enable *,  /bin/systemctl disable *

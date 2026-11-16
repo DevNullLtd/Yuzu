@@ -34,6 +34,7 @@
 ///     `export_definition` are the same shape by construction too.
 
 #include "instruction_store.hpp"
+#include "json_value_budget.hpp" // json_exceeds_value_count
 #include "instruction_yaml.hpp" // DefinitionFields (definition_from_yaml_fields)
 
 #include <nlohmann/json.hpp>
@@ -108,6 +109,18 @@ inline constexpr std::size_t kMaxDefinitionDescriptionLen = 512;        ///< `de
 /// longest is about 4.9 KB) and an export of one must stay importable.
 inline constexpr std::size_t kMaxDefinitionImportDescriptionLen = 16 * 1024;
 inline constexpr std::size_t kMaxDefinitionInstructionSetIdLen = 128;   ///< `instruction_set_id`, 0..128
+/// The most structural values (`[`, `{` and `,` outside a string literal) a definition request or
+/// import body may hold. nlohmann::json builds roughly 30 to 100 bytes per value, so a 16 MiB body
+/// of `[],[],...` (about 5.6 million values, 11 million counted characters) became a 258 to 429 MiB
+/// tree per request, and eight concurrent ones were killed for exceeding a 2 GB memory limit.
+/// A request that gains a `created_by` on the way (the legacy import) has one more comma counted.
+/// A definition is a few hundred values; the largest bundled one is far below this.
+inline constexpr std::size_t kMaxDefinitionJsonValues = 100'000;
+/// True when `body` holds more than `max_values` structural values: the shared raw-text counter
+/// (`json_value_budget.hpp`, `json_exceeds_value_count`, which also backs the body-cap chokepoint)
+/// with this module's default budget. It runs BEFORE any parse, skips string literals and does not validate the JSON.
+[[nodiscard]] bool json_exceeds_value_budget(std::string_view body,
+                                             std::size_t max_values = kMaxDefinitionJsonValues) noexcept;
 /// The `type` values the store's create accepts (`validate_and_prepare`); `update_definition` does
 /// not re-check it, so the twins' PUT does here.
 [[nodiscard]] constexpr bool is_valid_definition_type(std::string_view t) noexcept {
@@ -159,8 +172,8 @@ apply_definition_update_body(const nlohmann::json& body, InstructionDefinition& 
 /// `type`, `plugin`, `action`, `approval_mode` or `concurrency_mode` against `before` AND `before`
 /// carries a non-empty `yaml_source`, this clears `def.yaml_source` (the columns become the
 /// authority, which is already the state of every definition created through the JSON routes) and
-/// returns true. An edit to `enabled` and the rest leaves it alone. Called by the v1 PUT
-/// and the MCP `update_definition` only; a YAML save is the YAML authority and never calls it.
+/// returns true. An edit to `enabled` and the rest leaves it alone. Called by the v1 PUT,
+/// the legacy `PUT /api/instructions/{id}` and the MCP `update_definition` only; a YAML save is the YAML authority and never calls it.
 /// `describe_dispatch_binding_change` then ends the audit detail with `yaml_source cleared
 /// yaml_source_bytes=<n> yaml_source_sha256=<hex>` (the cleared text's size and digest) and, just
 /// before it, names which of `name`, `version`, `type` and `description` changed.
@@ -171,9 +184,10 @@ apply_definition_update_body(const nlohmann::json& body, InstructionDefinition& 
 /// a human must approve it: `plugin`, `action`, `approval_mode`, `concurrency_mode`, `enabled`
 /// (instruction_execute.cpp binds the first four into the effect; `enabled` gates dispatch).
 /// `type` is deliberately NOT recorded: it only labels the definition. Empty when none changed. Format: `field: old -> new` entries joined
-/// by `; ` (each value through `log_token`, CWE-117). Shared by the v1 and MCP
-/// twins' update rows, so an approval downgrade (`always` -> `auto`), a repoint or a concurrency
-/// change is visible in their audit trail. (The legacy dashboard routes do not record it.)
+/// by `; ` (each value through `log_token`, CWE-117). Shared by the legacy `PUT
+/// /api/instructions/{id}` and dashboard YAML-save success rows and the v1/MCP twins' rows, so an
+/// approval downgrade (`always` -> `auto`), a repoint or a concurrency change is visible in the
+/// audit trail on every surface. (The YAML save cannot change `enabled`: it carries it forward.)
 /// An update that emptied a non-empty `yaml_source` (`clear_stale_yaml_source`) first names which of
 /// `name`, `version` and `type` changed (`old -> new`, as above) and that the `description` did
 /// (`description: changed <old> -> <new> bytes`, sizes only), then ends the text with
@@ -186,7 +200,9 @@ apply_definition_update_body(const nlohmann::json& body, InstructionDefinition& 
 /// rows (the pre-image: once the row is gone nothing else records what it ran). Format:
 /// `name=... plugin=... action=... approval_mode=... concurrency_mode=... enabled=true|false`,
 /// each free-text value bounded (`bounded_definition_id`) then folded through `log_token`
-/// (CWE-117). Shared by the v1 REST and MCP delete twins.
+/// (CWE-117). Shared by the v1 REST and MCP delete twins and the legacy `DELETE
+/// /api/instructions/{id}` success row (which reads the pre-image before the referrer check: an
+/// unreadable definition is a 503, so the detail is empty only for an id that was absent then).
 [[nodiscard]] std::string describe_deleted_definition(const InstructionDefinition& def);
 
 /// Build the set a `POST /instruction-sets` body describes: `name` and `description` strings, no

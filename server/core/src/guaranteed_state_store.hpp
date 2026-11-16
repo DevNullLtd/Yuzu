@@ -293,6 +293,12 @@ public:
     /// reachable without holding real concurrent queries.
     void set_apps_read_budget_for_test(int n) noexcept { apps_read_budget_ = n; }
 
+    /// Test seam for the Apps read's concurrency budget: `fn` runs once per read, after the budget
+    /// slot is taken and before the lease, so a test can hold several reads at that point. Set it
+    /// before the store is used concurrently and clear it with an empty function after the
+    /// threads have joined. Production leaves it empty (a no-op).
+    void set_apps_read_barrier_for_test(std::function<void()> fn) { apps_read_barrier_ = std::move(fn); }
+
     /// Test seam for the census lock order: `fn` runs immediately after the pair-lock statement
     /// (every pending event row of the (agent, rule) pair, locked in `ingest_seq` order) returns
     /// and before the census row is touched, so a test can hold one writer at that point while a
@@ -525,12 +531,14 @@ public:
     /// devices (so they are members of it), while `crashes`, `hangs` and
     /// `affected_devices` stay window-wide. At most `kDexAppsConcurrentReads`
     /// run at once (each holds a lease for seconds); one over the budget is
-    /// refused at once. `std::nullopt` on a degraded read (store-not-open /
-    /// pool-timeout / query-error / concurrency-budget), never collapsed into an
-    /// empty vector, same contract as `dex_signal_summary_checked`. Row order is unspecified (no ORDER BY):
+    /// refused at once. A degraded read returns the `DexReadFault` that caused it
+    /// (store-not-open / pool-timeout / query-error / statement-timeout /
+    /// concurrency-budget), never collapsed into an empty vector. The statement
+    /// timeout is the pool's (30 s by default); the read adds no transaction of its
+    /// own. Row order is unspecified (no ORDER BY):
     /// `dex_apps_model_from_rows` owns the published ranking. `app_limit` 0 returns
     /// no rows, so `apps_total` is unreportable; callers pass a positive limit.
-    std::optional<std::vector<DexAppStabilityRow>>
+    std::expected<std::vector<DexAppStabilityRow>, DexReadFault>
     dex_app_stability_checked(const std::string& since, const std::string& platform, int app_limit,
                               int version_limit, std::int64_t per_device_cap,
                               const std::vector<std::string>& online_agent_ids,
@@ -795,6 +803,7 @@ private:
     std::atomic<uint64_t> events_redelivered_{0};  // event_id conflict, MATCHING payload
     std::atomic<uint64_t> events_ingest_errors_{0}; // operational ingest fault
     std::function<void()> census_lock_barrier_;     // test seam, empty in production
+    std::function<void()> apps_read_barrier_;       // test seam, empty in production
     std::atomic<bool> agent_step_enabled_{true};    // test seam, true in production
     std::atomic<int> agent_step_lock_timeout_ms_{kAgentStepLockTimeoutMs}; // test seam, 1000 in production
     std::atomic<int> repair_statement_timeout_ms_{kRepairStatementTimeoutMs};   // test seam, 2000

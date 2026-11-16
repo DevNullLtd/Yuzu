@@ -6,8 +6,9 @@ Single source of truth for the test-runs DB schema and operations. Bash
 wrappers in this directory delegate to this module via subcommand args.
 
 Schema v1: local /test runs. Schema v2: coarse CI run rows. Schema v3:
-per-runner/per-attempt CI jobs, Meson suite timings and recovered flake events,
-plus a schema_meta table for forward-compatible migrations.
+per-runner/per-attempt CI jobs, Meson suite timings and recovered flake events.
+Schema v4 adds append-only local gate observations alongside the latest result,
+and a durable floor for explicitly reported external failures/aborts.
 
 Default DB location: ~/.local/share/yuzu/test-runs.db
 Override with: YUZU_TEST_DB=path
@@ -22,9 +23,10 @@ Schema invariants (preserve against future regression):
   - All bash callers must go through the wrappers (test-db-init.sh,
     test-db-write.sh, test-db-query.sh) rather than executing this module
     directly. The wrappers are the stable CLI surface.
-  - `gate_name` must be unique within a run; (run_id, gate_name) is the
-    test_gates primary key. Duplicate writes silently overwrite via
-    INSERT OR REPLACE — caller must not assume otherwise.
+  - test_gates holds the latest result for (run_id, gate_name). Every gate
+    write also appends to test_gate_attempts in the same transaction. A repeat
+    write is another observation, not necessarily another test execution.
+    Earlier FAIL/ABORTED/WARN observations remain part of the run verdict.
 
 The stable CLI remains the bash wrappers; the cross-platform CI recorder calls
 this module's CLI directly because Windows cannot rely on a bash wrapper.
@@ -50,7 +52,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Iterable, Optional
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 SCHEMA_V1 = """
 PRAGMA journal_mode=WAL;
@@ -240,6 +242,25 @@ CREATE TABLE IF NOT EXISTS ci_flake_events (
 );
 """
 
+# v3 retained only the latest gate write. Migration can preserve that surviving
+# observation, but cannot recover overwritten attempts or their timestamps.
+SCHEMA_V4 = """
+ALTER TABLE test_runs ADD COLUMN status_floor TEXT;
+
+CREATE TABLE IF NOT EXISTS test_gate_attempts (
+    run_id           TEXT NOT NULL REFERENCES test_runs(run_id) ON DELETE CASCADE,
+    gate_name        TEXT NOT NULL,
+    attempt          INTEGER NOT NULL CHECK (attempt > 0),
+    recorded_at      INTEGER,
+    phase            INTEGER NOT NULL,
+    status           TEXT NOT NULL,
+    duration_seconds INTEGER NOT NULL,
+    log_path         TEXT,
+    notes            TEXT,
+    PRIMARY KEY (run_id, gate_name, attempt)
+);
+"""
+
 VALID_STATUS = {"PASS", "FAIL", "WARN", "SKIP", "RUNNING", "ABORTED"}
 VALID_CI_CONCLUSIONS = {
     "in_progress", "success", "failure", "cancelled", "skipped", "timed_out",
@@ -247,6 +268,10 @@ VALID_CI_CONCLUSIONS = {
 }
 VALID_CI_PLATFORMS = {"linux", "windows", "macos"}
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+class RunIdentityError(ValueError):
+    """A manual capture tried to reuse another revision's evidence identity."""
 
 
 # --- DB plumbing ----------------------------------------------------------
@@ -379,6 +404,43 @@ def _migrate_v2_to_v3(conn: sqlite3.Connection) -> int:
         raise
 
 
+def _migrate_v3_to_v4(conn: sqlite3.Connection) -> int:
+    """Seed surviving gate observations once, under the migration write lock."""
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        current = schema_version(conn)
+        if current != 3:
+            if current is None:
+                raise RuntimeError("schema version disappeared during v3 migration")
+            conn.commit()
+            return current
+        _execute_statements(conn, SCHEMA_V4)
+        # v3 may already have overwritten a failed gate with its retry. The
+        # surviving run verdict is still evidence, even when its underlying
+        # observations are gone. Preserve that floor without rewriting the
+        # historical summary or inventing an affirmative PASS observation.
+        conn.execute(
+            "UPDATE test_runs SET status_floor=overall_status "
+            "WHERE overall_status IN ('FAIL', 'WARN', 'ABORTED', 'SKIP')"
+        )
+        conn.execute(
+            """
+            INSERT INTO test_gate_attempts
+                (run_id, gate_name, attempt, recorded_at, phase, status,
+                 duration_seconds, log_path, notes)
+            SELECT run_id, gate_name, 1, NULL, phase, status,
+                   duration_seconds, log_path, notes FROM test_gates
+            """
+        )
+        stamp_version(conn, 4)
+        conn.commit()
+        return 4
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+
+
 def _upgrade_schema(conn: sqlite3.Connection, existing: Optional[int]) -> int:
     """Bring a fresh or older database to SCHEMA_VERSION."""
     version = existing
@@ -393,9 +455,13 @@ def _upgrade_schema(conn: sqlite3.Connection, existing: Optional[int]) -> int:
     if version == 2:
         version = _migrate_v2_to_v3(conn)
     if version == 3:
+        version = _migrate_v3_to_v4(conn)
+    if version == 4:
         # Idempotently restore indexes/tables if an operator repaired a DB by
         # hand but left the schema-version stamp intact.
         conn.executescript(SCHEMA_V3_TABLES)
+        # Do not silently recreate a missing attempt ledger: that would hide
+        # lost evidence. Only the versioned migration creates it.
     return version
 
 
@@ -504,37 +570,67 @@ def cmd_run_start(args: argparse.Namespace) -> int:
 
 def cmd_run_finish(args: argparse.Namespace) -> int:
     with connect() as conn:
-        # Aggregate gate counts.
-        counts = {row[0]: row[1] for row in conn.execute(
-            "SELECT status, COUNT(*) FROM test_gates WHERE run_id=? GROUP BY status",
-            (args.run_id,),
-        )}
-        fail = counts.get("FAIL", 0)
-        warn = counts.get("WARN", 0)
-        pass_ = counts.get("PASS", 0)
-        skip = counts.get("SKIP", 0)
-
-        # Overall status: any FAIL → FAIL; else any WARN → WARN; else PASS.
-        # If args.status is provided, use it (lets the caller override).
-        if args.status:
-            overall = args.status
-        elif fail > 0:
-            overall = "FAIL"
-        elif warn > 0:
-            overall = "WARN"
-        elif pass_ + skip > 0:
-            overall = "PASS"
-        else:
-            overall = "ABORTED"
-
-        # Compute total duration from started_at.
+        _ensure_schema_initialized(conn)
+        # Hold the writer lock through the verdict update. Counts describe
+        # effective gates: prior FAIL/ABORTED/WARN evidence survives a later PASS,
+        # while an ordinary RUNNING -> PASS transition completes the gate.
+        conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
-            "SELECT started_at FROM test_runs WHERE run_id=?",
+            "SELECT started_at, status_floor FROM test_runs WHERE run_id=?",
             (args.run_id,),
         ).fetchone()
         if not row:
             print(f"test_db: run {args.run_id} not found", file=sys.stderr)
             return 1
+        counts: dict[str, int] = {}
+        for status, failed, aborted, warned in conn.execute(
+            """
+            SELECT g.status, MAX(a.status='FAIL'), MAX(a.status='ABORTED'),
+                   MAX(a.status='WARN')
+            FROM test_gates g LEFT JOIN test_gate_attempts a
+              ON a.run_id=g.run_id AND a.gate_name=g.gate_name
+            WHERE g.run_id=? GROUP BY g.gate_name, g.status
+            """,
+            (args.run_id,),
+        ):
+            effective = (
+                "FAIL" if failed else
+                "ABORTED" if aborted or status not in {"PASS", "FAIL", "WARN", "SKIP"} else
+                "WARN" if warned else status
+            )
+            counts[effective] = counts.get(effective, 0) + 1
+        fail = counts.get("FAIL", 0)
+        warn = counts.get("WARN", 0)
+        pass_ = counts.get("PASS", 0)
+        skip = counts.get("SKIP", 0)
+
+        if fail > 0:
+            overall = "FAIL"
+        elif counts.get("ABORTED", 0) > 0 or not counts:
+            overall = "ABORTED"
+        elif warn > 0:
+            overall = "WARN"
+        elif pass_ > 0:
+            overall = "PASS"
+        else:
+            overall = "SKIP"
+
+        # An external failure/abort may worsen the result, but an override
+        # must never turn failed, unfinished or skipped evidence green. Keep
+        # the strongest explicit observation across refinalization and late
+        # gate writes: those do not retract an external failure/abort.
+        severity = {"PASS": 0, "SKIP": 1, "WARN": 2, "ABORTED": 3, "FAIL": 4}
+        status_floor = row[1]
+        if args.status and (status_floor is None
+                            or severity[args.status] > severity[status_floor]):
+            status_floor = args.status
+        if status_floor and severity[status_floor] > severity[overall]:
+            overall = status_floor
+        if args.status and args.status != overall:
+            print(f"test_db: ignoring --status {args.status}; recorded evidence "
+                  f"requires {overall}", file=sys.stderr)
+
+        # Compute total duration from started_at.
         started = row[0]
         finished = int(time.time())
         total = finished - started
@@ -548,11 +644,13 @@ def cmd_run_finish(args: argparse.Namespace) -> int:
                    fail_count=?,
                    warn_count=?,
                    pass_count=?,
-                   skip_count=?
+                   skip_count=?,
+                   status_floor=?
              WHERE run_id=?
             """,
-            (finished, overall, total, fail, warn, pass_, skip, args.run_id),
+            (finished, overall, total, fail, warn, pass_, skip, status_floor, args.run_id),
         )
+        conn.commit()
     print(
         f"test_db: finished run {args.run_id} status={overall} "
         f"duration={total}s pass={pass_} fail={fail} warn={warn} skip={skip}"
@@ -572,6 +670,19 @@ def _ensure_schema_initialized(conn: sqlite3.Connection) -> None:
         )
 
 
+def _check_manual_revision(run_id: str, recorded: str, current: str) -> None:
+    if current == "unknown":
+        raise RunIdentityError(
+            f"cannot verify the source revision for manual run {display_run_id(run_id)}. "
+            "Restore git HEAD before recording more evidence; the database is unchanged."
+        )
+    if recorded != current:
+        raise RunIdentityError(
+            f"manual run {display_run_id(run_id)} belongs to commit {recorded}; "
+            f"current commit is {current}. Use a new --run-id for this capture."
+        )
+
+
 def _ensure_run_exists(conn: sqlite3.Connection, run_id: str) -> None:
     # Auto-vivify a stub test_runs row when an operator-invoked write
     # (gate/timing/metric) targets a run_id that /test never created via
@@ -580,9 +691,9 @@ def _ensure_run_exists(conn: sqlite3.Connection, run_id: str) -> None:
     #
     # Behavior summary:
     #   - existing row, mode != 'manual' → no-op (real /test run, leave alone).
-    #   - existing row, mode == 'manual' → refresh started_at / commit_sha /
-    #     branch so a re-capture of baselines under the same --run-id
-    #     attributes the new metrics to the current commit (HP-1).
+    #   - existing row, mode == 'manual' → preserve identity/time; refuse a
+    #     different (or unavailable) current revision. Captures at a new commit
+    #     require a new run ID, never relabel earlier observations.
     #   - missing row → INSERT OR IGNORE a stub with mode='manual',
     #     overall_status='MANUAL'. The OR IGNORE absorbs the race where
     #     two concurrent invocations both passed the SELECT and both
@@ -592,26 +703,15 @@ def _ensure_run_exists(conn: sqlite3.Connection, run_id: str) -> None:
     #
     # MANUAL is a test_runs lifecycle sentinel for the overall_status
     # column; it is NOT a gate-status value (cmd_gate validates against
-    # VALID_STATUS, which deliberately excludes MANUAL — gate rows
-    # always carry PASS/FAIL/WARN/SKIP).
+    # VALID_STATUS, which deliberately excludes MANUAL).
     _ensure_schema_initialized(conn)
     row = conn.execute(
-        "SELECT mode FROM test_runs WHERE run_id=?", (run_id,)
+        "SELECT mode, commit_sha FROM test_runs WHERE run_id=?", (run_id,)
     ).fetchone()
     if row is not None:
         if row[0] == "manual":
             commit_sha = _git_oneshot(["rev-parse", "HEAD"]) or "unknown"
-            branch = (
-                _git_oneshot(["rev-parse", "--abbrev-ref", "HEAD"]) or "unknown"
-            )
-            conn.execute(
-                """
-                UPDATE test_runs
-                   SET started_at=?, commit_sha=?, branch=?
-                 WHERE run_id=? AND mode='manual'
-                """,
-                (int(time.time()), commit_sha, branch, run_id),
-            )
+            _check_manual_revision(run_id, row[1], commit_sha)
         return
     commit_sha = _git_oneshot(["rev-parse", "HEAD"]) or "unknown"
     branch = _git_oneshot(["rev-parse", "--abbrev-ref", "HEAD"]) or "unknown"
@@ -636,8 +736,7 @@ def _ensure_run_exists(conn: sqlite3.Connection, run_id: str) -> None:
         # Stub row freshly created. Visible signal so a /test pipeline
         # whose run-start failed silently doesn't ship a green-looking
         # run with mode='manual' rows. Operator-capture paths
-        # (--run-id manual) will see this on first call per DB and
-        # never again.
+        # see this on the first write for each fresh capture identity.
         run_id_safe = display_run_id(run_id)
         print(
             f"test_db: vivified stub test_runs row for run_id={run_id_safe} "
@@ -645,6 +744,14 @@ def _ensure_run_exists(conn: sqlite3.Connection, run_id: str) -> None:
             f"check that run-start succeeded",
             file=sys.stderr,
         )
+    else:
+        # Another writer may have created the manual identity after our first
+        # read. Validate the winning row before attaching this capture to it.
+        row = conn.execute(
+            "SELECT mode, commit_sha FROM test_runs WHERE run_id=?", (run_id,)
+        ).fetchone()
+        if row is not None and row[0] == "manual":
+            _check_manual_revision(run_id, row[1], commit_sha)
 
 
 def _git_oneshot(args: list[str]) -> str | None:
@@ -672,22 +779,45 @@ def cmd_gate(args: argparse.Namespace) -> int:
         return 2
     with connect() as conn:
         _ensure_run_exists(conn, args.run_id)
+        # Serialize attempt allocation and the latest-result update together.
+        # connect() rolls back an uncommitted transaction on close if either
+        # write fails, leaving neither a phantom attempt nor a lost failure.
+        conn.execute("BEGIN IMMEDIATE")
+        values = (
+            args.run_id, args.phase, args.gate, args.status, args.duration,
+            args.log or "", args.notes or "",
+        )
         conn.execute(
             """
-            INSERT OR REPLACE INTO test_gates
+            INSERT INTO test_gate_attempts
+                (run_id, phase, gate_name, status, duration_seconds, log_path,
+                 notes, attempt, recorded_at)
+            SELECT ?, ?, ?, ?, ?, ?, ?, COALESCE(MAX(attempt), 0) + 1, ?
+            FROM test_gate_attempts WHERE run_id=? AND gate_name=?
+            """,
+            (*values, int(time.time()), args.run_id, args.gate),
+        )
+        conn.execute(
+            """
+            INSERT INTO test_gates
                 (run_id, phase, gate_name, status, duration_seconds, log_path, notes)
             VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (run_id, gate_name) DO UPDATE SET
+                phase=excluded.phase, status=excluded.status,
+                duration_seconds=excluded.duration_seconds,
+                log_path=excluded.log_path, notes=excluded.notes
             """,
-            (
-                args.run_id,
-                args.phase,
-                args.gate,
-                args.status,
-                args.duration,
-                args.log or "",
-                args.notes or "",
-            ),
+            values,
         )
+        # A result arriving after finalization invalidates the old verdict.
+        # The caller must finish again to publish a summary of the new facts.
+        conn.execute(
+            "UPDATE test_runs SET overall_status='RUNNING', finished_at=NULL, "
+            "total_duration_seconds=NULL, fail_count=0, warn_count=0, "
+            "pass_count=0, skip_count=0 WHERE run_id=? AND finished_at IS NOT NULL",
+            (args.run_id,),
+        )
+        conn.commit()
     return 0
 
 
@@ -1285,6 +1415,20 @@ def cmd_query(args: argparse.Namespace) -> int:
                         f"{g['status']:<6} {g['duration_seconds']}s  "
                         f"{g['notes'] or ''}"
                     )
+                if (schema_version(conn) or 0) >= 4:
+                    attempts = list(conn.execute(
+                        "SELECT * FROM test_gate_attempts WHERE run_id=? "
+                        "AND gate_name IN (SELECT gate_name FROM test_gate_attempts "
+                        "WHERE run_id=? GROUP BY gate_name HAVING COUNT(*) > 1) "
+                        "ORDER BY phase, gate_name, attempt",
+                        (rows[0]["run_id"], rows[0]["run_id"]),
+                    ))
+                    if attempts:
+                        print("\n--- gate history (each recorded write) ---")
+                        for a in attempts:
+                            print(f"  {a['gate_name']} #{a['attempt']} "
+                                  f"{a['status']} {a['duration_seconds']}s  "
+                                  f"{a['log_path'] or ''}  {a['notes'] or ''}")
                 # Sub-step timings if any.
                 timings = list(
                     conn.execute(
@@ -1450,6 +1594,13 @@ def cmd_query(args: argparse.Namespace) -> int:
                         (args.export,),
                     )
                 ],
+                "gate_attempts": [
+                    dict(a)
+                    for a in conn.execute(
+                        "SELECT * FROM test_gate_attempts WHERE run_id=? "
+                        "ORDER BY phase, gate_name, attempt", (args.export,),
+                    )
+                ] if (schema_version(conn) or 0) >= 4 else None,
                 "timings": [
                     dict(t)
                     for t in conn.execute(
@@ -1557,13 +1708,13 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     p_run_finish = sub.add_parser("run-finish", help="finalize a run row")
     p_run_finish.add_argument("--run-id", required=True)
-    # Choices are the terminal states an operator might want to override to.
+    # Terminal states may worsen the evidence-derived result, never improve it.
     # `RUNNING` is the auto-default before run-finish; never a valid override.
     # `default=None` covers the "not provided, auto-compute" case.
     p_run_finish.add_argument(
         "--status", default=None,
         choices=["PASS", "FAIL", "WARN", "ABORTED", "SKIP"],
-        help="override computed overall_status",
+        help="worsen computed overall_status (cannot hide recorded failure or incompleteness)",
     )
     p_run_finish.set_defaults(func=cmd_run_finish)
 
@@ -1718,6 +1869,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             return 2
     try:
         return args.func(args)
+    except RunIdentityError as e:
+        print(f"test_db: {e}", file=sys.stderr)
+        return 2
     except sqlite3.OperationalError as e:
         # One central net for every subcommand's connect()/execute() (#1146):
         # under concurrent writers (nightly + PR run sharing YUZU_TEST_DB on

@@ -537,7 +537,7 @@ This table replaces the previous per-OS tables (Sections 9, 10, 11 of the origin
 | `network.diagnostics.run` | `network_diag` | Y | Y | Y | Verified | Ping, traceroute |
 | `network.adapter.enable` | `network_actions` | Y | Y | Y | Verified | Enable network adapter |
 | `network.adapter.disable` | `network_actions` | Y | Y | Y | Verified | Disable network adapter |
-| `network.quarantine` | `quarantine` | Y | Y | - | Planned | Isolate device (Phase 3) |
+| `network.quarantine` | `firewall` (`quarantine` action) | Y | Y | - | Planned | Isolate device (Phase 3) |
 
 ### 7.6 Software and Patching
 

@@ -24,6 +24,7 @@
  * keys are customer text).
  */
 
+#include "dex_pane.hpp"
 #include "dex_read_model.hpp"
 #include "dex_score_policy_json.hpp"
 #include "web_utils.hpp"
@@ -431,8 +432,8 @@ public:
             o += "<div class=\"note warn\" data-stale=\"1\" role=\"alert\"><b>This policy was "
                  "changed by someone else.</b> Nothing was saved. Reload to see the current "
                  "version; reloading discards the edits on screen, so note them first. <button "
-                 "type=\"button\" class=\"btn btn-secondary\" hx-get=\"/fragments/dex/scoring?window=7d\" "
-                 "hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">Reload</button></div>";
+                 "type=\"button\" class=\"btn btn-secondary\" hx-get=\"/fragments/dex/scoring?window=7d\"" +
+                 std::string(kDexPaneSwapAttrs) + ">Reload</button></div>";
         if (!v_.editable)
             o += "<div class=\"note\" data-denied=\"write\"><b>Editing the score policy needs "
                  "the Infrastructure:Write permission</b> (Administrator holds it by default), "

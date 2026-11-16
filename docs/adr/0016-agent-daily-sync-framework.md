@@ -5,7 +5,8 @@
 **Component:** Agent core (sync scheduler) · Server (inventory ingest + Postgres store) · Gateway (proxy)
 **Authors:** Dave Rae
 
-> **Amendment pending: ADR-3006 (plugin management, proposed 2026-10-06).** ADR-3006 sets
+> **Amendment pending delivery: ADR-3006 (plugin management, 2026-10-06; accepted, status
+> reconciled 2026-11-14).** ADR-3006 sets
 > the direction that `--inventory-disable` stops being the collection toggle: it becomes a
 > one-time starting-state input that the server adopts as a visible off-rule, and each daily-sync
 > source becomes a unit that can be switched off on its own. Nothing has changed in the product
@@ -155,7 +156,7 @@ envelope, so it is the natural **baseline store for the whole sync framework**
 (many data types will sync — not just software).
 
 Therefore we **coexist, not replace**:
-- Keep the generic `InventoryStore` (SQLite today) **untouched** — the
+- Keep the generic `InventoryStore` (SQLite at the time; Postgres-native since ADR-0037) **untouched** — the
   sync-framework baseline + the scope/eval surface. (Porting it to Postgres
   under the sync framework is a follow-on, aligned with ADR-0006.)
 - Add a **new born-on-Postgres `SoftwareInventoryStore`** (schema
@@ -1769,6 +1770,69 @@ Two recorded limits of the writer: component records are still normalised inside
 (idempotent, and unreachable until a producer exists; the component change plans them pre-normalised and
 drops that call), and the agent tests' server oracle is a test-local copy of the server recipe (the agent
 tests cannot link the store), so the server's golden vectors stay the cross-pin and both change together.
+
+### 2026-11-14 — the lookup read surface: purl, and `vers:` ranges (SAM-43)
+
+**Decision.** The REST lookup reads return and filter by the row's Package URL, and both lookup
+routes accept a `vers:` range. No schema change: the `purl` column and its partial index
+`installed_software_purl_idx` landed in schema v10 with the v3 apply path.
+
+- **purl on the installs route.** Rows carry `purl` (`null` when the stored value is empty: the
+  device has not yet sent a v3 report, or its ecosystem has no registered purl type) and the CSV
+  export gains a 23rd column, `purl`. `purl=` is a byte-equality filter on the stored canonical value (no prefix, no
+  case folding; it must start `pkg:`), emitted as `purl = $n AND purl <> ''` so the partial index
+  qualifies for every plan; the `agent_ids` scope push-down still applies, so a confined caller
+  gets complete pages. A purl filter makes `totals_omitted` read `filters`. The components table
+  has no purl column, so the components route takes `vers` only.
+- **One range evaluator.** `vers_range.hpp` (pure) parses `vers:<scheme>/<constraints>`, sorts the
+  constraints under the comparator, refuses a duplicate version or two lower or two upper bounds
+  in a row, and applies the VERS containment algorithm. `version_min` / `version_max` are read as
+  `vers:generic/>=min|<=max` when min is not above max (a min above max matches nothing), so
+  every range reaches the live distinct-version read through the same `resolve_version_range`,
+  with the kCatalogRowCap refusal and the empty-version rule unchanged (a row with an empty
+  version is outside every range, `*` and a `!=`-only range included). `vers` needs `name` with `match=exact` and cannot be combined with `version`,
+  `version_min` or `version_max`.
+- **Schemes.** `generic`, `semver`, `maven`, `npm`, `pypi` and `nuget` are evaluated, all under
+  the one catalogue comparator (`catalog_version_compare`), which is a recorded approximation:
+  a scheme's own ordering at the edges (Maven qualifiers, PyPI post and dev releases, written
+  epochs) can differ. `deb` and `rpm` are refused by name as not supported yet, any other scheme
+  is unknown; both are a `400`, never an unbounded match. The text is bounded (1024 bytes, 32
+  constraints), carries no control byte or space, and an error never echoes the input.
+- **The CVE matcher shares only the interval core.** `nvd_version_in_range`'s bounded branch calls
+  `vers::in_interval` once for the inclusive pair and once for the exclusive pair under
+  `nvd_version_compare`; results are identical (pinned by `test_nvd.cpp`). The matcher's
+  comparator, its epoch stripping and its CPE `exact` rule are untouched.
+- **Parity.** REST ships before the MCP tool; the gap is recorded in `docs/api-parity-ledger.md`
+  and tracked by #7749, which rides with #7396.
+- **Export width.** The maximum-width installs export is now 23 columns with a `purl` of up to
+  2048 bytes, about 245 MB per request by the same cap arithmetic as above (22 x 1024 + 2048
+  bytes, 10,000 rows).
+
+### 2026-11-14 — the host, change-feed, summary and plugin-health read surface
+
+Five REST v1 reads over the typed installed-software store, all `Inventory:Read` through the fleet-read gate as the sole authority, all audited per page, all `503` with a retry hint on a degraded read and never an empty `200` (§7):
+
+- `GET /api/v1/inventory/software/hosts` and `/hosts/{agent_id}`: reporting devices ordered by `agent_id`, each with its facet state rows. The host detail answers an unknown device, a device that has never reported and a device outside the caller's scope with the same `404`, decided before any store read for the out-of-scope case, so the response does not say whether a device outside the scope exists.
+- `GET /api/v1/inventory/software/changes`: the change ledger, scoped on every page.
+- `GET /api/v1/inventory/software/summary` and `/plugin-health`: fleet aggregates.
+
+**Settle window and feed order.** The feed publishes a row only once its `observed_at` is more than 60 seconds old (`stable_before` = now minus 60 seconds, returned in the response) and is ordered `(observed_at, change_id)`; the keyset anchor is that pair taken from the last row served. `change_id` is assigned at insert and `observed_at` is the writing replica's clock, so a `change_id`-only anchor could step over a lower id that becomes visible later. The cursor is bound to `since`, `agent_id` and `kind` but not to `stable_before` (which moves on every request), so it stays valid on the next request.
+
+**Lateness contract (decided, not a defect).** There is no watermark. A row that commits more than 60 seconds after its own `observed_at` lands behind a cursor that has already passed it and is not delivered to a consumer walking forward. Recovery is a re-read with `since`, de-duplicating on `change_id`. Ruled at the plan gate in preference to a watermark. Nothing yet counts rows that breach the window; that measurement is tracked by #7766, and the window or a watermark is revisited from it.
+
+**Known limits (tracked, not defects).** The hosts `q` search matches the device roster (seen in the last 30 days, the newest 100,000), so a roster cut at the cap is served with `roster_truncated` and `roster_cap` and a device quiet for over 30 days is listed with a null hostname and not matched; matching agent ids in the store is #7790. For a caller confined to more than 10,000 devices the change feed continues on the shared wide-scope cursor (last row served plus a count of passed-over rows, refused above 100,000 as a `400`), so a row deleted inside the passed-over span between two pages can make the next page skip a row; recovery is a re-read from an earlier `since`, de-duplicating on `change_id`, and the replacement is #7789.
+
+**Snapshot and confinement rule.** The summary and plugin-health figures for an unconfined caller come from one in-memory fleet snapshot, recomputed by the catalogue rollup thread on its hourly tick; a failed recompute publishes nothing and the last good snapshot stays, and the same tick sets the `yuzu_software_facet_*` gauges. The snapshot is fleet-wide and is therefore served ONLY to a caller whose scope is unconfined. A confined caller is never given a figure derived from the snapshot: with up to 10,000 visible devices the figure is computed live over exactly those devices, with the scope pushed into the query; with more, the blocks are `null` with `omitted` of `scope`. A block whose input is absent renders `null` with `omitted` of `scope` or `building`, never zeros. The catalogue block is the fleet rollup's own figure and is given to unconfined callers only.
+
+**Dropped from the earlier read-model plan, with reasons.**
+
+- Tombstones for removed packages: dropped. A removal is already a hard delete plus a `remove` ledger row carrying the name, publisher and version, so no read needs a `removed_at` filter and the change feed is the record of removals.
+- Reading the reserved slot 14 (`uninstall_string`): dropped. The slot stays reserved and empty in the v3 record (#5186), stays in the hash as an empty slot, and no read exposes it; nothing in the host or feed views needs it.
+- A separate freshness field per row: dropped. The row `status` (`current`, `unconfirmed`, `disabled`) and `last_confirmed_at`, derived from the facet state, already say how fresh a row is, and the hosts read exposes both per facet.
+- Device record fields on the host rows (OS, serial, system UUID, MAC addresses, agent version): dropped. A host row carries `agent_id`, the roster `hostname`, `last_seen` and the facet states, the same hostname join the lookup rows use. The full device record is served by the hardware list under the behavioural-PII access audit (`emit_behavioral_audit`), while these five routes audit set-and-proceed, so joining those fields here would change this route's audit contract and data tier, which this change neither planned nor reviewed. The runbook sends the operator to `GET /api/v1/devices/{id}` for the OS and the agent version. Which fields belong on a host row is tracked by #7784.
+- A `scope` parameter on the hosts list: dropped as unbacked, the same ruling that leaves `scope=expr` off the installs route; nothing in this read model resolves a scope expression. The hosts list reads `q`, `last_synced_before`, `limit` and `cursor` only, and the caller's gate scope is applied on every page, so a request cannot widen or narrow it.
+
+The MCP twins of the five routes are not part of this change (#7765).
 
 ## Routed-concern invariants
 

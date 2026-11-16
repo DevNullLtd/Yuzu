@@ -17,6 +17,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -144,9 +145,22 @@ constexpr const char* kRosterTruncatedMetric = "yuzu_server_agent_presence_roste
     return false;
 }
 
-// One `endpoints` row in the column order both roster reads select (agent_id, hostname, os,
-// last_heartbeat_ms, agent_ts, agent_version, arch) — one copy, so the roster scan and the
-// point read can never map a column differently.
+// The columns both roster reads select, in the order `read_endpoint_row` maps them: agent_id,
+// hostname, os, last_heartbeat_ms, agent_ts, agent_version, arch, then `live`. ONE copy of the
+// list AND of the liveness predicate, so the roster scan and the point read can never map a column
+// or judge presence differently. `live` is the predicate `query_live_ids` and `fleet_state_counts`
+// use (DB clock, non-blank session), gated on a positive TTL so "not asked" (0) is a literal
+// `false` by construction rather than by the clock arithmetic happening to come out that way.
+// `ttl_param` is the bind number of the TTL parameter in the calling statement.
+std::string endpoint_columns(int ttl_param) {
+    const std::string p = "$" + std::to_string(ttl_param) + "::bigint";
+    return "agent_id, hostname, os, last_heartbeat_ms, agent_ts, agent_version, arch, "
+           "(" + p + " > 0 AND session_id <> '' AND last_seen_at >= now() - (" + p +
+           " * interval '1 second')) AS live";
+}
+
+// One `endpoints` row in the column order `endpoint_columns` selects — one copy, so the roster
+// scan and the point read can never map a column differently.
 OfflineEndpoint read_endpoint_row(const PGresult* res, int i) {
     OfflineEndpoint ep;
     ep.agent_id = PQgetvalue(res, i, 0);
@@ -156,6 +170,7 @@ OfflineEndpoint read_endpoint_row(const PGresult* res, int i) {
     ep.agent_ts = to_i64(PQgetvalue(res, i, 4));
     ep.agent_version = PQgetvalue(res, i, 5);
     ep.arch = PQgetvalue(res, i, 6);
+    ep.live = PQgetvalue(res, i, 7)[0] == 't'; // a boolean column's text form is 't' / 'f'
     return ep;
 }
 
@@ -440,7 +455,8 @@ bool OfflineEndpointStore::delete_agent(std::string_view agent_id) {
     return true;
 }
 
-OfflineRosterRead OfflineEndpointStore::query_stale_within(std::chrono::seconds window) {
+OfflineRosterRead OfflineEndpointStore::query_stale_within(std::chrono::seconds window,
+                                                           std::chrono::seconds live_ttl) {
     if (!open_)
         return std::unexpected(PresenceReadError::StoreUnavailable);
     auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
@@ -462,14 +478,15 @@ OfflineRosterRead OfflineEndpointStore::query_stale_within(std::chrono::seconds 
     // #5712: the limit is kQueryRowCap + 1 — a row past the cap is how a truncated
     // roster is DETECTED (a count of exactly kQueryRowCap is the complete set). The extra
     // row is dropped and the result is flagged `truncated`; it is NOT an error (#5371).
+    const std::string sql = "SELECT " + endpoint_columns(3) +
+                            " FROM endpoint_state.endpoints "
+                            "WHERE last_heartbeat_ms >= $1::bigint "
+                            "ORDER BY last_heartbeat_ms DESC "
+                            "LIMIT $2::bigint";
     pg::PgResult res = pg::exec_params(
-        lease.get(),
-        "SELECT agent_id, hostname, os, last_heartbeat_ms, agent_ts, agent_version, arch "
-        "FROM endpoint_state.endpoints "
-        "WHERE last_heartbeat_ms >= $1::bigint "
-        "ORDER BY last_heartbeat_ms DESC "
-        "LIMIT $2::bigint",
-        std::vector<std::string>{std::to_string(since), std::to_string(kQueryRowCap + 1)});
+        lease.get(), sql.c_str(),
+        std::vector<std::string>{std::to_string(since), std::to_string(kQueryRowCap + 1),
+                                 std::to_string(live_ttl.count())});
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::warn("OfflineEndpointStore: query_stale_within failed: {}",
                      PQerrorMessage(lease.get()));
@@ -495,7 +512,8 @@ OfflineRosterRead OfflineEndpointStore::query_stale_within(std::chrono::seconds 
 }
 
 OfflineEndpointRead OfflineEndpointStore::find_within(std::string_view agent_id,
-                                                      std::chrono::seconds window) {
+                                                      std::chrono::seconds window,
+                                                      std::chrono::seconds live_ttl) {
     // A malformed id (NUL byte, ill-formed UTF-8) can never be a stored key: that is a CONFIRMED
     // absence by construction, decided without a store read, so no failure counter, no warn and
     // no "store unavailable" for an input that can never succeed (the roster scan this replaces
@@ -518,12 +536,13 @@ OfflineEndpointRead OfflineEndpointStore::find_within(std::string_view agent_id,
 
     // Primary-key lookup, same window predicate as query_stale_within (inclusive `>=`), so the
     // two reads can never disagree about whether a row is inside the roster window.
+    const std::string sql = "SELECT " + endpoint_columns(3) +
+                            " FROM endpoint_state.endpoints "
+                            "WHERE agent_id = $1::text AND last_heartbeat_ms >= $2::bigint";
     pg::PgResult res = pg::exec_params(
-        lease.get(),
-        "SELECT agent_id, hostname, os, last_heartbeat_ms, agent_ts, agent_version, arch "
-        "FROM endpoint_state.endpoints "
-        "WHERE agent_id = $1::text AND last_heartbeat_ms >= $2::bigint",
-        std::vector<std::string>{std::string(agent_id), std::to_string(since)});
+        lease.get(), sql.c_str(),
+        std::vector<std::string>{std::string(agent_id), std::to_string(since),
+                                 std::to_string(live_ttl.count())});
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::warn("OfflineEndpointStore: find_within failed: {}", PQerrorMessage(lease.get()));
         record_presence_store_failure(metrics_, "find_within", /*had_lease=*/true);

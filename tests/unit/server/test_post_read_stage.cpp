@@ -20,6 +20,8 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <brotli/decode.h>
+
 #include <algorithm>
 #include <atomic>
 #include <memory>
@@ -335,6 +337,91 @@ TEST_CASE("post-read stage: Handled from the stage answers the request and skips
     CHECK(s.handler_calls.load() == 0);
     // The stage ran once for the POST above and once for each of the five verbs here.
     CHECK(s.stage_calls.load() == 6);
+}
+
+TEST_CASE("post-read stage: HEAD on a dynamic route is refused and brotli is applied once, through "
+          "real httplib routing",
+          "[postread][wiring][response_policy]") {
+    httplib::Server svr;
+    Clean clean(&svr);
+    std::atomic<int> stage_calls{0};
+    std::atomic<int> handler_calls{0};
+    PostReadStageRegistry::instance().install(&svr, [&](const httplib::Request&, httplib::Response&) {
+        stage_calls.fetch_add(1);
+        return Handled::Unhandled;
+    });
+    std::string page;
+    while (page.size() < 100'000)
+        page += "<tr><td>row " + std::to_string(page.size() % 997) + "</td></tr>\n";
+    {
+        HttplibRouteSink sink(svr, StageRequirement::Required);
+        sink.Get("/yuzu_test_page", [&](const httplib::Request&, httplib::Response& res) {
+            handler_calls.fetch_add(1);
+            res.set_content(page, "text/html; charset=utf-8");
+        });
+        sink.Get("/health", [&](const httplib::Request&, httplib::Response& res) {
+            handler_calls.fetch_add(1);
+            res.set_content("ok", "text/plain");
+        });
+    }
+    const int port = svr.bind_to_any_port("127.0.0.1");
+    REQUIRE(port > 0);
+    std::thread th([&] { svr.listen_after_bind(); });
+    // Stops and joins on every exit, including a failed REQUIRE below: a joinable std::thread
+    // destroyed during unwinding would terminate the whole test binary. The wait sits inside the
+    // joinable() test because stop() is a no-op until the accept loop is running.
+    yuzu::test::ScopeExit joiner{[&] {
+        if (th.joinable()) {
+            svr.wait_until_ready();
+            svr.stop();
+            th.join();
+        }
+    }};
+    svr.wait_until_ready();
+    REQUIRE(svr.is_running());
+
+    {
+        httplib::Client cli("127.0.0.1", port);
+        cli.set_decompress(false); // see the bytes the server sent
+
+        // HEAD on a dynamic route: the stage ran (first in order), the handler did not.
+        auto head = cli.Head("/yuzu_test_page");
+        REQUIRE(head);
+        CHECK(head->status == 405);
+        CHECK(head->get_header_value("Allow") == "GET");
+        CHECK(stage_calls.load() == 1);
+        CHECK(handler_calls.load() == 0);
+
+        // HEAD on an exempt path still runs its handler.
+        auto probe = cli.Head("/health");
+        REQUIRE(probe);
+        CHECK(probe->status == 200);
+        CHECK(handler_calls.load() == 1);
+
+        // GET with br: exactly one Content-Encoding, a correct Content-Length, a body that decodes.
+        httplib::Headers h{{"Accept-Encoding", "br"}};
+        auto r = cli.Get("/yuzu_test_page", h);
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->get_header_value_count("Content-Encoding") == 1);
+        CHECK(r->get_header_value("Content-Encoding") == "br");
+        CHECK(r->get_header_value("Content-Length") == std::to_string(r->body.size()));
+        CHECK(r->body.size() < page.size());
+        std::string out(page.size(), '\0');
+        size_t n = out.size();
+        REQUIRE(BrotliDecoderDecompress(r->body.size(), reinterpret_cast<const uint8_t*>(r->body.data()),
+                                        &n, reinterpret_cast<uint8_t*>(out.data())) ==
+                BROTLI_DECODER_RESULT_SUCCESS);
+        out.resize(n);
+        CHECK(out == page);
+    }
+    {
+        // A client that decodes for itself gets the original, i.e. nothing was encoded twice.
+        httplib::Client cli("127.0.0.1", port);
+        auto r = cli.Get("/yuzu_test_page");
+        REQUIRE(r);
+        CHECK(r->body == page);
+    }
 }
 
 TEST_CASE("post-read stage: an exempt server with no stage installed serves its handlers "

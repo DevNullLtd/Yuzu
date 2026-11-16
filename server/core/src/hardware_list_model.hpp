@@ -396,6 +396,14 @@ inline constexpr std::int64_t kHardwareStaleAfterMs = 2LL * 24 * 60 * 60 * 1000;
 /// served, flagged, and every other bit is left alone.
 [[nodiscard]] bool apply_roster_read(InventoryDevicesResult& result, const OfflineRosterRead& eps);
 
+/// Whether a roster row reads Online (#7566): the database says it is connected to some replica
+/// (`OfflineEndpoint::live`, which needs a non-zero TTL on the read) OR this replica holds its
+/// session (`local_ids`, the one thing the database can lag on: a session whose row has not recorded
+/// a session id yet). Pure, so the composition is unit-tested rather than pinned by source text
+/// alone; a `live` of false means "not asked or not live", never an error.
+[[nodiscard]] bool roster_row_online(const OfflineEndpoint& e,
+                                     const std::unordered_set<std::string>& local_ids);
+
 /// `agent_id -> (key -> value)` bulk tag read (`TagStore::get_values_for_keys`).
 using TagValuesRead =
     std::expected<std::unordered_map<std::string, std::unordered_map<std::string, std::string>>,
@@ -412,7 +420,8 @@ void apply_tag_read(InventoryDevicesResult& result,
 
 /// One device's identity from the offline point read (`OfflineEndpointStore::find_within`, #5712):
 /// the error is propagated (a failed read is never "not in the roster"); a hit yields the row
-/// (online=false, stale past 2 days) and an empty read is a CONFIRMED absence (nullopt) — the
+/// (online = the endpoint's `live` flag, i.e. connected to some replica per the database; offline
+/// and stale past 2 days otherwise) and an empty read is a CONFIRMED absence (nullopt) — the
 /// point read is a primary-key lookup, so unlike the roster scan it replaced (a lower bound past
 /// the row cap, which read an enrolled offline device as absent) its miss is exact.
 [[nodiscard]] std::expected<std::optional<InventoryDeviceRow>, PresenceReadError>
@@ -465,6 +474,12 @@ enum class HardwareCiRead {
 [[nodiscard]] inline bool hardware_ci_sections_unreadable(const HardwareCiDetail& detail) noexcept {
     return detail.ci_sections.has_value() && !detail.ci_sections->has_value();
 }
+
+/// The scalar fields of one stored CI record exactly as `hardware_ci_json` renders its `ci` object
+/// (a blank or "unknown" value is null; a v2 scalar the agent could not read is null), WITHOUT
+/// `sections`. `hardware_ci_json` builds `ci` from this plus `sections`, and the bulk CI page
+/// (`hardware_ci_page_model.hpp`) uses it alone, so the two cannot disagree on a field.
+[[nodiscard]] nlohmann::json hardware_ci_scalars_json(const DeviceCiRecord& ci);
 
 /// `ci_state`, `sections_state` and `identity_state` in the output are each one of "found" |
 /// "absent" | "degraded" — never inferred by the reader from a blank field. `sections_state` is

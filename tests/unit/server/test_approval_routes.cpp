@@ -1118,6 +1118,36 @@ TEST_CASE("approval_routes: an SSO proof dated after the database clock is a 503
     }
 }
 
+TEST_CASE("approval_routes: a persistent MFA binding fault is a 503 with no retry hint and no "
+          "\"retry the request\" advice, and the ticket stays pending",
+          "[server][routes][approval_routes][pg]") {
+    for (const char* verb : {"approve", "reject"}) {
+        INFO(verb);
+        Pending p;
+        Harness h;
+        h.approval_manager = p.mgr.get();
+        h.mfa_outcome = {Kind::kStoreUnavailable, MfaFactorState::kStoreUnavailable,
+                         /*persistent=*/true};
+        h.wire();
+
+        auto res = h.sink.Post("/api/approvals/" + p.id + "/" + verb, "{}");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        auto j = body(res->body);
+        CHECK(j["error"]["code"] == 503);
+        // It cannot succeed before an operator repairs the trigger and restarts the server.
+        CHECK(j["error"]["retry_after_ms"].is_null());
+        CHECK(j["error"]["remediation"].get<std::string>().find("retry the request") ==
+              std::string::npos);
+        CHECK(j["error"]["remediation"].get<std::string>().find("restart") != std::string::npos);
+        REQUIRE(h.audits.size() == 1);
+        CHECK(h.audits[0].result == "error");
+        CHECK(h.audits[0].detail == "approver_assurance:mfa_store_unavailable");
+        CHECK(h.events.empty());
+        p.check_pending();
+    }
+}
+
 TEST_CASE("approval_routes: a stale MFA proof keeps the gate's 401 untouched and adds a "
           "mfa_proof_stale denied row, before any attempted row",
           "[server][routes][approval_routes][approver_mfa][pg]") {
@@ -1532,8 +1562,9 @@ struct RealGate {
     /// store would hold that session's own proof instant and the database clock reads "now"
     /// plus 5 ms (defensive here: `session()` stamps from this process's clock, but a
     /// Postgres-authored instant is ms-rounded and can sit a hair ahead of it, which the gate
-    /// reads as future-dated). The cases that stamp through a real SessionStore set `durable`
-    /// from the real read instead.
+    /// reads as future-dated). The default row is BOUND to the account's current factor
+    /// generation, as a step-up stamp writes it. The cases that stamp through a real SessionStore
+    /// set `durable` from the real read instead.
     std::optional<auth::DurableMfaProof> durable;
     std::string id;
     bool wired_{false};
@@ -1579,14 +1610,20 @@ struct RealGate {
         };
     }
 
-    static auth::DurableMfaProof durable_row_for(const auth::Session& s) {
+    auth::DurableMfaProof durable_row_for(const auth::Session& s) {
         const auto ms = [](system_clock::time_point t) {
             return t.time_since_epoch().count() == 0
                        ? std::int64_t{0}
                        : std::chrono::duration_cast<milliseconds>(t.time_since_epoch()).count();
         };
         return {auth::DurableMfaProof::Source::kRow, ms(s.mfa_verified_at),
-                ms(system_clock::now()) + 5};
+                ms(system_clock::now()) + 5, gen_of(s.username)};
+    }
+
+    /// The account's CURRENT factor generation (0 for an unknown or unreadable account).
+    std::int64_t gen_of(const std::string& user) {
+        const auto status = authdb->mfa_status(user);
+        return status ? status->factor_gen : 0;
     }
 
     void add_user(const std::string& name, auth::Role role) {
@@ -1611,6 +1648,19 @@ struct RealGate {
             yuzu::server::pg::exec_params(lease.get(), statement, std::vector<std::string>{user});
         INFO(PQresultErrorMessage(r.get()));
         REQUIRE(r.status() == PGRES_COMMAND_OK);
+    }
+    /// `auth.users.mfa_enrolled_at` as epoch milliseconds, read from the column (0 = not enrolled).
+    std::int64_t enrolled_ms(const std::string& user) {
+        auto lease = authdb.pool().acquire();
+        REQUIRE(lease);
+        auto r = yuzu::server::pg::exec_params(
+            lease.get(),
+            "SELECT COALESCE((extract(epoch from mfa_enrolled_at)*1000)::bigint, 0) "
+            "FROM auth.users WHERE username = $1",
+            std::vector<std::string>{user});
+        REQUIRE(r.status() == PGRES_TUPLES_OK);
+        REQUIRE(PQntuples(r.get()) == 1);
+        return std::strtoll(PQgetvalue(r.get(), 0, 0), nullptr, 10);
     }
     void backdate_enrolment(const std::string& user) {
         sql("UPDATE auth.users SET mfa_enrolled_at = now() - interval '1 hour' "
@@ -1722,7 +1772,7 @@ TEST_CASE("approval integration: a durable proof past 300 s on the database cloc
     g.h.session = g.session("alice", "local", auth::Role::admin, milliseconds(10'000));
     const auto now_ms =
         std::chrono::duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
-    g.durable = {auth::DurableMfaProof::Source::kRow, now_ms - 450'000, now_ms};
+    g.durable = {auth::DurableMfaProof::Source::kRow, now_ms - 450'000, now_ms, g.gen_of("alice")};
     auto res = g.decide("approve", g.id);
     REQUIRE(res);
     CHECK(res->status == 401);
@@ -1731,7 +1781,7 @@ TEST_CASE("approval integration: a durable proof past 300 s on the database cloc
     CHECK(g.audit_rows("attempted") == 0);
 
     // The same session with a durable proof inside the window decides.
-    g.durable = {auth::DurableMfaProof::Source::kRow, now_ms - 10'000, now_ms};
+    g.durable = {auth::DurableMfaProof::Source::kRow, now_ms - 10'000, now_ms, g.gen_of("alice")};
     auto ok = g.decide("approve", g.id);
     REQUIRE(ok);
     CHECK(ok->status == 200);
@@ -1743,6 +1793,9 @@ TEST_CASE("approval integration: a proof from before a disable + re-enrol is cha
     RealGate g;
     auto old_session = g.session("alice", "local", auth::Role::admin, milliseconds(10'000));
     g.h.session = old_session;
+    // The stored proof of that session, bound to the factor it was made under; kept across the
+    // reset so the same row is judged against the new factor.
+    g.durable = g.durable_row_for(old_session);
     {
         auto res = g.decide("approve", g.id);
         REQUIRE(res);
@@ -1751,9 +1804,7 @@ TEST_CASE("approval integration: a proof from before a disable + re-enrol is cha
     const auto next = g.submit();
 
     REQUIRE(g.authdb->mfa_disable("alice").has_value());
-    std::this_thread::sleep_for(milliseconds(10));
     g.enroll("alice");
-    std::this_thread::sleep_for(milliseconds(10));
 
     g.h.audits.clear();
     g.h.session = old_session;
@@ -1763,9 +1814,10 @@ TEST_CASE("approval integration: a proof from before a disable + re-enrol is cha
     CHECK(g.status_of(next) == "pending");
     bool saw_reason = false;
     for (const auto& a : g.h.audits)
-        saw_reason |= a.detail.find("reason=proof_predates_enrolment") != std::string::npos;
+        saw_reason |= a.detail.find("reason=proof_factor_mismatch") != std::string::npos;
     CHECK(saw_reason);
 
+    g.durable.reset(); // a fresh proof under the new factor: the default row is bound to it
     g.h.session = g.session("alice", "local", auth::Role::admin, milliseconds(0));
     auto fresh = g.decide("approve", next);
     REQUIRE(fresh);
@@ -1904,12 +1956,10 @@ TEST_CASE("approval integration: the gate agrees with a session minted and re-st
         CHECK(ok->status == 200);
     }
 
-    // Clear and re-enrol: the durable proof now predates the enrolment...
+    // Clear and re-enrol: the durable proof is now bound to a factor that is gone...
     const auto next = g.submit();
     REQUIRE(g.authdb->mfa_disable("alice").has_value());
-    std::this_thread::sleep_for(milliseconds(10));
     g.enroll("alice");
-    std::this_thread::sleep_for(milliseconds(10));
     live = mgr.validate_session(token);
     REQUIRE(live.has_value());
     g.h.session = live;
@@ -1919,10 +1969,21 @@ TEST_CASE("approval integration: the gate agrees with a session minted and re-st
         REQUIRE(stale);
         CHECK(stale->status == 401);
         CHECK(g.status_of(next) == "pending");
+        // The proof was bound to the old factor at mint; the re-enrolment advanced the
+        // generation, so it is refused as a mismatch (not by comparing instants).
+        bool mismatch = false;
+        for (const auto& a : g.h.audits)
+            mismatch |= a.detail.find("reason=proof_factor_mismatch") != std::string::npos;
+        CHECK(mismatch);
     }
 
-    // ...and re-proving through the store's own stamp (database now()) clears it.
-    REQUIRE(mgr.mark_session_mfa_verified(token));
+    // ...and re-proving through the proof-carrying stamp (the new factor's generation and a
+    // database instant, as /login/mfa/stepup writes them) clears it.
+    const auto fresh_status = g.authdb->mfa_status("alice");
+    REQUIRE(fresh_status.has_value());
+    REQUIRE(mgr.mark_session_mfa_verified(
+        token, yuzu::server::LocalMfaProof{.factor_gen = fresh_status->factor_gen,
+                                           .verified_ms = fresh_status->db_now_ms}));
     live = mgr.validate_session(token);
     REQUIRE(live.has_value());
     g.h.session = live;
@@ -1931,6 +1992,116 @@ TEST_CASE("approval integration: the gate agrees with a session minted and re-st
     REQUIRE(again);
     CHECK(again->status == 200);
     CHECK(g.status_of(next) == "approved");
+}
+
+TEST_CASE("approval integration: a bound proof decides by generation equality, a mismatch is a "
+          "401 and the ticket stays pending (I13)",
+          "[server][routes][approval_routes][pg][approver_mfa]") {
+    RealGate g;
+    // alice re-enrols NOW: a proof verified before that moment would predate the enrolment by
+    // instant, but is bound to the generation that is current.
+    g.sql("UPDATE auth.users SET mfa_enrolled_at = now() WHERE username = $1", "alice");
+    const auto status = g.authdb->mfa_status("alice");
+    REQUIRE(status.has_value());
+    REQUIRE(status->factor_gen >= 2);
+    const auto now_ms =
+        std::chrono::duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+    const auto bound = [&](std::int64_t gen) {
+        return auth::DurableMfaProof{auth::DurableMfaProof::Source::kRow, now_ms - 10'000, now_ms,
+                                     gen};
+    };
+    REQUIRE(bound(0).mfa_verified_ms < g.enrolled_ms("alice"));
+
+    g.h.session = g.session("alice", "local", auth::Role::admin, milliseconds(10'000));
+    g.durable = bound(status->factor_gen - 1);
+    {
+        auto res = g.decide("approve", g.id);
+        REQUIRE(res);
+        CHECK(res->status == 401);
+        CHECK(body(res->body)["meta"]["mfa_step_up_required"] == true);
+        CHECK(g.status_of(g.id) == "pending");
+        CHECK(g.audit_rows("attempted") == 0);
+        bool mismatch = false;
+        for (const auto& a : g.h.audits)
+            mismatch |= a.detail.find("reason=proof_factor_mismatch") != std::string::npos;
+        CHECK(mismatch);
+    }
+    g.durable = bound(status->factor_gen);
+    auto ok = g.decide("approve", g.id);
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    CHECK(g.status_of(g.id) == "approved");
+
+    // The same instant with no generation is unbound, and an unbound proof decides nothing.
+    const auto next = g.submit();
+    g.durable = bound(0);
+    auto unbound = g.decide("approve", next);
+    REQUIRE(unbound);
+    CHECK(unbound->status == 401);
+    CHECK(g.status_of(next) == "pending");
+}
+
+// Enrol-then-approve (the user-visible flow every commit must keep working): a user who has just
+// enrolled can decide at once with a BOUND stamp whose instant was captured before the enrolment
+// (generation equality, no instant comparison). A stamp with no generation is refused, naming
+// proof_factor_unbound: the transitional instant rule is gone.
+TEST_CASE("approval integration: enrol then approve at once passes for a bound stamp and is "
+          "refused for an unbound one (I14)",
+          "[server][routes][approval_routes][pg][approver_mfa]") {
+    RealGate g;
+    yuzu::server::SessionStore store{g.authdb.pool()};
+    REQUIRE(store.is_open());
+    auth::AuthManager mgr;
+    mgr.set_auth_db(g.authdb.get());
+    mgr.set_session_store(&store);
+
+    g.add_user("dave", auth::Role::user);
+    for (const bool bound : {false, true}) {
+        INFO(std::string(bound ? "bound" : "unbound") + " stamp");
+        const auto user = bound ? std::string("erin") : std::string("dave");
+        if (bound)
+            g.add_user(user, auth::Role::user);
+        // Password-only session first (no proof), then the enrolment, then the step-up stamp.
+        const auto token = mgr.create_local_session_for_test(user, auth::Role::user, false);
+        REQUIRE_FALSE(token.empty());
+        g.enroll(user);
+        const auto st = g.authdb->mfa_status(user);
+        REQUIRE(st.has_value());
+        REQUIRE(st->enrolled);
+        if (bound) {
+            // Verified 2 s BEFORE the enrolment instant, bound to the generation it produced.
+            REQUIRE(mgr.mark_session_mfa_verified(
+                token, yuzu::server::LocalMfaProof{st->factor_gen, g.enrolled_ms(user) - 2'000}));
+        } else {
+            // A proof with no generation: what a legacy row or a rebind-guard unbind holds.
+            REQUIRE(mgr.mark_session_mfa_verified(token,
+                                                  yuzu::server::LocalMfaProof{0, st->db_now_ms}));
+        }
+        auto live = mgr.validate_session(token);
+        REQUIRE(live.has_value());
+        g.h.session = live;
+        g.durable = mgr.read_durable_mfa_proof(token, user);
+        REQUIRE(g.durable->source == auth::DurableMfaProof::Source::kRow);
+        CHECK((g.durable->mfa_factor_gen > 0) == bound);
+        if (bound)
+            CHECK(g.durable->mfa_verified_ms < g.enrolled_ms(user));
+
+        const auto ticket = g.submit();
+        g.h.audits.clear();
+        auto res = g.decide("approve", ticket);
+        REQUIRE(res);
+        if (bound) {
+            CHECK(res->status == 200);
+            CHECK(g.status_of(ticket) == "approved");
+        } else {
+            CHECK(res->status == 401);
+            CHECK(g.status_of(ticket) == "pending");
+            bool unbound_reason = false;
+            for (const auto& a : g.h.audits)
+                unbound_reason |= a.detail.find("reason=proof_factor_unbound") != std::string::npos;
+            CHECK(unbound_reason);
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2001,11 +2172,28 @@ TEST_CASE("approval_routes: wiring -- server.cpp passes approver_mfa_fn and csrf
     // principal-checked) and hands it to the gate. Dropping it, or passing "no store
     // attached", would put production back on the suspend-blind cached clock while every
     // unit fixture (whose default is a kRow built from the session) stayed green.
+    // The read is a ternary on the session's auth_source: a LOCAL session reads through
+    // `durable_mfa_proof_for` (the chokepoint that also applies the rebind-guard check to a
+    // stored binding), an SSO session takes the raw read (no binding applies to it, so a latched
+    // guard must not refuse it). Each arm appears exactly once.
+    const auto count_in = [&](std::string_view needle) {
+        std::size_t n = 0;
+        for (auto at = closure.find(needle); at != std::string::npos;
+             at = closure.find(needle, at + needle.size()))
+            ++n;
+        return n;
+    };
+    CHECK(count_in("auth_source == \"oidc\"") == 1);
+    CHECK(count_in("auth_mgr_.read_durable_mfa_proof(") == 1);
+    CHECK(count_in("auth_routes_->durable_mfa_proof_for(") == 1);
     const auto read = closure.find("auth_mgr_.read_durable_mfa_proof(");
     REQUIRE(read != std::string::npos);
+    CHECK(closure.find("auth_source == \"oidc\"") < read);
+    CHECK(read < closure.find("auth_routes_->durable_mfa_proof_for("));
     CHECK(closure.find("AuthRoutes::extract_session_cookie(req)", read) != std::string::npos);
     CHECK(closure.find("session.username", read) != std::string::npos);
-    CHECK(read < closure.find("require_enrolled_fresh_mfa("));
+    CHECK(closure.find("auth_routes_->durable_mfa_proof_for(") <
+          closure.find("require_enrolled_fresh_mfa("));
     CHECK(closure.find("action_label, durable,") != std::string::npos);
     // The route="approval" 503 counter depends on the registry being handed to the gate: a
     // nullptr here compiles and silently loses the series.
@@ -2019,6 +2207,7 @@ TEST_CASE("approval_routes: wiring -- server.cpp passes approver_mfa_fn and csrf
 // arch-1 / sre-1 (#6079): `route="approval"` is emitted by require_enrolled_fresh_mfa, so it
 // belongs to the pre-seeded closed label set of yuzu_auth_secret_unavailable_total; without
 // the seed the series is absent until the first outage, which is invisible to absent() alerts.
+// `route="mfa_binding"` (the generic gates' undecidable binding) is seeded for the same reason.
 TEST_CASE("approval_routes: wiring -- server.cpp pre-seeds route=\"approval\" on "
           "yuzu_auth_secret_unavailable_total",
           "[server][routes][approval_routes]") {
@@ -2031,7 +2220,7 @@ TEST_CASE("approval_routes: wiring -- server.cpp pre-seeds route=\"approval\" on
     REQUIRE(counter != std::string::npos);
     const std::string seeded = src.substr(loop, counter - loop);
     for (const char* route : {"login", "mfa_verify", "mfa_stepup", "mfa_enroll", "elevate",
-                              "password_change", "approval"}) {
+                              "password_change", "approval", "mfa_binding"}) {
         INFO(route);
         CHECK(seeded.find(std::string("\"") + route + "\"") != std::string::npos);
     }

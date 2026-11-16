@@ -137,6 +137,10 @@ std::optional<json> parse_object_body(const httplib::Request& req, httplib::Resp
         fail(res, 400, "request body nests too deeply");
         return std::nullopt;
     }
+    if (json_exceeds_value_budget(req.body)) {
+        fail(res, 400, "request body holds too many values");
+        return std::nullopt;
+    }
     auto body = json::parse(req.body, nullptr, /*allow_exceptions=*/false);
     if (body.is_discarded()) {
         fail(res, 400, "request body is not valid JSON");
@@ -511,7 +515,7 @@ void register_instruction_authoring_routes(HttpRouteSink& sink, RouteDeps deps) 
         auto stored = deps.store->get_definition(id);
         if (!stored) {
             // The read failed before anything was decided: one `error` row (the same vocabulary
-            // the other v1 refusals write), no attempted/outcome pair, nothing mutated.
+            // the legacy DELETE writes), no attempted/outcome pair, nothing mutated.
             audit.outcome("error", target, "db_error");
             return fail(res, 503, "instruction store unavailable", /*retry=*/true);
         }

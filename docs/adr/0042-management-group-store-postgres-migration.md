@@ -1,6 +1,7 @@
 # ADR-0042: ManagementGroupStore → PostgreSQL (Wave 2.2)
 
 - **Status:** Accepted (governance-resolved 2026-08-02)
+- **Owner:** Nathan Dornbrook (platform)
 - **Date:** 2026-08-01
 - **Deciders:** pg workstream; security-guardian + architect + docs-writer (governance)
 - **Parents:** ADR-0006/0007/0008(+Correction), ADR-0009, ADR-0012, **ADR-0017**

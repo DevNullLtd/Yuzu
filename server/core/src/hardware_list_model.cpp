@@ -800,6 +800,35 @@ bool agent_supports_sync_now(std::string_view agent_version) noexcept {
     return parts && *parts >= kSyncNowMinAgentVersion; // lexicographic on {major, minor, patch}
 }
 
+nlohmann::json hardware_ci_scalars_json(const DeviceCiRecord& ci) {
+    return nlohmann::json{
+        {"manufacturer", ci_json(ci.manufacturer)}, {"model", ci_json(ci.model)},
+        {"serial", ci_json(ci.serial)},             {"system_uuid", ci_json(ci.system_uuid)},
+        {"domain", ci_json(ci.domain)},             {"ou", ci_json(ci.ou)},
+        {"bios_vendor", ci_json(ci.bios_vendor)},   {"bios_version", ci_json(ci.bios_version)},
+        {"bios_date", ci_json(ci.bios_date)},       {"cpu_model", ci_json(ci.cpu_model)},
+        {"cpu_cores", ci_json_int(ci.cpu_cores)},   {"cpu_threads", ci_json_int(ci.cpu_threads)},
+        {"ram_bytes", ci_json_int(ci.ram_bytes)},   {"disks_summary", ci_json(ci.disks_summary)},
+        {"primary_mac", ci_json(ci.primary_mac)},   {"macs_summary", ci_json(ci.macs_summary)},
+        {"nic_count", ci_json_int(ci.nic_count)},   {"os_name", ci_json(ci.os_name)},
+        {"os_version", ci_json(ci.os_version)},     {"os_build", ci_json(ci.os_build)},
+        {"arch", ci_json(ci.arch)},                 {"first_seen", ci.first_seen},
+        {"last_seen", ci.last_seen},
+        // v2 identity scalars (H.7). Null on a v1 record and on a section the agent could not read.
+        {"chassis_type", ci_json_ph(ci.chassis_type)},
+        {"chassis_serial", ci_json_ph(ci.chassis_serial)},
+        {"chassis_asset_tag", ci_json_ph(ci.chassis_asset_tag)},
+        {"chassis_source", ci_json_ph(ci.chassis_source)},
+        {"board_vendor", ci_json_ph(ci.board_vendor)},
+        {"board_product", ci_json_ph(ci.board_product)},
+        {"board_serial", ci_json_ph(ci.board_serial)},
+        {"board_source", ci_json_ph(ci.board_source)},
+        {"machine_id_hash", ci_json_ph(ci.machine_id_hash)},
+        {"machine_id_algorithm", ci_json_ph(ci.machine_id_algorithm)},
+        {"machine_id_source", ci_json_ph(ci.machine_id_source)},
+    };
+}
+
 nlohmann::json hardware_ci_json(const HardwareCiDetail& detail, std::int64_t /*now_secs*/) {
     nlohmann::json out;
     if (detail.identity) {
@@ -827,40 +856,15 @@ nlohmann::json hardware_ci_json(const HardwareCiDetail& detail, std::int64_t /*n
         out["ci_state"] = "absent";
     } else {
         const DeviceCiRecord& ci = **detail.ci;
-        out["ci"] = {
-            {"manufacturer", ci_json(ci.manufacturer)}, {"model", ci_json(ci.model)},
-            {"serial", ci_json(ci.serial)},             {"system_uuid", ci_json(ci.system_uuid)},
-            {"domain", ci_json(ci.domain)},             {"ou", ci_json(ci.ou)},
-            {"bios_vendor", ci_json(ci.bios_vendor)},   {"bios_version", ci_json(ci.bios_version)},
-            {"bios_date", ci_json(ci.bios_date)},       {"cpu_model", ci_json(ci.cpu_model)},
-            {"cpu_cores", ci_json_int(ci.cpu_cores)},   {"cpu_threads", ci_json_int(ci.cpu_threads)},
-            {"ram_bytes", ci_json_int(ci.ram_bytes)},   {"disks_summary", ci_json(ci.disks_summary)},
-            {"primary_mac", ci_json(ci.primary_mac)},   {"macs_summary", ci_json(ci.macs_summary)},
-            {"nic_count", ci_json_int(ci.nic_count)},   {"os_name", ci_json(ci.os_name)},
-            {"os_version", ci_json(ci.os_version)},     {"os_build", ci_json(ci.os_build)},
-            {"arch", ci_json(ci.arch)},                 {"first_seen", ci.first_seen},
-            {"last_seen", ci.last_seen},
-            // v2 identity scalars (H.7). Null on a v1 record and on a section the agent could not read.
-            {"chassis_type", ci_json_ph(ci.chassis_type)},
-            {"chassis_serial", ci_json_ph(ci.chassis_serial)},
-            {"chassis_asset_tag", ci_json_ph(ci.chassis_asset_tag)},
-            {"chassis_source", ci_json_ph(ci.chassis_source)},
-            {"board_vendor", ci_json_ph(ci.board_vendor)},
-            {"board_product", ci_json_ph(ci.board_product)},
-            {"board_serial", ci_json_ph(ci.board_serial)},
-            {"board_source", ci_json_ph(ci.board_source)},
-            {"machine_id_hash", ci_json_ph(ci.machine_id_hash)},
-            {"machine_id_algorithm", ci_json_ph(ci.machine_id_algorithm)},
-            {"machine_id_source", ci_json_ph(ci.machine_id_source)},
-            // [] = read and nothing stored. A failed sections read never reaches this serializer:
-            // both surfaces answer their retryable error first (`SectionsUnreadable`), and the
-            // two record-serving surfaces always read the sections, so ci.sections null (a failed
-            // or a not-read state) is not emitted by REST or MCP today; the null arms only keep
-            // the serializer total.
-            {"sections", detail.ci_sections && *detail.ci_sections
-                             ? ci_sections_json(ci, **detail.ci_sections)
-                             : nlohmann::json(nullptr)},
-        };
+        out["ci"] = hardware_ci_scalars_json(ci);
+        // [] = read and nothing stored. A failed sections read never reaches this serializer:
+        // both surfaces answer their retryable error first (`SectionsUnreadable`), and the
+        // two record-serving surfaces always read the sections, so ci.sections null (a failed
+        // or a not-read state) is not emitted by REST or MCP today; the null arms only keep
+        // the serializer total.
+        out["ci"]["sections"] = detail.ci_sections && *detail.ci_sections
+                                    ? ci_sections_json(ci, **detail.ci_sections)
+                                    : nlohmann::json(nullptr);
         out["ci_state"] = "found";
     }
 
@@ -928,6 +932,10 @@ void apply_tag_read(InventoryDevicesResult& result,
             r.tags.assign(it->second.begin(), it->second.end());
 }
 
+bool roster_row_online(const OfflineEndpoint& e, const std::unordered_set<std::string>& local_ids) {
+    return e.live || local_ids.count(e.agent_id) > 0;
+}
+
 std::expected<std::optional<InventoryDeviceRow>, PresenceReadError>
 offline_identity_row(const OfflineEndpointRead& ep, std::int64_t now_ms,
                      std::string (*human_age)(std::int64_t)) {
@@ -942,11 +950,15 @@ offline_identity_row(const OfflineEndpointRead& ep, std::int64_t now_ms,
     r.os = e.os;
     r.agent_version = e.agent_version;
     r.arch = e.arch;
-    r.online = false;
+    // #7551: `live` is the database's answer (a non-blank session whose last_seen_at is inside the
+    // presence TTL), so a device connected to ANOTHER replica reads online here instead of being
+    // hard-coded offline. It is only set when the point read was given a TTL; a read without one
+    // leaves it false, which this maps to offline exactly as before.
+    r.online = e.live;
     const std::int64_t age_ms = now_ms - e.last_heartbeat_ms;
-    r.stale = age_ms > kHardwareStaleAfterMs;
-    r.last_seen = human_age(age_ms);
-    r.last_seen_ms = e.last_heartbeat_ms;
+    r.stale = age_ms > kHardwareStaleAfterMs; // the same test the list applies
+    r.last_seen = r.online ? std::string("now") : human_age(age_ms);
+    r.last_seen_ms = r.online ? now_ms : e.last_heartbeat_ms;
     return std::optional<InventoryDeviceRow>{std::move(r)};
 }
 

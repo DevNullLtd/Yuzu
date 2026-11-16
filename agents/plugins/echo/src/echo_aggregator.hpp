@@ -14,6 +14,7 @@
 #include <yuzu/echo_retention_tick.hpp> // kEchoDbBudgetBytesDefault / kEchoDbBudgetBytesMin
 
 #include <yuzu/audit_retention_rules.hpp>
+#include <yuzu/agent/process_enum.hpp> // ProcessInfo -- the process baseline codec
 
 #include <algorithm>
 #include <cstddef>
@@ -329,6 +330,24 @@ void run_retention(EchoDatabase& db, int64_t now_epoch, RetentionGuardState& gua
  * clear can never target the wrong key (a silent no-op).
  */
 [[nodiscard]] std::string_view diff_state_key(std::string_view source);
+
+/**
+ * The `process` snapshot-diff baseline codec (echo_state row `diff_state_key("process")`).
+ *
+ * The baseline holds pid, ppid, name and user ONLY -- never the command line (#3864).
+ * echo_state is readable through echo.sql and a command line routinely carries credentials
+ * (`psql postgresql://user:pw@host`); the process diff keys on pid and name, so the same
+ * events are emitted. A stopped event takes its command line from the baseline, which now
+ * holds none, so that field is empty; the roll-up tiers keep no command line either way.
+ *
+ *   decode -- malformed JSON gives an empty vector, a malformed entry keeps the entries
+ *             before it, and a `cmdline` key is never read.
+ *   scrub  -- true only when it rewrote the row; false for no row or an already-clean row,
+ *             and for an unreadable row or a failed write (those two logged).
+ */
+[[nodiscard]] std::string encode_process_baseline(const std::vector<yuzu::agent::ProcessInfo>& procs);
+[[nodiscard]] std::vector<yuzu::agent::ProcessInfo> decode_process_baseline(const std::string& s);
+bool scrub_process_baseline(EchoDatabase& db);
 
 /**
  * Canonicalise a stored `<source>_enabled` value to a strict tri-state for the

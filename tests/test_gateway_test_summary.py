@@ -13,20 +13,27 @@ cannot silently come back:
   3. each suite's wrapper deadline stays BELOW its meson timeout, so the
      wrapper's pre-kill process-tree dump is reachable.
 
-Hermetic: parses sources and runs only the parser CLI under sys.executable
-(no rebar3, no network, no shared paths).
+Hermetic: parses sources, runs the parser CLI, and owns short-lived Python
+children to check deadlines (no real rebar3, network, or shared paths).
 """
 import ast
 import glob
+import io
 import json
 import os
+import queue
 import re
 import shutil
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from types import SimpleNamespace
+from unittest.mock import patch
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 sys.path.insert(0, os.path.join(ROOT, 'scripts'))
@@ -144,11 +151,292 @@ class RequireTestsExecuted(unittest.TestCase):
         self.assertEqual(gts.require_tests_executed('Failed 6 tests. Passed 44 tests.', 'ct', 1), 1)
         self.assertEqual(gts.require_tests_executed('', 'ct', -1), -1)
 
+    def test_failed_or_cancelled_output_cannot_pass_even_with_zero_status(self):
+        for text in ('Failed 1 tests. Passed 4 tests.',
+                     'Failed: 1.  Skipped: 0.  Passed: 4.',
+                     'Failed: 0.  Skipped: 0.  Passed: 1.\n'
+                     'One or more tests were cancelled.'):
+            with self.subTest(text=text):
+                self.assertEqual(gts.require_tests_executed(text, 'eunit', 0), 1)
 
-class CancelTolerantVerdict(unittest.TestCase):
-    # The verdict /test's eunit-gate.sh and the release workflow's EUnit step
-    # both take from scripts/gateway_test_summary.py (#1005 tolerance +
-    # #4800 zero-executed rule).
+
+class FailureDiagnostics(unittest.TestCase):
+
+    def report(self, output, code, **kwargs):
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            result = gts.require_tests_executed(output, 'eunit shard 1/2', code, **kwargs)
+        return result, stderr.getvalue()
+
+    def test_early_generator_error_survives_a_long_successful_tail(self):
+        output = ('module fixture_tests\n'
+                  '  *** test generator fixture_tests:validity_test_/0 failed ***\n'
+                  '**in function crypto:sign/5\n'
+                  '**error:signature_digest_rejected\n' + 'passing fixture noise\n' * 500 +
+                  'Failed: 0.  Skipped: 0.  Passed: 711.\n'
+                  'One or more tests were cancelled.\n')
+        code, diagnostic = self.report(output, 1)
+        self.assertEqual(code, 1)
+        self.assertIn('fixture_tests:validity_test_/0', diagnostic)
+        self.assertIn('signature_digest_rejected', diagnostic)
+        self.assertIn('711', diagnostic)
+        self.assertIn('cancelled', diagnostic)
+        self.assertLess(len(diagnostic.splitlines()), 80)
+
+    def test_child_status_is_preserved_without_inventing_cancellation(self):
+        code, diagnostic = self.report('native process crashed\n', 42)
+        self.assertEqual(code, 42)
+        self.assertIn('42', diagnostic)
+        self.assertIn('native process crashed', diagnostic)
+        self.assertNotIn('cancellation', diagnostic)
+
+    def test_ct_failure_and_ansi_generator_context_are_visible(self):
+        for failure in ('%%% fixture_SUITE ==> failed_case: FAILED\nreason: expected_true\n',
+                        '\x1b[31m*** context setup failed ***\x1b[0m\n'
+                        '**error:expected_true\n'):
+            with self.subTest(failure=failure):
+                code, diagnostic = self.report(failure + 'noise\n' * 200, 7)
+                self.assertEqual(code, 7)
+                self.assertIn('expected_true', diagnostic)
+                self.assertNotIn('\x1b[', diagnostic)
+
+    def test_failure_logs_are_complete_and_never_overwrite_an_attempt(self):
+        output = '*failed*\n**error:fixture_failure\n' + 'native output\n' * 500
+        with tempfile.TemporaryDirectory(prefix='yuzu_test_gateway_logs_') as directory:
+            for _ in range(2):
+                code, diagnostic = self.report(output, 1, log_dir=directory)
+                self.assertEqual(code, 1)
+                self.assertIn('Full gateway output:', diagnostic)
+            logs = glob.glob(os.path.join(directory, '*.log'))
+            self.assertEqual(len(logs), 2)
+            self.assertTrue(all(_read(path) == output for path in logs))
+
+    def test_log_write_error_does_not_hide_native_failure(self):
+        with tempfile.TemporaryDirectory(prefix='yuzu_test_gateway_logs_') as directory:
+            blocked = os.path.join(directory, 'not_a_directory')
+            with open(blocked, 'w') as stream:
+                stream.write('occupied')
+            code, diagnostic = self.report('*failed*\n**error:fixture_failure\n', 7,
+                                           log_dir=blocked)
+            self.assertEqual(code, 7)
+            self.assertIn('fixture_failure', diagnostic)
+            self.assertIn('could not save', diagnostic)
+
+    def test_failed_close_does_not_advertise_a_complete_log(self):
+        class FailedClose(io.StringIO):
+            name = 'partial.log'
+
+            def __exit__(self, *args):
+                super().__exit__(*args)
+                raise OSError('disk full during close')
+
+        with tempfile.TemporaryDirectory(prefix='yuzu_test_gateway_logs_') as directory:
+            with patch.object(gts.tempfile, 'NamedTemporaryFile', return_value=FailedClose()):
+                code, diagnostic = self.report('*failed*\n', 7, log_dir=directory)
+        self.assertEqual(code, 7)
+        self.assertIn('could not save', diagnostic)
+        self.assertNotIn('Full gateway output:', diagnostic)
+
+    @unittest.skipUnless(shutil.which('meson'), 'Meson executable is required')
+    def test_real_child_status_and_early_error_reach_mesons_console_tail(self):
+        # Run the actual wrapper under Meson. Only the rebar/OTP dependency is
+        # replaced: a real child emits both streams, then hundreds of later lines.
+        with tempfile.TemporaryDirectory(prefix='yuzu_test_gateway_meson_') as directory:
+            child = os.path.join(directory, 'child.py')
+            driver = os.path.join(directory, 'invoke.py')
+            gateway = os.path.join(directory, 'gateway')
+            os.mkdir(gateway)
+            with open(child, 'w', encoding='utf-8') as stream:
+                stream.write(
+                    'import sys\n'
+                    'sys.stdout.buffer.write(b"native diagnostic: \\xe2\\x95\\x90\\xff\\n")\n'
+                    'print("*** test generator fixture:broken_test_/0 failed ***", flush=True)\n'
+                    'print("**in function crypto:sign/5\\n**error:original_otp_reason", '
+                    'file=sys.stderr, flush=True)\n'
+                    'print("later passing output\\n" * 400, flush=True)\n'
+                    'print("Failed: 0.  Skipped: 0.  Passed: 711.\\n"\n'
+                    '      "One or more tests were cancelled.", flush=True)\n'
+                    'sys.exit(int(sys.argv[1]))\n')
+            with open(driver, 'w', encoding='utf-8') as stream:
+                stream.write(
+                    'import os, runpy, subprocess, sys, types\n'
+                    'status = sys.argv[1]\n'
+                    'toolchain = types.ModuleType("erlang_toolchain")\n'
+                    'toolchain.base_env = os.environ.copy\n'
+                    f'toolchain.rebar3_prefix = lambda: [sys.executable, {child!r}, status]\n'
+                    'toolchain.windows_stdio_isolation = lambda: {"stdin": subprocess.DEVNULL}\n'
+                    'toolchain.kill_tree = lambda proc, timeout=10: proc.kill() is None\n'
+                    'sys.modules["erlang_toolchain"] = toolchain\n'
+                    'epmd = types.ModuleType("gateway_epmd")\n'
+                    'epmd.activate = lambda env: None\n'
+                    'sys.modules["gateway_epmd"] = epmd\n'
+                    f'sys.argv = [{WRAPPER!r}, {gateway!r}, "eunit"]\n'
+                    f'runpy.run_path({WRAPPER!r}, run_name="__main__")\n')
+            python = sys.executable.replace('\\', '/').replace("'", "\\'")
+            with open(os.path.join(directory, 'meson.build'), 'w', encoding='utf-8') as stream:
+                stream.write(
+                    "project('gateway-diagnostics')\n"
+                    f"python = find_program('{python}')\n"
+                    "foreach code : ['0', '42']\n"
+                    "  test('gateway-' + code, python, args: ['invoke.py', code],\n"
+                    "    workdir: meson.current_source_dir(), timeout: 10,\n"
+                    "    env: {'YUZU_GATEWAY_TEST_LOG_DIR': meson.project_build_root() / 'meson-logs'})\n"
+                    "endforeach\n")
+            env = os.environ.copy()
+            for name in ('MESON_BUILD_ROOT', 'REBAR_BASE_DIR', 'YUZU_GATEWAY_TEST_LOG_DIR'):
+                env.pop(name, None)
+            env['PYTHONIOENCODING'] = 'cp1252'
+            build = os.path.join(directory, 'build')
+            # This whole selftest has a 30 s Meson budget. Bound the two
+            # nested children to at most half of it together; they compile no
+            # targets and each fake test exits immediately.
+            setup = subprocess.run(['meson', 'setup', build, directory], env=env,
+                                   capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5)
+            self.assertEqual(setup.returncode, 0, setup.stdout + setup.stderr)
+            run = subprocess.run(['meson', 'test', '-C', build, '--no-rebuild',
+                                  '--print-errorlogs', '--num-processes', '1'], env=env,
+                                 capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10)
+            self.assertNotEqual(run.returncode, 0)
+            console = run.stdout + run.stderr
+            self.assertIn('original_otp_reason', console)
+            self.assertIn('native diagnostic:', console)
+            self.assertIn('fixture:broken_test_/0', console)
+            self.assertIn('Full gateway output:', console)
+            with open(os.path.join(build, 'meson-logs', 'testlog.json'), encoding='utf-8') as stream:
+                native = [json.loads(line) for line in stream if line.strip()]
+            self.assertEqual(sorted(row['returncode'] for row in native), [1, 42])
+            logs = glob.glob(os.path.join(build, 'meson-logs', 'yuzu_test_gateway_*.log'))
+            self.assertEqual(len(logs), 2)
+            self.assertTrue(all(_read(path).count('later passing output') == 400 for path in logs))
+            self.assertTrue(all('native diagnostic: \u2550\ufffd' in _read(path) for path in logs))
+
+
+class WrapperDeadline(unittest.TestCase):
+    # The wrapper executes rebar3 at import time. Load its actual function
+    # definitions without running its CLI setup; only the diagnostic listing
+    # and tree kill are replaced, since these tests own a single Python child.
+    def functions(self, **overrides):
+        tree = ast.parse(_read(WRAPPER))
+        definitions = ast.Module(body=[n for n in tree.body
+                                       if isinstance(n, ast.FunctionDef)], type_ignores=[])
+        namespace = dict(queue=queue, threading=threading, time=time, sys=sys,
+                         subprocess=subprocess, os=os,
+                         HEX_FAIL_PATTERN='Failed to fetch and copy dep:',
+                         _RUN_DEADLINE_SECS=10)
+        exec(compile(definitions, WRAPPER, 'exec'), namespace)
+        namespace.update(_dump_process_tree=lambda: None,
+                         _kill_process_tree=lambda proc: proc.kill())
+        namespace.update(overrides)
+        return namespace
+
+    def test_stream_replaces_invalid_utf8_without_losing_the_summary(self):
+        # rebar3's output can include bytes from native tools. One bad byte
+        # must neither kill the reader nor discard the later terminal result.
+        ns = self.functions(gateway_dir=ROOT, env=os.environ.copy(),
+                            windows_stdio_isolation=lambda: {})
+        child = [sys.executable, '-c',
+                 'import os; os.write(1, b"diagnostic: \\xe2\\x95\\x90\\xff\\nAll 2 tests passed.\\n")']
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            rc, output = ns['_run_streamed'](child, 5)
+        self.assertEqual(rc, 0)
+        self.assertIn('diagnostic: \u2550\ufffd', output)
+        self.assertIn('All 2 tests passed.', output)
+
+    def test_output_eof_does_not_end_the_process_deadline(self):
+        # Real EOF while the child stays alive: previously the timed reader
+        # exited and proc.wait() then waited forever. The child has its own
+        # finite backstop and is reaped even if the assertion fails.
+        proc = subprocess.Popen(
+            [sys.executable, '-c',
+             'import os,time; print("before EOF",flush=True); '
+             'os.close(1); os.close(2); time.sleep(5)'],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
+        try:
+            started = time.monotonic()
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
+                rc, output = self.functions()['_stream_until_exit'](proc, 0.5)
+            self.assertNotEqual(rc, 0)
+            self.assertLess(time.monotonic() - started, 4)
+            self.assertIn('DEADLINE EXCEEDED', err.getvalue())
+            self.assertIn('before EOF', output)
+            self.assertIsNotNone(proc.poll())
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=5)
+            proc.stdout.close()
+
+    def test_eof_from_a_successfully_exited_child_still_passes(self):
+        with subprocess.Popen([sys.executable, '-c', 'print("All 2 tests passed.")'],
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              text=True, encoding="utf-8", errors="replace") as proc:
+            with redirect_stdout(io.StringIO()):
+                rc, output = self.functions()['_stream_until_exit'](proc, 5)
+            self.assertEqual(rc, 0)
+            self.assertEqual(output.strip(), 'All 2 tests passed.')
+
+    def test_exit_zero_during_deadline_cleanup_does_not_turn_green(self):
+        proc = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(0.3)'],
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
+        try:
+            # Simulate the child naturally finishing while diagnostics run,
+            # before the kill reaches it. Its final status is genuinely 0.
+            ns = self.functions(_dump_process_tree=lambda: proc.wait(timeout=5),
+                                _kill_process_tree=lambda proc: None)
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                rc, _ = ns['_stream_until_exit'](proc, 0.01)
+            self.assertEqual(proc.returncode, 0)
+            self.assertNotEqual(rc, 0)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=5)
+            proc.stdout.close()
+
+    def test_retries_share_one_deadline_including_backoff(self):
+        now = [0]
+        budgets, sleeps = [], []
+
+        def run(args, budget):
+            budgets.append(budget)
+            now[0] += 4 if len(budgets) == 1 else 0.5
+            return (1, 'Failed to fetch and copy dep: x') if len(budgets) == 1 else (0, 'pass')
+
+        def sleep(delay):
+            sleeps.append(delay)
+            now[0] += delay
+
+        ns = self.functions(time=SimpleNamespace(monotonic=lambda: now[0], sleep=sleep),
+                            _run_streamed=run)
+        with redirect_stderr(io.StringIO()):
+            result = ns['run_with_retry']([], 'eunit')
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(budgets, [10, 1])
+        self.assertEqual(sleeps, [5])
+
+    def test_retry_is_not_started_when_backoff_would_exhaust_budget(self):
+        now = [0]
+        budgets = []
+
+        def run(args, budget):
+            budgets.append(budget)
+            now[0] += 6
+            return 1, 'Failed to fetch and copy dep: x'
+
+        def sleep(delay):
+            self.fail('must not wait beyond the remaining suite budget')
+
+        ns = self.functions(time=SimpleNamespace(monotonic=lambda: now[0], sleep=sleep),
+                            _run_streamed=run)
+        with redirect_stderr(io.StringIO()):
+            result = ns['run_with_retry']([], 'eunit')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(budgets, [10])
+
+
+class StrictEUnitVerdict(unittest.TestCase):
+    # All EUnit gates are strict. The old cancel-tolerant API/CLI remains
+    # compatible in shape but must no longer turn cancellations green.
 
     def test_matrix(self):
         cases = [
@@ -156,8 +444,8 @@ class CancelTolerantVerdict(unittest.TestCase):
             ('  All 300 tests passed.', 0, 0, 'green'),
             ('  2 tests passed.', 0, 0, 'two tests'),
             ('  Test passed.', 0, 0, 'one test'),
-            ('  Failed: 0.  Skipped: 0.  Passed: 309.\nOne or more tests were cancelled.', 1, 0,
-             'some sets cancelled (#1005)'),
+            ('  Failed: 0.  Skipped: 0.  Passed: 309.\nOne or more tests were cancelled.', 1, 1,
+             'some sets cancelled (former #1005 tolerance)'),
             ('  Failed: 0.  Skipped: 0.  Passed: 0.\nOne or more tests were cancelled.', 1, 1,
              'ALL cancelled (#4800 C-1)'),
             ('  Failed: 2.  Skipped: 0.  Passed: 307.', 1, 1, 'real failure'),
@@ -175,13 +463,15 @@ class CancelTolerantVerdict(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='yuzu_test_') as d:
             log = os.path.join(d, 'eunit.log')
             for text, rc, want in [('  All 3 tests passed.\n', '0', 0),
-                                   ('  Failed: 0.  Skipped: 0.  Passed: 0.\n', '1', 1)]:
+                                   ('  Failed: 0.  Skipped: 0.  Passed: 0.\n', '1', 1),
+                                   ('  Failed: 0.  Skipped: 0.  Passed: 1.\n'
+                                    'One or more tests were cancelled.\n', '1', 1)]:
                 with open(log, 'w', encoding='utf-8') as f:
                     f.write(text)
                 p = subprocess.run([sys.executable, script, 'cancel-tolerant', rc, log, '--github'],
-                                   capture_output=True, text=True)
+                                   capture_output=True, text=True, encoding="utf-8", errors="replace")
                 self.assertEqual(p.returncode, want, p.stdout + p.stderr)
-            p = subprocess.run([sys.executable, script], capture_output=True, text=True)
+            p = subprocess.run([sys.executable, script], capture_output=True, text=True, encoding="utf-8", errors="replace")
             self.assertEqual(p.returncode, 2)
 
     def test_shell_gates_use_this_parser(self):
@@ -190,14 +480,13 @@ class CancelTolerantVerdict(unittest.TestCase):
         for path in (os.path.join(ROOT, 'scripts', 'test', 'eunit-gate.sh'),
                      os.path.join(ROOT, '.github', 'workflows', 'release.yml')):
             with self.subTest(path=path):
-                self.assertRegex(_read(path), r'gateway_test_summary\.py"?\s+cancel-tolerant')
+                self.assertRegex(_read(path), r'gateway_test_summary\.py"?\s+strict\s+eunit')
 
     def test_local_runner_judges_by_the_summary(self):
         # gateway/test_runner.sh (the documented local runner) used to trust
         # rebar3's exit code, so the #4800 false green survived there. Every
         # rebar3 test invocation must go through its `gated` helper, which
-        # hands the capture to the shared parser: strict for ct, the #1005
-        # cancel-tolerant rule for eunit.
+        # hands the capture to the same strict parser for both suites.
         src = _read(os.path.join(ROOT, 'gateway', 'test_runner.sh'))
         self.assertRegex(src, r'SUMMARY_PARSER="\$SCRIPT_DIR/\.\./scripts/gateway_test_summary\.py"')
         self.assertRegex(src, r'python3 "\$SUMMARY_PARSER" strict ')
@@ -206,7 +495,7 @@ class CancelTolerantVerdict(unittest.TestCase):
         self.assertEqual(len(calls), 4, calls)   # eunit and ct, each with/without cover
         for line in calls:
             with self.subTest(call=line):
-                want = 'strict ct' if ' ct ' in line else 'cancel-tolerant eunit'
+                want = 'strict ct' if ' ct ' in line else 'strict eunit'
                 self.assertRegex(line, r'^gated %s rebar3 as test ' % want)
 
     def test_strict_cli(self):
@@ -220,10 +509,10 @@ class CancelTolerantVerdict(unittest.TestCase):
                 with open(log, 'w', encoding='utf-8') as f:
                     f.write(text)
                 p = subprocess.run([sys.executable, script, 'strict', 'ct', rc, log],
-                                   capture_output=True, text=True)
+                                   capture_output=True, text=True, encoding="utf-8", errors="replace")
                 self.assertEqual(p.returncode, want, text + p.stdout + p.stderr)
             p = subprocess.run([sys.executable, script, 'strict', 'ct', '0'],
-                               capture_output=True, text=True)
+                               capture_output=True, text=True, encoding="utf-8", errors="replace")
             self.assertEqual(p.returncode, 2)
 
 
@@ -264,7 +553,7 @@ class LocalRunnerBehaviour(unittest.TestCase):
                        STUB_CT_OUT=ct[0], STUB_CT_RC=str(ct[1]),
                        STUB_EUNIT_OUT=eunit[0], STUB_EUNIT_RC=str(eunit[1]))
             p = subprocess.run(['bash', self.RUNNER] + args, env=env,
-                               capture_output=True, text=True, timeout=120)
+                               capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
             return p.returncode, p.stdout + p.stderr
 
     def test_ct_verdict_comes_from_the_summary(self):
@@ -285,7 +574,7 @@ class LocalRunnerBehaviour(unittest.TestCase):
         cancelled = '\nOne or more tests were cancelled.'
         cases = [
             ('  Failed: 0.  Skipped: 0.  Passed: 0.' + cancelled, 1, 1, 'every set cancelled'),
-            ('  Failed: 0.  Skipped: 0.  Passed: 309.' + cancelled, 1, 0, 'cancel-tolerated (#1005)'),
+            ('  Failed: 0.  Skipped: 0.  Passed: 309.' + cancelled, 1, 1, 'partial cancellation fails'),
             ('  Failed: 2.  Skipped: 0.  Passed: 307.', 1, 1, 'real failure'),
             ('  All 300 tests passed.', 1, 1, 'rc != 0 without a Failed: line'),
             ('  There were no tests to run.', 0, 1, 'nothing discovered'),
@@ -295,6 +584,17 @@ class LocalRunnerBehaviour(unittest.TestCase):
             with self.subTest(why=why):
                 got, log = self._run(['eunit'], eunit=(out, rc))
                 self.assertEqual(got, want, log)
+
+    def test_test_pipeline_eunit_gate_also_rejects_partial_cancellation(self):
+        self.RUNNER = os.path.join(ROOT, 'scripts', 'test', 'eunit-gate.sh')
+        cancelled = ('Failed: 0.  Skipped: 0.  Passed: 1.\n'
+                     'One or more tests were cancelled.')
+        for rc in (0, 1):
+            with self.subTest(rebar_status=rc):
+                got, log = self._run([], eunit=(cancelled, rc))
+                self.assertNotEqual(got, 0, log)
+        got, log = self._run([])
+        self.assertEqual(got, 0, log)
 
     def test_verdict_uses_rebar3_status_not_the_pipeline_status(self):
         # Under `set -o pipefail` a bare `$?` equals PIPESTATUS[0] unless the
@@ -381,7 +681,7 @@ class AssertGatewayTests(unittest.TestCase):
                 with open(os.path.join(d, 'meson-info', 'intro-tests.json'), 'w', encoding='utf-8') as f:
                     json.dump(tests, f)
             return subprocess.run([sys.executable, self.SCRIPT, d],
-                                  capture_output=True, text=True).returncode
+                                  capture_output=True, text=True, encoding="utf-8", errors="replace").returncode
 
     def test_verdicts(self):
         names = ['gateway eunit shard A', 'gateway eunit shard B', 'gateway eunit shard C',

@@ -53,15 +53,16 @@ constexpr std::chrono::milliseconds kIngestTimeout{500};
 constexpr std::chrono::milliseconds kDexReadTimeout{3000};
 
 // Read-degrade / ingest-drop reason labels (ADR-0037 label convention).
-constexpr const char* kReasonStoreNotOpen = "store_not_open";
-constexpr const char* kReasonPoolTimeout = "pool_acquire_timeout";
-constexpr const char* kReasonQueryError = "query_error";
+// One vocabulary with the model's `degraded_reason` (dex_read_fault_token).
+constexpr const char* kReasonStoreNotOpen = dex_read_fault_token(DexReadFault::kStoreNotOpen);
+constexpr const char* kReasonPoolTimeout = dex_read_fault_token(DexReadFault::kPoolTimeout);
+constexpr const char* kReasonQueryError = dex_read_fault_token(DexReadFault::kQueryError);
 // The Applications stability read holds one lease for its whole multi-second
 // 30-day aggregation, so it gets its own in-flight budget (the default pool is
 // 16 and no per-principal limit bounds synchronous reads): a request over the
 // budget is refused at once with this reason and the caller's retryable 503,
 // instead of queueing behind the pool.
-constexpr const char* kReasonConcurrencyBudget = "concurrency_budget";
+constexpr const char* kReasonConcurrencyBudget = dex_read_fault_token(DexReadFault::kConcurrencyBudget);
 // JC-8 (coordinator review): label parity with InventoryStore's
 // yuzu_inventory_read_degrade_total{reason, source} family — a constant
 // "source" so a future second Guardian-adjacent read-degrade emitter stays
@@ -87,10 +88,12 @@ constexpr const char* kDegradeSourceCensus = "guardian_census";
 // no gauge, so folding it into "guardian_census" would make request noise mask a
 // real gauge freeze and would make a per-device 503 read as a stale gauge.
 constexpr const char* kDegradeSourceCensusDevice = "guardian_census_device";
-// SQLSTATE 57014 (query_canceled) from the per-device read's statement timeout:
-// the retained pending backlog is too large for the time budget, so a retry fails
-// identically. Counted on kDegradeSourceCensusDevice only.
-constexpr const char* kReasonStatementTimeout = "statement_timeout";
+// SQLSTATE 57014 (query_canceled) from a statement timeout. On kDegradeSourceCensusDevice
+// (the per-device read's own budget) the retained pending backlog is too large for the time
+// budget, so a retry fails identically. On kDegradeSource (the Apps stability read, cancelled
+// at the pool's 30 s statement timeout) the chosen window is too heavy for the load: a shorter
+// window or less load clears it.
+constexpr const char* kReasonStatementTimeout = dex_read_fault_token(DexReadFault::kStatementTimeout);
 // Sample the per-site degrade WARN so a sustained PG outage cannot flood the
 // log — the counter is the continuous signal, the log a sampled breadcrumb.
 // Mirrors InventoryStore's constants.
@@ -297,6 +300,45 @@ void bump_policy_generation_on(PGconn* conn) {
                      PQerrorMessage(conn));
 }
 
+// `dex_read_faulted` is the fault-carrying core: the same open check, bounded lease and
+// count-plus-sampled-log as `dex_read_checked`, but a degrade comes back as the `DexReadFault`
+// that caused it so the caller can tell the causes apart. `body` returns the same
+// `std::expected<Result, DexReadFault>`; the metric label of a fault it returns is that fault's
+// token. A caller that passes `timeout_sampler` gives the statement-timeout log line its own
+// sampler, so a run of other faults cannot suppress it and the reverse (the counter increments
+// either way). A caller that passes `fault_detail` fills it from `body` with a bounded, already
+// sanitised description of a failed statement (SQLSTATE and where it applies); the sampled warn
+// appends it. It never carries SQL text and is never a metric label.
+template <typename Result, typename Body>
+std::expected<Result, DexReadFault>
+dex_read_faulted(bool open, pg::PgPool& pool, yuzu::MetricsRegistry* metrics, const char* method,
+                 DegradeSampler& sampler, Body&& body, DegradeSampler* timeout_sampler = nullptr,
+                 const std::string* fault_detail = nullptr) {
+    const auto degrade = [&](DexReadFault f, const char* what) {
+        DegradeSampler& s =
+            (f == DexReadFault::kStatementTimeout && timeout_sampler) ? *timeout_sampler : sampler;
+        if (const auto d = note_read_degrade(metrics, dex_read_fault_token(f), kDegradeSource, s);
+            d.should_log) {
+            if (fault_detail && !fault_detail->empty())
+                spdlog::warn("GuaranteedStateStore::{}: {} ({})", method, what, *fault_detail);
+            else
+                spdlog::warn("GuaranteedStateStore::{}: {}", method, what);
+        }
+        return std::unexpected(f);
+    };
+    if (!open)
+        return degrade(DexReadFault::kStoreNotOpen, "store not open");
+    auto lease = pool.try_acquire_for(kDexReadTimeout);
+    if (!lease)
+        return degrade(DexReadFault::kPoolTimeout, "pool acquire timed out");
+    std::expected<Result, DexReadFault> result = body(lease.get());
+    if (!result)
+        return degrade(result.error(), result.error() == DexReadFault::kStatementTimeout
+                                           ? "statement timeout"
+                                           : "query failed");
+    return result;
+}
+
 // Shared body for every DEX/analytics read (ADR-0038 "deferred widening",
 // follow-up #2659): acquire a bounded lease, run `body(conn)` (which executes
 // the query and returns the parsed result, or nullopt on a query-level
@@ -318,24 +360,17 @@ void bump_policy_generation_on(PGconn* conn) {
 template <typename Result, typename Body>
 std::optional<Result> dex_read_checked(bool open, pg::PgPool& pool, yuzu::MetricsRegistry* metrics,
                                        const char* method, DegradeSampler& sampler, Body&& body) {
-    if (!open) {
-        if (const auto d = note_read_degrade(metrics, kReasonStoreNotOpen, kDegradeSource, sampler); d.should_log)
-            spdlog::warn("GuaranteedStateStore::{}: store not open", method);
+    auto r = dex_read_faulted<Result>(
+        open, pool, metrics, method, sampler,
+        [&](PGconn* conn) -> std::expected<Result, DexReadFault> {
+            auto v = body(conn);
+            if (!v)
+                return std::unexpected(DexReadFault::kQueryError);
+            return std::move(*v);
+        });
+    if (!r)
         return std::nullopt;
-    }
-    auto lease = pool.try_acquire_for(kDexReadTimeout);
-    if (!lease) {
-        if (const auto d = note_read_degrade(metrics, kReasonPoolTimeout, kDegradeSource, sampler); d.should_log)
-            spdlog::warn("GuaranteedStateStore::{}: pool acquire timed out", method);
-        return std::nullopt;
-    }
-    auto result = body(lease.get());
-    if (!result) {
-        if (const auto d = note_read_degrade(metrics, kReasonQueryError, kDegradeSource, sampler); d.should_log)
-            spdlog::warn("GuaranteedStateStore::{}: query failed", method);
-        return std::nullopt;
-    }
-    return std::move(*result);
+    return std::move(*r);
 }
 
 template <typename Result, typename Body>
@@ -3531,7 +3566,7 @@ std::vector<DexAppCrashCount> GuaranteedStateStore::dex_top_apps(const std::stri
         });
 }
 
-std::optional<std::vector<DexAppStabilityRow>>
+std::expected<std::vector<DexAppStabilityRow>, DexReadFault>
 GuaranteedStateStore::dex_app_stability_checked(const std::string& since, const std::string& platform,
                                                 int app_limit, int version_limit,
                                                 std::int64_t per_device_cap,
@@ -3540,6 +3575,7 @@ GuaranteedStateStore::dex_app_stability_checked(const std::string& since, const 
                                                     per_subject_caps) const {
     static DegradeSampler sampler;
     static DegradeSampler budget_sampler; // a refusal storm must not hide a real fault's log line
+    static DegradeSampler timeout_sampler; // nor a run of other faults the statement-timeout line
     struct Slot {
         std::atomic<int>& n;
         ~Slot() { n.fetch_sub(1, std::memory_order_relaxed); }
@@ -3554,8 +3590,11 @@ GuaranteedStateStore::dex_app_stability_checked(const std::string& since, const 
             d.should_log)
             spdlog::warn("GuaranteedStateStore::dex_app_stability: concurrency budget ({}) reached",
                          apps_read_budget_.load());
-        return std::nullopt;
+        return std::unexpected(DexReadFault::kConcurrencyBudget);
     }
+    // Test seam: a read that holds here has its budget slot and no lease yet.
+    if (apps_read_barrier_)
+        apps_read_barrier_();
     // Ceiling: every online id travels as one text[] parameter per request;
     // measured flat to 30,000 ids (2.6 s vs 2.7 s). Beyond a few hundred thousand
     // devices replace it with a join against shared presence in the database.
@@ -3574,9 +3613,10 @@ GuaranteedStateStore::dex_app_stability_checked(const std::string& since, const 
     }
     const std::string cap_subject_array = pg::to_text_array(cap_subject_views);
     const std::string cap_value_array = pg::to_text_array(cap_value_views);
-    return dex_read_checked<std::vector<DexAppStabilityRow>>(
+    std::string fault_detail; // set by the body on a failed statement; the sampled warn appends it
+    return dex_read_faulted<std::vector<DexAppStabilityRow>>(
         open_, pool_, metrics_, "dex_app_stability", sampler,
-        [&](PGconn* conn) -> std::optional<std::vector<DexAppStabilityRow>> {
+        [&](PGconn* conn) -> std::expected<std::vector<DexAppStabilityRow>, DexReadFault> {
             // d: per (subject, version, device), with o = the device is in the
             // caller's online set ($6; the share, rate and score numerators are
             // members of the population they are divided by) and cap = the
@@ -3663,8 +3703,27 @@ GuaranteedStateStore::dex_app_stability_checked(const std::string& since, const 
                 " ls, 0::bigint, 0::bigint, ao::bigint, co::bigint, ho::bigint "
                 "FROM ranked WHERE rn <= $4::bigint";
             pg::PgResult res = pg::exec_params(conn, sql.c_str(), params);
-            if (res.status() != PGRES_TUPLES_OK)
-                return std::nullopt;
+            if (res.status() != PGRES_TUPLES_OK) {
+                // The pool starts every connection with a statement timeout, so a cancelled
+                // statement arrives here as SQLSTATE 57014. It also covers an administrator
+                // cancel, which is why the page says "took too long", never "timed out because".
+                const char* state = PQresultErrorField(res.get(), PG_DIAG_SQLSTATE);
+                const bool timed_out = state && std::string_view(state) == "57014";
+                fault_detail = "sqlstate=" + ::yuzu::log_key_token(state ? state : "?");
+                if (timed_out) {
+                    // `since` is the cutoff the requested window resolved to; the days token is not
+                    // known at this layer.
+                    fault_detail += " since=" + ::yuzu::log_key_token(since) +
+                                    " platform=" + ::yuzu::log_key_token(platform.empty() ? "all" : platform);
+                } else {
+                    // The first line of the server's message only; the rest is statement context.
+                    std::string_view msg = PQresultErrorMessage(res.get());
+                    msg = msg.substr(0, msg.find('\n'));
+                    fault_detail += " error=" + ::yuzu::log_key_token(msg);
+                }
+                return std::unexpected(timed_out ? DexReadFault::kStatementTimeout
+                                                 : DexReadFault::kQueryError);
+            }
             std::vector<DexAppStabilityRow> out;
             const int n = PQntuples(res.get());
             out.reserve(static_cast<std::size_t>(n));
@@ -3687,7 +3746,8 @@ GuaranteedStateStore::dex_app_stability_checked(const std::string& since, const 
                 out.push_back(std::move(r));
             }
             return out;
-        });
+        },
+        &timeout_sampler, &fault_detail);
 }
 
 std::vector<DexAppCrashCount>

@@ -2,6 +2,7 @@
 
 #include "access_render.hpp"
 
+#include "plural.hpp"
 #include "web_utils.hpp"
 
 #include <algorithm>
@@ -82,11 +83,6 @@ std::string hint(std::string_view text) {
 std::string account_noun(const auth::UserEntry& u) {
     const auto label = source_label(u.identity_source);
     return (label.empty() ? esc(u.identity_source) : std::string(label)) + " account";
-}
-
-// "1 permission" / "41 permissions": the count and its singular or plural noun.
-std::string plural(std::size_t n, std::string_view one, std::string_view many) {
-    return std::to_string(n) + " " + std::string(n == 1 ? one : many);
 }
 
 std::string detail_panel(const UserDetail& d) {
@@ -208,7 +204,7 @@ std::string render_roles_list(const std::variant<RolesList, Unavailable>& state)
                failbox("Roles could not be read.", kRolesUnavailable, retry) + "</div>";
     }
     std::string out = "<div class=\"hd\"><h2>Roles</h2><span class=\"sub\">" +
-                      plural(list->roles.size(), "role", "roles") +
+                      plural_count(list->roles.size(), "role", "roles") +
                       "</span></div><div class=\"tw\"><table><thead><tr><th>Role</th>"
                       "<th>What it allows</th><th class=\"r\">Assigned</th><th></th></tr></thead><tbody>";
     for (const auto& r : list->roles) {
@@ -263,8 +259,8 @@ std::string render_role_permissions(const std::variant<RolePerms, NotFound, Unav
     }
     std::string out = "<div class=\"hd\"><h2 class=\"long\">" + esc(p->role) +
                       " permissions</h2><span class=\"sub\">" +
-                      plural(p->rows.size(), "permission", "permissions") + " across " +
-                      plural(areas.size(), "area", "areas") +
+                      plural_count(p->rows.size(), "permission", "permissions") + " across " +
+                      plural_count(areas.size(), "area", "areas") +
                       "</span></div><div class=\"tw scroll\"><table class=\"compact\"><thead><tr><th>Area</th>"
                       "<th>Allowed</th></tr></thead><tbody>";
     for (std::size_t i = 0; i < areas.size(); ++i)

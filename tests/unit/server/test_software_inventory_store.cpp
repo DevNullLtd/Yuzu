@@ -4933,6 +4933,17 @@ TEST_CASE("v3: a full section replaces only its own facet and records its facet 
     CHECK(keyed[0][3] == expect_alpha.identity_key);
     CHECK(keyed[0][4] == expect_alpha.instance_key);
 
+    // The per-device read (the Installed software tab) carries the same two columns.
+    const auto dev = store.get_agent_software("agent-v3");
+    REQUIRE(dev.has_value());
+    REQUIRE(dev->size() == 3); // Alpha, Beta, libfoo ordered by (name, version)
+    CHECK((*dev)[0].name == "Alpha");
+    CHECK((*dev)[0].install_type == "installer");
+    CHECK((*dev)[0].install_location == "C:\\Apps\\Alpha");
+    CHECK((*dev)[1].name == "Beta"); // no collector location: empty, not a stale neighbour's
+    CHECK((*dev)[1].install_type == "installer");
+    CHECK((*dev)[1].install_location.empty());
+
     // Facet state: status, token, the recomputed section hash, a confirmation time.
     const auto fs = sql_rows(pool, "SELECT facet, status, token, section_hash, enabled::text, "
                                    "duration_ms, bytes_read, (last_confirmed_at > 0)::text, "
@@ -5128,6 +5139,83 @@ TEST_CASE("find_by_purl: exact match across agents, ordered, bounded, and served
     pg::PgResult plan = pg::exec_params(
         lease.get(), ("EXPLAIN (COSTS OFF) " + SoftwareInventoryStore::find_by_purl_sql()).c_str(),
         std::vector<std::string>{target, "100"});
+    REQUIRE(plan.status() == PGRES_TUPLES_OK);
+    std::string text;
+    for (int i = 0; i < PQntuples(plan.get()); ++i)
+        text += std::string(PQgetvalue(plan.get(), i, 0)) + "\n";
+    CHECK(text.find("installed_software_purl_idx") != std::string::npos);
+}
+
+TEST_CASE("query_software purl filter: exact, rows carry the purl, the scope push-down still applies, "
+          "present-empty runs no SQL, and the predicate reaches the partial index",
+          "[pg][software_inventory][v3][purl]") {
+    SWINV_SHARED(store, pool);
+    const auto curl = v3_linux("curl", "deb", "7.88.1", "10");
+    for (const char* agent : {"agent-qa", "agent-qb", "agent-qc"}) {
+        REQUIRE(store.apply_installed_software_v3(
+                    agent, v3_report({v3_full(kV3Apps, {curl, v3_linux("git", "deb", "2.39.2", "1")})}))[0]
+                    .outcome == V3SectionOutcome::kStored);
+    }
+    // A v2-style row (no purl) of the same name must never answer a purl query.
+    const std::vector<SoftwareEntry> v2rows = {v3_entry("curl", kV3Pkgs)};
+    REQUIRE(store.apply_installed_software("agent-qv2",
+                                           SoftwareInventoryStore::canonical_hash(v2rows), v2rows,
+                                           0) == InventoryIngestOutcome::kStored);
+
+    const std::string target = "pkg:deb/debian/curl@7.88.1-10?arch=amd64&distro=debian-12";
+    auto agents_of = [](const auto& rows) {
+        std::vector<std::string> out;
+        for (const auto& r : *rows)
+            out.push_back(r.agent_id);
+        return out;
+    };
+
+    SoftwareFleetQuery q;
+    q.purl = target;
+    auto all = store.query_software(q);
+    REQUIRE(all.has_value());
+    CHECK(agents_of(all) == std::vector<std::string>{"agent-qa", "agent-qb", "agent-qc"});
+    CHECK((*all)[0].entry.purl == target); // the row carries its purl
+    // No prefix matching and no case folding.
+    q.purl = target + "x";
+    CHECK(store.query_software(q).value().empty());
+    q.purl = "PKG" + target.substr(3);
+    CHECK(store.query_software(q).value().empty());
+
+    // The scope push-down composes with the purl predicate: only in-scope rows come back.
+    q.purl = target;
+    q.agent_ids = std::vector<std::string>{"agent-qb", "agent-nobody"};
+    CHECK(agents_of(store.query_software(q)) == std::vector<std::string>{"agent-qb"});
+    // Present-empty is deny-all: an empty value, never the whole fleet.
+    q.agent_ids = std::vector<std::string>{};
+    CHECK(store.query_software(q).value().empty());
+    // Composes with an exact name and version.
+    q.agent_ids.reset();
+    q.name = "curl";
+    q.version = "7.88.1";
+    CHECK(store.query_software(q).value().size() == 3);
+    q.name = "git";
+    CHECK(store.query_software(q).value().empty());
+
+    // The shared predicate reaches the partial index (seq scan priced out: the table is tiny).
+    auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+    REQUIRE(lease);
+    const std::vector<std::string> none;
+    struct RollbackGuard {
+        PGconn* conn;
+        ~RollbackGuard() { pg::exec_params(conn, "ROLLBACK", std::vector<std::string>{}); }
+    };
+    REQUIRE(pg::exec_params(lease.get(), "BEGIN", none).status() == PGRES_COMMAND_OK);
+    const RollbackGuard rollback{lease.get()};
+    REQUIRE(pg::exec_params(lease.get(), "SET LOCAL enable_seqscan = off", none).status() ==
+            PGRES_COMMAND_OK);
+    pg::PgResult plan = pg::exec_params(
+        lease.get(),
+        ("EXPLAIN (COSTS OFF) SELECT 1 FROM software_inventory_store.installed_software i "
+         "WHERE 1=1" +
+         SoftwareInventoryStore::query_software_purl_predicate_sql(1))
+            .c_str(),
+        std::vector<std::string>{target});
     REQUIRE(plan.status() == PGRES_TUPLES_OK);
     std::string text;
     for (int i = 0; i < PQntuples(plan.get()); ++i)
