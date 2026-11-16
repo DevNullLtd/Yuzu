@@ -20696,8 +20696,14 @@ private:
             // regardless) - mirrors the Hardware CI record's CiDetailFn contract.
             // KNOWN FOLLOW-UP (#1783): the read is still up to roster-size rows per render, unlike
             // the Software tab's hourly rollup (software_catalog_rollup.cpp).
+            // The collation gate (device_ci_read_gate.hpp): while it is not Trusted the keyed read
+            // would answer by the text primary key and miss stored devices, so it is not made and
+            // the columns degrade (`ci_degraded`), exactly as for a failed read.
             apply_ci_read(result, device_inventory_store_
-                                      ? CiKeyedReadFn{[this](const std::vector<std::string>& ids) {
+                                      ? CiKeyedReadFn{[this](const std::vector<std::string>& ids)
+                                                          -> std::optional<std::vector<DeviceCiRecord>> {
+                                            if (device_ci_read_gate::refuses(&collation_gate_))
+                                                return std::nullopt;
                                             return device_inventory_store_->list_device_ci_for(ids);
                                         }}
                                       : CiKeyedReadFn{});
@@ -20779,7 +20785,10 @@ private:
             apply_identity_read(detail, hw_identity_fn(agent_id));
             if (auto sess = registry_.get_session(agent_id))
                 detail.agent_version = sess->agent_version; // immutable identity field, lock-free
-            if (!device_inventory_store_) {
+            // An unwired store, or a collation gate that is not Trusted (device_ci_read_gate.hpp:
+            // the by-id read would miss a stored device), degrades `ci` before either store method
+            // is named; no sections read is made, so the record answers `degraded`, not `absent`.
+            if (!device_inventory_store_ || device_ci_read_gate::refuses(&collation_gate_)) {
                 detail.ci = std::unexpected(CiReadError::kDegraded);
             } else if (ci_read == CiRead::WithSections) {
                 // The v2 per-section statuses and rows (H.7): ONLY the REST record route and the
