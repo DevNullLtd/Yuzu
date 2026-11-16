@@ -627,7 +627,7 @@ collisions possible; vendor precision pending ADR-0018). See
 
 ### 9.6 Device Quarantine (Network Isolation) :white_check_mark: `T2`
 
-`quarantine` plugin (cross-platform). `quarantine` action isolates device from network, whitelisting management server and optional IPs via firewall rules (prefixed `YuzuQuarantine_`). `unquarantine` removes rules and restores access. `status` checks active quarantine state. `whitelist` adds/removes IPs from active quarantine. Server side (ADR-0047): the containment gate in the shared dispatch path (`dispatch_confined_arms.hpp`), the `QuarantineContainmentReconciler` and the stored-whitelist re-dispatch (`quarantine_reapply.hpp`) are shipped; a degraded containment read fails closed. *(Evidence: `server/core/src/quarantine_containment_reconciler.{hpp,cpp}`, `quarantine_reapply.{hpp,cpp}`.)*
+The `firewall` plugin's four containment actions (cross-platform). `quarantine` isolates a device from the network, allowing the management server and optional exceptions, through an own rule group, table or anchor. `release` removes the rules and restores access. `quarantine_status` reports whether containment is in force. `quarantine_allow` adds or removes exceptions on an active quarantine. Server side (ADR-0047): the containment gate in the shared dispatch path (`dispatch_confined_arms.hpp`), the `QuarantineContainmentReconciler` and the stored-whitelist re-dispatch (`quarantine_reapply.hpp`) are shipped; a degraded containment read fails closed. *(Evidence: `server/core/src/quarantine_containment_reconciler.{hpp,cpp}`, `quarantine_reapply.{hpp,cpp}`.)*
 
 ### 9.7 Indicator of Compromise (IOC) Checking :large_orange_diamond: `T2` *(verified 2026-11-14)*
 
@@ -1480,7 +1480,7 @@ Partial. The Guardian dashboard shipped at `/guardian` (`server/core/src/guardia
 
 ### 31.10 Rule Signing :x: `T2` *(verified 2026-11-14)*
 
-Not implemented (PR 12). HMAC rule signing (HKDF per design §11.2) with per-tenant key stored in `CredWrite`/`CredRead` (Windows), Linux Secret Service / kernel keyring (Linux), Keychain (macOS); agent-side signature validation before activating a rule prevents unauthenticated rule injection. The wire field exists but is unused (`bytes signature = 7; // ... (contract G3, deferred)` in `proto/yuzu/guardian/v1/guaranteed_state.proto`), and `guardian_rule_spec.cpp:394`'s own comment says "full RFC-8785 canonicalisation lands with rule signing"; no HKDF or signed rule-activation code exists in `guardian_rule_spec.*`, `baseline_store.*` or `guardian_engine.*`. **Retitled 2026-11-14** from "Rule Signing and Quarantine Integration": device quarantine shipped outside Guardian — the `quarantine` plugin (`quarantine`/`unquarantine`/`whitelist`/`status`) and the server-side `QuarantineStore`, containment gate and reconciler (§9.6, §9.9, ADR-0047). The original design text for a Guardian-integrated quarantine (WFP block-all at weight 65535, `quarantine.add_exception | remove_exception | lift`, resilience reset on lift) is not what shipped.
+Not implemented (PR 12). HMAC rule signing (HKDF per design §11.2) with per-tenant key stored in `CredWrite`/`CredRead` (Windows), Linux Secret Service / kernel keyring (Linux), Keychain (macOS); agent-side signature validation before activating a rule prevents unauthenticated rule injection. The wire field exists but is unused (`bytes signature = 7; // ... (contract G3, deferred)` in `proto/yuzu/guardian/v1/guaranteed_state.proto`), and `guardian_rule_spec.cpp:394`'s own comment says "full RFC-8785 canonicalisation lands with rule signing"; no HKDF or signed rule-activation code exists in `guardian_rule_spec.*`, `baseline_store.*` or `guardian_engine.*`. **Retitled 2026-11-14** from "Rule Signing and Quarantine Integration": device quarantine shipped outside Guardian — the `firewall` plugin's four containment actions (`quarantine`/`release`/`quarantine_status`/`quarantine_allow`) and the server-side `QuarantineStore`, containment gate and reconciler (§9.6, §9.9, ADR-0047). The original design text for a Guardian-integrated quarantine (WFP block-all at weight 65535, `quarantine.add_exception | remove_exception | lift`, resilience reset on lift) is not what shipped.
 
 ---
 
@@ -1880,7 +1880,6 @@ ADR-0070 D5/R1: operators register third-party CRL sources through `/api/v1/cryp
 | event_logs | Y | Y | Y | Security |
 | vuln_scan | Y | Y | Y | Security |
 | ioc | Y | Y | Y | Security |
-| quarantine | Y | Y | Y | Security |
 | certificates | Y | Y | Y | Security |
 | rdp_control | Y | - | - | Security |
 | autoruns | Y | Y | Y | Security |
@@ -1918,7 +1917,7 @@ ADR-0070 D5/R1: operators register third-party CRL sources through `/api/v1/cryp
 | chargen | Y | Y | Y | Test/Debug |
 | example | Y | Y | Y | Test/Debug |
 
-**74 plugin directories: 72 production plugins plus the two test/debug plugins (`chargen`, `example`)**, which appear in the table but are excluded from the headline count (`ls -d agents/plugins/*/` = 74 at HEAD, 2026-11-15). Coverage spans hardware, peripherals, network, security posture, filesystem, registry, WMI, WiFi, WoL, IOC, quarantine, certificates, content distribution, user interaction and more, across cross-platform and Windows-only plugins. Corrections in this pass: `pkg_inventory` Windows is supported (was shown `-`); constrained legs are now shown `🟡` instead of `Y`; and the former `software_usage` "planned" row is removed — usage metering shipped as `app_usage` (§27.2, §35.6). The previous recount history (51 → 71 between 2026-09-15 and 2026-11) is in git history.
+**73 plugin directories: 71 production plugins plus the two test/debug plugins (`chargen`, `example`)**, which appear in the table but are excluded from the headline count (`ls -d agents/plugins/*/` = 73 at HEAD, 2026-11-16, after the earlier device-containment plugin was removed: containment is now the `firewall` plugin's four actions). Coverage spans hardware, peripherals, network, security posture, filesystem, registry, WMI, WiFi, WoL, IOC, device containment, certificates, content distribution, user interaction and more, across cross-platform and Windows-only plugins. Corrections in this pass: `pkg_inventory` Windows is supported (was shown `-`); constrained legs are now shown `🟡` instead of `Y`; and the former `software_usage` "planned" row is removed — usage metering shipped as `app_usage` (§27.2, §35.6). The previous recount history (51 → 71 between 2026-09-15 and 2026-11) is in git history.
 ---
 
 ## Appendix B: Foundation Tier Status

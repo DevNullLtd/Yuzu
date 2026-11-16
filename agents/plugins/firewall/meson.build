@@ -38,11 +38,9 @@ firewall_plugin_lib = shared_library(
   'firewall',
   files('src/firewall_plugin.cpp'),
   name_prefix: '',
-  # ../../shared: win_com.hpp, win_str.hpp (Windows), icmp_probe.hpp, sudo_argv.hpp.
-  # ../quarantine/src: quarantine_serialization.hpp, for MutationGate ONLY (the header
-  # is a pure, OS-free concurrency primitive). PRQ.2 deletes the quarantine plugin and
-  # relocates the gate to agents/shared; this include goes with that move.
-  include_directories: include_directories('../../shared', '../quarantine/src'),
+  # ../../shared: win_com.hpp, win_str.hpp (Windows), icmp_probe.hpp, sudo_argv.hpp,
+  # mutation_gate.hpp.
+  include_directories: include_directories('../../shared'),
   cpp_args: firewall_cpp_args,
   dependencies: firewall_deps,
   install: true,

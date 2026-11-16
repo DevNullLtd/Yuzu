@@ -155,7 +155,6 @@ struct NftWorld {
     std::string delete_failure = "sudo: a password is required";
     std::optional<std::string> list_failure; // set: `nft list table` fails with this text
     bool load_times_out = false; // `nft -f` COMMITS the table, then overruns its budget
-    bool legacy = false;
     Crash crash;
     std::vector<Argv> log;
     std::function<void(const Argv&)> on_call; // runs before each call's effect (a test hook)
@@ -163,8 +162,6 @@ struct NftWorld {
     ToolResult effect(const Argv& a) {
         if (on_call)
             on_call(a);
-        if (a[0] == "/usr/sbin/iptables")
-            return done(0, legacy ? "-P INPUT ACCEPT\n-N yuzu-quarantine\n" : "-P INPUT ACCEPT\n");
         if (a[1] == "-f") {
             if (fail_load)
                 return done(1, "Error: syntax error, unexpected word");
@@ -240,7 +237,6 @@ struct IptWorld {
     std::chrono::milliseconds per_call{0};
     std::map<std::string, IptFamily> fam; // by tool path
     std::function<bool(const std::string&)> fail_on;
-    bool legacy = false;
     Crash crash;
     std::vector<Argv> log;
     int pre_existing_calls = 0;
@@ -253,8 +249,6 @@ struct IptWorld {
         const auto& op = a[1];
         if (op == "-S") {
             std::string out = "-P INPUT ACCEPT\n";
-            if (legacy)
-                out += "-N yuzu-quarantine\n";
             for (const auto& c : f.chains)
                 out += "-N " + c + "\n";
             // Like the real `iptables -S`, the listing carries each user chain's own rules
@@ -515,6 +509,44 @@ TEST_CASE("exception csv: dedupe, caps and bad entries", "[agent][firewall_quara
     big.pop_back();
     CHECK(parse_exceptions_csv(big).error() == "too_many_exceptions");
     CHECK(parse_exceptions_csv(std::string(9000, '1')).error() == "exceptions_too_long");
+}
+
+// The server (quarantine_reapply.cpp: map_whitelist_to_exceptions) sends each whitelisted address
+// as an outbound and an inbound exception. Pinned from the agent side: this is the shape the
+// agent must keep accepting, for both families, with no port and both protocols.
+TEST_CASE("exception csv: accepts exactly the shape the server emits for a whitelist",
+          "[agent][firewall_quarantine]") {
+    const auto r = parse_exceptions_csv("10.0.0.5/out,10.0.0.5/in,2001:db8::1/out,2001:db8::1/in");
+    REQUIRE(r);
+    REQUIRE(r->size() == 4);
+    const auto v4 = parse_exception("10.0.0.5/out");
+    const auto v4in = parse_exception("10.0.0.5/in");
+    const auto v6 = parse_exception("2001:db8::1/out");
+    const auto v6in = parse_exception("2001:db8::1/in");
+    REQUIRE(v4);
+    REQUIRE(v4in);
+    REQUIRE(v6);
+    REQUIRE(v6in);
+    CHECK((*r)[0] == *v4);
+    CHECK((*r)[1] == *v4in);
+    CHECK((*r)[2] == *v6);
+    CHECK((*r)[3] == *v6in);
+    for (const auto& e : *r) {
+        CHECK(e.port == 0);          // any port
+        CHECK(e.proto == Proto::both); // TCP and UDP
+        CHECK(e.prefix == -1);       // a single host
+    }
+    CHECK((*r)[0].dir == Dir::out);
+    CHECK((*r)[1].dir == Dir::in);
+    CHECK((*r)[2].dir == Dir::out);
+    CHECK((*r)[3].dir == Dir::in);
+    // 32 addresses (the server's cap) fit in the agent's 64 exceptions
+    std::string max;
+    for (int i = 1; i <= 32; ++i)
+        max += std::format("{}10.0.{}.1/out,10.0.{}.1/in", i > 1 ? "," : "", i, i);
+    const auto full = parse_exceptions_csv(max);
+    REQUIRE(full);
+    CHECK(full->size() == 64);
 }
 
 // ── allow set ───────────────────────────────────────────────────────────────
@@ -879,8 +911,6 @@ TEST_CASE("windows rule specs: names, group, directions", "[agent][firewall_quar
     std::set<std::string> names;
     for (const auto& s : specs) {
         CHECK(s.name.starts_with("YuzuFirewall_Quarantine_3_"));
-        CHECK_FALSE(is_legacy_marker(s.name));
-        CHECK_FALSE(s.name.starts_with(kLegacyWinRulePrefix));
         CHECK(names.insert(s.name).second); // unique
     }
     CHECK(kWinGroup == "Yuzu Firewall Quarantine");
@@ -909,8 +939,6 @@ TEST_CASE("windows rule specs: names, group, directions", "[agent][firewall_quar
     // a different generation shares no names
     for (const auto& s : win_rule_specs(set, 4))
         CHECK(names.count(s.name) == 0);
-    CHECK(is_legacy_marker("YuzuQuarantine_allow_1"));
-    CHECK_FALSE(is_legacy_marker("YuzuFirewall_Quarantine_1_1"));
 }
 
 TEST_CASE("windows: every enabled rule outside our group is disabled", "[agent][firewall_quarantine]") {
@@ -936,7 +964,6 @@ TEST_CASE("windows: every enabled rule outside our group is disabled", "[agent][
     // the one "is ours" test: our group, or our name prefix without the group
     CHECK(is_our_win_rule("anything", kWinGroup));
     CHECK(is_our_win_rule("YuzuFirewall_Quarantine_1_2", ""));
-    CHECK_FALSE(is_our_win_rule("YuzuQuarantine_allow_1", "")); // the legacy plugin's
     CHECK_FALSE(is_our_win_rule("No group at all", ""));
 }
 
@@ -1371,8 +1398,6 @@ TEST_CASE("iptables listing and removal plan", "[agent][firewall_quarantine]") {
     CHECK(l.chains.size() == 4);
     CHECK(l.jumps.size() == 4);
     CHECK(l.max_gen == 3);
-    CHECK_FALSE(l.legacy_chain);
-    CHECK(parse_iptables_listing("-N yuzu-quarantine\n").legacy_chain);
 
     // keep generation 3: only generation 2 goes, jumps before chains
     const auto plan = iptables_remove_plan(kIptablesPath, l, 3);
@@ -1703,17 +1728,6 @@ TEST_CASE("quarantine: refusals happen before any mutation", "[agent][firewall_q
         CHECK(rig.world.crash.calls == 0);
     }
     {
-        // a legacy quarantine is in force: refuse, touch nothing
-        NftRig rig;
-        rig.world.legacy = true;
-        auto dl = rig.dl();
-        const auto o = apply_and_verify(rig.env, rig.request(), dl);
-        CHECK(o.status == "refused");
-        CHECK(o.reason == "legacy_quarantine_active");
-        CHECK_FALSE(rig.world.table);
-        CHECK(rig.store.raw.empty());
-    }
-    {
         // the probe target does not answer BEFORE the mutation: nothing to prove against
         NftRig rig;
         rig.probe.blocked = [] { return true; };
@@ -1721,11 +1735,11 @@ TEST_CASE("quarantine: refusals happen before any mutation", "[agent][firewall_q
         const auto o = apply_and_verify(rig.env, rig.request(), dl);
         CHECK(o.status == "refused");
         CHECK(o.reason == "probe_unreachable_before_apply");
-        CHECK(rig.world.crash.calls == 1); // only the legacy preflight read
+        CHECK(rig.world.crash.calls == 0); // no tool call before the refusal
         CHECK(rig.store.raw.empty());
     }
     {
-        // no recovery record, no mutation (the opposite posture to the legacy plugin)
+        // no recovery record, no mutation
         NftRig rig;
         rig.store.fail_save = true;
         auto dl = rig.dl();
@@ -1733,7 +1747,7 @@ TEST_CASE("quarantine: refusals happen before any mutation", "[agent][firewall_q
         CHECK(o.status == "refused");
         CHECK(o.reason == "state_not_persisted");
         CHECK_FALSE(rig.world.table);
-        CHECK(rig.world.crash.calls == 1); // the preflight read, never the nft load
+        CHECK(rig.world.crash.calls == 0); // never the nft load
     }
 }
 
@@ -1990,6 +2004,49 @@ TEST_CASE("release is never blocked by the record", "[agent][firewall_quarantine
     CHECK(o.status == "inactive");
     CHECK_FALSE(bad.world.table);
     CHECK(bad.store.raw.empty());
+}
+
+// The rows the server's reconciler keys on (quarantine_reapply.cpp: parse_containment_reply),
+// pinned from the agent side so a change here cannot silently change what the server confirms.
+TEST_CASE("the status rows the server keys on: probe_target, ttl_expires, no verify row, inactive after expiry",
+          "[agent][firewall_quarantine]") {
+    NftRig rig;
+    auto dl = rig.dl();
+    const auto applied = apply_and_verify(rig.env, rig.request(kProbeTarget, 120), dl);
+    REQUIRE(applied.status == "active");
+
+    // a record with a probe target and a limit renders both notes on a status read
+    const auto st = report_status(rig.env, dl);
+    REQUIRE(st.status == "active");
+    const auto rows = render_rows(st);
+    CHECK(rows.front() == "status|active"); // the FIRST row decides for the server
+    CHECK(contains(rows, std::format("note|probe_target={}", kProbeTarget)));
+    CHECK(contains(rows, std::format("note|ttl_expires={}", rig.now + 120)));
+    // a status read carries no verify row (the server cannot tell a failed proof by it)
+    CHECK_FALSE(st.verify.has_value());
+    for (const auto& row : rows)
+        CHECK_FALSE(row.starts_with("verify|"));
+
+    // without a probe target there is no probe_target row, and without a limit no ttl row
+    NftRig bare;
+    auto d2 = bare.dl();
+    REQUIRE(apply_and_verify(bare.env, bare.request(""), d2).status == "active_unproven");
+    const auto bare_rows = render_rows(report_status(bare.env, d2));
+    CHECK(bare_rows.front() == "status|active_unproven");
+    for (const auto& row : bare_rows) {
+        CHECK_FALSE(row.starts_with("note|probe_target="));
+        CHECK_FALSE(row.starts_with("note|ttl_expires="));
+    }
+
+    // after a time-limit release the status reads inactive, with no record rows
+    ReleaseRequest due;
+    due.if_ttl_expired = true;
+    rig.now += 121;
+    REQUIRE(release(rig.env, due, dl).status == "inactive");
+    const auto after = render_rows(report_status(rig.env, dl));
+    CHECK(after.front() == "status|inactive");
+    for (const auto& row : after)
+        CHECK_FALSE(row.starts_with("note|ttl_expires="));
 }
 
 TEST_CASE("status shapes: inactive, active, active_unproven, partial, degraded",
@@ -2813,7 +2870,7 @@ TEST_CASE("crash at every runner call during apply: never unrestricted with an a
         REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
         clean_calls = rig.world.crash.calls;
     }
-    REQUIRE(clean_calls >= 2);
+    REQUIRE(clean_calls >= 1);
 
     for (int n = 1; n <= clean_calls; ++n) {
         for (const bool after : {false, true}) {
@@ -3134,16 +3191,6 @@ TEST_CASE("iptables: an interrupted attempt never reuses a chain name", "[agent]
     CHECK(o.status == "active");
     CHECK(rig.store.state()->os.ipt_gen == 4);
     CHECK(rig.chains(kIptablesPath) == std::set<std::string>{"yuzu-fwq-4", "yuzu-fwq-4-f"});
-}
-
-TEST_CASE("iptables: a legacy chain is refused; release removes strays", "[agent][firewall_quarantine]") {
-    IptRig rig;
-    rig.world.legacy = true;
-    auto dl = rig.dl();
-    const auto o = apply_and_verify(rig.env, rig.request(), dl);
-    CHECK(o.status == "refused");
-    CHECK(o.reason == "legacy_quarantine_active");
-    CHECK(rig.chains(kIptablesPath).empty());
 }
 
 TEST_CASE("iptables v6 plan: the tool and the stack are separate facts", "[agent][firewall_quarantine]") {
@@ -4183,6 +4230,49 @@ TEST_CASE("nft: an active record the table no longer backs is re-applied from th
     CHECK(rig.world.table);
     CHECK(rig.store.state()->allow == stored);
     CHECK(rig.store.state()->generation == 2);
+}
+
+TEST_CASE("quarantine on an active record names the allow-set note only when the operator exceptions "
+          "differ as a set",
+          "[agent][firewall_quarantine]") {
+    NftRig rig;
+    auto dl = rig.dl();
+    auto first = rig.request();
+    first.allow = make_set({"203.0.113.53"}, {ex("10.0.0.5:22/tcp/in"), ex("10.0.0.6:443/tcp/out")});
+    REQUIRE(apply_and_verify(rig.env, first, dl).status == "active");
+
+    SECTION("only the control peer and the resolvers differ: no note") {
+        auto retry = rig.request();
+        auto moved = build_allow_set("198.51.100.8", "198.51.100.8:50051", {"203.0.113.99"},
+                                     {ex("10.0.0.5:22/tcp/in"), ex("10.0.0.6:443/tcp/out")});
+        REQUIRE(moved.has_value());
+        retry.allow = *moved;
+        const auto o = apply_and_verify(rig.env, retry, dl);
+        CHECK(o.status == "active");
+        CHECK(contains(o.notes, "already_active=1"));
+        CHECK_FALSE(contains(o.notes, "allow_set_unchanged_use_quarantine_allow=1"));
+    }
+    SECTION("the same exceptions in another order: no note") {
+        auto retry = rig.request();
+        retry.allow = make_set({"203.0.113.53"}, {ex("10.0.0.6:443/tcp/out"), ex("10.0.0.5:22/tcp/in")});
+        const auto o = apply_and_verify(rig.env, retry, dl);
+        CHECK(o.status == "active");
+        CHECK_FALSE(contains(o.notes, "allow_set_unchanged_use_quarantine_allow=1"));
+    }
+    SECTION("a different exception, fewer, or none: the note") {
+        const std::vector<std::vector<Endpoint>> requests{
+            {ex("10.0.0.5:22/tcp/in"), ex("10.9.9.9:22/tcp/in")}, {ex("10.0.0.5:22/tcp/in")}, {}};
+        for (const auto& requested : requests) {
+            INFO("exceptions requested: " << requested.size());
+            auto retry = rig.request();
+            retry.allow = make_set({"203.0.113.53"}, requested);
+            const auto o = apply_and_verify(rig.env, retry, dl);
+            CHECK(o.status == "active");
+            CHECK(contains(o.notes, "already_active=1"));
+            CHECK(contains(o.notes, "allow_set_unchanged_use_quarantine_allow=1"));
+            CHECK(rig.store.state()->allow.exceptions.size() == 2); // the stored set was kept
+        }
+    }
 }
 
 TEST_CASE("quarantine on an active record says when a new ttl_seconds was ignored",
@@ -5564,7 +5654,7 @@ TEST_CASE("the ttl tick answers from the record: residue, an operation in progre
     CHECK(rig.leg.removes == 0);
 }
 
-TEST_CASE("a TTL release defers to a legacy containment that appeared underneath",
+TEST_CASE("a lapsed time limit releases with no deferral, whatever the preflight would say",
           "[agent][firewall_quarantine]") {
     ScriptRig rig;
     auto rec = make_record();
@@ -5574,24 +5664,17 @@ TEST_CASE("a TTL release defers to a legacy containment that appeared underneath
     due.if_ttl_expired = true;
     Deadline dl;
 
-    rig.leg.refuse = "legacy_quarantine_active"; // quarantine.quarantine ran since
-    const auto o = release(rig.env, due, dl);
-    CHECK(o.status == "partial");
-    CHECK(o.reason == "legacy_quarantine_active");
-    CHECK(contains(o.notes, "ttl_deferred_legacy=1"));
-    CHECK(rig.leg.removes == 0); // nothing restored underneath the legacy containment
-    CHECK(rig.store.state()->phase == Phase::active); // the next tick retries
-
-    // any OTHER preflight answer must not stop a lapsed limit from ending
-    rig.leg.refuse = "firewall_disabled:Public";
+    rig.leg.refuse = "firewall_disabled:Public"; // a preflight answer must not stop an expiry
     const auto lifted = release(rig.env, due, dl);
     CHECK(lifted.status == "inactive");
+    CHECK(contains(lifted.notes, "ttl_expired=1"));
     CHECK(rig.leg.removes == 1);
+    CHECK_FALSE(rig.store.state());
 
-    // and a manual release is the dispatch gate's business, not this tick's
+    // and a manual release is the same: nothing defers it
     REQUIRE(rig.store.save(rec));
-    rig.leg.refuse = "legacy_quarantine_active";
     CHECK(release(rig.env, ReleaseRequest{}, dl).status == "inactive");
+    CHECK(rig.leg.removes == 2);
 }
 
 TEST_CASE("recover_at_init releases a record whose time limit already lapsed instead of re-applying it",
@@ -5784,7 +5867,7 @@ TEST_CASE("CH-3: a throw out of an action is degraded|exception, never refused, 
     NftRig rig;
     auto dl = rig.dl();
     // the process dies (a throw) right after `nft -f` committed: the `applying` record exists
-    rig.world.crash.crash_at = 2;
+    rig.world.crash.crash_at = 1;
     rig.world.crash.after_effect = true;
     CHECK_THROWS_AS(apply_and_verify(rig.env, rig.request(kProbeTarget, 600), dl), CrashSim);
     REQUIRE(rig.store.state());
@@ -6062,16 +6145,6 @@ TEST_CASE("ttl: an expiry release says so, and the one logged line it leaves car
         REQUIRE(apply_and_verify(manual.env, manual.request(kProbeTarget, 120), d3).status == "active");
         CHECK_FALSE(contains(release(manual.env, ReleaseRequest{}, d3).notes, "ttl_expired=1"));
     }
-    SECTION("a lapsed limit deferred to a legacy containment has not expired anything yet") {
-        ScriptRig script;
-        auto rec = make_record();
-        rec.ttl_expires = script.now - 1;
-        REQUIRE(script.store.save(rec));
-        script.leg.refuse = "legacy_quarantine_active";
-        const auto deferred = release(script.env, due, dl);
-        CHECK(contains(deferred.notes, "ttl_deferred_legacy=1"));
-        CHECK_FALSE(contains(deferred.notes, "ttl_expired=1"));
-    }
 }
 
 TEST_CASE("ttl: a wall clock stepped behind the apply time is reported, and adds no way to expire",
@@ -6149,8 +6222,6 @@ TEST_CASE("log: what is logged for an outcome, at which level; the ticks stay qu
          LogLevel::none, nullptr},
         {"repair", "active", "", {"repair_tick=1", "repaired=1", "repairs=1"}, LogLevel::info,
          "firewall: repair -> active repair_tick=1 repaired=1 repairs=1"},
-        {"repair", "partial", "legacy_quarantine_active", {"repair_tick=1", "repair_deferred_legacy=1"},
-         LogLevel::warn, "firewall: repair -> partial:legacy_quarantine_active repair_tick=1 repair_deferred_legacy=1"},
         {"repair", "degraded", "policy_not_blocking", {"repair_tick=1"}, LogLevel::warn,
          "firewall: repair -> degraded:policy_not_blocking repair_tick=1"},
         {"repair", "degraded", "state_unreadable", {"repair_tick=1"}, LogLevel::warn,
@@ -6500,7 +6571,7 @@ TEST_CASE("repair: an unreadable store is never acted on; no record means nothin
     CHECK(trig.registered.empty());
 }
 
-TEST_CASE("repair: never over a record that is not active, a read that cannot help, or a legacy containment",
+TEST_CASE("repair: never over a record that is not active or a read that cannot help; always converges otherwise",
           "[agent][firewall_quarantine]") {
     ScriptRig rig;
     Deadline dl;
@@ -6538,20 +6609,8 @@ TEST_CASE("repair: never over a record that is not active, a read that cannot he
         CHECK(o.reason == "os_unreadable");
         CHECK(rig.leg.applies == 0);
     }
-    SECTION("a legacy containment that appeared underneath defers, with no mutation") {
+    SECTION("a repairable gap converges, with no deferral") {
         REQUIRE(rig.store.save(make_record()));
-        const auto raw = rig.store.raw;
-        rig.leg.refuse = "legacy_quarantine_active";
-        const auto o = repair(rig.env, dl);
-        CHECK(o.status == "partial");
-        CHECK(o.reason == "legacy_quarantine_active");
-        CHECK(contains(o.notes, "repair_deferred_legacy=1"));
-        CHECK(rig.leg.applies == 0);
-        CHECK(rig.store.raw == raw);
-        CHECK(log_level("repair", o) == LogLevel::warn);
-
-        // any OTHER preflight answer must not stop a repair: the converge re-checks it itself
-        rig.leg.refuse = "firewall_disabled:Public";
         const auto fixed = repair(rig.env, dl);
         CHECK(fixed.status != "partial");
         CHECK(rig.leg.applies == 1);

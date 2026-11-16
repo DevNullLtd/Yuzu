@@ -1718,7 +1718,7 @@ The worst-case race is: the guard fires between steps 2 and 3 (SQLite updated, p
 
 **Why instructions that update Guardian, not direct policy edits:** Policy modifications go through the two-person approval flow, which adds delay during an active incident. Instructions are faster (separate approval tier system), but by routing them through GuardianEngine's desired state, the instruction never bypasses enforcement. The instruction is the delivery mechanism; Guardian is always the enforcer.
 
-**Quarantine is a terminal state** — once activated, it persists until an administrator explicitly lifts it. The agent does not auto-unquarantine even if the underlying rule becomes compliant, because quarantine typically indicates a sustained compromise attempt that warrants human investigation.
+**Quarantine is a terminal state** — once activated, it persists until an administrator explicitly lifts it. The agent does not auto-release even if the underlying rule becomes compliant, because quarantine typically indicates a sustained compromise attempt that warrants human investigation.
 
 **Audit:** Quarantine activation and deactivation are `critical` severity audit events. Exception additions and IP re-resolution updates are `high` severity events.
 

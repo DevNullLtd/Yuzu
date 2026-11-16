@@ -1,5 +1,5 @@
-// Tests for MutationGate (quarantine_serialization.hpp, #3286): bounds
-// concurrent execution of the quarantine plugin's mutating actions to one at
+// Tests for MutationGate (mutation_gate.hpp, #3286): bounds
+// concurrent execution of the firewall plugin's mutating actions to one at
 // a time. Pure C++ standard library concurrency primitive — no fixture text,
 // no platform guard, no OS/subprocess involvement, so this TU compiles and
 // runs on every leg.
@@ -13,7 +13,7 @@
 // taken", the poll only decides WHEN the next contender starts, and the property
 // asserted (the order served) is never a timing. No test here spawns a subprocess.
 
-#include "quarantine_serialization.hpp"
+#include "mutation_gate.hpp"
 #include "test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -29,7 +29,7 @@
 #include <vector>
 #include <type_traits>
 
-using yuzu::quarantine::MutationGate;
+using yuzu::shared::MutationGate;
 
 namespace {
 
@@ -91,7 +91,7 @@ static_assert(!std::is_copy_assignable_v<MutationGate>, "MutationGate must not b
 
 TEST_CASE("MutationGate::try_enter succeeds immediately when uncontended, and "
          "a released Guard makes the gate available for a second acquisition",
-         "[agent][quarantine_serialization]") {
+         "[agent][mutation_gate]") {
     MutationGate gate(std::chrono::milliseconds{1000});
 
     auto first = gate.try_enter();
@@ -107,7 +107,7 @@ TEST_CASE("MutationGate forces a genuine overlap between two threads: a "
          "gate -- the critical sections never interleave -- the short wait "
          "budget returns promptly rather than blocking indefinitely, and "
          "the gate is acquirable again once the holder releases",
-         "[agent][quarantine_serialization]") {
+         "[agent][mutation_gate]") {
     using namespace std::chrono_literals;
     MutationGate gate(300ms);
 
@@ -192,7 +192,7 @@ TEST_CASE("MutationGate forces a genuine overlap between two threads: a "
 
 TEST_CASE("MutationGate::Guard releases the gate on scope exit, including via "
          "an early return from the enclosing function",
-         "[agent][quarantine_serialization]") {
+         "[agent][mutation_gate]") {
     MutationGate gate(std::chrono::milliseconds{500});
 
     CHECK(acquire_then_maybe_return_early(gate, /*take_early_return=*/true));
@@ -205,7 +205,7 @@ TEST_CASE("MutationGate::Guard releases the gate on scope exit, including via "
 
 TEST_CASE("MutationGate::Guard is movable, and only the moved-to instance "
          "releases the gate -- a moved-from Guard's destructor is a no-op",
-         "[agent][quarantine_serialization]") {
+         "[agent][mutation_gate]") {
     MutationGate gate(std::chrono::milliseconds{500});
 
     {
@@ -230,10 +230,10 @@ TEST_CASE("MutationGate::Guard is movable, and only the moved-to instance "
 
 TEST_CASE("MutationGate serves waiters in ARRIVAL ORDER, so a release cannot be "
           "starved by a burst of retrying quarantines",
-          "[agent][quarantine_serialization]") {
+          "[agent][mutation_gate]") {
     // The shape this test exists for is not "two threads contend". It is: N
     // threads hold the gate in a loop while ONE thread — the operator's
-    // `unquarantine` — tries to get in. Under the previous
+    // `release` — tries to get in. Under the previous
     // std::timed_mutex::try_lock_for implementation that thread measurably won
     // ZERO of 8 attempts across 20 seconds at 8 holders, because try_lock has
     // no queue and an arriving thread barges past one that has already waited.
@@ -330,7 +330,7 @@ TEST_CASE("MutationGate serves waiters in ARRIVAL ORDER, so a release cannot be 
 }
 
 TEST_CASE("MutationGate: a waiter that times out does not block the queue behind it",
-          "[agent][quarantine_serialization]") {
+          "[agent][mutation_gate]") {
     // The failure mode a naive ticket lock introduces: a waiter that gives up
     // must remove itself, or the queue head names a thread that is no longer
     // waiting and NOBODY can ever be served again. That converts a starvation

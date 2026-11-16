@@ -247,9 +247,9 @@ FRAGMENT_FILES = [
 # virtualization (runtime_posture, +1, ReadOnly, Security:Read, gate None) on top of wsl's 249 = 250, re-derived by running parse_fragment_gate_rows over FRAGMENT_FILES
 # PRQ.1 firewall containment: +4 firewall (quarantine Destructive/Reversible, release Mutating, quarantine_status
 # ReadOnly, quarantine_allow Mutating) on top of runtime_posture's 250 = 254, then component_inventory (scan, +1,
-# ReadOnly, Inventory:Read, gate None) = 255, re-derived by running parse_fragment_gate_rows over FRAGMENT_FILES,
+# ReadOnly, Inventory:Read, gate None) = 255, less the old containment plugin's four rows that PRQ.2 removed = 251, re-derived by running parse_fragment_gate_rows over FRAGMENT_FILES,
 # not by adding to a baseline.
-EXPECTED_TOTAL_ROWS = 255
+EXPECTED_TOTAL_ROWS = 251
 
 # Decision 1 (#1398 design doc): the ONLY prefixes a content-declared pair
 # with no catalogue row may carry — server-side handlers with no

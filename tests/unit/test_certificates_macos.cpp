@@ -453,7 +453,7 @@ TEST_CASE("sealed-root delete rejection uses the shared error| grammar, not a be
 
 TEST_CASE("build_login_keychain_read_argv: caller already root -- no outer sudo hop",
          "[certificates][macos]") {
-    // Mirrors quarantine_plugin.cpp's sudo_prefix(): today's shipped
+    // Mirrors sudo_argv.hpp's root-or-sudo idiom: today's shipped
     // LaunchDaemon runs as root, so `launchctl asuser` (which itself
     // requires root) needs no escalation -- only the inner drop to the
     // target console user does. The exact element split is load-bearing:

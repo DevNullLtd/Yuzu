@@ -467,9 +467,7 @@ agent_test_exe = executable(
                                                 # the above -- real staged/copied executable payload, real
                                                 # runner spawn (Windows-only TU guard)
     'unit/test_certificates_x509.cpp',        # Wave 2 WP-B: pure libcrypto PEM/DER field extraction
-    'unit/test_quarantine_parsers.cpp',       # Wave 2 WP-F: pure netsh/iptables/pfctl output parsers
-    'unit/test_quarantine_argv.cpp',          # Wave 2 WP-F remediation: pure mutating-argv construction (FN-03)
-    'unit/test_quarantine_serialization.cpp', # Wave 2 P4: MutationGate bounded-wait serialization (#3286)
+    'unit/test_mutation_gate.cpp',            # MutationGate bounded-wait serialization (#3286)
     'unit/test_reconnect_backoff.cpp',        # HA WS-13 (#291): jittered reconnect delay, pure, random source injected
     'unit/test_server_address_parsers.cpp',   # #3429 round 4: pure host:port / IP-literal helpers for
                                                 # server_address_resolver.cpp's boot-time DNS resolution
@@ -721,7 +719,6 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/filesystem/src'),    # filesystem_macos_sig.hpp (#2273/1.14); filesystem_acl_parsers.hpp (get_acl parser + dispatcher tests)
     include_directories('../agents/plugins/event_logs/src'),    # event_logs_macos.hpp (BR-08)
     include_directories('../agents/plugins/certificates/src'),  # certificates_macos_parsers.hpp (Gate-7 FIX A: pure helpers shared with the plugin)
-    include_directories('../agents/plugins/quarantine/src'),    # quarantine_parsers.hpp (Wave 2 WP-F)
     include_directories('../agents/plugins/users/src'),         # users_macos_last.hpp (qe-M1 pure parser)
     include_directories('../agents/plugins/content_dist/src'),  # content_dist_upload_parsers.hpp (PR1.6b pure helpers)
     include_directories('../agents/plugins/script_exec/src'),   # script_exec_parsers.hpp (Wave 5 PR5.1 pure helpers)
@@ -1788,6 +1785,7 @@ if build_server
       'unit/server/test_device_routes.cpp',
       'unit/server/test_device_lens_routes.cpp', # ADR-0031 WS-A4 wave 2: DEX/Guardian device lenses (no public twin — outside the seam)
       'unit/server/test_hardware_list_model.cpp', # round-3: Hardware CI list/record pure model
+      'unit/server/test_bulk_ci_page_model.cpp', # bulk device-CI keyset page: params, cursor, scope walk, JSON
       'unit/server/test_quarantine_read_model.cpp', # Seam PR2: shared quarantine list JSON builder (key order, escaping)
       'unit/server/test_hardware_ui.cpp',         # round-3: Hardware CI list/record HTML fragment
       'unit/server/test_hardware_routes.cpp',     # round-3: Hardware CI list/record routes + REST twin
@@ -4960,6 +4958,16 @@ test('issue lifecycle docs',
   timeout: 10,
 )
 
+# The old standalone containment agent plugin is removed and nothing names it again (device
+# containment is the firewall plugin's four actions): no tracked file outside the history
+# allowlist names its files, actions, rule or chain prefixes or definition ids.
+test('removed containment plugin lexical gate',
+  _python3_test,
+  args: [files('test_legacy_quarantine_plugin_removed_lexical.py')],
+  suite: 'docs',
+  timeout: 120,
+)
+
 # The Windows package-sources upgrade note states the fresh-deployment contract (routed
 # Forensics clause 8): its opening sentence is present and the in-place-upgrade phrasing is absent.
 test('upgrade notes contract',
@@ -5297,6 +5305,8 @@ test('gateway contract wrapper selftest', _python3_test,
   args: [files('test_gateway_contract.py')], suite: 'docs', timeout: 30)
 test('contract registry', _python3_test,
   args: [files('../scripts/test/contract-evidence.py'), 'check'], suite: 'docs', timeout: 30)
+test('contract evidence CI step', _python3_test,
+  args: [files('test_contract_evidence_ci_step.py')], suite: 'docs', timeout: 30)
 if get_option('build_contract_tests')
   _contract_adapter = files('../scripts/test/contract-evidence.py')
   test('contract.plugin.loader.reserved-name.reject', _python3_test,

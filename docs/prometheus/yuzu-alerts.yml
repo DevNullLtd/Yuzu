@@ -3067,15 +3067,10 @@ groups:
             stalled backend pinning the pool every other store shares. A slot
             timeout fails closed deliberately: serving stale containment state
             when nobody asked the store would under-enforce against a healthy
-            one. The quarantine plugin's own control actions stay
+            one. The firewall plugin's four containment actions stay
             reachable throughout - releasing a device does not depend on this
             read - as do the four system-reserved internal pushes
-            (yuzu_server_system_reserved_push_total). The firewall plugin's
-            four containment actions are protective for plugin enablement but
-            are NOT exempt from this gate until #7437, so while this alert
-            fires they are refused too (a firewall containment started with a time
-            limit still ends on the agent; one started without it stays until a
-            release can be dispatched). BE PRECISE ABOUT for: 2m:
+            (yuzu_server_system_reserved_push_total). BE PRECISE ABOUT for: 2m:
             it delays the page by two minutes, it does NOT require a sustained
             episode. increase()[5m] stays true for ~5 minutes after a single
             increment, so one fail-closed evaluation still pages, two minutes
@@ -3151,7 +3146,8 @@ groups:
             REACHABLE (a live AgentSession — the reconciler could dispatch to
             it right now), and QuarantineContainmentReconciler (#3425) has
             not been able to confirm its endpoint firewall via a follow-up
-            `quarantine.status` read returning state|active. The #881
+            `firewall.quarantine_status` read returning status|active (or
+            status|active_unproven with no probe target). The #881
             dispatch gate still refuses operator commands to this device —
             containment holds at the control plane — but the OTHER half,
             the device's own firewall stopping it reaching anything else,
@@ -3183,10 +3179,49 @@ groups:
             YuzuQuarantineGateFailClosed. The audited evidence trail is the
             quarantine.reapply verb (system principal, detail carries
             record_id + command_id + trigger=tick|heartbeat, or "CONFIRMED
-            record_id=... command_id=..." on success).
+            record_id=... command_id=..." once per transition to confirmed,
+            or "drift status=..." when a re-verify no longer confirms).
             This alert also fires when the device's agent lacks the
-            quarantine plugin: the dispatch is accepted but never
-            confirmed, so upgrade the agent.
+            firewall plugin: the dispatch is accepted but never
+            confirmed. An agent without the firewall plugin comes from an
+            earlier build, which is unsupported: reprovision the host into a
+            fresh deployment of this build. On a Linux host running the
+            packaged systemd unit every containment action is refused
+            (privilege_unavailable), so a record there stays unconfirmed.
+
+      - alert: YuzuQuarantineReleasePending
+        expr: |
+          yuzu_server_quarantine_release_pending{reachability="connected"} > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A connected, quarantined device has not confirmed its release"
+          description: >-
+            A release was requested for a device (DELETE /api/v1/quarantine/{agent_id}
+            sent firewall.release), the device is currently REACHABLE, and
+            QuarantineContainmentReconciler has not been able to read
+            status|inactive from firewall.quarantine_status for 15 minutes. The
+            record stays listed as releasing and the #881 dispatch gate keeps
+            refusing operator commands to the device until the device confirms.
+            reachability="offline" is DELIBERATELY EXCLUDED, for the reason
+            YuzuQuarantineEndpointUnconfirmed gives: a device that is off cannot
+            confirm, and paging on that is paging on correct behaviour. Check
+            yuzu_server_quarantine_reconciler_tick_healthy first - if 0 the
+            reconciler's own reads are failing and this gauge is frozen. Then
+            correlate with yuzu_server_quarantine_reapply_total{result}
+            (release_sent says the release went out; unconfirmed says the device
+            did not answer inactive) and the quarantine.disable audit rows
+            (pending release_sent). A common cause is a device that refuses every
+            mutating firewall action (a Linux host on the packaged systemd unit:
+            privilege_unavailable). The way out is
+            DELETE /api/v1/quarantine/{agent_id}?force=true, which ends the record
+            without the device's confirmation. A forced end does NOT release the
+            device: it may still be contained, the server stops refusing commands
+            to it, and the reconciler sends the release it owes once per
+            reconnect (yuzu_server_quarantine_forced_release_owed counts those; no
+            alert fires on it, an offline device that owes a release is an expected
+            state).
 
       - alert: YuzuDispatchTargetRejected
         expr: |
@@ -5412,25 +5447,25 @@ groups:
         annotations:
           summary: "Audit events failing to persist — behavioural-data routes and audit-first mutations are 503ing"
           description: >-
-            yuzu_server_audit_emit_failed_total is rising. Every REST route that uses
+            yuzu_server_audit_emit_failed_total is rising. The REST routes that use
             fail-closed audit-on-open (guardian.device.view, dex.device.view,
             dex.signal.view, dex.perf.device.view, network.device.view, inventory.devices,
-            inventory.device.ci, plus
+            inventory.device.ci, inventory.devices.ci, plus
             response.read on the v1 query, aggregate and export routes and on the
             legacy get, aggregate and export routes, plus response.forensics.read (written
             only when the rows served include a Forensics-tier plugin's) on the v1
             execution-scoped response, response get, export and visualization routes, on
             bundle collation (GET /api/v1/bundles/{id}) and on the legacy get and export
-            routes) is returning 503 and withholding PII or response
+            routes) are returning 503 and withholding PII or response
             data, so a ServiceNow / CMDB poll blackouts fleet-wide. Set-and-proceed reads, including
             crypto.libraries.* and response.forensics.read on the dashboard results fragment, the
             executions drawer, the hardware result poll, the MCP query_responses tool and
             the MCP get_bundle_result tool, keep
             serving data and do not 503: their REST routes and dashboard
             fragments set the Sec-Audit-Failed header, their MCP tools set audit_persisted:false
-            (the hardware CI tools list_hardware_ci and get_hardware_ci, which audit as
-            inventory.devices and inventory.device.ci, fail closed instead: they withhold the
-            data and answer a retryable -32603), and only the /crypto (crypto.libraries.*) pages
+            (the hardware CI tools list_hardware_ci, get_hardware_ci and list_hardware_ci_records,
+            which audit as inventory.devices, inventory.device.ci and inventory.devices.ci,
+            fail closed instead: they withhold the data and answer a retryable -32603), and only the /crypto (crypto.libraries.*) pages
             also show an on-page "Audit not recorded" notice.
             Check audit_store health (/healthz
             stores.audit) and free disk / connection saturation on the PostgreSQL
