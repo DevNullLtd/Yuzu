@@ -7233,8 +7233,11 @@ groups:
             store (a full or read-only data directory, permissions, a locked kv_store.db). Fix
             the store first. A graceful restart while the store is still failing loses the
             staged capture, because the stop-time flush uses the same store. After the store is
-            healthy, the worker retries without a restart (backoff up to 60 s). A crash or a
-            forced kill loses the capture regardless; the next boot then captures whatever the
+            healthy, the worker retries without a restart (backoff up to 60 s), unless the
+            agent log shows "Failed to open KV store" from boot: the store is opened once, at
+            boot, so that agent never recovers by itself, a restart after repairing the data
+            directory IS required and the captures staged in that process can no longer be
+            written. A crash or a forced kill loses the capture regardless; the next boot then captures whatever the
             file holds at that moment, which is the gap this alert exists to expose. This covers
             the Spark path only: persist failures on the legacy detection path are logged and are
             not counted. Read a quiet graph together with
