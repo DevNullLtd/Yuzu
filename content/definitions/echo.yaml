@@ -383,7 +383,11 @@ metadata:
     collection intervals, and command-line
     redaction patterns for sensitive data protection. Lowering
     db_budget_bytes deletes history on the next maintenance pass (within 15
-    minutes) and cannot be undone.
+    minutes) and cannot be undone. A setting that cannot be saved stops the
+    call with exit code 1 and an error| line; settings saved earlier in the
+    same call stay saved and are listed first as partial|applied|<keys>. An
+    interval listed there takes effect at the next agent restart or when sent
+    again in a call that succeeds.
   tags: [echo, timeline, configuration, security]
 
 spec:

@@ -2582,6 +2582,17 @@ TEST_CASE("Echo #1567: db_health line format", "[echo][status][issue1567]") {
     CHECK(format_db_health_line(false, 1700000000) == "db_health|ok|1700000000");
 }
 
+TEST_CASE("configure reply: a partial commit lists the applied keys in order",
+          "[echo][status][issue2155]") {
+    CHECK(format_configure_partial({"db_budget_bytes"}) == "partial|applied|db_budget_bytes");
+    CHECK(format_configure_partial({"fast_interval_seconds", "process_enabled", "redaction_patterns"}) ==
+          "partial|applied|fast_interval_seconds,process_enabled,redaction_patterns");
+}
+
+TEST_CASE("configure reply: nothing applied produces no partial line", "[echo][status][issue2155]") {
+    CHECK(format_configure_partial({}).empty());
+}
+
 // =============================================================================
 // Byte budget: run_budget eviction, vacuum_decision, parse_budget_bytes
 // =============================================================================

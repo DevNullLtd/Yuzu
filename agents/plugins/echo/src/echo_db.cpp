@@ -67,6 +67,12 @@ constexpr int kBusyTimeoutMs = 5000;
 
 using yuzu::shared::sqlite_quarantine::now_epoch_seconds;
 
+// Quarantined echo.db copies kept (owner ruling Q6, #2155): the newest three; older ones are
+// deleted at quarantine time. Deliberately separate from the command-dedup store's constant
+// (#3665, command_dedup_quarantine.hpp): two owner rulings on stores with different contents, and
+// the two may diverge.
+constexpr std::size_t kKeepQuarantined = 3;
+
 struct StmtDeleter {
     void operator()(sqlite3_stmt* s) const { sqlite3_finalize(s); }
 };
@@ -1032,6 +1038,19 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
         spdlog::error("ECHO: echo.db failed PRAGMA integrity_check (echo.db.corruption_detected) — "
                       "quarantined to {} and re-initialising a fresh database",
                       quarantined->string());
+        // Bound the evidence kept: a disk that corrupts echo.db on every start must not fill the
+        // volume with copies. Best effort (a copy that cannot be removed is left for the next
+        // recovery); the group just made is never a candidate.
+        {
+            const auto pruned = yuzu::shared::sqlite_quarantine::prune_old_quarantines(
+                path, *quarantined, kKeepQuarantined);
+            for (const auto& f : pruned.removed)
+                spdlog::info("EchoDatabase: removed old quarantined database {} (keeping the "
+                             "newest {})",
+                             f.string(), kKeepQuarantined);
+            for (const auto& note : pruned.notes)
+                spdlog::warn("EchoDatabase: {}", note);
+        }
 #ifdef _WIN32
         // A sidecar that had to be copied (not renamed) took the directory's ACL: protect it again.
         secure_quarantined_sidecars(*quarantined, dacl);
