@@ -8035,25 +8035,29 @@ tests:
   # rule is `sum by (job) (max_over_time(<gauge>[5m])) > 0`, `for: 15m`, severity=warning, the
   # same shape as YuzuDedupStoreDegraded and the same five-shape template: fires at 15m and not
   # 14m (T20), count not `== 1` (T21), zero stays quiet (T22), a transient stays quiet (T23),
-  # gaps (T24, T24b, T25), clearing (T26) and the window width (T27a, T27b).
+  # gaps (T24, T24b, T25), clearing (T26) and the window width (T27a, T27b). CH-1 is a
+  # characterisation pin of a documented limit, not a requirement.
   #
   # The whole file passes under the harness (the digest-pinned promtool 3.13.1 image) on the tree
   # that added the rule. The mutation and must-fail-before runs below were direct `promtool test
   # rules` runs of ONE case at a time, in the same v3.13.1 image, against the rule's own text in a
   # scratch rules file (the must-fail-before run used the full pre-rule rules file).
-  # Mutation-checked, each case run alone against each mutant, RED cases listed:
-  #   max_over_time window dropped (bare gauge)  -> T24, T24b, T26, T27b
+  # Mutation-checked, each case run alone against each mutant, RED cases listed (re-measured in
+  # governance fix round 1 against the v3.13.1 image; the first version of this table was wrong
+  # for several rows, notably `for:` dropped, which left T22 AND T23 green and is NOT "every case"):
+  #   max_over_time window dropped (bare gauge)  -> T24, T24b, T26, T27b, CH-1
   #   `> 0` changed to `>= 0`                    -> T22, T23, T26, T27a, T27b
   #   `> 0` changed to `== 1`                    -> T21, T25
-  #   `for: 16m`                                 -> T20, T27b
-  #   `for: 14m`                                 -> T20, T24, T27a, T27b
-  #   `for:` dropped                             -> every case
+  #   `for: 16m`                                 -> T20, T27b, CH-1
+  #   `for: 14m`                                 -> T20, T24, T24b, T27a, T27b
+  #   `for:` dropped                             -> T20, T23, T24, T24b, T27a, T27b (T23 only
+  #                                                 through its 7m evaluation)
   #   `sum by (job)` dropped                     -> T25 (the alert then carries an `instance`
-  #                                                 label, which also reddens T20, T21, T24, T26
-  #                                                 and T27b, whose expected labels omit it)
+  #                                                 label, which also reddens T20, T21, T24, T24b,
+  #                                                 T26, T27b and CH-1, whose expected labels omit it)
   #   window [4m]                                -> T26, T27b
   #   window [6m]                                -> T26, T27a, T27b
-  #   window [1m]                                -> T24, T24b, T26, T27b
+  #   window [1m]                                -> T24, T24b, T26, T27b, CH-1
   # Must-fail-before (#2553): the same cases run against the rules file as it stood before this
   # rule existed (origin/dev 3a76ef9ac3) are RED for T20, T21, T24, T25, T26 and T27b (each
   # expects a firing alert that does not exist), while T22, T23 and T27a pass vacuously there
@@ -8062,7 +8066,8 @@ tests:
   # T24 uses `stale` for its gaps, not `_`. A `_` gap shorter than the 5m lookback leaves the bare
   # gauge readable, so it does NOT go red without the window (measured: the bare-gauge mutant
   # passes a `_` version of T24). The dormant rule can only be shown to fire here: a live-rig
-  # firing check belongs to the flip evidence (prefer_spark is off in every released agent).
+  # firing check is a row of the flip evidence checklist in docs/spark-flip-gate.md (prefer_spark
+  # is off in every released agent).
 
   # CASE T20 -- fires once the backlog has held for the full 15m, and not before. RED if `for:` is
   # dropped (fires at 14m) or lengthened to 16m or more (the 15m eval is the only one that
@@ -8118,14 +8123,21 @@ tests:
         eval_time: 50m
         exp_samples: []
 
-  # CASE T23 -- a short transient backlog never fires: 3 samples of 1 between zeros, stretched to
-  # about 8 minutes by the 5m window, is under the 15m `for:`. RED if `for:` is removed.
+  # CASE T23 -- a short transient backlog never fires: 3 samples of 1 between zeros (minutes 2 to
+  # 4), stretched to about 7 minutes by the 5m window, is under the 15m `for:`. The 7m evaluation
+  # is the one that discriminates: the expression is true from minute 2 through minute 8, so with
+  # `for:` removed the alert is firing at 7m (the 12m, 16m and 30m evaluations all fall after the
+  # expression has gone false again, so they stay quiet with or without `for:`). RED at 7m if
+  # `for:` is removed.
   - interval: 1m
     name: baseline unpersisted - a 3 minute backlog stays quiet
     input_series:
       - series: 'yuzu_fleet_guardian_baseline_unpersisted{job="yuzu",instance="s1"}'
         values: "0 0 1 1 1 0x55"
     promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGuardianBaselineUnpersisted", alertstate="firing"}'
+        eval_time: 7m
+        exp_samples: []
       - expr: 'ALERTS{alertname="YuzuGuardianBaselineUnpersisted", alertstate="firing"}'
         eval_time: 12m
         exp_samples: []
@@ -8284,6 +8296,32 @@ tests:
       - expr: 'ALERTS{alertname="YuzuGuardianBaselineUnpersisted", alertstate="firing"}'
         eval_time: 16m
         exp_samples: []
+
+  # CASE CH-1 -- CHARACTERISATION of a documented limit, NOT a defect (UP-1; owner ruling Q2:
+  # the rule keeps the `> 0` shape). The gauge is already a fleet SUM when Prometheus sees it, so
+  # the rule cannot tell one stuck capture from a stream of healthy short backlogs: here a single
+  # one-scrape blip of 1 (a different agent each time, in real life) lands every 4 minutes, no
+  # capture is older than a scrape, and the 5m `max_over_time` window still holds a nonzero sample
+  # at every evaluation, so the alert FIRES at 15m and stays firing at 20m. A per-agent age signal
+  # would be needed to tell the two apart; that is a design change tracked as a follow-up, not
+  # something a PromQL edit fixes. This case pins today's behaviour so a change to it is
+  # deliberate; it is not an endorsement of the behaviour.
+  - interval: 1m
+    name: baseline unpersisted - a one scrape blip every 4 minutes fires (documented limit of the ruled > 0 shape)
+    input_series:
+      - series: 'yuzu_fleet_guardian_baseline_unpersisted{job="yuzu",instance="s1"}'
+        values: "1 0 0 0 1 0 0 0 1 0 0 0 1 0 0 0 1 0 0 0 1 0 0 0 1 0 0 0 1 0 0 0 1 0 0 0 1 0 0 0"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGuardianBaselineUnpersisted", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGuardianBaselineUnpersisted", alertstate="firing", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGuardianBaselineUnpersisted", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGuardianBaselineUnpersisted", alertstate="firing", job="yuzu", severity="warning"}'
+            value: 1
 
   # -- Workflow-run saturation and integrity (group yuzu-dispatch, #2146) -----------------------
   #
