@@ -1331,6 +1331,11 @@ public:
     /// before any request is served.
     void set_session_store(yuzu::server::SessionStore* s) { session_store_ = s; }
 
+    /// True iff a durable SessionStore is attached. Lets a caller tell the store-less legacy
+    /// wiring (no durable row exists to require) from a degraded read of an attached store:
+    /// `read_durable_mfa_proof` reports both as `kUnavailable`. Read-only.
+    [[nodiscard]] bool has_session_store() const noexcept { return session_store_ != nullptr; }
+
     /// True iff a durable SessionStore is set AND reports open. Wired into
     /// /readyz alongside `is_auth_db_ok()`: with sessions durable, a
     /// half-open/failed session store is a readiness failure (the node cannot

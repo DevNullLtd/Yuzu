@@ -709,10 +709,12 @@ TEST_CASE("POST /api/settings/mfa/verify: a failed durable stamp reports not_sta
     // trusted once the store is damaged.
     REQUIRE(h.auth_mgr.validate_session(token).has_value());
 
-    // The durable sessions table is moved aside: the cookie still validates from this replica's
-    // cache (so the stamp block reaches `mark_session_mfa_verified`), whose durable write fails.
-    fault.arm();
-    REQUIRE(h.auth_mgr.validate_session(token).has_value());
+    // The durable sessions table is moved aside AFTER the route's durable-session check (#6079:
+    // a store already damaged at that point is refused before the commit, see the 503 case) and
+    // after the cookie validated, from the stamp fault seam: the stamp's durable write then fails,
+    // the residual the check cannot close.
+    h.routes.set_stamp_fault_hook_for_test([&fault] { fault.arm(); });
+    yuzu::test::ScopeExit clear_hook{[&h] { h.routes.set_stamp_fault_hook_for_test(nullptr); }};
 
     auto res = post_verify_with_cookie(h, code, token);
     REQUIRE(res);
@@ -722,6 +724,122 @@ TEST_CASE("POST /api/settings/mfa/verify: a failed durable stamp reports not_sta
     CHECK(h.has_audit("mfa.recovery_codes.generated", "ok", "admin"));
     CHECK(h.auth_db->mfa_status("admin")->enrolled);
     CHECK_FALSE(has_step_up_proof(h, token));
+}
+
+namespace {
+
+/// A harness whose AuthManager has a real durable SessionStore attached and one local `admin`
+/// session minted into it (#6079: the enrol-confirm durable-session requirement). Member order
+/// matters: the detach runs before the store is destroyed, and the harness outlives both.
+struct DurableEnrolFx {
+    MfaSettingsHarness h;
+    SessionStore sessions{h.auth_db.pool()};
+    SessionStoreDetach detach{h.auth_mgr};
+    std::string token;
+
+    DurableEnrolFx() {
+        REQUIRE(sessions.is_open());
+        h.auth_mgr.set_session_store(&sessions);
+        token = h.auth_mgr.create_local_session_for_test("admin", auth::Role::admin, false);
+        REQUIRE_FALSE(token.empty());
+    }
+};
+
+} // namespace
+
+TEST_CASE("POST /api/settings/mfa/verify with a durable session enrols exactly as before (#6079)",
+          "[pg][mfa][routes][settings][stepup]") {
+    DurableEnrolFx fx;
+    auto& h = fx.h;
+    const auto code = begin_admin_enrolment(h);
+    auto res = post_verify_with_cookie(h, code, fx.token);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->body.find("Store these recovery codes now") != std::string::npos);
+    CHECK(h.auth_db->mfa_status("admin")->enrolled);
+    CHECK(h.audit_detail("mfa.enroll.verified") == "step_up_proof=stamped");
+    CHECK(h.has_audit("mfa.recovery_codes.generated", "ok", "admin"));
+    CHECK_FALSE(h.has_audit("mfa.enroll.failed"));
+}
+
+TEST_CASE("POST /api/settings/mfa/verify refuses to enrol on a session with no durable row (#6079)",
+          "[pg][mfa][routes][settings][stepup]") {
+    DurableEnrolFx fx;
+    auto& h = fx.h;
+    const auto code = begin_admin_enrolment(h);
+
+    std::string cookie = fx.token;
+    SECTION("the session's durable row was deleted before the confirm") {
+        REQUIRE(h.auth_mgr.invalidate_session(fx.token));
+    }
+    SECTION("no session cookie at all") {
+        cookie.clear();
+    }
+
+    auto res = post_verify_with_cookie(h, code, cookie);
+    REQUIRE(res);
+    CHECK(res->status == 401);
+    CHECK(res->body.find("no longer valid") != std::string::npos);
+    CHECK(res->get_header_value("Retry-After").empty());
+    check_mfa_no_store(*res);
+    CHECK(h.audit_detail("mfa.enroll.failed") == "session_not_durable");
+    CHECK(h.has_audit("mfa.enroll.failed", "error", "admin"));
+    CHECK_FALSE(h.has_audit("mfa.enroll.verified"));
+    CHECK_FALSE(h.has_audit("mfa.recovery_codes.generated"));
+    CHECK_FALSE(h.auth_db->mfa_status("admin")->enrolled);
+
+    // The provisional secret was left as it was: the same code confirms from a valid session.
+    const auto fresh = h.auth_mgr.create_local_session_for_test("admin", auth::Role::admin, false);
+    REQUIRE_FALSE(fresh.empty());
+    auto again = post_verify_with_cookie(h, code, fresh);
+    REQUIRE(again);
+    CHECK(again->status == 200);
+    CHECK(again->body.find("Store these recovery codes now") != std::string::npos);
+    CHECK(h.auth_db->mfa_status("admin")->enrolled);
+}
+
+TEST_CASE("POST /api/settings/mfa/verify fails closed with a 503 while the session store is "
+          "unreadable (#6079)",
+          "[pg][mfa][routes][settings][stepup]") {
+    DurableEnrolFx fx;
+    auto& h = fx.h;
+    yuzu::test::SessionWipeFault fault{h.auth_db.pool()}; // RAII: repaired on every exit path
+    const auto code = begin_admin_enrolment(h);
+
+    fault.arm(); // the durable sessions table is moved aside: the read degrades
+    auto res = post_verify_with_cookie(h, code, fx.token);
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Retry-After") == "5");
+    check_mfa_no_store(*res);
+    CHECK(h.audit_detail("mfa.enroll.failed") == "session_store_unavailable");
+    CHECK(h.has_audit("mfa.enroll.failed", "error", "admin"));
+    CHECK_FALSE(h.has_audit("mfa.enroll.verified"));
+    CHECK_FALSE(h.has_audit("mfa.recovery_codes.generated"));
+    CHECK_FALSE(h.auth_db->mfa_status("admin")->enrolled);
+
+    // Once the store is back, the same provisional code confirms.
+    fault.repair();
+    auto again = post_verify_with_cookie(h, code, fx.token);
+    REQUIRE(again);
+    CHECK(again->status == 200);
+    CHECK(h.auth_db->mfa_status("admin")->enrolled);
+}
+
+TEST_CASE("POST /api/settings/mfa/verify with no session store wired is unchanged (#6079)",
+          "[pg][mfa][routes][settings][stepup]") {
+    // The store-less (legacy and config-file-user) wiring has no durable row to require, so the
+    // check is skipped even for a caller with no cookie.
+    MfaSettingsHarness h;
+    REQUIRE_FALSE(h.auth_mgr.has_session_store());
+    const auto code = begin_admin_enrolment(h);
+    auto res = post_verify_with_cookie(h, code, {});
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->body.find("Store these recovery codes now") != std::string::npos);
+    CHECK(h.auth_db->mfa_status("admin")->enrolled);
+    CHECK(h.audit_detail("mfa.enroll.verified") == "step_up_proof=not_stamped");
+    CHECK_FALSE(h.has_audit("mfa.enroll.failed"));
 }
 
 namespace {

@@ -8107,6 +8107,53 @@ void SettingsRoutes::register_routes(
                                       "text/html; charset=utf-8");
                       return;
                   }
+                  // #6079: the confirming code commits the factor, so the caller's session must be
+                  // a durable, valid row BEFORE it does; otherwise the enrolment could commit on
+                  // a session that ended, was wiped or never had a row, leaving the account
+                  // enrolled with no usable proof on that session. Only when a session store is
+                  // wired: the store-less (legacy and config-file-user) wiring has no durable
+                  // row to require, and its behaviour is unchanged. The read is the raw
+                  // `read_durable_mfa_proof` (row existence and ownership only; the rebind
+                  // guard concerns a stored generation, which is not judged here). It runs
+                  // BEFORE and OUTSIDE the `auth.users` row lock that `mfa_verify_enrollment`
+                  // takes: AuthDB must never read the session store. Residual, stated plainly:
+                  // a session that ends between this read and the commit still ends in the
+                  // best-effort stamp's `not_stamped` outcome below, and the enrolment stands.
+                  // The provisional secret is untouched on either refusal, so the same code
+                  // can be confirmed from a valid session.
+                  if (auth_mgr_->has_session_store()) {
+                      using Source = auth::DurableMfaProof::Source;
+                      const auto durable = auth_mgr_->read_durable_mfa_proof(
+                          AuthRoutes::extract_session_cookie(req), session->username);
+                      if (durable.source != Source::kRow) {
+                          const bool unavailable = durable.source == Source::kUnavailable;
+                          const std::string msg =
+                              unavailable
+                                  ? "Session store is temporarily unavailable. Nothing was "
+                                    "enrolled; retry shortly."
+                                  : "Your session is no longer valid. Nothing was enrolled; "
+                                    "sign in again.";
+                          audit_fn_(req, "mfa.enroll.failed", "error", "User", session->username,
+                                    unavailable ? "session_store_unavailable"
+                                                : "session_not_durable");
+                          res.status = unavailable ? 503 : 401;
+                          if (unavailable)
+                              res.set_header("Retry-After", "5");
+                          // htmx swaps no 4xx/5xx body, so the toast is what tells the operator.
+                          const nlohmann::json toast = {
+                              {"showToast", {{"message", msg}, {"level", "error"}}}};
+                          res.set_header("HX-Trigger", toast.dump());
+                          set_no_store(res);
+                          // A transient outage keeps the provisional form so the same code can be
+                          // confirmed on retry; a dead session shows the not-enrolled panel.
+                          res.set_content(render_mfa_fragment(*session, {}, {}, {},
+                                                              unavailable ? session->username
+                                                                          : std::string{},
+                                                              msg),
+                                          "text/html; charset=utf-8");
+                          return;
+                      }
+                  }
                   auto codes_res = db->mfa_verify_enrollment(session->username, code,
                                                              /*expected_password_hash_hex=*/std::nullopt);
                   if (!codes_res && codes_res.error() == AuthDBError::CredentialChanged) {
