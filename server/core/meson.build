@@ -864,6 +864,7 @@ yuzu_server_core_lib = static_library(
     'src/inventory_ci_join.cpp',
     'src/hardware_list_model.cpp',
     'src/hardware_section_integrity.cpp', # #7159: section-integrity counter + sampled WARN (the pure model stays metrics-free)
+    'src/hardware_ci_page_model.cpp', # bulk device-CI keyset page (GET /api/v1/hardware-ci + MCP twin)
     'src/device_containment_render.cpp',
     'src/device_estate_render.cpp',
     'src/software_catalog_rollup.cpp',

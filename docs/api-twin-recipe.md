@@ -552,7 +552,7 @@ if a dashboard fragment already exists for the same data, its `(void)`-discard m
 rule for every tool. A twin whose data is behavioural PII (ADR-0016: serial, system UUID and MAC)
 and whose REST route already fails closed may do the same: it withholds the data when either audit
 row drops and answers a retryable `kInternalError`, with no `audit_persisted` key.
-`get_agent_app_usage` and the hardware CI twins (`list_hardware_ci`, `get_hardware_ci`) take this
+`get_agent_app_usage` and the hardware CI twins (`list_hardware_ci`, `get_hardware_ci`, `list_hardware_ci_records`) take this
 posture. State the choice explicitly in the PR, and do not copy it onto a tool whose data is not
 behavioural PII.
 

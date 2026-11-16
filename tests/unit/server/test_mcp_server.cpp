@@ -2359,7 +2359,7 @@ TEST_CASE("MCP 2g: tool families cover exactly the tools/list surface (staleness
 // The kill-switch tools' published descriptions are decision-grade machine
 // metadata: an agentic worker reads them to decide whether a switch is a real
 // emergency stop. They must keep carrying the protective-action caveat (the
-// quarantine control actions and __guard__.push_rules are never refused by a
+// firewall containment actions and __guard__.push_rules are never refused by a
 // switch), or a stale "reliable emergency stop" claim can reappear unnoticed.
 TEST_CASE("MCP kill-switch tools advertise the protective-action caveat",
           "[mcp][protective]") {
@@ -2386,13 +2386,13 @@ TEST_CASE("MCP kill-switch tools advertise the protective-action caveat",
     };
     // Both descriptions name the closed pair list and their own effect.
     check_mentions(getter["description"],
-                   {"protective", "unquarantine", "whitelist", "__guard__.push_rules",
-                    "quarantine_allow", "dispatch still proceeds"});
+                   {"protective", "release", "quarantine_allow", "__guard__.push_rules",
+                    "dispatch still proceeds"});
     check_mentions(getter["inputSchema"]["properties"]["os"]["description"],
                    {"protective", "never gates"});
     check_mentions(setter["description"],
-                   {"protective", "unquarantine", "whitelist", "__guard__.push_rules",
-                    "quarantine_allow", "no dispatch effect"});
+                   {"protective", "release", "quarantine_allow", "__guard__.push_rules",
+                    "no dispatch effect"});
     check_mentions(setter["inputSchema"]["properties"]["enabled"]["description"],
                    {"protective", "no dispatch effect"});
 }
@@ -36091,7 +36091,7 @@ TEST_CASE("MCP quarantine_device ticket round-trip records + dispatches isolatio
     ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
                                     const std::string&, const std::string&,
                                     const std::string&) -> bool { return true; };
-    // #1398: quarantine.quarantine is role-gated content (ExecuteGate::
+    // #1398: firewall.quarantine is role-gated content (ExecuteGate::
     // AdminOrApproval). Captured locally rather than added to the shared
     // McpTestServer harness — this test is the one place that needs it.
     yuzu::server::ApprovalProvenance captured_provenance = yuzu::server::ApprovalProvenance::None;
@@ -36153,12 +36153,14 @@ TEST_CASE("MCP quarantine_device ticket round-trip records + dispatches isolatio
     REQUIRE(rec.has_value()); // read succeeded
     REQUIRE(rec->has_value()); // and found an active record
     CHECK((*rec)->status == "active");
-    // Live isolation dispatched via the quarantine plugin with the whitelist.
-    CHECK(ts.last_dispatch_plugin == "quarantine");
+    // Live isolation dispatched via the firewall plugin with the whitelist mapped to the exception
+    // grammar, from the STORED row (the created branch reads it back like the retry branch).
+    CHECK(ts.last_dispatch_plugin == "firewall");
     CHECK(ts.last_dispatch_action == "quarantine");
     REQUIRE(ts.last_dispatch_agent_ids.size() == 1);
     CHECK(ts.last_dispatch_agent_ids[0] == "agent-q");
-    CHECK(ts.last_dispatch_params.at("whitelist_ips") == "10.0.0.1");
+    REQUIRE(ts.last_dispatch_params.size() == 1);
+    CHECK(ts.last_dispatch_params.at("exceptions") == "10.0.0.1/out,10.0.0.1/in");
     // governance UP-9: the isolation dispatch threads a set CONFINED to the
     // single scope-gate-checked target, never an unfiltered VisibleSet.
     REQUIRE(ts.last_dispatch_exec_visible.has_value());
@@ -36168,7 +36170,7 @@ TEST_CASE("MCP quarantine_device ticket round-trip records + dispatches isolatio
     CHECK(write_tool_structured(res2) == payload2);
     // #1398: the recall reached dispatch only after C8 consumed a real
     // ticket for this exact request — the caller must carry that
-    // provenance, since quarantine.quarantine's compiled dispatch-chokepoint
+    // provenance, since firewall.quarantine's compiled dispatch-chokepoint
     // gate (AdminOrApproval) checks it independently of MCP's own tier gate.
     CHECK(captured_provenance == yuzu::server::ApprovalProvenance::Ticket);
 }
@@ -36525,7 +36527,7 @@ TEST_CASE("MCP #3893: quarantine_device Forbidden denial at the MAIN-HANDLER sit
           1.0);
 }
 
-TEST_CASE("MCP #3893 (Gate 6 UP-5 parity): a Forbidden quarantine.quarantine pair is denied AT "
+TEST_CASE("MCP #3893 (Gate 6 UP-5 parity): a Forbidden firewall.quarantine pair is denied AT "
           "C8 PRE-MINT — no ticket minted, dispatch_fn NOT invoked",
           "[mcp][pg][integration][quarantine][approval][3893]") {
     yuzu::test::ApprovalManagerPg appr_bundle;
@@ -36549,7 +36551,7 @@ TEST_CASE("MCP #3893 (Gate 6 UP-5 parity): a Forbidden quarantine.quarantine pai
         return {.sent = 1, .command_id = "cmd"};
     };
     // supervised: requires_approval("supervised", "Security", "Execute") is
-    // unconditionally true (mcp_policy.hpp) — quarantine.quarantine is live
+    // unconditionally true (mcp_policy.hpp) — firewall.quarantine is live
     // device isolation, "as destructive as it gets".
     ts.start_with_dispatch(dispatch, "supervised");
 
@@ -36750,8 +36752,10 @@ TEST_CASE("MCP quarantine_device classifies store failure vs business error "
         // call's own unpersisted one ("10.0.0.42") - dispatching the
         // request's value would silently rewrite the device's firewall
         // allow-list with no store update and no audit trail.
-        CHECK(ts.last_dispatch_params.at("whitelist_ips") == "10.0.0.9");
-        CHECK(payload["quarantine_record"]["whitelist"] == "10.0.0.9");
+        CHECK(ts.last_dispatch_plugin == "firewall");
+        CHECK(ts.last_dispatch_action == "quarantine");
+        CHECK(ts.last_dispatch_params.at("exceptions") == "10.0.0.9/out,10.0.0.9/in");
+            CHECK(payload["quarantine_record"]["whitelist"] == "10.0.0.9");
         CHECK(payload["whitelist_request_ignored"] == true);
         REQUIRE_FALSE(ts.audit_details.empty());
         CHECK(ts.audit_details.back().find("record_pre_existing=1") != std::string::npos);
@@ -36791,6 +36795,64 @@ TEST_CASE("MCP quarantine_device classifies store failure vs business error "
         CHECK(dispatch_calls == 0);
         CHECK(ts.last_dispatch_plugin.empty());
     }
+
+    SECTION("a releasing record answers the release-in-progress error and dispatches nothing (no retry hint)") {
+        REQUIRE(quar.quarantine_device("agent-rel", "seed", "pre-seeded", "10.0.0.9").has_value());
+        REQUIRE(quar.request_release("agent-rel").has_value());
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":269,"params":{"name":"quarantine_device","arguments":{"agent_id":"agent-rel","reason":"again"}}})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(body["error"]["message"] == "a release is in progress for this device");
+        // not a transient fault: no retry_after_ms
+        CHECK((!body["error"].contains("data") || body["error"]["data"]["retry_after_ms"].is_null()));
+        CHECK(dispatch_calls == 0);
+        CHECK(ts.last_dispatch_plugin.empty());
+        REQUIRE_FALSE(ts.audit_details.empty());
+        CHECK(ts.audit_details.back().find("agent_id=agent-rel") != std::string::npos);
+        CHECK(ts.audit_details.back().find("release in progress") != std::string::npos);
+    }
+
+    SECTION("a whitelist the mapper refuses is rejected before any write or dispatch") {
+        for (const char* wl : {"10.0.0.5:443", "010.0.0.1", "::ffff:1.2.3.4", "1.2.3"}) {
+            CAPTURE(wl);
+            auto res = ts.call(
+                std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":270,"params":{"name":"quarantine_device","arguments":{"agent_id":"agent-badwl","reason":"x","whitelist":")") +
+                wl + R"("}}})");
+            REQUIRE(res);
+            auto body = nlohmann::json::parse(res->body);
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        }
+        auto st = quar.get_status("agent-badwl");
+        REQUIRE(st.has_value());
+        CHECK_FALSE(st->has_value()); // never written
+        CHECK(dispatch_calls == 0);
+    }
+}
+
+TEST_CASE("MCP quarantine_device description and output schema name the firewall actions",
+          "[mcp][integration][quarantine]") {
+    McpTestServer ts;
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":251})");
+    auto tools = nlohmann::json::parse(res->body)["result"]["tools"];
+    const nlohmann::json* tool = nullptr;
+    for (const auto& t : tools)
+        if (t["name"] == "quarantine_device")
+            tool = &t;
+    REQUIRE(tool != nullptr);
+    const std::string desc = (*tool)["description"].get<std::string>();
+    CHECK(desc.find("firewall.quarantine") != std::string::npos);
+    CHECK(desc.find("firewall.quarantine_status") != std::string::npos);
+    CHECK(desc.find("status|active") != std::string::npos);
+    CHECK(desc.find("releasing") != std::string::npos);
+    CHECK(desc.find("quarantine-plugin") == std::string::npos);
+    CHECK(desc.find("state|active") == std::string::npos);
+    const std::string out = (*tool)["outputSchema"].dump();
+    CHECK(out.find("firewall.quarantine_status") != std::string::npos);
 }
 
 // ── M1 (PR #1796): reviewer == submitter surfaces through the MCP error path ─
