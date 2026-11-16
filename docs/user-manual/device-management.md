@@ -313,7 +313,7 @@ The Hardware CI record's own **Live** lens (`/hardware` → device → **Live** 
 | **Network adapters** — adapter name, MAC, link speed, status | `network_config/adapters` | `device.live.adapters` | all |
 | **Wi-Fi** — current association: SSID, signal, security, BSSID/channel | `wifi/connected` | `device.live.wifi` | all |
 
-The **Memory** and **Processors** cards read rows in which the plugin writes a pipe in a slot name or CPU model as `\|`; each shows it in its own cell. The **Disks** and **Drivers** rows are not escaped yet, so a pipe in a disk model or driver name still shifts that card's columns.
+The **Memory** and **Processors** cards read rows in which the plugin writes a pipe in a slot name or CPU model as `\|` (and a backslash as `/`); each shows it in its own cell. The other cards, including **Disks** and **Drivers**, still split on every pipe, so a pipe in a disk model or driver name shifts that card's columns (#7957).
 
 All ten are machine-health reads (hardware attributes, not per-user behavioral data) and require **`Execution:Execute`** plus `GuaranteedState:Read`, scoped to the device's management group — same gating as every other live card. **Drivers** is Windows- and Linux-only: the agent enumerates no equivalent driver registry on macOS. **Disk health (SMART)** and **Volumes** are Windows- and macOS-only: the `disk_actions` plugin's Linux leg does not back either action. The remaining six (Disks, Memory, Processors, Battery, Thermal, Network adapters, Wi-Fi) report on all three platforms.
 
