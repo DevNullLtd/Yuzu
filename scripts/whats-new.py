@@ -9,7 +9,14 @@ Prints, for the range OLD..HEAD of the current checkout:
   2. surfaces touched that may need a rebuild or redeploy;
   3. dependency bumps: commits titled `build(deps):` / `chore(deps):` (Dependabot's
      title convention), which normally add no fragment and touch none of the files in 1;
-  4. the changelog.d/ fragments added in the range, grouped by section.
+  4. the changelog.d/ fragments added in the range, grouped by section. The header counts the entries
+     that start `**Breaking`; the heading counts those a release in the range already moved into
+     CHANGELOG.md, and each of those ends `[released X]` (the version section its line is under at HEAD)
+     or `[released]` (that version cannot be told, say because the release notes were reworded).
+     An entry with no marker was not moved by a release in the range.
+
+`--versions` prints the header, 1, 2 and the Docker image bumps, and still prints a `!` line for any
+fragment it could not read.
 
 Unreleased changes are recorded as fragments (changelog.d/README.md) and only
 assembled into CHANGELOG.md at release, so this is the way to read them
@@ -19,6 +26,7 @@ collated before a release.
   python3 scripts/whats-new.py --since v0.15.0 # since a tag, branch or commit
   python3 scripts/whats-new.py --since "2 weeks ago"   # ISO date or "N <unit> ago"
   python3 scripts/whats-new.py --full          # whole bullets; every non-image dep bump
+  python3 scripts/whats-new.py --versions      # only version bumps, rebuild notes and Docker image bumps
 
 "Your last pull" is read from the reflog of the branch you are on: the newest `pull`
 entry that names no source or names this branch's upstream, or a `merge <upstream>`
@@ -34,7 +42,7 @@ fresh clone has none, so pass --since.
 Read-only: it runs `git` queries and changes no ref, index or file (in a partial clone, git itself may
 fetch objects the range needs). All repository-sourced text is printed with control characters
 (other than newline and tab) and invisible format characters (zero-width joiners, variation
-selectors, bidi marks) replaced by `?`, so an emoji sequence can show one. Stdlib only.
+selectors, bidi marks) replaced by `?`, so an emoji sequence can show one. Stdlib only, Python 3.9 or later.
 """
 
 from __future__ import annotations
@@ -426,10 +434,13 @@ def plugin_abi(repo: Repo, ref: str) -> dict[str, str]:
     return {f"plugin ABI ({n})": v for n, v in re.findall(r"#define\s+(YUZU_PLUGIN_ABI_VERSION(?:_MIN)?)\s+(\d+)", text)}
 
 
+RELEASED_KEY = "latest released CHANGELOG section"
+
+
 def released_version(repo: Repo, ref: str) -> dict[str, str]:
     text = repo.show(ref, "CHANGELOG.md") or ""
     m = re.search(r"^## \[(\d[^\]\n]*)\]", text, re.M)
-    return {"latest released CHANGELOG section": m.group(1)} if m else {}
+    return {RELEASED_KEY: m.group(1)} if m else {}
 
 
 def _vcpkg_deps(deps: object, where: str, out: dict[str, str]) -> None:
@@ -503,13 +514,15 @@ def version_changes(repo: Repo, old: str, new: str) -> list[str]:
             b, a = before.get(key), after.get(key)
             if b == a:
                 continue
+            # A version heading is repository text of any length: compared whole, cut only for display.
+            show = cut_version if key == RELEASED_KEY else one
             key = one(key)
             if b is None:
-                lines.append(f"  + {key}: {one(a)}  (new)")
+                lines.append(f"  + {key}: {show(a)}  (new)")
             elif a is None:
-                lines.append(f"  - {key}: {one(b)}  (removed)")
+                lines.append(f"  - {key}: {show(b)}  (removed)")
             else:
-                lines.append(f"  ~ {key}: {one(b)} -> {one(a)}")
+                lines.append(f"  ~ {key}: {show(b)} -> {show(a)}")
     return lines
 
 
@@ -666,13 +679,41 @@ def unrecognised_names(repo: Repo, old: str, new: str) -> list[str]:
 
 
 class Fragments(dict):
-    """{key: body}; `promoted` holds the keys of entries a release moved into CHANGELOG.md."""
+    """{key: body}; `promoted` holds the keys of entries a release moved into CHANGELOG.md, and `released` maps
+    each to {first line of a bullet the release carried: the version section it sits under at the end of the
+    range ("" when that is not findable)}. A bullet the release editor dropped, or reworded in the release
+    commit itself, is not in it (the two look alike)."""
 
     def __init__(self) -> None:
         super().__init__()
         self.promoted: set[str] = set()
+        self.released: dict[str, dict[str, str]] = {}
         # Fragments a merge-commit release removed whose text matched no line the range added to CHANGELOG.md.
         self.unmatched: list[str] = []
+
+
+def release_sections(changelog: str | None) -> dict[str, str | None]:
+    """{line: version} for the lines of a CHANGELOG.md, the version being that of the `## [X]` heading above it.
+
+    None when the line is only under `[Unreleased]`, where nothing has been released. "" when the version cannot
+    be told: the line is before any heading, under a column-0 `#` or `##` heading that is not `## [X]`, or under
+    more than one version (a generic bullet repeated across releases). Headings are read the way
+    scripts/assemble-changelog.py reads them, so a sample heading inside a code fence counts as a heading."""
+    sections: dict[str, str | None] = {}
+    version: str | None = ""
+    for line in lines_of((changelog or "").removeprefix("\ufeff")):
+        if re.match(r"#{1,2}(?:[ \t\r]|$)", line):
+            m = re.match(r"## \[([^\]\n]*)\]", line)
+            name = m.group(1).strip() if m else ""
+            version = None if name.lower() == "unreleased" else name
+            continue
+        if line.strip():
+            key = line.rstrip()
+            if key not in sections:
+                sections[key] = version
+            elif sections[key] != version:
+                sections[key] = ""
+    return sections
 
 
 def added_fragments(repo: Repo, old: str, new: str) -> dict[str, str]:
@@ -812,6 +853,7 @@ def added_fragments(repo: Repo, old: str, new: str) -> dict[str, str]:
         first = bullets(body or "")[:1]
         return first[0].split("\n")[0].rstrip() if first else ""
 
+    sections = release_sections(repo.show(new, "CHANGELOG.md"))
     refs = {p: r for p, _ in specs if (r := reference(p)) is not None}
     ref_bodies = repo.blobs([f"{old}:{r}" for r in set(refs.values())])
     for (path, sha) in specs:
@@ -827,13 +869,24 @@ def added_fragments(repo: Repo, old: str, new: str) -> dict[str, str]:
             key = path if path not in found else f"{path}#{sha[:10]}"
             found[key] = body
             found.promoted.add(key)
+            # Per bullet: one the release editor dropped was never added to CHANGELOG.md. Under [Unreleased]
+            # nothing is released; a line the changelog no longer carries (reworded after) is still known to
+            # have been released, just not in which version.
+            for item in bullets(body):
+                bl = item.split("\n")[0].rstrip()
+                if bl in changelog_added and sections.get(bl, "") is not None:
+                    found.released.setdefault(key, {})[bl] = sections.get(bl) or ""
         elif orphans.get(path) == sha:
             found.unmatched.append(path)
     return found
 
 
-def render_fragments(frags: dict[str, str], full: bool) -> tuple[list[str], int, list[str]]:
-    """(lines, bullet count, names of fragments that yielded no '- ' bullet)."""
+def render_fragments(frags: dict[str, str], full: bool) -> tuple[list[str], int, list[str], int, int]:
+    """(lines, bullet count, names of fragments that yielded no '- ' bullet, the number of bullets that
+    start `**Breaking`, the number of bullets a release in the range already moved into CHANGELOG.md).
+    BRIEF_MAX cuts the bullet's own text; a `[released X]` tag follows the cut."""
+    released = getattr(frags, "released", {})
+    breaking = already = 0
     by_section: dict[str, list[str]] = {s: [] for s in SECTION_ORDER}
     seen: set[tuple[str, str]] = set()
     empty: list[str] = []
@@ -850,14 +903,21 @@ def render_fragments(frags: dict[str, str], full: bool) -> tuple[list[str], int,
             seen.add((section, b))
             total += 1
             first = b.split("\n")[0]
-            if full or section in NEVER_TRUNCATE or first.lower().startswith("- **breaking"):
+            is_breaking = first.lower().startswith("- **breaking")
+            breaking += is_breaking
+            tag = ""
+            marks = released.get(path, {})
+            if first.rstrip() in marks:
+                already += 1
+                tag = tag_for(marks[first.rstrip()])
+            if full or section in NEVER_TRUNCATE or is_breaking:
                 # Continuation lines are indented so that none starts at column 0, where text taken
                 # from a fragment could pass for one of this report's own headings.
-                shown = "\n".join([first, *(("    " + rest) if rest.strip() else "" for rest in b.split("\n")[1:])])
+                shown = "\n".join([first + tag, *(("    " + rest) if rest.strip() else "" for rest in b.split("\n")[1:])])
             elif len(first) > BRIEF_MAX:
-                shown = first[: BRIEF_MAX - 3].rstrip() + "..."
+                shown = first[: BRIEF_MAX - 3].rstrip() + "..." + tag
             else:
-                shown = first
+                shown = first + tag
             by_section[section].append(shown)
     lines: list[str] = []
     for section in SECTION_ORDER:
@@ -865,7 +925,22 @@ def render_fragments(frags: dict[str, str], full: bool) -> tuple[list[str], int,
             lines.append(f"{section.capitalize()} ({len(by_section[section])})")
             lines.extend(by_section[section])
             lines.append("")
-    return lines, total, empty
+    return lines, total, empty, breaking, already
+
+
+TAG_VERSION_MAX = 40
+
+
+def cut_version(version: str) -> str:
+    """A version heading is repository text of any length; it is printed in the version bumps and once per
+    entry in a `[released X]` tag, so it is cut."""
+    v = one(version)
+    return v[:TAG_VERSION_MAX - 3] + "..." if len(v) > TAG_VERSION_MAX else v
+
+
+def tag_for(version: str) -> str:
+    """The `[released X]` suffix of an entry; empty when the version cannot be told."""
+    return f"  [released {cut_version(version)}]" if version else "  [released]"
 
 
 def name_list(names: list[str], limit: int = 20) -> str:
@@ -874,7 +949,7 @@ def name_list(names: list[str], limit: int = 20) -> str:
     return shown + (f", and {len(names) - limit} more" if len(names) > limit else "")
 
 
-def build_report(repo: Repo, since: str | None, full: bool) -> list[str]:
+def build_report(repo: Repo, since: str | None, full: bool, versions_only: bool = False) -> list[str]:
     head = repo.resolves("HEAD")
     if head is None:
         raise GitError("this repository has no commits")
@@ -889,6 +964,11 @@ def build_report(repo: Repo, since: str | None, full: bool) -> list[str]:
     ]
     if via is not None:
         out.append(f"Via  reflog entry: {via}")
+    frags = added_fragments(repo, old, head)
+    lines, total, empty, breaking, released_count = render_fragments(frags, full)
+    if breaking:
+        out.append(f"Breaking  {breaking} changelog {'entry' if breaking == 1 else 'entries'} marked **Breaking"
+                   + (" (run without --versions to read them)" if versions_only else " (listed below)"))
     out.append("")
 
     versions = version_changes(repo, old, head)
@@ -902,7 +982,45 @@ def build_report(repo: Repo, since: str | None, full: bool) -> list[str]:
         out.extend(f"  * {n}" for n in notes)
         out.append("")
 
+    odd = unrecognised_names(repo, old, head)
+    not_regular = sorted(set(repo.not_regular))
+    too_big = sorted(set(repo.too_big))
+    unmatched = sorted(set(getattr(frags, "unmatched", [])))
+    # Fragments that were not read or not listed. They are printed in every mode: the Breaking count in the
+    # header is only complete if none of them is missing, and --versions must not read as an all-clear.
+    notices: list[str] = []
+    if unmatched:
+        notices.append(f"! {plural(len(unmatched), 'fragment')} removed by a merge commit matched no line added to CHANGELOG.md "
+                       f"(withdrawn, or reworded in the merge), not listed: {name_list(unmatched)}; read CHANGELOG.md for the release text")
+    if empty:
+        notices.append(f"! {plural(len(empty), 'fragment')} with no '- ' bullet, not summarised: {name_list(empty)}")
+    if odd:
+        notices.append(f"! {plural(len(odd), 'file')} added under {FRAGMENT_DIR}/ not named like fragments (or not directly in it), "
+                       f"not listed: {name_list(odd)}")
+    if not_regular:
+        notices.append(f"! {plural(len(not_regular), 'path')} named like fragments but not regular files (a submodule), "
+                       f"not listed: {name_list(not_regular)}")
+    if too_big:
+        notices.append(f"! {plural(len(too_big), 'fragment file')} over {MAX_FRAGMENT_BYTES // 1024} KiB, not read: {name_list(too_big)}")
+
     images, other = dependency_bumps(repo, old, head)
+    if versions_only:
+        if images:
+            out.append(f"Docker image bumps ({len(images)})")
+            out.extend(f"  {s}" for s in images)
+            out.append("")
+        if full and other:
+            out.append(f"Other dependency bumps ({len(other)})")
+            out.extend(f"  {s}" for s in other)
+            out.append("")
+        elif other:
+            out.append(f"+ {plural(len(other), 'other dependency bump')} (workflows, pip, npm); --full lists them")
+        if notices:
+            if out and out[-1]:
+                out.append("")
+            out.append("Fragments the report could not use, which the Breaking count leaves out (run without --versions for the full report):")
+            out.extend(notices)
+        return out
     if images or other:
         out.append(f"Dependency bumps (build(deps)/chore(deps) commits): {plural(len(images), 'Docker image')}, {len(other)} other")
         out.extend(f"  {s}" for s in images)
@@ -912,14 +1030,13 @@ def build_report(repo: Repo, since: str | None, full: bool) -> list[str]:
             out.append(f"  + {plural(len(other), 'other bump')} (workflows, pip, npm); --full lists them")
         out.append("")
 
-    frags = added_fragments(repo, old, head)
-    lines, total, empty = render_fragments(frags, full)
-    odd = unrecognised_names(repo, old, head)
-    not_regular = sorted(set(repo.not_regular))
-    too_big = sorted(set(repo.too_big))
-    unmatched = sorted(set(getattr(frags, "unmatched", [])))
     if lines:
-        out.append(f"Changelog entries added ({total})")
+        counts = [str(total)]
+        if released_count:
+            counts.append(f"{released_count} already released")
+        if breaking:
+            counts.append(f"{breaking} breaking")
+        out.append(f"Changelog entries added ({', '.join(counts)})")
         out.append("")
         out.extend(lines)
         if getattr(frags, "promoted", None):
@@ -930,27 +1047,17 @@ def build_report(repo: Repo, since: str | None, full: bool) -> list[str]:
     else:
         out.append("No changelog fragments were added in this range (refactors, CI and test-only changes may skip them;")
         out.append(f"`git log --first-parent --oneline {old[:10]}..HEAD` lists every merged PR).")
-    if unmatched:
-        out.append(f"! {plural(len(unmatched), 'fragment')} removed by a merge commit matched no line added to CHANGELOG.md "
-                   f"(withdrawn, or reworded in the merge), not listed: {name_list(unmatched)}; read CHANGELOG.md for the release text")
-    if empty:
-        out.append(f"! {plural(len(empty), 'fragment')} with no '- ' bullet, not summarised: {name_list(empty)}")
-    if odd:
-        out.append(f"! {plural(len(odd), 'file')} added under {FRAGMENT_DIR}/ not named like fragments (or not directly in it), "
-                   f"not listed: {name_list(odd)}")
-    if not_regular:
-        out.append(f"! {plural(len(not_regular), 'path')} named like fragments but not regular files (a submodule), "
-                   f"not listed: {name_list(not_regular)}")
-    if too_big:
-        out.append(f"! {plural(len(too_big), 'fragment file')} over {MAX_FRAGMENT_BYTES // 1024} KiB, not read: {name_list(too_big)}")
+    out.extend(notices)
     return out
 
 
 def main(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(description="Summarise what changed in this checkout since the last pull.")
+    ap = argparse.ArgumentParser(description="Summarise what changed in this checkout since the last pull.", allow_abbrev=False)
     ap.add_argument("--since", help="ref, tag or commit, or a date (YYYY-MM-DD[ HH:MM[:SS]], yesterday, \"N days ago\"); default: your last pull")
     ap.add_argument("--full", action="store_true",
                     help="print whole bullets (not first lines) and list every non-image dependency bump")
+    ap.add_argument("--versions", action="store_true",
+                    help="only the version bumps, rebuild/redeploy notes and Docker image bumps (the header still counts **Breaking entries, and a `!` line names any fragment that could not be read or listed)")
     ap.add_argument("--repo", type=Path, default=None, help=argparse.SUPPRESS)
     args = ap.parse_args(argv)
 
@@ -965,7 +1072,7 @@ def main(argv: list[str]) -> int:
             raise GitError(proc.stderr.decode("utf-8", "replace").strip() or "git rev-parse --show-toplevel failed")
         # Exactly the newline git adds, no more: a directory name may end in a space, and may not be UTF-8.
         root = os.fsdecode(proc.stdout.removesuffix(b"\n"))
-        report = build_report(Repo(Path(root)), args.since, args.full)
+        report = build_report(Repo(Path(root)), args.since, args.full, args.versions)
     except GitError as exc:
         print(f"whats-new: {clean(str(exc))}", file=sys.stderr)
         return 2

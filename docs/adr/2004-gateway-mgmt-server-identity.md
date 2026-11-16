@@ -1,9 +1,18 @@
-# ADR-2004 — Gateway management plane: authorize the server by a CA-issued identity, not an SPKI pin
-
 ---
 status: proposed
 owner: Fraser Jarvis (@fjarvis)
 ---
+
+# ADR-2004 — Gateway management plane: authorize the server by a CA-issued identity, not an SPKI pin
+
+> **Status note (2026-11-14, against dev @ 2c49b4ea0).** The decision is implemented and shipped
+> (`yuzu_gw_mgmt_identity.erl`, `yuzu_gw_mgmt_pins.erl`, `yuzu_gw_mgmt_crl.erl`,
+> `yuzu_gw_mgmt_crl_source.erl`; `gateway/config/sys.config.prod` sets
+> `{mgmt_peer_auth_mode, identity}`), but the status stays `proposed` by this ADR's own rule
+> ("Risk acceptance" below): acceptance awaits the approving non-author's recorded risk
+> acceptance, as a status flip in the approving commit or a `governance.d` row naming the
+> approver, the date and the review-by date. No such record exists on dev; the
+> `governance.d/6016-gateway-mgmt-identity-default.*.jsonl` ledger lists it as unrecorded.
 
 **Authors:** Fraser Jarvis (@fjarvis)
 **Date:** 2026-10-18

@@ -79,6 +79,24 @@ using namespace std::chrono_literals;
 
 namespace {
 
+// A stored proof that agrees with `session`'s cached anchor: bound to generation 1 (what the fake
+// MFA status below reports) and aged the same on a synthetic database clock. A session with no
+// cached proof has a stored row with none either.
+auth::DurableMfaProof durable_matching(const auth::Session& s) {
+    constexpr std::int64_t kDbNowMs = 4'000'000'000'000;
+    auth::DurableMfaProof d;
+    d.source = auth::DurableMfaProof::Source::kRow;
+    d.db_now_ms = kDbNowMs;
+    if (s.steady_mfa_verified.time_since_epoch().count() != 0) {
+        const auto age_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - s.steady_mfa_verified)
+                                .count();
+        d.mfa_verified_ms = kDbNowMs - age_ms;
+        d.mfa_factor_gen = 1;
+    }
+    return d;
+}
+
 // A kRequired row whose registered pattern is a regex with a capture group.
 constexpr std::string_view kRotatePattern = R"(/api/v1/tokens/([^/]+)/rotate)";
 constexpr std::string_view kRotateLabel = "POST /api/v1/tokens/{id}/rotate";
@@ -230,7 +248,11 @@ struct WiringServer {
     MfaStatusFn mfa_status = [](const std::string&) -> std::expected<AuthDB::MfaStatus, AuthDBError> {
         AuthDB::MfaStatus st;
         st.enrolled = true;
+        st.factor_gen = 1;
         return st;
+    };
+    DurableProofFn durable = [](const httplib::Request&, const auth::Session& s) {
+        return durable_matching(s);
     };
     StepUpSessionFn resolver = [this](const httplib::Request& req) -> std::optional<auth::Session> {
         const int n = resolutions.fetch_add(1);
@@ -268,6 +290,7 @@ struct WiringServer {
                 const StepUpChokepointDeps deps{.resolve_session = &resolver,
                                                 .auth_db = nullptr,
                                                 .mfa_status = &mfa_status,
+                                                .durable_proof = &durable,
                                                 .audit_fn = &audit,
                                                 .metrics = &metrics,
                                                 .window_secs = 300,
@@ -292,7 +315,7 @@ struct WiringServer {
                          handler_consumed_pass.store(
                              handler_session &&
                              detail::consume_step_up_pass(req, *handler_session,
-                                                          std::string(kRotateLabel)));
+                                                          std::string(kRotateLabel), nullptr));
                      }
                      res.status = 200;
                      res.set_content("{\"ok\":true}", "application/json");
@@ -319,15 +342,19 @@ struct WiringServer {
                     return;
                 }
             }
-            const bool consumed =
-                detail::consume_step_up_pass(req, *handler_session, std::string(kRaiseLabel));
+            const bool consumed = detail::consume_step_up_pass(req, *handler_session,
+                                                               std::string(kRaiseLabel), nullptr);
             raise_consumed_pass.store(consumed);
             if (resolve_after_consume.load() && !resolver(req)) {
                 res.status = 401;
                 return;
             }
             if (!consumed) {
-                const auto verdict = decide_step_up(*handler_session, mfa_status, 300, "optional");
+                const DurableProofReadFn read = [&] {
+                    return durable_matching(*handler_session);
+                };
+                const auto verdict = decide_step_up(*handler_session, mfa_status, read, 300,
+                                                    "optional", StepUpClass::kRequired);
                 if (!verdict.passed()) {
                     emit_step_up_refusal_effects(req, verdict, audit, std::string(kRaiseLabel), {},
                                                  &metrics);
@@ -350,7 +377,7 @@ struct WiringServer {
                      unclassified_consumed_rotate_pass.store(
                          handler_session &&
                          detail::consume_step_up_pass(req, *handler_session,
-                                                      std::string(kRotateLabel)));
+                                                      std::string(kRotateLabel), nullptr));
                      res.status = 200;
                      res.set_content("{\"ok\":true}", "application/json");
                  });
@@ -532,6 +559,34 @@ TEST_CASE("wiring: a route with no step-up row reaches the handler whatever the 
     CHECK(s.gate_count("pass", "local", "rest") == 0);
 }
 
+// #2146: the JSON value budget is applied by the SAME production stage over a real socket: a body
+// within the 4 MiB size cap but over the catch-all's 100000 values is refused 413 before the handler,
+// counted under the class and the new reason, and a body within budget reaches the handler.
+TEST_CASE("wiring: a body over its class's JSON value budget is refused 413 before the handler",
+          "[stepup][wiring][json_budget]") {
+    WiringServer s;
+    const auto flat = [](std::size_t values) {
+        std::string b = "[1";
+        for (std::size_t i = 1; i < values; ++i)
+            b += ",1";
+        return b + "]";
+    };
+    auto refused = s.post(std::string(kUnclassifiedPath), flat(100'001));
+    REQUIRE(refused);
+    CHECK(refused->status == 413);
+    CHECK(refused->body.find("JSON values") != std::string::npos);
+    CHECK(s.unclassified_handler_calls.load() == 0);
+    CHECK(s.metrics
+              .counter("yuzu_body_cap_rejected_total",
+                       {{"path_class", "default"}, {"reason", "over_json_values_post_read"}})
+              .value() == 1);
+
+    auto ok = s.post(std::string(kUnclassifiedPath), flat(1'000));
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    CHECK(s.unclassified_handler_calls.load() == 1);
+}
+
 TEST_CASE("wiring: a bearer principal passes a kRequired route and an unresolved caller is a 401",
           "[stepup][wiring]") {
     WiringServer s;
@@ -598,7 +653,11 @@ struct ApprovalWiringServer {
     MfaStatusFn mfa_status = [](const std::string&) -> std::expected<AuthDB::MfaStatus, AuthDBError> {
         AuthDB::MfaStatus st;
         st.enrolled = true;
+        st.factor_gen = 1;
         return st;
+    };
+    DurableProofFn durable = [](const httplib::Request&, const auth::Session& s) {
+        return durable_matching(s);
     };
     std::optional<auth::Session> resolve_next() {
         const int n = resolutions.fetch_add(1);
@@ -649,6 +708,7 @@ struct ApprovalWiringServer {
                 const StepUpChokepointDeps deps{.resolve_session = &resolver,
                                                 .auth_db = nullptr,
                                                 .mfa_status = &mfa_status,
+                                                .durable_proof = &durable,
                                                 .audit_fn = &audit,
                                                 .metrics = &metrics,
                                                 .window_secs = window_secs,
@@ -686,7 +746,8 @@ struct ApprovalWiringServer {
                 handler_step_up_labels.push_back(label);
             }
             return detail::run_in_handler_step_up(req, res, sess, label, /*auth_db=*/nullptr,
-                                                  window_secs, audit, "optional", &metrics);
+                                                  window_secs, audit, "optional", &metrics,
+                                                  &durable, /*admitted=*/nullptr);
         };
         // The approver gate (#6079) runs after the generic step-up. This harness exercises the
         // central check and the pass; the approver gate has its own tests, so it passes here.
@@ -1355,7 +1416,7 @@ struct RealResolveServer {
                 res.status = 401;
                 return;
             }
-            (void)detail::consume_step_up_pass(req, *first, std::string(kRaiseLabel));
+            (void)detail::consume_step_up_pass(req, *first, std::string(kRaiseLabel), nullptr);
             raise_mutations.fetch_add(1);
             res.status = 200;
             res.set_content("{\"ok\":true}", "application/json");
@@ -1469,7 +1530,7 @@ struct CookieResolveServer {
                 res.status = 401;
                 return;
             }
-            (void)detail::consume_step_up_pass(req, *first, std::string(kRaiseLabel));
+            (void)detail::consume_step_up_pass(req, *first, std::string(kRaiseLabel), nullptr);
             raise_mutations.fetch_add(1);
             res.status = 200;
             res.set_content("{\"ok\":true}", "application/json");
@@ -1672,6 +1733,55 @@ TEST_CASE("wiring: an over-cap body is refused 413 by the body cap, before the c
     // The control: the same session and route with a body inside the cap IS the chokepoint's 401,
     // so the 413 above is the cap's doing and not an artefact of the route or the session.
     auto within = s.post(path, std::string(cap, 'x'));
+    REQUIRE(within);
+    CHECK(within->status == 401);
+    CHECK(s.audit_rows().size() == 1);
+}
+
+// #2146 meets #6079: the stage order is size cap, then JSON value budget, then the chokepoint. The
+// budget case above runs on a route with NO step-up row, and the policy tests call the stage with
+// no matched route, so neither shows the budget refusing BEFORE a real step-up evaluation. A
+// kRequired route with a STALE proof is 401 with an audit row if the chokepoint ran, so only the
+// order "budget, then chokepoint" yields the 413 below, with no handler call, no audit row and no
+// gate outcome.
+TEST_CASE("wiring: a body over the JSON value budget is refused 413 before the chokepoint on a "
+          "kRequired route",
+          "[stepup][wiring][json_budget]") {
+    const auto* row = step_up_policy_for("POST", kRotatePattern);
+    REQUIRE(row != nullptr);
+    REQUIRE(row->cls == StepUpClass::kRequired);
+
+    WiringServer s;
+    s.set_session(make_session("alice", "local", Role::admin, 1h));
+
+    const std::string path = "/api/v1/tokens/abc123/rotate";
+    const auto match = resolve_body_cap("POST", path);
+    REQUIRE(match.max_json_values != kJsonValuesOff);
+    const auto flat = [](std::size_t values) {
+        std::string b = "[1";
+        for (std::size_t i = 1; i < values; ++i)
+            b += ",1";
+        return b + "]";
+    };
+    // Inside the size cap (so only the budget can refuse it) and small enough to send over loopback.
+    REQUIRE(2 * (match.max_json_values + 1) + 2 < match.max_body_bytes);
+    REQUIRE(match.max_json_values <= 1'000'000);
+
+    auto over = s.post(path, flat(match.max_json_values + 1));
+    REQUIRE(over);
+    CHECK(over->status == 413);
+    CHECK(s.rotate_handler_calls.load() == 0);
+    CHECK(s.audit_rows().empty());
+    CHECK(s.gate_count("refused", "local", "rest") == 0);
+    CHECK(s.metrics
+              .counter("yuzu_body_cap_rejected_total",
+                       {{"path_class", std::string(match.path_class)},
+                        {"reason", "over_json_values_post_read"}})
+              .value() == 1);
+
+    // The control: the same session and route with a body inside the budget IS the chokepoint's
+    // 401, so the 413 above is the budget's doing and not an artefact of the route or the session.
+    auto within = s.post(path, flat(1'000));
     REQUIRE(within);
     CHECK(within->status == 401);
     CHECK(s.audit_rows().size() == 1);
@@ -2201,8 +2311,10 @@ TEST_CASE("wiring: server.cpp's in-handler StepUpFn and the post-read deps name 
           "sources",
           "[stepup][wiring][lexical]") {
     const std::string src = read_server_cpp();
-    // Each needle is a single line, so a CRLF checkout cannot split it.
-    constexpr std::string_view kCall = "detail::run_in_handler_step_up(req, res, session, action_label,";
+    // Each needle is a single line, so a CRLF checkout cannot split it. The `return ` prefix
+    // names the `step_up_fn` call: the Settings factor-credential gate wired further down calls
+    // the same function behind an `if`, with its own label parameter.
+    constexpr std::string_view kCall = "return detail::run_in_handler_step_up(";
     REQUIRE(count_of(src, kCall) == 1);
     const auto call = src.find(kCall);
 
@@ -2227,6 +2339,19 @@ TEST_CASE("wiring: server.cpp's in-handler StepUpFn and the post-read deps name 
     CHECK(db < window);
     CHECK(window < enforcement);
     CHECK(enforcement < metrics);
+    // ...then the stored-proof read and no out-parameter (the 39 kRequired rows ignore the
+    // admission; the two factor-credential rows get theirs from the pass the chokepoint armed).
+    const auto durable = args.find("&durable,");
+    REQUIRE(durable != std::string::npos);
+    CHECK(metrics < durable);
+    CHECK(args.find("/*admitted=*/nullptr", durable) != std::string::npos);
+
+    // The stored proof is read through ONE extraction site, AuthRoutes::durable_mfa_proof_for:
+    // the chokepoint's provider, the in-handler fallback's, the Settings factor-credential gate's
+    // and the approver gate's local branch. The only direct read left is the approver gate's SSO
+    // branch (the generic gates never read a stored proof for an SSO session).
+    CHECK(count_of(src, "auth_routes_->durable_mfa_proof_for(") == 4);
+    CHECK(count_of(src, "auth_mgr_.read_durable_mfa_proof(") == 1);
 
     // The post-read deps block, built per request inside the installed stage.
     const auto pre_request = src.find("PostReadStageRegistry::instance().install(");
@@ -2238,8 +2363,9 @@ TEST_CASE("wiring: server.cpp's in-handler StepUpFn and the post-read deps name 
     const std::string block = src.substr(deps, stage - deps);
     for (const std::string_view needle :
          {".resolve_session = &step_up_resolve,", ".auth_db = auth_mgr_.auth_db_ptr(),",
-          ".audit_fn = &step_up_audit,", ".metrics = &metrics_,",
-          ".window_secs = cfg_.mfa_step_up_window_secs,", ".mfa_enforcement = cfg_.mfa_enforcement"}) {
+          ".durable_proof = &step_up_durable,", ".audit_fn = &step_up_audit,",
+          ".metrics = &metrics_,", ".window_secs = cfg_.mfa_step_up_window_secs,",
+          ".mfa_enforcement = cfg_.mfa_enforcement"}) {
         INFO("missing from the deps block: " << needle);
         CHECK(block.find(needle) != std::string::npos);
     }

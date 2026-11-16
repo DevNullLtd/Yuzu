@@ -7,7 +7,8 @@
 /// shared model (software_catalogue_model.hpp) — the same functions the REST and MCP twins
 /// call, so the three surfaces cannot disagree. The fleet-wide catalogue aggregate cannot be
 /// narrowed to a management group, so it is refused (audited `denied`) to a confined caller;
-/// the host view and the devices table are admitted and scoped.
+/// the host view and the devices table are admitted and scoped. The Find software fragment runs
+/// the REST lookups' own model (software_list_model.hpp).
 
 #include "inventory_routes.hpp"
 #include "model_param_helpers.hpp"
@@ -467,6 +468,266 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                                             (continuation ? " page=continuation" : ""));
         t.rows = std::move(rows);
         reply();
+    });
+
+    // -- FIND SOFTWARE (SAM-18): the /software panel's answer. It runs the REST lookups' own
+    // model call for call (rest_api_v1.cpp, `GET /api/v1/inventory/software[/components]`): the
+    // same parsers, version-range resolution, scoped page read and totals, so the card equals the
+    // REST `totals` and the rows are the REST rows. Gate order as the devices fragment: auth ->
+    // service-scope deny -> fleet-read gate -> parse -> reads -> audit -> render. A confined caller
+    // is ADMITTED (rows narrowed by the gate's scope) and gets no totals.
+    sink.Get("/fragments/inventory/software/find", [this](const httplib::Request& req,
+                                                           httplib::Response& res) {
+        namespace swl = software_list;
+        auto session = deps_.auth_fn(req, res);
+        if (!session)
+            return;
+        // `kind` is the chip: "app" or a component kind. An absent or blank one is "app".
+        std::string kind = req.has_param("kind") ? req.get_param_value("kind")
+                                                 : std::string(kSoftwareFindApp);
+        if (kind.empty())
+            kind = kSoftwareFindApp;
+        const bool kind_known = std::ranges::any_of(
+            kSoftwareFindKinds, [&](const SoftwareFindKind& k) { return k.token == kind; });
+        // The audit verb is the model's, as on the REST twins (the denied row included): a
+        // component search writes `inventory.components.view`, anything else (an application
+        // search, an unknown kind refused below) `inventory.software.query`.
+        const char* const kVerb = kind_known && kind != kSoftwareFindApp
+                                      ? "inventory.components.view"
+                                      : "inventory.software.query";
+        if (deny_service_scoped(*session, req, res, deps_.audit_fn, kVerb))
+            return;
+        auto gate = admit(deps_.fleet_read_fn, req, res);
+        if (!gate)
+            return;
+
+        SoftwareFindData d;
+        d.now_secs = now_secs();
+        d.confined = gate->scope.has_value();
+        auto reply = [&] { send_html(res, render_software_find(d)); };
+
+        // Only the panel's own inputs reach the parsers, and a blank input is not a parameter (an
+        // empty `version=` would be the exact empty-version bucket). `kind` is the chip, not the
+        // catalogue's app/pkg split, so it only reaches the components parser.
+        swc::Params p;
+        for (const auto& [k, v] : model_detail::to_params(req.params))
+            if (!v.empty() && (k == "name" || k == "version" || k == "version_min" ||
+                               k == "version_max" || k == "status" || k == "cursor"))
+                p.emplace(k, v);
+        // The echo of the first value of a key (the one the parsers read): a refusal answers
+        // inside the Load-more row, the retry banner re-asks the same lookup.
+        const auto first_or_empty = [&p](const char* k) {
+            const auto* v = model_detail::first_param(p, k);
+            return v ? *v : std::string{};
+        };
+        d.f.name = first_or_empty("name");
+        d.f.version = first_or_empty("version");
+        d.f.version_min = first_or_empty("version_min");
+        d.f.version_max = first_or_empty("version_max");
+        d.f.status = first_or_empty("status");
+        d.f.cursor = first_or_empty("cursor");
+        if (!kind_known) {
+            d.caveat = "Unknown kind."; // refused before any read
+            reply();
+            return;
+        }
+        d.f.kind = kind;
+        const bool comp = find_is_components(d.f);
+        if (const auto it = p.find("name"); it == p.end()) {
+            d.caveat = "A package name is required.";
+            reply();
+            return;
+        }
+        if (comp)
+            p.emplace("kind", d.f.kind);
+
+        const auto scope_push = swl::scope_ids(gate->scope);
+        // The version-range step both models share (REST has the same): the exact version set, or
+        // nullopt once the reply is written (retry banner on a degraded read, 200 + caveat when the
+        // range cannot be resolved).
+        auto resolve_range = [&](const auto& read_distinct, const auto& rq,
+                                 const std::string& target)
+            -> std::optional<std::vector<std::string>> {
+            const auto distinct = read_distinct();
+            if (!distinct) {
+                (void)detail::try_persist_audit(deps_.audit_fn, req, kVerb, "failure", "Inventory",
+                                                target, "version read degraded");
+                reply();
+                return std::nullopt;
+            }
+            auto set = swl::resolve_version_range(*distinct, *rq.range);
+            if (!set) {
+                d.caveat = set.error();
+                reply();
+                return std::nullopt;
+            }
+            return std::move(*set);
+        };
+        // The parsed request, the audit target and the page read differ per model; everything
+        // after the read is shared in `serve`.
+        auto serve = [&](const auto& read, const auto& query, const std::string& target,
+                         bool continuation, auto&& to_row, auto&& read_totals) {
+            if (!read) {
+                if (read.error()) { // 200 + caveat: htmx does not swap 4xx
+                    d.caveat = std::string(swc::cursor_error_message(*read.error()));
+                } else {
+                    (void)detail::try_persist_audit(deps_.audit_fn, req, kVerb, "failure", "Inventory",
+                                                    target, "store degraded");
+                }
+                reply(); // rows nullopt -> the retry banner, never an empty table
+                return;
+            }
+            const auto& page = *read;
+            swl::FactsReads fio;
+            fio.last_seen = deps_.last_synced_fn;
+            fio.hostnames = deps_.hostnames_fn;
+            const auto facts = swl::load_device_facts(fio, swl::page_agent_ids(page.rows));
+            if (!facts) {
+                (void)detail::try_persist_audit(deps_.audit_fn, req, kVerb, "failure", "Inventory",
+                                                target, "device facts degraded");
+                reply();
+                return;
+            }
+            // The count card is the first page's: Load more swaps rows only. The decision is the
+            // model's, the admission is the gate's (scope == nullopt is the unfiltered case).
+            if (!continuation) {
+                const auto decision = swl::totals_decision(!d.confined, query);
+                if (!decision.serve) {
+                    d.totals_omitted = std::string(decision.omitted);
+                } else {
+                    const auto& tr = deps_.totals_reads;
+                    const bool wired = tr.catalog_meta && tr.component_meta && tr.title_totals &&
+                                       tr.version_set_totals && tr.component_totals;
+                    const auto t = wired ? read_totals(tr, query) : swl::TotalsOutcome{};
+                    if (t.status == swl::TotalsStatus::kDegraded) {
+                        (void)detail::try_persist_audit(deps_.audit_fn, req, kVerb, "failure",
+                                                        "Inventory", target, "totals degraded");
+                        reply();
+                        return;
+                    }
+                    if (t.status == swl::TotalsStatus::kBuilding) {
+                        d.totals_omitted = std::string(swl::kOmittedBuilding);
+                    } else {
+                        d.totals = SoftwareFindTotals{t.totals.installs, t.totals.devices,
+                                                      t.totals.devices_unconfirmed, t.as_of};
+                    }
+                }
+            }
+            const auto os = deps_.host_os_fn ? deps_.host_os_fn()
+                                             : std::unordered_map<std::string, std::string>{};
+            std::vector<SoftwareFindRow> rows;
+            rows.reserve(page.rows.size());
+            for (const auto& r : page.rows) {
+                SoftwareFindRow o = to_row(r);
+                if (const auto h = facts->hostname.find(r.agent_id); h != facts->hostname.end())
+                    o.hostname = h->second;
+                if (const auto s = facts->last_seen.find(r.agent_id); s != facts->last_seen.end())
+                    o.last_synced = s->second;
+                if (const auto w = os.find(r.agent_id); w != os.end())
+                    o.os = w->second;
+                rows.push_back(std::move(o));
+            }
+            if (const auto denied = swc::denied_detail(page); !denied.empty())
+                (void)detail::try_persist_audit(deps_.audit_fn, req, kVerb, "denied", "Inventory",
+                                                target, denied);
+            (void)detail::try_persist_audit(deps_.audit_fn, req, kVerb, "success", "Inventory",
+                                            target,
+                                            "rows=" + std::to_string(rows.size()) +
+                                                (continuation ? " page=continuation" : ""));
+            d.shown_before = int_hint(req, "shown").value_or(0) + static_cast<std::int64_t>(rows.size());
+            d.next_cursor = page.next_cursor;
+            d.rows = std::move(rows);
+            reply();
+        };
+
+        if (!comp) {
+            auto parsed = swl::parse_list_params(p);
+            if (!parsed) {
+                d.caveat = parsed.error();
+                reply();
+                return;
+            }
+            auto rq = std::move(*parsed);
+            rq.base.query.limit = static_cast<int>(kSoftwareFindPageSize);
+            const std::string target = swl::audit_target(rq);
+            if (rq.has_range()) {
+                auto set = resolve_range(
+                    [&] {
+                        return deps_.install_versions_fn
+                                   ? deps_.install_versions_fn(rq.base.query.name, scope_push)
+                                   : std::optional<std::vector<std::string>>{};
+                    },
+                    rq, target);
+                if (!set)
+                    return;
+                rq.base.query.versions = std::move(*set);
+            }
+            const auto read = swl::read_list_page(
+                [&](const SoftwareFleetQuery& c) {
+                    return deps_.fleet_fn ? deps_.fleet_fn(c)
+                                          : std::optional<std::vector<SoftwareFleetRow>>{};
+                },
+                rq, gate->scope);
+            serve(
+                read, rq.base.query, target, !rq.base.cursor.empty(),
+                [](const SoftwareFleetRow& r) {
+                    SoftwareFindRow o;
+                    o.agent_id = r.agent_id;
+                    o.ecosystem = r.entry.ecosystem;
+                    o.name = r.entry.name;
+                    o.version = r.entry.version;
+                    o.path = r.entry.install_location;
+                    o.install_type = r.entry.install_type;
+                    o.status = std::string(swl::derive_status(r.facet_status, r.facet_enabled));
+                    o.last_confirmed_at = r.last_confirmed_at;
+                    return o;
+                },
+                &swl::read_application_totals);
+            return;
+        }
+
+        auto parsed = swl::parse_components_params(p);
+        if (!parsed) {
+            d.caveat = parsed.error();
+            reply();
+            return;
+        }
+        auto rq = std::move(*parsed);
+        rq.query.limit = static_cast<int>(kSoftwareFindPageSize);
+        const std::string target = swl::audit_target(rq);
+        if (rq.has_range()) {
+            auto set = resolve_range(
+                [&] {
+                    return deps_.component_versions_fn
+                               ? deps_.component_versions_fn(rq.query.kind, rq.query.name,
+                                                             scope_push)
+                               : std::optional<std::vector<std::string>>{};
+                },
+                rq, target);
+            if (!set)
+                return;
+            rq.query.versions = std::move(*set);
+        }
+        const auto read = swl::read_components_page(
+            [&](const SoftwareComponentQuery& c) {
+                return deps_.components_fn ? deps_.components_fn(c)
+                                           : std::optional<std::vector<SoftwareComponentRow>>{};
+            },
+            rq, gate->scope);
+        serve(
+            read, rq.query, target, !rq.cursor.empty(),
+            [](const SoftwareComponentRow& r) {
+                SoftwareFindRow o;
+                o.agent_id = r.agent_id;
+                o.name = r.name;
+                o.version = r.version;
+                o.version_source = r.version_source;
+                o.path = r.path;
+                o.anchor_app = r.anchor_app;
+                o.status = std::string(swl::derive_status(r.facet_status, r.facet_enabled));
+                return o;
+            },
+            &swl::read_component_totals);
     });
 }
 

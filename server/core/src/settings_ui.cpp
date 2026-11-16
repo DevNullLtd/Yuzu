@@ -941,8 +941,14 @@ const char* const kSettingsPageTemplate =
             body: form.toString()
           }).then(function(sr) {
             if (!sr.ok) {
-              showToast('MFA step-up failed — verify your code and try again.', 'error');
-              done(false, { cancelled: true });
+              var fallback = 'MFA step-up failed: verify your code and try again.';
+              var finish = function(msg) { showToast(msg, 'error'); done(false, { cancelled: true }); };
+              if (sr.status !== 503) { finish(fallback); return; }
+              /* 503: the server names the cause (the code was not checked, or it was spent and
+                 could not be recorded), so show its own message rather than guess. */
+              sr.json().then(function(b) {
+                finish((b && b.error && typeof b.error.message === 'string' && b.error.message) || fallback);
+              }, function() { finish(fallback); });
               return;
             }
             yuzuPwPost(url, payload, done, true);
