@@ -633,8 +633,11 @@ whole source name.
 - **Sync now can be spread too.** The agent's `__sync__.now` command takes a
   list of sources and an optional `delay_max_s` (0 to 86400 seconds); with it
   the agent reports at a stable offset within that many seconds instead of
-  immediately. Nothing in the console sends either yet, so Sync now is
-  immediate today. If its first send fails (the server is unreachable), the
+  immediately. A Sync now for a group, a scope or the whole fleet sends
+  `delay_max_s` whenever the run needs spreading: an estimate of the spread
+  that keeps the fleet's reports under one budget (the agent keeps a sync it
+  already armed sooner, so a device may still report earlier). A single device
+  stays immediate. If its first send fails (the server is unreachable), the
   retries follow the pattern in Gentle catch-up, so it can arrive up to about
   45 minutes after the click.
 - **Sections and deltas.** The installed-software report is sectioned per source (see "The
@@ -1259,34 +1262,67 @@ place, **Hardware** and **Software**, each its own page:
     - **Who may.** The route needs `Execution:Execute`, checked as a **global** grant (or
       RBAC off). An operator whose `Execution:Execute` is limited to management groups is
       refused with `403` for every choice, including a single device. A browser (session-cookie) request must carry an `Origin` or `Referer` naming this site (`403` otherwise; token callers are exempt). The route also
-      confines its targets to the caller's own `Execution:Execute` visible set and refuses
-      **Whole fleet** (`403`) unless that set is unfiltered; with a global grant neither
-      changes the outcome today, and both stay in place as defence in depth for when the
-      gate becomes scope-aware.
+      confines its targets to the caller's own `Execution:Execute` visible set. **Whole fleet**
+      needs a **fleet administrator**: an unfiltered `Execution:Execute` and the global
+      `ManagementGroup:Write` grant (`403` otherwise).
+    - **Confirmation.** A whole group (`group:<id>`) and the whole fleet are refused with
+      `400` unless the request carries `"confirm": true`; a single device and a scope
+      expression never need it. The page's dialog does not send the confirmation yet, so
+      its **Whole fleet** choice, and a `group:<id>` typed as the scope, are answered `400`
+      naming it; **This device** and a scope expression run as before. An API or MCP caller
+      sends `"confirm": true` itself.
     - **Which devices.** A run reaches agents attached to **this server process** only.
       `skipped_offline` counts the devices this server process did not reach that are not too old: it has no live session for them (a disconnected device, or one attached to another server), or the send was refused by the live stream (for example a gateway-attached agent whose gateway lacks the dispatch capability).
       Which devices are candidates depends on the scope: a group or a single named device lists its disconnected members too, but an `__all__` or scope-expression run lists only this server's own sessions plus the shared presence record, so a device that is offline everywhere is never counted, and if the presence read is degraded an `__all__` run lists fewer devices (those attached to other servers are not listed) while a scope-expression run is refused with 503 (the scope could not be evaluated) and sends nothing.
       `requested` and `skipped_offline` therefore describe what this server could reach; they are not a census of the fleet. Agents older than 0.13.1 are skipped
-      and counted separately (`skipped_version`). One request reaches at most 500 devices (`413` above that, counted after the skips:
-      narrow the scope). A scope expression may be up to 1,024 bytes and a device or group id
-      up to 256 bytes.
-    - **Limits.** A group, scope or fleet run is limited to one per operator per 60 seconds
-      (`429` with `Retry-After`; an attempt refused for exceeding 500 devices, or with no live target, counts as a run, a send every device refused does not) and one at a time per server process (`409`); a single device
-      is exempt from both. A `409` can follow a slow agent connection: the server sends to its
-      targets one after another, and a connected agent that has stopped reading holds the run
-      for at most 120 seconds, after which the next request takes the run over (`retry_after_ms` on the `409` is the time until that lease lapses; the stalled send itself is not cancelled). At most three runs are alive at once: while three stalled sends are still alive, no further takeover is allowed, the `409` keeps answering, and a WARN line is logged, until one of those sends unwinds (the agent reads, or its connection is cut) or the server restarts. A server clock that steps backwards
-      cannot lock an operator out: a last-run time in the future is ignored. Both limits are
-      held in each server process, not across a cluster: with several active servers every
-      one allows its own run and keeps its own per-operator cooldown, and each run is still
-      bounded by the 500-device cap. One run can make up to 500 agents upload their
-      inventory at nearly the same moment; see the connection-pool note in
-      [Server administration](server-admin.md).
-    - **Audit and result.** The request is audited as `inventory.sync.request` before
-      anything is sent, and is refused if the audit row cannot be written. `202` means the
-      request was sent, not that the devices have synced: the page's figures change when each
-      device reports back. In the `202` body `agents_reached` is the number of agents that
-      accepted the request; the audit row's `reached` is the number the run planned to send
-      to.
+      and counted separately (`skipped_version`). A request may also carry `last_synced_before`
+      (epoch seconds): only devices whose last accepted report is older are asked, and the rest
+      are counted in `skipped_fresh`. A scope expression may be up to 1,024 bytes and a device
+      or group id up to 256 bytes.
+    - **Pacing.** There is no limit on the number of devices. The server sends the request to
+      every reachable device at once, and asks each agent to report at a stable per-device
+      offset inside `delay_max_s` seconds (at most 86,400; `0` for a run small enough to go
+      at once). Every run still spreading shares one budget of 50 reports per second per
+      server process, and a run takes at most half of what is free: a run that finds the
+      budget used is refused with `429` (`Retry-After`), and one that could not be spread
+      inside 86,400 seconds even then is refused with `413`. `delay_max_s` and the
+      `estimated_completion_at` derived from it are **estimates**: the budget bounds what the
+      server asks for, not the rate reports arrive at, because an agent keeps a fire it already
+      armed when that is sooner than the offset it was given, so a device whose own scheduled
+      sync is due sooner reports then, as a full send. A fleet run that lands shortly before
+      the nightly sync window turns that window's scheduled syncs into full sends at the
+      window's own rate. One run can still make many agents upload their inventory within a
+      few seconds; see the connection-pool note in [Server administration](server-admin.md).
+    - **Joining and the cooldown.** A request for a group, scope expression or the fleet that
+      finds a run of the same target still spreading **joins** it: `202` with that run's
+      counts and `"joined": true`, and nothing is sent. Callers share a run only when they
+      are sent the same devices: administrators share the fleet's run, callers with an
+      unfiltered `Execution:Execute` share a group's run, and a caller confined to part of a
+      group has runs of their own and never receives another caller's counts. A scope
+      expression belongs to the operator who sent it and to its exact text. A request the
+      running run does not cover (a later or absent `last_synced_before` over a filtered run)
+      is `409` with the time left in `retry_after_ms`. After a run starts, the same group,
+      scope expression or fleet waits out a cooldown, 600 seconds by default
+      (`--inventory-sync-cooldown`, `0` for none): `429` with `Retry-After`. A run that no
+      device accepted does not start the cooldown. A single device is exempt from the
+      spread, the join and the cooldown. At most three send loops are alive in a server
+      process at once, and a fourth is `409`: the server sends to its targets one after
+      another, and a connected agent that has stopped reading holds its run (the stalled
+      send itself is not cancelled). A server clock that steps backwards cannot lock a key
+      out: a last-run time in the future is ignored. The run state, the cooldown and the
+      budget are held in memory in each server process, not across a cluster: with several
+      active servers every one paces and joins on its own, and a restart forgets them (agents
+      keep the delays they already armed).
+    - **Audit and result.** The request is audited as `inventory.sync.request` (the
+      whole-fleet row as `software_estate.sync.fleet_wide`) before anything is sent, and is
+      refused if the audit row cannot be written. `202` means the request was sent, not that
+      the devices have synced: the page's figures change when each device reports back. In
+      the `202` body `agents_reached` is the number of agents that accepted the request; the
+      audit row's `reached` is the number the run planned to send to. The body also carries
+      an `execution_id`: `GET /api/v1/hardware/sync/{execution_id}` reports the frames
+      accepted and the agents that armed the sync or failed. An agent answers when it arms
+      the sync, not when its report lands, so those figures count requests taken up, not
+      reports received.
   - **Who sees what.** The catalogue is a fleet-wide aggregate that cannot be narrowed to
     a management group, so the fleet view, the strip and the version counts need an
     unfiltered `Inventory:Read`; a management-group-scoped account is told so and refused
