@@ -3142,7 +3142,9 @@ groups:
             or "drift status=..." when a re-verify no longer confirms).
             This alert also fires when the device's agent lacks the
             firewall plugin: the dispatch is accepted but never
-            confirmed, so upgrade the agent. On a Linux host running the
+            confirmed. An agent without the firewall plugin comes from an
+            earlier build, which is unsupported: reprovision the host into a
+            fresh deployment of this build. On a Linux host running the
             packaged systemd unit every containment action is refused
             (privilege_unavailable), so a record there stays unconfirmed.
 

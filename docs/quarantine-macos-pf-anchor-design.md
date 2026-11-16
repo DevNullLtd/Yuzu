@@ -335,25 +335,22 @@ says so.
 - A sibling anchor inserted later that sorts before ours, or a `pass quick` before
   the anchor line in a customer's main ruleset, defeats containment; the first is
   detected by status, the second only by the probe.
-- The reboot gap (section 4) and rules left by an earlier build (section 3).
+- The reboot gap (section 4). Rules left by an earlier build are outside the deployment contract (section 3).
 - Connections cut by the state flush are never restored.
 
-## 3. Hosts that still carry an earlier build's rules
+## 3. Hosts that carry an earlier build's rules
 
-The earlier containment plugin's pf path replaced the main ruleset with its own (a
-block-all plus its whitelist, loaded by `pfctl -f`). **This build neither removes nor
-detects what an earlier build left on a host**, so a host that still carries that
-plugin's ruleset when it is brought under this build keeps its block-all main ruleset
-until an operator reloads `/etc/pf.conf` (or reboots, since pf rules are not persisted):
+Earlier builds, earlier hosts and records carried forward from them are outside the
+deployment contract (a fresh deployment, every writer on this build; see "Deployment
+contract (hard cutover)" in `docs/user-manual/upgrading.md`). A host that was contained
+by an earlier build is not brought under this one: it is reprovisioned into a fresh
+same-build deployment.
 
-- the main ruleset on such a host does not reference `com.apple/*`, so a `firewall`
-  apply fails `anchor_not_referenced` before the anchor is loaded (nothing is loaded),
-  and `quarantine_status` reports it the same way;
-- once `/etc/pf.conf` is reloaded the reference is live again and the next apply or
-  status sees a healthy anchor.
-
-The upgrading note in `docs/user-manual/upgrading.md` ("Not covered") tells operators
-to clear those rules before bringing the device under this build.
+This build neither removes nor detects what an earlier build left on a host. For
+diagnosis only: the earlier plugin's pf path replaced the main ruleset with its own
+(a block-all plus its whitelist, loaded by `pfctl -f`), so on such a host a `firewall`
+apply fails `anchor_not_referenced` before the anchor is loaded (nothing is loaded), and
+`quarantine_status` reports it the same way.
 
 ## 4. Persistence across reboot, and the gap before it
 
