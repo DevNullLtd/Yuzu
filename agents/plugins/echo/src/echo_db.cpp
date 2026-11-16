@@ -2115,9 +2115,12 @@ EchoDatabase::purge_source(const std::string& source,
     // record a complete erasure while the purged strings are still on disk. The weekly sweep
     // finishes the job.
     PurgeResult out{static_cast<int>(total), false, false};
+    bool stopped = false;
     if (fold_) {
         const auto swept =
             fold_->gc_dictionary(*this, EchoFold::Clock::now() + dictionary_deadline, cancelled);
+        // A stop request is sticky, so this one read holds for the rest of the call.
+        stopped = cancelled && cancelled();
         if (!swept) {
             out.dictionary_pending = true;
             spdlog::warn("purge_source({}): the dictionary sweep failed ({}); the purged strings "
@@ -2125,11 +2128,12 @@ EchoDatabase::purge_source(const std::string& source,
                          source, swept.error());
         } else if (swept->deadline_hit) {
             out.dictionary_pending = true;
-            spdlog::warn("purge_source({}): the dictionary sweep ran out of time; the purged strings "
-                         "stay until the weekly sweep",
-                         source);
+            spdlog::warn("purge_source({}): the dictionary sweep {}; the purged strings stay until "
+                         "the weekly sweep",
+                         source, stopped ? "was stopped" : "ran out of time");
         }
-        if (out.dictionary_pending) {
+        // A sweep the agent stop ended was not starved: it is reported pending, not counted.
+        if (out.dictionary_pending && !stopped) {
             int64_t starved = 0;
             const auto text = get_config("dict_gc_starved_total", "0");
             const auto [p, ec] = std::from_chars(text.data(), text.data() + text.size(), starved);
@@ -2146,14 +2150,17 @@ EchoDatabase::purge_source(const std::string& source,
     // reclaim disk, which a passive checkpoint won't do promptly. Force a TRUNCATE checkpoint
     // here so the erasure is complete and the WAL is reclaimed at return. Best-effort: the DELETE
     // already committed, so a checkpoint that can't fully complete (e.g. a lingering reader) is
-    // logged, not fatal -- the residue clears at the next one -- but REPORTED (`wal_pending`), as
-    // the dictionary is. A stop request skips it: the agent is going down and the close checkpoints.
-    if (cancelled && cancelled()) {
+    // logged, not fatal -- but REPORTED (`wal_pending`), as the dictionary is. The pages stay
+    // until a later checkpoint truncates the log: a rerun of this purge does, and reports it; the
+    // maintenance pass only when it evicts rows or the log outgrows its allowance. A stop request
+    // skips the checkpoint: the agent is going down and the close checkpoints.
+    if (stopped) {
         out.wal_pending = true;
     } else if (checkpoint(CheckpointMode::kTruncate) != CheckpointResult::kOk) {
         out.wal_pending = true;
         spdlog::warn("purge_source({}): WAL checkpoint(TRUNCATE) did not complete -- purged data may "
-                     "persist in the WAL until the next checkpoint",
+                     "persist in the WAL until a later checkpoint truncates it (a rerun of the "
+                     "purge does)",
                      source);
     }
     return out;

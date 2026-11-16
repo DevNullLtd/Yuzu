@@ -47,6 +47,7 @@
 
 #include <yuzu/agent/network_interfaces.hpp>
 #include <yuzu/agent/process_enum.hpp>
+#include <yuzu/agent/subprocess_runner.hpp> // subprocess_cancel_requested: the agent stop latch
 #include <yuzu/plugin.hpp>
 #include <yuzu/echo_retention_tick.hpp> // kEchoRollupTickSeconds (shared with the data-retention API)
 
@@ -568,7 +569,6 @@ public:
 
     yuzu::Result<void> init(yuzu::PluginContext& ctx) override {
         plugin_ctx_ = ctx.raw();
-        stopping_.store(false, std::memory_order_release);
 
         // Determine data directory
         auto data_dir = ctx.get_config("agent.data_dir");
@@ -1072,9 +1072,6 @@ public:
     }
 
     void shutdown(yuzu::PluginContext& ctx) noexcept override {
-        // First, before any lock: an in-flight purge holds collect_mu_ across its dictionary sweep,
-        // and the teardown below takes it. The sweep polls this and gives up.
-        stopping_.store(true, std::memory_order_release);
         ctx.unregister_trigger("echo.fast");
         ctx.unregister_trigger("echo.slow");
         ctx.unregister_trigger("echo.perf");
@@ -1497,10 +1494,6 @@ private:
     // Set when a pass ran out of time with evictable rows left and data still over target:
     // each fast tick then runs one more bounded slice (do_collect_fast) until it clears.
     std::atomic<bool> budget_catch_up_{false};
-    // Set as the first statement of shutdown(), before any lock, and read by an in-flight
-    // echo.purge_source (which holds collect_mu_ across its dictionary sweep) so the sweep gives up
-    // instead of making shutdown wait out its deadline. Cleared at init.
-    std::atomic<bool> stopping_{false};
     // The clock reading the pass that armed the catch-up was admitted with (the retention clock
     // guard had a verdict on it). Every slice of that drain runs with it, never a fresh reading:
     // a slice has no guard contact of its own. A separate field, not a sentinel in one int64,
@@ -3176,9 +3169,9 @@ private:
             int64_t rows = 0;
             int64_t oldest_ts = 0;
             if (!tier_table.empty()) {
-                // Two statements, not one: a lone COUNT(*) is answered from the b-tree's page
-                // counts and a lone MIN() is one index seek, but the pair in one SELECT scans the
-                // whole index (#7123; measured in docs/echo-implementer.md).
+                // Two statements, not one: a lone COUNT(*) sums each b-tree page's cell count
+                // without decoding rows and a lone MIN() is one index seek, but the pair in one
+                // SELECT scans the whole index (#7123; measured in docs/echo-implementer.md).
                 const auto scalar = [&](std::string_view expr) -> std::int64_t {
                     auto q = db_->execute_query(std::format("SELECT {} FROM {}", expr, tier_table),
                                                 /*max_rows=*/1);
@@ -3875,9 +3868,10 @@ private:
                 "error|source_not_paused: {} is enabled; disable it before purging", source));
             return 1;
         }
-        auto res = db_->purge_source(source, std::chrono::seconds(60), [this] {
-            return stopping_.load(std::memory_order_acquire);
-        });
+        // The agent's stop latch (raised when the stop is requested, before the agent joins its
+        // command workers) ends the dictionary sweep at its next check; see purge_source.
+        auto res = db_->purge_source(source, yuzu::echo::EchoDatabase::kPurgeDictionaryDeadline,
+                                     yuzu::agent::subprocess_cancel_requested);
         if (!res) {
             ctx.write_output(std::format("error|{}", res.error()));
             return 1;
@@ -3905,8 +3899,9 @@ private:
         // row is written at dispatch and carries no reply; only the status enum reaches the
         // server, the detail text stays in the agent log.)
         // The same holds for a WAL the final checkpoint could not truncate: the pre-delete page
-        // images of the purged rows stay in the -wal file until the next checkpoint. The
-        // dictionary outranks it in the status detail; the reply carries both flags.
+        // images of the purged rows stay in the -wal file until a later checkpoint truncates it (a
+        // rerun of this purge does). The dictionary outranks it in the status detail; the reply
+        // carries both flags.
         if (res->dictionary_pending || res->wal_pending)
             ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
                                   res->dictionary_pending ? "echo:purge_dictionary_pending"
@@ -4564,16 +4559,28 @@ private:
                                                    read_i64("dict_gc_last_attempt_ts"), streak);
         if (!plan.due)
             return;
-        const auto swept = db_->fold().gc_dictionary(*db_, yuzu::echo::EchoFold::Clock::now() + plan.deadline);
+        // The agent's stop latch ends the sweep at its next check, so a stop never waits out the
+        // 8 s ladder rung while this holds rollup_mu_.
+        const auto swept = db_->fold().gc_dictionary(
+            *db_, yuzu::echo::EchoFold::Clock::now() + plan.deadline,
+            yuzu::agent::subprocess_cancel_requested);
         if (!swept) {
             spdlog::warn("ECHO: dictionary sweep failed: {}", swept.error());
             return;
         }
         if (!swept->live_set_built) {
+            // A scan the stop ended was not starved: no count, no attempt stamp, no streak bump.
+            if (yuzu::agent::subprocess_cancel_requested())
+                return;
             const auto total = std::to_string(read_i64("dict_gc_starved_total") + 1);
             db_->set_config("dict_gc_starved_total", total);
-            db_->set_config("dict_gc_last_attempt_ts", std::to_string(now_ts));
-            db_->set_config("dict_gc_starved_streak", std::to_string(streak + 1));
+            // A clock at or before the epoch cannot be stored as a marker (it reads as unset), so
+            // the streak stays 0 and the pass behaves as it did before the ladder: the done
+            // marker below is guarded the same way.
+            if (now_ts > 0) {
+                db_->set_config("dict_gc_last_attempt_ts", std::to_string(now_ts));
+                db_->set_config("dict_gc_starved_streak", std::to_string(streak + 1));
+            }
             spdlog::warn("ECHO: the dictionary sweep's scan did not finish inside its {} s deadline "
                          "(starved {} time(s)); retrying in a day with a longer deadline",
                          plan.deadline.count(), total);

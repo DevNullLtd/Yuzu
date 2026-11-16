@@ -36,6 +36,7 @@
 #include <yuzu/agent/kv_store.hpp>
 #include <yuzu/agent/plugin_loader.hpp>
 #include <yuzu/agent/process_enum.hpp>
+#include <yuzu/agent/subprocess_runner.hpp> // the agent stop latch
 #include <yuzu/plugin.h>
 #include <yuzu/plugin.hpp>
 
@@ -190,6 +191,28 @@ std::optional<std::string> plugin_status_value(yuzu::agent::LocalDispatcher& d,
         return std::nullopt;
     return line->substr(key.size() + 1);
 }
+
+std::int64_t now_epoch_s() {
+    return static_cast<std::int64_t>(std::time(nullptr));
+}
+
+// Write one echo_config row on a second connection (no plugin code).
+void set_echo_config(const fs::path& db_path, const std::string& key, const std::string& value) {
+    (void)raw_sql(db_path, std::format("INSERT INTO echo_config (key, value) VALUES ('{0}', '{1}') "
+                                       "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                                       key, value));
+}
+
+// The agent's stop latch is one process-wide flag in the agent core, read by the loaded plugin.
+// Raise it for a scope and put back whatever was there, so a failed assertion cannot leave the
+// rest of this executable looking stopped.
+struct StopLatch {
+    const bool previous = yuzu::agent::subprocess_cancel_requested();
+    StopLatch() { yuzu::agent::request_subprocess_cancel(true); }
+    ~StopLatch() { yuzu::agent::request_subprocess_cancel(previous); }
+    StopLatch(const StopLatch&) = delete;
+    StopLatch& operator=(const StopLatch&) = delete;
+};
 
 } // namespace
 
@@ -686,44 +709,81 @@ TEST_CASE("echo plugin: db_budget_bytes validates, persists and shows in status 
 
     SECTION("the dictionary sweep is reported and paced by its last-run marker") {
         // The sweep runs inside the maintenance pass, weekly, paced by `dict_gc_last_ts`. The
-        // starved bump (the live-set scan outrunning its 2 s deadline) is not driven here: the
-        // deadline is a constant inside the plugin with no seam.
+        // starved bump (the live-set scan outrunning its deadline) is not driven here: the
+        // deadline is a ladder inside the plugin with no seam, and a test may not wait on a clock.
         const auto db_path = dir_guard.path / "echo.db";
-        const auto now_s = [] {
-            return std::chrono::duration_cast<std::chrono::seconds>(
-                       std::chrono::system_clock::now().time_since_epoch())
-                .count();
-        };
         const auto marker = [&] { return std::stoll(status_value("dict_gc_last_ts").value_or("-1")); };
         const auto set_marker = [&](std::int64_t v) {
-            raw_sql(db_path, std::format("INSERT INTO echo_config (key, value) VALUES "
-                                         "('dict_gc_last_ts', '{}') ON CONFLICT(key) DO UPDATE SET "
-                                         "value = excluded.value",
-                                         v));
+            set_echo_config(db_path, "dict_gc_last_ts", std::to_string(v));
         };
 
-        // never swept: both keys are reported as 0, the reply keeps its rows_aggregated line
+        // never swept: every key is reported as 0, the reply keeps its rows_aggregated line
         CHECK(status_value("dict_gc_last_ts") == std::optional<std::string>{"0"});
+        CHECK(status_value("dict_gc_last_attempt_ts") == std::optional<std::string>{"0"});
+        CHECK(status_value("dict_gc_starved_streak") == std::optional<std::string>{"0"});
         CHECK(status_value("dict_gc_starved_total") == std::optional<std::string>{"0"});
-        const auto before_first = now_s();
+        const auto before_first = now_epoch_s();
         const auto first = d.run(desc, "rollup");
         CHECK(first.rc == 0);
         CHECK(first.captured.find("echo|rollup|0|rows_aggregated") != std::string::npos);
         CHECK(marker() >= before_first); // an empty dictionary is swept at once
 
         // swept a day ago: the week has not elapsed, the marker is left alone
-        const auto yesterday = now_s() - 86400;
+        const auto yesterday = now_epoch_s() - 86400;
         set_marker(yesterday);
         CHECK(d.run(desc, "rollup").rc == 0);
         CHECK(marker() == yesterday);
 
         // swept eight days ago: due, so the sweep runs and the marker advances
-        const auto before_due = now_s();
+        const auto before_due = now_epoch_s();
         set_marker(before_due - 8 * 86400);
         CHECK(d.run(desc, "rollup").rc == 0);
         CHECK(marker() >= before_due);
 
         CHECK(status_value("dict_gc_starved_total") == std::optional<std::string>{"0"});
+    }
+
+    SECTION("a starved sweep is retried a day after its attempt, not weekly and not every pass") {
+        // The done marker is eight days old (due under the weekly rule) in both cases, so only the
+        // retry state can decide: a streak above 0 is paced by the attempt marker alone.
+        const auto db_path = dir_guard.path / "echo.db";
+        const auto eight_days_ago = now_epoch_s() - 8 * 86400;
+        set_echo_config(db_path, "dict_gc_last_ts", std::to_string(eight_days_ago));
+        set_echo_config(db_path, "dict_gc_starved_streak", "2");
+
+        // attempted an hour ago: not due; nothing moves
+        set_echo_config(db_path, "dict_gc_last_attempt_ts", std::to_string(now_epoch_s() - 3600));
+        CHECK(d.run(desc, "rollup").rc == 0);
+        CHECK(status_value("dict_gc_last_ts") ==
+              std::optional<std::string>{std::to_string(eight_days_ago)});
+        CHECK(status_value("dict_gc_starved_streak") == std::optional<std::string>{"2"});
+
+        // attempted two days ago: due; the scan finishes (nothing in the dictionary), the streak
+        // resets and the done marker advances
+        const auto before_retry = now_epoch_s();
+        set_echo_config(db_path, "dict_gc_last_attempt_ts",
+                        std::to_string(before_retry - 2 * 86400));
+        CHECK(d.run(desc, "rollup").rc == 0);
+        CHECK(status_value("dict_gc_starved_streak") == std::optional<std::string>{"0"});
+        CHECK(std::stoll(status_value("dict_gc_last_ts").value_or("-1")) >= before_retry);
+    }
+
+    SECTION("an agent stop ends a due sweep and the pass is not counted as starved") {
+        // The sweep polls the agent's stop latch where it polls its deadline, so a rollup that
+        // finds the latch raised gives up at its first check: no deletion, no done marker, and
+        // none of the three starved markers moves (the stop is not a signal about the database).
+        const auto db_path = dir_guard.path / "echo.db";
+        const auto eight_days_ago = now_epoch_s() - 8 * 86400;
+        set_echo_config(db_path, "dict_gc_last_ts", std::to_string(eight_days_ago));
+        {
+            const StopLatch stop;
+            CHECK(d.run(desc, "rollup").rc == 0);
+        }
+        CHECK(status_value("dict_gc_last_ts") ==
+              std::optional<std::string>{std::to_string(eight_days_ago)});
+        CHECK(status_value("dict_gc_starved_total") == std::optional<std::string>{"0"});
+        CHECK(status_value("dict_gc_starved_streak") == std::optional<std::string>{"0"});
+        CHECK(status_value("dict_gc_last_attempt_ts") == std::optional<std::string>{"0"});
     }
 
     SECTION("an unreadable budget setting reads as unknown, not as the default, and the pass is "
@@ -736,6 +796,101 @@ TEST_CASE("echo plugin: db_budget_bytes validates, persists and shows in status 
         const auto r = d.run(desc, "rollup");
         CHECK(r.rc == 0);
         CHECK(status_value("budget_evicted_hourly_rows_total") == std::optional<std::string>{"0"});
+    }
+}
+
+
+TEST_CASE("echo plugin: purge_source reports a stopped sweep and a pinned log in its reply and "
+          "its typed status",
+          "[echo][local_dispatcher][purge]") {
+    // The reply line and the typed status are the plugin's own wiring over EchoDatabase::
+    // purge_source (whose PurgeResult the store cases pin), so they are read here through the
+    // loaded plugin. No sleep, no thread: the sweep's stop is the agent latch, raised for a scope,
+    // and the busy checkpoint is a reader on a second connection.
+    const auto plugin_path = find_echo_plugin();
+    if (plugin_path.empty()) {
+        if (std::getenv("MESON_BUILD_ROOT") != nullptr)
+            FAIL("echo plugin library not found under meson test");
+        WARN("echo plugin library not found -- skipping (run from the build root or via meson test)");
+        return;
+    }
+    auto handle = yuzu::agent::PluginHandle::load(plugin_path);
+    REQUIRE(handle.has_value());
+    const auto* desc = handle->descriptor();
+    REQUIRE(desc != nullptr);
+    REQUIRE(desc->init != nullptr);
+
+    yuzu::test::TempDir dir_guard{"yuzu_test_echo_local_"};
+    std::error_code ec;
+    fs::create_directories(dir_guard.path, ec);
+    auto kv = yuzu::agent::KvStore::open(dir_guard.path / "kv_store.db");
+    REQUIRE(kv.has_value());
+    yuzu::agent::StandalonePluginContext ctx("echo", {{"agent.data_dir", dir_guard.path.string()}},
+                                             &*kv);
+    REQUIRE(desc->init(ctx.get()) == 0);
+    yuzu::agent::LocalDispatcher d;
+    const yuzu::test::ScopeExit shutdown_on_exit{[&] { desc->shutdown(ctx.get()); }};
+
+    const auto db_path = dir_guard.path / "echo.db";
+    set_echo_config(db_path, "process_enabled", "false"); // the purge needs a paused source
+    const YuzuParam params[] = {{"source", "process"}};
+    const auto reply_of = [](const yuzu::agent::LocalDispatcher::Result& r) {
+        const auto rows = rows_of(r.captured);
+        REQUIRE(rows.size() == 1);
+        return nlohmann::json::parse(rows[0]);
+    };
+
+    SECTION("a stop request: both pending, the dictionary wins, nothing counted as starved") {
+        {
+            const StopLatch stop;
+            const auto r = d.run(desc, "purge_source", params);
+            CHECK(r.rc == 0);
+            const auto reply = reply_of(r);
+            CHECK(reply.at("source") == "process");
+            CHECK(reply.at("status") == "purged");
+            CHECK(reply.at("dictionary_pending") == true);
+            CHECK(reply.at("wal_checkpoint_pending") == true);
+            CHECK(r.result_status == YUZU_RESULT_STATUS_CONSTRAINED);
+            CHECK(r.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+            CHECK(r.result_provenance == "echo:purge_dictionary_pending");
+        }
+        CHECK(plugin_status_value(d, desc, "dict_gc_starved_total") ==
+              std::optional<std::string>{"0"});
+
+        // The same purge once the stop is gone finishes both halves and declares nothing partial.
+        const auto rerun = d.run(desc, "purge_source", params);
+        CHECK(rerun.rc == 0);
+        const auto reply = reply_of(rerun);
+        CHECK(reply.at("dictionary_pending") == false);
+        CHECK(reply.at("wal_checkpoint_pending") == false);
+        CHECK(rerun.result_status == YUZU_RESULT_STATUS_UNDECLARED);
+    }
+
+    SECTION("a reader that pins the log: only the checkpoint is pending") {
+        // A write through a second connection leaves frames in the log; a reader that begins on
+        // them holds a read mark, and the purge's TRUNCATE checkpoint (busy timeout 0) cannot
+        // reset the log. The owner closes the reader on every path.
+        set_echo_config(db_path, "yuzu_test_pin", "1");
+        {
+            yuzu::test::SqliteHandleOwner<sqlite3> reader;
+            REQUIRE(sqlite3_open_v2(db_path.string().c_str(), &reader.db, SQLITE_OPEN_READONLY,
+                                    nullptr) == SQLITE_OK);
+            REQUIRE(sqlite3_exec(reader.db, "BEGIN; SELECT COUNT(*) FROM echo_config;", nullptr,
+                                 nullptr, nullptr) == SQLITE_OK);
+
+            const auto r = d.run(desc, "purge_source", params);
+            CHECK(r.rc == 0);
+            const auto reply = reply_of(r);
+            CHECK(reply.at("dictionary_pending") == false);
+            CHECK(reply.at("wal_checkpoint_pending") == true);
+            CHECK(r.result_status == YUZU_RESULT_STATUS_CONSTRAINED);
+            CHECK(r.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+            CHECK(r.result_provenance == "echo:purge_wal_pending");
+        }
+        const auto rerun = d.run(desc, "purge_source", params);
+        CHECK(rerun.rc == 0);
+        CHECK(reply_of(rerun).at("wal_checkpoint_pending") == false);
+        CHECK(rerun.result_status == YUZU_RESULT_STATUS_UNDECLARED);
     }
 }
 

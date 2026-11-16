@@ -115,35 +115,58 @@ Flow:
    to a literal so a new source is a decision).
 5. The weekly dictionary sweep (`run_dictionary_gc`, schedule in the pure
    `dict_gc_plan`) holds `rollup_mu_` and the fold's `op_mu_` for its whole
-   deadline. A pass whose live-set scan does not finish deletes nothing and is
-   a starved pass: it bumps `dict_gc_starved_total` and `dict_gc_starved_streak`
+   deadline, or until an agent stop (below). A pass whose live-set scan does
+   not finish deletes nothing and is a starved pass: it bumps `dict_gc_starved_total` and `dict_gc_starved_streak`
    and stamps `dict_gc_last_attempt_ts`; the next attempt is due a day later
    (not at the next 15-minute pass) with the deadline doubled, 2 s, 4 s, then
    8 s. A finished scan resets the streak to 0. Both markers are durable, so a
    restart keeps the backoff; a crash between the sweep and the marker writes
    repeats one attempt. A marker ahead of the clock is stale and never postpones
    a pass. The 8 s ceiling is the bound: a scan that needs longer starves
-   every day (the upgrade is to resume the scan across passes). An operator
-   `purge_source` runs the same sweep under a 60 s deadline and a stop flag the
-   plugin sets as the first statement of `shutdown()`: the sweep polls it where
-   it polls the deadline, so an agent stop no longer waits behind `collect_mu_`
-   for the sweep. The same purge reports a final `TRUNCATE` checkpoint that did
-   not complete (busy timeout 0, so a pinned WAL answers at once) as
-   `wal_pending` rather than only logging it.
+   every day (the upgrade is to resume the scan across passes). Both the weekly
+   sweep and an operator `purge_source` (which runs the same sweep under a
+   60 s deadline) pass the agent's stop latch, `yuzu::agent::
+   subprocess_cancel_requested`, to `gc_dictionary`, which polls it where it
+   polls the deadline. The latch is one process-lifetime flag in the
+   agent-core library that `Agent::stop()` raises as soon as the stop is
+   requested, before it joins the command workers (`thread_pool_`) and before
+   the trigger engine and the plugin `shutdown()` loop, so a stop reaches a
+   sweep that those joins would otherwise wait out; a plugin-local flag set in
+   `shutdown()` would arrive too late, after the pool join. A sweep ends at its
+   next check (between batches, or inside a statement at the progress handler's
+   1000-instruction poll); the row delete, a `COMMIT` and the wait for the
+   write lock are not interruptible, and a lost server connection is not a
+   stop. A sweep a stop ended is not a starved one: it is not counted, and the
+   weekly pass stamps neither marker. The same purge reports a final
+   `TRUNCATE` checkpoint that did not complete (busy timeout 0, so a pinned
+   WAL answers at once) as `wal_pending` rather than only logging it; the
+   pages stay in the log until a later checkpoint truncates it, which a rerun
+   of the purge does, and the maintenance pass does only when it evicts rows
+   or the log outgrows its allowance (an automatic retry is not built). The
+   test that drives this wiring is the single-threaded dispatcher case in
+   `test_echo_local_dispatcher.cpp`, which raises the latch for a scope; a
+   stop racing an in-flight action is not covered by a test.
 
 **The `status` row-count scan (#7123), measured.** `status` reads each
 capture source's finest tier for its row count and oldest bucket. In one
-`SELECT COUNT(*), MIN(bucket)` SQLite scans the whole covering index; as two
-statements, `COUNT(*)` alone is answered from the b-tree's page counts and
-`MIN(bucket)` alone is one index seek (`EXPLAIN QUERY PLAN`: `SCAN ... COVERING
-INDEX` for the pair, `SEARCH ... COVERING INDEX` for the lone `MIN`). Scope: the
-`sqlite3` CLI (library 3.51.0, `/usr/bin/sqlite3`) on the Mac mini `braga`, one
-table with the generated `process_hourly_r` layout and its unique
-`(hour_ts, name, usr)` index, 2,000,000 synthetic rows, warm cache,
-`/usr/bin/time` wall clock over three runs: the combined statement took about
-0.10 s, the lone `COUNT(*)` 0.01 s, the lone `MIN` under 0.01 s. That is one
-host, one SQLite build and one table shape, not a fleet figure, so `status` now
-issues the two statements.
+`SELECT COUNT(*), IFNULL(MIN(bucket), 0)` SQLite scans the whole covering
+index. As two statements, a lone `COUNT(*)` is a b-tree count (the `Count`
+opcode: SQLite sums each page's cell count without decoding rows), and the
+shipped `SELECT IFNULL(MIN(bucket), 0)` is one index seek (`EXPLAIN QUERY PLAN`:
+`SEARCH ... USING COVERING INDEX`; the bytecode stops after the first index
+entry). The plan line for the lone `COUNT(*)` still reads `SCAN ... USING
+COVERING INDEX`, because the plan does not show the `Count` opcode; its timing
+is the evidence there. Scope: the `sqlite3` CLI (library 3.51.0,
+`/usr/bin/sqlite3`) on the Mac mini `braga`, one table written to the shape
+`generate_fold_ddl` (`echo_fold_schema.cpp`) emits for `process_hourly_r` (an
+`INTEGER PRIMARY KEY` row table plus the unique `(hour_ts, name_id, user_id,
+parent_name_id)` index; written by hand from that generator, not dumped from a
+live database), 2,000,000 synthetic rows, warm cache, `/usr/bin/time` wall
+clock over three runs: the combined statement with the shipped `IFNULL`
+took 0.04 to 0.05 s (0.06 to 0.08 s with a bare `MIN`), the lone
+`COUNT(*)` 0.01 s, the shipped lone `IFNULL(MIN(...), 0)` under 0.01 s. That is
+one host, one SQLite build and one table shape, not a fleet figure, so
+`status` now issues the two statements.
 
 Two in-memory structures keep the folded event volume down. `HourlySeenSet`
 (`echo_hour_dedup.hpp`) is membership-only, holds at most 20,000 keys, is

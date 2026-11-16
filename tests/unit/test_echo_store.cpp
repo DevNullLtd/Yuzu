@@ -5520,12 +5520,10 @@ TEST_CASE("EchoDatabase: a pre-auto_vacuum database converts with one VACUUM",
     }
 }
 
-TEST_CASE("EchoDatabase: purge_source reports a dictionary sweep that did not finish and counts it",
-          "[echo][store][purge][dictionary]") {
-    // The rows go either way; the strings of the purged rows are forensic data too, so a sweep
-    // that outran its deadline is reported (dictionary_pending) and counted, never a silent
-    // "purged". A deadline already past is gc_dictionary's own seam for that path.
-    auto t = make_test_db();
+namespace {
+// One "process" event whose name lands in the dictionary and in the hourly, daily and monthly
+// roll-up rows: the data the purge cases below delete.
+void fold_purged_process_row(TestEchoDb& t) {
     ProcessEvent e;
     e.ts = 1000;
     e.snapshot_id = 1;
@@ -5534,6 +5532,16 @@ TEST_CASE("EchoDatabase: purge_source reports a dictionary sweep that did not fi
     e.name = "purged.exe";
     e.user = "u";
     REQUIRE(t.db.fold_process_events({e}));
+}
+} // namespace
+
+TEST_CASE("EchoDatabase: purge_source reports a dictionary sweep that did not finish and counts it",
+          "[echo][store][purge][dictionary]") {
+    // The rows go either way; the strings of the purged rows are forensic data too, so a sweep
+    // that outran its deadline is reported (dictionary_pending) and counted, never a silent
+    // "purged". A deadline already past is gc_dictionary's own seam for that path.
+    auto t = make_test_db();
+    fold_purged_process_row(t);
 
     const auto starved = t.db.purge_source("process", std::chrono::seconds(0));
     REQUIRE(starved.has_value());
@@ -5553,14 +5561,7 @@ TEST_CASE("EchoDatabase: purge_source reports a dictionary sweep that did not fi
 namespace {
 // One purged-then-starved "process" row: its dictionary string is left behind as an orphan.
 void seed_orphan_string(TestEchoDb& t) {
-    ProcessEvent e;
-    e.ts = 1000;
-    e.snapshot_id = 1;
-    e.action = "started";
-    e.pid = 1;
-    e.name = "purged.exe";
-    e.user = "u";
-    REQUIRE(t.db.fold_process_events({e}));
+    fold_purged_process_row(t);
     const auto starved = t.db.purge_source("process", std::chrono::seconds(0));
     REQUIRE(starved.has_value());
     REQUIRE(starved->dictionary_pending);
@@ -5580,12 +5581,17 @@ TEST_CASE("EchoDatabase: dictionary sweep: a cancelled pass deletes nothing and 
     CHECK(at_once->deleted == 0);
     CHECK(first_cell(t.db, orphan_sql) == "1");
 
-    // A stop that arrives after the first poll: the pass ends at the next one, wherever that
-    // is (inside the scan or between batches). The poll count, not elapsed time, is the assertion.
+    // A stop that arrives after the first poll (the check before the scan): the second poll is the
+    // statement progress handler's, which interrupts the live-set scan. Only an interrupted scan
+    // leaves live_set_built false (the between-batch check runs after it). The scan is an EXCEPT
+    // chain over every interned key column, several handler periods of 1000 VM instructions even
+    // here, so no extra rows are needed; reverting the handler to the deadline alone fails the
+    // live_set_built check. Counted in polls, never in elapsed time.
     int polls = 0;
     const auto midway = t.db.fold().gc_dictionary(t.db, far, [&polls] { return ++polls >= 2; });
     REQUIRE(midway.has_value());
     CHECK(midway->deadline_hit);
+    CHECK_FALSE(midway->live_set_built);
     CHECK(midway->deleted == 0);
     CHECK(polls >= 2);
     CHECK(first_cell(t.db, orphan_sql) == "1");
@@ -5599,34 +5605,22 @@ TEST_CASE("EchoDatabase: dictionary sweep: a cancelled pass deletes nothing and 
 TEST_CASE("EchoDatabase: purge: a stop request during the sweep returns with the dictionary and the WAL reported pending",
           "[echo][store][purge][dictionary]") {
     auto t = make_test_db();
-    ProcessEvent e;
-    e.ts = 1000;
-    e.snapshot_id = 1;
-    e.action = "started";
-    e.pid = 1;
-    e.name = "purged.exe";
-    e.user = "u";
-    REQUIRE(t.db.fold_process_events({e}));
+    fold_purged_process_row(t);
 
     const auto stopped = t.db.purge_source("process", std::chrono::seconds(60), [] { return true; });
     REQUIRE(stopped.has_value());
     CHECK(stopped->rows_deleted == 3);
     CHECK(stopped->dictionary_pending);
     CHECK(stopped->wal_pending);
+    // Reported pending, not starved: a sweep the stop ended is no signal about the database.
+    CHECK(t.db.get_config("dict_gc_starved_total", "0") == "0");
     CHECK(first_cell(t.db, "SELECT COUNT(*) FROM echo_dict WHERE text = 'purged.exe'") == "1");
 }
 
 TEST_CASE("EchoDatabase: purge: a checkpoint that finds the WAL pinned is reported as wal pending while the rows are gone",
           "[echo][store][purge]") {
     auto t = make_test_db();
-    ProcessEvent e;
-    e.ts = 1000;
-    e.snapshot_id = 1;
-    e.action = "started";
-    e.pid = 1;
-    e.name = "purged.exe";
-    e.user = "u";
-    REQUIRE(t.db.fold_process_events({e}));
+    fold_purged_process_row(t);
 
     // A read transaction on a second connection pins the WAL at its snapshot, so the purge's
     // frames sit past the reader's mark and TRUNCATE (busy timeout 0) cannot reset the log. The

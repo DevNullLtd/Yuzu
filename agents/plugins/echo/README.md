@@ -584,18 +584,24 @@ same convention. A failed perf/procperf counter read reports `counters_unavailab
 `{"source":"<name>","rows_deleted":<n>,"status":"purged","dictionary_pending":<true|false>,"wal_checkpoint_pending":<true|false>}` (see `do_purge_source` in `echo_plugin.cpp`), or an
 `error|` line if the named source is unknown, still enabled, or its enable flag cannot be read (`config_unreadable`).
 `dictionary_pending` is `true` when the dictionary sweep that follows the row delete (the interned strings only the
-purged rows referenced: process names, users, key paths) ran out of its 60 s deadline or failed: the rows are gone,
-the strings stay until the weekly sweep or a rerun of the purge (the rerun is idempotent and finishes the sweep), the
-reply carries a `constrained` result status (`echo:purge_dictionary_pending`) and `dict_gc_starved_total` is
-incremented, so the response record never claims a complete erasure the dictionary sweep has not finished: a pending
-result is not a complete erasure. `wal_checkpoint_pending` is `true` when the final `TRUNCATE` checkpoint did not
-complete (a reader pins the write-ahead log; the checkpoint never waits) or was skipped because the agent was
-stopping: the rows are gone but their pre-delete pages stay in the log until the next checkpoint; the status is then
-`echo:purge_wal_pending` unless the dictionary is also pending, which takes precedence. An agent stop during the
-purge ends the dictionary sweep at once instead of waiting out its 60 s deadline. One limit: the server's
+purged rows referenced: process names, users, key paths) ran out of its 60 s deadline, failed or was ended by an
+agent stop: the rows are gone, the strings stay until the weekly sweep or a rerun of the purge (the rerun is
+idempotent and finishes the sweep), the reply carries a `constrained` result status
+(`echo:purge_dictionary_pending`) and `dict_gc_starved_total` is incremented (not for a sweep an agent stop ended: it
+is reported pending but was not starved), so the response record never claims a complete erasure the dictionary sweep
+has not finished: a pending result is not a complete erasure. `wal_checkpoint_pending` is `true` when the final
+`TRUNCATE` checkpoint did not complete (a reader pins the write-ahead log; the checkpoint never waits) or was skipped
+because the agent was stopping: the rows are gone but their pre-delete pages stay in the log until a later checkpoint
+truncates it, which a rerun of the purge does (and reports) and the maintenance pass does only when it evicts rows or
+the log outgrows its allowance; the status is then `echo:purge_wal_pending` unless the dictionary is also pending,
+which takes precedence. An agent stop during the purge ends the dictionary sweep at its next check instead of waiting
+out its 60 s deadline: the sweep reads the agent's stop signal, which is raised when the stop is requested, before the
+agent waits for its running commands. The row delete, a commit and the wait for the database lock are not
+interruptible, and a lost server connection is not a stop. One limit: the server's
 `echo.source.purge` audit row is written at dispatch and carries no agent reply (the reply is in the command's
 response record). The routine weekly sweep backs off after a scan that does not finish: it is retried a day later
-(not at the next 15-minute pass) with the deadline doubled, 2 s, 4 s, then 8 s. A query over a retired `$<Source>_Live` name (`sql`) answers no rows with a
+(not at the next 15-minute pass) with the deadline doubled, 2 s, 4 s, then 8 s; a sweep an agent stop ended stamps
+nothing and counts nothing. A query over a retired `$<Source>_Live` name (`sql`) answers no rows with a
 `constrained` result status, so an empty answer is not mistaken for "nothing happened"; only the status enum reaches
 the server, and the retired table's name (`retired_table:<name>`) is in the agent's command log line.
 
@@ -621,8 +627,8 @@ guard that every action shares — ever calls the setter, so the agent records t
 | Status | Completeness | Provenance | When |
 |---|---|---|---|
 | `CONSTRAINED` | `PARTIAL` | `echo:snapshot_skipped_sources` | `snapshot` only, when `collect_or_retain` skipped at least one enabled source this pass. |
-| `CONSTRAINED` | `PARTIAL` | `echo:purge_dictionary_pending` | `purge_source` only, when the dictionary sweep after the row delete ran out of its deadline or failed: the rows are deleted, the strings of the purged rows stay until the weekly sweep, `dictionary_pending` is `true` in the JSON line and `dict_gc_starved_total` is incremented. |
-| `CONSTRAINED` | `PARTIAL` | `echo:purge_wal_pending` | `purge_source` only, when the dictionary is clean but the final `TRUNCATE` checkpoint found the write-ahead log pinned by a reader, or was skipped because the agent was stopping: the rows are deleted, `wal_checkpoint_pending` is `true` in the JSON line, and the purged pages stay in the log until the next checkpoint. |
+| `CONSTRAINED` | `PARTIAL` | `echo:purge_dictionary_pending` | `purge_source` only, when the dictionary sweep after the row delete ran out of its deadline or failed: the rows are deleted, the strings of the purged rows stay until the weekly sweep, `dictionary_pending` is `true` in the JSON line and `dict_gc_starved_total` is incremented (not when an agent stop ended the sweep). |
+| `CONSTRAINED` | `PARTIAL` | `echo:purge_wal_pending` | `purge_source` only, when the dictionary is clean but the final `TRUNCATE` checkpoint found the write-ahead log pinned by a reader, or was skipped because the agent was stopping: the rows are deleted, `wal_checkpoint_pending` is `true` in the JSON line, and the purged pages stay in the log until a later checkpoint truncates it (a rerun of the purge does). |
 | `CONSTRAINED` | `PARTIAL` | `retired_table:<name>` | `sql` only, when the translated query names a retired `<source>_live` shim view in any spelling SQLite accepts (an empty relation kept so a stored query does not error): the rows and the `__total__\|0` line are unchanged; the status is what tells a schedule or result set that the table is retired rather than empty. Only the status enum reaches the server; the name is in the agent's command log line. |
 | `UNDECLARED` (default) | `UNKNOWN` | *(empty)* | Every other action and every early-return path, including the `db_`-not-open guard. |
 | *(not a `set_result_status` call)* | *(n/a)* | `linux:netlink:remove:` | Not an action-level result status — the literal prefix of the per-row `evidence` column the Linux `removable` cursor-source writes on a normal `detached` device event (udev netlink), followed by the device name; the event itself is a successful capture, not a degraded read (`echo_removable_collector.cpp`). |
