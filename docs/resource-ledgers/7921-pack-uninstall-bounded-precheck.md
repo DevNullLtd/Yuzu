@@ -26,8 +26,11 @@ for the surrounding sites: `2146-twin-batch-c-instructions-sets.md`.
 - **Failure cleanup:** a missing lease or a failed query is an `unexpected` (fail closed, never an
   empty list). The number of leases a pre-check takes no longer grows with the pack: one for
   `policies_using_fragments`, at most three for `lookup_many` (one per source; a later source is
-  not read once `limit` referrers are in hand). Pinned by the lease-count test in
-  `test_workflow_routes.cpp`.
+  not read once `limit` referrers are in hand). Pinned in `test_workflow_routes.cpp` at two
+  levels: the store methods by the lease-count test (3 leases for `lookup_many` over 500 ids, 1 for
+  `policies_using_fragments` over 60), and the route's use of them by two lease comparisons through
+  the blocked-409 DELETE (a 5-definition against a 500-definition pack, and 5 against 60 own policy
+  fragments cost the same number of leases).
 
 ### `DefinitionReferrersFn::batch_` and `lookup_many`
 - **Site:** `instruction_referrers.hpp`; the batch lambda is built in

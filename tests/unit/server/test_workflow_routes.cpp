@@ -7954,9 +7954,10 @@ TEST_CASE("7921: a failing referrer lookup answers 503 with retry_after_ms and u
 // The held-by answer for a pack of 60 own fragments, one of which four policies use: the 409 names
 // that fragment and its first three policies (`+1` for the rest) and none of the 59 unused ones.
 // This pins the CONTENT of the batched held-by read (per-fragment cap, grouping, exclusion of the
-// unused fragments). The lease-count test below pins that the STORE METHOD is one lease; the route's
-// own use of it (one call for all own fragments) is not lease-counted here. Turns red if the batched
-// read loses the per-fragment cap, the grouping, or the exclusion.
+// unused fragments). That the STORE METHOD is one lease is pinned by the lease-count test below, and
+// that the ROUTE uses it once for all own fragments (not once per fragment) by the route-level
+// own-fragment lease comparison after it. Turns red if the batched read loses the per-fragment cap,
+// the grouping, or the exclusion.
 TEST_CASE("7921: sixty own fragments: the used one names its first three policies and +1",
           "[pg][workflow][product_pack][7921]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
@@ -8458,4 +8459,190 @@ TEST_CASE("7921: an unreadable referrer source answers 503 with retry_after_ms a
         REQUIRE(still_def.has_value());
         CHECK(still_def->has_value());
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #7921 item 1, adversarial-review round: route-level held-by leases, detail-row tolerance, order
+// ═══════════════════════════════════════════════════════════════════════════
+
+// The held-by read THROUGH THE ROUTE: otherwise-equivalent packs (one definition, one own fragment a
+// policy holds, the rest unheld, a schedule naming the definition so each DELETE is a 409) with 5
+// and with 60 own fragments cost the same number of pooled leases. Turns red if the route goes back
+// to one `policies_using_fragments` (or `query_policies`) per own fragment: the 60-fragment pack
+// would then cost 55 more leases.
+TEST_CASE("7921: the blocked DELETE costs the same leases for 5 and for 60 own fragments",
+          "[pg][workflow][product_pack][7921]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    std::atomic<int> leases{0};
+    PgPool pool{counting_pool_options(db.dsn(), leases)};
+    ScheduleEngine schedules{pool};
+    WorkflowEngine workflows{pool};
+    PolicyStore policies{pool};
+    REQUIRE(schedules.is_open());
+    REQUIRE(policies.is_open());
+    ExecHarness h(pool, true, nullptr, true, /*with_workflow_engine=*/true, true,
+                  /*with_product_pack_store=*/true, {}, {}, false, {}, {}, {}, {},
+                  yuzu::server::make_definition_referrers_fn(&schedules, &workflows, &policies),
+                  &policies);
+
+    // Installs a pack named `prefix`pack of one real definition and `fragments` own fragments that
+    // name it, holds fragment 0 with a policy and puts a schedule on the definition.
+    const auto install_pack = [&](const std::string& prefix, int fragments) {
+        std::string yaml = own_items_bundle(0, fragments).yaml;
+        yaml.replace(yaml.find("name: own-items"), std::string("name: own-items").size(),
+                     "name: " + prefix + "pack");
+        std::string def_id;
+        int n = 0;
+        auto install_fn = [&](const std::string& kind,
+                              const std::string&) -> std::expected<std::string, std::string> {
+            if (kind == "InstructionDefinition") {
+                InstructionDefinition d;
+                d.name = prefix + "def";
+                d.type = "question";
+                d.plugin = "os_info";
+                d.action = "os_name";
+                auto id = h.instructions->create_definition(d);
+                if (id)
+                    def_id = *id;
+                return id;
+            }
+            return policies.create_fragment(
+                fragment_naming(def_id, prefix + "frag-" + std::to_string(n++)));
+        };
+        auto installed = h.product_pack_store->install(yaml, install_fn);
+        REQUIRE(installed.has_value());
+        REQUIRE(n == fragments);
+        REQUIRE(policies.create_policy(policy_using(prefix + "frag-0")).has_value());
+        REQUIRE(schedules.create_schedule(schedule_naming(def_id)).has_value());
+        return *installed;
+    };
+    const std::string small = install_pack("s-", 5);
+    const std::string big = install_pack("b-", 60);
+
+    const auto blocked_leases = [&](const std::string& pack_id) {
+        leases = 0;
+        auto del = h.sink.Delete("/api/product-packs/" + pack_id);
+        REQUIRE(del);
+        CHECK(del->status == 409);
+        return leases.load();
+    };
+    const int small_cost = blocked_leases(small);
+    const int big_cost = blocked_leases(big);
+    CHECK(small_cost >= 4); // pack read, held-by read, three sources
+    CHECK(big_cost == small_cost);
+}
+
+// The held-by read needs only each holding policy's id and name, so a policy whose DETAIL rows
+// cannot be loaded (here `policy_triggers` is moved aside, which `load_policy_details` reads) still
+// refuses the uninstall with a 409 that names the policy, and does not turn it into a 503. Turns red
+// if the held-by read goes back to `query_policies` (which loads the details and fails the read).
+TEST_CASE("7921: a policy whose detail rows cannot load still blocks the uninstall with a 409",
+          "[pg][workflow][product_pack][7921]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ScheduleEngine schedules{pool};
+    WorkflowEngine workflows{pool};
+    PolicyStore policies{pool};
+    REQUIRE(schedules.is_open());
+    REQUIRE(policies.is_open());
+    ExecHarness h(pool, true, nullptr, true, /*with_workflow_engine=*/true, true,
+                  /*with_product_pack_store=*/true, {}, {}, false, {}, {}, {}, {},
+                  yuzu::server::make_definition_referrers_fn(&schedules, &workflows, &policies),
+                  &policies);
+    std::string def_id, own_policy_id;
+    const std::string pack_id = install_def_fragment_pack(h, policies, "frag-detail",
+                                                          /*with_policy_item=*/false, def_id,
+                                                          own_policy_id);
+    auto holder = policies.create_policy(policy_using("frag-detail"));
+    REQUIRE(holder.has_value());
+    h.audit_calls.clear();
+
+    yuzu::test::SqlFault broken(pool,
+                                "ALTER TABLE policy_store.policy_triggers RENAME TO policy_triggers_gone",
+                                "ALTER TABLE policy_store.policy_triggers_gone RENAME TO policy_triggers");
+    broken.arm();
+    // the detail load really does fail while the table is aside
+    CHECK_FALSE(policies.query_policies(PolicyQuery{.fragment_filter = "frag-detail", .limit = 4})
+                    .has_value());
+    auto del = h.sink.Delete("/api/product-packs/" + pack_id);
+    broken.repair();
+    REQUIRE(del);
+    CHECK(del->status == 409);
+    const auto msg = nlohmann::json::parse(del->body).at("error").at("message").get<std::string>();
+    CHECK(msg.find("policy fragment frag-detail (used by policy " + *holder) != std::string::npos);
+    REQUIRE(h.audit_calls.size() == 1);
+    CHECK(h.audit_calls[0].detail == "referenced");
+    auto still_pack = h.product_pack_store->get(pack_id);
+    REQUIRE(still_pack.has_value());
+    CHECK(still_pack->has_value());
+}
+
+namespace {
+
+/// Installs the one-definition pack and returns its pack id and definition id (the route-order tests).
+std::pair<std::string, std::string> install_one_definition_pack(ExecHarness& h) {
+    auto install = h.sink.Post("/api/product-packs", kPackWithDefinition, "text/x-yaml");
+    REQUIRE(install);
+    REQUIRE(install->status == 201);
+    const auto pack_id = nlohmann::json::parse(install->body).at("id").get<std::string>();
+    return {pack_id, pack_definition_id(*h.product_pack_store, pack_id)};
+}
+
+} // namespace
+
+// The batch route's 409 lists the referrer KINDS in a fixed order: schedules, then workflows, then
+// policy fragments (the order the sources are read). Turns red if the sources are reordered.
+TEST_CASE("7921: the batch route lists schedule, then workflow, then policy fragment",
+          "[pg][workflow][product_pack][7921]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ScheduleEngine schedules{pool};
+    WorkflowEngine workflows{pool};
+    PolicyStore policies{pool};
+    REQUIRE(schedules.is_open());
+    REQUIRE(policies.is_open());
+    ExecHarness h(pool, true, nullptr, true, /*with_workflow_engine=*/true, true,
+                  /*with_product_pack_store=*/true, {}, {}, false, {}, {}, {}, {},
+                  yuzu::server::make_definition_referrers_fn(&schedules, &workflows, &policies),
+                  &policies);
+    const auto [pack_id, def_id] = install_one_definition_pack(h);
+    auto frag = policies.create_fragment(fragment_naming(def_id, "foreign-frag"));
+    auto wf = workflows.create_workflow(workflow_naming(def_id, "foreign-wf"));
+    auto sched = schedules.create_schedule(schedule_naming(def_id));
+    REQUIRE((frag && wf && sched));
+
+    auto del = h.sink.Delete("/api/product-packs/" + pack_id);
+    REQUIRE(del);
+    CHECK(del->status == 409);
+    const auto msg = nlohmann::json::parse(del->body).at("error").at("message").get<std::string>();
+    CHECK(msg.find("3 items still use one of its definitions: schedule " + *sched + ", workflow " +
+                   *wf + ", policy fragment foreign-frag.") != std::string::npos);
+}
+
+// 22 referrers of ONE kind: the batch stops at the cap of 21, so the 409 counts 21, lists 20 and
+// ends ", and 1 more". Turns red if the cap, the listed count or the suffix changes.
+TEST_CASE("7921: the batch route with 22 referrers of one kind counts 21 and lists 20",
+          "[pg][workflow][product_pack][7921]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ScheduleEngine schedules{pool};
+    WorkflowEngine workflows{pool};
+    PolicyStore policies{pool};
+    REQUIRE(schedules.is_open());
+    REQUIRE(policies.is_open());
+    ExecHarness h(pool, true, nullptr, true, /*with_workflow_engine=*/true, true,
+                  /*with_product_pack_store=*/true, {}, {}, false, {}, {}, {}, {},
+                  yuzu::server::make_definition_referrers_fn(&schedules, &workflows, &policies),
+                  &policies);
+    const auto [pack_id, def_id] = install_one_definition_pack(h);
+    for (int i = 0; i < 22; ++i)
+        REQUIRE(schedules.create_schedule(schedule_naming(def_id)).has_value());
+
+    auto del = h.sink.Delete("/api/product-packs/" + pack_id);
+    REQUIRE(del);
+    CHECK(del->status == 409);
+    const auto msg = nlohmann::json::parse(del->body).at("error").at("message").get<std::string>();
+    CHECK(msg.find("21 items still use one of its definitions: schedule ") != std::string::npos);
+    CHECK(count_of(msg, "schedule ") == 20);
+    CHECK(msg.find(", and 1 more. Remove each of them") != std::string::npos);
 }
