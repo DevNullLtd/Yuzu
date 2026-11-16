@@ -2774,7 +2774,9 @@ Gates, applied at the marked rungs:
   exact match** — a tolerance band would let a real enforce divergence pass (UP-10).
 - **Resource:** detection threads drop O(rules) → O(mechanisms) (the Windows File mechanism
   additionally does O(watched directories) periodic identity-verification work since #5719 item 5,
-  one short-lived thread per directory per interval, so its steady-state cost is not O(mechanisms)); idle CPU,
+  one short-lived thread per directory per interval, so its steady-state cost is not O(mechanisms); the
+  Windows Registry mechanism does the same per watched key every interval when ENABLED, which is off by default,
+  floor 5 s, one short-lived detached worker per verification); idle CPU,
   wakeups/sec, **real OS thread count** (not the `watcher_units` gauge, which is a
   pool count, not `ps -T`, architect N1), and RSS old-vs-new via `/test` perf. This
   headline win is established at **rung 2** (Guardian becomes the consumer,
@@ -3144,7 +3146,9 @@ Each rung is an independently-governed PR on `dev`, run through the full
   no restart re-enforce storm).
 - Resource: `/test` perf shows the O(rules)→O(mechanisms) real-OS-thread drop at
   rung 2 (resident watch threads; the Windows File mechanism's periodic per-directory
-  verification threads since #5719 item 5 are extra and are not O(mechanisms)).
+  verification threads since #5719 item 5 are extra and are not O(mechanisms); the Windows Registry
+  mechanism's per-key verification workers are extra in the same way, but only when the operator
+  enables it: off by default, floor 5 s).
 - Health surface: `yuzu_fleet_spark_*` os-labelled gauges visible in UAT
   `recompute_metrics`; REST `/guaranteed-state/status[/{agent_id}]` and the
   `get_guardian_status` MCP tool return real per-rule health; a

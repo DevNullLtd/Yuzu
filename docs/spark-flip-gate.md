@@ -1787,7 +1787,13 @@ flip, with a red-first test each:
       paragraph below, and #7876 still owes the runtime switch for it and the File half). The Registry re-open cost is
       unmeasured at 50, 200 and 500 watched keys.
     - REG-15-I2: decide the Registry path verification interval per estate (`--spark-registry-path-verify-interval`,
-      0 where the watched keys carry auditing SACLs; the default is 0, off) before enabling it anywhere.
+      0 where the watched keys carry auditing SACLs; the default is 0, off) before enabling it anywhere. With the
+      default, flipping leaves the Registry parent-rename deaf watch (#7836 loss 6) open; enabling it is an estate
+      decision.
+    - File default (#7877 item 48): decide File's default (opt-in like Registry) or obtain the audit owner's sign-off;
+      a runtime off switch (#7876) alone does not stop the check being on by default at the flip.
+    - The pre-flip measurement of Security-log behaviour (#7877 item 39) covers watched DIRECTORIES (File: default ON,
+      every 5 s, and a UNC path means a periodic NTLM sign-in) as well as Registry keys; neither is measured.
     - #7877: the umbrella of the remaining verification residuals is triaged, File and Registry. The Registry items
       are item 31 (a rename followed by a re-creation of the path before the next sample is not noticed; ACCEPTED
       residual, Dave, no independent adjudicator) and two more accepted residuals found by the #7836 governance
@@ -1798,7 +1804,11 @@ flip, with a red-first test each:
       list. Items 35 to 40 (a probe lane of its own for the Registry verification, the admission backoff reset after
       a refused verification, a transient false fault on a delete-and-recreate, no signal for a check that cannot
       decide, the alert and cost measurement, and the missing tests) need code or tests and are triaged here, not
-      accepted. Items 41 and 42 are pre-existing test-helper lifetime items (the `FileProbeGate` and
+      accepted. Items 43 to 48 are also triaged here: 43 (the Registry `admission_attempts` ratchet: a refused
+      verification launch increments it and only a commit resets it), 44 (a File verification launch failure is
+      invisible to `verify_starved`), 45 (a File `stop()` with a hung verification is not counted as quarantined), 46
+      (the Registry armed-plus-Deferred state after a Lost verdict), 47 (the Registry flag's bad-value fatal exit
+      and its untested wiring) and 48 (the File default decision above). Items 41 and 42 are pre-existing test-helper lifetime items (the `FileProbeGate` and
       `ServiceProbeGate` hooks capture `this`; a `[&]` `probe_hook` in the "allocation failure after a probe
       launches" case).
     - #7901: a CI leg installs `dbus-daemon` and sets `YUZU_REQUIRE_SPARK_DBUS_TESTS`, so the Linux Service case runs.
@@ -1893,7 +1903,8 @@ flip, with a red-first test each:
     the watched key by path, and on a key that carries an auditing SACL that open can write a Security-log event, so an
     open per key per interval can push older events out of the Security log: irreversible and unmeasured. So
     `make_registry_mechanism(f3_counter, path_verify)` seeds the interval at ZERO (off; the default lives in the factory,
-    so a test calling the overload `agent.cpp` calls observes it), and the agent passes
+    so a test calling the factory with no second value observes the FACTORY default: that the flag reaches the factory is
+    pinned lexically by `tests/test_registry_verify_default_wiring_lexical.py`, not behaviourally), and the agent passes
     `clamp_registry_path_verify(spark_registry_path_verify_interval_s)` (0 stays 0, 1 to 4 becomes 5 s, `n` >= 5 becomes
     `n` s, ceiling 86400). The operator opts in at boot with `--spark-registry-path-verify-interval SECONDS` or
     `YUZU_AGENT_SPARK_REGISTRY_PATH_VERIFY_INTERVAL` (a negative or above-ceiling value is refused at startup, from either
@@ -1905,8 +1916,22 @@ flip, with a red-first test each:
     run**: a Registry watch whose parent key is renamed away is silently deaf again, as before the fix, until an operator
     opts in. The #7836 acceptance criterion 4 (an operator knob exists) is now met, boot-time only; criterion 1 (the rename
     is detected) holds only when the check is enabled. The tests count open attempts per key through a probe hook (zero
-    over a 6.5 s hold with the default, bounded by window over interval when enabled); Security-log behaviour (event 4656
-    counts, eviction) is NOT observed or asserted by any test, and no SACL is set in them.
+    over a 6.5 s hold with the default, fenced by a sweeper pass counter so a stalled box cannot end the hold early, and
+    bounded by window over interval when enabled); Security-log behaviour (event 4656
+    counts, eviction) is NOT observed or asserted by any test, and no SACL is set in them. At boot the agent logs ONE line
+    on every OS with the effective state (`Registry path verification: off (default)`, or `every N ms (opt-in; floor
+    5000 ms)`, with `(Windows only; ignored)` on Linux and macOS when a non-zero value is configured).
+    **What the default does NOT cover (REG-15-I2 residuals, none closed):** the flag governs only the periodic
+    verification opens; the failure-driven retry opens (30 s doubling to a 300 s cap, after a failed establishment or a
+    verdict) are unchanged by it and can write failure-audit events on an audited key; an estate that opts in carries the
+    full hazard, which is unmeasured; the File twin is unmitigated (ON by default, see the File default item above);
+    the cost at 50, 200 and 500 keys is unmeasured; the runtime off switch is still owed (#7876); and the persistence of
+    the value across a Windows service restart is not verified. **A bad value is fatal at boot, on every OS** (tracked as
+    #7877 item 47): a malformed or out-of-range `--spark-registry-path-verify-interval` or
+    `YUZU_AGENT_SPARK_REGISTRY_PATH_VERIFY_INTERVAL` refuses to start even where the flag is ignored, and `--spark-disable`
+    does not bypass the validation. On a Windows service that shows as Service Control Manager error 1053 with nothing in
+    the agent log. A trailing `#` comment on the environment line is fatal too, because a systemd `EnvironmentFile` does
+    not strip comments and the whole text becomes the value.
     **Open residuals of the Registry fix** (none is claimed as covered; the first three are ACCEPTED residuals, owner
     Dave, no independent adjudicator, tracked in #7877): a parent renamed away and a key re-created at
     the original path BEFORE the next sample is not noticed (#7877 item 31), because the fresh open succeeds and is not
@@ -2034,7 +2059,8 @@ flip, with a red-first test each:
     measured only up to 200 directories (author-reported, below). A rule path on a network share (a UNC path) makes it
     a periodic SMB session that authenticates as the machine account (an NTLM sign-in, by review; not measured), once
     per directory every 5 s, so audit and EDR owners must expect that sign-in and share traffic as well as local handle
-    requests. What is and is not known
+    requests. The pre-flip measurement of Security-log behaviour (#7877 item 39) must therefore cover these watched
+    directories (File: ON by default, every 5 s) as well as the Registry keys. What is and is not known
     about the cost: the only measurement is a non-committed probe at a 1 s interval over 30 s at 200 watched directories
     (3864 verifications, about 129 per second, which is a throughput ceiling and not a budget); no committed document
     carries a "share of a core" figure and none should be quoted from a review; above roughly 600 directories at the
@@ -2386,6 +2412,7 @@ flip, with a red-first test each:
     purpose: with a 1 s window the 5 s default mutation could not go red. Not observed or asserted by any of this: Security-log behaviour
     (event 4656 counts, eviction on a key with an auditing SACL); the tests count open attempts through the probe hook only. Not run: a Windows
     service restart with the value set (persistence on a service is NOT verified), any TSan run, any macOS build.
+    **Registry verification, final batch (boot log, `path_verify_ms`, default-chain tripwire, stall fence), rig bytes and runs.** Rig bytes (author-reported, weecolin Windows rig, not a CI run, logs not committed): the commits `0f98b85990` (production and header; whole-repo tree `c5f1fc3b42864715975f4c0f9c039448b9376c61`), `81b458717e` (tests; tree `2a77fd740a0f1af11d5d13a9261c15f29bc4dff6`) and `c2e1751015` (test fix; tree `606f3fbb3f8a079b7309394ddf8ff277baadf504`); md5 `0a07e58cae3693a033d5e0fa0c918a3d` for `test_spark_mechanism.cpp`, `6d46ad00f87c955406619bfeb3458f5a` for `spark_registry.cpp`, `cf2a85f1cc0f998de47740aed90c8f0f` for `spark_mechanism.hpp`, `6970b75feaf01df01a8dc3f3a61274f7` for `agent.cpp`, `37136dc381f338541931c867f601fdd2` for `main.cpp` and `c9c95d473e9e5fdeb8db143195721176` for `agent.hpp`, identical in the normal and the AddressSanitizer trees. The first run of the default-off case with a sweeper-pass fence that waited for two passes after one nudge FAILED on the rig (with the verification off the sweeper has no deadline to wake for, so one nudge is one pass); `c2e1751015` nudges twice instead. Normal build: `[mechanism]` 202 cases (5919 assertions), `[5719]` 77 (2339) and `[4415prA]` 105 (3544) green (before 201, 76, 105); `[known-gap-5719]` matches no case; the `Registry spark (real mechanism): *` pattern 32 cases (800 assertions) and the `File spark (real mechanism): *` pattern 54 cases (1689) green once; each of the eight Registry cases 20 of 20 green, and 50 of 50 green with one busy-loop process per logical core (16). MSVC AddressSanitizer build of the same bytes (same flags as above): the Registry pattern 3 times (32 cases each), `[5719]` 77, `[mechanism]` 202 and the File pattern (54) green, no AddressSanitizer report in any run. Linux debug: `[mechanism]` 64 cases (3543 assertions), `[5719]` 45 (1278) and `[4415prA]` 105 (3544) green. **Mutations** (each built from the restored source, 3 runs per case, restored md5 equal to the committed one): putting the compiled default back to 5 s in the constructor turned the default-off case red 3 of 3 (the other cases stayed green); removing the `count() > 0` guard at the sweeper's stage step turned it red 3 of 3; changing the `Config` field default to 5 turned the new cross-platform `Config` case red (Linux build); changing `main.cpp`'s `->default_val(0)` to 5 turned the lexical tripwire red. Not observed or asserted: Security-log behaviour; not run: a Windows service restart with the value set, any TSan run, any macOS build. The Registry cases add about 15 s of serial time to agent shard B on Windows (unmeasured in CI).
 - **Follow-ups (filed after #5497 merged: FU-1 is #5504; FU-2 to FU-5 are #5505; FU-6 and FU-7 are #5506; FU-8 and FU-9 are #5507).** (1) FU-1: measure the held-hold
   push rate and the endpoint journal eviction during a held period (a flip
   precondition, see AC-1). (2) FU-2: hang a full class quota of compensations, then
