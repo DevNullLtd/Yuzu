@@ -11487,6 +11487,11 @@ TEST_CASE("#5605 T12b: a poller reading the heartbeat getters while a wiring fai
         }
     });
     Join4045 join{poller};
+    // Declared after the join guard so it runs FIRST on any exit, including a REQUIRE that
+    // throws: the poller loops until stop_poller is set, so without this the join would wait
+    // forever. The normal path also stores it (idempotent) before its explicit join below.
+    yuzu::test::ScopeExit stop_on_unwind{
+        [&] { stop_poller.store(true, std::memory_order_release); }};
     REQUIRE(yuzu::test::spin_until([&] { return reads.load() > 0; })); // the poller is running
     engine.wire_spark_engine(&spark_engine, /*spark_disabled_by_config=*/false,
                              [](const OutboxEntry&) { return SendResult::Sent; });
