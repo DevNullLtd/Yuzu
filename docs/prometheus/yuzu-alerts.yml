@@ -4613,9 +4613,9 @@ groups:
   # These alerts carry `for:` windows and are for paging/escalation — they fire
   # AFTER the LB has already reacted, not before. The pool metrics come from
   # the pool's Observer feed; the reachability metrics from the probe.
-  # The three YuzuPgCollation* alerts are the exception: they are not load-balancer or
-  # readiness related (the collation check never changes /readyz), they read the
-  # collation-check series.
+  # The three YuzuPgCollation* alerts and YuzuDeviceCiWritesPaused are the exception: they are
+  # not load-balancer or readiness related (the collation check never changes /readyz), they
+  # read the collation-check series and the device_ci write-pause counter.
   - name: yuzu-postgres
     rules:
       - alert: YuzuServerPostgresUnreachable
@@ -4720,9 +4720,10 @@ groups:
             The database's recorded collation version is not the version the operating
             system of the PostgreSQL server reports, so text-keyed indexes may be ordered
             under the old rules. Ordered reads of a text key, such as a keyset page walk,
-            can then skip or repeat rows without any error. The server does not stop or change
-            anything because of this signal: it keeps serving, and the gauge and the log line
-            are the whole report.
+            can then skip or repeat rows without any error. The server keeps running and changes
+            nothing in the database, but on a replica that has seen the mismatch it pauses
+            device-CI writes (agents are told to resend later; see YuzuDeviceCiWritesPaused) and
+            refuses the bulk CI read; the text-keyed indexes of other stores are not gated.
             The mismatch is one shared database fact, so this is one alert for the Yuzu server
             job {{ $labels.job }}: any replica's gauge at 1 fires it, and it clears when every
             replica's gauge is 0 or absent (within about a minute of the repair). The gauges are
@@ -4811,7 +4812,9 @@ groups:
             at that cadence this takes about five to six failures, which depends on the
             Prometheus version and the scrape interval; do not rely on the exact count), so
             yuzu_pg_collation_version_mismatch is stale and says nothing about the database: a
-            mismatch could be present and unreported.
+            mismatch could be present and unreported. A replica that has had no conclusive
+            check since it started also refuses the bulk CI read (its collation gate
+            reads Unproven) while its device-CI writes are still accepted.
             Causes: PostgreSQL is down or unreachable, the pool is saturated (a lease cannot be had
             in time), a catalog read is not allowed, or the database records a collation version
             while the PostgreSQL host reports none (for example after a base image change under
@@ -4882,6 +4885,59 @@ groups:
             check, or a scrape gap) does not fire this alert: keep your own `up == 0` rule.
             Each replica exports its own series, so one database problem raises one alert per
             replica: group the notifications by alertname and job. Runbook:
+            docs/user-manual/server-admin.md, "PostgreSQL collation version".
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#postgresql-collation-version"
+
+      - alert: YuzuDeviceCiWritesPaused
+        # device_ci writes are being REFUSED on this replica because its collation gate reads
+        # Mismatch (DeviceInventoryStore::writes_deferred, device_ci_ingestion.cpp): every refused
+        # ingest and every refused decommission removal increments
+        # yuzu_device_ci_writes_deferred_total{op}, so a rise means data is being turned away
+        # now, which the mismatch gauge alone does not say (the gauge is per check, this counter
+        # is per refused write, and a replica whose gate has not flipped yet still accepts).
+        # Why [20m] and `for: 10m`, reasoned from the agent code and NOT measured: a refused
+        # device resends after a backoff that starts at 30 s, doubles per consecutive refusal up
+        # to 10 min, and carries up to 5 min of per-device jitter (agents/core/src/
+        # sync_scheduler.cpp), so a connected device is refused again within 15 min at the
+        # latest and a 20 min window keeps at least one refusal in it while that device stays
+        # paused (a 15 min window has no margin and can drop to 0 between two refusals of a
+        # one-device fleet, resetting the hold). The 10 m hold keeps a short pause from paging
+        # (the gate rechecks every minute, so a repair done within minutes never reaches it).
+        # `and yuzu_pg_collation_version_mismatch == 1` ties the alert to the CAUSE on the same
+        # instance (default all-label matching: both sides carry exactly job and instance, so no
+        # `on` narrowing): the write gate reads Mismatch exactly while that gauge is 1 (the gate
+        # is derived from the same last-conclusive state, pg_collation_check.cpp), so without the
+        # conjunct a range window would keep the alert true for up to 20 m AFTER the repair and
+        # page on a database that is already fixed. A replica with no connected device and no
+        # decommission in the window sees no refusal and does not fire:
+        # YuzuPgCollationVersionMismatch covers that case. The counter is pre-seeded at 0 on
+        # every replica, so increase() has a first sample. Per replica (each replica has its own
+        # gate and counter), so it stays per instance.
+        expr: |
+          sum by (job, instance) (increase(yuzu_device_ci_writes_deferred_total[20m])) > 0
+          and
+          yuzu_pg_collation_version_mismatch == 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Yuzu server {{ $labels.instance }}: device-CI writes have been paused for at least 10 minutes by a PostgreSQL collation mismatch"
+          description: >-
+            This replica has been refusing device-CI writes (agent ingest and decommission
+            removals) for at least 10 minutes because the PostgreSQL collation version of the
+            database differs from the operating system's. Nothing is stored for the refused
+            reports: ci.last_seen of the affected devices stops advancing, each device resends
+            its full CI record on the agent's backoff (up to about 15 minutes), and a
+            decommission of such a device answers 500 with details.write_paused and is not
+            complete until it is re-issued after the repair. The bulk CI read is refused (503)
+            and the per-device CI reads are degraded on this replica meanwhile. Writes and
+            reads resume on their own, with no restart, when the next collation check finds the
+            versions equal (every minute while the gate is not Trusted). Not covered: other
+            stores' text-keyed unique indexes (for example endpoint_state) and agent
+            registration are not gated, and a replica that has not yet seen the mismatch (up to
+            an hour) still accepts writes. Per replica: with N replicas one mismatch can raise
+            up to N of these; group the notifications by alertname and job. Remedy: reindex and
+            then refresh the recorded version, as in YuzuPgCollationVersionMismatch. Runbook:
             docs/user-manual/server-admin.md, "PostgreSQL collation version".
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#postgresql-collation-version"
 
