@@ -15,11 +15,8 @@
 ///            2026-11-16; Draft 2020-12). Specification source: https://github.com/Ecma-TC54/ECMA-428
 ///            (the `$schema` of a document is the pinned version; any other value is refused).
 ///
-/// NOT A FORMAT: OpenEoX (OASIS). As read on 2026-11-16, OpenEoX Core 1.0 is a Committee
-/// Specification Draft (CSD 01, https://docs.oasis-open.org/openeox/eox-core/v1.0/csd01/) and
-/// its document holds dates only: no product, vendor or version, so it cannot key a rule. The
-/// schema that names a product (the "shell") is unpublished. `parse_format("openeox")` is
-/// nullopt like any unknown token.
+/// NOT A FORMAT: OpenEoX (OASIS). Its published core document holds dates only (no product,
+/// vendor or version), so it cannot key a rule; the evidence and the follow-up are in #8000.
 ///
 /// WHAT A CLE DOCUMENT BECOMES (the rule model matches by dot-component PREFIX, so an exact version
 /// or a range cannot be stored without claiming other versions: `3.8` would also match `3.8.10`)

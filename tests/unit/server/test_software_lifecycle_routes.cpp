@@ -259,7 +259,9 @@ TEST_CASE("lifecycle routes: a refused import is a 4xx with a reason, audited de
         {"unknown format", "?format=openeox&name=f", kCsv, 400},
         {"upper-case format", "?format=CSV&name=f", kCsv, 400},
         {"format twice", "?format=csv&format=cle&name=f", kCsv, 400},
-        {"body over the cap", "?format=csv&name=f", over, 413},
+        // The rig has no post-read stage, so the parser's bound answers 400. The 413 is the
+        // body-cap row's, ahead of routing (pinned in test_body_cap_policy.cpp).
+        {"body over the parser bound", "?format=csv&name=f", over, 400},
         {"malformed csv", "?format=csv&name=f", "not,a,rule,file\n", 400},
         {"empty csv", "?format=csv&name=f", "", 400},
         {"malformed json", "?format=cle&name=f", "{not json", 400},

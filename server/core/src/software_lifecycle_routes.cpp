@@ -127,6 +127,9 @@ void SoftwareLifecycleRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         // The gate runs ahead of the body, the format and the name are looked at.
         if (!deps.perm_fn(req, res, "Inventory", "Write"))
             return;
+        // The content type is not read. httplib folds an application/x-www-form-urlencoded body
+        // into the request parameters, and the exactly-once counts below refuse a repeated
+        // `name` or `format`.
         const std::string name_raw =
             req.get_param_value_count("name") == 1 ? req.get_param_value("name") : std::string{};
         const std::string target = audit_token(name_raw.substr(0, kLifecycleImportNameMaxBytes));
@@ -143,11 +146,6 @@ void SoftwareLifecycleRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                                 : std::nullopt;
         if (!format) {
             refuse(req, res, 400, kVerbImport, target, "format must be " + format_list());
-            return;
-        }
-        if (req.body.size() > li::kImportMaxBytes) {
-            refuse(req, res, 413, kVerbImport, target,
-                   "body exceeds " + std::to_string(li::kImportMaxBytes) + " bytes");
             return;
         }
         auto parsed = li::parse(*format, req.body, name_raw);

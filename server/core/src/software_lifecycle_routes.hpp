@@ -62,13 +62,8 @@ lifecycle_import_name_defect(std::string_view name) {
 /// rule source, and anything else is nullopt.
 [[nodiscard]] inline std::optional<LifecycleSource>
 lifecycle_rules_listable_source(std::string_view token) {
-    if (token == "imported")
-        return LifecycleSource::imported;
-    if (token == "shipped")
-        return LifecycleSource::shipped;
-    if (token == "external")
-        return LifecycleSource::external;
-    return std::nullopt;
+    const auto source = parse_lifecycle_source(token);
+    return source && *source != LifecycleSource::declared ? source : std::nullopt;
 }
 
 class SoftwareLifecycleRoutes {

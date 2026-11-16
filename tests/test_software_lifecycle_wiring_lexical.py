@@ -245,23 +245,9 @@ MUTATIONS = [
         lambda t: t.replace(ROUTES_REGISTER, REST_REGISTER + ");\n        " + ROUTES_REGISTER, 1),
         "R11",
     ),
-    (
-        "routes handed no permission gate",
-        "server",
-        edit_routes_dep(ROUTES_DEPS[0], ".perm_fn = nullptr"),
-        "R11",
-    ),
-    (
-        "routes handed no store",
-        "server",
-        edit_routes_dep(ROUTES_DEPS[2], ".store = nullptr"),
-        "R11",
-    ),
-    (
-        "routes handed no audit gate",
-        "server",
-        edit_routes_dep(ROUTES_DEPS[1], ".audit_fn = nullptr"),
-        "R11",
+    *(
+        (f"routes Deps lose '{dep}'", "server", edit_routes_dep(dep, dep.split(" = ")[0] + " = nullptr"), "R11")
+        for dep in ROUTES_DEPS
     ),
     ("Deps wiring dropped", "server", lambda t: t.replace(DEPS_WIRING, ".x = nullptr", 1), "R5"),
     (
