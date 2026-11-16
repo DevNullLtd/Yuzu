@@ -56,19 +56,18 @@ inline constexpr std::int64_t kDefaultMaxRows = 5'000'000;
 inline constexpr std::int64_t kDefaultMaxBytes = std::int64_t{1} << 30; // 1 GiB
 inline constexpr std::int64_t kMinMaxRows = kPageRows;
 inline constexpr std::int64_t kMinMaxBytes = std::int64_t{1} << 20;     // 1 MiB
-inline constexpr std::int64_t kCeilingMaxRows = 1'000'000'000;
-inline constexpr std::int64_t kCeilingMaxBytes = std::int64_t{1} << 40; // 1 TiB
 
 struct Limits {
     std::int64_t max_rows{kDefaultMaxRows};
     std::int64_t max_bytes{kDefaultMaxBytes};
 };
 
-/// The accepted range, applied at registration so a caller that skipped the flag validator (a test,
-/// a future call site) can never turn a limit into "none": 0 or a negative reads as the floor.
+/// Applied at registration so a caller that skipped the flag validator (a test, a future call site)
+/// can never turn a limit into "none": 0 or a negative reads as the floor. The ceilings are the
+/// flags' own range (main.cpp).
 [[nodiscard]] constexpr Limits clamp_limits(Limits l) noexcept {
-    l.max_rows = std::clamp(l.max_rows, kMinMaxRows, kCeilingMaxRows);
-    l.max_bytes = std::clamp(l.max_bytes, kMinMaxBytes, kCeilingMaxBytes);
+    l.max_rows = std::max(l.max_rows, kMinMaxRows);
+    l.max_bytes = std::max(l.max_bytes, kMinMaxBytes);
     return l;
 }
 

@@ -197,7 +197,7 @@ TEST_CASE("export cap: the flag is clamped to the accepted range, never to 0 (wh
           static_cast<std::size_t>(swe::kDefaultConcurrency));
 }
 
-TEST_CASE("export limits: a cap is a true maximum, the ranges clamp, and 0 never means unlimited",
+TEST_CASE("export limits: a cap is a true maximum, the floor clamps, and 0 never means unlimited",
           "[software_export][stream][limit]") {
     constexpr swe::Limits l{.max_rows = 2'000, .max_bytes = 5'000};
     CHECK(swe::within_limits(l, 0, 0, 2'000, 5'000));      // exactly at both: allowed
@@ -208,9 +208,6 @@ TEST_CASE("export limits: a cap is a true maximum, the ranges clamp, and 0 never
     const auto lo = swe::clamp_limits({.max_rows = 0, .max_bytes = -1});
     CHECK(lo.max_rows == swe::kMinMaxRows);
     CHECK(lo.max_bytes == swe::kMinMaxBytes);
-    const auto hi = swe::clamp_limits({.max_rows = std::int64_t{1} << 60, .max_bytes = std::int64_t{1} << 60});
-    CHECK(hi.max_rows == swe::kCeilingMaxRows);
-    CHECK(hi.max_bytes == swe::kCeilingMaxBytes);
     const auto def = swe::clamp_limits({});
     CHECK(def.max_rows == swe::kDefaultMaxRows);
     CHECK(def.max_bytes == swe::kDefaultMaxBytes);

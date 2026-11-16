@@ -877,30 +877,6 @@ TEST_CASE("export route: the wall-clock deadline aborts the transfer and frees t
     CHECK(next->status == 200);
 }
 
-// Drives the provider to its end or its abort; returns the bytes written and whether it ended
-// cleanly (sink.done) so a limit test can tell a cut stream from a complete one.
-struct Cut {
-    std::string body;
-    bool done{false};
-    int pages{0};
-};
-Cut drive_to_end(httplib::Response& res) {
-    Cut c;
-    httplib::DataSink sink;
-    sink.write = [&](const char* p, size_t n) {
-        c.body.append(p, n);
-        return true;
-    };
-    sink.is_writable = [] { return true; };
-    sink.done = [&] { c.done = true; };
-    while (!c.done && c.pages < 100'000) {
-        ++c.pages;
-        if (!res.content_provider_(0, 0, sink))
-            break;
-    }
-    return c;
-}
-
 TEST_CASE("export route: the row limit cuts the stream before the page that would pass it, in both "
           "formats, and the metric says limit",
           "[software_export][routes][limit]") {
@@ -911,8 +887,8 @@ TEST_CASE("export route: the row limit cuts the stream before the page that woul
             h.generated = 3'500;
             auto res = h.get(std::string("?format=") + format);
             REQUIRE(res);
-            const auto cut = drive_to_end(*res);
-            CHECK_FALSE(cut.done); // cut: no terminating chunk
+            const auto cut = drive(*res);
+            CHECK(cut.aborted); // cut: no terminating chunk
             const auto lines = lines_of(cut.body);
             // One full page of 1,000 rows (+ the CSV header), never a row of the second.
             CHECK(lines.size() == 1'000 + (std::string(format) == "csv" ? 1u : 0u));
@@ -935,8 +911,8 @@ TEST_CASE("export route: the byte limit cuts the stream and never lets the body 
             h.generated = 30'000; // far more than 1 MiB of rows
             auto res = h.get(std::string("?format=") + format);
             REQUIRE(res);
-            const auto cut = drive_to_end(*res);
-            CHECK_FALSE(cut.done);
+            const auto cut = drive(*res);
+            CHECK(cut.aborted);
             CHECK(cut.body.size() <= static_cast<std::size_t>(swe::kMinMaxBytes));
             CHECK(cut.body.size() > 0); // at least one page fitted
             release(*res, false);
@@ -952,8 +928,9 @@ TEST_CASE("export route: a result inside both limits still ends cleanly and coun
     h.generated = 1'000; // exactly the row limit: allowed (a cap is a maximum, not a threshold)
     auto res = h.get("?format=jsonl");
     REQUIRE(res);
-    const auto cut = drive_to_end(*res);
+    const auto cut = drive(*res);
     CHECK(cut.done);
+    CHECK_FALSE(cut.aborted);
     CHECK(lines_of(cut.body).size() == 1'000);
     release(*res, true);
     CHECK(h.count("jsonl", "completed") == 1);
