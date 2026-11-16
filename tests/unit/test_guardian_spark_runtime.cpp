@@ -16246,6 +16246,18 @@ TEST_CASE("#5605 T5: the mirror equals the map size after concurrent staging, sn
     std::atomic<bool> stagers_done{false};
     std::atomic<int> finished{0};
     std::vector<std::thread> stagers;
+    std::thread drainer;
+    // Declared BEFORE the first thread is created and destroyed AFTER them: a joinable
+    // std::thread destructor is std::terminate(), so if a later thread constructor throws (or a
+    // check unwinds) this must still stop and join the drainer and every stager already started.
+    yuzu::test::ScopeExit join_all{[&] {
+        stagers_done.store(true);
+        for (auto& th : stagers)
+            if (th.joinable())
+                th.join();
+        if (drainer.joinable())
+            drainer.join();
+    }};
     for (int t = 0; t < kThreads; ++t) {
         stagers.emplace_back([&, t] {
             for (int i = 0; i < kPerThread; ++i)
@@ -16257,7 +16269,7 @@ TEST_CASE("#5605 T5: the mirror equals the map size after concurrent staging, sn
     }
     // One drainer snapshots and erases in a loop, exactly like the persister's pass. The counted
     // self-heal inside snapshot/erase checks the mirror on every iteration (asserted at the end).
-    std::thread drainer([&] {
+    drainer = std::thread([&] {
         while (!stagers_done.load()) {
             const auto got = rt->snapshot_staged_baselines();
             rt->erase_staged_baselines_if_unchanged(got);
