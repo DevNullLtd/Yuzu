@@ -34,8 +34,9 @@ CollationVerdict decide_collation_verdict(const CollationFacts& facts) noexcept 
 
 std::string invalid_index_failure_text() {
     return std::string("an invalid index exists in schema ") + kDeviceInventoryStoreSchema +
-           ", typically a leftover of a failed REINDEX ... CONCURRENTLY; drop or rebuild it; the "
-           "gate is held";
+           ", typically a leftover of a failed REINDEX ... CONCURRENTLY; drop or rebuild it, and "
+           "still reindex the original index (dropping only the leftover reopens the gate over "
+           "the stale original index); the gate is held";
 }
 
 const char* to_string(CollationVerdict v) noexcept {

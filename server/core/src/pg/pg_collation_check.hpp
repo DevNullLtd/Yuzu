@@ -19,11 +19,12 @@
 /// booting whatever the verdict, because an operator must be able to start the server to fix the
 /// database. Besides the gauge and the log it publishes a lock-free `CollationGate` (below) that
 /// the consumers read: a Mismatch pauses device_ci writes, and any gate other than Trusted
-/// refuses the device_ci reads that walk the text key. It runs once at start and is repeated by `PgCollationRecheck` (hourly once a conclusive Ok or
-/// NotApplicable stands and the checks are readable; every minute while a Mismatch stands, no
-/// conclusive verdict exists yet, or the latest check was unreadable), so drift that appears while
-/// the server keeps running (a provider maintenance event that changes the host library) is seen,
-/// and a fixed database clears the gauge without a restart.
+/// refuses the device_ci reads that walk the text key. It runs once at start and is repeated by
+/// `PgCollationRecheck` (hourly once a conclusive Ok or NotApplicable stands and the checks are
+/// readable; every minute while a Mismatch stands, no conclusive verdict exists yet, or the latest
+/// check was unreadable), so drift that appears while the server keeps running (a provider
+/// maintenance event that changes the host library) is seen, and a fixed database clears the
+/// gauge without a restart.
 ///
 /// WHAT A REPEAT REPORTS. A second pure function (`next_collation_state`) maps the previous
 /// state and the new verdict to the new state, a gauge action and a log action, so that the gauge

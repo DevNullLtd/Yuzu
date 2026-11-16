@@ -304,7 +304,7 @@ TEST_CASE("PgCollationRecheck: stop waits out a check in flight and reports noth
 }
 
 // request_stop(): the signal half of stop(), so ServerImpl::stop() can tell the loop to wind down
-// at the start of teardown and join it later (a check in flight can take about 15 s). The wait is
+// at the start of teardown and join it later (a check in flight can take about 20 s). The wait is
 // bounded everywhere, and a failure never leaves a spinning loop thread behind (the Finish guard).
 
 TEST_CASE("PgCollationRecheck: request_stop returns while a check is in flight, drops its report "
