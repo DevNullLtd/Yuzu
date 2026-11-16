@@ -24,6 +24,7 @@
  * the intersection was deleted (CDX-R8-02).
  */
 
+#include "agent_decommission.hpp"
 #include "authz_model.hpp"
 #include "management_group_store.hpp"
 #include "rbac_store.hpp"
@@ -739,4 +740,127 @@ TEST_CASE("authz_model meet: commutative and associative", "[authz_model][meet]"
     CHECK(*left_assoc == *right_assoc); // associative
     CHECK(left_assoc->size() == 1);
     CHECK(left_assoc->contains("a_3"));
+}
+
+// ── MG PR-5a: decommission narrows what a group-confined caller sees ─────────────────────────────
+//
+// The removal is driven through AgentDecommission (the feature's entry point), not a bare store call.
+// Exact sets, never "non-empty". Two visibility semantics are asserted separately because they
+// differ: the RBAC path (`visible_agents_for_permission`, which expands descendant groups) and the
+// legacy `get_visible_agents` (a direct join of members to role-assigned groups only).
+namespace {
+void decommission_memberships(yuzu::server::ManagementGroupStore& mgmt, const std::string& id) {
+    yuzu::server::AgentDecommission cascade{
+        yuzu::server::AgentDecommissionStores{.management_group_memberships = &mgmt}};
+    const auto r = cascade.decommission(id);
+    REQUIRE(r.ok());
+    REQUIRE(r.deleted == 1);
+}
+
+std::vector<std::string> sorted_vec(std::vector<std::string> v) {
+    std::sort(v.begin(), v.end());
+    return v;
+}
+} // namespace
+
+TEST_CASE("authz_model MG PR-5a: decommission removes the agent from a group-confined caller's "
+          "RBAC-visible set (hierarchical)",
+          "[pg][authz][decommission]") {
+    Rig r;
+    // alice holds ExecReader on the PARENT group P; the RBAC path expands to C1 and C2.
+    r.group_assign(r.gP, "alice", "ExecReader");
+
+    auto before = r.rbac.visible_agents_for_permission("alice", "Execution", "Execute", &r.mgmt);
+    REQUIRE(before.has_value());
+    CHECK(sorted_vec(*before) == sorted_vec({"a_p", "a_c1", "a_c2"}));
+    CHECK(r.rbac.check_scoped_permission("alice", "Execution", "Execute", "a_c1", &r.mgmt));
+    auto composed_before = compose_exec_visible(r.rbac, "alice", &r.mgmt);
+    REQUIRE(composed_before.has_value());
+    CHECK(composed_before->size() == 3);
+
+    decommission_memberships(r.mgmt, "a_c1");
+
+    auto after = r.rbac.visible_agents_for_permission("alice", "Execution", "Execute", &r.mgmt);
+    REQUIRE(after.has_value());
+    CHECK(sorted_vec(*after) == sorted_vec({"a_p", "a_c2"}));
+    CHECK_FALSE(r.rbac.check_scoped_permission("alice", "Execution", "Execute", "a_c1", &r.mgmt));
+    CHECK(r.rbac.check_scoped_permission("alice", "Execution", "Execute", "a_c2", &r.mgmt));
+    auto composed_after = compose_exec_visible(r.rbac, "alice", &r.mgmt);
+    REQUIRE(composed_after.has_value());
+    CHECK(composed_after->size() == 2);
+    CHECK_FALSE(composed_after->contains("a_c1"));
+    // The other groups' members are untouched.
+    CHECK(r.mgmt.get_agent_groups("a_s").value() == std::vector<std::string>{r.gS});
+}
+
+TEST_CASE("authz_model MG PR-5a: decommission removes the agent from the legacy direct-membership "
+          "visible set",
+          "[pg][authz][decommission]") {
+    Rig r;
+    // dora holds ExecReader on C1 itself, so the legacy join (members x role-assigned groups) sees
+    // exactly a_c1.
+    r.group_assign(r.gC1, "dora", "ExecReader");
+    auto before = r.mgmt.get_visible_agents("dora");
+    REQUIRE(before.has_value());
+    CHECK(sorted_vec(*before) == sorted_vec({"a_c1"}));
+
+    // And a parent-group grant does NOT reach a child's direct members on this path: alice on P
+    // sees only a_p (the hierarchical expansion is the RBAC path above, not this one).
+    r.group_assign(r.gP, "alice", "ExecReader");
+    CHECK(sorted_vec(r.mgmt.get_visible_agents("alice").value()) == sorted_vec({"a_p"}));
+
+    decommission_memberships(r.mgmt, "a_c1");
+
+    auto after = r.mgmt.get_visible_agents("dora");
+    REQUIRE(after.has_value()); // a value, not a degrade
+    CHECK(after->empty());
+    CHECK(sorted_vec(r.mgmt.get_visible_agents("alice").value()) == sorted_vec({"a_p"}));
+}
+
+// D2 consequence, pinned so it is a known property and not a surprise. With RBAC enforcement OFF the
+// legacy path answers `all_member_agents()` (every agent that has at least one membership row), so an
+// agent with NO membership rows, such as a decommissioned but still-connected agent, drops out of
+// every legacy-open operator's visible set until its next Register re-adds the ROOT group.
+TEST_CASE("authz_model MG PR-5a: with RBAC off, a decommissioned agent drops out of the legacy "
+          "visible set until it registers again",
+          "[pg][authz][decommission]") {
+    Rig r;
+    r.mgmt.set_rbac_enabled_probe([] { return false; });
+
+    auto before = r.mgmt.get_visible_agents("any-operator");
+    REQUIRE(before.has_value());
+    CHECK(sorted_vec(*before) == sorted_vec({"a_p", "a_c1", "a_c2", "a_s"}));
+
+    decommission_memberships(r.mgmt, "a_c1");
+    auto after = r.mgmt.get_visible_agents("any-operator");
+    REQUIRE(after.has_value());
+    CHECK(sorted_vec(*after) == sorted_vec({"a_p", "a_c2", "a_s"}));
+
+    // Register's one membership write brings it back (here a group stands in for the root group).
+    REQUIRE(r.mgmt.add_member(r.gP, "a_c1").has_value());
+    auto back = r.mgmt.get_visible_agents("any-operator");
+    REQUIRE(back.has_value());
+    CHECK(back->size() == 4);
+}
+
+// D4 pin. A caller whose ONLY Decommission:Delete is group-scoped passes the scoped check while the
+// agent is a member and is denied once the memberships are gone, so after a PARTIAL decommission that
+// caller cannot re-issue the DELETE (an Administrator with a global grant still can). Synthetic,
+// out-of-band authority: no shipped route can create such a holder (group scope assigns only
+// Operator/Viewer, neither seeded with Decommission:Delete, and set_permission has no route caller),
+// so this is a tripwire for the day one can.
+TEST_CASE("authz_model MG PR-5a: a group-scoped Decommission:Delete holder is denied once the "
+          "memberships are gone (D4 pin)",
+          "[pg][authz][decommission]") {
+    Rig r;
+    REQUIRE(r.rbac.create_role({"DecomScoped", "", false, 0}).has_value());
+    REQUIRE(r.rbac.set_permission({"DecomScoped", "Decommission", "Delete", "allow"}).has_value());
+    r.group_assign(r.gC1, "erin", "DecomScoped");
+
+    CHECK(r.rbac.check_scoped_permission("erin", "Decommission", "Delete", "a_c1", &r.mgmt));
+    CHECK_FALSE(r.rbac.check_scoped_permission("erin", "Decommission", "Delete", "a_c2", &r.mgmt));
+
+    decommission_memberships(r.mgmt, "a_c1");
+
+    CHECK_FALSE(r.rbac.check_scoped_permission("erin", "Decommission", "Delete", "a_c1", &r.mgmt));
 }
