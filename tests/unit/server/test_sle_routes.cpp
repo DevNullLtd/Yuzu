@@ -437,6 +437,38 @@ TEST_CASE("sle erase: a nine-entry stores result is passed through per store (ro
     }
 }
 
+// A write pause (a collation mismatch) is a Failed store with a DISTINCT reason: the 500 keeps its
+// status but names the pause and says to retry after the repair; a plain Failed store keeps the
+// generic text and carries no `write_paused` detail.
+TEST_CASE("sle erase: a paused device_inventory removal gets a distinct 500 reason", "[sle_routes]") {
+    {
+        SleHarness h;
+        h.allow_scoped_all = true;
+        h.decommission_result = ok_result();
+        h.decommission_result.failed = 1;
+        h.decommission_result.stores.push_back(
+            {"device_inventory", DecommissionOutcome::Failed, "paused", /*write_paused=*/true});
+        auto res = h.sink.Delete("/api/v1/sle/agents/agent-1");
+        REQUIRE(res);
+        CHECK(res->status == 500);
+        CHECK(contains(res->body, "not attempted"));
+        CHECK(contains(res->body, "collation mismatch"));
+        const auto j = json::parse(res->body);
+        CHECK(j["error"]["details"]["write_paused"] == json::array({"device_inventory"}));
+        CHECK(h.audited("sle.agent.decommission|partial"));
+    }
+    {
+        SleHarness h;
+        h.allow_scoped_all = true;
+        h.decommission_result = partial_result();
+        auto res = h.sink.Delete("/api/v1/sle/agents/agent-1");
+        REQUIRE(res);
+        CHECK(res->status == 500);
+        CHECK_FALSE(contains(res->body, "collation"));
+        CHECK_FALSE(contains(res->body, "write_paused"));
+    }
+}
+
 // Kills: the outcome row's persist failure being invisible (a (void)try_persist_audit that
 // never sets the header), which left the page client's warning branch dead.
 TEST_CASE("sle erase: a lost OUTCOME audit row sets Sec-Audit-Failed on the 200 and on the partial 500",

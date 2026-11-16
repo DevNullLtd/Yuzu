@@ -282,11 +282,20 @@ void SleRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_perm_fn
 
             std::string breakdown;
             json stores = json::object();
+            json paused = json::array(); // stores whose removal was not attempted: write pause
             for (const auto& s : r.stores) {
                 stores[s.store] = to_string(s.outcome);
                 breakdown += s.store;
                 breakdown += '=';
                 breakdown += to_string(s.outcome);
+                breakdown += ' ';
+                if (s.write_paused)
+                    paused.push_back(s.store);
+            }
+            if (!paused.empty()) {
+                breakdown += "write_paused=";
+                for (const auto& n : paused)
+                    breakdown += n.get<std::string>() + ",";
                 breakdown += ' ';
             }
             // The attempt row above is the fail-closed evidence; a lost OUTCOME row is
@@ -304,16 +313,29 @@ void SleRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_perm_fn
                 // see WHICH store failed (and which already erased) from the response
                 // itself — not only by pulling the audit log. Idempotent re-DELETE
                 // then targets the remaining failures.
+                // A write pause is not a database fault: say so, and say when to retry. The
+                // status stays 500 (the cascade is incomplete either way).
+                const std::string msg =
+                    paused.empty()
+                        ? "agent decommission incomplete — one or more stores failed (" +
+                              std::to_string(r.failed) +
+                              " failed); re-issue the DELETE (the cascade is idempotent)"
+                        : "agent decommission incomplete: the removal was not attempted for " +
+                              paused.dump() +
+                              " because device-CI writes are paused by a PostgreSQL collation "
+                              "mismatch (" +
+                              std::to_string(r.failed) +
+                              " failed); re-issue the DELETE (the cascade is idempotent) only "
+                              "after the collation repair";
+                json details{{"stores", stores},
+                             {"deleted", static_cast<std::int64_t>(r.deleted)},
+                             {"skipped", static_cast<std::int64_t>(r.skipped)},
+                             {"failed", static_cast<std::int64_t>(r.failed)}};
+                if (!paused.empty())
+                    details["write_paused"] = paused;
                 send_json(res, 500,
-                          a4_error(500,
-                                   "agent decommission incomplete — one or more stores failed (" +
-                                       std::to_string(r.failed) +
-                                       " failed); re-issue the DELETE (the cascade is idempotent)",
-                                   cid, 5000, "retry the request", /*permission=*/{},
-                                   json{{"stores", stores},
-                                        {"deleted", static_cast<std::int64_t>(r.deleted)},
-                                        {"skipped", static_cast<std::int64_t>(r.skipped)},
-                                        {"failed", static_cast<std::int64_t>(r.failed)}}));
+                          a4_error(500, msg, cid, 5000, "retry the request", /*permission=*/{},
+                                   std::move(details)));
                 return;
             }
             json data;
