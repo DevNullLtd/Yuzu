@@ -2992,17 +2992,26 @@ The step compiles the pilots' build targets (the union of `build_targets` in
 **before** it takes a slot, then runs the collector inside the slot; the
 collector's own `meson compile -j 2` finds nothing to do. Before this, that
 compile ran inside the slot at two jobs: across the 20 gcc-15 debug jobs of
-2026-11-15 and -16 the step took 6 to 50 min, and in one sampled run the
-build was 996 s of 1,022 s (the six pilots ran in 26 s), all while holding one
-of the three slots the Linux test step also needs. A failed precompile is a
-warning only: the collector repeats the build and records the failure in its
-evidence, as before. The Configure step sets `CCACHE_NOHASHDIR=1` for this leg
-only: ccache otherwise hashes the working directory for a `-g` compile, so the
-contract build directory never reused the standard build's objects. The step
-prints the precompile's wall time and its own ccache hit and miss counts (from
-a per-step stats log, since the cache is shared by all four runners). The
-first run of each runner after this change rebuilds the gcc-15 debug leg cold
-once, because the cache keys change.
+2026-11-15 and -16 the step took 6 to 50 min (slot wait included), and in one
+sampled run the build was 996 s and the six pilots ran in 26 s, all while
+holding one of the three slots the Linux test step also needs. A compile
+error in the precompile is a warning only: the collector repeats the build
+and records the failure in its evidence. A precompile that runs past the
+job's 90-minute limit cancels the job, which uploads no bundle, as a slow
+collector build could before. The Configure step sets `CCACHE_NOHASHDIR=1`
+for this leg only: ccache otherwise hashes the working directory for a `-g`
+compile, so the contract build directory never reused the standard build's
+objects (the two directories' compile commands are identical). The cost is
+debug info only: an object's recorded compile directory may name the other
+build directory, or another runner's workspace, and nothing in this leg reads
+it. The step prints the precompile's wall time with its own ccache hit and
+miss counts (from a per-step stats log, since the cache's global counters mix
+all four runners), and the collector's time including its slot wait. The
+job's overall ccache hit rate now also counts the precompile, so it is not
+comparable with earlier runs. The first gcc-15 debug run on each runner after
+this change rebuilds that leg cold once, because the cache keys change (each
+runner's include paths name its own workspace, so the runners do not share
+these entries).
 
 ### Persistent runner-local test history
 

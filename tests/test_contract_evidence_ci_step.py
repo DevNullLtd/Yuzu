@@ -2,17 +2,19 @@
 """Pin how ci.yml's Linux "Contract migration evidence" step builds the pilots.
 
 The step used to leave the build to the collector, which compiled the pilots'
-targets at -j2 inside a heavy-test slot: 7-50 min of slot time for six tests
-that run in under half a minute, while the Linux test step waited for the
-same three slots. Three things keep that from coming back:
+targets at -j2 inside a heavy-test slot: the step took 6 to 50 min for six
+tests that run in under half a minute, while the Linux test step waited for
+the same three slots. Four things keep that from coming back:
 
   1. the step compiles the pilots' targets at "$YUZU_BUILD_JOBS" BEFORE the
      with-test-slot call that runs the collector;
   2. the target list is read from tests/contracts/pilots.json, so a new pilot's
      targets are precompiled too rather than falling back to the slow path;
   3. the Configure step turns ccache's hash_dir off for the gcc-15 debug leg
-     (the only leg with a contract build dir), so that second build dir reuses
-     the standard build's objects.
+     (the only leg with a contract build dir), and only that leg, so that
+     second build dir reuses the standard build's objects;
+  4. a failed precompile stays a warning: the collector and the evidence
+     bundle still run after it.
 
 Lexical and hermetic: reads ci.yml and pilots.json, runs nothing.
 """
@@ -61,14 +63,22 @@ class ContractStepPrecompile(unittest.TestCase):
                         'the pilots must be compiled before a heavy-test slot is taken')
 
     def test_precompile_is_bounded_and_not_fatal(self):
-        script = self.contract['run']
-        self.assertIn('timeout "$YUZU_CONTRACT_BUILD_TIMEOUT_S"', script)
-        self.assertIn('|| echo "::warning::contract pilot precompile failed', script)
+        code = '\n'.join(self.lines)
+        self.assertIn('timeout -k 30 "$YUZU_CONTRACT_BUILD_TIMEOUT_S"', code)
+        # The warning is the whole fallback: no exit/return/false after it, and
+        # the if-block closes on the next line.
+        self.assertRegex(code, r'\|\| echo "::warning::contract pilot precompile failed[^"\n]*"\nfi\n')
+        warn_at = self.index_of('::warning::contract pilot precompile failed')
+        self.assertLess(warn_at, self.index_of('with-test-slot.sh'))
+        self.assertLess(self.index_of('with-test-slot.sh'),
+                        self.index_of('contract-evidence.py bundle'))
 
     def test_targets_come_from_the_pilot_registry(self):
-        at = self.index_of('mapfile -t contract_targets')
+        at = self.index_of('contract_targets_list=$(python3 -c')
         self.assertIn('tests/contracts/pilots.json', self.lines[at])
         self.assertIn('build_targets', self.lines[at])
+        self.assertIn('read -r -a contract_targets <<< "$contract_targets_list"',
+                      self.lines[at + 2])
         with open(os.path.join(ROOT, 'tests', 'contracts', 'pilots.json'), encoding='utf-8') as f:
             targets = {t for r in json.load(f)['contracts'] for t in r['build_targets']}
         self.assertIn('yuzu_server_tests', targets,
@@ -76,9 +86,12 @@ class ContractStepPrecompile(unittest.TestCase):
                       'no pilot needs it any more')
 
     def test_hash_dir_off_for_the_contract_leg_only(self):
-        script = step('Configure (Meson)')['run']
-        self.assertIn('if [[ "$BUILDDIR" == build-linux-gcc-15-debug ]]; then', script)
-        self.assertIn('echo "CCACHE_NOHASHDIR=1" >> "$GITHUB_ENV"', script)
+        code = '\n'.join(code_lines(step('Configure (Meson)')['run']))
+        self.assertIn('BUILDDIR=build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}', code)
+        self.assertRegex(code, r'if \[\[ "\$BUILDDIR" == build-linux-gcc-15-debug \]\]; then\n'
+                               r'echo "CCACHE_NOHASHDIR=1" >> "\$GITHUB_ENV"\nfi\n')
+        self.assertEqual(code.count('CCACHE_NOHASHDIR'), 1,
+                         'CCACHE_NOHASHDIR must be set only inside the gcc-15 debug branch')
         self.assertEqual(self.contract.get('if'),
                          "matrix.compiler == 'gcc-15' && matrix.build_type == 'debug'",
                          'the hash_dir leg and the contract leg must stay the same leg')

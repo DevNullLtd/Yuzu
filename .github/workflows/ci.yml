@@ -1165,10 +1165,14 @@ jobs:
           # build-linux-contracts-gcc15-debug (Contract migration evidence).
           # For a -g compile ccache hashes the working directory by default, so
           # the two sibling build dirs never shared a cache entry and the
-          # contract build compiled cold. With hash_dir off they share one; the
-          # cost is that an object's recorded compile directory may name the
-          # other sibling, whose ../-relative source paths resolve to the same
-          # files. Every later step in the job inherits it through GITHUB_ENV.
+          # contract build compiled cold. With hash_dir off they share one. The
+          # cost is debug info only: an object's recorded compile directory
+          # (DW_AT_comp_dir) may name the other sibling, whose generated files
+          # are its own copies, or, for a source compiled with no
+          # workspace-specific flag, another runner's workspace on this box.
+          # Nothing in this leg reads it (no gdb, coverage or symbolizer step;
+          # those run in the nightly, which keeps hash_dir on). Every later
+          # step in the job inherits the setting through GITHUB_ENV.
           if [[ "$BUILDDIR" == build-linux-gcc-15-debug ]]; then
             echo "CCACHE_NOHASHDIR=1" >> "$GITHUB_ENV"
           fi
@@ -2032,17 +2036,24 @@ jobs:
             -Dbuild_tests=true -Dbuild_contract_tests=true
           python3 scripts/ci/assert-gateway-tests.py "$CONTRACT_BUILD"
           # Compile the pilots' targets here, at the leg's full width and BEFORE
-          # taking a heavy-test slot. Done inside the slot by the collector at
-          # -j2, this compile took 7-50 min (996 s of a 1,022 s run; the six
-          # pilots ran in 26 s) while holding one of the three slots the Linux
+          # taking a heavy-test slot. When the collector did this compile inside
+          # the slot at -j2, the step took 6 to 50 min (one sampled run: a 996 s
+          # build and 26 s of tests), holding one of the three slots the Linux
           # test step also needs. The collector still runs its own
-          # `meson compile`, which then finds nothing to do, so the evidence
-          # bundle records the same build step, binaries and hashes as before.
-          # A failure here is not fatal: the collector repeats the compile and
-          # records the failure in its evidence, as it did before this step.
-          # CCACHE_NOHASHDIR (set for this leg in Configure) lets this second
-          # build directory reuse the standard build's ccache objects.
-          mapfile -t contract_targets < <(python3 -c 'import json; d = json.load(open("tests/contracts/pilots.json")); print("\n".join(sorted({t for r in d["contracts"] for t in r["build_targets"]})))')
+          # `meson compile`, which then has nothing to do: its build.log records
+          # that no-op, the real compile output is in this step's log, and the
+          # binary hashes it records are still those of the binaries it tests.
+          # A compile ERROR here is only a warning: the collector repeats the
+          # compile and records the failure in its evidence. A compile that runs
+          # past the job's 90-minute limit cancels the job and uploads no bundle,
+          # as it could before. CCACHE_NOHASHDIR (set for this leg in Configure)
+          # lets this second build directory reuse the standard build's objects.
+          # The target list is the collector's own: the union of build_targets
+          # in the registry. A registry it cannot read is a warning here; the
+          # collector then fails on the same file.
+          contract_targets_list=$(python3 -c 'import json; d = json.load(open("tests/contracts/pilots.json")); ts = [t for r in d["contracts"] for t in r["build_targets"]]; assert all(isinstance(t, str) and t for t in ts); print(" ".join(sorted(set(ts))))') \
+            || { echo "::warning::could not read build targets from tests/contracts/pilots.json; skipping the precompile"; contract_targets_list=""; }
+          read -r -a contract_targets <<< "$contract_targets_list"
           # Per-step ccache stats log: the shared cache's global counters mix
           # all four runners, this log holds only this compile's results.
           precompile_stats="$RUNNER_TEMP/ccache-contract-precompile-$GITHUB_RUN_ID.log"
@@ -2050,24 +2061,30 @@ jobs:
           precompile_start=$SECONDS
           if (( ${#contract_targets[@]} )); then
             CCACHE_STATSLOG="$precompile_stats" \
-              timeout "$YUZU_CONTRACT_BUILD_TIMEOUT_S" \
+              timeout -k 30 "$YUZU_CONTRACT_BUILD_TIMEOUT_S" \
               meson compile -C "$CONTRACT_BUILD" -j "$YUZU_BUILD_JOBS" "${contract_targets[@]}" \
               || echo "::warning::contract pilot precompile failed; the collector will retry it and record the failure"
           fi
           echo "contract pilot precompile: $(( SECONDS - precompile_start ))s for ${#contract_targets[@]} target(s)"
           if [[ -s "$precompile_stats" ]]; then
-            CCACHE_STATSLOG="$precompile_stats" ccache --show-log-stats --verbose 2>/dev/null \
-              | grep -iE 'hits|misses|uncacheable|errors' \
-              | sed 's/^/  ccache (contract precompile): /' || true
+            stats=$(CCACHE_STATSLOG="$precompile_stats" ccache --show-log-stats --verbose 2>/dev/null \
+              | grep -iE 'hits|misses|uncacheable|errors' || true)
+            if [[ -n "$stats" ]]; then
+              while IFS= read -r line; do echo "  ccache (contract precompile): $line"; done <<< "$stats"
+            else
+              echo "  ccache (contract precompile): stats unavailable"
+            fi
           else
             echo "  ccache (contract precompile): nothing compiled"
           fi
           rm -f "$precompile_stats"
+          collector_start=$SECONDS
           rc=0
           bash scripts/ci/with-test-slot.sh 3 -- \
             python3 scripts/test/contract-evidence.py run \
               --build-dir "$CONTRACT_BUILD" \
               --output "$YUZU_CONTRACT_OUTPUT" --jobs 2 || rc=$?
+          echo "contract collector (slot wait + run): $(( SECONDS - collector_start ))s, exit $rc"
           python3 scripts/test/contract-evidence.py bundle "$YUZU_CONTRACT_OUTPUT" "$YUZU_CONTRACT_OUTPUT.zip"
           exit "$rc"
 
