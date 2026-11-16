@@ -2350,10 +2350,10 @@ Quarantine a device.
 > result their shared dispatch closure now carries (a separate, smaller
 > follow-up per route). The quarantine
 > plugin's own four actions (`quarantine`, `unquarantine`, `status`,
-> `whitelist`) are exempt so that release stays reachable, and so are four
+> `whitelist`) are exempt so that release stays reachable, and so are five
 > server-internal pushes that are not operator dispatch —
-> `echo.fleet_snapshot`, `__guard__.push_rules`, `asset_tags.sync` and
-> `__sync__.now`, a closed set counted (not per-event audited) by
+> `echo.fleet_snapshot`, `__guard__.push_rules`, `asset_tags.sync`,
+> `__sync__.now` and `__sync__.settings`, a closed set counted (not per-event audited) by
 > `yuzu_server_system_reserved_push_total`.
 > Nothing else is.
 > If containment
@@ -9068,7 +9068,7 @@ Replaces the stored alias pack. The body is the alias-pack CSV (`Content-Type: t
 
 #### Software collection settings
 
-Per-management-group settings for the daily installed-software collection: how often it runs, in which local-time window, in which time zone, and which collectors run (see [Collection settings](inventory.md#collection-settings)). The server stores one document per group and resolves the single document that applies to a device. REST only: there is no MCP tool or page for these routes yet. This build sends no settings to agents: they take effect only when the settings push lands, and storing or changing a document never starts a collection and never contacts an agent.
+Per-management-group settings for the daily installed-software collection: how often it runs, in which local-time window, in which time zone, and which collectors run (see [Collection settings](inventory.md#collection-settings)). The server stores one document per group and resolves the single document that applies to a device. REST only: there is no MCP tool or page for these routes yet. Agents receive the effective settings through their heartbeat (see [How saved settings reach machines](inventory.md#how-saved-settings-reach-machines)), not at the moment of the write: storing or changing a document never starts a collection and never contacts an agent, and a change reaches a device within about a minute plus one heartbeat (about ten minutes for a group membership change).
 
 **A document** is the group's whole setting, replaced as a unit:
 

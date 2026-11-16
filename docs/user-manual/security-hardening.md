@@ -782,13 +782,14 @@ Two consequences worth planning for:
   it is informational only and has no dispatch effect. To stop Guardian rule delivery during an
   incident, disable or remove the rules instead; see
   [Guaranteed State](guaranteed-state.md#baselines--how-guards-reach-agents).
-- **Four server-internal pushes are also exempt, and you should know they exist.** The Echo
+- **Five server-internal pushes are also exempt, and you should know they exist.** The Echo
   fleet-topology snapshot request (`echo.fleet_snapshot`), the Guardian rule push
-  (`__guard__.push_rules`), the asset-tag sync (`asset_tags.sync`) and the on-demand inventory
-  sync (`__sync__.now`) continue to reach a contained device. This is deliberate — gating the Guardian push would stop a quarantined device
+  (`__guard__.push_rules`), the asset-tag sync (`asset_tags.sync`), the on-demand inventory
+  sync (`__sync__.now`) and the delivery of collection settings (`__sync__.settings`) continue to
+  reach a contained device. This is deliberate — gating the Guardian push would stop a quarantined device
   receiving the enforcement rules that make containment meaningful — but it means the containment
   boundary is not total, and a security review of the containment surface has to account for
-  those four channels. They are a closed set in code (`SystemReservedPush`) and are counted by
+  those five channels. They are a closed set in code (`SystemReservedPush`) and are counted by
   `yuzu_server_system_reserved_push_total{capability,result}`; a new one cannot be added without
   appearing in that set. **They are counted, not audited** — there is no per-event row saying a
   particular push reached a particular contained device, so this is a fleet-level signal rather
@@ -802,6 +803,7 @@ Two consequences worth planning for:
   | `echo.fleet_snapshot` | Requests a read-only topology/process snapshot. No state change. |
   | `asset_tags.sync` | Writes device tags. No code execution. |
   | `__sync__.now` | Requests an on-demand inventory sync — it arms the agent's existing sync scheduler and nothing else. No code execution beyond the plugin's existing daily-sync path. |
+| `__sync__.settings` | Delivers the software collection settings that apply to the device: how often installed software is collected, in which window, and which collectors run. It changes only the agent's own collection schedule and collector switches, and the agent refuses any document that is not exactly the expected shape. No code execution. |
   | `__guard__.push_rules` | Delivers Guardian baseline rules, which the agent may *enforce*. Enforcement is **not arbitrary command execution**: the assertion vocabulary is a closed five-value set — file present/absent, file hash, registry value, service running, service stopped — and dangerous registry keys and service names are refused at the `dangerous_enforce_in_spec` chokepoint before a push is ever built. So an operator with Guardian deploy rights can still change *typed, bounded* state on a contained device while their `execute_instruction` is refused. That is deliberate — enforcing a security baseline on a compromised host is the point — but it is the one exempt channel that mutates the endpoint, so scope it accordingly. |
 - **If containment state becomes unreadable, dispatch fails closed** — the server refuses *every*
   target rather than guess who is contained. A short store outage is absorbed by a 60-second
