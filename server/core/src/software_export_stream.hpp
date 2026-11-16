@@ -65,8 +65,8 @@ struct Limits {
 };
 
 /// Applied at registration so a caller that skipped the flag validator (a test, a future call site)
-/// can never turn a limit into "none": 0 or a negative reads as the floor. The ceilings are the
-/// flags' own range (main.cpp).
+/// can never turn a limit into "none": 0 or a negative reads as the floor. Only the flags (main.cpp)
+/// enforce a ceiling; the check itself is overflow-free for any value.
 [[nodiscard]] constexpr Limits clamp_limits(Limits l) noexcept {
     l.max_rows = std::max(l.max_rows, kMinMaxRows);
     l.max_bytes = std::max(l.max_bytes, kMinMaxBytes);
