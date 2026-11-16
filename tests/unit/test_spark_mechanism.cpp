@@ -18077,14 +18077,18 @@ TEST_CASE("Registry spark (real mechanism): the production factory default opens
     CHECK(quiet);
 
     // Stall fence: the wall-clock hold above can end early in effect if the whole box stalled
-    // (the sweeper may not have run a pass since the 5 s mark). Nudge the sweeper, then wait for
-    // TWO further passes to begin: the second begins only after the first, which began after the
-    // hold, has finished staging and launching. A verification regressed to 5 s would be due by
-    // now, so it would have been launched and counted before the assertions below.
-    const auto passes0 = sweeps->load(std::memory_order_relaxed);
-    h.apply(ctl(0ms));
-    REQUIRE(eventually([&] { return sweeps->load(std::memory_order_relaxed) >= passes0 + 2; },
-                       kDeafBound));
+    // (the sweeper may not have run a pass since the 5 s mark). With verification off the sweeper
+    // has no deadline to wake for, so passes are driven by nudges: h.apply() nudges it once. Do
+    // that twice, each time waiting for one more pass to begin. The sweeper is single-threaded,
+    // so the second pass begins only after the first has finished staging and launching, and
+    // both ran after the hold. A verification regressed to 5 s would be due by now, so it would
+    // have been staged and launched (and counted) before the assertions below.
+    for (int nudge = 0; nudge < 2; ++nudge) {
+        const auto before = sweeps->load(std::memory_order_relaxed);
+        h.apply(ctl(0ms));
+        REQUIRE(eventually([&] { return sweeps->load(std::memory_order_relaxed) > before; },
+                           kDeafBound));
+    }
 
     const auto c1 = h.counters();
     CHECK(c1.path_verify_ms == 0); // the effective interval itself, not only its silence
