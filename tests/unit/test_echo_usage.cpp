@@ -816,10 +816,97 @@ TEST_CASE("usage: a deferred-sweep fold writes no anchor and expires and caps no
     REQUIRE(credited->rows.size() == 1); // the events themselves were still folded
     CHECK(credited->rows[0][1] == "10");
 
+    // Against an implausible anchor a sweeping fold would count a decline and re-anchor; the
+    // deferred one reads no anchor, so neither happens. (The plausible anchor above cannot tell the
+    // two apart on the counter alone.)
+    const int64_t stale_anchor = now - 2 * 86400;
+    REQUIRE(t.db.set_config("usage_last_fold_ts", std::to_string(stale_anchor)));
+    REQUIRE(fold(UsageSweep::kDefer).has_value());
+    CHECK(cfg(t.db, "usage_last_fold_ts") == std::to_string(stale_anchor));
+    CHECK(cfg(t.db, "usage_expiry_declined_count").empty());
+    REQUIRE(t.db.set_config("usage_last_fold_ts", std::to_string(anchor)));
+
     REQUIRE(fold(UsageSweep::kRun).has_value()); // the closing call: expiry, cap and anchor
     CHECK(cfg(t.db, "usage_last_fold_ts") == std::to_string(now));
     CHECK(count_rows(t.db, "usage_live") == static_cast<int64_t>(kMaxOpenRuns));
     CHECK(count_rows(t.db, "usage_daily WHERE exe_key = 'old.exe' AND expired_runs = 1") == 1);
+}
+
+TEST_CASE("usage: a closing sweep runs while the process source is disabled, an ordinary "
+          "event-less sweep does not",
+          "[echo][usage][fold]") {
+    // The v10 migration credits its lagged rows while process is disabled, so its closing call is
+    // an admitted tick; the live sweep over a disabled process source stays idle.
+    auto t = make_test_db();
+    REQUIRE(usage_ensure_baselined(t.db, 1000).has_value());
+    REQUIRE(t.db.set_config("process_enabled", "false"));
+    const int64_t now = 1000 + kDefaultMaxAgeSeconds + 1000;
+    const int64_t anchor = now - 60;
+    REQUIRE(t.db.set_config("usage_last_fold_ts", std::to_string(anchor)));
+    seed_open_run(t.db, 1, "old.exe", 1000); // older than the max age at `now`
+
+    const auto sweep = [&](UsageSweep kind) {
+        return t.db.checked_transaction([&](TransactionHandle& h) { return usage_fold_in(h, now, {}, kind); });
+    };
+
+    REQUIRE(sweep(UsageSweep::kRun).has_value());
+    CHECK(count_rows(t.db, "usage_live") == 1);                       // idle: nothing expired
+    CHECK(cfg(t.db, "usage_last_fold_ts") == std::to_string(anchor)); // nor re-anchored
+
+    REQUIRE(sweep(UsageSweep::kClose).has_value());
+    CHECK(count_rows(t.db, "usage_live") == 0);
+    CHECK(count_rows(t.db, "usage_daily WHERE exe_key = 'old.exe' AND expired_runs = 1") == 1);
+    CHECK(cfg(t.db, "usage_last_fold_ts") == std::to_string(now));
+}
+
+TEST_CASE("usage: a usage_generation with an embedded NUL is malformed at every reader, the fold "
+          "included",
+          "[echo][usage][lifecycle]") {
+    // sqlite3_column_text alone stops at the NUL: the fold's transaction reader took "0<NUL>x" for
+    // generation 0, saw a mismatch against the active generation 1 and stamped a baseline that
+    // deleted the open run, while the database-level readers refused the same value.
+    auto t = make_test_db();
+    REQUIRE(usage_set_enabled(t.db, /*enabled=*/true, /*now=*/500)); // generation 1
+    REQUIRE(usage_ensure_baselined(t.db, 1000).has_value());          // active generation 1
+    seed_open_run(t.db, 1, "old.exe", 1000);
+    REQUIRE(t.db.execute_sql("UPDATE echo_config SET value = CAST(X'300078' AS TEXT) "
+                             "WHERE key = 'usage_generation'"));
+
+    CHECK(usage_lifecycle_state(t.db) == LifecycleState::PendingBaseline);
+    CHECK_FALSE(usage_set_enabled(t.db, /*enabled=*/false, /*now=*/2000));
+    CHECK_FALSE(usage_ensure_baselined(t.db, /*now=*/3000).has_value());
+
+    const auto folded = t.db.checked_transaction([&](TransactionHandle& h) {
+        return usage_fold_in(h, 2100, process_pair(2, "new.exe", 2000, 2100));
+    });
+    REQUIRE_FALSE(folded.has_value());
+    CHECK(folded.error().find("usage_generation read failed") != std::string::npos);
+    CHECK(count_rows(t.db, "usage_live") == 1); // the open run survived
+    CHECK(cfg(t.db, "usage_active_generation") == "1");
+    CHECK(cfg(t.db, "usage_coverage_since") == "1000"); // nothing was stamped
+}
+
+TEST_CASE("usage: the documented repair of a damaged usage_generation deletes both generation rows",
+          "[echo][usage][lifecycle]") {
+    // The manual's troubleshooting entry promises a fresh baseline: open runs forgotten, coverage
+    // restarted. Deleting usage_generation alone does not deliver it when the stored active
+    // generation is 0 (an absent generation reads 0 and matches), so the recipe deletes both.
+    auto t = make_test_db();
+    REQUIRE(usage_ensure_baselined(t.db, 1000).has_value()); // active generation 0, no generation row
+    seed_open_run(t.db, 1, "old.exe", 1000);
+    REQUIRE(t.db.set_config("usage_generation", "not_a_number"));
+    REQUIRE(usage_lifecycle_state(t.db) == LifecycleState::PendingBaseline);
+
+    REQUIRE(t.db.execute_sql("DELETE FROM echo_config WHERE key = 'usage_generation'"));
+    CHECK(usage_lifecycle_state(t.db) == LifecycleState::Active); // no re-baseline is owed
+    CHECK(count_rows(t.db, "usage_live") == 1);                   // and the run is kept
+
+    REQUIRE(t.db.execute_sql("DELETE FROM echo_config WHERE key = 'usage_active_generation'"));
+    CHECK(usage_lifecycle_state(t.db) == LifecycleState::PendingBaseline);
+    REQUIRE(usage_ensure_baselined(t.db, /*now=*/5000).has_value());
+    CHECK(count_rows(t.db, "usage_live") == 0);                   // the baseline forgot the run
+    CHECK(cfg(t.db, "usage_coverage_since") == "5000");
+    CHECK(usage_lifecycle_state(t.db) == LifecycleState::Active);
 }
 
 TEST_CASE("usage: an exe or user name reaches the rows byte for byte (bound and never spliced into SQL)",

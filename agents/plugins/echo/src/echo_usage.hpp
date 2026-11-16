@@ -474,8 +474,9 @@ enum class LifecycleState {
 [[nodiscard]] std::expected<bool, std::string> usage_active_in(TransactionHandle& h);
 
 /// Whether a usage_fold_in call runs the open-run sweep (expiry, cap, last-fold anchor) or leaves
-/// it to a later call. kRun is every live call.
-enum class UsageSweep { kRun, kDefer };
+/// it to a later call. kRun is every live call; kDefer leaves the sweep out; kClose is the later
+/// call that ends a run of kDefer calls (see usage_fold_in).
+enum class UsageSweep { kRun, kDefer, kClose };
 
 /**
  * Fold `events` (one tick's process events) into the usage tables ON THE CALLER'S TRANSACTION
@@ -498,8 +499,12 @@ enum class UsageSweep { kRun, kDefer };
  * anchor read, the expiry and cap of the open runs, the anchor write and the declined counter.
  * Only the v10 migration's chunked walk uses it, so a walk over many chunks is one logical tick
  * judged against the anchor as it stood before the walk, and a long run whose stop lands in a
- * later chunk is credited rather than expired at the chunk edge. That caller ends the walk with
- * one kRun call (events empty), which does the expiry, cap and anchor write once.
+ * later chunk is credited rather than expired at the chunk edge. That caller ends a walk that fed
+ * rows with one kClose call (events empty): kRun in every respect except that the idle return for
+ * a disabled process source does not apply, because the walk is an admitted tick (it credits its
+ * events while process is disabled) and its sweep is owed the same way. kClose does the expiry,
+ * cap and anchor write once. A disabled usage source and a source awaiting its baseline still
+ * return as they do for kRun.
  */
 [[nodiscard]] std::expected<void, std::string>
 usage_fold_in(TransactionHandle& h, int64_t now, const std::vector<ProcessEvent>& events,

@@ -19,6 +19,7 @@
 #include "echo_schema_registry.hpp"
 #include "echo_sql_executor.hpp"
 #include "echo_status_format.hpp"
+#include "echo_usage.hpp"
 #include "test_helpers.hpp"
 #include "test_log_capture.hpp"
 
@@ -1518,6 +1519,108 @@ TEST_CASE("v10 usage walk: a start above the roll-up mark pairs with its stop be
     CHECK(n(db, "SELECT run_count FROM usage_daily WHERE exe_key = 'alpha.exe'") == 1);
     CHECK(n(db, "SELECT total_seconds FROM usage_daily WHERE exe_key = 'alpha.exe'") == 0);
     CHECK(db.get_config("usage_clock_anomalies", "absent") == "1");
+}
+
+TEST_CASE("v10 usage walk: a failing closing sweep refuses the migration, leaves v9, and the retry "
+          "credits the run",
+          "[echo][v10][migration][usage]") {
+    Seeded seeded;
+    // Only the closing call writes usage_last_fold_ts (every chunk defers its sweep), so a trigger
+    // that aborts that one write fails the closing call and nothing before it. Inserts and updates
+    // are both covered because the write is an upsert.
+    seed(seeded, [&](sqlite3* db) {
+        seed_one_lagged_run(db);
+        exec(db, "INSERT INTO echo_config VALUES ('usage_active_generation', '0')");
+        exec(db, "CREATE TRIGGER fail_closing_insert BEFORE INSERT ON echo_config "
+                 "WHEN NEW.key = 'usage_last_fold_ts' "
+                 "BEGIN SELECT RAISE(ABORT, 'injected closing sweep fault'); END");
+        exec(db, "CREATE TRIGGER fail_closing_update BEFORE UPDATE ON echo_config "
+                 "WHEN NEW.key = 'usage_last_fold_ts' "
+                 "BEGIN SELECT RAISE(ABORT, 'injected closing sweep fault'); END");
+    });
+    const auto before = snapshot(seeded.tmp.path);
+
+    const auto failed = EchoDatabase::open(seeded.tmp.path);
+    REQUIRE(!failed.has_value());
+    INFO(failed.error());
+    // The failed write poisons the transaction handle, and checked_transaction reports the handle's
+    // first recorded reason ahead of the closing call's own prefix: the error names the write.
+    CHECK(failed.error().find("injected closing sweep fault") != std::string::npos);
+    CHECK(snapshot(seeded.tmp.path) == before); // still the v9 file, schema_version 9 included
+
+    {
+        Db raw;
+        open_raw(raw, seeded.tmp.path);
+        exec(raw.db, "DROP TRIGGER fail_closing_insert");
+        exec(raw.db, "DROP TRIGGER fail_closing_update");
+    }
+    auto db = open_ok(seeded.tmp.path); // the retry reaches v10 and credits the run
+    CHECK(db.get_config("schema_version") == "10");
+    CHECK(n(db, "SELECT COUNT(*) FROM usage_live") == 0);
+    CHECK(n(db, "SELECT run_count FROM usage_daily WHERE exe_key = 'alpha.exe'") == 1);
+    CHECK(n(db, "SELECT total_seconds FROM usage_daily WHERE exe_key = 'alpha.exe'") == 60);
+}
+
+TEST_CASE("v10 usage walk: the walk is swept exactly once, judged against the anchor as it stood "
+          "before it",
+          "[echo][v10][migration][usage]") {
+    Seeded seeded;
+    // The anchor is two days old, implausible against the migration clock (the guard allows a gap
+    // of one day), and an unmatched start is ten days old. One sweep judges `now` against that
+    // anchor, declines the expiry and counts the decline: the old run stays open. A second sweep
+    // (a duplicate closing call, or one per chunk) would see the anchor the first one wrote, find
+    // it plausible and expire the run.
+    const int64_t now = wall_clock_now();
+    seed(seeded, [&](sqlite3* db) {
+        seed_run_across_chunks(db, now - 60, 60); // two chunks of lagged rows
+        insert_raw(db, "process", {I(now - 10 * 86400), I(1), T("started"), I(5), I(0), T("old.exe"), T(""), T("u")});
+        exec(db, std::format("INSERT INTO echo_config VALUES ('usage_last_fold_ts', '{}')", now - 2 * 86400));
+    });
+    auto db = open_ok(seeded.tmp.path);
+    CHECK(n(db, "SELECT COUNT(*) FROM usage_live WHERE exe_key = 'old.exe'") == 1);
+    CHECK(n(db, "SELECT COUNT(*) FROM usage_daily WHERE exe_key = 'old.exe'") == 0); // no expired_runs row
+    CHECK(db.get_config("usage_expiry_declined_count", "absent") == "1");
+    CHECK(n(db, "SELECT CAST(value AS INTEGER) FROM echo_config WHERE key = 'usage_last_fold_ts'") >= now);
+}
+
+TEST_CASE("v10 usage walk: the closing sweep caps the open runs while the process source is disabled",
+          "[echo][v10][migration][usage]") {
+    Seeded seeded;
+    // The walk credits its lagged rows while process is disabled (the case above), so it is owed its
+    // sweep too: an event-less closing call that took the disabled-process idle return would leave
+    // the open runs over the cap and the anchor where it was.
+    const int64_t start = wall_clock_now() - 86400;
+    seed(seeded, [&](sqlite3* db) {
+        seed_process_rows(db, static_cast<int64_t>(usage::kMaxOpenRuns) + 1, start);
+        exec(db, "INSERT INTO echo_config VALUES ('process_enabled', 'false'), "
+                 "('usage_active_generation', '0'), ('usage_hwm_id', '0')");
+    });
+    auto db = open_ok(seeded.tmp.path);
+    CHECK(n(db, "SELECT COUNT(*) FROM usage_live") == static_cast<int64_t>(usage::kMaxOpenRuns));
+    CHECK(n(db, "SELECT CAST(value AS INTEGER) FROM echo_config WHERE key = 'usage_last_fold_ts'") >= start);
+    CHECK(db.get_config("usage_feeder_enabled", "absent") == "false"); // process is still off
+}
+
+TEST_CASE("v10 usage walk: a walk that fed no rows runs no sweep in either process state",
+          "[echo][v10][migration][usage]") {
+    Seeded seeded;
+    std::string process_enabled;
+    SECTION("process enabled") {
+        process_enabled = "true";
+    }
+    SECTION("process disabled") {
+        process_enabled = "false";
+    }
+    // The cursor sits on the only row: nothing is past it, so nothing is fed, and the closing call
+    // that follows a fed walk does not run (as at base, where only a fed chunk swept).
+    seed(seeded, [&](sqlite3* db) {
+        insert_raw(db, "process", {I(kT0), I(1), T("started"), I(1), I(0), T("a.exe"), T(""), T("u")});
+        exec(db, std::format("INSERT INTO echo_config VALUES ('process_enabled', '{}'), "
+                             "('usage_active_generation', '0'), ('usage_hwm_id', '1')",
+                             process_enabled));
+    });
+    auto db = open_ok(seeded.tmp.path);
+    CHECK(db.get_config("usage_last_fold_ts", "absent") == "absent");
 }
 
 TEST_CASE("v10 migration: the free-space demand counts the write-ahead log already on disk",

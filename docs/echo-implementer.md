@@ -331,7 +331,8 @@ retired tables just gets the roll-up schema installed. Otherwise `migrate_to_v10
    cursor in place while process was disabled and credited the rows once process was re-enabled,
    and the migration folds the raw rows into the process tiers regardless, so the rows reach usage
    now or never (`usage_fold_in` credits the events it is handed while process is disabled; only
-   its event-less sweep stays idle). Decided ONCE before the chunk loop; a PendingBaseline tick
+   its event-less live sweep stays idle, and the walk's closing call below is not that sweep).
+   Decided ONCE before the chunk loop; a PendingBaseline tick
    stamps a baseline and folds nothing, so the migration feeds nothing and stamps nothing (decided
    per chunk, the first chunk's stamp would turn the next into a retrospective fold of the rows
    the baseline excluded). An Active lifecycle with no cursor row is the damage the pre-v10 fold
@@ -341,17 +342,20 @@ retired tables just gets the roll-up schema installed. Otherwise `migrate_to_v10
    forgotten and the lagged rows are not credited); a malformed `usage_lag_events`
    (informational) is logged and the migration continues. The walk defers the open-run sweep
    (`UsageSweep::kDefer`: no anchor read, no expiry, no cap, no `usage_last_fold_ts` write) on
-   every chunk and ends with one event-less `usage_fold_in(..., UsageSweep::kRun)`, so the whole
-   walk is one logical fold tick judged against the anchor as it stood before it: a run older
-   than seven days whose stop lands in a later chunk is credited, not expired at a chunk edge.
-   The open-run set can grow inside the transaction until that closing call caps it (at most the
-   `process_live` row cap, about 105,000 rows). A failure of the closing call fails the migration
-   (`usage sweep after the lagged process rows: ...`) and the file stays at v9. Accepted
-   residuals, no code (#7124): the usage walk has no deadline of its own and decodes the lagged
-   process rows twice (tiers, then usage), bounded by that row cap and run once, at the upgrade;
-   and a stale `-wal` left by a crash can inflate the free-space demand of the first refused
-   open, whose refusal closes the connection and so checkpoints, after which the next open
-   succeeds. A migrated tier
+   every chunk. When it fed at least one row, it ends with one event-less
+   `usage_fold_in(..., UsageSweep::kClose)`, whether or not `process` is enabled. `kClose` is
+   `kRun` without the idle return for a disabled process source: the walk credited its rows in
+   that state, so it is owed the same sweep. The whole walk is then one logical fold tick, judged
+   against the anchor as it stood before it, and a run older than seven days whose stop lands in a
+   later chunk is credited, not expired at a chunk edge. A walk that fed no rows sweeps nothing.
+   Until the closing call, the open-run set can hold one run per lagged `started` row in the v9
+   `process_live` table past the cursor. The call caps it at `kMaxOpenRuns` (20,000). A failure of
+   the closing call fails the migration and the file stays at v9. Accepted residuals, no code
+   (#7124): the usage walk has no deadline of its own and decodes the lagged process rows twice
+   (tiers, then usage), bounded by the size of the v9 `process_live` table and run once, at the
+   upgrade; and a stale `-wal` left by a crash can inflate the free-space demand of the first
+   refused open, whose refusal closes the connection and so checkpoints, after which the next
+   open succeeds. A migrated tier
    row carries the columns v9 did not have (`parent_name`, `abnormal_exit_count`, tcp `failed_count`
    and `listen_*`, user `disconnect_count`, removable `partition_count`) as blank or 0, so a bucket
    spanning the upgrade holds two process rows per (name, user): the migrated one with a blank

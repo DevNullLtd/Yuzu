@@ -146,9 +146,14 @@ bool upsert_daily(TransactionHandle& h, const DailyDelta& d) {
          d.last_seen, d.superseded_runs, d.expired_runs});
 }
 
+// The column's whole text, by its byte length: sqlite3_column_text alone would stop at an
+// embedded NUL and so truncate a stored value (a generation, an exe key) that the database-level
+// readers return whole. The view is only valid until the statement is stepped or reset; every
+// caller copies it at once.
 std::string_view col_text(sqlite3_stmt* stmt, int idx) {
     const auto* txt = reinterpret_cast<const char*>(sqlite3_column_text(stmt, idx));
-    return txt ? std::string_view{txt} : std::string_view{};
+    return txt ? std::string_view{txt, static_cast<std::size_t>(sqlite3_column_bytes(stmt, idx))}
+               : std::string_view{};
 }
 
 // The text of an echo_config row, read through the transaction's own connection (calling
@@ -399,7 +404,9 @@ std::expected<void, std::string> usage_fold_in(TransactionHandle& h, int64_t now
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value WHERE value IS NOT excluded.value",
             (*usage_on && *process_on) ? "true" : "false")))
         return std::unexpected(h.error());
-    if (!*usage_on || (!*process_on && events.empty()))
+    // kClose ends a deferred walk that fed events while process was disabled: it is owed its sweep,
+    // so the idle return for an event-less pass over a disabled process source does not apply.
+    if (!*usage_on || (!*process_on && events.empty() && sweep != UsageSweep::kClose))
         return {}; // nothing to do this tick -- not a failure
 
     const auto active = usage_active_in(h);
@@ -481,10 +488,11 @@ std::expected<void, std::string> usage_fold_in(TransactionHandle& h, int64_t now
     // decline countable on a fleet-status surface.
     // kDefer (the v10 migration's chunked walk): none of the sweep below runs and the anchor is
     // neither read nor advanced, so a walk over many chunks is one logical tick judged against
-    // the anchor as it stood before it. The caller runs one kRun fold at the end (#7125).
+    // the anchor as it stood before it. The caller ends the walk with one kClose fold (#7125).
+    const bool sweeping = sweep != UsageSweep::kDefer;
     bool clock_plausible = false;
     bool anchor_declined = false;
-    if (sweep == UsageSweep::kRun) {
+    if (sweeping) {
         const auto anchor = read_config_i64_strict(h, "usage_last_fold_ts");
         if (!anchor.has_value()) {
             spdlog::warn("Echo usage: declining this tick's open-run expiry sweep -- failed to read "
@@ -563,9 +571,9 @@ std::expected<void, std::string> usage_fold_in(TransactionHandle& h, int64_t now
     }
 
     // ── echo_config counters, in the SAME transaction ──
-    // Unconditional -- see the comment above the anchor read for why a declined tick must still
-    // advance this.
-    if (sweep == UsageSweep::kRun && !upsert_config(h, "usage_last_fold_ts", std::to_string(now)))
+    // Every sweeping call advances the anchor, a declined one too -- see the comment above the
+    // anchor read for why. A deferred call leaves it alone.
+    if (sweeping && !upsert_config(h, "usage_last_fold_ts", std::to_string(now)))
         return std::unexpected(h.error());
     if (anchor_declined) {
         const int64_t prior = read_config_i64_locked(h, "usage_expiry_declined_count");
