@@ -1565,7 +1565,7 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      no MCP tool and no dashboard page.
      - **No MCP twin and no page - tracked follow-ups, not permanent
        exceptions.** Tracked as roadmap row **SAM.7** (rule import) in the
-       software estate roadmap; **revisit by 2026-12-31**. The MCP twin and the
+       software estate roadmap and as issue #8009; **revisit by 2026-12-31**. The MCP twin and the
        page are each their own change. The twin takes the same store and the
        same pure parsers (`software_lifecycle_import.hpp`), so there is no
        second validator. This entry retires when both merge. No parity-ledger
