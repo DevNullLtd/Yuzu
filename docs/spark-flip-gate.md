@@ -2760,15 +2760,17 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   a watchdog-cut stop, exit code 4, stays untraceable at stop time) and (2) the loss of
   lifecycle-journal records still pending at stop. Compensating control, PARTIAL: the
   boot-scan tag `yuzu.guardian_baseline_rebaselined_at_boot` (gauge
-  `yuzu_fleet_guardian_baseline_rebaselined_at_boot`) counts only a boot re-arm whose seed
-  read found NO persisted record (an Absent read). It does NOT see:
+  `yuzu_fleet_guardian_baseline_rebaselined_at_boot`) counts only a boot re-arm, of an enabled
+  `file-hash-equals` rule with no authored hash, whose seed read found NO persisted record (an
+  Absent read). It does NOT see:
 
   - (a) a Malformed record, a boot read error or a fingerprint mismatch (a retarget), all of
     which also re-baseline;
   - (b) a retarget whose new capture was never written before a crash (the old record still
     reads Ok);
-  - (c) a capture that was never staged while an older record for that target exists (with no
-    older record the next boot reads it as Absent and the boot-scan counts it);
+  - (c) a capture that was never staged while an older record under that rule id exists (for
+    an earlier target, or malformed; with no record at all the next boot reads it as Absent and
+    the boot-scan counts it);
   - (d) a malformed record that is overwritten at boot N, which reads Ok at boot N+1;
   - (e) a rule that was disabled at boot and enabled later, which is not counted at that boot
     (a later boot with an absent record would count it).
