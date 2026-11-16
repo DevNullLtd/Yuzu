@@ -2425,3 +2425,13 @@ TEST_CASE("fold: installing over a foreign view of a roll-up name replaces it wi
     CHECK(f->n("SELECT COUNT(*) FROM pragma_table_info('process_hourly') WHERE name='start_count'") == 1);
     REQUIRE(f->fold.install_fold_schema(f->db).has_value()); // idempotent over the current view
 }
+
+TEST_CASE("fold: a foreign view whose name differs only in case is replaced too",
+          "[echo][fold][writer]") {
+    auto f = make_fold_db(/*install=*/false);
+    REQUIRE(f->db.execute_sql("DROP VIEW process_hourly"));
+    REQUIRE(f->db.execute_sql("CREATE VIEW Process_Hourly AS SELECT 1 AS stale_col"));
+    REQUIRE(f->fold.install_fold_schema(f->db).has_value());
+    CHECK(f->n("SELECT COUNT(*) FROM pragma_table_info('process_hourly') WHERE name='stale_col'") == 0);
+    CHECK(f->n("SELECT COUNT(*) FROM pragma_table_info('process_hourly') WHERE name='start_count'") == 1);
+}

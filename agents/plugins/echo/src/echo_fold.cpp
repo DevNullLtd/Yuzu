@@ -258,7 +258,7 @@ std::expected<void, std::string> EchoFold::install_fold_schema(EchoDatabase& db)
         // EXISTS would then silently do nothing: drop the legacy table first. An empty
         // one is dropped; one that holds rows refuses the install, so it destroys no data.
         for (const auto& name : fold_view_names()) {
-            StmtPtr st = prep(h, "SELECT type FROM sqlite_master WHERE type IN ('table','view') AND name = ?");
+            StmtPtr st = prep(h, "SELECT type FROM sqlite_master WHERE type IN ('table','view') AND name = ? COLLATE NOCASE");
             if (!st)
                 return std::unexpected(h.error());
             bind_text(st.get(), 1, name);
