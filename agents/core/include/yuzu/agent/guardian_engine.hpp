@@ -373,10 +373,11 @@ public:
     /// (Windows today) re-captures the file's CURRENT content as its baseline at that boot. It
     /// is NOT proof that a capture was lost: a rule never captured, a prior failed arm, a
     /// platform whose file mechanism cannot arm (the seed read runs before placement is decided,
-    /// so nothing is re-captured there) and a genuinely lost capture all read the same. A read error, a
-    /// malformed record, a fingerprint mismatch (a retarget), a disabled rule and any apply_rules
-    /// after boot are not counted. Written only under mtx_ during the one start_local walk (a
-    /// second start_local is a no-op), so it is a per-boot constant afterwards; read lock-free.
+    /// so nothing is re-captured there) and a genuinely lost capture all read the same. A read
+    /// error, a malformed record, a fingerprint mismatch (a retarget), a disabled rule and any
+    /// apply_rules after boot are not counted. Written only under mtx_ during the one start_local
+    /// walk (a second start_local is a no-op), so it is a per-boot constant afterwards; read
+    /// lock-free.
     /// Live on every agent today (not gated on prefer_spark_).
     [[nodiscard]] std::uint64_t baseline_rebaselined_at_boot() const noexcept;
     /// #4045: cumulative count of staged captures the #4021 overwrite guard REFUSED to write

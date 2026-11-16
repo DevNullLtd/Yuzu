@@ -3109,7 +3109,8 @@ public:
                               } catch (...) {
                                   hb_guardian_contain(kHbGuardianBaseline,
                                                       "Guardian heartbeat baseline-persist tag "
-                                                      "failed (the remaining tags were skipped this tick)");
+                                                      "failed (the remaining tags were "
+                                                      "skipped this tick)");
                               }
                             }
 #if defined(_WIN32) || defined(__linux__) || defined(__APPLE__)
