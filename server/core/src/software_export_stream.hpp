@@ -9,7 +9,7 @@
 /// Rules this file owns (each stated once, here):
 ///  * REQUEST: the list route's filters (software_list::parse_list_params) plus a REQUIRED
 ///    `format` of `jsonl` or `csv`. `cursor` and `limit` are refused: a stream has no pages of its
-///    own to resume (the server walks its own cursors), and a row cap belongs to the in-memory
+///    own to resume (the server walks its own cursors), and a page-style row cap belongs to the in-memory
 ///    formats, not to a stream.
 ///  * ROWS: one row is exactly the list route's row (`list_row_json`, or the list CSV writer, which
 ///    neutralises formula cells through data_export.hpp). The two formats carry the same columns as
@@ -48,13 +48,47 @@ inline constexpr int kPageRows = static_cast<int>(software_catalogue::kCatalogue
 /// without its terminating chunk), so a sparse wide scope cannot hold a worker indefinitely.
 inline constexpr std::int64_t kExportMaxSeconds = 900;
 
+/// Size limits on one stream (`--inventory-export-max-rows`, `--inventory-export-max-bytes`): a
+/// stream that would pass either is aborted, like the deadline, so a huge fleet cannot be asked for
+/// one unbounded file. Both apply to JSONL and CSV alike; the bytes counted are the body bytes
+/// written (the CSV header included). The floor is one page: a smaller cap could never admit a page.
+inline constexpr std::int64_t kDefaultMaxRows = 5'000'000;
+inline constexpr std::int64_t kDefaultMaxBytes = std::int64_t{1} << 30; // 1 GiB
+inline constexpr std::int64_t kMinMaxRows = kPageRows;
+inline constexpr std::int64_t kMinMaxBytes = std::int64_t{1} << 20;     // 1 MiB
+inline constexpr std::int64_t kCeilingMaxRows = 1'000'000'000;
+inline constexpr std::int64_t kCeilingMaxBytes = std::int64_t{1} << 40; // 1 TiB
+
+struct Limits {
+    std::int64_t max_rows{kDefaultMaxRows};
+    std::int64_t max_bytes{kDefaultMaxBytes};
+};
+
+/// The accepted range, applied at registration so a caller that skipped the flag validator (a test,
+/// a future call site) can never turn a limit into "none": 0 or a negative reads as the floor.
+[[nodiscard]] constexpr Limits clamp_limits(Limits l) noexcept {
+    l.max_rows = std::clamp(l.max_rows, kMinMaxRows, kCeilingMaxRows);
+    l.max_bytes = std::clamp(l.max_bytes, kMinMaxBytes, kCeilingMaxBytes);
+    return l;
+}
+
+/// True when writing `add_rows` more rows and `add_bytes` more bytes on top of what is already
+/// written stays inside both limits. A cap is a true maximum: the chunk that would pass it is not
+/// written.
+[[nodiscard]] constexpr bool within_limits(const Limits& l, std::int64_t rows_written,
+                                           std::int64_t bytes_written, std::size_t add_rows,
+                                           std::size_t add_bytes) noexcept {
+    return rows_written + static_cast<std::int64_t>(add_rows) <= l.max_rows &&
+           bytes_written + static_cast<std::int64_t>(add_bytes) <= l.max_bytes;
+}
+
 /// The 503 retry hint when the export cap or the server's held-open budget is full.
 inline constexpr int kRetryAfterMs = 5000;
 
 /// The closed label sets of yuzu_server_software_export_total{format,result}, pre-seeded at boot.
 inline constexpr std::array<ExportFormat, 2> kFormats{ExportFormat::jsonl, ExportFormat::csv};
-inline constexpr std::array<std::string_view, 4> kResults{"completed", "degraded", "deadline",
-                                                           "aborted"};
+inline constexpr std::array<std::string_view, 5> kResults{"completed", "degraded", "deadline",
+                                                           "aborted", "limit"};
 /// The closed label set of yuzu_server_software_export_rejected_total{reason}, pre-seeded at boot:
 /// which limit refused the stream, so the operator knows which flag to raise.
 /// `export_concurrency_cap` = --inventory-export-concurrency (StreamBudget's per-key reject: every
