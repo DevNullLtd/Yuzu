@@ -64,8 +64,11 @@ DEX (Digital Employee Experience) <what this area is, in a sentence>.
 6. **Examples are placeholders.** Use `yuzu.example.com` and made-up identifiers.
    No real host names, addresses, user names or paths from a machine.
 7. **No personal data and no vendor or competitor names.**
-8. **Only what exists.** Do not describe unshipped work or give dates. If
-   something is not available, say it is not available.
+8. **Area pages say only what exists.** Do not describe unshipped work on an
+   area page or in the capability map, and give no dates. If something is not
+   available, say it is not available. Planned work, if a team wants to record
+   it, goes on its own page that is clearly marked as planned and linked from
+   the hub.
 9. **Name the off switch exactly.** Anything about turning collection off must say
    what stops and what keeps running. See
    [collectors and plugins](collectors-and-plugins.md#what---dex-disable-stops).
