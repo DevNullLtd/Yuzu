@@ -27,6 +27,7 @@
 #include <cstdio> // std::fputs - the T6 child process reports its own deadlock detection
 #include <functional>
 #include <iterator> // std::istreambuf_iterator - the T6 parent reads its child's captured output
+#include <limits>   // numeric_limits - the clamp helper bounds (#7836)
 #include <map>
 #include <memory>
 #include <mutex>
@@ -2449,12 +2450,44 @@ TEST_CASE("platform factories honor the mechanism-or-null contract", "[spark][me
 #else
     CHECK(make_file_mechanism() == nullptr);     // off Windows → no mechanism → arm() rejects
     CHECK(make_registry_mechanism() == nullptr);
+    CHECK(make_registry_mechanism(nullptr, std::chrono::seconds{5}) == nullptr); // opt-in ignored
 #if defined(__linux__) && defined(YUZU_HAVE_LIBSYSTEMD)
     CHECK(make_service_mechanism() != nullptr);  // Linux + libsystemd → real sd-bus mechanism
 #else
     CHECK(make_service_mechanism() == nullptr);  // macOS, or Linux built without libsystemd
 #endif
 #endif
+}
+
+// #5719 item 5, #7836 (REG-15-I2): the Registry mechanism's periodic path verification is OFF
+// unless the operator opts in at boot, and the opt-in seconds reach the factory through this
+// pure helper. Cross-platform: the helper is a constexpr function over plain integers, so the
+// Linux and macOS legs pin the clamp the Windows agent applies.
+TEST_CASE("clamp_registry_path_verify: 0 is off, 1..4 is raised to the 5 s floor, the rest is "
+          "n seconds up to a ceiling (#5719 item 5, #7836)",
+          "[spark][mechanism][5719]") {
+    using std::chrono::milliseconds;
+    // The floor and the ceiling are part of the contract an operator reads in the manual.
+    STATIC_REQUIRE(kRegistryPathVerifyFloor == milliseconds{5'000});
+    STATIC_REQUIRE(kRegistryPathVerifyMaxSeconds == 86'400);
+
+    CHECK(clamp_registry_path_verify(0) == milliseconds{0}); // off
+    CHECK(clamp_registry_path_verify(1) == milliseconds{5'000});
+    CHECK(clamp_registry_path_verify(3) == milliseconds{5'000});
+    CHECK(clamp_registry_path_verify(4) == milliseconds{5'000});
+    CHECK(clamp_registry_path_verify(5) == milliseconds{5'000});
+    CHECK(clamp_registry_path_verify(6) == milliseconds{6'000});
+    CHECK(clamp_registry_path_verify(60) == milliseconds{60'000});
+    CHECK(clamp_registry_path_verify(86'400) == milliseconds{86'400'000});
+    // Above the ceiling is lowered to it, never overflowed; the CLI refuses such a value
+    // first, so this is the defence behind the validator.
+    CHECK(clamp_registry_path_verify(86'401) == milliseconds{86'400'000});
+    CHECK(clamp_registry_path_verify(std::numeric_limits<std::int64_t>::max()) ==
+          milliseconds{86'400'000});
+    // A negative value is never a verification interval: it reads as off.
+    CHECK(clamp_registry_path_verify(-1) == milliseconds{0});
+    CHECK(clamp_registry_path_verify(std::numeric_limits<std::int64_t>::min()) ==
+          milliseconds{0});
 }
 
 // ── rung 9c PR-6 item 1: the establishment signal (SparkIncarnation /
@@ -17883,8 +17916,11 @@ struct RegVerifyHarness {
     std::vector<SparkSpec> specs;
     std::vector<SparkEngine::SubscriptionId> subs;
 
-    RegVerifyHarness(const std::vector<std::string>& keys, RegistryMechanismTestControls ctl) {
-        auto mech = make_registry_mechanism();
+    /// `make` builds the mechanism; null means the zero-argument factory. The REG-15-I2 cases
+    /// pass the exact overload production calls, so they observe what the agent gets.
+    RegVerifyHarness(const std::vector<std::string>& keys, RegistryMechanismTestControls ctl,
+                     const std::function<std::unique_ptr<ISparkMechanism>()>& make = nullptr) {
+        auto mech = make ? make() : make_registry_mechanism();
         raw = mech.get();
         REQUIRE(engine.register_mechanism(SparkType::Registry, std::move(mech)).has_value());
         REQUIRE(set_registry_test_controls_for_test(*raw, std::move(ctl)));
@@ -17938,6 +17974,142 @@ RegistryMechanismTestControls rename_controls(std::chrono::milliseconds verify) 
     return ctl;
 }
 } // namespace
+
+/// Counts how many times the probe worker reached each subkey (the test hook runs BEFORE the
+/// OS opens the key, so one count is one open attempt of that key: establishment, re-arm or
+/// verification). Shared by value into the detached workers, so every access is locked.
+struct KeyOpenCounter {
+    std::mutex mu;
+    std::map<std::string, std::size_t> n;
+    [[nodiscard]] std::size_t get(const std::string& key) {
+        std::lock_guard lk(mu);
+        const auto it = n.find(key);
+        return it == n.end() ? 0 : it->second;
+    }
+    [[nodiscard]] static std::function<void(std::string_view)>
+    hook(const std::shared_ptr<KeyOpenCounter>& self) {
+        return [self](std::string_view sub) {
+            std::lock_guard lk(self->mu);
+            ++self->n[std::string(sub)];
+        };
+    }
+};
+
+// REG-15-I2 (owner ruling 2026-11-16): the Registry mechanism opens no key for path verification
+// unless the operator opted in at boot. Each verification opens the watched key by path, and on a
+// key carrying an auditing SACL that open writes a Security-log event; an open per key per
+// interval can evict older events. THIS CASE OBSERVES THE OPENS (the probe hook counts each key's
+// open attempts) AND NOTHING ELSE: Security-log behaviour (event 4656 counts, eviction) is NOT
+// observed or asserted here, and no SACL is set.
+//
+// The mechanism is built with the EXACT overload agent.cpp calls when the operator sets nothing
+// (make_registry_mechanism(counter)); only sweep_cadence is shortened. The zero phase is held
+// longer than the old 5 s default plus slack, so a default put back to 5 s makes the case red.
+TEST_CASE("Registry spark (real mechanism): the production factory default opens no key for "
+          "verification (REG-15-I2, #7836)",
+          "[spark][mechanism][windows][5719]") {
+    RegRenameRig rig("deaf5719_defoff");
+    REQUIRE(rig.ok);
+    ScratchRegKey b("deaf5719_defoff_b");
+    ScratchRegKey c("deaf5719_defoff_c");
+    REQUIRE(b.h != nullptr);
+    REQUIRE(c.h != nullptr);
+    b.close();
+    c.close();
+    const std::vector<std::string> keys{rig.child, b.sub, c.sub};
+
+    auto opens = std::make_shared<KeyOpenCounter>(); // captured by value: the workers are detached
+    auto ctl = [&](std::chrono::milliseconds verify) {
+        RegistryMechanismTestControls k;
+        k.sweep_cadence = 20ms;
+        k.path_verify_interval = verify; // 0 leaves the construction-time seed unchanged
+        k.probe_hook = KeyOpenCounter::hook(opens);
+        return k;
+    };
+    auto f3 = std::make_shared<std::atomic<std::size_t>>(0);
+    RegVerifyHarness h(keys, ctl(0ms), [&] { return make_registry_mechanism(f3); });
+
+    std::vector<std::size_t> established;
+    for (const auto& k : keys) {
+        established.push_back(opens->get(k));
+        REQUIRE(established.back() >= 1); // each key was opened to establish its watch
+    }
+    const auto c0 = h.counters();
+
+    // Zero phase: 6.5 s, past the old 5 s default plus a sweep wake, probes and slack.
+    bool quiet = true;
+    const auto until = std::chrono::steady_clock::now() + 6500ms;
+    while (std::chrono::steady_clock::now() < until) {
+        if (h.counters().verify_launched != 0)
+            quiet = false;
+        std::this_thread::sleep_for(25ms);
+    }
+    CHECK(quiet);
+    const auto c1 = h.counters();
+    CHECK(c1.verify_launched == 0);
+    CHECK(c1.probe_launched == c0.probe_launched); // no probe of any kind after establishment
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+        INFO("key " << keys[i]);
+        CHECK(opens->get(keys[i]) == established[i]); // opens per key unchanged
+    }
+    CHECK(h.engine.stats().armed_faulted == 0);
+
+    // Positive control, same mechanism: turning the interval on (the test control) makes
+    // the opens happen, so the zero above was not a harness that cannot see them.
+    h.apply(ctl(20ms));
+    REQUIRE(eventually([&] { return h.counters().verify_launched >= keys.size(); }, kDeafBound));
+
+    // Rate bound: over a window W each key is opened at most W/I times, plus the
+    // verification already due when the control was applied and one in flight (slack).
+    constexpr auto kInterval = 20ms;
+    constexpr auto kWindow = 600ms;
+    std::vector<std::size_t> before;
+    for (const auto& k : keys)
+        before.push_back(opens->get(k));
+    const auto v0 = h.counters().verify_launched;
+    std::this_thread::sleep_for(kWindow);
+    const auto v1 = h.counters().verify_launched;
+    const std::size_t per_key_cap = static_cast<std::size_t>(kWindow / kInterval) + 3;
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+        INFO("key " << keys[i]);
+        const auto delta = opens->get(keys[i]) - before[i];
+        CHECK(delta >= 1);
+        CHECK(delta <= per_key_cap);
+    }
+    CHECK(v1 > v0);
+    CHECK(v1 - v0 <= keys.size() * per_key_cap);
+    h.engine.stop();
+}
+
+// REG-15-I2: the opt-in still detects a renamed parent. The mechanism is built with the
+// production factory overload and the opt-in value (the clamp's 5 s floor for a setting of 1), and
+// the verification interval is NOT overridden by a test control (zero leaves the seed), so the
+// seeded interval itself drives the check.
+TEST_CASE("Registry spark (real mechanism): an operator-enabled interval detects a renamed "
+          "parent key (REG-15-I2, #7836)",
+          "[spark][mechanism][windows][5719]") {
+    RegRenameRig rig("deaf5719_optin");
+    REQUIRE(rig.ok);
+    auto f3 = std::make_shared<std::atomic<std::size_t>>(0);
+    RegVerifyHarness h({rig.child}, rename_controls(0ms), [&] {
+        return make_registry_mechanism(f3, clamp_registry_path_verify(1));
+    });
+    const auto rsyn_pre = h.counters().synthetic_fires;
+    REQUIRE(rig.rename_parent() == ERROR_SUCCESS);
+    REQUIRE(rig.original_path_gone());
+
+    // The first verification is due one interval (5 s) after the commit, so nothing can
+    // be detected this early: the seed is neither zero (off) nor a short value.
+    std::this_thread::sleep_for(1500ms);
+    CHECK(h.counters().verify_launched == 0);
+    CHECK(h.engine.stats().armed_faulted == 0);
+
+    CHECK(eventually([&] { return h.engine.stats().armed_faulted == 1; }, kDeafBound * 2));
+    CHECK(h.counters().verify_launched >= 1);
+    CHECK(h.counters().verify_lost >= 1);
+    CHECK(eventually([&] { return h.counters().synthetic_fires > rsyn_pre; }, kDeafBound));
+    h.engine.stop();
+}
 
 // #5719 item 5, #7836: a Registry watch whose PARENT key is renamed away used to stay Healthy
 // and silent (the notify handle follows the key, the registered path no longer names it). The
