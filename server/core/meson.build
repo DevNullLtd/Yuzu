@@ -875,6 +875,8 @@ yuzu_server_core_lib = static_library(
     'src/software_hosts_model.cpp',
     'src/software_changes_model.cpp',
     'src/software_plugin_health_model.cpp',
+    'src/software_read_api.cpp', # SAM-35: transport-neutral body shared by the REST routes and the MCP twins
+    'src/software_collection_settings_api.cpp', # SAM-35: transport-neutral body shared by the REST routes and the MCP twins
     'src/crypto_cbom.cpp',    # /crypto CBOM export: pure CycloneDX 1.7 shaper
     'src/crypto_library_model.cpp', # /crypto slice 1: pure curated table + shared REST/MCP model
     'src/crypto_api.cpp',     # /crypto slice 1: store-backed CryptoApi seam impl
