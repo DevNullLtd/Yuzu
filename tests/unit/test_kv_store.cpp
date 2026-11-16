@@ -883,6 +883,34 @@ TEST_CASE("KvStore fallible reads surface a REAL SQLite failure as an error, not
     CHECK_FALSE(t.store.get("p1", "lc:a").has_value());
 }
 
+TEST_CASE("KvStore::exists_checked tells a fault from an absent key; exists() stays fail-open",
+          "[kv_store][entries]") {
+    // The plugin C ABI documents "negative on error" for yuzu_ctx_storage_exists, and a
+    // plugin that treats "absent" as "nothing to recover" must not be handed a fault as that
+    // answer (the firewall containment record is the first such reader). exists() keeps its
+    // bool shape for the callers that can live with a fault reading as absent.
+    auto t = make_test_store();
+    REQUIRE(t.store.set("p1", "k", "v"));
+    CHECK(t.store.exists_checked("p1", "k") == std::optional<bool>{true});
+    CHECK(t.store.exists_checked("p1", "nope") == std::optional<bool>{false});
+
+    // A REAL SQLite failure (the table dropped through a second connection).
+    sqlite3* raw = nullptr;
+    REQUIRE(sqlite3_open(t.path.string().c_str(), &raw) == SQLITE_OK);
+    const int rc = sqlite3_exec(raw, "DROP TABLE kv_store", nullptr, nullptr, nullptr);
+    sqlite3_close(raw);
+    REQUIRE(rc == SQLITE_OK);
+    CHECK_FALSE(t.store.exists_checked("p1", "k").has_value()); // unknown, NOT "absent"
+    CHECK_FALSE(t.store.exists("p1", "k"));                      // the fail-open form is unchanged
+
+    // A closed (moved-from) handle is also "cannot tell".
+    auto t2 = make_test_store();
+    REQUIRE(t2.store.set("p1", "k", "v"));
+    KvStore moved = std::move(t2.store);
+    CHECK_FALSE(t2.store.exists_checked("p1", "k").has_value());
+    CHECK(moved.exists_checked("p1", "k") == std::optional<bool>{true});
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // #5604: the busy budget is an atomic read by a busy HANDLER, so lowering it from another
 // thread cuts a write that is already waiting on a locked database.

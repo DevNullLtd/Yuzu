@@ -515,9 +515,8 @@ jobs:
           RC=${PIPESTATUS[0]}
           # One parser for every gateway test gate (scripts/gateway_test_summary.py,
           # pinned by tests/test_gateway_test_summary.py): >= 1 test must have
-          # EXECUTED (#4800), and a non-zero exit is tolerated only for eunit's
-          # "Failed: 0" line with tests passed (meck fixture cancellation, #1005).
-          python3 ../scripts/gateway_test_summary.py cancel-tolerant "$RC" eunit.log --github
+          # EXECUTED (#4800); any failure or cancellation remains a failure.
+          python3 ../scripts/gateway_test_summary.py strict eunit "$RC" eunit.log
 
       - name: Run Dialyzer
         working-directory: gateway

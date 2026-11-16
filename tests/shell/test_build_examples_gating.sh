@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # test_build_examples_gating.sh — #4262 smoke test.
 #
-# `-Dbuild_examples=false` must still configure a full, working build: only
+# `-Dbuild_examples=false` must still configure a working agent build: only
 # the four decorative demo plugins (example, chargen, procfetch, netprobe)
 # are omitted, every real plugin and the test suite's link_depends still
 # resolve. Before #4262 this configuration failed at `meson setup` with an
@@ -47,16 +47,27 @@ esac
 VCPKG_INSTALLED="$ROOT/vcpkg_installed/$TRIPLET"
 if [ ! -d "$VCPKG_INSTALLED" ]; then
   echo "test_build_examples_gating: SKIP — no populated vcpkg_installed/$TRIPLET (run scripts/setup.sh first)"
-  exit 0
+  exit 77
 fi
 
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/yuzu_test_build_examples_gating.XXXXXX")"
 trap 'rm -rf "$tmp"' EXIT
 
-if ! meson setup "$tmp/build" \
-    -Dbuild_examples=false -Dbuild_tests=true \
-    -Dcmake_prefix_path="$VCPKG_INSTALLED" \
-    -Dpkg_config_path="$VCPKG_INSTALLED/lib/pkgconfig" \
+# This test owns the agent/plugin graph. Disable the server explicitly on
+# Linux; elsewhere verify that the default server=auto keeps it disabled.
+meson_args=(-Dbuild_agent=true
+            -Dbuild_examples=false -Dbuild_tests=true
+            "-Dcmake_prefix_path=$VCPKG_INSTALLED")
+if [[ "$TRIPLET" == x64-linux ]]; then
+  meson_args+=(-Dserver=disabled)
+fi
+# Match setup.sh/Windows CI: release pkg-config libraries must not be selected
+# for an MSVC debug build. Windows resolves the matching configuration via CMake.
+if [[ "$TRIPLET" != x64-windows ]]; then
+  meson_args+=("-Dpkg_config_path=$VCPKG_INSTALLED/lib/pkgconfig")
+fi
+
+if ! meson setup "$tmp/build" "${meson_args[@]}" \
     > "$tmp/setup.log" 2>&1; then
   echo "::error::meson setup -Dbuild_examples=false -Dbuild_tests=true failed to configure — #4262 regression?" >&2
   cat "$tmp/setup.log" >&2
@@ -122,6 +133,9 @@ present_demos = demo_plugins & names
 missing_required = must_be_present - names
 
 errors = []
+unexpected_server = {"yuzu-server", "yuzu_server_tests"} & names
+if unexpected_server:
+    errors.append(f"server target(s) unexpectedly present in agent-only smoke: {sorted(unexpected_server)}")
 if present_demos:
     errors.append(f"demo plugin target(s) unexpectedly present under build_examples=false: {sorted(present_demos)}")
 if missing_required:

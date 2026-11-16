@@ -14,6 +14,11 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
+#include <optional>
+#include <string>
+#include <vector>
+
 using namespace yuzu::power_health;
 
 // ─────────────────────────────────────────────────────── Windows battery ──
@@ -430,10 +435,13 @@ const std::array<PowerScheme, 2> kSeqSchemes{{
 /// called at all on a pre-set failure).
 struct SequenceMock {
     std::vector<std::string> log;
+    std::vector<std::string> requested_guids;
+    GuidBytes active_guid{kSeqSchemes[0].guid};
     std::optional<EnumerateResult> enumerate_result{EnumerateResult{
         std::vector<PowerScheme>(kSeqSchemes.begin(), kSeqSchemes.end()), /*complete=*/true}};
     std::optional<std::optional<GuidBytes>> prior_result{kSeqSchemes[0].guid};
     std::optional<std::optional<GuidBytes>> readback_result{kSeqSchemes[1].guid};
+    bool scripted_readback{false}; // fault injection; otherwise observe the actual set argument
     std::optional<bool> set_result{true};
     bool read_active_called_once_already{false};
 
@@ -456,11 +464,15 @@ struct SequenceMock {
                     return prior_result;
                 }
                 log.push_back("read_active(readback)");
-                return readback_result;
+                return scripted_readback ? readback_result
+                                         : std::optional<std::optional<GuidBytes>>{active_guid};
             },
             /* .set_active  = */
-            [this](const GuidBytes&) {
+            [this](const GuidBytes& requested) {
                 log.push_back("set_active");
+                requested_guids.push_back(format_guid(requested));
+                if (set_result && *set_result)
+                    active_guid = requested;
                 return set_result;
             },
         };
@@ -548,6 +560,7 @@ TEST_CASE("do_set_power_plan_sequence: PowerSetActiveScheme fails -> SetFailed, 
     CHECK(guids_equal(*r.previous_guid, kSeqSchemes[0].guid));
     CHECK_FALSE(r.new_guid.has_value());
     CHECK(mock.log == std::vector<std::string>{"enumerate", "read_active(prior)", "set_active"});
+    CHECK(mock.requested_guids == std::vector<std::string>{"11111111-1111-1111-1111-111111111111"});
 }
 
 TEST_CASE("do_set_power_plan_sequence: PowerSetActiveScheme TIMES OUT -> SetFailed, no mutation "
@@ -559,6 +572,7 @@ TEST_CASE("do_set_power_plan_sequence: PowerSetActiveScheme TIMES OUT -> SetFail
     const auto r = do_set_power_plan_sequence("Balanced", mock.ops());
     CHECK(r.outcome == SetPowerPlanOutcome::SetFailed);
     CHECK(mock.log == std::vector<std::string>{"enumerate", "read_active(prior)", "set_active"});
+    CHECK(mock.requested_guids == std::vector<std::string>{"11111111-1111-1111-1111-111111111111"});
 }
 
 TEST_CASE("do_set_power_plan_sequence: post-set read-back fails -> ReadbackFailed; previous_guid "
@@ -566,6 +580,7 @@ TEST_CASE("do_set_power_plan_sequence: post-set read-back fails -> ReadbackFaile
           "[power_health][power_plan][set_power_plan]") {
     SequenceMock mock;
     mock.readback_result = std::optional<GuidBytes>{std::nullopt};
+    mock.scripted_readback = true;
     const auto r = do_set_power_plan_sequence("Balanced", mock.ops());
     CHECK(r.outcome == SetPowerPlanOutcome::ReadbackFailed);
     REQUIRE(r.previous_guid.has_value());
@@ -573,6 +588,7 @@ TEST_CASE("do_set_power_plan_sequence: post-set read-back fails -> ReadbackFaile
     CHECK_FALSE(r.new_guid.has_value());
     CHECK(mock.log == std::vector<std::string>{"enumerate", "read_active(prior)", "set_active",
                                                 "read_active(readback)"});
+    CHECK(mock.requested_guids == std::vector<std::string>{"11111111-1111-1111-1111-111111111111"});
 }
 
 TEST_CASE("do_set_power_plan_sequence: post-set read-back TIMES OUT -> ReadbackFailed, same "
@@ -580,8 +596,10 @@ TEST_CASE("do_set_power_plan_sequence: post-set read-back TIMES OUT -> ReadbackF
           "[power_health][power_plan][set_power_plan]") {
     SequenceMock mock;
     mock.readback_result = std::nullopt;
+    mock.scripted_readback = true;
     const auto r = do_set_power_plan_sequence("Balanced", mock.ops());
     CHECK(r.outcome == SetPowerPlanOutcome::ReadbackFailed);
+    CHECK(mock.requested_guids == std::vector<std::string>{"11111111-1111-1111-1111-111111111111"});
 }
 
 TEST_CASE("do_set_power_plan_sequence: post-set read-back does not match the target -> "
@@ -590,26 +608,33 @@ TEST_CASE("do_set_power_plan_sequence: post-set read-back does not match the tar
     SequenceMock mock;
     // readback_result defaults to kSeqSchemes[1] -- but the target the test
     // resolves is kSeqSchemes[0] ("Balanced"), so this IS the mismatch.
+    mock.scripted_readback = true;
     const auto r = do_set_power_plan_sequence("Balanced", mock.ops());
     CHECK(r.outcome == SetPowerPlanOutcome::ReadbackMismatch);
     REQUIRE(r.target_guid.has_value());
     REQUIRE(r.new_guid.has_value());
     CHECK(guids_equal(*r.target_guid, kSeqSchemes[0].guid));
     CHECK(guids_equal(*r.new_guid, kSeqSchemes[1].guid));
+    CHECK(mock.requested_guids == std::vector<std::string>{"11111111-1111-1111-1111-111111111111"});
 }
 
 TEST_CASE("do_set_power_plan_sequence: full success -> Ok, previous_guid/new_guid both reported, "
           "call order is exactly enumerate -> read(prior) -> set -> read(readback)",
           "[power_health][power_plan][set_power_plan]") {
     SequenceMock mock;
-    mock.readback_result = kSeqSchemes[0].guid; // matches the resolved target this time
-    const auto r = do_set_power_plan_sequence("balanced", mock.ops()); // case-insensitive
+    // The target differs from the prior scheme, so setting the old scheme (or
+    // skipping the mutation) cannot satisfy the read-back and argument oracle.
+    const auto r = do_set_power_plan_sequence("high PERFORMANCE", mock.ops());
     CHECK(r.ok());
     CHECK(r.outcome == SetPowerPlanOutcome::Ok);
     REQUIRE(r.previous_guid.has_value());
     REQUIRE(r.new_guid.has_value());
+    REQUIRE(r.target_guid.has_value());
     CHECK(guids_equal(*r.previous_guid, kSeqSchemes[0].guid));
-    CHECK(guids_equal(*r.new_guid, kSeqSchemes[0].guid));
+    CHECK(guids_equal(*r.new_guid, kSeqSchemes[1].guid));
+    CHECK(guids_equal(*r.target_guid, kSeqSchemes[1].guid));
+    CHECK(guids_equal(mock.active_guid, kSeqSchemes[1].guid));
+    CHECK(mock.requested_guids == std::vector<std::string>{"22222222-2222-2222-2222-222222222222"});
     CHECK(mock.log == std::vector<std::string>{"enumerate", "read_active(prior)", "set_active",
                                                 "read_active(readback)"});
 }
@@ -618,12 +643,14 @@ TEST_CASE("do_set_power_plan_sequence: a GUID-shaped param resolves without enum
           "membership, same as resolve_power_scheme itself",
           "[power_health][power_plan][set_power_plan]") {
     SequenceMock mock;
-    mock.readback_result = *parse_guid("33333333-3333-3333-3333-333333333333");
     const auto r =
         do_set_power_plan_sequence("33333333-3333-3333-3333-333333333333", mock.ops());
     CHECK(r.ok());
     REQUIRE(r.target_guid.has_value());
     CHECK(format_guid(*r.target_guid) == "33333333-3333-3333-3333-333333333333");
+    REQUIRE(r.new_guid.has_value());
+    CHECK(format_guid(*r.new_guid) == "33333333-3333-3333-3333-333333333333");
+    CHECK(mock.requested_guids == std::vector<std::string>{"33333333-3333-3333-3333-333333333333"});
 }
 
 // ─────────────────────────────────────────────────────────── row shapes ───

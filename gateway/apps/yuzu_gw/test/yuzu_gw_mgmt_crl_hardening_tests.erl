@@ -13,6 +13,7 @@
 -module(yuzu_gw_mgmt_crl_hardening_tests).
 
 -include_lib("eunit/include/eunit.hrl").
+-include_lib("public_key/include/public_key.hrl").
 
 -define(THIS, 1793628888).
 -define(NOW, (?THIS + 600)).
@@ -40,6 +41,20 @@ fetch_of(Bin) -> fun(_Policy, _State) -> {ok, Bin, undefined} end.
 %%--------------------------------------------------------------------
 
 ca() -> yuzu_gw_crl_build:ca("Yuzu Install CA (test-host)").
+
+%% Fixture signing must also work where the host crypto policy refuses SHA-1.
+%% Check the actual certificates so permissive development hosts catch a regression.
+fixture_signing_digest_test_() ->
+    [{atom_to_list(Kind) ++ " fixture CA and leaf use a supported signing digest",
+      fun() ->
+          Ca = yuzu_gw_crl_build:ca("Yuzu fixture digest", Kind),
+          lists:foreach(fun(Der) ->
+              ?assertMatch(#'OTPCertificate'{signatureAlgorithm =
+                               #'SignatureAlgorithm'{algorithm = Algorithm}},
+                           public_key:pkix_decode_cert(Der, otp))
+          end, [maps:get(cert, Ca), yuzu_gw_crl_build:leaf(Ca)])
+      end} || {Kind, Algorithm} <- [{ec, ?'ecdsa-with-SHA384'},
+                                   {rsa, ?'sha256WithRSAEncryption'}]].
 
 parse(Crl, Ca, Now, Opts) -> yuzu_gw_mgmt_crl:parse(Crl, [maps:get(cert, Ca)], Now, Opts).
 
