@@ -4737,8 +4737,10 @@ groups:
             is serving traffic, or REINDEX DATABASE "<name>" with the Yuzu servers
             stopped); only when the reindex has finished for every index, run ALTER DATABASE
             "<name>" REFRESH COLLATION VERSION (it records the version and rebuilds nothing,
-            so it clears this alert whether or not the reindex worked; the check compares
-            version strings only, so the reindex is what makes the result certain). The server
+            so it clears this alert whether or not the reindex worked, with one exception: it
+            does not clear while an INVALID index exists in the schema device_inventory_store,
+            for example the leftover of a failed REINDEX ... CONCURRENTLY; the check otherwise
+            compares version strings only, so the reindex is what makes the result certain). The server
             rechecks every minute while the mismatch stands, so this clears within about a
             minute and without a restart. If the reindex fails on a duplicate key, stop the
             servers and resolve the duplicates by hand first (see the runbook). A database
@@ -4816,14 +4818,18 @@ groups:
             check since it started also refuses the bulk CI read (its collation gate
             reads Unproven) while its device-CI writes are still accepted.
             Causes: PostgreSQL is down or unreachable, the pool is saturated (a lease cannot be had
-            in time), a catalog read is not allowed, or the database records a collation version
+            in time), a catalog read is not allowed, an INVALID index exists in the schema
+            device_inventory_store while the versions are equal (including a REINDEX ...
+            CONCURRENTLY that is still running), or the database records a collation version
             while the PostgreSQL host reports none (for example after a base image change under
             an existing data volume). In that last case the check is permanently unreadable
             and this alert does not clear: ALTER DATABASE ... REFRESH COLLATION VERSION fails
             with "invalid collation version change" (measured on PostgreSQL 18.4 only, on a
             C-locale database with a forced recorded value that has the same facts), so the
-            reindex-then-refresh way out does not apply; see the exits in the runbook. Meanwhile
-            silence this alert for that instance, with an expiry, rather than fleet-wide.
+            reindex-then-refresh way out does not apply; see the exits in the runbook. An
+            invalid index clears when it is dropped or rebuilt (and the original index is
+            reindexed). Meanwhile silence this alert for that instance, with an expiry, rather
+            than fleet-wide.
             Look for the "[PG] could not check the database collation version" WARN line in
             the server log. Check that PostgreSQL is reachable from this replica, and that
             pg_database_collation_actual_version() returns a value for the database.
@@ -4937,7 +4943,8 @@ groups:
             complete until it is re-issued after the repair. The bulk CI read is refused (503)
             and the per-device CI reads are degraded on this replica meanwhile. Writes and
             reads resume on their own, with no restart, when the next collation check finds the
-            versions equal (every minute while the gate is not Trusted). Not covered: other
+            versions equal and no invalid index remains in the schema device_inventory_store
+            (every minute while the gate is not Trusted). Not covered: other
             stores' text-keyed unique indexes (for example endpoint_state) and agent
             registration are not gated, and a replica that has not yet seen the mismatch (up to
             an hour) still accepts writes. Per replica: with N replicas one mismatch can raise
