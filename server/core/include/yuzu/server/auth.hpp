@@ -996,6 +996,16 @@ public:
     /// (nullptr) by default; install it before any concurrent validation starts.
     void set_validate_pre_cache_hook_for_test(std::function<void()> hook);
 
+    /// TEST-ONLY: installs a callback fired by `elevate_session` (op "elevate") and
+    /// `stamp_session_mfa_proof` (op "mfa_stamp") on the durable path, AFTER the durable write
+    /// succeeded and BEFORE the cache drop, with NO lock held. It lets a test hold a writer
+    /// open while another manager revokes the elevation and a validator repopulates the cache,
+    /// to prove the late writer cannot resurrect stale state. A hook shared by several threads
+    /// must select its own thread. Production code MUST NOT call this - no caller in
+    /// `server/core/src/**` references it. A no-op (empty) by default; install it before any
+    /// concurrent writer starts.
+    void set_post_durable_write_hook_for_test(std::function<void(std::string_view op)> hook);
+
     /// TEST-ONLY: installs a callback fired in `reactivate_user` and `update_role_checked`
     /// BETWEEN the local cache erase and the durable session wipe, with NO lock held. It lets a
     /// test run a validation inside that gap, which reads the still-present row and caches the
@@ -1840,6 +1850,11 @@ private:
     /// doc. Invoked (if set) from `validate_session_durable` only. Same shape/
     /// lifetime/production-reachability as `role_recheck_race_hook_for_test_` above.
     std::function<void()> validate_pre_cache_hook_for_test_;
+
+    /// Backing field for `set_post_durable_write_hook_for_test` - see that method's doc.
+    /// Invoked (if set) from `elevate_session` and `stamp_session_mfa_proof` only, with no lock
+    /// held. Same shape/lifetime/production-reachability as `validate_pre_cache_hook_for_test_`.
+    std::function<void(std::string_view)> post_durable_write_hook_for_test_;
 
     /// Backing field for `set_between_local_erase_and_wipe_hook_for_test` - see that method's
     /// doc. Invoked (if set) from `reactivate_user` and `update_role_checked` only, with no lock

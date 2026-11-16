@@ -1374,3 +1374,186 @@ TEST_CASE("unassign Administrator: a real AuthRoutes admin gate admits the eleva
     CHECK(after->status == 403);
     CHECK(after->body.find("admin role required") != std::string::npos);
 }
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+// A writer that stalls across an Administrator unassign cannot resurrect the elevation (PR-S10,
+// commit D)
+//
+// `elevate_session` and `stamp_session_mfa_proof` used to re-derive their durable RETURNING row
+// into an existing cache entry. A writer that committed and then stalled could therefore put its
+// pre-revocation elevation back into an entry a validator had just repopulated from the cleared
+// row. Both now drop the cached entry instead, so the next validate re-reads durable state.
+//
+// ORDERING, stated once for every case below: the writer's durable write commits FIRST (the
+// elevation is live in the row), then the unassign commits and clears that row's elevation, so
+// the FINAL durable state is unelevated and the cache must agree with it.
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+// Parks the thread that calls a writer in `set_post_durable_write_hook_for_test` until released.
+// Only the thread that arms `parks_this_thread` parks; every other caller passes straight through.
+class ParkedWriter {
+public:
+    void install(AuthManager& mgr, std::string_view op) {
+        mgr_ = &mgr;
+        mgr.set_post_durable_write_hook_for_test([this, op = std::string(op)](std::string_view o) {
+            if (o != op || !parks_this_thread())
+                return;
+            std::unique_lock lk(mu_);
+            reached_ = true;
+            cv_.notify_all();
+            // Bounded: a test that never releases must not hang the suite.
+            cv_.wait_for(lk, std::chrono::seconds(30), [this] { return released_; });
+        });
+    }
+
+    // Runs `fn` on a thread that is the parked one; returns once it is parked in the hook.
+    void start(std::function<void()> fn) {
+        worker_ = std::thread([this, fn = std::move(fn)] {
+            parks_this_thread() = true;
+            fn();
+        });
+        std::unique_lock lk(mu_);
+        if (!cv_.wait_for(lk, std::chrono::seconds(10), [this] { return reached_; }))
+            FAIL("the writer never reached the post-durable-write hook within 10 s");
+    }
+
+    void release_and_join() {
+        {
+            std::lock_guard lk(mu_);
+            released_ = true;
+        }
+        cv_.notify_all();
+        if (worker_.joinable())
+            worker_.join();
+    }
+
+    ~ParkedWriter() {
+        release_and_join(); // a failed REQUIRE must not leave a joinable thread behind
+        if (mgr_)
+            mgr_->set_post_durable_write_hook_for_test(nullptr); // only after the join
+    }
+
+private:
+    static bool& parks_this_thread() {
+        thread_local bool v = false;
+        return v;
+    }
+
+    AuthManager* mgr_ = nullptr;
+    std::mutex mu_;
+    std::condition_variable cv_;
+    bool reached_ = false;
+    bool released_ = false;
+    std::thread worker_;
+};
+
+std::int64_t wall_ms_minus(std::chrono::milliseconds back) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+               .count() -
+           back.count();
+}
+
+} // namespace
+
+TEST_CASE("an elevation write that stalls across an Administrator unassign does not resurrect the "
+          "elevation in the repopulated cache (S10-D1)",
+          "[auth][session_store][account_active][cache_epoch][pg][unassign_elevation]") {
+    UnassignWorld w;
+    ParkedWriter parked;
+    parked.install(w.a, "elevate");
+    std::optional<std::chrono::system_clock::time_point> until;
+    parked.start([&] { until = w.a.elevate_session(w.token, std::chrono::seconds(300)); });
+
+    // The writer's durable grant has committed and it is parked before touching the cache. Now the
+    // unassign clears the durable elevation and the callback drops A's entry (epoch advances).
+    const auto res = w.f.rbac.unassign_role_detailed("user", "s10c_x", "Administrator");
+    REQUIRE(res.has_value());
+    CHECK(res->elevations_cleared == 1);
+    // A validator repopulates A's cache from the cleared row.
+    {
+        const auto s = w.a.validate_session(w.token);
+        REQUIRE(s.has_value());
+        REQUIRE_FALSE(yuzu::server::auth::is_elevated(*s));
+    }
+
+    parked.release_and_join();
+    REQUIRE(until.has_value()); // the writer's own return value is untouched by the fix
+
+    // The stale writer data must not have been re-derived into the fresh entry.
+    const auto s = w.a.validate_session(w.token);
+    REQUIRE(s.has_value());
+    CHECK_FALSE(yuzu::server::auth::is_elevated(*s));
+    CHECK(yuzu::server::auth::effective_role(*s) != Role::admin);
+    // A poll converges either way; the immediate checks above are the discriminating ones.
+    const auto polled = poll_and_validate(w.a, w.token);
+    REQUIRE(polled.has_value());
+    CHECK_FALSE(yuzu::server::auth::is_elevated(*polled));
+}
+
+TEST_CASE("an MFA stamp that stalls across an Administrator unassign does not resurrect the "
+          "elevation in the repopulated cache, and the proof is read from durable state (S10-D2)",
+          "[auth][session_store][account_active][cache_epoch][pg][unassign_elevation]") {
+    UnassignWorld w;
+    ParkedWriter parked;
+    parked.install(w.a, "mfa_stamp");
+    auto outcome = AuthManager::MfaStampOutcome::kStoreError;
+    parked.start([&] {
+        outcome = w.a.stamp_session_mfa_proof(
+            w.token, yuzu::server::LocalMfaProof{0, wall_ms_minus(std::chrono::seconds(5))});
+    });
+
+    REQUIRE(w.f.rbac.unassign_role_detailed("user", "s10c_x", "Administrator").has_value());
+    {
+        const auto s = w.a.validate_session(w.token);
+        REQUIRE(s.has_value());
+        REQUIRE_FALSE(yuzu::server::auth::is_elevated(*s));
+    }
+
+    parked.release_and_join();
+    CHECK(outcome == AuthManager::MfaStampOutcome::kStamped);
+
+    const auto s = w.a.validate_session(w.token);
+    REQUIRE(s.has_value());
+    CHECK_FALSE(yuzu::server::auth::is_elevated(*s));
+    CHECK(yuzu::server::auth::effective_role(*s) != Role::admin);
+    // The stamp's own effect is intact: the (durable) proof is on the served session.
+    CHECK(s->mfa_verified_at != std::chrono::system_clock::time_point{});
+}
+
+TEST_CASE("elevate_session and the MFA stamp still show on the next validate, which re-reads "
+          "durable state (S10-D3)",
+          "[auth][session_store][account_active][pg][unassign_elevation]") {
+    AcctFx f;
+    auto& a = f.add();
+    f.seed("s10d_y", Role::user);
+    const auto token = a.create_local_session_for_test("s10d_y", Role::user, false);
+    REQUIRE_FALSE(token.empty());
+    {
+        const auto s = a.validate_session(token); // warm the cache with the plain session
+        REQUIRE(s.has_value());
+        REQUIRE_FALSE(yuzu::server::auth::is_elevated(*s));
+        REQUIRE(s->mfa_verified_at == std::chrono::system_clock::time_point{});
+    }
+
+    REQUIRE(a.stamp_session_mfa_proof(token, yuzu::server::LocalMfaProof{
+                                                 0, wall_ms_minus(std::chrono::seconds(5))}) ==
+            AuthManager::MfaStampOutcome::kStamped);
+    {
+        const auto s = a.validate_session(token);
+        REQUIRE(s.has_value());
+        CHECK(s->mfa_verified_at != std::chrono::system_clock::time_point{});
+        CHECK_FALSE(yuzu::server::auth::is_elevated(*s));
+    }
+
+    const auto until = a.elevate_session(token, std::chrono::seconds(300));
+    REQUIRE(until.has_value());
+    CHECK(*until > std::chrono::system_clock::now());
+    const auto s = a.validate_session(token);
+    REQUIRE(s.has_value());
+    CHECK(yuzu::server::auth::is_elevated(*s));
+    CHECK(yuzu::server::auth::effective_role(*s) == Role::admin);
+    CHECK(s->mfa_verified_at != std::chrono::system_clock::time_point{}); // the stamp survived
+}

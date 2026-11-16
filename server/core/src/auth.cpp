@@ -1542,11 +1542,17 @@ AuthManager::stamp_session_mfa_proof(const std::string& token,
             if (verdict == StampRecheck::kUnverifiable)
                 return MfaStampOutcome::kStoreError;
         }
+        // TEST-ONLY seam: no lock is held here (it may block to straddle a revocation).
+        if (post_durable_write_hook_for_test_)
+            post_durable_write_hook_for_test_("mfa_stamp");
+        // Drop the cached copy instead of re-deriving it from `a`. `a` was read inside the
+        // durable write, so by now it can predate a revocation that cleared the elevation and
+        // evicted this entry, after which a validator repopulated the cache from the cleared
+        // row; re-deriving the stale `a` into that fresh entry would resurrect the elevation
+        // with no later generation poll to undo it. The drop advances the cache epoch, so the
+        // next validate re-reads durable state under the epoch-guarded populate path.
         std::unique_lock lock(mu_);
-        if (auto it = sessions_.find(key); it != sessions_.end())
-            (void)derive_session_deadlines(it->second, a.created_at_ms, a.expires_at_ms,
-                                           a.last_activity_ms, a.mfa_verified_ms,
-                                           a.elevated_until_ms, a.elevation_issued_ms, a.db_now_ms);
+        drop_cached_session_locked(key);
         return MfaStampOutcome::kStamped;
     }
     // Legacy no-store path: this host's clock is the authority, the same rule as the
@@ -1593,13 +1599,18 @@ AuthManager::elevate_session(const std::string& token, std::chrono::seconds dura
         if (!r->has_value())
             return std::nullopt;
         const auto& a = r->value();
-        // Re-derive the cached session (best-effort — it may live only on another
-        // replica, which picks up the grant on its next generation refresh).
+        // TEST-ONLY seam: no lock is held here (it may block to straddle a revocation).
+        if (post_durable_write_hook_for_test_)
+            post_durable_write_hook_for_test_("elevate");
+        // Drop the cached copy instead of re-deriving it from `a` (another replica picks the
+        // grant up on its next generation refresh). `a` was read inside the durable write, so
+        // by now it can predate a revocation that cleared the elevation and evicted this
+        // entry, after which a validator repopulated the cache from the cleared row;
+        // re-deriving the stale `a` into that fresh entry would resurrect the elevation with
+        // no later generation poll to undo it. The drop advances the cache epoch, so the next
+        // validate re-reads durable state under the epoch-guarded populate path.
         std::unique_lock lock(mu_);
-        if (auto it = sessions_.find(key); it != sessions_.end())
-            derive_session_deadlines(it->second, a.created_at_ms, a.expires_at_ms,
-                                     a.last_activity_ms, a.mfa_verified_ms, a.elevated_until_ms,
-                                     a.elevation_issued_ms, a.db_now_ms);
+        drop_cached_session_locked(key);
         return tp_from_ms(a.elevated_until_ms);
     }
     std::unique_lock lock(mu_);
@@ -1830,6 +1841,11 @@ void AuthManager::set_validate_pre_cache_hook_for_test(std::function<void()> hoo
     validate_pre_cache_hook_for_test_ = std::move(hook);
 }
 
+void AuthManager::set_post_durable_write_hook_for_test(
+    std::function<void(std::string_view op)> hook) {
+    post_durable_write_hook_for_test_ = std::move(hook);
+}
+
 void AuthManager::set_between_local_erase_and_wipe_hook_for_test(std::function<void()> hook) {
     between_local_erase_and_wipe_hook_for_test_ = std::move(hook);
 }
@@ -1871,7 +1887,9 @@ std::expected<int, std::string> AuthManager::revoke_user_elevations(const std::s
     if (session_store_) {
         // Durable clear FIRST (bumps the generation → every replica drops the
         // stale elevations on refresh); the store's count is authoritative
-        // (sessions may live only on other replicas). Then clear local cache.
+        // (sessions may live only on other replicas). Then clear local cache. This loop does
+        // not advance the cache epoch, so it does not stop an in-flight validator from
+        // re-inserting a pre-clear copy: that copy converges on the next generation poll.
         auto r = session_store_->clear_user_elevations(username);
         if (!r) {
             spdlog::error("revoke_user_elevations: durable clear failed ({})", r.error().message);
