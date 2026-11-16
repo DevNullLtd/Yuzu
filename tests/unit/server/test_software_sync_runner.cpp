@@ -539,6 +539,14 @@ TEST_CASE("sync runner: a same-key request during the send is 409, never a join 
             CHECK(later.summary["joined"] == true);
             CHECK(later.summary["execution_id"] == outer.summary["execution_id"]);
             CHECK(later.summary["agents_reached"] == 100);
+        } else {
+            // Every frame was refused, so the 409 caller's hint was honest: the key is free and the
+            // same request now gets a run of its own, not a 409 or a 429.
+            rig.accept = std::nullopt;
+            const auto later = runner.run(session_of("bob"), group("g"), rig.audit());
+            REQUIRE(later.status == ss::Status::Accepted);
+            CHECK(later.summary["joined"] == false);
+            CHECK(rig.dispatches.size() == 2);
         }
     }
 }
@@ -876,6 +884,20 @@ TEST_CASE("sync runner: a throw after frames were accepted keeps the budget unti
     const auto second = runner.run(session_of("alice"), group("g2"), rig.audit());
     REQUIRE(second.status == ss::Status::Accepted);
     CHECK(rig.dispatches.back().delay == 80); // 12.5 per second
+    // The key was dropped, not left Pending, and each throw gave its live-send place back: throw
+    // until every place would be gone if none had been returned (the first throw above counts),
+    // then the same group is a fresh run. The wall steps move past the earlier spreads, so only the
+    // key and the live count are in play.
+    rig.targeted_throws = true;
+    for (int i = 1; i < ss::kMaxLiveRuns; ++i) {
+        rig.wall += 100;
+        CHECK_THROWS(runner.run(session_of("alice"), group("g1"), rig.audit()));
+    }
+    rig.targeted_throws = false;
+    rig.wall += 100;
+    const auto again = runner.run(session_of("alice"), group("g1"), rig.audit());
+    REQUIRE(again.status == ss::Status::Accepted);
+    CHECK(again.summary["joined"] == false);
 }
 
 TEST_CASE("sync runner: the whole-fleet row goes through persist_fleet_wide when it is bound",
