@@ -11377,7 +11377,10 @@ TEST_CASE("#5605 T9: a re-push that inherits a staged capture does not double-co
     Spark4045Target::write(target, "content A");
 
     f.apply(make_file_hash_rule("r1", target.string())); // arm-time eval stages the capture
-    REQUIRE(f.engine->baseline_unpersisted() == std::optional<std::uint64_t>{1});
+    // The arm-time evaluation runs on a convergence lane, so the staging is asynchronous to
+    // apply(): bound the wait instead of reading the count once (a 3-in-560 flake otherwise).
+    REQUIRE(yuzu::test::spin_until(
+        [&] { return f.engine->baseline_unpersisted() == std::optional<std::uint64_t>{1}; }));
     f.apply(make_file_hash_rule("r1", target.string())); // same id again: attach_core inherits
     CHECK(f.engine->baseline_unpersisted() == std::optional<std::uint64_t>{1}); // not 2
 
