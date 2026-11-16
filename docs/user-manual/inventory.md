@@ -1822,6 +1822,10 @@ sync, defeating the hash-skip protocol.
   memory slot as `\|` and a backslash as `/`, on every OS, so the record's cores, threads and RAM are
   summed from the right columns whatever the firmware text holds (#7040). A pipe, backslash or line
   break in those fields changes the device's record once: it re-uploads with the corrected figures.
+  The Linux and macOS escape lives in the `hardware` plugin, which an over-the-air agent update does
+  not replace (it replaces the agent binary only): deliver the agent with its package installer for it
+  to take effect. Until the plugin is updated, a Linux or macOS model or slot holding a pipe still
+  misreads as before, and one ending in a backslash can misread too.
   Known limit: a pipe in a disk model, adapter or the scalar fields of the record is still
   split on every pipe, so a disk model with one reads wrongly (#7957).
 - **Observability.** Ingest shares
