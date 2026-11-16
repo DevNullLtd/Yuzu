@@ -652,39 +652,38 @@ Settings is refused until it does.
 within the window; the MFA itself may predate the token, because the provider can reuse its own
 session (the server sends no `prompt=login` or `max_age`), and no second factor is presented again
 at approval time; any single MFA-method `amr` value the gate accepts counts; real re-authentication (`auth_time` with `max_age`) is a planned
-follow-up; (b) clearing an account's MFA factor ends that account's dashboard sessions, in a second database
-commit and not for API tokens. `yuzu-server --mfa-reset` and an administrator's own Disable in Settings
-(which needs a fresh step-up proof whatever `--mfa-step-up-window-secs` is, and signs the
-caller out too, except when it only cancels an enrolment that was never verified) clear the factor in
-one commit and delete the account's sessions in another, so the pair is not atomic. Both audit the
+follow-up; (b) clearing an account's MFA factor ends that account's dashboard sessions, but not its API tokens.
+`yuzu-server --mfa-reset` and an administrator's own Disable in Settings (which needs a fresh step-up
+proof whatever `--mfa-step-up-window-secs` is, and signs the caller out too, except when it only
+cancels an enrolment that was never verified) clear the factor, delete the account's recovery codes,
+delete the account's durable sessions and write the outcome audit row in ONE database transaction
+(`MfaDisableOwner`, #6079 PR 2c), so they commit or roll back together: a failed session delete or
+outcome write leaves the factor intact, and neither path has a `partial` outcome. Both audit the
 clear in two phases: an `attempted` intent row (`mfa.reset.breakglass` or `mfa.disabled`) is written
-first and fails closed, and an outcome row follows the work. No factor is cleared unless the intent
+first, outside that transaction, and fails closed. No factor is cleared unless the intent
 row is durable (on the Settings route this relies on the audit store having opened and the audit
 writer being wired into the route, which server boot requires; the CLI checks the write result
-directly); an `attempted` row with no outcome row marks a clear that was requested and whose outcome
-is unknown; the residual, until the clear and the session delete share one transaction, is the loss
-of the outcome row (a process that dies after the clear, or an outcome write that fails after it),
-which leaves the factor cleared, the sessions possibly live and an `attempted` row with nothing after
-it. A process that dies between the intent write and the clear leaves the factor intact and the same
-lone `attempted` row, so that row alone does not prove the factor was cleared: check
-`auth.users.mfa_enrolled_at`. If the session delete fails the factor
-stays cleared and the sessions stay live until an operator ends them: Settings records `mfa.disabled`
-with `result=partial`, `--mfa-reset` records `mfa.reset.breakglass` with `result=partial` and exits
-non-zero (both with `sessions_ended=failed`), and the Settings page offers no retry control (an
-administrator calls `DELETE /api/v1/sessions?username=`; the recovery runbook has a single-transaction
-SQL fallback, which writes no audit row). If the clear itself fails the result is `error` and the
-state is unknown, because the commit acknowledgement may have been lost and the clear may have
-landed: Settings still ends the sessions, and `--mfa-reset` ends none and exits non-zero. A Disable whose account's
+directly). Because the outcome row commits with the clear, an `attempted` row with no outcome row
+means the clear did not commit and the factor is intact (the request failed or was refused, the
+transaction rolled back, or the process died first). The one indeterminate case is a database connection
+lost at the instant of COMMIT, where the acknowledgement is lost: the transaction may have committed,
+and if it did the clear, the session delete and the outcome row all landed together; check
+`auth.users.mfa_enrolled_at` after such a failure. If the transaction fails, Settings answers `503`
+(nothing changed; `Sec-Audit-Failed: true` when the cause was the outcome row) and records `error`
+with detail `disable failed`, and `--mfa-reset` exits non-zero with a message that nothing was changed.
+The recovery runbook keeps a single-transaction SQL fallback for hosts without the binary, which
+writes no audit row. A Disable whose account's
 factor changed after the step-up check admitted it is refused `409` and records a `denied` row
 (`reason=factor_changed`), with nothing cleared and no session ended. A sign-in in
-flight when the delete runs can leave a session the delete did not cover; and a replica or CLI image
-still on an older build ends none and writes no `attempted` row. `sessions_ended` counts the durable
+flight when the delete runs can leave a session the delete did not cover. `sessions_ended` counts the durable
 session rows deleted, expired rows not yet reaped included. Other replicas drop their cached sessions
 within about one second in normal operation and within 30 seconds while a replica's session-generation
 poll is failing; neither bound holds after a database restore or a failover to a lagging standby
-(runbook, "Sessions are durable"). The outcome row cannot undo the clear, so a failed outcome write
-after it leaves only the intent row: `yuzu-server --mfa-reset` then exits non-zero, and Settings logs
-an error and completes the request. The comparison of the proof's factor generation with the account's
+(runbook, "Sessions are durable"). Separately, a Settings enrolment confirm is refused (`401`
+`session_not_durable`, or `503` `session_store_unavailable`, audited `mfa.enroll.failed`) unless the
+caller's session is a valid stored session, so an enrolment cannot commit on a session that has already
+ended; the check is made just before the commit and outside the account's row lock, so a session that ends
+in that instant still leaves the account enrolled, recorded `step_up_proof=not_stamped`. The comparison of the proof's factor generation with the account's
 current one (a proof of a replaced factor is refused after re-enrolment, `proof_factor_mismatch`) is the
 second line of defence: it reads no clock, so it stops a proof being reused after re-enrolment even when
 the database primary clock steps; the proof's age ceiling does assume that clock does not step backward.
@@ -749,15 +748,13 @@ passed, not the factor type, the proof age or the factor generation. The generat
 `mfa.step_up.passed` / `auth.oidc_login` rows, or, for a proof stamped by a Settings enrolment confirm, by
 `mfa.enroll.verified` with `step_up_proof=stamped`. Evidence for residual (b) is a pair of rows per clear, ordered by the audit `id`: an `attempted`
 intent row written before the factor is touched, then an outcome row. The `mfa.disabled` rows carry the
-acting session's principal, role and session id; `partial` or `sessions_ended=failed` marks an incomplete
-clear, `error` marks a clear whose state is unknown, and a `denied` row (`reason=factor_changed`) marks a request that changed nothing. The `mfa.reset.breakglass` rows carry the OS
-identity that ran the command as principal; its outcome is `success`, `partial` (the session delete
-failed, detail `sessions_ended=failed`) or `error`. Both are inside the `auth-sample` export. An
-`attempted` row with no outcome row marks a clear that was requested and whose outcome is unknown: the
-process died, or the outcome write failed, after the factor was cleared, or the process died before the
-clear and the factor is intact. The reconciliation query that lists them is under "Finding a clear whose
+acting session's principal, role and session id; an `ok` row (`sessions_ended=<n>`) marks a clear that committed,
+`error` (`disable failed`) marks a clear that rolled back and changed nothing, and a `denied` row (`reason=factor_changed`) marks a request that changed nothing. The `mfa.reset.breakglass` rows carry the OS
+identity that ran the command as principal; its outcome is `success` (a clear that committed) or `error` (nothing changed). Both are inside the `auth-sample` export. An
+`attempted` row with no outcome row marks a clear that did not commit and left the factor intact, apart from a connection
+lost at the instant of COMMIT (check the account). The reconciliation query that lists them is under "Finding a clear whose
 outcome is unknown" in `docs/ops-runbooks/auth-db-recovery.md`, which also has the query for outcome rows
-that ended `error` or `partial`; the row definitions are in
+that ended `error`; the row definitions are in
 `docs/user-manual/audit-log.md`.
 
 ---

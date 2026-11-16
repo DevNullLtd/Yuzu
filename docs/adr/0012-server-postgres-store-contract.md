@@ -472,3 +472,24 @@ takes an account or RBAC lock, so nothing that holds `session_meta` waits on one
 The wait on that row is bounded per lock by the lifecycle `lock_timeout` the owner installs; session
 create and revoke writers install no timeout of their own and run under the pool defaults.
 A failed bump aborts the deactivation (the account stays active, a store failure to the caller).
+
+## Update (2026-11-16) -- a seventh query owner: MfaDisableOwner
+
+A seventh query owner: `MfaDisableOwner` (`mfa_disable_owner.{hpp,cpp}`, #6079 PR 2c), the ONLY
+production path that clears a local account's second factor (the Settings disable and the host
+break-glass `--mfa-reset`). It copies `CredentialChangeOwner`'s shape: one `pool.with_txn_for` on one
+lease, schema-qualified SQL across `auth`, `session_store` and `audit_store`, a txn-scoped
+`lock_timeout`, and no compensating write. In one transaction it clears the factor and deletes the
+recovery codes (`auth_sql::clear_mfa_factor_in_txn` in `auth_db_sql_helpers.hpp`, the ONE copy of
+those statements, which `AuthDB::mfa_disable_report` also runs), deletes every durable session of
+the account (`session_sql::delete_user_sessions_in_txn`), inserts the OUTCOME audit row
+(`AuditStore::log_in_txn`) and LAST bumps the `session_meta` write generation
+(`session_sql::bump_generation_in_txn`). The clear, the session delete and the outcome row therefore
+commit or abort together; the caller's `attempted` intent row is written before, outside the
+transaction, and still fails closed. The one indeterminate case is a connection lost exactly at
+COMMIT. The lock order is `CredentialChangeOwner`'s, with the same acyclicity argument: the
+`auth.users` row, the `session_store.sessions` rows, the `audit_store.audit_events` INSERT, then the
+`session_meta` row last; a clear of an account with no verified factor that leaves its sessions alone
+takes only the first and the audit INSERT. As with the other owners it is correct only because
+`AuthDB`, `SessionStore` and `AuditStore` share ONE pool/database (ADR-0006); a split fails every
+statement closed, never a silent partial write.
