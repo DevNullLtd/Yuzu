@@ -73,6 +73,11 @@ Invariants:
      a Mismatch or Unproven gate in place until a restart (writes paused, CI reads refused), which
      is an operator-actionable fault, not a degradation to note in passing.
 
+  15a. The `collation_gate_` initialiser is exactly `{pg::kInitialCollationGate}` (Unproven, pinned
+     by a static_assert in test_pg_collation_check.cpp), never Trusted; and every member that
+     borrows a pointer to it (the recheck, the store, the hardware routes, the MCP server) is
+     declared after it.
+
   15. The collation GATE (the lock-free atomic the check publishes, which pauses device_ci writes)
      is wired at all three ends: both report sites (the constructor-time `report_collation_check(`
      and the `PgCollationRecheck` construction) pass `&collation_gate_`, and
@@ -175,13 +180,28 @@ MSG_START_UNGUARDED = ("the PgCollationRecheck start() is not wrapped in try/cat
 GATE_ARG = "&collation_gate_"
 WRITE_GATE = "device_inventory_store_->set_write_gate(&collation_gate_);"
 GATE_DECL = "std::atomic<pg::CollationGate> collation_gate_"
+GATE_INIT_DECL = "std::atomic<pg::CollationGate> collation_gate_{pg::kInitialCollationGate};"
 STORE_DECL = "std::unique_ptr<DeviceInventoryStore> device_inventory_store_;"
+# Every member that borrows a pointer to the gate (qe-3 / cpp-safety-2): the store (set_write_gate),
+# the recheck (publishes), the hardware routes and the MCP server (`ci_collation_gate`). Each must
+# be declared AFTER the gate so it is destroyed BEFORE it. STORE_DECL is checked by its own message.
+BORROWER_DECLS = (
+    ("pg_collation_recheck_", RECHECK_DECL),
+    ("hardware_routes_", "std::unique_ptr<HardwareRoutes> hardware_routes_;"),
+    ("mcp_server_", "std::unique_ptr<mcp::McpServer> mcp_server_;"),
+)
 MSG_REPORT_NO_GATE = "the report_collation_check call does not pass &collation_gate_"
 MSG_MAKE_NO_GATE = "the PgCollationRecheck is not given &collation_gate_"
 MSG_WRITE_GATE = ("server.cpp must call `" + WRITE_GATE + "` exactly once: without it the "
                   "device_ci store has no gate and a collation mismatch pauses nothing")
 MSG_GATE_DECL_ORDER = ("the collation_gate_ member is not declared before the "
                        "device_inventory_store_ member that borrows a pointer to it")
+MSG_GATE_INIT = ("the collation_gate_ member is not initialised with `{pg::kInitialCollationGate}`: "
+                 "any other initial value (a fail-open Trusted) would let every device_ci write and "
+                 "read through before the first check concludes")
+MSG_GATE_BORROWER_ORDER = ("the {name} member that borrows a pointer to the collation gate is not "
+                           "declared after the collation_gate_ member (it would outlive the gate it "
+                           "reads)")
 MSG_DECL_ORDER = ("the pg_collation_recheck_ member is not declared after the pg_pool_ member it "
                   "borrows")
 
@@ -433,6 +453,12 @@ def problems(src):
     store_decl = t.find(STORE_DECL)
     if gate_decl < 0 or store_decl < 0 or gate_decl > store_decl:
         out.append(MSG_GATE_DECL_ORDER)
+    if GATE_INIT_DECL not in t:
+        out.append(MSG_GATE_INIT)
+    for name, decl in BORROWER_DECLS:
+        pos_b = t.find(decl)
+        if gate_decl < 0 or pos_b < 0 or gate_decl > pos_b:
+            out.append(MSG_GATE_BORROWER_ORDER.format(name=name))
     seeds = [m.start() for m in re.finditer(re.escape(SEED), t)]
     if len(seeds) != 1 or seeds[0] > pos:
         out.append(MSG_SEED)
@@ -528,7 +554,32 @@ class PgCollationCheckWiring(unittest.TestCase):
         rest = self.src[:i] + self.src[j:]
         k = rest.index(STORE_DECL) + len(STORE_DECL)
         m = rest[:k] + "\n    " + decl + rest[k:]
-        self.assertEqual(problems(m), [MSG_GATE_DECL_ORDER])
+        # The store is declared after the hardware routes and the MCP server, so moving the gate
+        # past the store moves it past those two borrowers as well.
+        self.assertEqual(problems(m), [
+            MSG_GATE_DECL_ORDER,
+            MSG_GATE_BORROWER_ORDER.format(name="hardware_routes_"),
+            MSG_GATE_BORROWER_ORDER.format(name="mcp_server_"),
+        ])
+
+    def test_gate_declared_after_each_other_borrower(self):
+        for name, decl in BORROWER_DECLS:
+            with self.subTest(borrower=name):
+                i = self.src.index(GATE_DECL)
+                j = self.src.index(";", i) + 1
+                gate = self.src[i:j]
+                rest = self.src[:i] + self.src[j:]
+                k = rest.index(decl) + len(decl)
+                m = rest[:k] + "\n    " + gate + rest[k:]
+                self.assertIn(MSG_GATE_BORROWER_ORDER.format(name=name), problems(m))
+
+    def test_gate_initialised_to_trusted(self):
+        for bad in ("{pg::CollationGate::Trusted}", "{}", "{pg::CollationGate::Mismatch}"):
+            with self.subTest(init=bad):
+                m = self.src.replace(GATE_INIT_DECL,
+                                     "std::atomic<pg::CollationGate> collation_gate_" + bad + ";", 1)
+                self.assertNotEqual(m, self.src)
+                self.assertEqual(problems(m), [MSG_GATE_INIT])
 
     def test_recheck_start_deleted(self):
         m = self.src.replace(START, "(void)0;", 1)
@@ -622,7 +673,9 @@ class PgCollationCheckWiring(unittest.TestCase):
         rest = self.src[:i] + self.src[i + len(RECHECK_DECL):]
         k = rest.index(POOL_DECL)
         m = rest[:k] + RECHECK_DECL + "\n    " + rest[k:]
-        self.assertEqual(problems(m), [MSG_DECL_ORDER])
+        # Moved above the pool, the recheck is also above the gate declared right after the pool.
+        self.assertEqual(problems(m), [MSG_GATE_BORROWER_ORDER.format(name="pg_collation_recheck_"),
+                                       MSG_DECL_ORDER])
 
     def test_join_moved_before_the_leader_resign(self):
         i = self.src.index(STOP)

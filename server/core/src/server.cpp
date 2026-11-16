@@ -24904,7 +24904,12 @@ private:
     /// every ingest thread (agent_service_, declared later) has already stopped.
     std::unique_ptr<pg::PgPool> pg_pool_;
     /// The collation gate the check publishes (lock-free). Declared right after pg_pool_ and
-    /// BEFORE every store on purpose: a store will borrow a pointer to it, so it must outlive them.
+    /// BEFORE every borrower on purpose, so it is destroyed after all of them. The borrowers are:
+    /// `device_inventory_store_` (`set_write_gate`, the write pause), `pg_collation_recheck_` (the
+    /// publisher, handed `&collation_gate_`), `hardware_routes_` (`Deps::ci_collation_gate` plus
+    /// the roster and per-id closures that read it) and `mcp_server_` (`ToolDeps::ci_collation_gate`
+    /// plus the same closures). The initialiser is `kInitialCollationGate` (Unproven), never
+    /// Trusted. tests/test_pg_collation_check_wiring_lexical.py pins the order and the initialiser.
     std::atomic<pg::CollationGate> collation_gate_{pg::kInitialCollationGate};
     detail::EventBus event_bus_;
     detail::AgentRegistry registry_;
