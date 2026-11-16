@@ -1208,3 +1208,169 @@ TEST_CASE("update_role_checked answers UpdatedSessionWipeFailed when the durable
     REQUIRE(role.has_value());
     CHECK(role->role == Role::admin); // the role IS changed
 }
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+// Administrator unassign ends the target's live JIT elevation (PR-S10, commit C)
+//
+// The RbacStore clears the durable elevations in the unassign transaction; the callback wired
+// below (exactly as server.cpp wires it) drops THIS replica's cached sessions. AcctFx shares one
+// RbacStore, so the callback reaches manager A only: manager B models the OTHER replica, which
+// converges on its next generation poll.
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+struct UnassignWorld {
+    AcctFx f;
+    AuthManager& a;
+    AuthManager& b;
+    std::string token;
+
+    // `x` holds the Administrator grant AND a second counted Administrator exists, so the
+    // last-Administrator guard passes. `x` has an elevated session warm on BOTH replicas.
+    explicit UnassignWorld(bool wire_callback = true) : a(f.add()), b(f.add()) {
+        f.seed("s10c_other", Role::user);
+        f.seed("s10c_x", Role::user);
+        REQUIRE(f.rbac.assign_role({"user", "s10c_other", "Administrator"}).has_value());
+        REQUIRE(f.rbac.assign_role({"user", "s10c_x", "Administrator"}).has_value());
+        token = a.create_local_session_for_test("s10c_x", Role::user, false);
+        REQUIRE_FALSE(token.empty());
+        REQUIRE(a.elevate_session(token, std::chrono::seconds(300)).has_value());
+        REQUIRE(a.validate_session(token).has_value());
+        REQUIRE(b.validate_session(token).has_value()); // cold read: warms B with the elevation
+        if (wire_callback)
+            REQUIRE(f.rbac.set_local_session_drop(
+                [&mgr = a](const std::string& u) { mgr.drop_local_sessions_of_user(u); }));
+        REQUIRE(elevated(a));
+        REQUIRE(elevated(b));
+    }
+
+    bool elevated(AuthManager& m) const {
+        const auto s = m.validate_session(token);
+        REQUIRE(s.has_value());
+        return yuzu::server::auth::is_elevated(*s) &&
+               yuzu::server::auth::effective_role(*s) == Role::admin;
+    }
+};
+
+} // namespace
+
+TEST_CASE("unassign Administrator: the unassigning replica drops the elevation on its NEXT "
+          "request, the other replica after one poll (S10-C1)",
+          "[auth][session_store][account_active][pg][unassign_elevation]") {
+    UnassignWorld w;
+
+    const auto res = w.f.rbac.unassign_role_detailed("user", "s10c_x", "Administrator");
+    REQUIRE(res.has_value());
+    CHECK(res->removed);
+    CHECK(res->elevations_cleared == 1);
+
+    // A: the callback evicted the cached copy, so the very next validate re-reads the cleared row.
+    {
+        const auto s = w.a.validate_session(w.token);
+        REQUIRE(s.has_value());
+        CHECK_FALSE(yuzu::server::auth::is_elevated(*s));
+        CHECK(yuzu::server::auth::effective_role(*s) != Role::admin);
+    }
+    // B: nothing told it, so its warm entry is still elevated until the generation poll runs.
+    CHECK(w.elevated(w.b));
+    {
+        const auto s = poll_and_validate(w.b, w.token);
+        REQUIRE(s.has_value());
+        CHECK_FALSE(yuzu::server::auth::is_elevated(*s));
+        CHECK(yuzu::server::auth::effective_role(*s) != Role::admin);
+    }
+    // The clear emits no `role.elevation.expired` signal: the lapse reaper finds nothing to reap
+    // on either replica (a sentinel window is "already reaped or revoked").
+    CHECK_FALSE(w.a.reap_expired_elevation(w.token).has_value());
+    CHECK_FALSE(w.b.reap_expired_elevation(w.token).has_value());
+}
+
+TEST_CASE("unassign Administrator: without the callback only the generation poll converges "
+          "(the wiring is what makes the unassigning replica immediate) (S10-C2)",
+          "[auth][session_store][account_active][pg][unassign_elevation]") {
+    UnassignWorld w(/*wire_callback=*/false);
+    REQUIRE(w.f.rbac.unassign_role_detailed("user", "s10c_x", "Administrator").has_value());
+
+    CHECK(w.elevated(w.a)); // stale warm cache: the baseline the callback exists to remove
+    const auto s = poll_and_validate(w.a, w.token);
+    REQUIRE(s.has_value());
+    CHECK_FALSE(yuzu::server::auth::is_elevated(*s));
+}
+
+TEST_CASE("unassign of a non-Administrator role leaves both replicas elevated (S10-C3)",
+          "[auth][session_store][account_active][pg][unassign_elevation]") {
+    UnassignWorld w;
+    REQUIRE(w.f.rbac.assign_role({"user", "s10c_x", "Viewer"}).has_value());
+
+    const auto res = w.f.rbac.unassign_role_detailed("user", "s10c_x", "Viewer");
+    REQUIRE(res.has_value());
+    CHECK(res->removed);
+    CHECK(res->elevations_cleared == 0);
+
+    CHECK(w.elevated(w.a));
+    CHECK(w.elevated(w.b));
+    const auto sb = poll_and_validate(w.b, w.token);
+    REQUIRE(sb.has_value());
+    CHECK(yuzu::server::auth::is_elevated(*sb));
+}
+
+TEST_CASE("unassign Administrator: a last-Administrator refusal does not invoke the callback and "
+          "leaves the elevation alone (S10-C4)",
+          "[auth][session_store][account_active][pg][unassign_elevation]") {
+    UnassignWorld w(/*wire_callback=*/false);
+    int calls = 0;
+    REQUIRE(w.f.rbac.set_local_session_drop([&](const std::string& u) {
+        ++calls;
+        w.a.drop_local_sessions_of_user(u);
+    }));
+    // Remove the second counted Administrator first, so s10c_x is the last one.
+    REQUIRE(w.f.rbac.unassign_role_detailed("user", "s10c_other", "Administrator").has_value());
+    // That removal was a successful user Administrator unassign of ANOTHER user: one callback.
+    REQUIRE(calls == 1);
+
+    const auto res = w.f.rbac.unassign_role_detailed("user", "s10c_x", "Administrator");
+    CHECK_FALSE(res.has_value());
+    CHECK(calls == 1); // the refusal ran no callback
+    CHECK(w.elevated(w.a));
+    CHECK(w.elevated(w.b));
+    const auto sb = poll_and_validate(w.b, w.token);
+    REQUIRE(sb.has_value());
+    CHECK(yuzu::server::auth::is_elevated(*sb)); // nothing was cleared durably either
+}
+
+TEST_CASE("unassign Administrator: a real AuthRoutes admin gate admits the elevated user before "
+          "and refuses on the next request after (S10-C5)",
+          "[auth][session_store][account_active][pg][unassign_elevation]") {
+    UnassignWorld w;
+    yuzu::server::Config cfg{};
+    cfg.https_enabled = false;
+    std::shared_mutex oidc_mu;
+    std::unique_ptr<yuzu::server::oidc::OidcProvider> oidc_provider;
+    // The route runs on A, the replica the callback reaches. `routes` before `sink`.
+    yuzu::server::AuthRoutes routes(cfg, w.a, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                                    oidc_mu, oidc_provider);
+    yuzu::server::test::TestRouteSink sink;
+    routes.register_routes(sink);
+    const std::unordered_map<std::string, std::string> hdrs{
+        {"Cookie", "yuzu_session=" + w.token}};
+    // The inline admin gate (effective_role) runs before the step-up stage, so an elevated user
+    // gets PAST it (whatever the later stage answers) and a non-elevated one gets the 403 body.
+    const auto call = [&] {
+        return sink.dispatch("POST", "/api/v1/users/nobody_s10c/elevation-eligibility",
+                             R"({"eligible":true})", "application/json", hdrs);
+    };
+    {
+        const auto before = call();
+        REQUIRE(before);
+        CHECK(before->body.find("admin role required") == std::string::npos);
+        CHECK(before->status != 401);
+    }
+
+    REQUIRE(w.f.rbac.unassign_role_detailed("user", "s10c_x", "Administrator").has_value());
+
+    const auto after = call();
+    REQUIRE(after);
+    CHECK(after->status == 403);
+    CHECK(after->body.find("admin role required") != std::string::npos);
+}

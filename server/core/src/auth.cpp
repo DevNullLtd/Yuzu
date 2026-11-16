@@ -1903,6 +1903,29 @@ std::expected<int, std::string> AuthManager::revoke_user_elevations(const std::s
     return cleared;
 }
 
+void AuthManager::drop_local_sessions_of_user(const std::string& username) noexcept {
+    try {
+        std::unique_lock lock(mu_);
+        if (session_store_) {
+            // Durable mode: the clear already committed; evict this replica's cache and advance
+            // the epoch so a racing validator cannot re-insert the pre-clear copy.
+            drop_cached_user_sessions_locked(username);
+            return;
+        }
+        for (auto& [key, s] : sessions_) {
+            if (s.username == username) {
+                s.elevated_until = {};
+                s.elevation_issued_at = {};
+                s.steady_elevated_until = {}; // the field is_elevated reads
+            }
+        }
+    } catch (const std::exception& e) {
+        spdlog::error("drop_local_sessions_of_user failed ({})", e.what());
+    } catch (...) {
+        spdlog::error("drop_local_sessions_of_user failed (unknown exception)");
+    }
+}
+
 std::optional<Session> AuthManager::validate_session(const std::string& token) const {
     // Reject overly-long tokens early to prevent DoS via map key exhaustion (#630).
     // This check intentionally fires BEFORE the mutex acquire below — rejecting

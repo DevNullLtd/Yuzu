@@ -7540,6 +7540,29 @@ public:
                 // does not exist until this block. Nulled at teardown beside
                 // set_credential_change_owner(nullptr).
                 auth_mgr_.set_rbac_store(rbac_store_.get());
+                // PR-S10: an Administrator unassign clears the target's durable elevations in
+                // its own transaction (the RbacStore default mode; this file never opts out).
+                // That clear needs the session_store schema, which only an OPEN SessionStore
+                // guarantees, so refuse to boot without one rather than serve a console where
+                // every user Administrator unassign fails. The callback then drops THIS
+                // replica's cached sessions of the user (other replicas converge on their next
+                // generation poll). `auth_mgr_` is a reference to main.cpp's AuthManager, which
+                // outlives ServerImpl; the callback is never cleared at teardown (it is
+                // read lock-free by serving threads) and only takes AuthManager's own lock.
+                if (!session_store_ || !session_store_->is_open()) {
+                    spdlog::error("[PG] Refusing to start: the RbacStore Administrator unassign "
+                                  "ends the target's JIT elevation in its own transaction, which "
+                                  "needs an open SessionStore (session_store schema), and none is "
+                                  "available");
+                    startup_failed_ = true;
+                } else if (!rbac_store_->set_local_session_drop(
+                               [&auth_mgr = auth_mgr_](const std::string& username) {
+                                   auth_mgr.drop_local_sessions_of_user(username);
+                               })) {
+                    spdlog::error("[PG] Refusing to start: the RbacStore local session-drop "
+                                  "callback was already set (PR-S10)");
+                    startup_failed_ = true;
+                }
             }
         }
         // #4966 boot self-check: an AuthDB without the guard would leave

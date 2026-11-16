@@ -157,6 +157,36 @@ TEST_CASE("AuthManager::elevate_session sets the window; revoke clears it", "[ji
 
 // ── Follow-up B: clamp to the session's absolute lifetime ──────────────────
 
+TEST_CASE("AuthManager::drop_local_sessions_of_user (store-less) zeroes that user's elevation "
+          "only (PR-S10)",
+          "[jit][auth][unassign_elevation]") {
+    auto mgr = make_temp_auth();
+    mgr->upsert_user("alice", "secret123456", Role::user);
+    mgr->upsert_user("bob", "secret123456", Role::user);
+    const auto ta = mgr->authenticate("alice", "secret123456");
+    const auto tb = mgr->authenticate("bob", "secret123456");
+    REQUIRE(ta.has_value());
+    REQUIRE(tb.has_value());
+    REQUIRE(mgr->elevate_session(*ta, std::chrono::seconds(60)).has_value());
+    REQUIRE(mgr->elevate_session(*tb, std::chrono::seconds(60)).has_value());
+    REQUIRE(auth::is_elevated(*mgr->validate_session(*ta)));
+    REQUIRE(auth::is_elevated(*mgr->validate_session(*tb)));
+
+    mgr->drop_local_sessions_of_user("alice");
+
+    const auto sa = mgr->validate_session(*ta);
+    REQUIRE(sa.has_value()); // the session itself survives; only the elevation ends
+    CHECK_FALSE(auth::is_elevated(*sa));
+    CHECK(auth::effective_role(*sa) == Role::user);
+    const auto sb = mgr->validate_session(*tb);
+    REQUIRE(sb.has_value());
+    CHECK(auth::is_elevated(*sb)); // another user's elevation is untouched
+    // Idempotent and safe for an unknown user.
+    mgr->drop_local_sessions_of_user("alice");
+    mgr->drop_local_sessions_of_user("nobody");
+    CHECK(auth::is_elevated(*mgr->validate_session(*tb)));
+}
+
 TEST_CASE("AuthManager::elevate_session clamps the window to the session's own "
          "absolute expiry",
          "[jit][auth]") {

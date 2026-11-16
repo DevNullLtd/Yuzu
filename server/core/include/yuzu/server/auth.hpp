@@ -917,6 +917,16 @@ public:
     /// flip alone does not drop it). Store-less (legacy) mode never errors.
     [[nodiscard]] std::expected<int, std::string> revoke_user_elevations(const std::string& username);
 
+    /// Drop THIS replica's cached copies of `username`'s sessions, in memory only, so the next
+    /// `validate_session` re-reads the durable row. The `RbacStore` local-drop callback (wired in
+    /// server.cpp) calls this after an Administrator unassign has cleared the durable elevations
+    /// inside its own transaction; it repeats no durable work. With a `SessionStore` it goes
+    /// through `drop_cached_user_sessions_locked`, which also advances the cache epoch so a
+    /// validator that read the row before the clear cannot re-insert it. Store-less (unit-test)
+    /// mode zeroes the elevation fields of the user's cached sessions instead. Takes `mu_` only;
+    /// never throws.
+    void drop_local_sessions_of_user(const std::string& username) noexcept;
+
     /// Lazily reap a PASSIVELY-lapsed JIT elevation (residual-risk follow-up A,
     /// security review 2026-06-30): if `token`'s session holds an elevation
     /// whose window has elapsed (`elevated_until` set and `now >=
