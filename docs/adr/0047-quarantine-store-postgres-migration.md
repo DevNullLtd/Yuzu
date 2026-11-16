@@ -565,7 +565,7 @@ routes.
 **The four contract rulings of #7588**, recorded here as the issue asks:
 
 - (a) *Record reason on a device-side expiry*: **keep.** No server code ends a record on a device time
-  limit (routed-concern clause 5; Alex's ruling, PRQ.2 B8), so there is no expiry reason to store:
+  limit (routed-concern clause 5; owner ruling), so there is no expiry reason to store:
   `ReleaseEnd` stays `device_confirmed | forced`, and a device-reported limit is drift and is re-applied.
 - (b) *Error class for a release in progress*: **keep** `kInvalidParams` ("a release is in progress for
   this device") with no `retry_after_ms`. The closed JSON-RPC code set (`mcp_jsonrpc.hpp`) has no
