@@ -713,7 +713,7 @@ TEST_CASE("openapi_spec_json(): the kill-switch routes document the per-OS query
         // The protective-set caveat is part of the published contract.
         const std::string desc = op.value("description", "");
         CHECK(desc.find("__guard__.push_rules") != std::string::npos);
-        CHECK(desc.find("unquarantine") != std::string::npos);
+        CHECK(desc.find("quarantine_allow") != std::string::npos);
         CHECK(desc.find(std::string(method) == "get" ? "dispatch still proceeds"
                                                       : "no dispatch effect") !=
               std::string::npos);
@@ -2729,8 +2729,10 @@ TEST_CASE("openapi documents: the response status set of the hand-checked operat
         // check cannot classify); 401 (auth_fn); 403 (scoped gate, dispatch check); 500 (gate or
         // authorizer not wired); 503 (store not open, store fault, attempt audit unavailable).
         {"/quarantine", "post", {"201", "400", "401", "403", "500", "503"}},
-        // register_routes(): sink.Delete(R"(/api/v1/quarantine/(.+))"): 200; the same refusals.
-        {"/quarantine/{agent_id}", "delete", {"200", "400", "401", "403", "500", "503"}},
+        // register_routes(): sink.Delete(R"(/api/v1/quarantine/(.+))"): 200 (the device confirmed
+        // the release, or a forced end); 202 (the release is sent and unconfirmed: the record
+        // reads releasing); the same refusals.
+        {"/quarantine/{agent_id}", "delete", {"200", "202", "400", "401", "403", "500", "503"}},
         // register_routes(): sink.Delete(R"(/api/v1/engine-principals/([^/]+))"): 200; 401 and
         // 403 (step-up, perm_fn, engine session); 404 (no such principal); 503 (six causes). It
         // has no input-validation 400.

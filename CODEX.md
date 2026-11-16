@@ -5,7 +5,7 @@ Use repo-local Codex skills first. Start with the narrowest matching skill and c
 ## Route By Task
 
 - `governance`: run `/governance <range>` or full governance review. Produces a change summary, bounded review fanout, a governance ledger, and a blocking decision.
-- `test`: run `/test`, `/test --quick`, `/test --full`, `/test --instructions`, or quarantine-mode validation. Preserves the test-runs DB and UAT lifetime rules.
+- `test`: run `/test`, `/test --quick`, `/test --full`, or `/test --instructions`. Preserves the test-runs DB and UAT lifetime rules.
 - `tdd`: build a feature or fix test-first with Yuzu's public-interface, tracer-bullet red-green-refactor loop.
 - `diagnose`: debug failures, flakes, and performance regressions through reproduce, minimize, hypothesize, instrument, fix, and regression-test.
 - `grill-with-docs`: interrogate plans against Yuzu's domain language, `CONTEXT.md`, code, and ADRs; create ADRs lazily in `docs/adr/` only when warranted.

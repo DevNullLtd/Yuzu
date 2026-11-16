@@ -212,7 +212,7 @@ TEST_CASE("system-reserved ids: a present-EMPTY visible set reaches NOBODY",
 
 TEST_CASE("system-reserved ids: the fail-closed containment gate is not applied (a contained device still answers)",
           "[server][dispatch][scope][security][sync_fanout]") {
-    // The quarantine plugin gate itself is exercised in test_quarantine_dispatch_gate.cpp; this pins
+    // The containment gate itself is exercised in test_quarantine_dispatch_gate.cpp; this pins
     // only that this arm does not fail closed on an empty quarantine set.
     std::vector<std::string> sent_to;
     const auto r = dispatch_system_reserved_ids(

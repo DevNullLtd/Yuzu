@@ -691,6 +691,11 @@ server stores and resolves them, shows the effective result for a device
 (`GET /api/v1/inventory/software/hosts/{agent_id}/collection-settings`), and
 saving a document never starts a collection.
 
+The same documents are reachable by agentic clients over MCP, and each tool returns what its REST
+route returns: `list_software_collection_settings`, `get_software_collection_settings`,
+`set_software_collection_settings` (supervised tier, approval-gated, audited ahead of the write
+like the REST `PUT`) and `get_software_host_collection_settings`.
+
 ## Reading the inventory
 
 The data lands in the Postgres schema **`software_inventory_store`**:
@@ -997,6 +1002,8 @@ Three REST reads show how installed-software collection is going. Parameters and
 - **`GET /api/v1/inventory/software/plugin-health`** is the fleet view: one entry per facet (collector) with the number of devices in each status, the share timing out or failing, collection time and bytes read (p50, p95, max) and the ten slowest devices. Start here.
 - **`GET /api/v1/inventory/software/hosts`** and **`/hosts/{agent_id}`** are the per-device view: each device's last report time and, per facet, the status, the short `token` explaining it, when it was last confirmed, and what the last collection cost. Use `q` to find a device by hostname or agent id among the devices the roster holds (seen in the last 30 days, the newest 100,000: a search that finds nothing proves nothing while `roster_truncated` is `true`, and a device quiet for over 30 days is listed but not matched; tracked by #7790), and `last_synced_before` to list devices that have gone quiet.
 - **`GET /api/v1/inventory/software/summary`** gives devices reporting and stale (no report for 48 hours), install, removal and upgrade counts for the last 24 hours and 7 days, and the catalogue size.
+
+**MCP access.** Each read has an MCP twin that returns the same `data` object as the route: `list_software_hosts`, `get_software_host`, `list_software_changes`, `get_software_summary` and `get_software_plugin_health`. They need the same `Inventory:Read` grant, apply the same management-group scope, and are strict about input: an unknown argument or an out-of-range value is refused where the REST route clamps. A device outside the caller's scope and an unknown device answer the same not-found.
 
 **Reading collection health.**
 

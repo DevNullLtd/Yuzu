@@ -77,18 +77,19 @@ TEST_CASE("enablement units: the real catalogue builds with no missing or stale 
 
 TEST_CASE("enablement units: the injected predicate is the canonical protective one",
           "[enablement][catalogue]") {
-    // The real catalogue cannot tell the canonical set from the narrow quarantine one
+    // The real catalogue cannot tell the canonical set from the narrow containment one
     // (its only addition, __guard__.push_rules, is already a reserved name), so the
-    // constant is pinned by behaviour: the quarantine-only predicate answers false for
+    // constant is pinned by behaviour: the containment-only predicate answers false for
     // push_rules. This guards the constant itself; a caller must still pass it, and the
     // first production includer's own test must pin that (tracked by #5982).
     CHECK(kProtectivePredicate("__guard__", "push_rules"));
-    CHECK(kProtectivePredicate("quarantine", "whitelist"));
     // The firewall plugin's four containment actions (owner decision 2026-11-12) ...
     for (const auto* a : {"quarantine", "release", "quarantine_status", "quarantine_allow"})
         CHECK(kProtectivePredicate("firewall", a));
     // ... and only those: its other actions stay ordinary units.
     CHECK_FALSE(kProtectivePredicate("firewall", "state"));
+    // The removed plugin's name is protective for nothing.
+    CHECK_FALSE(kProtectivePredicate("quarantine", "release"));
     CHECK_FALSE(kProtectivePredicate("echo", "fleet_snapshot"));
 }
 
@@ -147,11 +148,6 @@ TEST_CASE("enablement units: the non-unit set is exactly the protective and rese
         {"firewall.quarantine_allow", R::Protective},
         {"firewall.quarantine_status", R::Protective},
         {"firewall.release", R::Protective},
-        {"quarantine", R::Protective},
-        {"quarantine.quarantine", R::Protective},
-        {"quarantine.status", R::Protective},
-        {"quarantine.unquarantine", R::Protective},
-        {"quarantine.whitelist", R::Protective},
     };
     REQUIRE(ov.non_units.size() == expected.size());
     for (const auto& [name, reason] : expected) {
@@ -160,6 +156,26 @@ TEST_CASE("enablement units: the non-unit set is exactly the protective and rese
         REQUIRE(n != nullptr);
         CHECK(n->reason == reason);
         CHECK(ov.find(name) == nullptr);
+    }
+}
+
+TEST_CASE("enablement units: firewall is a plugin unit whose action units are state and rules only",
+          "[enablement][catalogue]") {
+    const auto ov = real_overlay();
+    const auto* plugin = ov.find("firewall");
+    REQUIRE(plugin != nullptr);
+    CHECK(plugin->kind == UnitKind::Plugin);
+    std::vector<std::string> actions;
+    for (const auto* a : ov.actions_of("firewall"))
+        actions.push_back(a->name);
+    std::sort(actions.begin(), actions.end());
+    CHECK(actions == std::vector<std::string>{"firewall.rules", "firewall.state"});
+    // The four containment actions are recorded non-units, never switchable units.
+    for (const auto* name : {"firewall.quarantine", "firewall.release", "firewall.quarantine_status",
+                             "firewall.quarantine_allow"}) {
+        INFO(name);
+        CHECK(ov.find(name) == nullptr);
+        CHECK(ov.find_non_unit(name) != nullptr);
     }
 }
 
@@ -174,7 +190,13 @@ TEST_CASE("enablement units: system_reserved rows with D3 work are ordinary unit
     }
     CHECK(ov.find("echo") != nullptr);
     CHECK(ov.find("asset_tags") != nullptr);
+    // No unit and no non-unit is named for the removed plugin.
     CHECK(ov.find("quarantine") == nullptr);
+    CHECK(ov.find_non_unit("quarantine") == nullptr);
+    for (const auto& u : ov.units)
+        CHECK(u.plugin != "quarantine");
+    for (const auto& n : ov.non_units)
+        CHECK(n.name.rfind("quarantine", 0) != 0);
     // The firewall plugin is a mixed plugin: the plugin row and a non-containment action are
     // ordinary units a kill switch may turn off; the containment actions are not.
     CHECK(ov.find("firewall") != nullptr);

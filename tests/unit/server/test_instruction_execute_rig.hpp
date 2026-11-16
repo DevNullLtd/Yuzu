@@ -70,8 +70,8 @@ inline constexpr std::array<CommandCapability, 6> kFixture{{
         authz::Operation::Write, ExecuteGate::None),
     row("testplug", "forensic", DispatchClass::ReadOnly, Mutability::None, "Forensics",
         authz::Operation::Read, ExecuteGate::None),
-    // The quarantine control plugin is protective: never os_gate_unreadable / plugin_not_found.
-    row("quarantine", "status", DispatchClass::ReadOnly, Mutability::None, "Security",
+    // The firewall containment actions are protective: never os_gate_unreadable / plugin_not_found.
+    row("firewall", "quarantine_status", DispatchClass::ReadOnly, Mutability::None, "Security",
         authz::Operation::Read, ExecuteGate::None),
 }};
 
