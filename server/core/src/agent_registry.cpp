@@ -1057,6 +1057,10 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         // firewall
         {"firewall.state", "Firewall state per profile/backend"},
         {"firewall.rules", "List firewall rules (summary)"},
+        {"firewall.quarantine", "Isolate device from network, allowing the management server and listed exceptions"},
+        {"firewall.release", "Remove the quarantine firewall rules and restore network access"},
+        {"firewall.quarantine_status", "Check whether quarantine rules are currently in force"},
+        {"firewall.quarantine_allow", "Add or remove exceptions on an active quarantine allow-list"},
         // certificates
         {"certificates.list", "List certificates in system stores"},
         {"certificates.details", "Get details for a certificate by thumbprint"},
@@ -1083,11 +1087,6 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         {"chargen.chargen_stop", "Stop all running chargen sessions"},
         // ioc
         {"ioc.check", "Check indicators of compromise against local endpoint state"},
-        // quarantine
-        {"quarantine.quarantine", "Isolate device from network, whitelisting management server"},
-        {"quarantine.unquarantine", "Remove quarantine firewall rules and restore network access"},
-        {"quarantine.status", "Check whether quarantine rules are currently active"},
-        {"quarantine.whitelist", "Add or remove IPs from an active quarantine whitelist"},
         // agent_actions
         {"agent_actions.set_log_level", "Change the spdlog log level at runtime"},
         {"agent_actions.info", "Return agent runtime info from config context"},
@@ -1150,6 +1149,12 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         {"sccm.site", "Get SCCM site assignment info"},
         // firmware_posture
         {"firmware_posture.firmware", "Report BIOS/firmware vendor, version, release date and update-pending posture"},
+        // component_inventory
+        {"component_inventory.scan",
+         "List Java archives (.jar/.war/.ear) and the libraries nested one level inside them "
+         "under the machine-wide application roots, with name, version, version source, path, "
+         "size and anchor application (Linux and macOS; Windows planned; read-only, no "
+         "subprocess, machine roots only)"},
         // runtimes
         {"runtimes.dotnet",
          "List installed .NET (Core/5+) shared frameworks and SDKs by flavour, version and "

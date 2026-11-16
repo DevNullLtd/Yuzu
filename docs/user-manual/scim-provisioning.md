@@ -414,10 +414,14 @@ This case answers `500`, not `503` with `Retry-After` (tracked separately), so
 configure the connector to retry a `500`. Some identity providers pause or
 quarantine the provisioning app after repeated 5xx responses (Microsoft Entra
 does); after the store recovers, confirm the provisioning job is running and
-re-trigger a sync. If the post-deactivation session wipe itself fails, a
-surviving durable session is not checked against account state by session
-validation and can keep validating until it expires; end it with
-`DELETE /api/v1/sessions?username=<name>`.
+re-trigger a sync. If the post-deactivation session wipe itself fails, the
+account is deactivated and a session whose local account is inactive is rejected
+at validation (about one second after the deactivation commits on a healthy
+generation poll, at most about 30 seconds while a replica's poll fails); the
+surviving row is removed when the account is reactivated or you end it with
+`DELETE /api/v1/sessions?username=<name>`. Sessions of an OIDC or SAML sign-in
+are ended by the linked-identity revoke of the deprovision, not by this check,
+and API tokens are unchanged.
 
 **SCIM will not deactivate an account that is currently `role=admin`,**
 whether that admin role came from a dashboard promotion or from
@@ -741,7 +745,19 @@ enforcement is off; if the grant read is unavailable the answer is `503` with
 If the person is later re-added in the IdP, the same SCIM resource is
 reactivated (`active: true`): the account comes back, any lockout state is
 cleared, but **MFA is not restored** — they will re-enroll TOTP the next
-time they sign in.
+time they sign in. Reactivation first removes any session the account still has
+(also when the account is already active, for example on an IdP retry after a
+failed mirror write, which signs the user out again). If that removal does not
+persist, Yuzu answers `500`, the account stays inactive and the IdP must retry;
+configure the connector to retry a `500`, as for a deprovision. A sign-in after
+the reactivation is a new sign-in, with one residual: a login that carries no
+bound MFA proof, whose first factor was verified before the deactivation, can
+still complete after the reactivation, because the post-mint recheck compares
+the role, credential hash and active state, and for a login whose bound
+MFA proof was earned before the deactivation also the factor generation, which a
+deactivation changes;
+deactivation clears the TOTP secret and recovery codes, so a pending MFA
+login cannot complete unless the user enrols again inside the pending window.
 
 ## SCIM failure-mode matrix
 
@@ -817,6 +833,7 @@ and now also carry `Retry-After: 2`.
 | Group membership read fault | `503` ("membership unavailable") | `2` | `failure` on a Group `POST`, `PUT`, `PATCH` or `DELETE`; none on a `GET` | none | Retry. **`POST /Groups`:** the members are resolved before the group row is created, so on this `503` nothing is created, no rollback runs, and the retry creates the group normally (`201`, never a `409` against an empty group). The failure audit row `scim.group.created` has an empty target id and the detail `member resolution unavailable; no group was created`. A failure of the membership write after the group was created is a different case: the `500` `failed to persist group membership` leaves the empty group in place (limit 4 under "Known limits of the Group role recompute"). |
 | API-token revoke or durable session delete did not persist during a `PATCH`/`PUT` `active:false` or a `DELETE` of an active user (#4772) | `500` (`failed to revoke <API tokens \| sessions \| API tokens and sessions> for one or more linked identities`) | none | `scim.user.deactivated` or `scim.user.deleted`, `partial`, detail `api_tokens_db_error=true` and/or `sessions_db_error=true` | `YuzuSessionStoreDegraded` (`increase(yuzu_auth_session_store_degrade_total[10m]) > 0` held for 10 minutes, any `op`; it can miss a short outage) | Retry; the account stays active and the SCIM resource and links are untouched, but credentials that did revoke stay revoked. Configure the connector to retry a `500`. |
 | Same, on `POST /Users` with `active:false` (#4772) | `500` for a token step that did not persist, with audit `scim.user.provisioned` `partial`; when the principal set is only the local username, a session delete that did not persist is not a failure unless the account removal's own session wipe also fails (the backstop marker `session_leg_backstopped=true` is noted with `sessions_db_error=true`) (`500`, audit `failure`, `account deactivated; durable session wipe failed`) | none | as stated | as above | The account already exists and is mapped, so a retry meets `409`. Reconcile: `GET` the user, then `PATCH` `active:false`. |
+| The durable session wipe that runs before a reactivation did not persist (`PATCH`/`PUT` `active:true`, or a `POST` that revives a removed account) | `500` (`failed to reactivate the underlying account`; on a `POST` revive, `failed to revive the underlying account`) | none | `scim.user.reactivated` `failure` (`scim.user.provisioned` `failure` for the `POST` revive), no detail | none; `yuzu_auth_session_store_degrade_total{op}` moves when the cause is a store outage, and `YuzuSessionStoreDegraded` can fire | Retry. The account is still inactive and the SCIM mirror is unchanged. Configure the connector to retry a `500`. |
 | Resource does not exist | `404` | none | none | none | Treat as gone. |
 | Provenance or role refusal (account not created by SCIM, or role other than `user`) | `404` | none | `scim.user.provenance_denied` (`denied`) | `yuzu_scim_provenance_denied_total` | Stop. This is a refusal, not a fault. |
 | Duplicate `userName` or `displayName` | `409` (`scim_type=uniqueness`) | none | `denied` on the create or update action | none | Update the existing resource instead. On `POST /Groups` the members are resolved before the duplicate check, so while the store is faulting a duplicate whose members cannot be resolved answers `503` rather than `409`; the retry then meets the `409`. |

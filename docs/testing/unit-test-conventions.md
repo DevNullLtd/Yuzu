@@ -5,6 +5,8 @@ Loaded by `quality-engineer` on any change under `tests/unit/`.
 The "Shell and source-text gates" section also covers `test()` registrations in `tests/meson.build`, the `tests/test_*.py` source-text gates and `tests/shell/`.
 
 Companion: `docs/testing/integration-tests.md` covers the shell/E2E stack-bring-up layer.
+The opt-in obligation registry and evidence capture are described in
+[`contract-evidence.md`](contract-evidence.md).
 The authoritative statement of each helper's contract is its own doc comment at the source;
 this doc is the index and carries the rules that live nowhere else.
 
@@ -27,14 +29,36 @@ For server tests that need a live `ExecutionTracker` in `AgentServiceImpl`, use 
 ## Exception-safe test cleanup — `ScopeExit`
 
 `yuzu::test::ScopeExit` (`tests/unit/test_helpers.hpp`) is a generic RAII cleanup
-that runs on ANY scope exit, including exception unwind from a failing
-`REQUIRE`/`CHECK` — declare it after whatever it releases/reads so it destructs
+that runs on ANY scope exit, including a failing `REQUIRE` or an exception from
+tested code — declare it after whatever it releases/reads so it destructs
 FIRST (reverse declaration order); its callback must not throw, since it can run
 mid-unwind, where a second throw would terminate. Used by `test_thread_pool.cpp`
-(releasing parked pool workers before `~ThreadPool` joins them) and
-`test_guardian_outbox_send_executor.cpp` (#4223 — releasing a detached worker
-parked on a test-owned gate pointer before the pointer's stack storage can be
-destroyed). Promoted from `test_thread_pool.cpp` once a second file needed it.
+(releasing parked pool workers before `~ThreadPool` joins them). Promoted from
+`test_thread_pool.cpp` once a second file needed it.
+
+A bounded drain is not a lifetime guarantee for a detached worker. In
+`test_guardian_outbox_send_executor.cpp`, each stalled callback owns its gate
+through `shared_ptr`; fixture destruction releases the gate even during assertion
+unwind, and the callback keeps it alive until the worker exits. The SSE saturation
+fixture similarly releases held streams and joins every client before destroying
+the server, including partial construction and exception paths.
+
+## Fixture observations must detect the wrong behavior
+
+A fixture needs an observable result from the code under test. For example,
+`test_rest_sessions.cpp` distinguishes a missing session from an authenticated
+session with an empty username so the defensive handler actually runs;
+`test_power_health_parsers.cpp` records the requested power-plan GUID and derives
+read-back state from that argument. A fixed successful read-back could hide a
+wrong command. `KvProbe` in `test_guardian_spark_reapply_skip_engine.cpp` requires
+`SQLITE_DONE` after reading all rows: a database error cannot mean "no writes".
+
+For an assertion repair, preserve a failing baseline or a deliberate faulty copy
+alongside the passing run when practical. Record the source revision and dirty
+patch, exact command and filter, toolchain, prerequisite state, exit status,
+case/assertion/skip counts, and raw native reports. Identify extracted harnesses
+separately from registered test runs. A passing helper probe does not establish
+ADR conformance for its consumers, and a skipped prerequisite is not a pass.
 
 ## Agent-side journal storage tests — `FakeJournalStore`
 
@@ -60,7 +84,7 @@ the concurrency property under test — not the storage engine — is the point 
 
 For server tests needing live **PostgreSQL**, use `PostgresTestDb` + `YUZU_REQUIRE_PG_DB(var)` from `test_helpers.hpp` (behind `YUZU_TEST_ENABLE_PG`, server suite only). Creates an ephemeral `yuzu_test_<epoch>_<salt>_<n>` DB on `YUZU_TEST_POSTGRES_DSN`, drops it `WITH (FORCE)`; the name-embedded epoch drives a suite-start sweep of databases leaked by killed runs. Skip-vs-fail: env **unset** → skip (local dev); **set but broken** → FAIL (`scripts/ci/ensure-postgres.sh` guarantees a reachable instance on every CI server-test leg). **Store-behaviour tests use the pre-migrated template variant** `YUZU_REQUIRE_PG_DB_TPL(var, tpl)` + a file-local `PgTestTemplate` (clones an already-migrated DB — per-test migration DDL drove the 2026-07-12 Windows server-suite timeout; recipe: `docs/postgres-store-playbook.md` step 7); plain `YUZU_REQUIRE_PG_DB` is only for fresh-DB / pg-substrate behaviour tests. **Migration-in-substance tests** (a real fresh migrate, `!is_open` on failure, backfill/upgrade, drift-detection) use `YUZU_REQUIRE_PG_MIGRATION_DB(var)` instead (#2354, #3443) — same contract, SKIPs on Windows by default (fail-closed; `YUZU_TEST_PG_MIGRATION_DDL=1` overrides), so a new store's migration test belongs on this macro, never plain `YUZU_REQUIRE_PG_DB`. Local: run `postgres:18` on `:5433` with `-c max_connections=400` (what `scripts/ci/ensure-postgres.sh` uses — at the default 100, a full parallel `--suite server` run fails with "too many clients"), then `export YUZU_TEST_POSTGRES_DSN=postgresql://yuzu:yuzu@localhost:5433/yuzu`.
 
-**Clone-strategy A/B knob (measurement only).** `YUZU_TEST_PG_CLONE_STRATEGY` selects the `STRATEGY` of the template clone (`CREATE DATABASE "<db>" TEMPLATE "<tpl>"`, the `YUZU_REQUIRE_PG_DB_TPL` path): `wal_log` or `file_copy`, case-insensitive, appends ` STRATEGY WAL_LOG` / ` STRATEGY FILE_COPY`. **Unset (or empty) leaves the SQL byte-identical** to the knob not existing, so the server default (`WAL_LOG`) applies. **Any other value FAILS the fixture** (`PostgresTestDb::error()` names the variable and the accepted values; the macro's `REQUIRE` reports it) rather than silently measuring the default. **The `STRATEGY` clause needs PostgreSQL 15 or later**: an older server rejects the `CREATE DATABASE`, which fails the fixture, so leave the variable unset there. Fresh empty databases (plain `YUZU_REQUIRE_PG_DB`) are not affected. No CI job sets it (the Linux test step prints a `::warning::` if the runner's environment does); it exists to compare the two strategies on the pg step's wall time (`docs/ci-architecture.md`, "Postgres for server tests"). Parser and its contract: `parse_pg_clone_strategy` in `test_helpers.hpp`, tested in `tests/unit/server/test_pg_template_cleanup.cpp` (the parser on its own, plus a `[pg][template]` case cloning with each value and with an invalid one).
+**Clone-strategy knob.** `YUZU_TEST_PG_CLONE_STRATEGY` selects the `STRATEGY` of the template clone (`CREATE DATABASE "<db>" TEMPLATE "<tpl>"`, the `YUZU_REQUIRE_PG_DB_TPL` path): `wal_log` or `file_copy`, case-insensitive, appends ` STRATEGY WAL_LOG` / ` STRATEGY FILE_COPY`. **Unset (or empty) leaves the SQL byte-identical** to the knob not existing, so the server default (`WAL_LOG`) applies. **Any other value FAILS the fixture** (`PostgresTestDb::error()` names the variable and the accepted values; the macro's `REQUIRE` reports it) rather than silently measuring the default. **The `STRATEGY` clause needs PostgreSQL 15 or later**: an older server rejects the `CREATE DATABASE`, which fails the fixture, so leave the variable unset there. **`file_copy` is only faster on a cluster running with `fsync=off`** (as CI's does); on a durable one, such as a default local `postgres:18` container, each clone is several times slower, so leave it unset locally unless your cluster runs that way. Fresh empty databases (plain `YUZU_REQUIRE_PG_DB`) are not affected. The Linux CI test step's pg half sets it to `file_copy` (measured about 6-7% faster on that half than the default; a value already in the runner's environment is overridden there, with a `::warning::`); no other CI job sets it, so the Windows and macOS legs, the nightlies and local runs keep the server default unless you set it (`docs/ci-architecture.md`, "Postgres for server tests"). Parser and its contract: `parse_pg_clone_strategy` in `test_helpers.hpp`, tested in `tests/unit/server/test_pg_template_cleanup.cpp` (the parser on its own, plus a `[pg][template]` case cloning with each value and with an invalid one).
 
 ## Prometheus alert rules — parse vs behaviour
 

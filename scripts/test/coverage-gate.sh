@@ -14,8 +14,9 @@
 #                         updated JSON in the same change that earned the new
 #                         baseline. Exits PASS after capture.
 #
-# Required arguments:
-#   --run-id ID       — /test run ID (DB foreign key)
+# Run identity:
+#   --run-id ID       — /test run ID (DB foreign key); required except in capture
+#                       mode, which generates a fresh manual ID when omitted
 #
 # Optional arguments:
 #   --build-dir DIR   — coverage build directory (default: build-linux-coverage)
@@ -109,10 +110,10 @@ MIN_FREE_KB="${YUZU_COVERAGE_MIN_FREE_KB:-262144}"
 
 usage() {
     cat <<EOF
-usage: $0 --run-id ID [options]
+usage: $0 [--run-id ID] [options]
 
-Required:
-  --run-id ID
+Run identity:
+  --run-id ID            required unless --capture-baselines generates a fresh ID
 
 Optional:
   --build-dir DIR        (default: build-linux-coverage)
@@ -148,6 +149,27 @@ done
 # comparison could not parse here, not after a 20 minute run.
 [[ "$SLACK_PP" =~ ^[0-9]{1,6}([.][0-9]{1,6})?$ ]] && awk -v s="$SLACK_PP" 'BEGIN { exit !(s <= 50) }' || { echo "coverage-gate: --slack-pp must be a plain number from 0 to 50, got '${SLACK_PP//[^[:print:]]/?}'" >&2; exit 2; }
 
+# Resolve a working Python 3 once (python3, then python: a name that exists but
+# does not run, like the Windows Store stub, is skipped) and use it everywhere.
+PYTHON=""
+for _py in python3 python; do
+    if "$_py" -c 'import sys; sys.exit(0 if sys.version_info[0] == 3 else 1)' >/dev/null 2>&1; then
+        PYTHON="$_py"
+        break
+    fi
+done
+unset _py
+if [[ -z "$PYTHON" ]]; then
+    echo "coverage-gate: no working Python 3 interpreter (tried python3, python)" >&2
+    exit 2
+fi
+
+if [[ -z "$RUN_ID" && "$CAPTURE" == 1 ]]; then
+    RUN_ID=$("$PYTHON" -c 'import uuid; print("manual-" + uuid.uuid4().hex)') || {
+        echo "coverage-gate: could not generate a capture run ID" >&2
+        exit 2
+    }
+fi
 if [[ -z "$RUN_ID" ]]; then
     echo "coverage-gate: --run-id required" >&2
     exit 2
@@ -171,7 +193,7 @@ BASELINE="${BASELINE:-$YUZU_ROOT/tests/coverage-baseline.json}"
 # macOS); fall back to python's realpath. A raw spelling must never reach the
 # guard below: `build-x/../../elsewhere` matches the `build-*` glob lexically.
 BUILD_DIR_ABS=$(readlink -f "$BUILD_DIR" 2>/dev/null) \
-    || BUILD_DIR_ABS=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$BUILD_DIR" 2>/dev/null) \
+    || BUILD_DIR_ABS=$("$PYTHON" -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$BUILD_DIR" 2>/dev/null) \
     || BUILD_DIR_ABS=""
 if [[ -z "$BUILD_DIR_ABS" || "$BUILD_DIR_ABS" != /* ]]; then
     echo "coverage-gate: refusing --build-dir '$BUILD_DIR': could not resolve it to an absolute path" >&2
@@ -857,7 +879,7 @@ fi
 # of silently defaulting to 0 (which would anchor a false baseline).
 
 PARSE_RC=0
-COVERAGE_JSON=$(python3 - "$GCOVR_JSON" <<'PY'
+COVERAGE_JSON=$("$PYTHON" - "$GCOVR_JSON" <<'PY'
 import json, sys
 try:
     with open(sys.argv[1]) as f:
@@ -908,9 +930,9 @@ if [[ $PARSE_RC -ne 0 || -z "$COVERAGE_JSON" ]]; then
     exit 2
 fi
 
-BRANCH_PCT=$(echo "$COVERAGE_JSON" | python3 -c "import json, sys; print(json.load(sys.stdin)['branch_percent'])")
-LINE_PCT=$(echo "$COVERAGE_JSON" | python3 -c "import json, sys; print(json.load(sys.stdin)['line_percent'])")
-LINE_RESOLVED=$(echo "$COVERAGE_JSON" | python3 -c "import json, sys; print(json.load(sys.stdin).get('line_resolved', False))")
+BRANCH_PCT=$(echo "$COVERAGE_JSON" | "$PYTHON" -c "import json, sys; print(json.load(sys.stdin)['branch_percent'])")
+LINE_PCT=$(echo "$COVERAGE_JSON" | "$PYTHON" -c "import json, sys; print(json.load(sys.stdin)['line_percent'])")
+LINE_RESOLVED=$(echo "$COVERAGE_JSON" | "$PYTHON" -c "import json, sys; print(json.load(sys.stdin).get('line_resolved', False))")
 
 echo "coverage-gate: branch=$BRANCH_PCT% line=$LINE_PCT% (line_resolved=$LINE_RESOLVED)" | tee -a "$GATE_LOG"
 
@@ -952,7 +974,7 @@ if [[ $CAPTURE -eq 1 ]]; then
     # rewrite the git-tracked baseline (the exit code and the file state must agree).
     if (( DB_WRITE_FAILED )); then
         GATE_DUR=$(( $(date +%s) - GATE_START ))
-        NOTE="refused --capture-baselines: a DB write failed earlier in this run, so the run's record is incomplete; re-run once the test-runs DB is healthy"
+        NOTE="refused --capture-baselines: evidence recording failed earlier, so the run's record is incomplete; inspect the recorder error above (including run-ID/revision conflicts) and retry with a fresh run ID after correcting its cause"
         echo "coverage-gate: $NOTE" | tee -a "$GATE_LOG"
         write_gate FAIL "$GATE_DUR" "$NOTE"
         exit 1
@@ -973,7 +995,7 @@ if [[ $CAPTURE -eq 1 ]]; then
     OLD_BRANCH=""
     OLD_LINE=""
     if [[ -f "$BASELINE" ]]; then
-        OLD_BRANCH=$(python3 - "$BASELINE" 2>/dev/null <<'PY' || echo "?"
+        OLD_BRANCH=$("$PYTHON" - "$BASELINE" 2>/dev/null <<'PY' || echo "?"
 import json, sys
 try:
     with open(sys.argv[1]) as f:
@@ -982,7 +1004,7 @@ except Exception:
     print("?")
 PY
 )
-        OLD_LINE=$(python3 - "$BASELINE" 2>/dev/null <<'PY' || echo "?"
+        OLD_LINE=$("$PYTHON" - "$BASELINE" 2>/dev/null <<'PY' || echo "?"
 import json, sys
 try:
     with open(sys.argv[1]) as f:
@@ -995,7 +1017,7 @@ PY
     fi
 
     echo "coverage-gate: --capture-baselines set — rewriting $BASELINE"
-    python3 - "$BASELINE" "$GCOVR_JSON" "$BRANCH_PCT" "$LINE_PCT" "$YUZU_ROOT" <<'PY'
+    "$PYTHON" - "$BASELINE" "$GCOVR_JSON" "$BRANCH_PCT" "$LINE_PCT" "$YUZU_ROOT" <<'PY'
 import json, os, subprocess, sys, time
 path, summary_path, branch_pct, line_pct, repo = sys.argv[1:]
 try:
@@ -1009,7 +1031,8 @@ baseline = {
     "__doc": (
         "Locked branch coverage baseline enforced by "
         "scripts/test/coverage-gate.sh. Regenerate with "
-        "'bash scripts/test/coverage-gate.sh --run-id manual --capture-baselines' "
+        "'bash scripts/test/coverage-gate.sh --capture-baselines' "
+        "(a fresh run ID is generated for each capture), "
         "then commit this file alongside the change that earned the new baseline. "
         "Hardware fingerprint deliberately omitted — line-level coverage is "
         "compiler-deterministic, unlike perf timings."
@@ -1068,7 +1091,7 @@ fi
 # sec-h-1: $BASELINE is operator-controlled — pass via sys.argv, not
 # string interpolation, to block code injection via path names with
 # embedded single quotes.
-SEED_FLAG=$(python3 - "$BASELINE" 2>/dev/null <<'PY' || echo "false"
+SEED_FLAG=$("$PYTHON" - "$BASELINE" 2>/dev/null <<'PY' || echo "false"
 import json, sys
 try:
     with open(sys.argv[1]) as f:
@@ -1086,7 +1109,7 @@ if [[ "$SEED_FLAG" == "true" ]]; then
 fi
 
 COMPARE_RC=0
-RESULT=$(python3 - "$BASELINE" "$BRANCH_PCT" "$SLACK_PP" <<'PY'
+RESULT=$("$PYTHON" - "$BASELINE" "$BRANCH_PCT" "$SLACK_PP" <<'PY'
 import json, math, sys
 baseline_path, branch_pct, slack_pp = sys.argv[1], float(sys.argv[2]), float(sys.argv[3])
 try:

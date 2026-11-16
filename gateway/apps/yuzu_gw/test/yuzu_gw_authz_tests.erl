@@ -19,7 +19,7 @@
 %% cert-mint helpers shared with yuzu_gw_authz_rpc_tests and the
 %% connection-binding transport tests
 -export([setup_certs/0, setup_certs/1, cleanup_certs/1, der/2,
-         certs_unavailable/2]).
+         certs_unavailable/2, openssl/1]).
 
 %%%-------------------------------------------------------------------
 %%% Fixture
@@ -65,6 +65,55 @@ authz_test_() ->
         end
      end}.
 
+certificate_paths_test_() ->
+    case os:find_executable("openssl") of
+        false -> certs_unavailable("certificate path fixture", openssl_missing);
+        _ -> certificate_paths_case()
+    end.
+
+certificate_paths_case() ->
+    {timeout, 30, fun() ->
+        Salt = binary_to_list(binary:encode_hex(crypto:strong_rand_bytes(8))),
+        Base = filename:join(temp_base(),
+                             "yuzu_test_cert_paths_" ++ Salt ++ " with ' quote"),
+        try
+            Certs = setup_certs(Base),
+            try
+                ?assertMatch(#{srv_pem := _}, Certs),
+                ?assert(byte_size(der(Certs, srv_pem)) > 0),
+                spki_matches_openssl(Certs)
+            after cleanup_certs(Certs)
+            end,
+            ?assertNot(filelib:is_dir(maps:get(dir, Certs)))
+        after
+            _ = file:del_dir_r(Base)
+        end
+    end}.
+
+openssl_exit_status_test_() ->
+    case os:find_executable("openssl") of
+        false -> certs_unavailable("OpenSSL exit status fixture", openssl_missing);
+        _ -> fun() ->
+            Args = ["req", "-yuzu-test-invalid-option"],
+            {error, {openssl_failed, Status, Args, Output}} = openssl(Args),
+            ?assert(Status =/= 0),
+            ?assert(byte_size(Output) > 0)
+        end
+    end.
+
+missing_openssl_cleans_fixture_test() ->
+    SavedPath = os:getenv("PATH"),
+    Salt = binary_to_list(binary:encode_hex(crypto:strong_rand_bytes(8))),
+    Base = filename:join(temp_base(), "yuzu_test_missing_openssl_" ++ Salt),
+    try
+        true = os:putenv("PATH", ""),
+        ?assertEqual({error, openssl_missing}, setup_certs(Base)),
+        ?assertEqual({ok, []}, file:list_dir(Base))
+    after
+        case SavedPath of false -> os:unsetenv("PATH"); _ -> os:putenv("PATH", SavedPath) end,
+        _ = file:del_dir_r(Base)
+    end.
+
 %%%-------------------------------------------------------------------
 %%% Cases
 %%%-------------------------------------------------------------------
@@ -86,11 +135,14 @@ accept_hex_pin(Certs) ->
 
 %% Empirically validates the plain-decode → der_encode SPKI round trip
 %% against openssl's own extraction of the same certificate's public key.
-spki_matches_openssl(#{srv_pem := SrvPem} = Certs) ->
+spki_matches_openssl(#{srv_pem := SrvPem, dir := Dir} = Certs) ->
     {ok, Spki} = yuzu_gw_authz:spki_sha256(der(Certs, srv_pem)),
-    Out = os:cmd("openssl x509 -in '" ++ SrvPem ++ "' -pubkey -noout"
-                 " | openssl pkey -pubin -outform DER"
-                 " | openssl dgst -sha256 -hex"),
+    Pub = filename:join(Dir, "spki-public.pem"),
+    SpkiFile = filename:join(Dir, "spki-public.der"),
+    {ok, _} = openssl(["x509", "-in", SrvPem, "-pubkey", "-noout", "-out", Pub]),
+    {ok, _} = openssl(["pkey", "-pubin", "-in", Pub, "-outform", "DER", "-out", SpkiFile]),
+    {ok, Output} = openssl(["dgst", "-sha256", "-hex", SpkiFile]),
+    Out = binary_to_list(Output),
     %% output shape: "SHA2-256(stdin)= <hex>\n" (tool-version dependent
     %% prefix) — take the last whitespace-separated token.
     OpensslHex = lists:last(string:lexemes(string:trim(Out), " =\n")),
@@ -200,7 +252,14 @@ app_env_entry_point(#{srv_pem := SrvPem} = Certs) ->
 %%%-------------------------------------------------------------------
 
 setup_certs() ->
-    setup_certs("/tmp").
+    setup_certs(temp_base()).
+
+temp_base() ->
+    case [V || Name <- ["TMPDIR", "TEMP", "TMP"],
+               V <- [os:getenv(Name)], V =/= false, V =/= ""] of
+        [Base | _] -> Base;
+        [] -> filename:basedir(user_cache, "yuzu_test")
+    end.
 
 %% setup_certs/0, then publish the srv leaf's file pin the way the running
 %% gateway's watcher (yuzu_gw_mgmt_pins) would, so the cases that pin
@@ -221,9 +280,16 @@ setup_published() ->
 %% `{error, _}' has nothing to clean up (cleanup_certs/1 on an error is a no-op).
 setup_certs(BaseDir) ->
     Rand = binary_to_list(binary:encode_hex(crypto:strong_rand_bytes(12))),
-    Dir = filename:join([BaseDir, "yuzu_gw_authz_" ++ Rand]),
+    Dir = filename:join([filename:absname(BaseDir), "yuzu_test_authz_" ++ Rand]),
     ok = filelib:ensure_dir(filename:join(Dir, "x")),
     _ = file:change_mode(Dir, 8#700),
+    try create_certs(Dir)
+    catch Class:Reason:Stack ->
+        cleanup_certs(#{dir => Dir}),
+        erlang:raise(Class, Reason, Stack)
+    end.
+
+create_certs(Dir) ->
     CaK = filename:join(Dir, "ca.key"),
     Ca  = filename:join(Dir, "ca.pem"),
     SrvExt = ext_file(Dir, "srv.ext",
@@ -235,23 +301,22 @@ setup_certs(BaseDir) ->
           "extendedKeyUsage=clientAuth\n"
           "basicConstraints=CA:FALSE\n">>),
     Cmds =
-        [["openssl ecparam -name secp384r1 -genkey -noout -out ", q(CaK)],
-         ["openssl req -x509 -new -key ", q(CaK), " -sha384 -days 1 ",
-          "-subj /CN=Yuzu-Test-CA ",
-          "-addext basicConstraints=critical,CA:TRUE ",
-          "-addext keyUsage=critical,keyCertSign,cRLSign ",
-          "-out ", q(Ca)]]
-        ++ leaf_cmds(Dir, "srv", "'/O=Yuzu/CN=Yuzu Default server'", SrvExt, Ca, CaK)
-        ++ leaf_cmds(Dir, "gw", "'/O=Yuzu/CN=Yuzu Default gateway'", SrvExt, Ca, CaK)
-        ++ leaf_cmds(Dir, "agent", "'/O=Yuzu/CN=agent-123'", AgentExt, Ca, CaK)
-        ++ leaf_cmds(Dir, "collide", "'/O=Yuzu/CN=Yuzu Default server'", AgentExt, Ca, CaK)
+        [["ecparam", "-name", "secp384r1", "-genkey", "-noout", "-out", CaK],
+         ["req", "-x509", "-new", "-key", CaK, "-sha384", "-days", "1",
+          "-subj", "/CN=Yuzu-Test-CA",
+          "-addext", "basicConstraints=critical,CA:TRUE",
+          "-addext", "keyUsage=critical,keyCertSign,cRLSign", "-out", Ca]]
+        ++ leaf_cmds(Dir, "srv", "/O=Yuzu/CN=Yuzu Default server", SrvExt, Ca, CaK)
+        ++ leaf_cmds(Dir, "gw", "/O=Yuzu/CN=Yuzu Default gateway", SrvExt, Ca, CaK)
+        ++ leaf_cmds(Dir, "agent", "/O=Yuzu/CN=agent-123", AgentExt, Ca, CaK)
+        ++ leaf_cmds(Dir, "collide", "/O=Yuzu/CN=Yuzu Default server", AgentExt, Ca, CaK)
         %% self-signed: not CA-issued at all (`req -x509` takes -addext, not -extfile)
-        ++ [["openssl ecparam -name prime256v1 -genkey -noout -out ",
-             q(filename:join(Dir, "selfs.key"))],
-            ["openssl req -x509 -new -key ", q(filename:join(Dir, "selfs.key")),
-             " -sha256 -days 1 -subj '/O=Yuzu/CN=Yuzu Default server' ",
-             "-addext extendedKeyUsage=serverAuth -addext basicConstraints=CA:FALSE ",
-             "-out ", q(filename:join(Dir, "selfs.pem"))]],
+        ++ [["ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out",
+             filename:join(Dir, "selfs.key")],
+            ["req", "-x509", "-new", "-key", filename:join(Dir, "selfs.key"),
+             "-sha256", "-days", "1", "-subj", "/O=Yuzu/CN=Yuzu Default server",
+             "-addext", "extendedKeyUsage=serverAuth", "-addext", "basicConstraints=CA:FALSE",
+             "-out", filename:join(Dir, "selfs.pem")]],
     Out = #{dir => Dir,
             ca => Ca,
             srv_pem => filename:join(Dir, "srv.pem"),
@@ -272,7 +337,7 @@ setup_certs(BaseDir) ->
             E
     end,
     case Result of
-        {error, _} -> _ = os:cmd("rm -rf " ++ q(Dir)), Result;
+        {error, _} -> cleanup_certs(#{dir => Dir}), Result;
         _          -> Result
     end.
 
@@ -301,31 +366,56 @@ leaf_cmds(Dir, Name, Subj, Ext, Ca, CaK) ->
     Key = filename:join(Dir, Name ++ ".key"),
     Csr = filename:join(Dir, Name ++ ".csr"),
     Pem = filename:join(Dir, Name ++ ".pem"),
-    [["openssl ecparam -name prime256v1 -genkey -noout -out ", q(Key)],
-     ["openssl req -new -key ", q(Key), " -subj ", Subj, " -out ", q(Csr)],
-     ["openssl x509 -req -in ", q(Csr), " -CA ", q(Ca), " -CAkey ", q(CaK),
-      " -CAcreateserial -days 1 -sha256 -extfile ", q(Ext), " -out ", q(Pem)]].
+    [["ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", Key],
+     ["req", "-new", "-key", Key, "-subj", Subj, "-out", Csr],
+     ["x509", "-req", "-in", Csr, "-CA", Ca, "-CAkey", CaK,
+      "-CAcreateserial", "-days", "1", "-sha256", "-extfile", Ext, "-out", Pem]].
 
 ext_file(Dir, Name, Content) ->
     Path = filename:join(Dir, Name),
     ok = file:write_file(Path, Content),
     Path.
 
-cleanup_certs(#{dir := Dir}) -> os:cmd("rm -rf '" ++ Dir ++ "'"), ok;
+cleanup_certs(#{dir := Dir}) ->
+    case file:del_dir_r(Dir) of
+        ok -> ok;
+        {error, enoent} -> ok;
+        {error, Why} -> error({certificate_cleanup_failed, Dir, Why})
+    end;
 cleanup_certs(_) -> ok.
 
-q(S) -> "'" ++ S ++ "'".
-
 run_all([]) -> ok;
-run_all([Cmd | Rest]) ->
-    Flat = lists:flatten(Cmd) ++ " 2>&1",
-    Out = os:cmd(Flat),
-    %% openssl prints status noise on success; hard failure is detected by
-    %% the artifact-existence check in setup_certs (mirrors yuzu_gw_mtls_tests)
-    %% — here we only bail if openssl is entirely absent.
-    case string:find(Out, "not found") of
-        nomatch -> run_all(Rest);
-        _ -> {error, {openssl_missing, Out}}
+run_all([Args | Rest]) ->
+    case openssl(Args) of
+        {ok, _} -> run_all(Rest);
+        {error, _} = Error -> Error
+    end.
+
+%% Native argv preserves spaces, quotes and /CN subjects on every host. Never
+%% return success based only on output text or on an artifact from an earlier command.
+openssl(Args) ->
+    case os:find_executable("openssl") of
+        false -> {error, openssl_missing};
+        Exe ->
+            try open_port({spawn_executable, Exe},
+                          [binary, use_stdio, stderr_to_stdout, exit_status, hide, {args, Args}]) of
+                Port -> collect_openssl(Port, Args, [])
+            catch error:Why -> {error, {openssl_start_failed, Args, Why}}
+            end
+    end.
+
+%% This synchronous fixture has no independent timeout: closing a port does
+%% not guarantee termination of the OS child. Run it under the gateway runner's
+%% existing process-tree deadline, rather than returning while OpenSSL lives on.
+collect_openssl(Port, Args, Output) ->
+    receive
+        {Port, {data, Data}} -> collect_openssl(Port, Args, [Data | Output]);
+        {Port, {exit_status, Status}} ->
+            Text = iolist_to_binary(lists:reverse(Output)),
+            case Status of
+                0 -> {ok, Text};
+                _ -> {error, {openssl_failed, Status, Args, Text}}
+            end
     end.
 
 %% @private DER of the (first) certificate in the named PEM.

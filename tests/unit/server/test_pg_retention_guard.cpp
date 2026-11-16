@@ -18,6 +18,7 @@
 #include <libpq-fe.h>
 
 #include <chrono>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -46,15 +47,27 @@ void setup_schema(PgPool& pool) {
     }));
 }
 
-std::int64_t now_ms() {
-    return std::chrono::duration_cast<std::chrono::milliseconds>(
-               std::chrono::system_clock::now().time_since_epoch())
-        .count();
+std::int64_t db_now_ms(PgPool& pool) {
+    // Production reads the shared PostgreSQL clock. A host-clock anchor can
+    // be a few milliseconds ahead of a remote/VM database and correctly trip
+    // BadState, obscuring the cap/lock/wipe behavior the fixture intends to test.
+    std::int64_t value = 0;
+    REQUIRE(pool.with_txn_for(2000ms, [&](PGconn* c) {
+        PgResult r = yuzu::server::pg::exec_params(
+            c, "SELECT (EXTRACT(EPOCH FROM now())*1000)::bigint",
+            std::vector<std::string>{});
+        if (r.status() != PGRES_TUPLES_OK || PQntuples(r.get()) != 1 ||
+            PQgetisnull(r.get(), 0, 0))
+            return false;
+        value = std::stoll(PQgetvalue(r.get(), 0, 0));
+        return true;
+    }));
+    return value;
 }
 
 // Seed `n` rows all stamped `age_ms` in the past (so a small window expires them).
 void seed(PgPool& pool, int n, std::int64_t age_ms) {
-    const std::int64_t ts = now_ms() - age_ms;
+    const std::int64_t ts = db_now_ms(pool) - age_ms;
     REQUIRE(pool.with_txn_for(2000ms, [&](PGconn* c) {
         for (int i = 0; i < n; ++i)
             if (yuzu::server::pg::exec_params(c, "INSERT INTO rg_test.t (ts) VALUES ($1::bigint)",
@@ -159,7 +172,7 @@ TEST_CASE("retention guard: a held advisory lock makes the pass SKIP",
     seed(pool, 4, 3'600'000);
     seed(pool, 1, 0);
     set_meta(pool, "t_bootstrap_settled", "1");
-    set_meta(pool, "t_last_pass_now", std::to_string(now_ms()));
+    set_meta(pool, "t_last_pass_now", std::to_string(db_now_ms(pool)));
 
     // Hold the SAME advisory-lock key (session-scoped) on an independent backend.
     PgConn holder{PQconnectdb(db.dsn().c_str())};
@@ -206,7 +219,7 @@ TEST_CASE("retention guard: an ahead-of-now anchor DECLINES (BadState, part 3)",
     seed(pool, 1, 0);         // recent → NOT would_wipe (isolates the ahead-of-now clause)
     set_meta(pool, "t_bootstrap_settled", "1");
     // 1h in the FUTURE: ahead-of-now, but well under the 24h big_step floor.
-    set_meta(pool, "t_last_pass_now", std::to_string(now_ms() + 3'600'000));
+    set_meta(pool, "t_last_pass_now", std::to_string(db_now_ms(pool) + 3'600'000));
 
     auto r = run_clock_guarded_prune(pool, spec(60'000, 100, MissingAnchorPolicy::Decline), 2000ms);
     CHECK(r.anomaly == yuzu::server::audit_retention::Anomaly::BadState);
@@ -221,7 +234,7 @@ TEST_CASE("retention guard: a large clock step DECLINES (Step)", "[pg][store][re
     seed(pool, 2, 3'600'000);
     set_meta(pool, "t_bootstrap_settled", "1");
     // A plausible anchor 10 days in the past — |now - anchor| >> the 24h floor.
-    set_meta(pool, "t_last_pass_now", std::to_string(now_ms() - 10LL * 86'400'000));
+    set_meta(pool, "t_last_pass_now", std::to_string(db_now_ms(pool) - 10LL * 86'400'000));
 
     auto r = run_clock_guarded_prune(pool, spec(60'000, 100, MissingAnchorPolicy::Decline), 2000ms);
     CHECK(r.anomaly == yuzu::server::audit_retention::Anomaly::Step);
@@ -236,7 +249,7 @@ TEST_CASE("retention guard: an all-expired table DECLINES once (Wipe), then drai
     setup_schema(pool);
     seed(pool, 3, 3'600'000); // every row is older than the window → would_wipe
     set_meta(pool, "t_bootstrap_settled", "1");
-    set_meta(pool, "t_last_pass_now", std::to_string(now_ms())); // fresh, plausible → no Step
+    set_meta(pool, "t_last_pass_now", std::to_string(db_now_ms(pool))); // fresh, plausible → no Step
 
     auto s = spec(60'000, 100, MissingAnchorPolicy::Decline);
     auto r1 = run_clock_guarded_prune(pool, s, 2000ms);
@@ -258,7 +271,7 @@ TEST_CASE("retention guard: caps deletes per pass, unconditionally",
     seed(pool, 10, 3'600'000);
     seed(pool, 1, 0);
     set_meta(pool, "t_bootstrap_settled", "1");
-    set_meta(pool, "t_last_pass_now", std::to_string(now_ms()));
+    set_meta(pool, "t_last_pass_now", std::to_string(db_now_ms(pool)));
 
     auto s = spec(/*window*/ 60'000, /*cap*/ 4, MissingAnchorPolicy::Decline);
     auto r = run_clock_guarded_prune(pool, s, 2000ms);
@@ -292,43 +305,79 @@ TEST_CASE("retention guard: a pass persists the anchor (survives restart)",
     CHECK(std::stoll(anchor) > 946'684'800'000); // a plausible present-day ms epoch
 }
 
-TEST_CASE("retention guard: cutoff_align floors the cutoff but leaves the anchor RAW (WS-10 C1)",
-          "[pg][store][retention-guard]") {
-    // cutoff_align must day-align the CUTOFF only — the persisted anchor stays the
-    // RAW reading, or two adjacent-bucket passes read one full bucket apart and
-    // false-fire Step every boundary crossing. (a) a row exactly at the floored
-    // cutoff survives (cutoff floored); (b) the stored anchor is near raw now, NOT
-    // floored to the day bucket.
+TEST_CASE("Retention cutoff preserves boundary rows and raw anchors across midnight",
+          "[pg][store][retention-guard][contract-pg-retention-cutoff]") {
+    // ClockGuardedPruneSpec::cutoff_align applies to the cutoff only. Fixed SQL
+    // readings exercise the real prune before and after midnight, without a
+    // wall-clock race or a near-midnight blind spot in the anchor assertion.
+    // This tests the helper's clock handling, not consumers' now_expr wiring.
     YUZU_REQUIRE_PG_DB(db);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    REQUIRE(pool.valid());
     setup_schema(pool);
-    const std::int64_t day = 86'400'000; // ms/day (the align unit)
-    seed(pool, 1, 3 * day); // ~3 days old → well before the 2-day floored cutoff → deleted
-    seed(pool, 1, 0);       // recent survivor (avoids would_wipe)
-    const std::int64_t before = now_ms();
 
-    // Proceed policy → no bootstrap decline; a fresh raw anchor is stamped this pass.
-    auto s = spec(/*window*/ 2 * day, /*cap*/ 100, MissingAnchorPolicy::Proceed, /*cutoff_align*/ day);
-    auto r = run_clock_guarded_prune(pool, s, 2000ms);
-    CHECK_FALSE(r.declined);
-    CHECK(r.deleted == 1);        // the ~3-day-old row (cutoff floored to ~2 days)
-    CHECK(count_rows(pool) == 1); // the recent survivor
+    // Independent connection observes committed state, including a positive
+    // before-state. Explicit IDs and timestamp values are the oracle; we do not
+    // copy production cutoff arithmetic into the expected-row calculation.
+    PgConn observer{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(observer.get()) == CONNECTION_OK);
+    PgResult inserted{PQexec(observer.get(),
+        "INSERT INTO rg_test.t (id, ts) VALUES "
+        "(1, 1727827199999)," // one ms before the first floored cutoff
+        "(2, 1727827200000)," // exactly at the first floored cutoff
+        "(3, 1727827200001)," // inside the bucket, before the raw cutoff
+        "(4, 1727913600000)," // exactly at the next day's floored cutoff
+        "(5, 1728086399999)")}; // recent survivor prevents would-wipe
+    REQUIRE(inserted.status() == PGRES_COMMAND_OK);
+    REQUIRE(std::string{PQcmdTuples(inserted.get())} == "5");
 
-    // The persisted anchor is the RAW reading (≈ now), NOT floored to the day
-    // bucket (a floored anchor would be up to ~24h < now → fails this bound, except
-    // within 60s of UTC midnight where the distinction — and the bug — vanish).
-    std::string anchor;
-    pool.with_txn_for(2000ms, [&](PGconn* c) {
-        PgResult a = yuzu::server::pg::exec_params(
-            c, "SELECT value FROM rg_test.retention_meta WHERE key='t_last_pass_now'",
-            std::vector<std::string>{});
-        if (a.status() != PGRES_TUPLES_OK || PQntuples(a.get()) != 1)
-            return false;
-        anchor = PQgetvalue(a.get(), 0, 0);
-        return true;
-    });
-    REQUIRE_FALSE(anchor.empty());
-    CHECK(std::stoll(anchor) >= before - 60'000); // raw, not day-floored
+    using Rows = std::vector<std::string>;
+    const auto read_rows = [&] {
+        PgResult rows{PQexec(observer.get(), "SELECT id, ts FROM rg_test.t ORDER BY id")};
+        REQUIRE(rows.status() == PGRES_TUPLES_OK);
+        REQUIRE(PQnfields(rows.get()) == 2);
+        Rows result;
+        for (int i = 0; i < PQntuples(rows.get()); ++i) {
+            REQUIRE_FALSE(PQgetisnull(rows.get(), i, 0));
+            REQUIRE_FALSE(PQgetisnull(rows.get(), i, 1));
+            result.push_back(std::string{PQgetvalue(rows.get(), i, 0)} + ":" +
+                             PQgetvalue(rows.get(), i, 1));
+        }
+        return result;
+    };
+    const auto read_anchor = [&] {
+        PgResult anchor{PQexec(observer.get(),
+            "SELECT value FROM rg_test.retention_meta WHERE key='t_last_pass_now'")};
+        REQUIRE(anchor.status() == PGRES_TUPLES_OK);
+        REQUIRE(PQntuples(anchor.get()) == 1);
+        REQUIRE_FALSE(PQgetisnull(anchor.get(), 0, 0));
+        return std::string{PQgetvalue(anchor.get(), 0, 0)};
+    };
+    REQUIRE(read_rows() == Rows{"1:1727827199999", "2:1727827200000", "3:1727827200001",
+                               "4:1727913600000", "5:1728086399999"});
+
+    constexpr std::int64_t kDayMs = 86'400'000;
+    auto s = spec(2 * kDayMs, 100, MissingAnchorPolicy::Proceed, kDayMs);
+    s.now_expr = "1728086399999::bigint"; // one ms before midnight
+    const auto first = run_clock_guarded_prune(pool, s, 2000ms);
+    CHECK_FALSE(first.error);
+    CHECK_FALSE(first.declined);
+    CHECK_FALSE(first.skipped_lock);
+    CHECK(first.anomaly == yuzu::server::audit_retention::Anomaly::None);
+    CHECK(first.deleted == 1);
+    CHECK(read_rows() == Rows{"2:1727827200000", "3:1727827200001",
+                             "4:1727913600000", "5:1728086399999"});
+    CHECK(read_anchor() == "1728086399999");
+
+    s.now_expr = "1728086400001::bigint"; // two ms later, across midnight
+    const auto second = run_clock_guarded_prune(pool, s, 2000ms);
+    CHECK_FALSE(second.error);
+    CHECK_FALSE(second.declined);
+    CHECK_FALSE(second.skipped_lock);
+    CHECK(second.anomaly == yuzu::server::audit_retention::Anomaly::None);
+    CHECK(second.deleted == 2);
+    CHECK(read_rows() == Rows{"4:1727913600000", "5:1728086399999"});
+    CHECK(read_anchor() == "1728086400001");
 }
 
 TEST_CASE("retention guard: a failed txn reports error and deletes nothing",

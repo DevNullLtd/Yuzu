@@ -64,7 +64,9 @@
 #include "app_usage_read_model.hpp"        // AppUsageModel, app_usage_json (Rule 1 shared builder)
 #include "app_usage_store.hpp"            // get_agent_app_usage (wave 7 PR7.2 projection)
 #include "rbac_store.hpp"                 // rbac_enforcement_in_effect (#1717 fail-closed SLE gate)
+#include "mgmt_group_agent_known.hpp" // lookup_agent_known: the add-member `agent_known` audit flag, REST and MCP
 #include "mgmt_group_error.hpp"            // mgmt_group_error_is_store_fault: one classifier for REST and MCP
+#include "mgmt_group_limits.hpp"           // name / group id bounds and the clean-text rule (REST, MCP, Settings)
 #include "rbac_text.hpp"                  // rbac_text_is_clean — identifier check shared with the owner
 #include "service_scope_policy.hpp"       // authz::kServiceScopeGlobalSafe (#2298 PR 3 §3c boot cross-check)
 // ADR-0031 operator surface (PR1.6c, p14) — mint/list/revoke_upload_grant.
@@ -1115,7 +1117,10 @@ static const ToolDef kTools[] = {
     {"create_management_group",
      "Create a new management group (hierarchical device grouping used for access scoping). "
      "Mirrors POST /api/v1/management-groups. Requires ManagementGroup:Write — approval-gated "
-     "(supervised MCP tier maker-checker). Additive: creates a new group, overwrites nothing.",
+     "(supervised MCP tier maker-checker). Additive: creates a new group, overwrites nothing. "
+     "Audit-first: an `attempted` audit row is stored before the group is created; if it cannot "
+     "be stored the call is refused with an internal error (retryable) and nothing is created. "
+     "audit_persisted:false in a success means only the closing outcome row was lost.",
      R"j({"type":"object","properties":{)j"
      R"j("name":{"type":"string","minLength":1,"maxLength":256,"description":"Group display name"},)j"
      R"j("description":{"type":"string","maxLength":1024,"description":"Optional description"},)j"
@@ -1123,7 +1128,7 @@ static const ToolDef kTools[] = {
      R"j("membership_type":{"type":"string","enum":["static","dynamic"],"default":"static","description":"static = explicit member list via add_management_group_member; dynamic = scope_expression-evaluated"},)j"
      R"j("scope_expression":{"type":"string","maxLength":4096,"description":"Scope DSL expression for a dynamic group; ignored for static"})j"
      R"j(},"required":["name"]})j",
-     R"j({"type":"object","properties":{"id":{"type":"string"}},"required":["id"]})j"},
+     R"j({"type":"object","properties":{"id":{"type":"string"},"audit_persisted":{"type":"boolean","description":"Present (false) only when the closing success row could not be stored; the group exists. A closing failure row that could not be stored is not reported here (no group exists then)"}},"required":["id"]})j"},
 
     {"get_management_group",
      "Get one management group's metadata plus its current member list. #1762: "
@@ -1157,12 +1162,18 @@ static const ToolDef kTools[] = {
      "Add a static member to a management group. Idempotent — adding an agent already in the "
      "group is a no-op. Mirrors POST /api/v1/management-groups/{id}/members. Requires "
      "ManagementGroup:Write — approval-gated (supervised MCP tier maker-checker). Additive: "
-     "extends the member set, overwrites nothing.",
+     "extends the member set, overwrites nothing. An agent id with no enrolment record "
+     "(pending, approved or denied) is still added; whether it has one is recorded on the "
+     "success audit row (`agent_known`), not returned. Audit-first: an `attempted` audit row is "
+     "stored before the member is added; if it cannot be stored the call is refused with an "
+     "internal error "
+     "(retryable) and nothing is added. audit_persisted:false in a success means only the "
+     "closing outcome row was lost.",
      R"j({"type":"object","properties":{)j"
      R"j("group_id":{"type":"string","minLength":1,"maxLength":256,"description":"Management group id"},)j"
      R"j("agent_id":{"type":"string","minLength":1,"maxLength":256,"description":"Agent to add as a static member"})j"
      R"j(},"required":["group_id","agent_id"]})j",
-     R"j({"type":"object","properties":{"added":{"type":"boolean"}},"required":["added"]})j"},
+     R"j({"type":"object","properties":{"added":{"type":"boolean"},"audit_persisted":{"type":"boolean","description":"Present (false) only when the closing success row could not be stored; the member was added. A closing failure row that could not be stored is not reported here (nothing was added then)"}},"required":["added"]})j"},
 
     {"list_management_group_roles",
      "List a management group's role-assignment grants (who holds ITServiceOwner/Operator/Viewer "
@@ -1214,6 +1225,9 @@ static const ToolDef kTools[] = {
      "execution's dispatcher is admitted to VIEW the execution (avoids a false "
      "not-found on a just-dispatched execution with no responses yet) but gets "
      "the SAME redacted counts/scope_expression as any other confined caller. "
+     "A service-scoped token has no dispatcher admission: it sees an execution only "
+     "once an agent in its service scope has a status row for it, so an execution its "
+     "minting account dispatched reads as not found until an in-scope agent responds. "
      "#4030: include:[\"agents\"] adds a confined per-agent status/duration array "
      "plus a kpi summary (total/succeeded/failed/p50_ms/p95_ms) — audited "
      "separately from the bare call because it discloses raw agent identities. "
@@ -1237,7 +1251,8 @@ static const ToolDef kTools[] = {
      "and - per #3789 - a visible parent does NOT by itself disclose a "
      "child dispatched by, or targeting, someone else: each child "
      "independently passes the same visible-agent-or-owner test the parent "
-     "did. Mirrors GET /api/v1/executions/{id}/children and the legacy "
+     "did (a service-scoped token has no owner disjunct: only an in-scope agent "
+     "status row admits a child). Mirrors GET /api/v1/executions/{id}/children and the legacy "
      "GET /api/executions/{id}/children (same shared row builder, "
      "docs/api-twin-recipe.md Rule 1). The underlying query is hard-capped "
      "at 100 rows (governance Gate 8 re-review fix, #2146 A2-R1) with no "
@@ -1299,7 +1314,11 @@ static const ToolDef kTools[] = {
      "caller admitted through a management-group grant (rather than a global permission) "
      "sees only executions they themselves dispatched — a narrower interim mechanism than "
      "the visible-agent filtering other read tools apply, since execution rows carry no "
-     "single agent_id to filter by. #4030: rows now also carry the resolved definition "
+     "single agent_id to filter by. A service-scoped token is the exception: it lists "
+     "every execution with a status row for an agent in its service scope, whoever "
+     "dispatched it, with counts projected to those agents; executions its minting "
+     "account dispatched that no in-scope agent has answered are not listed, and a "
+     "service scope with no tagged agent lists nothing. #4030: rows now also carry the resolved definition "
      "name, the agents_success/agents_failure split, and a truncated error preview — "
      "reconciled onto the dashboard fragment's fuller field set.",
      R"({"type":"object","properties":{"definition_id":{"type":"string","maxLength":256},"status":{"type":"string","maxLength":64},"limit":{"type":"integer","default":50,"minimum":1,"maximum":500}}})",
@@ -2811,6 +2830,9 @@ static const ToolDef kTools[] = {
      "query_responses by execution_id, or list_executions if you never learned one). NEVER re-send this call, which would run the action a second time. Progress is always BEST-EFFORT: even after supplying a "
      "token you MUST still be prepared to poll (a reservation can silently degrade under load "
      "and zero progress frames is indistinguishable from 'nothing has happened yet'). "
+     "SCOPE: a caller whose Execution:Read is limited to a management group (or absent, or "
+     "unresolvable) receives no progress notifications and a final result without "
+     "agents_success/agents_failure; poll get_execution_status for the counts it may see. "
      "FALLBACK when not streaming: poll query_responses with the "
      "returned execution_id - an EMPTY result means the run is still in flight, so wait ~2-5s "
      "and retry a few times (or call get_execution_status to confirm a terminal state), or "
@@ -3576,7 +3598,7 @@ static const ToolDef kTools[] = {
 
     {"quarantine_device",
      "Isolate a device from the network (records the quarantine AND dispatches the live "
-     "quarantine-plugin isolation), whitelisting the management server. Mirrors POST "
+     "firewall.quarantine isolation), whitelisting the management server. Mirrors POST "
      "/api/v1/quarantine for the record; the dispatch has no REST twin. Destructive "
      "(Security:Execute): approval-gated on the supervised tier — the first call returns an "
      "approval ticket, re-call with the returned approval_id after an admin approves. #3127: a "
@@ -3586,7 +3608,9 @@ static const ToolDef kTools[] = {
      "the device was already quarantined by an earlier call. dispatch_confirmed means the plugin "
      "registry ACCEPTED the isolation frame, NOT that the device is isolated — for a "
      "gateway-attached agent the frame is only queued; confirming isolation requires a follow-up "
-     "`status` read returning state|active.",
+     "firewall.quarantine_status read returning status|active. The whitelist is at most 32 bare "
+     "IPv4 or IPv6 addresses. A record whose release was requested reads status releasing; a "
+     "call on it is refused until the device confirms the release.",
      R"j({"type":"object","properties":{)j"
      // #2444 item 1: mirror the handler's own limits so an oversized/off-charset
      // reason or whitelist is refused by schema instead of burning an
@@ -3599,16 +3623,16 @@ static const ToolDef kTools[] = {
      // whitelist outweighs closing the last sliver of this burn class).
      R"j("agent_id":{"type":"string","minLength":1,"description":"Target agent id"},)j"
      R"j("reason":{"type":"string","maxLength":1024,"description":"Optional quarantine reason (audited)"},)j"
-     R"j("whitelist":{"type":"string","maxLength":512,"pattern":"^[0-9A-Fa-f.:, ]*$","description":"Comma-separated extra IPs to allow through the isolation firewall"},)j"
+     R"j("whitelist":{"type":"string","maxLength":512,"pattern":"^[0-9A-Fa-f.:, ]*$","description":"Comma-separated bare IPv4 or IPv6 addresses (at most 32) to allow through the isolation firewall"},)j"
      R"j("approval_id":{"type":"string","description":"Approval ticket id from a prior kApprovalRequired response; supply after admin approval to execute"})j"
      R"j(},"required":["agent_id"]})j",
      R"j({"type":"object","properties":{)j"
      R"j("command_id":{"type":"string","description":"Id of the dispatched isolation command"},)j"
      R"j("agents_reached":{"type":"integer","minimum":1,"description":"#3127: a result is returned ONLY when at least one agent accepted the isolation frame; agents_reached=0 (or a dispatch that threw) returns a retryable error instead, with the quarantine record still persisted"},)j"
-     R"j("dispatch_confirmed":{"const":true,"description":"#3127: the plugin registry ACCEPTED the isolation frame. NOT proof of isolation - for a gateway-attached agent the frame is only QUEUED. Confirming isolation requires a subsequent status read returning state|active"},)j"
+     R"j("dispatch_confirmed":{"const":true,"description":"#3127: the plugin registry ACCEPTED the isolation frame. NOT proof of isolation - for a gateway-attached agent the frame is only QUEUED. Confirming isolation requires a subsequent firewall.quarantine_status read returning status|active"},)j"
      R"j("record_pre_existing":{"type":"boolean","description":"#3127: true when an active quarantine record already existed and this call re-dispatched the STORED intent (reason/whitelist) rather than writing a new record from this request"},)j"
      R"j("whitelist_request_ignored":{"type":"boolean","description":"#3127: true when this call supplied a whitelist that differs from the stored one; the STORED whitelist was dispatched and the request's was NOT applied"},)j"
-     R"j("quarantine_record":{"type":"object","properties":{"agent_id":{"type":"string"},"status":{"type":"string"},"quarantined_by":{"type":"string"},"reason":{"type":"string"},"whitelist":{"type":"string"},"quarantined_at":{"type":"integer","description":"Present when record_pre_existing is true - the stored record's original creation time"},"last_applied_at":{"type":"integer","description":"#3425: epoch seconds a system re-dispatch of the stored whitelist was accepted; 0 = never. NOT proof of endpoint containment."},"last_confirmed_at":{"type":"integer","description":"#3425: epoch seconds a follow-up quarantine.status read reported state|active; 0 = never. This is the target agent's own self-report, not independently corroborated by any network-side signal - strong operational evidence of containment, not proof; see security-hardening.md Device Quarantine."}},"required":["agent_id","status","quarantined_by","reason","whitelist","last_applied_at","last_confirmed_at"]},)j"
+     R"j("quarantine_record":{"type":"object","properties":{"agent_id":{"type":"string"},"status":{"type":"string","description":"active; a record with a release in progress reads releasing"},"quarantined_by":{"type":"string"},"reason":{"type":"string"},"whitelist":{"type":"string"},"quarantined_at":{"type":"integer","description":"Present when record_pre_existing is true - the stored record's original creation time"},"last_applied_at":{"type":"integer","description":"#3425: epoch seconds a system re-dispatch of the stored whitelist was accepted; 0 = never. NOT proof of endpoint containment."},"last_confirmed_at":{"type":"integer","description":"#3425: epoch seconds a follow-up firewall.quarantine_status read reported the device's rules in force (status|active); 0 = never. This is the target agent's own self-report, not independently corroborated by any network-side signal - strong operational evidence of containment, not proof; see security-hardening.md Device Quarantine."}},"required":["agent_id","status","quarantined_by","reason","whitelist","last_applied_at","last_confirmed_at"]},)j"
      R"j("audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this action itself failed"})j"
      R"j(},"required":["command_id","agents_reached","dispatch_confirmed","record_pre_existing","whitelist_request_ignored","quarantine_record"]})j"},
 
@@ -4260,8 +4284,8 @@ static const ToolDef kTools[] = {
      "decision (PluginConfigStore::action_allowed collapses any store error to disabled, "
      "which this display accessor deliberately does not) — this is the inspection view an "
      "operator reads before deciding whether to flip it. Absence of a prior flip reads as "
-     "enabled=true with no reason/set_by. For a protective action (the quarantine plugin's "
-     "quarantine/unquarantine/status/whitelist and __guard__.push_rules) the state shown here is "
+     "enabled=true with no reason/set_by. For a protective action (the firewall plugin's "
+     "quarantine/release/quarantine_status/quarantine_allow and __guard__.push_rules) the state shown here is "
      "informational only: enabled=false can be displayed while dispatch still proceeds. "
      "Without os this reports the all-OS layer only and "
      "never reflects a per-OS OFF row. Requires PluginConfig:Read.",
@@ -4278,8 +4302,8 @@ static const ToolDef kTools[] = {
      "dispatch-gating caller that consults this switch fails CLOSED (treats disabled) on any "
      "store error, so throwing this switch is a reliable emergency stop for the named "
      "plugin/action — there is no separate 'force disable' escalation beyond this call. "
-     "Exception: a protective action (the quarantine plugin's quarantine/unquarantine/status/"
-     "whitelist and __guard__.push_rules) is never refused by this switch; a row for one is "
+     "Exception: a protective action (the firewall plugin's quarantine/release/quarantine_status/"
+     "quarantine_allow and __guard__.push_rules) is never refused by this switch; a row for one is "
      "stored and echoed but has no dispatch effect; to stop Guardian rule delivery disable or "
      "remove the rules instead (disarms them on the agent's next reconcile). "
      "The result echoes the row written, not the effective state. Requires "
@@ -5693,6 +5717,15 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // Implemented write tools
     {"set_tag", {"Tag", "Write", ServiceScopeClass::confined}},
     {"delete_tag", {"Tag", "Delete", ServiceScopeClass::confined}},
+    // execute_instruction stays `confined` although cancel/rerun above are `denied` for the same
+    // pair (#7817 weighed relabelling it). `confined` is true here by mcp_tool_registry.hpp's own
+    // definition: the dispatch chokepoint confines to `exec_visible`, and compose_exec_visible
+    // resolves a service-scoped token's tag scope FIRST and never as unfiltered, a real
+    // service-scope mechanism (cancel/rerun have only admit_confined_mutation, a management-group
+    // one). It is not USABLE by a service-scoped token: perm_fn(Execution, Execute) below refuses
+    // it, since the pair is not on the empty kServiceScopeGlobalSafe. `denied` would move that
+    // refusal to the C8 short-circuit, which answers with its own message and audit row, a
+    // behaviour change for a service-scoped caller that this label is not worth.
     {"execute_instruction", {"Execution", "Execute", ServiceScopeClass::confined}},
     // #2146: the REST twin gates on the plain, global Execution:Execute pair, which a
     // service-scoped token cannot clear (kServiceScopeGlobalSafe is seeded empty), so this is
@@ -6566,7 +6599,9 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     // B4 (#2146 API-parity) — management-group mutations.
     // create_management_group: pure INSERT of a new group → Additive, matching
     // create_engine_principal's reasoning above. Not idempotent — a repeat call
-    // with the same name mints a SECOND group (name is not unique).
+    // with the same name creates nothing: management_groups.name is UNIQUE
+    // (`management_groups_name_key`), so the second call is refused as a name
+    // conflict and answers an error, not the first call's group id.
     {"create_management_group", {ToolEffect::Additive, false, "Create management group"}},
     // update_management_group: UPDATE overwrites the group's existing fields
     // (name/description/parent/membership_type/scope_expression) → Destructive.
@@ -6774,6 +6809,9 @@ static_assert(std::is_same_v<ToolDeps::RosterFn, HardwareRoutes::RosterFn>,
               "ToolDeps::RosterFn drifted from HardwareRoutes::RosterFn");
 static_assert(std::is_same_v<ToolDeps::CiDetailFn, HardwareRoutes::CiDetailFn>,
               "ToolDeps::CiDetailFn drifted from HardwareRoutes::CiDetailFn");
+static_assert(std::is_same_v<decltype(ToolDeps::ci_page_reader),
+                             decltype(HardwareRoutes::Deps::ci_page_reader)>,
+              "ToolDeps::ci_page_reader drifted from HardwareRoutes::Deps::ci_page_reader");
 static_assert(std::is_same_v<ToolDeps::DexScoreFn, HardwareRoutes::DexScoreFn>,
               "ToolDeps::DexScoreFn drifted from HardwareRoutes::DexScoreFn");
 static_assert(std::is_same_v<ToolDeps::CryptoAccessFn, McpServer::CryptoAccessFn>,
@@ -7269,22 +7307,13 @@ MgmtGroupErrorInfo classify_mgmt_group_error(const std::string& msg) {
 
 // The management-group id fields reach a text bind: a control byte or an invalid
 // UTF-8 sequence is refused as invalid params instead of surfacing as a retryable
-// store fault. Twin: mgmt_text_ok in rest_api_v1.cpp (same rule).
-bool mgmt_text_ok(std::string_view s) {
-    if (!rbac_text_is_clean(s))
-        return false;
-    for (std::size_t i = 0; i < s.size();) {
-        if (static_cast<unsigned char>(s[i]) < 0x80) {
-            ++i;
-            continue;
-        }
-        const std::size_t len = ::yuzu::utf8_sequence_length(s, i);
-        if (len == 0)
-            return false;
-        i += len;
-    }
-    return true;
-}
+// store fault. Twin: mgmt_text_ok in rest_api_v1.cpp (the same predicate,
+// mgmt_group_text_is_clean).
+bool mgmt_text_ok(std::string_view s) { return mgmt_group_text_is_clean(s); }
+static_assert(kMgmtGroupNameMaxLen == kMgmtGroupNameMaxBytes,
+              "the MCP schema bound for a group name and the handler bound must agree");
+static_assert(kMgmtGroupIdMaxLen == kMgmtGroupIdMaxBytes,
+              "the MCP schema bound for a group id and the handler bound must agree");
 
 // True only when the store answered authoritatively that the group does not
 // exist (a failed read is not "absent"). Used after a write failed to tell a
@@ -7650,9 +7679,9 @@ dispatch_pairs_for(const std::string& tool_name, const nlohmann::json& args) {
         return {{param_str(args, "plugin"), param_str(args, "action")}};
     }
     if (tool_name == "quarantine_device") {
-        // "quarantine"/"quarantine" is the one fixed pair every
+        // "firewall"/"quarantine" is the one fixed pair every
         // quarantine_device call dispatches — not caller-supplied.
-        return {{"quarantine", "quarantine"}};
+        return {{std::string(kContainmentPlugin), std::string(kContainmentApplyAction)}};
     }
     if (tool_name == "execute_bundle") {
         std::vector<std::pair<std::string, std::string>> pairs;
@@ -8832,6 +8861,76 @@ McpServer::HandlerFn McpServer::build_handler(
                     data += R"(,"audit_persisted":false)";
                 data += "}";
                 return error_response(id, code, message, data);
+            };
+
+            // The ONE audit write of the audit-first management-group tools (#7074): a
+            // `ManagementGroup` row through the shared kernel `try_persist_audit`, which catches
+            // any exception (std or not), logs it and reports "not stored" instead of letting it
+            // escape the handler. An unwired sink is audit-off and reports stored, as on the REST
+            // twins. `attempted` fails closed (a refusal); an outcome row only sets
+            // `audit_persisted:false` on a result that already stands.
+            auto mg_audit = [&](const char* action, const char* result_status,
+                                const std::string& target_id,
+                                const std::string& detail_text) -> bool {
+                return yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, action, result_status, "ManagementGroup", target_id,
+                    detail_text);
+            };
+
+            // EVERY management-group row that names the caller (the `attempted` row, the
+            // `*_revoked` failure rows and the outcome row) is written after the session may be
+            // gone (the handler resolves it first, then waits on the pool for the group read, the
+            // enrolment lookup, the audit write and the store call), when the re-resolving
+            // `audit_fn` would stamp an empty principal and break principal-based pairing of the
+            // rows. They go through the session-bound writer (`ToolDeps::audit_as_session_fn`,
+            // the one REST binds its session-bound rows to) with the session this call resolved
+            // at the top of the handler and the role taken from it ONCE, here, so every row of
+            // one call carries the same principal and role. server.cpp binds the writer only
+            // where the runtime-config store is open (the DEX score policy tools' deps, whose
+            // tripwire pins that wiring); with none wired (that deployment, tests) they use
+            // mg_audit, whose row re-resolves the session. Any exception from the writer is
+            // caught like mg_audit's.
+            auto mg_audit_bound = [&, role = auth::role_to_string(auth::effective_role(*session))](
+                                      const char* action, const char* result_status,
+                                      const std::string& target_id,
+                                      const std::string& detail_text) -> bool {
+                if (!tool_deps_.audit_as_session_fn)
+                    return mg_audit(action, result_status, target_id, detail_text);
+                try {
+                    return tool_deps_.audit_as_session_fn(req, *session, role, action,
+                                                          result_status, "ManagementGroup",
+                                                          target_id, detail_text);
+                } catch (...) {
+                    spdlog::warn("audit_as_session_fn threw on management-group row action={} "
+                                 "target={}",
+                                 action, audit_token(target_id));
+                    return false;
+                }
+            };
+
+            // The ONE attempted-row-or-refuse step of the audit-first management-group writes
+            // (#7074, ADR-0033 section 9 "no audit row, no mutation"): create_management_group
+            // and add_management_group_member both use it, the twin of detail::audit_attempted on
+            // the REST routes. Stores the `attempted` row for `action`; when it cannot be stored
+            // it writes the tool-level `mcp.<tool>` failure row (`refused_detail`), answers an
+            // internal error with a retry hint and returns false: the caller must return without
+            // mutating. Extend this, never copy it into a second handler.
+            auto mcp_audit_attempted_or_refuse = [&](const char* action,
+                                                     const std::string& target_id,
+                                                     const std::string& detail_text,
+                                                     const char* refused_detail) -> bool {
+                if (mg_audit_bound(action, "attempted", target_id, detail_text))
+                    return true;
+                mcp_audit("failure", refused_detail);
+                // The approval ticket of a supervised call was spent before this handler ran, so
+                // a retry at that tier needs a new approval as well as a working audit log.
+                res.set_content(
+                    a4_error(kInternalError, "audit log unavailable; the change was not made",
+                             "retry once the audit log is available; at the supervised tier a new "
+                             "approval is needed",
+                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                    "application/json");
+                return false;
             };
 
             // #4353 follow-up (Gate 2 finding on #4364): shared responder for the
@@ -14268,6 +14367,22 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                // The length bound is enforced above; the name and the parent id are also held
+                // to clean text (mgmt_group_limits.hpp) before any store read or `attempted`
+                // row, with a fixed refusal text. Only the tool-level mcp.* row is written.
+                if (!mgmt_group_name_ok(name)) {
+                    mcp_audit("denied", "invalid_name");
+                    res.set_content(
+                        a4_error(kInvalidParams, std::string(kMgmtGroupNameInvalidText)),
+                        "application/json");
+                    return;
+                }
+                if (!mgmt_group_id_ok(param_str(args, "parent_id"))) { // names no group
+                    mcp_audit("denied", "invalid_parent_id");
+                    res.set_content(a4_error(kInvalidParams, "parent group not found"),
+                                    "application/json");
+                    return;
+                }
                 if (!mgmt_store) {
                     res.set_content(a4_error(kInternalError, "Management group store unavailable",
                                              "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
@@ -14282,20 +14397,77 @@ McpServer::HandlerFn McpServer::build_handler(
                 g.scope_expression = param_str(args, "scope_expression");
                 g.created_by = session->username;
 
-                auto result = mgmt_store->create_group(g);
-                if (!result) {
-                    const auto info = classify_mgmt_group_error(result.error());
-                    const bool audit_ok = audit_fn(req, "management_group.create", "failure",
-                                                   "ManagementGroup", name, result.error());
-                    res.set_content(
-                        a4_error(info.code, result.error(), {}, /*retry_after_ms=*/info.retry_after_ms,
-                                 {}, audit_ok),
-                        "application/json");
-                    mcp_audit("failure", result.error());
+                // Audit-first (ADR-0033 section 9, "no audit row, no mutation", #7074); the
+                // REST twin is POST /api/v1/management-groups. The store's own fault text
+                // (libpq output) is never returned or audited: a fixed answer and token only.
+                const auto store_fault = [&]() {
+                    res.set_content(a4_error(kInternalError, "Management group store unavailable",
+                                             "retry the request",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                };
+                // The checks create_group runs before its insert, decided here so a refusal
+                // burns no `attempted` row (and writes no management_group.create row).
+                if (auto valid = mgmt_store->validate_new_group(g); !valid) {
+                    if (classify_mgmt_group_error(valid.error()).code == kInternalError) {
+                        mcp_audit("failure", "store_error");
+                        store_fault();
+                        return;
+                    }
+                    mcp_audit("failure", valid.error());
+                    res.set_content(a4_error(kInvalidParams, valid.error()), "application/json");
                     return;
                 }
-                const bool audit_ok = audit_fn(req, "management_group.create", "success",
-                                               "ManagementGroup", *result, name);
+                if (!mcp_audit_attempted_or_refuse("management_group.create", "", name,
+                                                   "audit unavailable; group not created"))
+                    return;
+                // The attempted row can wait on the audit pool: authenticate and authorise
+                // again, so a credential revoked or a grant removed meanwhile creates nothing.
+                // `auth_fn` / `perm_fn` write their own 401 / 403 into `res`.
+                const auto fresh = auth_fn(req, res);
+                if (!fresh || fresh->username != session->username) {
+                    (void)mg_audit_bound("management_group.create", "failure", "",
+                                         mgmt_group_failure_detail("session_revoked", name));
+                    if (res.status < 400) { // auth_fn writes its own 401; cover one that did not
+                        res.status = 401;
+                        res.set_content(a4_error(kPermissionDenied, "authentication required",
+                                                 "authenticate again and retry the call"),
+                                        "application/json");
+                    }
+                    return;
+                }
+                if (!perm_fn(req, res, "ManagementGroup", "Write")) {
+                    (void)mg_audit_bound("management_group.create", "failure", "",
+                                         mgmt_group_failure_detail("permission_revoked", name));
+                    return;
+                }
+
+                auto result = mgmt_store->create_group(g);
+                if (!result) {
+                    // The attempted row is stored, so it gets an outcome with a FIXED token.
+                    const auto token = create_failure_token(result.error());
+                    const bool conflict = token == kMgmtGroupTokenNameConflict;
+                    const bool fault = token == kMgmtGroupTokenStoreError;
+                    const bool audit_ok =
+                        mg_audit_bound("management_group.create", "failure", "",
+                                       mgmt_group_failure_detail(token, name));
+                    mcp_audit("failure", conflict ? std::string(kMgmtGroupTokenNameConflict)
+                                                  : (fault ? std::string(kMgmtGroupTokenStoreError)
+                                                           : result.error()));
+                    if (fault) {
+                        // The cause is logged, never returned to the caller or audited.
+                        spdlog::error("management_group.create store fault: {}",
+                                      ::yuzu::log_key_token(result.error()));
+                        store_fault();
+                        return;
+                    }
+                    // A name conflict or a validation literal: closed text, safe to echo.
+                    res.set_content(a4_error(kInvalidParams, result.error(), {}, -1, {}, audit_ok),
+                                    "application/json");
+                    return;
+                }
+                const bool audit_ok =
+                    mg_audit_bound("management_group.create", "success", *result, name);
                 JObj payload;
                 payload.add("id", *result);
                 if (!audit_ok)
@@ -14623,8 +14795,10 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!mgmt_text_ok(group_id) || !mgmt_text_ok(agent_id)) {
                     const char* detail_token =
                         !mgmt_text_ok(agent_id) ? "invalid_agent_id" : "invalid_group_id";
-                    (void)audit_fn(req, "management_group.add_member", "denied", "ManagementGroup",
-                                   audit_token(group_id), detail_token);
+                    // Through mg_audit (try_persist_audit): a throwing sink must not escape the
+                    // handler as a 500 on this refusal, as on every other row of this route.
+                    (void)mg_audit("management_group.add_member", "denied", audit_token(group_id),
+                                   detail_token);
                     res.set_content(
                         a4_error(kInvalidParams,
                                  "group_id and agent_id must not contain control characters or "
@@ -14638,20 +14812,78 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                // Audit-first (ADR-0033 section 9, "no audit row, no mutation", #7074); the REST
+                // twin is POST /api/v1/management-groups/{id}/members. A group that does not
+                // exist is answered before any row is written: a refusal burns no `attempted`
+                // row. An unreadable group is a store fault, not "absent".
+                const auto exists = mgmt_store->get_group_checked(group_id);
+                if (!exists) {
+                    spdlog::warn("add_management_group_member group read failure: {}",
+                                 ::yuzu::log_key_token(exists.error()));
+                    mcp_audit("failure", "store_error");
+                    res.set_content(a4_error(kInternalError, "management group store unavailable",
+                                             "retry shortly",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                if (!exists->has_value()) {
+                    mcp_audit("denied", "group not found");
+                    res.set_content(a4_error(kInvalidParams, "group not found"),
+                                    "application/json");
+                    return;
+                }
+                // Does the server hold an enrolment record for this id? A read, made after the
+                // group-exists answer and before the `attempted` row. It only FLAGS the id, on the
+                // success audit row; it is never returned. An unknown id is accepted and no lookup
+                // outcome refuses the add. Unreadable is recorded as neither known nor unknown (the
+                // REST twin does the same).
+                const AgentKnown agent_known = lookup_agent_known(auth_db, agent_id);
+                if (!mcp_audit_attempted_or_refuse("management_group.add_member", group_id,
+                                                   agent_id,
+                                                   "audit unavailable; member not added"))
+                    return;
+                // The attempted row can wait on the audit pool: authenticate and authorise
+                // again, so a credential revoked or a grant removed meanwhile adds nothing.
+                // `auth_fn` / `perm_fn` write their own 401 / 403 into `res`.
+                const auto fresh = auth_fn(req, res);
+                if (!fresh || fresh->username != session->username) {
+                    (void)mg_audit_bound("management_group.add_member", "failure", group_id,
+                                         mgmt_group_failure_detail("session_revoked", agent_id));
+                    if (res.status < 400) { // auth_fn writes its own 401; cover one that did not
+                        res.status = 401;
+                        res.set_content(a4_error(kPermissionDenied, "authentication required",
+                                                 "authenticate again and retry the call"),
+                                        "application/json");
+                    }
+                    return;
+                }
+                if (!perm_fn(req, res, "ManagementGroup", "Write")) {
+                    (void)mg_audit_bound("management_group.add_member", "failure", group_id,
+                                         mgmt_group_failure_detail("permission_revoked", agent_id));
+                    return;
+                }
                 auto result = mgmt_store->add_member(group_id, agent_id);
                 if (!result) {
                     const auto info = classify_mgmt_group_error(result.error());
-                    // A well-formed id naming no group fails the membership foreign key:
-                    // not found (the sibling tools' answer), no failure row, no retry hint.
+                    // The group vanished between the check above and the insert (the membership
+                    // foreign key failed): not found and no retry hint, as before, plus a
+                    // `failure` outcome row with a fixed token so the `attempted` row is never
+                    // left without one.
                     if (info.retry_after_ms > 0 && mgmt_group_confirmed_absent(*mgmt_store, group_id)) {
+                        (void)mg_audit_bound(
+                            "management_group.add_member", "failure", group_id,
+                            mgmt_group_failure_detail("group_not_found", agent_id));
                         mcp_audit("denied", "group not found");
                         res.set_content(a4_error(kInvalidParams, "group not found"),
                                         "application/json");
                         return;
                     }
-                    spdlog::warn("add_management_group_member store failure: {}", result.error());
-                    const bool audit_ok = audit_fn(req, "management_group.add_member", "failure",
-                                                   "ManagementGroup", group_id, "store_error");
+                    spdlog::warn("add_management_group_member store failure: {}",
+                                 ::yuzu::log_key_token(result.error()));
+                    const bool audit_ok = mg_audit_bound(
+                        "management_group.add_member", "failure", group_id,
+                        mgmt_group_failure_detail("store_error", agent_id));
                     res.set_content(
                         a4_error(info.code, "management group store unavailable", "retry shortly",
                                  /*retry_after_ms=*/info.retry_after_ms, {}, audit_ok),
@@ -14659,8 +14891,11 @@ McpServer::HandlerFn McpServer::build_handler(
                     mcp_audit("failure", "store_error");
                     return;
                 }
-                const bool audit_ok = audit_fn(req, "management_group.add_member", "success",
-                                               "ManagementGroup", group_id, agent_id);
+                // The success row's detail ends with the `agent_known=` flag (see
+                // mgmt_group_agent_known.hpp for how a reader takes it).
+                const bool audit_ok =
+                    mg_audit_bound("management_group.add_member", "success", group_id,
+                                   add_member_success_detail(agent_id, agent_known));
                 JObj payload;
                 payload.add("added", true);
                 if (!audit_ok)
@@ -14988,7 +15223,9 @@ McpServer::HandlerFn McpServer::build_handler(
                     for (const auto& a : agents)
                         has_visible_agent = authz::in_scope(gate.scope, a.agent_id) || has_visible_agent;
                 }
-                const bool owns_execution = exec && exec->dispatched_by == session->username;
+                // #5557: ownership is keyed on the owner key, never on `username` (a
+                // service-scoped credential's `username` is its MINTING account).
+                const bool owns_execution = exec && execution_owner_key(*session).owns(*exec);
                 const bool visible = !gate.scope || owns_execution || has_visible_agent;
                 if (!exec || !visible) {
                     spdlog::debug("get_execution_status: {} exec_id={}",
@@ -15131,14 +15368,15 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 auto exec_id = param_str(args, "execution_id");
-                std::string username;
-                ExecutionScope scope_arg; // nullopt = unrestricted
+                // #5557: the visibility key. Empty for a service-scoped session (whose
+                // `username` is its minting account); the guard below stays on the RAW
+                // username, never on the key.
+                const ExecutionOwnerKey owner = execution_owner_key(*session);
                 if (gate.scope) {
                     // #1634/#3789 precedent (list_executions below): an empty
                     // username under an engaged scope must never silently
                     // widen to "no owner filter" -- fail closed instead.
-                    username = session->username;
-                    if (username.empty()) {
+                    if (session->username.empty()) {
                         spdlog::error("get_execution_children: confined session has empty "
                                       "username; failing closed rather than risk an unfiltered "
                                       "read");
@@ -15146,17 +15384,15 @@ McpServer::HandlerFn McpServer::build_handler(
                                         "application/json");
                         return;
                     }
-                    // #2146 A2-R1 Gate 8 fix: threads the SAME owner-or-
-                    // visible-agent admission predicate into
-                    // get_children_checked's SQL below (execution_routes.cpp's
-                    // list route precedent) -- closes the cap-before-scope
-                    // defect where an invisible sibling could displace this
-                    // caller's own visible children out of the capped window.
-                    ExecutionListScope s;
-                    s.owner = username;
-                    s.visible_agents.assign(gate.scope->begin(), gate.scope->end());
-                    scope_arg = std::move(s);
                 }
+                // #2146 A2-R1 Gate 8 fix: threads the SAME owner-or-
+                // visible-agent admission predicate into
+                // get_children_checked's SQL below (execution_routes.cpp's
+                // list route precedent) -- closes the cap-before-scope
+                // defect where an invisible sibling could displace this
+                // caller's own visible children out of the capped window.
+                // nullopt (unrestricted) when the gate returned no scope.
+                const auto scope_arg = confined_list_scope(owner, gate.scope);
 
                 auto exec_r = execution_tracker->get_execution_checked(exec_id);
                 if (!exec_r) {
@@ -15183,7 +15419,7 @@ McpServer::HandlerFn McpServer::build_handler(
 
                 const bool parent_visible =
                     exec_opt.has_value() &&
-                    execution_visible(*exec_opt, parent_statuses, gate.scope, username);
+                    execution_visible(*exec_opt, parent_statuses, gate.scope, owner);
                 if (!exec_opt || !parent_visible) {
                     // #3789: audit ONLY under an engaged scope -- mirrors the
                     // REST twins' identical rationale (compliance-officer F2).
@@ -15231,7 +15467,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         auto it = child_statuses_opt->find(c.id);
                         const auto& c_statuses =
                             it != child_statuses_opt->end() ? it->second : kEmptyStatuses;
-                        if (!execution_visible(c, c_statuses, gate.scope, username))
+                        if (!execution_visible(c, c_statuses, gate.scope, owner))
                             continue;
                         arr.add_raw(execution_child_row_json(c).dump());
                     }
@@ -15275,12 +15511,15 @@ McpServer::HandlerFn McpServer::build_handler(
             // a per-execution agent-status lookup per row — an N+1 pattern
             // (ADR-0017 INV-10). A batched status read exists and is used
             // below to project the counts, but LIST ADMISSION stays owner-only
-            // (no visible-agent disjunct, unlike REST GET /api/v1/executions):
-            // a confined caller is restricted to their OWN dispatches
-            // (`dispatched_by` pushed into the SQL WHERE,
+            // for a management-group-confined caller (no visible-agent disjunct,
+            // unlike REST GET /api/v1/executions): they are restricted to their
+            // OWN dispatches (`dispatched_by` pushed into the SQL WHERE,
             // ExecutionQuery::dispatched_by): cheap, provably safe (never
             // another operator's execution), and consistent with the
-            // dispatcher-ownership precedent elsewhere.
+            // dispatcher-ownership precedent elsewhere. #5557: a SERVICE-SCOPED session is
+            // the exception (see docs/auth-architecture.md clause (7) item 3). It has no
+            // owner key, so it takes the engaged fleet-read scope through the checked query
+            // (the REST list twin's admission), never the owner-only filter.
             if (tool_name == "list_executions") {
                 if (!fleet_read_fn_) {
                     spdlog::error("list_executions: fleet_read_fn_ unwired; failing closed");
@@ -15316,8 +15555,33 @@ McpServer::HandlerFn McpServer::build_handler(
                 ExecutionQuery eq;
                 eq.definition_id = param_str(args, "definition_id");
                 eq.status = param_str(args, "status");
-                if (gate.scope)
-                    eq.dispatched_by = session->username;
+                // #5557: a service-scoped session's owner key is EMPTY, and an
+                // empty `eq.dispatched_by` means "no filter" -- clearing the key here would
+                // widen a confined caller to the whole list. So the two confined classes take
+                // different, EXPLICIT paths (service-scoped is decided by the session's scope,
+                // not by the key):
+                //   - service-scoped: the engaged fleet-read scope through the checked query
+                //     (agent evidence only, no owner disjunct; a present-empty scope lists
+                //     nothing, `AND 1=0`), the same admission as the REST list twin;
+                //   - any other confined caller: the owner-only filter, exactly as before.
+                const ExecutionOwnerKey owner = execution_owner_key(*session);
+                const bool service_scoped = !session->token_scope_service.empty();
+                // Fail closed locally: both gates already refuse to admit a service-scoped
+                // session unrestricted, and without a scope this would list the whole fleet.
+                if (service_scoped && !gate.scope) {
+                    spdlog::error("list_executions: service-scoped session admitted without a "
+                                  "scope; failing closed rather than risk an unrestricted list");
+                    res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                    "application/json");
+                    return;
+                }
+                if (gate.scope && !service_scoped)
+                    // Non-empty: the raw username was guarded above.
+                    eq.dispatched_by = owner_only_filter(owner);
+                // An unrestricted (default) VisibleSet pushes down nothing.
+                const authz::VisibleSet unrestricted;
+                const auto query_scope =
+                    confined_list_scope(owner, service_scoped ? gate.scope : unrestricted);
                 eq.limit = std::min(param_int32(args, "limit", 50), 500);
                 // #4030: reconciled onto the fragment's fuller field set —
                 // populate last_error_detail so the error preview below is
@@ -15331,7 +15595,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // GET /api/v1/executions above (rest_api_v1.cpp), which
                 // already has this checked/error shape, and mirrors the
                 // list_schedules fix immediately below in this same file.
-                auto execs_opt = execution_tracker->query_executions_checked(eq);
+                auto execs_opt = execution_tracker->query_executions_checked(eq, query_scope);
                 if (!execs_opt) {
                     res.set_content(
                         a4_error(kInternalError, "execution tracker degraded", {},
@@ -22591,9 +22855,38 @@ McpServer::HandlerFn McpServer::build_handler(
                             }
                             stream_lease.emplace(std::move(acquired.lease));
                         }
+                        // #7817: the bridge relays this execution's counts to the
+                        // dispatcher, so it applies the same confined projection as
+                        // GET /api/v1/events, from the dispatcher's Execution:Read scope.
+                        // Derived through the one gate every Execution read uses here
+                        // (fleet_read_fn_, as get_execution_status does), on a scratch
+                        // response because a refusal here must not answer THIS request.
+                        // FAIL CLOSED: not admitted, unwired or a throw resolves to
+                        // deny-all (progress dropped, terminal sanitized), never to
+                        // nullopt (unrestricted). Only an admitted, unfiltered gate yields
+                        // nullopt, which keeps that caller's frames unchanged.
+                        yuzu::server::authz::VisibleSet bridge_fleet_scope =
+                            yuzu::server::authz::deny_all();
+                        try {
+                            if (fleet_read_fn_) {
+                                httplib::Response scratch;
+                                auto fleet_gate =
+                                    fleet_read_fn_(req, scratch, "Execution", "Read");
+                                if (fleet_gate.admitted)
+                                    bridge_fleet_scope = std::move(fleet_gate.scope);
+                            } else {
+                                spdlog::error("execute_instruction: fleet_read_fn_ unwired; "
+                                              "progress bridge uses its most restricted view");
+                            }
+                        } catch (...) {
+                            spdlog::error("execute_instruction: Execution:Read scope derivation "
+                                          "threw; progress bridge uses its most restricted view");
+                            bridge_fleet_scope = yuzu::server::authz::deny_all();
+                        }
                         auto rr = bridge->reserve(bridge_sid, binding, id,
                                                   std::move(bridge_token),
-                                                  /*streamed_intent=*/streamed_mode);
+                                                  /*streamed_intent=*/streamed_mode,
+                                                  std::move(bridge_fleet_scope));
                         if (rr.ok) {
                             bridge_active = true;
                             streamed_active = streamed_mode;
@@ -23148,9 +23441,11 @@ McpServer::HandlerFn McpServer::build_handler(
                 // #2712: structuredContent is baked into `result` HERE, before it
                 // is handed to bridge->arm() below as result_base - a streamed or
                 // parked final's build_real_final() parse-merges result_base and
-                // only ADDS top-level status/agents_success/agents_failure keys
-                // (mcp_stream_bridge.cpp), so structuredContent survives into every
-                // final shape unchanged. This is a deliberate, pinned decision, not
+                // only ADDS top-level status keys, plus agents_success/agents_failure
+                // when the terminal payload carries them (it does not for a
+                // scope-confined dispatcher) (mcp_stream_bridge.cpp), so
+                // structuredContent survives into every final shape unchanged.
+                // This is a deliberate, pinned decision, not
                 // an accident of construction order - see the bridge byte-pin test
                 // added alongside this change.
                 auto result = tool_result(payload, kObjectOutputSchema);
@@ -23158,7 +23453,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 // the latched progress snapshot to the projector, which publishes
                 // progress LIVE onto this session's GET stream. `result` is passed as the
                 // result_base (B5): a parked record's real final re-emits today's
-                // result object with status/agents_* added as top-level keys.
+                // result object with status (and agents_success/agents_failure when the
+                // terminal payload carries them) added as top-level keys.
                 // The plain JSON below answers this POST either way - GET-only
                 // mode NEVER emits a second final response (no pin, no final
                 // frame; the H2/G9-class byte test pins this).
@@ -23904,7 +24200,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     // newly-created branch's own inline construction.
                     .principal_is_admin =
                         auth::effective_role(*session) == auth::Role::admin,
-                    // #1398: quarantine.quarantine is AdminOrApproval-gated.
+                    // #1398: firewall.quarantine is AdminOrApproval-gated.
                     // A supervised-tier MCP token reaches here only after C8
                     // consumed a real ticket for THIS request
                     // (approval_ticket_just_consumed); a non-MCP-tiered
@@ -23937,7 +24233,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!authorize_dispatch_fn_) {
                     // Fail-closed, same shape as C8's own guard: an unwired
                     // authorizer means this handler cannot determine whether
-                    // THIS caller may dispatch quarantine.quarantine at all.
+                    // THIS caller may dispatch firewall.quarantine at all.
                     const std::string cid = yuzu::server::detail::make_correlation_id();
                     mcp_audit("denied", "agent_id=" + agent_id +
                                              ", dispatch authorizer unavailable correlation_id=" +
@@ -23951,9 +24247,11 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 if (auto authz_decision =
-                        authorize_dispatch_fn_(quarantine_caller, "quarantine", "quarantine");
+                        authorize_dispatch_fn_(quarantine_caller, kContainmentPlugin,
+                                               kContainmentApplyAction);
                     !authz_decision) {
-                    deny_dispatch_authorization("quarantine", "quarantine",
+                    deny_dispatch_authorization(std::string(kContainmentPlugin),
+                                                std::string(kContainmentApplyAction),
                                                 authz_decision.error());
                     return;
                 }
@@ -23976,32 +24274,30 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                // Mirror the agent's is_safe_ip charset ([0-9a-fA-F.:], <=45) so we
-                // reject anything the agent would silently drop, loudly.
-                // #3425: moved to quarantine_reapply.hpp
-                // (quarantine_whitelist_tokens_safe) — the SAME shared
-                // chokepoint the already_active retry path below,
-                // QuarantineContainmentReconciler, and the REST twin
-                // (rest_api_v1.cpp's POST /api/v1/quarantine) all call, so
-                // this check exists in exactly one place rather than N
-                // hand-rolled copies.
-                if (!quarantine_whitelist_tokens_safe(whitelist)) {
+                // The firewall plugin's exception grammar takes bare IPv4/IPv6 literals, at most
+                // 32 here (each is sent as an /out and an /in exception): refuse anything it
+                // would refuse, loudly. #3425: map_whitelist_to_exceptions
+                // (quarantine_reapply.hpp) is the SAME single validator the already_active
+                // retry path below, QuarantineContainmentReconciler, and the REST twin
+                // (rest_api_v1.cpp's POST /api/v1/quarantine) all call, so this check exists
+                // in exactly one place rather than N hand-rolled copies.
+                if (!map_whitelist_to_exceptions(whitelist)) {
                     res.set_content(
                         error_response(id, kInvalidParams,
-                                       "whitelist must be comma-separated IPv4/IPv6 literals"),
+                                       "whitelist must be comma-separated IPv4/IPv6 literals, "
+                                       "at most 32"),
                         "application/json");
                     return;
                 }
-                // NOTE (governance sec-LOW-1 / UP-6): this call never sets qparams'
-                // server_ip — but live isolation still keeps the management channel
-                // reachable, because the agent independently derives its own server
-                // address once at STARTUP (agents/core/src/server_address_resolver.cpp,
-                // resolved via DNS when it's a hostname) and threads the result into
-                // every plugin's config, rather than depending on a caller-supplied
-                // one. Deliberately not resolved by the quarantine plugin itself at
-                // dispatch time -- see quarantine_plugin.cpp's do_quarantine comment
-                // on why that would let the host being quarantined steer its own
-                // containment exception via its own (possibly compromised) resolver.
+                // NOTE (governance sec-LOW-1 / UP-6): this call sends no server address — but
+                // live isolation still keeps the management channel reachable, because the
+                // agent independently derives its own server address once at STARTUP
+                // (agents/core/src/server_address_resolver.cpp, resolved via DNS when it's a
+                // hostname) and threads the result into every plugin's config, rather than
+                // depending on a caller-supplied one. Deliberately not resolved by the
+                // firewall plugin at dispatch time: that would let the host being
+                // quarantined steer its own containment exception via its own (possibly
+                // compromised) resolver.
                 // 1. Persist the quarantine record (store row only; mirror REST).
                 auto quar_res =
                     quarantine_store->quarantine_device(agent_id, session->username, reason, whitelist);
@@ -24081,9 +24377,12 @@ McpServer::HandlerFn McpServer::build_handler(
                 std::string command_id;
                 int agents_reached = 0;
                 bool dispatch_threw = false;
-                if (record_pre_existing) {
+                // Both branches read the STORED row and dispatch from it: the `created` branch's
+                // row IS this call's own write, so the dispatched whitelist is the same value, and
+                // there is no second hand-built dispatch to drift from the reconciler's.
+                if (record_pre_existing || (dispatch_fn && should_dispatch_isolation(write_result))) {
                     // #3425: the shared recipe (quarantine_reapply.hpp) owns
-                    // the read-stored-row + validate + dispatch sequence —
+                    // the read-stored-row + map + dispatch sequence —
                     // the SAME chokepoint QuarantineContainmentReconciler
                     // uses on reconnect, so the stored-whitelist-only
                     // invariant lives in exactly one function rather than
@@ -24094,24 +24393,29 @@ McpServer::HandlerFn McpServer::build_handler(
                         [&](const std::unordered_map<std::string, std::string>& params)
                             -> std::pair<std::string, int> {
                             // ReapplyDispatchFn's narrower pair shape is deliberate --
-                            // see its own doc comment. `is_quarantine_control_plugin`
-                            // is the closed quarantine set inside the shared
+                            // see its own doc comment. `is_firewall_control_plugin`
+                            // is the closed firewall containment set inside the shared
                             // protective predicate (yuzu::protective::
                             // is_protective_action): these actions are exempt from
                             // the CONTAINMENT gate, the kill switch, the per-OS
                             // withhold and #3511's plugin-presence filter
                             // (`AgentRegistry::ids_missing_plugin` returns nothing
                             // for them). A reapply to an agent genuinely missing
-                            // the quarantine plugin is therefore delivered and the
+                            // the firewall plugin is therefore delivered and the
                             // agent answers with its own plugin-not-found; the
                             // narrower return shape can't discriminate that, so see
                             // the caller's `agents_reached == 0` handling, which
                             // reads an unreached result as an ordinary retry case.
+                            // governance UP-9: the caller carries a set CONFINED to the
+                            // single scope-gate-checked target, not an unfiltered
+                            // VisibleSet{}; #1398: quarantine_caller (defined above)
+                            // already carries principal_is_admin/approval_provenance.
                             if (!dispatch_fn)
                                 return {};
-                            const auto outcome = dispatch_fn("quarantine", "quarantine", {agent_id},
-                                                             /*scope=*/"", params,
-                                                             /*execution_id=*/"", quarantine_caller);
+                            const auto outcome = dispatch_fn(
+                                std::string(kContainmentPlugin),
+                                std::string(kContainmentApplyAction), {agent_id},
+                                /*scope=*/"", params, /*execution_id=*/"", quarantine_caller);
                             return {outcome.command_id, outcome.sent};
                         },
                         stored);
@@ -24126,11 +24430,26 @@ McpServer::HandlerFn McpServer::build_handler(
                                 "application/json");
                             return;
                         }
+                        if (err.kind == ContainmentReapplyErrorKind::release_pending) {
+                            // Not a transient fault: a release is in flight for this record, and
+                            // containment is not re-applied under it. The request is refused for
+                            // the state the resource is in (kInvalidParams, as the REST twin's
+                            // 400), not a service fault. No retry hint.
+                            mcp_audit("failure", "agent_id=" + agent_id +
+                                                     ", release in progress; isolation not "
+                                                     "dispatched");
+                            res.set_content(
+                                a4_error(kInvalidParams,
+                                         "a release is in progress for this device"),
+                                "application/json");
+                            return;
+                        }
                         // store_error / no_active_record: both leave nothing
                         // durable to dispatch against — retry the whole
                         // request rather than report isolated on a record
                         // that turned out not to be there.
-                        mcp_audit("failure", "agent_id=" + agent_id + ", " + err.detail);
+                        mcp_audit("failure", "agent_id=" + agent_id + ", " + err.detail +
+                                                 (record_pre_existing ? "" : " record_persisted=1"));
                         res.set_content(a4_error(kInternalError, err.detail, "retry the request",
                                                  /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                         "application/json");
@@ -24145,43 +24464,11 @@ McpServer::HandlerFn McpServer::build_handler(
                     // The caller's params were not applied — tell it, rather
                     // than silently discarding a whitelist it thought it was
                     // setting.
-                    if (!whitelist.empty() && whitelist != stored.whitelist)
+                    if (record_pre_existing && !whitelist.empty() && whitelist != stored.whitelist)
                         whitelist_request_ignored = true;
                     command_id = reapply_res->command_id;
                     agents_reached = reapply_res->agents_reached;
                     dispatch_threw = reapply_res->dispatch_threw;
-                } else if (dispatch_fn && should_dispatch_isolation(write_result)) {
-                    // `created`: dispatch this call's own (already
-                    // server-edge-validated above) whitelist directly — no
-                    // extra store read needed, the row we just wrote IS
-                    // `effective_whitelist`. `store_error` already returned
-                    // above, so `should_dispatch_isolation` is true here by
-                    // construction; the call stays explicit per #3127.
-                    std::unordered_map<std::string, std::string> qparams;
-                    if (!effective_whitelist.empty())
-                        qparams["whitelist_ips"] = effective_whitelist;
-                    try {
-                        // governance UP-9: thread a set CONFINED to the single
-                        // scope-gate-checked target, not an unfiltered VisibleSet{} —
-                        // defense in depth matching the bundle/execute_instruction
-                        // dispatch arms (this was the last arm still passing
-                        // unfiltered on a single already-authorized target).
-                        // PLAN-006: `session` was authenticated at handler entry and
-                        // is already used for the store write above — identify the
-                        // caller to dispatch_confined too, not just its visible set.
-                        // #1398: quarantine_caller (defined above this if/else,
-                        // shared with the reapply branch) already carries
-                        // principal_is_admin/approval_provenance.
-                        const auto outcome =
-                            dispatch_fn("quarantine", "quarantine", {agent_id}, /*scope=*/"",
-                                        qparams, /*execution_id=*/"", quarantine_caller);
-                        command_id = outcome.command_id;
-                        agents_reached = outcome.sent;
-                    } catch (const std::exception& e) {
-                        dispatch_threw = true;
-                        spdlog::error("MCP quarantine_device: isolation dispatch failed: {}",
-                                      e.what());
-                    }
                 }
                 // #3127: agents_reached>0 means the plugin registry ACCEPTED
                 // the frame — for a gateway-attached agent, send_to only
@@ -24189,7 +24476,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // execution. The response's dispatch_confirmed below means
                 // exactly that acceptance, never "the device is provably
                 // isolated": confirming isolation still requires a follow-up
-                // `status` read returning `state|active`.
+                // `firewall.quarantine_status` read returning `status|active`.
                 const QuarantineResponse response_shape =
                     quarantine_response_shape(write_result, agents_reached, dispatch_threw);
                 if (response_shape == QuarantineResponse::unconfirmed_retryable) {
@@ -24245,7 +24532,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     // (heartbeat-triggered, with a periodic tick backstop for
                     // anything the heartbeat hook misses) and only marks
                     // containment confirmed after a follow-up
-                    // `quarantine.status` read reports `state|active` — the
+                    // `firewall.quarantine_status` read reports the rules in force — the
                     // wording below reflects that a manual re-issue is no
                     // longer load-bearing, only redundant-but-harmless.
                     //
@@ -24316,8 +24603,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     .add("agents_reached", agents_reached)
                     // dispatch_confirmed, NOT isolation_confirmed: see the
                     // comment above response_shape. A client that needs proof
-                    // of isolation reads `status` and checks for
-                    // state|active.
+                    // of isolation reads firewall.quarantine_status and checks for
+                    // status|active.
                     .add("dispatch_confirmed", true)
                     // Unconditional booleans (not present-only-when-true) so a
                     // client can distinguish "false" from "this server
@@ -25092,7 +25379,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         exec_agents = std::move(*agents_opt);
                     }
                     if (exec && execution_visible(*exec, exec_agents, gate.scope,
-                                                  session->username)) {
+                                                  execution_owner_key(*session))) {
                         int agents_targeted = exec->agents_targeted;
                         int agents_responded = exec->agents_responded;
                         if (gate.scope) {
@@ -28508,6 +28795,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 mreq.what = ExecutionMutation::kCancel;
                 mreq.execution_id = *exec_id;
                 mreq.username = session->username;
+                // #5557: admission key; `username` stays the real audit identity.
+                mreq.owner = execution_owner_key(*session);
                 mreq.scope = gate.scope;
                 mreq.audit_context = "surface=mcp";
                 const auto outcome = apply_execution_mutation(
@@ -28604,6 +28893,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 mreq.what = ExecutionMutation::kRerun;
                 mreq.execution_id = *exec_id;
                 mreq.username = session->username;
+                // #5557: admission key; `username` stays the real audit identity.
+                mreq.owner = execution_owner_key(*session);
                 mreq.scope = gate.scope;
                 mreq.failed_only = *failed_only;
                 mreq.audit_context = "surface=mcp";
@@ -32818,8 +33109,10 @@ McpServer::HandlerFn McpServer::build_get_handler(AuthFn auth_fn, AuditFn audit_
                 error_response_null_a4(kPermissionDenied,
                                        "service-scoped tokens may not open the MCP stream channel",
                                        cid,
-                                       "use a token without scope_service; durable results "
-                                       "remain fetchable by execution_id"));
+                                       "use a token without scope_service for the stream channel; "
+                                       "a service-scoped token can read an execution by "
+                                       "execution_id only after an agent in its service scope "
+                                       "has a status row for it"));
             return;
         }
         // The SSE channel itself (session gate, Accept negotiation, replay, caps,

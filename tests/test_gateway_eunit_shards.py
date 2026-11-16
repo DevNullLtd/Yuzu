@@ -108,12 +108,14 @@ class Partition(unittest.TestCase):
 
     def test_deterministic_regardless_of_listing_order(self):
         mods = ges.list_test_modules(TEST_DIR)
-        want = ges.partition(mods, 2)
         rng = random.Random(2093)
-        for _ in range(5):
-            shuffled = list(mods)
-            rng.shuffle(shuffled)
-            self.assertEqual(ges.partition(shuffled, 2), want)
+        for n in (1, 2, 3):
+            with self.subTest(n=n):
+                want = ges.partition(mods, n)
+                for _ in range(5):
+                    shuffled = list(mods)
+                    rng.shuffle(shuffled)
+                    self.assertEqual(ges.partition(shuffled, n), want)
 
     def test_bad_shard_count_is_refused(self):
         with self.assertRaises(ValueError):
@@ -183,6 +185,11 @@ class MesonAndCiAgree(unittest.TestCase):
         self.assertIn("'--shard', _gw_shard_spec", body)
         self.assertRegex(body, r"'REBAR_BASE_DIR': _gw_src / \('_build_eunit_' \+ _gw_shard_spec\.split\('/'\)\[0\]\)")
         self.assertIn("suite: 'gateway'", body)
+
+    def test_registered_shards_cover_the_real_inventory_exactly_once(self):
+        shards = [ges.shard_modules(TEST_DIR, int(k), int(n))
+                  for _, k, n in self._meson_shards()]
+        _assert_exact_cover(self, shards, ges.eunit_units(ges.list_test_modules(TEST_DIR)))
 
     def test_ci_registration_check_requires_every_shard(self):
         src = _read(ASSERT_SCRIPT)

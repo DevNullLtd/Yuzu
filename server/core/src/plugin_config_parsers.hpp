@@ -229,8 +229,10 @@ parse_kill_switch_scope(std::string_view plugin_raw, std::string_view action_raw
 /// action (`yuzu/protective_actions.hpp`): an action-level row for a protective
 /// pair, or a plugin-level row for a plugin that owns protective actions. Such
 /// a row never stops the protective actions and still gates any non-protective
-/// action the plugin declares (none today: `quarantine` declares exactly the
-/// four protective actions and `__guard__` dispatches only `push_rules`). The
+/// action the plugin declares: `firewall` is the first plugin with both kinds (a
+/// plugin-level `firewall` row never stops its four containment actions and still
+/// stops `firewall.state` and `firewall.rules`; `__guard__` dispatches only
+/// `push_rules`). The
 /// write surfaces use it to label the audit evidence so a stored OFF row is
 /// never read as proof of a stop. One list: both predicates come from the
 /// shared header.
@@ -253,8 +255,10 @@ inline constexpr std::size_t kListRowCap = 5000;
 
 /// The `plugin_config.kill_switch.set` audit detail: `enabled=<bool>`, plus
 /// `, protective_exempt=true` when the row covers a protective action (stored
-/// but never gating dispatch), plus `, reason="<text>"` when the operator gave
-/// one. The reason survives on the live row only until the next flip, so without
+/// but never gating the protective actions), or `, protective_exempt=partial` for a
+/// plugin-level `firewall` row (it exempts the protective actions but still gates that plugin's
+/// ordinary ones, `state` and `rules`), plus `, reason="<text>"` when the operator gave one. The
+/// reason survives on the live row only until the next flip, so without
 /// it here the audit trail cannot answer "why was this switched off". It is
 /// already validated (<= 512 bytes, no control characters but tab) by
 /// `is_valid_reason`; this re-bounds it anyway so the evidence format never
@@ -268,8 +272,17 @@ inline constexpr std::size_t kListRowCap = 5000;
 [[nodiscard]] inline std::string kill_switch_set_detail(const KillSwitchScope& scope, bool enabled,
                                                         std::string_view reason = {}) {
     std::string detail = enabled ? "enabled=true" : "enabled=false";
-    if (kill_switch_row_covers_protective(scope))
-        detail += ", protective_exempt=true";
+    if (kill_switch_row_covers_protective(scope)) {
+        // A plugin-level row (at any OS layer) for a plugin that also declares ordinary actions
+        // (today only `firewall`: `state`, `rules`) exempts the protective ones yet still gates
+        // the rest: `partial`, so a post-mortem cannot read it as a complete exemption.
+        // `__guard__` declares only protective actions, and an action-level row
+        // is exact: both stay `true`.
+        const bool partial =
+            scope.action.empty() &&
+            yuzu::protective::plugin_mixes_protective_and_ordinary_actions(scope.plugin);
+        detail += partial ? ", protective_exempt=partial" : ", protective_exempt=true";
+    }
     if (!reason.empty()) {
         std::size_t keep = reason.size() < kMaxReasonBytes ? reason.size() : kMaxReasonBytes;
         // A continuation byte (10xxxxxx) at the cut means the cut tears a sequence: back up.

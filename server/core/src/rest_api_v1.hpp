@@ -118,6 +118,9 @@ namespace detail {
 std::atomic<int>& live_max_inflight();     // default 4 (strictly below the worker pool)
 std::atomic<int>& live_poll_max_polls();   // default 40
 std::atomic<int>& live_poll_interval_ms(); // default 500
+// DELETE /api/v1/quarantine/{agent_id}: how many times (one per live_poll_interval_ms) the handler
+// reads the device's reply to its firewall.release before answering 202. Same seam, same reason.
+std::atomic<int>& release_confirm_max_polls(); // default 10
 } // namespace detail
 
 /// Versioned REST API v1 — registers all /api/v1/ routes on the httplib::Server.

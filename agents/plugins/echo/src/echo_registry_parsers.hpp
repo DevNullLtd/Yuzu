@@ -17,6 +17,13 @@
 //     a Layer-1 change on value name + type + size + time window
 //     (attribute_candidate), never read off an event that named the key.
 //
+// SECRET VALUES. A value under a sensitive name (is_sensitive_reg_value) is never stored in
+// any form. Masking is applied where values are derived (diff_registry_snapshot,
+// baseline_from_read) and enforced again, idempotently, at the three persisted exits
+// (encode_registry_baseline, candidate_to_json, registry_row_from_candidate), so a legacy
+// baseline or cursor cannot carry a secret through. A content-only change to such a value
+// produces no row. Other secret-bearing values are NOT detected.
+//
 // A change becomes a row only after its attribution is final: a candidate is HELD
 // (persisted in the cursor) until kEtwSettle100ns after its window closed, since an
 // event for a write just before the read can still arrive that long after it
@@ -702,6 +709,8 @@ private:
 /// decodes the baseline), and `dt` = the value exceeded kBaselineValueReadCap, so
 /// `h` covers only what the reader returned (nothing, from the Windows API, which has
 /// no partial read) and a change that keeps the type and size is not detected.
+/// A value under a sensitive name (is_sensitive_reg_value) keeps its type only: s = 0, h and d
+/// empty, dt false (masked_baseline_entry).
 struct BaselineEntry {
     std::uint32_t t{0};
     std::uint64_t s{0};
@@ -740,6 +749,37 @@ struct RegistryBaseline {
         if (c >= 'A' && c <= 'Z')
             c = static_cast<char>(c - 'A' + 'a');
     return out;
+}
+
+/// What a row holds in place of a sensitive value (same text echo_diff.cpp shows operators).
+inline constexpr std::string_view kRegistryMaskedData = "[REDACTED by Echo]";
+
+/// True for a value name whose data is a stored credential: Winlogon autologon's
+/// DefaultPassword and AltDefaultPassword (ASCII case-insensitive). A CLOSED, name-only list:
+/// it matches under any watched key, so it holds across HKLM, HKU\<sid>, numbered control
+/// sets and offline mounts. Do not extend it by pattern.
+///
+/// No value under the watched `SYSTEM\CurrentControlSet\Control\Lsa` key is listed, on
+/// purpose. By the documented Windows layout that key holds LSA configuration (package lists,
+/// policy flags). LSA secrets and cached logons live under `HKLM\SECURITY` and account
+/// hashes under `HKLM\SAM`, neither of which is in default_registry_scope(); the system key
+/// sits in the class strings of four Lsa subkeys, which the reader never requests (lpClass is
+/// null in RegQueryInfoKeyW and RegEnumKeyExW). This rests on that layout plus our scope and
+/// reader code; it was not probed on a Windows host.
+[[nodiscard]] inline bool is_sensitive_reg_value(std::string_view value_name) {
+    const std::string f = fold_value_name(value_name);
+    return f == "defaultpassword" || f == "altdefaultpassword";
+}
+
+/// The baseline entry for a sensitive value: the type and nothing derived from the bytes.
+/// Deliberately no size and no hash, although #6634 asked for both: either one lets a reader
+/// of echo_state test guesses of a short password offline. The accepted cost is that a
+/// content-only change to such a value is not detected (an add, a removal and a type change
+/// are).
+[[nodiscard]] inline BaselineEntry masked_baseline_entry(std::uint32_t type) {
+    BaselineEntry e;
+    e.t = type;
+    return e;
 }
 
 /// What an ETW event keeps of its value name: the SHA-256 of the folded name. Equal folded
@@ -804,6 +844,20 @@ struct RegistryCandidate {
     std::string source;                      // notify | reconcile | offline
 };
 
+/// Replaces everything a candidate holds of a sensitive value's bytes (see
+/// is_sensitive_reg_value). Idempotent; the type and prev_type are kept.
+inline void mask_sensitive_candidate(RegistryCandidate& c) {
+    if (!is_sensitive_reg_value(c.value))
+        return;
+    c.size = 0;
+    c.data = (c.action == "added" || c.action == "changed") ? std::string(kRegistryMaskedData)
+                                                            : std::string{};
+    c.data_truncated = false;
+    c.prev_size = 0;
+    c.prev_data.clear();
+    c.prev_truncated = false;
+}
+
 struct DiffResult {
     std::vector<RegistryCandidate> candidates;
     RegistryBaseline baseline;
@@ -815,7 +869,9 @@ struct DiffResult {
     for (const auto& [key, values] : read.keys) {
         auto& m = b.keys[key];
         for (const auto& [name, v] : values)
-            m[name] = baseline_entry_from_bytes(v.type, v.full_size, v.bytes, v.truncated);
+            m[name] = is_sensitive_reg_value(name)
+                          ? masked_baseline_entry(v.type)
+                          : baseline_entry_from_bytes(v.type, v.full_size, v.bytes, v.truncated);
     }
     return b;
 }
@@ -872,22 +928,31 @@ struct DiffResult {
         auto& out_vals = r.baseline.keys[key];
         const auto bk = base.keys.find(key);
         for (const auto& [name, v] : values) {
-            BaselineEntry now = baseline_entry_from_bytes(v.type, v.full_size, v.bytes, v.truncated);
+            // A sensitive value is never hashed, sized or rendered: its entry is the type only and
+            // only an add, a type change or a removal is a change (a legacy entry that still holds
+            // a size and hash is compared on type alone, so the upgrade fabricates no row).
+            const bool masked = is_sensitive_reg_value(name);
+            BaselineEntry now = masked ? masked_baseline_entry(v.type)
+                                       : baseline_entry_from_bytes(v.type, v.full_size, v.bytes,
+                                                                   v.truncated);
             const BaselineEntry* before = nullptr;
             if (bk != base.keys.end())
                 if (auto it = bk->second.find(name); it != bk->second.end())
                     before = &it->second;
-            const bool differs = before == nullptr || before->t != now.t || before->s != now.s ||
-                                 before->h != now.h;
+            const bool differs = before == nullptr || before->t != now.t ||
+                                 (!masked && (before->s != now.s || before->h != now.h));
             if (differs && !suppress) {
                 RegistryCandidate c = make(key, name, before ? "changed" : "added");
                 c.type = v.type;
-                c.size = v.full_size;
-                auto rd = render_reg_data(v.type, v.bytes, kRegistryDataCap);
-                c.data = std::move(rd.text);
-                c.data_truncated = rd.truncated || v.truncated;
+                if (!masked) {
+                    c.size = v.full_size;
+                    auto rd = render_reg_data(v.type, v.bytes, kRegistryDataCap);
+                    c.data = std::move(rd.text);
+                    c.data_truncated = rd.truncated || v.truncated;
+                }
                 if (before)
                     set_prev(c, *before);
+                mask_sensitive_candidate(c);
                 r.candidates.push_back(std::move(c));
             }
             out_vals[name] = std::move(now);
@@ -913,6 +978,7 @@ struct DiffResult {
                     break;
                 RegistryCandidate c = make(key, name, "removed");
                 set_prev(c, e);
+                mask_sensitive_candidate(c);
                 r.candidates.push_back(std::move(c));
             }
             if (!suppress)
@@ -928,6 +994,7 @@ struct DiffResult {
                     continue;
                 RegistryCandidate c = make(key, name, "removed");
                 set_prev(c, e);
+                mask_sensitive_candidate(c);
                 r.candidates.push_back(std::move(c));
             }
         }
@@ -936,6 +1003,12 @@ struct DiffResult {
     // (it may simply be past the cap) stays, and only what it visited is updated.
     // An excluded key a legacy baseline still holds is dropped, once, with no rows.
     std::erase_if(r.baseline.keys, [](const auto& kv) { return registry_path_excluded(kv.first); });
+    // A listed name still held with a size/hash (a Capped read's retained copy, an under-skipped
+    // key, a legacy baseline) is reduced to its type, so nothing derived from its bytes survives.
+    for (auto& [k, values] : r.baseline.keys)
+        for (auto& [n, e] : values)
+            if (is_sensitive_reg_value(n))
+                e = masked_baseline_entry(e.t);
     r.changed = !(r.baseline == base);
     return r;
 }
@@ -1009,6 +1082,7 @@ struct Attribution {
     if (c.action == "key_removed")
         return a;
     const bool is_set = c.action == "added" || c.action == "changed";
+    const bool sensitive = is_sensitive_reg_value(c.value);
     const ValueNameKey name = value_name_key(c.value);
     const RegistryEtwEvent* last = nullptr;
     std::set<std::uint32_t> pids;
@@ -1016,7 +1090,10 @@ struct Attribution {
         if (!(c.window_lo < e.ts100ns && e.ts100ns <= c.window_hi))
             continue;
         if (is_set) {
-            if (e.op != RegistryEtwOp::Set || e.type != c.type || e.size != c.size)
+            // A sensitive value's length is not kept (the candidate's size is 0), so its writer is
+            // correlated on name, type, op and window alone.
+            if (e.op != RegistryEtwOp::Set || e.type != c.type ||
+                (!sensitive && e.size != c.size))
                 continue;
         } else if (e.op != RegistryEtwOp::DeleteValue) {
             continue;
@@ -1111,9 +1188,13 @@ inline std::string rk_escape(std::string_view s) {
 }
 
 [[nodiscard]] inline RegistryEvent
-registry_row_from_candidate(const RegistryCandidate& c, std::uint32_t actor_pid,
+registry_row_from_candidate(const RegistryCandidate& candidate, std::uint32_t actor_pid,
                             const std::string& actor_image, std::string detail,
                             std::int64_t snapshot_id) {
+    // Enforced here, at the row egress, whatever the diff did: a candidate from a legacy cursor
+    // may still hold a sensitive value's bytes.
+    RegistryCandidate c = candidate;
+    mask_sensitive_candidate(c);
     RegistryEvent ev;
     const auto ms = filetime_to_unix_ms(c.observed_at);
     // Row time is when the key was written, when the read saw a plausible stamp (after 1601 and
@@ -1303,7 +1384,8 @@ struct RegistryCursor {
 
 namespace registry_detail {
 
-inline nlohmann::json candidate_to_json(const RegistryCandidate& c) {
+inline nlohmann::json candidate_to_json(RegistryCandidate c) {
+    mask_sensitive_candidate(c); // the cursor row is persisted: a held candidate never keeps a secret
     return {{"r", c.root},         {"k", c.key},          {"v", c.value},
             {"a", c.action},       {"t", c.type},         {"s", c.size},
             {"d", c.data},         {"dtr", c.data_truncated}, {"hp", c.has_prev},
@@ -1436,6 +1518,26 @@ inline RegistryCandidate candidate_from_json(const nlohmann::json& j) {
     return j.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
 }
 
+/// The text to store in place of the cursor @p stored when it holds a change to a sensitive
+/// value (is_sensitive_reg_value) in a form this build would not write: an earlier build kept
+/// the rendered value in a held candidate, and only a committed tick re-encodes the row, which
+/// a disabled source never has. nullopt when there is nothing to rewrite, and for a cursor that
+/// does not decode: that one is collect()'s to report (gap:cursorlost) and re-baseline, never
+/// replaced here. The rewrite is the decoded cursor re-encoded, so the position (tick, roots,
+/// held windows, loss epochs, hku, offline) is unchanged and nothing is replayed. A field only a
+/// later build writes is dropped, as any committed tick of this build drops it (no downgrade).
+[[nodiscard]] inline std::optional<std::string> masked_registry_cursor(const std::string& stored) {
+    const RegistryCursor cur = decode_registry_cursor(stored);
+    if (cur.malformed ||
+        std::none_of(cur.held.begin(), cur.held.end(),
+                     [](const RegistryCandidate& c) { return is_sensitive_reg_value(c.value); }))
+        return std::nullopt;
+    std::string clean = encode_registry_cursor(cur);
+    if (clean == stored)
+        return std::nullopt;
+    return clean;
+}
+
 struct DecodedBaseline {
     bool malformed{false};
     RegistryBaseline baseline;
@@ -1445,8 +1547,14 @@ struct DecodedBaseline {
     nlohmann::json keys = nlohmann::json::object();
     for (const auto& [k, values] : b.keys) {
         auto vj = nlohmann::json::object();
-        for (const auto& [n, e] : values)
-            vj[n] = {{"t", e.t}, {"s", e.s}, {"h", e.h}, {"d", e.d}, {"dt", e.dt}};
+        for (const auto& [n, e] : values) {
+            // Bound without a copy for the unmasked entry: a conditional with a prvalue arm
+            // would copy every `e`.
+            const bool masked = is_sensitive_reg_value(n);
+            const BaselineEntry clean = masked ? masked_baseline_entry(e.t) : BaselineEntry{};
+            const BaselineEntry& w = masked ? clean : e;
+            vj[n] = {{"t", w.t}, {"s", w.s}, {"h", w.h}, {"d", w.d}, {"dt", w.dt}};
+        }
         keys[k] = std::move(vj);
     }
     nlohmann::json j;
