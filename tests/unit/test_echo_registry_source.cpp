@@ -401,6 +401,8 @@ TEST_CASE("diff_registry_snapshot: added/changed/removed values and the four rea
     }
 }
 
+namespace {
+
 // The test-side inverse of registry_name_utf8 (production has no decoder: nothing needs one).
 // Reading left to right a U+FFFD is followed by a second U+FFFD (a literal one) or by four hex
 // digits that start with `D` (a lone surrogate).
@@ -438,15 +440,15 @@ std::u16string decode_registry_name(const std::string& s) {
 const std::vector<std::u16string>& registry_name_table() {
     static const std::vector<std::u16string> t{
        u"Run",                        // valid BMP text
-       u"café 中",           // non-ASCII BMP
+       u"caf\u00E9 \u4E2D",           // non-ASCII BMP
        u"x\U0001F600y",               // a surrogate pair
        std::u16string{u'a', char16_t(0xD800)},                          // a lone high
        std::u16string{u'a', char16_t(0xDC00)},                          // a lone low
        std::u16string{char16_t(0xD800), u'D', u'8', u'0', u'0'},        // a lone high then the text D800
        std::u16string{char16_t(0xD800)},                                // a lone high alone
-       u"�",                     // a literal replacement character
-       u"�" u"D800",             // a literal one followed by the text D800
-       u"��",               // two literal ones
+       u"\uFFFD",                     // a literal replacement character
+       u"\uFFFD" u"D800",             // a literal one followed by the text D800
+       u"\uFFFD\uFFFD",               // two literal ones
        u"\\uD800",                    // the valid name spelt backslash-u-D800
        std::u16string{u'n', char16_t(0), u'm'}, // a name with U+0000
        std::u16string{char16_t(0xDC00), char16_t(0xD800)}, // low then high: both lone
@@ -454,10 +456,12 @@ const std::vector<std::u16string>& registry_name_table() {
     return t;
 }
 
+} // namespace
+
 TEST_CASE("registry names: valid UTF-16 without a replacement character converts to the same UTF-8 as before",
           "[echo][registry][pure]") {
     CHECK(registry_name_utf8(u"Run") == "Run");
-    CHECK(registry_name_utf8(u"café 中") == "caf\xC3\xA9 \xE4\xB8\xAD");
+    CHECK(registry_name_utf8(u"caf\u00E9 \u4E2D") == "caf\xC3\xA9 \xE4\xB8\xAD");
     CHECK(registry_name_utf8(u"x\U0001F600y") == "x\xF0\x9F\x98\x80y");
     CHECK(registry_name_utf8(u"\\uD800") == "\\uD800"); // a backslash is just a backslash
     CHECK(registry_name_utf8(std::u16string{u'n', char16_t(0), u'm'}) == std::string("n\0m", 3));
@@ -471,7 +475,7 @@ TEST_CASE("registry names: a lone surrogate and a literal replacement character 
         CHECK(seen.insert(registry_name_utf8(n)).second); // pairwise distinct
     CHECK(seen.size() == t.size());
     CHECK(registry_name_utf8(std::u16string{char16_t(0xD800)}) == "\xEF\xBF\xBD" "D800");
-    CHECK(registry_name_utf8(u"�") == "\xEF\xBF\xBD\xEF\xBF\xBD");
+    CHECK(registry_name_utf8(u"\uFFFD") == "\xEF\xBF\xBD\xEF\xBF\xBD");
 }
 
 TEST_CASE("registry names: every encoded name decodes back to the name it came from", "[echo][registry][pure]") {
@@ -495,6 +499,63 @@ TEST_CASE("registry diff: a value replaced by one whose name differs only in a l
     for (const auto& c : d.candidates)
         got.insert(c.action + ":" + c.value);
     CHECK(got == std::set<std::string>{"removed:" + spelt, "added:" + lone});
+}
+
+TEST_CASE("registry diff: unnamed skipped children make a read non-authoritative whatever its status",
+          "[echo][registry][pure]") {
+    namespace P = yuzu::profiles;
+    const std::string root = "HKLM\\SOFTWARE\\r";
+    const RegistryWindow win{10, 20};
+    const std::string a = root + "\\A", b = root + "\\B";
+    const auto base_read = complete({{a, {{"v", vread(P::kRegDword, dword(1))}}},
+                                     {b, {{"v", vread(P::kRegDword, dword(2))}}}});
+    const auto base = diff_registry_snapshot({}, base_read, root, "reconcile", win, 20, /*suppress=*/true).baseline;
+    const auto actions = [&](const DiffResult& d) {
+        std::set<std::string> got;
+        for (const auto& c : d.candidates)
+            got.insert(c.action + ":" + c.key.substr(root.size() + 1) + ":" + c.value);
+        return got;
+    };
+
+    // B is missing from the read, and it may be one of the unnamed children. The status says
+    // Complete on purpose: the guard is where removals are derived, not only in the shell.
+    auto now = complete({{a, {{"v", vread(P::kRegDword, dword(1))}}}});
+    now.skipped_overflow = 3;
+    const auto held = diff_registry_snapshot(base, now, root, "reconcile", win, 20);
+    CHECK(held.candidates.empty()); // no removed row and no key_removed row
+    CHECK(held.baseline.keys.contains(b));
+
+    now.skipped_overflow = 0; // the same read without unnamed children proves B is gone
+    CHECK(actions(diff_registry_snapshot(base, now, root, "reconcile", win, 20)) ==
+          std::set<std::string>{"removed:B:v", "key_removed:B:"});
+}
+
+TEST_CASE("registry diff: a legacy single-U+FFFD name is replaced on a Complete read and only added beside on a Capped one",
+          "[echo][registry][pure]") {
+    namespace P = yuzu::profiles;
+    const std::string root = "HKLM\\SOFTWARE\\r";
+    const RegistryWindow win{10, 20};
+    const std::string key = root + "\\A";
+    // What the lossy conversion stored for a lone surrogate, against what the encoder writes now.
+    const std::string legacy = "\xEF\xBF\xBD";
+    const std::string lone = registry_name_utf8(std::u16string{char16_t(0xD800)});
+    REQUIRE(lone == "\xEF\xBF\xBD" "D800");
+    const auto base_read = complete({{key, {{legacy, vread(P::kRegDword, dword(1))}}}});
+    const auto base = diff_registry_snapshot({}, base_read, root, "reconcile", win, 20, /*suppress=*/true).baseline;
+    auto now = complete({{key, {{lone, vread(P::kRegDword, dword(1))}}}});
+
+    std::set<std::string> got;
+    for (const auto& c : diff_registry_snapshot(base, now, root, "reconcile", win, 20).candidates)
+        got.insert(c.action + ":" + c.value);
+    CHECK(got == std::set<std::string>{"removed:" + legacy, "added:" + lone});
+
+    now.status = RegistryReadStatus::Capped; // a root that stays partial: only adds appear
+    const auto partial = diff_registry_snapshot(base, now, root, "reconcile", win, 20);
+    got.clear();
+    for (const auto& c : partial.candidates)
+        got.insert(c.action + ":" + c.value);
+    CHECK(got == std::set<std::string>{"added:" + lone});
+    CHECK(partial.baseline.keys.at(key).contains(legacy)); // the old stored form lingers
 }
 
 TEST_CASE("registry read: a name already present in the key marks the read partial and keeps the first",
@@ -653,6 +714,47 @@ TEST_CASE("attribute_candidate: correlation on value name, type, size and window
         CHECK(attribute_candidate(kr, {ev(150, 9, RegistryEtwOp::DeleteKey, "", 0, 0, "x.exe"),
                                        ev(150, 9, RegistryEtwOp::DeleteValue, "", 0, 0, "x.exe")})
                  .kind == AttributionKind::None);
+    }
+}
+
+TEST_CASE("attribute_candidate: the ETW name and the snapshot name share one identity",
+          "[echo][registry][pure]") {
+    // The Windows shell builds both sides through registry_name_utf8: the reader stores a name
+    // through name_identity and the ETW callback hands the event's ValueName through the same
+    // function before value_name_key, so a candidate and the event that wrote it compare equal.
+    const std::string fffd = registry_name_utf8(u"\uFFFD");
+    const std::string lone = registry_name_utf8(std::u16string{char16_t(0xD800)});
+    const std::string fffd_d800 = registry_name_utf8(u"\uFFFD" u"D800");
+    REQUIRE(lone != fffd_d800);
+
+    SECTION("a name holding a literal U+FFFD is correlated to its writer") {
+        const auto a = attribute_candidate(cand("changed", fffd, 4, 4, 100, 200),
+                                           {ev(150, 31, RegistryEtwOp::Set, fffd, 4, 4, "w.exe")});
+        CHECK(a.kind == AttributionKind::Corr);
+        CHECK(a.pid == 31);
+        CHECK(a.image == "w.exe");
+    }
+    SECTION("a lone surrogate and a literal U+FFFD followed by D800 each name their own writer") {
+        // Same type, size and window; written by two processes. Neither is Ambiguous or swapped.
+        const std::vector<RegistryEtwEvent> events{
+           ev(150, 11, RegistryEtwOp::Set, lone, 4, 4, "a.exe"),
+           ev(160, 22, RegistryEtwOp::Set, fffd_d800, 4, 4, "b.exe")};
+        const auto a = attribute_candidate(cand("changed", lone, 4, 4, 100, 200), events);
+        CHECK(a.kind == AttributionKind::Corr);
+        CHECK(a.pid == 11);
+        CHECK(a.image == "a.exe");
+        const auto b = attribute_candidate(cand("changed", fffd_d800, 4, 4, 100, 200), events);
+        CHECK(b.kind == AttributionKind::Corr);
+        CHECK(b.pid == 22);
+        CHECK(b.image == "b.exe");
+    }
+    SECTION("an ASCII name is unchanged") {
+        const std::string start = registry_name_utf8(u"Start");
+        CHECK(start == "Start");
+        CHECK(value_name_key(start) == value_name_key("Start"));
+        CHECK(attribute_candidate(cand("changed", start, 4, 4, 100, 200),
+                                  {ev(150, 1, RegistryEtwOp::Set, registry_name_utf8(u"START"))})
+                 .kind == AttributionKind::Corr); // the ASCII fold still applies
     }
 }
 
@@ -2903,6 +3005,95 @@ TEST_CASE("registry read: more than 32 denied children are counted and the gap r
     CHECK(read_cursor(t.db).roots.at(kRoot).skipped.size() == kSkippedCap); // the stored set stays bounded
 }
 
+TEST_CASE("registry source: a larger count of unnamed denied children writes one gap row; a steady, lower or cleared count writes none",
+          "[echo][registry][lifecycle]") {
+    auto t = make_db();
+    Fake f;
+    auto src = make_registry_cursor_source(scope1(), f.reader());
+    std::vector<std::string> named;
+    for (std::size_t i = 0; i < kSkippedCap; ++i)
+        named.push_back(std::format("{}\\D{:03}", kRoot, i));
+    auto gap_count = [&] {
+        return std::stoll(ql("SELECT COUNT(*) FROM registry_live WHERE record_key LIKE 'gap:unreadable:%'")
+                             .rows.at(0).at(0));
+    };
+    auto last_gap = [&] {
+        return ql("SELECT detail FROM registry_live WHERE record_key LIKE 'gap:unreadable:%' "
+                  "ORDER BY id DESC LIMIT 1").rows.at(0).at(0);
+    };
+    auto stored = [&] { return read_cursor(t.db).roots.at(kRoot).skipped_overflow; };
+    // One tick over an unchanged root: the same 32 named children, `overflow` more beyond them.
+    auto next_tick = [&](RegistryReadStatus status, std::size_t overflow) {
+        auto r = svc(1);
+        r.status = status;
+        r.skipped = named;
+        r.skipped_overflow = overflow;
+        f.reads[kRoot] = std::move(r);
+        f.clock += 100 * SEC;
+        f.dirty->mark(kRoot, f.clock);
+        return tick(t.db, *src);
+    };
+    using S = RegistryReadStatus;
+
+    // 32 denied children and no more: all named, a Complete read, one gap row.
+    CHECK(next_tick(S::Complete, 0).events_emitted == 1);
+    CHECK(gap_count() == 1);
+    CHECK(stored() == 0);
+
+    // The 33rd: every named child is one the stored set already holds, only the count is new.
+    CHECK(next_tick(S::Capped, 1).events_emitted == 1);
+    CHECK(gap_count() == 2);
+    CHECK_THAT(last_gap(), ContainsSubstring("(33 child key(s) denied read access"));
+    CHECK(last_gap().ends_with("; and 1 more not named"));
+    CHECK(stored() == 1);
+
+    CHECK(next_tick(S::Capped, 1).events_emitted == 0); // steady: nothing new
+    CHECK(gap_count() == 2);
+
+    CHECK(next_tick(S::Capped, 2).events_emitted == 1); // the 34th
+    CHECK(gap_count() == 3);
+    CHECK(last_gap().ends_with("; and 2 more not named"));
+    CHECK(stored() == 2);
+
+    // A Capped read may add but never shrinks, like the named set: a lower count writes nothing
+    // and is not remembered, so the same 2 again is not a gain.
+    CHECK(next_tick(S::Capped, 1).events_emitted == 0);
+    CHECK(stored() == 2);
+    CHECK(next_tick(S::Capped, 2).events_emitted == 0);
+    CHECK(gap_count() == 3);
+
+    // A Complete read clears the count (nothing to report), and a count that comes back is new.
+    CHECK(next_tick(S::Complete, 0).events_emitted == 0);
+    CHECK(stored() == 0);
+    CHECK(gap_count() == 3);
+    CHECK(next_tick(S::Capped, 1).events_emitted == 1);
+    CHECK(gap_count() == 4);
+}
+
+TEST_CASE("registry cursor: the unnamed skipped count is written only when set and decodes to 0 when absent",
+          "[echo][registry][pure]") {
+    RegistryCursor cur;
+    cur.present = true;
+    cur.tick = 3;
+    cur.roots["HKLM\\R"] = RegistryRootState{true, 100, 110, 120, "capped", false, {"HKLM\\R\\D"}};
+    const auto plain = encode_registry_cursor(cur);
+    // Unset: the row has no such field, so it is byte-identical to one an earlier build wrote.
+    CHECK_FALSE(nlohmann::json::parse(plain).at("roots").at("HKLM\\R").contains("skipped_overflow"));
+    const auto absent = decode_registry_cursor(plain);
+    CHECK_FALSE(absent.malformed);
+    CHECK(absent.roots.at("HKLM\\R").skipped_overflow == 0);
+    CHECK(absent.roots.at("HKLM\\R") == cur.roots.at("HKLM\\R"));
+
+    cur.roots["HKLM\\R"].skipped_overflow = 7;
+    const auto set = encode_registry_cursor(cur);
+    CHECK(nlohmann::json::parse(set).at("roots").at("HKLM\\R").at("skipped_overflow").get<std::size_t>() == 7);
+    const auto back = decode_registry_cursor(set);
+    CHECK_FALSE(back.malformed);
+    CHECK(back.roots.at("HKLM\\R").skipped_overflow == 7);
+    CHECK(back.roots.at("HKLM\\R") == cur.roots.at("HKLM\\R"));
+    CHECK(encode_registry_cursor(back) == set);
+}
+
 TEST_CASE("registry read: a read with uncounted denied children derives adds for later siblings and no removals",
           "[echo][registry][lifecycle]") {
     auto t = make_db();
@@ -2944,7 +3135,7 @@ TEST_CASE("registry names: a NUL is escaped in the gap detail only", "[echo][reg
     tick(t.db, *src);
     const std::string detail = ql("SELECT detail FROM registry_live WHERE record_key LIKE 'gap:unreadable:%' "
                                   "ORDER BY id DESC LIMIT 1").rows.at(0).at(0);
-    CHECK_THAT(detail, ContainsSubstring("\\a\\0b"));
+    CHECK_THAT(detail, ContainsSubstring("\\a<NUL>b"));
     CHECK(detail.find('\0') == std::string::npos);
     CHECK(read_cursor(t.db).roots.at(kRoot).skipped ==
           std::vector<std::string>{kRoot + std::string{'\\', 'a', '\0', 'b'}}); // identity unchanged

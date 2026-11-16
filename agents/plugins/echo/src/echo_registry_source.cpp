@@ -37,8 +37,10 @@ std::string baseline_collector(const std::string& root) { return "registry:" + r
 // are key names a local user chose under their own hive, so each goes through log_key_token
 // (control bytes and line separators folded) before it lands in the stored row.
 // `overflow` counts the children past kSkippedCap that are skipped but cannot be named. A child
-// whose name holds U+0000 (never opened) shows the NUL as `\0`: log_key_token would fold it to
-// an underscore, which reads as a different name.
+// whose name holds U+0000 (never opened) shows the NUL as `<NUL>`: log_key_token would fold it to
+// an underscore, which reads as a different name, and a backslash escape would read as a path
+// separator (`a\0b` looks like key `0b` under `a`). The row text is lossy by design; the exact
+// identity stays in the cursor.
 std::string denied_children_detail(const std::string& root, const std::vector<std::string>& denied,
                                    std::size_t overflow = 0) {
     constexpr std::size_t kShown = 3;
@@ -50,7 +52,7 @@ std::string denied_children_detail(const std::string& root, const std::vector<st
         std::string name;
         for (const char c : denied[i]) {
             if (c == '\0')
-                name += "\\0";
+                name += "<NUL>";
             else
                 name += c;
         }
@@ -380,9 +382,9 @@ CursorCollectResult RegistryCursorSource::collect(EchoDatabase& db,
 
             // A root that could not be read, or child keys that deny access, are a blind
             // spot the operator must be able to see: one gap row when the root becomes
-            // unreadable or a child key is newly denied, none while it holds steady, shrinks
-            // or clears. The cursor commits with the row, so a replay cannot lose or
-            // duplicate it.
+            // unreadable, a child key is newly denied or the count of denied children past
+            // kSkippedCap grows, none while it holds steady, shrinks or clears. The cursor
+            // commits with the row, so a replay cannot lose or duplicate it.
             if (rd.status == RegistryReadStatus::Unreadable) {
                 if (st.status != "unreadable") {
                     std::string detail = "gap:unreadable:" + root +
@@ -403,7 +405,9 @@ CursorCollectResult RegistryCursorSource::collect(EchoDatabase& db,
                 // and report an unchanged set again. (The diff above was given the read's own
                 // list: its Capped handling already keeps the unvisited keys.)
                 std::set<std::string> known(st.skipped.begin(), st.skipped.end());
-                bool gained = false;
+                // A larger count of children skipped past kSkippedCap is a gain too: the blind
+                // area grew although every named child is one the stored set already holds.
+                bool gained = rd.skipped_overflow > st.skipped_overflow;
                 for (const auto& sk : rd.skipped)
                     if (known.insert(sk).second)
                         gained = true;
@@ -417,14 +421,18 @@ CursorCollectResult RegistryCursorSource::collect(EchoDatabase& db,
                     st.skipped.assign(known.begin(), known.end());
                     if (st.skipped.size() > kSkippedCap)
                         st.skipped.resize(kSkippedCap);
+                    // The count is persisted with the set (the cursor commits with the row, so a
+                    // replay cannot duplicate it) and, like the set, a Capped read never lowers it.
+                    st.skipped_overflow = std::max(st.skipped_overflow, rd.skipped_overflow);
                 } else {
                     st.skipped = std::move(rd.skipped);
+                    st.skipped_overflow = rd.skipped_overflow; // 0: an overflow read is Capped
                 }
                 if (gained)
-                    rows.push_back(registry_gap_row("unreadable",
-                                                    root + ":" + std::to_string(read_end),
-                                                    denied_children_detail(root, st.skipped, rd.skipped_overflow), now,
-                                                    snapshot_id));
+                    rows.push_back(registry_gap_row(
+                       "unreadable", root + ":" + std::to_string(read_end),
+                       denied_children_detail(root, st.skipped, st.skipped_overflow), now,
+                       snapshot_id));
             }
 
             st.read_start = read_start;
@@ -758,6 +766,7 @@ std::unique_ptr<RegistryCursorSource> make_registry_cursor_source(RegistryScope 
 #include "echo_win_process_name.hpp" // process_basename_for_pid
 
 #include <atomic>
+#include <cwchar> // wcsnlen: the ETW ValueName is cut at its first NUL
 #include <thread>
 #include <unordered_map>
 
@@ -811,6 +820,22 @@ bool prop_u32(EVENT_RECORD* rec, const wchar_t* name, std::uint32_t& out) {
     return true;
 }
 
+// A registry name as the identity string: the wide characters go through registry_name_utf8
+// (injective, lone surrogates and all), never the lossy from_wide. The ONE identity: the reader
+// stores names through it and the ETW callback hashes the same string, so a snapshot candidate
+// and the event that wrote it compare equal.
+//
+// The reinterpret_cast below rests on this: the translation unit is Windows-only and built with
+// MSVC, where wchar_t and char16_t are both unsigned 16-bit UTF-16 code units of equal size and
+// alignment (asserted below) and the compiler performs no type-based alias analysis. The view is
+// read-only and does not outlive this call: the caller owns the n code units at `p` for its
+// duration.
+std::string name_identity(const wchar_t* p, std::size_t n) {
+    static_assert(sizeof(wchar_t) == sizeof(char16_t));
+    static_assert(alignof(wchar_t) == alignof(char16_t));
+    return registry_name_utf8(std::u16string_view(reinterpret_cast<const char16_t*>(p), n));
+}
+
 // ValueName; the default value ("") is a legitimate 2-byte (NUL only) property.
 bool prop_string(EVENT_RECORD* rec, const wchar_t* name, std::string& out) {
     PROPERTY_DATA_DESCRIPTOR pdd{};
@@ -831,7 +856,9 @@ bool prop_string(EVENT_RECORD* rec, const wchar_t* name, std::string& out) {
     if (TdhGetProperty(rec, 0, nullptr, 1, &pdd, size, reinterpret_cast<PBYTE>(buf.data())) !=
         ERROR_SUCCESS)
         return false;
-    out = yuzu::win::from_wide(buf.data());
+    // The ETW ValueName is NUL-terminated, so the identity is taken up to the first NUL: a name
+    // holding U+0000 arrives cut here (its snapshot name keeps the NUL) and is not attributed.
+    out = name_identity(buf.data(), wcsnlen(buf.data(), size / sizeof(wchar_t)));
     return true;
 }
 
@@ -1307,13 +1334,6 @@ bool admit_visit(ReadCtx& ctx) {
     return ctx.budget.admit_key_by(filetime_now(), ctx.deadline);
 }
 
-// A registry name as the identity string: the wide characters go through registry_name_utf8
-// (injective, lone surrogates and all), never the lossy from_wide.
-std::string name_identity(const wchar_t* p, std::size_t n) {
-    static_assert(sizeof(wchar_t) == sizeof(char16_t));
-    return registry_name_utf8(std::u16string_view(reinterpret_cast<const char16_t*>(p), n));
-}
-
 void read_key(ReadCtx& ctx, HKEY key, const std::string& full, std::size_t depth) {
     if (ctx.capped || ctx.unreadable)
         return;
@@ -1550,6 +1570,8 @@ std::vector<std::string> enumerate_hku() {
         const LONG rc =
             RegEnumKeyExW(HKEY_USERS, i, buf, &len, nullptr, nullptr, nullptr, nullptr);
         if (rc == ERROR_SUCCESS) {
+            // Deliberately the lossy from_wide: these are loaded-user SID strings (ASCII, so no
+            // loss), root names for scope_.roots_for, not value or key identities.
             name = yuzu::win::from_wide(buf, static_cast<int>(len));
             return ListStep::Item;
         }

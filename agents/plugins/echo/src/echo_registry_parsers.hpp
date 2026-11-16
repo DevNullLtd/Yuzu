@@ -640,17 +640,18 @@ struct RegistryValueRead {
 /// Every visited key is present, with an empty map when it holds no values, so a
 /// vanished key is distinguishable from a key that never had values.
 ///
-/// `skipped` names the child keys the reader was denied access to (full paths, at
-/// most kSkippedCap; one more makes the read Capped). They are absent from `keys`,
-/// and the diff keeps whatever the baseline holds at or under them rather than
-/// reading their absence as a deletion. A denied child therefore never blinds the
-/// rest of its root. `Unreadable` means the root, or any key beneath it other than an
-/// access-denied child, could not be read.
+/// `skipped` names the child keys the reader did not read (full paths, at most kSkippedCap):
+/// those it was denied access to, and those whose name holds U+0000, which are never opened. They
+/// are absent from `keys`, and the diff keeps whatever the baseline holds at or under them rather
+/// than reading their absence as a deletion. A skipped child therefore never blinds the rest of
+/// its root. `Unreadable` means the root, or any key beneath it other than an access-denied
+/// child, could not be read.
 ///
-/// `skipped_overflow` counts the child keys skipped past kSkippedCap: the walk reads on (every
-/// later sibling is read, so adds and changes land) but cannot name them. A read that has any
-/// ends Capped, so no removal is derived (an unnamed child's baseline cannot be protected by
-/// name). Key and value maps are case-exact: two names differing only in case are two names.
+/// `skipped_overflow` counts the children skipped past kSkippedCap: the walk reads on (a 33rd
+/// child is counted, not a stop; every later sibling is read, so adds and changes land) but
+/// cannot name them. A read that has any ends Capped and derives no removal (an unnamed child's
+/// baseline cannot be protected by name). Key and value maps are case-exact: two names
+/// differing only in case are two names.
 struct SubtreeRead {
     RegistryReadStatus status{RegistryReadStatus::Unreadable};
     std::map<std::string, std::map<std::string, RegistryValueRead>> keys;
@@ -946,9 +947,9 @@ struct DiffResult {
 }
 
 /// Diffs a read against a root's baseline. Removals are derived ONLY from a
-/// Complete or Absent read (a partial read cannot prove anything is gone) and
-/// never for a key at or under one of `read.skipped`, whose baseline is kept as
-/// it was; Unreadable changes nothing; Capped adds/updates what it visited and
+/// Complete or Absent read with no unnamed skipped child (a partial read cannot prove
+/// anything is gone) and never for a key at or under one of `read.skipped`, whose baseline
+/// is kept as it was; Unreadable changes nothing; Capped adds/updates what it visited and
 /// retains the rest. `suppress` returns the new baseline with no candidates (the
 /// first read of a root). Every candidate carries its `root` and `window`.
 [[nodiscard]] inline DiffResult diff_registry_snapshot(const RegistryBaseline& base,
@@ -963,8 +964,11 @@ struct DiffResult {
         r.baseline = base;
         return r;
     }
-    const bool authoritative =
-       read.status == RegistryReadStatus::Complete || read.status == RegistryReadStatus::Absent;
+    // An unnamed skipped child (skipped_overflow) protects nothing by name, so such a read proves
+    // no deletion whatever its status says: the guard sits here, where removals are derived.
+    const bool authoritative = (read.status == RegistryReadStatus::Complete ||
+                                read.status == RegistryReadStatus::Absent) &&
+                               read.skipped_overflow == 0;
     r.baseline = authoritative ? RegistryBaseline{} : base;
 
     auto make = [&](const std::string& key, const std::string& value, const char* action) {
@@ -1383,6 +1387,12 @@ struct RegistryRootState {
     // deferred keeps status "unreadable" (one gap row per transition) and is still retried
     // next tick.
     bool deferred{false};
+    // The children the last Capped read skipped past kSkippedCap and could not name
+    // (SubtreeRead::skipped_overflow). An increase is a gain, like a new name in `skipped`, so the
+    // gap row says the blind area grew. A Capped read raises it and never lowers it; any other
+    // read sets it (0 by construction). Optional on decode and written only when set, so every
+    // existing cursor row stays byte-identical.
+    std::size_t skipped_overflow{0};
     bool operator==(const RegistryRootState&) const = default;
 };
 
@@ -1524,6 +1534,7 @@ inline RegistryCandidate candidate_from_json(const nlohmann::json& j) {
             st.armed = r.at("armed").get<bool>();
             st.skipped = r.value("skipped", std::vector<std::string>{});
             st.deferred = r.value("deferred", false);
+            st.skipped_overflow = r.value("skipped_overflow", std::size_t{0});
             cur.roots.emplace(name, std::move(st));
         }
         // Optional: a cursor written before held/loss existed has neither, and holds no
@@ -1565,6 +1576,8 @@ inline RegistryCandidate candidate_from_json(const nlohmann::json& j) {
                        {"skipped", st.skipped}};
         if (st.deferred)
             roots[name]["deferred"] = true; // optional on decode: only written when set
+        if (st.skipped_overflow > 0)
+            roots[name]["skipped_overflow"] = st.skipped_overflow; // likewise
     }
     j["roots"] = std::move(roots);
     auto held = nlohmann::json::array();
