@@ -153,7 +153,8 @@ int echo_query_authorizer(void* /*ctx*/, int action, const char* arg1, const cha
             if (is_queryable_table(arg1) || is_fold_view(arg1))
                 return SQLITE_OK;
             // The roll-up views read echo_dict and their `_r` tables; operator SQL may
-            // reach those ONLY through a roll-up view, never by name. The inner-most
+            // reach those only through a roll-up view, or a column-less read of a row
+            // table (below), never by name. The inner-most
             // view argument names a SQL context, not a persisted view: a CTE of that
             // name is reported the same way. This rule is sound ONLY because
             // validate_and_translate_sql rejects WITH, so no CTE can shadow a view
