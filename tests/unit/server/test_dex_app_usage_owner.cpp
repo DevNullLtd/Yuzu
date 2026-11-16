@@ -205,6 +205,13 @@ TEST_CASE("DexAppUsageOwner splits devices over cells and sums back to the fleet
     CHECK(devices == fleet->cells[0].devices);
     CHECK(launches == fleet->cells[0].launches);
     CHECK(seconds == fleet->cells[0].run_seconds);
+    // Each cell holds its own devices, not just a share of the sum: a swap would show here.
+    REQUIRE(find_cell(*split, 0, 0) != nullptr);
+    REQUIRE(find_cell(*split, 0, 1) != nullptr);
+    CHECK(find_cell(*split, 0, 0)->devices == 1);
+    CHECK(find_cell(*split, 0, 0)->run_seconds == 3600);
+    CHECK(find_cell(*split, 0, 1)->devices == 1);
+    CHECK(find_cell(*split, 0, 1)->run_seconds == 7200);
     CHECK(find_cell(*split, 0, 2)->devices == 2);
     CHECK(find_cell(*split, 0, 2)->run_seconds == 80);
 }
@@ -240,7 +247,7 @@ TEST_CASE("DexAppUsageOwner exposes only events on devices that report usage for
 
     seed_usage(usage, "d1", {{"alpha.exe", 5, 3600}});
     seed_usage(usage, "d2", {{"alpha.exe", 7, 7200}});
-    seed_usage(usage, "d4", {{"other.exe", 1, 10}}); // reports usage, but for another application
+    seed_usage(usage, "d4", {{"beta.exe", 1, 10}}); // reports usage, but for another application
     seed_usage(usage, "d5", {{"alpha.exe", 1, 60}});
     age_state(db.dsn(), "d5", "3 days"); // stale
 
@@ -254,21 +261,26 @@ TEST_CASE("DexAppUsageOwner exposes only events on devices that report usage for
     ev("d1", "Alpha.exe", "process.hung", in);    // counted
     ev("d2", "Alpha.exe", "process.crashed", in); // counted
     ev("d3", "Alpha.exe", "process.crashed", in); // d3 never reported usage
-    ev("d4", "Alpha.exe", "process.crashed", in); // d4's usage is for another application
+    ev("d4", "Alpha.exe", "process.crashed", in); // d4 reports usage, but for beta.exe: not for Alpha.exe
     ev("d5", "Alpha.exe", "process.crashed", in); // d5 is stale
-    ev("d1", "Beta.exe", "process.crashed", in);  // a subject that was not asked about
+    ev("d4", "beta.exe", "process.hung", in);     // counted on subject 1: d4 reports beta.exe usage
+    ev("d1", "gamma.exe", "process.crashed", in); // a subject that was not asked about
     ev("d1", "Alpha.exe", "process.started", in); // another observation type
     ev("d2", "Alpha.exe", "process.crashed", now - 8 * 86400); // before the window
 
     DexAppUsageOwner owner{pool};
-    const auto r =
-        owner.read(make_query(now, {"d1", "d2", "d3", "d4", "d5"}, {"Alpha.exe"}));
+    const auto r = owner.read(
+        make_query(now, {"d1", "d2", "d3", "d4", "d5"}, {"Alpha.exe", "beta.exe"}));
     REQUIRE(r.has_value());
     const auto* e = find_event(*r, 0);
     REQUIRE(e != nullptr);
-    CHECK(e->crashes == 2);
+    CHECK(e->crashes == 2); // d4's Alpha.exe crash is left out by the subject match
     CHECK(e->hangs == 1);
-    CHECK(r->events.size() == 1);
+    const auto* e1 = find_event(*r, 1);
+    REQUIRE(e1 != nullptr);
+    CHECK(e1->crashes == 0);
+    CHECK(e1->hangs == 1);
+    CHECK(r->events.size() == 2);
 }
 
 TEST_CASE("DexAppUsageOwner never counts an event at or after the window end", "[pg][dex_usage]") {
@@ -286,14 +298,30 @@ TEST_CASE("DexAppUsageOwner never counts an event at or after the window end", "
     seed_obs(gss, "edge", "d1", "alpha.exe", "process.crashed", now);     // the exclusive end: not
     seed_obs(gss, "future", "d1", "alpha.exe", "process.hung", now + 3600);
     seed_obs(gss, "since", "d1", "alpha.exe", "process.hung", now - 7 * 86400); // inclusive start
+    seed_obs(gss, "old", "d1", "alpha.exe", "process.crashed", now - 30 * 86400); // before the window
 
     DexAppUsageOwner owner{pool};
-    const auto r = owner.read(make_query(now, {"d1"}, {"alpha.exe"}));
+    auto q = make_query(now, {"d1"}, {"alpha.exe"});
+    const auto r = owner.read(q);
     REQUIRE(r.has_value());
     const auto* e = find_event(*r, 0);
     REQUIRE(e != nullptr);
     CHECK(e->crashes == 1);
     CHECK(e->hangs == 1);
+
+    // Window `all`: no lower bound, so the 30-day-old crash counts. The event at the exclusive
+    // end and the future one stay out, and the usage figure is the same.
+    q.since_iso.clear();
+    const auto all = owner.read(q);
+    REQUIRE(all.has_value());
+    const auto* ea = find_event(*all, 0);
+    REQUIRE(ea != nullptr);
+    CHECK(ea->crashes == 2);
+    CHECK(ea->hangs == 1);
+    REQUIRE(r->cells.size() == 1);
+    REQUIRE(all->cells.size() == 1);
+    CHECK(all->cells[0].devices == r->cells[0].devices);
+    CHECK(all->cells[0].run_seconds == 3600);
 }
 
 TEST_CASE("DexAppUsageOwner leaves a stale device out of every figure", "[pg][dex_usage]") {

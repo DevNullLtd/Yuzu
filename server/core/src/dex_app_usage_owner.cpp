@@ -29,19 +29,33 @@ constexpr const char* kStatementTimeout = "10s";
 //   1 = event counts:  c1 subject, c2 crashes, c3 hangs
 //   2 = coverage:      c1 fresh devices, c2 stale devices
 //
-// pop: the asked-about devices with their cell and platform. st: those with a
-// usage_state row, `fresh` against the server receipt time. m: the match keys.
+// pop: the asked-about devices with their cell and platform. Agent ids must be
+// unique: a repeated id repeats its rows in every sum and in the coverage counts
+// (no DISTINCT here, so this population stays the same list the Apps read took
+// at face value). st: those with a usage_state row, `fresh` against the server
+// receipt time. m: the match keys.
 // mu: usage rows of FRESH devices that match a key (an exact key matches any
 // device; a trunc key only a Linux one), with the agent-reported values clamped.
+// agent_last_used is keyed (agent_id, exe_key) and a subject's exact key never
+// equals its trunc key (over 15 bytes against 15), so one stored row joins at
+// most one key of a subject: a device matching through both keys has two
+// different stored rows, each summed once (the device is counted once by
+// COUNT(DISTINCT agent_id)).
 // ev: crash and hang observations of the raw subject, cut at BOTH ends (the same
 // as dex_app_version_failures_owner.cpp), kept only when the same device freshly
 // reports usage for the same subject (an EXISTS over mu), so the events, the
 // usage totals and the reporting count are one population by construction.
+// Crashes and hangs are RAW counts, as in the Apps rate per 1,000 devices; the
+// per-device cap applies to the Apps stability score only. Events clustered on one
+// crash-looping device make the interval falsely narrow (the consumer duty at
+// dex_stats.hpp).
 // ponytail: no exe_key index on agent_last_used, so the usage side is a filtered
 // scan bounded by the 10 s statement timeout; add an index (a migration) only when
-// a measured fleet nears that bound. The result is bounded by the caller's
-// subject and cell counts (one row per application and cell, one per application,
-// one coverage row).
+// a measured fleet nears that bound. Past the bound every request times out, so the
+// model reads usage_unavailable on every request until the index exists; the fleet
+// size at which that happens has not been measured. The result is bounded by the
+// caller's subject and cell counts (one row per application and cell, one per
+// application, one coverage row).
 const std::string& read_sql() {
     static const std::string sql =
         "WITH pop AS ("

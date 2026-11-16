@@ -20,6 +20,12 @@
 /// Events are cut at BOTH ends (`since_iso` inclusive, `until_iso` exclusive), so
 /// a future-dated observation never enters a numerator.
 ///
+/// No authorization and no disclosure floor are applied here. The device list,
+/// cells, keys and time cuts are taken as given from the caller, and agent ids
+/// must be unique (a repeated id repeats its rows in every sum and in the
+/// coverage counts). Admitting the caller and the device list is the surface's
+/// duty before it builds the query.
+///
 /// The owner returns aggregates per (application, cell) and per application,
 /// never an agent id. Typed failure: `read` returns `std::nullopt` when no
 /// connection is available within the bounded acquire, an index in the query is

@@ -115,6 +115,41 @@ TEST_CASE("usage match plan: exact key is the lowercased subject, trunc only abo
     CHECK_FALSE(plan[3].trunc);
 }
 
+// A 15-byte cut inside a multi-byte character would be an invalid UTF-8 key, and one
+// invalid key fails the owner's whole statement. The bytes are \x escapes (no literal
+// non-ASCII in the source); a literal is split after an escape only when a hex digit
+// would follow, and none does here.
+TEST_CASE("usage match plan: a 15-byte cut inside a character emits the exact key only",
+          "[dex][usage_model]") {
+    // 14 ASCII bytes, then a 2-byte character on bytes 14-15: byte 15 is a continuation byte.
+    const auto two = dex_usage_match_plan({"abcdefghijklmn\xC3\xA9.exe"});
+    REQUIRE(two.size() == 1);
+    CHECK_FALSE(two[0].trunc);
+    CHECK(two[0].key == "abcdefghijklmn\xC3\xA9.exe");
+
+    // 13 ASCII bytes, then a 4-byte character on bytes 13-16 lying over byte 15.
+    const auto four = dex_usage_match_plan({"abcdefghijklm\xF0\x9F\x98\x80.exe"});
+    REQUIRE(four.size() == 1);
+    CHECK_FALSE(four[0].trunc);
+}
+
+TEST_CASE("usage match plan: a character ending exactly at the cut keeps its trunc key",
+          "[dex][usage_model]") {
+    // 13 ASCII bytes, then a 2-byte character on bytes 13-14: the cut falls after it.
+    const auto ends = dex_usage_match_plan({"abcdefghijklm\xC3\xA9.exe"});
+    REQUIRE(ends.size() == 2);
+    CHECK_FALSE(ends[0].trunc);
+    CHECK(ends[1].trunc);
+    CHECK(ends[1].key == "abcdefghijklm\xC3\xA9");
+    CHECK(ends[1].key.size() == kDexUsageTruncBytes);
+
+    // 15 ASCII bytes, then a character starting at byte 15: the next byte is a lead byte.
+    const auto starts = dex_usage_match_plan({"abcdefghijklmno\xC3\xA9.exe"});
+    REQUIRE(starts.size() == 2);
+    CHECK(starts[1].trunc);
+    CHECK(starts[1].key == "abcdefghijklmno");
+}
+
 TEST_CASE("usage ambiguity: a Linux prefix name reaching two longer images marks both",
           "[dex][usage_model]") {
     const auto plan = dex_usage_match_plan({"sharedprefix123-a.exe", "sharedprefix123-b.exe"});
@@ -322,6 +357,74 @@ TEST_CASE("usage disclose at floor 10: a total below the floor publishes the dev
     CHECK_FALSE(d.totals.has_value());
 }
 
+// Every comparison against the floor is inclusive: a count equal to the floor is enough.
+TEST_CASE("usage disclose at floor 10: a count equal to the floor is enough", "[dex][usage_model]") {
+    {
+        // A cell of exactly 10 publishes beside a cell of 12; nothing merges.
+        const std::vector<DexUsageRawCell> in{raw(DexUsageCellKind::Named, "a", 12),
+                                              raw(DexUsageCellKind::Named, "b", 10)};
+        const auto d = dex_usage_disclose(in, 10);
+        REQUIRE(d.cells.size() == 2);
+        CHECK(d.cells[0].label == "a");
+        CHECK(d.cells[1].label == "b");
+        CHECK(d.cells[1].devices == 10);
+        for (const auto& c : d.cells)
+            CHECK(c.kind == DexUsageCellKind::Named);
+        check_invariants(d, in, 10);
+    }
+    {
+        // A table total of exactly 10 publishes its totals, as one other of 10.
+        const std::vector<DexUsageRawCell> in{raw(DexUsageCellKind::Named, "a", 6),
+                                              raw(DexUsageCellKind::Named, "b", 4)};
+        const auto d = dex_usage_disclose(in, 10);
+        REQUIRE(d.totals.has_value());
+        REQUIRE(d.cells.size() == 1);
+        CHECK(d.cells[0].kind == DexUsageCellKind::Other);
+        CHECK(d.cells[0].devices == 10);
+        check_invariants(d, in, 10);
+    }
+    {
+        // An other of exactly 10 absorbs nothing from the published cell.
+        const std::vector<DexUsageRawCell> in{raw(DexUsageCellKind::Named, "a", 12),
+                                              raw(DexUsageCellKind::Named, "b", 5),
+                                              raw(DexUsageCellKind::Named, "c", 5)};
+        const auto d = dex_usage_disclose(in, 10);
+        REQUIRE(d.cells.size() == 2);
+        CHECK(d.cells[0].label == "a");
+        CHECK(d.cells[0].devices == 12);
+        CHECK(d.cells[1].kind == DexUsageCellKind::Other);
+        CHECK(d.cells[1].devices == 10);
+        check_invariants(d, in, 10);
+    }
+    {
+        // An Other-kind cell of 12 still merges with the sub-floor cell beside it.
+        const std::vector<DexUsageRawCell> in{raw(DexUsageCellKind::Other, "other", 12),
+                                              raw(DexUsageCellKind::Named, "x", 3),
+                                              raw(DexUsageCellKind::Named, "y", 20)};
+        const auto d = dex_usage_disclose(in, 10);
+        REQUIRE(d.cells.size() == 2);
+        CHECK(d.cells[0].label == "y");
+        CHECK(d.cells[0].devices == 20);
+        CHECK(d.cells[1].kind == DexUsageCellKind::Other);
+        CHECK(d.cells[1].devices == 15);
+        check_invariants(d, in, 10);
+    }
+    {
+        // The same rule with the Other-kind cell larger than a published one: it must not stay
+        // a published cell (a second other), it merges into the one other.
+        const std::vector<DexUsageRawCell> in{raw(DexUsageCellKind::Other, "other", 25),
+                                              raw(DexUsageCellKind::Named, "x", 3),
+                                              raw(DexUsageCellKind::Named, "y", 12)};
+        const auto d = dex_usage_disclose(in, 10);
+        REQUIRE(d.cells.size() == 2);
+        CHECK(d.cells[0].label == "y");
+        CHECK(d.cells[0].kind == DexUsageCellKind::Named);
+        CHECK(d.cells[1].kind == DexUsageCellKind::Other);
+        CHECK(d.cells[1].devices == 28);
+        check_invariants(d, in, 10);
+    }
+}
+
 TEST_CASE("usage disclose invariants over a table of mixed cells", "[dex][usage_model]") {
     const std::vector<DexUsageRawCell> in{
         raw(DexUsageCellKind::Named, "m1", 40),        raw(DexUsageCellKind::Named, "m3", 25),
@@ -394,6 +497,10 @@ TEST_CASE("usage exposure: window all and zero run time are withheld", "[dex][us
     CHECK(dex_usage_exposure(1, 0, 3600, 0, 0, kDexStatsConfidence).withheld == "unbounded_window");
     CHECK(dex_usage_exposure(1, 0, 0, 7, 0, kDexStatsConfidence).withheld == "zero_usage");
     CHECK_FALSE(dex_usage_exposure(1, 0, 0, 7, 0, kDexStatsConfidence).rate.has_value());
+    // dex_rate refuses a confidence outside its range: a typed refusal, not a rate or a throw.
+    const auto bad_level = dex_usage_exposure(1, 0, 3600, 7, 0, 2.0);
+    CHECK(bad_level.withheld == "no_statistic");
+    CHECK_FALSE(bad_level.rate.has_value());
 }
 
 TEST_CASE("usage exposure: a window longer than the retention is withheld", "[dex][usage_model]") {
@@ -403,6 +510,10 @@ TEST_CASE("usage exposure: a window longer than the retention is withheld", "[de
     CHECK(dex_usage_exposure(1, 0, 3600, 30, 30, kDexStatsConfidence).rate.has_value());
     CHECK(dex_usage_exposure(1, 0, 3600, 30, 0, kDexStatsConfidence).rate.has_value()); // unbounded
     CHECK(dex_usage_exposure(1, 0, 3600, 7, -1, kDexStatsConfidence).rate.has_value());
+    // Precedence: the retention refusal outranks zero run time.
+    const auto both = dex_usage_exposure(1, 0, 0, 30, 7, kDexStatsConfidence);
+    CHECK(both.withheld == "window_exceeds_retention");
+    CHECK_FALSE(both.rate.has_value());
 }
 
 // ── Assembly ─────────────────────────────────────────────────────────────────
@@ -553,6 +664,14 @@ DexFleet fleet_of() {
     return f;
 }
 
+// A valid request. The retention is required (unset is refused); 0 means unbounded.
+DexUsageRequest request_at(std::int64_t now = kNow, int retention_days = 0) {
+    DexUsageRequest r;
+    r.now_epoch = now;
+    r.observation_retention_days = retention_days;
+    return r;
+}
+
 } // namespace
 
 TEST_CASE("usage builder refuses a bad request with its token and calls no closure",
@@ -562,14 +681,18 @@ TEST_CASE("usage builder refuses a bad request with its token and calls no closu
     const auto fleet = fleet_of();
     const auto ok_apps = apps_of({"alpha.exe"});
 
-    DexUsageRequest zero;
-    zero.now_epoch = 0;
-    auto r = build_dex_apps_usage_model(ok_apps, fleet, zero, src);
+    auto r = build_dex_apps_usage_model(ok_apps, fleet, request_at(0), src);
     REQUIRE_FALSE(r.has_value());
     CHECK(r.error() == "invalid_request");
 
-    DexUsageRequest req;
-    req.now_epoch = kNow;
+    // The retention is required: unset is refused, an explicit 0 (unbounded) is not.
+    DexUsageRequest unset = request_at();
+    unset.observation_retention_days.reset();
+    r = build_dex_apps_usage_model(ok_apps, fleet, unset, src);
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error() == "invalid_request");
+
+    DexUsageRequest req = request_at();
     auto degraded = ok_apps;
     degraded.degraded = true;
     r = build_dex_apps_usage_model(degraded, fleet, req, src);
@@ -596,8 +719,7 @@ TEST_CASE("usage builder refuses a bad request with its token and calls no closu
 TEST_CASE("usage builder: a failed input is unavailable, never an empty model", "[dex][usage_model]") {
     const auto fleet = fleet_of();
     const auto apps = apps_of({"alpha.exe"});
-    DexUsageRequest req;
-    req.now_epoch = kNow;
+    DexUsageRequest req = request_at();
 
     {
         Calls c;
@@ -634,6 +756,26 @@ TEST_CASE("usage builder: a failed input is unavailable, never an empty model", 
         CHECK(r.error() == "usage_unavailable");
     }
     {
+        // An empty membership or tag closure is a failed input too; the usage read never starts.
+        Calls c;
+        DexUsageRequest grp = req;
+        grp.slice = {DexUsageSliceKind::Group, "group-1"};
+        auto no_group = sources_of(c);
+        no_group.group_members = nullptr;
+        auto r = build_dex_apps_usage_model(apps, fleet, grp, no_group);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == "group_unavailable");
+
+        DexUsageRequest tag = req;
+        tag.slice = {DexUsageSliceKind::Tag, "model"};
+        auto no_tag = sources_of(c);
+        no_tag.tag_values = nullptr;
+        r = build_dex_apps_usage_model(apps, fleet, tag, no_tag);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == "tag_unavailable");
+        CHECK(c.read == 0);
+    }
+    {
         // A row outside the Apps rows is a failed read, not a silently dropped row.
         Calls c;
         DexUsageRead bad;
@@ -646,8 +788,7 @@ TEST_CASE("usage builder: a failed input is unavailable, never an empty model", 
 
 TEST_CASE("usage builder: an empty tag key resolves to the default key", "[dex][usage_model]") {
     Calls c;
-    DexUsageRequest req;
-    req.now_epoch = kNow;
+    DexUsageRequest req = request_at();
     req.slice = {DexUsageSliceKind::Tag, ""};
     const auto r = build_dex_apps_usage_model(apps_of({"alpha.exe"}), fleet_of(), req, sources_of(c));
     REQUIRE(r.has_value());
@@ -659,8 +800,7 @@ TEST_CASE("usage builder: an empty tag key resolves to the default key", "[dex][
 
 TEST_CASE("usage builder: the query carries the scope, the cells and one instant", "[dex][usage_model]") {
     Calls c;
-    DexUsageRequest req;
-    req.now_epoch = kNow;
+    DexUsageRequest req = request_at();
     req.slice = {DexUsageSliceKind::Platform, ""};
     const auto r = build_dex_apps_usage_model(apps_of({"Alpha.exe", "sharedprefix123-a.exe"}, "7d", "all"),
                                               fleet_of(), req, sources_of(c));
@@ -704,8 +844,7 @@ TEST_CASE("usage builder: the query carries the scope, the cells and one instant
 
 TEST_CASE("usage builder: a platform scope limits the population", "[dex][usage_model]") {
     Calls c;
-    DexUsageRequest req;
-    req.now_epoch = kNow;
+    DexUsageRequest req = request_at();
     const auto r = build_dex_apps_usage_model(apps_of({"alpha.exe"}, "7d", "windows"), fleet_of(), req,
                                               sources_of(c));
     REQUIRE(r.has_value());
@@ -720,8 +859,7 @@ TEST_CASE("usage builder: an Apps model with no rows still reads once", "[dex][u
     DexUsageRead read;
     read.reporting_devices = 3;
     read.stale_devices = 1;
-    DexUsageRequest req;
-    req.now_epoch = kNow;
+    DexUsageRequest req = request_at();
     const auto r = build_dex_apps_usage_model(apps_of({}), fleet_of(), req, sources_of(c, read));
     REQUIRE(r.has_value());
     CHECK(c.read == 1);
@@ -729,4 +867,55 @@ TEST_CASE("usage builder: an Apps model with no rows still reads once", "[dex][u
     CHECK(r->apps.empty());
     CHECK(r->reporting_devices == 3);
     CHECK(r->stale_devices == 1);
+}
+
+TEST_CASE("usage builder: the request's floor, retention and window reach the model",
+          "[dex][usage_model]") {
+    const auto fleet = fleet_of();
+    const auto apps = apps_of({"alpha.exe"}, "30d");
+    DexUsageRequest req = request_at(kNow, 7); // the store keeps 7 days; the window is 30
+    req.floor = 10;
+
+    Calls c;
+    DexUsageRead twelve;
+    twelve.cells = {cell_row(0, 0, 12, 12, 0, 40, 1'080'000)};
+    const auto r = build_dex_apps_usage_model(apps, fleet, req, sources_of(c, twelve));
+    REQUIRE(r.has_value());
+    CHECK(r->floor == 10);
+    CHECK(r->apps[0].state == DexUsageState::Matched);
+    REQUIRE(r->apps[0].totals.has_value());
+    CHECK(r->apps[0].totals->run_seconds_30d == 1'080'000);
+    CHECK_FALSE(r->apps[0].rate.has_value());
+    CHECK(r->apps[0].rate_withheld == "window_exceeds_retention");
+
+    // The same read with nine devices is below the request's floor, not the shipped one.
+    Calls c9;
+    DexUsageRead nine;
+    nine.cells = {cell_row(0, 0, 9, 9, 0, 30, 810'000)};
+    const auto below = build_dex_apps_usage_model(apps, fleet, req, sources_of(c9, nine));
+    REQUIRE(below.has_value());
+    CHECK(below->apps[0].devices == 9);
+    CHECK_FALSE(below->apps[0].totals.has_value());
+    CHECK(below->apps[0].rate_withheld == "below_floor");
+}
+
+TEST_CASE("usage builder: a floor below one is applied as one and reported as one",
+          "[dex][usage_model]") {
+    const auto fleet = fleet_of();
+    const auto apps = apps_of({"alpha.exe"});
+    DexUsageRead one;
+    one.cells = {cell_row(0, 0, 1, 1, 0, 2, 3600)};
+    for (const std::int64_t asked : {std::int64_t{0}, std::int64_t{-5}, std::int64_t{1}}) {
+        Calls c;
+        DexUsageRequest req = request_at();
+        req.floor = asked;
+        const auto r = build_dex_apps_usage_model(apps, fleet, req, sources_of(c, one));
+        REQUIRE(r.has_value());
+        CHECK(r->floor == 1);
+        REQUIRE(r->apps[0].cells.size() == 1);
+        CHECK(r->apps[0].cells[0].devices == 1);
+        REQUIRE(r->apps[0].totals.has_value());
+        CHECK(r->apps[0].totals->run_seconds_30d == 3600);
+        CHECK(r->apps[0].totals->launches_30d == 2);
+    }
 }

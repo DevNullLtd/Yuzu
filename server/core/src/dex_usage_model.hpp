@@ -16,8 +16,14 @@
 ///    A usage name that reaches two or more Apps rows marks every one of them
 ///    `ambiguous_name`: those rows carry no usage figures and no rate. The rule
 ///    fires only when such usage rows actually exist. A name cut inside a
-///    multi-byte character is altered at ingest and will not prefix-match; that
-///    application reads `no_usage` (a known ceiling).
+///    multi-byte character is altered at ingest (sanitize_utf8_strict), so it
+///    could never prefix-match; the plan emits no trunc key for an image whose
+///    15-byte cut falls inside a character (that key would be invalid UTF-8 and
+///    fail the owner's whole statement). Such an application's Linux devices do
+///    not match, and it reads `no_usage` where only Linux devices run it (a known
+///    ceiling). The agent's usage name is the basename, trimmed and ASCII-
+///    lowercased; the plan does not take the basename or trim, so a subject that
+///    carries a path or surrounding whitespace reads `no_usage`.
 ///  - One population. A device counts as reporting usage only while the server
 ///    received its usage state within `kDexUsageFreshSecs` (server receipt time).
 ///    The usage totals, the exposed events and the reporting count come from
@@ -39,7 +45,13 @@
 ///    `other`; `other` below the floor absorbs the smallest published cell until
 ///    it reaches the floor; a table whose total is below the floor publishes the
 ///    device count only. The floor is a request field defaulting to
-///    `kDexCohortFloor`.
+///    `kDexCohortFloor`. The floor and the `other` merge protect ONE table only:
+///    comparing two slices, two windows, or a slice with the fleet total can
+///    still isolate a small group.
+///  - Labels. A cell label is caller data (a tag value or a group id), not
+///    unique and not escaped: a tag value of `other` or `(untagged)` yields a
+///    Named cell carrying the residual's label. A consumer keys on `kind` and
+///    escapes the label on output.
 ///  - Failure is unavailable, never zero: any failed input read (group members,
 ///    tag values, the usage read) makes the whole model unavailable with a reason
 ///    token. There is no partial model.
@@ -84,9 +96,11 @@ inline constexpr std::int64_t kDexUsageSmallCohortDevices = 30;
 /// sync_source_app_usage.cpp). The same value as software_catalogue::kStaleWindowSecs,
 /// restated here so this pure DEX header does not include the catalogue model.
 inline constexpr std::int64_t kDexUsageFreshSecs = 2 * 86400;
-/// Per-row clamps on agent-reported values, so one device cannot dominate a sum
-/// or overflow it. 30 days of seconds times 1024 concurrent instances is
-/// 2.65e9; a per-table sum over even 10^9 devices stays below 2^63 (9.2e18).
+/// Per-row clamps on agent-reported values, so a sum cannot overflow. 30 days
+/// of seconds times 1024 concurrent instances is 2.65e9 seconds per row, far
+/// above any real device, so the cap bounds overflow and impossible values only:
+/// one device can still dominate a sum up to the cap. A per-table sum over even
+/// 10^9 devices stays below 2^63 (9.2e18).
 inline constexpr std::int64_t kDexUsageRowSecondsCap = 30LL * 86400 * 1024;
 inline constexpr std::int64_t kDexUsageRowLaunchesCap = 1'000'000'000;
 
@@ -112,8 +126,14 @@ struct DexUsageRequest {
     /// The ONE request instant (epoch seconds). Required: an omitted instant
     /// would cut every event out and read as a zero-event rate.
     std::int64_t now_epoch{0};
-    /// The observation store's retention in days; 0 or less = unbounded.
-    int observation_retention_days{0};
+    /// The observation store's retention in days. REQUIRED: unset is refused as
+    /// `invalid_request`, because an omitted value would silently turn off the
+    /// retention guard (a 30-day window over 7 days of kept events reads about
+    /// four times too low). An explicit 0 or less means unbounded.
+    std::optional<int> observation_retention_days;
+    /// The disclosure floor on contributing devices. A value below 1 is treated
+    /// as 1 (dex_usage_model_from_read clamps, so the builder and any direct
+    /// caller get it) and `DexAppsUsageModel::floor` reports the value applied.
     std::int64_t floor{kDexCohortFloor};
 };
 
@@ -178,12 +198,18 @@ struct DexUsageTotals {
 
 struct DexUsageCell {
     DexUsageCellKind kind{DexUsageCellKind::Named};
+    /// Caller data (a tag value or a group id): not unique and not escaped. A
+    /// consumer keys on `kind` and escapes the label on output.
     std::string label;
     std::int64_t devices{0};
     DexUsageTotals totals;
     bool small_cohort{false};
 };
 
+/// `crashes` and `hangs` are RAW counts, as in the Apps rate per 1,000 devices;
+/// the per-device cap applies to the Apps stability score only. Events clustered
+/// on one crash-looping device make the interval falsely narrow (the consumer
+/// duty stated at dex_stats.hpp, "Events clustered on one crash-looping device").
 struct DexExposureRate {
     DexInterval per_hour; ///< crashes + hangs per process-hour of use, at the policy's level
     double hours{0.0};    ///< the denominator: run seconds scaled to the window, in hours
@@ -219,7 +245,12 @@ struct DexAppsUsageModel {
 
 /// The match keys for the Apps subjects. Byte lengths, not characters. An image
 /// of exactly 15 bytes needs no trunc key: its exact key already equals the
-/// truncated name.
+/// truncated name. No trunc key is emitted for an image whose 15-byte cut falls
+/// inside a multi-byte character (the first byte after the cut is a UTF-8
+/// continuation byte): the cut would be invalid UTF-8 and the owner's one
+/// statement would fail for every application, and ingest alters such a name, so
+/// the prefix could never match. That image's Linux devices do not match, and it
+/// reads `no_usage` where only Linux devices run it.
 [[nodiscard]] inline std::vector<DexUsageKey>
 dex_usage_match_plan(const std::vector<std::string>& subjects) {
     std::vector<DexUsageKey> plan;
@@ -230,7 +261,8 @@ dex_usage_match_plan(const std::vector<std::string>& subjects) {
             continue;
         const int idx = static_cast<int>(i);
         plan.push_back({idx, image, false});
-        if (image.size() > kDexUsageTruncBytes)
+        if (image.size() > kDexUsageTruncBytes &&
+            (static_cast<unsigned char>(image[kDexUsageTruncBytes]) & 0xC0) != 0x80)
             plan.push_back({idx, image.substr(0, kDexUsageTruncBytes), true});
     }
     return plan;
@@ -470,6 +502,9 @@ struct DexExposureOutcome {
 dex_usage_model_from_read(const DexAppsModel& apps, const std::vector<DexUsageCellDef>& defs,
                           const std::vector<DexUsageKey>& plan, const DexUsageRead& read,
                           int window_days, int retention_days, std::int64_t floor) {
+    // dex_usage_disclose already behaves as floor 1 for 0 or less (zero-device cells
+    // are dropped first), so report the floor that was applied.
+    floor = std::max<std::int64_t>(floor, 1);
     const std::size_t n = apps.apps.size();
     for (const auto& r : read.cells)
         if (r.subject < 0 || static_cast<std::size_t>(r.subject) >= n || r.cell < 0 ||
@@ -539,16 +574,29 @@ struct DexUsageSources {
         tag_values;
 };
 
-/// Refusal tokens: invalid_request, apps_degraded, no_population, invalid_slice,
-/// group_unavailable, tag_unavailable, usage_unavailable. Read-only and
-/// stateless: nothing to recover after a crash, a repeat request is idempotent,
-/// and one failed input fails the whole model. The membership reads complete
-/// before the usage read starts, so no lease is held across another.
+/// Refusal tokens: invalid_request (no request instant, or no observation
+/// retention), apps_degraded, no_population, invalid_slice, group_unavailable,
+/// tag_unavailable, usage_unavailable. Read-only and stateless: nothing to
+/// recover after a crash, a repeat request is idempotent, and one failed input
+/// fails the whole model. The membership reads complete before the usage read
+/// starts, so no lease is held across another.
+///
+/// No authorization is applied here: a surface must admit the caller and filter
+/// the device list (`fleet`) before calling it.
+///
+/// Token meanings differ from the Apps stability score's withheld vocabulary,
+/// because here a token refuses the WHOLE model. `no_population` means the Apps
+/// population is unknown; with zero devices online the model is built with
+/// population == 0 and every application reads `no_usage` (zero online is a
+/// valid state, not a failure, and a refusal would answer 503 every night), so a
+/// consumer reads `population` before wording `no_usage` (the score uses the
+/// same token for unknown or zero). `apps_degraded` does not carry the Apps
+/// model's `degraded_reason`; a surface reads that from the Apps model.
 [[nodiscard]] inline std::expected<DexAppsUsageModel, std::string>
 build_dex_apps_usage_model(const DexAppsModel& apps, const DexFleet& fleet, const DexUsageRequest& req,
                            const DexUsageSources& src) {
     using std::unexpected;
-    if (req.now_epoch <= 0)
+    if (req.now_epoch <= 0 || !req.observation_retention_days)
         return unexpected(std::string("invalid_request"));
     if (apps.degraded)
         return unexpected(std::string("apps_degraded"));
@@ -604,7 +652,7 @@ build_dex_apps_usage_model(const DexAppsModel& apps, const DexFleet& fleet, cons
     if (!read)
         return unexpected(std::string("usage_unavailable"));
     auto model = dex_usage_model_from_read(apps, cells.defs, q.keys, *read, days,
-                                           req.observation_retention_days, req.floor);
+                                           *req.observation_retention_days, req.floor);
     if (!model)
         return unexpected(std::string("usage_unavailable"));
     model->slice = slice;
