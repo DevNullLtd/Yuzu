@@ -415,20 +415,18 @@ state stores. If a customer asks for "delete echo data on uninstall",
 that is a deployment-tooling change (MSI custom action), not an Echo
 plugin change.
 
-> **Collect gate and retention share `canonical_source_enabled`.** Both
-> `source_enabled()` (`echo_aggregator.cpp`) and `source_retention_exempt()`
-> decide a source's state through it; retention and the budget pass call the
-> latter. Decision (#1572): an `errored` source that was never paused
+> **Collect gate and retention both read `canonical_source_enabled`.**
+> `source_enabled()` (`echo_aggregator.cpp`) gates collection; retention and the
+> budget pass decide through `source_retention_exempt()`. Decision (#1572): an `errored` source that was never paused
 > (`<source>_paused_at` absent or fully parsed `0`) gets the normal retention
 > ceiling and budget eviction; `false`, an unreadable flag, and `errored` with
 > `paused_at` above 0, unreadable or malformed stay preserved, so a damaged hold
 > marker never ages out a forensic hold. `paused_at` lives in the same
 > `echo_config` an endpoint user could edit: the rule narrows the tamper window
-> and does not close it. `source_enabled()` `source_enabled()` maps the stored value through
-> `canonical_source_enabled(stored_value)`, which maps anything other than the
+> and does not close it. `canonical_source_enabled(stored_value)` maps anything other than the
 > literal `"true"` to non-enabled (`"false"` → disabled, anything else →
 > `"errored"`). This is load-bearing: a value the plugin never writes fails
-> **closed** — collection stops *and* retention preserves the rows of a paused source — instead of
+> **closed** — collection stops *and* retention keeps the rows of a source paused or errored while paused — instead of
 > a bare `!= "false"` that would treat a tampered/corrupt value as enabled and
 > let retention delete the paused window (#560). `source_enabled()` also fails
 > closed on a failed config read (closed database, SQL error): the registry

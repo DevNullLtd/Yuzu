@@ -357,9 +357,11 @@ bool scrub_process_baseline(EchoDatabase& db);
  * explicit "errored" sentinel — never coerced/guessed — so the dashboard can
  * render a value-error badge instead of silently omitting the source.
  *
- * Both the collect-time gate (`source_enabled`, echo_plugin.cpp) and
- * `run_retention` gate on this canonical value, so a non-canonical value fails
- * closed: collection stops AND the source's rows are preserved (not pruned).
+ * The collect-time gate (`source_enabled`, echo_plugin.cpp) gates on this
+ * canonical value, so a non-canonical value fails closed: collection stops.
+ * `run_retention` and the budget pass decide through `source_retention_exempt`
+ * (#1572): a paused source, or one errored while paused, keeps its rows; an
+ * unreadable flag is preserved.
  */
 [[nodiscard]] std::string_view canonical_source_enabled(std::string_view stored_value);
 
@@ -379,8 +381,8 @@ bool scrub_process_baseline(EchoDatabase& db);
 
 /**
  * Collect-time gate: `source_enabled_state(...).value_or(false)`, so an unreadable flag skips.
- * Collect/retention gate only (false = skip); drain/discard/purge sites use
- * `source_enabled_state()`.
+ * Collect gate only (false = skip); retention and the budget pass use
+ * `source_retention_exempt()`; drain/discard/purge sites use `source_enabled_state()`.
  */
 [[nodiscard]] bool source_enabled(EchoDatabase& db, std::string_view source);
 
