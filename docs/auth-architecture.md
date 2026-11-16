@@ -109,12 +109,16 @@ of the HA "safe-to-scale" gate. The design:
   sees a store failure (`503`), which the response does not tell apart from a lock
   timeout elsewhere in the transaction. (2) The validate cache carries an epoch
   (`session_cache_epoch_`, under `mu_`) incremented by the generation poll's
-  `sessions_.clear()` and by every targeted erase (sign-out, deactivation,
-  reactivation, password change, role change and a gate refusal) and by every
-  in-place edit of a cached entry's MFA proof on this replica (a step-up stamp, its
-  post-stamp re-derive and a cleared proof, whether or not the entry is cached, #8010),
-  so a validation held across a stamp or a clear is served to its one request but not
-  cached; the expiry and
+  `sessions_.clear()`, by every targeted erase (sign-out, deactivation,
+  reactivation, password change, role change and a gate refusal) and by the
+  in-place edits of a cached entry on this replica that are listed here (#8010): the
+  MFA-proof edits (the drop of a cached proof, the post-stamp re-derive and the durable
+  stamp, whether or not the entry is cached) and the elevation clears
+  (`revoke_elevation` and `revoke_user_elevations`; the elevation clears were fixed in
+  the same change). So a validation held across one of those edits is served to its one
+  request but not cached. `elevate_session`'s re-derive and the legacy no-store stamp
+  deliberately do not move it: a stale pre-elevation copy under-grants and self-heals
+  at the next generation poll. The expiry and
   idle evictions inside validation and the legacy in-memory reap do not move it. A
   validation captures the epoch before any store read and inserts its session at
   the tail only if it is unchanged (ADR-0012 section 4, rule 2). On a mismatch the
@@ -391,7 +395,7 @@ conflict`. Then one guarded `UPDATE auth.users` (new hash/salt, `updated_at`,
 the provisional TOTP secret wiped, and — admin reset only — the lockout
 columns cleared); `DELETE FROM session_store.sessions WHERE username=$1`
 (`session_store_sql_helpers.hpp`, the ONE copy, shared with
-`SessionStore::invalidate_user`); the success audit row(s) via
+`SessionStore::invalidate_user` and `MfaDisableOwner`); the success audit row(s) via
 `AuditStore::log_in_txn` — `user.password_change` / `user.password_reset`
 (detail `sessions_revoked=N provisional_mfa_cleared=…`) and, for an admin reset
 of an account that had a lockout (`locked_until` set — even if the lock has
@@ -407,8 +411,8 @@ with the database at commit; a successful sign-in with the new password
 confirms the change, which is audited either way (the audit row is in the same
 commit).
 
-**Lock order** (documented in the owner header; a change inverting it can
-deadlock): the `auth.users` row → `session_store.sessions` rows →
+**Lock order** (documented in the `CredentialChangeOwner` header, and shared by
+`MfaDisableOwner`; a change inverting it can deadlock in either): the `auth.users` row → `session_store.sessions` rows →
 `audit_store.audit_events` (INSERT) → the `session_store.session_meta`
 `write_generation` row → COMMIT. The generation row is last because every
 session create and revoke in the fleet takes it: holding it while waiting on
@@ -421,14 +425,14 @@ re-read takes `auth.users` only after its session INSERT committed.
 `RbacAdminAuthorityOwner` takes `principal_roles` → `auth.users` and no audit
 lock; in `deactivate_account` (when a `SessionStore` is wired) it then takes the
 `session_store.session_meta` `write_generation` row last, the same position
-`CredentialChangeOwner` takes it in, before COMMIT. That edge is acyclic because
+`CredentialChangeOwner` and `MfaDisableOwner` take it in, before COMMIT. That edge is acyclic because
 no session writer takes an RBAC or account lock. The owner requires AuthDB, SessionStore and AuditStore on
 ONE pool/database (ADR-0006; server.cpp builds all three on `*pg_pool_`); a
 split fails every statement closed, never a partial write.
 
 **A sibling owner for the factor clear (#6079 PR 2c).** `MfaDisableOwner`
-(`mfa_disable_owner.{hpp,cpp}`) is the second member of the same ADR-0012 §3
-cross-store owner family and copies `CredentialChangeOwner`'s shape: one pool
+(`mfa_disable_owner.{hpp,cpp}`) is the second owner that deletes session rows in its own
+transaction, in the same ADR-0012 §3 cross-store owner family, and copies `CredentialChangeOwner`'s shape: one pool
 lease, one `with_txn_for`, schema-qualified SQL across `auth`, `session_store`
 and `audit_store`, built in `server.cpp` on the same `*pg_pool_` and audit store.
 The Settings disable and `yuzu-server --mfa-reset` are its only callers (see
@@ -993,9 +997,12 @@ by each handler.
   confirm (`POST /api/settings/mfa/verify`) stamps the confirming local cookie
   session through the same `stamp_session_mfa_proof`, so a just-enrolled
   administrator is covered inside the window for that session only. The
-  Settings stamp needs a local cookie session of the same user; otherwise the
-  session could not be stamped (a bearer principal, an absent or mismatched
-  cookie, or a store failure) and the enrolment stands unstamped. It writes no
+  confirm itself needs a durable session row (a bearer or cookie-less caller is
+  refused `401` before the code is checked, see "Settings enrolment confirm needs
+  a durable session"), so the session fails to stamp only when it ended between
+  that check and the commit, the stamp is refused (`;factor_changed`,
+  `;verification_future_dated`) or the stamp's store write fails, and the
+  enrolment stands unstamped. It writes no
   `mfa.step_up.passed` row: the evidence is the `step_up_proof=` detail on
   `mfa.enroll.verified`. Every one of these writes stores the proof together with the factor generation
   and the database instant the verifier produced (see "Factor-generation binding
@@ -1007,15 +1014,27 @@ by each handler.
   commits the factor, so `POST /api/settings/mfa/verify` first requires the caller's session to
   be a durable, valid row, read with `AuthManager::read_durable_mfa_proof` (row existence and
   ownership only) BEFORE `mfa_verify_enrollment`. A session that is not a durable row (ended,
-  wiped, or never persisted) is refused `401` with audit `mfa.enroll.failed` and detail
-  `session_not_durable`; a session store that cannot be read is refused `503` with
-  `Retry-After: 5` and detail `session_store_unavailable`. Either way nothing is enrolled, no
-  recovery codes are issued and the provisional secret is untouched, so the same code can be
-  confirmed after signing in again (or on retry, for the `503`). The check applies only when a
-  session store is wired. It runs outside the `auth.users` row lock, because `AuthDB` never
-  reads the session store, so a session that ends between the check and the commit still
-  enrols the account and ends as `step_up_proof=not_stamped` on `mfa.enroll.verified`: the
-  enrolment stands and the operator signs in again.
+  wiped, never persisted) and any API-token (bearer) or cookie-less caller is refused `401` with
+  audit `mfa.enroll.failed` and detail `session_not_durable` (the toast says "This action needs a
+  signed-in browser session. Nothing was enrolled." when the request carries no session cookie at
+  all, and "Your session is no longer valid. Nothing was enrolled; sign in again." when a cookie
+  is present but has no durable row for the user). This is a deliberate fail-closed narrowing and
+  a behaviour change for API-token callers, who used to enrol and end as
+  `step_up_proof=not_stamped`: they must confirm from a signed-in browser session. A session
+  store that cannot be read is refused `503` with `Retry-After: 5` and detail
+  `session_store_unavailable`, and counts `yuzu_auth_session_store_degrade_total{op="validate"}`.
+  Either way nothing is enrolled, no recovery codes are issued and the provisional secret is
+  untouched. After a `401` the operator signs in again, presses Set up (which shows the SAME
+  provisional secret again) and enters a CURRENT code from the same authenticator entry (codes
+  rotate every 30 seconds, so the code typed before is not the one to retry); after the `503` the
+  form is kept and a current code works on retry. The two refusals reuse the action
+  `mfa.enroll.failed`, so a rule that counts it as bad-code attempts must filter on the detail.
+  The check applies only when a session store is wired (a no-store wiring, tests and legacy
+  only, skips it). It runs outside the `auth.users` row lock, because `AuthDB` never reads the
+  session store, so with a store wired the remaining `step_up_proof=not_stamped` causes on
+  `mfa.enroll.verified` are a session that ended between the check and the commit (the
+  enrolment stands and the operator signs in again), a stamp refusal (`;factor_changed`,
+  `;verification_future_dated`) and a stamp store failure.
 - **Classification is enforced three ways.** A compiled test registers every
   route owner it can construct with null dependencies on a `TestRouteSink` and
   asserts that each mutating `(method, pattern)` has a row, comparing the
@@ -1418,7 +1437,9 @@ Consequences, each deliberate:
   `success` with `sessions_ended=<n>`, written inside the transaction; every failure exits `1`, writes a best-effort `error` row
   (the intent row already records that a clear was requested) and says nothing was changed: the session store did not
   open, no active account at the clear, the audit store refused the outcome row, or the transaction rolled back
-  (the last also says to check the account's status and re-run, because of the COMMIT-loss case). Disabling MFA from Settings
+  (the last also says to check the account's status and re-run, because of the COMMIT-loss case). The session-store,
+  owner-failure and outcome-row refusals also print the runbook's "Fallback: direct SQL" pointer as an extra stderr line after
+  the error line; the no-active-account refusal does not. Disabling MFA from Settings
   (`POST /api/settings/mfa/disable`, through `AuthManager::commit_mfa_disable`) compares the factor generation the step-up gate admitted
   under the `auth.users` row lock inside the same transaction, deletes EVERY session of the account, the caller's
   included, clears the cookie and sends the browser to `/home`; the outcome row records `ok` with `sessions_ended=<n>`.
@@ -1426,13 +1447,19 @@ Consequences, each deliberate:
   session write-generation lock: the row is `ok` with `no verified factor to clear` and the caller stays signed in.
   A factor that changed after the gate admitted the request is refused `409` with nothing cleared and no session ended
   (audit `denied`, `reason=factor_changed expected_gen=<n>`, written by the handler). A store fault, or an account that went
-  away mid-request, answers `503` with `Retry-After: 5`, nothing changed (audit `error`, `disable failed`, written by the
-  handler and, if it also fails to store, logged only). An outcome row the transaction could not insert rolls the whole clear back and
-  answers `503` with `Sec-Audit-Failed: true`, nothing changed. The Settings intent, `denied` and `error` rows are written
+  away mid-request (owner result `kStoreUnavailable` or `kNotFound`), answers `503` with `Retry-After: 5`, a toast saying MFA
+  may not have been changed and an `error` audit row with detail `disable failed` (written by the handler and, if it also fails
+  to store, logged only); nothing was changed except in the one indeterminate case, a connection lost exactly at COMMIT, which
+  can leave the clear committed (an `ok` row then sits beside the `error` row), and on that case this replica also drops its
+  cached sessions of the account. An outcome row the transaction could not insert (`kAuditUnavailable`) rolls the whole clear
+  back and answers `503` with `Sec-Audit-Failed: true`, nothing changed and NO `error` row, so only the lone `attempted` row
+  remains. Neither path calls `SessionStore::invalidate_user` any more, so neither is counted on
+  `yuzu_auth_session_store_degrade_total{op="invalidate_user"}`; their failures are the `503` / `error` rows and log lines (an
+  outcome-row refusal also moves `yuzu_server_audit_emit_failed_total`), and no replacement metric exists yet. The Settings intent, `denied` and `error` rows are written
   through the session-bound audit writer, and the success row is built with the same identity builder inside the
   transaction, so the actor's principal, role and session are recorded even though that session is deleted by the
   clear. `sessions_ended` counts the durable session rows deleted, expired rows the reaper has not yet removed included.
-  Neither path ends API tokens. These are the only two production paths that clear a factor. The factor-generation comparison above remains the second line, and it reads no clock: a
+  Neither path ends API tokens. These are the only operator-initiated paths that clear an ENROLLED factor while leaving the account active (account deactivation clears it incidentally through `soft_delete_user_in_txn` and ends sessions in a separate step). The factor-generation comparison above remains the second line, and it reads no clock: a
   database clock step cannot make a proof of a replaced factor match. The proof's age ceiling does rest on
   the database primary clock not stepping backward (ADR-2002 section 4 treats database clock integrity as
   a security dependency; the shipped control is the `YuzuSessionReapClockAnomaly` alert, which fires only when a

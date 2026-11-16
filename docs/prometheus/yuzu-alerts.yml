@@ -5432,6 +5432,9 @@ groups:
             which audit as inventory.devices, inventory.device.ci and inventory.devices.ci,
             fail closed instead: they withhold the data and answer a retryable -32603), and only the /crypto (crypto.libraries.*) pages
             also show an on-page "Audit not recorded" notice.
+            The Settings MFA disable (mfa.disabled) answers 503 with Sec-Audit-Failed
+            when the "attempted" row or the in-transaction outcome row cannot be stored,
+            and nothing is cleared; the CLI --mfa-reset exits 1 for the same condition.
             Check audit_store health (/healthz
             stores.audit) and free disk / connection saturation on the PostgreSQL
             server (ADR-0040 — audit is Postgres-backed, not a local file). Note: a bad_alloc-class
@@ -7635,14 +7638,17 @@ groups:
             also counted as `validate`: session validation is unaffected, but that one
             local MFA binding read is refused 503 `mfa_proof_unavailable` and retried on
             the next read; `create`/`elevate`/`mark_mfa`/`invalidate`/
-            `invalidate_user` degrades fail the privileged op closed, except an
-            `invalidate_user` after an MFA clear that already committed (Settings MFA
-            disable), which leaves the clear in place and ends `partial`;
+            `invalidate_user` degrades fail the privileged op closed
+            (`DELETE /api/v1/sessions` and the deprovision paths; look for
+            deprovision rows with `result=partial, db_error=true`). The Settings MFA
+            disable and the CLI `--mfa-reset` no longer call `invalidate_user`, so
+            they are not counted here: their failures are 503 / `result=error`
+            audit rows (docs/ops-runbooks/auth-db-recovery.md, "There is no partial
+            result");
             `account_state` (the read of `auth.users` that gates a durable local
             session) fails the request closed (401), and the failing store for
             that op is the account store, not session_store; a single
-            event does not hold this alert's 10m condition, so look for
-            `mfa.disabled` rows with result `partial` in the audit log; a sustained
+            event does not hold this alert's 10m condition; a sustained
             `generation_refresh` degrade drops the validate cache past the
             stale-serve bound. `op=rebind_guard` means the session rebind guard is
             not in force: local MFA proofs are refused with `mfa_proof_unavailable`

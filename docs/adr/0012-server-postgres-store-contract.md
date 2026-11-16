@@ -475,9 +475,10 @@ A failed bump aborts the deactivation (the account stays active, a store failure
 
 ## Update (2026-11-16) -- a seventh query owner: MfaDisableOwner
 
-A seventh query owner: `MfaDisableOwner` (`mfa_disable_owner.{hpp,cpp}`, #6079 PR 2c), the ONLY
-production path that clears a local account's second factor (the Settings disable and the host
-break-glass `--mfa-reset`). It copies `CredentialChangeOwner`'s shape: one `pool.with_txn_for` on one
+A seventh query owner: `MfaDisableOwner` (`mfa_disable_owner.{hpp,cpp}`, #6079 PR 2c), the only
+operator-initiated path that clears an ENROLLED factor while leaving the account active (the Settings
+disable and the host break-glass `--mfa-reset`); account deactivation clears it incidentally through
+`soft_delete_user_in_txn` and ends sessions in a separate step. It copies `CredentialChangeOwner`'s shape: one `pool.with_txn_for` on one
 lease, schema-qualified SQL across `auth`, `session_store` and `audit_store`, a txn-scoped
 `lock_timeout`, and no compensating write. In one transaction it clears the factor and deletes the
 recovery codes (`auth_sql::clear_mfa_factor_in_txn` in `auth_db_sql_helpers.hpp`, the ONE copy of

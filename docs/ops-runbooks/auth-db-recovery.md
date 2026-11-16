@@ -864,24 +864,28 @@ reaped included, so it is not a count of sessions that were still usable. The
 command's stdout line is unchanged. Every failure exits `1`, says that nothing was changed and writes a
 best-effort `result=error` outcome row (the intent row already records that a clear was requested):
 
-| stderr | outcome row `detail` (each ends `(os_identity=<account>)`) | Meaning |
-|---|---|---|
-| `error: session store unavailable; nothing was changed` | `MFA clear refused; session store did not open, nothing changed` | The session store did not open. |
-| `error: no active account '<user>'; nothing was changed` | `MFA clear refused; no active account, nothing changed` | The account was removed or deactivated after the existence check. |
-| `error: audit store did not accept the outcome row; nothing was changed` | `MFA clear failed; audit store refused the outcome row, nothing changed` | The clear rolled back with its outcome row (that `error` row is best effort and may fail too). |
-| `error: failed to clear MFA; nothing was changed (unless the connection was lost at commit): check the account's status and re-run` | `MFA clear failed; rolled back, re-run after checking status` | Lease, lock, statement or COMMIT failure. |
+| stderr | outcome row `detail` (each ends `(os_identity=<account>)`) | Meaning | Operator step |
+|---|---|---|---|
+| `error: session store unavailable; nothing was changed` | `MFA clear refused; session store did not open, nothing changed` | The session store did not open. | Restore the database and re-run; use the direct SQL fallback only when you cannot restore it. A second stderr line points at it. |
+| `error: no active account '<user>'; nothing was changed` | `MFA clear refused; no active account, nothing changed` | The account was removed or deactivated after the existence check. | None for the factor: the account is gone or inactive (deactivation clears the factor). No fallback pointer is printed. |
+| `error: audit store did not accept the outcome row; nothing was changed` | `MFA clear failed; audit store refused the outcome row, nothing changed` | The clear rolled back with its outcome row (that `error` row is best effort and may fail too). | Restore the audit store and re-run; use the direct SQL fallback only when you cannot. A second stderr line points at it. |
+| `error: failed to clear MFA; nothing was changed (unless the connection was lost at commit): check the account's status and re-run` | `MFA clear failed; rolled back, re-run after checking status` | Lease, lock, statement or COMMIT failure. | Check `auth.users.mfa_enrolled_at` (null means it landed), then re-run only if still needed. A second stderr line points at the direct SQL fallback. |
 
-The last row is the one indeterminate case: a database connection lost exactly at COMMIT can leave the transaction
+Each refusal or owner failure above except the no-active-account one prints a second stderr line pointing at "Fallback: direct
+SQL" (below), for an operator who is locked out and cannot restore the database in time. The last row is the one indeterminate case: a database connection lost exactly at COMMIT can leave the transaction
 committed with its acknowledgement lost, and then the clear, the session delete and the `success` outcome row all
 landed together. Check the account's `mfa_enrolled_at` (null means the clear landed) before re-running; if it landed,
 the sessions are already ended. A re-run clears again idempotently and ends the account's sessions, and needs no admin
 session (do it only if the account has not re-enrolled since, because a re-run also clears a newly enrolled factor).
 Disabling MFA from Settings ends **every** session of the
 account, the caller's included, and sends the browser to the landing page, in the same single transaction. If
-that transaction fails the page answers `503` (`Retry-After: 5`) with "Could not disable MFA. It was not
-changed; try again. If you were signed out, sign in and check its state." and the audit row is `mfa.disabled` with
-`result=error` and `disable failed`; nothing was changed, and the same COMMIT-loss exception applies. If the outcome
-row cannot be stored the whole clear rolls back and the response is `503` with `Sec-Audit-Failed: true`. A factor
+that transaction fails the page answers `503` (`Retry-After: 5`) with a toast ("Could not confirm MFA was disabled; it
+may not have been changed. Check its state.") and the message "Could not disable MFA. It may not have been changed; check
+its state and try again. If you were signed out, sign in and check its state."; the audit row is `mfa.disabled` with
+`result=error` and `disable failed`. Nothing was changed apart from the COMMIT-loss exception (a connection lost exactly
+at COMMIT can leave the clear committed, with an `ok` row beside the `error` row; this replica then also drops its cached
+sessions of the account). If the outcome row cannot be stored the whole clear rolls back and the response is `503` with
+`Sec-Audit-Failed: true` and NO `error` row: only the lone `attempted` row remains. A factor
 that changed between the step-up check and the clear is refused with `result=denied` and
 `reason=factor_changed expected_gen=<n>`, clearing nothing. Cancelling an enrolment that was never
 verified ends no session (`result=ok`, `no verified factor to clear`). Settings
@@ -1009,9 +1013,14 @@ psql -q "$YUZU_POSTGRES_DSN" -c \
 
 For each listed account check `auth.users.mfa_enrolled_at`. If it is not NULL the factor is intact and nothing more is needed;
 re-run the clear only if it is still wanted. If it is NULL, either the clear was completed by a later attempt or the COMMIT-loss
-case applies: the sessions were ended in the same transaction as the clear, so confirm with the "Check that no session remains"
-query and, if any row is left (a sign-in after the clear), end it with `DELETE /api/v1/sessions?username=<name>`. A SIEM rule
-can use the same predicate.
+case applies. The sessions were ended inside the clear's own transaction, so a session row created AFTER the clear is a
+legitimate sign-in and needs no action; only a session row OLDER than the `success` / `ok` row (or, with no such row, older
+than the clear) indicates a fault, and you end it with `DELETE /api/v1/sessions?username=<name>`. To
+compare, list the rows' creation times (`SELECT to_timestamp(created_at_ms / 1000.0) AT TIME ZONE 'UTC' AS created_utc FROM
+session_store.sessions WHERE username = '<name>';`) and read them against the outcome row's time. A SIEM rule can use the same
+predicate. Two other real causes of an `error` row beside a NULL `mfa_enrolled_at` are a concurrent deactivation of the account
+(the deactivation clears the factor itself, so the clear found no active account or lost the row) and a concurrent
+`--mfa-reset` of the same account that cleared it first; neither is a fault, and neither needs a re-run.
 
 **Detective control.** Because the CLI exits without serving, it emits no
 Prometheus metric — the audit row is the only signal. Alert on
@@ -1019,6 +1028,10 @@ Prometheus metric — the audit row is the only signal. Alert on
 authentication-downgrade event and should page on-call. A `result=error` row for either action is a clear that failed and
 rolled back (nothing was changed, apart from the COMMIT-loss case above); if `YuzuAuditPersistFailures` fired in the same minutes,
 the outcome row, and with it the whole clear, may have been refused, so check the account.
+
+Rows written by 0.15.x builds can carry `result=partial` and `sessions_ended=failed` (those builds cleared the factor and
+ended the sessions in two commits), so keep those values in any query or rule over retained history; this build never writes
+them.
 
 Every clear writes two rows, the `attempted` intent row and then the outcome row, so a SIEM rule that counts these
 actions once per clear counts twice, and a rule written as `result <> 'success'` (or `result != 'ok'`) matches every
@@ -1038,11 +1051,14 @@ key version that is not registered and that header is corrupt (see
 where a restore of the paired backup comes first when the version once existed); or
 `--mfa-reset` refuses because the audit store does not open or does not accept the intent row
 (`error: audit store unavailable; refusing to clear MFA without an audit record`, or
-`error: audit store did not accept the intent row; nothing was changed`) while an
-operator is locked out and the audit store cannot be restored in the time available.
-**Last resort. It writes no audit row.** In the third case restore the audit store first
-and re-run `--mfa-reset`, which is the audited path; use this SQL only when that cannot be done,
-because it removes exactly the audit guarantee the CLI's refusal exists to keep.
+`error: audit store did not accept the intent row; nothing was changed`), because it does not accept the outcome row
+(`error: audit store did not accept the outcome row; nothing was changed`), or because the session store did not open
+(`error: session store unavailable; nothing was changed`), while an
+operator is locked out and that store cannot be restored in the time available.
+**Last resort. It writes no audit row.** In the third case restore the audit store or the session store first
+and re-run `--mfa-reset`, which is the audited path; use this SQL only when you cannot restore first,
+because it removes exactly the audit guarantee the CLI's refusal exists to keep. The CLI prints a second stderr line
+pointing here after each of those refusals.
 
 Because the database leaves no record of this path, the change-management record that
 follows it is the only evidence. It must state: who ran it (the OS account and the named

@@ -668,9 +668,11 @@ means the clear did not commit and the factor is intact (the request failed or w
 transaction rolled back, or the process died first). The one indeterminate case is a database connection
 lost at the instant of COMMIT, where the acknowledgement is lost: the transaction may have committed,
 and if it did the clear, the session delete and the outcome row all landed together; check
-`auth.users.mfa_enrolled_at` after such a failure. If the transaction fails, Settings answers `503`
-(nothing changed; `Sec-Audit-Failed: true` when the cause was the outcome row) and records `error`
-with detail `disable failed`, and `--mfa-reset` exits non-zero with a message that nothing was changed.
+`auth.users.mfa_enrolled_at` after such a failure. If the transaction fails for a store fault or
+a vanished account, Settings answers `503` (`Retry-After: 5`; nothing changed, apart from a connection lost at COMMIT) and records
+`error` with detail `disable failed`. If the outcome row cannot be stored, Settings answers `503` with
+`Sec-Audit-Failed: true`, the whole transaction rolls back, no outcome row is written and only the lone
+`attempted` row remains. `--mfa-reset` exits non-zero with a message that nothing was changed.
 The recovery runbook keeps a single-transaction SQL fallback for hosts without the binary, which
 writes no audit row. A Disable whose account's
 factor changed after the step-up check admitted it is refused `409` and records a `denied` row
@@ -749,8 +751,8 @@ passed, not the factor type, the proof age or the factor generation. The generat
 `mfa.enroll.verified` with `step_up_proof=stamped`. Evidence for residual (b) is a pair of rows per clear, ordered by the audit `id`: an `attempted`
 intent row written before the factor is touched, then an outcome row. The `mfa.disabled` rows carry the
 acting session's principal, role and session id; an `ok` row (`sessions_ended=<n>`) marks a clear that committed,
-`error` (`disable failed`) marks a clear that rolled back and changed nothing, and a `denied` row (`reason=factor_changed`) marks a request that changed nothing. The `mfa.reset.breakglass` rows carry the OS
-identity that ran the command as principal; its outcome is `success` (a clear that committed) or `error` (nothing changed). Both are inside the `auth-sample` export. An
+`error` (`disable failed`) marks a clear that rolled back and changed nothing (apart from a connection lost at COMMIT, where an `ok` row can sit beside it), and a `denied` row (`reason=factor_changed`) marks a request that changed nothing. The `mfa.reset.breakglass` rows carry the OS
+identity that ran the command as principal; its outcome is `success` (a clear that committed) or `error` (nothing changed, with the same COMMIT exception). Both are inside the `auth-sample` export. An
 `attempted` row with no outcome row marks a clear that did not commit and left the factor intact, apart from a connection
 lost at the instant of COMMIT (check the account). The reconciliation query that lists them is under "Finding a clear whose
 outcome is unknown" in `docs/ops-runbooks/auth-db-recovery.md`, which also has the query for outcome rows

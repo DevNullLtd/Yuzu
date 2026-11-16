@@ -275,10 +275,12 @@ canonical list lives here. For broader auth/RBAC/crypto context, defer to the
   as a HIGH finding requiring an explicit decision (this was a deliberate
   drop, not an oversight; see `docs/auth-architecture.md` "AuthDB —
   persistent authentication store"). The cross-store writers are the
-  credential-change owner (`CredentialChangeOwner`, #5342), which deletes a
+  credential-change owner (`CredentialChangeOwner`,
+  `credential_change_owner.{hpp,cpp}`, #5342), which deletes a
   user's `session_store` rows in the same transaction as its `auth.users`
   credential write, and its sibling the MFA-disable owner (`MfaDisableOwner`,
-  #6079 PR 2c), which does the same for a factor clear, both through
+  `mfa_disable_owner.{hpp,cpp}`, #6079 PR 2c), which does the same for a factor
+  clear, both through
   `session_store_sql_helpers.hpp`, never an `AuthDB` method.
 
 - **Cleanup thread now sweeps ONLY stale provisional MFA enrollments** (the
