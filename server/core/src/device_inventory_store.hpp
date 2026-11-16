@@ -145,8 +145,8 @@ public:
     /// database collation, so a libc/ICU change under an existing volume cannot make a walk skip
     /// or miss a row; a duplicate row admitted by a write through a stale primary key is a
     /// write-side residual; migration v4 builds the matching index): `agent_id > after`, then up to
-    /// `limit` rows (a `limit` `<= 0` or above the same ceiling as `list_device_ci` reads the
-    /// ceiling). `agent_id` and `agent_ids` narrow the
+    /// `limit` rows (a `limit` `<= 0` or above the 100000-row ceiling, the store's `kListRowCap`,
+    /// reads the ceiling). `agent_id` and `agent_ids` narrow the
     /// read in SQL; a present-empty `agent_ids` is an empty page with no SQL. The query runs in a
     /// transaction under `SET LOCAL statement_timeout = '5s'`: a SELECT that runs past 5 s is
     /// cancelled and that is a `std::nullopt` (the cap is per statement, not a bound on the whole
