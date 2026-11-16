@@ -90,8 +90,10 @@ def hits_in(text):
 def tracked_files():
     try:
         out = subprocess.run(
-            # --others so a file not yet added is scanned too (in CI every file is tracked).
-            ["git", "-C", REPO, "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+            # Tracked files only. `--others` also lists untracked files, and a shared CI workspace holds
+            # leftovers of earlier jobs (e.g. *.gcov files named after a plugin that has since been
+            # removed): the gate would read them all (96 s) and report them as offenders.
+            ["git", "-C", REPO, "ls-files", "-z", "--cached"],
             capture_output=True, check=True, timeout=120,
         ).stdout
         return [p for p in out.decode("utf-8", "replace").split("\0") if p]
