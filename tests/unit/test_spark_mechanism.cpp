@@ -16,6 +16,8 @@
 #include "test_helpers.hpp" // process_random_salt - the PR-A watch-establishment harness'
                             // scratch registry keys (#2012/#3840 D-value measurement)
 
+#include <yuzu/agent/agent.hpp> // Config: the operator-facing default of the Registry opt-in
+
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 
@@ -2488,6 +2490,23 @@ TEST_CASE("clamp_registry_path_verify: 0 is off, 1..4 is raised to the 5 s floor
     CHECK(clamp_registry_path_verify(-1) == milliseconds{0});
     CHECK(clamp_registry_path_verify(std::numeric_limits<std::int64_t>::min()) ==
           milliseconds{0});
+}
+
+// #5719 item 5, #7836 (REG-15-I2): the operator-facing default of the Registry opt-in. The Windows
+// default-off case further down proves the FACTORY default (make_registry_mechanism(counter) with
+// no second argument). The value the agent actually passes is
+// clamp_registry_path_verify(cfg_.spark_registry_path_verify_interval_s), so this pins the other
+// two links this process CAN see: the Config field's own default and the clamp of that default.
+// The links it cannot see (main.cpp's CLI default and range check, and agent.cpp's call into the
+// factory) are pinned LEXICALLY by tests/test_registry_verify_default_wiring_lexical.py, not
+// behaviourally: no test here runs the CLI parser or boots the agent.
+TEST_CASE("Registry path verification: the operator-facing default is off (Config field and "
+          "clamp, REG-15-I2, #7836)",
+          "[spark][mechanism][5719]") {
+    const yuzu::agent::Config defaults{};
+    CHECK(defaults.spark_registry_path_verify_interval_s == 0);
+    CHECK(clamp_registry_path_verify(defaults.spark_registry_path_verify_interval_s) ==
+          std::chrono::milliseconds{0});
 }
 
 // ── rung 9c PR-6 item 1: the establishment signal (SparkIncarnation /
@@ -17917,7 +17936,8 @@ struct RegVerifyHarness {
     std::vector<SparkEngine::SubscriptionId> subs;
 
     /// `make` builds the mechanism; null means the zero-argument factory. The REG-15-I2 cases
-    /// pass the exact overload production calls, so they observe what the agent gets.
+    /// pass the two-argument factory overload production uses, so they observe the FACTORY
+    /// default and the opt-in value; the flag-to-factory wiring is pinned lexically.
     RegVerifyHarness(const std::vector<std::string>& keys, RegistryMechanismTestControls ctl,
                      const std::function<std::unique_ptr<ISparkMechanism>()>& make = nullptr) {
         auto mech = make ? make() : make_registry_mechanism();
@@ -17975,6 +17995,7 @@ RegistryMechanismTestControls rename_controls(std::chrono::milliseconds verify) 
 }
 } // namespace
 
+namespace {
 /// Counts how many times the probe worker reached each subkey (the test hook runs BEFORE the
 /// OS opens the key, so one count is one open attempt of that key: establishment, re-arm or
 /// verification). Shared by value into the detached workers, so every access is locked.
@@ -17994,6 +18015,7 @@ struct KeyOpenCounter {
         };
     }
 };
+} // namespace
 
 // REG-15-I2 (owner ruling 2026-11-16): the Registry mechanism opens no key for path verification
 // unless the operator opted in at boot. Each verification opens the watched key by path, and on a
@@ -18002,9 +18024,14 @@ struct KeyOpenCounter {
 // open attempts) AND NOTHING ELSE: Security-log behaviour (event 4656 counts, eviction) is NOT
 // observed or asserted here, and no SACL is set.
 //
-// The mechanism is built with the EXACT overload agent.cpp calls when the operator sets nothing
-// (make_registry_mechanism(counter)); only sweep_cadence is shortened. The zero phase is held
-// longer than the old 5 s default plus slack, so a default put back to 5 s makes the case red.
+// The mechanism is built with the two-argument factory's own default
+// (make_registry_mechanism(counter)); only sweep_cadence is shortened. THIS OBSERVES THE FACTORY
+// DEFAULT: that agent.cpp passes the operator's value through, that main.cpp defaults the flag to
+// 0 and that Config's field is 0 are pinned elsewhere (the Config/clamp case above, and the
+// lexical tripwire tests/test_registry_verify_default_wiring_lexical.py), not behaviourally. The
+// zero phase is held longer than the old 5 s default plus slack, so a default put back to 5 s makes
+// the case red; a sweep-pass counter fences the hold against a whole-box stall (a wall-clock poll
+// alone could end before the sweeper staged a regressed verification).
 TEST_CASE("Registry spark (real mechanism): the production factory default opens no key for "
           "verification (REG-15-I2, #7836)",
           "[spark][mechanism][windows][5719]") {
@@ -18019,11 +18046,14 @@ TEST_CASE("Registry spark (real mechanism): the production factory default opens
     const std::vector<std::string> keys{rig.child, b.sub, c.sub};
 
     auto opens = std::make_shared<KeyOpenCounter>(); // captured by value: the workers are detached
+    // Sweeper passes seen (the hook runs on the sweeper at the top of every pass).
+    auto sweeps = std::make_shared<std::atomic<std::uint64_t>>(0);
     auto ctl = [&](std::chrono::milliseconds verify) {
         RegistryMechanismTestControls k;
         k.sweep_cadence = 20ms;
         k.path_verify_interval = verify; // 0 leaves the construction-time seed unchanged
         k.probe_hook = KeyOpenCounter::hook(opens);
+        k.sweep_hook = [sweeps] { sweeps->fetch_add(1, std::memory_order_relaxed); };
         return k;
     };
     auto f3 = std::make_shared<std::atomic<std::size_t>>(0);
@@ -18045,7 +18075,19 @@ TEST_CASE("Registry spark (real mechanism): the production factory default opens
         std::this_thread::sleep_for(25ms);
     }
     CHECK(quiet);
+
+    // Stall fence: the wall-clock hold above can end early in effect if the whole box stalled
+    // (the sweeper may not have run a pass since the 5 s mark). Nudge the sweeper, then wait for
+    // TWO further passes to begin: the second begins only after the first, which began after the
+    // hold, has finished staging and launching. A verification regressed to 5 s would be due by
+    // now, so it would have been launched and counted before the assertions below.
+    const auto passes0 = sweeps->load(std::memory_order_relaxed);
+    h.apply(ctl(0ms));
+    REQUIRE(eventually([&] { return sweeps->load(std::memory_order_relaxed) >= passes0 + 2; },
+                       kDeafBound));
+
     const auto c1 = h.counters();
+    CHECK(c1.path_verify_ms == 0); // the effective interval itself, not only its silence
     CHECK(c1.verify_launched == 0);
     CHECK(c1.probe_launched == c0.probe_launched); // no probe of any kind after establishment
     for (std::size_t i = 0; i < keys.size(); ++i) {

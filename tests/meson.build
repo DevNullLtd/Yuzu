@@ -4325,6 +4325,18 @@ test('agent guardian sender-refusal wiring lexical gate (#5690)',
   timeout: 30,
 )
 
+# Registry path verification is OFF unless the operator opts in (REG-15-I2, #7836): the Catch2 cases
+# observe the factory default and the Config field and clamp, but nothing unit-tests that main.cpp
+# defaults the option to 0 with a post-parse range check (not a CLI11 validator, which drops an env
+# value silently) or that agent.cpp passes the clamped operator value to the two-argument factory.
+# Carries its own in-memory mutation self-test. No build required.
+test('registry path-verification default-off wiring lexical gate (REG-15-I2, #7836)',
+  _python3_test,
+  args: [files('test_registry_verify_default_wiring_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
+
 # __sync__.now parameter wiring: decide_sync_now is a pure function with its own unit tests; this
 # pins that agent.cpp's Subscribe loop still reads the `source` and `delay_max_s` keys and passes
 # both in (no gRPC seam to test the loop, #1492). Carries its own in-memory mutation self-test.
