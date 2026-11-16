@@ -36,6 +36,7 @@ struct Rig {
     bool persist_ok = true;
     bool dispatch_throws = false;
     bool throws_non_std = false; // with dispatch_throws: throw something that is not a std::exception
+    bool targeted_throws = false; // the record update after the send throws
     std::optional<std::size_t> accept; // frames the registry accepts; unset = all
     bool last_seen_ok = true;
     std::unordered_map<std::string, std::int64_t> seen;
@@ -110,6 +111,8 @@ struct Rig {
             };
             e.track.set_targeted = [this](const std::string&, std::size_t n) {
                 events.push_back("track.targeted");
+                if (targeted_throws)
+                    throw std::runtime_error("boom");
                 targeted.push_back(n);
                 return true;
             };
@@ -313,6 +316,11 @@ TEST_CASE("sync runner: a whole group needs confirm; a device and an expression 
     CHECK(runner.run(session_of("alice"), device("host-01"), rig.audit()).status == ss::Status::Accepted);
     const ss::Selector expr{DispatchArm::Scope, R"(ostype == "linux")"};
     CHECK(runner.run(session_of("alice"), expr, rig.audit()).status == ss::Status::Accepted);
+    // The fleet-administrator rule is about naming `__all__`: an expression is the caller's own
+    // targeting inside their visible set, whatever it matches, and is never asked for that grant.
+    rig.admin = false;
+    const ss::Selector everything{DispatchArm::Scope, R"(ostype == "linux" OR ostype != "linux")"};
+    CHECK(runner.run(session_of("alice"), everything, rig.audit()).status == ss::Status::Accepted);
     // A confined caller may sync a group within their own set.
     rig.unfiltered_of = [](const std::string&) { return false; };
     CHECK(runner.run(session_of("bob"), group("g"), rig.audit()).status == ss::Status::Accepted);
@@ -495,6 +503,44 @@ TEST_CASE("sync runner: a same-key request while the first is still being starte
     CHECK(inner.retry_after_ms == 1000);
     CHECK(dispatches_seen_by_inner == 0); // the inner request sent nothing
     CHECK(rig.dispatches.size() == 1);
+}
+
+TEST_CASE("sync runner: a same-key request during the send is 409, never a join of a run that may send nothing",
+          "[server][software_sync][runner]") {
+    // Whether the send then accepts every frame or none, a request that arrives while it is in
+    // flight is told to come back: it is never handed counts and an execution id for frames that
+    // were not accepted yet.
+    for (const bool none_accepted : {false, true}) {
+        CAPTURE(none_accepted);
+        Rig rig;
+        rig.live(100);
+        if (none_accepted)
+            rig.accept = 0;
+        ss::Runner runner(rig.env());
+        ss::Outcome inner;
+        bool fired = false;
+        rig.on_dispatch = [&] {
+            if (fired)
+                return;
+            fired = true;
+            inner = runner.run(session_of("bob"), group("g"), rig.audit());
+        };
+        const auto outer = runner.run(session_of("alice"), group("g"), rig.audit());
+        CHECK(outer.status == (none_accepted ? ss::Status::NoneReachable : ss::Status::Accepted));
+        CHECK(inner.status == ss::Status::InFlight);
+        CHECK(inner.http == 409);
+        CHECK(inner.retry_after_ms == 1000);
+        CHECK(rig.dispatches.size() == 1);
+        CHECK_FALSE(saw(rig, "note:joined"));
+        // Once the send has returned with frames accepted, the same request joins the settled run.
+        if (!none_accepted) {
+            const auto later = runner.run(session_of("bob"), group("g"), rig.audit());
+            REQUIRE(later.status == ss::Status::Accepted);
+            CHECK(later.summary["joined"] == true);
+            CHECK(later.summary["execution_id"] == outer.summary["execution_id"]);
+            CHECK(later.summary["agents_reached"] == 100);
+        }
+    }
 }
 
 TEST_CASE("sync runner: different groups run at once; the same group inside its cooldown is 429",
@@ -814,6 +860,22 @@ TEST_CASE("sync runner: a dispatch that throws keeps its budget, is neither join
         // until its spread ends: the retry got half of the remaining half.
         CHECK(rig.dispatches.back().delay == 80);
     }
+}
+
+TEST_CASE("sync runner: a throw after frames were accepted keeps the budget until the spread ends",
+          "[server][software_sync][runner]") {
+    Rig rig;
+    rig.live(1000);
+    rig.targeted_throws = true;
+    ss::Runner runner(rig.env());
+    CHECK_THROWS(runner.run(session_of("alice"), group("g1"), rig.audit()));
+    REQUIRE(rig.dispatches.size() == 1); // the frames went out at 25 per second
+    // They still report inside that spread, so the next run gets half of what is left, not half
+    // of the whole budget; and the live-send place went back.
+    rig.targeted_throws = false;
+    const auto second = runner.run(session_of("alice"), group("g2"), rig.audit());
+    REQUIRE(second.status == ss::Status::Accepted);
+    CHECK(rig.dispatches.back().delay == 80); // 12.5 per second
 }
 
 TEST_CASE("sync runner: the whole-fleet row goes through persist_fleet_wide when it is bound",

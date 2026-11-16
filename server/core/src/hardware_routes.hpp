@@ -369,7 +369,8 @@ public:
         /// both.
         std::shared_ptr<software_sync::Runner> sync_runner;
         /// GET /api/v1/hardware/sync/{execution_id}: the tracker read and the "may this caller read
-        /// every sync run" answer. Either empty == 503 (never an empty 200).
+        /// every sync run" answer. An empty `sync_status_fn` == 503 (never an empty 200); an empty
+        /// `sync_unfiltered_fn` == nobody is unfiltered (a caller reads only the runs it started).
         SyncStatusFn sync_status_fn;
         SyncUnfilteredFn sync_unfiltered_fn;
         /// Same-site gate for the cookie-authorised sync POSTs (both the fleet and the

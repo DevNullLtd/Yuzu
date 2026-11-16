@@ -394,11 +394,6 @@ private:
                 env_.track.cancel(execution_id, session);
         };
         started_at = now();
-        const auto planned = summary_json(plan.counts, "", started_at, execution_id, delay_max_s);
-        if (guarded) {
-            std::lock_guard<std::mutex> lk(mu_);
-            reservation.begin_sending_locked(planned, execution_id);
-        }
 
         const auto none_reachable = [&] {
             close_record();
@@ -432,14 +427,16 @@ private:
         }
 
         // Frames the registry accepted are the run; a frame that was not accepted keeps its share
-        // of the reservation until the spread ends (the budget bounds what was ASKED).
+        // of the reservation until the spread ends (the budget bounds what was ASKED). That holds
+        // from here whatever follows: a throw before the settle below must not give the entry back.
+        reservation.forget_key();
         if (!execution_id.empty() && env_.track.set_targeted)
             env_.track.set_targeted(execution_id, sent.sent);
         const auto final_counts = finalize(plan.counts, sent.sent);
         const auto summary = summary_json(final_counts, sent.command_id, started_at, execution_id, delay_max_s);
         if (guarded) {
             std::lock_guard<std::mutex> lk(mu_);
-            reservation.settle_locked(summary, sent.command_id, started_at);
+            reservation.settle_locked(summary, sent.command_id, execution_id, started_at);
         }
         out.status = Status::Accepted;
         out.http = 202;
@@ -458,11 +455,12 @@ private:
     };
 
     /// One key's run state plus its cooldown stamp. An entry with `phase == Idle` is only a stamp.
+    /// Pending: admitted and not settled yet (the audit write, the execution record, the send
+    /// loop). It cannot expire (a stalled send must not let a second run of the same key start) and
+    /// is never joined, so a join only ever reports a run whose frames were accepted. Running:
+    /// sent, and spreading until `ends_at`.
     struct KeyState {
         enum class Phase { Idle, Pending, Running } phase{Phase::Idle};
-        /// Running: the send loop has not returned yet, so the run cannot expire (a stalled send
-        /// would otherwise let a second run of the same key start while the first still sends).
-        bool sending{false};
         std::uint64_t ledger_id{0};
         std::string command_id;
         std::string execution_id;
@@ -487,11 +485,10 @@ private:
         std::erase_if(ledger_, [at](const ActiveRun& e) { return e.ends_at <= at; });
     }
 
-    /// Is the key's run still a run? Pending is; Running is until its send has returned AND its
-    /// spread has ended (a stalled send must not let a second run of the same key start).
+    /// Is the key's run still a run? Pending is; Running is until its spread has ended.
     [[nodiscard]] static bool live_locked(const KeyState& k, std::int64_t at) {
         return k.phase == KeyState::Phase::Pending ||
-               (k.phase == KeyState::Phase::Running && (k.sending || k.ends_at > at));
+               (k.phase == KeyState::Phase::Running && k.ends_at > at);
     }
 
     /// A finished run stops being a run: only its cooldown stamp stays.
@@ -609,28 +606,23 @@ private:
             ++r_.live_sends_;
             live_ = true;
         }
-        void begin_sending_locked(const nlohmann::json& planned, const std::string& execution_id) {
-            auto it = r_.keys_.find(key_);
-            if (it == r_.keys_.end() || it->second.ledger_id != id_)
-                return;
-            it->second.phase = KeyState::Phase::Running;
-            it->second.sending = true;
-            it->second.summary = planned;
-            it->second.execution_id = execution_id;
-        }
-        /// Called with `mu_` held after a send that accepted at least one frame.
-        void settle_locked(const nlohmann::json& summary, const std::string& command_id, std::int64_t started) {
+        /// Called with `mu_` held after a send that accepted at least one frame: the key becomes
+        /// Running (joinable, with the counts of what was accepted) and starts its cooldown.
+        void settle_locked(const nlohmann::json& summary, const std::string& command_id,
+                           const std::string& execution_id, std::int64_t started) {
             give_back_ledger_ = false; // the reservation stands until its spread ends
             give_back_key_ = false;
             auto it = r_.keys_.find(key_);
             if (it == r_.keys_.end() || it->second.ledger_id != id_)
                 return;
-            it->second.sending = false;
+            it->second.phase = KeyState::Phase::Running;
             it->second.summary = summary;
             it->second.command_id = command_id;
+            it->second.execution_id = execution_id;
             it->second.cooldown_from = started;
         }
-        /// A send that threw: the ledger entry stays until its spread ends, the key's state goes.
+        /// A send that threw, or anything that throws after frames were accepted: the ledger entry
+        /// stays until its spread ends, the key's state goes.
         void forget_key() {
             give_back_ledger_ = false;
             give_back_key_ = true;

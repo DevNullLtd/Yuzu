@@ -238,6 +238,10 @@ struct Selector {
 /// outright rather than silently narrowed to their own devices: the request they made is not the
 /// request that would run. `fleet_admin` is the Runner's answer for the session (an answer that
 /// could not be determined is `false`).
+/// This is a rule about NAMING the fleet, not a limit on reach (owner ruling 2026-11-16): a scope
+/// expression is the caller's own targeting inside their visible set and takes neither this rule
+/// nor the confirmation, even when it matches every device they can see. What bounds the load of
+/// every arm alike is the pacing budget.
 [[nodiscard]] inline bool fleet_wide_denied(DispatchArm arm, bool caller_unfiltered, bool fleet_admin) {
     return arm == DispatchArm::Broadcast && !(caller_unfiltered && fleet_admin);
 }
