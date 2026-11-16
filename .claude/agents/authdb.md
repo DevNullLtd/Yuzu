@@ -195,6 +195,64 @@ canonical list lives here. For broader auth/RBAC/crypto context, defer to the
   to prevent (a Postgres substrate makes transient read failures materially
   more likely than a local SQLite file ever did).
 
+- **MFA proofs bind to a DATABASE-OWNED factor generation (#6079).**
+  `auth.users.mfa_factor_gen` is assigned only by the row trigger
+  `users_mfa_factor_gen` (`ENABLE ALWAYS`, auth migration v3; its function is
+  created `SET search_path = pg_catalog, pg_temp` and the boot check pins `proconfig`), a fresh random
+  positive value (about 60 bits) on every change of `mfa_enrolled_at`, never a
+  counter; application code never writes it. The TOTP and recovery-code
+  verifiers return `MfaVerification{ok, factor_gen, verified_ms}` and
+  `mfa_verify_enrollment` returns `MfaEnrolment{recovery_codes, factor_gen,
+  verified_ms}`: the instant is the database `now()` of the statement that
+  LOADED the secret or candidates (before any crypto check) and success is
+  published only after COMMIT (a failed or unacknowledged COMMIT is
+  `WriteFailed`, never a proof). The constructor validates the
+  trigger and does not open if it fails (the two host recovery one-shots,
+  `--mfa-reset` and `--break-glass-arm`, may open their bootstrap `AuthDB`
+  with `MfaBindingCheck::kBypassForRecovery`: warn, binding reported not
+  enforced for the process life; it exists ONLY on the `AuthDB` and `SessionStore`
+  constructors, `--mfa-reset` passes it to both (the session delete) and
+  `--break-glass-arm` to `AuthDB`, the serving binary never passes it, any other
+  use is CRITICAL); `mfa_status` re-validates behind a
+  request-driven 60 s memo and a trigger observed not in force is STICKY
+  (`MfaStatus::binding_enforced == false`; a check that could not run instead latches
+  `binding_inconclusive`, so every read reports not-enforced until a later check returns Valid), which every gate must answer `503`
+  through the one `judge_local_mfa_binding` (a second copy of that decision is
+  a defect). `mfa_regenerate_recovery_codes` takes a REQUIRED
+  `expected_factor_gen` and compares it under the `auth.users` row lock
+  before writing (`FactorChanged`, deliberately NOT a store-unavailable error);
+  a new factor mutation does the same. **The Settings Disable clears through
+  `AuthDB::mfa_disable_report`, which compares the admitted generation under the
+  `auth.users` row lock (`FactorChanged`: nothing cleared) and clears the factor
+  and deletes the recovery codes in ONE transaction; `--mfa-reset` clears through
+  `AuthDB::mfa_disable` (no expected generation).** Both end the account's durable
+  sessions in a separate, later step (`AuthManager::invalidate_user_sessions`; the
+  CLI opens a `SessionStore` and calls `invalidate_user`), so a failed session delete
+  leaves the factor cleared and is recorded as `partial` / `sessions_ended=failed`.
+  Account deactivation also clears the factor and the recovery codes, through
+  `auth_sql::soft_delete_user_in_txn`, and ends sessions in a separate step
+  (outcome `deactivated_but_session_wipe_failed`). **A NEW route-reachable factor-clear path
+  that skips the generation compare, or that clears the factor and deletes the recovery
+  codes in separate transactions, is CRITICAL.** The auth v3 migration
+  seeds nothing (a hard cutover with no upgrade path, mixed-version window or rollback): every existing row
+  starts at generation `0`. **A PR that writes `mfa_factor_gen`,
+  weakens the trigger or its pinned-body check, publishes a verifier's success
+  before COMMIT, takes the verification instant after the crypto check, or
+  adds a proof decision (admit or refuse on a stored MFA proof) that
+  ignores `binding_enforced` is CRITICAL; the login enrolled-check, Settings view
+  and elevation pre-check read it without that flag legitimately.**
+  Runbook: `docs/ops-runbooks/auth-db-recovery.md` "MFA binding enforcement
+  failed".
+
+- **The SessionStore half of the same invariant (#6079).** The durable proof lives in
+  `session_store.sessions` (`mfa_verified_ms`, `mfa_factor_gen`), guarded by the
+  `sessions_mfa_rebind_guard` trigger (`ENABLE ALWAYS`, session_store migration v3) and the
+  `mfa_bind_seq` column. Any `SessionStore` writer of `mfa_verified_ms`, `mfa_factor_gen`,
+  `username`, `auth_source` or `principal_kind` MUST advance `mfa_bind_seq` in the SAME
+  statement, or the trigger zeroes `mfa_factor_gen` and the proof reads unbound. A PR that
+  adds such a writer without it, or weakens the boot and `find` guard validation
+  (`check_rebind_guard`, the pinned function body, `ENABLE ALWAYS`), is CRITICAL.
+
 - **No session surface on `AuthDB` at all.** `create_session` /
   `validate_session` / `invalidate_session` / `invalidate_all_sessions` /
   `cleanup_expired_sessions` / `touch_session_activity` /
@@ -255,6 +313,9 @@ out each item as PASS / FINDING / N/A:
 - [ ] Every new/modified MFA-state read distinguishes `SecretUnavailable`/
       `QueryFailed` from "not enrolled" / "code rejected" and fails closed
       (503), not silently treating either as a pass-through
+- [ ] Every new MFA verifier or factor mutation carries the factor generation
+      and the pre-crypto database instant, publishes success only after
+      COMMIT, and compares an admitted generation under the row lock (#6079)
 - [ ] No new session-persistence method added to `AuthDB` (sessions stay
       `AuthManager::sessions_`-only)
 - [ ] All SQL parameterised via `pg::exec_params`; zero string interpolation
@@ -290,8 +351,7 @@ out each item as PASS / FINDING / N/A:
 - `docs/postgres-store-playbook.md` — the general born-on-PG store recipe
   `AuthDB` followed.
 - `docs/ops-runbooks/auth-db-recovery.md` — operator recovery procedures
-  (SQLite-era; verify against the current Postgres substrate before
-  following verbatim — a stale-doc follow-up, not yet rewritten).
+  (Postgres-current; the SQLite procedure is gone).
 - `docs/security-reviews/authdb-2026-04-30.md` — the v0.12.0 SQLite-era
   security review record (the source of several invariants above that
   carried forward unchanged).
