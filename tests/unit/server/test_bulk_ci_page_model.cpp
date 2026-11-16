@@ -884,16 +884,19 @@ TEST_CASE("hardware ci page: every ReadError has one answer on both transports",
          "caller's scope",
          -1},
         {hcp::ReadError::kOrderingUnverified, true,
-         "hardware CI records are refused: the database collation version changed under the stored "
-         "CI keys, or the check that confirms it has not yet concluded; the read is refused until "
-         "the database is repaired and re-verified (see PostgreSQL collation version in "
-         "server-admin.md)",
+         "hardware CI records are refused: the database collation version is not verified. "
+         "Either it changed under the stored CI keys (a database repair is needed), or no "
+         "check has concluded yet (it has not run, could not read the version, or is held by "
+         "an invalid index; no repair may be needed). The read is refused until the check "
+         "concludes (see PostgreSQL collation version in server-admin.md)",
          true, "failure", "hardware CI records (REST) state=collation ordering unverified",
          "hardware CI records (MCP) state=collation ordering unverified",
-         "wait retry_after_ms and call once more; if it persists, ask an administrator to repair the "
-         "database collation (see PostgreSQL collation version in server-admin.md)",
-         "wait retry_after_ms and call once more; if it persists, ask an administrator to repair the "
-         "database collation (see PostgreSQL collation version in server-admin.md)",
+         "wait retry_after_ms and call once more, then restart the walk from the first page (do not "
+         "resume the old cursor); if it persists, ask an administrator to check the database "
+         "collation state (see PostgreSQL collation version in server-admin.md)",
+         "wait retry_after_ms and call once more, then restart the walk from the first page (do not "
+         "resume the old cursor); if it persists, ask an administrator to check the database "
+         "collation state (see PostgreSQL collation version in server-admin.md)",
          60000},
     }};
     static_assert(table.size() == static_cast<std::size_t>(hcp::ReadError::kCount),

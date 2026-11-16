@@ -2281,7 +2281,7 @@ TEST_CASE("mcp list_hardware_ci_records: refused as a retryable error while the 
         const std::string msg = r["error"]["message"].get<std::string>();
         CHECK(msg.find("collation version") != std::string::npos);
         CHECK(msg.find("server-admin.md") != std::string::npos);
-        CHECK(r["error"]["data"]["remediation"].get<std::string>().find("repair") != std::string::npos);
+        CHECK(r["error"]["data"]["remediation"].get<std::string>().find("restart the walk from the first page") != std::string::npos);
         CHECK(r.dump().find("SN-a") == std::string::npos);
         CHECK(t.ci_store.reads == 0);
         CHECK(has(t.domain_rows, "inventory.devices.ci|failure|Inventory|fleet"));
@@ -2320,4 +2320,8 @@ TEST_CASE("mcp list_hardware_ci_records: the description names the refusal and i
     const std::string d = tool_entry(json::parse(res->body), "list_hardware_ci_records")["description"];
     CHECK(d.find("retry_after_ms 60000") != std::string::npos);
     CHECK(d.find("collation") != std::string::npos);
+    // After a refusal the walk restarts from the first page (the old cursor is not resumed), and
+    // the confirm read is refused too (ER-1 / UP-1 / CI-7).
+    CHECK(d.find("RESTART the walk from the first page") != std::string::npos);
+    CHECK(d.find("the agent_id confirm read is refused with the same error") != std::string::npos);
 }

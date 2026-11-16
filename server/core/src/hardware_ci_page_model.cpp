@@ -220,10 +220,11 @@ std::string_view read_error_message(ReadError e) {
         return "the caller's scope covers more than 10000 devices and no agent_id was given; a "
                "credential with global read has no such limit";
     case ReadError::kOrderingUnverified:
-        return "hardware CI records are refused: the database collation version changed under the "
-               "stored CI keys, or the check that confirms it has not yet concluded; the read is "
-               "refused until the database is repaired and re-verified (see PostgreSQL collation "
-               "version in server-admin.md)";
+        return "hardware CI records are refused: the database collation version is not verified. "
+               "Either it changed under the stored CI keys (a database repair is needed), or no "
+               "check has concluded yet (it has not run, could not read the version, or is held by "
+               "an invalid index; no repair may be needed). The read is refused until the check "
+               "concludes (see PostgreSQL collation version in server-admin.md)";
     case ReadError::kCount: // a sentinel, not an error: answered like an out-of-range value
         break;
     }

@@ -185,8 +185,9 @@ inline constexpr std::string_view kScopeTooWideRemediation =
 
 /// The A4 `remediation` hint for a `kOrderingUnverified` refusal, the same text on REST and MCP.
 inline constexpr std::string_view kOrderingUnverifiedRemediation =
-    "wait retry_after_ms and call once more; if it persists, ask an administrator to repair the "
-    "database collation (see PostgreSQL collation version in server-admin.md)";
+    "wait retry_after_ms and call once more, then restart the walk from the first page (do not "
+    "resume the old cursor); if it persists, ask an administrator to check the database collation "
+    "state (see PostgreSQL collation version in server-admin.md)";
 
 /// Which transport is answering: it picks the wording of the audit detail and the audit rows the
 /// transport writes (`REST` / `MCP` in the text), nothing else.

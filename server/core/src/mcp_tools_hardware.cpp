@@ -454,8 +454,11 @@ constexpr ToolRecord kToolRecords[] = {
      "store read is a retryable error (wait retry_after_ms, 5000, then call once more; do not "
      "loop), never an empty page. While the database collation version is changed under the stored "
      "keys, or the check that confirms it has not yet concluded, the read is refused with a "
-     "retryable error (retry_after_ms 60000, one more call, not a loop) until an administrator has "
-     "repaired the database (see the server administration guide). Serial, system UUID, MAC and the chassis and board serials are "
+     "retryable error (retry_after_ms 60000, one more call, not a loop) until the check concludes, "
+     "which after a mismatch needs an administrator to repair the database first (see the server "
+     "administration guide). Once the read is served again, RESTART the walk from the first page "
+     "(do not resume the old cursor); the agent_id confirm read is refused with the same error "
+     "while the check has not concluded Trusted, so a refused confirm is not an absence. Serial, system UUID, MAC and the chassis and board serials are "
      "personal data: every served page is audited as inventory.devices.ci and, unlike most MCP "
      "reads, fails CLOSED (no data, retryable error) when that audit row cannot be persisted.",
      R"j({"type":"object","properties":{"limit":{"type":"integer","minimum":1,"maximum":1000,"default":20,"description":"Maximum devices in the page, 1..1000. Default 20; prefer 20 or less for agentic use."},"cursor":{"type":"string","maxLength":2048,"description":"The next_cursor of the previous page. Omit it for the first page. Valid only with the same agent_id it was issued with."},"agent_id":{"type":"string","minLength":1,"maxLength":256,"description":"Read only this device's record: at most 256 bytes, no byte below 0x20 (maxLength counts characters in JSON Schema; the server enforces bytes)."}}})j",

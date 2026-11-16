@@ -3402,7 +3402,7 @@ TEST_CASE("route: GET /api/v1/hardware-ci is refused with a retryable 503 while 
         const std::string msg = body["error"]["message"].get<std::string>();
         CHECK(contains(msg, "collation version"));
         CHECK(contains(msg, "server-admin.md"));
-        CHECK(body["error"]["remediation"].get<std::string>().find("repair") != std::string::npos);
+        CHECK(body["error"]["remediation"].get<std::string>().find("restart the walk from the first page") != std::string::npos);
         CHECK_FALSE(contains(res->body, "SN-a")); // no record body leaked
         CHECK(h.ci_store.reads == 0);             // no store round-trip
         REQUIRE(h.audit_full.size() == 1);
