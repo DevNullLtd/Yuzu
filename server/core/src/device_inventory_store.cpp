@@ -35,7 +35,7 @@ namespace yuzu::server {
 
 namespace {
 
-constexpr const char* kStoreName = "device_inventory_store";
+constexpr const char* kStoreName = kDeviceInventoryStoreSchema;
 
 // Bounded acquires (ADR-0012 lease discipline). Ingest runs on the gRPC thread
 // (direct ReportInventory / gateway ProxyInventory) so it gives up fast on a

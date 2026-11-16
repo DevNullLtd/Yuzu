@@ -1,5 +1,6 @@
 #include "pg_collation_check.hpp"
 
+#include "../device_inventory_store.hpp" // kDeviceInventoryStoreSchema
 #include "pg_exec.hpp"
 #include "pg_pool.hpp"
 #include "pg_raii.hpp"
@@ -24,7 +25,17 @@ CollationVerdict decide_collation_verdict(const CollationFacts& facts) noexcept 
         return CollationVerdict::NotApplicable;
     if (!facts.actual)
         return CollationVerdict::Unreadable;
-    return *facts.recorded == *facts.actual ? CollationVerdict::Ok : CollationVerdict::Mismatch;
+    if (*facts.recorded != *facts.actual)
+        return CollationVerdict::Mismatch;
+    // Equal versions do not prove sound indexes while an invalid one exists (a failed REINDEX
+    // CONCURRENTLY): hold, never conclude Ok. Reported as Unreadable so the gate is untouched.
+    return facts.invalid_index ? CollationVerdict::Unreadable : CollationVerdict::Ok;
+}
+
+std::string invalid_index_failure_text() {
+    return std::string("an invalid index exists in schema ") + kDeviceInventoryStoreSchema +
+           ", typically a leftover of a failed REINDEX ... CONCURRENTLY; drop or rebuild it; the "
+           "gate is held";
 }
 
 const char* to_string(CollationVerdict v) noexcept {
@@ -130,6 +141,23 @@ CollationReport check_collation_version(PgPool& pool) noexcept {
             out.database = PQgetvalue(row.get(), 0, 0);
             facts.recorded = nullable(row.get(), 0, 1);
             facts.actual = nullable(row.get(), 0, 2);
+            // The invalid-index fact matters only when the versions are equal (see
+            // `decide_collation_verdict`), so it is read only then: every other verdict is
+            // reached without this query, and cannot be made Unreadable by it.
+            if (facts.recorded && facts.actual && *facts.recorded == *facts.actual) {
+                PgResult inv = exec_params(
+                    c,
+                    "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_index i "
+                    "JOIN pg_catalog.pg_class c ON c.oid = i.indrelid "
+                    "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+                    "WHERE NOT i.indisvalid AND n.nspname = $1)",
+                    std::vector<std::string>{kDeviceInventoryStoreSchema});
+                if (inv.status() != PGRES_TUPLES_OK || PQntuples(inv.get()) != 1) {
+                    failure = PQerrorMessage(c);
+                    return false;
+                }
+                facts.invalid_index = std::string(PQgetvalue(inv.get(), 0, 0)) == "t";
+            }
             facts_read = true;
             return true;
         });
@@ -143,7 +171,10 @@ CollationReport check_collation_version(PgPool& pool) noexcept {
         out.recorded = facts.recorded.value_or("");
         out.actual = facts.actual.value_or("");
         if (out.verdict == CollationVerdict::Unreadable)
-            out.failure = "the operating system reported no collation version for this database";
+            out.failure = facts.invalid_index
+                              ? invalid_index_failure_text()
+                              : "the operating system reported no collation version for this "
+                                "database";
     } catch (const std::exception& e) {
         out.verdict = CollationVerdict::Unreadable;
         // The text is best effort: assigning it can itself throw (out of memory), and this function

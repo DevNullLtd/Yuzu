@@ -13,7 +13,7 @@
 /// (`pg_database.datcollversion`) and can compute the current one
 /// (`pg_database_collation_actual_version(oid)`); a difference is the signal checked here.
 ///
-/// SHAPE. A pure decision (`decide_collation_verdict`) over three facts, and one I/O function
+/// SHAPE. A pure decision (`decide_collation_verdict`) over four facts, and one I/O function
 /// (`check_collation_version`) that fetches them with one short bounded transaction. Neither
 /// throws. The check never stops the server: it logs the result, exports a gauge, and keeps
 /// booting whatever the verdict, because an operator must be able to start the server to fix the
@@ -48,7 +48,19 @@
 ///     builtin provider records a version and is checked, measured on PostgreSQL 18.4).
 ///   - Mismatch: both are known and they differ.
 ///   - Unreadable: the facts could not be read, or the recorded version is set but the operating
-///     system could not report the actual one.
+///     system could not report the actual one, or the two versions are EQUAL but an invalid index
+///     exists in the device inventory store's schema (below).
+///
+/// THE INVALID-INDEX HOLD. `ALTER DATABASE ... REFRESH COLLATION VERSION` makes the recorded
+/// version equal the actual one whether or not the indexes were rebuilt, so equal versions cannot
+/// prove the indexes are sound. A `REINDEX ... CONCURRENTLY` that failed (a duplicate key found
+/// while building the new index) leaves an INVALID index behind (`pg_index.indisvalid = false`)
+/// while the old index stays live. The check therefore reports Unreadable, not Ok, when the
+/// versions match and such an index exists in schema `device_inventory_store`. This can only HOLD:
+/// an Unreadable report never writes the gate (`report_collation_check`), so it keeps a standing
+/// Mismatch (or the boot Unproven) in place and never enters Mismatch, never pauses a write by
+/// itself, and never disturbs a Trusted gate. It covers only the CONCURRENTLY failure form (a
+/// plain `REINDEX` that fails rolls back and leaves no invalid index) and only that one schema.
 
 #include <array>
 #include <atomic>
@@ -89,12 +101,17 @@ all_collation_verdicts() noexcept {
     return kCollationVerdictNames;
 }
 
-/// The three facts the decision is made from.
+/// The facts the decision is made from.
 struct CollationFacts {
     bool column_exists{false};           ///< `pg_database.datcollversion` exists (PostgreSQL 15+)
     std::optional<std::string> recorded; ///< `datcollversion`; nullopt when NULL
     /// `pg_database_collation_actual_version(oid)`; nullopt when NULL.
     std::optional<std::string> actual;
+    /// An invalid index (`pg_index.indisvalid = false`) exists in schema
+    /// `device_inventory_store`. Read only when the two versions are equal (the one case it
+    /// changes the answer); false otherwise, so a row of the decision table that never reads it
+    /// is unaffected.
+    bool invalid_index{false};
 };
 
 /// Pure. No I/O.
@@ -114,6 +131,10 @@ struct CollationFacts {
 /// possibly from an earlier attempt, because the pool keeps only its latest error.
 [[nodiscard]] std::string unreadable_failure_text(const std::string& failure, bool facts_read,
                                                   const std::string& pool_error);
+
+/// The log text of an Unreadable verdict caused by the invalid-index hold: names the cause and
+/// the repair. Pure.
+[[nodiscard]] std::string invalid_index_failure_text();
 
 /// Fixed text for logs and tests: "ok", "not_applicable", "mismatch", "unreadable".
 [[nodiscard]] const char* to_string(CollationVerdict v) noexcept;

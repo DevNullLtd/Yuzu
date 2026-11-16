@@ -52,6 +52,11 @@ struct PgMigration;
 
 namespace yuzu::server {
 
+/// The store's name and PostgreSQL schema (the migration runner's key). The ONE spelling: the
+/// collation check reads it to look for an invalid index in this schema
+/// (`pg::check_collation_version`), so a rename cannot leave that guard looking elsewhere.
+inline constexpr const char* kDeviceInventoryStoreSchema = "device_inventory_store";
+
 /// The store's migration array (schema `device_inventory_store`), so a test can pin the text a
 /// migration carries (the transaction-local settings of v4) without a second copy of it.
 [[nodiscard]] const std::vector<pg::PgMigration>& device_inventory_migrations();
