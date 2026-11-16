@@ -474,7 +474,9 @@ TEST_CASE("lifecycle import: oversized, deep and wide bodies are refused by thei
 }
 
 TEST_CASE("lifecycle import: 5,000 rules pass and 5,001 are refused", "[lifecycle][import]") {
-    // Two mapped events over N aliases store 2N rules: 2,500 aliases land on the cap, 2,501 pass.
+    // Two mapped events over N aliases store 2N rules: 2,500 aliases land on the cap and 2,501 are
+    // refused. Exactly 5,001 CLE rules cannot be built (rules = aliases x at most two events, aliases
+    // capped at 5,000), so the CLE boundary is 5,000 pass / 5,002 refused; the exact 5,001 case is csv.
     const auto both = event(2, "endOfLife", range("vers:npm/*")) + "," +
                       event(1, "endOfSupport", range("vers:npm/*"));
     const auto at_cap = li::parse(li::Format::cle, doc_with(many_identifiers(2500), both), kRef);

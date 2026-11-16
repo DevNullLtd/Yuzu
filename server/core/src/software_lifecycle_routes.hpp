@@ -19,8 +19,8 @@
 /// never an empty 200.
 ///
 /// The formats are exactly the enumerators of `lifecycle_import::Format`, resolved through
-/// `lifecycle_import::parse_format`. `kFormatTokens` is the one place the route spells them for
-/// its 400 text; the unit test pins it to `parse_format`.
+/// `lifecycle_import::parse_format`. `kLifecycleImportFormatTokens` is the one place the route spells
+/// them for its 400 text; the unit test checks every token resolves through `parse_format`.
 ///
 /// Registered from server.cpp ahead of `RestApiV1::register_routes`, because the generic
 /// `GET /api/v1/inventory/{a}/{b}` pattern would otherwise be tried first.

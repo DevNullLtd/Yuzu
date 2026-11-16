@@ -175,8 +175,8 @@ TEST_CASE("lifecycle routes: the pure helpers", "[lifecycle][routes]") {
 
 TEST_CASE("lifecycle routes: the offered formats are exactly the parser's enumerators",
           "[lifecycle][routes]") {
-    // Two enumerators today; adding one to Format fails this until the token list, the OpenAPI
-    // enum and the docs follow.
+    // Pins what the route offers: every listed token resolves through parse_format and the OpenAPI
+    // enum equals the list. A new Format enumerator has to be added to the token list by hand.
     CHECK(kLifecycleImportFormatTokens.size() == 2);
     std::set<li::Format> resolved;
     for (const auto token : kLifecycleImportFormatTokens) {
