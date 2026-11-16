@@ -5123,41 +5123,64 @@ struct ScratchRegKey {
 /// `mu` once released. `inside` counts the calls currently between hook entry and hook exit;
 /// it is the LAST thing a call touches (after its lock is dropped), and the destructor waits
 /// for it to reach zero - bounded, so a stuck worker can never hang the test binary.
+///
+/// The state lives in a shared_ptr that the hook captures BY VALUE (the rule of
+/// VerifyHookState): the hook runs on detached, never-joined probe workers, and the destructor's
+/// wait only covers workers already inside, so a worker launched but not yet inside the hook
+/// could otherwise call into a destroyed gate. The public members are references into that
+/// state, so a case still writes `gate.open`, locks `gate.mu` and reads `gate.parked`.
+///
+/// Resource ledger: one shared_ptr<State> (std::make_shared, released by the last holder: the
+/// gate and each hook copy); one mutex, one condition_variable and three atomics inside it,
+/// all owned by the State; no raw handle, thread or callback is added. The destructor still
+/// releases every parked worker and waits (bounded 10 s) for those already inside.
 struct ProbeGate {
-    std::mutex mu;
-    std::condition_variable cv;
-    bool open{false};
-    std::atomic<int> parked{0};
-    std::atomic<int> seen{0};
-    std::atomic<int> inside{0};
+    struct State {
+        std::mutex mu;
+        std::condition_variable cv;
+        bool open{false};
+        std::atomic<int> parked{0};
+        std::atomic<int> seen{0};
+        std::atomic<int> inside{0};
+    };
+    std::shared_ptr<State> st{std::make_shared<State>()};
+    std::mutex& mu{st->mu};
+    std::condition_variable& cv{st->cv};
+    bool& open{st->open};
+    std::atomic<int>& parked{st->parked};
+    std::atomic<int>& seen{st->seen};
+    std::atomic<int>& inside{st->inside};
+    ProbeGate() = default;
+    ProbeGate(const ProbeGate&) = delete;
+    ProbeGate& operator=(const ProbeGate&) = delete;
     std::function<void(std::string_view)> hook_for(std::string match) {
-        return [this, match](std::string_view sub) {
+        return [st = this->st, match](std::string_view sub) {
             struct Inside {
                 std::atomic<int>& n;
                 explicit Inside(std::atomic<int>& n_) : n(n_) {
                     n.fetch_add(1, std::memory_order_acq_rel);
                 }
                 ~Inside() { n.fetch_sub(1, std::memory_order_acq_rel); }
-            } inside_scope{inside}; // declared first: destroyed last, after `lk` below
-            seen.fetch_add(1, std::memory_order_relaxed);
+            } inside_scope{st->inside}; // declared first: destroyed last, after `lk` below
+            st->seen.fetch_add(1, std::memory_order_relaxed);
             if (sub != match)
                 return;
-            parked.fetch_add(1, std::memory_order_acq_rel);
-            std::unique_lock lk(mu);
-            cv.wait(lk, [&] { return open; });
+            st->parked.fetch_add(1, std::memory_order_acq_rel);
+            std::unique_lock lk(st->mu);
+            st->cv.wait(lk, [&] { return st->open; });
         };
     }
     void release() {
         {
-            std::lock_guard lk(mu);
-            open = true;
+            std::lock_guard lk(st->mu);
+            st->open = true;
         }
-        cv.notify_all();
+        st->cv.notify_all();
     }
     ~ProbeGate() {
         release(); // never leave a worker parked past the test
         const auto deadline = std::chrono::steady_clock::now() + 10s;
-        while (inside.load(std::memory_order_acquire) > 0 &&
+        while (st->inside.load(std::memory_order_acquire) > 0 &&
                std::chrono::steady_clock::now() < deadline)
             std::this_thread::sleep_for(1ms);
     }
@@ -17986,8 +18009,8 @@ TEST_CASE("Registry spark (real mechanism): an idle healthy watch is verified an
 // with the one the watch holds. A parent renamed away and a key re-created at the original
 // path BEFORE the next verification is therefore not noticed, and the watch stays deaf on the
 // renamed tree. Closing it needs the held handle's kernel name (NtQueryKey on a duplicate of
-// it), which the owner has not asked for. If this case ever fails because the watch IS
-// faulted, the residual was closed: update the manual and the flip-gate text with it.
+// it); it is an ACCEPTED residual, deferred to #7877 item 31. If this case ever fails because
+// the watch IS faulted, the residual was closed: update the manual and the flip-gate text with it.
 TEST_CASE("Registry spark (real mechanism): a parent renamed away and its path re-created "
           "before the next verification is not noticed (documented residual, #7836)",
           "[spark][mechanism][windows][5719]") {
