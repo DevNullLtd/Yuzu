@@ -74,7 +74,12 @@
  *     watches launches its verifications together (probe lane cap, refusals
  *     defer without demoting coverage); a registry open that hangs pins one slot
  *     of the SHARED 16-slot probe lane (File has a separate verification lane),
- *     and 16 such opens stall every arm and re-arm until they return.
+ *     and 16 such opens stall every arm and re-arm until they return; a write in
+ *     the renamed (ghost) tree during the Faulted window can still deliver one
+ *     Fired for the registered key (an accepted residual, adjudicated LOW by an
+ *     independent non-author reviewer, #7877 item 34, pre-existing emission): it
+ *     costs one idempotent evaluation that re-reads live state, ends at the
+ *     retry, and the File mechanism suppresses it.
  *
  * OWNERSHIP / DISPATCH PROTOCOL (plan amendment 5 - the same rules PR-B2/B3
  * apply to File/Service):

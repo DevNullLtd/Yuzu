@@ -1789,7 +1789,8 @@ flip, with a red-first test each:
       residual, Dave, no independent adjudicator) and two more accepted residuals found by the #7836 governance
       review: an undecided verification keeps the old handle and so misses a rename it saw until the next
       verification that decides, and an Ancestor-mode watch is never verified, so a later rename of its shelter
-      ancestor (including one re-committed in Ancestor mode after a verdict) is missed.
+      ancestor (including one re-committed in Ancestor mode after a verdict) is missed; item 34 (a Fired from a
+      write in the renamed tree during the Faulted window, adjudicated LOW) is a fourth, noted in the residual list.
     - #7901: a CI leg installs `dbus-daemon` and sets `YUZU_REQUIRE_SPARK_DBUS_TESTS`, so the Linux Service case runs.
     - Also below: export of the File debug counters (#7658; the Registry `verify_lost` and `verify_undecided` counters
       are test-only too and should be exported alongside them, a recommendation: #7658 does not yet say so), the audit,
@@ -1895,7 +1896,11 @@ flip, with a red-first test each:
     demote coverage); a verification that hangs pins one probe-lane slot and that watch stays unverified, and because the
     Registry verification shares that one 16-slot lane with every Registry arm and re-arm (File has a separate verification
     lane), 16 hung verifications stall every arm and re-arm, including Guardian registry-rule re-arming after a fire,
-    until they return (a residual, not a measured event). Cost and audit: one
+    until they return (a residual, not a measured event); and a write in the renamed (ghost) tree during the Faulted
+    window can still deliver one `Fired` for the registered key (an accepted residual, #7877 item 34, adjudicated LOW
+    by an independent non-author reviewer; the emission is pre-existing, this change only bounds the window): it
+    costs one idempotent evaluation that re-reads live state, ends at the retry, and the File mechanism suppresses
+    it (the "no Fired event between Faulted and Recovered" case above is a File case). Cost and audit: one
     detached worker launch, one `RegOpenKeyExW`, one `RegNotifyChangeKeyValue`, one event and two or three handle
     closes per watched key per interval, and an object-access audit event on a key that carries an auditing SACL (not
     measured; no figure is quoted). The cost statement of item (2) below, the missing off switch and #7876 (now titled for
