@@ -1052,7 +1052,7 @@ There is no aggregation pass: the fold writes every tier as the event arrives. T
 
 1. Enforces retention on each tier (clock-guarded, at most 5000 rows per table per pass)
 2. Enforces the database byte budget, runs the one-off VACUUM check and trims the write-ahead log (see [The database byte budget](#the-database-byte-budget))
-3. Once a week, sweeps the string dictionary of entries no tier refers to any more (2 seconds at first; a sweep whose scan does not finish is counted in `dict_gc_starved_total` and retried a day later with a longer limit, 4 s and then 8 s)
+3. Once a week, sweeps the string dictionary of entries no tier refers to any more (2 seconds at first; a sweep whose scan does not finish is counted in `dict_gc_starved_total` (with `dict_gc_starved_streak` and the attempt time `dict_gc_last_attempt_ts`) and retried a day later with a longer limit, 4 s and then 8 s)
 
 To force an immediate cycle, use the `echo.rollup` action. It still replies `echo|rollup|0|rows_aggregated`; the count stays so a stored client keeps parsing it.
 
