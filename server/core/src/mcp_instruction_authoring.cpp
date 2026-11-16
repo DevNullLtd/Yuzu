@@ -369,7 +369,7 @@ Result delete_definition(const json& args, const Ports& p) {
     const std::string preimage = *stored ? describe_deleted_definition(**stored) : "";
     // UP-6: after the existence read, before the attempted row (see the v1 route). A refusal
     // mutates nothing, so it writes one row: `denied` for a referenced definition, `error` when
-    // the lookup was unwired or failed (the vocabulary the v1 DELETE writes).
+    // the lookup was unwired or failed (the vocabulary the v1 and legacy DELETE write).
     if (*stored) {
         if (auto refusal = delete_referrer_refusal(id, p.referrers_fn)) {
             if (refusal->kind == Kind::kReferenced)

@@ -5,7 +5,8 @@
 **Component:** Agent core (sync scheduler) · Server (inventory ingest + Postgres store) · Gateway (proxy)
 **Authors:** Dave Rae
 
-> **Amendment pending: ADR-3006 (plugin management, proposed 2026-10-06).** ADR-3006 sets
+> **Amendment pending delivery: ADR-3006 (plugin management, 2026-10-06; accepted, status
+> reconciled 2026-11-14).** ADR-3006 sets
 > the direction that `--inventory-disable` stops being the collection toggle: it becomes a
 > one-time starting-state input that the server adopts as a visible off-rule, and each daily-sync
 > source becomes a unit that can be switched off on its own. Nothing has changed in the product
@@ -155,7 +156,7 @@ envelope, so it is the natural **baseline store for the whole sync framework**
 (many data types will sync — not just software).
 
 Therefore we **coexist, not replace**:
-- Keep the generic `InventoryStore` (SQLite today) **untouched** — the
+- Keep the generic `InventoryStore` (SQLite at the time; Postgres-native since ADR-0037) **untouched** — the
   sync-framework baseline + the scope/eval surface. (Porting it to Postgres
   under the sync framework is a follow-on, aligned with ADR-0006.)
 - Add a **new born-on-Postgres `SoftwareInventoryStore`** (schema

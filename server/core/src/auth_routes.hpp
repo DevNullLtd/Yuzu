@@ -520,7 +520,10 @@ public:
     /// global-grant, permission-group or subtree read: `read_failed`) is
     /// `GateFailure::Degraded` (503) too. Only a genuine
     /// `ListReadDecision::DenyAll` (real "no grant") lands on
-    /// `GateFailure::Forbidden` (403).
+    /// `GateFailure::Forbidden` (403), as does the engine-entry refusal of a
+    /// service-scoped engine session (also 403, no `.permission`); an admit that
+    /// would have been unrestricted for a service-scoped session is
+    /// `GateFailure::InvariantViolated` (500, not retryable).
     ///
     /// SELF-SUFFICIENT for the RBAC/management-group authority decision — do
     /// NOT additionally gate the same `(securable_type, operation)` on
@@ -1154,6 +1157,29 @@ private:
                                   const std::string& audit_action,
                                   const std::string& audit_detail,
                                   const authz::CeilingResult& ceiling);
+
+    /// The ONE response when a list gate would hand a service-scoped session UNRESTRICTED
+    /// authority (a corrupted service-scoped engine row; minting refuses it). Shared by
+    /// `require_fleet_read` and `require_list_read`: counts
+    /// `yuzu_server_authz_service_scope_unrestricted_refused_total{gate,site}`, logs, writes one
+    /// audit row (the gate's own action, FIXED text) and answers `kEngineEntry` 403 /
+    /// `kPostcondition` 500, never naming a `.permission` (clause 5). Extend, never fork.
+    void refuse_service_scoped_unrestricted(const httplib::Request& req, httplib::Response& res,
+                                            const auth::Session& session, const std::string& perm,
+                                            authz::UnrestrictedRefusalGate gate,
+                                            authz::UnrestrictedRefusalSite site);
+
+    /// `require_fleet_read`'s one admit point: the only place a `ListAuthority` is minted.
+    [[nodiscard]] std::expected<authz::ListAuthority, authz::GateFailure>
+    admit_fleet_read(const httplib::Request& req, httplib::Response& res,
+                     const auth::Session& session, const std::string& perm,
+                     authz::VisibleSet scope);
+
+    /// `require_list_read`'s body. `require_list_read` is the ONLY caller (it applies the
+    /// service-scope postcondition to whatever this admits); never call this directly.
+    ListReadGate require_list_read_unchecked(const httplib::Request& req, httplib::Response& res,
+                                             const std::string& securable_type,
+                                             const std::string& operation);
 
     std::optional<std::vector<authz::PermPair>> service_scope_global_safe_override_for_test_;
 

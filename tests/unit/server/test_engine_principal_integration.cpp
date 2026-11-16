@@ -18,6 +18,8 @@
 #include "engine_principal_store.hpp"
 
 #include "api_token_store.hpp"
+#include "audit_store.hpp"
+#include "authz_gates.hpp"
 #include "test_api_token_pg_helper.hpp" // ApiTokenStorePg — shared PG-backed ApiTokenStore helper
 #include "management_group_store.hpp"
 #include "oidc_provider.hpp"
@@ -26,6 +28,7 @@
 
 #include "test_auth_db_pg_helper.hpp"
 
+#include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auth_db.hpp>
 #include <yuzu/server/server.hpp>
@@ -1114,6 +1117,258 @@ TEST_CASE("require_fleet_read — engine principal with an explicit global RBAC 
     REQUIRE_FALSE(result2.has_value());
     CHECK(result2.error() == authz::GateFailure::Forbidden); // Write denied structurally (Read-only gate)
     CHECK(res2.status == 403);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 6c-1. A service-scoped session never receives unrestricted fleet-read authority
+//       (#5557). Minting refuses a service-scoped engine token, so the only way to
+//       reach the gate with one is a corrupted row: this rig mints a VALID engine token,
+//       then sets its stored `scope_service` by direct SQL (DML on the shared clone).
+//       The refusal is the FIRST statement of the gate's engine branch, so the grant
+//       and the RBAC on/off state must not matter.
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+/// Set the stored `scope_service` of every token minted for `principal_id`: the corrupted-row
+/// shape `ApiTokenStore::create_token` refuses to mint.
+void corrupt_token_scope_service(const std::string& dsn, const std::string& principal_id,
+                                 const std::string& scope_service) {
+    yuzu::server::pg::PgConn c{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(c.get()) == CONNECTION_OK);
+    auto r = yuzu::server::pg::exec_params(
+        c.get(), "UPDATE api_token_store.api_tokens SET scope_service = $1 WHERE principal_id = $2",
+        std::vector<std::string>{scope_service, principal_id});
+    REQUIRE(r.status() == PGRES_COMMAND_OK);
+    REQUIRE(std::string(PQcmdTuples(r.get())) == "1");
+}
+
+/// A real AuthRoutes over a real RbacStore, a real AuditStore and a metrics registry, with the
+/// engine `engine:vuln` minted, optionally granted `GuaranteedState:Read`, and its token's
+/// stored `scope_service` set to `scope` (empty = a clean engine). Member order is the
+/// destruction-safe order: `metrics` is first because `fix.auth_mgr` keeps a raw pointer to it.
+struct ServiceScopedEngineRig {
+    yuzu::MetricsRegistry metrics;
+    EngineRbacGateFixture fix;
+    yuzu::test::RbacStorePg rbac_bundle;
+    RbacStore& rbac = *rbac_bundle;
+    yuzu::server::pg::PgPool audit_pool;
+    AuditStore audit_store;
+    std::unique_ptr<AuthRoutes> ar;
+
+    ServiceScopedEngineRig(bool rbac_on, bool grant, const std::string& scope)
+        : audit_pool{{.conninfo = rbac_bundle.dsn(), .size = 2}}, audit_store{audit_pool} {
+        REQUIRE(rbac.is_open());
+        REQUIRE(audit_store.is_open());
+        rbac.set_rbac_enabled(rbac_on);
+        if (grant) {
+            REQUIRE(rbac.create_role({.name = "EngineReader", .description = "d"}).has_value());
+            REQUIRE(rbac.set_permission({"EngineReader", "GuaranteedState", "Read", "allow"})
+                        .has_value());
+            REQUIRE(rbac.assign_role({"engine", "engine:vuln", "EngineReader"}).has_value());
+        }
+        if (!scope.empty())
+            corrupt_token_scope_service(fix.api_tokens.dsn(), "engine:vuln", scope);
+        fix.auth_mgr.set_metrics_registry(&metrics);
+        ar = std::make_unique<AuthRoutes>(fix.cfg, fix.auth_mgr, &rbac, fix.api_tokens.get(),
+                                          &audit_store, /*mgmt_group_store=*/nullptr,
+                                          /*tag_store=*/nullptr, /*analytics_store=*/nullptr,
+                                          fix.oidc_mu, fix.oidc_provider);
+        ar->set_engine_principal_store(fix.engine_store.get());
+    }
+
+    double refused(const char* gate, const char* site) {
+        return metrics
+            .counter("yuzu_server_authz_service_scope_unrestricted_refused_total",
+                     {{"gate", gate}, {"site", site}})
+            .value();
+    }
+
+    /// Sum of the four fixed series: "nothing was refused" is exactly 0.
+    double refused_total() {
+        double t = 0;
+        for (const char* gate : {"fleet_read", "list_read"})
+            for (const char* site : {"engine_entry", "postcondition"})
+                t += refused(gate, site);
+        return t;
+    }
+};
+
+/// The shared assertions for a refused corrupted-engine request on either gate: the A4 body
+/// names the permission in its message but NEVER carries a `permission` field (clause 5, no
+/// grant would admit this caller), has no retry hint, and does not echo the scope value; the
+/// audit trail has exactly one `denied` row with the gate's own action and the fixed text.
+void check_corrupted_engine_refused(ServiceScopedEngineRig& rig, const httplib::Response& res,
+                                    const std::string& audit_action) {
+    CHECK(res.status == 403);
+    CHECK(res.body.find("permission denied: GuaranteedState:Read") != std::string::npos);
+    CHECK(res.body.find("\"permission\"") == std::string::npos);
+    CHECK(res.body.find("\"retry_after_ms\":null") != std::string::npos);
+    CHECK(res.body.find("scope_service") == std::string::npos);
+    auto rows = rig.audit_store.query({});
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK((*rows)[0].action == audit_action);
+    CHECK((*rows)[0].result == "denied");
+    CHECK((*rows)[0].detail ==
+          "engine principal denied: corrupted scope_service on engine session");
+    CHECK((*rows)[0].principal == "engine:vuln");
+}
+
+} // namespace
+
+TEST_CASE("require_fleet_read: a service-scoped engine session is refused 403 even WITH a "
+          "global grant (RBAC on), counted and audited, the body names no permission",
+          "[pg][engine_principal][integration][auth_routes][rbac][service_scope]") {
+    ServiceScopedEngineRig rig(/*rbac_on=*/true, /*grant=*/true, "A");
+    auto req = rig.fix.request();
+    httplib::Response res;
+    auto result = rig.ar->require_fleet_read(req, res, "GuaranteedState", "Read");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() == authz::GateFailure::Forbidden);
+    check_corrupted_engine_refused(rig, res, "auth.fleet_read_required");
+    CHECK(rig.refused("fleet_read", "engine_entry") == 1.0);
+    CHECK(rig.refused_total() == 1.0); // the other three series did not move
+}
+
+TEST_CASE("require_fleet_read: a service-scoped engine session is refused identically when "
+          "RBAC is off (not the legacy-open path, not a different text)",
+          "[pg][engine_principal][integration][auth_routes][rbac][service_scope]") {
+    ServiceScopedEngineRig rig(/*rbac_on=*/false, /*grant=*/true, "A");
+    auto req = rig.fix.request();
+    httplib::Response res;
+    auto result = rig.ar->require_fleet_read(req, res, "GuaranteedState", "Read");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() == authz::GateFailure::Forbidden);
+    check_corrupted_engine_refused(rig, res, "auth.fleet_read_required");
+    CHECK(rig.refused("fleet_read", "engine_entry") == 1.0);
+    CHECK(rig.refused_total() == 1.0);
+}
+
+TEST_CASE("require_fleet_read: a service-scoped engine session with NO grant gets the "
+          "corrupted-row refusal, proving the entry refusal and not the grant check fired",
+          "[pg][engine_principal][integration][auth_routes][rbac][service_scope]") {
+    ServiceScopedEngineRig rig(/*rbac_on=*/true, /*grant=*/false, "A");
+    auto req = rig.fix.request();
+    httplib::Response res;
+    auto result = rig.ar->require_fleet_read(req, res, "GuaranteedState", "Read");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() == authz::GateFailure::Forbidden);
+    check_corrupted_engine_refused(rig, res, "auth.fleet_read_required");
+    CHECK(rig.refused("fleet_read", "engine_entry") == 1.0);
+}
+
+TEST_CASE("require_fleet_read: a clean engine with the same grant is unchanged: admitted TOP, "
+          "no refusal counted, no audit row (the refusal, not the grant, is what denied above)",
+          "[pg][engine_principal][integration][auth_routes][rbac][service_scope]") {
+    ServiceScopedEngineRig rig(/*rbac_on=*/true, /*grant=*/true, /*scope=*/"");
+    auto req = rig.fix.request();
+    httplib::Response res;
+    auto result = rig.ar->require_fleet_read(req, res, "GuaranteedState", "Read");
+    REQUIRE(result.has_value());
+    CHECK(result->unfiltered());
+    CHECK(rig.refused_total() == 0.0);
+    auto rows = rig.audit_store.query({});
+    REQUIRE(rows.has_value());
+    CHECK(rows->empty());
+}
+
+TEST_CASE("require_fleet_read: a clean engine without the grant keeps the ordinary 403 "
+          "(permission named, as today), with no refusal counted",
+          "[pg][engine_principal][integration][auth_routes][rbac][service_scope]") {
+    ServiceScopedEngineRig rig(/*rbac_on=*/true, /*grant=*/false, /*scope=*/"");
+    auto req = rig.fix.request();
+    httplib::Response res;
+    auto result = rig.ar->require_fleet_read(req, res, "GuaranteedState", "Read");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() == authz::GateFailure::Forbidden);
+    CHECK(res.status == 403);
+    CHECK(res.body.find("\"permission\":\"GuaranteedState:Read\"") != std::string::npos);
+    CHECK(rig.refused_total() == 0.0);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 6c-2. The same refusal on the list-read gate (#5557): require_list_read's engine branch
+//       also admitted a service-scoped (corrupted) engine session unfiltered. Same rig, same
+//       shared responder; the audit action is the gate's own, `auth.permission_required`.
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("require_list_read: a service-scoped engine session is refused 403 even WITH a "
+          "global grant (RBAC on), counted and audited, the body names no permission",
+          "[pg][engine_principal][integration][auth_routes][rbac][adr0017][service_scope]") {
+    ServiceScopedEngineRig rig(/*rbac_on=*/true, /*grant=*/true, "A");
+    auto req = rig.fix.request();
+    httplib::Response res;
+    auto gate = rig.ar->require_list_read(req, res, "GuaranteedState", "Read");
+    CHECK_FALSE(gate.admitted);
+    CHECK_FALSE(gate.scope.has_value());
+    check_corrupted_engine_refused(rig, res, "auth.permission_required");
+    CHECK(rig.refused("list_read", "engine_entry") == 1.0);
+    CHECK(rig.refused_total() == 1.0); // the other three series did not move
+}
+
+TEST_CASE("require_list_read: a service-scoped engine session is refused identically when "
+          "RBAC is off",
+          "[pg][engine_principal][integration][auth_routes][rbac][adr0017][service_scope]") {
+    ServiceScopedEngineRig rig(/*rbac_on=*/false, /*grant=*/true, "A");
+    auto req = rig.fix.request();
+    httplib::Response res;
+    auto gate = rig.ar->require_list_read(req, res, "GuaranteedState", "Read");
+    CHECK_FALSE(gate.admitted);
+    check_corrupted_engine_refused(rig, res, "auth.permission_required");
+    CHECK(rig.refused("list_read", "engine_entry") == 1.0);
+    CHECK(rig.refused_total() == 1.0);
+}
+
+TEST_CASE("require_list_read: a service-scoped engine session with NO grant gets the "
+          "corrupted-row refusal, proving the entry refusal and not the grant check fired",
+          "[pg][engine_principal][integration][auth_routes][rbac][adr0017][service_scope]") {
+    ServiceScopedEngineRig rig(/*rbac_on=*/true, /*grant=*/false, "A");
+    auto req = rig.fix.request();
+    httplib::Response res;
+    auto gate = rig.ar->require_list_read(req, res, "GuaranteedState", "Read");
+    CHECK_FALSE(gate.admitted);
+    check_corrupted_engine_refused(rig, res, "auth.permission_required");
+    CHECK(rig.refused("list_read", "engine_entry") == 1.0);
+}
+
+TEST_CASE("require_list_read: a clean engine with the same grant is unchanged: admitted "
+          "unfiltered, no refusal counted, no audit row",
+          "[pg][engine_principal][integration][auth_routes][rbac][adr0017][service_scope]") {
+    ServiceScopedEngineRig rig(/*rbac_on=*/true, /*grant=*/true, /*scope=*/"");
+    auto req = rig.fix.request();
+    httplib::Response res;
+    auto gate = rig.ar->require_list_read(req, res, "GuaranteedState", "Read");
+    CHECK(gate.admitted);
+    CHECK_FALSE(gate.scope.has_value());
+    CHECK(rig.refused_total() == 0.0);
+    auto rows = rig.audit_store.query({});
+    REQUIRE(rows.has_value());
+    CHECK(rows->empty());
+}
+
+TEST_CASE("require_list_read: a service-scoped HUMAN token keeps the existing blanket deny "
+          "(its own text and audit detail), the new refusal does not shadow it",
+          "[pg][engine_principal][integration][auth_routes][rbac][adr0017][service_scope]") {
+    ServiceScopedEngineRig rig(/*rbac_on=*/true, /*grant=*/true, /*scope=*/"");
+    REQUIRE(rig.fix.auth_mgr.upsert_user("alice", "password1234", auth::Role::admin));
+    auto raw = rig.fix.api_tokens->create_token("svc-human", "alice", now_epoch() + 3600, "A");
+    REQUIRE(raw.has_value());
+    httplib::Request req;
+    req.headers.emplace("Authorization", "Bearer " + *raw);
+    httplib::Response res;
+    auto gate = rig.ar->require_list_read(req, res, "GuaranteedState", "Read");
+    CHECK_FALSE(gate.admitted);
+    CHECK(res.status == 403);
+    CHECK(res.body.find("service-scoped tokens cannot read the fleet-wide status rollup") !=
+          std::string::npos);
+    CHECK(res.body.find("\"permission\"") == std::string::npos);
+    auto rows = rig.audit_store.query({});
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK((*rows)[0].detail.find("service-scoped token 'A' cannot read the fleet-wide") !=
+          std::string::npos);
+    CHECK(rig.refused_total() == 0.0);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

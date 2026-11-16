@@ -10,6 +10,13 @@ context-refs: #1634 (response-reader ruling), PR #1711 (per-row filter foundatio
 
 # 0017 — Management-group confinement applies to list/fan-out reads: the admit-then-filter list gate
 
+> **Update (2026-11-14, against dev @ 2c49b4ea0) — currency notes.** (1) References to `rbac.db` are
+> from the SQLite era: RBAC now lives in the Postgres `rbac_store` schema (ADR-0041), which fails
+> closed on a degraded read. The rule each passage states is unchanged. (2) The `file:line` cites in
+> this ADR (notably the `server.cpp:NNNN` ones) record where each site was when the passage was
+> written. `server.cpp` has since grown several-fold and they no longer point at the named code;
+> find each site by the function or route it names.
+
 > **Update (2026-07-24) — #1715 resolved; PR-A foundation landed.** The global↔management-group
 > deny-precedence lattice the "Combining algorithm" section below left *undecided* has been decided:
 > **cross-boundary combining is additive/OR; deny-overrides applies only within a single group's
@@ -272,8 +279,9 @@ gate.
   replaced with an HTTP 200 note (`data-denied="true"` for a 403, `data-degraded="gate"` for a 503;
   a 401 passes through), because the dashboard drops 4xx/5xx bodies; the REST and MCP twins keep the
   real 403/503. The fragment suppresses the owner disjunct for service-scoped sessions
-  (a service-scoped token's session username is its minter); the other execution read surfaces still show
-  a minter's executions to a service-scoped token (#5557). The fragment pushes the scope into SQL
+  (a service-scoped token's session username is its minter); since #5557 every other execution read
+  surface does too, through the ownership key `execution_owner_key(session)`, so a service-scoped
+  token sees an execution only once an agent in its service scope has a status row for it. The fragment pushes the scope into SQL
   before its LIMIT and bounds the agent-status read to the visible agents; MCP's first gate stays a
   plain `Infrastructure:Read`. **NOT covered, disclosed:** `summarize_working_set` `kind=fleet` and
   `kind=result_set` return the whole-registry agent count from `agents_fn()` (#4753, checklist still
@@ -291,7 +299,8 @@ gate.
   migration (#3789)". The LIST route's confinement predicate is pushed into SQL before `LIMIT`
   (INV-3) via a correlated `EXISTS` over `agent_exec_status` plus an owner disjunct — a real
   visible-agent intersection, not the own-dispatches-only shortcut MCP `list_executions` still uses
-  (`docs/auth-architecture.md`'s Third migration paragraph). The two mutating routes keep `require_permission(Execution, Execute)` ahead of
+  for a management-group-confined caller (a service-scoped caller has used the agent-evidence rule
+  since #5557; `docs/auth-architecture.md`'s Third migration paragraph). The two mutating routes keep `require_permission(Execution, Execute)` ahead of
   `require_fleet_read(..., "Read")` (the fleet gate is structurally Read-only, INV — see
   `authz_gates.cpp`) and apply a stricter complete-cohort-in-scope rule, not bare visibility, before
   allowing a rerun/cancel. Coverage: `tests/unit/server/test_legacy_executions_scope_authz.cpp`.

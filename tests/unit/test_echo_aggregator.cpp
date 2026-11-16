@@ -10,6 +10,7 @@
  */
 
 #include "echo_aggregator.hpp"
+#include "echo_collectors.hpp" // compute_process_events: the baseline diff-equivalence case
 #include "echo_db.hpp"
 #include "echo_fold_schema.hpp"
 #include "echo_schema_registry.hpp"
@@ -37,6 +38,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using namespace yuzu::echo;
@@ -3305,4 +3307,132 @@ TEST_CASE("budget eligibility: the evictable source set is pinned so a new sourc
           sorted({"process", "tcp", "service", "user", "perf", "procperf", "netqual", "module",
                   "software", "arp", "dns", "netconn", "mapdrive", "power", "removable",
                   "registry"}));
+}
+
+// ── #3864: the process baseline holds no command line ─────────────────────────
+
+namespace {
+
+yuzu::agent::ProcessInfo make_proc(uint32_t pid, uint32_t ppid, std::string name, std::string cmdline,
+                                   std::string user) {
+    yuzu::agent::ProcessInfo p;
+    p.pid = pid;
+    p.ppid = ppid;
+    p.name = std::move(name);
+    p.cmdline = std::move(cmdline);
+    p.user = std::move(user);
+    return p;
+}
+
+// Synthetic credential-bearing command line.
+constexpr const char* kSecretCmdline = "psql postgresql://user:S3cret@db";
+
+// What an earlier build wrote: the same array plus a `cmdline` key per entry.
+const std::string kLegacyBaseline =
+    R"([{"pid":10,"ppid":1,"name":"psql","cmdline":"psql postgresql://user:S3cret@db","user":"svc"},)"
+    R"({"pid":11,"ppid":1,"name":"sshd","cmdline":"sshd -D","user":"root"}])";
+
+} // namespace
+
+TEST_CASE("process baseline: encode carries neither the command line nor a cmdline key",
+          "[echo][aggregator][process-baseline]") {
+    const auto json = encode_process_baseline({make_proc(10, 1, "psql", kSecretCmdline, "svc")});
+    CHECK(json.find("S3cret") == std::string::npos);
+    CHECK(json.find("cmdline") == std::string::npos);
+    CHECK(json.find("psql") != std::string::npos); // the name is kept
+}
+
+TEST_CASE("process baseline: round trip keeps pid, ppid, name and user, with an empty cmdline",
+          "[echo][aggregator][process-baseline]") {
+    const auto back = decode_process_baseline(
+        encode_process_baseline({make_proc(10, 1, "psql", kSecretCmdline, "svc")}));
+    REQUIRE(back.size() == 1);
+    CHECK(back[0].pid == 10);
+    CHECK(back[0].ppid == 1);
+    CHECK(back[0].name == "psql");
+    CHECK(back[0].user == "svc");
+    CHECK(back[0].cmdline.empty());
+}
+
+TEST_CASE("process baseline: decode never reads the cmdline of a legacy row",
+          "[echo][aggregator][process-baseline]") {
+    const auto back = decode_process_baseline(kLegacyBaseline);
+    REQUIRE(back.size() == 2);
+    CHECK(back[0].name == "psql");
+    CHECK(back[0].cmdline.empty());
+    CHECK(back[1].cmdline.empty());
+    CHECK(decode_process_baseline("").empty());
+    CHECK(decode_process_baseline("not json").empty());
+}
+
+TEST_CASE("process baseline: the diff over a decoded baseline matches the diff over the original",
+          "[echo][aggregator][process-baseline]") {
+    const std::vector<yuzu::agent::ProcessInfo> previous{make_proc(10, 1, "psql", kSecretCmdline, "svc"),
+                                                         make_proc(11, 1, "sshd", "sshd -D", "root"),
+                                                         make_proc(12, 1, "old", "old --x", "u")};
+    const std::vector<yuzu::agent::ProcessInfo> current{make_proc(10, 1, "psql", kSecretCmdline, "svc"),
+                                                        make_proc(11, 1, "sshd", "sshd -D", "root"),
+                                                        make_proc(13, 1, "new", "new --y", "u")};
+
+    const auto direct = compute_process_events(previous, current, 100, 1);
+    const auto via_baseline =
+        compute_process_events(decode_process_baseline(encode_process_baseline(previous)), current, 100, 1);
+
+    const auto key = [](const std::vector<ProcessEvent>& evs) {
+        std::set<std::pair<std::string, uint32_t>> k;
+        for (const auto& e : evs)
+            k.emplace(e.action, e.pid);
+        return k;
+    };
+    CHECK(key(direct) == key(via_baseline));
+    CHECK(key(via_baseline) ==
+          std::set<std::pair<std::string, uint32_t>>{{"started", 13u}, {"stopped", 12u}});
+}
+
+TEST_CASE("process baseline: scrub rewrites a legacy row once and is then a no-op",
+          "[echo][aggregator][process-baseline]") {
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_echo_pbscrub_"}};
+    auto opened = EchoDatabase::open(tmp.path);
+    REQUIRE(opened.has_value());
+    EchoDatabase db = std::move(*opened);
+
+    // No row: nothing written.
+    CHECK_FALSE(scrub_process_baseline(db));
+    CHECK(db.get_state("process").empty());
+
+    REQUIRE(db.set_state("process", kLegacyBaseline));
+    CHECK(scrub_process_baseline(db));
+    const auto cleaned = db.get_state("process");
+    CHECK(cleaned.find("S3cret") == std::string::npos);
+    CHECK(cleaned.find("cmdline") == std::string::npos);
+    CHECK(decode_process_baseline(cleaned).size() == 2);
+
+    // Second call: already clean, row byte-identical.
+    CHECK_FALSE(scrub_process_baseline(db));
+    CHECK(db.get_state("process") == cleaned);
+}
+
+TEST_CASE("process baseline: a scrub that cannot write leaves the row and succeeds on a later start",
+          "[echo][aggregator][process-baseline]") {
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_echo_pbscrub_fault_"}};
+    auto opened = EchoDatabase::open(tmp.path);
+    REQUIRE(opened.has_value());
+    EchoDatabase db = std::move(*opened);
+    REQUIRE(db.set_state("process", kLegacyBaseline));
+
+    // A store fault from a second connection: writes to echo_state fail at step, reads still work.
+    const auto exec = [&](const char* sql) {
+        yuzu::test::SqliteHandleOwner<sqlite3> owner;
+        REQUIRE(sqlite3_open(tmp.path.string().c_str(), &owner.db) == SQLITE_OK);
+        sqlite3_busy_timeout(owner.db, 5000);
+        REQUIRE(sqlite3_exec(owner.db, sql, nullptr, nullptr, nullptr) == SQLITE_OK);
+    };
+    exec("CREATE TRIGGER yuzu_test_state_fault BEFORE INSERT ON echo_state "
+         "BEGIN SELECT RAISE(FAIL, 'store fault'); END;");
+    CHECK_FALSE(scrub_process_baseline(db));
+    CHECK(db.get_state("process") == kLegacyBaseline); // the disclosed residual: unchanged
+
+    exec("DROP TRIGGER yuzu_test_state_fault;");
+    CHECK(scrub_process_baseline(db)); // the next start
+    CHECK(db.get_state("process").find("S3cret") == std::string::npos);
 }

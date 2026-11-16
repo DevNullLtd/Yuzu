@@ -559,6 +559,34 @@ TEST_CASE("wiring: a route with no step-up row reaches the handler whatever the 
     CHECK(s.gate_count("pass", "local", "rest") == 0);
 }
 
+// #2146: the JSON value budget is applied by the SAME production stage over a real socket: a body
+// within the 4 MiB size cap but over the catch-all's 100000 values is refused 413 before the handler,
+// counted under the class and the new reason, and a body within budget reaches the handler.
+TEST_CASE("wiring: a body over its class's JSON value budget is refused 413 before the handler",
+          "[stepup][wiring][json_budget]") {
+    WiringServer s;
+    const auto flat = [](std::size_t values) {
+        std::string b = "[1";
+        for (std::size_t i = 1; i < values; ++i)
+            b += ",1";
+        return b + "]";
+    };
+    auto refused = s.post(std::string(kUnclassifiedPath), flat(100'001));
+    REQUIRE(refused);
+    CHECK(refused->status == 413);
+    CHECK(refused->body.find("JSON values") != std::string::npos);
+    CHECK(s.unclassified_handler_calls.load() == 0);
+    CHECK(s.metrics
+              .counter("yuzu_body_cap_rejected_total",
+                       {{"path_class", "default"}, {"reason", "over_json_values_post_read"}})
+              .value() == 1);
+
+    auto ok = s.post(std::string(kUnclassifiedPath), flat(1'000));
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    CHECK(s.unclassified_handler_calls.load() == 1);
+}
+
 TEST_CASE("wiring: a bearer principal passes a kRequired route and an unresolved caller is a 401",
           "[stepup][wiring]") {
     WiringServer s;

@@ -15,6 +15,7 @@
 #include "event_emit.hpp"       // yuzu::server::EmitEventFn: the 4-argument emitter the v1 execute twin binds
 #include "execution_tracker.hpp"
 #include "forensics_visibility.hpp" // ForensicsVisibilityFn (#4990)
+#include "instruction_referrers.hpp" // DefinitionReferrersFn (Deps::referrers_fn)
 #include "instruction_param_schema.hpp" // ParamValidatorCache (Deps::param_validators)
 #include "instruction_store.hpp"
 #include "policy_store.hpp"
@@ -271,6 +272,17 @@ public:
         ProductPackStore* product_pack_store{nullptr};
         InstructionStore* instruction_store{nullptr};
         PolicyStore* policy_store{nullptr};
+        /// The shared "what still points at this definition?" lookup (instruction_referrers.hpp),
+        /// the SAME closure the instruction DELETE routes take. `DELETE /api/product-packs/{id}`
+        /// asks it about every InstructionDefinition item the pack carries BEFORE deleting any
+        /// item, ignoring referrers that are the pack's own Workflow items and the own
+        /// PolicyFragment items no policy uses (they go in the same uninstall; an own fragment a
+        /// policy still uses survives the uninstall, so it IS counted and the 409 names the
+        /// policy), and refuses with a 409 listing the rest, or a 503 (fail closed) when it is
+        /// unwired or cannot answer, or when a pack carrying a definition and own fragments finds
+        /// `policy_store` unwired or its policy read failing; nothing is deleted. A pack with no
+        /// InstructionDefinition item never consults it.
+        DefinitionReferrersFn referrers_fn;
         CommandDispatchFn command_dispatch_fn;
         /// ADR-1007. Default-constructed (empty) ⇒ the two call sites that
         /// use it fall back to `command_dispatch_fn` with no concurrency

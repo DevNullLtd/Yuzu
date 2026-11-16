@@ -1037,7 +1037,7 @@ place, **Hardware** and **Software**, each its own page:
     for it (see `inventory.sync.request` in [Audit log](audit-log.md)).
   - **Installed software** — the same per-device software list as before (audited
     `inventory.device.software`), now with its own filter box and, for the first time,
-    rendered **Signature** and **Ecosystem** columns. Carries the same **Sync now**
+    rendered **Signature**, **Ecosystem**, **Install type** and **Location** columns (Location is a dash where the collector reports no single folder). Carries the same **Sync now**
     affordance, scoped to the `installed_software` source.
   - **Tags and properties** — inline add/remove via the existing tag routes. Add is
     shown when a `Tag:Write` probe passes for the device; Remove needs its own
@@ -1093,6 +1093,30 @@ place, **Hardware** and **Software**, each its own page:
   catalogue model that the REST and MCP twins (`GET /api/v1/inventory/software/catalogue`,
   `query_software_catalogue`) share, so the page, the API and the agent tools cannot
   disagree.
+  - **Find software** (the first block on the page). Type a package name and press **Find**
+    to see how many installs and devices carry it, where, and how fresh the data is. The
+    search runs the same model as `GET /api/v1/inventory/software`, so the counts equal that
+    route's `totals` and the table rows are its rows, with the REST call shown under the
+    box (copy it into a script) and **Export CSV** pointing at that route (the components
+    route for a Java, Python or Node search) with `format=csv`. Name matching is exact. Add an exact version, or a from/to range (inclusive,
+    in the catalogue's version order), to narrow it. The **Applications** chip searches
+    installed applications; **Java**, **Python** and **Node** search the components found
+    inside applications (`GET /api/v1/inventory/software/components`), and say plainly that
+    a device that has not sent its component list cannot be ruled in or out. The table runs
+    application, then version (newest first on each page), then device. An application row
+    shows the OS, install location, install type, status (current, unconfirmed or disabled),
+    when a report last confirmed the install, and **Last synced**. A component row shows the
+    OS, component, version (and where it was read from), path, the application folder it
+    sits in, status and **Last synced**; it has no install type or last-confirmed column.
+    **Last synced** turns amber after 48 hours. **Load more rows** continues from the
+    cursor. For component searches the count card also shows how many of the devices were
+    not confirmed by their last report, with a link that lists only those; installs searches
+    carry no such figure because the model does not return one. An account scoped to
+    management groups gets the rows on its own devices and no fleet count (a count of part
+    of the fleet could be read as the whole), and a store that does not answer shows a retry
+    banner, never an empty table. Every search is audited, under the verb of the REST route it
+    mirrors: `inventory.software.query` for an application search and `inventory.components.view`
+    for a Java, Python or Node search.
   - **Metrics strip.** Inventory coverage (devices reporting software, devices connected
     now, devices not seen in 48 hours), Titles and publishers, Installs with a
     Windows/macOS/Linux bar and the average per device, Stay current (installs on their
@@ -1196,7 +1220,8 @@ place, **Hardware** and **Software**, each its own page:
     tokens are denied outright.
   - **Audit.** Every call that serves data (or is refused on scope) is audited, not only the first page: `inventory.software.catalog`
     (title pages), `inventory.software.versions` and `inventory.software.query` (devices
-    tables). A continuation page is tagged `page=continuation`; a degraded read is
+    tables and Find software application searches; Find software component searches write
+    `inventory.components.view`). A continuation page is tagged `page=continuation`; a degraded read is
     `failure`; a refused caller is `denied`, as is a devices page that drops devices through the
     scope post-filter or names an `agent_id` outside the caller's scope. See [Audit log](audit-log.md).
   - **Degraded or refused.** A store that cannot answer shows an unavailable banner with

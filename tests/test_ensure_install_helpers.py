@@ -583,13 +583,13 @@ class GuardSnapshotSelfTest(unittest.TestCase):
 
         cases = {
             "a script's file mode changed": (
-                lambda r, h: None,
+                lambda r, h: (r / "scripts" / "test" / "ensure-gcovr.sh").chmod(0o644),
                 lambda r, h: (r / "scripts" / "test" / "ensure-gcovr.sh").chmod(0o700)),
             "package-lock.json's file mode changed": (
-                lambda r, h: None,
+                lambda r, h: (r / "tests" / "puppeteer" / "package-lock.json").chmod(0o644),
                 lambda r, h: (r / "tests" / "puppeteer" / "package-lock.json").chmod(0o600)),
             "requirements-ci.txt's file mode changed": (
-                lambda r, h: None,
+                lambda r, h: (r / "requirements-ci.txt").chmod(0o644),
                 lambda r, h: (r / "requirements-ci.txt").chmod(0o600)),
             "npm's lock file rewritten with the same size and mtime": (
                 lambda r, h: put(r / "tests" / "puppeteer" / "node_modules" / ".package-lock.json", "aaaa"),

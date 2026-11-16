@@ -51,6 +51,7 @@ FileNotFoundError [WinError 2] on the Wee Tam runners while the build passed.)
 Resolution precedence mirrors the runner provisioning contract — see
 deploy/windows/Provision-Windows-Runner.ps1 + toolchain-manifest.json.
 """
+import contextlib
 import glob
 import os
 import re
@@ -478,6 +479,24 @@ def windows_stdio_isolation():
         "stdin": subprocess.DEVNULL,
         "creationflags": subprocess.CREATE_NO_WINDOW,
     }
+
+
+@contextlib.contextmanager
+def uninterrupted_cleanup():
+    """A repeated cancellation cannot bypass the bounded child kill/reap."""
+    handlers = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
+    try:
+        for sig in handlers:
+            signal.signal(sig, signal.SIG_IGN)
+        yield
+    finally:
+        for sig, handler in handlers.items():
+            signal.signal(sig, handler)
+
+
+def termination_interrupt(_signum, _frame):
+    # Meson cancellation must enter owned-child cleanup, just like Ctrl-C.
+    raise KeyboardInterrupt('SIGTERM')
 
 
 def _signal_tree(proc, timeout):

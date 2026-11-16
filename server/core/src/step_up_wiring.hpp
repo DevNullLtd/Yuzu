@@ -10,8 +10,9 @@
 /// applied. It is NOT a `set_pre_request_handler` body: from cpp-httplib v0.47.0 that handler runs
 /// before the body is read, so `req.body.size()` below would always be 0.
 ///
-/// Stage order, fixed: the post-read body cap (413 on an over-cap body), then
-/// `apply_step_up_chokepoint` for a body within the cap. The whole block is contained: a throw
+/// Stage order, fixed: the post-read body cap (413 over the size cap), then the class's JSON value
+/// budget (413 `over_json_values_post_read`), then `apply_step_up_chokepoint` for a body within
+/// both. The whole block is contained: a throw
 /// answers 413 (fail closed) rather than reaching an httplib call site. The caller builds `deps`
 /// per request (the auth store pointer is re-read each time so a nulled store answers 503).
 /// See `server.cpp` at the `PostReadStageRegistry::install` call for the capture contract and the
@@ -25,6 +26,7 @@
 /// in-handler call per kRequired row go with them).
 
 #include "body_cap_policy.hpp"
+#include "json_value_budget.hpp"
 #include "on_behalf_guard.hpp"
 #include "rest_a4_envelope_http.hpp"
 #include "step_up_gate.hpp"
@@ -42,12 +44,59 @@
 
 namespace yuzu::server::detail {
 
+/// 413 for a body over its class's JSON value budget: the same envelope, log sampling and counter
+/// as the over-cap refusal (`reason="over_json_values_post_read"`), so one dashboard reads both.
+[[nodiscard]] inline httplib::Server::HandlerResponse
+refuse_json_value_budget(const httplib::Request& req, httplib::Response& res,
+                         const StepUpChokepointDeps& deps, const BodyCapMatch& cap_match) {
+    static std::atomic<std::uint64_t> budget_hits{0};
+    constexpr std::uint64_t kBodyLogEvery = 100;
+    if (budget_hits.fetch_add(1, std::memory_order_relaxed) % kBodyLogEvery == 0) {
+        spdlog::warn("[#2146 json-budget] rejected {} {} from {}: {}-byte body holds more than the "
+                     "{} JSON values this class admits (class={}, 1 log per {} rejections; the "
+                     "counter records all)",
+                     onbehalf::sanitize_for_log(req.method, 16),
+                     onbehalf::sanitize_for_log(req.path),
+                     onbehalf::sanitize_for_log(req.remote_addr, 64), req.body.size(),
+                     cap_match.max_json_values, cap_match.path_class, kBodyLogEvery);
+    }
+    try {
+        if (deps.metrics)
+            deps.metrics
+                ->counter("yuzu_body_cap_rejected_total",
+                          {{"path_class", std::string(cap_match.path_class)},
+                           {"reason", "over_json_values_post_read"}})
+                .increment();
+    } catch (...) { // NOLINT(bugprone-empty-catch)
+        // Observability must never kill the process from this handler.
+    }
+    res.status = 413;
+    if (cap_match.path_class == "scim") {
+        res.set_content(scim::error(413, "request body too large").dump(), "application/scim+json");
+    } else {
+        res.set_content(
+            a4_denial(res, 413, "request body holds more JSON values than this route admits",
+                      A4ErrorOpts{.remediation = "split the request into smaller ones; see "
+                                                 "docs/user-manual/rest-api.md, Pre-Auth Request "
+                                                 "Body Caps, for the per-route limit"}),
+            "application/json");
+    }
+    return httplib::Server::HandlerResponse::Handled;
+}
+
 [[nodiscard]] inline httplib::Server::HandlerResponse
 run_post_read_stage(const httplib::Request& req, httplib::Response& res,
                     const StepUpChokepointDeps& deps) {
     try {
         const auto cap_match = resolve_body_cap(req.method, req.path);
         if (req.body.size() <= cap_match.max_body_bytes) {
+            // The size cap does not bound a parse tree: a body of `[],[],...` builds one 16 to 27
+            // times its size. The class's value budget (`BodyCapEntry::max_json_values`, a raw-text
+            // count, no parse) is checked before any handler can parse the body. It keys on the
+            // route class, never on Content-Type (a handler parses whatever it is sent).
+            if (cap_match.max_json_values != kJsonValuesOff &&
+                json_exceeds_value_count(req.body, cap_match.max_json_values))
+                return refuse_json_value_budget(req, res, deps, cap_match);
             return apply_step_up_chokepoint(req, res, deps) == StepUpChokepointResult::kRefused
                        ? httplib::Server::HandlerResponse::Handled
                        : httplib::Server::HandlerResponse::Unhandled;

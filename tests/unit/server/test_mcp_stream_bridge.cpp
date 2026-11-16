@@ -9,6 +9,8 @@
 // property, dtor safety) are the TSan leg's primary targets.
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
+#include <catch2/generators/catch_generators_range.hpp>
 
 #include "../../../server/core/src/mcp_jsonrpc.hpp"
 #include "../../../server/core/src/mcp_session.hpp"
@@ -27,7 +29,9 @@
 #include <algorithm>  // std::find over the closed cancel-outcome label set
 #include <atomic>
 #include <condition_variable>
+#include <initializer_list>
 #include <set>
+#include <unordered_set>
 #include <chrono>
 #include <future>
 #include <memory>
@@ -5632,4 +5636,345 @@ TEST_CASE("UnpinFault: `times` fires exactly N times and then disarms",
         CHECK(state.unpin(id));  // fault consumed
         CHECK(state.pinned_count() == 0);
     }
+}
+
+// ── #7817: the bridge applies the confined projection for a scope-confined dispatcher ──
+//
+// The dispatching session's fleet-read scope rides reserve(); a confined record gets
+// what GET /api/v1/events gives the same caller (execution_event_scope.hpp): no
+// progress, and a terminal reduced to its real `status`. An unrestricted record is
+// unchanged.
+
+namespace {
+
+using yuzu::server::authz::VisibleSet;
+
+VisibleSet confined_to(std::initializer_list<const char*> agents) {
+    std::unordered_set<std::string> s;
+    for (const char* a : agents) {
+        s.emplace(a);
+    }
+    return VisibleSet{std::move(s)};
+}
+
+/// The one JSON-RPC result frame in `frames`, if any.
+std::optional<json> final_result_of(const std::vector<mcp::sse_bus::SseEvent>& frames) {
+    for (const auto& f : frames) {
+        auto j = json::parse(f.data, nullptr, /*allow_exceptions=*/false);
+        if (j.is_object() && j.contains("result")) {
+            return j["result"];
+        }
+    }
+    return std::nullopt;
+}
+
+void check_no_count_keys(const json& result) {
+    CHECK_FALSE(result.contains("agents_success"));
+    CHECK_FALSE(result.contains("agents_failure"));
+    CHECK_FALSE(result.contains("agents_responded"));
+    CHECK_FALSE(result.contains("agents_targeted"));
+}
+
+const std::string kConfinedBase =
+    R"({"content":[{"type":"text","text":"{\"execution_id\":\"exec-c\"}"}],)"
+    R"("structuredContent":{"execution_id":"exec-c"}})";
+
+}  // namespace
+
+TEST_CASE("bridge confined dispatcher (#7817) - a parked final carries the real status and no counts",
+          "[mcp][bridge][7817]") {
+    Fx fx;
+    auto s = fx.make_session();
+
+    // The status the tracker stamped must survive sanitizing, so a cancelled or failed
+    // execution is never told to the confined caller as a success.
+    struct TerminalCase {
+        std::string payload;
+        std::string status;
+    };
+    const std::vector<TerminalCase> cases{
+        {kCompleted, "completed"},
+        {R"({"status":"cancelled"})", "cancelled"},
+        {R"({"status":"failed","agents_success":0,"agents_failure":2})", "failed"},
+        {R"({"agents_success":4,"agents_failure":1})", "completed"},  // no status: fixed fallback
+    };
+    const auto& [terminal, want_status] = cases[static_cast<std::size_t>(
+        GENERATE(range(0, 4)))];
+    CAPTURE(terminal);
+
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(9), json("tok"), true,
+                               confined_to({"agent-1"}))
+                .ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(9), "exec-c"));
+    REQUIRE(fx.bridge->arm(s.id, json(9), Bridge::ArmMode::kStreaming, kConfinedBase) ==
+            Bridge::ArmOutcome::kArmed);
+    REQUIRE(fx.bridge->on_post_closed(s.id, json(9)));
+
+    // Progress first, as a real execution does: none of it may reach the session.
+    fx.bus.publish("exec-c", "execution-progress", prog(1, 3));
+    fx.bus.publish("exec-c", "execution-progress", prog(2, 3));
+    fx.bus.publish("exec-c", "execution-completed", terminal, /*is_terminal=*/true);
+    REQUIRE(poll_until([&] { return s.stream->pinned_count() == 1; }));
+
+    auto frames = ring_frames(*s.stream, "alice");
+    CHECK(count_method(frames, "notifications/progress") == 0);
+    REQUIRE(count_results(frames) == 1);
+    const auto result = final_result_of(frames);
+    REQUIRE(result.has_value());
+    CHECK((*result)["status"] == want_status);
+    check_no_count_keys(*result);
+    // An absent count is absent, never rendered as 0 (a wrong answer shown as a right one).
+    // The caller's own dispatch response is carried through untouched.
+    CHECK((*result)["content"][0]["type"] == "text");
+    CHECK((*result)["structuredContent"] == json{{"execution_id", "exec-c"}});
+    CHECK((*result)["execution_id"] == "exec-c");
+    // Dropping progress is not a fault: no listener failure, no suppression counted.
+    fx.bridge->sweep();
+    CHECK(fx.reg.counter("yuzu_mcp_bridge_listener_failures_total").value() == 0.0);
+    CHECK(fx.reg.counter("yuzu_mcp_bridge_progress_suppressed_total").value() == 0.0);
+}
+
+TEST_CASE("bridge confined dispatcher (#7817) - GET-only: no progress ever, terminal still settles",
+          "[mcp][bridge][7817]") {
+    Fx fx;
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(7), json(42), false,
+                               confined_to({"agent-1"}))
+                .ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(7), "exec-g7"));
+    // Progress latched while still kArming would drain at the arm handoff if it had been
+    // kept; a confined record keeps none.
+    fx.bus.publish("exec-g7", "execution-progress", kProgress13);
+    REQUIRE(fx.bridge->arm(s.id, json(7), Bridge::ArmMode::kGetOnly) == Bridge::ArmOutcome::kArmed);
+    fx.bus.publish("exec-g7", "execution-progress", prog(2, 3));
+    CHECK_FALSE(poll_until([&] { return s.stream->next_event_id() > 1; },
+                           std::chrono::milliseconds(150)));
+    CHECK(ring_frames(*s.stream, "alice").empty());
+
+    fx.bus.publish("exec-g7", "execution-completed", kCompleted, /*is_terminal=*/true);
+    REQUIRE(poll_until([&] {
+        auto ph = fx.bridge->phase_for(s.id, json(7));
+        return ph.has_value() && *ph == Bridge::Phase::kDone;
+    }));
+    CHECK(s.stream->pinned_count() == 0);  // GET-only: still no final, no pin
+    CHECK(ring_frames(*s.stream, "alice").empty());
+    fx.bridge->sweep();
+    CHECK(fx.bridge->record_count() == 0);
+    CHECK(fx.reg.counter("yuzu_mcp_bridge_listener_failures_total").value() == 0.0);
+    CHECK(fx.reg.counter("yuzu_mcp_bridge_progress_suppressed_total").value() == 0.0);
+}
+
+TEST_CASE("bridge confined dispatcher (#7817) - agent-transition is never projected, in scope or not",
+          "[mcp][bridge][7817]") {
+    // The listener returns before agent-transition in BOTH modes, so for this bridge
+    // the classifier's per-agent verdict has nothing to decide; this pins that a
+    // confined record neither latches nor emits one for an in-scope or an out-of-scope
+    // agent.
+    Fx fx;
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(8), json("t"), false,
+                               confined_to({"agent-1"}))
+                .ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(8), "exec-at"));
+    REQUIRE(fx.bridge->arm(s.id, json(8), Bridge::ArmMode::kGetOnly) == Bridge::ArmOutcome::kArmed);
+    fx.bus.publish("exec-at", "agent-transition", R"({"agent_id":"agent-1","status":"success"})");
+    fx.bus.publish("exec-at", "agent-transition", R"({"agent_id":"agent-9","status":"failure"})");
+    CHECK_FALSE(poll_until([&] { return s.stream->next_event_id() > 1; },
+                           std::chrono::milliseconds(150)));
+    CHECK(ring_frames(*s.stream, "alice").empty());
+    CHECK(fx.bridge->phase_for(s.id, json(8)) == Bridge::Phase::kArmedGetOnly);
+}
+
+TEST_CASE("bridge confined dispatcher (#7817) - an unresolved scope (deny-all) is as confined as any",
+          "[mcp][bridge][7817]") {
+    // What execute_instruction passes when the fleet-read gate refuses, is unwired or
+    // throws: a PRESENT empty set, never nullopt.
+    Fx fx;
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(10), json("t"), true,
+                               yuzu::server::authz::deny_all())
+                .ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(10), "exec-dn"));
+    REQUIRE(fx.bridge->arm(s.id, json(10), Bridge::ArmMode::kStreaming, kConfinedBase) ==
+            Bridge::ArmOutcome::kArmed);
+    REQUIRE(fx.bridge->on_post_closed(s.id, json(10)));
+    fx.bus.publish("exec-dn", "execution-progress", kProgress13);
+    fx.bus.publish("exec-dn", "execution-completed", kCompleted, /*is_terminal=*/true);
+    REQUIRE(poll_until([&] { return s.stream->pinned_count() == 1; }));
+    auto frames = ring_frames(*s.stream, "alice");
+    CHECK(count_method(frames, "notifications/progress") == 0);
+    const auto result = final_result_of(frames);
+    REQUIRE(result.has_value());
+    CHECK((*result)["status"] == "completed");
+    check_no_count_keys(*result);
+}
+
+TEST_CASE("bridge confined dispatcher (#7817) - the pressure visitor's buffered terminal is sanitized too",
+          "[mcp][bridge][7817][2409]") {
+    // The kTerminalBuffered arm latches the terminal-flagged execution-progress, whose
+    // payload carries the counts: a confined record must not get them from that path.
+    Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 0}};
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true,
+                               confined_to({"agent-1"}))
+                .ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-7817p"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) == Bridge::ArmOutcome::kArmed);
+    REQUIRE(fx.bridge->on_post_closed(s.id, json(1)));
+    fx.bus.publish(
+        "exec-7817p", "execution-progress",
+        R"({"status":"succeeded","agents_responded":3,"agents_targeted":3,"agents_success":3,"agents_failure":0})",
+        /*is_terminal=*/true);
+    REQUIRE(poll_until([&] {
+        fx.bridge->sweep();
+        return fx.bridge->record_count() == 0;
+    }));
+    auto frames = ring_frames(*s.stream, "alice");
+    CHECK(count_error_code(frames, mcp::kMcpTerminalUnavailable) == 0);
+    REQUIRE(count_results(frames) == 1);
+    const auto result = final_result_of(frames);
+    REQUIRE(result.has_value());
+    CHECK((*result)["status"] == "succeeded");
+    check_no_count_keys(*result);
+}
+
+TEST_CASE("bridge unrestricted dispatcher (#7817) - frames are byte-identical with and without an explicit null scope",
+          "[mcp][bridge][7817]") {
+    // The scope parameter defaults to nullopt, so the same record reserved with and
+    // without it must produce the same bytes. The exact strings below are the
+    // pre-change outputs (the progress notification is the shared builder's; the
+    // final is result_base plus status/agents_success/agents_failure, keys in nlohmann
+    // dump order).
+    const std::string base = R"({"content":[{"type":"text","text":"x"}]})";
+    const auto run = [&](bool explicit_null) {
+        Fx fx;
+        auto s = fx.make_session();
+        const auto r = explicit_null
+                           ? fx.bridge->reserve(s.id, bound("alice"), json(3), json("tok"), true,
+                                                VisibleSet{})
+                           : fx.bridge->reserve(s.id, bound("alice"), json(3), json("tok"), true);
+        REQUIRE(r.ok);
+        REQUIRE(fx.bridge->subscribe(s.id, json(3), "exec-n"));
+        REQUIRE(fx.bridge->arm(s.id, json(3), Bridge::ArmMode::kStreaming, base) ==
+                Bridge::ArmOutcome::kArmed);
+        REQUIRE(fx.bridge->on_post_closed(s.id, json(3)));
+        fx.bus.publish("exec-n", "execution-progress", kProgress13);
+        REQUIRE(poll_until([&] { return s.stream->next_event_id() > 1; }));
+        fx.bus.publish("exec-n", "execution-completed", kCompleted, /*is_terminal=*/true);
+        REQUIRE(poll_until([&] { return s.stream->pinned_count() == 1; }));
+        std::vector<std::string> out;
+        for (const auto& f : ring_frames(*s.stream, "alice")) {
+            out.push_back(f.data);
+        }
+        return out;
+    };
+    const auto implicit_frames = run(false);
+    const auto explicit_frames = run(true);
+    REQUIRE(implicit_frames.size() == 2);
+    CHECK(implicit_frames == explicit_frames);
+    CHECK(implicit_frames[0] ==
+          mcp::progress_notification(json("tok"), 1, 3, "1/3 agents responded", "exec-n"));
+    CHECK(implicit_frames[1] ==
+          R"({"jsonrpc":"2.0","result":{"agents_failure":0,"agents_success":3,)"
+          R"("content":[{"text":"x","type":"text"}],"execution_id":"exec-n","status":"completed"},)"
+          R"("id":3})");
+}
+
+TEST_CASE("bridge confined dispatcher (#7817) - a buffered terminal with no usable status latches \"unknown\", not \"completed\"",
+          "[mcp][bridge][7817][2409]") {
+    // Parity with an unrestricted record, whose build_real_final defaults a missing status
+    // to "unknown": the pressure visitor's sanitize must not invent "completed". Three payloads:
+    // valid JSON with counts and no status, text that is not JSON, and JSON that is not an object.
+    const std::string payload = GENERATE(
+        std::string(R"({"agents_responded":3,"agents_targeted":3,"agents_success":3,"agents_failure":0})"),
+        std::string("this is not json"), std::string("[1,2,3]"));
+    CAPTURE(payload);
+    Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 0}};
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true,
+                               confined_to({"agent-1"}))
+                .ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-7817u"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) == Bridge::ArmOutcome::kArmed);
+    REQUIRE(fx.bridge->on_post_closed(s.id, json(1)));
+    fx.bus.publish("exec-7817u", "execution-progress", payload, /*is_terminal=*/true);
+    REQUIRE(poll_until([&] {
+        fx.bridge->sweep();
+        return fx.bridge->record_count() == 0;
+    }));
+    auto frames = ring_frames(*s.stream, "alice");
+    REQUIRE(count_results(frames) == 1);
+    const auto result = final_result_of(frames);
+    REQUIRE(result.has_value());
+    CHECK((*result)["status"] == "unknown");
+    check_no_count_keys(*result);
+    // build_fallback_final also says "unknown" but carries a `detail`; the arm-built final does
+    // not, so this cannot pass through the fallback final.
+    CHECK_FALSE(result->contains("detail"));
+}
+
+TEST_CASE("bridge confined dispatcher (#7817) - a listener fault on the terminal latches nothing; a later terminal latches sanitized",
+          "[mcp][bridge][7817]") {
+    Fx fx;
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(4), json("t"), true,
+                               confined_to({"agent-1"}))
+                .ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(4), "exec-7817f"));
+    REQUIRE(fx.bridge->arm(s.id, json(4), Bridge::ArmMode::kStreaming, kConfinedBase) ==
+            Bridge::ArmOutcome::kArmed);
+    REQUIRE(fx.bridge->on_post_closed(s.id, json(4)));
+
+    // The injected fault throws at the top of the listener, so it models any throw inside the
+    // listener's try block, including one from the confined terminal's sanitize allocation: the
+    // same catch arm counts it and leaves the slot untouched.
+    fx.bridge->inject_listener_fault_for_test();
+    fx.bus.publish("exec-7817f", "execution-completed", kCompleted, /*is_terminal=*/true);
+    // The fault is counted (the projector flushes it) and nothing was latched or published.
+    REQUIRE(poll_until([&] {
+        return fx.reg.counter("yuzu_mcp_bridge_listener_failures_total").value() >= 1.0;
+    }));
+    CHECK(s.stream->pinned_count() == 0);
+    CHECK(count_results(ring_frames(*s.stream, "alice")) == 0);
+
+    // The one-shot fault is spent: a later terminal latches, sanitized.
+    fx.bus.publish("exec-7817f", "execution-completed", kCompleted, /*is_terminal=*/true);
+    REQUIRE(poll_until([&] { return s.stream->pinned_count() == 1; }));
+    const auto result = final_result_of(ring_frames(*s.stream, "alice"));
+    REQUIRE(result.has_value());
+    CHECK((*result)["status"] == "completed");
+    check_no_count_keys(*result);
+}
+
+TEST_CASE("bridge confined dispatcher (#7817) - a pressure-visitor copy fault defers, and the retry latches the sanitized terminal",
+          "[mcp][bridge][7817][2409]") {
+    Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 0}};
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true,
+                               confined_to({"agent-1"}))
+                .ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-7817v"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) == Bridge::ArmOutcome::kArmed);
+    REQUIRE(fx.bridge->on_post_closed(s.id, json(1)));
+    fx.bus.publish(
+        "exec-7817v", "execution-progress",
+        R"({"status":"succeeded","agents_responded":3,"agents_targeted":3,"agents_success":3,"agents_failure":0})",
+        /*is_terminal=*/true);
+
+    fx.bridge->inject_visit_copy_fault_for_test(1);
+    fx.bridge->sweep();
+    // The copy threw: nothing secured, the record and its listener are kept, no final yet.
+    CHECK(fx.bridge->record_count() == 1);
+    CHECK(count_results(ring_frames(*s.stream, "alice")) == 0);
+
+    REQUIRE(poll_until([&] {
+        fx.bridge->sweep();
+        return fx.bridge->record_count() == 0;
+    }));
+    auto frames = ring_frames(*s.stream, "alice");
+    REQUIRE(count_results(frames) == 1);
+    const auto result = final_result_of(frames);
+    REQUIRE(result.has_value());
+    CHECK((*result)["status"] == "succeeded");
+    check_no_count_keys(*result);
 }

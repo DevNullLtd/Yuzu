@@ -47,6 +47,9 @@ struct sqlite3; // Forward declaration
 
 namespace yuzu::echo {
 
+/// Default wall-clock bound on one operator statement (execute_user_query).
+inline constexpr std::chrono::milliseconds kUserQueryDeadline{10'000};
+
 class EchoFold; // echo_fold.hpp: the roll-up writer every fold_* wrapper below drives
 
 /**
@@ -433,7 +436,8 @@ struct RemovableEvent {
 /// change the key watch observed (echo_registry_parsers.hpp). The actor fields hold
 /// the writer correlated to the change (a lead to verify, not proof): actor_pid is 0
 /// and actor_image '' when no writer is named, and `detail` says why (attr:*).
-/// `data` is the UNMASKED rendered new value; `prev_data` is empty for an event this build
+/// `data` is the rendered new value, except under a sensitive value name (is_sensitive_reg_value),
+/// where it is the fixed placeholder kRegistryMaskedData; `prev_data` is empty for an event this build
 /// makes (the old value is not carried; `prev_data_type`/`prev_data_size` are). The fold keeps
 /// only hive, key_path, value_name, action, a count, the newest data (512 bytes), its type,
 /// the actor image and ts; actor_pid, `detail`, `source` (notify | reconcile | offline),
@@ -892,9 +896,16 @@ public:
      * Recovery: if the read-only connection cannot be opened at startup it stays
      * unavailable for the process lifetime (fail closed); restart the agent to
      * retry.
+     *
+     * `deadline` is elapsed time on the steady clock, checked every 1000 VM
+     * instructions. It does not include the wait for query_mu_ (bounded by the
+     * holder's own deadline and busy wait) or a busy wait (bounded by busy_timeout).
+     * A hit returns an error and discards any rows read so far; a short result is
+     * never presented as complete.
      */
-    std::expected<QueryResult, std::string> execute_user_query(const std::string& sql,
-                                                               int max_rows = 10000);
+    std::expected<QueryResult, std::string>
+    execute_user_query(const std::string& sql, int max_rows = 10000,
+                       std::chrono::milliseconds deadline = kUserQueryDeadline);
 
     /**
      * Execute arbitrary DDL/DML SQL (for rollup inserts, retention deletes).

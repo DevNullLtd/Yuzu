@@ -1,0 +1,523 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Mock-up: Find software panel (/software)</title>
+<!--
+  STANDALONE MOCK-UP (design artifact, not product code; no server, no external asset).
+
+  What it shows: the "Find software" panel on the /software page, the CISO's screen:
+  type a package name, see how many installs and devices, where, and how fresh.
+  Application -> version -> device, never host-first.
+
+  States (one section each; the toolbar shows one at a time, "All states" shows every
+  one and is what prints):
+    1 Empty panel            5 Components not collected yet on a device
+    2 Application result     6 Nothing found
+    3 Component result       7 Store unavailable
+    4 Management-group view  8 Per-device software tab (two new columns)
+
+  Fidelity: class names and rules for the reused parts are copied from the live page
+  (inv-* from server/core/src/inventory_ui.cpp, hw-*/gp-*/pill from hardware_ui.cpp,
+  guardian_page_ui.cpp and yuzu.css). Only fs-* (panel head, version group row, path
+  truncation, unconfirmed box) and mk-* (this mock-up's own toolbar) are new.
+  Colours use the page's short token names. The live page switches schemes with
+  html[data-theme]; here one token set uses light-dark() so Dark (slate) and Light
+  both work from a single block.
+  All data is invented: Example Application, log4j-core, host-0412 and similar.
+-->
+<style>
+  /* ---- tokens: slate (dark) / light, same names as yuzu.css ---- */
+  :root{
+    color-scheme:light dark;
+    --bg:light-dark(#f5f6f8,#14171c);
+    --surface:light-dark(#ffffff,#1b1f26);
+    --surface2:light-dark(#eef0f4,#222730);
+    --raise:light-dark(#ffffff,#2b313c);
+    --line:light-dark(#dfe3ea,#2a303a);
+    --line2:light-dark(#b4bcc9,#3c4452);
+    --ink:light-dark(#12161c,#e9ecf0);
+    --ink2:light-dark(#3a424f,#c4cad3);
+    --mut:light-dark(#566070,#9aa2ae);
+    --faint:light-dark(#5f6979,#9199a6);
+    --primary:light-dark(#1a5fd0,#4c9aff);
+    --primary-h:light-dark(#154eab,#7ab6ff);
+    --on-primary:light-dark(#ffffff,#06101f);
+    --hl:light-dark(#b87900,#f5c542);
+    --focus:light-dark(#1a5fd0,#7ab6ff);
+    --ok:light-dark(#146a35,#3dd68c);
+    --warn:light-dark(#8c4a00,#ff9f43);
+    --bad:light-dark(#b3222f,#ff6b7a);
+    --info:light-dark(#0a6091,#5cc8ff);
+    --c1:light-dark(#1d5fc2,#4c9aff);
+    --c2:light-dark(#13766b,#2dd4bf);
+    --c3:light-dark(#86610a,#f5c542);
+    --rad-ctl:3px;--rad-panel:4px;--ctl:36px;--cell-y:11px;
+    --font:'IBM Plex Sans',system-ui,-apple-system,'Segoe UI',sans-serif;
+    --mds-font-family-mono:'IBM Plex Mono',ui-monospace,'SF Mono',Menlo,Consolas,monospace;
+  }
+  html[data-theme=light]{color-scheme:light}
+  html[data-theme=dark]{color-scheme:dark}
+  *{box-sizing:border-box}
+  body{margin:0;font:14px/1.45 var(--font);background:var(--bg);color:var(--ink);font-variant-numeric:tabular-nums;-webkit-print-color-adjust:exact;print-color-adjust:exact}
+  :where(button,input,select){font-family:inherit}
+  a{color:var(--primary)}
+
+  /* ---- shared primitives (yuzu.css / guardian_page_ui.cpp) ---- */
+  .pill{display:inline-flex;align-items:center;padding:1px 8px;border-radius:3px;font-size:12.5px;font-weight:500;white-space:nowrap}
+  .pill.ok{color:var(--ok);background:color-mix(in srgb,var(--ok) 14%,transparent)}
+  .pill.warn{color:var(--warn);background:color-mix(in srgb,var(--warn) 15%,transparent)}
+  .pill.idle{color:var(--mut);background:var(--surface2)}
+  .os-tag{padding:0 5px;white-space:nowrap;border:1px solid var(--line2);border-radius:3px;color:var(--mut)}
+  .gp-btn{display:inline-flex;align-items:center;gap:6px;height:28px;padding:0 10px;font-size:13px;font-weight:500;white-space:nowrap;text-decoration:none;cursor:pointer;color:var(--ink);background:var(--raise);border:1px solid var(--line2);border-radius:var(--rad-ctl)}
+  .gp-btn:hover{background:var(--surface2);border-color:var(--mut)}
+  .gp-btn.accent{color:var(--on-primary);background:var(--primary);border-color:var(--primary);font-weight:600}
+  .gp-btn.accent:hover{background:var(--primary-h);border-color:var(--primary-h)}
+  .gp-subnav{display:flex;gap:2px;align-items:center;flex-wrap:wrap;border-bottom:1px solid var(--line);margin-bottom:16px}
+  .gp-subnav a{padding:8px 14px;font-weight:500;color:var(--mut);cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px;text-decoration:none}
+  .gp-subnav a:hover{color:var(--ink)}
+  .gp-subnav a.on{color:var(--ink);font-weight:600;border-bottom-color:var(--hl)}
+
+  /* ---- /software page: inv-* copied from inventory_ui.cpp inv_style() ---- */
+  .inv-wrap>*+*{margin-top:22px}
+  .inv-h1{margin:0;font-size:24px;font-weight:600;letter-spacing:-.015em;line-height:1.2;color:var(--ink)}
+  .inv-titlerow{display:flex;align-items:center;justify-content:space-between;gap:12px}
+  .inv-wrap>.inv-sub{margin-top:4px;max-width:70ch;color:var(--mut)}
+  .inv-wrap>.inv-sub a{color:var(--primary)}.inv-wrap>.inv-sub a:hover{text-decoration:underline}
+  .inv-wrap :focus-visible,.mk-bar :focus-visible{outline:2px solid var(--focus);outline-offset:2px}
+  .inv-panel{min-width:0;background:var(--surface);border:1px solid var(--line);border-radius:var(--rad-panel)}
+  .inv-pb{display:flex;flex-direction:column;gap:12px;padding:16px}
+  .inv-kpis{display:flex;flex-wrap:wrap;background:var(--surface);border:1px solid var(--line);border-radius:var(--rad-panel)}
+  .inv-kpi{flex:1 1 170px;min-width:0;display:flex;flex-direction:column;padding:14px 18px;border-left:1px solid var(--line)}
+  .inv-kpi:first-child{border-left:0}
+  .inv-kpi .big{order:-2;font-size:26px;font-weight:500;letter-spacing:-.02em;line-height:1.15;color:var(--ink)}
+  .inv-kpi .h{order:-1;margin-top:2px;font-size:13px;color:var(--mut)}
+  .inv-kpi .s2{margin-top:4px;font-size:12.5px;color:var(--mut)}.inv-kpi .s2 b{color:var(--ink2);font-weight:600}
+  .inv-kpi.warn .big{color:var(--warn)}
+  .inv-osbar{display:flex;height:6px;margin:6px 0 2px;border-radius:2px;overflow:hidden;background:var(--line)}
+  .inv-osbar>span{display:block;height:100%}.inv-osbar>span+span{border-left:1px solid var(--surface)}
+  .inv-osbar .w{background:var(--c1)}.inv-osbar .m{background:var(--c2)}.inv-osbar .l{background:var(--c3)}
+  .inv-fresh{font-size:12.5px;color:var(--faint)}
+  .inv-wrap>.inv-fresh{margin-top:8px}
+  .inv-caveat,.inv-degrade{padding:12px 14px;border:1px solid var(--line2);border-radius:var(--rad-panel);background:var(--surface2);color:var(--ink2);font-size:13.5px}
+  .inv-degrade{border-color:color-mix(in srgb,var(--bad) 50%,var(--line2))}.inv-degrade b{color:var(--bad)}
+  .inv-degrade .inv-btn{margin-left:.6rem}
+  .inv-search{height:var(--ctl);padding:0 10px;border:1px solid var(--line2);border-radius:var(--rad-ctl);background:var(--bg);color:var(--ink);font:inherit;width:100%;max-width:520px}
+  .inv-search::placeholder{color:var(--faint)}
+  .inv-filters{display:grid;gap:8px}
+  .inv-frow,.inv-chips{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+  .inv-frow .lab{min-width:88px;font-size:13px;font-weight:500;color:var(--ink2)}
+  .inv-chip{height:28px;padding:0 10px;border:1px solid var(--line2);border-radius:var(--rad-ctl);background:var(--bg);color:var(--mut);font:inherit;font-size:13px;font-weight:500;cursor:pointer}
+  .inv-chip:hover{background:var(--surface2);color:var(--ink)}
+  .inv-chip[aria-pressed=true]{border-color:var(--primary);background:color-mix(in srgb,var(--primary) 14%,transparent);color:var(--ink)}
+  .inv-active{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+  .inv-apill{display:inline-flex;align-items:center;gap:2px;height:28px;padding:0 4px 0 10px;border:1px solid var(--line2);border-radius:var(--rad-ctl);background:var(--surface2);color:var(--ink);font-size:13px}
+  .inv-apill button{padding:0 6px;border:0;background:none;color:var(--mut);font-size:16px;line-height:1;cursor:pointer}.inv-apill button:hover{color:var(--ink)}
+  .inv-link{padding:0;border:0;background:none;color:var(--primary);font:inherit;font-size:13px;cursor:pointer}.inv-link:hover{text-decoration:underline}
+  .inv-rest{display:flex;gap:10px;align-items:center;overflow:auto;white-space:nowrap;padding:6px 10px;border:1px solid var(--line);border-radius:var(--rad-ctl);background:var(--bg);color:var(--mut);font-family:var(--mds-font-family-mono);font-size:12.5px}
+  .inv-rest .v{color:var(--ink2)}
+  .inv-resbar{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:8px 14px;padding:12px 16px;border-bottom:1px solid var(--line)}
+  .inv-count{font-size:13px;color:var(--mut)}.inv-count b{color:var(--ink);font-weight:600}
+  .inv-exports{display:flex;flex-wrap:wrap;gap:8px;align-items:center;font-size:13px;color:var(--mut)}
+  .inv-btn{display:inline-flex;align-items:center;height:var(--ctl);padding:0 14px;border:1px solid var(--line2);border-radius:var(--rad-ctl);background:var(--raise);color:var(--ink);font:inherit;font-weight:500;white-space:nowrap;text-decoration:none;cursor:pointer}
+  .inv-btn:hover{border-color:var(--mut);background:var(--surface2)}
+  .inv-btn.pri{border-color:var(--primary);background:var(--primary);color:var(--on-primary);font-weight:600}.inv-btn.pri:hover{border-color:var(--primary-h);background:var(--primary-h)}
+  .inv-btn.sm{height:28px;padding:0 10px;font-size:13px}
+  .inv-tblwrap{overflow-x:auto}
+  table.inv-tbl{width:100%;border-collapse:collapse}
+  table.inv-tbl th{padding:8px 16px;border-bottom:1px solid var(--line);background:var(--surface2);color:var(--mut);font-size:12.5px;font-weight:500;text-align:left;white-space:nowrap}
+  table.inv-tbl td{padding:var(--cell-y) 16px;border-bottom:1px solid var(--line);vertical-align:middle;color:var(--ink2)}
+  table.inv-tbl tbody tr:not(.inv-more):hover>td{background:var(--surface2)}
+  .inv-grey{color:var(--mut)}
+  .inv-mono{font-family:var(--mds-font-family-mono);font-size:12.5px}
+  .inv-pill{display:inline-block;vertical-align:middle;padding:0 5px;border:1px solid var(--line2);border-radius:3px;color:var(--mut);font-family:var(--mds-font-family-mono);font-size:11.5px}
+  .inv-pill.on,.inv-pill.stale{padding:1px 8px;border-color:transparent;font:500 12.5px var(--font)}
+  .inv-pill.on{background:color-mix(in srgb,var(--info) 14%,transparent);color:var(--info)}
+  .inv-pill.stale{background:color-mix(in srgb,var(--warn) 15%,transparent);color:var(--warn)}
+  .inv-empty{padding:16px;color:var(--mut)}
+  .inv-hostlink{color:var(--primary);text-decoration:none;cursor:pointer}.inv-hostlink:hover{color:var(--primary-h);text-decoration:underline}
+  tr.inv-more td{padding:12px;text-align:center;white-space:normal}
+  .inv-cursor{margin-left:12px;color:var(--faint);font-family:var(--mds-font-family-mono);font-size:12px}
+
+  /* ---- device page: hw-* copied from hardware_ui.cpp hw_style() ---- */
+  .hw-h1{font-size:24px;font-weight:600;letter-spacing:-.015em;line-height:1.2;color:var(--ink)}
+  .hw-panel{min-width:0;background:var(--surface);border:1px solid var(--line);border-radius:var(--rad-panel)}
+  .hw-hdr{display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px;margin:0 0 12px}
+  .hw-lab{color:var(--mut);font-size:13px}
+  .hw-mono{font-family:var(--mds-font-family-mono);font-size:12.5px;color:var(--mut)}
+  .hw-name{color:var(--ink);font-weight:600;text-decoration:none}
+  .hw-page{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:10px 16px;color:var(--mut);font-size:13px;border-bottom:1px solid var(--line)}
+  .hw-tools{padding:10px 16px;border-bottom:1px solid var(--line)}
+  .hw-search{height:28px;min-width:220px;padding:0 10px;border:1px solid var(--line2);border-radius:var(--rad-ctl);background:var(--bg);color:var(--ink);font-size:13px}
+  .hw-search::placeholder{color:var(--faint)}
+  .hw-scroll{overflow-x:auto}
+  table.hw-tbl{width:100%;border-collapse:collapse}
+  table.hw-tbl th{padding:8px 12px;border-bottom:1px solid var(--line);background:var(--surface2);color:var(--mut);font-size:12.5px;font-weight:500;text-align:left;white-space:nowrap}
+  table.hw-tbl td{padding:var(--cell-y) 12px;border-bottom:1px solid var(--line);color:var(--ink2);white-space:nowrap;vertical-align:middle}
+  table.hw-tbl tbody tr:last-child td{border-bottom:0}
+  table.hw-tbl tbody tr:hover td{background:var(--surface2)}
+  table.hw-tbl td.hw-mono{color:var(--ink2)}
+  .gp-link{color:var(--primary);text-decoration:none}.gp-link:hover{text-decoration:underline}
+
+  /* ---- NEW in this panel (fs-*) ---- */
+  .fs-head{display:flex;flex-wrap:wrap;align-items:center;gap:6px 12px;padding:14px 16px;border-bottom:1px solid var(--line)}
+  .fs-head h2{margin:0;font-size:16px;font-weight:600;color:var(--ink)}
+  .fs-head .fs-hint{flex:1 1 280px}
+  .fs-hint{font-size:12.5px;color:var(--mut)}
+  .fs-in{height:var(--ctl);width:150px;padding:0 10px;border:1px solid var(--line2);border-radius:var(--rad-ctl);background:var(--bg);color:var(--ink);font:inherit}
+  .fs-in::placeholder{color:var(--faint)}
+  .inv-frow .inv-search{flex:1 1 320px}
+  .fs-cards{display:flex;flex-wrap:wrap;gap:14px;align-items:stretch}
+  .fs-cards>.inv-kpis{flex:3 1 520px}
+  .fs-apart{flex:1 1 250px;display:flex;flex-direction:column;padding:14px 18px;border:1px dashed var(--line2);border-radius:var(--rad-panel);background:transparent}
+  .fs-apart .big{font-size:26px;font-weight:500;letter-spacing:-.02em;line-height:1.15;color:var(--warn)}
+  .fs-apart .h{margin-top:2px;font-size:13px;color:var(--mut)}
+  .fs-apart .s2{margin-top:4px;font-size:12.5px;color:var(--mut)}
+  .fs-apart .inv-link{align-self:flex-start;margin-top:6px}
+  tr.fs-vgrp>td{padding:8px 16px;background:var(--surface2);color:var(--ink);font-weight:600}
+  table.inv-tbl tbody td{white-space:nowrap}
+  table.inv-tbl tr.inv-more td{white-space:normal}
+  .fs-trunc{display:inline-block;max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:bottom}
+  .fs-src{margin-left:6px}
+  table.inv-tbl.fs-tight th,table.inv-tbl.fs-tight td{padding-left:12px;padding-right:12px}
+  table.inv-tbl.fs-tight .fs-trunc{max-width:230px}
+  table.inv-tbl.fs-tight .fs-trunc.tail{max-width:200px;direction:rtl;text-align:left}
+  .fs-box{background:var(--surface);border:1px solid var(--line);border-radius:var(--rad-panel)}
+  .fs-ttl{display:block;margin-bottom:4px;color:var(--ink);font-weight:600;font-size:14px}
+  .fs-next{margin-top:10px;color:var(--ink2)}
+  .fs-devline{margin:10px 0;display:flex;flex-wrap:wrap;gap:6px 10px;align-items:center;color:var(--mut)}
+  .fs-note{margin-top:10px;color:var(--mut);font-size:12.5px}
+
+  /* ---- mock-up chrome (mk-*): not part of the product ---- */
+  .mk-bar{position:sticky;top:0;z-index:5;display:flex;flex-wrap:wrap;gap:6px 8px;align-items:center;padding:10px 16px;background:var(--surface2);border-bottom:1px solid var(--line2)}
+  .mk-bar b{margin-right:6px;color:var(--ink);font-size:13px}
+  .mk-bar .sp{flex:1}
+  .mk-bar label{font-size:12.5px;color:var(--mut)}
+  .mk-bar select{height:28px;padding:0 8px;border:1px solid var(--line2);border-radius:var(--rad-ctl);background:var(--bg);color:var(--ink);font-size:13px}
+  .mk-frame{max-width:1400px;margin:0 auto;padding:0 16px}
+  .mk-state{display:none;padding:22px 0 8px}
+  .mk-lab{display:flex;align-items:center;gap:10px}
+  .mk-lab h2{margin:0;font-size:18px;font-weight:600}
+  .mk-n{display:inline-grid;place-items:center;width:26px;height:26px;border-radius:50%;background:var(--primary);color:var(--on-primary);font-weight:600;font-size:13px}
+  .mk-cap{margin:6px 0 16px;max-width:90ch;color:var(--mut);font-size:13px}
+  .mk-stub{margin-top:22px;padding:14px 16px;border:1px dashed var(--line2);border-radius:var(--rad-panel);color:var(--faint);font-size:12.5px;text-align:center}
+  .mk-new::after{content:"new";margin-left:6px;padding:0 5px;border-radius:3px;background:color-mix(in srgb,var(--info) 18%,transparent);color:var(--info);font-size:11px;font-weight:600}
+  .mk-notes{max-width:1400px;margin:30px auto 48px;padding:16px 16px 0;border-top:1px solid var(--line2)}
+  .mk-notes h2{margin:0 0 8px;font-size:16px}
+  .mk-notes ol{margin:0;padding-left:20px;color:var(--ink2);font-size:13.5px}
+  .mk-notes li+li{margin-top:6px}
+
+  /* one state at a time; every state with no script, and in print */
+  body[data-view=s1] #s1,body[data-view=s2] #s2,body[data-view=s3] #s3,body[data-view=s4] #s4,
+  body[data-view=s5] #s5,body[data-view=s6] #s6,body[data-view=s7] #s7,body[data-view=s8] #s8,
+  body[data-view=all] .mk-state,body:not([data-view]) .mk-state{display:block}
+  @media print{
+    .mk-bar{display:none}
+    .mk-state{display:block!important;break-inside:avoid-page;padding-top:14px}
+    .inv-rest,.inv-tblwrap,.hw-scroll{overflow:visible}
+  }
+</style>
+</head>
+<body>
+
+<div class="mk-bar" role="toolbar" aria-label="Mock-up states">
+  <b>Find software panel</b>
+  <button type="button" class="inv-chip" data-s="s1" aria-pressed="false">1 Empty</button>
+  <button type="button" class="inv-chip" data-s="s2" aria-pressed="false">2 Application</button>
+  <button type="button" class="inv-chip" data-s="s3" aria-pressed="false">3 Component</button>
+  <button type="button" class="inv-chip" data-s="s4" aria-pressed="false">4 Management group</button>
+  <button type="button" class="inv-chip" data-s="s5" aria-pressed="false">5 Not collected</button>
+  <button type="button" class="inv-chip" data-s="s6" aria-pressed="false">6 Nothing found</button>
+  <button type="button" class="inv-chip" data-s="s7" aria-pressed="false">7 Store unavailable</button>
+  <button type="button" class="inv-chip" data-s="s8" aria-pressed="false">8 Device tab</button>
+  <button type="button" class="inv-chip" data-s="all" aria-pressed="false">All states (prints)</button>
+  <span class="sp"></span>
+  <label for="mk-theme">Theme</label>
+  <select id="mk-theme"><option value="auto">Auto</option><option value="dark">Dark (slate)</option><option value="light">Light</option></select>
+</div>
+
+<main class="mk-frame">
+
+<!-- =============== 1. EMPTY PANEL =============== -->
+<section id="s1" class="mk-state" aria-labelledby="h-s1">
+  <div class="mk-lab"><span class="mk-n">1</span><h2 id="h-s1">Empty panel</h2></div>
+  <p class="mk-cap">/software, panel at rest. One search box, optional version inputs, kind chips. Nothing is queried until a name is typed. The panel sits first on the page, above the existing KPI strip.</p>
+  <div class="inv-wrap">
+    <div class="inv-titlerow"><h1 class="inv-h1">Software</h1><button type="button" class="gp-btn accent" title="Ask devices to re-send their software inventory now">Sync now</button></div>
+    <div class="inv-sub">Installed-software inventory by application, version and device, synced <b>daily</b> from every endpoint. Looking for a device? Open it from <a href="#!">Hardware</a> &rarr; Installed software &rarr; Open in Software.</div>
+
+    <div class="inv-panel">
+      <div class="fs-head"><h2>Find software</h2><span class="fs-hint">Type a package name to see how many installs and devices carry it, where, and how fresh the data is.</span><span class="inv-pill">Scope: whole fleet</span></div>
+      <div class="inv-pb">
+        <div class="inv-filters">
+          <div class="inv-frow"><label class="lab" for="q1">Package</label><input id="q1" class="inv-search" type="search" placeholder="Package or application name, e.g. log4j-core" value=""><span class="fs-hint">exact name</span></div>
+          <div class="inv-frow"><span class="lab">Version</span><input class="fs-in" aria-label="Exact version" placeholder="exact, e.g. 4.2.1"><span class="fs-hint">or from</span><input class="fs-in" aria-label="From version" placeholder="from, e.g. 2.0"><span class="fs-hint">to</span><input class="fs-in" aria-label="To version" placeholder="to, e.g. 2.14.1"><span class="fs-hint">(range is inclusive)</span></div>
+          <div class="inv-frow"><span class="lab">Kind</span><div class="inv-chips" role="group" aria-label="Kind"><button type="button" class="inv-chip" aria-pressed="true">Applications</button><button type="button" class="inv-chip" aria-pressed="false">Java</button><button type="button" class="inv-chip" aria-pressed="false">Python</button><button type="button" class="inv-chip" aria-pressed="false">Node</button></div><span class="fs-hint">Java, Python and Node search components found inside applications</span></div>
+        </div>
+      </div>
+    </div>
+    <div class="inv-empty fs-box">Nothing searched yet. Type a package name above. Counts use the exact name; add a version, or a from/to range, to narrow them.</div>
+    <div class="mk-stub">KPI strip, catalogue table and inventory sources continue here, unchanged.</div>
+  </div>
+</section>
+
+<!-- =============== 2. APPLICATION RESULT =============== -->
+<section id="s2" class="mk-state" aria-labelledby="h-s2">
+  <div class="mk-lab"><span class="mk-n">2</span><h2 id="h-s2">Application result</h2></div>
+  <p class="mk-cap">Applications chip. The cards count confirmed installs and devices only; unconfirmed ones sit apart and are never added in. The table runs application, then version (newest first), then device.</p>
+  <div class="inv-wrap">
+    <div class="inv-panel">
+      <div class="fs-head"><h2>Find software</h2><span class="fs-hint">Type a package name to see how many installs and devices carry it, where, and how fresh the data is.</span><span class="inv-pill">Scope: whole fleet</span></div>
+      <div class="inv-pb">
+        <div class="inv-filters">
+          <div class="inv-frow"><label class="lab" for="q2">Package</label><input id="q2" class="inv-search" type="search" placeholder="Package or application name, e.g. log4j-core" value="Example Application"><span class="fs-hint">exact name</span></div>
+          <div class="inv-frow"><span class="lab">Version</span><input class="fs-in" aria-label="Exact version" placeholder="exact, e.g. 4.2.1"><span class="fs-hint">or from</span><input class="fs-in" aria-label="From version" placeholder="from, e.g. 2.0"><span class="fs-hint">to</span><input class="fs-in" aria-label="To version" placeholder="to, e.g. 2.14.1"><span class="fs-hint">(range is inclusive)</span></div>
+          <div class="inv-frow"><span class="lab">Kind</span><div class="inv-chips" role="group" aria-label="Kind"><button type="button" class="inv-chip" aria-pressed="true">Applications</button><button type="button" class="inv-chip" aria-pressed="false">Java</button><button type="button" class="inv-chip" aria-pressed="false">Python</button><button type="button" class="inv-chip" aria-pressed="false">Node</button></div></div>
+        </div>
+        <div class="inv-rest" title="every control maps to one REST parameter"><span>GET</span><span class="v">/api/v1/inventory/software?name=Example%20Application&amp;limit=50</span><button type="button" class="inv-link">copy</button></div>
+      </div>
+    </div>
+
+    <div class="fs-cards">
+      <div class="inv-kpis">
+        <div class="inv-kpi" title="Install rows whose device's last report confirmed them"><div class="h">Installs</div><div class="big">1,284</div><div class="inv-osbar" title="Windows 68% &middot; macOS 21% &middot; Linux 11%"><span class="w" style="width:68%"></span><span class="m" style="width:21%"></span><span class="l" style="width:11%"></span></div><div class="s2">Windows 68% &middot; macOS 21% &middot; Linux 11%</div></div>
+        <div class="inv-kpi" title="Distinct devices with at least one confirmed install"><div class="h">Devices</div><div class="big">1,207</div><div class="s2">with a confirmed install &middot; some carry more than one copy</div></div>
+        <div class="inv-kpi"><div class="h">Versions</div><div class="big">4</div><div class="s2">newest in fleet <b>4.2.1</b> &middot; oldest <b>3.9.8</b></div></div>
+      </div>
+      <div class="fs-apart" role="note"><div class="big">11 devices</div><div class="h">Unconfirmed, not in the counts</div><div class="s2"><b>13</b> installs the device's last report did not confirm. Yuzu keeps the last known install and marks it unconfirmed.</div><button type="button" class="inv-link">show only these</button></div>
+    </div>
+    <div class="inv-fresh">As of 14 Nov 2026 09:42 UTC (23m ago). Counts come from the hourly catalogue rollup; table rows are read when you search.</div>
+
+    <div class="inv-panel">
+      <div class="inv-resbar"><div class="inv-count" aria-live="polite"><b>1,297</b> rows &middot; <b>1,284</b> confirmed + <b>13</b> unconfirmed &middot; application &rarr; version (newest first) &rarr; device</div><div class="inv-exports"><a class="inv-btn sm" href="#!" download="software-installs.csv" title="the matching rows (up to 10,000); the file says if it was cut off">Export CSV</a></div></div>
+      <div class="inv-tblwrap"><table class="inv-tbl"><thead><tr><th scope="col">Device</th><th scope="col">OS</th><th scope="col">Version</th><th scope="col">Install location</th><th scope="col">Install type</th><th scope="col" title="confirmed by the device's last report, unconfirmed if it was not">Status</th><th scope="col" title="When a report last confirmed this install">Last confirmed</th><th scope="col" title="When the device last sent its software inventory; amber after 48 h">Last synced</th></tr></thead><tbody>
+        <tr class="fs-vgrp"><td colspan="8"><span class="inv-mono">4.2.1</span> <span class="inv-pill on">newest in fleet</span> <span class="inv-grey">&middot; 698 installs</span></td></tr>
+        <tr><td><a class="inv-hostlink" href="#!" title="Open this device (Hardware &rsaquo; CI view)">host-0188</a></td><td><span class="inv-pill">macOS</span></td><td class="inv-mono">4.2.1</td><td><span class="inv-mono fs-trunc" title="/Applications/Example Application.app">/Applications/Example Application.app</span></td><td class="inv-mono">installer</td><td><span class="pill ok">current</span></td><td><span class="inv-grey">3h ago</span></td><td><span class="inv-grey">3h ago</span></td></tr>
+        <tr><td><a class="inv-hostlink" href="#!" title="Open this device (Hardware &rsaquo; CI view)">host-0412</a></td><td><span class="inv-pill">Windows</span></td><td class="inv-mono">4.2.1</td><td><span class="inv-mono fs-trunc" title="C:\Program Files\Example Application">C:\Program Files\Example Application</span></td><td class="inv-mono">installer</td><td><span class="pill ok">current</span></td><td><span class="inv-grey">5h ago</span></td><td><span class="inv-grey">5h ago</span></td></tr>
+        <tr><td><a class="inv-hostlink" href="#!" title="Open this device (Hardware &rsaquo; CI view)">host-0731</a></td><td><span class="inv-pill">Linux</span></td><td class="inv-mono">4.2.1</td><td><span class="inv-grey">&mdash;</span></td><td class="inv-mono">package_manager</td><td><span class="pill ok">current</span></td><td><span class="inv-grey">1h ago</span></td><td><span class="inv-grey">1h ago</span></td></tr>
+        <tr><td><a class="inv-hostlink" href="#!" title="Open this device (Hardware &rsaquo; CI view)">host-1054</a></td><td><span class="inv-pill">Windows</span></td><td class="inv-mono">4.2.1</td><td><span class="inv-mono fs-trunc" title="D:\Apps\Example Application">D:\Apps\Example Application</span></td><td class="inv-mono">msi</td><td><span class="pill ok">current</span></td><td><span class="inv-grey">3d ago</span></td><td><span class="inv-pill stale" title="last sync more than 48h ago">3d ago</span></td></tr>
+        <tr class="fs-vgrp"><td colspan="8"><span class="inv-mono">4.2.0</span> <span class="inv-grey">&middot; 427 installs</span></td></tr>
+        <tr><td><a class="inv-hostlink" href="#!" title="Open this device (Hardware &rsaquo; CI view)">host-0207</a></td><td><span class="inv-pill">Windows</span></td><td class="inv-mono">4.2.0</td><td><span class="inv-mono fs-trunc" title="C:\Program Files\Example Application">C:\Program Files\Example Application</span></td><td class="inv-mono">installer</td><td><span class="pill ok">current</span></td><td><span class="inv-grey">6h ago</span></td><td><span class="inv-grey">6h ago</span></td></tr>
+        <tr><td><a class="inv-hostlink" href="#!" title="Open this device (Hardware &rsaquo; CI view)">host-0412</a></td><td><span class="inv-pill">Windows</span></td><td class="inv-mono">4.2.0</td><td><span class="inv-mono fs-trunc" title="D:\Legacy\Example Application">D:\Legacy\Example Application</span></td><td class="inv-mono">installer</td><td><span class="pill ok">current</span></td><td><span class="inv-grey">5h ago</span></td><td><span class="inv-grey">5h ago</span></td></tr>
+        <tr><td><a class="inv-hostlink" href="#!" title="Open this device (Hardware &rsaquo; CI view)">host-0561</a></td><td><span class="inv-pill">Linux</span></td><td class="inv-mono">4.2.0</td><td><span class="inv-grey">&mdash;</span></td><td class="inv-mono">package_manager</td><td><span class="pill ok">current</span></td><td><span class="inv-grey">4h ago</span></td><td><span class="inv-grey">4h ago</span></td></tr>
+        <tr><td><a class="inv-hostlink" href="#!" title="Open this device (Hardware &rsaquo; CI view)">host-0933</a></td><td><span class="inv-pill">macOS</span></td><td class="inv-mono">4.2.0</td><td><span class="inv-mono fs-trunc" title="/Applications/Example Application.app">/Applications/Example Application.app</span></td><td class="inv-mono">installer</td><td><span class="pill warn" title="the last report did not confirm this install">unconfirmed</span></td><td><span class="inv-grey">9d ago</span></td><td><span class="inv-grey">2h ago</span></td></tr>
+        <tr class="fs-vgrp"><td colspan="8"><span class="inv-mono">4.1.3</span> <span class="inv-grey">&middot; 126 installs</span></td></tr>
+        <tr><td><a class="inv-hostlink" href="#!" title="Open this device (Hardware &rsaquo; CI view)">host-0090</a></td><td><span class="inv-pill">Windows</span></td><td class="inv-mono">4.1.3</td><td><span class="inv-mono fs-trunc" title="C:\Program Files\Example Application">C:\Program Files\Example Application</span></td><td class="inv-mono">installer</td><td><span class="pill ok">current</span></td><td><span class="inv-grey">11h ago</span></td><td><span class="inv-grey">11h ago</span></td></tr>
+        <tr><td><a class="inv-hostlink" href="#!" title="Open this device (Hardware &rsaquo; CI view)">host-0845</a></td><td><span class="inv-pill">macOS</span></td><td class="inv-mono">4.1.3</td><td><span class="inv-mono fs-trunc" title="/Applications/Example Application.app">/Applications/Example Application.app</span></td><td class="inv-mono">installer</td><td><span class="pill ok">current</span></td><td><span class="inv-grey">5h ago</span></td><td><span class="inv-grey">5h ago</span></td></tr>
+        <tr class="fs-vgrp"><td colspan="8"><span class="inv-mono">3.9.8</span> <span class="inv-grey">&middot; 33 installs</span></td></tr>
+        <tr><td><a class="inv-hostlink" href="#!" title="Open this device (Hardware &rsaquo; CI view)">host-0066</a></td><td><span class="inv-pill">Windows</span></td><td class="inv-mono">3.9.8</td><td><span class="inv-mono fs-trunc" title="C:\Program Files (x86)\Example Application">C:\Program Files (x86)\Example Application</span></td><td class="inv-mono">installer</td><td><span class="pill ok">current</span></td><td><span class="inv-grey">8d ago</span></td><td><span class="inv-pill stale" title="last sync more than 48h ago">8d ago</span></td></tr>
+        <tr class="inv-more"><td colspan="8"><button type="button" class="inv-btn pri">Load 50 more rows</button><span class="inv-cursor">11 of 1,297 &middot; cursor after (3.9.8, host-0066)</span></td></tr>
+      </tbody></table></div>
+    </div>
+  </div>
+</section>
+
+<!-- =============== 3. COMPONENT RESULT (JAVA) =============== -->
+<section id="s3" class="mk-state" aria-labelledby="h-s3">
+  <div class="mk-lab"><span class="mk-n">3</span><h2 id="h-s3">Component result (Java chip)</h2></div>
+  <p class="mk-cap">Same shape for components found inside applications. Version shows where it was read from; Inside is the application folder, a dash when the component sits on its own. The zero-day question: which devices carry log4j-core between 2.0 and 2.14.1.</p>
+  <div class="inv-wrap">
+    <div class="inv-panel">
+      <div class="fs-head"><h2>Find software</h2><span class="fs-hint">Type a package name to see how many installs and devices carry it, where, and how fresh the data is.</span><span class="inv-pill">Scope: whole fleet</span></div>
+      <div class="inv-pb">
+        <div class="inv-filters">
+          <div class="inv-frow"><label class="lab" for="q3">Package</label><input id="q3" class="inv-search" type="search" placeholder="Package or application name, e.g. log4j-core" value="log4j-core"><span class="fs-hint">exact name</span></div>
+          <div class="inv-frow"><span class="lab">Version</span><input class="fs-in" aria-label="Exact version" placeholder="exact, e.g. 4.2.1"><span class="fs-hint">or from</span><input class="fs-in" aria-label="From version" placeholder="from, e.g. 2.0" value="2.0"><span class="fs-hint">to</span><input class="fs-in" aria-label="To version" placeholder="to, e.g. 2.14.1" value="2.14.1"><span class="fs-hint">(range is inclusive)</span></div>
+          <div class="inv-frow"><span class="lab">Kind</span><div class="inv-chips" role="group" aria-label="Kind"><button type="button" class="inv-chip" aria-pressed="false">Applications</button><button type="button" class="inv-chip" aria-pressed="true">Java</button><button type="button" class="inv-chip" aria-pressed="false">Python</button><button type="button" class="inv-chip" aria-pressed="false">Node</button></div></div>
+        </div>
+        <div class="inv-rest" title="every control maps to one REST parameter"><span>GET</span><span class="v">/api/v1/inventory/software/components?name=log4j-core&amp;version_min=2.0&amp;version_max=2.14.1&amp;limit=50</span><button type="button" class="inv-link">copy</button></div>
+      </div>
+    </div>
+
+    <div class="fs-cards">
+      <div class="inv-kpis">
+        <div class="inv-kpi"><div class="h">Components</div><div class="big">214</div><div class="inv-osbar" title="Windows 64% &middot; macOS 17% &middot; Linux 19%"><span class="w" style="width:64%"></span><span class="m" style="width:17%"></span><span class="l" style="width:19%"></span></div><div class="s2">Windows 64% &middot; macOS 17% &middot; Linux 19%</div></div>
+        <div class="inv-kpi"><div class="h">Devices</div><div class="big">163</div><div class="s2">with a confirmed copy &middot; some carry more than one</div></div>
+        <div class="inv-kpi"><div class="h">Versions</div><div class="big">4</div><div class="s2">from <b>2.0.2</b> to <b>2.14.1</b></div></div>
+      </div>
+      <div class="fs-apart" role="note"><div class="big">4 devices</div><div class="h">Unconfirmed, not in the counts</div><div class="s2"><b>5</b> components the device's last report did not confirm. Listed below with status unconfirmed.</div><button type="button" class="inv-link">show only these</button></div>
+    </div>
+    <div class="inv-fresh">As of 14 Nov 2026 09:42 UTC (12m ago). Counts come from the hourly component rollup; table rows are read when you search.</div>
+    <div class="inv-caveat"><b>Coverage.</b> These counts include only devices that have sent their component list. A device that has not cannot be ruled in or out; see &ldquo;Components not collected yet&rdquo; on that device.</div>
+
+    <div class="inv-panel">
+      <div class="inv-resbar"><div class="inv-count" aria-live="polite"><b>219</b> rows &middot; <b>214</b> confirmed + <b>5</b> unconfirmed &middot; component &rarr; version (newest first) &rarr; device</div><div class="inv-exports"><a class="inv-btn sm" href="#!" download="software-components.csv" title="the matching rows (up to 10,000); the file says if it was cut off">Export CSV</a></div></div>
+      <div class="inv-tblwrap"><table class="inv-tbl fs-tight"><thead><tr><th scope="col">Device</th><th scope="col">OS</th><th scope="col">Component</th><th scope="col" title="Version, and where it was read from">Version (read from)</th><th scope="col">Path</th><th scope="col" title="The application folder the component sits inside">Inside</th><th scope="col">Status</th><th scope="col" title="When the device last sent its software inventory; amber after 48 h">Last synced</th></tr></thead><tbody>
+        <tr class="fs-vgrp"><td colspan="8"><span class="inv-mono">2.14.1</span> <span class="inv-grey">&middot; 88 components</span></td></tr>
+        <tr><td><a class="inv-hostlink" href="#!" title="Open this device (Hardware &rsaquo; CI view)">host-0188</a></td><td><span class="inv-pill">macOS</span></td><td class="inv-mono">log4j-core</td><td><span class="inv-mono">2.14.1</span><span class="inv-pill fs-src" title="Where the version was read from">MANIFEST.MF</span></td><td><span class="inv-mono fs-trunc tail" title="/Applications/Example Application.app/Contents/Java/log4j-core-2.14.1.jar"><bdo dir="ltr">/Applications/Example Application.app/Contents/Java/log4j-core-2.14.1.jar</bdo></span></td><td><span class="inv-mono fs-trunc" title="/Applications/Example Application.app">/Applications/Example Application.app</span></td><td><span class="pill ok">current</span></td><td><span class="inv-grey">3h ago</span></td></tr>
+        <tr><td><a class="inv-hostlink" href="#!" title="Open this device (Hardware &rsaquo; CI view)">host-0412</a></td><td><span class="inv-pill">Windows</span></td><td class="inv-mono">log4j-core</td><td><span class="inv-mono">2.14.1</span><span class="inv-pill fs-src" title="Where the version was read from">pom.properties</span></td><td><span class="inv-mono fs-trunc tail" title="C:\Program Files\Example Application\lib\log4j-core-2.14.1.jar"><bdo dir="ltr">C:\Program Files\Example Application\lib\log4j-core-2.14.1.jar</bdo></span></td><td><span class="inv-mono fs-trunc" title="C:\Program Files\Example Application">C:\Program Files\Example Application</span></td><td><span class="pill ok">current</span></td><td><span class="inv-grey">5h ago</span></td></tr>
+        <tr><td><a class="inv-hostlink" href="#!" title="Open this device (Hardware &rsaquo; CI view)">host-0731</a></td><td><span class="inv-pill">Linux</span></td><td class="inv-mono">log4j-core</td><td><span class="inv-mono">2.14.1</span><span class="inv-pill fs-src" title="Where the version was read from">file name</span></td><td><span class="inv-mono fs-trunc tail" title="/opt/example-application/lib/log4j-core-2.14.1.jar"><bdo dir="ltr">/opt/example-application/lib/log4j-core-2.14.1.jar</bdo></span></td><td><span class="inv-mono fs-trunc" title="/opt/example-application">/opt/example-application</span></td><td><span class="pill ok">current</span></td><td><span class="inv-grey">1h ago</span></td></tr>
+        <tr><td><a class="inv-hostlink" href="#!" title="Open this device (Hardware &rsaquo; CI view)">host-1054</a></td><td><span class="inv-pill">Windows</span></td><td class="inv-mono">log4j-core</td><td><span class="inv-mono">2.14.1</span><span class="inv-pill fs-src" title="Where the version was read from">pom.properties</span></td><td><span class="inv-mono fs-trunc tail" title="D:\Apps\Example Application\lib\log4j-core-2.14.1.jar"><bdo dir="ltr">D:\Apps\Example Application\lib\log4j-core-2.14.1.jar</bdo></span></td><td><span class="inv-mono fs-trunc" title="D:\Apps\Example Application">D:\Apps\Example Application</span></td><td><span class="pill ok">current</span></td><td><span class="inv-pill stale" title="last sync more than 48h ago">3d ago</span></td></tr>
+        <tr class="fs-vgrp"><td colspan="8"><span class="inv-mono">2.13.3</span> <span class="inv-grey">&middot; 61 components</span></td></tr>
+        <tr><td><a class="inv-hostlink" href="#!" title="Open this device (Hardware &rsaquo; CI view)">host-0207</a></td><td><span class="inv-pill">Windows</span></td><td class="inv-mono">log4j-core</td><td><span class="inv-mono">2.13.3</span><span class="inv-pill fs-src" title="Where the version was read from">pom.properties</span></td><td><span class="inv-mono fs-trunc tail" title="C:\Program Files\Example Application\lib\log4j-core-2.13.3.jar"><bdo dir="ltr">C:\Program Files\Example Application\lib\log4j-core-2.13.3.jar</bdo></span></td><td><span class="inv-mono fs-trunc" title="C:\Program Files\Example Application">C:\Program Files\Example Application</span></td><td><span class="pill ok">current</span></td><td><span class="inv-grey">6h ago</span></td></tr>
+        <tr><td><a class="inv-hostlink" href="#!" title="Open this device (Hardware &rsaquo; CI view)">host-0933</a></td><td><span class="inv-pill">macOS</span></td><td class="inv-mono">log4j-core</td><td><span class="inv-mono">2.13.3</span><span class="inv-pill fs-src" title="Where the version was read from">MANIFEST.MF</span></td><td><span class="inv-mono fs-trunc tail" title="/Applications/Example Application.app/Contents/Java/log4j-core-2.13.3.jar"><bdo dir="ltr">/Applications/Example Application.app/Contents/Java/log4j-core-2.13.3.jar</bdo></span></td><td><span class="inv-mono fs-trunc" title="/Applications/Example Application.app">/Applications/Example Application.app</span></td><td><span class="pill warn" title="the last report did not confirm this component">unconfirmed</span></td><td><span class="inv-grey">2h ago</span></td></tr>
+        <tr class="fs-vgrp"><td colspan="8"><span class="inv-mono">2.12.1</span> <span class="inv-grey">&middot; 40 components</span></td></tr>
+        <tr><td><a class="inv-hostlink" href="#!" title="Open this device (Hardware &rsaquo; CI view)">host-0090</a></td><td><span class="inv-pill">Windows</span></td><td class="inv-mono">log4j-core</td><td><span class="inv-mono">2.12.1</span><span class="inv-pill fs-src" title="Where the version was read from">pom.properties</span></td><td><span class="inv-mono fs-trunc tail" title="C:\Program Files\Example Application\lib\log4j-core-2.12.1.jar"><bdo dir="ltr">C:\Program Files\Example Application\lib\log4j-core-2.12.1.jar</bdo></span></td><td><span class="inv-mono fs-trunc" title="C:\Program Files\Example Application">C:\Program Files\Example Application</span></td><td><span class="pill ok">current</span></td><td><span class="inv-grey">11h ago</span></td></tr>
+        <tr><td><a class="inv-hostlink" href="#!" title="Open this device (Hardware &rsaquo; CI view)">host-0561</a></td><td><span class="inv-pill">Linux</span></td><td class="inv-mono">log4j-core</td><td><span class="inv-mono">2.12.1</span><span class="inv-pill fs-src" title="Where the version was read from">file name</span></td><td><span class="inv-mono fs-trunc tail" title="/srv/tools/log4j-core-2.12.1.jar"><bdo dir="ltr">/srv/tools/log4j-core-2.12.1.jar</bdo></span></td><td><span class="inv-grey" title="not inside an application folder">&mdash;</span></td><td><span class="pill ok">current</span></td><td><span class="inv-grey">4h ago</span></td></tr>
+        <tr class="fs-vgrp"><td colspan="8"><span class="inv-mono">2.0.2</span> <span class="inv-grey">&middot; 25 components</span></td></tr>
+        <tr><td><a class="inv-hostlink" href="#!" title="Open this device (Hardware &rsaquo; CI view)">host-0066</a></td><td><span class="inv-pill">Windows</span></td><td class="inv-mono">log4j-core</td><td><span class="inv-mono">2.0.2</span><span class="inv-pill fs-src" title="Where the version was read from">MANIFEST.MF</span></td><td><span class="inv-mono fs-trunc tail" title="C:\Program Files (x86)\Example Application\lib\log4j-core-2.0.2.jar"><bdo dir="ltr">C:\Program Files (x86)\Example Application\lib\log4j-core-2.0.2.jar</bdo></span></td><td><span class="inv-mono fs-trunc" title="C:\Program Files (x86)\Example Application">C:\Program Files (x86)\Example Application</span></td><td><span class="pill ok">current</span></td><td><span class="inv-pill stale" title="last sync more than 48h ago">8d ago</span></td></tr>
+        <tr class="inv-more"><td colspan="8"><button type="button" class="inv-btn pri">Load 50 more rows</button><span class="inv-cursor">9 of 219 &middot; cursor after (2.0.2, host-0066)</span></td></tr>
+      </tbody></table></div>
+    </div>
+  </div>
+</section>
+
+<!-- =============== 4. MANAGEMENT-GROUP VIEW =============== -->
+<section id="s4" class="mk-state" aria-labelledby="h-s4">
+  <div class="mk-lab"><span class="mk-n">4</span><h2 id="h-s4">Management-group view</h2></div>
+  <p class="mk-cap">Account scoped to management groups. No fleet count (the API returns totals as null, never zero), a short note says why, and the table lists only the devices in the account's groups. No &ldquo;newest in fleet&rdquo; marker either.</p>
+  <div class="inv-wrap">
+    <div class="inv-panel">
+      <div class="fs-head"><h2>Find software</h2><span class="fs-hint">Type a package name to see how many installs and devices carry it, where, and how fresh the data is.</span><span class="inv-pill">Scope: your management groups</span></div>
+      <div class="inv-pb">
+        <div class="inv-filters">
+          <div class="inv-frow"><label class="lab" for="q4">Package</label><input id="q4" class="inv-search" type="search" placeholder="Package or application name, e.g. log4j-core" value="Example Application"><span class="fs-hint">exact name</span></div>
+          <div class="inv-frow"><span class="lab">Version</span><input class="fs-in" aria-label="Exact version" placeholder="exact, e.g. 4.2.1"><span class="fs-hint">or from</span><input class="fs-in" aria-label="From version" placeholder="from, e.g. 2.0"><span class="fs-hint">to</span><input class="fs-in" aria-label="To version" placeholder="to, e.g. 2.14.1"><span class="fs-hint">(range is inclusive)</span></div>
+          <div class="inv-frow"><span class="lab">Kind</span><div class="inv-chips" role="group" aria-label="Kind"><button type="button" class="inv-chip" aria-pressed="true">Applications</button><button type="button" class="inv-chip" aria-pressed="false">Java</button><button type="button" class="inv-chip" aria-pressed="false">Python</button><button type="button" class="inv-chip" aria-pressed="false">Node</button></div></div>
+        </div>
+        <div class="inv-rest" title="every control maps to one REST parameter"><span>GET</span><span class="v">/api/v1/inventory/software?name=Example%20Application&amp;limit=50</span><button type="button" class="inv-link">copy</button></div>
+      </div>
+    </div>
+
+    <div class="inv-caveat"><b>Fleet totals are not shown to an account scoped to management groups.</b> A count of only part of the fleet could be read as the whole of it, so none is given. The table below lists installs on the devices in your groups.</div>
+
+    <div class="inv-panel">
+      <div class="inv-resbar"><div class="inv-count" aria-live="polite"><b>4</b> rows on devices in your groups &middot; application &rarr; version &rarr; device</div><div class="inv-exports"><a class="inv-btn sm" href="#!" download="software-installs.csv" title="the matching rows in your groups (up to 10,000); the file says if it was cut off">Export CSV</a></div></div>
+      <div class="inv-tblwrap"><table class="inv-tbl"><thead><tr><th scope="col">Device</th><th scope="col">OS</th><th scope="col">Version</th><th scope="col">Install location</th><th scope="col">Install type</th><th scope="col">Status</th><th scope="col">Last confirmed</th><th scope="col">Last synced</th></tr></thead><tbody>
+        <tr class="fs-vgrp"><td colspan="8"><span class="inv-mono">4.2.1</span> <span class="inv-grey">&middot; 2 installs on your devices</span></td></tr>
+        <tr><td><a class="inv-hostlink" href="#!" title="Open this device (Hardware &rsaquo; CI view)">host-0412</a></td><td><span class="inv-pill">Windows</span></td><td class="inv-mono">4.2.1</td><td><span class="inv-mono fs-trunc" title="C:\Program Files\Example Application">C:\Program Files\Example Application</span></td><td class="inv-mono">installer</td><td><span class="pill ok">current</span></td><td><span class="inv-grey">5h ago</span></td><td><span class="inv-grey">5h ago</span></td></tr>
+        <tr><td><a class="inv-hostlink" href="#!" title="Open this device (Hardware &rsaquo; CI view)">host-0731</a></td><td><span class="inv-pill">Linux</span></td><td class="inv-mono">4.2.1</td><td><span class="inv-grey">&mdash;</span></td><td class="inv-mono">package_manager</td><td><span class="pill ok">current</span></td><td><span class="inv-grey">1h ago</span></td><td><span class="inv-grey">1h ago</span></td></tr>
+        <tr class="fs-vgrp"><td colspan="8"><span class="inv-mono">4.2.0</span> <span class="inv-grey">&middot; 2 installs on your devices</span></td></tr>
+        <tr><td><a class="inv-hostlink" href="#!" title="Open this device (Hardware &rsaquo; CI view)">host-0412</a></td><td><span class="inv-pill">Windows</span></td><td class="inv-mono">4.2.0</td><td><span class="inv-mono fs-trunc" title="D:\Legacy\Example Application">D:\Legacy\Example Application</span></td><td class="inv-mono">installer</td><td><span class="pill ok">current</span></td><td><span class="inv-grey">5h ago</span></td><td><span class="inv-grey">5h ago</span></td></tr>
+        <tr><td><a class="inv-hostlink" href="#!" title="Open this device (Hardware &rsaquo; CI view)">host-0561</a></td><td><span class="inv-pill">Linux</span></td><td class="inv-mono">4.2.0</td><td><span class="inv-grey">&mdash;</span></td><td class="inv-mono">package_manager</td><td><span class="pill ok">current</span></td><td><span class="inv-grey">4h ago</span></td><td><span class="inv-grey">4h ago</span></td></tr>
+        <tr class="inv-more"><td colspan="8"><span class="inv-grey">All 4 matching rows are loaded.</span></td></tr>
+      </tbody></table></div>
+    </div>
+  </div>
+</section>
+
+<!-- =============== 5. COMPONENTS NOT COLLECTED YET =============== -->
+<section id="s5" class="mk-state" aria-labelledby="h-s5">
+  <div class="mk-lab"><span class="mk-n">5</span><h2 id="h-s5">Components not collected yet on a device</h2></div>
+  <p class="mk-cap">Opened from a device (host filter pill). The device has not sent its component list, so the panel refuses to read that as &ldquo;none found&rdquo; and offers Sync now.</p>
+  <div class="inv-wrap">
+    <div class="inv-panel">
+      <div class="fs-head"><h2>Find software</h2><span class="fs-hint">Type a package name to see how many installs and devices carry it, where, and how fresh the data is.</span><span class="inv-pill">Scope: whole fleet</span></div>
+      <div class="inv-pb">
+        <div class="inv-filters">
+          <div class="inv-frow"><label class="lab" for="q5">Package</label><input id="q5" class="inv-search" type="search" placeholder="Package or application name, e.g. log4j-core" value="log4j-core"><span class="fs-hint">exact name</span></div>
+          <div class="inv-frow"><span class="lab">Version</span><input class="fs-in" aria-label="Exact version" placeholder="exact, e.g. 4.2.1"><span class="fs-hint">or from</span><input class="fs-in" aria-label="From version" placeholder="from, e.g. 2.0"><span class="fs-hint">to</span><input class="fs-in" aria-label="To version" placeholder="to, e.g. 2.14.1"><span class="fs-hint">(range is inclusive)</span></div>
+          <div class="inv-frow"><span class="lab">Kind</span><div class="inv-chips" role="group" aria-label="Kind"><button type="button" class="inv-chip" aria-pressed="false">Applications</button><button type="button" class="inv-chip" aria-pressed="true">Java</button><button type="button" class="inv-chip" aria-pressed="false">Python</button><button type="button" class="inv-chip" aria-pressed="false">Node</button></div></div>
+        </div>
+        <div class="inv-active"><span class="inv-apill">host: host-0412<button type="button" aria-label="Remove filter host: host-0412">&times;</button></span><button type="button" class="inv-link">Clear all</button></div>
+        <div class="inv-rest" title="every control maps to one REST parameter"><span>GET</span><span class="v">/api/v1/inventory/software/components?name=log4j-core&amp;agent_id=&lt;host-0412&gt;&amp;limit=50</span><button type="button" class="inv-link">copy</button></div>
+      </div>
+    </div>
+
+    <div class="inv-caveat">
+      <span class="fs-ttl">Components not collected yet on host-0412.</span>
+      This device has not sent its component list, so Yuzu cannot say whether log4j-core is present. That is not the same as &ldquo;none found&rdquo;.
+      <div class="fs-devline"><a class="inv-hostlink" href="#!">host-0412</a><span class="inv-pill">Windows</span><span>software last synced <b>5h ago</b></span><span class="inv-mono">component list: not_collected</span></div>
+      Components arrive with the device's daily software sync. Sync now asks for them straight away.
+      <div class="fs-next"><button type="button" class="gp-btn accent">Sync now</button></div>
+    </div>
+  </div>
+</section>
+
+<!-- =============== 6. NOTHING FOUND =============== -->
+<section id="s6" class="mk-state" aria-labelledby="h-s6">
+  <div class="mk-lab"><span class="mk-n">6</span><h2 id="h-s6">Nothing found</h2></div>
+  <p class="mk-cap">The store answered and nothing matches: a real zero. A common miss is searching a component under Applications, so the panel offers the component search.</p>
+  <div class="inv-wrap">
+    <div class="inv-panel">
+      <div class="fs-head"><h2>Find software</h2><span class="fs-hint">Type a package name to see how many installs and devices carry it, where, and how fresh the data is.</span><span class="inv-pill">Scope: whole fleet</span></div>
+      <div class="inv-pb">
+        <div class="inv-filters">
+          <div class="inv-frow"><label class="lab" for="q6">Package</label><input id="q6" class="inv-search" type="search" placeholder="Package or application name, e.g. log4j-core" value="log4j-core"><span class="fs-hint">exact name</span></div>
+          <div class="inv-frow"><span class="lab">Version</span><input class="fs-in" aria-label="Exact version" placeholder="exact, e.g. 4.2.1"><span class="fs-hint">or from</span><input class="fs-in" aria-label="From version" placeholder="from, e.g. 2.0"><span class="fs-hint">to</span><input class="fs-in" aria-label="To version" placeholder="to, e.g. 2.14.1"><span class="fs-hint">(range is inclusive)</span></div>
+          <div class="inv-frow"><span class="lab">Kind</span><div class="inv-chips" role="group" aria-label="Kind"><button type="button" class="inv-chip" aria-pressed="true">Applications</button><button type="button" class="inv-chip" aria-pressed="false">Java</button><button type="button" class="inv-chip" aria-pressed="false">Python</button><button type="button" class="inv-chip" aria-pressed="false">Node</button></div></div>
+        </div>
+      </div>
+    </div>
+    <div class="inv-empty fs-box">
+      <span class="fs-ttl">Nothing found.</span>
+      No install matches the exact name &ldquo;log4j-core&rdquo; on any device in your scope. The store answered, so this is a real zero, not a failure. Check the spelling, or clear the version fields.
+      <div class="fs-next">log4j-core is a component that lives inside applications. <button type="button" class="inv-link">Search Java components for log4j-core</button></div>
+    </div>
+  </div>
+</section>
+
+<!-- =============== 7. STORE UNAVAILABLE =============== -->
+<section id="s7" class="mk-state" aria-labelledby="h-s7">
+  <div class="mk-lab"><span class="mk-n">7</span><h2 id="h-s7">Store unavailable</h2></div>
+  <p class="mk-cap">The store did not answer. Wording is the page's existing banner; filters are kept and Retry re-runs them. Nothing is drawn that could be read as zero.</p>
+  <div class="inv-wrap">
+    <div class="inv-panel">
+      <div class="fs-head"><h2>Find software</h2><span class="fs-hint">Type a package name to see how many installs and devices carry it, where, and how fresh the data is.</span><span class="inv-pill">Scope: whole fleet</span></div>
+      <div class="inv-pb">
+        <div class="inv-filters">
+          <div class="inv-frow"><label class="lab" for="q7">Package</label><input id="q7" class="inv-search" type="search" placeholder="Package or application name, e.g. log4j-core" value="Example Application"><span class="fs-hint">exact name</span></div>
+          <div class="inv-frow"><span class="lab">Version</span><input class="fs-in" aria-label="Exact version" placeholder="exact, e.g. 4.2.1"><span class="fs-hint">or from</span><input class="fs-in" aria-label="From version" placeholder="from, e.g. 2.0"><span class="fs-hint">to</span><input class="fs-in" aria-label="To version" placeholder="to, e.g. 2.14.1"><span class="fs-hint">(range is inclusive)</span></div>
+          <div class="inv-frow"><span class="lab">Kind</span><div class="inv-chips" role="group" aria-label="Kind"><button type="button" class="inv-chip" aria-pressed="true">Applications</button><button type="button" class="inv-chip" aria-pressed="false">Java</button><button type="button" class="inv-chip" aria-pressed="false">Python</button><button type="button" class="inv-chip" aria-pressed="false">Node</button></div></div>
+        </div>
+      </div>
+    </div>
+    <div class="inv-degrade" role="alert"><b>Inventory store unavailable.</b> The installed-software store did not answer, so nothing is shown rather than an empty list that could be mistaken for &ldquo;no software&rdquo;. <button type="button" class="inv-btn">Retry</button></div>
+  </div>
+</section>
+
+<!-- =============== 8. PER-DEVICE SOFTWARE TAB =============== -->
+<section id="s8" class="mk-state" aria-labelledby="h-s8">
+  <div class="mk-lab"><span class="mk-n">8</span><h2 id="h-s8">Per-device software tab</h2></div>
+  <p class="mk-cap">Hardware, device page, Installed software tab. Two new columns, Install type and Location, after the existing six. Location is a dash where the collector reports no single folder (MSI products, store packages, runtimes, Linux packages).</p>
+  <div class="inv-wrap">
+    <div>
+      <div class="hw-hdr"><a class="gp-btn" href="#!">&larr; Hardware</a></div>
+      <div class="hw-hdr"><span class="pill ok">online</span><h1 class="hw-h1" style="margin:0">host-0412</h1><span class="os-tag">Windows 11</span><span class="hw-mono">7c1e9a40-0412</span><span class="hw-lab">last seen 2m ago</span><span style="flex:1"></span><button type="button" class="gp-btn accent">Sync now</button></div>
+      <div class="gp-subnav"><a href="#!">Overview</a><a href="#!" class="on">Installed software</a><a href="#!">Tags and properties</a><a href="#!">DEX</a><a href="#!">Guardian</a><a href="#!">Live</a><a href="#!">Actions</a></div>
+      <div class="hw-panel">
+        <div class="hw-page"><span>6 applications, last synced 2026-11-14T07:12:09Z &middot; <a class="gp-link" href="#!">Open in Software</a></span></div>
+        <div class="hw-tools"><input class="hw-search" placeholder="Filter installed software&hellip;" aria-label="Filter installed software"></div>
+        <div class="hw-scroll"><table class="hw-tbl"><thead><tr><th scope="col">Name</th><th scope="col">Version</th><th scope="col">Publisher</th><th scope="col">Install date</th><th scope="col">Signature</th><th scope="col">Ecosystem</th><th scope="col" class="mk-new">Install type</th><th scope="col" class="mk-new">Location</th></tr></thead><tbody>
+          <tr><td class="hw-name">Example Application</td><td class="hw-mono">4.2.1</td><td>Example Publisher</td><td class="hw-mono">2026-10-02</td><td><span class="inv-grey">&mdash;</span></td><td>windows</td><td class="hw-mono">installer</td><td class="hw-mono"><span class="fs-trunc" title="C:\Program Files\Example Application">C:\Program Files\Example Application</span></td></tr>
+          <tr><td class="hw-name">Example Application</td><td class="hw-mono">4.2.0</td><td>Example Publisher</td><td class="hw-mono">2025-08-19</td><td><span class="inv-grey">&mdash;</span></td><td>windows</td><td class="hw-mono">installer</td><td class="hw-mono"><span class="fs-trunc" title="D:\Legacy\Example Application">D:\Legacy\Example Application</span></td></tr>
+          <tr><td class="hw-name">Example Reader</td><td class="hw-mono">3.1.4</td><td>Sample Software</td><td class="hw-mono">2026-07-30</td><td><span class="inv-grey">&mdash;</span></td><td>msi</td><td class="hw-mono">msi</td><td><span class="inv-grey">&mdash;</span></td></tr>
+          <tr><td class="hw-name">Example Runtime</td><td class="hw-mono">8.0.11</td><td>Example Publisher</td><td class="hw-mono">2026-09-18</td><td><span class="inv-grey">&mdash;</span></td><td>dotnet</td><td class="hw-mono">runtime</td><td><span class="inv-grey">&mdash;</span></td></tr>
+          <tr><td class="hw-name">Example Notes</td><td class="hw-mono">2.3.1</td><td>Sample Software</td><td class="hw-mono">2026-05-12</td><td><span class="inv-grey">&mdash;</span></td><td>appx</td><td class="hw-mono">store</td><td><span class="inv-grey">&mdash;</span></td></tr>
+          <tr><td class="hw-name">Sample Terminal</td><td class="hw-mono">1.22.0</td><td>Sample Software</td><td class="hw-mono">2026-10-21</td><td><span class="inv-grey">&mdash;</span></td><td>winget</td><td class="hw-mono">package_manager</td><td><span class="inv-grey">&mdash;</span></td></tr>
+        </tbody></table></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<aside class="mk-notes" aria-labelledby="h-notes">
+  <h2 id="h-notes">Design choices to review</h2>
+  <ol>
+    <li><b>Placement.</b> The panel is the first block on /software, above the KPI strip, because it is the CISO's first action.</li>
+    <li><b>Unconfirmed apart.</b> Unconfirmed installs never enter the count cards; they get their own dashed box and stay in the table, marked by status.</li>
+    <li><b>Python and Node chips.</b> Assumed to share the Java component layout (state 3); Applications is the only installs view.</li>
+    <li><b>Version labels.</b> pom.properties, MANIFEST.MF and file name are sample values for the &ldquo;read from&rdquo; tag.</li>
+    <li><b>New styling.</b> Limited to fs-* (panel head, version group row, path truncation, unconfirmed box); everything else reuses the page's inv-*, hw-*, gp-* and pill classes.</li>
+  </ol>
+</aside>
+
+<script>
+(function () {
+  var b = document.body, tabs = document.querySelectorAll('[data-s]');
+  function show(v) {
+    b.setAttribute('data-view', v);
+    tabs.forEach(function (t) { t.setAttribute('aria-pressed', t.getAttribute('data-s') === v ? 'true' : 'false'); });
+  }
+  tabs.forEach(function (t) { t.onclick = function () { show(t.getAttribute('data-s')); window.scrollTo(0, 0); }; });
+  var th = document.getElementById('mk-theme'), root = document.documentElement;
+  th.onchange = function () { if (th.value === 'auto') root.removeAttribute('data-theme'); else root.setAttribute('data-theme', th.value); };
+  show('s1');
+})();
+</script>
+</body>
+</html>

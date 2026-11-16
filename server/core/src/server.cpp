@@ -2154,7 +2154,10 @@ public:
             "class that requires one it can size; unsupported_encoding: a "
             "non-identity Content-Encoding, refused on every class; "
             "over_cap_post_read: the body was read in full - because it could not be "
-            "sized in advance - and turned out to be over the class's cap)",
+            "sized in advance - and turned out to be over the class's cap; "
+            "over_json_values_post_read: the body is within the class's size cap but holds "
+            "more structural JSON values than the class's budget, refused before any handler "
+            "parses it)",
             "counter");
         for (const auto& entry : yuzu::server::kBodyCapTable) {
             metrics_.counter("yuzu_body_cap_rejected_total",
@@ -2166,6 +2169,12 @@ public:
             metrics_.counter("yuzu_body_cap_rejected_total",
                              {{"path_class", std::string(entry.path_class)},
                               {"reason", "over_cap_post_read"}});
+            // Only a class that scans (`max_json_values` != off) can reach the value-budget refusal.
+            if (entry.max_json_values != yuzu::server::kJsonValuesOff) {
+                metrics_.counter("yuzu_body_cap_rejected_total",
+                                 {{"path_class", std::string(entry.path_class)},
+                                  {"reason", "over_json_values_post_read"}});
+            }
             if (entry.requires_measurable) {
                 metrics_.counter("yuzu_body_cap_rejected_total",
                                  {{"path_class", std::string(entry.path_class)},
@@ -2342,6 +2351,8 @@ public:
                                   "generation_refresh_failed", "generation_refresh_failed_within_bound",
                                   "rbac_enabled_non_canonical", "stale_beyond_accepted_bound"})
             metrics_.counter("yuzu_server_rbac_read_degrade_total", {{"reason", reason}});
+        // #5557: the service-scoped unrestricted-authority refusal on the two list gates.
+        authz::seed_service_scope_unrestricted_refusal_metrics(metrics_);
         // Last-Administrator guard refusals: A2's role-unassign guard
         // (RbacStore::unassign_role) and, since #4966, the account-lifecycle guard
         // (RbacStore::deactivate_account / set_local_role: a deactivation or a demotion
@@ -17916,9 +17927,10 @@ private:
                              .nvd_sync = nvd_sync_.get(),
                          });
 
-        // UP-6: ONE referrer lookup and ONE advisory pack lookup, built here (their stores are
-        // members constructed in the ctor, long before this) and handed to every consumer: the v1
-        // DELETE twin and MCP delete_definition, so neither can disagree about what blocks a
+        // UP-6 / M2: ONE referrer lookup and ONE advisory pack lookup, built here (their stores
+        // are members constructed in the ctor, long before this) and handed to every consumer:
+        // the legacy DELETE /api/instructions/{id}, the pack uninstall (WorkflowRoutes), the v1
+        // DELETE twin and MCP delete_definition, so none of them can disagree about what blocks a
         // delete. The lookups hold raw store pointers, the same lifetime the route lambdas'
         // other store pointers already rely on.
         DefinitionReferrersFn definition_referrers_fn = make_definition_referrers_fn(
@@ -17936,6 +17948,8 @@ private:
                              .audit_fn = audit_fn,
                              .emit_event_fn = emit_event_fn,
                              .store = instruction_store_.get(),
+                             .referrers_fn = definition_referrers_fn,
+                             .pack_advisory_fn = definition_pack_advisory_fn,
                              .csrf_trusted_origins = cfg_.csrf_trusted_origins,
                          });
 
@@ -18960,10 +18974,13 @@ private:
         // reconnected. Same shared dispatch lambda as every other
         // background engine. The shared protective predicate
         // (yuzu::protective::is_protective_action, built on
-        // is_quarantine_control_plugin) lets the quarantine plugin's own
-        // actions through every gate unmodified: the #881 containment gate, the
+        // is_quarantine_control_plugin and is_firewall_control_plugin) lets
+        // the quarantine plugin's own actions (and the firewall plugin's four
+        // containment actions) through every enablement gate unmodified: the
         // per-plugin/action kill switch (incl. a degraded store), the per-OS
-        // withhold and its presence read, and the plugin-presence filter.
+        // withhold and its presence read, and the plugin-presence filter. The
+        // #881 containment gate's own exemption names the quarantine plugin's
+        // four only (the firewall four follow in #7437).
         // Joined BEFORE the stores in stop().
         quarantine_reconciler_ =
             std::make_unique<QuarantineContainmentReconciler>(QuarantineContainmentReconciler::Deps{
@@ -20799,6 +20816,20 @@ private:
                 out.emplace(std::move(e.agent_id), std::move(e.hostname));
             return out;
         };
+        // agent_id -> OS string from the same 30-day roster, for the Find software panel's OS
+        // column. ponytail: a second roster read per page; fold it into hw_hostnames_fn's read if
+        // it shows.
+        auto hw_host_os_fn = [this]() -> std::unordered_map<std::string, std::string> {
+            std::unordered_map<std::string, std::string> out;
+            if (!offline_endpoint_store_)
+                return out;
+            auto roster = offline_endpoint_store_->query_stale_within(kHardwareRosterWindow)
+                              .value_or(OfflineRoster{});
+            for (auto& e : roster.rows)
+                if (!e.os.empty())
+                    out.emplace(std::move(e.agent_id), std::move(e.os));
+            return out;
+        };
         inventory_routes_ = std::make_unique<InventoryRoutes>();
         inventory_routes_->register_routes(
             *web_server_,
@@ -20867,7 +20898,50 @@ private:
                     return software_inventory_store_->source_last_seen_bulk("installed_software",
                                                                             ids);
                 },
-                .audit_fn = audit_fn});
+                .audit_fn = audit_fn,
+                // Find software panel: the REST lookups' own store reads (rest_api_v1.cpp
+                // lookup_totals_reads / resolve_range), so the panel and the REST answer agree.
+                .components_fn = [this](const SoftwareComponentQuery& q)
+                    -> std::optional<std::vector<SoftwareComponentRow>> {
+                    if (!software_inventory_store_)
+                        return std::nullopt;
+                    return software_inventory_store_->query_components(q);
+                },
+                .install_versions_fn = [this](const std::string& name,
+                                              const std::optional<std::vector<std::string>>& ids)
+                    -> std::optional<std::vector<std::string>> {
+                    if (!software_inventory_store_)
+                        return std::nullopt;
+                    return software_inventory_store_->installed_software_distinct_versions(name, ids);
+                },
+                .component_versions_fn = [this](const std::string& kind, const std::string& name,
+                                                const std::optional<std::vector<std::string>>& ids)
+                    -> std::optional<std::vector<std::string>> {
+                    if (!software_inventory_store_)
+                        return std::nullopt;
+                    return software_inventory_store_->component_versions(kind, name, ids);
+                },
+                .totals_reads = [this]() {
+                    software_list::TotalsReads io;
+                    if (!software_inventory_store_)
+                        return io; // unwired closures: the route reads it as a degrade
+                    auto* store = software_inventory_store_.get();
+                    io.catalog_meta = [store] { return store->catalog_rollup_meta(); };
+                    io.component_meta = [store] { return store->component_rollup_meta(); };
+                    io.title_totals = [store](std::string_view name) {
+                        return store->catalog_title_totals(name);
+                    };
+                    io.version_set_totals = [store](std::string_view name,
+                                                    const std::vector<std::string>& vs) {
+                        return store->installed_software_version_set_totals(name, vs);
+                    };
+                    io.component_totals = [store](std::string_view kind, std::string_view name,
+                                                  const std::optional<std::vector<std::string>>& vs) {
+                        return store->component_totals(kind, name, vs);
+                    };
+                    return io;
+                }(),
+                .host_os_fn = hw_host_os_fn});
 
         // CryptoRoutes — /crypto, /fragments/crypto/*, /api/v1/crypto/* (crypto-library
         // presence from the installed_software inventory, the Yuzu-issued certificate widgets
@@ -21222,7 +21296,8 @@ private:
                     if (!execution_tracker_)
                         return std::nullopt;
                     auto rows = execution_tracker_->query_executions_checked(
-                        {.status = "failed", .limit = static_cast<int>(home::kFailedReadCap)});
+                        {.status = "failed", .limit = static_cast<int>(home::kFailedReadCap)},
+                        std::nullopt);
                     if (!rows)
                         return std::nullopt;
                     std::vector<home::FailedRow> out;
@@ -21713,6 +21788,17 @@ private:
         // pre-existing `/fragments/echo/...` HTML routes stay on perm_fn_ this
         // round — see the recorded-exception comment at their registration.
         echo_tree_routes_->set_fleet_read_fn(fleet_read_fn);
+        echo_tree_routes_->set_metrics(&metrics_); // yuzu_echo_sources_push_total
+        // The capture-sources push stamps its rows from the session it resolved (never re-resolved).
+        echo_tree_routes_->set_audit_as_session_fn(auth_routes_->audit_as_session_fn());
+        // A refused push dispatch answers 403 (permission-class reasons) or 500 (catalogue fault),
+        // the mapping respond_echo_dispatch_denied uses; injected so the route TU stays store-free.
+        echo_tree_routes_->set_denial_status_fn([](const ConfinedDispatchOutcome& o) {
+            const auto cls = describe_dispatch_denial(o.denied->reason, "echo", "configure",
+                                                      *o.denied, DenialSurface::kRest)
+                                 .cls;
+            return cls == DispatchDenialClass::kPermissionDenied ? 403 : 500;
+        });
         // #4143 review fix — same unfiltered source list_agents' DeviceApi and
         // GET /api/v1/devices (#4033) read from; gate.scope (fleet_read_fn_
         // above) is the SOLE filter now, not an intersection with devices_fn's
@@ -21747,9 +21833,10 @@ private:
         // request, so setting it afterwards would race the request threads.
         dashboard_routes_->set_csrf_trusted_origins(cfg_.csrf_trusted_origins);
         // ADR-0033 section 9: every DashboardRoutes mutation (each console send,
-        // group-from-results, Echo re-enable and purge; not EchoTreeRoutes' capture-sources push)
-        // writes its `attempted` row through this persist-reporting sink BEFORE it acts (#3619;
-        // unwired = those mutations refuse with 503).
+        // group-from-results, Echo re-enable and purge) writes its `attempted` row through this
+        // persist-reporting sink BEFORE it acts (#3619; unwired = those mutations refuse with
+        // 503). EchoTreeRoutes' capture-sources push does the same, but writes through the
+        // session-bound writer wired above and refuses (503) when that is unset.
         dashboard_routes_->set_persist_audit_fn(audit_fn);
         // #1712 / #3290 Phase 2 — same conversion lambda already wired into
         // McpServer's query_installed_software (fleet_read_fn, defined
@@ -21962,6 +22049,7 @@ private:
             emit_event(event_type, req);
         };
         wf_deps.emit_event_fn = emit_event_fn; // the v1 execute twin's workflow.executed
+        wf_deps.referrers_fn = definition_referrers_fn; // M2: the pack uninstall's referrer guard
         wf_deps.scope_fn =
             [this](const std::string& expression,
                    const std::string& principal) -> std::pair<std::size_t, std::size_t> {
@@ -23718,8 +23806,8 @@ private:
         // instruction-set authoring routes. Same store, same permission gate and same audit sink
         // as the legacy cluster above; audit-first on every write.
         {
-            // UP-6: the SAME referrer lookup built above is shared here and with the MCP
-            // delete_definition (wired into mcp_server_ below).
+            // UP-6: the SAME referrer lookup built before the legacy routes (see there) is shared
+            // here and with the MCP delete_definition (wired into mcp_server_ below).
             yuzu::server::instruction_authoring::RouteDeps authoring_deps;
             authoring_deps.perm_fn = [this](const httplib::Request& req, httplib::Response& res,
                                             const std::string& securable_type,
@@ -24478,10 +24566,12 @@ private:
     /// other one. They were missed by the original sweep because they do not
     /// route through `command_dispatch_fn` — they call the registry directly —
     /// and their bare global `require_permission("Execution","Execute")` gate
-    /// admits a SERVICE-SCOPED token on its `ITServiceOwner` role grant with no
-    /// target check, so before this they reached the entire fleet: verbatim the
+    /// once admitted a SERVICE-SCOPED token on its `ITServiceOwner` role grant
+    /// with no target check, so they reached the entire fleet: verbatim the
     /// escape #1788 exists to close, on three routes the changelog claimed were
-    /// already covered.
+    /// already covered. The service-scoped branch of `require_permission` now
+    /// refuses that pair outright (it is not on the seeded-empty
+    /// `kServiceScopeGlobalSafe`); every admitted caller is narrowed below.
     ///
     /// An omitted target means the fleet (#2500), so this is the Broadcast arm —
     /// narrowed to the caller's visible set, exactly as a named `__all__` is.

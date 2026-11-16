@@ -3070,7 +3070,12 @@ groups:
             one. The quarantine plugin's own control actions stay
             reachable throughout - releasing a device does not depend on this
             read - as do the four system-reserved internal pushes
-            (yuzu_server_system_reserved_push_total). BE PRECISE ABOUT for: 2m:
+            (yuzu_server_system_reserved_push_total). The firewall plugin's
+            four containment actions are protective for plugin enablement but
+            are NOT exempt from this gate until #7437, so while this alert
+            fires they are refused too (a firewall containment started with a time
+            limit still ends on the agent; one started without it stays until a
+            release can be dispatched). BE PRECISE ABOUT for: 2m:
             it delays the page by two minutes, it does NOT require a sustained
             episode. increase()[5m] stays true for ~5 minutes after a single
             increment, so one fail-closed evaluation still pages, two minutes
@@ -6755,7 +6760,9 @@ groups:
             id ("compensation FAILED for <kind> '<item_id>'"), that item is a
             confirmed orphan: delete it directly through that sibling store's
             own route (DELETE /api/instructions/{id}, /api/policies/{id} or
-            /api/policy-fragments/{id}, /api/workflows/{id}). If it instead
+            /api/policy-fragments/{id}, /api/workflows/{id}); delete the
+            schedules, workflows and fragments that name an orphan definition first,
+            because its DELETE answers 409 while they exist. If it instead
             says "outcome could not be confirmed" (no item named), do NOT
             delete anything by guessing ids from the submitted bundle — first
             confirm via GET /api/product-packs/{id} whether the pack actually
