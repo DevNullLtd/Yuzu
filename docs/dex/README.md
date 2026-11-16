@@ -41,7 +41,8 @@ guide links to it rather than copying it.
 
 ## Quick start
 
-1. Make sure your account holds `GuaranteedState:Read`. Every DEX read needs it.
+1. Make sure your account holds `GuaranteedState:Read`. Every DEX read needs it
+   except per-device application usage, which needs `Forensics:Read`.
 2. Open **DEX** in the sidebar, or go to `/dex`. Start at the Overview and click
    down.
 3. For scripts, create an API token and call a route such as

@@ -131,11 +131,16 @@ The per-device live Top applications panel is dashboard only.
 | Read | Permission | Audit |
 |---|---|---|
 | Picker, fleet trend | `GuaranteedState:Read` | Not audited. They are fleet aggregates. |
-| Group and tag trends | `GuaranteedState:Read` | Not audited. A service-scoped token is refused. |
+| Group and tag trends | `GuaranteedState:Read` | Not audited when they succeed. |
 | Version-devices drill | `GuaranteedState:Read` through the fleet-read check, confined to the devices the caller can see | `dex.app_perf.devices.view`. REST refuses to answer if the row cannot be stored. |
 | One device's retained history | `GuaranteedState:Read`, scoped to the device | `dex.device.app_perf.view` on REST, MCP and the dashboard panel |
 | Live Top applications panel | `GuaranteedState:Read` and `Execution:Execute` | `dex.device.procperf.query`, kept separate because per-application data shows what people run |
-| Version comparison | `GuaranteedState:Read` | `dex.app_perf.compare`. A service-scoped token is refused. |
+| Version comparison | `GuaranteedState:Read` | `dex.app_perf.compare` |
+
+A service-scoped token is refused on every read here except the version-devices
+drill, which answers with only the devices the token can see, and one device's
+retained history, which is open only for a device tagged with the token's own
+service. See [surfaces](surfaces.md#the-rest-api).
 
 ## Limits and privacy
 

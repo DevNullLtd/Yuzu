@@ -101,7 +101,7 @@ the raw samples stay there until an operator asks. DEX uses four of its sources.
 |---|---|---|---|
 | `perf` (device performance) | The per-device performance panel | `perf_enabled` | Windows, Linux |
 | `procperf` (per-application top-N) | [App performance](app-performance.md), the daily sync, the device Top applications panel | `procperf_enabled` | Windows, Linux |
-| `netqual` (per-connection TCP quality) | Per-connection network detail through Echo queries | `netqual_enabled` | Linux, Windows (elevated agent) |
+| `netqual` (per-connection TCP quality) | Per-connection network detail through Echo queries | `netqual_enabled` | Linux, Windows (elevated agent), macOS (root agent) |
 | `usage` (derived run history) | [App usage](app-usage.md) | `usage_enabled` | Windows, Linux, macOS (constrained) |
 
 **Default state.** All four are on by default, like every other Echo capture

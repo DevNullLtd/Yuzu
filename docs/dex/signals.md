@@ -138,9 +138,10 @@ All reads need `GuaranteedState:Read`. The live-info route additionally needs
 | Catalogue, rollup and scope | Not audited |
 
 On REST, an audited read refuses to answer if its audit row cannot be stored
-(`503` with `Sec-Audit-Failed: true`). The signal drill-down is refused to a
-service-scoped token, because it lists devices fleet-wide. The per-device reads
-accept such a token only for a device tagged with its own service.
+(`503` with `Sec-Audit-Failed: true`). A service-scoped token is refused on the
+catalogue, rollup, scope and signal drill-down reads. The per-device reads and
+live info accept such a token only for a device tagged with its own service.
+See [surfaces](surfaces.md#the-rest-api).
 
 ## Limits and privacy
 

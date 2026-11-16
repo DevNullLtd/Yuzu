@@ -44,7 +44,8 @@ not part of DEX. It is described in
   device and reachable through Echo queries. It is on by default and controlled
   by Echo's `netqual_enabled` setting. Only a coarse destination class
   (loopback, private or public) is stored; remote addresses are dropped at the
-  edge. Windows needs an elevated agent for it.
+  edge. Windows needs an elevated agent for it and macOS needs a root agent;
+  without that, the source records nothing.
 
 See [collectors and plugins](collectors-and-plugins.md#the-echo-plugin).
 
@@ -79,8 +80,9 @@ poor link, not which destination or application is affected.
 
 Both routes need `GuaranteedState:Read`. The fleet figures are not audited. The
 device list names devices fleet-wide, so it is audited as
-`network.device.view` (REST refuses to answer if the row cannot be stored) and
-is refused to a service-scoped token.
+`network.device.view` (REST refuses to answer if the row cannot be stored). A
+service-scoped token is refused on both routes. See
+[surfaces](surfaces.md#the-rest-api).
 
 ## Limits and privacy
 

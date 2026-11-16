@@ -35,13 +35,19 @@ Conventions that apply to every tab:
 - **Everything drills.** Cards and rows open the next level down: an
   application, a signal type, a device, one observation.
 
+Worked example: from a crash spike to the event behind it. On the Overview, read
+the top crashing applications and click one name to open its blast-radius
+drill-down. Click an affected device to open that device's signal history, then
+click one row of the history to read the single observation. The window you
+chose on the Overview stays selected all the way down.
+
 The Scoring and Alerts tabs are configuration pages. Scoring edits the
 [score policy](apps.md#the-score-policy); Alerts is for administrators and
 configures [alert routing](alerts.md).
 
 ## The REST API
 
-All routes live under `/api/v1/dex/`, plus two network routes and one
+All routes live under `/api/v1/dex/`, plus the network routes and the
 per-device app-usage route (see the map below). Conventions:
 
 - **Authentication.** Send an API token as `Authorization: Bearer <token>`.
@@ -63,10 +69,16 @@ per-device app-usage route (see the map below). Conventions:
   they answer, and refuse to answer (`503` with `Sec-Audit-Failed: true`) if
   that row cannot be stored. Aggregates that carry no device identity are not
   audited. Each area page lists its verbs.
-- **Service-scoped tokens.** A token scoped to one service is refused
-  outright on the routes that list devices fleet-wide (the refusal is
-  audited). On the per-device routes it is accepted only for a device
-  tagged with its own service. The map notes which is which.
+- **Service-scoped tokens.** A token scoped to one service is refused on
+  every DEX route except these. The per-device routes under
+  `/api/v1/dex/devices/{id}` accept it only for a device tagged with its own
+  service. `GET /api/v1/dex/perf/app/devices` answers with only the devices the
+  token can see. Both kinds need RBAC enforcement to be on and the service
+  owner role to hold the permission. Every other route is refused, aggregates included,
+  and so is the per-device app-usage route, because the service owner role does
+  not hold `Forensics:Read`. Every refusal is audited: the routes that name
+  devices fleet-wide record it under their own verb with the result `denied`,
+  and the rest under the standard permission-denied row.
 - **Management-group grants.** A grant scoped to a management group alone does
   not pass the aggregate reads, which need a global `GuaranteedState:Read`. It
   does pass the per-device reads for devices in the group.
@@ -88,8 +100,10 @@ An agentic worker reaches the same data through MCP tools. Conventions:
 - **Endpoint and tokens.** `POST /mcp/v1/` with an API token minted with an
   `mcp_tier` (`readonly`, `operator` or `supervised`). A token without a tier
   is refused. See the [MCP guide](../user-manual/mcp.md).
-- **Read tools work at every tier.** All DEX read tools need
-  `GuaranteedState:Read` and are available to a `readonly` token.
+- **Read tools work at every tier.** The DEX read tools need
+  `GuaranteedState:Read` and are available to a `readonly` token. The
+  per-device app-usage tool needs `Forensics:Read` instead, and is available at
+  every tier too.
 - **Same model, same numbers.** A tool answers from the same read model as the
   REST route it mirrors, so the two agree figure for figure. Tool arguments
   match the route's query parameters.
@@ -101,8 +115,13 @@ An agentic worker reaches the same data through MCP tools. Conventions:
   twin. Most set-and-proceed on MCP, flagging `audit_persisted: false` if the
   row was lost; the per-device app-usage tool withholds data instead.
 - **Service-scoped tokens.** A tool follows the same rule as the REST route
-  it mirrors: refused where the route reads fleet-wide data, and limited to
-  the token's own devices where the route reads one device.
+  it mirrors. A token scoped to one service is refused on every DEX tool
+  except the per-device tools (`get_dex_device_score`,
+  `get_dex_device_history`, `get_dex_observation` and
+  `get_dex_device_app_perf`), which accept it only for a device tagged with its
+  own service, and `list_dex_app_perf_devices`, which answers with only the
+  devices the token can see. The other tools are refused, either before the
+  handler runs or by the handler's own permission check.
 
 Worked example: ask for the fleet's CPU, memory and disk figures.
 
@@ -124,9 +143,10 @@ the [MCP guide](../user-manual/mcp.md); where this table and those pages
 disagree, they win. See [contributing](contributing.md) for the rule.
 
 Every route listed here is under `/api/v1`. "Read" means
-`GuaranteedState:Read` unless the row says otherwise. "Refused to
-service-scoped tokens" describes the REST route; the tool in the same row
-follows the same rule. Network discovery (the
+`GuaranteedState:Read` unless the row says otherwise. Unless a row says
+otherwise, a service-scoped token is refused on the route and on the tool in
+the same row; see the service-scoped rule under
+[the REST API](#the-rest-api). Network discovery (the
 Discovered tab of the Network page) is an Estate feature, not DEX, and is not in
 this map; see [network](network.md).
 
@@ -134,7 +154,7 @@ this map; see [network](network.md).
 
 | Capability | Dashboard | REST | MCP | Fed by | Permission and audit | Page |
 |---|---|---|---|---|---|---|
-| Executive summary and headline reliability | Overview | `GET /api/v1/dex/overview` | `get_dex_overview` | DEX observer | Read; audited `dex.overview.view`; refused to service-scoped tokens | [fleet health](fleet-health.md) |
+| Executive summary and headline reliability | Overview | `GET /api/v1/dex/overview` | `get_dex_overview` | DEX observer | Read; audited `dex.overview.view` | [fleet health](fleet-health.md) |
 | Composite health score and its deductions | Health score | `GET /api/v1/dex/health` | `get_dex_health` | DEX observer | Read; not audited | [fleet health](fleet-health.md) |
 | Cross-OS comparison and trends | Trends | `GET /api/v1/dex/trends` | `get_dex_trends` | DEX observer | Read; not audited | [fleet health](fleet-health.md) |
 
@@ -144,18 +164,18 @@ this map; see [network](network.md).
 |---|---|---|---|---|---|---|
 | Signal catalogue: families, coverage, health per family | Catalogue | `GET /api/v1/dex/catalogue`<br>`GET /api/v1/dex/catalogue/group` | `get_dex_catalogue`<br>`get_dex_catalogue_group` | DEX observer | Read; not audited | [signals](signals.md) |
 | Signal rollup and per-OS coverage | Catalogue | `GET /api/v1/dex/signals`<br>`GET /api/v1/dex/scope` | `list_dex_signals`<br>`get_dex_signal_scope` | DEX observer | Read; not audited | [signals](signals.md) |
-| One signal type in depth | Catalogue, signal drill | `GET /api/v1/dex/signals/{obs_type}` | `get_dex_signal_detail` | DEX observer | Read; audited `dex.signal.view`; refused to service-scoped tokens | [signals](signals.md) |
-| One device: score and signal summary | Device drill | `GET /api/v1/dex/devices/{id}` | `get_dex_device_score` | DEX observer | Read, scoped to the device; audited `dex.device.view` | [signals](signals.md) |
-| One device: signal history | Device drill | `GET /api/v1/dex/devices/{id}/history` | `get_dex_device_history` | DEX observer | Read, scoped to the device; audited `dex.device.view` | [signals](signals.md) |
-| One observation in detail | Device drill, event panel | `GET /api/v1/dex/devices/{id}/observations/{event_id}` | `get_dex_observation` | DEX observer | Read, scoped to the device; audited `dex.observation.view` | [signals](signals.md) |
-| Live uptime or process list from a device | Device page, Get live info | `POST /api/v1/dex/devices/{id}/live` | None | `os_info`, `processes` plugins | Read and `Execution:Execute`, both scoped to the device; audited `device.live.uptime` or `device.live.processes` before dispatch | [signals](signals.md) |
+| One signal type in depth | Catalogue, signal drill | `GET /api/v1/dex/signals/{obs_type}` | `get_dex_signal_detail` | DEX observer | Read; audited `dex.signal.view` | [signals](signals.md) |
+| One device: score and signal summary | Device drill | `GET /api/v1/dex/devices/{id}` | `get_dex_device_score` | DEX observer | Read, scoped to the device; a service-scoped token reaches only devices tagged with its own service; audited `dex.device.view` | [signals](signals.md) |
+| One device: signal history | Device drill | `GET /api/v1/dex/devices/{id}/history` | `get_dex_device_history` | DEX observer | Read, scoped to the device; a service-scoped token reaches only devices tagged with its own service; audited `dex.device.view` | [signals](signals.md) |
+| One observation in detail | Device drill, event panel | `GET /api/v1/dex/devices/{id}/observations/{event_id}` | `get_dex_observation` | DEX observer | Read, scoped to the device; a service-scoped token reaches only devices tagged with its own service; audited `dex.observation.view` | [signals](signals.md) |
+| Live uptime or process list from a device | Device page, Get live info | `POST /api/v1/dex/devices/{id}/live` | None | `os_info`, `processes` plugins | Read and `Execution:Execute`, both scoped to the device; a service-scoped token reaches only devices tagged with its own service; audited `device.live.uptime` or `device.live.processes` before dispatch | [signals](signals.md) |
 
 ### Applications
 
 | Capability | Dashboard | REST | MCP | Fed by | Permission and audit | Page |
 |---|---|---|---|---|---|---|
 | Application stability list | Apps | `GET /api/v1/dex/apps` | `list_dex_apps` | DEX observer | Read; not audited | [apps](apps.md) |
-| One application's blast radius | Apps, app drill | `GET /api/v1/dex/app` | `get_dex_app` | DEX observer | Read; audited `dex.app.view`; refused to service-scoped tokens | [apps](apps.md) |
+| One application's blast radius | Apps, app drill | `GET /api/v1/dex/app` | `get_dex_app` | DEX observer | Read; audited `dex.app.view` | [apps](apps.md) |
 | Read the score policy | Scoring | `GET /api/v1/dex/score-policy` | `get_dex_score_policy` | Runtime config | Read; not audited | [apps](apps.md) |
 | Replace the score policy | Scoring | `PUT /api/v1/dex/score-policy` | `set_dex_score_policy` | Runtime config | `Infrastructure:Write` (and Read for the tool); audited `dex.score_policy.update` or `dex.score_policy.validate`; supervised-tier token on MCP | [apps](apps.md) |
 | Reset the score policy to defaults | Scoring | `DELETE /api/v1/dex/score-policy` | `reset_dex_score_policy` | Runtime config | `Infrastructure:Write` on REST; `Infrastructure:Delete` plus an approval ticket on MCP; audited `dex.score_policy.reset` | [apps](apps.md) |
@@ -167,7 +187,7 @@ this map; see [network](network.md).
 | Fleet CPU, memory and disk figures | Performance | `GET /api/v1/dex/perf/fleet` | `get_dex_perf_fleet` | Heartbeat performance tags | Read; not audited | [performance](performance.md) |
 | Cohort benchmarking by tag value | Performance | `GET /api/v1/dex/perf/cohorts` | `get_dex_perf_cohorts` | Heartbeat performance tags, device tags | Read; not audited | [performance](performance.md) |
 | Compare two cohorts | Performance | `GET /api/v1/dex/perf/cohort-diff` | `get_dex_perf_cohort_diff` | Heartbeat performance tags, device tags | Read; not audited | [performance](performance.md) |
-| Devices behind a metric, a cohort or not reporting | Performance drill | `GET /api/v1/dex/perf/devices` | `list_dex_perf_devices` | Heartbeat performance tags | Read; audited `dex.perf.device.view`; refused to service-scoped tokens | [performance](performance.md) |
+| Devices behind a metric, a cohort or not reporting | Performance drill | `GET /api/v1/dex/perf/devices` | `list_dex_perf_devices` | Heartbeat performance tags | Read; audited `dex.perf.device.view` | [performance](performance.md) |
 
 ### Application performance over time
 
@@ -175,24 +195,24 @@ this map; see [network](network.md).
 |---|---|---|---|---|---|---|
 | Applications with retained history | App Performance | `GET /api/v1/dex/perf/apps` | `list_dex_perf_apps` | Echo `procperf`, daily sync | Read; not audited | [app performance](app-performance.md) |
 | Fleet trend for one application | App Performance | `GET /api/v1/dex/perf/app` | `get_dex_app_perf` | Echo `procperf`, daily sync | Read; not audited | [app performance](app-performance.md) |
-| Devices behind one application version | App Performance, version drill | `GET /api/v1/dex/perf/app/devices` | `list_dex_app_perf_devices` | Echo `procperf`, daily sync | Fleet read, confined to visible devices; audited `dex.app_perf.devices.view` | [app performance](app-performance.md) |
-| Trend for one management group | App Performance | `GET /api/v1/dex/perf/group` | `get_dex_group_app_perf` | Echo `procperf`, daily sync | Read; refused to service-scoped tokens | [app performance](app-performance.md) |
-| Trend for one device-tag cohort | App Performance | `GET /api/v1/dex/perf/tag` | `get_dex_tag_app_perf` | Echo `procperf`, daily sync | Read; refused to service-scoped tokens | [app performance](app-performance.md) |
-| One device's retained per-application history | Device drill | `GET /api/v1/dex/devices/{id}/app-perf` | `get_dex_device_app_perf` | Echo `procperf`, daily sync | Read, scoped to the device; audited `dex.device.app_perf.view` | [app performance](app-performance.md) |
-| Before and after comparison of two versions | None | `GET /api/v1/dex/perf/compare` | `compare_app_perf_versions` | Echo `procperf`, daily sync | Read; audited `dex.app_perf.compare`; refused to service-scoped tokens | [app performance](app-performance.md) |
+| Devices behind one application version | App Performance, version drill | `GET /api/v1/dex/perf/app/devices` | `list_dex_app_perf_devices` | Echo `procperf`, daily sync | Fleet read, confined to visible devices; a service-scoped token gets only the devices it can see; audited `dex.app_perf.devices.view` | [app performance](app-performance.md) |
+| Trend for one management group | App Performance | `GET /api/v1/dex/perf/group` | `get_dex_group_app_perf` | Echo `procperf`, daily sync | Read | [app performance](app-performance.md) |
+| Trend for one device-tag cohort | App Performance | `GET /api/v1/dex/perf/tag` | `get_dex_tag_app_perf` | Echo `procperf`, daily sync | Read | [app performance](app-performance.md) |
+| One device's retained per-application history | Device drill | `GET /api/v1/dex/devices/{id}/app-perf` | `get_dex_device_app_perf` | Echo `procperf`, daily sync | Read, scoped to the device; a service-scoped token reaches only devices tagged with its own service; audited `dex.device.app_perf.view` | [app performance](app-performance.md) |
+| Before and after comparison of two versions | None | `GET /api/v1/dex/perf/compare` | `compare_app_perf_versions` | Echo `procperf`, daily sync | Read; audited `dex.app_perf.compare` | [app performance](app-performance.md) |
 
 ### Network quality
 
 | Capability | Dashboard | REST | MCP | Fed by | Permission and audit | Page |
 |---|---|---|---|---|---|---|
 | Fleet network quality now | Network | `GET /api/v1/network/fleet` | `get_network_fleet` | Heartbeat network tags | Read; not audited | [network](network.md) |
-| Worst devices by network metric | Network, Devices | `GET /api/v1/network/devices` | `list_network_devices` | Heartbeat network tags | Read; audited `network.device.view`; refused to service-scoped tokens | [network](network.md) |
+| Worst devices by network metric | Network, Devices | `GET /api/v1/network/devices` | `list_network_devices` | Heartbeat network tags | Read; audited `network.device.view` | [network](network.md) |
 
 ### Application usage
 
 | Capability | Dashboard | REST | MCP | Fed by | Permission and audit | Page |
 |---|---|---|---|---|---|---|
-| One device's per-executable usage | Device page, Application usage | `GET /api/v1/forensics/agents/{id}/app-usage` | `get_agent_app_usage` | Echo `usage`, `app_usage` plugin, daily sync | `Forensics:Read` scoped to the device; audited `app_usage.agent.view`, fails closed | [app usage](app-usage.md) |
+| One device's per-executable usage | Device page, Application usage | `GET /api/v1/forensics/agents/{id}/app-usage` | `get_agent_app_usage` | Echo `usage`, `app_usage` plugin, daily sync | `Forensics:Read` scoped to the device; refused to service-scoped tokens, whose role does not hold `Forensics:Read`; audited `app_usage.agent.view`, fails closed | [app usage](app-usage.md) |
 
 ### Alerts
 

@@ -133,13 +133,14 @@ repeat the same call with the approval id.
 | Action | Permission | Audit |
 |---|---|---|
 | View the Apps list | `GuaranteedState:Read` | Not audited. It is an aggregate with no device identity. |
-| Open one application | `GuaranteedState:Read` | `dex.app.view`. REST refuses to answer if the row cannot be stored. A service-scoped token is refused. |
+| Open one application | `GuaranteedState:Read` | `dex.app.view`. REST refuses to answer if the row cannot be stored. |
 | Read the policy | `GuaranteedState:Read` (held outright) | Not audited. |
 | Edit or reset the policy | `Infrastructure:Write` on REST and the Scoring tab; the tab also needs Read | `dex.score_policy.update`, `dex.score_policy.reset`, and `dex.score_policy.validate` for a dry run. A real write records an attempted row first and fails closed if it cannot be stored. |
 
 Anyone who can view Scoring without `Infrastructure:Write` sees the page with
 every control disabled and a note naming the grant. A service-scoped token is
-refused on the score policy routes.
+refused on every read and write on this page. See
+[surfaces](surfaces.md#the-rest-api).
 
 ## Limits and privacy
 
