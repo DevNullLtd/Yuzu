@@ -764,11 +764,14 @@ TEST_CASE("POST /management-groups/{id}/members: a clean agent_id is added and a
     CHECK(res->status == 201);
     CHECK(res->body.find("\"added\":true") != std::string::npos);
     CHECK(h.mgmt_bundle->get_members(gid).size() == 1);
-    REQUIRE(h.audits.size() == 1);
+    // Audit-first (#7074): an `attempted` row precedes the success row.
+    REQUIRE(h.audits.size() == 2);
     CHECK(h.audits[0].action == "management_group.add_member");
-    CHECK(h.audits[0].result == "success");
-    CHECK(h.audits[0].target_id == gid);
-    CHECK(h.audits[0].detail == "agent-1");
+    CHECK(h.audits[0].result == "attempted");
+    CHECK(h.audits[1].action == "management_group.add_member");
+    CHECK(h.audits[1].result == "success");
+    CHECK(h.audits[1].target_id == gid);
+    CHECK(h.audits[1].detail == "agent-1 agent_known=unreadable"); // this harness wires no AuthDB
 }
 
 TEST_CASE("POST /management-groups/{id}/members: a store error answers 503 with a failure row, "
@@ -787,11 +790,14 @@ TEST_CASE("POST /management-groups/{id}/members: a store error answers 503 with 
     CHECK(body["error"]["retry_after_ms"].is_number());
 
     CHECK(h.audit_count("management_group.add_member", "success") == 0);
-    REQUIRE(h.audits.size() == 1);
+    // Audit-first (#7074): an `attempted` row precedes the failure row.
+    REQUIRE(h.audits.size() == 2);
     CHECK(h.audits[0].action == "management_group.add_member");
-    CHECK(h.audits[0].result == "failure");
-    CHECK(h.audits[0].target_id == gid);
-    CHECK(h.audits[0].detail == "store_error");
+    CHECK(h.audits[0].result == "attempted");
+    CHECK(h.audits[1].action == "management_group.add_member");
+    CHECK(h.audits[1].result == "failure");
+    CHECK(h.audits[1].target_id == gid);
+    CHECK(h.audits[1].detail == "store_error agent-1");
 }
 
 TEST_CASE("DELETE /management-groups/{id}/members/{agent}: a control byte in the agent id is "
@@ -830,8 +836,10 @@ TEST_CASE("DELETE /management-groups/{id}/members/{agent}: a control byte in the
     CHECK(ok->status == 200);
     CHECK(ok->body.find("\"removed\":true") != std::string::npos);
     CHECK(h.mgmt_bundle->get_members(gid).empty());
-    REQUIRE(h.audits.size() == 1);
-    CHECK(h.audits[0].result == "success");
+    // Audit-first (#7074): an `attempted` row precedes the success row.
+    REQUIRE(h.audits.size() == 2);
+    CHECK(h.audits[0].result == "attempted");
+    CHECK(h.audits[1].result == "success");
 }
 
 TEST_CASE("DELETE /management-groups/{id}/members/{agent}: a store error answers 503 with a "
@@ -847,11 +855,14 @@ TEST_CASE("DELETE /management-groups/{id}/members/{agent}: a store error answers
     CHECK(res->body.find("\"removed\":true") == std::string::npos);
 
     CHECK(h.audit_count("management_group.remove_member", "success") == 0);
-    REQUIRE(h.audits.size() == 1);
+    // Audit-first (#7074): an `attempted` row precedes the failure row.
+    REQUIRE(h.audits.size() == 2);
     CHECK(h.audits[0].action == "management_group.remove_member");
-    CHECK(h.audits[0].result == "failure");
-    CHECK(h.audits[0].target_id == gid);
-    CHECK(h.audits[0].detail == "store_error");
+    CHECK(h.audits[0].result == "attempted");
+    CHECK(h.audits[1].action == "management_group.remove_member");
+    CHECK(h.audits[1].result == "failure");
+    CHECK(h.audits[1].target_id == gid);
+    CHECK(h.audits[1].detail == "store_error agent-1");
 }
 
 TEST_CASE("DELETE /management-groups/{id}/roles: a control byte in a field is refused 400 with a "

@@ -70,6 +70,7 @@
 
 #include <cerrno>
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <utility>
 
@@ -106,6 +107,35 @@ public:
 
 private:
     DIR* d_ = nullptr;
+};
+
+/// Move-only owner of a file descriptor (the file-side twin of ScopedDir).
+/// Not agents/core's ScopedFd on purpose: agents/shared holds zero-dependency header-only leaves with
+/// no core dependency edge (docs/cpp-conventions.md, "What belongs in agents/shared/"), so this header
+/// cannot include scoped_fd.hpp.
+class ScopedFile {
+public:
+    ScopedFile() noexcept = default;
+    explicit ScopedFile(int fd) noexcept : fd_(fd) {}
+    ~ScopedFile() {
+        if (fd_ >= 0) ::close(fd_);
+    }
+    ScopedFile(const ScopedFile&) = delete;
+    ScopedFile& operator=(const ScopedFile&) = delete;
+    ScopedFile(ScopedFile&& o) noexcept : fd_(o.fd_) { o.fd_ = -1; }
+    ScopedFile& operator=(ScopedFile&& o) noexcept {
+        if (this != &o) {
+            if (fd_ >= 0) ::close(fd_);
+            fd_ = o.fd_;
+            o.fd_ = -1;
+        }
+        return *this;
+    }
+    [[nodiscard]] int fd() const noexcept { return fd_; }
+    [[nodiscard]] bool valid() const noexcept { return fd_ >= 0; }
+
+private:
+    int fd_ = -1;
 };
 
 /// Result of a directory open: `err` is 0 on success, else the errno.
@@ -157,6 +187,18 @@ inline bool is_single_component(const char* name) noexcept {
     return true;
 }
 
+/// openat(), retried while a signal interrupts it (EINTR): a spurious failure would otherwise read
+/// as an unreadable directory or file and constrain a whole answer. Every open in this header goes
+/// through it (AT_FDCWD for the path forms, where openat is open). No test injects EINTR: that needs a
+/// syscall seam this leaf header does not have (the read loop below retries the same way).
+inline int openat_retry(int dir_fd, const char* name, int flags) {
+    int fd;
+    do {
+        fd = ::openat(dir_fd, name, flags);
+    } while (fd < 0 && errno == EINTR);
+    return fd;
+}
+
 /// Takes ownership of raw_fd. After fdopendir succeeds the DIR* owns it; on
 /// failure it is closed here exactly once. No path leaves it owned twice.
 inline DirOpen finish_dir_open(int raw_fd) {
@@ -178,10 +220,7 @@ inline DirOpen finish_dir_open(int raw_fd) {
 
 inline FileRead read_open_fd(int fd, std::size_t cap) {
     FileRead out;
-    struct FdCloser {
-        int fd;
-        ~FdCloser() { ::close(fd); }
-    } closer{fd};
+    ScopedFile closer{fd};
 
     struct stat st {};
     if (::fstat(fd, &st) != 0) {
@@ -251,7 +290,7 @@ inline DirOpen open_dir(const std::string& path, Leaf leaf) {
         out.err = EINVAL;
         return out;
     }
-    return detail::finish_dir_open(::open(path.c_str(), detail::dir_flags(leaf)));
+    return detail::finish_dir_open(detail::openat_retry(AT_FDCWD, path.c_str(), detail::dir_flags(leaf)));
 }
 
 /// Open the directory at `path`; the leaf is not followed (intermediates are).
@@ -266,7 +305,7 @@ inline DirOpen open_dir_no_follow_at(int parent_fd, const char* name) {
         out.err = EINVAL;
         return out;
     }
-    return detail::finish_dir_open(::openat(parent_fd, name, detail::kDirFlags));
+    return detail::finish_dir_open(detail::openat_retry(parent_fd, name, detail::kDirFlags));
 }
 
 /// Read the regular file at `path` up to `cap` bytes; `leaf` selects whether a symlink leaf is followed.
@@ -277,7 +316,7 @@ inline FileRead read_file(const std::string& path, std::size_t cap, Leaf leaf) {
         out.err = EINVAL;
         return out;
     }
-    return detail::finish_file_open(::open(path.c_str(), detail::file_flags(leaf)), cap, leaf);
+    return detail::finish_file_open(detail::openat_retry(AT_FDCWD, path.c_str(), detail::file_flags(leaf)), cap, leaf);
 }
 
 /// Read the regular file `name` under `dir_fd` up to `cap` bytes; `leaf` selects whether a symlink is followed.
@@ -288,7 +327,7 @@ inline FileRead read_file_at(int dir_fd, const char* name, std::size_t cap, Leaf
         out.err = EINVAL;
         return out;
     }
-    return detail::finish_file_open(::openat(dir_fd, name, detail::file_flags(leaf)), cap, leaf);
+    return detail::finish_file_open(detail::openat_retry(dir_fd, name, detail::file_flags(leaf)), cap, leaf);
 }
 
 /// Read the regular file at `path` (leaf not followed) up to `cap` bytes.
@@ -299,6 +338,60 @@ inline FileRead read_file_no_follow(const std::string& path, std::size_t cap) {
 /// Read the regular file `name` under `dir_fd` (leaf not followed) up to `cap` bytes.
 inline FileRead read_file_no_follow_at(int dir_fd, const char* name, std::size_t cap) {
     return read_file_at(dir_fd, name, cap, Leaf::no_follow);
+}
+
+/// Result of open_file_no_follow_at: the open regular file, or why not. `error`/`err` follow the
+/// read forms (symlink_refused for a link leaf, not_regular for a directory, FIFO or device,
+/// io + errno for the rest). `size` and `mtime` come from the fstat of the opened descriptor, so
+/// they describe the object that will be read, not the name it was reached by.
+struct FileOpen {
+    ScopedFile file;
+    ReadError error = ReadError::none;
+    int err = 0;
+    std::uint64_t size = 0;
+    struct timespec mtime {};
+    [[nodiscard]] bool opened() const noexcept { return file.valid(); }
+};
+
+/// The modification time of a stat result, at nanosecond resolution (the field name differs by OS).
+[[nodiscard]] inline struct timespec mtime_of(const struct stat& st) noexcept {
+#if defined(__APPLE__)
+    return st.st_mtimespec;
+#else
+    return st.st_mtim;
+#endif
+}
+
+/// Open the regular file `name` under `dir_fd` for ranged reads by the caller (pread, fstat), the
+/// leaf not followed. Same single-component contract, flags and by-descriptor regular-file check
+/// as the read forms; unlike them it reads nothing and applies no size cap.
+inline FileOpen open_file_no_follow_at(int dir_fd, const char* name) {
+    FileOpen out;
+    if (!detail::is_single_component(name)) {
+        out.error = ReadError::io;
+        out.err = EINVAL;
+        return out;
+    }
+    ScopedFile file{detail::openat_retry(dir_fd, name, detail::kFileFlags)};
+    if (!file.valid()) {
+        out.err = errno;
+        out.error = out.err == ELOOP ? ReadError::symlink_refused : ReadError::io;
+        return out;
+    }
+    struct stat st {};
+    if (::fstat(file.fd(), &st) != 0) {
+        out.err = errno;
+        out.error = ReadError::io;
+        return out;
+    }
+    if (!S_ISREG(st.st_mode)) {
+        out.error = ReadError::not_regular;
+        return out;
+    }
+    out.size = static_cast<std::uint64_t>(st.st_size);
+    out.mtime = mtime_of(st);
+    out.file = std::move(file);
+    return out;
 }
 
 } // namespace yuzu::shared

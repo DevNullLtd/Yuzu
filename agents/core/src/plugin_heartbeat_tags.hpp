@@ -21,7 +21,7 @@
  * agent's contribution via IEEE-754. A plugin publishing more than
  * kPluginHeartbeatMaxKeys keys has the excess silently dropped (sorted,
  * truncated) with no warning to the plugin author; not reachable today (every
- * current consumer publishes at most 2 keys).
+ * current consumer publishes at most 6 keys; component_inventory is the widest).
  */
 
 #include <algorithm>
