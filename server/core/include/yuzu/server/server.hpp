@@ -526,6 +526,12 @@ struct Config {
     /// clamped to whatever the pool you chose can actually carry.
     std::size_t http_worker_threads{0};
 
+    /// Concurrent streamed installed-software exports (--inventory-export-concurrency, 1-16),
+    /// server-wide. Each open export holds one HTTP worker for the life of the stream and is one
+    /// lease from the held-open stream budget (--max-sse-streams); this is the cap on those
+    /// leases. A request over the cap is answered 503 with a retry hint.
+    int inventory_export_concurrency{2};
+
     // Fleet visualization (PR 3 of feat/viz-engine ladder)
     bool viz_disable{false}; // Kill switch: reject all /viz/fleet requests (DEP-1)
 
