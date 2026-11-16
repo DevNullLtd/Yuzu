@@ -154,7 +154,13 @@
         nested: true,
         submit: function (v) {
           return rawRequest('POST', challenge, { form: { code: v.code.trim() } }).then(function (r) {
-            return r.ok ? null : 'That code was not accepted. Check it and try again.';
+            if (r.ok) return null;
+            // 503: the server names the cause itself. Before verification the code was not
+            // checked (retry now); after it the code is spent and could not be recorded (wait
+            // for the next one), so show the server's own message rather than guess.
+            return r.status === 503 && r.message
+              ? r.message
+              : 'That code was not accepted. Check it and try again.';
           });
         }
       }).then(function (ok) {
