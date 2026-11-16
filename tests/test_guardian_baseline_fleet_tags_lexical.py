@@ -247,8 +247,14 @@ def problems() -> list:
             out.append(f"server.cpp no longer describes the meta gauges via {needle}")
     reg = strip_line_comments(read(AGENT_REGISTRY_CPP))
     reg_flat = re.sub(r"\s+", "", reg)
-    for publish in ("metrics.gauge(kGuardianBaselineMetrics[i].gauge).set(gbp_sum[i])",
-                    "metrics.gauge(kGuardianBaselineReportingGauge).set(",
+    # The table publish names its loop variable only through a back-reference, so renaming `i` stays
+    # green; the index must be an identifier, so a literal `[0]` or `.set(0)` goes red.
+    if not re.search(r"metrics\.gauge\(kGuardianBaselineMetrics\[([A-Za-z_]\w*)\]\.gauge\)"
+                     r"\.set\(gbp_sum\[\1\]\)", reg_flat):
+        out.append("agent_registry.cpp must publish `metrics.gauge(kGuardianBaselineMetrics[<var>].gauge)"
+                   ".set(gbp_sum[<var>])` (the identifier surviving somewhere else is not the gauge "
+                   "being published)")
+    for publish in ("metrics.gauge(kGuardianBaselineReportingGauge).set(",
                     "metrics.gauge(kGuardianBaselineTagRejectedGauge).set("):
         if publish.replace(" ", "") not in reg_flat:
             out.append(f"agent_registry.cpp must publish `{publish}...` (the identifier surviving "
@@ -384,6 +390,22 @@ class GuardianBaselineFleetTagsLexical(unittest.TestCase):
         found = self._problems_with({
             AGENT_REGISTRY_CPP: lambda s: s.replace(".set(gbp_sum[i])", ".set(0)", 1)})
         self.assertTrue(any("agent_registry.cpp must publish" in p for p in found), found)
+
+    def test_self_check_detects_a_literal_index_publish_site(self):
+        # A hard-coded row index publishes one gauge for every row: the index must be a variable.
+        found = self._problems_with({
+            AGENT_REGISTRY_CPP: lambda s: s.replace("kGuardianBaselineMetrics[i].gauge).set(gbp_sum[i])",
+                                                    "kGuardianBaselineMetrics[0].gauge).set(gbp_sum[0])", 1)})
+        self.assertTrue(any("agent_registry.cpp must publish" in p for p in found), found)
+
+    def test_self_check_accepts_a_renamed_publish_loop_variable(self):
+        # A harmless loop-variable rename (i -> row) must not fail the gate.
+        def rename(s):
+            self.assertIn("kGuardianBaselineMetrics[i].gauge).set(gbp_sum[i])", s)
+            return s.replace("kGuardianBaselineMetrics[i].gauge).set(gbp_sum[i])",
+                             "kGuardianBaselineMetrics[row].gauge).set(gbp_sum[row])", 1)
+        found = self._problems_with({AGENT_REGISTRY_CPP: rename})
+        self.assertFalse(any("agent_registry.cpp must publish" in p for p in found), found)
 
     def test_self_check_detects_a_defaulted_unpersisted_feed(self):
         found = self._problems_with({
