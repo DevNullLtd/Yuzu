@@ -104,7 +104,7 @@ inline const EchoDbTemplate& echo_db_template() {
 /// Copy the migrated template to `dest` when `dest` does not exist yet. Returns true when the copy
 /// was made. The copy is written to `<dest>.tmp` and renamed into place, so `dest` is never a
 /// partial file: a failure leaves `dest` absent and the open that follows is an ordinary fresh one.
-/// A `dest` that already existed is never touched or removed.
+/// A `dest` that already existed is never touched or removed (checked up front, not race-proof).
 inline bool seed_echo_db_from_template(const std::filesystem::path& dest) {
     const auto& tpl = detail::echo_db_template();
     std::error_code ec;
@@ -118,8 +118,9 @@ inline bool seed_echo_db_from_template(const std::filesystem::path& dest) {
             std::filesystem::remove(staging, ec);
         return false;
     }
-    // rename() does not replace a destination created in the meantime on Windows, and replaces it
-    // on POSIX; either way `dest` is complete or absent.
+    // rename() replaces an existing destination on POSIX and on Windows. `dest` was checked absent
+    // above and the path is per-process salted, so nothing else creates it; either way `dest` is
+    // complete or absent, never partial.
     std::filesystem::rename(staging, dest, ec);
     if (ec) {
         std::filesystem::remove(staging, ec);

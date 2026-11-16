@@ -3145,8 +3145,9 @@ TEST_CASE("echo_test_db: the migrated template is built and a copy opens at sche
     REQUIRE(yuzu::test::seed_echo_db_from_template(copy.path));
     // The copy is the whole template file, not an empty or truncated one that open() would quietly
     // rebuild through the full ladder (which would also read schema_version 10).
-    CHECK(fs::file_size(copy.path) ==
-          fs::file_size(yuzu::test::detail::echo_db_template().file.path));
+    const auto template_bytes = fs::file_size(yuzu::test::detail::echo_db_template().file.path);
+    CHECK(template_bytes > 0);
+    CHECK(fs::file_size(copy.path) == template_bytes);
     CHECK_FALSE(fs::exists(fs::path{copy.path.string() + ".tmp"}));
     {
         auto opened = EchoDatabase::open(copy.path);
