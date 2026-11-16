@@ -219,7 +219,8 @@ process started).
 - A start whose first check cannot run leaves the gate Unproven (reads refused, writes accepted) until
   a repeat concludes, usually about a minute after the repeat thread starts. **Unproven is not always
   transient:** when the database records a collation version and the host reports none, or the catalog
-  read is refused, every check is unreadable and the gate stays Unproven for as long as the state
+  read is refused, or an INVALID index exists in the schema `device_inventory_store` while the two
+  versions are equal (the hold-only guard below), every check is unreadable and the gate stays Unproven for as long as the state
   stands: the bulk read stays refused, the per-device CI reads stay degraded, writes are NOT paused, and
   there is no override flag (D3 stands). The documented catalog exit (setting the recorded version to
   NULL) needs a superuser, which managed PostgreSQL usually does not give (reasoned, not tested) and it
