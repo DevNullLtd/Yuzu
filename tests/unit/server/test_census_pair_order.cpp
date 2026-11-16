@@ -3017,19 +3017,29 @@ TEST_CASE("census pair order, #7149: a refused census decision logs a sampled wa
             ++lines;
         return lines;
     };
-    yuzu::test::LogCapture cap(spdlog::level::warn);
-    // An ordinary decision (applied_pair) advances nothing.
-    CHECK(store.insert_event_classified(with_pair(stamped("o1", "r1", "dup-a", kCompliant, 1000), 5, 3))
-              .outcome == EventInsertOutcome::Inserted);
-    CHECK(count_lines(cap.text()) == 0);
+    // An ordinary decision (applied_pair) advances nothing. Every text() read is after stop().
+    {
+        yuzu::test::LogCapture cap(spdlog::level::warn);
+        CHECK(store
+                  .insert_event_classified(
+                      with_pair(stamped("o1", "r1", "dup-a", kCompliant, 1000), 5, 3))
+                  .outcome == EventInsertOutcome::Inserted);
+        cap.stop();
+        CHECK(count_lines(cap.text()) == 0);
+    }
     // Two refusals inside one quiet gap: the first logs, the second is only counted.
+    yuzu::test::LogCapture cap(spdlog::level::warn);
     const DecisionCounts counts = decision_counts(metrics);
-    CHECK(store.insert_event_classified(with_pair(stamped("o2", "r1", "dup-a", kDrifted, 1010), 5, 3))
-              .outcome == EventInsertOutcome::Inserted);
-    CHECK(store.insert_event_classified(with_pair(stamped("o3", "r1", "dup-a", kDrifted, 1020), 5, 3))
-              .outcome == EventInsertOutcome::Inserted);
+    CHECK(
+        store.insert_event_classified(with_pair(stamped("o2", "r1", "dup-a", kDrifted, 1010), 5, 3))
+            .outcome == EventInsertOutcome::Inserted);
+    CHECK(
+        store.insert_event_classified(with_pair(stamped("o3", "r1", "dup-a", kDrifted, 1020), 5, 3))
+            .outcome == EventInsertOutcome::Inserted);
     // A later in-order event applies and logs nothing.
-    CHECK(store.insert_event_classified(with_pair(stamped("o4", "r1", "dup-a", kCompliant, 1030), 5, 4))
+    CHECK(store
+              .insert_event_classified(
+                  with_pair(stamped("o4", "r1", "dup-a", kCompliant, 1030), 5, 4))
               .outcome == EventInsertOutcome::Inserted);
     cap.stop();
     CHECK(decision_delta(counts, decision_counts(metrics)) == "applied_pair,refused_duplicate+2");
@@ -3040,6 +3050,55 @@ TEST_CASE("census pair order, #7149: a refused census decision logs a sampled wa
     CHECK(logged.find("rule_id=" + yuzu::log_id_token("r1")) != std::string::npos);
     CHECK(logged.find("event_id=" + yuzu::log_id_token("o2")) != std::string::npos);
     CHECK(logged.find("(occurrence 1)") != std::string::npos);
+}
+
+TEST_CASE("census pair order, #7149: a held unpaired event writes no refusal warning, and a batch "
+          "refusal writes one naming the agent, rule and event",
+          PAIR_TAGS) {
+    // Pins the predicate (`held_unpaired` is counted, not named) and the Batch call site of
+    // `note_refusal`. The sampler is per store, so each section runs on a fresh store.
+    PAIR_FIXTURE();
+    const std::string refused_line = "refused an event: its verdict was not applied";
+    const auto count_lines = [&](const std::string& logged) {
+        std::size_t lines = 0;
+        for (std::size_t at = logged.find(refused_line); at != std::string::npos;
+             at = logged.find(refused_line, at + 1))
+            ++lines;
+        return lines;
+    };
+    SECTION("a held unpaired event is counted and flags the row but writes no warning") {
+        REQUIRE(store
+                    .insert_event_classified(
+                        with_pair(stamped("h1", "r1", "hold-a", kCompliant, 1000), 5, 10))
+                    .outcome == EventInsertOutcome::Inserted);
+        const DecisionCounts counts = decision_counts(metrics);
+        yuzu::test::LogCapture cap(spdlog::level::warn);
+        const auto r = store.insert_event_classified(stamped("h2", "r1", "hold-a", kDrifted, 1010));
+        cap.stop();
+        CHECK(r.outcome == EventInsertOutcome::Inserted);
+        CHECK(decision_delta(counts, decision_counts(metrics)) == "held_unpaired");
+        CHECK(verdict(db.dsn(), "hold-a", "r1") == "C F 5/10");
+        CHECK(count_lines(cap.text()) == 0);
+    }
+    SECTION("a refusal delivered through the batch path writes one warning with its labels") {
+        const DecisionCounts counts = decision_counts(metrics);
+        yuzu::test::LogCapture cap(spdlog::level::warn);
+        const auto r = store.insert_events({
+            with_pair(stamped("b1", "r1", "batch-a", kCompliant, 1000), 5, 10),
+            with_pair(stamped("b2", "r1", "batch-a", kDrifted, 1010), 5, 10),
+        });
+        cap.stop();
+        REQUIRE(r.has_value());
+        CHECK(*r == 2);
+        CHECK(decision_delta(counts, decision_counts(metrics)) == "applied_pair,refused_duplicate");
+        const std::string logged = cap.text();
+        CHECK(count_lines(logged) == 1);
+        CHECK(logged.find("census refused_duplicate refused an event") != std::string::npos);
+        CHECK(logged.find("agent_id=" + yuzu::log_id_token("batch-a")) != std::string::npos);
+        CHECK(logged.find("rule_id=" + yuzu::log_id_token("r1")) != std::string::npos);
+        CHECK(logged.find("event_id=" + yuzu::log_id_token("b2")) != std::string::npos);
+        CHECK(logged.find("(occurrence 1)") != std::string::npos);
+    }
 }
 
 TEST_CASE("census pair order, Gate 7: the Repair admission is released on every exit, an exception "

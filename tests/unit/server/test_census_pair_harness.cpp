@@ -33,17 +33,17 @@
  * WHERE THE EXPECTED VALUES COME FROM. The model of record is the C++ in this file. It is a port
  * of the original Python model, `pend.Store("plan", REC2)` with the generator `pend.gen_actions`
  * over `ext.gen2`, and of CPython's Mersenne Twister, so that `random.Random(seed)` and this file
- * draw the same numbers. The Python sources are NOT in the tree (nothing ran them): they are at
- * commit d96b0e54a3 of PR #8011 under tests/unit/server/pair_model/ (`git show
- * d96b0e54a3:tests/unit/server/pair_model/README.md`), where `harness_digests.py` produced the table.
- * The port is held to that original by the case "census pair harness: the C++ port agrees with the
- * Python model": it needs no database, and compares an FNV-style digest (see `fnv1a`) of the first
- * 64 seeds' schedules and model traces with the table `kPythonDigests` (from the canonical forms
- * `schedule_text` and `snap_text` below). What the table pins from here on is THIS FILE: a change
- * to the generator or the model changes a digest and fails that case. An intended change is made
- * on purpose, by updating the digests from the values the failing CHECKs print, in the same change
- * as the model edit and with the reason stated; the independent Python cross-check is no longer
- * run, so such a change is reviewed on the model's merits.
+ * draw the same numbers. The Python sources are NOT in the tree (no build or CI step ran them):
+ * they are at commit d96b0e54a3 of PR #8011 under tests/unit/server/pair_model/ (`git show
+ * d96b0e54a3:tests/unit/server/pair_model/README.md`), where `harness_digests.py` produced the
+ * table. The port is held to that original by the case "census pair harness: the C++ port agrees
+ * with its pinned digests": it needs no database, and compares an FNV-style digest (see `fnv1a`) of
+ * the first 64 seeds' schedules and model traces with the table `kPythonDigests` (from the
+ * canonical forms `schedule_text` and `snap_text` below). What the table pins from here on is THIS
+ * FILE: a change to the generator or the model changes a digest and fails that case. An intended
+ * change is made on purpose, by updating the digests from the values the failing CHECKs print, in
+ * the same change as the model edit and with the reason stated; the independent Python cross-check
+ * is no longer run, so such a change is reviewed on the model's merits.
  *
  * SEEDS AND REPLAY. A seed is the Python seed, so seed 17 here is `random.Random(17)` there.
  *   YUZU_TEST_PAIR_HARNESS_SEEDS=N  runs seeds 0..N-1 (default 64; a campaign of
@@ -1461,7 +1461,7 @@ bool labels_enabled() {
 
 } // namespace
 
-TEST_CASE("census pair harness: the C++ port agrees with the Python model",
+TEST_CASE("census pair harness: the C++ port agrees with its pinned digests",
           "[census][ordering][pair][harness][digest]") {
     // No database: the generator and the model are ported, and this pins the port to the Python
     // model's schedules and per-step traces for the first 64 seeds (digests in kPythonDigests).
@@ -1469,7 +1469,7 @@ TEST_CASE("census pair harness: the C++ port agrees with the Python model",
         Seed s = generate(seed);
         Model m;
         run_model(s, m);
-        INFO("seed " << seed << " (a mismatch means the port, or the Python model, changed)");
+        INFO("seed " << seed << " (a mismatch means the port, or its digest table, changed)");
         CHECK(fnv1a(schedule_text(s)) == kPythonDigests[seed][0]);
         CHECK(fnv1a(trace_text(s)) == kPythonDigests[seed][1]);
     }

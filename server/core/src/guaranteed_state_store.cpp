@@ -1790,20 +1790,47 @@ void count_decision(yuzu::MetricsRegistry* metrics,
 }
 
 // Whether a census decision refused the event's verdict (the four `refused_*` labels). A held
-// unpaired event (`held_unpaired`) is a different class, a routine outcome of a mixed fleet, and
-// is deliberately not named here.
+// unpaired event (`held_unpaired`) is a different class: it is counted and flags the row, but no
+// named WARN is written for it (its counter is the signal), so it is deliberately not named here.
 constexpr bool is_census_refusal(CensusDecision d) noexcept {
     return d == CensusDecision::RefusedRegression || d == CensusDecision::RefusedRetired ||
            d == CensusDecision::RefusedDuplicate || d == CensusDecision::RefusedStraggler;
 }
+
+// `is_census_refusal` must be true for exactly the decisions whose label starts with "refused_":
+// a new `refused_*` decision that is not added above would be counted but never named (#7149).
+constexpr bool census_refusal_matches_labels() noexcept {
+    constexpr std::string_view kPrefix = "refused_";
+    for (const CensusDecision d : kCensusDecisions) {
+        const std::string_view label = census_decision_label(d);
+        const bool refused_label =
+            label.size() >= kPrefix.size() && label.substr(0, kPrefix.size()) == kPrefix;
+        if (is_census_refusal(d) != refused_label)
+            return false;
+    }
+    return true;
+}
+static_assert(census_refusal_matches_labels(),
+              "is_census_refusal must be true exactly for the census decisions labelled "
+              "refused_*");
 
 // Name the culprit of a census refusal: the decision counter is fleet-wide and carries no agent, so
 // two hosts sharing one agent id, or a stuck retired-epoch fence, would show a rising number and
 // no name (#7149). One sampled WARN per refusal, shared by every refusal decision (the sampler
 // logs the first of an episode and every `kReadDegradeLogSample`th after it). It is consulted for
 // a refusal only, so ordinary decisions never advance it. Best-effort and noexcept, like
-// `count_decision`: spdlog may throw, and that must never reach the ingest thread. Call it after
-// `project_rule_status` returned, never inside a lock.
+// `count_decision`: spdlog may throw, and that must never reach the ingest thread.
+//
+// Call it after `project_rule_status` returned: that is outside any C++ mutex, but INSIDE the open
+// ingest transaction, which still holds the pooled connection and the DB row locks (the agent
+// order row, the census rows) and, for a Repair, its admission slot. A stalled log sink would
+// lengthen that hold; the sampling bounds it (the first after a quiet minute, then every 100th).
+// `spdlog::error` is already written inside the same transaction elsewhere in this file.
+//
+// The sampler is ONE per store, shared by all four refusal labels and all agents, so a continuous
+// refuser can leave a rarer culprit named only on every 100th refusal. The counters in
+// guardian_agent_order (pair_regressions, pair_stragglers, pair_duplicates, retired_events,
+// exposed as `ordering`) are the per-agent evidence.
 void note_refusal(const std::optional<CensusDecision>& decision, const GuaranteedStateEventRow& row,
                   std::atomic<std::uint64_t>& count, std::atomic<std::int64_t>& last_ts) noexcept {
     if (!decision || !is_census_refusal(*decision))
@@ -1931,11 +1958,12 @@ constexpr const char* kCensusLockAll =
 // (0 or NULL = none). The statements below implement the regime rules in
 // docs/user-manual/guaranteed-state.md, "What the server does with the pair". The executable model
 // of those rules is the model in `test_census_pair_harness.cpp`, a C++ port of the original Python
-// `pend.py` (that header says where the Python is); it replays seeded schedules through this store and compares after every delivery. The
-// text was transcribed from a generated form of that model, so a clause is not to be edited by
-// hand-copying: change the model and the harness in the same change. The text is NOT
-// byte-identical to the generated form: `YUZU_CENSUS_SEEN_MAX_SEQ_` below carries one deliberate,
-// semantics-preserving deviation (`+ 0`, P-1), re-checked by the same differential.
+// `pend.py` (that header says where the Python is); it replays seeded schedules through this store
+// and compares after every delivery. The text was transcribed from the generated form of the
+// original Python model (at the commit that header names) and carries one deliberate,
+// semantics-preserving deviation from it: `YUZU_CENSUS_SEEN_MAX_SEQ_` below has a `+ 0` (P-1). It
+// is checked by the harness differential, which replays seeded schedules against this store. A
+// clause is not to be edited by hand-copying: change the model and the harness in the same change.
 #define YUZU_CENSUS_IN_EPOCH_ "$9::bigint"
 #define YUZU_CENSUS_IN_SEQ_ "$10::bigint"
 #define YUZU_CENSUS_MODE_ "$11::text"
