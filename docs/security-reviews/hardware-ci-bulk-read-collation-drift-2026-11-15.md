@@ -287,8 +287,8 @@ owner's answers to the governance run's findings on 2026-11-16.
   none, or the catalog read is refused, is documented plainly; D3 stands; there is no override flag.
 - 2026-11-16, residuals: replica skew, the detection delay of up to about an hour, other text-keyed
   stores including `endpoint_state` and agent registration, and the resume burst of full resends are
-  accepted as design limits of this change; they are disclosed in the manual and follow-up issues are to
-  be filed (none exist yet).
+  accepted as design limits of this change (owner session decision, not a renewed 2026-11-15
+  acceptance); they are disclosed in the manual and follow-up issues are to be filed (none exist yet).
 - 2026-11-16, repeat thread start failure: an ERROR log and the documentation, no retry machinery.
 
 ## Owner acceptance of the residual
