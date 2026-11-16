@@ -108,8 +108,14 @@ struct LegacyColumn {
 /// columns are copied as stored (a dictionary id is shared by every tier). Used once, by the v10
 /// migration, to finish the roll-ups the retired aggregator had not yet performed. Empty when
 /// the source lacks either tier, or `from`/`to` is not a supported step.
+///
+/// `only_absent` adds `AND NOT EXISTS (...)` over the same bucket and key columns as the conflict
+/// target: a finer row is rolled up only when `<to>` held no row for its (coarser bucket, key)
+/// before the statement ran. The migration asks for it when the upper tier's mark is not
+/// trustworthy, because a finer row at or above the substituted floor may already be in a bucket
+/// the retired pass rolled up. The default statement is unchanged.
 [[nodiscard]] std::string fold_tier_from_tier_sql(std::string_view source, std::string_view from,
-                                                  std::string_view to);
+                                                  std::string_view to, bool only_absent = false);
 
 /// The `DO UPDATE SET` body of a tier UPSERT: one assignment per merged measure, joined by commas,
 /// in declaration order. Every right-hand side sees the stored row, so a last-by-guard

@@ -226,6 +226,38 @@ TEST_CASE("Echo warehouse roll-up: unknown source or unsupported step is empty",
     CHECK(fold_tier_from_tier_sql("usage", "hourly", "daily").empty());     // own tables, no tiers
 }
 
+TEST_CASE("fold schema: the tier to tier statement is unchanged by default and its only absent form "
+          "excludes held buckets by bucket and every key",
+          "[echo][warehouse][rollup]") {
+    const auto plain = fold_tier_from_tier_sql("process", "hourly", "daily");
+    REQUIRE_FALSE(plain.empty());
+    CHECK(plain == fold_tier_from_tier_sql("process", "hourly", "daily", false));
+    CHECK(plain.find("NOT EXISTS") == std::string::npos);
+
+    // The only absent form is the same statement with ONE clause between the WHERE and the ORDER BY:
+    // the upper tier's row for the finer row's coarser bucket and EVERY key column of the conflict
+    // target (a dictionary id for an interned key), and no measure.
+    const auto absent = fold_tier_from_tier_sql("process", "hourly", "daily", true);
+    const auto at = plain.find(" ORDER BY");
+    REQUIRE(at != std::string::npos);
+    const std::string clause =
+        " AND NOT EXISTS (SELECT 1 FROM process_daily_r t WHERE t.day_ts = "
+        "(r.hour_ts - ((r.hour_ts % 86400) + 86400) % 86400) AND t.name_id = r.name_id AND "
+        "t.user_id = r.user_id AND t.parent_name_id = r.parent_name_id)";
+    CHECK(absent == plain.substr(0, at) + clause + plain.substr(at));
+
+    // the monthly step floors the day in SQL, and a non-interned key is compared as stored
+    const auto monthly = fold_tier_from_tier_sql("tcp", "daily", "monthly", true);
+    CHECK(monthly.find("t.month_ts = CAST(strftime('%s', date(r.day_ts, 'unixepoch', 'start of month')) AS "
+                       "INTEGER)") != std::string::npos);
+    CHECK(monthly.find("AND t.remote_port = r.remote_port") != std::string::npos);
+    CHECK(monthly.find("t.connect_count") == std::string::npos);
+
+    // an unsupported step stays empty whatever the flag
+    CHECK(fold_tier_from_tier_sql("process", "hourly", "monthly", true).empty());
+    CHECK(fold_tier_from_tier_sql("nope", "hourly", "daily", true).empty());
+}
+
 // ── Retention independence across granularities ────────────────────────────
 
 TEST_CASE("Echo warehouse retention: only netqual_boot and usage_live are row-count tables",

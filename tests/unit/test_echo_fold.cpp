@@ -2364,3 +2364,42 @@ TEST_CASE("synthetic three-day run: every source, every tier equals the independ
     CHECK(integrity_violations(*f) == 0);
     CHECK(f->db.try_get_config(std::string{kFoldRejectedCounterKey}).value() == std::nullopt);
 }
+
+TEST_CASE("accumulator: an admit predicate filters an event out of every tier and counts it without rejecting it",
+          "[echo][fold][admit]") {
+    auto acc = make_acc("process");
+    std::vector<std::pair<int64_t, std::vector<Value>>> asked;
+    acc.set_admit([&](int64_t ts, const std::vector<Value>& keys) {
+        asked.emplace_back(ts, keys);
+        return std::get<std::string>(keys[0]) != "drop.exe"; // key 0 is the process name
+    });
+
+    CHECK(acc.add(kT0, {{"name", vt("keep.exe")}, {"user", vt("u")}}, {{"start_count", vi(1)}}));
+    // refused by the predicate, yet true: a filtered event is not a rejection
+    CHECK(acc.add(kT0 + 1, {{"name", vt("drop.exe")}, {"user", vt("u")}}, {{"start_count", vi(1)}}));
+    CHECK(acc.filtered() == 1);
+    CHECK(acc.rejected() == 0);
+    for (const auto tier : {"hourly", "daily", "monthly"}) {
+        INFO(tier);
+        const auto rows = acc.rows(tier);
+        REQUIRE(rows.size() == 1);
+        CHECK(*acc.key(rows[0], "name") == vt("keep.exe"));
+    }
+
+    // asked once per event, with the stamp and the key values in key-column order
+    REQUIRE(asked.size() == 2);
+    CHECK(asked[1].first == kT0 + 1);
+    CHECK(asked[1].second == std::vector<Value>{vt("drop.exe"), vt("u"), vt("")}); // name, user, parent_name
+
+    // an event refused for its stamp is rejected before the predicate is consulted
+    CHECK_FALSE(acc.add(kLo - 1, {{"name", vt("late.exe")}}, {{"start_count", vi(1)}}));
+    CHECK(acc.rejected() == 1);
+    CHECK(acc.filtered() == 1);
+    CHECK(asked.size() == 2);
+
+    // with no predicate set nothing is filtered
+    auto plain = make_acc("process");
+    CHECK(plain.add(kT0, {{"name", vt("drop.exe")}}, {{"start_count", vi(1)}}));
+    CHECK(plain.filtered() == 0);
+    CHECK(plain.rows("hourly").size() == 1);
+}

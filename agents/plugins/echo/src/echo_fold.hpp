@@ -165,9 +165,20 @@ public:
             tiers_.push_back({t, {}});
     }
 
+    /// Decides, for one event that survived key resolution, whether it folds: its stamp and its
+    /// key values in key-column order (the order key_columns() lists).
+    using AdmitFn = std::function<bool(int64_t ts, const std::vector<Value>& keys)>;
+
+    /// Install an admission predicate. add() asks it after the keys and measures resolve and
+    /// before any tier is touched; a `false` answer drops the event from every tier. With none
+    /// set, add() behaves exactly as it always did. The v10 migration uses it to leave out a raw
+    /// row the converted tiers already hold.
+    void set_admit(AdmitFn admit) { admit_ = std::move(admit); }
+
     /// Fold one event. Returns false -- folding nothing -- when `ts` is
     /// unrepresentable or a measure is non-finite (counted in rejected()); the
-    /// caller keeps folding the rest.
+    /// caller keeps folding the rest. An event the admission predicate refuses
+    /// returns true, folds nothing and is counted in filtered(): it is not a rejection.
     bool add(int64_t ts, const NamedValues& keys, const NamedValues& measures) {
         const auto reject = [&] {
             ++rejected_;
@@ -188,6 +199,10 @@ public:
         for (const auto& v : mv)
             if (const auto* d = std::get_if<double>(&v); d && !std::isfinite(*d))
                 return reject();
+        if (admit_ && !admit_(ts, kv)) {
+            ++filtered_;
+            return true;
+        }
         for (std::size_t i = 0; i < tiers_.size(); ++i) {
             const auto [it, fresh] = tiers_[i].slots.try_emplace(SlotKey{buckets[i], kv}, mv);
             if (!fresh)
@@ -217,6 +232,8 @@ public:
     }
     /// Events refused for an unrepresentable stamp or a non-finite measure.
     [[nodiscard]] std::size_t rejected() const noexcept { return rejected_; }
+    /// Events the admission predicate left out (never refused: see add()).
+    [[nodiscard]] std::size_t filtered() const noexcept { return filtered_; }
     /// The first refused event's stamp -- the only thing the batch warning names.
     [[nodiscard]] std::optional<int64_t> first_rejected_stamp() const noexcept {
         return first_rejected_;
@@ -334,6 +351,8 @@ private:
     std::vector<std::size_t> guards_; // per measure: index of its kLast guard (unused otherwise)
     std::vector<Tier> tiers_;
     std::size_t rejected_{0};
+    std::size_t filtered_{0};
+    AdmitFn admit_;
     std::optional<int64_t> first_rejected_;
 };
 

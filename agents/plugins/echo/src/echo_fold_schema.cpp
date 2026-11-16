@@ -429,7 +429,7 @@ std::string_view avg_sum_column(const ColumnDef& generated) {
 }
 
 std::string fold_tier_from_tier_sql(std::string_view source, std::string_view from,
-                                    std::string_view to) {
+                                    std::string_view to, bool only_absent) {
     const FoldSourceDef* def = fold_source(source);
     if (!def || def->own_tables)
         return {};
@@ -441,31 +441,45 @@ std::string fold_tier_from_tier_sql(std::string_view source, std::string_view fr
     const std::string from_bucket{ts_column_for_suffix(from)};
     const std::string to_bucket{ts_column_for_suffix(to)};
     // Floor to the coarser bucket in SQL (SQLite's % truncates toward zero, hence the double mod).
-    std::string bucket_expr;
-    if (from == "hourly" && to == "daily")
-        bucket_expr = std::format("({0} - (({0} % 86400) + 86400) % 86400)", from_bucket);
-    else if (from == "daily" && to == "monthly")
-        bucket_expr = std::format(
-            "CAST(strftime('%s', date({}, 'unixepoch', 'start of month')) AS INTEGER)", from_bucket);
-    else
+    // `col` is the finer bucket column as the caller spells it: bare in the SELECT list, `r.`-
+    // qualified inside the NOT EXISTS below.
+    const auto bucket_of = [&](const std::string& col) -> std::string {
+        if (from == "hourly" && to == "daily")
+            return std::format("({0} - (({0} % 86400) + 86400) % 86400)", col);
+        if (from == "daily" && to == "monthly")
+            return std::format("CAST(strftime('%s', date({}, 'unixepoch', 'start of month')) AS INTEGER)",
+                               col);
+        return {};
+    };
+    const std::string bucket_expr = bucket_of(from_bucket);
+    if (bucket_expr.empty())
         return {};
 
     std::string cols = to_bucket, vals = bucket_expr, conflict = to_bucket;
+    // The same (upper bucket, key) the conflict target names, read from the upper tier as it
+    // stood BEFORE this statement: SQLite materialises an INSERT ... SELECT that reads its own
+    // target before writing a row, so two finer rows of one absent (bucket, key) are both added.
+    std::string absent = std::format(" AND NOT EXISTS (SELECT 1 FROM {} t WHERE t.{} = {}",
+                                     physical_table_name(source, to), to_bucket,
+                                     bucket_of("r." + from_bucket));
     for (const auto& c : def->columns) {
         if (c.role == ColumnRole::kGenerated)
             continue;
         const std::string name = physical_column_name(c);
         cols += "," + name;
         vals += ",r." + name;
-        if (c.role == ColumnRole::kKey)
+        if (c.role == ColumnRole::kKey) {
             conflict += "," + name;
+            absent += std::format(" AND t.{0} = r.{0}", name);
+        }
     }
+    absent += ")";
     // WHERE is required: without it SQLite reads `ON CONFLICT` after a bare SELECT as a join clause.
-    return std::format("INSERT INTO {0}({1}) SELECT {2} FROM {3} r WHERE r.{4} >= ?1 "
+    return std::format("INSERT INTO {0}({1}) SELECT {2} FROM {3} r WHERE r.{4} >= ?1{7} "
                        "ORDER BY r.{4}, r.id ON CONFLICT({5}) DO UPDATE SET {6}",
                        physical_table_name(source, to), cols, vals,
                        physical_table_name(source, from), from_bucket, conflict,
-                       fold_upsert_assignments(*def));
+                       fold_upsert_assignments(*def), only_absent ? absent : std::string{});
 }
 
 } // namespace yuzu::echo

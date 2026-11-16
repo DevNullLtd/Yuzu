@@ -280,8 +280,9 @@ retired tables just gets the roll-up schema installed. Otherwise `migrate_to_v10
    legacy row into the interned table (an average becomes `avg * samples`, a sum column is rebuilt
    from it, the keys intern through the dictionary).
 3. Finish the tier-to-tier roll-ups the old aggregator had not yet performed, using each source's
-   `rollup_<src>_<to>_at` mark (absent means "fold all"), then fold the raw rows at or after the
-   first old tier's mark (`ts >= mark`: a mark is the half-open end of the last rolled bucket).
+   `rollup_<src>_<to>_at` mark (absent means "fold all"), then fold the raw rows below the first
+   old tier's stored mark that its converted tier does not hold (the held-bucket rule, below), then
+   the raw rows at or after it (`ts >= mark`: a mark is the half-open end of the last rolled bucket).
    The marks are read once and validated before any of this: a mark that is not an integer, a
    populated old tier whose own mark is absent, or a coarser tier's mark ahead of its finer tier's
    fails the migration with the key, value and table named (an absent mark means "fold everything
@@ -292,8 +293,8 @@ retired tables just gets the roll-up schema installed. Otherwise `migrate_to_v10
    becomes the end of the newest bucket at or before the clock that the converted tier holds (what
    was provably summarised; a bucket the excursion itself wrote is ahead of the clock too and is
    never the floor, or every raw row written since the clock healed would be dropped as
-   summarised), clamped to the clock, the decision is logged once per mark with the figures, and
-   the rows below that floor are counted in the "older than the mark" figure. A converted tier
+   summarised), clamped to the clock, and the decision is logged once per mark with the figures.
+   The substitute floor only decides where the held-bucket rule applies; it drops nothing. A converted tier
    with no bucket at or before the clock cannot bound the fold: folding everything would add every
    raw row on top of the upper tiers that already hold them, so the migration refuses with the
    source, tier, mark and clock named, unless the source holds no raw row and no converted bucket
@@ -303,26 +304,46 @@ retired tables just gets the roll-up schema installed. Otherwise `migrate_to_v10
    `mark > now` (no tolerance, `acd22e776` `echo_aggregator.cpp` `raw_budget_candidates`), so a
    migration clock behind every stored mark (a restored snapshot, a reset real-time clock) takes
    the same path: bounded by the converted tier, or refused until the clock or the mark is
-   repaired. Known limit, two triggers of one mechanism: a raw row the excursion itself stamped
-   ahead of the clock folds again on top of the converted future bucket that already holds it;
-   and a migration clock set back from a SANE mark (a restored snapshot, an NTP step) makes the
-   mark untrusted by the same rule, and the clamp to the clock folds the raw rows between the
-   clock and the mark again on top of the buckets that hold them (an upper bound on the raw read
-   would close both; not built). A sane mark is used exactly as stored; the migration does not
-   otherwise decide per row whether a below-mark raw row was summarised.
+   repaired.
+   The held-bucket rule. A raw row below the STORED mark of the source's first old tier (the
+   stored figure, not the substitute floor) is folded only when (a) its bucket is strictly newer
+   than the converted tier's oldest bucket and (b) the converted tier holds no row for its bucket
+   and the key columns the old `GROUP BY` carried. (a): the pre-v10 byte budget evicted hourly
+   buckets oldest first while raw rows survived, so an absent bucket inside the evicted range does
+   not mean "never summarised" and folding there would count the row again in the daily and
+   monthly tiers; an empty tier admits nothing. (b): the tier's other key columns are enrichment
+   the old pass never wrote (blank or 0 in every converted row), so they are not compared. One
+   decision is made per (bucket, keys) for the whole pass, so it never changes between chunks and
+   never sees the pass's own writes; rows at or above the stored mark fold as they are. This
+   closes both triggers that used to fold a row twice (a raw row the excursion itself stamped
+   ahead of the clock sits in a converted future bucket; a migration clock set back from a SANE
+   mark, a restored snapshot or an NTP step, makes the mark untrusted by the same rule and put the
+   rows between the clock and the mark on top of the buckets that hold them), and it folds, once,
+   rows the old clock-gap clamp skipped and rows a process-event backfill wrote, which used to be
+   dropped. The tier-to-tier finish has the same two triggers and runs first, so it carries the
+   rule itself: when the upper tier's mark is untrusted, a finer row at or above the floor goes up
+   only into an (upper bucket, key) the upper tier does not hold (`fold_tier_from_tier_sql`'s
+   `only_absent`; the old pass rolled whole upper buckets, so a bucket and key the tier holds were
+   rolled in full). A sane mark keeps the statement as it was, and a cursor source keeps its single
+   pass at the floor. Residuals, all erring toward not folding: raw rows in the range the budget
+   evicted from the first tier; a raw row of a bucket and keys the converted tier holds only
+   because other events of that bucket and keys were summarised (an event kind the old tier did not
+   count); and the rest of an upper bucket whose old range began mid-bucket after the old clock-gap
+   clamp (the monthly step only: the clamp is 62.5 days). The rule is bounded by what the migration
+   can read: the old tiers carried no unique index, so a re-rolled range wrote a second row and the
+   conversion merged it; the rule never counts that range twice and never completes it.
    Sixteen decoders read the raw columns through `legacy_live_columns()`; a row the delta rules
-   reject is counted and dropped. Raw rows older than that mark are dropped with the raw tables, by
-   design: the old roll-up already summarised them, except rows a process-event backfill wrote with
-   historical timestamps and rows the old aggregator's clock-gap clamp skipped while the mark still
-   advanced. The old `GROUP BY` destroyed the row identity that would tell the two apart, so folding
-   them would double-count the first group; the migration logs how many it left unfolded. The usage
+   reject is counted and dropped. A raw row the rule leaves out is dropped with the raw tables; the log
+   line says how many rows below the stored mark were read, how many events folded and how many
+   were skipped, and how many tier-to-tier rows were left out because the upper tier already held
+   them. The usage
    fold read the raw process rows through its own cursor, `usage_hwm_id`: the process rows past it
    (the stored `usage_lag_events`, normally 0) are fed to `usage_fold_in` in this same transaction,
    so a lagging usage fold loses nothing it would have credited when the cursor is deleted; the
    log line carries the rows past the cursor, the stored counter and how many of them were folded
-   (a row past the cursor but below the roll-up floor is not folded into the tiers, and is in the
-   "older than the mark" figure, but usage still gets it: usage is fed in one id-ordered walk over
-   every row past the cursor, whatever its ts, so a run that straddles the floor pairs start first). They are fed only when the usage fold would have credited them, through the
+   (a row past the cursor that the rule leaves out of the tiers still reaches usage: usage is fed in
+   one id-ordered walk over every row past the cursor, whatever its ts, so a run that straddles the
+   stored mark pairs start first). They are fed only when the usage fold would have credited them, through the
    fold's own predicate (`usage_active_in`): usage enabled and the lifecycle Active, with the
    active generation parsed as `usage_lifecycle_state` parses it (an empty or malformed
    `usage_active_generation` is 0 and reads Active against an absent or 0 `usage_generation`,
@@ -354,8 +375,9 @@ A failure at any step, a crash or a power loss before the commit leaves the reti
 next open retries from v9. After the commit `open()` refuses if the connection is not in autocommit mode
 (a wedged connection is never published), checkpoints and truncates the WAL, and runs one `VACUUM`
 when the volume holds twice the new file free (else it records `auto_vacuum_deferred_at` and the daily
-maintenance pass retries). The log line carries the duration, rows converted, rows folded, rows
-rejected, replay keys seeded, tables dropped, file sizes and the WAL size at commit. The migration needs
+maintenance pass retries). The log line carries the duration, rows converted, rows folded, the rows
+read below the stored mark with the events folded and skipped, the tier-to-tier rows left out as
+held, rows rejected, replay keys seeded, tables dropped, file sizes and the WAL size at commit. The migration needs
 the retired tables' own column lists, which live in `echo_fold_schema.cpp` (`legacy_live_columns`); they
 are the last copy of the raw schema and exist only to read old files.
 
