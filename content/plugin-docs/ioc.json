@@ -318,15 +318,20 @@
     "capability_rows": [
       "server/core/src/capability_decls/plugin_action_catalogue_d.hpp"
     ],
-    "changelog": [],
+    "changelog": [
+      "changelog.d/7710-ioc-hosts-exact-match.fixed.md"
+    ],
     "definitions": [
       "content/definitions/ioc.yaml"
     ],
     "plugin": [
+      "agents/plugins/ioc/src/ioc_parsers.hpp",
       "agents/plugins/ioc/src/ioc_plugin.cpp"
     ],
     "privilege_row": false,
-    "tests": []
+    "tests": [
+      "tests/unit/test_ioc_parsers.cpp"
+    ]
   },
   "version": "1.0.0",
   "where_the_data_goes": [

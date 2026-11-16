@@ -27,6 +27,8 @@
 
 #include <yuzu/plugin.hpp>
 
+#include "ioc_parsers.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -604,23 +606,15 @@ void check_domains(yuzu::CommandContext& ctx, const std::vector<std::string>& do
 #else
         // On Linux/macOS, DNS caching varies widely (systemd-resolved,
         // dnsmasq, mDNSResponder). Check /etc/hosts as a basic fallback.
-        bool found = false;
-        std::string detail;
-        std::ifstream hosts("/etc/hosts");
-        if (hosts.is_open()) {
+        std::vector<std::string> host_lines;
+        {
+            std::ifstream hosts("/etc/hosts");
             std::string line;
-            while (std::getline(hosts, line)) {
-                // Skip comments
-                auto pos = line.find('#');
-                if (pos != std::string::npos)
-                    line = line.substr(0, pos);
-                if (line.find(domain) != std::string::npos) {
-                    found = true;
-                    detail = "Found in /etc/hosts";
-                    break;
-                }
-            }
+            while (std::getline(hosts, line))
+                host_lines.push_back(std::move(line));
         }
+        const bool found = yuzu::ioc::hosts_contains_domain(host_lines, domain);
+        std::string detail = found ? "Found in /etc/hosts" : "";
         if (!found)
             detail = "Not found in /etc/hosts (DNS cache not available)";
 

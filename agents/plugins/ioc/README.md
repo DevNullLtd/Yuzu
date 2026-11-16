@@ -137,9 +137,10 @@ port|22|false|No listening service on this port
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/ioc/src/ioc_plugin.cpp`
+- Plugin: `agents/plugins/ioc/src/ioc_parsers.hpp` · `agents/plugins/ioc/src/ioc_plugin.cpp`
 - Definitions: `content/definitions/ioc.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_d.hpp`
-- Tests: none found by name
+- Tests: `tests/unit/test_ioc_parsers.cpp`
 - Privilege row: `docs/agent-privilege-model.md` (no row yet)
+- Changelog: `changelog.d/7710-ioc-hosts-exact-match.fixed.md`
 <!-- END GENERATED -->
