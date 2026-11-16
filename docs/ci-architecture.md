@@ -2929,7 +2929,28 @@ and the names in `tests/test_gateway_test_summary.py` (and the shard count in
 `docs/rhel9-build-setup.md`),
 delete the `NoCover` wrapper from the config script, and delete `gateway ct`'s
 priority; each of the three is separable.
-*Samples.* To be recorded here after the change's own runs.
+*Samples (measured, 2026-11-13 to -14).* Three same-SHA samples per leg on the
+PR #7703 head `f17fcc7c26`, run 43456524845 (Linux attempts 1, 2 and 4, jobs
+131992161922, 132062790009, 132464908320; Windows attempts 1, 3 and 5, jobs
+131992161930, 132075575242, 132467714240). Every gateway entry passed on its
+first attempt in all six.
+
+| Leg | Shard A (s) | Shard B (s) | Shard C (s) | `gateway ct` (s) | non-pg half (s) |
+|---|---|---|---|---|---|
+| Linux | 100, 98, 103 | 107, 103, 113 | 130, 127, 109 | 143, 145, 142 | 411, 401, 394 |
+| Windows | 154, 155, 154 | 149, 152, 145 | 170, 170, 165 | 48, 49, 48 | — |
+
+The cheap-suites invocation's wall is not printed on its own (the half's log is
+written at its end); taking the non-pg half less the server-shard invocation
+(about 95 s to 110 s at two workers, from its entries' durations) gives about
+290 s to 300 s in each Linux sample, against the 362 s to 375 s baseline: rule
+(a) holds (about 19%), and the non-pg half fell from about 480 s to 394 s to
+411 s. Rule (c): the longest shard is 130 s on Linux (22% of its 600 s meson
+timeout) and 170 s on Windows (31% of the wrapper's 540 s deadline). Not
+checked from CI: rule (b) entry by entry, and the EUnit test count (a green run
+uploads no test logs, and meson's summary shows each shard passing, not its
+count); the 2807 is from the local cover-off run. The Windows job took 7.6 to
+10.3 min; its barrier wait is not measured separately.
 
 ### Persistent runner-local test history
 
@@ -3137,7 +3158,9 @@ ADR-0006 decision 8: every tier that runs the server **`[pg]`** suite gets a
 real PostgreSQL and exports `YUZU_TEST_POSTGRES_DSN`. The shipped substrate is
 **PostgreSQL 18** (`deploy/docker/Dockerfile.postgres`), and the Linux/docker
 legs test against it; the server SQL is version-agnostic (13+), so a
-runner-native cluster on an older major still exercises the suites correctly.
+runner-native cluster on an older major still exercises the suites correctly,
+except where a step sets `YUZU_TEST_PG_CLONE_STRATEGY` (the Linux test step's
+pg half does), which needs 15+.
 One script implements it everywhere — `scripts/ci/ensure-postgres.sh`, inserted
 as an `Ensure Postgres (server tests)` step between Build and Test in ci.yml
 (linux) and nightly.yml (asan / tsan / coverage).
@@ -3220,17 +3243,44 @@ Resolution order inside the script:
    bumping the label again. Docker Linux path only. Probe output and the
    decision: pending — filled by the push that applies or declines it.
 
-   **Clone-strategy A/B knob (2026-11-10, pending measurement).** Every
+   **Clone-strategy knob (2026-11-10; measured and wired 2026-11-14).** Every
    template-cloned `[pg]` case runs `CREATE DATABASE ... TEMPLATE ...`
    (`PostgresTestDb`, `tests/unit/test_helpers.hpp`). Setting
    `YUZU_TEST_PG_CLONE_STRATEGY` to `wal_log` or `file_copy` (any case) appends
    `STRATEGY WAL_LOG` or `STRATEGY FILE_COPY` to that statement; unset leaves the
    SQL unchanged (the server default, `WAL_LOG` on PostgreSQL 15+), and any other
-   value fails the fixture with a message naming the variable. No CI job sets it.
-   It exists so the two strategies can be compared on the pg step's wall time,
-   on the same terms as the tmpfs experiment above (two same-SHA samples, kept
-   only on a gain); if `FILE_COPY` wins, wiring it into CI is a separate change.
-   Result: pending. Contract: `docs/testing/unit-test-conventions.md`.
+   value fails the fixture with a message naming the variable. Measured on Big
+   Tam in two runs of draft PR #7701, each running the `server-pg` suite four
+   times in one job (default, file_copy, file_copy, default) so that load drift
+   hits both strategies alike:
+
+   | Run | default (wall / serial) | file_copy (wall / serial) | default (wall / serial) |
+   |---|---|---|---|
+   | 1 | 751 s / 2633 s | 739 s / 2625 s, 711 s / 2499 s | 807 s / 2850 s |
+   | 2 | 927 s / 3303 s | 869 s / 3133 s, 870 s / 3136 s | not finished (step timeout) |
+
+   Every default pass was slower than both file_copy passes of its run: about
+   6-7% wall and 5-7% serial. Run 2 was on a busier box (all of its numbers
+   about 20% higher), so compare within a run, not across. Result: the Linux
+   test step's `pg_half` exports `YUZU_TEST_PG_CLONE_STRATEGY=file_copy` for
+   both `pg_mode`s (a value leaking in from the runner is warned about and
+   overridden; `tests/shell/test_linux_concurrent_step.sh` pins both). The
+   checkpoint `FILE_COPY` forces stays inside the job's own per-runner
+   Postgres container. No other workflow sets it. It needs PostgreSQL 15+ (every
+   Big Tam agent runs the pinned 18 image), and it is only a gain with
+   `fsync=off`, as `ensure-postgres.sh`'s Docker cluster runs: on that image a
+   25 MB template cloned in 44 ms against 65 ms (`WAL_LOG`) with fsync off, but
+   636 ms against 68 ms with fsync on. The pg half sets it whatever the
+   cluster, so a Linux runner whose pre-set DSN or native fallback reaches a
+   durable cluster would lose time instead (no Big Tam agent does). It moves the
+   pg step's baseline: pg-step samples for a later push (the tmpfs push, Push 3)
+   compare only against runs that include it, and samples taken before it (the
+   concurrent-halves runs, and #7703's Push 2d samples) do not. Revert:
+   `git revert -m 1` the merge commit of the PR that wired it. The
+   concurrent-halves kill switch (`YUZU_CI_SEQUENTIAL_HALVES=1`) does not undo
+   it: if a pg-half revert trigger persists with the switch set, revert this
+   next. Contract:
+   `docs/testing/unit-test-conventions.md`.
 3. **brew** (GHA-hosted macOS, no docker) — `postgresql@18` bottle +
    throwaway trust-auth cluster under `$RUNNER_TEMP` on
    `127.0.0.1:15432`.

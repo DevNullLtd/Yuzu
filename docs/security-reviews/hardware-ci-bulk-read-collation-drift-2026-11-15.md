@@ -133,7 +133,10 @@ Caveats, all of which bound how these numbers may be used:
    per-id reads of `device_ci` still go through the primary key, which follows the drifting database
    collation. Measured on the emulation above (not a prediction for a real upgrade, see its caveats):
    61% of existing devices are not found by primary key, so the hash-skip and the per-id reads
-   (`GET /api/v1/hardware/{id}`, MCP `get_hardware_ci`) report a stored device as missing; every
+   (`GET /api/v1/hardware/{id}`, MCP `get_hardware_ci`) report a stored device as missing, and so
+   does the roster-keyed read that fills the CI columns of the device list (`list_device_ci_for`,
+   `GET /api/v1/hardware`: it looks the roster's ids up in the primary key; not measured separately
+   here, same mechanism); every
    full-ingest cycle adds physical rows (20,000 to 37,842 in four cycles) instead of updating them;
    from the third cycle ingest also fails with `unique_violation` for some devices (refused ingest);
    the byte-ordered walk then serves duplicate rows for one device with divergent content, and for

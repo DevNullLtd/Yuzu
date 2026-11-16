@@ -1664,6 +1664,8 @@ if build_server
       'unit/server/test_oidc_egress_policy.cpp', # #5692: pure address-class policy for OIDC fetches
       'unit/server/test_oidc_egress.cpp', # #5692: the policy applied to real fetches (pin, refusal, cross-host)
       'unit/server/test_bounded_resolver.cpp', # bounded resolver + resolver error classifier
+      'unit/server/test_resolver_host_admission.cpp', # #7153: the lookup admission in front of the OIDC name lookup: refusal memory (keys, TTL, caps, which outcomes arm a name), per-name limit, lease lifetime, and the doc-figure pin
+      'unit/server/test_resolver_pool_metrics.cpp', # #7153 PR-4b: resolver pool metrics: register pre-seeds all five outcomes at 0, publish mirrors deltas, a baseline hides earlier history, a reset never goes negative
       'unit/server/test_oidc_scim_link.cpp',
       'unit/server/test_sha256_steps.cpp',
       'unit/server/test_oidc_routes.cpp',
@@ -1707,6 +1709,7 @@ if build_server
       'unit/server/test_session_store.cpp',
       'unit/server/test_session_dbclock.cpp',
       'unit/server/test_auth_session_store.cpp',
+      'unit/server/test_session_account_active.cpp',
       'unit/server/test_clock_drift_monitor.cpp',
       'unit/server/test_dispatch_chokepoint.cpp',
       'unit/server/test_capability_catalogue.cpp',
@@ -1903,7 +1906,8 @@ if build_server
       'unit/server/test_mcp_tools_containment.cpp', # Seam PR2: list_quarantined_devices registry tool (gate, scope, degrade, audit, byte identity with the REST body)
       'unit/server/test_mcp_tools_crypto.cpp',     # #6558 PR2: the seven /crypto MCP tools (gate, confinement, audit-first layout write, retry hints, unwired providers)
       'unit/server/test_mcp_tools_dex.cpp',        # #6087: get/set/reset_dex_score_policy registry tools (gates, tiers, approval, If-Match/dry_run, audit-first, audit_persisted, retry hints, unwired providers)
-      'unit/server/test_delivery_pool_metrics_wiring_lexical.cpp', # #7153: LEXICAL pin (not behaviour) that server.cpp registers the delivery pool metrics once and publishes each store under its own label from its own accessors, scanned from server.cpp at test run time
+      'unit/server/test_revocation_source_degrade_wiring_lexical.cpp', # #7153: LEXICAL check (not behaviour) that server.cpp pre-seeds the CRL source degrade reasons (dns_busy included) and increments the counter under the reason it is handed, and that the service spells dns_busy for both lookup refusals, scanned from the sources at test run time
+      'unit/server/test_delivery_pool_metrics_wiring_lexical.cpp', # #7153: LEXICAL pin (not behaviour) that server.cpp registers the delivery pool metrics once and publishes each store under its own label from its own accessors, and that the OIDC resolver pool publisher is registered once and published once on the same tick and `bounded_resolve` counts through `note_outcome` once, scanned from server.cpp and bounded_resolver.hpp at test run time
       'unit/server/test_hw_ci_detail_wiring_lexical.cpp', # #7163: LEXICAL pin (not behaviour) that the hw_ci_detail_fn closure in server.cpp is the one handed to the REST routes and the MCP tools, and that CiRead::WithSections selects get_device_ci_with_sections, scanned from server.cpp at test run time
       'unit/server/test_store_wiring_order.cpp', # #3261: every agent_service_/gateway_service_ store setter runs after its member's construction, mechanically scanned from server.cpp at test run time
       'unit/server/test_presence_departure.cpp', # #5678: the one departure->presence mirror both disconnect paths share (pure helper cases)
@@ -2047,11 +2051,16 @@ if build_server
       'unit/server/test_agent_registry_log_neutralisation.cpp',   # #5513: register_agent log lines neutralised
       'unit/server/test_secret_codec.cpp',
       'unit/server/test_software_inventory_store.cpp',
+      'unit/server/test_software_inventory_reads_v3.cpp', # SAM-33 reads: hosts, change feed, facet health, summary ([pg][software_inventory][reads_v3], shard E)
       'unit/server/test_inventory_blob_v3.cpp',          # pure blob-v3 grammar + install-type table
       'unit/server/test_purl_compose.cpp',               # pure purl composer (purl-spec vectors)
       'unit/server/test_software_catalog_rules.cpp',
       'unit/server/test_software_catalogue_model.cpp',   # pure shared REST+MCP catalogue model
       'unit/server/test_software_list_model.cpp',        # pure SAM-17 lookup list model (totals, status, range)
+      'unit/server/test_software_hosts_model.cpp',       # SAM-33 pure hosts model
+      'unit/server/test_software_changes_model.cpp',     # SAM-33 pure change-feed model
+      'unit/server/test_software_plugin_health_model.cpp', # SAM-33 pure plugin-health model + gauges
+      'unit/server/test_vers_range.cpp',                 # pure vers: parser + interval core (SAM-43)
       'unit/server/test_crypto_cbom.cpp',                # /crypto CBOM export: CycloneDX 1.7 shaper + goldens
       'unit/server/test_crypto_library_model.cpp',       # /crypto slice 1: curated table + shared model
       'unit/server/test_crypto_api.cpp',                 # /crypto slice 1: local CryptoApi over the real store
@@ -2064,12 +2073,18 @@ if build_server
       'unit/server/test_product_normalize.cpp',
       'unit/server/test_product_registry_store.cpp',
       'unit/server/test_software_normalization_pack.cpp',
+      # SAM-23 lifecycle: pure evaluator + rule-file parser + embedded seed (no store, no [pg])
+      'unit/server/test_software_lifecycle_rules.cpp',
+      # SAM-23 lifecycle store (born-on-PG, [pg][store][lifecycle])
+      'unit/server/test_software_lifecycle_store.cpp',
       # pure per-group collection settings resolver (collection_settings_resolve.hpp): no store, no I/O, no [pg]
       'unit/server/test_collection_settings_resolve.cpp',
       # per-group collection settings store (born-on-PG, [pg][store])
       'unit/server/test_software_collection_settings_store.cpp',
       # collection-settings REST routes: null-dep shapes (no PG) + [pg][routes] real AuthRoutes gate over ManagementGroupStorePg/RbacStorePg
       'unit/server/test_software_collection_settings_routes.cpp',
+      # SAM-33 read routes (hosts, host detail, change feed, summary, plugin health) over injected store reads: no store, no [pg]
+      'unit/server/test_software_read_routes.cpp',
       'unit/server/test_software_title_dimension.cpp',
       'unit/server/test_software_licensing_store.cpp',
       'unit/server/test_software_licensing_ingestion.cpp',
@@ -3628,6 +3643,14 @@ test('changelog promote append',
   suite: 'docs',
   timeout: 60,
 )
+# scripts/whats-new.py: collated "what changed since my last pull" view (version bumps +
+# changelog.d fragments). Builds throwaway git repositories. Stdlib only.
+test('whats-new script',
+  _python3_test,
+  args: [files('test_whats_new.py')],
+  suite: 'docs',
+  timeout: 180,
+)
 test('changelog order',
   _python3_test,
   args: [files('test_changelog_order.py')],
@@ -4905,11 +4928,27 @@ test('collection settings wiring lexical',
   suite: 'docs',
   timeout: 30,
 )
+# SAM-23: the lifecycle store's refuse-to-start arms, /readyz row, Deps wiring and stop() reset.
+test('software lifecycle wiring lexical',
+  _python3_test,
+  args: [files('test_software_lifecycle_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
 # SAM-17: the software lookup routes' hostname roster must be handed to RestApiV1 before
 # register_routes(); an unset function leaves every hostname null with no other signal.
 test('software lookup wiring lexical',
   _python3_test,
   args: [files('test_software_lookup_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+# SAM-33: the software v3 read routes must register ahead of the generic inventory route, and the
+# fleet snapshot holder must be attached to the rollup before it starts and read by the routes;
+# either gap leaves every test green and the routes or the alert gauges silently wrong.
+test('software read wiring lexical',
+  _python3_test,
+  args: [files('test_software_read_wiring_lexical.py')],
   suite: 'docs',
   timeout: 30,
 )
@@ -4986,6 +5025,15 @@ test('no conn-less libpq escape references',
 test('rbac cross-schema query-owner seam',
   _python3_test,
   args: [files('test_rbac_query_owner_seam.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# #7223: the durable-session account gate wiring (the soft-delete literal, the owner's session
+# generation bump, the mode ternary, the gate position and the cache epoch guard) keeps its shape.
+test('session account gate wiring (#7223)',
+  _python3_test,
+  args: [files('test_session_account_gate_wiring.py')],
   suite: 'docs',
   timeout: 30,
 )

@@ -52,6 +52,13 @@ public:
         return true;
     }
 
+    /// Forgets every key, so the next `should_warn` for each is a first sighting. A test seam: a
+    /// throttle that lives for the whole process would otherwise carry one test's warn into the next.
+    void clear() {
+        std::lock_guard lock(mu_);
+        last_warn_.clear();
+    }
+
 private:
     std::chrono::seconds interval_;
     std::size_t max_keys_;
