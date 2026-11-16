@@ -691,6 +691,11 @@ server stores and resolves them, shows the effective result for a device
 (`GET /api/v1/inventory/software/hosts/{agent_id}/collection-settings`), and
 saving a document never starts a collection.
 
+The same documents are reachable by agentic clients over MCP, and each tool returns what its REST
+route returns: `list_software_collection_settings`, `get_software_collection_settings`,
+`set_software_collection_settings` (supervised tier, approval-gated, audited ahead of the write
+like the REST `PUT`) and `get_software_host_collection_settings`.
+
 ## Reading the inventory
 
 The data lands in the Postgres schema **`software_inventory_store`**:
@@ -997,6 +1002,8 @@ Three REST reads show how installed-software collection is going. Parameters and
 - **`GET /api/v1/inventory/software/plugin-health`** is the fleet view: one entry per facet (collector) with the number of devices in each status, the share timing out or failing, collection time and bytes read (p50, p95, max) and the ten slowest devices. Start here.
 - **`GET /api/v1/inventory/software/hosts`** and **`/hosts/{agent_id}`** are the per-device view: each device's last report time and, per facet, the status, the short `token` explaining it, when it was last confirmed, and what the last collection cost. Use `q` to find a device by hostname or agent id among the devices the roster holds (seen in the last 30 days, the newest 100,000: a search that finds nothing proves nothing while `roster_truncated` is `true`, and a device quiet for over 30 days is listed but not matched; tracked by #7790), and `last_synced_before` to list devices that have gone quiet.
 - **`GET /api/v1/inventory/software/summary`** gives devices reporting and stale (no report for 48 hours), install, removal and upgrade counts for the last 24 hours and 7 days, and the catalogue size.
+
+**MCP access.** Each read has an MCP twin that returns the same `data` object as the route: `list_software_hosts`, `get_software_host`, `list_software_changes`, `get_software_summary` and `get_software_plugin_health`. They need the same `Inventory:Read` grant, apply the same management-group scope, and are strict about input: an unknown argument or an out-of-range value is refused where the REST route clamps. A device outside the caller's scope and an unknown device answer the same not-found.
 
 **Reading collection health.**
 
@@ -1899,6 +1906,14 @@ sync, defeating the hash-skip protocol.
   Chassis, board and DIMM serial numbers are personal data on the same footing as the
   device serial and system UUID. Agents keep working unchanged; upgrade the server
   before the agents.
+- **Bulk pull.** To read every stored record without one call per device, page through
+  `GET /api/v1/hardware-ci` (MCP: `list_hardware_ci_records`): the scalar `ci` fields of each
+  device plus its stored `content_hash` and `blob_version`, 100 devices per page by default (the MCP tool defaults to 20) and
+  1000 at most, with no sections. It reads the stored records, not the 30-day device roster, so a
+  device that has been offline longer still appears while its record exists. Walk the pages one
+  at a time and off-peak; do not fan pages out in parallel. Every page leases one connection from
+  the server's shared PostgreSQL pool (`--postgres-pool-size`), which also serves RBAC checks and
+  audit writes. Rows are ordered by the byte value of `agent_id`, not by the database's collation, and every `agent_id` comparison it makes (the single-device `?agent_id=` read included) is byte-ordered, so a change to the operating system's collation rules cannot make this READ skip or miss a device; an index on that byte order makes an index scan available for each page (the planner decides, and the representative plans measured use it). Writes, decommission and the per-device reads (`GET /api/v1/hardware/{id}`, `get_hardware_ci`) still go through the primary key, which follows the database collation. If the collation changes and the indexes are not rebuilt, an emulation (20,000 devices, one run; an upper bound, not a prediction for a real upgrade) showed about 6 in 10 existing devices not found by those per-device reads, every report inserting a new row instead of updating the record (about 38,000 rows after four rounds), some reports refused, duplicate and divergent records for one device served by this walk (and for some devices not the newest copy), and a decommission reporting success while removing only about 4 records in 10, so decommissioned devices stayed stored and kept being served. The write-side control (a pause of writes while a mismatch stands) is a later change; every other keyset read still follows the database collation too: see "PostgreSQL collation version" in [Server administration](server-admin.md#postgresql-collation-version). A complete walk is not a snapshot: confirm a device with `?agent_id=<id>` (byte-exact, unaffected by a collation change) before acting on its absence, and treat an empty confirm page as "not found" (no stored record, or outside the credential's scope), not as "deleted". `GET /api/v1/devices/{id}` is no substitute: it answers only for a device with a live session, so a long-offline device is `404` although its record exists. Retire a configuration item only through your own decommission process, never from absence in a walk or a `404` there. See [REST API](rest-api.md#get-apiv1hardware-ci).
 - **What the agent sends.** An agent that carries this change always sends the versioned
   record; there is no flag to fall back to the earlier format, and `--inventory-disable`
   still stops the collection. Each section reports one of four levels:

@@ -1612,6 +1612,14 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      `GET`/`PUT /api/v1/inventory/software/collection-settings/{group_id}` and
      `GET /api/v1/inventory/software/hosts/{agent_id}/collection-settings` have
      no MCP tool.
+     - **Retired 2026-11-16.** The four twins landed under SAM-35
+       (`list_software_collection_settings`, `get_software_collection_settings`,
+       `set_software_collection_settings`, `get_software_host_collection_settings`),
+       together with the five twins of the installed-software v3 reads
+       (`list_software_hosts`, `get_software_host`, `list_software_changes`,
+       `get_software_summary`, `get_software_plugin_health`). Each calls the same
+       function as its REST route. The paragraphs below are the record of the
+       exception while it stood.
      - **No MCP twin - tracked follow-up, not a permanent exception.** Tracked
        as roadmap row **3.7a-mcp** in the software estate roadmap; **revisit by
        2026-12-31**. The MCP twin and the dashboard Collection tab (roadmap row
@@ -1652,6 +1660,10 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      `repair`), so discoverability (Decision 1) is not met for them yet. The server cut-over that
      re-points the quarantine definitions at these actions is the change that adds
      them; until then the plugin README documents the parameters.
+     **Resolved 2026-11-12 (PRQ.2):** `content/definitions/firewall.yaml` now carries
+     `security.firewall.quarantine`, `.release`, `.quarantine_status` and
+     `.quarantine_allow`, which publish the parameters; the revisit trigger has
+     happened and this entry is closed.
    - **2026-11-09 - the software lookup read surface (SAM-17; REST only, the MCP
      twin is a recorded exception).** `GET /api/v1/inventory/software` gains eight
      lookup fields (`hostname`, `last_seen`, `status`, `last_confirmed_at`,
@@ -1840,6 +1852,31 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        `docs/user-manual/rest-api.md` "GET / PUT / DELETE
        /api/v1/dex/score-policy"; audit rows: `docs/user-manual/audit-log.md`
        (verbs unchanged).
+     - Recorded by the change author; ADR-owner acceptance pending.
+
+   - **2026-11-12 - the quarantine release over `DELETE /api/v1/quarantine/{agent_id}`
+     and its `?force=true` flag are REST only (PRQ.2); the MCP release tool is a
+     recorded exception.** `exception:#6234 REST DELETE (device-confirmed release,
+     200 or 202) and ?force=true have no MCP release tool; revisit: when the MCP
+     release tool lands`. The route asks the device to lift its firewall rules and
+     answers `200` with `state: released` when the device confirms within its short
+     wait, otherwise `202` with `state: releasing`; `?force=true` ends the record
+     without the device's confirmation (REST only, under the release's own gates).
+     The open issue #6234 tracks the MCP release tool; its acceptance criteria still
+     name the removed plugin's actions and must be updated to the firewall pairs, the
+     `releasing` state, the `202` and the forced end.
+     - **What an MCP-only caller can and cannot reach.** It can create a record
+       (`quarantine_device`) and list records (`list_quarantined_devices`, which
+       reports `releasing`). It cannot end one: a `firewall.release` sent through
+       `execute_instruction` lifts the device, and the reconciler then re-applies the
+       containment of the record, which is still active. The way to end a record is
+       the REST `DELETE`.
+     - **The exception relaxes no control.** The `DELETE` gates are unchanged by this
+       entry: scoped `Security:Execute`, the same-principal check, the dispatch
+       approval check for the `firewall.release` pair and an audited `attempt` row
+       ahead of the change. The flag adds no authority of its own. Wire reference:
+       `docs/user-manual/rest-api.md` (the quarantine section) and
+       `docs/user-manual/security-hardening.md` "Device Quarantine".
      - Recorded by the change author; ADR-owner acceptance pending.
 
 ## Interim rules (until the named follow-ups ship)

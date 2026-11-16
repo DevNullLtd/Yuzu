@@ -850,7 +850,7 @@ public:
         plugin_ctx_.config["agent.server_address"] = cfg_.server_address;
         // Resolved ONCE, here, at startup -- see server_address_resolver.hpp
         // for why this must not be re-resolved later by a plugin at
-        // quarantine-dispatch time (the quarantine plugin used to do this
+        // quarantine-dispatch time (a plugin used to do this
         // itself; #3429 round 4 moved it here after round 3's review found
         // that let a possibly-already-compromised host's own DNS resolution
         // decide what survives its own containment).
