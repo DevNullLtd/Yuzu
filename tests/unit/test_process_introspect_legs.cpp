@@ -79,6 +79,7 @@ struct Fake {
     RawRead boot = ok(kBootId);
     RawRead mount = ok(kProcVisible);
     mutable std::vector<std::string> reads; ///< names read from the pid directory, in order
+    mutable std::vector<std::size_t> read_caps; ///< the byte cap requested with each read
     mutable int boot_calls = 0;
     mutable int mount_calls = 0;
 
@@ -98,8 +99,9 @@ struct Fake {
     ProcSource src() const {
         ProcSource s;
         s.open_errno = open_errno;
-        s.read = [this](const char* name, std::size_t) {
+        s.read = [this](const char* name, std::size_t cap) {
             reads.emplace_back(name);
+            read_caps.push_back(cap);
             auto it = files.find(name);
             if (it == files.end())
                 return io(ENOENT);
@@ -406,6 +408,35 @@ TEST_CASE("process_introspect read order: stat first and last, a facet reads onl
         CHECK(fk.reads == expected.at(f));
         CHECK(fk.boot_calls == 1);
     }
+}
+
+TEST_CASE("process_introspect requests exact source caps", "[process_introspect]") {
+    // LITERALS, never the constants under test: the README publishes these numbers, so a cap
+    // that moves must fail here. boot_id and mountinfo are nullary at the boundary, so their
+    // two caps are pinned as constants instead.
+    const std::map<std::string, std::size_t> expected_cap{{"stat", 4096},
+                                                          {"status", 16384},
+                                                          {"limits", 8192},
+                                                          {"oom_score", 64},
+                                                          {"oom_score_adj", 64}};
+    for (Facet f : kAll) {
+        INFO(facet_name(f));
+        const Fake fk;
+        const auto r = run(fk, f);
+        REQUIRE(r.status == StatusState::supported);
+        REQUIRE(fk.reads.size() >= 2);
+        REQUIRE(fk.read_caps.size() == fk.reads.size());
+        CHECK(fk.reads.front() == "stat");
+        CHECK(fk.reads.back() == "stat");
+        for (std::size_t i = 0; i < fk.reads.size(); ++i) {
+            INFO("read " << i << ": " << fk.reads[i]);
+            const auto it = expected_cap.find(fk.reads[i]);
+            REQUIRE(it != expected_cap.end());
+            CHECK(fk.read_caps[i] == it->second);
+        }
+    }
+    static_assert(kBootIdCap == 64);
+    static_assert(kMountinfoCap == 1024 * 1024);
 }
 
 TEST_CASE("process_introspect partial reads are constrained, all-denied is permission_denied",

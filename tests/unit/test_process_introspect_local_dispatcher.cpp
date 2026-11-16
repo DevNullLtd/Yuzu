@@ -5,7 +5,9 @@
  *
  * UNGUARDED TU on all three platforms; only the per-OS assertions inside a test body are #if'd.
  * The Linux cases inspect the test process's OWN pid (nothing is spawned) and assert shape only,
- * never host values: which capabilities and limits a CI runner holds is unknown.
+ * never host values: which capabilities and limits a CI runner holds is unknown. Shape includes
+ * the facet's row kinds and counts, and a fully readable own process answering supported: a
+ * process always reads its own five /proc files, so a constrained answer there is a defect.
  *
  * Tagged [process_introspect] ONLY: a carved tag would move a case to another shard.
  */
@@ -197,20 +199,36 @@ TEST_CASE("process_introspect plugin (Linux): each facet of the test's own pid h
         return;
     }
     static const std::regex row_shape{R"(^[a-z_]+(\|[a-z0-9_.,:-]+)*$)"};
-    for (const char* facet : {"resource_limits", "sigmasks", "caps", "seccomp", "oom", "sched"}) {
+    // Per facet: the row kind that every facet row starts with and the allowed row count.
+    struct Shape {
+        const char* facet;
+        const char* prefix;
+        std::size_t min_rows, max_rows;
+    };
+    const Shape shapes[] = {{"resource_limits", "limit|", 1, 16}, {"sigmasks", "sigmask|", 5, 5},
+                            {"caps", "cap|", 5, 5},               {"seccomp", "seccomp|", 1, 1},
+                            {"oom", "oom|", 1, 1},                {"sched", "sched|", 1, 1}};
+    for (const auto& sh : shapes) {
+        const std::string facet = sh.facet;
         const auto r = inspect(*plugin, own_pid(), facet);
         INFO(facet);
         CHECK(r.rc == 0);
+        CHECK(r.result_status == YUZU_RESULT_STATUS_OK);
         const auto rows = captured_rows(r.captured);
-        REQUIRE(rows.size() >= 2);
-        REQUIRE((rows[0].starts_with("status|inspect|supported|") ||
-                 rows[0].starts_with("status|inspect|constrained|")));
+        // status row + target row + the facet's rows.
+        REQUIRE(rows.size() >= 2 + sh.min_rows);
+        CHECK(rows.size() <= 2 + sh.max_rows);
+        CHECK(rows[0] == "status|inspect|supported|-");
         // The second row is the target row: pid, token, facet.
         const std::string expect_prefix = "target|" + own_pid() + "|";
         REQUIRE(rows[1].starts_with(expect_prefix));
-        CHECK(rows[1].ends_with(std::string{"|"} + facet));
+        CHECK(rows[1].ends_with("|" + facet));
         for (std::size_t i = 1; i < rows.size(); ++i)
             CHECK(std::regex_match(rows[i], row_shape));
+        for (std::size_t i = 2; i < rows.size(); ++i) {
+            INFO("row " << i << ": " << rows[i]);
+            CHECK(rows[i].starts_with(sh.prefix));
+        }
     }
 }
 
@@ -224,6 +242,7 @@ TEST_CASE("process_introspect plugin (Linux): the start_time token from one insp
     const auto first = inspect(*plugin, own_pid(), "oom");
     const auto first_rows = captured_rows(first.captured);
     REQUIRE(first_rows.size() >= 2);
+    REQUIRE(first_rows[0] == "status|inspect|supported|-");
     // target|<pid>|<token>|<facet>
     const std::string& target = first_rows[1];
     const std::size_t a = target.find('|', 7);
@@ -232,10 +251,15 @@ TEST_CASE("process_introspect plugin (Linux): the start_time token from one insp
     REQUIRE(b != std::string::npos);
     const std::string token = target.substr(a + 1, b - a - 1);
 
+    // The matching token is accepted: same supported answer and the same target row. The oom
+    // row after it is not compared, because the score moves.
     const auto same = inspect(*plugin, own_pid(), "oom", token);
     CHECK(same.rc == 0);
-    CHECK(captured_rows(same.captured)[0].starts_with("status|inspect|"));
-    CHECK_FALSE(captured_rows(same.captured)[0].find("pid_reused") != std::string::npos);
+    CHECK(same.result_status == YUZU_RESULT_STATUS_OK);
+    const auto same_rows = captured_rows(same.captured);
+    REQUIRE(same_rows.size() >= 2);
+    CHECK(same_rows[0] == "status|inspect|supported|-");
+    CHECK(same_rows[1] == target);
 
     // A different, well-formed token is refused with no data row.
     const std::string other = token.substr(0, 8) == "ffffffff" ? "00000000.1" : "ffffffff.1";

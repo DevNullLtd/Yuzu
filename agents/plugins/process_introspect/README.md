@@ -9,12 +9,12 @@
 
 On Linux the leg opens `/proc/<pid>` once as a directory descriptor, without following a link, and reads every file relative to that descriptor, so a recycled pid cannot be read through a stale path. It reads identity first: `stat` gives the process start time and `boot_id` the machine boot, and together they form the token `<boot_id first 8 hex>.<start time>`. If the request carries a `start_time` that differs, the answer is `pid_reused` and nothing else is read. Then the one facet's sources are read and parsed by pure functions, and `stat` is read again: a process that has gone, or a pid now owned by another process, discards every row (`torn_read`). The status row is written first, then the `target` row, then the facet rows.
 
-A pid that is not found is not proof that the process is gone. On a `/proc` mounted with `hidepid=2` or above, the unprivileged agent gets the same not-found answer for another account's live process, so on that path only the leg reads `/proc/self/mountinfo` once; unless the `/proc` mount is shown without hiding, the answer is `no_such_process_or_hidden`, never a bare `no_such_process`. macOS and Windows answer one `unsupported` status row through the shared planned-leg reporter. No subprocess, ptrace, `/proc/<pid>/mem`, task port or write is used.
+A pid that is not found is not proof that the process is gone. On a `/proc` mounted with `hidepid=2` or above, the unprivileged agent gets the same not-found answer for another account's live process, so on that path only the leg reads `/proc/self/mountinfo` once; unless the `/proc` mount is shown without hiding, the answer is `no_such_process_or_hidden`, never a bare `no_such_process`. macOS and Windows read nothing and answer one `unsupported` status row (`macos:planned`, `windows:planned`) through the shared leg reporter. No subprocess, ptrace, `/proc/<pid>/mem`, task port or write is used.
 
 | Facet | Source (Linux) | Rows | Disclosed | Bounds |
 |---|---|---|---|---|
 | `resource_limits` | `limits` | `limit` per kernel limit, 16 names | soft and hard limit as a number or `unlimited`, unit from a fixed table | 8,192 bytes read |
-| `sigmasks` | `status` | `sigmask` x5 | pending, shared pending, blocked, ignored and caught signal masks of the main thread, 16 hex digits | 16,384 bytes read |
+| `sigmasks` | `status` | `sigmask` x5 | pending, shared pending, blocked, ignored and caught signal masks, 16 hex digits (which thread's: caveat 3) | 16,384 bytes read |
 | `caps` | `status` | `cap` x5 | inheritable, permitted, effective, bounding and ambient capability sets, 16 hex digits | 16,384 bytes read |
 | `seccomp` | `status` | `seccomp` | mode (`disabled`, `strict`, `filter`), installed filter count and `NoNewPrivs` when the kernel reports them | 16,384 bytes read |
 | `oom` | `oom_score`, `oom_score_adj` | `oom` | the two integers | 64 bytes each |
@@ -27,8 +27,8 @@ flowchart LR
   OP[Operator / workflow] --> SRV[Server<br/>authz: Forensics.Read, single target]
   SRV -- gRPC mTLS --> HOST[Agent plugin host] --> EX[process_introspect.execute]
   EX --> LIN[Linux leg<br/>open /proc/pid once, identity, one facet, re-check]
-  EX --> MAC[macOS leg<br/>planned: one unsupported status row]
-  EX --> WIN[Windows leg<br/>planned: one unsupported status row]
+  EX --> MAC[macOS leg<br/>status row only: macos:planned]
+  EX --> WIN[Windows leg<br/>status row only: windows:planned]
   LIN & MAC & WIN --> ROWS[status row + target row + facet rows + typed result status] --> RS[(ResponseStore)] --> API[REST /api/responses]
 ```
 
@@ -41,8 +41,8 @@ flowchart LR
 
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
-| Windows | n/a: the leg is planned and reads nothing | None | n/a | `status\|inspect\|unsupported\|windows:planned`, result `UNAVAILABLE` |
-| macOS | n/a: the leg is planned and reads nothing | None | n/a | `status\|inspect\|unsupported\|macos:planned`, result `UNAVAILABLE` |
+| Windows | n/a: the leg reads nothing (caveat 5) | None | n/a | `status\|inspect\|unsupported\|windows:planned`, result `UNAVAILABLE` |
+| macOS | n/a: the leg reads nothing (caveat 5) | None | n/a | `status\|inspect\|unsupported\|macos:planned`, result `UNAVAILABLE` |
 | Linux | agent daemon, dedicated unprivileged account (`yuzu-agent` on the packaged unit), never root by design (`docs/agent-privilege-model.md`) | None: the five files are world-readable. `CAP_DAC_READ_SEARCH`, which the packaged unit grants, does not lift `hidepid`. Under `hidepid=1` another account's process answers `permission_denied`; under `hidepid=2` or above it answers `no_such_process_or_hidden`. An operator can tell by looking for `hidepid=` on the `/proc` line of `/proc/self/mountinfo` | The committed sample ran as euid 0 on a throwaway VM (see Sample output). LANE-PENDING: the uid 65534 cross-account result and the `hidepid=2` result, exactly as observed on the lane. The `yuzu-agent` account itself was not measured | `status\|inspect\|permission_denied\|linux:process_introspect:permission_denied`, result `PERMISSION_DENIED` / partial; a facet source refused after the target opened is `linux:process_introspect:<facet>:permission_denied` and the answer is `constrained` (or `permission_denied` when no facet row was produced) |
 
 No external binaries, no subprocesses, no network use: the plugin opens one directory and reads at most five small files and, on the not-found path, the mount table.
@@ -72,7 +72,7 @@ Every read sets a typed result status; a degraded read is `CONSTRAINED`, never a
 | `PERMISSION_DENIED` | partial | `linux:process_introspect:permission_denied` / `linux:process_introspect:<facet>:permission_denied` | The `/proc/<pid>` open or the identity read was refused, or every source of the facet was refused and no facet row was produced |
 | `UNAVAILABLE` | unknown | `process_introspect:invalid_pid` / `process_introspect:invalid_facet` / `process_introspect:invalid_start_time` | The request failed validation on the agent (the command also returns 1); nothing was read |
 | `UNAVAILABLE` | unknown | `linux:process_introspect:no_such_process` / `linux:process_introspect:no_such_process_or_hidden` / `linux:process_introspect:identity_unreadable` / `linux:process_introspect:pid_reused` / `linux:process_introspect:torn_read` | No such process (or, with `_or_hidden`, not visible to this account); identity could not be read; the pid now belongs to another process than the supplied `start_time`; or the process exited or was replaced during the read and every row was discarded |
-| `UNAVAILABLE` | unknown | `windows:planned` / `macos:planned` / `linux:planned` | The leg is planned: the action answers `status\|inspect\|unsupported\|<os>:planned` and nothing else. `linux:planned` is the shared reporter's token and is not emitted by this plugin's Linux leg |
+| `UNAVAILABLE` | unknown | `windows:planned` / `macos:planned` / `linux:planned` | The leg reads nothing (caveat 5): the action answers `status\|inspect\|unsupported\|<os>:planned` and nothing else. `linux:planned` is the shared reporter's token and is not emitted by this plugin's Linux leg |
 | `UNAVAILABLE` | unknown | `linux:leg:exception` / `macos:leg:exception` / `windows:leg:exception` | The leg threw: one `status\|inspect\|unsupported\|<os>:leg:exception` row and the command returns 0 |
 
 ### What to do about a token
@@ -102,7 +102,7 @@ Every read sets a typed result status; a degraded read is `CONSTRAINED`, never a
 
 1. **One switch and one permission cover every facet.** The plugin has a single kill switch and a single `Forensics:Read` catalogue row. File or memory contents, environment values, socket payloads and command-line arguments are a new action with its own row, never a new facet.
 2. **A hidden process reads as not found.** On a `/proc` mounted `hidepid=2` or above, a not-found pid answers `no_such_process_or_hidden` because the two cannot be told apart. `gid=` and `CAP_SYS_PTRACE` exemptions are not evaluated, and a mount table over 1 MiB reads as unknown, so those hosts get the weaker, still true answer.
-3. **Torn reads are detected on exit only.** A process that exits during the read gives `torn_read`. An exec keeps the pid and start time, so values may straddle it and that is not detected. A thread id is accepted by `/proc` and reads that thread; the signal masks are the main thread's.
+3. **Torn reads are detected on exit only.** A process that exits during the read gives `torn_read`. An exec keeps the pid and start time, so values may straddle it and that is not detected. A thread id is accepted by `/proc` and reads that thread. The pending and blocked signal masks, the capability sets, the seccomp state and the scheduling values (policy, nice, realtime priority and allowed CPUs) belong to the thread the id names, which is the main thread for a process id; the shared pending, ignored and caught masks, the limits and the OOM values are process-wide.
 4. **Linux masks are 16 hex digits.** A platform with 128 signals would report `sigmasks:malformed` and no mask rows, never `OK`.
 5. **Other facets and operating systems are planned.** Listing facets for Linux, then a macOS leg and a Windows leg, are later changes; today macOS and Windows answer one `unsupported` status row.
 
