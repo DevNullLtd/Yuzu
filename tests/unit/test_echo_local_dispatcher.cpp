@@ -531,6 +531,70 @@ TEST_CASE("echo plugin: every source is enabled by default with no stored flag; 
     desc->shutdown(ctx.get());
 }
 
+// #3864: echo_plugin.cpp is not linked into the unit exe, so the start-time scrub call in init()
+// is reachable only here. On a host whose process source runs from the event stream nothing
+// else rewrites the baseline a polling build left, so deleting that call must fail this case.
+TEST_CASE("echo plugin: init rewrites a process baseline an earlier build left with command lines",
+          "[echo][local_dispatcher][process-baseline]") {
+    const auto plugin_path = find_echo_plugin();
+    if (plugin_path.empty()) {
+        if (std::getenv("MESON_BUILD_ROOT") != nullptr)
+            FAIL("echo plugin library not found under meson test");
+        WARN("echo plugin library not found -- skipping (run from the build root or via meson test)");
+        return;
+    }
+    auto handle = yuzu::agent::PluginHandle::load(plugin_path);
+    REQUIRE(handle.has_value());
+    const auto* desc = handle->descriptor();
+    REQUIRE(desc != nullptr);
+    REQUIRE(desc->init != nullptr);
+
+    yuzu::test::TempDir dir_guard{"yuzu_test_echo_local_"};
+    std::error_code ec;
+    fs::create_directories(dir_guard.path, ec);
+    auto kv = yuzu::agent::KvStore::open(dir_guard.path / "kv_store.db");
+    REQUIRE(kv.has_value());
+    const auto db_path = dir_guard.path / "echo.db";
+
+    // First start creates echo.db and its schema.
+    {
+        yuzu::agent::StandalonePluginContext ctx(
+            "echo", {{"agent.data_dir", dir_guard.path.string()}}, &*kv);
+        REQUIRE(desc->init(ctx.get()) == 0);
+        desc->shutdown(ctx.get());
+    }
+
+    // What an earlier build wrote (synthetic): the process array with a `cmdline` per entry.
+    // 'process' is diff_state_key("process") (echo_aggregator.cpp), a TU this exe does not link.
+    const std::string legacy =
+        R"([{"pid":10,"ppid":1,"name":"psql","cmdline":"psql postgresql://user:S3cret@db","user":"svc"},)"
+        R"({"pid":11,"ppid":1,"name":"sshd","cmdline":"sshd -D","user":"root"}])";
+    (void)raw_sql(db_path,
+                  std::format("INSERT INTO echo_state (collector, state_json, updated_at) "
+                              "VALUES ('process', '{}', 0) "
+                              "ON CONFLICT(collector) DO UPDATE SET state_json = excluded.state_json",
+                              legacy));
+    const std::string read_baseline = "SELECT state_json FROM echo_state WHERE collector = 'process'";
+    // Control: the seed took, so a clean row afterwards is the scrub's doing.
+    const auto seeded = raw_sql(db_path, read_baseline);
+    REQUIRE(seeded.size() == 1);
+    REQUIRE(seeded[0][0].find("S3cret") != std::string::npos);
+
+    yuzu::agent::StandalonePluginContext ctx2("echo", {{"agent.data_dir", dir_guard.path.string()}},
+                                              &*kv);
+    REQUIRE(desc->init(ctx2.get()) == 0);
+    const yuzu::test::ScopeExit shutdown_on_exit{[&] { desc->shutdown(ctx2.get()); }};
+
+    // Read before dispatching any action: the standalone context fires no trigger, so only
+    // init() can have rewritten the row.
+    const auto cleaned = raw_sql(db_path, read_baseline);
+    REQUIRE(cleaned.size() == 1);
+    CHECK(cleaned[0][0].find("S3cret") == std::string::npos);
+    CHECK(cleaned[0][0].find("cmdline") == std::string::npos);
+    CHECK(cleaned[0][0].find("psql") != std::string::npos);
+    CHECK(cleaned[0][0].find("sshd") != std::string::npos);
+}
+
 TEST_CASE("echo plugin: db_budget_bytes validates, persists and shows in status with the budget counters",
           "[echo][local_dispatcher][budget]") {
     const auto plugin_path = find_echo_plugin();

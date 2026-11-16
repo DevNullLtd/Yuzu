@@ -923,6 +923,96 @@ TEST_CASE("echo page shell: capture-sources frame and hourly process record text
     CHECK(page.find("capTable") == std::string::npos);
     CHECK(page.find("echoTreeState") == std::string::npos);
     CHECK(page.find("badge-pii") == std::string::npos);
+    // #7075: the push's toast is server-authored (HX-Trigger on every answer, a refusal
+    // included); the push function must raise no toast itself, whatever its wording.
+    const auto push_fn = page.find("function pushCapChanges");
+    REQUIRE(push_fn != std::string::npos);
+    const auto push_end = page.find("function filterCap", push_fn);
+    REQUIRE(push_end != std::string::npos);
+    CHECK(page.substr(push_fn, push_end - push_fn).find("showToast") == std::string::npos);
+}
+
+// ── (#1162) Every echo.sql pre-dispatch rejection leaves a `denied` audit row ──
+//
+// The detail is a fixed reason token plus, where useful, a byte count or a matched blocklist
+// entry: never the SQL text or any other caller string. Response bodies and statuses are unchanged.
+
+TEST_CASE("echo-execute: each pre-dispatch SQL rejection writes one echo.sql denied row",
+          "[pg][server][dashboard][echo-execute][audit]") {
+    FragmentHarness h;
+
+    SECTION("no sql") {
+        auto res = h.post("/api/dashboard/echo-execute", "scope=__all__");
+        REQUIRE(res->status == 200);
+        CHECK(res->body.find("Missing SQL query") != std::string::npos);
+        CHECK(h.audit_detail("echo.sql", "denied") == "reason=sql_missing");
+    }
+    SECTION("sql over 4096 bytes: the byte count is audited, the text is not") {
+        const std::string filler(4100, 'q');
+        const std::size_t decoded_bytes = std::string("SELECT ").size() + filler.size();
+        auto res = h.post("/api/dashboard/echo-execute", "sql=SELECT+" + filler);
+        REQUIRE(res->status == 200);
+        CHECK(res->body.find("exceeds 4KB") != std::string::npos);
+        const auto detail = h.audit_detail("echo.sql", "denied");
+        CHECK(detail == "reason=sql_too_large sql_bytes=" + std::to_string(decoded_bytes));
+        CHECK(detail.find("qqqq") == std::string::npos);
+    }
+    SECTION("not a SELECT") {
+        auto res = h.post("/api/dashboard/echo-execute", "sql=UPDATE+echo_config+SET+x%3D1");
+        REQUIRE(res->status == 200);
+        CHECK(res->body.find("Only SELECT") != std::string::npos);
+        CHECK(h.audit_detail("echo.sql", "denied") == "reason=not_select");
+    }
+    SECTION("a SELECT with a blocked keyword names the entry that matched") {
+        auto res = h.post("/api/dashboard/echo-execute", "sql=SELECT+drop+FROM+t");
+        REQUIRE(res->status == 200);
+        CHECK(res->body.find("forbidden keyword") != std::string::npos);
+        CHECK(h.audit_detail("echo.sql", "denied") == "reason=forbidden_keyword keyword=DROP");
+    }
+    SECTION("a supplied-but-empty scope") {
+        auto res = h.post("/api/dashboard/echo-execute", "sql=SELECT+1&scope=");
+        REQUIRE(res->status == 200);
+        CHECK(res->body.find("No target selected") != std::string::npos);
+        CHECK(h.audit_detail("echo.sql", "denied") == "reason=no_target");
+    }
+    CHECK(h.audits_for("echo.sql", "denied") == 1);
+    CHECK(h.calls.empty()); // nothing dispatched on any refusal
+    CHECK(h.audits_for("echo.sql", "success") == 0);
+}
+
+TEST_CASE("echo-execute: a denied row the store does not persist keeps the refusal and flags it",
+          "[pg][server][dashboard][echo-execute][audit]") {
+    FragmentHarness h;
+    h.audit_persists = [](const AuditRow&) { return false; };
+    auto res = h.post("/api/dashboard/echo-execute", "sql=DELETE+FROM+t");
+    REQUIRE(res->status == 200);
+    CHECK(res->body.find("Only SELECT") != std::string::npos); // same refusal body
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK(h.calls.empty());
+}
+
+TEST_CASE("echo-execute: an accepted query writes its success row and no denied row; gate refusals write none",
+          "[pg][server][dashboard][echo-execute][audit]") {
+    SECTION("accepted") {
+        FragmentHarness h;
+        auto res = h.post("/api/dashboard/echo-execute", "sql=SELECT+1");
+        REQUIRE(res->status == 200);
+        CHECK(h.audits_for("echo.sql", "success") == 1);
+        CHECK(h.audits_for("echo.sql", "denied") == 0);
+    }
+    SECTION("permission gate") {
+        FragmentHarness h;
+        h.perm_allow = false;
+        auto res = h.post("/api/dashboard/echo-execute", "sql=SELECT+1");
+        CHECK(res->status == 403);
+        CHECK(h.audits_for("echo.sql", "denied") == 0);
+    }
+    SECTION("cross-site write") {
+        FragmentHarness h;
+        auto res = h.post("/api/dashboard/echo-execute", "sql=SELECT+1", {{"Host", kHost}});
+        CHECK(res->status == 403);
+        CHECK(h.audits_for("echo.sql", "denied") == 0);
+    }
 }
 
 // ── (#3619) Audit-failure posture (ADR-0033 §9: no audit row, no mutation) ──

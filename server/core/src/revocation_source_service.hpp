@@ -45,6 +45,7 @@
 #include <cstdint>
 #include <expected>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -113,12 +114,18 @@ struct EgressEnv {
     };
     /// Resolve `host` within `budget`.
     std::function<Resolved(const std::string& host, std::chrono::milliseconds budget)> resolve;
+    /// Why the own-address set could not be determined. kBusy = a listen-host name lookup was
+    /// refused because the resolver pool was at its cap (counted `dns_busy`, as a refused URL host
+    /// lookup is); kUnavailable = any other cause (interface enumeration failed, or a listen host
+    /// did not resolve, ran out of time or failed; counted `own_addresses_unavailable`).
+    enum class OwnAddressesError { kUnavailable, kBusy };
     /// Every address the server is bound to or listening on, with a wildcard bind expanded to every
     /// address on every local interface; `budget` bounds any listen-host name lookups (the total, not
-    /// per host). nullopt = it could NOT be determined (interface
+    /// per host). An error = it could NOT be determined (interface
     /// enumeration failed, or a listen host did not resolve): registration then FAILS CLOSED with a
     /// retryable 503, never proceeds on a partial set.
-    std::function<std::optional<std::vector<std::string>>(std::chrono::milliseconds budget)>
+    std::function<std::expected<std::vector<std::string>, OwnAddressesError>(
+        std::chrono::milliseconds budget)>
         local_addresses;
     /// NAT64 prefixes (RFC 6052) the operator declared (`--oidc-nat64-prefix`): an IPv6 address
     /// inside one is classified, and compared with this server's own addresses, by the IPv4 address
@@ -134,11 +141,12 @@ struct EgressEnv {
 /// The production environment. `listen_specs` are the configured listener addresses
 /// ("host", "host:port" or "[v6]:port"; an empty spec is a disabled listener and is skipped);
 /// a wildcard host expands to every interface address. `listen_lookup` replaces the system
-/// resolver for a listen host that is a name (tests only; empty = the system resolver).
+/// resolver for a listen host that is a name and `listen_pool` replaces the process resolver pool
+/// it resolves in (both tests only; empty = the system resolver and the process pool).
 [[nodiscard]] EgressEnv make_system_egress_env(
     std::vector<std::string> listen_specs,
     std::vector<::yuzu::server::oidc::egress::Nat64Prefix> nat64_prefixes = {},
-    net::LookupFn listen_lookup = {});
+    net::LookupFn listen_lookup = {}, std::shared_ptr<net::ResolverPool> listen_pool = {});
 
 struct ListResult {
     std::vector<RevocationSourceRecord> sources;

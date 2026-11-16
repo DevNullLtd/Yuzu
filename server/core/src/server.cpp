@@ -166,6 +166,7 @@
 #include "quarantine_store.hpp"
 #include "quarantine_containment_reconciler.hpp" // #3425: reconnect re-application
 #include "refusal_log_throttle.hpp"
+#include "resolver_pool_metrics.hpp"
 #include "result_set_matcher.hpp"
 #include "result_set_members.hpp" // #4990
 #include "result_set_store.hpp"
@@ -260,6 +261,7 @@
 #include "software_catalog_rollup.hpp"
 #include "software_normalization_job.hpp"
 #include "software_normalization_pack.hpp"
+#include "software_read_routes.hpp"
 #include "software_title_dimension.hpp"
 #include "device_routes.hpp"
 #include "device_lens_routes.hpp"
@@ -714,13 +716,11 @@ public:
                           "registrations are refused until lookups return",
                           "gauge");
         metrics_.gauge("yuzu_server_revocation_source_resolver_in_flight").set(0.0);
-        metrics_.describe("yuzu_server_oidc_resolver_in_flight",
-                          "Name lookups outstanding in the resolver pool the OIDC egress path "
-                          "resolves hosts in, published every 15 s; a value at or above the "
-                          "pool's cap means new OIDC lookups fail at once until lookups return; "
-                          "fed only on POSIX builds, 0 elsewhere",
-                          "gauge");
-        metrics_.gauge("yuzu_server_oidc_resolver_in_flight").set(0.0);
+        // The OIDC resolver pool's gauges and lookup counter: described and pre-seeded together
+        // (resolver_pool_metrics.hpp). The pool is process-wide, so its counts now are the baseline.
+        oidc_resolver_publisher_.register_metrics(
+            metrics_, ::yuzu::server::oidc::oidc_resolver_pool_capacity(),
+            ::yuzu::server::oidc::oidc_resolver_outcome_counts());
         // Pre-seed every reason so absent() alerting and rate() read 0, not "no series".
         for (const char* reason :
              {"own_addresses_unavailable", "dns_unavailable", "dns_timeout", "dns_busy",
@@ -2150,7 +2150,10 @@ public:
             "class that requires one it can size; unsupported_encoding: a "
             "non-identity Content-Encoding, refused on every class; "
             "over_cap_post_read: the body was read in full - because it could not be "
-            "sized in advance - and turned out to be over the class's cap)",
+            "sized in advance - and turned out to be over the class's cap; "
+            "over_json_values_post_read: the body is within the class's size cap but holds "
+            "more structural JSON values than the class's budget, refused before any handler "
+            "parses it)",
             "counter");
         for (const auto& entry : yuzu::server::kBodyCapTable) {
             metrics_.counter("yuzu_body_cap_rejected_total",
@@ -2162,6 +2165,12 @@ public:
             metrics_.counter("yuzu_body_cap_rejected_total",
                              {{"path_class", std::string(entry.path_class)},
                               {"reason", "over_cap_post_read"}});
+            // Only a class that scans (`max_json_values` != off) can reach the value-budget refusal.
+            if (entry.max_json_values != yuzu::server::kJsonValuesOff) {
+                metrics_.counter("yuzu_body_cap_rejected_total",
+                                 {{"path_class", std::string(entry.path_class)},
+                                  {"reason", "over_json_values_post_read"}});
+            }
             if (entry.requires_measurable) {
                 metrics_.counter("yuzu_body_cap_rejected_total",
                                  {{"path_class", std::string(entry.path_class)},
@@ -2338,6 +2347,8 @@ public:
                                   "generation_refresh_failed", "generation_refresh_failed_within_bound",
                                   "rbac_enabled_non_canonical", "stale_beyond_accepted_bound"})
             metrics_.counter("yuzu_server_rbac_read_degrade_total", {{"reason", reason}});
+        // #5557: the service-scoped unrestricted-authority refusal on the two list gates.
+        authz::seed_service_scope_unrestricted_refusal_metrics(metrics_);
         // Last-Administrator guard refusals: A2's role-unassign guard
         // (RbacStore::unassign_role) and, since #4966, the account-lifecycle guard
         // (RbacStore::deactivate_account / set_local_role: a deactivation or a demotion
@@ -2507,7 +2518,9 @@ public:
                           "than a result, by reason "
                           "(store_not_open/pool_acquire_timeout/query_error, plus "
                           "sections_query_error for device_ci: the record read answered but its "
-                          "v2 hardware sections did not, and "
+                          "v2 hardware sections did not, "
+                          "keyed_read_budget for device_ci only: the Hardware list CI read ran "
+                          "out of its 20 second budget between chunks, and "
                           "admission_full for installed_software and ca_issued: a /crypto read "
                           "refused by its in-flight bound before any store call) and source "
                           "(installed_software/device_ci/software_licensing/product_registry/"
@@ -2734,6 +2747,20 @@ public:
                           "the first); alert when now - this exceeds twice the rollup cadence (7200 s), "
                           "guarded by > 0 (a failing refresh leaves the components totals aging or "
                           "building)",
+                          "gauge");
+        metrics_.describe("yuzu_software_fleet_snapshot_total",
+                          "Fleet facet-health and summary snapshot refresh outcomes, by outcome "
+                          "(success/error), on the catalogue rollup thread. Keep-last-good on "
+                          "error; both series are seeded at 0.",
+                          "counter");
+        metrics_.describe("yuzu_software_facet_devices",
+                          "Devices per installed-software collection facet and status (full, delta, "
+                          "constrained, timeout, oversize, not_collected, disabled), fleet-wide, "
+                          "refreshed with the catalogue rollup. No agent label.",
+                          "gauge");
+        metrics_.describe("yuzu_software_facet_duration_ms",
+                          "Collection duration of a facet over its measured devices, by quantile "
+                          "(0.5, 0.95), fleet-wide, refreshed with the catalogue rollup",
                           "gauge");
         metrics_.describe("yuzu_software_normalization_pass_total",
                           "Software-title normalisation ticks by outcome (success/error); hourly, "
@@ -8458,6 +8485,10 @@ public:
                 software_catalog_rollup_ = std::make_unique<SoftwareCatalogRollup>(
                     *software_inventory_store_,
                     std::chrono::seconds{kCatalogueRefreshIntervalSeconds}, &metrics_);
+                // SAM-33: the rollup thread publishes the fleet facet-health/summary snapshot
+                // into this holder, a plain member that outlives the thread (stop() resets the
+                // rollup first) and the routes that read it.
+                software_catalog_rollup_->set_snapshot_holder(&software_fleet_snapshot_);
                 software_catalog_rollup_->start();
             }
         }
@@ -10035,9 +10066,12 @@ public:
                 // from a request path), so the in-flight gauge cannot sit stale after a lookup ends.
                 metrics_.gauge("yuzu_server_revocation_source_resolver_in_flight")
                     .set(static_cast<double>(::yuzu::server::net::process_resolver_in_flight()));
-                // The OIDC egress resolver pool, from the same tick.
-                metrics_.gauge("yuzu_server_oidc_resolver_in_flight")
-                    .set(static_cast<double>(::yuzu::server::oidc::oidc_resolver_in_flight()));
+                // The OIDC egress resolver pool, from the same tick: the two gauges, and the change
+                // in each lookup outcome count since the last tick.
+                oidc_resolver_publisher_.publish(
+                    metrics_, ::yuzu::server::oidc::oidc_resolver_in_flight(),
+                    ::yuzu::server::oidc::oidc_resolver_pool_capacity(),
+                    ::yuzu::server::oidc::oidc_resolver_outcome_counts());
                 // Webhook and offload delivery pool backlog, from the same tick. A store that is
                 // not open reads 0 (never a stale value).
                 {
@@ -11904,7 +11938,8 @@ public:
         // handler, but it matches the offline-store contract and is safe if the store
         // ever gains a pool-touching dtor).
         // Stop the catalogue rollup thread (borrows software_inventory_store_ + the pool)
-        // BEFORE the store/pool tear down — the dtor signals stop + joins. Idempotent.
+        // BEFORE the store/pool tear down — the dtor signals stop + joins. Idempotent. It also
+        // publishes into software_fleet_snapshot_, a member that outlives it.
         software_catalog_rollup_.reset();
         // SAM.4 normalisation job + its owner borrow software_inventory_store_,
         // product_registry_store_ and the pool - join/drop them before any of the three.
@@ -17841,9 +17876,10 @@ private:
                              .nvd_sync = nvd_sync_.get(),
                          });
 
-        // UP-6: ONE referrer lookup and ONE advisory pack lookup, built here (their stores are
-        // members constructed in the ctor, long before this) and handed to every consumer: the v1
-        // DELETE twin and MCP delete_definition, so neither can disagree about what blocks a
+        // UP-6 / M2: ONE referrer lookup and ONE advisory pack lookup, built here (their stores
+        // are members constructed in the ctor, long before this) and handed to every consumer:
+        // the legacy DELETE /api/instructions/{id}, the pack uninstall (WorkflowRoutes), the v1
+        // DELETE twin and MCP delete_definition, so none of them can disagree about what blocks a
         // delete. The lookups hold raw store pointers, the same lifetime the route lambdas'
         // other store pointers already rely on.
         DefinitionReferrersFn definition_referrers_fn = make_definition_referrers_fn(
@@ -17861,6 +17897,8 @@ private:
                              .audit_fn = audit_fn,
                              .emit_event_fn = emit_event_fn,
                              .store = instruction_store_.get(),
+                             .referrers_fn = definition_referrers_fn,
+                             .pack_advisory_fn = definition_pack_advisory_fn,
                              .csrf_trusted_origins = cfg_.csrf_trusted_origins,
                          });
 
@@ -18844,10 +18882,13 @@ private:
         // reconnected. Same shared dispatch lambda as every other
         // background engine. The shared protective predicate
         // (yuzu::protective::is_protective_action, built on
-        // is_quarantine_control_plugin) lets the quarantine plugin's own
-        // actions through every gate unmodified: the #881 containment gate, the
+        // is_quarantine_control_plugin and is_firewall_control_plugin) lets
+        // the quarantine plugin's own actions (and the firewall plugin's four
+        // containment actions) through every enablement gate unmodified: the
         // per-plugin/action kill switch (incl. a degraded store), the per-OS
-        // withhold and its presence read, and the plugin-presence filter.
+        // withhold and its presence read, and the plugin-presence filter. The
+        // #881 containment gate's own exemption names the quarantine plugin's
+        // four only (the firewall four follow in #7437).
         // Joined BEFORE the stores in stop().
         quarantine_reconciler_ =
             std::make_unique<QuarantineContainmentReconciler>(QuarantineContainmentReconciler::Deps{
@@ -20531,49 +20572,27 @@ private:
                 r.last_seen_ms = r.online ? now_ms : e.last_heartbeat_ms;
                 out.push_back(std::move(r));
             }
-            // Device-CI enrichment (PR2): one list_device_ci(0) read — `0` means "uncapped,
-            // clamped to DeviceInventoryStore's kListRowCap (100k)" per that store's own
-            // limit-clamp contract, not "zero rows" — (symmetric with the capped
-            // offline roster read above, #5712), joined by agent_id via the pure
-            // attach_device_ci (inventory_ci_join.cpp). `out` is the
-            // UNFILTERED roster — confinement is HardwareRoutes' `scoped_roster` on the
-            // FleetReadGate scope, downstream of this join; attach_device_ci only ever
-            // looks up by an agent_id already in `out`, never re-deriving
-            // visibility. A CI-join degrade (nullopt) leaves CI columns
-            // blank; the roster read itself is typed and handled by apply_roster_read above.
-            // KNOWN FOLLOW-UP (#1783 — gov Gate 3 performance + architect + Gate 5 chaos
-            // review): this reads the WHOLE fleet's CI on every render regardless of how
-            // few devices are visible, unlike the Software tab's hourly rollup
-            // (software_catalog_rollup.cpp) which exists specifically to avoid this
-            // read-cadence-vs-write-cadence mismatch for daily-synced data. Deferred rather
-            // than fixed here to keep this PR scoped to dashboard-read enrichment.
-            //
-            // `result.ci_degraded` (#1785 review HIGH-1) tells the route's UI banner and
-            // the REST `ci_degraded` field whether the CI columns above are genuinely
-            // enriched or blank because this join failed/was unwired (the audit row is
-            // emitted regardless) — an unwired store is treated the same as a live failure
-            // (mirrors the Hardware CI record's CiDetailFn contract).
-            if (device_inventory_store_) {
-                auto ci_list = device_inventory_store_->list_device_ci(0);
-                if (ci_list) {
-                    std::unordered_map<std::string, DeviceCiRecord> ci_by_agent;
-                    ci_by_agent.reserve(ci_list->size());
-                    for (auto& rec : *ci_list)
-                        // Safe: pair's members initialize in declaration order (`first`
-                        // before `second`), so the key copies from `rec.agent_id` before
-                        // `std::move(rec)` constructs `second` and leaves `rec` (incl. its
-                        // own .agent_id member) moved-from. Don't read the map VALUE's own
-                        // .agent_id after this, though — it's redundant with (and no longer
-                        // matches) the key; attach_device_ci never does (gov Gate 3
-                        // cpp-expert review).
-                        ci_by_agent.emplace(rec.agent_id, std::move(rec));
-                    attach_device_ci(out, ci_by_agent);
-                } else {
-                    result.ci_degraded = true;
-                }
-            } else {
-                result.ci_degraded = true;
-            }
+            // Device-CI enrichment: ONE read keyed by the roster's own agent ids (#7549), joined by
+            // agent_id via the pure attach_device_ci (inventory_ci_join.cpp). It replaced a
+            // whole-table read ordered by hostname and capped at 100,000 rows, which silently gave
+            // every device past the cut a blank CI. The keyed read is bounded by the roster, which
+            // is itself capped (#5712), so it cannot drop a listed device. It must cover the whole
+            // roster, not just a page: the search haystack, the model/serial sorts and the
+            // CI-coverage KPI all read the CI columns before any paging happens.
+            // `out` is the UNFILTERED roster: confinement is HardwareRoutes' `scoped_roster` on
+            // the FleetReadGate scope, downstream of this join, and the join only ever looks up
+            // an agent_id already in `out`.
+            // `result.ci_degraded` (#1785 review HIGH-1) tells the route's UI banner and the REST
+            // `ci_degraded` field whether the CI columns are genuinely enriched or blank because
+            // this read failed, ran out of its budget or was never wired (the audit row is emitted
+            // regardless) - mirrors the Hardware CI record's CiDetailFn contract.
+            // KNOWN FOLLOW-UP (#1783): the read is still up to roster-size rows per render, unlike
+            // the Software tab's hourly rollup (software_catalog_rollup.cpp).
+            apply_ci_read(result, device_inventory_store_
+                                      ? CiKeyedReadFn{[this](const std::vector<std::string>& ids) {
+                                            return device_inventory_store_->list_device_ci_for(ids);
+                                        }}
+                                      : CiKeyedReadFn{});
             // Round-3 Devices-page merge: agent version/arch (session-sourced,
             // online rows only — an offline row's version/arch come from the
             // endpoint_state v2 columns via the CI-attach step above, not here),
@@ -20705,6 +20724,20 @@ private:
                 out.emplace(std::move(e.agent_id), std::move(e.hostname));
             return out;
         };
+        // agent_id -> OS string from the same 30-day roster, for the Find software panel's OS
+        // column. ponytail: a second roster read per page; fold it into hw_hostnames_fn's read if
+        // it shows.
+        auto hw_host_os_fn = [this]() -> std::unordered_map<std::string, std::string> {
+            std::unordered_map<std::string, std::string> out;
+            if (!offline_endpoint_store_)
+                return out;
+            auto roster = offline_endpoint_store_->query_stale_within(kHardwareRosterWindow)
+                              .value_or(OfflineRoster{});
+            for (auto& e : roster.rows)
+                if (!e.os.empty())
+                    out.emplace(std::move(e.agent_id), std::move(e.os));
+            return out;
+        };
         inventory_routes_ = std::make_unique<InventoryRoutes>();
         inventory_routes_->register_routes(
             *web_server_,
@@ -20773,7 +20806,50 @@ private:
                     return software_inventory_store_->source_last_seen_bulk("installed_software",
                                                                             ids);
                 },
-                .audit_fn = audit_fn});
+                .audit_fn = audit_fn,
+                // Find software panel: the REST lookups' own store reads (rest_api_v1.cpp
+                // lookup_totals_reads / resolve_range), so the panel and the REST answer agree.
+                .components_fn = [this](const SoftwareComponentQuery& q)
+                    -> std::optional<std::vector<SoftwareComponentRow>> {
+                    if (!software_inventory_store_)
+                        return std::nullopt;
+                    return software_inventory_store_->query_components(q);
+                },
+                .install_versions_fn = [this](const std::string& name,
+                                              const std::optional<std::vector<std::string>>& ids)
+                    -> std::optional<std::vector<std::string>> {
+                    if (!software_inventory_store_)
+                        return std::nullopt;
+                    return software_inventory_store_->installed_software_distinct_versions(name, ids);
+                },
+                .component_versions_fn = [this](const std::string& kind, const std::string& name,
+                                                const std::optional<std::vector<std::string>>& ids)
+                    -> std::optional<std::vector<std::string>> {
+                    if (!software_inventory_store_)
+                        return std::nullopt;
+                    return software_inventory_store_->component_versions(kind, name, ids);
+                },
+                .totals_reads = [this]() {
+                    software_list::TotalsReads io;
+                    if (!software_inventory_store_)
+                        return io; // unwired closures: the route reads it as a degrade
+                    auto* store = software_inventory_store_.get();
+                    io.catalog_meta = [store] { return store->catalog_rollup_meta(); };
+                    io.component_meta = [store] { return store->component_rollup_meta(); };
+                    io.title_totals = [store](std::string_view name) {
+                        return store->catalog_title_totals(name);
+                    };
+                    io.version_set_totals = [store](std::string_view name,
+                                                    const std::vector<std::string>& vs) {
+                        return store->installed_software_version_set_totals(name, vs);
+                    };
+                    io.component_totals = [store](std::string_view kind, std::string_view name,
+                                                  const std::optional<std::vector<std::string>>& vs) {
+                        return store->component_totals(kind, name, vs);
+                    };
+                    return io;
+                }(),
+                .host_os_fn = hw_host_os_fn});
 
         // CryptoRoutes — /crypto, /fragments/crypto/*, /api/v1/crypto/* (crypto-library
         // presence from the installed_software inventory, the Yuzu-issued certificate widgets
@@ -21035,6 +21111,40 @@ private:
                 });
         }
 
+        // Installed-software v3 reads REST (SAM-33): hosts, host detail, change feed, summary,
+        // plugin health. Registered here, ahead of rest_api_v1_->register_routes, for the same
+        // reason as the collection-settings routes above: the generic
+        // GET /api/v1/inventory/{a}/{b} would take the two-segment paths. fleet_read_fn is the
+        // sole gate. The routes borrow software_inventory_store_ and, through snapshot_fn,
+        // software_fleet_snapshot_ (a member, declared ahead of the rollup thread that writes it);
+        // stop() joins the web thread ahead of resetting the store, and the class holds no state
+        // of its own.
+        {
+            HttplibRouteSink software_read_sink{*web_server_};
+            SoftwareReadRoutes{}.register_routes(
+                software_read_sink,
+                SoftwareReadRoutes::Deps{
+                    .fleet_read_fn = fleet_read_fn,
+                    .audit_fn = audit_fn,
+                    // The hosts `q` search decides from the roster, so unlike the display-only
+                    // hw_hostnames_fn a failed read is reported (the route answers 503), never an
+                    // empty roster that would read as "no such device", and a roster cut at the
+                    // cap keeps its `truncated` flag (the route serves it flagged, as the hardware
+                    // list does). The same reader names the devices on every page, where a failed
+                    // read leaves the names null.
+                    .roster_fn = [this]() -> std::optional<OfflineRoster> {
+                        if (!offline_endpoint_store_)
+                            return std::nullopt;
+                        auto roster = offline_endpoint_store_->query_stale_within(kHardwareRosterWindow);
+                        if (!roster)
+                            return std::nullopt;
+                        return std::move(*roster);
+                    },
+                    .snapshot_fn = [this] { return software_fleet_snapshot_.get(); },
+                    .store = software_inventory_store_.get(),
+                });
+        }
+
         // DashboardSummaryRoutes — /fragments/dashboard/summary (readout, needs
         // attention, estate state). Every figure arrives through a closure over an
         // existing typed read; the gates are the SAME fleet_read_fn / perm_fn the
@@ -21094,7 +21204,8 @@ private:
                     if (!execution_tracker_)
                         return std::nullopt;
                     auto rows = execution_tracker_->query_executions_checked(
-                        {.status = "failed", .limit = static_cast<int>(home::kFailedReadCap)});
+                        {.status = "failed", .limit = static_cast<int>(home::kFailedReadCap)},
+                        std::nullopt);
                     if (!rows)
                         return std::nullopt;
                     std::vector<home::FailedRow> out;
@@ -21585,6 +21696,17 @@ private:
         // pre-existing `/fragments/echo/...` HTML routes stay on perm_fn_ this
         // round — see the recorded-exception comment at their registration.
         echo_tree_routes_->set_fleet_read_fn(fleet_read_fn);
+        echo_tree_routes_->set_metrics(&metrics_); // yuzu_echo_sources_push_total
+        // The capture-sources push stamps its rows from the session it resolved (never re-resolved).
+        echo_tree_routes_->set_audit_as_session_fn(auth_routes_->audit_as_session_fn());
+        // A refused push dispatch answers 403 (permission-class reasons) or 500 (catalogue fault),
+        // the mapping respond_echo_dispatch_denied uses; injected so the route TU stays store-free.
+        echo_tree_routes_->set_denial_status_fn([](const ConfinedDispatchOutcome& o) {
+            const auto cls = describe_dispatch_denial(o.denied->reason, "echo", "configure",
+                                                      *o.denied, DenialSurface::kRest)
+                                 .cls;
+            return cls == DispatchDenialClass::kPermissionDenied ? 403 : 500;
+        });
         // #4143 review fix — same unfiltered source list_agents' DeviceApi and
         // GET /api/v1/devices (#4033) read from; gate.scope (fleet_read_fn_
         // above) is the SOLE filter now, not an intersection with devices_fn's
@@ -21619,9 +21741,10 @@ private:
         // request, so setting it afterwards would race the request threads.
         dashboard_routes_->set_csrf_trusted_origins(cfg_.csrf_trusted_origins);
         // ADR-0033 section 9: every DashboardRoutes mutation (each console send,
-        // group-from-results, Echo re-enable and purge; not EchoTreeRoutes' capture-sources push)
-        // writes its `attempted` row through this persist-reporting sink BEFORE it acts (#3619;
-        // unwired = those mutations refuse with 503).
+        // group-from-results, Echo re-enable and purge) writes its `attempted` row through this
+        // persist-reporting sink BEFORE it acts (#3619; unwired = those mutations refuse with
+        // 503). EchoTreeRoutes' capture-sources push does the same, but writes through the
+        // session-bound writer wired above and refuses (503) when that is unset.
         dashboard_routes_->set_persist_audit_fn(audit_fn);
         // #1712 / #3290 Phase 2 — same conversion lambda already wired into
         // McpServer's query_installed_software (fleet_read_fn, defined
@@ -21834,6 +21957,7 @@ private:
             emit_event(event_type, req);
         };
         wf_deps.emit_event_fn = emit_event_fn; // the v1 execute twin's workflow.executed
+        wf_deps.referrers_fn = definition_referrers_fn; // M2: the pack uninstall's referrer guard
         wf_deps.scope_fn =
             [this](const std::string& expression,
                    const std::string& principal) -> std::pair<std::size_t, std::size_t> {
@@ -23590,8 +23714,8 @@ private:
         // instruction-set authoring routes. Same store, same permission gate and same audit sink
         // as the legacy cluster above; audit-first on every write.
         {
-            // UP-6: the SAME referrer lookup built above is shared here and with the MCP
-            // delete_definition (wired into mcp_server_ below).
+            // UP-6: the SAME referrer lookup built before the legacy routes (see there) is shared
+            // here and with the MCP delete_definition (wired into mcp_server_ below).
             yuzu::server::instruction_authoring::RouteDeps authoring_deps;
             authoring_deps.perm_fn = [this](const httplib::Request& req, httplib::Response& res,
                                             const std::string& securable_type,
@@ -24350,10 +24474,12 @@ private:
     /// other one. They were missed by the original sweep because they do not
     /// route through `command_dispatch_fn` — they call the registry directly —
     /// and their bare global `require_permission("Execution","Execute")` gate
-    /// admits a SERVICE-SCOPED token on its `ITServiceOwner` role grant with no
-    /// target check, so before this they reached the entire fleet: verbatim the
+    /// once admitted a SERVICE-SCOPED token on its `ITServiceOwner` role grant
+    /// with no target check, so they reached the entire fleet: verbatim the
     /// escape #1788 exists to close, on three routes the changelog claimed were
-    /// already covered.
+    /// already covered. The service-scoped branch of `require_permission` now
+    /// refuses that pair outright (it is not on the seeded-empty
+    /// `kServiceScopeGlobalSafe`); every admitted caller is narrowed below.
     ///
     /// An omitted target means the fleet (#2500), so this is the Broadcast arm —
     /// narrowed to the caller's visible set, exactly as a named `__all__` is.
@@ -24605,6 +24731,11 @@ private:
     auth::AuthManager& auth_mgr_;
     auth::AutoApproveEngine auto_approve_;
     yuzu::MetricsRegistry metrics_;
+    /// The OIDC resolver pool's publisher. Declared after `metrics_` and used only by the 15 s
+    /// tick (`health_recompute_thread_`, which `stop()` joins first) once the constructor has
+    /// registered the metrics; nothing else reads or writes it.
+    yuzu::server::ResolverPoolPublisher oidc_resolver_publisher_{
+        yuzu::server::kOidcResolverMetrics};
     /// PR1.9c: the composed classification ruleset `build_classified_command`
     /// consults on every dispatch — core (this package) plus the six
     /// per-group plugin catalogues (p7/p10-p13). A STATIC ruleset, constructed
@@ -25302,6 +25433,9 @@ private:
     // Typed software-inventory projection — born-on-Postgres (ADR-0016).
     // Declared after pg_pool_ so it destructs before the pool.
     std::unique_ptr<SoftwareInventoryStore> software_inventory_store_;
+    // The rollup thread's publish target for the SAM-33 fleet snapshot: declared BEFORE the
+    // rollup so it is destroyed after it (the thread is joined in stop() and by the rollup's dtor).
+    SoftwareFleetSnapshotHolder software_fleet_snapshot_;
     std::unique_ptr<SoftwareCatalogRollup> software_catalog_rollup_;
     // /crypto slice 1 (the CryptoApi seam over software_inventory_store_). crypto_api_ BORROWS
     // the store and crypto_device_api_ (hostnames for the drill), and crypto_routes_ /

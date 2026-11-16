@@ -103,6 +103,7 @@ Source: "{#BuildDir}\agents\plugins\peripherals\peripherals.dll"; DestDir: "{app
 Source: "{#BuildDir}\agents\plugins\browser_policy\browser_policy.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\pkg_inventory\pkg_inventory.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\middleware\middleware.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\component_inventory\component_inventory.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\virtualization\virtualization.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
 
 ; --- Plugins: network ---

@@ -1,4 +1,4 @@
-captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-15 · interactive user (elevated) · leg-hash 8ef7b004fc8a
+captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-15 · interactive user (elevated) · leg-hash a0eaca353541
 == action=state
 profile|Domain|enabled
 profile|Private|enabled
@@ -110,4 +110,16 @@ rule|@{Microsoft.StartExperiencesApp_1.380.2.0_x64__8wekyb3d8bbwe?ms-resource://
 ruleset|100
 truncated|true
 [result_status] UNDECLARED / UNKNOWN / 
+
+== action=quarantine
+[not captured] Destructive/Reversible: not executed on a live host (it contains the host: every rule outside the quarantine group is disabled or blocked until release)
+
+== action=release
+[not captured] Mutating/Reversible: not executed on a live host (lifts a containment; needs one in force)
+
+== action=quarantine_status
+[not captured] agent-context: the containment record lives in the plugin KV store, which plugin-capture does not provide
+
+== action=quarantine_allow
+[not captured] Mutating/Reversible: not executed on a live host (changes the allow set of a containment in force)
 

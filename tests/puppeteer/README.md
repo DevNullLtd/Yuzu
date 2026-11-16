@@ -91,7 +91,7 @@ stack and runs only in `/test` Phase 5.
    `app_shell.cpp` means editing that list in the same change.
 2. Overflow: submit controls on the plugin upload form, the add-user dialog and the new-token
    dialog stay inside their form or dialog and the viewport at 1400x900 and 1024x768.
-3. Scenarios, eight in all. Five force their own precondition (writes are answered by a request
+3. Scenarios, nine in all. Five force their own precondition (writes are answered by a request
    stub, so none reaches the server): upload rollout percentage and a failing upload, add user,
    the Ctrl+K guard on a focused field, the PKI audit-failed banner and load-error text, and the
    Engine Principals audit-failed notice. The sixth is the DEX Apps tab: a live half (the tab opens
@@ -101,7 +101,12 @@ stack and runs only in `/test` Phase 5.
    every run whatever the stack holds). The seventh, `dex-pane-sync`, holds the Apps response in the
    browser, opens Overview, asserts the page cancelled the held request, then releases it and asserts
    it replaced nothing. The eighth, `dex-keyboard`, operates the Apps tab, a window chip and an
-   application link with focus and Enter only.
+   application link with focus and Enter only. The ninth, `find-software`, is the Find software
+   panel on `/software`: a live half (an Applications search, Copy REST call against a clipboard
+   stub, and the Java chip and back, each answering with a result or a real zero, never the
+   "Inventory store unavailable" banner) and a stub half (a first page and its continuation are
+   served through GET stubs, so Load more and where focus lands are exercised on every run whatever
+   the stack holds).
 
 It does not check: WebGL scenes (the Fleet and Host maps), non-administrator roles, a write that
 really reaches the server, or any route the shell does not link to. The nav list it compares

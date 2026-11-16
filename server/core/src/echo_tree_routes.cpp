@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <format>
 #include <functional>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -65,6 +66,27 @@ void note(httplib::Response& res, const std::string& text) {
 // empty out-of-band replacement clears them; every answer that is not a finished tree for the
 // device carries it, so one host's tables never sit under another host's view.
 const char* const kDevnetReset = "<div id=\"echo-devnet\" hx-swap-oob=\"true\"></div>";
+
+// The capture-sources page pushes with htmx.ajax(swap:'none'), so a response body is never
+// shown: the HX-Trigger toast is the only signal the operator gets, on every answer. @p message
+// is always static text (or integers), never request data; the JSON library escapes it.
+void push_toast(httplib::Response& res, const std::string& message, const char* level) {
+    const nlohmann::ordered_json trigger = {{"showToast", {{"message", message}, {"level", level}}}};
+    res.set_header("HX-Trigger", trigger.dump(-1, ' ', true,
+                                              nlohmann::ordered_json::error_handler_t::replace));
+}
+
+// A note plus the matching error toast (the push's refusals before any dispatch).
+void push_refusal(httplib::Response& res, const std::string& html, const std::string& toast) {
+    note(res, html);
+    push_toast(res, toast, "error");
+}
+
+// Mirrors kEchoAuditRefusal in dashboard_routes.cpp: the sentence for a mutation refused because
+// its `attempted` audit row could not be stored.
+constexpr const char* kPushAuditRefusal =
+    "The audit record could not be stored, so nothing was sent. Retry once the audit store "
+    "recovers.";
 
 // A note for the tree frame (`/run`, `/result`): the note plus the panel reset.
 void tree_note(httplib::Response& res, const std::string& text) {
@@ -537,6 +559,22 @@ std::optional<std::string> EchoTreeRoutes::cache_render_detail(const std::string
         return a.connect_count > b.connect_count;
     });
     return render_echo_proc_detail(node, conns);
+}
+
+void EchoTreeRoutes::set_metrics(yuzu::MetricsRegistry* m) {
+    metrics_ = m;
+    if (!metrics_)
+        return;
+    metrics_->describe("yuzu_echo_sources_push_total",
+                       "Operator capture-sources pushes by result (pushed / none_applied / "
+                       "audit_unavailable / permission_revoked / dispatch_denied / "
+                       "dispatch_exception).",
+                       "counter");
+    // Bounded-label counter: seed every result at 0 so the first refusal is an increase()
+    // an alert can see, not the birth of a series (observability-conventions.md, #5177).
+    for (const char* result : {"pushed", "none_applied", "audit_unavailable", "permission_revoked",
+                               "dispatch_denied", "dispatch_exception"})
+        metrics_->counter("yuzu_echo_sources_push_total", {{"result", result}}).increment(0);
 }
 
 void EchoTreeRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
@@ -1232,8 +1270,14 @@ void EchoTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn
     });
 
     // Push: apply staged enable/disable changes. POST body: device + changes
-    // ("src=on,src2=off"). One `echo configure` dispatch per source, each audited
-    // separately (echo.sources.configure) — DNS enable is its own audit row.
+    // ("src=on,src2=off"). Audit-first (ADR-0033 section 9, "no audit row, no mutation"): ONE
+    // `attempted` row listing every validated change is stored before anything is dispatched, and
+    // if it cannot be stored the push is refused (503 + Sec-Audit-Failed) with zero dispatches.
+    // Then one `echo configure` dispatch per source, each with its own outcome row
+    // (echo.sources.configure) — DNS enable is its own audit row. The permissions are decided and
+    // the caller derived again before EACH dispatch (each outcome row is a wait in which a grant
+    // or the session can be withdrawn), and a refusal stops the rest of the batch; so does a
+    // dispatch the chokepoint refuses or one that throws, each with a failure row.
     sink.Post("/fragments/echo/capture-sources/push", [this, can_execute](const httplib::Request& req,
                                                                          httplib::Response& res) {
         auto session = auth_fn_(req, res);
@@ -1242,19 +1286,27 @@ void EchoTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn
             res.set_content("auth required", "text/plain");
             return;
         }
+        const auto count = [this](const char* result) {
+            if (metrics_)
+                metrics_->counter("yuzu_echo_sources_push_total", {{"result", result}}).increment();
+        };
         const std::string device = get_param(req, "device");
         if (device.empty()) {
-            note(res, "No device selected.");
+            push_refusal(res, "No device selected.", "No device selected.");
             return;
         }
-        if (!scoped_perm_fn_(req, res, "Infrastructure", "Read", device))
+        if (!scoped_perm_fn_(req, res, "Infrastructure", "Read", device)) {
+            push_toast(res, "The push was refused by the permission check.", "error");
             return;
+        }
         if (!can_execute(req, device)) {
-            note(res, "Pushing capture-source changes needs the <b>Execute</b> permission.");
+            push_refusal(res, "Pushing capture-source changes needs the <b>Execute</b> permission.",
+                         "Pushing capture-source changes needs the Execute permission.");
             return;
         }
         if (!dispatch_fn_) {
-            note(res, "Live device dispatch is unavailable on this server.");
+            push_refusal(res, "Live device dispatch is unavailable on this server.",
+                         "Live device dispatch is unavailable on this server.");
             return;
         }
         // Allowlist of source names — never interpolate an arbitrary token into the
@@ -1263,15 +1315,9 @@ void EchoTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn
             "process", "tcp", "service", "user",   "perf",
             "procperf", "netqual", "module", "arp", "dns", "registry"};
         const std::string changes = get_param(req, "changes");
-        // Review finding (#3133): this route gates only Infrastructure:Read above,
-        // but `echo.configure` is classified Infrastructure:Write — the route relied
-        // on the chokepoint to enforce Write, and the chokepoint only does that when
-        // handed a real, non-system caller. Deriving it here (not a bare Read-only
-        // gate) is the complete fix: an operator who lacks Write is refused by
-        // build_classified_command exactly like every other Write-classified action.
-        const auto caller = caller_fn_(req);
-        int applied = 0;
-        int refused_or_unreached = 0;
+        // Stage the valid changes first, one slot per known source (a repeated source keeps its
+        // last value), so the `attempted` row and the dispatch count are bounded at kKnown.size().
+        std::array<std::optional<bool>, kKnown.size()> staged;
         std::size_t pos = 0;
         while (pos < changes.size()) {
             const auto comma = changes.find(',', pos);
@@ -1283,46 +1329,173 @@ void EchoTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn
                 continue;
             const std::string src = tok.substr(0, eq);
             const std::string val = tok.substr(eq + 1);
-            if (std::find(kKnown.begin(), kKnown.end(), src) == kKnown.end())
+            const auto known = std::find(kKnown.begin(), kKnown.end(), src);
+            if (known == kKnown.end())
                 continue; // reject unknown source name
             if (val != "on" && val != "off")
                 continue;
-            const std::string enabled = (val == "on") ? "true" : "false";
-            const auto outcome = dispatch_fn_("echo", "configure", {device}, "",
-                                              {{src + "_enabled", enabled}}, caller);
-            const auto& cmd = outcome.command_id;
+            staged[static_cast<std::size_t>(known - kKnown.begin())] = (val == "on");
+        }
+        // The staged `<source>_enabled=<bool>` pairs from slot @p from on, in kKnown order.
+        const auto pairs_from = [&staged](std::size_t from) {
+            std::string out;
+            for (std::size_t i = from; i < kKnown.size(); ++i) {
+                if (!staged[i])
+                    continue;
+                if (!out.empty())
+                    out += ' ';
+                out += std::format("{}_enabled={}", kKnown[i], *staged[i] ? "true" : "false");
+            }
+            return out;
+        };
+        const std::string pairs = pairs_from(0);
+        const int total = static_cast<int>(
+            std::count_if(staged.begin(), staged.end(), [](const auto& slot) { return slot.has_value(); }));
+        if (total == 0) {
+            push_toast(res, "No valid capture-source changes to push.", "error");
+            res.set_content("<span data-applied=\"0\">0 change(s) pushed</span>",
+                            "text/html; charset=utf-8");
+            return;
+        }
+
+        // Every row of this push is stamped from a session this handler resolved, never from one
+        // the sink re-resolves at write time: that leaves the actor blank on exactly the rows
+        // that evidence a withdrawn session. `actor` is the session resolved at entry, rebound
+        // before each source while the request still resolves, so an outcome row names the
+        // principal its source was decided for. An unset writer leaves `audit` empty and the
+        // `attempted` row then refuses: an unwired sink is a refusal here, never audit-off (the
+        // kernel alone would read an empty sink as "audit disabled, proceed").
+        auth::Session actor = *session;
+        std::string actor_role = auth::role_to_string(auth::effective_role(actor));
+        AuditFn audit;
+        if (audit_as_session_fn_)
+            audit = [this, &actor, &actor_role](
+                        const httplib::Request& rq, const std::string& action,
+                        const std::string& result, const std::string& target_type,
+                        const std::string& target_id, const std::string& text) {
+                return audit_as_session_fn_(rq, actor, actor_role, action, result, target_type,
+                                            target_id, text);
+            };
+
+        // The `attempted` row, after every refusal above and before any dispatch.
+        if (!(audit && detail::try_persist_audit(audit, req, "echo.sources.configure", "attempted",
+                                                 "Agent", device, pairs))) {
+            if (!audit) // a wiring fault, not an audit-store outage: say which
+                spdlog::error("capture-sources push: no session-bound audit writer wired");
+            res.status = 503;
+            res.set_header("Sec-Audit-Failed", "true");
+            push_toast(res, kPushAuditRefusal, "error");
+            res.set_content(std::string("<div class=\"echo-tree-note\" data-reason=\"audit_unavailable\">") +
+                                kPushAuditRefusal + "</div>",
+                            "text/html; charset=utf-8");
+            count("audit_unavailable");
+            return;
+        }
+        int applied = 0;
+        for (std::size_t i = 0; i < kKnown.size(); ++i) {
+            if (!staged[i])
+                continue;
+            {
+                // Attribution only: the gates below stay the authority on whether this source runs.
+                httplib::Response unused;
+                if (auto again = auth_fn_(req, unused)) {
+                    actor = std::move(*again);
+                    actor_role = auth::role_to_string(auth::effective_role(actor));
+                }
+            }
+            // The hard gate writes its own refusal (a 403, or the 401 of its require_auth once the
+            // session is gone); the soft one answers with the Execute note.
+            const bool read_ok = scoped_perm_fn_(req, res, "Infrastructure", "Read", device);
+            const bool exec_ok = read_ok && can_execute(req, device);
+            if (!exec_ok) {
+                (void)detail::emit_behavioral_audit(
+                    audit, req, res, "echo.sources.configure", "failure", "Agent", device,
+                    std::format("permission_revoked sent={} {}", applied, pairs_from(i)));
+                if (read_ok)
+                    note(res, std::format("Pushing capture-source changes needs the <b>Execute</b> "
+                                          "permission. <span data-applied=\"{0}\">{0} change(s) "
+                                          "pushed</span>",
+                                          applied));
+                push_toast(res,
+                           std::format("Permission was withdrawn during the push: {} of {} "
+                                       "change(s) were sent, the rest were not.",
+                                       applied, total),
+                           "error");
+                count("permission_revoked");
+                return;
+            }
+            const std::string src{kKnown[i]};
+            const std::string enabled = *staged[i] ? "true" : "false";
+            // Built before the dispatch, so a throw cannot leave the push without its failure row.
+            const std::string unsent = std::format("sent={} {}", applied, pairs_from(i));
+            // #3133: the route itself decides only Read and Execute (above, for this source), but
+            // `echo.configure` is classified Infrastructure:Write, and the chokepoint enforces
+            // that only when handed a real, non-system caller. So the caller is derived from the
+            // request here, again for each source: an operator who lacks Write is refused by
+            // build_classified_command exactly like every other Write-classified action.
+            ConfinedDispatchOutcome outcome;
+            bool threw = false;
+            try {
+                outcome = dispatch_fn_("echo", "configure", {device}, "",
+                                       {{src + "_enabled", enabled}}, caller_fn_(req));
+            } catch (const std::exception& e) {
+                spdlog::error("capture-sources push: the {} dispatch threw: {}", src, e.what());
+                threw = true;
+            } catch (...) {
+                spdlog::error("capture-sources push: the {} dispatch threw (not a std exception)",
+                              src);
+                threw = true;
+            }
+            if (threw) {
+                // Whether an agent received this source's change is unknown: its pair leads the
+                // ones not dispatched, and nothing is retried.
+                (void)detail::emit_behavioral_audit(audit, req, res, "echo.sources.configure",
+                                                    "failure", "Agent", device,
+                                                    "dispatch_exception " + unsent);
+                res.status = 500;
+                const std::string message =
+                    std::format("The push failed part-way: {} of {} change(s) were sent and the "
+                                "rest may not have been. Reload the sources before pushing again.",
+                                applied, total);
+                push_refusal(res, message, message);
+                count("dispatch_exception");
+                return;
+            }
+            if (outcome.denied) {
+                // #7114: the dispatch chokepoint refused the command for this caller
+                // (echo.configure needs Infrastructure:Write and an administrator or an approval).
+                // Reported as that, never as an unreached agent, and it ends the batch: the
+                // refusal is about the caller and the action, not this source.
+                const std::string token(detail::to_string(outcome.denied->reason));
+                (void)detail::emit_behavioral_audit(
+                    audit, req, res, "echo.sources.configure", "failure", "Agent", device,
+                    std::format("dispatch_denied reason={} {}", token, unsent));
+                // 403 for the permission-class reasons; 500 for unclassified / ambiguous, a
+                // catalogue fault on this server-chosen pair (the same mapping as
+                // respond_echo_dispatch_denied in dashboard_routes.cpp, injected by server.cpp).
+                res.status = denial_status_fn_ ? denial_status_fn_(outcome) : 500;
+                const std::string message = std::format(
+                    "Not permitted: {}. {} of {} change(s) were sent, the rest were not.", token,
+                    applied, total);
+                push_refusal(res, message, message);
+                count("dispatch_denied");
+                return;
+            }
             const auto sent = outcome.sent;
             (void)detail::emit_behavioral_audit(
-                audit_fn_, req, res, "echo.sources.configure", sent > 0 ? "dispatched" : "no_agents",
+                audit, req, res, "echo.sources.configure", sent > 0 ? "dispatched" : "no_agents",
                 "Agent", device,
-                std::format("{}_enabled={} command_id={}", src, enabled, audit_token(cmd)));
+                std::format("{}_enabled={} command_id={}", src, enabled,
+                            audit_token(outcome.command_id)));
             // Only count a change the operator can observe as applied: when the dispatch
             // reached no agents (sent==0) the audit records `no_agents`, so the toast must
             // not claim it was pushed (ADR-0015 review LOW-D).
             if (sent > 0)
                 ++applied;
-            else
-                ++refused_or_unreached;
         }
-        // #3133 round-2 review minor: a chokepoint denial (the operator lacks
-        // the Infrastructure:Write that echo.configure is classified as) used
-        // to render the same "0 change(s) pushed" as an offline agent. The
-        // dispatch return can't distinguish the two ({command_id, 0} either
-        // way), so when nothing landed, probe scoped Write the same soft way
-        // can_execute probes Execute — for the MESSAGE only. The probe
-        // approximates the chokepoint's decision for display; the chokepoint
-        // itself remains the enforcement authority either way.
-        if (applied == 0 && refused_or_unreached > 0) {
-            httplib::Response probe;
-            const bool likely_authorized =
-                scoped_perm_fn_ && scoped_perm_fn_(req, probe, "Infrastructure", "Write", device);
-            if (!likely_authorized) {
-                note(res, "No changes pushed: modifying capture sources dispatches "
-                          "<code>echo.configure</code>, which needs the <b>Infrastructure "
-                          "Write</b> permission.");
-                return;
-            }
-        }
+        count(applied > 0 ? "pushed" : "none_applied");
+        push_toast(res, std::format("{} of {} change(s) pushed", applied, total),
+                   applied == total ? "success" : "error");
         res.set_content(std::format("<span data-applied=\"{}\">{} change(s) pushed</span>", applied,
                                     applied),
                         "text/html; charset=utf-8");

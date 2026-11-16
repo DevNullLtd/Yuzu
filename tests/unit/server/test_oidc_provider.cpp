@@ -4364,9 +4364,10 @@ TEST_CASE("OIDC test seams: no production file references set_binding_digest_fai
           "set_discovery_negative_cache_for_test - set_resolver_for_test - "
           "add_test_jwks_key - winhttp_url_agrees_for_test - "
           "clear_nat64_discovery_cache_for_test - expire_nat64_discovery_cache_for_test - "
-          "set_bounded_lookup_for_test - "
+          "set_bounded_lookup_for_test - production_lookup_admission_for_test - "
+          "reset_resolver_log_throttle_for_test - "
           "vet_egress_target_for_test or pending_flow_count_for_test "
-          "(source pin)",
+          "(source scan)",
           "[oidc][oidc_binding][source_pin]") {
     // The seams are public members of the production class and the first makes the binding
     // digest fail. Their only legitimate callers are tests; any file under server/core/src other
@@ -4382,6 +4383,8 @@ TEST_CASE("OIDC test seams: no production file references set_binding_digest_fai
                                              "clear_nat64_discovery_cache_for_test",
                                              "expire_nat64_discovery_cache_for_test",
                                              "set_bounded_lookup_for_test",
+                                             "production_lookup_admission_for_test",
+                                             "reset_resolver_log_throttle_for_test",
                                              "vet_egress_target_for_test",
                                              "pending_flow_count_for_test"};
     std::size_t scanned = 0;
