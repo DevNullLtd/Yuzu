@@ -22,9 +22,13 @@ this gate also binds the documented tag names. It enforces, by source text only 
      unique across the table and the two meta gauges, and the header is 7-bit ASCII (HELP text).
   3. server.cpp registers HELP by looping over the table (a hand-copied name list there would drift
      from what recompute_metrics publishes) and describes both meta gauges; agent_registry.cpp
-     still clears, reads and publishes from the same table.
-  4. agent.cpp's heartbeat Group D2 still calls all three emitters (comments stripped). Deleting a
-     call site is otherwise caught by no test: the emitters are pinned, the call is not.
+     still clears, reads and PUBLISHES from the same table (the `.set(...)` publish expressions
+     are required, not just the identifiers: a needle that survives in a comment or an unrelated
+     line proves nothing).
+  4. agent.cpp's heartbeat Group D2 still calls all three emitters (`//` and `/* */` comments and
+     literal `#if 0` regions stripped first, so a call that is commented out or compiled out does
+     not count). Deleting a call site is otherwise caught by no test: the emitters are pinned, the
+     call is not. This pin is source text: it does not run in a packaged build with no tree.
   5. The alert `YuzuGuardianBaselineUnpersisted` exists in docs/prometheus/yuzu-alerts.yml, its
      `expr` names the SAME gauge as table row 0, it has a `runbook_url`, and NO alert expression
      reads the monitor-only gauges (a boot-scan count and a latching cumulative sum must never be
@@ -37,8 +41,9 @@ this gate also binds the documented tag names. It enforces, by source text only 
 
 Lexical only: it cannot see that recompute_metrics reads a row correctly (that is
 tests/unit/server/test_agent_health_store.cpp, "REAL AgentHealthStore: guardian baseline ...").
-Comments are stripped before matching so comment text cannot satisfy a check. The self-tests apply
-in-memory mutations and require problems() to report each one.
+Comments are stripped before matching so comment text cannot satisfy a check (`#if 0` is handled
+only in its literal form; an `#elif` after it is treated as live, which errs towards keeping text).
+The self-tests apply in-memory mutations and require problems() to report each one.
 
 Usage: python3 tests/test_guardian_baseline_fleet_tags_lexical.py
 """
@@ -75,10 +80,64 @@ def read(p: Path) -> str:
     return p.read_text(encoding="utf-8")
 
 
+def strip_if0(src: str) -> str:
+    """Blank every line of a literal `#if 0` region (nesting-aware; an `#else` of the outermost
+    `#if 0` is live again). Line count is preserved."""
+    out = []
+    dead = 0
+    for line in src.splitlines():
+        directive = line.strip()
+        if dead == 0:
+            if re.match(r"#\s*if\s+0\b", directive):
+                dead = 1
+                out.append("")
+            else:
+                out.append(line)
+            continue
+        if re.match(r"#\s*if", directive):
+            dead += 1
+        elif re.match(r"#\s*endif", directive):
+            dead -= 1
+        elif dead == 1 and re.match(r"#\s*(else|elif)\b", directive):
+            dead = 0
+        out.append("")
+    return "\n".join(out)
+
+
 def strip_line_comments(src: str) -> str:
-    # A `//` inside a string literal on the same line is an accepted blind spot (no such line in
-    # the pinned regions); stripping errs towards losing text, which makes a check go red, not green.
-    return "\n".join(re.sub(r"//.*$", "", line) for line in src.splitlines())
+    """Remove `#if 0` regions, `/* */` blocks and `//` comments, leaving string, character and raw
+    string literals intact (a `//` inside a string is code). Newlines are kept so a stripped block
+    cannot join two statements. Despite its historic name this also strips block comments."""
+    src = strip_if0(src)
+    out = []
+    i, n = 0, len(src)
+    while i < n:
+        c = src[i]
+        two = src[i:i + 2]
+        if two == "//":
+            while i < n and src[i] != "\n":
+                i += 1
+        elif two == "/*":
+            j = src.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            out.append(" " + "\n" * src.count("\n", i, j))
+            i = j
+        elif c == "R" and src[i + 1:i + 2] == '"' and (i == 0 or not (src[i - 1].isalnum() or src[i - 1] == "_")):
+            m = re.match(r'R"([^()\\\s]{0,16})\(', src[i:])
+            end = src.find(")" + m.group(1) + '"', i + m.end()) if m else -1
+            j = n if end < 0 else end + len(m.group(1)) + 2
+            out.append(src[i:j])
+            i = j
+        elif c == '"' or (c == "'" and not (i > 0 and src[i - 1].isalnum())):
+            j = i + 1
+            while j < n and src[j] != c and src[j] != "\n":
+                j += 2 if src[j] == "\\" else 1
+            out.append(src[i:j + 1])
+            i = j + 1
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
 
 
 def strip_yaml_comments(src: str) -> str:
@@ -187,6 +246,13 @@ def problems() -> list:
         if needle not in srv:
             out.append(f"server.cpp no longer describes the meta gauges via {needle}")
     reg = strip_line_comments(read(AGENT_REGISTRY_CPP))
+    reg_flat = re.sub(r"\s+", "", reg)
+    for publish in ("metrics.gauge(kGuardianBaselineMetrics[i].gauge).set(gbp_sum[i])",
+                    "metrics.gauge(kGuardianBaselineReportingGauge).set(",
+                    "metrics.gauge(kGuardianBaselineTagRejectedGauge).set("):
+        if publish.replace(" ", "") not in reg_flat:
+            out.append(f"agent_registry.cpp must publish `{publish}...` (the identifier surviving "
+                       f"somewhere else is not the gauge being published)")
     for needle in ("kGuardianBaselineMetrics", "kNGuardianBaselineMetrics", "kGuardianBaselineUnpersistedIndex",
                    "kGuardianBaselineReportingGauge", "kGuardianBaselineTagRejectedGauge",
                    "parse_guardian_baseline_count"):
@@ -299,6 +365,25 @@ class GuardianBaselineFleetTagsLexical(unittest.TestCase):
             AGENT_CPP: lambda s: re.sub(r"emit_guardian_baseline_unpersisted_heartbeat_tag\(\s*tags,\s*guardian_->baseline_unpersisted\(\)\);",
                                         "// emit_guardian_baseline_unpersisted_heartbeat_tag(tags, guardian_->baseline_unpersisted());", s, count=1)})
         self.assertTrue(any("emit_guardian_baseline_unpersisted_heartbeat_tag(...) exactly once" in p for p in found), found)
+
+    def test_self_check_detects_a_block_comment_wrapped_emit_call(self):
+        # A /* */ wrapper must not let the call survive as text (only // was stripped before).
+        found = self._problems_with({
+            AGENT_CPP: lambda s: re.sub(r"(emit_guardian_baseline_unpersisted_heartbeat_tag\(\s*tags,\s*guardian_->baseline_unpersisted\(\)\);)",
+                                        r"/* \1 */", s, count=1)})
+        self.assertTrue(any("emit_guardian_baseline_unpersisted_heartbeat_tag(...) exactly once" in p for p in found), found)
+
+    def test_self_check_detects_an_if_zero_compiled_out_emit_call(self):
+        found = self._problems_with({
+            AGENT_CPP: lambda s: re.sub(r"(emit_guardian_baseline_rebaselined_heartbeat_tag\(\s*tags,\s*guardian_->baseline_rebaselined_at_boot\(\)\);)",
+                                        r"\n#if 0\n\1\n#endif\n", s, count=1)})
+        self.assertTrue(any("emit_guardian_baseline_rebaselined_heartbeat_tag(...) exactly once" in p for p in found), found)
+
+    def test_self_check_detects_a_deleted_publish_site(self):
+        # The identifiers stay referenced (the read side), only the publish expression goes.
+        found = self._problems_with({
+            AGENT_REGISTRY_CPP: lambda s: s.replace(".set(gbp_sum[i])", ".set(0)", 1)})
+        self.assertTrue(any("agent_registry.cpp must publish" in p for p in found), found)
 
     def test_self_check_detects_a_defaulted_unpersisted_feed(self):
         found = self._problems_with({

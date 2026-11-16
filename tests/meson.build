@@ -2147,8 +2147,8 @@ if build_server
       # server's guardian_baseline_fleet_tags.hpp table.
       #
       # CONSTRAINT (governance Gate-3 architect). This puts every PRIVATE agent header
-      # (78 `agents/core/src/*.hpp` files when #5605 was written; the count this comment once
-      # gave, 47, was stale) on the include path of every server test TU. It is safe TODAY only because there is
+      # (78 `agents/core/src/*.hpp` files when #5605 was written, not the 47 this comment once
+      # gave) on the include path of every server test TU. It is safe TODAY only because there is
       # zero CASE-INSENSITIVE basename collision (APFS/NTFS resolve case-insensitively,
       # so a Linux-only case-sensitive check under-detects) between agents/core/src/*.hpp
       # and server/core/src/*.hpp,
