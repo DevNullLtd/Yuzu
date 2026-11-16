@@ -333,6 +333,10 @@ public:
         /// `DeviceInventoryStore::list_device_ci_after`). Reads the CI table directly, never
         /// the roster, in byte order of agent_id. Empty == the route answers 503.
         hardware_ci_page::Reader ci_page_reader;
+        /// The collation gate the bulk read consults before it asks the store (see
+        /// `device_ci_read_gate.hpp`). Production wires `&collation_gate_`; null means no gate
+        /// (serves) and is for tests that build a Deps by hand.
+        const std::atomic<pg::CollationGate>* ci_collation_gate{nullptr};
         ActionsFn actions_fn;
         ClassifyFn classify_fn;
         SchemaFn schema_fn;

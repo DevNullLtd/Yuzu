@@ -101,6 +101,9 @@ struct ToolDeps {
     RosterFn roster_fn;      // build_hw_roster: UNFILTERED, the gate's scope is the sole filter
     CiDetailFn ci_detail_fn; // hw_ci_detail_fn: the full per-device CI record composition
     hardware_ci_page::Reader ci_page_reader; // hw_ci_page_reader: the keyset read of the stored CI rows
+    // The collation gate the bulk read consults before the store (device_ci_read_gate.hpp);
+    // production wires &collation_gate_, null (tests) serves.
+    const std::atomic<pg::CollationGate>* ci_collation_gate{nullptr};
     DexScoreFn dex_score_fn; // page rows only, never the whole roster (one query per call)
     QuarantineListFn quarantine_list_fn;
 

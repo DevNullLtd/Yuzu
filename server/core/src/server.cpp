@@ -131,6 +131,7 @@
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 #include "pg/secret_codec.hpp"
+#include "device_ci_read_gate.hpp"
 #include "device_inventory_store.hpp"
 #include "software_inventory_store.hpp"
 #include "software_licensing_store.hpp"
@@ -21067,6 +21068,7 @@ private:
                              .roster_fn = build_hw_roster,
                              .ci_detail_fn = hw_ci_detail_fn,
                              .ci_page_reader = hw_ci_page_reader,
+                             .ci_collation_gate = &collation_gate_,
                              // Actions lens (generic action runner): the connected
                              // agent's advertised plugins/actions, copied into the
                              // gRPC-free HwPluginActions shape.
@@ -23983,6 +23985,7 @@ private:
             tool_deps.roster_fn = build_hw_roster;
             tool_deps.ci_detail_fn = hw_ci_detail_fn;
             tool_deps.ci_page_reader = hw_ci_page_reader;
+            tool_deps.ci_collation_gate = &collation_gate_;
             tool_deps.dex_score_fn = hw_dex_score_fn;
             tool_deps.quarantine_list_fn = hw_quarantine_list_fn;
             // /crypto widgets: list_crypto_widgets' availability, get_crypto_ca_stats' R2

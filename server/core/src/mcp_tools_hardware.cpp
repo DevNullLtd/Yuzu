@@ -75,14 +75,18 @@ constexpr const char* kNotFoundRemediation =
 // A failed roster / identity / sections read: never an empty success (ADR-0016 section 7).
 // Transient, so the caller is told to back off, matching REST's 503 + retry_after_ms 5000.
 // `message` names the unavailable part (the REST twin's 503 message for the same condition).
+//
+// `retry_after_ms` and `remediation` default to the generic store-fault pair; the bulk read's
+// unverified-ordering refusal passes its own (device_ci_read_gate.hpp).
 void answer_store_unreadable(const ToolCallContext& ctx, const char* message, const char* verb,
                              const char* target_type, const std::string& target_id,
-                             const std::string& domain_detail) {
+                             const std::string& domain_detail,
+                             std::int64_t retry_after_ms = kMcpStoreFaultRetryMs,
+                             std::string_view remediation = "retry the request") {
     const bool domain_ok = yuzu::server::detail::try_persist_audit(
         ctx.deps->audit_fn, ctx.req, verb, "failure", target_type, target_id, domain_detail);
     const bool generic_ok = ctx.audit("failure", domain_detail);
-    answer(ctx, ctx.a4_error(kInternalError, message, "retry the request",
-                             /*retry_after_ms=*/kMcpStoreFaultRetryMs, {},
+    answer(ctx, ctx.a4_error(kInternalError, message, std::string(remediation), retry_after_ms, {},
                              domain_ok && generic_ok));
 }
 
@@ -213,7 +217,10 @@ void handle_list_hardware_ci_records(const ToolCallContext& ctx) {
                                  -1, {}, audit_ok));
         return;
     }
-    const auto read = hardware_ci_page::read_page(deps->ci_page_reader, *rq, gate.scope);
+    // deps->ci_collation_gate: the collation gate (device_ci_read_gate.hpp); not Trusted refuses
+    // the page before the store is asked. Null means no gate was wired (tests only).
+    const auto read = hardware_ci_page::read_page(deps->ci_page_reader, *rq, gate.scope,
+                                                  deps->ci_collation_gate);
     if (!read) {
         // ONE answer per failure, shared with REST (hardware_ci_page::describe_read_error).
         const auto f = hardware_ci_page::describe_read_error(read.error(), hardware_ci_page::Surface::kMcp);
@@ -221,7 +228,8 @@ void handle_list_hardware_ci_records(const ToolCallContext& ctx) {
             // A failed store read is never an empty page (ADR-0016 section 7).
             answer_store_unreadable(ctx, std::string(f.message).c_str(), "inventory.devices.ci",
                                     hardware_ci_page::audit_target_type(*rq).c_str(),
-                                    hardware_ci_page::audit_target_id(*rq), f.audit_detail);
+                                    hardware_ci_page::audit_target_id(*rq), f.audit_detail,
+                                    f.retry_after_ms, f.remediation.empty() ? "retry the request" : f.remediation);
             return;
         }
         // A refusal (scope too wide: TERMINAL, the caller's own scope is the cause and no store
@@ -443,7 +451,10 @@ constexpr ToolRecord kToolRecords[] = {
      "-32602 (a credential with global read has no such limit; otherwise pass agent_id or narrow "
      "the scope); that is terminal, do not retry it. A failed "
      "store read is a retryable error (wait retry_after_ms, 5000, then call once more; do not "
-     "loop), never an empty page. Serial, system UUID, MAC and the chassis and board serials are "
+     "loop), never an empty page. While the database collation version is changed under the stored "
+     "keys, or the check that confirms it has not yet concluded, the read is refused with a "
+     "retryable error (retry_after_ms 60000, one more call, not a loop) until an administrator has "
+     "repaired the database (see the server administration guide). Serial, system UUID, MAC and the chassis and board serials are "
      "personal data: every served page is audited as inventory.devices.ci and, unlike most MCP "
      "reads, fails CLOSED (no data, retryable error) when that audit row cannot be persisted.",
      R"j({"type":"object","properties":{"limit":{"type":"integer","minimum":1,"maximum":1000,"default":20,"description":"Maximum devices in the page, 1..1000. Default 20; prefer 20 or less for agentic use."},"cursor":{"type":"string","maxLength":2048,"description":"The next_cursor of the previous page. Omit it for the first page. Valid only with the same agent_id it was issued with."},"agent_id":{"type":"string","minLength":1,"maxLength":256,"description":"Read only this device's record: at most 256 bytes, no byte below 0x20 (maxLength counts characters in JSON Schema; the server enforces bytes)."}}})j",
