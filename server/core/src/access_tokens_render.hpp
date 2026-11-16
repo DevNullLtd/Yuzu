@@ -83,11 +83,18 @@ struct PageFlags {
 /// `^engine:[a-z0-9._-]{1,128}$`. Checked before any store read.
 [[nodiscard]] bool valid_principal_id(std::string_view id);
 
-/// The detail of the ORIGINAL committed `engine_principal.revoke` (input is newest first).
+/// The detail of the OLDEST committed `engine_principal.revoke` the input holds (input is newest
+/// first). That is the original revoke's only when nothing older was lost, and not when a raced
+/// revoke left an older success row or an interrupted one kept its count in a failure row (see
+/// the Settings panel's cell).
 /// A later failed or denied attempt writes the same action with a store error string as its
 /// detail; that text is never shown. "" = no committed revoke recorded. The success detail is
-/// `credentials_revoked=N[; superseded_by=ID]` from REST, or the operator's own typed reason
-/// from MCP; it is escaped like every other store string.
+/// `credentials_revoked=N[; superseded_by=ID]` from REST (the ID sanitised: space, `=`, `,` and
+/// control bytes become `_`), or from MCP the operator's typed reason, sanitised the same way
+/// (an empty reason leaves an empty detail). When a concurrent revoke won, both surfaces write
+/// `credentials_revoked=N; revoked_by_concurrent_request` plus an optional
+/// `; superseded_by_not_persisted` (and, MCP only, `; reason=<sanitised reason>`). The text is
+/// escaped like every other store string.
 [[nodiscard]] std::string committed_revoke_detail(const std::vector<AuditEvent>& newest_first);
 
 /// Newest-first window of `engine_principal.revoke` audit events read for one principal. The
@@ -105,6 +112,13 @@ struct RevokeDetail {
 /// `committed_revoke_detail` over at most `kRevokeHistoryWindow` events, with `truncated` set
 /// when the query returned the extra row (input is newest first, up to the query limit).
 [[nodiscard]] RevokeDetail revoke_detail_from(std::vector<AuditEvent> newest_first);
+
+/// The caveat every surface that shows a `RevokeDetail` appends when `truncated` is set (HTML,
+/// leading space included): the shown text is the oldest success among the newest window, which a
+/// retry may be rather than the original revoke, or no event in the window succeeded. `have_detail`
+/// is whether `text` was non-empty. ONE copy, shared by the Access tokens panel and the Settings
+/// Engine Principals panel, so the two cannot word the same fact differently.
+[[nodiscard]] std::string revoke_truncation_hint(bool have_detail);
 
 struct TokensView {
     std::vector<ApiToken> rows;  ///< store order (newest first)

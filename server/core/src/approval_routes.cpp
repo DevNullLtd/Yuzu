@@ -134,7 +134,7 @@ void handle_review(const Deps& deps, const httplib::Request& req, httplib::Respo
     // admit ONLY cookie sessions, which is exactly the ambient-credential class
     // `browser_write_is_cross_site` exists for -- every sibling cookie-write route
     // family carries it. The central pre-routing gate answers a cookie-session write
-    // first, then the central step-up check runs in the pre-request stage; this copy is
+    // first, then the central step-up check runs in the post-read stage; this copy is
     // defence in depth and runs after both and after the permission gate (an
     // unauthorised caller keeps its 403), BEFORE the class check, this handler's
     // step-up call and the `attempted` row, so a cross-site request mutates nothing
@@ -216,6 +216,20 @@ void handle_review(const Deps& deps, const httplib::Request& req, httplib::Respo
         (void)detail::emit_behavioral_audit(deps.audit_fn, req, res, audit_action, "error",
                                             "approval", audit_id,
                                             "approver_assurance:mfa_store_unavailable");
+        if (mfa.persistent) {
+            // The condition does not clear by itself (a binding trigger or rebind guard not in
+            // force, or an enrolled row with an unusable factor generation): no retry can
+            // succeed until an operator repairs it, so no retry hint and no "retry the request".
+            write_a4(res, 503,
+                     "the approver's MFA binding cannot be verified, so the decision was not "
+                     "recorded",
+                     "ask an administrator to follow the MFA binding enforcement runbook (if the "
+                     "account's factor generation is not positive, the administrator resets it "
+                     "with `yuzu-server --mfa-reset <user>`; otherwise they restore the auth "
+                     "store's MFA binding triggers and restart the server); the approval ticket "
+                     "is unchanged and still pending");
+            return;
+        }
         write_a4(res, 503,
                  "the approver's MFA state could not be read, so the decision was not recorded",
                  "retry the request; the approval ticket is unchanged and still pending",

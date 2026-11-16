@@ -119,9 +119,19 @@ void drop_session_schema(PgPool& pool) {
                                   std::vector<std::string>{});
 }
 
+using yuzu::server::LocalMfaProof;
+
+std::int64_t pg_now_ms(PgPool& pool) {
+    auto lease = pool.acquire();
+    auto r = yuzu::server::pg::exec_params(
+        lease.get(), "SELECT (extract(epoch from now())*1000)::bigint", std::vector<std::string>{});
+    REQUIRE(r.status() == PGRES_TUPLES_OK);
+    return std::strtoll(PQgetvalue(r.get(), 0, 0), nullptr, 10);
+}
+
 } // namespace
 
-TEST_CASE("AuthManager+SessionStore: mark_session_mfa_verified authors the proof from the DB clock "
+TEST_CASE("AuthManager+SessionStore: mark_session_mfa_verified stores the carried DB-clock proof "
           "and advances the generation",
           "[auth][session_store][pg][stepup]") {
     // The Settings enrol-confirm stamp and POST /login/mfa/stepup both go through this primitive; the
@@ -141,7 +151,7 @@ TEST_CASE("AuthManager+SessionStore: mark_session_mfa_verified authors the proof
 
     auto g0 = store.read_generation();
     REQUIRE(g0.has_value());
-    REQUIRE(mgr->mark_session_mfa_verified(token));
+    REQUIRE(mgr->mark_session_mfa_verified(token, LocalMfaProof{0, pg_now_ms(pool)}));
     auto g1 = store.read_generation();
     REQUIRE(g1.has_value());
     CHECK(*g1 > *g0); // every replica's cache drops its stale copy on the next refresh
@@ -161,7 +171,8 @@ TEST_CASE("AuthManager+SessionStore: mark_session_mfa_verified authors the proof
     CHECK(seen->steady_mfa_verified.time_since_epoch().count() != 0);
 
     // No such durable session: nothing is stamped and the caller is told so.
-    CHECK_FALSE(mgr->mark_session_mfa_verified("no-such-session-token"));
+    CHECK_FALSE(
+        mgr->mark_session_mfa_verified("no-such-session-token", LocalMfaProof{0, pg_now_ms(pool)}));
 }
 
 TEST_CASE("AuthManager+SessionStore: create_local_session → validate round-trips",
@@ -570,17 +581,129 @@ TEST_CASE("AuthManager legacy path: an empty token never matches a session",
     CHECK_FALSE(mgr.validate_session("").has_value());
 }
 
-// ── #2343: a stored session the engine token authenticated is an engine at every gate ───────
+namespace {
+
+// Raw write of the durable write_generation counter, standing in for a
+// point-in-time restore / a failover to a lagging standby (which can lower it)
+// or for another replica's bump. REQUIREs the statement took effect.
+void set_write_generation_raw(PgPool& pool, std::uint64_t value) {
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    auto r = yuzu::server::pg::exec_params(
+        lease.get(),
+        "UPDATE session_store.session_meta SET value = $1 WHERE key = 'write_generation'",
+        std::vector<std::string>{std::to_string(value)});
+    REQUIRE(r.ok());
+    REQUIRE(std::string(PQcmdTuples(r.get())) == "1");
+}
+
+// Delete every durable session row WITHOUT bumping the generation: an
+// out-of-band row change only the cache-clear decision can mask or expose.
+void delete_session_rows_raw(PgPool& pool) {
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    auto r = yuzu::server::pg::exec_params(lease.get(), "DELETE FROM session_store.sessions",
+                                           std::vector<std::string>{});
+    REQUIRE(r.ok());
+}
+
+// Validate `tok` on `mgr` after forcing the generation poll to run now.
+bool validates_after_poll(AuthManager& mgr, const std::string& tok) {
+    mgr.expire_session_generation_poll_for_test();
+    return mgr.validate_session(tok).has_value();
+}
+
+} // namespace
+
+TEST_CASE("AuthManager+SessionStore: a LOWER durable generation clears the replica session cache "
+          "(restore/lagging-standby regression, #6079)",
+          "[auth][session_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, authsess_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    SessionStore store{pool};
+    REQUIRE(store.is_open());
+
+    SECTION("a revocation after the counter regressed is not masked by the cached session") {
+        auto a = make_mgr(store); // replica A: holds the high cached generation
+        auto b = make_mgr(store); // replica B: the "other replica" that revokes
+        auto tok = a->create_local_session_for_test("rhea", Role::user, /*mfa=*/false);
+
+        // A adopts generation 100 (clearing its cache), then re-caches the
+        // session from its row on the validate.
+        set_write_generation_raw(pool, 100);
+        REQUIRE(validates_after_poll(*a, tok));
+
+        // Recovery lowers the stored counter to 40; replica B then revokes the
+        // session (generation 41). A's cached value is still 100.
+        set_write_generation_raw(pool, 40);
+        REQUIRE(b->invalidate_session(tok));
+        // Old forward-only code: 41 < 100 keeps A's cache and A keeps serving the
+        // revoked session. Any-difference adoption drops it and re-reads the row.
+        CHECK_FALSE(validates_after_poll(*a, tok));
+
+        // The LOWER value was ADOPTED (not merely noticed): with the counter back at 41,
+        // an unchanged read must not clear again. A session cached on A survives an
+        // out-of-band row delete (no bump), which a replica still holding the old 100
+        // would have cleared on this poll (it differs from 41) and failed to re-read.
+        // Creating tok2 bumps the stored counter to 42 without A polling, so A
+        // still caches 41; the raw set puts the counter back to exactly 41, so
+        // the poll below reads a value equal to A's cache (unchanged).
+        auto tok2 = a->create_local_session_for_test("rhea2", Role::user, /*mfa=*/false);
+        set_write_generation_raw(pool, 41);
+        delete_session_rows_raw(pool);
+        CHECK(validates_after_poll(*a, tok2));
+    }
+
+    SECTION("an unchanged generation does not clear the cache (no thrash)") {
+        auto a = make_mgr(store);
+        auto tok = a->create_local_session_for_test("sol", Role::user, /*mfa=*/false);
+        REQUIRE(a->validate_session(tok).has_value()); // confirms the view, re-caches
+        // Remove the row out-of-band with NO generation bump. Only a cache clear
+        // could expose it: an unchanged generation must keep serving the cache.
+        delete_session_rows_raw(pool);
+        CHECK(validates_after_poll(*a, tok));
+        CHECK(validates_after_poll(*a, tok)); // repeated polls stay a no-op
+    }
+
+    SECTION("a normal advance still clears the cache") {
+        auto a = make_mgr(store);
+        auto tok = a->create_local_session_for_test("tess", Role::user, /*mfa=*/false);
+        REQUIRE(a->validate_session(tok).has_value());
+        delete_session_rows_raw(pool);
+        set_write_generation_raw(pool, 1'000'000); // far above any plausible cached value
+        CHECK_FALSE(validates_after_poll(*a, tok));
+    }
+
+    SECTION("a failed generation read keeps the cache unchanged") {
+        auto a = make_mgr(store);
+        auto tok = a->create_local_session_for_test("uma", Role::user, /*mfa=*/false);
+        REQUIRE(a->validate_session(tok).has_value());
+        drop_session_schema(pool);
+        REQUIRE_FALSE(store.read_generation().has_value()); // fault-inject took effect
+        // The poll runs and fails: the cached session is still served (inside
+        // the stale-serve bound) rather than being cleared on the failure.
+        CHECK(validates_after_poll(*a, tok));
+    }
+}
+
+// ── #2343 / #7223: a stored (engine_token source, human kind) row is refused before any gate ──
 //
 // The bearer path cannot produce a Session whose stored kind says human while its source is
 // engine_token (synthesize_token_session sets both together), so the only way to put one in
 // front of the gates is the durable row, restored by a fresh (cold-cache) AuthManager. The v2
 // CHECK forbids the row, so the test drops it first, exactly as a hand edit of an older
-// database would. With RBAC off (the default), an engine-classed session is refused 403 by the
-// engine branch of every gate, while an ordinary human admin is admitted by the legacy path
-// (or, for require_fleet_read, reaches the 503 arm of an unwired store), so reverting any one
-// site to the raw stored-kind compare turns its assertion red.
-TEST_CASE("Gates: a restored (engine_token source, human kind) session takes the engine branch",
+// database would. Before #7223 such a row was served and every gate took the engine branch
+// (403). The durable-session account gate is now a closed three-way on the stored auth source
+// (local, oidc, saml), so the row is refused at validation: no session resolves, every gate
+// answers 401 and the audit class stays at the cookie presentation ("human"). That is the
+// stronger outcome: a stored engine-source row never reaches a gate in either class. The engine
+// branch of each gate is pinned by the synthesized-session tests in
+// test_engine_principal_integration.cpp (require_permission, require_scoped_permission,
+// require_list_read, require_fleet_read, make_audit_event) and the engine audit class by
+// test_auth_routes.cpp (the audit_as_session_fn case for an engine-source, human-kind
+// session). An ordinary human admin is still admitted by the legacy path (or,
+// for require_fleet_read, reaches the 503 arm of an unwired store) as the control.
+TEST_CASE("Gates: a restored (engine_token source, human kind) session is refused at validation",
           "[auth_session_store][pg][engine_principal]") {
     YUZU_REQUIRE_PG_DB_TPL(db, authsess_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -637,7 +760,7 @@ TEST_CASE("Gates: a restored (engine_token source, human kind) session takes the
         auto sreq = request_for(split_token);
         httplib::Response sres;
         CHECK_FALSE(ar.require_permission(sreq, sres, "Infrastructure", "Read"));
-        CHECK(sres.status == 403);
+        CHECK(sres.status == 401); // no session resolved: the engine-source row was refused
     }
     SECTION("require_scoped_permission") {
         auto req = request_for(human_token);
@@ -648,7 +771,7 @@ TEST_CASE("Gates: a restored (engine_token source, human kind) session takes the
         httplib::Response sres;
         CHECK_FALSE(
             ar.require_scoped_permission(sreq, sres, "Execution", "Execute", "agent-1"));
-        CHECK(sres.status == 403);
+        CHECK(sres.status == 401); // no session resolved: the engine-source row was refused
     }
     SECTION("require_list_read") {
         auto req = request_for(human_token);
@@ -658,14 +781,15 @@ TEST_CASE("Gates: a restored (engine_token source, human kind) session takes the
         auto sreq = request_for(split_token);
         httplib::Response sres;
         CHECK_FALSE(ar.require_list_read(sreq, sres, "GuaranteedState", "Read").admitted);
-        CHECK(sres.status == 403);
+        CHECK(sres.status == 401); // no session resolved: the engine-source row was refused
     }
     SECTION("require_fleet_read") {
         auto req = request_for(human_token);
         httplib::Response res;
         // No management-group store is wired here, so a human session stops at that
-        // check and is answered 503; the engine branch answers first with 403. The two statuses
-        // differ, so the 403 below is the engine branch and not the human arm.
+        // check and is answered 503; the refused split row never resolves a session and is
+        // answered 401. The two statuses differ, so the 401 below is the refusal and not the
+        // human arm.
         auto control = ar.require_fleet_read(req, res, "GuaranteedState", "Read");
         CHECK_FALSE(control.has_value());
         CHECK(res.status == 503);
@@ -673,16 +797,265 @@ TEST_CASE("Gates: a restored (engine_token source, human kind) session takes the
         auto sreq = request_for(split_token);
         httplib::Response sres;
         CHECK_FALSE(ar.require_fleet_read(sreq, sres, "GuaranteedState", "Read").has_value());
-        CHECK(sres.status == 403);
+        CHECK(sres.status == 401); // no session resolved: the engine-source row was refused
     }
     SECTION("make_audit_event") {
         // The audit class starts from the credential presentation (a cookie reads "human") and
-        // is re-stamped "engine" from the resolved session's is_engine(). The split session
-        // carries a human stored kind, so only the predicate, not the stored kind, yields it.
+        // is re-stamped "engine" only from a RESOLVED session's is_engine(). The split row
+        // resolves no session, so it stays at the presentation class.
         auto req = request_for(human_token);
         CHECK(ar.make_audit_event(req, "test.action", "success").principal_class == "human");
 
         auto sreq = request_for(split_token);
-        CHECK(ar.make_audit_event(sreq, "test.action", "success").principal_class == "engine");
+        CHECK(ar.make_audit_event(sreq, "test.action", "success").principal_class == "human");
     }
+}
+
+// ── #6079: carried, factor-bound MFA proofs through AuthManager ────────────────────────────────
+//
+// AuthManager hands the store the verifier's {factor generation, DB instant} unchanged, refuses an
+// instant later than the DB clock (never clamps it). The AuthDB-dependent rechecks (S1) are in
+// test_auth.cpp.
+
+namespace {
+
+using yuzu::server::auth::DurableMfaProof;
+
+void exec_sql(PgPool& pool, const std::string& sql) {
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    auto r = yuzu::server::pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{});
+    INFO(PQresultErrorMessage(r.get()));
+    REQUIRE(r.status() == PGRES_COMMAND_OK);
+}
+
+std::int64_t count_sessions(PgPool& pool, const std::string& user) {
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    auto r = yuzu::server::pg::exec_params(
+        lease.get(), "SELECT count(*) FROM session_store.sessions WHERE username = $1",
+        std::vector<std::string>{user});
+    REQUIRE(r.status() == PGRES_TUPLES_OK);
+    return std::strtoll(PQgetvalue(r.get(), 0, 0), nullptr, 10);
+}
+
+yuzu::server::SessionRow durable_row(SessionStore& store, const std::string& token) {
+    auto found = store.find(AuthManager::sha256_hex(token));
+    REQUIRE(found.has_value());
+    REQUIRE(found->has_value());
+    return found->value().row;
+}
+
+double counter_value(yuzu::MetricsRegistry& m, const std::string& name,
+                     const yuzu::Labels& labels = {}) {
+    return labels.empty() ? m.counter(name).value() : m.counter(name, labels).value();
+}
+
+} // namespace
+
+TEST_CASE("AuthManager+SessionStore: create_local_session stores the carried proof exactly",
+          "[auth][session_store][pg][mfa_binding]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, authsess_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    SessionStore store{pool};
+    REQUIRE(store.is_open());
+    auto mgr = make_mgr(store);
+
+    // A verification that began 20 s ago on the DATABASE clock.
+    const std::int64_t verified = pg_now_ms(pool) - 20'000;
+    auto token = mgr->create_local_session("alice", Role::admin, "", LocalMfaProof{7, verified});
+    REQUIRE_FALSE(token.empty());
+
+    // The row holds the carried instant and generation, not the write's own now().
+    const auto row = durable_row(store, token);
+    CHECK(row.mfa_verified_ms == verified);
+    CHECK(row.mfa_factor_gen == 7);
+    CHECK(row.mfa_bind_seq == 1);
+
+    // The cached proof ages from the verification, so it is already ~20 s old.
+    auto s = mgr->validate_session(token);
+    REQUIRE(s.has_value());
+    const auto age = std::chrono::steady_clock::now() - s->steady_mfa_verified;
+    CHECK(age >= std::chrono::seconds(19));
+    CHECK(age < std::chrono::seconds(60));
+
+    // The authoritative read hands the gates the generation with the instants.
+    const auto durable = mgr->read_durable_mfa_proof(token, "alice");
+    REQUIRE(durable.source == DurableMfaProof::Source::kRow);
+    CHECK(durable.mfa_verified_ms == verified);
+    CHECK(durable.mfa_factor_gen == 7);
+    CHECK(durable.db_now_ms >= verified);
+
+    // No-proof overload: a session with no proof and no binding.
+    auto bare = mgr->create_local_session("bob", Role::user, "");
+    REQUIRE_FALSE(bare.empty());
+    const auto bare_row = durable_row(store, bare);
+    CHECK(bare_row.mfa_verified_ms == 0);
+    CHECK(bare_row.mfa_factor_gen == 0);
+}
+
+TEST_CASE("AuthManager+SessionStore: a future-dated proof refuses the mint and leaves nothing",
+          "[auth][session_store][pg][mfa_binding]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, authsess_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    SessionStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::MetricsRegistry metrics;
+    auto mgr = make_mgr(store);
+    mgr->set_metrics_registry(&metrics);
+
+    // The DB clock "stepped back": the carried instant is a minute ahead of it.
+    AuthManager::MintDenial why = AuthManager::MintDenial::kNone;
+    auto token = mgr->create_local_session("alice", Role::admin, "",
+                                           LocalMfaProof{7, pg_now_ms(pool) + 60'000}, &why);
+    CHECK(token.empty());
+    CHECK(why == AuthManager::MintDenial::kVerificationFutureDated);
+    // Refused, not clamped to an age-zero proof: the row written for it is gone.
+    CHECK(count_sessions(pool, "alice") == 0);
+    CHECK(counter_value(metrics, "yuzu_auth_mfa_verification_future_dated_total") == 1.0);
+
+    // Control: the same call with a past instant mints, so the refusal was the instant.
+    why = AuthManager::MintDenial::kPersistFailed;
+    auto ok = mgr->create_local_session("alice", Role::admin, "",
+                                        LocalMfaProof{7, pg_now_ms(pool) - 1'000}, &why);
+    CHECK_FALSE(ok.empty());
+    CHECK(why == AuthManager::MintDenial::kNone);
+    CHECK(count_sessions(pool, "alice") == 1);
+}
+
+TEST_CASE("AuthManager+SessionStore: a malformed proof mints and stamps nothing",
+          "[auth][session_store][pg][mfa_binding]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, authsess_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    SessionStore store{pool};
+    REQUIRE(store.is_open());
+    auto mgr = make_mgr(store);
+
+    // A binding without an instant, a zero proof and a negative generation are caller bugs.
+    for (const LocalMfaProof bad :
+         {LocalMfaProof{3, 0}, LocalMfaProof{0, 0}, LocalMfaProof{-1, 5}}) {
+        CHECK(mgr->create_local_session("alice", Role::admin, "", bad).empty());
+    }
+    CHECK(count_sessions(pool, "alice") == 0);
+
+    auto token = mgr->create_local_session("alice", Role::admin, "");
+    REQUIRE_FALSE(token.empty());
+    for (const LocalMfaProof bad :
+         {LocalMfaProof{3, 0}, LocalMfaProof{0, 0}, LocalMfaProof{-1, 5}}) {
+        CHECK(mgr->stamp_session_mfa_proof(token, bad) ==
+              AuthManager::MfaStampOutcome::kInvalidProof);
+        CHECK_FALSE(mgr->mark_session_mfa_verified(token, bad));
+    }
+    CHECK(durable_row(store, token).mfa_verified_ms == 0);
+}
+
+TEST_CASE("AuthManager+SessionStore: stamping a carried proof stores it; a future one stores none",
+          "[auth][session_store][pg][mfa_binding]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, authsess_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    SessionStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::MetricsRegistry metrics;
+    auto mgr = make_mgr(store);
+    mgr->set_metrics_registry(&metrics);
+
+    auto token = mgr->create_local_session("alice", Role::admin, "");
+    REQUIRE_FALSE(token.empty());
+    const auto g0 = store.read_generation();
+    REQUIRE(g0.has_value());
+
+    // Bound stamp: stored as given, sequence advanced, write generation bumped.
+    const std::int64_t verified = pg_now_ms(pool) - 5'000;
+    CHECK(mgr->stamp_session_mfa_proof(token, {9, verified}) ==
+          AuthManager::MfaStampOutcome::kStamped);
+    auto row = durable_row(store, token);
+    CHECK(row.mfa_verified_ms == verified);
+    CHECK(row.mfa_factor_gen == 9);
+    CHECK(row.mfa_bind_seq == 2); // create wrote 1, the stamp advanced it
+    const auto g1 = store.read_generation();
+    REQUIRE(g1.has_value());
+    CHECK(*g1 > *g0);
+    auto cached = mgr->validate_session(token);
+    REQUIRE(cached.has_value());
+    CHECK(cached->steady_mfa_verified.time_since_epoch().count() != 0);
+
+    // A later stamp with an instant ahead of the DB clock: refused, and the previous proof
+    // is NOT kept as if it were current (the store wrote no proof and no binding).
+    const auto refused = mgr->stamp_session_mfa_proof(token, {9, pg_now_ms(pool) + 60'000});
+    CHECK(refused == AuthManager::MfaStampOutcome::kFutureDated);
+    CHECK_FALSE(mgr->mark_session_mfa_verified(token, {9, pg_now_ms(pool) + 60'000}));
+    row = durable_row(store, token);
+    CHECK(row.mfa_verified_ms == 0);
+    CHECK(row.mfa_factor_gen == 0);
+    auto after = mgr->validate_session(token);
+    REQUIRE(after.has_value());
+    CHECK(after->steady_mfa_verified.time_since_epoch().count() == 0);
+    CHECK(counter_value(metrics, "yuzu_auth_mfa_verification_future_dated_total") == 2.0);
+
+    // No such session.
+    CHECK(mgr->stamp_session_mfa_proof("no-such-session-token", {9, verified}) ==
+          AuthManager::MfaStampOutcome::kNoSession);
+}
+
+TEST_CASE("AuthManager+SessionStore: once the rebind guard is gone the stored binding is "
+          "untrustworthy, the raw row read is not refused",
+          "[auth][session_store][pg][mfa_binding]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, authsess_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    SessionStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::MetricsRegistry metrics;
+    auto mgr = make_mgr(store);
+    mgr->set_metrics_registry(&metrics);
+
+    auto token = mgr->create_local_session("alice", Role::admin, "",
+                                           LocalMfaProof{4, pg_now_ms(pool) - 1'000});
+    REQUIRE_FALSE(token.empty());
+    CHECK(mgr->read_durable_mfa_proof(token, "alice").source == DurableMfaProof::Source::kRow);
+    CHECK(mgr->stored_binding_trustworthy());
+
+    // The binding cannot be trusted once the guard is observed to be off. The raw read still
+    // returns the row (an SSO approver reads it and no binding applies to it); a local binding
+    // decision asks `stored_binding_trustworthy`, which refuses and counts the degrade once.
+    store.set_binding_validation_memo_for_test(std::chrono::milliseconds{0});
+    exec_sql(pool, "ALTER TABLE session_store.sessions DISABLE TRIGGER sessions_mfa_rebind_guard");
+    const auto durable = mgr->read_durable_mfa_proof(token, "alice");
+    CHECK(durable.source == DurableMfaProof::Source::kRow);
+    CHECK_FALSE(store.rebind_guard_ok());
+    const double before =
+        counter_value(metrics, "yuzu_auth_session_store_degrade_total", {{"op", "rebind_guard"}});
+    CHECK_FALSE(mgr->stored_binding_trustworthy());
+    CHECK(counter_value(metrics, "yuzu_auth_session_store_degrade_total",
+                        {{"op", "rebind_guard"}}) == before + 1.0);
+}
+
+TEST_CASE("AuthManager legacy path: a carried proof is stored, a future one refused",
+          "[auth][session][mfa_binding]") {
+    AuthManager mgr; // no stores: this host's clock is the authority
+    const auto wall = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::system_clock::now().time_since_epoch())
+                          .count();
+
+    auto token = mgr.create_local_session("alice", Role::user, "", LocalMfaProof{3, wall - 30'000});
+    REQUIRE_FALSE(token.empty());
+    auto s = mgr.validate_session(token);
+    REQUIRE(s.has_value());
+    const auto age = std::chrono::steady_clock::now() - s->steady_mfa_verified;
+    CHECK(age >= std::chrono::seconds(29));
+    CHECK(age < std::chrono::seconds(60));
+
+    AuthManager::MintDenial why = AuthManager::MintDenial::kNone;
+    CHECK(mgr.create_local_session("bob", Role::user, "", LocalMfaProof{3, wall + 3'600'000}, &why)
+              .empty());
+    CHECK(why == AuthManager::MintDenial::kVerificationFutureDated);
+
+    auto bare = mgr.create_local_session("carol", Role::user, "");
+    REQUIRE_FALSE(bare.empty());
+    CHECK(mgr.stamp_session_mfa_proof(bare, {3, wall + 3'600'000}) ==
+          AuthManager::MfaStampOutcome::kFutureDated);
+    CHECK(mgr.stamp_session_mfa_proof(bare, {3, wall - 10'000}) ==
+          AuthManager::MfaStampOutcome::kStamped);
+    auto stamped = mgr.validate_session(bare);
+    REQUIRE(stamped.has_value());
+    CHECK(stamped->steady_mfa_verified.time_since_epoch().count() != 0);
 }

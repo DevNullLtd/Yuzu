@@ -1,22 +1,21 @@
 /**
- * pkg_inventory_win.cpp — Windows leg entry point: PLANNED placeholder.
+ * pkg_inventory_win.cpp — Windows leg entry point.
  *
- * Every action (managers, packages, store_packages) reports
- * `status|<action>|unsupported|windows:planned` and no data rows. The real legs
- * (Chocolatey lib\ walk + nuspec metadata; winget presence; the Appx store
- * roster) follow as their own PRs; no winget argv and no libxml2 dependency
- * lands here (unwired code is not committed). The descriptor declares every
- * Windows leg YUZU_SUPPORT_PLANNED to match.
+ * `run_windows` is a one-line wrapper over `win::run_windows_with`
+ * (pkg_inventory_win_parsers.hpp), which takes its OS access as an injected ops
+ * seam: production passes `win::RealOps` (HKLM Appx roster, the Chocolatey lib
+ * listing and one bounded nuspec read per package); the unit suite drives the same
+ * body over a FakeOps. No process is spawned: no choco.exe, no winget.exe.
  */
 #include "pkg_inventory_legs.hpp"
+#include "pkg_inventory_win_parsers.hpp"
 
 #if defined(_WIN32)
 
 namespace yuzu::pkg_inventory {
 
 int run_windows(yuzu::CommandContext& ctx, Action a) {
-    emit_unsupported(ctx, a, kTokenWindowsPlanned);
-    return 0;
+    return win::run_windows_with(ctx, a, win::RealOps{});
 }
 
 } // namespace yuzu::pkg_inventory

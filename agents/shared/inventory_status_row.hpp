@@ -6,9 +6,9 @@
 //
 //   status|<action>|<supported|constrained|unsupported>|<tokens or ->
 //
-// row followed by its data rows. Other plugins keep their own status rows:
-// runtimes (its own StatusLevel in runtimes_parsers.hpp), the StatusState plugins
-// and browser_policy. None of them feeds the collector. This header owns the
+// row followed by its data rows. runtimes uses this header's formatter; the StatusState
+// plugins and browser_policy keep their own status rows and none of them feeds the
+// collector. This header owns the
 // collector's grammar in both directions so the producers and the consumer
 // cannot drift:
 //
@@ -19,9 +19,9 @@
 // What lives here: the field positions, the level vocabulary, the `>= 4
 // fields` and `same action` rules. What does NOT: line splitting (the
 // collector splits on the raw '|' and hands over tokens), and what a level
-// MEANS for a cycle -- that is the collector's per-action policy table
-// (ConstrainedPolicy), so parse_status_row returns field 4 at every level and
-// the caller decides whether it surfaces as a reason.
+// MEANS for the report -- the collector sends a constrained level as a
+// status-only section for that source, so parse_status_row returns field 4 at
+// every level and the caller decides whether it surfaces as a reason.
 //
 // ESCAPING. Free text goes through yuzu::util::safe_output_field, which is
 // DOCUMENTED LOSSY (sdk/include/yuzu/string_utils.hpp): a literal backslash

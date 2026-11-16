@@ -75,6 +75,7 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
 
         yuzu::server::ExecutionScope scope_arg; // nullopt = unrestricted
         std::string username;
+        yuzu::server::ExecutionOwnerKey owner; // empty unless a confined, resolved session
         if (gate.scope) {
             auto session = deps.resolve_session_fn(req);
             username = session ? session->username : std::string{};
@@ -90,10 +91,8 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
                     "application/json");
                 return;
             }
-            yuzu::server::ExecutionListScope s;
-            s.owner = username;
-            s.visible_agents.assign(gate.scope->begin(), gate.scope->end());
-            scope_arg = std::move(s);
+            owner = execution_owner_key(*session);
+            scope_arg = confined_list_scope(owner, gate.scope);
         }
 
         auto execs_opt = deps.execution_tracker->query_executions_checked(q, scope_arg);
@@ -131,7 +130,7 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
                 auto it = statuses_opt->find(e.id);
                 const auto& statuses =
                     it != statuses_opt->end() ? it->second : kEmptyStatuses;
-                if (!execution_visible(e, statuses, gate.scope, username))
+                if (!execution_visible(e, statuses, gate.scope, owner))
                     continue;
                 auto counts = confined_projection(statuses, gate.scope);
                 arr.push_back({{"id", e.id},
@@ -180,6 +179,7 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
 
         auto id = req.matches[1].str();
         std::string username;
+        yuzu::server::ExecutionOwnerKey owner; // empty unless a confined, resolved session
         if (gate.scope) {
             auto session = deps.resolve_session_fn(req);
             username = session ? session->username : std::string{};
@@ -199,6 +199,7 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
                     "application/json");
                 return;
             }
+            owner = execution_owner_key(*session);
         }
 
         auto exec_r = deps.execution_tracker->get_execution_checked(id);
@@ -228,7 +229,7 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
         }
 
         const bool visible =
-            exec_opt.has_value() && execution_visible(*exec_opt, statuses, gate.scope, username);
+            exec_opt.has_value() && execution_visible(*exec_opt, statuses, gate.scope, owner);
         if (!exec_opt || !visible) {
             // #3789: audit ONLY when a confinement decision actually
             // happened (gate.scope engaged) — a suppressed
@@ -311,6 +312,7 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
 
         auto id = req.matches[1].str();
         std::string username;
+        yuzu::server::ExecutionOwnerKey owner; // empty unless a confined, resolved session
         if (gate.scope) {
             auto session = deps.resolve_session_fn(req);
             username = session ? session->username : std::string{};
@@ -330,6 +332,7 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
                     "application/json");
                 return;
             }
+            owner = execution_owner_key(*session);
         }
 
         auto exec_r = deps.execution_tracker->get_execution_checked(id);
@@ -356,7 +359,7 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
         }
 
         const bool visible =
-            exec_opt.has_value() && execution_visible(*exec_opt, statuses, gate.scope, username);
+            exec_opt.has_value() && execution_visible(*exec_opt, statuses, gate.scope, owner);
         if (!exec_opt || !visible) {
             // #3789: unknown-id and invisible now collapse to the SAME
             // 404 for EVERY caller — the legacy route previously
@@ -416,6 +419,7 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
 
         auto id = req.matches[1].str();
         std::string username;
+        yuzu::server::ExecutionOwnerKey owner; // empty unless a confined, resolved session
         if (gate.scope) {
             auto session = deps.resolve_session_fn(req);
             username = session ? session->username : std::string{};
@@ -435,6 +439,7 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
                     "application/json");
                 return;
             }
+            owner = execution_owner_key(*session);
         }
 
         auto exec_r = deps.execution_tracker->get_execution_checked(id);
@@ -458,7 +463,7 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
         const auto& statuses = *statuses_opt;
 
         const bool visible =
-            exec_opt.has_value() && execution_visible(*exec_opt, statuses, gate.scope, username);
+            exec_opt.has_value() && execution_visible(*exec_opt, statuses, gate.scope, owner);
         if (!exec_opt || !visible) {
             // #3789: audit ONLY under an engaged scope — see the detail
             // route's identical rationale (compliance-officer F2).
@@ -514,6 +519,10 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
         auto session = deps.resolve_session_fn(req);
         auto user = session ? session->username : "unknown";
         const std::string username = session ? session->username : std::string{};
+        // #5557: admission compares the OWNERSHIP key, never `username` (the real principal, kept
+        // for the guard, `user` and the audit rows).
+        const ExecutionOwnerKey owner_key =
+            session ? execution_owner_key(*session) : ExecutionOwnerKey{};
 
         if (gate.scope) {
             // #3789: an empty username under an engaged scope means
@@ -556,7 +565,7 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
             }
             const bool admitted = exec_opt.has_value() &&
                                  admit_confined_mutation(*exec_opt, *statuses_opt, gate.scope,
-                                                        username);
+                                                        owner_key);
             if (!admitted) {
                 // #3789: uniform deny shape — nonexistent, zero-visible,
                 // partial, and incomplete-target-ledger all collapse to
@@ -613,6 +622,10 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
         auto session = deps.resolve_session_fn(req);
         auto user = session ? session->username : "unknown";
         const std::string username = session ? session->username : std::string{};
+        // #5557: admission compares the OWNERSHIP key, never `username` (the real principal, kept
+        // for the guard, `user` and the audit rows).
+        const ExecutionOwnerKey owner_key =
+            session ? execution_owner_key(*session) : ExecutionOwnerKey{};
 
         auto exec_r = deps.execution_tracker->get_execution_checked(id);
         if (!exec_r) {
@@ -658,7 +671,7 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
             }
             const bool admitted = exec_opt.has_value() &&
                                  admit_confined_mutation(*exec_opt, *statuses_opt, gate.scope,
-                                                        username);
+                                                        owner_key);
             if (!admitted) {
                 (void)deps.audit_fn(req, "execution.cancel", "denied", "execution", id,
                                     "not found or outside caller's fleet-read scope cid=" + cid);
@@ -667,24 +680,28 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
                 return;
             }
         } else if (!exec_opt) {
-            // #3789 + PR #3842: this existence check gives an unknown id a
-            // clean 404. It was originally load-bearing because
-            // `mark_cancelled` reported PGRES_COMMAND_OK (a false "cancelled"
-            // 200) on an UPDATE matching zero rows (Sol/gpt-5.6-sol review);
-            // PR #3842's `RETURNING id` + terminal-status guard now makes
-            // mark_cancelled return FALSE for an unknown OR already-terminal
-            // execution, so this check is now defense-in-depth — it keeps the
-            // common unknown-id case a 404 rather than the 503 a bare
-            // mark_cancelled-false would produce below (a not-found/terminal-
-            // vs-degrade refinement of that 503 is tracked in #3845). A
-            // confined caller's existence check is folded into the branch above.
+            // #3789 + PR #3842 + #3845: this existence check is what gives an
+            // unknown id its 404, BEFORE any write. It is load-bearing: the
+            // guarded UPDATE matches zero rows for an unknown id exactly as it
+            // does for an already-terminal one, so `mark_cancelled_checked`
+            // reports BOTH as `kNoOp`, which the switch below answers 409
+            // "already finished". Without this check an unknown id would get a
+            // 409. (It was first added because `mark_cancelled` reported
+            // PGRES_COMMAND_OK, a false "cancelled" 200, on a zero-row UPDATE;
+            // Sol/gpt-5.6-sol review.) One residual: a row that goes terminal
+            // between this read and the guarded UPDATE (the stuck-execution
+            // reaper flips it to `cancelled`, or a late agent response
+            // completes it) is a `kNoOp` too, i.e. a 409 "already finished",
+            // which is true. Nothing deletes execution rows, so it is never
+            // "gone". A confined caller's existence check is folded into the
+            // branch above.
             res.status = 404;
             res.set_content(detail::a4_error(res, "not found"), "application/json");
             return;
         }
 
-        // mark_cancelled_checked keeps "nothing to cancel" (already terminal, or the row
-        // vanished between the read above and the guarded UPDATE) apart from a store failure:
+        // mark_cancelled_checked keeps "nothing to cancel" (already terminal, or it went terminal
+        // between the read above and the guarded UPDATE) apart from a store failure:
         // the first is a state-guard refusal (409, audited `denied`), only the second is a 503.
         using Outcome = ExecutionTracker::MarkCancelledOutcome;
         switch (deps.execution_tracker->mark_cancelled_checked(id, user)) {
@@ -727,6 +744,7 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
 
         auto id = req.matches[1].str();
         std::string username;
+        yuzu::server::ExecutionOwnerKey owner; // empty unless a confined, resolved session
         yuzu::server::ExecutionScope scope_arg; // nullopt = unrestricted
         if (gate.scope) {
             auto session = deps.resolve_session_fn(req);
@@ -753,10 +771,8 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
             // cap-before-scope defect where an invisible sibling could
             // displace this caller's own visible children out of the capped
             // window.
-            yuzu::server::ExecutionListScope s;
-            s.owner = username;
-            s.visible_agents.assign(gate.scope->begin(), gate.scope->end());
-            scope_arg = std::move(s);
+            owner = execution_owner_key(*session);
+            scope_arg = confined_list_scope(owner, gate.scope);
         }
 
         auto exec_r = deps.execution_tracker->get_execution_checked(id);
@@ -784,7 +800,7 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
 
         const bool parent_visible =
             exec_opt.has_value() &&
-            execution_visible(*exec_opt, parent_statuses, gate.scope, username);
+            execution_visible(*exec_opt, parent_statuses, gate.scope, owner);
         if (!exec_opt || !parent_visible) {
             // #3789: audit ONLY under an engaged scope — see the detail
             // route's identical rationale (compliance-officer F2).
@@ -834,7 +850,7 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
                 auto it = child_statuses_opt->find(c.id);
                 const auto& c_statuses =
                     it != child_statuses_opt->end() ? it->second : kEmptyStatuses;
-                if (!execution_visible(c, c_statuses, gate.scope, username))
+                if (!execution_visible(c, c_statuses, gate.scope, owner))
                     continue;
                 // #2146 A2-R1: shared builder (execution_model.hpp) - REST v1's
                 // new GET /api/v1/executions/{id}/children and MCP's new

@@ -36,14 +36,31 @@ The primary integration test runs all three components together:
 ./scripts/integration-test.sh --tls --free-ports --gateway-ct
 ```
 
-The script needs Postgres (`YUZU_TEST_POSTGRES_DSN`; it creates a uniquely named database and
-drops it on exit), `psql`, `openssl`, `curl`, `python3` and Erlang/OTP with `rebar3` (it builds the
-gateway release). `--free-ports` makes concurrent runs on one host safe.
+The script needs bash 4+ (an older bash exits 2 before it creates anything) and Postgres (`YUZU_TEST_POSTGRES_DSN`; it creates a uniquely named database and
+drops it on exit), `psql`, `openssl`, `curl`, `python3` (and `ps`, only where there is no `/proc`) and Erlang/OTP with `rebar3` (it
+builds the gateway release). `ss` (iproute2) is optional: under `--free-ports` it confirms that
+every port belongs to the process that should hold it, and without it that check is skipped (the
+script logs so once); without `ss` a lost web port is not retried (a stranger that does not answer HTTP fails the start with "no
+bind-failure evidence", and one that answers HTTP is not detected at start-up: the run fails later). `--free-ports` makes concurrent runs on one host safe, with one checkout per
+concurrent run (the gateway release under `gateway/_build` is shared).
+
+If another process takes one of the drawn ports before the stack binds it, `--free-ports` retries
+the start-up (at most 3 attempts, all 8 ports redrawn) and keeps the failed attempt's logs as
+`server.attemptN.log` / `gateway.attemptN.log`. Only an unambiguous bind failure is retried: the
+`eaddrinuse` / `Address already in use` error in a log, the server's web-listener failure line
+together with another process listening on that port, or another process found listening on one
+of the stack's ports. Any other start failure (a crash, a timeout, a TLS or key error) fails at
+once. Under GitHub Actions a retry is also a `::warning::` annotation and a line in the step
+summary. What this does and does not guarantee is stated in the script's "Free ports" comment, and
+the classifier, the post-start ownership check and the attempt loop are locked by
+`tests/shell/test_integration_port_retry.sh`.
+`YUZU_IT_PORT_HOG_INDEX=<0..7>` is a local-only test seam that makes attempt 1 lose that port; it
+is refused when `GITHUB_ACTIONS` is set or `CI=true`.
 
 This test:
 - Starts the C++ server in gateway mode with `--gateway-upstream`. The gateway-upstream service refuses to start without gateway peer authorization or an acknowledgement. The plaintext mode passes `--no-tls --insecure-gateway-peer` (the check is disabled, so that mode does not exercise it). `--tls` passes no acknowledgement: the server runs on its generated default certificates and enforces the automatic pin of its own `default-gateway.pem`, the leaf the gateway presents, so the gateway hop is pinned mutual TLS and the script asserts the server booted enforcing with that leaf's SPKI prefix and denied no call
 - Starts the Erlang gateway (the `rebar3 as prod release` build, on a generated `sys.config`) connecting to the server
-- With `--tls`, runs the gateway's management listener (`:50063`, the privileged command plane) in the production posture except for the mode: strict mutual TLS, `auth_fun => fun yuzu_gw_authz:check_mgmt_peer/1`, `mgmt_peer_pins` naming the server's default leaf, and `mgmt_peer_auth_mode` set to `identity_or_pin`. The rig opts in to that mode (#6016); the shipped configs stay on `pin`, so the shipped `pin` configuration (resolved and judged by the real boot-guard functions) is covered by the eunit module `yuzu_gw_config_posture_tests`, not exercised on the real stack. The server is started with `--gateway-command-addr` (and `--rate-limit 10000`, so the burst below is not answered with 429) and forwards commands over it
+- With `--tls`, runs the gateway's management listener (`:50063`, the privileged command plane) in the production posture, in the shipped mode by default: strict mutual TLS, `auth_fun => fun yuzu_gw_authz:check_mgmt_peer/1`, and `mgmt_peer_auth_mode` set to `identity` with no `mgmt_peer_pins`, the form the reference configs ship (#6016, release N+1): the server is admitted by the identity its leaf carries, derived from the single-certificate `default-ca.pem`. `YUZU_GW_MGMT_AUTH_MODE=identity_or_pin` is the one setting that differs from the shipped posture: it runs the transition mode instead, with the server's default leaf also pinned as `mgmt_peer_pins`; the shipped configurations (resolved and judged by the real boot-guard functions) are also covered by the eunit module `yuzu_gw_config_posture_tests`. The server is started with `--gateway-command-addr` (and `--rate-limit 10000`, so the burst below is not answered with 429) and forwards commands over it
 - Starts N C++ agents connecting through the gateway
 - Runs ~20 test scenarios covering connectivity, registration, heartbeats, and stability
 - With `--tls`, covers the management hop (server to gateway to agent and back, #5175): it logs in to the server's REST API, dispatches `os_info.os_name` to the real agent through the gateway (one round trip, then 300 commands over the server's single management connection) and requires every command to return the agent's SUCCESS and the server to count every forward as `ok`. With `--gateway-ct`, `yuzu_gw_real_mgmt_SUITE` also dials the management listener directly: the server's pinned leaf is served, and so is the server identity (#6016: the real server leaf is admitted by identity in the `identity_or_pin` mode the script configures, a renewed-key leaf and a same-key re-issue carrying the identity are served, one carrying another install's identity or an agent-style URI is refused), while a valid but unpinned leaf of the same CA (the gateway's own, or an enrolled agent's) is refused with `UNAUTHENTICATED` and counted in `yuzu_gw_mgmt_auth_rejected_total`; 300 `SendCommand` streams over one connection complete; and the early-end paths (unknown agent, a fan-out deadline that passes before the agent answers, cancelled streams) leave the connection serving. Afterwards the gateway log must hold no `function_clause`, crash report or `[error]` line and the server log no `Socket closed` or failed `Gateway SendCommand`
@@ -238,11 +255,11 @@ The `test_gateway.py` script (`scripts/test_gateway.py`) provides a Python-based
 
 ```bash
 python3 scripts/test_gateway.py gateway eunit               # whole EUnit suite (Windows: python or py -3)
-python3 scripts/test_gateway.py gateway eunit --shard 1/2   # one EUnit shard, as Meson runs it
+python3 scripts/test_gateway.py gateway eunit --shard 1/3   # one EUnit shard, as Meson runs it
 python3 scripts/test_gateway.py gateway ct
 ```
 
-It is the wrapper Meson's gateway `test()` targets call, and CI runs it that way (`meson test --suite gateway`); invoke it directly only for local debugging. Meson runs EUnit as two shards, `gateway eunit shard A` and `gateway eunit shard B` (`--shard 1/2` and `2/2`), each in its own `REBAR_BASE_DIR`; between them they run exactly what the whole-suite run does (`docs/erlang-gateway-build.md`). `ct` runs use a minimised performance profile.
+It is the wrapper Meson's gateway `test()` targets call, and CI runs it that way (`meson test --suite gateway`); invoke it directly only for local debugging. Meson runs EUnit as three shards, `gateway eunit shard A`, `B` and `C` (`--shard 1/3` to `3/3`), each in its own `REBAR_BASE_DIR` and with cover off; between them they run exactly what the whole-suite run does (`docs/erlang-gateway-build.md`). `ct` runs use a minimised performance profile.
 
 ## MCP Integration Testing
 

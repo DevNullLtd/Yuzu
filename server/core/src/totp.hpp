@@ -13,10 +13,13 @@
 
 #include <chrono>
 #include <cstdint>
+#include <expected>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include "secure_random.hpp"
 
 namespace yuzu::server::mfa {
 
@@ -67,13 +70,23 @@ inline constexpr int kTotpSkewSteps = 1;    // ±1 step (90 s effective window)
 [[nodiscard]] std::string otpauth_uri(std::string_view issuer, std::string_view account,
                                       std::string_view secret_base32);
 
-/// Generate a freshly random kTotpSecretBytes-byte secret using the
-/// platform CSPRNG (OpenSSL `RAND_bytes` on Unix, BCrypt on Windows).
-[[nodiscard]] std::vector<uint8_t> random_secret();
+/// Generate a freshly random kTotpSecretBytes-byte secret from the shared
+/// checked CSPRNG helper (`yuzu::server::fill_random`: OpenSSL `RAND_bytes`
+/// on Unix, `BCryptGenRandom` on Windows).
+///
+/// FAIL CLOSED (#4763): a CSPRNG failure returns `SecureRandomError`, never a
+/// zero-filled or partially-filled secret. A constant secret would be a
+/// publicly-known TOTP key (a complete second-factor bypass that still reports
+/// as enrolled). The caller MUST refuse the enrollment and persist nothing.
+[[nodiscard]] std::expected<std::vector<uint8_t>, SecureRandomError> random_secret();
 
-/// Generate a single recovery code: 10 base32 characters → 5 + 5 with a
-/// '-' separator for human readability. Caller PBKDF2-hashes the value
-/// before persisting; the raw form is shown to the user exactly once.
-[[nodiscard]] std::string random_recovery_code();
+/// Generate a single recovery code: 16 base32 characters (80 bits) grouped
+/// 4-4-4-4 with '-' separators for human readability. Caller PBKDF2-hashes
+/// the value before persisting; the raw form is shown to the user exactly once.
+///
+/// FAIL CLOSED (#4763): a CSPRNG failure returns `SecureRandomError`; no code
+/// is ever derived from unwritten bytes. The caller MUST NOT issue or persist
+/// a partial set.
+[[nodiscard]] std::expected<std::string, SecureRandomError> random_recovery_code();
 
 } // namespace yuzu::server::mfa

@@ -310,20 +310,24 @@ bool ScimStore::has_token() const {
 }
 
 bool ScimStore::validate_token(const std::string& raw) const {
+    return validate_token_checked(raw) == TokenCheck::Valid;
+}
+
+ScimStore::TokenCheck ScimStore::validate_token_checked(const std::string& raw) const {
     if (!open_ || raw.empty())
-        return false;
+        return TokenCheck::Invalid; // permanent: not a store FAULT
 
     std::string hash = auth::AuthManager::sha256_hex(raw);
 
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease)
-        return false;
+        return TokenCheck::Unavailable; // #6835: the credential was NOT checked
 
     pg::PgResult res =
         pg::exec_params(lease.get(), "SELECT token_hash FROM scim_store.scim_tokens WHERE revoked_at IS NULL",
                         std::vector<std::string>{});
     if (res.status() != PGRES_TUPLES_OK)
-        return false;
+        return TokenCheck::Unavailable; // #6835: the credential was NOT checked
 
     // Scan every active hash rather than short-circuiting on first match —
     // each individual comparison is constant-time via CRYPTO_memcmp, and not
@@ -340,7 +344,7 @@ bool ScimStore::validate_token(const std::string& raw) const {
             matched = true;
         }
     }
-    return matched;
+    return matched ? TokenCheck::Valid : TokenCheck::Invalid;
 }
 
 // ── SCIM resources ───────────────────────────────────────────────────────
@@ -385,6 +389,27 @@ std::optional<ScimResource> ScimStore::get_by_scim_id(const std::string& scim_id
     if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0)
         return std::nullopt;
     return read_resource(res.get(), 0);
+}
+
+std::optional<std::optional<ScimResource>>
+ScimStore::get_by_scim_id_checked(const std::string& scim_id) const {
+    if (!open_)
+        return std::nullopt; // store unusable: never conflate with "not found"
+    if (scim_id.empty())
+        return std::optional<ScimResource>{}; // nothing asked for: a definitive miss
+
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::nullopt; // lease timeout: a store fault, not "not found"
+
+    std::string sql =
+        std::string("SELECT ") + kResourceCols + " FROM scim_store.scim_resources WHERE scim_id = $1";
+    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{scim_id});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::nullopt; // query failed: a store fault, not "not found"
+    if (PQntuples(res.get()) == 0)
+        return std::optional<ScimResource>{}; // the store answered: genuinely no such row
+    return std::optional<ScimResource>{read_resource(res.get(), 0)};
 }
 
 std::optional<bool> ScimStore::resource_exists(const std::string& scim_id) const {
@@ -658,6 +683,49 @@ ScimStore::get_group_by_display_name(const std::string& display_name) const {
     if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0)
         return std::nullopt;
     return read_group(res.get(), 0);
+}
+
+std::optional<std::optional<ScimGroup>>
+ScimStore::get_group_by_id_checked(const std::string& scim_id) const {
+    if (!open_)
+        return std::nullopt;
+    if (scim_id.empty())
+        return std::optional<ScimGroup>{};
+
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::nullopt;
+
+    std::string sql =
+        std::string("SELECT ") + kGroupCols + " FROM scim_store.scim_groups WHERE scim_id = $1";
+    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{scim_id});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::nullopt;
+    if (PQntuples(res.get()) == 0)
+        return std::optional<ScimGroup>{};
+    return std::optional<ScimGroup>{read_group(res.get(), 0)};
+}
+
+std::optional<std::optional<ScimGroup>>
+ScimStore::get_group_by_display_name_checked(const std::string& display_name) const {
+    if (!open_)
+        return std::nullopt;
+    if (display_name.empty())
+        return std::optional<ScimGroup>{};
+
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::nullopt;
+
+    std::string sql =
+        std::string("SELECT ") + kGroupCols + " FROM scim_store.scim_groups WHERE display_name = $1";
+    pg::PgResult res =
+        pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{display_name});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::nullopt;
+    if (PQntuples(res.get()) == 0)
+        return std::optional<ScimGroup>{};
+    return std::optional<ScimGroup>{read_group(res.get(), 0)};
 }
 
 std::vector<ScimGroup> ScimStore::list_groups(int start_index, int count, int& total_out) const {

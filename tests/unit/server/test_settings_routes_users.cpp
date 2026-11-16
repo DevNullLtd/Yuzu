@@ -1645,9 +1645,124 @@ TEST_CASE("SettingsRoutes POST role: a lock-timeout store failure whose durable 
     CHECK(durable_sessions_of_bob() == 1); // still there: the repeat is not a convergence path
 }
 
+namespace {
+/// #4068: hold every connection of the harness pool so the next AuthDB lookup cannot lease one
+/// (AuthDB::get_user -> a store error, the state get_user_role() reports as DbError).
+std::vector<yuzu::server::pg::PgPool::Lease> drain_pool(yuzu::server::pg::PgPool& pool) {
+    std::vector<yuzu::server::pg::PgPool::Lease> held;
+    for (int i = 0; i < 64; ++i) {
+        auto lease = pool.try_acquire_for(std::chrono::milliseconds(50));
+        if (!lease)
+            break;
+        held.push_back(std::move(lease));
+    }
+    // The harness pool has 4 connections (AuthDbPg): a short drain would let the route succeed
+    // and turn the 503 assertions into a flake, so say so loudly instead.
+    REQUIRE(held.size() == 4);
+    return held;
+}
+} // namespace
+
+TEST_CASE("SettingsRoutes POST role: an AuthDB store error is a 503 audited store_unavailable, "
+          "not a 404 user_not_found (#4068)",
+          "[pg][settings][users][role][store-error]") {
+    SettingsAdr2001Harness h;
+    h.session_user = "ops";
+
+    std::unique_ptr<httplib::Response> res;
+    {
+        auto held = drain_pool(h.auth_db.pool());
+        REQUIRE_FALSE(held.empty());
+        res = h.set_role("bob", "admin");
+    }
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK_FALSE(h.has_audit("user.role_change", "denied", "User", "bob"));
+    CHECK(h.has_audit("user.role_change", "failure", "User", "bob"));
+    CHECK(h.audit_detail("user.role_change", "failure", "bob") == "store_unavailable");
+    CHECK(h.auth_mgr.get_user_role("bob") == auth::Role::user); // nothing changed
+
+    // A genuinely absent user is still the 404 / user_not_found.
+    auto missing = h.set_role("nobody_here", "admin");
+    REQUIRE(missing);
+    CHECK(missing->status == 404);
+    CHECK(h.audit_detail("user.role_change", "denied", "nobody_here") == "user_not_found");
+}
+
+TEST_CASE("SettingsRoutes POST /users: an AuthDB store error on the duplicate check is a 503, "
+          "creation does not proceed (#4068)",
+          "[pg][settings][users][create][store-error]") {
+    SettingsAdr2001Harness h;
+    h.session_user = "ops";
+
+    std::unique_ptr<httplib::Response> res;
+    {
+        auto held = drain_pool(h.auth_db.pool());
+        REQUIRE_FALSE(held.empty());
+        res = h.sink.Post("/api/settings/users", "username=newuser&password=anotherpassword1",
+                          "application/x-www-form-urlencoded");
+    }
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(h.audit_detail("user.create", "failure", "newuser") == "store_unavailable");
+    CHECK_FALSE(h.auth_mgr.get_user_role("newuser").has_value()); // never created
+}
+
 TEST_CASE("SettingsRoutes DELETE: a failed durable session wipe after the deactivation is a "
           "503 partial that says the account IS deactivated (#4966)",
           "[pg][settings][users][lifecycle_guard][wipefailed]") {
+    SettingsAdr2001Harness h;
+    h.session_user = "ops";
+    h.use_session_store();
+    const auto token = h.auth_mgr.create_local_session_for_test("bob", auth::Role::user, false);
+    REQUIRE_FALSE(token.empty());
+    const auto durable_sessions_of_bob = [&] {
+        auto lease = h.auth_db.pool().acquire();
+        REQUIRE(lease);
+        yuzu::server::pg::PgResult r = yuzu::server::pg::exec_params(
+            lease.get(), "SELECT 1 FROM session_store.sessions WHERE username = 'bob'",
+            std::vector<std::string>{});
+        REQUIRE(r.status() == PGRES_TUPLES_OK);
+        return PQntuples(r.get());
+    };
+    REQUIRE(durable_sessions_of_bob() == 1);
+    // Fires AFTER the deactivation commits, so the #4772 credentials-first revoke still persists
+    // and only the post-commit wipe inside remove_user_checked faults.
+    yuzu::test::SessionWipeFaultAfterDeactivation fault{h.auth_db.pool()};
+    fault.arm();
+
+    auto res = h.delete_user("bob");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    // The DELETE route DOES converge on a repeat (the second call re-runs the wipe), so it keeps
+    // the retry shape.
+    CHECK(res->get_header_value("Retry-After") == "2");
+    const auto body = nlohmann::json::parse(res->body);
+    CHECK(body["error"]["message"].get<std::string>().starts_with("User deactivated, but session"));
+    CHECK_FALSE(h.auth_mgr.get_user_role("bob").has_value()); // deactivated
+    CHECK(h.has_audit("user.delete", "partial", "User", "bob"));
+    CHECK(h.audit_detail("user.delete", "partial", "bob")
+              .starts_with("account_deactivated session_wipe_failed=true"));
+    // Once the store is healthy a repeat answers 404 (already inactive); there is nothing left to
+    // finish here, because the earlier revoke leg had already removed the session.
+    fault.repair();
+    // The credentials-first revoke (#4772) already deleted the durable session before the
+    // deactivation, so the post-commit wipe that faulted had nothing left to remove.
+    CHECK(durable_sessions_of_bob() == 0);
+    auto again = h.delete_user("bob");
+    REQUIRE(again);
+    CHECK(again->status == 404);
+    // ... and the repeat leaves it that way.
+    CHECK(durable_sessions_of_bob() == 0);
+    CHECK_FALSE(h.auth_mgr.validate_session(token).has_value());
+}
+
+// #4772: the credentials-first revoke holds the durable session DELETE to the same fail-closed
+// contract as the token revoke. A row that did not delete survives and is rehydrated by another
+// replica (or after a restart), so the delete must refuse BEFORE touching the account.
+TEST_CASE("SettingsRoutes DELETE: a durable session delete that does not persist during the "
+          "credential revoke is a 500 partial and the account is NOT deleted (#4772)",
+          "[pg][settings][users][adr2001][sessions-persisted]") {
     SettingsAdr2001Harness h;
     h.session_user = "ops";
     h.use_session_store();
@@ -1667,24 +1782,26 @@ TEST_CASE("SettingsRoutes DELETE: a failed durable session wipe after the deacti
 
     auto res = h.delete_user("bob");
     REQUIRE(res);
-    CHECK(res->status == 503);
-    // The DELETE route DOES converge on a repeat (the second call re-runs the wipe), so it keeps
-    // the retry shape.
-    CHECK(res->get_header_value("Retry-After") == "2");
+    CHECK(res->status == 500);
     const auto body = nlohmann::json::parse(res->body);
-    CHECK(body["error"]["message"].get<std::string>().starts_with("User deactivated, but session"));
-    CHECK_FALSE(h.auth_mgr.get_user_role("bob").has_value()); // deactivated
+    CHECK(body["error"]["message"].get<std::string>().starts_with("Failed to revoke sessions"));
+    // NOT a clean delete: the account is untouched and the audit row says so.
+    CHECK(h.auth_mgr.get_user_role("bob").has_value());
     CHECK(h.has_audit("user.delete", "partial", "User", "bob"));
-    CHECK(h.audit_detail("user.delete", "partial", "bob")
-              .starts_with("account_deactivated session_wipe_failed=true"));
-    // A repeat once the store is healthy finishes the job and answers 404 (already inactive).
+    const auto detail = h.audit_detail("user.delete", "partial", "bob");
+    CHECK(detail.find("sessions_db_error=true") != std::string::npos);
+    CHECK(detail.find("api_tokens_db_error=true") == std::string::npos);
+    CHECK_FALSE(h.has_audit("user.delete", "success", "User", "bob"));
+
+    // The surviving durable row is exactly what the failed attempt left behind ...
     h.wipe_fault.repair();
-    CHECK(durable_sessions_of_bob() == 1); // the wipe failed: the durable session survived
+    CHECK(durable_sessions_of_bob() == 1);
+    // ... and a retry against a healthy store deprovisions for real.
     auto again = h.delete_user("bob");
     REQUIRE(again);
-    CHECK(again->status == 404);
-    // ... and it genuinely finished the job: the durable session is gone now.
+    CHECK(again->status == 200);
     CHECK(durable_sessions_of_bob() == 0);
+    CHECK_FALSE(h.auth_mgr.get_user_role("bob").has_value());
     CHECK_FALSE(h.auth_mgr.validate_session(token).has_value());
 }
 
@@ -2140,4 +2257,100 @@ TEST_CASE("SettingsRoutes DELETE /api/settings/users: a lost outcome row keeps t
     CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
     CHECK_FALSE(h.auth_mgr.get_user_role("bob").has_value());
     REQUIRE(h.attempts.size() == 1);
+}
+
+// ── #6940: the Users and API-token fragments are never cached ─────────────────
+// `set_header` appends, and `get_header_value` returns the first, so a doubled header would hide
+// from a value-only assertion: count them.
+namespace {
+void check_private_no_store(const httplib::Response& res) {
+    CHECK(res.get_header_value("Cache-Control") == "no-store, private");
+    CHECK(res.get_header_value("Vary") == "Cookie");
+    CHECK(res.headers.count("Cache-Control") == 1);
+    CHECK(res.headers.count("Vary") == 1);
+}
+} // namespace
+
+TEST_CASE("SettingsRoutes users fragment: the list and every mutation re-render is no-store "
+          "and private",
+          "[settings][users][cache]") {
+    SettingsRoutesHarness h;
+    h.session_user = "admin";
+    h.session_role = auth::Role::admin;
+
+    SECTION("GET /fragments/settings/users") {
+        auto res = h.Get("/fragments/settings/users");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        check_private_no_store(*res);
+    }
+    SECTION("POST /api/settings/users: created") {
+        auto res = h.Post("/api/settings/users", "username=carol&password=carolpassword1",
+                          "application/x-www-form-urlencoded");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        check_private_no_store(*res);
+    }
+    SECTION("POST /api/settings/users: required-field refusal re-renders the list") {
+        auto res = h.Post("/api/settings/users", "username=&password=",
+                          "application/x-www-form-urlencoded");
+        REQUIRE(res);
+        REQUIRE(res->status == 400);
+        CHECK(res->body.find("hx-delete=\"/api/settings/users/bob\"") != std::string::npos);
+        check_private_no_store(*res);
+    }
+    SECTION("POST /api/settings/users/{name}/role: changed") {
+        auto res = h.Post("/api/settings/users/bob/role", R"({"role":"admin"})");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        CHECK(res->get_header_value("HX-Trigger").find("Role updated") != std::string::npos);
+        check_private_no_store(*res);
+    }
+    SECTION("POST /api/settings/users/{name}/role: unchanged") {
+        auto res = h.Post("/api/settings/users/bob/role", R"({"role":"user"})");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        CHECK(res->get_header_value("HX-Trigger").find("Role unchanged") != std::string::npos);
+        check_private_no_store(*res);
+    }
+}
+
+TEST_CASE("SettingsRoutes users and API tokens: the PG-backed re-renders are no-store, private",
+          "[pg][settings][users][api_tokens][cache]") {
+    constexpr const char* kFormCt = "application/x-www-form-urlencoded";
+    SettingsAdr2001Harness h;
+
+    SECTION("DELETE /api/settings/users/{name}: removed") {
+        auto res = h.delete_user("bob");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        check_private_no_store(*res);
+    }
+    SECTION("GET /fragments/settings/api-tokens") {
+        REQUIRE(h.token_store->create_token("listed", "admin").has_value());
+        auto res = h.sink.Get("/fragments/settings/api-tokens");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        CHECK(res->body.find("listed") != std::string::npos);
+        check_private_no_store(*res);
+    }
+    SECTION("POST /api/settings/api-tokens: the response carries the raw token once") {
+        auto res = h.sink.Post("/api/settings/api-tokens", "name=t1&ttl_hours=24", kFormCt);
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        const auto listed = h.token_store->list_tokens();
+        REQUIRE(listed.has_value());
+        REQUIRE(listed->size() == 1); // it minted, so the body is the reveal, not a refusal
+        check_private_no_store(*res);
+    }
+    SECTION("DELETE /api/settings/api-tokens/{id}: revoked") {
+        REQUIRE(h.token_store->create_token("revoke-me", "admin").has_value());
+        const auto before = h.token_store->list_tokens("admin");
+        REQUIRE(before.has_value());
+        REQUIRE(before->size() == 1);
+        auto res = h.sink.Delete("/api/settings/api-tokens/" + (*before)[0].token_id);
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        check_private_no_store(*res);
+    }
 }

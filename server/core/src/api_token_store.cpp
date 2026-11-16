@@ -52,6 +52,16 @@ constexpr const char* kStoreName = "api_token_store";
 constexpr std::chrono::milliseconds kReadTimeout{1500};
 constexpr std::chrono::milliseconds kWriteTimeout{2000};
 
+// Shared by rotate_engine_credential's 1-active guard and confirm_rotation's
+// kUnresolvedSole arm (#6716 UP-6): the two must refuse the same state with the
+// same words. The substring "unresolved rotation metadata" is what
+// engine_store_error_class.hpp keys Conflict on; keep it. Remediation LEADS WITH
+// inspect, not revoke: the sole surviving row is often the GOOD credential.
+constexpr const char* kUnresolvedRotationMetadataMsg =
+    "one active credential with unresolved rotation metadata - "
+    "inspect the credential state and do not rotate; revoke only "
+    "if it is confirmed stale";
+
 // Raw token layout: "yuzu_" prefix + 32 random chars = 37 bytes total
 // (generate_raw_token below). The move-based secret-scrub discipline
 // elsewhere in this file (rotate_token's `scrub_secrets` ScopeExit, and
@@ -892,7 +902,8 @@ std::optional<ApiToken> ApiTokenStore::validate_token(const std::string& raw_tok
     return t;
 }
 
-ApiTokenStore::CheckedToken ApiTokenStore::validate_token_checked(const std::string& raw_token) {
+ApiTokenStore::CheckedToken ApiTokenStore::validate_token_checked(const std::string& raw_token,
+                                                                  TokenReadMode mode) {
     if (raw_token.empty())
         return {TokenCheck::kInvalid, std::nullopt};  // definitive: no credential is no credential
     if (!open_)
@@ -913,26 +924,40 @@ ApiTokenStore::CheckedToken ApiTokenStore::validate_token_checked(const std::str
     // "we asked and did not get an answer", and zero rows is the same definitive no.)
     const auto hash = sha256_hex(raw_token);
     const auto gen_before = revoke_generation_.load(std::memory_order_acquire);
-
-    {
-        std::lock_guard cache_lock(cache_mtx_);
-        auto it = token_cache_.find(hash);
-        if (it != token_cache_.end()) {
-            if (std::chrono::steady_clock::now() - it->second.cached_at < kTokenCacheTtl) {
-                const auto& cached = it->second.token;
-                const auto now = now_epoch();
-                if (cached.revoked || (cached.expires_at > 0 && now > cached.expires_at)) {
-                    token_cache_.erase(it);
-                    cache_misses_.fetch_add(1, std::memory_order_relaxed);
-                    return {TokenCheck::kInvalid, std::nullopt}; // definitive
-                }
-                cache_hits_.fetch_add(1, std::memory_order_relaxed);
-                return {TokenCheck::kValid, cached};
-            }
-            token_cache_.erase(it);
+    // The one place the mode is interpreted. No `default:` on purpose: a new enumerator is a
+    // -Wswitch diagnostic here, not a silent fall-through to the cache. A value outside the
+    // enumerators (only reachable through a cast) takes the durable read, the stronger one.
+    const bool authoritative = [mode] {
+        switch (mode) {
+        case TokenReadMode::kCached:
+            return false;
+        case TokenReadMode::kAuthoritative:
+            return true;
         }
+        return true;
+    }();
+
+    if (!authoritative) {
+        {
+            std::lock_guard cache_lock(cache_mtx_);
+            auto it = token_cache_.find(hash);
+            if (it != token_cache_.end()) {
+                if (std::chrono::steady_clock::now() - it->second.cached_at < kTokenCacheTtl) {
+                    const auto& cached = it->second.token;
+                    const auto now = now_epoch();
+                    if (cached.revoked || (cached.expires_at > 0 && now > cached.expires_at)) {
+                        token_cache_.erase(it);
+                        cache_misses_.fetch_add(1, std::memory_order_relaxed);
+                        return {TokenCheck::kInvalid, std::nullopt}; // definitive
+                    }
+                    cache_hits_.fetch_add(1, std::memory_order_relaxed);
+                    return {TokenCheck::kValid, cached};
+                }
+                token_cache_.erase(it);
+            }
+        }
+        cache_misses_.fetch_add(1, std::memory_order_relaxed);
     }
-    cache_misses_.fetch_add(1, std::memory_order_relaxed);
 
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease) {
@@ -969,7 +994,11 @@ ApiTokenStore::CheckedToken ApiTokenStore::validate_token_checked(const std::str
     // check-then-lock ordering leaves a window where a racing revoke's erase runs
     // between the check and the insert, leaving a revoked=false entry alive for a full
     // kTokenCacheTtl — which on this path would keep a revoked credential's stream up.
-    {
+    //
+    // `kAuthoritative` leaves the cache alone altogether: a caller that bypasses the cache to
+    // see a revoke made elsewhere must not also change what every other caller on this replica
+    // is served (no insert, and no erase on a negative answer either).
+    if (!authoritative) {
         std::lock_guard cache_lock(cache_mtx_);
         if (revoke_generation_.load(std::memory_order_acquire) == gen_before) {
             token_cache_[hash] = CachedToken{t, std::chrono::steady_clock::now()};
@@ -1511,6 +1540,27 @@ ApiTokenStore::rotate_engine_credential(const std::string& principal_id, int64_t
 
         if (active.size() == 1) {
             const ApiToken& predecessor = active.front();
+
+            // #6716 UP-6: a SOLE active credential that still carries rotation
+            // linkage (a non-empty rotation_group or supersedes_token_id) is a
+            // rotation that never finished resolving: the partner was revoked
+            // or expired and the best-effort pair-resolve failed. Minting from
+            // here would stamp a second successor beside a row that already
+            // claims to be one, producing two active rows that both carry
+            // supersedes_token_id (no predecessor to pair), and the route's
+            // read-back would then pin the wrong row. Refuse BEFORE anything is
+            // minted, using the SAME predicate and the SAME string as
+            // confirm_rotation's kUnresolvedSole arm (one classifier, so the
+            // two can never disagree on what "stale linkage" means). The
+            // string is keyed Conflict (terminal, 409, no retry hint). The
+            // surviving row is usually the GOOD credential, so the remedy
+            // leads with inspect, never with revoke or re-rotate.
+            if (detail::classify_confirm_state(active, std::string{}) ==
+                detail::RotationConfirmState::kUnresolvedSole) {
+                error_msg = kUnresolvedRotationMetadataMsg;
+                return false;
+            }
+
             const int64_t window_end = now + overlap_secs;
 
             // Reject, never truncate, if the requested overlap would
@@ -1731,9 +1781,7 @@ ApiTokenStore::confirm_rotation(const std::string& principal_id, const std::stri
             // Remediation LEADS WITH inspect, not revoke: in the sweep-outage
             // variant (UP-2) this sole row is the GOOD surviving credential, so
             // a reflexive revoke would drop the principal to zero credentials.
-            error_msg = "one active credential with unresolved rotation metadata - "
-                        "inspect the credential state and do not rotate; revoke only "
-                        "if it is confirmed stale";
+            error_msg = kUnresolvedRotationMetadataMsg;
             return false;
         case detail::RotationConfirmState::kSoleConfirmed:
             error_msg = "rotation already confirmed - the supplied token_id is the "
@@ -1757,8 +1805,8 @@ ApiTokenStore::confirm_rotation(const std::string& principal_id, const std::stri
         // are checking the same shape (#2443 added that helper for the same
         // linkage question, unlocked). pair_matches_pin collapses "not
         // linked" and "linked but wrong pin" into one bool; here those are
-        // two DIFFERENT client-visible error classes (this block: retryable
-        // "no in-flight rotation to confirm"; the pin check below: terminal
+        // two DIFFERENT client-visible error classes (this block: terminal
+        // "rotation pair is malformed"; the pin check below: terminal
         // "token_id does not match" - see engine_store_error_class.hpp).
         // Swapping in the bool would silently merge them. A shared helper
         // needs a reason enum, not a bool - tracked as #2953, not done here
@@ -1775,7 +1823,14 @@ ApiTokenStore::confirm_rotation(const std::string& principal_id, const std::stri
         if (predecessor == nullptr || successor == nullptr || successor->rotation_group.empty() ||
             successor->rotation_group != predecessor->rotation_group ||
             successor->supersedes_token_id != predecessor->token_id) {
-            error_msg = "no in-flight rotation to confirm";
+            // A POSITIVE read of exactly two active rows whose linkage is
+            // broken: terminal, not the ambiguous empty read. Its own string
+            // (keyed Conflict), because "no in-flight rotation to confirm" is
+            // keyed Transient and would hand an agentic client a retry hint
+            // for a state no retry can repair. Same reasoning and wording as
+            // the human token-keyed `confirm_token_rotation`.
+            error_msg = "rotation pair is malformed - confirm cannot proceed; "
+                        "revoke one side explicitly";
             return false;
         }
 

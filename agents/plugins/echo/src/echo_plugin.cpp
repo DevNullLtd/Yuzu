@@ -13,7 +13,7 @@
  *   query         -- Query events by time range with optional type filter
  *   export        -- Export events as JSON array
  *   snapshot      -- Force an immediate full snapshot (all 4 collectors)
- *   configure     -- Update retention_days, intervals, redaction patterns
+ *   configure     -- Update intervals, redaction patterns
  *
  * Data flow:
  *   trigger fires -> enumerate current state -> load previous state from echo_state
@@ -29,6 +29,8 @@
 #include "echo_proc_stream.hpp"
 #include "echo_module_etw.hpp"
 #include "echo_db.hpp"
+#include "echo_fold.hpp" // EchoFold::gc_dictionary
+#include "echo_fold_schema.hpp"
 #include "echo_usage.hpp"
 #include "echo_fleet_snapshot.hpp"
 #include "echo_source_health.hpp"
@@ -39,6 +41,7 @@
 #include "echo_proc_perf.hpp"
 #include "echo_schema_registry.hpp"
 #include "echo_aggregator.hpp"
+#include "echo_hour_dedup.hpp" // HourlySeenSet
 #include "echo_software_core.hpp"
 #include "echo_sql_executor.hpp"
 
@@ -55,6 +58,7 @@
 #include <cstdint>
 #include <charconv>
 #include <chrono>
+#include <filesystem>
 #include <format>
 #include <iterator>
 #include <memory>
@@ -100,37 +104,6 @@ int64_t netconn_lookback_seconds(yuzu::echo::EchoDatabase& db) {
 }
 
 // ── State serialization helpers ──────────────────────────────────────────────
-
-json processes_to_json(const std::vector<yuzu::agent::ProcessInfo>& procs) {
-    json arr = json::array();
-    for (const auto& p : procs) {
-        arr.push_back({{"pid", p.pid},
-                       {"ppid", p.ppid},
-                       {"name", p.name},
-                       {"cmdline", p.cmdline},
-                       {"user", p.user}});
-    }
-    return arr;
-}
-
-std::vector<yuzu::agent::ProcessInfo> json_to_processes(const std::string& s) {
-    std::vector<yuzu::agent::ProcessInfo> result;
-    if (s.empty())
-        return result;
-    try {
-        auto arr = json::parse(s);
-        for (const auto& j : arr) {
-            yuzu::agent::ProcessInfo p;
-            p.pid = j.value("pid", 0u);
-            p.ppid = j.value("ppid", 0u);
-            p.name = j.value("name", "");
-            p.cmdline = j.value("cmdline", "");
-            p.user = j.value("user", "");
-            result.push_back(std::move(p));
-        }
-    } catch (...) {}
-    return result;
-}
 
 json connections_to_json(const std::vector<yuzu::echo::NetConnection>& conns) {
     json arr = json::array();
@@ -304,10 +277,13 @@ std::vector<yuzu::echo::ServiceInfo> json_to_services(const std::string& s) {
 json users_to_json(const std::vector<yuzu::echo::UserSession>& users) {
     json arr = json::array();
     for (const auto& u : users) {
-        arr.push_back({{"user", u.user},
-                       {"domain", u.domain},
-                       {"logon_type", u.logon_type},
-                       {"session_id", u.session_id}});
+        json j = {{"user", u.user},
+                  {"domain", u.domain},
+                  {"logon_type", u.logon_type},
+                  {"session_id", u.session_id}};
+        if (u.disconnected)
+            j["disconnected"] = true; // absent = attached: an older baseline reads as attached
+        arr.push_back(std::move(j));
     }
     return arr;
 }
@@ -324,6 +300,7 @@ std::vector<yuzu::echo::UserSession> json_to_users(const std::string& s) {
             u.domain = j.value("domain", "");
             u.logon_type = j.value("logon_type", "");
             u.session_id = j.value("session_id", "");
+            u.disconnected = j.value("disconnected", false);
             result.push_back(std::move(u));
         }
     } catch (...) {}
@@ -339,14 +316,14 @@ std::vector<yuzu::echo::UserSession> json_to_users(const std::string& s) {
 std::vector<std::string> load_redaction_patterns(yuzu::echo::EchoDatabase& db) {
     // The built-in patterns (`kDefaultRedactionPatterns` — password/secret/token/
     // api_key/credential) are the baseline content-protection layer for
-    // process_live, and they MUST always apply: an operator can ADD patterns via
+    // the process tiers, and they MUST always apply: an operator can ADD patterns via
     // configure but can never fully DISABLE redaction. So union the defaults into
     // whatever is stored — fail-closed (fjarvis HIGH). A bare `parse_pattern_config`
     // fallback was fail-OPEN: it returns the safe built-in set only for an empty or
     // non-array value, but a *valid array whose elements all get dropped* (`[]`,
     // `[1,2,3]`, all-over-long, or `["*"]` whose stripped core is empty) returns an
     // EMPTY vector — silently disabling redaction so `password`/`token`/`secret`
-    // land in process_live in plaintext. collect_fast and procperf called this
+    // land in the process tiers in plaintext. collect_fast and procperf called this
     // without the union do_fleet_snapshot already applied; centralising it here
     // closes all three paths at once and removes the divergent local default list.
     // #541 — parse_pattern_config still bounds + sanitises at load (drops
@@ -606,16 +583,28 @@ public:
         }
 
         auto db_path = std::filesystem::path{db_dir} / "echo.db";
+        db_path_ = db_path;
         auto result = yuzu::echo::EchoDatabase::open(db_path);
         if (!result) {
             // The ABI carries only the code, so this line is where the cause (a refused planted
             // file, its owner and the remedy; a corrupt-and-unmovable db) reaches the log.
             spdlog::error("ECHO: failed to open db: {}", result.error());
+            if (yuzu::echo::is_free_space_refusal(result.error())) {
+                // The v10 roll-up migration needs twice the file's size (plus its log) free and the volume has
+                // less. Nothing was changed. The plugin LOADS, offline, so `echo.status` can say why
+                // (`storage_state|offline|free_space`); no trigger is registered and nothing
+                // collects until the agent restarts with the space freed.
+                offline_detail_ = result.error();
+                return {};
+            }
             return std::unexpected(
                 yuzu::PluginError{1, std::format("ECHO: failed to open db: {}", result.error())});
         }
         db_ = std::make_unique<yuzu::echo::EchoDatabase>(std::move(*result));
         reconcile_db_health_publish(ctx); // #1567: replay any unpublished quarantine fact
+        // #3864: a process baseline left by an earlier build holds command lines; rewrite it
+        // before any trigger can run. The result is advisory (logged inside, retried next start).
+        (void)yuzu::echo::scrub_process_baseline(*db_);
 
         // Load config
         int fast_interval = 60;
@@ -693,6 +682,17 @@ public:
         if (stream_active_) {
             spdlog::info("ECHO: {} process stream active (process poll superseded)",
                          proc_stream_->method_name());
+            // The stream reports only processes that start from now on; seed the pid -> name
+            // map with the ones already running so their sockets and loads can be labelled.
+            // Best effort: init() is not contained at the plugin seam, and the map also fills
+            // from the stream and the next poll, so a failed seed must not fail the plugin.
+            try {
+                note_pid_names(yuzu::agent::enumerate_processes(), now_epoch_seconds());
+            } catch (const std::exception& e) {
+                spdlog::warn("ECHO: process-name seed failed: {}", e.what());
+            } catch (...) {
+                spdlog::warn("ECHO: process-name seed failed");
+            }
         }
 
         // roadmap 2.2: construct + start the nstat client alongside the ES
@@ -771,7 +771,7 @@ public:
                             spdlog::info(
                                 "ECHO: boot AutoLogger trace had no pre-session process events");
                             db_->set_config("last_backfill_boot_ts", boot_key);
-                        } else if (db_->insert_process_events(typed)) {
+                        } else if (db_->fold_process_events(typed)) {
                             db_->set_config("last_backfill_boot_ts", boot_key);
                             spdlog::info(
                                 "ECHO: boot-backfilled {} process events from the ETW AutoLogger",
@@ -868,7 +868,7 @@ public:
                     r.snapshot_id = nc_snap;
                 if (nc_rows.empty()) {
                     db_->set_config("netconn_backfill_hwm", std::to_string(plan.hwm));
-                } else if (db_->insert_netconn_events(nc_rows)) {
+                } else if (db_->fold_netconn_events(nc_rows)) {
                     db_->set_config("netconn_backfill_hwm", std::to_string(plan.hwm));
                     spdlog::info("ECHO: netconn backfilled {} pre-Echo connectivity events",
                                  nc_rows.size());
@@ -938,7 +938,7 @@ public:
                            // skip_known_historical: a restart after the commit below failed
                            // re-walks every profile, and the rows the failed pass already wrote
                            // must not be written a second time (the retry path's own insert).
-                           db_->insert_mapdrive_events(typed, std::nullopt,
+                           db_->fold_mapdrive_events(typed, std::nullopt,
                                                        /*skip_known_historical=*/true)) {
                     // §3.8 bounded per-profile retry (related issue #5291): every profile this
                     // pass could not fully resolve (not_found, privilege_missing, mount_failed, a
@@ -1119,12 +1119,74 @@ public:
             for (auto& src : cursor_sources_)
                 src->stop();
         }
-        db_.reset();
+        {
+            // A pool command (a manual `rollup`, or a `status` released from a VACUUM wait) can
+            // still be inside enforce_budget. Wait for that pass to finish rather than reset the
+            // database under it. collect_mu_ is already released, so the lock order
+            // rollup_mu_ -> collect_mu_ -> mu_ holds.
+            std::lock_guard rollup_lock(rollup_mu_);
+            set_budget_catch_up({}); // a collect_fast past the db_ check must not arm a slice
+            db_.reset();
+        }
         spdlog::info("Echo plugin shut down");
     }
 
+    // Frozen plugin-ABI seam: no C++ exception may unwind out of an action. One containment
+    // point for all of them -- before this, a throw from any of the dispatch chain (a
+    // std::ios_base::failure from a /proc read, a bad_alloc, a std::length_error) terminated the
+    // agent. The catch also rolls back a transaction the unwind left open on the shared write
+    // connection (purge_source and the other raw-BEGIN paths allocate between BEGIN and COMMIT).
+    // What it does: fail_internal asks for a ROLLBACK before this action returns and logs the
+    // result (a warning with the SQLite return code when the ROLLBACK itself fails); it does
+    // not promise the connection is back in autocommit. What it cannot cover: the unwind
+    // releases mu_ before the catch re-takes it, so another thread can write in between. A
+    // transactional writer fails its own BEGIN; the two standalone writers (set_config,
+    // set_state) refuse while a transaction is open and report failure instead of a success
+    // the rollback would discard. The one per-call-locked writer left,
+    // the roll-up's execute_sql_range, can still join and be discarded. Its mark is written by
+    // set_config, which refuses while the transaction is open, so that window is rolled up
+    // again at the next pass; if the rollback lands first the mark is written and the window
+    // is not re-run (a missing hourly summary, never a lost raw capture row). A throw between
+    // BEGIN and COMMIT plus a writer in the unwind-to-catch gap is the whole exposure.
     int execute(yuzu::CommandContext& ctx, std::string_view action, yuzu::Params params) override {
+        try {
+            return execute_dispatch(ctx, action, params);
+        } catch (const std::exception& e) {
+            return fail_internal(ctx, e.what());
+        } catch (...) {
+            return fail_internal(ctx, "unknown exception");
+        }
+    }
+
+    int fail_internal(yuzu::CommandContext& ctx, const char* what) noexcept {
+        // Ask for the rollback FIRST (it is noexcept and logs its own result): the logger and
+        // the output sink can throw, and a swallowed throw must not skip the rollback request
+        // for a transaction the unwind left open on the shared connection.
+        if (db_)
+            db_->rollback_open_transaction();
+        try {
+            // what() stays in the log only; the wire line is a fixed token because the text can
+            // carry paths and JSON fragments.
+            spdlog::error("ECHO: action aborted by an exception: {}", what);
+            ctx.write_output("error|internal");
+        } catch (...) {
+            // Containment of the containment: nothing may escape the catch handler.
+        }
+        return 1;
+    }
+
+    int execute_dispatch(yuzu::CommandContext& ctx, std::string_view action, yuzu::Params params) {
         if (!db_) {
+            if (!offline_detail_.empty()) {
+                // Loaded but offline (the migration was refused): `status` explains, every other
+                // action refuses with the same error. `error|` leads, as format_storage_*_lines
+                // pins.
+                const auto lines = yuzu::echo::format_storage_refused_lines(offline_detail_);
+                for (std::size_t i = 0; i < lines.size(); ++i)
+                    if (i == 0 || action == "status")
+                        ctx.write_output(lines[i]);
+                return 1;
+            }
             ctx.write_output("error|Echo database not initialized");
             return 1;
         }
@@ -1171,6 +1233,46 @@ public:
                 .count());
         std::lock_guard lock(health_mu_);
         health_.record(registry_name, token, now);
+    }
+
+    // ── pid -> name map (pid_name_) ───────────────────────────────────────────
+    // Callers hold collect_mu_ (init runs before any trigger can fire).
+    // `ts` (the event or tick time, epoch seconds) only ages out exited pids at the cap.
+    void note_pid_start(std::uint32_t pid, const std::string& name, std::int64_t ts) {
+        if (pid == 0 || name.empty())
+            return;
+        if (pid_name_.size() >= kPidNameCap && !pid_name_.contains(pid)) {
+            // The stream leg never erases a stopped pid, so a busy host fills the map with dead
+            // ones. Entries past their grace window already resolve to "" and cost nothing to
+            // drop; flush wholesale (which forgets running pids too) only if that left no room.
+            std::erase_if(pid_name_, [ts](const auto& kv) {
+                return kv.second.exited_at != 0 &&
+                       ts - kv.second.exited_at > yuzu::echo::kPidNameGraceSec;
+            });
+            if (pid_name_.size() >= kPidNameCap)
+                pid_name_.clear(); // wholesale flush, as the ETW consumer's cache does
+        }
+        pid_name_[pid] = yuzu::echo::PidName{name, 0};
+    }
+    // A stop never erases: loads and sockets of a just-exited process still resolve inside
+    // kPidNameGraceSec, while a reused pid whose start was missed resolves to "" after it.
+    void note_pid_names(const std::vector<yuzu::echo::ProcEvent>& evs) {
+        for (const auto& e : evs) {
+            if (e.is_start) {
+                note_pid_start(e.pid, e.image_name, e.ts_unix);
+            } else if (auto it = pid_name_.find(e.pid); it != pid_name_.end()) {
+                it->second.exited_at = e.ts_unix;
+            }
+        }
+    }
+    // Poll leg: a snapshot has no stop events, so a pid missing from the UNFILTERED enumeration
+    // is stamped exited at `ts` (same epoch-seconds clock as the stream's ts_unix), which is what
+    // makes the grace window hold on a platform with no process stream. Starts first, so a pid
+    // observed again after a stamp is reset to running by note_pid_start.
+    void note_pid_names(const std::vector<yuzu::agent::ProcessInfo>& procs, std::int64_t ts) {
+        for (const auto& p : procs)
+            note_pid_start(p.pid, p.name, ts);
+        yuzu::echo::note_pid_exits(pid_name_, procs, ts);
     }
 
     // #1567: idempotent reconcile of the persisted quarantine fact (echo_config)
@@ -1261,6 +1363,11 @@ private:
     // Guarded by collect_mu_.
     bool proc_poll_seed_pending_{false};
     std::unique_ptr<yuzu::echo::EchoDatabase> db_;
+    // Set when the database could not be opened because the v10 migration needs more free disk
+    // space than the volume has (the plugin loads, offline): the open error's text, which `status`
+    // reports as `storage_state|offline|free_space`. Empty on every other path. Written once in
+    // init(), before any action runs.
+    std::string offline_detail_;
     std::mutex collect_mu_; // Protects the state read-diff-write sequence in collect methods
     // Separate mutex for the software source: its state read-diff-write touches
     // only the "software" KV state (never prev_perf_/prev_proc_/proc_stream_), and
@@ -1366,6 +1473,40 @@ private:
     // block's self-heal comment). Guarded by collect_mu_.
     bool nstat_tcp_primary_prev_{false};
 
+    // ── Storage budget and hourly de-duplication state ────────────────────────
+    // Path of echo.db, for the free-disk check that gates the one-off VACUUM.
+    std::filesystem::path db_path_;
+    // pid -> process name, so tcp sockets and module loads (which carry a pid but not always a
+    // name) can be labelled. Fed by the process source (stream events or poll snapshots), so
+    // a paused process source leaves it empty. Guarded by collect_mu_; flushed wholesale at
+    // kPidNameCap, cleared when the process source is confirmed disabled.
+    std::unordered_map<std::uint32_t, yuzu::echo::PidName> pid_name_;
+    static constexpr std::size_t kPidNameCap = 65536;
+    // Hourly de-duplication sets (echo_hour_dedup.hpp). Each tick filters IN PLACE inside a
+    // BatchScope and keeps the admitted keys only once the rows are committed, so a rolled-back
+    // tick re-derives the same rows. Guarded by collect_mu_. The overflow counters mirror the
+    // committed sets for status.
+    yuzu::echo::HourlySeenSet tcp_closing_seen_;
+    yuzu::echo::HourlySeenSet module_seen_;
+    std::atomic<std::uint64_t> tcp_closing_overflows_{0};
+    std::atomic<std::uint64_t> module_overflows_{0};
+    // Set when a pass ran out of time with evictable rows left and data still over target:
+    // each fast tick then runs one more bounded slice (do_collect_fast) until it clears.
+    std::atomic<bool> budget_catch_up_{false};
+    // The clock reading the pass that armed the catch-up was admitted with (the retention clock
+    // guard had a verdict on it). Every slice of that drain runs with it, never a fresh reading:
+    // a slice has no guard contact of its own. A separate field, not a sentinel in one int64,
+    // because a reading <= 0 is the legitimate dead-CMOS case. Only meaningful while the flag is
+    // set; written and read under rollup_mu_ (the flag alone is also peeked lock-free).
+    std::atomic<std::int64_t> budget_catch_up_now_{0};
+    // The conversion-VACUUM deferral time when the persisted marker could not be written: it
+    // keeps the retry at most daily for this process. 0 = none. Written under rollup_mu_, read
+    // lock-free by status.
+    std::atomic<std::int64_t> vacuum_marker_fallback_{0};
+    // steady_clock tick count of this process's last conversion attempt, 0 = none (see
+    // vacuum_attempted_recently).
+    std::atomic<std::int64_t> vacuum_last_attempt_{0};
+
     // Cursor-model sources (echo_cursor.hpp: power, removable — wave 2). Built
     // once in init() from make_cursor_sources() (empty this wave); NOT a
     // function-local static (P-002) — these are EchoPlugin-owned members with
@@ -1411,7 +1552,7 @@ private:
         // Forensic-pause contract: the ETW collector owns a live session and keeps
         // filling its ring even while the `process` source is disabled. Unlike the
         // poll (which simply doesn't enumerate), the buffered events SURVIVE — so on
-        // the first drain after re-enable they would be persisted into process_live,
+        // the first drain after re-enable they would be folded into the process tiers,
         // capturing exactly the paused window the toggle forbids ("the agent will not
         // STORE what the toggle forbids", as already enforced for boot-backfill).
         // Drain-and-DISCARD each disabled tick so nothing from the paused window is
@@ -1424,6 +1565,8 @@ private:
             proc_stream_->drain();       // flush + discard; never inserted
             pending_stream_evs_.clear(); // and drop any pre-disable insert-retry backlog
         }
+        if (process_state.has_value() && !*process_state)
+            pid_name_.clear(); // a paused process source feeds nothing; forget what it knew
         if (process_enabled) {
             // #538: single source of truth for the diff-baseline state key (see
             // diff_state_key) — the same key apply_source_enabled_transition
@@ -1431,8 +1574,8 @@ private:
             const std::string proc_key{yuzu::echo::diff_state_key("process")};
             if (stream_active_) {
                 // Gap-free stream (ETW/Windows or Endpoint Security/macOS)
-                // supersedes the snapshot-diff poll. Same process_live schema +
-                // 'started'/'stopped' so rollups and the $Process_* query surface
+                // supersedes the snapshot-diff poll. Same ProcessEvent shape +
+                // 'started'/'stopped' so the fold and the $Process_* query surface
                 // are unchanged. Names-only (no cmdline — matches the works-council
                 // posture); user resolved at drain (SID on Windows, audit-token uid
                 // on macOS).
@@ -1446,6 +1589,7 @@ private:
                                std::make_move_iterator(pending_stream_evs_.end()));
                     pending_stream_evs_.clear();
                 }
+                note_pid_names(evs); // all events, including stabilization-excluded ones
                 std::vector<yuzu::echo::ProcessEvent> typed;
                 typed.reserve(evs.size());
                 for (auto& e : evs) {
@@ -1461,10 +1605,12 @@ private:
                     pe.ppid = e.ppid;
                     pe.name = e.image_name;
                     pe.user = e.user;
+                    pe.exit_code = e.exit_code;
+                    pe.parent_name = yuzu::echo::pid_name_lookup(pid_name_, e.ppid, e.ts_unix);
                     typed.push_back(std::move(pe));
                 }
                 if (!typed.empty()) {
-                    if (!db_->insert_process_events(typed)) {
+                    if (!db_->fold_process_events(typed, std::nullopt, ts)) {
                         note_health("process", "insert_failed");
                         spdlog::error("ECHO: process stream insert failed — re-queuing {} events "
                                       "for the next tick",
@@ -1522,6 +1668,7 @@ private:
                     // since the fallback. (Mirrors the poll branch's enumerate +
                     // stabilization-exclusion filter, minus the diff/insert.)
                     auto current = yuzu::agent::enumerate_processes();
+                    note_pid_names(current, ts);
                     if (!stab_excl.empty()) {
                         std::erase_if(current, [&](const auto& p) {
                             return yuzu::echo::should_redact(p.name, stab_excl);
@@ -1530,7 +1677,7 @@ private:
                     // Checked (#1654): a failed seed must not be followed by a diff
                     // against a stale/empty baseline (ghost `started` storm), so the
                     // poll re-seeds WITHOUT diffing on the next tick.
-                    if (!db_->set_state(proc_key, processes_to_json(current).dump())) {
+                    if (!db_->set_state(proc_key, yuzu::echo::encode_process_baseline(current))) {
                         spdlog::error("ECHO: process poll-baseline seed failed after stream "
                                       "fallback; will re-seed next tick");
                         ctx.write_output("error|process state_save_failed");
@@ -1542,6 +1689,8 @@ private:
                 // No active stream (poll-only platform, or stream unavailable):
                 // snapshot-diff poll.
                 auto current = yuzu::agent::enumerate_processes();
+                // Before the exclusions: a noisy process still names its sockets.
+                note_pid_names(current, ts);
 
                 // Stabilization exclusions: drop processes whose name matches any
                 // exclusion pattern. The patterns reuse the same matching as
@@ -1558,7 +1707,7 @@ private:
                 if (proc_poll_seed_pending_) {
                     // A previous stream-fallback seed failed: re-seed the baseline
                     // without diffing (no ghost `started` for every process).
-                    if (!db_->set_state(proc_key, processes_to_json(current).dump())) {
+                    if (!db_->set_state(proc_key, yuzu::echo::encode_process_baseline(current))) {
                         spdlog::error("ECHO: process poll-baseline re-seed failed");
                         ctx.write_output("error|process state_save_failed");
                         note_health("process", "state_save_failed");
@@ -1568,19 +1717,22 @@ private:
                     note_health("process", "baseline");
                 } else {
                     auto prev_json = db_->get_state(proc_key);
-                    auto previous = json_to_processes(prev_json);
+                    auto previous = yuzu::echo::decode_process_baseline(prev_json);
 
                     auto typed = yuzu::echo::compute_process_events(previous, current, ts, snap_id,
                                                                    redaction);
+                    // The parent's image name, from the pid -> name map filled just above.
+                    for (auto& pe : typed)
+                        pe.parent_name = yuzu::echo::pid_name_lookup(pid_name_, pe.ppid, ts);
                     // Events + baseline commit in ONE transaction (#1654): a failed
                     // baseline save can no longer leave events durable with a stale
                     // baseline that the next tick would re-diff and double-emit.
-                    const std::string state_json = processes_to_json(current).dump();
+                    const std::string state_json = yuzu::echo::encode_process_baseline(current);
                     const bool ok =
                         typed.empty()
                             ? db_->set_state(proc_key, state_json)
-                            : db_->insert_process_events(
-                                  typed, yuzu::echo::StateWrite{proc_key, state_json});
+                            : db_->fold_process_events(
+                                  typed, yuzu::echo::StateWrite{proc_key, state_json}, ts);
                     if (!ok) {
                         const char* tok = typed.empty() ? "state_save_failed" : "insert_failed";
                         spdlog::error("ECHO: process poll {} — nothing persisted, next tick "
@@ -1599,21 +1751,18 @@ private:
             note_health("process", skip_token(process_state));
         }
 
-        // `usage` derived fold (Wave 7 PR7.2b): ONE call, after BOTH process
-        // feeders above have had their chance to insert this tick (the
-        // gap-free stream branch or the snapshot-diff poll branch -- they are
-        // mutually exclusive per tick; the one-time boot-backfill, the third
-        // feeder, always runs at init, strictly before any fast tick can
-        // reach here). Still under collect_mu_ (this whole function runs
-        // under the caller's lock_guard). Gates itself on usage_enabled AND
-        // process_enabled, and on the lifecycle state internally -- a
-        // disabled or not-yet-baselined source is not a failure.
-        if (auto fold = yuzu::echo::usage::run_usage_fold(*db_, ts); !fold.ok) {
+        // `usage` derived fold (Wave 7 PR7.2b): the events themselves were folded into the usage
+        // tables INSIDE the process fold's transaction above (EchoDatabase::fold_process_events
+        // passes usage_fold_in as the fold's `extra`, so the two commit or roll back together).
+        // What is left here is the per-tick sweep with no events: expire and cap the open runs and
+        // advance the anchor, so a run ages out even on a tick with no process event. Still under
+        // collect_mu_. Gates itself on usage_enabled AND process_enabled, and on the lifecycle
+        // state internally -- a disabled or not-yet-baselined source is not a failure.
+        if (auto fold = yuzu::echo::usage::usage_sweep(*db_, ts); !fold) {
             note_health("usage", "insert_failed");
             if (ts - usage_last_fold_warn_ts_ >= 60) {
-                spdlog::warn("ECHO: usage fold failed this tick ({}) -- hwm unchanged, retrying "
-                            "next tick",
-                            fold.error);
+                spdlog::warn("ECHO: usage sweep failed this tick ({}) -- retrying next tick",
+                            fold.error());
                 usage_last_fold_warn_ts_ = ts;
             }
         } else {
@@ -1628,6 +1777,9 @@ private:
             // #538: tcp's diff baseline lives under "network" (see diff_state_key).
             const std::string net_key{yuzu::echo::diff_state_key("tcp")};
             auto current = yuzu::echo::enumerate_connections();
+            // Label sockets the collector could not name (TIME_WAIT sockets have pid 0 and stay
+            // unnamed; the rest resolve through the process source's pid -> name map).
+            yuzu::echo::fill_process_names(current, pid_name_, ts);
 
             // macOS (roadmap 2.2): nstat is the PRIMARY tcp lifecycle source
             // when the plugin's NstatClient is live and system-wide — its
@@ -1658,30 +1810,14 @@ private:
                 [&](std::vector<yuzu::echo::NstatFlowEvent> flow_events) {
                     std::vector<yuzu::echo::NetworkEvent> typed;
                     typed.reserve(flow_events.size());
-                    for (const auto& e : flow_events) {
-                        yuzu::echo::NetworkEvent ev;
-                        ev.ts = e.ts_unix;
-                        ev.snapshot_id = snap_id;
-                        ev.action = e.is_open ? "connected" : "disconnected";
-                        ev.proto = e.proto;
-                        ev.local_addr = e.local_addr;
-                        ev.local_port = e.local_port;
-                        ev.remote_addr = e.remote_addr;
-                        // nstat is a lifecycle event stream, not the
-                        // DNS-resolving poll (resolve_hostnames) —
-                        // remote_host stays empty, the same simplification
-                        // the ES process stream makes for cmdline.
-                        ev.remote_port = e.remote_port;
-                        // nstat's ADDED/REMOVED messages carry no TCP state
-                        // enum (only SRC_DESC's counters do, and only once
-                        // resolved) — ESTABLISHED/CLOSED is the honest
-                        // best-effort label for "flow just appeared" / "flow
-                        // just vanished" from the kernel's source table.
-                        ev.state = e.is_open ? "ESTABLISHED" : "CLOSED";
-                        ev.pid = e.pid;
-                        ev.process_name = e.process_name;
-                        typed.push_back(std::move(ev));
-                    }
+                    // remote_host stays empty: nstat is a lifecycle event stream, not the
+                    // DNS-resolving poll (resolve_hostnames), the same simplification the ES
+                    // process stream makes for cmdline.
+                    // Closing-state opens follow the poll leg's once-per-hour rule (#6899).
+                    flow_events = yuzu::echo::nstat_dedupe_closing_opens(std::move(flow_events),
+                                                                         tcp_closing_seen_);
+                    for (const auto& e : flow_events)
+                        typed.push_back(yuzu::echo::network_event_from_nstat_flow(e, snap_id));
                     if (!pending_nstat_evs_.empty()) {
                         typed.insert(typed.begin(),
                                      std::make_move_iterator(pending_nstat_evs_.begin()),
@@ -1690,7 +1826,7 @@ private:
                     }
                     if (typed.empty())
                         return;
-                    if (!db_->insert_network_events(typed)) {
+                    if (!db_->fold_network_events(typed)) {
                         spdlog::error("ECHO: nstat tcp lifecycle insert failed — re-queuing "
                                       "{} events for the next tick",
                                       typed.size());
@@ -1698,9 +1834,15 @@ private:
                         pending_nstat_evs_ = std::move(typed);
                         if (pending_nstat_evs_.size() > kPendingStreamCap) {
                             const auto excess = pending_nstat_evs_.size() - kPendingStreamCap;
-                            pending_nstat_evs_.erase(pending_nstat_evs_.begin(),
-                                                     pending_nstat_evs_.begin() +
-                                                         static_cast<std::ptrdiff_t>(excess));
+                            const auto cut = pending_nstat_evs_.begin() +
+                                             static_cast<std::ptrdiff_t>(excess);
+                            // The rows cut here are never stored: give their hourly keys back
+                            // so the next closing-state sighting this hour is not read as a
+                            // repeat of a row that was lost (the drain admitted them above).
+                            yuzu::echo::nstat_release_closing_keys(
+                                pending_nstat_evs_.data(), pending_nstat_evs_.data() + excess,
+                                tcp_closing_seen_);
+                            pending_nstat_evs_.erase(pending_nstat_evs_.begin(), cut);
                         }
                     } else {
                         total_events += static_cast<int>(typed.size());
@@ -1741,6 +1883,9 @@ private:
                     // already-typed pending_nstat_evs_ from an earlier failed
                     // insert rather than let it sit stuck-forever bounded.
                     nstat_client_->drain(); // discard — untrustworthy bytes
+                    yuzu::echo::nstat_release_closing_keys(
+                        pending_nstat_evs_.data(),
+                        pending_nstat_evs_.data() + pending_nstat_evs_.size(), tcp_closing_seen_);
                     pending_nstat_evs_.clear();
                     spdlog::warn("ECHO: nstat layout mismatch on stream death — discarding "
                                  "the buffered tcp lifecycle ring");
@@ -1792,7 +1937,13 @@ private:
             // back fallback tick must re-prime next tick, not diff a udp-only
             // baseline against the full snapshot (#1654).
 
-            auto typed = yuzu::echo::compute_network_events(*diff_previous, *diff_current, ts, snap_id);
+            // Filter in place inside a batch: the keys it admits are kept once the rows commit
+            // below and erased if they do not (the scope rolls back on any exit without a
+            // commit, an exception included), so a rolled-back tick re-derives the same rows
+            // without copying the whole set every tick.
+            yuzu::echo::BatchScope tcp_batch{tcp_closing_seen_};
+            auto typed = yuzu::echo::compute_network_events(*diff_previous, *diff_current, ts,
+                                                            snap_id, tcp_closing_seen_);
 
             // While nstat is primary, persist the udp-only view so the next
             // tick's poll diff stays apples-to-apples (never mistakes
@@ -1803,9 +1954,10 @@ private:
                 connections_to_json(nstat_primary ? *diff_current : current).dump();
             const bool ok = typed.empty()
                                 ? db_->set_state(net_key, state_json)
-                                : db_->insert_network_events(
+                                : db_->fold_network_events(
                                       typed, yuzu::echo::StateWrite{net_key, state_json});
             if (!ok) {
+                tcp_batch.rollback();
                 const char* tok = typed.empty() ? "state_save_failed" : "insert_failed";
                 spdlog::error("ECHO: network {} — nothing persisted, next tick re-diffs", tok);
                 ctx.write_output(typed.empty() ? "error|network state_save_failed"
@@ -1817,6 +1969,8 @@ private:
                 return 1;
             }
             nstat_tcp_primary_prev_ = nstat_primary;
+            tcp_batch.commit();
+            tcp_closing_overflows_.store(tcp_closing_seen_.overflows(), std::memory_order_relaxed);
             total_events += static_cast<int>(typed.size());
             note_health("tcp", yuzu::echo::tcp_tick_status(nstat_insert_failed, "events_recorded"));
         } else if (nstat_client_ && tcp_state.has_value()) {
@@ -1836,6 +1990,9 @@ private:
             // an unreadable flag skips the tick via the plain branch below and
             // leaves the ring buffering rather than discarding live lifecycle events.
             nstat_client_->drain();
+            yuzu::echo::nstat_release_closing_keys(
+                pending_nstat_evs_.data(), pending_nstat_evs_.data() + pending_nstat_evs_.size(),
+                tcp_closing_seen_);
             pending_nstat_evs_.clear();
         } else {
             note_health("tcp", skip_token(tcp_state));
@@ -1861,7 +2018,7 @@ private:
                 // committed, so returning 1 here would misreport a healthy cycle
                 // as failed (and suppress the events_recorded line the server
                 // reads for retention-pause detection). Log and skip instead.
-                if (db_->insert_netqual_samples(rows)) {
+                if (db_->fold_netqual_samples(rows)) {
                     total_events += static_cast<int>(rows.size());
                     note_health("netqual", "sample_recorded");
                 } else {
@@ -1918,7 +2075,7 @@ private:
                 const std::string state_json = arp_to_json(*current).dump();
                 const bool ok = typed.empty()
                                     ? db_->set_state("arp", state_json)
-                                    : db_->insert_arp_events(
+                                    : db_->fold_arp_events(
                                           typed, yuzu::echo::StateWrite{"arp", state_json});
                 if (ok) {
                     total_events += static_cast<int>(typed.size());
@@ -1946,7 +2103,7 @@ private:
             const std::string state_json = dns_to_json(current).dump();
             const bool ok = typed.empty()
                                 ? db_->set_state("dns", state_json)
-                                : db_->insert_dns_events(
+                                : db_->fold_dns_events(
                                       typed, yuzu::echo::StateWrite{"dns", state_json});
             if (ok) {
                 total_events += static_cast<int>(typed.size());
@@ -1999,8 +2156,19 @@ private:
                             std::make_move_iterator(pending_module_evs_.end()));
                 pending_module_evs_.clear();
             }
-            // §5 edge risk-filter: keep every risky load, dedup + cap signed.
-            mevs = yuzu::echo::apply_module_risk_filter(std::move(mevs));
+            // Label loads whose loader the ETW consumer could not name (an exited or protected
+            // process), from the process source's pid -> name map. Kernel loads have no user
+            // process to name. Before the filter: the loader name is part of its key.
+            for (auto& e : mevs) {
+                if (e.process_name.empty() && !e.is_kernel)
+                    e.process_name = yuzu::echo::pid_name_lookup(pid_name_, e.pid, e.ts_unix);
+            }
+            // §5 edge filter: unloads dropped, every risky load kept, other loads once per hour
+            // per (action, loader, module, folder). Filter in place inside a batch and keep the
+            // admitted keys only once the rows commit, so a failed insert re-filters identically
+            // (the scope rolls back on any exit without a commit, an exception included).
+            yuzu::echo::BatchScope module_batch{module_seen_};
+            mevs = yuzu::echo::apply_module_risk_filter(std::move(mevs), module_seen_);
             std::vector<yuzu::echo::ModuleRow> mrows;
             mrows.reserve(mevs.size());
             for (const auto& e : mevs) {
@@ -2018,11 +2186,12 @@ private:
                 mrows.push_back(std::move(r));
             }
             if (!mrows.empty()) {
-                if (!db_->insert_module_events(mrows)) {
+                if (!db_->fold_module_events(mrows)) {
                     // Like netqual, do NOT fail the whole tick (the
                     // other legs already committed). Re-queue the filtered
                     // batch for the next tick, bounded, and log.
                     module_tok = "insert_failed";
+                    module_batch.rollback();
                     spdlog::error("ECHO: module stream insert failed — re-queuing {} events",
                                   mevs.size());
                     pending_module_evs_ = std::move(mevs);
@@ -2036,6 +2205,10 @@ private:
                     total_events += static_cast<int>(mrows.size());
                 }
             }
+            // Keeps the admitted keys on success or an empty batch; after the rollback above the
+            // scope is already closed, so this is a no-op there.
+            module_batch.commit();
+            module_overflows_.store(module_seen_.overflows(), std::memory_order_relaxed);
             if (auto d = module_stream_->dropped(); d > last_module_dropped_) {
                 spdlog::warn("ECHO: module stream ring overflow — {} dropped (+{} since last drain)",
                              d, d - last_module_dropped_);
@@ -2110,9 +2283,14 @@ private:
             dns_pre.clear();
             netqual_pre.clear();
         }
-        std::lock_guard lock(collect_mu_);
-        return collect_fast_impl(ctx, arp_on ? &arp_pre : nullptr, dns_on ? &dns_pre : nullptr,
-                                 netqual_on ? &netqual_pre : nullptr);
+        int rc = 0;
+        {
+            std::lock_guard lock(collect_mu_);
+            rc = collect_fast_impl(ctx, arp_on ? &arp_pre : nullptr, dns_on ? &dns_pre : nullptr,
+                                   netqual_on ? &netqual_pre : nullptr);
+        }
+        run_budget_catch_up(); // outside collect_mu_; no-op unless a pass left data over target
+        return rc;
     }
 
     // ── collect_perf: device performance sample (BRD A1) ─────────────────────
@@ -2124,7 +2302,7 @@ private:
     // collect_mu_ (gov UP-6): that mutex also serialises collect_fast/slow and
     // fleet_snapshot, so a slow/hung disk IOCTL under the lock would stall them
     // and the /viz hot path. Only the prev_perf_ read-modify-write needs the
-    // lock; next_snapshot_id is atomic and insert_perf_sample takes its own.
+    // lock; next_snapshot_id is atomic and fold_perf_sample takes its own.
     //
     // A2: the per-app top-N sampler (echo_proc_perf) rides the SAME tick under
     // its OWN `procperf` source toggle — disabling device perf does not kill
@@ -2181,7 +2359,7 @@ private:
                     row.disk_write_lat_us = sample.disk_write_lat_us;
                     row.net_rx_bps = sample.net_rx_bps;
                     row.net_tx_bps = sample.net_tx_bps;
-                    if (!db_->insert_perf_sample(row)) {
+                    if (!db_->fold_perf_sample(row)) {
                         note_health("perf", "insert_failed");
                         ctx.write_output("error|perf insert failed");
                         rc = 1;
@@ -2265,7 +2443,7 @@ private:
             r.is_kthread = s.is_kthread;
             rows.push_back(std::move(r));
         }
-        if (!db_->insert_proc_perf_samples(rows)) {
+        if (!db_->fold_proc_perf_samples(rows)) {
             note_health("procperf", "insert_failed");
             ctx.write_output("error|procperf insert failed");
             return 1;
@@ -2320,7 +2498,7 @@ private:
                 const std::string state_json = services_to_json(*current).dump();
                 const bool ok = typed.empty()
                                     ? db_->set_state(svc_key, state_json)
-                                    : db_->insert_service_events(
+                                    : db_->fold_service_events(
                                           typed, yuzu::echo::StateWrite{svc_key, state_json});
                 if (!ok) {
                     const char* tok = typed.empty() ? "state_save_failed" : "insert_failed";
@@ -2350,7 +2528,7 @@ private:
             const std::string state_json = users_to_json(current).dump();
             const bool ok = typed.empty()
                                 ? db_->set_state(usr_key, state_json)
-                                : db_->insert_user_events(
+                                : db_->fold_user_events(
                                       typed, yuzu::echo::StateWrite{usr_key, state_json});
             if (!ok) {
                 const char* tok = typed.empty() ? "state_save_failed" : "insert_failed";
@@ -2408,7 +2586,7 @@ private:
                     // so the next tick doesn't re-scan the same empty window.
                     db_->set_config("netconn_backfill_hwm", std::to_string(plan.hwm));
                     note_health("netconn", "events_recorded");
-                } else if (db_->insert_netconn_events(rows)) {
+                } else if (db_->fold_netconn_events(rows)) {
                     db_->set_config("netconn_backfill_hwm", std::to_string(plan.hwm));
                     total_events += static_cast<int>(rows.size());
                     note_health("netconn", "events_recorded");
@@ -2458,7 +2636,7 @@ private:
                 const std::string state_json = mapdrive_to_json(*current).dump();
                 const bool ok = typed.empty()
                                     ? db_->set_state(md_key, state_json)
-                                    : db_->insert_mapdrive_events(
+                                    : db_->fold_mapdrive_events(
                                           typed, yuzu::echo::StateWrite{md_key, state_json});
                 if (ok) {
                     total_events += static_cast<int>(typed.size());
@@ -2562,6 +2740,10 @@ private:
                 ctx.write_output(std::format("echo|collect_{}|0|{}", src_name,
                                              yuzu::echo::kCollectStatusCaptureIncomplete));
             } catch (const std::exception& e) {
+                // A source's events+cursor write opens a raw BEGIN IMMEDIATE; an unwind between
+                // it and COMMIT would leave the shared connection mid-transaction and every
+                // later write would refuse. noexcept, and a no-op in autocommit.
+                db_->rollback_open_transaction();
                 // ABI containment. The SDK's execute trampoline
                 // (sdk/include/yuzu/plugin.hpp) is an extern "C" boundary with
                 // no try/catch of its own, so ANY exception that escapes here
@@ -2590,6 +2772,7 @@ private:
                 ctx.write_output(std::format("echo|collect_{}|0|{}", src_name,
                                              yuzu::echo::kCollectStatusCaptureIncomplete));
             } catch (...) {
+                db_->rollback_open_transaction(); // same reason as the std::exception arm above
                 spdlog::error("ECHO: {} cursor collect threw a non-std exception -- source "
                               "skipped this tick", src_name);
                 note_health(src_name, yuzu::echo::kCollectStatusCaptureIncomplete);
@@ -2709,7 +2892,7 @@ private:
         // skip_known_historical=true: the NOT EXISTS insert makes a repeated attempt over the
         // same identity idempotent, so a retry that re-observes an already-recorded mapping never
         // duplicates it.
-        if (!db_->insert_mapdrive_events(typed, std::nullopt, /*skip_known_historical=*/true)) {
+        if (!db_->fold_mapdrive_events(typed, std::nullopt, /*skip_known_historical=*/true)) {
             spdlog::warn("ECHO: mapdrive backfill retry insert failed — will retry at the next "
                          "due tick");
             return; // claimed state untouched; the retry is idempotent next time
@@ -2838,7 +3021,7 @@ private:
             // Events + baseline in ONE transaction (#1654).
             const bool ok = result.events.empty()
                                 ? db_->set_state("software", result.new_state_json)
-                                : db_->insert_software_events(
+                                : db_->fold_software_events(
                                       result.events,
                                       yuzu::echo::StateWrite{"software", result.new_state_json});
             if (!ok) {
@@ -2903,13 +3086,53 @@ private:
         ctx.write_output(std::format("oldest_timestamp|{}", s.oldest_timestamp));
         ctx.write_output(std::format("newest_timestamp|{}", s.newest_timestamp));
         ctx.write_output(std::format("db_size_bytes|{}", s.db_size_bytes));
-        ctx.write_output(std::format("retention_days|{}", s.retention_days));
+        // Byte budget (db_budget_bytes): db_size_bytes above is used pages + WAL, the figure the
+        // budget is enforced against. budget_over_bytes is how far data + WAL sit above it right
+        // now (measured here, not cached, so it is true before the first pass too); it can be
+        // non-zero while an echo.sql read pins the WAL (the budget is hard for data pages, soft
+        // for the WAL). Either figure is `unknown` when its input could not be read: an
+        // unreadable setting or size is not "within budget".
+        {
+            const auto budget = yuzu::echo::budget_from_config(
+                db_->try_get_config(std::string{yuzu::echo::kDbBudgetKey}));
+            const auto sb = db_->storage_bytes();
+            if (budget)
+                ctx.write_output(std::format("db_budget_bytes|{}", *budget));
+            else
+                ctx.write_output("db_budget_bytes|unknown");
+            if (budget && sb.ok) {
+                ctx.write_output(std::format(
+                    "budget_over_bytes|{}",
+                    yuzu::echo::budget_over_bytes(sb.data_bytes(), sb.wal_bytes, *budget)));
+            } else {
+                ctx.write_output("budget_over_bytes|unknown");
+            }
+            ctx.write_output(std::format(
+                "budget_evicted_hourly_rows_total|{}",
+                db_->get_config(std::string{yuzu::echo::kBudgetEvictedHourlyKey}, "0")));
+            ctx.write_output(std::format("dict_gc_last_ts|{}", db_->get_config("dict_gc_last_ts", "0")));
+            ctx.write_output(
+                std::format("dict_gc_starved_total|{}", db_->get_config("dict_gc_starved_total", "0")));
+            // incremental: auto_vacuum is on. deferred: a conversion VACUUM was wanted but the
+            // volume lacked the free space (or it failed); retried at most daily. none: a file
+            // created before auto_vacuum existed that has not needed the conversion yet.
+            const bool deferred = deferred_marker() > 0;
+            ctx.write_output(std::format("db_auto_vacuum|{}",
+                                         sb.auto_vacuum == 2 ? "incremental"
+                                                             : (deferred ? "deferred" : "none")));
+            ctx.write_output(std::format("module_dedup_overflow_total|{}",
+                                         module_overflows_.load(std::memory_order_relaxed)));
+            ctx.write_output(std::format("tcp_closing_dedup_overflow_total|{}",
+                                         tcp_closing_overflows_.load(std::memory_order_relaxed)));
+        }
 
         // Per-source enable/disable state (issue #59) plus the operational
-        // surface PR-A (#547) needs: paused_at, live_rows, oldest_ts. Default
+        // surface PR-A (#547) needs: paused_at, rows, oldest_ts. Default
         // = enabled, paused_at = 0, so operators that never call `configure`
-        // see the steady-state behavior. live_rows / oldest_ts are queried
-        // from the per-source `*_live` table; an empty table reports 0 / 0.
+        // see the steady-state behavior. rows / oldest_ts are queried from the source's
+        // FINEST physical tier (the roll-up has no raw table to count): `<src>_hourly_r`, or
+        // `usage_daily` for usage. A bucket is its hour's (day's) start, not an event's own time.
+        // An empty table reports 0 / 0.
         for (const auto& src : yuzu::echo::capture_sources()) {
             std::string enabled_key = std::format("{}_enabled", src.name);
             // Default to the source's declared default so a fresh agent
@@ -2928,27 +3151,43 @@ private:
             auto paused_at_val = db_->get_config(paused_at_key, "0");
             ctx.write_output(std::format("config|{}|{}", paused_at_key, paused_at_val));
 
-            std::string live_table = std::format("{}_live", src.name);
-            auto count_q = db_->execute_query("SELECT COUNT(*) FROM " + live_table, /*max_rows=*/1);
-            int64_t live_rows = 0;
-            if (count_q.has_value() && !count_q->rows.empty()) {
-                try {
-                    live_rows = std::stoll(count_q->rows[0][0]);
-                } catch (...) {}
+            // The source's finest physical tier and its bucket column.
+            std::string tier_table;
+            std::string_view bucket_col = "hour_ts";
+            if (src.name == "usage") {
+                tier_table = "usage_daily";
+                bucket_col = "day_ts";
+            } else if (const auto* fold = yuzu::echo::fold_source(src.name); fold && !fold->tiers.empty()) {
+                tier_table = yuzu::echo::physical_table_name(src.name, fold->tiers.front());
+                bucket_col = yuzu::echo::ts_column_for_suffix(fold->tiers.front());
             }
-            ctx.write_output(std::format("config|{}_live_rows|{}", src.name, live_rows));
-
-            // `ts` is the column name on every `*_live` table per the schema
-            // registry. NULL on empty table → 0 fallback.
-            auto oldest_q =
-                db_->execute_query("SELECT IFNULL(MIN(ts), 0) FROM " + live_table, /*max_rows=*/1);
+            int64_t rows = 0;
             int64_t oldest_ts = 0;
-            if (oldest_q.has_value() && !oldest_q->rows.empty()) {
-                try {
-                    oldest_ts = std::stoll(oldest_q->rows[0][0]);
-                } catch (...) {}
+            if (!tier_table.empty()) {
+                auto count_q =
+                    db_->execute_query(std::format("SELECT COUNT(*), IFNULL(MIN({}), 0) FROM {}",
+                                                   bucket_col, tier_table),
+                                       /*max_rows=*/1);
+                if (count_q.has_value() && !count_q->rows.empty() && count_q->rows[0].size() == 2) {
+                    try {
+                        rows = std::stoll(count_q->rows[0][0]);
+                        oldest_ts = std::stoll(count_q->rows[0][1]);
+                    } catch (...) {}
+                }
             }
+            ctx.write_output(std::format("config|{}_rows|{}", src.name, rows));
             ctx.write_output(std::format("config|{}_oldest_ts|{}", src.name, oldest_ts));
+            if (src.name == "netqual") {
+                // The per-boot baseline is a plain table beside the roll-up tiers.
+                auto boot_q = db_->execute_query("SELECT COUNT(*) FROM netqual_boot", /*max_rows=*/1);
+                int64_t boot_rows = 0;
+                if (boot_q.has_value() && !boot_q->rows.empty()) {
+                    try {
+                        boot_rows = std::stoll(boot_q->rows[0][0]);
+                    } catch (...) {}
+                }
+                ctx.write_output(std::format("config|netqual_boot_rows|{}", boot_rows));
+            }
         }
         // Retention clock-guard declines, per warehouse table (#2361). The agent
         // has no /metrics endpoint, so this action is the ONLY fleet-readable
@@ -2987,18 +3226,10 @@ private:
             }
             ctx.write_output(std::format("config|usage_lifecycle_state|{}", lifecycle));
         }
-        ctx.write_output(
-            std::format("config|usage_gap_count|{}", db_->get_config("usage_gap_count", "0")));
-        ctx.write_output(std::format("config|usage_gap_lost_events|{}",
-                                     db_->get_config("usage_gap_lost_events", "0")));
-        ctx.write_output(
-            std::format("config|usage_gap_last_ts|{}", db_->get_config("usage_gap_last_ts", "-")));
         ctx.write_output(std::format("config|usage_expiry_declined_count|{}",
                                      db_->get_config("usage_expiry_declined_count", "0")));
         ctx.write_output(std::format("config|usage_coverage_since|{}",
                                      db_->get_config("usage_coverage_since", "-")));
-        ctx.write_output(
-            std::format("config|usage_lag_events|{}", db_->get_config("usage_lag_events", "0")));
 
         // Currently-configured network capture method (defaults to "polling").
         auto net_method = db_->get_config("network_capture_method", "polling");
@@ -3007,7 +3238,7 @@ private:
         // Software source pacing + heartbeat. software_last_run_ts is the wall-clock
         // of the last collect_software tick (0 if it has never run) — the operator's
         // signal that the hourly trigger is alive even on a host with no software
-        // changes (where software_live_rows stays 0).
+        // changes (where software_rows stays 0).
         ctx.write_output(std::format("config|software_interval_seconds|{}",
                                      db_->get_config("software_interval_seconds", "3600")));
         ctx.write_output(std::format("config|software_last_run_ts|{}",
@@ -3087,7 +3318,10 @@ private:
                 {"registry_roots_capped", "0"},        {"registry_etw_events", "0"},
                 {"registry_etw_dropped", "0"},         {"registry_etw_lost", "0"},
                 {"registry_attr_attributed", "0"},     {"registry_attr_ambiguous", "0"},
-                {"registry_attr_none", "0"},
+                {"registry_attr_none", "0"},           {"registry_offline_roots", "0"},
+                {"registry_offline_roots_unreadable", "0"},
+                {"registry_offline_roots_deferred", "0"},
+                {"registry_offline_discovery_incomplete", "0"},
             };
             for (const auto& [key, def] : kRegistryKeys)
                 ctx.write_output(std::format("config|{}|{}", key,
@@ -3207,75 +3441,62 @@ private:
         if (limit <= 0 || limit > 10000)
             limit = 1000;
 
-        // Query typed live tables (replaces legacy tar_events)
-        auto from_s = std::to_string(from);
+        // Query the hourly roll-up views. The raw capture rows these queries once read are not
+        // kept: every row is an hour BUCKET, reported as ts = the bucket's start, action =
+        // 'bucket' and snapshot_id = 0, so the columns keep their old shape. A bucket is in range
+        // when it STARTS at or before `to` and ends after `from`.
+        auto from_s = std::to_string(from - from % 3600);
         auto to_s = std::to_string(to);
         auto lim_s = std::to_string(limit);
-        std::string where = " WHERE ts >= " + from_s + " AND ts <= " + to_s;
+        std::string where = " WHERE hour_ts >= " + from_s + " AND hour_ts <= " + to_s;
         std::string tail = " ORDER BY ts ASC LIMIT " + lim_s;
+        const auto select = [&](std::string_view type, std::string_view view,
+                                std::string_view detail) {
+            return std::format("SELECT hour_ts AS ts, '{}' AS event_type, 'bucket' AS action, "
+                               "0 AS snapshot_id, {} AS detail_json FROM {}",
+                               type, detail, view);
+        };
 
         std::string sql;
         if (type_filter == "process") {
-            sql = "SELECT ts, 'process' AS event_type, action, snapshot_id, "
-                  "'' AS detail_json FROM process_live" +
+            sql = select("process", "process_hourly",
+                         "(name || ' start=' || start_count || ' stop=' || stop_count)") +
                   where + tail;
         } else if (type_filter == "network") {
-            sql = "SELECT ts, 'network' AS event_type, action, snapshot_id, "
-                  "'' AS detail_json FROM tcp_live" +
+            sql = select("network", "tcp_hourly",
+                         "(proto || ' ' || remote_addr || ':' || remote_port)") +
                   where + tail;
         } else if (type_filter == "service") {
-            sql = "SELECT ts, 'service' AS event_type, action, snapshot_id, "
-                  "'' AS detail_json FROM service_live" +
-                  where + tail;
+            sql = select("service", "service_hourly", "name") + where + tail;
         } else if (type_filter == "user") {
-            sql = "SELECT ts, 'user' AS event_type, action, snapshot_id, "
-                  "'' AS detail_json FROM user_live" +
-                  where + tail;
+            sql = select("user", "user_hourly", "(user || '@' || domain)") + where + tail;
         } else if (type_filter == "software") {
-            sql = "SELECT ts, 'software' AS event_type, action, snapshot_id, "
-                  "'' AS detail_json FROM software_live" +
-                  where + tail;
+            sql = select("software", "software_hourly", "name") + where + tail;
         } else if (type_filter == "arp") {
             // ADR-0015. detail_json carries a human summary (ip @ mac [iface]); the
-            // full row is available via echo.sql over $ARP_Live.
-            sql = "SELECT ts, 'arp' AS event_type, action, snapshot_id, "
-                  "(ip_address || ' @ ' || mac_address || ' [' || interface || ']') AS detail_json "
-                  "FROM arp_live" +
+            // full row is available via echo.sql over $ARP_Hourly.
+            sql = select("arp", "arp_hourly",
+                         "(ip_address || ' @ ' || mac_address || ' [' || interface || ']')") +
                   where + tail;
         } else if (type_filter == "dns") {
-            sql = "SELECT ts, 'dns' AS event_type, action, snapshot_id, "
-                  "(name || ' ' || record_type || ' ' || data) AS detail_json "
-                  "FROM dns_live" +
+            sql = select("dns", "dns_hourly", "(name || ' ' || record_type || ' ' || data)") +
                   where + tail;
         } else if (type_filter == "mapdrive") {
-            // §3.8. detail_json is a human summary (direction mount remote [host]
-            // user); the full row (incl. origin/provider) is via echo.sql over
-            // $MapDrive_Live. Includes historical rows (action='historical').
-            sql = "SELECT ts, 'mapdrive' AS event_type, action, snapshot_id, "
-                  "(direction || ' ' || local_mount || ' ' || remote_path || ' [' || "
-                  "remote_host || '] ' || username) AS detail_json "
-                  "FROM mapdrive_live" +
+            // §3.8. detail_json is a human summary (direction mount remote [host]); the full
+            // row (incl. the historical count) is via echo.sql over $MapDrive_Hourly.
+            sql = select("mapdrive", "mapdrive_hourly",
+                         "(direction || ' ' || local_mount || ' ' || remote_path || ' [' || "
+                         "remote_host || ']')") +
                   where + tail;
         } else {
             // No-filter union stays the core event timeline. arp/dns/mapdrive are
             // device-state sources — reachable only via an explicit
             // type filter above or echo.sql, never the default feed.
-            sql = "SELECT * FROM ("
-                  "SELECT ts, 'process' AS event_type, action, snapshot_id, '' AS detail_json FROM "
-                  "process_live" +
-                  where +
-                  " UNION ALL "
-                  "SELECT ts, 'network', action, snapshot_id, '' FROM tcp_live" +
-                  where +
-                  " UNION ALL "
-                  "SELECT ts, 'service', action, snapshot_id, '' FROM service_live" +
-                  where +
-                  " UNION ALL "
-                  "SELECT ts, 'user', action, snapshot_id, '' FROM user_live" +
-                  where +
-                  " UNION ALL "
-                  "SELECT ts, 'software', action, snapshot_id, '' FROM software_live" +
-                  where + ")" + tail;
+            sql = "SELECT * FROM (" + select("process", "process_hourly", "''") + where +
+                  " UNION ALL " + select("network", "tcp_hourly", "''") + where +
+                  " UNION ALL " + select("service", "service_hourly", "''") + where +
+                  " UNION ALL " + select("user", "user_hourly", "''") + where +
+                  " UNION ALL " + select("software", "software_hourly", "''") + where + ")" + tail;
         }
 
         auto query_result = db_->execute_query(sql);
@@ -3323,59 +3544,67 @@ private:
         if (limit <= 0 || limit > 10000)
             limit = 1000;
 
-        // Pick the right live table (HP-5: handle empty filter and unknown types)
+        // Pick the right hourly view (HP-5: handle empty filter and unknown types). Rows are hour
+        // BUCKETS (ts = the bucket's start, action = 'bucket', snapshot_id = 0): the raw capture
+        // rows this once exported are not kept.
         //
-        // For the "no filter" case we have to UNION ALL five tables that do
+        // For the "no filter" case we have to UNION ALL five views that do
         // not share a column count or schema. Project each branch to a
         // uniform shape (source, ts, snapshot_id, action, summary) so the
         // UNION is well-typed and the JSON envelope stays consistent for
         // SIEM ingest. Callers that want per-table fields should pass a
         // type filter.
+        const int64_t from_hour = from - from % 3600;
         std::string sql;
         if (type_filter.empty()) {
             sql = std::format("SELECT * FROM ("
-                              "SELECT 'process' AS source, ts, snapshot_id, action, "
-                              "       (name || '[' || pid || ']') AS summary "
-                              "  FROM process_live WHERE ts >= {} AND ts <= {} UNION ALL "
-                              "SELECT 'network', ts, snapshot_id, action, "
-                              "       (proto || ' ' || local_addr || ':' || local_port) AS summary "
-                              "  FROM tcp_live WHERE ts >= {} AND ts <= {} UNION ALL "
-                              "SELECT 'service', ts, snapshot_id, action, "
-                              "       (name || ' (' || status || ')') AS summary "
-                              "  FROM service_live WHERE ts >= {} AND ts <= {} UNION ALL "
-                              "SELECT 'user', ts, snapshot_id, action, "
-                              "       (user || '@' || COALESCE(domain,'')) AS summary "
-                              "  FROM user_live WHERE ts >= {} AND ts <= {} UNION ALL "
-                              "SELECT 'software', ts, snapshot_id, action, "
-                              "       (name || ' ' || COALESCE(version,'')) AS summary "
-                              "  FROM software_live WHERE ts >= {} AND ts <= {}"
-                              ") ORDER BY ts ASC LIMIT {}",
-                              from, to, from, to, from, to, from, to, from, to, limit);
+                              "SELECT 'process' AS source, hour_ts AS ts, 0 AS snapshot_id, "
+                              "       'bucket' AS action, "
+                              "       (name || ' start=' || start_count || ' stop=' || stop_count) "
+                              "       AS summary "
+                              "  FROM process_hourly WHERE hour_ts >= {0} AND hour_ts <= {1} "
+                              "UNION ALL "
+                              "SELECT 'network', hour_ts, 0, 'bucket', "
+                              "       (proto || ' ' || remote_addr || ':' || remote_port) "
+                              "  FROM tcp_hourly WHERE hour_ts >= {0} AND hour_ts <= {1} "
+                              "UNION ALL "
+                              "SELECT 'service', hour_ts, 0, 'bucket', "
+                              "       (name || ' (' || last_status || ')') "
+                              "  FROM service_hourly WHERE hour_ts >= {0} AND hour_ts <= {1} "
+                              "UNION ALL "
+                              "SELECT 'user', hour_ts, 0, 'bucket', (user || '@' || domain) "
+                              "  FROM user_hourly WHERE hour_ts >= {0} AND hour_ts <= {1} "
+                              "UNION ALL "
+                              "SELECT 'software', hour_ts, 0, 'bucket', (name || ' ' || version) "
+                              "  FROM software_hourly WHERE hour_ts >= {0} AND hour_ts <= {1}"
+                              ") ORDER BY ts ASC LIMIT {2}",
+                              from_hour, to, limit);
         } else {
-            std::string table;
+            std::string view;
             if (type_filter == "process")
-                table = "process_live";
+                view = "process_hourly";
             else if (type_filter == "network")
-                table = "tcp_live";
+                view = "tcp_hourly";
             else if (type_filter == "service")
-                table = "service_live";
+                view = "service_hourly";
             else if (type_filter == "user")
-                table = "user_live";
+                view = "user_hourly";
             else if (type_filter == "software")
-                table = "software_live";
+                view = "software_hourly";
             else if (type_filter == "arp") // ADR-0015
-                table = "arp_live";
+                view = "arp_hourly";
             else if (type_filter == "dns") // ADR-0015
-                table = "dns_live";
+                view = "dns_hourly";
             else if (type_filter == "mapdrive") // §3.8
-                table = "mapdrive_live";
+                view = "mapdrive_hourly";
             else {
                 ctx.write_output(std::format("error|unknown type filter: {}", type_filter));
                 return 1;
             }
-            sql =
-                std::format("SELECT * FROM {} WHERE ts >= {} AND ts <= {} ORDER BY ts ASC LIMIT {}",
-                            table, from, to, limit);
+            sql = std::format("SELECT hour_ts AS ts, 0 AS snapshot_id, 'bucket' AS action, v.* "
+                              "FROM {} v WHERE hour_ts >= {} AND hour_ts <= {} "
+                              "ORDER BY hour_ts ASC LIMIT {}",
+                              view, from_hour, to, limit);
         }
 
         auto query_result = db_->execute_query(sql);
@@ -3546,31 +3775,11 @@ private:
         std::vector<yuzu::echo::NetConnection> connections;
         if (tcp_on) {
             auto live = yuzu::echo::enumerate_connections();
-            // Widen the snapshot from "currently ESTABLISHED" to "ESTABLISHED
-            // within the rolling window" by joining /proc with Echo's tcp_live
-            // warehouse. A connection that closed 30 minutes ago still
-            // appears with last_seen_seconds_ago>0 so the viz can render it
-            // as a tube. Window default 3600s; operator-tunable via the
-            // fleet_snapshot_window_seconds config (added by echo.configure).
-            int window_seconds = 3600;
-            if (auto cfg = db_->get_config("fleet_snapshot_window_seconds", ""); !cfg.empty()) {
-                try {
-                    window_seconds = std::max(0, std::stoi(cfg));
-                } catch (...) {
-                    // Bad config value — fall back to the default rather
-                    // than fail the whole snapshot.
-                }
-            }
-            std::vector<yuzu::echo::NetworkEvent> recent;
-            if (window_seconds > 0) {
-                auto q = db_->query_recent_tcp_connections(ts - window_seconds);
-                if (q.has_value()) {
-                    recent = std::move(*q);
-                } else {
-                    spdlog::warn("echo.fleet_snapshot: tcp_live query failed: {}", q.error());
-                }
-            }
-            connections = yuzu::echo::merge_live_and_recent_connections(live, recent, ts);
+            // The snapshot is the connections ESTABLISHED right now. It once widened this to
+            // "established within a rolling window" from the raw tcp rows (each 5-tuple, last seen);
+            // the roll-up keeps hourly counts per remote and process, not per socket, so there is
+            // nothing to widen it with and `fleet_snapshot_window_seconds` no longer has an effect.
+            connections = std::move(live);
         }
 
         // Redaction defaults are now unioned inside load_redaction_patterns (so
@@ -3670,13 +3879,22 @@ private:
                 "list; retry the purge (the deletion itself is idempotent and will not repeat)");
             return 1;
         }
-        ctx.write_output(
-            std::format(R"({{"source":"{}","rows_deleted":{},"status":"purged"}})", source, *res));
+        // The rows are gone either way; a dictionary sweep that did not finish leaves the purged
+        // strings on disk until the weekly sweep (or a rerun of this purge), which the reply and
+        // the typed status both say: the command's response record carries what the action
+        // reported, so "purged" alone would overstate it. (The server's `echo.source.purge` audit
+        // row is written at dispatch and carries no reply; only the status enum reaches the
+        // server, the detail text stays in the agent log.)
+        if (res->dictionary_pending)
+            ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                  "echo:purge_dictionary_pending");
+        ctx.write_output(std::format(
+            R"({{"source":"{}","rows_deleted":{},"status":"purged","dictionary_pending":{}}})", source,
+            res->rows_deleted, res->dictionary_pending ? "true" : "false"));
         return 0;
     }
 
     int do_configure(yuzu::CommandContext& ctx, yuzu::Params params) {
-        auto retention = params.get("retention_days");
         auto fast_interval = params.get("fast_interval");
         auto slow_interval = params.get("slow_interval");
         auto software_interval = params.get("software_interval");
@@ -3684,11 +3902,13 @@ private:
         auto power_lookback = params.get("power_lookback_seconds");
         auto removable_lookback = params.get("removable_lookback_seconds");
         auto redaction = params.get("redaction_patterns");
+        auto db_budget = params.get("db_budget_bytes");
 
         bool changed = false;
+        // db_budget_bytes: set only when provided AND valid (parse_budget_bytes).
+        std::optional<int64_t> budget_bytes;
         int fast_secs = 0;
         int slow_secs = 0;
-        int days = 0;
         // Software interval accepts 0 (disable the trigger) or 300–86400, so it
         // needs a "was it provided" flag distinct from the 0 sentinel.
         int software_secs = 0;
@@ -3720,12 +3940,12 @@ private:
         // the "Phase 2" block below; every path before it only reads + validates.
 
         // ── Phase 1: validate everything (no writes) ─────────────────────────
-        if (!retention.empty()) {
-            try {
-                days = std::stoi(std::string{retention});
-            } catch (...) {}
-            if (days < 1 || days > 365) {
-                ctx.write_output("error|retention_days must be 1-365");
+        if (!db_budget.empty()) {
+            budget_bytes = yuzu::echo::parse_budget_bytes(db_budget);
+            if (!budget_bytes) {
+                ctx.write_output(std::format(
+                    "error|db_budget_bytes must be a whole number of bytes >= {}",
+                    yuzu::echo::kEchoDbBudgetBytesMin));
                 return 1;
             }
         }
@@ -3947,9 +4167,16 @@ private:
         }
 
         // ── Phase 2: persist (every parameter above is already validated) ────
-        if (days > 0) {
-            db_->set_config("retention_days", std::string{retention});
-            ctx.write_output(std::format("config|retention_days|{}", retention));
+        if (budget_bytes) {
+            // The only checked write, so it goes FIRST: this control gates deletes, a value that
+            // did not persist must not be reported as applied, and its failure must leave nothing
+            // else half-applied.
+            if (!db_->set_config(std::string{yuzu::echo::kDbBudgetKey},
+                                 std::to_string(*budget_bytes))) {
+                ctx.write_output("error|db_budget_bytes could not be saved");
+                return 1;
+            }
+            ctx.write_output(std::format("config|db_budget_bytes|{}", *budget_bytes));
             changed = true;
         }
         if (fast_secs > 0) {
@@ -4092,6 +4319,11 @@ private:
                 if (transition_ok && src_name == "tcp" && nstat_client_ &&
                     (v == "true") != tcp_prev_enabled) {
                     nstat_client_->drain();
+                    // The backlog rows are dropped unstored: give their hourly keys
+                    // back (the drain's own events were never admitted).
+                    yuzu::echo::nstat_release_closing_keys(
+                        pending_nstat_evs_.data(),
+                        pending_nstat_evs_.data() + pending_nstat_evs_.size(), tcp_closing_seen_);
                     pending_nstat_evs_.clear();
                 }
                 // Cursor-model sources (echo_cursor.hpp, P-002): forward the
@@ -4242,23 +4474,325 @@ private:
         return 0;
     }
 
-    // ── rollup action (aggregation engine) ───────────────────────────────────
+    // ── rollup action (retention, byte budget, dictionary sweep) ─────────────
 
     int do_rollup(yuzu::CommandContext& ctx) {
-        // No collect_mu_ needed — rollup operates on aggregate tables, not live-state diffs.
+        // No collect_mu_ needed — rollup operates on the roll-up tiers, not live-state diffs.
         // The SQLite-level mutex (db_->mu_) provides thread safety for individual
         // statements. It does NOT cover run_retention's in-memory clock-guard
         // state, which spans many statements - rollup_mu_ does (#2361), and it
         // keeps the trigger tick and a manual `echo rollup` from interleaving.
         std::lock_guard rollup_lock(rollup_mu_);
         auto ts = now_epoch_seconds();
-        // Ordering is load-bearing and unchanged: aggregation runs BEFORE
-        // retention so each tier consumes the tier below it before retention can
-        // delete from it.
-        int total = yuzu::echo::run_aggregation(*db_, ts);
+
+        // There is no aggregation pass: the fold writes every tier as events arrive. What this
+        // action does is prune by age, prune by size, and sweep the string dictionary.
+        //
+        // Retention's clock guard has a verdict on `ts`: a fresh decline (a big wall-clock step,
+        // an implausible or ahead-of-clock anchor) or a failed read means this pass's clock
+        // cannot be trusted to delete anything. Every budget floor derives from the same `ts`,
+        // so a clock the guard refused must not drive eviction either. Same semantics as
+        // retention: a FRESH anomaly declines the pass; a suppressed repeat is paced and drains
+        // on a later pass.
+        const std::int64_t guard_before = yuzu::echo::retention_clock_events(retention_guard_);
         yuzu::echo::run_retention(*db_, ts, retention_guard_);
-        ctx.write_output(std::format("echo|rollup|{}|rows_aggregated", total));
+        if (yuzu::echo::retention_clock_events(retention_guard_) > guard_before) {
+            {
+                // Surfaced as `retention_guard|__budget__|N`; counted in neither status total,
+                // because the decline or failure that caused it is already counted.
+                std::lock_guard guard_lock(retention_guard_.mu);
+                ++retention_guard_.budget_skips;
+            }
+            // A pending catch-up slice is cleared: the guard has just refused the clock, so the
+            // reading that slice was admitted with is no longer a basis to keep deleting on.
+            set_budget_catch_up({});
+            spdlog::warn("ECHO: byte budget pass skipped: the retention clock guard refused this "
+                         "pass's clock reading");
+        } else {
+            // Then the byte budget, the one-off VACUUM gate and file hygiene.
+            enforce_budget(ts, /*maintenance_pass=*/true);
+        }
+        // After the budget: eviction and retention are what create orphaned strings.
+        run_dictionary_gc(ts);
+        // `rows_aggregated` is kept for the reply shape (a stored client parses it): the roll-up
+        // has no aggregation pass, so it is always 0.
+        ctx.write_output("echo|rollup|0|rows_aggregated");
         return 0;
+    }
+
+    // The dictionary sweep: weekly, 2 s of steady clock (the PR 2 measurement: the live-set scan
+    // alone took about 1.6 s of the 2 s at 3.92 M roll-up rows). A pass whose scan outruns the
+    // deadline deletes nothing and is counted in `dict_gc_starved_total`; it is retried at the next
+    // maintenance pass, not in a week. The caller holds rollup_mu_.
+    void run_dictionary_gc(std::int64_t now_ts) {
+        constexpr std::int64_t kDictGcIntervalSec = 7 * 86400;
+        constexpr auto kDictGcDeadline = std::chrono::seconds(2);
+        // A stored integer; unset or unparsable reads as 0.
+        const auto read_i64 = [this](const char* key) -> std::int64_t {
+            const auto text = db_->get_config(key, "0");
+            std::int64_t v = 0;
+            const auto [p, ec] = std::from_chars(text.data(), text.data() + text.size(), v);
+            return ec == std::errc{} && p == text.data() + text.size() ? v : 0;
+        };
+        const std::int64_t last = read_i64("dict_gc_last_ts");
+        // A marker ahead of the clock was written during a forward excursion: stale, never a reason
+        // to wait.
+        if (last > 0 && last <= now_ts && now_ts - last < kDictGcIntervalSec)
+            return;
+        const auto swept = db_->fold().gc_dictionary(*db_, yuzu::echo::EchoFold::Clock::now() + kDictGcDeadline);
+        if (!swept) {
+            spdlog::warn("ECHO: dictionary sweep failed: {}", swept.error());
+            return;
+        }
+        if (!swept->live_set_built) {
+            const auto total = std::to_string(read_i64("dict_gc_starved_total") + 1);
+            db_->set_config("dict_gc_starved_total", total);
+            spdlog::warn("ECHO: the dictionary sweep's scan did not finish inside its {} s deadline "
+                         "(starved {} time(s)); retrying at the next maintenance pass",
+                         kDictGcDeadline.count(), total);
+            return;
+        }
+        if (swept->deleted > 0)
+            spdlog::info("ECHO: dictionary sweep removed {} unreferenced strings", swept->deleted);
+        // Done for the week only when nothing is left to delete; a deadline hit mid-delete leaves
+        // orphans, so the next pass continues.
+        if (!swept->deadline_hit && now_ts > 0)
+            db_->set_config("dict_gc_last_ts", std::to_string(now_ts));
+    }
+
+    // ── byte budget: eviction, VACUUM gate, file hygiene ─────────────────────
+
+    // Store both halves of the catch-up latch: the clock first, then the flag the reader checks.
+    // The caller holds rollup_mu_, which orders the pair for run_budget_catch_up.
+    void set_budget_catch_up(const yuzu::echo::BudgetCatchUp& c) {
+        budget_catch_up_now_.store(c.admitted_now, std::memory_order_relaxed);
+        budget_catch_up_.store(c.armed, std::memory_order_relaxed);
+    }
+
+    // One bounded eviction pass plus the post-pass hygiene. Runs in the 15-minute maintenance
+    // pass (`maintenance_pass`, which also gates the one-off conversion VACUUM) and as the
+    // catch-up slice of a fast tick. `now_ts` is the clock the retention guard admitted for a
+    // maintenance pass, and the ARMING pass's admitted reading for a catch-up slice (never a
+    // fresh one). The caller holds rollup_mu_.
+    void enforce_budget(std::int64_t now_ts, bool maintenance_pass) {
+        // Tri-state: an unreadable budget is NOT the default. Falling back to 250 MiB would
+        // delete down to a smaller target than the operator configured.
+        const auto stored = db_->try_get_config(std::string{yuzu::echo::kDbBudgetKey});
+        const auto configured = yuzu::echo::budget_from_config(stored);
+        if (!configured) {
+            set_budget_catch_up({});
+            // A PRESENT value that is not a usable budget (damaged or edited outside the plugin)
+            // is unknown too, never the default: deleting down to 250 MiB would undo a budget the
+            // operator raised (#6900). Say which it is.
+            if (yuzu::echo::budget_setting_invalid(stored))
+                spdlog::warn("ECHO: the stored db_budget_bytes is not a valid budget; the byte "
+                             "budget pass was skipped. Re-set it with `echo.configure "
+                             "db_budget_bytes=<bytes>`");
+            else
+                spdlog::warn("ECHO: db_budget_bytes could not be read; the byte budget pass was "
+                             "skipped and is retried at the next pass");
+            return;
+        }
+        const std::int64_t budget = *configured;
+        const std::int64_t target = budget - yuzu::echo::kEchoWalAllowanceBytes;
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::milliseconds(yuzu::echo::kBudgetPassDeadlineMs);
+        const auto time_left = [&] { return std::chrono::steady_clock::now() < deadline; };
+        const auto res = yuzu::echo::run_budget(*db_, now_ts, target, time_left);
+
+        // Another slice on the next fast tick only when this one ran out of time with rows left
+        // to evict, carrying the clock reading this pass ran with (a slice re-arms with the same
+        // one). A failed pass is retried by the next maintenance pass, not hammered.
+        set_budget_catch_up(yuzu::echo::budget_catch_up_after(res, target, now_ts));
+        const std::int64_t evicted = res.evicted_hourly;
+        if (evicted > 0) {
+            spdlog::info("ECHO: byte budget evicted {} hourly rows (data {} bytes, target {})",
+                         res.evicted_hourly, res.data_bytes_after, target);
+        }
+        if (maintenance_pass && res.exhausted) {
+            spdlog::warn("ECHO: echo.db data ({} bytes) is above its {} byte target and nothing "
+                         "more is eligible to evict (hourly rows under 48 h (5 d for procperf), "
+                         "daily and monthly rows, the usage tables, netqual_boot and paused or "
+                         "errored sources are never evicted)",
+                         res.data_bytes_after, target);
+        }
+
+        if (maintenance_pass)
+            maybe_vacuum_to_incremental(now_ts, target, res.exhausted);
+
+        // Hygiene: hand free pages back to the OS while the pass deadline allows (at least one
+        // call, as before; only an incremental-auto_vacuum file has any to hand back, and the
+        // guard stops the loop burning the deadline on a file where the call is a no-op), then
+        // checkpoint. TRUNCATE (reclaims the WAL file) when rows were evicted or the WAL outgrew
+        // its allowance -- the recovery from a pinned reader, retried every pass and slice;
+        // PASSIVE otherwise. The checkpoint never waits: a busy result means a reader pins the
+        // WAL and is retried.
+        const auto has_free_pages = [this] {
+            const auto sb = db_->storage_bytes();
+            return sb.ok && sb.auto_vacuum == 2 && sb.freelist_count > 0;
+        };
+        // A failing PRAGMA (disk full, I/O error, read-only) ends the loop: re-issuing it would
+        // only spin to the deadline with a warning per call.
+        while (db_->incremental_vacuum(256) && time_left() && has_free_pages()) {
+        }
+        const auto wal = db_->storage_bytes();
+        const bool truncate = evicted > 0 || (wal.ok && wal.wal_bytes >
+                                                            yuzu::echo::kEchoWalAllowanceBytes);
+        if (db_->checkpoint(truncate ? yuzu::echo::CheckpointMode::kTruncate
+                                     : yuzu::echo::CheckpointMode::kPassive) ==
+            yuzu::echo::CheckpointResult::kBusy) {
+            spdlog::debug("ECHO: WAL checkpoint busy (a reader pins the WAL); retrying next pass");
+        }
+    }
+
+    // The conversion-deferral time: the in-memory copy kept while the last marker write failed,
+    // else the persisted marker (0 when absent, unreadable or not a whole non-negative number);
+    // precedence in yuzu::echo::deferred_marker_reading. The one reader behind both the VACUUM
+    // decision and the status line.
+    std::int64_t deferred_marker() {
+        const auto text = db_->get_config(std::string{yuzu::echo::kAutoVacuumDeferredKey}, "0");
+        std::int64_t at = 0;
+        const auto [p, ec] = std::from_chars(text.data(), text.data() + text.size(), at);
+        if (ec != std::errc{} || p != text.data() + text.size() || at < 0)
+            at = 0;
+        return yuzu::echo::deferred_marker_reading(
+            at, vacuum_marker_fallback_.load(std::memory_order_relaxed));
+    }
+
+    // Persist the deferral time. A write that fails keeps an in-memory copy so a database that
+    // cannot store the marker still retries at most daily within this process.
+    //
+    // A reading at or below zero (a dead-CMOS clock, #6889 B6) cannot be stored as a marker: the
+    // reader treats a non-positive marker as "absent". Storing it would silently lift the daily
+    // bound, so it is not stored; the in-process attempt limiter below holds the bound instead.
+    void set_deferred_marker(std::int64_t value) {
+        if (value <= 0)
+            return;
+        const bool stored = db_->set_config(std::string{yuzu::echo::kAutoVacuumDeferredKey},
+                                            std::to_string(value));
+        vacuum_marker_fallback_.store(stored ? 0 : value, std::memory_order_relaxed);
+    }
+
+    // A conversion succeeded: the marker reads 0 ("none") again, and the in-memory copy goes with it.
+    void clear_deferred_marker() {
+        db_->set_config(std::string{yuzu::echo::kAutoVacuumDeferredKey}, "0");
+        vacuum_marker_fallback_.store(0, std::memory_order_relaxed);
+    }
+
+    // True when a conversion attempt was made less than a day ago BY THIS PROCESS, on the steady
+    // clock. The persisted marker bounds attempts across restarts but only works while the wall
+    // clock is positive; this bounds them within a process whatever the wall clock says.
+    bool vacuum_attempted_recently() {
+        const auto last = vacuum_last_attempt_.load(std::memory_order_relaxed);
+        if (last == 0)
+            return false;
+        const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+        return std::chrono::nanoseconds(now - last) < std::chrono::hours(24);
+    }
+    void note_vacuum_attempt() {
+        vacuum_last_attempt_.store(std::chrono::steady_clock::now().time_since_epoch().count(),
+                                   std::memory_order_relaxed);
+    }
+
+    // The one-off conversion of a pre-existing database to incremental auto_vacuum. Never at
+    // boot; only here, once eviction has brought data under target (or has nothing left to
+    // evict) and the file holds many free pages. Too little free disk (or a failed VACUUM)
+    // records the time and retries at most daily; status shows db_auto_vacuum|deferred until a
+    // conversion succeeds (the marker is not cleared when a later pass finds the freelist too
+    // small to warrant one). The VACUUM runs on the single interval-trigger thread with the
+    // database lock held, so it stalls the agent's triggers for its duration. It copies used
+    // pages only, so its duration (and the free disk it needs, twice that size) follows the used
+    // data at the time of the conversion: at or under the target, or, when eviction is exhausted,
+    // whatever exempt data remains, which can sit above the target. It happens once per database.
+    void maybe_vacuum_to_incremental(std::int64_t now_ts, std::int64_t target,
+                                     bool eviction_exhausted) {
+        const auto sb = db_->storage_bytes();
+        if (!sb.ok)
+            return; // cannot size the decision; the next pass retries
+        const std::int64_t deferred_at = deferred_marker();
+        // An unreadable volume counts as no free space: defer rather than risk a full disk.
+        std::error_code ec;
+        const auto space = std::filesystem::space(db_path_.parent_path(), ec);
+        const auto free_disk =
+            ec ? std::int64_t{0}
+               : static_cast<std::int64_t>(std::min<std::uintmax_t>(
+                     space.available, static_cast<std::uintmax_t>(INT64_MAX)));
+
+        if (vacuum_attempted_recently())
+            return;
+        switch (yuzu::echo::vacuum_decision(yuzu::echo::VacuumInputs{
+            .auto_vacuum = sb.auto_vacuum,
+            .data_bytes = sb.data_bytes(),
+            .target_bytes = target,
+            .freelist_bytes = sb.freelist_bytes(),
+            .file_bytes = sb.file_bytes(),
+            .free_disk_bytes = free_disk,
+            .deferred_at = deferred_at,
+            .now = now_ts,
+            .eviction_exhausted = eviction_exhausted})) {
+        case yuzu::echo::VacuumAction::kSkip:
+            break;
+        case yuzu::echo::VacuumAction::kDefer:
+            spdlog::warn("ECHO: not converting echo.db to incremental auto_vacuum yet: {} bytes "
+                         "free on its volume, {} needed; retrying within a day",
+                         free_disk, 2 * sb.data_bytes());
+            set_deferred_marker(now_ts);
+            note_vacuum_attempt();
+            break;
+        case yuzu::echo::VacuumAction::kRun: {
+            spdlog::info("ECHO: converting echo.db to incremental auto_vacuum (one-off VACUUM; "
+                         "collectors pause while it runs)");
+            // The attempt is recorded BEFORE the VACUUM and cleared on success, so a crash or a
+            // watchdog kill mid-VACUUM bounds the repeat to daily instead of every boot.
+            set_deferred_marker(now_ts);
+            note_vacuum_attempt();
+            const auto started = std::chrono::steady_clock::now();
+            const bool converted = db_->vacuum_to_incremental();
+            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - started)
+                                .count();
+            const auto after = db_->storage_bytes();
+            if (converted) {
+                clear_deferred_marker();
+                spdlog::info("ECHO: auto_vacuum conversion finished in {} ms (used {} -> {} "
+                             "bytes, file {} -> {} bytes)",
+                             ms, sb.data_bytes(), after.data_bytes(), sb.file_bytes(),
+                             after.file_bytes());
+            } else {
+                spdlog::warn("ECHO: the auto_vacuum conversion VACUUM failed after {} ms; "
+                             "retrying within a day",
+                             ms);
+            }
+            break;
+        }
+        }
+    }
+
+    // One more bounded eviction slice per fast tick while a pass has left the database over
+    // target. try_lock only: it never waits on a maintenance pass, and a pass that is running
+    // already does the same work. Called with collect_mu_ RELEASED, so rollup_mu_ is never
+    // taken inside it. The slice runs with the clock reading the arming pass was admitted with:
+    // it has no retention-guard contact of its own, so a clock that stepped forward since would
+    // widen every floor unchecked. It also reads a FRESH clock, but only to refuse: a wall clock
+    // that has stepped BACKWARD below the admitted reading puts that reading's floors above rows
+    // written since the step, so the drain is disarmed (budget_slice_clock, #6889 review B1). The
+    // next maintenance pass admits (or refuses, and clears the latch) a new reading.
+    void run_budget_catch_up() {
+        if (!budget_catch_up_.load(std::memory_order_relaxed))
+            return;
+        std::unique_lock lock(rollup_mu_, std::try_to_lock);
+        // db_ is reset under rollup_mu_ in shutdown(), so it is checked under the lock.
+        if (!lock.owns_lock() || !db_ || !budget_catch_up_.load(std::memory_order_relaxed))
+            return;
+        const yuzu::echo::BudgetCatchUp armed{true, budget_catch_up_now_.load(std::memory_order_relaxed)};
+        const auto clock = yuzu::echo::budget_slice_clock(armed, now_epoch_seconds());
+        if (!clock) {
+            set_budget_catch_up({});
+            spdlog::warn("ECHO: byte budget catch-up disarmed: the wall clock stepped back below the "
+                         "reading the drain was admitted with; the next maintenance pass decides");
+            return;
+        }
+        enforce_budget(*clock, /*maintenance_pass=*/false);
     }
 
     // ── sql action (warehouse query engine) ──────────────────────────────────

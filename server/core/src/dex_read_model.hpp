@@ -35,6 +35,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace yuzu::server {
@@ -111,8 +112,8 @@ struct DexAppModel {
 /// (`build_dex_app_model` — the store-reaching builder — is in `dex_read_builders.hpp`.)
 std::string dex_app_json(const DexAppModel& model, bool audit_persisted = true);
 
-// ── New twin #2: app-centric stability list (GET /api/v1/dex/apps, MCP list_dex_apps; the
-// /fragments/dex/apps tab still reads dex_top_apps until it is rewired) ──
+// ── New twin #2: app-centric stability list (GET /api/v1/dex/apps, MCP list_dex_apps and the
+// /fragments/dex/apps tab, rendered by dex_apps_ui.cpp from this same model) ──
 
 /// Figures published for one application or one version of it. Counts are
 /// scoped to the requested platform and window-wide. The share, rate and score are over ONE
@@ -133,6 +134,9 @@ struct DexStabilityFigures {
     std::optional<DexInterval> rate_per_1000;  ///< exact; online-device events per 1,000 online
                                                ///< devices
     StabilityScore score;
+    /// The tier name the score reads as under the policy that scored this row (an override's own
+    /// names for an overridden application and its versions); "" when no score is given.
+    std::string tier;
 };
 
 struct DexAppVersionStability {
@@ -172,6 +176,17 @@ std::vector<std::string> dex_apps_online_ids(const DexFleet& fleet, std::string_
 /// The published `population_basis`: `<scope>_online` ("windows_online" for windows).
 std::string dex_apps_population_basis(std::string_view scope);
 
+/// The published `crash_source_coverage`: how complete the crash/hang sources are per
+/// platform in `scope` (a normalized token). windows = "complete"; linux and macos =
+/// "partial" (an empty list there is not proof of stability). `all` carries all three
+/// keys, a single scope its one key; the vector order is this helper's, and the JSON
+/// object is keyed by platform with no ordering promise.
+/// A fixed table of the shipped design, NOT live collector health: it mirrors the crash
+/// sources in docs/dex-signal-catalog.md (Windows WER/event log; Linux
+/// `process.crashed` needs systemd-coredump as the active handler; macOS fidelity notes)
+/// and does not change when a collector is disabled or absent on a host.
+std::vector<std::pair<std::string, std::string>> dex_apps_crash_source_coverage(std::string_view scope);
+
 /// The score policy an Apps read scored under, and where it came from.
 /// `source` is "default" (nothing stored, or the stored document was refused and
 /// the shipped defaults are in force) or "custom". `revision` identifies the
@@ -183,6 +198,15 @@ struct DexPolicyInForce {
     std::string source{"default"};
     std::string revision{"default"};
     std::string fault;
+};
+
+/// How many of the online devices in one platform report the crash and hang observer armed,
+/// disarmed, or not at all (a count per state, never an agent id).
+struct DexObserverSplit {
+    std::string platform; ///< windows, linux, macos or other
+    int64_t armed{0};
+    int64_t disarmed{0};
+    int64_t none_reported{0};
 };
 
 /// The whole-fleet apps-by-reliability list - no per-agent identity (a
@@ -202,13 +226,20 @@ struct DexAppsModel {
     int64_t apps_total{0};
     bool apps_truncated{false}; ///< apps_total > apps.size(): the top-N cut dropped some
     DexPolicyInForce policy;    ///< the policy every figure in this model was scored under
+    /// The live observer state of the devices in `platform_scope`, counted per platform;
+    /// nullopt = no observer source is wired (unknown, never zero). Unlike
+    /// `crash_source_coverage` (the shipped design) this is what the devices report now.
+    std::optional<std::vector<DexObserverSplit>> observer_state;
     bool degraded{false};
+    /// Why the read is degraded: invalid_scope, score_policy_unavailable, score_policy_invalid,
+    /// not_wired, internal_error, or a `dex_read_fault_token` (store_not_open,
+    /// pool_acquire_timeout, query_error, statement_timeout, concurrency_budget).
     std::string degraded_reason;
 };
 
 /// The message of the 503 / MCP error for a degraded Apps read: the generic text, with
-/// the reason token appended when the model carries one ("score_policy_unavailable",
-/// "score_policy_invalid"). One copy for the REST and MCP handlers.
+/// the reason token appended when the model carries one (any of the tokens listed on
+/// `DexAppsModel::degraded_reason`). One copy for the REST and MCP handlers.
 [[nodiscard]] inline std::string dex_degraded_message(const DexAppsModel& m) {
     return m.degraded_reason.empty() ? std::string("DEX store read degraded")
                                      : "DEX store read degraded (" + m.degraded_reason + ")";
@@ -221,10 +252,18 @@ struct DexAppsModel {
 /// kDexCohortFloor (one device, maintainer ruling 2026-10-14): every figure is
 /// published at any device count; an unknown or zero population withholds
 /// `no_population`.
-DexAppsModel dex_apps_model_from_rows(const std::string& window,
+DexAppsModel dex_apps_model_from_rows(const std::string& window, const std::string& platform_scope,
                                       const std::vector<DexAppStabilityRow>& rows,
                                       std::optional<int64_t> population,
                                       const DexPolicyInForce& policy);
+
+/// PURE: counts the scope's online devices by observer state. `states` is aligned by index to
+/// `dex_apps_online_ids(fleet, scope)`. A platform scope yields its one row; `all` yields
+/// windows, linux, macos and other (any other operating system), always present and zero-filled
+/// so the rows sum to the population. A size mismatch yields nullopt: unknown, never wrong numbers.
+std::optional<std::vector<DexObserverSplit>>
+dex_apps_observer_split(const DexFleet& fleet, std::string_view scope,
+                        const std::vector<DexObserverState>& states);
 
 std::string dex_apps_json(const DexAppsModel& model);
 

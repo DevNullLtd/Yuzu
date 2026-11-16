@@ -87,7 +87,8 @@
 # non-ASCII character in a scanned HELP literal, or a scan error (a missing or
 # unreadable scan target, an unsupported Erlang construct, no gateway
 # {help, ...} tuple found) -- or the selftest failed; 2 = usage error, or no
-# working python interpreter.
+# working python interpreter. An uncaught Python exception (a traceback) also
+# exits 1, so a red run with a traceback is a bug in the lint, not a finding.
 
 set -euo pipefail
 
@@ -145,6 +146,7 @@ SCAN_TARGETS = {
     "help_tables": [
         "server/core/src/guardian_journal_fleet_tags.hpp",
         "server/core/src/guardian_health_fleet_tags.hpp",
+        "server/core/src/guardian_backend_fleet_tags.hpp",
     ],
     # (c) roots whose apps' src/ and include/ *.erl/*.hrl are scanned for {help, ...} tuples.
     "erl_help_dirs": ["gateway/apps"],

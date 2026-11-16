@@ -5,14 +5,18 @@
 #include "execution_tracker.hpp"
 #include "leader_elector.hpp" // kServerBackgroundLeaderLock, LeaderElector::epoch()
 #include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
+#include "refusal_log_throttle.hpp" // RefusalLogThrottle: bounded log lines for repeated holds (#3678)
 
 #include <yuzu/metrics.hpp>
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <chrono>
 #include <exception>
+#include <limits>
+#include <string>
 
 namespace yuzu::server {
 
@@ -61,6 +65,12 @@ bool decode_payload(const OutboxCommand& c, std::vector<std::string>& agent_ids,
 } // namespace
 
 CommandOutboxDelivery::CommandOutboxDelivery(Deps deps) : d_(std::move(deps)) {
+    // R4 (#3678): the horizon can never exceed the constant that is static_asserted below the
+    // agent dedup ring, and a non-positive value would dead-letter every redrive.
+    d_.redelivery_horizon_commands =
+        std::clamp<std::int64_t>(d_.redelivery_horizon_commands, 1,
+                                 yuzu::kMaxOutboxRedeliveryHorizonCommands);
+
     // Post-merge review #4344 follow-up (MEDIUM finding 2, docs/observability-conventions.md):
     // pre-seed both `cause` values `yuzu_server_command_outbox_deliver_retry_cause_total` can
     // actually emit (see the increment call site below). Lazy-created-on-first-increment means a
@@ -85,6 +95,29 @@ CommandOutboxDelivery::CommandOutboxDelivery(Deps deps) : d_(std::move(deps)) {
                             {{"cause", "route_unreadable"}});
         d_.metrics->counter("yuzu_server_command_outbox_deliver_retry_cause_total",
                             {{"cause", "os_gate_unreadable"}});
+        // #3678: pre-seed so the first dead-letter is a visible step from 0, not a series that
+        // appears already at 1 (the lone-incident reason above).
+        d_.metrics->describe(
+            "yuzu_server_command_outbox_deliver_horizon_exceeded_total",
+            "Outbox occurrences dead-lettered because a redrive would have re-sent a stable "
+            "command_id after the dispatch count had advanced by the redelivery horizon "
+            "(redelivery_horizon_exceeded) or the shared dispatch sequence had gone backwards "
+            "(redelivery_sequence_regressed) (#3678): the agent's dedup ring may have evicted the "
+            "id, so the send would re-execute. An earlier attempt may or may not have reached any "
+            "agent.",
+            "counter");
+        d_.metrics->counter("yuzu_server_command_outbox_deliver_horizon_exceeded_total");
+        d_.metrics->describe(
+            "yuzu_server_command_outbox_deliver_hold_cause_total",
+            "Pending outbox occurrences HELD (neither sent nor failed) because the redelivery "
+            "retry-limit check (#3678) could not run, by `cause`: sequence_unwired (no reader wired; "
+            "also ends the tick), sequence_unreadable (the dispatch counters could not be read; "
+            "also ends the tick), or stamp_not_committed (the first-attempt stamp was fenced out, "
+            "already set, or the store degraded). A held row is retried on the next tick.",
+            "counter");
+        for (const char* cause : {"sequence_unwired", "sequence_unreadable", "stamp_not_committed"})
+            d_.metrics->counter("yuzu_server_command_outbox_deliver_hold_cause_total",
+                                {{"cause", cause}});
         // json-dump-depth-guard fix: the bare
         // yuzu_server_command_outbox_deliver_decode_failed_total counter stays
         // unchanged (dashboards/alerts-in-waiting keep working), but it now
@@ -124,7 +157,10 @@ void CommandOutboxDelivery::tick() {
         spdlog::warn("command_outbox_delivery: list_pending degraded — deferring this tick");
         return;
     }
+    hold_remaining_ = false;
     for (const auto& c : *pending) {
+        if (hold_remaining_)
+            break; // a systemic R4 hold (sequence unwired/unreadable) already logged once
         if (d_.should_stop && d_.should_stop()) {
             spdlog::info("command_outbox_delivery: tick stopping early on shutdown — "
                          "remaining occurrence(s) deferred");
@@ -284,6 +320,92 @@ void CommandOutboxDelivery::deliver(const OutboxCommand& c, const std::string& l
         return;
     }
 
+    // 2b. R4 (#3678) REDELIVERY HORIZON. Runs after authorization and decode (a denied or
+    //     malformed row never reaches it) and BEFORE any send. Every branch that cannot prove
+    //     the row is inside the horizon HOLDS it (return, no send, no reschedule): the next tick
+    //     retries, and a held row can only be re-sent later, never sooner. An unwired or
+    //     unreadable position is SYSTEMIC (every row would hold the same way), so it also ends
+    //     the tick instead of repeating one pool lease and one log line per pending row.
+    if (!d_.dispatch_seq_fn) {
+        hold_row(c, "sequence_unwired", /*systemic=*/true);
+        return;
+    }
+    const auto pos = d_.dispatch_seq_fn();
+    if (!pos) {
+        hold_row(c, "sequence_unreadable", /*systemic=*/true);
+        return;
+    }
+    bool stamped_now = false; // this call wrote the stamp (no earlier attempt can have sent)
+    if (!c.dispatch_seq_first_sent) {
+        // First attempt: the stamp MUST commit before the send. Fenced out, already stamped by
+        // another writer, or a store error all mean "not ours / unknown": hold, do not send.
+        auto stamped = d_.outbox->stamp_first_send(c.occurrence_id, lock_name, epoch, pos->shared,
+                                                   pos->unrecorded);
+        if (!stamped.has_value() || !*stamped) {
+            hold_row(c, "stamp_not_committed", /*systemic=*/false);
+            return;
+        }
+        stamped_now = true;
+    } else {
+        const std::int64_t first_shared = *c.dispatch_seq_first_sent;
+        // The shared sequence going BACKWARD (restore, lost-WAL failover) makes the elapsed count
+        // unknowable, so it dead-letters like an exceeded horizon, under its own reason so an
+        // operator can tell the two apart. Only the shared term is judged here: the local count
+        // legitimately restarts at zero in a new process.
+        const bool regressed = pos->shared < first_shared;
+        // Same leadership term => same process => the two local counts are comparable, and the
+        // reader's count can only have grown since the stamp. Any other case counts the reader's
+        // WHOLE local count: a different term, a stamp row missing its companions, or a count that
+        // went DOWN inside one epoch (impossible unless an epoch were ever reused, which the
+        // elector documents as not covered; clamping that to zero would under-count).
+        //
+        // Charging the whole count is an OVER-count relative to the reader's own history (it
+        // includes failures that predate the stamp), but it is NOT a bound on what was missed: a
+        // previous process's unrecorded dispatches after the stamp are not in this process's count
+        // at all, and a freshly started reader holds about zero. That is the under-count residual
+        // documented in command_replay_horizon.hpp ("an earlier process lifetime").
+        const bool same_term = c.dispatch_stamp_epoch && *c.dispatch_stamp_epoch == epoch &&
+                               c.dispatch_unrecorded_first_sent &&
+                               pos->unrecorded >= *c.dispatch_unrecorded_first_sent;
+        const std::int64_t local =
+            same_term ? std::max<std::int64_t>(0, pos->unrecorded - *c.dispatch_unrecorded_first_sent)
+                      : pos->unrecorded;
+        const std::int64_t shared_delta = regressed ? 0 : pos->shared - first_shared;
+        // Saturating: an overflow must read as "far past the horizon", never wrap negative.
+        const std::int64_t elapsed =
+            local > std::numeric_limits<std::int64_t>::max() - shared_delta
+                ? std::numeric_limits<std::int64_t>::max()
+                : shared_delta + local;
+        if (regressed || elapsed >= d_.redelivery_horizon_commands) {
+            const char* reason =
+                regressed ? "redelivery_sequence_regressed" : "redelivery_horizon_exceeded";
+            auto marked = d_.outbox->mark_failed(c.occurrence_id, lock_name, epoch, reason);
+            if (marked.has_value() && *marked) {
+                count("yuzu_server_command_outbox_deliver_horizon_exceeded_total");
+                spdlog::error("command_outbox_delivery: occurrence '{}' (command_id={}) "
+                              "dead-lettered: {} (first_seq={} current_seq={} local_delta={} "
+                              "same_term={} horizon={})",
+                              c.occurrence_id, c.command_id, reason, first_shared, pos->shared,
+                              local, same_term, d_.redelivery_horizon_commands);
+                // NOT decline_or_cancel_exec: an earlier attempt may have reached agents and
+                // their responses may still be arriving (see R4 in the header).
+                audit(c, "failure",
+                      std::string(reason) + " first_seq=" + std::to_string(first_shared) +
+                          " current_seq=" + std::to_string(pos->shared) +
+                          " local_delta=" + std::to_string(local) +
+                          " horizon=" + std::to_string(d_.redelivery_horizon_commands) +
+                          " execution_id=" + c.execution_id +
+                          // An approval id is a bearer capability (approval_manager.cpp redacts it
+                          // to 8 characters in its logs), so only that prefix is recorded here;
+                          // the full id is on the approval's own audit rows.
+                          " approval_id=" + c.approval_id.substr(0, 8) +
+                          " (an earlier attempt may or may not have reached any agent; "
+                          "redelivery refused to stay inside the agent dedup window)");
+            }
+            return;
+        }
+    }
+
     // 3. Re-resolve the caller from the stored principal (never a serialized
     //    DispatchCaller — #1398) and stamp the approval provenance the
     //    occurrence carries. THIS is the declared #1398 stamping site for
@@ -349,7 +471,15 @@ void CommandOutboxDelivery::deliver(const OutboxCommand& c, const std::string& l
                      outcome.containment_unreadable ? "containment unreadable"
                      : outcome.route_unreadable     ? "gateway route directory unreadable"
                                                     : "agent presence unreadable (per-OS kill switch set)");
-        (void)d_.outbox->reschedule(c.occurrence_id, lock_name, epoch, d_.retry_backoff);
+        // R4 (#3678): when THIS call wrote the stamp and the attempt provably reached no agent
+        // (`sent == 0`), no earlier attempt can have sent either, so the stamp guards nothing:
+        // clear it in the same fenced write and let the next attempt re-stamp. Otherwise a row
+        // held back only by an unreadable gate would age toward a dead-letter without ever having
+        // been sent. NEVER clear a stamp that predates this call (an earlier attempt, such as a
+        // rolled-back bookkeeping write, may really have sent). A concurrent send by a stale
+        // ex-leader inside this window is the documented stale-replica gap, not excluded by this clear.
+        (void)d_.outbox->reschedule(c.occurrence_id, lock_name, epoch, d_.retry_backoff,
+                                    /*clear_first_send_stamp=*/stamped_now && outcome.sent == 0);
         return;
     }
 
@@ -518,6 +648,31 @@ CommandOutboxDelivery::ExecCancelOutcome CommandOutboxDelivery::decline_or_cance
         return ExecCancelOutcome::kCancelled;
     }
     return ExecCancelOutcome::kCancelled; // unreachable; silences -Wreturn-type on some compilers
+}
+
+void CommandOutboxDelivery::hold_row(const OutboxCommand& c, const char* cause, bool systemic) {
+    // The base degrade counter keeps counting every hold (dashboards key on it); the
+    // cause-labelled companion separates an unreadable position from a stamp that did not commit.
+    // The COUNTERS are never throttled (they are the evidence); only the human-readable line is,
+    // because a sustained hold repeats it every tick (about 17,000 times a day for one cause).
+    count("yuzu_server_command_outbox_deliver_degrade_total");
+    count_cause("yuzu_server_command_outbox_deliver_hold_cause_total", cause);
+    static RefusalLogThrottle hold_log_throttle;
+    const bool loud = hold_log_throttle.should_warn(cause);
+    if (systemic) {
+        // The caller stops iterating after this row, so it is once per tick at most.
+        hold_remaining_ = true;
+        if (loud)
+            spdlog::error("command_outbox_delivery: redelivery horizon cannot be enforced ({}); "
+                          "holding this and every remaining pending occurrence this tick, first "
+                          "occurrence '{}' (nothing is sent or failed; retried next tick; at most "
+                          "one such line per minute per cause)",
+                          cause, c.occurrence_id);
+    } else if (loud) {
+        spdlog::warn("command_outbox_delivery: occurrence '{}' held: {} (at most one such line "
+                     "per minute per cause)",
+                     c.occurrence_id, cause);
+    }
 }
 
 void CommandOutboxDelivery::audit(const OutboxCommand& c, const std::string& result,

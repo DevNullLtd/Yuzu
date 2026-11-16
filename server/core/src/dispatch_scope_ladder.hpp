@@ -17,6 +17,7 @@
 #include "custom_properties_store.hpp"
 #include "dispatch_confined_arms.hpp"
 #include "dispatch_route_fallback.hpp"
+#include "dispatch_send_progress.hpp"
 #include "dispatch_target_shape.hpp"
 #include "execution_tracker.hpp"
 #include "gateway_route_store.hpp"
@@ -82,6 +83,9 @@ enum class ScopeAbortReason {
     PrincipalUnresolved,
     Unresolvable,
     PresenceDegraded,
+    ResultSetUnusable,          ///< a referenced set is still pending (transient)
+    ResultSetUnusablePermanent, ///< failed, or incomplete where a missing member would match
+                                ///< (for example NOT, LEN or STARTSWITH); permanent; same wire reason
 };
 
 /// Audit-log string vocabulary for `ScopeAbortReason` — MUST agree pairwise
@@ -103,6 +107,9 @@ inline const char* to_string(ScopeAbortReason r) {
         return "unresolvable";
     case ScopeAbortReason::PresenceDegraded:
         return "presence_degraded";
+    case ScopeAbortReason::ResultSetUnusable:
+    case ScopeAbortReason::ResultSetUnusablePermanent:
+        return "result_set_unusable";
     }
     return "unknown";
 }
@@ -124,6 +131,10 @@ inline ScopeAbortReason to_abort_reason(ScopeEvalError::Kind k) {
         return ScopeAbortReason::OwnerCheckFailed;
     case ScopeEvalError::Kind::PresenceDegraded:
         return ScopeAbortReason::PresenceDegraded;
+    case ScopeEvalError::Kind::ResultSetUnusable:
+        return ScopeAbortReason::ResultSetUnusable;
+    case ScopeEvalError::Kind::ResultSetUnusablePermanent:
+        return ScopeAbortReason::ResultSetUnusablePermanent;
     }
     return ScopeAbortReason::DbDegraded;
 }
@@ -142,6 +153,10 @@ struct ScopeLadderResult {
     std::optional<std::vector<std::string>> matched;
     std::optional<std::string> parse_error;
     std::optional<ScopeAbortReason> abort_reason;
+    /// For a `result_set_unusable` abort only: `cause=<pending|failed|incomplete> result_set=<id>`
+    /// (fixed tokens, the id neutralised). The set passed the caller's owner check, so naming it
+    /// answers the caller about its own set. Empty for every other reason.
+    std::string abort_detail;
 };
 
 /// The ladder itself: alias resolution -> owner-check gate -> parse ->
@@ -209,8 +224,16 @@ inline ScopeLadderResult resolve_scope_targets(
         !matched.error().detail.empty() && audit.resolution_failed)
         audit.resolution_failed(matched.error().detail);
     result.abort_reason = to_abort_reason(matched.error().kind);
-    spdlog::error("scope dispatch: evaluate_scope degraded (reason={})",
-                  to_string(*result.abort_reason));
+    if (matched.error().kind == ScopeEvalError::Kind::ResultSetUnusable ||
+        matched.error().kind == ScopeEvalError::Kind::ResultSetUnusablePermanent) {
+        // An expected state of the caller's own set, not a degrade (the registry logged it).
+        result.abort_detail = matched.error().detail;
+        spdlog::warn("scope dispatch: evaluate_scope aborted (reason={})",
+                     to_string(*result.abort_reason));
+    } else {
+        spdlog::error("scope dispatch: evaluate_scope degraded (reason={})",
+                      to_string(*result.abort_reason));
+    }
     if (audit.evaluation_aborted)
         audit.evaluation_aborted(to_string(*result.abort_reason));
     return result;
@@ -438,14 +461,13 @@ inline ConfinedDispatchOutcome wire_and_dispatch_confined(
     // per-id consult) and `prepare_route_fallback` (the batched read).
     auto route_fallback =
         std::make_shared<yuzu::server::GatewayRouteFallback>(registry, gateway_route_store);
-    yuzu::server::ConfinedDispatchSink sink{
+    yuzu::server::ConfinedDispatchSink raw_sink{
         [&registry, &cmd, route_fallback](const std::string& aid) {
             // A local session ALWAYS wins (route_fallback->prepare() never
             // even looks up an id with one) — this fallback fires ONLY for a
             // candidate this replica has no local session for at all.
             if (auto cluster = route_fallback->cluster_for(aid))
-                return registry.send_via_directory(aid, cmd, *cluster,
-                                                   route_fallback->legacy_wire_for(aid));
+                return registry.send_via_directory(aid, cmd, *cluster);
             return registry.send_to(aid, cmd);
         },
         [&registry, &cmd] { return registry.send_to_all(cmd); },
@@ -465,6 +487,10 @@ inline ConfinedDispatchOutcome wire_and_dispatch_confined(
         [&registry](const std::vector<std::string>& candidates) {
             return registry.has_remote_presence(candidates);
         }};
+    // Counts sends accepted by the send path into the caller's SendProgressScope when one is open (the
+    // instruction-execute core and POST /api/v1/commands), so a throw mid fan-out still tells
+    // them how many agents hold the command. Identity otherwise.
+    const yuzu::server::ConfinedDispatchSink sink = yuzu::server::instrument_sink(std::move(raw_sink));
 
     // #3424/#3511: one registry read per dispatch, same lifecycle as `gate`
     // (built once by the caller before this function runs) -- never

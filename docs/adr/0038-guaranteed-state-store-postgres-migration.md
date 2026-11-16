@@ -3,6 +3,7 @@
 - **Status:** Accepted — shipped PR #2663, merged 2026-08-08; `guaranteed_state_store.cpp` is
   PG-native (`PgPool`/`pg_exec`), zero live `sqlite3_` calls (comments only), re-verified
   2026-09-07.
+- **Owner:** Nathan Dornbrook (platform)
 - **Date:** 2026-07-31
 - **Deciders:** pg workstream, security-guardian + docs-writer review (Guardian routing per CLAUDE.md)
 - **Parents:** ADR-0006/0007/0008 (+Correction), ADR-0009, ADR-0012; conventions from the
@@ -235,6 +236,126 @@ statement itself fails, the transaction is abandoned and the event is not stored
 single-event path the ingest error counter moves). The store constructor also checks, after the migrations, that the cascade
 key exists and refuses to open otherwise, because the migration runner cannot tell this schema's
 v3 from another branch's v3. Status reads are unchanged.
+
+## Update (2026-11-03) - census ordering key and durable pending evidence (#5690)
+
+The "Status upserts: fail-soft ... reconcile heals" decision above, and the Retention section's
+statement that the reaper deletes every expired event, are superseded for the compliance census.
+Schema v4 gives the census row an ordering tuple. The key is the agent's event time limited to the
+server's receipt time plus 300 seconds; ties break by `ingest_seq`, the sequence value the event
+INSERT allocates. A verdict whose order cannot be proven marks the row `order_uncertain`. An event
+whose census write fails stays stored with `projection_pending`, a redelivery of it repairs the
+census from its stored ordering inputs, and the retention reaper skips it. Under one `SAVEPOINT
+census_upsert` a writer locks every pending event of the pair in `ingest_seq` order in one
+statement, then the census row; `delete_rule` locks and retires the rule's pending events in the
+same order inside one transaction. The census reads gain `order_uncertain`, `projection_pending`
+and `uncertain_rules`. The migration rewrites the events table under ACCESS EXCLUSIVE, which relies
+on the no-rolling-upgrade exception recorded in ADR-0008. Two classes of pending event are not
+retired automatically (a decommissioned agent's, and one whose rule was deleted mid-ingest); they
+are listed in docs/clock-guarded-retention.md and counted on
+`yuzu_server_guardian_census_pending_events`.
+
+## Update (2026-11-09) - a decommission erases the census and retires its pending evidence (#5675)
+
+The Update (2026-11-03) above lists two classes of pending event that nothing retires. The first,
+a decommissioned agent's, is now retired by the agent decommission cascade, which gains
+`GuaranteedStateStore::delete_agent` as its ninth store (public key `guaranteed_state`). In one
+transaction it locks the agent's pending events in `ingest_seq` order, sets `projection_pending` false on exactly those
+rows (the step `delete_rule` takes for a rule), then deletes the agent's `guardian_agent_rule_status`
+rows. That is the census writers' own lock order for the event rows (pending events, then the census
+row), so it adds no new lock and event-row waits are acyclic. The census-row deletes of two overlapping
+transactions can in principle deadlock; Postgres then aborts one, the caller sees a failure and the
+re-issue is idempotent. The method is not a rule mutation: no policy-generation bump, no hook and no push.
+The second class, a first delivery whose projection failed while its rule was being deleted, is
+unchanged.
+
+Owner ruling D1, 2026-11-08: the decommission does NOT erase `guaranteed_state_events` or
+`guardian_observations`. The event log stays an immutable audit-style log and time-based expiry stays
+its single retention mechanism; the retired pending rows expire on that clock like any other event
+(30 days by default; rows stamped while `guardian_event_retention_days` is 0 or below never expire, so
+those rows are kept for good). The DEX observations are behavioural data, so retention expiry, not the decommission, is the
+erasure position for them. Widening the decommission to erase the events or the DEX observations is a
+follow-up that needs its own Update to this ADR and the store header; it is not made here and is
+tracked in #7531.
+
+Known gap (tracker #7147, which also covers the sweep of stranded pending evidence; `delete_rule` has the same list-read gap): a pending event committed after `delete_agent` read the
+agent's pending list but before it deleted the census rows is not retired by that transaction. A later
+pending event for a decommissioned agent likewise stays pending and is exempt from the events reaper
+until something retires it (a rule delete, a later decommission, a redelivery repair, or a later
+verdict that out-ranks it). A still-running agent re-creates its census row on its next
+census-bearing event (after a state change, an agent restart or a rule push; not on a schedule), and a journal replay cannot rebuild the census from retired
+evidence (the retained events are redelivered with no repair), so the agent is stopped first. The owner
+will revisit that later; it is tracked in #7532.
+
+## Update (2026-11-12) - a decommission also deletes the agent's order row, first (UP-14, H1)
+
+This is the Update the 2026-11-09 Update above calls for, in the one respect it widens. Schema v5
+adds the per-agent order table `guardian_agent_order` (one row per agent), whose row every
+census-bearing first delivery locks first, before the pair's pending events, the census row and the
+rule row. `GuaranteedStateStore::delete_agent` now deletes that agent's row as the FIRST statement of its
+existing single transaction, so the lock order of every census writer is the same: agent row, pending
+events in `ingest_seq` order, census rows, never a rule row. The delete is never a transaction of its
+own: a later statement's failure rolls it back with the rest. Without the delete a decommissioned
+agent would keep its order row; taking it after the pending events would invert the order against a
+first delivery.
+
+The 2026-11-09 sentence that `delete_agent` "adds no new lock" is therefore true of the pending-event and
+census steps and no longer of the method as a whole: it now takes the agent's order-row lock, first.
+Nothing else is added: no advisory lock, no rule-mutation hook, no policy-generation bump, no push, and no
+tenth cascade store (the order row is part of the `guaranteed_state` store, so the nine-store count
+and its pins are unchanged).
+
+Erasure of this store remains PARTIAL (owner ruling D1, unchanged): the event log and the DEX
+observations stay until retention expiry, and widening that is still tracked in #7531; the event
+log's `boot_epoch` and `emit_seq` columns stay with their events until they expire. The order row
+holds the agent's counters and pair clock only: it is device-level (keyed by `agent_id`), holds
+server receipt-time clock readings and counters, and holds no user content and no behavioural data.
+The `epoch` and `emit_seq_hwm` values are what the agent asserted (the server checks only their
+range and does not verify them otherwise), while the clock readings are server database time. The row
+is retained until the device is decommissioned, with no TTL and no prune. An agent that vanishes
+without a decommission can therefore stay counted in the unordered-agents figure (while its latest
+unpaired event is later than its pair clock) and can crowd the first-50 id list. A prune of this table would be a separate clock-guarded-retention decision, not a
+quiet addition.
+
+Known residual, accepted: a first delivery that inserts the agent's order row and has not committed is
+invisible to the DELETE, so a brand-new or just-decommissioned agent's first event can commit an order
+row after `delete_agent` returned. A running agent also re-creates its order row with its census
+row (tracker #7532), the same class as the pending-list race of #7147. The decommissioned agent then
+has an order row again. That is accepted: the row holds counters and the pair clock only, and a later
+decommission deletes it.
+
+Lock wait and pool bound of the agent step (owner decision, 2026-11-12). Every census-bearing first
+delivery of an agent queues on that agent's order row, so one transaction that holds the row
+(for example the census fold of another rule of the same agent, a stalled commit, or an operator
+session left idle in a transaction) makes the agent's other first deliveries wait. A waiter holds a
+connection lease for the whole wait, and the leases come from one shared `PgPool` (default 16
+connections, `--postgres-pool-size`) that serves every store, authentication and audit included,
+with a 500 ms acquire timeout for ingest. The step therefore bounds its own wait: it runs
+`SET LOCAL lock_timeout = 1000` after its savepoint and restores the connection's own value (its
+session reset value: the pool's startup option, 10 s by default, a DSN `options=` value, or the
+role, database or server setting) before the savepoint is released (`kAgentStepLockTimeoutMs`), so
+each lock wait in the step gives up after 1 s instead of the pool's default 10 s. The bound is
+absolute: a pool or DSN `lock_timeout` below 1 s is loosened to 1 s for the step. One step can wait
+more than once (Ensure, DECIDE and one re-run after a concurrent delete of the agent's row), so a
+pooled connection can be held for the sum of those waits. A waiter that gives up takes the existing
+failure path: the event is stored with pending census evidence, its census write is skipped, and it
+is counted as a failed census projection. Such an event is acked and nothing on the server redelivers it, and the
+reaper exempts pending rows (`NOT projection_pending`), so for a rule that never fires again on that
+agent it stays until a later verdict for that (agent, rule) retires it: the accepted pending-list
+class of #7147, now also reachable through an order-step wait of over 1 s. The census write and the
+fold keep the connection's own `lock_timeout`. The owner chose this trade on 2026-11-12, with the
+cost of faster pending growth stated in the option, over recording the pool bound alone: a waiter fails fast
+into pending instead of holding a pooled connection for 10 s, and the cost is faster pending growth
+for the waiting rules. Different agents do not wait on one another through this row, but they share
+the pool, so one agent holding its row for long can occupy leases until the shared pool saturates. Measured on one
+development host (Postgres 18.4, a pool of 8, default timeouts): the fold of one first delivery took
+about 155 ms with 10,000 pending events on one (agent, rule) pair and about 1.67 s with 100,000,
+and another rule of the same agent waited about 151 ms during the 10,000-pending fold (about 2 ms
+with the step off). The point at which the pool saturates was not measured, and neither was the
+gateway's in-flight occupancy. A redelivery repairs only the census row of such an event: a repair
+runs no order step, so the event is never counted in the agent's order clock or counters, and the
+fleet count of unordered agents can undercount for an agent whose first deliveries all failed the
+step, until its next first delivery. That gap must be closed before the comparison ships.
 
 ## Follow-ups
 

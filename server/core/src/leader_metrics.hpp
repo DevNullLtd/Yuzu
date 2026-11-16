@@ -125,8 +125,9 @@ public:
                  std::int64_t now_steady_ns) {
         std::lock_guard<std::mutex> lk(mu_);
         m.gauge(kLeaderIsLeaderMetric).set(s.leader ? 1 : 0);
-        // Absent-vs-0 is unambiguous only because minted epochs are >= 1 (see
-        // LeaderElector::try_acquire): 0 always means "not leading".
+        // Absent-vs-0 is unambiguous only because a minted epoch is always above 2^32 (see
+        // LeaderElector::try_acquire, #6535): 0 always means "not leading". The value is a
+        // double: exact below 2^53, i.e. for timelines below 2^21.
         m.gauge(kLeaderEpochMetric).set(s.leader ? static_cast<double>(s.epoch) : 0);
         sync(m.counter(kLeaderAcquiredMetric), s.acquired);
         for (std::size_t i = 0; i < kAcquireFailureCount; ++i)

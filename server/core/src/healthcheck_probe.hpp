@@ -46,9 +46,10 @@ inline constexpr int kRequestMs = 3000; ///< whole-request ceiling (probe_once d
 #endif
 
 /// One GET against `target`. A transport or TLS failure is reported as status 0
-/// plus a reason; an exception escaping httplib (0.37.1 reserves the response
-/// body on a peer-claimed Content-Length before its payload ceiling applies) is
-/// translated by run_healthcheck, never propagated. `max_total_ms` is the request-phase
+/// plus a reason; an exception escaping httplib (through 0.37.1 the client reserved the
+/// response body from a peer-claimed Content-Length before its payload ceiling applied; 0.59.0
+/// caps that reservation at `payload_max_length_`, so the allocation is bounded by that ceiling,
+/// not removed) is translated by run_healthcheck, never propagated. `max_total_ms` is the request-phase
 /// ceiling handed to httplib::set_max_timeout; it does not cover name
 /// resolution or the TLS handshake (see probe_bounded).
 [[nodiscard]] HealthcheckOutcome probe_once(const HealthcheckTarget& target,

@@ -10,6 +10,13 @@ context-refs: #1634 (response-reader ruling), PR #1711 (per-row filter foundatio
 
 # 0017 — Management-group confinement applies to list/fan-out reads: the admit-then-filter list gate
 
+> **Update (2026-11-14, against dev @ 2c49b4ea0) — currency notes.** (1) References to `rbac.db` are
+> from the SQLite era: RBAC now lives in the Postgres `rbac_store` schema (ADR-0041), which fails
+> closed on a degraded read. The rule each passage states is unchanged. (2) The `file:line` cites in
+> this ADR (notably the `server.cpp:NNNN` ones) record where each site was when the passage was
+> written. `server.cpp` has since grown several-fold and they no longer point at the named code;
+> find each site by the function or route it names.
+
 > **Update (2026-07-24) — #1715 resolved; PR-A foundation landed.** The global↔management-group
 > deny-precedence lattice the "Combining algorithm" section below left *undecided* has been decided:
 > **cross-boundary combining is additive/OR; deny-overrides applies only within a single group's
@@ -272,8 +279,9 @@ gate.
   replaced with an HTTP 200 note (`data-denied="true"` for a 403, `data-degraded="gate"` for a 503;
   a 401 passes through), because the dashboard drops 4xx/5xx bodies; the REST and MCP twins keep the
   real 403/503. The fragment suppresses the owner disjunct for service-scoped sessions
-  (a service-scoped token's session username is its minter); the other execution read surfaces still show
-  a minter's executions to a service-scoped token (#5557). The fragment pushes the scope into SQL
+  (a service-scoped token's session username is its minter); since #5557 every other execution read
+  surface does too, through the ownership key `execution_owner_key(session)`, so a service-scoped
+  token sees an execution only once an agent in its service scope has a status row for it. The fragment pushes the scope into SQL
   before its LIMIT and bounds the agent-status read to the visible agents; MCP's first gate stays a
   plain `Infrastructure:Read`. **NOT covered, disclosed:** `summarize_working_set` `kind=fleet` and
   `kind=result_set` return the whole-registry agent count from `agents_fn()` (#4753, checklist still
@@ -291,7 +299,8 @@ gate.
   migration (#3789)". The LIST route's confinement predicate is pushed into SQL before `LIMIT`
   (INV-3) via a correlated `EXISTS` over `agent_exec_status` plus an owner disjunct — a real
   visible-agent intersection, not the own-dispatches-only shortcut MCP `list_executions` still uses
-  (`docs/auth-architecture.md`'s Third migration paragraph). The two mutating routes keep `require_permission(Execution, Execute)` ahead of
+  for a management-group-confined caller (a service-scoped caller has used the agent-evidence rule
+  since #5557; `docs/auth-architecture.md`'s Third migration paragraph). The two mutating routes keep `require_permission(Execution, Execute)` ahead of
   `require_fleet_read(..., "Read")` (the fleet gate is structurally Read-only, INV — see
   `authz_gates.cpp`) and apply a stricter complete-cohort-in-scope rule, not bare visibility, before
   allowing a rerun/cancel. Coverage: `tests/unit/server/test_legacy_executions_scope_authz.cpp`.
@@ -318,6 +327,20 @@ gate.
     alternative and are out of scope). It **MUST NOT** be left on the flipped gate, or it becomes an
     INV-3 cross-group count leak. The UI scope caveat is *not* the safeguard (it shows only to
     operators who already hold global read); this ADR entry is.
+  - **Update (2026-11-09, SAM-17):** the list routes `GET /api/v1/inventory/software` and
+    `GET /api/v1/inventory/software/components` return a `totals` block (install rows or
+    instances, distinct devices) that reads the same shape of fleet-wide aggregate. It is served
+    **only** when the gate admitted the caller unfiltered (`ListReadDecision::AdmitAll`, an
+    unfiltered `FleetReadGate` scope) **and** the request is an exact-name lookup with at most one
+    version filter. A confined caller (`AdmitScoped`) gets its scoped rows and `totals: null` with
+    `totals_omitted: "scope"`; distinct counts are not additive across groups, so no confined
+    total can be derived from a fleet one. `null` documents "not shown", never zero. The
+    components figures come from a new fleet-wide rollup (`component_rollup`) that falls under
+    the same rule. For the same reason the `version_min` / `version_max` range is resolved
+    over the caller's own scope (the gate's `VisibleSet` pushed into the distinct-version read,
+    an unfiltered caller reading the fleet): a fleet-wide cut would make the range refusal a
+    fact about devices the caller cannot see, so a confined caller is answered for a title with
+    2000 versions outside its scope exactly as for an unknown title (ADR-0016 "Version range").
 - **Audit-log** — `AuditLog:Read` reads (`server.cpp:5848`); audit rows carry `agent_id`, so a
   confined auditor must see only in-scope events. (Classified here per Gate-2/Gate-3 review; it is
   also a no-per-agent-filter reader, so it is in the fail-closed ship-now fix below.)

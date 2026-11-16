@@ -1,0 +1,7 @@
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-11-15 · euid 501 · leg-hash 2f84f2a4c6e7
+== action=scan
+status|scan|constrained|macos:component_inventory:budget_entries
+comp|java|test||unreadable|/opt/homebrew/Library/Homebrew/test/support/fixtures/test.jar|397|1787153877|Library
+comp|java|concurrent_ruby||unreadable|/opt/homebrew/Library/Homebrew/vendor/bundle/ruby/4.0.0/gems/concurrent-ruby-1.3.8/lib/concurrent-ruby/concurrent/concurrent_ruby.jar|136802|1787153877|Library
+[result_status] CONSTRAINED / PARTIAL / macos:component_inventory:budget_entries
+

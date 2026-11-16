@@ -311,6 +311,9 @@ struct Config {
 
     // Response persistence
     LiveInt response_retention_days{90};
+    // Most stored response rows per (command, agent) pair; frames past it are dropped at the store
+    // (#561). Boot-only (not a runtime-config key), so a plain int; 0 is refused at the flag.
+    int response_max_rows_per_agent{256};
 
     // Audit trail
     LiveInt audit_retention_days{365};

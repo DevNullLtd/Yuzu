@@ -308,7 +308,8 @@ spec:
   assignment:
     mode: dynamic
     managementGroups:
-      - workstations
+      # the workstations group's id (ids, not names)
+      - 8d41e0c7a2b9
   fragment:
     ref: fragment.service.must_be_running
     with:

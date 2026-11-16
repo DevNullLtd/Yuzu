@@ -70,7 +70,7 @@ function tlsModeLabel(mode) {
 }
 
 // Fill a field with a cryptographically-random 24-byte hex secret. Used for
-// the Postgres credentials so operators can avoid weak / shared passwords —
+// the Postgres and Grafana credentials so operators can avoid weak / shared passwords —
 // the secret only ever lands in the generated .env, never in the compose YAML.
 function genSecret(id) {
   const bytes = new Uint8Array(24);

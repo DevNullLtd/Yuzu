@@ -1306,11 +1306,7 @@ gw_enrolled:
         session_id =
             "gw-session-" + auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(16));
         if (gateway_route_store_) {
-            // Upgrade-window shim (removed with the other legacy-name shims): carry the agent's
-            // legacy plugin-name flag onto the directory row, so a replica without this session
-            // can still dispatch.
-            if (auto res = gateway_route_store_->register_fresh(info.agent_id(), session_id,
-                                                                installed->legacy_echo_wire_name);
+            if (auto res = gateway_route_store_->register_fresh(info.agent_id(), session_id);
                 !res) {
                 record_route_store_failure(metrics_, "register_fresh", res.error());
                 // Task B (4.2b): register_fresh is the ONE fail-CLOSED
@@ -1986,6 +1982,23 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
                                                gw::StreamStatusAck* response) {
     // ADR-1005 enforceable seam — see grpc_on_behalf_enforce.hpp.
     if (auto s = onbehalf::enforce(context); !s.ok()) return s;
+
+    // The identifiers below are asserted by the gateway and are compared and stored as text.
+    // A value with an embedded NUL cannot be stored faithfully (the database sees only its
+    // prefix), so the whole notification is refused here, before any lookup, check, publish or
+    // write. Only the field name is logged: the value is externally supplied.
+    for (const auto& [field, value] :
+         {std::pair<std::string_view, const std::string*>{"agent_id", &request->agent_id()},
+          {"session_id", &request->session_id()},
+          {"cluster_id", &request->cluster_id()},
+          {"stream_home_id", &request->stream_home_id()}}) {
+        if (value->find('\0') != std::string::npos) {
+            spdlog::warn("[gateway] NotifyStreamStatus rejected: {} contains an embedded NUL",
+                         field);
+            return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                                "identifier contains an embedded NUL");
+        }
+    }
 
     const auto& agent_id = request->agent_id();
     const auto& session_id = request->session_id();

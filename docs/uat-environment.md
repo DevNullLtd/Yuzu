@@ -11,7 +11,7 @@ map, and gateway command forwarding.
 > compose / UAT-script change. The Cedar & Vale sales demo has its own full
 > runbook at `docs/demo-environment.md`.
 
-A cross-platform UAT script at `scripts/start-UAT.sh` (Linux + macOS) stands up the full stack, verifies connectivity, and runs command round-trip tests. The historical `scripts/linux-start-UAT.sh` name is kept as a thin shim that execs the canonical script. Usage:
+A UAT script at `scripts/start-UAT.sh` (Linux; macOS builds no native server since ADR-0035 step 3, so the native stack is unavailable there) stands up the full stack, verifies connectivity, and runs command round-trip tests. The historical `scripts/linux-start-UAT.sh` name is kept as a thin shim that execs the canonical script. Usage:
 
 ```bash
 bash scripts/start-UAT.sh          # start + verify (6 automated tests)
@@ -26,6 +26,17 @@ bash scripts/start-UAT.sh status   # show running processes
 ## viz-UAT (container-based, feat/viz-engine ladder)
 
 `scripts/start-viz-uat.sh` stands up a three-container Docker stack (server + gateway + agent) for the visualization feature ladder. **Cannot run alongside `start-UAT.sh`** — both bind host ports 8080 *and* 50051. Auto-detects arm64 vs amd64 and sets `--build-arg TRIPLET` accordingly (the gateway image is `linux/amd64` only, #6711: on Apple Silicon set `VIZ_UAT_PLATFORM=linux/amd64`, which builds all three images for amd64 under emulation; the gateway's Erlang build has crashed under OrbStack emulation); default `x64-linux` preserves the `release.yml` path. The launcher exports `VIZ_UAT_CONFIG` (absolute path to a generated `yuzu-server.cfg`); do not invoke `docker compose -f docker-compose.viz-uat.yml up` directly. State dir `/tmp/yuzu-viz-uat/`; scale agents with `VIZ_UAT_AGENTS=N`. Set `VIZ_UAT_AGENT_MODE=vm` to skip the in-container agent and print the enrollment token + host-exposed gateway address for running a native `yuzu-agent` on an OrbStack VM / bare-metal host — needed for PR 8+ visuals that depend on real loopback workloads. `VIZ_UAT_AGENT_MODE=none` skips agent startup entirely. **Note:** `scripts/start-UAT.sh` (the native, non-container UAT) force-wipes `/tmp/yuzu-uat/` on each start to work around a stale-DB session-auth bug (#947); do not remove that wipe without first closing the issue. See `bash scripts/start-viz-uat.sh --help` for full usage.
+
+## Grafana in the Docker UAT composes (#4817)
+
+`deploy/docker/docker-compose.uat.yml` (run by `scripts/win-start-UAT.sh`), `deploy/docker/docker-compose.full-uat.yml` (run by `scripts/docker-start-UAT.sh`) and the root `docker-compose.uat.yml` have no default Grafana password: Compose refuses every command that reads them, `down` and `ps` included, until `YUZU_GRAFANA_ADMIN_PASSWORD` is set.
+
+- **`start`** uses an exported `YUZU_GRAFANA_ADMIN_PASSWORD`, otherwise the password the previous `start` saved, otherwise a new random one; saves it to `.uat/grafana-admin-password` (0600 where the filesystem honours it) and prints it as the Grafana login (user `admin`). It refuses `admin`, an empty value and leading or trailing whitespace, checking an exported value before it stops anything. When its `down -v` succeeds Grafana gets a fresh database, so the printed password is the one Grafana has; if `down` fails (the launchers' `kill_docker` reports a failed `down` as "No containers running", #7057), an old volume keeps its old password.
+- **`stop` and `status`** only read the file and never write it, so a missing, unreadable or unwritable `.uat` cannot stop the stack from being stopped. `status` prints the saved password, an exported one with a caveat when no usable password is saved, or says the login is unknown (a stack started before this change or by hand).
+- The launchers source the shared helper `scripts/lib/uat-grafana-password.sh`, which un-exports the password; they pass it only to each `docker compose` command, so the native server, gateway and agent they start never inherit it, even one the operator exported. `tests/test_compose_default_credentials.py` checks the wiring and runs `stop` and `status` against a fake `docker`.
+- **By hand**, export the variable first (`export YUZU_GRAFANA_ADMIN_PASSWORD="$(openssl rand -hex 16)"`; the root file also needs `YUZU_GW_COOKIE`, and `docker-compose.full-uat.yml` needs `UAT_CONFIG`), and keep the same values across shells. For `down`, `ps` and `logs` any non-empty values work.
+- A Grafana volume from before this change (`grafana-uat-data` for the two `deploy/docker/` files, `grafana-data` for the root file) keeps `admin`/`admin` until `down -v` or `grafana cli admin reset-admin-password` (see "Grafana admin password" in `docs/user-manual/server-admin.md`).
+- Grafana and ClickHouse are published on every interface: these are UAT-only stacks.
 
 ## Cedar & Vale demo environment (release-pinned, sales)
 

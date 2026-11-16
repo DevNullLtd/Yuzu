@@ -40,7 +40,7 @@ param(
   [string]$Rebar3Version   = '3.24.0',
   [string]$PostgresVersion = '18.4',
   [ValidateSet('10.0.26100.0')][string]$WindowsSdkVersion = '10.0.26100.0',
-  [string]$VcpkgBaseline   = '4b77da7fed37817f124936239197833469f1b9a8',  # == vcpkg.json builtin-baseline
+  [string]$VcpkgBaseline   = '9eec002df1cd109f8f104cd966a763daf9751489',  # == vcpkg.json builtin-baseline
 
   # --- machine layout (conventions; keep in sync with Start-PinnedRunner.ps1) ---
   [string]$CacheRoot       = 'D:\ci',     # ccache + shared tool_cache live here (fast data drive)

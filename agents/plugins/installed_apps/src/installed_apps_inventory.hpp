@@ -1,14 +1,23 @@
 #pragma once
 
 // installed_apps_inventory.hpp -- pure parsing/formatting helpers for the
-// `list_inventory` action (software-inventory blob contract v2, ADR-0016).
+// `list_inventory` action (software-inventory blob contract v3, ADR-0016).
 //
-// The v2 contract: fields an ecosystem does not store stay EMPTY, never
+// The contract: fields an ecosystem does not store stay EMPTY, never
 // synthesised. Every function here is a pure string operation -- no popen, no
 // platform #ifdefs -- so the unit test (test_installed_apps_inventory.cpp)
 // exercises the exact code the plugin runs against per-ecosystem fixture
 // vectors, without needing dpkg/rpm/pacman/apk on the test host (same
 // header-for-testability pattern as installed_apps_registry_utf8.hpp, #1662).
+//
+// Publisher derivation per leg (empty here = the agent core labels the row `via:<ecosystem>`):
+//   rpm      VENDOR, else PACKAGER (a person), else empty      deb   Maintainer (empty -> via:deb)
+//   pacman   empty (no vendor field without a second subprocess) -> via:pacman
+//   apk      empty (same reason)                                 -> via:apk
+//   windows  Uninstall-hive Publisher, else empty               -> via:windows
+//   macos    signing leaf CN, else empty                        -> via:macos
+//   macos_pkgutil  empty always (a reverse-domain id is an identifier, not a vendor)
+//                                                              -> via:macos_pkgutil
 
 #include <algorithm>
 #include <cctype>
@@ -20,13 +29,14 @@
 namespace yuzu::installed_apps::inventory {
 
 // One `inv|` row. Member order == wire order after the prefix -- the blob
-// contract v2 field order the agent core hashes and the server re-parses:
+// contract v3 field order the agent core hashes and the server re-parses:
 //   name, version, publisher, install_date, kind, ecosystem, epoch, release,
-//   arch, signature_status, distro_id, distro_version
+//   arch, signature_status, distro_id, distro_version, install_location
 struct InvRecord {
     std::string name;
     std::string version;      // upstream version, release/revision stripped
-    std::string publisher;    // rpm PACKAGER / deb Maintainer / Windows Publisher
+    std::string publisher;    // rpm VENDOR>PACKAGER / deb Maintainer / Windows Publisher /
+                              // macOS signer; empty = unlabelled (see the table above)
     std::string install_date; // human-readable per ecosystem, EXCEPT macos_pkgutil,
                               // whose receipts store only a UNIX epoch-seconds
                               // integer -- carried through verbatim rather than
@@ -48,6 +58,10 @@ struct InvRecord {
                                   // tamper detection.
     std::string distro_id;        // /etc/os-release ID (Linux rows only)
     std::string distro_version;   // /etc/os-release VERSION_ID (Linux rows only)
+    std::string install_location; // Windows InstallLocation, macOS the .app path, Linux empty (no
+                                  // single prefix). Wire token 14 (blob v3 slot 13). The agent
+                                  // core keeps it only under a known machine root, blanking any
+                                  // other value (installed_software_v3.hpp machine_install_location).
 };
 
 // Epoch/version/release triple shared by the deb and pacman splitters.
@@ -142,6 +156,14 @@ inline bool rpm_sig_present(std::string_view raw) {
     return !v.empty() && v.rfind("%{", 0) != 0;
 }
 
+// A free-text rpm tag (VENDOR, PACKAGER) as honest-empty: "(none)" and an
+// unexpanded literal "%{...}" echo (an rpm too old to know the tag) both read
+// as empty, so the publisher falls through to the next source instead of
+// carrying the format string. Same guard as rpm_sig_present.
+inline std::string rpm_text_value(std::string_view raw) {
+    return rpm_sig_present(raw) ? std::string{raw} : std::string{};
+}
+
 // deb `${Version}` = [epoch:]upstream[-revision].
 inline EvrParts split_deb_version(std::string_view v) {
     return detail::split_evr(v);
@@ -225,9 +247,13 @@ inline std::string parse_os_release(std::string_view content, std::string_view k
 // action's "install ok installed" substring filter excludes held, this does
 // not. "rc" (removed, config-files) and "un" (unknown) are correctly
 // excluded. nullopt for a structurally wrong or not-installed line.
+//
+// Maintainer is free text and the LAST field, so a tab inside it never drops the
+// row: the publisher is its head segment (the text before the first tab). The
+// first four fields are tab/newline-free by the dpkg grammar.
 inline std::optional<InvRecord> parse_dpkg_inv_line(std::string_view line) {
     const auto tok = detail::split_tabs(line);
-    if (tok.size() != 5 || tok[1].size() < 2 || tok[1][1] != 'i')
+    if (tok.size() < 5 || tok[1].size() < 2 || tok[1][1] != 'i')
         return std::nullopt;
     InvRecord r;
     r.name = std::string(tok[0]);
@@ -242,8 +268,25 @@ inline std::optional<InvRecord> parse_dpkg_inv_line(std::string_view line) {
     return r;
 }
 
-// One rpm line (9 tab-separated tokens):
-//   NAME EPOCH VERSION RELEASE ARCH PACKAGER INSTALLTIME:date SIGPGP RSAHEADER
+// The rpm `--queryformat` whose output parse_rpm_inv_line reads: ONE copy, passed to rpm by the
+// plugin and fed back through the parser by the unit test, so the producer and the parser cannot
+// drift apart. The two free-text tags (VENDOR, PACKAGER) stay last (see below).
+inline constexpr std::string_view kRpmInvQueryFormat =
+    "%{NAME}\t%{EPOCH}\t%{VERSION}\t%{RELEASE}\t%{ARCH}\t"
+    "%{INSTALLTIME:date}\t%{SIGPGP}\t%{RSAHEADER}\t%{VENDOR}\t%{PACKAGER}\n";
+
+// One rpm line (at least 9 tab-separated tokens):
+//   NAME EPOCH VERSION RELEASE ARCH INSTALLTIME:date SIGPGP RSAHEADER VENDOR PACKAGER
+// The publisher is the declared VENDOR when set, else PACKAGER (a person, kept only as the
+// fallback), else empty (the agent core then labels the row `via:rpm`). `(none)` = unset.
+//
+// The two free-text tags (VENDOR, PACKAGER) are LAST so a tab inside either never drops the
+// row: the first eight tags are fixed by position and the publisher is the head segment of
+// VENDOR, else of PACKAGER (a tab inside VENDOR shifts PACKAGER right; only its head is read
+// as a fallback when VENDOR is empty or its first byte is the tab). The first eight tags are
+// tab/newline-free because rpmbuild enforces it at build time; the rpmdb does not, so a
+// hand-built header with a tab in one of them can still shift a field (disclosed residual,
+// as is a newline inside a free-text tag, which rpm prints as a second line).
 // SIGPGP is the payload (v3 OpenPGP) signature tag; RSAHEADER is the header
 // signature tag. Both are checked (via rpm_sig_present) because modern
 // RHEL/Fedora packages are frequently header-signed only -- SIGPGP alone
@@ -265,7 +308,7 @@ inline std::optional<InvRecord> parse_dpkg_inv_line(std::string_view line) {
 //      fleet -- now reads "unsigned" where the old scheme read "signed".
 inline std::optional<InvRecord> parse_rpm_inv_line(std::string_view line) {
     const auto tok = detail::split_tabs(line);
-    if (tok.size() != 9)
+    if (tok.size() < 9)
         return std::nullopt;
     InvRecord r;
     r.name = std::string(tok[0]);
@@ -273,10 +316,12 @@ inline std::optional<InvRecord> parse_rpm_inv_line(std::string_view line) {
     r.version = std::string(tok[2]);
     r.release = map_rpm_none(tok[3]);
     r.arch = map_rpm_none(tok[4]); // gpg-pubkey pseudo-packages have (none) arch
-    r.publisher = map_rpm_none(tok[5]); // PACKAGER (the v2 spec; `list` keeps VENDOR)
-    r.install_date = map_rpm_none(tok[6]);
+    r.publisher = rpm_text_value(tok[8]); // VENDOR: the declared vendor (head segment)
+    if (r.publisher.empty() && tok.size() >= 10)
+        r.publisher = rpm_text_value(tok[9]); // PACKAGER: a person, fallback only
+    r.install_date = map_rpm_none(tok[5]);
     r.signature_status =
-        (rpm_sig_present(tok[7]) || rpm_sig_present(tok[8])) ? "signed" : "unsigned";
+        (rpm_sig_present(tok[6]) || rpm_sig_present(tok[7])) ? "signed" : "unsigned";
     r.kind = "package";
     r.ecosystem = "rpm";
     return r;
@@ -330,7 +375,22 @@ inline std::string pipe_safe(std::string_view v) {
     return out;
 }
 
-// The one place that knows the 13-token `inv|` row layout. Keep in lockstep
+// A path that holds '|' keeps its place in the row: the bar becomes U+FFFD (a visibly altered
+// path) rather than being deleted (which would silently merge two different directories);
+// tab, CR and LF are deleted as pipe_safe does.
+inline std::string install_location_safe(std::string_view v) {
+    std::string out;
+    out.reserve(v.size());
+    for (char c : v) {
+        if (c == '|')
+            out += "\xEF\xBF\xBD";
+        else if (c != '\t' && c != '\r' && c != '\n')
+            out.push_back(c);
+    }
+    return out;
+}
+
+// The one place that knows the 14-token `inv|` row layout. Keep in lockstep
 // with parse_installed_apps_output (agents/core/src/sync_source_installed_software.cpp).
 inline std::string format_inv_row(const InvRecord& r) {
     std::string out = "inv";
@@ -342,6 +402,8 @@ inline std::string format_inv_row(const InvRecord& r) {
         out.push_back('|');
         out += pipe_safe(f);
     }
+    out.push_back('|');
+    out += install_location_safe(r.install_location);
     return out;
 }
 

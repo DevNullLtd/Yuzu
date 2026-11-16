@@ -12,13 +12,20 @@
 
 #include "authz_gates.hpp" // authz::FleetReadGate (#4027 fix round, CDX-P1-01/K4)
 #include "authz_model.hpp"
+#include "dispatch_denial_text.hpp" // describe_dispatch_denial: the mapping server.cpp injects
 #include "secure_random.hpp"
 #include "echo_tree_routes.hpp"
+#include "openapi_spec_access.hpp"
+#include "source_scan.hpp"
 #include "test_route_sink.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <nlohmann/json.hpp>
 
+#include <cctype>
+#include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -27,6 +34,7 @@
 #include <vector>
 
 using namespace yuzu::server;
+using yuzu::test::source_scan::count_occurrences;
 
 namespace {
 
@@ -38,23 +46,39 @@ DexAgentResponse resp(const std::string& agent_id, const std::string& output) {
     return r;
 }
 
-// A canned $Process_Live body: systemd(1) -> bash(100). node 0 is systemd.
-const char* kProcOut =
-    "__schema__|ts|action|pid|ppid|name|cmdline|user\n"
-    "100|started|1|0|systemd||root\n"
-    "110|started|100|1|bash||alice\n";
+// An empty $TCP_Hourly answer (schema and trailer only), what an agent sends for a quiet hour.
+const char* kEmptyTcp =
+    "__schema__|hour_ts|remote_addr|remote_port|proto|process_name|connect_count|disconnect_count|"
+    "failed_count\n__total__|0\n";
 
-// The two canned command ids the result route polls (must start with "echo-").
+// A canned $Process_Hourly body for hour 7200: systemd -> bash. node 0 is systemd, node 1
+// bash. (parent_name and abnormal_exit_count are agent-folded; fixture-only until then.)
+const char* kProcOut =
+    "__schema__|hour_ts|name|parent_name|user|start_count|stop_count|abnormal_exit_count\n"
+    "7200|systemd||root|1|0|0\n"
+    "7200|bash|systemd|alice|3|3|1\n";
+// Two hours: 7200 (systemd -> bash) is the newest, 3600 holds only cron.
+const char* kProcTwoHours =
+    "__schema__|hour_ts|name|parent_name|user|start_count|stop_count|abnormal_exit_count\n"
+    "7200|systemd||root|1|0|0\n"
+    "7200|bash|systemd|alice|3|3|1\n"
+    "3600|cron||root|2|2|0\n";
+
+// The three canned command ids the result route polls (must start with "echo-").
 const std::string kProcCmd = "echo-p";
 const std::string kTcpCmd = "echo-t";
+const std::string kHoursCmd = "echo-h";
 // Canned ids for the capture-sources frame's two dispatches (`echo status` and
 // `echo compatibility`), which the route polls by the scmd/ccmd query params.
+const std::string kDnsCmd = "echo-d";
+const std::string kArpCmd = "echo-a";
 const std::string kStatusCmd = "echo-s";
 const std::string kCompatCmd = "echo-c";
 
 // An EchoTreeRoutes registered over a TestRouteSink with toggleable stubs.
 struct EchoHarness {
     yuzu::server::test::TestRouteSink sink;
+    yuzu::MetricsRegistry metrics; // before `routes`, which borrows it
     EchoTreeRoutes routes;
 
     std::string device = "dev-A";
@@ -67,6 +91,7 @@ struct EchoHarness {
     // (nullopt = unfiltered/TOP, matching a global grant or RBAC-off).
     std::optional<std::vector<std::string>> fleet_scope;
     bool allow_execute = true;
+    int dispatch_sent = 1; // agents a dispatch reaches; 0 models an offline device
     // #4027: operator-scoped device list the /fragments/echo/... HTML frames
     // (still on devices_fn_/perm_fn_ this round) render.
     std::vector<DeviceRow> devices_list;
@@ -82,22 +107,60 @@ struct EchoHarness {
     std::string scope_device; // empty = unrestricted; else scoped Read denied elsewhere
     std::string os = "linux";
     std::string proc_output = kProcOut;
-    std::string tcp_output;    // empty → tree renders without conns (best-effort TCP)
+    // The window's hour list (the `SELECT DISTINCT hour_ts` answer) and an empty $TCP_Hourly
+    // answer: a real agent always writes the schema line and the trailer.
+    std::string hours_output = "__schema__|hour_ts\n7200\n3600\n__total__|2\n";
+    std::string tcp_output = kEmptyTcp;
+    std::string dns_output;    // canned $DNS_Hourly / $ARP_Hourly replies for the device-net poll
+    std::string arp_output;
+    std::vector<std::string> sql_log; // every echo.sql string a dispatch carried, in order
     // Capture-sources frame: canned `echo status` / `echo compatibility` replies.
     std::string status_output;
     std::string compat_output = "config|dummy|1";
     bool audit_ok = true;      // #1647: flip to drop the evidence row (audit_fn → false)
     bool audit_throws = false; // #1647: simulate a bad_alloc-class throw out of audit_fn
     bool service_scoped = false; // simulate a service-scoped API token session
+    int dispatch_calls = 0;      // every dispatch_fn_ call, whatever it carried
+    /// Set = the dispatch chokepoint refuses every dispatch with this reason (sent 0, #7114).
+    std::optional<yuzu::server::detail::DispatchDenialReason> dispatch_denied;
+    bool dispatch_throws = false; ///< the dispatch itself throws
+    bool dispatch_throws_other = false; ///< the dispatch throws something that is no std::exception
+    bool caller_throws = false; ///< deriving the dispatch caller throws
+    int write_probes = 0; ///< scoped-gate calls for Write, which this stub always refuses
+    /// "audit:<action>/<result>" and "dispatch", in call order: proves the `attempted` row
+    /// precedes every dispatch it covers.
+    std::vector<std::string> order;
 
     struct AuditRow {
         std::string action, result, target_id, detail;
+        std::string principal; ///< stamped by the session-bound writer (the push); empty otherwise
     };
     std::vector<AuditRow> audit_log;
+    /// Whether the audit store persists a given row (read live per row), applied after
+    /// audit_throws. Unset = audit_ok decides for every row.
+    std::function<bool(const AuditRow&)> audit_persists;
+    /// The one store behind both audit writers: records the row, then throws or drops it as
+    /// configured. #1647: recorded before the throw so find_audit still proves the site was reached.
+    bool record_audit(AuditRow row) {
+        audit_log.push_back(std::move(row));
+        order.push_back("audit:" + audit_log.back().action + "/" + audit_log.back().result);
+        if (audit_throws)
+            throw std::runtime_error("audit DB write blew up");
+        if (audit_persists)
+            return audit_persists(audit_log.back());
+        return audit_ok;
+    }
+    double metric(const std::string& name, const std::string& result) {
+        return metrics.counter(name, {{"result", result}}).value();
+    }
     DispatchCaller last_dispatch_caller; // #3133: observes what dispatch actually received
     std::unordered_map<std::string, std::string> last_dispatch_params; // what the last dispatch carried
+    // Per command id, the exact frames the store answers (newest first, as the real store does):
+    // a long answer is several frames. Overrides the one-frame replies below.
+    std::unordered_map<std::string, std::vector<DexAgentResponse>> frames_override;
 
-    EchoHarness() {
+    /// `wire_audit` = false registers an empty audit sink (the unwired posture).
+    explicit EchoHarness(bool wire_audit = true, bool wire_dispatch = true) {
         auto auth = [this](const httplib::Request&,
                            httplib::Response&) -> std::optional<auth::Session> {
             if (session_user.empty())
@@ -138,10 +201,13 @@ struct EchoHarness {
             return authz::FleetReadGate{true, std::nullopt}; // TOP — unfiltered
         };
         // Scoped gate: Execute toggled by allow_execute, Read by allow_read; a non-empty
-        // scope_device denies any other device (mirrors a management-scope miss → 403).
+        // scope_device denies any other device (mirrors a management-scope miss → 403). Write is
+        // counted and refused: no route here may probe it (the dispatch chokepoint decides Write).
         auto scoped = [this](const httplib::Request&, httplib::Response& res, const std::string&,
                              const std::string& op, const std::string& dev) {
-            bool ok = (op == "Execute") ? allow_execute : allow_read;
+            if (op == "Write")
+                ++write_probes;
+            bool ok = (op == "Execute") ? allow_execute : (op != "Write" && allow_read);
             if (ok && !scope_device.empty() && dev != scope_device)
                 ok = false;
             if (!ok)
@@ -170,12 +236,28 @@ struct EchoHarness {
                                const std::unordered_map<std::string, std::string>& params,
                                const DispatchCaller& caller)
             -> yuzu::server::ConfinedDispatchOutcome {
+            ++dispatch_calls;
+            order.push_back("dispatch");
             last_dispatch_caller = caller;
             last_dispatch_params = params;
+            if (dispatch_throws)
+                throw std::runtime_error("dispatch blew up");
+            if (dispatch_throws_other)
+                throw 42;
+            if (dispatch_denied)
+                return {.command_id = "echo-denied",
+                        .denied = yuzu::server::detail::DispatchDenial{
+                            *dispatch_denied, "Infrastructure", authz::Operation::Write}};
             const auto it = params.find("sql");
-            const bool is_proc =
-                it != params.end() && it->second.find("$Process_Live") != std::string::npos;
-            return {.sent = 1, .command_id = is_proc ? kProcCmd : kTcpCmd};
+            const std::string sql = it != params.end() ? it->second : std::string{};
+            sql_log.push_back(sql);
+            const auto has = [&](const char* t) { return sql.find(t) != std::string::npos; };
+            return {.sent = dispatch_sent,
+                    .command_id = has("DISTINCT hour_ts") ? kHoursCmd
+                                  : has("$Process_Hourly") ? kProcCmd
+                                  : has("$DNS_Hourly")     ? kDnsCmd
+                                  : has("$ARP_Hourly")     ? kArpCmd
+                                                           : kTcpCmd};
         };
         // #3133 review fix: mirrors the production idiom (resolve the session,
         // derive a real caller) closely enough for this harness's simplified
@@ -183,16 +265,26 @@ struct EchoHarness {
         // (empty session_user) fails closed with an empty principal, same
         // contract every production CallerFn documents.
         auto caller_fn = [this](const httplib::Request&) -> DispatchCaller {
+            if (caller_throws)
+                throw std::runtime_error("caller derivation blew up");
             if (session_user.empty())
                 return DispatchCaller{.exec_visible = authz::deny_all()};
             return DispatchCaller{.principal = session_user, .system = false};
         };
         auto responses = [this](const std::string& cmd,
                                  const std::string& /*agent_id*/) -> std::vector<DexAgentResponse> {
+            if (const auto f = frames_override.find(cmd); f != frames_override.end())
+                return f->second;
             if (cmd == kProcCmd)
                 return {resp(device, proc_output)};
             if (cmd == kTcpCmd)
                 return {resp(device, tcp_output)};
+            if (cmd == kHoursCmd)
+                return {resp(device, hours_output)};
+            if (cmd == kDnsCmd)
+                return {resp(device, dns_output)};
+            if (cmd == kArpCmd)
+                return {resp(device, arp_output)};
             if (cmd == kStatusCmd)
                 return {resp(device, status_output)};
             if (cmd == kCompatCmd)
@@ -202,24 +294,46 @@ struct EchoHarness {
         auto audit = [this](const httplib::Request&, const std::string& a, const std::string& r,
                             const std::string&, const std::string& tid,
                             const std::string& d) -> bool {
-            audit_log.push_back({a, r, tid, d});
-            // #1647: the row is recorded before the throw so find_audit still proves the
-            // site was reached; the throw then exercises the shared helper's catch-arm.
-            if (audit_throws)
-                throw std::runtime_error("audit DB write blew up");
-            return audit_ok; // DexRoutes::AuditFn (aliased by EchoTreeRoutes) is bool-returning (#1549)
+            // DexRoutes::AuditFn (aliased by EchoTreeRoutes) is bool-returning (#1549); #1647:
+            // record_audit records the row before the throw, so the shared helper's catch-arm
+            // is exercised.
+            return record_audit({a, r, tid, d, {}});
         };
-        routes.register_routes(sink, auth, perm, scoped, devices, lookup, dispatch, responses, audit,
+        routes.register_routes(sink, auth, perm, scoped, devices, lookup,
+                               wire_dispatch ? EchoTreeRoutes::DispatchFn{dispatch}
+                                             : EchoTreeRoutes::DispatchFn{},
+                               responses,
+                               wire_audit ? EchoTreeRoutes::AuditFn{audit} : EchoTreeRoutes::AuditFn{},
                                caller_fn);
+        // The capture-sources push writes every row through this session-bound writer; the
+        // unwired posture leaves it unset as well.
+        if (wire_audit)
+            routes.set_audit_as_session_fn(
+                [this](const httplib::Request&, const auth::Session& s, const std::string&,
+                       const std::string& a, const std::string& r, const std::string&,
+                       const std::string& tid, const std::string& d) -> bool {
+                    return record_audit({a, r, tid, d, s.username});
+                });
+        // The status server.cpp injects for a refused push dispatch (403 permission-class, 500 otherwise).
+        routes.set_denial_status_fn([](const ConfinedDispatchOutcome& o) {
+            const auto cls = describe_dispatch_denial(o.denied->reason, "echo", "configure",
+                                                      *o.denied, DenialSurface::kRest)
+                                 .cls;
+            return cls == DispatchDenialClass::kPermissionDenied ? 403 : 500;
+        });
+        routes.set_metrics(&metrics);
         routes.set_fleet_read_fn(fleet_read); // #4027 fix round — REST twins' sole gate
         routes.set_all_devices_fn(all_devices); // #4143 review fix — REST twins' sole row source
     }
 
-    // Drive /result directly (skips /run; the result route reads pcmd/tcmd from the
-    // query, and we control the canned command ids). Returns the response.
-    std::unique_ptr<httplib::Response> run_result(const std::string& extra = "") {
+    // Drive /result directly (skips /run; the result route reads pcmd/tcmd/hcmd and the resolved
+    // hour from the query, and we control the canned command ids). `hour` defaults to the hour
+    // the canned process rows are for; "" sends none. Returns the response.
+    std::unique_ptr<httplib::Response> run_result(const std::string& hour = "7200",
+                                                  const std::string& extra = "") {
         return sink.Get("/fragments/echo/process-tree/result?device=" + device +
-                        "&preset=10m&pcmd=" + kProcCmd + "&tcmd=" + kTcpCmd + "&n=1" + extra);
+                        "&preset=24h&pcmd=" + kProcCmd + "&tcmd=" + kTcpCmd + "&hcmd=" + kHoursCmd +
+                        "&n=1" + (hour.empty() ? "" : "&hour=" + hour) + extra);
     }
 
     // Drive the capture-sources frame past the pending poll, the same way
@@ -381,12 +495,12 @@ TEST_CASE("echo routes: /detail audit normalizes the agent-controlled os",
 
 TEST_CASE("echo routes: /run audit neutralizes an injected preset", "[echo][routes][audit]") {
     EchoHarness h;
-    // preset carries an audit-field-forgery attempt; canonicalization maps it to 10m.
+    // preset carries an audit-field-forgery attempt; canonicalization maps it to 24h.
     auto r = h.sink.Get("/fragments/echo/process-tree/run?device=dev-A&preset=x%20command_id%3Dforged");
     REQUIRE(r);
     const auto* row = h.find_audit("echo.process_tree.read", "dispatched");
     REQUIRE(row != nullptr);
-    CHECK(row->detail.find("preset=10m") != std::string::npos);
+    CHECK(row->detail.find("preset=24h") != std::string::npos);
     CHECK(row->detail.find("forged") == std::string::npos); // injection neutralized
 }
 
@@ -438,14 +552,15 @@ TEST_CASE("echo routes: /result refuses an invalid custom window and renders a v
     for (const char* window : {"&from=garbage&to=", "&from=2026-02-31T00:00&to=2026-03-01T00:00"}) {
         EchoHarness h;
         auto r = h.sink.Get("/fragments/echo/process-tree/result?device=" + h.device +
-                            "&preset=custom&pcmd=" + kProcCmd + "&tcmd=" + kTcpCmd + "&n=1" + window);
+                            "&preset=custom&pcmd=" + kProcCmd + "&tcmd=" + kTcpCmd + "&hcmd=" + kHoursCmd +
+                            "&n=1" + window);
         REQUIRE(r);
         CHECK(r->body.find("not a valid time") != std::string::npos);
         CHECK(h.find_audit("echo.process_tree.read", "success") == nullptr);
     }
     EchoHarness h;
     auto r = h.sink.Get("/fragments/echo/process-tree/result?device=" + h.device +
-                        "&preset=custom&pcmd=" + kProcCmd + "&tcmd=" + kTcpCmd +
+                        "&preset=custom&pcmd=" + kProcCmd + "&tcmd=" + kTcpCmd + "&hcmd=" + kHoursCmd +
                         "&n=1&from=2026-06-18T12:00&to=2026-06-18T13:00");
     REQUIRE(r);
     CHECK(r->body.find("not a valid time") == std::string::npos);
@@ -530,6 +645,8 @@ TEST_CASE("echo routes: a throwing audit_fn is caught + flags Sec-Audit-Failed a
         CHECK(h.find_audit("echo.sources.read", "dispatched") != nullptr);
     }
     SECTION("/capture-sources/push — echo.sources.configure") {
+        // The push is audit-first (#7075): the sink throwing on the `attempted` row is a
+        // refusal (503 + Sec-Audit-Failed), nothing is dispatched, and no exception escapes.
         EchoHarness h;
         h.audit_throws = true;
         std::unique_ptr<httplib::Response> r;
@@ -538,9 +655,29 @@ TEST_CASE("echo routes: a throwing audit_fn is caught + flags Sec-Audit-Failed a
             r = h.sink.Post("/fragments/echo/capture-sources/push?device=dev-A&changes=process%3Don",
                             ""));
         REQUIRE(r);
+        CHECK(r->status == 503);
+        CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
+        CHECK(h.find_audit("echo.sources.configure", "attempted") != nullptr);
+        CHECK(h.find_audit("echo.sources.configure", "dispatched") == nullptr);
+        CHECK(h.dispatch_calls == 0);
+    }
+    SECTION("/capture-sources/push — echo.sources.configure outcome row throws") {
+        // The `attempted` row stored, the per-source outcome row throws: set-and-proceed.
+        EchoHarness h;
+        h.audit_persists = [&](const EchoHarness::AuditRow& row) {
+            if (row.result != "attempted")
+                throw std::runtime_error("audit DB write blew up");
+            return true;
+        };
+        std::unique_ptr<httplib::Response> r;
+        CHECK_NOTHROW(
+            r = h.sink.Post("/fragments/echo/capture-sources/push?device=dev-A&changes=process%3Don",
+                            ""));
+        REQUIRE(r);
         CHECK(r->status == 200);
         CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
         CHECK(h.find_audit("echo.sources.configure", "dispatched") != nullptr);
+        CHECK(h.dispatch_calls == 1);
     }
 }
 
@@ -635,7 +772,9 @@ TEST_CASE("echo routes: dropped audit row flags Sec-Audit-Failed once; clean pat
     }
     SECTION("/capture-sources/push two sources both drop — header exactly once over the loop") {
         EchoHarness h;
-        h.audit_ok = false;
+        // The `attempted` row is stored (a dropped one refuses the push, see below); both
+        // per-source outcome rows then fail.
+        h.audit_persists = [](const EchoHarness::AuditRow& row) { return row.result == "attempted"; };
         // Two known sources toggled in one request; the per-source audit loop fails twice.
         auto r = h.sink.Post(
             "/fragments/echo/capture-sources/push?device=dev-A&changes=process%3Don,tcp%3Doff", "");
@@ -645,11 +784,11 @@ TEST_CASE("echo routes: dropped audit row flags Sec-Audit-Failed once; clean pat
         CHECK(r->get_header_value_count("Sec-Audit-Failed") == 1);
         // BOTH loop iterations must have reached the audit chokepoint — otherwise
         // count==1 could mean the loop skipped the second source, not de-duplication.
-        int cfg_rows = 0;
+        int outcome_rows = 0;
         for (const auto& row : h.audit_log)
-            if (row.action == "echo.sources.configure")
-                ++cfg_rows;
-        CHECK(cfg_rows == 2);
+            if (row.action == "echo.sources.configure" && row.result != "attempted")
+                ++outcome_rows;
+        CHECK(outcome_rows == 2);
     }
     SECTION("clean path sets NO Sec-Audit-Failed header") {
         EchoHarness h; // audit_ok=true, audit_throws=false
@@ -700,10 +839,10 @@ TEST_CASE("Echo capture-sources: an offline device shows the agent's reason, not
     // The `error|` prefix itself is stripped, not echoed raw.
     CHECK(res->body.find("error|") == std::string::npos);
     // And it must NOT have rendered the sources grid for a dead store. Assert
-    // the id the renderer actually emits (`capTable`, echo_process_tree.cpp:1235)
+    // the id the renderer actually emits (`capCards`, echo_process_tree.cpp)
     // -- an earlier version of this checked for "capture-source-row", a string
     // that exists nowhere in the codebase and so passed vacuously.
-    CHECK(res->body.find("capTable") == std::string::npos);
+    CHECK(res->body.find("capCards") == std::string::npos);
 }
 
 TEST_CASE("Echo capture-sources: a healthy device still renders the sources grid",
@@ -719,10 +858,788 @@ TEST_CASE("Echo capture-sources: a healthy device still renders the sources grid
     auto res = h.run_capture_sources();
     REQUIRE(res != nullptr);
     REQUIRE(res->status == 200);
-    // Positively assert the grid: `capTable` is what the renderer emits.
-    CHECK(res->body.find("capTable") != std::string::npos);
+    // Positively assert the grid: `capCards` is what the renderer emits.
+    CHECK(res->body.find("capCards") != std::string::npos);
     CHECK(res->body.find("Echo storage is offline") == std::string::npos);
     CHECK(res->body.find("failed the status query") == std::string::npos);
+}
+
+// =============================================================================
+// Roll-up only: the hourly SQL, whole-hour windows, the Hour selector, the cards
+// =============================================================================
+
+namespace {
+
+// The number following `key` in `sql` (digits only), or -1.
+std::int64_t number_after(const std::string& sql, const std::string& key) {
+    const auto p = sql.find(key);
+    if (p == std::string::npos)
+        return -1;
+    std::int64_t v = 0;
+    std::size_t i = p + key.size();
+    if (i >= sql.size() || !std::isdigit(static_cast<unsigned char>(sql[i])))
+        return -1;
+    for (; i < sql.size() && std::isdigit(static_cast<unsigned char>(sql[i])); ++i)
+        v = v * 10 + (sql[i] - '0');
+    return v;
+}
+
+} // namespace
+
+TEST_CASE("echo routes: /run reads ONE hour of the process and tcp tables plus the window's hour list",
+          "[echo][routes][sql]") {
+    EchoHarness h;
+    auto r = h.sink.Get("/fragments/echo/process-tree/run?device=dev-A&preset=24h");
+    REQUIRE(r);
+    REQUIRE(h.sql_log.size() == 3);
+    const std::string& psql = h.sql_log[0];
+    const std::string& tsql = h.sql_log[1];
+    const std::string& hsql = h.sql_log[2];
+    // No hour asked for: the window's last complete bucket, as a single int64 equality.
+    const auto hour = number_after(hsql, "hour_ts <= ");
+    REQUIRE(hour > 0);
+    CHECK(hour % 3600 == 0);
+    CHECK(psql == "SELECT hour_ts, name, parent_name, user, start_count, stop_count, "
+                  "abnormal_exit_count FROM $Process_Hourly WHERE hour_ts = " +
+                      std::to_string(hour) + " LIMIT 10000");
+    CHECK(tsql == "SELECT hour_ts, remote_addr, remote_port, proto, process_name, connect_count, "
+                  "disconnect_count, failed_count FROM $TCP_Hourly WHERE hour_ts = " +
+                      std::to_string(hour) + " LIMIT 10000");
+    // The hour list: the 24 whole buckets of the window, distinct, newest first, bounded.
+    const auto from = number_after(hsql, "hour_ts >= ");
+    REQUIRE(from > 0);
+    CHECK(from % 3600 == 0);
+    CHECK((hour - from) / 3600 == 23);
+    CHECK(hsql == "SELECT DISTINCT hour_ts FROM $Process_Hourly WHERE hour_ts >= " +
+                      std::to_string(from) + " AND hour_ts <= " + std::to_string(hour) +
+                      " ORDER BY hour_ts DESC LIMIT 168");
+    for (const auto& sql : h.sql_log)
+        CHECK(sql.find("_Live") == std::string::npos); // no raw capture rows are read
+    // The poll URL carries the window, the RESOLVED hour and all three command ids.
+    CHECK(r->body.find("process-tree/result") != std::string::npos);
+    CHECK(r->body.find("preset=24h") != std::string::npos);
+    CHECK(r->body.find("hour=" + std::to_string(hour)) != std::string::npos);
+    CHECK(r->body.find("pcmd=echo-p") != std::string::npos);
+    CHECK(r->body.find("tcmd=echo-t") != std::string::npos);
+    CHECK(r->body.find("hcmd=echo-h") != std::string::npos);
+
+    SECTION("an asked-for hour is the one read; the hour list still covers the window") {
+        EchoHarness one;
+        auto res = one.sink.Get("/fragments/echo/process-tree/run?device=dev-A&preset=24h&hour=3600");
+        REQUIRE(res);
+        REQUIRE(one.sql_log.size() == 3);
+        CHECK(one.sql_log[0].find("FROM $Process_Hourly WHERE hour_ts = 3600 LIMIT 10000") !=
+              std::string::npos);
+        CHECK(one.sql_log[1].find("FROM $TCP_Hourly WHERE hour_ts = 3600 LIMIT 10000") !=
+              std::string::npos);
+        CHECK(number_after(one.sql_log[2], "hour_ts <= ") != 3600);
+        CHECK(res->body.find("hour=3600") != std::string::npos);
+    }
+    SECTION("1h is one bucket; a reversed custom range collapses to one") {
+        EchoHarness one;
+        (void)one.sink.Get("/fragments/echo/process-tree/run?device=dev-A&preset=1h");
+        REQUIRE(one.sql_log.size() == 3);
+        CHECK(number_after(one.sql_log[2], "hour_ts >= ") == number_after(one.sql_log[2], "hour_ts <= "));
+
+        EchoHarness rev;
+        (void)rev.sink.Get("/fragments/echo/process-tree/run?device=dev-A&preset=custom"
+                           "&from=2026-06-18T13:00&to=2026-06-18T12:00");
+        REQUIRE(rev.sql_log.size() == 3);
+        CHECK(number_after(rev.sql_log[2], "hour_ts >= ") == number_after(rev.sql_log[2], "hour_ts <= "));
+    }
+}
+
+TEST_CASE("echo routes: the frame offers 1h / 24h / 7d / custom and no retired anchors",
+          "[echo][routes][presets]") {
+    EchoHarness h;
+    auto r = h.sink.Get("/fragments/echo/process-tree");
+    REQUIRE(r);
+    for (const char* tok : {"preset=1h", "preset=24h", "preset=7d", "preset=custom"})
+        CHECK(r->body.find(tok) != std::string::npos);
+    for (const char* gone : {"on_boot", "on_install", "preset=1m", "preset=10m", "preset=1d",
+                             "On boot", "On agent install", "data-statechip", "Running", "Exited"})
+        CHECK(r->body.find(gone) == std::string::npos);
+    // The device DNS / ARP placeholder is filled by the tree result, not by a host-change poll.
+    CHECK(r->body.find("id=\"echo-devnet\"></div>") != std::string::npos);
+}
+
+TEST_CASE("echo routes: /result shows the resolved hour and an Hour selector for this device",
+          "[echo][routes][hour]") {
+    EchoHarness h;
+    h.proc_output = kProcTwoHours; // the agent answers ONE hour; the extra rows are not trusted
+    auto r = h.run_result();
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    // Hour 7200 was asked for: systemd + bash, and cron (another hour's row) is not shown.
+    CHECK(r->body.find("<span class=\"tt-name\">bash</span>") != std::string::npos);
+    CHECK(r->body.find("<span class=\"tt-name\">cron</span>") == std::string::npos);
+    // The selector lists the hours the device reported, the shown one selected. Its URL names
+    // THIS device and carries no host-picker include, so a later hour change cannot ask another.
+    CHECK(r->body.find("<option value=\"7200\" selected>") != std::string::npos);
+    CHECK(r->body.find("<option value=\"3600\">") != std::string::npos);
+    CHECK(r->body.find("id=\"echo-tree-hour\" name=\"hour\"") != std::string::npos);
+    CHECK(r->body.find("process-tree/run?device=dev-A&amp;preset=24h") != std::string::npos);
+    CHECK(r->body.find("hx-include") == std::string::npos);
+    // Out-of-band: the device DNS / ARP panels follow the shown hour, for this device.
+    CHECK(r->body.find("id=\"echo-devnet\" hx-swap-oob=\"true\"") != std::string::npos);
+    CHECK(r->body.find("device-net?device=dev-A&amp;hour=7200") != std::string::npos);
+
+    SECTION("an explicit hour picks that hour's tree") {
+        h.proc_output = "__schema__|hour_ts|name|parent_name|user|start_count|stop_count|"
+                        "abnormal_exit_count\n3600|cron||root|2|2|0\n__total__|1\n";
+        auto older = h.run_result("3600");
+        REQUIRE(older);
+        CHECK(older->body.find("<span class=\"tt-name\">cron</span>") != std::string::npos);
+        CHECK(older->body.find("<span class=\"tt-name\">bash</span>") == std::string::npos);
+        CHECK(older->body.find("<option value=\"3600\" selected>") != std::string::npos);
+        CHECK(older->body.find("device-net?device=dev-A&amp;hour=3600") != std::string::npos);
+    }
+    SECTION("an hour the device did not report is offered and selected, so the box and banner agree") {
+        h.hours_output = "__schema__|hour_ts\n7200\n__total__|1\n";
+        auto other = h.run_result("10800");
+        REQUIRE(other);
+        CHECK(other->body.find("<option value=\"10800\" selected>") != std::string::npos);
+        CHECK(other->body.find("<option value=\"7200\">") != std::string::npos);
+        CHECK(other->body.find("1970-01-01T03:00:00Z") != std::string::npos); // the banner's hour
+        CHECK(other->body.find("No process activity recorded for this hour") != std::string::npos);
+    }
+    SECTION("no hour at all is the window's last complete bucket") {
+        auto none = h.run_result("");
+        REQUIRE(none);
+        // Hour 7200's rows are not that bucket, so the tree is empty for it, and says so.
+        CHECK(none->body.find("No process activity recorded for this hour") != std::string::npos);
+        CHECK(none->body.find("<span class=\"tt-name\">bash</span>") == std::string::npos);
+        CHECK(none->body.find(" selected>") != std::string::npos);
+    }
+    SECTION("an unparseable hour is refused") {
+        EchoHarness bad;
+        bad.proc_output = kProcTwoHours;
+        auto res = bad.run_result("yesterday");
+        REQUIRE(res);
+        CHECK(res->body.find("not a valid time") != std::string::npos);
+        CHECK(bad.find_audit("echo.process_tree.read", "success") == nullptr);
+    }
+    SECTION("a device that could not list the hours still shows the tree and says so") {
+        h.hours_output = "error|no such column: hour_ts";
+        auto res = h.run_result();
+        REQUIRE(res);
+        CHECK(res->body.find("<span class=\"tt-name\">bash</span>") != std::string::npos);
+        CHECK(res->body.find("The list of other hours was unavailable") != std::string::npos);
+        CHECK(res->body.find("<option value=\"7200\" selected>") != std::string::npos);
+    }
+}
+
+TEST_CASE("echo routes: an agent without the roll-up store gets the upgrade note for the tree",
+          "[echo][routes][skew]") {
+    EchoHarness h;
+    h.proc_output = "error|no such column: parent_name";
+    auto r = h.run_result();
+    REQUIRE(r);
+    CHECK(r->body.find("This device runs an agent without the roll-up store: upgrade the agent") !=
+          std::string::npos);
+    CHECK(r->body.find("parent_name") == std::string::npos); // the raw SQLite text is not the message
+    CHECK(h.find_audit("echo.process_tree.read", "success") == nullptr);
+
+    SECTION("any other agent error keeps its reason") {
+        h.proc_output = "error|database is locked";
+        auto other = h.run_result();
+        REQUIRE(other);
+        CHECK(other->body.find("The device reported an error: database is locked") != std::string::npos);
+    }
+    SECTION("a failed command reads the same way") {
+        DexAgentResponse f;
+        f.agent_id = "dev-A";
+        f.status = 2;
+        f.error_detail = "no such table: process_hourly";
+        h.frames_override[kProcCmd] = {f};
+        auto failed = h.run_result();
+        REQUIRE(failed);
+        CHECK(failed->body.find("upgrade the agent") != std::string::npos);
+    }
+    SECTION("an answer with no schema is unreadable and never an empty tree") {
+        h.proc_output = "7200|bash|systemd|alice|3|3|1\n";
+        auto bare = h.run_result();
+        REQUIRE(bare);
+        CHECK(bare->body.find("could not be read as process activity") != std::string::npos);
+        CHECK(bare->body.find("No process activity recorded") == std::string::npos);
+        CHECK(h.find_audit("echo.process_tree.read", "success") == nullptr);
+    }
+}
+
+TEST_CASE("echo routes: the tree names why connections are missing", "[echo][routes][skew]") {
+    EchoHarness h;
+    SECTION("an old agent") {
+        h.tcp_output = "error|no such column: failed_count";
+        auto r = h.run_result();
+        REQUIRE(r);
+        CHECK(r->body.find("<span class=\"tt-name\">bash</span>") != std::string::npos); // tree kept
+        CHECK(r->body.find("Connection data was unavailable for this host") != std::string::npos);
+        CHECK(r->body.find("upgrade the agent") != std::string::npos);
+    }
+    SECTION("an answer with no schema") {
+        h.tcp_output = "";
+        auto r = h.run_result();
+        REQUIRE(r);
+        CHECK(r->body.find("its answer could not be read") != std::string::npos);
+    }
+    SECTION("a healthy empty answer says nothing is wrong") {
+        auto r = h.run_result();
+        REQUIRE(r);
+        CHECK(r->body.find("Connection data was unavailable") == std::string::npos);
+    }
+}
+
+// B1: the agent flushes a long answer as several frames and the store answers newest first.
+// Reading only one frame showed a torn tree; every frame of the command is merged.
+namespace {
+DexAgentResponse frame(const std::string& body, int status = 1) {
+    DexAgentResponse f;
+    f.agent_id = "dev-A";
+    f.status = status;
+    f.output = body;
+    return f;
+}
+const char* kProcSchema =
+    "__schema__|hour_ts|name|parent_name|user|start_count|stop_count|abnormal_exit_count";
+} // namespace
+
+TEST_CASE("echo routes: a process answer in two frames reconstructs the whole tree",
+          "[echo][routes][frames]") {
+    EchoHarness h;
+    // Newest first, as the store answers: the data-only frame ahead of the schema frame.
+    h.frames_override[kProcCmd] = {frame("7200|bash|systemd|alice|3|3|1\n__total__|2"),
+                                   frame(std::string(kProcSchema) + "\n7200|systemd||root|1|0|0")};
+    auto r = h.run_result();
+    REQUIRE(r);
+    CHECK(r->body.find("<span class=\"tt-name\">systemd</span>") != std::string::npos);
+    CHECK(r->body.find("<span class=\"tt-name\">bash</span>") != std::string::npos);
+    CHECK(r->body.find("2 process names") != std::string::npos);
+    CHECK(r->body.find("unreadable") == std::string::npos);
+    CHECK(h.find_audit("echo.process_tree.read", "success") != nullptr);
+
+    SECTION("the same frames in the other order read the same") {
+        h.frames_override[kProcCmd] = {frame(std::string(kProcSchema) + "\n7200|systemd||root|1|0|0"),
+                                       frame("7200|bash|systemd|alice|3|3|1\n__total__|2")};
+        auto swapped = h.run_result();
+        REQUIRE(swapped);
+        CHECK(swapped->body.find("2 process names") != std::string::npos);
+    }
+    SECTION("an answer that is still streaming is not rendered as the whole") {
+        EchoHarness s;
+        s.frames_override[kProcCmd] = {frame(std::string(kProcSchema) + "\n7200|systemd||root|1|0|0", 0)};
+        auto streaming = s.run_result();
+        REQUIRE(streaming);
+        CHECK(streaming->body.find("process-tree/result") != std::string::npos); // keeps polling
+        CHECK(streaming->body.find("tt-name") == std::string::npos);
+        CHECK(s.find_audit("echo.process_tree.read", "success") == nullptr);
+    }
+}
+
+TEST_CASE("echo routes: an answer at the agent's row cap is said to be cut", "[echo][routes][frames]") {
+    const auto rows_for = [](std::size_t n) {
+        std::string out = std::string(kProcSchema) + "\n";
+        for (std::size_t i = 0; i < n; ++i)
+            out += "7200|p" + std::to_string(i) + "||u|1|0|0\n";
+        return out + "__total__|" + std::to_string(n);
+    };
+    EchoHarness h;
+    h.proc_output = rows_for(kEchoAgentRowCap);
+    auto cut = h.run_result();
+    REQUIRE(cut);
+    CHECK(cut->status == 200);
+    CHECK(cut->body.find("Results were cut at 10,000 rows for this hour") != std::string::npos);
+    CHECK(cut->body.find("echo-tree-banner") != std::string::npos); // the rows that came are shown
+    // One row under the cap is complete: no note.
+    EchoHarness under;
+    under.proc_output = rows_for(kEchoAgentRowCap - 1);
+    auto whole = under.run_result();
+    REQUIRE(whole);
+    CHECK(whole->body.find("were cut at") == std::string::npos);
+
+    SECTION("the connection list is held to the same rule") {
+        std::string tcp =
+            "__schema__|hour_ts|remote_addr|remote_port|proto|process_name|connect_count|"
+            "disconnect_count|failed_count\n";
+        for (std::size_t i = 0; i < kEchoAgentRowCap; ++i)
+            tcp += "7200|10.0.0.1|" + std::to_string(1 + i % 60000) + "|tcp|bash|1|1|0\n";
+        EchoHarness c;
+        c.tcp_output = tcp;
+        auto r = c.run_result();
+        REQUIRE(r);
+        CHECK(r->body.find("Connection results were cut at 10,000 rows for this hour") != std::string::npos);
+        CHECK(r->body.find(">Results were cut") == std::string::npos); // the process list was whole
+    }
+}
+
+// B6: rows the parser cannot place are counted and shown, never silently absent.
+TEST_CASE("echo routes: rows that could not be read are counted on the page", "[echo][routes][security]") {
+    EchoHarness h;
+    h.proc_output = std::string(kProcSchema) +
+                    "\n7200|systemd||root|1|0|0\n"
+                    "7200|x|winword.exe|SYSTEM|5|5|0|9|9\n" // a forged name carrying pipes
+                    "7200|torn||u|1\n__total__|3";
+    auto r = h.run_result();
+    REQUIRE(r);
+    CHECK(r->body.find("2 rows unreadable") != std::string::npos);
+    CHECK(r->body.find("1 process names") != std::string::npos);
+    CHECK(r->body.find("tt-name\">x<") == std::string::npos); // the forged row is not in the tree
+}
+
+// B3: the DNS / ARP panels live outside the tree, so every answer that is not a finished tree
+// for this device clears them. One host's tables must never sit under another host's view.
+TEST_CASE("echo routes: every answer that is not a finished tree clears the DNS and ARP panels",
+          "[echo][routes][devnet]") {
+    const std::string reset = "<div id=\"echo-devnet\" hx-swap-oob=\"true\"></div>";
+    SECTION("a blank host") {
+        EchoHarness h;
+        auto r = h.sink.Get("/fragments/echo/process-tree/run?device=&preset=24h");
+        REQUIRE(r);
+        CHECK(r->body.find("Select a host") != std::string::npos);
+        CHECK(r->body.find(reset) != std::string::npos);
+    }
+    SECTION("the poll fragment /run answers while the tree is rebuilt") {
+        EchoHarness h;
+        auto r = h.sink.Get("/fragments/echo/process-tree/run?device=dev-A&preset=24h");
+        REQUIRE(r);
+        CHECK(r->body.find("process-tree/result") != std::string::npos);
+        CHECK(r->body.find(reset) != std::string::npos);
+    }
+    SECTION("an offline device") {
+        EchoHarness h;
+        h.dispatch_sent = 0;
+        auto r = h.sink.Get("/fragments/echo/process-tree/run?device=dev-A&preset=24h");
+        REQUIRE(r);
+        CHECK(r->body.find("Device offline") != std::string::npos);
+        CHECK(r->body.find(reset) != std::string::npos);
+    }
+    SECTION("an operator without Execute") {
+        EchoHarness h;
+        h.allow_execute = false;
+        auto run = h.sink.Get("/fragments/echo/process-tree/run?device=dev-A&preset=24h");
+        REQUIRE(run);
+        CHECK(run->body.find(reset) != std::string::npos);
+        auto result = h.run_result();
+        REQUIRE(result);
+        CHECK(result->body.find("Execute") != std::string::npos);
+        CHECK(result->body.find(reset) != std::string::npos);
+    }
+    SECTION("an invalid window or hour") {
+        EchoHarness h;
+        auto r = h.sink.Get("/fragments/echo/process-tree/run?device=dev-A&preset=custom&from=garbage");
+        REQUIRE(r);
+        CHECK(r->body.find("not a valid time") != std::string::npos);
+        CHECK(r->body.find(reset) != std::string::npos);
+    }
+    SECTION("a result still being collected, and one that timed out") {
+        EchoHarness h;
+        h.frames_override[kProcCmd] = {}; // nothing stored yet
+        auto pending = h.run_result();
+        REQUIRE(pending);
+        CHECK(pending->body.find("hx-trigger=\"load delay:700ms\"") != std::string::npos);
+        CHECK(pending->body.find(reset) != std::string::npos);
+        auto late = h.sink.Get("/fragments/echo/process-tree/result?device=dev-A&preset=24h&hour=7200&pcmd=" +
+                               kProcCmd + "&tcmd=" + kTcpCmd + "&hcmd=" + kHoursCmd + "&n=40");
+        REQUIRE(late);
+        CHECK(late->body.find("timed out") != std::string::npos);
+        CHECK(late->body.find(reset) != std::string::npos);
+    }
+    SECTION("an agent error") {
+        EchoHarness h;
+        h.proc_output = "error|boom";
+        auto r = h.run_result();
+        REQUIRE(r);
+        CHECK(r->body.find(reset) != std::string::npos);
+    }
+    SECTION("a finished tree replaces the panel once, for this device") {
+        EchoHarness h;
+        auto r = h.run_result();
+        REQUIRE(r);
+        CHECK(r->body.find(reset) == std::string::npos);
+        CHECK(count_occurrences(r->body, "id=\"echo-devnet\"") == 1);
+        CHECK(r->body.find("hx-get=\"/fragments/echo/process-tree/device-net?device=dev-A&amp;hour=7200\"") !=
+              std::string::npos);
+        CHECK(r->body.find("hx-include") == std::string::npos); // the picker's current value is not asked
+    }
+}
+
+// B8: dispatch details name the window and the hour; the success detail names the hour.
+TEST_CASE("echo routes: the tree audit rows name the window and the hour", "[echo][routes][audit]") {
+    EchoHarness h;
+    (void)h.sink.Get("/fragments/echo/process-tree/run?device=dev-A&preset=24h&hour=3600");
+    const auto* run = h.find_audit("echo.process_tree.read", "dispatched");
+    REQUIRE(run != nullptr);
+    CHECK(run->detail.starts_with("dispatch preset=24h from="));
+    CHECK(run->detail.find(" to=") != std::string::npos);
+    CHECK(run->detail.find(" hour=3600 command_id=echo-p") != std::string::npos);
+
+    EchoHarness r;
+    (void)r.run_result();
+    const auto* ok = r.find_audit("echo.process_tree.read", "success");
+    REQUIRE(ok != nullptr);
+    CHECK(ok->detail.find(" hour=7200 ") != std::string::npos);
+    CHECK(ok->detail.find("from=") != std::string::npos);
+    CHECK(ok->detail.find("to=") != std::string::npos);
+}
+
+TEST_CASE("echo routes: /detail joins connections by process name", "[echo][routes][detail]") {
+    EchoHarness h;
+    h.tcp_output =
+        "__schema__|hour_ts|remote_addr|remote_port|proto|process_name|connect_count|"
+        "disconnect_count|failed_count\n"
+        "7200|1.2.3.4|443|tcp|bash|5|4|1\n"
+        "3600|9.9.9.9|80|tcp|bash|1|1|0\n"; // another hour: not shown
+    const std::string token = extract_token(h.run_result()->body);
+    REQUIRE(is_32_hex(token));
+    auto bash = h.get_detail(token, 1);
+    REQUIRE(bash);
+    CHECK(bash->body.find("1.2.3.4:443") != std::string::npos);
+    CHECK(bash->body.find("9.9.9.9") == std::string::npos);
+    auto systemd = h.get_detail(token, 0);
+    REQUIRE(systemd);
+    CHECK(systemd->body.find("1.2.3.4") == std::string::npos);
+    CHECK(systemd->body.find("No TCP connections recorded under this name") != std::string::npos);
+}
+
+TEST_CASE("echo routes: /device-net dispatches only the hourly tables for the chosen hour",
+          "[echo][routes][sql]") {
+    SECTION("with an hour: that single bucket, only the counts the agent measures") {
+        EchoHarness h;
+        auto r = h.sink.Get("/fragments/echo/process-tree/device-net?device=dev-A&hour=7200");
+        REQUIRE(r);
+        REQUIRE(h.sql_log.size() == 2);
+        CHECK(h.sql_log[0] ==
+              "SELECT hour_ts, name, record_type, data, appear_count, remove_count "
+              "FROM $DNS_Hourly WHERE hour_ts >= 7200 AND hour_ts <= 7200 "
+              "ORDER BY hour_ts DESC LIMIT 10000");
+        CHECK(h.sql_log[1] ==
+              "SELECT hour_ts, interface, ip_address, mac_address, appear_count, remove_count "
+              "FROM $ARP_Hourly WHERE hour_ts >= 7200 AND hour_ts <= 7200 "
+              "ORDER BY hour_ts DESC LIMIT 10000");
+        for (const char* unmeasured : {"negative_count", "is_router", "rebind_count"})
+            for (const auto& sql : h.sql_log)
+                CHECK(sql.find(unmeasured) == std::string::npos);
+        CHECK(r->body.find("hour=7200") != std::string::npos); // the poll keeps the hour
+        // The dispatch audit names the hour it read.
+        const auto* dns = h.find_audit("echo.dns.read", "dispatched");
+        REQUIRE(dns != nullptr);
+        CHECK(dns->detail == "hour=7200 command_id=echo-d");
+        const auto* arp = h.find_audit("echo.arp.read", "dispatched");
+        REQUIRE(arp != nullptr);
+        CHECK(arp->detail == "hour=7200 command_id=echo-a");
+    }
+    SECTION("without one: the default 24-hour window") {
+        EchoHarness h;
+        (void)h.sink.Get("/fragments/echo/process-tree/device-net?device=dev-A");
+        REQUIRE(h.sql_log.size() == 2);
+        for (const auto& sql : h.sql_log) {
+            CHECK(sql.find("_Live") == std::string::npos);
+            CHECK((number_after(sql, "hour_ts <= ") - number_after(sql, "hour_ts >= ")) / 3600 == 23);
+        }
+    }
+    SECTION("a bad hour is refused before any dispatch") {
+        EchoHarness h;
+        auto r = h.sink.Get("/fragments/echo/process-tree/device-net?device=dev-A&hour=soon");
+        REQUIRE(r);
+        CHECK(r->body.find("not a valid time") != std::string::npos);
+        CHECK(h.sql_log.empty());
+    }
+}
+
+namespace {
+const char* kDnsSchema = "__schema__|hour_ts|name|record_type|data|appear_count|remove_count\n";
+const char* kArpSchema =
+    "__schema__|hour_ts|interface|ip_address|mac_address|appear_count|remove_count\n";
+} // namespace
+
+TEST_CASE("echo routes: /device-net renders the chosen hour's DNS and ARP activity",
+          "[echo][routes][devnet]") {
+    EchoHarness h;
+    h.dns_output = std::string(kDnsSchema) +
+                   "7200|new.test|A|1.1.1.1|4|3\n"
+                   "3600|old.test|A|2.2.2.2|1|1\n__total__|2\n";
+    h.arp_output = std::string(kArpSchema) + "7200|eth0|10.0.0.1|aa:bb:cc:dd:ee:ff|1|0\n__total__|1\n";
+    const std::string poll = "/fragments/echo/process-tree/device-net?device=dev-A&dcmd=" + kDnsCmd +
+                             "&acmd=" + kArpCmd + "&n=1";
+    auto chosen = h.sink.Get(poll + "&hour=3600");
+    REQUIRE(chosen);
+    CHECK(chosen->body.find("old.test") != std::string::npos);
+    CHECK(chosen->body.find("new.test") == std::string::npos);
+    CHECK(chosen->body.find("No ARP activity recorded for this hour") != std::string::npos);
+    // No hour given: the newest hour present in either answer.
+    auto newest = h.sink.Get(poll);
+    REQUIRE(newest);
+    CHECK(newest->body.find("new.test") != std::string::npos);
+    CHECK(newest->body.find("old.test") == std::string::npos);
+    // Nothing the agent does not write is shown as a measure.
+    for (const char* gone : {"No such name", "Rebinds", "<th>Role</th>"})
+        CHECK(newest->body.find(gone) == std::string::npos);
+}
+
+// B8: the poll that renders the rows is the audited read, as on the device pages; the
+// dispatch row alone recorded only a command id.
+TEST_CASE("echo routes: /device-net audits the DNS and ARP rows it renders", "[echo][routes][audit]") {
+    EchoHarness h;
+    h.dns_output = std::string(kDnsSchema) +
+                   "7200|a.test|A|1.1.1.1|1|0\n7200|b.test|A|1.1.1.2|1|0\n3600|old.test|A|2.2.2.2|1|1\n"
+                   "__total__|3\n";
+    h.arp_output = std::string(kArpSchema) + "7200|eth0|10.0.0.1|aa:bb:cc:dd:ee:ff|1|0\n__total__|1\n";
+    const std::string poll = "/fragments/echo/process-tree/device-net?device=dev-A&dcmd=" + kDnsCmd +
+                             "&acmd=" + kArpCmd + "&n=1&hour=7200";
+    auto r = h.sink.Get(poll);
+    REQUIRE(r);
+    const auto* dns = h.find_audit("echo.dns.read", "success");
+    REQUIRE(dns != nullptr);
+    CHECK(dns->detail == "hour=7200 rows=2"); // the hour's rows only, as an int64 count
+    CHECK(dns->target_id == "dev-A");
+    const auto* arp = h.find_audit("echo.arp.read", "success");
+    REQUIRE(arp != nullptr);
+    CHECK(arp->detail == "hour=7200 rows=1");
+
+    SECTION("a failed read is a failure row with no free text") {
+        EchoHarness f;
+        f.dns_output = "error|query failed: no such column: negative_count\nsecret detail";
+        f.arp_output = std::string(kArpSchema) + "__total__|0\n";
+        auto res = f.sink.Get(poll);
+        REQUIRE(res);
+        const auto* fail = f.find_audit("echo.dns.read", "failure");
+        REQUIRE(fail != nullptr);
+        CHECK(fail->detail == "hour=7200");
+        CHECK(f.find_audit("echo.dns.read", "success") == nullptr);
+        const auto* ok = f.find_audit("echo.arp.read", "success");
+        REQUIRE(ok != nullptr);
+        CHECK(ok->detail == "hour=7200 rows=0");
+    }
+    SECTION("a poll that is not ready yet audits nothing") {
+        EchoHarness pending;
+        DexAgentResponse running;
+        running.agent_id = "dev-A";
+        running.status = 0;
+        running.output = std::string(kDnsSchema);
+        pending.frames_override[kDnsCmd] = {running};
+        auto res = pending.sink.Get(poll);
+        REQUIRE(res);
+        CHECK(res->body.find("device-net?device=dev-A") != std::string::npos); // keeps polling
+        CHECK(pending.find_audit("echo.dns.read", "success") == nullptr);
+        CHECK(pending.find_audit("echo.arp.read", "success") == nullptr);
+    }
+}
+
+TEST_CASE("echo routes: a DNS or ARP failure is an error in the panel and never an empty note",
+          "[echo][routes][skew]") {
+    const std::string poll = "/fragments/echo/process-tree/device-net?device=dev-A&dcmd=" + kDnsCmd +
+                             "&acmd=" + kArpCmd + "&n=1&hour=7200";
+    const std::string upgrade = "This device runs an agent without the roll-up store: upgrade the agent";
+    SECTION("an old agent, both panels") {
+        EchoHarness h;
+        h.dns_output = "error|query failed: no such column: negative_count";
+        h.arp_output = "error|unknown table: $ARP_Hourly";
+        auto r = h.sink.Get(poll);
+        REQUIRE(r);
+        CHECK(count_occurrences(r->body, upgrade) == 2);
+        CHECK(r->body.find("recorded for this hour") == std::string::npos);
+        CHECK(r->body.find("may be disabled") == std::string::npos);
+    }
+    SECTION("a failed command") {
+        EchoHarness h;
+        DexAgentResponse f;
+        f.agent_id = "dev-A";
+        f.status = 2;
+        f.error_detail = "plugin crashed";
+        h.frames_override[kDnsCmd] = {f};
+        h.arp_output = std::string(kArpSchema) + "__total__|0\n";
+        auto r = h.sink.Get(poll);
+        REQUIRE(r);
+        CHECK(r->body.find("The device reported an error: plugin crashed") != std::string::npos);
+        CHECK(r->body.find("No ARP activity recorded for this hour") != std::string::npos); // ARP is fine and empty
+    }
+    SECTION("an answer with no schema and an oversize answer") {
+        EchoHarness h;
+        h.dns_output = "7200|a.test|A|1.1.1.1|1|0\n";
+        h.arp_output = std::string(kMaxEchoDeviceNetOutputBytes + 1, 'x');
+        auto r = h.sink.Get(poll);
+        REQUIRE(r);
+        CHECK(r->body.find("answer could not be read") != std::string::npos);
+        CHECK(r->body.find("unexpectedly large") != std::string::npos);
+        CHECK(r->body.find("a.test") == std::string::npos);
+    }
+    SECTION("a quiet host is still said to be quiet") {
+        EchoHarness h;
+        h.dns_output = std::string(kDnsSchema) + "__total__|0\n";
+        h.arp_output = std::string(kArpSchema) + "__total__|0\n";
+        auto r = h.sink.Get(poll);
+        REQUIRE(r);
+        CHECK(r->body.find("No DNS cache activity recorded for this hour") != std::string::npos);
+        CHECK(r->body.find("upgrade the agent") == std::string::npos);
+    }
+    SECTION("cut and unreadable rows are flagged") {
+        EchoHarness h;
+        std::string dns = kDnsSchema;
+        for (std::size_t i = 0; i < kEchoAgentRowCap; ++i)
+            dns += "7200|n" + std::to_string(i) + ".test|A|1.1.1.1|1|0\n";
+        h.dns_output = dns;
+        h.arp_output = std::string(kArpSchema) + "7200|eth0|10.0.0.1|aa:bb|1|0|9|9\n__total__|1\n";
+        auto r = h.sink.Get(poll);
+        REQUIRE(r);
+        CHECK(r->body.find("Results were cut at 10,000 rows for this hour") != std::string::npos);
+        CHECK(r->body.find("1 row unreadable") != std::string::npos);
+    }
+}
+
+// G8-1: the agent flushes a long answer as several frames, so a failure status can sit beside the
+// frames that came before it. Any failure fails the whole answer, whichever way the store orders
+// the rows: the head of a failed answer must never read as a finished one.
+namespace {
+DexAgentResponse failure_frame(const std::string& why) {
+    DexAgentResponse f;
+    f.agent_id = "dev-A";
+    f.status = 2;
+    f.error_detail = why;
+    return f;
+}
+const char* kTcpFrameBody =
+    "__schema__|hour_ts|remote_addr|remote_port|proto|process_name|connect_count|"
+    "disconnect_count|failed_count\n7200|10.0.0.1|443|tcp|bash|1|1|0\n__total__|1\n";
+} // namespace
+
+TEST_CASE("echo routes: a failure beside output frames fails the whole answer in either store order",
+          "[echo][routes][frames]") {
+    const bool failure_first = GENERATE(true, false);
+    CAPTURE(failure_first);
+    // The store answers newest first: the frames this test hands back, in the order under test.
+    const auto beside = [&](const std::string& body) {
+        std::vector<DexAgentResponse> v{frame(body), failure_frame("plugin crashed")};
+        if (failure_first)
+            std::swap(v[0], v[1]);
+        return v;
+    };
+    const std::string crashed = "The device reported an error: plugin crashed";
+    const std::string poll = "/fragments/echo/process-tree/device-net?device=dev-A&dcmd=" + kDnsCmd +
+                             "&acmd=" + kArpCmd + "&n=1&hour=7200";
+
+    SECTION("the process tree") {
+        EchoHarness h;
+        h.frames_override[kProcCmd] = beside(kProcOut);
+        auto r = h.run_result();
+        REQUIRE(r);
+        CHECK(r->body.find(crashed) != std::string::npos);
+        CHECK(r->body.find("tt-name") == std::string::npos);
+        CHECK(h.find_audit("echo.process_tree.read", "success") == nullptr);
+    }
+    SECTION("the connection list keeps the tree and says why it is missing") {
+        EchoHarness h;
+        h.frames_override[kTcpCmd] = beside(kTcpFrameBody);
+        auto r = h.run_result();
+        REQUIRE(r);
+        CHECK(r->body.find("<span class=\"tt-name\">bash</span>") != std::string::npos);
+        CHECK(r->body.find("Connection data was unavailable for this host") != std::string::npos);
+        CHECK(r->body.find(crashed) != std::string::npos);
+    }
+    SECTION("the hour list keeps the tree and the shown hour") {
+        EchoHarness h;
+        h.frames_override[kHoursCmd] = beside("__schema__|hour_ts\n7200\n3600\n__total__|2\n");
+        auto r = h.run_result();
+        REQUIRE(r);
+        CHECK(r->body.find("<span class=\"tt-name\">bash</span>") != std::string::npos);
+        CHECK(r->body.find("The list of other hours was unavailable") != std::string::npos);
+        CHECK(r->body.find("<option value=\"7200\" selected>") != std::string::npos);
+        CHECK(r->body.find("<option value=\"3600\">") == std::string::npos); // the torn list is not used
+    }
+    SECTION("the DNS panel shows the error and never a quiet hour") {
+        EchoHarness h;
+        h.frames_override[kDnsCmd] = beside(std::string(kDnsSchema) + "7200|a.test|A|1.1.1.1|1|0\n__total__|1\n");
+        h.arp_output = std::string(kArpSchema) + "__total__|0\n";
+        auto r = h.sink.Get(poll);
+        REQUIRE(r);
+        CHECK(r->body.find(crashed) != std::string::npos);
+        CHECK(r->body.find("a.test") == std::string::npos);
+        CHECK(r->body.find("No DNS cache activity recorded") == std::string::npos);
+        CHECK(h.find_audit("echo.dns.read", "failure") != nullptr);
+        CHECK(h.find_audit("echo.dns.read", "success") == nullptr);
+    }
+    SECTION("the ARP panel shows the error and never a quiet hour") {
+        EchoHarness h;
+        h.dns_output = std::string(kDnsSchema) + "__total__|0\n";
+        h.frames_override[kArpCmd] = beside(std::string(kArpSchema) +
+                                            "7200|eth0|10.0.0.1|aa:bb:cc:dd:ee:ff|1|0\n__total__|1\n");
+        auto r = h.sink.Get(poll);
+        REQUIRE(r);
+        CHECK(r->body.find(crashed) != std::string::npos);
+        CHECK(r->body.find("10.0.0.1") == std::string::npos);
+        CHECK(r->body.find("No ARP activity recorded") == std::string::npos);
+        CHECK(h.find_audit("echo.arp.read", "failure") != nullptr);
+        CHECK(h.find_audit("echo.arp.read", "success") == nullptr);
+    }
+}
+
+// G8-2: the frames are merged only up to the answer's own byte cap, then the caller's over-cap
+// branch refuses the answer as it would a single oversize frame.
+TEST_CASE("echo routes: frames that together pass a payload cap take the over-cap path",
+          "[echo][routes][frames]") {
+    const std::string poll = "/fragments/echo/process-tree/device-net?device=dev-A&dcmd=" + kDnsCmd +
+                             "&acmd=" + kArpCmd + "&n=1&hour=7200";
+    SECTION("DNS frames over the device-net cap") {
+        EchoHarness h;
+        const std::string filler(kMaxEchoDeviceNetOutputBytes / 2 + 1, 'x');
+        h.frames_override[kDnsCmd] = {frame(filler), frame(filler), frame(filler),
+                                      frame(std::string(kDnsSchema) + "7200|a.test|A|1.1.1.1|1|0\n")};
+        h.arp_output = std::string(kArpSchema) + "__total__|0\n";
+        auto r = h.sink.Get(poll);
+        REQUIRE(r);
+        CHECK(r->body.find("The device returned an unexpectedly large dataset") != std::string::npos);
+        CHECK(r->body.find("a.test") == std::string::npos);
+        CHECK(r->body.find("No DNS cache activity recorded") == std::string::npos);
+        CHECK(h.find_audit("echo.dns.read", "failure") != nullptr);
+    }
+    SECTION("an hour list over its cap keeps the tree and the shown hour") {
+        EchoHarness h;
+        const std::string filler(256 * 1024 + 1, 'x');
+        h.frames_override[kHoursCmd] = {frame(filler),
+                                        frame("__schema__|hour_ts\n7200\n3600\n__total__|2\n")};
+        auto r = h.run_result();
+        REQUIRE(r);
+        CHECK(r->body.find("<span class=\"tt-name\">bash</span>") != std::string::npos);
+        CHECK(r->body.find("The list of other hours was unavailable") != std::string::npos);
+        CHECK(r->body.find("<option value=\"7200\" selected>") != std::string::npos);
+        CHECK(r->body.find("<option value=\"3600\">") == std::string::npos);
+    }
+}
+
+TEST_CASE("echo routes: capture-source cards read the row count from <src>_rows only",
+          "[echo][routes][capture-sources]") {
+    SECTION("<src>_rows alone") {
+        EchoHarness h;
+        h.status_output = "config|process_enabled|true\nconfig|process_rows|1234\n";
+        auto res = h.run_capture_sources();
+        REQUIRE(res);
+        CHECK(res->body.find(">1234<") != std::string::npos);
+        CHECK(res->body.find("$Process_Hourly") != std::string::npos);
+        CHECK(res->body.find("upgrade the agent") == std::string::npos);
+    }
+    SECTION("<src>_live_rows alone is not read: a dash") {
+        EchoHarness h;
+        h.status_output = "config|process_enabled|true\nconfig|process_live_rows|5678\n";
+        auto res = h.run_capture_sources();
+        REQUIRE(res);
+        CHECK(res->body.find("5678") == std::string::npos);
+        CHECK(res->body.find("without the roll-up tables") == std::string::npos);
+        CHECK(res->body.find("&mdash;") != std::string::npos);
+    }
+    SECTION("neither key: a dash, not zero") {
+        EchoHarness h;
+        h.status_output = "config|process_enabled|true\n";
+        auto res = h.run_capture_sources();
+        REQUIRE(res);
+        CHECK(res->body.find("&mdash;") != std::string::npos);
+        CHECK(res->body.find("upgrade the agent") == std::string::npos);
+    }
+    SECTION("an oversize status reply is refused with a note") {
+        EchoHarness h;
+        h.status_output = "config|process_enabled|true\n" + std::string(kMaxEchoStatusOutputBytes, 'x');
+        auto res = h.run_capture_sources();
+        REQUIRE(res);
+        CHECK(res->body.find("unexpectedly large status reply") != std::string::npos);
+        CHECK(res->body.find("capCards") == std::string::npos);
+    }
 }
 
 // SEC-2/SEC-3 confinement-gap class (found during a docs sweep): devices_fn_
@@ -1008,6 +1925,49 @@ TEST_CASE("echo_retention_paused_json: sorts value-error first, then oldest-paus
     CHECK(rows[2]["agent_id"] == "dev-new");
 }
 
+// The REST and MCP twins both serialise through this builder: the row count is the hourly
+// roll-up count under `hourly_rows`, and no `live_rows` key is emitted.
+TEST_CASE("echo_retention_paused_json: rows carry hourly_rows and no live_rows",
+          "[echo][tree][model]") {
+    EchoRetentionPausedScan scan;
+    EchoPausedSourceRow known;
+    known.agent_id = "dev-a";
+    known.agent_display = "dev-a";
+    known.source = "process";
+    known.hourly_rows = 42;
+    EchoPausedSourceRow unknown;
+    unknown.agent_id = "dev-b";
+    unknown.agent_display = "dev-b";
+    unknown.source = "tcp";
+    scan.rows = {known, unknown};
+
+    auto parsed = nlohmann::json::parse(echo_retention_paused_json(scan), nullptr, false);
+    REQUIRE_FALSE(parsed.is_discarded());
+    const auto& rows = parsed["rows"];
+    REQUIRE(rows.size() == 2);
+    for (const auto& r : rows) {
+        CHECK(r.contains("hourly_rows"));
+        CHECK_FALSE(r.contains("live_rows"));
+    }
+    // Both rows share paused_at 0 and no value error, so the order falls to agent_display.
+    CHECK(rows[0]["agent_id"] == "dev-a");
+    CHECK(rows[0]["hourly_rows"] == 42);
+    CHECK(rows[1]["hourly_rows"] == -1);
+}
+
+// The OpenAPI row schema is the machine-readable twin of the builder above.
+TEST_CASE("OpenAPI EchoRetentionPausedRow names hourly_rows and not live_rows",
+          "[echo][tree][openapi]") {
+    const auto spec = nlohmann::json::parse(openapi_spec_json(), nullptr, false);
+    REQUIRE_FALSE(spec.is_discarded());
+    const auto& row = spec.at("components").at("schemas").at("EchoRetentionPausedRow");
+    CHECK(row.at("properties").contains("hourly_rows"));
+    CHECK_FALSE(row.at("properties").contains("live_rows"));
+    const auto required = row.at("required").dump();
+    CHECK(required.find("\"hourly_rows\"") != std::string::npos);
+    CHECK(required.find("live_rows") == std::string::npos);
+}
+
 // #4644: `node` is ONE non-negative base-10 integer. `stoul` accepted "-1" (wrapping to
 // SIZE_MAX) and "5x" (as 5), so a malformed node id silently selected a different process node.
 TEST_CASE("process-tree detail: a malformed node id is a 400",
@@ -1020,4 +1980,447 @@ TEST_CASE("process-tree detail: a malformed node id is a 400",
         REQUIRE(res);
         CHECK(res->status == 400);
     }
+}
+
+// ── #7075: the capture-sources push is audit-first (ADR-0033 section 9) ─────────────────────
+//
+// One `attempted` row listing every validated change is stored BEFORE the first dispatch; if it
+// cannot be stored the push is refused (503 + Sec-Audit-Failed + an error toast) and nothing is
+// dispatched. The page swaps nothing from this response, so the HX-Trigger toast is the signal.
+
+namespace {
+
+constexpr const char* kPushUrl = "/fragments/echo/capture-sources/push?device=dev-A&changes=";
+constexpr const char* kSourcesPushMetric = "yuzu_echo_sources_push_total";
+
+std::unique_ptr<httplib::Response> push(EchoHarness& h, const std::string& changes_encoded) {
+    return h.sink.Post(kPushUrl + changes_encoded, "");
+}
+
+// The decoded HX-Trigger toast: {"message", "level"} or null when the header is absent.
+nlohmann::json toast_of(const httplib::Response& r) {
+    const auto hdr = r.get_header_value("HX-Trigger");
+    if (hdr.empty())
+        return nullptr;
+    const auto j = nlohmann::json::parse(hdr, nullptr, false);
+    REQUIRE_FALSE(j.is_discarded());
+    return j.at("showToast");
+}
+
+const EchoHarness::AuditRow* first_row(const EchoHarness& h, const std::string& result) {
+    for (const auto& r : h.audit_log)
+        if (r.action == "echo.sources.configure" && r.result == result)
+            return &r;
+    return nullptr;
+}
+
+} // namespace
+
+TEST_CASE("capture-sources push: an `attempted` row that is not stored refuses the push",
+          "[echo][routes][capture-sources][audit]") {
+    SECTION("the sink returns false") {
+        EchoHarness h;
+        h.audit_ok = false;
+        auto r = push(h, "process%3Don,tcp%3Doff");
+        REQUIRE(r);
+        CHECK(r->status == 503);
+        CHECK(r->get_header_value_count("Sec-Audit-Failed") == 1);
+        CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
+        CHECK(r->body.find("data-reason=\"audit_unavailable\"") != std::string::npos);
+        const auto toast = toast_of(*r);
+        REQUIRE(toast.is_object());
+        CHECK(toast.at("level") == "error");
+        CHECK(toast.at("message").get<std::string>().find("nothing was sent") != std::string::npos);
+        CHECK(h.dispatch_calls == 0);
+        CHECK(h.audit_log.size() == 1); // the attempted row only: no outcome row for a send that never happened
+        CHECK(h.metric(kSourcesPushMetric, "audit_unavailable") == 1);
+        CHECK(h.metric(kSourcesPushMetric, "pushed") == 0);
+    }
+    SECTION("the sink throws: same refusal, no exception escapes") {
+        EchoHarness h;
+        h.audit_throws = true;
+        std::unique_ptr<httplib::Response> r;
+        CHECK_NOTHROW(r = push(h, "process%3Don"));
+        REQUIRE(r);
+        CHECK(r->status == 503);
+        CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
+        CHECK(h.dispatch_calls == 0);
+        CHECK(h.metric(kSourcesPushMetric, "audit_unavailable") == 1);
+    }
+    SECTION("the sink is unwired: a refusal, never audit-off") {
+        EchoHarness h(/*wire_audit=*/false);
+        auto r = push(h, "process%3Don");
+        REQUIRE(r);
+        CHECK(r->status == 503);
+        CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
+        CHECK(r->body.find("data-reason=\"audit_unavailable\"") != std::string::npos);
+        CHECK(h.dispatch_calls == 0);
+        CHECK(h.metric(kSourcesPushMetric, "audit_unavailable") == 1);
+    }
+}
+
+TEST_CASE("capture-sources push: one attempted row precedes every dispatch, then one outcome per source",
+          "[echo][routes][capture-sources][audit]") {
+    EchoHarness h;
+    auto r = push(h, "process%3Don,tcp%3Doff");
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    CHECK(r->get_header_value("Sec-Audit-Failed").empty());
+    CHECK(r->body.find("2 change(s) pushed") != std::string::npos);
+
+    const std::vector<std::string> expected{
+        "audit:echo.sources.configure/attempted", "dispatch",
+        "audit:echo.sources.configure/dispatched", "dispatch",
+        "audit:echo.sources.configure/dispatched"};
+    CHECK(h.order == expected);
+
+    const auto* attempted = first_row(h, "attempted");
+    REQUIRE(attempted != nullptr);
+    CHECK(attempted->target_id == "dev-A");
+    CHECK(attempted->detail == "process_enabled=true tcp_enabled=false");
+    CHECK(attempted->principal == "alice");
+
+    const auto toast = toast_of(*r);
+    REQUIRE(toast.is_object());
+    CHECK(toast.at("level") == "success");
+    CHECK(toast.at("message") == "2 of 2 change(s) pushed");
+    CHECK(h.metric(kSourcesPushMetric, "pushed") == 1);
+}
+
+TEST_CASE("capture-sources push: outcome rows that are not stored still set the header once and proceed",
+          "[echo][routes][capture-sources][audit]") {
+    EchoHarness h;
+    h.audit_persists = [](const EchoHarness::AuditRow& row) { return row.result == "attempted"; };
+    auto r = push(h, "process%3Don,tcp%3Doff");
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    CHECK(r->get_header_value_count("Sec-Audit-Failed") == 1);
+    CHECK(h.dispatch_calls == 2); // both sources still dispatched
+}
+
+TEST_CASE("capture-sources push: a grant withdrawn during the audit wait dispatches nothing",
+          "[echo][routes][capture-sources][audit]") {
+    SECTION("Execute withdrawn") {
+        EchoHarness h;
+        h.audit_persists = [&h](const EchoHarness::AuditRow& row) {
+            if (row.result == "attempted")
+                h.allow_execute = false; // the grant goes while the row is being stored
+            return true;
+        };
+        auto r = push(h, "process%3Don");
+        REQUIRE(r);
+        CHECK(h.dispatch_calls == 0);
+        const auto* failure = first_row(h, "failure");
+        REQUIRE(failure != nullptr);
+        CHECK(failure->detail == "permission_revoked sent=0 process_enabled=true");
+        CHECK(r->body.find("<b>Execute</b>") != std::string::npos);
+        const auto toast = toast_of(*r);
+        REQUIRE(toast.is_object());
+        CHECK(toast.at("level") == "error");
+        CHECK(h.metric(kSourcesPushMetric, "permission_revoked") == 1);
+        CHECK(h.metric(kSourcesPushMetric, "pushed") == 0);
+    }
+    SECTION("Infrastructure:Read withdrawn: the gate's own 403 stands") {
+        EchoHarness h;
+        h.audit_persists = [&h](const EchoHarness::AuditRow& row) {
+            if (row.result == "attempted")
+                h.allow_read = false;
+            return true;
+        };
+        auto r = push(h, "process%3Don");
+        REQUIRE(r);
+        CHECK(r->status == 403);
+        CHECK(h.dispatch_calls == 0);
+        CHECK(first_row(h, "failure") != nullptr);
+        CHECK(h.metric(kSourcesPushMetric, "permission_revoked") == 1);
+    }
+}
+
+TEST_CASE("capture-sources push: permissions and caller are decided again before each source",
+          "[echo][routes][capture-sources][audit]") {
+    // Each outcome row is a wait in which a grant or the session can go, so the second source is
+    // dispatched on its own decision, not on the one taken for the first.
+    SECTION("Execute withdrawn between two sources stops the rest") {
+        EchoHarness h;
+        h.audit_persists = [&h](const EchoHarness::AuditRow& row) {
+            if (row.result == "dispatched")
+                h.allow_execute = false;
+            return true;
+        };
+        auto r = push(h, "process%3Don,tcp%3Doff");
+        REQUIRE(r);
+        CHECK(h.dispatch_calls == 1);
+        const std::vector<std::string> expected{
+            "audit:echo.sources.configure/attempted", "dispatch",
+            "audit:echo.sources.configure/dispatched", "audit:echo.sources.configure/failure"};
+        CHECK(h.order == expected);
+        const auto* failure = first_row(h, "failure");
+        REQUIRE(failure != nullptr);
+        CHECK(failure->detail == "permission_revoked sent=1 tcp_enabled=false");
+        const auto toast = toast_of(*r);
+        REQUIRE(toast.is_object());
+        CHECK(toast.at("level") == "error");
+        CHECK(toast.at("message").get<std::string>().find("1 of 2") != std::string::npos);
+        CHECK(r->body.find("<b>Execute</b>") != std::string::npos);
+        CHECK(r->body.find("data-applied=\"1\"") != std::string::npos);
+        CHECK(h.metric(kSourcesPushMetric, "permission_revoked") == 1);
+        CHECK(h.metric(kSourcesPushMetric, "pushed") == 0);
+    }
+    SECTION("a session withdrawn between two sources stops the rest, on the gate's own 403") {
+        EchoHarness h;
+        h.audit_persists = [&h](const EchoHarness::AuditRow& row) {
+            if (row.result == "dispatched") {
+                h.allow_read = false; // production: the scoped gate fails at its require_auth
+                h.session_user.clear(); // and the session no longer resolves at all
+            }
+            return true;
+        };
+        auto r = push(h, "process%3Don,tcp%3Doff");
+        REQUIRE(r);
+        CHECK(r->status == 403);
+        CHECK(r->body.empty()); // the gate's answer stands: the route adds no note of its own
+        CHECK(h.dispatch_calls == 1);
+        const auto* failure = first_row(h, "failure");
+        REQUIRE(failure != nullptr);
+        CHECK(failure->detail == "permission_revoked sent=1 tcp_enabled=false");
+        CHECK(failure->principal == "alice"); // the session is gone; the row still names its holder
+        CHECK(toast_of(*r).at("message").get<std::string>().find("1 of 2") != std::string::npos);
+    }
+    SECTION("the caller is derived again for the second source") {
+        EchoHarness h;
+        h.audit_persists = [&h](const EchoHarness::AuditRow& row) {
+            if (row.result == "dispatched")
+                h.session_user = "bob";
+            return true;
+        };
+        auto r = push(h, "process%3Don,tcp%3Doff");
+        REQUIRE(r);
+        CHECK(h.dispatch_calls == 2);
+        CHECK(h.last_dispatch_caller.principal == "bob");
+        REQUIRE(h.audit_log.size() == 3); // attempted, then one outcome row per source
+        CHECK(h.audit_log[1].principal == "alice");
+        CHECK(h.audit_log[2].principal == "bob");
+    }
+    SECTION("no agent reached and then Execute withdrawn counts as permission_revoked only") {
+        EchoHarness h;
+        h.dispatch_sent = 0; // the first source is dispatched and reaches no agent
+        h.audit_persists = [&h](const EchoHarness::AuditRow& row) {
+            if (row.result == "no_agents")
+                h.allow_execute = false;
+            return true;
+        };
+        auto r = push(h, "process%3Don,tcp%3Doff");
+        REQUIRE(r);
+        CHECK(h.dispatch_calls == 1);
+        const std::vector<std::string> expected{
+            "audit:echo.sources.configure/attempted", "dispatch",
+            "audit:echo.sources.configure/no_agents", "audit:echo.sources.configure/failure"};
+        CHECK(h.order == expected);
+        const auto* failure = first_row(h, "failure");
+        REQUIRE(failure != nullptr);
+        // The unreached source is in neither `sent=` nor the pairs: its `no_agents` row has it.
+        CHECK(failure->detail == "permission_revoked sent=0 tcp_enabled=false");
+        const auto toast = toast_of(*r);
+        REQUIRE(toast.is_object());
+        CHECK(toast.at("level") == "error");
+        CHECK(toast.at("message").get<std::string>().find("0 of 2") != std::string::npos);
+        CHECK(h.metric(kSourcesPushMetric, "permission_revoked") == 1);
+        for (const char* result : {"pushed", "none_applied", "audit_unavailable"})
+            CHECK(h.metric(kSourcesPushMetric, result) == 0);
+    }
+}
+
+TEST_CASE("capture-sources push: a request with no valid change writes no row and dispatches nothing",
+          "[echo][routes][capture-sources][audit]") {
+    EchoHarness h;
+    for (const char* changes : {"", "bogus%3Don", "process%3Dmaybe", "process", "registryx%3Doff"}) {
+        INFO("changes=" << changes);
+        auto r = push(h, changes);
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("0 change(s) pushed") != std::string::npos);
+    }
+    CHECK(h.audit_log.empty());
+    CHECK(h.dispatch_calls == 0);
+    for (const char* result : {"pushed", "none_applied", "audit_unavailable", "permission_revoked"})
+        CHECK(h.metric(kSourcesPushMetric, result) == 0);
+}
+
+TEST_CASE("capture-sources push: a repeated source keeps its last value and dispatches once",
+          "[echo][routes][capture-sources][audit]") {
+    EchoHarness h;
+    auto r = push(h, "process%3Don,process%3Doff");
+    REQUIRE(r);
+    CHECK(h.dispatch_calls == 1);
+    REQUIRE(h.last_dispatch_params.contains("process_enabled"));
+    CHECK(h.last_dispatch_params.at("process_enabled") == "false");
+    const auto* attempted = first_row(h, "attempted");
+    REQUIRE(attempted != nullptr);
+    CHECK(attempted->detail == "process_enabled=false"); // one pair, not two
+}
+
+TEST_CASE("capture-sources push: refusals before the attempted row write none and dispatch nothing",
+          "[echo][routes][capture-sources][audit]") {
+    SECTION("no Execute permission") {
+        EchoHarness h;
+        h.allow_execute = false;
+        auto r = push(h, "process%3Don");
+        REQUIRE(r);
+        CHECK(r->body.find("<b>Execute</b>") != std::string::npos);
+        CHECK(toast_of(*r).at("level") == "error");
+        CHECK(h.audit_log.empty());
+        CHECK(h.dispatch_calls == 0);
+    }
+    SECTION("scoped Read denied") {
+        EchoHarness h;
+        h.allow_read = false;
+        auto r = push(h, "process%3Don");
+        REQUIRE(r);
+        CHECK(r->status == 403);
+        CHECK(h.audit_log.empty());
+        CHECK(h.dispatch_calls == 0);
+    }
+    SECTION("no device") {
+        EchoHarness h;
+        auto r = h.sink.Post("/fragments/echo/capture-sources/push?changes=process%3Don", "");
+        REQUIRE(r);
+        CHECK(r->body.find("No device selected.") != std::string::npos);
+        CHECK(h.audit_log.empty());
+        CHECK(h.dispatch_calls == 0);
+    }
+    SECTION("dispatch unwired") {
+        EchoHarness h(/*wire_audit=*/true, /*wire_dispatch=*/false);
+        auto r = push(h, "process%3Don");
+        REQUIRE(r);
+        CHECK(r->body.find("dispatch is unavailable") != std::string::npos);
+        CHECK(toast_of(*r).at("level") == "error");
+        CHECK(h.audit_log.empty());
+        CHECK(h.dispatch_calls == 0);
+    }
+}
+
+TEST_CASE("capture-sources push: a device that no agent reached is reported as not pushed",
+          "[echo][routes][capture-sources][audit]") {
+    EchoHarness h;
+    h.dispatch_sent = 0;
+    auto r = push(h, "process%3Don");
+    REQUIRE(r);
+    CHECK(r->body.find("0 change(s) pushed") != std::string::npos);
+    const auto toast = toast_of(*r);
+    REQUIRE(toast.is_object());
+    CHECK(toast.at("level") == "error");
+    CHECK(toast.at("message") == "0 of 1 change(s) pushed");
+    CHECK(first_row(h, "no_agents") != nullptr);
+    CHECK(h.metric(kSourcesPushMetric, "none_applied") == 1);
+    CHECK(h.write_probes == 0); // the cause is read from the dispatch outcome, never probed
+}
+
+TEST_CASE("capture-sources push: a chokepoint refusal is a dispatch_denied failure and stops the batch",
+          "[echo][routes][capture-sources][audit]") {
+    using Reason = yuzu::server::detail::DispatchDenialReason;
+    EchoHarness h;
+    int status = 403;
+    SECTION("approval_required answers 403") { h.dispatch_denied = Reason::ApprovalRequired; }
+    SECTION("unclassified is a server catalogue fault: 500") {
+        h.dispatch_denied = Reason::Unclassified;
+        status = 500;
+    }
+    const std::string token{yuzu::server::detail::to_string(*h.dispatch_denied)};
+    auto r = push(h, "process%3Don,tcp%3Doff");
+    REQUIRE(r);
+    CHECK(r->status == status);
+    const std::vector<std::string> expected{"audit:echo.sources.configure/attempted", "dispatch",
+                                            "audit:echo.sources.configure/failure"};
+    CHECK(h.order == expected); // the second source is never tried
+    CHECK(first_row(h, "no_agents") == nullptr); // not folded into an unreached agent
+    const auto* failure = first_row(h, "failure");
+    REQUIRE(failure != nullptr);
+    CHECK(failure->detail ==
+          "dispatch_denied reason=" + token + " sent=0 process_enabled=true tcp_enabled=false");
+    const auto toast = toast_of(*r);
+    REQUIRE(toast.is_object());
+    CHECK(toast.at("level") == "error");
+    CHECK(toast.at("message").get<std::string>().find("Not permitted: " + token) !=
+          std::string::npos);
+    CHECK(h.metric(kSourcesPushMetric, "dispatch_denied") == 1);
+    for (const char* result : {"pushed", "none_applied", "permission_revoked"})
+        CHECK(h.metric(kSourcesPushMetric, result) == 0);
+}
+
+TEST_CASE("capture-sources push: a dispatch that throws leaves a failure row and stops the batch",
+          "[echo][routes][capture-sources][audit]") {
+    EchoHarness h;
+    h.dispatch_throws = true;
+    std::unique_ptr<httplib::Response> r;
+    CHECK_NOTHROW(r = push(h, "process%3Don,tcp%3Doff"));
+    REQUIRE(r);
+    CHECK(r->status == 500);
+    CHECK(h.dispatch_calls == 1);
+    const auto* failure = first_row(h, "failure");
+    REQUIRE(failure != nullptr);
+    CHECK(failure->detail == "dispatch_exception sent=0 process_enabled=true tcp_enabled=false");
+    CHECK(toast_of(*r).at("level") == "error");
+    CHECK(h.metric(kSourcesPushMetric, "dispatch_exception") == 1);
+    CHECK(h.metric(kSourcesPushMetric, "none_applied") == 0);
+}
+
+TEST_CASE("capture-sources push: a failure on the second of three sources reports what was sent",
+          "[echo][routes][capture-sources][audit]") {
+    using Reason = yuzu::server::detail::DispatchDenialReason;
+    EchoHarness h;
+    // Armed when the first source's outcome row is written, so the fault meets the second source.
+    std::function<void()> arm;
+    h.audit_persists = [&arm](const EchoHarness::AuditRow& row) {
+        if (row.result == "dispatched")
+            arm();
+        return true;
+    };
+    int status = 500;
+    int dispatches = 2;
+    std::string token = "dispatch_exception";
+    std::string message = "The push failed part-way: 1 of 3 change(s) were sent and the rest may "
+                          "not have been. Reload the sources before pushing again.";
+    SECTION("the dispatch throws") { arm = [&h] { h.dispatch_throws = true; }; }
+    SECTION("the dispatch throws something that is not a std exception") {
+        arm = [&h] { h.dispatch_throws_other = true; };
+    }
+    SECTION("deriving the caller throws: that source is never dispatched") {
+        arm = [&h] { h.caller_throws = true; };
+        dispatches = 1;
+    }
+    SECTION("the chokepoint refuses") {
+        arm = [&h] { h.dispatch_denied = Reason::ApprovalRequired; };
+        status = 403;
+        token = "dispatch_denied reason=approval_required";
+        message =
+            "Not permitted: approval_required. 1 of 3 change(s) were sent, the rest were not.";
+    }
+    std::unique_ptr<httplib::Response> r;
+    CHECK_NOTHROW(r = push(h, "process%3Don,tcp%3Doff,service%3Don"));
+    REQUIRE(r);
+    CHECK(r->status == status);
+    CHECK(h.dispatch_calls == dispatches); // the third source is never tried
+    REQUIRE(h.audit_log.size() == 3);      // attempted, the first source's outcome, the failure
+    const auto& failure = h.audit_log.back();
+    CHECK(failure.result == "failure");
+    CHECK(failure.detail == token + " sent=1 tcp_enabled=false service_enabled=true");
+    CHECK(failure.principal == "alice");
+    const auto toast = toast_of(*r);
+    REQUIRE(toast.is_object());
+    CHECK(toast.at("level") == "error");
+    CHECK(toast.at("message").get<std::string>() == message);
+    const std::string counted = status == 403 ? "dispatch_denied" : "dispatch_exception";
+    for (const char* result : {"pushed", "none_applied", "audit_unavailable", "permission_revoked",
+                               "dispatch_denied", "dispatch_exception"})
+        CHECK(h.metric(kSourcesPushMetric, result) == (counted == result ? 1 : 0));
+}
+
+TEST_CASE("capture-sources push: every result series exists before the first push",
+          "[echo][routes][capture-sources][metrics]") {
+    EchoHarness h; // set_metrics has run; h.metric() is not used: it creates what it reads
+    const auto text = h.metrics.serialize();
+    for (const char* result : {"pushed", "none_applied", "audit_unavailable", "permission_revoked",
+                               "dispatch_denied", "dispatch_exception"})
+        CHECK(text.find(std::string("yuzu_echo_sources_push_total{result=") + '"' + result + '"' +
+                        "}") != std::string::npos);
 }

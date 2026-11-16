@@ -393,6 +393,9 @@ const char* const kSettingsPageTemplate =
              it appeared. Populated by the body-level `submit` listener
              below (CSP-safe, no `hx-on`). -->
         <div id="engine-principal-reveal"></div>
+        <!-- Also OUTSIDE the refreshing section, for the same reason: the audit-failed note
+             written by the afterRequest listener below must survive the next refresh. -->
+        <div id="engine-principals-notices"></div>
         <div id="engine-principals-section"
              hx-get="/fragments/settings/engine-principals"
              hx-trigger="load, refreshEnginePrincipals from:body"
@@ -664,6 +667,58 @@ const char* const kSettingsPageTemplate =
       }
     });
 
+    /* The Engine Principals panel is gated on EnginePrincipal:Read, which this page's own
+       administrator gate does not imply (an account administrator under RBAC enforcement needs
+       the grant). htmx drops 4xx/5xx bodies, so a refused panel would sit on "Loading..."
+       forever: say why instead. Plain body listener (textContent only), no hx-on: the CSP
+       blocks the new Function() that htmx compiles it with. */
+    document.body.addEventListener('htmx:responseError', function(e) {
+      var d = e.detail || {}, el = d.elt, x = d.xhr;
+      if (!el || !x || el.id !== 'engine-principals-section') return;
+      if (x.status === 403)
+        el.textContent = 'You do not have permission to view this panel. It needs the EnginePrincipal:Read permission.';
+      else if (x.status === 401)
+        el.textContent = 'Your session has expired. Sign in again to view this panel.';
+      else {
+        /* Not a reload: a freshly minted or rotated credential secret is shown outside this
+           section and a reload discards it. The Retry control and its wording mirror
+           settings_routes.cpp's kEngineRetryControl (a hand copy, pinned in
+           test_settings_page_ui.cpp), built as elements (textContent only) so the note stays
+           free of markup parsing. */
+        el.textContent = 'This panel could not be loaded (HTTP ' + x.status + '). ';
+        var retry = document.createElement('button');
+        retry.type = 'button';
+        retry.className = 'btn btn-secondary';
+        retry.textContent = 'Retry';
+        retry.addEventListener('click', function() {
+          htmx.trigger(document.body, 'refreshEnginePrincipals');
+        });
+        var hint = document.createElement('span');
+        hint.className = 'hint';
+        hint.textContent = ' Retry here instead of reloading the page, which would discard a credential secret shown above.';
+        el.appendChild(retry);
+        el.appendChild(hint);
+      }
+    });
+
+    /* #6749: the roster read answers 200 with Sec-Audit-Failed when its audit row could not be
+       saved. Say so, persistently, in the notices div (outside the section that refreshes), once.
+       The sentence is yuzu-tokens.js AUDIT_FAILED (pinned equal in test_settings_page_ui.cpp);
+       the sentence is only true after a successful read, hence the status test. Text only, no markup. */
+    document.body.addEventListener('htmx:afterRequest', function(e) {
+      var d = e.detail || {}, x = d.xhr;
+      if (!x || x.status !== 200 || !d.pathInfo) return;
+      if (d.pathInfo.requestPath !== '/fragments/settings/engine-principals') return;
+      if (x.getResponseHeader('Sec-Audit-Failed') !== 'true') return;
+      var notices = document.getElementById('engine-principals-notices');
+      if (!notices || notices.firstChild) return;
+      var box = document.createElement('div');
+      box.className = 'failbox';
+      box.setAttribute('role', 'alert');
+      box.textContent = 'An audit record for this read could not be saved. The data shown is still current.';
+      notices.appendChild(box);
+    });
+
 )HTM"
     // Split here purely to keep each raw-string literal under MSVC's 16 KB
     // C2026 cap (adjacent literals concatenate byte-for-byte; the engine-
@@ -886,8 +941,14 @@ const char* const kSettingsPageTemplate =
             body: form.toString()
           }).then(function(sr) {
             if (!sr.ok) {
-              showToast('MFA step-up failed — verify your code and try again.', 'error');
-              done(false, { cancelled: true });
+              var fallback = 'MFA step-up failed: verify your code and try again.';
+              var finish = function(msg) { showToast(msg, 'error'); done(false, { cancelled: true }); };
+              if (sr.status !== 503) { finish(fallback); return; }
+              /* 503: the server names the cause (the code was not checked, or it was spent and
+                 could not be recorded), so show its own message rather than guess. */
+              sr.json().then(function(b) {
+                finish((b && b.error && typeof b.error.message === 'string' && b.error.message) || fallback);
+              }, function() { finish(fallback); });
               return;
             }
             yuzuPwPost(url, payload, done, true);

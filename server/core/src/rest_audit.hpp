@@ -38,7 +38,11 @@
 /// A null / empty `audit_fn` means the deployment runs audit-off; that is NOT
 /// a persistence failure, so the kernel returns `true` and sets no header —
 /// the established `AuditFn` contract (callers that fail closed must keep
-/// serving when audit is simply disabled).
+/// serving when audit is simply disabled). One deliberate exception is a
+/// mutation's `attempted` row (`DashboardRoutes::audit_attempted`, #3619): it
+/// refuses on an unwired sink, because the mutation must not run without a
+/// row; production always wires the sink there (`server.cpp`), and audit-off
+/// still reports the row as persisted from inside `audit_log`.
 ///
 /// **`result` semantics (#4858) — read this before assuming "success" means
 /// "data was shown".** The bool returned by `try_persist_audit`/
@@ -59,8 +63,8 @@
 ///     already recorded `success` audit row.
 ///   * Some surfaces instead audit AFTER the read and set `result` by ACTUAL
 ///     outcome — the Guardian REST/MCP twins (e.g. `guardian.device.view`
-///     on REST/MCP, which passes `rows ? "success" : "failure"`; the
-///     device-page Guardian lens fragment is a DIFFERENT posture, see below)
+///     on REST/MCP and the device-page Guardian lens fragment, which pass
+///     `rows ? "success" : "failure"`)
 ///     and `dex.app_perf.devices.view` record `success`/`failure` reflecting
 ///     whether the read itself succeeded, not merely whether it was
 ///     authorised and attempted.
@@ -77,13 +81,13 @@
 ///     runs, with the same constant `"success"`) — two different MCP tools
 ///     emitting the same verb under the same post-read-constant-success
 ///     convention, not a drift between them.
-///   * A fourth, surface-specific split on the SAME verb: `guardian.device.
-///     view` is audited post-read-by-outcome on REST and MCP (bucket two
-///     above), but the device-page Guardian lens dashboard fragment
-///     (`device_lens_routes.cpp`) audits it BEFORE the read with a constant
-///     `"success"` (bucket-one shape) — the same audit verb therefore
-///     carries a DIFFERENT ordering/outcome convention depending on which
-///     surface emitted it.
+///   * `guardian.device.view` is audited post-read-by-outcome on REST, MCP
+///     and (since #7217) the device-page Guardian lens dashboard fragment
+///     (`device_lens_routes.cpp`, set-and-proceed on that HTML surface): all
+///     three record `success`/`failure` by the read's actual outcome. Rows
+///     written by earlier builds on the lens carry a constant `"success"`
+///     written BEFORE the read, so a historical lens row can say `success`
+///     for a read that rendered the degraded placeholder.
 /// These postures are a known, accepted split across surfaces, not a bug in
 /// any one of them — an auditor reading raw rows must not assume one meaning
 /// fleet-wide, and must key off (verb, surface), not verb alone. Converging

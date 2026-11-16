@@ -4,6 +4,9 @@ if host_machine.system() == 'windows'
   hardware_deps += cxx.find_library('wbemuuid')
   hardware_deps += cxx.find_library('ole32')
   hardware_deps += cxx.find_library('oleaut32')
+  # RegOpenKeyExW / RegQueryValueExW (the machine_id leg's MachineGuid read) are advapi32; the same
+  # lookup app_control/meson.build uses.
+  hardware_deps += cxx.find_library('advapi32')
 elif host_machine.system() == 'darwin'
   # Wave 3 (#2380/ADR-3002 promotion): the "system" action reads the IOKit
   # IOPlatformExpertDevice registry entry natively (kIOPlatformSerialNumberKey
@@ -26,9 +29,11 @@ endif
 # yuzu::agent::PluginHandle::load.
 hardware_plugin_lib = shared_library(
   'hardware',
-  files('src/hardware_plugin.cpp'),
+  # hardware_estate_win.cpp is #ifdef _WIN32 inside, so it is listed unconditionally (the shape
+  # firmware_posture/meson.build uses for its per-OS leg TUs).
+  files('src/hardware_plugin.cpp', 'src/hardware_estate_win.cpp'),
   name_prefix: '',
-  include_directories: include_directories('../../shared'),  # wmi_bounded.hpp (#3404, _WIN32-gated), planned_leg.hpp
+  include_directories: include_directories('../../shared'),  # wmi_bounded.hpp (#3404, _WIN32-gated), planned_leg.hpp, win_rsmb.hpp, hmac_sha256.hpp
   dependencies: hardware_deps,
   install: true,
   install_dir: get_option('libdir') / 'yuzu' / 'plugins',

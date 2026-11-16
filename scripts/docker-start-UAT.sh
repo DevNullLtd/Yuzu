@@ -42,6 +42,15 @@ fi
 UAT_DIR="$YUZU_ROOT/.uat"
 COMPOSE_FILE="$YUZU_ROOT/deploy/docker/docker-compose.full-uat.yml"
 
+# Grafana admin password (#4817). The compose requires YUZU_GRAFANA_ADMIN_PASSWORD
+# for every command, `down` and `ps` included. `start` generates it once, keeps
+# it here (0600 where the filesystem honours it) and reuses it; an exported
+# YUZU_GRAFANA_ADMIN_PASSWORD takes precedence and is saved. `stop` and `status`
+# only read it. It is never exported (the helper un-exports it): each docker
+# compose call gets it explicitly (scripts/lib/uat-grafana-password.sh).
+GRAFANA_PASSWORD_FILE="$UAT_DIR/grafana-admin-password"
+. "$YUZU_ROOT/scripts/lib/uat-grafana-password.sh"
+
 ADMIN_USER="admin"
 ADMIN_PASS='YuzuUatAdmin1!'
 
@@ -117,6 +126,8 @@ kill_agent() {
 
 kill_docker() {
     echo "Stopping Docker containers..."
+    uat_grafana_password_for_compose "$GRAFANA_PASSWORD_FILE"
+    YUZU_GRAFANA_ADMIN_PASSWORD="$UAT_GRAFANA_ADMIN_PASSWORD" \
     UAT_CONFIG="$UAT_DIR/yuzu-server.cfg" \
     UAT_DASHBOARDS="$UAT_DIR/dashboards" \
         docker compose -f "$COMPOSE_FILE" down -v 2>/dev/null \
@@ -189,6 +200,8 @@ show_status() {
     echo "=== Yuzu Docker UAT Stack Status ==="
     echo ""
     echo "Docker containers:"
+    uat_grafana_password_for_compose "$GRAFANA_PASSWORD_FILE"
+    YUZU_GRAFANA_ADMIN_PASSWORD="$UAT_GRAFANA_ADMIN_PASSWORD" \
     UAT_CONFIG="$UAT_DIR/yuzu-server.cfg" \
     UAT_DASHBOARDS="$UAT_DIR/dashboards" \
         docker compose -f "$COMPOSE_FILE" ps 2>/dev/null || echo "  (not running)"
@@ -204,7 +217,7 @@ show_status() {
     echo ""
     echo "Endpoints:"
     echo "  Dashboard:   http://localhost:${SERVER_PORT}"
-    echo "  Grafana:     http://localhost:3000 (admin/admin)"
+    printf "  Grafana:     http://localhost:3000 (%s)\n" "$(uat_grafana_password_describe "$GRAFANA_PASSWORD_FILE")"
     echo "  Prometheus:  http://localhost:9090"
     echo "  ClickHouse:  http://localhost:8123"
     echo "  GW Health:   http://localhost:8081/readyz"
@@ -283,8 +296,14 @@ start_all() {
     ok "Preflight checks passed"
 
     # ── Clean state ───────────────────────────────────────────────────
+    # Refuse a bad exported Grafana password before anything is stopped (#4817).
+    uat_grafana_password_preflight
     kill_agent
     kill_docker
+    # Read the saved Grafana password before the wipe below deletes it, so a
+    # restart keeps the same login (#4817).
+    local grafana_prev=""
+    grafana_prev="$(uat_grafana_password_stored "$GRAFANA_PASSWORD_FILE")" || grafana_prev=""
     # Preserve .uat/windows-agent/ (the extracted Windows release binaries —
     # we don't want to re-extract on every start). Wipe everything else.
     if [ -d "$UAT_DIR" ]; then
@@ -295,6 +314,10 @@ start_all() {
     # ── Generate credentials ──────────────────────────────────────────
     generate_config
     ok "Generated server config ($ADMIN_USER / $ADMIN_PASS)"
+    # Save the Grafana password again (an exported one wins, then the one read
+    # before the wipe) or generate the first one.
+    uat_grafana_password "$GRAFANA_PASSWORD_FILE" "$grafana_prev"
+    ok "Grafana admin password in $GRAFANA_PASSWORD_FILE"
 
     # ── Prepare dashboards ────────────────────────────────────────────
     prepare_dashboards
@@ -304,6 +327,7 @@ start_all() {
     echo ""
     echo "[1/2] Starting Docker stack (server + gateway + prometheus + clickhouse + grafana)..."
 
+    YUZU_GRAFANA_ADMIN_PASSWORD="$UAT_GRAFANA_ADMIN_PASSWORD" \
     UAT_CONFIG="$UAT_DIR/yuzu-server.cfg" \
     UAT_DASHBOARDS="$UAT_DIR/dashboards" \
         docker compose -f "$COMPOSE_FILE" up -d 2>&1 | tail -10
@@ -639,7 +663,7 @@ for r in d.get('responses',[]):
     echo ""
     echo "  Dashboard:   http://localhost:${SERVER_PORT}"
     printf "  Login:       %s / %s\n" "$ADMIN_USER" "$ADMIN_PASS"
-    echo "  Grafana:     http://localhost:3000 (admin/admin)"
+    printf "  Grafana:     http://localhost:3000 (admin / %s)\n" "$UAT_GRAFANA_ADMIN_PASSWORD"
     echo "  Prometheus:  http://localhost:9090"
     echo "  ClickHouse:  http://localhost:8123"
     echo ""
@@ -666,6 +690,6 @@ case "${1:-start}" in
     start)   start_all ;;
     stop)    kill_agent; kill_docker; echo "Docker UAT stack stopped." ;;
     status)  show_status ;;
-    rebuild) ensure_docker && rebuild_images && start_all ;;
+    rebuild) uat_grafana_password_preflight; ensure_docker && rebuild_images && start_all ;;
     *)       echo "Usage: $0 {start|stop|status|rebuild}"; exit 1 ;;
 esac

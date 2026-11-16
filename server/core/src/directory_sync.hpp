@@ -190,9 +190,22 @@ public:
 
     // ── Sync operations ─────────────────────────────────────────────────
 
+    /// What one snapshot apply stored: the user and group counts left after skipped records
+    /// were removed, how many records (or member ids) were skipped, and how many display
+    /// fields had an embedded NUL replaced. These are the figures of THAT apply alone, so a
+    /// caller reporting a sync reports them rather than re-reading the status row or the
+    /// cumulative accessors below.
+    struct ApplyCounts {
+        int users{0};
+        int groups{0};
+        std::uint64_t skipped{0};
+        std::uint64_t sanitized{0};
+    };
+
     /// Sync users and groups from Microsoft Entra ID (Azure AD) via Graph API.
     /// Uses OAuth2 client credentials flow to obtain an access token, then
-    /// fetches /users and /groups from Microsoft Graph.
+    /// fetches /users and /groups from Microsoft Graph. On success returns the counts that
+    /// this sync stored (see `ApplyCounts`).
     ///
     /// ADR-1007: re-entrancy guarded — two concurrent callers racing this
     /// method previously both proceeded (the deleted `mtx_`, see the file
@@ -201,7 +214,19 @@ public:
     /// port). A busy call returns `std::unexpected("sync already in
     /// progress")` immediately rather than queuing or blocking — callers
     /// map this to HTTP 409, not 500 (see `discovery_routes.cpp`).
-    std::expected<void, std::string> sync_entra(const EntraConfig& config);
+    std::expected<ApplyCounts, std::string> sync_entra(const EntraConfig& config);
+
+    /// TEST ONLY: set before any sync starts and never from production code. When non-empty,
+    /// replaces `https://graph.microsoft.com/v1.0` as the base of every Graph request
+    /// `sync_entra` makes, so a local server can stand in for Graph. Empty (default) in
+    /// production.
+    std::string test_hook_graph_base_url_;
+
+    /// TEST ONLY: set before any sync starts and never from production code. When set,
+    /// `sync_entra` takes its access token from this callable instead of the OAuth2 token
+    /// endpoint. Unset (default) in production.
+    std::function<std::expected<std::string, std::string>(const EntraConfig&)>
+        test_hook_acquire_token_;
 
     /// Fires once, synchronously, immediately after `sync_entra` wins the
     /// re-entrancy guard and before any network/store work — TEST ONLY, a
@@ -244,6 +269,30 @@ public:
     /// Get all synced groups.
     std::vector<DirectoryGroup> get_synced_groups() const;
 
+    /// Cumulative metric: number of directory records skipped since this object was constructed,
+    /// across every snapshot apply: a user, or a group, with an embedded NUL byte in a key field
+    /// (id, upn, email), plus each group member id carrying one. Postgres text cannot hold a
+    /// NUL, so such a record is skipped and counted instead of aborting the whole snapshot. Not
+    /// a per-sync figure: the result of `sync_entra` carries those.
+    [[nodiscard]] std::uint64_t skipped_records() const noexcept {
+        return skipped_records_.load(std::memory_order_relaxed);
+    }
+
+    /// Cumulative metric: number of display-only fields (user display name, group display name,
+    /// group description) whose embedded NUL bytes were replaced with U+FFFD since this object
+    /// was constructed. The record is kept; only the field text changes.
+    [[nodiscard]] std::uint64_t sanitized_fields() const noexcept {
+        return sanitized_fields_.load(std::memory_order_relaxed);
+    }
+
+    /// The skipped count (same definition as `skipped_records()`) of the most recent snapshot
+    /// apply on this object; 0 when that snapshot skipped nothing. Overlapping applies on the
+    /// same object overwrite each other, so a report about one sync uses the result
+    /// `sync_entra` returned instead.
+    [[nodiscard]] std::uint64_t last_sync_skipped_records() const noexcept {
+        return last_sync_skipped_.load(std::memory_order_relaxed);
+    }
+
     /// Get sync status for each configured provider.
     SyncStatus get_status() const;
 
@@ -282,6 +331,15 @@ private:
     /// (the function has several early `return std::unexpected(...)`s).
     std::atomic<bool> entra_sync_in_progress_{false};
 
+    /// See `skipped_records()`.
+    std::atomic<std::uint64_t> skipped_records_{0};
+
+    /// See `sanitized_fields()`.
+    std::atomic<std::uint64_t> sanitized_fields_{0};
+
+    /// See `last_sync_skipped_records()`.
+    std::atomic<std::uint64_t> last_sync_skipped_{0};
+
     /// Complete remote snapshot fetched from Microsoft Graph before any
     /// database write — see the file header's transaction-shape note.
     /// `memberships` maps group_id -> the raw member ids Graph returned
@@ -298,18 +356,23 @@ private:
     /// user/group the snapshot names (role mapping is NOT stored here — see
     /// file header), then clears and bulk-repopulates memberships (filtered
     /// to known user ids, so a non-user Graph member can never abort the
-    /// sync via a foreign-key violation). This is where the SQLite-era
+    /// sync via a foreign-key violation). The snapshot is taken by value and
+    /// filtered in place: a record with a NUL in a key field is removed (and
+    /// counted), a NUL in a display-only field is replaced with U+FFFD, and a
+    /// snapshot whose users (or groups) were all skipped is refused before
+    /// any write, leaving the roster untouched. This is where the SQLite-era
     /// self-deadlock lived; it is exposed to the private
     /// `friend struct DirectorySyncTestAccess` test seam so that logic is
     /// unit-testable without a live/stubbed Graph HTTP endpoint (the client
     /// itself stays untouched — see file header).
-    std::expected<void, std::string> apply_entra_sync(const EntraSyncData& data);
+    std::expected<ApplyCounts, std::string> apply_entra_sync(EntraSyncData data);
 
     // Internal: update sync status. Self-contained (acquires its own lease) —
     // called independently of apply_entra_sync at several points in
     // sync_entra (running/failed/completed), never from inside its
-    // transaction.
-    void update_status(const std::string& provider, const std::string& status,
+    // transaction. Returns false when the status row could not be written (closed store, no
+    // connection in time, or a failed statement); the cause is logged here.
+    bool update_status(const std::string& provider, const std::string& status,
                        int user_count = 0, int group_count = 0,
                        const std::string& error = {});
 

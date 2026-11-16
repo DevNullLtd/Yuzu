@@ -37,7 +37,7 @@ they do not share one host-wide SQLite file:
 - Wee Tam: `D:\ci\test-runs\yuzu-weetam-windows-N\test-runs.db`
 
 `ci.yml`'s Linux and Windows jobs initialize and write these databases
-automatically. Schema v3 preserves GitHub rerun attempts separately and stores
+automatically. Schema v4 preserves GitHub rerun attempts separately and stores
 job outcome/duration, platform, runner, commit/branch/event, ccache hit ratio,
 Meson suite result/duration/timeout, and recovered known-flake events. Query one
 on its host by setting `YUZU_TEST_DB`, for example:
@@ -64,22 +64,25 @@ passes CI if an isolated retry recovers; each recovery is also persisted in
 
 Initialize each manual orchestration with a `RUN_ID`, `TEST_DIR=/tmp/yuzu-test-$RUN_ID`, `LOG_DIR=$HOME/.local/share/yuzu/test-runs/$RUN_ID`, `COMMIT`, `BRANCH`, and `BUILDDIR=$(build_dir)` from `scripts/test/_portable.sh`. Record gates with `scripts/test/test-db-write.sh`.
 
+For manual coverage capture, run `bash scripts/test/coverage-gate.sh --capture-baselines`; it generates a fresh run ID for every capture. See `docs/ci-architecture.md` → "Persistent runner-local test history" for schema-v4 compatibility and rollback instructions.
+
 ## Phase Order
 
 Wall-clock order is fixed:
 
 1. Phase 0 preflight: `bash scripts/test/preflight.sh` or `--force-cleanup`.
+1b. Phase 0b tooling (default and full modes only): `bash scripts/test/ensure-puppeteer.sh` (a failure aborts the run) and `bash scripts/test/ensure-gcovr.sh` (a failure aborts a full run; in default mode it is a WARN and Phase 7b measures nothing).
 2. Phase 1 build HEAD: Meson compile, Erlang `rebar3 as prod release`, and docker images except in quick mode.
 3. Phase 2 upgrade test: `bash scripts/test/test-upgrade-stack.sh ...`; skipped in quick mode.
 4. Phase 3 OTA: full mode only; may record SKIP if still stubbed.
 5. Phase 7a perf: full mode only, before UAT stack; measure-and-report only.
 6. Phase 4 fresh stack: `bash scripts/start-UAT.sh`; skipped in quick mode.
-7. Phase 5 gates: unit, EUnit, Dialyzer, CT, integration/e2e/synthetic UAT/puppeteer/instructions as applicable. Security E2E runs after the parallel fan-out, alone (its rate-limit probe empties the shared login bucket). Puppeteer records SKIP when `tests/puppeteer/node_modules` is absent.
+7. Phase 5 gates: unit, EUnit, Dialyzer, CT, integration/e2e/synthetic UAT/puppeteer/instructions as applicable. Security E2E runs after the parallel fan-out, alone (its rate-limit probe empties the shared login bucket). Puppeteer and Browser smoke record FAIL (never SKIP) when `tests/puppeteer/node_modules/puppeteer` is absent (step 1b installs it first).
 8. Phase 6 sanitizers: full mode only, dispatched runner.
-9. Phase 7b coverage: full mode only, enforces `tests/coverage-baseline.json`.
+9. Phase 7b coverage: `--full` enforces `tests/coverage-baseline.json`; default mode runs it report-only. Before measuring, `scripts/test/ensure-gcovr.sh` is re-run, and if the pinned gcovr is not usable the gate is not run and a Coverage row is recorded (WARN in default mode, FAIL in `--full`, which enforces the baseline).
 10. Phase 8 teardown and summary.
 
-Phase 1 is mandatory-blocking. Other phases should normally continue so the operator gets one prioritized report.
+Phases 0, 0b and 1 are mandatory-blocking. Other phases should normally continue so the operator gets one prioritized report.
 
 ## UAT Lifetime Rule
 
@@ -95,7 +98,7 @@ Phase 8 must not stop the native UAT stack from `scripts/start-UAT.sh`. A succes
 
 ## Perf Status
 
-Perf is measure-only as of 2026-05-03. `scripts/test/perf-gate.sh` records metrics and exits PASS; humans inspect trend and distribution shape using the test-runs DB and `docs/perf-baseline-calibration-2026-05-03.md`.
+Perf thresholds are measure-only as of 2026-05-03. `scripts/test/perf-gate.sh` records metrics and passes only when every requested suite completes and its metrics are recorded; failed, incomplete or unrecorded execution fails. Humans inspect trend and distribution shape using the test-runs DB and `docs/perf-baseline-calibration-2026-05-03.md`.
 
 ## Mode Shortcuts
 

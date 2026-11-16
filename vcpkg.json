@@ -5,7 +5,7 @@
   "description": "Multi-platform agent and server framework",
   "homepage": "https://github.com/DevNullLtd/Yuzu",
   "license": "AGPL-3.0-or-later",
-  "builtin-baseline": "4b77da7fed37817f124936239197833469f1b9a8",
+  "builtin-baseline": "9eec002df1cd109f8f104cd966a763daf9751489",
   "dependencies": [
     {
       "name": "grpc",

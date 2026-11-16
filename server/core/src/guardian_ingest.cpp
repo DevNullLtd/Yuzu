@@ -7,6 +7,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -106,6 +107,25 @@ void warm_create_guardian_event_store_metric(yuzu::MetricsRegistry& metrics) {
           EventInsertOutcome::Conflict, EventInsertOutcome::Error})
         metrics.histogram(kGuardianEventStoreDurationMetric,
                           {{"status", std::string(event_insert_status_label(status))}}, buckets);
+}
+
+void publish_guardian_census_unordered_gauge(yuzu::MetricsRegistry& metrics,
+                                             const GuaranteedStateStore& store) {
+    // Published only on success: an unanswered read must not read as zero, and a failed one leaves
+    // the last value. The count-only read is bounded and counted on the gauge's own degrade source.
+    // The caller is a bare thread body, so nothing may escape: the handler nests its own
+    // observability (formatting allocates), the pattern of the bridge sweep tick in server.cpp.
+    try {
+        if (const auto unordered = store.unordered_agent_count())
+            metrics.gauge(kGuardianCensusUnorderedAgentsMetric)
+                .set(static_cast<double>(*unordered));
+    } catch (...) {
+        try {
+            spdlog::warn(
+                "guardian census unordered-agents gauge tick failed; keeping the last value");
+        } catch (...) { // NOLINT(bugprone-empty-catch) - nested by design
+        }
+    }
 }
 
 // ── #4666 PR-4: dedicated bounded async logger for the T_server diagnostic line ─────────────
@@ -242,6 +262,58 @@ void set_t_server_construction_fault_for_test(bool fail) noexcept {
     g_t_server_construction_fault_for_test.store(fail, std::memory_order_relaxed);
 }
 
+std::optional<std::int64_t> agent_stamp_ns(bool has_timestamp, std::int64_t seconds,
+                                           std::int32_t nanos) noexcept {
+    constexpr std::int64_t kNsPerSec = 1'000'000'000;
+    if (!has_timestamp || nanos < 0 || nanos >= kNsPerSec || seconds < 0 ||
+        seconds > (std::numeric_limits<std::int64_t>::max() / kNsPerSec) - 1)
+        return std::nullopt;
+    return seconds * kNsPerSec + nanos;
+}
+
+WirePair pair_from_wire(std::uint64_t boot_epoch, std::uint64_t emit_seq) noexcept {
+    // Exclusive upper bound: below 2^62 the BIGINT sign bit is unreachable.
+    constexpr std::uint64_t kPairLimit = std::uint64_t{1} << 62;
+    if (boot_epoch == 0 && emit_seq == 0)
+        return {};
+    if (boot_epoch == 0 || emit_seq == 0)
+        return {.reject = PairReject::HalfSet};
+    if (boot_epoch >= kPairLimit || emit_seq >= kPairLimit)
+        return {.reject = PairReject::OutOfRange};
+    return {.paired = true,
+            .boot_epoch = static_cast<std::int64_t>(boot_epoch),
+            .emit_seq = static_cast<std::int64_t>(emit_seq)};
+}
+
+std::optional<PairReject> apply_wire_pair(GuaranteedStateEventRow& row, std::uint64_t boot_epoch,
+                                          std::uint64_t emit_seq) {
+    row.boot_epoch.reset();
+    row.emit_seq.reset();
+    const WirePair wire = pair_from_wire(boot_epoch, emit_seq);
+    if (wire.paired) {
+        row.boot_epoch = wire.boot_epoch;
+        row.emit_seq = wire.emit_seq;
+        return std::nullopt;
+    }
+    if (wire.reject == PairReject::None)
+        return std::nullopt; // 0/0: an unpaired sender, not a rejection
+    return wire.reject;
+}
+
+void report_pair_reject(PairReject reject, const GuaranteedStateEventRow& row,
+                        yuzu::MetricsRegistry* metrics) {
+    const char* reason = pair_reject_reason(reject);
+    spdlog::warn("Guardian: withholding the emit-order pair ({}) from agent {} event {}; the "
+                 "event is still stored unpaired",
+                 reason, log_id_token(row.agent_id), log_id_token(row.event_id));
+    if (metrics) {
+        try { // best-effort metric; never propagate onto the ingest thread
+            metrics->counter(kGuardianPairRejectedMetric, {{"reason", reason}}).increment();
+        } catch (...) {
+        }
+    }
+}
+
 void ingest_guardian_response(GuaranteedStateStore& store, const std::string& agent_id,
                               const pb::CommandResponse& resp, BlastRadiusDetector* blast_radius,
                               DexAlertRouter* alert_router, yuzu::MetricsRegistry* metrics) {
@@ -251,6 +323,22 @@ void ingest_guardian_response(GuaranteedStateStore& store, const std::string& ag
             spdlog::warn("Guardian: failed to parse GuaranteedStateEvent from agent {}",
                          log_id_token(agent_id));
             return; // a malformed frame never reaches the store - not a timed ingest
+        }
+        // A guard event without a rule id is unprojectable and unmatchable (ruleless
+        // observations carry the reserved kObservationRuleId, never an empty id), so it is
+        // refused like a malformed frame instead of being stored as an orphan audit row. Under
+        // schema v4 the same event must also never carry pending census evidence.
+        if (ev.rule_id().empty()) {
+            spdlog::warn("Guardian: dropping event with an empty rule_id from agent {} event {}",
+                         log_id_token(agent_id), log_id_token(ev.event_id()));
+            if (metrics) {
+                try { // best-effort metric; never propagate onto the ingest thread
+                    metrics->counter(kGuardianEventsRejectedMetric, {{"reason", "empty_rule_id"}})
+                        .increment();
+                } catch (...) {
+                }
+            }
+            return;
         }
         // #4606 criterion-10 T_server waypoint: server receipt, captured before
         // store.insert_event_classified so store latency is not folded in.
@@ -291,6 +379,16 @@ void ingest_guardian_response(GuaranteedStateStore& store, const std::string& ag
         ev_row.detection_latency_us = static_cast<int64_t>(ev.detection_latency_us());
         ev_row.remediation_latency_us = static_cast<int64_t>(ev.remediation_latency_us());
         ev_row.timestamp = ts_to_iso8601(ev.timestamp().seconds());
+        // The census ordering inputs (schema v4): the validated agent stamp (0 when absent or
+        // unusable) and the server receipt captured above. The store derives the key from them.
+        const std::optional<std::int64_t> stamp = agent_stamp_ns(
+            ev.has_timestamp(), ev.timestamp().seconds(), ev.timestamp().nanos());
+        ev_row.agent_ns = stamp.value_or(0);
+        ev_row.received_ns = recv_wall_ns;
+        // Applied now, reported only after the store accepts the event (below): a redelivery of
+        // the same event must not count or warn again.
+        const std::optional<PairReject> pair_reject =
+            apply_wire_pair(ev_row, ev.boot_epoch(), ev.emit_seq());
         // Enrich severity from the rule store (contract decision 4) — the agent
         // isn't pushed severity. Fall back to the event's own value, then
         // "unknown" for an already-deleted rule.
@@ -334,6 +432,8 @@ void ingest_guardian_response(GuaranteedStateStore& store, const std::string& ag
         }
         switch (res.outcome) {
         case EventInsertOutcome::Inserted:
+            if (pair_reject)
+                report_pair_reject(*pair_reject, ev_row, metrics);
             break; // fall through to the observers below
         case EventInsertOutcome::Redelivered:
             // Agent-controlled identifiers are neutralised before they reach any key=value
@@ -384,17 +484,9 @@ void ingest_guardian_response(GuaranteedStateStore& store, const std::string& ag
                 const std::int64_t store_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                                    std::chrono::steady_clock::now() - store_t0)
                                                    .count();
-                // Agent-supplied wire timestamp, checked before use (untrusted protobuf input):
-                // the field must be present, nanos must be in [0, 1e9) and seconds must not
-                // overflow an int64 once scaled. An ABSENT timestamp reads as seconds()==0, which
-                // must not be reported as a real epoch-0 instant, so it takes the sentinel too.
-                std::int64_t agent_ns = -1; // sentinel: invalid/unavailable
-                const std::int64_t secs = ev.timestamp().seconds();
-                const std::int32_t nanos = ev.timestamp().nanos();
-                constexpr std::int64_t kNsPerSec = 1'000'000'000;
-                if (ev.has_timestamp() && nanos >= 0 && nanos < kNsPerSec && secs >= 0 &&
-                    secs <= (std::numeric_limits<std::int64_t>::max() / kNsPerSec) - 1)
-                    agent_ns = secs * kNsPerSec + nanos;
+                // The agent-supplied wire timestamp was validated once by agent_stamp_ns above
+                // (untrusted protobuf input); the line reports -1 when it was unusable.
+                const std::int64_t agent_ns = stamp.value_or(-1);
                 // The three ids are agent- or operator-supplied text embedded in a space-delimited
                 // key=value line, so each goes through the SAME neutraliser and shortening the
                 // agent's T_wire/T_detect lines use (yuzu/log_token.hpp, log_id_token): a space or

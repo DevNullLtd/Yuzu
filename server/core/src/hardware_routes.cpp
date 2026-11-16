@@ -243,6 +243,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
         HardwareListPage page = build_hardware_list_page(std::move(scoped), *normalised);
+        page.roster_truncated = all.roster_truncated; // #5712: typed partial, served + flagged
         page.containment_ui = deps_.containment_ui;
         // DEX is scored ONLY on the page's rendered rows (device_routes.cpp's own
         // "score only rendered rows" rule) — a GROUP-BY per device is too costly to
@@ -286,7 +287,8 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         const bool persisted = detail::emit_behavioral_audit(
             deps_.audit_fn, req, res, "inventory.devices", "success", "Inventory", "fleet",
             "hardware list: devices=" + std::to_string(page.total_matching) +
-                " omitted=" + std::to_string(omitted));
+                " omitted=" + std::to_string(omitted) +
+                (page.roster_truncated ? " roster_truncated=1" : ""));
         (void)persisted; // HTML fragment: set-and-proceed — the header is the signal
 
         send_html(res, render_hardware_list_fragment(page, all.ci_degraded, false, results_only, all.tags_degraded));
@@ -348,7 +350,8 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             }
         }
 
-        const HardwareCiDetail detail = deps_.ci_detail_fn(id);
+        // No sections: the fragment (and its sync-now poll) never renders them.
+        const HardwareCiDetail detail = deps_.ci_detail_fn(id, CiRead::RecordOnly);
         HwCiAffordances aff = affordances_for(req, id, detail);
         if (lens == "tags")
             aff.can_delete_tags = deps_.scoped_probe_fn && deps_.scoped_probe_fn(req, "Tag", "Delete", id);
@@ -521,6 +524,19 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                             "application/json");
             return;
         }
+        // #7110: the `requested` row is stored, so decide the per-device gate AGAIN: a grant or a
+        // JIT elevation withdrawn while the row was being written dispatches nothing. The dispatch
+        // below authorizes as the system caller, so no layer past this one can see the operator's
+        // grant. On a false return the gate has written its own refusal (403, or the 404 an
+        // out-of-scope id collapses to); the row that exists gets its outcome, flagged with
+        // `Sec-Audit-Failed` when it cannot be stored, since it is the only evidence the sync was
+        // NOT requested of the agent. This recheck has no catch: a gate that throws (a store
+        // fault) unwinds to the generic 500 and leaves the `requested` row with no outcome row.
+        if (!deps_.scoped_perm_fn(req, res, "Execution", "Execute", id)) {
+            (void)detail::emit_behavioral_audit(deps_.audit_fn, req, res, "inventory.sync.request",
+                                                "failure", "Agent", id, "permission_revoked");
+            return;
+        }
         const auto r = deps_.sync_dispatch_fn(id, source);
         if (!r.sent) {
             // No second audit row here — matching the /api/v1/dex/devices/{id}/live
@@ -677,6 +693,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
         HardwareListPage page = build_hardware_list_page(std::move(scoped), *normalised);
+        page.roster_truncated = all.roster_truncated; // #5712: typed partial, served + flagged
         if (deps_.dex_score_fn)
             for (auto& row : page.rows)
                 row.dex_score = deps_.dex_score_fn(row.agent_id);
@@ -684,7 +701,8 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         const bool persisted = detail::emit_behavioral_audit(
             deps_.audit_fn, req, res, "inventory.devices", "success", "Inventory", "fleet",
             "hardware list (REST): devices=" + std::to_string(page.total_matching) +
-                " omitted=" + std::to_string(omitted));
+                " omitted=" + std::to_string(omitted) +
+                (page.roster_truncated ? " roster_truncated=1" : ""));
         if (!persisted) {
             res.status = 503;
             res.set_content(detail::a4_error(res, "audit subsystem unavailable — request not served",
@@ -738,7 +756,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             res.set_content(detail::a4_error(res, "hardware CI record unavailable"), "application/json");
             return;
         }
-        const HardwareCiDetail detail = deps_.ci_detail_fn(agent_id);
+        const HardwareCiDetail detail = deps_.ci_detail_fn(agent_id, CiRead::WithSections);
         const HardwareCiRead read = classify_hardware_ci_read(detail);
         if (read == HardwareCiRead::RosterUnreadable) {
             // A failed roster read is never a 404 (#5531).
@@ -754,6 +772,21 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         if (read == HardwareCiRead::NotFound) {
             res.status = 404;
             res.set_content(detail::a4_error(res, "not found"), "application/json");
+            return;
+        }
+
+        if (read == HardwareCiRead::SectionsUnreadable) {
+            // The record's v2 sections (the REPEATABLE READ sections reader) could not be read:
+            // a store error is never an empty 200 (H.7). Unlike `ci` / `software` / `tags`, which
+            // degrade one part at a time, an unreadable sections read withholds the whole record -
+            // a body with `sections` blank would read as "this device reports none".
+            (void)detail::emit_behavioral_audit(deps_.audit_fn, req, res, "inventory.device.ci", "failure",
+                                                "Agent", agent_id,
+                                                "hardware CI record (REST) state=sections unreadable");
+            res.status = 503;
+            res.set_content(detail::a4_error(res, "hardware sections unavailable",
+                                             {.retry_after_ms = 5000}),
+                            "application/json");
             return;
         }
 
@@ -777,7 +810,10 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             {"data", hardware_ci_json(detail, now_secs())},
             {"meta", {{"api_version", "v1"}}},
         };
-        res.set_content(out.dump(), "application/json");
+        // Section rows are agent-supplied bytes: a byte that is not valid UTF-8 must not throw
+        // out of dump() AFTER the access audit row persisted (the MCP twin's dump_replace).
+        res.set_content(out.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace),
+                        "application/json");
     });
 
     // -- Fragment: Actions lens (the generic action runner catalogue) --
@@ -814,7 +850,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         std::string hostname = id;
         std::string agent_os;
         if (deps_.ci_detail_fn) {
-            auto ident = deps_.ci_detail_fn(id).identity;
+            auto ident = deps_.ci_detail_fn(id, CiRead::RecordOnly).identity; // identity only
             if (ident) {
                 if (!ident->hostname.empty()) hostname = ident->hostname;
                 agent_os = ident->os;

@@ -36,6 +36,7 @@
 #include <chrono>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace yuzu::server;
@@ -444,6 +445,192 @@ scope:
     REQUIRE(pol.has_value());
     REQUIRE(pol->has_value());
     CHECK((*pol)->scope_expression == "ostype == \"windows\" AND EXISTS tag:prod");
+}
+
+// #2123 fail-open regression pin. A blank or comment line inside the scope
+// selector used to end the block under CRLF/lone-CR endings (comment lines
+// under LF too), so the stored scope_expression lost `EXISTS tag:prod` and the
+// policy evaluated every Windows device. The triggers list carries the same
+// shape, so its count is pinned too. managementGroups is deliberately NOT
+// asserted here: its accepted placement is an open question on #2123.
+TEST_CASE("PolicyStore: scope selector survives blank/comment lines and any line ending (#2123)",
+          "[policy_store][pg][policy][scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PolicyStore store{pool};
+    auto frag = store.create_fragment(kFullFragment);
+    REQUIRE(frag.has_value());
+
+    const std::string lf = "apiVersion: yuzu.io/v1alpha1\n"
+                           "kind: Policy\n"
+                           "displayName: Line Ending Policy\n"
+                           "fragment: " +
+                           frag.value() +
+                           "\n"
+                           "scope:\n"
+                           "  selector:\n"
+                           "    platform: Windows\n"
+                           "\n"
+                           "    tags:\n"
+                           "      - prod\n"
+                           "triggers:\n"
+                           "  - type: interval\n"
+                           "    interval_seconds: 300\n"
+                           "\n"
+                           "  - type: interval\n"
+                           "    interval_seconds: 600\n";
+    auto with_eol = [](const std::string& s, const std::string& eol) {
+        std::string out;
+        for (char c : s)
+            out += (c == '\n') ? eol : std::string(1, c);
+        return out;
+    };
+    std::string mixed = lf;
+    mixed.replace(mixed.find("Windows\n\n"), 9, "Windows\n\r\n");
+    std::string commented = lf;
+    commented.replace(commented.find("Windows\n\n"), 9, "Windows\n# prod only\n");
+
+    const std::pair<const char*, std::string> cases[] = {
+        {"LF", lf},
+        {"CRLF", with_eol(lf, "\r\n")},
+        {"lone CR inside LF",
+         [&] {
+             std::string d = lf;
+             d.replace(d.find("Windows\n\n"), 9, "Windows\n\r");
+             return d;
+         }()},
+        {"mixed", mixed},
+        {"LF comment line", commented},
+    };
+    for (const auto& [label, yaml] : cases) {
+        INFO("case: " << label);
+        auto result = store.create_policy(yaml);
+        REQUIRE(result.has_value());
+        auto pol = store.get_policy(result.value());
+        REQUIRE(pol.has_value());
+        REQUIRE(pol->has_value());
+        CHECK((*pol)->scope_expression == "ostype == \"windows\" AND EXISTS tag:prod");
+        CHECK((*pol)->triggers.size() == 2);
+    }
+}
+
+// #2123 security review. Placement-neutral on purpose: managementGroups'
+// accepted location is an open question on #2123, so these assert only what
+// must NOT be absorbed, never which nested managementGroups is read.
+TEST_CASE("PolicyStore: list extent never widens groups or drops tags (#2123)",
+          "[policy_store][pg][policy][scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PolicyStore store{pool};
+    auto frag = store.create_fragment(kFullFragment);
+    REQUIRE(frag.has_value());
+    const std::string head = "apiVersion: yuzu.io/v1alpha1\n"
+                             "kind: Policy\n"
+                             "displayName: Extent Policy\n"
+                             "fragment: " +
+                             frag.value() + "\n";
+
+    SECTION("an outer list's item is refused, never absorbed as a management group") {
+        auto result = store.create_policy(head + "spec:\n"
+                                                 "  things:\n"
+                                                 "    - name: a\n"
+                                                 "      managementGroups:\n"
+                                                 "        - g1\n"
+                                                 "    - g2\n");
+        // The outer item is kept raw by the scanner and refused as a group id:
+        // never stored as group `g2` (governance G3-QE-3: assert the outcome,
+        // not a loop that passes on an empty list).
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error().find("is not a management group id") != std::string::npos);
+    }
+    // An inline list that does not close on its key's line becomes one raw item.
+    // A management group id outside the scope-token charset is now refused, so a
+    // broken groups list is a 400, never a policy silently targeting nobody or
+    // overriding its selector (governance G4-UP-1, G4-UP-2, G3-ARCH-F1).
+    SECTION("comment text in a multi-line flow groups list is refused, never a group") {
+        auto result =
+            store.create_policy(head + "managementGroups: [g1,  # canary, prod-all,\n  g2]\n");
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error().find("is not a management group id") != std::string::npos);
+    }
+    SECTION("a valid multi-line flow groups list is refused, not silently zero targets") {
+        auto result = store.create_policy(head + "managementGroups: [g1,\n  g2]\n");
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error().find("is not a management group id") != std::string::npos);
+    }
+    SECTION("an unterminated groups list never overrides a valid selector") {
+        auto result = store.create_policy(head + "scope:\n"
+                                                 "  selector:\n"
+                                                 "    platform: windows\n"
+                                                 "    tags: [prod]\n"
+                                                 "managementGroups: [g1");
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error().find("is not a management group id") != std::string::npos);
+    }
+    SECTION("an unterminated tags list is rejected, never stored without the tag") {
+        auto result = store.create_policy(head + "scope:\n"
+                                                 "  selector:\n"
+                                                 "    platform: windows\n"
+                                                 "    tags: [prod\n"
+                                                 "other: [x]\n");
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error().find("selector.tags entry '[prod'") != std::string::npos);
+        CHECK(result.error().find("same line") != std::string::npos);
+    }
+    SECTION("a misindented tag item is rejected, never stored without the tag") {
+        auto result = store.create_policy(head + "scope:\n"
+                                                 "  selector:\n"
+                                                 "    platform: windows\n"
+                                                 "    tags:\n"
+                                                 "   - prod\n");
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error().find("indentation") != std::string::npos);
+    }
+    SECTION("managementGroups: null is no groups, and a scalar group id is refused") {
+        // Governance Gate 8 A1 / UP-A / UP-B: a YAML null is an empty list (the
+        // selector applies); any other scalar is refused, never read as a group
+        // that replaces the selector.
+        auto none = store.create_policy(head + "scope:\n  selector:\n    platform: windows\n"
+                                               "managementGroups: null\n");
+        REQUIRE(none.has_value());
+        auto pol = store.get_policy(none.value());
+        REQUIRE(pol.has_value());
+        REQUIRE(pol->has_value());
+        CHECK((*pol)->management_groups.empty());
+        CHECK((*pol)->scope_expression == "ostype == \"windows\"");
+        auto scalar = store.create_policy(head + "managementGroups: abc123def456\n");
+        REQUIRE_FALSE(scalar.has_value());
+        CHECK(scalar.error().find("is not a management group id") != std::string::npos);
+    }
+    SECTION("a scalar managementGroups inside a description block is refused") {
+        // Round 4 quality-engineer: pins UP-B's placement end to end.
+        auto r = store.create_policy(head + "description: |\n  managementGroups: abc123def456\n"
+                                            "scope:\n  selector:\n    platform: windows\n");
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().find("is not a management group id") != std::string::npos);
+    }
+    SECTION("managementGroups null followed by a list line is refused") {
+        // Round 4 R4-1 / UP-F: the null must not hide the line after it.
+        auto r = store.create_policy(head + "scope:\n  selector:\n    platform: windows\n"
+                                            "managementGroups: null\n  - abc123def456\n");
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().find("is not a management group id") != std::string::npos);
+    }
+    SECTION("a hyphen inside a comment does not drop the triggers") {
+        // Governance G4-TRIG-1: the trigger splitter used the first '-' in the
+        // section, comments included, so dash_indent was wrong and no trigger
+        // was stored (the interval fell back to the default).
+        auto result = store.create_policy(head + "triggers:\n"
+                                                 "  # re-check every 5-min\n"
+                                                 "  - type: interval\n"
+                                                 "    interval_seconds: 300\n");
+        REQUIRE(result.has_value());
+        auto pol = store.get_policy(result.value());
+        REQUIRE(pol.has_value());
+        REQUIRE(pol->has_value());
+        REQUIRE((*pol)->triggers.size() == 1);
+        CHECK((*pol)->triggers[0].config_json.find("300") != std::string::npos);
+    }
 }
 
 TEST_CASE("PolicyStore: scope.fromResultSet is rejected for policies (deferred to PR-E2)",

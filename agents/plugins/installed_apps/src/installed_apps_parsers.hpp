@@ -2,7 +2,7 @@
 
 // installed_apps_parsers.hpp -- pure parse helpers for the `list`/`query`/
 // `list_per_user` acquisition legs of installed_apps_plugin.cpp (the
-// `list_inventory` v2-row parsers already live in installed_apps_inventory.hpp
+// `list_inventory` row parsers already live in installed_apps_inventory.hpp
 // and are unchanged by this header).
 //
 // Header-only and OS-free so every parser here is fixture-tested on any host
@@ -416,6 +416,13 @@ constexpr long kErrorNoMoreItems = 259;
     return HiveRead::failed;
 }
 
+// Whether one root's read degrades the whole walk: only a failed read, and only on a root that is
+// machine scope. The agent identity's own HKCU is per-user data, so its failure is logged
+// (WalkResult::failed_roots) but never degrades the machine-scope collection.
+[[nodiscard]] constexpr bool walk_degrades(HiveRead read, bool root_degrades_walk) noexcept {
+    return read == HiveRead::failed && root_degrades_walk;
+}
+
 // ── Degraded-acquisition contract (every OS) ────────────────────────────────
 // ONE place declares what a degraded acquisition looks like to the caller, so
 // list / query / list_per_user / list_inventory cannot drift. Templated on the
@@ -478,10 +485,12 @@ void report_hive_file_refused(Ctx& ctx, std::string_view sid, std::string_view t
         yuzu::util::safe_output_field(yuzu::util::sanitize_utf8(std::string(token)))));
 }
 
-// list_inventory: a degraded collection emits NO rows and returns rc 1 (the
-// daily sync, sync_source_installed_software.cpp, skips the cycle on any
-// nonzero rc, so a partial snapshot is never committed as authoritative).
-// `fmt` renders one record to its wire row; a record with no name is dropped.
+// list_inventory: a degraded collection emits NO rows and returns rc 1 (the daily sync,
+// sync_source_installed_software.cpp, reports the facet constrained on any nonzero rc, so a
+// partial snapshot is never committed as authoritative); a clean pass declares OK / FULL, the
+// completeness signal the sync's gate reads (an undeclared answer is UNKNOWN, never FULL).
+// `fmt` renders one record to its wire row; a record with no name is dropped. This is the one
+// chokepoint every OS leg reaches (registry_walk.hpp, the macOS and Linux collectors).
 template <class Ctx, class Rec, class Fmt>
 int emit_inventory(Ctx& ctx, bool degraded, const std::vector<Rec>& records, Fmt&& fmt) {
     if (degraded) {
@@ -493,6 +502,7 @@ int emit_inventory(Ctx& ctx, bool degraded, const std::vector<Rec>& records, Fmt
             continue;
         ctx.write_output(fmt(r));
     }
+    ctx.set_result_status(YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_FULL, "");
     return 0;
 }
 
@@ -505,10 +515,13 @@ int emit_inventory(Ctx& ctx, bool degraded, const std::vector<Rec>& records, Fmt
 // no defined order (std::sort is unstable), exactly as at base -- that survivor
 // choice is NOT made deterministic here, because doing so could move a hashed
 // row on a host with duplicates.
-// The one `list`-only layer sits between the sort and unique(): the survivor's
+// The one location layer sits between the sort and unique(): the survivor's
 // install_location becomes the lexicographically smallest populated location in
 // its run, so the value is the same whatever order the sort left the run in and
-// a '-' never shadows a path another hive holds. No other field moves.
+// a '-' never shadows a path another hive holds. No other field moves. Since the
+// `inv|` row carries install_location as its 14th token, this deterministic
+// survivor is what the daily sync hashes (the agent core then keeps it only under
+// a machine root).
 // Templated because the plugin's AppInfo aliases AppRowFields; any record with
 // name/version/install_location std::string members qualifies. Pure, so the
 // whole pipeline is tested on every host with the plugin's own instantiation.

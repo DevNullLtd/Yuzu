@@ -27,6 +27,8 @@
 /// the legacy file so an environment where "no production fleet" turns out
 /// to be locally wrong gets a loud signal instead of silent loss.
 
+#include "approval_request_limits.hpp" // kMaxRequestJsonBytes
+
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -262,11 +264,8 @@ struct Approval {
     std::string row_position;
 };
 
-/// Bounds on a bound ticket's frozen request (#6062). `request_json` is returned by
-/// every list/read of the table and rendered on the Approvals page, so it is capped;
-/// a request that does not fit is refused at mint, never truncated (a truncated
-/// request is a different request than the one that will be redeemed).
-inline constexpr std::size_t kMaxRequestJsonBytes = 16 * 1024;
+/// Bounds on a bound ticket's frozen request (#6062). `kMaxRequestJsonBytes` (the size cap) lives
+/// in approval_request_limits.hpp so the page renderer need not include this header.
 inline constexpr std::size_t kMaxRequestJsonDepth = 16; ///< nesting limit of the frozen request
 inline constexpr std::size_t kMaxExcludedRoots = 32;
 inline constexpr std::size_t kMaxExcludedRootBytes = 256;
@@ -674,6 +673,16 @@ public:
            ApprovalOrigin origin, std::string target_plugin = {},
            std::string target_action = {});
 
+    /// `submit()` with the refusal kept TYPED (`SubmitFailure`), for a caller that must answer a
+    /// full queue (`kQueueFull`: only a reviewer or the 7-day expiry clears it) differently from
+    /// a store fault (`kStoreError`: a retry may succeed). The same mint body: `submit()` is a
+    /// thin wrapper that drops the kind.
+    [[nodiscard]] std::expected<std::string, SubmitError>
+    submit_typed(const std::string& definition_id, const std::string& submitted_by,
+                 const std::string& scope_expression, const std::string& schedule_id,
+                 ApprovalOrigin origin, std::string target_plugin = {},
+                 std::string target_action = {});
+
     /// Mint a ticket that BINDS the exact reviewed effect (#6062, four-eyes MVP PR2).
     /// `bound.request_json` and its SHA-256 digest (computed here, so the two cannot
     /// disagree) and `bound.excluded_roots` are frozen on the row at INSERT; no later
@@ -782,11 +791,21 @@ public:
     /// identical to a real "zero pending approvals" state.
     std::expected<int, StoreReadError> pending_count_checked() const;
 
-    /// Count of PENDING approvals submitted by one principal. Backs the MCP
-    /// mint's per-submitter sub-cap (governance sec8-MEDIUM-1): dedup alone does
-    /// not stop an adaptive flood (a nonce key defeats the args-hash), so the
-    /// mint bounds any single supervised token's share of the GLOBAL cap.
-    int pending_count_for(const std::string& submitted_by) const;
+    /// Count of UNEXPIRED PENDING approvals submitted by one principal, with a store fault kept
+    /// apart from a genuine zero (an empty `submitted_by` is a genuine 0). Backs the per-principal
+    /// sub-cap (governance sec8-MEDIUM-1) at both cap sites (REST/MCP instruction execute, the MCP
+    /// tier-ticket mint): dedup alone does not stop an adaptive flood (a nonce key defeats the
+    /// args-hash), so the cap bounds any single principal's share of the GLOBAL queue.
+    ///
+    /// A pending row older than `kApprovalTicketTtlSeconds` (database clock) is excluded even if
+    /// `submit()`'s lazy sweep has not yet flipped it to 'expired': it is stale (nobody reviewed
+    /// it within the window), and since the sweep only runs inside a submit that the cap itself
+    /// would refuse, counting it would lock a principal out of every approval-gated tool until
+    /// someone else happened to submit. The admission decision is FAIL-CLOSED on a fault (a cap
+    /// that read 0 on a fault would admit everyone exactly when the store is struggling); there is
+    /// deliberately no fail-open sibling.
+    std::expected<int, StoreReadError>
+    pending_count_for_checked(const std::string& submitted_by) const;
 
     std::expected<void, std::string> approve(const std::string& id, const std::string& reviewer,
                                              const std::string& comment);

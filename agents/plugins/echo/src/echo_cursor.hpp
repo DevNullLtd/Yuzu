@@ -42,12 +42,18 @@
 //     1432 -> 1352 records mid-capture (the provider recycled/wrapped the
 //     channel) -- a real, not hypothetical, log-wrap.
 //
-//  3. Replay idempotence comes from the UNIQUE `record_key` column + INSERT OR
-//     IGNORE (echo_db.hpp/.cpp), never from cursor arithmetic. A cursor that is
-//     re-read from a slightly earlier position than strictly necessary (e.g.
-//     after rule 2's re-baseline, or a retry) must never double-insert -- the
-//     database's unique index is the single source of truth for "have I
-//     already stored this event", not any offset math a source might do.
+//  3. Replay idempotence comes from the fold's digest-checked replay ring
+//     (`echo_fold_seen`, EchoFold::fold_cursor_rows in echo_fold.hpp: the newest
+//     kReplayRingDepth = 4096 record_keys per source with their identity
+//     digests), never from cursor arithmetic. A cursor that is re-read from a
+//     slightly earlier position than strictly necessary (e.g. after rule 2's
+//     re-baseline, or a retry) must never double-fold -- the ring is the single
+//     source of truth for "have I already folded this event", not any offset
+//     math a source might do. The ring is BOUNDED: a record re-offered after
+//     4096 newer keys of its source folds again (a summed measure double
+//     counts; max, min and last do not), and a reused key with a different
+//     digest is a permanent KeyCollision error. There is no raw table and no
+//     UNIQUE column any more.
 //
 //     TWO INVARIANTS THIS PLACES ON YOU, because the store VERIFIES the claim
 //     rather than trusting it. A key that is already present is only accepted
@@ -89,8 +95,8 @@
 //     name, never one row per input.
 //
 //  4b. FREE-TEXT FIELDS ARE THE SOURCE'S RESPONSIBILITY, AND THE SEAM DOES NOT
-//     REDACT FOR YOU. `removable_live.image_path` and `evidence` are free text
-//     and the atomic inserts write them verbatim. The user manual states the
+//     REDACT FOR YOU. `RemovableEvent::image_path` and `evidence` are free text
+//     and the fold writes the ones a tier keeps verbatim. The user manual states the
 //     built-in redaction patterns are "enforced on every collect path"; that is
 //     a claim about the SOURCE, because this seam has no hook. So:
 //

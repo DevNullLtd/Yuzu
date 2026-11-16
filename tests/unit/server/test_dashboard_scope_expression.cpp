@@ -25,16 +25,26 @@
 #include "dashboard_routes.hpp"
 #include "test_route_sink.hpp"
 
+#include "agent_registry.hpp"
 #include "dispatch_destructive_gate.hpp"
 #include "dispatch_target_shape.hpp"
+#include "event_bus.hpp"
+#include "instruction_store.hpp"
 #include "mcp_input_bounds.hpp"
+#include "pg/pg_pool.hpp"
 #include "test_real_capability_registry.hpp"
 
-#include <catch2/catch_test_macros.hpp>
+#include "../test_helpers.hpp"
 
+#include <catch2/catch_test_macros.hpp>
+#include <nlohmann/json.hpp>
+
+#include <iterator>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -58,6 +68,10 @@ struct AuditRow {
 // Member order is load-bearing: `sink` last so it is destroyed first.
 struct Harness {
     yuzu::MetricsRegistry metrics;
+    // Only the built-in `help` command needs a registry (it renders the registry's help table);
+    // every other case runs with none, exactly as before.
+    detail::EventBus bus;
+    std::unique_ptr<detail::AgentRegistry> registry;
     DashboardRoutes routes;
     yuzu::server::test::TestRouteSink sink;
     std::vector<DispatchCall> calls;
@@ -65,11 +79,14 @@ struct Harness {
     std::vector<AuditRow> persisted; // rows that went through the persist-reporting sink
     std::vector<std::string> order;  // "audit:<result>" / "dispatch", in call order
     bool persist_ok = true;          // false = the audit store refuses the row
+    bool audit_ok = true;            // false = the store refuses rows written through audit_fn
     std::string auth_source{"local"}; // the resolved session's source ("local" = cookie session)
     int sent = 3;
     std::pair<std::string, std::string> resolve_to{kReadOnly.first, kReadOnly.second};
 
-    Harness() {
+    explicit Harness(bool with_registry = false, InstructionStore* instruction_store = nullptr) {
+        if (with_registry)
+            registry = std::make_unique<detail::AgentRegistry>(bus, metrics);
         auto auth_fn = [this](const httplib::Request&,
                               httplib::Response&) -> std::optional<auth::Session> {
             auth::Session s;
@@ -83,6 +100,7 @@ struct Harness {
         auto audit_fn = [this](const httplib::Request&, const std::string& a, const std::string& r,
                                const std::string&, const std::string&, const std::string& d) {
             audits.push_back({a, r, d});
+            return audit_ok;
         };
         DashboardRoutes::DispatchFn dispatch =
             [this](const std::string& plugin, const std::string& action,
@@ -95,14 +113,13 @@ struct Harness {
         };
         routes.register_routes(
             sink, auth_fn, perm_fn, audit_fn, /*response_store=*/nullptr, /*mg=*/nullptr,
-            /*registry=*/nullptr, /*tag_store=*/nullptr, /*event_bus=*/nullptr,
+            registry.get(), /*tag_store=*/nullptr, /*event_bus=*/nullptr,
             [] { return std::string{"[]"}; }, dispatch,
             [](const httplib::Request&) -> yuzu::server::DispatchCaller {
                 return yuzu::server::DispatchCaller{.principal = "expr-op",
                                                     .exec_visible = std::nullopt};
             },
-            [this](const std::string&) { return resolve_to; }, &metrics,
-            /*instruction_store=*/nullptr);
+            [this](const std::string&) { return resolve_to; }, &metrics, instruction_store);
         routes.set_capability_classify_fn(yuzu::test::real_classify_fn());
         routes.set_persist_audit_fn([this](const httplib::Request&, const std::string& a,
                                            const std::string& r, const std::string&,
@@ -165,6 +182,16 @@ std::string enc(const std::string& s) {
 bool contains(const std::string& hay, std::string_view needle) {
     return hay.find(needle) != std::string::npos;
 }
+
+// Same key as test_dashboard_results_fragment.cpp's instruction-store template (one migration run
+// across the suite; shared keys are verified by structural replay).
+yuzu::test::PgTestTemplate dashboard_exec_instr_tpl{
+    "dashfraginstr", [](const std::string& dsn) {
+        yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+        InstructionStore store{pool};
+        if (!store.is_open())
+            throw std::runtime_error("dashboard_exec_instr template: store failed to migrate");
+    }};
 
 } // namespace
 
@@ -364,14 +391,73 @@ TEST_CASE("scope_expression audit: an unwired persist sink refuses rather than d
     CHECK(h.calls.empty());
 }
 
-TEST_CASE("scope_expression audit: refusals burn no attempted row, and plain sends skip the sink",
-          "[server][dashboard][execute][scope_expression][audit]") {
+// #3619 flipped the second half of this case. It used to pin that a plain (non-expression) send
+// SKIPPED the persist sink; ADR-0033 section 9 ("no audit row, no mutation") applies to every
+// console send, so a plain send now writes its own `attempted` row before dispatching. Refusals
+// still burn none.
+TEST_CASE("scope_expression audit: refusals burn no attempted row, and a plain send writes one "
+          "before dispatching",
+          "[server][dashboard][execute][scope_expression][audit][3619]") {
     Harness h;
     h.post("instruction=version&scope_expression=" + enc(R"(ostypo != "windows")"));
     h.post("instruction=version&scope=__all__&scope_expression=" + enc(R"(ostype == "windows")"));
-    h.post("instruction=version&scope=agent-1");
     CHECK(h.persisted.empty());
-    CHECK(h.order == std::vector<std::string>{"dispatch"});
+    CHECK(h.order.empty());
+    h.post("instruction=version&scope=agent-1");
+    REQUIRE(h.persisted.size() == 1);
+    CHECK(h.persisted[0].action == "command.dispatch");
+    CHECK(h.persisted[0].result == "attempted");
+    CHECK(contains(h.persisted[0].detail, "os_info:os_version"));
+    CHECK_FALSE(contains(h.persisted[0].detail, "scope_expression="));
+    CHECK(h.order == std::vector<std::string>{"audit:attempted", "dispatch"});
+}
+
+TEST_CASE("dashboard execute audit (#3619): a plain send whose attempted row is not stored "
+          "dispatches NOTHING",
+          "[server][dashboard][execute][audit][security][3619]") {
+    Harness h;
+    h.persist_ok = false;
+    for (const std::string body : {"instruction=version&scope=agent-1", "instruction=version"}) {
+        INFO(body);
+        auto res = h.post(body);
+        CHECK(res->status == 503);
+        CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+        CHECK(contains(res->body, "audit_unavailable"));
+        CHECK_FALSE(res->has_header("X-Yuzu-Dispatched"));
+    }
+    CHECK(h.calls.empty());
+    CHECK(h.rows("command.dispatch", "success") == 0);
+}
+
+TEST_CASE("dashboard execute audit (#3619): an unwired persist sink refuses a plain send",
+          "[server][dashboard][execute][audit][security][3619]") {
+    Harness h;
+    h.routes.set_persist_audit_fn({});
+    auto res = h.post("instruction=version&scope=agent-1");
+    CHECK(res->status == 503);
+    CHECK(h.calls.empty());
+}
+
+TEST_CASE("dashboard execute audit (#3619): a success row that is not stored keeps the send and "
+          "flags the response",
+          "[server][dashboard][execute][audit][3619]") {
+    Harness h;
+    h.audit_ok = false;
+    auto res = h.post("instruction=version&scope=agent-1");
+    CHECK(res->status == 200);
+    CHECK(res->has_header("X-Yuzu-Dispatched"));
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK(h.calls.size() == 1);
+}
+
+TEST_CASE("dashboard execute audit (#3619): a zero-reach failure row that is not stored is flagged",
+          "[server][dashboard][execute][audit][3619]") {
+    Harness h;
+    h.sent = 0;
+    h.audit_ok = false;
+    auto res = h.post("instruction=version&scope_expression=" + enc(R"(ostype == "windows")"));
+    CHECK(h.rows("command.dispatch", "failure") == 1);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
 }
 
 TEST_CASE("scope_expression audit: a send that reaches no agent records a failure outcome",
@@ -450,6 +536,87 @@ TEST_CASE("dashboard execute: only a dispatched send carries X-Yuzu-Dispatched, 
     }
 }
 
+// ── #5677 / #6075: a Send (or help) replaces the results, so it aborts the old request ─────
+
+TEST_CASE("dashboard execute: a dispatch aborts an in-flight results request and replaces the "
+          "pager",
+          "[server][dashboard][execute][sync]") {
+    Harness h;
+    auto res = h.post("instruction=version&scope=__all__");
+    REQUIRE(res->status == 200);
+    REQUIRE(h.calls.size() == 1);
+    const std::string cmd = "cmd-1";
+
+    // HX-Trigger is JSON: the toast first, the abort LAST (htmx keeps a key's target for the keys
+    // after it, so an earlier target:#filter-bar would retarget the toast too).
+    const auto trigger = nlohmann::ordered_json::parse(res->get_header_value("HX-Trigger"));
+    REQUIRE(trigger.is_object());
+    REQUIRE(trigger.size() == 2);
+    CHECK(trigger.begin().key() == "showToast");
+    CHECK(std::prev(trigger.end()).key() == "htmx:abort");
+    CHECK(trigger.at("htmx:abort").at("target") == "#filter-bar");
+
+    CHECK(contains(res->body, "<nav id=\"result-pagination\" hx-swap-oob=\"true\"></nav>"));
+    // The initializer exists for every dispatch, with or without a definition.
+    CHECK(contains(res->body, "<div id=\"chart-deck-host\" hx-swap-oob=\"true\" "
+                              "hx-get=\"/fragments/results?command_id=" + cmd +
+                                  "&amp;plugin=os_info\" hx-trigger=\"load delay:2s\" "
+                                  "hx-swap=\"none\"></div>"));
+    // Residual tripwire: there is no sort/page control in the placeholder window, so nothing in
+    // the dispatch body may re-read the filter bar (it would race the abort above).
+    CHECK_FALSE(contains(res->body, "hx-include=\"#filter-bar\""));
+}
+
+// The chart-deck initializer is how the first results fetch learns the definition the dispatch
+// resolved; with one, its request carries the id so the deck and the template columns follow.
+TEST_CASE("dashboard execute: the chart-deck initializer carries the definition the dispatch "
+          "resolved",
+          "[pg][server][dashboard][execute][sync]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dashboard_exec_instr_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore is{pool};
+    REQUIRE(is.is_open());
+    is.set_require_signed_definitions(false);
+    InstructionDefinition def;
+    def.name = "os-version-deck";
+    def.version = "1.0";
+    def.plugin = kReadOnly.first;
+    def.action = kReadOnly.second;
+    def.type = "question";
+    def.description = "definition resolved by the dispatch";
+    def.enabled = true;
+    def.platforms = "windows,linux,darwin";
+    def.approval_mode = "auto";
+    def.result_schema = R"([{"name":"hostname","type":"string"}])";
+    const auto id = is.create_definition(def);
+    REQUIRE(id.has_value());
+
+    Harness h(/*with_registry=*/false, &is);
+    auto res = h.post("instruction=version&scope=__all__");
+    REQUIRE(res->status == 200);
+    CHECK(contains(res->body, "hx-get=\"/fragments/results?command_id=cmd-1&amp;plugin=os_info"
+                              "&amp;definition_id=" + *id +
+                                  "\" hx-trigger=\"load delay:2s\" hx-swap=\"none\""));
+}
+
+TEST_CASE("dashboard execute: help aborts an in-flight results request and replaces the "
+          "previous command's chrome",
+          "[server][dashboard][execute][sync]") {
+    Harness h(/*with_registry=*/true);
+    auto res = h.post("instruction=help&scope=__all__");
+    REQUIRE(res->status == 200);
+    CHECK(res->get_header_value("HX-Trigger") == R"({"htmx:abort":{"target":"#filter-bar"}})");
+    // outerHTML (not innerHTML): replacing the element drops the previous command's pending
+    // hx-get / hx-trigger load (filter bar, chart-deck host) and clears the pager's view stamp.
+    CHECK(contains(res->body, "<nav id=\"result-pagination\" hx-swap-oob=\"true\"></nav>"));
+    CHECK(contains(res->body, "<div id=\"chart-deck-host\" hx-swap-oob=\"true\"></div>"));
+    CHECK(contains(res->body, "<div id=\"filter-bar\" hx-swap-oob=\"true\"></div>"));
+    CHECK_FALSE(contains(res->body, "<nav id=\"result-pagination\" hx-swap-oob=\"innerHTML\""));
+    CHECK_FALSE(contains(res->body, "<div id=\"chart-deck-host\" hx-swap-oob=\"innerHTML\""));
+    CHECK_FALSE(contains(res->body, "<div id=\"filter-bar\" hx-swap-oob=\"innerHTML\""));
+    CHECK(h.calls.empty());
+}
+
 // Same-site gate (browser_write_is_cross_site): a cookie session needs an Origin or Referer naming
 // this site. The refusal comes before any parsing, the audit-before-dispatch row and the dispatch.
 TEST_CASE("dashboard execute: a cookie-session write without a same-site Origin is refused",
@@ -507,4 +674,26 @@ TEST_CASE("dashboard execute: a same-site cookie-session write passes the gate",
     }
     CHECK(h.calls.size() == 1);
     CHECK(h.rows("csrf.denied", "denied") == 0);
+}
+
+TEST_CASE("dashboard execute audit (#3619): a plain send that reaches no agent records an "
+          "attempted row and a failure outcome",
+          "[server][dashboard][execute][audit][3619]") {
+    // qe-1 / CH-7: before #3619 only an expression send wrote the zero-reach failure row.
+    // Restoring that expression-only guard must turn this case red. hp-1: a send with NO
+    // `scope` field is the fleet by omission, and its attempted row says so.
+    Harness h;
+    h.sent = 0;
+    h.post("instruction=version");
+    REQUIRE(h.persisted.size() == 1);
+    CHECK(h.persisted[0].result == "attempted");
+    CHECK(h.persisted[0].detail == "os_info:os_version scope=__all__");
+    CHECK(h.order == std::vector<std::string>{"audit:attempted", "dispatch"});
+    int failures = 0;
+    for (const auto& a : h.audits)
+        if (a.action == "command.dispatch" && a.result == "failure") {
+            ++failures;
+            CHECK(a.detail == "reason=no_agents_reached");
+        }
+    CHECK(failures == 1);
 }

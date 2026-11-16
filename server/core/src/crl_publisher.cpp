@@ -123,7 +123,7 @@ std::optional<std::vector<std::uint8_t>> CrlPublisher::publish(bool background, 
                 // (or a validator on a still-catching-up host) reject as CRL_NOT_YET_VALID.
                 const auto build_now = now();
                 const pki::Validity validity{build_now - pki::kClockSkewBackdate,
-                                             build_now + std::chrono::hours(24 * 7)};
+                                             build_now + kCrlValidity};
                 auto der = pki::build_crl(root->cert_pem, *ca_key, revoked, validity, number);
                 if (!der) {
                     spdlog::error("PKI: build_crl failed for CRL v{}", number);
@@ -204,7 +204,9 @@ CrlPublisher::FreshnessDecision CrlPublisher::decide_freshness_tick() const {
     const auto now_epoch =
         std::chrono::duration_cast<std::chrono::seconds>(now().time_since_epoch()).count();
     auto latest = d_.ca_store->latest_crl();
-    const bool stale = !latest || (latest->next_update - now_epoch) < 24 * 3600;
+    const auto threshold_s =
+        std::chrono::duration_cast<std::chrono::seconds>(kCrlRepublishThreshold).count();
+    const bool stale = !latest || (latest->next_update - now_epoch) < threshold_s;
     if (stale)
         return {.act = true, .reason = CrlTrigger::Freshness};
     // HA WS-6 6.1 (UP-1): also re-publish when the latest CRL was not built from the current

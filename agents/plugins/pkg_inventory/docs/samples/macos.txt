@@ -1,4 +1,4 @@
-captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-10-14 · euid 501 · leg-hash 5e3ad4e08431
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-10-14 · euid 501 · leg-hash 1b03567381e2
 == action=managers
 status|managers|supported|-
 manager|homebrew|present|-|/opt/homebrew|taps=0;formulae=69;casks=0|-

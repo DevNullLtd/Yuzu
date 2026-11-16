@@ -106,6 +106,8 @@ EXPECTED_FAMILIES = {
             "server/core/src/dex_read_model.hpp",
             "server/core/src/dex_api.hpp",
             "server/core/src/dex_api_local.hpp",
+            "server/core/src/dex_apps_ui.hpp",
+            "server/core/src/dex_apps_ui.cpp",
         ],
     },
     "dex_perf": {
@@ -246,10 +248,11 @@ S0_DELIBERATELY_NOT_STORE_DEFINITION_FREE = [
 # is a loud edit here (and to MIN_REGISTRY_FILES in check-api-parity.py and kRegistryDomainFiles in the
 # C++ dispatch test), never a silent widening.
 EXPECTED_MCP_REGISTRY_TU_GLOB = "mcp_tools_*.cpp"
-EXPECTED_MCP_REGISTRY_TU_COUNT = 4
+EXPECTED_MCP_REGISTRY_TU_COUNT = 5
 EXPECTED_MCP_REGISTRY_CPPS = [
     "server/core/src/mcp_tools_containment.cpp",
     "server/core/src/mcp_tools_crypto.cpp",
+    "server/core/src/mcp_tools_dex.cpp",
     "server/core/src/mcp_tools_discovery.cpp",
     "server/core/src/mcp_tools_hardware.cpp",
 ]

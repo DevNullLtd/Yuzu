@@ -492,9 +492,11 @@
         var a = e.target.closest('a[data-ref]');
         if (!a || !st || !plainClick(e)) return;
         e.preventDefault();
-        st.ref = a.getAttribute('data-ref');
-        markOn(st.ref);
+        var ref = a.getAttribute('data-ref');
+        markOn(ref);
+        st.ref = null; // the stop below flushes the moment panel only; the one selected request is made here
         stopPlayback(true); // a selection change is a manual action: the line stops, the panels catch up
+        st.ref = ref;
         request(selected, tl.selectedUrl(run.getAttribute('data-selected-url') || '', st.ref, st.t));
       });
       if (copyBtn) copyBtn.addEventListener('click', onCopy);

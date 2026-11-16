@@ -39,24 +39,25 @@ Modes are layered: `--full` includes everything `default` runs, `default` includ
 The skill runs on both **Linux** (CI, WSL2) and **macOS** (operator dev box). The orchestration prefers a single OS-aware script per concern over OS-specific forks:
 
 - Build dir is `build-linux` on Linux, `build-macos` on macOS — `scripts/setup.sh` auto-picks. The skill computes `BUILDDIR=build-$(host_os)` (with `darwin → macos`) via `scripts/test/_portable.sh` and uses `$BUILDDIR` everywhere.
-- Stack stand-up (Phase 4) calls `scripts/start-UAT.sh` — cross-platform; the historical `start-UAT.sh` name is a back-compat shim.
+- Stack stand-up (Phase 4) calls `scripts/start-UAT.sh` — Linux only since ADR-0035 step 3 (macOS builds no native server; see the end of the paragraph after "What skips on macOS"); the historical `start-UAT.sh` name is a back-compat shim.
 - Port checks, disk-free, loadavg/CPU/mem fingerprints all go through `scripts/test/_portable.sh` (lsof + sysctl on macOS, ss + /proc on Linux).
 
 **Security E2E prerequisite:** curl >= 7.68 (>= 7.84 for the Retry-After check; an older curl skips that one assertion, below 7.68 the gate fails with an explicit message).
 
-**macOS prerequisites:** GNU bash 5+ (`brew install bash` — stock /bin/bash 3.2 doesn't support `mapfile`/`declare -A`), kerl-installed Erlang, vcpkg with `VCPKG_ROOT` set, OrbStack or Docker Desktop installed (and launched once so its CLI symlinks populate `~/.orbstack/bin`).
+**macOS prerequisites:** GNU bash 5+ (`brew install bash` — stock /bin/bash 3.2 doesn't support `mapfile`/`declare -A`), kerl-installed Erlang, vcpkg with `VCPKG_ROOT` set, OrbStack or Docker Desktop installed (and launched once so its CLI symlinks populate `~/.orbstack/bin`), and Node 22.12+ (Phase 0b installs the puppeteer dependencies and Chrome itself; the gcovr install and the coverage gate are Linux-only, so macOS needs nothing more).
 
 **What skips on macOS without a running Docker daemon:**
 - Phase 1 docker-image-build → SKIP (operator can build locally only what they need)
 - Phase 2 upgrade-test → SKIP via `test-upgrade-stack.sh`'s `docker_available` early-out, gate row records SKIP with operator-readable note
 - Phase 6 sanitizers → still dispatches to the `yuzu-bigtam-linux` self-hosted pool, unaffected by local Docker availability
 
-Everything else (Phase 0 preflight, Phase 1 C++ + Erlang build, Phase 4 native stack, Phase 5 unit/EUnit/dialyzer/CT/integration/e2e/synthetic-UAT/puppeteer, Phase 7a perf, Phase 8 teardown) runs natively on macOS. Phase 7b coverage is Linux-only: on macOS the gate refuses with a WARN row (#6187).
+Everything else (Phase 0 preflight, Phase 0b tooling, Phase 1 C++ + Erlang build, Phase 5 unit/EUnit/dialyzer, Phase 7a perf, Phase 8 teardown) runs natively on macOS. Phase 4 (native stack) and the live-stack Phase 5 gates (integration, e2e, synthetic-UAT, puppeteer, browser-smoke, and the CT real-upstream gate) need a native `yuzu-server`, which macOS no longer builds (ADR-0035 step 3), so on macOS they fail loudly until step 5: run them on the Linux stack. Phase 7b coverage is Linux-only: on macOS the gate refuses with a WARN row (#6187).
 
 ## Workflow summary
 
 ```
 Phase 0 — Preflight             (toolchains, ports, disk, docker, init DB)
+Phase 0b — Test tooling         (default/--full: puppeteer + Chrome proven to launch; gcovr pinned as CI)
 Phase 1 — Build HEAD            (meson + rebar3 + docker build local :test images)
 Phase 2 — Upgrade Test          (latest release → HEAD: fixtures, migrate, verify)
 Phase 3 — OTA Agent Test        (--full only — Linux + Windows self-exec)
@@ -70,7 +71,8 @@ Phase 4 — Fresh Stack Stand-up  (full-uat at HEAD + native agent — STAYS UP
                                  stack before /release)
 Phase 5 — Test Gates (parallel) (unit / EUnit / dialyzer / CT / integration /
                                  e2e-api / e2e-mcp / synthetic UAT /
-                                 puppeteer / instructions; e2e-security runs
+                                 puppeteer / browser-smoke /
+                                 instructions; e2e-security runs
                                  alone after the fan-out)
 Phase 6 — Sanitizers            (--full only — dispatched to yuzu-bigtam-linux pool)
 Phase 7b — Coverage             (--full only — enforces tests/coverage-baseline.json)
@@ -79,15 +81,15 @@ Phase 8 — Teardown + Summary    (cleans Phase 2 compose projects + scratch dir
                                  purpose — do NOT call start-UAT.sh stop)
 ```
 
-**Wall-clock order: 0, 1, 2, 3, 7a-perf, 4, 5, 6, 7b-coverage, 8.** Perf is intentionally pulled forward of Phase 4 because it has no functional dependency on the UAT stack (every upstream RPC is meck'd inside the suite, gateway components run in-process) but its measurements are extremely sensitive to CPU/scheduler contention. Running perf on a quiet box — after Phase 1 binaries exist but before Phase 2's docker compose, Phase 4's native server+gateway+agent, and Phase 5's parallel fan-out — gives the most-isolated environment available in the pipeline. DB phase numbers stay stable (`phase=7` for both perf and coverage) so the report table groups them together at the end; the wall-clock split is purely an isolation guarantee.
+**Wall-clock order: 0, 0b, 1, 2, 3, 7a-perf, 4, 5, 6, 7b-coverage, 8.** Perf is intentionally pulled forward of Phase 4 because it has no functional dependency on the UAT stack (every upstream RPC is meck'd inside the suite, gateway components run in-process) but its measurements are extremely sensitive to CPU/scheduler contention. Running perf on a quiet box — after Phase 1 binaries exist but before Phase 2's docker compose, Phase 4's native server+gateway+agent, and Phase 5's parallel fan-out — gives the most-isolated environment available in the pipeline. DB phase numbers stay stable (`phase=7` for both perf and coverage) so the report table groups them together at the end; the wall-clock split is purely an isolation guarantee.
 
 **Phase 8 leaves the UAT alive.** `scripts/test/teardown.sh` only stops Docker compose projects matching `yuzu-test-${RUN_ID}-*` (Phase 2 fixtures); it does not touch the native processes started by `start-UAT.sh`. This is deliberate: a successful `/test --full` run leaves a working UAT at the tested HEAD so humans can sanity-check it before cutting `/release`. Do **not** add `bash scripts/start-UAT.sh stop` to your orchestration — if the operator wants the stack down they can run it themselves.
 
-Phase 1 is the only mandatory-blocking phase — if HEAD doesn't compile, nothing else can run. Every other phase runs to completion regardless of upstream failures so the operator gets a prioritized fix list in one pass.
+Phases 0, 0b and 1 are the blocking phases — a failed preflight, a failed Puppeteer install (or, in `--full`, a failed gcovr install) or a HEAD that doesn't compile stops the run, because nothing after them can be trusted. Every other phase runs to completion regardless of upstream failures so the operator gets a prioritized fix list in one pass.
 
 **Every phase emits structured timing data into the test-runs DB.** Top-level gate timings land in `test_gates.duration_seconds`; sub-step timings (upgrade phases, OTA flow steps, individual command round-trips) land in `test_timings`. This is how trend analysis catches "Phase 2 upgrade got 3× slower since last week" without grepping log files.
 
-> **PR2 status.** Phases 0, 1, 2, 4, 5, 6, 7, 8 are wired. Phase 3 (cross-platform OTA self-exec) is still stubbed pending PR3; its gate rows record as `SKIP` with a "planned for PR3" note. Phase 6 (sanitizers) dispatches `.github/workflows/sanitizer-tests.yml` onto the `yuzu-wsl2-linux` self-hosted runner; if the runner is offline the gate records WARN and the rest of the run continues. Phase 7 coverage runs locally against `tests/coverage-baseline.json` (real captured numbers; the original PR2 `__seed: true` permissive baseline is gone). Phase 7 perf is **measure-and-report** as of 2026-05-03: the gate records `perf_*` metrics into the test-runs DB but no longer reads a baseline file or fails on regressions — see Phase 7a below and `docs/perf-baseline-calibration-2026-05-03.md`.
+> **PR2 status.** Phases 0, 0b, 1, 2, 4, 5, 6, 7, 8 are wired. Phase 3 (cross-platform OTA self-exec) is still stubbed pending PR3; its gate rows record as `SKIP` with a "planned for PR3" note. Phase 6 (sanitizers) dispatches `.github/workflows/sanitizer-tests.yml` onto the `yuzu-wsl2-linux` self-hosted runner; if the runner is offline the gate records WARN and the rest of the run continues. Phase 7 coverage runs locally against `tests/coverage-baseline.json` (real captured numbers; the original PR2 `__seed: true` permissive baseline is gone). Phase 7 perf is **measure-and-report** as of 2026-05-03: the gate records `perf_*` metrics into the test-runs DB but no longer reads a baseline file or fails on regressions — see Phase 7a below and `docs/perf-baseline-calibration-2026-05-03.md`.
 
 ## Step 0 — Initialise run state
 
@@ -121,7 +123,7 @@ bash scripts/test/test-db-write.sh run-start \
 
 Record `RUN_ID` in your scratch space so every subsequent gate call can reference it. The DB row is in `RUNNING` state until Phase 8 finalizes it.
 
-> **`--run-id` format.** Valid run ids match `[A-Za-z0-9._-]+` and must not be the bare `.` or `..`. The generated `"$(date +%s)-$$"` always satisfies this, as does a hand-supplied `--run-id manual` for coverage-baseline capture. An invalid run id (path separator, whitespace, shell/control char, `.`/`..`) is **rejected** (the Instructions runner is stricter, see "`--instructions` mode"): `test_db.py` and all three gate scripts print an error to stderr and exit `2`, and the gate scripts surface that as a gate FAIL. This guards the test-runs DB and its log root against path traversal — see the `[Unreleased]` Security entry in `CHANGELOG.md`.
+> **`--run-id` format.** Valid run ids match `[A-Za-z0-9._-]+` and must not be the bare `.` or `..`. The generated `"$(date +%s)-$$"` always satisfies this, as does the fresh `manual-<UUID>` generated when coverage-baseline capture omits `--run-id`. An invalid run id (path separator, whitespace, shell/control char, `.`/`..`) is **rejected** (the Instructions runner is stricter, see "`--instructions` mode"): `test_db.py` and all three gate scripts print an error to stderr and exit `2`, and the gate scripts surface that as a gate FAIL. This guards the test-runs DB and its log root against path traversal — see the `[Unreleased]` Security entry in `CHANGELOG.md`.
 
 ## Phase 0 — Preflight
 
@@ -145,6 +147,105 @@ bash scripts/test/test-db-write.sh gate \
     --status "$PRE_STATUS" --duration "$PREFLIGHT_DUR"
 [[ "$PRE_STATUS" == "FAIL" ]] && { bash scripts/test/teardown.sh --run-id "$RUN_ID" --status ABORTED; exit 1; }
 ```
+
+### Phase 0b — Test tooling (default and `--full` only; `--quick` has no live stack and the `--instructions*` modes need neither a browser nor coverage)
+
+The two headless-browser gates in Phase 5 need Node dependencies and a Chrome for Testing binary
+that are not committed. `/test` installs them rather than skipping the gates: a gate that skips for
+want of a one-line install silently stops protecting the dashboard. The script is idempotent (a
+ready box only verifies), and it proves the browser LAUNCHES headless, not merely that a file exists.
+
+The coverage gate (Phase 7b, report-only in default mode) needs `gcovr`. `ensure-gcovr.sh` installs what
+it installs with the hash-pinned file CI uses: `pip install --require-hashes` from `requirements-ci.txt`
+into a private virtualenv (`~/.local/share/yuzu/gcovr-venv`; CI installs with `--user`), so gcovr and every
+dependency are hash-verified, and links the one `gcovr` into `~/.local/bin`. (`pip3 install --user` fails on
+a distro Python that is externally managed, and a bare `pipx install gcovr==X` would leave the dependencies
+unpinned.) It passes when the `gcovr` your `PATH` resolves to (the lookup `coverage-gate.sh` itself does)
+reports the version `requirements-ci.in` pins and can produce the reports the gate asks for: a gcovr you
+already have at that version is used as it is (its integrity is then yours, not verified here), and only a
+missing, different or non-working one is replaced. A `~/.local/bin/gcovr` that is a regular file, or a link
+that does not point into this virtualenv, is never overwritten: the script refuses and prints the `rm`
+command to run yourself. It moves or deletes a directory (the virtualenv, a moved-aside copy of it) only when
+it can show the directory is its own: a marker with the script's token and a virtualenv layout, never a file
+name alone; `YUZU_GCOVR_VENV` must be an absolute path with no `.` or `..` segment. If a rebuild fails
+(pip, a timeout, Ctrl-C) the previous virtualenv is put back, and the last line of the log is the cause. It
+needs python3 3.10+ with `ensurepip` to install, and
+`~/.local/bin` on `PATH` (`export PATH="$HOME/.local/bin:$PATH"`): on a fresh account the directory may not
+exist at login, so the first run can install the tool and still report it is not on `PATH` until you
+re-login or add it. It does nothing off Linux, where the coverage gate does not measure.
+
+The Chrome for Testing archive is fetched over TLS from Google's CDN and is NOT hash-verified (no checksum is
+published); `npm ci` is lockfile-integrity-checked with lifecycle scripts disabled.
+
+First run side effects: a Chrome for Testing download into `~/.cache/puppeteer` (about 400 MB per build, shared
+by every worktree; old builds are not pruned), npm's cache in `~/.npm`, and the gcovr virtualenv (about 60 MB)
+under `~/.local/share/yuzu/`. Later runs only verify. A first run takes minutes on a normal link. Network
+steps run under timeouts (npm 600 s, browser 900 s, launch 60 s, pip 600 s; `YUZU_ENSURE_NPM_TIMEOUT`,
+`_BROWSER_TIMEOUT`, `_LAUNCH_TIMEOUT`, `YUZU_ENSURE_PIP_TIMEOUT` and `_LOCK_TIMEOUT` override), and a stalled
+connection that burns every timeout, with the retries, can hold Phase 0b for well over an hour (about 70
+minutes for the Puppeteer step alone; up to about two hours if another run holds the lock; Phase 0b as a
+whole up to about two and a half hours in that worst case). An interrupted install repairs itself on the
+next run (on Linux; a truncated macOS browser needs the manual step in `tests/puppeteer/README.md`).
+
+```bash
+if [[ "$MODE" == "default" || "$MODE" == "full" ]]; then
+    PPTR_START=$(date +%s)
+    bash scripts/test/ensure-puppeteer.sh > "$LOG_DIR/ensure-puppeteer.log" 2>&1 \
+        && PPTR_STATUS=PASS || PPTR_STATUS=FAIL
+    bash scripts/test/test-db-write.sh gate \
+        --run-id "$RUN_ID" --phase 0 --gate "Puppeteer install" \
+        --status "$PPTR_STATUS" --duration $(( $(date +%s) - PPTR_START )) \
+        --log "ensure-puppeteer.log" --notes "$(tail -n 1 "$LOG_DIR/ensure-puppeteer.log" | LC_ALL=C tr -cd '[:print:]')"
+    if [[ "$PPTR_STATUS" == "FAIL" ]]; then
+        cat "$LOG_DIR/ensure-puppeteer.log"
+        bash scripts/test/teardown.sh --run-id "$RUN_ID" --status ABORTED
+        exit 1
+    fi
+
+    # gcovr only matters to the coverage gate (Phase 7b), which measures on Linux alone. (`uname`, not
+    # the host_os function, so this block depends on nothing defined elsewhere.)
+    rm -f "$LOG_DIR/gcovr-unavailable"
+    if [[ "$(uname -s)" != "Linux" ]]; then
+        bash scripts/test/test-db-write.sh gate \
+            --run-id "$RUN_ID" --phase 0 --gate "gcovr install" \
+            --status SKIP --duration 0 --notes "the coverage gate measures on Linux only"
+    else
+        GCOVR_START=$(date +%s)
+        bash scripts/test/ensure-gcovr.sh > "$LOG_DIR/ensure-gcovr.log" 2>&1 \
+            && GCOVR_STATUS=PASS || GCOVR_STATUS=FAIL
+        # Default mode runs coverage report-only, so a host that cannot install gcovr (a python3
+        # older than 3.10, no route to PyPI) keeps the old behaviour: WARN and carry on. --full
+        # ENFORCES the coverage baseline, so there a missing gcovr stops the run.
+        if [[ "$GCOVR_STATUS" == "FAIL" && "$MODE" != "full" ]]; then
+            GCOVR_RECORD=WARN
+        else
+            GCOVR_RECORD=$GCOVR_STATUS
+        fi
+        bash scripts/test/test-db-write.sh gate \
+            --run-id "$RUN_ID" --phase 0 --gate "gcovr install" \
+            --status "$GCOVR_RECORD" --duration $(( $(date +%s) - GCOVR_START )) \
+            --log "ensure-gcovr.log" --notes "$(tail -n 1 "$LOG_DIR/ensure-gcovr.log" | LC_ALL=C tr -cd '[:print:]')"
+        if [[ "$GCOVR_STATUS" == "FAIL" ]]; then
+            cat "$LOG_DIR/ensure-gcovr.log"
+            if [[ "$MODE" == "full" ]]; then
+                bash scripts/test/teardown.sh --run-id "$RUN_ID" --status ABORTED
+                exit 1
+            fi
+            # Remember it for Phase 7b IN A FILE under the run's log directory (the one thing the runbook
+            # already carries between blocks): with no usable pinned gcovr the coverage gate must not
+            # run at all, or it would measure with whatever other gcovr is on PATH and record that as
+            # a figure.
+            : > "$LOG_DIR/gcovr-unavailable"
+            echo "gcovr unavailable: Phase 7b will not measure coverage (default mode is report-only)"
+        fi
+    fi
+fi
+```
+
+**On failure**: stop, like preflight, for the Puppeteer step (and for the gcovr step in `--full`; in default
+mode a gcovr failure is a WARN, because coverage is report-only there). The log's last line says what to do
+(no Node, no network to the npm registry, a missing shared library for Chrome, a python3 older than 3.10). An offline box can point
+`PUPPETEER_EXECUTABLE_PATH` at an existing Chrome for Testing binary.
 
 ## Phase 1 — Build HEAD
 
@@ -268,8 +369,8 @@ if [[ "$PHASE1_FAILS" -gt 0 ]]; then
 fi
 ```
 
-Phase 1 is the only mandatory-blocking phase. If HEAD doesn't compile,
-nothing else can run.
+Phases 0, 0b and 1 are the blocking phases. If preflight, the Puppeteer install (or, in `--full`,
+the gcovr install) or the HEAD build fails, nothing else can run.
 
 ## Phase 2 — Upgrade Test (the user's headline priority)
 
@@ -467,16 +568,16 @@ gate_run "Synthetic UAT" "synthetic-uat.log" \
         --gateway-metrics http://localhost:9568 \
         --run-id $RUN_ID --gate-name phase5-synthetic-uat"
 
-# Puppeteer is warn-only — flaky on first run. Its npm dependency is never installed by
-# the pipeline (tests/puppeteer/node_modules is gitignored), so a missing install is
-# recorded as SKIP with the fix, not as a permanent WARN; a WARN means it ran and failed.
+# Puppeteer is warn-only — flaky on first run. Phase 0b installs its dependencies and browser
+# (tests/puppeteer/node_modules is gitignored), so a missing install here means that step was
+# bypassed: record FAIL, never SKIP. A WARN means it ran and failed.
 (
     start=$(date +%s)
     if [[ ! -d tests/puppeteer/node_modules/puppeteer ]]; then
         bash scripts/test/test-db-write.sh gate \
             --run-id "$RUN_ID" --phase 5 --gate "Puppeteer" \
-            --status SKIP --duration 0 \
-            --notes "puppeteer not installed; run: (cd tests/puppeteer && npm ci)"
+            --status FAIL --duration 0 \
+            --notes "puppeteer not installed; Phase 0b should have run: bash scripts/test/ensure-puppeteer.sh"
     else
         if node tests/puppeteer/dashboard-help-test.mjs > "$LOG_DIR/puppeteer.log" 2>&1; then
             STATUS=PASS
@@ -489,6 +590,22 @@ gate_run "Synthetic UAT" "synthetic-uat.log" \
             --status "$STATUS" --duration "$DUR" --log "puppeteer.log"
     fi
 ) &
+
+# Browser smoke — unlike the legacy Puppeteer block above, a failure here is FAIL, not WARN:
+# the script is deterministic (no sleeps; stubbed writes, nothing reaches the stack). It
+# first runs --selftest (a local fixture, no stack: proves each crawl/overflow check can
+# fail; a failing selftest fails the gate), then crawls the shell nav (200 + CSP + no page
+# errors), checks submit-control bounds and runs the stubbed write scenarios. Phase 0b installs
+# puppeteer; if it is still absent here that step was bypassed, so FAIL rather than SKIP.
+if [[ ! -d tests/puppeteer/node_modules/puppeteer ]]; then
+    bash scripts/test/test-db-write.sh gate \
+        --run-id "$RUN_ID" --phase 5 --gate "Browser smoke" \
+        --status FAIL --duration 0 \
+        --notes "puppeteer not installed; Phase 0b should have run: bash scripts/test/ensure-puppeteer.sh" &
+else
+    gate_run "Browser smoke" "browser-smoke.log" \
+        "node tests/puppeteer/ui-smoke.mjs --selftest && node tests/puppeteer/ui-smoke.mjs"
+fi
 
 # Instructions content-suite gate — schema-driven REST exerciser.
 # Drives every default-risk (safe + mutating) InstructionDefinition and
@@ -652,7 +769,31 @@ The gate script:
 Coverage runs locally on the operator's dev box, at the end of the pipeline (after Phase 5 gates and Phase 6 sanitizer dispatch). It uses `${BUILDDIR}-coverage/` (separate from the main `${BUILDDIR}/` to keep ccache hit rates intact). Coverage is contention-tolerant — it's measuring code-execution coverage, not throughput, so the live UAT stack from Phase 4 doesn't affect the numbers. The earlier perf step (Phase 7a) already ran on a quiet box.
 
 ```bash
-if [[ "$MODE" == "full" ]]; then
+# Is the pinned gcovr still usable NOW? Phase 0b checked it, but the venv is shared by every worktree
+# and another one may have rebuilt it since, and a failure recorded in Phase 0b must hold. Re-running
+# the installer is a no-op when all is well. If gcovr is not usable the gate is not run at all, so a
+# different gcovr on PATH can never produce a figure that gets compared with the baseline.
+gcovr_usable() {
+    [[ "$(uname -s)" != "Linux" ]] && return 0      # coverage-gate.sh refuses off Linux on its own
+    [[ ! -e "$LOG_DIR/gcovr-unavailable" ]] \
+        && bash scripts/test/ensure-gcovr.sh > "$LOG_DIR/ensure-gcovr-7b.log" 2>&1
+}
+if ! gcovr_usable; then
+    # --full ENFORCES the coverage baseline, so "not measured" is a FAIL there, exactly as Phase 0b stops a
+    # --full run whose gcovr cannot be installed: recording a WARN would let a --full run that measured
+    # nothing finish as if coverage held (the overall status is FAIL when any gate is FAIL). Default mode
+    # is report-only, so it stays a WARN.
+    if [[ "$MODE" == "full" ]]; then COVERAGE_UNUSABLE=FAIL; else COVERAGE_UNUSABLE=WARN; fi
+    bash scripts/test/test-db-write.sh gate \
+        --run-id "$RUN_ID" --phase 7 --gate "Coverage" \
+        --status "$COVERAGE_UNUSABLE" --duration 0 \
+        --notes "not measured: the pinned gcovr is not usable (see the gcovr install row and the ensure-gcovr logs in the run's log directory)"
+    if [[ "$MODE" == "default" ]]; then
+        bash scripts/test/test-db-write.sh gate \
+            --run-id "$RUN_ID" --phase 7 --gate "Perf" \
+            --status SKIP --duration 0 --notes "perf measurement runs in --full only"
+    fi
+elif [[ "$MODE" == "full" ]]; then
     bash scripts/test/coverage-gate.sh --run-id "$RUN_ID"
 elif [[ "$MODE" == "default" ]]; then
     # Default mode: coverage in report-only (metric recorded, no enforce);
@@ -672,7 +813,7 @@ fi
 **Coverage baseline update workflow.**
 1. Make a change you believe deserves a new coverage baseline (coverage up, or an accepted trade-off).
 2. **Pre-flight**: a clean `meson test -C ${BUILDDIR}-coverage` must pass — the gate refuses `--capture-baselines` (FAIL row, note `refused --capture-baselines: inconclusive run (...)`) if tests fail or time out, libgcov reports counter-write errors, a stale `.gcda` cannot be deleted before the run, or the build filesystem is nearly full (UP-18 guard protecting you from anchoring a broken-environment baseline).
-3. Run `bash scripts/test/coverage-gate.sh --run-id manual --capture-baselines`. The script rewrites the JSON file with current numbers + `captured_at` + `captured_commit` and prints a diff of old-vs-new values before overwrite so you can sanity-check the direction.
+3. Run `bash scripts/test/coverage-gate.sh --capture-baselines`. Omitting `--run-id` generates a fresh `manual-<UUID>` for this capture, including recaptures on the same commit. Explicit pipeline run IDs are unchanged; a manual ID from another revision is refused to preserve its evidence. The script rewrites the JSON file with current numbers + `captured_at` + `captured_commit` and prints a diff of old-vs-new values before overwrite so you can sanity-check the direction.
 4. `git add tests/coverage-baseline.json` alongside your feature commit. `git blame` is the audit trail.
 5. Do NOT capture a baseline in the middle of an unrelated change — the commit SHA recorded in the baseline becomes the receipt for "this is the code that earned these numbers."
 
@@ -691,7 +832,7 @@ bash scripts/test/teardown.sh --run-id "$RUN_ID"
 The teardown script:
 1. Stops every `yuzu-test-${RUN_ID}-*` compose project
 2. Removes `/tmp/yuzu-test-${RUN_ID}/`
-3. Calls `test-db-write.sh run-finish --run-id "$RUN_ID"` which aggregates gate counts and computes overall status (any FAIL → FAIL, any WARN → WARN, else PASS)
+3. Calls `test-db-write.sh run-finish --run-id "$RUN_ID"` which retains prior FAIL/ABORTED/WARN observations and computes overall status: FAIL first, then ABORTED for an aborted/unfinished gate or an empty run, then WARN, then PASS if anything passed, otherwise SKIP. RUNNING → PASS is a legitimate completion; ABORTED → PASS retains ABORTED. An explicit `--status` can only worsen the result and remains a persistent floor.
 
 After teardown, print the final summary by querying the just-finished run:
 
@@ -751,7 +892,7 @@ Each runner agent owns a durable database outside its checkout:
 - Wee Tam: `D:\ci\test-runs\yuzu-weetam-windows-N\test-runs.db`
 
 `ci.yml` initializes and finalizes the current runner's row automatically.
-Schema v3 keeps GitHub rerun attempts distinct and records the job result and
+Schema v4 keeps GitHub rerun attempts distinct and records the job result and
 duration, platform/runner/commit/event, ccache ratio, Meson test-entry
 result/duration/timeout, and known flakes recovered by isolated retry. Query a
 runner in place by setting `YUZU_TEST_DB`:
@@ -777,7 +918,7 @@ Meson logs remain Actions artifacts rather than runner-local history.
 The skill is designed so a single gate failure does NOT short-circuit the run. Goals:
 
 1. **Always finalize the run row.** Even on a hard error or interrupt, `teardown.sh --run-id "$RUN_ID"` should be called so the DB has `finished_at` set and `overall_status` is something other than `RUNNING`. Wrap the body of the run in a `trap 'bash scripts/test/teardown.sh --run-id "$RUN_ID" --status ABORTED' ERR INT TERM` near the top.
-2. **Phase 1 (build) is the only hard short-circuit.** Build failures mean nothing else can run.
+2. **Phases 0, 0b and 1 are the hard short-circuits.** A failed preflight, a failed Puppeteer install (or, in `--full`, gcovr install) or a build failure means nothing else can run.
 3. **All other phases run to completion.** The operator gets a prioritized fix list in one pass instead of a fix-rerun loop.
 4. **Print failure summaries inline.** When a gate fails, the skill should `tail -50 "$LOG_DIR/<gate>.log"` so the operator sees the actual error without having to find the log path themselves.
 
@@ -786,7 +927,7 @@ The skill is designed so a single gate failure does NOT short-circuit the run. G
 | Mode | Phases | Wall clock | Use case |
 |---|---|---|---|
 | `--quick` | 0, 1 (no images), 5-subset, 8 | 8-15 min | "About to commit, want a fast sanity check" |
-| default | 0, 1, 2, 4, 5, 8 | 25-45 min | "About to push to dev" |
+| default | 0, 0b, 1, 2, 4, 5, 8 | 25-45 min | "About to push to dev" |
 | `--full` | 0-8 (PR2/PR3 features lit) | 60-120 min | "About to tag a release" |
 | `--instructions` | 0, 4, 5-instructions, 8 | 8-20 min | "Content YAML changed / dispatch path edited" |
 | `--instructions-quarantine` | 0, 4, ceremony | 30-40s | "Quarantine plugin / firewall behaviour edited" |

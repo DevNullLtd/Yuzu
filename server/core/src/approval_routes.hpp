@@ -30,7 +30,7 @@
 ///
 /// APPROVER ASSURANCE (#6061, four-eyes MVP PR1) -- approve/reject. Both routes
 /// are kRequired rows in the central step-up table, so the central check runs
-/// in the pre-request stage, before the handler (and after the server-wide
+/// in the post-read stage, before the handler (and after the server-wide
 /// same-site gate, which answers a cross-site cookie write first): a stale or
 /// absent proof is a 401, a SAML session a 403, and an engine principal a 403
 /// (`engine_principal_denied`, audited as `mfa.step_up.required`); the handler
@@ -66,14 +66,14 @@
 ///      It does not replace step 3b: the generic gate passes un-enrolled accounts
 ///      and bearers and honours a window of 0, none of which may decide a
 ///      four-eyes approval. Its outcome is switched on, and every non-pass leaves
-///      the ticket untouched: a stale or enrolment-predating proof -> the 401 it
+///      the ticket untouched: a stale, unbound or other-factor proof -> the 401 it
 ///      wrote, plus a ticket-specific `denied` row
-///      (`approver_assurance:mfa_proof_stale`); an unreadable enrolment -> 503
-///      (`retry_after_ms`) plus an `error` row
-///      (`approver_assurance:mfa_store_unavailable`); an SSO proof dated after the database
-///      clock -> 503 with no retry hint plus an `error` row
-///      (`approver_assurance:mfa_proof_clock_skew`); no usable factor (not enrolled, no
-///      SSO attestation, SAML, a deactivated or deleted account) -> 403
+///      (`approver_assurance:mfa_proof_stale`); an unreadable enrolment or durable
+///      proof -> 503 (`retry_after_ms` 5000 when a retry may clear it, null for the
+///      persistent causes) plus an `error` row; an SSO proof dated after the
+///      database clock -> 503 with `retry_after_ms` null (clock skew); no usable
+///      factor (not enrolled, no SSO attestation, SAML, a deactivated or
+///      deleted account) -> 403
 ///      `approver_assurance_required:<reason>` plus a `denied` row. An UNWIRED
 ///      `approver_mfa_fn` is a 503, not a skip: this is the one place a null
 ///      closure must not read as "no step-up required". If a refusal's audit row

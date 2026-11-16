@@ -25,7 +25,7 @@
  * PROTECTIVE SEAM (one line): the caller injects the predicate, and it is the
  * canonical protective set, `kProtectivePredicate`, which is
  * `&yuzu::protective::is_protective_action` (common/include/yuzu/protective_actions.hpp):
- * the quarantine control actions plus `__guard__.push_rules`. One predicate, never a
+ * the quarantine and firewall control actions plus `__guard__.push_rules`. One predicate, never a
  * second list, so a future widening of that set removes the new action from the
  * switchable units with no edit here. `__guard__.push_rules` is also caught by the
  * reserved-name rule (the control channel), which is checked first. There is no default, so a
@@ -142,8 +142,13 @@ inline constexpr std::array<RequirementEdge, 2> kRequirements{{
 // matrix: docs/os-capability-matrix.md generated block (2026-10-06; shares.list,
 // pkg_inventory.store_packages, msi_packages.list_inventory and remote_access_audit.list added
 // 2026-10-17/19; registry set_user_value, delete_user_value and apply added in registry 2.1.0;
-// hardware chassis/baseboard/swap/machine_id and disk_actions partitions/topology added as planned), 242 rows.
-inline constexpr std::array<UnitOsRow, 242> kUnitOs{{
+// hardware chassis/baseboard/swap/machine_id and disk_actions partitions/topology added as planned;
+// middleware ibm_mq added by SAM.2; runtimes python added 2026-10-28; hardware drivers_inventory
+// added by SAM-32; virtualization host added by PR12.1-a, virtualization wsl added 2026-11-08,
+// virtualization runtime_posture added by PR12.1-b2; firewall quarantine, release, quarantine_status
+// and quarantine_allow added by PRQ.1; component_inventory scan added by SAM-16, Windows leg planned
+// so applicable on all three), 253 rows.
+inline constexpr std::array<UnitOsRow, 253> kUnitOs{{
     {"agent_actions", "set_log_level", kWin | kLin | kMac},
     {"agent_actions", "info", kWin | kLin | kMac},
     {"agent_logging", "get_log", kWin | kLin | kMac},
@@ -171,6 +176,7 @@ inline constexpr std::array<UnitOsRow, 242> kUnitOs{{
     {"certificates", "delete", kWin | kLin | kMac},
     {"chargen", "chargen_start", kWin | kLin | kMac},
     {"chargen", "chargen_stop", kWin | kLin | kMac},
+    {"component_inventory", "scan", kWin | kLin | kMac},
     {"content_dist", "stage", kWin | kLin | kMac},
     {"content_dist", "execute_staged", kWin | kLin | kMac},
     {"content_dist", "list_staged", kWin | kLin | kMac},
@@ -217,6 +223,10 @@ inline constexpr std::array<UnitOsRow, 242> kUnitOs{{
     {"filesystem_posture", "snapshots", kWin | kLin | kMac},
     {"firewall", "state", kWin | kLin | kMac},
     {"firewall", "rules", kWin | kLin | kMac},
+    {"firewall", "quarantine", kWin | kLin | kMac},
+    {"firewall", "release", kWin | kLin | kMac},
+    {"firewall", "quarantine_status", kWin | kLin | kMac},
+    {"firewall", "quarantine_allow", kWin | kLin | kMac},
     {"firmware_posture", "firmware", kWin | kLin | kMac},
     {"hardware", "manufacturer", kWin | kLin | kMac},
     {"hardware", "model", kWin | kLin | kMac},
@@ -225,8 +235,9 @@ inline constexpr std::array<UnitOsRow, 242> kUnitOs{{
     {"hardware", "memory", kWin | kLin | kMac},
     {"hardware", "disks", kWin | kLin | kMac},
     {"hardware", "drivers", kWin | kLin},
+    {"hardware", "drivers_inventory", kWin | kLin},
     {"hardware", "system", kWin | kLin | kMac},
-    // chassis/baseboard/swap/machine_id: planned on every leg (applicable).
+    // chassis/baseboard/swap/machine_id: applicable on every leg (read on Windows, planned on Linux/macOS).
     {"hardware", "chassis", kWin | kLin | kMac},
     {"hardware", "baseboard", kWin | kLin | kMac},
     {"hardware", "swap", kWin | kLin | kMac},
@@ -251,6 +262,7 @@ inline constexpr std::array<UnitOsRow, 242> kUnitOs{{
     {"local_security_policy", "audit_policy", kWin | kLin | kMac},
     {"local_security_policy", "sudoers", kLin | kMac},
     {"mgmt_posture", "posture", kWin | kLin | kMac},
+    {"middleware", "ibm_mq", kWin | kLin | kMac},
     {"msi_packages", "list", kWin | kMac},
     {"msi_packages", "product_codes", kWin | kMac},
     {"msi_packages", "list_inventory", kWin},
@@ -280,7 +292,7 @@ inline constexpr std::array<UnitOsRow, 242> kUnitOs{{
     {"peripherals", "thunderbolt", kWin | kLin | kMac},
     {"pkg_inventory", "managers", kWin | kLin | kMac},
     {"pkg_inventory", "packages", kWin | kMac},
-    // store_packages: the Windows leg is `planned` (applicable); macOS is `unsupported`.
+    // store_packages: macOS is `unsupported` (installed_apps owns it).
     {"pkg_inventory", "store_packages", kWin | kLin},
     {"platform_security", "secure_boot", kWin | kLin},
     {"platform_security", "code_integrity", kWin | kLin | kMac},
@@ -317,6 +329,7 @@ inline constexpr std::array<UnitOsRow, 242> kUnitOs{{
     {"registry", "apply", kWin | kLin | kMac},
     {"runtimes", "dotnet", kWin | kLin | kMac},
     {"runtimes", "jvm", kWin | kLin | kMac},
+    {"runtimes", "python", kWin | kLin | kMac},
     {"sccm", "client_version", kWin},
     {"sccm", "site", kWin},
     {"script_exec", "exec", kWin | kLin | kMac},
@@ -374,6 +387,9 @@ inline constexpr std::array<UnitOsRow, 242> kUnitOs{{
     {"users", "group_members", kWin | kLin | kMac},
     {"users", "primary_user", kWin | kLin | kMac},
     {"users", "session_history", kWin | kLin | kMac},
+    {"virtualization", "host", kWin | kLin | kMac},
+    {"virtualization", "wsl", kWin},
+    {"virtualization", "runtime_posture", kLin},
     {"vuln_scan", "scan", kWin | kLin | kMac},
     {"vuln_scan", "cve_scan", kWin | kLin | kMac},
     {"vuln_scan", "config_scan", kWin | kLin | kMac},

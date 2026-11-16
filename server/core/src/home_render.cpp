@@ -3,6 +3,7 @@
 
 #include "home_render.hpp"
 
+#include "plural.hpp"
 #include "web_utils.hpp"
 
 #include <algorithm>
@@ -19,10 +20,6 @@ namespace {
 std::string esc(const std::string& s) { return html_escape(s); }
 
 constexpr std::int64_t kDay = 24 * 60 * 60;
-
-std::string plural(std::int64_t n, const char* one, const char* many) {
-    return n == 1 ? std::string(one) : std::string(many);
-}
 
 // ── Notes: one distinct sentence per non-Ok state ──────────────────────────
 
@@ -268,7 +265,7 @@ std::string render_attention(const SummaryView& v) {
             if (a.oldest && *a.oldest > 0)
                 sub = "Oldest submitted " + format_relative_time(*a.oldest, v.now_epoch);
             out += att_row("s-w",
-                           fmt_int(a.count) + plural(a.count, " approval is waiting",
+                           fmt_int(a.count) + plural_word(a.count, " approval is waiting",
                                                      " approvals are waiting"),
                            sub, v.links.approvals, "Review");
             ++rows;
@@ -290,7 +287,7 @@ std::string render_attention(const SummaryView& v) {
                 break;
             case CountBound::Exact:
                 title = fmt_int(f.count) +
-                        plural(f.count, " execution failed in the last 24 hours",
+                        plural_word(f.count, " execution failed in the last 24 hours",
                                " executions failed in the last 24 hours");
                 break;
             }
@@ -311,7 +308,7 @@ std::string render_attention(const SummaryView& v) {
         if (n > 0) {
             const std::string lead = v.devices.value.at_least ? "At least " : "";
             out += att_row("s-w",
-                           lead + fmt_int(n) + plural(n, " device has not reported for 2 days or more",
+                           lead + fmt_int(n) + plural_word(n, " device has not reported for 2 days or more",
                                                       " devices have not reported for 2 days or more"),
                            "", v.links.devices, "Show devices");
             ++rows;
@@ -327,7 +324,7 @@ std::string render_attention(const SummaryView& v) {
             const auto n = v.enrolment.value;
             if (n > 0) {
                 out += att_row("s-w",
-                               fmt_int(n) + plural(n, " agent is awaiting enrolment",
+                               fmt_int(n) + plural_word(n, " agent is awaiting enrolment",
                                                    " agents are awaiting enrolment"),
                                "", v.links.enrolment, "Review");
                 ++rows;

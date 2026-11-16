@@ -1,6 +1,6 @@
 /**
  * runtimes_parsers.hpp -- the PURE parsing / row-formatting layer for the
- * runtimes plugin (installed .NET and JVM runtimes).
+ * runtimes plugin (installed .NET, JVM and Python runtimes).
  *
  * Everything here is a free function over plain data: no OS call, no I/O, no
  * logging, no platform header (the repo's pure-core / thin-shell discipline;
@@ -8,8 +8,8 @@
  * compiles and is unit-tested on EVERY OS (tests/unit/test_runtimes_parsers.cpp,
  * unguarded); the OS-reading legs live in runtimes_{linux,macos,win}.cpp.
  *
- * ZERO SUBPROCESS. The plugin never runs `java -version` or `dotnet
- * --list-runtimes`: every fact comes from a directory name or a metadata file
+ * ZERO SUBPROCESS. The plugin never runs `java -version`, `dotnet
+ * --list-runtimes` or `python --version`: every fact comes from a directory name or a metadata file
  * the runtime's installer laid down.
  *
  * WIRE GRAMMAR. Every action emits, in this order:
@@ -30,7 +30,8 @@
  * from "no data" (which is an empty optional / no row):
  *   dotnet  core | sdk | unmodelled
  *   jvm     jdk | jre | unmodelled
- * Only the Linux legs ship today, so the vocabulary is the Linux subset; the
+ *   python  cpython | unmodelled   (runtimes_python_parsers.hpp)
+ * dotnet and jvm ship on Linux only, so their vocabulary is the Linux subset; the
  * planned macOS and Windows legs add their own flavours (.NET Framework).
  *
  * Free-text fields (version, path, vendor) are untrusted OS-supplied text and
@@ -41,6 +42,7 @@
 #pragma once
 
 #include <constraint_accumulator.hpp> // yuzu::shared::ConstraintAccumulator (agents/shared)
+#include <inventory_status_row.hpp>    // yuzu::shared::StatusLevel / format_status_row (agents/shared)
 
 #include <yuzu/string_utils.hpp>
 
@@ -53,16 +55,16 @@
 namespace yuzu::runtimes {
 
 // -- fixed vocabulary: status level ----------------------------------------
+//
+// The status row grammar is the collector's, owned by agents/shared/inventory_status_row.hpp
+// (producers and the consumer cannot drift); this plugin uses it unchanged.
 
-enum class StatusLevel { supported, constrained, unsupported };
+using yuzu::shared::StatusLevel;
+using yuzu::shared::format_status_row;
 
+/// Kept as a forwarder: tests/unit/test_runtimes_parsers.cpp pins the three tokens through this name.
 [[nodiscard]] constexpr std::string_view status_token(StatusLevel l) noexcept {
-    switch (l) {
-    case StatusLevel::supported:   return "supported";
-    case StatusLevel::constrained: return "constrained";
-    case StatusLevel::unsupported: return "unsupported";
-    }
-    return "unsupported";
+    return yuzu::shared::status_level_token(l);
 }
 
 // -- fixed vocabulary: flavours --------------------------------------------
@@ -291,18 +293,6 @@ struct DotnetEntry {
     out += field_or_dash(install_path);
     out += '|';
     out += field_or_dash(vendor);
-    return out;
-}
-
-/// status|<action>|<level>|<reason or ->
-[[nodiscard]] inline std::string format_status_row(std::string_view action, StatusLevel level,
-                                                   std::string_view reason) {
-    std::string out = "status|";
-    out.append(action);
-    out += '|';
-    out.append(status_token(level));
-    out += '|';
-    out += field_or_dash(reason);
     return out;
 }
 

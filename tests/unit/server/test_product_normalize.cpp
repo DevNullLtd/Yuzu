@@ -21,6 +21,7 @@ using yuzu::server::is_lapsed;
 using yuzu::server::kExpiryAlertBuckets;
 using yuzu::server::kExpiryWarnDays;
 using yuzu::server::kRearmSecs;
+using yuzu::server::make_norm_key;
 using yuzu::server::match_confidence;
 using yuzu::server::match_product;
 using yuzu::server::norm_key;
@@ -59,6 +60,17 @@ TEST_CASE("normalize_title lowercases, collapses whitespace, strips version/arch
     SECTION("no edition token → empty edition") {
         CHECK(normalize_title("Google Chrome x64").edition == "");
     }
+}
+
+TEST_CASE("normalize_title returns the first stripped version token as version", "[normalize]") {
+    CHECK(normalize_title("7-Zip 23.01 (x64)").version == "23.01");
+    CHECK(normalize_title("Visual Studio v2.1 2019").version == "2.1");
+    CHECK(normalize_title("Mozilla Firefox 120.0.1").title == "mozilla firefox");
+}
+
+TEST_CASE("normalize_title leaves version empty when the title carries none", "[normalize]") {
+    CHECK(normalize_title("Mozilla Firefox").version.empty());
+    CHECK(normalize_title("v").version.empty());
 }
 
 TEST_CASE("normalize_title extracts edition tokens", "[normalize]") {
@@ -120,6 +132,31 @@ TEST_CASE("normalize_vendor strips legal suffixes and applies aliases", "[normal
     }
 }
 
+TEST_CASE("an agent origin label (via:<ecosystem>) is no vendor", "[normalize][vendor]") {
+    CHECK(yuzu::server::kOriginLabelPrefix == "via:");
+    SECTION("normalize_vendor returns empty for every label") {
+        for (const char* label : {"via:brew", "via:snap", "via:flatpak", "via:deb", "via:rpm",
+                                  "via:macos_pkgutil", "via:", "via:Microsoft"})
+            CHECK(normalize_vendor(label).empty());
+    }
+    SECTION("a labelled title keys exactly like a vendorless one") {
+        CHECK(norm_key("Foo", "via:snap") == norm_key("Foo", ""));
+        CHECK(norm_key("Foo", "via:brew") == norm_key("Foo", "via:snap"));
+        // ...and not like one with a real vendor
+        CHECK(norm_key("Foo", "via:snap") != norm_key("Foo", "Acme"));
+    }
+    SECTION("only a RAW prefix counts: case-sensitive, exact, at byte 0") {
+        // the agent emits the label in lower case, so these are vendors and normalise as such
+        CHECK(normalize_vendor("VIA:Acme") == "via:acme");
+        CHECK(normalize_vendor("Via:Acme") == "via:acme");
+        // a vendor merely containing "via:" is not a label
+        CHECK(normalize_vendor("Acme via:brew") == "acme via:brew");
+        CHECK(normalize_vendor(" via:brew") == "via:brew"); // leading blank: not the raw prefix
+        CHECK(normalize_vendor("via") == "via");
+        CHECK(normalize_vendor("Viacom Inc.") == "viacom");
+    }
+}
+
 TEST_CASE("norm_key is deterministic and stable across raw form variants", "[normalize]") {
     // Key shape: <vendor>:<title> with an optional :<edition> suffix.
     const std::string k =
@@ -137,6 +174,11 @@ TEST_CASE("norm_key is deterministic and stable across raw form variants", "[nor
 
     SECTION("repeated calls agree") {
         CHECK(norm_key("7-Zip 23.01", "Igor Pavlov") == norm_key("7-Zip 23.01", "Igor Pavlov"));
+    }
+
+    SECTION("make_norm_key owns the shape norm_key ends in") {
+        CHECK(make_norm_key("microsoft", "microsoft office", "professional") == k);
+        CHECK(make_norm_key("google", "google chrome", "") == "google:google chrome");
     }
 }
 

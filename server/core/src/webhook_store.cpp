@@ -1,5 +1,7 @@
 #include "webhook_store.hpp"
 
+#include "delivery_pool_metrics.hpp"
+
 #include "outbound_url_policy.hpp"
 
 #include "pg/pg_exec.hpp"
@@ -305,6 +307,12 @@ void WebhookStore::set_metrics(yuzu::MetricsRegistry* metrics) { metrics_ = metr
 
 bool WebhookStore::quiesce(std::chrono::milliseconds timeout) {
     return delivery_pool_.quiesce(timeout);
+}
+
+std::size_t WebhookStore::delivery_pool_pending() const { return delivery_pool_.pending(); }
+
+std::size_t WebhookStore::delivery_pool_capacity() const noexcept {
+    return delivery_pool_.capacity();
 }
 
 // ── CRUD ────────────────────────────────────────────────────────────────────
@@ -721,14 +729,15 @@ void WebhookStore::fire_event(const std::string& event_type, const std::string& 
     // plaintext, so this closure never holds a decrypted secret while
     // queued.
     for (const auto& wh : matching) {
-        const bool queued = delivery_pool_.submit(
+        const auto queued = delivery_pool_.try_submit(
             [this, wh, event_type, payload_json]() { deliver_single(wh, event_type, payload_json); });
-        if (!queued) {
-            spdlog::warn("WebhookStore: dropped delivery to {} (webhook {}) - worker pool queue "
-                         "full or server shutting down",
-                         url_log_host(wh.url), wh.id);
+        if (queued != StoreWorkerPool::SubmitResult::kQueued) {
+            const char* reason = StoreWorkerPool::drop_reason(queued);
+            spdlog::warn("WebhookStore: dropped delivery to {} (webhook {}) - the delivery worker "
+                         "pool refused it ({})",
+                         url_log_host(wh.url), wh.id, reason);
             if (metrics_)
-                metrics_->counter("yuzu_server_webhook_delivery_dropped_total").increment();
+                metrics_->counter(kWebhookDeliveryDroppedMetric, {{"reason", reason}}).increment();
         }
     }
 }
