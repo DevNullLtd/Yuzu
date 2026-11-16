@@ -600,8 +600,10 @@ the server, and the retired table's name (`retired_table:<name>`) is in the agen
 call had already persisted, the reply first carries `partial|applied|<key1,key2,...>` (the keys that did
 persist, in the order they were written) and the result status is `constrained` with
 `echo:configure_partial_commit`: a non-zero exit means at least one requested change did not persist, and
-`constrained` means some did. Nothing persisted is the `error|` line alone. A caller that treated exit 0 as
-success on a busy database now sees exit 1.
+`constrained` means some did. An interval (`fast_interval`, `slow_interval`, `software_interval`) listed under
+`partial|applied` is saved, but collection keeps its previous schedule until the agent restarts or that
+interval is sent again in a call that succeeds, so include it when re-sending. Nothing persisted is the
+`error|` line alone. A caller that treated exit 0 as success on a busy database now sees exit 1.
 
 **Corrupt-database quarantine is bounded.** When a corrupt `echo.db` is moved aside, only the newest three
 `echo.db.corrupt-<epoch>[-<n>]` groups (the file and its `-wal`/`-shm`/`-journal` sidecars) are kept; older

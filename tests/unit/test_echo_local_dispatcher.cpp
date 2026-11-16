@@ -739,6 +739,128 @@ TEST_CASE("echo plugin: db_budget_bytes validates, persists and shows in status 
     }
 }
 
+TEST_CASE("echo plugin: configure reports a write that failed after earlier ones persisted as a "
+          "partial commit, and a first write that failed as the flat error (#2155)",
+          "[echo][local_dispatcher][configure]") {
+    const auto plugin_path = find_echo_plugin();
+    if (plugin_path.empty()) {
+        if (std::getenv("MESON_BUILD_ROOT") != nullptr)
+            FAIL("echo plugin library not found under meson test");
+        WARN("echo plugin library not found -- skipping (run from the build root or via meson test)");
+        return;
+    }
+    auto handle = yuzu::agent::PluginHandle::load(plugin_path);
+    REQUIRE(handle.has_value());
+    const auto* desc = handle->descriptor();
+    REQUIRE(desc != nullptr);
+    REQUIRE(desc->init != nullptr);
+
+    yuzu::test::TempDir dir_guard{"yuzu_test_echo_local_"};
+    std::error_code ec;
+    fs::create_directories(dir_guard.path, ec);
+    auto kv = yuzu::agent::KvStore::open(dir_guard.path / "kv_store.db");
+    REQUIRE(kv.has_value());
+    yuzu::agent::StandalonePluginContext ctx("echo", {{"agent.data_dir", dir_guard.path.string()}},
+                                             &*kv);
+    REQUIRE(desc->init(ctx.get()) == 0);
+    yuzu::agent::LocalDispatcher d;
+    const yuzu::test::ScopeExit shutdown_on_exit{[&] { desc->shutdown(ctx.get()); }};
+
+    const auto db_path = dir_guard.path / "echo.db";
+    // A write the plugin cannot make: a trigger that aborts any insert or update of `key` in
+    // echo_config, from a second connection. A deterministic stand-in for a busy or failing
+    // database (no timing involved); every other key still writes.
+    const auto block = [&](const std::string& key) {
+        (void)raw_sql(db_path,
+                      std::format("CREATE TRIGGER yuzu_test_block_ins BEFORE INSERT ON echo_config "
+                                  "WHEN NEW.key = '{0}' BEGIN SELECT RAISE(ABORT, 'blocked'); END;"
+                                  "CREATE TRIGGER yuzu_test_block_upd BEFORE UPDATE ON echo_config "
+                                  "WHEN NEW.key = '{0}' BEGIN SELECT RAISE(ABORT, 'blocked'); END;",
+                                  key));
+    };
+    const auto unblock = [&] {
+        (void)raw_sql(db_path, "DROP TRIGGER yuzu_test_block_ins; DROP TRIGGER yuzu_test_block_upd;");
+    };
+    const auto stored = [&](const std::string& key) -> std::optional<std::string> {
+        const auto rows =
+            raw_sql(db_path, std::format("SELECT value FROM echo_config WHERE key = '{}'", key));
+        if (rows.empty())
+            return std::nullopt;
+        return rows[0][0];
+    };
+    // Index of the first line starting with `prefix`, or npos: the lines' ORDER is part of the
+    // contract (the partial line comes before the error that ends the reply).
+    const auto line_index = [](const std::vector<std::string>& rows, const std::string& prefix) {
+        for (std::size_t i = 0; i < rows.size(); ++i)
+            if (rows[i].rfind(prefix, 0) == 0)
+                return i;
+        return std::string::npos;
+    };
+
+    SECTION("the first write failing is the flat error: no partial line, no typed status") {
+        block("fast_interval_seconds");
+        const YuzuParam params[] = {{"fast_interval", "30"}, {"slow_interval", "120"}};
+        const auto r = d.run(desc, "configure", params);
+        const auto rows = rows_of(r.captured);
+        CHECK(r.rc == 1);
+        CHECK(row_with_prefix(rows, "error|fast_interval_seconds could not be saved").has_value());
+        CHECK_FALSE(row_with_prefix(rows, "partial|").has_value());
+        CHECK_FALSE(row_with_prefix(rows, "config|fast_interval_seconds").has_value());
+        CHECK_FALSE(row_with_prefix(rows, "status|ok").has_value());
+        CHECK(r.result_status == YUZU_RESULT_STATUS_UNDECLARED);
+        CHECK_FALSE(stored("slow_interval_seconds") == std::optional<std::string>{"120"});
+        unblock();
+    }
+
+    SECTION("a later write failing lists what persisted before the error, and types the reply "
+            "PARTIAL") {
+        block("slow_interval_seconds");
+        const YuzuParam params[] = {{"fast_interval", "30"}, {"slow_interval", "120"}};
+        const auto r = d.run(desc, "configure", params);
+        const auto rows = rows_of(r.captured);
+        CHECK(r.rc == 1);
+        const auto applied = line_index(rows, "config|fast_interval_seconds|30");
+        const auto partial = line_index(rows, "partial|applied|fast_interval_seconds");
+        const auto error = line_index(rows, "error|slow_interval_seconds could not be saved");
+        REQUIRE(applied != std::string::npos);
+        REQUIRE(partial != std::string::npos);
+        REQUIRE(error != std::string::npos);
+        CHECK(applied < partial);
+        CHECK(partial < error);
+        CHECK(r.result_status == YUZU_RESULT_STATUS_CONSTRAINED);
+        CHECK(r.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+        CHECK(r.result_provenance == "echo:configure_partial_commit");
+        CHECK_FALSE(row_with_prefix(rows, "status|ok").has_value());
+        // A failed call does not re-register triggers: the saved interval is live only after a
+        // restart or a call that succeeds (documented in the manual and README).
+        CHECK_FALSE(row_with_prefix(rows, "trigger|echo.fast|re-registered").has_value());
+        // The saved key really is saved; the one that failed is not.
+        CHECK(stored("fast_interval_seconds") == std::optional<std::string>{"30"});
+        CHECK_FALSE(stored("slow_interval_seconds") == std::optional<std::string>{"120"});
+        unblock();
+    }
+
+    SECTION("a source toggle that took effect is listed too, ahead of a later failed write") {
+        block("process_stabilization_exclusions");
+        const YuzuParam params[] = {{"service_enabled", "false"},
+                                    {"process_stabilization_exclusions", R"(["chrome.exe"])"}};
+        const auto r = d.run(desc, "configure", params);
+        const auto rows = rows_of(r.captured);
+        CHECK(r.rc == 1);
+        const auto partial = line_index(rows, "partial|applied|service_enabled");
+        const auto error =
+            line_index(rows, "error|process_stabilization_exclusions could not be saved");
+        REQUIRE(partial != std::string::npos);
+        REQUIRE(error != std::string::npos);
+        CHECK(partial < error);
+        CHECK(r.result_status == YUZU_RESULT_STATUS_CONSTRAINED);
+        CHECK(r.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+        CHECK(stored("service_enabled") == std::optional<std::string>{"false"});
+        CHECK_FALSE(stored("process_stabilization_exclusions").has_value());
+        unblock();
+    }
+}
+
 
 TEST_CASE("echo plugin: a rollup pass on an over-budget legacy database evicts to the byte target, "
           "converts it to incremental auto_vacuum and publishes the result",

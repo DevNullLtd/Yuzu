@@ -68,7 +68,9 @@ constexpr int kBusyTimeoutMs = 5000;
 using yuzu::shared::sqlite_quarantine::now_epoch_seconds;
 
 // Quarantined echo.db copies kept (owner ruling Q6, #2155): the newest three; older ones are
-// deleted at quarantine time.
+// deleted at quarantine time. Deliberately separate from the command-dedup store's constant
+// (#3665, command_dedup_quarantine.hpp): two owner rulings on stores with different contents, and
+// the two may diverge.
 constexpr std::size_t kKeepQuarantined = 3;
 
 struct StmtDeleter {

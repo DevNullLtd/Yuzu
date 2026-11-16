@@ -4330,6 +4330,22 @@ TEST_CASE("quarantine: a stuck file left by an earlier prune is counted as a gro
     CHECK_FALSE(fs::exists(stuck));
 }
 
+TEST_CASE("quarantine: a directory that cannot be listed deletes nothing and is reported (#2155)",
+          "[echo][store][corruption]") {
+    // The database's directory does not exist, so the listing fails on every platform with no
+    // permission tricks. Nothing can be removed from a directory that was not read, and the
+    // function reports it instead of throwing.
+    yuzu::test::TempDir dir{"yuzu_test_echo_qlist_"};
+    REQUIRE(fs::create_directories(dir.path));
+    const auto missing = dir.path / "missing";
+    const auto pruned = yuzu::shared::sqlite_quarantine::prune_old_quarantines(
+        missing / "echo.db", missing / "echo.db.corrupt-40", 3);
+
+    CHECK(pruned.removed.empty());
+    REQUIRE(pruned.notes.size() == 1);
+    CHECK(pruned.notes[0].starts_with("could not list"));
+}
+
 // #1527. A link at the database path (or a sidecar) is refused before anything is opened, moved or
 // secured; the link's target is never touched. A dangling link is refused as well. Windows needs a
 // privilege to create a symlink, so the case skips where it cannot; the junction/reparse arm is

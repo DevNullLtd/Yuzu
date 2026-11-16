@@ -523,10 +523,18 @@ inline PruneResult prune_old_quarantines(const std::filesystem::path& db_path,
             --excess;
         }
     } catch (const std::exception& e) {
-        result.notes.push_back(
-            std::format("pruning old quarantined stores stopped early: {}", e.what()));
+        // Building the note allocates: under memory pressure that can throw out of a noexcept
+        // function (terminate), so a note that cannot be made is dropped.
+        try {
+            result.notes.push_back(
+                std::format("pruning old quarantined stores stopped early: {}", e.what()));
+        } catch (...) {
+        }
     } catch (...) {
-        result.notes.push_back("pruning old quarantined stores stopped early");
+        try {
+            result.notes.push_back("pruning old quarantined stores stopped early");
+        } catch (...) {
+        }
     }
     return result;
 }
