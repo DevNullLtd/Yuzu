@@ -5809,6 +5809,32 @@ TEST_CASE("registry source: a failed cursor rewrite at start() changes nothing a
 }
 
 
+// The named environment causes that stop the Kernel-Registry ETW session opening, as a SKIP
+// reason; nullopt for anything else, which the caller FAILs with the code (#7173). Win32 1450
+// (ERROR_NO_SYSTEM_RESOURCES) is the system trace-session limit; Win32 5 (ERROR_ACCESS_DENIED)
+// is a missing elevation, a cause only on a token that is not elevated.
+namespace {
+std::optional<std::string> etw_skip_reason(unsigned long start_rc, bool elevated) {
+    if (start_rc == 1450)
+        return "ETW session unavailable: the system trace-session limit is reached (Win32 1450)";
+    if (start_rc == 5 && !elevated)
+        return "ETW session unavailable: not elevated (Win32 5)";
+    return std::nullopt;
+}
+} // namespace
+
+TEST_CASE("registry live: the ETW skip reason names the session limit and the missing elevation and nothing else",
+          "[echo][registry]") {
+    CHECK(etw_skip_reason(1450, true).value_or("").find("trace-session limit") != std::string::npos);
+    CHECK(etw_skip_reason(1450, false).value_or("").find("trace-session limit") != std::string::npos);
+    CHECK(etw_skip_reason(5, false).value_or("").find("not elevated") != std::string::npos);
+    CHECK_FALSE(etw_skip_reason(5, true).has_value());
+    CHECK_FALSE(etw_skip_reason(87, true).has_value());
+    CHECK_FALSE(etw_skip_reason(87, false).has_value());
+    CHECK_FALSE(etw_skip_reason(0, true).has_value());
+    CHECK_FALSE(etw_skip_reason(0, false).has_value());
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // [windows] live cases: the real key watch and the real Kernel-Registry ETW session.
 // Writing HKLM and opening the session need an elevated token; each case SKIPs with a
@@ -5824,8 +5850,9 @@ namespace {
 // window_base or read stamp ever carries the offset; it is reset straight after.
 std::atomic<std::int64_t> g_clock_offset{0};
 
-// Is this process's token elevated? The ETW cases SKIP when it is not, and FAIL when it is and
-// the session still did not open, so a broken session can never pass as "not elevated".
+// Is this process's token elevated? It feeds etw_skip_reason through require_etw_or_skip: a start
+// failure is a SKIP only for a named environment cause, so a broken session can never pass as
+// "not elevated".
 bool is_elevated() {
     HANDLE token = nullptr;
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
@@ -5835,6 +5862,14 @@ bool is_elevated() {
     const bool ok = GetTokenInformation(token, TokenElevation, &e, sizeof(e), &len) != 0;
     CloseHandle(token);
     return ok && e.TokenIsElevated != 0;
+}
+
+// The session did not open: SKIP when the reader's start error is a named environment cause,
+// FAIL with the code otherwise, so a broken session can never pass as "not elevated".
+void require_etw_or_skip(unsigned long start_rc, const std::string& detail) {
+    if (const auto reason = etw_skip_reason(start_rc, is_elevated()))
+        SKIP(*reason);
+    FAIL("the ETW session did not open (Win32 " << start_rc << "): " << detail);
 }
 
 std::string salt() { return std::to_string(::GetCurrentProcessId()) + "_" + std::to_string(::GetTickCount64()); }
@@ -5957,6 +5992,7 @@ struct LiveRun {
     TestDb t = make_db();
     std::shared_ptr<RegistryDirtyTable> dirty;
     std::function<bool()> etw_running; // the reader's own answer: is the session delivering?
+    std::function<unsigned long()> etw_start_error; // why it did not open (0 = no error recorded)
     // The session's own loss counters; the failure message of a missed ETW event reads them (#7135).
     std::function<SessionLoss()> session_loss;
     std::string root;                  // the watched root, as the dirty table names it
@@ -5970,6 +6006,7 @@ struct LiveRun {
         }
         dirty = reader.dirty;
         etw_running = reader.etw_running;
+        etw_start_error = reader.etw_start_error;
         session_loss = reader.session_loss;
         src = make_registry_cursor_source(RegistryScope{{hklm_root}, {}}, std::move(reader));
         src->start(t.db);
@@ -6076,10 +6113,8 @@ TEST_CASE("registry live: set, change and delete through a pre-opened handle are
     if (std::stoi(run.t.db.get_config("registry_watch_roots", "0")) == 0)
         FAIL("the watch did not arm");
     if (const auto method = run.t.db.get_config("registry_capture_method", ""); method != "notify+etw") {
-        if (is_elevated())
-            FAIL("the token is elevated but the ETW session did not open: registry_capture_method="
-                 << method);
-        SKIP("ETW session unavailable (not elevated)");
+        require_etw_or_skip(run.etw_start_error ? run.etw_start_error() : 0,
+                            "registry_capture_method=" + method);
     }
 
     DWORD one = 1, two = 2;
@@ -6157,13 +6192,12 @@ TEST_CASE("registry live: stop leaves no ETW session behind", "[echo][registry][
     g_clock_offset = 0;
     auto reader = live_reader();
     auto etw_running = reader.etw_running;
+    auto start_error = reader.etw_start_error;
     auto src = make_registry_cursor_source(RegistryScope{{"SOFTWARE\\yuzu_test_reg_none"}, {}}, std::move(reader));
     TestDb t = make_db();
     src->start(t.db); // ~RegistryCursorSource() stops the session even if a REQUIRE below throws
     if (!etw_running()) {
-        if (is_elevated())
-            FAIL("the token is elevated but the ETW session did not open");
-        SKIP("ETW session unavailable (not elevated)");
+        require_etw_or_skip(start_error ? start_error() : 0, "etw_running is false after start");
     }
     REQUIRE(session_exists()); // the positive control: the lookup does find a running session
     // A collect samples the session's loss (ControlTraceW QUERY), which writes into the block the
