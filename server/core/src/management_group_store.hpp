@@ -84,6 +84,21 @@ public:
 
     // ── Group CRUD (deny-or-benign display class — may stay plain, EXCEPT
     // get_group: see get_group_checked below) ────────────────────────────
+    /// The refusals `create_group` makes BEFORE it writes (store not open, empty
+    /// name, self-parent, parent not found, degraded parent or ancestor read, depth cap),
+    /// with the exact error text `create_group` returns for each. Success means
+    /// "would pass those checks now"; nothing is written. `create_group` calls
+    /// this itself (one copy of the logic), so a caller that pre-checks and then
+    /// calls `create_group` is validated twice by design.
+    ///
+    /// ADVISORY, not an authorization or a reservation: the check is not atomic
+    /// with the later insert (a parent can be deleted or re-parented in
+    /// between), so its only use is to refuse BEFORE writing an audit row.
+    /// `create_group` remains the authority and may still refuse a group this
+    /// accepted; it also has write-time failures (name conflict, pool timeout,
+    /// SQL error) this method cannot predict.
+    [[nodiscard]] std::expected<void, std::string>
+    validate_new_group(const ManagementGroup& group) const;
     std::expected<std::string, std::string> create_group(const ManagementGroup& group);
     /// LEGACY fail-soft: `get_group_checked(id).value_or(std::nullopt)` — a
     /// store-not-open / pool-acquire-timeout / query-error degrade is
