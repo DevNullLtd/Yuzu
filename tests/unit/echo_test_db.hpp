@@ -114,6 +114,8 @@ inline bool seed_echo_db_from_template(const std::filesystem::path& dest) {
     ec.clear();
     if (!std::filesystem::copy_file(tpl.file.path, staging, std::filesystem::copy_options::none,
                                     ec)) {
+        std::fprintf(stderr, "echo_test_db: copy to %s failed (%s); plain fresh open instead\n",
+                     staging.string().c_str(), ec.message().c_str());
         if (ec != std::errc::file_exists) // not ours to remove if someone else made it meanwhile
             std::filesystem::remove(staging, ec);
         return false;
@@ -123,6 +125,8 @@ inline bool seed_echo_db_from_template(const std::filesystem::path& dest) {
     // complete or absent, never partial.
     std::filesystem::rename(staging, dest, ec);
     if (ec) {
+        std::fprintf(stderr, "echo_test_db: rename to %s failed (%s); plain fresh open instead\n",
+                     dest.string().c_str(), ec.message().c_str());
         std::filesystem::remove(staging, ec);
         return false;
     }

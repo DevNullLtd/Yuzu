@@ -15,6 +15,7 @@
 
 #include "echo_collectors.hpp"
 #include "echo_db.hpp"
+#include "echo_test_db.hpp"
 #include "echo_mapdrive_backfill.hpp"
 #include "echo_mapdrive_macos_parsers.hpp"
 #include "test_helpers.hpp"
@@ -317,8 +318,8 @@ TEST_CASE("mapdrive parse_samba_logs: connect events from both log shapes",
 
 TEST_CASE("mapdrive fold: historical and live rows are rolled up by mapping with the right counts",
           "[echo][mapdrive][db]") {
-    yuzu::test::TempDbFile tmp{std::string_view{"echo-mapdrive-"}};
-    auto opened = EchoDatabase::open(tmp.path);
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_echo_mapdrive_"}};
+    auto opened = yuzu::test::open_echo_db(tmp.path);
     REQUIRE(opened.has_value());
     EchoDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
@@ -1254,7 +1255,7 @@ TEST_CASE("mapdrive fold: skip_known_historical counts no mapping twice whicheve
           "folded it first",
           "[echo][mapdrive][backfill][db]") {
     yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_echo_mapdrive_backfill_"}};
-    auto opened = EchoDatabase::open(tmp.path);
+    auto opened = yuzu::test::open_echo_db(tmp.path);
     REQUIRE(opened.has_value());
     EchoDatabase db = std::move(*opened);
 
