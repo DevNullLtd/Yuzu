@@ -3081,11 +3081,13 @@ public:
                               // not gated on prefer_spark_ (0 while Spark is inert). These
                               // accessors take no lock (the Group B/C accessors above do take
                               // mtx_).
-                              // Deleting THIS call site is not caught by any test, same as
-                              // Group D's: the emitter and the accessor are pinned (E10, E15,
-                              // E23 and the doc-scrape test), the call itself is verified by
-                              // reading. Deliberately no source-grep pin: it would break
-                              // out-of-tree and packaged builds that carry no source tree.
+                              // Deleting THIS call site is not caught by any unit test, same
+                              // as Group D's: the emitter and the accessor are pinned (E10,
+                              // E15, E23 and the doc-scrape test). The three emit calls here
+                              // are pinned only by the source-text check
+                              // tests/test_guardian_baseline_fleet_tags_lexical.py, which runs
+                              // in the docs suite against the source tree and so does not run
+                              // in out-of-tree or packaged builds that carry no source tree.
                               //
                               // #5605: the same group also carries the CURRENT unpersisted
                               // backlog (present only on a live prefer_spark agent with a
@@ -3107,7 +3109,7 @@ public:
                               } catch (...) {
                                   hb_guardian_contain(kHbGuardianBaseline,
                                                       "Guardian heartbeat baseline-persist tag "
-                                                      "failed (the tag was skipped this tick)");
+                                                      "failed (the remaining tags were skipped this tick)");
                               }
                             }
 #if defined(_WIN32) || defined(__linux__) || defined(__APPLE__)

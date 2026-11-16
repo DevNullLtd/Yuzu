@@ -369,10 +369,11 @@ public:
     /// #5605: the number of `file-hash-equals` rules with no authored expected_hash whose boot
     /// re-arm seed lookup (start_local's walk over the cached rules) found NO persisted baseline
     /// record, counted once per rule per boot, on BOTH detection backends (the lookup precedes
-    /// the backend choice). Each such rule re-captures the file's CURRENT content as its
-    /// baseline at that boot. It is NOT proof that a capture was lost: a rule never captured, a
-    /// prior failed arm, a platform whose file mechanism cannot arm (the seed read runs before
-    /// placement is decided) and a genuinely lost capture all read the same. A read error, a
+    /// the backend choice). Each such rule re-arms, and where the file mechanism can arm
+    /// (Windows today) re-captures the file's CURRENT content as its baseline at that boot. It
+    /// is NOT proof that a capture was lost: a rule never captured, a prior failed arm, a
+    /// platform whose file mechanism cannot arm (the seed read runs before placement is decided,
+    /// so nothing is re-captured there) and a genuinely lost capture all read the same. A read error, a
     /// malformed record, a fingerprint mismatch (a retarget), a disabled rule and any apply_rules
     /// after boot are not counted. Written only under mtx_ during the one start_local walk (a
     /// second start_local is a no-op), so it is a per-boot constant afterwards; read lock-free.
