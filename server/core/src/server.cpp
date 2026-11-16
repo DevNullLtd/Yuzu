@@ -2150,7 +2150,10 @@ public:
             "class that requires one it can size; unsupported_encoding: a "
             "non-identity Content-Encoding, refused on every class; "
             "over_cap_post_read: the body was read in full - because it could not be "
-            "sized in advance - and turned out to be over the class's cap)",
+            "sized in advance - and turned out to be over the class's cap; "
+            "over_json_values_post_read: the body is within the class's size cap but holds "
+            "more structural JSON values than the class's budget, refused before any handler "
+            "parses it)",
             "counter");
         for (const auto& entry : yuzu::server::kBodyCapTable) {
             metrics_.counter("yuzu_body_cap_rejected_total",
@@ -2162,6 +2165,12 @@ public:
             metrics_.counter("yuzu_body_cap_rejected_total",
                              {{"path_class", std::string(entry.path_class)},
                               {"reason", "over_cap_post_read"}});
+            // Only a class that scans (`max_json_values` != off) can reach the value-budget refusal.
+            if (entry.max_json_values != yuzu::server::kJsonValuesOff) {
+                metrics_.counter("yuzu_body_cap_rejected_total",
+                                 {{"path_class", std::string(entry.path_class)},
+                                  {"reason", "over_json_values_post_read"}});
+            }
             if (entry.requires_measurable) {
                 metrics_.counter("yuzu_body_cap_rejected_total",
                                  {{"path_class", std::string(entry.path_class)},
@@ -17867,9 +17876,10 @@ private:
                              .nvd_sync = nvd_sync_.get(),
                          });
 
-        // UP-6: ONE referrer lookup and ONE advisory pack lookup, built here (their stores are
-        // members constructed in the ctor, long before this) and handed to every consumer: the v1
-        // DELETE twin and MCP delete_definition, so neither can disagree about what blocks a
+        // UP-6 / M2: ONE referrer lookup and ONE advisory pack lookup, built here (their stores
+        // are members constructed in the ctor, long before this) and handed to every consumer:
+        // the legacy DELETE /api/instructions/{id}, the pack uninstall (WorkflowRoutes), the v1
+        // DELETE twin and MCP delete_definition, so none of them can disagree about what blocks a
         // delete. The lookups hold raw store pointers, the same lifetime the route lambdas'
         // other store pointers already rely on.
         DefinitionReferrersFn definition_referrers_fn = make_definition_referrers_fn(
@@ -17887,6 +17897,8 @@ private:
                              .audit_fn = audit_fn,
                              .emit_event_fn = emit_event_fn,
                              .store = instruction_store_.get(),
+                             .referrers_fn = definition_referrers_fn,
+                             .pack_advisory_fn = definition_pack_advisory_fn,
                              .csrf_trusted_origins = cfg_.csrf_trusted_origins,
                          });
 
@@ -21945,6 +21957,7 @@ private:
             emit_event(event_type, req);
         };
         wf_deps.emit_event_fn = emit_event_fn; // the v1 execute twin's workflow.executed
+        wf_deps.referrers_fn = definition_referrers_fn; // M2: the pack uninstall's referrer guard
         wf_deps.scope_fn =
             [this](const std::string& expression,
                    const std::string& principal) -> std::pair<std::size_t, std::size_t> {
@@ -23701,8 +23714,8 @@ private:
         // instruction-set authoring routes. Same store, same permission gate and same audit sink
         // as the legacy cluster above; audit-first on every write.
         {
-            // UP-6: the SAME referrer lookup built above is shared here and with the MCP
-            // delete_definition (wired into mcp_server_ below).
+            // UP-6: the SAME referrer lookup built before the legacy routes (see there) is shared
+            // here and with the MCP delete_definition (wired into mcp_server_ below).
             yuzu::server::instruction_authoring::RouteDeps authoring_deps;
             authoring_deps.perm_fn = [this](const httplib::Request& req, httplib::Response& res,
                                             const std::string& securable_type,
