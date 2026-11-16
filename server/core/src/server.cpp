@@ -6158,6 +6158,20 @@ public:
             }
         }
 
+        // process_introspect ships default-off (Forensics class, like remote_access_audit);
+        // enable via PUT /api/v1/plugin-config/process_introspect/kill-switch.
+        if (plugin_config_store_ && !startup_failed_) {
+            if (!plugin_config_store_->seed_kill_switch_default_off(
+                    "process_introspect",
+                    "default-off: forensics class; enable per PUT "
+                    "/api/v1/plugin-config/process_introspect/kill-switch")) {
+                spdlog::error(
+                    "[PG] Refusing to start: process_introspect default-off kill-switch "
+                    "seed failed");
+                startup_failed_ = true;
+            }
+        }
+
         // UploadGrantStore (PR1.6a/c) — no secret codec of its own: grant
         // and session credentials are stored as SHA-256 digests, never a
         // sealed SecretCodec blob (upload_grant_store.hpp file header).

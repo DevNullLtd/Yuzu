@@ -38,6 +38,7 @@
 #include "capability_decls/plugin_action_catalogue_power_health.hpp"
 #include "capability_decls/plugin_action_catalogue_printing.hpp"
 #include "capability_decls/plugin_action_catalogue_privacy_permissions.hpp"
+#include "capability_decls/plugin_action_catalogue_process_introspect.hpp"
 #include "capability_decls/plugin_action_catalogue_remote_access_audit.hpp"
 #include "capability_decls/plugin_action_catalogue_runtimes.hpp"
 #include "capability_decls/plugin_action_catalogue_shares.hpp"
@@ -78,4 +79,5 @@
     ::yuzu::server::capdecls::plugin_action_catalogue_shares(),\
     ::yuzu::server::capdecls::plugin_action_catalogue_virtualization(),\
     ::yuzu::server::capdecls::plugin_action_catalogue_remote_access_audit(),\
+    ::yuzu::server::capdecls::plugin_action_catalogue_process_introspect(),\
     ::yuzu::server::capdecls::plugin_action_catalogue_middleware()

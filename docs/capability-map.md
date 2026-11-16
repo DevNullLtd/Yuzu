@@ -1009,7 +1009,7 @@ Token rotation: `POST /api/v1/tokens/{id}/rotate` and its confirm step (`ApiToke
 
 ### 18.17 Plugin Configuration, Secrets and Kill Switches :white_check_mark: `T2` *(new row, v4.1)*
 
-`/api/v1/plugin-config` (list, get, set per key, and the per-plugin `kill-switch` with optional `action`/`os`) on the `PluginConfig` and `PluginSecret` securables, with MCP twins `list_plugin_config`, `get_plugin_config`, `set_plugin_config`, `delete_plugin_config`, `set_plugin_secret`, `delete_plugin_secret`, `get_plugin_kill_switch` and `set_plugin_kill_switch`. The Forensics-tier plugins (`browser_inventory`, `execution_artifacts`, `privacy_permissions`, `remote_access_audit`) are seeded default-off. *(Evidence: `server/core/src/plugin_config_parsers.hpp`, `PluginConfigStore::seed_kill_switch_default_off`.)*
+`/api/v1/plugin-config` (list, get, set per key, and the per-plugin `kill-switch` with optional `action`/`os`) on the `PluginConfig` and `PluginSecret` securables, with MCP twins `list_plugin_config`, `get_plugin_config`, `set_plugin_config`, `delete_plugin_config`, `set_plugin_secret`, `delete_plugin_secret`, `get_plugin_kill_switch` and `set_plugin_kill_switch`. The Forensics-tier plugins (`browser_inventory`, `execution_artifacts`, `privacy_permissions`, `remote_access_audit`, `process_introspect`) are seeded default-off. *(Evidence: `server/core/src/plugin_config_parsers.hpp`, `PluginConfigStore::seed_kill_switch_default_off`.)*
 
 ### 18.18 KEK Rotation and Secrets Rewrap :white_check_mark: `T2` *(new row, v4.1)*
 
@@ -1831,6 +1831,8 @@ ADR-0070 D5/R1: operators register third-party CRL sources through `/api/v1/cryp
 
 `remote_access_audit` plugin `list`: `sshd_config` as written (Includes followed), per-account `authorized_keys` SHA-256 fingerprints and option names, and sshd service state — never a key comment, option value, principals list or key-file path. Forensics securable, default-off, AdminOrApproval, single-target. macOS supported, Linux constrained, Windows planned. *(Evidence: `agents/plugins/remote_access_audit/README.md`.)*
 
+`process_introspect` plugin `inspect`: one pid and one facet per request (`resource_limits`, `sigmasks`, `caps`, `seccomp`, `oom`, `sched`) as numbers, masks and fixed tokens — never file or memory contents, environment values, socket payloads or command-line arguments. Forensics securable, default-off, AdminOrApproval, single-target. Linux constrained, macOS and Windows planned. *(Evidence: `agents/plugins/process_introspect/README.md`.)*
+
 ### 42.11 Filesystem Mount, Quota and Snapshot Posture :large_orange_diamond: `T3` *(new row, v4.1)*
 
 `filesystem_posture` plugin: `mounts`, per-mount `quotas` subsystem state and snapshot-capable volumes (`snapshots`), read-only (`Inventory:Read`). macOS supported; Windows and Linux constrained. *(Evidence: `agents/plugins/filesystem_posture/README.md`.)*
@@ -1908,6 +1910,7 @@ ADR-0070 D5/R1: operators register third-party CRL sources through `/api/v1/cryp
 | update_source_trust | - | Y | - | Security |
 | mgmt_posture | - | 🟡 | Y | Security |
 | remote_access_audit | - | 🟡 | Y | Security |
+| process_introspect | - | 🟡 | - | Security |
 | shares | Y | Y | Y | Network |
 | virtualization | 🟡 | Y | Y | System Info |
 | agent_logging | Y | Y | Y | Agent Mgmt |
