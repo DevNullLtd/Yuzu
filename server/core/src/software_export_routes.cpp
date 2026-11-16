@@ -264,7 +264,7 @@ void SoftwareExportRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                         std::string(export_cap ? "export concurrency limit reached"
                                                : "server held-open stream budget full") +
                             "; reason=" + std::string(reason) + "; cid=" + cid);
-            res.set_header("Retry-After", "5");
+            res.set_header("Retry-After", std::to_string(swe::kRetryAfterMs / 1000));
             fail(res, 503,
                  export_cap ? "too many concurrent software exports"
                             : "the server is running as many held-open requests as it is sized for",
@@ -282,7 +282,7 @@ void SoftwareExportRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 (void)audit(*ctx, req, "failure", target,
                             "version read degraded; cid=" + cid);
                 fail(res, 503, "software inventory store degraded - version range read failed",
-                     {.retry_after_ms = 5000, .remediation = "retry the request"});
+                     {.retry_after_ms = swe::kRetryAfterMs, .remediation = "retry the request"});
                 return;
             }
             auto set = swl::resolve_version_range(*distinct, *rq.list.range);
