@@ -912,9 +912,14 @@ public:
     /// admin was revoked, governance-missed / adversarial C2). The clear is
     /// attempted even when the pre-clear session read is degraded; if that clear
     /// succeeds the value is true when a session row existed (was_elevated is
-    /// then UNKNOWN: an elevation, if there was one, has been ended). Store-less
-    /// (legacy) mode never errors.
-    [[nodiscard]] std::expected<bool, std::string> revoke_elevation(const std::string& token);
+    /// then UNKNOWN: an elevation, if there was one, has been ended) and, when
+    /// `lookup_degraded` is non-null, `*lookup_degraded` is set true so the caller
+    /// can report "unknown" instead of asserting an elevation was ended (it is
+    /// false on every other path). On a success the cached session is dropped
+    /// (advancing the cache epoch), not zeroed in place. Store-less (legacy) mode
+    /// never errors.
+    [[nodiscard]] std::expected<bool, std::string> revoke_elevation(const std::string& token,
+                                                                    bool* lookup_degraded = nullptr);
 
     /// Clear any active JIT elevation on EVERY session of `username` (all
     /// devices). Called when an admin removes a user's elevation eligibility so

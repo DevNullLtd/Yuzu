@@ -29785,12 +29785,15 @@ McpServer::HandlerFn McpServer::build_handler(
                                         "application/json");
                         return;
                     }
+                    // audit_token, not log_key_token: it maps space, '=' and ',' as well as
+                    // control bytes to '_', so a value cannot forge a `role=x error=y` field
+                    // on this unquoted line. Each value is capped at 256 bytes.
+                    const auto tok = [](std::string_view v) { return audit_token(v.substr(0, 256)); };
                     spdlog::warn("rbac.role.unassigned store fault: user={} role={} error={}",
-                                 ::yuzu::log_key_token(principal_id),
-                                 ::yuzu::log_key_token(role_id),
-                                 ::yuzu::log_key_token(flatten_audit_text(result.error())));
+                                 tok(principal_id), tok(role_id), tok(result.error()));
                     // A store fault returns a constant client message; the raw text
-                    // goes only to the audit row above.
+                    // reaches only the audit row above and the server log line, never
+                    // the client.
                     res.set_content(
                         a4_error(kInternalError,
                                  "role unassignment store fault; retry, and if this persists "

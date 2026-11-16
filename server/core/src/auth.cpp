@@ -1650,7 +1650,10 @@ AuthManager::elevate_session(const std::string& token, std::chrono::seconds dura
     return until;
 }
 
-std::expected<bool, std::string> AuthManager::revoke_elevation(const std::string& token) {
+std::expected<bool, std::string> AuthManager::revoke_elevation(const std::string& token,
+                                                               bool* lookup_degraded) {
+    if (lookup_degraded)
+        *lookup_degraded = false;
     if (token.size() > auth::kMaxSessionTokenLength)
         return false;
     if (session_store_) {
@@ -1693,15 +1696,21 @@ std::expected<bool, std::string> AuthManager::revoke_elevation(const std::string
                                        "; durable clear also failed: " + r.error().message);
             return std::unexpected(std::string("durable clear failed: ") + r.error().message);
         }
-        std::unique_lock lock(mu_);
-        if (auto it = sessions_.find(key); it != sessions_.end()) {
-            it->second.elevated_until = {};
-            it->second.elevation_issued_at = {};
-            it->second.steady_elevated_until = {}; // the field is_elevated reads
+        // Drop the cached entry (advancing the cache epoch) rather than zeroing it in place: a
+        // validator that read the still-elevated durable row before the clear and is parked
+        // before its cache insert re-inserts only while the epoch is unchanged
+        // (validate_session_durable), so an in-place zero would let it put an elevated copy
+        // back. The next validate re-reads the cleared durable row.
+        {
+            std::unique_lock lock(mu_);
+            drop_cached_session_locked(key);
         }
         // With a degraded read was_elevated is UNKNOWN: the clear succeeded, so any elevation
-        // is definitively gone, and the answer is whether a row existed (true = "an elevation,
-        // if there was one, has been ended"; never a false "nothing was elevated").
+        // is definitively gone. The returned value is then only whether a session ROW existed
+        // (clear_elevation's RETURNING), NOT whether it was elevated, and `*lookup_degraded` is
+        // set so the caller can say "unknown" rather than claim an elevation was ended.
+        if (find_error && lookup_degraded)
+            *lookup_degraded = true;
         return find_error ? *r : was_elevated;
     }
     std::unique_lock lock(mu_);

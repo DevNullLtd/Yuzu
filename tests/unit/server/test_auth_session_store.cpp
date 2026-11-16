@@ -405,11 +405,14 @@ TEST_CASE("AuthManager+SessionStore: revoke_elevation after elevate_session stil
     // The fault does what it claims: the read fails, so the old code returned before the clear.
     REQUIRE_FALSE(store.find(AuthManager::sha256_hex(token)).has_value());
 
-    const auto rev = a->revoke_elevation(token);
+    bool lookup_degraded = false;
+    const auto rev = a->revoke_elevation(token, &lookup_degraded);
     read_fault.repair();
 
     REQUIRE(rev.has_value()); // the clear succeeded, so success even with the read degraded
     CHECK(*rev);              // was_elevated unknown: reported true because a row existed
+    // g8-sec-1: the caller is told the answer is "unknown", so it cannot audit `was_elevated=true`.
+    CHECK(lookup_degraded);
     auto b = make_mgr(store); // a fresh replica reads the durable row
     const auto s = b->validate_session(token);
     REQUIRE(s.has_value());
@@ -455,12 +458,15 @@ TEST_CASE("AuthManager+SessionStore: revoke_elevation after elevate_session repo
     auto token = a->create_local_session_for_test("nora", Role::user, /*mfa_verified=*/true);
     REQUIRE(a->elevate_session(token, std::chrono::seconds(120)).has_value()); // cache now cold
 
-    const auto first = a->revoke_elevation(token);
+    bool degraded = true; // reset to false by every call
+    const auto first = a->revoke_elevation(token, &degraded);
     REQUIRE(first.has_value());
     CHECK(*first); // a real step-down
-    const auto second = a->revoke_elevation(token);
+    CHECK_FALSE(degraded);
+    const auto second = a->revoke_elevation(token, &degraded);
     REQUIRE(second.has_value());
     CHECK_FALSE(*second); // nothing left to step down from
+    CHECK_FALSE(degraded);
 }
 
 TEST_CASE("AuthManager+SessionStore: a failed single-session invalidate reports db_persisted=false",

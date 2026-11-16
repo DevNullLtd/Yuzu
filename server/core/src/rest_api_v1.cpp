@@ -9213,15 +9213,19 @@ void RestApiV1::register_routes(
                 // 400 and not a retryable 503.
                 const bool bad_input =
                     result.error() == "invalid role name" || result.error() == "invalid principal";
-                if (!last_admin && !bad_input)
+                if (!last_admin && !bad_input) {
+                    // audit_token, not log_key_token: it maps space, '=' and ',' as well as
+                    // control bytes to '_', so a value cannot forge a `role=x error=y` field
+                    // on this unquoted line. Each value is capped at 256 bytes.
+                    const auto tok = [](std::string_view v) { return audit_token(v.substr(0, 256)); };
                     spdlog::warn("rbac.role.unassigned store fault: user={} role={} error={}",
-                                 ::yuzu::log_key_token(principal_id),
-                                 ::yuzu::log_key_token(role_name),
-                                 ::yuzu::log_key_token(flatten_audit_text(result.error())));
+                                 tok(principal_id), tok(role_name), tok(result.error()));
+                }
                 res.status = last_admin ? 409 : bad_input ? 400 : 503;
                 // The 409 carries the store's business-rule message; a store fault
                 // returns a constant client message (the raw text, which can name
-                // relations or carry a CONTEXT line, goes only to the audit row).
+                // relations or carry a CONTEXT line, reaches only the audit row and the
+                // server log line above, never the client).
                 res.set_content(
                     detail::a4_error(
                         res, last_admin || bad_input

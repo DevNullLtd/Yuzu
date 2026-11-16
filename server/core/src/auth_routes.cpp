@@ -5850,7 +5850,8 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                       res.set_content(detail::a4_denial(res, 401, "unauthorized"), "application/json");
                       return;
                   }
-                  auto rev = auth_mgr_.revoke_elevation(token);
+                  bool lookup_degraded = false;
+                  auto rev = auth_mgr_.revoke_elevation(token, &lookup_degraded);
                   if (!rev) {
                       // Durable clear failed — the elevation may still be LIVE.
                       // Fail CLOSED (503 + error audit) rather than auditing a
@@ -5869,10 +5870,15 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                       return;
                   }
                   const bool was_elevated = *rev;
+                  // A degraded pre-clear lookup means the clear succeeded but whether the
+                  // session WAS elevated is unknown (`*rev` is then only "a row existed"):
+                  // never claim an elevation was ended.
                   audit_log_for_principal(req, "role.elevation.revoked", "ok", session->username,
                                           auth::role_to_string(session->role), "User",
                                           session->username,
-                                          was_elevated ? "was_elevated=true" : "was_elevated=false");
+                                          lookup_degraded ? "was_elevated=unknown"
+                                          : was_elevated  ? "was_elevated=true"
+                                                          : "was_elevated=false");
                   res.set_content(R"({"status":"ok"})", "application/json");
               });
 }

@@ -69,8 +69,12 @@
 #include <catch2/matchers/catch_matchers_string.hpp>
 #include <libpq-fe.h>
 #include <nlohmann/json.hpp>
+#include <spdlog/sinks/ostream_sink.h>
+#include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <memory>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -1110,6 +1114,47 @@ TEST_CASE("MCP unassign_rbac_role: a genuine store fault is kInternalError with 
     // The raw store error still reaches the audit row (which is what proves the client
     // message above is a substitution and not an absence of the error).
     CHECK(h.audit_log.back().detail.find("principal_roles") != std::string::npos);
+}
+
+TEST_CASE("MCP unassign_rbac_role: the store-fault log line neutralises a hostile role, so it "
+          "cannot forge a field (g8-sec-3)",
+          "[pg][mcp][rbac][a2]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(h.auth_db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult d{
+            PQexec(conn.get(), "DROP TABLE rbac_store.principal_roles CASCADE")};
+        REQUIRE(d.ok());
+    }
+
+    // Captures the default logger for this scope (restored on every unwind path).
+    std::ostringstream oss;
+    const auto prev = spdlog::default_logger();
+    {
+        auto lg = std::make_shared<spdlog::logger>(
+            "g8_sec_3_test", std::make_shared<spdlog::sinks::ostream_sink_mt>(oss));
+        lg->set_level(spdlog::level::trace);
+        spdlog::set_default_logger(lg);
+    }
+    struct Restore {
+        std::shared_ptr<spdlog::logger> prev;
+        ~Restore() { spdlog::set_default_logger(prev); }
+    } restore{prev};
+
+    auto res = h.mcp_call_tool_approved("unassign_rbac_role",
+                                        {{"principal_id", "jane"}, {"role", "Operator x error=y"}});
+    REQUIRE(res);
+    const std::string log = oss.str();
+    const auto at = log.find("rbac.role.unassigned store fault:");
+    REQUIRE(at != std::string::npos);
+    const auto line = log.substr(at, log.find('\n', at) - at);
+    // The hostile value is one token: no space or '=' survives inside the role field, so it
+    // cannot start a second `error=` field ahead of the real one.
+    CHECK(line.find("role=Operator_x_error_y ") != std::string::npos);
+    CHECK(line.find("role=Operator x") == std::string::npos);
+    CHECK(line.find("x error=y") == std::string::npos);
 }
 
 // ── REST: assign_role store-fault classification (Doomgoose external

@@ -1569,3 +1569,39 @@ TEST_CASE("elevate_session and the MFA stamp still show on the next validate, wh
     CHECK(yuzu::server::auth::effective_role(*s) == Role::admin);
     CHECK(s->mfa_verified_at != std::chrono::system_clock::time_point{}); // the stamp survived
 }
+
+TEST_CASE("revoke_elevation drops the cached session, so a validation that read the elevated row "
+          "before the clear cannot re-cache an elevated copy (g8-sec-2)",
+          "[auth][session_store][account_active][cache_epoch][pg][unassign_elevation]") {
+    // elevate_session leaves the cache cold, so revoke_elevation finds no entry to zero. A
+    // validator that read the still-elevated durable row and is parked before its cache insert
+    // inserts only while the cache epoch is unchanged; zeroing in place never advances it, so
+    // the elevated copy would be served from the cache until the next generation poll.
+    YUZU_REQUIRE_PG_DB_TPL(db, sessacct_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 6}};
+    SessionStore store{pool};
+    REQUIRE(store.is_open());
+    auto a = make_mgr(store);
+
+    const auto token = a->create_local_session_for_test("alice", Role::user, true);
+    REQUIRE_FALSE(token.empty());
+    REQUIRE(a->elevate_session(token, std::chrono::seconds(300)).has_value()); // cache is cold
+    a->suppress_session_generation_poll_for_test(); // a real poll would mask the resurrection
+
+    HeldValidation held;
+    held.install(*a);
+    // The cold validation reads the elevated durable row, then parks before the cache insert.
+    held.start([&] { return a->validate_session(token); });
+
+    const auto rev = a->revoke_elevation(token); // durable clear, then returns
+    REQUIRE(rev.has_value());
+    CHECK(*rev);
+
+    // The held validation is concurrent with the revoke, so what it returns is not asserted.
+    (void)held.release_and_join();
+
+    const auto s = a->validate_session(token);
+    REQUIRE(s.has_value());
+    CHECK_FALSE(yuzu::server::auth::is_elevated(*s));
+    CHECK(yuzu::server::auth::effective_role(*s) == Role::user);
+}
