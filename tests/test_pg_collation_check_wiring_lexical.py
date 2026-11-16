@@ -69,6 +69,10 @@ Invariants:
      recheck: a refused thread creation (a task or thread limit) must degrade a best-effort check,
      not abort the boot (found by an external review; one mutant).
 
+  14b. The catch logs at ERROR (`spdlog::error(`), never warn: a recheck that never starts leaves
+     a Mismatch or Unproven gate in place until a restart (writes paused, CI reads refused), which
+     is an operator-actionable fault, not a degradation to note in passing.
+
   15. The collation GATE (the lock-free atomic the check publishes, which pauses device_ci writes)
      is wired at all three ends: both report sites (the constructor-time `report_collation_check(`
      and the `PgCollationRecheck` construction) pass `&collation_gate_`, and
@@ -162,6 +166,9 @@ MSG_JOIN_LATE = ("the PgCollationRecheck join must come after the leader resign,
                  "able to skip them")
 START_CATCH = "} catch (const std::exception& e) {"
 RESET_ARM = "pg_collation_recheck_.reset();"
+MSG_START_NOT_ERROR = ("the PgCollationRecheck start() catch does not log with spdlog::error (or logs "
+                       "with spdlog::warn): a failed start leaves a Mismatch or Unproven gate in place "
+                       "until a restart, so it must be an ERROR")
 MSG_START_UNGUARDED = ("the PgCollationRecheck start() is not wrapped in try/catch(const std::exception&) "
                        "that resets the unstarted recheck: a refused thread creation would abort the "
                        "boot of a best-effort check")
@@ -367,6 +374,11 @@ def recheck_problems(t, report_pos):
             out.append(MSG_NO_START)
         elif not (0 <= t.find(START_CATCH, start) < start + 120) or t.find(RESET_ARM, start, run[1]) < 0:
             out.append(MSG_START_UNGUARDED)
+        else:
+            c0 = t.find(START_CATCH, start)
+            c1 = t.find(RESET_ARM, start, run[1])
+            if "spdlog::error(" not in t[c0:c1] or "spdlog::warn(" in t[c0:c1]:
+                out.append(MSG_START_NOT_ERROR)
     stops = [m.start() for m in re.finditer(re.escape(STOP), t)]
     if len(stops) != 1:
         out.append(MSG_STOP_COUNT.format(n=len(stops)))
@@ -651,6 +663,20 @@ class PgCollationCheckWiring(unittest.TestCase):
                        "pg_collation_recheck_->start();", self.src, count=1, flags=re.S)
         self.assertEqual(n, 1)
         self.assertEqual(problems(m), [MSG_START_UNGUARDED])
+
+    def test_start_catch_logging_at_warn_not_error(self):
+        i = self.src.index(START)
+        j = self.src.index("spdlog::error(", i)
+        m = self.src[:j] + "spdlog::warn(" + self.src[j + len("spdlog::error("):]
+        self.assertNotEqual(m, self.src)
+        self.assertEqual(problems(m), [MSG_START_NOT_ERROR])
+
+    def test_start_catch_without_a_log(self):
+        i = self.src.index(START)
+        j = self.src.index("spdlog::error(", i)
+        m = self.src[:j] + "(void)(" + self.src[j + len("spdlog::error("):]
+        self.assertNotEqual(m, self.src)
+        self.assertEqual(problems(m), [MSG_START_NOT_ERROR])
 
     def test_start_guard_with_the_stop_condition_not_negated(self):
         m = self.src.replace("!stop_requested_.load(std::memory_order_acquire)) {\n                    pg_collation_recheck_",

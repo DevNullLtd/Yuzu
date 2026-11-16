@@ -9731,14 +9731,22 @@ public:
                     // refusal to create its thread (a task or thread limit) degrades instead of
                     // failing the boot: the check does not stop the server. Without the repeat the
                     // last-completed gauge stops advancing and YuzuPgCollationCheckStale fires,
-                    // and collation_gate_ keeps the value the start-time check left.
+                    // and collation_gate_ keeps the value the start-time check left. That is not
+                    // harmless: nothing will ever lift the gate, so a Mismatch or Unproven gate
+                    // stays until a restart, with device_ci writes paused (Mismatch) and the CI
+                    // reads refused (either). Hence ERROR, not warn. No retry is attempted.
                     try {
                         pg_collation_recheck_->start();
                     } catch (const std::exception& e) {
-                        spdlog::warn("[PG] could not start the collation version recheck thread "
-                                     "(continuing with the start-time check only; the repeat will "
-                                     "not run): {}",
-                                     ::yuzu::log_key_token(e.what()));
+                        spdlog::error(
+                            "[PG] could not start the collation version recheck thread ({}); the "
+                            "collation gate will NOT be rechecked: a Mismatch or Unproven gate "
+                            "stays until this server restarts, so device_ci writes stay paused "
+                            "(Mismatch) and the device CI reads stay refused (Mismatch or "
+                            "Unproven) until then. Restart this server once the thread or task "
+                            "limit is fixed. See docs/user-manual/server-admin.md, 'PostgreSQL "
+                            "collation version'. The server keeps running.",
+                            ::yuzu::log_key_token(e.what()));
                         pg_collation_recheck_.reset();
                     }
                 }
