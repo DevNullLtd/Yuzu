@@ -1,9 +1,10 @@
 /**
  * test_software_sync_decision.cpp — fixture vectors for the pure decision core behind
  * POST /api/v1/hardware/sync (the Software page's "Sync now" for a device / scope / fleet):
- * the request grammar, the target partition, the fleet-wide rule, the 500-target cap, the
- * per-operator cooldown, and the audit/response wording. No process, clock, registry or
- * store — see software_sync_decision.hpp.
+ * the request grammar (confirm, last_synced_before), the target partition (no target ceiling),
+ * the fleet-administrator and confirmation rules, the run key, the join rule, the per-key
+ * cooldown rule, and the audit/response wording. No process, clock, registry or store — see
+ * software_sync_decision.hpp.
  */
 
 #include "hardware_list_model.hpp" // agent_supports_sync_now: the real 0.13.1 floor
@@ -12,6 +13,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <functional>
+#include <limits>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -129,6 +131,42 @@ TEST_CASE("sync request: id and expression length bounds are inclusive", "[serve
     CHECK_FALSE(ss::parse_request(json{{"scope_expression", ex_long}}).has_value());
 }
 
+TEST_CASE("sync request: confirm must be a JSON boolean; last_synced_before a non-negative integer",
+          "[server][software_sync]") {
+    const auto confirm_of = [](const char* extra) {
+        return ss::parse_request(json::parse(std::string(R"({"scope":"group:g",)") + extra + "}"));
+    };
+    CHECK(confirm_of(R"("confirm":true)")->confirm);
+    CHECK_FALSE(confirm_of(R"("confirm":false)")->confirm);
+    CHECK_FALSE(ss::parse_request(json{{"scope", "group:g"}})->confirm); // absent is false
+    for (const char* bad : {R"("confirm":"true")", R"("confirm":1)", R"("confirm":0)", R"("confirm":null)",
+                            R"("confirm":[true])", R"("confirm":{})"}) {
+        INFO(bad);
+        CHECK_FALSE(confirm_of(bad).has_value());
+    }
+
+    CHECK_FALSE(ss::parse_request(json{{"scope", "group:g"}})->last_synced_before.has_value());
+    CHECK(confirm_of(R"("last_synced_before":0)")->last_synced_before == 0);
+    CHECK(confirm_of(R"("last_synced_before":1700000000)")->last_synced_before == 1700000000);
+    CHECK(confirm_of(R"("last_synced_before":9223372036854775807)")->last_synced_before ==
+          std::numeric_limits<std::int64_t>::max());
+    for (const char* bad : {R"("last_synced_before":-1)", R"("last_synced_before":1.5)",
+                            R"("last_synced_before":1e3)", R"("last_synced_before":"1700000000")",
+                            R"("last_synced_before":true)", R"("last_synced_before":null)",
+                            R"("last_synced_before":9223372036854775808)",
+                            R"("last_synced_before":18446744073709551615)"}) {
+        INFO(bad);
+        CHECK_FALSE(confirm_of(bad).has_value());
+    }
+    // Both ride along with a selector of any arm; neither selects anything.
+    const auto device = ss::parse_request(json::parse(R"({"scope":"host-01","confirm":true,"last_synced_before":5})"));
+    REQUIRE(device.has_value());
+    CHECK(device->arm == DispatchArm::Ids);
+    CHECK(device->expr == "host-01");
+    CHECK(device->confirm);
+    CHECK(device->last_synced_before == 5);
+}
+
 TEST_CASE("sync request: both spellings of an empty group name are refused with the same message",
           "[server][software_sync]") {
     CHECK(kGroupScopePrefix == "group:");
@@ -173,7 +211,6 @@ TEST_CASE("sync partition: offline; too-old and unparseable are counted; not sen
     CHECK(p.counts.skipped_version == 3);
     CHECK(p.counts.requested ==
           p.counts.reached + p.counts.skipped_offline + p.counts.skipped_version);
-    CHECK_FALSE(p.over_cap);
 }
 
 TEST_CASE("sync partition: nothing in; nothing out", "[server][software_sync]") {
@@ -183,9 +220,10 @@ TEST_CASE("sync partition: nothing in; nothing out", "[server][software_sync]") 
     CHECK(p.counts.reached == 0);
 }
 
-TEST_CASE("sync partition: stops at the first reachable target past the cap", "[server][software_sync]") {
+TEST_CASE("sync partition: there is no target ceiling; 10,000 reachable ids partition to 10,000 targets",
+          "[server][software_sync]") {
     std::vector<std::string> in;
-    for (std::size_t i = 0; i < ss::kMaxTargets + 200; ++i)
+    for (std::size_t i = 0; i < 10'000; ++i)
         in.push_back("d" + std::to_string(i));
     std::size_t lookups = 0;
     const auto p = ss::partition(
@@ -195,14 +233,30 @@ TEST_CASE("sync partition: stops at the first reachable target past the cap", "[
             return std::optional<std::string>("0.13.1");
         },
         floor_ok);
-    CHECK(p.over_cap);
-    CHECK(p.targets.size() == ss::kMaxTargets + 1);
-    CHECK(lookups == ss::kMaxTargets + 1);
-    // Exactly the cap is not over it.
-    in.resize(ss::kMaxTargets);
-    CHECK_FALSE(ss::partition(in, [](const std::string&) { return std::optional<std::string>("0.13.1"); },
-                              floor_ok)
-                    .over_cap);
+    CHECK(p.targets.size() == 10'000);
+    CHECK(p.counts.requested == 10'000);
+    CHECK(p.counts.reached == 10'000);
+    CHECK(lookups == 10'000); // one session lookup per candidate, the walk is never cut short
+}
+
+TEST_CASE("sync fresh split: only devices not older than the bound are dropped; no row is stale",
+          "[server][software_sync]") {
+    const std::vector<std::string> in = {"a", "b", "c", "d", "e"};
+    const std::unordered_map<std::string, std::int64_t> seen = {
+        {"a", 1000},  // exactly the bound: not older than it, so fresh
+        {"b", 999},   // one second older: asked
+        {"c", 5000},  // newer: fresh
+        {"d", 0},     // a store row with a zero stamp is just old
+        // "e" has no row: never reported, so it is asked
+    };
+    const auto split = ss::split_fresh(in, seen, 1000);
+    CHECK(split.stale == std::vector<std::string>{"b", "d", "e"}); // input order preserved
+    CHECK(split.fresh == 2);
+    CHECK(split.stale.size() + split.fresh == in.size());
+    // A bound of 0 makes every device that has a row fresh; only a device with no row is asked.
+    CHECK(ss::split_fresh(in, seen, 0).fresh == 4);
+    CHECK(ss::split_fresh(in, seen, 0).stale == std::vector<std::string>{"e"});
+    CHECK(ss::split_fresh({}, seen, 1000).stale.empty());
 }
 
 TEST_CASE("sync finalize: a refused send moves a target to skipped_offline", "[server][software_sync]") {
@@ -223,74 +277,103 @@ TEST_CASE("sync finalize: a refused send moves a target to skipped_offline", "[s
     CHECK(ss::finalize(planned, 99).skipped_offline == 3);
 }
 
-// ── verdicts ──────────────────────────────────────────────────────────────────────
+// ── fleet administrator, confirmation, run key, join ──────────────────────────────
 
-TEST_CASE("sync decide: only an unfiltered caller may name the whole fleet", "[server][software_sync]") {
-    const ss::Counts few{.requested = 3, .reached = 3};
-    CHECK(ss::decide(DispatchArm::Broadcast, true, few) == ss::Verdict::Proceed);
-    CHECK(ss::decide(DispatchArm::Broadcast, false, few) == ss::Verdict::FleetWideRequired);
-    // The other arms never need the fleet-wide grant; their targets are already confined.
+TEST_CASE("sync fleet: only an unfiltered caller who is also a fleet administrator may name the fleet",
+          "[server][software_sync][security]") {
+    CHECK_FALSE(ss::fleet_wide_denied(DispatchArm::Broadcast, true, true));
+    CHECK(ss::fleet_wide_denied(DispatchArm::Broadcast, true, false));  // unfiltered but not an admin
+    CHECK(ss::fleet_wide_denied(DispatchArm::Broadcast, false, true));  // an admin grant, but confined
+    CHECK(ss::fleet_wide_denied(DispatchArm::Broadcast, false, false));
+    // The other arms never need it; their targets are already confined to the caller's set.
     for (const auto arm : {DispatchArm::Group, DispatchArm::Scope, DispatchArm::Ids}) {
-        CHECK(ss::decide(arm, false, few) == ss::Verdict::Proceed);
-        CHECK(ss::decide(arm, true, few) == ss::Verdict::Proceed);
+        CHECK_FALSE(ss::fleet_wide_denied(arm, false, false));
+        CHECK_FALSE(ss::fleet_wide_denied(arm, true, false));
     }
-    CHECK(ss::fleet_wide_denied(DispatchArm::Broadcast, false));
-    CHECK_FALSE(ss::fleet_wide_denied(DispatchArm::Broadcast, true));
-    CHECK_FALSE(ss::fleet_wide_denied(DispatchArm::Group, false));
 }
 
-TEST_CASE("sync decide: the cap is on what is reached; and 500 itself is allowed", "[server][software_sync]") {
-    CHECK(ss::kMaxTargets == 500);
-    CHECK(ss::decide(DispatchArm::Group, true, {.requested = 500, .reached = 500}) == ss::Verdict::Proceed);
-    CHECK(ss::decide(DispatchArm::Group, true, {.requested = 501, .reached = 501}) == ss::Verdict::TooMany);
-    CHECK(ss::decide(DispatchArm::Scope, false, {.requested = 9000, .reached = 501}) == ss::Verdict::TooMany);
-    // A big named set that is mostly offline still dispatches only what is live.
-    CHECK(ss::decide(DispatchArm::Group, true,
-                     {.requested = 900, .reached = 400, .skipped_offline = 500}) == ss::Verdict::Proceed);
-    // The fleet-wide refusal outranks the cap: a confined caller learns nothing about size.
-    CHECK(ss::decide(DispatchArm::Broadcast, false, {.requested = 900, .reached = 900}) ==
-          ss::Verdict::FleetWideRequired);
+TEST_CASE("sync confirm: a whole group or the whole fleet needs confirm; a device or expression never does",
+          "[server][software_sync]") {
+    CHECK(ss::confirmation_required(DispatchArm::Group, false));
+    CHECK(ss::confirmation_required(DispatchArm::Broadcast, false));
+    CHECK_FALSE(ss::confirmation_required(DispatchArm::Group, true));
+    CHECK_FALSE(ss::confirmation_required(DispatchArm::Broadcast, true));
+    for (const auto arm : {DispatchArm::Ids, DispatchArm::Scope}) {
+        CHECK_FALSE(ss::confirmation_required(arm, false));
+        CHECK_FALSE(ss::confirmation_required(arm, true));
+    }
+    // An empty or missing scope never means the fleet: it is refused at the grammar, so the
+    // fleet word has to be spelled out.
+    CHECK_FALSE(ss::parse_request(json::parse(R"({"confirm":true})")).has_value());
+    CHECK_FALSE(ss::parse_request(json::parse(R"({"scope":"","confirm":true})")).has_value());
+    CHECK_FALSE(ss::parse_request(json::parse(R"({"scope_expression":"","confirm":true})")).has_value());
+}
+
+TEST_CASE("sync run key: fleet; group by caller class; scope by requester and exact expression",
+          "[server][software_sync]") {
+    const ss::Selector fleet{DispatchArm::Broadcast, "__all__"};
+    const ss::Selector group{DispatchArm::Group, "group:finance"};
+    const ss::Selector expr{DispatchArm::Scope, R"(ostype == "linux")"};
+    // The whole fleet is one run for every administrator.
+    CHECK(ss::run_key(fleet, "alice", true) == "fleet");
+    CHECK(ss::run_key(fleet, "bob", true) == "fleet");
+    // Callers who see the whole group share its run; a confined caller has a run of their own.
+    CHECK(ss::run_key(group, "alice", true) == "group:finance");
+    CHECK(ss::run_key(group, "bob", true) == "group:finance");
+    CHECK(ss::run_key(group, "carol", false) == std::string("group:finance\x1f") + "carol");
+    CHECK(ss::run_key(group, "dave", false) != ss::run_key(group, "carol", false));
+    CHECK(ss::run_key(group, "carol", false) != ss::run_key(group, "carol", true));
+    // An expression resolves per caller: keyed by the requester and the full text, never hashed.
+    CHECK(ss::run_key(expr, "alice", true) == std::string("scope:alice\x1f") + R"(ostype == "linux")");
+    CHECK(ss::run_key(expr, "alice", true) == ss::run_key(expr, "alice", false)); // class does not matter
+    CHECK(ss::run_key(expr, "alice", true) != ss::run_key(expr, "bob", true));
+    CHECK(ss::run_key({DispatchArm::Scope, R"(ostype == "windows")"}, "alice", true) !=
+          ss::run_key(expr, "alice", true));
+    // Moving the split point between the username and the expression changes the key.
+    CHECK(ss::run_key({DispatchArm::Scope, "b"}, "a", true) != ss::run_key({DispatchArm::Scope, "ab"}, "", true));
+    // A group id that looks like a username suffix cannot collide with a confined caller's key.
+    CHECK(ss::run_key({DispatchArm::Group, "group:x"}, "y", false) !=
+          ss::run_key({DispatchArm::Group, "group:xy"}, "", true));
+}
+
+TEST_CASE("sync join: a running run with no filter covers everything; a filter covers its own and older bounds",
+          "[server][software_sync]") {
+    // The running run had no last_synced_before: it asked every device, so it covers any request.
+    CHECK(ss::join_covers(std::nullopt, std::nullopt));
+    CHECK(ss::join_covers(std::nullopt, 500));
+    // Both filtered: the request is covered when it is not wider than the run.
+    CHECK(ss::join_covers(1000, 1000));
+    CHECK(ss::join_covers(1000, 999));
+    CHECK(ss::join_covers(1000, 0));
+    CHECK_FALSE(ss::join_covers(1000, 1001)); // wants devices the run left out
+    // A filtered run never covers an unfiltered (every device) request.
+    CHECK_FALSE(ss::join_covers(1000, std::nullopt));
+    CHECK_FALSE(ss::join_covers(0, std::nullopt));
 }
 
 // ── cooldown ──────────────────────────────────────────────────────────────────────
 
-TEST_CASE("sync cooldown: 60 s per operator; boundary exact; a stamp from the future is stale",
+TEST_CASE("sync cooldown: per key and configurable; boundary exact; a stamp from the future is stale",
           "[server][software_sync]") {
-    CHECK(ss::kCooldownSecs == 60);
-    CHECK(ss::cooldown_remaining(std::nullopt, 1000) == 0);       // never ran
-    CHECK(ss::cooldown_remaining(1000, 1000) == 60);              // just ran
-    CHECK(ss::cooldown_remaining(1000, 1001) == 59);
-    CHECK(ss::cooldown_remaining(1000, 1059) == 1);
-    CHECK(ss::cooldown_remaining(1000, 1060) == 0);               // boundary: clear at exactly 60
-    CHECK(ss::cooldown_remaining(1000, 5000) == 0);
-    CHECK(ss::cooldown_remaining(1000, 999) == 0);                // clock stepped back by 1 s
-    CHECK(ss::cooldown_remaining(1000, 900) == 0);                // ...by 100 s: stale, not a lock-out
-    CHECK(ss::cooldown_remaining(1000, -5) == 0);
-}
-
-TEST_CASE("sync cooldown state: bounded; oldest stamp evicted; a returning operator never evicts",
-          "[server][software_sync]") {
-    std::unordered_map<std::string, std::int64_t> state;
-    CHECK_FALSE(ss::last_run_of(state, "alice").has_value());
-    ss::stamp(state, "alice", 100);
-    CHECK(ss::last_run_of(state, "alice") == 100);
-    ss::stamp(state, "alice", 200); // restamp replaces
-    CHECK(ss::last_run_of(state, "alice") == 200);
-
-    state.clear();
-    for (std::size_t i = 0; i < ss::kCooldownStateCap; ++i)
-        ss::stamp(state, "u" + std::to_string(i), static_cast<std::int64_t>(1000 + i));
-    REQUIRE(state.size() == ss::kCooldownStateCap);
-    // At the cap a returning operator is restamped in place, nobody is dropped.
-    ss::stamp(state, "u5", 9999);
-    CHECK(state.size() == ss::kCooldownStateCap);
-    CHECK(state.contains("u0"));
-    // A new operator evicts the oldest stamp (u0), and only that one.
-    ss::stamp(state, "newcomer", 5000);
-    CHECK(state.size() == ss::kCooldownStateCap);
-    CHECK_FALSE(state.contains("u0"));
-    CHECK(state.contains("u1"));
-    CHECK(state.contains("newcomer"));
+    CHECK(ss::kDefaultCooldownSecs == 600);
+    CHECK(ss::kMaxCooldownSecs == 86'400);
+    const auto left = [](std::optional<std::int64_t> last, std::int64_t now, std::int64_t window) {
+        return ss::cooldown_remaining(last, now, window);
+    };
+    CHECK(left(std::nullopt, 1000, 600) == 0);       // never ran
+    CHECK(left(1000, 1000, 600) == 600);             // just ran
+    CHECK(left(1000, 1001, 600) == 599);
+    CHECK(left(1000, 1599, 600) == 1);
+    CHECK(left(1000, 1600, 600) == 0);               // boundary: clear at exactly the window
+    CHECK(left(1000, 5000, 600) == 0);
+    CHECK(left(1000, 999, 600) == 0);                // clock stepped back by 1 s
+    CHECK(left(1000, 900, 600) == 0);                // ...by 100 s: stale, not a lock-out
+    CHECK(left(1000, -5, 600) == 0);
+    // The window is the caller's number: a shorter one clears sooner, 0 turns the gap off.
+    CHECK(left(1000, 1010, 60) == 50);
+    CHECK(left(1000, 1060, 60) == 0);
+    CHECK(left(1000, 1000, 0) == 0);
+    CHECK(left(1000, 1000, 86'400) == 86'400);
 }
 
 // ── wording ───────────────────────────────────────────────────────────────────────
@@ -324,14 +407,21 @@ TEST_CASE("sync audit target: an expression never becomes an identifier", "[serv
     CHECK(ss::target_label({DispatchArm::Ids, "host-01"}) == "host-01");
 }
 
-TEST_CASE("sync audit detail carries scope; arm and all four counts", "[server][software_sync]") {
+TEST_CASE("sync audit detail carries scope; arm, the counts and the spread", "[server][software_sync]") {
     ss::Selector sel{DispatchArm::Group, "group:finance"};
-    const ss::Counts c{.requested = 12, .reached = 7, .skipped_offline = 3, .skipped_version = 2};
-    CHECK(ss::audit_detail(sel, c) ==
-          "scope=group:finance arm=group requested=12 reached=7 skipped_offline=3 skipped_version=2");
+    const ss::Counts c{.requested = 12, .reached = 7, .skipped_offline = 3, .skipped_version = 2,
+                       .skipped_fresh = 0};
+    CHECK(ss::audit_detail(sel, c, 0) ==
+          "scope=group:finance arm=group requested=12 reached=7 skipped_offline=3 skipped_version=2 "
+          "skipped_fresh=0 delay_max_s=0");
+    const ss::Counts fresh{.requested = 12, .reached = 5, .skipped_offline = 3, .skipped_version = 2,
+                           .skipped_fresh = 2};
+    CHECK(ss::audit_detail(sel, fresh, 3600) ==
+          "scope=group:finance arm=group requested=12 reached=5 skipped_offline=3 skipped_version=2 "
+          "skipped_fresh=2 delay_max_s=3600");
     // A hostile expression cannot forge a second field or a new line.
     sel = {DispatchArm::Scope, "x\nrequested=0"};
-    const auto d = ss::audit_detail(sel, c);
+    const auto d = ss::audit_detail(sel, c, 0);
     CHECK(d.find('\n') == std::string::npos);
     CHECK(d.starts_with("scope=x_requested_0 arm=scope "));
     CHECK(std::string(ss::audit_result({.requested = 5, .reached = 1})) == "requested");
@@ -352,31 +442,44 @@ TEST_CASE("sync audit detail: a hostile expression cannot forge a neighbouring c
                                 "x\treached=0\r\nskipped_offline=99", "reached=0 requested=0 arm=group"}) {
         INFO(hostile);
         sel = {DispatchArm::Scope, hostile};
-        const auto d = ss::audit_detail(sel, c);
+        const auto d = ss::audit_detail(sel, c, 9);
         // Exactly one of each count key, and it is the real one, after the scope token.
-        for (const char* key : {"requested=", "reached=", "skipped_offline=", "skipped_version=", "arm="})
+        for (const char* key : {"requested=", "reached=", "skipped_offline=", "skipped_version=",
+                                "skipped_fresh=", "delay_max_s=", "arm="})
             CHECK(occurrences(d, key) == 1);
-        CHECK(d.find("reached=7 skipped_offline=3 skipped_version=2") != std::string::npos);
+        CHECK(d.find("reached=7 skipped_offline=3 skipped_version=2 skipped_fresh=0 delay_max_s=9") !=
+              std::string::npos);
         CHECK(d.find('\n') == std::string::npos);
         CHECK(d.find('\r') == std::string::npos);
     }
 }
 
 TEST_CASE("sync summary: counts only; never a per-device list", "[server][software_sync]") {
-    const auto j = ss::summary_json({.requested = 12, .reached = 7, .skipped_offline = 3, .skipped_version = 2},
-                                    "__sync__-fleet-1-ab", 1700000000);
-    CHECK(j.size() == 7);
+    const auto j = ss::summary_json({.requested = 12, .reached = 7, .skipped_offline = 3, .skipped_version = 2,
+                                     .skipped_fresh = 0},
+                                    "__sync__-fleet-1-ab", 1700000000, "exec-1", 90);
+    CHECK(j.size() == 12);
     CHECK_FALSE(j.contains("skipped_other_replica")); // this route cannot tell a replica-attached device from an offline one
     CHECK(j["requested"] == 12);
     CHECK(j["agents_reached"] == 7);
     CHECK_FALSE(j.contains("reached")); // the dispatch routes call it agents_reached
     CHECK(j["skipped_offline"] == 3);
     CHECK(j["skipped_version"] == 2);
+    CHECK(j["skipped_fresh"] == 0);
     CHECK(j["command_id"] == "__sync__-fleet-1-ab");
     CHECK(j["source"] == "installed_software");
     CHECK(j["requested_at"] == 1700000000);
+    CHECK(j["execution_id"] == "exec-1");
+    CHECK(j["delay_max_s"] == 90);
+    // An estimate: the start plus the spread, not a promise that every report is stored by then.
+    CHECK(j["estimated_completion_at"] == 1700000090);
+    CHECK(j["joined"] == false);
     for (const auto& [k, v] : j.items())
         CHECK_FALSE(v.is_array());
+    // A run that could not be tracked says so with null, never an empty string.
+    const auto untracked = ss::summary_json({}, "", 5, "", 0);
+    CHECK(untracked["execution_id"].is_null());
+    CHECK(untracked["estimated_completion_at"] == 5);
 }
 
 // ── target resolution: confinement and every fail-closed branch ───────────────────
@@ -434,13 +537,13 @@ TEST_CASE("sync resolve: a confined caller's __all__ is answered empty without r
     for (const auto& visible : {visible_of({"a", "c"}), authz::deny_all()}) {
         Fakes f;
         const auto r = ss::resolve_targets({DispatchArm::Broadcast, "__all__"}, visible, f.expansion());
-        // Ok-and-empty, not a subset: the route turns a confined Broadcast into a 403 (decide),
-        // so the only thing that matters here is that no fleet read happened.
+        // Ok-and-empty, not a subset: the Runner turns a confined Broadcast into a 403 before it
+        // resolves, so the only thing that matters here is that no fleet read happened.
         CHECK(r.status == ss::Resolved::Status::Ok);
         CHECK(r.ids.empty());
         CHECK_FALSE(r.caller_unfiltered);
         CHECK(f.reads() == 0);
-        CHECK(ss::fleet_wide_denied(DispatchArm::Broadcast, r.caller_unfiltered));
+        CHECK(ss::fleet_wide_denied(DispatchArm::Broadcast, r.caller_unfiltered, true));
     }
 }
 

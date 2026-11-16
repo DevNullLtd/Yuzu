@@ -44469,12 +44469,14 @@ struct SyncToolRig {
             r.ids = {"d0", "d1", "d2"};
             return r;
         };
-        e.dispatch = [this](const yuzu::server::auth::Session&, const std::vector<std::string>& ids) {
+        e.dispatch = [this](const yuzu::server::auth::Session&, const std::vector<std::string>& ids,
+                            std::int64_t, const std::string&) {
             ++dispatches;
             dispatched = ids;
             return ss::DispatchResult{ids.size(), "__sync__-mcp-test"};
         };
         e.caller_unfiltered = [](const yuzu::server::auth::Session&) { return true; };
+        e.fleet_admin = [](const yuzu::server::auth::Session&) { return true; };
         e.agent_version = [](const std::string& id) -> std::optional<std::string> {
             if (id == "d2")
                 return std::nullopt; // offline
@@ -44487,6 +44489,9 @@ struct SyncToolRig {
 
 constexpr const char* kSyncCall =
     R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"sync_hardware_software","arguments":)";
+// A whole fleet or group must say so; the tool's own schema does not advertise `confirm` yet, but the
+// shared request grammar reads it.
+constexpr const char* kFleetArgs = R"({"scope":"__all__","confirm":true}}})";
 
 } // namespace
 
@@ -44497,7 +44502,7 @@ TEST_CASE("MCP sync_hardware_software: a fleet run is accepted with counts only,
     ts.software_sync_runner_for_test = rig.runner();
     ts.start("");
 
-    auto res = ts.call(std::string(kSyncCall) + R"({"scope":"__all__"}}})");
+    auto res = ts.call(std::string(kSyncCall) + kFleetArgs);
     REQUIRE(res);
     auto body = nlohmann::json::parse(res->body);
     REQUIRE(body.contains("result"));
@@ -44505,27 +44510,66 @@ TEST_CASE("MCP sync_hardware_software: a fleet run is accepted with counts only,
     CHECK(payload["requested"] == 3);
     CHECK(payload["agents_reached"] == 2);
     CHECK(payload["skipped_offline"] == 1);
+    CHECK(payload["skipped_fresh"] == 0);
     CHECK(payload["command_id"] == "__sync__-mcp-test");
+    CHECK(payload["delay_max_s"] == 0);
+    CHECK(payload["joined"] == false);
+    CHECK(payload["execution_id"].is_null()); // this rig wires no tracker
     CHECK(res->body.find("d0") == std::string::npos); // counts only, never a device id
     CHECK(rig.dispatches == 1);
     REQUIRE_FALSE(ts.audit_log.empty());
     CHECK(ts.audit_log.front() == "inventory.sync.request|requested");
 }
 
-TEST_CASE("MCP sync_hardware_software: shares the cooldown with every other caller of the runner",
+TEST_CASE("MCP sync_hardware_software: shares the run state with every other caller of the runner",
           "[mcp][integration][sync_fanout]") {
     SyncToolRig rig;
     McpTestServer ts;
     ts.software_sync_runner_for_test = rig.runner();
     ts.start("");
 
-    REQUIRE(ts.call(std::string(kSyncCall) + R"({"scope":"__all__"}}})"));
-    auto again = ts.call(std::string(kSyncCall) + R"({"scope":"__all__"}}})");
+    REQUIRE(ts.call(std::string(kSyncCall) + kFleetArgs));
+    // The same request while the run is still going JOINS it: success, nothing sent.
+    auto joined = ts.call(std::string(kSyncCall) + kFleetArgs);
+    REQUIRE(joined);
+    auto jbody = nlohmann::json::parse(joined->body);
+    REQUIRE(jbody.contains("result"));
+    CHECK(nlohmann::json::parse(jbody["result"]["content"][0]["text"].get<std::string>())["joined"] == true);
+    CHECK(rig.dispatches == 1);
+
+    // Once the run is over, the key only cools down: a retryable error carrying the wait.
+    rig.wall += 5;
+    auto again = ts.call(std::string(kSyncCall) + kFleetArgs);
     REQUIRE(again);
     auto body = nlohmann::json::parse(again->body);
     REQUIRE(body.contains("error"));
     CHECK(body["error"]["data"]["retry_after_ms"].get<int>() > 0);
     CHECK(rig.dispatches == 1);
+}
+
+TEST_CASE("MCP sync_hardware_software: a group or the fleet without confirm is invalid params naming the confirmation",
+          "[mcp][integration][sync_fanout]") {
+    SyncToolRig rig;
+    McpTestServer ts;
+    ts.software_sync_runner_for_test = rig.runner();
+    ts.start("");
+    for (const char* args : {R"({"scope":"group:g"}}})", R"({"scope":"__all__"}}})"}) {
+        INFO(args);
+        auto res = ts.call(std::string(kSyncCall) + args);
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        // Invalid parameters, never an internal error: the caller can fix it by confirming.
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(body["error"]["message"].get<std::string>().find("confirm") != std::string::npos);
+        CHECK(rig.dispatches == 0);
+    }
+    // A confirmed group, and a device or expression that never needs it, run.
+    CHECK(ts.call(std::string(kSyncCall) + R"({"scope":"group:g","confirm":true}}})"));
+    CHECK(rig.dispatches == 1);
+    auto device = ts.call(std::string(kSyncCall) + R"({"scope":"host-01"}}})");
+    REQUIRE(device);
+    CHECK(nlohmann::json::parse(device->body).contains("result"));
 }
 
 TEST_CASE("MCP sync_hardware_software: refuses a service-scoped token, bad arguments and an unwired runner",
@@ -44536,7 +44580,7 @@ TEST_CASE("MCP sync_hardware_software: refuses a service-scoped token, bad argum
         ts.mock_token_scope_service = "printers";
         ts.software_sync_runner_for_test = rig.runner();
         ts.start("");
-        auto res = ts.call(std::string(kSyncCall) + R"({"scope":"__all__"}}})");
+        auto res = ts.call(std::string(kSyncCall) + kFleetArgs);
         REQUIRE(res);
         auto body = nlohmann::json::parse(res->body);
         REQUIRE(body.contains("error"));
@@ -44559,7 +44603,7 @@ TEST_CASE("MCP sync_hardware_software: refuses a service-scoped token, bad argum
     {
         McpTestServer ts; // no runner wired
         ts.start("");
-        auto res = ts.call(std::string(kSyncCall) + R"({"scope":"__all__"}}})");
+        auto res = ts.call(std::string(kSyncCall) + kFleetArgs);
         REQUIRE(res);
         auto body = nlohmann::json::parse(res->body);
         REQUIRE(body.contains("error"));
@@ -44578,7 +44622,7 @@ TEST_CASE("MCP sync_hardware_software: a lost outcome row is flagged audit_persi
         return action != "mcp.sync_hardware_software";
     };
     ts.start("");
-    auto res = ts.call(std::string(kSyncCall) + R"({"scope":"__all__"}}})");
+    auto res = ts.call(std::string(kSyncCall) + kFleetArgs);
     REQUIRE(res);
     auto body = nlohmann::json::parse(res->body);
     REQUIRE(body.contains("result"));
@@ -44596,20 +44640,14 @@ TEST_CASE("MCP sync_hardware_software: every Runner refusal maps to the intended
         std::function<void(ss::Env&)> tweak;
         int code;
         bool hint;
+        const char* args = R"({"scope":"__all__","confirm":true}}})";
     };
     const std::vector<Case> cases = {
-        {"over the cap -> invalid params, no hint",
+        {"fleet without the administrator grant -> permission denied, no hint",
          [](ss::Env& e) {
-             e.resolve = [](const yuzu::server::auth::Session&, const ss::Selector&) {
-                 ss::Resolved r;
-                 r.status = ss::Resolved::Status::Ok;
-                 r.caller_unfiltered = true;
-                 for (int i = 0; i < 600; ++i)
-                     r.ids.push_back("d" + std::to_string(i));
-                 return r;
-             };
+             e.fleet_admin = [](const yuzu::server::auth::Session&) { return false; };
          },
-         yuzu::server::mcp::kInvalidParams, false},
+         yuzu::server::mcp::kPermissionDenied, false},
         {"confined caller naming the fleet -> permission denied",
          [](ss::Env& e) {
              e.caller_unfiltered = [](const yuzu::server::auth::Session&) { return false; };
@@ -44626,11 +44664,17 @@ TEST_CASE("MCP sync_hardware_software: every Runner refusal maps to the intended
          yuzu::server::mcp::kInternalError, true},
         {"every send refused -> internal error with a hint",
          [](ss::Env& e) {
-             e.dispatch = [](const yuzu::server::auth::Session&, const std::vector<std::string>&) {
-                 return ss::DispatchResult{0, "x"};
-             };
+             e.dispatch = [](const yuzu::server::auth::Session&, const std::vector<std::string>&, std::int64_t,
+                             const std::string&) { return ss::DispatchResult{0, "x"}; };
          },
          yuzu::server::mcp::kInternalError, true},
+        {"the scope's last_synced_before read degraded -> internal error with a hint",
+         [](ss::Env& e) {
+             e.last_seen = [](const std::vector<std::string>&)
+                 -> std::optional<std::unordered_map<std::string, std::int64_t>> { return std::nullopt; };
+         },
+         yuzu::server::mcp::kInternalError, true,
+         R"({"scope":"__all__","confirm":true,"last_synced_before":100}}})"},
     };
     for (const auto& c : cases) {
         INFO(c.name);
@@ -44643,16 +44687,16 @@ TEST_CASE("MCP sync_hardware_software: every Runner refusal maps to the intended
             r.ids = {"d0", "d1"};
             return r;
         };
-        env.dispatch = [](const yuzu::server::auth::Session&, const std::vector<std::string>& ids) {
-            return ss::DispatchResult{ids.size(), "__sync__-t"};
-        };
+        env.dispatch = [](const yuzu::server::auth::Session&, const std::vector<std::string>& ids, std::int64_t,
+                          const std::string&) { return ss::DispatchResult{ids.size(), "__sync__-t"}; };
         env.caller_unfiltered = [](const yuzu::server::auth::Session&) { return true; };
+        env.fleet_admin = [](const yuzu::server::auth::Session&) { return true; };
         env.agent_version = [](const std::string&) { return std::optional<std::string>("0.13.1"); };
         c.tweak(env);
         McpTestServer ts;
         ts.software_sync_runner_for_test = std::make_shared<ss::Runner>(std::move(env));
         ts.start("");
-        auto res = ts.call(std::string(kSyncCall) + R"({"scope":"__all__"}}})");
+        auto res = ts.call(std::string(kSyncCall) + c.args);
         REQUIRE(res);
         auto body = nlohmann::json::parse(res->body);
         REQUIRE(body.contains("error"));
@@ -44661,6 +44705,44 @@ TEST_CASE("MCP sync_hardware_software: every Runner refusal maps to the intended
                               !body["error"]["data"]["retry_after_ms"].is_null();
         CHECK(has_hint == c.hint);
     }
+}
+
+TEST_CASE("MCP sync_hardware_software: a busy pacing budget is answered as a retryable error with its hint",
+          "[mcp][integration][sync_fanout]") {
+    namespace ss = yuzu::server::software_sync;
+    SyncToolRig rig;
+    ss::Env env;
+    env.resolve = [](const yuzu::server::auth::Session&, const ss::Selector&) {
+        ss::Resolved r;
+        r.status = ss::Resolved::Status::Ok;
+        r.caller_unfiltered = true;
+        for (int i = 0; i < 1000; ++i)
+            r.ids.push_back("d" + std::to_string(i));
+        return r;
+    };
+    env.dispatch = [](const yuzu::server::auth::Session&, const std::vector<std::string>& ids, std::int64_t,
+                      const std::string&) { return ss::DispatchResult{ids.size(), "__sync__-t"}; };
+    env.caller_unfiltered = [](const yuzu::server::auth::Session&) { return true; };
+    env.fleet_admin = [](const yuzu::server::auth::Session&) { return true; };
+    env.agent_version = [](const std::string&) { return std::optional<std::string>("0.13.1"); };
+    env.now = [&rig] { return rig.wall; };
+    McpTestServer ts;
+    ts.software_sync_runner_for_test = std::make_shared<ss::Runner>(std::move(env));
+    ts.start("");
+    // Five runs of other groups spread over 40..640 s and leave less than the minimum rate free.
+    for (int i = 0; i < 5; ++i) {
+        auto ok = ts.call(std::string(kSyncCall) + "{\"scope\":\"group:g" + std::to_string(i) +
+                          "\",\"confirm\":true}}}");
+        REQUIRE(ok);
+        REQUIRE(nlohmann::json::parse(ok->body).contains("result"));
+    }
+    auto res = ts.call(std::string(kSyncCall) + R"({"scope":"group:g5","confirm":true}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    // The default branch: a retryable internal error carrying how long to wait, never invalid params.
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["data"]["retry_after_ms"].get<int>() == 40'000);
 }
 
 

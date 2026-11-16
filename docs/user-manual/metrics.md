@@ -317,6 +317,14 @@ The related `yuzu_inventory_read_degrade_total{source="device_ci",reason="sectio
 | `yuzu_software_facet_duration_ms{facet,quantile}` | gauge | Collection time in milliseconds per facet at `quantile` `0.5` and `0.95`, over devices that actually collected (a disabled or not-collected device is left out). Set with `yuzu_software_facet_devices`. |
 | `yuzu_software_fleet_snapshot_total{outcome}` | counter | Recomputes of the fleet snapshot behind the two gauges above and the summary and plugin-health reads, by `outcome` (`success` or `error`). Both series start at 0. After an `error` the last good snapshot and gauge values stay in place. |
 
+## On-demand software sync metrics
+
+`POST /api/v1/hardware/sync` and the MCP tool `sync_hardware_software` share one engine (see [Inventory](inventory.md)), and it counts every request it answers. Per server process; no label carries a scope, group id, operator or device.
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_server_software_sync_runs_total{result}` | counter | One increment per on-demand software-inventory sync request, by `result`, a closed eleven-value set pre-seeded at 0 on every boot: `accepted` (a new run was admitted and its frames sent), `joined` (a repeat of a run still spreading was joined, nothing sent), `cooldown` (the same group, scope expression or fleet started a run inside `--inventory-sync-cooldown`), `in_flight` (the same key is being started or is spreading and does not cover the request, or three send loops are already alive), `budget_busy` (the pacing budget of 50 reports per second per server process is held by runs still spreading), `too_large` (the run could not be spread inside 86,400 seconds at the capacity free), `bad_request` (including a whole group or the whole fleet without `confirm`), `fleet_denied` (the whole fleet named by a caller who is not a fleet administrator), `unresolved` (the scope, the caller's grants or the `last_synced_before` read could not be evaluated), `audit_failed` (the pre-dispatch audit row could not be stored, nothing sent), `none_reachable` (every frame was refused, or the send threw). A sustained `budget_busy` or `too_large` rate means runs are being started faster than the budget lets them spread. The pacing numbers behind them are estimates of what the server asks for, not a measure of the reports that arrive, which are counted by the inventory ingest metrics. A request with a per-device `scope` is counted here too, as `accepted`. The per-frame count of what was sent is `yuzu_server_system_reserved_push_total{capability="__sync__.now"}`, which a fleet run raises by one per device sent. |
+
 ## Inventory purge metrics (typed-source hygiene)
 
 | Metric | Type | Description |

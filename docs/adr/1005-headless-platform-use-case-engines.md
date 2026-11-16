@@ -1637,6 +1637,42 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        `docs/user-manual/rest-api.md`, "GET /api/v1/inventory/software" and
        "GET /api/v1/inventory/software/components".
      - Recorded by the change author; ADR-owner acceptance pending.
+   - **2026-11-16 - on-demand software sync: confirmation, pacing and run status
+     (SAM-20; REST only, the MCP twin is a recorded exception).**
+     `POST /api/v1/hardware/sync` gains the request fields `confirm` and
+     `last_synced_before` and the 202 fields `execution_id`, `delay_max_s`,
+     `estimated_completion_at`, `skipped_fresh` and `joined`, and the new route
+     `GET /api/v1/hardware/sync/{execution_id}` reports how a run is going. The MCP
+     tool `sync_hardware_software` calls the same engine (`software_sync::Runner`),
+     so it already applies the confirmation, the fleet-administrator rule, the
+     pacing, the join and the cooldown; what it lacks is the surface. Its input
+     schema, description and output schema do not name `confirm` or
+     `last_synced_before` or the new result fields, and there is no tool for the
+     status route.
+     - **No MCP twin of the new surface - tracked follow-up, not a permanent
+       exception.** Delivery row **SAM-21** of the software estate roadmap (the
+       tool's schema and wording, the two arguments, a status tool). **Revisit by
+       2026-12-31.** The twin takes the same engine and the same execution-record
+       read, so no second copy of any rule is created. This entry retires when the
+       twin merges. No parity-ledger row is added: v1 routes are held to the
+       OpenAPI check, and `docs/api-parity-ledger.md` points here.
+     - **What an MCP-only caller can and cannot reach.** The send itself (a group
+       or the fleet needs `"confirm": true` among the tool's arguments, which the
+       schema does not yet declare; a refusal without it is invalid parameters
+       naming the confirmation) and the new fields in the result. Not the status
+       of a run after it was sent: the status route has no tool.
+     - **The exception relaxes no control.** The status route gates on
+       `Execution:Execute` as a global grant, serves a caller the runs it started
+       (the execution owner key, empty for a service-scoped session) or, with an
+       unfiltered `Execution:Execute`, any sync run, and answers an unknown id,
+       another operator's run and an execution that is not a sync run with the
+       same `404`; a record that cannot be read is a retryable `503`, never an
+       empty `200`. The send keeps its audit-before-dispatch row, fail closed (the
+       whole-fleet row under `software_estate.sync.fleet_wide`), the visible-set
+       intersection at send time, and is paced and de-duplicated per run key. Wire
+       reference: `docs/user-manual/rest-api.md`, "POST /api/v1/hardware/sync" and
+       "GET /api/v1/hardware/sync/{execution_id}".
+     - Recorded by the change author; ADR-owner acceptance pending.
    - **2026-11-09 - MCP twins of the DEX score policy routes (#6087):
      `get_dex_score_policy`, `set_dex_score_policy`, `reset_dex_score_policy`.**
      This entry retires the 2026-10-23 and 2026-11-02 #6087 exceptions above.
