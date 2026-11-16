@@ -28,8 +28,8 @@
 /// `send_to` comment) — it does not confirm the agent executed it, let alone
 /// that its firewall now blocks traffic. So `isolated` here means "dispatch
 /// was accepted and didn't throw", not "the device is provably network-
-/// isolated"; confirming that still requires a follow-up `status` read
-/// returning `state|active`. Anything short of that (`agents_reached == 0`,
+/// isolated"; confirming that still requires a follow-up `firewall.quarantine_status`
+/// read reporting `status|active`. Anything short of that (`agents_reached == 0`,
 /// or a dispatch that threw) is `unconfirmed_retryable`, not a success — the
 /// caller must be able to safely retry rather than believe a device is
 /// contained when it might not be.

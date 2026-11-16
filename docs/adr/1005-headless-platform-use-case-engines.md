@@ -1612,6 +1612,14 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      `GET`/`PUT /api/v1/inventory/software/collection-settings/{group_id}` and
      `GET /api/v1/inventory/software/hosts/{agent_id}/collection-settings` have
      no MCP tool.
+     - **Retired 2026-11-16.** The four twins landed under SAM-35
+       (`list_software_collection_settings`, `get_software_collection_settings`,
+       `set_software_collection_settings`, `get_software_host_collection_settings`),
+       together with the five twins of the installed-software v3 reads
+       (`list_software_hosts`, `get_software_host`, `list_software_changes`,
+       `get_software_summary`, `get_software_plugin_health`). Each calls the same
+       function as its REST route. The paragraphs below are the record of the
+       exception while it stood.
      - **No MCP twin - tracked follow-up, not a permanent exception.** Tracked
        as roadmap row **3.7a-mcp** in the software estate roadmap; **revisit by
        2026-12-31**. The MCP twin and the dashboard Collection tab (roadmap row
@@ -1652,6 +1660,10 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      `repair`), so discoverability (Decision 1) is not met for them yet. The server cut-over that
      re-points the quarantine definitions at these actions is the change that adds
      them; until then the plugin README documents the parameters.
+     **Resolved 2026-11-12 (PRQ.2):** `content/definitions/firewall.yaml` now carries
+     `security.firewall.quarantine`, `.release`, `.quarantine_status` and
+     `.quarantine_allow`, which publish the parameters; the revisit trigger has
+     happened and this entry is closed.
    - **2026-11-09 - the software lookup read surface (SAM-17; REST only, the MCP
      twin is a recorded exception).** `GET /api/v1/inventory/software` gains eight
      lookup fields (`hostname`, `last_seen`, `status`, `last_confirmed_at`,
@@ -1717,6 +1729,43 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        malformed `vers` or `purl` a `400` in the A4 envelope. Wire reference:
        `docs/user-manual/rest-api.md`, "GET /api/v1/inventory/software" and
        "GET /api/v1/inventory/software/components".
+     - Recorded by the change author; ADR-owner acceptance pending.
+   - **2026-11-16 - on-demand software sync: confirmation, pacing and run status
+     (SAM-20; REST only, the MCP twin is a recorded exception).**
+     `POST /api/v1/hardware/sync` gains the request fields `confirm` and
+     `last_synced_before` and the 202 fields `execution_id`, `delay_max_s`,
+     `estimated_completion_at`, `skipped_fresh` and `joined`, and the new route
+     `GET /api/v1/hardware/sync/{execution_id}` reports how a run is going. The MCP
+     tool `sync_hardware_software` calls the same engine (`software_sync::Runner`),
+     so it already applies the confirmation, the fleet-administrator rule, the
+     pacing, the join and the cooldown; what it lacks is the surface. Its input
+     schema, description and output schema do not name `confirm` or
+     `last_synced_before` or the new result fields, and there is no tool for the
+     status route.
+     - **No MCP twin of the new surface - tracked follow-up, not a permanent
+       exception.** Delivery row **SAM-21** of the software estate roadmap, tracked
+       as issue #7984 (the tool's schema and wording, the two arguments, a status
+       tool). **Revisit by
+       2026-12-31.** The twin takes the same engine and the same execution-record
+       read, so no second copy of any rule is created. This entry retires when the
+       twin merges. No parity-ledger row is added: v1 routes are held to the
+       OpenAPI check, and `docs/api-parity-ledger.md` points here.
+     - **What an MCP-only caller can and cannot reach.** The send itself (a group
+       or the fleet needs `"confirm": true` among the tool's arguments, which the
+       schema does not yet declare; a refusal without it is invalid parameters
+       naming the confirmation) and the new fields in the result. Not the status
+       of a run after it was sent: the status route has no tool.
+     - **The exception relaxes no control.** The status route gates on
+       `Execution:Execute` as a global grant, serves a caller the runs it started
+       (the execution owner key, empty for a service-scoped session) or, with an
+       unfiltered `Execution:Execute`, any sync run, and answers an unknown id,
+       another operator's run and an execution that is not a sync run with the
+       same `404`; a record that cannot be read is a retryable `503`, never an
+       empty `200`. The send keeps its audit-before-dispatch row, fail closed (the
+       whole-fleet row under `software_estate.sync.fleet_wide`), the visible-set
+       intersection at send time, and is paced and de-duplicated per run key. Wire
+       reference: `docs/user-manual/rest-api.md`, "POST /api/v1/hardware/sync" and
+       "GET /api/v1/hardware/sync/{execution_id}".
      - Recorded by the change author; ADR-owner acceptance pending.
    - **2026-11-09 - MCP twins of the DEX score policy routes (#6087):
      `get_dex_score_policy`, `set_dex_score_policy`, `reset_dex_score_policy`.**
@@ -1840,6 +1889,31 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        `docs/user-manual/rest-api.md` "GET / PUT / DELETE
        /api/v1/dex/score-policy"; audit rows: `docs/user-manual/audit-log.md`
        (verbs unchanged).
+     - Recorded by the change author; ADR-owner acceptance pending.
+
+   - **2026-11-12 - the quarantine release over `DELETE /api/v1/quarantine/{agent_id}`
+     and its `?force=true` flag are REST only (PRQ.2); the MCP release tool is a
+     recorded exception.** `exception:#6234 REST DELETE (device-confirmed release,
+     200 or 202) and ?force=true have no MCP release tool; revisit: when the MCP
+     release tool lands`. The route asks the device to lift its firewall rules and
+     answers `200` with `state: released` when the device confirms within its short
+     wait, otherwise `202` with `state: releasing`; `?force=true` ends the record
+     without the device's confirmation (REST only, under the release's own gates).
+     The open issue #6234 tracks the MCP release tool; its acceptance criteria still
+     name the removed plugin's actions and must be updated to the firewall pairs, the
+     `releasing` state, the `202` and the forced end.
+     - **What an MCP-only caller can and cannot reach.** It can create a record
+       (`quarantine_device`) and list records (`list_quarantined_devices`, which
+       reports `releasing`). It cannot end one: a `firewall.release` sent through
+       `execute_instruction` lifts the device, and the reconciler then re-applies the
+       containment of the record, which is still active. The way to end a record is
+       the REST `DELETE`.
+     - **The exception relaxes no control.** The `DELETE` gates are unchanged by this
+       entry: scoped `Security:Execute`, the same-principal check, the dispatch
+       approval check for the `firewall.release` pair and an audited `attempt` row
+       ahead of the change. The flag adds no authority of its own. Wire reference:
+       `docs/user-manual/rest-api.md` (the quarantine section) and
+       `docs/user-manual/security-hardening.md` "Device Quarantine".
      - Recorded by the change author; ADR-owner acceptance pending.
 
 ## Interim rules (until the named follow-ups ship)

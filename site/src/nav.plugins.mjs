@@ -52,7 +52,6 @@ export const PLUGIN_ENTRIES = [
   { file: 'agents/plugins/privacy_permissions/README', slug: 'plugins/privacy_permissions', title: 'privacy_permissions' },
   { file: 'agents/plugins/processes/README', slug: 'plugins/processes', title: 'processes' },
   { file: 'agents/plugins/procfetch/README', slug: 'plugins/procfetch', title: 'procfetch' },
-  { file: 'agents/plugins/quarantine/README', slug: 'plugins/quarantine', title: 'quarantine' },
   { file: 'agents/plugins/rdp_control/README', slug: 'plugins/rdp_control', title: 'rdp_control' },
   { file: 'agents/plugins/registry/README', slug: 'plugins/registry', title: 'registry' },
   { file: 'agents/plugins/remote_access_audit/README', slug: 'plugins/remote_access_audit', title: 'remote_access_audit' },

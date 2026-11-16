@@ -3,7 +3,7 @@
 /**
  * server_address_resolver.hpp -- resolves the agent's configured server
  * target ("host:port", possibly a hostname) to concrete IP literal(s) ONCE
- * at agent startup, before any plugin (including quarantine) ever runs.
+ * at agent startup, before any plugin (including firewall) ever runs.
  *
  * WHY THIS LIVES HERE, RESOLVED AT STARTUP, AND CACHED -- not re-resolved
  * on demand by a plugin at the moment it's needed: quarantine's whitelist
@@ -18,12 +18,12 @@
  * startup" instead. It also means quarantine-time performs NO DNS I/O at
  * all: resolve_server_address_literals() below is bounded, so a wedged
  * resolver delays agent startup once rather than blocking every future
- * quarantine/unquarantine/whitelist dispatch (which all share one
- * mutation gate in the quarantine plugin).
+ * quarantine/release/quarantine_allow dispatch (which all share one
+ * mutation gate in the firewall plugin).
  *
  * Threaded into every plugin's config as "agent.server_address_resolved"
- * by Agent::Run() (agent.cpp), read by the quarantine plugin's
- * do_quarantine instead of resolving anything itself.
+ * by Agent::Run() (agent.cpp), read by the firewall plugin's
+ * quarantine action instead of resolving anything itself.
  *
  * Its companion, "agent.server_peer" (UP-8): the literal address of the peer
  * the LATEST successful Register actually answered on (`host:port` or

@@ -379,7 +379,7 @@ Derived directly from `server/core/src/body_cap_policy.hpp`'s `kBodyCapTable` (l
 | POST | `/api/instructions/yaml` | 3076 KiB | `instruction_yaml` | † The handler checks the FORM-DECODED `yaml_source` field at 1048576 chars (`instruction_yaml.cpp:165`); 3× worst-case percent-encoding of that value, plus 4 KiB flat headroom for field-name framing and the `id` field (save only). |
 | POST | `/api/instructions/validate-yaml` | 3076 KiB | `instruction_yaml` | † Same check, same margin — see above. |
 | POST | `/fragments/instructions/yaml-preview` | 3076 KiB | `instruction_yaml` | † Same check, same margin — see above. |
-| any | `/api/v1/hardware` | 4 KiB | `hardware` | The third `requires_measurable=true` class. Only `POST .../sync` and `POST /api/v1/hardware/sync` carry a body (a short `source` enum token, and for the fan-out a scope token or an expression of at most 1,024 bytes); the bodyless `GET /api/v1/hardware` and `GET /api/v1/hardware/{id}` list/record routes share the class rather than falling to the 4 MiB catch-all. |
+| any | `/api/v1/hardware` | 4 KiB | `hardware` | The third `requires_measurable=true` class. Only `POST .../sync` and `POST /api/v1/hardware/sync` carry a body (a short `source` enum token, and for the fan-out a scope token or an expression of at most 1,024 bytes plus `confirm` and `last_synced_before`); the bodyless `GET /api/v1/hardware`, `GET /api/v1/hardware/{id}` and `GET /api/v1/hardware/sync/{execution_id}` list/record/status routes share the class rather than falling to the 4 MiB catch-all. |
 | any | `/api/v1/rbac/roles/` | 4 KiB | `rbac_role_assignment` | A2 global human role assignment — see "Fleet-Wide Role Assignment" below. `POST .../assignments` body is `{principal_type, principal_id}`, two short strings; `DELETE .../assignments/{principal_id}` carries none. Any method — the DELETE sibling shares this literal prefix once past the role-name path segment. |
 | any | `/api/v1/rbac/enforcement` | 1 KiB | `rbac_enforcement` | A1 enforcement enable/disable toggle. Body is `{"enabled": true}`, under 64 bytes even pretty-printed; 1 KiB is 16× headroom. A segment-boundary-distinct prefix from `rbac_role_assignment` above, so it needs its own row or it would fall to the 4 MiB catch-all. |
 | any | `/api/v1/guaranteed-state/policy-generation` | 1 KiB | `guardian_policy_generation` | The Guardian policy-generation raise (`POST .../raise`). Body is `{"target_generation": <integer>, "acknowledge_rule_set_replaced": true}`, under 128 bytes even pretty-printed; 1 KiB is 8× headroom. The row is any-method, so the read-only `GET .../policy-generation` resolves to the same class; it carries no body. A segment-boundary-distinct prefix from `guardian_rule_authoring` (`/api/v1/guaranteed-state/rules`), so it needs its own row or it would fall to the 4 MiB catch-all. |
@@ -602,7 +602,7 @@ existence-oracle closure exactly).
 
 ### Hardware
 
-The Hardware CI list, the single-device CI record and the bulk CI page: the three read routes of the OpenAPI tag `Hardware`, followed by short entries for the on-demand syncs `POST /api/v1/hardware/{id}/sync` (one device) and `POST /api/v1/hardware/sync` (a scope or the fleet). All three read routes are audited on a served read, and with `result=failure` when the device roster (or, for the bulk page, the CI store) could not be read.
+The Hardware CI list, the single-device CI record and the bulk CI page: the three read routes of the OpenAPI tag `Hardware`, followed by short entries for the on-demand syncs `POST /api/v1/hardware/{id}/sync` (one device) and `POST /api/v1/hardware/sync` (a scope or the fleet) and for `GET /api/v1/hardware/sync/{execution_id}` (how a fan-out run is going). All three read routes are audited on a served read, and with `result=failure` when the device roster (or, for the bulk page, the CI store) could not be read.
 
 #### `GET /api/v1/hardware`
 
@@ -778,9 +778,25 @@ The loop exits non-zero on any non-2xx answer (`curl -f`, with `-S` so the HTTP 
 
 #### `POST /api/v1/hardware/sync`
 
-Requests an on-demand software-inventory sync for a device, a scope or the whole fleet (the Software page's **Sync now**). **Permission:** `Execution:Execute`, checked as a global grant: an operator whose `Execution:Execute` is limited to management groups is refused with `403` for every scope kind. The route also confines its targets to the caller's own `Execution:Execute` visible set and refuses the whole fleet (`"scope":"__all__"`) unless that set is unfiltered (`403`); with a global grant neither changes the outcome today, and both are defence in depth for when the gate becomes scope-aware. The body names the targets with exactly one of `scope` (`__all__`, `group:<id>` or a device id, up to 256 bytes) or `scope_expression` (a scope expression, up to 1,024 bytes); `source` may only be `installed_software`.
+Requests an on-demand software-inventory sync for a device, a scope or the whole fleet (the Software page's **Sync now**). **Permission:** `Execution:Execute`, checked as a global grant: an operator whose `Execution:Execute` is limited to management groups is refused with `403` for every scope kind. The route also confines its targets to the caller's own `Execution:Execute` visible set (a device the caller cannot see is silently left out and never counted). The body names the targets with exactly one of `scope` (`__all__`, `group:<id>` or a device id, up to 256 bytes) or `scope_expression` (a scope expression, up to 1,024 bytes); `source` may only be `installed_software`.
 
-A run reaches agents attached to **this server process** only. `skipped_offline` counts the devices this server process did not reach that are not too old: it has no live session for them (a disconnected device, or one attached to another server), or the send was refused by the live stream (for example a gateway-attached agent whose gateway lacks the dispatch capability). Which devices are candidates depends on the scope: a group or a single named device lists its disconnected members too, but an `__all__` or scope-expression run lists only this server's own sessions plus the shared presence record, so a device that is offline everywhere is never counted, and if the presence read is degraded an `__all__` run lists fewer devices (those attached to other servers are not listed) while a scope-expression run is refused with 503 (the scope could not be evaluated) and sends nothing. `requested` and `skipped_offline` therefore describe what this server could reach; they are not a census of the fleet. Agents below 0.13.1 are skipped and counted in `skipped_version`. At most 500 devices are reached per request (`413`). A group, scope or fleet run is limited to one per operator per 60 seconds (`429`, `Retry-After`) (an attempt refused for exceeding 500 devices, or with no live target, counts as a run; a send every device refused does not) and one at a time (`409`; the slot is a 120 s lease a later run can take over, but only while fewer than three stalled runs are alive, after which `409` persists until one of them unwinds or the server restarts), both per server process rather than cluster-wide (with several active servers each allows its own run, still bounded by the 500-device cap); a single named device is exempt. The `202` body carries counts only (`requested`, `agents_reached`, `skipped_offline`, `skipped_version`) plus `command_id`, never device ids. A server that is missing a required component answers `500` and writes a `result=failure` audit row. A browser (session-cookie) request must carry an `Origin` or `Referer` naming this site, otherwise it is refused with `403` and a `csrf.denied` audit row; API-token and MCP-token callers are exempt. Who is reached is decided at send time by the `dispatch_confined_arms` system-reserved arm, which intersects the target list with the caller's own `Execution:Execute` visible set. The MCP tool `sync_hardware_software` is the twin of this route and shares its cooldown and its single in-flight run. The request, statuses and bounds are in the OpenAPI document. **Audit:** `inventory.sync.request`, written before dispatch (see [audit-log.md](audit-log.md)).
+**Whole group and whole fleet.** A whole group (`group:<id>`) or the whole fleet (`__all__`) is refused with `400` unless the body carries `"confirm": true`. `confirm` must be a JSON boolean: a string or a number does not confirm and is itself a `400`. A single device and a scope expression never need it. The whole fleet also needs a **fleet administrator**: an unfiltered `Execution:Execute` and the global `ManagementGroup:Write` grant (the administrator role while RBAC enforcement is off). Anyone else is refused with `403`, whether or not they confirmed. Both rules are about **naming** a group or the fleet in `scope`. A `scope_expression` is the caller's own targeting: it is evaluated inside the devices their `Execution:Execute` lets them see and needs neither `confirm` nor a fleet administrator, even when it matches every one of those devices, which for an operator whose `Execution:Execute` is unfiltered is the whole fleet. Such a run is paced, cooled down and audited like any other scope run: as `inventory.sync.request` with `arm=scope` and its counts, not as `software_estate.sync.fleet_wide`. `last_synced_before` (epoch seconds, optional) asks only the devices whose last accepted installed-software report is older than that time; a device that has never reported is asked, and the devices left out are counted in `skipped_fresh`.
+
+**No device ceiling; the run is paced.** There is no limit on the number of devices. Each run is admitted against one budget of 50 reports per second per server process, shared by every run still spreading, and a run takes at most half of what is free. The agents are asked to report inside a spread of `delay_max_s` seconds (at most 86,400; `0` means now, for a run small enough to go at once). A run that cannot start because the budget is in use is refused with `429` and `Retry-After`; one that could not be spread inside 86,400 seconds at the capacity free is refused with `413`. `delay_max_s` and `estimated_completion_at` (`requested_at + delay_max_s`) are **estimates**. The budget bounds what the server asks for, not the rate at which reports arrive: an agent keeps a fire it already armed when that is sooner than the offset it was given, so a device whose own scheduled sync is due sooner reports then, as a full send. A fleet run that lands shortly before the nightly sync window can therefore turn that window's scheduled syncs into full sends at the window's own rate.
+
+**Joining and cooldown.** A request whose group, scope expression or fleet already has a run still spreading **joins** it: `202` with that run's counts, `execution_id` and `command_id`, `"joined": true`, and nothing sent. A run is shared only by callers who would be sent the same devices: the whole fleet is one run for every fleet administrator; a group is one run for callers whose `Execution:Execute` is unfiltered; a caller confined to part of a group has runs of their own and is never handed another caller's counts; a scope expression belongs to the operator who sent it and to its exact text. A request the running run does not cover (a later or absent `last_synced_before` over a filtered run) is `409` with the time left in `retry_after_ms`, as is a request that finds the same run still being started, which lasts until its frames have been sent (`retry_after_ms` 1,000): a join only ever reports a run whose frames were accepted. After a run starts, the same group, expression or fleet waits out a cooldown, 600 seconds by default (`--inventory-sync-cooldown`, `0` for none): `429` with `Retry-After`. A send that every device refused does not start the cooldown. A single named device is exempt from the spread, the join and the cooldown. At most three send loops are alive in a server process at once; a fourth is `409`.
+
+The run state, the cooldown and the budget are held in memory, per server process: they are forgotten on restart (agents keep the delays they already armed; the execution records persist), and each replica under active-active keeps its own.
+
+A run reaches agents attached to **this server process** only. `skipped_offline` counts the devices this server process did not reach that are not too old: it has no live session for them (a disconnected device, or one attached to another server), or the send was refused by the live stream (for example a gateway-attached agent whose gateway lacks the dispatch capability). Which devices are candidates depends on the scope: a group or a single named device lists its disconnected members too, but an `__all__` or scope-expression run lists only this server's own sessions plus the shared presence record, so a device that is offline everywhere is never counted, and if the presence read is degraded an `__all__` run lists fewer devices (those attached to other servers are not listed) while a scope-expression run is refused with 503 (the scope could not be evaluated) and sends nothing. `requested` and `skipped_offline` therefore describe what this server could reach; they are not a census of the fleet. Agents below 0.13.1 are skipped and counted in `skipped_version`.
+
+The `202` body carries counts only (`requested`, `agents_reached`, `skipped_offline`, `skipped_version`, `skipped_fresh`) plus `command_id`, `execution_id`, `delay_max_s`, `estimated_completion_at` and `joined`, never device ids. `execution_id` names the run's execution record (it is `null` when nothing was sent or the record could not be created); read it with `GET /api/v1/hardware/sync/{execution_id}`. A server that is missing a required component answers `500` and writes a `result=failure` audit row. A browser (session-cookie) request must carry an `Origin` or `Referer` naming this site, otherwise it is refused with `403` and a `csrf.denied` audit row; API-token and MCP-token callers are exempt. Who is reached is decided at send time by the `dispatch_confined_arms` system-reserved arm, which intersects the target list with the caller's own `Execution:Execute` visible set. The MCP tool `sync_hardware_software` calls the same engine and shares its run keys, joins, cooldown and budget. The request, statuses and bounds are in the OpenAPI document. **Audit:** `inventory.sync.request` (the whole-fleet row is written as `software_estate.sync.fleet_wide`), written before dispatch (see [audit-log.md](audit-log.md)).
+
+---
+
+#### `GET /api/v1/hardware/sync/{execution_id}`
+
+Reports how an on-demand software sync run is going, by the `execution_id` that `POST /api/v1/hardware/sync` answered with. **Permission:** `Execution:Execute`, checked as a global grant, like the POST. A caller reads the runs it started, or any sync run when its `Execution:Execute` is unfiltered; an unknown id, another operator's run and an execution that is not a sync run all answer the same `404`, so the route does not reveal which ids exist. The `200` body carries `execution_id`, `state` (the execution record's state), `targeted` (the frames the server's sessions accepted), `acknowledged` (agents that armed the sync), `failed` (agents that answered with a failure, for example because their daily-sync scheduler is not running), `dispatched_at`, `delay_max_s` and `estimated_completion_at`. An agent answers when it **arms** the sync, not when its report lands, so `acknowledged` counts requests taken up, not reports received; a count of reports per run is not reported. `delay_max_s` and `estimated_completion_at` are estimates (see above). An execution record that cannot be read is a `503` with `retry_after_ms`, never an empty `200`; a server with no execution tracking answers `503` too. No audit row is written for a read.
 
 ---
 
@@ -2235,11 +2251,17 @@ costs neither a per-record permission check nor an audit row.
 > re-applies a device's own firewall on reconnect. `last_applied_at` means a system re-dispatch of
 > the stored whitelist was accepted (`agents_reached > 0`) — NOT proof of containment (a
 > gateway-attached agent's `send_to` only queues the frame). `last_confirmed_at` is set only after
-> a follow-up `quarantine.status` read reports `state|active` — but that read is the target
+> a follow-up `firewall.quarantine_status` read reports the device's rules in force (`status|active`) — but that read is the target
 > agent's own self-report (cert-bound to its identity, not independently corroborated by any
 > network-side signal), so treat it as strong operational evidence of containment, not proof. See
 > `docs/user-manual/security-hardening.md` "Reconnect re-application (#3425)" for the full trust
-> boundary.
+> boundary. A device that was already contained under other operator exceptions keeps them: for a
+> record that was never confirmed, `last_confirmed_at` stays `0` (audit `quarantine.reapply`,
+> `allow_set_not_applied`), and the whitelist is not on the device until it is released and quarantined
+> again.
+>
+> **`status`** is `active`, or `releasing` while a release the device has not yet confirmed is in
+> progress (the record stays listed and keeps the dispatch refusal). Ended records are not listed.
 
 ---
 
@@ -2265,7 +2287,7 @@ Quarantine a device.
 
 > **Dispatch approval check (#6065).** After the scoped `Security:Execute` gate and
 > `whitelist` validation, and before the `attempt` audit row or any record is
-> written, the route runs the shared dispatch check for `quarantine.quarantine`,
+> written, the route runs the shared dispatch check for `firewall.quarantine`,
 > the same one MCP `quarantine_device` runs. REST has no approval-ticket path today, so
 > the check admits only an **administrator**: here that means an account whose account
 > role is `admin` (a live temporary JIT elevation counts as that role). Holding the RBAC
@@ -2288,7 +2310,7 @@ Quarantine a device.
 > |---|---|---|
 > | `403` | RBAC on: the caller holds `Security:Execute` globally but is not an administrator (account role `user`, no live JIT elevation) | `approval_required` |
 > | `403` | RBAC on: the caller's own `Security:Execute` grant is not global (for example it is held only through a management group, or the caller is an administrator only through a JIT elevation), **or the RBAC store could not be read** (a transient failure reads the same as a denial) | `forbidden` |
-> | `400` | The `quarantine.quarantine` pair cannot be classified | `unclassified` or `ambiguous` |
+> | `400` | The `firewall.quarantine` pair cannot be classified | `unclassified` or `ambiguous` |
 > | `403` | Other chokepoint refusals map the same way (`kill_switched`, `anonymous_operator`); neither is reachable for this pair today, because quarantine is exempt from the per-action kill switch and an unauthenticated request ends at the `401` | `kill_switched`, `anonymous_operator` |
 > | `401` | The request's second session look-up named a different principal than the first (for example a session cookie lapsed and a bearer token for another account is on the same request); written as a `quarantine.enable` row with `result=denied` and `detail` `authenticated principal changed during the request now=<second account>` (the account name has control bytes, spaces, commas, `=` and `;` replaced by `_` and is cut at 128 bytes), naming the first account as the actor | none |
 > | `500` | The dispatch check is not wired on this server (also written as a `quarantine.enable` row with `result=failure`) | none |
@@ -2336,7 +2358,7 @@ Quarantine a device.
 |---|---|---|---|
 | `agent_id` | string | Yes | Target device ID |
 | `reason` | string | No | Human-readable reason for quarantine |
-| `whitelist` | string | No | Comma-separated IPs still allowed to communicate. Validated server-side (#3425): ≤512 characters total, each token ≤45 characters and drawn from `[0-9A-Fa-f.:]` — the same charset the reconciler and MCP's `quarantine_device` retry path require before ever dispatching a stored whitelist. Rejected with `400`, not written. |
+| `whitelist` | string | No | Comma-separated bare IPv4 or IPv6 addresses (at most 32) still allowed to communicate; each is sent to the firewall plugin as an outbound and an inbound exception. Validated server-side by the one rule the reconciler and MCP's `quarantine_device` also apply before dispatching a stored whitelist: a port, a prefix length, an IPv4-mapped form, a leading-zero octet or any other token the plugin's exception grammar cannot express is refused. Rejected with `400` (`whitelist must be comma-separated IPv4 or IPv6 addresses, at most 32`), not written. |
 
 **Response (201):**
 
@@ -2367,7 +2389,7 @@ Quarantine a device.
 >
 > - A `201` here means **the record was written**, not that the device's
 >   firewall is enforcing anything **yet**. To isolate a device immediately,
->   dispatch `quarantine.quarantine` through the normal execution routes as
+>   dispatch `firewall.quarantine` through the normal execution routes as
 >   well — see [Security Hardening](security-hardening.md#device-quarantine).
 >   **As of #3425, "yet" is load-bearing: this route no longer leaves a
 >   record permanently unenforced.** `QuarantineContainmentReconciler`
@@ -2381,13 +2403,10 @@ Quarantine a device.
 >   reachable device does not stay dormant — the one exception is a stored
 >   `whitelist` the re-dispatch validator refuses. As of #3425 (`d1f71c58f`)
 >   this route validates `whitelist` at write time (`400` instead of `201`
->   for a malformed value), the same rule MCP's `quarantine_device` already
->   enforced — so a fresh write here can no longer land in this state. A
->   `validation_failed` reconcile now points at a record written via this
->   route before `d1f71c58f` shipped, or — on a fleet with pre-#3623 history
->   — one migrated from a legacy `quarantine.db` by the since-retired
->   `migrate_from_sqlite` backfill (ADR-0047, which copied `whitelist`
->   verbatim with no validation), not a fresh call. Either way, every reconcile
+>   for a malformed value), the same rule MCP's `quarantine_device`
+>   enforces — so a fresh write here cannot land in this state. A
+>   `validation_failed` reconcile points at a record written under an
+>   earlier, looser rule, not a fresh call. Either way, every reconcile
 >   attempt then counts `validation_failed` and nothing is ever dispatched.
 >   That failure is loud, not silent — the device stays in
 >   `yuzu_server_quarantine_endpoint_unconfirmed{reachability="connected"}`
@@ -2451,7 +2470,7 @@ Quarantine a device.
 > | *(absent)* | Genuinely no agent reachable — the pre-existing meaning. | *(absent)* |
 >
 > `plugin_not_found`, `kill_switched_os` and `os_gate_unreadable` are never produced for a
-> protective action (the quarantine plugin's four actions, the firewall plugin's four containment actions and `__guard__.push_rules`); see
+> protective action (the firewall plugin's four containment actions and `__guard__.push_rules`); see
 > [Upgrading](upgrading.md#behaviour-change-protective-actions-exempt-from-plugin-enablement).
 >
 > `reason` is a top-level key on the error object, not part of the A4
@@ -2479,9 +2498,9 @@ Quarantine a device.
 > result-set producers still do **not** carry this split — their own
 > response-building code was not extended to surface the richer per-arm
 > result their shared dispatch closure now carries (a separate, smaller
-> follow-up per route). The quarantine
-> plugin's own four actions (`quarantine`, `unquarantine`, `status`,
-> `whitelist`) are exempt so that release stays reachable, and so are four
+> follow-up per route). The firewall
+> plugin's four containment actions (`quarantine`, `release`,
+> `quarantine_status`, `quarantine_allow`) are exempt so that release stays reachable, and so are four
 > server-internal pushes that are not operator dispatch —
 > `echo.fleet_snapshot`, `__guard__.push_rules`, `asset_tags.sync` and
 > `__sync__.now`, a closed set counted (not per-event audited) by
@@ -2498,10 +2517,11 @@ Quarantine a device.
 
 #### `DELETE /api/v1/quarantine/{agent_id}`
 
-Release a device from quarantine. This ends the server's quarantine **record** only: it does
-**not** remove the device's firewall rules. To lift those, run the quarantine plugin's release
-instruction (`security.quarantine.release`, "Release Device from Quarantine") from the Instructions
-page or through `execute_instruction`.
+Release a device from quarantine. The route asks the device to lift its firewall rules (it sends
+`firewall.release` as the caller) and waits up to 5 seconds for the reply. The record **ends only on
+the device's confirmation** (`status|inactive`): `200` when it arrives in time, `202` otherwise. A
+record whose release is not yet confirmed reads `releasing` in the list, stays listed and keeps the
+dispatch refusal; the server's reconciler finishes the release when the device is reachable.
 
 **Permission:** `Security:Execute`, scoped per-device (see the note above)
 
@@ -2509,35 +2529,90 @@ Like `POST`, the release writes a `quarantine.disable` row with `result=attempt`
 before the change and answers `503` (`Sec-Audit-Failed: true`) without releasing
 the device if that row cannot be written.
 
+**Query parameter:** `force` (optional). `true` ends the record without the device's confirmation
+(see below); `false` or absent is the plain call; **any other value, an empty one included, is a `400`**
+(`force must be true or false`) with a `failure` audit row and no release requested or dispatched.
+
 **Dispatch approval check (#6065).** After the scoped gate, and before the `attempt` audit row
 and the release, the route runs the same dispatch approval check as `POST`, for the
-`quarantine.unquarantine` pair: a caller who cannot create a record cannot end one. The
-answers, statuses and reason labels are the table under `POST`, with the pair read as `quarantine.unquarantine` and the audit verb as `quarantine.disable`; a refusal leaves the record
+`firewall.release` pair: a caller who cannot create a record cannot end one. The
+answers, statuses and reason labels are the table under `POST`, with the pair read as `firewall.release` and the audit verb as `quarantine.disable`; a refusal leaves the record
 active, writes a `quarantine.disable` audit row with `result=denied` and `detail`
 `reason=<label> securable=<name>` (no `attempt` row), and increments
 `yuzu_server_dispatch_denied_total{reason}`. The `remediation` text names the MCP supervised
 flow, which has no release tool, so a non-administrator has no path to release through REST,
-the dashboard or MCP; an administrator releases it. Running the plugin's `unquarantine` without
-ending the record does not release the device from the server's side: the record stays active,
-the lens can keep reading the earlier confirmation, and containment is re-applied at the next
-session change, so an administrator should end the record first.
+the dashboard or MCP; an administrator releases it. A repeated `DELETE` on a releasing record
+sends the release again; it is not a `400`.
 
 The `401` for a changed principal, the `500` for an unwired audit identity writer and the
 session-stamped audit rows are exactly as for `POST` above, with the audit verb
 `quarantine.disable`.
 
-**Response:**
+**Response (`200`, the device confirmed the release, or the record was already ended and the device confirmed it):**
 
 ```json
 {
-  "data": { "released": true },
+  "data": { "released": true, "state": "released", "forced": false, "device_confirmed": true },
   "meta": { "api_version": "v1" }
 }
 ```
 
+**Response (`202`, not confirmed yet; the record stays `releasing`):**
+
+```json
+{
+  "data": { "released": false, "state": "releasing", "command_id": "..." },
+  "meta": { "api_version": "v1" }
+}
+```
+
+`202` covers every outcome short of the device's `inactive`: the device is offline, the dispatch was
+refused or threw, no reply arrived in 5 seconds, or the reply was anything else (a privilege refusal
+such as `status|refused|privilege_unavailable`, a partial release). The wait shares the 4-slot live
+in-flight budget with the DEX live route; with no slot free the release is dispatched and the answer
+is `202` without waiting.
+
+**Forced end (`?force=true`, REST only).** For a device that will not return, or one that cannot finish
+a release (a Linux host on the packaged systemd unit refuses every mutating firewall action), the
+same call with `?force=true` runs the same gates and the same release attempt, and where the plain
+call would answer `202` it ends the record at once:
+
+```json
+{
+  "data": {
+    "released": true, "state": "released", "forced": true, "device_confirmed": false,
+    "message": "Record ended without the device's confirmation. The device may still be contained.",
+    "command_id": "..."
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+A forced end **does not release the device**. The device may still be contained; the server stops
+refusing commands to it, so the operator has chosen to treat it as reachable; and the reconciler still
+owes it a release, which it reads and sends once per reconnect (`yuzu_server_quarantine_forced_release_owed`),
+and a `firewall.release` sent through any generic route reaches it at any time. A reachable device is
+still released for real: if it answers `inactive` within the wait the answer says `forced: false,
+device_confirmed: true`. The authority is the release's own (the scoped `Security:Execute` gate, the
+same-principal check and the dispatch check for `firewall.release`); no new permission or approval
+exists. Audit rows name the operator: the `attempt` row's `detail` is `force=true`, the outcome row
+`state=released reason=forced device_confirmed=false record_id=<id>`. A store failure while ending the
+record is a retryable `503` (the record stays releasing), never a `202` that hides it.
+
+**A record already ended by someone else.** When another writer ends the record between this call's
+release request and its own end (the reconciler, or a second `DELETE` for the same device), this call
+answers `200` with that record's real end. A forced call reads that end back from the store; a call
+whose own wait read `inactive` reads nothing back and answers on the device's word. A record ended on
+the device's confirmation: `forced: false, device_confirmed: true`. A forced end by the other writer
+still owes the device a release: the same body as a forced end, `forced: true, device_confirmed: false`
+and the message that the device may still be contained. A forced call that cannot read the record back
+(the read fails or the row is gone) answers the same way, never as a confirmed end. The audit row is
+`state=released record_id=<id> already_ended device_confirmed=<true|false>` and names no one: the
+writer that ended the record has its own `quarantine.disable` row with the same `record_id`.
+
 > **`400` vs `503` (ADR-0047).** Same distinction as `POST` above — `400`
-> means the device is not currently quarantined (retrying will not help);
-> `503` means a genuine store/pool failure (retrying is reasonable).
+> means the device is not currently quarantined or `force` is not `true`/`false` (retrying will not
+> help); `503` means a genuine store/pool failure (retrying is reasonable).
 
 ---
 
@@ -11488,10 +11563,9 @@ narrow the all-OS layer but never widen it, and within the OS layer an `action@o
 }
 ```
 
-For a **protective action** (the quarantine plugin's `quarantine`/`unquarantine`/`status`/`whitelist`,
-the firewall plugin's `quarantine`/`release`/`quarantine_status`/`quarantine_allow`
+For a **protective action** (the firewall plugin's `quarantine`/`release`/`quarantine_status`/`quarantine_allow`
 and `__guard__.push_rules`) the state shown is for information only: `enabled: false` can be displayed
-while dispatch still goes ahead (see
+while dispatch still goes ahead. A plugin-level `firewall` row never stops those four and still stops `state` and `rules`, so `protective_exempt=partial` on it means 'covers a protective action', not 'gates nothing' (see
 [Security Hardening](security-hardening.md) and [Upgrading](upgrading.md)).
 
 **Errors:** `400` (invalid plugin/action/os, or `?os=` present but empty), `503` (store unavailable).
