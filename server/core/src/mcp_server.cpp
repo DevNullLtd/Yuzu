@@ -1214,6 +1214,9 @@ static const ToolDef kTools[] = {
      "execution's dispatcher is admitted to VIEW the execution (avoids a false "
      "not-found on a just-dispatched execution with no responses yet) but gets "
      "the SAME redacted counts/scope_expression as any other confined caller. "
+     "A service-scoped token has no dispatcher admission: it sees an execution only "
+     "once an agent in its service scope has a status row for it, so an execution its "
+     "minting account dispatched reads as not found until an in-scope agent responds. "
      "#4030: include:[\"agents\"] adds a confined per-agent status/duration array "
      "plus a kpi summary (total/succeeded/failed/p50_ms/p95_ms) — audited "
      "separately from the bare call because it discloses raw agent identities. "
@@ -1237,7 +1240,8 @@ static const ToolDef kTools[] = {
      "and - per #3789 - a visible parent does NOT by itself disclose a "
      "child dispatched by, or targeting, someone else: each child "
      "independently passes the same visible-agent-or-owner test the parent "
-     "did. Mirrors GET /api/v1/executions/{id}/children and the legacy "
+     "did (a service-scoped token has no owner disjunct: only an in-scope agent "
+     "status row admits a child). Mirrors GET /api/v1/executions/{id}/children and the legacy "
      "GET /api/executions/{id}/children (same shared row builder, "
      "docs/api-twin-recipe.md Rule 1). The underlying query is hard-capped "
      "at 100 rows (governance Gate 8 re-review fix, #2146 A2-R1) with no "
@@ -1299,7 +1303,11 @@ static const ToolDef kTools[] = {
      "caller admitted through a management-group grant (rather than a global permission) "
      "sees only executions they themselves dispatched — a narrower interim mechanism than "
      "the visible-agent filtering other read tools apply, since execution rows carry no "
-     "single agent_id to filter by. #4030: rows now also carry the resolved definition "
+     "single agent_id to filter by. A service-scoped token is the exception: it lists "
+     "every execution with a status row for an agent in its service scope, whoever "
+     "dispatched it, with counts projected to those agents; executions its minting "
+     "account dispatched that no in-scope agent has answered are not listed, and a "
+     "service scope with no tagged agent lists nothing. #4030: rows now also carry the resolved definition "
      "name, the agents_success/agents_failure split, and a truncated error preview — "
      "reconciled onto the dashboard fragment's fuller field set.",
      R"({"type":"object","properties":{"definition_id":{"type":"string","maxLength":256},"status":{"type":"string","maxLength":64},"limit":{"type":"integer","default":50,"minimum":1,"maximum":500}}})",
@@ -2269,18 +2277,26 @@ static const ToolDef kTools[] = {
      "including agents whose operating system is not recognised, so not the sum of the per-platform "
      "results), windows, macos or linux. The population is that scope's devices online now "
      "(population: null = no fleet source wired, 0 = no device of the scope online now; "
-     "population_basis names it, e.g. all_online or windows_online). crash_source_coverage says "
-     "per platform whether its crash sources are complete (windows) or partial (linux, macos), so "
-     "a short list for linux or macos is not proof of a healthy fleet. An empty apps list means no "
+     "population_basis names it, e.g. all_online or windows_online). crash_source_coverage is the "
+     "shipped design of the crash sources per platform, complete (windows) or partial (linux, macos), "
+     "not live collector health: it does not change when a collector is off or missing on a host, so "
+     "a short list for linux or macos is not proof of a healthy fleet. observer_state is the live "
+     "count: per platform in scope, how many online devices report the crash and hang observer "
+     "armed, disarmed or not at all (null when no observer source is wired); a device that is not "
+     "armed or not reporting may not be sending all of its crash and hang signals (collection can "
+     "be incomplete or unavailable), so a quiet list does not cover it. An empty apps list means no "
      "crash or hang signal in the window on that scope, not a failure. "
      "Pass platform=windows for the Windows scope only; get_dex_app is the per-application drill-down and counts every platform. An invalid platform or window is invalid params (-32602, terminal: do not retry it unchanged). No device floor is applied. "
      "The policy object names the score policy every figure was scored under (source default or custom, "
      "revision, fault - a reason string when a stored policy document was refused and the shipped "
-     "defaults are in force, otherwise null - and the four tier edges and display names); each "
-     "application's profile is override when a per-application override shaped its tiers or weights, "
+     "defaults are in force, otherwise null - interval_confidence, and the four tier edges and display "
+     "names); each score carries tier, the display name its band reads as for that row (null when "
+     "withheld); each application's profile is override when a per-application override shaped its tiers or weights, "
      "else default. No per-agent identity (a distinct-device "
      "COUNT, never an agent_id) - not audited. A degraded read, including a stored policy that cannot be "
-     "read within its staleness bound, is an error, never an empty list. "
+     "read within its staleness bound, is an error naming the reason (concurrency_budget, "
+     "pool_acquire_timeout, statement_timeout, query_error, store_not_open, score_policy_unavailable "
+     "or score_policy_invalid), never an empty list. "
      "Mirrors GET /api/v1/dex/apps. Not audited beyond the generic tool-call row. A degraded read "
      "is a retryable error (retry_after_ms). Requires GuaranteedState:Read.",
      R"j({"type":"object","properties":{)j"
@@ -2288,11 +2304,12 @@ static const ToolDef kTools[] = {
      R"j("window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d","description":"Look-back window for crash and hang signals."})j"
      R"j(}})j",
      R"j({"type":"object","properties":{"window":{"type":"string"},"population":{"type":["integer","null"]},"population_basis":{"type":"string"},"crash_source_coverage":{"type":"object","additionalProperties":{"type":"string","enum":["complete","partial"]}},"apps_total":{"type":"integer"},"apps_truncated":{"type":"boolean"},)j"
-     R"j("policy":{"type":"object","properties":{"source":{"type":"string","enum":["default","custom"]},"revision":{"type":"string"},"fault":{"type":["string","null"]},"tiers":{"type":"object","properties":{"excellent":{"type":"object","properties":{"edge":{"type":"number"},"name":{"type":"string"}},"required":["edge","name"]},"good":{"type":"object","properties":{"edge":{"type":"number"},"name":{"type":"string"}},"required":["edge","name"]},"fair":{"type":"object","properties":{"edge":{"type":"number"},"name":{"type":"string"}},"required":["edge","name"]},"poor":{"type":"object","properties":{"edge":{"type":"number","description":"The fixed 0, not a stored value."},"name":{"type":"string"}},"required":["edge","name"]}},"required":["excellent","good","fair","poor"]}},"required":["source","revision","fault","tiers"]},)j"
+     R"j("policy":{"type":"object","properties":{"source":{"type":"string","enum":["default","custom"]},"revision":{"type":"string"},"fault":{"type":["string","null"]},"interval_confidence":{"type":"number"},"tiers":{"type":"object","properties":{"excellent":{"type":"object","properties":{"edge":{"type":"number"},"name":{"type":"string"}},"required":["edge","name"]},"good":{"type":"object","properties":{"edge":{"type":"number"},"name":{"type":"string"}},"required":["edge","name"]},"fair":{"type":"object","properties":{"edge":{"type":"number"},"name":{"type":"string"}},"required":["edge","name"]},"poor":{"type":"object","properties":{"edge":{"type":"number","description":"The fixed 0, not a stored value."},"name":{"type":"string"}},"required":["edge","name"]}},"required":["excellent","good","fair","poor"]}},"required":["source","revision","fault","interval_confidence","tiers"]},)j"
+     R"j("observer_state":{"type":["object","null"],"description":"Live observer counts per platform (windows, linux, macos, other under all); null when no observer source is wired.","additionalProperties":{"type":"object","properties":{"armed":{"type":"integer"},"disarmed":{"type":"integer"},"none_reported":{"type":"integer"}},"required":["armed","disarmed","none_reported"]}},)j"
      R"j("apps":{"type":"array","items":{"type":"object","properties":{"subject":{"type":"string"},"profile":{"type":"string","enum":["default","override"]},)j"
-     R"j("crashes":{"type":"integer"},"hangs":{"type":"integer"},"distinct_devices":{"type":"integer"},"distinct_devices_online":{"type":["integer","null"]},"last_seen":{"type":"string"},"share_affected":{"type":["object","null"],"properties":{"estimate":{"type":["number","null"]},"lower":{"type":"number"},"upper":{"type":["number","null"]},"reliable":{"type":"boolean"}},"required":["estimate","lower","upper","reliable"]},"rate_per_1000":{"type":["object","null"],"properties":{"estimate":{"type":["number","null"]},"lower":{"type":"number"},"upper":{"type":["number","null"]},"reliable":{"type":"boolean"}},"required":["estimate","lower","upper","reliable"]},"score":{"type":"object","properties":{"score":{"type":["number","null"]},"band":{"type":["string","null"]},"withheld":{"type":["string","null"],"description":"Why no score: no_population, offline_affected (an affected device is offline now) or a core reason; not a failure and not healthy."},"deductions":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"points":{"type":"number"},"assessed":{"type":"boolean"}},"required":["name","points","assessed"]}}},"required":["score","band","withheld","deductions"]},"versions":{"type":"array","items":{"type":"object","properties":{"version":{"type":"string"},)j"
-     R"j("crashes":{"type":"integer"},"hangs":{"type":"integer"},"distinct_devices":{"type":"integer"},"distinct_devices_online":{"type":["integer","null"]},"last_seen":{"type":"string"},"share_affected":{"type":["object","null"],"properties":{"estimate":{"type":["number","null"]},"lower":{"type":"number"},"upper":{"type":["number","null"]},"reliable":{"type":"boolean"}},"required":["estimate","lower","upper","reliable"]},"rate_per_1000":{"type":["object","null"],"properties":{"estimate":{"type":["number","null"]},"lower":{"type":"number"},"upper":{"type":["number","null"]},"reliable":{"type":"boolean"}},"required":["estimate","lower","upper","reliable"]},"score":{"type":"object","properties":{"score":{"type":["number","null"]},"band":{"type":["string","null"]},"withheld":{"type":["string","null"],"description":"Why no score: no_population, offline_affected (an affected device is offline now) or a core reason; not a failure and not healthy."},"deductions":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"points":{"type":"number"},"assessed":{"type":"boolean"}},"required":["name","points","assessed"]}}},"required":["score","band","withheld","deductions"]}},"required":["version","crashes","hangs","distinct_devices","distinct_devices_online","last_seen","share_affected","rate_per_1000","score"]}},"version_count":{"type":"integer"},"versions_truncated":{"type":"boolean"}},"required":["subject","profile","crashes","hangs","distinct_devices","distinct_devices_online","last_seen","share_affected","rate_per_1000","score","versions","version_count","versions_truncated"]}}},)j"
-     R"j("required":["window","apps","policy","population","population_basis","crash_source_coverage","apps_total","apps_truncated"]})j"},
+     R"j("crashes":{"type":"integer"},"hangs":{"type":"integer"},"distinct_devices":{"type":"integer"},"distinct_devices_online":{"type":["integer","null"]},"last_seen":{"type":"string"},"share_affected":{"type":["object","null"],"properties":{"estimate":{"type":["number","null"]},"lower":{"type":"number"},"upper":{"type":["number","null"]},"reliable":{"type":"boolean"}},"required":["estimate","lower","upper","reliable"]},"rate_per_1000":{"type":["object","null"],"properties":{"estimate":{"type":["number","null"]},"lower":{"type":"number"},"upper":{"type":["number","null"]},"reliable":{"type":"boolean"}},"required":["estimate","lower","upper","reliable"]},"score":{"type":"object","properties":{"score":{"type":["number","null"]},"band":{"type":["string","null"]},"tier":{"type":["string","null"],"description":"The tier name the band reads as under the policy that scored this row; null when withheld."},"withheld":{"type":["string","null"],"description":"Why no score: no_population, offline_affected (an affected device is offline now) or a core reason; not a failure and not healthy."},"deductions":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"points":{"type":"number"},"assessed":{"type":"boolean"}},"required":["name","points","assessed"]}}},"required":["score","band","tier","withheld","deductions"]},"versions":{"type":"array","items":{"type":"object","properties":{"version":{"type":"string"},)j"
+     R"j("crashes":{"type":"integer"},"hangs":{"type":"integer"},"distinct_devices":{"type":"integer"},"distinct_devices_online":{"type":["integer","null"]},"last_seen":{"type":"string"},"share_affected":{"type":["object","null"],"properties":{"estimate":{"type":["number","null"]},"lower":{"type":"number"},"upper":{"type":["number","null"]},"reliable":{"type":"boolean"}},"required":["estimate","lower","upper","reliable"]},"rate_per_1000":{"type":["object","null"],"properties":{"estimate":{"type":["number","null"]},"lower":{"type":"number"},"upper":{"type":["number","null"]},"reliable":{"type":"boolean"}},"required":["estimate","lower","upper","reliable"]},"score":{"type":"object","properties":{"score":{"type":["number","null"]},"band":{"type":["string","null"]},"tier":{"type":["string","null"],"description":"The tier name the band reads as under the policy that scored this row; null when withheld."},"withheld":{"type":["string","null"],"description":"Why no score: no_population, offline_affected (an affected device is offline now) or a core reason; not a failure and not healthy."},"deductions":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"points":{"type":"number"},"assessed":{"type":"boolean"}},"required":["name","points","assessed"]}}},"required":["score","band","tier","withheld","deductions"]}},"required":["version","crashes","hangs","distinct_devices","distinct_devices_online","last_seen","share_affected","rate_per_1000","score"]}},"version_count":{"type":"integer"},"versions_truncated":{"type":"boolean"}},"required":["subject","profile","crashes","hangs","distinct_devices","distinct_devices_online","last_seen","share_affected","rate_per_1000","score","versions","version_count","versions_truncated"]}}},)j"
+     R"j("required":["window","apps","policy","observer_state","population","population_basis","crash_source_coverage","apps_total","apps_truncated"]})j"},
 
     {"get_dex_catalogue",
      "Signal catalogue family cards (Catalogue View 1): every catalogued signal family's "
@@ -2802,6 +2819,9 @@ static const ToolDef kTools[] = {
      "query_responses by execution_id, or list_executions if you never learned one). NEVER re-send this call, which would run the action a second time. Progress is always BEST-EFFORT: even after supplying a "
      "token you MUST still be prepared to poll (a reservation can silently degrade under load "
      "and zero progress frames is indistinguishable from 'nothing has happened yet'). "
+     "SCOPE: a caller whose Execution:Read is limited to a management group (or absent, or "
+     "unresolvable) receives no progress notifications and a final result without "
+     "agents_success/agents_failure; poll get_execution_status for the counts it may see. "
      "FALLBACK when not streaming: poll query_responses with the "
      "returned execution_id - an EMPTY result means the run is still in flight, so wait ~2-5s "
      "and retry a few times (or call get_execution_status to confirm a terminal state), or "
@@ -4252,7 +4272,8 @@ static const ToolDef kTools[] = {
      "which this display accessor deliberately does not) — this is the inspection view an "
      "operator reads before deciding whether to flip it. Absence of a prior flip reads as "
      "enabled=true with no reason/set_by. For a protective action (the quarantine plugin's "
-     "quarantine/unquarantine/status/whitelist and __guard__.push_rules) the state shown here is "
+     "quarantine/unquarantine/status/whitelist, the firewall plugin's quarantine/release/"
+     "quarantine_status/quarantine_allow and __guard__.push_rules) the state shown here is "
      "informational only: enabled=false can be displayed while dispatch still proceeds. "
      "Without os this reports the all-OS layer only and "
      "never reflects a per-OS OFF row. Requires PluginConfig:Read.",
@@ -4270,7 +4291,8 @@ static const ToolDef kTools[] = {
      "store error, so throwing this switch is a reliable emergency stop for the named "
      "plugin/action — there is no separate 'force disable' escalation beyond this call. "
      "Exception: a protective action (the quarantine plugin's quarantine/unquarantine/status/"
-     "whitelist and __guard__.push_rules) is never refused by this switch; a row for one is "
+     "whitelist, the firewall plugin's quarantine/release/quarantine_status/quarantine_allow "
+     "and __guard__.push_rules) is never refused by this switch; a row for one is "
      "stored and echoed but has no dispatch effect; to stop Guardian rule delivery disable or "
      "remove the rules instead (disarms them on the agent's next reconcile). "
      "The result echoes the row written, not the effective state. Requires "
@@ -5684,6 +5706,15 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // Implemented write tools
     {"set_tag", {"Tag", "Write", ServiceScopeClass::confined}},
     {"delete_tag", {"Tag", "Delete", ServiceScopeClass::confined}},
+    // execute_instruction stays `confined` although cancel/rerun above are `denied` for the same
+    // pair (#7817 weighed relabelling it). `confined` is true here by mcp_tool_registry.hpp's own
+    // definition: the dispatch chokepoint confines to `exec_visible`, and compose_exec_visible
+    // resolves a service-scoped token's tag scope FIRST and never as unfiltered, a real
+    // service-scope mechanism (cancel/rerun have only admit_confined_mutation, a management-group
+    // one). It is not USABLE by a service-scoped token: perm_fn(Execution, Execute) below refuses
+    // it, since the pair is not on the empty kServiceScopeGlobalSafe. `denied` would move that
+    // refusal to the C8 short-circuit, which answers with its own message and audit row, a
+    // behaviour change for a service-scoped caller that this label is not worth.
     {"execute_instruction", {"Execution", "Execute", ServiceScopeClass::confined}},
     // #2146: the REST twin gates on the plain, global Execution:Execute pair, which a
     // service-scoped token cannot clear (kServiceScopeGlobalSafe is seeded empty), so this is
@@ -14979,7 +15010,9 @@ McpServer::HandlerFn McpServer::build_handler(
                     for (const auto& a : agents)
                         has_visible_agent = authz::in_scope(gate.scope, a.agent_id) || has_visible_agent;
                 }
-                const bool owns_execution = exec && exec->dispatched_by == session->username;
+                // #5557: ownership is keyed on the owner key, never on `username` (a
+                // service-scoped credential's `username` is its MINTING account).
+                const bool owns_execution = exec && execution_owner_key(*session).owns(*exec);
                 const bool visible = !gate.scope || owns_execution || has_visible_agent;
                 if (!exec || !visible) {
                     spdlog::debug("get_execution_status: {} exec_id={}",
@@ -15122,14 +15155,15 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 auto exec_id = param_str(args, "execution_id");
-                std::string username;
-                ExecutionScope scope_arg; // nullopt = unrestricted
+                // #5557: the visibility key. Empty for a service-scoped session (whose
+                // `username` is its minting account); the guard below stays on the RAW
+                // username, never on the key.
+                const ExecutionOwnerKey owner = execution_owner_key(*session);
                 if (gate.scope) {
                     // #1634/#3789 precedent (list_executions below): an empty
                     // username under an engaged scope must never silently
                     // widen to "no owner filter" -- fail closed instead.
-                    username = session->username;
-                    if (username.empty()) {
+                    if (session->username.empty()) {
                         spdlog::error("get_execution_children: confined session has empty "
                                       "username; failing closed rather than risk an unfiltered "
                                       "read");
@@ -15137,17 +15171,15 @@ McpServer::HandlerFn McpServer::build_handler(
                                         "application/json");
                         return;
                     }
-                    // #2146 A2-R1 Gate 8 fix: threads the SAME owner-or-
-                    // visible-agent admission predicate into
-                    // get_children_checked's SQL below (execution_routes.cpp's
-                    // list route precedent) -- closes the cap-before-scope
-                    // defect where an invisible sibling could displace this
-                    // caller's own visible children out of the capped window.
-                    ExecutionListScope s;
-                    s.owner = username;
-                    s.visible_agents.assign(gate.scope->begin(), gate.scope->end());
-                    scope_arg = std::move(s);
                 }
+                // #2146 A2-R1 Gate 8 fix: threads the SAME owner-or-
+                // visible-agent admission predicate into
+                // get_children_checked's SQL below (execution_routes.cpp's
+                // list route precedent) -- closes the cap-before-scope
+                // defect where an invisible sibling could displace this
+                // caller's own visible children out of the capped window.
+                // nullopt (unrestricted) when the gate returned no scope.
+                const auto scope_arg = confined_list_scope(owner, gate.scope);
 
                 auto exec_r = execution_tracker->get_execution_checked(exec_id);
                 if (!exec_r) {
@@ -15174,7 +15206,7 @@ McpServer::HandlerFn McpServer::build_handler(
 
                 const bool parent_visible =
                     exec_opt.has_value() &&
-                    execution_visible(*exec_opt, parent_statuses, gate.scope, username);
+                    execution_visible(*exec_opt, parent_statuses, gate.scope, owner);
                 if (!exec_opt || !parent_visible) {
                     // #3789: audit ONLY under an engaged scope -- mirrors the
                     // REST twins' identical rationale (compliance-officer F2).
@@ -15222,7 +15254,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         auto it = child_statuses_opt->find(c.id);
                         const auto& c_statuses =
                             it != child_statuses_opt->end() ? it->second : kEmptyStatuses;
-                        if (!execution_visible(c, c_statuses, gate.scope, username))
+                        if (!execution_visible(c, c_statuses, gate.scope, owner))
                             continue;
                         arr.add_raw(execution_child_row_json(c).dump());
                     }
@@ -15266,12 +15298,15 @@ McpServer::HandlerFn McpServer::build_handler(
             // a per-execution agent-status lookup per row — an N+1 pattern
             // (ADR-0017 INV-10). A batched status read exists and is used
             // below to project the counts, but LIST ADMISSION stays owner-only
-            // (no visible-agent disjunct, unlike REST GET /api/v1/executions):
-            // a confined caller is restricted to their OWN dispatches
-            // (`dispatched_by` pushed into the SQL WHERE,
+            // for a management-group-confined caller (no visible-agent disjunct,
+            // unlike REST GET /api/v1/executions): they are restricted to their
+            // OWN dispatches (`dispatched_by` pushed into the SQL WHERE,
             // ExecutionQuery::dispatched_by): cheap, provably safe (never
             // another operator's execution), and consistent with the
-            // dispatcher-ownership precedent elsewhere.
+            // dispatcher-ownership precedent elsewhere. #5557: a SERVICE-SCOPED session is
+            // the exception (see docs/auth-architecture.md clause (7) item 3). It has no
+            // owner key, so it takes the engaged fleet-read scope through the checked query
+            // (the REST list twin's admission), never the owner-only filter.
             if (tool_name == "list_executions") {
                 if (!fleet_read_fn_) {
                     spdlog::error("list_executions: fleet_read_fn_ unwired; failing closed");
@@ -15307,8 +15342,33 @@ McpServer::HandlerFn McpServer::build_handler(
                 ExecutionQuery eq;
                 eq.definition_id = param_str(args, "definition_id");
                 eq.status = param_str(args, "status");
-                if (gate.scope)
-                    eq.dispatched_by = session->username;
+                // #5557: a service-scoped session's owner key is EMPTY, and an
+                // empty `eq.dispatched_by` means "no filter" -- clearing the key here would
+                // widen a confined caller to the whole list. So the two confined classes take
+                // different, EXPLICIT paths (service-scoped is decided by the session's scope,
+                // not by the key):
+                //   - service-scoped: the engaged fleet-read scope through the checked query
+                //     (agent evidence only, no owner disjunct; a present-empty scope lists
+                //     nothing, `AND 1=0`), the same admission as the REST list twin;
+                //   - any other confined caller: the owner-only filter, exactly as before.
+                const ExecutionOwnerKey owner = execution_owner_key(*session);
+                const bool service_scoped = !session->token_scope_service.empty();
+                // Fail closed locally: both gates already refuse to admit a service-scoped
+                // session unrestricted, and without a scope this would list the whole fleet.
+                if (service_scoped && !gate.scope) {
+                    spdlog::error("list_executions: service-scoped session admitted without a "
+                                  "scope; failing closed rather than risk an unrestricted list");
+                    res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                    "application/json");
+                    return;
+                }
+                if (gate.scope && !service_scoped)
+                    // Non-empty: the raw username was guarded above.
+                    eq.dispatched_by = owner_only_filter(owner);
+                // An unrestricted (default) VisibleSet pushes down nothing.
+                const authz::VisibleSet unrestricted;
+                const auto query_scope =
+                    confined_list_scope(owner, service_scoped ? gate.scope : unrestricted);
                 eq.limit = std::min(param_int32(args, "limit", 50), 500);
                 // #4030: reconciled onto the fragment's fuller field set —
                 // populate last_error_detail so the error preview below is
@@ -15322,7 +15382,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // GET /api/v1/executions above (rest_api_v1.cpp), which
                 // already has this checked/error shape, and mirrors the
                 // list_schedules fix immediately below in this same file.
-                auto execs_opt = execution_tracker->query_executions_checked(eq);
+                auto execs_opt = execution_tracker->query_executions_checked(eq, query_scope);
                 if (!execs_opt) {
                     res.set_content(
                         a4_error(kInternalError, "execution tracker degraded", {},
@@ -22582,9 +22642,38 @@ McpServer::HandlerFn McpServer::build_handler(
                             }
                             stream_lease.emplace(std::move(acquired.lease));
                         }
+                        // #7817: the bridge relays this execution's counts to the
+                        // dispatcher, so it applies the same confined projection as
+                        // GET /api/v1/events, from the dispatcher's Execution:Read scope.
+                        // Derived through the one gate every Execution read uses here
+                        // (fleet_read_fn_, as get_execution_status does), on a scratch
+                        // response because a refusal here must not answer THIS request.
+                        // FAIL CLOSED: not admitted, unwired or a throw resolves to
+                        // deny-all (progress dropped, terminal sanitized), never to
+                        // nullopt (unrestricted). Only an admitted, unfiltered gate yields
+                        // nullopt, which keeps that caller's frames unchanged.
+                        yuzu::server::authz::VisibleSet bridge_fleet_scope =
+                            yuzu::server::authz::deny_all();
+                        try {
+                            if (fleet_read_fn_) {
+                                httplib::Response scratch;
+                                auto fleet_gate =
+                                    fleet_read_fn_(req, scratch, "Execution", "Read");
+                                if (fleet_gate.admitted)
+                                    bridge_fleet_scope = std::move(fleet_gate.scope);
+                            } else {
+                                spdlog::error("execute_instruction: fleet_read_fn_ unwired; "
+                                              "progress bridge uses its most restricted view");
+                            }
+                        } catch (...) {
+                            spdlog::error("execute_instruction: Execution:Read scope derivation "
+                                          "threw; progress bridge uses its most restricted view");
+                            bridge_fleet_scope = yuzu::server::authz::deny_all();
+                        }
                         auto rr = bridge->reserve(bridge_sid, binding, id,
                                                   std::move(bridge_token),
-                                                  /*streamed_intent=*/streamed_mode);
+                                                  /*streamed_intent=*/streamed_mode,
+                                                  std::move(bridge_fleet_scope));
                         if (rr.ok) {
                             bridge_active = true;
                             streamed_active = streamed_mode;
@@ -23139,9 +23228,11 @@ McpServer::HandlerFn McpServer::build_handler(
                 // #2712: structuredContent is baked into `result` HERE, before it
                 // is handed to bridge->arm() below as result_base - a streamed or
                 // parked final's build_real_final() parse-merges result_base and
-                // only ADDS top-level status/agents_success/agents_failure keys
-                // (mcp_stream_bridge.cpp), so structuredContent survives into every
-                // final shape unchanged. This is a deliberate, pinned decision, not
+                // only ADDS top-level status keys, plus agents_success/agents_failure
+                // when the terminal payload carries them (it does not for a
+                // scope-confined dispatcher) (mcp_stream_bridge.cpp), so
+                // structuredContent survives into every final shape unchanged.
+                // This is a deliberate, pinned decision, not
                 // an accident of construction order - see the bridge byte-pin test
                 // added alongside this change.
                 auto result = tool_result(payload, kObjectOutputSchema);
@@ -23149,7 +23240,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 // the latched progress snapshot to the projector, which publishes
                 // progress LIVE onto this session's GET stream. `result` is passed as the
                 // result_base (B5): a parked record's real final re-emits today's
-                // result object with status/agents_* added as top-level keys.
+                // result object with status (and agents_success/agents_failure when the
+                // terminal payload carries them) added as top-level keys.
                 // The plain JSON below answers this POST either way - GET-only
                 // mode NEVER emits a second final response (no pin, no final
                 // frame; the H2/G9-class byte test pins this).
@@ -25083,7 +25175,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         exec_agents = std::move(*agents_opt);
                     }
                     if (exec && execution_visible(*exec, exec_agents, gate.scope,
-                                                  session->username)) {
+                                                  execution_owner_key(*session))) {
                         int agents_targeted = exec->agents_targeted;
                         int agents_responded = exec->agents_responded;
                         if (gate.scope) {
@@ -28499,6 +28591,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 mreq.what = ExecutionMutation::kCancel;
                 mreq.execution_id = *exec_id;
                 mreq.username = session->username;
+                // #5557: admission key; `username` stays the real audit identity.
+                mreq.owner = execution_owner_key(*session);
                 mreq.scope = gate.scope;
                 mreq.audit_context = "surface=mcp";
                 const auto outcome = apply_execution_mutation(
@@ -28595,6 +28689,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 mreq.what = ExecutionMutation::kRerun;
                 mreq.execution_id = *exec_id;
                 mreq.username = session->username;
+                // #5557: admission key; `username` stays the real audit identity.
+                mreq.owner = execution_owner_key(*session);
                 mreq.scope = gate.scope;
                 mreq.failed_only = *failed_only;
                 mreq.audit_context = "surface=mcp";
@@ -32809,8 +32905,10 @@ McpServer::HandlerFn McpServer::build_get_handler(AuthFn auth_fn, AuditFn audit_
                 error_response_null_a4(kPermissionDenied,
                                        "service-scoped tokens may not open the MCP stream channel",
                                        cid,
-                                       "use a token without scope_service; durable results "
-                                       "remain fetchable by execution_id"));
+                                       "use a token without scope_service for the stream channel; "
+                                       "a service-scoped token can read an execution by "
+                                       "execution_id only after an agent in its service scope "
+                                       "has a status row for it"));
             return;
         }
         // The SSE channel itself (session gate, Accept negotiation, replay, caps,

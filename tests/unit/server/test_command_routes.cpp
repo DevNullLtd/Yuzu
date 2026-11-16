@@ -398,7 +398,7 @@ void grant_visibility(ManagementGroupStore& mg, std::initializer_list<std::strin
     ra.group_id = *gid;
     ra.principal_type = "user";
     ra.principal_id = "tester";
-    ra.role_name = "ITServiceOwner";
+    ra.role_name = "Operator";
     REQUIRE(mg.assign_role(ra).has_value());
 }
 
@@ -765,6 +765,37 @@ TEST_CASE("/api/command: a protective action reaches an agent whose inventory la
     h.send_to_ids_called.clear();
     auto ordinary =
         h.sink.Post("/api/command", R"({"plugin":"noop","action":"run","agent_ids":["inv-A"]})");
+    REQUIRE(ordinary);
+    CHECK(ordinary->status == 503);
+    CHECK(nlohmann::json::parse(ordinary->body)["error"]["reason"] == "plugin_not_found");
+    CHECK(h.send_to_ids_called.empty());
+}
+
+// The firewall plugin's four containment actions are protective too (owner decision 2026-11-12):
+// reached with the plugin missing from the inventory and through a per-OS kill switch, while the
+// plugin's ordinary actions are not. Exhaustive over the closed set.
+TEST_CASE("/api/command: every firewall containment action is protective; an ordinary firewall "
+          "action is withheld",
+          "[command_routes][protective]") {
+    for (const char* action : {"quarantine", "release", "quarantine_status", "quarantine_allow"}) {
+        INFO(action);
+        CommandHarness h;
+        auto info = make_agent_info("inv-A");
+        info.add_plugins()->set_name("noop"); // non-empty inventory without the firewall plugin
+        (void)h.registry.register_agent(info);
+        auto res = h.sink.Post("/api/command",
+                               std::string(R"({"plugin":"firewall","action":")") + action +
+                                   R"(","agent_ids":["inv-A"]})");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(h.send_to_ids_called == std::vector<std::string>{"inv-A"});
+    }
+    CommandHarness h;
+    auto info = make_agent_info("inv-A");
+    info.add_plugins()->set_name("noop");
+    (void)h.registry.register_agent(info);
+    auto ordinary = h.sink.Post("/api/command",
+                                R"({"plugin":"firewall","action":"state","agent_ids":["inv-A"]})");
     REQUIRE(ordinary);
     CHECK(ordinary->status == 503);
     CHECK(nlohmann::json::parse(ordinary->body)["error"]["reason"] == "plugin_not_found");

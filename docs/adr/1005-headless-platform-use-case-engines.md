@@ -1559,6 +1559,18 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        "Software collection settings".
      - Recorded by the change author; ADR-owner acceptance pending.
 
+   - **2026-11-09 - the `firewall` plugin's four containment actions
+     (`firewall.quarantine`, `firewall.release`, `firewall.quarantine_status`,
+     `firewall.quarantine_allow`, PRQ.1) are reachable only by raw dispatch, with no
+     instruction definition.** `exception:PRQ.1 containment actions reachable by raw
+     dispatch without a definition; revisit: PRQ.2 re-points definitions`. REST and
+     MCP `execute_instruction` reach them through the shared gates (the capability
+     catalogue classifies `firewall.quarantine` Destructive and Reversible, so it needs
+     explicit targets and the approval gate), but no definition publishes their
+     parameters (`ttl_seconds`, `probe_target`, `exceptions`, `op`, `if_ttl_expired`,
+     `repair`), so discoverability (Decision 1) is not met for them yet. The server cut-over that
+     re-points the quarantine definitions at these actions is the change that adds
+     them; until then the plugin README documents the parameters.
    - **2026-11-09 - the software lookup read surface (SAM-17; REST only, the MCP
      twin is a recorded exception).** `GET /api/v1/inventory/software` gains eight
      lookup fields (`hostname`, `last_seen`, `status`, `last_confirmed_at`,
@@ -1595,6 +1607,33 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        degraded store, facts, totals or version read is an audited `503` with the
        A4 envelope and `retry_after_ms`, never an empty `200`; both operations are
        in `paths` with typed responses. Wire reference:
+       `docs/user-manual/rest-api.md`, "GET /api/v1/inventory/software" and
+       "GET /api/v1/inventory/software/components".
+     - Recorded by the change author; ADR-owner acceptance pending.
+   - **2026-11-14 - the software lookup gains purl and `vers:` ranges (SAM-43;
+     REST only, the MCP twin is a recorded exception).** Rows of
+     `GET /api/v1/inventory/software` gain a `purl` field (the canonical Package
+     URL, `null` when the row has none) and the CSV export a 23rd column; the
+     route gains a `purl` filter (byte equality on the stored value); and both
+     lookup routes (`GET /api/v1/inventory/software` and
+     `GET /api/v1/inventory/software/components`) gain a `vers` filter (a
+     `vers:<scheme>/...` range resolved by the same evaluator as `version_min`
+     and `version_max`). None of this is reachable over MCP:
+     `query_installed_software` keeps its 14 fields and five arguments, and the
+     components route has no tool.
+     - **No MCP twin - tracked follow-up, not a permanent exception.** Tracked by
+       issue **#7749**, which rides with the SAM-17 twin (#7396, delivery row
+       SAM-21): the twin takes the same pure model (`software_list_model.hpp`,
+       `vers_range.hpp`), so no second copy of any rule is created. **Revisit by
+       2026-12-31.** This entry retires when the twin merges. The parity ledger
+       (`docs/api-parity-ledger.md`, "Known asymmetry on purl and vers") points
+       here.
+     - **The exception relaxes no control.** Both routes keep the SAM-17
+       posture: `require_fleet_read` (`Inventory:Read`) as the sole gate, the
+       composed management-group and service scope pushed into every page read
+       and into the version-range read, the `purl` filter ANDed with that scope,
+       every served call audited with the new filters in its target, and a
+       malformed `vers` or `purl` a `400` in the A4 envelope. Wire reference:
        `docs/user-manual/rest-api.md`, "GET /api/v1/inventory/software" and
        "GET /api/v1/inventory/software/components".
      - Recorded by the change author; ADR-owner acceptance pending.

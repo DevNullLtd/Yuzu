@@ -1,9 +1,11 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdint>
 #include <expected>
 #include <functional>
 #include <memory>
@@ -35,6 +37,7 @@
 namespace yuzu::server::net {
 struct ResolverPool;
 struct ResolveResult;
+class HostLookupAdmission;
 } // namespace yuzu::server::net
 
 namespace yuzu::server::oidc {
@@ -360,13 +363,25 @@ public:
     /// adapter passes to `net::bounded_resolve` (bounded_resolver.hpp), BELOW
     /// `set_resolver_for_test`, so a test can block a lookup behind a latch, fill a small pool or
     /// fail a lookup without DNS. An empty `lookup` and a null `pool` restore the system lookup and
-    /// the OIDC pool. Process-wide: a test must restore it. Same source-scan pin.
+    /// the OIDC pool. `admission` is the per-name limit and refusal memory the adapter consults: a
+    /// test that installs a lookup or a pool and passes none gets no admission, so only a test that
+    /// asks for it sees it. Process-wide: a test must restore it. Same source-scan pin.
     using BoundedLookupForTest = std::function<net::ResolveResult(const std::string& host)>;
-    static void set_bounded_lookup_for_test(BoundedLookupForTest lookup,
-                                            std::shared_ptr<net::ResolverPool> pool);
+    static void set_bounded_lookup_for_test(
+        BoundedLookupForTest lookup, std::shared_ptr<net::ResolverPool> pool,
+        std::shared_ptr<net::HostLookupAdmission> admission = {});
+    /// Test-only seam: the process-wide admission the POSIX adapter uses when no test has installed
+    /// a lookup or a pool (null on Windows, whose lookup has none). A test reads its limits and
+    /// that it is one object; the adapter's choice of it is checked by a source-text test. Same
+    /// source-scan check.
+    [[nodiscard]] static std::shared_ptr<net::HostLookupAdmission>
+    production_lookup_admission_for_test();
     /// Test-only seam: replaces the 30 s window during which a failed discovery is not retried
     /// (0 = retry on the next call) and clears any window already running. Same source-scan pin.
     void set_discovery_negative_cache_for_test(int ms);
+    /// Test-only seam: forgets the once-per-60-s throttle of the pool-full and NAT64 "not started"
+    /// warnings, so the next one of each is written at warn level again. Same source-scan rule.
+    static void reset_resolver_log_throttle_for_test();
     /// Test-only seam: forgets the process-wide cache of NAT64 prefixes learned from
     /// `ipv4only.arpa`, so the next eligible fetch looks them up again. Same source-scan pin.
     static void clear_nat64_discovery_cache_for_test();
@@ -567,8 +582,18 @@ private:
 
 /// Name lookups currently outstanding in the pool the OIDC egress path owns (cap
 /// `net::kMaxInFlightLookups`). A lookup that has timed out for its caller still holds its slot
-/// until the resolver returns. Feeds `yuzu_server_oidc_resolver_in_flight`. Fed only on POSIX
-/// builds (the pool is not used elsewhere), so it always reads 0 on other builds.
+/// until the resolver returns. Feeds `yuzu_server_oidc_resolver_in_flight`. The pool is used only
+/// on POSIX builds, so it is non-zero only there.
 [[nodiscard]] int oidc_resolver_in_flight();
+
+/// The pool's slot count. Feeds `yuzu_server_oidc_resolver_pool_capacity`.
+[[nodiscard]] int oidc_resolver_pool_capacity();
+
+/// How many lookups through the pool ended in each `net::ResolveStatus`, in enumerator order (five
+/// members; oidc_provider.cpp asserts the length against `net::kResolveStatusCount`, which this
+/// header cannot name because bounded_resolver.hpp stays out of it). Feeds
+/// `yuzu_server_oidc_resolver_lookups_total`. A lookup that goes through the test-resolver seam
+/// does not use the pool and is not counted.
+[[nodiscard]] std::array<std::uint64_t, 5> oidc_resolver_outcome_counts();
 
 } // namespace yuzu::server::oidc

@@ -112,7 +112,7 @@ void grant_visibility(ManagementGroupStore& mg, std::initializer_list<std::strin
     ra.group_id = *gid;
     ra.principal_type = "user";
     ra.principal_id = kUser;
-    ra.role_name = "ITServiceOwner";
+    ra.role_name = "Operator";
     REQUIRE(mg.assign_role(ra).has_value());
 }
 

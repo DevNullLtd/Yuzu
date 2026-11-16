@@ -1,6 +1,7 @@
 #include "echo_timeline_render.hpp"
 
 #include "echo_process_tree.hpp" // normalize_echo_os
+#include "plural.hpp"
 #include "web_utils.hpp"        // html_escape, format_iso_utc
 
 #include <algorithm>
@@ -38,10 +39,6 @@ std::string iso(std::int64_t ts) {
 std::string num(std::int64_t n) { return std::to_string(n); }
 std::string fix3(double v) { return std::format("{:.3f}", v); }
 
-std::string plural(std::size_t n, const char* one, const char* many) {
-    return std::to_string(n) + " " + (n == 1 ? one : many);
-}
-
 std::string lane_label(const EchoTimelineLane& l) { return l.name.empty() ? l.id : l.name; }
 
 std::string join(const std::vector<std::string>& v, const char* sep) {
@@ -57,12 +54,12 @@ std::string join(const std::vector<std::string>& v, const char* sep) {
 /// "31 days", "1 hour", "90 seconds": whole units only, never a rounded figure.
 std::string span_text(std::int64_t s) {
     if (s % 86400 == 0)
-        return plural(static_cast<std::size_t>(s / 86400), "day", "days");
+        return plural_count(static_cast<std::size_t>(s / 86400), "day", "days");
     if (s % 3600 == 0)
-        return plural(static_cast<std::size_t>(s / 3600), "hour", "hours");
+        return plural_count(static_cast<std::size_t>(s / 3600), "hour", "hours");
     if (s % 60 == 0)
-        return plural(static_cast<std::size_t>(s / 60), "minute", "minutes");
-    return plural(static_cast<std::size_t>(s), "second", "seconds");
+        return plural_count(static_cast<std::size_t>(s / 60), "minute", "minutes");
+    return plural_count(static_cast<std::size_t>(s), "second", "seconds");
 }
 
 constexpr std::array<EchoTier, 3> kTiers{EchoTier::hourly, EchoTier::daily, EchoTier::monthly};
@@ -365,7 +362,7 @@ std::string render_regions(const EchoTimelineLane& lane, const EchoTimelineModel
     }
     if (cursor < m.window_to_ts)
         gap(cursor, m.window_to_ts,
-            omitted > 0 ? plural(omitted, "more stretch", "more stretches") + ", not drawn"
+            omitted > 0 ? plural_count(omitted, "more stretch", "more stretches") + ", not drawn"
                         : "Coverage not stated");
     return h;
 }
@@ -973,7 +970,7 @@ std::string render_timeline_lanes(const EchoTimelineModel& m) {
             for (const auto& b : lay.blocks)
                 h += render_block(b);
             if (lay.overflow_count > 0) {
-                const std::string label = plural(lay.overflow_count, "more item", "more items") +
+                const std::string label = plural_count(lay.overflow_count, "more item", "more items") +
                                           ", not drawn";
                 h += "<span class=\"tl-d\" style=\"left:" + fix3(lay.overflow_left_pct) +
                      "%;width:" + fix3(std::max(100.0 - lay.overflow_left_pct, kEchoTimelineMinWidthPct)) +

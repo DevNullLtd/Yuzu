@@ -2,6 +2,7 @@
 
 #include "authz_model.hpp"
 #include "event_emit_hook.hpp"
+#include "execution_scope_rules.hpp"
 #include "execution_tracker.hpp"
 
 #include <expected>
@@ -86,8 +87,16 @@ struct ExecutionMutationPorts {
 struct ExecutionMutationRequest {
     ExecutionMutation what{ExecutionMutation::kCancel};
     std::string execution_id;
-    /// The resolved principal. Empty is refused (`kNoPrincipal`); there is no "unknown" default.
+    /// The resolved principal: the REAL identity, for the `kNoPrincipal` refusal,
+    /// `mark_cancelled` / `create_rerun` attribution and every audit row. Empty is refused; there
+    /// is no "unknown" default. Never an ownership key: a service-scoped session's `username` is
+    /// its MINTING account, so admission reads `owner` below instead.
     std::string username;
+    /// The OWNERSHIP key admission compares against `Execution::dispatched_by` (#5557), set with
+    /// `execution_owner_key(session)` at every construction site. Empty for a service-scoped
+    /// session, so it admits only on complete cohort visibility. The default owns nothing: a site
+    /// that forgets to set it fails closed in the zero-status-row dispatcher window.
+    ExecutionOwnerKey owner;
     /// The fleet-read scope: `nullopt` = unconfined, present-empty = deny-all.
     authz::VisibleSet scope;
     /// Rerun only: target just the agents that failed.

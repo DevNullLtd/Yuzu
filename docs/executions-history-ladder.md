@@ -404,9 +404,13 @@ a confined caller does not pull every agent row of a fleet-wide execution; `exec
 `confined_projection` still do the redaction, and the served result is identical because both
 ignore out-of-scope rows. **Never use a filtered read where the complete cohort is needed**
 (`admit_confined_mutation` must see every agent row to decide a mutation). Service-scoped sessions
-get no owner disjunct on the fragment, because a service-scoped token's session username is its
-minter; the other surfaces that read the disjunct still show a minter's executions to a
-service-scoped token (#5557). Full account: `docs/auth-architecture.md`'s "Sixth migration".
+get no owner disjunct on any execution surface (#5557), because a service-scoped token's session
+username is its minter: every visibility and mutation-admission decision takes its ownership key from
+`execution_owner_key(session)` (`execution_scope_rules.hpp`), which is empty for such a session, so it
+sees an execution only once an agent in its service scope has a status row for it (a row is written
+when an agent's response arrives; the cohort rule above is unchanged). Real dispatch attribution and
+audit identity still use the session's own username. A service scope with no tagged agent is an
+engaged-empty scope and sees nothing. Full account: `docs/auth-architecture.md`'s "Sixth migration".
 
 **#3526 (per-agent execution-statistics rollup):** REST `GET /api/v1/execution-statistics/agents` and
 MCP `get_execution_statistics_by_agent` gate on `fleet_read_fn` and pass the visible set as
@@ -546,8 +550,9 @@ and the collapsed responses list at 50; the drawer's default view is unchanged a
 
 ### Audit policy
 
-`execution.live_subscribe` audits on first connect per session-per-execution
-(deduped). SSE auto-reconnect inside the dedup window does NOT re-audit.
+`execution.live_subscribe` audits every successful subscribe, with no per-session-per-execution
+dedup (tracked as #700), so an SSE auto-reconnect writes another row; a not-found subscribe is
+audited as `denied`.
 The forensic-grade audit on read remains on
 `/fragments/executions/{id}/detail`'s `execution.detail.view`.
 
@@ -579,7 +584,9 @@ consumer reads. The three live consumers are (1) the dashboard SSE route
 progress bridge** (track 2f, `McpStreamBridge`), a *consumer-side
 projection only*: it maps the same bus events onto an MCP session as
 `notifications/progress` + a final JSON-RPC response, adds **no bus event
-type** and renames no step. Which wire carries those frames is a per-request
+type** and renames no step, and it applies the same confined projection as
+the other two (see "Bridge as a projected consumer (#7817)" below). Which
+wire carries those frames is a per-request
 client choice and changes nothing here — the session's `GET` stream (PR 3a)
 or the `tools/call` POST response held open as SSE (PR 3b) — because both
 read the same subscription off the same bus. The bridge subscribes via
@@ -680,11 +687,29 @@ principal — REST `/api/v1/events`, the dashboard `/sse/executions/{id}`, and a
 MUST route every event through `execution_event_scope.hpp`'s
 `classify_execution_event_for_scope` / `sanitize_execution_event_for_scope`. A consumer that reads
 the bus directly without this call leaks agent-transition and progress events to an out-of-scope
-subscriber.
+subscriber. The MCP stream bridge (`McpStreamBridge`) is the third consumer and follows the same rule
+(see "Bridge as a projected consumer (#7817)" below).
 
-Both call sites are pinned by source-tripwire tests
-(`tests/unit/server/test_response_execution_scope_authz.cpp`) that fail if either call is deleted.
+The REST and dashboard call sites are pinned by source-tripwire tests
+(`tests/unit/server/test_response_execution_scope_authz.cpp`) that fail if either call is deleted; the
+bridge is pinned by `tests/test_execution_owner_key_tripwire.py` CHECK 9 (the
+classifier call and its `kDrop` return inside the listener, both sanitize
+sites, the normalised scope store in `reserve()`, the handler's derivation
+arms, and the frozen set of files that hold the bridge).
 **A NEW bus consumer needs its own tripwire** — never an assumption that the existing ones cover it.
+
+**Limit (b): withheld-event counts are inferable.** Bus ids are per-execution counters (one per event, for all agents) sent raw, so a confined subscriber can infer how many events were withheld from gaps in the ids, the sanitized terminal frame's id and the replay-gap `missing_to`; no content or attribution leaks. A dense per-connection id would break `Last-Event-ID` resume; an opaque resumable cursor is tracked as #7816.
+
+**Bridge as a projected consumer (#7817).** `McpStreamBridge` relays `execution-progress` counts and the terminal event to the session that armed it, and it applies the same projection as the REST and dashboard consumers: its listener calls `classify_execution_event_for_scope` against the DISPATCHING session's fleet-read scope. `execute_instruction` derives that scope from the `Execution:Read` gate (`fleet_read_fn_`, the gate `get_execution_status` uses), hands it to `McpStreamBridge::reserve`, and the record keeps whether it was confined, immutable, like the listener it feeds. One bus and one taxonomy: no bridge-specific event type or format was added. The cases:
+
+- **Unrestricted** (the gate admits with no scope): nothing changes. The frames are byte-identical to what the bridge emitted before the rule; a unit test pins the exact strings.
+- **Confined** (an engaged scope): `execution-progress` is dropped before it is latched, so the session receives no progress notification; the terminal is latched as `sanitize_execution_event_for_scope(ev)`, so the final result carries the real `status` (a cancelled or failed execution is not reported as a success) and neither `agents_success` nor `agents_failure`. An absent count is omitted, never shown as 0. The pressure visitor's buffered terminal (a terminal-flagged `execution-progress`, which carries the counts) is sanitized the same way; one with no string `status` latches `unknown`, the default an unrestricted record's final gets.
+- **Unresolved** (the gate refuses, is unwired or throws): the handler passes `deny_all()`, which is confined, never `nullopt`. An unwired gate or a throw also writes a server error log line; no metric counts it. The record keeps only engaged-or-not (`deny_all()` or `nullopt`), never the caller's agent ids.
+- **A terminal payload with no string `status` is not a real case, and the two paths differ on it.** The pressure visitor's buffered terminal latches `status:"unknown"` (the default an unrestricted record's final gets), while the listener path, like REST and SSE, uses the shared sanitizer's fixed `completed`. Neither is reachable in practice because every terminal publisher stamps `status`: `refresh_counts` on both its terminal-flagged `execution-progress` and its `execution-completed` (`execution_tracker.cpp` lines 1651 and 1656), `mark_cancelled` (line 1769, `cancelled`) and the stuck-execution reaper (line 3390, `cancelled`).
+- `agent-transition` is not latched or emitted by the bridge in either mode (the listener returns before it), so the classifier's per-agent verdict has nothing to decide there.
+
+This closes the case a principal holding global `Execution:Execute` but only scoped `Execution:Read` exposed: its own fleet-wide dispatch used to report fleet-wide counts on the bridge that the REST events route withheld. A service-scoped session is unchanged: `Execution:Execute` is not on the empty `kServiceScopeGlobalSafe` table, so it never reaches `execute_instruction`. `agents_reached` in the dispatcher's own plain tool result is unchanged: it is the caller's own dispatch response, not a bus event.
+
 ## HA WS-2a — durable event outbox (ADR-2002 §5)
 
 The "Restart loss" characteristic above is what WS-2a closes. `ExecutionTracker`

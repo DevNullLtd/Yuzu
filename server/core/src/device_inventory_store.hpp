@@ -30,6 +30,8 @@
 #include "digest_fn.hpp"                // DigestFn (the writer's test seam; no OpenSSL here)
 #include "inventory_ingest_outcome.hpp" // InventoryIngestOutcome (shared sync-ingest vocabulary)
 
+#include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <optional>
@@ -46,6 +48,17 @@ class PgPool;
 }
 
 namespace yuzu::server {
+
+/// Bounds of one `list_device_ci_for` read. A struct so a test can inject a tiny chunk and an
+/// already-spent budget without the production caller naming either.
+struct DeviceCiKeyedReadLimits {
+    /// Ids per statement. 10k ids is ~0.4 MB of array text; the whole 100k-device roster is ten
+    /// statements on ONE lease.
+    std::size_t chunk = 10000;
+    /// One budget for the whole read, checked BEFORE each chunk after the first. Without it N chunks
+    /// could each run to the pool's 30 s statement bound and pin a shared lease for N x 30 s.
+    std::chrono::milliseconds budget{20000};
+};
 
 class DeviceInventoryStore {
 public:
@@ -102,10 +115,15 @@ public:
     [[nodiscard]] std::expected<std::optional<DeviceCiRecord>, CiReadError>
     get_device_ci(std::string_view agent_id);
 
-    /// The whole device-CI roster (the Hardware list source), hostname-sorted,
-    /// capped at a hard ceiling regardless of `limit`. Authoritative: `std::nullopt`
-    /// on a store/pool/query degrade, NEVER a silent empty. An empty value = no rows.
-    [[nodiscard]] std::optional<std::vector<DeviceCiRecord>> list_device_ci(int limit);
+    /// The device-CI records of exactly the named agents (the Hardware list's CI join, keyed by the
+    /// roster it is joined onto, #7549). There is NO row cap: the result holds at most one record per
+    /// id, so it is bounded by the caller's roster and cannot silently drop a device the way the
+    /// hostname-ordered whole-table read it replaced did. An id with no CI row is simply absent from
+    /// the result (not yet synced). An empty `agent_ids` is an empty success. Authoritative: a store /
+    /// pool / statement failure, or the budget running out between chunks, is `std::nullopt` for the
+    /// WHOLE read, never a partial vector and never a silent empty. Order is unspecified.
+    [[nodiscard]] std::optional<std::vector<DeviceCiRecord>>
+    list_device_ci_for(const std::vector<std::string>& agent_ids, DeviceCiKeyedReadLimits limits = {});
 
     /// One agent's v2 per-section statuses + list rows (cpu, dimm, disk, swap, volume,
     /// partition, topology; chassis/baseboard/machine_id carry a status only), in the

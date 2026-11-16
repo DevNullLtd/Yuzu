@@ -105,7 +105,10 @@ TEST_CASE("hw_identity_fn wiring (LEXICAL pin, not behaviour): the offline fallb
     REQUIRE_FALSE(body.empty());
 
     // The offline fallback is the point read, named exactly once, with the roster's own window.
-    CHECK(count_occurrences(body, "offline_endpoint_store_->find_within(agent_id,kHardwareRosterWindow)") == 1);
+    // #7551: ...and it is asked whether the device is live on ANOTHER replica (the session ttl), so a
+    // device connected elsewhere is not hard-coded offline.
+    CHECK(count_occurrences(body,
+                            "offline_endpoint_store_->find_within(agent_id,kHardwareRosterWindow,cfg_.session_timeout)") == 1);
     // ... and the roster scan is not named anywhere in the closure.
     CHECK(count_occurrences(body, "query_stale_within(") == 0);
     CHECK(count_occurrences(body, "offline_endpoint_store_->") == 1);
@@ -128,15 +131,52 @@ TEST_CASE("build_hw_roster wiring (LEXICAL pin, not behaviour): the roster read 
     const std::string roster_body =
         lambda_body(comment_free_source("server.cpp"), "build_hw_roster", "-> InventoryDevicesResult");
     REQUIRE_FALSE(roster_body.empty());
-    const auto read = roster_body.find("offline_endpoint_store_->query_stale_within(kHardwareRosterWindow)");
+    const auto read = roster_body.find(
+        "offline_endpoint_store_->query_stale_within(kHardwareRosterWindow,cfg_.session_timeout)");
     const auto apply = roster_body.find("apply_roster_read(result,eps)");
     REQUIRE(read != std::string::npos);
     REQUIRE(apply != std::string::npos);
     CHECK(read < apply);
     CHECK(count_occurrences(roster_body, "query_stale_within(") == 1);
     CHECK(count_occurrences(roster_body, "apply_roster_read(") == 1);
+    // #7566: "online" is the roster row's own `live` flag OR a session held on THIS replica. The
+    // registry's presence-merged `all_ids()` (a second read that can fail or be truncated on its own
+    // and silently read connected devices as Offline) must not come back into this closure, and the
+    // TTL must be the session timeout (the presence window the registry itself uses).
+    CHECK(count_occurrences(roster_body, "registry_.all_ids()") == 0);
+    CHECK(count_occurrences(roster_body, "registry_.local_ids()") == 1);
+    // The composition itself is `roster_row_online` (behaviourally tested in test_hardware_list_model);
+    // this pins that the closure calls it, and that nothing else assigns `online` afterwards.
+    CHECK(count_occurrences(roster_body, "r.online=roster_row_online(e,online);") == 1);
+    CHECK(count_occurrences(roster_body, "r.online=") == 1);
     // The rows come from the served partial's `.rows`, not from a re-read.
     CHECK(count_occurrences(roster_body, "eps->rows") >= 1);
+}
+
+// #7549: the CI join is driven by `apply_ci_read`, keyed by the roster's own ids. Every behavioural
+// test calls that helper directly or feeds a hand-built roster, so deleting the call (or wiring it
+// to an empty reader) would leave the Hardware list with blank CI and `ci_degraded=false` - the
+// exact symptom the issue reports - with every unit test green. This pin is what notices.
+TEST_CASE("build_hw_roster wiring (LEXICAL pin, not behaviour): the CI join is the roster-keyed "
+          "apply_ci_read, after the roster read",
+          "[hardware][wiring][lexical][ci_join]") {
+    const std::string roster_body =
+        lambda_body(comment_free_source("server.cpp"), "build_hw_roster", "-> InventoryDevicesResult");
+    REQUIRE_FALSE(roster_body.empty());
+
+    // The one call, with the real store behind the reader and an unwired store as an empty reader.
+    CHECK(count_occurrences(roster_body, "apply_ci_read(") == 1);
+    CHECK(count_occurrences(roster_body, "apply_ci_read(result,device_inventory_store_?CiKeyedReadFn{") == 1);
+    CHECK(count_occurrences(roster_body, ":CiKeyedReadFn{});") == 1);
+    // The reader asks the store for exactly the ids it was handed; the whole-table read is gone.
+    CHECK(count_occurrences(roster_body, "device_inventory_store_->list_device_ci_for(ids)") == 1);
+    CHECK(count_occurrences(roster_body, "list_device_ci(") == 0);
+    // It runs on the rows the roster read produced, so it comes after `apply_roster_read`.
+    const auto roster = roster_body.find("apply_roster_read(result,eps)");
+    const auto join = roster_body.find("apply_ci_read(");
+    REQUIRE(roster != std::string::npos);
+    REQUIRE(join != std::string::npos);
+    CHECK(roster < join);
 }
 
 TEST_CASE("hw_ci_detail_fn wiring (LEXICAL pin, not behaviour): one closure feeds REST and MCP",

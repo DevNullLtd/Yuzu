@@ -42,12 +42,9 @@ SUMMARY_PARSER="$SCRIPT_DIR/../scripts/gateway_test_summary.py"
 # gated MODE LABEL CMD...  Run CMD, show its output, then judge the run with
 # scripts/gateway_test_summary.py instead of trusting rebar3's exit code,
 # which is 0 when nothing ran (#4800: a ct run with no suites printed
-# "All 0 tests passed." and exited 0). MODE is `cancel-tolerant` (eunit: a
-# non-zero exit with "Failed: 0" and tests executed is tolerated, #1005, the
-# same rule as scripts/test/eunit-gate.sh) or `strict` (ct: rebar3's own
-# non-zero exit stays a failure, and a green exit must have executed >= 1
-# test). Returns the verdict's exit code. Pinned by
-# tests/test_gateway_test_summary.py.
+# "All 0 tests passed." and exited 0). EUnit and CT both use `strict`:
+# nonzero exits, cancellations, failed summaries and zero execution fail.
+# Pinned by tests/test_gateway_test_summary.py.
 gated() {
     local mode="$1" label="$2" capture rebar_rc verdict
     shift 2
@@ -112,9 +109,9 @@ FAILURES=0
 if $RUN_EUNIT; then
     log "Running EUnit tests..."
     if $RUN_COVER; then
-        gated cancel-tolerant eunit rebar3 as test do eunit --dir apps/yuzu_gw/test, cover || FAILURES=$((FAILURES + 1))
+        gated strict eunit rebar3 as test do eunit --dir apps/yuzu_gw/test, cover || FAILURES=$((FAILURES + 1))
     else
-        gated cancel-tolerant eunit rebar3 as test eunit --dir apps/yuzu_gw/test || FAILURES=$((FAILURES + 1))
+        gated strict eunit rebar3 as test eunit --dir apps/yuzu_gw/test || FAILURES=$((FAILURES + 1))
     fi
 fi
 

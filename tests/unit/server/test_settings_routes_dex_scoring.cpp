@@ -319,8 +319,14 @@ struct WriterHold {
 std::vector<std::string> control_tags(const std::string& html) {
     std::vector<std::string> out;
     for (const char* open : {"<input", "<button"})
-        for (auto at = html.find(open); at != std::string::npos; at = html.find(open, at + 1))
-            out.push_back(html.substr(at, html.find('>', at) - at + 1));
+        for (auto at = html.find(open); at != std::string::npos; at = html.find(open, at + 1)) {
+            auto tag = html.substr(at, html.find('>', at) - at + 1);
+            // The DEX sub-navigation tabs are buttons that swap the pane; they are navigation, not
+            // part of the editable form, and stay enabled on a locked page.
+            if (tag.find("hx-target=\"#guardian-detail\"") != std::string::npos)
+                continue;
+            out.push_back(std::move(tag));
+        }
     return out;
 }
 
@@ -358,7 +364,7 @@ TEST_CASE("scoring GET: a holder of both grants gets the whole editable form, as
         REQUIRE(scoring != std::string::npos);
         REQUIRE(alerts != std::string::npos);
         CHECK(scoring < alerts);
-        CHECK(has(res->body, "<a class=\"on\" hx-get=\"/fragments/dex/scoring?window=7d\""));
+        CHECK(has(res->body, "<button type=\"button\" class=\"on\" aria-current=\"page\" hx-get=\"/fragments/dex/scoring?window=7d\""));
         CHECK(count_of(res->body, "id=\"dex-scoring-section\"") == 1);
         for (const char* name : {"tiers.edges.excellent", "tiers.names.poor", "weights.regression",
                                  "model.per_device_event_cap", "model.interval_confidence"})
@@ -951,4 +957,27 @@ TEST_CASE("scoring save is equivalent to PUT /api/v1/dex/score-policy",
     CHECK(rest_bad->status == 400);
     const std::string message = json::parse(rest_bad->body)["error"]["message"];
     CHECK(has(h.post(kSave, form_body(bad, rev), kHx)->body, message));
+}
+
+// #7536: the sub-navigation carries the window the viewer chose, like every other DEX tab. (This case
+// belongs with the Scoring fragment's own harness; the REST twin's file has no fragment route.)
+TEST_CASE("scoring GET: the sub-navigation carries the chosen window, and a missing or unknown one is 7d",
+          "[server][routes][dex][score_policy][scoring][window]") {
+    Harness h;
+    const auto tabs = [](const std::string& body, const std::string& window) {
+        return count_of(body, "?window=" + window + "\"");
+    };
+    const auto thirty = h.get(std::string(kGet) + "?window=30d");
+    CHECK(thirty->status == 200);
+    CHECK(tabs(thirty->body, "30d") == 10); // every one of the ten tabs
+    CHECK(tabs(thirty->body, "7d") == 0);
+    for (const char* target : {"/fragments/dex/scoring", "/fragments/dex/scoring?window=bogus"}) {
+        const auto r = h.get(target);
+        CHECK(tabs(r->body, "7d") == 10);
+        CHECK(tabs(r->body, "30d") == 0);
+    }
+    // Only the sub-navigation differs: the Scoring section below it is byte-identical.
+    const auto plain = h.get();
+    const auto section = [](const std::string& body) { return body.substr(body.find("id=\"dex-scoring-section\"")); };
+    CHECK(section(thirty->body) == section(plain->body));
 }

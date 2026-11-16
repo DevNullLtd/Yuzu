@@ -10,6 +10,7 @@
 #include "echo_netqual.hpp"
 #include "echo_netqual_boot.hpp"
 #include "echo_sql_executor.hpp"
+#include "echo_sqlite_progress.hpp"
 #include "test_helpers.hpp"
 #include "test_log_capture.hpp"
 
@@ -5546,4 +5547,147 @@ TEST_CASE("EchoDatabase: purge_source reports a dictionary sweep that did not fi
     CHECK(!swept->dictionary_pending);
     CHECK(t.db.get_config("dict_gc_starved_total", "0") == "1");
     CHECK(first_cell(t.db, "SELECT COUNT(*) FROM echo_dict WHERE text = 'purged.exe'") == "0");
+}
+
+// =============================================================================
+// execute_user_query: statement deadline (#1161)
+// =============================================================================
+
+namespace {
+// ~200 config rows: a self cross join is 40k row pairs, far above the 1000-VM-step poll
+// interval, so a deadline that has already passed interrupts it deterministically.
+constexpr const char* kCrossJoinCount = "SELECT COUNT(*) FROM echo_config a, echo_config b";
+
+void seed_config_rows(EchoDatabase& db) {
+    for (int i = 0; i < 200; ++i)
+        REQUIRE(db.set_config("deadline_probe_" + std::to_string(i), "v"));
+}
+} // namespace
+
+TEST_CASE("execute_user_query: a statement past its deadline is an error, not a short result",
+          "[echo][store][sandbox][deadline]") {
+    auto t = make_test_db();
+    seed_config_rows(t.db);
+
+    // A zero deadline has already passed at the first poll: no clock dependence.
+    auto r = t.db.execute_user_query(kCrossJoinCount, 10000, std::chrono::milliseconds{0});
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().find("statement deadline") != std::string::npos);
+    // The SQL text is never echoed back in the error.
+    CHECK(r.error().find("echo_config") == std::string::npos);
+}
+
+// The manual, the upgrade note and the changelog state this value; they change with it.
+static_assert(kUserQueryDeadline == std::chrono::seconds{10});
+
+TEST_CASE("execute_user_query: the same statement succeeds under the default deadline",
+          "[echo][store][sandbox][deadline]") {
+    auto t = make_test_db();
+    seed_config_rows(t.db);
+
+    auto r = t.db.execute_user_query(kCrossJoinCount);
+    REQUIRE(r.has_value());
+    REQUIRE(r->rows.size() == 1);
+    CHECK(std::stoll(r->rows[0][0]) >= 40000);
+}
+
+TEST_CASE("execute_user_query: a deadline hit leaves the connection usable",
+          "[echo][store][sandbox][deadline]") {
+    auto t = make_test_db();
+    seed_config_rows(t.db);
+
+    REQUIRE_FALSE(
+        t.db.execute_user_query(kCrossJoinCount, 10000, std::chrono::milliseconds{0}).has_value());
+    // Handler cleared and query_mu_ released: an ordinary query on the same handle works.
+    auto next = t.db.execute_user_query("SELECT COUNT(*) FROM echo_config");
+    REQUIRE(next.has_value());
+    CHECK(std::stoll(next->rows[0][0]) >= 200);
+}
+
+TEST_CASE("execute_user_query: a deadline that interrupts the prepare is the same error",
+          "[echo][store][sandbox][deadline]") {
+    auto t = make_test_db();
+    // The sandbox connection has run nothing yet, so its first prepare loads the schema; 500 more
+    // tables put that load over the 1000-step poll interval whatever the schema itself holds.
+    std::string pad = "BEGIN;";
+    for (int i = 0; i < 500; ++i)
+        pad += "CREATE TABLE yuzu_test_pad_" + std::to_string(i) + "(x);";
+    REQUIRE(t.db.execute_sql(pad + "COMMIT;"));
+    constexpr const char* kCheap = "SELECT COUNT(*) FROM echo_config"; // a handful of steps
+    auto r = t.db.execute_user_query(kCheap, 10000, std::chrono::milliseconds{0});
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().find("statement deadline") != std::string::npos);
+    // With the schema loaded (the next prepare) the statement never reaches a poll, even at a
+    // zero deadline: it was the prepare that was interrupted above.
+    REQUIRE(t.db.execute_user_query(kCheap).has_value());
+    CHECK(t.db.execute_user_query(kCheap, 10000, std::chrono::milliseconds{0}).has_value());
+}
+
+TEST_CASE("execute_user_query: the row cap still truncates to a successful result",
+          "[echo][store][sandbox][deadline]") {
+    auto t = make_test_db();
+    seed_config_rows(t.db);
+
+    auto r = t.db.execute_user_query("SELECT a.key FROM echo_config a, echo_config b", 5);
+    REQUIRE(r.has_value());
+    CHECK(r->rows.size() == 5);
+}
+
+TEST_CASE("execute_user_query: a step failure after rows is an error, not a short result",
+          "[echo][store][sandbox][deadline]") {
+    auto t = make_test_db();
+    seed_config_rows(t.db);
+    // Set last and sorting last, so it is scanned last in rowid order and in key order.
+    REQUIRE(t.db.set_config("zzz_overflow_probe", "v"));
+    // abs() of the smallest 64-bit integer fails at step time with "integer overflow". The
+    // argument depends on the row, so it cannot be evaluated once before the first row.
+    constexpr const char* kFailsOnLastRow =
+        "SELECT abs(-9223372036854775807 - (key = 'zzz_overflow_probe')) FROM echo_config";
+
+    // Control: rows are produced before the failing one, so the failure is reached only
+    // by reading on past them.
+    auto head = t.db.execute_user_query(kFailsOnLastRow, 2);
+    REQUIRE(head.has_value());
+    CHECK(head->rows.size() == 2);
+
+    auto r = t.db.execute_user_query(kFailsOnLastRow);
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().find("integer overflow") != std::string::npos);
+
+    // The connection is unharmed.
+    auto next = t.db.execute_user_query("SELECT COUNT(*) FROM echo_config");
+    REQUIRE(next.has_value());
+}
+
+TEST_CASE("ScopedProgressHandler: leaving the scope clears the handler",
+          "[echo][store][sandbox][deadline]") {
+    yuzu::test::SqliteHandleOwner<sqlite3> owner;
+    REQUIRE(sqlite3_open(":memory:", &owner.db) == SQLITE_OK);
+    // Far above the 1000-step poll interval.
+    constexpr const char* kLongStatement =
+        "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 100000) "
+        "SELECT count(*) FROM c";
+
+    {
+        ScopedProgressHandler guard(owner.db, [] { return true; });
+        // In scope the handler is live (control).
+        CHECK(sqlite3_exec(owner.db, kLongStatement, nullptr, nullptr, nullptr) ==
+              SQLITE_INTERRUPT);
+    }
+    // No second guard is installed: only the destructor can have removed the handler.
+    CHECK(sqlite3_exec(owner.db, kLongStatement, nullptr, nullptr, nullptr) == SQLITE_OK);
+}
+
+TEST_CASE("execute_user_query: sandbox rejections keep their errors with a deadline in force",
+          "[echo][store][sandbox][deadline]") {
+    auto t = make_test_db();
+    const std::chrono::milliseconds dl{5000};
+
+    auto denied = t.db.execute_user_query("INSERT INTO echo_config VALUES('k','v')", 10000, dl);
+    REQUIRE_FALSE(denied.has_value());
+    CHECK(denied.error().find("not permitted") != std::string::npos);
+
+    auto multi = t.db.execute_user_query("SELECT 1; SELECT 2", 10000, dl);
+    REQUIRE_FALSE(multi.has_value());
+    CHECK(multi.error().find("single-statement") != std::string::npos);
 }

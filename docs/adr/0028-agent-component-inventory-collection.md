@@ -44,6 +44,13 @@ supersedes: >-
 
 # 0028 — Agent-Side Component Inventory Collection (Bundled & Filesystem-Resident Dependencies)
 
+> **Update (2026-11-14, against dev @ 2c49b4ea0): Partial.** The banner below is stale. The wire
+> contract and server ingest exist: the v3 `component_inventory` facet and `SwComponent` record
+> (`agents/core/src/installed_software_v3.hpp`), `kComponentInventoryFacet` in
+> `server/core/src/inventory_blob_v3.hpp`, and ingestion in `inventory_ingestion.cpp`. No agent
+> producer exists yet ("No plugin produces component rows yet", `installed_software_v3.hpp`), so
+> no endpoint reports components.
+
 > **Implementation status (2026-09-07 ADR reconciliation):** Accepted — deferred, not started. Zero `sync_source_component*` files in `agents/core/src`. Deferred, not started; agent-side mechanism — stays core under ADR-1005, not use-case-engine scope (#4099).
 
 > **Naming note (resolved during grill-with-docs review, 2026-07-07):** this capability is called

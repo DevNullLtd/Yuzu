@@ -341,9 +341,9 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // Confinement (ADR-0017): the SOLE gate is `fleet_read_fn`
     // (require_fleet_read) -- never stacked with perm_fn on the same
     // (Execution, Read) pair. A confined caller gets the SAME owner-or-visible
-    // view as the v1 twin GET /api/v1/executions, except service-scoped
-    // sessions, which get visible-only (the owner rule would expose the
-    // minter's identity; #5557): the admission predicate is pushed into SQL
+    // view as the v1 twin GET /api/v1/executions; a service-scoped session's
+    // owner key is empty (execution_owner_key), so it is visible-only on every
+    // execution surface (#5557): the admission predicate is pushed into SQL
     // BEFORE the LIMIT (a page of 50 invisible rows must not starve the
     // visible ones), each surviving row's counters and error preview are
     // recomputed from the in-scope agent rows only (so neither the preview
@@ -451,6 +451,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
 
         ExecutionScope scope_arg; // nullopt = unrestricted
         std::string username;
+        ExecutionOwnerKey owner; // empty unless a confined, resolved session
         if (gate.scope) {
             auto session = auth_fn(req, res);
             if (!session)
@@ -466,19 +467,12 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                                         "Contact an administrator if this persists.");
                 return;
             }
-            // A service-scoped token's session username is its MINTER's identity, so the
-            // owner disjunct (dispatched_by == username) would list every execution the
-            // minter dispatched, outside the token's service tag scope (ADR-1006: the
-            // token must never see more than its tag scope). Suppress the owner disjunct
-            // for such a session, in SQL and in the per-row check below: it sees only
-            // executions that touched an in-scope agent. The other execution surfaces
-            // still carry the minter-keyed disjunct for service tokens (tracked in #5557).
-            if (!session->token_scope_service.empty())
-                username.clear();
-            ExecutionListScope s;
-            s.owner = username;
-            s.visible_agents.assign(gate.scope->begin(), gate.scope->end());
-            scope_arg = std::move(s);
+            // #5557: the owner key is empty for a service-scoped session (its username is the
+            // MINTER's identity, so a minter-keyed disjunct would list every execution the minter
+            // dispatched outside the token's service tag scope, ADR-1006). Such a session sees
+            // only executions that touched an in-scope agent, in SQL and in the per-row check.
+            owner = execution_owner_key(*session);
+            scope_arg = confined_list_scope(owner, gate.scope);
         }
 
         auto execs_opt = execution_tracker->query_executions_checked(q, scope_arg);
@@ -508,7 +502,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             for (const auto& e : execs) {
                 auto it = statuses_opt->find(e.id);
                 const auto& statuses = it != statuses_opt->end() ? it->second : kEmptyStatuses;
-                if (!execution_visible(e, statuses, gate.scope, username))
+                if (!execution_visible(e, statuses, gate.scope, owner))
                     continue;
                 auto counts = confined_projection(statuses, gate.scope);
                 Execution row = e;
@@ -851,8 +845,10 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 for (const auto& a : agents)
                     has_visible_agent = authz::in_scope(gate.scope, a.agent_id) || has_visible_agent;
             }
+            // #5557: the owner KEY, never the raw username (a service-scoped session's username
+            // is its minter's).
             const bool owns_execution =
-                exec_opt && exec_opt->dispatched_by == session->username;
+                exec_opt && execution_owner_key(*session).owns(*exec_opt);
             if (!exec_opt || (gate.scope && !owns_execution && !has_visible_agent)) {
                 // #1634 (governance Gate 6 compliance-officer finding): a
                 // suppressed cross-operator read attempt is CC7.2-evidence-worthy
@@ -1500,8 +1496,9 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                          has_visible_agent =
                              authz::in_scope(gate.scope, a.agent_id) || has_visible_agent;
                  }
+                 // #5557: the owner KEY, never the raw username.
                  const bool owns_execution =
-                     exec_opt && exec_opt->dispatched_by == session->username;
+                     exec_opt && execution_owner_key(*session).owns(*exec_opt);
                  if (!exec_opt || (gate.scope && !owns_execution && !has_visible_agent)) {
                      // #1634 (governance Gate 6 compliance-officer finding): a
                      // suppressed cross-operator subscribe attempt is
