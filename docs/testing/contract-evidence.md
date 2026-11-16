@@ -65,7 +65,12 @@ generator in a fresh VM using the repository's pinned OTP resolver. This is
 process-state isolation; deleting a shared `_build` is unnecessary.
 
 The collector's build-directory lease excludes another collector, not arbitrary
-`ninja`, Meson or rebar commands. Coordinate ownership before running. It does not
+`ninja`, Meson or rebar commands. Coordinate ownership before running. The lease is
+an operating-system lock on `.contract-evidence.lease` in the build directory, so it
+ends when the collector exits, even when the collector is killed; a second collector
+on the same directory fails at once with `BuildDirectoryBusy`. The file stays in place
+and means nothing while unlocked. A `.contract-evidence-lock` directory left by an
+older collector is ignored and can be deleted. The collector does not
 start PostgreSQL or other services. Live stack validation remains the separate
 `scripts/integration-test.sh --tls --free-ports --gateway-ct` workflow described in
 `integration-tests.md`; a mocked-RPC lifecycle case does not replace that test.
@@ -188,7 +193,9 @@ The duplicate-name case includes a distinct working plugin so rejecting every
 candidate after the first cannot satisfy the contract.
 
 On failure, start with `manifest.json`, then `build.log`, `meson.log` and the
-per-contract native report. Distinguish prerequisites, assertion failure, timeout,
+per-contract native report. An ERROR run also prints its exception type, and which
+error fields it recorded, to standard error; the portable bundle carries the type as
+`error_kind` but never the error text. Distinguish prerequisites, assertion failure, timeout,
 teardown and recording failure. Reproduce the recorded filter/generator and seed
 against the recorded source and build. Preserve the first attempt before retrying.
 

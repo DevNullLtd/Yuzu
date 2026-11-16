@@ -6,6 +6,7 @@ This is an evidence collector around native tests, not an ADR correctness score.
 """
 import argparse
 from datetime import datetime, timezone
+import errno
 import hashlib
 import json
 import math
@@ -36,6 +37,67 @@ def write_json(path, value):
     temporary = path.with_suffix(path.suffix + '.tmp')
     temporary.write_text(json.dumps(value, indent=2) + '\n', encoding='utf-8')
     temporary.replace(path)
+
+
+# The build-directory lease. It is an OS lock on a file, not the file's presence,
+# so it ends with the process that holds it, however that process ends: a
+# collector killed mid-run cannot leave it held (#7986, where the previous
+# mkdir lease outlived a cancelled job and failed every later run on that
+# runner). The file itself is left in place; only the lock on it means anything.
+LEASE_NAME = '.contract-evidence.lease'
+
+
+class BuildDirectoryBusy(RuntimeError):
+    """Another live collector holds this build directory's lease."""
+
+
+def _lock_fd(fd):
+    """Take an exclusive, non-blocking lock; raise BuildDirectoryBusy if held."""
+    if os.name == 'nt':
+        import msvcrt
+        os.lseek(fd, 0, os.SEEK_SET)
+        try:
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        except OSError as error:
+            # msvcrt reports a held region as EACCES (or EDEADLOCK after its retries).
+            if error.errno in (errno.EACCES, getattr(errno, 'EDEADLOCK', errno.EDEADLK)):
+                raise BuildDirectoryBusy('Another contract collector holds this build directory') from error
+            raise
+    else:
+        import fcntl
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise BuildDirectoryBusy('Another contract collector holds this build directory') from error
+
+
+def _unlock_fd(fd):
+    if os.name == 'nt':
+        import msvcrt
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+def acquire_lease(build):
+    """Return an open descriptor holding the build directory's lease."""
+    fd = os.open(build/LEASE_NAME, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        _lock_fd(fd)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def release_lease(fd):
+    """Unlock and close. The close alone also ends the lease, so it always runs."""
+    try:
+        _unlock_fd(fd)
+    finally:
+        os.close(fd)
 
 
 def source_path(root, relative):
@@ -305,13 +367,12 @@ def collect(args, rows):
         with (out/'history.log').open('a') as log:
             subprocess.run([sys.executable, str(ROOT/'scripts/test/test_db.py'), *arguments],
                            cwd=ROOT, env=history_env, check=True, stdout=log, stderr=subprocess.STDOUT, timeout=30)
-    lock = build/'.contract-evidence-lock'
-    locked = False
+    lease = None
     try:
         history('gate', '--run-id', run_id, '--phase', '0', '--gate', 'collector',
                 '--status', 'RUNNING', '--duration', '0', '--notes', f'Planned capture: {out}')
-        lock.mkdir()  # Only our collectors honor this lease; caller owns the build directory.
-        locked = True
+        # Only our collectors take this lease; the caller still owns the build directory.
+        lease = acquire_lease(build)
         manifest['source'], diff = snapshot(rows)
         (out/'source.patch').write_bytes(diff)
         for path in manifest['source']['inputs']:
@@ -371,10 +432,11 @@ def collect(args, rows):
     except (Exception, KeyboardInterrupt) as error:
         manifest['status'] = 'ERROR'
         manifest['error'] = f'{type(error).__name__}: {error}'
+        manifest['error_kind'] = type(error).__name__
     finally:
-        if locked:
+        if lease is not None:
             try:
-                lock.rmdir()
+                release_lease(lease)
             except OSError as error:
                 manifest['status'] = 'ERROR'
                 manifest['cleanup_error'] = str(error)
@@ -400,6 +462,14 @@ def collect(args, rows):
                                       if p.is_file() and 'private' not in p.relative_to(out).parts and p.name != 'manifest.json'}
         write_json(out/'manifest.json', manifest)
     print(f"{manifest['status']}: {out/'manifest.json'}")
+    if manifest['status'] == 'ERROR':
+        # The free text stays in the private capture (it can carry environment-derived
+        # values); the job log gets the exception type and which fields were recorded,
+        # so a CI failure names its cause without the raw capture (#7986).
+        recorded = [key for key in ('error', 'report_error', 'cleanup_error', 'history_error') if key in manifest]
+        print(f"contract-evidence: ERROR ({manifest.get('error_kind', 'no exception')}); "
+              f"recorded: {', '.join(recorded) or 'none'}; text in the private manifest",
+              file=sys.stderr)
     return 0 if manifest['status'] == 'PASS' else 1
 
 
@@ -422,7 +492,7 @@ def bundle(directory, destination):
     public = {key: manifest[key] for key in (
         'schema_version', 'run_id', 'status', 'started_at', 'finished_at', 'platform',
         'planned_contracts', 'source', 'results', 'binary_sha256', 'prerequisites',
-        'raw_meson_sha256') if key in manifest}
+        'raw_meson_sha256', 'error_kind') if key in manifest}
     public['steps'] = [{key: step[key] for key in ('exit_code', 'seconds', 'log') if key in step}
                        for step in manifest.get('steps', [])]
     public.update(artifact_sha256=portable,

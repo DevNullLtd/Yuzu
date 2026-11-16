@@ -2067,8 +2067,10 @@ jobs:
           fi
           echo "contract pilot precompile: $(( SECONDS - precompile_start ))s for ${#contract_targets[@]} target(s)"
           if [[ -s "$precompile_stats" ]]; then
-            stats=$(CCACHE_STATSLOG="$precompile_stats" ccache --show-log-stats --verbose 2>/dev/null \
-              | grep -iE 'hits|misses|uncacheable|errors' || true)
+            # ccache repeats Hits/Misses under "Local storage:" (4.12.3, checked on
+            # Big Tam); print only the call totals above that section.
+            stats=$(CCACHE_STATSLOG="$precompile_stats" ccache --show-log-stats 2>/dev/null \
+              | awk '/^Local storage:/ { exit } tolower($0) ~ /^[[:space:]]*(hits|misses|uncacheable|errors)/' || true)
             if [[ -n "$stats" ]]; then
               while IFS= read -r line; do echo "  ccache (contract precompile): $line"; done <<< "$stats"
             else

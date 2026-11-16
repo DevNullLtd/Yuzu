@@ -304,7 +304,11 @@ class CollectorTests(unittest.TestCase):
         self.history_calls.append(command)
         return subprocess.CompletedProcess(command, 0)
 
-    def run_collector(self, *, lock_remains=False):
+    def assert_lease_free(self):
+        # Raises BuildDirectoryBusy if anything still holds the build directory's lease.
+        evidence.release_lease(evidence.acquire_lease(self.build))
+
+    def run_collector(self):
         initial = {"commit": "a" * 40, "diff_sha256": "b" * 64,
                    "inputs": {"owner.cpp": evidence.sha(self.root / "owner.cpp")}}
         final = dict(initial, commit="c" * 40) if self.source_changed else initial
@@ -315,10 +319,11 @@ class CollectorTests(unittest.TestCase):
             patch.object(evidence.subprocess, "check_output", side_effect=self.introspect),
             patch.object(evidence.subprocess, "run", side_effect=self.history),
             redirect_stdout(io.StringIO()),
+            redirect_stderr(io.StringIO()) as stderr,
         ):
             result = evidence.collect(self.args, self.rows)
+        self.stderr = stderr.getvalue()
         manifest = json.loads((self.out / "manifest.json").read_text())
-        self.assertEqual((self.build / ".contract-evidence-lock").exists(), lock_remains)
         return result, manifest
 
     def test_complete_selection_preserves_reports_and_qualifies(self):
@@ -457,23 +462,85 @@ class CollectorTests(unittest.TestCase):
         self.assertIn("history_error", manifest)
         self.assertTrue((self.out / "meson-native.json").is_file())
 
-    def test_lock_cleanup_failure_preserves_error_manifest_and_finalizes_history(self):
-        lock = self.build / ".contract-evidence-lock"
-        original_rmdir = Path.rmdir
+    def test_lease_release_failure_preserves_error_manifest_and_finalizes_history(self):
+        def fail_unlock(fd):
+            raise OSError("injected lease release failure")
 
-        def fail_lock_cleanup(path):
-            if path == lock:
-                raise OSError("injected lock cleanup failure")
-            return original_rmdir(path)
-
-        with patch.object(Path, "rmdir", fail_lock_cleanup):
-            result, manifest = self.run_collector(lock_remains=True)
+        with patch.object(evidence, "_unlock_fd", fail_unlock):
+            result, manifest = self.run_collector()
         self.assertEqual((result, manifest["status"]), (1, "ERROR"))
-        self.assertIn("injected lock cleanup failure", manifest["cleanup_error"])
+        self.assertIn("injected lease release failure", manifest["cleanup_error"])
         finish = self.history_calls[-1]
         self.assertEqual(finish[2], "run-finish")
         self.assertEqual(finish[finish.index("--status") + 1], "ABORTED")
-        lock.rmdir()
+        # Closing the descriptor ends the lease even when the explicit unlock failed.
+        self.assert_lease_free()
+        self.assertIn("recorded: cleanup_error", self.stderr)
+
+    def test_successful_run_releases_the_lease(self):
+        result, manifest = self.run_collector()
+        self.assertEqual((result, manifest["status"]), (0, "PASS"), manifest)
+        self.assert_lease_free()
+        self.assertEqual(self.stderr, "")
+
+    def test_live_holder_refuses_the_run_and_keeps_its_lease(self):
+        holder = evidence.acquire_lease(self.build)
+        try:
+            result, manifest = self.run_collector()
+            self.assertEqual((result, manifest["status"]), (1, "ERROR"))
+            self.assertEqual(manifest["error_kind"], "BuildDirectoryBusy")
+            self.assertNotIn("source", manifest)
+            self.assertEqual(manifest["steps"], [])
+            finish = self.history_calls[-1]
+            self.assertEqual(finish[finish.index("--status") + 1], "ABORTED")
+            # The refused collector must not release (or have taken) the holder's lease.
+            with self.assertRaises(evidence.BuildDirectoryBusy):
+                evidence.acquire_lease(self.build)
+            # The job log names the cause; the free text stays out of it.
+            self.assertIn("contract-evidence: ERROR (BuildDirectoryBusy); recorded: error;", self.stderr)
+            self.assertNotIn("Another contract collector", self.stderr)
+        finally:
+            evidence.release_lease(holder)
+
+    def test_killed_holder_does_not_strand_the_lease(self):
+        # #7986: the previous mkdir lease outlived a cancelled job and failed every
+        # later run on that runner. A hard-killed holder must leave the lease free.
+        script = (
+            "import importlib.util, sys, time\n"
+            "spec = importlib.util.spec_from_file_location('ce', sys.argv[1])\n"
+            "ce = importlib.util.module_from_spec(spec); spec.loader.exec_module(ce)\n"
+            "from pathlib import Path\n"
+            "ce.acquire_lease(Path(sys.argv[2]))\n"
+            "print('held', flush=True)\n"
+            "time.sleep(60)\n")
+        holder = subprocess.Popen([sys.executable, "-c", script, str(MODULE_PATH), str(self.build)],
+                                  stdout=subprocess.PIPE, text=True)
+        self.addCleanup(lambda: holder.poll() is None and holder.kill())
+        self.addCleanup(holder.stdout.close)
+        self.assertEqual(holder.stdout.readline().strip(), "held")
+        with self.assertRaises(evidence.BuildDirectoryBusy):
+            evidence.acquire_lease(self.build)
+        holder.kill()  # SIGKILL on POSIX, TerminateProcess on Windows: no cleanup runs.
+        holder.wait(timeout=10)
+        if os.name == "nt":
+            # Windows releases a dead process's byte-range locks asynchronously.
+            deadline = time.monotonic() + 10
+            while True:
+                try:
+                    self.assert_lease_free()
+                    break
+                except evidence.BuildDirectoryBusy:
+                    if time.monotonic() > deadline:
+                        raise
+                    time.sleep(0.1)
+        result, manifest = self.run_collector()
+        self.assertEqual((result, manifest["status"]), (0, "PASS"), manifest)
+
+    def test_leftover_legacy_lock_directory_does_not_block(self):
+        # A directory stranded by a collector from before the OS-lock lease is inert.
+        (self.build / ".contract-evidence-lock").mkdir()
+        result, manifest = self.run_collector()
+        self.assertEqual((result, manifest["status"]), (0, "PASS"), manifest)
 
     def test_existing_evidence_directory_is_never_overwritten(self):
         self.out.mkdir()
@@ -649,7 +716,7 @@ class BundleTests(unittest.TestCase):
             path.parent.mkdir(exist_ok=True)
             path.write_text(secret, encoding="utf-8")
             self.manifest["artifact_sha256"][name] = evidence.sha(path)
-        self.manifest.update(error=secret, history_error=secret,
+        self.manifest.update(error=secret, history_error=secret, error_kind="ValueError",
                              meson_selection=[{"env": {"TOKEN": secret}}],
                              steps=[{"command": [secret], "exit_code": 7, "seconds": 1.0}])
         self.write_manifest()
@@ -659,6 +726,9 @@ class BundleTests(unittest.TestCase):
                 self.assertNotIn(secret.encode(), archive.read(name), name)
             exported = json.loads(archive.read("manifest.json"))
             self.assertEqual(exported["steps"], [{"exit_code": 7, "seconds": 1.0}])
+            # The exception type crosses the export boundary; its text does not.
+            self.assertEqual(exported["error_kind"], "ValueError")
+            self.assertNotIn("error", exported)
         # The diagnosis/reproduction input has not been destructively sanitized.
         self.assertEqual((self.capture / "source.patch").read_text(), secret)
 
