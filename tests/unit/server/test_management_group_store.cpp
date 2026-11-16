@@ -335,6 +335,72 @@ TEST_CASE("ManagementGroupStore: static membership", "[pg][management_group][mem
     CHECK(members2.size() == 1);
 }
 
+// MG PR-5a, commit 1: characterisation of the returning-id question. Nothing in the server
+// deletes an agent's membership rows when it is decommissioned (the cascade names no
+// management-group store), and Register's only membership write is add_member(root), so an agent
+// that registers again with the same id is still a member of every group it was in. This test
+// models that Register write directly against the store; the Register-side half (an approved id
+// takes the fast path, no token) is driven through the real service in test_agent_service_impl.cpp.
+TEST_CASE("ManagementGroupStore: a re-registered agent id keeps every group membership",
+          "[pg][management_group][members][decommission]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mgmt_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ManagementGroupStore store{pool};
+
+    // The root group is created by ServerImpl at boot (server.cpp: "Ensure root 'All Devices' group
+    // exists"), not by the store migration, so a bare store has none and add_member(root) would
+    // violate the group foreign key. Bootstrap it the way the server does.
+    {
+        ManagementGroup root;
+        root.id = ManagementGroupStore::kRootGroupId;
+        root.name = "All Devices";
+        root.membership_type = "dynamic";
+        root.scope_expression = "*";
+        root.created_by = "system";
+        REQUIRE(store.create_group(root).has_value());
+    }
+    auto make = [&](const char* name, const char* type) {
+        ManagementGroup g;
+        g.name = name;
+        g.membership_type = type;
+        auto id = store.create_group(g);
+        REQUIRE(id.has_value());
+        return *id;
+    };
+    const auto s1 = make("Static one", "static");
+    const auto s2 = make("Static two", "static");
+    const auto dyn = make("Dynamic one", "dynamic");
+
+    // a1: root (as Register adds it), two static groups, one dynamic group. a2: bystander.
+    REQUIRE(store.add_member(ManagementGroupStore::kRootGroupId, "a1").has_value());
+    REQUIRE(store.add_member(s1, "a1").has_value());
+    REQUIRE(store.add_member(s2, "a1").has_value());
+    store.refresh_dynamic_membership(dyn, {"a1"});
+    REQUIRE(store.add_member(s1, "a2").has_value());
+    REQUIRE(store.add_member(s2, "a2").has_value());
+
+    auto sorted_groups = [&](const std::string& agent) {
+        auto g = store.get_agent_groups(agent);
+        REQUIRE(g.has_value());
+        std::vector<std::string> v = *g;
+        std::sort(v.begin(), v.end());
+        return v;
+    };
+    std::vector<std::string> want_a1{ManagementGroupStore::kRootGroupId, s1, s2, dyn};
+    std::sort(want_a1.begin(), want_a1.end());
+    REQUIRE(sorted_groups("a1") == want_a1);
+
+    // Re-registration, modelled exactly as production does it: the root-group add, result discarded.
+    // Nothing else on that path writes membership.
+    (void)store.add_member(ManagementGroupStore::kRootGroupId, "a1");
+
+    // The agent never left a group, so its old scope is intact: exact set, not "non-empty".
+    CHECK(sorted_groups("a1") == want_a1);
+    std::vector<std::string> want_a2{s1, s2};
+    std::sort(want_a2.begin(), want_a2.end());
+    CHECK(sorted_groups("a2") == want_a2);
+}
+
 TEST_CASE("ManagementGroupStore: dynamic membership refresh", "[pg][management_group][members]") {
     YUZU_REQUIRE_PG_DB_TPL(db, mgmt_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
