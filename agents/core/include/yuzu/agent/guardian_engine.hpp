@@ -887,8 +887,8 @@ public:
         stop_busy_timeout_ms_.store(budget.count(), std::memory_order_relaxed);
     }
     /// TEST-ONLY (#4045): forget the published persister pointer, as if stop() had read it just
-    /// before wire_spark_engine published it. The heartbeat getters then read 0. No production
-    /// caller.
+    /// before wire_spark_engine published it. baseline_unpersisted() then reads nullopt and
+    /// baseline_persist_failures() reads 0. No production caller.
     void unpublish_baseline_persister_for_test() noexcept {
         baseline_persister_published_.store(nullptr, std::memory_order_release);
     }

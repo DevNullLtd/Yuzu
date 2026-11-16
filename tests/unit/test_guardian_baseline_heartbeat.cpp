@@ -3,7 +3,8 @@
  * fleet signal: the emission posture of the two new emitters in guardian_baseline_heartbeat.hpp
  * (the CURRENT unpersisted backlog, optional-gated like the arm pair: dormant is nullopt and
  * emits nothing, a present 0 emits "0"; the boot-scan count is sparse: 0 omits) plus the exact
- * key names, which the server reader pins against its own table in a later change.
+ * key names, which the server reader pins against its own table in the same change
+ * (test_guardian_baseline_fleet_tags.cpp).
  */
 
 #include "guardian_baseline_heartbeat.hpp"

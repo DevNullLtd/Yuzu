@@ -1160,12 +1160,15 @@ std::expected<void, std::string> GuardianEngine::start_local() {
     // #5605: mark the boot re-arm walk so reconcile_rule_locked's shared seed block counts a
     // rule whose boot seed lookup found no persisted baseline (boot_rebaselined_). The flag is
     // mtx_-guarded (start_local and apply_rules both hold it), so apply_rules can never see it
-    // set; this scope guard clears it on EVERY exit of the walk, including the catch arms below
-    // and an un-firewalled throw (the journal_flush pattern above; declared after it, so it
-    // fires first, with mtx_ still held).
-    boot_rearm_walk_ = true;
+    // set. The scope guard is function-scoped, so it clears the flag when start_local returns
+    // (including on the catch arms below and an un-firewalled throw; the journal_flush pattern
+    // above; declared after it, so it fires first, with mtx_ still held). The flag therefore
+    // stays set through the summary logging after the loop, which never reaches
+    // reconcile_rule_locked. The handler is assigned BEFORE the flag is set: a throwing
+    // std::function assignment would otherwise leave the flag set with no guard to clear it.
     GuardianRollback boot_walk_clear;
     boot_walk_clear.fn = [this] { boot_rearm_walk_ = false; };
+    boot_rearm_walk_ = true;
 
     std::size_t rearmed = 0;
     std::size_t boot_rearm_failed = 0; // #5513: synchronous failures only (Failed or a throw)
@@ -3766,8 +3769,10 @@ GuardianEngine::reconcile_rule_locked(const gpb::GuaranteedStateRule& rule) {
         // before the backend fork, so it runs once per rule on BOTH backends (the legacy branch
         // seeds a second time inside start_guard_for_rule_locked, which is deliberately NOT
         // instrumented: counting there would double-count) and before the Unwired/SparkFailed
-        // return below. Only a genuinely Absent record counts: a read error, a malformed record
-        // and a fingerprint mismatch (a retarget) already log or are not a lost capture.
+        // return below. Only a genuinely Absent record counts. A read error and a malformed
+        // record already log, and a fingerprint mismatch (a retarget) reads as Ok here and is
+        // not counted; a retarget whose new capture was never persisted before a crash reads
+        // the same way, so a lost capture of that kind moves no signal (documented gap).
         BaselineReadOutcome seed_outcome = BaselineReadOutcome::Ok;
         if (auto seeded = guardian_seed_baseline(*kv_, rule.rule_id(), fingerprint, &seed_outcome))
             assertion->expected_hash = *seeded;

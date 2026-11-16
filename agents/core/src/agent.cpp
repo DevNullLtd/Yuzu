@@ -3094,7 +3094,9 @@ public:
                               // count (sparse, live on every agent: a boot re-arm found no
                               // persisted baseline, which is not proof a capture was lost).
                               // Both accessors are lock-free. One try for all three: a throw
-                              // drops the group's tags for one tick, counted once.
+                              // skips the group's REMAINING emitters for that tick (tags
+                              // already written stay), counted once. The older persist_failures
+                              // tag is emitted last, so a throw in either new emitter skips it.
                               try {
                                 emit_guardian_baseline_unpersisted_heartbeat_tag(
                                     tags, guardian_->baseline_unpersisted());
