@@ -312,9 +312,10 @@ retired tables just gets the roll-up schema installed. Otherwise `migrate_to_v10
    buckets oldest first while raw rows survived, so an absent bucket inside the evicted range does
    not mean "never summarised" and folding there would count the row again in the daily and
    monthly tiers; an empty tier admits nothing. (b): the tier's other key columns are enrichment
-   the old pass never wrote (blank or 0 in every converted row), so they are not compared. One
-   decision is made per (bucket, keys) for the whole pass, so it never changes between chunks and
-   never sees the pass's own writes; rows at or above the stored mark fold as they are. This
+   the old pass never wrote (blank or 0 in every converted row), so they are not compared. The
+   converted tier is read as it stood before the pass: a watermark (its highest id before any
+   fold) keeps the pass's own writes out, so the answer for a (bucket, keys) is the same in every
+   chunk; answers are cached per chunk, so memory stays bounded by one chunk. Rows at or above the stored mark fold as they are. This
    closes both triggers that used to fold a row twice (a raw row the excursion itself stamped
    ahead of the clock sits in a converted future bucket; a migration clock set back from a SANE
    mark, a restored snapshot or an NTP step, makes the mark untrusted by the same rule and put the
@@ -324,8 +325,10 @@ retired tables just gets the roll-up schema installed. Otherwise `migrate_to_v10
    rule itself: when the upper tier's mark is untrusted, a finer row at or above the floor goes up
    only into an (upper bucket, key) the upper tier does not hold (`fold_tier_from_tier_sql`'s
    `only_absent`; the old pass rolled whole upper buckets, so a bucket and key the tier holds were
-   rolled in full). A sane mark keeps the statement as it was, and a cursor source keeps its single
-   pass at the floor. Residuals, all erring toward not folding: raw rows in the range the budget
+   rolled in full). A sane mark keeps the statement as it was. Cursor sources are outside the
+   held-bucket test and keep the single pass at the floor; no shipped schema gave `power`,
+   `removable` or `registry` a summary tier or a mark, so no file in the field takes that path (a
+   file that did would keep the old rule, with both gaps). Residuals, all erring toward not folding: raw rows in the range the budget
    evicted from the first tier; a raw row of a bucket and keys the converted tier holds only
    because other events of that bucket and keys were summarised (an event kind the old tier did not
    count); and the rest of an upper bucket whose old range began mid-bucket after the old clock-gap

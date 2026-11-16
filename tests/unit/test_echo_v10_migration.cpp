@@ -844,9 +844,10 @@ TEST_CASE("v10 below mark: an empty converted tier with a stored mark folds noth
 TEST_CASE("v10 below mark: two unsummarised rows of one bucket and key in different chunks both fold",
           "[echo][v10][migration][below_mark][chunks]") {
     Seeded seeded;
-    // One row past the 10,000-row chunk, all of one bucket and key. Were the converted tier asked
+    // One row past the 10,000-row chunk, all of one bucket and key. Were the converted tier read
     // afresh for each chunk, the second chunk would find the row the first had written and leave
-    // its row out: the answer is decided once per bucket and key for the whole pass.
+    // its row out: the tier is read as it stood before the pass (an id watermark read before any
+    // fold keeps the pass's own writes out) and answers are cached per chunk.
     constexpr int64_t kRows = 10'001;
     seed(seeded, [&](sqlite3* db) {
         exec(db, std::format("WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < {}) "

@@ -880,14 +880,18 @@ private:
     //     key) the upper tier does not hold (fold_tier_from_tier_sql's only_absent);
     //   - fold_raw: a raw row below the STORED mark of the first old tier folds only where that
     //     converted tier holds no row for its bucket and keys, and rows at or above it fold as
-    //     they are (cursor sources keep the single pass at the floor: their replay ring, not a
-    //     bucket, is what makes a replay safe).
+    //     they are (cursor sources are outside the held-bucket test and keep the single pass at
+    //     the floor; see the last residual).
     // Residuals, all erring toward not folding: a raw row in the range the pre-v10 byte budget
     // evicted from the first tier (at or before its oldest bucket); a raw row whose bucket and
     // keys the converted tier holds only because OTHER events of that bucket and keys were
-    // summarised (an event kind the old tier did not count); and, in finish_rollup, the rest of an
+    // summarised (an event kind the old tier did not count); in finish_rollup, the rest of an
     // upper bucket whose old range began mid-bucket after the old clock-gap clamp (boundary -
-    // max_gap; mid-bucket only for the monthly step). The old tiers carried no unique index, so a
+    // max_gap; mid-bucket only for the monthly step); and cursor sources, which the held-bucket
+    // test does not cover and whose migration fold never consults the replay ring: a file that
+    // gave one a summary tier or a mark would keep the old rule with both gaps (no shipped schema
+    // gave power, removable or registry either, so no file in the field takes that path).
+    // The old tiers carried no unique index, so a
     // re-rolled range wrote a second row and the conversion merged it: the rule never counts that
     // range twice and never completes it.
     std::expected<int64_t, std::string> floor_for(const FoldSourceDef& def, std::string_view tier) {
