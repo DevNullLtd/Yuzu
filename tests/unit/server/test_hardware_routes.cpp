@@ -86,6 +86,10 @@ struct HwHarness {
     // decided once at construction, like the other unwire flags (see below).
     yuzu::server::test::FakeCiKeysetStore ci_store;
     bool ci_page_unwired = false;
+    // The collation gate the bulk read consults (production wires &collation_gate_). Trusted by
+    // default and mutable after construction (the route reads it per request); the constructor's
+    // `unwire_ci_gate_ctor` leaves the deps pointer null (no gate), which serves.
+    std::atomic<pg::CollationGate> ci_gate{pg::CollationGate::Trusted};
 
     HardwareCiDetail ci_detail; // configurable per test; default = degraded (the struct's own default)
     std::vector<CiRead> ci_reads; // the `CiRead` argument of every ci_detail_fn call, in order
@@ -149,7 +153,8 @@ struct HwHarness {
     explicit HwHarness(bool unwire_sync_dispatch_ctor = false, bool unwire_agent_version_fn_ctor = false,
                        bool quarantine_list_wired_ctor = false,
                        bool containment_ui_ctor = kContainmentUi,
-                       ResponseStore* response_store = nullptr, bool unwire_ci_page_ctor = false) {
+                       ResponseStore* response_store = nullptr, bool unwire_ci_page_ctor = false,
+                       bool unwire_ci_gate_ctor = false) {
         ci_page_unwired = unwire_ci_page_ctor;
         quarantine_list_wired = quarantine_list_wired_ctor;
         unwire_sync_dispatch = unwire_sync_dispatch_ctor;
@@ -253,6 +258,8 @@ struct HwHarness {
         deps.ci_detail_fn = ci_fn;
         if (!ci_page_unwired)
             deps.ci_page_reader = ci_store.reader();
+        if (!unwire_ci_gate_ctor)
+            deps.ci_collation_gate = &ci_gate;
         deps.scoped_probe_fn = probe;
         deps.dex_score_fn = dex_fn;
         if (quarantine_list_wired) {
@@ -3367,4 +3374,88 @@ TEST_CASE("route: GET /api/v1/hardware-ci lists a device the 30-day roster does 
     auto list = h.sink.Get("/api/v1/hardware");
     REQUIRE(list);
     CHECK(nlohmann::json::parse(list->body)["data"]["devices"].empty());
+}
+
+// ───────────────── GET /api/v1/hardware-ci: the collation read gate (#7730) ─────────────────
+
+// Kills: a bulk page served while the collation gate is not Trusted (duplicate and ghost rows
+// served as truth), a refusal that still asks the store, a refusal that is not the retryable 503
+// with the documented hint, and a refusal that is not audited as a failure.
+TEST_CASE("route: GET /api/v1/hardware-ci is refused with a retryable 503 while the collation gate is not Trusted",
+          "[hardware][route][rest][ci_page][collation_gate]") {
+    for (const auto refused : {pg::CollationGate::Mismatch, pg::CollationGate::Unproven}) {
+        HwHarness h;
+        seed_ci(h, {"a", "b"});
+        h.ci_gate.store(refused);
+        auto res = h.sink.Get("/api/v1/hardware-ci");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(res->get_header_value("Retry-After") == "60");
+        CHECK(res->get_header_value("Cache-Control") != "no-store"); // nothing served
+        const auto body = nlohmann::json::parse(res->body, nullptr, false);
+        REQUIRE_FALSE(body.is_discarded());
+        CHECK_FALSE(body.contains("data"));
+        CHECK(body["error"]["code"] == 503);
+        CHECK(body["error"]["retry_after_ms"] == 60000);
+        const std::string msg = body["error"]["message"].get<std::string>();
+        CHECK(contains(msg, "collation version"));
+        CHECK(contains(msg, "server-admin.md"));
+        CHECK(body["error"]["remediation"].get<std::string>().find("repair") != std::string::npos);
+        CHECK_FALSE(contains(res->body, "SN-a")); // no record body leaked
+        CHECK(h.ci_store.reads == 0);             // no store round-trip
+        REQUIRE(h.audit_full.size() == 1);
+        CHECK(h.audit_full[0] == "inventory.devices.ci|failure|Inventory|fleet");
+        CHECK(h.audit_details[0] == "hardware CI records (REST) state=collation ordering unverified");
+        CHECK(res->get_header_value("Sec-Audit-Failed").empty()); // the row persisted
+    }
+}
+
+TEST_CASE("route: GET /api/v1/hardware-ci refusal is marked Sec-Audit-Failed when its audit row fails",
+          "[hardware][route][rest][ci_page][collation_gate][security]") {
+    HwHarness h;
+    seed_ci(h, {"a"});
+    h.ci_gate.store(pg::CollationGate::Mismatch);
+    h.audit_should_fail = true;
+    auto res = h.sink.Get("/api/v1/hardware-ci");
+    REQUIRE(res);
+    CHECK(res->status == 503); // the refusal stands
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK(h.ci_store.reads == 0);
+}
+
+TEST_CASE("route: GET /api/v1/hardware-ci serves under a Trusted gate and answers again once it clears",
+          "[hardware][route][rest][ci_page][collation_gate]") {
+    HwHarness h;
+    seed_ci(h, {"a", "b"});
+    h.ci_gate.store(pg::CollationGate::Mismatch);
+    CHECK(h.sink.Get("/api/v1/hardware-ci")->status == 503);
+    h.ci_gate.store(pg::CollationGate::Trusted);
+    auto res = h.sink.Get("/api/v1/hardware-ci");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    CHECK(ci_page_ids(nlohmann::json::parse(res->body)) == std::vector<std::string>{"a", "b"});
+}
+
+// A Deps built without a gate serves (the documented null default); production wiring is pinned
+// lexically (test_hw_ci_detail_wiring_lexical.cpp).
+TEST_CASE("route: GET /api/v1/hardware-ci with no gate wired serves",
+          "[hardware][route][rest][ci_page][collation_gate]") {
+    HwHarness h(false, false, false, kContainmentUi, nullptr, false, /*unwire_ci_gate_ctor=*/true);
+    seed_ci(h, {"a"});
+    h.ci_gate.store(pg::CollationGate::Mismatch); // not wired, so never consulted
+    auto res = h.sink.Get("/api/v1/hardware-ci");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+}
+
+// An argument refusal needs no read and keeps its own answer under a refusing gate.
+TEST_CASE("route: GET /api/v1/hardware-ci keeps a 400 for a malformed cursor while the gate refuses",
+          "[hardware][route][rest][ci_page][collation_gate]") {
+    HwHarness h;
+    seed_ci(h, {"a"});
+    h.ci_gate.store(pg::CollationGate::Mismatch);
+    auto res = h.sink.Get("/api/v1/hardware-ci?cursor=garbage");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    CHECK(h.ci_store.reads == 0);
 }

@@ -318,3 +318,32 @@ TEST_CASE("hw_ci_page_reader wiring (LEXICAL pin, not behaviour): one closure fe
     CHECK(count_occurrences(flat, "ci_page_reader=nullptr") == 0);
     CHECK(count_occurrences(flat, "ci_page_reader={}") == 0);
 }
+
+// #7730: the collation read gate (device_ci_read_gate.hpp). Every device_ci read that can answer
+// wrongly while the gate is not Trusted asks it, and a NULL gate means "no gate wired" and serves,
+// so a closure that silently defaulted to null would serve wrong answers with every unit test green
+// (the tests build their deps by hand). This pins the production wiring: BOTH bulk-read consumers
+// are handed `&collation_gate_` (never null), and each transport passes its deps' gate to
+// `read_page`. The per-id and roster closures are pinned in the two cases above.
+TEST_CASE("collation read gate wiring (LEXICAL pin, not behaviour): both bulk-read consumers are "
+          "handed the production gate and pass it to read_page",
+          "[hardware][wiring][lexical][collation_gate]") {
+    const std::string flat = squeeze(comment_free_source("server.cpp"));
+
+    CHECK(count_occurrences(flat, ".ci_collation_gate=&collation_gate_,") == 1);
+    CHECK(count_occurrences(flat, "tool_deps.ci_collation_gate=&collation_gate_;") == 1);
+    // The member is assigned in those two places only, and never to null or an empty value.
+    CHECK(count_occurrences(flat, "ci_collation_gate=") == 2);
+    CHECK(count_occurrences(flat, "ci_collation_gate=nullptr") == 0);
+    CHECK(count_occurrences(flat, "ci_collation_gate={}") == 0);
+
+    // Each transport's one `read_page` call passes the gate its deps carry.
+    const std::string rest = squeeze(comment_free_source("hardware_routes.cpp"));
+    CHECK(count_occurrences(rest, "hardware_ci_page::read_page(") == 1);
+    CHECK(count_occurrences(rest, "hardware_ci_page::read_page(deps_.ci_page_reader,rq,gate.scope,"
+                                  "deps_.ci_collation_gate)") == 1);
+    const std::string mcp = squeeze(comment_free_source("mcp_tools_hardware.cpp"));
+    CHECK(count_occurrences(mcp, "hardware_ci_page::read_page(") == 1);
+    CHECK(count_occurrences(mcp, "hardware_ci_page::read_page(deps->ci_page_reader,*rq,gate.scope,"
+                                 "deps->ci_collation_gate)") == 1);
+}

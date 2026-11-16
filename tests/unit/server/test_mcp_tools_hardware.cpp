@@ -142,6 +142,9 @@ struct Twin {
     std::vector<std::string> dex_calls_for;
     // The keyset store behind GET /api/v1/hardware-ci and list_hardware_ci_records.
     yuzu::server::test::FakeCiKeysetStore ci_store;
+    // The collation gate both transports hand to read_page (production wires &collation_gate_).
+    // Trusted by default; Opts::wire_ci_gate = false leaves the deps pointer null (no gate).
+    std::atomic<pg::CollationGate> ci_gate{pg::CollationGate::Trusted};
 
     // Domain-verb audit sink (deps.audit_fn on both transports).
     bool domain_audit_ok = true;
@@ -168,6 +171,7 @@ struct Twin {
         bool wire_dex = true;
         bool wire_audit = true;
         bool wire_ci_page = true;
+        bool wire_ci_gate = true;
     };
 
     Twin() : Twin(Opts{}) {}
@@ -235,6 +239,8 @@ struct Twin {
         deps.roster_fn = roster_fn;
         deps.ci_detail_fn = ci_fn;
         deps.ci_page_reader = ci_store.reader();
+        if (o.wire_ci_gate)
+            deps.ci_collation_gate = &ci_gate;
         deps.dex_score_fn = dex_fn;
         sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://yuzu.test"}};
         routes.register_routes(sink, deps);
@@ -251,6 +257,8 @@ struct Twin {
             td.ci_detail_fn = ci_fn;
         if (o.wire_ci_page)
             td.ci_page_reader = ci_store.reader();
+        if (o.wire_ci_gate)
+            td.ci_collation_gate = &ci_gate;
         if (o.wire_dex)
             td.dex_score_fn = dex_fn;
         server.set_tool_deps(std::move(td));
@@ -2252,4 +2260,64 @@ TEST_CASE("mcp list_hardware_ci_records: unwired providers and a gate refusal",
         CHECK(t.generic_rows.empty());
         CHECK(t.perm_calls == 0); // fleet_read_fn alone; no second gate stacked
     }
+}
+
+// ─────────────── list_hardware_ci_records: the collation read gate (#7730) ───────────────
+
+// Kills: the bulk MCP read served while the gate is not Trusted, a refusal that asks the store, a
+// refusal that is the 5 s store-fault hint (it must be the 60 s recheck interval), and a refusal
+// that is audited on one row only.
+TEST_CASE("mcp list_hardware_ci_records: refused as a retryable error while the collation gate is not Trusted",
+          "[mcp][hardware][ci_page][collation_gate]") {
+    for (const auto refused : {pg::CollationGate::Mismatch, pg::CollationGate::Unproven}) {
+        Twin t;
+        seed(t, {"a", "b"});
+        t.ci_gate.store(refused);
+        const json r = t.call("list_hardware_ci_records");
+        REQUIRE(r.contains("error"));
+        CHECK_FALSE(r.contains("result"));
+        CHECK(r["error"]["code"] == mcp::kInternalError);
+        CHECK(r["error"]["data"]["retry_after_ms"] == 60000);
+        const std::string msg = r["error"]["message"].get<std::string>();
+        CHECK(msg.find("collation version") != std::string::npos);
+        CHECK(msg.find("server-admin.md") != std::string::npos);
+        CHECK(r["error"]["data"]["remediation"].get<std::string>().find("repair") != std::string::npos);
+        CHECK(r.dump().find("SN-a") == std::string::npos);
+        CHECK(t.ci_store.reads == 0);
+        CHECK(has(t.domain_rows, "inventory.devices.ci|failure|Inventory|fleet"));
+        CHECK(t.domain_details.back() == "hardware CI records (MCP) state=collation ordering unverified");
+        CHECK(has(t.generic_rows, "mcp.list_hardware_ci_records|failure"));
+    }
+}
+
+TEST_CASE("mcp list_hardware_ci_records: serves under a Trusted gate, and with no gate wired",
+          "[mcp][hardware][ci_page][collation_gate]") {
+    {
+        Twin t;
+        seed(t, {"a"});
+        t.ci_gate.store(pg::CollationGate::Mismatch);
+        CHECK(t.call("list_hardware_ci_records").contains("error"));
+        t.ci_gate.store(pg::CollationGate::Trusted);
+        const json ok = t.call("list_hardware_ci_records");
+        REQUIRE_FALSE(ok.contains("error"));
+        CHECK(ok["result"]["structuredContent"]["devices"].size() == 1);
+    }
+    {
+        Twin::Opts o;
+        o.wire_ci_gate = false;
+        Twin t(o);
+        seed(t, {"a"});
+        t.ci_gate.store(pg::CollationGate::Mismatch); // not wired, so never consulted
+        CHECK_FALSE(t.call("list_hardware_ci_records").contains("error"));
+    }
+}
+
+TEST_CASE("mcp list_hardware_ci_records: the description names the refusal and its hint",
+          "[mcp][hardware][ci_page][collation_gate]") {
+    Twin t;
+    auto res = t.post(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    REQUIRE(res);
+    const std::string d = tool_entry(json::parse(res->body), "list_hardware_ci_records")["description"];
+    CHECK(d.find("retry_after_ms 60000") != std::string::npos);
+    CHECK(d.find("collation") != std::string::npos);
 }
