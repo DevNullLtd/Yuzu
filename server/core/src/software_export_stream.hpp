@@ -51,7 +51,9 @@ inline constexpr std::int64_t kExportMaxSeconds = 900;
 /// Size limits on one stream (`--inventory-export-max-rows`, `--inventory-export-max-bytes`): a
 /// stream that would pass either is aborted, like the deadline, so a huge fleet cannot be asked for
 /// one unbounded file. Both apply to JSONL and CSV alike; the bytes counted are the body bytes
-/// written (the CSV header included). The floor is one page: a smaller cap could never admit a page.
+/// written (the CSV header included). The row floor is one page, so a smaller row cap could never
+/// admit a page; the byte floor (1 MiB) is far above a normal 1000-row page, and a page that did not
+/// fit would be cut on its first chunk (the cap is a true maximum).
 inline constexpr std::int64_t kDefaultMaxRows = 5'000'000;
 inline constexpr std::int64_t kDefaultMaxBytes = std::int64_t{1} << 30; // 1 GiB
 inline constexpr std::int64_t kMinMaxRows = kPageRows;
