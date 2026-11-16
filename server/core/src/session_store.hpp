@@ -59,6 +59,28 @@
  * owns the durable side (mutations bump; `read_generation()` reads); the cache
  * itself lives in AuthManager.
  *
+ * LOCAL MFA FACTOR BINDING (#6079, schema v3). A local MFA proof is stored with the
+ * per-account factor generation it was verified under (`mfa_factor_gen`, authored by
+ * `auth.users`, which this store never reads) and a bind sequence (`mfa_bind_seq`).
+ * A BEFORE UPDATE row trigger (`sessions_mfa_rebind_guard`, ENABLE ALWAYS so it fires
+ * under every `session_replication_role`) resets `mfa_factor_gen` to 0 (UNBOUND)
+ * whenever a proof or identity column (`mfa_verified_ms`, `mfa_factor_gen`, `username`,
+ * `auth_source`, `principal_kind`) is written without advancing `mfa_bind_seq`: a legacy
+ * binary sharing the schema during a rolling upgrade or rollback cannot forge or carry
+ * over a binding, and a same-millisecond restamp or an `ON CONFLICT` identity rewrite
+ * is unbound whatever its values. Every writer in THIS store sets
+ * `mfa_bind_seq = OLD + 1` in the same statement that writes the proof, so it is never
+ * affected; `touch_activity`, elevation and reap name none of those columns. A proof
+ * instant later than the writing statement's `now()` is REFUSED (stored as no proof, no
+ * binding), never clamped to an age-zero proof. The trigger's effective firing is
+ * validated at construction (a failure leaves the store closed, except for the recovery
+ * one-shots that open it with `MfaBindingCheck::kBypassForRecovery`) and again by `find`
+ * behind a steady-clock memo; a failure observed after boot is STICKY until restart
+ * (`rebind_guard_ok()` reads false), because a re-enabled trigger cannot reconstruct
+ * the writes it missed. Validation is request-driven only: a disable, change and
+ * re-enable that completes between two validations is not observable, and the
+ * control's trust boundary is the database role that can alter triggers.
+ *
  * RETENTION. `reap_expired()` is a wall-clock bulk delete, so once sessions are
  * durable it joins the clock-guarded-retention set (routed concern #2360/#2361 —
  * previously the in-memory monotonic sweep was exempt "by construction"). It is
@@ -66,11 +88,18 @@
  * own statement before the check-and-delete, and it is capped + guarded.
  */
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <expected>
 #include <optional>
 #include <string>
 #include <vector>
+
+// Real header, not a forward-declare of PGconn (see pg_migration_runner.hpp).
+#include <libpq-fe.h>
+
+#include "yuzu/server/mfa_binding_check.hpp"
 
 namespace yuzu::server::pg {
 class PgPool;
@@ -97,6 +126,18 @@ struct SessionRow {
     std::int64_t mfa_verified_ms{0};     ///< 0 = no MFA proof
     std::int64_t elevated_until_ms{0};   ///< 0 = not elevated
     std::int64_t elevation_issued_ms{0}; ///< wall-clock at elevation grant — the max-delta anchor
+    std::int64_t mfa_factor_gen{0};      ///< factor generation the proof is bound to; 0 = UNBOUND
+    std::int64_t mfa_bind_seq{0};        ///< advances on every proof write by this store
+};
+
+/// A local MFA proof to store: the factor generation it was verified under and the
+/// DATABASE instant (epoch-ms) the verification began. `{0, 0}` = no proof.
+/// `{0, v > 0}` is a legal UNBOUND proof (what a legacy row holds); `{g > 0, 0}` is a
+/// writer error (a binding without a proof) and is refused with an `Error`. The
+/// instant is the caller's carried value, never `now()` of the writing statement.
+struct LocalMfaProof {
+    std::int64_t factor_gen{0};
+    std::int64_t verified_ms{0};
 };
 
 /// Parameters for authoring a NEW session. The time-derived fields are NOT
@@ -105,8 +146,9 @@ struct SessionRow {
 /// (ADR-2002 §4 DB-clock authority; the fix for cross-host skew). The MFA proof
 /// time is the sole exception: for a federated (OIDC/SAML) login it is the IdP's
 /// asserted proof instant, not a local authoring, so it is passed through in
-/// `mfa_verified_ms_abs`; a LOCAL step-up at login sets `mfa_verified_now` to
-/// stamp `now()` instead. At most one MFA option is set.
+/// `mfa_verified_ms_abs`; a LOCAL step-up at login carries its verification instant
+/// and factor generation in `local_mfa`. At most one MFA option is set; setting
+/// both is refused with an `Error`.
 struct SessionWriteParams {
     std::string token_hash;
     std::string username;
@@ -119,7 +161,7 @@ struct SessionWriteParams {
     std::string principal_kind{"human"};
     std::int64_t session_lifetime_ms{0};  ///< expires_at = now() + this
     std::int64_t mfa_verified_ms_abs{0};  ///< 0 = no proof; >0 = absolute IdP proof time
-    bool mfa_verified_now{false};         ///< true = stamp mfa_verified = now() (local login step-up)
+    LocalMfaProof local_mfa;              ///< carried verification instant + factor generation
 };
 
 /// The DB-authored timestamps a mutation stamped, plus `db_now_ms` — the `now()`
@@ -134,6 +176,10 @@ struct AuthoredTimes {
     std::int64_t elevated_until_ms{0};
     std::int64_t elevation_issued_ms{0};
     std::int64_t db_now_ms{0}; ///< (extract(epoch from now())*1000)::bigint at authoring
+    /// Factor generation the stored proof is bound to after the guard trigger ran
+    /// (0 = unbound or no proof). A caller that asked to store a proof and reads
+    /// `mfa_verified_ms == 0` here was refused (future-dated instant).
+    std::int64_t mfa_factor_gen{0};
 };
 
 /// A durable row plus the DB clock at the instant it was read, in ONE atomic
@@ -144,6 +190,13 @@ struct AuthoredTimes {
 struct FoundSession {
     SessionRow row;
     std::int64_t db_now_ms{0};
+    /// True when the rebind guard's most recent validation could not run (a catalog query that
+    /// failed or returned no verdict) and has not since succeeded. The row is still served: the
+    /// check is not evidence the trigger is gone, and validate and liveness do not read the
+    /// binding. A caller that treats `row.mfa_factor_gen` as a binding MUST refuse this read
+    /// (transient, retryable) rather than trust a generation the guard has not been confirmed
+    /// to protect. Distinct from `rebind_guard_ok()` reading false, the sticky definite failure.
+    bool guard_unverified{false};
 };
 
 class SessionStore {
@@ -156,6 +209,14 @@ public:
     /// is_open() is false if the lease was empty or the migration failed —
     /// fail-closed, no fallback (ADR-0007).
     explicit SessionStore(pg::PgPool& pool);
+
+    /// As above, with an explicit treatment of the rebind-guard check (#6079). The one-argument
+    /// form is `MfaBindingCheck::kEnforce`: a guard not provably in force leaves the store
+    /// closed. `kBypassForRecovery` is for the `--mfa-reset` host-CLI one-shot ONLY: the store
+    /// opens whatever the guard state, logs a WARN naming it, and `rebind_guard_ok()` reads false
+    /// for the life of the instance (so every binding decision through it fails closed). The
+    /// serving binary never passes it.
+    SessionStore(pg::PgPool& pool, MfaBindingCheck binding_check);
 
     SessionStore(const SessionStore&) = delete;
     SessionStore& operator=(const SessionStore&) = delete;
@@ -195,11 +256,22 @@ public:
     /// Clear elevation on every session for a username. Returns the count cleared.
     [[nodiscard]] std::expected<int, Error> clear_user_elevations(const std::string& username);
 
-    /// Stamp an MFA step-up proof time = Postgres `now()` (DB clock domain).
-    /// Returns the authored times (incl. db_now_ms) to seed the cache, or nullopt
-    /// when the session did not exist.
+    /// Stamp a carried, bound MFA proof (#6079): `mfa_verified_ms = proof.verified_ms`
+    /// and `mfa_factor_gen = proof.factor_gen` when `0 < verified_ms <= now()` of this
+    /// statement; a later (future-dated) instant stores NO proof and NO binding and
+    /// the caller sees `mfa_verified_ms == 0` in the result. Always advances the bind
+    /// sequence in the same statement. `verified_ms <= 0` or `factor_gen < 0` or a
+    /// binding without an instant is an `Error` (never a silent clear: use
+    /// `clear_mfa_proof`). nullopt when the session did not exist.
     [[nodiscard]] std::expected<std::optional<AuthoredTimes>, Error>
-    mark_mfa(const std::string& token_hash);
+    mark_mfa(const std::string& token_hash, const LocalMfaProof& proof);
+
+    /// Remove the MFA proof and its binding (`mfa_verified_ms = 0`, `mfa_factor_gen = 0`),
+    /// advancing the bind sequence and the write generation. Returns the authored
+    /// times so the caller's cache re-derives (no proof), or nullopt when the session
+    /// did not exist.
+    [[nodiscard]] std::expected<std::optional<AuthoredTimes>, Error>
+    clear_mfa_proof(const std::string& token_hash);
 
     // ── Sliding activity update (NO generation bump — not an authz change) ─────
 
@@ -216,12 +288,36 @@ public:
     /// Fetch one session by token hash, WITH the DB clock at read time in the same
     /// atomic SELECT. nullopt = definitively absent; unexpected = DB degraded (the
     /// caller must NOT treat this as "invalid session", and must NOT treat a
-    /// missing db_now_ms as 0 — both fail the request instead).
+    /// missing db_now_ms as 0: both fail the request instead). A served row carries
+    /// `guard_unverified` while the rebind-guard check cannot run (see `FoundSession`).
     [[nodiscard]] std::expected<std::optional<FoundSession>, Error>
     find(const std::string& token_hash) const;
 
     /// The durable write-generation the validate-cache validates against.
     [[nodiscard]] std::expected<std::uint64_t, Error> read_generation() const;
+
+    /// True while the rebind-guard trigger is observed to fire for every session
+    /// writer (see the banner). False once a validation has seen it missing,
+    /// disabled, replica-only or altered, and STICKY until restart; a consumer of
+    /// the bound proof must treat false as "binding cannot be trusted" (fail closed).
+    [[nodiscard]] bool rebind_guard_ok() const noexcept {
+        return rebind_guard_ok_.load(std::memory_order_acquire);
+    }
+
+    /// Test seam: make every trigger validation inconclusive (the catalog query "cannot run")
+    /// WITHOUT touching the sessions table, so the row SELECT after it still succeeds. Takes
+    /// effect at the next `find` that validates; pair with a zero memo.
+    void set_binding_validation_inconclusive_for_test(bool on) noexcept {
+        force_inconclusive_for_test_.store(on, std::memory_order_relaxed);
+    }
+
+    /// Test seam: the interval between request-driven trigger validations (default
+    /// 60 s), taking effect at the next `find` (the pending deadline is cleared).
+    /// Zero validates on every `find`.
+    void set_binding_validation_memo_for_test(std::chrono::milliseconds memo) noexcept {
+        validation_memo_ms_.store(memo.count(), std::memory_order_relaxed);
+        next_validation_steady_ms_.store(0, std::memory_order_relaxed);
+    }
 
     // ── Retention (clock-guarded, single-writer across replicas) ───────────────
 
@@ -248,8 +344,24 @@ public:
     [[nodiscard]] std::expected<ReapOutcome, Error> reap_expired();
 
 private:
+    /// Re-run the trigger validation on the caller's lease when the memo has
+    /// expired (at most one thread per expiry). Flips `rebind_guard_ok_` false,
+    /// stickily, on a definite failure; an inconclusive check latches nothing but flags the
+    /// reads that follow `guard_unverified` (and retries on the next find) until a check succeeds.
+    /// Returns true iff THIS call ran the check and it was inconclusive, so the caller can flag its
+    /// own read without sampling the shared flag afterwards: a concurrent successful check clears
+    /// that flag between this call's verdict and the caller's load (#6079 K3).
+    [[nodiscard]] bool revalidate_rebind_guard_if_due(PGconn* conn) const;
+
     pg::PgPool& pool_;
     bool open_{false};
+    mutable std::atomic<bool> rebind_guard_ok_{false};
+    /// The latest validation was inconclusive and none has succeeded since (see
+    /// `FoundSession::guard_unverified`). Cleared by a successful validation.
+    mutable std::atomic<bool> last_validation_inconclusive_{false};
+    std::atomic<bool> force_inconclusive_for_test_{false};
+    mutable std::atomic<std::int64_t> next_validation_steady_ms_{0};
+    std::atomic<std::int64_t> validation_memo_ms_{60'000};
 };
 
 } // namespace yuzu::server

@@ -73,6 +73,11 @@ import threading
 import time
 from pathlib import Path
 
+# Meson consumes UTF-8 logs, including native-tool diagnostics which may need
+# replacement characters. A Windows console code page must not reject the tee.
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gateway_epmd  # noqa: E402
 from erlang_toolchain import base_env, kill_tree, rebar3_prefix, windows_stdio_isolation  # noqa: E402
@@ -263,9 +268,9 @@ def _dump_process_tree():
     """Best-effort process listing, for diagnosing a hung child tree."""
     try:
         if os.name == "nt":
-            subprocess.run(["tasklist", "/V"], check=False)
+            subprocess.run(["tasklist", "/V"], check=False, timeout=5)
         else:
-            subprocess.run(["ps", "-ef"], check=False)
+            subprocess.run(["ps", "-ef"], check=False, timeout=5)
     except Exception as exc:  # noqa: BLE001 - diagnostic path, never fatal
         print(f"[test_gateway.py] process-tree dump failed: {exc}", file=sys.stderr)
 
@@ -277,7 +282,7 @@ def _kill_process_tree(proc):
     uses): root killed last, taskkill in its own process group and bounded,
     retried across a second Ctrl-C.
     """
-    if not kill_tree(proc):
+    if not kill_tree(proc, timeout=10):
         print("[test_gateway.py] process-tree kill reported failure; some "
               "processes may survive", file=sys.stderr)
 
@@ -302,6 +307,8 @@ def _run_streamed(args, deadline_secs):
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         bufsize=1,
     )
     # Null stdin + a private console on Windows (erlang_toolchain hazard 3);
@@ -315,9 +322,10 @@ def _run_streamed(args, deadline_secs):
     else:
         popen_kwargs["start_new_session"] = True
 
+    started = time.monotonic()
     proc = subprocess.Popen(args, **popen_kwargs)
     try:
-        return _stream_until_exit(proc, deadline_secs)
+        return _stream_until_exit(proc, max(0, deadline_secs - (time.monotonic() - started)))
     except BaseException:
         # Ctrl-C, or a closed console: the child sits on its own console and
         # process group, so neither reaches it. Kill the tree before
@@ -354,6 +362,13 @@ def _stream_until_exit(proc, deadline_secs):
         except queue.Empty:
             continue
         if line is None:
+            # EOF only means the output pipe closed. A child can close both
+            # descriptors and keep running; retain the same deadline while
+            # waiting for its actual exit.
+            try:
+                proc.wait(timeout=max(0, deadline_secs - (time.monotonic() - start)))
+            except subprocess.TimeoutExpired:
+                deadline_hit = True
             break
         sys.stdout.write(line)
         sys.stdout.flush()
@@ -379,11 +394,14 @@ def _stream_until_exit(proc, deadline_secs):
             sys.stdout.write(line)
             lines.append(line)
         try:
-            returncode = proc.wait(timeout=15)
+            proc.wait(timeout=15)
         except subprocess.TimeoutExpired:
-            returncode = -1
+            print("[test_gateway.py] child did not exit after the kill", file=sys.stderr)
+        # A child exiting 0 while diagnostics/kill run cannot turn a deadline
+        # breach into success.
+        returncode = -1
     else:
-        returncode = proc.wait()
+        returncode = proc.returncode
 
     return returncode, "".join(lines)
 
@@ -396,9 +414,9 @@ def run_with_retry(args, label, max_attempts=4):
     streamed live (see `_run_streamed`) and also captured for the hex.pm
     sentinel check below.
 
-    Backoff: 5s, 10s, 20s between attempts (exponential). Total worst
-    case is ~35s of waits across 4 attempts, plus the actual rebar3
-    runtime per attempt.
+    Backoff: 5s, 10s, 20s between attempts (exponential). All attempts and
+    backoff share one suite deadline; bounded diagnostics/kill/reaping use
+    the headroom before Meson's outer timeout.
     """
 
     class _Result:
@@ -407,13 +425,23 @@ def run_with_retry(args, label, max_attempts=4):
             self.stdout = stdout
 
     result = _Result(-1, "")
+    deadline = time.monotonic() + _RUN_DEADLINE_SECS
     for attempt in range(1, max_attempts + 1):
-        returncode, output = _run_streamed(args, _RUN_DEADLINE_SECS)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            print(f"[test_gateway.py] {label}: suite deadline exhausted before retry",
+                  file=sys.stderr)
+            return _Result(-1, result.stdout)
+        returncode, output = _run_streamed(args, remaining)
         result = _Result(returncode, output)
         if returncode == 0:
             return result
         if HEX_FAIL_PATTERN in output and attempt < max_attempts:
             backoff = 5 * (2 ** (attempt - 1))
+            if backoff >= deadline - time.monotonic():
+                print(f"[test_gateway.py] {label}: insufficient suite deadline "
+                      "remaining for a hex.pm retry", file=sys.stderr)
+                return result
             print(
                 f"\n[test_gateway.py] {label}: hex.pm fetch failure detected "
                 f"(attempt {attempt}/{max_attempts}) — sleeping {backoff}s and retrying",
@@ -429,7 +457,7 @@ def run_with_retry(args, label, max_attempts=4):
 # Output is captured for the zero-executed guard and also teed to console.
 # run_with_retry handles hex.pm fetch flakes by detecting the
 # "Failed to fetch and copy dep:" sentinel and backing off between
-# attempts. 4 attempts × ~35s of waits at most before giving up.
+# attempts, all within one suite deadline.
 result = run_with_retry(cmd, label, max_attempts=4)
 output = result.stdout or ""
 
@@ -457,4 +485,7 @@ if shard is not None:
 # so it was removed. OTP 28 is the only supported toolchain
 # (scripts/erlang_toolchain.py, CI), and on any other OTP the wrapper now
 # fails closed on rebar3's own exit code.)
-sys.exit(_require_tests_executed(output, label, returncode))
+# Both Meson registrations explicitly select its uploaded meson-logs directory.
+# Direct invocations retain the same diagnostics in their rebar build root.
+_log_dir = Path(os.environ.get("YUZU_GATEWAY_TEST_LOG_DIR") or Path(_base) / "test-logs")
+sys.exit(_require_tests_executed(output, label, returncode, log_dir=_log_dir))

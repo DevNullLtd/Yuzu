@@ -124,7 +124,7 @@ std::string pack_advisory_note(const DefinitionPackAdvisoryFn& fn,
 }
 
 namespace {
-/// "(used by policy <id> (<name>), <id>, +N)": the policies holding a policy fragment alive, at
+/// "(used by policy <id> (<name>), <id>, +N)": the policies holding a pack-own fragment alive, at
 /// most `kMaxHeldByPoliciesNamed` of them, each id and name bounded and folded; the name is left
 /// out when empty. `N` is a lower bound (the caller reads one policy past the cap). Empty when
 /// `held_by` is.
@@ -169,6 +169,19 @@ std::string describe_definition_referrers(const std::vector<DefinitionReferrer>&
            (referrers.size() == 1 ? " item" : " items") + " and was NOT deleted: " +
            list_referrers(referrers) +
            ". Remove each of them (or point it at another definition), then delete this one.";
+}
+
+std::string describe_pack_uninstall_blockers(const std::vector<DefinitionReferrer>& referrers) {
+    const bool policy_held = std::any_of(referrers.begin(), referrers.end(), [](const auto& r) {
+        return !r.held_by.empty();
+    });
+    return "the pack was NOT uninstalled; " + std::to_string(referrers.size()) +
+           (referrers.size() == 1 ? " item still uses" : " items still use") +
+           " one of its definitions: " + list_referrers(referrers) +
+           ". Remove each of them (or point it at another definition), then retry the uninstall." +
+           (policy_held ? " A pack policy fragment that a policy uses survives the uninstall: "
+                          "delete that policy, then retry."
+                        : "");
 }
 
 } // namespace yuzu::server

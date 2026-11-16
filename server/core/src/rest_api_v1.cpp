@@ -19,7 +19,9 @@
 #include "mgmt_group_owner_gate.hpp" // the one management-group owner-arm predicate
 #include "rbac_admin_predicate.hpp" // A2: is_rbac_administrator / is_self_target — global human role assignment gate
 #include "rbac_assignable_roles.hpp" // A2: kRbacAssignableRoles / is_rbac_assignable_role — closed 7-role set
+#include "mgmt_group_agent_known.hpp" // lookup_agent_known: the add-member `agent_known` audit flag, REST and MCP
 #include "mgmt_group_error.hpp" // mgmt_group_error_is_store_fault: one classifier for REST and MCP
+#include "mgmt_group_limits.hpp" // name / agent id / group id bounds and clean-text rule (REST, MCP, Settings)
 #include "rbac_text.hpp" // rbac_text_is_clean - the one clean-text predicate for RBAC identifiers
 #include "rbac_enforcement_read.hpp" // GET /api/v1/rbac/enforcement: the builder shared with MCP get_rbac_enforcement
 #include "app_perf_compare.hpp" // app_perf_param_valid — shared cap + control-char/NUL re-floor
@@ -1718,10 +1720,10 @@ const std::string& openapi_spec() {
       "docs": []
     }},
     {"name": "Events", "description": "Follow a running instruction execution as a JSON event stream, and read executions, their responses and their child executions once they exist.", "x-yuzu-guide": {
-      "overview": ["An execution is one dispatch of an instruction to a set of devices. This group has a live view and a stored view. The live view is a Server-Sent Events stream for one running execution, built for agentic workers that need to react as devices report. The stored view lists executions, returns one execution with optional per-device detail, returns its responses, and lists the executions it spawned.", "Every call is confined to what the caller may see. A caller limited to some management groups sees only executions that involve a device in scope, or that they dispatched themselves, and sees counts and event detail trimmed to that scope."],
+      "overview": ["An execution is one dispatch of an instruction to a set of devices. This group has a live view and a stored view. The live view is a Server-Sent Events stream for one running execution, built for agentic workers that need to react as devices report. The stored view lists executions, returns one execution with optional per-device detail, returns its responses, and lists the executions it spawned.", "Every call is confined to what the caller may see. A caller limited to some management groups sees only executions that involve a device in scope, or that they dispatched themselves, and sees counts and event detail trimmed to that scope. A service-scoped API token is the exception: an execution its minting account dispatched is not visible to it merely because that account dispatched it, and it sees an execution only once an agent in its service scope has a status row for it."],
       "how_it_works": [{"title": "Dispatch", "text": "Dispatching an instruction creates an execution with an id. That id is the only handle the stream needs."}, {"title": "Subscribe", "text": "Call the events stream with execution_id. An execution that is missing, or outside your scope, gives the same 404. An execution that has already finished gives 410."}, {"title": "Stream", "text": "Events arrive as JSON envelopes with numeric ids. A heartbeat event keeps the connection alive while nothing else is sent."}, {"title": "Resume", "text": "After a disconnect, reconnect with since or Last-Event-ID to replay what you missed. If the buffer no longer holds those events, a replay-gap event says which ids are missing."}, {"title": "Read final state", "text": "When the execution is complete, read GET /executions/{id}, its responses and its children to get the final picture."}],
       "tables": [{"title": "Stream event types", "caption": "The last column shows what a caller confined to some management groups receives.", "columns": ["Type", "Meaning", "Confined caller"], "rows": [["agent-transition", "One device changed status", "Only devices in scope"], ["execution-progress", "Running totals for the whole execution", "Not sent"], ["execution-completed", "The execution reached a final state", "Status only"], ["heartbeat", "Liveness signal, empty data", "Sent"], ["replay-gap", "Events between missing_from and missing_to are no longer buffered", "Sent"], ["events-dropped", "This connection fell behind and events were discarded", "Sent"]]}],
-      "access": {"permissions": ["Execution:Read, via the fleet-read check, gates /events, /executions, /executions/{id} and /executions/{id}/children.", "Response:Read, via the fleet-read check, gates /executions/{id}/responses. It is a different securable from Execution:Read, so holding one does not give the other.", "Execution:Execute and then Execution:Read, via the fleet-read check, gate POST /executions/{id}/cancel and POST /executions/{id}/rerun. Neither sends anything to a device: cancel marks the stored execution cancelled, and rerun creates a pending record."], "audit": ["api.v1.events.subscribe, written on each successful subscribe, and as a denied row when the execution is missing or outside the caller's scope. If the success row cannot be saved the stream still starts and the response carries Sec-Audit-Failed: true. A rejected since writes no success row.", "execution.detail.fetch, written when the responses call succeeds and when the detail call is made with include=agents. Both fail with 503 if the row cannot be saved. The detail call also writes a denied row when it answers 404.", "execution.read, written as a denied row by the children call when a confined caller asks about an execution they cannot see.", "execution.cancel and execution.rerun, written by the cancel and rerun calls: an attempted row before the change (503 with Sec-Audit-Failed: true, and no change, if it cannot be saved), then success, denied or failure. A confined caller's denial is identical for a hidden and a nonexistent execution."], "notes": ["The execution's dispatcher is admitted to see it so that a just-dispatched execution does not look missing. This does not bypass the trimming of counts and events for a confined caller.", "A plain list, a plain detail call and a successful children call write no audit row."]},
+      "access": {"permissions": ["Execution:Read, via the fleet-read check, gates /events, /executions, /executions/{id} and /executions/{id}/children.", "Response:Read, via the fleet-read check, gates /executions/{id}/responses. It is a different securable from Execution:Read, so holding one does not give the other.", "Execution:Execute and then Execution:Read, via the fleet-read check, gate POST /executions/{id}/cancel and POST /executions/{id}/rerun. Neither sends anything to a device: cancel marks the stored execution cancelled, and rerun creates a pending record."], "audit": ["api.v1.events.subscribe, written on each successful subscribe, and as a denied row when the execution is missing or outside the caller's scope. If the success row cannot be saved the stream still starts and the response carries Sec-Audit-Failed: true. A rejected since writes no success row.", "execution.detail.fetch, written when the responses call succeeds and when the detail call is made with include=agents. Both fail with 503 if the row cannot be saved. The detail call also writes a denied row whenever it answers 404, for every caller class. A service-scoped API token that polls before an agent in its service scope has replied writes one such row per poll.", "execution.read, written as a denied row by the children call when a caller whose fleet-read scope is engaged (a management-group-confined caller or a service-scoped API token) asks about an execution they cannot see or that does not exist.", "execution.cancel and execution.rerun, written by the cancel and rerun calls: an attempted row before the change (503 with Sec-Audit-Failed: true, and no change, if it cannot be saved), then success, denied or failure. A confined caller's denial is identical for a hidden and a nonexistent execution."], "notes": ["The execution's dispatcher is admitted to see it so that a just-dispatched execution does not look missing. This does not bypass the trimming of counts and events for a confined caller. A service-scoped API token has no dispatcher admission: it sees an execution only once an agent in its service scope has a status row for it, so an execution its minting account dispatched reads as not found until an in-scope agent responds.", "A plain list, a plain detail call that succeeds and a successful children call write no audit row."]},
       "good_to_know": [{"label": "Execution id required", "text": "The stream needs execution_id, matching letters, digits, underscore and hyphen, up to 128 characters. There is no stream across all executions."}, {"label": "Replay window", "text": "Replay comes from a bounded in-memory buffer of 1000 events per execution. With neither since nor Last-Event-ID the buffer is replayed from its start. A since that is not one non-negative whole number is a 400, answered before the stream budget is used and before any success audit row is written. A Last-Event-ID header that is malformed gives no error and replays nothing, so the stream is live only."}, {"label": "Slow readers", "text": "Each connection queues up to 500 events. When it is full the oldest are discarded and an events-dropped event reports how many."}, {"label": "Stream limits", "text": "Each open stream uses a worker from the shared stream budget (--max-sse-streams). Over the limit you get 429 with retry_after_ms. A single principal may hold 16 event streams at once."}, {"label": "Paging does not page", "text": "The list returns up to limit rows with no cursor. limit defaults to 100 and is held between 1 and 500, and a limit that is not a whole number is a 400. pagination.total is the number of rows returned, and page_size always reads 50."}, {"label": "Confined view", "text": "For a confined caller, scope_expression and parameter_values read (redacted - confined view), and the agent counts include only devices in scope. Counts can run low because they only include devices that have already responded."}, {"label": "Per-device detail", "text": "include=agents adds per-device rows and a kpi summary. The match is a substring test on the include value, and this expansion is audited."}, {"label": "Responses paging", "text": "The responses call rejects offset with 400 because the order changes while an execution runs. Use limit (up to 1000) and since. Rows have a narrower shape than the general responses calls."}, {"label": "Children cap", "text": "The children call returns at most 100 executions and sets result_truncated_by_cap inside data when there were more. It has no pagination object."}, {"label": "Degraded reads", "text": "If the execution tracker or response store cannot be read, these calls answer 503 with retry_after_ms. They do not answer 404 or an empty list."}],
       "docs": ["docs/user-manual/rest-api.md", "docs/user-manual/response-store.md"]
     }},
@@ -1808,8 +1810,8 @@ const std::string& openapi_spec() {
       "overview": ["A management group is a named set of devices. Groups form a tree under one built-in root group called All Devices. Operators use them to organise the fleet, and to give a person or team a role over the devices in one branch only.", "Group membership and group roles feed the device confinement that other API groups apply. A role held on a group reaches the agents in that group and in the groups below it. This group of calls manages the groups, their members and the roles delegated on them.", "The group routes check global grants on the ManagementGroup securable. The roles routes add one group-scoped path, ITServiceOwner of that group, described under access."],
       "how_it_works": [{"title": "Root group", "text": "At start the server creates the root group All Devices (id 000000000000) if it is missing. Every agent is added to it when it registers, directly or through a gateway."}, {"title": "Build the tree", "text": "Create groups with an optional parent id. Add agents to a group one at a time. Group names must be unique across the whole tree."}, {"title": "Delegate roles", "text": "Assign Operator or Viewer to a user or a group principal on a management group. No other role can be delegated here."}, {"title": "Scope applies", "text": "When RBAC enforcement is on, a role held on a group is resolved to the agents in that group and the groups below it. Other API groups then confine their device reads and actions to that set."}],
       "tables": [{"title": "Kinds of group", "caption": "How members arrive and what the calls in this group can change.", "columns": ["Kind", "How members arrive", "What these calls can do"], "rows": [["Root (All Devices)", "Every agent is added on registration.", "Rename or describe it. Delete is refused with 403 and a new parent is refused with 400."], ["Static group", "You add agents one at a time.", "Add and remove members."], ["Dynamic group", "Entries marked source dynamic, written only by the server.", "Remove member never deletes a dynamic entry."], ["Service group", "Created by the server when a service tag is written, named Service: followed by the tag value.", "Same as a dynamic group. Members are filled from agents holding the tag when it is created."]]}],
-      "access": {"permissions": ["ManagementGroup:Read, gates list groups and get one group with its members. A global grant check.", "ManagementGroup:Write, gates create, update, add member, remove member and the agent count preview.", "ManagementGroup:Delete, gates delete group.", "ManagementGroup:Read plus either UserManagement:Read or ITServiceOwner of that group, gates list roles. The role list shows who holds which role, so it is treated as authorization topology.", "ManagementGroup:Write or ITServiceOwner of that group, gates assign role and unassign role."], "audit": ["management_group.create, written after a group is created.", "management_group.update, written after a group is updated.", "management_group.delete, written after a group is deleted.", "management_group.add_member, written after an add member call. A control byte or invalid UTF-8 in agent_id is written as denied (detail invalid_agent_id) and a store fault as failure (detail store_error).", "management_group.remove_member, written after a remove member call, with the same denied and failure rows.", "management_group.assign_role, written after a role is assigned. A control byte or invalid UTF-8 in the role name, principal_id or principal_type is written as denied (detail invalid_role_name, invalid_principal_id or invalid_principal_type) and a store fault as failure (detail store_error).", "management_group.unassign_role, written after a role is unassigned, with the same denied and failure rows. The success rows are written only after the store reports success, and the audit write result is not checked, so a failed audit write does not fail the request. A group id that names no group answers 404 on add member and assign role and writes no row. Reads are not audited."], "notes": ["The ITServiceOwner path on the roles routes is not offered to a service-scoped API token. Such a token is judged by the global permission check only.", "Only Operator and Viewer can be delegated. Any other role name returns 403.", "MCP tools exist for list, get, create, update, add member, list roles, assign role and the agent count preview. Delete, remove member and unassign role are REST only."]},
-      "good_to_know": [{"label": "Paging", "text": "The list returns every group in one response. The pagination block reports start 0, page size 50 and a total equal to the rows returned, whatever the size of the tree."}, {"label": "Dynamic groups", "text": "A dynamic group stores its scope expression, but the only server code that fills dynamic members is the service tag helper. A dynamic group you create through the API gets no members from its expression, so add static members or expect it to stay empty."}, {"label": "Write outcomes", "text": "Add member, remove member, assign role and unassign role answer success only after the store accepted the write. A control byte or invalid UTF-8 in an id is a 400, a group id naming no group on add member or assign role is a 404, and a store fault is a 503 with a retry hint. Removing an agent that was not a member, or unassigning a role that was not held, is not an error and still returns 200."}, {"label": "Delete cascades", "text": "Deleting a group also deletes the groups below it, their memberships and their role assignments. The agents themselves are not deleted."}, {"label": "Depth and cycles", "text": "A group may sit at most five levels below the root. Create is refused beyond that, and re-parenting is refused one level earlier. Moving a group under one of its own descendants is refused. Update changes only the fields you send."}, {"label": "Fail-closed read", "text": "Get one group reads the group row and its member list separately. If either read fails the call returns 503 with a retry hint, never a 404 or an empty member list."}, {"label": "RBAC off", "text": "While RBAC enforcement is off, device visibility falls back to every enrolled agent and group roles do not narrow it. Assign group roles before you turn enforcement on."}, {"label": "Ids and bodies", "text": "The server generates group ids as 12 lowercase hex characters, and the routes match only lowercase hex ids. Unassign role names the grant in its JSON body, not in the URL."}, {"label": "Count preview", "text": "The agent count preview needs ManagementGroup:Write, as creating a group does. Filters are repeated query parameters, and an empty filter set returns a count of 0 without reading the store. The response also lists unindexed_filter_keys, the filters whose value is longer than 2048 bytes as stored. Such a value is not indexed, so for those filters agent_count can be 0 or an undercount. If the response store is degraded it returns 503 with a retry hint."}],
+      "access": {"permissions": ["ManagementGroup:Read, gates list groups and get one group with its members. A global grant check.", "ManagementGroup:Write, gates create, update, add member, remove member and the agent count preview.", "ManagementGroup:Delete, gates delete group.", "ManagementGroup:Read plus either UserManagement:Read or ITServiceOwner of that group, gates list roles. The role list shows who holds which role, so it is treated as authorization topology.", "ManagementGroup:Write or ITServiceOwner of that group, gates assign role and unassign role."], "audit": ["management_group.create, written twice per call. An attempted row is stored before the group is created, then a success row (target_id is the new group id) or a failure row (detail is a token, a space and the group name the attempted row carries, the token being name_conflict, store_error or validation_refused; read the first space-delimited word as the token). If the attempted row cannot be stored the call answers 503 with Sec-Audit-Failed and creates nothing. The session and the permission are checked again after the attempted row, and a request that no longer passes writes a failure row (detail session_revoked or permission_revoked, then a space and the group name). A request refused before any write (permission, body, an empty name, a name or parent id over 256 bytes or holding a control character, an unknown parent, depth) writes no management_group row. A fault of the group store, including a failed read of the parent group, answers 503 with a retry hint. If only the outcome row cannot be stored the 201 stands and carries Sec-Audit-Failed.", "management_group.update, written after a group is updated.", "management_group.delete, written after a group is deleted.", "management_group.add_member, written twice per call once the request is valid and the group exists. An attempted row (detail is the agent id) is stored before the member is added, then a success row whose detail is the agent id, a space and agent_known=1, agent_known=0 or agent_known=unreadable (read the last space-delimited token) or a failure row (detail is a token, a space and the agent id the attempted row carries, the token being store_error, group_not_found, session_revoked or permission_revoked; read the first space-delimited word as the token). If the attempted row cannot be stored the call answers 503 with Sec-Audit-Failed and adds nothing; if only the outcome row cannot be stored the 201 stands and carries Sec-Audit-Failed. A control byte or invalid UTF-8 in agent_id is written as denied (detail invalid_agent_id) with no attempted row.", "management_group.remove_member, written twice per call in the same order: an attempted row, then a success row (detail is the agent id) or a failure row (detail is a token, a space and the agent id, the token being store_error, session_revoked or permission_revoked), with the same Sec-Audit-Failed behaviour and the same denied row for an invalid agent_id.", "management_group.assign_role, written after a role is assigned. A control byte or invalid UTF-8 in the role name, principal_id or principal_type is written as denied (detail invalid_role_name, invalid_principal_id or invalid_principal_type) and a store fault as failure (detail store_error).", "management_group.unassign_role, written after a role is unassigned, with the same denied and failure rows. The update, delete, assign role and unassign role success rows are written only after the store reports success, and the audit write result is not checked there, so a failed audit write does not fail those requests. A group id that names no group answers 404 on assign role and writes no row. On add member it answers 404 and writes no attempted row, a group id over 256 bytes is a 404 too, and a group deleted after that check writes a failure row (detail group_not_found, a space and the agent id). A failed read of the group before the attempted row answers 503 and writes no management_group row. Remove member does not check that the group or the member exists: removing from an absent group, or an absent member, answers 200 and writes attempted and success rows for a change that did nothing. Reads are not audited."], "notes": ["The ITServiceOwner path on the roles routes is not offered to a service-scoped API token. Such a token is judged by the global permission check only.", "Only Operator and Viewer can be delegated. Any other role name returns 403.", "MCP tools exist for list, get, create, update, add member, list roles, assign role and the agent count preview. Delete, remove member and unassign role are REST only."]},
+      "good_to_know": [{"label": "Paging", "text": "The list returns every group in one response. The pagination block reports start 0, page size 50 and a total equal to the rows returned, whatever the size of the tree."}, {"label": "Dynamic groups", "text": "A dynamic group stores its scope expression, but the only server code that fills dynamic members is the service tag helper. A dynamic group you create through the API gets no members from its expression, so add static members or expect it to stay empty."}, {"label": "Write outcomes", "text": "Add member, remove member, assign role and unassign role answer success only after the store accepted the write. A control byte or invalid UTF-8 in an id is a 400, as is an agent id over 256 bytes (that one writes no row), a group id naming no group on add member or assign role is a 404, and a store fault is a 503 with a retry hint. Removing an agent that was not a member, or unassigning a role that was not held, is not an error and still returns 200."}, {"label": "Delete cascades", "text": "Deleting a group also deletes the groups below it, their memberships and their role assignments. The agents themselves are not deleted."}, {"label": "Depth and cycles", "text": "A group may sit at most five levels below the root. Create is refused beyond that, and re-parenting is refused one level earlier. Moving a group under one of its own descendants is refused. Update changes only the fields you send."}, {"label": "Fail-closed read", "text": "Get one group reads the group row and its member list separately. If either read fails the call returns 503 with a retry hint, never a 404 or an empty member list."}, {"label": "RBAC off", "text": "While RBAC enforcement is off, device visibility falls back to every enrolled agent and group roles do not narrow it. Assign group roles before you turn enforcement on."}, {"label": "Ids and bodies", "text": "The server generates group ids as 12 lowercase hex characters, and the routes match only lowercase hex ids. Unassign role names the grant in its JSON body, not in the URL."}, {"label": "Count preview", "text": "The agent count preview needs ManagementGroup:Write, as creating a group does. Filters are repeated query parameters, and an empty filter set returns a count of 0 without reading the store. The response also lists unindexed_filter_keys, the filters whose value is longer than 2048 bytes as stored. Such a value is not indexed, so for those filters agent_count can be 0 or an undercount. If the response store is degraded it returns 503 with a retry hint."}],
       "docs": ["docs/user-manual/management-groups.md"]
     }},
 )json"
@@ -1889,7 +1891,7 @@ const std::string& openapi_spec() {
       "overview": ["A result set is a saved list of device ids with a name, an owner, a source and an expiry. Operators build one from an inventory query, an Echo SQL query, an instruction run, or a list of ids they already hold. A later query or dispatch can then use the set as its scope with from_result_set:<id>, so each step narrows the one before it.", "Sets are private to the operator who created them. There is no RBAC securable for them and no administrator override. Another operator's set answers exactly like one that does not exist, so ids cannot be probed. Only the routes that reach into fleet data to build a set carry real permission checks.", "A set expires an hour after it is created unless it is pinned. Using a set as the scope of a dispatch pushes the expiry out again, but a scope preview does not. The record shows metadata only. The query that built the set stays on the server for re-evaluation and is not returned."],
       "how_it_works": [{"title": "Produce a set", "text": "An inventory query or a direct create fills the set at once. An Echo SQL query or an instruction run dispatches a command to agents and returns a pending set with no members yet."}, {"title": "Wait for answers", "text": "A background pass runs about every two seconds. It fills a pending set when every targeted agent has answered, or after five minutes with whatever has answered by then. Only successful replies that match the set's matcher become members."}, {"title": "Narrow further", "text": "Pass a set as parent_id when producing the next set, or use from_result_set:<id> in a scope expression. The producers that run a query limit it to the devices the earlier set holds."}, {"title": "Keep or expire", "text": "Pin a set to keep it. Unpinned sets are removed by a sweep that runs about every five minutes once their expiry has passed."}],
       "tables": [{"title": "Ways to make a set", "columns": ["Route", "What runs", "Result", "Permission"], "rows": [["POST /result-sets", "Nothing. You supply device_ids", "materialized at once", "Ownership only. Infrastructure:Read scope applies when device_ids is not empty"], ["POST /result-sets/from-inventory-query", "An inventory query on the server", "materialized at once", "Inventory:Read, management group scoped"], ["POST /result-sets/from-echo-query", "SQL sent to agents (echo sql)", "pending, filled later", "Execution:Execute"], ["POST /result-sets/from-instruction-result", "A stored instruction definition sent to agents", "pending, filled later", "Execution:Execute"], ["POST /result-sets/{id}/re-eval", "The set's own source query, run again", "new pending set", "Execution:Execute"]]}, {"title": "Limits", "columns": ["Limit", "Value", "When it is reached"], "rows": [["Default lifetime", "1 hour", "The sweep removes the set unless it is pinned"], ["Sets per owner", "10000", "Creating another set is refused"], ["Members per set", "100000", "A direct create is refused"], ["Response rows read to fill a pending set", "100000", "The set is marked failed, not filled: it reads device_count 0, agents_failed 0 and partial false, and the reason is in the server log"],["Pinned sets per owner", "50", "Pinning another set is refused"], ["Wait for a pending set", "5 minutes", "The set is filled with the replies received so far"], ["Inventory rows read", "5000", "The inventory query is refused, never cut short"], ["SQL text length", "100000 bytes", "The request is refused"], ["List page size", "50 by default, up to 500", "A whole number outside 1 to 500 falls back to 50. Anything that is not a whole number is a 400"], ["Member page size", "1000 by default, up to 10000", "A whole number outside 1 to 10000 falls back to 1000. Anything that is not a whole number is a 400"]]}],
-      "access": {"permissions": ["Execution:Execute gates from-echo-query, from-instruction-result and re-eval. The dispatch is limited to devices the caller may reach, so hidden devices are never sent the command.", "Inventory:Read, management group scoped, gates from-inventory-query. Devices outside the caller's scope are left out of the match.", "Infrastructure:Read, management group scoped, gates the members list and is applied before paging. It also gates a direct create whose device_ids list is not empty.", "Infrastructure:Write (create, pin, unpin) and Infrastructure:Delete (delete) are borrowed labels for the MCP tier check. They are not grantable RBAC permissions."], "audit": ["result_set.create, written for each create or re-eval attempt that passes validation. The outcome is success, denied or failure, and the detail carries a reason token. The success row is written after the set exists and a failed write does not undo it. A request refused at validation with a 400 (bad JSON, an oversized sql, or RESULT_SET_REEVAL_STALE_SOURCE) writes no row, except that a refusal for a NUL byte in the name, the sql, an instruction parameter or parent_id writes a result_set.create row with outcome denied and reason=field_contains_nul, and a RESULT_SET_SOURCE_NOT_SUPPORTED refusal (a Forensics-tier source) writes one with reason=forensics_source and source_kind. A 409 RESULT_SET_NOT_READY refusal (a pending or failed parent) writes no row.", "result_set.pin, result_set.unpin and result_set.delete, written on success.", "result_set.access, outcome denied, written when an id is not found or not owned by the caller.", "result_set.list, result_set.members and result_set.lineage, outcome failure only, written when the store read fails. Successful reads are not audited.", "result_set.heal, written when re-eval discards a stored query that nests too deeply.", "result_set.create.access_denied, result_set.list.access_denied and the matching verbs for detail, members, lineage, pin, unpin and delete, outcome denied, written when a service-scoped token is refused."], "notes": ["Service-scoped API tokens get a 403 on the nine routes that do not dispatch, and the error names no permission to ask for. The three routes that dispatch (from-echo-query, from-instruction-result, re-eval) rely on the Execution:Execute check instead.", "A token that carries an MCP tier is also held to that tier's policy on create, pin, unpin and delete. Plain sessions and tokens without a tier are not affected by that check.", "Every route here has an MCP twin, for example list_result_sets, create_result_set_from_echo_query and reevaluate_result_set."]},
+      "access": {"permissions": ["Execution:Execute gates from-echo-query, from-instruction-result and re-eval. The dispatch is limited to devices the caller may reach, so hidden devices are never sent the command.", "Inventory:Read, management group scoped, gates from-inventory-query. Devices outside the caller's scope are left out of the match.", "Infrastructure:Read, management group scoped, gates the members list and is applied before paging. It also gates a direct create whose device_ids list is not empty.", "Infrastructure:Write (create, pin, unpin) and Infrastructure:Delete (delete) are borrowed labels for the MCP tier check. They are not grantable RBAC permissions."], "audit": ["result_set.create, written for each create or re-eval attempt that passes validation. The outcome is success, denied or failure, and the detail carries a reason token. The success row is written after the set exists and a failed write does not undo it. A request refused at validation with a 400 (bad JSON) writes no row, except that a missing or oversized sql, or a sql over a raw capture table (RESULT_SET_REEVAL_STALE_SOURCE), on from-echo-query and re-eval writes a result_set.create row with outcome denied and reason=sql_missing, sql_too_large or stale_source (never the sql text), the same stale_source refusal of an echo.sql instruction, on from-instruction-result and on re-eval of an instruction_result set, writes one with source_kind=instruction_result, and a refusal for a NUL byte in the name, the sql, an instruction parameter or parent_id writes a result_set.create row with outcome denied and reason=field_contains_nul, and a RESULT_SET_SOURCE_NOT_SUPPORTED refusal (a Forensics-tier source) writes one with reason=forensics_source and source_kind. A 409 RESULT_SET_NOT_READY refusal (a pending or failed parent) writes no row.", "result_set.pin, result_set.unpin and result_set.delete, written on success.", "result_set.access, outcome denied, written when an id is not found or not owned by the caller.", "result_set.list, result_set.members and result_set.lineage, outcome failure only, written when the store read fails. Successful reads are not audited.", "result_set.heal, written when re-eval discards a stored query that nests too deeply.", "result_set.create.access_denied, result_set.list.access_denied and the matching verbs for detail, members, lineage, pin, unpin and delete, outcome denied, written when a service-scoped token is refused."], "notes": ["Service-scoped API tokens get a 403 on the nine routes that do not dispatch, and the error names no permission to ask for. The three routes that dispatch (from-echo-query, from-instruction-result, re-eval) rely on the Execution:Execute check instead.", "A token that carries an MCP tier is also held to that tier's policy on create, pin, unpin and delete. Plain sessions and tokens without a tier are not affected by that check.", "Every route here has an MCP twin, for example list_result_sets, create_result_set_from_echo_query and reevaluate_result_set."]},
       "good_to_know": [{"label": "Pending sets", "text": "The two dispatching producers and re-eval answer 202 with status pending and device_count 0. Poll GET /result-sets/{id} until status is materialized, or watch source_execution_id on the events stream. A direct create and an inventory query answer 201 with the finished set."}, {"label": "After a dispatch", "text": "If the store fails or the quota is hit after the command was already sent, the error message says so and carries the execution id. Do not send the request again. Look up that execution to see what happened."}, {"label": "Nobody reached", "text": "A 503 with RESULT_SET_NO_AGENTS means the command reached no agent. Targets may be unreachable, hidden from the caller, quarantined, or withheld because containment state could not be read. The response does not say which, because hidden devices must stay hidden."}, {"label": "Parent ids", "text": "On the two dispatching producers parent_id may be an rs_ id or the name of one of the caller's own sets. A direct create and the inventory query take the rs_ id only, and the id in a route path is always an rs_ id. A parent_id that is empty or not a string is rejected with 400 and never ignored."}, {"label": "Inventory query", "text": "The query reads at most 5000 inventory rows. If the read is cut short, or a record cannot be parsed, the route answers 503 and creates nothing, so a set is never narrower than the true match. With parent_id, only members of that parent are kept."}, {"label": "Re-eval", "text": "Only sets made by an Echo query or an instruction run can be re-evaluated. The result is a new set, and a named original gives it the same name with the suffix (re-eval). The original is left alone. The caller's current permission and visibility apply, so the new members can differ. It is refused with 400 if the original was built from a parent set that has since been deleted."}, {"label": "Members and counts", "text": "The members list shows only devices the caller can see, and that narrowing happens before the page limit. The device_count on the set record is not narrowed, so it can be larger than what the list returns."}, {"label": "Unknown ids on create", "text": "If any id in device_ids is unknown or hidden from the caller the whole request is refused with 400. The message names up to 20 of them. An unknown id and a hidden one look the same."}, {"label": "Fail-closed reads", "text": "List, members and lineage answer 503 with retry_after_ms 5000 when the store cannot be read. They never return an empty list for a failed read."}, {"label": "Pin and delete", "text": "A pinned set cannot be deleted until it is unpinned, and the 51st pin is refused. A delete answers 200 with deleted true, not 204."}, {"label": "Input checks", "text": "Each inventory condition is checked before the query runs: plugin, field and op must be strings, and the value must be a string, a number (with a comparison operator) or a boolean (with == or !=). A bad condition is a 400. On from-instruction-result a matcher that is present but not a JSON object, or has a malformed threshold, is a 400 and nothing is dispatched."}, {"label": "Who becomes a member", "text": "An Echo query keeps agents that returned at least one row, or every successful responder when include_empty is true. An instruction run with no matcher keeps every successful responder, and its matcher can ask for any response, a minimum number of Echo rows, or a test on one output column. A responder that failed never qualifies."}],
       "docs": ["docs/user-manual/rbac.md"]
     }},
@@ -2042,7 +2044,7 @@ const std::string& openapi_spec() {
     },
     "/management-groups": {
       "get": {"operationId": "getManagementGroups", "summary": "List management groups", "tags": ["Management Groups"], "responses": {"200": {"description": "List of management groups", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MgmtGroupListResponse"}}}}}},
-      "post": {"operationId": "postManagementGroups", "summary": "Create a management group", "tags": ["Management Groups"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ManagementGroup"}}}}, "responses": {"201": {"description": "Group created", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MgmtGroupCreatedResponse"}}}}}}
+      "post": {"operationId": "postManagementGroups", "summary": "Create a management group", "tags": ["Management Groups"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ManagementGroup"}}}}, "description": "Audit-first: an attempted audit row is stored before the group is created, and a call whose attempted row cannot be stored creates nothing. The session and the permission are checked again after that row.", "responses": {"201": {"description": "Group created. If only the closing audit row could not be stored the 201 stands and the response carries Sec-Audit-Failed: true.", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when an audit row for this request could not be stored"}}, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MgmtGroupCreatedResponse"}}}}, "400": {"description": "Invalid JSON; an empty name; a name over 256 bytes or holding a control character or invalid UTF-8 (group name must be at most 256 bytes and must not contain control characters or invalid UTF-8); a parent_id over 256 bytes, holding such a character, or naming no group (parent group not found); a hierarchy deeper than five levels; or a name already used by another group (a group with that name already exists). A name conflict, and a parent removed after the check, are answered after the attempted row is stored and are recorded as a failure row; every other refusal writes no audit row."}, "503": {"description": "The group store could not answer, including a failed read of the parent group (fixed message; the store error text is not returned), or the attempted audit row could not be stored, in which case the response carries Sec-Audit-Failed: true. Nothing is created either way; the envelope includes retry_after_ms.", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when an audit row for this request could not be stored"}}}}}
     },
     "/management-groups/{id}": {
       "get": {"operationId": "getManagementGroupsById", "summary": "Get a management group with members", "tags": ["Management Groups"], "description": "Both the group row itself and its member list are read in a way that distinguishes a degraded store from a missing record, so a store-not-open, pool-acquire-timeout or query-error degrade on EITHER read fails closed with 503 rather than rendering a flat 404 (group-row degrade) or an authoritative empty members:[] (member-list degrade); retry_after_ms 2000 either way. A genuine not-found (the group row does not exist) still 404s.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Management group details", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MgmtGroupDetailResponse"}}}}, "404": {"description": "Group not found"}, "503": {"description": "Management group store read degraded (group-row or member resolution failed); retry shortly (standard error envelope, retry_after_ms 2000)."}}},
@@ -2052,10 +2054,10 @@ const std::string& openapi_spec() {
 )json"
         R"json(
     "/management-groups/{id}/members": {
-      "post": {"operationId": "postManagementGroupsByIdMembers", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["agent_id"], "properties": {"agent_id": {"type": "string"}}}}}}, "summary": "Add member to management group", "tags": ["Management Groups"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"201": {"description": "Member added", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MgmtGroupMemberAddedResponse"}}}}, "400": {"description": "agent_id missing, or it holds a control byte or invalid UTF-8"}, "404": {"description": "No management group has that id; nothing is written and no audit row is added"}, "503": {"description": "Store fault: nothing was added (retryable; envelope includes retry_after_ms)"}}}
+      "post": {"operationId": "postManagementGroupsByIdMembers", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["agent_id"], "properties": {"agent_id": {"type": "string"}}}}}}, "summary": "Add member to management group", "tags": ["Management Groups"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "description": "Audit-first: an attempted audit row is stored before the member is added, and a call whose attempted row cannot be stored adds nothing. The session and the permission are checked again after that row.", "responses": {"201": {"description": "Member added. If only the closing audit row could not be stored the 201 stands and the response carries Sec-Audit-Failed: true.", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when an audit row for this request could not be stored"}}, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MgmtGroupMemberAddedResponse"}}}}, "400": {"description": "The body is not a JSON object, agent_id is missing, agent_id is over 256 bytes, or agent_id holds a control character or invalid UTF-8. Only the last is recorded, as a denied audit row (detail invalid_agent_id)."}, "404": {"description": "No management group has that id (an id over 256 bytes included) when the request is checked: nothing is written and no attempted audit row is added. A group deleted after that check is also answered 404 and writes a failure row with detail group_not_found followed by a space and the agent id."}, "503": {"description": "The group store could not answer, or could not apply the add, or the attempted audit row could not be stored, in which case the response carries Sec-Audit-Failed: true. Nothing is added in any of these. A failed read of the group before the attempted row writes no management-group audit row and no Sec-Audit-Failed. Retryable; the envelope includes retry_after_ms.", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when an audit row for this request could not be stored"}}}}}
     },
     "/management-groups/{id}/members/{agent_id}": {
-      "delete": {"operationId": "deleteManagementGroupsByIdMembersByAgentId", "summary": "Remove member from management group", "tags": ["Management Groups"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Member removed", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MgmtGroupMemberRemovedResponse"}}}}, "400": {"description": "agent_id holds a control byte or invalid UTF-8"}, "503": {"description": "Store fault: nothing was removed (retryable; envelope includes retry_after_ms)"}}}
+      "delete": {"operationId": "deleteManagementGroupsByIdMembersByAgentId", "summary": "Remove member from management group", "tags": ["Management Groups"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "description": "Audit-first: an attempted audit row is stored before the member is removed, and a call whose attempted row cannot be stored removes nothing. The session and the permission are checked again after that row. There is no check that the group or the member exists: removing an absent member, or from a group that does not exist, answers 200 and writes attempted and success audit rows for a change that did nothing.", "responses": {"200": {"description": "Member removed, or there was nothing to remove. If only the closing audit row could not be stored the 200 stands and the response carries Sec-Audit-Failed: true.", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when an audit row for this request could not be stored"}}, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MgmtGroupMemberRemovedResponse"}}}}, "400": {"description": "agent_id is over 256 bytes (no audit row), or holds a control character or invalid UTF-8 (a denied audit row, detail invalid_agent_id)"}, "404": {"description": "The group id in the path is over 256 bytes; nothing is written and no audit row is added"}, "503": {"description": "The store could not apply the removal, or the attempted audit row could not be stored, in which case the response carries Sec-Audit-Failed: true. Nothing is removed in either case; retryable, the envelope includes retry_after_ms.", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when an audit row for this request could not be stored"}}}}}
     },
     "/management-groups/{id}/roles": {
       "get": {"operationId": "getManagementGroupsByIdRoles", "summary": "List roles assigned to a management group", "tags": ["Management Groups"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "List of role assignments", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MgmtGroupRoleListResponse"}}}}}},
@@ -2401,7 +2403,7 @@ const std::string& openapi_spec() {
       "post": {"operationId": "postUsersByUsernameElevationEligibility", "summary": "Grant or revoke a user's JIT-admin-elevation eligibility", "tags": ["Users"], "description": "Admin (or an active elevation) + MFA step-up. Sets the per-user users.elevation_eligible flag. Self-grant is blocked. Granting (eligible=true) needs the caller's own administrator role: a session that is administrator only through an elevation gets 403. Setting eligible=false also terminates any in-flight elevation for that user. Errors use the standard error envelope (correlation_id + remediation).", "parameters": [{"name": "username", "in": "path", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["eligible"], "properties": {"eligible": {"type": "boolean"}}}}}}, "responses": {"200": {"description": "{status: ok}", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/UsersElevationEligibilityResult"}}}}, "400": {"description": "Invalid username or non-boolean body"}, "401": {"description": "Not authenticated, or MFA step-up required (stale/absent proof) — see meta.challenge_url"}, "403": {"description": "Not admin, or self-grant"}, "404": {"description": "User not found"}, "503": {"description": "Auth store not configured or unreachable — see --postgres-dsn"}}}
     },
     "/elevate": {
-      "post": {"operationId": "postElevate", "security": [{"cookieAuth": []}], "summary": "Activate a time-boxed JIT admin elevation on the current cookie session", "tags": ["Authentication"], "description": "Cookie session only (API/MCP tokens get 401 and can never elevate). The caller must be marked elevation-eligible and pass a fresh step-up. A local session must also have an enrolled TOTP factor (required regardless of --mfa-enforcement). An SSO (OIDC) session instead needs a login where the identity provider asserted multi-factor, with SSO elevation left enabled; local enrollment does not apply. SAML sessions cannot elevate in this release. duration_secs defaults to and is clamped by --jit-max-elevation-secs; a negative value is 400. The grant audit is fail-closed. Errors use the standard error envelope.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["justification"], "properties": {"justification": {"type": "string", "description": "Required, non-empty; control bytes sanitised; truncated to 1 KiB at a UTF-8 code-point boundary"}, "duration_secs": {"type": "integer", "minimum": 1}}}}}}, "responses": {"200": {"description": "{status: ok, expires_in: <true remaining seconds, clamped to the session's own absolute expiry>, expires_at: <RFC3339 UTC timestamp>}", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AuthElevationGranted"}}}}, "400": {"description": "Blank/missing justification, wrong-typed field, or negative duration"}, "401": {"description": "Not authenticated, no cookie (token caller), session dissolved mid-request, the session is already at/past its own absolute expiry (dead-window guard), or MFA step-up required (stale/absent proof) — see meta.challenge_url"}, "403": {"description": "Refused. The account is not marked eligible, or its eligibility or identity source could not be read or does not match the session. An SSO session lacks identity-provider multi-factor, or SSO elevation is turned off (--no-jit-oidc-amr-elevation). A local account has no enrolled TOTP factor. Or eligibility was revoked while the step-up was in progress. A SAML session is always refused in this release."}, "500": {"description": "Grant audit unrecordable. The elevation is revoked again; if that revoke also fails it stays live and unrecorded and must be revoked by hand (Sec-Audit-Failed header)"}, "503": {"description": "The persistent auth store is not available, or the second-factor store is unavailable. Retry shortly or contact an administrator."}}}
+      "post": {"operationId": "postElevate", "security": [{"cookieAuth": []}], "summary": "Activate a time-boxed JIT admin elevation on the current cookie session", "tags": ["Authentication"], "description": "Cookie session only (API/MCP tokens get 401 and can never elevate). The caller must be marked elevation-eligible and pass a fresh step-up. A local session must also have an enrolled TOTP factor (required regardless of --mfa-enforcement). An SSO (OIDC) session instead needs a login where the identity provider asserted multi-factor, with SSO elevation left enabled; local enrollment does not apply. SAML sessions cannot elevate in this release. duration_secs defaults to and is clamped by --jit-max-elevation-secs; a negative value is 400. The grant audit is fail-closed. Errors use the standard error envelope.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["justification"], "properties": {"justification": {"type": "string", "description": "Required, non-empty; control bytes sanitised; truncated to 1 KiB at a UTF-8 code-point boundary"}, "duration_secs": {"type": "integer", "minimum": 1}}}}}}, "responses": {"200": {"description": "{status: ok, expires_in: <true remaining seconds, clamped to the session's own absolute expiry>, expires_at: <RFC3339 UTC timestamp>}", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AuthElevationGranted"}}}}, "400": {"description": "Blank/missing justification, wrong-typed field, or negative duration"}, "401": {"description": "Not authenticated, no cookie (token caller), session dissolved mid-request, the session is already at/past its own absolute expiry (dead-window guard), or MFA step-up required (stale/absent proof) — see meta.challenge_url"}, "403": {"description": "Refused. The account is not marked eligible, or its eligibility or identity source could not be read or does not match the session. An SSO session lacks identity-provider multi-factor, or SSO elevation is turned off (--no-jit-oidc-amr-elevation). A local account has no enrolled TOTP factor. Or eligibility was revoked while the step-up was in progress. A SAML session is always refused in this release."}, "500": {"description": "Grant audit unrecordable. The elevation is revoked again; if that revoke also fails it stays live and unrecorded and must be revoked by hand (Sec-Audit-Failed header)"}, "503": {"description": "The persistent auth store is not available, or the second-factor state cannot be verified. Retry while error.retry_after_ms is 5000; null is no retry hint, not a promise that nothing will clear it. For a 503 that names the second-factor state, null means do not loop and follow the MFA binding enforcement runbook; run yuzu-server --mfa-reset only for an account whose factor generation is not positive, because an unenforced binding trigger or an inconclusive trigger validation is not repaired by it."}}}
     },
     "/elevate/revoke": {
       "post": {"operationId": "postElevateRevoke", "security": [{"cookieAuth": []}], "summary": "Step an active JIT elevation down early", "tags": ["Authentication"], "description": "Cookie session only; no MFA step-up (reduces privilege). 200 once the elevation is cleared, whether or not a window was active (recorded in the role.elevation.revoked audit detail); 503 if the durable clear fails, when the elevation may still be live.", "responses": {"200": {"description": "{status: ok}", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AuthElevationRevoked"}}}}, "401": {"description": "Not authenticated"}, "503": {"description": "The elevation could not be durably cleared and may still be live; retry"}}}
@@ -2514,7 +2516,7 @@ const std::string& openapi_spec() {
       "get": {"operationId": "getExecutions", "summary": "List executions, fleet-confined", "tags": ["Events"], "description": "REST v1 twin of the dashboard /fragments/executions list fragment and the MCP list_executions tool; all three return the same row shape. Gated on the fleet-read check (Execution:Read), the same check the fragment uses. Rows carry the definition name (resolved + memoized per request) and a truncated last_error_detail preview alongside the existing agents_targeted/responded/success/failure split.", "parameters": [{"name": "definition_id", "in": "query", "required": false, "schema": {"type": "string"}}, {"name": "status", "in": "query", "required": false, "schema": {"type": "string"}}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 100, "maximum": 500}}], "responses": {"200": {"description": "Execution list", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}}, "content": {"application/json": {"schema": {"type": "object", "required": ["data", "pagination", "meta"], "properties": {"data": {"type": "array", "items": {"$ref": "#/components/schemas/ExecutionListRow"}}, "meta": {"$ref": "#/components/schemas/ApiMeta"}, "pagination": {"$ref": "#/components/schemas/ApiPagination"}}}}}}, "400": {"description": "Invalid numeric query parameter"}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Execution:Read)"}, "503": {"description": "Execution tracker not initialised or degraded; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
     },
     "/executions/{id}": {
-      "get": {"operationId": "getExecutionsById", "summary": "Fetch the final state of a single execution, optional per-agent expansion", "tags": ["Events"], "description": "Companion to GET /api/v1/events: when the SSE subscribe returns 410 (execution already terminal), the worker calls this endpoint to fetch the final state in one round-trip. Mirrors the dashboard /fragments/executions/{id}/detail data but JSON-shaped. Gated by the fleet-read check (Execution:Read): an execution with no agent visible to the caller 404s identically to a nonexistent one; a confined caller's counts/last_error_detail are recomputed from only their visible agents, and scope_expression/parameter_values are redacted. The execution's dispatcher is admitted to VIEW it (avoids a false 404 on a just-dispatched execution with no responses yet) but gets the same redacted projection as any other confined caller. ?include=agents adds a confined per-agent status/duration array (agent_id/status/dispatched_at/first_response_at/completed_at/exit_code/error_detail) plus a kpi object (total/succeeded/failed/p50_ms/p95_ms) to the response; this expansion IS audited (execution.detail.fetch, REST fail-closed) because it discloses raw agent identities, unlike the bare request. Response bodies are a SEPARATE route (GET .../responses) on a different securable (Response:Read), not part of this expansion. error_detail (per agent, and last_error_detail): for a command of a Forensics-tier plugin a failure message is kept only when it is a short machine token (scope:cause[:detail], for example windows:amcache:hive_locked); any other text is replaced by the fixed value forensics_error, while status and exit_code are unchanged.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}}, {"name": "include", "in": "query", "required": false, "schema": {"type": "string", "enum": ["agents"]}, "description": "When \"agents\", adds the per-agent array + kpi object described above."}], "responses": {"200": {"description": "Final execution state, optionally with agents[]/kpi", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}}, "content": {"application/json": {"schema": {"type": "object", "required": ["data", "meta"], "properties": {"data": {"$ref": "#/components/schemas/ExecutionDetail"}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}}}}}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Execution:Read)"}, "404": {"description": "Execution not found", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Execution tracker not initialised/degraded, or (when include=agents) the execution.detail.fetch audit row could not persist; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
+      "get": {"operationId": "getExecutionsById", "summary": "Fetch the final state of a single execution, optional per-agent expansion", "tags": ["Events"], "description": "Companion to GET /api/v1/events: when the SSE subscribe returns 410 (execution already terminal), the worker calls this endpoint to fetch the final state in one round-trip. Mirrors the dashboard /fragments/executions/{id}/detail data but JSON-shaped. Gated by the fleet-read check (Execution:Read): an execution with no agent visible to the caller 404s identically to a nonexistent one; a confined caller's counts/last_error_detail are recomputed from only their visible agents, and scope_expression/parameter_values are redacted. The execution's dispatcher is admitted to VIEW it (avoids a false 404 on a just-dispatched execution with no responses yet) but gets the same redacted projection as any other confined caller. A service-scoped API token has no dispatcher admission: it sees an execution only once an agent in its service scope has a status row for it, so an execution its minting account dispatched 404s until an in-scope agent responds. ?include=agents adds a confined per-agent status/duration array (agent_id/status/dispatched_at/first_response_at/completed_at/exit_code/error_detail) plus a kpi object (total/succeeded/failed/p50_ms/p95_ms) to the response; this expansion IS audited (execution.detail.fetch, REST fail-closed) because it discloses raw agent identities, unlike the bare request. Response bodies are a SEPARATE route (GET .../responses) on a different securable (Response:Read), not part of this expansion. error_detail (per agent, and last_error_detail): for a command of a Forensics-tier plugin a failure message is kept only when it is a short machine token (scope:cause[:detail], for example windows:amcache:hive_locked); any other text is replaced by the fixed value forensics_error, while status and exit_code are unchanged.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}}, {"name": "include", "in": "query", "required": false, "schema": {"type": "string", "enum": ["agents"]}, "description": "When \"agents\", adds the per-agent array + kpi object described above."}], "responses": {"200": {"description": "Final execution state, optionally with agents[]/kpi", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}}, "content": {"application/json": {"schema": {"type": "object", "required": ["data", "meta"], "properties": {"data": {"$ref": "#/components/schemas/ExecutionDetail"}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}}}}}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Execution:Read)"}, "404": {"description": "Execution not found", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Execution tracker not initialised/degraded, or (when include=agents) the execution.detail.fetch audit row could not persist; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
     },)json"
         // Split here (MSVC C2026 ~16,380-byte per-literal cap): the merge of the Forensics
         // notes (#4990) and the typed-response schemas grew this segment past the gate ceiling.
@@ -4785,9 +4787,31 @@ void RestApiV1::register_routes(
                                  "application/json");
              });
 
-    sink.Post("/api/v1/management-groups", [auth_fn, perm_fn, audit_fn,
-                                            mgmt_store](const httplib::Request& req,
-                                                        httplib::Response& res) {
+    // A management-group write whose store call reported an error answers a
+    // retryable 503 with a fixed message (the store's libpq text is never
+    // echoed), never a 2xx. The caller writes the matching `failure` audit row.
+    const auto mgmt_write_failed = [](httplib::Response& res) {
+        res.status = 503;
+        res.set_content(
+            detail::a4_error(res, "management group store unavailable",
+                             detail::A4ErrorOpts{.retry_after_ms = mcp::kMcpStoreFaultRetryMs,
+                                                 .remediation = "retry shortly"}),
+            "application/json");
+    };
+
+    // Create is audit-first (ADR-0033 section 9, "no audit row, no mutation", #7074): the
+    // `attempted` row is stored BEFORE create_group and a row that cannot be stored refuses the
+    // create (503 + Sec-Audit-Failed). Every refusal that needs no write to decide (permission,
+    // body, `validate_new_group`) answers first and burns no row. The attempted row can wait on
+    // the audit pool, so the session and the permission are decided again after it (#3619, the
+    // dashboard's group.create_from_results twin). Failure rows carry a FIXED token and the
+    // group name the `attempted` row carries (`mgmt_group_failure_detail`), never store text; the
+    // group name (success/attempted detail) is the existing raw-name contract.
+    sink.Post("/api/v1/management-groups", [auth_fn, perm_fn, audit_fn, mgmt_store,
+                                            mgmt_write_failed,
+                                            audit_as_session = audit_as_session_fn_](
+                                               const httplib::Request& req,
+                                               httplib::Response& res) {
         if (!perm_fn(req, res, "ManagementGroup", "Write"))
             return;
         if (!mgmt_store) {
@@ -4810,17 +4834,103 @@ void RestApiV1::register_routes(
         g.membership_type = body.value("membership_type", "static");
         g.scope_expression = body.value("scope_expression", "");
 
-        auto session = auth_fn(req, res);
-        if (session)
-            g.created_by = session->username;
+        // The name and the parent id are bounded and held to clean text BEFORE any store read or
+        // `attempted` row (mgmt_group_limits.hpp): each value lands in two audit rows, and a name
+        // the unique index cannot hold would otherwise read as a retryable store fault. The
+        // refusal text is fixed, never the caller's value; nothing is written.
+        if (!mgmt_group_name_ok(g.name)) {
+            res.status = 400;
+            res.set_content(detail::a4_error(res, std::string(kMgmtGroupNameInvalidText)),
+                            "application/json");
+            return;
+        }
+        if (!mgmt_group_id_ok(g.parent_id)) { // an id like this names no group
+            res.status = 400;
+            res.set_content(detail::a4_error(res, "parent group not found"), "application/json");
+            return;
+        }
+
+        // The checks create_group runs before its insert, decided here so a refusal burns no
+        // `attempted` row. A fault of the store itself is a retryable 503, never a 400.
+        if (auto valid = mgmt_store->validate_new_group(g); !valid) {
+            if (mgmt_group_error_is_store_fault(valid.error())) {
+                mgmt_write_failed(res);
+                return;
+            }
+            res.status = 400;
+            res.set_content(detail::a4_error(res, valid.error()), "application/json");
+            return;
+        }
+
+        const auto session = auth_fn(req, res); // writes its own 401
+        if (!session)
+            return; // no caller to name: no audit row is written and nothing is created
+        g.created_by = session->username;
+        // EVERY row of this route that names the caller (the `attempted` row, the `*_revoked`
+        // failure rows and the outcome row) is stamped from the session resolved here: each can
+        // be written after the session is gone (the audit pool wait, the recheck below and
+        // create_group's pool wait), when the re-resolving `audit_fn` would stamp an empty
+        // principal and break principal-based pairing of the rows. Without a session writer
+        // wired (tests) they fall back to `audit_fn`.
+        const AuditFn bound_audit =
+            audit_as_session ? audit_as(audit_as_session, *session) : audit_fn;
+
+        if (!detail::audit_attempted(bound_audit, req, res, "management_group.create",
+                                     "ManagementGroup", "", g.name))
+            return;
+
+        // The attempted row can wait on the audit pool: authenticate and authorise again, so a
+        // session invalidated or a grant revoked during the wait creates nothing. The username
+        // is compared too: the resolver falls through its credential sources (cookie, Bearer,
+        // X-Yuzu-Token), so with the first session gone a different principal's credential on the
+        // same request would resolve, and the rows (bound to the first) would misname the actor.
+        const auto fresh_session = auth_fn(req, res);
+        if (!fresh_session || fresh_session->username != session->username) {
+            (void)detail::emit_behavioral_audit(bound_audit, req, res, "management_group.create",
+                                                "failure", "ManagementGroup", "",
+                                                mgmt_group_failure_detail("session_revoked",
+                                                                          g.name));
+            if (res.status < 400) { // auth_fn writes its own 401; cover one that did not
+                res.status = 401;
+                res.set_content(detail::a4_error(res, "authentication required"),
+                                "application/json");
+            }
+            return;
+        }
+        if (!perm_fn(req, res, "ManagementGroup", "Write")) { // writes its own 403
+            (void)detail::emit_behavioral_audit(bound_audit, req, res, "management_group.create",
+                                                "failure", "ManagementGroup", "",
+                                                mgmt_group_failure_detail("permission_revoked",
+                                                                          g.name));
+            return;
+        }
+        g.created_by = fresh_session->username;
 
         auto result = mgmt_store->create_group(g);
         if (!result) {
+            // The attempted row is stored, so it gets an outcome. The detail is a fixed token,
+            // never the store text (which can carry database error output).
+            const auto token = create_failure_token(result.error());
+            const bool fault = token == kMgmtGroupTokenStoreError;
+            (void)detail::emit_behavioral_audit(bound_audit, req, res, "management_group.create",
+                                                "failure", "ManagementGroup", "",
+                                                mgmt_group_failure_detail(token, g.name));
+            if (fault) {
+                // The cause is logged (sanitised), never returned to the caller or audited.
+                spdlog::error("management_group.create store fault: {}",
+                              ::yuzu::log_key_token(result.error()));
+                mgmt_write_failed(res);
+                return;
+            }
+            // A name conflict or a validation literal: closed text, safe to echo.
             res.status = 400;
             res.set_content(detail::a4_error(res, result.error()), "application/json");
             return;
         }
-        audit_fn(req, "management_group.create", "success", "ManagementGroup", *result, g.name);
+        // The group exists: a lost outcome row keeps the 201 and marks the response
+        // `Sec-Audit-Failed` (the `attempted` row stands as "started, outcome unknown").
+        (void)detail::emit_behavioral_audit(bound_audit, req, res, "management_group.create",
+                                            "success", "ManagementGroup", *result, g.name);
         res.status = 201;
         res.set_content(ok_json(JObj().add("id", *result).str()), "application/json");
     });
@@ -4997,36 +5107,11 @@ void RestApiV1::register_routes(
             res.set_content(ok_json(JObj().add("deleted", true).str()), "application/json");
         });
 
-    // A management-group write whose store call reported an error answers a
-    // retryable 503 with a fixed message (the store's libpq text is never
-    // echoed), never a 2xx. The caller writes the matching `failure` audit row.
-    const auto mgmt_write_failed = [](httplib::Response& res) {
-        res.status = 503;
-        res.set_content(
-            detail::a4_error(res, "management group store unavailable",
-                             detail::A4ErrorOpts{.retry_after_ms = mcp::kMcpStoreFaultRetryMs,
-                                                 .remediation = "retry shortly"}),
-            "application/json");
-    };
-
     // The member and role id fields reach a text bind: a control byte or an
     // invalid UTF-8 sequence is refused up front (400) instead of becoming a
-    // retryable store fault. Twin: mgmt_text_ok in mcp_server.cpp (same rule).
-    const auto mgmt_text_ok = [](std::string_view s) {
-        if (!rbac_text_is_clean(s))
-            return false;
-        for (std::size_t i = 0; i < s.size();) {
-            if (static_cast<unsigned char>(s[i]) < 0x80) {
-                ++i;
-                continue;
-            }
-            const std::size_t len = ::yuzu::utf8_sequence_length(s, i);
-            if (len == 0)
-                return false;
-            i += len;
-        }
-        return true;
-    };
+    // retryable store fault. Twin: mgmt_text_ok in mcp_server.cpp (the same predicate,
+    // mgmt_group_text_is_clean).
+    const auto mgmt_text_ok = [](std::string_view s) { return mgmt_group_text_is_clean(s); };
 
     // True only when the store answered authoritatively that the group does not
     // exist (a failed read is not "absent"). Used after a write failed to tell a
@@ -5050,11 +5135,57 @@ void RestApiV1::register_routes(
         res.set_content(detail::a4_error(res, "group not found"), "application/json");
     };
 
+    // The member writes are audit-first like create (ADR-0033 section 9, "no audit row, no
+    // mutation", #7074): perm, store, body and field checks, then (add only) the group-exists
+    // answer, all BEFORE any row; then the `attempted` row (503 + Sec-Audit-Failed when it cannot
+    // be stored); then the session and the permission decided AGAIN (the attempted row can wait
+    // on the audit pool), `session_revoked` / `permission_revoked` failure rows; then the
+    // mutation; then the outcome row. Failure rows carry a FIXED token and the agent id the
+    // `attempted` row carries (`mgmt_group_failure_detail`), never store text. This is the
+    // post-attempted re-check, the member twin of the one in POST /api/v1/management-groups.
+    // `bound_audit` stamps every row that names the caller (the `attempted` row, these two
+    // `*_revoked` failure rows and the outcome row) from the session the route resolved BEFORE
+    // the `attempted` row (see the create route): the re-resolving `audit_fn` would stamp an
+    // empty principal once the session is gone.
+    const auto mgmt_member_recheck = [auth_fn, perm_fn](const httplib::Request& req,
+                                                        httplib::Response& res, const char* action,
+                                                        const std::string& group_id,
+                                                        const std::string& agent_id,
+                                                        const AuditFn& bound_audit,
+                                                        const std::string& original_username) {
+        // The username is compared too: the resolver falls through its credential sources
+        // (cookie, Bearer, X-Yuzu-Token), so with the original session gone a different
+        // principal's credential on the same request would resolve, and the rows (bound to the
+        // original session) would misname the actor. A different principal counts as revoked.
+        const auto fresh = auth_fn(req, res);
+        if (!fresh || fresh->username != original_username) {
+            (void)detail::emit_behavioral_audit(bound_audit, req, res, action, "failure",
+                                                "ManagementGroup", group_id,
+                                                mgmt_group_failure_detail("session_revoked",
+                                                                          agent_id));
+            if (res.status < 400) { // auth_fn writes its own 401; cover one that did not
+                res.status = 401;
+                res.set_content(detail::a4_error(res, "authentication required"),
+                                "application/json");
+            }
+            return false;
+        }
+        if (!perm_fn(req, res, "ManagementGroup", "Write")) { // writes its own 403
+            (void)detail::emit_behavioral_audit(bound_audit, req, res, action, "failure",
+                                                "ManagementGroup", group_id,
+                                                mgmt_group_failure_detail("permission_revoked",
+                                                                          agent_id));
+            return false;
+        }
+        return true;
+    };
+
     // Members
     sink.Post(R"(/api/v1/management-groups/([a-f0-9]+)/members)",
-              [perm_fn, audit_fn, mgmt_store, mgmt_write_failed, mgmt_text_ok,
-               mgmt_group_confirmed_absent, mgmt_group_not_found](const httplib::Request& req,
-                                                                  httplib::Response& res) {
+              [auth_fn, perm_fn, audit_fn, mgmt_store, mgmt_write_failed, mgmt_text_ok,
+               mgmt_group_confirmed_absent, mgmt_group_not_found, mgmt_member_recheck, auth_db,
+               audit_as_session = audit_as_session_fn_](const httplib::Request& req,
+                                                        httplib::Response& res) {
                   if (!perm_fn(req, res, "ManagementGroup", "Write"))
                       return;
                   if (!mgmt_store) {
@@ -5064,6 +5195,10 @@ void RestApiV1::register_routes(
                   }
 
                   auto group_id = req.matches[1].str();
+                  if (group_id.size() > kMgmtGroupIdMaxBytes) { // names no group; no row
+                      mgmt_group_not_found(res);
+                      return;
+                  }
                   auto body = nlohmann::json::parse(req.body, nullptr, false);
                   if (body.is_discarded() || !body.is_object()) {
                       res.status = 400;
@@ -5077,6 +5212,16 @@ void RestApiV1::register_routes(
                       res.set_content(detail::a4_error(res, "agent_id required"), "application/json");
                       return;
                   }
+                  // Bounded before anything else reads or records it (mgmt_group_limits.hpp):
+                  // no row, fixed text. An id within the bound that holds a control byte or
+                  // invalid UTF-8 keeps its `denied` row below.
+                  if (!mgmt_group_agent_id_length_ok(agent_id)) {
+                      res.status = 400;
+                      res.set_content(
+                          detail::a4_error(res, std::string(kMgmtGroupAgentIdTooLongText)),
+                          "application/json");
+                      return;
+                  }
                   if (!mgmt_text_ok(agent_id)) {
                       audit_fn(req, "management_group.add_member", "denied", "ManagementGroup",
                                group_id, "invalid_agent_id");
@@ -5085,29 +5230,79 @@ void RestApiV1::register_routes(
                                       "application/json");
                       return;
                   }
-                  if (auto added = mgmt_store->add_member(group_id, agent_id); !added) {
-                      // A well-formed id naming no group fails the membership foreign
-                      // key: answer 404 (no failure row, no retry hint), not a retryable 503.
-                      if (mgmt_group_confirmed_absent(mgmt_store, group_id)) {
-                          mgmt_group_not_found(res);
-                          return;
-                      }
-                      spdlog::warn("management_group.add_member store failure: {}", added.error());
-                      audit_fn(req, "management_group.add_member", "failure", "ManagementGroup",
-                               group_id, "store_error");
+                  // A well-formed id naming no group is a 404 BEFORE any row is written (a
+                  // refusal burns no `attempted` row); an unreadable group is a store fault,
+                  // never "absent".
+                  const auto exists = mgmt_store->get_group_checked(group_id);
+                  if (!exists) {
+                      spdlog::warn("management_group.add_member group read failure: {}",
+                                   ::yuzu::log_key_token(exists.error()));
                       mgmt_write_failed(res);
                       return;
                   }
-                  audit_fn(req, "management_group.add_member", "success", "ManagementGroup",
-                           group_id, agent_id);
+                  if (!exists->has_value()) {
+                      mgmt_group_not_found(res);
+                      return;
+                  }
+                  // Does the server hold an enrolment record for this id? A read, made after the
+                  // group-exists answer and before the `attempted` row. It only FLAGS the id, on
+                  // the success audit row; it is never returned (a response field would reveal
+                  // enrolment status to a caller whose scope hides the device). An unknown id is
+                  // accepted (an operator may stage a membership ahead of the device) and no lookup
+                  // outcome refuses the add. Unreadable is recorded as neither known nor unknown.
+                  const AgentKnown agent_known = lookup_agent_known(auth_db, agent_id);
+                  // The session every row names, the `attempted` row included, resolved before it
+                  // (see the create route): each is stamped from it.
+                  const auto session = auth_fn(req, res); // writes its own 401
+                  if (!session)
+                      return;
+                  const AuditFn bound_audit =
+                      audit_as_session ? audit_as(audit_as_session, *session) : audit_fn;
+                  if (!detail::audit_attempted(bound_audit, req, res, "management_group.add_member",
+                                               "ManagementGroup", group_id, agent_id))
+                      return;
+                  if (!mgmt_member_recheck(req, res, "management_group.add_member", group_id,
+                                           agent_id, bound_audit, session->username))
+                      return;
+                  if (auto added = mgmt_store->add_member(group_id, agent_id); !added) {
+                      // The group vanished between the check above and the insert (the
+                      // membership foreign key failed): 404 and no retry hint, as before, and
+                      // a `failure` outcome row with a fixed token so the `attempted` row is
+                      // never left without one.
+                      if (mgmt_group_confirmed_absent(mgmt_store, group_id)) {
+                          (void)detail::emit_behavioral_audit(
+                              bound_audit, req, res, "management_group.add_member", "failure",
+                              "ManagementGroup", group_id,
+                              mgmt_group_failure_detail("group_not_found", agent_id));
+                          mgmt_group_not_found(res);
+                          return;
+                      }
+                      spdlog::warn("management_group.add_member store failure: {}",
+                                   ::yuzu::log_key_token(added.error()));
+                      (void)detail::emit_behavioral_audit(bound_audit, req, res,
+                                                          "management_group.add_member", "failure",
+                                                          "ManagementGroup", group_id,
+                                                          mgmt_group_failure_detail("store_error",
+                                                                                    agent_id));
+                      mgmt_write_failed(res);
+                      return;
+                  }
+                  // The member is added: a lost outcome row keeps the 201 and marks the response
+                  // `Sec-Audit-Failed` (the `attempted` row stands as "started, outcome unknown").
+                  // The success row's detail ends with the `agent_known=` flag (see
+                  // mgmt_group_agent_known.hpp for how a reader takes it).
+                  (void)detail::emit_behavioral_audit(
+                      bound_audit, req, res, "management_group.add_member", "success",
+                      "ManagementGroup", group_id, add_member_success_detail(agent_id, agent_known));
                   res.status = 201;
                   res.set_content(ok_json(JObj().add("added", true).str()), "application/json");
               });
 
     sink.Delete(
         R"(/api/v1/management-groups/([a-f0-9]+)/members/(.+))",
-        [perm_fn, audit_fn, mgmt_store, mgmt_write_failed,
-         mgmt_text_ok](const httplib::Request& req, httplib::Response& res) {
+        [auth_fn, perm_fn, audit_fn, mgmt_store, mgmt_write_failed, mgmt_text_ok,
+         mgmt_member_recheck, audit_as_session = audit_as_session_fn_](const httplib::Request& req,
+                                                                      httplib::Response& res) {
             if (!perm_fn(req, res, "ManagementGroup", "Write"))
                 return;
             if (!mgmt_store) {
@@ -5118,6 +5313,18 @@ void RestApiV1::register_routes(
 
             auto group_id = req.matches[1].str();
             auto agent_id = req.matches[2].str();
+            if (group_id.size() > kMgmtGroupIdMaxBytes) { // names no group; no row
+                res.status = 404;
+                res.set_content(detail::a4_error(res, "group not found"), "application/json");
+                return;
+            }
+            // No row; an unclean id keeps its denied row.
+            if (!mgmt_group_agent_id_length_ok(agent_id)) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, std::string(kMgmtGroupAgentIdTooLongText)),
+                                "application/json");
+                return;
+            }
             if (!mgmt_text_ok(agent_id)) {
                 audit_fn(req, "management_group.remove_member", "denied", "ManagementGroup",
                          group_id, "invalid_agent_id");
@@ -5126,15 +5333,35 @@ void RestApiV1::register_routes(
                                 "application/json");
                 return;
             }
+            // Idempotent as before: removing an absent member (or from an absent group) is a
+            // success, so there is no group-exists answer here, only the audit-first order.
+            // The session every row names, the `attempted` row included, resolved before it (see
+            // the create route).
+            const auto session = auth_fn(req, res); // writes its own 401
+            if (!session)
+                return;
+            const AuditFn bound_audit =
+                audit_as_session ? audit_as(audit_as_session, *session) : audit_fn;
+            if (!detail::audit_attempted(bound_audit, req, res, "management_group.remove_member",
+                                         "ManagementGroup", group_id, agent_id))
+                return;
+            if (!mgmt_member_recheck(req, res, "management_group.remove_member", group_id,
+                                     agent_id, bound_audit, session->username))
+                return;
             if (auto removed = mgmt_store->remove_member(group_id, agent_id); !removed) {
-                spdlog::warn("management_group.remove_member store failure: {}", removed.error());
-                audit_fn(req, "management_group.remove_member", "failure", "ManagementGroup",
-                         group_id, "store_error");
+                spdlog::warn("management_group.remove_member store failure: {}",
+                             ::yuzu::log_key_token(removed.error()));
+                (void)detail::emit_behavioral_audit(bound_audit, req, res,
+                                                    "management_group.remove_member", "failure",
+                                                    "ManagementGroup", group_id,
+                                                    mgmt_group_failure_detail("store_error",
+                                                                              agent_id));
                 mgmt_write_failed(res);
                 return;
             }
-            audit_fn(req, "management_group.remove_member", "success", "ManagementGroup", group_id,
-                     agent_id);
+            (void)detail::emit_behavioral_audit(bound_audit, req, res,
+                                                "management_group.remove_member", "success",
+                                                "ManagementGroup", group_id, agent_id);
             res.set_content(ok_json(JObj().add("removed", true).str()), "application/json");
         });
 
@@ -12586,6 +12813,7 @@ void RestApiV1::register_routes(
 
             yuzu::server::ExecutionScope scope_arg; // nullopt = unrestricted
             std::string username;
+            yuzu::server::ExecutionOwnerKey owner; // empty unless a confined, resolved session
             if (gate.scope) {
                 auto session = auth_fn(req, res);
                 if (!session)
@@ -12603,10 +12831,8 @@ void RestApiV1::register_routes(
                         "application/json");
                     return;
                 }
-                yuzu::server::ExecutionListScope s;
-                s.owner = username;
-                s.visible_agents.assign(gate.scope->begin(), gate.scope->end());
-                scope_arg = std::move(s);
+                owner = execution_owner_key(*session);
+                scope_arg = confined_list_scope(owner, gate.scope);
             }
 
             auto execs_opt = execution_tracker->query_executions_checked(q, scope_arg);
@@ -12659,7 +12885,7 @@ void RestApiV1::register_routes(
                     auto it = statuses_opt->find(e.id);
                     const auto& statuses =
                         it != statuses_opt->end() ? it->second : kEmptyStatuses;
-                    if (!execution_visible(e, statuses, gate.scope, username))
+                    if (!execution_visible(e, statuses, gate.scope, owner))
                         continue;
                     auto counts = confined_projection(statuses, gate.scope);
                     ExecutionListRow row;
@@ -13509,8 +13735,10 @@ void RestApiV1::register_routes(
                 for (const auto& a : agents)
                     has_visible_agent = authz::in_scope(gate.scope, a.agent_id) || has_visible_agent;
             }
+            // #5557: the ownership disjunct takes the owner KEY, never the raw username (a
+            // service-scoped session's username is its minter's).
             const bool owns_execution =
-                exec_opt && exec_opt->dispatched_by == session->username;
+                exec_opt && execution_owner_key(*session).owns(*exec_opt);
             const bool visible = !gate.scope || owns_execution || has_visible_agent;
             if (!exec_opt || !visible) {
                 // #1634 (governance Gate 4 consistency-auditor finding): a
@@ -13689,6 +13917,7 @@ void RestApiV1::register_routes(
 
             auto exec_id = req.matches[1].str();
             std::string username;
+            yuzu::server::ExecutionOwnerKey owner; // empty unless a confined, resolved session
             yuzu::server::ExecutionScope scope_arg; // nullopt = unrestricted
             if (gate.scope) {
                 auto session = auth_fn(req, res);
@@ -13715,10 +13944,8 @@ void RestApiV1::register_routes(
                 // the cap-before-scope defect where an invisible sibling
                 // could displace this caller's own visible children out of
                 // the capped window.
-                yuzu::server::ExecutionListScope s;
-                s.owner = username;
-                s.visible_agents.assign(gate.scope->begin(), gate.scope->end());
-                scope_arg = std::move(s);
+                owner = execution_owner_key(*session);
+                scope_arg = confined_list_scope(owner, gate.scope);
             }
 
             auto exec_r = execution_tracker->get_execution_checked(exec_id);
@@ -13746,7 +13973,7 @@ void RestApiV1::register_routes(
 
             const bool parent_visible =
                 exec_opt.has_value() &&
-                execution_visible(*exec_opt, parent_statuses, gate.scope, username);
+                execution_visible(*exec_opt, parent_statuses, gate.scope, owner);
             if (!exec_opt || !parent_visible) {
                 // #3789: audit ONLY under an engaged scope -- matches the
                 // legacy route's identical rationale (compliance-officer F2).
@@ -13795,7 +14022,7 @@ void RestApiV1::register_routes(
                     auto it = child_statuses_opt->find(c.id);
                     const auto& c_statuses =
                         it != child_statuses_opt->end() ? it->second : kEmptyStatuses;
-                    if (!execution_visible(c, c_statuses, gate.scope, username))
+                    if (!execution_visible(c, c_statuses, gate.scope, owner))
                         continue;
                     arr.add_raw(execution_child_row_json(c).dump());
                 }
@@ -14009,6 +14236,8 @@ void RestApiV1::register_routes(
             mreq.what = ExecutionMutation::kCancel;
             mreq.execution_id = req.matches[1].str();
             mreq.username = session->username;
+            // #5557: admission key; `username` stays the real audit identity.
+            mreq.owner = execution_owner_key(*session);
             mreq.scope = gate.scope;
             mreq.audit_context = "surface=rest-v1 cid=" + cid;
             const auto outcome = apply_execution_mutation(
@@ -14108,6 +14337,7 @@ void RestApiV1::register_routes(
             if (!session)
                 return; // auth_fn wrote the 401.
             mreq.username = session->username;
+            mreq.owner = execution_owner_key(*session); // #5557: see the cancel arm
             const auto outcome = apply_execution_mutation(
                 execution_mutation_ports, mreq,
                 [&](const std::string& action, const std::string& result,
@@ -16123,7 +16353,7 @@ void RestApiV1::register_routes(
         // SQL is sandboxed AGENT-side by EchoDatabase::execute_user_query
         // (read-only authorizer, #760/#631) — the server only length-checks.
         sink.Post("/api/v1/result-sets/from-echo-query",
-                  [auth_fn, perm_fn, rs_err, run_async](const httplib::Request& req,
+                  [auth_fn, perm_fn, audit_fn, rs_err, run_async](const httplib::Request& req,
                                                httplib::Response& res) {
                       auto session = auth_fn(req, res);
                       if (!session)
@@ -16159,17 +16389,28 @@ void RestApiV1::register_routes(
                       std::string sql =
                           (body.contains("sql") && body["sql"].is_string()) ? body.value("sql", "")
                                                                              : "";
+                      // #1162: a refused SQL is audited (the text is never put in the detail),
+                      // so a probing operator leaves a trail; a body that is not JSON still is not.
                       if (sql.empty()) {
+                          (void)detail::emit_behavioral_audit(
+                              audit_fn, req, res, "result_set.create", "denied", "ResultSet", "",
+                              "reason=sql_missing source_kind=echo_query");
                           rs_err(res, 400, "RESULT_SET_BAD_REQUEST: 'sql' is required");
                           return;
                       }
                       if (sql.size() > 100000) {
+                          (void)detail::emit_behavioral_audit(
+                              audit_fn, req, res, "result_set.create", "denied", "ResultSet", "",
+                              "reason=sql_too_large source_kind=echo_query");
                           rs_err(res, 400, "RESULT_SET_BAD_REQUEST: 'sql' exceeds 100 KiB");
                           return;
                       }
                       // Roll-up is the only Echo store: a query over a raw capture table
                       // answers with no rows, so the set would silently be empty.
                       if (yuzu::server::rs_matcher::references_raw_capture_table(sql)) {
+                          (void)detail::emit_behavioral_audit(
+                              audit_fn, req, res, "result_set.create", "denied", "ResultSet", "",
+                              "reason=stale_source source_kind=echo_query");
                           rs_err(res, 400, std::string(yuzu::server::rs_matcher::kStaleSourceMessage));
                           return;
                       }
@@ -16224,7 +16465,7 @@ void RestApiV1::register_routes(
         // (column/op/value — design §3.2, applied by the maintenance thread via
         // rs_matcher). Mirrors the Chrome-IR hash-check step (design §10).
         sink.Post("/api/v1/result-sets/from-instruction-result",
-                  [auth_fn, perm_fn, rs_err, instruction_store, run_async](const httplib::Request& req,
+                  [auth_fn, perm_fn, audit_fn, rs_err, instruction_store, run_async](const httplib::Request& req,
                                                                   httplib::Response& res) {
                       auto session = auth_fn(req, res);
                       if (!session)
@@ -16396,6 +16637,9 @@ void RestApiV1::register_routes(
                           yuzu::server::rs_matcher::instruction_reads_raw_capture_table(
                               body.value("params", nlohmann::json::object()),
                               def.parameter_schema)) {
+                          (void)detail::emit_behavioral_audit(
+                              audit_fn, req, res, "result_set.create", "denied", "ResultSet", "",
+                              "reason=stale_source source_kind=instruction_result");
                           rs_err(res, 400, std::string(yuzu::server::rs_matcher::kStaleSourceMessage));
                           return;
                       }
@@ -16590,7 +16834,11 @@ void RestApiV1::register_routes(
                               (sp.is_object() && sp.contains("sql") && sp["sql"].is_string())
                                   ? sp.value("sql", "")
                                   : "";
+                          // #1162: the three refusals below are audited like parent_gone above.
                           if (sql.empty()) {
+                              (void)detail::emit_behavioral_audit(
+                                  audit_fn, req, res, "result_set.create", "denied", "ResultSet",
+                                  id, "reason=sql_missing source_kind=echo_query");
                               rs_err(res, 400, "RESULT_SET_BAD_REQUEST: original carries no SQL");
                               return;
                           }
@@ -16601,12 +16849,18 @@ void RestApiV1::register_routes(
                           // an oversized SQL payload past the dedicated body cap that
                           // exists specifically for this field.
                           if (sql.size() > 100000) {
+                              (void)detail::emit_behavioral_audit(
+                                  audit_fn, req, res, "result_set.create", "denied", "ResultSet",
+                                  id, "reason=sql_too_large source_kind=echo_query");
                               rs_err(res, 400, "RESULT_SET_BAD_REQUEST: 'sql' exceeds 100 KiB");
                               return;
                           }
                           // A set stored over a raw capture table would re-run to an empty
                           // membership with no error: refuse it, nothing is dispatched.
                           if (yuzu::server::rs_matcher::references_raw_capture_table(sql)) {
+                              (void)detail::emit_behavioral_audit(
+                                  audit_fn, req, res, "result_set.create", "denied", "ResultSet",
+                                  id, "reason=stale_source source_kind=echo_query");
                               rs_err(res, 400, std::string(yuzu::server::rs_matcher::kStaleSourceMessage));
                               return;
                           }
@@ -16707,6 +16961,9 @@ void RestApiV1::register_routes(
                               yuzu::server::rs_matcher::instruction_reads_raw_capture_table(
                                   sp.value("params", nlohmann::json::object()),
                                   def->parameter_schema)) {
+                              (void)detail::emit_behavioral_audit(
+                                  audit_fn, req, res, "result_set.create", "denied", "ResultSet",
+                                  id, "reason=stale_source source_kind=instruction_result");
                               rs_err(res, 400, std::string(yuzu::server::rs_matcher::kStaleSourceMessage));
                               return;
                           }
@@ -22580,8 +22837,8 @@ void RestApiV1::register_routes(
             for (const auto& a : *agents_opt)
                 has_visible_agent = authz::in_scope(gate.scope, a.agent_id) || has_visible_agent;
         }
-        const bool owns_execution =
-            exec_opt && exec_opt->dispatched_by == session->username;
+        // #5557: the ownership disjunct takes the owner KEY, never the raw username.
+        const bool owns_execution = exec_opt && execution_owner_key(*session).owns(*exec_opt);
         const bool visible = !gate.scope || owns_execution || has_visible_agent;
         if (!exec_opt || !visible) {
             // Keep nonexistent and outside-scope cases caller-identical. The

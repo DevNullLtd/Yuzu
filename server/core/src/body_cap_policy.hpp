@@ -62,10 +62,11 @@
 /// cap. Chunked request bodies are legal HTTP, and this repo does not
 /// control every client that will ever talk to these routes, so the bit
 /// DEFAULTS OFF and is opted into per class, not per table. It is ON for
-/// six classes: `/mcp/` (that surface's own protocol/client contract already requires
+/// seven classes: `/mcp/` (that surface's own protocol/client contract already requires
 /// `Content-Length` on every framed body - see `web_utils.hpp:577`'s
 /// `mcp_body_unmeasurable` rationale - so refusing an unmeasurable MCP body
-/// costs a conforming client nothing), `upload_session`, `hardware` (the
+/// costs a conforming client nothing), `upload_session`, `upload_commit` (a carve-out of
+/// `upload_session`'s subtree that keeps its framing rule), `hardware` (the
 /// Hardware CI routes carry only a tiny JSON body from the dashboard and API
 /// callers), `dex_score_policy` (one JSON document, capped by its handler),
 /// `dex_score_policy_form` (the DEX Scoring tab's three form POSTs, the same reason) and `commands`
@@ -81,10 +82,10 @@
 /// KNOWN LIMITATION, recorded deliberately, not implied away: because of the
 /// default above, a chunked or Content-Length-less body is NOT refused BEFORE
 /// BEING READ on any class that keeps `requires_measurable` off (all but the
-/// five listed above); this table's pre-routing chokepoint
+/// seven listed above); this table's pre-routing chokepoint
 /// admits it, up to httplib's own 100 MiB backstop, without checking this
 /// table's cap at all. A comment or doc that says chunked bodies are
-/// "refused" without naming all five classes that require a measurable body is wrong.
+/// "refused" without naming all seven classes that require a measurable body is wrong.
 /// This is a recorded adjudication, not an oversight — see the paragraph
 /// above for why — kept in sync with `docs/user-manual/rest-api.md` "Pre-Auth
 /// Request Body Caps".
@@ -144,14 +145,26 @@
 /// without a real contract to measure against, and do not read their
 /// presence as license to guess a number for any OTHER class; every other
 /// entry below mirrors a cited, decoded-equals-raw byte count exactly. A
-/// THIRD, distinct category — `ota_upload` and `json_to_csv_export` — is
-/// pinned at httplib's own 100 MiB backstop rather than squeezed OR given a
-/// judgment-call MiB number: both carry content whose legitimate size is a
-/// direct function of something this table cannot bound (an installer
-/// binary's real size; an export's size following directly from the
-/// operator's own prior query), so there is no smaller number to reason
-/// toward — the entry's only job is making that an explicit, reviewed
-/// decision instead of an accidental fallthrough to the catch-all.
+/// THIRD, distinct category — `ota_upload` — is pinned at httplib's own
+/// 100 MiB backstop rather than squeezed OR given a judgment-call MiB
+/// number: an installer binary's real size is something this table cannot
+/// bound, so there is no smaller number to reason toward — the entry's only
+/// job is making that an explicit, reviewed decision instead of an
+/// accidental fallthrough to the catch-all. (`json_to_csv_export` left this
+/// category: it is parsed into a tree 16 to 27 times its size, so #2146
+/// lowered it to 16 MiB and gave it a value budget.)
+///
+/// JSON VALUE BUDGET (#2146). A size cap does not bound a parse tree: a body
+/// of `[],[],...` builds one 16 to 27 times its size. Every row therefore
+/// states `max_json_values`, counted on the raw text by `run_post_read_stage`
+/// before any handler parses (`json_value_budget.hpp`), or `kJsonValuesOff`.
+/// Two classes are NOT scanned centrally although their JSON form is
+/// parsed: `workflow_yaml` and `product_pack_yaml`, whose other form is raw
+/// YAML text (a count of `[`, `{` and `,` over YAML prose would refuse real
+/// documents, and the stage keys on the route class, never on Content-Type).
+/// Their JSON form (`{"yaml_source": ...}`) is bounded in the handler,
+/// `kYamlEnvelopeMaxJsonValues` in workflow_routes.cpp: a recorded exception
+/// to "this table is the one place", pinned by a test there.
 namespace yuzu::server {
 
 /// Sentinel method value meaning "matches every HTTP method". Used ONLY
@@ -161,7 +174,21 @@ namespace yuzu::server {
 /// default.
 inline constexpr std::string_view kBodyCapAnyMethod = "*";
 
-/// One `{method, path-prefix}` -> `{cap, requires_measurable, metric label}`
+/// `BodyCapEntry::max_json_values` for a class whose body is NOT scanned: not JSON (an upload, a
+/// form, a YAML document), or capped at 1 MiB or less, where even a body of `[],[],...` builds a
+/// tree of at most about 35 MiB. Every row with a cap above 1 MiB that uses this is named in
+/// `test_body_cap_policy.cpp` (a new such row must be a reviewed decision, not an omission).
+inline constexpr std::size_t kJsonValuesOff = 0;
+/// The budget of a JSON class with no tighter contract: the catch-all default. A body of
+/// `[],[],...` at the 4 MiB catch-all cap would otherwise reach about 2.8 million values, a tree of
+/// 65 to 110 MiB per request.
+inline constexpr std::size_t kJsonValuesDefault = 100'000;
+/// The MCP JSON-RPC envelope and `POST /api/v1/result-sets`: `create_result_set`'s `device_ids`
+/// admits 100000 members (`kMaxMembersPerSet`), the largest legitimate body, plus headroom for the
+/// arbitrary `source_payload`. The envelope is held as 2 to 3 live trees per request.
+inline constexpr std::size_t kJsonValuesMcp = 200'000;
+
+/// One `{method, path-prefix}` -> `{cap, requires_measurable, metric label, json budget}`
 /// row.
 struct BodyCapEntry {
     /// Exact HTTP method (e.g. "POST"), or `kBodyCapAnyMethod`.
@@ -179,6 +206,13 @@ struct BodyCapEntry {
     /// is its own DoS surface). Also the label source of
     /// `yuzu_server_csrf_denied_total` (same_site_write_gate.hpp).
     std::string_view path_class;
+    /// The most structural JSON values (`[`, `{`, `,` outside a string literal) the body of this
+    /// class may hold, counted on the raw text by `run_post_read_stage` BEFORE any handler parses
+    /// it (413 over the budget), or `kJsonValuesOff` for a body that is not scanned. Required on
+    /// every row, never defaulted: an omitted decision is how a 70 MiB route ended up with no
+    /// breadth bound. The body size cap does not bound a parse tree (a body of `[],[],...` builds a
+    /// tree 16 to 27 times its size); this does. See `json_value_budget.hpp`.
+    std::size_t max_json_values;
 };
 
 /// THE table. Longest matching `path_prefix` wins among entries whose
@@ -192,7 +226,7 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // teardown), not just POST. requires_measurable=true: MCP's own client
     // contract already requires Content-Length (web_utils.hpp:577).
     // Source: mcp_jsonrpc.hpp:63 (kMcpMaxRequestBodyBytes).
-    {kBodyCapAnyMethod, "/mcp/", 4u * 1024 * 1024, true, "mcp"},
+    {kBodyCapAnyMethod, "/mcp/", 4u * 1024 * 1024, true, "mcp", kJsonValuesMcp},
 
     // POST /api/v1/bundles — live-query bundle dispatch (rest_api_v1.cpp:1417).
     // bundle_service.hpp:24-33 admits up to kMaxBundleSteps(32) steps x
@@ -202,13 +236,14 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // leaves ~6 MiB of headroom above that computed 64 MiB floor. A 4 MiB
     // default (the catch-all below) would break this route outright — do
     // not "simplify" this entry away.
-    {"POST", "/api/v1/bundles", 70u * 1024 * 1024, false, "bundles"},
+    {"POST", "/api/v1/bundles", 70u * 1024 * 1024, false, "bundles", 5'000},
     // /api/v1/uploads — the PR1.6a authenticated chunked-receive surface
-    // (session open POST, chunk PUT, status GET, commit POST, cancel DELETE).
+    // (session open POST, chunk PUT, status GET, cancel DELETE; the commit POST is carved out into
+    // `upload_commit` below).
     // ANY method: only the chunk PUT carries a large body, but scoping to PUT
     // would silently drop every sibling verb on this prefix to the catch-all
     // (rule 4 in the routed-concern row: a mutating route needs its own entry or a
-    // reviewed catch-all decision). Any-method rows are preferred. Cap = the
+    // reviewed catch-all decision). Cap = the
     // protocol's own per-chunk maximum, `upload_grant::kDefaultChunkMaxBytes`
     // (upload_grant_parsers.hpp; bound by a static_assert in
     // file_retrieval_routes.cpp so the two cannot drift). requires_measurable
@@ -220,7 +255,21 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // protocol's Content-Range header), so this refuses no conforming client.
     // Bodyless GET/DELETE on this prefix are unaffected: the measurability
     // rule fires only for POST/PUT/PATCH (web_utils.hpp body_unmeasurable).
-    {kBodyCapAnyMethod, "/api/v1/uploads", 8u * 1024 * 1024, true, "upload_session"},
+    {kBodyCapAnyMethod, "/api/v1/uploads", 8u * 1024 * 1024, true, "upload_session", kJsonValuesOff},
+    // POST /api/v1/uploads/{id}/commit — the one JSON body under the upload subtree: `{"sha256":
+    // "<hex>"}` (file_retrieval_routes.cpp parses it with nlohmann::json). The row above matches by
+    // prefix and admits 8 MiB of CHUNK bytes for any method, so without this one the commit POST
+    // inherited 8 MiB with no value budget: a body of `[],[],...` built a tree 16 to 27 times its size
+    // (#2146 review). 4 KiB is generous for a 64-hex-digit field, which bounds the tree at about
+    // 100 KB, so no value budget is needed (a cap at or below 1 MiB is not scanned). POST only: the
+    // chunk PUT keeps the row above. The trailing slash keeps the exact `POST /api/v1/uploads`
+    // (session open, headers only) on that row (the longer prefix wins). A NEW POST route under
+    // `/api/v1/uploads/` inherits this 4 KiB: give it its own row if its body is larger.
+    // requires_measurable=true, as on the row above, which this commit POST previously resolved to:
+    // the pre-routing gate refuses a chunked or undeclared body with 411 BEFORE httplib buffers it,
+    // so the carve-out must not weaken that (an unmeasurable body here would otherwise be read in
+    // full, up to httplib's 100 MiB backstop, before the post-read cap refused it).
+    {"POST", "/api/v1/uploads/", 4u * 1024, true, "upload_commit", kJsonValuesOff},
     // /api/v1/plugin-config — the PR1.5 config/secret/kill-switch plane. The
     // store's own grammar caps a config value at 8 KiB and a secret plaintext
     // at 64 KiB (plugin_config_parsers.hpp kMaxConfigValueBytes/
@@ -229,7 +278,7 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // unauthenticated flood against this surface two orders of magnitude
     // under the 4 MiB catch-all. ANY method — PUT config/secret writes,
     // DELETE carries no body, GET/list are bodyless.
-    {kBodyCapAnyMethod, "/api/v1/plugin-config", 256u * 1024, false, "plugin_config"},
+    {kBodyCapAnyMethod, "/api/v1/plugin-config", 256u * 1024, false, "plugin_config", kJsonValuesOff},
 
     // POST /api/settings/updates/upload — OTA agent binary upload
     // (settings_routes.cpp:5146 handler start, :5206 the unbounded file
@@ -238,26 +287,21 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // backstop rather than squeeze a legitimate multi-ten-MB installer
     // binary. This entry exists so the class is an explicit, reviewed
     // decision rather than an accidental fallthrough to the catch-all.
-    {"POST", "/api/settings/updates/upload", 100u * 1024 * 1024, false, "ota_upload"},
+    {"POST", "/api/settings/updates/upload", 100u * 1024 * 1024, false, "ota_upload", kJsonValuesOff},
 
     // POST /api/export/json-to-csv — generic JSON-array-to-CSV export
     // (server.cpp:10809; the entire raw body is handed to
-    // `data_export::json_array_to_csv` verbatim). Unbounded BY DESIGN: this
-    // converts a full exported dataset (responses, audit rows, inventory —
-    // whatever REST query the caller ran) to CSV, and there is no natural
-    // "this export is too big" line to draw; a large legitimate export is
-    // the expected case, not an abuse case. Choice made here: an EXPLICIT
-    // entry pinned at httplib's own 100 MiB backstop, mirroring the
-    // ota_upload treatment immediately above — NOT squeezed to a judgment-
-    // call MiB number, because unlike guardian_rule_authoring/workflow_yaml/
-    // product_pack_yaml (arbitrary but SINGLE-DOCUMENT content, where a
-    // generous MiB-scale cap is a defensible judgment call) an export's
-    // size is a direct, unbounded function of how much data the operator's
-    // own prior query returned — there is no analogous "one document" scale
-    // to be generous relative to. This entry's only job is to make that a
-    // reviewed decision instead of an accidental fallthrough to the 4 MiB
-    // catch-all, which would break real exports outright.
-    {"POST", "/api/export/json-to-csv", 100u * 1024 * 1024, false, "json_to_csv_export"},
+    // `data_export::json_array_to_csv` verbatim). This converts an exported
+    // dataset (responses, audit rows, inventory — whatever REST query the
+    // caller ran) to CSV. It was pinned at httplib's 100 MiB backstop on the
+    // reasoning that an export's size has no natural line, but the raw body is
+    // PARSED into an nlohmann tree 16 to 27 times its size, so 100 MiB was a
+    // 1.6 to 2.7 GiB allocation per request (#2146). Chosen:
+    // 16 MiB (a tree of at most about 430 MiB) plus a value budget of one
+    // million values (about 100 MiB of tree); a larger export is split into
+    // several requests. A streaming (`json::sax_parse`) rewrite would lift the
+    // limit and is a follow-up.
+    {"POST", "/api/export/json-to-csv", 16u * 1024 * 1024, false, "json_to_csv_export", 1'000'000},
 
     // POST /api/nvd/match — software-inventory vulnerability match
     // (server.cpp:9258; parses a JSON body's `inventory` array of
@@ -274,19 +318,19 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // this specific content's realistic scale, not borrowed from the
     // arbitrary-YAML judgment-call classes below; still two orders of
     // magnitude below httplib's 100 MiB backstop.
-    {"POST", "/api/nvd/match", 8u * 1024 * 1024, false, "nvd_match"},
+    {"POST", "/api/nvd/match", 8u * 1024 * 1024, false, "nvd_match", 600'000},
 
     // POST /api/v1/ca/import-chain — subordinate CA chain import, JSON body
     // (ca_routes.cpp:24 kMaxImportBody, enforced at :516). Mirrors the
     // handler's own 256 KiB bound exactly, so this pre-routing gate never
     // rejects anything the handler itself would still admit.
-    {"POST", "/api/v1/ca/import-chain", 256u * 1024, false, "ca_import_chain"},
+    {"POST", "/api/v1/ca/import-chain", 256u * 1024, false, "ca_import_chain", kJsonValuesOff},
 
     // POST /api/v1/ca/issue-code-signing — code-signing leaf issuance via CSR
     // custody (gap-matrix #10; ca_routes.cpp kMaxIssueCodeSigningBody,
     // enforced before nlohmann::json::parse). Mirrors that bound exactly —
     // same two-authority-split precedent as ca_import_chain/ca_revoke below.
-    {"POST", "/api/v1/ca/issue-code-signing", 64u * 1024, false, "ca_issue_code_signing"},
+    {"POST", "/api/v1/ca/issue-code-signing", 64u * 1024, false, "ca_issue_code_signing", kJsonValuesOff},
 
     // POST /api/v1/ca/revoke — serial-scoped cert revocation, JSON body
     // (ca_routes.cpp:24 kMaxRevokeBody, enforced at ca_routes.cpp:394 before
@@ -294,7 +338,7 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // same reasoning as the import-chain entry above. Without this entry the
     // route silently fell through to the 4 MiB catch-all, two authorities
     // (this table and the handler) disagreeing on the same route.
-    {"POST", "/api/v1/ca/revoke", 64u * 1024, false, "ca_revoke"},
+    {"POST", "/api/v1/ca/revoke", 64u * 1024, false, "ca_revoke", kJsonValuesOff},
 
     // POST /api/v1/secrets/kek/rotate|rewrap — both take zero body fields
     // (kek_routes.cpp:46 kMaxKekBody, enforced at :54 in validate_empty_body,
@@ -303,7 +347,7 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // the segment-boundary matcher treats a prefix already ending in '/' as
     // matching every child segment (see body_cap_prefix_matches). Mirrors
     // kMaxKekBody exactly — same two-authority-split fix as ca_revoke above.
-    {"POST", "/api/v1/secrets/kek/", 64u * 1024, false, "kek_ops"},
+    {"POST", "/api/v1/secrets/kek/", 64u * 1024, false, "kek_ops", kJsonValuesOff},
 
     // POST /api/settings/ca/import-chain — the dashboard (HTMX,
     // application/x-www-form-urlencoded) twin of the above
@@ -315,7 +359,7 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // field names/framing — still three orders of magnitude below
     // httplib's 100 MiB backstop.
     {"POST", "/api/settings/ca/import-chain", 512u * 1024, false,
-     "ca_import_chain_dashboard"},
+     "ca_import_chain_dashboard", kJsonValuesOff},
 
     // POST /api/settings/plugin-signing/upload — plugin code-signing trust
     // bundle (settings_routes.cpp:3445 upload handler, :3461 the 256 KiB
@@ -324,7 +368,7 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // field). Doubled for that framing overhead, same reasoning as the CA
     // dashboard twin above.
     {"POST", "/api/settings/plugin-signing/upload", 512u * 1024, false,
-     "plugin_trust_bundle"},
+     "plugin_trust_bundle", kJsonValuesOff},
 
     // SCIM — scim_routes.cpp:65 kMaxBodyBytes, currently checked only AFTER
     // buffering (first call site :827). This moves the same bound BEFORE the
@@ -344,14 +388,14 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // reachable pre-auth on more verbs than the three that mutate. A class
     // whose bound is justified by the shape of its payload should not depend
     // on the verb used to deliver it.
-    {kBodyCapAnyMethod, "/scim/v2/", 64u * 1024, false, "scim"},
+    {kBodyCapAnyMethod, "/scim/v2/", 64u * 1024, false, "scim", kJsonValuesOff},
 
     // POST /saml/acs — SAML assertion consumer service
     // (auth_routes.cpp:2794-2798, kSamlMaxBodyBytes). A legitimate signed
     // SAMLResponse is well under 64 KiB; 1 MiB is generous headroom while
     // refusing a plaintext-amplification DoS via an oversized fake
     // SAMLResponse field.
-    {"POST", "/saml/acs", 1u * 1024 * 1024, false, "saml_acs"},
+    {"POST", "/saml/acs", 1u * 1024 * 1024, false, "saml_acs", kJsonValuesOff},
 
     // POST/PUT /api/v1/definitions/{id}/response-templates[/{template_id}]
     // (rest_api_v1.cpp:4237 kRtMaxBodyBytes, checked at :4376 and :4461).
@@ -365,8 +409,8 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // gets its own, more specific entry ABOVE this one (longest match wins,
     // so a new entry naming its own longer literal prefix takes priority
     // automatically).
-    {"POST", "/api/v1/definitions/", 64u * 1024, false, "response_templates"},
-    {"PUT", "/api/v1/definitions/", 64u * 1024, false, "response_templates"},
+    {"POST", "/api/v1/definitions/", 64u * 1024, false, "response_templates", kJsonValuesOff},
+    {"PUT", "/api/v1/definitions/", 64u * 1024, false, "response_templates", kJsonValuesOff},
 
     // POST /api/dashboard/echo-execute — Echo warehouse SQL query, HTMX form
     // fields `sql` + `scope` (dashboard_routes.cpp:866 `sql.size() > 4096`
@@ -387,7 +431,7 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // "group:<name>", short, but nothing bounds it today) = 12288 + 4096 =
     // 16384 bytes exactly. Reasoned margin, not a byte-for-byte measurement
     // — same category as the CA/plugin-trust dashboard classes below.
-    {"POST", "/api/dashboard/echo-execute", 16u * 1024, false, "echo_dashboard_sql"},
+    {"POST", "/api/dashboard/echo-execute", 16u * 1024, false, "echo_dashboard_sql", kJsonValuesOff},
 
     // POST /api/v1/result-sets/from-echo-query — Echo result-set SQL, JSON
     // body (rest_api_v1.cpp:6802, `sql.size() > 100000` check on the JSON-
@@ -412,7 +456,7 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // then decided by the handler's own check, as intended; a raw body over
     // 204800 bytes never reaches the handler at all.
     {"POST", "/api/v1/result-sets/from-echo-query", 200u * 1024, false,
-     "echo_result_set_sql"},
+     "echo_result_set_sql", kJsonValuesOff},
 
     // POST /api/v1/guaranteed-state/rules — Guardian rule authoring
     // (rest_api_v1.cpp:7759 handler start; :7842 the legacy path that
@@ -422,7 +466,7 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // file header. Do NOT tighten this without a real contract to measure
     // against.
     {"POST", "/api/v1/guaranteed-state/rules", 16u * 1024 * 1024, false,
-     "guardian_rule_authoring"},
+     "guardian_rule_authoring", 50'000},
 
     // PUT /api/v1/guaranteed-state/rules/{id} — the sibling regex UPDATE
     // route (rest_api_v1.cpp:7904). #2407-as-shipped scoped the entry above
@@ -436,19 +480,26 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // could not otherwise tell this apart from the POST create route on the
     // identical literal prefix.
     {"PUT", "/api/v1/guaranteed-state/rules/", 16u * 1024 * 1024, false,
-     "guardian_rule_authoring"},
+     "guardian_rule_authoring", 50'000},
 
     // POST /api/workflows — workflow authoring from a YAML bundle
     // (workflow_routes.cpp:1023). Same "no aggregate contract yet" shape as
     // guardian rule authoring above — deliberate, generous, explicit.
-    {"POST", "/api/workflows", 16u * 1024 * 1024, false, "workflow_yaml"},
+    {"POST", "/api/workflows", 16u * 1024 * 1024, false, "workflow_yaml", kJsonValuesOff},
+    // POST /api/workflows/{id}/execute — the workflow EXECUTE subtree. The row above matches by
+    // prefix, so without this one every POST under `/api/workflows/` inherited the 16 MiB, unscanned
+    // YAML-authoring class (a JSON body of `[],[],...` built a 258 to 429 MiB tree; #2146). The
+    // execute body is `agent_ids` (at most 10000), a scope and 32 parameters, the same worst case as
+    // `commands` (about 3.3 MiB), so the same 4 MiB cap and 30000-value budget. The trailing slash
+    // keeps the exact `POST /api/workflows` create on the row above (the longer prefix wins).
+    {"POST", "/api/workflows/", 4u * 1024 * 1024, false, "workflow_execute", 30'000},
 
     // POST /api/product-packs — product-pack installation from a YAML
     // bundle (workflow_routes.cpp:1746). A pack holds MULTIPLE YAML
     // documents (product_pack_store.cpp:122's `split_yaml_documents`), so
     // this needs the same generous headroom as workflow authoring, not the
     // single-document default.
-    {"POST", "/api/product-packs", 16u * 1024 * 1024, false, "product_pack_yaml"},
+    {"POST", "/api/product-packs", 16u * 1024 * 1024, false, "product_pack_yaml", kJsonValuesOff},
 
     // POST /api/instructions/import — JSON instruction-definition import,
     // whole raw body forwarded verbatim to `import_definition_json`
@@ -465,7 +516,7 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // anything downstream. No genuine aggregate contract, therefore: same
     // "no contract yet" judgment-call category as guardian_rule_authoring/
     // workflow_yaml/product_pack_yaml above, and the same peer bound.
-    {"POST", "/api/instructions/import", 16u * 1024 * 1024, false, "instruction_import"},
+    {"POST", "/api/instructions/import", 16u * 1024 * 1024, false, "instruction_import", kJsonValuesDefault},
 
     // POST /api/instructions/yaml (save), POST /api/instructions/validate-
     // yaml, POST /fragments/instructions/yaml-preview — three FORM-encoded
@@ -486,9 +537,9 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // 3145728 + 4096 = 3149824 bytes exactly. One shared cap+label across
     // all three routes — same size-defense reasoning, same check, distinct
     // literal paths (no common prefix to key one table entry on).
-    {"POST", "/api/instructions/yaml", 3149824u, false, "instruction_yaml"},
-    {"POST", "/api/instructions/validate-yaml", 3149824u, false, "instruction_yaml"},
-    {"POST", "/fragments/instructions/yaml-preview", 3149824u, false, "instruction_yaml"},
+    {"POST", "/api/instructions/yaml", 3149824u, false, "instruction_yaml", kJsonValuesOff},
+    {"POST", "/api/instructions/validate-yaml", 3149824u, false, "instruction_yaml", kJsonValuesOff},
+    {"POST", "/fragments/instructions/yaml-preview", 3149824u, false, "instruction_yaml", kJsonValuesOff},
 
     // /api/v1/hardware — the Hardware CI list/record/sync REST v1 twin
     // (hardware_routes.cpp). ANY method: GET /api/v1/hardware and
@@ -509,7 +560,7 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // caller reaching this prefix with a chunked (no Content-Length) body
     // would be uncapped up to httplib's 100 MiB default — the same class the
     // /api/v1/uploads entry above closes.
-    {kBodyCapAnyMethod, "/api/v1/hardware", 4u * 1024, true, "hardware"},
+    {kBodyCapAnyMethod, "/api/v1/hardware", 4u * 1024, true, "hardware", kJsonValuesOff},
 
     // /api/v1/rbac/roles/{name}/assignments[/{principal_id}] — A2 global
     // human role assignment (rest_api_v1.cpp). POST's body is
@@ -519,7 +570,7 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // captures — see the file header's MATCHING section for the same
     // reasoning applied to every other any-method entry with a same-prefix
     // sibling. 4 KiB leaves generous headroom over the real shape.
-    {kBodyCapAnyMethod, "/api/v1/rbac/roles/", 4u * 1024, false, "rbac_role_assignment"},
+    {kBodyCapAnyMethod, "/api/v1/rbac/roles/", 4u * 1024, false, "rbac_role_assignment", kJsonValuesOff},
 
     // /api/v1/rbac/enforcement — A1 enforcement enable/disable toggle
     // (rest_api_v1.cpp). Body is {"enabled": true}, under 64 bytes even
@@ -527,7 +578,7 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // means this path does NOT inherit the rbac_role_assignment row above
     // (different literal prefix) — without its own entry it would fall to
     // the 4 MiB catch-all, which a toggle this small does not need.
-    {kBodyCapAnyMethod, "/api/v1/rbac/enforcement", 1u * 1024, false, "rbac_enforcement"},
+    {kBodyCapAnyMethod, "/api/v1/rbac/enforcement", 1u * 1024, false, "rbac_enforcement", kJsonValuesOff},
 
     // /api/v1/guaranteed-state/policy-generation: the Guardian policy-generation raise
     // (rest_api_v1.cpp): POST .../raise carries {"target_generation": <integer up to 16
@@ -537,7 +588,7 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // catch-all. Segment-boundary matching means it does NOT inherit the
     // guardian_rule_authoring rows above (a different literal prefix).
     {kBodyCapAnyMethod, "/api/v1/guaranteed-state/policy-generation", 1u * 1024, false,
-     "guardian_policy_generation"},
+     "guardian_policy_generation", kJsonValuesOff},
 
     // /api/v1/users — the local-account user-management REST v1 subtree
     // (#5342): POST /api/v1/users/me/password {current_password,
@@ -554,7 +605,7 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // under the 4 MiB catch-all it previously fell to. ANY method: the
     // bodyless siblings share the prefix.
     // requires_measurable stays OFF per the file-header default.
-    {kBodyCapAnyMethod, "/api/v1/users", 16u * 1024, false, "users"},
+    {kBodyCapAnyMethod, "/api/v1/users", 16u * 1024, false, "users", kJsonValuesOff},
 
     // /api/v1/dex/score-policy: the customer DEX score policy (rest_api_v1.cpp). PUT's body IS
     // the policy document, capped at kDexScorePolicyMaxBytes (256 KiB) by the handler; 320 KiB
@@ -564,7 +615,7 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // permission gate runs in the handler, after httplib buffers the body (a cookie session's
     // same-site gate runs earlier, pre-routing), so an unmeasurable (chunked) body must be
     // refused here (the hardware row's reasoning).
-    {kBodyCapAnyMethod, "/api/v1/dex/score-policy", 320u * 1024, true, "dex_score_policy"},
+    {kBodyCapAnyMethod, "/api/v1/dex/score-policy", 320u * 1024, true, "dex_score_policy", kJsonValuesOff},
     // /api/settings/dex-scoring: the DEX Scoring tab's three POSTs (settings_routes.cpp). The
     // body is the whole policy as a urlencoded form, and Save, Preview and Reset each submit all
     // of it. Worst case from the document's own limits: 200 override rows (kDexPolicyMaxOverrides)
@@ -576,21 +627,21 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // rebuilds the worst case and pins it under this cap. The REST row above stays 320 KiB: its
     // body is the 256 KiB JSON document. requires_measurable = true for the same reason as the
     // REST row: the permission gate runs in the handler, after httplib buffers the body.
-    {kBodyCapAnyMethod, "/api/settings/dex-scoring", 512u * 1024, true, "dex_score_policy_form"},
+    {kBodyCapAnyMethod, "/api/settings/dex-scoring", 512u * 1024, true, "dex_score_policy_form", kJsonValuesOff},
     // /api/v1/crypto — the /crypto REST v1 subtree. The only body-bearing route is
     // PUT /api/v1/crypto/dashboard/layout {"widgets":[ids]}: at most 64 catalogue ids of at most
     // 64 bytes (crypto_widget_catalogue.hpp kMaxLayoutWidgets / kWidgetIdMaxBytes), about 4.4 KiB
     // even fully escaped. Mirrors the handler's own kLayoutBodyMaxBytes (16 KiB) exactly - the
     // ca_revoke two-authority-split precedent. ANY method: every sibling is a bodyless GET and
     // shares the prefix.
-    {kBodyCapAnyMethod, "/api/v1/crypto", 16u * 1024, false, "crypto"},
+    {kBodyCapAnyMethod, "/api/v1/crypto", 16u * 1024, false, "crypto", kJsonValuesOff},
 
     // /api/v1/config — the runtime-configuration REST v1 twin. The only body-bearing route is
     // PUT /api/v1/config/{key} {"value": ...}: one scalar (an integer, a flag, a log level, a
     // tag key, an OIDC client secret or a short JSON array of routed observation types), well
     // under 16 KiB. The legacy PUT /api/config/{key} keeps the catch-all (kDefaultIsCorrectFor).
     // ANY method: the sibling GET is bodyless and shares the prefix.
-    {kBodyCapAnyMethod, "/api/v1/config", 16u * 1024, false, "config"},
+    {kBodyCapAnyMethod, "/api/v1/config", 16u * 1024, false, "config", kJsonValuesOff},
 
     // /api/v1/inventory/software/normalization/ — the software-title curation REST v1 routes
     // (software_curation_routes.cpp). The body-bearing routes are POST .../aliases (one JSON
@@ -600,21 +651,21 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // 4 MiB catch-all (the admission gate runs in the handler, after httplib buffers the body).
     // ANY method: the GET siblings share the prefix (rule 4 in the routed-concern row).
     {kBodyCapAnyMethod, "/api/v1/inventory/software/normalization/", 64u * 1024, false,
-     "software_curation"},
+     "software_curation", kJsonValuesOff},
     // POST /api/v1/inventory/software/normalization/pack — the alias-pack CSV upload. The raw
     // body IS the CSV, which parse_normalization_pack refuses over kMaxPackBytes (1 MiB,
     // software_normalization_pack.hpp), so the cap mirrors that bound exactly (the ca_revoke
     // two-authority precedent). Longer literal prefix than the row above, so it wins there.
     // ANY method; no sibling verb carries a body on this path.
     {kBodyCapAnyMethod, "/api/v1/inventory/software/normalization/pack", 1u * 1024 * 1024,
-     false, "software_alias_pack"},
+     false, "software_alias_pack", kJsonValuesOff},
     // /api/v1/inventory/software/collection-settings — the per-group collection settings REST
     // v1 routes (software_collection_settings_routes.cpp). The only body-bearing route is PUT
     // .../{group_id}: one small JSON object (an interval, a window, a zone name, six boolean
     // switches, a priority and a version), well under 16 KiB. ANY method: the GET siblings
     // share the prefix.
     {kBodyCapAnyMethod, "/api/v1/inventory/software/collection-settings", 16u * 1024, false,
-     "software_collection_settings"},
+     "software_collection_settings", kJsonValuesOff},
     // /api/v1/commands -- POST: the REST v1 twin of MCP execute_instruction (command_v1_routes.cpp).
     // The same 4 MiB as the `/mcp/` row because the same worst case rides it: a maximal request
     // (10000 agent ids, 32 parameters of 64 KiB, an 8 KiB scope) is `kExecInstrWorstCaseBody`,
@@ -622,7 +673,12 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // is true like the MCP row: an unmeasurable (chunked) body would otherwise bypass the pre-routing
     // cap on this route while the twin refuses it. ANY method: the segment-boundary match keeps a
     // future sibling under this prefix capped too (rule 4 in the routed-concern row).
-    {kBodyCapAnyMethod, "/api/v1/commands", 4u * 1024 * 1024, true, "commands"},
+    {kBodyCapAnyMethod, "/api/v1/commands", 4u * 1024 * 1024, true, "commands", 30'000},
+    // /api/v1/result-sets -- POST create (and its sub-routes): `device_ids` admits up to 100000
+    // members (`kMaxMembersPerSet`), so the catch-all's 100000-value budget would refuse a legitimate
+    // maximal body; the same 200000 as the MCP twin `create_result_set`. The cap stays the catch-all's
+    // 4 MiB. The longer `/api/v1/result-sets/from-echo-query` row below keeps its own entry.
+    {kBodyCapAnyMethod, "/api/v1/result-sets", 4u * 1024 * 1024, false, "result_sets", kJsonValuesMcp},
     // /api/v1/crypto/revocation-sources — registered CRL sources (ADR-0070 R1, revocation_source_
     // routes.cpp): POST / PUT carry {name, ca_certificates (<= 8 PEM, 16 KiB each), crl_urls (<= 8
     // x 2,048 bytes)}, so 192 KiB (the largest valid body, JSON-escaped, is about 151 KiB) mirrors revocation_source::kBodyMaxBytes exactly (a
@@ -632,12 +688,12 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // Longest match: it outranks the `/api/v1/crypto` row above for this subtree only. ANY method:
     // a verb-scoped row would drop the whole prefix to the shorter row (rule 4).
     {kBodyCapAnyMethod, "/api/v1/crypto/revocation-sources", 192u * 1024, false,
-     "crypto_revocation_sources"},
+     "crypto_revocation_sources", kJsonValuesOff},
 
     // The catch-all default. ANY method, empty prefix — always matches, and
     // always loses a longest-match comparison against every entry above.
     // Ordinary JSON/form traffic (most REST mutation routes) lands here.
-    {kBodyCapAnyMethod, "", 4u * 1024 * 1024, false, "default"},
+    {kBodyCapAnyMethod, "", 4u * 1024 * 1024, false, "default", kJsonValuesDefault},
 };
 
 /// True when `path` matches `prefix` at a segment boundary: `path` starts
@@ -662,6 +718,9 @@ struct BodyCapMatch {
     std::size_t max_body_bytes;
     bool requires_measurable;
     std::string_view path_class;
+    /// `BodyCapEntry::max_json_values` of the matched row (`kJsonValuesOff` for the fail-closed
+    /// "unmatched" sentinel, whose cap of 0 already refuses everything).
+    std::size_t max_json_values{kJsonValuesOff};
 };
 
 /// Resolve the body-cap policy for one request. Longest matching
@@ -719,7 +778,7 @@ struct BodyCapMatch {
     if (best == kNone)
         return {0, true, "unmatched"};
     const auto& hit = kBodyCapTable[best];
-    return {hit.max_body_bytes, hit.requires_measurable, hit.path_class};
+    return {hit.max_body_bytes, hit.requires_measurable, hit.path_class, hit.max_json_values};
 }
 
 /// True iff `kBodyCapTable` carries an any-method, empty-prefix catch-all row.

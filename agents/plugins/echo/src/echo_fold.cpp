@@ -6,6 +6,7 @@
  */
 
 #include "echo_fold.hpp"
+#include "echo_sqlite_progress.hpp"
 
 #include <sqlite3.h>
 #include <spdlog/spdlog.h>
@@ -233,28 +234,6 @@ void warn_rejected(std::string_view source, std::size_t n, std::optional<int64_t
                  "or a non-finite measure (first stamp: {}); the rest of the batch folded",
                  n, source, first.value_or(0));
 }
-
-// Restores the progress handler on every exit path from a GC statement.
-struct GcProgress {
-    std::function<bool()> expired;
-    sqlite3* db;
-    GcProgress(sqlite3* d, std::function<bool()> f) : expired(std::move(f)), db(d) {
-        // Every 1000 VM instructions; a nonzero return interrupts the statement.
-        sqlite3_progress_handler(
-            db, 1000,
-            [](void* p) noexcept -> int {
-                try {
-                    return (*static_cast<std::function<bool()>*>(p))() ? 1 : 0;
-                } catch (...) {
-                    return 1;
-                }
-            },
-            &expired);
-    }
-    ~GcProgress() { sqlite3_progress_handler(db, 0, nullptr, nullptr); }
-    GcProgress(const GcProgress&) = delete;
-    GcProgress& operator=(const GcProgress&) = delete;
-};
 
 } // namespace
 
@@ -549,7 +528,7 @@ std::expected<GcResult, std::string> EchoFold::gc_dictionary(EchoDatabase& db,
         int64_t rows = 0;
         bool hit = false;
         const auto r = db.checked_transaction([&](TransactionHandle& h) -> std::expected<void, std::string> {
-            GcProgress guard(h.raw(), [this, deadline] { return now() >= deadline; });
+            ScopedProgressHandler guard(h.raw(), [this, deadline] { return now() >= deadline; });
             for (const auto& sql : sqls) {
                 // A prepare can be interrupted too (it may re-load the schema after a VACUUM).
                 const StmtPtr st = prep(h, sql);

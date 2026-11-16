@@ -10,8 +10,9 @@
 /// applied. It is NOT a `set_pre_request_handler` body: from cpp-httplib v0.47.0 that handler runs
 /// before the body is read, so `req.body.size()` below would always be 0.
 ///
-/// Stage order, fixed: the post-read body cap (413 on an over-cap body), then
-/// `apply_step_up_chokepoint` for a body within the cap. The whole block is contained: a throw
+/// Stage order, fixed: the post-read body cap (413 over the size cap), then the class's JSON value
+/// budget (413 `over_json_values_post_read`), then `apply_step_up_chokepoint` for a body within
+/// both. The whole block is contained: a throw
 /// answers 413 (fail closed) rather than reaching an httplib call site. The caller builds `deps`
 /// per request (the auth store pointer is re-read each time so a nulled store answers 503).
 /// See `server.cpp` at the `PostReadStageRegistry::install` call for the capture contract and the
@@ -25,6 +26,7 @@
 /// in-handler call per kRequired row go with them).
 
 #include "body_cap_policy.hpp"
+#include "json_value_budget.hpp"
 #include "on_behalf_guard.hpp"
 #include "rest_a4_envelope_http.hpp"
 #include "step_up_gate.hpp"
@@ -42,12 +44,59 @@
 
 namespace yuzu::server::detail {
 
+/// 413 for a body over its class's JSON value budget: the same envelope, log sampling and counter
+/// as the over-cap refusal (`reason="over_json_values_post_read"`), so one dashboard reads both.
+[[nodiscard]] inline httplib::Server::HandlerResponse
+refuse_json_value_budget(const httplib::Request& req, httplib::Response& res,
+                         const StepUpChokepointDeps& deps, const BodyCapMatch& cap_match) {
+    static std::atomic<std::uint64_t> budget_hits{0};
+    constexpr std::uint64_t kBodyLogEvery = 100;
+    if (budget_hits.fetch_add(1, std::memory_order_relaxed) % kBodyLogEvery == 0) {
+        spdlog::warn("[#2146 json-budget] rejected {} {} from {}: {}-byte body holds more than the "
+                     "{} JSON values this class admits (class={}, 1 log per {} rejections; the "
+                     "counter records all)",
+                     onbehalf::sanitize_for_log(req.method, 16),
+                     onbehalf::sanitize_for_log(req.path),
+                     onbehalf::sanitize_for_log(req.remote_addr, 64), req.body.size(),
+                     cap_match.max_json_values, cap_match.path_class, kBodyLogEvery);
+    }
+    try {
+        if (deps.metrics)
+            deps.metrics
+                ->counter("yuzu_body_cap_rejected_total",
+                          {{"path_class", std::string(cap_match.path_class)},
+                           {"reason", "over_json_values_post_read"}})
+                .increment();
+    } catch (...) { // NOLINT(bugprone-empty-catch)
+        // Observability must never kill the process from this handler.
+    }
+    res.status = 413;
+    if (cap_match.path_class == "scim") {
+        res.set_content(scim::error(413, "request body too large").dump(), "application/scim+json");
+    } else {
+        res.set_content(
+            a4_denial(res, 413, "request body holds more JSON values than this route admits",
+                      A4ErrorOpts{.remediation = "split the request into smaller ones; see "
+                                                 "docs/user-manual/rest-api.md, Pre-Auth Request "
+                                                 "Body Caps, for the per-route limit"}),
+            "application/json");
+    }
+    return httplib::Server::HandlerResponse::Handled;
+}
+
 [[nodiscard]] inline httplib::Server::HandlerResponse
 run_post_read_stage(const httplib::Request& req, httplib::Response& res,
                     const StepUpChokepointDeps& deps) {
     try {
         const auto cap_match = resolve_body_cap(req.method, req.path);
         if (req.body.size() <= cap_match.max_body_bytes) {
+            // The size cap does not bound a parse tree: a body of `[],[],...` builds one 16 to 27
+            // times its size. The class's value budget (`BodyCapEntry::max_json_values`, a raw-text
+            // count, no parse) is checked before any handler can parse the body. It keys on the
+            // route class, never on Content-Type (a handler parses whatever it is sent).
+            if (cap_match.max_json_values != kJsonValuesOff &&
+                json_exceeds_value_count(req.body, cap_match.max_json_values))
+                return refuse_json_value_budget(req, res, deps, cap_match);
             return apply_step_up_chokepoint(req, res, deps) == StepUpChokepointResult::kRefused
                        ? httplib::Server::HandlerResponse::Handled
                        : httplib::Server::HandlerResponse::Unhandled;
@@ -111,16 +160,22 @@ run_post_read_stage(const httplib::Request& req, httplib::Response& res,
 ///      identity match are what protect against a stale pass or one earned by another principal
 ///      (see `StepUpPassStash`). A pass for a different principal is refused and spent, and
 ///      step 2/3 evaluate `session` afresh. The request's principal binding outlives the pass.
+///      A consumed pass also hands back what it admitted (`admitted`, see `StepUpAdmission`).
 ///   2. No auth store: fail closed with the 503 (`refuse_step_up_store_unwired`) for EVERY caller
 ///      class, before any decision is made.
-///   3. Otherwise evaluate and render exactly as `require_mfa_step_up` does.
+///   3. Otherwise evaluate and render exactly as `require_mfa_step_up` does, with the class of the
+///      row `action_label` names (so a `kFactorCredential` label gets its own window, local-only
+///      rule and admission here too).
 /// `auth_db` is read per request by the caller, so a store that is nulled answers 503.
+/// `durable_proof` is the stored-proof read a local enrolled caller is judged on (null is
+/// fail-closed 503 for such a caller); `admitted` may be nullptr for the 39 `kRequired` rows.
 [[nodiscard]] inline bool
 run_in_handler_step_up(const httplib::Request& req, httplib::Response& res,
                        const auth::Session& session, const std::string& action_label,
                        AuthDB* auth_db, int window_secs, const StepUpAuditFn& audit,
-                       std::string_view mfa_enforcement, yuzu::MetricsRegistry* metrics) {
-    if (consume_step_up_pass(req, session, action_label))
+                       std::string_view mfa_enforcement, yuzu::MetricsRegistry* metrics,
+                       const DurableProofFn* durable_proof, StepUpAdmission* admitted) {
+    if (consume_step_up_pass(req, session, action_label, admitted))
         return true;
     if (auth_db == nullptr) {
         // Fail closed: no auth store means the gate cannot evaluate, so it refuses.
@@ -128,7 +183,7 @@ run_in_handler_step_up(const httplib::Request& req, httplib::Response& res,
         return false;
     }
     return require_mfa_step_up(req, res, session, *auth_db, window_secs, audit, action_label,
-                               mfa_enforcement, metrics);
+                               mfa_enforcement, metrics, durable_proof, admitted);
 }
 
 } // namespace yuzu::server::detail

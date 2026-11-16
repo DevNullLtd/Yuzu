@@ -141,7 +141,23 @@ struct SigningFixtures {
     fs::path artifact_file;   ///< the signed payload (a plugin .so, or an update binary)
     fs::path sig_file;
 
+    SigningFixtures() = default;
+    SigningFixtures(const SigningFixtures&) = delete;
+    SigningFixtures& operator=(const SigningFixtures&) = delete;
+
+    // Returning the builder's named local may move when NRVO is disabled.
+    // Only the destination owns directory cleanup; a moved-from path is not
+    // guaranteed empty, so explicitly disarm the source.
+    SigningFixtures(SigningFixtures&& other) noexcept
+        : dir(std::exchange(other.dir, fs::path{})),
+          trust_bundle(std::move(other.trust_bundle)),
+          other_trust_bundle(std::move(other.other_trust_bundle)),
+          artifact_file(std::move(other.artifact_file)), sig_file(std::move(other.sig_file)) {}
+    SigningFixtures& operator=(SigningFixtures&&) = delete;
+
     ~SigningFixtures() {
+        if (dir.empty())
+            return;
         std::error_code ec;
         fs::remove_all(dir, ec);
     }

@@ -44,6 +44,14 @@ related: >-
 > `tests/split_interlock_ledger.json`). This ADR builds nothing; it decides where things
 > are built and what the next slices must satisfy.
 
+> **Update (2026-11-14, against dev @ 2c49b4ea0).** "Slices 2 and 3 are not started" is no longer true
+> for slice 2: its server half has landed. `CertificateInventoryStore`
+> (`certificate_inventory_store.{hpp,cpp}`, schema `certificate_inventory_store`) and
+> `certificate_inventory_ingestion.{hpp,cpp}` are built, the store is opened at boot in `server.cpp`,
+> and the `ReportInventory`/`ProxyInventory` handlers ingest into it (commits b2761ed88, db0e87f53).
+> The agent-side certificate collector has not landed, so no endpoint reports certificates yet.
+> Slice 3 (SSH) is not started. No use-case engine exists.
+
 ## Summary
 
 Domain 41 inventories the cryptographic material and libraries on managed endpoints. Its
@@ -762,7 +770,8 @@ must decide privacy before any slice-3 code is written. It must at least settle 
     design review", `:67`). This will bind any engine that consumes the data; Decisions
     5–7 gain their remaining force with their follow-ups (ADR-1005:17);
   - ADR-0032 D14: engine behavioural reads fail closed on audit failure on every surface.
-- **ADR-0067** is proposed in PR #5367 and not accepted. If it is accepted as drafted:
+- **ADR-0067** is proposed in PR #5367 and not accepted. (2026-11-14: that PR is not merged, so
+  no ADR-0067 file exists on `dev`; this is a reference to the unmerged draft.) If it is accepted as drafted:
   - its D3 denies an individually-identifying behavioural read of an in-purview subject
     unless the read is made under an approved Incident;
   - its D5 says an EU co-determination deployment "must not enable ... any other new

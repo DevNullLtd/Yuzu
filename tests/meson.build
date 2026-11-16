@@ -653,6 +653,12 @@ agent_test_exe = executable(
     'unit/test_system_hardening_win_parsers.cpp',        # Wave 8 PR8.1-b: pure mitigation-registry decoder over the-rig REAL CAPTURE fixtures
     'unit/test_system_hardening_local_dispatcher.cpp',   # Wave 8 PR8.1-b: real system_hardening dylib/.so/.dll via LocalDispatcher, unguarded on every OS
     'unit/test_runtimes_parsers.cpp',            # Wave 10 PR10.1-b: pure parsers over REAL CAPTURE fixtures, unguarded on every OS
+    'unit/test_component_zip.cpp',               # component_inventory: bounded zip reader (wave 1)
+    'unit/test_component_java_parsers.cpp',      # component_inventory: Java manifest/pom parsers (wave 1)
+    'unit/test_component_walk.cpp',              # component_inventory: bounded walk policy over an in-memory tree and a fake clock, unguarded on every OS
+    'unit/test_component_scan.cpp',              # component_inventory: portable scan over an in-memory tree and a fake clock, archives built as bytes; one POSIX-only case through the real leg
+    'unit/test_component_fs_posix.cpp',          # component_inventory: POSIX filesystem leg (body POSIX-only)
+    'unit/test_component_inventory_local_dispatcher.cpp',  # component_inventory: real plugin via LocalDispatcher, unguarded on every OS (dispatches scan on Windows only)
     'unit/test_runtimes_linux_parsers.cpp',      # Wave 10 PR10.1-b: Linux walk over materialized tree manifests (REAL CAPTURE structure plus labelled reconstructions; walk bodies POSIX-only)
     'unit/test_runtimes_local_dispatcher.cpp',   # Wave 10 PR10.1-b: real plugin via LocalDispatcher, unguarded on every OS
     'unit/test_runtimes_python_parsers.cpp',     # runtimes python: pure python layer + macOS framework walk over a materialized fixture tree (walk body POSIX-only)
@@ -670,6 +676,7 @@ agent_test_exe = executable(
     'unit/test_middleware_linux_parsers.cpp',       # SAM.2: Linux leg over a materialized tree manifest (REAL registered-install capture plus labelled inline cases; body POSIX-only)
     'unit/test_middleware_local_dispatcher.cpp',    # SAM.2: real middleware plugin via LocalDispatcher and the table-generated descriptors, unguarded on every OS
     '../agents/plugins/middleware/src/middleware_linux.cpp', # SAM.2: run_linux (self-gated to __linux__, empty elsewhere)
+    '../agents/plugins/component_inventory/src/component_fs_posix.cpp',  # SAM-16: POSIX filesystem leg (self-gated to non-Windows, empty on Windows)
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp, config_checks.hpp
@@ -681,6 +688,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/printing/src'),  # printing_ipp.hpp / printing_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/browser_policy/src'),  # browser_policy_*.hpp (Wave 10 PR10.2-b)
     include_directories('../agents/plugins/runtimes/src'),  # runtimes_*parsers.hpp / runtimes_legs.hpp (Wave 10 PR10.1-b pure helpers)
+    include_directories('../agents/plugins/component_inventory/src'),  # component_walk.hpp / component_*.hpp (pure helpers)
     include_directories('../agents/plugins/browser_inventory/src'),  # browser_inventory_*_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/local_security_policy/src'),  # Wave 8 PR8.3
     include_directories('../agents/plugins/power_health/src'),  # power_health_parsers.hpp (pure helpers)
@@ -786,7 +794,7 @@ agent_test_exe = executable(
   # libxml2_dep: test_autoruns_parsers.cpp #includes autoruns_parsers.hpp,
   # which parses Task Scheduler XML via real libxml2 unconditionally on
   # every platform -- this test TU needs it on its include/link path too.
-  dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, agent_test_proto_dep, nlohmann_dep, catch2_nomain_dep, agent_test_openssl_dep, spdlog_dep, sqlite3_dep, libxml2_dep] + agent_test_native_deps,
+  dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, agent_test_proto_dep, nlohmann_dep, catch2_nomain_dep, agent_test_openssl_dep, spdlog_dep, sqlite3_dep, libxml2_dep, component_inventory_zlib_dep] + agent_test_native_deps,
   # Ensure the fixture plugins are built before the test runs so the lookups
   # inside test_plugin_loader.cpp / test_capability_descriptor.cpp find them
   # under MESON_BUILD_ROOT/tests/.
@@ -838,6 +846,7 @@ agent_test_exe = executable(
   # scripts/ci/check-plugin-spawn-lexical.sh's GRANDFATHERED set.
   link_depends: [
                 abi3_fixture_plugin,
+                abi4_declared_fixture_plugin,
                 agent_actions_plugin_lib,  # #4666 PR-2 W3a: MI-3 loads the real agent_actions plugin by path
                 certificates_plugin_lib,
                 content_dist_plugin_lib,
@@ -892,6 +901,7 @@ agent_test_exe = executable(
                 runtimes_plugin_lib,  # Wave 10 PR10.1-b
                 pkg_inventory_plugin_lib,  # Wave 10 PR10.1-c
                 middleware_plugin_lib,  # SAM.2: test_middleware_local_dispatcher.cpp loads the real plugin by path
+                component_inventory_plugin_lib,  # SAM-16: test_component_inventory_local_dispatcher.cpp loads the real plugin by path
                 ],
 )
 # ONE agent test is [tsan-heavy] as of #4153 (down from three): the #3848 concurrency soak
@@ -1163,7 +1173,7 @@ agent_shard_specs = {
 # firewall_plugin_lib (agents/plugins/firewall/meson.build): the [firewall_quarantine]
 # action-boundary cases load the real plugin by path and FAIL when it is missing under
 # `meson test`, so the shards must build it first.
-agent_shard_deps = [reserved_name_fixture_plugin, invalid_name_fixture_plugin, retired_name_fixture_plugin, abi3_fixture_plugin, firewall_plugin_lib]
+agent_shard_deps = [reserved_name_fixture_plugin, invalid_name_fixture_plugin, retired_name_fixture_plugin, abi3_fixture_plugin, abi4_declared_fixture_plugin, firewall_plugin_lib]
 # Per-shard meson timeouts. Only shard C is raised (#7135); A and B keep the old single
 # entry's 240s, because only C was measured to need more.
 #
@@ -1661,6 +1671,13 @@ if build_server
       'unit/server/test_list_read_confinement.cpp',
       'unit/server/test_response_execution_scope_authz.cpp', # #1634: response/execution fleet-read confinement
       'unit/server/test_legacy_executions_scope_authz.cpp', # #3789: legacy /api/executions* fleet-read confinement
+      'unit/server/test_execution_owner_key.cpp', # #5557: ExecutionOwnerKey / execution_owner_key() derivation per session class (pure)
+      'unit/server/test_execution_owner_rig_smoke.cpp', # #5557: smoke test of the shared real-gate execution-visibility rig
+      'unit/server/test_execution_owner_legacy.cpp', # #5557: legacy /api/executions* exact-set cases under service-scoped credentials
+      'unit/server/test_execution_owner_rest_v1.cpp', # #5557: REST v1 execution reads and /api/v1/events exact-set cases under service-scoped credentials
+      'unit/server/test_execution_owner_dashboard.cpp', # #5557: dashboard execution fragments and /sse/executions exact-set cases under service-scoped credentials
+      'unit/server/test_service_scope_refusal.cpp', # #5557: service-scoped refusal counter seed + plugin-config list-read consumer (corrupted engine row)
+      'unit/server/test_execution_mutation_owner_key.cpp', # #5557: cancel/rerun admission keys on ExecutionOwnerKey; username stays the audit principal
       'unit/server/test_workflow_executions_list_authz.cpp', # #3526: /fragments/executions real fleet-read confinement
       'unit/server/test_workflow_executions_real_gate_authz.cpp', # GET /api/v1/workflow-executions real fleet-read confinement
       'unit/server/test_oidc_principal_key.cpp',
@@ -1892,6 +1909,9 @@ if build_server
       'unit/server/test_secret_column_registration_tripwire.cpp', # #2530 C3 — registered-column trip-wire
       'unit/server/test_key_provider.cpp',
       'unit/server/test_rest_mgmt_group_roles_floor.cpp', # #2376: the mgmt-group role graph needs the floored UserManagement:Read
+      'unit/server/test_rest_mgmt_group_audit_first.cpp', # #7074: REST group create, add member and remove member store their `attempted` audit row first
+      'unit/server/test_rest_mgmt_group_audit_real_auth.cpp', # #7074: the same routes through the production AuthRoutes + AuditStore wiring (no stub in the identity path)
+      'unit/server/test_mgmt_group_agent_known.cpp', # #6967/#7074: add member flags an unknown agent id (pure classification, no PG)
       'unit/server/test_mgmt_group_owner_gate.cpp', # owner-arm predicate: surface, token class, engine, grant rows (pure, no PG)
       'unit/server/test_rest_rbac_role_reads.cpp', # PR-0b: GET /rbac/roles + /rbac/roles/{role}/permissions fail closed (503) and 404 an unknown role
       'unit/server/test_rest_management_group_detail_degrade.cpp', # #1762 governance round-1: GET /management-groups/{id} fails closed on a degraded member read
@@ -3530,6 +3550,13 @@ test('server feature option lint',
   timeout: 300,
 )
 
+test('local test runner platform selftest',
+  _python3_test,
+  args: [files('test_run_tests_platform.py')],
+  suite: 'platform',
+  timeout: 30,
+)
+
 # Windows agent installer trust-anchor lockdown (#5196): the .iss is compiled
 # only by release.yml, so this lints its source text -- no /T on the icacls
 # grant, a Constrained-Language-safe exact SDDL check, the user manual's copy of
@@ -3826,6 +3853,16 @@ test('runtimes definition columns',
   timeout: 30,
 )
 
+# component_inventory's definition-column contract (content/definitions/component_inventory.yaml):
+# row_kind first and the column order match the comp wire row component_scan.hpp emits; parses the
+# YAML directly.
+test('component_inventory definition columns',
+  _python3_test,
+  args: [files('test_component_inventory_definition.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # middleware's definition-column contract (content/definitions/middleware.yaml): row_kind first and the
 # column order match the wire row middleware_parsers.hpp emits; parses the YAML directly.
 test('middleware definition columns',
@@ -4017,14 +4054,22 @@ test('prometheus harness selftest',
   timeout: 60,
 )
 
-# #4800: pins scripts/test_gateway.py's zero-executed guard, the ct --dir that
-# points at apps/yuzu_gw/test/ct, and each gateway suite's wrapper deadline
-# sitting below its meson timeout. Hermetic (parses sources, runs no
-# rebar3), so it needs no Erlang; suite docs, i.e. the Linux leg only.
+# Executes the workflow extractor against selected, missing and ambiguous steps;
+# a uses-only step must never borrow a later step's shell body.
+test('workflow step extractor selftest',
+  _python3_test,
+  args: [files('test_extract_run_block.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# #4800: pins scripts/test_gateway.py's summary/deadline guards and CT directory.
+# Platform placement: native Windows process-tree termination and stdout encoding
+# differ from POSIX. Hermetic children exercise both without needing Erlang.
 test('gateway wrapper guard selftest',
   _python3_test,
   args: [files('test_gateway_test_summary.py')],
-  suite: 'docs',
+  suite: 'platform',
   timeout: 30,
 )
 
@@ -4159,6 +4204,14 @@ if _bash_test.found()
   # macOS/Linux rig (Windows uses scripts/win-start-UAT.sh) and the README
   # touch rule runs on hosted Ubuntu (docs-lint.yml).
   if host_machine.system() != 'windows'
+    # Exercise the actual measure-only gate with private DB/logs and fake CT.
+    # A failed or empty requested scale run must not borrow ordinary perf metrics.
+    test('performance gate verdict selftest',
+      _bash_test,
+      args: [files('shell/test_pr2_gates.sh'), 'CH-6', 'CH-25'],
+      suite: 'docs',
+      timeout: 60,
+    )
     # docs/plugin-readme-standard.md rule 7 — the README touch rule's own
     # fixture run (a fake `git` on PATH; no repository, no network).
     test('plugin readme touch-rule selftest',
@@ -5046,6 +5099,24 @@ test('forensics tier wiring lexical selftest',
   timeout: 30,
 )
 
+# #5557: ownership-based execution admission is keyed on ExecutionOwnerKey and neither list gate
+# hands a service-scoped session unrestricted authority. Best-effort lexical tripwire over the server
+# tree + a selftest that mutates the sources in memory and requires every mutation to fail; both also
+# run in .github/workflows/docs-lint.yml.
+test('execution owner key tripwire',
+  _python3_test,
+  args: [files('test_execution_owner_key_tripwire.py')],
+  suite: 'docs',
+  timeout: 60,
+)
+test('execution owner key tripwire selftest',
+  _python3_test,
+  args: [files('test_execution_owner_key_tripwire_selftest.py')],
+  suite: 'docs',
+  # One scan of the tree plus about a hundred mutations, each re-scanning only the file it changed.
+  timeout: 300,
+)
+
 # yuzu_fleet_plugin_init_failed label catalogue: the one production set_known_plugins(...) line must
 # exist exactly once and precede the health recompute thread (no unit test builds ServerImpl; an
 # unwired store labels every real plugin "unknown"), and both metrics_.describe rows must exist.
@@ -5077,6 +5148,14 @@ test('workflow execute docs lexical',
 test('dashboard audit checked lexical',
   _python3_test,
   args: [files('test_dashboard_audit_checked_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+# #7075/#3864: the Echo process baseline codec and the capture-sources push's session-bound
+# audit writer, both in files no Mac unit binary builds; the script self-checks its detector.
+test('Echo security wiring lexical gate',
+  _python3_test,
+  args: [files('test_echo_security_wiring_lexical.py')],
   suite: 'docs',
   timeout: 30,
 )
@@ -5171,7 +5250,7 @@ test('dex score-policy single-writer tripwire (#6086)',
   timeout: 30,
 )
 
-# Runner-local CI telemetry contract: v2->v3 migration preserves history,
+# Runner-local CI telemetry contract: schema upgrades preserve history,
 # GitHub reruns remain distinct, and Meson suite durations/timeouts plus known
 # flake recoveries land in the persistent per-runner test-runs.db.
 test('ci telemetry selftest',
@@ -5208,3 +5287,34 @@ test('tsan-gdb-capture selftest',
   suite: 'docs',
   timeout: 30,
 )
+
+# Migration pilots are opt-in: these are required executions, so missing live PG
+# or compiled fixtures must fail rather than turn a default developer run green.
+# The collector selftest exercises native process cleanup on every platform.
+test('contract evidence selftest', _python3_test,
+  args: [files('test_contract_evidence.py')], suite: 'platform', timeout: 30)
+test('gateway contract wrapper selftest', _python3_test,
+  args: [files('test_gateway_contract.py')], suite: 'docs', timeout: 30)
+test('contract registry', _python3_test,
+  args: [files('../scripts/test/contract-evidence.py'), 'check'], suite: 'docs', timeout: 30)
+if get_option('build_contract_tests')
+  _contract_adapter = files('../scripts/test/contract-evidence.py')
+  test('contract.plugin.loader.reserved-name.reject', _python3_test,
+    args: [_contract_adapter, 'case', '--id', 'plugin.loader.reserved-name.reject', '--binary', agent_test_exe],
+    depends: [agent_test_exe, reserved_name_fixture_plugin, abi3_fixture_plugin],
+    suite: 'contracts', timeout: 120,
+    env: {'MESON_BUILD_ROOT': meson.project_build_root()})
+  test('contract.plugin.loader.duplicate-name.isolate', _python3_test,
+    args: [_contract_adapter, 'case', '--id', 'plugin.loader.duplicate-name.isolate', '--binary', agent_test_exe],
+    depends: [agent_test_exe, abi3_fixture_plugin, abi4_declared_fixture_plugin],
+    suite: 'contracts', timeout: 120,
+    env: {'MESON_BUILD_ROOT': meson.project_build_root()})
+  if build_server
+    test('contract.pg.baseline.members-atomic-replace', _python3_test,
+      args: [_contract_adapter, 'case', '--id', 'pg.baseline.members-atomic-replace', '--binary', server_test_exe],
+      depends: [server_test_exe], suite: 'contracts', timeout: 120)
+    test('contract.pg.retention.cutoff-boundary', _python3_test,
+      args: [_contract_adapter, 'case', '--id', 'pg.retention.cutoff-boundary', '--binary', server_test_exe],
+      depends: [server_test_exe], suite: 'contracts', timeout: 120)
+  endif
+endif

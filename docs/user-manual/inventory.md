@@ -412,6 +412,83 @@ cadences.
   installed-software inventory. Deploy-time opt-out; not a server-side runtime
   toggle. It does not gate the operator `list`/`query`/`list_per_user` actions.
 
+### Java components (`component_inventory`)
+
+The `component_inventory` plugin's `scan` action (instruction `crossplatform.components.scan`) lists
+software that no package manager owns: Java archives (`.jar`, `.war`, `.ear`) found in application
+trees, and the libraries nested one level inside them (`BOOT-INF/lib/`, `WEB-INF/lib/` or `lib/`).
+It reads the archive files themselves in-process; no process is started and no nested archive is
+unpacked (the archive's directory and, when needed, two small entries are read).
+
+- **Where.** Linux and macOS only, in machine-wide locations only, walked in this order. Linux:
+  `/usr/lib/jvm`, `/usr/share/java`, `/usr/share/maven`, `/usr/local/lib`, `/usr/local/share` and
+  `/opt`. macOS: `/Library/Java`, `/usr/local`, `/opt/homebrew` and `/Applications`. The root list
+  holds no per-user location, so an archive under a home directory is not looked for (a property of
+  the list: an archive found under a root is read wherever it sits). Windows is not read yet: it
+  answers one `unsupported` status row (`windows:planned`). Python and Node components are not
+  collected.
+- **What a row holds.** Kind (`java`), name, version, where the version came from (`filename`,
+  `pom`, `manifest`, or `unreadable` when no source gives one), path (a nested library is
+  `<archive path>!<entry>`), size, modification time and the application folder it sits under.
+- **How the version is read.** From the file name: a pre-release or build qualifier stays in it
+  (`my-app-1.0.0-rc1.jar` reads `1.0.0-rc1`, `spring-core-6.0.0-M1.jar` reads `6.0.0-M1`), while
+  other trailing words are classifiers (`netty-...-4.1.77.Final-linux-x86_64.jar` reads
+  `4.1.77.Final`; `guava-31.1-jre.jar` reads `31.1` from the name alone). When the name gave no
+  version, or is ambiguous (a word follows the version that is not one of the qualifiers above, such
+  as a classifier, or the name holds more than one version-like part), the scan asks the archive:
+  its `pom.properties`, then its manifest. An
+  archive value replaces the name's split only when the file name carries it (`guava-31.1-jre.jar`
+  with a pom version `31.1-jre` reads `31.1-jre`, source `pom`). A `pom` version is read from the
+  archive's only `pom.properties` or, when it holds several, the one named for the archive. An
+  archive with no pom of its own that bundles exactly one dependency's reads that dependency's
+  version, when its file name has no version (`app.jar`, `ROOT.war`); a name that carries a version
+  keeps it (`myapp-2.0.jar` is not affected) unless the archive's value sits in the name.
+  A nested row, and an archive with no pom or manifest, take the file name's word.
+- **Bounds.** One scan stops at 400,000 directory entries or 45 seconds, reads at most 32
+  directory levels, 50,000 entries per directory, 3,000 rows per application folder under each root and 20,000 rows
+  in all, and reads at most a 16 MiB archive directory and 64 KiB per version entry.
+- **When the list may be incomplete.** The status row reads `constrained` when any bound was
+  reached (`budget_entries`, `budget_time`, `section_rows`, `anchor_rows`, `depth`), a directory
+  could not be listed (`dir_unreadable`) or was cut at its cap (`dir_truncated`), an archive could
+  not be enumerated or changed while it was read (`archive_unenumerated`, `archive_changed`), or the
+  mount table could not be read so nothing was walked (`mount_table_unreadable`). Each token is
+  prefixed `<os>:component_inventory:`. The rows already read are still returned, but when time
+  runs out archives not yet read give no rows, and a walk that used the whole budget returns none.
+  Only `supported` means the scan finished: no bound was reached and every directory and archive
+  it opened was read in full.
+- **Reading `budget_entries`.** The 400,000-entry budget is shared by every root, which is why the
+  roots are walked cheapest first. A host whose early roots use it all (a Mac with many large
+  applications under `/Applications`, which is walked last on macOS) answers `constrained` with
+  `budget_entries` and the later roots are not walked, so read the list as the part of the host
+  reached, not as everything. Re-running gives the same answer.
+- **Reported without blocking the answer.** On a `supported` answer, a root dropped because it is a
+  link (`root_link_skipped`), a link met inside a tree (`link_skipped`: the scan follows no link, so
+  the link is neither entered nor listed), a root or directory on a network mount that was passed
+  over (`network_fs_skipped`) and a row with no readable version (`version_unreadable`) ride the
+  status row as information. A `constrained` answer names its one cause only. A missing root is
+  skipped silently.
+- **What to do about a token.** Terminal (a repeat gives the same answer): `budget_entries`,
+  `section_rows`, `anchor_rows`, `depth`, `dir_truncated`, and `archive_unenumerated` for that
+  archive. Retryable: `budget_time` (run again off-peak), `archive_changed`,
+  `mount_table_unreadable`, `dir_unreadable` (after checking what the agent account may read) and
+  `internal_error` (retry once, then report). The informational tokens need no action.
+- **Who can run it, and what it costs.** The roles that may run instructions on a device
+  (`endpoint-admin`, `endpoint-operator`) with the `Inventory` read grant; the result is an
+  ordinary instruction result, read over the responses API like any other. A scan is a live read
+  made when the instruction runs, and it can take up to 45 seconds and 400,000 directory entries
+  on one device. It cannot be cancelled once started: the budget is checked between directories and
+  between archives, so one blocked read is not interrupted. On the packaged Linux unit the agent
+  holds `CAP_DAC_READ_SEARCH`, so permission-restricted directories are readable there and
+  `dir_unreadable` is rare.
+- **Switching it off.** The per-plugin kill switch (`component_inventory/scan`,
+  `PUT /api/v1/plugin-config/component_inventory/kill-switch`) turns the action off. The permanent
+  customer opt-out of ADR-0028 Decisions 2 and 8 is still open (#7737).
+- **What the rows reveal.** Names, versions, paths and application folder names as they appear on
+  disk, which is a detailed software inventory for the device; the names of nested libraries can
+  reveal a customer's internal dependency names.
+- **When it runs.** On demand only, as an instruction. The daily report does not carry these rows
+  yet, so they do not appear in the software inventory views.
+
 ### Install type, scope and location, and the sectioned report
 
 Each stored software row carries four more attributes. They are read-side facts today: the
@@ -1037,7 +1114,7 @@ place, **Hardware** and **Software**, each its own page:
     for it (see `inventory.sync.request` in [Audit log](audit-log.md)).
   - **Installed software** — the same per-device software list as before (audited
     `inventory.device.software`), now with its own filter box and, for the first time,
-    rendered **Signature** and **Ecosystem** columns. Carries the same **Sync now**
+    rendered **Signature**, **Ecosystem**, **Install type** and **Location** columns (Location is a dash where the collector reports no single folder). Carries the same **Sync now**
     affordance, scoped to the `installed_software` source.
   - **Tags and properties** — inline add/remove via the existing tag routes. Add is
     shown when a `Tag:Write` probe passes for the device; Remove needs its own
@@ -1093,6 +1170,30 @@ place, **Hardware** and **Software**, each its own page:
   catalogue model that the REST and MCP twins (`GET /api/v1/inventory/software/catalogue`,
   `query_software_catalogue`) share, so the page, the API and the agent tools cannot
   disagree.
+  - **Find software** (the first block on the page). Type a package name and press **Find**
+    to see how many installs and devices carry it, where, and how fresh the data is. The
+    search runs the same model as `GET /api/v1/inventory/software`, so the counts equal that
+    route's `totals` and the table rows are its rows, with the REST call shown under the
+    box (copy it into a script) and **Export CSV** pointing at that route (the components
+    route for a Java, Python or Node search) with `format=csv`. Name matching is exact. Add an exact version, or a from/to range (inclusive,
+    in the catalogue's version order), to narrow it. The **Applications** chip searches
+    installed applications; **Java**, **Python** and **Node** search the components found
+    inside applications (`GET /api/v1/inventory/software/components`), and say plainly that
+    a device that has not sent its component list cannot be ruled in or out. The table runs
+    application, then version (newest first on each page), then device. An application row
+    shows the OS, install location, install type, status (current, unconfirmed or disabled),
+    when a report last confirmed the install, and **Last synced**. A component row shows the
+    OS, component, version (and where it was read from), path, the application folder it
+    sits in, status and **Last synced**; it has no install type or last-confirmed column.
+    **Last synced** turns amber after 48 hours. **Load more rows** continues from the
+    cursor. For component searches the count card also shows how many of the devices were
+    not confirmed by their last report, with a link that lists only those; installs searches
+    carry no such figure because the model does not return one. An account scoped to
+    management groups gets the rows on its own devices and no fleet count (a count of part
+    of the fleet could be read as the whole), and a store that does not answer shows a retry
+    banner, never an empty table. Every search is audited, under the verb of the REST route it
+    mirrors: `inventory.software.query` for an application search and `inventory.components.view`
+    for a Java, Python or Node search.
   - **Metrics strip.** Inventory coverage (devices reporting software, devices connected
     now, devices not seen in 48 hours), Titles and publishers, Installs with a
     Windows/macOS/Linux bar and the average per device, Stay current (installs on their
@@ -1196,7 +1297,8 @@ place, **Hardware** and **Software**, each its own page:
     tokens are denied outright.
   - **Audit.** Every call that serves data (or is refused on scope) is audited, not only the first page: `inventory.software.catalog`
     (title pages), `inventory.software.versions` and `inventory.software.query` (devices
-    tables). A continuation page is tagged `page=continuation`; a degraded read is
+    tables and Find software application searches; Find software component searches write
+    `inventory.components.view`). A continuation page is tagged `page=continuation`; a degraded read is
     `failure`; a refused caller is `denied`, as is a devices page that drops devices through the
     scope post-filter or names an `agent_id` outside the caller's scope. See [Audit log](audit-log.md).
   - **Degraded or refused.** A store that cannot answer shows an unavailable banner with
