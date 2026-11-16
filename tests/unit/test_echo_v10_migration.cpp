@@ -19,6 +19,7 @@
 #include "echo_schema_registry.hpp"
 #include "echo_sql_executor.hpp"
 #include "echo_status_format.hpp"
+#include "echo_usage.hpp"
 #include "test_helpers.hpp"
 #include "test_log_capture.hpp"
 
@@ -2049,6 +2050,193 @@ TEST_CASE("v10 migration: the usage walk starts past the usage cursor",
     CHECK(n(db, "SELECT run_count FROM usage_daily WHERE exe_key = 'alpha.exe'") == 1);
     CHECK(n(db, "SELECT total_seconds FROM usage_daily WHERE exe_key = 'alpha.exe'") == 60);
     CHECK(n(db, "SELECT superseded_runs FROM usage_daily WHERE exe_key = 'alpha.exe'") == 0);
+}
+
+namespace {
+
+int64_t wall_clock_now() {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
+// A run whose start and stop sit in different 10,000-row chunks of the usage walk, past a
+// non-zero cursor. Row 1 is the one the old usage fold had read (usage_hwm_id = 1). Rows 2..10001
+// are the first chunk: the start of alpha.exe, then unmatched stops of other pids. Row 10002 (the
+// second chunk) is alpha.exe's stop, `seconds` later.
+void seed_run_across_chunks(sqlite3* db, int64_t start_ts, int64_t seconds) {
+    insert_raw(db, "process", {I(start_ts), I(1), T("stopped"), I(1), I(0), T("f.exe"), T(""), T("u")});
+    insert_raw(db, "process", {I(start_ts), I(1), T("started"), I(100), I(1), T("alpha.exe"), T(""), T("jsmith")});
+    exec(db, std::format("WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 9999) "
+                         "INSERT INTO process_live (ts, snapshot_id, action, pid, ppid, name, cmdline, user) "
+                         "SELECT {}, 1, 'stopped', 1000 + i, 0, 'f.exe', '', 'u' FROM c",
+                         start_ts));
+    insert_raw(db, "process",
+               {I(start_ts + seconds), I(1), T("stopped"), I(100), I(1), T("alpha.exe"), T(""), T("jsmith")});
+    exec(db, "INSERT INTO echo_config VALUES ('usage_hwm_id', '1'), ('usage_active_generation', '0')");
+}
+
+} // namespace
+
+TEST_CASE("v10 usage walk: more than 10000 lagged rows past a non-zero cursor pair a run whose start "
+          "and stop sit in different chunks",
+          "[echo][v10][migration][usage]") {
+    Seeded seeded;
+    const int64_t start = wall_clock_now() - 3600;
+    seed(seeded, [&](sqlite3* db) { seed_run_across_chunks(db, start, 60); });
+    yuzu::test::LogCapture logs;
+    auto db = open_ok(seeded.tmp.path);
+    logs.stop();
+    INFO(logs.text());
+    CHECK(logs.text().find("usage lag: 10001 raw process rows past usage_hwm_id") != std::string::npos);
+    CHECK(n(db, "SELECT COUNT(*) FROM usage_live") == 0);
+    CHECK(n(db, "SELECT run_count FROM usage_daily WHERE exe_key = 'alpha.exe'") == 1);
+    CHECK(n(db, "SELECT total_seconds FROM usage_daily WHERE exe_key = 'alpha.exe'") == 60);
+    // the one closing sweep ran: the anchor is advanced once, to the migration's clock
+    CHECK(n(db, "SELECT CAST(value AS INTEGER) FROM echo_config WHERE key = 'usage_last_fold_ts'") >= start);
+}
+
+TEST_CASE("v10 usage walk: a run older than seven days that straddles a chunk boundary is credited "
+          "and not expired early",
+          "[echo][v10][migration][usage]") {
+    Seeded seeded;
+    // A recent anchor makes every per-chunk sweep plausible, as it is on a host whose fold ran
+    // shortly before the upgrade. Swept at the first chunk's edge, the 10-day-old run would be
+    // expired at 0 s before its stop arrives in the second chunk.
+    const int64_t now = wall_clock_now();
+    const int64_t start = now - 10 * 86400;
+    seed(seeded, [&](sqlite3* db) {
+        seed_run_across_chunks(db, start, 60);
+        exec(db, std::format("INSERT INTO echo_config VALUES ('usage_last_fold_ts', '{}')", now - 60));
+    });
+    auto db = open_ok(seeded.tmp.path);
+    CHECK(n(db, "SELECT COUNT(*) FROM usage_live") == 0);
+    CHECK(n(db, "SELECT run_count FROM usage_daily WHERE exe_key = 'alpha.exe'") == 1);
+    CHECK(n(db, "SELECT total_seconds FROM usage_daily WHERE exe_key = 'alpha.exe'") == 60);
+    CHECK(n(db, "SELECT expired_runs FROM usage_daily WHERE exe_key = 'alpha.exe'") == 0);
+}
+
+TEST_CASE("v10 usage walk: a start above the roll-up mark pairs with its stop below it",
+          "[echo][v10][migration][usage]") {
+    Seeded seeded;
+    // The start (id 1) has a stamp at or above the mark, the stop (id 2) one below it (the clock
+    // stepped back between them). The tier walk reads only rows at or past the mark; the usage
+    // walk reads every row past the cursor, so the stop still finds its start: one run, clamped
+    // to 0 s and counted as a clock anomaly, with nothing left open for the 7-day expiry.
+    seed(seeded, [&](sqlite3* db) {
+        insert_raw(db, "process", {I(kH0 + 3700), I(1), T("started"), I(100), I(1), T("alpha.exe"), T(""), T("jsmith")});
+        insert_raw(db, "process", {I(kH0 + 3500), I(1), T("stopped"), I(100), I(1), T("alpha.exe"), T(""), T("jsmith")});
+        exec(db, std::format("INSERT INTO echo_config VALUES ('usage_hwm_id', '0'), "
+                             "('usage_active_generation', '0'), ('rollup_process_hourly_at', '{}')",
+                             kH0 + 3600));
+    });
+    auto db = open_ok(seeded.tmp.path);
+    CHECK(n(db, "SELECT COUNT(*) FROM usage_live") == 0);
+    CHECK(n(db, "SELECT run_count FROM usage_daily WHERE exe_key = 'alpha.exe'") == 1);
+    CHECK(n(db, "SELECT total_seconds FROM usage_daily WHERE exe_key = 'alpha.exe'") == 0);
+    CHECK(db.get_config("usage_clock_anomalies", "absent") == "1");
+}
+
+TEST_CASE("v10 usage walk: a failing closing sweep refuses the migration, leaves v9, and the retry "
+          "credits the run",
+          "[echo][v10][migration][usage]") {
+    Seeded seeded;
+    // Only the closing call writes usage_last_fold_ts (every chunk defers its sweep), so a trigger
+    // that aborts that one write fails the closing call and nothing before it. Inserts and updates
+    // are both covered because the write is an upsert.
+    seed(seeded, [&](sqlite3* db) {
+        seed_one_lagged_run(db);
+        exec(db, "INSERT INTO echo_config VALUES ('usage_active_generation', '0')");
+        exec(db, "CREATE TRIGGER fail_closing_insert BEFORE INSERT ON echo_config "
+                 "WHEN NEW.key = 'usage_last_fold_ts' "
+                 "BEGIN SELECT RAISE(ABORT, 'injected closing sweep fault'); END");
+        exec(db, "CREATE TRIGGER fail_closing_update BEFORE UPDATE ON echo_config "
+                 "WHEN NEW.key = 'usage_last_fold_ts' "
+                 "BEGIN SELECT RAISE(ABORT, 'injected closing sweep fault'); END");
+    });
+    const auto before = snapshot(seeded.tmp.path);
+
+    const auto failed = EchoDatabase::open(seeded.tmp.path);
+    REQUIRE(!failed.has_value());
+    INFO(failed.error());
+    // The failed write poisons the transaction handle, and checked_transaction reports the handle's
+    // first recorded reason ahead of the closing call's own prefix: the error names the write.
+    CHECK(failed.error().find("injected closing sweep fault") != std::string::npos);
+    CHECK(snapshot(seeded.tmp.path) == before); // still the v9 file, schema_version 9 included
+
+    {
+        Db raw;
+        open_raw(raw, seeded.tmp.path);
+        exec(raw.db, "DROP TRIGGER fail_closing_insert");
+        exec(raw.db, "DROP TRIGGER fail_closing_update");
+    }
+    auto db = open_ok(seeded.tmp.path); // the retry reaches v10 and credits the run
+    CHECK(db.get_config("schema_version") == "10");
+    CHECK(n(db, "SELECT COUNT(*) FROM usage_live") == 0);
+    CHECK(n(db, "SELECT run_count FROM usage_daily WHERE exe_key = 'alpha.exe'") == 1);
+    CHECK(n(db, "SELECT total_seconds FROM usage_daily WHERE exe_key = 'alpha.exe'") == 60);
+}
+
+TEST_CASE("v10 usage walk: the walk is swept exactly once, judged against the anchor as it stood "
+          "before it",
+          "[echo][v10][migration][usage]") {
+    Seeded seeded;
+    // The anchor is two days old, implausible against the migration clock (the guard allows a gap
+    // of one day), and an unmatched start is ten days old. One sweep judges `now` against that
+    // anchor, declines the expiry and counts the decline: the old run stays open. A second sweep
+    // (a duplicate closing call, or one per chunk) would see the anchor the first one wrote, find
+    // it plausible and expire the run.
+    const int64_t now = wall_clock_now();
+    seed(seeded, [&](sqlite3* db) {
+        seed_run_across_chunks(db, now - 60, 60); // two chunks of lagged rows
+        insert_raw(db, "process", {I(now - 10 * 86400), I(1), T("started"), I(5), I(0), T("old.exe"), T(""), T("u")});
+        exec(db, std::format("INSERT INTO echo_config VALUES ('usage_last_fold_ts', '{}')", now - 2 * 86400));
+    });
+    auto db = open_ok(seeded.tmp.path);
+    CHECK(n(db, "SELECT COUNT(*) FROM usage_live WHERE exe_key = 'old.exe'") == 1);
+    CHECK(n(db, "SELECT COUNT(*) FROM usage_daily WHERE exe_key = 'old.exe'") == 0); // no expired_runs row
+    CHECK(db.get_config("usage_expiry_declined_count", "absent") == "1");
+    CHECK(n(db, "SELECT CAST(value AS INTEGER) FROM echo_config WHERE key = 'usage_last_fold_ts'") >= now);
+}
+
+TEST_CASE("v10 usage walk: the closing sweep caps the open runs while the process source is disabled",
+          "[echo][v10][migration][usage]") {
+    Seeded seeded;
+    // The walk credits its lagged rows while process is disabled (the case above), so it is owed its
+    // sweep too: an event-less closing call that took the disabled-process idle return would leave
+    // the open runs over the cap and the anchor where it was.
+    const int64_t start = wall_clock_now() - 86400;
+    seed(seeded, [&](sqlite3* db) {
+        seed_process_rows(db, static_cast<int64_t>(usage::kMaxOpenRuns) + 1, start);
+        exec(db, "INSERT INTO echo_config VALUES ('process_enabled', 'false'), "
+                 "('usage_active_generation', '0'), ('usage_hwm_id', '0')");
+    });
+    auto db = open_ok(seeded.tmp.path);
+    CHECK(n(db, "SELECT COUNT(*) FROM usage_live") == static_cast<int64_t>(usage::kMaxOpenRuns));
+    CHECK(n(db, "SELECT CAST(value AS INTEGER) FROM echo_config WHERE key = 'usage_last_fold_ts'") >= start);
+    CHECK(db.get_config("usage_feeder_enabled", "absent") == "false"); // process is still off
+}
+
+TEST_CASE("v10 usage walk: a walk that fed no rows runs no sweep in either process state",
+          "[echo][v10][migration][usage]") {
+    Seeded seeded;
+    std::string process_enabled;
+    SECTION("process enabled") {
+        process_enabled = "true";
+    }
+    SECTION("process disabled") {
+        process_enabled = "false";
+    }
+    // The cursor sits on the only row: nothing is past it, so nothing is fed, and the closing call
+    // that follows a fed walk does not run (as at base, where only a fed chunk swept).
+    seed(seeded, [&](sqlite3* db) {
+        insert_raw(db, "process", {I(kT0), I(1), T("started"), I(1), I(0), T("a.exe"), T(""), T("u")});
+        exec(db, std::format("INSERT INTO echo_config VALUES ('process_enabled', '{}'), "
+                             "('usage_active_generation', '0'), ('usage_hwm_id', '1')",
+                             process_enabled));
+    });
+    auto db = open_ok(seeded.tmp.path);
+    CHECK(db.get_config("usage_last_fold_ts", "absent") == "absent");
 }
 
 TEST_CASE("v10 migration: the free-space demand counts the write-ahead log already on disk",

@@ -14,6 +14,9 @@
 #include "echo_usage.hpp"
 #include "echo_aggregator.hpp" // source_enabled
 #include "test_helpers.hpp"
+#include "test_log_capture.hpp"
+
+#include <sqlite3.h> // second connection: selective config-read fault injection
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -99,6 +102,32 @@ void seed_open_run(EchoDatabase& db, uint32_t pid, const std::string& exe, int64
         "INSERT INTO usage_live (ts,snapshot_id,action,pid,exe_key,user,start_ts) VALUES "
         "({0},0,'open',{1},'{2}','alice',{0})",
         start, pid, exe)));
+}
+
+// Make ONLY the read of `echo_config.value` for `key` fail (at step, not prepare), from a second
+// connection to the same file, leaving every other key readable: `value` becomes a VIRTUAL
+// generated column whose expression overflows for that one key. Its writers then fail at prepare.
+// The same technique as test_echo_aggregator.cpp's make_config_key_unreadable.
+void make_config_key_unreadable(const fs::path& db_path, const std::string& key) {
+    yuzu::test::SqliteHandleOwner<sqlite3> owner;
+    REQUIRE(sqlite3_open(db_path.string().c_str(), &owner.db) == SQLITE_OK);
+    sqlite3_busy_timeout(owner.db, 5000);
+    const auto sql =
+        std::format("INSERT INTO echo_config (key, value) VALUES ('{0}', 'true') "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value; "
+                    "ALTER TABLE echo_config RENAME COLUMN value TO value_raw; "
+                    "ALTER TABLE echo_config ADD COLUMN value TEXT GENERATED ALWAYS AS "
+                    "(CASE WHEN key = '{0}' THEN abs(-9223372036854775808 + 0 * length(key)) "
+                    "ELSE value_raw END) VIRTUAL;",
+                    key);
+    REQUIRE(sqlite3_exec(owner.db, sql.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK);
+}
+
+// The stored text of `key` once make_config_key_unreadable has hidden `value` (empty: no row).
+std::string raw_cfg(EchoDatabase& db, const char* key) {
+    auto r = db.execute_query(std::format("SELECT value_raw FROM echo_config WHERE key = '{}'", key));
+    REQUIRE(r.has_value());
+    return r->rows.empty() ? std::string{} : r->rows[0][0];
 }
 
 } // namespace
@@ -669,6 +698,215 @@ TEST_CASE("usage: a malformed usage_generation fails the whole fold instead of r
     CHECK(count_rows(t.db, "usage_daily") == 0);
     CHECK(count_rows(t.db, "process_hourly") == 0); // and the process half rolled back with it
     CHECK(t.db.is_open());
+}
+
+// =============================================================================
+// #7287: usage_generation is read strictly at every reader, so a fault never flips the lifecycle
+// =============================================================================
+
+TEST_CASE("usage: a failed usage_generation read leaves the lifecycle PendingBaseline and never "
+          "Active",
+          "[echo][usage][lifecycle]") {
+    // The lenient read took the fault for generation 0, which matched the stored active
+    // generation 0 and reported Active over a row it could not read.
+    auto t = make_test_db();
+    REQUIRE(usage_ensure_baselined(t.db, 1000).has_value());
+    REQUIRE(usage_lifecycle_state(t.db) == LifecycleState::Active);
+
+    make_config_key_unreadable(t.path, "usage_generation");
+    CHECK(usage_lifecycle_state(t.db) == LifecycleState::PendingBaseline);
+}
+
+TEST_CASE("usage: enabling or disabling with an unreadable usage_generation writes no generation "
+          "and reports failure",
+          "[echo][usage][lifecycle]") {
+    auto t = make_test_db();
+    REQUIRE(usage_ensure_baselined(t.db, 1000).has_value());
+    make_config_key_unreadable(t.path, "usage_generation");
+
+    yuzu::test::LogCapture cap;
+    CHECK_FALSE(usage_set_enabled(t.db, /*enabled=*/false, /*now=*/2000));
+    CHECK_FALSE(usage_set_enabled(t.db, /*enabled=*/true, /*now=*/3000));
+    cap.stop();
+    // The refusal must come from the strict read, not from the config write failing at prepare.
+    const auto log = cap.text();
+    CHECK(log.find("transition refused, usage_generation is unreadable") != std::string::npos);
+    CHECK(log.find("transition failed to persist") == std::string::npos);
+    CHECK(raw_cfg(t.db, "usage_generation") == "true"); // the injected row, never bumped
+    CHECK(cfg(t.db, "usage_enabled").empty());          // no edge was written
+    CHECK(cfg(t.db, "usage_paused_at").empty());
+}
+
+TEST_CASE("usage: a baseline attempt with an unreadable usage_generation stamps nothing and keeps "
+          "the open runs",
+          "[echo][usage][lifecycle]") {
+    // Never baselined, so the lifecycle is PendingBaseline either way; the lenient read then
+    // stamped a baseline for a guessed generation 0 and deleted the open runs over the fault.
+    auto t = make_test_db();
+    seed_open_run(t.db, 1, "old.exe", 1000);
+    make_config_key_unreadable(t.path, "usage_generation");
+
+    yuzu::test::LogCapture cap;
+    const auto result = usage_ensure_baselined(t.db, /*now=*/5000);
+    cap.stop();
+    CHECK_FALSE(result.has_value());
+    // The refusal must come from the strict read, not from the config write failing at prepare.
+    const auto log = cap.text();
+    CHECK(log.find("baseline attempt refused, usage_generation is unreadable") !=
+          std::string::npos);
+    CHECK(log.find("baseline attempt failed") == std::string::npos);
+    CHECK(count_rows(t.db, "usage_live") == 1);
+    CHECK(cfg(t.db, "usage_active_generation").empty());
+    CHECK(cfg(t.db, "usage_coverage_since").empty());
+    CHECK(usage_lifecycle_state(t.db) == LifecycleState::PendingBaseline);
+}
+
+TEST_CASE("usage: a malformed usage_generation fails closed at all three readers",
+          "[echo][usage][lifecycle]") {
+    auto t = make_test_db();
+    REQUIRE(usage_ensure_baselined(t.db, 1000).has_value()); // active generation 0
+    seed_open_run(t.db, 1, "old.exe", 1000);
+    REQUIRE(t.db.set_config("usage_generation", "not_a_number"));
+
+    // lifecycle: the damaged value used to parse as 0, which matches the active generation 0
+    CHECK(usage_lifecycle_state(t.db) == LifecycleState::PendingBaseline);
+
+    // set_enabled: used to bump from 0 and overwrite the damaged row with 1
+    CHECK_FALSE(usage_set_enabled(t.db, /*enabled=*/false, /*now=*/2000));
+    CHECK(cfg(t.db, "usage_generation") == "not_a_number");
+    CHECK(cfg(t.db, "usage_enabled").empty());
+
+    // ensure_baselined: used to delete the open run and stamp generation 0
+    CHECK_FALSE(usage_ensure_baselined(t.db, /*now=*/3000).has_value());
+    CHECK(count_rows(t.db, "usage_live") == 1);
+    CHECK(cfg(t.db, "usage_coverage_since") == "1000");
+}
+
+TEST_CASE("usage: a deferred-sweep fold writes no anchor and expires and caps nothing",
+          "[echo][usage][fold]") {
+    // The v10 migration folds its lagged rows chunk by chunk with kDefer and ends with one kRun
+    // call, so a long run whose stop is chunks away is credited rather than expired at an edge.
+    auto t = make_test_db();
+    REQUIRE(usage_ensure_baselined(t.db, 1000).has_value());
+    const int64_t now = 1000 + kDefaultMaxAgeSeconds + 1000;
+    const int64_t anchor = now - 60; // plausible: a kRun fold would sweep
+    REQUIRE(t.db.set_config("usage_last_fold_ts", std::to_string(anchor)));
+    seed_open_run(t.db, 1, "old.exe", 1000); // older than the max age at `now`
+    REQUIRE(t.db.execute_sql(std::format(
+        "WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < {1}) "
+        "INSERT INTO usage_live (ts,snapshot_id,action,pid,exe_key,user,start_ts) "
+        "SELECT {0},0,'open',100 + i,'r.exe','alice',{0} FROM c",
+        now - 100, kMaxOpenRuns + 1)));
+    const int64_t open_before = count_rows(t.db, "usage_live");
+    REQUIRE(open_before == static_cast<int64_t>(kMaxOpenRuns) + 2);
+
+    const auto fold = [&](UsageSweep sweep) {
+        return t.db.checked_transaction([&](TransactionHandle& h) {
+            return usage_fold_in(h, now, process_pair(2, "new.exe", now - 50, now - 40), sweep);
+        });
+    };
+
+    REQUIRE(fold(UsageSweep::kDefer).has_value());
+    CHECK(cfg(t.db, "usage_last_fold_ts") == std::to_string(anchor));    // not advanced
+    CHECK(count_rows(t.db, "usage_live") == open_before);                // nothing expired or capped
+    CHECK(cfg(t.db, "usage_expiry_declined_count").empty());
+    auto credited = t.db.execute_query("SELECT run_count, total_seconds FROM usage_daily WHERE "
+                                       "exe_key = 'new.exe'");
+    REQUIRE(credited.has_value());
+    REQUIRE(credited->rows.size() == 1); // the events themselves were still folded
+    CHECK(credited->rows[0][1] == "10");
+
+    // Against an implausible anchor a sweeping fold would count a decline and re-anchor; the
+    // deferred one reads no anchor, so neither happens. (The plausible anchor above cannot tell the
+    // two apart on the counter alone.)
+    const int64_t stale_anchor = now - 2 * 86400;
+    REQUIRE(t.db.set_config("usage_last_fold_ts", std::to_string(stale_anchor)));
+    REQUIRE(fold(UsageSweep::kDefer).has_value());
+    CHECK(cfg(t.db, "usage_last_fold_ts") == std::to_string(stale_anchor));
+    CHECK(cfg(t.db, "usage_expiry_declined_count").empty());
+    REQUIRE(t.db.set_config("usage_last_fold_ts", std::to_string(anchor)));
+
+    REQUIRE(fold(UsageSweep::kRun).has_value()); // the closing call: expiry, cap and anchor
+    CHECK(cfg(t.db, "usage_last_fold_ts") == std::to_string(now));
+    CHECK(count_rows(t.db, "usage_live") == static_cast<int64_t>(kMaxOpenRuns));
+    CHECK(count_rows(t.db, "usage_daily WHERE exe_key = 'old.exe' AND expired_runs = 1") == 1);
+}
+
+TEST_CASE("usage: a closing sweep runs while the process source is disabled, an ordinary "
+          "event-less sweep does not",
+          "[echo][usage][fold]") {
+    // The v10 migration credits its lagged rows while process is disabled, so its closing call is
+    // an admitted tick; the live sweep over a disabled process source stays idle.
+    auto t = make_test_db();
+    REQUIRE(usage_ensure_baselined(t.db, 1000).has_value());
+    REQUIRE(t.db.set_config("process_enabled", "false"));
+    const int64_t now = 1000 + kDefaultMaxAgeSeconds + 1000;
+    const int64_t anchor = now - 60;
+    REQUIRE(t.db.set_config("usage_last_fold_ts", std::to_string(anchor)));
+    seed_open_run(t.db, 1, "old.exe", 1000); // older than the max age at `now`
+
+    const auto sweep = [&](UsageSweep kind) {
+        return t.db.checked_transaction([&](TransactionHandle& h) { return usage_fold_in(h, now, {}, kind); });
+    };
+
+    REQUIRE(sweep(UsageSweep::kRun).has_value());
+    CHECK(count_rows(t.db, "usage_live") == 1);                       // idle: nothing expired
+    CHECK(cfg(t.db, "usage_last_fold_ts") == std::to_string(anchor)); // nor re-anchored
+
+    REQUIRE(sweep(UsageSweep::kClose).has_value());
+    CHECK(count_rows(t.db, "usage_live") == 0);
+    CHECK(count_rows(t.db, "usage_daily WHERE exe_key = 'old.exe' AND expired_runs = 1") == 1);
+    CHECK(cfg(t.db, "usage_last_fold_ts") == std::to_string(now));
+}
+
+TEST_CASE("usage: a usage_generation with an embedded NUL is malformed at every reader, the fold "
+          "included",
+          "[echo][usage][lifecycle]") {
+    // sqlite3_column_text alone stops at the NUL: the fold's transaction reader took "0<NUL>x" for
+    // generation 0, saw a mismatch against the active generation 1 and stamped a baseline that
+    // deleted the open run, while the database-level readers refused the same value.
+    auto t = make_test_db();
+    REQUIRE(usage_set_enabled(t.db, /*enabled=*/true, /*now=*/500)); // generation 1
+    REQUIRE(usage_ensure_baselined(t.db, 1000).has_value());          // active generation 1
+    seed_open_run(t.db, 1, "old.exe", 1000);
+    REQUIRE(t.db.execute_sql("UPDATE echo_config SET value = CAST(X'300078' AS TEXT) "
+                             "WHERE key = 'usage_generation'"));
+
+    CHECK(usage_lifecycle_state(t.db) == LifecycleState::PendingBaseline);
+    CHECK_FALSE(usage_set_enabled(t.db, /*enabled=*/false, /*now=*/2000));
+    CHECK_FALSE(usage_ensure_baselined(t.db, /*now=*/3000).has_value());
+
+    const auto folded = t.db.checked_transaction([&](TransactionHandle& h) {
+        return usage_fold_in(h, 2100, process_pair(2, "new.exe", 2000, 2100));
+    });
+    REQUIRE_FALSE(folded.has_value());
+    CHECK(folded.error().find("usage_generation read failed") != std::string::npos);
+    CHECK(count_rows(t.db, "usage_live") == 1); // the open run survived
+    CHECK(cfg(t.db, "usage_active_generation") == "1");
+    CHECK(cfg(t.db, "usage_coverage_since") == "1000"); // nothing was stamped
+}
+
+TEST_CASE("usage: the documented repair of a damaged usage_generation deletes both generation rows",
+          "[echo][usage][lifecycle]") {
+    // The manual's troubleshooting entry promises a fresh baseline: open runs forgotten, coverage
+    // restarted. Deleting usage_generation alone does not deliver it when the stored active
+    // generation is 0 (an absent generation reads 0 and matches), so the recipe deletes both.
+    auto t = make_test_db();
+    REQUIRE(usage_ensure_baselined(t.db, 1000).has_value()); // active generation 0, no generation row
+    seed_open_run(t.db, 1, "old.exe", 1000);
+    REQUIRE(t.db.set_config("usage_generation", "not_a_number"));
+    REQUIRE(usage_lifecycle_state(t.db) == LifecycleState::PendingBaseline);
+
+    REQUIRE(t.db.execute_sql("DELETE FROM echo_config WHERE key = 'usage_generation'"));
+    CHECK(usage_lifecycle_state(t.db) == LifecycleState::Active); // no re-baseline is owed
+    CHECK(count_rows(t.db, "usage_live") == 1);                   // and the run is kept
+
+    REQUIRE(t.db.execute_sql("DELETE FROM echo_config WHERE key = 'usage_active_generation'"));
+    CHECK(usage_lifecycle_state(t.db) == LifecycleState::PendingBaseline);
+    REQUIRE(usage_ensure_baselined(t.db, /*now=*/5000).has_value());
+    CHECK(count_rows(t.db, "usage_live") == 0);                   // the baseline forgot the run
+    CHECK(cfg(t.db, "usage_coverage_since") == "5000");
+    CHECK(usage_lifecycle_state(t.db) == LifecycleState::Active);
 }
 
 TEST_CASE("usage: an exe or user name reaches the rows byte for byte (bound and never spliced into SQL)",
