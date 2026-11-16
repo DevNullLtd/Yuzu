@@ -1782,8 +1782,12 @@ flip, with a red-first test each:
     - #7875: a lost path whose cancelled read never drains gets a deadline-driven recovery, or the owner re-accepts
       the residual (it is also in section 5).
     - #7876: a runtime off switch exists for the Spark File AND Registry mechanisms (the issue now covers both; the
-      knob, cost and audit statement of item (2) of the File list below applies to the Registry verification of #7836
-      by reference). The Registry re-open cost is unmeasured at 50, 200 and 500 watched keys.
+      cost and audit statement of item (2) of the File list below applies to the Registry verification of #7836
+      by reference, but the Registry verification is OFF by default with a boot-time opt-in, see the REG-15-I2
+      paragraph below, and #7876 still owes the runtime switch for it and the File half). The Registry re-open cost is
+      unmeasured at 50, 200 and 500 watched keys.
+    - REG-15-I2: decide the Registry path verification interval per estate (`--spark-registry-path-verify-interval`,
+      0 where the watched keys carry auditing SACLs; the default is 0, off) before enabling it anywhere.
     - #7877: the umbrella of the remaining verification residuals is triaged, File and Registry. The Registry items
       are item 31 (a rename followed by a re-creation of the path before the next sample is not noticed; ACCEPTED
       residual, Dave, no independent adjudicator) and two more accepted residuals found by the #7836 governance
@@ -1862,8 +1866,9 @@ flip, with a red-first test each:
     `[spark][mechanism][windows][5719]` case and `[known-gap-5719]` lists no case. It is the same class as the legacy
     guard's disclosed residual (`guard_registry.cpp` lines 25-32 describe a rename of the watched KEY; this case renames
     the key's PARENT), and the legacy guard was not run on this case, so no parity claim is made either way.
-    *The Registry fix.* An idle, healthy Registry watch in Target mode is verified every `kRegPathVerifyInterval` (5 s in
-    production; a sampled check, not continuous): the sweeper stages it as a Deferred probe (`RegWatch::verify_probe`)
+    *The Registry fix.* When the verification is enabled (it is OFF by default, see the REG-15-I2 paragraph below), an idle,
+    healthy Registry watch in Target mode is verified every configured interval (floor 5 s, `kRegistryPathVerifyFloor`; a
+    sampled check, not continuous): the sweeper stages it as a Deferred probe (`RegWatch::verify_probe`)
     that runs on the existing probe lane, F3-counted, with no new long-lived thread but one short-lived detached worker per
     watched key per check; the probe re-opens the registered PATH with
     `KEY_NOTIFY` and arms a throw-away notify on that fresh handle. If the path resolves to no key (the probe falls
@@ -1878,12 +1883,30 @@ flip, with a red-first test each:
     `probe_admission_rejected` / `probe_launch_failed`, which also count arm and re-arm refusals) and leaves the watch
     healthy and unfaulted, with no streak. Detection takes at most one interval plus a sweep wake plus the probe's own
     latency, plus the admission backoff (50 ms doubling to 30 s) on each verification launch the probe lane refused, so
-    it is about 5 s in production only while the lane admits every verification: a refused launch increments the
+    it is about one interval (5 s at the floor) only while the lane admits every verification: a refused launch increments the
     watch's admission attempts and only a commit resets them, so with more than 16 watches verifying together the
-    bound is not 5 s (the tests shorten the interval; the figure is a bound from the design, not a measurement). A fire that lands while a verification is outstanding consumes the live notification, so that probe is
+    bound is not the interval (the tests shorten the interval; the figure is a bound from the design, not a measurement). A fire that lands while a verification is outstanding consumes the live notification, so that probe is
     committed as the watch's re-arm (`resolve_probe_locked` checks `armed`), with the ordinary re-arm grace restarted
     from the fire; a refused or failed verification LAUNCH (lane cap, launch failure) does not mark the watch's coverage
     None, because its notify is still live.
+    **The Registry verification is OFF by default (REG-15-I2, owner ruling 2026-11-16, Dave).** Each verification opens
+    the watched key by path, and on a key that carries an auditing SACL that open can write a Security-log event, so an
+    open per key per interval can push older events out of the Security log: irreversible and unmeasured. So
+    `make_registry_mechanism(f3_counter, path_verify)` seeds the interval at ZERO (off; the default lives in the factory,
+    so a test calling the overload `agent.cpp` calls observes it), and the agent passes
+    `clamp_registry_path_verify(spark_registry_path_verify_interval_s)` (0 stays 0, 1 to 4 becomes 5 s, `n` >= 5 becomes
+    `n` s, ceiling 86400). The operator opts in at boot with `--spark-registry-path-verify-interval SECONDS` or
+    `YUZU_AGENT_SPARK_REGISTRY_PATH_VERIFY_INTERVAL` (a negative or above-ceiling value is refused at startup, from either
+    source). It is boot-time only: changing it needs an agent restart, and a runtime switch is still owed (#7876, which
+    also owes the File mechanism a setting; File is NOT changed by this). The flag exists on every OS and is ignored where
+    there is no Registry mechanism. A Windows service reaches the value only through `main.cpp`'s parse and
+    `--install-service` records no flag, so a machine-wide environment variable is the route; persistence of a value across
+    a service restart and an upgrade is NOT verified. **Consequence: with the default, #7836's rename detection does not
+    run**: a Registry watch whose parent key is renamed away is silently deaf again, as before the fix, until an operator
+    opts in. The #7836 acceptance criterion 4 (an operator knob exists) is now met, boot-time only; criterion 1 (the rename
+    is detected) holds only when the check is enabled. The tests count open attempts per key through a probe hook (zero
+    over a 6.5 s hold with the default, bounded by window over interval when enabled); Security-log behaviour (event 4656
+    counts, eviction) is NOT observed or asserted by any test, and no SACL is set in them.
     **Open residuals of the Registry fix** (none is claimed as covered; the first three are ACCEPTED residuals, owner
     Dave, no independent adjudicator, tracked in #7877): a parent renamed away and a key re-created at
     the original path BEFORE the next sample is not noticed (#7877 item 31), because the fresh open succeeds and is not
@@ -1912,10 +1935,10 @@ flip, with a red-first test each:
     it (the "no Fired event between Faulted and Recovered" case above is a File case). Cost and audit: one
     detached worker launch, one `RegOpenKeyExW`, one `RegNotifyChangeKeyValue`, one event and two or three handle
     closes per watched key per interval, and an object-access audit event on a key that carries an auditing SACL (not
-    measured; no figure is quoted). The cost statement of item (2) below, the missing off switch and #7876 (now titled for
-    the File and Registry mechanisms) apply to the Registry verification by reference, which the owner accepted; the
-    operator lever until then is `--spark-disable`, a boot-time flag that restarts the agent and switches off all three
-    spark mechanisms. A Registry delete-and-recreate case was not added: the existing RF-6 case (#4340) already covers
+    measured; no figure is quoted). The cost statement of item (2) below and #7876 (now titled for the File and Registry
+    mechanisms) apply to the Registry verification by reference, which the owner accepted; the operator levers until the
+    runtime switch exists are the boot-time Registry interval (0 = off, the default) and `--spark-disable`, a boot-time
+    flag that restarts the agent and switches off all three spark mechanisms. A Registry delete-and-recreate case was not added: the existing RF-6 case (#4340) already covers
     that transition, with a coverage oracle rather than a `fault()` oracle. *Windows Service: NOT covered*, by owner
     ruling: deleting a Windows service needs administrator rights. macOS has no File, Registry or Service
     mechanism, so there is nothing to test there.
@@ -2340,6 +2363,29 @@ flip, with a red-first test each:
     `b330b7c60a`, recomputed with `git show b330b7c60a:agents/core/src/spark_registry.cpp | md5sum`): every change to
     `spark_registry.cpp` after `5731eb0632` is comment-only and was not re-run, and the rig-run bytes remain those of
     `9c04408b6a`. The commit after `b330b7c60a` changes documentation and comments only.
+    **Registry verification default-off (REG-15-I2), rig bytes and runs.** Rig bytes (author-reported, weecolin Windows rig, not a
+    CI run, logs not committed): the commits `f4df321a9e` (production; whole-repo tree `2c55212c7e10506ebb81f30150d1c808e02ba4ac`) and
+    `1bdae636ab` (tests; tree `ca52b7b64fcd326dfd2111d3e22c5469f9515780`); md5 `5c6f1729417bc54093519b29c2f4a277` for
+    `test_spark_mechanism.cpp`, `a3e352b2830c5ab3912dcf13eafd51e4` for `spark_registry.cpp`, `f9d4e44e897d1b749a13c2528f764141`
+    for `spark_mechanism.hpp`, `ad55e31477b10f1a576c0ed1f134b862` for `agent.cpp`, `37136dc381f338541931c867f601fdd2` for `main.cpp`
+    and `c9c95d473e9e5fdeb8db143195721176` for `agent.hpp`. Normal build: `[mechanism]` 201 cases (5910 assertions), `[5719]` 76 (2332) and `[4415prA]`
+    105 (3544) green (before 198, 73, 105); `[known-gap-5719]` matches no case; the `Registry spark (real mechanism): *` pattern 32
+    cases (795 assertions) and the `File spark (real mechanism): *` pattern 54 cases (1687) green once; each of the eight Registry
+    cases 20 of 20 green, and 50 of 50 green with one busy-loop process per logical core (16). MSVC AddressSanitizer build of the same bytes
+    (same flags as above): the Registry pattern 3 times (32 cases each), `[5719]` 76, `[mechanism]` 201 and the File pattern (54) green,
+    no AddressSanitizer report in any run. Linux debug: `[mechanism]` 63 cases (3541 assertions), `[5719]` 44 (1276) and `[4415prA]`
+    105 (3544) green; the full agent suite on Linux showed 1 to 3 failures that differed between two runs under load
+    (the `[4415prA]` CH-7 case, a content-distribution fixture lookup) and pass when run alone (`[4415prA]` 105 cases, the content
+    distribution cases 15), so they are load-dependent and not caused by this change, which touches neither. **Mutations** (each
+    built from the restored source, 3 runs per case, restored md5 equal to the committed one): putting the compiled default back to
+    5 s in the constructor turned the default-off case red 3 of 3 (the other cases stayed green, as they pass their own
+    interval); removing the `count() > 0` guard at the sweeper's stage step turned the default-off case red 3 of 3 (it was not
+    asserted that the wake guard in `next_wake_locked` alone prevents a spin: that guard was not mutated); not counting
+    `verify_launched` turned the default-off case (its positive control) and the opt-in case red; ignoring the constructor's seed
+    turned the opt-in case red 3 of 3; removing the clamp's floor turned the Linux clamp case red. The default-off case holds for 6.5 s on
+    purpose: with a 1 s window the 5 s default mutation could not go red. Not observed or asserted by any of this: Security-log behaviour
+    (event 4656 counts, eviction on a key with an auditing SACL); the tests count open attempts through the probe hook only. Not run: a Windows
+    service restart with the value set (persistence on a service is NOT verified), any TSan run, any macOS build.
 - **Follow-ups (filed after #5497 merged: FU-1 is #5504; FU-2 to FU-5 are #5505; FU-6 and FU-7 are #5506; FU-8 and FU-9 are #5507).** (1) FU-1: measure the held-hold
   push rate and the endpoint journal eviction during a held period (a flip
   precondition, see AC-1). (2) FU-2: hang a full class quota of compensations, then
