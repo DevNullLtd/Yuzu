@@ -268,24 +268,107 @@ TEST_CASE("create_baseline/update_baseline reject an invalid lifecycle", "[pg][b
     CHECK(store.get_baseline(id)->lifecycle == kBaselineDraft); // untouched
 }
 
-TEST_CASE("Member set replace is transactional and de-duplicates", "[pg][baseline_store]") {
+TEST_CASE("ADR-0055: member replacement rolls back on mid-write failure and recovers",
+          "[pg][baseline_store][adr0055_members_atomicity]") {
+    // ADR-0055, Decision / Posture: authoritative CRUD failures reach the caller;
+    // Decision / Backfill records set_members' atomic full-replace contract.
+    // Exercise the real writer. The old happy-path-only case could not detect
+    // a DELETE committed separately from the replacement INSERTs.
     YUZU_REQUIRE_PG_DB_TPL(db, baselinestore_tpl);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PgPool pool{{.conninfo = db.dsn(), .size = 1}};
     BaselineStore store{pool};
-    const std::string id = *store.create_baseline(make_baseline("members"));
+    REQUIRE(store.is_open());
+    const auto created = store.create_baseline(make_baseline("members"));
+    REQUIRE(created.has_value());
+    const std::string id = *created;
+
+    // Observe committed state from a separate connection, not through the
+    // writer's return value or a read helper that collapses errors to empty.
+    struct MemberState {
+        std::string updated_at;
+        std::vector<std::string> rules;
+    };
+    const auto read_durable_state = [&] {
+        pg::PgConn observer{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(observer.get()) == CONNECTION_OK);
+        const auto rows = pg::exec_params(
+            observer.get(),
+            "SELECT b.updated_at::text, r.rule_id FROM baseline_store.baselines b "
+            "LEFT JOIN baseline_store.baseline_rules r USING (baseline_id) "
+            "WHERE b.baseline_id = $1 ORDER BY r.rule_id",
+            std::vector<std::string>{id});
+        REQUIRE(rows.status() == PGRES_TUPLES_OK);
+        REQUIRE(PQntuples(rows.get()) > 0); // parent must survive even an empty member set
+        MemberState state{PQgetvalue(rows.get(), 0, 0), {}};
+        for (int i = 0; i < PQntuples(rows.get()); ++i) {
+            if (!PQgetisnull(rows.get(), i, 1))
+                state.rules.emplace_back(PQgetvalue(rows.get(), i, 1));
+        }
+        return state;
+    };
 
     REQUIRE(store.set_members(id, {"r1", "r2", "r1", "", "r3"}).has_value());
     auto m = store.get_members(id);
     REQUIRE(m == std::vector<std::string>{"r1", "r2", "r3"}); // sorted, de-duped, blanks dropped
     CHECK(store.member_count(id) == 3);
+    REQUIRE(read_durable_state().rules == m);
 
-    // Replace wholesale.
+    // Make the parent touch distinguishable without sleeping across its
+    // second-granularity timestamp. The failed write must roll it back too.
+    exec_sql(db.dsn(), "UPDATE baseline_store.baselines SET updated_at = 1 "
+                       "WHERE baseline_id = '" + id + "'");
+    const auto before = read_durable_state();
+    REQUIRE(before.updated_at == "1");
+
+    const std::string remove_fault =
+        "DROP TRIGGER IF EXISTS yuzu_test_members_fault ON baseline_store.baseline_rules; "
+        "DROP FUNCTION IF EXISTS baseline_store.yuzu_test_members_fault()";
+    yuzu::test::ScopeExit restore{[&] { exec_sql_nothrow(db.dsn(), remove_fault); }};
+    exec_sql(db.dsn(), R"SQL(
+        CREATE FUNCTION baseline_store.yuzu_test_members_fault() RETURNS trigger
+        LANGUAGE plpgsql AS $$
+        BEGIN
+            IF NEW.rule_id = 'r2' THEN
+                IF NOT EXISTS (SELECT 1 FROM baseline_store.baseline_rules
+                               WHERE baseline_id = NEW.baseline_id AND rule_id = 'r9')
+                   OR EXISTS (SELECT 1 FROM baseline_store.baseline_rules
+                              WHERE baseline_id = NEW.baseline_id
+                                AND rule_id IN ('r1', 'r2', 'r3')) THEN
+                    RAISE EXCEPTION 'member fault did not reach the expected write boundary';
+                END IF;
+                RAISE EXCEPTION 'yuzu_test_members_mid_insert_failure';
+            END IF;
+            RETURN NEW;
+        END;
+        $$;
+        CREATE TRIGGER yuzu_test_members_fault BEFORE INSERT
+        ON baseline_store.baseline_rules FOR EACH ROW
+        EXECUTE FUNCTION baseline_store.yuzu_test_members_fault()
+    )SQL");
+
+    const auto failed = store.set_members(id, {"r9", "r2"});
+    REQUIRE_FALSE(failed.has_value());
+    // This exact marker also proves the fault happened AFTER the delete and
+    // the first replacement insert, rather than during admission or setup.
+    CHECK(failed.error().find("yuzu_test_members_mid_insert_failure") != std::string::npos);
+    CHECK_FALSE(is_conflict_error(failed.error()));
+    const auto after_failure = read_durable_state();
+    CHECK(after_failure.rules == before.rules);
+    CHECK(after_failure.updated_at == before.updated_at);
+
+    // The same valid request succeeds once the database fault is removed;
+    // the one-connection pool must remain usable after the aborted write.
+    exec_sql(db.dsn(), remove_fault);
     REQUIRE(store.set_members(id, {"r9", "r2"}).has_value());
-    CHECK(store.get_members(id) == std::vector<std::string>{"r2", "r9"});
+    const auto recovered = read_durable_state();
+    CHECK(recovered.rules == std::vector<std::string>{"r2", "r9"});
+    CHECK(recovered.updated_at != before.updated_at);
+    CHECK(store.get_members(id) == recovered.rules);
 
     // Clear.
     REQUIRE(store.set_members(id, {}).has_value());
     CHECK(store.get_members(id).empty());
+    CHECK(read_durable_state().rules.empty());
 }
 
 TEST_CASE("set_members on a non-existent baseline is not-found", "[pg][baseline_store]") {

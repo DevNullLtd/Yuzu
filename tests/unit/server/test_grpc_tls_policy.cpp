@@ -268,6 +268,7 @@ TEST_CASE("grpc tls policy: positive TLS 1.2 via a suite outside gRPC's default"
     REQUIRE(r.connect_ok);
     CHECK(r.handshake_ok);
     CHECK(r.version == "TLSv1.2");
+    CHECK(r.alpn == "h2");
     CHECK(r.cipher == "ECDHE-ECDSA-CHACHA20-POLY1305");
 }
 
@@ -283,6 +284,7 @@ TEST_CASE("grpc tls policy: positive TLS 1.3 with the suite asserted", "[tls][ha
     REQUIRE(r.connect_ok);
     CHECK(r.handshake_ok);
     CHECK(r.version == "TLSv1.3");
+    CHECK(r.alpn == "h2");
     CHECK((r.cipher == "TLS_AES_256_GCM_SHA384" || r.cipher == "TLS_CHACHA20_POLY1305_SHA256" ||
           r.cipher == "TLS_AES_128_GCM_SHA256"));
 }
@@ -499,6 +501,7 @@ TEST_CASE("grpc tls policy: negative wrong-CA gateway impersonator (outbound)",
     CHECK(good.wait_for_handshake(std::chrono::seconds(5)));
     good.stop();
     CHECK(good.observed.handshake_ok);
+    CHECK(good.observed.alpn == "h2");
 }
 
 // ── Positive/negative: outbound builder forced onto specific policies ───────
@@ -521,6 +524,7 @@ TEST_CASE("grpc tls policy: positive outbound builder forced to TLS 1.2 on a pin
 
     CHECK(server.observed.handshake_ok);
     CHECK(server.observed.version == "TLSv1.2");
+    CHECK(server.observed.alpn == "h2");
     CHECK(server.observed.cipher == "ECDHE-ECDSA-CHACHA20-POLY1305");
 }
 

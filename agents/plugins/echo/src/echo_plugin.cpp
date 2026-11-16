@@ -105,37 +105,6 @@ int64_t netconn_lookback_seconds(yuzu::echo::EchoDatabase& db) {
 
 // ── State serialization helpers ──────────────────────────────────────────────
 
-json processes_to_json(const std::vector<yuzu::agent::ProcessInfo>& procs) {
-    json arr = json::array();
-    for (const auto& p : procs) {
-        arr.push_back({{"pid", p.pid},
-                       {"ppid", p.ppid},
-                       {"name", p.name},
-                       {"cmdline", p.cmdline},
-                       {"user", p.user}});
-    }
-    return arr;
-}
-
-std::vector<yuzu::agent::ProcessInfo> json_to_processes(const std::string& s) {
-    std::vector<yuzu::agent::ProcessInfo> result;
-    if (s.empty())
-        return result;
-    try {
-        auto arr = json::parse(s);
-        for (const auto& j : arr) {
-            yuzu::agent::ProcessInfo p;
-            p.pid = j.value("pid", 0u);
-            p.ppid = j.value("ppid", 0u);
-            p.name = j.value("name", "");
-            p.cmdline = j.value("cmdline", "");
-            p.user = j.value("user", "");
-            result.push_back(std::move(p));
-        }
-    } catch (...) {}
-    return result;
-}
-
 json connections_to_json(const std::vector<yuzu::echo::NetConnection>& conns) {
     json arr = json::array();
     for (const auto& c : conns) {
@@ -633,6 +602,9 @@ public:
         }
         db_ = std::make_unique<yuzu::echo::EchoDatabase>(std::move(*result));
         reconcile_db_health_publish(ctx); // #1567: replay any unpublished quarantine fact
+        // #3864: a process baseline left by an earlier build holds command lines; rewrite it
+        // before any trigger can run. The result is advisory (logged inside, retried next start).
+        (void)yuzu::echo::scrub_process_baseline(*db_);
 
         // Load config
         int fast_interval = 60;
@@ -1705,7 +1677,7 @@ private:
                     // Checked (#1654): a failed seed must not be followed by a diff
                     // against a stale/empty baseline (ghost `started` storm), so the
                     // poll re-seeds WITHOUT diffing on the next tick.
-                    if (!db_->set_state(proc_key, processes_to_json(current).dump())) {
+                    if (!db_->set_state(proc_key, yuzu::echo::encode_process_baseline(current))) {
                         spdlog::error("ECHO: process poll-baseline seed failed after stream "
                                       "fallback; will re-seed next tick");
                         ctx.write_output("error|process state_save_failed");
@@ -1735,7 +1707,7 @@ private:
                 if (proc_poll_seed_pending_) {
                     // A previous stream-fallback seed failed: re-seed the baseline
                     // without diffing (no ghost `started` for every process).
-                    if (!db_->set_state(proc_key, processes_to_json(current).dump())) {
+                    if (!db_->set_state(proc_key, yuzu::echo::encode_process_baseline(current))) {
                         spdlog::error("ECHO: process poll-baseline re-seed failed");
                         ctx.write_output("error|process state_save_failed");
                         note_health("process", "state_save_failed");
@@ -1745,7 +1717,7 @@ private:
                     note_health("process", "baseline");
                 } else {
                     auto prev_json = db_->get_state(proc_key);
-                    auto previous = json_to_processes(prev_json);
+                    auto previous = yuzu::echo::decode_process_baseline(prev_json);
 
                     auto typed = yuzu::echo::compute_process_events(previous, current, ts, snap_id,
                                                                    redaction);
@@ -1755,7 +1727,7 @@ private:
                     // Events + baseline commit in ONE transaction (#1654): a failed
                     // baseline save can no longer leave events durable with a stale
                     // baseline that the next tick would re-diff and double-emit.
-                    const std::string state_json = processes_to_json(current).dump();
+                    const std::string state_json = yuzu::echo::encode_process_baseline(current);
                     const bool ok =
                         typed.empty()
                             ? db_->set_state(proc_key, state_json)
