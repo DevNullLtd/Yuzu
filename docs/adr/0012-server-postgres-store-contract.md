@@ -472,3 +472,22 @@ takes an account or RBAC lock, so nothing that holds `session_meta` waits on one
 The wait on that row is bounded per lock by the lifecycle `lock_timeout` the owner installs; session
 create and revoke writers install no timeout of their own and run under the pool defaults.
 A failed bump aborts the deactivation (the account stays active, a store failure to the caller).
+
+## Update (2026-11-16) -- a seventh query owner: DexAppUsageOwner
+
+A seventh query owner: `DexAppUsageOwner` (`dex_app_usage_owner.{hpp,cpp}`), the read behind the
+fleet application usage model of the Digital Employee Experience (DEX) Apps list. It is a READ join
+across `app_usage_store.agent_last_used`, `app_usage_store.usage_state` and
+`guaranteed_state_store.guardian_observations` on one lease (`pool.with_txn_for`, `SET LOCAL
+statement_timeout`, one statement). One statement matters for the same reason as the fifth owner:
+usage collection can be off per device, so crashes and hangs counted on every online device over
+usage from only the reporting devices would overstate the exposure rate. The usage totals, the
+exposed events and the reporting count therefore come from one population. A device counts only when
+the server received its usage state within the last 48 hours (`usage_state.last_seen`, the server's
+receipt time, never the agent's collection time); stale devices are counted separately and add
+nothing else. Events are cut at both ends of the window, so a future-dated observation never enters
+a numerator. The owner returns aggregates per application and cell and never an agent id. A degraded
+read (no connection in the bounded acquire, a statement error or timeout, an index out of range)
+returns `std::nullopt`, distinct from an engaged empty result. Nothing about the rule changes: the
+owner borrows the pool, issues schema-qualified SQL with bound parameters, and no per-store class
+gained a cross-schema method.
