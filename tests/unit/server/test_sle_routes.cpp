@@ -306,9 +306,10 @@ TEST_CASE("sle erase: scoped Decommission:Delete gate — out-of-scope 403, no e
     CHECK(h.audits.empty()); // denied before the attempt audit / cascade
 }
 
-// The route is NAMED for licences but the cascade erases FIVE per-agent stores spanning
-// THREE securables' READ (SoftwareLicensing/software_licensing, Inventory/inventory+
-// software_inventory+device_inventory, GuaranteedState/app_perf_daily). Rather than a
+// The route is NAMED for licences but the cascade erases TEN per-agent stores (when this was written
+// it was FIVE, spanning THREE securables' READ: SoftwareLicensing/software_licensing, Inventory/
+// inventory+software_inventory+device_inventory, GuaranteedState/app_perf_daily; the later stores
+// and ManagementGroup/management_group_memberships joined it). Rather than a
 // hand-maintained conjunction over all three — the shape ADR-0024 Decision 9 REVERSED
 // once a fourth securable was set to join (PLAN-01 ruling (b)) — the gate is now ONE
 // scoped securable, `Decommission:Delete`, that authorizes for the whole blast radius
@@ -397,12 +398,12 @@ TEST_CASE("sle erase: all-Deleted → 200 decommissioned, attempt+success audite
     CHECK(h.audited("sle.agent.decommission|success"));
 }
 
-// #5675: route passthrough only. The handler reports whatever stores the injected cascade result
-// names, so this pins the nine-entry JSON shape and that a Failed Guardian line is not rolled up
+// #5675 / MG PR-5a: route passthrough only. The handler reports whatever stores the injected cascade
+// result names, so this pins the ten-entry JSON shape and that a Failed Guardian line is not rolled up
 // into a success. It does not prove the cascade registers or wires the Guardian store: that is
 // the real-store fan-out in test_agent_decommission.cpp and
 // tests/test_decommission_wiring_lexical.py.
-TEST_CASE("sle erase: a nine-entry stores result is passed through per store (route shape)",
+TEST_CASE("sle erase: a ten-entry stores result is passed through per store (route shape)",
           "[sle_routes]") {
     SleHarness h;
     h.allow_scoped_all = true;
@@ -410,7 +411,8 @@ TEST_CASE("sle erase: a nine-entry stores result is passed through per store (ro
     r.agent_id = "agent-1";
     for (const char* name : {"inventory", "software_inventory", "app_perf_daily",
                              "device_inventory", "software_licensing", "app_usage",
-                             "offline_endpoint", "certificate_inventory", "guaranteed_state"}) {
+                             "offline_endpoint", "certificate_inventory", "guaranteed_state",
+                             "management_group_memberships"}) {
         r.stores.push_back({name, DecommissionOutcome::Deleted, ""});
         ++r.deleted;
     }
@@ -420,12 +422,18 @@ TEST_CASE("sle erase: a nine-entry stores result is passed through per store (ro
         REQUIRE(res);
         REQUIRE(res->status == 200);
         const auto j = json::parse(res->body)["data"];
-        CHECK(j["deleted"] == 9);
-        REQUIRE(j["stores"].size() == 9);
+        CHECK(j["deleted"] == 10);
+        REQUIRE(j["stores"].size() == 10);
         CHECK(j["stores"]["guaranteed_state"] == "deleted");
+        CHECK(j["stores"]["management_group_memberships"] == "deleted");
     }
-    h.decommission_result.stores.back().outcome = DecommissionOutcome::Failed;
-    h.decommission_result.stores.back().error = "txn rolled back";
+    // Fail the Guardian line by NAME: it is no longer the last entry.
+    for (auto& st : h.decommission_result.stores) {
+        if (st.store == "guaranteed_state") {
+            st.outcome = DecommissionOutcome::Failed;
+            st.error = "txn rolled back";
+        }
+    }
     --h.decommission_result.deleted;
     ++h.decommission_result.failed;
     {

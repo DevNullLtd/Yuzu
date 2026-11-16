@@ -11327,6 +11327,7 @@ public:
             .offline_endpoint = offline_endpoint_store_.get(),
             .certificate_inventory = certificate_inventory_store_.get(),
             .guaranteed_state = guaranteed_state_store_.get(),
+            .management_group_memberships = mgmt_group_store_.get(),
         }};
         return cascade.decommission(agent_id);
     }

@@ -19,7 +19,11 @@
 /// device was erased. It does not for `guaranteed_state` (#5675): that store deletes the device's
 /// per-agent order row and the compliance census rows and retires the pending census evidence,
 /// and the Guardian event log and the DEX observations are retained until retention expiry (never,
-/// when the retention setting is 0 or below). The Art.17 reading of a result must therefore go
+/// when the retention setting is 0 or below). For `management_group_memberships` (MG PR-5a) it
+/// means the agent's rows in every management group (static, dynamic and root) were removed in one
+/// statement; the enrolment row is untouched, so the same id can still reconnect and its next
+/// Register re-adds the ROOT group only, and a concurrent add can re-insert it (point-in-time, see
+/// `ManagementGroupStore::delete_agent`). The Art.17 reading of a result must therefore go
 /// through each store's own contract, not through the word `Deleted` alone.
 ///
 /// STANDING RULE — the gate is the single `Decommission:Delete` securable, so
@@ -28,7 +32,9 @@
 /// you MUST: (a) append the store here, (b) register it in
 /// `agent_decommission.cpp`'s registration list, (c) bump `kCascadeStoreCount` in
 /// `test_agent_decommission.cpp` (the drift guard, the null-store case's two counts, the
-/// unconfigured-store case's skipped count and the real-store fan-out's counts: four pins), (d) add
+/// unconfigured-store case's skipped count and the real-store fan-out's counts, including the two
+/// failing-census counts: seven numeric sites in five tests, plus `_MIN_FIELDS` in
+/// `tests/test_decommission_wiring_lexical.py`), (d) add
 /// the store to the blast-radius lists in `sle_routes.hpp`/`.cpp`, `rest_api_v1.cpp`'s delete
 /// block, ADR-0024 Decisions 9/11, and `rest-api.md`, (e) hand the live pointer over in
 /// `ServerImpl::decommission_agent` (`server.cpp`). The drift guard in
@@ -76,6 +82,7 @@ class AppUsageStore;
 class CertificateInventoryStore;
 class OfflineEndpointStore;
 class GuaranteedStateStore;
+class ManagementGroupStore;
 
 /// Per-store outcome of one decommission fan-out.
 enum class DecommissionOutcome {
@@ -141,6 +148,10 @@ struct AgentDecommissionStores {
     CertificateInventoryStore* certificate_inventory{nullptr}; ///< PG certificate_inventory_store (erase only)
     /// PG guardian_agent_order row + guardian_agent_rule_status census rows + pending-evidence retire (#5675)
     GuaranteedStateStore* guaranteed_state{nullptr};
+    /// PG management_group_members rows for the agent: every group, static and dynamic, root included
+    /// (MG PR-5a). Registered LAST. `Deleted` means the membership rows are gone, nothing more: the
+    /// enrolment row, the groups, their role assignments and the agent's tags are not touched.
+    ManagementGroupStore* management_group_memberships{nullptr};
 };
 
 /// A single decommission entry point that fans `delete_agent` across a fixed set

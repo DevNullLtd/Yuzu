@@ -7,6 +7,7 @@
 #include "rbac_store.hpp" // RbacStore::validate_assignment — shared engine-principal assignment guard
 #include "utf8_sanitize.hpp"
 
+#include <yuzu/log_token.hpp> // log_id_token, log_key_token
 #include <yuzu/metrics.hpp>
 
 #include <libpq-fe.h>
@@ -538,6 +539,33 @@ std::expected<void, std::string> ManagementGroupStore::remove_member(const std::
     if (r.status() != PGRES_COMMAND_OK)
         return std::unexpected(std::string("remove_member failed: ") + PQerrorMessage(lease.get()));
     return {};
+}
+
+bool ManagementGroupStore::delete_agent(std::string_view agent_id) {
+    if (!open_ || agent_id.empty())
+        return false;
+    // An operator request: the write budget, not the heartbeat-path one.
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease) {
+        spdlog::warn("ManagementGroupStore::delete_agent: no connection in time for agent {} ({})",
+                     ::yuzu::log_id_token(agent_id), pool_.last_error());
+        return false;
+    }
+    // A string_view may carry an embedded NUL; pg::exec_params refuses it (SQLSTATE 22021), so it
+    // returns false below rather than truncating onto another agent's id.
+    pg::PgResult r = pg::exec_params(
+        lease.get(),
+        "DELETE FROM management_group_store.management_group_members WHERE agent_id = $1",
+        std::vector<std::string>{std::string(agent_id)});
+    if (r.status() != PGRES_COMMAND_OK) {
+        spdlog::warn("ManagementGroupStore::delete_agent: delete failed for agent {}: {}",
+                     ::yuzu::log_id_token(agent_id),
+                     ::yuzu::log_key_token(PQerrorMessage(lease.get())));
+        return false;
+    }
+    spdlog::info("ManagementGroupStore::delete_agent: agent {} removed from {} group(s)",
+                 ::yuzu::log_id_token(agent_id), PQcmdTuples(r.get()));
+    return true;
 }
 
 std::vector<ManagementGroupMember>

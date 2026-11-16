@@ -32,6 +32,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "agent_decommission.hpp"
 #include "agent_registry.hpp"
 #include "app_usage_store.hpp"
 #include "audit_store.hpp"
@@ -4162,7 +4163,7 @@ TEST_CASE("Register: notification fires once on first enrollment; webhook/offloa
 // no approval), so every non-root membership it already had is still in place afterwards. Driven
 // through the real service with a real Postgres ManagementGroupStore; only the transport context is
 // null. Characterisation test: it passes before the decommission fix because nothing removes the rows.
-TEST_CASE("Register: a returning approved agent id keeps its non-root group memberships (MG PR-5a)",
+TEST_CASE("Register: a returning approved agent id keeps its non-root group memberships until decommission (MG PR-5a)",
           "[pg][agent_service][management_group][decommission]") {
     yuzu::test::ManagementGroupStorePg mg_bundle;
     yuzu::server::ManagementGroupStore& mg = *mg_bundle;
@@ -4228,6 +4229,28 @@ TEST_CASE("Register: a returning approved agent id keeps its non-root group memb
     REQUIRE(h.svc.Register(/*context=*/nullptr, &req, &again).ok());
     CHECK(again.accepted());
     CHECK(sorted_groups() == want);
+
+    // After the fix: decommission removes every membership, but it does NOT un-enrol the agent. The
+    // enrolment row is still approved, so the same id is accepted again on the fast path, and its
+    // Register re-adds the ROOT group only. The un-enrol change is a tracked follow-up.
+    yuzu::server::AgentDecommission cascade{
+        yuzu::server::AgentDecommissionStores{.management_group_memberships = &mg}};
+    const auto decom = cascade.decommission("returning-agent");
+    CHECK(decom.ok());
+    CHECK(decom.deleted == 1);
+    auto after = mg.get_agent_groups("returning-agent");
+    REQUIRE(after.has_value());
+    CHECK(after->empty());
+    auto still = h.auth_mgr.get_pending_status("returning-agent");
+    REQUIRE(still.has_value());
+    REQUIRE(still->has_value());
+    CHECK(**still == yuzu::server::auth::PendingStatus::approved); // not un-enrolled
+
+    apb::RegisterResponse third;
+    REQUIRE(h.svc.Register(/*context=*/nullptr, &req, &third).ok());
+    CHECK(third.accepted());
+    CHECK(sorted_groups() ==
+          std::vector<std::string>{yuzu::server::ManagementGroupStore::kRootGroupId});
 }
 
 // ── Metric: the delivery drop counters and pool gauges, registered and pre-seeded ──

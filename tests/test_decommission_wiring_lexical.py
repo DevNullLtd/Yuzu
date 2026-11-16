@@ -34,7 +34,7 @@ SRC = ROOT / "server" / "core" / "src"
 _RAW_OPEN = re.compile(r'"([^ ()\\\t\v\f\n"]{0,16})\(')
 # A struct member of the shape `Type* name{nullptr};`.
 _FIELD = re.compile(r"\b\w+\s*\*\s*(\w+)\s*\{\s*nullptr\s*\}\s*;")
-_MIN_FIELDS = 9  # the ninth store (guaranteed_state, #5675) joined an eight-store cascade
+_MIN_FIELDS = 10  # the tenth store (management_group_memberships, MG PR-5a) joined a nine-store cascade
 
 
 def strip_comments(text: str) -> str:
@@ -174,6 +174,9 @@ class DecommissionWiring(unittest.TestCase):
         cases = {
             "the ninth store is not wired": mutated(
                 "server.cpp", ".guaranteed_state = guaranteed_state_store_.get(),", ""),
+            "the tenth store is not wired": mutated(
+                "server.cpp",
+                ".management_group_memberships = mgmt_group_store_.get(),", ""),
             "the first store is not wired": mutated(
                 "server.cpp", ".inventory = inventory_store_.get(),", ""),
             "a store is wired from a literal null": mutated(
@@ -187,10 +190,13 @@ class DecommissionWiring(unittest.TestCase):
                 "// .guaranteed_state = guaranteed_state_store_.get(),"),
             "a struct field is not registered": mutated(
                 "agent_decommission.cpp", "stores.guaranteed_state", "stores.inventory", count=-1),
+            "the tenth struct field is not registered": mutated(
+                "agent_decommission.cpp", "stores.management_group_memberships",
+                "stores.inventory", count=-1),
             "a new struct field is never wired": mutated(
                 "agent_decommission.hpp", "GuaranteedStateStore* guaranteed_state{nullptr};",
                 "GuaranteedStateStore* guaranteed_state{nullptr}; "
-                "OfflineEndpointStore* tenth{nullptr};"),
+                "OfflineEndpointStore* eleventh{nullptr};"),
         }
         for label, files in cases.items():
             self.assertTrue(problems(files), f"mutation not reported: {label}")

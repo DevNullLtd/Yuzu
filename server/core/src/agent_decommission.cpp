@@ -9,6 +9,7 @@
 #include "app_perf_daily_store.hpp"
 #include "device_inventory_store.hpp"
 #include "inventory_store.hpp"
+#include "management_group_store.hpp"
 #include "software_inventory_store.hpp"
 #include "software_licensing_store.hpp"
 #include "app_usage_store.hpp"
@@ -108,6 +109,16 @@ AgentDecommission::AgentDecommission(const AgentDecommissionStores& stores) {
                                        return p->delete_agent(id);
                                    })
                                  : nullptr});
+    // The tenth store (MG PR-5a): the agent's management-group memberships. Registered LAST.
+    // `deleted` means every membership row for the id was removed; the enrolment row is NOT touched,
+    // so decommission still does not un-enrol the agent.
+    targets_.push_back(
+        {"management_group_memberships",
+         stores.management_group_memberships
+             ? Fn([p = stores.management_group_memberships](std::string_view id) {
+                   return p->delete_agent(id);
+               })
+             : nullptr});
 }
 
 void AgentDecommission::add_store(std::string name, std::function<bool(std::string_view)> deleter) {
