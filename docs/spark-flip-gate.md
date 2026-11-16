@@ -1787,10 +1787,16 @@ flip, with a red-first test each:
     - #7877: the umbrella of the remaining verification residuals is triaged, File and Registry. The Registry items
       are item 31 (a rename followed by a re-creation of the path before the next sample is not noticed; ACCEPTED
       residual, Dave, no independent adjudicator) and two more accepted residuals found by the #7836 governance
-      review: an undecided verification keeps the old handle and so misses a rename it saw until the next
-      verification that decides, and an Ancestor-mode watch is never verified, so a later rename of its shelter
-      ancestor (including one re-committed in Ancestor mode after a verdict) is missed; item 34 (a Fired from a
-      write in the renamed tree during the Faulted window, adjudicated LOW) is a fourth, noted in the residual list.
+      review: item 32 (an undecided verification keeps the old handle and so misses a rename it saw until the next
+      verification that decides) and item 33 (an Ancestor-mode watch is never verified, so a later rename of its
+      shelter ancestor, including one re-committed in Ancestor mode after a verdict, is missed); item 34 (a Fired
+      from a write in the renamed tree during the Faulted window, adjudicated LOW) is a fourth, noted in the residual
+      list. Items 35 to 40 (a probe lane of its own for the Registry verification, the admission backoff reset after
+      a refused verification, a transient false fault on a delete-and-recreate, no signal for a check that cannot
+      decide, the alert and cost measurement, and the missing tests) need code or tests and are triaged here, not
+      accepted. Items 41 and 42 are pre-existing test-helper lifetime items (the `FileProbeGate` and
+      `ServiceProbeGate` hooks capture `this`; a `[&]` `probe_hook` in the "allocation failure after a probe
+      launches" case).
     - #7901: a CI leg installs `dbus-daemon` and sets `YUZU_REQUIRE_SPARK_DBUS_TESTS`, so the Linux Service case runs.
     - Also below: export of the File debug counters (#7658; the Registry `verify_lost` and `verify_undecided` counters
       are test-only too and should be exported alongside them, a recommendation: #7658 does not yet say so), the audit,
@@ -1868,7 +1874,8 @@ flip, with a red-first test each:
     fault, in Ancestor mode while the path is still absent, in Target mode once it exists again). If the path still
     resolves to a key the result is discarded and the live handle stays. A verification that could not decide (open
     refused, notify refused, the probe threw) is counted (`verify_undecided`, a debug counter; the File counterpart is
-    `verify_unverifiable`, and the Registry mechanism has no launch-refusal counter of its own beyond `probe_admission_rejected`) and leaves the watch
+    `verify_unverifiable`, and the Registry mechanism has no launch-refusal counter of its own, only the shared
+    `probe_admission_rejected` / `probe_launch_failed`, which also count arm and re-arm refusals) and leaves the watch
     healthy and unfaulted, with no streak. Detection takes at most one interval plus a sweep wake plus the probe's own
     latency, plus the admission backoff (50 ms doubling to 30 s) on each verification launch the probe lane refused, so
     it is about 5 s in production only while the lane admits every verification: a refused launch increments the
@@ -1890,7 +1897,9 @@ flip, with a red-first test each:
     a key deleted and re-created around a verification (an installer) can fault a healthy watch with the same reason
     text and leave it without coverage until the retry, about 30 s, the synthetic fire covering the gap;
     a persistent access-denied on the verification open leaves the watch unverified with no fault and no streak (unlike
-    File); HKCR is a merged view, so a user-hive key that appears later changes what the path resolves to; every
+    File); HKCR is a merged view, so a user-hive key that appears later changes what the path resolves to, and a
+    registry link re-pointed to another target is the same class (the verification open follows links; both are
+    sub-cases of the rename-plus-recreate residual, item 31); every
     watch commits at about the same time at startup, so N watches launch their verifications together against the
     16-slot probe lane (no fairness queue like File's; a refused launch is retried on the admission backoff and does not
     demote coverage); a verification that hangs pins one probe-lane slot and that watch stays unverified, and because the
@@ -2323,7 +2332,10 @@ flip, with a red-first test each:
     same bytes (same flags as above): the Registry pattern 3 times and `[5719]` green, no AddressSanitizer report. The
     `ProbeGate` change is verified by code reading plus that AddressSanitizer run, not by a mutation (restoring a by-reference
     capture does not give a red test, because the destructor's bounded wait keeps the gate alive in every normal run). Not
-    re-run for the final bytes: the File pattern, the seven mutations, the Linux build and suites.
+    re-run for the final bytes: the File pattern, the seven mutations, the Linux build and suites. Commit `1beb84467e`
+    then changed seven lines of comment in `spark_registry.cpp` (the Faulted-window residual; md5
+    `08542dfb794b1b0072a3d157e8a11de6` at `1beb84467e`, recomputed with `git show 1beb84467e:agents/core/src/spark_registry.cpp | md5sum`)
+    and no code line, so it was not re-run; the rig-run md5 `8b9507c8...` above is the `9c04408b6a` blob.
 - **Follow-ups (filed after #5497 merged: FU-1 is #5504; FU-2 to FU-5 are #5505; FU-6 and FU-7 are #5506; FU-8 and FU-9 are #5507).** (1) FU-1: measure the held-hold
   push rate and the endpoint journal eviction during a held period (a flip
   precondition, see AC-1). (2) FU-2: hang a full class quota of compensations, then

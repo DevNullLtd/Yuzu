@@ -69,7 +69,9 @@
  *     just re-committed in Ancestor mode, so a later rename of its shelter ancestor
  *     is missed; a persistent access-denied on the verification open leaves the
  *     watch unverified with no fault (counted as undecided); HKCR is a merged
- *     view, so a user-hive key appearing later changes what the path resolves to;
+ *     view, so a user-hive key appearing later changes what the path resolves to,
+ *     and a registry link re-pointed to another target is the same class (the
+ *     verification open follows links; both are rename-plus-recreate sub-cases);
  *     every watch commits at about the same time at startup, so a large fleet of
  *     watches launches its verifications together (probe lane cap, refusals
  *     defer without demoting coverage); a registry open that hangs pins one slot
