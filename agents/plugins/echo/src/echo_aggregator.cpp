@@ -1091,4 +1091,19 @@ bool budget_setting_invalid(const std::expected<std::optional<std::string>, std:
     return stored.has_value() && stored->has_value() && !parse_budget_bytes(**stored);
 }
 
+DictGcPlan dict_gc_plan(int64_t now, int64_t last_done_ts, int64_t last_attempt_ts,
+                        int64_t starved_streak) noexcept {
+    const auto waited = [now](int64_t marker, int64_t interval) {
+        return marker <= 0 || marker > now || now - marker >= interval;
+    };
+    DictGcPlan plan;
+    if (starved_streak > 0) {
+        plan.due = waited(last_attempt_ts, kDictGcStarvedRetrySec);
+        plan.deadline = std::chrono::seconds(starved_streak == 1 ? 4 : 8);
+    } else {
+        plan.due = waited(last_done_ts, kDictGcIntervalSec);
+    }
+    return plan;
+}
+
 } // namespace yuzu::echo

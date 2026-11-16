@@ -878,9 +878,12 @@ public:
     /// live-set scan per pass into a temp table, then batches by id. A deadline hit is a
     /// result, not an error (GcResult::live_set_built says whether the scan finished; a
     /// pass whose scan outruns the deadline deletes nothing); any OTHER failure is
-    /// returned as an error, never as an empty success.
-    [[nodiscard]] std::expected<GcResult, std::string> gc_dictionary(EchoDatabase& db,
-                                                                      Clock::time_point deadline);
+    /// returned as an error, never as an empty success. `cancelled`, when set, is polled
+    /// wherever the deadline is (between batches and by the statement progress handler) and
+    /// counts as the deadline: a cancelled pass reports deadline_hit and deletes nothing more.
+    [[nodiscard]] std::expected<GcResult, std::string>
+    gc_dictionary(EchoDatabase& db, Clock::time_point deadline,
+                  const std::function<bool()>& cancelled = {});
 
 private:
     [[nodiscard]] Clock::time_point now() const { return now_ ? now_() : Clock::now(); }

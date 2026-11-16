@@ -568,6 +568,7 @@ public:
 
     yuzu::Result<void> init(yuzu::PluginContext& ctx) override {
         plugin_ctx_ = ctx.raw();
+        stopping_.store(false, std::memory_order_release);
 
         // Determine data directory
         auto data_dir = ctx.get_config("agent.data_dir");
@@ -1071,6 +1072,9 @@ public:
     }
 
     void shutdown(yuzu::PluginContext& ctx) noexcept override {
+        // First, before any lock: an in-flight purge holds collect_mu_ across its dictionary sweep,
+        // and the teardown below takes it. The sweep polls this and gives up.
+        stopping_.store(true, std::memory_order_release);
         ctx.unregister_trigger("echo.fast");
         ctx.unregister_trigger("echo.slow");
         ctx.unregister_trigger("echo.perf");
@@ -1493,6 +1497,10 @@ private:
     // Set when a pass ran out of time with evictable rows left and data still over target:
     // each fast tick then runs one more bounded slice (do_collect_fast) until it clears.
     std::atomic<bool> budget_catch_up_{false};
+    // Set as the first statement of shutdown(), before any lock, and read by an in-flight
+    // echo.purge_source (which holds collect_mu_ across its dictionary sweep) so the sweep gives up
+    // instead of making shutdown wait out its deadline. Cleared at init.
+    std::atomic<bool> stopping_{false};
     // The clock reading the pass that armed the catch-up was admitted with (the retention clock
     // guard had a verdict on it). Every slice of that drain runs with it, never a fresh reading:
     // a slice has no guard contact of its own. A separate field, not a sentinel in one int64,
@@ -3111,6 +3119,10 @@ private:
                 "budget_evicted_hourly_rows_total|{}",
                 db_->get_config(std::string{yuzu::echo::kBudgetEvictedHourlyKey}, "0")));
             ctx.write_output(std::format("dict_gc_last_ts|{}", db_->get_config("dict_gc_last_ts", "0")));
+            ctx.write_output(std::format("dict_gc_last_attempt_ts|{}",
+                                         db_->get_config("dict_gc_last_attempt_ts", "0")));
+            ctx.write_output(std::format("dict_gc_starved_streak|{}",
+                                         db_->get_config("dict_gc_starved_streak", "0")));
             ctx.write_output(
                 std::format("dict_gc_starved_total|{}", db_->get_config("dict_gc_starved_total", "0")));
             // incremental: auto_vacuum is on. deferred: a conversion VACUUM was wanted but the
@@ -3164,16 +3176,21 @@ private:
             int64_t rows = 0;
             int64_t oldest_ts = 0;
             if (!tier_table.empty()) {
-                auto count_q =
-                    db_->execute_query(std::format("SELECT COUNT(*), IFNULL(MIN({}), 0) FROM {}",
-                                                   bucket_col, tier_table),
-                                       /*max_rows=*/1);
-                if (count_q.has_value() && !count_q->rows.empty() && count_q->rows[0].size() == 2) {
-                    try {
-                        rows = std::stoll(count_q->rows[0][0]);
-                        oldest_ts = std::stoll(count_q->rows[0][1]);
-                    } catch (...) {}
-                }
+                // Two statements, not one: a lone COUNT(*) is answered from the b-tree's page
+                // counts and a lone MIN() is one index seek, but the pair in one SELECT scans the
+                // whole index (#7123; measured in docs/echo-implementer.md).
+                const auto scalar = [&](std::string_view expr) -> std::int64_t {
+                    auto q = db_->execute_query(std::format("SELECT {} FROM {}", expr, tier_table),
+                                                /*max_rows=*/1);
+                    if (q.has_value() && !q->rows.empty() && q->rows[0].size() == 1) {
+                        try {
+                            return std::stoll(q->rows[0][0]);
+                        } catch (...) {}
+                    }
+                    return 0;
+                };
+                rows = scalar("COUNT(*)");
+                oldest_ts = scalar(std::format("IFNULL(MIN({}), 0)", bucket_col));
             }
             ctx.write_output(std::format("config|{}_rows|{}", src.name, rows));
             ctx.write_output(std::format("config|{}_oldest_ts|{}", src.name, oldest_ts));
@@ -3858,7 +3875,9 @@ private:
                 "error|source_not_paused: {} is enabled; disable it before purging", source));
             return 1;
         }
-        auto res = db_->purge_source(source);
+        auto res = db_->purge_source(source, std::chrono::seconds(60), [this] {
+            return stopping_.load(std::memory_order_acquire);
+        });
         if (!res) {
             ctx.write_output(std::format("error|{}", res.error()));
             return 1;
@@ -3885,12 +3904,18 @@ private:
         // reported, so "purged" alone would overstate it. (The server's `echo.source.purge` audit
         // row is written at dispatch and carries no reply; only the status enum reaches the
         // server, the detail text stays in the agent log.)
-        if (res->dictionary_pending)
+        // The same holds for a WAL the final checkpoint could not truncate: the pre-delete page
+        // images of the purged rows stay in the -wal file until the next checkpoint. The
+        // dictionary outranks it in the status detail; the reply carries both flags.
+        if (res->dictionary_pending || res->wal_pending)
             ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
-                                  "echo:purge_dictionary_pending");
-        ctx.write_output(std::format(
-            R"({{"source":"{}","rows_deleted":{},"status":"purged","dictionary_pending":{}}})", source,
-            res->rows_deleted, res->dictionary_pending ? "true" : "false"));
+                                  res->dictionary_pending ? "echo:purge_dictionary_pending"
+                                                          : "echo:purge_wal_pending");
+        ctx.write_output(std::format(R"({{"source":"{}","rows_deleted":{},"status":"purged",)"
+                                     R"("dictionary_pending":{},"wal_checkpoint_pending":{}}})",
+                                     source, res->rows_deleted,
+                                     res->dictionary_pending ? "true" : "false",
+                                     res->wal_pending ? "true" : "false"));
         return 0;
     }
 
@@ -4520,13 +4545,13 @@ private:
         return 0;
     }
 
-    // The dictionary sweep: weekly, 2 s of steady clock (the PR 2 measurement: the live-set scan
-    // alone took about 1.6 s of the 2 s at 3.92 M roll-up rows). A pass whose scan outruns the
-    // deadline deletes nothing and is counted in `dict_gc_starved_total`; it is retried at the next
-    // maintenance pass, not in a week. The caller holds rollup_mu_.
+    // The dictionary sweep: weekly (dict_gc_plan). A pass whose live-set scan outruns its deadline
+    // deletes nothing, is counted in `dict_gc_starved_total`, and is retried a day later with a
+    // doubled deadline (2, 4, then 8 s; the PR 2 measurement: the scan alone took about 1.6 s of
+    // the 2 s at 3.92 M roll-up rows), so a starved database neither holds the database lock on
+    // every maintenance pass nor stays starved forever. Both markers are durable; a crash between
+    // the sweep and the marker writes repeats one attempt. The caller holds rollup_mu_.
     void run_dictionary_gc(std::int64_t now_ts) {
-        constexpr std::int64_t kDictGcIntervalSec = 7 * 86400;
-        constexpr auto kDictGcDeadline = std::chrono::seconds(2);
         // A stored integer; unset or unparsable reads as 0.
         const auto read_i64 = [this](const char* key) -> std::int64_t {
             const auto text = db_->get_config(key, "0");
@@ -4534,12 +4559,12 @@ private:
             const auto [p, ec] = std::from_chars(text.data(), text.data() + text.size(), v);
             return ec == std::errc{} && p == text.data() + text.size() ? v : 0;
         };
-        const std::int64_t last = read_i64("dict_gc_last_ts");
-        // A marker ahead of the clock was written during a forward excursion: stale, never a reason
-        // to wait.
-        if (last > 0 && last <= now_ts && now_ts - last < kDictGcIntervalSec)
+        const std::int64_t streak = read_i64("dict_gc_starved_streak");
+        const auto plan = yuzu::echo::dict_gc_plan(now_ts, read_i64("dict_gc_last_ts"),
+                                                   read_i64("dict_gc_last_attempt_ts"), streak);
+        if (!plan.due)
             return;
-        const auto swept = db_->fold().gc_dictionary(*db_, yuzu::echo::EchoFold::Clock::now() + kDictGcDeadline);
+        const auto swept = db_->fold().gc_dictionary(*db_, yuzu::echo::EchoFold::Clock::now() + plan.deadline);
         if (!swept) {
             spdlog::warn("ECHO: dictionary sweep failed: {}", swept.error());
             return;
@@ -4547,11 +4572,15 @@ private:
         if (!swept->live_set_built) {
             const auto total = std::to_string(read_i64("dict_gc_starved_total") + 1);
             db_->set_config("dict_gc_starved_total", total);
+            db_->set_config("dict_gc_last_attempt_ts", std::to_string(now_ts));
+            db_->set_config("dict_gc_starved_streak", std::to_string(streak + 1));
             spdlog::warn("ECHO: the dictionary sweep's scan did not finish inside its {} s deadline "
-                         "(starved {} time(s)); retrying at the next maintenance pass",
-                         kDictGcDeadline.count(), total);
+                         "(starved {} time(s)); retrying in a day with a longer deadline",
+                         plan.deadline.count(), total);
             return;
         }
+        if (streak > 0)
+            db_->set_config("dict_gc_starved_streak", "0");
         if (swept->deleted > 0)
             spdlog::info("ECHO: dictionary sweep removed {} unreferenced strings", swept->deleted);
         // Done for the week only when nothing is left to delete; a deadline hit mid-delete leaves

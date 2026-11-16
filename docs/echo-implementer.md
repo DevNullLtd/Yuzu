@@ -113,6 +113,37 @@ Flow:
    budget from the roll-up declarations with no change (it is listed in
    `budget_hourly_eligible_sources()`, which `test_echo_aggregator.cpp` pins
    to a literal so a new source is a decision).
+5. The weekly dictionary sweep (`run_dictionary_gc`, schedule in the pure
+   `dict_gc_plan`) holds `rollup_mu_` and the fold's `op_mu_` for its whole
+   deadline. A pass whose live-set scan does not finish deletes nothing and is
+   a starved pass: it bumps `dict_gc_starved_total` and `dict_gc_starved_streak`
+   and stamps `dict_gc_last_attempt_ts`; the next attempt is due a day later
+   (not at the next 15-minute pass) with the deadline doubled, 2 s, 4 s, then
+   8 s. A finished scan resets the streak to 0. Both markers are durable, so a
+   restart keeps the backoff; a crash between the sweep and the marker writes
+   repeats one attempt. A marker ahead of the clock is stale and never postpones
+   a pass. The 8 s ceiling is the bound: a scan that needs longer starves
+   every day (the upgrade is to resume the scan across passes). An operator
+   `purge_source` runs the same sweep under a 60 s deadline and a stop flag the
+   plugin sets as the first statement of `shutdown()`: the sweep polls it where
+   it polls the deadline, so an agent stop no longer waits behind `collect_mu_`
+   for the sweep. The same purge reports a final `TRUNCATE` checkpoint that did
+   not complete (busy timeout 0, so a pinned WAL answers at once) as
+   `wal_pending` rather than only logging it.
+
+**The `status` row-count scan (#7123), measured.** `status` reads each
+capture source's finest tier for its row count and oldest bucket. In one
+`SELECT COUNT(*), MIN(bucket)` SQLite scans the whole covering index; as two
+statements, `COUNT(*)` alone is answered from the b-tree's page counts and
+`MIN(bucket)` alone is one index seek (`EXPLAIN QUERY PLAN`: `SCAN ... COVERING
+INDEX` for the pair, `SEARCH ... COVERING INDEX` for the lone `MIN`). Scope: the
+`sqlite3` CLI (library 3.51.0, `/usr/bin/sqlite3`) on the Mac mini `braga`, one
+table with the generated `process_hourly_r` layout and its unique
+`(hour_ts, name, usr)` index, 2,000,000 synthetic rows, warm cache,
+`/usr/bin/time` wall clock over three runs: the combined statement took about
+0.10 s, the lone `COUNT(*)` 0.01 s, the lone `MIN` under 0.01 s. That is one
+host, one SQLite build and one table shape, not a fleet figure, so `status` now
+issues the two statements.
 
 Two in-memory structures keep the folded event volume down. `HourlySeenSet`
 (`echo_hour_dedup.hpp`) is membership-only, holds at most 20,000 keys, is

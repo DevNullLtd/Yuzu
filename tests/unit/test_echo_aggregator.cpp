@@ -3436,3 +3436,46 @@ TEST_CASE("process baseline: a scrub that cannot write leaves the row and succee
     CHECK(scrub_process_baseline(db)); // the next start
     CHECK(db.get_state("process").find("S3cret") == std::string::npos);
 }
+
+// =============================================================================
+// Dictionary sweep schedule
+// =============================================================================
+
+TEST_CASE("dictionary sweep plan: a starved pass waits a day before the next attempt",
+          "[echo][aggregator][dictionary]") {
+    constexpr int64_t kNow = 2'000'000'000;
+    CHECK_FALSE(dict_gc_plan(kNow, 0, kNow - 3600, 1).due);
+    CHECK_FALSE(dict_gc_plan(kNow, 0, kNow - (kDictGcStarvedRetrySec - 1), 1).due);
+    CHECK(dict_gc_plan(kNow, 0, kNow - kDictGcStarvedRetrySec, 1).due);
+    CHECK(dict_gc_plan(kNow, 0, 0, 1).due); // never attempted: unset reads as due
+}
+
+TEST_CASE("dictionary sweep plan: the deadline doubles per starved pass and stops at eight seconds",
+          "[echo][aggregator][dictionary]") {
+    constexpr int64_t kNow = 2'000'000'000;
+    const auto deadline = [&](int64_t streak) {
+        return dict_gc_plan(kNow, 0, 0, streak).deadline.count();
+    };
+    CHECK(deadline(0) == 2);
+    CHECK(deadline(1) == 4);
+    CHECK(deadline(2) == 8);
+    CHECK(deadline(3) == 8);
+    CHECK(deadline(1'000'000) == 8);
+}
+
+TEST_CASE("dictionary sweep plan: a finished pass resets the streak and waits a week",
+          "[echo][aggregator][dictionary]") {
+    constexpr int64_t kNow = 2'000'000'000;
+    // Streak 0 reads only the done marker; a stale attempt marker means nothing.
+    CHECK_FALSE(dict_gc_plan(kNow, kNow - 86400, kNow, 0).due);
+    CHECK_FALSE(dict_gc_plan(kNow, kNow - (kDictGcIntervalSec - 1), 0, 0).due);
+    CHECK(dict_gc_plan(kNow, kNow - kDictGcIntervalSec, 0, 0).due);
+    CHECK(dict_gc_plan(kNow, 0, 0, 0).due); // first ever pass
+}
+
+TEST_CASE("dictionary sweep plan: markers ahead of the clock never postpone a pass",
+          "[echo][aggregator][dictionary]") {
+    constexpr int64_t kNow = 2'000'000'000;
+    CHECK(dict_gc_plan(kNow, kNow + 86400, 0, 0).due);
+    CHECK(dict_gc_plan(kNow, 0, kNow + 86400, 2).due);
+}

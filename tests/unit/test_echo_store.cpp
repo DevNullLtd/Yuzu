@@ -7,6 +7,7 @@
 
 #include "echo_aggregator.hpp" // run_budget: the failed-measurement case
 #include "echo_db.hpp"
+#include "echo_fold.hpp" // gc_dictionary: the cancellable sweep
 #include "echo_netqual.hpp"
 #include "echo_netqual_boot.hpp"
 #include "echo_sql_executor.hpp"
@@ -5547,6 +5548,105 @@ TEST_CASE("EchoDatabase: purge_source reports a dictionary sweep that did not fi
     CHECK(!swept->dictionary_pending);
     CHECK(t.db.get_config("dict_gc_starved_total", "0") == "1");
     CHECK(first_cell(t.db, "SELECT COUNT(*) FROM echo_dict WHERE text = 'purged.exe'") == "0");
+}
+
+namespace {
+// One purged-then-starved "process" row: its dictionary string is left behind as an orphan.
+void seed_orphan_string(TestEchoDb& t) {
+    ProcessEvent e;
+    e.ts = 1000;
+    e.snapshot_id = 1;
+    e.action = "started";
+    e.pid = 1;
+    e.name = "purged.exe";
+    e.user = "u";
+    REQUIRE(t.db.fold_process_events({e}));
+    const auto starved = t.db.purge_source("process", std::chrono::seconds(0));
+    REQUIRE(starved.has_value());
+    REQUIRE(starved->dictionary_pending);
+}
+} // namespace
+
+TEST_CASE("EchoDatabase: dictionary sweep: a cancelled pass deletes nothing and reports the deadline as hit",
+          "[echo][store][purge][dictionary]") {
+    auto t = make_test_db();
+    seed_orphan_string(t);
+    const std::string orphan_sql = "SELECT COUNT(*) FROM echo_dict WHERE text = 'purged.exe'";
+    const auto far = EchoFold::Clock::now() + std::chrono::hours(1);
+
+    const auto at_once = t.db.fold().gc_dictionary(t.db, far, [] { return true; });
+    REQUIRE(at_once.has_value());
+    CHECK(at_once->deadline_hit);
+    CHECK(at_once->deleted == 0);
+    CHECK(first_cell(t.db, orphan_sql) == "1");
+
+    // A stop that arrives after the first poll: the pass ends at the next one, wherever that
+    // is (inside the scan or between batches). The poll count, not elapsed time, is the assertion.
+    int polls = 0;
+    const auto midway = t.db.fold().gc_dictionary(t.db, far, [&polls] { return ++polls >= 2; });
+    REQUIRE(midway.has_value());
+    CHECK(midway->deadline_hit);
+    CHECK(midway->deleted == 0);
+    CHECK(polls >= 2);
+    CHECK(first_cell(t.db, orphan_sql) == "1");
+
+    const auto done = t.db.fold().gc_dictionary(t.db, far);
+    REQUIRE(done.has_value());
+    CHECK_FALSE(done->deadline_hit);
+    CHECK(first_cell(t.db, orphan_sql) == "0");
+}
+
+TEST_CASE("EchoDatabase: purge: a stop request during the sweep returns with the dictionary and the WAL reported pending",
+          "[echo][store][purge][dictionary]") {
+    auto t = make_test_db();
+    ProcessEvent e;
+    e.ts = 1000;
+    e.snapshot_id = 1;
+    e.action = "started";
+    e.pid = 1;
+    e.name = "purged.exe";
+    e.user = "u";
+    REQUIRE(t.db.fold_process_events({e}));
+
+    const auto stopped = t.db.purge_source("process", std::chrono::seconds(60), [] { return true; });
+    REQUIRE(stopped.has_value());
+    CHECK(stopped->rows_deleted == 3);
+    CHECK(stopped->dictionary_pending);
+    CHECK(stopped->wal_pending);
+    CHECK(first_cell(t.db, "SELECT COUNT(*) FROM echo_dict WHERE text = 'purged.exe'") == "1");
+}
+
+TEST_CASE("EchoDatabase: purge: a checkpoint that finds the WAL pinned is reported as wal pending while the rows are gone",
+          "[echo][store][purge]") {
+    auto t = make_test_db();
+    ProcessEvent e;
+    e.ts = 1000;
+    e.snapshot_id = 1;
+    e.action = "started";
+    e.pid = 1;
+    e.name = "purged.exe";
+    e.user = "u";
+    REQUIRE(t.db.fold_process_events({e}));
+
+    // A read transaction on a second connection pins the WAL at its snapshot, so the purge's
+    // frames sit past the reader's mark and TRUNCATE (busy timeout 0) cannot reset the log. The
+    // owner closes the connection on every path, so a failed assertion cannot leave it locked.
+    SqliteOwner reader;
+    REQUIRE(sqlite3_open_v2(t.path.string().c_str(), &reader.db, SQLITE_OPEN_READONLY, nullptr) ==
+            SQLITE_OK);
+    exec_sql(reader.db, "BEGIN; SELECT COUNT(*) FROM echo_config;");
+
+    const auto pinned = t.db.purge_source("process");
+    REQUIRE(pinned.has_value());
+    CHECK(pinned->rows_deleted == 3);
+    CHECK_FALSE(pinned->dictionary_pending);
+    CHECK(pinned->wal_pending);
+    CHECK(first_cell(t.db, "SELECT COUNT(*) FROM process_hourly_r") == "0");
+
+    exec_sql(reader.db, "COMMIT");
+    const auto clear = t.db.purge_source("process");
+    REQUIRE(clear.has_value());
+    CHECK_FALSE(clear->wal_pending);
 }
 
 // =============================================================================

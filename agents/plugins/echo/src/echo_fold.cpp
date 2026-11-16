@@ -518,9 +518,13 @@ EchoFold::fold_cursor_rows(EchoDatabase& db, std::string_view source,
 }
 
 std::expected<GcResult, std::string> EchoFold::gc_dictionary(EchoDatabase& db,
-                                                             Clock::time_point deadline) {
+                                                             Clock::time_point deadline,
+                                                             const std::function<bool()>& cancelled) {
     std::lock_guard lock(op_mu_);
     GcResult out;
+    const auto expired = [this, deadline, &cancelled] {
+        return now() >= deadline || (cancelled && cancelled());
+    };
     // Run `sqls` in ONE transaction under the pass deadline. The RETURNING rows they
     // produced, or nullopt when the deadline fired (that transaction rolled back).
     const auto timed = [&](std::initializer_list<std::string> sqls)
@@ -528,7 +532,7 @@ std::expected<GcResult, std::string> EchoFold::gc_dictionary(EchoDatabase& db,
         int64_t rows = 0;
         bool hit = false;
         const auto r = db.checked_transaction([&](TransactionHandle& h) -> std::expected<void, std::string> {
-            ScopedProgressHandler guard(h.raw(), [this, deadline] { return now() >= deadline; });
+            ScopedProgressHandler guard(h.raw(), expired);
             for (const auto& sql : sqls) {
                 // A prepare can be interrupted too (it may re-load the schema after a VACUUM).
                 const StmtPtr st = prep(h, sql);
@@ -550,7 +554,7 @@ std::expected<GcResult, std::string> EchoFold::gc_dictionary(EchoDatabase& db,
 
     // Cooperative: checked before each batch starts and by the progress handler inside a statement
     // (the batch rolls back). Not mutex acquisition, BEGIN IMMEDIATE's busy wait or COMMIT I/O.
-    if (now() >= deadline) {
+    if (expired()) {
         out.deadline_hit = true;
         return out;
     }
@@ -580,7 +584,7 @@ std::expected<GcResult, std::string> EchoFold::gc_dictionary(EchoDatabase& db,
     const std::string del_orphan =
         std::format("DELETE FROM temp.{} WHERE id IN ({})", kGcOrphanTable, batch);
     for (;;) {
-        if (now() >= deadline) {
+        if (expired()) {
             out.deadline_hit = true;
             break;
         }

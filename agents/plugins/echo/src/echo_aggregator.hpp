@@ -17,6 +17,7 @@
 #include <yuzu/agent/process_enum.hpp> // ProcessInfo -- the process baseline codec
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -573,5 +574,22 @@ budget_from_config(const std::expected<std::optional<std::string>, std::string>&
 /// for a reason other than a failed read): the caller says so in the log and in `status`.
 [[nodiscard]] bool
 budget_setting_invalid(const std::expected<std::optional<std::string>, std::string>& stored);
+
+/// The dictionary sweep's schedule (run_dictionary_gc). A finished pass is next due a week after
+/// `last_done_ts`; a marker ahead of `now` (written during a forward clock excursion) is stale,
+/// never a reason to wait. A pass whose live-set scan outran its deadline ("starved") deleted
+/// nothing: it is retried daily rather than every maintenance pass, and its deadline doubles per
+/// consecutive starved pass up to 8 s, so a database whose scan is slow neither holds the
+/// database lock for 2 s of every pass nor can never finish. Pure: the caller reads the markers.
+/// ponytail: the 8 s ceiling is the bound; a scan that needs longer starves forever, and the
+/// upgrade path is to resume the scan across passes.
+inline constexpr int64_t kDictGcIntervalSec = 7 * 86400;
+inline constexpr int64_t kDictGcStarvedRetrySec = 86400;
+struct DictGcPlan {
+    bool due{false};
+    std::chrono::seconds deadline{2};
+};
+[[nodiscard]] DictGcPlan dict_gc_plan(int64_t now, int64_t last_done_ts, int64_t last_attempt_ts,
+                                      int64_t starved_streak) noexcept;
 
 } // namespace yuzu::echo

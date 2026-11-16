@@ -2029,7 +2029,8 @@ bool EchoDatabase::create_warehouse_tables() {
 
 std::expected<EchoDatabase::PurgeResult, std::string>
 EchoDatabase::purge_source(const std::string& source,
-                           std::chrono::steady_clock::duration dictionary_deadline) {
+                           std::chrono::steady_clock::duration dictionary_deadline,
+                           const std::function<bool()>& cancelled) {
     // Resolve the source's tables from the schema registry -- never hardcode. A roll-up tier
     // name (`process_hourly`) is a VIEW; the rows live in its `_r` table. The tables the roll-up
     // does not own (netqual_boot, usage_live, usage_daily) are named as they are.
@@ -2113,9 +2114,10 @@ EchoDatabase::purge_source(const std::string& source,
     // the result SAYS so and the starved counter moves (cmp-3): the action's audit row must not
     // record a complete erasure while the purged strings are still on disk. The weekly sweep
     // finishes the job.
-    PurgeResult out{static_cast<int>(total), false};
+    PurgeResult out{static_cast<int>(total), false, false};
     if (fold_) {
-        const auto swept = fold_->gc_dictionary(*this, EchoFold::Clock::now() + dictionary_deadline);
+        const auto swept =
+            fold_->gc_dictionary(*this, EchoFold::Clock::now() + dictionary_deadline, cancelled);
         if (!swept) {
             out.dictionary_pending = true;
             spdlog::warn("purge_source({}): the dictionary sweep failed ({}); the purged strings "
@@ -2144,8 +2146,12 @@ EchoDatabase::purge_source(const std::string& source,
     // reclaim disk, which a passive checkpoint won't do promptly. Force a TRUNCATE checkpoint
     // here so the erasure is complete and the WAL is reclaimed at return. Best-effort: the DELETE
     // already committed, so a checkpoint that can't fully complete (e.g. a lingering reader) is
-    // logged, not fatal -- the residue clears at the next one.
-    if (checkpoint(CheckpointMode::kTruncate) != CheckpointResult::kOk) {
+    // logged, not fatal -- the residue clears at the next one -- but REPORTED (`wal_pending`), as
+    // the dictionary is. A stop request skips it: the agent is going down and the close checkpoints.
+    if (cancelled && cancelled()) {
+        out.wal_pending = true;
+    } else if (checkpoint(CheckpointMode::kTruncate) != CheckpointResult::kOk) {
+        out.wal_pending = true;
         spdlog::warn("purge_source({}): WAL checkpoint(TRUNCATE) did not complete -- purged data may "
                      "persist in the WAL until the next checkpoint",
                      source);
