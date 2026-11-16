@@ -32,9 +32,13 @@ Linux-only under [ADR-0035](../adr/0035-server-is-linux-only-windows-is-agent-on
 `build_tests=true`, `build_agent=true`, `server=enabled` and the gateway toolchain
 are required. Missing registration is an error, not a smaller successful plan.
 `--only ID` (repeatable) selects a declared subset; the manifest records it.
-`--jobs N` defaults to four. `--build-timeout SECONDS` bounds the native build step; it defaults
-to `YUZU_CONTRACT_BUILD_TIMEOUT_S`, else 1800 (CI sets 3600, because a runner's first build of
-the contract build directory is cold).
+`--jobs N` is the native build's parallelism (`meson compile -j`) and defaults to four; the
+contracts themselves always run one at a time. `--build-timeout SECONDS` bounds the native build
+step; it defaults to `YUZU_CONTRACT_BUILD_TIMEOUT_S`, else 1800 (CI sets 3600, because a runner's
+first build of the contract build directory is cold). CI compiles the pilots' targets at the leg's
+full width before it runs the collector, so the collector's own build finds nothing to do: in a CI
+bundle the build step's duration and `build.log` record that no-op, not the compile cost, which is
+in the CI step log. See `docs/ci-architecture.md` "Contract migration evidence".
 
 On macOS or Windows (MSYS2 bash), select the four plugin/gateway contracts
 explicitly and leave the server disabled:
