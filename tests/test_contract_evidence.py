@@ -516,6 +516,32 @@ class CollectorTests(unittest.TestCase):
         with self.assertRaises(OSError):  # the failed attempt closed its descriptor
             os.fstat(opened[0])
 
+    def test_windows_lock_errors_map_only_a_held_region_to_busy(self):
+        # Exercise the msvcrt branch on every OS with a fake module: only a held region
+        # (EACCES, or LK_LOCK's EDEADLOCK) is BuildDirectoryBusy; any other fault is itself.
+        import types
+        for code, busy in ((errno.EACCES, True), (getattr(errno, "EDEADLOCK", errno.EDEADLK), True),
+                           (errno.ENOLCK, False), (errno.EBADF, False)):
+            with self.subTest(errno=errno.errorcode.get(code, code)):
+                calls = []
+
+                def locking(fd, mode, length, code=code):
+                    calls.append(mode)
+                    raise OSError(code, os.strerror(code))
+
+                fake = types.SimpleNamespace(LK_NBLCK=2, LK_UNLCK=0, locking=locking)
+                fd = os.open(self.build / "probe", os.O_RDWR | os.O_CREAT, 0o600)
+                try:
+                    with patch.dict(sys.modules, {"msvcrt": fake}), patch.object(evidence.os, "name", "nt"):
+                        with self.assertRaises((OSError, evidence.BuildDirectoryBusy)) as raised:
+                            evidence._lock_fd(fd)
+                finally:
+                    os.close(fd)
+                self.assertEqual(isinstance(raised.exception, evidence.BuildDirectoryBusy), busy)
+                if not busy:
+                    self.assertEqual(raised.exception.errno, code)
+                self.assertEqual(calls, [fake.LK_NBLCK])
+
     @unittest.skipIf(os.name == "nt", "O_NOFOLLOW is POSIX")
     def test_symlink_at_the_lease_path_is_refused_not_followed(self):
         target = self.root / "elsewhere"

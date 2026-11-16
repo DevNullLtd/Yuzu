@@ -3029,7 +3029,8 @@ type, a fixed explanation for a known type, and which error fields the
 manifest recorded, for example `contract-evidence: ERROR (BuildDirectoryBusy:
 a live collector holds .contract-evidence.lease; retry after it exits);
 recorded: error; error text stays in the private capture`. The portable
-bundle carries the same as `error_kind` and `error_fields`. The error text
+bundle carries the type and the field names, as `error_kind` and
+`error_fields`. The error text
 itself stays in the private capture on the runner, because it can carry
 values derived from the environment.
 

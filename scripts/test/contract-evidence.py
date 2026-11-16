@@ -92,12 +92,13 @@ def acquire_lease(build):
     """Return an open descriptor holding the build directory's lease.
 
     Any failure other than a live holder (no such directory, a read-only or
-    lock-less filesystem, a symlink at the lease path) propagates as itself, never
+    lock-less filesystem, a symlink at the lease path on POSIX) propagates as itself, never
     as BuildDirectoryBusy. Child processes never inherit the descriptor (PEP 446),
     so the lease covers the collector process only, not build or test processes
     that outlive it in their own sessions.
     """
-    # O_NOFOLLOW: a symlink planted at the lease path is refused, not followed.
+    # O_NOFOLLOW: a symlink planted at the lease path is refused, not followed (POSIX;
+    # Windows Python has no O_NOFOLLOW, so there the flag is 0 and a link is followed).
     fd = os.open(build/LEASE_NAME, os.O_RDWR | os.O_CREAT | getattr(os, 'O_NOFOLLOW', 0), 0o600)
     try:
         _lock_fd(fd)

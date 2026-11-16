@@ -72,9 +72,10 @@ few seconds after a kill: the system releases a dead process's locks asynchronou
 A second collector on the same directory fails at once with `BuildDirectoryBusy`. The
 lease covers the collector process only: a build or test process it started runs in
 its own session and, if it outlives a killed collector, is not covered. The file stays
-in place and means nothing while unlocked; a symlink at its path is refused. A
+in place and means nothing while unlocked; on Linux and macOS a symlink at its path is refused. A
 `.contract-evidence-lock` directory left by an older collector is ignored and can be
-deleted. The collector does not
+deleted; an older collector and a current one do not exclude each other, so do not run
+both on one build directory. The collector does not
 start PostgreSQL or other services. Live stack validation remains the separate
 `scripts/integration-test.sh --tls --free-ports --gateway-ct` workflow described in
 `integration-tests.md`; a mocked-RPC lifecycle case does not replace that test.
