@@ -4880,9 +4880,12 @@ void RestApiV1::register_routes(
             return;
 
         // The attempted row can wait on the audit pool: authenticate and authorise again, so a
-        // session invalidated or a grant revoked during the wait creates nothing.
+        // session invalidated or a grant revoked during the wait creates nothing. The username
+        // is compared too: the resolver falls through its credential sources (cookie, Bearer,
+        // X-Yuzu-Token), so with the first session gone a different principal's credential on the
+        // same request would resolve, and the rows (bound to the first) would misname the actor.
         const auto fresh_session = auth_fn(req, res);
-        if (!fresh_session) {
+        if (!fresh_session || fresh_session->username != session->username) {
             (void)detail::emit_behavioral_audit(bound_audit, req, res, "management_group.create",
                                                 "failure", "ManagementGroup", "",
                                                 mgmt_group_failure_detail("session_revoked",
@@ -5148,8 +5151,14 @@ void RestApiV1::register_routes(
                                                         httplib::Response& res, const char* action,
                                                         const std::string& group_id,
                                                         const std::string& agent_id,
-                                                        const AuditFn& bound_audit) {
-        if (!auth_fn(req, res)) {
+                                                        const AuditFn& bound_audit,
+                                                        const std::string& original_username) {
+        // The username is compared too: the resolver falls through its credential sources
+        // (cookie, Bearer, X-Yuzu-Token), so with the original session gone a different
+        // principal's credential on the same request would resolve, and the rows (bound to the
+        // original session) would misname the actor. A different principal counts as revoked.
+        const auto fresh = auth_fn(req, res);
+        if (!fresh || fresh->username != original_username) {
             (void)detail::emit_behavioral_audit(bound_audit, req, res, action, "failure",
                                                 "ManagementGroup", group_id,
                                                 mgmt_group_failure_detail("session_revoked",
@@ -5253,7 +5262,7 @@ void RestApiV1::register_routes(
                                                "ManagementGroup", group_id, agent_id))
                       return;
                   if (!mgmt_member_recheck(req, res, "management_group.add_member", group_id,
-                                           agent_id, bound_audit))
+                                           agent_id, bound_audit, session->username))
                       return;
                   if (auto added = mgmt_store->add_member(group_id, agent_id); !added) {
                       // The group vanished between the check above and the insert (the
@@ -5337,7 +5346,7 @@ void RestApiV1::register_routes(
                                          "ManagementGroup", group_id, agent_id))
                 return;
             if (!mgmt_member_recheck(req, res, "management_group.remove_member", group_id,
-                                     agent_id, bound_audit))
+                                     agent_id, bound_audit, session->username))
                 return;
             if (auto removed = mgmt_store->remove_member(group_id, agent_id); !removed) {
                 spdlog::warn("management_group.remove_member store failure: {}",

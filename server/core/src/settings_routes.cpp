@@ -7105,9 +7105,13 @@ void SettingsRoutes::register_routes(
         }
 
         // The attempted row can wait on the audit pool: authenticate and authorise again, so a
-        // session invalidated or a grant revoked during the wait creates nothing.
+        // session invalidated or a grant revoked during the wait creates nothing. The username
+        // is compared too: the resolver falls through its credential sources (cookie, Bearer,
+        // X-Yuzu-Token), so with the original session gone a different principal's credential
+        // on the same request would resolve, and the rows (bound to the original session) would
+        // misname the actor. A different principal counts as revoked.
         const auto fresh_session = auth_fn_(req, res); // writes its own 401 when gone
-        if (!fresh_session) {
+        if (!fresh_session || fresh_session->username != session->username) {
             (void)detail::emit_behavioral_audit(bound_audit, req, res, "management_group.create",
                                                 "failure", "ManagementGroup", "",
                                                 mgmt_group_failure_detail("session_revoked",

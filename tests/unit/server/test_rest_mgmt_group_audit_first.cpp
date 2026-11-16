@@ -89,6 +89,10 @@ struct AuditFirstHarness {
     /// does not look at the action): the session is gone / the permission is revoked, that is,
     /// every auth_fn / perm_fn call from then on answers that way.
     bool session_gone_after_attempted = false;
+    /// After an `attempted` row is stored the request resolves to a DIFFERENT principal
+    /// ("intruder"): the production resolver falls through cookie -> Bearer -> X-Yuzu-Token, so
+    /// with the first credential gone a second credential on the same request resolves.
+    bool other_principal_after_attempted = false;
     bool perm_revoked_after_attempted = false;
     /// The session is gone only AFTER the route's post-attempted re-check has passed (the
     /// re-check is the first auth_fn call once an attempted row is stored): the window in which
@@ -167,7 +171,8 @@ struct AuditFirstHarness {
             if (attempted_stored())
                 ++post_attempted_auth_calls;
             auth::Session s;
-            s.username = "tester";
+            s.username = (other_principal_after_attempted && attempted_stored()) ? "intruder"
+                                                                                  : "tester";
             s.role = auth::Role::user;
             return s;
         };
@@ -1726,4 +1731,72 @@ TEST_CASE("POST /management-groups/{id}/members: the group read failure log line
     const auto next_line = text.substr(eol + 1, text.find('\n', eol + 1) - (eol + 1));
     CHECK((next_line.empty() || next_line.front() == '['));
     CHECK(h.audits.empty()); // refused before any row
+}
+
+// ── C1 (PR #7920 review): a recheck that resolves a DIFFERENT principal is a revoked session ────
+// The rows are bound to the session resolved before the attempted row; a mutation authorised as
+// another principal would misname the actor. Nothing is mutated and the failure row names the
+// ORIGINAL principal.
+
+TEST_CASE("POST /management-groups: a different principal at the post-attempted recheck creates "
+          "nothing and writes a session_revoked row naming the original principal",
+          "[pg][rest][mgmt_group][mgmt-audit-first][security]") {
+    AuditFirstHarness h;
+    h.other_principal_after_attempted = true;
+    const auto before = h.group_count();
+
+    auto res = h.create(R"({"name":"other-principal"})");
+    REQUIRE(res);
+    CHECK(res->status == 401);
+    CHECK(h.group_count() == before);
+    CHECK_FALSE(h.group_exists("other-principal"));
+
+    REQUIRE(h.audits.size() == 2);
+    CHECK(h.audits[0].result == "attempted");
+    CHECK(h.audits[1].action == kCreate);
+    CHECK(h.audits[1].result == "failure");
+    CHECK(h.audits[1].detail == "session_revoked other-principal");
+    CHECK(h.audits[1].bound);
+    CHECK(h.audits[1].principal == "tester");
+    CHECK(h.audit_count(kCreate, "success") == 0);
+}
+
+TEST_CASE("POST and DELETE members: a different principal at the post-attempted recheck mutates "
+          "nothing and writes a session_revoked row naming the original principal",
+          "[pg][rest][mgmt_group][mgmt-audit-first][security]") {
+    AuditFirstHarness h;
+    const std::string gid = make_group(h, "other-principal-members");
+    REQUIRE(h.mgmt_bundle->add_member(gid, "agent-1").has_value());
+    h.other_principal_after_attempted = true;
+
+    SECTION("add member") {
+        auto res = h.add_member(gid, R"({"agent_id":"agent-2"})");
+        REQUIRE(res);
+        CHECK(res->status == 401);
+        const auto rows = h.rows_of(kAdd);
+        REQUIRE(rows.size() == 2);
+        CHECK(rows[0].result == "attempted");
+        CHECK(rows[1].result == "failure");
+        CHECK(rows[1].detail == "session_revoked agent-2");
+        CHECK(rows[1].bound);
+        CHECK(rows[1].principal == "tester");
+        CHECK(rows[1].target_id == gid);
+        CHECK(h.member_count(gid) == 1);
+        CHECK(h.audit_count(kAdd, "success") == 0);
+    }
+    SECTION("remove member") {
+        auto res = h.remove_member(gid, "agent-1");
+        REQUIRE(res);
+        CHECK(res->status == 401);
+        const auto rows = h.rows_of(kRemove);
+        REQUIRE(rows.size() == 2);
+        CHECK(rows[0].result == "attempted");
+        CHECK(rows[1].result == "failure");
+        CHECK(rows[1].detail == "session_revoked agent-1");
+        CHECK(rows[1].bound);
+        CHECK(rows[1].principal == "tester");
+        CHECK(rows[1].target_id == gid);
+        CHECK(h.member_count(gid) == 1);
+        CHECK(h.audit_count(kRemove, "success") == 0);
+    }
 }

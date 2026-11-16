@@ -62,6 +62,7 @@ namespace {
 
 constexpr const char* kCreate = "management_group.create";
 constexpr const char* kAdd = "management_group.add_member";
+constexpr const char* kRemove = "management_group.remove_member";
 constexpr const char* kPassword = "real-auth-password-123";
 
 struct RealAuthHarness {
@@ -202,6 +203,20 @@ struct RealAuthHarness {
     post(const std::string& path, const nlohmann::json& body,
          const std::unordered_map<std::string, std::string>& headers) {
         return sink.dispatch("POST", path, body.dump(), "application/json", headers);
+    }
+
+    std::unique_ptr<httplib::Response>
+    del(const std::string& path, const std::unordered_map<std::string, std::string>& headers) {
+        return sink.dispatch("DELETE", path, {}, "application/json", headers);
+    }
+
+    /// Alice's cookie AND bob's bearer API token on ONE request, both for local administrators.
+    /// The resolver tries the cookie first and falls through to the bearer token, so once alice's
+    /// session is revoked mid-request the request resolves to bob.
+    std::unordered_map<std::string, std::string> mixed_headers(const std::string& alice_cookie,
+                                                              const std::string& bob_bearer) {
+        return {{"Cookie", "yuzu_session=" + alice_cookie},
+                {"Authorization", "Bearer " + bob_bearer}};
     }
 
     /// Every stored row of one action, oldest first (the REAL store).
@@ -394,4 +409,108 @@ TEST_CASE("real auth: a bearer API token request names the token's principal wit
         CHECK(r.principal == "alice");
         CHECK(r.session_id.empty());
     }
+}
+
+// C1 (PR #7920 review): the post-attempted re-check must refuse a DIFFERENT principal, not just
+// an absent one. The resolver falls through cookie -> Bearer -> X-Yuzu-Token, so a request that
+// carries alice's cookie and bob's API token resolves to bob once alice's session is gone.
+// The rows are bound to alice; a mutation authorised as bob would misname the actor.
+
+TEST_CASE("real auth: create with alice's cookie and bob's bearer token, alice revoked after the "
+          "attempted row, is refused (the fall-through principal is not alice) and creates nothing",
+          "[pg][rest][mgmt_group][mgmt-audit-first][real-auth]") {
+    RealAuthHarness h(/*with_api_tokens=*/true);
+    const auto alice = h.login_admin("alice");
+    (void)h.login_admin("bob");
+    auto bob_raw = (*h.tokens)->create_token("bob-ci", "bob");
+    REQUIRE(bob_raw.has_value());
+    h.revoke_on_action = kCreate;
+    h.revoke_token = alice;
+
+    auto res = h.post("/api/v1/management-groups", {{"name", "real-mixed-create"}},
+                      h.mixed_headers(alice, *bob_raw));
+    REQUIRE(res);
+    INFO(res->status << " " << res->body);
+    REQUIRE(h.revoke_fired == 1);
+    CHECK_FALSE(h.auth_mgr.validate_session(alice).has_value());
+    CHECK(res->status == 401);
+    CHECK_FALSE(h.group_exists("real-mixed-create"));
+
+    const auto rows = h.rows_of(kCreate);
+    REQUIRE(rows.size() == 2);
+    CHECK(rows[0].result == "attempted");
+    CHECK(rows[1].result == "failure");
+    CHECK(rows[1].principal == "alice");
+    CHECK(rows[1].principal_role == "admin");
+    CHECK(rows[1].session_id == cookie_digest(alice));
+    CHECK(rows[1].detail == "session_revoked real-mixed-create");
+    for (const auto& r : rows)
+        CHECK(r.result != "success");
+}
+
+TEST_CASE("real auth: add member with alice's cookie and bob's bearer token, alice revoked after "
+          "the attempted row, is refused and adds nothing",
+          "[pg][rest][mgmt_group][mgmt-audit-first][real-auth]") {
+    RealAuthHarness h(/*with_api_tokens=*/true);
+    const auto alice = h.login_admin("alice");
+    (void)h.login_admin("bob");
+    auto bob_raw = (*h.tokens)->create_token("bob-ci", "bob");
+    REQUIRE(bob_raw.has_value());
+    const auto gid = h.make_group("real-mixed-add");
+    h.revoke_on_action = kAdd;
+    h.revoke_token = alice;
+
+    auto res = h.post("/api/v1/management-groups/" + gid + "/members",
+                      {{"agent_id", "agent-mixed-1"}}, h.mixed_headers(alice, *bob_raw));
+    REQUIRE(res);
+    INFO(res->status << " " << res->body);
+    REQUIRE(h.revoke_fired == 1);
+    CHECK(res->status == 401);
+    CHECK(h.mgmt_bundle->get_members(gid).empty());
+
+    const auto rows = h.rows_of(kAdd);
+    REQUIRE(rows.size() == 2);
+    CHECK(rows[0].result == "attempted");
+    CHECK(rows[1].result == "failure");
+    CHECK(rows[1].principal == "alice");
+    CHECK(rows[1].principal_role == "admin");
+    CHECK(rows[1].session_id == cookie_digest(alice));
+    CHECK(rows[1].target_id == gid);
+    CHECK(rows[1].detail == "session_revoked agent-mixed-1");
+    for (const auto& r : rows)
+        CHECK(r.result != "success");
+}
+
+TEST_CASE("real auth: remove member with alice's cookie and bob's bearer token, alice revoked "
+          "after the attempted row, is refused and removes nothing",
+          "[pg][rest][mgmt_group][mgmt-audit-first][real-auth]") {
+    RealAuthHarness h(/*with_api_tokens=*/true);
+    const auto alice = h.login_admin("alice");
+    (void)h.login_admin("bob");
+    auto bob_raw = (*h.tokens)->create_token("bob-ci", "bob");
+    REQUIRE(bob_raw.has_value());
+    const auto gid = h.make_group("real-mixed-remove");
+    REQUIRE(h.mgmt_bundle->add_member(gid, "agent-mixed-2").has_value());
+    h.revoke_on_action = kRemove;
+    h.revoke_token = alice;
+
+    auto res = h.del("/api/v1/management-groups/" + gid + "/members/agent-mixed-2",
+                     h.mixed_headers(alice, *bob_raw));
+    REQUIRE(res);
+    INFO(res->status << " " << res->body);
+    REQUIRE(h.revoke_fired == 1);
+    CHECK(res->status == 401);
+    CHECK(h.mgmt_bundle->get_members(gid).size() == 1);
+
+    const auto rows = h.rows_of(kRemove);
+    REQUIRE(rows.size() == 2);
+    CHECK(rows[0].result == "attempted");
+    CHECK(rows[1].result == "failure");
+    CHECK(rows[1].principal == "alice");
+    CHECK(rows[1].principal_role == "admin");
+    CHECK(rows[1].session_id == cookie_digest(alice));
+    CHECK(rows[1].target_id == gid);
+    CHECK(rows[1].detail == "session_revoked agent-mixed-2");
+    for (const auto& r : rows)
+        CHECK(r.result != "success");
 }

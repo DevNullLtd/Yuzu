@@ -94,6 +94,10 @@ struct MgmtGroupsHarness {
     // 403 into the response, as the production callbacks do.
     bool session_gone_after_attempt{false};
     bool perm_revoked_after_attempt{false};
+    /// After an `attempted` row is stored the request resolves to a DIFFERENT principal
+    /// ("intruder"): the production resolver falls through cookie -> Bearer -> X-Yuzu-Token, so
+    /// with the first credential gone a second credential on the same request resolves.
+    bool other_principal_after_attempt{false};
     /// The session is gone only AFTER the route's post-attempted re-check passed (the re-check is
     /// the first session resolution once an `attempted` row is stored): the window in which the
     /// outcome row is written. A row the re-resolving hook stamps from then on names nobody, so a
@@ -159,7 +163,7 @@ struct MgmtGroupsHarness {
             if (attempted_stored())
                 ++post_attempted_auth_calls;
             auth::Session s;
-            s.username = "admin";
+            s.username = (other_principal_after_attempt && attempted_stored()) ? "intruder" : "admin";
             s.role = auth::Role::admin;
             return s;
         };
@@ -614,6 +618,28 @@ TEST_CASE("Settings group create: a session or grant gone after the attempted ro
         CHECK(rows[1].bound);
     }
     CHECK(h.group_names().empty());
+}
+
+TEST_CASE("Settings group create: a different principal at the post-attempted recheck creates "
+          "nothing and writes a session_revoked row naming the original principal",
+          "[pg][settings][management-groups][mgmt-audit-first][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mgmt_routes_tpl);
+    MgmtGroupsHarness h(db.dsn());
+    h.other_principal_after_attempt = true;
+
+    auto res = h.create("Other Principal");
+    REQUIRE(res);
+    CHECK(res->status == 401);
+    CHECK(h.group_names().empty());
+    const auto rows = h.create_rows();
+    REQUIRE(rows.size() == 2);
+    CHECK(rows[0].result == "attempted");
+    CHECK(rows[1].result == "failure");
+    CHECK(rows[1].target_id.empty());
+    CHECK(rows[1].detail == "session_revoked Other Principal");
+    CHECK(rows[1].bound);
+    CHECK(rows[1].principal == "admin");
+    CHECK(h.create_rows().back().result != "success");
 }
 
 TEST_CASE("Settings group create: no session on the first resolution answers the 401 before any "
