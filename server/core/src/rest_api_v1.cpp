@@ -19,7 +19,9 @@
 #include "mgmt_group_owner_gate.hpp" // the one management-group owner-arm predicate
 #include "rbac_admin_predicate.hpp" // A2: is_rbac_administrator / is_self_target — global human role assignment gate
 #include "rbac_assignable_roles.hpp" // A2: kRbacAssignableRoles / is_rbac_assignable_role — closed 7-role set
+#include "mgmt_group_agent_known.hpp" // lookup_agent_known: the add-member `agent_known` audit flag, REST and MCP
 #include "mgmt_group_error.hpp" // mgmt_group_error_is_store_fault: one classifier for REST and MCP
+#include "mgmt_group_limits.hpp" // name / agent id / group id bounds and clean-text rule (REST, MCP, Settings)
 #include "rbac_text.hpp" // rbac_text_is_clean - the one clean-text predicate for RBAC identifiers
 #include "rbac_enforcement_read.hpp" // GET /api/v1/rbac/enforcement: the builder shared with MCP get_rbac_enforcement
 #include "app_perf_compare.hpp" // app_perf_param_valid — shared cap + control-char/NUL re-floor
@@ -1808,8 +1810,8 @@ const std::string& openapi_spec() {
       "overview": ["A management group is a named set of devices. Groups form a tree under one built-in root group called All Devices. Operators use them to organise the fleet, and to give a person or team a role over the devices in one branch only.", "Group membership and group roles feed the device confinement that other API groups apply. A role held on a group reaches the agents in that group and in the groups below it. This group of calls manages the groups, their members and the roles delegated on them.", "The group routes check global grants on the ManagementGroup securable. The roles routes add one group-scoped path, ITServiceOwner of that group, described under access."],
       "how_it_works": [{"title": "Root group", "text": "At start the server creates the root group All Devices (id 000000000000) if it is missing. Every agent is added to it when it registers, directly or through a gateway."}, {"title": "Build the tree", "text": "Create groups with an optional parent id. Add agents to a group one at a time. Group names must be unique across the whole tree."}, {"title": "Delegate roles", "text": "Assign Operator or Viewer to a user or a group principal on a management group. No other role can be delegated here."}, {"title": "Scope applies", "text": "When RBAC enforcement is on, a role held on a group is resolved to the agents in that group and the groups below it. Other API groups then confine their device reads and actions to that set."}],
       "tables": [{"title": "Kinds of group", "caption": "How members arrive and what the calls in this group can change.", "columns": ["Kind", "How members arrive", "What these calls can do"], "rows": [["Root (All Devices)", "Every agent is added on registration.", "Rename or describe it. Delete is refused with 403 and a new parent is refused with 400."], ["Static group", "You add agents one at a time.", "Add and remove members."], ["Dynamic group", "Entries marked source dynamic, written only by the server.", "Remove member never deletes a dynamic entry."], ["Service group", "Created by the server when a service tag is written, named Service: followed by the tag value.", "Same as a dynamic group. Members are filled from agents holding the tag when it is created."]]}],
-      "access": {"permissions": ["ManagementGroup:Read, gates list groups and get one group with its members. A global grant check.", "ManagementGroup:Write, gates create, update, add member, remove member and the agent count preview.", "ManagementGroup:Delete, gates delete group.", "ManagementGroup:Read plus either UserManagement:Read or ITServiceOwner of that group, gates list roles. The role list shows who holds which role, so it is treated as authorization topology.", "ManagementGroup:Write or ITServiceOwner of that group, gates assign role and unassign role."], "audit": ["management_group.create, written after a group is created.", "management_group.update, written after a group is updated.", "management_group.delete, written after a group is deleted.", "management_group.add_member, written after an add member call. A control byte or invalid UTF-8 in agent_id is written as denied (detail invalid_agent_id) and a store fault as failure (detail store_error).", "management_group.remove_member, written after a remove member call, with the same denied and failure rows.", "management_group.assign_role, written after a role is assigned. A control byte or invalid UTF-8 in the role name, principal_id or principal_type is written as denied (detail invalid_role_name, invalid_principal_id or invalid_principal_type) and a store fault as failure (detail store_error).", "management_group.unassign_role, written after a role is unassigned, with the same denied and failure rows. The success rows are written only after the store reports success, and the audit write result is not checked, so a failed audit write does not fail the request. A group id that names no group answers 404 on add member and assign role and writes no row. Reads are not audited."], "notes": ["The ITServiceOwner path on the roles routes is not offered to a service-scoped API token. Such a token is judged by the global permission check only.", "Only Operator and Viewer can be delegated. Any other role name returns 403.", "MCP tools exist for list, get, create, update, add member, list roles, assign role and the agent count preview. Delete, remove member and unassign role are REST only."]},
-      "good_to_know": [{"label": "Paging", "text": "The list returns every group in one response. The pagination block reports start 0, page size 50 and a total equal to the rows returned, whatever the size of the tree."}, {"label": "Dynamic groups", "text": "A dynamic group stores its scope expression, but the only server code that fills dynamic members is the service tag helper. A dynamic group you create through the API gets no members from its expression, so add static members or expect it to stay empty."}, {"label": "Write outcomes", "text": "Add member, remove member, assign role and unassign role answer success only after the store accepted the write. A control byte or invalid UTF-8 in an id is a 400, a group id naming no group on add member or assign role is a 404, and a store fault is a 503 with a retry hint. Removing an agent that was not a member, or unassigning a role that was not held, is not an error and still returns 200."}, {"label": "Delete cascades", "text": "Deleting a group also deletes the groups below it, their memberships and their role assignments. The agents themselves are not deleted."}, {"label": "Depth and cycles", "text": "A group may sit at most five levels below the root. Create is refused beyond that, and re-parenting is refused one level earlier. Moving a group under one of its own descendants is refused. Update changes only the fields you send."}, {"label": "Fail-closed read", "text": "Get one group reads the group row and its member list separately. If either read fails the call returns 503 with a retry hint, never a 404 or an empty member list."}, {"label": "RBAC off", "text": "While RBAC enforcement is off, device visibility falls back to every enrolled agent and group roles do not narrow it. Assign group roles before you turn enforcement on."}, {"label": "Ids and bodies", "text": "The server generates group ids as 12 lowercase hex characters, and the routes match only lowercase hex ids. Unassign role names the grant in its JSON body, not in the URL."}, {"label": "Count preview", "text": "The agent count preview needs ManagementGroup:Write, as creating a group does. Filters are repeated query parameters, and an empty filter set returns a count of 0 without reading the store. The response also lists unindexed_filter_keys, the filters whose value is longer than 2048 bytes as stored. Such a value is not indexed, so for those filters agent_count can be 0 or an undercount. If the response store is degraded it returns 503 with a retry hint."}],
+      "access": {"permissions": ["ManagementGroup:Read, gates list groups and get one group with its members. A global grant check.", "ManagementGroup:Write, gates create, update, add member, remove member and the agent count preview.", "ManagementGroup:Delete, gates delete group.", "ManagementGroup:Read plus either UserManagement:Read or ITServiceOwner of that group, gates list roles. The role list shows who holds which role, so it is treated as authorization topology.", "ManagementGroup:Write or ITServiceOwner of that group, gates assign role and unassign role."], "audit": ["management_group.create, written twice per call. An attempted row is stored before the group is created, then a success row (target_id is the new group id) or a failure row (detail is a token, a space and the group name the attempted row carries, the token being name_conflict, store_error or validation_refused; read the first space-delimited word as the token). If the attempted row cannot be stored the call answers 503 with Sec-Audit-Failed and creates nothing. The session and the permission are checked again after the attempted row, and a request that no longer passes writes a failure row (detail session_revoked or permission_revoked, then a space and the group name). A request refused before any write (permission, body, an empty name, a name or parent id over 256 bytes or holding a control character, an unknown parent, depth) writes no management_group row. A fault of the group store, including a failed read of the parent group, answers 503 with a retry hint. If only the outcome row cannot be stored the 201 stands and carries Sec-Audit-Failed.", "management_group.update, written after a group is updated.", "management_group.delete, written after a group is deleted.", "management_group.add_member, written twice per call once the request is valid and the group exists. An attempted row (detail is the agent id) is stored before the member is added, then a success row whose detail is the agent id, a space and agent_known=1, agent_known=0 or agent_known=unreadable (read the last space-delimited token) or a failure row (detail is a token, a space and the agent id the attempted row carries, the token being store_error, group_not_found, session_revoked or permission_revoked; read the first space-delimited word as the token). If the attempted row cannot be stored the call answers 503 with Sec-Audit-Failed and adds nothing; if only the outcome row cannot be stored the 201 stands and carries Sec-Audit-Failed. A control byte or invalid UTF-8 in agent_id is written as denied (detail invalid_agent_id) with no attempted row.", "management_group.remove_member, written twice per call in the same order: an attempted row, then a success row (detail is the agent id) or a failure row (detail is a token, a space and the agent id, the token being store_error, session_revoked or permission_revoked), with the same Sec-Audit-Failed behaviour and the same denied row for an invalid agent_id.", "management_group.assign_role, written after a role is assigned. A control byte or invalid UTF-8 in the role name, principal_id or principal_type is written as denied (detail invalid_role_name, invalid_principal_id or invalid_principal_type) and a store fault as failure (detail store_error).", "management_group.unassign_role, written after a role is unassigned, with the same denied and failure rows. The update, delete, assign role and unassign role success rows are written only after the store reports success, and the audit write result is not checked there, so a failed audit write does not fail those requests. A group id that names no group answers 404 on assign role and writes no row. On add member it answers 404 and writes no attempted row, a group id over 256 bytes is a 404 too, and a group deleted after that check writes a failure row (detail group_not_found, a space and the agent id). A failed read of the group before the attempted row answers 503 and writes no management_group row. Remove member does not check that the group or the member exists: removing from an absent group, or an absent member, answers 200 and writes attempted and success rows for a change that did nothing. Reads are not audited."], "notes": ["The ITServiceOwner path on the roles routes is not offered to a service-scoped API token. Such a token is judged by the global permission check only.", "Only Operator and Viewer can be delegated. Any other role name returns 403.", "MCP tools exist for list, get, create, update, add member, list roles, assign role and the agent count preview. Delete, remove member and unassign role are REST only."]},
+      "good_to_know": [{"label": "Paging", "text": "The list returns every group in one response. The pagination block reports start 0, page size 50 and a total equal to the rows returned, whatever the size of the tree."}, {"label": "Dynamic groups", "text": "A dynamic group stores its scope expression, but the only server code that fills dynamic members is the service tag helper. A dynamic group you create through the API gets no members from its expression, so add static members or expect it to stay empty."}, {"label": "Write outcomes", "text": "Add member, remove member, assign role and unassign role answer success only after the store accepted the write. A control byte or invalid UTF-8 in an id is a 400, as is an agent id over 256 bytes (that one writes no row), a group id naming no group on add member or assign role is a 404, and a store fault is a 503 with a retry hint. Removing an agent that was not a member, or unassigning a role that was not held, is not an error and still returns 200."}, {"label": "Delete cascades", "text": "Deleting a group also deletes the groups below it, their memberships and their role assignments. The agents themselves are not deleted."}, {"label": "Depth and cycles", "text": "A group may sit at most five levels below the root. Create is refused beyond that, and re-parenting is refused one level earlier. Moving a group under one of its own descendants is refused. Update changes only the fields you send."}, {"label": "Fail-closed read", "text": "Get one group reads the group row and its member list separately. If either read fails the call returns 503 with a retry hint, never a 404 or an empty member list."}, {"label": "RBAC off", "text": "While RBAC enforcement is off, device visibility falls back to every enrolled agent and group roles do not narrow it. Assign group roles before you turn enforcement on."}, {"label": "Ids and bodies", "text": "The server generates group ids as 12 lowercase hex characters, and the routes match only lowercase hex ids. Unassign role names the grant in its JSON body, not in the URL."}, {"label": "Count preview", "text": "The agent count preview needs ManagementGroup:Write, as creating a group does. Filters are repeated query parameters, and an empty filter set returns a count of 0 without reading the store. The response also lists unindexed_filter_keys, the filters whose value is longer than 2048 bytes as stored. Such a value is not indexed, so for those filters agent_count can be 0 or an undercount. If the response store is degraded it returns 503 with a retry hint."}],
       "docs": ["docs/user-manual/management-groups.md"]
     }},
 )json"
@@ -2042,7 +2044,7 @@ const std::string& openapi_spec() {
     },
     "/management-groups": {
       "get": {"operationId": "getManagementGroups", "summary": "List management groups", "tags": ["Management Groups"], "responses": {"200": {"description": "List of management groups", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MgmtGroupListResponse"}}}}}},
-      "post": {"operationId": "postManagementGroups", "summary": "Create a management group", "tags": ["Management Groups"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ManagementGroup"}}}}, "responses": {"201": {"description": "Group created", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MgmtGroupCreatedResponse"}}}}}}
+      "post": {"operationId": "postManagementGroups", "summary": "Create a management group", "tags": ["Management Groups"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ManagementGroup"}}}}, "description": "Audit-first: an attempted audit row is stored before the group is created, and a call whose attempted row cannot be stored creates nothing. The session and the permission are checked again after that row.", "responses": {"201": {"description": "Group created. If only the closing audit row could not be stored the 201 stands and the response carries Sec-Audit-Failed: true.", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when an audit row for this request could not be stored"}}, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MgmtGroupCreatedResponse"}}}}, "400": {"description": "Invalid JSON; an empty name; a name over 256 bytes or holding a control character or invalid UTF-8 (group name must be at most 256 bytes and must not contain control characters or invalid UTF-8); a parent_id over 256 bytes, holding such a character, or naming no group (parent group not found); a hierarchy deeper than five levels; or a name already used by another group (a group with that name already exists). A name conflict, and a parent removed after the check, are answered after the attempted row is stored and are recorded as a failure row; every other refusal writes no audit row."}, "503": {"description": "The group store could not answer, including a failed read of the parent group (fixed message; the store error text is not returned), or the attempted audit row could not be stored, in which case the response carries Sec-Audit-Failed: true. Nothing is created either way; the envelope includes retry_after_ms.", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when an audit row for this request could not be stored"}}}}}
     },
     "/management-groups/{id}": {
       "get": {"operationId": "getManagementGroupsById", "summary": "Get a management group with members", "tags": ["Management Groups"], "description": "Both the group row itself and its member list are read in a way that distinguishes a degraded store from a missing record, so a store-not-open, pool-acquire-timeout or query-error degrade on EITHER read fails closed with 503 rather than rendering a flat 404 (group-row degrade) or an authoritative empty members:[] (member-list degrade); retry_after_ms 2000 either way. A genuine not-found (the group row does not exist) still 404s.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Management group details", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MgmtGroupDetailResponse"}}}}, "404": {"description": "Group not found"}, "503": {"description": "Management group store read degraded (group-row or member resolution failed); retry shortly (standard error envelope, retry_after_ms 2000)."}}},
@@ -2052,10 +2054,10 @@ const std::string& openapi_spec() {
 )json"
         R"json(
     "/management-groups/{id}/members": {
-      "post": {"operationId": "postManagementGroupsByIdMembers", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["agent_id"], "properties": {"agent_id": {"type": "string"}}}}}}, "summary": "Add member to management group", "tags": ["Management Groups"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"201": {"description": "Member added", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MgmtGroupMemberAddedResponse"}}}}, "400": {"description": "agent_id missing, or it holds a control byte or invalid UTF-8"}, "404": {"description": "No management group has that id; nothing is written and no audit row is added"}, "503": {"description": "Store fault: nothing was added (retryable; envelope includes retry_after_ms)"}}}
+      "post": {"operationId": "postManagementGroupsByIdMembers", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["agent_id"], "properties": {"agent_id": {"type": "string"}}}}}}, "summary": "Add member to management group", "tags": ["Management Groups"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "description": "Audit-first: an attempted audit row is stored before the member is added, and a call whose attempted row cannot be stored adds nothing. The session and the permission are checked again after that row.", "responses": {"201": {"description": "Member added. If only the closing audit row could not be stored the 201 stands and the response carries Sec-Audit-Failed: true.", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when an audit row for this request could not be stored"}}, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MgmtGroupMemberAddedResponse"}}}}, "400": {"description": "The body is not a JSON object, agent_id is missing, agent_id is over 256 bytes, or agent_id holds a control character or invalid UTF-8. Only the last is recorded, as a denied audit row (detail invalid_agent_id)."}, "404": {"description": "No management group has that id (an id over 256 bytes included) when the request is checked: nothing is written and no attempted audit row is added. A group deleted after that check is also answered 404 and writes a failure row with detail group_not_found followed by a space and the agent id."}, "503": {"description": "The group store could not answer, or could not apply the add, or the attempted audit row could not be stored, in which case the response carries Sec-Audit-Failed: true. Nothing is added in any of these. A failed read of the group before the attempted row writes no management-group audit row and no Sec-Audit-Failed. Retryable; the envelope includes retry_after_ms.", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when an audit row for this request could not be stored"}}}}}
     },
     "/management-groups/{id}/members/{agent_id}": {
-      "delete": {"operationId": "deleteManagementGroupsByIdMembersByAgentId", "summary": "Remove member from management group", "tags": ["Management Groups"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Member removed", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MgmtGroupMemberRemovedResponse"}}}}, "400": {"description": "agent_id holds a control byte or invalid UTF-8"}, "503": {"description": "Store fault: nothing was removed (retryable; envelope includes retry_after_ms)"}}}
+      "delete": {"operationId": "deleteManagementGroupsByIdMembersByAgentId", "summary": "Remove member from management group", "tags": ["Management Groups"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "description": "Audit-first: an attempted audit row is stored before the member is removed, and a call whose attempted row cannot be stored removes nothing. The session and the permission are checked again after that row. There is no check that the group or the member exists: removing an absent member, or from a group that does not exist, answers 200 and writes attempted and success audit rows for a change that did nothing.", "responses": {"200": {"description": "Member removed, or there was nothing to remove. If only the closing audit row could not be stored the 200 stands and the response carries Sec-Audit-Failed: true.", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when an audit row for this request could not be stored"}}, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MgmtGroupMemberRemovedResponse"}}}}, "400": {"description": "agent_id is over 256 bytes (no audit row), or holds a control character or invalid UTF-8 (a denied audit row, detail invalid_agent_id)"}, "404": {"description": "The group id in the path is over 256 bytes; nothing is written and no audit row is added"}, "503": {"description": "The store could not apply the removal, or the attempted audit row could not be stored, in which case the response carries Sec-Audit-Failed: true. Nothing is removed in either case; retryable, the envelope includes retry_after_ms.", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when an audit row for this request could not be stored"}}}}}
     },
     "/management-groups/{id}/roles": {
       "get": {"operationId": "getManagementGroupsByIdRoles", "summary": "List roles assigned to a management group", "tags": ["Management Groups"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "List of role assignments", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MgmtGroupRoleListResponse"}}}}}},
@@ -4785,9 +4787,31 @@ void RestApiV1::register_routes(
                                  "application/json");
              });
 
-    sink.Post("/api/v1/management-groups", [auth_fn, perm_fn, audit_fn,
-                                            mgmt_store](const httplib::Request& req,
-                                                        httplib::Response& res) {
+    // A management-group write whose store call reported an error answers a
+    // retryable 503 with a fixed message (the store's libpq text is never
+    // echoed), never a 2xx. The caller writes the matching `failure` audit row.
+    const auto mgmt_write_failed = [](httplib::Response& res) {
+        res.status = 503;
+        res.set_content(
+            detail::a4_error(res, "management group store unavailable",
+                             detail::A4ErrorOpts{.retry_after_ms = mcp::kMcpStoreFaultRetryMs,
+                                                 .remediation = "retry shortly"}),
+            "application/json");
+    };
+
+    // Create is audit-first (ADR-0033 section 9, "no audit row, no mutation", #7074): the
+    // `attempted` row is stored BEFORE create_group and a row that cannot be stored refuses the
+    // create (503 + Sec-Audit-Failed). Every refusal that needs no write to decide (permission,
+    // body, `validate_new_group`) answers first and burns no row. The attempted row can wait on
+    // the audit pool, so the session and the permission are decided again after it (#3619, the
+    // dashboard's group.create_from_results twin). Failure rows carry a FIXED token and the
+    // group name the `attempted` row carries (`mgmt_group_failure_detail`), never store text; the
+    // group name (success/attempted detail) is the existing raw-name contract.
+    sink.Post("/api/v1/management-groups", [auth_fn, perm_fn, audit_fn, mgmt_store,
+                                            mgmt_write_failed,
+                                            audit_as_session = audit_as_session_fn_](
+                                               const httplib::Request& req,
+                                               httplib::Response& res) {
         if (!perm_fn(req, res, "ManagementGroup", "Write"))
             return;
         if (!mgmt_store) {
@@ -4810,17 +4834,103 @@ void RestApiV1::register_routes(
         g.membership_type = body.value("membership_type", "static");
         g.scope_expression = body.value("scope_expression", "");
 
-        auto session = auth_fn(req, res);
-        if (session)
-            g.created_by = session->username;
+        // The name and the parent id are bounded and held to clean text BEFORE any store read or
+        // `attempted` row (mgmt_group_limits.hpp): each value lands in two audit rows, and a name
+        // the unique index cannot hold would otherwise read as a retryable store fault. The
+        // refusal text is fixed, never the caller's value; nothing is written.
+        if (!mgmt_group_name_ok(g.name)) {
+            res.status = 400;
+            res.set_content(detail::a4_error(res, std::string(kMgmtGroupNameInvalidText)),
+                            "application/json");
+            return;
+        }
+        if (!mgmt_group_id_ok(g.parent_id)) { // an id like this names no group
+            res.status = 400;
+            res.set_content(detail::a4_error(res, "parent group not found"), "application/json");
+            return;
+        }
+
+        // The checks create_group runs before its insert, decided here so a refusal burns no
+        // `attempted` row. A fault of the store itself is a retryable 503, never a 400.
+        if (auto valid = mgmt_store->validate_new_group(g); !valid) {
+            if (mgmt_group_error_is_store_fault(valid.error())) {
+                mgmt_write_failed(res);
+                return;
+            }
+            res.status = 400;
+            res.set_content(detail::a4_error(res, valid.error()), "application/json");
+            return;
+        }
+
+        const auto session = auth_fn(req, res); // writes its own 401
+        if (!session)
+            return; // no caller to name: no audit row is written and nothing is created
+        g.created_by = session->username;
+        // EVERY row of this route that names the caller (the `attempted` row, the `*_revoked`
+        // failure rows and the outcome row) is stamped from the session resolved here: each can
+        // be written after the session is gone (the audit pool wait, the recheck below and
+        // create_group's pool wait), when the re-resolving `audit_fn` would stamp an empty
+        // principal and break principal-based pairing of the rows. Without a session writer
+        // wired (tests) they fall back to `audit_fn`.
+        const AuditFn bound_audit =
+            audit_as_session ? audit_as(audit_as_session, *session) : audit_fn;
+
+        if (!detail::audit_attempted(bound_audit, req, res, "management_group.create",
+                                     "ManagementGroup", "", g.name))
+            return;
+
+        // The attempted row can wait on the audit pool: authenticate and authorise again, so a
+        // session invalidated or a grant revoked during the wait creates nothing. The username
+        // is compared too: the resolver falls through its credential sources (cookie, Bearer,
+        // X-Yuzu-Token), so with the first session gone a different principal's credential on the
+        // same request would resolve, and the rows (bound to the first) would misname the actor.
+        const auto fresh_session = auth_fn(req, res);
+        if (!fresh_session || fresh_session->username != session->username) {
+            (void)detail::emit_behavioral_audit(bound_audit, req, res, "management_group.create",
+                                                "failure", "ManagementGroup", "",
+                                                mgmt_group_failure_detail("session_revoked",
+                                                                          g.name));
+            if (res.status < 400) { // auth_fn writes its own 401; cover one that did not
+                res.status = 401;
+                res.set_content(detail::a4_error(res, "authentication required"),
+                                "application/json");
+            }
+            return;
+        }
+        if (!perm_fn(req, res, "ManagementGroup", "Write")) { // writes its own 403
+            (void)detail::emit_behavioral_audit(bound_audit, req, res, "management_group.create",
+                                                "failure", "ManagementGroup", "",
+                                                mgmt_group_failure_detail("permission_revoked",
+                                                                          g.name));
+            return;
+        }
+        g.created_by = fresh_session->username;
 
         auto result = mgmt_store->create_group(g);
         if (!result) {
+            // The attempted row is stored, so it gets an outcome. The detail is a fixed token,
+            // never the store text (which can carry database error output).
+            const auto token = create_failure_token(result.error());
+            const bool fault = token == kMgmtGroupTokenStoreError;
+            (void)detail::emit_behavioral_audit(bound_audit, req, res, "management_group.create",
+                                                "failure", "ManagementGroup", "",
+                                                mgmt_group_failure_detail(token, g.name));
+            if (fault) {
+                // The cause is logged (sanitised), never returned to the caller or audited.
+                spdlog::error("management_group.create store fault: {}",
+                              ::yuzu::log_key_token(result.error()));
+                mgmt_write_failed(res);
+                return;
+            }
+            // A name conflict or a validation literal: closed text, safe to echo.
             res.status = 400;
             res.set_content(detail::a4_error(res, result.error()), "application/json");
             return;
         }
-        audit_fn(req, "management_group.create", "success", "ManagementGroup", *result, g.name);
+        // The group exists: a lost outcome row keeps the 201 and marks the response
+        // `Sec-Audit-Failed` (the `attempted` row stands as "started, outcome unknown").
+        (void)detail::emit_behavioral_audit(bound_audit, req, res, "management_group.create",
+                                            "success", "ManagementGroup", *result, g.name);
         res.status = 201;
         res.set_content(ok_json(JObj().add("id", *result).str()), "application/json");
     });
@@ -4997,36 +5107,11 @@ void RestApiV1::register_routes(
             res.set_content(ok_json(JObj().add("deleted", true).str()), "application/json");
         });
 
-    // A management-group write whose store call reported an error answers a
-    // retryable 503 with a fixed message (the store's libpq text is never
-    // echoed), never a 2xx. The caller writes the matching `failure` audit row.
-    const auto mgmt_write_failed = [](httplib::Response& res) {
-        res.status = 503;
-        res.set_content(
-            detail::a4_error(res, "management group store unavailable",
-                             detail::A4ErrorOpts{.retry_after_ms = mcp::kMcpStoreFaultRetryMs,
-                                                 .remediation = "retry shortly"}),
-            "application/json");
-    };
-
     // The member and role id fields reach a text bind: a control byte or an
     // invalid UTF-8 sequence is refused up front (400) instead of becoming a
-    // retryable store fault. Twin: mgmt_text_ok in mcp_server.cpp (same rule).
-    const auto mgmt_text_ok = [](std::string_view s) {
-        if (!rbac_text_is_clean(s))
-            return false;
-        for (std::size_t i = 0; i < s.size();) {
-            if (static_cast<unsigned char>(s[i]) < 0x80) {
-                ++i;
-                continue;
-            }
-            const std::size_t len = ::yuzu::utf8_sequence_length(s, i);
-            if (len == 0)
-                return false;
-            i += len;
-        }
-        return true;
-    };
+    // retryable store fault. Twin: mgmt_text_ok in mcp_server.cpp (the same predicate,
+    // mgmt_group_text_is_clean).
+    const auto mgmt_text_ok = [](std::string_view s) { return mgmt_group_text_is_clean(s); };
 
     // True only when the store answered authoritatively that the group does not
     // exist (a failed read is not "absent"). Used after a write failed to tell a
@@ -5050,11 +5135,57 @@ void RestApiV1::register_routes(
         res.set_content(detail::a4_error(res, "group not found"), "application/json");
     };
 
+    // The member writes are audit-first like create (ADR-0033 section 9, "no audit row, no
+    // mutation", #7074): perm, store, body and field checks, then (add only) the group-exists
+    // answer, all BEFORE any row; then the `attempted` row (503 + Sec-Audit-Failed when it cannot
+    // be stored); then the session and the permission decided AGAIN (the attempted row can wait
+    // on the audit pool), `session_revoked` / `permission_revoked` failure rows; then the
+    // mutation; then the outcome row. Failure rows carry a FIXED token and the agent id the
+    // `attempted` row carries (`mgmt_group_failure_detail`), never store text. This is the
+    // post-attempted re-check, the member twin of the one in POST /api/v1/management-groups.
+    // `bound_audit` stamps every row that names the caller (the `attempted` row, these two
+    // `*_revoked` failure rows and the outcome row) from the session the route resolved BEFORE
+    // the `attempted` row (see the create route): the re-resolving `audit_fn` would stamp an
+    // empty principal once the session is gone.
+    const auto mgmt_member_recheck = [auth_fn, perm_fn](const httplib::Request& req,
+                                                        httplib::Response& res, const char* action,
+                                                        const std::string& group_id,
+                                                        const std::string& agent_id,
+                                                        const AuditFn& bound_audit,
+                                                        const std::string& original_username) {
+        // The username is compared too: the resolver falls through its credential sources
+        // (cookie, Bearer, X-Yuzu-Token), so with the original session gone a different
+        // principal's credential on the same request would resolve, and the rows (bound to the
+        // original session) would misname the actor. A different principal counts as revoked.
+        const auto fresh = auth_fn(req, res);
+        if (!fresh || fresh->username != original_username) {
+            (void)detail::emit_behavioral_audit(bound_audit, req, res, action, "failure",
+                                                "ManagementGroup", group_id,
+                                                mgmt_group_failure_detail("session_revoked",
+                                                                          agent_id));
+            if (res.status < 400) { // auth_fn writes its own 401; cover one that did not
+                res.status = 401;
+                res.set_content(detail::a4_error(res, "authentication required"),
+                                "application/json");
+            }
+            return false;
+        }
+        if (!perm_fn(req, res, "ManagementGroup", "Write")) { // writes its own 403
+            (void)detail::emit_behavioral_audit(bound_audit, req, res, action, "failure",
+                                                "ManagementGroup", group_id,
+                                                mgmt_group_failure_detail("permission_revoked",
+                                                                          agent_id));
+            return false;
+        }
+        return true;
+    };
+
     // Members
     sink.Post(R"(/api/v1/management-groups/([a-f0-9]+)/members)",
-              [perm_fn, audit_fn, mgmt_store, mgmt_write_failed, mgmt_text_ok,
-               mgmt_group_confirmed_absent, mgmt_group_not_found](const httplib::Request& req,
-                                                                  httplib::Response& res) {
+              [auth_fn, perm_fn, audit_fn, mgmt_store, mgmt_write_failed, mgmt_text_ok,
+               mgmt_group_confirmed_absent, mgmt_group_not_found, mgmt_member_recheck, auth_db,
+               audit_as_session = audit_as_session_fn_](const httplib::Request& req,
+                                                        httplib::Response& res) {
                   if (!perm_fn(req, res, "ManagementGroup", "Write"))
                       return;
                   if (!mgmt_store) {
@@ -5064,6 +5195,10 @@ void RestApiV1::register_routes(
                   }
 
                   auto group_id = req.matches[1].str();
+                  if (group_id.size() > kMgmtGroupIdMaxBytes) { // names no group; no row
+                      mgmt_group_not_found(res);
+                      return;
+                  }
                   auto body = nlohmann::json::parse(req.body, nullptr, false);
                   if (body.is_discarded() || !body.is_object()) {
                       res.status = 400;
@@ -5077,6 +5212,16 @@ void RestApiV1::register_routes(
                       res.set_content(detail::a4_error(res, "agent_id required"), "application/json");
                       return;
                   }
+                  // Bounded before anything else reads or records it (mgmt_group_limits.hpp):
+                  // no row, fixed text. An id within the bound that holds a control byte or
+                  // invalid UTF-8 keeps its `denied` row below.
+                  if (!mgmt_group_agent_id_length_ok(agent_id)) {
+                      res.status = 400;
+                      res.set_content(
+                          detail::a4_error(res, std::string(kMgmtGroupAgentIdTooLongText)),
+                          "application/json");
+                      return;
+                  }
                   if (!mgmt_text_ok(agent_id)) {
                       audit_fn(req, "management_group.add_member", "denied", "ManagementGroup",
                                group_id, "invalid_agent_id");
@@ -5085,29 +5230,79 @@ void RestApiV1::register_routes(
                                       "application/json");
                       return;
                   }
-                  if (auto added = mgmt_store->add_member(group_id, agent_id); !added) {
-                      // A well-formed id naming no group fails the membership foreign
-                      // key: answer 404 (no failure row, no retry hint), not a retryable 503.
-                      if (mgmt_group_confirmed_absent(mgmt_store, group_id)) {
-                          mgmt_group_not_found(res);
-                          return;
-                      }
-                      spdlog::warn("management_group.add_member store failure: {}", added.error());
-                      audit_fn(req, "management_group.add_member", "failure", "ManagementGroup",
-                               group_id, "store_error");
+                  // A well-formed id naming no group is a 404 BEFORE any row is written (a
+                  // refusal burns no `attempted` row); an unreadable group is a store fault,
+                  // never "absent".
+                  const auto exists = mgmt_store->get_group_checked(group_id);
+                  if (!exists) {
+                      spdlog::warn("management_group.add_member group read failure: {}",
+                                   ::yuzu::log_key_token(exists.error()));
                       mgmt_write_failed(res);
                       return;
                   }
-                  audit_fn(req, "management_group.add_member", "success", "ManagementGroup",
-                           group_id, agent_id);
+                  if (!exists->has_value()) {
+                      mgmt_group_not_found(res);
+                      return;
+                  }
+                  // Does the server hold an enrolment record for this id? A read, made after the
+                  // group-exists answer and before the `attempted` row. It only FLAGS the id, on
+                  // the success audit row; it is never returned (a response field would reveal
+                  // enrolment status to a caller whose scope hides the device). An unknown id is
+                  // accepted (an operator may stage a membership ahead of the device) and no lookup
+                  // outcome refuses the add. Unreadable is recorded as neither known nor unknown.
+                  const AgentKnown agent_known = lookup_agent_known(auth_db, agent_id);
+                  // The session every row names, the `attempted` row included, resolved before it
+                  // (see the create route): each is stamped from it.
+                  const auto session = auth_fn(req, res); // writes its own 401
+                  if (!session)
+                      return;
+                  const AuditFn bound_audit =
+                      audit_as_session ? audit_as(audit_as_session, *session) : audit_fn;
+                  if (!detail::audit_attempted(bound_audit, req, res, "management_group.add_member",
+                                               "ManagementGroup", group_id, agent_id))
+                      return;
+                  if (!mgmt_member_recheck(req, res, "management_group.add_member", group_id,
+                                           agent_id, bound_audit, session->username))
+                      return;
+                  if (auto added = mgmt_store->add_member(group_id, agent_id); !added) {
+                      // The group vanished between the check above and the insert (the
+                      // membership foreign key failed): 404 and no retry hint, as before, and
+                      // a `failure` outcome row with a fixed token so the `attempted` row is
+                      // never left without one.
+                      if (mgmt_group_confirmed_absent(mgmt_store, group_id)) {
+                          (void)detail::emit_behavioral_audit(
+                              bound_audit, req, res, "management_group.add_member", "failure",
+                              "ManagementGroup", group_id,
+                              mgmt_group_failure_detail("group_not_found", agent_id));
+                          mgmt_group_not_found(res);
+                          return;
+                      }
+                      spdlog::warn("management_group.add_member store failure: {}",
+                                   ::yuzu::log_key_token(added.error()));
+                      (void)detail::emit_behavioral_audit(bound_audit, req, res,
+                                                          "management_group.add_member", "failure",
+                                                          "ManagementGroup", group_id,
+                                                          mgmt_group_failure_detail("store_error",
+                                                                                    agent_id));
+                      mgmt_write_failed(res);
+                      return;
+                  }
+                  // The member is added: a lost outcome row keeps the 201 and marks the response
+                  // `Sec-Audit-Failed` (the `attempted` row stands as "started, outcome unknown").
+                  // The success row's detail ends with the `agent_known=` flag (see
+                  // mgmt_group_agent_known.hpp for how a reader takes it).
+                  (void)detail::emit_behavioral_audit(
+                      bound_audit, req, res, "management_group.add_member", "success",
+                      "ManagementGroup", group_id, add_member_success_detail(agent_id, agent_known));
                   res.status = 201;
                   res.set_content(ok_json(JObj().add("added", true).str()), "application/json");
               });
 
     sink.Delete(
         R"(/api/v1/management-groups/([a-f0-9]+)/members/(.+))",
-        [perm_fn, audit_fn, mgmt_store, mgmt_write_failed,
-         mgmt_text_ok](const httplib::Request& req, httplib::Response& res) {
+        [auth_fn, perm_fn, audit_fn, mgmt_store, mgmt_write_failed, mgmt_text_ok,
+         mgmt_member_recheck, audit_as_session = audit_as_session_fn_](const httplib::Request& req,
+                                                                      httplib::Response& res) {
             if (!perm_fn(req, res, "ManagementGroup", "Write"))
                 return;
             if (!mgmt_store) {
@@ -5118,6 +5313,18 @@ void RestApiV1::register_routes(
 
             auto group_id = req.matches[1].str();
             auto agent_id = req.matches[2].str();
+            if (group_id.size() > kMgmtGroupIdMaxBytes) { // names no group; no row
+                res.status = 404;
+                res.set_content(detail::a4_error(res, "group not found"), "application/json");
+                return;
+            }
+            // No row; an unclean id keeps its denied row.
+            if (!mgmt_group_agent_id_length_ok(agent_id)) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, std::string(kMgmtGroupAgentIdTooLongText)),
+                                "application/json");
+                return;
+            }
             if (!mgmt_text_ok(agent_id)) {
                 audit_fn(req, "management_group.remove_member", "denied", "ManagementGroup",
                          group_id, "invalid_agent_id");
@@ -5126,15 +5333,35 @@ void RestApiV1::register_routes(
                                 "application/json");
                 return;
             }
+            // Idempotent as before: removing an absent member (or from an absent group) is a
+            // success, so there is no group-exists answer here, only the audit-first order.
+            // The session every row names, the `attempted` row included, resolved before it (see
+            // the create route).
+            const auto session = auth_fn(req, res); // writes its own 401
+            if (!session)
+                return;
+            const AuditFn bound_audit =
+                audit_as_session ? audit_as(audit_as_session, *session) : audit_fn;
+            if (!detail::audit_attempted(bound_audit, req, res, "management_group.remove_member",
+                                         "ManagementGroup", group_id, agent_id))
+                return;
+            if (!mgmt_member_recheck(req, res, "management_group.remove_member", group_id,
+                                     agent_id, bound_audit, session->username))
+                return;
             if (auto removed = mgmt_store->remove_member(group_id, agent_id); !removed) {
-                spdlog::warn("management_group.remove_member store failure: {}", removed.error());
-                audit_fn(req, "management_group.remove_member", "failure", "ManagementGroup",
-                         group_id, "store_error");
+                spdlog::warn("management_group.remove_member store failure: {}",
+                             ::yuzu::log_key_token(removed.error()));
+                (void)detail::emit_behavioral_audit(bound_audit, req, res,
+                                                    "management_group.remove_member", "failure",
+                                                    "ManagementGroup", group_id,
+                                                    mgmt_group_failure_detail("store_error",
+                                                                              agent_id));
                 mgmt_write_failed(res);
                 return;
             }
-            audit_fn(req, "management_group.remove_member", "success", "ManagementGroup", group_id,
-                     agent_id);
+            (void)detail::emit_behavioral_audit(bound_audit, req, res,
+                                                "management_group.remove_member", "success",
+                                                "ManagementGroup", group_id, agent_id);
             res.set_content(ok_json(JObj().add("removed", true).str()), "application/json");
         });
 
