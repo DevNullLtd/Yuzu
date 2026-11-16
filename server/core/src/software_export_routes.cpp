@@ -191,8 +191,10 @@ bool pump(Stream& st, httplib::DataSink& sink) {
     if (!swe::within_limits(st.ctx->limits, st.rows_written, st.bytes_written, rows.size(),
                             chunk.size())) {
         st.outcome = Outcome::kLimit;
-        spdlog::warn("{}: size limit reached after {} rows / {} bytes; aborting; cid={}", kVerb,
-                     st.rows_written, st.bytes_written, st.cid);
+        spdlog::warn("{}: size limit reached ({}/{} rows, {}/{} bytes written, next page +{} rows "
+                     "+{} bytes); aborting; cid={}",
+                     kVerb, st.rows_written, st.ctx->limits.max_rows, st.bytes_written,
+                     st.ctx->limits.max_bytes, rows.size(), chunk.size(), st.cid);
         return false;
     }
     if (!chunk.empty() && !sink.write(chunk.data(), chunk.size()))

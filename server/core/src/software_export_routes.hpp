@@ -23,7 +23,8 @@
 /// Sequence: gate -> parse (400) -> lease (refused: 503 + a `denied` audit row, nothing streamed)
 /// -> audit (BEFORE the provider; set-and-proceed with `Sec-Audit-Failed: true` on a miss) ->
 /// headers -> chunked provider. The provider reads one page per call and holds no store lease
-/// between calls. A degraded read, the wall-clock deadline, a size limit (--inventory-export-max-rows / -bytes) or a server shutdown makes it return
+/// between calls. A degraded read, the wall-clock deadline, a size limit
+/// (--inventory-export-max-rows / -bytes) or a server shutdown makes it return
 /// false, which aborts the chunked response WITHOUT its terminating chunk, so every HTTP client
 /// sees a truncated transfer: after the headers are sent that is the only failure signal there is.
 /// There is no trailer record; the size limits are Deps::limits. No second audit row is written

@@ -9,8 +9,8 @@
 /// Rules this file owns (each stated once, here):
 ///  * REQUEST: the list route's filters (software_list::parse_list_params) plus a REQUIRED
 ///    `format` of `jsonl` or `csv`. `cursor` and `limit` are refused: a stream has no pages of its
-///    own to resume (the server walks its own cursors), and a page-style row cap belongs to the in-memory
-///    formats, not to a stream.
+///    own to resume (the server walks its own cursors), and a page-style row cap belongs to the
+///    in-memory formats, not to a stream.
 ///  * ROWS: one row is exactly the list route's row (`list_row_json`, or the list CSV writer, which
 ///    neutralises formula cells through data_export.hpp). The two formats carry the same columns as
 ///    the list route's JSON and CSV, so a consumer can move between them.
@@ -52,8 +52,8 @@ inline constexpr std::int64_t kExportMaxSeconds = 900;
 /// stream that would pass either is aborted, like the deadline, so a huge fleet cannot be asked for
 /// one unbounded file. Both apply to JSONL and CSV alike; the bytes counted are the body bytes
 /// written (the CSV header included). The row floor is one page, so a smaller row cap could never
-/// admit a page; the byte floor (1 MiB) is far above a normal 1000-row page, and a page that did not
-/// fit would be cut on its first chunk (the cap is a true maximum).
+/// admit a page; the byte floor (1 MiB) is far above a normal 1000-row page, and a page that did
+/// not fit would be cut on its first chunk (the cap is a true maximum).
 inline constexpr std::int64_t kDefaultMaxRows = 5'000'000;
 inline constexpr std::int64_t kDefaultMaxBytes = std::int64_t{1} << 30; // 1 GiB
 inline constexpr std::int64_t kMinMaxRows = kPageRows;
@@ -79,8 +79,10 @@ struct Limits {
 [[nodiscard]] constexpr bool within_limits(const Limits& l, std::int64_t rows_written,
                                            std::int64_t bytes_written, std::size_t add_rows,
                                            std::size_t add_bytes) noexcept {
-    return rows_written + static_cast<std::int64_t>(add_rows) <= l.max_rows &&
-           bytes_written + static_cast<std::int64_t>(add_bytes) <= l.max_bytes;
+    // Compared against the remaining allowance, never as a sum, so no counter state can overflow.
+    // The caller keeps each written counter at or under its limit, so the allowances are >= 0.
+    return static_cast<std::int64_t>(add_rows) <= l.max_rows - rows_written &&
+           static_cast<std::int64_t>(add_bytes) <= l.max_bytes - bytes_written;
 }
 
 /// The 503 retry hint when the export cap or the server's held-open budget is full.

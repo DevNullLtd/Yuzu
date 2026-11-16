@@ -13,6 +13,7 @@
 #include <nlohmann/json.hpp>
 
 #include <cstddef>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -204,6 +205,14 @@ TEST_CASE("export limits: a cap is a true maximum, the floor clamps, and 0 never
     CHECK_FALSE(swe::within_limits(l, 1'000, 0, 1'001, 0)); // one row over
     CHECK_FALSE(swe::within_limits(l, 0, 4'000, 0, 1'001)); // one byte over
     CHECK(swe::within_limits(l, 1'000, 4'000, 1'000, 1'000));
+
+    // Near the top of the range the check still refuses (no signed overflow): the allowance is
+    // compared, never summed.
+    constexpr swe::Limits big{.max_rows = std::numeric_limits<std::int64_t>::max(),
+                              .max_bytes = std::numeric_limits<std::int64_t>::max()};
+    CHECK_FALSE(swe::within_limits(big, big.max_rows - 500, 0, 1'000, 0));
+    CHECK(swe::within_limits(big, big.max_rows - 1'000, 0, 1'000, 0));
+    CHECK_FALSE(swe::within_limits(big, 0, big.max_bytes - 5, 0, 10));
 
     const auto lo = swe::clamp_limits({.max_rows = 0, .max_bytes = -1});
     CHECK(lo.max_rows == swe::kMinMaxRows);
