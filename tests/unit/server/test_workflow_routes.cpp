@@ -62,6 +62,7 @@
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <set>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -7120,8 +7121,9 @@ TEST_CASE("N2-3: an unwired policy store 503s the uninstall of a pack with a def
 }
 
 // N2-3(c): a policy read that FAILS is a 503 (referrer_check_unavailable), never "no policy uses
-// it". `policy_store.policies` is moved aside, so query_policies fails while the fragment reads the
-// referrer lookup makes keep working. Turns red if a failed query_policies is read as empty.
+// it". `policy_store.policies` is moved aside, so policies_using_fragments fails while the fragment
+// reads the referrer lookup makes keep working. Turns red if a failed policies_using_fragments is
+// read as empty.
 TEST_CASE("N2-3: a failing policy read 503s the uninstall of a pack with a definition and an own "
           "fragment and deletes nothing",
           "[pg][workflow][product_pack]") {
@@ -7741,9 +7743,9 @@ TEST_CASE("M2-2: a pack whose definition nothing references uninstalls unchanged
 namespace {
 
 /// A ProductPack bundle of `definitions` InstructionDefinition items (`own-def-<n>`).
-std::string many_definitions_bundle(int definitions) {
-    std::string bundle = "apiVersion: yuzu.io/v1alpha1\nkind: ProductPack\nname: many-defs\n"
-                         "version: 1.0.0\ndescription: d\n";
+std::string many_definitions_bundle(int definitions, const std::string& pack_name = "many-defs") {
+    std::string bundle = "apiVersion: yuzu.io/v1alpha1\nkind: ProductPack\nname: " + pack_name +
+                         "\nversion: 1.0.0\ndescription: d\n";
     for (int i = 0; i < definitions; ++i)
         bundle += "---\napiVersion: yuzu.io/v1alpha1\nkind: InstructionDefinition\nname: own-def-" +
                   std::to_string(i) + "\n";
@@ -7752,9 +7754,10 @@ std::string many_definitions_bundle(int definitions) {
 
 /// An install callback that records an id per definition WITHOUT creating the definition: the
 /// pre-check only reads the pack's own item rows, and the uninstall tolerates an absent definition.
-auto fake_definition_installer(std::vector<std::string>& ids) {
-    return [&ids](const std::string&, const std::string&) -> std::expected<std::string, std::string> {
-        ids.push_back("fake-def-" + std::to_string(ids.size()));
+auto fake_definition_installer(std::vector<std::string>& ids, std::string prefix = "fake-def-") {
+    return [&ids, prefix = std::move(prefix)](
+               const std::string&, const std::string&) -> std::expected<std::string, std::string> {
+        ids.push_back(prefix + std::to_string(ids.size()));
         return ids.back();
     };
 }
@@ -7769,12 +7772,14 @@ std::size_t count_of(const std::string& haystack, const std::string& needle) {
 
 } // namespace
 
-// The headline: the lookup for a 500-definition pack is ONE batched call (never one per item),
-// whether it finds nothing or finds the referrer of only the LAST item, and the batch is answered
-// by the real stores. The counting double sits in front of the real closure and counts both call
-// forms: the single-id form is what cost 3 reads per item (1500 reads for this pack). Turns red if
-// the handler goes back to asking per definition: `single_calls` becomes 500.
-TEST_CASE("7921: a 500-definition pack is checked in one batched lookup, all-clear or blocked",
+// What this observes is CLOSURE CALLS, not store statements: the route asks the referrer lookup
+// ONE batched question for a 500-definition pack (never one per item), whether it finds nothing or
+// the referrer of only the LAST item, and the batch is answered by the real stores. The counting
+// double sits in front of the real closure and counts both call forms: the single-id form is what
+// cost 3 reads per item (1500 reads for this pack). The bound on real pooled leases is pinned by
+// the lease-count test below ("7921: lease counts ..."). Turns red if the handler goes back to
+// asking per definition: `single_calls` becomes 500.
+TEST_CASE("7921: the route asks the referrer lookup one batched question for a 500-definition pack",
           "[pg][workflow][product_pack][7921]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -7946,11 +7951,12 @@ TEST_CASE("7921: a failing referrer lookup answers 503 with retry_after_ms and u
     CHECK(still_pack->has_value());
 }
 
-// The held-by read is ONE read for every own fragment: a pack with 60 own fragments, one of which
-// four policies use, refuses naming that fragment and its first three policies (`+1` for the
-// rest) and none of the 59 unused ones. Turns red if the batched read loses the per-fragment cap,
-// the per-fragment grouping, or the exclusion of the unused fragments.
-TEST_CASE("7921: sixty own fragments need one held-by read; the used one names its policies",
+// The held-by answer for a pack of 60 own fragments, one of which four policies use: the 409 names
+// that fragment and its first three policies (`+1` for the rest) and none of the 59 unused ones.
+// This pins the CONTENT of the batched held-by read (per-fragment cap, grouping, exclusion of the
+// unused fragments); that it is ONE lease is pinned by the lease-count test below. Turns red if the
+// batched read loses the per-fragment cap, the grouping, or the exclusion.
+TEST_CASE("7921: sixty own fragments: the used one names its first three policies and +1",
           "[pg][workflow][product_pack][7921]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -8049,7 +8055,7 @@ TEST_CASE("7921: the batched referrer reads match any id of the list, once, and 
 
     auto sched = schedules.schedules_referencing_definitions(ids, 10);
     REQUIRE(sched.has_value());
-    CHECK(sched->size() == 2); // the "other" schedule is not among them
+    REQUIRE(sched->size() == 2); // the "other" schedule is not among them
     CHECK(((*sched)[0] == *sa || (*sched)[1] == *sa));
     CHECK(((*sched)[0] == *sb || (*sched)[1] == *sb));
     auto sched_capped = schedules.schedules_referencing_definitions(ids, 1);
@@ -8191,4 +8197,262 @@ TEST_CASE("7921: the real batched lookup stops at the limit before it reads a la
     auto healthy = fn.lookup_many(ids, {}, 100);
     REQUIRE(healthy.has_value());
     CHECK(healthy->size() == 22);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #7921 item 1, fix round: lease counts, hostile ids, closure parity, wiring, degraded sources
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+/// A pool whose every successful checkout bumps `leases` (the acquire-wait observer fires once per
+/// lease, including the idle-hit fast path). Reset `leases` after the stores are constructed: their
+/// migrations lease too.
+PgPool::Options counting_pool_options(const std::string& dsn, std::atomic<int>& leases) {
+    PgPool::Options opts;
+    opts.conninfo = dsn;
+    opts.size = 4;
+    opts.observer.on_acquire_wait_seconds = [&leases](double) { leases.fetch_add(1); };
+    return opts;
+}
+
+using ReferrerKey = std::set<std::pair<std::string, std::string>>;
+
+ReferrerKey referrer_keys(const yuzu::server::DefinitionReferrersFn::Result& r) {
+    REQUIRE(r.has_value());
+    ReferrerKey keys;
+    for (const auto& x : *r)
+        keys.emplace(x.kind, x.id);
+    return keys;
+}
+
+std::string workflow_naming_quoted(const std::string& definition_id, const std::string& name) {
+    // single-quoted YAML scalar: backslash and double quote are literal, only ' needs doubling
+    return "apiVersion: yuzu.io/v1alpha1\nkind: Workflow\nmetadata:\n  displayName: " + name +
+           "\nspec:\n  steps:\n    - instruction: '" + definition_id + "'\n";
+}
+
+std::string fragment_naming_quoted(const std::string& definition_id, const std::string& id) {
+    return "apiVersion: yuzu.io/v1alpha1\nkind: PolicyFragment\nid: " + id + "\ndisplayName: " + id +
+           "\nspec:\n  check:\n    instruction: '" + definition_id + "'\n    compliance: \"true\"\n";
+}
+
+} // namespace
+
+// THE bound evidence: counted in pooled LEASES (each store read is one lease), through the
+// production closure with no double in front. The batched lookup over 500 ids costs exactly the
+// three source reads, the held-by read over 60 fragments costs one, and a blocked 409 DELETE costs
+// the same number of leases for a 5-definition pack as for a 500-definition one. Turns red if the
+// batch form is lost (1500 leases), `policies_using_fragments` goes back to one read per fragment
+// (60), a store loops per id, or the route stops using `lookup_many`.
+TEST_CASE("7921: lease counts: the lookup, the held-by read and the blocked route cost a fixed "
+          "number of pooled leases",
+          "[pg][workflow][product_pack][referrers][7921]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    std::atomic<int> leases{0};
+    PgPool pool{counting_pool_options(db.dsn(), leases)};
+    ScheduleEngine schedules{pool};
+    WorkflowEngine workflows{pool};
+    PolicyStore policies{pool};
+    REQUIRE(schedules.is_open());
+    REQUIRE(policies.is_open());
+    const auto fn = yuzu::server::make_definition_referrers_fn(&schedules, &workflows, &policies);
+    REQUIRE(fn.has_batch());
+
+    std::vector<std::string> ids;
+    for (int i = 0; i < 500; ++i)
+        ids.push_back("lease-def-" + std::to_string(i));
+    leases = 0;
+    auto clear = fn.lookup_many(ids, {}, yuzu::server::kMaxReferrersListed + 1);
+    REQUIRE(clear.has_value());
+    CHECK(clear->empty());
+    CHECK(leases.load() == 3); // schedule, workflow, policy fragment: one read each
+
+    std::vector<std::string> fragments;
+    for (int i = 0; i < 60; ++i)
+        fragments.push_back("lease-frag-" + std::to_string(i));
+    leases = 0;
+    auto held = policies.policies_using_fragments(fragments, 4);
+    REQUIRE(held.has_value());
+    CHECK(leases.load() == 1);
+
+    // Route level: the blocked 409 costs the same for a small and a large pack.
+    ExecHarness h(pool, true, nullptr, true, /*with_workflow_engine=*/true, true,
+                  /*with_product_pack_store=*/true, {}, {}, false, {}, {}, {}, {}, fn, &policies);
+    std::vector<std::string> small_ids, big_ids;
+    auto small = h.product_pack_store->install(many_definitions_bundle(5, "small-pack"),
+                                               fake_definition_installer(small_ids, "small-def-"));
+    auto big = h.product_pack_store->install(many_definitions_bundle(500, "big-pack"),
+                                             fake_definition_installer(big_ids, "big-def-"));
+    REQUIRE((small.has_value() && big.has_value()));
+    REQUIRE(schedules.create_schedule(schedule_naming("small-def-1")).has_value());
+    REQUIRE(schedules.create_schedule(schedule_naming("big-def-1")).has_value());
+
+    const auto blocked_leases = [&](const std::string& pack_id) {
+        leases = 0;
+        auto del = h.sink.Delete("/api/product-packs/" + pack_id);
+        REQUIRE(del);
+        CHECK(del->status == 409);
+        return leases.load();
+    };
+    const int small_cost = blocked_leases(*small);
+    const int big_cost = blocked_leases(*big);
+    CHECK(small_cost >= 3);
+    CHECK(big_cost == small_cost);
+}
+
+// Ids that would break a hand-built array literal or an unescaped filter (a space, a double quote,
+// a comma, braces, a backslash) are matched EXACTLY through all three batch reads, never split, and
+// never an invalid-text-representation error (22P02); decoys that are pieces of the id are not
+// matched.
+TEST_CASE("7921: hostile definition ids are matched exactly by the batched reads",
+          "[pg][workflow][referrers][7921]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ScheduleEngine schedules{pool};
+    WorkflowEngine workflows{pool};
+    PolicyStore policies{pool};
+    REQUIRE(schedules.is_open());
+    REQUIRE(policies.is_open());
+    const auto fn = yuzu::server::make_definition_referrers_fn(&schedules, &workflows, &policies);
+
+    const std::string hostile = "a b\"c,d{e}f\\g";
+    auto s = schedules.create_schedule(schedule_naming(hostile));
+    auto w = workflows.create_workflow(workflow_naming_quoted(hostile, "hostile-wf"));
+    auto f = policies.create_fragment(fragment_naming_quoted(hostile, "frag-hostile"));
+    REQUIRE((s && w && f));
+    // decoys: the pieces a naive split would produce
+    REQUIRE(schedules.create_schedule(schedule_naming("a b")).has_value());
+    REQUIRE(schedules.create_schedule(schedule_naming("c")).has_value());
+    REQUIRE(workflows.create_workflow(workflow_naming_quoted("d{e}f\\g", "decoy-wf")).has_value());
+    REQUIRE(policies.create_fragment(fragment_naming_quoted("c,d", "frag-decoy")).has_value());
+
+    auto many = fn.lookup_many({hostile, "plain-id"}, {}, 100);
+    CHECK(referrer_keys(many) == ReferrerKey{{"schedule", *s}, {"workflow", *w},
+                                             {"policy fragment", *f}});
+    // and the same through the single-id form (a parameter, never an array)
+    CHECK(referrer_keys(fn(hostile)) == referrer_keys(many));
+    // exclusions with hostile ids are exact too
+    yuzu::server::DefinitionReferrerExclusions ex;
+    ex.workflow_ids = {*w};
+    CHECK(referrer_keys(fn.lookup_many({hostile}, ex, 100)) ==
+          ReferrerKey{{"schedule", *s}, {"policy fragment", *f}});
+}
+
+// The single-id and batch closures are two SQL shapes of one question (the schedule source reads
+// full rows capped at 5000 in one, ids with a LIMIT in the other): they must answer the same set
+// for the same id, with and without exclusions, for an id with every kind of referrer, one with
+// some, and one with none.
+TEST_CASE("7921: the one-id and batch forms of the production closure answer the same set",
+          "[pg][workflow][referrers][7921]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ScheduleEngine schedules{pool};
+    WorkflowEngine workflows{pool};
+    PolicyStore policies{pool};
+    REQUIRE(schedules.is_open());
+    REQUIRE(policies.is_open());
+    const auto fn = yuzu::server::make_definition_referrers_fn(&schedules, &workflows, &policies);
+
+    auto s1 = schedules.create_schedule(schedule_naming("def-a"));
+    auto s2 = schedules.create_schedule(schedule_naming("def-a"));
+    auto w1 = workflows.create_workflow(workflow_naming("def-a", "wf-a"));
+    auto w2 = workflows.create_workflow(workflow_naming("def-b", "wf-b"));
+    auto f1 = policies.create_fragment(fragment_naming("def-a", "frag-a"));
+    auto f2 = policies.create_fragment(fragment_naming("def-b", "frag-b"));
+    REQUIRE((s1 && s2 && w1 && w2 && f1 && f2));
+
+    yuzu::server::DefinitionReferrerExclusions none, exclude_some;
+    exclude_some.workflow_ids = {*w1};
+    exclude_some.fragment_ids = {*f2};
+    for (const char* id : {"def-a", "def-b", "def-none"}) {
+        INFO("definition " << id);
+        for (const auto* ex : {&none, &exclude_some}) {
+            const auto single = referrer_keys(fn(id, *ex));
+            const auto batch = referrer_keys(fn.lookup_many({id}, *ex, 100));
+            CHECK(single == batch);
+        }
+    }
+    // the fixture is not vacuous
+    CHECK(referrer_keys(fn("def-a", none)).size() == 4);
+    CHECK(referrer_keys(fn("def-a", exclude_some)).size() == 3);
+    CHECK(referrer_keys(fn("def-none", none)).empty());
+}
+
+// has_batch() tells the production closure from one rebuilt around it: wrapping it in a lambda (as
+// the tests' helpers once did) silently drops the batch form, and `lookup_many` then asks per id.
+TEST_CASE("7921: has_batch is true for the production closure and false for a wrapped one",
+          "[workflow][referrers][7921]") {
+    using yuzu::server::DefinitionReferrersFn;
+    const auto production = yuzu::server::make_definition_referrers_fn(nullptr, nullptr, nullptr);
+    CHECK(production.has_batch());
+    CHECK(static_cast<bool>(production));
+    const DefinitionReferrersFn wrapped{
+        [&](const std::string& id, const yuzu::server::DefinitionReferrerExclusions& ex) {
+            return production(id, ex);
+        }};
+    CHECK(static_cast<bool>(wrapped));
+    CHECK_FALSE(wrapped.has_batch());
+    CHECK_FALSE(DefinitionReferrersFn{}.has_batch());
+    CHECK_FALSE(DefinitionReferrersFn::with_batch(DefinitionReferrersFn{}, {}).has_batch());
+    CHECK(DefinitionReferrersFn::with_batch(
+              wrapped,
+              [](const std::vector<std::string>&, const yuzu::server::DefinitionReferrerExclusions&,
+                 std::size_t) { return DefinitionReferrersFn::Result{}; })
+              .has_batch());
+}
+
+// A referrer source that cannot be read (here each of the three tables in turn is moved aside) is a
+// 503 with the retry hint, never a 409 or a 200, and the pack and its definition stay: the check
+// fails closed in front of the PRODUCTION closure.
+TEST_CASE("7921: an unreadable referrer source answers 503 with retry_after_ms and uninstalls "
+          "nothing",
+          "[pg][workflow][product_pack][7921]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ScheduleEngine schedules{pool};
+    WorkflowEngine workflows{pool};
+    PolicyStore policies{pool};
+    REQUIRE(schedules.is_open());
+    REQUIRE(policies.is_open());
+    ExecHarness h(pool, true, nullptr, true, /*with_workflow_engine=*/true, true,
+                  /*with_product_pack_store=*/true, {}, {}, false, {}, {}, {}, {},
+                  yuzu::server::make_definition_referrers_fn(&schedules, &workflows, &policies),
+                  &policies);
+    auto install = h.sink.Post("/api/product-packs", kPackWithDefinition, "text/x-yaml");
+    REQUIRE(install);
+    REQUIRE(install->status == 201);
+    const auto pack_id = nlohmann::json::parse(install->body).at("id").get<std::string>();
+    const auto def_id = pack_definition_id(*h.product_pack_store, pack_id);
+
+    struct Source {
+        const char* table;
+        const char* moved;
+    };
+    for (const Source src : {Source{"schedule_engine.schedules", "schedules_gone"},
+                             Source{"workflow_engine.workflows", "workflows_gone"},
+                             Source{"policy_store.policy_fragments", "policy_fragments_gone"}}) {
+        INFO("source " << src.table);
+        h.audit_calls.clear();
+        const std::string schema = std::string(src.table).substr(0, std::string(src.table).find('.'));
+        const std::string name = std::string(src.table).substr(schema.size() + 1);
+        yuzu::test::SqlFault broken(pool,
+                                    "ALTER TABLE " + std::string(src.table) + " RENAME TO " + src.moved,
+                                    "ALTER TABLE " + schema + "." + src.moved + " RENAME TO " + name);
+        broken.arm();
+        auto del = h.sink.Delete("/api/product-packs/" + pack_id);
+        broken.repair();
+        REQUIRE(del);
+        CHECK(del->status == 503);
+        CHECK(nlohmann::json::parse(del->body)["error"]["retry_after_ms"] == 5000);
+        REQUIRE(h.audit_calls.size() == 1);
+        CHECK(h.audit_calls[0].result == "error");
+        CHECK(h.audit_calls[0].detail == "referrer_check_unavailable");
+        auto still_pack = h.product_pack_store->get(pack_id);
+        REQUIRE(still_pack.has_value());
+        CHECK(still_pack->has_value());
+        auto still_def = h.instructions->get_definition(def_id);
+        REQUIRE(still_def.has_value());
+        CHECK(still_def->has_value());
+    }
 }

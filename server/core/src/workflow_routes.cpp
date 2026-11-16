@@ -4569,8 +4569,13 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                         has_definition = true;
                 }
                 std::vector<DefinitionReferrer> blocking;
-                // `retry`: the failure is a transient read fault (never a wiring fault), so the
-                // answer carries `retry_after_ms`; nothing was deleted, so a retry is safe.
+                // `retry`: the failure is a read fault the caller can retry (nothing was
+                // deleted, so a retry is safe), so the answer carries `retry_after_ms`. An unwired
+                // check never gets it (that is `referrer_check_unwired`, decided before the
+                // lookup), but a null store INSIDE the batch closure reaches this site through
+                // the same error channel as a failed read and so carries it too; that case is
+                // unreachable in production (the closure is built over live stores), and a typed
+                // error that separates it is #7921 item 2.
                 const auto refuse = [&](int status, const char* audit_result,
                                         const char* audit_detail, std::string_view message,
                                         bool retry = false) {

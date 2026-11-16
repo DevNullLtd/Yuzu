@@ -132,6 +132,10 @@ public:
     }
 
     explicit operator bool() const noexcept { return static_cast<bool>(fn_); }
+    /// True when this function carries a batch form (only `make_definition_referrers_fn` builds
+    /// one). A function rebuilt from a callable that wraps another loses it silently and
+    /// `lookup_many` then asks per id, so a wiring test asserts this on the production closure.
+    [[nodiscard]] bool has_batch() const noexcept { return static_cast<bool>(batch_); }
     [[nodiscard]] Result operator()(const std::string& definition_id) const {
         return fn_(definition_id, Exclusions{});
     }
