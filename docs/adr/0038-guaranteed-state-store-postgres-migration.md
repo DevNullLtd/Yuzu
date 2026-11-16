@@ -406,7 +406,7 @@ row first).
   so the fleet unordered count and the agent's per-agent counters do not include it, and it is not listed
   in `unordered_agent_ids`, until its next first delivery writes the clock and counters. Its failed events
   are stored with pending evidence, so they show on `yuzu_server_guardian_census_pending_events`. The
-  follow-up (issue to be filed) is a fresh-database DDL change under the hard-cutover contract: a database-clock receipt column
+  follow-up (#7959) is a fresh-database DDL change under the hard-cutover contract: a database-clock receipt column
   (`recv_ns`) on `guaranteed_state_events` written in the event INSERT, plus a partial index leading with
   `agent_id` on `projection_pending AND boot_epoch IS NULL` (the only pending index today is
   `idx_gse_pending (rule_id, agent_id)`; the owner declined an `agent_id`-leading pending index on
@@ -419,8 +419,7 @@ row first).
   when the Repair loop's one retry (the Ensure and the clock read run again when the agent's row is deleted
   mid-Repair) is taken. A Repair can also wait on the unique index when a redelivery overlaps
   an in-flight first delivery of the same event id (before the cap check, bounded by the other transaction). Those
-  are per-statement bounds, not a deadline for the whole Repair (a whole-Repair deadline is a follow-up, issue
-  to be filed). At most `kRepairMaxConcurrent` (4, a compile-time constant with no operator setting) Repairs
+  are per-statement bounds, not a deadline for the whole Repair (a whole-Repair deadline is a follow-up, #7967). At most `kRepairMaxConcurrent` (4, a compile-time constant with no operator setting) Repairs
   run at once in one server process, because the pool (16 connections by default) is shared with auth and
   audit. A Repair that finds the cap full is shed at once: nothing is written, the transaction is rolled back,
   the event stays pending, and the shed is counted as a failed Repair on
@@ -436,8 +435,7 @@ row first).
   Repairs, and the WARN names the victim, not the slot holders); the shed is instant with no bounded wait (a
   50-wide replay admits about 4); the cap is a fixed constant 4, not scaled to `--postgres-pool-size`, and
   assumes the default pool of 16; first deliveries, batch rows and `delete_rule` holders are not capped.
-  Per-agent sub-cap, a pool-scaled cap, a bounded admission wait and backpressure are follow-ups (issue to be
-  filed). The first delivery's
+  Per-agent sub-cap, a pool-scaled cap, a bounded admission wait and backpressure are follow-ups (#7974, #7975, #7976, #7229). The first delivery's
   order step also runs under `SET LOCAL statement_timeout` equal to its lock bound plus 2 s
   (`kAgentStepStatementMarginMs`), 3 s per statement, restored like its `lock_timeout`: `lock_timeout` is per
   wait and a `FOR SHARE` locker does not queue behind a waiting `FOR UPDATE`, so a rolling chain of Repair
@@ -448,7 +446,7 @@ row first).
   failed 12 to 37 of about 50 first deliveries on one agent row (each holding it for a 10 to 20 ms commit) with
   57014 although every individual wait was under 1 s. A same-agent burst whose waits still exceed the ceiling
   stores the delivery pending, and that event is stranded (acks are unconditional); backpressure is a follow-up
-  (issue to be filed). A statement that
+  (#7229, #7980). A statement that
   reaches either bound takes the failed-step path (the event is stored pending). No alert rule ships for any
   of these signals.
 - An absolute plausibility bound at the ingest boundary (UP-9): `emit_seq` of 2^40 or more, or a `boot_epoch`
@@ -500,7 +498,7 @@ to a lower epoch the slot holds the epoch that re-base left, and the first retir
 (6) The plausibility bound is read against the ingesting replica's wall clock, not the database clock (the
 rest of the pair regime uses the database clock), so a replica whose clock was set years back judges every
 honest paired event of every agent implausible, which is then decided as an unpaired event; a follow-up
-(issue to be filed) derives it from the database `now()`. (7) The pair is agent-asserted and not
+(#7971) derives it from the database `now()`. (7) The pair is agent-asserted and not
 authenticated beyond the agent identity; it steers only that agent's own census rows.
 No new background loop, reaper or job is added, so the leader fence and the retention rules are not
 touched.

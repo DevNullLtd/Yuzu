@@ -2780,7 +2780,7 @@ struct AgentStepResult {
 // under 1 s (measured on a toy schema with the real Ensure and DECIDE shapes). A same-agent burst
 // whose waits still exceed the 3 s ceiling stores the delivery pending, and that row is
 // stranded: acks are unconditional, so the agent does not resend it (backpressure needs an ack
-// contract change; follow-up issue to be filed). The step
+// contract change; follow-up #7229). The step
 // can still run more than one statement, Ensure, DECIDE, and the one re-run of both after a
 // concurrent delete of the agent's row, so a pooled connection can be held for the sum of those
 // bounds, not for one. The agent row is the one lock every first delivery of an agent queues on,
@@ -5136,7 +5136,7 @@ GuaranteedStateStore::unrepresented_pending_for_agent(
     // reason="statement_timeout"}. The owner declined an agent_id-leading pending index
     // (2026-11-06) and no such index exists. A partial (agent_id, rule_id) WHERE projection_pending
     // index, and the database-clock receipt column that closes the clock/counter gap, are a
-    // fresh-database DDL change tracked by a follow-up (issue to be filed); the boot index-shape
+    // fresh-database DDL change tracked by a follow-up (#7959); the boot index-shape
     // check in the schema DO block (idx_gse_pending) must learn the index in the same change.
     std::vector<std::string> params{agent_id};
     std::string sql = "WITH q AS (SELECT DISTINCT e.rule_id "
