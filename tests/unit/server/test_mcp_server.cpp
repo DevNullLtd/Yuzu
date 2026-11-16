@@ -55191,16 +55191,20 @@ TEST_CASE("MCP SAM-35 reads: a service-scoped token is denied the settings tools
     }
 }
 
-TEST_CASE("MCP set_software_collection_settings: the readonly tier is refused before the handler",
+TEST_CASE("MCP set_software_collection_settings: the readonly and operator tiers are refused "
+          "before the handler",
           "[mcp][inventory][software][security]") {
-    McpTestServer ts;
-    ts.start("readonly");
-    auto body = mcp_tool_call(
-        ts, "set_software_collection_settings",
-        R"({"group_id":"aaaa11112222","interval_s":86400,"plugins":{"installed_apps":true}})");
-    REQUIRE(body.contains("error"));
-    CHECK(body["error"]["code"] == yuzu::server::mcp::kTierDenied);
-    CHECK(mcp_audits(ts, "software_estate.collection_settings.update|requested") == 0);
+    for (const char* tier : {"readonly", "operator"}) {
+        INFO(tier);
+        McpTestServer ts;
+        ts.start(tier);
+        auto body = mcp_tool_call(
+            ts, "set_software_collection_settings",
+            R"({"group_id":"aaaa11112222","interval_s":86400,"plugins":{"installed_apps":true}})");
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kTierDenied);
+        CHECK(mcp_audits(ts, "software_estate.collection_settings.update|requested") == 0);
+    }
 }
 
 // ── The collection settings over real stores (Postgres) ───────────────────────
