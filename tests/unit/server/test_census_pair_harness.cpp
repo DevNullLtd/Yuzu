@@ -30,16 +30,20 @@
  * about 60 s (the real clock runs while the model's does not). The threaded pairs prove same-agent
  * serialisation only, not an interleaving of different agents. Keys are never capped or zero.
  *
- * WHERE THE EXPECTED VALUES COME FROM. The model is `pend.Store("plan", REC2)` and the generator
- * `pend.gen_actions` over `ext.gen2`, kept in the repo under tests/unit/server/pair_model/ (see its
- * README.md; it is NOT a dependency of this file or of the build). Both are ported here,
- * with a port of CPython's Mersenne Twister so that `random.Random(seed)` and this file draw the
- * same numbers. The port is held faithful by the case "census pair harness: the C++ port agrees
- * with the Python model": it needs no database, and compares an FNV-style digest (see `fnv1a`) of
- * the first 64 seeds' schedules and model traces with digests produced by the Python model (the
- * table `kPythonDigests`, from the canonical forms `schedule_text` and `snap_text` below, produced
- * by tests/unit/server/pair_model/harness_digests.py). A model change is a change to the table:
- * regenerate it with that script, never edit a digest by hand.
+ * WHERE THE EXPECTED VALUES COME FROM. The model of record is the C++ in this file. It is a port
+ * of the original Python model, `pend.Store("plan", REC2)` with the generator `pend.gen_actions`
+ * over `ext.gen2`, and of CPython's Mersenne Twister, so that `random.Random(seed)` and this file
+ * draw the same numbers. The Python sources are NOT in the tree (nothing ran them): they are at
+ * commit d96b0e54a3 of PR #8011 under tests/unit/server/pair_model/ (`git show
+ * d96b0e54a3:tests/unit/server/pair_model/README.md`), where `harness_digests.py` produced the table.
+ * The port is held to that original by the case "census pair harness: the C++ port agrees with the
+ * Python model": it needs no database, and compares an FNV-style digest (see `fnv1a`) of the first
+ * 64 seeds' schedules and model traces with the table `kPythonDigests` (from the canonical forms
+ * `schedule_text` and `snap_text` below). What the table pins from here on is THIS FILE: a change
+ * to the generator or the model changes a digest and fails that case. An intended change is made
+ * on purpose, by updating the digests from the values the failing CHECKs print, in the same change
+ * as the model edit and with the reason stated; the independent Python cross-check is no longer
+ * run, so such a change is reviewed on the model's merits.
  *
  * SEEDS AND REPLAY. A seed is the Python seed, so seed 17 here is `random.Random(17)` there.
  *   YUZU_TEST_PAIR_HARNESS_SEEDS=N  runs seeds 0..N-1 (default 64; a campaign of
@@ -847,8 +851,8 @@ std::string trace_text(const Seed& s) {
 
 // An FNV-style 64-bit hash, NOT standard FNV-1a: the offset basis below is 1469598103934665603, not
 // the real FNV-1a basis 14695981039346656037 (a digit was lost when it was first typed). The
-// same constant is in harness_digests.py, so the two agree; changing it on one side, or "fixing"
-// it, requires regenerating the digest table `kPythonDigests`.
+// same constant was in harness_digests.py (see the header), so the two agreed; changing it, or
+// "fixing" it, changes every digest in `kPythonDigests`.
 std::uint64_t fnv1a(const std::string& s) {
     std::uint64_t h = 1469598103934665603ULL;
     for (unsigned char c : s) {
@@ -882,7 +886,7 @@ void adapt(Seed& s) {
     throw std::runtime_error("harness: no receipt shift clears the clock window");
 }
 
-// ── Digests from the Python model, for the first 64 seeds: {schedule, trace} ─────────────────────
+// ── Digests from the original Python model (see the header), seeds 0..63: {schedule, trace} ──────
 
 constexpr std::array<std::array<std::uint64_t, 2>, 64> kPythonDigests = {{
     {0x4555c08ed599ea31, 0x6c6ad8e4486c58f7}, {0x72d5b61832a66f30, 0xe152bf6ef0e88631},

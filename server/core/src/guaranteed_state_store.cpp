@@ -1930,8 +1930,8 @@ constexpr const char* kCensusLockAll =
 // order step or a Repair's read), $12 the epoch the agent's latest lower-epoch recovery retired
 // (0 or NULL = none). The statements below implement the regime rules in
 // docs/user-manual/guaranteed-state.md, "What the server does with the pair". The executable model
-// of those rules is tests/unit/server/pair_model/ (`pend.py`); `test_census_pair_harness.cpp` ports
-// it to C++, replays seeded schedules through this store and compares after every delivery. The
+// of those rules is the model in `test_census_pair_harness.cpp`, a C++ port of the original Python
+// `pend.py` (that header says where the Python is); it replays seeded schedules through this store and compares after every delivery. The
 // text was transcribed from a generated form of that model, so a clause is not to be edited by
 // hand-copying: change the model and the harness in the same change. The text is NOT
 // byte-identical to the generated form: `YUZU_CENSUS_SEEN_MAX_SEQ_` below carries one deliberate,
@@ -2369,7 +2369,7 @@ constexpr const char* kAgentOrderDecide =
 // definition, so it never refreshes the clock, never re-bases it and never sets a fence: a stale
 // clock gives `current_straggler` (same epoch) or `refused_regression` (lower epoch) where the
 // first delivery's CASE above would re-base. The model's `agent_mode_readonly`
-// (tests/unit/server/pair_model/pend.py) states this CASE; it differs from
+// (`pend.py` of the original Python model, see the harness header) states this CASE; it differs from
 // `YUZU_AGENT_ORDER_MODE_` only in those two re-base arms. The row is locked FOR SHARE in the inner
 // select and the CASE runs above it, on the locked version (the same shape as DECIDE's `old`), so
 // a first delivery that bumped the clock while this waited is read, not missed. $1 agent,
