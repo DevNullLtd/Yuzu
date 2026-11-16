@@ -344,12 +344,34 @@ public:
 [[nodiscard]] YUZU_EXPORT std::unique_ptr<ISparkMechanism>
 make_file_mechanism(std::shared_ptr<std::atomic<std::size_t>> f3_counter);
 
+/// The Registry mechanism's periodic path verification (#5719 item 5, #7836) is OFF
+/// by default: each verification opens the watched key by path, which on a key
+/// carrying an auditing SACL writes a Security-log event (an open per key per
+/// interval can evict older events: irreversible, not measured). The operator opts
+/// in at boot with --spark-registry-path-verify-interval SECONDS; the value reaches
+/// the factory below through this pure helper. Zero is off. A non-zero value below
+/// the floor is raised to it (a 1 s setting would be five times the audit volume of
+/// the documented minimum), a value above the ceiling is lowered to it, and a
+/// negative value is treated as off (the CLI validator already refuses one).
+inline constexpr std::chrono::milliseconds kRegistryPathVerifyFloor{5'000};
+inline constexpr std::int64_t kRegistryPathVerifyMaxSeconds = 86'400;
+
+[[nodiscard]] constexpr std::chrono::milliseconds
+clamp_registry_path_verify(std::int64_t seconds) noexcept {
+    if (seconds <= 0)
+        return std::chrono::milliseconds{0};
+    if (seconds > kRegistryPathVerifyMaxSeconds)
+        seconds = kRegistryPathVerifyMaxSeconds;
+    const std::chrono::milliseconds requested{seconds * 1000};
+    return requested < kRegistryPathVerifyFloor ? kRegistryPathVerifyFloor : requested;
+}
+
 /// Platform factory: a real TP_WAIT + RegNotifyChangeKeyValue registry-change
 /// mechanism on Windows, `nullptr` on every other platform. This zero-argument
 /// form constructs the mechanism with NO shared F3 counter (its detached probe
-/// and drain workers are then counted only lane-locally) - it exists for tests
-/// and for the platform-capability cross-check; production wiring uses the
-/// counter-taking overload below.
+/// and drain workers are then counted only lane-locally) and with periodic path
+/// verification OFF - it exists for tests and for the platform-capability
+/// cross-check; production wiring uses the counter-taking overload below.
 [[nodiscard]] YUZU_EXPORT std::unique_ptr<ISparkMechanism> make_registry_mechanism();
 
 /// Production factory (#2012/#3840 PR-B1): the same mechanism, with every
@@ -360,8 +382,16 @@ make_file_mechanism(std::shared_ptr<std::atomic<std::size_t>> f3_counter);
 /// "F3 / §24"). Same platform contract as the zero-argument form: real on
 /// Windows, `nullptr` elsewhere (the argument is ignored off Windows). A null
 /// counter is accepted and behaves like the zero-argument form.
+///
+/// `path_verify` seeds the periodic path verification interval at construction
+/// (#5719 item 5, #7836). The DEFAULT, zero, is OFF: the mechanism opens no key
+/// for verification. A caller passes clamp_registry_path_verify(seconds) of the
+/// operator's opt-in. The default lives HERE (not in the agent.cpp glue) so a test
+/// calling this exact factory observes what production gets when the operator
+/// sets nothing. Ignored off Windows.
 [[nodiscard]] YUZU_EXPORT std::unique_ptr<ISparkMechanism>
-make_registry_mechanism(std::shared_ptr<std::atomic<std::size_t>> f3_counter);
+make_registry_mechanism(std::shared_ptr<std::atomic<std::size_t>> f3_counter,
+                        std::chrono::milliseconds path_verify = std::chrono::milliseconds{0});
 
 /// Platform factory: a real multiplexed service/unit run-state mechanism — one
 /// sd-bus connection servicing N `PropertiesChanged` matches on Linux built
@@ -746,8 +776,9 @@ struct RegistryMechanismTestControls {
     std::chrono::milliseconds sweep_cadence{0};
     /// How often an idle, healthy Target-mode watch re-opens its registered path
     /// and checks it still resolves to a key (#5719 item 5, #7836: a renamed
-    /// parent key is otherwise silent). Production default 5 s. Zero leaves the
-    /// current value unchanged; a shortened value takes effect at the next wake
+    /// parent key is otherwise silent). Production default is OFF (zero, opt-in
+    /// at boot: see clamp_registry_path_verify). Zero here leaves the
+    /// current value unchanged (it cannot switch verification off); a shortened value takes effect at the next wake
     /// (the control call nudges the sweeper), so a test can hold it long, change
     /// the world, then shorten it.
     std::chrono::milliseconds path_verify_interval{0};
@@ -775,6 +806,7 @@ struct RegistryMechanismDebugCounters {
     std::uint64_t emit_failed{0};    ///< emit() threw on submit (fire callback or sweeper)
     std::uint64_t resync_retries{0}; ///< restored resync debt re-staged by the sweeper
     std::uint64_t established_failed{0}; ///< established() threw when invoked
+    std::uint64_t verify_launched{0};    ///< periodic path verification probes actually launched
     std::uint64_t verify_lost{0};        ///< periodic path verifications that found the path lost
     std::uint64_t verify_undecided{0};   ///< periodic path verifications that could not decide
     std::size_t probe_workers_active{0};

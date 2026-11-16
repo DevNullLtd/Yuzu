@@ -1372,7 +1372,22 @@ public:
                 // counter (it launches no detached workers - only the
                 // Windows SCM half restructures off mech_ops_mu_by_type_).
                 try_register(SparkType::File, make_file_mechanism(spark_detached_workers_));
-                try_register(SparkType::Registry, make_registry_mechanism(spark_detached_workers_));
+                // Registry path verification is OFF unless the operator opted in at boot
+                // (--spark-registry-path-verify-interval, REG-15-I2): the factory's own
+                // default is zero, so passing the clamped config value (0 -> 0) is the
+                // only place the opt-in enters. Ignored off Windows (the factory is null).
+                const auto registry_path_verify = clamp_registry_path_verify(
+                    cfg_.spark_registry_path_verify_interval_s);
+#ifdef _WIN32
+                if (registry_path_verify.count() > 0)
+                    spdlog::info("SparkEngine: Registry path verification ENABLED every {} ms "
+                                 "(--spark-registry-path-verify-interval); each check opens "
+                                 "every watched Registry key",
+                                 registry_path_verify.count());
+#endif
+                try_register(SparkType::Registry,
+                             make_registry_mechanism(spark_detached_workers_,
+                                                     registry_path_verify));
                 try_register(SparkType::Service, make_service_mechanism(spark_detached_workers_));
                 spark_engine_->start();
                 spdlog::info("SparkEngine: instantiated OBSERVE-ONLY (no consumer at rung 1); "
@@ -4839,7 +4854,7 @@ private:
     // header's own doc comment ("Ticketing"). Summed into
     // guardian_active_io_workers() below, additively with guardian_'s own
     // count. First consumer: the Windows Registry mechanism (PR-B1, handed in
-    // via make_registry_mechanism(spark_detached_workers_) in the spark boot
+    // via make_registry_mechanism(spark_detached_workers_, ...) in the spark boot
     // block); File (PR-B2) and the Windows Service mechanism (PR-B3) both
     // followed the same shape.
     //

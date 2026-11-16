@@ -52,7 +52,8 @@
  *     edges and synthetic fires (dispatched with mu_ released).
  *   - periodic path verification (#5719 item 5, #7836): a notify handle follows
  *     its KEY, so a renamed PARENT key leaves the watch healthy and silent on
- *     the renamed tree. Every kRegPathVerifyInterval the sweeper stages an idle,
+ *     the renamed tree. When the operator opts in (OFF by default, see below) the
+ *     sweeper stages, once per configured interval (floor 5 s), an idle,
  *     armed, Target-mode watch as a Deferred probe (RegWatch::verify_probe) that
  *     runs through the ordinary probe lane, F3-counted: no new long-lived
  *     thread, but one short-lived detached worker per watched key per check. A
@@ -82,6 +83,16 @@
  *     #7877 item 34 and the governance ledger row REG-03; pre-existing emission): it
  *     costs one idempotent evaluation that re-reads live state, ends at the
  *     retry, and the File mechanism suppresses it.
+ *     OFF BY DEFAULT (REG-15-I2, owner ruling 2026-11-16): each verification
+ *     opens the watched key by path, and on a key carrying an auditing SACL
+ *     that open can write a Security-log event, so an open per key per
+ *     interval can evict older events (irreversible, not measured here). The
+ *     interval is seeded once, at construction, by make_registry_mechanism()'s
+ *     path_verify argument (zero = off), which production fills from
+ *     --spark-registry-path-verify-interval via clamp_registry_path_verify().
+ *     A watch whose notify handle has been renamed away from its registered path
+ *     is therefore NOT detected unless the operator opted in. This file does not
+ *     observe or assert Security-log behaviour.
  *
  * OWNERSHIP / DISPATCH PROTOCOL (plan amendment 5 - the same rules PR-B2/B3
  * apply to File/Service):
@@ -205,19 +216,21 @@ constexpr std::chrono::milliseconds kRegAdmissionBackoffCap{30'000};
 /// a 300 s cap, attempts reset on a successful establishment.
 constexpr std::chrono::milliseconds kRegBackendRetryBase{30'000};
 constexpr std::chrono::milliseconds kRegBackendRetryCap{300'000};
-/// How often an idle, healthy Target-mode watch re-opens its registered PATH and
-/// checks the path still resolves to a key (#5719 item 5, #7836). The notify handle
-/// follows its KEY, not its path: when a PARENT key is renamed away the handle keeps
+/// Periodic path verification (no constant here: the interval is seeded per mechanism,
+/// see path_verify_ms_). When enabled, an idle, healthy Target-mode watch re-opens its
+/// registered PATH at that interval and checks the path still resolves to a key
+/// (#5719 item 5, #7836). The notify handle follows its KEY, not its path: when a PARENT key is renamed away the handle keeps
 /// working on the renamed tree and nothing signals, so the watch reads healthy while
 /// the registered path no longer names it. SAMPLED, so a rename is noticed up to one
 /// interval plus a sweep wake plus the probe's own latency late, and plus the
 /// admission backoff (50 ms doubling to kRegAdmissionBackoffCap, 30 s) on each launch
 /// the probe lane refused: a refused verification launch increments admission_attempts
 /// and only a commit resets it, so with more than 16 watches verifying together the
-/// bound is NOT 5 s. A rename away and back within one interval is not noticed at all.
+/// bound is NOT the configured interval. A rename away and back within one interval is not noticed at all.
 /// Not a measured value; the test control
-/// RegistryMechanismTestControls::path_verify_interval overrides it.
-constexpr std::chrono::milliseconds kRegPathVerifyInterval{5'000};
+/// RegistryMechanismTestControls::path_verify_interval overrides it. The interval is
+/// OFF (zero) unless the operator opts in at boot: the smallest non-zero value is
+/// kRegistryPathVerifyFloor (spark_mechanism.hpp), the clamp floor.
 
 constexpr std::size_t kProbeLaneCap = 16; ///< concurrent detached probe workers
 constexpr std::size_t kDrainLaneCap = 8;  ///< concurrent detached drain workers
@@ -677,9 +690,16 @@ public:
     /// detached worker this mechanism launches is admitted against (#2012/#3840
     /// PR-B1, F3). Both lanes are constructed here, once - SparkDetachedLane is
     /// non-movable - and keep their identity across start()/stop().
-    explicit WindowsRegistryMechanism(std::shared_ptr<std::atomic<std::size_t>> f3_counter)
+    ///
+    /// `path_verify` seeds the periodic path verification interval (zero = OFF, the
+    /// default every factory passes unless the operator opted in). Stored in the body,
+    /// not the initializer list: path_verify_ms_ is declared last among the members.
+    WindowsRegistryMechanism(std::shared_ptr<std::atomic<std::size_t>> f3_counter,
+                             std::chrono::milliseconds path_verify)
         : probe_lane_(f3_counter, kProbeLaneCap),
-          drain_lane_(std::move(f3_counter), kDrainLaneCap) {}
+          drain_lane_(std::move(f3_counter), kDrainLaneCap) {
+        path_verify_ms_.store(path_verify.count(), std::memory_order_relaxed);
+    }
     ~WindowsRegistryMechanism() override {
         stop();
         reap_residual_drains(); // nothing may outlive `this` while holding `owner`
@@ -1131,6 +1151,7 @@ public:
         d.drains_untracked = drains_untracked_.load(std::memory_order_relaxed);
         d.fault_failed = fault_failed_.load(std::memory_order_relaxed);
         d.sweep_pass_failed = sweep_pass_failed_.load(std::memory_order_relaxed);
+        d.verify_launched = verify_launched_.load(std::memory_order_relaxed);
         d.verify_lost = verify_lost_.load(std::memory_order_relaxed);
         d.verify_undecided = verify_undecided_.load(std::memory_order_relaxed);
         return d;
@@ -1896,6 +1917,11 @@ private:
             }
             if (pl.status == DetachedLaunch::Launched) {
                 probe_launched_.fetch_add(1, std::memory_order_relaxed);
+                // A periodic path verification (staged by the sweeper with
+                // verify_probe set) actually left the building: the count a test uses to
+                // prove "opens per key". An ordinary retry probe shares this path.
+                if (w->verify_probe)
+                    verify_launched_.fetch_add(1, std::memory_order_relaxed);
                 w->call = std::move(pl.call);
             } else {
                 defer_admission_locked(*w, pl.status);
@@ -2284,6 +2310,7 @@ private:
     std::atomic<std::uint64_t> established_failed_{0}; ///< an established() call threw
     std::atomic<std::uint64_t> fault_failed_{0};     ///< a fault() submit threw (sweeper path)
     std::atomic<std::uint64_t> sweep_pass_failed_{0}; ///< sweeper passes that threw (sg-7/sre6-1)
+    std::atomic<std::uint64_t> verify_launched_{0};  ///< verification probes actually launched
     std::atomic<std::uint64_t> verify_lost_{0};      ///< path verifications that found the path lost
     std::atomic<std::uint64_t> verify_undecided_{0}; ///< path verifications that could not decide
     std::atomic<std::size_t> retiring_cap_{kRetiringCap};
@@ -2292,7 +2319,9 @@ private:
     std::atomic<std::int64_t> sweep_cadence_ms_{kRegSweepCadence.count()};
     std::atomic<std::int64_t> backend_retry_base_ms_{kRegBackendRetryBase.count()};
     std::atomic<std::int64_t> admission_seed_ms_{kRegAdmissionBackoffSeed.count()};
-    std::atomic<std::int64_t> path_verify_ms_{kRegPathVerifyInterval.count()};
+    /// OFF (0) until the constructor seeds it from the factory argument or a test
+    /// control sets a non-zero value; every use is guarded by `count() > 0`.
+    std::atomic<std::int64_t> path_verify_ms_{0};
 };
 
 void CALLBACK reg_on_wait_cb(PTP_CALLBACK_INSTANCE, PVOID ctx, PTP_WAIT, TP_WAIT_RESULT) {
@@ -2303,12 +2332,14 @@ void CALLBACK reg_on_wait_cb(PTP_CALLBACK_INSTANCE, PVOID ctx, PTP_WAIT, TP_WAIT
 } // namespace
 
 std::unique_ptr<ISparkMechanism> make_registry_mechanism() {
-    return std::make_unique<WindowsRegistryMechanism>(nullptr); // no shared F3 counter (tests)
+    // no shared F3 counter (tests); path verification OFF, the same default as below
+    return std::make_unique<WindowsRegistryMechanism>(nullptr, std::chrono::milliseconds{0});
 }
 
 std::unique_ptr<ISparkMechanism>
-make_registry_mechanism(std::shared_ptr<std::atomic<std::size_t>> f3_counter) {
-    return std::make_unique<WindowsRegistryMechanism>(std::move(f3_counter));
+make_registry_mechanism(std::shared_ptr<std::atomic<std::size_t>> f3_counter,
+                        std::chrono::milliseconds path_verify) {
+    return std::make_unique<WindowsRegistryMechanism>(std::move(f3_counter), path_verify);
 }
 
 bool set_registry_test_controls_for_test(ISparkMechanism& mech,
@@ -2339,7 +2370,8 @@ std::unique_ptr<ISparkMechanism> make_registry_mechanism() {
 }
 
 std::unique_ptr<ISparkMechanism>
-make_registry_mechanism(std::shared_ptr<std::atomic<std::size_t>> /*f3_counter*/) {
+make_registry_mechanism(std::shared_ptr<std::atomic<std::size_t>> /*f3_counter*/,
+                        std::chrono::milliseconds /*path_verify*/) {
     return nullptr; // same platform contract as the zero-argument form
 }
 
