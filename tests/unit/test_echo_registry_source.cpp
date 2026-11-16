@@ -54,7 +54,7 @@
 #include <regex>
 #include <evntrace.h> // ControlTraceW QUERY: no session may outlive stop()
 #include <sddl.h>
-#include <win_profiles.hpp> // enumerate_hku_subkeys, PrivilegeScope: the offline-hive cases
+#include <win_profiles.hpp> // enumerate_hku_subkeys_checked, PrivilegeScope: the offline-hive cases
 #include <win_str.hpp>
 #include "echo_hive_mount_gate.hpp"  // g_mount_workers_in_flight
 #include "echo_win_process_name.hpp" // process_basename_for_pid
@@ -1578,6 +1578,38 @@ TEST_CASE("select_stale_hive_mounts: a prefix only narrows the set; one that is 
     CHECK(select_stale_hive_mounts(hku, "S-1-").empty());
     CHECK(select_stale_hive_mounts(hku, "").empty());
     CHECK(select_stale_hive_mounts(hku, "YUZU_").empty());
+}
+
+TEST_CASE("registry sweep: an incomplete HKU listing stays pending for one retry and then completes with one warning",
+          "[echo][registry][pure]") {
+    bool retried = false;
+    HiveSweepResult listed; // the listing was complete (whatever it found)
+    HiveSweepResult unlisted;
+    unlisted.listing_error = "index 3 (RegEnumKeyExW rc=5)";
+
+    // A complete listing settles at once and never spends the retry.
+    auto settle = settle_sweep(listed, retried);
+    CHECK_FALSE(settle.pending);
+    CHECK_FALSE(settle.warn);
+    CHECK_FALSE(retried);
+
+    // The first incomplete listing keeps the sweep pending, silently, for exactly one retry.
+    settle = settle_sweep(unlisted, retried);
+    CHECK(settle.pending);
+    CHECK_FALSE(settle.warn);
+    CHECK(retried);
+
+    // The second one completes it with the one warning: a deterministic failure is not retried
+    // every tick.
+    settle = settle_sweep(unlisted, retried);
+    CHECK_FALSE(settle.pending);
+    CHECK(settle.warn);
+
+    // A retry that does list completes without a warning.
+    retried = true;
+    settle = settle_sweep(listed, retried);
+    CHECK_FALSE(settle.pending);
+    CHECK_FALSE(settle.warn);
 }
 
 TEST_CASE("sweep_hive_mounts: each name is offered once in order; a refusal is retained and the rest are still attempted",
@@ -6575,7 +6607,8 @@ const std::string& offline_fake_sid() {
 // Any HKEY_USERS subkey CONTAINING the fake sid: the mount name is salted
 // (unique_hive_mount_name), so an exact-name check would never see a leak.
 bool offline_fake_mount_present() {
-    for (const auto& n : yuzu::win::enumerate_hku_subkeys())
+    const auto hku = yuzu::win::enumerate_hku_subkeys_checked();
+    for (const auto& n : hku.names)
         if (n.find(offline_fake_sid()) != std::string::npos)
             return true;
     return false;
@@ -6588,7 +6621,8 @@ struct OfflineMountSweep {
             return;
         const yuzu::win::PrivilegeScope restore(L"SeRestorePrivilege");
         const yuzu::win::PrivilegeScope backup(L"SeBackupPrivilege");
-        for (const auto& n : yuzu::win::enumerate_hku_subkeys())
+        const auto hku = yuzu::win::enumerate_hku_subkeys_checked();
+        for (const auto& n : hku.names)
             if (n.find(offline_fake_sid()) != std::string::npos)
                 RegUnLoadKeyW(HKEY_USERS, yuzu::win::to_wide(n).c_str());
     }
@@ -6794,6 +6828,15 @@ TEST_CASE("registry live: the start-up sweep unloads a leaked YUZU_HIVE_ mount a
     }
 }
 
+TEST_CASE("registry live: the checked HKU listing is complete and holds this process's loaded hives",
+          "[echo][registry][windows]") {
+    const auto listing = yuzu::win::enumerate_hku_subkeys_checked();
+    INFO("error=" << listing.error);
+    CHECK(listing.error.empty());
+    // .DEFAULT is always loaded, so an empty answer is a failed listing read as complete.
+    CHECK(std::find(listing.names.begin(), listing.names.end(), ".DEFAULT") != listing.names.end());
+}
+
 TEST_CASE("registry live: a root under an HKU hive that is not mounted reads Unreadable (hive_unloaded), never Absent",
           "[echo][registry][windows]") {
     // A user who logs off after collect() took its HKU snapshot leaves its root pointing at a hive
@@ -6844,7 +6887,7 @@ TEST_CASE("registry live: the production profile discovery lists unloaded SID-na
           "[echo][registry][windows]") {
     auto reader = make_windows_registry_reader();
     const ReaderStop stop{reader};
-    const auto loaded = yuzu::win::enumerate_hku_subkeys();
+    const auto loaded = yuzu::win::enumerate_hku_subkeys_checked().names;
     const auto d = reader.offline_profiles(loaded);
     INFO("profiles=" << d.profiles.size() << " partial=" << d.partial.size());
     CHECK(d.complete); // a healthy host's ProfileList walk is complete

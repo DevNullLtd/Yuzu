@@ -893,9 +893,16 @@ cursor.** What it adds to the pattern:
     warning names the mounts), through the same gate and bounded worker as a mount. A sweep
     whose worker did not return (`sweep_pending`: gate closed, call rejected or timed out) runs
     before the first offline mount that finds the gate open. Every other outcome completes it,
-    so it is one attempt per start: a refused unload, a missing privilege, a partial HKU
-    listing (`enumerate_hku_subkeys` has no error channel) or an exception is not retried this
-    run, and what it missed waits for the next start or `reg unload`. It is process-wide, so a
+    so it is one attempt per start: a refused unload, a missing privilege or an exception is not
+    retried this run, and what it missed waits for the next start or `reg unload`. The one
+    exception is the HKU listing: the sweep lists through `enumerate_hku_subkeys_checked`
+    (`agents/shared/win_profiles.hpp`), which reports a failed or unstable walk instead of a
+    short list, and a sweep that could not list (`HiveSweepResult::listing_error`, the cause;
+    nothing offered to the unload) stays pending for exactly one retry, before the next offline
+    mount, then completes (`settle_sweep`). Each failed listing logs one `hku_list_incomplete`
+    warning naming the cause, so the second one completes the sweep; a host that never mounts a
+    logged-off hive does not retry, and what the sweep missed waits for the next start or
+    `reg unload`. It is process-wide, so a
     sibling plugin's leftover goes too; a mount of a second agent process in its handle-less
     window could also be unloaded: an out-of-process mount is unguarded (`win_reg_handle.hpp`),
     and that is the default shape on the shared CI pools.

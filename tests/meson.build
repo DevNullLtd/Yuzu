@@ -4349,6 +4349,16 @@ test('virtualization wsl Windows shell wiring lexical gate',
   timeout: 30,
 )
 
+# #7035: static lexical gate over the Windows callers of the checked HKEY_USERS listing -- each
+# call tests `hku.error.empty()` before it reads `hku.names` and reports `hku_list_incomplete`, and
+# a new caller must be listed. Source text only (the callers cannot run in the unit suites).
+test('HKEY_USERS listing callers refuse a failed listing lexical gate (#7035)',
+  _python3_test,
+  args: [files('test_hku_listing_pin_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # #2182: static lexical gate pinning that agent.cpp still CALLS the tested OtaUpdateThread /
 # CtxSlot stop_seen() primitives (no AgentImpl seam exists to test that, #1492) and keeps the
 # flag-then-cancel_ctx() teardown order. Carries its own in-memory mutation self-test. No build

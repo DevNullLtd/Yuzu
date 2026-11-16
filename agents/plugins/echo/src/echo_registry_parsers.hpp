@@ -82,6 +82,7 @@
 
 #include <nlohmann/json.hpp>
 #include <sha256.hpp>
+#include <list_walk.hpp>          // ListStep, ListWalk, walk_enumeration
 #include <user_profile_model.hpp> // yuzu::profiles::reg_type_name
 
 #include <algorithm>
@@ -209,7 +210,28 @@ struct HiveSweepResult {
     // the unload was refused or failed (a holder has it open, it was already gone, or the
     // privilege was not held)
     std::vector<std::string> retained;
+    // Non-empty when the HKEY_USERS listing failed or never settled (the cause, from the shared
+    // listing's `error`): the sweep could not tell which mounts are stale, nothing was offered to
+    // `unload`, and the sweep is NOT a statement that none are left.
+    std::string listing_error;
 };
+
+/// What a COMPLETED sweep means for the start-up sweep's pending flag. A sweep that could not
+/// list HKEY_USERS stays pending for exactly ONE retry (`retried`, owned by the caller), then
+/// completes with a warning: a listing that fails deterministically is not retried every tick.
+struct SweepSettle {
+    bool pending;
+    bool warn;
+};
+[[nodiscard]] inline SweepSettle settle_sweep(const HiveSweepResult& r, bool& retried) {
+    if (r.listing_error.empty())
+        return {false, false};
+    if (!retried) {
+        retried = true;
+        return {true, false};
+    }
+    return {false, true};
+}
 
 /// Offers every name to `unload` (true = the mount is gone), in order. A refusal is recorded and
 /// the rest are still attempted, so one held hive never keeps another leaked mount loaded.
@@ -1677,40 +1699,11 @@ struct DecodedBaseline {
 }
 
 // ── Walking an index-driven OS list (RegEnumKeyExW and its kin) ─────────────────────
+// The walk decision lives in agents/shared/list_walk.hpp (one copy, shared with the HKEY_USERS
+// listing in win_profiles.hpp); Echo uses it under its own names.
 
-/// What an index-driven enumerator answers for one index.
-enum class ListStep { Item, End, Error };
-
-/// The result of walking such a list. `error` is empty exactly when the walk ended at the
-/// list's end. A walk that ended on an error is a FAILED READ, never a short list: `names` is
-/// then empty, so a partial list cannot be mistaken for a complete one.
-struct ListWalk {
-    std::vector<std::string> names;
-    std::string error; // "index <i> (<the detail the step supplied>)" when the walk failed
-};
-
-/// Walk `step(i, name, err)` from index 0: it fills `name` and answers Item, answers End at
-/// the end of the list, or fills `err` and answers Error. Only End completes a walk. (An
-/// index-driven walk can still skip a hive that loads or unloads while it runs, with no
-/// error code; the next name-watch or hourly pass lists it.)
-template <class Step>
-[[nodiscard]] ListWalk walk_enumeration(Step&& step) {
-    ListWalk walk;
-    for (unsigned i = 0;; ++i) {
-        std::string name;
-        std::string err;
-        switch (step(i, name, err)) {
-        case ListStep::Item:
-            walk.names.push_back(std::move(name));
-            break;
-        case ListStep::End:
-            return walk;
-        case ListStep::Error:
-            walk.names.clear();
-            walk.error = "index " + std::to_string(i) + " (" + err + ")";
-            return walk;
-        }
-    }
-}
+using yuzu::shared::ListStep;
+using yuzu::shared::ListWalk;
+using yuzu::shared::walk_enumeration;
 
 } // namespace yuzu::echo

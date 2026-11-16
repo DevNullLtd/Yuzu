@@ -45,7 +45,7 @@ test_echo_mapdrive.cpp), so this pins the wiring lexically. Invariants:
      read_offline_hive_bounded before that function's own halted check. The shell
      (sweep_leftover_hive_mounts) takes the process-wide offline-hive lock BEFORE it lists
      HKEY_USERS (that lock is what keeps it off this process's own live mounts), lists through
-     the shared enumerate_hku_subkeys, offers only select_stale_hive_mounts' names to
+     the shared enumerate_hku_subkeys_checked, offers only select_stale_hive_mounts' names to
      RegUnLoadKeyW only when SeRestorePrivilege is held, and never forces an unload; the
      worker sweeps the whole default prefix (no argument).
 
@@ -194,10 +194,13 @@ def problems(collector_src, plugin_src, gate_src, registry_src):
         if not re.search(r"const MountWorkerGuard \w+;[^}]*?sweep_leftover_hive_mounts\(\)", sweep):
             out.append("the sweep worker no longer counts itself in flight before it sweeps, or "
                        "no longer sweeps the whole default prefix (no argument)")
-        if not re.search(r"BoundedCallStatus::Completed\) \{ tick\.sweep_pending = false; return; \}", sweep):
-            out.append("the sweep must clear sweep_pending when, and only when, its worker completed")
-        if sweep.count("sweep_pending = false") != 1:
-            out.append("sweep_pending is cleared on a path other than a completed worker")
+        if not re.search(r"BoundedCallStatus::Completed\) \{[^}]*?"
+                         r"settle_sweep\(\*bounded\.value, tick\.sweep_listing_retried\);[^}]*?"
+                         r"tick\.sweep_pending = settle\.pending;.*?return;\s*\}", sweep):
+            out.append("the sweep must settle sweep_pending through settle_sweep when, and only when, "
+                       "its worker completed")
+        if sweep.count("sweep_pending =") != 1:
+            out.append("sweep_pending is written on a path other than a completed worker")
         if "decide_mount_call(" not in sweep or "tick.halted = decision.halt_walk;" not in sweep:
             out.append("a timed-out or rejected sweep no longer halts the tick through decide_mount_call")
         if not sweep.lstrip("{ ").startswith("if (!tick.sweep_pending || tick.halted) return;"):
@@ -220,13 +223,17 @@ def problems(collector_src, plugin_src, gate_src, registry_src):
         out.append("sweep_leftover_hive_mounts() is missing")
     else:
         lock_at = shell.find('ScopedOfflineHiveLock offline_lock("echo_registry_sweep")')
-        list_at = shell.find("enumerate_hku_subkeys()")
+        list_at = shell.find("enumerate_hku_subkeys_checked()")
         if not (0 <= lock_at < list_at):
             out.append("the sweep must take the process-wide offline-hive lock BEFORE it lists "
                        "HKEY_USERS: the lock is what keeps it off this process's live mounts")
-        if "select_stale_hive_mounts(yuzu::win::enumerate_hku_subkeys(), prefix)" not in shell:
-            out.append("the sweep must list through the shared enumerate_hku_subkeys and select "
+        if ("select_stale_hive_mounts(listing.names, prefix)" not in shell
+                or "const auto listing = yuzu::win::enumerate_hku_subkeys_checked();" not in shell):
+            out.append("the sweep must list through the shared enumerate_hku_subkeys_checked and select "
                        "through the unit-tested select_stale_hive_mounts")
+        if not re.search(r"if \(!listing\.error\.empty\(\)\) \{\s*r\.listing_error = listing\.error;\s*return r;", shell):
+            out.append("a failed or unstable HKEY_USERS listing must report its cause in listing_error "
+                       "and unload nothing")
         if "enumerate_hku()" in shell:
             out.append("the sweep must not list through Echo's own enumerate_hku")
         if ('PrivilegeScope restore_priv(L"SeRestorePrivilege")' not in shell
@@ -420,7 +427,7 @@ class EchoMapdrivePinLexical(unittest.TestCase):
                 r, "return discover_offline_profiles(loaded);", "return OfflineDiscovery{};")),
             "registry discovery enumerates HKU a second time": dict(r=mutate(
                 r, "build_profile_list(disc.records, loaded)",
-                   "build_profile_list(disc.records, yuzu::win::enumerate_hku_subkeys())")),
+                   "build_profile_list(disc.records, yuzu::win::enumerate_hku_subkeys_checked().names)")),
             "registry discovery ignores collect's loaded list": dict(r=mutate(
                 r, "build_profile_list(disc.records, loaded)", "build_profile_list(disc.records, {})")),
             "registry closed gate answers attempted": dict(r=mutate(
@@ -466,10 +473,16 @@ class EchoMapdrivePinLexical(unittest.TestCase):
                    "        return yuzu::echo::sweep_leftover_hive_mounts();",
                    "return yuzu::echo::sweep_leftover_hive_mounts();")),
             "sweep cleared when it did not complete": dict(r=mutate(
-                r, "if (bounded.status == yuzu::shared::BoundedCallStatus::Completed) {\n"
-                   "        tick.sweep_pending = false;\n        return;\n    }",
-                   "tick.sweep_pending = false;\n    if (bounded.status == yuzu::shared::BoundedCallStatus::Completed) {\n"
-                   "        return;\n    }")),
+                r, "if (bounded.status == yuzu::shared::BoundedCallStatus::Completed) {",
+                   "tick.sweep_pending = false;\n    if (bounded.status == yuzu::shared::BoundedCallStatus::Completed) {")),
+            "sweep ignores an incomplete listing": dict(r=mutate(
+                r, "tick.sweep_pending = settle.pending;", "tick.sweep_pending = false;")),
+            "sweep retry state dropped": dict(r=mutate(
+                r, "settle_sweep(*bounded.value, tick.sweep_listing_retried)",
+                   "settle_sweep(*bounded.value, tick.sweep_pending)")),
+            "sweep acts on a failed listing": dict(r=mutate(
+                r, "        if (!listing.error.empty()) {\n            r.listing_error = listing.error;\n            return r;\n        }\n",
+                   "")),
             "sweep timeout no longer halts the tick": dict(r=mutate(
                 r, "tick.halted = decision.halt_walk;\n    tick.halted_token = decision.attempted ? "
                    "\"skipped_after_timeout\"", "(void)decision;\n    tick.halted_token = decision.attempted ? "
@@ -492,14 +505,13 @@ class EchoMapdrivePinLexical(unittest.TestCase):
             "hook and start stop sharing one tick": dict(r=mutate(
                 r, "r.read_offline_hive = [tick](", "r.read_offline_hive = [tick = std::make_shared<OfflineMountTick>()](")),
             "sweep lists HKU before it takes the lock": dict(r=mutate(
-                r, '        const yuzu::agent::ScopedOfflineHiveLock offline_lock("echo_registry_sweep");\n'
-                   "        stale = select_stale_hive_mounts(yuzu::win::enumerate_hku_subkeys(), prefix);\n",
-                   "        stale = select_stale_hive_mounts(yuzu::win::enumerate_hku_subkeys(), prefix);\n"
+                r, '        const yuzu::agent::ScopedOfflineHiveLock offline_lock("echo_registry_sweep");\n',
+                   "        (void)yuzu::win::enumerate_hku_subkeys_checked();\n"
                    '        const yuzu::agent::ScopedOfflineHiveLock offline_lock("echo_registry_sweep");\n')),
             "sweep unloads names it did not select": dict(r=mutate(
-                r, "r = sweep_hive_mounts(stale, [](", "r = sweep_hive_mounts(yuzu::win::enumerate_hku_subkeys(), [](")),
+                r, "r = sweep_hive_mounts(stale, [](", "r = sweep_hive_mounts(yuzu::win::enumerate_hku_subkeys_checked().names, [](")),
             "sweep lists through Echo's own enumeration": dict(r=mutate(
-                r, "select_stale_hive_mounts(yuzu::win::enumerate_hku_subkeys(), prefix)",
+                r, "select_stale_hive_mounts(listing.names, prefix)",
                    "select_stale_hive_mounts(enumerate_hku(), prefix)")),
             "sweep no longer enables SeRestorePrivilege": dict(r=mutate(
                 r, 'const yuzu::win::PrivilegeScope restore_priv(L"SeRestorePrivilege");', "(void)0;")),
