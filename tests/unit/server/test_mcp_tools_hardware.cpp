@@ -23,6 +23,7 @@
 #include "mcp_server_testonly.hpp"
 #include "mcp_tool_deps.hpp"
 #include "mcp_tool_registry.hpp"
+#include "test_fake_ci_keyset_store.hpp"
 #include "test_json_schema_subset.hpp"
 #include "test_route_sink.hpp"
 
@@ -31,6 +32,7 @@
 #include <yuzu/metrics.hpp>
 
 #include <algorithm>
+#include <cstdio>
 #include <functional>
 #include <map>
 #include <memory>
@@ -138,6 +140,8 @@ struct Twin {
     std::vector<CiRead> ci_reads; // the `CiRead` argument of every ci_detail_fn call
     yuzu::MetricsRegistry metrics; // the integrity counter the fake ci_detail_fn below feeds
     std::vector<std::string> dex_calls_for;
+    // The keyset store behind GET /api/v1/hardware-ci and list_hardware_ci_records.
+    yuzu::server::test::FakeCiKeysetStore ci_store;
 
     // Domain-verb audit sink (deps.audit_fn on both transports).
     bool domain_audit_ok = true;
@@ -163,6 +167,7 @@ struct Twin {
         bool wire_ci = true;
         bool wire_dex = true;
         bool wire_audit = true;
+        bool wire_ci_page = true;
     };
 
     Twin() : Twin(Opts{}) {}
@@ -229,6 +234,7 @@ struct Twin {
         deps.audit_fn = domain_audit;
         deps.roster_fn = roster_fn;
         deps.ci_detail_fn = ci_fn;
+        deps.ci_page_reader = ci_store.reader();
         deps.dex_score_fn = dex_fn;
         sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://yuzu.test"}};
         routes.register_routes(sink, deps);
@@ -243,6 +249,8 @@ struct Twin {
             td.roster_fn = roster_fn;
         if (o.wire_ci)
             td.ci_detail_fn = ci_fn;
+        if (o.wire_ci_page)
+            td.ci_page_reader = ci_store.reader();
         if (o.wire_dex)
             td.dex_score_fn = dex_fn;
         server.set_tool_deps(std::move(td));
@@ -532,7 +540,7 @@ TEST_CASE("mcp hardware twins: an unwired provider is an internal error with no 
             CHECK(out["code"] == mcp::kInternalError);
             CHECK(out["retry"] == -1);
         }
-        CHECK(rows.size() == 2);
+        CHECK(rows.size() == mcp::hardware_tool_records().size());
     }
 }
 
@@ -1626,4 +1634,622 @@ TEST_CASE("mcp hardware twins: an out-of-scope read does not fetch the record or
     REQUIRE(t.ci_reads.size() == 1);
     CHECK(t.ci_reads[0] == CiRead::WithSections);
     CHECK(integrity(t, "row_count_mismatch") == 1.0);
+}
+
+// ───────────────────── list_hardware_ci_records: the bulk keyset twin ─────────────────────
+// The MCP twin of GET /api/v1/hardware-ci. It is a separate tool, not a mode of
+// list_hardware_ci: that tool is roster-driven with offset paging and one output schema, and
+// the bulk page reads the CI table with cursor paging and a different row.
+
+namespace {
+
+void seed(Twin& t, std::initializer_list<const char*> ids) {
+    for (const char* id : ids)
+        t.ci_store.add(std::string(id));
+}
+
+std::vector<std::string> record_ids(const json& structured) {
+    std::vector<std::string> out;
+    for (const auto& d : structured["devices"])
+        out.push_back(d["agent_id"].get<std::string>());
+    return out;
+}
+
+} // namespace
+
+TEST_CASE("mcp list_hardware_ci_records: served as a confined Inventory:Read read with typed, bounded schemas",
+          "[mcp][hardware][ci_page][registry_seam]") {
+    Twin t;
+    const auto rows = mcp::tool_security_rows_for_test();
+    const auto it = std::find_if(rows.begin(), rows.end(),
+                                 [](const auto& r) { return r.name == "list_hardware_ci_records"; });
+    REQUIRE(it != rows.end());
+    CHECK(it->securable == "Inventory");
+    CHECK(it->operation == "Read");
+    CHECK(it->service_scope == mcp::ServiceScopeClassForTest::kConfined);
+
+    auto res = t.post(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    REQUIRE(res);
+    const json listed = json::parse(res->body);
+    const json& tool = tool_entry(listed, "list_hardware_ci_records");
+    CHECK(tool["annotations"]["readOnlyHint"] == true);
+    CHECK(tool["annotations"]["idempotentHint"] == true);
+    CHECK(tool["outputSchema"]["type"] == "object");
+    CHECK(tool["outputSchema"]["required"] == json::array({"devices", "next_cursor"}));
+    const auto& p = tool["inputSchema"]["properties"];
+    CHECK(p["limit"]["minimum"] == 1);
+    CHECK(p["limit"]["maximum"] == 1000);
+    CHECK(p["limit"]["default"] == 20); // the handler's default (agents), not REST's 100
+    CHECK(p["cursor"]["maxLength"] == 2048);
+    CHECK(p["agent_id"]["minLength"] == 1);
+    CHECK(p["agent_id"]["maxLength"] == 256);
+    const std::string desc = tool["description"].get<std::string>();
+    CHECK(desc.find("retry_after_ms") != std::string::npos);
+    // the decision-grade facts a worker needs before it calls
+    for (const char* needle : {"more than 10000 devices", "-32602", "scope_basis", "daily-sync snapshot",
+                               "from list_hardware_ci", "indistinguishable", "limit up to 20",
+                               "GET /api/v1/hardware-ci", "byte order", "not a snapshot",
+                               "confirm a device with agent_id before you retire it",
+                               "empty devices array without agent_id"})
+        CHECK(desc.find(needle) != std::string::npos);
+    // The agentic guidance LEADS (it comes before the CMDB walk instructions), and the retired
+    // "built for a daily pull" lead and the old default are gone.
+    CHECK(desc.find("For agentic workers") < desc.find("To walk the records"));
+    CHECK(desc.find("Built for a daily pull") == std::string::npos);
+    CHECK(desc.find("(default 100)") != std::string::npos); // REST's default, named as REST's
+    CHECK(desc.find("limit is 1..1000 (default 20)") != std::string::npos);
+    CHECK(desc.find("Rows are in agent_id order") == std::string::npos);
+    // the retired wide-scope remark is gone
+    CHECK(desc.find("can be empty while next_cursor is not") == std::string::npos);
+    CHECK(desc.find("devices_omitted") == std::string::npos);
+    CHECK(tool["outputSchema"]["properties"].contains("scope_basis"));
+    CHECK_FALSE(tool["outputSchema"]["properties"].contains("devices_omitted"));
+    // and the roster tool points at the bulk one
+    CHECK(tool_entry(listed, "list_hardware_ci")["description"].get<std::string>().find(
+              "list_hardware_ci_records") != std::string::npos);
+}
+
+TEST_CASE("mcp list_hardware_ci_records: the page is the REST data object byte for byte, and walks to the end",
+          "[mcp][hardware][ci_page]") {
+    Twin t;
+    seed(t, {"a", "b", "c", "d", "e"});
+
+    std::vector<std::string> seen;
+    std::string cursor;
+    for (int pages = 0; pages < 10; ++pages) {
+        json args = {{"limit", 2}};
+        std::string url = "/api/v1/hardware-ci?limit=2";
+        if (!cursor.empty()) {
+            args["cursor"] = cursor;
+            url += "&cursor=" + cursor;
+        }
+        const json mcp_r = t.call("list_hardware_ci_records", args);
+        REQUIRE_FALSE(mcp_r.contains("error"));
+        const json mcp_page = mcp_r["result"]["structuredContent"];
+        const json rest_page = t.rest_data(url);
+        CHECK(mcp_page == rest_page); // global read: the MCP body is the REST data object
+        for (const auto& id : record_ids(mcp_page))
+            seen.push_back(id);
+        cursor = mcp_page["next_cursor"].get<std::string>();
+        if (cursor.empty())
+            break;
+    }
+    CHECK(seen == std::vector<std::string>{"a", "b", "c", "d", "e"});
+}
+
+TEST_CASE("mcp list_hardware_ci_records: output conforms to its schema, v1 and v2 rows alike",
+          "[mcp][hardware][ci_page]") {
+    Twin t;
+    auto v1 = yuzu::server::test::make_ci_record("old");
+    v1.blob_version = 1;
+    t.ci_store.add(v1);
+    seed(t, {"new"});
+    auto res = t.post(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    REQUIRE(res);
+    const json schema = tool_entry(json::parse(res->body), "list_hardware_ci_records")["outputSchema"];
+    const json r = t.call("list_hardware_ci_records");
+    REQUIRE_FALSE(r.contains("error"));
+    CHECK(schema_violation(schema, r["result"]["structuredContent"]) == "");
+    // an empty store is a valid, empty page
+    Twin empty;
+    CHECK(schema_violation(schema, empty.call("list_hardware_ci_records")["result"]["structuredContent"]) ==
+          "");
+}
+
+TEST_CASE("mcp list_hardware_ci_records: a confined caller sees only its scope and is not told what was hidden",
+          "[mcp][hardware][ci_page][security]") {
+    Twin t;
+    seed(t, {"in-a", "in-b", "out-c", "out-d"});
+    t.scope = std::unordered_set<std::string>{"in-a", "in-b"};
+
+    std::vector<std::string> seen;
+    std::string cursor;
+    for (int pages = 0; pages < 10; ++pages) {
+        json args = {{"limit", 1}};
+        if (!cursor.empty())
+            args["cursor"] = cursor;
+        const json r = t.call("list_hardware_ci_records", args);
+        REQUIRE_FALSE(r.contains("error"));
+        const json sc = r["result"]["structuredContent"];
+        CHECK(sc["scope_basis"] == "authority_scoped");
+        CHECK_FALSE(sc.contains("devices_omitted")); // no count of what lies outside the scope
+        CHECK(r.dump().find("out-") == std::string::npos);
+        for (const auto& id : record_ids(sc))
+            seen.push_back(id);
+        cursor = sc["next_cursor"].get<std::string>();
+        if (cursor.empty())
+            break;
+    }
+    CHECK(seen == std::vector<std::string>{"in-a", "in-b"});
+
+    // A named device outside the scope reads as an empty page and carries none of its bytes; the
+    // audit rows (domain verb and generic) record a refusal, not a served page.
+    t.clear_audit();
+    const int reads_before = t.ci_store.reads;
+    const json named = t.call("list_hardware_ci_records", {{"agent_id", "out-c"}});
+    REQUIRE_FALSE(named.contains("error"));
+    CHECK(record_ids(named["result"]["structuredContent"]).empty());
+    CHECK(named.dump().find("out-c") == std::string::npos);
+    CHECK(t.ci_store.reads == reads_before); // no SQL for a device outside the scope
+    REQUIRE(t.domain_rows.size() == 1);
+    CHECK(t.domain_rows[0] == "inventory.devices.ci|denied|Agent|out-c");
+    CHECK(t.domain_details[0] == "hardware CI records (MCP) state=agent_id outside the caller's scope");
+    REQUIRE(t.generic_rows.size() == 1);
+    CHECK(t.generic_rows[0] == "mcp.list_hardware_ci_records|denied");
+
+    // A global-read caller gets no scope_basis, and nobody gets a count of hidden devices.
+    Twin g;
+    seed(g, {"a"});
+    const json gr = g.call("list_hardware_ci_records");
+    CHECK_FALSE(gr["result"]["structuredContent"].contains("devices_omitted"));
+    CHECK_FALSE(gr["result"]["structuredContent"].contains("scope_basis"));
+}
+
+// The audit detail grammar, as exact strings, on this transport.
+TEST_CASE("mcp list_hardware_ci_records: audit detail is the exact documented grammar",
+          "[mcp][hardware][ci_page][security]") {
+    Twin t;
+    seed(t, {"a", "b", "c"});
+
+    const auto last = [&]() {
+        REQUIRE_FALSE(t.domain_details.empty());
+        REQUIRE(t.generic_details.size() == t.domain_details.size());
+        CHECK(t.generic_details.back() == t.domain_details.back()); // the same text on both rows
+        return t.domain_details.back();
+    };
+    t.clear_audit();
+    json first = t.call("list_hardware_ci_records", {{"limit", 2}});
+    CHECK(last() == "hardware CI records (MCP): rows=2 scope=fleet");
+    CHECK(t.domain_rows.back() == "inventory.devices.ci|success|Inventory|fleet");
+    CHECK(t.generic_rows.back() == "mcp.list_hardware_ci_records|success");
+
+    const std::string cursor = first["result"]["structuredContent"]["next_cursor"];
+    REQUIRE_FALSE(cursor.empty());
+    t.clear_audit();
+    (void)t.call("list_hardware_ci_records", {{"limit", 2}, {"cursor", cursor}});
+    CHECK(last() == "hardware CI records (MCP): rows=1 page=continuation scope=fleet");
+
+    t.clear_audit();
+    (void)t.call("list_hardware_ci_records", {{"agent_id", "b"}});
+    CHECK(last() == "hardware CI records (MCP): rows=1 scope=fleet");
+    CHECK(t.domain_rows.back() == "inventory.devices.ci|success|Agent|b");
+
+    t.scope = std::unordered_set<std::string>{"a", "b"};
+    t.clear_audit();
+    (void)t.call("list_hardware_ci_records");
+    CHECK(last() == "hardware CI records (MCP): rows=2 scope=authority_scoped");
+
+    t.ci_store.degraded = true;
+    t.clear_audit();
+    (void)t.call("list_hardware_ci_records");
+    CHECK(t.domain_rows.back() == "inventory.devices.ci|failure|Inventory|fleet");
+    CHECK(t.domain_details.back() == "hardware CI records (MCP) state=store unreadable");
+}
+
+// An out-of-scope id that exists and an in-scope id with no record are the
+// same bytes (apart from the per-request correlation id); only the audit outcome differs.
+TEST_CASE("mcp list_hardware_ci_records: an out-of-scope id and an unknown id answer identically",
+          "[mcp][hardware][ci_page][security]") {
+    Twin t;
+    seed(t, {"in-a", "out-b"});
+    t.scope = std::unordered_set<std::string>{"in-a", "in-ghost"};
+
+    t.clear_audit();
+    json hidden = t.call("list_hardware_ci_records", {{"agent_id", "out-b"}});
+    const std::string hidden_row = t.domain_rows.back() + " / " + t.domain_details.back();
+    t.clear_audit();
+    json ghost = t.call("list_hardware_ci_records", {{"agent_id", "in-ghost"}});
+    const std::string ghost_row = t.domain_rows.back() + " / " + t.domain_details.back();
+
+    REQUIRE_FALSE(hidden.contains("error"));
+    REQUIRE_FALSE(ghost.contains("error"));
+    CHECK(hidden["result"] == ghost["result"]);
+    CHECK(hidden["result"]["structuredContent"]["devices"].empty());
+    CHECK(hidden["result"]["structuredContent"]["next_cursor"] == "");
+    CHECK(hidden_row ==
+          "inventory.devices.ci|denied|Agent|out-b / hardware CI records (MCP) state=agent_id outside the caller's scope");
+    CHECK(ghost_row ==
+          "inventory.devices.ci|success|Agent|in-ghost / hardware CI records (MCP): rows=0 scope=authority_scoped");
+}
+
+// A denied named read is still a fail-closed audit on this transport.
+TEST_CASE("mcp list_hardware_ci_records: a denied named read is withheld when either audit row is dropped",
+          "[mcp][hardware][ci_page][security]") {
+    Twin t;
+    seed(t, {"out-b"});
+    t.scope = std::unordered_set<std::string>{"in-a"};
+    for (const bool drop_domain : {true, false}) {
+        t.clear_audit();
+        t.domain_audit_ok = !drop_domain;
+        t.generic_audit_ok = drop_domain;
+        const json r = t.call("list_hardware_ci_records", {{"agent_id", "out-b"}});
+        REQUIRE(r.contains("error"));
+        CHECK_FALSE(r.contains("result"));
+        CHECK(r["error"]["code"] == mcp::kInternalError);
+    }
+}
+
+namespace {
+
+authz::VisibleSet mcp_scope_of_size(std::initializer_list<const char*> real, std::size_t n) {
+    std::unordered_set<std::string> ids;
+    for (const char* r : real)
+        ids.insert(r);
+    for (int i = 0; ids.size() < n; ++i)
+        ids.insert("pad-" + std::to_string(i));
+    return ids;
+}
+
+} // namespace
+
+// Kills: a `>=` ceiling, and a scope at the ceiling not reaching SQL as the full id list.
+TEST_CASE("mcp list_hardware_ci_records: a scope of exactly 10000 ids is pushed into SQL and pages exactly",
+          "[mcp][hardware][ci_page][ceiling]") {
+    Twin t;
+    seed(t, {"in-a", "out-b", "in-d"});
+    t.scope = mcp_scope_of_size({"in-a", "in-d"}, 10000);
+    const json r = t.call("list_hardware_ci_records", {{"limit", 1}});
+    REQUIRE_FALSE(r.contains("error"));
+    CHECK(record_ids(r["result"]["structuredContent"]) == std::vector<std::string>{"in-a"});
+    CHECK(r["result"]["structuredContent"]["next_cursor"] != "");
+    REQUIRE(t.ci_store.queries.size() == 1);
+    REQUIRE(t.ci_store.queries[0].agent_ids.has_value());
+    CHECK(t.ci_store.queries[0].agent_ids->size() == 10000);
+}
+
+// Kills: reading a scope above the ceiling; answering it as retryable; dropping the audit row or
+// putting a count in it.
+TEST_CASE("mcp list_hardware_ci_records: a scope of 10001 ids and no agent_id is a terminal -32602 with zero reads",
+          "[mcp][hardware][ci_page][ceiling]") {
+    Twin t;
+    seed(t, {"in-a", "out-b", "in-d"});
+    t.scope = mcp_scope_of_size({"in-a", "in-d"}, 10001);
+    t.clear_audit();
+    const json r = t.call("list_hardware_ci_records");
+    REQUIRE(r.contains("error"));
+    CHECK_FALSE(r.contains("result"));
+    CHECK(r["error"]["code"] == mcp::kInvalidParams);
+    CHECK(r["error"]["message"] ==
+          "the caller's scope covers more than 10000 devices and no agent_id was given; a credential with global read has no such limit");
+    CHECK(r["error"]["data"]["remediation"] == "use a credential with global read, pass agent_id, or ask an administrator to narrow the caller's scope");
+    CHECK(r["error"]["data"]["retry_after_ms"].is_null()); // terminal: nothing to wait for
+    // The control for the dropped-row test below: both rows persisted here, so the flag is absent.
+    CHECK_FALSE(r["error"]["data"].contains("audit_persisted"));
+    CHECK(t.ci_store.reads == 0);
+    CHECK(r.dump().find("in-a") == std::string::npos);
+    REQUIRE(t.domain_rows.size() == 1);
+    CHECK(t.domain_rows[0] == "inventory.devices.ci|denied|Inventory|fleet");
+    CHECK(t.domain_details[0] == "hardware CI records (MCP) state=scope too wide");
+    REQUIRE(t.generic_rows.size() == 1);
+    CHECK(t.generic_rows[0] == "mcp.list_hardware_ci_records|denied");
+
+    // distinct from the store-degrade answer, even with a degraded store
+    Twin d;
+    d.scope = mcp_scope_of_size({"x"}, 10001);
+    d.ci_store.degraded = true;
+    const json dr = d.call("list_hardware_ci_records");
+    REQUIRE(dr.contains("error"));
+    CHECK(dr["error"]["code"] == mcp::kInvalidParams);
+    CHECK(d.ci_store.reads == 0);
+}
+
+// The scope refusal serves nothing, so its two audit rows are best effort: when either does not
+// persist the -32602 stands and the error data says audit_persisted:false. Kills: turning the
+// refusal into a retryable kInternalError like a withheld page, or hiding the dropped row.
+TEST_CASE("mcp list_hardware_ci_records: scope-too-wide -32602 stands, audit_persisted false, when a row is dropped",
+          "[mcp][hardware][ci_page][ceiling][security]") {
+    for (const bool drop_domain : {true, false}) {
+        INFO((drop_domain ? "domain row dropped" : "generic row dropped"));
+        Twin t;
+        seed(t, {"in-a", "in-d"});
+        t.scope = mcp_scope_of_size({"in-a", "in-d"}, 10001);
+        t.clear_audit();
+        t.domain_audit_ok = !drop_domain;
+        t.generic_audit_ok = drop_domain;
+        const json r = t.call("list_hardware_ci_records");
+        REQUIRE(r.contains("error"));
+        CHECK_FALSE(r.contains("result"));
+        CHECK(r["error"]["code"] == mcp::kInvalidParams);
+        CHECK(r["error"]["data"]["audit_persisted"] == false);
+        CHECK(t.ci_store.reads == 0);
+        CHECK(r.dump().find("in-a") == std::string::npos);
+    }
+}
+
+TEST_CASE("mcp list_hardware_ci_records: a scope of 10001 ids with an agent_id reads that one device by key",
+          "[mcp][hardware][ci_page][ceiling]") {
+    Twin t;
+    seed(t, {"in-a", "out-b", "in-d"});
+    t.scope = mcp_scope_of_size({"in-a", "in-d"}, 10001);
+
+    const json ok = t.call("list_hardware_ci_records", {{"agent_id", "in-d"}});
+    REQUIRE_FALSE(ok.contains("error"));
+    CHECK(record_ids(ok["result"]["structuredContent"]) == std::vector<std::string>{"in-d"});
+    REQUIRE(t.ci_store.queries.size() == 1);
+    CHECK(t.ci_store.queries[0].agent_id == std::optional<std::string>("in-d"));
+    CHECK_FALSE(t.ci_store.queries[0].agent_ids.has_value());
+
+    const int reads = t.ci_store.reads;
+    t.clear_audit();
+    const json hidden = t.call("list_hardware_ci_records", {{"agent_id", "out-b"}});
+    REQUIRE_FALSE(hidden.contains("error"));
+    CHECK(record_ids(hidden["result"]["structuredContent"]).empty());
+    CHECK(t.ci_store.reads == reads);
+    CHECK(t.domain_rows.back() == "inventory.devices.ci|denied|Agent|out-b");
+}
+
+// Kills: the MCP default staying at REST's 100 (each page lands in an agent's context) and the
+// two transports sharing one default; both limits are observable as the store's limit + 1.
+TEST_CASE("mcp list_hardware_ci_records: the default page is 20 rows, REST's stays 100",
+          "[mcp][hardware][ci_page]") {
+    Twin t;
+    for (int i = 0; i < 130; ++i) {
+        char buf[16];
+        std::snprintf(buf, sizeof buf, "d%03d", i);
+        t.ci_store.add(std::string(buf));
+    }
+    t.ci_store.queries.clear();
+    const json r = t.call("list_hardware_ci_records");
+    REQUIRE_FALSE(r.contains("error"));
+    CHECK(record_ids(r["result"]["structuredContent"]).size() == 20);
+    CHECK_FALSE(r["result"]["structuredContent"]["next_cursor"].get<std::string>().empty());
+    REQUIRE(t.ci_store.queries.size() == 1);
+    CHECK(t.ci_store.queries[0].limit == 21);
+
+    t.ci_store.queries.clear();
+    const json rest = t.rest_data("/api/v1/hardware-ci");
+    CHECK(record_ids(rest).size() == 100);
+    REQUIRE(t.ci_store.queries.size() == 1);
+    CHECK(t.ci_store.queries[0].limit == 101);
+    // an explicit limit is honoured on both, up to 1000
+    CHECK(record_ids(t.call("list_hardware_ci_records", {{"limit", 130}})["result"]["structuredContent"])
+              .size() == 130);
+}
+
+// Kills: REST and MCP answering a present-but-empty agent_id differently (REST used to read the
+// whole fleet where MCP refused), and either transport touching the store or auditing a page.
+TEST_CASE("route and mcp agree: a present-but-empty agent_id is refused with the same words, before any read",
+          "[mcp][hardware][ci_page]") {
+    Twin t;
+    seed(t, {"a", "b"});
+    t.clear_audit();
+    const int reads = t.ci_store.reads;
+    auto rest = t.sink.Get("/api/v1/hardware-ci?agent_id=");
+    REQUIRE(rest);
+    CHECK(rest->status == 400);
+    const json mcp_r = t.call("list_hardware_ci_records", {{"agent_id", ""}});
+    REQUIRE(mcp_r.contains("error"));
+    CHECK(mcp_r["error"]["code"] == mcp::kInvalidParams);
+    const std::string expected = "agent_id must be a non-empty string when given";
+    CHECK(json::parse(rest->body)["error"]["message"] == expected);
+    CHECK(mcp_r["error"]["message"] == expected);
+    CHECK(t.ci_store.reads == reads);
+    CHECK(t.domain_rows.empty());
+    CHECK_FALSE(rest->body.find("\"devices\"") != std::string::npos);
+}
+
+// A confined caller walks the same pages on both transports: the same ids, in the same order,
+// with the same cursors, and nothing outside the scope on either. (The ids are chosen so the
+// scope is not a prefix of the byte order.)
+TEST_CASE("route and mcp agree for a confined caller: same ids, same order, same cursors, nothing hidden",
+          "[mcp][hardware][ci_page][security]") {
+    Twin t;
+    seed(t, {"Zeta", "agent-3", "out-1", "agent-1", "out-2", "_underscore", "agent-2", "out-3"});
+    t.scope = std::unordered_set<std::string>{"Zeta", "agent-3", "agent-1", "_underscore", "agent-2"};
+
+    std::vector<std::string> mcp_seen, rest_seen;
+    std::string cursor;
+    for (int pages = 0; pages < 20; ++pages) {
+        json args = {{"limit", 2}};
+        std::string url = "/api/v1/hardware-ci?limit=2";
+        if (!cursor.empty()) {
+            args["cursor"] = cursor;
+            url += "&cursor=" + cursor;
+        }
+        const json mcp_r = t.call("list_hardware_ci_records", args);
+        REQUIRE_FALSE(mcp_r.contains("error"));
+        const json mcp_page = mcp_r["result"]["structuredContent"];
+        const json rest_page = t.rest_data(url);
+        CHECK(mcp_page == rest_page); // same ids, order, next_cursor and scope_basis
+        CHECK(mcp_page["scope_basis"] == "authority_scoped");
+        for (const auto& id : record_ids(mcp_page))
+            mcp_seen.push_back(id);
+        for (const auto& id : record_ids(rest_page))
+            rest_seen.push_back(id);
+        cursor = mcp_page["next_cursor"].get<std::string>();
+        if (cursor.empty())
+            break;
+    }
+    const std::vector<std::string> visible = {"Zeta", "_underscore", "agent-1", "agent-2", "agent-3"};
+    CHECK(mcp_seen == visible);
+    CHECK(rest_seen == visible);
+}
+
+TEST_CASE("mcp list_hardware_ci_records: arguments are refused, never clamped, and a bad cursor is -32602",
+          "[mcp][hardware][ci_page]") {
+    Twin t;
+    seed(t, {"a"});
+    const std::vector<json> bad = {
+        {{"limit", 0}},     {{"limit", 1001}},     {{"limit", "5"}},   {{"limit", 1.5}},
+        {{"limit", INT64_MAX}}, {{"limit", static_cast<std::uint64_t>(INT64_MAX) + 1}},
+        {{"limit", UINT64_MAX}}, {{"limit", INT64_MIN}}, {{"limit", -1}},
+        {{"limit", nullptr}}, {{"limit", true}},   {{"agent_id", ""}}, {{"agent_id", 7}},
+        {{"agent_id", "a\nb"}}, {{"cursor", 7}},   {{"cursor", std::string(2049, 'x')}},
+        {{"cursor", "garbage"}},
+    };
+    for (const auto& args : bad) {
+        INFO(args.dump());
+        t.clear_audit();
+        const int reads = t.ci_store.reads;
+        const json r = t.call("list_hardware_ci_records", args);
+        REQUIRE(r.contains("error"));
+        CHECK(r["error"]["code"] == mcp::kInvalidParams);
+        CHECK(t.ci_store.reads == reads); // judged before the store is read
+        CHECK(has(t.generic_rows, "mcp.list_hardware_ci_records|denied"));
+        CHECK(t.domain_rows.empty()); // nothing was served, so no served-page row
+    }
+    // limit at both bounds is accepted
+    CHECK_FALSE(t.call("list_hardware_ci_records", {{"limit", 1}}).contains("error"));
+    CHECK_FALSE(t.call("list_hardware_ci_records", {{"limit", 1000}}).contains("error"));
+
+    // A cursor issued without a filter is refused once an agent_id is added.
+    seed(t, {"b"});
+    const json page = t.call("list_hardware_ci_records", {{"limit", 1}});
+    const std::string cursor = page["result"]["structuredContent"]["next_cursor"];
+    REQUIRE_FALSE(cursor.empty());
+    const json cross = t.call("list_hardware_ci_records", {{"agent_id", "a"}, {"cursor", cursor}});
+    REQUIRE(cross.contains("error"));
+    CHECK(cross["error"]["code"] == mcp::kInvalidParams);
+}
+
+// Kills: the two cursor refusals drifting apart again. An over-long cursor (refused while the
+// arguments are read) and one that fails to decode (refused by the page read) give ONE
+// remediation and ONE audit detail, and the same A4 message. A wrongly typed cursor and the
+// other argument refusals keep their own remediation and detail.
+TEST_CASE("mcp list_hardware_ci_records: every refused cursor has one remediation and one audit detail",
+          "[mcp][hardware][ci_page]") {
+    Twin t;
+    seed(t, {"a", "b"});
+    const json page = t.call("list_hardware_ci_records", {{"limit", 1}});
+    const std::string good = page["result"]["structuredContent"]["next_cursor"];
+    REQUIRE_FALSE(good.empty());
+
+    const std::vector<json> refused_cursors = {
+        {{"cursor", std::string(2049, 'x')}},               // over-long, refused at parse time
+        {{"cursor", std::string("a\0b", 3)}},               // NUL: not valid text, same refusal
+        {{"cursor", std::string("a\0b", 3)}, {"agent_id", "a\nb"}}, // judged before the agent_id
+        {{"cursor", "garbage"}},                            // fails to decode
+        {{"agent_id", "a"}, {"cursor", good}},              // issued for another agent_id filter
+    };
+    for (const auto& args : refused_cursors) {
+        INFO(args.dump().substr(0, 80));
+        t.clear_audit();
+        const json r = t.call("list_hardware_ci_records", args);
+        REQUIRE(r.contains("error"));
+        CHECK(r["error"]["code"] == mcp::kInvalidParams);
+        CHECK(r["error"]["message"] == "invalid cursor; restart from the first page");
+        CHECK(r["error"]["data"]["remediation"] == "omit cursor to restart from the first page");
+        REQUIRE(t.generic_details.size() == 1);
+        CHECK(t.generic_details.back() == "invalid arguments: cursor");
+        CHECK(has(t.generic_rows, "mcp.list_hardware_ci_records|denied"));
+        CHECK(t.domain_rows.empty());
+    }
+
+    // The other argument refusals keep "fix the argument and re-call" and their own reason.
+    struct Other {
+        json args;
+        const char* detail;
+    };
+    const std::vector<Other> others = {
+        {{{"limit", 0}}, "invalid arguments: limit must be between 1 and 1000"},
+        {{{"agent_id", ""}}, "invalid arguments: agent_id must be a non-empty string when given"},
+        {{{"agent_id", "a\nb"}}, "invalid arguments: invalid agent_id"},
+        {{{"cursor", 7}}, "invalid arguments: cursor must be a JSON string"},
+    };
+    for (const auto& o : others) {
+        INFO(o.args.dump());
+        t.clear_audit();
+        const json r = t.call("list_hardware_ci_records", o.args);
+        REQUIRE(r.contains("error"));
+        CHECK(r["error"]["data"]["remediation"] == "fix the argument and re-call");
+        REQUIRE(t.generic_details.size() == 1);
+        CHECK(t.generic_details.back() == o.detail);
+    }
+}
+
+TEST_CASE("mcp list_hardware_ci_records: if either access row does not persist the data is withheld",
+          "[mcp][hardware][ci_page][security]") {
+    Twin t;
+    seed(t, {"a"});
+    for (const bool drop_domain : {true, false}) {
+        INFO((drop_domain ? "domain row dropped" : "generic row dropped"));
+        t.clear_audit();
+        t.domain_audit_ok = !drop_domain;
+        t.generic_audit_ok = drop_domain;
+        const json r = t.call("list_hardware_ci_records");
+        REQUIRE(r.contains("error"));
+        CHECK_FALSE(r.contains("result"));
+        CHECK(r["error"]["code"] == mcp::kInternalError);
+        CHECK(r["error"]["data"]["retry_after_ms"] == mcp::kMcpStoreFaultRetryMs);
+        const std::string body = r.dump();
+        CHECK(body.find("SN-a") == std::string::npos);
+        CHECK(body.find("host-a") == std::string::npos);
+        CHECK(body.find("audit_persisted") == std::string::npos);
+        // both rows were attempted
+        CHECK(has(t.domain_rows, "inventory.devices.ci|success|Inventory|fleet"));
+        CHECK(has(t.generic_rows, "mcp.list_hardware_ci_records|success"));
+    }
+    t.domain_audit_ok = true;
+    t.generic_audit_ok = true;
+    CHECK_FALSE(t.call("list_hardware_ci_records").contains("error"));
+}
+
+TEST_CASE("mcp list_hardware_ci_records: a store degrade is a retryable error, never an empty page",
+          "[mcp][hardware][ci_page]") {
+    Twin t;
+    seed(t, {"a"});
+    t.ci_store.degraded = true;
+    const json r = t.call("list_hardware_ci_records");
+    REQUIRE(r.contains("error"));
+    CHECK_FALSE(r.contains("result"));
+    CHECK(r["error"]["code"] == mcp::kInternalError);
+    CHECK(r["error"]["data"]["retry_after_ms"] == mcp::kMcpStoreFaultRetryMs);
+    CHECK(has(t.domain_rows, "inventory.devices.ci|failure|Inventory|fleet"));
+    CHECK(has(t.generic_rows, "mcp.list_hardware_ci_records|failure"));
+}
+
+TEST_CASE("mcp list_hardware_ci_records: unwired providers and a gate refusal",
+          "[mcp][hardware][ci_page]") {
+    {
+        Twin::Opts o;
+        o.wire_ci_page = false;
+        Twin t(o);
+        const json r = t.call("list_hardware_ci_records");
+        REQUIRE(r.contains("error"));
+        CHECK(r["error"]["code"] == mcp::kInternalError);
+        CHECK_FALSE(r.contains("result"));
+    }
+    {
+        Twin::Opts o;
+        o.wire_audit = false;
+        Twin t(o);
+        seed(t, {"a"});
+        const json r = t.call("list_hardware_ci_records");
+        REQUIRE(r.contains("error")); // a missing audit sink is unwired, not "audit off"
+        CHECK(r.dump().find("SN-a") == std::string::npos);
+    }
+    {
+        Twin t;
+        seed(t, {"a"});
+        t.allow_fleet_read = false;
+        json params = {{"name", "list_hardware_ci_records"}, {"arguments", json::object()}};
+        auto res = t.post(
+            json{{"jsonrpc", "2.0"}, {"method", "tools/call"}, {"id", 3}, {"params", params}}.dump());
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(t.ci_store.reads == 0);
+        CHECK(t.domain_rows.empty());
+        CHECK(t.generic_rows.empty());
+        CHECK(t.perm_calls == 0); // fleet_read_fn alone; no second gate stacked
+    }
 }

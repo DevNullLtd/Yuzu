@@ -113,6 +113,7 @@
 #include "principal_class.hpp"
 #include "principal_quota_gate.hpp"
 #include "step_up_wiring.hpp" // post-read body cap + MFA step-up chokepoint (the post-read stage body)
+#include "mfa_binding_gauge.hpp" // yuzu_auth_mfa_binding_enforcement_ok (#6079)
 #include "step_up_gate.hpp" // MFA step-up chokepoint (policy table: step_up_policy.hpp)
 #include "same_site_write_gate.hpp" // cookie-session writes require a same-site Origin or Referer
 #include "rest_a4_envelope_http.hpp"
@@ -835,6 +836,9 @@ public:
                           "gauge");
         metrics_.gauge("yuzu_auth_mfa_step_up_window_seconds")
             .set(static_cast<double>(cfg_.mfa_step_up_window_secs));
+        // #6079: binding-enforcement health. The series are published once both stores are open
+        // (right after the SessionStore is wired) and re-sampled on the 15 s health sweep.
+        describe_mfa_binding_gauge(metrics_);
 
         // Agent OTA pull bounds (#913 / #911 / #416). Pre-seeded closed series
         // per docs/observability-conventions.md so absent() alerts stay
@@ -3645,7 +3649,10 @@ public:
         // this, labelled by the route that hit it. route="approval" (#6079)
         // also counts the approval gate's other 503 causes: the approver's
         // stored MFA secret unreadable, and the session's durable proof
-        // unreadable (or no SessionStore attached). A PG/KEK outage is
+        // unreadable (or no SessionStore attached). route="mfa_binding" (#6079)
+        // counts the generic step-up gates' binding decisions that could not be
+        // made: the stored proof unreadable, or the factor-generation trigger
+        // not observed in force. A PG/KEK outage is
         // visible as a metric spike distinct from ordinary 401/403 traffic,
         // and SRE can tell WHICH fail-closed path is degraded. Bounded,
         // pre-seeded closed label set (route) per
@@ -3655,15 +3662,16 @@ public:
                           "Total requests refused (503, or a retry fragment on Settings) by a "
                           "fail-closed store-unavailable "
                           "guard on the auth/MFA surface, by route (route=approval also counts "
-                          "an unreadable durable session proof; route=mfa_recovery counts a "
-                          "refused Settings recovery-code regeneration; a CSPRNG fault is "
+                          "an unreadable durable session proof; route=mfa_binding counts a "
+                          "step-up binding decision that could not be made; route=mfa_recovery "
+                          "counts a refused Settings recovery-code regeneration; a CSPRNG fault is "
                           "never counted here, see yuzu_secure_random_failure_total)",
                           "counter");
         // route=mfa_recovery (#6995): a refused Settings recovery-code
         // regeneration on a store fault. A CSPRNG fault there is NOT counted
         // here; it goes to yuzu_secure_random_failure_total{site=mfa_recovery}.
         for (auto route : {"login", "mfa_verify", "mfa_stepup", "mfa_enroll", "elevate",
-                           "password_change", "approval", "mfa_recovery"}) {
+                           "password_change", "approval", "mfa_binding", "mfa_recovery"}) {
             metrics_.counter("yuzu_auth_secret_unavailable_total", {{"route", route}});
         }
         // #2396 / #2401: reason-labelled sibling of the counter above. Same
@@ -3765,15 +3773,16 @@ public:
             "Durable session-store operations that hit a degraded PostgreSQL read/"
             "write on the auth hot path (labelled by op: validate / create / touch / "
             "generation_refresh / reap / invalidate_user / invalidate / mark_mfa / "
-            "elevate / account_state, the last being the read of the account store "
-            "that gates a durable local session); a validate degrade fails the request "
-            "closed, and elevate / revoke (via invalidate_user) degrades fail the "
-            "privileged op closed, except "
+            "clear_mfa_proof / rebind_guard / elevate / account_state, the last being the "
+            "read of the account store that gates a durable local session); a validate "
+            "degrade fails the request closed, and elevate / revoke (via invalidate_user) "
+            "degrades fail the privileged op closed, except "
             "that an invalidate_user after an already-committed MFA clear leaves the "
             "clear in place and ends partial",
             "counter");
         for (auto op : {"validate", "create", "touch", "generation_refresh", "reap",
-                        "invalidate_user", "invalidate", "mark_mfa", "elevate", "account_state"})
+                        "invalidate_user", "invalidate", "mark_mfa", "clear_mfa_proof",
+                        "rebind_guard", "elevate", "account_state"})
             metrics_.counter("yuzu_auth_session_store_degrade_total", {{"op", op}});
         metrics_.describe("yuzu_auth_session_account_inactive_total",
                           "Durable local sessions refused at validation because their account "
@@ -3785,6 +3794,30 @@ public:
                           "source is not local, oidc or saml",
                           "counter");
         metrics_.counter("yuzu_auth_session_unknown_source_total");
+        // #6079 factor-generation binding: the three closed-set counters AuthManager increments
+        // when a local MFA proof is refused or withdrawn. Pre-seeded to 0 per
+        // docs/observability-conventions.md so increase() sees the first event of each series.
+        metrics_.describe("yuzu_auth_mfa_stamp_denied_total",
+                          "MFA step-up proofs cleared right after being stamped, by reason "
+                          "(factor_changed: the account's factor generation changed between the "
+                          "verification and the stamp; unverifiable: the generation could not be "
+                          "read to check it)",
+                          "counter");
+        for (auto reason : {"factor_changed", "unverifiable"})
+            metrics_.counter("yuzu_auth_mfa_stamp_denied_total", {{"reason", reason}});
+        metrics_.describe("yuzu_auth_mfa_verification_future_dated_total",
+                          "MFA verifications refused because their database-clock instant was "
+                          "later than the write that would have stored it (the database clock "
+                          "stepped back); the proof is never stored",
+                          "counter");
+        metrics_.counter("yuzu_auth_mfa_verification_future_dated_total");
+        metrics_.describe("yuzu_auth_role_recheck_post_mint_denied_total",
+                          "Freshly minted sessions revoked and denied by the post-mint recheck, "
+                          "by reason (role / credential / factor changed during the mint, removed "
+                          "account, store unavailable)",
+                          "counter");
+        for (auto reason : {"role", "credential", "factor", "removed", "store"})
+            metrics_.counter("yuzu_auth_role_recheck_post_mint_denied_total", {{"reason", reason}});
         // WS-6 6.2: enrollment tokens + pending agents are AuthDB-only (Postgres,
         // shared by every replica) and fail CLOSED on any store failure. This
         // counts each degrade so an operator can tell "agents cannot enroll /
@@ -5921,6 +5954,8 @@ public:
                 auth_mgr_.set_session_store(session_store_.get());
             }
         }
+        // #6079: both binding flags read healthy here (a boot check that failed refused to open).
+        publish_mfa_binding_gauges(metrics_, auth_db_.get(), session_store_.get());
 
         // ScimStore — born-on-PG SCIM v2 store (ADR-0006). Constructed
         // unconditionally (cheap to open; mirrors every other always-on
@@ -10061,6 +10096,17 @@ public:
                     metrics_.gauge(yuzu::server::kWorkflowRunsInFlightMetric)
                         .set(static_cast<double>(stream_budget_->active_for_surface(
                             yuzu::server::detail::SseSurface::kWorkflowRun)));
+                }
+                // #6079: two atomic flag reads. The flags flip only when a request-driven
+                // validation observes the fault (AuthDB::mfa_status, SessionStore::find).
+                // A throw here (an allocation failure in the labelled series) must not end
+                // this thread's loop or terminate the process: the next tick republishes.
+                try {
+                    publish_mfa_binding_gauges(metrics_, auth_db_.get(), session_store_.get());
+                } catch (const std::exception& e) {
+                    spdlog::warn("mfa binding gauge publish failed: {}", e.what());
+                } catch (...) {
+                    spdlog::warn("mfa binding gauge publish failed: unknown exception");
                 }
                 // The CRL source registration resolver pool, published from this 15 s tick (never
                 // from a request path), so the in-flight gauge cannot sit stale after a lookup ends.
@@ -16992,8 +17038,8 @@ private:
         // it locally costs nothing and fails CLOSED (413) rather than
         // deferring to httplib's generic 500.
         //
-        // `[this]` plus the two by-value init-captures named at the bottom of
-        // this comment (the step-up session resolver and audit callable); NO
+        // `[this]` plus the three by-value init-captures named at the bottom of
+        // this comment (the step-up session resolver, audit callable and stored-proof read); NO
         // reference captures. The stage is copied into the registry and then
         // run on every httplib worker thread for the life of the server, so a
         // captured reference to anything scoped to one request's stack frame
@@ -17019,7 +17065,11 @@ private:
                                                   const std::string& rs, const std::string& tt,
                                                   const std::string& ti, const std::string& d) {
                  return audit_log(r, a, rs, tt, ti, d);
-             })](const httplib::Request& req, httplib::Response& res)
+             }),
+             step_up_durable =
+                 DurableProofFn([this](const httplib::Request& r, const auth::Session& s) {
+                     return auth_routes_->durable_mfa_proof_for(r, s);
+                 })](const httplib::Request& req, httplib::Response& res)
                 -> httplib::Server::HandlerResponse {
             // The body cap and the chokepoint live in `detail::run_post_read_stage`
             // (step_up_wiring.hpp), which contains every throw. Building the deps does not
@@ -17028,6 +17078,7 @@ private:
                 .resolve_session = &step_up_resolve,
                 .auth_db = auth_mgr_.auth_db_ptr(),
                 .mfa_status = nullptr,
+                .durable_proof = &step_up_durable,
                 .audit_fn = &step_up_audit,
                 .metrics = &metrics_,
                 .window_secs = cfg_.mfa_step_up_window_secs,
@@ -17941,10 +17992,17 @@ private:
                                                const std::string& ti, const std::string& d) {
                 return audit_log(r, a, rs, tt, ti, d);
             };
-            return detail::run_in_handler_step_up(req, res, session, action_label,
-                                                  auth_mgr_.auth_db_ptr(),
-                                                  cfg_.mfa_step_up_window_secs, audit,
-                                                  cfg_.mfa_enforcement, &metrics_);
+            // The stored proof a local enrolled caller is judged on: the one shared extraction
+            // site, `AuthRoutes::durable_mfa_proof_for` (the chokepoint and the elevation gate
+            // read through it too).
+            const DurableProofFn durable = [this](const httplib::Request& r,
+                                                  const auth::Session& s) {
+                return auth_routes_->durable_mfa_proof_for(r, s);
+            };
+            return detail::run_in_handler_step_up(
+                req, res, session, action_label, auth_mgr_.auth_db_ptr(),
+                cfg_.mfa_step_up_window_secs, audit, cfg_.mfa_enforcement, &metrics_, &durable,
+                /*admitted=*/nullptr);
         };
 
         // #6079: the approve/reject MFA gate, run after `step_up_fn`. That one passes an
@@ -17963,9 +18021,17 @@ private:
             // (ADR-2002 s4); the gate also keeps this replica's cached monotonic check as a
             // second, stricter condition (both must be in the window), because that anchor
             // alone is suspend-blind. Approve/reject admit only cookie sessions
-            // (check_approver_class), so the cookie is the session credential here.
-            const auto durable = auth_mgr_.read_durable_mfa_proof(
-                AuthRoutes::extract_session_cookie(req), session.username);
+            // (check_approver_class), so the cookie is the session credential here. A local
+            // session reads through `durable_mfa_proof_for`, the one site the generic gates use;
+            // an SSO session (kAbsent there, because the generic gate never reads for it) keeps
+            // the direct read, since this gate applies the durable ceiling to its IdP-seeded proof.
+            // The direct read deliberately skips the local rebind-guard check
+            // (`stored_binding_trustworthy`): the binding does not apply to an SSO session.
+            const auto durable =
+                session.auth_source == "oidc"
+                    ? auth_mgr_.read_durable_mfa_proof(AuthRoutes::extract_session_cookie(req),
+                                                       session.username)
+                    : auth_routes_->durable_mfa_proof_for(req, session);
             return require_enrolled_fresh_mfa(
                 req, res, session, *auth_db, cfg_.mfa_step_up_window_secs,
                 [this](const httplib::Request& r, const std::string& a, const std::string& rs,
@@ -18427,9 +18493,35 @@ private:
         // use the quiet admin probe, as the Users page does: a non-administrator's page view
         // must not write an auth.admin_required row per panel. Mutating routes keep the loud
         // require_admin bound above. Wired before the listener starts.
-        // mfa.disable audits after ending the actor's own session (#6079), so it needs the
-        // session-bound writer, not the request-resolving one.
+        // The Settings disable ends the actor's own session (#6079), so the intent row and the
+        // outcome row (ok, partial or error) it writes around the clear need the session-bound
+        // writer, not the request-resolving one.
         settings_routes_->set_audit_as_session_fn(auth_routes_->audit_as_session_fn());
+        // #6079: the recovery-codes and disable handlers use this gate instead of `step_up_fn`:
+        // the same decision (`run_in_handler_step_up`), but it also returns the factor generation
+        // it admitted, which the handler compares under the users row lock. Same sources as
+        // `step_up_fn` above.
+        settings_routes_->set_factor_credential_gate_fn(
+            [this](const httplib::Request& req, httplib::Response& res,
+                   const auth::Session& session,
+                   const std::string& label) -> std::optional<StepUpAdmission> {
+                const StepUpAuditFn audit = [this](const httplib::Request& r, const std::string& a,
+                                                   const std::string& rs, const std::string& tt,
+                                                   const std::string& ti, const std::string& d) {
+                    return audit_log(r, a, rs, tt, ti, d);
+                };
+                const DurableProofFn durable = [this](const httplib::Request& r,
+                                                      const auth::Session& s) {
+                    return auth_routes_->durable_mfa_proof_for(r, s);
+                };
+                StepUpAdmission admitted{};
+                if (!detail::run_in_handler_step_up(
+                        req, res, session, label, auth_mgr_.auth_db_ptr(),
+                        cfg_.mfa_step_up_window_secs, audit, cfg_.mfa_enforcement, &metrics_,
+                        &durable, &admitted))
+                    return std::nullopt;
+                return admitted;
+            });
         settings_routes_->set_read_admin_fn(
             [this](const httplib::Request& req, httplib::Response& res) {
                 return auth_routes_->probe_admin(req, res);
@@ -20707,6 +20799,15 @@ private:
             }
             return detail;
         };
+        // The keyset read of the stored CI rows behind GET /api/v1/hardware-ci and the MCP
+        // list_hardware_ci_records twin: ONE closure for both, so they page the same table the same
+        // way. An unwired store reads as a degrade (nullopt), never an empty page.
+        auto hw_ci_page_reader =
+            [this](const DeviceCiKeysetQuery& q) -> std::optional<std::vector<DeviceCiRecord>> {
+            if (!device_inventory_store_)
+                return std::nullopt;
+            return device_inventory_store_->list_device_ci_after(q);
+        };
         // agent_id -> hostname, one bulk read of the 30-day roster. Shared by the Software
         // devices tables and the Quarantined devices panel.
         auto hw_hostnames_fn = [this]() -> std::unordered_map<std::string, std::string> {
@@ -20950,6 +21051,7 @@ private:
                              .audit_fn = audit_fn,
                              .roster_fn = build_hw_roster,
                              .ci_detail_fn = hw_ci_detail_fn,
+                             .ci_page_reader = hw_ci_page_reader,
                              // Actions lens (generic action runner): the connected
                              // agent's advertised plugins/actions, copied into the
                              // gRPC-free HwPluginActions shape.
@@ -23868,6 +23970,7 @@ private:
             tool_deps.audit_fn = audit_fn;
             tool_deps.roster_fn = build_hw_roster;
             tool_deps.ci_detail_fn = hw_ci_detail_fn;
+            tool_deps.ci_page_reader = hw_ci_page_reader;
             tool_deps.dex_score_fn = hw_dex_score_fn;
             tool_deps.quarantine_list_fn = hw_quarantine_list_fn;
             // /crypto widgets: list_crypto_widgets' availability, get_crypto_ca_stats' R2
