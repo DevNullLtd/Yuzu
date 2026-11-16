@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SAM-23 lexical gate: the software lifecycle store stays wired, fail-closed and observable.
+"""SAM-23 wiring + SAM-24 routes lexical gate: the software lifecycle store stays wired, fail-closed and observable.
 
 Nothing exercises ServerImpl's boot block in a unit test (docs/testing/unit-test-conventions.md;
 no unit test boots ServerImpl for any fail-closed store), and a dropped or inverted line fails
