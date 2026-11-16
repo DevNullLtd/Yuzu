@@ -1519,6 +1519,7 @@ if build_server
       'unit/server/test_auth_break_glass.cpp',
       'unit/server/test_auth_db_pg.cpp',
       'unit/server/test_auth_password.cpp',   # #5342/#5274: AuthManager password change/reset + DB-first credential read
+      'unit/server/test_mfa_disable_owner.cpp', # #6079 PR 2c: MfaDisableOwner one-transaction factor clear + session end + outcome audit row
       'unit/server/test_auto_approve.cpp',
       'unit/server/test_cidr_match.cpp',
       'unit/server/test_runtime_config_secret_redaction.cpp',
