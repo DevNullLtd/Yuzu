@@ -14,6 +14,7 @@
 
 #include "sle_routes.hpp"
 
+#include "device_ci_read_gate.hpp" // kOrderingRetryAfterMs (the recheck-derived retry hint)
 #include "http_route_sink.hpp"
 #include "rest_audit.hpp" // detail::try_persist_audit / emit_behavioral_audit (#1647)
 
@@ -314,28 +315,47 @@ void SleRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_perm_fn
                 // itself — not only by pulling the audit log. Idempotent re-DELETE
                 // then targets the remaining failures.
                 // A write pause is not a database fault: say so, and say when to retry. The
-                // status stays 500 (the cascade is incomplete either way).
-                const std::string msg =
-                    paused.empty()
-                        ? "agent decommission incomplete — one or more stores failed (" +
-                              std::to_string(r.failed) +
-                              " failed); re-issue the DELETE (the cascade is idempotent)"
-                        : "agent decommission incomplete: the removal was not attempted for " +
-                              paused.dump() +
-                              " because device-CI writes are paused by a PostgreSQL collation "
-                              "mismatch (" +
-                              std::to_string(r.failed) +
-                              " failed); re-issue the DELETE (the cascade is idempotent) only "
-                              "after the collation repair";
+                // status stays 500 (the cascade is incomplete either way). The pause names only
+                // the device_inventory store; any OTHER failed store is a different fault and is
+                // worded separately, so the message never blames every failure on the pause.
+                const std::int64_t paused_n = static_cast<std::int64_t>(paused.size());
+                const std::int64_t other_failed =
+                    r.failed > paused_n ? static_cast<std::int64_t>(r.failed) - paused_n : 0;
+                std::string msg;
+                if (paused.empty()) {
+                    msg = "agent decommission incomplete — one or more stores failed (" +
+                          std::to_string(r.failed) +
+                          " failed); re-issue the DELETE (the cascade is idempotent)";
+                } else {
+                    msg = "agent decommission incomplete: the removal was not attempted for " +
+                          paused.dump() +
+                          " because device-CI writes are paused by a PostgreSQL collation "
+                          "mismatch. Retrying before the collation repair is finished and the "
+                          "pause has lifted (the server rechecks about once a minute) will fail "
+                          "the same way; re-issue the DELETE only AFTER the repair (the cascade "
+                          "is idempotent).";
+                    if (other_failed > 0)
+                        msg += " " + std::to_string(other_failed) +
+                               " other store(s) also failed for a different reason (see "
+                               "details.stores); the re-issued DELETE retries them too.";
+                }
                 json details{{"stores", stores},
                              {"deleted", static_cast<std::int64_t>(r.deleted)},
                              {"skipped", static_cast<std::int64_t>(r.skipped)},
                              {"failed", static_cast<std::int64_t>(r.failed)}};
                 if (!paused.empty())
                     details["write_paused"] = paused;
+                // A pause clears only when the recheck next concludes Trusted, so the hint is the
+                // recheck's unsettled interval (the read gate's refusal hint, derived from the
+                // same constant), not the 5 s of a transient fault: a shorter hint would re-run
+                // the whole cascade and its fail-closed attempt audit row for the same cause.
+                const bool is_paused = !paused.empty();
                 send_json(res, 500,
-                          a4_error(500, msg, cid, 5000, "retry the request", /*permission=*/{},
-                                   std::move(details)));
+                          a4_error(500, msg, cid,
+                                   is_paused ? device_ci_read_gate::kOrderingRetryAfterMs : 5000,
+                                   is_paused ? "retry after the PostgreSQL collation repair"
+                                             : "retry the request",
+                                   /*permission=*/{}, std::move(details)));
                 return;
             }
             json data;
