@@ -127,6 +127,7 @@
 #include "dex_app_version_failures_owner.hpp"
 #include "dex_app_perf_model.hpp"
 #include "offline_endpoint_store.hpp"
+#include "plugin_absence_confirmation.hpp"
 #include "pg/pg_collation_check.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
@@ -6767,6 +6768,16 @@ public:
             // production) leaves presence unconfigured: local-only behavior,
             // unchanged from pre-WS-5.
             registry_.configure_presence(offline_endpoint_store_.get(), cfg_.session_timeout);
+            // #5685 follow-up: the CONFIRMATION read for a cross-replica plugin-absence verdict. A
+            // published list is trusted only while the agent's routable directory row still names
+            // the session that published it. Borrowed raw pointer, same lifetime discipline as
+            // the store above: unwired in stop() before `gateway_route_store_` is reset, after
+            // every dispatch thread has been joined. No route store (direct-connect only) leaves
+            // it unset, so no cross-replica absence is ever withheld (fail open).
+            registry_.configure_route_session_reader(
+                gateway_route_store_ && gateway_route_store_->is_open()
+                    ? make_route_session_confirmer(*gateway_route_store_)
+                    : detail::AgentRegistry::RouteSessionReadFn{});
 
             // #5513: reconcile admission outcomes and duration. The counter family is bounded
             // (a closed `result` set), so every value is pre-seeded to 0 per
@@ -11881,6 +11892,7 @@ public:
         // raw-pointer null-out in this block (execution_tracker_,
         // blast_radius_detector, cert callbacks, session_store).
         registry_.configure_presence(nullptr, cfg_.session_timeout);
+        registry_.configure_route_session_reader({}); // before gateway_route_store_ is reset
         offline_endpoint_store_.reset();
         // #3425: same discipline — null the heartbeat-side caller of
         // quarantine_reconciler_ before dropping the object it calls into.
@@ -21194,6 +21206,12 @@ private:
         // management groups, plugin config) and, through the probe lambda's `this`, auth_routes_;
         // stop() joins the web thread ahead of resetting any of them, and the class holds no
         // state of its own.
+        // The RBAC-unavailable-aware probe is shared with the MCP twins (set_collection_settings_deps).
+        const SoftwareCollectionSettingsRoutes::ProbePermFn collection_settings_probe_fn =
+            [this](const httplib::Request& req, httplib::Response& res, const std::string& type,
+                   const std::string& op) {
+                return auth_routes_->probe_permission_unavailable_aware(req, res, type, op);
+            };
         {
             HttplibRouteSink collection_settings_sink{*web_server_};
             SoftwareCollectionSettingsRoutes{}.register_routes(
@@ -21201,12 +21219,7 @@ private:
                 SoftwareCollectionSettingsRoutes::Deps{
                     .auth_fn = auth_fn,
                     .perm_fn = perm_fn,
-                    .probe_perm_fn =
-                        [this](const httplib::Request& req, httplib::Response& res,
-                               const std::string& type, const std::string& op) {
-                            return auth_routes_->probe_permission_unavailable_aware(req, res, type,
-                                                                                    op);
-                        },
+                    .probe_perm_fn = collection_settings_probe_fn,
                     .scoped_perm_fn = scoped_perm_fn,
                     .audit_fn = audit_fn,
                     .store = software_collection_settings_store_.get(),
@@ -21222,7 +21235,21 @@ private:
         // sole gate. The routes borrow software_inventory_store_ and, through snapshot_fn,
         // software_fleet_snapshot_ (a member, declared ahead of the rollup thread that writes it);
         // stop() joins the web thread ahead of resetting the store, and the class holds no state
-        // of its own.
+        // of its own. The roster reader below is ALSO handed to the MCP twins (set_software_read_ctx),
+        // with the same snapshot holder, so both surfaces read the same sources.
+        // The hosts `q` search decides from the roster, so unlike the display-only
+        // hw_hostnames_fn a failed read is reported (the route answers 503), never an empty
+        // roster that would read as "no such device", and a roster cut at the cap keeps its
+        // `truncated` flag (the route serves it flagged, as the hardware list does). The same
+        // reader names the devices on every page, where a failed read leaves the names null.
+        const software_read_api::RosterFn software_roster_fn = [this]() -> std::optional<OfflineRoster> {
+            if (!offline_endpoint_store_)
+                return std::nullopt;
+            auto roster = offline_endpoint_store_->query_stale_within(kHardwareRosterWindow);
+            if (!roster)
+                return std::nullopt;
+            return std::move(*roster);
+        };
         {
             HttplibRouteSink software_read_sink{*web_server_};
             SoftwareReadRoutes{}.register_routes(
@@ -21230,20 +21257,7 @@ private:
                 SoftwareReadRoutes::Deps{
                     .fleet_read_fn = fleet_read_fn,
                     .audit_fn = audit_fn,
-                    // The hosts `q` search decides from the roster, so unlike the display-only
-                    // hw_hostnames_fn a failed read is reported (the route answers 503), never an
-                    // empty roster that would read as "no such device", and a roster cut at the
-                    // cap keeps its `truncated` flag (the route serves it flagged, as the hardware
-                    // list does). The same reader names the devices on every page, where a failed
-                    // read leaves the names null.
-                    .roster_fn = [this]() -> std::optional<OfflineRoster> {
-                        if (!offline_endpoint_store_)
-                            return std::nullopt;
-                        auto roster = offline_endpoint_store_->query_stale_within(kHardwareRosterWindow);
-                        if (!roster)
-                            return std::nullopt;
-                        return std::move(*roster);
-                    },
+                    .roster_fn = software_roster_fn,
                     .snapshot_fn = [this] { return software_fleet_snapshot_.get(); },
                     .store = software_inventory_store_.get(),
                 });
@@ -24073,6 +24087,16 @@ private:
             // gets pushed or to whom.
             mcp_server_->set_guardian_push_fn(guardian_push_fn_);
             mcp_server_->set_software_sync_runner(software_sync_runner());
+            // SAM-35 twins: the SAME read sources and settings stores the REST routes above are
+            // given, so the two surfaces answer from one body.
+            mcp_server_->set_software_read_ctx(software_read_api::make_ctx(
+                {}, software_roster_fn, [this] { return software_fleet_snapshot_.get(); }, {},
+                software_inventory_store_.get()));
+            mcp_server_->set_collection_settings_deps(
+                software_collection_settings_api::Stores{software_collection_settings_store_.get(),
+                                                         mgmt_group_store_.get(),
+                                                         plugin_config_store_.get()},
+                collection_settings_probe_fn);
             // #2146 Batch B1 — the SAME BaselineStore GET
             // /guaranteed-state/device-compliance already reads, backing MCP
             // get_guardian_device_compliance's identical baseline lookup.
