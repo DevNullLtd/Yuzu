@@ -2089,6 +2089,10 @@ if build_server
       'unit/server/test_software_lifecycle_rules.cpp',
       # SAM-23 lifecycle store (born-on-PG, [pg][store][lifecycle])
       'unit/server/test_software_lifecycle_store.cpp',
+      # SAM-24 lifecycle import parsers (csv dispatch, CLE ECMA-428 1.0.0): pure, no store, no I/O
+      'unit/server/test_software_lifecycle_import.cpp',
+      # SAM-24 lifecycle rules REST routes: fake gates (no PG) + [pg][lifecycle][routes] over the real store
+      'unit/server/test_software_lifecycle_routes.cpp',
       # pure per-group collection settings resolver (collection_settings_resolve.hpp): no store, no I/O, no [pg]
       'unit/server/test_collection_settings_resolve.cpp',
       # per-group collection settings store (born-on-PG, [pg][store])

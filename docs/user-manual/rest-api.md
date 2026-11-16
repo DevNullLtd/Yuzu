@@ -394,12 +394,13 @@ Derived directly from `server/core/src/body_cap_policy.hpp`'s `kBodyCapTable` (l
 | any | `/api/v1/inventory/software/normalization/pack` | 1 MiB | `software_alias_pack` | The alias-pack CSV upload. The raw body is the CSV, which `parse_normalization_pack` refuses over 1 MiB, so the cap mirrors that bound exactly. A longer prefix than the row above, so it wins for this path. |
 | any | `/api/v1/crypto/revocation-sources` | 192 KiB | `crypto_revocation_sources` | ADR-0070 R1 registered CRL sources: `POST` and `PUT` carry `{name, ca_certificates (up to 8 PEM certificates), crl_urls (up to 8 URLs of up to 2,048 bytes)}`. 192 KiB mirrors the handler's own `revocation_source::kBodyMaxBytes` exactly (a `static_assert` pins the pair) and outranks the 16 KiB `/api/v1/crypto` row for this subtree only (longest match). |
 | any | `/api/v1/inventory/software/collection-settings` | 16 KiB | `software_collection_settings` | The per-group collection settings routes. The only body-bearing route is `PUT .../{group_id}`: one small JSON object (an interval, a window, a zone name, six boolean switches, a priority and a version). The GET siblings share the prefix. |
+| any | `/api/v1/inventory/software/lifecycle/rules` | 4 MiB | `software_lifecycle_rules` | The lifecycle rule import. `POST` carries the raw `csv` or `cle` file, which the parser refuses over 4 MiB, so the cap mirrors that bound exactly (a `static_assert` pins the pair). Its own row because a csv body is not JSON: the JSON value budget is off here, and the `cle` parser applies its own depth and value budgets. `GET` and `DELETE` share the path and carry no body. |
 | any (catch-all) | *(empty prefix: matches everything not listed above)* | 4 MiB | `default` | Applies to ordinary JSON/form mutation routes not called out individually. Reviewed defaults (no table row of their own): the instruction authoring twins under `/api/v1/instructions` and `/api/v1/instruction-sets`, including `POST /api/v1/instructions/import`, which is therefore 4 MiB where the legacy `POST /api/instructions/import` is 16 MiB (`instruction_import`). |
 
 † = a reasoned margin over a real, cited handler-level check — the pre-routing gate sees the RAW body while the handler checks a DECODED/PARSED value (form-decoded, JSON-unescaped, or multipart-extracted), so the two numbers are never expected to match exactly. Reasoned headroom, not a measured worst case; getting the margin wrong rejects legitimate traffic (the `echo_dashboard_sql`/`echo_result_set_sql` history above is a shipped example).
 ‡ = a generous, explicit, judgment-call bound because no aggregate size contract exists for that class yet, reasoned against that class's OWN realistic scale rather than copy-pasted from a sibling — **not** a fixed multiple below httplib's 100 MiB backstop: it ranges from ~12.5× for the 8 MiB `nvd_match` entry (just over one order of magnitude) down to 6.25× for the five 16 MiB entries (under one order of magnitude) — none of the ‡ entries reach two orders of magnitude. Do not read either footnote as license to invent a number for a different route — see the header block of `body_cap_policy.hpp`.
 
-Counting by table **ROW** (one `BodyCapEntry` struct in `kBodyCapTable` = one row): **8 rows carry †** (`plugin_config`, `ca_import_chain_dashboard`, `plugin_trust_bundle`, `echo_dashboard_sql`, `echo_result_set_sql`, and all three `instruction_yaml` rows) and **6 rows carry ‡** (`nvd_match`, both `guardian_rule_authoring` rows, `workflow_yaml`, `product_pack_yaml`, `instruction_import`) — **14 rows total**, out of **45 rows** in the table overall (A2 added `rbac_role_assignment`, A1 `rbac_enforcement`, the policy-generation raise `guardian_policy_generation`, #5342 `users`, and then `crypto`, `config`, `dex_score_policy`, `dex_score_policy_form`, `commands`, `crypto_revocation_sources`, `software_curation`, `software_alias_pack` and `software_collection_settings`, all unmarked — an exact reasoned-from-real-shape bound, not a measured mirror or a judgment call against an arbitrary-content class). Counting by **CLASS** (`path_class`; several classes span multiple rows) that collapses to **6 † classes and 5 ‡ classes — 11 classes total**, out of **41 classes** overall (the catch-all `default` included). Every other row/class mirrors a cited, decoded-equals-raw byte count exactly (this now includes `upload_session`, added alongside `plugin_config` in this table — an exact protocol-constant mirror, not a reasoned margin, so it carries neither footnote). A third, unmarked category is `ota_upload`, pinned at httplib's own 100 MiB backstop as an explicit, reviewed decision rather than squeezed or given a judgment-call number — it is not "reasoned" in the † /‡ sense, since an installer's size is not boundable here. `json_to_csv_export` left this category: it is capped at 16 MiB and 1,000,000 JSON values (#2146).
+Counting by table **ROW** (one `BodyCapEntry` struct in `kBodyCapTable` = one row): **8 rows carry †** (`plugin_config`, `ca_import_chain_dashboard`, `plugin_trust_bundle`, `echo_dashboard_sql`, `echo_result_set_sql`, and all three `instruction_yaml` rows) and **6 rows carry ‡** (`nvd_match`, both `guardian_rule_authoring` rows, `workflow_yaml`, `product_pack_yaml`, `instruction_import`) — **14 rows total**, out of **46 rows** in the table overall (A2 added `rbac_role_assignment`, A1 `rbac_enforcement`, the policy-generation raise `guardian_policy_generation`, #5342 `users`, and then `crypto`, `config`, `dex_score_policy`, `dex_score_policy_form`, `commands`, `crypto_revocation_sources`, `software_curation`, `software_alias_pack`, `software_collection_settings` and `software_lifecycle_rules`, all unmarked — an exact reasoned-from-real-shape bound, not a measured mirror or a judgment call against an arbitrary-content class). Counting by **CLASS** (`path_class`; several classes span multiple rows) that collapses to **6 † classes and 5 ‡ classes — 11 classes total**, out of **42 classes** overall (the catch-all `default` included). Every other row/class mirrors a cited, decoded-equals-raw byte count exactly (this now includes `upload_session`, added alongside `plugin_config` in this table — an exact protocol-constant mirror, not a reasoned margin, so it carries neither footnote). A third, unmarked category is `ota_upload`, pinned at httplib's own 100 MiB backstop as an explicit, reviewed decision rather than squeezed or given a judgment-call number — it is not "reasoned" in the † /‡ sense, since an installer's size is not boundable here. `json_to_csv_export` left this category: it is capped at 16 MiB and 1,000,000 JSON values (#2146).
 
 ### JSON value budget (#2146)
 
@@ -9262,6 +9263,52 @@ The settings that apply to one device, resolved across every management group it
 - `source_group_id` is the winning group, the root group id (`000000000000`) when the root document applies, or empty for the built-in default. It is an opaque id and can name a group outside a scoped caller's branch when the device is also a member there.
 - A device in no group, or one the server has no record of, answers `200` with the root document and `source_group_id` `000000000000` when a root document exists, else the built-in default with an empty `source_group_id`; no device lookup is made.
 - Requires `Inventory:Read` on the device. A membership, settings or kill-switch read that cannot be completed is a `503`, never a document with collectors off.
+
+#### Software lifecycle rules
+
+The imported lifecycle rule set: the product lifecycle dates an administrator loads from a file, kept beside the rules the server ships and the dates hosts report about themselves (see [Software lifecycle](inventory.md#software-lifecycle-server-store)). Rules are fleet-global, keyed by product and never by device, so these routes take the **global** `Inventory` permission: `Inventory:Write` for `POST` and `DELETE`, `Inventory:Read` for `GET`. A management-group-confined caller is refused with `403` (permission `Inventory:Write` or `Inventory:Read`) and a service-scoped API token is denied. REST only: there is no MCP tool or page for these routes yet.
+
+**Formats.** `format` is required and is exactly one of `csv` or `cle`; any other value is a `400` that names these two. OpenEoX is not offered: its published schema does not yet name a product, so it cannot key a rule (follow-up: #8000).
+
+| Format | What the body is | Version scope of a stored rule |
+|---|---|---|
+| `csv` | The rule-file grammar, header `product_key,version_prefix,event,date,source_reference`, at most 256 KiB and 5,000 rows | The `version_prefix` column, unchanged (empty means every version) |
+| `cle` | A Common Lifecycle Enumeration document: ECMA-428 1st edition, schema version 1.0.0 (a document with any other `$schema` is refused) | Every version of the product: an imported CLE rule has an empty prefix |
+
+A CLE document maps its `endOfSupport` and `endOfLife` events; the product key comes from the identifier's package URL. A CLE record that names one exact version, or a version range, is **skipped, never stored as a prefix** (a stored prefix `3.8` would also claim `3.8.10`) and counted in `skipped`. Skip reasons: `exact_version`, `version_range`, `unmapped_event_type` (any other event type), `empty_key` and `invalid_key` (an identifier that yields no usable product key).
+
+#### `POST /api/v1/inventory/software/lifecycle/rules?format=csv|cle&name=<file name>`
+
+**Replaces the whole imported set** with the rules in the request body, which is the raw file (at most 4 MiB; a longer body is a `413` from the pre-auth body cap). `name` is required, 1 to 128 bytes with no control character, and is stored on every rule as its `source_reference`. The `shipped` seed and any `external` rules are never touched. The permission is checked before the name, the format or the body is looked at.
+
+The file is read all or nothing. A refusal is a `400` carrying the reason, and the stored set is unchanged. The reasons are: the CSV defects (with a line number), invalid UTF-8, JSON that nests or is large beyond the parser budget, invalid JSON, a CLE `$schema` other than the pinned one, a required field that is missing or of the wrong type, a malformed `vers:` range, an `identifier` that lists more than 5000 aliases, a repeated (product, version prefix, event) rule, more than 5000 rules, and a `name` the rule model refuses.
+
+```json
+{"data": {"stored": 12, "replaced": true, "format": "cle", "spec_version": "1.0.0",
+          "source_reference": "vendor-cle.json",
+          "skipped": [{"reason": "exact_version", "count": 3}, {"reason": "version_range", "count": 1}]},
+ "meta": {"api_version": "v1"}}
+```
+
+`spec_version` is empty for `csv`, and `skipped` is empty when nothing was skipped. Audited as `software_estate.lifecycle_rules.import` with a `requested` row stored ahead of the write (a row that cannot be stored answers `503` with `Sec-Audit-Failed`, and nothing is written) and an outcome row; a refusal is audited `denied`. **Errors:** `400`, `401`, `403`, `413`, `503` with `retry_after_ms` (a closed or missing store, a failed write).
+
+#### `GET /api/v1/inventory/software/lifecycle/rules`
+
+Lists the stored rules of one source, ordered by product key, version prefix and event. `source` is `imported` (the default), `shipped` or `external`; `declared` and any other value is a `400`, audited as `software_estate.lifecycle_rules.read` with `result=denied`. At most 5,000 rules.
+
+```json
+{"data": {"source": "imported",
+          "rules": [{"product_key": "product:postgresql:postgresql", "version_prefix": "", "event": "end_of_life", "date": "2029-11-09", "source_reference": "vendor-cle.json"}],
+          "count": 1},
+ "meta": {"api_version": "v1"}}
+```
+
+A degraded or closed store is a `503` with `retry_after_ms`, never an empty list. A served read is not audited.
+
+#### `DELETE /api/v1/inventory/software/lifecycle/rules`
+
+Empties the imported set only and answers `200` with `{"data": {"removed": <n>}}`, where `removed` is the number of imported rules the call found ahead of the audited clear (a concurrent import can make it differ from the rows cleared). Audited as `software_estate.lifecycle_rules.delete`, `requested` first and fail-closed like the import. **Errors:** `401`, `403`, `503`.
+
 
 ---
 
