@@ -444,6 +444,25 @@ TEST_CASE("export route: a confined caller streams only its own rows; a deny-all
         REQUIRE(h.last_query.agent_ids.has_value()); // the scope was pushed into the read
         CHECK(h.last_query.agent_ids->size() == 2);
     }
+    SECTION("a device outside the caller's scope named by agent_id: an empty export, no read") {
+        h.scope = scope_of({agent_id("a", 3, 2), agent_id("a", 7, 2)});
+        const auto denied = agent_id("a", 5, 2); // has rows in the fixture, is not in the scope
+        for (const char* format : {"jsonl", "csv"}) {
+            INFO("format=" << format);
+            auto res = h.get(std::string("?format=") + format + "&agent_id=" + denied);
+            REQUIRE(res);
+            CHECK(res->status == 200);
+            const auto t = drive(*res);
+            CHECK(t.done);
+            CHECK_FALSE(t.aborted);
+            CHECK(t.body.find(denied) == std::string::npos);
+            CHECK(t.body == (std::string_view(format) == "csv"
+                                 ? std::string(swl::kListCsvHeader) + "\n"
+                                 : std::string()));
+            release(*res, true);
+        }
+        CHECK(h.install_reads == 0); // the confinement decides before any store read
+    }
     SECTION("deny-all, CSV: the header and nothing else") {
         h.scope = Scope{std::unordered_set<std::string>{}};
         auto res = h.get("?format=csv");
@@ -523,6 +542,29 @@ TEST_CASE("export route: under a wide scope no field of an out-of-scope row reac
         CHECK(t.body.find("own-host-z-000") != std::string::npos);
         release(*res, true);
     }
+}
+
+TEST_CASE("export route: under a wide scope a named device outside it streams an empty export "
+          "without a store read",
+          "[software_export][routes][scope]") {
+    Harness h;
+    wide_fixture(h);
+    const auto denied = agent_id("a", 5); // an out-of-scope device that has rows in the fixture
+    for (const char* format : {"jsonl", "csv"}) {
+        INFO("format=" << format);
+        auto res = h.get(std::string("?format=") + format + "&agent_id=" + denied);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        const auto t = drive(*res);
+        CHECK(t.done);
+        CHECK_FALSE(t.aborted);
+        CHECK(t.body.find(denied) == std::string::npos);
+        CHECK(t.body.find("LEAK") == std::string::npos);
+        CHECK(t.body == (std::string_view(format) == "csv" ? std::string(swl::kListCsvHeader) + "\n"
+                                                           : std::string()));
+        release(*res, true);
+    }
+    CHECK(h.install_reads == 0); // not even the wide scope's bounded reads run
 }
 
 TEST_CASE("export route: a run of hidden rows longer than the page-mode OFFSET ceiling is walked "
@@ -1054,6 +1096,7 @@ TEST_CASE("export route: a version range is resolved once, then held for the who
         REQUIRE(res);
         CHECK(res->status == 503);
         CHECK_FALSE(res->content_provider_);
+        CHECK(res->get_header_value("Retry-After") == "5"); // the same hint as the budget refusals
         CHECK(one.held() == 0); // admitted, then refused: the lease went back on the way out
         one.distinct_degrades = false;
         CHECK(one.get("?format=jsonl&name=pkg&match=exact&version_min=1.2")->status == 200);

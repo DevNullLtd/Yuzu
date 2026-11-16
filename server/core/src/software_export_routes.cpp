@@ -87,6 +87,9 @@ struct Stream {
 void fail(httplib::Response& res, int status, std::string_view message,
           detail::A4ErrorOpts opts = {}) {
     res.status = status;
+    // One place for the header, so every retryable 503 carries it (rounded up, like the v1 refusals).
+    if (opts.retry_after_ms)
+        res.set_header("Retry-After", std::to_string((*opts.retry_after_ms + 999) / 1000));
     res.set_content(detail::a4_error(res, message, opts), "application/json");
 }
 
@@ -174,7 +177,8 @@ bool pump(Stream& st, httplib::DataSink& sink) {
         return false;
     }
     // A wide scope can answer an EMPTY page that still has a position to resume from: nothing to
-    // write, carry on.
+    // write, carry on. No sink.is_writable() check is needed here: httplib's chunked loop checks
+    // the peer before every provider call, so a client that closed is noticed on the next turn.
     const auto chunk = swe::format_chunk(rows, *facts, st.request.format, st.first_chunk);
     st.first_chunk = false;
     if (!chunk.empty() && !sink.write(chunk.data(), chunk.size()))
@@ -264,7 +268,6 @@ void SoftwareExportRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                         std::string(export_cap ? "export concurrency limit reached"
                                                : "server held-open stream budget full") +
                             "; reason=" + std::string(reason) + "; cid=" + cid);
-            res.set_header("Retry-After", std::to_string(swe::kRetryAfterMs / 1000));
             fail(res, 503,
                  export_cap ? "too many concurrent software exports"
                             : "the server is running as many held-open requests as it is sized for",
