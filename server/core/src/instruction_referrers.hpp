@@ -72,9 +72,10 @@ struct DefinitionReferrerExclusions {
 
 /// Every referrer of `definition_id`, or the reason the question could not be answered (a fixed
 /// internal text: the caller does not echo it). An empty vector means "looked, nothing found".
-/// ONE closure, two call forms: `fn(id)` counts everything; `fn(id, exclusions)` leaves the named
-/// workflows and policy fragments out. It can be built from a callable taking just the id (the
-/// exclusions are then ignored) or from one taking both.
+/// ONE closure, three call forms: `fn(id)` counts everything; `fn(id, exclusions)` leaves the named
+/// workflows and policy fragments out; `fn.lookup_many(ids, exclusions, limit)` asks about a whole
+/// list of definitions in a bounded number of reads (the pack uninstall). It can be built from a
+/// callable taking just the id (the exclusions are then ignored) or from one taking both.
 class DefinitionReferrersFn {
 public:
     using Result = std::expected<std::vector<DefinitionReferrer>, std::string>;
@@ -117,6 +118,19 @@ public:
         };
     }
 
+    /// A batch form: the distinct referrers of ANY of `definition_ids` at once, at most `limit` of
+    /// them, read in a number of store reads that does not grow with `definition_ids`.
+    using BatchFn = std::function<Result(const std::vector<std::string>&, const Exclusions&,
+                                         std::size_t)>;
+
+    /// `single` with `batch` attached for `lookup_many`. An unwired `single` stays unwired.
+    [[nodiscard]] static DefinitionReferrersFn with_batch(DefinitionReferrersFn single,
+                                                          BatchFn batch) {
+        if (single)
+            single.batch_ = std::move(batch);
+        return single;
+    }
+
     explicit operator bool() const noexcept { return static_cast<bool>(fn_); }
     [[nodiscard]] Result operator()(const std::string& definition_id) const {
         return fn_(definition_id, Exclusions{});
@@ -126,8 +140,19 @@ public:
         return fn_(definition_id, exclusions);
     }
 
+    /// The distinct referrers (one per kind and id) of ANY of `definition_ids`, at most `limit`
+    /// of them (a caller that lists `n` passes `n + 1`, which is enough to know the list is longer
+    /// than it shows). An empty id names nothing and is left out (the sources would read it as "no
+    /// filter"); with no id left the answer is empty without a read. A function built with
+    /// `with_batch` (the real one, `make_definition_referrers_fn`) answers from its batch form;
+    /// any other asks the one-id form per id, stops once `limit` referrers are in hand and
+    /// de-duplicates with a hash set. An unwired function answers an error (never "none found").
+    [[nodiscard]] Result lookup_many(const std::vector<std::string>& definition_ids,
+                                     const Exclusions& exclusions, std::size_t limit) const;
+
 private:
     std::function<Result(const std::string&, const Exclusions&)> fn_;
+    BatchFn batch_;
 };
 
 /// The most referrers a refusal names; the rest are counted ("and N more").
@@ -135,8 +160,9 @@ inline constexpr std::size_t kMaxReferrersListed = 20;
 
 /// Builds the one lookup over the real stores. A null or closed source makes the lookup an error
 /// (fail closed), so wire exactly the stores the build has. Each source is asked for at most
-/// `kMaxReferrersListed + 1` rows (after any exclusions): enough to know the list is longer than
-/// it shows.
+/// `kMaxReferrersListed + 1` rows (after any exclusions) per call: enough to know the list is
+/// longer than it shows. The batch form (`lookup_many`) reads each source ONCE for the whole id
+/// list and stops reading further sources once `limit` referrers are in hand.
 [[nodiscard]] DefinitionReferrersFn make_definition_referrers_fn(ScheduleEngine* schedules,
                                                                  WorkflowEngine* workflows,
                                                                  PolicyStore* policies);

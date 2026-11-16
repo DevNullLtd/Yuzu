@@ -104,6 +104,16 @@ public:
     std::expected<ScheduleListResult, std::string>
     query_schedules_checked(const ScheduleQuery& q = {}) const;
 
+    /// Ids of the schedules whose definition is ANY of `definition_ids` (one read for the whole
+    /// list, `definition_id = ANY(...)`), at most `limit` of them, in the order
+    /// `query_schedules_checked` lists them (name, then id). Ids only, so no row is decoded and
+    /// the 5000-row listing cap does not apply. An empty `definition_ids` answers an empty list
+    /// without a read. `unexpected(msg)` (prefixed `kDbErrorPrefix`) = the question could not be
+    /// answered; never read it as "no schedule references it".
+    std::expected<std::vector<std::string>, std::string>
+    schedules_referencing_definitions(const std::vector<std::string>& definition_ids,
+                                      int limit) const;
+
     /// On a failed insert the error is `kScheduleCreateValueRefusedError` when Postgres reported a
     /// data exception or integrity violation (SQLSTATE class 22 or 23, for example a NUL byte or
     /// invalid UTF-8 in a text field), `kScheduleCreateInsertFailedError` for any other failure of
