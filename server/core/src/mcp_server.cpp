@@ -3738,6 +3738,10 @@ static const ToolDef kTools[] = {
      "principal is never counted as a surviving Administrator, so a refusal can happen even "
      "when other Administrator grants nominally exist. "
      "Idempotent: unassigning a role the principal did not hold still returns success. "
+     "Removing a user's Administrator grant also ends that user's live JIT elevation window "
+     "in the same transaction (if the clear fails, nothing is removed). It does not change "
+     "the user's elevation eligibility, so an eligible user can elevate again: to end "
+     "elevated access for good, revoke eligibility first. "
      "Destructive — verify the target doesn't need this role before calling. Requires "
      "Security:Write (supervised MCP tier; approval-gated).",
      R"j({"type":"object","properties":{)j"

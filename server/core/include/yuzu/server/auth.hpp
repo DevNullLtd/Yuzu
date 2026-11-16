@@ -882,7 +882,13 @@ public:
     /// session's own absolute lifetime — an elevation can never outlive the
     /// cookie session that carries it (residual-risk follow-up B, security
     /// review 2026-06-30). The CALLER is responsible for the eligibility +
-    /// MFA-step-up gates; this only mutates the in-memory session. Returns the
+    /// MFA-step-up gates. With a `SessionStore` the grant is a durable write (authored in
+    /// the DB clock domain), after which THIS replica's cached copy of the session is
+    /// DROPPED, not re-derived from the row the write returned, so the next validate
+    /// re-reads durable state (a re-derive could resurrect an elevation that an
+    /// Administrator unassign cleared in between); other replicas pick the grant up on
+    /// their next generation refresh. Store-less (unit-test) mode mutates the in-memory
+    /// session instead. Returns the
     /// absolute (possibly-clamped) expiry `system_clock::time_point` on success
     /// (so the route can report it), nullopt if the session does not exist OR
     /// is already at/past its own `expires_at` (a dead-window guard, governance

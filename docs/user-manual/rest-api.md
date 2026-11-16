@@ -3504,6 +3504,23 @@ identical SAML gap in the last-Administrator guard. Audited `rbac.role.assigned`
 Revoke a fleet-wide RBAC role grant from a human user. Idempotent —
 unassigning a role the principal did not hold still returns success.
 
+**Removing a user's `Administrator` grant also ends that user's live JIT
+elevation window**, in the same database transaction as the removal: the
+removal and the clear commit together or not at all, so if the clear cannot be
+done nothing is removed and the route answers `503`. This replica drops its
+cached sessions of the user after the commit; other replicas converge within
+about a second (up to about 30 seconds while their session-generation read is
+failing). It does not change the user's elevation eligibility and does not block
+a later `POST /api/v1/elevate`: an eligible user can open a new window. To end
+elevated access for good, first call
+`POST /api/v1/users/{name}/elevation-eligibility` with `{"eligible": false}`
+(it also ends live elevations), then remove the grant. A request already past
+its authorization check when the clear lands is not recalled, and an open
+event stream is not re-checked for elevation. For this case the transaction
+bounds each lock wait at 2000 ms (other unassigns keep the pool default), so
+it can answer a retryable `503` when it cannot take its locks in time. See
+"Fleet-Wide Role Assignment" in `rbac.md`.
+
 **Permission:** Same dedicated `is_rbac_administrator` check as the `POST`
 above (including the MCP-tier-token structural denial), plus MFA step-up.
 
@@ -3535,9 +3552,17 @@ surface) principal is never counted as a surviving administrator (the guard has
 known residual gaps, see "Fleet-Wide Role Assignment" in `rbac.md`); `503` — the
 RBAC store is unavailable (including when the admin gate itself cannot
 confirm durable authority — logged and audited as a `denied` row), a
-genuine store/query fault removing the grant, or (on an otherwise-successful
+genuine store/query fault removing the grant (for a user `Administrator`
+grant this includes a lock wait over 2000 ms, a deadlock, or a failure to clear
+the elevation: nothing is removed, so retry), or (on an otherwise-successful
 unassignment) its audit row could not persist — treat the removal as
-unconfirmed and reconcile via a read. Audited `rbac.role.unassigned`.
+unconfirmed and reconcile via a read. Audited `rbac.role.unassigned`; when the
+removal ended N > 0 live elevations, its `detail` ends with
+` elevations_cleared=N` and one `role.elevation.revoked` row
+(`detail=reason=administrator_unassign cleared=N role=Administrator`, target the
+user) is written too, either failing to persist giving the same audit-gap `503`.
+The response body is the same in every case. See
+`docs/user-manual/audit-log.md`.
 
 MCP twins: `assign_rbac_role` / `unassign_rbac_role` — see
 `docs/user-manual/mcp.md`.

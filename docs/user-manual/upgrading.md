@@ -11,6 +11,19 @@ A statement elsewhere on this page that a rollback, a mixed fleet or an in-place
 
 Running `dev` between releases? Some entries below describe changes on `dev` that are not in a release yet. For what a `git pull` of `dev` changed, run the repository script `python3 scripts/whats-new.py` (`--versions` for the version bumps, rebuild notes and Docker image bumps); see `changelog.d/README.md`.
 
+## Behaviour change: removing a user's Administrator grant ends that user's live JIT elevation window
+
+**In short.** Affected: operators and automation that remove a user's `Administrator` RBAC grant (`DELETE /api/v1/rbac/roles/Administrator/assignments/{principal_id}` or the MCP tool `unassign_rbac_role`), and anything that reads the audit trail for those calls. To do: nothing is required; read the audit and `503` notes below. Elevation eligibility is untouched.
+
+**What changed.**
+
+- **The live window ends.** Before, removing the grant left an already-open JIT elevation of that user standing until its window lapsed. Now the same database transaction clears the user's durable elevations: the removal and the clear commit together, and if the clear cannot be done nothing is removed and the route answers `503` (MCP: an internal error with a retry hint). The replica that handled the call drops its cached sessions of the user after the commit; other replicas converge on their next session-generation poll (about 1 s, up to about 30 s while that read is failing). Response bodies are unchanged.
+- **Eligibility is not changed.** The user's elevation eligibility flag is neither read nor written, and `POST /api/v1/elevate` is unchanged: an eligible user can open a new window after the unassign. To end elevated access for good, first `POST /api/v1/users/{name}/elevation-eligibility` with `{"eligible": false}` (it ends live elevations too), then remove the grant.
+- **Audit rows change.** When the call ended N > 0 elevations, the `rbac.role.unassigned` success row's `detail` ends with ` elevations_cleared=N`, and one new `role.elevation.revoked` row is written for the user (`detail=reason=administrator_unassign cleared=N role=Administrator`). That verb was already written by the self-service `POST /api/v1/elevate/revoke`, whose `detail` is `was_elevated=<bool>`; a parser that treated every `role.elevation.revoked` row as a self-service step-down should read `reason=` first. Neither addition is written when N is 0.
+- **A new `503` cause, with a shorter wait.** The user `Administrator` unassign transaction now sets a transaction-local 2000 ms `lock_timeout` and a 15 s `idle_in_transaction_session_timeout`; it waited up to the pool's 10 s default before. It answers a retryable `503` when it cannot take its locks within 2 s or loses a deadlock; nothing is removed, so retry. Other unassigns keep the pool defaults.
+
+**Not covered.** A request already past its authorization check when the clear lands is not recalled. Open event streams are not re-checked for elevation. Removing a group-held `Administrator` role, an identity-provider group change and the RBAC enforcement toggle do not end an elevation.
+
 ## ⚠️ Breaking: management-group create and member writes are refused (503) while the audit store is unavailable, and REST create answers a store fault with 503 (#7074)
 
 **What changed.**
