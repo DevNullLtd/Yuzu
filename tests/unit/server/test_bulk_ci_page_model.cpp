@@ -863,15 +863,16 @@ TEST_CASE("hardware ci page: every ReadError has one answer on both transports",
         const char* mcp_detail;
         const char* rest_remediation;
         const char* mcp_remediation;
+        int retry_after_ms; // -1 = none
     };
-    static constexpr std::array<Expect, 4> table = {{
+    static constexpr std::array<Expect, 5> table = {{
         {hcp::ReadError::kDegraded, true, "hardware CI records unavailable", true, "failure",
          "hardware CI records (REST) state=store unreadable",
-         "hardware CI records (MCP) state=store unreadable", "", ""},
+         "hardware CI records (MCP) state=store unreadable", "", "", 5000},
         {hcp::ReadError::kCursorMalformed, false, "invalid cursor; restart from the first page", false,
-         "denied", "", "invalid arguments: cursor", "", "omit cursor to restart from the first page"},
+         "denied", "", "invalid arguments: cursor", "", "omit cursor to restart from the first page", -1},
         {hcp::ReadError::kCursorFilterMismatch, false, "invalid cursor; restart from the first page",
-         false, "denied", "", "invalid arguments: cursor", "", "omit cursor to restart from the first page"},
+         false, "denied", "", "invalid arguments: cursor", "", "omit cursor to restart from the first page", -1},
         {hcp::ReadError::kScopeTooWide, false,
          "the caller's scope covers more than 10000 devices and no agent_id was given; a credential "
          "with global read has no such limit",
@@ -880,7 +881,20 @@ TEST_CASE("hardware ci page: every ReadError has one answer on both transports",
          "use a credential with global read, pass agent_id, or ask an administrator to narrow the "
          "caller's scope",
          "use a credential with global read, pass agent_id, or ask an administrator to narrow the "
-         "caller's scope"},
+         "caller's scope",
+         -1},
+        {hcp::ReadError::kOrderingUnverified, true,
+         "hardware CI records are refused: the database collation version changed under the stored "
+         "CI keys, or the check that confirms it has not yet concluded; the read is refused until "
+         "the database is repaired and re-verified (see PostgreSQL collation version in "
+         "server-admin.md)",
+         true, "failure", "hardware CI records (REST) state=collation ordering unverified",
+         "hardware CI records (MCP) state=collation ordering unverified",
+         "wait retry_after_ms and call once more; if it persists, ask an administrator to repair the "
+         "database collation (see PostgreSQL collation version in server-admin.md)",
+         "wait retry_after_ms and call once more; if it persists, ask an administrator to repair the "
+         "database collation (see PostgreSQL collation version in server-admin.md)",
+         60000},
     }};
     static_assert(table.size() == static_cast<std::size_t>(hcp::ReadError::kCount),
                   "a new ReadError needs a row in this table (and a case in describe_read_error)");
@@ -899,8 +913,9 @@ TEST_CASE("hardware ci page: every ReadError has one answer on both transports",
             CHECK(f->message == hcp::read_error_message(e));
             CHECK(f->domain_audit_row == it->domain_row);
             CHECK(f->audit_outcome == it->outcome);
-            // a refusal is never retried; an unavailable read carries the 5 s hint
-            CHECK(f->retry_after_ms == (it->unavailable ? 5000 : -1));
+            // a refusal is never retried; an unavailable read carries its own hint (5 s for a
+            // failed store read, 60 s for an unverified ordering)
+            CHECK(f->retry_after_ms == it->retry_after_ms);
         }
         CHECK(rest.audit_detail == it->rest_detail);
         CHECK(mcp.audit_detail == it->mcp_detail);
