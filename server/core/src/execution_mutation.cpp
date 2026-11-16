@@ -107,7 +107,7 @@ ExecutionMutationOutcome apply_execution_mutation(const ExecutionMutationPorts& 
             return out;
         }
         admitted = exec_opt.has_value() &&
-                   admit_confined_mutation(*exec_opt, *statuses, req.scope, req.username);
+                   admit_confined_mutation(*exec_opt, *statuses, req.scope, req.owner);
         if (!admitted) {
             // One deny shape for nonexistent, zero-visible, partial and incomplete-cohort: a
             // distinct status or detail for "partial visibility" would be a hidden-cohort

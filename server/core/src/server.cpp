@@ -2338,6 +2338,8 @@ public:
                                   "generation_refresh_failed", "generation_refresh_failed_within_bound",
                                   "rbac_enabled_non_canonical", "stale_beyond_accepted_bound"})
             metrics_.counter("yuzu_server_rbac_read_degrade_total", {{"reason", reason}});
+        // #5557: the service-scoped unrestricted-authority refusal on the two list gates.
+        authz::seed_service_scope_unrestricted_refusal_metrics(metrics_);
         // Last-Administrator guard refusals: A2's role-unassign guard
         // (RbacStore::unassign_role) and, since #4966, the account-lifecycle guard
         // (RbacStore::deactivate_account / set_local_role: a deactivation or a demotion
@@ -21190,7 +21192,8 @@ private:
                     if (!execution_tracker_)
                         return std::nullopt;
                     auto rows = execution_tracker_->query_executions_checked(
-                        {.status = "failed", .limit = static_cast<int>(home::kFailedReadCap)});
+                        {.status = "failed", .limit = static_cast<int>(home::kFailedReadCap)},
+                        std::nullopt);
                     if (!rows)
                         return std::nullopt;
                     std::vector<home::FailedRow> out;
@@ -24446,10 +24449,12 @@ private:
     /// other one. They were missed by the original sweep because they do not
     /// route through `command_dispatch_fn` — they call the registry directly —
     /// and their bare global `require_permission("Execution","Execute")` gate
-    /// admits a SERVICE-SCOPED token on its `ITServiceOwner` role grant with no
-    /// target check, so before this they reached the entire fleet: verbatim the
+    /// once admitted a SERVICE-SCOPED token on its `ITServiceOwner` role grant
+    /// with no target check, so they reached the entire fleet: verbatim the
     /// escape #1788 exists to close, on three routes the changelog claimed were
-    /// already covered.
+    /// already covered. The service-scoped branch of `require_permission` now
+    /// refuses that pair outright (it is not on the seeded-empty
+    /// `kServiceScopeGlobalSafe`); every admitted caller is narrowed below.
     ///
     /// An omitted target means the fleet (#2500), so this is the Broadcast arm —
     /// narrowed to the caller's visible set, exactly as a named `__all__` is.
