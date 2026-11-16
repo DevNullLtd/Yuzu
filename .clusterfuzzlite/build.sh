@@ -31,6 +31,9 @@ build_target() {
 build_target fuzz_preflight_parse \
   "$SRC_DIR/tests/fuzz/fuzz_preflight_parse.cpp"
 
+build_target fuzz_component_zip \
+  "$SRC_DIR/tests/fuzz/fuzz_component_zip.cpp"
+
 build_target fuzz_deployment_parse \
   "$SRC_DIR/tests/fuzz/fuzz_deployment_parse.cpp"
 

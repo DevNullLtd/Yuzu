@@ -394,9 +394,10 @@ struct ConfinedDispatchOutcome {
     /// reads no cause); dashboard_routes.cpp runs no dry run, so all five of
     /// its readers check this field before their cascade: the execute console,
     /// the Echo re-enable and purge arms, the echo-execute (SQL) arm and the
-    /// echo.status scan. The sibling fragments in echo_tree_routes.cpp,
-    /// dex_routes.cpp and device_routes.cpp, and the REST result-set producers,
-    /// still fold a denial into no-agents.
+    /// echo.status scan. echo_tree_routes.cpp's capture-sources push reads it too
+    /// (a `dispatch_denied` failure row, and the batch stops); its read dispatches,
+    /// dex_routes.cpp, device_routes.cpp and the REST result-set producers still
+    /// fold a denial into no-agents.
     std::optional<detail::DispatchDenial> denied;
 };
 

@@ -1492,3 +1492,75 @@ on its own terms.
 
 Route via the normal review / `/governance` path. Record the accepting reviewer(s) + date here on
 acceptance.
+
+## Update (2026-11-14) — first slice shipped: Java archives on Linux and macOS, machine roots only
+
+**What shipped.** A `component_inventory` plugin with one action, `scan` (no parameters), and the
+definition `crossplatform.components.scan`. Kind: `java` — archives ending `.jar`, `.war` or `.ear`,
+plus the libraries nested one level inside them (`BOOT-INF/lib/`, `WEB-INF/lib/`, `lib/`), listed from
+the archive's central directory alone. OSes: Linux and macOS. Roots, machine-wide only, per Decision 1
+(the root list holds no per-user location), walked in this order because one entry budget is shared by
+all roots: Linux `/usr/lib/jvm`, `/usr/share/java`, `/usr/share/maven`, `/usr/local/lib`,
+`/usr/local/share`, `/opt`; macOS `/Library/Java`, `/usr/local`, `/opt/homebrew`, `/Applications`.
+Only the residual generic walk of Decision 1 shipped: the dpkg/rpm file-list anchoring and the
+`InstallLocation` anchoring it describes did not. No link is followed at any path component, and a root on a network mount is dropped.
+This slice follows no link at all, which supersedes Decision 1's "ordinary in-root version symlinks are
+followed and resolved normally" for now: a link inside a tree is not entered and a link to an archive is
+not listed, and the answer says so (`link_skipped`, below) instead of skipping it silently. Following
+in-root links, scoped to escapes of the anchored root as Decision 1 describes, is a later change. The
+action runs on demand; the daily sync does not carry it yet.
+
+The version is the file name's, with pre-release and build qualifiers kept in it
+(`my-app-1.0.0-rc1.jar` reads `1.0.0-rc1`); other trailing words are classifiers. The archive is asked
+when the name gives no version or is ambiguous (a word follows the version that is not a known
+qualifier, such as a classifier, or the name holds more than one version-like part), and its value replaces the name's split only when the
+file name carries it (`<name>-<version>`, or `<name>_<version>` for a `Bundle-Version`). A `pom` version
+is read from the archive's only `pom.properties`, or, when it holds several, from the one whose artifact
+segment equals the archive's name (never by directory order). Known limits: an archive that has no pom
+of its own but bundles exactly one dependency's reads that dependency's version when its name has no
+version, and a renamed archive (`app.jar`) has no pom named for it, so a name match would leave it
+without a version; the sole pom is trusted for that reason, and the row says `pom`. A nested row, and an
+archive with no pom or manifest, take the file name's word, and a qualifier word the parser does not
+know reads as a classifier (nested `guava-31.1-jre.jar` reads `31.1`).
+
+**Bounds as built.** 400,000 directory entries and 45 seconds per scan (one deadline covering the walk,
+the archive reads and the parsing, checked between directories and between archives, so one blocked
+read is not interrupted), 32 directory levels, 50,000 entries per directory listing, 3,000 rows per
+application folder, 20,000 rows per scan. Per archive: a 16 MiB central directory, 1,024-byte entry
+names, and the `pom.properties` and `MANIFEST.MF` entries read only up to 64 KiB compressed and 64 KiB
+inflated. ZIP64 archives are not enumerated.
+
+**Completeness rule as built (Decision 4).** The answer is `supported` (typed result OK/FULL) only when
+no bound was reached and every directory and archive it opened was read in full. It is `constrained`
+(CONSTRAINED/PARTIAL), with the first cause as an `<os>:component_inventory:<cause>` token, for: `budget_entries`, `budget_time`, `section_rows`,
+`anchor_rows`, `depth`, `dir_unreadable`, `dir_truncated`, `archive_unenumerated` (an archive that could
+not be opened, read or parsed, ZIP64 included), `archive_changed` (an archive that changed while it was
+read) and `mount_table_unreadable` (nothing is walked, because a network mount could not be told from a
+local one). The rows already read are returned at both levels, but when time runs out archives not yet
+read give no rows, and a walk that used the whole budget returns none (reading candidates after the
+deadline would break the one-deadline bound). Reported but not blocking
+(informational tokens on a `supported` row): `root_link_skipped` (a root dropped for a link),
+`link_skipped` (a link met inside a tree, not entered and not listed), `network_fs_skipped` and
+`version_unreadable` (a row whose version no source gives is listed with `version_source` `unreadable`).
+A missing root is skipped silently. A `constrained` answer names its cause alone; the informational
+tokens ride a `supported` row only.
+
+**Fuzz harness.** `tests/fuzz/fuzz_component_zip.cpp` drives the ZIP central-directory reader
+(`zip_directory.hpp`: the end-record search, the directory walk and the local-header offset) with
+arbitrary bytes. It is registered in `tests/fuzz/meson.build` and `.clusterfuzzlite/build.sh` and runs
+in ClusterFuzzLite on pull requests (`cflite-pr.yml`) and in the batch run (`cflite-batch.yml`), both
+path-filtered to `zip_directory*`. The Java file-name, manifest and `pom.properties` parsers and the
+capped inflate are covered by unit tests only, not by a fuzz target.
+
+**Still open.**
+- The Windows leg (answers `windows:planned` today). It also brings the name-based exclusion of
+  OS-owned trees (`\WindowsApps`, `\Windows Kits`, `\WinSxS`, `\Windows`, `\System32`, `\SysWOW64`).
+  The Linux and macOS roots above hold no OS-owned tree, so this slice excludes no directory by name.
+- The hard per-cycle time bound (the sync assembler's bounded wait) arrives with the daily-report
+  section. Until then the 45 second budget is checked between directories and between archives, so one
+  blocked read inside a listing or a file read is not interrupted.
+- Python and Node kinds; the daily-report section and the amendment to Decision 3 that goes with it;
+  the permanent customer opt-out (Decision 2 and Decision 8; the per-plugin kill switch
+  `component_inventory/scan` exists today, #7737 tracks the rest); and the
+  `component_inventory.future_dated_rejected` audit event, which belongs to the store that does not
+  exist yet.

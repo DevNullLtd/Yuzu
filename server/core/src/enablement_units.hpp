@@ -146,8 +146,9 @@ inline constexpr std::array<RequirementEdge, 2> kRequirements{{
 // middleware ibm_mq added by SAM.2; runtimes python added 2026-10-28; hardware drivers_inventory
 // added by SAM-32; virtualization host added by PR12.1-a, virtualization wsl added 2026-11-08,
 // virtualization runtime_posture added by PR12.1-b2; firewall quarantine, release, quarantine_status
-// and quarantine_allow added by PRQ.1), 252 rows.
-inline constexpr std::array<UnitOsRow, 252> kUnitOs{{
+// and quarantine_allow added by PRQ.1; component_inventory scan added by SAM-16, Windows leg planned
+// so applicable on all three), 253 rows.
+inline constexpr std::array<UnitOsRow, 253> kUnitOs{{
     {"agent_actions", "set_log_level", kWin | kLin | kMac},
     {"agent_actions", "info", kWin | kLin | kMac},
     {"agent_logging", "get_log", kWin | kLin | kMac},
@@ -175,6 +176,7 @@ inline constexpr std::array<UnitOsRow, 252> kUnitOs{{
     {"certificates", "delete", kWin | kLin | kMac},
     {"chargen", "chargen_start", kWin | kLin | kMac},
     {"chargen", "chargen_stop", kWin | kLin | kMac},
+    {"component_inventory", "scan", kWin | kLin | kMac},
     {"content_dist", "stage", kWin | kLin | kMac},
     {"content_dist", "execute_staged", kWin | kLin | kMac},
     {"content_dist", "list_staged", kWin | kLin | kMac},
