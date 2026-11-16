@@ -15,8 +15,9 @@
  *   - the permission tier, asked of the per-device scoped gate (#2540, the REST
  *     twin's chokepoint) on the posted device — Infrastructure:Delete for purge,
  *     Execution:Execute for reenable (a tier downgrade must fail here); a denial
- *     collapses to the offline 404, a store outage answers 503, an unwired gate
- *     fails closed, and the gate is asked again after the attempted row,
+ *     collapses to the offline 404, a gate that itself answers 503 answers 503,
+ *     an unwired gate fails closed, and the gate is asked again after the
+ *     attempted row; a service-scoped token is refused 403 before the gate,
  *   - the CSRF same-site gate — cross-origin AND header-less POSTs are 403'd
  *     BEFORE dispatch (these fragments are stricter than the shared
  *     `origin_is_same_site` helper, which permits header-less non-browser
@@ -150,10 +151,13 @@ struct FragmentHarness {
     bool perm_allow{true}; ///< perm_fn verdict (false → handler's 403 path)
     /// #2540: devices the scoped gate admits (read live per probe; clear() == grant withdrawn).
     std::unordered_set<std::string> scoped_allowed{"dev-A", "dev-B"};
-    /// Status the scoped gate writes on a refusal: 403 = plain denial, 503 = store outage.
+    /// Status the scoped gate writes on a refusal: 403 = plain denial (a degraded RBAC read
+    /// included), 503 = the gate could not evaluate authority.
     int scoped_deny_status{403};
     bool auth_ok{true};    ///< auth_fn verdict (false → handler returns early)
     std::string auth_source{"local"}; ///< resolved session source; "local" = a cookie session
+    /// Non-empty models a service-scoped API token (both POSTs refuse it 403 before any gate).
+    std::string token_scope_service;
     int dispatch_sent{1};  ///< agents reached per dispatch (0 → offline 404)
     /// #5294: ConfinedDispatchOutcome fields the zero-reach messages key on.
     bool dispatch_os_gate_unreadable{false};
@@ -203,6 +207,7 @@ struct FragmentHarness {
             s.username = kUser;
             s.role = auth::Role::admin;
             s.auth_source = auth_source;
+            s.token_scope_service = token_scope_service;
             return s;
         };
         auto perm_fn = [this](const httplib::Request&, httplib::Response& res,
@@ -405,18 +410,94 @@ TEST_CASE("fragment purge and reenable: an unwired scoped gate refuses with 503 
     CHECK(h.calls.empty());
 }
 
-TEST_CASE("fragment purge: an authorization store outage answers 503 and not the 404 collapse",
-          "[pg][server][echo][purge][fragment][security][2540]") {
+TEST_CASE("fragment purge and reenable: a scoped gate that answers 503 refuses with 503 at "
+          "admission and at the recheck",
+          "[pg][server][echo][purge][reenable][fragment][audit][security][2540]") {
+    // 503 is the gate saying it could not evaluate authority; it must not collapse into the 404 a
+    // denial gets. (A degraded RBAC read is NOT this case: the real gate answers it 403.)
+    for (const auto& [path, action, family] :
+         {std::tuple{kPurgePath, "echo.source.purge", "yuzu_echo_source_purge_total"},
+          std::tuple{kReenablePath, "echo.source.reenable", "yuzu_echo_source_reenable_total"}}) {
+        DYNAMIC_SECTION(action) {
+            const std::string act = action;
+            FragmentHarness h;
+            h.scoped_allowed.clear();
+            h.scoped_deny_status = 503;
+            auto at_admission = h.post(path, "device_id=dev-A&source=process");
+            CHECK(at_admission->status == 503);
+            CHECK(at_admission->body != kEchoAgentNotReachableBody);
+            CHECK(h.audits_for(act, "attempted") == 0);
+            CHECK(h.audits_for(act, "failure") == 0); // not a scope violation
+            CHECK(h.audit_detail(act, "denied") == "scoped_gate_unavailable source=process");
+            CHECK(h.metric(family, "denied") == 1.0);
+
+            // Admitted, then unavailable once the attempted row is stored.
+            h.scoped_allowed = {"dev-A"};
+            h.scoped_deny_status = 403;
+            h.scoped_calls.clear();
+            h.audit_persists = [&h, act](const AuditRow& r) {
+                if (r.action == act && r.result == "attempted") {
+                    h.scoped_allowed.clear();
+                    h.scoped_deny_status = 503;
+                }
+                return true;
+            };
+            auto at_recheck = h.post(path, "device_id=dev-A&source=process");
+            CHECK(at_recheck->status == 503);
+            CHECK(at_recheck->body != kEchoAgentNotReachableBody);
+            REQUIRE(h.scoped_calls.size() == 2);
+            CHECK(h.audits_for(act, "attempted") == 1);
+            CHECK(h.audit_detail(act, "failure") ==
+                  "scoped_gate_unavailable device=dev-A source=process");
+            CHECK(h.audits_for(act, "success") == 0);
+            CHECK(h.metric(family, "denied") == 2.0);
+            CHECK(h.calls.empty());
+        }
+    }
+}
+
+TEST_CASE("fragment purge and reenable: a service-scoped token is refused 403 before the scoped "
+          "gate and dispatches nothing",
+          "[pg][server][echo][purge][reenable][fragment][security][2540]") {
+    // The global gate these routes asked before #2540 refused every service-scoped token. The
+    // scoped gate's service branch would admit a confined one, so the handlers refuse it first.
+    for (const auto& [path, action, family] :
+         {std::tuple{kPurgePath, "echo.source.purge", "yuzu_echo_source_purge_total"},
+          std::tuple{kReenablePath, "echo.source.reenable", "yuzu_echo_source_reenable_total"}}) {
+        DYNAMIC_SECTION(action) {
+            FragmentHarness h;
+            h.token_scope_service = "svc-example";
+            auto res = h.post(path, "device_id=dev-A&source=process"); // a device the gate admits
+            CHECK(res->status == 403);
+            CHECK(contains(res->body, "Permission denied"));
+            // The same answer whatever the device: the refusal is no existence oracle.
+            auto other = h.post(path, "device_id=dev-OTHER&source=process");
+            CHECK(other->status == res->status);
+            CHECK(other->body == res->body);
+            CHECK(h.scoped_calls.empty());
+            CHECK(h.perms.empty());
+            CHECK(h.calls.empty());
+            CHECK(h.audits_for(action, "attempted") == 0);
+            CHECK(h.audit_detail(action, "denied") == "service_scoped_token_denied");
+            CHECK(h.metric(family, "denied") == 2.0);
+        }
+    }
+}
+
+TEST_CASE("fragment purge and reenable: the scoped gate admits a device outside the caller's "
+          "group membership",
+          "[pg][server][echo][purge][reenable][fragment][2540]") {
+    // dev-OTHER is in no group kUser holds a role on (grant_visibility covers dev-A and dev-B), so
+    // the get_visible_agents loop these handlers used to run refused it. The scoped gate is the
+    // SOLE gate: when it admits (a global grant holder), the dispatch goes out. Reintroducing the
+    // membership loop fails here.
     FragmentHarness h;
-    h.scoped_allowed.clear();
-    h.scoped_deny_status = 503;
-    auto res = h.post(kPurgePath, "device_id=dev-A&source=process");
-    CHECK(res->status == 503);
-    CHECK(res->body != kEchoAgentNotReachableBody);
-    CHECK(h.calls.empty());
-    CHECK(h.audits_for("echo.source.purge", "attempted") == 0);
-    CHECK(h.audits_for("echo.source.purge", "failure") == 0); // not a scope violation
-    CHECK(h.audit_detail("echo.source.purge", "denied") == "scoped_gate_unavailable source=process");
+    h.scoped_allowed.insert("dev-OTHER");
+    CHECK(h.post(kPurgePath, "device_id=dev-OTHER&source=process")->status == 200);
+    CHECK(h.post(kReenablePath, "device_id=dev-OTHER&source=process")->status == 200);
+    REQUIRE(h.calls.size() == 2);
+    CHECK(h.calls[0].agent_ids == std::vector<std::string>{"dev-OTHER"});
+    CHECK(h.calls[1].agent_ids == std::vector<std::string>{"dev-OTHER"});
 }
 
 TEST_CASE("fragment purge: a grant withdrawn after the attempted row dispatches nothing and audits "
@@ -540,7 +621,7 @@ TEST_CASE("fragment and REST purge: a confined operator is denied for the same o
     CHECK(rest_dispatched.empty());
     CHECK(h.calls.empty());
     // ...and both admit the device the policy admits.
-    CHECK(rest_post("dev-A") == 200);
+    CHECK(rest_post("dev-A") == 202); // REST: accepted, poll the command
     CHECK(h.post(kPurgePath, "device_id=dev-A&source=process")->status == 200);
     CHECK(rest_dispatched == std::vector<std::string>{"dev-A"});
     REQUIRE(h.calls.size() == 1);
@@ -560,6 +641,7 @@ TEST_CASE("fragment purge: cross-origin and header-less POSTs are refused before
         CHECK(h.calls.empty());
         CHECK(h.audit_detail("echo.source.purge", "denied") == "csrf_cross_origin");
         CHECK(h.metric("yuzu_echo_source_purge_total", "denied") == 1.0);
+        CHECK(h.scoped_calls.empty()); // refused before the scoped gate is asked
     }
     SECTION("cross-origin Referer (no Origin)") {
         FragmentHarness h;
@@ -594,6 +676,7 @@ TEST_CASE("fragment reenable: cross-origin and header-less POSTs are refused bef
         CHECK(h.calls.empty());
         CHECK(h.audit_detail("echo.source.reenable", "denied") == "csrf_cross_origin");
         CHECK(h.metric("yuzu_echo_source_reenable_total", "denied") == 1.0);
+        CHECK(h.scoped_calls.empty()); // refused before the scoped gate is asked
     }
     SECTION("header-less") {
         FragmentHarness h;
@@ -615,6 +698,7 @@ TEST_CASE("fragment purge: missing fields and forged sources are rejected 400, n
     // A real Echo source deliberately outside the four-source frame scope.
     CHECK(h.post(kPurgePath, "device_id=dev-A&source=software")->status == 400);
     CHECK(h.calls.empty());
+    CHECK(h.scoped_calls.empty()); // validation precedes the scoped gate (no gate audit row)
     CHECK(h.metric("yuzu_echo_source_purge_total", "invalid_input") == 5.0);
 }
 
@@ -627,6 +711,7 @@ TEST_CASE("fragment reenable: missing fields and forged sources are rejected 400
     CHECK(h.post(kReenablePath, "device_id=dev-A&source=evil")->status == 400);
     CHECK(h.post(kReenablePath, "device_id=dev-A&source=software")->status == 400);
     CHECK(h.calls.empty());
+    CHECK(h.scoped_calls.empty()); // validation precedes the scoped gate (no gate audit row)
     CHECK(h.metric("yuzu_echo_source_reenable_total", "invalid_input") == 5.0);
 }
 
@@ -729,6 +814,7 @@ TEST_CASE("fragment purge/reenable: no dispatch wiring → 503",
     FragmentHarness h{/*with_dispatch=*/false};
     CHECK(h.post(kPurgePath, "device_id=dev-A&source=process")->status == 503);
     CHECK(h.post(kReenablePath, "device_id=dev-A&source=process")->status == 503);
+    CHECK(h.scoped_calls.empty()); // dispatch wiring is checked before the scoped gate
 }
 
 TEST_CASE("fragment purge/reenable: an unauthenticated session stops before dispatch",
@@ -738,6 +824,7 @@ TEST_CASE("fragment purge/reenable: an unauthenticated session stops before disp
     CHECK(h.post(kPurgePath, "device_id=dev-A&source=process")->status == 401);
     CHECK(h.post(kReenablePath, "device_id=dev-A&source=process")->status == 401);
     CHECK(h.calls.empty());
+    CHECK(h.scoped_calls.empty());
 }
 
 // ── Success shape ───────────────────────────────────────────────────────────

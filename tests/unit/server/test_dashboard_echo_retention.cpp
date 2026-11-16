@@ -671,6 +671,9 @@ struct FrameHarness {
     bool gate_admits{true};
     bool global_exec{true};   ///< global Execution:Execute probe
     bool global_delete{true}; ///< global Infrastructure:Delete probe
+    bool global_read{true};   ///< global Infrastructure:Read probe (the frame no longer asks it)
+    std::string token_scope_service;  ///< non-empty models a service-scoped API token
+    std::vector<std::string> audits;  ///< "<action>/<result>" per audit row
 
     void wire(bool with_fleet_gate, ResponseStore* rs, ManagementGroupStore* mg) {
         acc.set_stores(rs, mg);
@@ -688,22 +691,30 @@ struct FrameHarness {
         }
         acc.routes.register_routes(
             sink,
-            [](const httplib::Request&, httplib::Response&) -> std::optional<auth::Session> {
+            [this](const httplib::Request&, httplib::Response&) -> std::optional<auth::Session> {
                 auth::Session sess;
                 sess.username = kUser;
                 sess.role = auth::Role::admin;
+                sess.token_scope_service = token_scope_service;
                 return sess;
             },
-            [this](const httplib::Request&, httplib::Response&, const std::string& type,
+            [this](const httplib::Request&, httplib::Response& res, const std::string& type,
                    const std::string& op) -> bool {
                 if (type == "Execution" && op == "Execute")
                     return global_exec;
                 if (type == "Infrastructure" && op == "Delete")
                     return global_delete;
+                if (type == "Infrastructure" && op == "Read" && !global_read) {
+                    res.status = 403; // what the real global gate writes on a refusal
+                    return false;
+                }
                 return true;
             },
-            [](const httplib::Request&, const std::string&, const std::string&, const std::string&,
-               const std::string&, const std::string&) { return true; },
+            [this](const httplib::Request&, const std::string& action, const std::string& result,
+                   const std::string&, const std::string&, const std::string&) {
+                audits.push_back(action + "/" + result);
+                return true;
+            },
             rs, mg, /*registry=*/nullptr, /*tag_store=*/nullptr, /*event_bus=*/nullptr,
             /*agents_json_fn=*/[] { return std::string{"[]"}; },
             /*dispatch_fn=*/DashboardRoutes::DispatchFn{}, /*caller_fn=*/DashboardRoutes::CallerFn{},
@@ -749,6 +760,23 @@ TEST_CASE("retention-paused frame: the fragment is gated by the fleet read choke
         auto denied = h.get();
         CHECK(denied->status == 403);
         CHECK_FALSE(contains(denied->body, "agent-A"));
+    }
+    SECTION("a reader the global Infrastructure:Read gate would refuse is still admitted") {
+        // The management-group-scoped reader: no global grant, admitted by the fleet gate.
+        // Putting the global gate back in front of the frame fails here.
+        h.global_read = false;
+        auto scoped = h.get();
+        CHECK(scoped->status == 200);
+        CHECK(contains(scoped->body, "data-device=\"agent-A\""));
+    }
+    SECTION("a service-scoped token is refused 403 before the fleet gate is asked") {
+        h.token_scope_service = "svc-example";
+        h.fleet_calls.clear();
+        auto refused = h.get();
+        CHECK(refused->status == 403);
+        CHECK_FALSE(contains(refused->body, "agent-A"));
+        CHECK(h.fleet_calls.empty());
+        CHECK(h.audits == std::vector<std::string>{"echo.retention_paused.view/denied"});
     }
 }
 
