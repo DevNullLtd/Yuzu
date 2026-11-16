@@ -321,12 +321,32 @@ namespace detail {
     return f;
 }
 
+/// The ten 16-hex mask keys of /proc/<pid>/status and the field each one fills.
+struct MaskKey {
+    std::string_view key;
+    TextField StatusFields::*field;
+};
+inline constexpr std::array<MaskKey, 10> kMaskKeys{{
+    {"SigPnd", &StatusFields::sig_pnd},
+    {"ShdPnd", &StatusFields::shd_pnd},
+    {"SigBlk", &StatusFields::sig_blk},
+    {"SigIgn", &StatusFields::sig_ign},
+    {"SigCgt", &StatusFields::sig_cgt},
+    {"CapInh", &StatusFields::cap_inh},
+    {"CapPrm", &StatusFields::cap_prm},
+    {"CapEff", &StatusFields::cap_eff},
+    {"CapBnd", &StatusFields::cap_bnd},
+    {"CapAmb", &StatusFields::cap_amb},
+}};
+
 } // namespace detail
 
 /// Lines are `Key:\tvalue`; the FIRST occurrence of a key wins (a later forged line is ignored).
 [[nodiscard]] inline StatusFields parse_status(std::string_view text) {
     StatusFields out;
-    std::array<bool, 12> seen{};
+    // One first-wins bit per key: the mask keys in kMaskKeys order, then the four arms below.
+    constexpr std::size_t n = detail::kMaskKeys.size();
+    std::array<bool, n + 4> seen{};
     detail::for_each_line(text, [&](std::string_view line) {
         const std::size_t colon = line.find(':');
         if (colon == std::string_view::npos)
@@ -339,47 +359,33 @@ namespace detail {
             seen[idx] = true;
             return true;
         };
-        if (key == "SigPnd") {
-            if (once(0)) out.sig_pnd = detail::hex16_field(val);
-        } else if (key == "ShdPnd") {
-            if (once(1)) out.shd_pnd = detail::hex16_field(val);
-        } else if (key == "SigBlk") {
-            if (once(2)) out.sig_blk = detail::hex16_field(val);
-        } else if (key == "SigIgn") {
-            if (once(3)) out.sig_ign = detail::hex16_field(val);
-        } else if (key == "SigCgt") {
-            if (once(4)) out.sig_cgt = detail::hex16_field(val);
-        } else if (key == "CapInh") {
-            if (once(5)) out.cap_inh = detail::hex16_field(val);
-        } else if (key == "CapPrm") {
-            if (once(6)) out.cap_prm = detail::hex16_field(val);
-        } else if (key == "CapEff") {
-            if (once(7)) out.cap_eff = detail::hex16_field(val);
-        } else if (key == "CapBnd") {
-            if (once(8)) out.cap_bnd = detail::hex16_field(val);
-        } else if (key == "CapAmb") {
-            if (once(9)) out.cap_amb = detail::hex16_field(val);
-        } else if (key == "Seccomp") {
-            if (seen[10]) return;
-            seen[10] = true;
-            out.seccomp = detail::small_num_field(val, 2);
+        for (std::size_t i = 0; i < n; ++i) {
+            if (key == detail::kMaskKeys[i].key) {
+                if (once(i))
+                    out.*detail::kMaskKeys[i].field = detail::hex16_field(val);
+                return;
+            }
+        }
+        if (key == "Seccomp") {
+            if (once(n))
+                out.seccomp = detail::small_num_field(val, 2);
         } else if (key == "Cpus_allowed_list") {
-            if (seen[11]) return;
-            seen[11] = true;
-            TextField f;
-            bool ok = !val.empty() && val.size() <= kCpusListCap;
-            for (char c : val)
-                if (!((c >= '0' && c <= '9') || c == ',' || c == '-'))
-                    ok = false;
-            f.presence = ok ? Presence::ok : Presence::invalid;
-            if (ok)
-                f.value = std::string{val};
-            out.cpus_allowed_list = std::move(f);
+            if (once(n + 1)) {
+                TextField f;
+                bool ok = !val.empty() && val.size() <= kCpusListCap;
+                for (char c : val)
+                    if (!((c >= '0' && c <= '9') || c == ',' || c == '-'))
+                        ok = false;
+                f.presence = ok ? Presence::ok : Presence::invalid;
+                if (ok)
+                    f.value = std::string{val};
+                out.cpus_allowed_list = std::move(f);
+            }
         } else if (key == "NoNewPrivs") {
-            if (out.no_new_privs.presence == Presence::absent)
+            if (once(n + 2))
                 out.no_new_privs = detail::small_num_field(val, 1);
         } else if (key == "Seccomp_filters") {
-            if (out.seccomp_filters.presence == Presence::absent)
+            if (once(n + 3))
                 out.seccomp_filters = detail::small_num_field(val, 0xffffffffu);
         }
     });
@@ -502,12 +508,10 @@ inline constexpr std::array<LimitName, 16> kLimitNames{{
            std::string{r.unit};
 }
 
-[[nodiscard]] inline std::string format_sigmask(std::string_view which, std::string_view hex16) {
-    return "sigmask|" + std::string{which} + '|' + std::string{hex16};
-}
-
-[[nodiscard]] inline std::string format_cap(std::string_view which, std::string_view hex16) {
-    return "cap|" + std::string{which} + '|' + std::string{hex16};
+/// `kind` is `sigmask` or `cap`; `which` is a call-site literal naming the mask.
+[[nodiscard]] inline std::string format_mask(std::string_view kind, std::string_view which,
+                                             std::string_view hex16) {
+    return std::string{kind} + '|' + std::string{which} + '|' + std::string{hex16};
 }
 
 [[nodiscard]] inline std::string num_or_dash(const NumField& f) {

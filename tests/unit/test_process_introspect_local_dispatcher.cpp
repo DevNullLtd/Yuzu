@@ -16,6 +16,7 @@
 #include <yuzu/plugin.hpp>
 
 #include "local_dispatcher.hpp"
+#include "pkg_inventory_test_support.hpp"
 
 #include <algorithm>
 #include <cstdlib>
@@ -31,25 +32,9 @@
 #endif
 
 namespace fs = std::filesystem;
+using yuzu::test::pkg_inventory_support::captured_rows;
 
 namespace {
-
-std::vector<std::string> captured_rows(const std::string& captured) {
-    std::vector<std::string> out;
-    std::size_t i = 0;
-    while (i < captured.size()) {
-        const std::size_t nl = captured.find('\n', i);
-        std::string line = captured.substr(i, nl - i);
-        if (!line.empty() && line.back() == '\r')
-            line.pop_back();
-        if (!line.empty())
-            out.push_back(std::move(line));
-        if (nl == std::string::npos)
-            break;
-        i = nl + 1;
-    }
-    return out;
-}
 
 /// Under `meson test` (MESON_BUILD_ROOT is always set) a missing plugin means the
 /// build is genuinely broken and must NOT report "All tests passed".

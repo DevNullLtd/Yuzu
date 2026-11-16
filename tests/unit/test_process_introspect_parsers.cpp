@@ -403,8 +403,8 @@ TEST_CASE("process_introspect formatters emit only validated shapes", "[process_
     rows.push_back(format_target(4242, "0123abcd.987654", Facet::caps));
     for (const auto& r : lp.rows)
         rows.push_back(format_limit(r));
-    rows.push_back(format_sigmask("blocked", ss.sig_blk.value));
-    rows.push_back(format_cap("effective", ss.cap_eff.value));
+    rows.push_back(format_mask("sigmask", "blocked", ss.sig_blk.value));
+    rows.push_back(format_mask("cap", "effective", ss.cap_eff.value));
     rows.push_back(format_seccomp(ss));
     rows.push_back(format_seccomp(StatusFields{}));
     rows.push_back(format_oom(500, -1000));
@@ -425,8 +425,9 @@ TEST_CASE("process_introspect formatters emit only validated shapes", "[process_
     CHECK(format_oom(std::nullopt, 5) == "oom|-|5");
     CHECK(format_sched(*st, ss.cpus_allowed_list) == "sched|rr|-5|10|0-15");
     CHECK(format_sched(*st, TextField{}) == "sched|rr|-5|10|-");
-    CHECK(format_sigmask("blocked", "0000000000010000") == "sigmask|blocked|0000000000010000");
-    CHECK(format_cap("effective", "000001ffffffffff") == "cap|effective|000001ffffffffff");
+    CHECK(format_mask("sigmask", "blocked", "0000000000010000") ==
+          "sigmask|blocked|0000000000010000");
+    CHECK(format_mask("cap", "effective", "000001ffffffffff") == "cap|effective|000001ffffffffff");
 }
 
 TEST_CASE("process_introspect: a process name never reaches any row", "[process_introspect]") {

@@ -15,6 +15,7 @@
 
 #include "local_dispatcher.hpp"
 
+#include "pkg_inventory_test_support.hpp"
 #include "process_introspect_legs.hpp"
 
 #include <algorithm>
@@ -27,6 +28,7 @@
 #include <vector>
 
 using namespace yuzu::process_introspect;
+using yuzu::test::pkg_inventory_support::captured_rows;
 
 namespace {
 
@@ -173,21 +175,6 @@ int exec_exec(YuzuCommandContext* raw_ctx, const char*, const YuzuParam*, std::s
 yuzu::agent::LocalDispatcher::Result dispatch(YuzuPluginDescriptor& d) {
     yuzu::agent::LocalDispatcher dispatcher;
     return dispatcher.run(&d, "inspect");
-}
-
-std::vector<std::string> rows_of(const std::string& captured) {
-    std::vector<std::string> out;
-    std::size_t i = 0;
-    while (i < captured.size()) {
-        const std::size_t nl = captured.find('\n', i);
-        const std::string line = captured.substr(i, nl - i);
-        if (!line.empty())
-            out.push_back(line);
-        if (nl == std::string::npos)
-            break;
-        i = nl + 1;
-    }
-    return out;
 }
 
 } // namespace
@@ -612,7 +599,7 @@ TEST_CASE("process_introspect execute_inspect: validation, dispatch and containm
         g_exec.action = "other";
         const auto r = dispatch(d);
         CHECK(r.rc == 1);
-        CHECK(rows_of(r.captured) == std::vector<std::string>{"unknown action: other"});
+        CHECK(captured_rows(r.captured) == std::vector<std::string>{"unknown action: other"});
         CHECK(g_exec.leg_calls == 0);
     }
     for (const auto& bad : std::vector<std::pair<const char*, const char*>>{
@@ -629,7 +616,7 @@ TEST_CASE("process_introspect execute_inspect: validation, dispatch and containm
             g_exec.start_time = "zz";
         const auto r = dispatch(d);
         CHECK(r.rc == 1);
-        CHECK(rows_of(r.captured) == std::vector<std::string>{std::string{"status|inspect|unavailable|"} + bad.second});
+        CHECK(captured_rows(r.captured) == std::vector<std::string>{std::string{"status|inspect|unavailable|"} + bad.second});
         CHECK(r.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
         CHECK(g_exec.leg_calls == 0); // the leg never runs on invalid input
     }
@@ -638,7 +625,7 @@ TEST_CASE("process_introspect execute_inspect: validation, dispatch and containm
         g_exec.leg = &throwing_leg;
         const auto r = dispatch(d);
         CHECK(r.rc == 0); // contained, never unwound
-        CHECK(rows_of(r.captured) ==
+        CHECK(captured_rows(r.captured) ==
               std::vector<std::string>{"status|inspect|unsupported|linux:leg:exception"});
         CHECK(r.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
         CHECK(r.result_completeness == YUZU_RESULT_COMPLETENESS_UNKNOWN);
@@ -680,7 +667,7 @@ TEST_CASE("process_introspect report pairs each state with its result status", "
         g_report_input = &in;
         const auto r = dispatch(d);
         INFO(c.token);
-        const auto rows = rows_of(r.captured);
+        const auto rows = captured_rows(r.captured);
         REQUIRE(rows.size() == 2);
         CHECK(rows[0] == std::string{"status|inspect|"} + c.token + "|" + (supported ? "-" : tok("x:y")));
         CHECK(rows[1] == "target|1|0123abcd.1|oom");

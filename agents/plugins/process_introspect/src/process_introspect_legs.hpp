@@ -96,12 +96,11 @@ enum class ReadState { ok, not_found, denied, oversized, io };
         return ReadState::ok;
     case RawErr::oversized:
         return ReadState::oversized;
-    case RawErr::io:
-        if (err == ENOENT || err == ESRCH)
-            return ReadState::not_found;
-        if (err == EACCES || err == EPERM)
-            return ReadState::denied;
-        return ReadState::io;
+    case RawErr::io: {
+        // Same errno ladder as the open; an io failure carrying errno 0 stays io, never ok.
+        const ReadState s = classify_open_errno(err);
+        return s == ReadState::ok ? ReadState::io : s;
+    }
     case RawErr::symlink_refused:
     case RawErr::not_regular:
         return ReadState::io;
@@ -285,10 +284,9 @@ inline constexpr std::size_t kOomCap = 64;
         }
         return false;
     };
-    auto mask_row = [&](const TextField& tf, std::string (*fmt)(std::string_view, std::string_view),
-                        std::string_view which) {
+    auto mask_row = [&](const TextField& tf, std::string_view kind, std::string_view which) {
         if (tf.presence == Presence::ok)
-            rows.push_back(fmt(which, tf.value));
+            rows.push_back(format_mask(kind, which, tf.value));
         else
             fail("malformed");
     };
@@ -309,21 +307,21 @@ inline constexpr std::size_t kOomCap = 64;
     case Facet::sigmasks:
         if (fetch("status", kStatusCap, text)) {
             const StatusFields s = parse_status(text);
-            mask_row(s.sig_pnd, format_sigmask, "pending");
-            mask_row(s.shd_pnd, format_sigmask, "shared_pending");
-            mask_row(s.sig_blk, format_sigmask, "blocked");
-            mask_row(s.sig_ign, format_sigmask, "ignored");
-            mask_row(s.sig_cgt, format_sigmask, "caught");
+            mask_row(s.sig_pnd, "sigmask", "pending");
+            mask_row(s.shd_pnd, "sigmask", "shared_pending");
+            mask_row(s.sig_blk, "sigmask", "blocked");
+            mask_row(s.sig_ign, "sigmask", "ignored");
+            mask_row(s.sig_cgt, "sigmask", "caught");
         }
         break;
     case Facet::caps:
         if (fetch("status", kStatusCap, text)) {
             const StatusFields s = parse_status(text);
-            mask_row(s.cap_inh, format_cap, "inheritable");
-            mask_row(s.cap_prm, format_cap, "permitted");
-            mask_row(s.cap_eff, format_cap, "effective");
-            mask_row(s.cap_bnd, format_cap, "bounding");
-            mask_row(s.cap_amb, format_cap, "ambient");
+            mask_row(s.cap_inh, "cap", "inheritable");
+            mask_row(s.cap_prm, "cap", "permitted");
+            mask_row(s.cap_eff, "cap", "effective");
+            mask_row(s.cap_bnd, "cap", "bounding");
+            mask_row(s.cap_amb, "cap", "ambient");
         }
         break;
     case Facet::seccomp:

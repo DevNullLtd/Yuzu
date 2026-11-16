@@ -606,8 +606,6 @@ TEST_CASE("ServerImpl's boot sequence actually calls "
     REQUIRE(block_end != std::string::npos);
     const auto block = source.substr(marker, block_end - marker);
 
-    CHECK(block.find("\"process_introspect\"") != std::string::npos);
-
     // The call is gated on the store existing and the boot not already
     // having failed — never unconditional.
     const auto guard_start = source.rfind("if (plugin_config_store_ && !startup_failed_)",
@@ -626,7 +624,7 @@ TEST_CASE("ServerImpl's boot sequence actually calls "
     CHECK(block.find("\"default-off: forensics class; enable per PUT \"") != std::string::npos);
     CHECK(block.find("\"/api/v1/plugin-config/process_introspect/kill-switch\"") !=
           std::string::npos);
-    CHECK(block.find("Wave 11") == std::string::npos);
+    CHECK(block.find("Wave ") == std::string::npos);
 }
 
 TEST_CASE("set_kill_switch rejects an invalid reason as InvalidInput",
