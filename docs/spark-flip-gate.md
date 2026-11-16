@@ -965,6 +965,16 @@ flip, with a red-first test each:
   run out after the backlog drains). The alert keeps the `> 0` shape on purpose (a ruled
   decision); a series of one-scrape backlogs from different agents can hold it above 0, and
   a promtool case documents that limit.
+  **Flip-time refresh item (#5605; part of the same checklist row):** at the flip, (4)
+  refresh every statement that says Spark or `prefer_spark` is off, or that the gauge is
+  absent, in every released agent today. List them with `git grep -n -i "released agent"` and
+  `git grep -n "prefer_spark.*off"` over: the HELP strings in
+  `server/core/src/guardian_baseline_fleet_tags.hpp`, `docs/user-manual/metrics.md`,
+  `docs/user-manual/guaranteed-state.md`, `docs/user-manual/upgrading.md`, the alert comment
+  and description in `docs/prometheus/yuzu-alerts.yml`, and the runbook "Fleet monitoring of
+  baseline persistence". To tell which agents are on the Spark path, use the
+  `yuzu.guardian_backend` tag (`guardian_backend` on `GET /api/v1/devices`) and the `path=`
+  field of the `Guardian: full_sync rebuilt` log line.
   Alert-at-scale revisit (recorded risk, owner Dave): the rule is `sum by (job)
   (max_over_time(...[5m])) > 0` for 15 minutes, a sum of current counts that stays above 0
   while ANY agent has a slow or failing store, so on a large fleet one flapping endpoint can
@@ -2742,7 +2752,7 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   read found NO persisted record (an Absent read). It does not see a Malformed record, a boot
   read error or a fingerprint mismatch (a retarget), all of which also re-baseline, nor a
   retarget whose new capture was never written before a crash (the old record still reads
-  Ok), and it says nothing about journal records. It cannot prove that a capture was lost or
+  Ok), nor a capture that was never staged, and it says nothing about journal records. It cannot prove that a capture was lost or
   that the previous stop was an exit-4 (a never-captured target, a failed arm and a lost
   capture all read the same). On Linux and macOS no file mechanism arms, so such a rule reads
   Absent at every boot and the tag is non-zero on every boot there, so it is not a baseline-loss

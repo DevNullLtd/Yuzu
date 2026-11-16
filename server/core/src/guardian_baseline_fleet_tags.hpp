@@ -73,7 +73,7 @@ inline constexpr GuardianBaselineMetric kGuardianBaselineMetrics[] = {
      "agent (its series vanishes)"},
     {"yuzu.guardian_baseline_rebaselined_at_boot",
      "yuzu_fleet_guardian_baseline_rebaselined_at_boot",
-     "Fleet SUM of file-hash-equals rules with no authored expected_hash whose boot re-arm seed "
+     "Fleet SUM of enabled file-hash-equals rules with no authored expected_hash whose boot re-arm seed "
      "lookup found NO persisted baseline record (both detection backends; counted once per rule "
      "per agent boot; sparse per agent, so ABSENT means no agent reported a non-zero count). "
      "Each such rule re-arms and, where the file mechanism can arm, re-captures the file's "
