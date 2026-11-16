@@ -251,8 +251,8 @@ inline constexpr std::string_view kSvcHelperPathMacos =
 /// which is why `--` precedes it). A root agent (euid_is_root) has no sudoers grant to bound and
 /// runs systemctl itself, at `systemctl_path`; any other agent goes through the helper, under the
 /// canonical `sudo -n --` form. The decision is the euid alone, the one sudo_wrap makes: there is
-/// no probe for the helper and no fallback to the tool when it is missing (a host whose installer
-/// has not been re-run fails with sudo's own message).
+/// no probe for the helper and no fallback to the tool when it is missing (a host provisioned
+/// without this build's installer fails with sudo's own message).
 [[nodiscard]] inline std::vector<std::string>
 systemctl_set_start_mode_argv(std::string_view systemctl_path, std::string_view verb,
                               std::string_view name, bool euid_is_root) {

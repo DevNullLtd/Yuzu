@@ -421,11 +421,8 @@ itself, so it needs neither the sudoers file nor the helper.
 
 **The enable reference is released with `pfctl -X <token>`**, which is not a helper
 action: the leg takes the reference (`-E`) before the load and gives it back when
-the load fails, and a host whose installer has not been re-run would refuse a helper
-release and keep the reference until reboot. The token is 1 to 24 digits, and
-sudoers pins that length itself with one bracket class per digit (24 lines, no
-wildcard), so the same argv matches the sudoers file of an earlier installer and
-this one.
+the load fails, so the give-back does not depend on the helper. The token is 1 to 24 digits, and sudoers pins
+that length itself with one bracket class per digit (24 lines, no wildcard).
 
 The core still builds every token that reaches an argv or a ruleset line from a
 typed, validated value and re-checks it against a strict charset (`is_safe_token`,
@@ -439,10 +436,11 @@ through the helper's own text by
 sudoers line takes a wildcard and that the 24 `-X` lines are exactly what is shown
 above.
 
-**A host provisioned by an earlier copy of the installer has no helper** until the
-installer is re-run on it (`docs/user-manual/upgrading.md`): until then `quarantine`
+**A host provisioned without this build's installer has no helper**: `quarantine`
 and `quarantine_allow` fail there with `pf_load_failed` and sudo's own message, and
-the enable reference taken for the attempt is given back.
+the enable reference taken for the attempt is given back. An earlier host is
+unsupported and is reprovisioned into a fresh deployment of this build ("Deployment
+contract (hard cutover)" in `docs/user-manual/upgrading.md`).
 
 **Private staging.** The ruleset is written to `<agent.data_dir>/firewall-staging`,
 a directory the agent creates mode 0700 and verifies (a real directory, owned by

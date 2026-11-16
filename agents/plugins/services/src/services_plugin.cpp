@@ -479,8 +479,8 @@ int do_set_start_mode_linux(yuzu::CommandContext& ctx, std::string_view name,
     // "-foo"-shaped unit names to reach the pipe-delimited protocol unmangled), so without "--"
     // a crafted name could still be parsed as a systemctl flag even though there is no shell
     // involved. The choice is the euid alone, the static decision sudo_wrap makes; there is no
-    // probe for the helper and no fallback to the old form, so a host whose installer has not
-    // been re-run fails with sudo's own message (docs/user-manual/upgrading.md).
+    // probe for the helper and no fallback to the old form, so a host provisioned without this
+    // build's installer fails with sudo's own message (docs/agent-privilege-model.md).
     //
     // Mode -> systemctl verb:
     //   automatic -> enable  (starts at boot)
@@ -567,8 +567,8 @@ int do_set_start_mode_macos(yuzu::CommandContext& ctx, std::string_view name,
     // starts with the literal "system/" prefix), so launchctl can never mistake it for a flag
     // regardless of what `name` contains. The choice is the euid alone, the static decision
     // sudo_wrap makes; there is no probe for the helper and no fallback to the old form, so a
-    // host whose installer has not been re-run fails with sudo's own message
-    // (docs/user-manual/upgrading.md). The plugin runs no launchctl bootstrap or bootout.
+    // host provisioned without this build's installer fails with sudo's own message
+    // (docs/agent-privilege-model.md). The plugin runs no launchctl bootstrap or bootout.
     const bool euid_is_root = ::geteuid() == 0;
     std::vector<std::string> argv;
     if (mode == "automatic") {

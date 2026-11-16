@@ -1589,9 +1589,9 @@ class RenderedSudoers(unittest.TestCase):
             self.assertNotIn("requiretty", refused, platform)
             self.assertIn('env_keep += "YUZU_*"', refused, platform)
 
-    def test_the_comments_say_what_the_grants_are_and_that_the_installer_is_rerun(self):
+    def test_the_comments_say_the_installer_writes_the_helpers(self):
         for platform, text in self.text.items():
-            self.assertIn("installer is re-run", text, platform)
+            self.assertIn("provisioned with this build's installer", text, platform)
             self.assertNotRegex(text, r"(?i)exploit|root-equivalent|vulnerab", platform)
 
 
@@ -1876,6 +1876,42 @@ class SectionAllowlistSelfTest(unittest.TestCase):
         for prefix in self.PREFIXES:
             self.assertTrue(any(h.startswith(prefix) for h in headings),
                             "no upgrading.md heading starts with: " + prefix)
+
+
+class DeploymentContractWording(unittest.TestCase):
+    """The containment helper docs never describe an upgrade path. The deployment contract (a fresh
+    deployment, every writer on this build: upgrading.md "Deployment contract (hard cutover)") makes an
+    earlier agent, an earlier host and a carried-forward record unsupported; they are reprovisioned into a
+    fresh same-build deployment. Re-running the installer on the same build is fine and is not matched."""
+
+    FILES = ("scripts/install-agent-user.sh", "docs/agent-privilege-model.md",
+             "docs/quarantine-macos-pf-anchor-design.md", "docs/agent-spawn-sink-manifest.md",
+             "docs/user-manual/upgrading.md", "docs/user-manual/security-hardening.md",
+             "docs/adr/0047-quarantine-store-postgres-migration.md",
+             "agents/plugins/firewall/README.md", "agents/plugins/services/README.md",
+             "content/plugin-docs/firewall.json", "content/plugin-docs/services.json",
+             "changelog.d/2026-11-14-containment-followups.changed.md",
+             "changelog.d/2026-11-14-containment-followups.fixed.md")
+    UPGRADE_PATH = re.compile(r"(?i)with (?:the|this) agent upgrade|provisioned before the|upgraded host"
+                              r"|earlier copy of (?:the|this) (?:installer|script)|upgrade both"
+                              r"|until (?:it|the installer) (?:has been|is) re-?run"
+                              r"|re-?run (?:the installer|`?scripts/install-agent-user\.sh`?) on every"
+                              r"|must be re-?run on every")
+
+    def test_no_containment_helper_doc_describes_an_upgrade_path(self):
+        for rel in self.FILES:
+            text = read_text(rel)
+            self.assertIsNotNone(text, rel)
+            hits = [m.group(0) for m in self.UPGRADE_PATH.finditer(text)]
+            self.assertEqual(hits, [], rel)
+
+    def test_the_pattern_catches_the_phrases_it_names(self):
+        for bad in ("re-run it with the agent upgrade", "A host provisioned before the helper existed",
+                    "an upgraded host", "an earlier copy of this script", "Upgrade both first",
+                    "until the installer is re-run", "re-run the installer on every host",
+                    "The installer must be re-run on every host provisioned with it"):
+            self.assertRegex(bad, self.UPGRADE_PATH)
+        self.assertNotRegex("correct the directory and re-run this installer", self.UPGRADE_PATH)
 
 
 if __name__ == "__main__":

@@ -77,14 +77,16 @@
 # a group-writable one is accepted with a warning) the installer removes the sudoers file and exits 1, so no grant names a helper
 # that is not there. Correct the directory and re-run to get the file back.
 #
-# UPGRADES
-# ────────
-# A host provisioned by an earlier copy of this script has neither helper and its
-# sudoers file still carries the earlier lines. Re-run this script (with the agent
-# upgrade) on EVERY Linux and macOS host provisioned with it: it installs both helpers
-# and replaces the sudoers file. Until it has run, the containment actions (the
-# nftables load and the iptables fallback on Linux, the pf anchor load on macOS) and
-# services.set_start_mode fail on that host, unless the agent runs as root.
+# HOSTS WITHOUT THE HELPERS
+# ─────────────────────────
+# The two helpers and the sudoers lines that name them are written by this script. A
+# host without them has none of these grants: the containment actions (the nftables
+# load and the iptables fallback on Linux, the pf anchor load on macOS) and
+# services.set_start_mode fail there with sudo's own message, unless the agent runs as
+# root. Provision every Linux and macOS host with this build's copy of this script. An
+# agent or host from an earlier build is unsupported and is reprovisioned into a fresh
+# deployment of this build (docs/user-manual/upgrading.md, "Deployment contract (hard
+# cutover)"); running this script again on the same build is safe (see above).
 #
 # UNINSTALL
 # ─────────
@@ -513,8 +515,8 @@ EOF
 # classes), because a sudoers argument pattern cannot otherwise fix a length without a wildcard and
 # sudo regular expressions need sudo 1.9.10, which an older sudo does not read. There is no bare
 # pfctl grant. The anchor name sorts first among Apple's com.apple/* sub-anchors, and the release
-# flush is -F rules / -F nat on that anchor only (never -F all: that is global). A host provisioned
-# before the helper existed has none of this until the installer is re-run.
+# flush is -F rules / -F nat on that anchor only (never -F all: that is global). The installer
+# writes the helper before this file; a host without it is provisioned with this build's installer.
 $ACCOUNT_NAME ALL=(root) NOPASSWD: $FW_HELPER_PATH
 $ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -E
 EOF
@@ -540,8 +542,8 @@ $ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -s References
 # 1 to 256 of them), and runs /bin/launchctl enable|disable system/<label> with an argument list
 # it builds from its own literals plus that label. It never passes the caller's arguments on, and
 # any other subcommand or shape exits non-zero having run nothing. The plugin runs no launchctl
-# bootstrap or bootout, so there is no line for them. A host provisioned before the helper existed
-# has none of this until the installer is re-run.
+# bootstrap or bootout, so there is no line for them. The installer writes the helper before this
+# file; a host without it is provisioned with this build's installer.
 $ACCOUNT_NAME ALL=(root) NOPASSWD: $SVC_HELPER_PATH
 
 # network_actions.flush_dns
@@ -565,8 +567,8 @@ EOF
 # run nothing. There is no iptables, ip6tables, iptables-save, iptables-restore or nft grant that
 # takes a file name or an argument pattern. A sudo regular expression could pin the arguments in
 # this file instead, but it needs sudo 1.9.10, which RHEL 8 and 9, Ubuntu 22.04 and earlier and
-# Debian 11 do not ship. A host provisioned before the helper existed has none of this until the
-# installer is re-run.
+# Debian 11 do not ship. The installer writes the helper before this file; a host without it is
+# provisioned with this build's installer.
 $ACCOUNT_NAME ALL=(root) NOPASSWD: $FW_HELPER_PATH
 
 # firewall plugin — nftables containment (own table inet yuzu_quarantine). The ruleset is loaded
@@ -582,8 +584,8 @@ $ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/nft list table inet yuzu_quarantine
 # - _ . @, 1 to 256 of them), and runs systemctl <verb> -- <unit> with an argument list it builds
 # from its own literals plus that name. It never passes the caller's arguments on, and any other
 # subcommand or shape exits non-zero having run nothing. A sudo regular expression could pin the
-# name in this file instead, but it needs sudo 1.9.10 (see the firewall note above). A host
-# provisioned before the helper existed has none of this until the installer is re-run.
+# name in this file instead, but it needs sudo 1.9.10 (see the firewall note above). The installer
+# writes the helper before this file; a host without it is provisioned with this build's installer.
 $ACCOUNT_NAME ALL=(root) NOPASSWD: $SVC_HELPER_PATH
 
 # network_actions.flush_dns
