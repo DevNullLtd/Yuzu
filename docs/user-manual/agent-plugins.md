@@ -9,7 +9,7 @@ Each plugin that has adopted the README standard (`docs/plugin-readme-standard.m
 The `echo` plugin was named `tar` before 2026-10 (`tar.dll`, `tar.so`, `tar.dylib`); there is no alias, and the agent rejects a leftover `tar` plugin file. See the Echo section of [Upgrading](upgrading.md).
 
 <!-- BEGIN GENERATED: plugin-doc-gen index -->
-72 of 72 plugins document themselves this way; the rest are described in the prose below until their README lands.
+73 of 73 plugins document themselves this way; the rest are described in the prose below until their README lands.
 
 | Plugin | Platforms | What it does | Docs |
 |---|---|---|---|
@@ -25,6 +25,7 @@ The `echo` plugin was named `tar` before 2026-10 (`tar.dll`, `tar.so`, `tar.dyli
 | `browser_policy` | 🟡 🟡 ✅ | Enterprise-managed Chrome, Chromium and Edge browser policy inventory | [README](../../agents/plugins/browser_policy/README.md) |
 | `certificates` | ✅ ✅ ✅ | Certificate inventory and management for system stores | [README](../../agents/plugins/certificates/README.md) |
 | `chargen` | ✅ ✅ ✅ | RFC 864 character generator — streams rotating ASCII lines | [README](../../agents/plugins/chargen/README.md) |
+| `component_inventory` | 🟡 ✅ ✅ | Installed software components found in application trees (Java archives) | [README](../../agents/plugins/component_inventory/README.md) |
 | `content_dist` | ✅ ✅ ✅ | Content staging — download, verify, execute, and manage staged files (no shell-out) | [README](../../agents/plugins/content_dist/README.md) |
 | `device_identity` | ✅ ✅ ✅ | Reports device hostname, domain membership, and AD organizational unit | [README](../../agents/plugins/device_identity/README.md) |
 | `diagnostics` | ✅ ✅ ✅ | Agent diagnostics — log level, certificates, connection info | [README](../../agents/plugins/diagnostics/README.md) |

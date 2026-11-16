@@ -1868,6 +1868,7 @@ ADR-0070 D5/R1: operators register third-party CRL sources through `/api/v1/cryp
 | msi_packages | Y | - | Y | Software |
 | pkg_inventory | Y | Y | Y | Software |
 | middleware | - | Y | - | Software |
+| component_inventory | - | Y | Y | Software |
 | windows_updates | Y | Y | Y | Patch |
 | software_actions | Y | Y | Y | Software |
 | sccm | Y | - | - | Software |
@@ -1916,7 +1917,7 @@ ADR-0070 D5/R1: operators register third-party CRL sources through `/api/v1/cryp
 | chargen | Y | Y | Y | Test/Debug |
 | example | Y | Y | Y | Test/Debug |
 
-**72 plugin directories: 70 production plugins plus the two test/debug plugins (`chargen`, `example`)**, which appear in the table but are excluded from the headline count (`ls -d agents/plugins/*/` = 72 at HEAD, 2026-11-16, after the earlier device-containment plugin was removed: containment is now the `firewall` plugin's four actions). Coverage spans hardware, peripherals, network, security posture, filesystem, registry, WMI, WiFi, WoL, IOC, device containment, certificates, content distribution, user interaction and more, across cross-platform and Windows-only plugins. Corrections in this pass: `pkg_inventory` Windows is supported (was shown `-`); constrained legs are now shown `🟡` instead of `Y`; and the former `software_usage` "planned" row is removed — usage metering shipped as `app_usage` (§27.2, §35.6). The previous recount history (51 → 71 between 2026-09-15 and 2026-11) is in git history.
+**73 plugin directories: 71 production plugins plus the two test/debug plugins (`chargen`, `example`)**, which appear in the table but are excluded from the headline count (`ls -d agents/plugins/*/` = 73 at HEAD, 2026-11-16, after the earlier device-containment plugin was removed: containment is now the `firewall` plugin's four actions). Coverage spans hardware, peripherals, network, security posture, filesystem, registry, WMI, WiFi, WoL, IOC, device containment, certificates, content distribution, user interaction and more, across cross-platform and Windows-only plugins. Corrections in this pass: `pkg_inventory` Windows is supported (was shown `-`); constrained legs are now shown `🟡` instead of `Y`; and the former `software_usage` "planned" row is removed — usage metering shipped as `app_usage` (§27.2, §35.6). The previous recount history (51 → 71 between 2026-09-15 and 2026-11) is in git history.
 ---
 
 ## Appendix B: Foundation Tier Status
