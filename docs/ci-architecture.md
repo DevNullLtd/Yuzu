@@ -2994,24 +2994,25 @@ collector's own `meson compile -j 2` finds nothing to do. Before this, that
 compile ran inside the slot at two jobs: across the 20 gcc-15 debug jobs of
 2026-11-15 and -16 the step took 6 to 50 min (slot wait included), and in one
 sampled run the build was 996 s and the six pilots ran in 26 s, all while
-holding one of the three slots the Linux test step also needs. A compile
-error in the precompile is a warning only: the collector repeats the build
-and records the failure in its evidence. A precompile that runs past the
-job's 90-minute limit cancels the job, which uploads no bundle, as a slow
-collector build could before. The Configure step sets `CCACHE_NOHASHDIR=1`
-for this leg only: ccache otherwise hashes the working directory for a `-g`
-compile, so the contract build directory never reused the standard build's
-objects (the two directories' compile commands are identical). The cost is
-debug info only: an object's recorded compile directory may name the other
-build directory, or, for a source compiled with no workspace-specific flag,
-another runner's workspace, and nothing in this leg reads it. The step prints the precompile's wall time with its own ccache hit and
-miss counts (from a per-step stats log, since the cache's global counters mix
-all four runners), and the collector's time including its slot wait. The
-contract build's compiles, previously ccache misses, now mostly hit, so the
-job's overall ccache hit rate is not comparable with earlier runs. The first gcc-15 debug run on each runner after
-this change rebuilds that leg cold once, because the cache keys change (most
-sources are compiled with include paths that name the runner's own workspace,
-so the runners share few of these entries).
+holding one of the three slots the Linux test step also needs. A compile error
+in the precompile is a warning only: the collector repeats the build and
+records the failure in its evidence. A precompile that runs past the job's
+90-minute limit cancels the job, which uploads no bundle, as a slow collector
+build could before. The Configure step sets `CCACHE_NOHASHDIR=1` for this leg
+only: ccache otherwise hashes the working directory for a `-g` compile, so the
+contract build directory never reused the standard build's objects (the two
+directories' compile commands are identical). The cost is debug info only: an
+object's recorded compile directory may name the other build directory, or,
+for a source compiled with no workspace-specific flag, another runner's
+workspace, and nothing in this leg reads it. The step prints the precompile's
+wall time with its own ccache hit and miss counts (from a per-step stats log,
+since the cache's global counters mix all four runners), and the collector's
+time including its slot wait. The contract build's compiles, previously ccache
+misses, now mostly hit, so the job's overall ccache hit rate is not comparable
+with earlier runs. The first gcc-15 debug run on each runner after this change
+rebuilds that leg cold once, because the cache keys change (most sources are
+compiled with include paths that name the runner's own workspace, so the
+runners share few of these entries).
 
 ### Persistent runner-local test history
 
