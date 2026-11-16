@@ -1656,34 +1656,40 @@ std::expected<bool, std::string> AuthManager::revoke_elevation(const std::string
         const std::string key = hash_token(token);
         // Determine "was elevated" from authoritative state (cache-first), then
         // clear durably. was_elevated distinguishes a real step-down from a
-        // no-op for the route's audit.
+        // no-op for the route's audit. The CLEAR is the fail-closed action and
+        // does not depend on the read: elevate_session drops the cached entry
+        // after its durable write, so this read is usually cache-cold, and a
+        // degraded find must not stop the clear (the /elevate audit-failure
+        // rollback would otherwise leave a live, unrecorded elevation).
         std::optional<Session> s;
         {
             std::shared_lock lock(mu_);
             if (auto it = sessions_.find(key); it != sessions_.end())
                 s = it->second;
         }
+        std::optional<std::string> find_error; // set when the authoritative read degraded
         if (!s) {
             auto found = session_store_->find(key);
             if (!found) {
-                // Degraded authoritative read — cannot tell if an elevation is
-                // live. Fail closed: do NOT report a successful no-op over a
-                // possibly-live durable elevation (adversarial C2).
                 note_session_store_degrade("validate");
-                return std::unexpected(std::string("session lookup degraded: ") +
-                                       found.error().message);
-            }
-            if (!found->has_value())
+                find_error = found.error().message;
+            } else if (!found->has_value()) {
                 return false; // definitively no such session → genuine no-op
-            s = session_from_row(found->value().row, found->value().db_now_ms);
+            } else {
+                s = session_from_row(found->value().row, found->value().db_now_ms);
+            }
         }
-        const bool was_elevated = is_elevated(*s);
+        const bool was_elevated = s && is_elevated(*s);
         auto r = session_store_->clear_elevation(key);
         if (!r) {
             spdlog::error("revoke_elevation: durable clear failed ({})", r.error().message);
             note_session_store_degrade("invalidate_user");
-            // The durable elevation is STILL LIVE — surface the failure so the
-            // route fails closed instead of auditing a false revocation.
+            // The durable elevation is STILL LIVE (or, with a degraded read too, cannot be
+            // ruled out) - surface the failure so the route fails closed instead of auditing
+            // a false revocation.
+            if (find_error)
+                return std::unexpected("session lookup degraded: " + *find_error +
+                                       "; durable clear also failed: " + r.error().message);
             return std::unexpected(std::string("durable clear failed: ") + r.error().message);
         }
         std::unique_lock lock(mu_);
@@ -1692,7 +1698,10 @@ std::expected<bool, std::string> AuthManager::revoke_elevation(const std::string
             it->second.elevation_issued_at = {};
             it->second.steady_elevated_until = {}; // the field is_elevated reads
         }
-        return was_elevated;
+        // With a degraded read was_elevated is UNKNOWN: the clear succeeded, so any elevation
+        // is definitively gone, and the answer is whether a row existed (true = "an elevation,
+        // if there was one, has been ended"; never a false "nothing was elevated").
+        return find_error ? *r : was_elevated;
     }
     std::unique_lock lock(mu_);
     auto it = sessions_.find(token);
@@ -1830,6 +1839,11 @@ void AuthManager::lapse_elevation_for_test(const std::string& token,
 void AuthManager::expire_session_generation_poll_for_test() {
     std::lock_guard<std::mutex> g(session_gen_mtx_);
     last_session_gen_refresh_ms_ = steady_now_ms() - kSessionGenRefreshMs - 1;
+}
+
+void AuthManager::suppress_session_generation_poll_for_test() {
+    std::lock_guard<std::mutex> g(session_gen_mtx_);
+    last_session_gen_refresh_ms_ = steady_now_ms() + 3'600'000;
 }
 
 void AuthManager::age_session_generation_refresh_for_test(std::chrono::milliseconds age) {

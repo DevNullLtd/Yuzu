@@ -909,7 +909,10 @@ public:
     /// no-op). Returns `unexpected` ONLY when a durable `SessionStore` clear
     /// FAILED — the route MUST fail closed there (the elevation is still live
     /// durably; reporting success would falsely tell an incident responder the
-    /// admin was revoked, governance-missed / adversarial C2). Store-less
+    /// admin was revoked, governance-missed / adversarial C2). The clear is
+    /// attempted even when the pre-clear session read is degraded; if that clear
+    /// succeeds the value is true when a session row existed (was_elevated is
+    /// then UNKNOWN: an elevation, if there was one, has been ended). Store-less
     /// (legacy) mode never errors.
     [[nodiscard]] std::expected<bool, std::string> revoke_elevation(const std::string& token);
 
@@ -984,6 +987,13 @@ public:
     /// interval (#6079). Does not touch the cached generation or the stale-serve
     /// anchor. Production code MUST NOT call this.
     void expire_session_generation_poll_for_test();
+
+    /// TEST-ONLY: the opposite of `expire_session_generation_poll_for_test`: suppress the
+    /// session generation poll (for an hour of steady time) so a test can assert that a cached
+    /// entry is still served without a slow runner's real ~1 s poll falsifying the assertion.
+    /// `expire_session_generation_poll_for_test` (or `poll_and_validate`) lifts it. Does not
+    /// touch the cached generation or the stale-serve anchor. Production code MUST NOT call this.
+    void suppress_session_generation_poll_for_test();
 
     /// TEST-ONLY: age the last SUCCESSFUL session-generation refresh by `age`, so the
     /// stale-serve bound (`kSessionGenStaleServeBoundMs`) can be crossed without waiting it

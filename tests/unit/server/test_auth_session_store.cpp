@@ -21,6 +21,7 @@
 #include "rbac_store.hpp"
 #include "session_store.hpp"
 #include "test_rbac_store_pg_helper.hpp" // RbacStorePg — RbacStore is PG-only (ADR-0041)
+#include "test_principal_lock_gate.hpp" // SqlFault / SessionWipeFault (real, RAII-scoped faults)
 #include "test_route_sink.hpp" // in-process HttpRouteSink (no socket — TSan-safe, #438)
 
 #include "../test_helpers.hpp"
@@ -366,6 +367,100 @@ TEST_CASE("AuthManager+SessionStore: a durable-clear failure fails revoke CLOSED
     // revoke_user_elevations likewise surfaces the failure, not a false "0 cleared".
     auto rvu = a->revoke_user_elevations("jack");
     CHECK_FALSE(rvu.has_value());
+}
+
+// ── revoke_elevation after elevate_session (the cache is cold: adb-1) ───────────────────────
+
+namespace {
+// Fails `SessionStore::find` (its SELECT names display_name) but not `clear_elevation`, whose
+// UPDATE and generation bump never touch that column: the "degraded read, working write" fault.
+class SessionReadFault : public yuzu::test::SqlFault {
+public:
+    explicit SessionReadFault(PgPool& pool)
+        : SqlFault(pool,
+                   "ALTER TABLE session_store.sessions RENAME COLUMN display_name TO display_name_gone",
+                   "ALTER TABLE session_store.sessions RENAME COLUMN display_name_gone TO "
+                   "display_name") {}
+};
+} // namespace
+
+TEST_CASE("AuthManager+SessionStore: revoke_elevation after elevate_session still clears when the "
+          "durable find is degraded (adb-1)",
+          "[auth][session_store][pg][jit]") {
+    // elevate_session drops the cached entry, so the /elevate audit-failure rollback calls
+    // revoke_elevation cache-cold. A failing find must not stop the CLEAR: otherwise the
+    // elevation stays live and unrecorded.
+    YUZU_REQUIRE_PG_DB_TPL(db, authsess_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    SessionStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto a = make_mgr(store);
+    auto token = a->create_local_session_for_test("lena", Role::user, /*mfa_verified=*/true);
+    REQUIRE_FALSE(token.empty());
+    REQUIRE(a->elevate_session(token, std::chrono::seconds(120)).has_value()); // cache now cold
+
+    SessionReadFault read_fault{pool};
+    read_fault.arm();
+    // The fault does what it claims: the read fails, so the old code returned before the clear.
+    REQUIRE_FALSE(store.find(AuthManager::sha256_hex(token)).has_value());
+
+    const auto rev = a->revoke_elevation(token);
+    read_fault.repair();
+
+    REQUIRE(rev.has_value()); // the clear succeeded, so success even with the read degraded
+    CHECK(*rev);              // was_elevated unknown: reported true because a row existed
+    auto b = make_mgr(store); // a fresh replica reads the durable row
+    const auto s = b->validate_session(token);
+    REQUIRE(s.has_value());
+    CHECK_FALSE(is_elevated(*s)); // the durable elevation is gone
+    CHECK(effective_role(*s) == Role::user);
+}
+
+TEST_CASE("AuthManager+SessionStore: revoke_elevation with BOTH the find and the clear failing "
+          "fails closed and leaves the elevation live (adb-1)",
+          "[auth][session_store][pg][jit]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, authsess_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    SessionStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto a = make_mgr(store);
+    auto token = a->create_local_session_for_test("mona", Role::user, /*mfa_verified=*/true);
+    REQUIRE(a->elevate_session(token, std::chrono::seconds(120)).has_value()); // cache now cold
+
+    yuzu::test::SessionWipeFault both_fault{pool}; // the table is gone: find AND clear fail
+    both_fault.arm();
+    const auto rev = a->revoke_elevation(token);
+    both_fault.repair();
+
+    REQUIRE_FALSE(rev.has_value());
+    CHECK(rev.error().find("session lookup degraded") != std::string::npos);
+    CHECK(rev.error().find("durable clear also failed") != std::string::npos);
+    auto b = make_mgr(store);
+    const auto s = b->validate_session(token);
+    REQUIRE(s.has_value());
+    CHECK(is_elevated(*s)); // still live durably: the caller must see the failure
+}
+
+TEST_CASE("AuthManager+SessionStore: revoke_elevation after elevate_session reports was_elevated "
+          "from the durable read when it works (adb-1)",
+          "[auth][session_store][pg][jit]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, authsess_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    SessionStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto a = make_mgr(store);
+    auto token = a->create_local_session_for_test("nora", Role::user, /*mfa_verified=*/true);
+    REQUIRE(a->elevate_session(token, std::chrono::seconds(120)).has_value()); // cache now cold
+
+    const auto first = a->revoke_elevation(token);
+    REQUIRE(first.has_value());
+    CHECK(*first); // a real step-down
+    const auto second = a->revoke_elevation(token);
+    REQUIRE(second.has_value());
+    CHECK_FALSE(*second); // nothing left to step down from
 }
 
 TEST_CASE("AuthManager+SessionStore: a failed single-session invalidate reports db_persisted=false",

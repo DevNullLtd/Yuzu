@@ -1259,6 +1259,10 @@ TEST_CASE("unassign Administrator: the unassigning replica drops the elevation o
           "request, the other replica after one poll (S10-C1)",
           "[auth][session_store][account_active][pg][unassign_elevation]") {
     UnassignWorld w;
+    // No real poll may run before the staleness assertions: A's drop must come from the callback
+    // alone and B's staleness must not depend on how fast this runner is (qa-4).
+    w.a.suppress_session_generation_poll_for_test();
+    w.b.suppress_session_generation_poll_for_test();
 
     const auto res = w.f.rbac.unassign_role_detailed("user", "s10c_x", "Administrator");
     REQUIRE(res.has_value());
@@ -1290,6 +1294,7 @@ TEST_CASE("unassign Administrator: without the callback only the generation poll
           "(the wiring is what makes the unassigning replica immediate) (S10-C2)",
           "[auth][session_store][account_active][pg][unassign_elevation]") {
     UnassignWorld w(/*wire_callback=*/false);
+    w.a.suppress_session_generation_poll_for_test(); // staleness must not race a real poll (qa-4)
     REQUIRE(w.f.rbac.unassign_role_detailed("user", "s10c_x", "Administrator").has_value());
 
     CHECK(w.elevated(w.a)); // stale warm cache: the baseline the callback exists to remove
@@ -1367,6 +1372,7 @@ TEST_CASE("unassign Administrator: a real AuthRoutes admin gate admits the eleva
         CHECK(before->status != 401);
     }
 
+    w.a.suppress_session_generation_poll_for_test(); // only the callback may drop A (qa-4)
     REQUIRE(w.f.rbac.unassign_role_detailed("user", "s10c_x", "Administrator").has_value());
 
     const auto after = call();
@@ -1462,9 +1468,12 @@ TEST_CASE("an elevation write that stalls across an Administrator unassign does 
           "elevation in the repopulated cache (S10-D1)",
           "[auth][session_store][account_active][cache_epoch][pg][unassign_elevation]") {
     UnassignWorld w;
+    // Declared BEFORE `parked`: the worker writes into it by reference and ~ParkedWriter joins
+    // the worker, so it must outlive `parked` on every unwind path (a failed REQUIRE included).
+    std::optional<std::chrono::system_clock::time_point> until;
     ParkedWriter parked;
     parked.install(w.a, "elevate");
-    std::optional<std::chrono::system_clock::time_point> until;
+    w.a.suppress_session_generation_poll_for_test(); // a real poll would mask a resurrection (qa-4)
     parked.start([&] { until = w.a.elevate_session(w.token, std::chrono::seconds(300)); });
 
     // The writer's durable grant has committed and it is parked before touching the cache. Now the
@@ -1497,9 +1506,12 @@ TEST_CASE("an MFA stamp that stalls across an Administrator unassign does not re
           "elevation in the repopulated cache, and the proof is read from durable state (S10-D2)",
           "[auth][session_store][account_active][cache_epoch][pg][unassign_elevation]") {
     UnassignWorld w;
+    // Declared BEFORE `parked`: see S10-D1 (the worker's by-reference write target must outlive
+    // the join in ~ParkedWriter).
+    auto outcome = AuthManager::MfaStampOutcome::kStoreError;
     ParkedWriter parked;
     parked.install(w.a, "mfa_stamp");
-    auto outcome = AuthManager::MfaStampOutcome::kStoreError;
+    w.a.suppress_session_generation_poll_for_test(); // a real poll would mask a resurrection (qa-4)
     parked.start([&] {
         outcome = w.a.stamp_session_mfa_proof(
             w.token, yuzu::server::LocalMfaProof{0, wall_ms_minus(std::chrono::seconds(5))});
