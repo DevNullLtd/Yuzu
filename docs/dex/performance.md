@@ -113,11 +113,14 @@ route or MCP tool. The retained per-device history is covered in
 |---|---|---|
 | Fleet, cohorts, cohort comparison | `GuaranteedState:Read` | Not audited. They are machine-health aggregates. |
 | Device lists | `GuaranteedState:Read` | `dex.perf.device.view`. REST refuses to answer if the row cannot be stored. |
-| Per-device performance panel | `GuaranteedState:Read` and `Execution:Execute` | `dex.device.perf.query` |
+| Per-device performance panel | `GuaranteedState:Read` and `Execution:Execute`, both scoped to the device | `dex.device.perf.query` |
 
 A grant scoped to one management group does not pass the aggregate reads. A
-service-scoped token is refused on every read on this page. See
-[surfaces](surfaces.md#the-rest-api).
+service-scoped token is refused on the fleet, cohort, cohort comparison and
+device-list reads. The per-device performance panel follows the per-device rule
+instead: it accepts such a token only for a device tagged with its own service,
+with RBAC enforcement on, and then runs its read-only Echo query on that one
+device. See [surfaces](surfaces.md#the-rest-api).
 
 ## Limits and privacy
 

@@ -74,11 +74,18 @@ per-device app-usage route (see the map below). Conventions:
   `/api/v1/dex/devices/{id}` accept it only for a device tagged with its own
   service. `GET /api/v1/dex/perf/app/devices` answers with only the devices the
   token can see. Both kinds need RBAC enforcement to be on and the service
-  owner role to hold the permission. Every other route is refused, aggregates included,
-  and so is the per-device app-usage route, because the service owner role does
-  not hold `Forensics:Read`. Every refusal is audited: the routes that name
-  devices fleet-wide record it under their own verb with the result `denied`,
-  and the rest under the standard permission-denied row.
+  owner role to hold the permission. Every other route is refused, aggregates
+  included, and so is the per-device app-usage route, because the service owner
+  role does not hold `Forensics:Read`. Every refusal is audited. The overview,
+  the signal and application drill-downs, the performance and network device
+  lists, the group and tag trends and the version comparison record it under
+  their own verb with the result `denied`. Every other refused route records
+  the standard permission-denied row. The dashboard's fragments make the same
+  checks, and the version drill uses the same gate as its route, so a
+  service-scoped token gets no fleet-wide data there either. The per-device
+  panels (device history, one observation, live performance, Top applications
+  and application history) follow the per-device rule. The Application usage
+  panel shows a permission note instead of an error.
 - **Management-group grants.** A grant scoped to a management group alone does
   not pass the aggregate reads, which need a global `GuaranteedState:Read`. It
   does pass the per-device reads for devices in the group.
@@ -143,7 +150,10 @@ the [MCP guide](../user-manual/mcp.md); where this table and those pages
 disagree, they win. See [contributing](contributing.md) for the rule.
 
 Every route listed here is under `/api/v1`. "Read" means
-`GuaranteedState:Read` unless the row says otherwise. Unless a row says
+`GuaranteedState:Read` unless the row says otherwise. Audit statements describe
+the REST route and its MCP twin. The dashboard writes the same verb when it
+opens the same view, with two exceptions: the Overview and the application
+drill-down open without an audit row. Unless a row says
 otherwise, a service-scoped token is refused on the route and on the tool in
 the same row; see the service-scoped rule under
 [the REST API](#the-rest-api). Network discovery (the
@@ -196,8 +206,8 @@ this map; see [network](network.md).
 | Applications with retained history | App Performance | `GET /api/v1/dex/perf/apps` | `list_dex_perf_apps` | Echo `procperf`, daily sync | Read; not audited | [app performance](app-performance.md) |
 | Fleet trend for one application | App Performance | `GET /api/v1/dex/perf/app` | `get_dex_app_perf` | Echo `procperf`, daily sync | Read; not audited | [app performance](app-performance.md) |
 | Devices behind one application version | App Performance, version drill | `GET /api/v1/dex/perf/app/devices` | `list_dex_app_perf_devices` | Echo `procperf`, daily sync | Fleet read, confined to visible devices; a service-scoped token gets only the devices it can see; audited `dex.app_perf.devices.view` | [app performance](app-performance.md) |
-| Trend for one management group | App Performance | `GET /api/v1/dex/perf/group` | `get_dex_group_app_perf` | Echo `procperf`, daily sync | Read | [app performance](app-performance.md) |
-| Trend for one device-tag cohort | App Performance | `GET /api/v1/dex/perf/tag` | `get_dex_tag_app_perf` | Echo `procperf`, daily sync | Read | [app performance](app-performance.md) |
+| Trend for one management group | App Performance | `GET /api/v1/dex/perf/group` | `get_dex_group_app_perf` | Echo `procperf`, daily sync | Read; not audited on success | [app performance](app-performance.md) |
+| Trend for one device-tag cohort | App Performance | `GET /api/v1/dex/perf/tag` | `get_dex_tag_app_perf` | Echo `procperf`, daily sync | Read; not audited on success | [app performance](app-performance.md) |
 | One device's retained per-application history | Device drill | `GET /api/v1/dex/devices/{id}/app-perf` | `get_dex_device_app_perf` | Echo `procperf`, daily sync | Read, scoped to the device; a service-scoped token reaches only devices tagged with its own service; audited `dex.device.app_perf.view` | [app performance](app-performance.md) |
 | Before and after comparison of two versions | None | `GET /api/v1/dex/perf/compare` | `compare_app_perf_versions` | Echo `procperf`, daily sync | Read; audited `dex.app_perf.compare` | [app performance](app-performance.md) |
 

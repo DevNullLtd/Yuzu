@@ -133,7 +133,7 @@ repeat the same call with the approval id.
 | Action | Permission | Audit |
 |---|---|---|
 | View the Apps list | `GuaranteedState:Read` | Not audited. It is an aggregate with no device identity. |
-| Open one application | `GuaranteedState:Read` | `dex.app.view`. REST refuses to answer if the row cannot be stored. |
+| Open one application | `GuaranteedState:Read` | `dex.app.view` on REST and MCP; the dashboard drill-down writes no row. REST refuses to answer if the row cannot be stored. |
 | Read the policy | `GuaranteedState:Read` (held outright) | Not audited. |
 | Edit or reset the policy | `Infrastructure:Write` on REST and the Scoring tab; the tab also needs Read | `dex.score_policy.update`, `dex.score_policy.reset`, and `dex.score_policy.validate` for a dry run. A real write records an attempted row first and fails closed if it cannot be stored. |
 
@@ -145,7 +145,7 @@ refused on every read and write on this page. See
 ## Limits and privacy
 
 - The Apps list carries no device identity. The application drill-down names
-  devices, which is why it is audited.
+  devices, which is why the REST and MCP reads are audited.
 - The score is not a verdict. A score of Poor on a few devices is a flag to
   look, not a finding.
 - The stored policy has no history. To go back, save the earlier document

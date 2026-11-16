@@ -102,8 +102,9 @@ Full shapes: [REST reference](../user-manual/rest-api.md#dex-digital-employee-ex
 | Overview (REST, MCP) | `GuaranteedState:Read` | `dex.overview.view`. REST refuses to answer if the row cannot be stored. |
 | Health score, Trends | `GuaranteedState:Read` | Not audited. They carry no device identity. |
 
-The Overview is audited because its top-devices list names devices. A
-service-scoped token is refused on all three reads. See
+The Overview is audited on REST and MCP because its top-devices list names
+devices; the dashboard Overview opens without an audit row. A service-scoped
+token is refused on all three reads. See
 [surfaces](surfaces.md#the-rest-api).
 
 ## Limits and privacy

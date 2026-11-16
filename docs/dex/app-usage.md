@@ -80,11 +80,12 @@ Read the health row of `summary` before treating a result as complete.
 
 | Surface | Permission | Audit |
 |---|---|---|
-| REST route, MCP tool, dashboard panel | `Forensics:Read`, scoped to the device. Administrator and ForensicsAnalyst hold it by default. | `app_usage.agent.view`, written before any data is served. If the row cannot be stored the read fails closed, on REST (`503` with `Sec-Audit-Failed: true`) and on MCP. |
+| REST route, MCP tool, dashboard panel | `Forensics:Read`, scoped to the device. Administrator and ForensicsAnalyst hold it by default. | `app_usage.agent.view`, written before any data is served. If the row cannot be stored the read fails closed: REST answers `503` with `Sec-Audit-Failed: true`, MCP answers with an error and no data, and the dashboard panel shows a note instead of the figures. |
 | `app_usage` plugin actions | `Forensics:Read`, administrator or approval | Standard command audit |
 
-A service-scoped token is refused, because the service owner role does not hold
-`Forensics:Read`.
+A service-scoped token is refused on the REST route and the MCP tool, and the
+dashboard panel shows a permission note instead of data, because the service
+owner role does not hold `Forensics:Read`.
 
 ## Limits and privacy
 
