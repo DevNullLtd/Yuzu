@@ -29757,7 +29757,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // zero administrators (a business-rule conflict, not a store
                 // fault) — is_rbac_last_admin_refusal distinguishes them so
                 // only the genuine fault carries a retry hint.
-                auto result = rbac_store->unassign_role("user", principal_id, role_id);
+                auto result = rbac_store->unassign_role_detailed("user", principal_id, role_id);
                 if (!result) {
                     (void)audit_fn(req, "rbac.role.unassigned", "denied", "User", audit_target_id,
                                    result.error());
@@ -29787,9 +29787,24 @@ McpServer::HandlerFn McpServer::build_handler(
                 // removed=<bool> (governance SHOULD #10) lets an auditor
                 // tell an actual revoke apart from an idempotent no-op from
                 // the log alone.
+                //
+                // PR-S10: an Administrator unassign that ended live elevations says so on this
+                // row (suffix) and on one dedicated `role.elevation.revoked` row, both only when
+                // N > 0 and both attempted even if the first fails. Either failing takes the same
+                // 503 as the success row alone always did: the removal and the clear are already
+                // committed, so it reports the audit gap, never a failed removal. The response
+                // payload is unchanged.
+                const int cleared = result->elevations_cleared;
                 bool audit_ok = yuzu::server::detail::try_persist_audit(
                     audit_fn, req, "rbac.role.unassigned", "success", "User", audit_target_id,
-                    audit_role + "; removed=" + (*result ? "true" : "false"));
+                    audit_role + "; removed=" + (result->removed ? "true" : "false") +
+                        unassign_elevations_cleared_suffix(cleared));
+                if (cleared > 0) {
+                    const bool revoked_ok = yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, std::string(kElevationRevokedAuditAction), "ok", "User",
+                        audit_target_id, unassign_elevation_revoked_detail(cleared, audit_role));
+                    audit_ok = audit_ok && revoked_ok;
+                }
                 if (!audit_ok) {
                     mcp_audit("error", "audit_persist_failed");
                     res.set_content(

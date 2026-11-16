@@ -1,5 +1,6 @@
 #pragma once
 
+#include <string>
 #include <string_view>
 
 #include "rbac_admin_hint.hpp"
@@ -415,6 +416,25 @@ inline constexpr std::string_view kRbacAdminGateUnavailableAuditReason =
 /// checks degraded. EXTEND this, never fork a second copy.
 inline constexpr std::string_view kRbacRegimeAuthorityUnavailableAuditReason =
     "RBAC regime-authority check could not confirm authority — store degraded";
+
+/// PR-S10: removing a user's `Administrator` grant ends that user's live JIT elevation inside the
+/// unassign transaction (`RbacStore::unassign_role_detailed`). The REST route and its MCP twin
+/// report it the same two ways, from these shared helpers so the wording cannot drift: a
+/// ` elevations_cleared=N` suffix on the `rbac.role.unassigned` success row, and ONE dedicated
+/// `role.elevation.revoked` row (the verb the self-service `POST /api/v1/elevate/revoke` already
+/// writes; `reason=administrator_unassign` tells the two apart). Both only when N > 0. EXTEND
+/// these, never fork a second copy.
+inline constexpr std::string_view kElevationRevokedAuditAction = "role.elevation.revoked";
+[[nodiscard]] inline std::string unassign_elevations_cleared_suffix(int cleared) {
+    return cleared > 0 ? " elevations_cleared=" + std::to_string(cleared) : std::string{};
+}
+/// `audit_role` is caller-controlled text on the MCP surface and MUST already have been through
+/// `audit_token` (CWE-117); the count is ours.
+[[nodiscard]] inline std::string unassign_elevation_revoked_detail(int cleared,
+                                                                   std::string_view audit_role) {
+    return "reason=administrator_unassign cleared=" + std::to_string(cleared) +
+           " role=" + std::string(audit_role);
+}
 
 /// Shared control-flow chokepoint for the two non-admit `RbacAdminGate`
 /// outcomes. Returns `true` (having already invoked exactly one of

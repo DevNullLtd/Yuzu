@@ -9194,7 +9194,7 @@ void RestApiV1::register_routes(
             // URL-path-captured groups (`[A-Za-z0-9._-]+`), so both are
             // already regex-charset-safe by construction — no audit_token
             // needed on this transport (unlike POST's JSON-body fields).
-            auto result = rbac_store->unassign_role("user", principal_id, role_name);
+            auto result = rbac_store->unassign_role_detailed("user", principal_id, role_name);
             if (!result) {
                 const bool last_admin = is_rbac_last_admin_refusal(result.error());
                 if (last_admin && metrics_registry)
@@ -9231,9 +9231,24 @@ void RestApiV1::register_routes(
             // not audited. `removed=<bool>` (governance SHOULD #10) lets an
             // auditor tell an actual revoke apart from an idempotent no-op
             // (the principal never held the role) from the log alone.
-            if (!detail::emit_behavioral_audit(
-                    audit_fn, req, res, "rbac.role.unassigned", "success", "User", principal_id,
-                    role_name + "; removed=" + (*result ? "true" : "false"))) {
+            // PR-S10: an Administrator unassign that ended live elevations says so on this row
+            // (suffix) and on one dedicated `role.elevation.revoked` row, both only when N > 0.
+            // Both rows are attempted even if the first fails, and either failing takes the SAME
+            // 503 below: the removal and the clear are already committed, so that 503 reports the
+            // audit gap and never a failed removal. The response body is unchanged.
+            const int cleared = result->elevations_cleared;
+            bool audit_ok = detail::emit_behavioral_audit(
+                audit_fn, req, res, "rbac.role.unassigned", "success", "User", principal_id,
+                role_name + "; removed=" + (result->removed ? "true" : "false") +
+                    unassign_elevations_cleared_suffix(cleared));
+            if (cleared > 0) {
+                const bool revoked_ok = detail::emit_behavioral_audit(
+                    audit_fn, req, res, std::string(kElevationRevokedAuditAction), "ok", "User",
+                    audit_token(principal_id),
+                    unassign_elevation_revoked_detail(cleared, audit_token(role_name)));
+                audit_ok = audit_ok && revoked_ok;
+            }
+            if (!audit_ok) {
                 res.status = 503;
                 res.set_content(
                     detail::a4_error(res,
