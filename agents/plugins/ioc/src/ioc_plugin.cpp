@@ -597,6 +597,18 @@ void check_ip_addresses(yuzu::CommandContext& ctx, const std::vector<std::string
 }
 
 void check_domains(yuzu::CommandContext& ctx, const std::vector<std::string>& domains) {
+#ifndef _WIN32
+    // On Linux/macOS, DNS caching varies widely (systemd-resolved,
+    // dnsmasq, mDNSResponder). Check /etc/hosts as a basic fallback,
+    // read once for all domains.
+    std::vector<std::string> host_lines;
+    {
+        std::ifstream hosts("/etc/hosts");
+        std::string line;
+        while (std::getline(hosts, line))
+            host_lines.push_back(std::move(line));
+    }
+#endif
     for (const auto& domain : domains) {
 #ifdef _WIN32
         bool found = check_dns_cache(domain);
@@ -604,20 +616,9 @@ void check_domains(yuzu::CommandContext& ctx, const std::vector<std::string>& do
         ctx.write_output(std::format("domain|{}|{}|{}", escape_pipes(domain),
                                      found ? "true" : "false", escape_pipes(detail)));
 #else
-        // On Linux/macOS, DNS caching varies widely (systemd-resolved,
-        // dnsmasq, mDNSResponder). Check /etc/hosts as a basic fallback.
-        std::vector<std::string> host_lines;
-        {
-            std::ifstream hosts("/etc/hosts");
-            std::string line;
-            while (std::getline(hosts, line))
-                host_lines.push_back(std::move(line));
-        }
         const bool found = yuzu::ioc::hosts_contains_domain(host_lines, domain);
-        std::string detail = found ? "Found in /etc/hosts" : "";
-        if (!found)
-            detail = "Not found in /etc/hosts (DNS cache not available)";
-
+        const std::string detail =
+            found ? "Found in /etc/hosts" : "Not found in /etc/hosts (DNS cache not available)";
         ctx.write_output(std::format("domain|{}|{}|{}", escape_pipes(domain),
                                      found ? "true" : "false", escape_pipes(detail)));
 #endif

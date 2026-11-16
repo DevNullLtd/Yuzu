@@ -7,6 +7,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <string>
+#include <string_view>
 #include <vector>
 
 using yuzu::ioc::hosts_contains_domain;
@@ -28,6 +29,11 @@ TEST_CASE("ioc hosts: an alias in a later column is found", "[ioc]") {
 TEST_CASE("ioc hosts: the match ignores ASCII case and one trailing dot", "[ioc]") {
     CHECK(has({"10.0.0.5 Bad.Example.Test."}, "bad.example.test"));
     CHECK(has({"10.0.0.5 bad.example.test"}, "BAD.example.test."));
+}
+
+TEST_CASE("ioc hosts: only one trailing dot is ignored", "[ioc]") {
+    CHECK_FALSE(has({"10.0.0.5 bad.example.test.."}, "bad.example.test"));
+    CHECK_FALSE(has({"10.0.0.5 bad.example.test"}, "bad.example.test.."));
 }
 
 TEST_CASE("ioc hosts: a longer hostname containing the domain is not a match", "[ioc]") {

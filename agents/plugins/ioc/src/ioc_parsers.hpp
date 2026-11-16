@@ -9,6 +9,7 @@
 
 #include <user_profile_model.hpp>
 
+#include <cstddef>
 #include <span>
 #include <string>
 #include <string_view>

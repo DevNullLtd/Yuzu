@@ -13,7 +13,7 @@ metadata:
     Check one or more Indicators of Compromise against the local endpoint
     state. Supports five IOC types: IP addresses (checked against active
     connections — TCP and UDP on Windows and macOS, TCP only on Linux),
-    domains (checked against the DNS resolver cache on Windows, or a
+    domains (checked against the DNS resolver cache on Windows, or an
     exact hostname or alias match against /etc/hosts on Linux/macOS), file hashes
     (SHA-256 compared against specified file paths), file paths (existence
     and size), and ports (checked against the same connection table as IP
