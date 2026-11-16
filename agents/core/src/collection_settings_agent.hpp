@@ -266,30 +266,28 @@ parse_settings_command(const Params& params) {
 struct SettingsHooks {
     /// Write one KV value; false = the write failed.
     std::function<bool(std::string_view key, std::string_view value)> persist;
-    /// Make the validated, persisted settings live (scheduler cadence, collector switches, the
-    /// applied-state the heartbeat tag reads). Must not throw and must not force a sync.
+    /// Make the validated, persisted settings live (collector switches, the applied-state the
+    /// heartbeat tag reads, and the scheduler cadence when a scheduler exists). Must not throw and
+    /// must not force a sync.
     std::function<void(const AgentCollectionSettings&)> apply;
 };
 
 /// Decide the reply to a `__sync__` `settings` command.
 ///   parse failure           -> FAILURE exit 2, the reason, nothing changed
-///   daily-sync not running  -> FAILURE exit 1, nothing changed
 ///   a KV write fails        -> FAILURE exit 1, the previous settings stay live
 ///   otherwise               -> SUCCESS `applied|<version>`
+/// Whether a daily-sync scheduler is running is not an input: a valid command is always
+/// persisted, held and reported (under --inventory-disable, or before the scheduler of a new
+/// connection is published), and the scheduler built later starts on the held settings. A
+/// refusal there would leave the tag at `none` and the server re-sending for good.
 /// The document is written before the version, so a crash between them leaves a pair whose hash
 /// does not match; load_stored_settings() discards it and the tag reads `none`.
 template <class Params>
-[[nodiscard]] SyncNowDecision decide_sync_settings(const Params& params, bool inventory_disable,
-                                                   bool scheduler_running,
+[[nodiscard]] SyncNowDecision decide_sync_settings(const Params& params,
                                                    const SettingsHooks& hooks) {
     auto parsed = parse_settings_command(params);
     if (!parsed)
         return {SyncNowDecision::Status::Failure, 2, "invalid settings: " + parsed.error()};
-    if (!scheduler_running) {
-        return {SyncNowDecision::Status::Failure, 1,
-                inventory_disable ? "daily-sync disabled (--inventory-disable)"
-                                  : "daily-sync not running (not connected)"};
-    }
     const std::string document{params.find("document")->second};
     if (!hooks.persist(kSettingsKvDocumentKey, document))
         return {SyncNowDecision::Status::Failure, 1, "could not persist settings.document"};

@@ -86,9 +86,7 @@ struct Rig {
                     ++applies;
                 }};
     }
-    SyncNowDecision run(const Params& p, bool running = true, bool inventory_disable = false) {
-        return decide_sync_settings(p, inventory_disable, running, hooks());
-    }
+    SyncNowDecision run(const Params& p) { return decide_sync_settings(p, hooks()); }
 };
 
 } // namespace
@@ -378,19 +376,39 @@ TEST_CASE("settings: a KV write failure is FAILURE exit 1 and the previous setti
     }
 }
 
-TEST_CASE("settings: with no scheduler running the command fails exit 1 and changes nothing",
+// No scheduler is not an input of the decision (--inventory-disable, or the sync thread of a new
+// connection has not published one): the hooks here reach no scheduler at all, and the command is
+// still persisted, held and reported. A refusal would leave the tag at `none` and the server
+// re-sending every re-push gap for the life of the agent.
+TEST_CASE("settings: with no scheduler a valid command is still persisted, held and reported",
           "[collection_settings]") {
-    Rig r;
-    const Params p{{"version", kVersionA}, {"document", kDocA}};
-    const auto not_connected = r.run(p, /*running=*/false);
-    CHECK(not_connected.status == SyncNowDecision::Status::Failure);
-    CHECK(not_connected.exit_code == 1);
-    CHECK(contains(not_connected.output, "not connected"));
-    const auto disabled = r.run(p, /*running=*/false, /*inventory_disable=*/true);
-    CHECK(disabled.exit_code == 1);
-    CHECK(contains(disabled.output, "--inventory-disable"));
-    CHECK(r.kv.writes.empty());
-    CHECK(r.applies == 0);
+    FakeKv kv;
+    std::optional<AgentCollectionSettings> held; // what agent.cpp keeps for the tag and the next scheduler
+    const SettingsHooks no_scheduler{
+        [&](std::string_view k, std::string_view v) { return kv.set(k, v); },
+        [&](const AgentCollectionSettings& s) { held = s; }};
+
+    const auto d =
+        decide_sync_settings(Params{{"version", kVersionA}, {"document", kDocA}}, no_scheduler);
+    CHECK(d.status == SyncNowDecision::Status::Success);
+    CHECK(d.exit_code == 0);
+    CHECK(d.output == "applied|" + kVersionA);
+    CHECK(kv.writes == std::vector<std::string>{"settings.document", "settings.version"});
+    CHECK(kv.data.at("settings.document") == kDocA);
+    CHECK(kv.data.at("settings.version") == kVersionA);
+    REQUIRE(held.has_value());
+
+    std::map<std::string, std::string> tags;
+    emit_settings_tags(tags, held);
+    CHECK(tags.at("yuzu.inv_settings_version") == kVersionA);
+
+    // The same agent after a restart, still with no scheduler: the stored pair loads and the tag
+    // carries the version, so the server has nothing to re-send.
+    const auto reloaded = load_stored_settings([&](const std::string& k) { return kv.get(k); });
+    REQUIRE(reloaded.has_value());
+    std::map<std::string, std::string> tags_after_restart;
+    emit_settings_tags(tags_after_restart, std::optional<AgentCollectionSettings>{*reloaded});
+    CHECK(tags_after_restart.at("yuzu.inv_settings_version") == kVersionA);
 }
 
 TEST_CASE("settings: restart applies a valid stored pair and discards a mismatched one",

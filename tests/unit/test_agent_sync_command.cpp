@@ -277,8 +277,7 @@ TEST_CASE("decide_sync_settings: a valid command reaches the scheduler and arms 
             sched->apply_settings(yuzu::agent::kSettingsSyncSource,
                                   std::chrono::seconds{s.interval_s}, s.window);
         }};
-    const auto decision = decide_sync_settings(params, /*inventory_disable=*/false,
-                                               /*scheduler_running=*/true, hooks);
+    const auto decision = decide_sync_settings(params, hooks);
     CHECK(decision.status == SyncNowDecision::Status::Success);
     CHECK(decision.output == "applied|" + yuzu::agent::sha256_hex(doc));
     REQUIRE(applied.has_value());

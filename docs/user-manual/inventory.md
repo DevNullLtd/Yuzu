@@ -642,10 +642,10 @@ The agent checks the document, stores it, and from then on reports the new versi
 - **The re-push gap.** The same version is not sent to one agent again within 5
   minutes. A document that changed in the meantime is sent at once. If a send is
   lost, or the agent could not apply it, the next heartbeat after the gap sends
-  it again. An agent that cannot apply settings at all (daily sync disabled with
-  `--inventory-disable`, or not yet connected to the server) keeps reporting
-  `none` and is sent the document every 5 minutes, and each send is refused with
-  a reason in the command result.
+  it again. An agent whose daily sync is not running (disabled with
+  `--inventory-disable`, or still starting after a reconnect) stores the document
+  and reports its version all the same, so it is not sent again; with
+  `--inventory-disable` nothing is collected, whatever the document says.
 - **Restarts.** Server state is in memory and is rebuilt from heartbeats, so a
   restart loses nothing; an agent whose version differs is simply sent the
   document. The agent keeps the applied document across a restart and re-checks it

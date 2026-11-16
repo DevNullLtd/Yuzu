@@ -1878,8 +1878,10 @@ neither end carries handling for a peer that predates it.
   letters, digits, `_`, `/`, `+` and `-`; a plugin line is malformed, has an invalid name, a value other than 0 or
   1, is repeated or is out of order; one of the six collectors the server can switch has no line; or the version
   is not the SHA-256 of the document. Names the agent does not know are accepted and stored. It answers FAILURE
-  exit 1, also changing nothing, when daily sync is not running (`--inventory-disable`, or not yet connected) or
-  a KV write fails. Otherwise SUCCESS `applied|<version>`.
+  exit 1, also changing nothing, when a KV write fails. Otherwise SUCCESS `applied|<version>`. Whether daily sync
+  is running is not a refusal: with no scheduler (`--inventory-disable`, or the scheduler of a new connection is
+  not yet published) a valid document is still persisted, held and reported in the version tag, and a scheduler
+  started later runs on it, so the server does not send it again.
 - **Persistence and restart.** The agent writes the document to the `__sync__` KV key `settings.document` and
   then the version to `settings.version`, and only then makes the settings live. A crash between the two writes
   leaves a pair whose hash does not match. At start-up the pair is read back and validated exactly like a live
