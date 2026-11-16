@@ -19,7 +19,9 @@
 #include "mgmt_group_owner_gate.hpp" // the one management-group owner-arm predicate
 #include "rbac_admin_predicate.hpp" // A2: is_rbac_administrator / is_self_target — global human role assignment gate
 #include "rbac_assignable_roles.hpp" // A2: kRbacAssignableRoles / is_rbac_assignable_role — closed 7-role set
+#include "mgmt_group_agent_known.hpp" // lookup_agent_known: the add-member `agent_known` audit flag, REST and MCP
 #include "mgmt_group_error.hpp" // mgmt_group_error_is_store_fault: one classifier for REST and MCP
+#include "mgmt_group_limits.hpp" // name / agent id / group id bounds and clean-text rule (REST, MCP, Settings)
 #include "rbac_text.hpp" // rbac_text_is_clean - the one clean-text predicate for RBAC identifiers
 #include "rbac_enforcement_read.hpp" // GET /api/v1/rbac/enforcement: the builder shared with MCP get_rbac_enforcement
 #include "app_perf_compare.hpp" // app_perf_param_valid — shared cap + control-char/NUL re-floor
@@ -1485,6 +1487,9 @@ const std::string& openapi_spec() {
         R"json(
       "HardwareRecord": {"type": "object", "properties": {"agent_id": {"type": "string", "nullable": true}, "hostname": {"type": "string", "nullable": true}, "os": {"type": "string", "nullable": true}, "online": {"type": "boolean", "description": "False when the identity is absent or unreadable"}, "last_seen": {"type": "string", "description": "Readable age", "nullable": true}, "identity_state": {"type": "string", "description": "degraded means the roster could not be read", "enum": ["found", "degraded", "absent"]}, "ci": {"allOf": [{"$ref": "#/components/schemas/HardwareCiRecord"}], "description": "Null unless ci_state is found", "nullable": true}, "ci_state": {"type": "string", "description": "absent means not synced yet; degraded means the store could not be read", "enum": ["found", "absent", "degraded"]}, "sections_state": {"type": "string", "description": "found means ci.sections holds the reported sections; absent means none are stored (an agent that predates the v2 record, or no record yet), which does not mean the device has none; degraded means ci_state is degraded so the sections were not read. A failed read of the sections themselves is a 503, never a 200 with this value", "enum": ["found", "absent", "degraded"]}, "software": {"type": "array", "description": "Null when the software store could not be read", "items": {"type": "object", "properties": {"name": {"type": "string"}, "version": {"type": "string"}, "publisher": {"type": "string", "description": "The declared vendor, else the origin label via:<ecosystem>, which names where the row came from, not a vendor"}, "install_date": {"type": "string"}}, "required": ["name", "version", "publisher", "install_date"]}, "nullable": true}, "software_truncated": {"type": "boolean", "description": "The software list was cut at its cap"}, "tags": {"type": "array", "description": "Null when the tag store could not be read", "items": {"type": "object", "properties": {"key": {"type": "string"}, "value": {"type": "string"}, "source": {"type": "string", "description": "Who set the tag"}, "updated_at": {"type": "integer", "description": "Epoch seconds"}}, "required": ["key", "value", "source", "updated_at"]}, "nullable": true}, "agent_version": {"type": "string", "description": "The live session's version; null when the device has no live session", "nullable": true}, "sync_supported": {"type": "boolean", "description": "The live agent is 0.13.1 or later, so POST /hardware/{id}/sync is accepted; false for an offline device"}, "software_last_seen": {"type": "integer", "description": "Epoch seconds of the last installed-software sync; 0 means never synced, null means the store could not be read", "nullable": true}}, "required": ["agent_id", "hostname", "os", "online", "last_seen", "identity_state", "ci", "ci_state", "sections_state", "software", "software_truncated", "tags", "agent_version", "sync_supported", "software_last_seen"], "description": "One device's composed record. Each part reports on its own whether it is degraded or absent."},
       "HardwareRecordResponse": {"type": "object", "properties": {"data": {"$ref": "#/components/schemas/HardwareRecord"}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}, "required": ["data", "meta"], "description": "GET /api/v1/hardware/{id} 200 body"},
+      "HardwareCiScalars": {"type": "object", "properties": {"manufacturer": {"type": "string", "nullable": true}, "model": {"type": "string", "nullable": true}, "serial": {"type": "string", "nullable": true, "description": "CMDB correlation key; personal data where a device is person-assigned"}, "system_uuid": {"type": "string", "nullable": true, "description": "CMDB correlation key; personal data where a device is person-assigned"}, "domain": {"type": "string", "nullable": true}, "ou": {"type": "string", "nullable": true}, "bios_vendor": {"type": "string", "nullable": true}, "bios_version": {"type": "string", "nullable": true}, "bios_date": {"type": "string", "nullable": true}, "cpu_model": {"type": "string", "nullable": true}, "cpu_cores": {"type": "integer", "nullable": true}, "cpu_threads": {"type": "integer", "nullable": true}, "ram_bytes": {"type": "integer", "nullable": true}, "disks_summary": {"type": "string", "nullable": true}, "primary_mac": {"type": "string", "nullable": true}, "macs_summary": {"type": "string", "nullable": true}, "nic_count": {"type": "integer", "nullable": true}, "os_name": {"type": "string", "nullable": true}, "os_version": {"type": "string", "nullable": true}, "os_build": {"type": "string", "nullable": true}, "arch": {"type": "string", "nullable": true}, "first_seen": {"type": "integer", "description": "First sync, epoch seconds, server clock"}, "last_seen": {"type": "integer", "description": "Latest sync, epoch seconds, server clock"}, "chassis_type": {"type": "string", "nullable": true}, "chassis_serial": {"type": "string", "nullable": true}, "chassis_asset_tag": {"type": "string", "nullable": true}, "chassis_source": {"type": "string", "nullable": true}, "board_vendor": {"type": "string", "nullable": true}, "board_product": {"type": "string", "nullable": true}, "board_serial": {"type": "string", "nullable": true}, "board_source": {"type": "string", "nullable": true}, "machine_id_hash": {"type": "string", "nullable": true}, "machine_id_algorithm": {"type": "string", "nullable": true}, "machine_id_source": {"type": "string", "nullable": true}}, "required": ["manufacturer", "model", "serial", "system_uuid", "domain", "ou", "bios_vendor", "bios_version", "bios_date", "cpu_model", "cpu_cores", "cpu_threads", "ram_bytes", "disks_summary", "primary_mac", "macs_summary", "nic_count", "os_name", "os_version", "os_build", "arch", "first_seen", "last_seen", "chassis_type", "chassis_serial", "chassis_asset_tag", "chassis_source", "board_vendor", "board_product", "board_serial", "board_source", "machine_id_hash", "machine_id_algorithm", "machine_id_source"], "description": "The scalar fields of a device's CI record: exactly the ci object of GET /hardware/{id} (HardwareCiRecord) without its sections, with the same null rules (a value the device could not report, or that predates the v2 record, is null)."},
+      "HardwareCiPageRow": {"type": "object", "properties": {"agent_id": {"type": "string"}, "hostname": {"type": "string", "description": "The CI record's own hostname (the last daily sync, not the live roster's); null when empty or the literal unknown", "nullable": true}, "ci": {"$ref": "#/components/schemas/HardwareCiScalars"}, "content_hash": {"type": "string", "description": "The stored hash of the device's CI record. Equal to your copy means the stored record is unchanged apart from first_seen and last_seen, which can move without a hash change (always take last_seen from the row); unequal means re-read it (it also covers section rows this route does not return). Null when none is stored", "nullable": true}, "blob_version": {"type": "integer", "description": "1 = the older 22-field record (the chassis, board and machine-id values are null), 2 = the versioned record"}}, "required": ["agent_id", "hostname", "ci", "content_hash", "blob_version"], "description": "One device's stored CI record."},
+      "HardwareCiPageResponse": {"type": "object", "properties": {"data": {"type": "object", "properties": {"devices": {"type": "array", "items": {"$ref": "#/components/schemas/HardwareCiPageRow"}}, "next_cursor": {"type": "string", "description": "Pass it back as `cursor` for the next page. Empty means there is nothing further to read"}, "scope_basis": {"type": "string", "description": "Present when the caller's read is confined to a scope: every page describes only devices within that scope. A status, set whether or not any device was hidden; no count of hidden devices is ever returned", "enum": ["authority_scoped"]}}, "required": ["devices", "next_cursor"]}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}, "required": ["data", "meta"], "description": "GET /api/v1/hardware-ci 200 body"},
       "HardwareSyncAccepted": {"type": "object", "properties": {"data": {"type": "object", "properties": {"command_id": {"type": "string", "description": "The dispatched __sync__ command"}, "source": {"type": "string", "enum": ["installed_software", "app_perf", "device_ci", "software_licensing", "all"]}, "agents_reached": {"type": "integer", "description": "Always 1 on this route"}, "requested_at": {"type": "integer", "description": "Epoch seconds"}}, "required": ["command_id", "source", "agents_reached", "requested_at"]}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}, "required": ["data", "meta"], "description": "POST /api/v1/hardware/{id}/sync 202 body"},
       "CryptoLibraryVersion": {"type": "object", "properties": {"version": {"type": "string"}, "ecosystem": {"type": "string", "description": "Empty for rows that carry none"}, "device_count": {"type": "integer"}, "package_names": {"type": "array", "items": {"type": "string"}}, "package_names_truncated": {"type": "boolean", "description": "More matching package names exist than the per-bucket cap returns"}}, "required": ["version", "ecosystem", "device_count", "package_names", "package_names_truncated"]},
       "CryptoLibraryFamily": {"type": "object", "properties": {"id": {"type": "string"}, "display": {"type": "string"}, "device_count": {"type": "integer", "description": "Distinct devices carrying any package of the family"}, "versions": {"type": "array", "items": {"$ref": "#/components/schemas/CryptoLibraryVersion"}}, "versions_truncated": {"type": "boolean", "description": "The version list was cut by the per-family cap or the response size budget"}}, "required": ["id", "display", "device_count", "versions", "versions_truncated"]},
@@ -1769,11 +1774,11 @@ const std::string& openapi_spec() {
         // Group guides (15 of 30). Own segment (MSVC C2026 16,380-byte cap).
         R"json(
     {"name": "Hardware", "description": "List the fleet's devices with their hardware identity, read one device's full record, and ask agents to sync inventory now, for one device, a group, a scope or the whole fleet.", "x-yuzu-guide": {
-      "overview": ["Every agent reports its machine identity (manufacturer, model, serial number, BIOS, CPU, memory, disks, network adapters and OS details) to the server once a day. GET /hardware lists devices with the main fields, and GET /hardware/{id} returns one device's record together with its installed software and tags.", "The two sync routes ask connected agents to run a sync now instead of waiting for their slot. POST /hardware/{id}/sync asks one agent. POST /hardware/sync asks the agents named by a device id, a group, a scope expression or the whole fleet, and is the route behind the Software page's Sync now button."],
+      "overview": ["Every agent reports its machine identity (manufacturer, model, serial number, BIOS, CPU, memory, disks, network adapters and OS details) to the server once a day. GET /hardware lists devices with the main fields, GET /hardware/{id} returns one device's record together with its installed software and tags, and GET /hardware-ci pages through the stored CI records of every device for a bulk pull.", "The two sync routes ask connected agents to run a sync now instead of waiting for their slot. POST /hardware/{id}/sync asks one agent. POST /hardware/sync asks the agents named by a device id, a group, a scope expression or the whole fleet, and is the route behind the Software page's Sync now button."],
       "how_it_works": [{"title": "Agent collects", "text": "The hardware, device_identity, os_info and network_config plugins are read and rolled into one record."}, {"title": "Daily sync", "text": "The record is sent about every 24 hours at a stable per-agent offset, and an unchanged record is skipped by hash."}, {"title": "Server stores", "text": "One row per device is kept. The server stamps first-seen and last-seen with its own clock."}, {"title": "Operators read", "text": "These routes and the dashboard Hardware page read the same stores."}, {"title": "Sync on demand", "text": "A sync route sends the request to live agents. A 202 means the request was sent, and the figures change when each device reports back."}],
       "tables": [{"title": "What is collected", "columns": ["Plugin action", "Feeds", "Rolled up as"], "rows": [["hardware: manufacturer, model", "manufacturer, model", "As reported."], ["hardware: system", "serial, system_uuid", "The correlation key for a configuration database. unknown when SMBIOS has none."], ["hardware: bios", "bios_vendor, bios_version, bios_date", "As reported."], ["hardware: processors", "cpu_model, cpu_cores, cpu_threads", "Cores and threads are summed across sockets."], ["hardware: memory", "ram_bytes", "Summed to bytes."], ["hardware: disks", "disks_summary", "Summarised and sorted."], ["device_identity", "domain, ou", "Domain membership and organisational unit."], ["os_info", "os_name, os_version, os_build, arch", "As reported."], ["network_config: adapters", "primary_mac, macs_summary, nic_count", "MACs are de-duplicated and sorted, and the primary is the first after sorting."], ["hardware: chassis", "chassis_type, chassis_serial, chassis_asset_tag, chassis_source and the chassis section", "As reported, null when the agent could not read it."], ["hardware: baseboard", "board_vendor, board_product, board_serial, board_source and the baseboard section", "As reported, null when the agent could not read it."], ["hardware: machine_id", "machine_id_hash, machine_id_algorithm, machine_id_source and the machine_id section", "Only a hash of the machine ID is kept, never the ID itself."], ["hardware: processors, memory, disks, swap; disk_actions: volumes, partitions, topology", "The cpu, dimm, disk, swap, volume, partition and topology sections, one row per item", "Each section carries its own status, and its rows are capped per section."]]}, {"title": "The two sync routes", "columns": ["Route", "Who is asked", "Limits"], "rows": [["POST /hardware/{id}/sync", "One connected agent", "The source is installed_software, app_perf, device_ci, software_licensing or all, and defaults to all. The agent must be at version 0.13.1 or later."], ["POST /hardware/sync", "A device id, group:<id>, a scope expression or __all__", "The source is always installed_software. At most 500 devices per request, one run per operator per 60 seconds and one run at a time per server process. A single named device is exempt from the last two."]]}],
-      "access": {"permissions": ["Inventory:Read through the fleet-read check, for GET /hardware and GET /hardware/{id}. A confined caller sees only the devices in scope, and an out-of-scope id answers 404 like an unknown id.", "Execution:Execute scoped to the device, for POST /hardware/{id}/sync.", "Execution:Execute as a global grant, for POST /hardware/sync. An operator whose Execution:Execute is limited to management groups is refused with 403 for every choice. Naming the whole fleet also needs an unfiltered Execution:Execute."], "audit": ["inventory.devices, written for each list read, and as a failure row when the roster cannot be read", "inventory.device.ci, written for each record read, and as a failure row when the device identity cannot be read", "inventory.sync.request, written before anything is sent (result requested, or no_agents when no device is reachable) and as a denied row for a malformed, over-limit or otherwise refused request"], "notes": ["A failed audit write fails the list and record reads with 503, and blocks both sync requests before dispatch.", "A browser session that calls either sync route must send an Origin or Referer naming this site, or the answer is 403. Token callers are exempt."]},
-      "good_to_know": [{"label": "Privacy", "text": "Serial number, system UUID and MAC address identify a device and can be personal data where a device is assigned to a person. Free disk space, uptime and IP addresses are left out of the synced record on purpose."}, {"label": "Unknown values", "text": "A value the agent could not read is null. A device with no SMBIOS serial, many virtual machines, reports unknown, which the API returns as null."}, {"label": "Degraded reads", "text": "ci_degraded and tags_degraded on the list, and ci_state and identity_state on the record, say when a store could not be read, so null CI fields then mean unknown and not no data. A roster that cannot be read is a 503 with a retry hint, never an empty list and never a 404. The same holds for the record's hardware sections: a failed read of them is a 503, never a 200 with an empty list. An empty list with sections_state absent is a different answer: nothing is stored."}, {"label": "Sections", "text": "ci.sections lists each section the agent reported, with status, reason, source, complete and rows. A section with status constrained is incomplete (complete is false): it is a bounded or partial read, not a device with fewer items. A section that is unavailable or permission_denied shows its reason and no rows. An empty list, with sections_state absent, means no sections are stored (an agent that predates the v2 record); it does not mean the device has none. A section missing from the list was not reported."}, {"label": "Paging", "text": "The list takes offset and limit, with limit clamped to 1 to 200 and a default of 50. An offset or limit that is not a whole number, or is negative, is a 400. The record carries at most 2000 installed-software rows and sets software_truncated when it cuts."}, {"label": "Window", "text": "The roster covers devices seen in the last 30 days, at most the 100000 most recently seen, and a device not seen for 2 days is marked stale and counts as offline."}, {"label": "Large fleets", "text": "When more than 100000 devices were seen in the window, roster_truncated is true and roster_cap is 100000. The list is still served: it holds the newest 100000, and total_matching, pagination.total, devices_omitted and every kpis figure are lower bounds. A search that finds nothing does not prove a device is absent, and the list cannot be paged past the cap. GET /hardware/{id} reads one device exactly, whatever the fleet size."}, {"label": "Sync reach", "text": "A sync run reaches only agents attached to this server process. The counts requested and skipped_offline describe what this server could reach and are not a census of the fleet. Agents older than 0.13.1 are skipped and counted in skipped_version."}, {"label": "Sync answers", "text": "The single-device route answers 409 for an agent older than 0.13.1 and 503 with a retry hint when the agent is not connected. The multi-device route answers 429 inside the 60 second cooldown, 409 while another run is in progress and 413 when more than 500 devices would be reached."}],
+      "access": {"permissions": ["Inventory:Read through the fleet-read check, for GET /hardware, GET /hardware-ci and GET /hardware/{id}. A confined caller sees only the devices in scope, and an out-of-scope id answers 404 like an unknown id (on GET /hardware-ci a named agent_id outside the scope reads as an empty page).", "Execution:Execute scoped to the device, for POST /hardware/{id}/sync.", "Execution:Execute as a global grant, for POST /hardware/sync. An operator whose Execution:Execute is limited to management groups is refused with 403 for every choice. Naming the whole fleet also needs an unfiltered Execution:Execute."], "audit": ["inventory.devices, written for each list read, and as a failure row when the roster cannot be read", "inventory.device.ci, written for each record read, and as a failure row when the device identity cannot be read", "inventory.devices.ci, written for each page served by GET /hardware-ci (one row per page, fail closed), as a failure row when the store cannot be read and as a denied row when the named agent_id is outside the caller's scope or the caller's scope is too wide", "inventory.sync.request, written before anything is sent (result requested, or no_agents when no device is reachable) and as a denied row for a malformed, over-limit or otherwise refused request"], "notes": ["A failed audit write fails the list, the bulk page and the record reads with 503, and blocks both sync requests before dispatch.", "A browser session that calls either sync route must send an Origin or Referer naming this site, or the answer is 403. Token callers are exempt."]},
+      "good_to_know": [{"label": "Privacy", "text": "Serial number, system UUID and MAC address identify a device and can be personal data where a device is assigned to a person. Free disk space, uptime and IP addresses are left out of the synced record on purpose."}, {"label": "Unknown values", "text": "A value the agent could not read is null. A device with no SMBIOS serial, many virtual machines, reports unknown, which the API returns as null."}, {"label": "Degraded reads", "text": "ci_degraded and tags_degraded on the list, and ci_state and identity_state on the record, say when a store could not be read, so null CI fields then mean unknown and not no data. A roster that cannot be read is a 503 with a retry hint, never an empty list and never a 404. The same holds for the record's hardware sections: a failed read of them is a 503, never a 200 with an empty list. An empty list with sections_state absent is a different answer: nothing is stored."}, {"label": "Sections", "text": "ci.sections lists each section the agent reported, with status, reason, source, complete and rows. A section with status constrained is incomplete (complete is false): it is a bounded or partial read, not a device with fewer items. A section that is unavailable or permission_denied shows its reason and no rows. An empty list, with sections_state absent, means no sections are stored (an agent that predates the v2 record); it does not mean the device has none. A section missing from the list was not reported."}, {"label": "Paging", "text": "The list takes offset and limit, with limit clamped to 1 to 200 and a default of 50. An offset or limit that is not a whole number, or is negative, is a 400. The record carries at most 2000 installed-software rows and sets software_truncated when it cuts."}, {"label": "Bulk paging", "text": "GET /hardware-ci takes limit (1 to 1000, default 100, clamped), cursor and agent_id (an empty agent_id is a 400). Follow data.next_cursor as cursor until it is empty. Rows are ordered by the byte value of agent_id, and a complete walk is not a snapshot: confirm a device with ?agent_id=<id> before acting on its absence, and retire a configuration item only through your own decommission process. After an unrepaired database collation change the walk can serve duplicate records for a device and devices that were decommissioned."}, {"label": "Window", "text": "The roster covers devices seen in the last 30 days, at most the 100000 most recently seen, and a device not seen for 2 days is marked stale and counts as offline."}, {"label": "Large fleets", "text": "When more than 100000 devices were seen in the window, roster_truncated is true and roster_cap is 100000. The list is still served: it holds the newest 100000, and total_matching, pagination.total, devices_omitted and every kpis figure are lower bounds. A search that finds nothing does not prove a device is absent, and the list cannot be paged past the cap. GET /hardware/{id} reads one device exactly, whatever the fleet size."}, {"label": "Sync reach", "text": "A sync run reaches only agents attached to this server process. The counts requested and skipped_offline describe what this server could reach and are not a census of the fleet. Agents older than 0.13.1 are skipped and counted in skipped_version."}, {"label": "Sync answers", "text": "The single-device route answers 409 for an agent older than 0.13.1 and 503 with a retry hint when the agent is not connected. The multi-device route answers 429 inside the 60 second cooldown, 409 while another run is in progress and 413 when more than 500 devices would be reached."}],
       "docs": ["docs/user-manual/inventory.md"]
     }},
     {"name": "Instructions", "description": "Read the catalogue of instruction definitions, the YAML-defined questions and actions the server can send to agents, with filters, a single-definition view and a JSON export. Create, update, delete, import and validate definitions, and manage instruction sets.", "x-yuzu-guide": {
@@ -1808,8 +1813,8 @@ const std::string& openapi_spec() {
       "overview": ["A management group is a named set of devices. Groups form a tree under one built-in root group called All Devices. Operators use them to organise the fleet, and to give a person or team a role over the devices in one branch only.", "Group membership and group roles feed the device confinement that other API groups apply. A role held on a group reaches the agents in that group and in the groups below it. This group of calls manages the groups, their members and the roles delegated on them.", "The group routes check global grants on the ManagementGroup securable. The roles routes add one group-scoped path, ITServiceOwner of that group, described under access."],
       "how_it_works": [{"title": "Root group", "text": "At start the server creates the root group All Devices (id 000000000000) if it is missing. Every agent is added to it when it registers, directly or through a gateway."}, {"title": "Build the tree", "text": "Create groups with an optional parent id. Add agents to a group one at a time. Group names must be unique across the whole tree."}, {"title": "Delegate roles", "text": "Assign Operator or Viewer to a user or a group principal on a management group. No other role can be delegated here."}, {"title": "Scope applies", "text": "When RBAC enforcement is on, a role held on a group is resolved to the agents in that group and the groups below it. Other API groups then confine their device reads and actions to that set."}],
       "tables": [{"title": "Kinds of group", "caption": "How members arrive and what the calls in this group can change.", "columns": ["Kind", "How members arrive", "What these calls can do"], "rows": [["Root (All Devices)", "Every agent is added on registration.", "Rename or describe it. Delete is refused with 403 and a new parent is refused with 400."], ["Static group", "You add agents one at a time.", "Add and remove members."], ["Dynamic group", "Entries marked source dynamic, written only by the server.", "Remove member never deletes a dynamic entry."], ["Service group", "Created by the server when a service tag is written, named Service: followed by the tag value.", "Same as a dynamic group. Members are filled from agents holding the tag when it is created."]]}],
-      "access": {"permissions": ["ManagementGroup:Read, gates list groups and get one group with its members. A global grant check.", "ManagementGroup:Write, gates create, update, add member, remove member and the agent count preview.", "ManagementGroup:Delete, gates delete group.", "ManagementGroup:Read plus either UserManagement:Read or ITServiceOwner of that group, gates list roles. The role list shows who holds which role, so it is treated as authorization topology.", "ManagementGroup:Write or ITServiceOwner of that group, gates assign role and unassign role."], "audit": ["management_group.create, written after a group is created.", "management_group.update, written after a group is updated.", "management_group.delete, written after a group is deleted.", "management_group.add_member, written after an add member call. A control byte or invalid UTF-8 in agent_id is written as denied (detail invalid_agent_id) and a store fault as failure (detail store_error).", "management_group.remove_member, written after a remove member call, with the same denied and failure rows.", "management_group.assign_role, written after a role is assigned. A control byte or invalid UTF-8 in the role name, principal_id or principal_type is written as denied (detail invalid_role_name, invalid_principal_id or invalid_principal_type) and a store fault as failure (detail store_error).", "management_group.unassign_role, written after a role is unassigned, with the same denied and failure rows. The success rows are written only after the store reports success, and the audit write result is not checked, so a failed audit write does not fail the request. A group id that names no group answers 404 on add member and assign role and writes no row. Reads are not audited."], "notes": ["The ITServiceOwner path on the roles routes is not offered to a service-scoped API token. Such a token is judged by the global permission check only.", "Only Operator and Viewer can be delegated. Any other role name returns 403.", "MCP tools exist for list, get, create, update, add member, list roles, assign role and the agent count preview. Delete, remove member and unassign role are REST only."]},
-      "good_to_know": [{"label": "Paging", "text": "The list returns every group in one response. The pagination block reports start 0, page size 50 and a total equal to the rows returned, whatever the size of the tree."}, {"label": "Dynamic groups", "text": "A dynamic group stores its scope expression, but the only server code that fills dynamic members is the service tag helper. A dynamic group you create through the API gets no members from its expression, so add static members or expect it to stay empty."}, {"label": "Write outcomes", "text": "Add member, remove member, assign role and unassign role answer success only after the store accepted the write. A control byte or invalid UTF-8 in an id is a 400, a group id naming no group on add member or assign role is a 404, and a store fault is a 503 with a retry hint. Removing an agent that was not a member, or unassigning a role that was not held, is not an error and still returns 200."}, {"label": "Delete cascades", "text": "Deleting a group also deletes the groups below it, their memberships and their role assignments. The agents themselves are not deleted."}, {"label": "Depth and cycles", "text": "A group may sit at most five levels below the root. Create is refused beyond that, and re-parenting is refused one level earlier. Moving a group under one of its own descendants is refused. Update changes only the fields you send."}, {"label": "Fail-closed read", "text": "Get one group reads the group row and its member list separately. If either read fails the call returns 503 with a retry hint, never a 404 or an empty member list."}, {"label": "RBAC off", "text": "While RBAC enforcement is off, device visibility falls back to every enrolled agent and group roles do not narrow it. Assign group roles before you turn enforcement on."}, {"label": "Ids and bodies", "text": "The server generates group ids as 12 lowercase hex characters, and the routes match only lowercase hex ids. Unassign role names the grant in its JSON body, not in the URL."}, {"label": "Count preview", "text": "The agent count preview needs ManagementGroup:Write, as creating a group does. Filters are repeated query parameters, and an empty filter set returns a count of 0 without reading the store. The response also lists unindexed_filter_keys, the filters whose value is longer than 2048 bytes as stored. Such a value is not indexed, so for those filters agent_count can be 0 or an undercount. If the response store is degraded it returns 503 with a retry hint."}],
+      "access": {"permissions": ["ManagementGroup:Read, gates list groups and get one group with its members. A global grant check.", "ManagementGroup:Write, gates create, update, add member, remove member and the agent count preview.", "ManagementGroup:Delete, gates delete group.", "ManagementGroup:Read plus either UserManagement:Read or ITServiceOwner of that group, gates list roles. The role list shows who holds which role, so it is treated as authorization topology.", "ManagementGroup:Write or ITServiceOwner of that group, gates assign role and unassign role."], "audit": ["management_group.create, written twice per call. An attempted row is stored before the group is created, then a success row (target_id is the new group id) or a failure row (detail is a token, a space and the group name the attempted row carries, the token being name_conflict, store_error or validation_refused; read the first space-delimited word as the token). If the attempted row cannot be stored the call answers 503 with Sec-Audit-Failed and creates nothing. The session and the permission are checked again after the attempted row, and a request that no longer passes writes a failure row (detail session_revoked or permission_revoked, then a space and the group name). A request refused before any write (permission, body, an empty name, a name or parent id over 256 bytes or holding a control character, an unknown parent, depth) writes no management_group row. A fault of the group store, including a failed read of the parent group, answers 503 with a retry hint. If only the outcome row cannot be stored the 201 stands and carries Sec-Audit-Failed.", "management_group.update, written after a group is updated.", "management_group.delete, written after a group is deleted.", "management_group.add_member, written twice per call once the request is valid and the group exists. An attempted row (detail is the agent id) is stored before the member is added, then a success row whose detail is the agent id, a space and agent_known=1, agent_known=0 or agent_known=unreadable (read the last space-delimited token) or a failure row (detail is a token, a space and the agent id the attempted row carries, the token being store_error, group_not_found, session_revoked or permission_revoked; read the first space-delimited word as the token). If the attempted row cannot be stored the call answers 503 with Sec-Audit-Failed and adds nothing; if only the outcome row cannot be stored the 201 stands and carries Sec-Audit-Failed. A control byte or invalid UTF-8 in agent_id is written as denied (detail invalid_agent_id) with no attempted row.", "management_group.remove_member, written twice per call in the same order: an attempted row, then a success row (detail is the agent id) or a failure row (detail is a token, a space and the agent id, the token being store_error, session_revoked or permission_revoked), with the same Sec-Audit-Failed behaviour and the same denied row for an invalid agent_id.", "management_group.assign_role, written after a role is assigned. A control byte or invalid UTF-8 in the role name, principal_id or principal_type is written as denied (detail invalid_role_name, invalid_principal_id or invalid_principal_type) and a store fault as failure (detail store_error).", "management_group.unassign_role, written after a role is unassigned, with the same denied and failure rows. The update, delete, assign role and unassign role success rows are written only after the store reports success, and the audit write result is not checked there, so a failed audit write does not fail those requests. A group id that names no group answers 404 on assign role and writes no row. On add member it answers 404 and writes no attempted row, a group id over 256 bytes is a 404 too, and a group deleted after that check writes a failure row (detail group_not_found, a space and the agent id). A failed read of the group before the attempted row answers 503 and writes no management_group row. Remove member does not check that the group or the member exists: removing from an absent group, or an absent member, answers 200 and writes attempted and success rows for a change that did nothing. Reads are not audited."], "notes": ["The ITServiceOwner path on the roles routes is not offered to a service-scoped API token. Such a token is judged by the global permission check only.", "Only Operator and Viewer can be delegated. Any other role name returns 403.", "MCP tools exist for list, get, create, update, add member, list roles, assign role and the agent count preview. Delete, remove member and unassign role are REST only."]},
+      "good_to_know": [{"label": "Paging", "text": "The list returns every group in one response. The pagination block reports start 0, page size 50 and a total equal to the rows returned, whatever the size of the tree."}, {"label": "Dynamic groups", "text": "A dynamic group stores its scope expression, but the only server code that fills dynamic members is the service tag helper. A dynamic group you create through the API gets no members from its expression, so add static members or expect it to stay empty."}, {"label": "Write outcomes", "text": "Add member, remove member, assign role and unassign role answer success only after the store accepted the write. A control byte or invalid UTF-8 in an id is a 400, as is an agent id over 256 bytes (that one writes no row), a group id naming no group on add member or assign role is a 404, and a store fault is a 503 with a retry hint. Removing an agent that was not a member, or unassigning a role that was not held, is not an error and still returns 200."}, {"label": "Delete cascades", "text": "Deleting a group also deletes the groups below it, their memberships and their role assignments. The agents themselves are not deleted."}, {"label": "Depth and cycles", "text": "A group may sit at most five levels below the root. Create is refused beyond that, and re-parenting is refused one level earlier. Moving a group under one of its own descendants is refused. Update changes only the fields you send."}, {"label": "Fail-closed read", "text": "Get one group reads the group row and its member list separately. If either read fails the call returns 503 with a retry hint, never a 404 or an empty member list."}, {"label": "RBAC off", "text": "While RBAC enforcement is off, device visibility falls back to every enrolled agent and group roles do not narrow it. Assign group roles before you turn enforcement on."}, {"label": "Ids and bodies", "text": "The server generates group ids as 12 lowercase hex characters, and the routes match only lowercase hex ids. Unassign role names the grant in its JSON body, not in the URL."}, {"label": "Count preview", "text": "The agent count preview needs ManagementGroup:Write, as creating a group does. Filters are repeated query parameters, and an empty filter set returns a count of 0 without reading the store. The response also lists unindexed_filter_keys, the filters whose value is longer than 2048 bytes as stored. Such a value is not indexed, so for those filters agent_count can be 0 or an undercount. If the response store is degraded it returns 503 with a retry hint."}],
       "docs": ["docs/user-manual/management-groups.md"]
     }},
 )json"
@@ -2026,6 +2031,9 @@ const std::string& openapi_spec() {
     "/hardware": {
       "get": {"operationId": "getHardware", "summary": "Hardware CI list", "tags": ["Hardware"], "description": "Requires Inventory:Read, gated by the fleet-read check. Query params q/os/status/sort/dir/tag/offset/limit: an unrecognised sort/os/status token or an invalid tag key is a 400, and any dir other than desc sorts ascending. q is split into at most 8 whitespace-separated tokens, all of which must match (case-insensitive substring) one of: hostname, device id, OS, serial, model, manufacturer, CPU model, OS name, version and build, domain, architecture, agent version, IPs, tag keys and key=value pairs, chassis asset tag, chassis serial and baseboard serial. A blank or `unknown` value never matches, and neither does the `-` placeholder in the chassis and baseboard fields; a search term of `-` still matches hyphenated hostnames. Rows carry the same identity fields as /devices plus CI blob fields (manufacturer/model/serial/cpu/ram/os_version), a per-page DEX score, agent_version/arch, claimed IPs, and tags. `dex_score` is `null` both when the device has no DEX data and when the per-device DEX read degraded; this list/badge view does not distinguish the two (see `GET /api/v1/dex/devices/{id}` for a degrade-distinguishing per-device read). Audited as inventory.devices (result=failure when the roster read failed); a persist failure on the success audit fails the request closed (503).", "responses": {"200": {"description": "{data: {devices[], kpis, query}, pagination, meta}", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/HardwareListPage"}}}}, "400": {"description": "Unrecognised sort, os, or status token, or an invalid tag key"}, "401": {"description": "Not authenticated"}, "403": {"description": "Caller lacks Inventory:Read"}, "503": {"description": "Route misconfigured (roster unwired), the device roster could not be read (retry_after_ms set), the authorization store unavailable (retry_after_ms 5000), or audit subsystem degraded"}}}
     },
+    "/hardware-ci": {
+      "get": {"operationId": "getHardwareCi", "summary": "Hardware CI records, one keyset page", "tags": ["Hardware"], "description": "Requires Inventory:Read, checked by the fleet-read check and nothing else. One keyset page of the stored device CI records, for a bulk pull into an external CMDB: follow data.next_cursor as `cursor` until it is empty. Rows are ordered by the byte value of agent_id, independent of the database collation, and every agent_id comparison in the read (the cursor bound, the scope membership test, the single-device filter and the order) is byte-ordered, so a collation change cannot make this read skip or miss a device (an index on that byte order makes an index scan available for each page; the planner decides); writes, decommission and the per-device reads (GET /hardware/{id}) still go through the primary key and follow the database collation: after an unrepaired collation change (measured on an emulation, one run, an upper bound) ingest inserts new rows instead of updating records (some reports are refused), this read can then serve duplicate rows for one device with different content and keep serving decommissioned devices, and GET /hardware/{id} can report a stored device as missing; every other keyset read follows the collation too, and the server only reports a collation mismatch (the yuzu_pg_collation_version_mismatch gauge) and stops no read or write, the write pause being a later control (see the collation note in server-admin.md). A complete walk is not a snapshot: a device registered or removed while it runs, or a change of the caller's scope between pages, can be missed or can vanish from it, so confirm a device with ?agent_id=<id> before acting on its absence (an empty confirm page means no stored record or a device outside the credential's scope: treat it as not found, not as deleted). GET /devices/{id} is not a substitute: it answers only for a device with a live session, so its 404 does not show that a record was removed. Retire a configuration item only through your own decommission process, never from absence in a walk. Each row carries the same scalar ci block as GET /hardware/{id} without sections, plus the stored content_hash (equal means unchanged apart from first_seen and last_seen, which move without a hash change, so always read last_seen; unequal means re-read) and blob_version. Reads the stored CI table directly, not the device roster, so a device offline for more than 30 days is still returned while its record exists; online state, tags and the DEX score are not part of this route. A 1000-row page is about 1.2 MB of JSON: size client timeouts and proxy limits for that. Query params: limit (1 to 1000, default 100; an integer outside that range is clamped, text that is not an integer is a 400), cursor (opaque; a malformed one, or one issued for a different agent_id filter, is a 400: restart from the first page), agent_id (read one device; a device outside the caller's scope reads as an empty page, the same as a device with no record; a present-but-empty agent_id is a 400, omit it to read the whole fleet). A repeated parameter keeps its first value and an unknown one is ignored. The caller's scope is applied in the query, so a device outside it is never returned; a caller whose read is confined to a scope gets scope_basis authority_scoped, and no count of hidden devices is ever returned. Confinement applies only while RBAC enforcement is on: with it off every non-engine caller the gate admits reads the whole fleet and a service-scoped token is refused with 403. An engine principal is resolved by RBAC alone (403 without an explicit Inventory:Read grant, and always while RBAC is off; with the grant it reads fleet-wide), and an MCP token whose tier does not allow Inventory:Read gets 403. A caller whose scope covers more than 10000 devices and passes no agent_id gets a terminal 400 (a credential with global read has no such limit; otherwise pass agent_id or ask an administrator to narrow the scope), and a walk that started under a smaller scope aborts the same way if the scope grows past 10000 between pages; a caller with global read pages through any number of devices. Serial, system UUID, MAC and the chassis and board serials are personal data: each served page is audited as inventory.devices.ci and the request fails closed (503, Sec-Audit-Failed) when that audit row does not persist. A failed store read is a 503 with retry_after_ms, never an empty page. A served page (the 200) is sent with Cache-Control: no-store; the error answers do not set it.", "parameters": [{"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 100}}, {"name": "cursor", "in": "query", "required": false, "schema": {"type": "string", "maxLength": 2048}}, {"name": "agent_id", "in": "query", "required": false, "schema": {"type": "string", "maxLength": 256}}], "responses": {"200": {"description": "{data: {devices[], next_cursor}, meta}, plus scope_basis inside data for a caller confined to a scope", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/HardwareCiPageResponse"}}}}, "400": {"description": "limit is not an integer; cursor is malformed, over 2048 bytes or was issued for a different agent_id filter; agent_id is empty (agent_id must be a non-empty string when given), over 256 bytes or carries a byte below 0x20 (invalid agent_id), or is not valid UTF-8 or carries a NUL (invalid parameter encoding, which applies to agent_id only); a cursor that is not valid UTF-8 or carries a NUL is refused with the cursor message (invalid cursor; restart from the first page); or the caller's scope covers more than 10000 devices and no agent_id was given (terminal, retry_after_ms is null; the best-effort audit row of this refusal can leave Sec-Audit-Failed on the 400, which stands)"}, "401": {"description": "Not authenticated"}, "403": {"description": "Caller lacks Inventory:Read, or is an engine principal without an explicit grant (always while RBAC enforcement is off), or an MCP token whose tier does not allow Inventory:Read, or is a service-scoped token while RBAC enforcement is off (service-scoped tokens require RBAC to be enabled; the body names no permission), or a service-scoped token whose ITServiceOwner ceiling lacks Inventory:Read"}, "503": {"description": "Route misconfigured (CI provider unwired), the CI store could not be read (retry_after_ms 5000), the authorization store unavailable, or the audit subsystem unavailable (Sec-Audit-Failed, retry_after_ms 5000)"}}}
+    },
     "/hardware/{id}": {
       "get": {"operationId": "getHardwareById", "summary": "Hardware CI record", "tags": ["Hardware"], "description": "Requires Inventory:Read, checked by the fleet-read check; an id outside the caller's fleet-read scope collapses to the same 404 as a genuinely nonexistent id, so a caller cannot probe which ids exist (the same answer as /devices/{id}). Composes identity + CI blob + the per-section hardware record + installed software + tags into one record: each independently distinguishes degraded from absent. The CI blob carries the chassis, baseboard and hashed machine-id scalars, and ci.sections lists each reported section (cpu, dimm, disk, swap, volume, partition, topology, plus the status of chassis, baseboard and machine_id) with status, reason, source, complete and rows; a constrained section is complete=false (a bounded or partial read, not a device with fewer rows) and an unavailable or permission_denied section carries its reason and no rows. The record and its sections are read in one consistent snapshot. If the sections read fails the answer is a 503 (a 200 with sections_state absent and an empty sections list instead means none are stored: an agent that predates the v2 record, a record with no sections, or a device removed during the read). Audited as inventory.device.ci (result=failure when the roster read or the sections read failed); a persist failure on the success audit fails the request closed (503).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{data: {agent_id, hostname, os, online, last_seen, identity_state (found|degraded|absent), ci, ci_state, sections_state (found|degraded|absent), software, tags, software_truncated, agent_version, sync_supported, software_last_seen}, meta}. A degraded CI store alongside a degraded roster is a 200 carrying identity_state and ci_state as degraded", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/HardwareRecordResponse"}}}}, "400": {"description": "Device id longer than 256 bytes or containing a byte below 0x20 (agent registration refuses both, so a registered device is not affected)"}, "401": {"description": "Not authenticated"}, "403": {"description": "Caller lacks Inventory:Read"}, "404": {"description": "Not found, or found but outside the caller's fleet-read scope (indistinguishable by design)"}, "503": {"description": "Route misconfigured; audit subsystem degraded; authorization store unavailable (retry_after_ms 5000); device roster unreadable (retry_after_ms set) when the device was not otherwise found (this is never a 404); or the record's hardware sections could not be read after the record itself was read (message hardware sections unavailable, retry_after_ms 5000), which is never a 200 with an empty sections list"}}}
     },
@@ -2042,7 +2050,7 @@ const std::string& openapi_spec() {
     },
     "/management-groups": {
       "get": {"operationId": "getManagementGroups", "summary": "List management groups", "tags": ["Management Groups"], "responses": {"200": {"description": "List of management groups", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MgmtGroupListResponse"}}}}}},
-      "post": {"operationId": "postManagementGroups", "summary": "Create a management group", "tags": ["Management Groups"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ManagementGroup"}}}}, "responses": {"201": {"description": "Group created", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MgmtGroupCreatedResponse"}}}}}}
+      "post": {"operationId": "postManagementGroups", "summary": "Create a management group", "tags": ["Management Groups"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ManagementGroup"}}}}, "description": "Audit-first: an attempted audit row is stored before the group is created, and a call whose attempted row cannot be stored creates nothing. The session and the permission are checked again after that row.", "responses": {"201": {"description": "Group created. If only the closing audit row could not be stored the 201 stands and the response carries Sec-Audit-Failed: true.", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when an audit row for this request could not be stored"}}, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MgmtGroupCreatedResponse"}}}}, "400": {"description": "Invalid JSON; an empty name; a name over 256 bytes or holding a control character or invalid UTF-8 (group name must be at most 256 bytes and must not contain control characters or invalid UTF-8); a parent_id over 256 bytes, holding such a character, or naming no group (parent group not found); a hierarchy deeper than five levels; or a name already used by another group (a group with that name already exists). A name conflict, and a parent removed after the check, are answered after the attempted row is stored and are recorded as a failure row; every other refusal writes no audit row."}, "503": {"description": "The group store could not answer, including a failed read of the parent group (fixed message; the store error text is not returned), or the attempted audit row could not be stored, in which case the response carries Sec-Audit-Failed: true. Nothing is created either way; the envelope includes retry_after_ms.", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when an audit row for this request could not be stored"}}}}}
     },
     "/management-groups/{id}": {
       "get": {"operationId": "getManagementGroupsById", "summary": "Get a management group with members", "tags": ["Management Groups"], "description": "Both the group row itself and its member list are read in a way that distinguishes a degraded store from a missing record, so a store-not-open, pool-acquire-timeout or query-error degrade on EITHER read fails closed with 503 rather than rendering a flat 404 (group-row degrade) or an authoritative empty members:[] (member-list degrade); retry_after_ms 2000 either way. A genuine not-found (the group row does not exist) still 404s.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Management group details", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MgmtGroupDetailResponse"}}}}, "404": {"description": "Group not found"}, "503": {"description": "Management group store read degraded (group-row or member resolution failed); retry shortly (standard error envelope, retry_after_ms 2000)."}}},
@@ -2052,10 +2060,10 @@ const std::string& openapi_spec() {
 )json"
         R"json(
     "/management-groups/{id}/members": {
-      "post": {"operationId": "postManagementGroupsByIdMembers", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["agent_id"], "properties": {"agent_id": {"type": "string"}}}}}}, "summary": "Add member to management group", "tags": ["Management Groups"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"201": {"description": "Member added", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MgmtGroupMemberAddedResponse"}}}}, "400": {"description": "agent_id missing, or it holds a control byte or invalid UTF-8"}, "404": {"description": "No management group has that id; nothing is written and no audit row is added"}, "503": {"description": "Store fault: nothing was added (retryable; envelope includes retry_after_ms)"}}}
+      "post": {"operationId": "postManagementGroupsByIdMembers", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["agent_id"], "properties": {"agent_id": {"type": "string"}}}}}}, "summary": "Add member to management group", "tags": ["Management Groups"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "description": "Audit-first: an attempted audit row is stored before the member is added, and a call whose attempted row cannot be stored adds nothing. The session and the permission are checked again after that row.", "responses": {"201": {"description": "Member added. If only the closing audit row could not be stored the 201 stands and the response carries Sec-Audit-Failed: true.", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when an audit row for this request could not be stored"}}, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MgmtGroupMemberAddedResponse"}}}}, "400": {"description": "The body is not a JSON object, agent_id is missing, agent_id is over 256 bytes, or agent_id holds a control character or invalid UTF-8. Only the last is recorded, as a denied audit row (detail invalid_agent_id)."}, "404": {"description": "No management group has that id (an id over 256 bytes included) when the request is checked: nothing is written and no attempted audit row is added. A group deleted after that check is also answered 404 and writes a failure row with detail group_not_found followed by a space and the agent id."}, "503": {"description": "The group store could not answer, or could not apply the add, or the attempted audit row could not be stored, in which case the response carries Sec-Audit-Failed: true. Nothing is added in any of these. A failed read of the group before the attempted row writes no management-group audit row and no Sec-Audit-Failed. Retryable; the envelope includes retry_after_ms.", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when an audit row for this request could not be stored"}}}}}
     },
     "/management-groups/{id}/members/{agent_id}": {
-      "delete": {"operationId": "deleteManagementGroupsByIdMembersByAgentId", "summary": "Remove member from management group", "tags": ["Management Groups"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Member removed", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MgmtGroupMemberRemovedResponse"}}}}, "400": {"description": "agent_id holds a control byte or invalid UTF-8"}, "503": {"description": "Store fault: nothing was removed (retryable; envelope includes retry_after_ms)"}}}
+      "delete": {"operationId": "deleteManagementGroupsByIdMembersByAgentId", "summary": "Remove member from management group", "tags": ["Management Groups"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "description": "Audit-first: an attempted audit row is stored before the member is removed, and a call whose attempted row cannot be stored removes nothing. The session and the permission are checked again after that row. There is no check that the group or the member exists: removing an absent member, or from a group that does not exist, answers 200 and writes attempted and success audit rows for a change that did nothing.", "responses": {"200": {"description": "Member removed, or there was nothing to remove. If only the closing audit row could not be stored the 200 stands and the response carries Sec-Audit-Failed: true.", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when an audit row for this request could not be stored"}}, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MgmtGroupMemberRemovedResponse"}}}}, "400": {"description": "agent_id is over 256 bytes (no audit row), or holds a control character or invalid UTF-8 (a denied audit row, detail invalid_agent_id)"}, "404": {"description": "The group id in the path is over 256 bytes; nothing is written and no audit row is added"}, "503": {"description": "The store could not apply the removal, or the attempted audit row could not be stored, in which case the response carries Sec-Audit-Failed: true. Nothing is removed in either case; retryable, the envelope includes retry_after_ms.", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when an audit row for this request could not be stored"}}}}}
     },
     "/management-groups/{id}/roles": {
       "get": {"operationId": "getManagementGroupsByIdRoles", "summary": "List roles assigned to a management group", "tags": ["Management Groups"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "List of role assignments", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MgmtGroupRoleListResponse"}}}}}},
@@ -2401,7 +2409,7 @@ const std::string& openapi_spec() {
       "post": {"operationId": "postUsersByUsernameElevationEligibility", "summary": "Grant or revoke a user's JIT-admin-elevation eligibility", "tags": ["Users"], "description": "Admin (or an active elevation) + MFA step-up. Sets the per-user users.elevation_eligible flag. Self-grant is blocked. Granting (eligible=true) needs the caller's own administrator role: a session that is administrator only through an elevation gets 403. Setting eligible=false also terminates any in-flight elevation for that user. Errors use the standard error envelope (correlation_id + remediation).", "parameters": [{"name": "username", "in": "path", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["eligible"], "properties": {"eligible": {"type": "boolean"}}}}}}, "responses": {"200": {"description": "{status: ok}", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/UsersElevationEligibilityResult"}}}}, "400": {"description": "Invalid username or non-boolean body"}, "401": {"description": "Not authenticated, or MFA step-up required (stale/absent proof) — see meta.challenge_url"}, "403": {"description": "Not admin, or self-grant"}, "404": {"description": "User not found"}, "503": {"description": "Auth store not configured or unreachable — see --postgres-dsn"}}}
     },
     "/elevate": {
-      "post": {"operationId": "postElevate", "security": [{"cookieAuth": []}], "summary": "Activate a time-boxed JIT admin elevation on the current cookie session", "tags": ["Authentication"], "description": "Cookie session only (API/MCP tokens get 401 and can never elevate). The caller must be marked elevation-eligible and pass a fresh step-up. A local session must also have an enrolled TOTP factor (required regardless of --mfa-enforcement). An SSO (OIDC) session instead needs a login where the identity provider asserted multi-factor, with SSO elevation left enabled; local enrollment does not apply. SAML sessions cannot elevate in this release. duration_secs defaults to and is clamped by --jit-max-elevation-secs; a negative value is 400. The grant audit is fail-closed. Errors use the standard error envelope.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["justification"], "properties": {"justification": {"type": "string", "description": "Required, non-empty; control bytes sanitised; truncated to 1 KiB at a UTF-8 code-point boundary"}, "duration_secs": {"type": "integer", "minimum": 1}}}}}}, "responses": {"200": {"description": "{status: ok, expires_in: <true remaining seconds, clamped to the session's own absolute expiry>, expires_at: <RFC3339 UTC timestamp>}", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AuthElevationGranted"}}}}, "400": {"description": "Blank/missing justification, wrong-typed field, or negative duration"}, "401": {"description": "Not authenticated, no cookie (token caller), session dissolved mid-request, the session is already at/past its own absolute expiry (dead-window guard), or MFA step-up required (stale/absent proof) — see meta.challenge_url"}, "403": {"description": "Refused. The account is not marked eligible, or its eligibility or identity source could not be read or does not match the session. An SSO session lacks identity-provider multi-factor, or SSO elevation is turned off (--no-jit-oidc-amr-elevation). A local account has no enrolled TOTP factor. Or eligibility was revoked while the step-up was in progress. A SAML session is always refused in this release."}, "500": {"description": "Grant audit unrecordable. The elevation is revoked again; if that revoke also fails it stays live and unrecorded and must be revoked by hand (Sec-Audit-Failed header)"}, "503": {"description": "The persistent auth store is not available, or the second-factor store is unavailable. Retry shortly or contact an administrator."}}}
+      "post": {"operationId": "postElevate", "security": [{"cookieAuth": []}], "summary": "Activate a time-boxed JIT admin elevation on the current cookie session", "tags": ["Authentication"], "description": "Cookie session only (API/MCP tokens get 401 and can never elevate). The caller must be marked elevation-eligible and pass a fresh step-up. A local session must also have an enrolled TOTP factor (required regardless of --mfa-enforcement). An SSO (OIDC) session instead needs a login where the identity provider asserted multi-factor, with SSO elevation left enabled; local enrollment does not apply. SAML sessions cannot elevate in this release. duration_secs defaults to and is clamped by --jit-max-elevation-secs; a negative value is 400. The grant audit is fail-closed. Errors use the standard error envelope.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["justification"], "properties": {"justification": {"type": "string", "description": "Required, non-empty; control bytes sanitised; truncated to 1 KiB at a UTF-8 code-point boundary"}, "duration_secs": {"type": "integer", "minimum": 1}}}}}}, "responses": {"200": {"description": "{status: ok, expires_in: <true remaining seconds, clamped to the session's own absolute expiry>, expires_at: <RFC3339 UTC timestamp>}", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AuthElevationGranted"}}}}, "400": {"description": "Blank/missing justification, wrong-typed field, or negative duration"}, "401": {"description": "Not authenticated, no cookie (token caller), session dissolved mid-request, the session is already at/past its own absolute expiry (dead-window guard), or MFA step-up required (stale/absent proof) — see meta.challenge_url"}, "403": {"description": "Refused. The account is not marked eligible, or its eligibility or identity source could not be read or does not match the session. An SSO session lacks identity-provider multi-factor, or SSO elevation is turned off (--no-jit-oidc-amr-elevation). A local account has no enrolled TOTP factor. Or eligibility was revoked while the step-up was in progress. A SAML session is always refused in this release."}, "500": {"description": "Grant audit unrecordable. The elevation is revoked again; if that revoke also fails it stays live and unrecorded and must be revoked by hand (Sec-Audit-Failed header)"}, "503": {"description": "The persistent auth store is not available, or the second-factor state cannot be verified. Retry while error.retry_after_ms is 5000; null is no retry hint, not a promise that nothing will clear it. For a 503 that names the second-factor state, null means do not loop and follow the MFA binding enforcement runbook; run yuzu-server --mfa-reset only for an account whose factor generation is not positive, because an unenforced binding trigger or an inconclusive trigger validation is not repaired by it."}}}
     },
     "/elevate/revoke": {
       "post": {"operationId": "postElevateRevoke", "security": [{"cookieAuth": []}], "summary": "Step an active JIT elevation down early", "tags": ["Authentication"], "description": "Cookie session only; no MFA step-up (reduces privilege). 200 once the elevation is cleared, whether or not a window was active (recorded in the role.elevation.revoked audit detail); 503 if the durable clear fails, when the elevation may still be live.", "responses": {"200": {"description": "{status: ok}", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AuthElevationRevoked"}}}}, "401": {"description": "Not authenticated"}, "503": {"description": "The elevation could not be durably cleared and may still be live; retry"}}}
@@ -4785,9 +4793,31 @@ void RestApiV1::register_routes(
                                  "application/json");
              });
 
-    sink.Post("/api/v1/management-groups", [auth_fn, perm_fn, audit_fn,
-                                            mgmt_store](const httplib::Request& req,
-                                                        httplib::Response& res) {
+    // A management-group write whose store call reported an error answers a
+    // retryable 503 with a fixed message (the store's libpq text is never
+    // echoed), never a 2xx. The caller writes the matching `failure` audit row.
+    const auto mgmt_write_failed = [](httplib::Response& res) {
+        res.status = 503;
+        res.set_content(
+            detail::a4_error(res, "management group store unavailable",
+                             detail::A4ErrorOpts{.retry_after_ms = mcp::kMcpStoreFaultRetryMs,
+                                                 .remediation = "retry shortly"}),
+            "application/json");
+    };
+
+    // Create is audit-first (ADR-0033 section 9, "no audit row, no mutation", #7074): the
+    // `attempted` row is stored BEFORE create_group and a row that cannot be stored refuses the
+    // create (503 + Sec-Audit-Failed). Every refusal that needs no write to decide (permission,
+    // body, `validate_new_group`) answers first and burns no row. The attempted row can wait on
+    // the audit pool, so the session and the permission are decided again after it (#3619, the
+    // dashboard's group.create_from_results twin). Failure rows carry a FIXED token and the
+    // group name the `attempted` row carries (`mgmt_group_failure_detail`), never store text; the
+    // group name (success/attempted detail) is the existing raw-name contract.
+    sink.Post("/api/v1/management-groups", [auth_fn, perm_fn, audit_fn, mgmt_store,
+                                            mgmt_write_failed,
+                                            audit_as_session = audit_as_session_fn_](
+                                               const httplib::Request& req,
+                                               httplib::Response& res) {
         if (!perm_fn(req, res, "ManagementGroup", "Write"))
             return;
         if (!mgmt_store) {
@@ -4810,17 +4840,103 @@ void RestApiV1::register_routes(
         g.membership_type = body.value("membership_type", "static");
         g.scope_expression = body.value("scope_expression", "");
 
-        auto session = auth_fn(req, res);
-        if (session)
-            g.created_by = session->username;
+        // The name and the parent id are bounded and held to clean text BEFORE any store read or
+        // `attempted` row (mgmt_group_limits.hpp): each value lands in two audit rows, and a name
+        // the unique index cannot hold would otherwise read as a retryable store fault. The
+        // refusal text is fixed, never the caller's value; nothing is written.
+        if (!mgmt_group_name_ok(g.name)) {
+            res.status = 400;
+            res.set_content(detail::a4_error(res, std::string(kMgmtGroupNameInvalidText)),
+                            "application/json");
+            return;
+        }
+        if (!mgmt_group_id_ok(g.parent_id)) { // an id like this names no group
+            res.status = 400;
+            res.set_content(detail::a4_error(res, "parent group not found"), "application/json");
+            return;
+        }
+
+        // The checks create_group runs before its insert, decided here so a refusal burns no
+        // `attempted` row. A fault of the store itself is a retryable 503, never a 400.
+        if (auto valid = mgmt_store->validate_new_group(g); !valid) {
+            if (mgmt_group_error_is_store_fault(valid.error())) {
+                mgmt_write_failed(res);
+                return;
+            }
+            res.status = 400;
+            res.set_content(detail::a4_error(res, valid.error()), "application/json");
+            return;
+        }
+
+        const auto session = auth_fn(req, res); // writes its own 401
+        if (!session)
+            return; // no caller to name: no audit row is written and nothing is created
+        g.created_by = session->username;
+        // EVERY row of this route that names the caller (the `attempted` row, the `*_revoked`
+        // failure rows and the outcome row) is stamped from the session resolved here: each can
+        // be written after the session is gone (the audit pool wait, the recheck below and
+        // create_group's pool wait), when the re-resolving `audit_fn` would stamp an empty
+        // principal and break principal-based pairing of the rows. Without a session writer
+        // wired (tests) they fall back to `audit_fn`.
+        const AuditFn bound_audit =
+            audit_as_session ? audit_as(audit_as_session, *session) : audit_fn;
+
+        if (!detail::audit_attempted(bound_audit, req, res, "management_group.create",
+                                     "ManagementGroup", "", g.name))
+            return;
+
+        // The attempted row can wait on the audit pool: authenticate and authorise again, so a
+        // session invalidated or a grant revoked during the wait creates nothing. The username
+        // is compared too: the resolver falls through its credential sources (cookie, Bearer,
+        // X-Yuzu-Token), so with the first session gone a different principal's credential on the
+        // same request would resolve, and the rows (bound to the first) would misname the actor.
+        const auto fresh_session = auth_fn(req, res);
+        if (!fresh_session || fresh_session->username != session->username) {
+            (void)detail::emit_behavioral_audit(bound_audit, req, res, "management_group.create",
+                                                "failure", "ManagementGroup", "",
+                                                mgmt_group_failure_detail("session_revoked",
+                                                                          g.name));
+            if (res.status < 400) { // auth_fn writes its own 401; cover one that did not
+                res.status = 401;
+                res.set_content(detail::a4_error(res, "authentication required"),
+                                "application/json");
+            }
+            return;
+        }
+        if (!perm_fn(req, res, "ManagementGroup", "Write")) { // writes its own 403
+            (void)detail::emit_behavioral_audit(bound_audit, req, res, "management_group.create",
+                                                "failure", "ManagementGroup", "",
+                                                mgmt_group_failure_detail("permission_revoked",
+                                                                          g.name));
+            return;
+        }
+        g.created_by = fresh_session->username;
 
         auto result = mgmt_store->create_group(g);
         if (!result) {
+            // The attempted row is stored, so it gets an outcome. The detail is a fixed token,
+            // never the store text (which can carry database error output).
+            const auto token = create_failure_token(result.error());
+            const bool fault = token == kMgmtGroupTokenStoreError;
+            (void)detail::emit_behavioral_audit(bound_audit, req, res, "management_group.create",
+                                                "failure", "ManagementGroup", "",
+                                                mgmt_group_failure_detail(token, g.name));
+            if (fault) {
+                // The cause is logged (sanitised), never returned to the caller or audited.
+                spdlog::error("management_group.create store fault: {}",
+                              ::yuzu::log_key_token(result.error()));
+                mgmt_write_failed(res);
+                return;
+            }
+            // A name conflict or a validation literal: closed text, safe to echo.
             res.status = 400;
             res.set_content(detail::a4_error(res, result.error()), "application/json");
             return;
         }
-        audit_fn(req, "management_group.create", "success", "ManagementGroup", *result, g.name);
+        // The group exists: a lost outcome row keeps the 201 and marks the response
+        // `Sec-Audit-Failed` (the `attempted` row stands as "started, outcome unknown").
+        (void)detail::emit_behavioral_audit(bound_audit, req, res, "management_group.create",
+                                            "success", "ManagementGroup", *result, g.name);
         res.status = 201;
         res.set_content(ok_json(JObj().add("id", *result).str()), "application/json");
     });
@@ -4997,36 +5113,11 @@ void RestApiV1::register_routes(
             res.set_content(ok_json(JObj().add("deleted", true).str()), "application/json");
         });
 
-    // A management-group write whose store call reported an error answers a
-    // retryable 503 with a fixed message (the store's libpq text is never
-    // echoed), never a 2xx. The caller writes the matching `failure` audit row.
-    const auto mgmt_write_failed = [](httplib::Response& res) {
-        res.status = 503;
-        res.set_content(
-            detail::a4_error(res, "management group store unavailable",
-                             detail::A4ErrorOpts{.retry_after_ms = mcp::kMcpStoreFaultRetryMs,
-                                                 .remediation = "retry shortly"}),
-            "application/json");
-    };
-
     // The member and role id fields reach a text bind: a control byte or an
     // invalid UTF-8 sequence is refused up front (400) instead of becoming a
-    // retryable store fault. Twin: mgmt_text_ok in mcp_server.cpp (same rule).
-    const auto mgmt_text_ok = [](std::string_view s) {
-        if (!rbac_text_is_clean(s))
-            return false;
-        for (std::size_t i = 0; i < s.size();) {
-            if (static_cast<unsigned char>(s[i]) < 0x80) {
-                ++i;
-                continue;
-            }
-            const std::size_t len = ::yuzu::utf8_sequence_length(s, i);
-            if (len == 0)
-                return false;
-            i += len;
-        }
-        return true;
-    };
+    // retryable store fault. Twin: mgmt_text_ok in mcp_server.cpp (the same predicate,
+    // mgmt_group_text_is_clean).
+    const auto mgmt_text_ok = [](std::string_view s) { return mgmt_group_text_is_clean(s); };
 
     // True only when the store answered authoritatively that the group does not
     // exist (a failed read is not "absent"). Used after a write failed to tell a
@@ -5050,11 +5141,57 @@ void RestApiV1::register_routes(
         res.set_content(detail::a4_error(res, "group not found"), "application/json");
     };
 
+    // The member writes are audit-first like create (ADR-0033 section 9, "no audit row, no
+    // mutation", #7074): perm, store, body and field checks, then (add only) the group-exists
+    // answer, all BEFORE any row; then the `attempted` row (503 + Sec-Audit-Failed when it cannot
+    // be stored); then the session and the permission decided AGAIN (the attempted row can wait
+    // on the audit pool), `session_revoked` / `permission_revoked` failure rows; then the
+    // mutation; then the outcome row. Failure rows carry a FIXED token and the agent id the
+    // `attempted` row carries (`mgmt_group_failure_detail`), never store text. This is the
+    // post-attempted re-check, the member twin of the one in POST /api/v1/management-groups.
+    // `bound_audit` stamps every row that names the caller (the `attempted` row, these two
+    // `*_revoked` failure rows and the outcome row) from the session the route resolved BEFORE
+    // the `attempted` row (see the create route): the re-resolving `audit_fn` would stamp an
+    // empty principal once the session is gone.
+    const auto mgmt_member_recheck = [auth_fn, perm_fn](const httplib::Request& req,
+                                                        httplib::Response& res, const char* action,
+                                                        const std::string& group_id,
+                                                        const std::string& agent_id,
+                                                        const AuditFn& bound_audit,
+                                                        const std::string& original_username) {
+        // The username is compared too: the resolver falls through its credential sources
+        // (cookie, Bearer, X-Yuzu-Token), so with the original session gone a different
+        // principal's credential on the same request would resolve, and the rows (bound to the
+        // original session) would misname the actor. A different principal counts as revoked.
+        const auto fresh = auth_fn(req, res);
+        if (!fresh || fresh->username != original_username) {
+            (void)detail::emit_behavioral_audit(bound_audit, req, res, action, "failure",
+                                                "ManagementGroup", group_id,
+                                                mgmt_group_failure_detail("session_revoked",
+                                                                          agent_id));
+            if (res.status < 400) { // auth_fn writes its own 401; cover one that did not
+                res.status = 401;
+                res.set_content(detail::a4_error(res, "authentication required"),
+                                "application/json");
+            }
+            return false;
+        }
+        if (!perm_fn(req, res, "ManagementGroup", "Write")) { // writes its own 403
+            (void)detail::emit_behavioral_audit(bound_audit, req, res, action, "failure",
+                                                "ManagementGroup", group_id,
+                                                mgmt_group_failure_detail("permission_revoked",
+                                                                          agent_id));
+            return false;
+        }
+        return true;
+    };
+
     // Members
     sink.Post(R"(/api/v1/management-groups/([a-f0-9]+)/members)",
-              [perm_fn, audit_fn, mgmt_store, mgmt_write_failed, mgmt_text_ok,
-               mgmt_group_confirmed_absent, mgmt_group_not_found](const httplib::Request& req,
-                                                                  httplib::Response& res) {
+              [auth_fn, perm_fn, audit_fn, mgmt_store, mgmt_write_failed, mgmt_text_ok,
+               mgmt_group_confirmed_absent, mgmt_group_not_found, mgmt_member_recheck, auth_db,
+               audit_as_session = audit_as_session_fn_](const httplib::Request& req,
+                                                        httplib::Response& res) {
                   if (!perm_fn(req, res, "ManagementGroup", "Write"))
                       return;
                   if (!mgmt_store) {
@@ -5064,6 +5201,10 @@ void RestApiV1::register_routes(
                   }
 
                   auto group_id = req.matches[1].str();
+                  if (group_id.size() > kMgmtGroupIdMaxBytes) { // names no group; no row
+                      mgmt_group_not_found(res);
+                      return;
+                  }
                   auto body = nlohmann::json::parse(req.body, nullptr, false);
                   if (body.is_discarded() || !body.is_object()) {
                       res.status = 400;
@@ -5077,6 +5218,16 @@ void RestApiV1::register_routes(
                       res.set_content(detail::a4_error(res, "agent_id required"), "application/json");
                       return;
                   }
+                  // Bounded before anything else reads or records it (mgmt_group_limits.hpp):
+                  // no row, fixed text. An id within the bound that holds a control byte or
+                  // invalid UTF-8 keeps its `denied` row below.
+                  if (!mgmt_group_agent_id_length_ok(agent_id)) {
+                      res.status = 400;
+                      res.set_content(
+                          detail::a4_error(res, std::string(kMgmtGroupAgentIdTooLongText)),
+                          "application/json");
+                      return;
+                  }
                   if (!mgmt_text_ok(agent_id)) {
                       audit_fn(req, "management_group.add_member", "denied", "ManagementGroup",
                                group_id, "invalid_agent_id");
@@ -5085,29 +5236,79 @@ void RestApiV1::register_routes(
                                       "application/json");
                       return;
                   }
-                  if (auto added = mgmt_store->add_member(group_id, agent_id); !added) {
-                      // A well-formed id naming no group fails the membership foreign
-                      // key: answer 404 (no failure row, no retry hint), not a retryable 503.
-                      if (mgmt_group_confirmed_absent(mgmt_store, group_id)) {
-                          mgmt_group_not_found(res);
-                          return;
-                      }
-                      spdlog::warn("management_group.add_member store failure: {}", added.error());
-                      audit_fn(req, "management_group.add_member", "failure", "ManagementGroup",
-                               group_id, "store_error");
+                  // A well-formed id naming no group is a 404 BEFORE any row is written (a
+                  // refusal burns no `attempted` row); an unreadable group is a store fault,
+                  // never "absent".
+                  const auto exists = mgmt_store->get_group_checked(group_id);
+                  if (!exists) {
+                      spdlog::warn("management_group.add_member group read failure: {}",
+                                   ::yuzu::log_key_token(exists.error()));
                       mgmt_write_failed(res);
                       return;
                   }
-                  audit_fn(req, "management_group.add_member", "success", "ManagementGroup",
-                           group_id, agent_id);
+                  if (!exists->has_value()) {
+                      mgmt_group_not_found(res);
+                      return;
+                  }
+                  // Does the server hold an enrolment record for this id? A read, made after the
+                  // group-exists answer and before the `attempted` row. It only FLAGS the id, on
+                  // the success audit row; it is never returned (a response field would reveal
+                  // enrolment status to a caller whose scope hides the device). An unknown id is
+                  // accepted (an operator may stage a membership ahead of the device) and no lookup
+                  // outcome refuses the add. Unreadable is recorded as neither known nor unknown.
+                  const AgentKnown agent_known = lookup_agent_known(auth_db, agent_id);
+                  // The session every row names, the `attempted` row included, resolved before it
+                  // (see the create route): each is stamped from it.
+                  const auto session = auth_fn(req, res); // writes its own 401
+                  if (!session)
+                      return;
+                  const AuditFn bound_audit =
+                      audit_as_session ? audit_as(audit_as_session, *session) : audit_fn;
+                  if (!detail::audit_attempted(bound_audit, req, res, "management_group.add_member",
+                                               "ManagementGroup", group_id, agent_id))
+                      return;
+                  if (!mgmt_member_recheck(req, res, "management_group.add_member", group_id,
+                                           agent_id, bound_audit, session->username))
+                      return;
+                  if (auto added = mgmt_store->add_member(group_id, agent_id); !added) {
+                      // The group vanished between the check above and the insert (the
+                      // membership foreign key failed): 404 and no retry hint, as before, and
+                      // a `failure` outcome row with a fixed token so the `attempted` row is
+                      // never left without one.
+                      if (mgmt_group_confirmed_absent(mgmt_store, group_id)) {
+                          (void)detail::emit_behavioral_audit(
+                              bound_audit, req, res, "management_group.add_member", "failure",
+                              "ManagementGroup", group_id,
+                              mgmt_group_failure_detail("group_not_found", agent_id));
+                          mgmt_group_not_found(res);
+                          return;
+                      }
+                      spdlog::warn("management_group.add_member store failure: {}",
+                                   ::yuzu::log_key_token(added.error()));
+                      (void)detail::emit_behavioral_audit(bound_audit, req, res,
+                                                          "management_group.add_member", "failure",
+                                                          "ManagementGroup", group_id,
+                                                          mgmt_group_failure_detail("store_error",
+                                                                                    agent_id));
+                      mgmt_write_failed(res);
+                      return;
+                  }
+                  // The member is added: a lost outcome row keeps the 201 and marks the response
+                  // `Sec-Audit-Failed` (the `attempted` row stands as "started, outcome unknown").
+                  // The success row's detail ends with the `agent_known=` flag (see
+                  // mgmt_group_agent_known.hpp for how a reader takes it).
+                  (void)detail::emit_behavioral_audit(
+                      bound_audit, req, res, "management_group.add_member", "success",
+                      "ManagementGroup", group_id, add_member_success_detail(agent_id, agent_known));
                   res.status = 201;
                   res.set_content(ok_json(JObj().add("added", true).str()), "application/json");
               });
 
     sink.Delete(
         R"(/api/v1/management-groups/([a-f0-9]+)/members/(.+))",
-        [perm_fn, audit_fn, mgmt_store, mgmt_write_failed,
-         mgmt_text_ok](const httplib::Request& req, httplib::Response& res) {
+        [auth_fn, perm_fn, audit_fn, mgmt_store, mgmt_write_failed, mgmt_text_ok,
+         mgmt_member_recheck, audit_as_session = audit_as_session_fn_](const httplib::Request& req,
+                                                                      httplib::Response& res) {
             if (!perm_fn(req, res, "ManagementGroup", "Write"))
                 return;
             if (!mgmt_store) {
@@ -5118,6 +5319,18 @@ void RestApiV1::register_routes(
 
             auto group_id = req.matches[1].str();
             auto agent_id = req.matches[2].str();
+            if (group_id.size() > kMgmtGroupIdMaxBytes) { // names no group; no row
+                res.status = 404;
+                res.set_content(detail::a4_error(res, "group not found"), "application/json");
+                return;
+            }
+            // No row; an unclean id keeps its denied row.
+            if (!mgmt_group_agent_id_length_ok(agent_id)) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, std::string(kMgmtGroupAgentIdTooLongText)),
+                                "application/json");
+                return;
+            }
             if (!mgmt_text_ok(agent_id)) {
                 audit_fn(req, "management_group.remove_member", "denied", "ManagementGroup",
                          group_id, "invalid_agent_id");
@@ -5126,15 +5339,35 @@ void RestApiV1::register_routes(
                                 "application/json");
                 return;
             }
+            // Idempotent as before: removing an absent member (or from an absent group) is a
+            // success, so there is no group-exists answer here, only the audit-first order.
+            // The session every row names, the `attempted` row included, resolved before it (see
+            // the create route).
+            const auto session = auth_fn(req, res); // writes its own 401
+            if (!session)
+                return;
+            const AuditFn bound_audit =
+                audit_as_session ? audit_as(audit_as_session, *session) : audit_fn;
+            if (!detail::audit_attempted(bound_audit, req, res, "management_group.remove_member",
+                                         "ManagementGroup", group_id, agent_id))
+                return;
+            if (!mgmt_member_recheck(req, res, "management_group.remove_member", group_id,
+                                     agent_id, bound_audit, session->username))
+                return;
             if (auto removed = mgmt_store->remove_member(group_id, agent_id); !removed) {
-                spdlog::warn("management_group.remove_member store failure: {}", removed.error());
-                audit_fn(req, "management_group.remove_member", "failure", "ManagementGroup",
-                         group_id, "store_error");
+                spdlog::warn("management_group.remove_member store failure: {}",
+                             ::yuzu::log_key_token(removed.error()));
+                (void)detail::emit_behavioral_audit(bound_audit, req, res,
+                                                    "management_group.remove_member", "failure",
+                                                    "ManagementGroup", group_id,
+                                                    mgmt_group_failure_detail("store_error",
+                                                                              agent_id));
                 mgmt_write_failed(res);
                 return;
             }
-            audit_fn(req, "management_group.remove_member", "success", "ManagementGroup", group_id,
-                     agent_id);
+            (void)detail::emit_behavioral_audit(bound_audit, req, res,
+                                                "management_group.remove_member", "success",
+                                                "ManagementGroup", group_id, agent_id);
             res.set_content(ok_json(JObj().add("removed", true).str()), "application/json");
         });
 

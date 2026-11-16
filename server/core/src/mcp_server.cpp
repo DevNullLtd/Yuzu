@@ -64,7 +64,9 @@
 #include "app_usage_read_model.hpp"        // AppUsageModel, app_usage_json (Rule 1 shared builder)
 #include "app_usage_store.hpp"            // get_agent_app_usage (wave 7 PR7.2 projection)
 #include "rbac_store.hpp"                 // rbac_enforcement_in_effect (#1717 fail-closed SLE gate)
+#include "mgmt_group_agent_known.hpp" // lookup_agent_known: the add-member `agent_known` audit flag, REST and MCP
 #include "mgmt_group_error.hpp"            // mgmt_group_error_is_store_fault: one classifier for REST and MCP
+#include "mgmt_group_limits.hpp"           // name / group id bounds and the clean-text rule (REST, MCP, Settings)
 #include "rbac_text.hpp"                  // rbac_text_is_clean — identifier check shared with the owner
 #include "service_scope_policy.hpp"       // authz::kServiceScopeGlobalSafe (#2298 PR 3 §3c boot cross-check)
 // ADR-0031 operator surface (PR1.6c, p14) — mint/list/revoke_upload_grant.
@@ -1115,7 +1117,10 @@ static const ToolDef kTools[] = {
     {"create_management_group",
      "Create a new management group (hierarchical device grouping used for access scoping). "
      "Mirrors POST /api/v1/management-groups. Requires ManagementGroup:Write — approval-gated "
-     "(supervised MCP tier maker-checker). Additive: creates a new group, overwrites nothing.",
+     "(supervised MCP tier maker-checker). Additive: creates a new group, overwrites nothing. "
+     "Audit-first: an `attempted` audit row is stored before the group is created; if it cannot "
+     "be stored the call is refused with an internal error (retryable) and nothing is created. "
+     "audit_persisted:false in a success means only the closing outcome row was lost.",
      R"j({"type":"object","properties":{)j"
      R"j("name":{"type":"string","minLength":1,"maxLength":256,"description":"Group display name"},)j"
      R"j("description":{"type":"string","maxLength":1024,"description":"Optional description"},)j"
@@ -1123,7 +1128,7 @@ static const ToolDef kTools[] = {
      R"j("membership_type":{"type":"string","enum":["static","dynamic"],"default":"static","description":"static = explicit member list via add_management_group_member; dynamic = scope_expression-evaluated"},)j"
      R"j("scope_expression":{"type":"string","maxLength":4096,"description":"Scope DSL expression for a dynamic group; ignored for static"})j"
      R"j(},"required":["name"]})j",
-     R"j({"type":"object","properties":{"id":{"type":"string"}},"required":["id"]})j"},
+     R"j({"type":"object","properties":{"id":{"type":"string"},"audit_persisted":{"type":"boolean","description":"Present (false) only when the closing success row could not be stored; the group exists. A closing failure row that could not be stored is not reported here (no group exists then)"}},"required":["id"]})j"},
 
     {"get_management_group",
      "Get one management group's metadata plus its current member list. #1762: "
@@ -1157,12 +1162,18 @@ static const ToolDef kTools[] = {
      "Add a static member to a management group. Idempotent — adding an agent already in the "
      "group is a no-op. Mirrors POST /api/v1/management-groups/{id}/members. Requires "
      "ManagementGroup:Write — approval-gated (supervised MCP tier maker-checker). Additive: "
-     "extends the member set, overwrites nothing.",
+     "extends the member set, overwrites nothing. An agent id with no enrolment record "
+     "(pending, approved or denied) is still added; whether it has one is recorded on the "
+     "success audit row (`agent_known`), not returned. Audit-first: an `attempted` audit row is "
+     "stored before the member is added; if it cannot be stored the call is refused with an "
+     "internal error "
+     "(retryable) and nothing is added. audit_persisted:false in a success means only the "
+     "closing outcome row was lost.",
      R"j({"type":"object","properties":{)j"
      R"j("group_id":{"type":"string","minLength":1,"maxLength":256,"description":"Management group id"},)j"
      R"j("agent_id":{"type":"string","minLength":1,"maxLength":256,"description":"Agent to add as a static member"})j"
      R"j(},"required":["group_id","agent_id"]})j",
-     R"j({"type":"object","properties":{"added":{"type":"boolean"}},"required":["added"]})j"},
+     R"j({"type":"object","properties":{"added":{"type":"boolean"},"audit_persisted":{"type":"boolean","description":"Present (false) only when the closing success row could not be stored; the member was added. A closing failure row that could not be stored is not reported here (nothing was added then)"}},"required":["added"]})j"},
 
     {"list_management_group_roles",
      "List a management group's role-assignment grants (who holds ITServiceOwner/Operator/Viewer "
@@ -6588,7 +6599,9 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     // B4 (#2146 API-parity) — management-group mutations.
     // create_management_group: pure INSERT of a new group → Additive, matching
     // create_engine_principal's reasoning above. Not idempotent — a repeat call
-    // with the same name mints a SECOND group (name is not unique).
+    // with the same name creates nothing: management_groups.name is UNIQUE
+    // (`management_groups_name_key`), so the second call is refused as a name
+    // conflict and answers an error, not the first call's group id.
     {"create_management_group", {ToolEffect::Additive, false, "Create management group"}},
     // update_management_group: UPDATE overwrites the group's existing fields
     // (name/description/parent/membership_type/scope_expression) → Destructive.
@@ -6796,6 +6809,9 @@ static_assert(std::is_same_v<ToolDeps::RosterFn, HardwareRoutes::RosterFn>,
               "ToolDeps::RosterFn drifted from HardwareRoutes::RosterFn");
 static_assert(std::is_same_v<ToolDeps::CiDetailFn, HardwareRoutes::CiDetailFn>,
               "ToolDeps::CiDetailFn drifted from HardwareRoutes::CiDetailFn");
+static_assert(std::is_same_v<decltype(ToolDeps::ci_page_reader),
+                             decltype(HardwareRoutes::Deps::ci_page_reader)>,
+              "ToolDeps::ci_page_reader drifted from HardwareRoutes::Deps::ci_page_reader");
 static_assert(std::is_same_v<ToolDeps::DexScoreFn, HardwareRoutes::DexScoreFn>,
               "ToolDeps::DexScoreFn drifted from HardwareRoutes::DexScoreFn");
 static_assert(std::is_same_v<ToolDeps::CryptoAccessFn, McpServer::CryptoAccessFn>,
@@ -7291,22 +7307,13 @@ MgmtGroupErrorInfo classify_mgmt_group_error(const std::string& msg) {
 
 // The management-group id fields reach a text bind: a control byte or an invalid
 // UTF-8 sequence is refused as invalid params instead of surfacing as a retryable
-// store fault. Twin: mgmt_text_ok in rest_api_v1.cpp (same rule).
-bool mgmt_text_ok(std::string_view s) {
-    if (!rbac_text_is_clean(s))
-        return false;
-    for (std::size_t i = 0; i < s.size();) {
-        if (static_cast<unsigned char>(s[i]) < 0x80) {
-            ++i;
-            continue;
-        }
-        const std::size_t len = ::yuzu::utf8_sequence_length(s, i);
-        if (len == 0)
-            return false;
-        i += len;
-    }
-    return true;
-}
+// store fault. Twin: mgmt_text_ok in rest_api_v1.cpp (the same predicate,
+// mgmt_group_text_is_clean).
+bool mgmt_text_ok(std::string_view s) { return mgmt_group_text_is_clean(s); }
+static_assert(kMgmtGroupNameMaxLen == kMgmtGroupNameMaxBytes,
+              "the MCP schema bound for a group name and the handler bound must agree");
+static_assert(kMgmtGroupIdMaxLen == kMgmtGroupIdMaxBytes,
+              "the MCP schema bound for a group id and the handler bound must agree");
 
 // True only when the store answered authoritatively that the group does not
 // exist (a failed read is not "absent"). Used after a write failed to tell a
@@ -8854,6 +8861,76 @@ McpServer::HandlerFn McpServer::build_handler(
                     data += R"(,"audit_persisted":false)";
                 data += "}";
                 return error_response(id, code, message, data);
+            };
+
+            // The ONE audit write of the audit-first management-group tools (#7074): a
+            // `ManagementGroup` row through the shared kernel `try_persist_audit`, which catches
+            // any exception (std or not), logs it and reports "not stored" instead of letting it
+            // escape the handler. An unwired sink is audit-off and reports stored, as on the REST
+            // twins. `attempted` fails closed (a refusal); an outcome row only sets
+            // `audit_persisted:false` on a result that already stands.
+            auto mg_audit = [&](const char* action, const char* result_status,
+                                const std::string& target_id,
+                                const std::string& detail_text) -> bool {
+                return yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, action, result_status, "ManagementGroup", target_id,
+                    detail_text);
+            };
+
+            // EVERY management-group row that names the caller (the `attempted` row, the
+            // `*_revoked` failure rows and the outcome row) is written after the session may be
+            // gone (the handler resolves it first, then waits on the pool for the group read, the
+            // enrolment lookup, the audit write and the store call), when the re-resolving
+            // `audit_fn` would stamp an empty principal and break principal-based pairing of the
+            // rows. They go through the session-bound writer (`ToolDeps::audit_as_session_fn`,
+            // the one REST binds its session-bound rows to) with the session this call resolved
+            // at the top of the handler and the role taken from it ONCE, here, so every row of
+            // one call carries the same principal and role. server.cpp binds the writer only
+            // where the runtime-config store is open (the DEX score policy tools' deps, whose
+            // tripwire pins that wiring); with none wired (that deployment, tests) they use
+            // mg_audit, whose row re-resolves the session. Any exception from the writer is
+            // caught like mg_audit's.
+            auto mg_audit_bound = [&, role = auth::role_to_string(auth::effective_role(*session))](
+                                      const char* action, const char* result_status,
+                                      const std::string& target_id,
+                                      const std::string& detail_text) -> bool {
+                if (!tool_deps_.audit_as_session_fn)
+                    return mg_audit(action, result_status, target_id, detail_text);
+                try {
+                    return tool_deps_.audit_as_session_fn(req, *session, role, action,
+                                                          result_status, "ManagementGroup",
+                                                          target_id, detail_text);
+                } catch (...) {
+                    spdlog::warn("audit_as_session_fn threw on management-group row action={} "
+                                 "target={}",
+                                 action, audit_token(target_id));
+                    return false;
+                }
+            };
+
+            // The ONE attempted-row-or-refuse step of the audit-first management-group writes
+            // (#7074, ADR-0033 section 9 "no audit row, no mutation"): create_management_group
+            // and add_management_group_member both use it, the twin of detail::audit_attempted on
+            // the REST routes. Stores the `attempted` row for `action`; when it cannot be stored
+            // it writes the tool-level `mcp.<tool>` failure row (`refused_detail`), answers an
+            // internal error with a retry hint and returns false: the caller must return without
+            // mutating. Extend this, never copy it into a second handler.
+            auto mcp_audit_attempted_or_refuse = [&](const char* action,
+                                                     const std::string& target_id,
+                                                     const std::string& detail_text,
+                                                     const char* refused_detail) -> bool {
+                if (mg_audit_bound(action, "attempted", target_id, detail_text))
+                    return true;
+                mcp_audit("failure", refused_detail);
+                // The approval ticket of a supervised call was spent before this handler ran, so
+                // a retry at that tier needs a new approval as well as a working audit log.
+                res.set_content(
+                    a4_error(kInternalError, "audit log unavailable; the change was not made",
+                             "retry once the audit log is available; at the supervised tier a new "
+                             "approval is needed",
+                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                    "application/json");
+                return false;
             };
 
             // #4353 follow-up (Gate 2 finding on #4364): shared responder for the
@@ -14290,6 +14367,22 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                // The length bound is enforced above; the name and the parent id are also held
+                // to clean text (mgmt_group_limits.hpp) before any store read or `attempted`
+                // row, with a fixed refusal text. Only the tool-level mcp.* row is written.
+                if (!mgmt_group_name_ok(name)) {
+                    mcp_audit("denied", "invalid_name");
+                    res.set_content(
+                        a4_error(kInvalidParams, std::string(kMgmtGroupNameInvalidText)),
+                        "application/json");
+                    return;
+                }
+                if (!mgmt_group_id_ok(param_str(args, "parent_id"))) { // names no group
+                    mcp_audit("denied", "invalid_parent_id");
+                    res.set_content(a4_error(kInvalidParams, "parent group not found"),
+                                    "application/json");
+                    return;
+                }
                 if (!mgmt_store) {
                     res.set_content(a4_error(kInternalError, "Management group store unavailable",
                                              "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
@@ -14304,20 +14397,77 @@ McpServer::HandlerFn McpServer::build_handler(
                 g.scope_expression = param_str(args, "scope_expression");
                 g.created_by = session->username;
 
-                auto result = mgmt_store->create_group(g);
-                if (!result) {
-                    const auto info = classify_mgmt_group_error(result.error());
-                    const bool audit_ok = audit_fn(req, "management_group.create", "failure",
-                                                   "ManagementGroup", name, result.error());
-                    res.set_content(
-                        a4_error(info.code, result.error(), {}, /*retry_after_ms=*/info.retry_after_ms,
-                                 {}, audit_ok),
-                        "application/json");
-                    mcp_audit("failure", result.error());
+                // Audit-first (ADR-0033 section 9, "no audit row, no mutation", #7074); the
+                // REST twin is POST /api/v1/management-groups. The store's own fault text
+                // (libpq output) is never returned or audited: a fixed answer and token only.
+                const auto store_fault = [&]() {
+                    res.set_content(a4_error(kInternalError, "Management group store unavailable",
+                                             "retry the request",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                };
+                // The checks create_group runs before its insert, decided here so a refusal
+                // burns no `attempted` row (and writes no management_group.create row).
+                if (auto valid = mgmt_store->validate_new_group(g); !valid) {
+                    if (classify_mgmt_group_error(valid.error()).code == kInternalError) {
+                        mcp_audit("failure", "store_error");
+                        store_fault();
+                        return;
+                    }
+                    mcp_audit("failure", valid.error());
+                    res.set_content(a4_error(kInvalidParams, valid.error()), "application/json");
                     return;
                 }
-                const bool audit_ok = audit_fn(req, "management_group.create", "success",
-                                               "ManagementGroup", *result, name);
+                if (!mcp_audit_attempted_or_refuse("management_group.create", "", name,
+                                                   "audit unavailable; group not created"))
+                    return;
+                // The attempted row can wait on the audit pool: authenticate and authorise
+                // again, so a credential revoked or a grant removed meanwhile creates nothing.
+                // `auth_fn` / `perm_fn` write their own 401 / 403 into `res`.
+                const auto fresh = auth_fn(req, res);
+                if (!fresh || fresh->username != session->username) {
+                    (void)mg_audit_bound("management_group.create", "failure", "",
+                                         mgmt_group_failure_detail("session_revoked", name));
+                    if (res.status < 400) { // auth_fn writes its own 401; cover one that did not
+                        res.status = 401;
+                        res.set_content(a4_error(kPermissionDenied, "authentication required",
+                                                 "authenticate again and retry the call"),
+                                        "application/json");
+                    }
+                    return;
+                }
+                if (!perm_fn(req, res, "ManagementGroup", "Write")) {
+                    (void)mg_audit_bound("management_group.create", "failure", "",
+                                         mgmt_group_failure_detail("permission_revoked", name));
+                    return;
+                }
+
+                auto result = mgmt_store->create_group(g);
+                if (!result) {
+                    // The attempted row is stored, so it gets an outcome with a FIXED token.
+                    const auto token = create_failure_token(result.error());
+                    const bool conflict = token == kMgmtGroupTokenNameConflict;
+                    const bool fault = token == kMgmtGroupTokenStoreError;
+                    const bool audit_ok =
+                        mg_audit_bound("management_group.create", "failure", "",
+                                       mgmt_group_failure_detail(token, name));
+                    mcp_audit("failure", conflict ? std::string(kMgmtGroupTokenNameConflict)
+                                                  : (fault ? std::string(kMgmtGroupTokenStoreError)
+                                                           : result.error()));
+                    if (fault) {
+                        // The cause is logged, never returned to the caller or audited.
+                        spdlog::error("management_group.create store fault: {}",
+                                      ::yuzu::log_key_token(result.error()));
+                        store_fault();
+                        return;
+                    }
+                    // A name conflict or a validation literal: closed text, safe to echo.
+                    res.set_content(a4_error(kInvalidParams, result.error(), {}, -1, {}, audit_ok),
+                                    "application/json");
+                    return;
+                }
+                const bool audit_ok =
+                    mg_audit_bound("management_group.create", "success", *result, name);
                 JObj payload;
                 payload.add("id", *result);
                 if (!audit_ok)
@@ -14645,8 +14795,10 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!mgmt_text_ok(group_id) || !mgmt_text_ok(agent_id)) {
                     const char* detail_token =
                         !mgmt_text_ok(agent_id) ? "invalid_agent_id" : "invalid_group_id";
-                    (void)audit_fn(req, "management_group.add_member", "denied", "ManagementGroup",
-                                   audit_token(group_id), detail_token);
+                    // Through mg_audit (try_persist_audit): a throwing sink must not escape the
+                    // handler as a 500 on this refusal, as on every other row of this route.
+                    (void)mg_audit("management_group.add_member", "denied", audit_token(group_id),
+                                   detail_token);
                     res.set_content(
                         a4_error(kInvalidParams,
                                  "group_id and agent_id must not contain control characters or "
@@ -14660,20 +14812,78 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                // Audit-first (ADR-0033 section 9, "no audit row, no mutation", #7074); the REST
+                // twin is POST /api/v1/management-groups/{id}/members. A group that does not
+                // exist is answered before any row is written: a refusal burns no `attempted`
+                // row. An unreadable group is a store fault, not "absent".
+                const auto exists = mgmt_store->get_group_checked(group_id);
+                if (!exists) {
+                    spdlog::warn("add_management_group_member group read failure: {}",
+                                 ::yuzu::log_key_token(exists.error()));
+                    mcp_audit("failure", "store_error");
+                    res.set_content(a4_error(kInternalError, "management group store unavailable",
+                                             "retry shortly",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                if (!exists->has_value()) {
+                    mcp_audit("denied", "group not found");
+                    res.set_content(a4_error(kInvalidParams, "group not found"),
+                                    "application/json");
+                    return;
+                }
+                // Does the server hold an enrolment record for this id? A read, made after the
+                // group-exists answer and before the `attempted` row. It only FLAGS the id, on the
+                // success audit row; it is never returned. An unknown id is accepted and no lookup
+                // outcome refuses the add. Unreadable is recorded as neither known nor unknown (the
+                // REST twin does the same).
+                const AgentKnown agent_known = lookup_agent_known(auth_db, agent_id);
+                if (!mcp_audit_attempted_or_refuse("management_group.add_member", group_id,
+                                                   agent_id,
+                                                   "audit unavailable; member not added"))
+                    return;
+                // The attempted row can wait on the audit pool: authenticate and authorise
+                // again, so a credential revoked or a grant removed meanwhile adds nothing.
+                // `auth_fn` / `perm_fn` write their own 401 / 403 into `res`.
+                const auto fresh = auth_fn(req, res);
+                if (!fresh || fresh->username != session->username) {
+                    (void)mg_audit_bound("management_group.add_member", "failure", group_id,
+                                         mgmt_group_failure_detail("session_revoked", agent_id));
+                    if (res.status < 400) { // auth_fn writes its own 401; cover one that did not
+                        res.status = 401;
+                        res.set_content(a4_error(kPermissionDenied, "authentication required",
+                                                 "authenticate again and retry the call"),
+                                        "application/json");
+                    }
+                    return;
+                }
+                if (!perm_fn(req, res, "ManagementGroup", "Write")) {
+                    (void)mg_audit_bound("management_group.add_member", "failure", group_id,
+                                         mgmt_group_failure_detail("permission_revoked", agent_id));
+                    return;
+                }
                 auto result = mgmt_store->add_member(group_id, agent_id);
                 if (!result) {
                     const auto info = classify_mgmt_group_error(result.error());
-                    // A well-formed id naming no group fails the membership foreign key:
-                    // not found (the sibling tools' answer), no failure row, no retry hint.
+                    // The group vanished between the check above and the insert (the membership
+                    // foreign key failed): not found and no retry hint, as before, plus a
+                    // `failure` outcome row with a fixed token so the `attempted` row is never
+                    // left without one.
                     if (info.retry_after_ms > 0 && mgmt_group_confirmed_absent(*mgmt_store, group_id)) {
+                        (void)mg_audit_bound(
+                            "management_group.add_member", "failure", group_id,
+                            mgmt_group_failure_detail("group_not_found", agent_id));
                         mcp_audit("denied", "group not found");
                         res.set_content(a4_error(kInvalidParams, "group not found"),
                                         "application/json");
                         return;
                     }
-                    spdlog::warn("add_management_group_member store failure: {}", result.error());
-                    const bool audit_ok = audit_fn(req, "management_group.add_member", "failure",
-                                                   "ManagementGroup", group_id, "store_error");
+                    spdlog::warn("add_management_group_member store failure: {}",
+                                 ::yuzu::log_key_token(result.error()));
+                    const bool audit_ok = mg_audit_bound(
+                        "management_group.add_member", "failure", group_id,
+                        mgmt_group_failure_detail("store_error", agent_id));
                     res.set_content(
                         a4_error(info.code, "management group store unavailable", "retry shortly",
                                  /*retry_after_ms=*/info.retry_after_ms, {}, audit_ok),
@@ -14681,8 +14891,11 @@ McpServer::HandlerFn McpServer::build_handler(
                     mcp_audit("failure", "store_error");
                     return;
                 }
-                const bool audit_ok = audit_fn(req, "management_group.add_member", "success",
-                                               "ManagementGroup", group_id, agent_id);
+                // The success row's detail ends with the `agent_known=` flag (see
+                // mgmt_group_agent_known.hpp for how a reader takes it).
+                const bool audit_ok =
+                    mg_audit_bound("management_group.add_member", "success", group_id,
+                                   add_member_success_detail(agent_id, agent_known));
                 JObj payload;
                 payload.add("added", true);
                 if (!audit_ok)
