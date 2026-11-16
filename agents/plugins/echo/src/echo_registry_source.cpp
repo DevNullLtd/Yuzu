@@ -36,16 +36,30 @@ std::string baseline_collector(const std::string& root) { return "registry:" + r
 // The gap row text for child keys that denied read access: names the first few. The names
 // are key names a local user chose under their own hive, so each goes through log_key_token
 // (control bytes and line separators folded) before it lands in the stored row.
-std::string denied_children_detail(const std::string& root, const std::vector<std::string>& denied) {
+// `overflow` counts the children past kSkippedCap that are skipped but cannot be named. A child
+// whose name holds U+0000 (never opened) shows the NUL as `\0`: log_key_token would fold it to
+// an underscore, which reads as a different name.
+std::string denied_children_detail(const std::string& root, const std::vector<std::string>& denied,
+                                   std::size_t overflow = 0) {
     constexpr std::size_t kShown = 3;
-    std::string d = std::format("gap:unreadable:{} ({} child key(s) denied read access; their values "
-                                "and anything beneath them are not read, and deletions beneath them "
-                                "are not derived, until they can be): ",
-                                root, denied.size());
-    for (std::size_t i = 0; i < denied.size() && i < kShown; ++i)
-        d += (i == 0 ? "" : "; ") + yuzu::log_key_token(denied[i]);
+    std::string d = std::format("gap:unreadable:{} ({} child key(s) denied read access or not "
+                                "openable; their values and anything beneath them are not read, and "
+                                "deletions beneath them are not derived, until they can be): ",
+                                root, denied.size() + overflow);
+    for (std::size_t i = 0; i < denied.size() && i < kShown; ++i) {
+        std::string name;
+        for (const char c : denied[i]) {
+            if (c == '\0')
+                name += "\\0";
+            else
+                name += c;
+        }
+        d += (i == 0 ? "" : "; ") + yuzu::log_key_token(name);
+    }
     if (denied.size() > kShown)
         d += std::format("; +{} more", denied.size() - kShown);
+    if (overflow > 0)
+        d += std::format("; and {} more not named", overflow);
     return d;
 }
 
@@ -409,7 +423,7 @@ CursorCollectResult RegistryCursorSource::collect(EchoDatabase& db,
                 if (gained)
                     rows.push_back(registry_gap_row("unreadable",
                                                     root + ":" + std::to_string(read_end),
-                                                    denied_children_detail(root, st.skipped), now,
+                                                    denied_children_detail(root, st.skipped, rd.skipped_overflow), now,
                                                     snapshot_id));
             }
 
@@ -1286,11 +1300,24 @@ LONG query_key(HKEY key, KeyInfo& out) {
                             &out.n_val, nullptr, &out.max_data, nullptr, &out.written);
 }
 
+// The one key-budget-and-deadline check: every key the walk enters AND every child it skips is
+// charged here, so the two cannot drift (the decision itself is RegistryReadBudget::admit_key_by,
+// which the unit suite runs).
+bool admit_visit(ReadCtx& ctx) {
+    return ctx.budget.admit_key_by(filetime_now(), ctx.deadline);
+}
+
+// A registry name as the identity string: the wide characters go through registry_name_utf8
+// (injective, lone surrogates and all), never the lossy from_wide.
+std::string name_identity(const wchar_t* p, std::size_t n) {
+    static_assert(sizeof(wchar_t) == sizeof(char16_t));
+    return registry_name_utf8(std::u16string_view(reinterpret_cast<const char16_t*>(p), n));
+}
+
 void read_key(ReadCtx& ctx, HKEY key, const std::string& full, std::size_t depth) {
     if (ctx.capped || ctx.unreadable)
         return;
-    if (!RegistryReadBudget::depth_ok(depth) || !ctx.budget.admit_key() ||
-        filetime_now() >= ctx.deadline) {
+    if (!RegistryReadBudget::depth_ok(depth) || !admit_visit(ctx)) {
         ctx.capped = true;
         return;
     }
@@ -1339,7 +1366,10 @@ void read_key(ReadCtx& ctx, HKEY key, const std::string& full, std::size_t depth
             ctx.capped = true;
             return;
         }
-        values[yuzu::win::from_wide(ctx.name.data(), static_cast<int>(nlen))] = std::move(v);
+        // The first entry under a name is kept: a repeat (not expected, the encoding is
+        // injective) makes the read partial instead of overwriting.
+        if (!record_registry_name(values, name_identity(ctx.name.data(), nlen), std::move(v)))
+            ctx.capped = true;
     }
     if (ctx.capped)
         return; // a value was left unread: the read is partial, do not walk on
@@ -1354,27 +1384,41 @@ void read_key(ReadCtx& ctx, HKEY key, const std::string& full, std::size_t depth
             ctx.unreadable = true;
             return;
         }
-        const std::string child_path =
-           full + "\\" + yuzu::win::from_wide(sub.data(), static_cast<int>(slen));
+        const std::string child_path = full + "\\" + name_identity(sub.data(), slen);
         // Not configuration (see registry_path_excluded): never opened, so its constant writes
         // cannot disturb the read of the rest of the root.
         if (registry_path_excluded(child_path))
             continue;
+        if (ctx.out->keys.contains(child_path)) {
+            ctx.capped = true; // a repeat of a key already read: keep the first, the read is partial
+            return;
+        }
+        // A name holding U+0000 cannot be passed to RegOpenKeyExW (it stops at the NUL and would
+        // open a different key): it is never opened, only reported as a child that was not read.
+        const bool has_nul = std::find(sub.data(), sub.data() + slen, L'\0') != sub.data() + slen;
         yuzu::win::RegKey child;
-        // OPEN_LINK: a child that is a symbolic-link key is read as the link (its own
-        // SymbolicLinkValue), never followed into whatever it points at.
-        const LONG orc = RegOpenKeyExW(key, sub.data(), REG_OPTION_OPEN_LINK, KEY_READ | KEY_WOW64_64KEY,
-                                       child.put());
-        if (orc == ERROR_FILE_NOT_FOUND || orc == ERROR_KEY_DELETED)
-            continue; // deleted between enumerate and open: the next read sees it gone
-        if (orc == ERROR_ACCESS_DENIED) {
+        LONG orc = ERROR_SUCCESS;
+        if (!has_nul) {
+            // OPEN_LINK: a child that is a symbolic-link key is read as the link (its own
+            // SymbolicLinkValue), never followed into whatever it points at.
+            orc = RegOpenKeyExW(key, sub.data(), REG_OPTION_OPEN_LINK, KEY_READ | KEY_WOW64_64KEY,
+                                child.put());
+            if (orc == ERROR_FILE_NOT_FOUND || orc == ERROR_KEY_DELETED)
+                continue; // deleted between enumerate and open: the next read sees it gone
+        }
+        if (has_nul || orc == ERROR_ACCESS_DENIED) {
             // A child this agent may not read hides only itself: record it and read on. The
             // diff keeps what the baseline holds beneath it, and collect() reports the gap.
-            if (ctx.out->skipped.size() >= kSkippedCap) {
-                ctx.capped = true; // too many to track: a partial read, so no removals
+            // Skipping is charged like a visit, so a key with a huge number of unopenable
+            // children still ends at the budget or the deadline.
+            if (!admit_visit(ctx)) {
+                ctx.capped = true;
                 return;
             }
-            ctx.out->skipped.push_back(child_path);
+            if (ctx.out->skipped.size() < kSkippedCap)
+                ctx.out->skipped.push_back(child_path);
+            else
+                ++ctx.out->skipped_overflow; // counted, not named: the read ends Capped (no removals)
             continue;
         }
         if (orc != ERROR_SUCCESS) {
@@ -1418,14 +1462,19 @@ SubtreeRead read_root_at(HKEY key, const std::string& label, std::int64_t deadli
             out.keys.clear();
             out.written.clear();
             out.skipped.clear();
+            out.skipped_overflow = 0;
             out.status = RegistryReadStatus::Unreadable;
         } else {
-            out.status = ctx.capped ? RegistryReadStatus::Capped : RegistryReadStatus::Complete;
+            // Unnamed skipped children: their baseline cannot be protected by name, so no
+            // removal may be derived from this read.
+            out.status = (ctx.capped || out.skipped_overflow > 0) ? RegistryReadStatus::Capped
+                                                                  : RegistryReadStatus::Complete;
         }
     } catch (...) {
         out.keys.clear();
         out.written.clear();
         out.skipped.clear();
+        out.skipped_overflow = 0;
         out.status = RegistryReadStatus::Unreadable;
     }
     return out;
@@ -1470,6 +1519,7 @@ SubtreeRead read_root(const std::string& root, std::int64_t deadline) noexcept {
     } catch (...) {
         out.keys.clear();
         out.skipped.clear();
+        out.skipped_overflow = 0;
         out.status = RegistryReadStatus::Unreadable;
     }
     return out;

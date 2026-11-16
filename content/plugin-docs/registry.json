@@ -2193,7 +2193,9 @@
     "capability_rows": [
       "server/core/src/capability_decls/plugin_action_catalogue_a.hpp"
     ],
-    "changelog": [],
+    "changelog": [
+      "changelog.d/6513-echo-registry-child-names.fixed.md"
+    ],
     "definitions": [
       "content/definitions/registry.yaml"
     ],

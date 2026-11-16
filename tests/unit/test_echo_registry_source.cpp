@@ -401,6 +401,129 @@ TEST_CASE("diff_registry_snapshot: added/changed/removed values and the four rea
     }
 }
 
+// The test-side inverse of registry_name_utf8 (production has no decoder: nothing needs one).
+// Reading left to right a U+FFFD is followed by a second U+FFFD (a literal one) or by four hex
+// digits that start with `D` (a lone surrogate).
+std::u16string decode_registry_name(const std::string& s) {
+    std::u16string out;
+    const auto cp_at = [&](std::size_t& i) {
+        const auto b0 = static_cast<unsigned char>(s[i]);
+        const std::size_t n = b0 < 0x80 ? 1 : b0 < 0xE0 ? 2 : b0 < 0xF0 ? 3 : 4;
+        char32_t cp = n == 1 ? b0 : (b0 & (0xFF >> (n + 1)));
+        for (std::size_t k = 1; k < n; ++k)
+            cp = (cp << 6) | (static_cast<unsigned char>(s[i + k]) & 0x3F);
+        i += n;
+        return cp;
+    };
+    for (std::size_t i = 0; i < s.size();) {
+        const char32_t cp = cp_at(i);
+        if (cp == 0xFFFD) {
+            if (i < s.size() && static_cast<unsigned char>(s[i]) == 0xEF) { // a second U+FFFD
+                cp_at(i);
+                out += static_cast<char16_t>(0xFFFD);
+            } else { // four hex digits: a lone surrogate
+                out += static_cast<char16_t>(std::stoi(s.substr(i, 4), nullptr, 16));
+                i += 4;
+            }
+        } else if (cp >= 0x10000) {
+            out += static_cast<char16_t>(0xD800 + ((cp - 0x10000) >> 10));
+            out += static_cast<char16_t>(0xDC00 + ((cp - 0x10000) & 0x3FF));
+        } else {
+            out += static_cast<char16_t>(cp);
+        }
+    }
+    return out;
+}
+
+const std::vector<std::u16string>& registry_name_table() {
+    static const std::vector<std::u16string> t{
+       u"Run",                        // valid BMP text
+       u"café 中",           // non-ASCII BMP
+       u"x\U0001F600y",               // a surrogate pair
+       std::u16string{u'a', char16_t(0xD800)},                          // a lone high
+       std::u16string{u'a', char16_t(0xDC00)},                          // a lone low
+       std::u16string{char16_t(0xD800), u'D', u'8', u'0', u'0'},        // a lone high then the text D800
+       std::u16string{char16_t(0xD800)},                                // a lone high alone
+       u"�",                     // a literal replacement character
+       u"�" u"D800",             // a literal one followed by the text D800
+       u"��",               // two literal ones
+       u"\\uD800",                    // the valid name spelt backslash-u-D800
+       std::u16string{u'n', char16_t(0), u'm'}, // a name with U+0000
+       std::u16string{char16_t(0xDC00), char16_t(0xD800)}, // low then high: both lone
+    };
+    return t;
+}
+
+TEST_CASE("registry names: valid UTF-16 without a replacement character converts to the same UTF-8 as before",
+          "[echo][registry][pure]") {
+    CHECK(registry_name_utf8(u"Run") == "Run");
+    CHECK(registry_name_utf8(u"café 中") == "caf\xC3\xA9 \xE4\xB8\xAD");
+    CHECK(registry_name_utf8(u"x\U0001F600y") == "x\xF0\x9F\x98\x80y");
+    CHECK(registry_name_utf8(u"\\uD800") == "\\uD800"); // a backslash is just a backslash
+    CHECK(registry_name_utf8(std::u16string{u'n', char16_t(0), u'm'}) == std::string("n\0m", 3));
+}
+
+TEST_CASE("registry names: a lone surrogate and a literal replacement character and the spelled-out escape text all encode differently",
+          "[echo][registry][pure]") {
+    const auto& t = registry_name_table();
+    std::set<std::string> seen;
+    for (const auto& n : t)
+        CHECK(seen.insert(registry_name_utf8(n)).second); // pairwise distinct
+    CHECK(seen.size() == t.size());
+    CHECK(registry_name_utf8(std::u16string{char16_t(0xD800)}) == "\xEF\xBF\xBD" "D800");
+    CHECK(registry_name_utf8(u"�") == "\xEF\xBF\xBD\xEF\xBF\xBD");
+}
+
+TEST_CASE("registry names: every encoded name decodes back to the name it came from", "[echo][registry][pure]") {
+    for (const auto& n : registry_name_table())
+        CHECK(decode_registry_name(registry_name_utf8(n)) == n);
+}
+
+TEST_CASE("registry diff: a value replaced by one whose name differs only in a lone surrogate is reported removed and added",
+          "[echo][registry][pure]") {
+    namespace P = yuzu::profiles;
+    const std::string root = "HKLM\\SOFTWARE\\r";
+    const RegistryWindow win{10, 20};
+    const std::string spelt = registry_name_utf8(u"\\uD800");
+    const std::string lone = registry_name_utf8(std::u16string{char16_t(0xD800)});
+    REQUIRE(spelt != lone);
+    const auto base_read = complete({{root + "\\A", {{spelt, vread(P::kRegDword, dword(1))}}}});
+    const auto base = diff_registry_snapshot({}, base_read, root, "reconcile", win, 20, /*suppress=*/true).baseline;
+    const auto now = complete({{root + "\\A", {{lone, vread(P::kRegDword, dword(1))}}}});
+    const auto d = diff_registry_snapshot(base, now, root, "reconcile", win, 20);
+    std::set<std::string> got;
+    for (const auto& c : d.candidates)
+        got.insert(c.action + ":" + c.value);
+    CHECK(got == std::set<std::string>{"removed:" + spelt, "added:" + lone});
+}
+
+TEST_CASE("registry read: a name already present in the key marks the read partial and keeps the first",
+          "[echo][registry][pure]") {
+    std::map<std::string, RegistryValueRead> values;
+    CHECK(record_registry_name(values, "Same", vread(4, dword(1))));
+    CHECK_FALSE(record_registry_name(values, "Same", vread(4, dword(2)))); // the caller marks the read Capped
+    CHECK(values.size() == 1);
+    CHECK(values.at("Same").bytes == dword(1)); // the first entry is kept, never overwritten
+}
+
+TEST_CASE("registry read budget: a skipped child is charged like a visited key and a passed deadline refuses it",
+          "[echo][registry][pure]") {
+    {
+        RegistryReadBudget b;
+        bool all_admitted = true;
+        for (std::size_t i = 0; i < kBaselineKeyCap; ++i)
+            all_admitted = b.admit_key_by(100, 200) && all_admitted;
+        CHECK(all_admitted);
+        CHECK_FALSE(b.admit_key_by(100, 200)); // the key budget ends a run of skipped children
+    }
+    {
+        RegistryReadBudget b;
+        CHECK(b.admit_key_by(199, 200));
+        CHECK_FALSE(b.admit_key_by(200, 200)); // at the deadline
+        CHECK_FALSE(b.admit_key_by(201, 200)); // past it
+    }
+}
+
 TEST_CASE("RegistryReadBudget caps keys and values and bytes (R9)", "[echo][registry][pure]") {
     {
         RegistryReadBudget b;
@@ -2754,6 +2877,77 @@ TEST_CASE("registry source: the denied child set writes a gap only when it gains
         CHECK(stored().front() == kRoot + "\\D0_000");
         CHECK(stored().back() == kRoot + "\\D0_031");
     }
+}
+
+TEST_CASE("registry read: more than 32 denied children are counted and the gap row says how many are not named",
+          "[echo][registry][lifecycle]") {
+    auto t = make_db();
+    Fake f;
+    auto src = make_registry_cursor_source(scope1(), f.reader());
+    auto last_gap = [&] {
+        return ql("SELECT detail FROM registry_live WHERE record_key LIKE 'gap:unreadable:%' "
+                  "ORDER BY id DESC LIMIT 1").rows.at(0).at(0);
+    };
+    auto r = svc(1);
+    r.status = RegistryReadStatus::Capped;
+    for (std::size_t i = 0; i < kSkippedCap; ++i)
+        r.skipped.push_back(std::format("{}\\D{:03}", kRoot, i));
+    r.skipped_overflow = 5;
+    f.reads[kRoot] = std::move(r);
+    f.clock += 100 * SEC;
+    f.dirty->mark(kRoot, f.clock);
+    tick(t.db, *src);
+    const std::string detail = last_gap();
+    CHECK_THAT(detail, ContainsSubstring("(37 child key(s) denied read access"));
+    CHECK_THAT(detail, ContainsSubstring("; and 5 more not named"));
+    CHECK(read_cursor(t.db).roots.at(kRoot).skipped.size() == kSkippedCap); // the stored set stays bounded
+}
+
+TEST_CASE("registry read: a read with uncounted denied children derives adds for later siblings and no removals",
+          "[echo][registry][lifecycle]") {
+    auto t = make_db();
+    Fake f;
+    auto src = make_registry_cursor_source(scope1(), f.reader());
+    const std::string a = kRoot + "\\A", b = kRoot + "\\B", c = kRoot + "\\C";
+    auto step = [&](SubtreeRead r) {
+        f.reads[kRoot] = std::move(r);
+        f.clock += 100 * SEC;
+        f.dirty->mark(kRoot, f.clock);
+        return tick_settled(t.db, f, *src);
+    };
+    step(complete({{a, {{"v", vread(4, dword(1))}}}, {b, {{"v", vread(4, dword(2))}}}}));
+    // B is gone from this read (it may be one of the unnamed denied children); C is a later sibling.
+    auto r = complete({{a, {{"v", vread(4, dword(1))}}}, {c, {{"v", vread(4, dword(3))}}}});
+    r.status = RegistryReadStatus::Capped;
+    r.skipped_overflow = 3;
+    step(std::move(r));
+    const auto rows = ql("SELECT action, key_path FROM registry_live WHERE action IN ('added','removed','key_removed')");
+    REQUIRE_FALSE(rows.rows.empty());
+    int added_c = 0;
+    for (const auto& row : rows.rows) {
+        CHECK(row.at(0) == "added"); // no removed and no key_removed row
+        added_c += row.at(1).ends_with("\\C");
+    }
+    CHECK(added_c == 1);
+}
+
+TEST_CASE("registry names: a NUL is escaped in the gap detail only", "[echo][registry][lifecycle]") {
+    auto t = make_db();
+    Fake f;
+    auto src = make_registry_cursor_source(scope1(), f.reader());
+    auto r = svc(1);
+    r.status = RegistryReadStatus::Capped;
+    r.skipped = {kRoot + std::string{'\\', 'a', '\0', 'b'}}; // the identity path keeps the NUL
+    f.reads[kRoot] = std::move(r);
+    f.clock += 100 * SEC;
+    f.dirty->mark(kRoot, f.clock);
+    tick(t.db, *src);
+    const std::string detail = ql("SELECT detail FROM registry_live WHERE record_key LIKE 'gap:unreadable:%' "
+                                  "ORDER BY id DESC LIMIT 1").rows.at(0).at(0);
+    CHECK_THAT(detail, ContainsSubstring("\\a\\0b"));
+    CHECK(detail.find('\0') == std::string::npos);
+    CHECK(read_cursor(t.db).roots.at(kRoot).skipped ==
+          std::vector<std::string>{kRoot + std::string{'\\', 'a', '\0', 'b'}}); // identity unchanged
 }
 
 TEST_CASE("registry source: with a budget admitting one root per tick every root is read within n ticks (R15)",
@@ -5941,6 +6135,164 @@ TEST_CASE("registry live: a symbolic-link key is read as the link and never foll
 
     // Remove the link itself (as the link, never through it) before the parent's tree delete.
     REQUIRE(link_key.remove() == 0);
+}
+
+namespace {
+
+// Restores an allow-all DACL on denied test children before the owning TestKey deletes the tree
+// (RegDeleteTreeW cannot delete a key this token may not open). Declare it AFTER the TestKey.
+struct DeniedChildrenGuard {
+    HKEY parent;
+    std::vector<std::wstring> names;
+    explicit DeniedChildrenGuard(HKEY p) : parent(p) {}
+    DeniedChildrenGuard(const DeniedChildrenGuard&) = delete;
+    DeniedChildrenGuard& operator=(const DeniedChildrenGuard&) = delete;
+    ~DeniedChildrenGuard() {
+        PSECURITY_DESCRIPTOR allow = nullptr;
+        if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:PAI(A;;KA;;;WD)", SDDL_REVISION_1,
+                                                                   &allow, nullptr))
+            return;
+        for (const auto& n : names) {
+            HKEY h = nullptr;
+            if (RegOpenKeyExW(parent, n.c_str(), 0, WRITE_DAC, &h) == ERROR_SUCCESS) {
+                RegSetKeySecurity(h, DACL_SECURITY_INFORMATION, allow);
+                RegCloseKey(h);
+            }
+        }
+        LocalFree(allow);
+    }
+};
+
+// A key whose name holds U+0000: only the native API can create or delete one. The handle stays
+// open until the destructor deletes the key through it, so every exit path removes it. Declare
+// it AFTER the TestKey that owns `parent`.
+struct NulNamedKey {
+    using Fn = LONG(NTAPI*)(PHANDLE, ACCESS_MASK, void*, ULONG, void*, ULONG, PULONG);
+    struct Unicode {
+        USHORT Length, MaximumLength;
+        PWSTR Buffer;
+    };
+    struct ObjAttr {
+        ULONG Length;
+        HANDLE RootDirectory;
+        Unicode* ObjectName;
+        ULONG Attributes;
+        PVOID SecurityDescriptor, SecurityQualityOfService;
+    };
+    HANDLE h{nullptr};
+
+    // 0 on success, else the NTSTATUS (or ERROR_PROC_NOT_FOUND).
+    LONG create(HKEY parent, std::wstring name) {
+        const auto fn = reinterpret_cast<Fn>(
+            reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtCreateKey")));
+        if (fn == nullptr)
+            return ERROR_PROC_NOT_FOUND;
+        Unicode u{static_cast<USHORT>(name.size() * sizeof(wchar_t)),
+                  static_cast<USHORT>(name.size() * sizeof(wchar_t)), name.data()};
+        ObjAttr oa{sizeof(ObjAttr), parent, &u, 0x40 /*OBJ_CASE_INSENSITIVE*/, nullptr, nullptr};
+        return fn(&h, KEY_ALL_ACCESS, &oa, 0, nullptr, 0, nullptr);
+    }
+    ~NulNamedKey() {
+        if (h == nullptr)
+            return;
+        using DelFn = LONG(NTAPI*)(HANDLE);
+        if (const auto del = reinterpret_cast<DelFn>(
+               reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtDeleteKey"))))
+            del(h);
+        RegCloseKey(static_cast<HKEY>(h));
+    }
+};
+
+} // namespace
+
+TEST_CASE("registry live: 33 denied children do not stop a later sibling being read",
+          "[echo][registry][windows]") {
+    const std::string leaf = "yuzu_test_reg_" + salt();
+    TestKey key(leaf);
+    if (key.create() != ERROR_SUCCESS)
+        SKIP("cannot write HKLM (not elevated)");
+    DeniedChildrenGuard guard(key.h);
+    PSECURITY_DESCRIPTOR deny = nullptr;
+    REQUIRE(ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:PAI(D;;KR;;;WD)(A;;KA;;;SY)(A;;KA;;;BA)",
+                                                                  SDDL_REVISION_1, &deny, nullptr));
+    for (std::size_t i = 0; i < kSkippedCap + 1; ++i) {
+        const std::wstring name = L"Denied" + std::to_wstring(1000 + i);
+        guard.names.push_back(name);
+        HKEY k = nullptr;
+        REQUIRE(RegCreateKeyExW(key.h, name.c_str(), 0, nullptr, 0, KEY_ALL_ACCESS, nullptr, &k, nullptr) ==
+                ERROR_SUCCESS);
+        RegSetKeySecurity(k, DACL_SECURITY_INFORMATION, deny);
+        RegCloseKey(k);
+    }
+    LocalFree(deny);
+    HKEY later = nullptr; // sorts after every denied child
+    REQUIRE(RegCreateKeyExW(key.h, L"zz_later", 0, nullptr, 0, KEY_ALL_ACCESS, nullptr, &later, nullptr) ==
+            ERROR_SUCCESS);
+    DWORD seen = 9;
+    RegSetValueExW(later, L"Seen", 0, REG_DWORD, reinterpret_cast<BYTE*>(&seen), 4);
+    RegCloseKey(later);
+
+    auto reader = make_windows_registry_reader();
+    const std::string root = "HKLM\\SOFTWARE\\" + leaf;
+    const auto r = reader.read_subtree(root, reader.now_ts() + kSnapshotBudget100ns);
+    CHECK(r.status == RegistryReadStatus::Capped); // an unnamed denied child: no removals derived
+    CHECK(r.skipped.size() == kSkippedCap);
+    CHECK(r.skipped_overflow == 1);
+    REQUIRE(r.keys.contains(root + "\\zz_later")); // the sibling after the 33rd denied child is read
+    CHECK(r.keys.at(root + "\\zz_later").contains("Seen"));
+}
+
+TEST_CASE("registry live: value and subkey pairs that differ only in a lone surrogate are both captured",
+          "[echo][registry][windows]") {
+    const std::string leaf = "yuzu_test_reg_" + salt();
+    TestKey key(leaf);
+    if (key.create() != ERROR_SUCCESS)
+        SKIP("cannot write HKLM (not elevated)");
+    // Both convert to "p" + U+FFFD through the lossy path; as identities they must stay apart.
+    const std::wstring n1{L'p', static_cast<wchar_t>(0xD800)}, n2{L'p', static_cast<wchar_t>(0xD801)};
+    DWORD one = 1, two = 2;
+    REQUIRE(RegSetValueExW(key.h, n1.c_str(), 0, REG_DWORD, reinterpret_cast<BYTE*>(&one), 4) == ERROR_SUCCESS);
+    REQUIRE(RegSetValueExW(key.h, n2.c_str(), 0, REG_DWORD, reinterpret_cast<BYTE*>(&two), 4) == ERROR_SUCCESS);
+    for (const auto* n : {&n1, &n2}) {
+        HKEY k = nullptr;
+        REQUIRE(RegCreateKeyExW(key.h, n->c_str(), 0, nullptr, 0, KEY_ALL_ACCESS, nullptr, &k, nullptr) ==
+                ERROR_SUCCESS);
+        RegCloseKey(k);
+    }
+    auto reader = make_windows_registry_reader();
+    const std::string root = "HKLM\\SOFTWARE\\" + leaf;
+    const auto r = reader.read_subtree(root, reader.now_ts() + kSnapshotBudget100ns);
+    REQUIRE(r.status == RegistryReadStatus::Complete);
+    const std::string e1 = registry_name_utf8(std::u16string{u'p', char16_t(0xD800)});
+    const std::string e2 = registry_name_utf8(std::u16string{u'p', char16_t(0xD801)});
+    REQUIRE(e1 != e2);
+    CHECK(r.keys.at(root).size() == 2);
+    CHECK(r.keys.at(root).contains(e1));
+    CHECK(r.keys.at(root).contains(e2));
+    CHECK(r.keys.contains(root + "\\" + e1));
+    CHECK(r.keys.contains(root + "\\" + e2));
+}
+
+TEST_CASE("registry live: a NUL-named child is reported as skipped", "[echo][registry][windows]") {
+    const std::string leaf = "yuzu_test_reg_" + salt();
+    TestKey key(leaf);
+    if (key.create() != ERROR_SUCCESS)
+        SKIP("cannot write HKLM (not elevated)");
+    NulNamedKey nul_key; // after `key`: destroyed first
+    if (const LONG st = nul_key.create(key.h, std::wstring{L'n', L'\0', L'm'}); st != 0)
+        SKIP("cannot create a NUL-named key (NTSTATUS " << st << ")");
+    HKEY later = nullptr;
+    REQUIRE(RegCreateKeyExW(key.h, L"zz_later", 0, nullptr, 0, KEY_ALL_ACCESS, nullptr, &later, nullptr) ==
+            ERROR_SUCCESS);
+    RegCloseKey(later);
+
+    auto reader = make_windows_registry_reader();
+    const std::string root = "HKLM\\SOFTWARE\\" + leaf;
+    const auto r = reader.read_subtree(root, reader.now_ts() + kSnapshotBudget100ns);
+    CHECK(r.status == RegistryReadStatus::Complete);
+    CHECK(r.skipped == std::vector<std::string>{root + "\\" + std::string("n\0m", 3)});
+    CHECK_FALSE(r.keys.contains(root + "\\" + std::string("n\0m", 3)));
+    CHECK(r.keys.contains(root + "\\zz_later")); // the siblings are still read
 }
 
 TEST_CASE("registry live: stop is idempotent and destruction after stop is clean",

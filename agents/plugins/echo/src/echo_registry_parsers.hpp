@@ -646,10 +646,16 @@ struct RegistryValueRead {
 /// reading their absence as a deletion. A denied child therefore never blinds the
 /// rest of its root. `Unreadable` means the root, or any key beneath it other than an
 /// access-denied child, could not be read.
+///
+/// `skipped_overflow` counts the child keys skipped past kSkippedCap: the walk reads on (every
+/// later sibling is read, so adds and changes land) but cannot name them. A read that has any
+/// ends Capped, so no removal is derived (an unnamed child's baseline cannot be protected by
+/// name). Key and value maps are case-exact: two names differing only in case are two names.
 struct SubtreeRead {
     RegistryReadStatus status{RegistryReadStatus::Unreadable};
     std::map<std::string, std::map<std::string, RegistryValueRead>> keys;
     std::vector<std::string> skipped;
+    std::size_t skipped_overflow{0};
     /// Empty for an ordinary read. An Unreadable read can name its cause, which the gap row
     /// quotes: an offline read that could not mount its hive carries the refusal
     /// (`offline:<token>`), and a live read whose whole hive was unloaded under it carries
@@ -692,6 +698,12 @@ struct OfflineHiveRead {
 class RegistryReadBudget {
 public:
     [[nodiscard]] bool admit_key() { return ++keys_ <= kBaselineKeyCap; }
+    /// One key charged against the key budget and the deadline (`now` and `deadline` are
+    /// FILETIME 100 ns). The reader charges every key it visits AND every child it skips through
+    /// this, so a key with a very large number of unopenable children cannot loop unchecked.
+    [[nodiscard]] bool admit_key_by(std::int64_t now, std::int64_t deadline) {
+        return admit_key() && now < deadline;
+    }
     [[nodiscard]] bool admit_value(std::size_t bytes) {
         bytes_ += bytes;
         return ++values_ <= kBaselineValueCap && bytes_ <= kBaselineBytesCap;
@@ -701,6 +713,60 @@ public:
 private:
     std::size_t keys_{0}, values_{0}, bytes_{0};
 };
+
+/// The one identity encoding for a registry value or key name, injective: two different names
+/// never share a string. Valid UTF-16 is the same UTF-8 the lossy conversion wrote, except that
+/// a literal U+FFFD is written twice; a lone surrogate is written as U+FFFD followed by its four
+/// upper-case hex digits (U+D800 -> U+FFFD "D800"). Read left to right a U+FFFD is followed
+/// either by a second U+FFFD (a literal one) or by four hex digits starting with `D` (a lone
+/// surrogate), so the output decodes one way only. A backslash escape would have to escape its
+/// own introducer, and value names routinely contain backslashes. U+0000 is kept as a NUL byte.
+[[nodiscard]] inline std::string registry_name_utf8(std::u16string_view w) {
+    static constexpr char kHex[] = "0123456789ABCDEF";
+    const auto put = [](std::string& o, char32_t cp) {
+        if (cp < 0x80) {
+            o += static_cast<char>(cp);
+        } else if (cp < 0x800) {
+            o += static_cast<char>(0xC0 | (cp >> 6));
+            o += static_cast<char>(0x80 | (cp & 0x3F));
+        } else if (cp < 0x10000) {
+            o += static_cast<char>(0xE0 | (cp >> 12));
+            o += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+            o += static_cast<char>(0x80 | (cp & 0x3F));
+        } else {
+            o += static_cast<char>(0xF0 | (cp >> 18));
+            o += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+            o += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+            o += static_cast<char>(0x80 | (cp & 0x3F));
+        }
+    };
+    std::string out;
+    out.reserve(w.size());
+    for (std::size_t i = 0; i < w.size(); ++i) {
+        const char16_t c = w[i];
+        if (c >= 0xD800 && c <= 0xDBFF && i + 1 < w.size() && w[i + 1] >= 0xDC00 && w[i + 1] <= 0xDFFF) {
+            put(out, 0x10000 + ((static_cast<char32_t>(c) - 0xD800) << 10) + (w[i + 1] - 0xDC00));
+            ++i;
+        } else if (c >= 0xD800 && c <= 0xDFFF) { // lone surrogate
+            put(out, 0xFFFD);
+            for (int shift = 12; shift >= 0; shift -= 4)
+                out += kHex[(c >> shift) & 0xF];
+        } else if (c == 0xFFFD) { // literal replacement character: doubled
+            put(out, 0xFFFD);
+            put(out, 0xFFFD);
+        } else {
+            put(out, c);
+        }
+    }
+    return out;
+}
+
+/// Records `v` under `name` unless the key already holds that name: the first entry is kept and
+/// false is returned, so the caller marks the read partial instead of overwriting.
+template <class Map, class V>
+[[nodiscard]] bool record_registry_name(Map& m, std::string name, V&& v) {
+    return m.try_emplace(std::move(name), std::forward<V>(v)).second;
+}
 
 /// What the baseline remembers about a value: type, full stored size, a hash of
 /// every byte read (R8: a change anywhere in the value shows), `d` (a rendered prefix of the
