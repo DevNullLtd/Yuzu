@@ -2380,23 +2380,27 @@ public:
         // #4966: a store fault inside the account-lifecycle guard (a lock wait that expired, a
         // lost connection, an unwired guard), by the guarded operation. NOT a refusal: the
         // request was neither allowed nor judged. Counted in AuthManager, so the dashboard, SCIM
-        // and every other caller through it share one series. No alert rule ships with it yet
-        // (a later change owns the alerts).
+        // and every other caller through it share one series, except op=unassign, which
+        // RbacStore counts for a failed role unassignment of any role or principal type. No
+        // alert rule ships with it yet (a later change owns the alerts).
         metrics_.describe("yuzu_server_rbac_lifecycle_store_failure_total",
-                          "Store faults inside the account-lifecycle last-Administrator guard, "
-                          "by operation (deactivate: account removal; set_role: role write; "
-                          "would_strand: the advisory pre-check, after which the request still "
-                          "proceeds to the guarded write; grant_read: the SCIM "
-                          "pre-provisioning Administrator-grant read; unassign: a role "
-                          "unassignment). The unwired fail-closed "
+                          "Store faults in the account-lifecycle last-Administrator guard and in "
+                          "role unassignment, by operation (deactivate: account removal; "
+                          "set_role: role write; would_strand: the advisory pre-check, after "
+                          "which the request still proceeds to the guarded write; grant_read: "
+                          "the SCIM pre-provisioning Administrator-grant read; unassign: a "
+                          "role unassignment, of any role or principal type, whose transaction "
+                          "failed with a store fault; a last-Administrator refusal is not "
+                          "counted). The unwired fail-closed "
                           "arm also counts, for deactivate and set_role only. A sustained "
-                          "non-zero rate means deprovisioning or role changes are being "
-                          "answered with a store-unavailable error rather than judged, except "
-                          "for would_strand, which never stops the request (SCIM answers 503 "
-                          "with Retry-After; the dashboard role route gives no retry hint): "
-                          "look at yuzu_pg_pool_waiters and "
-                          "yuzu_pg_acquire_wait_seconds, and for a stuck rbac_enabled row lock "
-                          "holder.",
+                          "non-zero rate means deprovisioning, role changes or unassignments "
+                          "are being answered with a store-unavailable error rather than "
+                          "judged, except for would_strand, which never stops the request "
+                          "(SCIM answers 503 with Retry-After; the dashboard role route gives "
+                          "no retry hint): look at yuzu_pg_pool_waiters and "
+                          "yuzu_pg_acquire_wait_seconds, and for a stuck lock holder (the "
+                          "rbac_enabled row for deactivate and set_role; an unassign takes no "
+                          "rbac_enabled lock).",
                           "counter");
         for (const auto op : {"deactivate", "set_role", "would_strand", "grant_read", "unassign"})
             metrics_.counter("yuzu_server_rbac_lifecycle_store_failure_total", {{"op", op}});
@@ -7565,7 +7569,7 @@ public:
                                    auth_mgr.drop_local_sessions_of_user(username);
                                })) {
                     spdlog::error("[PG] Refusing to start: the RbacStore local session-drop "
-                                  "callback was already set (PR-S10)");
+                                  "callback was already set; it must be wired exactly once");
                     startup_failed_ = true;
                 }
             }

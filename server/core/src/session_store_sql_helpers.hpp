@@ -42,7 +42,8 @@
 /// Postgres aborts one victim, which the caller's rollback turns into a retryable failure.
 /// There is no per-user cap on session rows, so the row lock and the clear touch as many rows as
 /// the user holds; that count is bounded only by the 8 h absolute session lifetime
-/// (`AuthManager::kSessionDuration`) and the session reaper.
+/// (`AuthManager::kSessionDuration`), the session reaper and the per-IP login rate limit, and
+/// was not measured.
 
 #include "pg/pg_exec.hpp"
 #include "pg/pg_raii.hpp"

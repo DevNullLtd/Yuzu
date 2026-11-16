@@ -516,5 +516,5 @@ now covers `SessionStore` as well as `AuthDB`: the unassign is correct only beca
 `AuthDB` and `SessionStore` share ONE pool/database (ADR-0006), and a split, or a missing
 `session_store` schema, fails the statement and rolls the unassign back rather than answering success
 while the elevation survives. There is no per-user cap on session rows, so the row lock and the clear
-touch every row the user holds; that count is bounded only by the 8 h absolute session lifetime and the
-session reaper.
+touch every row the user holds; that count is bounded only by the 8 h absolute session lifetime, the
+session reaper and the per-IP login rate limit, and was not measured.

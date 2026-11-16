@@ -3514,14 +3514,20 @@ alone) is an idempotent no-op: it answers success, the audit detail records
 `removed=false`, and no elevation is ended. This replica drops its cached
 sessions of the user after the commit; other replicas converge within about a
 second (up to about 30 seconds while their session-generation read is failing
-or slow). It does not change the user's elevation eligibility and does not
+or slow; neither bound holds after a database restore or a failover to a lagging
+standby, which can bring the cleared elevation back and leave a restored
+generation equal to a replica's cached one unnoticed, so restart every replica).
+It does not change the user's elevation eligibility and does not
 block a later `POST /api/v1/elevate`: an eligible user can open a new window. To
 end elevated access for good, first call
 `POST /api/v1/users/{name}/elevation-eligibility` with `{"eligible": false}`
 (it refuses service-scoped and MCP-tier tokens, and it also ends live
 elevations); for a user with no grant that call is the only step needed. A
 request already past its authorization check when the clear lands is not
-recalled, and an open event stream is not re-checked for elevation. For this
+recalled, a `POST /api/v1/elevate` that had already passed its eligibility check
+can wait on the unassign's session-row lock and complete just after the unassign
+commits (so a new window can stand), and an open event stream is not re-checked
+for elevation. For this
 case the transaction bounds each lock wait at 2000 ms (other unassigns keep the
 pool default), so it can answer a retryable `503` when it cannot take its locks
 in time. A server log warning `rbac.role.unassigned store fault` and the
@@ -15601,7 +15607,7 @@ curl -s -X POST -H "Cookie: yuzu_session=$COOKIE" \
 
 #### `POST /api/v1/elevate/revoke`
 
-Step an active elevation down early (reduces privilege; no MFA step-up required). Body: none. Answers `200 {"status":"ok"}` once the elevation is cleared, whether or not a window was active; that is recorded as `was_elevated=<bool>` in the `role.elevation.revoked` audit detail, not the response body. If the server cannot durably clear the elevation it answers `503` (retry) and writes the same action with `result=error`, because the elevation may still be live.
+Step an active elevation down early (reduces privilege; no MFA step-up required). Body: none. Answers `200 {"status":"ok"}` once the elevation is cleared, whether or not a window was active; that is recorded as `was_elevated=<bool>` in the `role.elevation.revoked` audit detail, not the response body (`was_elevated=unknown` when the lookup of the session before the clear was degraded: the clear succeeded, so any elevation has ended). If the server cannot durably clear the elevation it answers `503` (retry) and writes the same action with `result=error`, because the elevation may still be live.
 
 #### `POST /logout`
 

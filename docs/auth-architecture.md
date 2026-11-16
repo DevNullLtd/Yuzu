@@ -1464,7 +1464,9 @@ auto-reverts — so a compromised everyday session is not a standing admin sessi
 - **What ends a live elevation, and what does not.** An elevation is two
   durable columns on the user's `session_store.sessions` rows (`elevated_until_ms`,
   `elevation_issued_ms`); anything that zeroes them or deletes the row ends it.
-  Per session: the window lapsing, `POST /api/v1/elevate/revoke` and logout. Per
+  Per session: the window lapsing (the lapsed window's durable zero is written by
+  `AuthManager::reap_expired_elevation`, which clears a window that has already ended and
+  ends no live one), `POST /api/v1/elevate/revoke` and logout. Per
   user: revoking eligibility (`revoke_user_elevations`: the eligibility flag is
   written durably FIRST, then the durable clear, then a local cache
   loop that does not advance the cache epoch, so a validator that read the row
@@ -1472,8 +1474,11 @@ auto-reverts — so a compromised everyday session is not a standing admin sessi
   fails the route answers `503` with the flag already flipped, which is partial
   containment: no new elevation can open, a live window may stand until it lapses,
   and repeating the call retries the clear), the session
-  wipes on local demote, delete and deactivation (SCIM deprovision deactivates), and
-  **removing a user's `Administrator` grant** through `DELETE
+  wipes on local demote, delete and deactivation (SCIM deprovision deactivates), a
+  credential change (a password change or an administrator password reset: the credential
+  change owner deletes every durable session of the account in its own transaction),
+  `yuzu-server --mfa-reset` (which ends the account's durable sessions after clearing its
+  MFA enrolment), and **removing a user's `Administrator` grant** through `DELETE
   /api/v1/rbac/roles/{name}/assignments/{principal_id}` or MCP `unassign_rbac_role`.
   The last one is a clear inside the unassign transaction (see "RBAC administration
   surface invariants (A2/A1)" clause 1, which owns the lock order): the grant
@@ -1490,7 +1495,11 @@ auto-reverts — so a compromised everyday session is not a standing admin sessi
   on their next generation poll (about 1 s). While a replica's generation read is
   failing or slow it keeps serving its cached elevation until the 30 s stale-serve
   bound after its last successful read (`kSessionGenStaleServeBoundMs`); this is an
-  accepted, documented residual. Does NOT end it: **removing a group-held
+  accepted, documented residual. Neither bound holds after a database restore
+  or a failover to a lagging standby: the restore can bring the cleared elevation back, and
+  a session-generation value restored to exactly the one a replica has cached looks
+  unchanged to it, so restart every replica (the "Sessions are durable" section of
+  `docs/ops-runbooks/auth-db-recovery.md`). Does NOT end it: **removing a group-held
   `Administrator` role**, IdP group reconciliation and the RBAC enforcement toggle
   (an elevation is independent of every RBAC grant, and `POST /api/v1/elevate` checks
   `users.elevation_eligible`, not a grant), and **a later re-elevation**: the unassign
@@ -1525,8 +1534,13 @@ auto-reverts — so a compromised everyday session is not a standing admin sessi
   now leaves the cache cold, `revoke_elevation` (the self-service step-down and the
   `/elevate` audit-failure compensating revoke) no longer lets a failed durable
   read stop the clear: it still attempts the clear and, when that succeeds, answers
-  true if a session row existed (`was_elevated` is then unknown: an elevation, if
-  there was one, has been ended); a failed read AND a failed clear still fail closed.
+  true if a session row existed and flags the lookup as degraded (`was_elevated` is then
+  unknown: an elevation, if there was one, has been ended; `POST /api/v1/elevate/revoke`
+  then audits `was_elevated=unknown` rather than `true`); a failed read AND a failed clear still
+  fail closed. After a successful durable clear it drops this replica's cached session
+  (advancing the cache epoch) instead of zeroing it in place, so the next request on that
+  session re-reads the cleared durable row and a validator that read the elevated row
+  before the clear cannot re-cache it.
   If the compensating revoke itself fails the request answers `500` with
   `Sec-Audit-Failed` and logs at CRITICAL (`manual revocation required`); beyond the
   generic session-store degrade counter, no dedicated counter or alert rule ships
