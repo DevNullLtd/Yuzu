@@ -497,7 +497,7 @@ inline PruneResult prune_old_quarantines(const std::filesystem::path& db_path,
         }
         if (ec) {
             result.notes.push_back(std::format(
-                "could not list {} to prune old quarantined databases: {}", dir.string(),
+                "could not list {} to prune old quarantined stores: {}", dir.string(),
                 ec.message()));
             return result;
         }
@@ -514,7 +514,7 @@ inline PruneResult prune_old_quarantines(const std::filesystem::path& db_path,
                 std::filesystem::remove(f, rec);
                 if (rec) {
                     result.notes.push_back(std::format(
-                        "could not remove old quarantined database {}: {}", f.string(),
+                        "could not remove old quarantined store {}: {}", f.string(),
                         rec.message()));
                 } else {
                     result.removed.push_back(f);
@@ -524,9 +524,9 @@ inline PruneResult prune_old_quarantines(const std::filesystem::path& db_path,
         }
     } catch (const std::exception& e) {
         result.notes.push_back(
-            std::format("pruning old quarantined databases stopped early: {}", e.what()));
+            std::format("pruning old quarantined stores stopped early: {}", e.what()));
     } catch (...) {
-        result.notes.push_back("pruning old quarantined databases stopped early");
+        result.notes.push_back("pruning old quarantined stores stopped early");
     }
     return result;
 }
