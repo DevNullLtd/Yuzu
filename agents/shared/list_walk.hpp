@@ -2,17 +2,17 @@
 // kin) as COMPLETE or as a failed read.
 //
 // windows.h-free by design (mirrors value_enumeration.hpp): the OS shell supplies the per-index
-// step and the "did the list change under me" stamp as callables, so both decisions are
-// unit-tested on every host (tests/unit/test_value_enumeration.cpp) without a live registry.
+// step and the whole-walk callable, so both decisions are unit-tested on every host
+// (tests/unit/test_value_enumeration.cpp) without a live registry.
 //
 //   walk_enumeration -- an error part-way is a failed read, never a short list.
-//   stable_walk      -- a walk is accepted only when the same stamp was observed before and after
-//                       it; a changed stamp walks again, and a stamp that cannot be taken, or
-//                       never settles, is a failed read.
+//   stable_walk      -- a list is accepted only when two CONSECUTIVE walks returned the same
+//                       names; a walk that failed is returned as it is, and a list that never
+//                       settles is a failed read.
 
 #pragma once
 
-#include <optional>
+#include <algorithm>
 #include <string>
 #include <utility>
 #include <vector>
@@ -54,35 +54,32 @@ template <class Step>
     }
 }
 
-/// `error` values stable_walk adds to walk_enumeration's own.
-inline constexpr const char* kStampFailed = "stamp_failed"; // a stamp could not be taken
-inline constexpr const char* kStampUnstable = "unstable";   // the stamp changed on every attempt
+/// `error` value stable_walk adds to walk_enumeration's own.
+inline constexpr const char* kWalkUnstable = "unstable"; // no two consecutive walks agreed
 
-/// Walk with a change guard. `stamp_fn()` answers a `std::optional<Stamp>` (Stamp is
-/// equality-comparable) describing the list's current state, or nullopt when it cannot be read;
-/// `walk_fn()` answers a ListWalk. Each attempt takes a stamp, walks, takes a stamp:
-///   - a stamp that cannot be taken ends the call at once with `stamp_failed` (two failed stamps
-///     never compare equal, so they never certify a listing);
-///   - a walk that failed is returned as it is (its own error);
-///   - equal stamps accept the walk; unequal stamps try again, up to `max_attempts` attempts, and
-///     the last one reports `unstable`.
-/// A failed result carries no names.
-template <class StampFn, class WalkFn>
-[[nodiscard]] ListWalk stable_walk(StampFn&& stamp_fn, WalkFn&& walk_fn, unsigned max_attempts) {
-    for (unsigned attempt = 0; attempt < max_attempts; ++attempt) {
-        const auto before = stamp_fn();
-        if (!before)
-            return ListWalk{{}, kStampFailed};
+/// Walk until two consecutive walks return the same names. `walk_fn()` answers a ListWalk.
+///   - a walk that failed is returned as it is (its own error), whichever walk it was;
+///   - each walk's names are sorted, and a walk is accepted only when its sorted names equal the
+///     previous walk's; a walk that differs becomes the one the next is compared with;
+///   - `max_walks` walks that never produced an agreeing pair report `unstable`. With
+///     `max_walks` < 2 no pair can form, so nothing is ever accepted.
+/// A failed result carries no names; an accepted one carries them sorted. The comparison is
+/// between walks' own names: it does not rely on any separate "did the list change" probe, so a
+/// walk that skipped an entry is never accepted on the strength of a probe that read the list
+/// before and after it.
+template <class WalkFn>
+[[nodiscard]] ListWalk stable_walk(WalkFn&& walk_fn, unsigned max_walks) {
+    ListWalk prev;
+    for (unsigned walk_no = 0; walk_no < max_walks; ++walk_no) {
         ListWalk walk = walk_fn();
         if (!walk.error.empty())
             return walk;
-        const auto after = stamp_fn();
-        if (!after)
-            return ListWalk{{}, kStampFailed};
-        if (*before == *after)
+        std::sort(walk.names.begin(), walk.names.end());
+        if (walk_no > 0 && walk.names == prev.names)
             return walk;
+        prev = std::move(walk);
     }
-    return ListWalk{{}, kStampUnstable};
+    return ListWalk{{}, kWalkUnstable};
 }
 
 } // namespace yuzu::shared

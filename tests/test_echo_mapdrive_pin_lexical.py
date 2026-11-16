@@ -45,7 +45,7 @@ test_echo_mapdrive.cpp), so this pins the wiring lexically. Invariants:
      read_offline_hive_bounded before that function's own halted check. The shell
      (sweep_leftover_hive_mounts) takes the process-wide offline-hive lock BEFORE it lists
      HKEY_USERS (that lock is what keeps it off this process's own live mounts), lists through
-     the shared enumerate_hku_subkeys, offers only select_stale_hive_mounts' names to
+     the shared enumerate_hku_subkeys_checked, offers only select_stale_hive_mounts' names to
      RegUnLoadKeyW only when SeRestorePrivilege is held, and never forces an unload; the
      worker sweeps the whole default prefix (no argument).
 
@@ -196,7 +196,7 @@ def problems(collector_src, plugin_src, gate_src, registry_src):
                        "no longer sweeps the whole default prefix (no argument)")
         if not re.search(r"BoundedCallStatus::Completed\) \{[^}]*?"
                          r"settle_sweep\(\*bounded\.value, tick\.sweep_listing_retried\);[^}]*?"
-                         r"tick\.sweep_pending = settle\.pending;[^}]*?return;\s*\}", sweep):
+                         r"tick\.sweep_pending = settle\.pending;.*?return;\s*\}", sweep):
             out.append("the sweep must settle sweep_pending through settle_sweep when, and only when, "
                        "its worker completed")
         if sweep.count("sweep_pending =") != 1:
@@ -231,9 +231,9 @@ def problems(collector_src, plugin_src, gate_src, registry_src):
                 or "const auto listing = yuzu::win::enumerate_hku_subkeys_checked();" not in shell):
             out.append("the sweep must list through the shared enumerate_hku_subkeys_checked and select "
                        "through the unit-tested select_stale_hive_mounts")
-        if not re.search(r"if \(!listing\.error\.empty\(\)\) \{\s*r\.listing_incomplete = true;\s*return r;", shell):
-            out.append("a failed or unstable HKEY_USERS listing must report listing_incomplete and "
-                       "unload nothing")
+        if not re.search(r"if \(!listing\.error\.empty\(\)\) \{\s*r\.listing_error = listing\.error;\s*return r;", shell):
+            out.append("a failed or unstable HKEY_USERS listing must report its cause in listing_error "
+                       "and unload nothing")
         if "enumerate_hku()" in shell:
             out.append("the sweep must not list through Echo's own enumerate_hku")
         if ('PrivilegeScope restore_priv(L"SeRestorePrivilege")' not in shell
@@ -427,7 +427,7 @@ class EchoMapdrivePinLexical(unittest.TestCase):
                 r, "return discover_offline_profiles(loaded);", "return OfflineDiscovery{};")),
             "registry discovery enumerates HKU a second time": dict(r=mutate(
                 r, "build_profile_list(disc.records, loaded)",
-                   "build_profile_list(disc.records, yuzu::win::enumerate_hku_subkeys())")),
+                   "build_profile_list(disc.records, yuzu::win::enumerate_hku_subkeys_checked().names)")),
             "registry discovery ignores collect's loaded list": dict(r=mutate(
                 r, "build_profile_list(disc.records, loaded)", "build_profile_list(disc.records, {})")),
             "registry closed gate answers attempted": dict(r=mutate(
@@ -481,7 +481,7 @@ class EchoMapdrivePinLexical(unittest.TestCase):
                 r, "settle_sweep(*bounded.value, tick.sweep_listing_retried)",
                    "settle_sweep(*bounded.value, tick.sweep_pending)")),
             "sweep acts on a failed listing": dict(r=mutate(
-                r, "        if (!listing.error.empty()) {\n            r.listing_incomplete = true;\n            return r;\n        }\n",
+                r, "        if (!listing.error.empty()) {\n            r.listing_error = listing.error;\n            return r;\n        }\n",
                    "")),
             "sweep timeout no longer halts the tick": dict(r=mutate(
                 r, "tick.halted = decision.halt_walk;\n    tick.halted_token = decision.attempted ? "
@@ -509,7 +509,7 @@ class EchoMapdrivePinLexical(unittest.TestCase):
                    "        (void)yuzu::win::enumerate_hku_subkeys_checked();\n"
                    '        const yuzu::agent::ScopedOfflineHiveLock offline_lock("echo_registry_sweep");\n')),
             "sweep unloads names it did not select": dict(r=mutate(
-                r, "r = sweep_hive_mounts(stale, [](", "r = sweep_hive_mounts(yuzu::win::enumerate_hku_subkeys(), [](")),
+                r, "r = sweep_hive_mounts(stale, [](", "r = sweep_hive_mounts(yuzu::win::enumerate_hku_subkeys_checked().names, [](")),
             "sweep lists through Echo's own enumeration": dict(r=mutate(
                 r, "select_stale_hive_mounts(listing.names, prefix)",
                    "select_stale_hive_mounts(enumerate_hku(), prefix)")),

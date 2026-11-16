@@ -54,7 +54,7 @@
 #include <regex>
 #include <evntrace.h> // ControlTraceW QUERY: no session may outlive stop()
 #include <sddl.h>
-#include <win_profiles.hpp> // enumerate_hku_subkeys, PrivilegeScope: the offline-hive cases
+#include <win_profiles.hpp> // enumerate_hku_subkeys_checked, PrivilegeScope: the offline-hive cases
 #include <win_str.hpp>
 #include "echo_hive_mount_gate.hpp"  // g_mount_workers_in_flight
 #include "echo_win_process_name.hpp" // process_basename_for_pid
@@ -1360,7 +1360,7 @@ TEST_CASE("registry sweep: an incomplete HKU listing stays pending for one retry
     bool retried = false;
     HiveSweepResult listed; // the listing was complete (whatever it found)
     HiveSweepResult unlisted;
-    unlisted.listing_incomplete = true;
+    unlisted.listing_error = "index 3 (RegEnumKeyExW rc=5)";
 
     // A complete listing settles at once and never spends the retry.
     auto settle = settle_sweep(listed, retried);
@@ -6027,7 +6027,8 @@ const std::string& offline_fake_sid() {
 // Any HKEY_USERS subkey CONTAINING the fake sid: the mount name is salted
 // (unique_hive_mount_name), so an exact-name check would never see a leak.
 bool offline_fake_mount_present() {
-    for (const auto& n : yuzu::win::enumerate_hku_subkeys())
+    const auto hku = yuzu::win::enumerate_hku_subkeys_checked();
+    for (const auto& n : hku.names)
         if (n.find(offline_fake_sid()) != std::string::npos)
             return true;
     return false;
@@ -6040,7 +6041,8 @@ struct OfflineMountSweep {
             return;
         const yuzu::win::PrivilegeScope restore(L"SeRestorePrivilege");
         const yuzu::win::PrivilegeScope backup(L"SeBackupPrivilege");
-        for (const auto& n : yuzu::win::enumerate_hku_subkeys())
+        const auto hku = yuzu::win::enumerate_hku_subkeys_checked();
+        for (const auto& n : hku.names)
             if (n.find(offline_fake_sid()) != std::string::npos)
                 RegUnLoadKeyW(HKEY_USERS, yuzu::win::to_wide(n).c_str());
     }
@@ -6305,7 +6307,7 @@ TEST_CASE("registry live: the production profile discovery lists unloaded SID-na
           "[echo][registry][windows]") {
     auto reader = make_windows_registry_reader();
     const ReaderStop stop{reader};
-    const auto loaded = yuzu::win::enumerate_hku_subkeys();
+    const auto loaded = yuzu::win::enumerate_hku_subkeys_checked().names;
     const auto d = reader.offline_profiles(loaded);
     INFO("profiles=" << d.profiles.size() << " partial=" << d.partial.size());
     CHECK(d.complete); // a healthy host's ProfileList walk is complete

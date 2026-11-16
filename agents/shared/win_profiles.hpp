@@ -45,13 +45,11 @@
 // header-local static cannot do this job (#2771 code-review CFX-1).
 #include <yuzu/agent/offline_hive_mutex.hpp>
 
-#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <functional>
 #include <mutex>
-#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -256,17 +254,18 @@ inline std::vector<yuzu::profiles::RawProfileRecord> enumerate_profile_records(
 // "<SID>_Classes" siblings. This is the input to
 // yuzu::profiles::classify_hive_state.
 //
-// A CHECKED listing: `error` is empty exactly when the walk ended at the list's end (an
-// RegEnumKeyExW answer of ERROR_NO_MORE_ITEMS) AND the list did not change while it was read.
-// Any other RegEnumKeyExW answer, a list that cannot be read, or one that never settled
-// (yuzu::shared::stable_walk, three attempts) is a FAILED READ with no names -- never a short
-// list. A caller that acts on the names (hive-state classification, a sweep, a per-user read)
-// must refuse on a non-empty `error` and not treat the listing as "no one is logged on".
+// A CHECKED listing: `error` is empty exactly when the walk ended at the list's end (a
+// RegEnumKeyExW answer of ERROR_NO_MORE_ITEMS) AND two consecutive walks listed the same names.
+// Any other RegEnumKeyExW answer, or a list that never settled
+// (yuzu::shared::stable_walk, at most four walks), is a FAILED READ with no names -- never a
+// short list. A caller that acts on the names (hive-state classification, a sweep, a per-user
+// read) must refuse on a non-empty `error` and not treat the listing as "no one is logged on".
+// The names come back sorted; every consumer treats the list as a set.
 //
-// The stamp is the sorted name list of a second checked walk: a hive that loads or unloads
-// between the walks changes it, including a swap that leaves the count unchanged. (A cheaper
-// RegQueryInfoKeyW count-plus-last-write stamp is not used: it is not shown to move on a
-// same-count swap.)
+// Accepted only when two consecutive walks list the same names (two walks on a quiet host). A
+// RegQueryInfoKeyW count-plus-last-write stamp is not used: its behaviour on a same-count swap
+// (one hive unloaded and another loaded between two reads) was not measured, and this rule does
+// not depend on it.
 inline yuzu::shared::ListWalk enumerate_hku_subkeys_checked() {
     constexpr DWORD kNameBufLen = 256;
     const auto walk_once = [] {
@@ -286,21 +285,8 @@ inline yuzu::shared::ListWalk enumerate_hku_subkeys_checked() {
                 return yuzu::shared::ListStep::Error;
             });
     };
-    const auto stamp = [&]() -> std::optional<std::vector<std::string>> {
-        auto w = walk_once();
-        if (!w.error.empty())
-            return std::nullopt;
-        std::sort(w.names.begin(), w.names.end());
-        return std::move(w.names);
-    };
-    constexpr unsigned kMaxAttempts = 3;
-    return yuzu::shared::stable_walk(stamp, walk_once, kMaxAttempts);
-}
-
-// The names only, empty when the checked listing failed. Prefer enumerate_hku_subkeys_checked:
-// this form cannot tell "no hives loaded" from "the listing failed".
-inline std::vector<std::string> enumerate_hku_subkeys() {
-    return enumerate_hku_subkeys_checked().names;
+    constexpr unsigned kMaxWalks = 4;
+    return yuzu::shared::stable_walk(walk_once, kMaxWalks);
 }
 
 // Result of enumerate_value_names(): the names actually collected, plus
@@ -332,7 +318,7 @@ struct ValueNameEnumeration {
 // RegQueryInfoKeyW sizes the longest value name actually present so the
 // buffer is neither a truncating fixed guess (a value name here can be a
 // full filesystem path, unlike the short SID/profile key names
-// enumerate_profile_records/enumerate_hku_subkeys size for) nor an
+// enumerate_profile_records/enumerate_hku_subkeys_checked size for) nor an
 // unbounded allocation (kMaxValueNameChars caps it regardless of what the
 // key reports). Enumeration itself is bounded at kMaxEnumeratedValueNames
 // entries so a key stuffed with an unbounded number of values cannot pin
@@ -365,7 +351,7 @@ inline ValueNameEnumeration enumerate_value_names(HKEY key) {
         // RegEnumValueW's lpcchValueName is WCHAR count and MUST include
         // room for the terminator on input, even though the count it writes
         // back on success does not include it (mirrors RegEnumKeyExW's
-        // contract in enumerate_hku_subkeys above, just measured in the
+        // contract in enumerate_hku_subkeys_checked above, just measured in the
         // opposite unit from read_reg_value's byte-oriented RegQueryValueExW).
         DWORD name_len = static_cast<DWORD>(name_buf.size());
         const LSTATUS rc = RegEnumValueW(key, idx, name_buf.data(), &name_len, nullptr, nullptr,

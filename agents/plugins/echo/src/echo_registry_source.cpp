@@ -1584,13 +1584,17 @@ void run_pending_hive_sweep(OfflineMountTick& tick) {
         return yuzu::echo::sweep_leftover_hive_mounts();
     });
     if (bounded.status == yuzu::shared::BoundedCallStatus::Completed) {
-        // A listing that failed or never settled keeps the sweep pending for exactly one retry (at
-        // the first offline mount), then completes with one warning.
+        // A listing that failed or never settled keeps the sweep pending for exactly one retry
+        // (before the next offline mount), then completes. Each failed listing logs one warning
+        // naming the cause. (The lock the worker held is already released.)
         const auto settle = yuzu::echo::settle_sweep(*bounded.value, tick.sweep_listing_retried);
         tick.sweep_pending = settle.pending;
-        if (settle.warn)
-            spdlog::warn("Echo registry: hku_list_incomplete -- HKEY_USERS could not be listed "
-                         "twice, so leftover hive mounts were not swept this start");
+        if (settle.pending || settle.warn)
+            spdlog::warn("Echo registry: hku_list_incomplete ({}) -- leftover hive mounts were not "
+                         "swept; {}",
+                         bounded.value->listing_error,
+                         settle.pending ? "one retry before the next offline mount"
+                                        : "not retried this start");
         return;
     }
     const auto decision = yuzu::echo::decide_mount_call(
@@ -1754,10 +1758,10 @@ HiveSweepResult sweep_leftover_hive_mounts(std::string_view prefix) {
         // (win_reg_handle.hpp), and that is the default shape on the shared CI pools.
         const yuzu::agent::ScopedOfflineHiveLock offline_lock("echo_registry_sweep");
         // A failed or unstable listing is not "no mounts are left": nothing is offered to the unload
-        // and the result says so (listing_incomplete), so the caller does not settle on it.
+        // and the result says so (listing_error), so the caller does not settle on it.
         const auto listing = yuzu::win::enumerate_hku_subkeys_checked();
         if (!listing.error.empty()) {
-            r.listing_incomplete = true;
+            r.listing_error = listing.error;
             return r;
         }
         stale = select_stale_hive_mounts(listing.names, prefix);

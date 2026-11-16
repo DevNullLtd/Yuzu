@@ -396,7 +396,7 @@
   "privileges": [
     {
       "grant": "**None** for `list`, `query` and `list_inventory`: `Reg*W` reads only. `list_per_user`'s offline `NTUSER.DAT` mount for a logged-out profile uses `SeBackupPrivilege` and `SeRestorePrivilege`, which the agent account already holds.",
-      "if_refused": "`list_per_user` writes `warning|privilege_missing: ...` naming how many logged-out profiles could not be read, `warning|hive_file_refused` per refused hive and `warning|hive_read_failed` for unreadable Uninstall keys; machine-scope actions are unaffected. An unreadable profile list is `error|profile_list_unreadable` with rc 1; a failed or unstable `HKEY_USERS` listing (re-read until two walks agree, at most three attempts) is `error|hku_list_incomplete` with rc 1, never a list built as if no hive were loaded.",
+      "if_refused": "`list_per_user` writes `warning|privilege_missing: ...` naming how many logged-out profiles could not be read, `warning|hive_file_refused` per refused hive and `warning|hive_read_failed` for unreadable Uninstall keys; machine-scope actions are unaffected. An unreadable profile list is `error|profile_list_unreadable` with rc 1; a failed or unstable `HKEY_USERS` listing (re-read until two consecutive walks agree, at most four walks) is `error|hku_list_incomplete` with rc 1, never a list built as if no hive were loaded.",
       "measured": "Bare-metal Windows (10.0.26200) as `LocalSystem`, 2026-09-21. The capture predates the typed hive-read status and the default-on hive-file guard, so neither shows in it.",
       "os": "Windows",
       "runs_as": "Agent service account, LocalSystem today, not the intended virtual service account (`docs/agent-privilege-model.md` Correction)."

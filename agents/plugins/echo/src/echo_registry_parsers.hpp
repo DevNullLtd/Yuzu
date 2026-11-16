@@ -210,9 +210,10 @@ struct HiveSweepResult {
     // the unload was refused or failed (a holder has it open, it was already gone, or the
     // privilege was not held)
     std::vector<std::string> retained;
-    // The HKEY_USERS listing failed or never settled, so the sweep could not tell which mounts are
-    // stale: nothing was offered to `unload` and the sweep is NOT a statement that none are left.
-    bool listing_incomplete{false};
+    // Non-empty when the HKEY_USERS listing failed or never settled (the cause, from the shared
+    // listing's `error`): the sweep could not tell which mounts are stale, nothing was offered to
+    // `unload`, and the sweep is NOT a statement that none are left.
+    std::string listing_error;
 };
 
 /// What a COMPLETED sweep means for the start-up sweep's pending flag. A sweep that could not
@@ -223,7 +224,7 @@ struct SweepSettle {
     bool warn;
 };
 [[nodiscard]] inline SweepSettle settle_sweep(const HiveSweepResult& r, bool& retried) {
-    if (!r.listing_incomplete)
+    if (r.listing_error.empty())
         return {false, false};
     if (!retried) {
         retried = true;

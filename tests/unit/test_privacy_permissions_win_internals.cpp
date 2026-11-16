@@ -169,7 +169,8 @@ const std::string& synthetic_sid() {
 
 /// Whether any HKEY_USERS subkey is an offline mount this process made for the synthetic SID.
 bool synthetic_mount_present() {
-    for (const auto& n : yuzu::win::enumerate_hku_subkeys())
+    const auto hku = yuzu::win::enumerate_hku_subkeys_checked();
+    for (const auto& n : hku.names)
         if (n.find(synthetic_sid()) != std::string::npos) return true;
     return false;
 }

@@ -21,7 +21,6 @@
 
 #include <catch2/catch_test_macros.hpp>
 
-#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -86,24 +85,22 @@ ListWalk scripted_walk(const Script& script) {
     });
 }
 
-// One scripted listing per walk attempt, and one scripted stamp per stamp call.
+// One scripted answer per walk: a listing, or a failed walk when `fail_at` names that walk.
 struct StableFixture {
-    std::vector<std::optional<int>> stamps;
     std::vector<std::vector<std::string>> walks;
-    std::size_t stamp_calls = 0;
+    std::size_t fail_at = static_cast<std::size_t>(-1); // index of a walk that reports an error
     std::size_t walk_calls = 0;
 
-    ListWalk run(unsigned max_attempts = 3) {
+    ListWalk run(unsigned max_walks = 4) {
         return stable_walk(
-            [&]() -> std::optional<int> {
-                REQUIRE(stamp_calls < stamps.size());
-                return stamps[stamp_calls++];
-            },
             [&] {
-                REQUIRE(walk_calls < walks.size());
-                return ListWalk{walks[walk_calls++], {}};
+                REQUIRE(walk_calls < walks.size()); // the loop never walks past max_walks
+                const auto i = walk_calls++;
+                if (i == fail_at)
+                    return ListWalk{{}, "index 0 (rc=5)"};
+                return ListWalk{walks[i], {}};
             },
-            max_attempts);
+            max_walks);
     }
 };
 } // namespace
@@ -132,51 +129,81 @@ TEST_CASE("index walk: an error at index zero is a failed walk and not an empty 
     CHECK(scripted_walk({{ListStep::End, ""}}).error.empty());
 }
 
-TEST_CASE("stable walk: an unchanged stamp accepts the first walk", "[list_walk]") {
-    StableFixture f{{1, 1}, {{"a", "b"}}};
+TEST_CASE("stable walk: two agreeing walks accept, whatever order they list in", "[list_walk]") {
+    StableFixture f{{{"b", "a"}, {"a", "b"}}};
     const auto w = f.run();
     CHECK(w.error.empty());
-    CHECK(w.names == std::vector<std::string>{"a", "b"});
-    CHECK(f.walk_calls == 1);
-}
-
-TEST_CASE("stable walk: a changed stamp walks again and accepts the stable pass", "[list_walk]") {
-    StableFixture f{{1, 2, 2, 2}, {{"a"}, {"a", "b"}}};
-    const auto w = f.run();
-    CHECK(w.error.empty());
-    CHECK(w.names == std::vector<std::string>{"a", "b"}); // the second pass, not the first
+    CHECK(w.names == std::vector<std::string>{"a", "b"}); // sorted
     CHECK(f.walk_calls == 2);
 }
 
-TEST_CASE("stable walk: a stamp that never settles reports unstable after three attempts",
+TEST_CASE("stable walk: a differing walk walks again and the agreeing pair is accepted",
           "[list_walk]") {
-    StableFixture f{{1, 2, 3, 4, 5, 6}, {{"a"}, {"b"}, {"c"}}};
-    const auto w = f.run(3);
-    CHECK(w.error == kStampUnstable);
-    CHECK(w.names.empty());
+    StableFixture f{{{"a"}, {"a", "b"}, {"a", "b"}}};
+    const auto w = f.run();
+    CHECK(w.error.empty());
+    CHECK(w.names == std::vector<std::string>{"a", "b"}); // the pair, not the first walk
     CHECK(f.walk_calls == 3);
 }
 
-TEST_CASE("stable walk: a stamp that cannot be taken before the walk is an incomplete listing",
-          "[list_walk]") {
-    StableFixture f{{std::nullopt}, {{"a"}}};
-    const auto w = f.run();
-    CHECK(w.error == kStampFailed);
-    CHECK(w.names.empty());
-    CHECK(f.walk_calls == 0); // no walk is trusted without a stamp to compare it with
+TEST_CASE("stable walk: {A,B},{A},{A,B} is never certified as {A}", "[list_walk]") {
+    // The regression the surrounding-stamp rule failed: a middle walk that skipped B (A removed
+    // and reloaded while the walk ran) sat between two walks that listed the same names, and was
+    // accepted. Only two CONSECUTIVE walks that agree certify a list.
+    StableFixture three{{{"A", "B"}, {"A"}, {"A", "B"}}};
+    const auto w3 = three.run(3);
+    CHECK(w3.error == kWalkUnstable);
+    CHECK(w3.names.empty()); // never {A}
+    CHECK(three.walk_calls == 3);
+
+    // A fourth walk that agrees with the third settles it, on the full list.
+    StableFixture four{{{"A", "B"}, {"A"}, {"A", "B"}, {"A", "B"}}};
+    const auto w4 = four.run(4);
+    CHECK(w4.error.empty());
+    CHECK(w4.names == std::vector<std::string>{"A", "B"});
+    CHECK(four.walk_calls == 4);
 }
 
-TEST_CASE("stable walk: two failed stamps do not match and the listing is incomplete",
+TEST_CASE("stable walk: a list that never settles reports unstable after max_walks",
           "[list_walk]") {
-    // The stamp before the walk is fine and the one after it fails: absent == absent must never
-    // read as "unchanged".
-    StableFixture f{{1, std::nullopt}, {{"a"}}};
-    const auto w = f.run();
-    CHECK(w.error == kStampFailed);
+    StableFixture f{{{"a"}, {"b"}, {"c"}, {"d"}}};
+    const auto w = f.run(4);
+    CHECK(w.error == kWalkUnstable);
     CHECK(w.names.empty());
+    CHECK(f.walk_calls == 4);
+}
 
-    // A walk that itself failed is returned as it is, whatever the stamps say.
-    const auto failed = stable_walk([] { return std::optional<int>{1}; },
-                                    [] { return ListWalk{{}, "index 0 (rc=5)"}; }, 3);
-    CHECK(failed.error == "index 0 (rc=5)");
+TEST_CASE("stable walk: a failed walk, first or later, is returned as it is with no names",
+          "[list_walk]") {
+    StableFixture first{{{"a"}, {"a"}}, 0};
+    const auto w1 = first.run();
+    CHECK(w1.error == "index 0 (rc=5)"); // the cause is kept, not replaced
+    CHECK(w1.names.empty());
+    CHECK(first.walk_calls == 1);
+
+    StableFixture later{{{"a"}, {"b"}, {"b"}}, 1};
+    const auto w2 = later.run();
+    CHECK(w2.error == "index 0 (rc=5)");
+    CHECK(w2.names.empty());
+    CHECK(later.walk_calls == 2); // it stops at the failure; the agreeing pair never forms
+}
+
+TEST_CASE("stable walk: fewer than two walks can never certify a list", "[list_walk]") {
+    StableFixture one{{{"a"}, {"a"}}};
+    const auto w1 = one.run(1);
+    CHECK(w1.error == kWalkUnstable);
+    CHECK(w1.names.empty());
+    CHECK(one.walk_calls == 1);
+
+    StableFixture none{{}};
+    CHECK(none.run(0).error == kWalkUnstable);
+    CHECK(none.walk_calls == 0);
+}
+
+TEST_CASE("stable walk: an empty list read twice is a complete empty list", "[list_walk]") {
+    StableFixture f{{{}, {}}};
+    const auto w = f.run();
+    CHECK(w.error.empty());
+    CHECK(w.names.empty());
+    CHECK(f.walk_calls == 2);
 }
