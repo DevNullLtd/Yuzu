@@ -724,6 +724,14 @@ int main(int argc, char* argv[]) {
         // flag cannot accept a value the pool will silently refuse to honour.
         ->check(CLI::Range(std::size_t{0}, yuzu::server::detail::kMaxHttpWorkerThreads))
         ->envname("YUZU_HTTP_WORKER_THREADS");
+    app.add_option("--inventory-sync-cooldown", cfg.inventory_sync_cooldown_s,
+                   "Seconds between two on-demand software-inventory sync runs of the same group, "
+                   "scope expression or the whole fleet (POST /api/v1/hardware/sync and the MCP "
+                   "tool sync_hardware_software). A repeat of a run still spreading joins it and is "
+                   "not held back. 0 = no gap. Per server process (default: 600)")
+        ->default_val(600)
+        ->check(CLI::Range(0, 86400)) // 86400 = software_sync::kMaxCooldownSecs
+        ->envname("YUZU_INVENTORY_SYNC_COOLDOWN");
 
     // Fleet visualization (PR 3 of feat/viz-engine ladder)
     app.add_flag("--viz-disable", cfg.viz_disable,

@@ -1789,8 +1789,9 @@ if build_server
       'unit/server/test_hardware_ui.cpp',         # round-3: Hardware CI list/record HTML fragment
       'unit/server/test_hardware_routes.cpp',     # round-3: Hardware CI list/record routes + REST twin
       'unit/server/test_mcp_tools_hardware.cpp',  # Seam PR2: list_hardware_ci / get_hardware_ci MCP twins (REST byte identity, fail-closed audit, confinement)
-      'unit/server/test_software_sync_decision.cpp', # Software "Sync now": pure request grammar, partition, fleet-wide rule, 500 cap, cooldown, audit wording
-      'unit/server/test_software_sync_runner.cpp',   # Software sync: the shared Runner (REST + MCP) - cooldown, lease, bounded partition, audit-before-send
+      'unit/server/test_software_sync_decision.cpp', # Software "Sync now": pure request grammar, partition, fleet-administrator and confirm rules, run key, join, cooldown, audit wording
+      'unit/server/test_software_sync_runner.cpp',   # Software sync: the shared Runner (REST + MCP) - run key and join, cooldown, pacing ledger, live-send bound, audit-before-send
+      'unit/server/test_software_sync_pacing.cpp',   # Software sync: the pure pacing/admission rule (budget, spread, busy, too large)
       'unit/server/test_hardware_sync_routes.cpp', # Software "Sync now": POST /api/v1/hardware/sync route matrix (HwHarness pattern)
       'unit/server/test_home_render.cpp',         # Dashboard summary: pure renderers, partitions, states
       'unit/server/test_home_routes.cpp',         # Dashboard summary: gates, scope, degrade, caller matrix
@@ -1822,6 +1823,7 @@ if build_server
       'unit/server/test_dex_app_perf_model.cpp',
       'unit/server/test_dex_app_perf_failures.cpp', # pure per-version crash/hang join + shared versions[] serializer - no store, no PG
       'unit/server/test_dex_apps_stability.cpp', # pure application/version stability assembly + shared apps JSON serializer - no store, no PG
+      'unit/server/test_dex_usage_model.cpp', # pure fleet usage read model: matching, cells, disclosure, exposure rate, builder - no store, no PG
       'unit/server/test_app_perf_compare.cpp',
       'unit/server/test_dex_app_perf_ui.cpp',
       'unit/server/test_dex_app_perf_version_table.cpp', # per-version crash/hang table renderer + fragment route over the FnDexPerfApi double - no store, no PG
@@ -1846,6 +1848,7 @@ if build_server
       'unit/server/test_dex_score_policy_form.cpp',
       'unit/server/test_dex_catalogue.cpp', # ADR-0031 WS-A4 PR-1: the Catalogue View 1 read model + FnDexApi double
       'unit/server/test_dex_perf_api.cpp', # ADR-0031 WS-A4: the sixth per-family in-process API seam (DEX app-perf-over-time)
+      'unit/server/test_dex_app_usage_owner.cpp', # DexAppUsageOwner: the one-statement fleet usage + exposed-events read ([pg][dex_usage])
       'unit/server/test_schedule_api.cpp', # ADR-0031 WS-A4: the seventh per-family in-process API seam (schedule read)
       'unit/server/test_workflow_api.cpp', # ADR-0031 WS-A4: the eighth per-family in-process API seam (workflow read)
       'unit/server/test_list_keyset.cpp', # pure keyset cursor/int primitives (workflow-execution list)
