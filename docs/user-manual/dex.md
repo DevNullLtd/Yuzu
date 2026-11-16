@@ -1,5 +1,9 @@
 # DEX — Digital Employee Experience
 
+For a guided tour of every DEX capability, with the collectors and plugins behind
+each one and how the dashboard, REST API and MCP surfaces work, start at the
+[DEX guide](../dex/README.md).
+
 The **DEX dashboard** (`/dex`) is a read-only fleet-reliability lens over the
 Guardian event store. It reinterprets ruleless [signal observations](guaranteed-state.md#dex-signal-observations)
 — app crashes and hangs, service failures, device stability, boot/resume
@@ -376,7 +380,7 @@ drill. It is **device / local-link health**, not localization: a bad local link
 (Wi-Fi, congested uplink) shows up cleanly across every connection, but *which*
 destination or app is affected is a later per-destination slice. Linux agents
 report all three metrics; Windows reports throughput and retransmit rate (RTT
-deferred — needs ESTATS); macOS is a later slice. Full detail,
+deferred — needs ESTATS); macOS reports throughput only. Full detail,
 platform coverage, and the privacy model are on the
 [Network quality dashboard](network.md) page.
 
@@ -855,8 +859,8 @@ exported to Prometheus — reach those via the REST endpoints on demand.
 DEX collection is a **deploy-time agent setting**. Start the agent with
 **`--dex-disable`** (or `YUZU_AGENT_DEX_DISABLE=1`) and that endpoint arms no
 observer and sends no DEX telemetry of any kind. **Note:** `--dex-disable` turns
-off the DEX event observer, the Windows state poll, and the heartbeat perf
-tags (the fleet rollup above), but the Echo performance
+off the DEX event observer, the Windows state poll, and the heartbeat perf and
+network-quality tags (the fleet rollup above), but the Echo performance
 sampler is a separate subsystem — disable it with `perf_enabled=false` (see
 [Echo configuration](echo.md#configuration)). There is no server-side runtime
 toggle today; per-category collection toggles and an individual-view kill switch
@@ -887,6 +891,8 @@ follow-up). The Guardian event store and rules are unaffected by this operation.
 
 ## Related documentation
 
+- [DEX guide](../dex/README.md) — one page per DEX area, the collectors and
+  plugins behind them, and the dashboard / REST / MCP surface map.
 - [Guaranteed State (Guardian)](guaranteed-state.md) — the underlying event
   store, the observer, and `--dex-disable`.
 - [`docs/dex-signal-catalog.md`](../dex-signal-catalog.md) — the full
