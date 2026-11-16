@@ -441,7 +441,7 @@ row first).
   (`kAgentStepStatementMarginMs`), 3 s per statement, restored like its `lock_timeout`: `lock_timeout` is per
   wait and a `FOR SHARE` locker does not queue behind a waiting `FOR UPDATE`, so a rolling chain of Repair
   share locks on one agent could otherwise keep a first delivery waiting past its 1 s bound. The lock bound ends a
-  single wait and the statement bound is the total ceiling for the step's statements. The margin is 2 s because one
+  single wait and the statement bound is the ceiling for each of the step's statements. The margin is 2 s because one
   statement can wait in two stages (the tuple-lock queue, then the holder's transaction), each with its own
   `lock_timeout`: measured on a toy schema with the real Ensure and DECIDE shapes, a 1.5 s statement bound
   failed 12 to 37 of about 50 first deliveries on one agent row (each holding it for a 10 to 20 ms commit) with
@@ -450,10 +450,11 @@ row first).
   (#7229, #7980). A statement that
   reaches either bound takes the failed-step path (the event is stored pending). No alert rule ships for any
   of these signals.
-  The owner ruled the 3 s statement bound during this change's Gate 8 fix round, widening the 1 s per-statement
-  bound of the 2026-11-12 decision, because the 1 s and 1.5 s bounds stranded same-agent bursts as measured above;
-  the cost is that one first delivery's order step can hold its pooled connection for up to the sum of its
-  statements' bounds.
+  Owner ruling 2026-11-15: the step's statement bound is 3 s (the lock bound plus the 2 s margin), widening the
+  1.5 s bound set at Gate 7, because 1.5 s stranded same-agent bursts as measured above. The 2026-11-12 decision set
+  only the 1 s lock bound, which is unchanged. The cost is that one first delivery's order step can hold its pooled
+  connection for up to the sum of its statements' bounds, so the statement bound above is a per-statement ceiling,
+  not a ceiling on the whole step.
 - An absolute plausibility bound at the ingest boundary (UP-9): `emit_seq` of 2^40 or more, or a `boot_epoch`
   more than ten years past receipt, is `implausible`. The pair is dropped at the ingest boundary, exactly as an
   `out_of_range` one is, and the event is judged as an unpaired event at first delivery: its stored pair is
