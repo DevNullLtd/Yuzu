@@ -120,8 +120,9 @@ public:
         const std::vector<std::string>& instruction_ids, int limit,
         const std::unordered_set<std::string>& exclude_ids = {}) const;
     /// The policies that use any of `fragment_ids`, at most `per_fragment_limit` for each fragment
-    /// (ordered by name, then id as a stable tiebreak; `query_policies` orders by name only), in ONE read of the policy rows
-    /// only (no trigger/input/binding detail is loaded, so a bad detail row cannot fail it). A
+    /// (ordered by name, then id as a stable tiebreak; `query_policies` orders by name only), in
+    /// ONE read of the policy rows only (no trigger/input/binding detail is loaded, so a bad
+    /// detail row cannot fail it). A
     /// fragment no policy uses is simply absent. An empty list answers an empty vector without a
     /// read. `kDegraded` = the question could not be answered; it is never an empty list.
     [[nodiscard]] std::expected<std::vector<FragmentUse>, PolicyReadError>

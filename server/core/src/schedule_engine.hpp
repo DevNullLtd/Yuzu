@@ -105,9 +105,9 @@ public:
     query_schedules_checked(const ScheduleQuery& q = {}) const;
 
     /// Ids of the schedules whose definition is ANY of `definition_ids` (one read for the whole
-    /// list, `definition_id = ANY(...)`), at most `limit` of them, ordered by name,
-    /// then id as a stable tiebreak (`query_schedules_checked` orders by name only). Ids only, so no row is decoded and
-    /// the 5000-row listing cap does not apply. An empty `definition_ids` answers an empty list
+    /// list, `definition_id = ANY(...)`), at most `limit` of them, ordered by name, then id as a
+    /// stable tiebreak (`query_schedules_checked` orders by name only). Ids only, so no row is
+    /// decoded and the 5000-row listing cap does not apply. An empty `definition_ids` answers an empty list
     /// without a read. `unexpected(msg)` (prefixed `kDbErrorPrefix`) = the question could not be
     /// answered; never read it as "no schedule references it".
     std::expected<std::vector<std::string>, std::string>

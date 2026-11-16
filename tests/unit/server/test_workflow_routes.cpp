@@ -7954,8 +7954,9 @@ TEST_CASE("7921: a failing referrer lookup answers 503 with retry_after_ms and u
 // The held-by answer for a pack of 60 own fragments, one of which four policies use: the 409 names
 // that fragment and its first three policies (`+1` for the rest) and none of the 59 unused ones.
 // This pins the CONTENT of the batched held-by read (per-fragment cap, grouping, exclusion of the
-// unused fragments); that it is ONE lease is pinned by the lease-count test below. Turns red if the
-// batched read loses the per-fragment cap, the grouping, or the exclusion.
+// unused fragments). The lease-count test below pins that the STORE METHOD is one lease; the route's
+// own use of it (one call for all own fragments) is not lease-counted here. Turns red if the batched
+// read loses the per-fragment cap, the grouping, or the exclusion.
 TEST_CASE("7921: sixty own fragments: the used one names its first three policies and +1",
           "[pg][workflow][product_pack][7921]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
@@ -8244,7 +8245,9 @@ std::string fragment_naming_quoted(const std::string& definition_id, const std::
 // three source reads, the held-by read over 60 fragments costs one, and a blocked 409 DELETE costs
 // the same number of leases for a 5-definition pack as for a 500-definition one. Turns red if the
 // batch form is lost (1500 leases), `policies_using_fragments` goes back to one read per fragment
-// (60), a store loops per id, or the route stops using `lookup_many`.
+// (60), a store takes a lease per id, or the route stops using `lookup_many`. It counts leases, not
+// statements: a store that looped per id on ONE lease would not turn it red (the single
+// `= ANY($1::text[])` statement in each store method is what rules that out).
 TEST_CASE("7921: lease counts: the lookup, the held-by read and the blocked route cost a fixed "
           "number of pooled leases",
           "[pg][workflow][product_pack][referrers][7921]") {
