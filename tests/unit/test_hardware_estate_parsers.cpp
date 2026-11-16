@@ -486,6 +486,7 @@ TEST_CASE("estate: the Linux and macOS cpu rows are written through format_cpu_r
     };
     CHECK(count("format_cpu_row_sampled(") == 2); // the Linux leg and the macOS leg
     CHECK(count("{:.0f}|-|-") == 0);               // no inline cpu row format is left
+    CHECK(count("std::format(\"cpu|") == 0);       // nor any other inline `cpu|` format call
 }
 
 TEST_CASE("estate: dimm row formatter escapes the slot and keeps the column order", "[hardware_estate]") {
