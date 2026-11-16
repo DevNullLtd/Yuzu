@@ -450,6 +450,10 @@ row first).
   (#7229, #7980). A statement that
   reaches either bound takes the failed-step path (the event is stored pending). No alert rule ships for any
   of these signals.
+  The owner ruled the 3 s statement bound during this change's Gate 8 fix round, widening the 1 s per-statement
+  bound of the 2026-11-12 decision, because the 1 s and 1.5 s bounds stranded same-agent bursts as measured above;
+  the cost is that one first delivery's order step can hold its pooled connection for up to the sum of its
+  statements' bounds.
 - An absolute plausibility bound at the ingest boundary (UP-9): `emit_seq` of 2^40 or more, or a `boot_epoch`
   more than ten years past receipt, is `implausible`. The pair is dropped at the ingest boundary, exactly as an
   `out_of_range` one is, and the event is judged as an unpaired event at first delivery: its stored pair is
