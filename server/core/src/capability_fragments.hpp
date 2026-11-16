@@ -22,6 +22,7 @@
 #include "capability_decls/plugin_action_catalogue_browser_inventory.hpp"
 #include "capability_decls/plugin_action_catalogue_browser_policy.hpp"
 #include "capability_decls/plugin_action_catalogue_c.hpp"
+#include "capability_decls/plugin_action_catalogue_component_inventory.hpp"
 #include "capability_decls/plugin_action_catalogue_content_dist.hpp"
 #include "capability_decls/plugin_action_catalogue_d.hpp"
 #include "capability_decls/plugin_action_catalogue_disk_actions.hpp"
@@ -65,6 +66,7 @@
     ::yuzu::server::capdecls::plugin_action_catalogue_update_source_trust(),\
     ::yuzu::server::capdecls::plugin_action_catalogue_app_control(),\
     ::yuzu::server::capdecls::plugin_action_catalogue_firmware_posture(),\
+    ::yuzu::server::capdecls::plugin_action_catalogue_component_inventory(),\
     ::yuzu::server::capdecls::plugin_action_catalogue_runtimes(),\
     ::yuzu::server::capdecls::plugin_action_catalogue_platform_security(),\
     ::yuzu::server::capdecls::plugin_action_catalogue_browser_inventory(),\

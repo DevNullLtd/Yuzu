@@ -37,6 +37,7 @@
 #include "capability_decls/plugin_action_catalogue_app_control.hpp"
 #include "capability_decls/plugin_action_catalogue_firmware_posture.hpp"
 #include "capability_decls/plugin_action_catalogue_middleware.hpp"
+#include "capability_decls/plugin_action_catalogue_component_inventory.hpp"
 #include "capability_decls/plugin_action_catalogue_runtimes.hpp"
 #include "capability_decls/plugin_action_catalogue_platform_security.hpp"
 #include "capability_decls/plugin_action_catalogue_browser_inventory.hpp"
@@ -162,6 +163,7 @@ struct LabeledSpan {
         {"update_source_trust", capdecls::plugin_action_catalogue_update_source_trust(), false},
         {"app_control", capdecls::plugin_action_catalogue_app_control(), false},
         {"firmware_posture", capdecls::plugin_action_catalogue_firmware_posture(), false},
+        {"component_inventory", capdecls::plugin_action_catalogue_component_inventory(), false},
         {"runtimes", capdecls::plugin_action_catalogue_runtimes(), false},
         {"platform_security", capdecls::plugin_action_catalogue_platform_security(), false},
         {"browser_inventory", capdecls::plugin_action_catalogue_browser_inventory(), false},
@@ -202,6 +204,7 @@ struct LabeledSpan {
         capdecls::plugin_action_catalogue_update_source_trust(),
         capdecls::plugin_action_catalogue_app_control(),
         capdecls::plugin_action_catalogue_firmware_posture(),
+        capdecls::plugin_action_catalogue_component_inventory(),
         capdecls::plugin_action_catalogue_runtimes(),
         capdecls::plugin_action_catalogue_platform_security(),
         capdecls::plugin_action_catalogue_browser_inventory(),
@@ -754,6 +757,25 @@ TEST_CASE("capability catalogue: runtimes.dotnet, runtimes.jvm and runtimes.pyth
         CHECK_FALSE(it->system_reserved);
         CHECK(it->execute_gate == ExecuteGate::None);
     }
+}
+
+/// Exact-row pin for `component_inventory.scan`, the only row of its fragment. `Inventory`
+/// (a software-inventory fact), not `Infrastructure`: both are seeded securables, so the
+/// generic invariants accept either and only this pin catches a silent re-typing.
+TEST_CASE("capability catalogue: component_inventory.scan pins its exact classification",
+          "[server][dispatch][capability]") {
+    const auto rows = capdecls::plugin_action_catalogue_component_inventory();
+    REQUIRE(rows.size() == 1);
+    const auto& row = rows[0];
+    CHECK(row.plugin == "component_inventory");
+    CHECK(row.action == "scan");
+    CHECK(row.dispatch_class == DispatchClass::ReadOnly);
+    CHECK(row.mutability == Mutability::None);
+    CHECK(row.securable == "Inventory");
+    CHECK(row.operation == authz::Operation::Read);
+    CHECK(row.risk_tier == authz::RiskTier::Low);
+    CHECK_FALSE(row.system_reserved);
+    CHECK(row.execute_gate == ExecuteGate::None);
 }
 
 /// Exact-row pin for `platform_security` (Wave 8): both rows read fixed boot-integrity
