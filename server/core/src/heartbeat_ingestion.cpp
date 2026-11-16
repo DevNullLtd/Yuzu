@@ -20,6 +20,39 @@
 
 namespace yuzu::server {
 
+namespace {
+
+/// Run one heartbeat reconcile hook so that nothing it throws escapes the heartbeat handler or
+/// skips the rest of ingestion. A throw is counted in `counter` (pre-seeded at server start-up,
+/// so a persistent failure is alertable) and then logged; the count comes first and cannot
+/// itself throw out of the handler. The agent id and the exception text are untrusted, so both
+/// go through the log-token neutralisers.
+template <typename Fn>
+void guarded_reconcile(MetricsRegistry* metrics, const char* counter, std::string_view what,
+                       const std::string& via, const std::string& agent_id, Fn&& fn) {
+    const auto count_throw = [&]() noexcept {
+        try {
+            if (metrics)
+                metrics->counter(counter).increment();
+        } catch (...) {
+            // A lost sample only under-reports; ingestion carries on.
+        }
+    };
+    try {
+        fn();
+    } catch (const std::exception& e) {
+        count_throw();
+        spdlog::warn("[{}] Heartbeat {} reconcile threw for agent={}: {}", via, what,
+                     ::yuzu::log_id_token(agent_id), ::yuzu::log_id_token(e.what()));
+    } catch (...) {
+        count_throw();
+        spdlog::warn("[{}] Heartbeat {} reconcile threw a non-standard exception for agent={}",
+                     via, what, ::yuzu::log_id_token(agent_id));
+    }
+}
+
+} // namespace
+
 void HeartbeatIngestion::ingest(const ::yuzu::agent::v1::HeartbeatRequest& hb,
                                 std::string_view agent_id, std::string_view via,
                                 std::string_view resolved_session_id,
@@ -116,35 +149,11 @@ void HeartbeatIngestion::ingest(const ::yuzu::agent::v1::HeartbeatRequest& hb,
             // Require the WHOLE tag to parse (ptr at end) — "123abc" must be
             // rejected, not silently read as 123 (cpp-expert / #1209).
             if (ec == std::errc() && ptr == v.data() + v.size()) {
-                // Defensive, like the quarantine hook below: a throwing reconcile
-                // dependency must not escape the heartbeat handler or skip the rest of
-                // ingestion. The agent id and the exception text are untrusted, so both
-                // go through the log-token neutralisers.
-                // Each throw is counted (the series is pre-seeded at server start-up) as
-                // well as logged, so a persistent failure is alertable. The count comes
-                // first and cannot itself throw out of the handler.
-                const auto count_throw = [this]() noexcept {
-                    try {
-                        if (metrics_)
-                            metrics_->counter("yuzu_server_guardian_reconcile_exceptions_total")
-                                .increment();
-                    } catch (...) {
-                        // A lost sample only under-reports; ingestion carries on.
-                    }
-                };
-                try {
-                    guardian_reconcile_fn_(agent_id_str, gen);
-                } catch (const std::exception& e) {
-                    count_throw();
-                    spdlog::warn("[{}] Heartbeat guardian reconcile threw for agent={}: {}",
-                                 via_str, ::yuzu::log_id_token(agent_id_str),
-                                 ::yuzu::log_id_token(e.what()));
-                } catch (...) {
-                    count_throw();
-                    spdlog::warn("[{}] Heartbeat guardian reconcile threw a non-standard "
-                                 "exception for agent={}",
-                                 via_str, ::yuzu::log_id_token(agent_id_str));
-                }
+                // Defensive, like the quarantine hook below: a throwing reconcile dependency
+                // must not escape the heartbeat handler or skip the rest of ingestion.
+                guarded_reconcile(metrics_, "yuzu_server_guardian_reconcile_exceptions_total",
+                                  "guardian", via_str, agent_id_str,
+                                  [&] { guardian_reconcile_fn_(agent_id_str, gen); });
             }
         }
     }
@@ -157,33 +166,13 @@ void HeartbeatIngestion::ingest(const ::yuzu::agent::v1::HeartbeatRequest& hb,
     {
         const auto& tags = hb.status_tags();
         const auto it = tags.find("yuzu.inv_settings_version");
-        if (it != tags.end() &&
-            collection_settings::is_reportable_tag(it->second)) {
+        if (it != tags.end() && collection_settings::is_reportable_tag(it->second)) {
             std::shared_lock lock(inventory_settings_reconcile_mu_);
             if (inventory_settings_reconcile_fn_) {
-                const auto count_throw = [this]() noexcept {
-                    try {
-                        if (metrics_)
-                            metrics_
-                                ->counter("yuzu_server_inventory_settings_reconcile_exceptions_total")
-                                .increment();
-                    } catch (...) {
-                        // A lost sample only under-reports; ingestion carries on.
-                    }
-                };
-                try {
-                    inventory_settings_reconcile_fn_(agent_id_str, it->second);
-                } catch (const std::exception& e) {
-                    count_throw();
-                    spdlog::warn("[{}] Heartbeat inventory settings reconcile threw for agent={}: {}",
-                                 via_str, ::yuzu::log_id_token(agent_id_str),
-                                 ::yuzu::log_id_token(e.what()));
-                } catch (...) {
-                    count_throw();
-                    spdlog::warn("[{}] Heartbeat inventory settings reconcile threw a non-standard "
-                                 "exception for agent={}",
-                                 via_str, ::yuzu::log_id_token(agent_id_str));
-                }
+                guarded_reconcile(
+                    metrics_, "yuzu_server_inventory_settings_reconcile_exceptions_total",
+                    "inventory settings", via_str, agent_id_str,
+                    [&] { inventory_settings_reconcile_fn_(agent_id_str, it->second); });
             }
         }
     }

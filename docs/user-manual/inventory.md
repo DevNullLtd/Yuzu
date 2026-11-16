@@ -668,7 +668,9 @@ OS, is `not_collected`. Switching a collector back on collects afresh.
 **Registered apps and the kill switch.** A document cannot turn registered apps
 collection off, but a plugin kill switch on it is carried into the delivered
 settings, and the agent honours it as sent: collection stops on the machine and
-the agent still reports the version it really applied.
+the agent still reports the version it really applied. Only the plugin-wide kill
+switch is carried: a switch set for one operating system or one action does not
+stop that collector's daily collection.
 
 **Intervals of several days.** Without a window, a device syncs one interval after
 its last clean sync, at the agent's own offset. With a window (which needs a

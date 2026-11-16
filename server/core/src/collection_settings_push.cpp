@@ -8,7 +8,10 @@ std::shared_ptr<const CollectionSettingsPusher::Snapshot>
 CollectionSettingsPusher::snapshot(std::int64_t now) {
     {
         std::lock_guard lock(mu_);
-        const bool due = !attempted_at_ || now - *attempted_at_ >= kSnapshotTtlSecs;
+        // A clock that stepped back (now before the last attempt) counts as due: the age would
+        // otherwise stay negative and freeze the snapshot until the clock caught up.
+        const bool due = !attempted_at_ || now < *attempted_at_ ||
+                         now - *attempted_at_ >= kSnapshotTtlSecs;
         if (!due || refreshing_)
             return snapshot_; // fresh enough, or another heartbeat is already refreshing
         refreshing_ = true;
@@ -83,12 +86,14 @@ void CollectionSettingsPusher::on_heartbeat(const std::string& agent_id,
     std::optional<std::vector<std::string>> cached_groups;
     std::int64_t cached_membership_at = 0;
     bool decided = false;
+    bool membership_cooling = false;
     {
         std::lock_guard lock(mu_);
         if (const auto it = memos_.find(agent_id); it != memos_.end()) {
             Memo& m = it->second;
             m.seen_at = now;
-            if (now - m.membership_at < kMembershipTtlSecs) {
+            // A negative age (the clock stepped back) is expired, like the snapshot's.
+            if (const auto age = now - m.membership_at; age >= 0 && age < kMembershipTtlSecs) {
                 if (m.epoch >= snap->epoch) {
                     verdict = decide_and_claim_locked(m, reported_tag, claim);
                     decided = true;
@@ -98,6 +103,16 @@ void CollectionSettingsPusher::on_heartbeat(const std::string& agent_id,
                 }
             }
         }
+        // This heartbeat needs a membership read. After a failed one none is attempted, for any
+        // agent, until the retry gap has passed (a clock that stepped back ends the gap).
+        if (!decided && !cached_groups && membership_failed_at_) {
+            const auto since = now - *membership_failed_at_;
+            membership_cooling = since >= 0 && since < kMembershipRetrySecs;
+        }
+    }
+    if (membership_cooling) {
+        degrade("membership");
+        return;
     }
 
     if (!decided) {
@@ -110,6 +125,10 @@ void CollectionSettingsPusher::on_heartbeat(const std::string& agent_id,
         } else {
             auto read = deps_.read_membership(agent_id);
             if (!read) {
+                {
+                    std::lock_guard lock(mu_);
+                    membership_failed_at_ = now;
+                }
                 degrade("membership");
                 return;
             }

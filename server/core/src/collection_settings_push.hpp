@@ -48,6 +48,10 @@ inline constexpr std::int64_t kMinRepushGapSecs = 300;
 inline constexpr std::int64_t kSnapshotTtlSecs = 60;
 /// An agent's group membership is re-read when the cached read is older than this.
 inline constexpr std::int64_t kMembershipTtlSecs = 600;
+/// After a failed membership read no membership read is attempted, for any agent, for this long:
+/// a degraded pool then costs one acquire timeout per gap, not one per heartbeat (a gateway batch
+/// ingests its heartbeats one after another on one thread).
+inline constexpr std::int64_t kMembershipRetrySecs = 60;
 /// A memo not seen for this long is evicted during a snapshot refresh.
 inline constexpr std::int64_t kMemoEvictSecs = 3600;
 
@@ -158,10 +162,11 @@ private:
 
     Deps deps_;
     std::mutex mu_;
-    std::shared_ptr<const Snapshot> snapshot_; // guarded by mu_
-    std::optional<std::int64_t> attempted_at_; // guarded by mu_: start of the last refresh
-    bool refreshing_{false};                   // guarded by mu_
-    std::map<std::string, Memo> memos_;        // guarded by mu_
+    std::shared_ptr<const Snapshot> snapshot_;         // guarded by mu_
+    std::optional<std::int64_t> attempted_at_;         // guarded by mu_: start of the last refresh
+    std::optional<std::int64_t> membership_failed_at_; // guarded by mu_: the last failed read
+    bool refreshing_{false};                           // guarded by mu_
+    std::map<std::string, Memo> memos_;                // guarded by mu_
 };
 
 } // namespace yuzu::server::collection_settings

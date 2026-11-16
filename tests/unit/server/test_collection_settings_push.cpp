@@ -408,8 +408,110 @@ TEST_CASE("a degraded read pushes nothing, counts a degrade and the previous sna
         CHECK(f.sent.empty());
         CHECK(f.degrades["membership"] == 1);
         f.membership_fails = false;
+        f.t += cs::kMembershipRetrySecs; // the retry gap after a failed read
         f.hb("a", kNone);
         CHECK(f.sent.size() == 1);
+    }
+}
+
+TEST_CASE("a failed membership read is not retried for any agent inside the retry gap",
+          "[collection_settings][push]") {
+    Fake f;
+    f.docs = std::vector<cs::StoredDocument>{doc_for(kRoot, 172800)};
+    f.membership_fails = true;
+
+    f.hb("a", kNone);
+    CHECK(f.membership_reads == 1);
+    CHECK(f.degrades["membership"] == 1);
+
+    // Another agent, and the same one again, inside the gap: no read, still counted as a degrade.
+    f.hb("b", kNone);
+    f.t += cs::kMembershipRetrySecs - 1;
+    f.hb("a", kNone);
+    CHECK(f.membership_reads == 1);
+    CHECK(f.degrades["membership"] == 3);
+    CHECK(f.sent.empty());
+
+    // The gap has passed: the next heartbeat that needs a read performs it.
+    f.membership_fails = false;
+    f.t += 1;
+    f.hb("b", kNone);
+    CHECK(f.membership_reads == 2);
+    CHECK(f.sent.size() == 1);
+
+    // A second failure starts a new gap, and a clock that stepped back ends it.
+    f.membership_fails = true;
+    f.hb("c", kNone);
+    CHECK(f.membership_reads == 3);
+    f.hb("d", kNone);
+    CHECK(f.membership_reads == 3);
+    f.t -= 1;
+    f.hb("d", kNone);
+    CHECK(f.membership_reads == 4);
+}
+
+TEST_CASE("an agent with a fresh membership read is not held back by a failed read for another",
+          "[collection_settings][push]") {
+    Fake f;
+    f.docs = std::vector<cs::StoredDocument>{doc_for(kRoot, 172800)};
+    f.hb("a", kNone); // membership read once
+    REQUIRE(f.sent.size() == 1);
+    const auto v = version_for_interval(172800);
+
+    f.t += cs::kSnapshotTtlSecs - 1;
+    f.membership_fails = true;
+    f.hb("b", kNone); // fails, starts the gap
+    CHECK(f.membership_reads == 2);
+    CHECK(f.degrades["membership"] == 1);
+
+    // "a" needs no read (its memo is fresh and current), so the gap does not touch it.
+    f.hb("a", v);
+    CHECK(f.membership_reads == 2);
+    CHECK(f.degrades["membership"] == 1);
+
+    // A new snapshot epoch re-resolves "a" from its cached membership, still without a read, while
+    // the gap is one second old.
+    f.t += 1;
+    f.hb("a", v);
+    CHECK(f.docs_reads == 2);
+    CHECK(f.membership_reads == 2);
+    CHECK(f.degrades["membership"] == 1);
+}
+
+TEST_CASE("a clock that stepped back refreshes the snapshot and re-reads the membership",
+          "[collection_settings][push]") {
+    SECTION("the snapshot is not frozen until the clock catches up") {
+        Fake f;
+        f.docs = std::vector<cs::StoredDocument>{doc_for(kRoot, 172800)};
+        const auto v1 = version_for_interval(172800);
+        const auto v2 = version_for_interval(259200);
+
+        f.hb("a", kNone);
+        REQUIRE(f.sent.size() == 1);
+        CHECK(f.sent[0].version == v1);
+        CHECK(f.docs_reads == 1);
+
+        f.docs = std::vector<cs::StoredDocument>{doc_for(kRoot, 259200)};
+        f.t -= 3600; // an NTP step back of an hour
+        f.hb("a", v1);
+        CHECK(f.docs_reads == 2);
+        REQUIRE(f.sent.size() == 2);
+        CHECK(f.sent[1].version == v2);
+    }
+    SECTION("a membership read dated after now counts as expired") {
+        Fake f;
+        f.docs = std::vector<cs::StoredDocument>{doc_for(kRoot, 172800)};
+        const auto v1 = version_for_interval(172800);
+
+        f.hb("a", kNone); // the snapshot is read at t0
+        f.t += 30;
+        f.hb("b", kNone); // inside the snapshot TTL; the membership read is dated t0 + 30
+        CHECK(f.membership_reads == 2);
+
+        f.t -= 20; // still after the snapshot attempt, before the membership read
+        f.hb("b", v1);
+        CHECK(f.docs_reads == 1);
+        CHECK(f.membership_reads == 3);
     }
 }
 

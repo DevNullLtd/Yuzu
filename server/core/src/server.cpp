@@ -8780,9 +8780,12 @@ public:
         // before any listener opens, cleared (and reset) in stop() ahead of those stores. There is
         // no push-on-save and no job: an agent that reports a different version in its heartbeat is
         // sent the document that applies to it. All state is in memory and rebuilt from heartbeats.
+        // The three stores are fail-closed (a store that cannot open sets startup_failed_ and the
+        // server refuses to serve), so the pusher exists on every server that serves.
         if (heartbeat_ingestion_ && software_collection_settings_store_ &&
             software_collection_settings_store_->is_open() && mgmt_group_store_ &&
-            mgmt_group_store_->is_open() && plugin_config_store_ && !startup_failed_) {
+            mgmt_group_store_->is_open() && plugin_config_store_ &&
+            plugin_config_store_->is_open() && !startup_failed_) {
             namespace cset = yuzu::server::collection_settings;
             metrics_.describe("yuzu_server_inventory_settings_push_total",
                               "Heartbeat-driven collection settings pushes by result: sent (the "

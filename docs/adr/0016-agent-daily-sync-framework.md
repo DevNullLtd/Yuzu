@@ -1907,9 +1907,13 @@ neither end carries handling for a peer that predates it.
   after the re-push gap; `sent` for a gateway agent is a queue, not a delivery. The reconcile hook runs under a
   shared lock in the heartbeat handler, and an exception from it is caught there, logged and counted in
   `yuzu_server_inventory_settings_reconcile_exceptions_total`; heartbeat ingestion carries on. A suppressed
-  repeat is `result="suppressed"`.
+  repeat is `result="suppressed"`. The hook runs synchronously on the heartbeat thread, as the quarantine hook
+  does: one heartbeat per 60 seconds refreshes the snapshot (single flight, each read bounded by the store's
+  acquire timeout), and a failed membership read is not retried for any agent for 60 seconds
+  (`kMembershipRetrySecs`), so a degraded pool costs one acquire timeout per gap, not one per heartbeat.
 - **Not in this change.** Push on save, a settings command for any source but `installed_software`, per-OS
-  withheld collectors, and zone conversion on the agent.
+  withheld collectors, carrying a per-OS or per-action kill switch (only the plugin-wide switch is carried,
+  which is the one the effective-settings route shows), and zone conversion on the agent.
 
 ## Routed-concern invariants
 
