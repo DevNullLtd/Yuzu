@@ -405,7 +405,7 @@ per line); most, but not all, actions follow the plugin-wide `discriminator\|fie
 pipe-delimited convention (see `echo_status_format.hpp` and `echo_collectors.hpp`). The four
 collection actions share one line shape, `echo\|collect_<leg>\|<events_recorded>\|<token>`, where
 `<token>` is one of `source_disabled`, `unsupported_platform`, `baseline`, `sample_recorded`,
-`apps_recorded`, `cursor_advanced`, `cursor_lost`, `capture_incomplete`, `counters_unavailable`, `state_unreadable` (the `kCollectStatus*` tokens in `echo_collectors.hpp`; `state_unreadable` is emitted by `skip_token()` in `echo_plugin.cpp`). Cursor sources (`power`, `removable`, `registry`) add their own `echo|collect_<source>|<n>|<token>` line to the `collect_slow` stream.
+`apps_recorded`, `cursor_advanced`, `cursor_lost`, `capture_incomplete`, `counters_unavailable`, `state_unreadable`, `retry_backoff` (the `kCollectStatus*` tokens in `echo_collectors.hpp`; `state_unreadable` is emitted by `skip_token()` in `echo_plugin.cpp`; `retry_backoff` appears only on a cursor source's own `collect_<source>` line, for a tick skipped while backed off). Cursor sources (`power`, `removable`, `registry`) add their own `echo|collect_<source>|<n>|<token>` line to the `collect_slow` stream.
 `status`'s wire format is line-oriented `key\|value` pairs (`storage_state\|ok`,
 `record_count\|<n>`, `config\|<key>\|<value>`, ...), not one positional row — the five YAML columns
 below correspond to five of those lines; the rest (`config\|*`, `retention_guard\|*`,
@@ -421,7 +421,7 @@ their declared columns at all; see Caveats.
 
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
-| `events_recorded` | int32 | - | Windows, Linux, macOS | `-` | Count of change events this tick appended to the warehouse. Carried as the third field of the actual response line `echo\|collect_fast\|<events_recorded>\|<token>`, where <token> is one of source_disabled / unsupported_platform / baseline / sample_recorded / cursor_advanced / cursor_lost / capture_incomplete / counters_unavailable / state_unreadable. Values: non-negative integer. |
+| `events_recorded` | int32 | - | Windows, Linux, macOS | `-` | Count of change events this tick appended to the warehouse. Carried as the third field of the actual response line `echo\|collect_fast\|<events_recorded>\|<token>`, where <token> is one of source_disabled / unsupported_platform / baseline / sample_recorded / cursor_advanced / cursor_lost / capture_incomplete / counters_unavailable / state_unreadable / retry_backoff (retry_backoff only on a cursor source's own collect_<source> line). Values: non-negative integer. |
 
 **`crossplatform.echo.collect_slow` — `events_recorded`**
 

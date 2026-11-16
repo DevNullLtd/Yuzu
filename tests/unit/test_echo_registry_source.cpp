@@ -3234,6 +3234,8 @@ TEST_CASE("registry source: a commit that fails for three ticks then succeeds re
     f.reads[kRoot] = svc(1);
     REQUIRE(tick(t.db, *src).outcome == CursorOutcome::Baseline);
 
+    const std::string lost_before = t.db.get_config("registry_etw_lost", "");
+
     // Three ticks whose commit is refused. Each has a loss row, so it has a row to fail on.
     std::int64_t first_failure = 0;
     {
@@ -3252,9 +3254,11 @@ TEST_CASE("registry source: a commit that fails for three ticks then succeeds re
     // The trap is gone: the next tick commits the loss it re-derived and the stall window.
     f.clock += 10 * SEC;
     const std::int64_t recovered = f.clock + 1000;
+    CHECK(t.db.get_config("registry_etw_lost", "") == lost_before); // still nothing committed
     const auto before = read_cursor(t.db).tick;
     tick(t.db, *src);
     CHECK(read_cursor(t.db).tick == before + 1); // the status keys and cursor moved again
+    CHECK(t.db.get_config("registry_etw_lost", "") == "3"); // the three losses, committed now
     const auto stalled =
         ql("SELECT record_key FROM registry_live WHERE record_key LIKE 'gap:commit_stalled:%'");
     REQUIRE(stalled.rows.size() == 1);
