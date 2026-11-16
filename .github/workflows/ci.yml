@@ -1161,6 +1161,17 @@ jobs:
           # entirely; ccache absorbs the per-TU work across matrix runs
           # so the disk cost is the only added cost (~1-2 GB × 4).
           BUILDDIR=build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}
+          # This leg also builds the same targets with the same flags in
+          # build-linux-contracts-gcc15-debug (Contract migration evidence).
+          # For a -g compile ccache hashes the working directory by default, so
+          # the two sibling build dirs never shared a cache entry and the
+          # contract build compiled cold. With hash_dir off they share one; the
+          # cost is that an object's recorded compile directory may name the
+          # other sibling, whose ../-relative source paths resolve to the same
+          # files. Every later step in the job inherits it through GITHUB_ENV.
+          if [[ "$BUILDDIR" == build-linux-gcc-15-debug ]]; then
+            echo "CCACHE_NOHASHDIR=1" >> "$GITHUB_ENV"
+          fi
           reconfig=""
           [[ -d "$BUILDDIR/meson-info" ]] && reconfig="--reconfigure"
           meson setup $reconfig "$BUILDDIR" \
@@ -2020,6 +2031,38 @@ jobs:
             -Dpkg_config_path="$GITHUB_WORKSPACE/vcpkg_installed/x64-linux/lib/pkgconfig" \
             -Dbuild_tests=true -Dbuild_contract_tests=true
           python3 scripts/ci/assert-gateway-tests.py "$CONTRACT_BUILD"
+          # Compile the pilots' targets here, at the leg's full width and BEFORE
+          # taking a heavy-test slot. Done inside the slot by the collector at
+          # -j2, this compile took 7-50 min (996 s of a 1,022 s run; the six
+          # pilots ran in 26 s) while holding one of the three slots the Linux
+          # test step also needs. The collector still runs its own
+          # `meson compile`, which then finds nothing to do, so the evidence
+          # bundle records the same build step, binaries and hashes as before.
+          # A failure here is not fatal: the collector repeats the compile and
+          # records the failure in its evidence, as it did before this step.
+          # CCACHE_NOHASHDIR (set for this leg in Configure) lets this second
+          # build directory reuse the standard build's ccache objects.
+          mapfile -t contract_targets < <(python3 -c 'import json; d = json.load(open("tests/contracts/pilots.json")); print("\n".join(sorted({t for r in d["contracts"] for t in r["build_targets"]})))')
+          # Per-step ccache stats log: the shared cache's global counters mix
+          # all four runners, this log holds only this compile's results.
+          precompile_stats="$RUNNER_TEMP/ccache-contract-precompile-$GITHUB_RUN_ID.log"
+          rm -f "$precompile_stats"
+          precompile_start=$SECONDS
+          if (( ${#contract_targets[@]} )); then
+            CCACHE_STATSLOG="$precompile_stats" \
+              timeout "$YUZU_CONTRACT_BUILD_TIMEOUT_S" \
+              meson compile -C "$CONTRACT_BUILD" -j "$YUZU_BUILD_JOBS" "${contract_targets[@]}" \
+              || echo "::warning::contract pilot precompile failed; the collector will retry it and record the failure"
+          fi
+          echo "contract pilot precompile: $(( SECONDS - precompile_start ))s for ${#contract_targets[@]} target(s)"
+          if [[ -s "$precompile_stats" ]]; then
+            CCACHE_STATSLOG="$precompile_stats" ccache --show-log-stats --verbose 2>/dev/null \
+              | grep -iE 'hits|misses|uncacheable|errors' \
+              | sed 's/^/  ccache (contract precompile): /' || true
+          else
+            echo "  ccache (contract precompile): nothing compiled"
+          fi
+          rm -f "$precompile_stats"
           rc=0
           bash scripts/ci/with-test-slot.sh 3 -- \
             python3 scripts/test/contract-evidence.py run \

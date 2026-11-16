@@ -2979,13 +2979,30 @@ count); the 2807 is from the local cover-off run. The Windows job took 7.6 to
 The Linux gcc-15 debug leg enables `build_contract_tests` in the dedicated
 `build-linux-contracts-gcc15-debug` directory and runs all six registered
 migration pilots after the regular suites, under the same three-slot
-Big Tam admission limit and with two collector jobs. PostgreSQL contracts use
+Big Tam admission limit. PostgreSQL contracts use
 the job's test database; gateway and plugin contracts retain their native
 reports. The collector's default portable bundle is uploaded after success or
 failure with the GitHub run ID and attempt in its artifact name, retained for
 30 days. Raw local inputs are excluded from that upload. A failed contract
 fails the step; its evidence does not replace the regular suite verdicts.
 See `docs/testing/contract-evidence.md` for the obligations and bundle format.
+
+The step compiles the pilots' build targets (the union of `build_targets` in
+`tests/contracts/pilots.json`) at the leg's full `YUZU_BUILD_JOBS` width
+**before** it takes a slot, then runs the collector inside the slot; the
+collector's own `meson compile -j 2` finds nothing to do. Before this, that
+compile ran inside the slot at two jobs: across the 20 gcc-15 debug jobs of
+2026-11-15 and -16 the step took 6 to 50 min, and in one sampled run the
+build was 996 s of 1,022 s (the six pilots ran in 26 s), all while holding one
+of the three slots the Linux test step also needs. A failed precompile is a
+warning only: the collector repeats the build and records the failure in its
+evidence, as before. The Configure step sets `CCACHE_NOHASHDIR=1` for this leg
+only: ccache otherwise hashes the working directory for a `-g` compile, so the
+contract build directory never reused the standard build's objects. The step
+prints the precompile's wall time and its own ccache hit and miss counts (from
+a per-step stats log, since the cache is shared by all four runners). The
+first run of each runner after this change rebuilds the gcc-15 debug leg cold
+once, because the cache keys change.
 
 ### Persistent runner-local test history
 
