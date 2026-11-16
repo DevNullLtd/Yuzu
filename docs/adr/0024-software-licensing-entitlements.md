@@ -486,6 +486,16 @@ Decision numbers are stable, since other documents cite them.
     decommission; they are kept until retention expires (30 days by default; rows stamped while `guardian_event_retention_days` is 0 or below never expire). Widening the erasure to them is a separate follow-up (#7531) that needs an
     ADR-0038 Update. The "five per-agent stores" list in Decisions 9 and 11 is left as written; it is history.
     A still-running agent re-creates its census row on its next census-bearing event (after a state change, an agent restart or a rule push; not on a schedule), so stop the agent first.)*
+    *(Update 2026-11-16, MG PR-5a: the cascade now covers **ten** stores. `ManagementGroupStore` (schema
+    `management_group_store`, public key `management_group_memberships`) joined, registered last: its
+    `delete_agent` removes the device's rows in every management group (static, dynamic and the root group) in
+    one statement. Its read securable is `ManagementGroup:Read`. Only `management_group_members` is touched:
+    the groups, their role assignments, the device's tags and its enrolment row are not. Decommission therefore
+    still does not unenrol, so the same agent id is accepted again on the approved re-register fast path and its
+    next Register re-adds the root group only; un-enrolling is a separate tracked change. The removal is a point in
+    time (an operator add or a dynamic group created at the same moment can re-insert the id). The "five
+    per-agent stores" list in Decisions 9 and 11 stays as written; it is history. The authoritative list is
+    `AgentDecommissionStores` in `agent_decommission.hpp`.)*
     There is **no row-level erasure API**, a stated gap. The cascade's
     production trigger is `DELETE /api/v1/sle/agents/{id}`, authorized by the scoped
     `SoftwareLicensing:Delete` **AND** `Inventory:Delete` **AND** `GuaranteedState:Delete`

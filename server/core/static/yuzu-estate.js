@@ -164,14 +164,16 @@
       return D.form({
         title: 'Remove stored data for ' + label + '?',
         body: [
-          'This erases the device from nine stores: inventory, installed software, device ' +
+          'This erases the device from ten stores: inventory, installed software, device ' +
             'configuration, application performance, detected licences, application usage, the ' +
-            'endpoint presence row, fleet certificates and Guardian compliance results. ' +
+            'endpoint presence row, fleet certificates, Guardian compliance results and management-group ' +
+            'memberships. ' +
             'Guardian event history and DEX observations are kept until retention expires (30 ' +
             'days by default). It cannot be undone.',
           'It does not unenrol the device; a connected agent will report again, but Guardian ' +
             'compliance results return when the agent next reports a rule result (after a ' +
-            'state change, a restart or a rule push). Tags, custom properties, quarantine ' +
+            'state change, a restart or a rule push), and the device rejoins the All Devices group ' +
+            'only, not the other management groups it was in. Tags, custom properties, quarantine ' +
             'records and property schemas are not removed.'
         ],
         fields: [],

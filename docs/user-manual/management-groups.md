@@ -330,6 +330,10 @@ Returns `200 OK`:
 
 Only removes static membership records. Dynamic membership entries (the root group's enrollment members and the one-time snapshot of a `Service: {name}` group) are not removed by this endpoint.
 
+### Decommissioning a Device
+
+`DELETE /api/v1/sle/agents/{agent_id}` (see [REST API](rest-api.md#software-licensing-sle)) removes the device from every management group in one statement: static and dynamic memberships and the root group alike. The response's `stores` map reports this as `management_group_memberships`. Only the membership rows are removed. The groups, their role assignments and the device's tags are not touched, and neither is its enrolment, so the same agent id is accepted again on its next registration and rejoins the root group only; the other groups it was in are not restored. Stop the agent first. The removal is a point in time: an operator adding the id to a group, or a dynamic group created at the same moment, can put it back in a group after the DELETE returned. With RBAC enforcement off, a device that is decommissioned but still connected is missing from the legacy-open device lists until it registers again.
+
 ## Role Delegation
 
 Management groups serve as the scoping boundary for RBAC. You can assign roles to principals within the context of a specific group, so the permissions only apply to devices in that group (and its children).
