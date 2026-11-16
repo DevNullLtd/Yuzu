@@ -48,7 +48,11 @@ parse_pem_test_() ->
     UtcDer = mint({2030, 6, 1}),
     GenDer = mint({2055, 6, 1}),
     {ok, UtcSpki} = yuzu_gw_authz:spki_sha256(UtcDer),
-    [{"a UTCTime notAfter is read in Unix seconds, with the SPKI of the certificate",
+    [{"fixture certificates use SHA-256 even when the host permits SHA-1",
+      ?_assertMatch(#'OTPCertificate'{signatureAlgorithm =
+                        #'SignatureAlgorithm'{algorithm = ?'ecdsa-with-SHA256'}},
+                   public_key:pkix_decode_cert(UtcDer, otp))},
+     {"a UTCTime notAfter is read in Unix seconds, with the SPKI of the certificate",
       ?_assertEqual({ok, #{spki => UtcSpki, not_after => unix({{2030, 6, 1}, {13, 0, 0}})}},
                     yuzu_gw_cert_files:parse_pem(pem([UtcDer])))},
      {"a GeneralizedTime notAfter (after 2049) is read too",
@@ -388,7 +392,7 @@ equal_size_rsa_pems(DateA, DateB, N) ->
                    #{cert := Der} = public_key:pkix_test_root_cert(
                                       "yuzu-cert-files-test",
                                       [{validity, {{2020, 1, 1}, Date}},
-                                       {key, {rsa, 2048, 65537}}]),
+                                       {key, {rsa, 2048, 65537}}, {digest, sha256}]),
                    pem([Der])
            end,
     A = Mint(DateA),
@@ -412,7 +416,8 @@ replace_keeping_mtime(Path, Bin) ->
 mint(Date) ->
     #{cert := Der} = public_key:pkix_test_root_cert(
                        "yuzu-cert-files-test",
-                       [{validity, {{2020, 1, 1}, Date}}, {key, {namedCurve, secp256r1}}]),
+                       [{validity, {{2020, 1, 1}, Date}}, {key, {namedCurve, ?'secp256r1'}},
+                        {digest, sha256}]),
     Der.
 
 pem(Ders) ->

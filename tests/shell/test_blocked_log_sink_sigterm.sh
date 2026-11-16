@@ -45,11 +45,8 @@
 # reads /proc/<pid>/task/*/wchan, which has no equivalent on macOS/Windows —
 # gated in tests/meson.build on host_machine.system() == 'linux'.
 #
-# Cases (see docs/testing/unit-test-conventions.md for the skip-vs-fail
-# convention this file follows — SKIP is `exit 0` with a `SKIP:`-prefixed
-# message, matching every other shell test under tests/shell/, e.g.
-# test_mfa_reset.sh / test_build_examples_gating.sh — NOT the exit-77
-# Automake convention, which nothing else in this tree's shell suite uses):
+# Cases (this legacy harness reports unavailable prerequisites with exit 0
+# and a `SKIP:` prefix; such output does not establish case coverage):
 #   P0    — healthy control (no injected fault): calibrates the bound the
 #           fault cases are checked against and proves the harness itself
 #           isn't just always-slow.

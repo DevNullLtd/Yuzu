@@ -834,6 +834,7 @@ agent_test_exe = executable(
   # scripts/ci/check-plugin-spawn-lexical.sh's GRANDFATHERED set.
   link_depends: [
                 abi3_fixture_plugin,
+                abi4_declared_fixture_plugin,
                 agent_actions_plugin_lib,  # #4666 PR-2 W3a: MI-3 loads the real agent_actions plugin by path
                 certificates_plugin_lib,
                 content_dist_plugin_lib,
@@ -1159,7 +1160,7 @@ agent_shard_specs = {
 # firewall_plugin_lib (agents/plugins/firewall/meson.build): the [firewall_quarantine]
 # action-boundary cases load the real plugin by path and FAIL when it is missing under
 # `meson test`, so the shards must build it first.
-agent_shard_deps = [reserved_name_fixture_plugin, invalid_name_fixture_plugin, retired_name_fixture_plugin, abi3_fixture_plugin, firewall_plugin_lib]
+agent_shard_deps = [reserved_name_fixture_plugin, invalid_name_fixture_plugin, retired_name_fixture_plugin, abi3_fixture_plugin, abi4_declared_fixture_plugin, firewall_plugin_lib]
 # Per-shard meson timeouts. Only shard C is raised (#7135); A and B keep the old single
 # entry's 240s, because only C was measured to need more.
 #
@@ -3520,6 +3521,13 @@ test('server feature option lint',
   timeout: 300,
 )
 
+test('local test runner platform selftest',
+  _python3_test,
+  args: [files('test_run_tests_platform.py')],
+  suite: 'platform',
+  timeout: 30,
+)
+
 # Windows agent installer trust-anchor lockdown (#5196): the .iss is compiled
 # only by release.yml, so this lints its source text -- no /T on the icacls
 # grant, a Constrained-Language-safe exact SDDL check, the user manual's copy of
@@ -4007,14 +4015,22 @@ test('prometheus harness selftest',
   timeout: 60,
 )
 
-# #4800: pins scripts/test_gateway.py's zero-executed guard, the ct --dir that
-# points at apps/yuzu_gw/test/ct, and each gateway suite's wrapper deadline
-# sitting below its meson timeout. Hermetic (parses sources, runs no
-# rebar3), so it needs no Erlang; suite docs, i.e. the Linux leg only.
+# Executes the workflow extractor against selected, missing and ambiguous steps;
+# a uses-only step must never borrow a later step's shell body.
+test('workflow step extractor selftest',
+  _python3_test,
+  args: [files('test_extract_run_block.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# #4800: pins scripts/test_gateway.py's summary/deadline guards and CT directory.
+# Platform placement: native Windows process-tree termination and stdout encoding
+# differ from POSIX. Hermetic children exercise both without needing Erlang.
 test('gateway wrapper guard selftest',
   _python3_test,
   args: [files('test_gateway_test_summary.py')],
-  suite: 'docs',
+  suite: 'platform',
   timeout: 30,
 )
 
@@ -4149,6 +4165,14 @@ if _bash_test.found()
   # macOS/Linux rig (Windows uses scripts/win-start-UAT.sh) and the README
   # touch rule runs on hosted Ubuntu (docs-lint.yml).
   if host_machine.system() != 'windows'
+    # Exercise the actual measure-only gate with private DB/logs and fake CT.
+    # A failed or empty requested scale run must not borrow ordinary perf metrics.
+    test('performance gate verdict selftest',
+      _bash_test,
+      args: [files('shell/test_pr2_gates.sh'), 'CH-6', 'CH-25'],
+      suite: 'docs',
+      timeout: 60,
+    )
     # docs/plugin-readme-standard.md rule 7 — the README touch rule's own
     # fixture run (a fake `git` on PATH; no repository, no network).
     test('plugin readme touch-rule selftest',
@@ -5156,7 +5180,7 @@ test('dex score-policy single-writer tripwire (#6086)',
   timeout: 30,
 )
 
-# Runner-local CI telemetry contract: v2->v3 migration preserves history,
+# Runner-local CI telemetry contract: schema upgrades preserve history,
 # GitHub reruns remain distinct, and Meson suite durations/timeouts plus known
 # flake recoveries land in the persistent per-runner test-runs.db.
 test('ci telemetry selftest',
@@ -5193,3 +5217,34 @@ test('tsan-gdb-capture selftest',
   suite: 'docs',
   timeout: 30,
 )
+
+# Migration pilots are opt-in: these are required executions, so missing live PG
+# or compiled fixtures must fail rather than turn a default developer run green.
+# The collector selftest exercises native process cleanup on every platform.
+test('contract evidence selftest', _python3_test,
+  args: [files('test_contract_evidence.py')], suite: 'platform', timeout: 30)
+test('gateway contract wrapper selftest', _python3_test,
+  args: [files('test_gateway_contract.py')], suite: 'docs', timeout: 30)
+test('contract registry', _python3_test,
+  args: [files('../scripts/test/contract-evidence.py'), 'check'], suite: 'docs', timeout: 30)
+if get_option('build_contract_tests')
+  _contract_adapter = files('../scripts/test/contract-evidence.py')
+  test('contract.plugin.loader.reserved-name.reject', _python3_test,
+    args: [_contract_adapter, 'case', '--id', 'plugin.loader.reserved-name.reject', '--binary', agent_test_exe],
+    depends: [agent_test_exe, reserved_name_fixture_plugin, abi3_fixture_plugin],
+    suite: 'contracts', timeout: 120,
+    env: {'MESON_BUILD_ROOT': meson.project_build_root()})
+  test('contract.plugin.loader.duplicate-name.isolate', _python3_test,
+    args: [_contract_adapter, 'case', '--id', 'plugin.loader.duplicate-name.isolate', '--binary', agent_test_exe],
+    depends: [agent_test_exe, abi3_fixture_plugin, abi4_declared_fixture_plugin],
+    suite: 'contracts', timeout: 120,
+    env: {'MESON_BUILD_ROOT': meson.project_build_root()})
+  if build_server
+    test('contract.pg.baseline.members-atomic-replace', _python3_test,
+      args: [_contract_adapter, 'case', '--id', 'pg.baseline.members-atomic-replace', '--binary', server_test_exe],
+      depends: [server_test_exe], suite: 'contracts', timeout: 120)
+    test('contract.pg.retention.cutoff-boundary', _python3_test,
+      args: [_contract_adapter, 'case', '--id', 'pg.retention.cutoff-boundary', '--binary', server_test_exe],
+      depends: [server_test_exe], suite: 'contracts', timeout: 120)
+  endif
+endif

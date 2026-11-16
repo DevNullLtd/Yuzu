@@ -66,11 +66,15 @@ class FakeClient:
 
     def __init__(self, responses):
         self.responses = responses
+        self.dispatches = []
+        self.polls = []
 
     def execute_instruction(self, def_id, params):
-        return 200, {"command_id": "c1"}
+        self.dispatches.append((def_id, params))
+        return 200, {"command_id": "c1", "agents_reached": 1}
 
     def get_responses(self, command_id):
+        self.polls.append(command_id)
         return {"responses": self.responses}
 
 
@@ -155,15 +159,22 @@ class RiskTable(unittest.TestCase):
         self.assertEqual(args.risks, ["forensic", "server-internal"])
 
     def test_server_side_definition_needs_an_agent_response(self):
-        # HTTP 200 + command_id used to auto-pass server-side plugins without any response, which
-        # hid the dispatch chokepoint denying them. poll_timeout_s=0 skips the poll loop (no sleep).
+        # A valid dispatch ack must not auto-pass server-side plugins without an agent response.
+        # A zero deadline still performs one poll, but never sleeps.
         for plugin in ("_server", "server", "server_internal"):
-            outcome = ir.exercise(FakeClient([]), make_def(plugin=plugin), {}, poll_timeout_s=0)
-            self.assertEqual(outcome.status, "fail", plugin)
-            self.assertIn("no response within", outcome.note)
-        # The pass case breaks on its first poll; 30s is never reached, so a stalled VM cannot flip it.
-        answered = FakeClient([{"output": "x", "status": "ok", "rc": 0}])
-        self.assertEqual(ir.exercise(answered, make_def(plugin="server"), {}, poll_timeout_s=30).status, "pass")
+            for responses, status in (([], "fail"), ([{
+                    "agent_id": "agent-1", "instruction_id": "c1", "output": "x",
+                    "status": 1, "error_detail": "", "rc": 0}], "pass")):
+                with self.subTest(plugin=plugin, status=status):
+                    client = FakeClient(responses)
+                    outcome = ir.exercise(client, make_def(plugin=plugin), {}, poll_timeout_s=0)
+                    self.assertEqual(outcome.status, status)
+                    self.assertEqual(outcome.command_id, "c1")
+                    self.assertEqual(outcome.response_count, len(responses))
+                    self.assertEqual(client.dispatches, [("x.y", {})])
+                    self.assertEqual(client.polls, ["c1"])
+                    if not responses:
+                        self.assertIn("no response within", outcome.note)
 
 
 if __name__ == "__main__":

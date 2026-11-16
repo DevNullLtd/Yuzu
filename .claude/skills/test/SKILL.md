@@ -116,7 +116,7 @@ bash scripts/test/test-db-write.sh run-start \
 
 Record `RUN_ID` in your scratch space so every subsequent gate call can reference it. The DB row is in `RUNNING` state until Phase 8 finalizes it.
 
-> **`--run-id` format.** Valid run ids match `[A-Za-z0-9._-]+` and must not be the bare `.` or `..`. The generated `"$(date +%s)-$$"` always satisfies this, as does a hand-supplied `--run-id manual` for coverage-baseline capture. An invalid run id (path separator, whitespace, shell/control char, `.`/`..`) is **rejected** (the Instructions runner is stricter, see "`--instructions` mode"): `test_db.py` and all three gate scripts print an error to stderr and exit `2`, and the gate scripts surface that as a gate FAIL. This guards the test-runs DB and its log root against path traversal — see the `[Unreleased]` Security entry in `CHANGELOG.md`.
+> **`--run-id` format.** Valid run ids match `[A-Za-z0-9._-]+` and must not be the bare `.` or `..`. The generated `"$(date +%s)-$$"` always satisfies this, as does the fresh `manual-<UUID>` generated when coverage-baseline capture omits `--run-id`. An invalid run id (path separator, whitespace, shell/control char, `.`/`..`) is **rejected** (the Instructions runner is stricter, see "`--instructions` mode"): `test_db.py` and all three gate scripts print an error to stderr and exit `2`, and the gate scripts surface that as a gate FAIL. This guards the test-runs DB and its log root against path traversal — see the `[Unreleased]` Security entry in `CHANGELOG.md`.
 
 ## Phase 0 — Preflight
 
@@ -759,7 +759,7 @@ fi
 **Coverage baseline update workflow.**
 1. Make a change you believe deserves a new coverage baseline (coverage up, or an accepted trade-off).
 2. **Pre-flight**: a clean `meson test -C ${BUILDDIR}-coverage` must pass — the gate refuses `--capture-baselines` (FAIL row, note `refused --capture-baselines: inconclusive run (...)`) if tests fail or time out, libgcov reports counter-write errors, a stale `.gcda` cannot be deleted before the run, or the build filesystem is nearly full (UP-18 guard protecting you from anchoring a broken-environment baseline).
-3. Run `bash scripts/test/coverage-gate.sh --run-id manual --capture-baselines`. The script rewrites the JSON file with current numbers + `captured_at` + `captured_commit` and prints a diff of old-vs-new values before overwrite so you can sanity-check the direction.
+3. Run `bash scripts/test/coverage-gate.sh --capture-baselines`. Omitting `--run-id` generates a fresh `manual-<UUID>` for this capture, including recaptures on the same commit. Explicit pipeline run IDs are unchanged; a manual ID from another revision is refused to preserve its evidence. The script rewrites the JSON file with current numbers + `captured_at` + `captured_commit` and prints a diff of old-vs-new values before overwrite so you can sanity-check the direction.
 4. `git add tests/coverage-baseline.json` alongside your feature commit. `git blame` is the audit trail.
 5. Do NOT capture a baseline in the middle of an unrelated change — the commit SHA recorded in the baseline becomes the receipt for "this is the code that earned these numbers."
 
@@ -778,7 +778,7 @@ bash scripts/test/teardown.sh --run-id "$RUN_ID"
 The teardown script:
 1. Stops every `yuzu-test-${RUN_ID}-*` compose project
 2. Removes `/tmp/yuzu-test-${RUN_ID}/`
-3. Calls `test-db-write.sh run-finish --run-id "$RUN_ID"` which aggregates gate counts and computes overall status (any FAIL → FAIL, any WARN → WARN, else PASS)
+3. Calls `test-db-write.sh run-finish --run-id "$RUN_ID"` which retains prior FAIL/ABORTED/WARN observations and computes overall status: FAIL first, then ABORTED for an aborted/unfinished gate or an empty run, then WARN, then PASS if anything passed, otherwise SKIP. RUNNING → PASS is a legitimate completion; ABORTED → PASS retains ABORTED. An explicit `--status` can only worsen the result and remains a persistent floor.
 
 After teardown, print the final summary by querying the just-finished run:
 
@@ -838,7 +838,7 @@ Each runner agent owns a durable database outside its checkout:
 - Wee Tam: `D:\ci\test-runs\yuzu-weetam-windows-N\test-runs.db`
 
 `ci.yml` initializes and finalizes the current runner's row automatically.
-Schema v3 keeps GitHub rerun attempts distinct and records the job result and
+Schema v4 keeps GitHub rerun attempts distinct and records the job result and
 duration, platform/runner/commit/event, ccache ratio, Meson test-entry
 result/duration/timeout, and known flakes recovered by isolated retry. Query a
 runner in place by setting `YUZU_TEST_DB`:

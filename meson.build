@@ -142,6 +142,9 @@ elif _server_opt.allowed() and not build_server
 endif
 build_examples = get_option('build_examples')
 build_tests    = get_option('build_tests')
+if get_option('build_contract_tests') and not build_tests
+  error('build_contract_tests requires build_tests=true')
+endif
 
 # ── Dependencies ──────────────────────────────────────────────────────────────
 # All third-party includes are marked `include_type: 'system'` so the compiler
@@ -809,6 +812,7 @@ if _gw_otp_bin != ''
       timeout: 600,
       priority: 120,
       env: {'REBAR_BASE_DIR': _gw_src / ('_build_eunit_' + _gw_shard_spec.split('/')[0]),
+            'YUZU_GATEWAY_TEST_LOG_DIR': meson.project_build_root() / 'meson-logs',
             'YUZU_OTP_BIN': _gw_otp_bin, 'YUZU_OTP_VERSION': _gw_otp_pin},
     )
   endforeach
@@ -831,9 +835,25 @@ if _gw_otp_bin != ''
     suite: 'gateway',
     timeout: 600,
     priority: 120,
-    env: {'REBAR_BASE_DIR': _gw_src / '_build_ct', 'YUZU_OTP_BIN': _gw_otp_bin, 'YUZU_OTP_VERSION': _gw_otp_pin},
+    env: {'REBAR_BASE_DIR': _gw_src / '_build_ct',
+          'YUZU_GATEWAY_TEST_LOG_DIR': meson.project_build_root() / 'meson-logs',
+          'YUZU_OTP_BIN': _gw_otp_bin, 'YUZU_OTP_VERSION': _gw_otp_pin},
   )
   message('Erlang gateway: enabled, ' + _gw_otp_desc)
+  if get_option('build_contract_tests')
+    # Direct Meson runs share the caller's REBAR_BASE_DIR. Serialize these
+    # wrappers so their rebar compiles cannot rewrite the same BEAMs concurrently.
+    test('contract.GW-HB-RETRY-001', _python3,
+      args: [meson.project_source_root() / 'scripts/test/gateway-contract.py',
+             _gw_src, 'yuzu_gw_upstream_tests', 'heartbeat_retry_lifecycle_test_', '--id', 'GW-HB-RETRY-001'],
+      suite: 'contracts', timeout: 330, is_parallel: false,
+      env: {'YUZU_OTP_BIN': _gw_otp_bin, 'YUZU_OTP_VERSION': _gw_otp_pin})
+    test('contract.GW-REGISTRY-OWNER-DOWN-001', _python3,
+      args: [meson.project_source_root() / 'scripts/test/gateway-contract.py',
+             _gw_src, 'yuzu_gw_registry_tests', 'registry_owner_down_lifecycle_test_', '--id', 'GW-REGISTRY-OWNER-DOWN-001'],
+      suite: 'contracts', timeout: 330, is_parallel: false,
+      env: {'YUZU_OTP_BIN': _gw_otp_bin, 'YUZU_OTP_VERSION': _gw_otp_pin})
+  endif
 else
   if get_option('require_gateway')
     # A skipped gateway is invisible: the build and every test leg stay green
