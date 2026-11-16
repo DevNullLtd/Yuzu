@@ -5589,7 +5589,9 @@ public:
                 // The probe lease is released here. At start, before any store serves: compare the
                 // database's recorded collation version with the operating system's. Never stops
                 // the server (logs, exports yuzu_pg_collation_version_mismatch), so an operator can
-                // start it to fix the database; a failed check does not either. It gates nothing.
+                // start it to fix the database; a failed check does not either. It does publish
+                // collation_gate_ (pg_collation_check.hpp), which pauses device_ci writes on a
+                // mismatch and refuses the CI reads until a check has found a match.
                 // Like every query this constructor runs before the listener binds, it has no
                 // client-side deadline against a backend that is frozen while its connection keeps
                 // acknowledging data (the 5 s bounds are the pool acquire and server-side
@@ -9727,8 +9729,9 @@ public:
                         kCollationUnsettledRecheckInterval, &collation_gate_);
                     // The repeat is optional (the start-time check has already reported), so a
                     // refusal to create its thread (a task or thread limit) degrades instead of
-                    // failing the boot: the check only reports. Without the repeat the last-
-                    // completed gauge stops advancing and YuzuPgCollationCheckStale fires.
+                    // failing the boot: the check does not stop the server. Without the repeat the
+                    // last-completed gauge stops advancing and YuzuPgCollationCheckStale fires,
+                    // and collation_gate_ keeps the value the start-time check left.
                     try {
                         pg_collation_recheck_->start();
                     } catch (const std::exception& e) {
