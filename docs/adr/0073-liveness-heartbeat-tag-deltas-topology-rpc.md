@@ -1,7 +1,7 @@
 # ADR-0073: A liveness-only heartbeat over an opaque gateway relay: status tags as deltas, topology on its own RPC, registration replay by ids
 
 - **Status:** Proposed
-- **Date:** 2026-10-29. First drafted 2026-10-26; revised 2026-10-29 for ADR-0074 and the merged PR #5695.
+- **Date:** 2026-10-29. First drafted 2026-10-26; revised 2026-10-29 for ADR-0074 and the merged PR #5695; the owner's decisions of 2026-11-03 recorded in ADR-0074 folded in 2026-11-16.
 - **Authors:** Nathan Dornbrook (platform block `0xxx`; see `docs/adr/README.md`)
 - **Deciders:** Nathan Dornbrook. Owner rulings of 2026-10-26:
   - adopt the architect's heartbeat/topology split;
@@ -2537,9 +2537,10 @@ row, not a stored request, and re-registers through reattach, like any replay.
   subtraction). The gateway answers them `UNIMPLEMENTED`. The gateway gpb module is regenerated.
 - **Where agent views come from.** The server's REST and MCP surfaces are the only agent views.
   No back-compat.
-- **Status.** The retirement is gateway-only and may land ahead of the rest of this ADR (slice 0b).
-  It needs no server change, because the server never called these RPCs. It is not on `dev` at the
-  time of writing.
+- **Status.** The retirement is gateway-only and needs no server change, because the server never
+  called these RPCs. It waits for this ADR to be Accepted (decided by the owner on 2026-11-03,
+  recorded in ADR-0074's wave 0; slice 0b, open point 17). It is not on `dev` at the time of
+  writing.
 
 ### D15. No proto subtraction (owner ruling 2026-10-26)
 
@@ -2566,8 +2567,11 @@ lands. The two are kept consistent as follows.
   Register). It does not by itself meet the check. Of the remaining live state, kTLS (ADR-0074 D8)
   addresses the TLS term (fewer processes per agent). ADR-0074's memory measures do not address
   live state: the collection after an agent-count drop and `malloc_trim` reclaim garbage and
-  allocator slack. The Cowboy connection, the relay, the inet port and buffer and the index rows
-  have no named measure in either ADR yet; ADR-0074 defers that to its hibernation work.
+  allocator slack. ADR-0074's wave 0 hibernation work (decided by the owner on 2026-11-03) names
+  measures for the Cowboy connection (it hibernates, with HPACK dynamic tables off), the TLS socket
+  (it hibernates after 5 seconds), the per-agent owner (it hibernates) and the relay (it collects
+  its garbage when idle). The inet port and buffer and the index rows still have no named measure
+  in either ADR.
 - **State.** Both ADRs use the same rule: no per-agent state beyond the connection. Fleet-level state
   any gateway could rebuild is allowed (ADR-0074's Conflict 5, decided 2026-10-29).
 - **Signing.** ADR-0074 D5's scope was decided on 2026-10-29: the server signs every command and
@@ -2798,9 +2802,12 @@ lands. The two are kept consistent as follows.
     nothing in steady state.
 15. **Typed `StatusTags` in the heartbeat.** Rejected for `bytes` (D2), so the gateway never decodes
     tags.
-16. **Keep the Register once at the gateway** (a registry row read by replay; about −29 KiB).
+16. **Keep the Register once at the gateway** (a registry row read by replay; about −29 KiB
+    estimated; ADR-0074 records about 26 KiB measured).
     Rejected. It still keeps per-agent registration state and the enrollment token, and only removes
-    a duplicate.
+    a duplicate. The rejection is of the end state: ADR-0074's wave 0 ships this shape, with
+    identical plugin lists shared through a reference count, as two temporary memory stopgaps (G2a
+    and G2b, decided by the owner on 2026-11-03), and slice 7b removes both.
 17. **Keep the encoded Register as one refcounted binary** (about 9 KB, decoded on replay).
     Rejected for the same reasons. Smaller, but still per-agent state and a credential.
 18. **Persist the verbatim RegisterRequest at the server.** Rejected. It would put the enrollment
@@ -3487,7 +3494,8 @@ The same changes fix known truth-drift:
 
 ## Implementation slices
 
-Small PRs, in order. Slices 0-2b are wire-compatible and could land early. Slices 3-10 are the
+Small PRs, in order. Slices 0-2b are wire-compatible; slice 0b waits for acceptance, and slices 0, 1,
+2 and 2b could land early if the owner allows it (open point 17). Slices 3-10 are the
 breaking release and merge to `dev` inside one release window. ADR-0074 gates its own waves at
 5,000 agents (its Conflict 7); slice 10's measurement uses the same counts. Slice 1 measures
 per-agent bytes on the agent, at no fleet count.
@@ -3496,8 +3504,9 @@ per-agent bytes on the agent, at no fleet count.
 - Slices 3-10 wait for this ADR to be Accepted, and so for ADR-0074's ratification (*Depends on*).
 - Slices 0-2b are additive and change no wire behaviour, but they are still implementation of a
   Proposed ADR. Slice 2b in particular creates a durable Postgres schema that nothing reads until
-  slice 7b. Whether any of them may merge before acceptance is the owner's call (open point 17);
-  none has a tracking epic yet, and the implementing PRs open one.
+  slice 7b. Slice 0b waits for acceptance (decided by the owner on 2026-11-03). Whether slices 0,
+  1, 2 and 2b may merge before acceptance is still the owner's call (open point 17); none has a
+  tracking epic yet, and the implementing PRs open one.
 - **Slice 7b against ADR-0074 wave 2.** If 7b lands before wave 2, reattach carries today's replay
   authority (D14, *Authority is unchanged*). Wave 2 gates the route write on a verified
   per-session agent signature (its exit criterion: a CONNECTED notification without one changes no
@@ -3522,7 +3531,11 @@ renewal (D16, *key*).
     The mgmt `auth_fun` admission tests (`yuzu_gw_authz_rpc_tests.erl`) use `ListAgents` as their
     probe. They are re-pointed, never deleted, so a positive-admission case remains: an admitted
     peer calling a retired path gets `UNIMPLEMENTED` and a refused peer `UNAUTHENTICATED`, or the
-    probe moves to `WatchEvents`. It is independent of every other slice.
+    probe moves to `WatchEvents`. It depends on no other slice, but waits for this ADR to be
+    Accepted (decided by the owner on 2026-11-03; open point 17). With these reads gone, the
+    hostname and plugin list held by the per-agent owner process have no reader either; the
+    gateway-only change that stops that process keeping them follows 0b and waits with it (the same decision, recorded
+    in ADR-0074's wave 0).
 1. **Agent jitter and measurement.**
    - `agents/core/include/yuzu/agent/jitter.hpp` with its unit tests (injected source), then the
      jittered heartbeat and pump sleeps through it (D9).
@@ -3538,10 +3551,11 @@ renewal (D16, *key*).
    - `yuzu_agent_heartbeat_would_be_delta_bytes`, computed locally from the class table, which
      measures the tag saving before the wire changes (removed in slice 5).
 2b. **`AgentRegistrationStore`, written on every successful registration** (direct and gateway).
-    It is additive and wire-compatible, so it can land early. Records accumulate before anything
-    reads them, so this slice also registers the store in the decommission cascade (all four
-    steps of `agent_decommission.hpp`), adds its `docs/postgres-migration-ladder.md` row and adds
-    its data-inventory entries: it is the first slice to persist per-agent rows.
+    It is additive and wire-compatible, so it could land early if the owner allows it (open
+    point 17). Records accumulate before anything reads them, so this slice also registers the
+    store in the decommission cascade (all four steps of `agent_decommission.hpp`), adds its
+    `docs/postgres-migration-ladder.md` row and adds its data-inventory entries: it is the first
+    slice to persist per-agent rows.
 3. **Proto and gpb.**
    - `StatusTags` (carried as `bytes`), `TopologyDigest`, `ReportTopology`, `ProxyTopology` and
      `ProxyReattach`.
@@ -3604,8 +3618,8 @@ renewal (D16, *key*).
       `yuzu_agents_registered_total` skip, the shared SPKI-principal helper for the
       `agent.reattach` row, and the peer-guard override.
     - Gateway: the per-session `RATE_LIMITED`/`DEGRADED` requeue timer that clears
-      `recent_replays`, with full jitter and a 0 floored at 1 s; replay sends ids; all three Register copies and the plugin-name lists removed; owner
-      restart from ids; `NO_RECORD` closes the stream.
+      `recent_replays`, with full jitter and a 0 floored at 1 s; replay sends ids; all three Register copies and the plugin-name lists removed (this also removes ADR-0074's
+      G2a and G2b stopgaps); owner restart from ids; `NO_RECORD` closes the stream.
     - Agent: no reconnect change (already jittered, `reconnect_backoff.hpp`, #5990).
 8. **Server topology.** `ReportTopology`, digest confirm, the D6 slot changes, `stale_reason`,
    retain-on-disconnect, age rebasing, the topology resync trigger, the fetcher removed, server
@@ -3756,7 +3770,9 @@ make a new choice.
     wire-compatible and additive, but they implement a Proposed ADR, and slice 2b creates a durable
     Postgres schema (`agent_registration_store`) that nothing reads until slice 7b and that
     accumulates rows from its first deployment. The alternative is to hold every slice until
-    acceptance. The owner decides, and names the tracking epic.
+    acceptance. The owner decides, and names the tracking epic. *Decided by the owner on 2026-11-03
+    for slice 0b only:* it waits for acceptance (recorded in ADR-0074's wave 0). Slices 0, 1, 2 and
+    2b remain open.
 18. **Per-gateway fairness of the reattach rate limit** (D14 step 1). The `--reattach-rate` bucket
     is per replica and shared by every gateway, so one gateway (a large honest replay, a buggy one,
     or one holding a valid but compromised certificate) can delay session install, and with it
