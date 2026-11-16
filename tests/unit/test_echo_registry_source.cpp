@@ -6279,8 +6279,11 @@ TEST_CASE("registry live: a NUL-named child is reported as skipped", "[echo][reg
     if (key.create() != ERROR_SUCCESS)
         SKIP("cannot write HKLM (not elevated)");
     NulNamedKey nul_key; // after `key`: destroyed first
-    if (const LONG st = nul_key.create(key.h, std::wstring{L'n', L'\0', L'm'}); st != 0)
-        SKIP("cannot create a NUL-named key (NTSTATUS " << st << ")");
+    // HKLM is writable here, so a failure to build the test subject is a broken test, not an
+    // environment cause: it must be red, never a skip that leaves the NUL path unproven.
+    const LONG nul_st = nul_key.create(key.h, std::wstring{L'n', L'\0', L'm'});
+    INFO("NtCreateKey NTSTATUS " << nul_st);
+    REQUIRE(nul_st == 0);
     HKEY later = nullptr;
     REQUIRE(RegCreateKeyExW(key.h, L"zz_later", 0, nullptr, 0, KEY_ALL_ACCESS, nullptr, &later, nullptr) ==
             ERROR_SUCCESS);

@@ -800,6 +800,9 @@ struct BaselineEntry {
     return e;
 }
 
+/// Key and value names are case-exact identities: two names that differ only in case are two
+/// entries, and a case-only rename reads as one removed and one added row. That is accepted
+/// behaviour (no case folding).
 struct RegistryBaseline {
     std::map<std::string, std::map<std::string, BaselineEntry>> keys;
     bool operator==(const RegistryBaseline&) const = default;
