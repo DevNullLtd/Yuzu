@@ -2275,6 +2275,16 @@ public:
         // Pre-seeded so every result reads 0, not absent, before it first happens
         // (docs/observability-conventions.md): the closed set is pg::all_collation_verdicts().
         pg::seed_collation_metrics(metrics_);
+        // device_ci write pause (a collation mismatch): one increment per refused write. Closed
+        // `op` set, both series pre-seeded so an idle server reads 0, not absent.
+        metrics_.describe("yuzu_device_ci_writes_deferred_total",
+                          "device_ci writes refused because the PostgreSQL collation gate reads "
+                          "mismatch, by op (ingest = a report answered need_full without being "
+                          "stored, delete = a decommission removal not attempted); a sustained "
+                          "rate means device_ci is paused until the collation is repaired",
+                          "counter");
+        for (const auto op : {"ingest", "delete"})
+            metrics_.counter("yuzu_device_ci_writes_deferred_total", {{"op", op}});
         // HA WS-8 (ADR-2002 §12): the runtime reachability probe behind /readyz.
         metrics_.describe("yuzu_server_pg_reachable",
                           "1 when this replica's dedicated reachability probe can reach a writable "
@@ -2308,8 +2318,10 @@ public:
         metrics_.describe("yuzu_inventory_ingest_total",
                           "Inventory-report ingest outcomes by source and outcome "
                           "(stored/touched/need_full/error/dropped/rejected/rejected_depth; deferred = "
-                          "a report skipped because another report for the same agent held its "
-                          "lock, certificate_inventory only - not a failure)",
+                          "a report skipped without being read or written, not a failure: for "
+                          "certificate_inventory because another report for the same agent held "
+                          "its lock, for device_ci because device_ci writes are paused by a "
+                          "PostgreSQL collation mismatch and the agent was told to resend)",
                           "counter");
         // Closed facet x outcome label set, pre-seeded so the first refused section counts.
         seed_section_ingest_series(metrics_);
@@ -8631,6 +8643,9 @@ public:
                 startup_failed_ = true;
             } else {
                 device_inventory_store_->set_metrics(&metrics_);
+                // Pause device_ci writes while the collation gate reads Mismatch. collation_gate_
+                // is declared before every store, so it outlives this borrow.
+                device_inventory_store_->set_write_gate(&collation_gate_);
                 agent_service_.set_device_inventory_store(device_inventory_store_.get());
                 if (gateway_service_)
                     gateway_service_->set_device_inventory_store(device_inventory_store_.get());

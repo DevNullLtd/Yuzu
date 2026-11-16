@@ -535,12 +535,51 @@ DeviceInventoryStore::DeviceInventoryStore(pg::PgPool& pool) : pool_(pool) {
     open_ = true;
 }
 
+void DeviceInventoryStore::note_write_deferred(const char* op) noexcept {
+    try {
+        if (metrics_)
+            metrics_->counter("yuzu_device_ci_writes_deferred_total", {{"op", op}}).increment();
+        // One line per entry into the refusing state: the flag is cleared by the next call that
+        // finds the gate open (see clear_write_pause_flag), so a long pause is one line, not one
+        // per call.
+        if (!write_pause_logged_.exchange(true, std::memory_order_relaxed))
+            spdlog::warn("DeviceInventoryStore: device_ci writes are PAUSED because the PostgreSQL "
+                         "collation version recorded for the database differs from the "
+                         "operating system's (text-key lookups cannot be trusted): ingest is "
+                         "refused (agents resend later) and decommission of device_ci rows is not "
+                         "attempted. Repair per the \"PostgreSQL collation version\" section of "
+                         "docs/user-manual/server-admin.md; writes resume after the next "
+                         "collation check passes");
+    } catch (...) { // a metrics or log failure must never change the refusal itself
+    }
+}
+
+void DeviceInventoryStore::clear_write_pause_flag() noexcept {
+    // Relaxed load first: the open-gate hot path pays one load, not a read-modify-write.
+    if (write_pause_logged_.load(std::memory_order_relaxed) &&
+        write_pause_logged_.exchange(false, std::memory_order_relaxed)) {
+        try {
+            spdlog::info("DeviceInventoryStore: device_ci writes resumed (the collation gate no "
+                         "longer reads mismatch)");
+        } catch (...) {
+        }
+    }
+}
+
 InventoryIngestOutcome DeviceInventoryStore::apply_device_ci(std::string_view agent_id,
                                                             std::string_view claimed_hash,
                                                             std::optional<DeviceCiRecord> rec,
                                                             [[maybe_unused]] std::int64_t collected_at) {
     if (!open_ || agent_id.empty())
         return InventoryIngestOutcome::kError;
+
+    // Write pause: refuse BEFORE the pool is touched, for the hash-only touch and the full upsert
+    // alike (both resolve the row by the text primary key).
+    if (writes_deferred()) {
+        note_write_deferred("ingest");
+        return InventoryIngestOutcome::kDeferred;
+    }
+    clear_write_pause_flag();
 
     // last_seen / first_seen are the SERVER receipt time, never the agent-supplied
     // collected_at (#1685): the freshness comparison must stay on one clock.
@@ -1202,6 +1241,11 @@ DeviceInventoryStore::get_device_ci_with_sections(std::string_view agent_id) {
 bool DeviceInventoryStore::delete_agent(std::string_view agent_id) {
     if (!open_ || agent_id.empty())
         return false;
+    if (writes_deferred()) { // the DELETE would resolve the row by the text key: not attempted
+        note_write_deferred("delete");
+        return false;
+    }
+    clear_write_pause_flag();
     auto lease = pool_.try_acquire_for(kIngestAcquireTimeout);
     if (!lease) {
         spdlog::debug("DeviceInventoryStore: delete skipped for agent={}, no connection ({})",

@@ -344,6 +344,17 @@ void ingest_device_ci_report(DeviceInventoryStore& store, const std::string& age
         return; // device_ci not due this cycle
     const std::string& claimed_hash = hit->second;
 
+    // Write pause (a collation mismatch): decided BEFORE the blob is parsed, so a paused fleet
+    // does not pay a parse of every resent blob (up to kDeviceCiMaxBlobBytes each). Nothing is
+    // read or written; the agent is told to resend later (need_full, no proto change). Shared by
+    // the direct agent path and the gateway path, which both come through this function.
+    if (store.writes_deferred()) {
+        store.note_ingest_deferred();
+        emit("deferred");
+        ack.add_need_full(kSourceDeviceCi);
+        return;
+    }
+
     std::int64_t collected_at = 0;
     if (report.has_collected_at())
         collected_at = report.collected_at().millis_epoch() / 1000;
@@ -387,8 +398,10 @@ void ingest_device_ci_report(DeviceInventoryStore& store, const std::string& age
     emit(outcome == InventoryIngestOutcome::kStored    ? "stored"
          : outcome == InventoryIngestOutcome::kTouched ? "touched"
          : outcome == InventoryIngestOutcome::kNeedFull ? "need_full"
+         : outcome == InventoryIngestOutcome::kDeferred ? "deferred" // pause raced in after the check
                                                         : "error");
-    if (outcome == InventoryIngestOutcome::kNeedFull || outcome == InventoryIngestOutcome::kError)
+    if (outcome == InventoryIngestOutcome::kNeedFull || outcome == InventoryIngestOutcome::kError ||
+        outcome == InventoryIngestOutcome::kDeferred)
         ack.add_need_full(kSourceDeviceCi);
 }
 
