@@ -84,7 +84,11 @@ struct DeviceCiRecord {
     // ── v2 additions (appended AFTER last_seen so existing designated initialisers
     //    keep compiling). Blank on a v1 record. ──
     int blob_version{1};       ///< 1 = positional 22-field blob, 2 = versioned blob
-    std::string content_hash;  ///< v2 only: sha256 of the received blob (set by the parser)
+    /// The stored `content_hash` column, which the keyset read (`list_device_ci_after`) fills and
+    /// the other reads leave empty. v2: the sha256 of the received blob (set by the parser). v1:
+    /// the sha256 of the positional 22-field join, computed by the store at ingest, so a v1 row
+    /// carries a hash too.
+    std::string content_hash;
     std::string chassis_type;  ///< wire position 22
     std::string chassis_serial;
     std::string chassis_asset_tag;
@@ -119,6 +123,22 @@ enum class CiReadError { kDegraded };
 struct DeviceCiWithSections {
     std::optional<DeviceCiRecord> record;
     bool sections_failed{false};
+};
+
+/// One keyset page of the stored device-CI rows, ordered by the BYTE value of `agent_id`
+/// ascending (`agent_id COLLATE "C"`, not the database collation;
+/// `DeviceInventoryStore::list_device_ci_after`). Scalar columns only: no v2 sections.
+struct DeviceCiKeysetQuery {
+    /// Exclusive lower bound on `agent_id` in byte order; empty = from the first row.
+    std::string after;
+    /// Rows wanted. A value `<= 0`, or above the store's row ceiling, reads the ceiling (never
+    /// zero rows); the bulk read's `read_page` always passes `[2, kPageMax + 1]`.
+    int limit{100};
+    /// Only this agent's row, when set.
+    std::optional<std::string> agent_id;
+    /// Only these agents' rows, when set. Present-and-empty means "none": the store answers
+    /// an empty page without running SQL, which is how a deny-all scope reads.
+    std::optional<std::vector<std::string>> agent_ids;
 };
 
 } // namespace yuzu::server

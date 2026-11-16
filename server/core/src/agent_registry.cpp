@@ -1210,6 +1210,12 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         {"sccm.site", "Get SCCM site assignment info"},
         // firmware_posture
         {"firmware_posture.firmware", "Report BIOS/firmware vendor, version, release date and update-pending posture"},
+        // component_inventory
+        {"component_inventory.scan",
+         "List Java archives (.jar/.war/.ear) and the libraries nested one level inside them "
+         "under the machine-wide application roots, with name, version, version source, path, "
+         "size and anchor application (Linux and macOS; Windows planned; read-only, no "
+         "subprocess, machine roots only)"},
         // runtimes
         {"runtimes.dotnet",
          "List installed .NET (Core/5+) shared frameworks and SDKs by flavour, version and "

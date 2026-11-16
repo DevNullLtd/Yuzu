@@ -1,24 +1,9 @@
 #!/usr/bin/env bash
-# eunit-gate.sh — wrap rebar3 eunit so the gate distinguishes "actual test
-# failure" from "rebar3 returns 1 because EUnit emitted 'One or more tests
-# were cancelled'".
+# eunit-gate.sh — run EUnit with the same strict verdict as Meson.
 #
-# Background (#1005): rebar3 eunit reports cancellations as a process-exit
-# error even when every test that ran passed. Cancellations have multiple
-# causes:
-#   * EUnit's --dir discovery encounters a non-test module like
-#     `yuzu_gw_perf_helpers` (no test_/0 exports).
-#   * A flake (registry_tests gen_server timeout under VM pollution) aborts
-#     a test set partway through.
-# Neither case is a regression we want to block a `/test` run on. This
-# wrapper exits 0 iff EUnit's summary line says `Failed: 0` AND at least one
-# test EXECUTED. Real failures (Failed: N > 0), infrastructure errors (no
-# summary line) and zero-executed runs propagate as non-zero. The executed
-# check matters because a set-up that crashes in EVERY module prints
-# `Failed: 0.  Skipped: 0.  Passed: 0.` plus "One or more tests were
-# cancelled" -- an all-cancelled run that would otherwise read as a pass
-# (the #4800 false-green class; scripts/test_gateway.py applies the same rule
-# via scripts/gateway_test_summary.py).
+# A partially cancelled set is incomplete execution, even if every test that
+# ran passed. The former #1005 tolerance hid setup/time-out failures; retain
+# rebar3's nonzero status and require a nonempty successful summary (#4800).
 #
 # Usage:
 #   bash scripts/test/eunit-gate.sh [extra rebar3 args...]
@@ -28,12 +13,8 @@
 # (e.g. --module=foo,bar) — default is `--dir apps/yuzu_gw/test`.
 #
 # Exit codes:
-#   0 — EUnit ran, Failed: 0, and >= 1 test executed (passed, even if some
-#       sets were cancelled)
-#   1 — EUnit ran and Failed: >0, OR no summary line found, OR 0 tests
-#       executed (real failure)
-#   2 — toolchain or invocation error (rebar3 or python3 missing, gateway/
-#       missing, capture file unreadable)
+#   0 — EUnit completed successfully and >= 1 test executed
+#   nonzero — child failure/cancellation, invalid/empty summary, or setup error
 
 set -uo pipefail
 
@@ -86,10 +67,5 @@ REBAR_BASE_DIR="${REBAR_BASE_DIR:-$PWD/_build_eunit}" \
     rebar3 eunit "$@" 2>&1 | tee "$capture"
 rebar3_rc=${PIPESTATUS[0]}
 
-# The verdict comes from the same summary PARSER the Meson wrapper uses
-# (scripts/gateway_test_summary.py, pinned by tests/test_gateway_test_summary.py):
-# whole-line summary matching, the LAST summary wins, and >= 1 test must have
-# EXECUTED (#4800). Unlike the Meson gate, this gate (like the release
-# workflow's) tolerates a non-zero rebar3 exit when eunit's "Failed: 0" line
-# shows tests passed (cancelled sets, #1005); the Meson gate stays strict.
-python3 "$REPO_ROOT/scripts/gateway_test_summary.py" cancel-tolerant "$rebar3_rc" "$capture"
+# One strict parser across Meson, /test, the local runner and release.
+python3 "$REPO_ROOT/scripts/gateway_test_summary.py" strict eunit "$rebar3_rc" "$capture"

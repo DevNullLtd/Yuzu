@@ -1,6 +1,9 @@
 # ADR-0071: CryptoDashboardLayoutStore, a born-on-Postgres per-operator layout store
 
-- **Status:** Proposed (feat/crypto-dashboard-widgets)
+- **Status:** Accepted (was Proposed on feat/crypto-dashboard-widgets). Status reconciled
+  2026-11-14 against dev @ 2c49b4ea0: the store shipped in 288a8758e and is constructed at boot in
+  `server.cpp` (`crypto_dashboard_layout_store_`), with its routes in `crypto_routes.cpp` and its
+  erasure hook in `crypto_layout_erasure.hpp`.
 - **Date:** 2026-10-19
 - **Owner:** @liamsomerville (platform block `0xxx`; see `docs/adr/README.md`)
 - **Deciders:** pg workstream; architect + sre (server store), security-guardian (Gate 2);

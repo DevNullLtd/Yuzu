@@ -218,6 +218,49 @@ std::string_view diff_state_key(std::string_view source) {
     return {};
 }
 
+std::string encode_process_baseline(const std::vector<yuzu::agent::ProcessInfo>& procs) {
+    nlohmann::json arr = nlohmann::json::array();
+    for (const auto& p : procs)
+        arr.push_back({{"pid", p.pid}, {"ppid", p.ppid}, {"name", p.name}, {"user", p.user}});
+    return arr.dump();
+}
+
+std::vector<yuzu::agent::ProcessInfo> decode_process_baseline(const std::string& s) {
+    std::vector<yuzu::agent::ProcessInfo> result;
+    if (s.empty())
+        return result;
+    try {
+        for (const auto& j : nlohmann::json::parse(s)) {
+            yuzu::agent::ProcessInfo p;
+            p.pid = j.value("pid", 0u);
+            p.ppid = j.value("ppid", 0u);
+            p.name = j.value("name", "");
+            p.user = j.value("user", "");
+            result.push_back(std::move(p));
+        }
+    } catch (...) {}
+    return result;
+}
+
+bool scrub_process_baseline(EchoDatabase& db) {
+    const std::string key{diff_state_key("process")};
+    const auto stored = db.try_get_state(key);
+    if (!stored) {
+        spdlog::warn("ECHO: process baseline scrub skipped, state unreadable: {}", stored.error());
+        return false;
+    }
+    if (!stored->has_value() || (*stored)->empty())
+        return false;
+    const std::string clean = encode_process_baseline(decode_process_baseline(**stored));
+    if (clean == **stored)
+        return false;
+    if (!db.set_state(key, clean)) {
+        spdlog::error("ECHO: process baseline scrub failed to rewrite the row; retried at next start");
+        return false;
+    }
+    return true;
+}
+
 namespace {
 // The effective match core of a pattern: should_redact strips only leading and
 // trailing '*' and treats an interior '*' as a literal, so "*a*" matches the

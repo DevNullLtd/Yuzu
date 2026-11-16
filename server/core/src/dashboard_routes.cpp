@@ -1864,6 +1864,8 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
 
                  auto sql = req.get_param_value("sql");
                  if (sql.empty()) {
+                     audit_or_flag(req, res, "echo.sql", "denied", "command", "",
+                                   "reason=sql_missing");
                      res.set_content("<span id=\"result-context\" hx-swap-oob=\"true\""
                                      " class=\"result-context is-error\">"
                                      "Missing SQL query.</span>",
@@ -1873,6 +1875,8 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
 
                  // M5: Server-side SQL validation with keyword blocklist (defense in depth)
                  if (sql.size() > 4096) {
+                     audit_or_flag(req, res, "echo.sql", "denied", "command", "",
+                                   std::format("reason=sql_too_large sql_bytes={}", sql.size()));
                      res.set_content("<span id=\"result-context\" hx-swap-oob=\"true\""
                                      " class=\"result-context is-error\">"
                                      "SQL query exceeds 4KB limit.</span>",
@@ -1884,6 +1888,8 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      for (auto& c : upper) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
                      size_t start = upper.find_first_not_of(" \t\r\n");
                      if (start == std::string::npos || !upper.substr(start).starts_with("SELECT")) {
+                         audit_or_flag(req, res, "echo.sql", "denied", "command", "",
+                                       "reason=not_select");
                          res.set_content("<span id=\"result-context\" hx-swap-oob=\"true\""
                                          " class=\"result-context is-error\">"
                                          "Only SELECT queries are allowed.</span>",
@@ -1897,6 +1903,8 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      };
                      for (auto kw = blocked; *kw; ++kw) {
                          if (upper.find(*kw) != std::string::npos) {
+                             audit_or_flag(req, res, "echo.sql", "denied", "command", "",
+                                           std::string("reason=forbidden_keyword keyword=") + *kw);
                              res.set_content("<span id=\"result-context\" hx-swap-oob=\"true\""
                                              " class=\"result-context is-error\">"
                                              "Query contains forbidden keyword.</span>",
@@ -1930,6 +1938,8 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  } else if (scope == yuzu::server::kBroadcastScope) {
                      scope_expr = std::string(yuzu::server::kBroadcastScope);
                  } else if (req.has_param("scope") || form_value_supplied(req.body, "scope")) {
+                     audit_or_flag(req, res, "echo.sql", "denied", "command", "",
+                                   "reason=no_target");
                      res.set_content(
                          "<span id=\"result-context\" hx-swap-oob=\"true\""
                          " class=\"result-context is-error\">"
