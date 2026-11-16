@@ -21,6 +21,10 @@ When Windows-originated changes land on `origin/dev`, the standing reconciliatio
 8. Commit clean with a Darwin-fix commit message.
 
 After **any** cross-platform change, always run `bash scripts/run-tests.sh all` on Darwin before committing.
+On Darwin, `all` runs static checks, agent tests and available gateway suites;
+it explicitly skips Linux-native server unit tests and full-stack integration
+under ADR-0035. The existing agent shutdown smoke skip remains. These skips
+provide no coverage for the unavailable tests.
 
 ## Standing Darwin pitfalls
 
