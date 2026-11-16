@@ -597,6 +597,10 @@ TEST_CASE("Settings group create: a session or grant gone after the attempted ro
         auto res = h.create("Session Gone");
         REQUIRE(res);
         CHECK(res->status == 401);
+        // htmx drops a 4xx body: the refusal must carry a fixed-text toast (K2, PR #7920).
+        const auto toast = toast_of(*res);
+        CHECK(toast.at("message") == "Session no longer valid: the group was not created");
+        CHECK(toast.at("level") == "error");
         const auto rows = h.create_rows();
         REQUIRE(rows.size() == 2);
         CHECK(rows[0].result == "attempted");
@@ -609,6 +613,9 @@ TEST_CASE("Settings group create: a session or grant gone after the attempted ro
         auto res = h.create("Grant Gone");
         REQUIRE(res);
         CHECK(res->status == 403);
+        const auto toast = toast_of(*res);
+        CHECK(toast.at("message") == "Permission revoked: the group was not created");
+        CHECK(toast.at("level") == "error");
         const auto rows = h.create_rows();
         REQUIRE(rows.size() == 2);
         CHECK(rows[0].result == "attempted");
@@ -630,6 +637,9 @@ TEST_CASE("Settings group create: a different principal at the post-attempted re
     auto res = h.create("Other Principal");
     REQUIRE(res);
     CHECK(res->status == 401);
+    const auto toast = toast_of(*res);
+    CHECK(toast.at("message") == "Session no longer valid: the group was not created");
+    CHECK(toast.at("level") == "error");
     CHECK(h.group_names().empty());
     const auto rows = h.create_rows();
     REQUIRE(rows.size() == 2);
@@ -919,7 +929,7 @@ TEST_CASE("Settings group create: a failure row's detail is the token, a space a
     }
 
     std::vector<std::string> details;
-    for (const std::string name : {std::string("Pair A"), std::string("Pair B")}) {
+    for (const std::string& name : {std::string("Pair A"), std::string("Pair B")}) {
         h.calls.clear();
         auto res = h.create(name);
         REQUIRE(res);

@@ -30775,6 +30775,37 @@ TEST_CASE("MCP add_management_group_member: a throwing audit sink never escapes 
     }
 }
 
+TEST_CASE("MCP add_management_group_member: a throwing audit sink on the invalid-id denial row "
+          "never escapes the handler",
+          "[mcp][pg][management_group][mgmt-audit-first][chaos]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    MgAddFixture f(db.dsn());
+    const bool nonstd = GENERATE(false, true);
+    INFO("non-std exception: " << nonstd);
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &f.store;
+    ts.audit_throw_nonstd_ = nonstd;
+    ts.audit_throw_action_result_ = "management_group.add_member|denied";
+    ts.start();
+
+    SECTION("a control byte in the agent_id") {
+        auto res = ts.call(mg_add_body(f.gid, std::string("agent") + '\t' + "1"));
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+    }
+    SECTION("a control byte in the group_id") {
+        auto res = ts.call(mg_add_body(f.gid + "\t", "agent-1"));
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+    }
+    CHECK(f.store.get_members(f.gid).empty());
+}
+
 TEST_CASE("MCP add_management_group_member: a changed principal after the attempted row answers an "
           "A4 envelope, not a bare error",
           "[mcp][pg][management_group][mgmt-audit-first]") {
@@ -31168,7 +31199,7 @@ TEST_CASE("MCP create_management_group: a failure row's detail is the token, a s
     ts.start();
     std::vector<std::string> details;
     std::size_t row = 0;
-    for (const std::string name : {std::string("pair-a"), std::string("pair-b")}) {
+    for (const std::string& name : {std::string("pair-a"), std::string("pair-b")}) {
         auto res = ts.call(mg_create_body({{"name", name}}));
         REQUIRE(res);
         REQUIRE(mg_create_rows(ts).size() == (row + 1) * 2);
@@ -31205,7 +31236,7 @@ TEST_CASE("MCP add_management_group_member: a failure row's detail is the token,
     ts.start();
     std::vector<std::string> details;
     std::size_t row = 0;
-    for (const std::string agent : {std::string("agent-a"), std::string("agent-b")}) {
+    for (const std::string& agent : {std::string("agent-a"), std::string("agent-b")}) {
         auto res = ts.call(mg_add_body(f.gid, agent));
         REQUIRE(res);
         REQUIRE(mg_add_rows(ts).size() == (row + 1) * 2);

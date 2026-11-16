@@ -1651,7 +1651,7 @@ TEST_CASE("POST /management-groups: a failure row's detail is the token, a space
     make_group(h, longest);
 
     std::set<std::string> details;
-    for (const std::string name : {std::string("pair-a"), std::string("pair-b"), longest}) {
+    for (const std::string& name : {std::string("pair-a"), std::string("pair-b"), longest}) {
         h.audits.clear();
         auto res = h.create(nlohmann::json{{"name", name}}.dump());
         REQUIRE(res);
@@ -1675,7 +1675,7 @@ TEST_CASE("POST and DELETE members: a failure row's detail is the token, a space
 
     std::set<std::string> add_details;
     std::set<std::string> remove_details;
-    for (const std::string agent : {std::string("agent-a"), std::string("agent-b")}) {
+    for (const std::string& agent : {std::string("agent-a"), std::string("agent-b")}) {
         h.audits.clear();
         auto added = h.add_member(gid, nlohmann::json{{"agent_id", agent}}.dump());
         REQUIRE(added);

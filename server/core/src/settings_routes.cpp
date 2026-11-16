@@ -7110,6 +7110,8 @@ void SettingsRoutes::register_routes(
         // X-Yuzu-Token), so with the original session gone a different principal's credential
         // on the same request would resolve, and the rows (bound to the original session) would
         // misname the actor. A different principal counts as revoked.
+        // Both refusal arms set a toast: htmx drops a 4xx body, so the operator would otherwise
+        // see nothing.
         const auto fresh_session = auth_fn_(req, res); // writes its own 401 when gone
         if (!fresh_session || fresh_session->username != session->username) {
             (void)detail::emit_behavioral_audit(bound_audit, req, res, "management_group.create",
@@ -7121,6 +7123,7 @@ void SettingsRoutes::register_routes(
                 res.set_content(detail::a4_error(res, "authentication required"),
                                 "application/json");
             }
+            set_toast("Session no longer valid: the group was not created", "error");
             return;
         }
         if (!perm_fn_(req, res, "ManagementGroup", "Write")) { // writes its own 403
@@ -7128,6 +7131,7 @@ void SettingsRoutes::register_routes(
                                                 "failure", "ManagementGroup", "",
                                                 mgmt_group_failure_detail("permission_revoked",
                                                                           g.name));
+            set_toast("Permission revoked: the group was not created", "error");
             return;
         }
         g.created_by = fresh_session->username;

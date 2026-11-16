@@ -14792,8 +14792,10 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!mgmt_text_ok(group_id) || !mgmt_text_ok(agent_id)) {
                     const char* detail_token =
                         !mgmt_text_ok(agent_id) ? "invalid_agent_id" : "invalid_group_id";
-                    (void)audit_fn(req, "management_group.add_member", "denied", "ManagementGroup",
-                                   audit_token(group_id), detail_token);
+                    // Through mg_audit (try_persist_audit): a throwing sink must not escape the
+                    // handler as a 500 on this refusal, as on every other row of this route.
+                    (void)mg_audit("management_group.add_member", "denied", audit_token(group_id),
+                                   detail_token);
                     res.set_content(
                         a4_error(kInvalidParams,
                                  "group_id and agent_id must not contain control characters or "
