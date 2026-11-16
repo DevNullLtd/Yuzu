@@ -498,8 +498,8 @@ class EchoMapdrivePinLexical(unittest.TestCase):
             "start no longer runs the sweep": dict(r=mutate(
                 r, "run_pending_hive_sweep(*tick);", "(void)tick;")),
             "start runs the sweep after the session opens": dict(r=mutate_after(
-                mutate(r, "        run_pending_hive_sweep(*tick);\n        if (const ULONG rc = etw->start();",
-                          "        if (const ULONG rc = etw->start();"),
+                mutate(r, "        run_pending_hive_sweep(*tick);\n        const ULONG rc = etw->start();",
+                          "        const ULONG rc = etw->start();"),
                 "r.start = [etw, tick] {", "                         rc);\n    };",
                 "                         rc);\n        run_pending_hive_sweep(*tick);\n    };")),
             "hook and start stop sharing one tick": dict(r=mutate(
