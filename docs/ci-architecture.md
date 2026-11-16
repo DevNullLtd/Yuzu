@@ -3012,8 +3012,8 @@ misses, now mostly hit, so the job's overall ccache hit rate is not comparable
 with earlier runs. Each runner compiles each source cold once under the new
 cache keys, in whichever directory compiles it first: the standard build is
 incremental, so on a runner whose standard build directory survived, the
-contract precompile pays it (393 s with 1% hits on linux-0's first run, then
-5 s with 100%). Most sources are compiled with include paths that name the
+contract precompile pays it (on 2026-11-16, 393 s with 1% hits on linux-0's
+first run, then 5 s with 100%). Most sources are compiled with include paths that name the
 runner's own workspace, so the runners share few of these entries.
 
 The collector's build-directory lease is an OS lock (`flock`, or
@@ -3021,14 +3021,17 @@ The collector's build-directory lease is an OS lock (`flock`, or
 build directory, so it ends with the collector however the collector ends. The
 earlier lease was a directory, `.contract-evidence-lock`, which a cancelled job
 could leave behind in this uncleaned workspace; every later contract run on
-that runner then failed within a second until a branch-switch wipe removed it
-(#7986). A leftover directory of that name is inert and can be deleted. When a
-run ends in ERROR, the step log prints the exception type and which error
-fields the manifest recorded, for example `contract-evidence: ERROR
-(BuildDirectoryBusy); recorded: error; text in the private manifest`, and the
-portable bundle carries the type as `error_kind`. The error text itself stays
-in the private capture on the runner, because it can carry values derived
-from the environment.
+that runner then failed within seconds until a branch-switch wipe removed it
+(#7986). A leftover directory of that name is inert and can be deleted. A
+`BuildDirectoryBusy` now means a live collector holds the lease, and clears
+once it exits. When a run ends in ERROR, the step log prints the exception
+type, a fixed explanation for a known type, and which error fields the
+manifest recorded, for example `contract-evidence: ERROR (BuildDirectoryBusy:
+a live collector holds .contract-evidence.lease; retry after it exits);
+recorded: error; error text stays in the private capture`. The portable
+bundle carries the same as `error_kind` and `error_fields`. The error text
+itself stays in the private capture on the runner, because it can carry
+values derived from the environment.
 
 ### Persistent runner-local test history
 

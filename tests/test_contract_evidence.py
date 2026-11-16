@@ -3,6 +3,7 @@
 
 import argparse
 import copy
+import errno
 import hashlib
 import importlib.util
 import io
@@ -475,13 +476,54 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(finish[finish.index("--status") + 1], "ABORTED")
         # Closing the descriptor ends the lease even when the explicit unlock failed.
         self.assert_lease_free()
-        self.assertIn("recorded: cleanup_error", self.stderr)
+        self.assertEqual(manifest["error_fields"], ["cleanup_error"])
+        self.assertIn("contract-evidence: ERROR (no exception); recorded: cleanup_error;", self.stderr)
+        self.assertNotIn("injected lease release failure", self.stderr)
 
-    def test_successful_run_releases_the_lease(self):
+    def test_successful_run_releases_the_lease_and_keeps_its_file(self):
+        lease = self.build / ".contract-evidence.lease"
+        self.assert_lease_free()
+        inode = lease.stat().st_ino
         result, manifest = self.run_collector()
         self.assertEqual((result, manifest["status"]), (0, "PASS"), manifest)
+        self.assertNotIn("error_fields", manifest)
+        # Deleting the file would let a second collector lock a fresh inode while the
+        # first still holds the old one: the lease is only exclusive if the file stays.
+        self.assertEqual(lease.stat().st_ino, inode)
         self.assert_lease_free()
         self.assertEqual(self.stderr, "")
+
+    @unittest.skipIf(os.name == "nt", "flock and O_NOFOLLOW are POSIX")
+    def test_lock_faults_other_than_a_holder_propagate_and_close(self):
+        import fcntl
+        opened = []
+        real_open = os.open
+
+        def tracking_open(*args, **kwargs):
+            fd = real_open(*args, **kwargs)
+            opened.append(fd)
+            return fd
+
+        def no_locks(fd, operation):
+            raise OSError(errno.ENOLCK, "No locks available")
+
+        with patch.object(evidence.os, "open", tracking_open), patch.object(fcntl, "flock", no_locks):
+            with self.assertRaises(OSError) as raised:
+                evidence.acquire_lease(self.build)
+        self.assertNotIsInstance(raised.exception, evidence.BuildDirectoryBusy)
+        self.assertEqual(raised.exception.errno, errno.ENOLCK)
+        self.assertEqual(len(opened), 1)
+        with self.assertRaises(OSError):  # the failed attempt closed its descriptor
+            os.fstat(opened[0])
+
+    @unittest.skipIf(os.name == "nt", "O_NOFOLLOW is POSIX")
+    def test_symlink_at_the_lease_path_is_refused_not_followed(self):
+        target = self.root / "elsewhere"
+        (self.build / ".contract-evidence.lease").symlink_to(target)
+        with self.assertRaises(OSError) as raised:
+            evidence.acquire_lease(self.build)
+        self.assertNotIsInstance(raised.exception, evidence.BuildDirectoryBusy)
+        self.assertFalse(target.exists())
 
     def test_live_holder_refuses_the_run_and_keeps_its_lease(self):
         holder = evidence.acquire_lease(self.build)
@@ -497,7 +539,9 @@ class CollectorTests(unittest.TestCase):
             with self.assertRaises(evidence.BuildDirectoryBusy):
                 evidence.acquire_lease(self.build)
             # The job log names the cause; the free text stays out of it.
-            self.assertIn("contract-evidence: ERROR (BuildDirectoryBusy); recorded: error;", self.stderr)
+            self.assertEqual(manifest["error_fields"], ["error"])
+            self.assertIn("contract-evidence: ERROR (BuildDirectoryBusy: a live collector holds "
+                          ".contract-evidence.lease; retry after it exits); recorded: error;", self.stderr)
             self.assertNotIn("Another contract collector", self.stderr)
         finally:
             evidence.release_lease(holder)
@@ -515,7 +559,9 @@ class CollectorTests(unittest.TestCase):
             "time.sleep(60)\n")
         holder = subprocess.Popen([sys.executable, "-c", script, str(MODULE_PATH), str(self.build)],
                                   stdout=subprocess.PIPE, text=True)
-        self.addCleanup(lambda: holder.poll() is None and holder.kill())
+        # Kill AND reap before the temporary directory is removed: on Windows an open
+        # handle in a live child blocks the deletion.
+        self.addCleanup(lambda: holder.poll() is None and (holder.kill(), holder.wait(timeout=10)))
         self.addCleanup(holder.stdout.close)
         self.assertEqual(holder.stdout.readline().strip(), "held")
         with self.assertRaises(evidence.BuildDirectoryBusy):
@@ -716,7 +762,9 @@ class BundleTests(unittest.TestCase):
             path.parent.mkdir(exist_ok=True)
             path.write_text(secret, encoding="utf-8")
             self.manifest["artifact_sha256"][name] = evidence.sha(path)
-        self.manifest.update(error=secret, history_error=secret, error_kind="ValueError",
+        self.manifest.update(error=secret, history_error=secret, report_error=secret, cleanup_error=secret,
+                             error_kind="ValueError",
+                             error_fields=["error", "report_error", "cleanup_error", "history_error"],
                              meson_selection=[{"env": {"TOKEN": secret}}],
                              steps=[{"command": [secret], "exit_code": 7, "seconds": 1.0}])
         self.write_manifest()
@@ -728,7 +776,10 @@ class BundleTests(unittest.TestCase):
             self.assertEqual(exported["steps"], [{"exit_code": 7, "seconds": 1.0}])
             # The exception type crosses the export boundary; its text does not.
             self.assertEqual(exported["error_kind"], "ValueError")
-            self.assertNotIn("error", exported)
+            self.assertEqual(exported["error_fields"],
+                             ["error", "report_error", "cleanup_error", "history_error"])
+            for field in ("error", "report_error", "cleanup_error", "history_error"):
+                self.assertNotIn(field, exported)
         # The diagnosis/reproduction input has not been destructively sanitized.
         self.assertEqual((self.capture / "source.patch").read_text(), secret)
 

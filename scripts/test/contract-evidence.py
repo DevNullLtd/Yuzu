@@ -51,6 +51,12 @@ class BuildDirectoryBusy(RuntimeError):
     """Another live collector holds this build directory's lease."""
 
 
+# Manifest fields whose presence makes a run ERROR. Their texts stay private.
+ERROR_FIELDS = ('error', 'report_error', 'cleanup_error', 'history_error')
+# Fixed, value-free explanations printed beside a known error type.
+ERROR_HINTS = {'BuildDirectoryBusy': f'a live collector holds {LEASE_NAME}; retry after it exits'}
+
+
 def _lock_fd(fd):
     """Take an exclusive, non-blocking lock; raise BuildDirectoryBusy if held."""
     if os.name == 'nt':
@@ -59,7 +65,8 @@ def _lock_fd(fd):
         try:
             msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
         except OSError as error:
-            # msvcrt reports a held region as EACCES (or EDEADLOCK after its retries).
+            # LK_NBLCK reports a held region as EACCES at once. EDEADLOCK is LK_LOCK's
+            # retries-exhausted code; it is accepted defensively.
             if error.errno in (errno.EACCES, getattr(errno, 'EDEADLOCK', errno.EDEADLK)):
                 raise BuildDirectoryBusy('Another contract collector holds this build directory') from error
             raise
@@ -82,8 +89,16 @@ def _unlock_fd(fd):
 
 
 def acquire_lease(build):
-    """Return an open descriptor holding the build directory's lease."""
-    fd = os.open(build/LEASE_NAME, os.O_RDWR | os.O_CREAT, 0o600)
+    """Return an open descriptor holding the build directory's lease.
+
+    Any failure other than a live holder (no such directory, a read-only or
+    lock-less filesystem, a symlink at the lease path) propagates as itself, never
+    as BuildDirectoryBusy. Child processes never inherit the descriptor (PEP 446),
+    so the lease covers the collector process only, not build or test processes
+    that outlive it in their own sessions.
+    """
+    # O_NOFOLLOW: a symlink planted at the lease path is refused, not followed.
+    fd = os.open(build/LEASE_NAME, os.O_RDWR | os.O_CREAT | getattr(os, 'O_NOFOLLOW', 0), 0o600)
     try:
         _lock_fd(fd)
     except BaseException:
@@ -456,6 +471,10 @@ def collect(args, rows):
             manifest['status'] = 'ERROR'
             manifest['history_error'] = str(error)
         manifest['finished_at'] = datetime.now(timezone.utc).isoformat()
+        if manifest['status'] == 'ERROR':
+            # Field NAMES only: they cross the portable-export boundary and reach the job
+            # log, unlike the texts, which can carry environment-derived values.
+            manifest['error_fields'] = [key for key in ERROR_FIELDS if key in manifest]
         # Build caches are intentionally excluded; native logs/reports and source are
         # the bundle. The output directory is private because raw logs may be sensitive.
         manifest['artifact_sha256'] = {str(p.relative_to(out)): sha(p) for p in out.rglob('*')
@@ -464,11 +483,14 @@ def collect(args, rows):
     print(f"{manifest['status']}: {out/'manifest.json'}")
     if manifest['status'] == 'ERROR':
         # The free text stays in the private capture (it can carry environment-derived
-        # values); the job log gets the exception type and which fields were recorded,
-        # so a CI failure names its cause without the raw capture (#7986).
-        recorded = [key for key in ('error', 'report_error', 'cleanup_error', 'history_error') if key in manifest]
-        print(f"contract-evidence: ERROR ({manifest.get('error_kind', 'no exception')}); "
-              f"recorded: {', '.join(recorded) or 'none'}; text in the private manifest",
+        # values); the job log gets the exception type, a fixed hint for known types and
+        # which fields were recorded, so a CI failure names its cause without the raw
+        # capture (#7986).
+        kind = manifest.get('error_kind', 'no exception')
+        hint = ERROR_HINTS.get(kind)
+        print(f"contract-evidence: ERROR ({kind}{': ' + hint if hint else ''}); "
+              f"recorded: {', '.join(manifest['error_fields']) or 'none'}; "
+              f"error text stays in the private capture",
               file=sys.stderr)
     return 0 if manifest['status'] == 'PASS' else 1
 
@@ -492,7 +514,7 @@ def bundle(directory, destination):
     public = {key: manifest[key] for key in (
         'schema_version', 'run_id', 'status', 'started_at', 'finished_at', 'platform',
         'planned_contracts', 'source', 'results', 'binary_sha256', 'prerequisites',
-        'raw_meson_sha256', 'error_kind') if key in manifest}
+        'raw_meson_sha256', 'error_kind', 'error_fields') if key in manifest}
     public['steps'] = [{key: step[key] for key in ('exit_code', 'seconds', 'log') if key in step}
                        for step in manifest.get('steps', [])]
     public.update(artifact_sha256=portable,

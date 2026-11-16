@@ -2068,7 +2068,8 @@ jobs:
           echo "contract pilot precompile: $(( SECONDS - precompile_start ))s for ${#contract_targets[@]} target(s)"
           if [[ -s "$precompile_stats" ]]; then
             # ccache repeats Hits/Misses under "Local storage:" (4.12.3, checked on
-            # Big Tam); print only the call totals above that section.
+            # Big Tam); print only the call totals above that section. A row that
+            # is absent (Uncacheable, Errors) was zero.
             stats=$(CCACHE_STATSLOG="$precompile_stats" ccache --show-log-stats 2>/dev/null \
               | awk '/^Local storage:/ { exit } tolower($0) ~ /^[[:space:]]*(hits|misses|uncacheable|errors)/' || true)
             if [[ -n "$stats" ]]; then
