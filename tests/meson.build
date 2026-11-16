@@ -2142,8 +2142,13 @@ if build_server
       # its include_directories('include') and '../../common/include'); no link to
       # yuzu_agent_core.
       #
-      # CONSTRAINT (governance Gate-3 architect). This puts 47 PRIVATE agent headers on
-      # the include path of every server test TU. It is safe TODAY only because there is
+      # #5605: test_guardian_baseline_fleet_tags.cpp is the second such TU: it includes
+      # guardian_baseline_heartbeat.hpp (the agent's real baseline emitters) to bind them to the
+      # server's guardian_baseline_fleet_tags.hpp table.
+      #
+      # CONSTRAINT (governance Gate-3 architect). This puts every PRIVATE agent header
+      # (78 `agents/core/src/*.hpp` files when #5605 was written; the count this comment once
+      # gave, 47, was stale) on the include path of every server test TU. It is safe TODAY only because there is
       # zero CASE-INSENSITIVE basename collision (APFS/NTFS resolve case-insensitively,
       # so a Linux-only case-sensitive check under-detects) between agents/core/src/*.hpp
       # and server/core/src/*.hpp,
@@ -4445,6 +4450,21 @@ test('agent command-dedup fleet telemetry drift gate (#3663)',
   _python3_test,
   args: [files('test_dedup_fleet_tags_lexical.py')],
   suite: 'agent',
+  timeout: 30,
+)
+
+# Guardian baseline-persistence fleet signal (#5605): the agent's `yuzu.guardian_baseline_*`
+# heartbeat tags, the server's kGuardianBaselineMetrics table, the describe loop in server.cpp, the
+# agent.cpp Group D2 call sites, the YuzuGuardianBaselineUnpersisted alert (its expr must name row
+# 0's gauge; no alert may read the monitor-only rows), its promtool cases and the metrics.md table
+# rows. The C++ pin test (test_guardian_baseline_fleet_tags.cpp) binds the emitters to the table but
+# stays green under a coordinated agent+table rename; this gate catches that, the alert and the call
+# site. Carries its own in-memory mutation self-test. No build required. Suite 'docs', like the
+# other server-source lexical gates (see the guardian_backend gate below).
+test('guardian baseline fleet signal drift gate (#5605)',
+  _python3_test,
+  args: [files('test_guardian_baseline_fleet_tags_lexical.py')],
+  suite: 'docs',
   timeout: 30,
 )
 
