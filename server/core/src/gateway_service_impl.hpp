@@ -345,6 +345,11 @@ private:
         /// unique): refused, never guessed at. Neither acted on nor listed
         /// as unknown (listing would trigger a gateway re-register).
         std::unordered_set<std::string> ambiguous;
+        /// #6339: this replica's gateway_sessions_ names a DIFFERENT agent for the id than the
+        /// directory row does: refused (never in `resolved`), already counted by resolve_sessions
+        /// as `agent_mismatch`. Unlike `ambiguous`, callers that list unknown ids DO list these,
+        /// so the gateway replays ProxyRegister and the register path decides who holds the id.
+        std::unordered_set<std::string> agent_mismatch;
         /// The directory read degraded: `resolved` then holds only what the
         /// local gateway_sessions_ hint map knows, and every other id is in
         /// `unresolved_degraded` — "cannot tell", NOT "unknown".
