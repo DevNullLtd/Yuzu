@@ -9540,8 +9540,9 @@ tests:
   # (the 10m hold), still firing at 54m (just before a jump) and at 85m (the window of [20m]
   # carries the last refusal to about 88m), quiet at 100m. Asserted below: pending and not firing
   # at 15m, firing at 22m, 40m, 54m and 85m, nothing at 100m. A window of 15m or less would drop
-  # to 0 between two refusals and reset the hold (red at 22m onward); a hold of 4m or less would
-  # fire at 15m (red); a window of 32m or more would still fire at 100m (red). It does not pin the
+  # to 0 between two refusals and reset the hold (a [15m] mutant measured red at 40m, 54m and 85m,
+  # not at 22m); a hold of 4m or less would fire at 15m (red); a window of 32m or more would still
+  # fire at 100m (red). It does not pin the
   # exact hold or window to the minute.
   - interval: 1m
     name: device ci writes paused - refusals at the slowest cadence fire after the hold and resolve
@@ -9650,6 +9651,75 @@ tests:
           - labels: 'ALERTS{alertname="YuzuDeviceCiWritesPaused", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
             value: 1
           - labels: 'ALERTS{alertname="YuzuDeviceCiWritesPaused", alertstate="firing", instance="s2", job="yuzu", severity="warning"}'
+            value: 1
+
+  # CASE -- the shipped scrape configs (deploy/prometheus/*.yml) add component="server" to every
+  # server series, so both the counter and the gauge carry a label the rule's left side drops
+  # (`sum by (job, instance)`). Same shape as the first case (refusals at 10, 25, 40, 55 and 70
+  # minutes, gauge 1) with that extra label on BOTH series. Red if the join were a plain `and`
+  # (it matches on the whole label set, so nothing would ever match and the alert could never
+  # fire). The alert carries only job and instance (the left side's labels).
+  - interval: 1m
+    name: device ci writes paused - fires when the series carry the extra component label
+    input_series:
+      - series: 'yuzu_device_ci_writes_deferred_total{job="yuzu",instance="s1",component="server",op="ingest"}'
+        values: "0x9 1x14 2x14 3x14 4x14 5x80"
+      - series: 'yuzu_device_ci_writes_deferred_total{job="yuzu",instance="s1",component="server",op="delete"}'
+        values: "0x130"
+      - series: 'yuzu_pg_collation_version_mismatch{job="yuzu",instance="s1",component="server"}'
+        values: "1x130"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuDeviceCiWritesPaused", alertstate="firing"}'
+        eval_time: 22m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuDeviceCiWritesPaused", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuDeviceCiWritesPaused", alertstate="firing"}'
+        eval_time: 54m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuDeviceCiWritesPaused", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+
+  # CASE -- the same extra component label, but the gauge reads 0 (no mismatch) while the counter
+  # still rose inside the window: the alert stays quiet. Red if the join ignored the gauge's
+  # value (for example if the `== 1` filter were dropped, the gauge series would still match on
+  # job and instance), and a guard that the extra-label join does not turn into "always true".
+  - interval: 1m
+    name: device ci writes paused - the extra component label with no mismatch stays quiet
+    input_series:
+      - series: 'yuzu_device_ci_writes_deferred_total{job="yuzu",instance="s1",component="server",op="ingest"}'
+        values: "0x9 1x14 2x14 3x100"
+      - series: 'yuzu_pg_collation_version_mismatch{job="yuzu",instance="s1",component="server"}'
+        values: "0x130"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuDeviceCiWritesPaused"}'
+        eval_time: 30m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuDeviceCiWritesPaused"}'
+        eval_time: 50m
+        exp_samples: []
+
+  # CASE -- YuzuInventoryHighNeedFullRatio ignores outcome="deferred" in its denominator. A paused
+  # device_ci fleet counts one deferred per refused report (400 per minute here), while another
+  # source is in a real need_full surge (30 of 100 non-deferred outcomes, 30%). With the deferred
+  # outcomes in the denominator the ratio would read 30 / 500 = 6% and the alert would stay quiet
+  # for the whole pause; without them it is 30% and fires after its 15m hold. Red if the
+  # `outcome!="deferred"` matcher were dropped. The deferred series does not count in the
+  # numerator either (it is not need_full).
+  - interval: 1m
+    name: inventory need_full ratio - deferred outcomes do not dilute the denominator
+    input_series:
+      - series: 'yuzu_inventory_ingest_total{job="yuzu",instance="s1",source="installed_software",outcome="need_full"}'
+        values: "0+30x100"
+      - series: 'yuzu_inventory_ingest_total{job="yuzu",instance="s1",source="installed_software",outcome="stored"}'
+        values: "0+70x100"
+      - series: 'yuzu_inventory_ingest_total{job="yuzu",instance="s1",source="device_ci",outcome="deferred"}'
+        values: "0+400x100"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuInventoryHighNeedFullRatio", alertstate="firing"}'
+        eval_time: 40m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuInventoryHighNeedFullRatio", alertstate="firing", severity="warning"}'
             value: 1
 
   # SAM-33 plugin-health alerts. Series are the yuzu_software_facet_devices gauge: 30 collecting

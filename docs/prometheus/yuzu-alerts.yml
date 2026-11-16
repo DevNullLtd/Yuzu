@@ -4903,11 +4903,16 @@ groups:
         # paused (a 15 min window has no margin and can drop to 0 between two refusals of a
         # one-device fleet, resetting the hold). The 10 m hold keeps a short pause from paging
         # (the gate rechecks every minute, so a repair done within minutes never reaches it).
-        # `and yuzu_pg_collation_version_mismatch == 1` ties the alert to the CAUSE on the same
-        # instance (default all-label matching: both sides carry exactly job and instance, so no
-        # `on` narrowing): the write gate reads Mismatch exactly while that gauge is 1 (the gate
-        # is derived from the same last-conclusive state, pg_collation_check.cpp), so without the
-        # conjunct a range window would keep the alert true for up to 20 m AFTER the repair and
+        # `and on (job, instance) yuzu_pg_collation_version_mismatch == 1` ties the alert to the
+        # CAUSE on the same instance. The join is narrowed with `on (job, instance)` because the
+        # left side is reduced to exactly those two labels while the gauge keeps every target
+        # label, and the shipped scrape configs (deploy/prometheus/*.yml) add a `component`
+        # label to the server targets: a plain `and` matches on the whole label set and would
+        # never match there, so the alert could never fire (the promtool cases carry the extra
+        # label for that reason). The write gate reads
+        # Mismatch exactly while that gauge is 1 (the gate is derived from the same
+        # last-conclusive state, pg_collation_check.cpp), so without the conjunct a range window
+        # would keep the alert true for up to 20 m AFTER the repair and
         # page on a database that is already fixed. A replica with no connected device and no
         # decommission in the window sees no refusal and does not fire:
         # YuzuPgCollationVersionMismatch covers that case. The counter is pre-seeded at 0 on
@@ -4915,7 +4920,7 @@ groups:
         # gate and counter), so it stays per instance.
         expr: |
           sum by (job, instance) (increase(yuzu_device_ci_writes_deferred_total[20m])) > 0
-          and
+          and on (job, instance)
           yuzu_pg_collation_version_mismatch == 1
         for: 10m
         labels:
@@ -6192,9 +6197,15 @@ groups:
             to grep for names "v3 ingest ... failed".
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       - alert: YuzuInventoryHighNeedFullRatio
+        # The denominator leaves out outcome="deferred": a paused device_ci write
+        # (YuzuDeviceCiWritesPaused) counts one deferred per refused report, and a paused
+        # fleet resends on the agent backoff far more often than it syncs normally, so keeping
+        # those in the denominator would dilute a real need_full surge on another source for the
+        # length of the pause. The deferral is answered need_full on the wire but is not hash
+        # drift, so it stays out of the numerator too (it has its own outcome label).
         expr: |
           sum(rate(yuzu_inventory_ingest_total{outcome="need_full"}[15m]))
-          / clamp_min(sum(rate(yuzu_inventory_ingest_total[15m])), 0.0001) > 0.2
+          / clamp_min(sum(rate(yuzu_inventory_ingest_total{outcome!="deferred"}[15m])), 0.0001) > 0.2
         for: 15m
         labels:
           severity: warning
