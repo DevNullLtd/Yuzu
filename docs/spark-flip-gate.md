@@ -2751,7 +2751,7 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   writes: plugin actions, the sync scheduler and the license scan too.
   **F14 precondition (journal loss): RISK ACCEPTED by Dave Rae, F14 sign-off owner (owner
   ruling 2026-10-23, Ruling 28 of the #5605 kickoff; sign-off ownership confirmed 2026-11-15),
-  recorded in the acceptance comment on #5605 dated 2026-11-16. Scope: F14 only; this is not
+  recorded in the acceptance comment on #5605 dated 2026-11-16 (https://github.com/DevNullLtd/Yuzu/issues/5605#issuecomment-6925253547). Scope: F14 only; this is not
   a SOC 2 exception. The owner is also the author of the change, so no independent approval
   is implied by this record.** The pending-journal ERROR line is agent-local only (the heartbeat has already
   stopped; no metric, no server row; absent if the watchdog cuts the stop; count and stage
