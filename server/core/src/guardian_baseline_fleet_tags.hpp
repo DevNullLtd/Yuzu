@@ -67,17 +67,24 @@ inline constexpr GuardianBaselineMetric kGuardianBaselineMetrics[] = {
      "about legacy-path persist failures, which are logged only. ABSENT means no reporting agent "
      "this sweep: prefer_spark off fleet-wide (every released agent today) or the persister not "
      "wired. A sustained non-zero value is a persistence BACKLOG (a failing or slow local store, "
-     "a budget-limited pass, a yielded worker pass); it detects an open loss window on a live "
-     "agent and cannot show that a loss happened (the series vanishes with a crashed agent)"},
+     "a budget-limited pass, a yielded worker pass); it detects a staged-but-unwritten backlog "
+     "on a live agent and cannot show that a loss happened. Not seen: a retarget followed by a "
+     "crash, a never-staged capture, a malformed record re-baselined at boot, and a crashed "
+     "agent (its series vanishes)"},
     {"yuzu.guardian_baseline_rebaselined_at_boot",
      "yuzu_fleet_guardian_baseline_rebaselined_at_boot",
      "Fleet SUM of file-hash-equals rules with no authored expected_hash whose boot re-arm seed "
      "lookup found NO persisted baseline record (both detection backends; counted once per rule "
      "per agent boot; sparse per agent, so ABSENT means no agent reported a non-zero count). "
-     "Each such rule re-captured the file's CURRENT content as its baseline at that boot. NOT "
-     "proof that a capture was lost: a never-captured target, a prior failed arm, a platform "
-     "that cannot arm the file mechanism, and a lost capture all read the same. Monitor-only; "
-     "never alert on it"},
+     "Each such rule re-arms and, where the file mechanism can arm, re-captures the file's "
+     "CURRENT content as its baseline at that boot. Only a genuinely absent record counts; a "
+     "malformed record, a boot read error and a fingerprint mismatch (retarget) are not counted "
+     "but also re-baseline, so a retarget followed by a crash reads as not lost. NOT proof that "
+     "a capture was lost: a never-captured target, a prior failed arm, a platform that cannot "
+     "arm the file mechanism, and a lost capture all read the same. On Linux and macOS no "
+     "file-hash guard arms, so every agent with such a rule counts it on every boot and the "
+     "value is not a baseline-loss signal; meaningful readings come from Windows agents only. "
+     "Monitor-only; never alert on it"},
     {"yuzu.guardian_baseline_persist_failures", "yuzu_fleet_guardian_baseline_persist_failures",
      "Fleet SUM of the agents' cumulative-since-boot yuzu.guardian_baseline_persist_failures "
      "counters (failed Spark persist passes, failed or displaced staging attempts, no-store "

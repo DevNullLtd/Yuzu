@@ -2841,7 +2841,9 @@ Guardian ladder must check these.
   heartbeat reads the CURRENT unpersisted backlog without any of those three locks: the
   runtime mirrors `staged_baselines_.size()` into the atomic `staged_baseline_count_`
   (written only under `registry_mu_`, by `store(size())` at the two sites that change the
-  size), which the persister co-owns by `shared_ptr` and reads relaxed through
+  size; a mismatch found when a snapshot or an erase runs is repaired there by the same
+  `store(size())` under `registry_mu_`, counted and logged once, and never aborts the
+  agent), which the persister co-owns by `shared_ptr` and reads relaxed through
   `pending_captures()`, reached via the atomic `baseline_persister_published_` (a
   `rollback_spark_wiring_locked` unpublishes that pointer, leaving the persister object
   alive, so a failed wiring reads as no persister and never as a live zero). Because every

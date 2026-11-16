@@ -30,12 +30,19 @@ members.
   Stop pass takes `persist_mu_` afterwards), the same pair `apply_rules` -> `attach_core` takes.
 - **Destruction order.** `agent.cpp` declares `kv_store_` before `guardian_`, so the engine (and the
   persister it owns, which borrows the `KvStore*`) is destroyed first; the drain worker is joined
-  before either. The runtime holds no `KvStore`: its drop counter is a `shared_ptr` the persister
-  copies, so it stays valid whichever of the two dies first.
+  before either. The runtime holds no `KvStore`: its drop counter and the staged-size mirror
+  (`staged_baseline_count_`, #5605) are `shared_ptr`s the persister copies, so both stay valid
+  whichever of the two dies first. The mirror is written only under `registry_mu_` (`store(size())`
+  where staging changes size, and a repair of any mismatch found when a snapshot or an erase runs);
+  that repair is counted (`staged_baseline_mirror_resyncs_`), logged once and never aborts.
 - **Published persister pointer.** `GuardianEngine::baseline_persister_published_` is a
   non-owning `std::atomic<GuardianBaselinePersister*>`, stored once with release by
-  `wire_spark_engine` (under `mtx_`, right after `make_shared`) and never cleared. Readers use
-  acquire: the two heartbeat getters and the top of `stop()` (for `begin_stop()`).
+  `wire_spark_engine` (under `mtx_`, right after `make_shared`) and cleared (stored null) only by
+  `rollback_spark_wiring_locked`, so a wiring that failed after the publish reads as no persister
+  (#5605); the persister object itself stays alive until the engine's destructor. Readers use
+  acquire: the three lock-free heartbeat getters (`baseline_persist_failures`,
+  `baseline_persist_refusals`, `baseline_unpersisted`) and the top of `stop()` (for
+  `begin_stop()`).
   A `stop()` that loads null before the wire publishes is covered by a second `begin_stop()` after
   `stop()` takes `mtx_` (first call wins).
 
