@@ -30,9 +30,13 @@
 ///     one rule with the EMPTY version prefix. A range of only `=` constraints names exact versions
 ///     (`exact_version`); anything else is a `version_range`. Both are counted, never stored.
 ///   * The key is `product_lifecycle_key(norm_key(name, namespace))` of each PURL in `identifier`
-///     (a string or an array of aliases); aliases that normalise to the same key collapse. An event
-///     whose identifiers yield no key is counted as `empty_key`; a key the rule model refuses
-///     (too long, not printable) as `invalid_key`.
+///     (a string or an array of at most `kLifecycleCsvMaxRows` aliases); aliases that normalise to
+///     the same key collapse, uncounted. A PURL whose name has no title token (`pkg:npm/2019`,
+///     `pkg:generic/x64`) identifies nothing and yields no key. Every alias that yields no key is
+///     counted as `empty_key`, once per mapped (endOfSupport / endOfLife) active event whatever its
+///     versions; a distinct key the rule model refuses (too long, not printable) is counted as
+///     `invalid_key` once per whole-product event. Each distinct key is judged once, where the keys
+///     are built, so the parse stays linear in the body.
 ///   * `effective` gives the date: the `YYYY-MM-DD` part of the timestamp, validated by
 ///     `is_lifecycle_date`.
 ///   * `withdrawn` events are applied as the specification says (the referenced event is ignored as
@@ -41,8 +45,9 @@
 /// All-or-nothing refusals (no rules, a caller-facing reason): body over `kImportMaxBytes`, a
 /// `source_reference` the rule model refuses, invalid UTF-8, JSON nesting or value count over the
 /// budget, invalid JSON, a spec version other than the pinned one, a required field missing or of
-/// the wrong type, a malformed `vers:` range, two rules with the same (product_key, event), more
-/// than `kLifecycleCsvMaxRows` rules, and any csv defect.
+/// the wrong type, a malformed `vers:` range, an `identifier` array of more than
+/// `kLifecycleCsvMaxRows` aliases, two rules with the same (product_key, event), more than
+/// `kLifecycleCsvMaxRows` rules, and any csv defect.
 
 #include "json_value_budget.hpp"
 #include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: the shared depth guard
@@ -116,12 +121,15 @@ using Refusal = std::unexpected<ImportError>;
 /// Skip counts grouped by reason, in order of first occurrence.
 struct SkipTally {
     std::vector<Skipped> items;
-    void add(std::string_view reason) {
+    /// Count `n` skips of `reason`; `n == 0` records nothing (no empty row for the reason).
+    void add(std::string_view reason, std::size_t n = 1) {
+        if (n == 0)
+            return;
         const auto it = std::ranges::find_if(items, [&](const Skipped& s) { return s.reason == reason; });
         if (it == items.end())
-            items.push_back({std::string{reason}, 1});
+            items.push_back({std::string{reason}, n});
         else
-            ++it->count;
+            it->count += n;
     }
 };
 
@@ -191,19 +199,30 @@ purl_name_namespace(std::string_view purl) {
     return std::pair{std::move(*name), std::move(ns)};
 }
 
-/// The lifecycle key of one PURL; empty when it is not a PURL or normalises to nothing.
+/// The lifecycle key of one PURL; empty when it is not a PURL or its name has no title token.
+/// `norm_key` is never empty (it always carries the `:` separator), so the empty test has to be on
+/// the title itself: a name such as "2019" or "x64" identifies nothing (the same rule as
+/// `SoftwareTitleDimension`), and must not collapse unrelated PURLs onto the key `product::`.
 [[nodiscard]] inline std::string purl_key(std::string_view purl) {
     const auto parts = purl_name_namespace(purl);
-    if (!parts)
+    if (!parts || normalize_title(parts->first).title.empty())
         return {};
     return product_lifecycle_key(norm_key(parts->first, parts->second));
 }
 
 enum class Span { whole_product, exact_versions, interval };
 
+/// The scheme-neutral prefix a range is rebuilt with, and the constraint bytes that fit after it in
+/// `vers::kMaxInputBytes`.
+inline constexpr std::string_view kVersGenericPrefix = "vers:generic/";
+inline constexpr std::size_t kMaxVersConstraintBytes =
+    vers::kMaxInputBytes - kVersGenericPrefix.size();
+
 /// Classify one `vers:<scheme>/<constraints>` text. The scheme does not change the answer, so it is
 /// replaced with `generic` for the grammar check (`vers::parse` refuses deb, rpm and unknown
-/// schemes by name, which would otherwise refuse a whole file for one such record).
+/// schemes by name, which would otherwise refuse a whole file for one such record). The rebuilt
+/// text has to pass `vers::parse`'s own size bound, so the constraint text is bounded here by
+/// `kMaxVersConstraintBytes`.
 [[nodiscard]] inline std::optional<Span> classify_vers(std::string_view text) {
     constexpr std::string_view kPrefix = "vers:";
     if (text.size() > vers::kMaxInputBytes || !text.starts_with(kPrefix))
@@ -217,7 +236,10 @@ enum class Span { whole_product, exact_versions, interval };
             return u <= 0x20 || u == 0x7f;
         }))
         return std::nullopt;
-    const auto range = vers::parse("vers:generic/" + std::string{text.substr(slash + 1)});
+    const auto constraints = text.substr(slash + 1);
+    if (constraints.size() > kMaxVersConstraintBytes)
+        return std::nullopt;
+    const auto range = vers::parse(std::string{kVersGenericPrefix} + std::string{constraints});
     if (!range)
         return std::nullopt;
     if (range->all)
@@ -278,16 +300,24 @@ struct CleEvent {
     if (updated == doc.end() || !updated->is_string())
         return refuse("required field updatedAt is missing or not a string");
 
-    // identifier: a PURL string or a non-empty array of PURL strings.
+    // identifier: a PURL string or a non-empty array of at most kLifecycleCsvMaxRows PURL strings.
+    // Every alias is judged once, here, so the work per event below never grows with the alias
+    // count: the rule model's verdict on a key depends on the key alone (the date comes from
+    // date_of, the source_reference was checked by parse()).
     const auto ident = doc.find("identifier");
     if (ident == doc.end())
         return refuse("required field identifier is missing");
-    std::vector<std::string> keys;
+    std::vector<std::string> keys;    // accepted by the rule model, first-seen order
+    std::size_t invalid_keys = 0;     // distinct keys the rule model refuses
+    std::size_t unusable_aliases = 0; // aliases that yield no key at all
     {
         std::vector<std::string_view> purls;
         if (ident->is_string())
             purls.push_back(ident->get_ref<const std::string&>());
         else if (ident->is_array() && !ident->empty()) {
+            if (ident->size() > kLifecycleCsvMaxRows)
+                return refuse("identifier lists more than " + std::to_string(kLifecycleCsvMaxRows) +
+                              " aliases");
             for (const auto& a : *ident) {
                 if (!a.is_string())
                     return refuse("identifier must hold only strings");
@@ -295,9 +325,21 @@ struct CleEvent {
             }
         } else
             return refuse("identifier must be a string or a non-empty array of strings");
+        LifecycleRule probe{std::string{}, "", LifecycleEvent::end_of_life, "2000-01-01",
+                            LifecycleSource::imported, std::string{source_ref}, 0};
+        std::set<std::string> seen_keys;
         for (const auto p : purls) {
             auto k = purl_key(p);
-            if (!k.empty() && std::ranges::find(keys, k) == keys.end())
+            if (k.empty()) {
+                ++unusable_aliases;
+                continue;
+            }
+            if (!seen_keys.insert(k).second)
+                continue; // aliases that normalise to one key collapse
+            probe.product_key = k;
+            if (validate_lifecycle_rule(probe))
+                ++invalid_keys;
+            else
                 keys.push_back(std::move(k));
         }
     }
@@ -379,7 +421,9 @@ struct CleEvent {
                 return refuse(at + "every versions entry needs a string range");
             const auto span = classify_vers(r->get_ref<const std::string&>());
             if (!span)
-                return refuse(at + "versions range is not a valid vers range");
+                return refuse(at + "versions range is not a valid vers range (at most " +
+                              std::to_string(vers::kMaxConstraints) + " constraints and " +
+                              std::to_string(kMaxVersConstraintBytes) + " constraint bytes)");
             switch (*span) {
             case Span::whole_product:
                 whole = true;
@@ -392,28 +436,22 @@ struct CleEvent {
                 break;
             }
         }
-        if (keys.empty()) {
-            skips.add(kEmptyKey);
-            continue;
-        }
-        for (std::size_t i = 0; i < exact; ++i)
-            skips.add(kExactVersion);
-        for (std::size_t i = 0; i < interval; ++i)
-            skips.add(kVersionRange);
+        skips.add(kEmptyKey, unusable_aliases);
+        if (keys.empty() && invalid_keys == 0)
+            continue; // every alias was unusable: the versions describe no product
+        skips.add(kExactVersion, exact);
+        skips.add(kVersionRange, interval);
         if (!whole)
             continue;
+        skips.add(kInvalidKey, invalid_keys);
+        // Each pass stores a rule or refuses the file, so the loop is bounded by the rule cap.
         for (const auto& key : keys) {
-            LifecycleRule rule{key, "", kind, *date, LifecycleSource::imported,
-                               std::string{source_ref}, 0};
-            if (validate_lifecycle_rule(rule)) { // date and source_ref are already checked: the key
-                skips.add(kInvalidKey);
-                continue;
-            }
             if (!seen.emplace(key, kind).second)
                 return refuse(at + "duplicate (product_key, version_prefix, event)");
             if (out.rules.size() >= kLifecycleCsvMaxRows)
                 return refuse("more than " + std::to_string(kLifecycleCsvMaxRows) + " rules");
-            out.rules.push_back(std::move(rule));
+            out.rules.push_back(LifecycleRule{key, "", kind, *date, LifecycleSource::imported,
+                                              std::string{source_ref}, 0});
         }
     }
     out.skipped = std::move(skips.items);

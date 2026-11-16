@@ -137,7 +137,7 @@ std::string reason_of(const std::expected<li::Parsed, li::ImportError>& r) {
     return r.error().reason;
 }
 
-/// `n` whole-product end_of_support events' worth of keys: one identifier per rule.
+/// A JSON array of `n` distinct PURL aliases (distinct keys, none a title-less name).
 std::string many_identifiers(std::size_t n) {
     std::string out = "[";
     for (std::size_t i = 0; i < n; ++i) {
@@ -250,6 +250,23 @@ TEST_CASE("lifecycle import: unmapped event types are counted and the rest still
     CHECK(skipped_count(*r, "unmapped_event_type") == 2);
 }
 
+TEST_CASE("lifecycle import: a vers range is bounded by its constraint bytes, not its scheme",
+          "[lifecycle][import]") {
+    // `>=` and then digits: one interval constraint of exactly `n` bytes after the slash.
+    const auto doc_for = [](std::size_t n) {
+        return doc_with(R"("pkg:npm/example-component")",
+                        event(1, "endOfLife", range("vers:npm/>=" + std::string(n - 2, '1'))));
+    };
+    constexpr auto kLimit = li::detail::kMaxVersConstraintBytes;
+    const auto at_limit = li::parse(li::Format::cle, doc_for(kLimit), kRef);
+    REQUIRE(at_limit.has_value());
+    CHECK(skipped_count(*at_limit, "version_range") == 1);
+    // One byte over is refused, and the reason names the limits it applies.
+    const auto reason = reason_of(li::parse(li::Format::cle, doc_for(kLimit + 1), kRef));
+    CHECK(reason.find("32 constraints") != std::string::npos);
+    CHECK(reason.find(std::to_string(kLimit) + " constraint bytes") != std::string::npos);
+}
+
 TEST_CASE("lifecycle import: withdrawn events follow the specification", "[lifecycle][import]") {
     const auto id = R"("pkg:npm/example-component")";
     // A withdrawn event is ignored: no rule, nothing counted.
@@ -299,6 +316,102 @@ TEST_CASE("lifecycle import: identifier aliases", "[lifecycle][import]") {
         CHECK(r->rules.empty());
         CHECK(skipped_count(*r, "empty_key") == 1);
     }
+    // Rules follow the first-seen order of the aliases, and a repeat collapses.
+    r = li::parse(li::Format::cle,
+                  doc_with(R"(["pkg:npm/b-comp","pkg:npm/a-comp","pkg:npm/b-comp"])", ev), kRef);
+    REQUIRE(r.has_value());
+    REQUIRE(r->rules.size() == 2);
+    CHECK(r->rules[0].product_key == product_lifecycle_key(norm_key("b-comp", "")));
+    CHECK(r->rules[1].product_key == product_lifecycle_key(norm_key("a-comp", "")));
+    CHECK(r->skipped.empty());
+}
+
+TEST_CASE("lifecycle import: a PURL name with no title token identifies nothing",
+          "[lifecycle][import]") {
+    // `norm_key` of these is ":" / "vendor:", never empty; the key `product::` would join
+    // unrelated PURLs, so each is an unusable identifier, counted and not stored.
+    const auto ev = event(1, "endOfLife", range("vers:npm/*"));
+    for (const char* bare : {R"("pkg:npm/2019")", R"("pkg:generic/x64")",
+                             R"("pkg:generic/enterprise")", R"("pkg:generic/acme/2019")"}) {
+        const auto r = li::parse(li::Format::cle, doc_with(bare, ev), kRef);
+        REQUIRE(r.has_value());
+        CHECK(r->rules.empty());
+        CHECK(skipped_count(*r, "empty_key") == 1);
+    }
+}
+
+TEST_CASE("lifecycle import: every unusable alias is counted once per mapped event",
+          "[lifecycle][import]") {
+    const auto whole = range("vers:npm/*");
+    // One usable and one unusable alias: the rule is stored, the unusable alias is counted.
+    auto r = li::parse(li::Format::cle,
+                       doc_with(R"(["pkg:npm/example-component","not-a-purl"])",
+                                event(1, "endOfLife", whole)),
+                       kRef);
+    REQUIRE(r.has_value());
+    CHECK(r->rules.size() == 1);
+    CHECK(skipped_count(*r, "empty_key") == 1);
+    // Two unusable aliases are two; the unit is the alias, whatever the event's versions.
+    r = li::parse(li::Format::cle,
+                  doc_with(R"(["not-a-purl","pkg:npm/2019"])", event(1, "endOfLife", whole)), kRef);
+    REQUIRE(r.has_value());
+    CHECK(r->rules.empty());
+    CHECK(skipped_count(*r, "empty_key") == 2);
+    // Per mapped event: two mapped events count 2, an unmapped event counts nothing here.
+    r = li::parse(li::Format::cle,
+                  doc_with(R"(["pkg:npm/example-component","not-a-purl"])",
+                           event(3, "endOfSupport", range("vers:npm/>=1|<2")) + "," +
+                               event(2, "endOfLife", whole) + "," +
+                               event(1, "endOfDevelopment", whole)),
+                  kRef);
+    REQUIRE(r.has_value());
+    CHECK(r->rules.size() == 1);
+    CHECK(skipped_count(*r, "empty_key") == 2);
+    CHECK(skipped_count(*r, "unmapped_event_type") == 1);
+}
+
+TEST_CASE("lifecycle import: a key the rule model refuses is counted once per whole-product event",
+          "[lifecycle][import]") {
+    // `%01` decodes to a control byte, which the rule model refuses as not printable.
+    const auto ids = R"(["pkg:generic/a%01b","pkg:generic/c%01d","pkg:npm/example-component"])";
+    const auto whole = range("vers:npm/*");
+    const auto both = event(2, "endOfLife", whole) + "," + event(1, "endOfSupport", whole);
+    auto r = li::parse(li::Format::cle, doc_with(ids, both), kRef);
+    REQUIRE(r.has_value());
+    CHECK(r->rules.size() == 2); // the valid key, once per event
+    CHECK(skipped_count(*r, "invalid_key") == 4);
+    CHECK(skipped_count(*r, "empty_key") == 0);
+    // Only invalid keys: the event is not an empty_key; its exact entries are still counted, and
+    // invalid_key is counted only where a rule would have been stored.
+    const auto bad_key = R"("pkg:generic/a%01b")";
+    r = li::parse(li::Format::cle,
+                  doc_with(bad_key, event(1, "endOfLife", range("vers:npm/=1.0"))), kRef);
+    REQUIRE(r.has_value());
+    CHECK(r->rules.empty());
+    CHECK(skipped_count(*r, "exact_version") == 1);
+    CHECK(skipped_count(*r, "invalid_key") == 0);
+    CHECK(skipped_count(*r, "empty_key") == 0);
+    r = li::parse(li::Format::cle, doc_with(bad_key, event(1, "endOfLife", whole)), kRef);
+    REQUIRE(r.has_value());
+    CHECK(r->rules.empty());
+    CHECK(skipped_count(*r, "invalid_key") == 1);
+}
+
+TEST_CASE("lifecycle import: one event can hold a whole-product entry and counted entries",
+          "[lifecycle][import]") {
+    const auto r = li::parse(
+        li::Format::cle,
+        doc_with(R"("pkg:npm/example-component")",
+                 event(1, "endOfLife",
+                       range("vers:npm/*") + "," + range("vers:npm/=1.0") + "," +
+                           range("vers:npm/>=2|<3"))),
+        kRef);
+    REQUIRE(r.has_value());
+    REQUIRE(r->rules.size() == 1);
+    CHECK(r->rules[0].version_prefix.empty());
+    CHECK(skipped_count(*r, "exact_version") == 1);
+    CHECK(skipped_count(*r, "version_range") == 1);
+    CHECK(r->skipped.size() == 2);
 }
 
 TEST_CASE("lifecycle import: CLE refusals are distinct and produce no rules",
@@ -361,12 +474,31 @@ TEST_CASE("lifecycle import: oversized, deep and wide bodies are refused by thei
 }
 
 TEST_CASE("lifecycle import: 5,000 rules pass and 5,001 are refused", "[lifecycle][import]") {
+    // Two mapped events over N aliases store 2N rules: 2,500 aliases land on the cap, 2,501 pass.
+    const auto both = event(2, "endOfLife", range("vers:npm/*")) + "," +
+                      event(1, "endOfSupport", range("vers:npm/*"));
+    const auto at_cap = li::parse(li::Format::cle, doc_with(many_identifiers(2500), both), kRef);
+    REQUIRE(at_cap.has_value());
+    CHECK(at_cap->rules.size() == 5000);
+    const auto over = li::parse(li::Format::cle, doc_with(many_identifiers(2501), both), kRef);
+    CHECK(reason_of(over) == "more than 5000 rules");
+}
+
+TEST_CASE("lifecycle import: 5,000 identifier aliases pass and 5,001 are refused",
+          "[lifecycle][import]") {
     const auto ev = event(1, "endOfLife", range("vers:npm/*"));
     const auto at_cap = li::parse(li::Format::cle, doc_with(many_identifiers(5000), ev), kRef);
     REQUIRE(at_cap.has_value());
     CHECK(at_cap->rules.size() == 5000);
     const auto over = li::parse(li::Format::cle, doc_with(many_identifiers(5001), ev), kRef);
-    CHECK(reason_of(over).find("more than 5000") != std::string::npos);
+    CHECK(reason_of(over) == "identifier lists more than 5000 aliases");
+    // The cap counts array entries, so repeats of one key do not slip under it.
+    std::string repeats = "[";
+    for (int i = 0; i < 5001; ++i)
+        repeats += (i ? ",\"pkg:npm/same\"" : "\"pkg:npm/same\"");
+    repeats += "]";
+    CHECK(reason_of(li::parse(li::Format::cle, doc_with(repeats, ev), kRef)) ==
+          "identifier lists more than 5000 aliases");
 }
 
 TEST_CASE("lifecycle import: csv through parse equals parse_lifecycle_rules_csv with the "
