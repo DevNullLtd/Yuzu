@@ -30,6 +30,12 @@ const char* to_string(DecommissionOutcome o) noexcept {
     return "unknown";
 }
 
+namespace {
+constexpr const char* kWritePausedReason =
+    "removal not attempted because device-CI writes are paused by a PostgreSQL collation "
+    "mismatch; retry the decommission after the repair";
+} // namespace
+
 AgentDecommission::AgentDecommission(const AgentDecommissionStores& stores) {
     // Fixed registration order: the generic inventory store first, then each
     // typed projection (all born-on-PG). Every store is registered even when
@@ -62,6 +68,12 @@ AgentDecommission::AgentDecommission(const AgentDecommissionStores& stores) {
                             ? Fn([p = stores.device_inventory](std::string_view id) {
                                   return p->delete_agent(id);
                               })
+                            : nullptr,
+                        // delete_agent returns false without trying while device_ci writes are
+                        // paused (a collation mismatch): report that, not a generic commit failure.
+                        stores.device_inventory
+                            ? std::function<bool()>(
+                                  [p = stores.device_inventory] { return p->writes_deferred(); })
                             : nullptr});
     // The Decision 11 store: its agent_licenses / agent_license_state rows carry
     // the per-user `user_ref` pseudonyms, so a decommission MUST reach it.
@@ -150,6 +162,15 @@ DecommissionResult AgentDecommission::decommission(std::string_view agent_id) {
             if (t.deleter(agent_id)) {
                 r.outcome = DecommissionOutcome::Deleted;
                 ++result.deleted;
+            } else if (t.write_paused && t.write_paused()) {
+                r.outcome = DecommissionOutcome::Failed;
+                r.write_paused = true;
+                r.error = kWritePausedReason;
+                ++result.failed;
+                spdlog::warn("AgentDecommission: store '{}' removal for agent={} was not attempted "
+                             "because its writes are paused (collation mismatch), recorded Failed; "
+                             "retry after the repair",
+                             t.name, ::yuzu::log_id_token(agent_id));
             } else {
                 r.outcome = DecommissionOutcome::Failed;
                 r.error = "delete_agent reported failure (delete did not commit)";
