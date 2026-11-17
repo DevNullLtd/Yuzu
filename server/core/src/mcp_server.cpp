@@ -24950,10 +24950,10 @@ McpServer::HandlerFn McpServer::build_handler(
                         // the record is there and another apply holds it, and
                         // that apply is dispatching the containment or has not had
                         // its reply read yet, so this call has not contained the
-                        // device. The retry is
-                        // still right. (An apply that reached the device keeps its
-                        // claim until its reply is consumed or the claim window
-                        // passes, so a retry inside that window is refused this
+                        // device. The retry is still right. (An apply that reached
+                        // the device keeps its claim until its reply is consumed or
+                        // the claim window passes, so a retry inside that window is
+                        // refused this
                         // way; this path consumes no reply and leaves it to expire.)
                         mcp_audit("failure", "agent_id=" + agent_id + ", " + err.detail +
                                                  (record_pre_existing ? "" : " record_persisted=1"));

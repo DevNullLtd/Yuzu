@@ -1879,7 +1879,7 @@ class SectionAllowlistSelfTest(unittest.TestCase):
 
 
 class HelperSitesAreGovernedInterpreterSites(unittest.TestCase):
-    """#8045 review: both helpers start with `#!/bin/sh`, so under ADR-3002
+    """#8045: both helpers start with `#!/bin/sh`, so under ADR-3002
     Decision 5 the calls a non-root agent makes through them sit at the interpreter's rung. The
     manifest registers each such site, and the descriptors that name a helper say rung 3."""
 
@@ -1908,7 +1908,7 @@ class HelperSitesAreGovernedInterpreterSites(unittest.TestCase):
 
 
 class InstallerCheckComparesSudoersBytes(unittest.TestCase):
-    """#8045 review: `--check` compares the installed sudoers file with the
+    """#8045: `--check` compares the installed sudoers file with the
     text the installer would write, as it does for the helpers."""
 
     def test_check_compares_the_file_with_the_generated_text(self):
@@ -1918,7 +1918,7 @@ class InstallerCheckComparesSudoersBytes(unittest.TestCase):
 
 
 class ReconcilerThreadNamesThePassThatFailed(unittest.TestCase):
-    """#8045 review: a drain failure is not logged as a tick failure."""
+    """#8045: a drain failure is not logged as a tick failure."""
 
     def test_the_catch_blocks_name_the_pass(self):
         text = read_text("server/core/src/server.cpp")

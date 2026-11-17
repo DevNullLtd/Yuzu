@@ -277,8 +277,8 @@ using ReapplyDispatchFn =
 /// The shared recipe: `store.get_status(agent_id)` -> refuse a releasing row -> map the
 /// stored whitelist -> claim the apply (`claim_apply`) -> invoke `dispatch_fn(params)` -> drop the
 /// claim (`release_apply_claim`) unless the dispatch reached an agent, in which case it is kept and
-/// returned in `held_claim_gen` for the caller to drop once the reply is consumed. `out_record` receives the stored
-/// row on success (the caller typically needs `quarantined_by`/`reason`/
+/// returned in `held_claim_gen` for the caller to drop once the reply is consumed. `out_record`
+/// receives the stored row on success (the caller typically needs `quarantined_by`/`reason`/
 /// `quarantined_at` for its own response/audit shaping, which this function does not
 /// interpret). Returns `unexpected` without ever calling `dispatch_fn` on any
 /// `ContainmentReapplyError`.

@@ -186,8 +186,9 @@
 /// Residuals, stated plainly: (1) the rule assumes commands to one device arrive in the order one
 /// server dispatched them (one stream, a first-in first-out gateway queue); a transport that
 /// reorders them, or an apply and a release dispatched by two different server replicas, can still
-/// reopen the window. (2) A claim older than `kApplyClaimTtlSecs` (120 s) is ignored, so an apply that stays
-/// unexecuted longer than that reopens it. (3) DELETE's own release has a check-then-dispatch window
+/// reopen the window. (2) A claim older than `kApplyClaimTtlSecs` (120 s) is ignored, so an apply
+/// that stays unexecuted longer than that reopens it. (3) DELETE's own release has a
+/// check-then-dispatch window
 /// against a re-quarantine of the device, as does the owed-release leg; the new record's re-verify
 /// corrects either within 5 minutes. (4) The same outcome follows when a release sent earlier is run
 /// by the device after a later record's apply, for the same ordering reason: the new record can be
@@ -392,8 +393,8 @@ private:
         // record. 0 only before the first-ever claim.
         std::int64_t pending_record_id{0};
         // The apply claim this entry's last apply still holds (`ContainmentReapplyResult::
-        // held_claim_gen`), `gen` 0 for none, with the record and command it belongs to. It is dropped
-        // when that apply's terminal reply is consumed (`release_held_claim`), by the in-flight
+        // held_claim_gen`), `gen` 0 for none, with the record and command it belongs to. It is
+        // dropped when the device's answer to that apply (a `status|` line) is consumed (`release_held_claim`), by the in-flight
         // poll or, after a release request has turned the entry into a releasing one,
         // by `reconcile_one`'s own look at the command. `reset_for` keeps this whole struct: a
         // reset must not strand a claim whose apply may not have run yet. An apply that never

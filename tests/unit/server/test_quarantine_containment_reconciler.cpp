@@ -3318,6 +3318,28 @@ TEST_CASE("reconciler (firewall): a release requested while an apply is unanswer
     CHECK(rig.has_row("quarantine.disable", "success", "confirmed record_id=" + std::to_string(rec.id)));
 }
 
+TEST_CASE("reconciler (firewall): a stored row that is not the device's answer does not drop the claim "
+          "(#8045)",
+          "[pg][quarantine][reconciler][prq2][fence][apply-claim]") {
+    RECON_RIG(rig);
+    const auto rec = rig.quarantine();
+    rig.reply("", "status|inactive");
+    rig.step(); // the apply is dispatched and its claim held
+    REQUIRE(rig.sent() == (std::vector<std::string>{"firewall.quarantine"}));
+    REQUIRE(rig.qstore.request_release("agent-1").has_value());
+    // The agent answers a redelivery of the apply with progress text while the original has not run.
+    store_status_response(rig.rstore, ReconRig::cmd(1), "agent-1", "duplicate command still in flight");
+    rig.run(10);
+    CHECK(rig.active().has_value()); // no end: the claim is still held
+    const auto token = rig.qstore.apply_fence_token("agent-1", rec.id);
+    REQUIRE(token.has_value());
+    CHECK_FALSE(token->has_value());
+    // The apply's own answer arrives: the claim drops and the release settles.
+    store_status_response(rig.rstore, ReconRig::cmd(1), "agent-1", "status|active_unproven");
+    rig.run(10);
+    CHECK_FALSE(rig.active().has_value());
+}
+
 TEST_CASE("reconciler (firewall): the marks a heartbeat drain had not reached go back when the pass throws "
           "(#8045)",
           "[pg][quarantine][reconciler][prq2][drain]") {

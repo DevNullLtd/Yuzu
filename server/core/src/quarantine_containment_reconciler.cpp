@@ -1149,12 +1149,14 @@ bool QuarantineContainmentReconciler::reconcile_one(const std::string& agent_id,
 
     // An apply of ours still holds its claim, and the entry is no longer waiting on it (a release
     // request turned the entry into a releasing one before the reply was read): drop the claim
-    // once that apply's reply is in. Until then no token is issued and no end is accepted, which
-    // is the point of holding it. Nothing is dispatched or decided here.
+    // once that apply's answer is in. The answer is the device's `status|` line; a stored row
+    // without one (progress text for a redelivered command that is still in flight) is not proof
+    // the apply ran. Until then no token is issued and no end is accepted, which is the point of
+    // holding it. Nothing is dispatched or decided here.
     if (c.held_claim.gen != 0 && d_.response_store &&
         !(c.pending == Pending::apply && c.pending_command_id == c.held_claim.command_id)) {
         const auto held = poll_command(c.held_claim.command_id, agent_id);
-        if (held && !held->empty())
+        if (held && !held->empty() && parse_containment_reply(combined_output(*held)).status_seen)
             release_held_claim(agent_id, c);
     }
 
@@ -1198,9 +1200,12 @@ bool QuarantineContainmentReconciler::reconcile_one(const std::string& agent_id,
         }
 
         const auto reply = parse_containment_reply(combined_output(*resp));
-        // The apply's terminal reply is in hand: it ran, so its claim can go and a confirmed end is
-        // possible again. (A timed-out apply keeps the claim until it expires: it may not have run.)
-        if (c.pending == Pending::apply && c.pending_command_id == c.held_claim.command_id)
+        // The device's answer to the apply is in hand (a `status|` line, even a refusal): it ran,
+        // or was refused before it could, so its claim can go and a confirmed end is possible
+        // again. A row without one is not proof, so the claim stays. (A timed-out apply keeps the
+        // claim until it expires: it may not have run.)
+        if (c.pending == Pending::apply && c.pending_command_id == c.held_claim.command_id &&
+            reply.status_seen)
             release_held_claim(agent_id, c);
         switch (c.pending) {
         case Pending::apply:
