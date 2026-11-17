@@ -1,6 +1,15 @@
 # process_introspect
 
 <!-- BEGIN GENERATED: plugin-doc-gen header -->
+| | |
+|---|---|
+| **What it does** | Per-process introspection of one pid, one facet per request: resource limits, signal masks, capabilities, seccomp, OOM and scheduling; numbers and masks only |
+| **Version** | 1.0.0 |
+| **Kind** | Collector · read-only · gathered (crossplatform.process_introspect.inspect) |
+| **Platforms** | Windows 🟡 planned · macOS 🟡 planned · Linux 🟡 constrained |
+| **Actions** | `inspect` (definition `crossplatform.process_introspect.inspect`) |
+| **Security** | securable `Forensics` · operation Read · risk High · dispatch ReadOnly · approval gate AdminOrApproval |
+| **Roles** | execute: admin · author: content-author |
 <!-- END GENERATED -->
 
 ## How it works
@@ -35,6 +44,15 @@ flowchart LR
 ## OS capability
 
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
+| Action | Windows | macOS | Linux |
+|---|---|---|---|
+| `inspect` | 🟡 planned · rung 1 · NtQueryInformationProcess and toolhelp snapshots | 🟡 planned · rung 1 · libproc proc_pidinfo, no task port | 🟡 constrained · rung 1 · bounded reads of /proc/<pid>/{stat,status,limits,oom_score,oom_score_adj} through one directory descriptor opened once per dispatch |
+
+**Declared limits per leg** (descriptor fallback text, verbatim):
+
+- **`inspect` / Windows** — not read yet: one unsupported status row, windows:planned
+- **`inspect` / macOS** — not read yet: one unsupported status row, macos:planned
+- **`inspect` / Linux** — constrained: six facets (resource_limits, sigmasks, caps, seccomp, oom, sched), one facet per dispatch; numbers, masks and fixed tokens only; a supplied start_time that no longer matches is refused as pid_reused and a process that changed during the read as torn_read; on a /proc mounted with hidepid 2 or above another account's process answers no_such_process_or_hidden (the mount table is read only when the pid is not found); a thread id reads that thread; an exec during the read is not detected
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
@@ -52,6 +70,11 @@ No external binaries, no subprocesses, no network use: the plugin opens one dire
 ### Inputs
 
 <!-- BEGIN GENERATED: plugin-doc-gen inputs -->
+| Definition | Parameter | Type | Required | Default | Constraints | Description |
+|---|---|---|---|---|---|---|
+| `crossplatform.process_introspect.inspect` | `pid` | string | yes | - | pattern: ^([1-9][0-9]{0,8}\|1[0-9]{9}\|20[0-9]{8}\|21[0-3][0-9]{7}\|214[0-6][0-9]{6}\|2147[0-3][0-9]{5}\|21474[0-7][0-9]{4}\|214748[0-2][0-9]{3}\|2147483[0-5][0-9]{2}\|21474836[0-3][0-9]\|214748364[0-7])$ | The numeric process id to inspect, 1 to 2147483647 with no leading zero (e.g. 4242). One process per request; names are never matched. |
+| `crossplatform.process_introspect.inspect` | `facet` | string | yes | - | enum: resource_limits, sigmasks, caps, seccomp, oom, sched | Which part of the process to read: resource_limits, sigmasks, caps, seccomp, oom or sched. One facet per request. |
+| `crossplatform.process_introspect.inspect` | `start_time` | string | no | - | pattern: ^([0-9a-f]{8}\.[0-9]{1,20})?$ | Optional identity guard. The token is field 2 of the `target` row of an earlier inspect of the same pid; no other plugin or action emits it, so the first inspect of a pid is always unguarded and the guard only links one inspect to the next. If the pid now belongs to a different process the request is refused as pid_reused. Leave empty for no guard. |
 <!-- END GENERATED -->
 
 ### Outputs
@@ -59,6 +82,15 @@ No external binaries, no subprocesses, no network use: the plugin opens one dire
 The first row is always `status|inspect|<state>|<reason or ->`. A completed read then writes one `target|<pid>|<start_time token>|<facet>` row and the facet's rows; a refusal writes the status row alone. Row grammars by `row_kind`: `limit|<name>|<soft>|<hard>|<unit>`, `sigmask|<which>|<hex16>`, `cap|<which>|<hex16>`, `seccomp|<mode>|<filters>|<no_new_privs>`, `oom|<score>|<score_adj>` and `sched|<policy>|<nice>|<rt_priority>|<cpus>`. A `-` marks a value the kernel did not report or that could not be validated. Field 2 of the `target` row is the only source of a `start_time` token: no other plugin or action emits it, so the first inspect of a pid is always unguarded and the token only links one inspect to the next. The committed sample shows the `caps` facet only; the other five facets emit the row grammars above and are covered by the unit fixtures, not by the sample.
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
+**`crossplatform.process_introspect.inspect` — `row_kind|field_1|field_2|field_3|field_4`**
+
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `row_kind` | string | `status` `target` `limit` `sigmask` `cap` `seccomp` `oom` `sched` | Windows, Linux, macOS | `sigmask` | Row shape discriminator (field 0). Values: status, target, limit, sigmask, cap, seccomp, oom, sched. |
+| `field_1` | string | - | Windows, Linux, macOS | `blocked` | status: the literal "inspect". target: the pid inspected. limit: the limit name (cpu_time, file_size, data_size, stack_size, core_file_size, resident_set, processes, open_files, locked_memory, address_space, file_locks, pending_signals, msgqueue_size, nice_priority, realtime_priority, realtime_timeout). sigmask: pending, shared_pending, blocked, ignored or caught. cap: inheritable, permitted, effective, bounding or ambient. seccomp: the mode (disabled, strict, filter) or "-". oom: the OOM score, or "-". sched: the scheduling policy (other, fifo, rr, batch, idle, deadline, ext, unknown). |
+| `field_2` | string | - | Windows, Linux, macOS | `0000000000000000` | status: supported, constrained, permission_denied, unavailable or unsupported (the planned legs, and a leg that threw). target: the start-time token, <8 hex of the boot id>.<process start time>, to pass back as start_time. limit: the soft limit, a number or unlimited. sigmask and cap: the 16-digit hex mask. seccomp: the number of installed filters, or "-". oom: the OOM score adjustment, or "-". sched: the nice value. |
+| `field_3` | string | - | Windows, Linux, macOS | `unlimited` | status: reason token(s) for a non-supported read, "-" when complete; tokens look like linux:process_introspect:pid_reused or macos:planned. target: the facet inspected. limit: the hard limit, a number or unlimited. seccomp: NoNewPrivs, 0 or 1, or "-". sched: the realtime priority, 0 to 99. |
+| `field_4` | string | - | Linux | `bytes` | limit: the unit (seconds, bytes, count, microseconds, none). sched: the allowed-CPU list such as 0-7 or 0,2,4, or "-" when it could not be read. Not used by the other kinds. |
 <!-- END GENERATED -->
 
 ### Result status
@@ -104,6 +136,19 @@ Every read sets a typed result status; a degraded read is `CONSTRAINED`, never a
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
+**Linux** — captured: linux Ubuntu 26.04.1 LTS x86_64 · vm · 2026-11-17 · euid 0 · leg-hash 054f810948b5
+
+```
+== action=inspect pid=75 facet=caps
+status|inspect|supported|-
+target|75|2664b550.15539926|caps
+cap|inheritable|0000000000000000
+cap|permitted|000001ffffffffff
+cap|effective|000001ffffffffff
+cap|bounding|000001ffffffffff
+cap|ambient|0000000000000000
+[result_status] OK / FULL
+```
 <!-- END GENERATED -->
 
 ## Caveats and known gaps
@@ -117,4 +162,10 @@ Every read sets a typed result status; a degraded read is `CONSTRAINED`, never a
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
+- Plugin: `agents/plugins/process_introspect/src/process_introspect_legs.hpp` · `agents/plugins/process_introspect/src/process_introspect_linux.cpp` · `agents/plugins/process_introspect/src/process_introspect_parsers.hpp` · `agents/plugins/process_introspect/src/process_introspect_plugin.cpp`
+- Definitions: `content/definitions/process_introspect.yaml`
+- Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_process_introspect.hpp`
+- Tests: `tests/test_process_introspect_definition.py` · `tests/unit/test_process_introspect_legs.cpp` · `tests/unit/test_process_introspect_local_dispatcher.cpp` · `tests/unit/test_process_introspect_parsers.cpp`
+- Privilege row: `docs/agent-privilege-model.md`
+- Changelog: `changelog.d/2026-11-16-process_introspect-inspect.added.md`
 <!-- END GENERATED -->
