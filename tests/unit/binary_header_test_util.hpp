@@ -43,10 +43,8 @@ struct Probe {
     std::vector<std::pair<std::uint64_t, std::size_t>> reads; // answered calls: offset, len
 
     Probe() = default;
-    explicit Probe(std::string b, std::uint64_t vis = std::numeric_limits<std::uint64_t>::max())
-        : bytes(std::move(b)), visible(vis) {}
-    explicit Probe(const std::vector<std::uint8_t>& b, std::uint64_t vis = std::numeric_limits<std::uint64_t>::max())
-        : bytes(b.begin(), b.end()), visible(vis) {}
+    explicit Probe(std::string b) : bytes(std::move(b)) {}
+    explicit Probe(const std::vector<std::uint8_t>& b) : bytes(b.begin(), b.end()) {}
 
     std::uint64_t end() const { return std::min<std::uint64_t>(visible, bytes.size()); }
     // Some request reached past the visible bytes.

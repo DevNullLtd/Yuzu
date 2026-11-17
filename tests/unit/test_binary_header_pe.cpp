@@ -18,8 +18,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <functional>
-#include <limits>
-#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>

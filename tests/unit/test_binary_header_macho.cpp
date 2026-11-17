@@ -11,12 +11,10 @@
 
 #include <binary_header_macho.hpp>
 
-#include <algorithm>
 #include <array>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
-#include <iterator>
 #include <limits>
 #include <optional>
 #include <string>
