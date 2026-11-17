@@ -1911,25 +1911,21 @@ std::expected<int, std::string> AuthManager::revoke_user_elevations(const std::s
     if (session_store_) {
         // Durable clear FIRST (bumps the generation → every replica drops the
         // stale elevations on refresh); the store's count is authoritative
-        // (sessions may live only on other replicas). Then clear local cache. This loop does
-        // not advance the cache epoch, so it does not stop an in-flight validator from
-        // re-inserting a pre-clear copy: that copy converges on the next generation poll.
+        // (sessions may live only on other replicas). Then drop this replica's cached copies,
+        // advancing the cache epoch: a validator that read the still-elevated durable row
+        // before the clear (a cold miss, or a cache HIT whose copy is written back) and is
+        // parked before its insert must not re-cache an elevated copy, so an in-place zero
+        // would not do. The next validate re-reads the cleared durable row.
         auto r = session_store_->clear_user_elevations(username);
         if (!r) {
             spdlog::error("revoke_user_elevations: durable clear failed ({})", r.error().message);
             note_session_store_degrade("invalidate_user");
-            // Elevations may still be live durably — surface so the caller fails
+            // Elevations may still be live durably - surface so the caller fails
             // closed rather than reporting a successful "0 cleared" (C2).
             return std::unexpected(std::string("durable clear failed: ") + r.error().message);
         }
         std::unique_lock lock(mu_);
-        for (auto& [key, s] : sessions_) {
-            if (s.username == username) {
-                s.elevated_until = {};
-                s.elevation_issued_at = {};
-                s.steady_elevated_until = {}; // the field is_elevated reads
-            }
-        }
+        drop_cached_user_sessions_locked(username);
         return *r;
     }
     std::unique_lock lock(mu_);

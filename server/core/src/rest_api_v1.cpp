@@ -5989,6 +5989,11 @@ void RestApiV1::register_routes(
             // query failure, not a client error, so surface it as 503.
             auto result = rbac_store->unassign_role("engine", principal_id, role_name);
             if (!result) {
+                // audit_token, as on the user arm: the text can carry control bytes and spaces.
+                const auto tok = [](std::string_view v) { return audit_token(v.substr(0, 256)); };
+                spdlog::warn("engine_principal.role.unassigned store fault: principal={} role={} "
+                             "error={}",
+                             tok(principal_id), tok(role_name), tok(result.error()));
                 res.status = 503;
                 res.set_content(detail::a4_error(res, result.error()), "application/json");
                 return;
@@ -9206,9 +9211,11 @@ void RestApiV1::register_routes(
                         ->counter("yuzu_server_rbac_last_admin_guard_refused_total",
                                  {{"transport", "rest"}})
                         .increment();
+                // flatten_audit_text: a libpq error carries a trailing newline and a CONTEXT
+                // line, which would otherwise reach the audit row as extra physical lines.
                 (void)detail::emit_behavioral_audit(audit_fn, req, res, "rbac.role.unassigned",
                                                     "denied", "User", principal_id,
-                                                    result.error());
+                                                    flatten_audit_text(result.error()));
                 // RbacAdminAuthorityOwner::unassign_role refuses a role name or principal id
                 // that is not clean text with "invalid role name" / "invalid principal". This
                 // route cannot produce one today: both values come from the path regex above

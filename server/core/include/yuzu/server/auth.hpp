@@ -928,7 +928,10 @@ public:
     /// the number of sessions whose elevation was cleared. Returns `unexpected`
     /// ONLY when the durable `SessionStore` clear FAILED — the route MUST fail
     /// closed (an in-flight elevation may still be live durably; the eligibility
-    /// flip alone does not drop it). Store-less (legacy) mode never errors.
+    /// flip alone does not drop it). After a successful durable clear the user's cached
+    /// sessions are dropped (advancing the cache epoch), not zeroed in place, so a validator
+    /// that read an elevated row before the clear cannot re-cache it. Store-less (legacy) mode
+    /// never errors.
     [[nodiscard]] std::expected<int, std::string> revoke_user_elevations(const std::string& username);
 
     /// Drop THIS replica's cached copies of `username`'s sessions, in memory only, so the next

@@ -112,7 +112,7 @@ struct RbacRoleHarness {
     RbacStoreOnAuthPool rbac{auth_db.pool()};
     yuzu::test::ApprovalManagerPg appr;
     /// A real durable `SessionStore` on the SAME pool plus an `AuthManager` over it, for the
-    /// tests that need an unassign to find LIVE elevations to clear (PR-S10). Absent by default:
+    /// tests that need an unassign to find LIVE elevations to clear. Absent by default:
     /// every other user of this harness has no `session_store` schema and an Administrator
     /// unassign that succeeds is not part of its test. `use_real_sessions()` creates it.
     struct RealSessions {

@@ -1607,7 +1607,7 @@ TEST_CASE("SessionStore v3: upgrading a v2 schema keeps its rows, unbound",
     CHECK((*found)->row.mfa_bind_seq == 0);
 }
 
-// ---- session_sql in-txn lock + elevation-clear helpers (PR-S10 commit A) --------------------
+// ---- session_sql in-txn lock + elevation-clear helpers -------------------------------------
 namespace {
 
 struct InTxnClear {

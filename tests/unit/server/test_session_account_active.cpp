@@ -160,6 +160,18 @@ std::optional<yuzu::server::auth::Session> poll_and_validate(AuthManager& mgr,
     return mgr.validate_session(token);
 }
 
+// Arms `suppress_session_generation_poll_for_test` for real. The seam is voided while the
+// manager has never completed a poll (`session_gen_valid_` false): the first validate then polls
+// regardless and re-stamps the refresh clock, so a stall of a second or more would let a real
+// poll mask the defect a barrier test hunts. One throwaway validate (of a session no test
+// asserts on) completes that first poll; the suppression is applied after it.
+void warm_generation_view_then_suppress_poll(AuthManager& mgr) {
+    const auto warmup = mgr.create_local_session_for_test("poll_warmup", Role::user, false);
+    REQUIRE_FALSE(warmup.empty());
+    REQUIRE(mgr.validate_session(warmup).has_value());
+    mgr.suppress_session_generation_poll_for_test();
+}
+
 // Fixture SQL: delete a session's durable row WITHOUT the store's generation bump, so a
 // later validate can tell a cached entry (served) from an uncached one (cold read, absent).
 void delete_durable_row_silently(PgPool& pool, const std::string& token) {
@@ -1210,7 +1222,7 @@ TEST_CASE("update_role_checked answers UpdatedSessionWipeFailed when the durable
 }
 
 // ═════════════════════════════════════════════════════════════════════════════════════════════
-// Administrator unassign ends the target's live JIT elevation (PR-S10, commit C)
+// Administrator unassign ends the target's live JIT elevation
 //
 // The RbacStore clears the durable elevations in the unassign transaction; the callback wired
 // below (exactly as server.cpp wires it) drops THIS replica's cached sessions. AcctFx shares one
@@ -1382,8 +1394,7 @@ TEST_CASE("unassign Administrator: a real AuthRoutes admin gate admits the eleva
 }
 
 // ═════════════════════════════════════════════════════════════════════════════════════════════
-// A writer that stalls across an Administrator unassign cannot resurrect the elevation (PR-S10,
-// commit D)
+// A writer that stalls across an Administrator unassign cannot resurrect the elevation
 //
 // `elevate_session` and `stamp_session_mfa_proof` used to re-derive their durable RETURNING row
 // into an existing cache entry. A writer that committed and then stalled could therefore put its
@@ -1571,7 +1582,7 @@ TEST_CASE("elevate_session and the MFA stamp still show on the next validate, wh
 }
 
 TEST_CASE("revoke_elevation drops the cached session, so a validation that read the elevated row "
-          "before the clear cannot re-cache an elevated copy (g8-sec-2)",
+          "before the clear cannot re-cache an elevated copy",
           "[auth][session_store][account_active][cache_epoch][pg][unassign_elevation]") {
     // elevate_session leaves the cache cold, so revoke_elevation finds no entry to zero. A
     // validator that read the still-elevated durable row and is parked before its cache insert
@@ -1586,7 +1597,7 @@ TEST_CASE("revoke_elevation drops the cached session, so a validation that read 
     const auto token = a->create_local_session_for_test("alice", Role::user, true);
     REQUIRE_FALSE(token.empty());
     REQUIRE(a->elevate_session(token, std::chrono::seconds(300)).has_value()); // cache is cold
-    a->suppress_session_generation_poll_for_test(); // a real poll would mask the resurrection
+    warm_generation_view_then_suppress_poll(*a); // a real poll would mask the resurrection
 
     HeldValidation held;
     held.install(*a);
@@ -1596,6 +1607,53 @@ TEST_CASE("revoke_elevation drops the cached session, so a validation that read 
     const auto rev = a->revoke_elevation(token); // durable clear, then returns
     REQUIRE(rev.has_value());
     CHECK(*rev);
+
+    // The held validation is concurrent with the revoke, so what it returns is not asserted.
+    (void)held.release_and_join();
+
+    const auto s = a->validate_session(token);
+    REQUIRE(s.has_value());
+    CHECK_FALSE(yuzu::server::auth::is_elevated(*s));
+    CHECK(yuzu::server::auth::effective_role(*s) == Role::user);
+}
+
+TEST_CASE("revoke_user_elevations drops the user's cached sessions, so a validation in flight "
+          "cannot re-cache an elevated copy (cold read and cache hit)",
+          "[auth][session_store][account_active][cache_epoch][pg][unassign_elevation]") {
+    // The eligibility revoke clears every durable elevation of a user, then the local cache. A
+    // validator that copied an elevated session before the clear and is parked before its cache
+    // insert writes that copy back whenever the cache epoch is unchanged: a cold validator
+    // inserts what it read, and a cache HIT writes its copy back too. Zeroing the cached entries
+    // in place never advances the epoch, so the elevated copy would be served until the next
+    // generation poll. The poll is suppressed (after a warm-up, see the helper), so only the
+    // epoch can protect the cache.
+    YUZU_REQUIRE_PG_DB_TPL(db, sessacct_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 6}};
+    SessionStore store{pool};
+    REQUIRE(store.is_open());
+    auto a = make_mgr(store);
+
+    const auto token = a->create_local_session_for_test("alice", Role::user, true);
+    REQUIRE_FALSE(token.empty());
+    REQUIRE(a->elevate_session(token, std::chrono::seconds(300)).has_value()); // cache is cold
+    warm_generation_view_then_suppress_poll(*a);
+
+    SECTION("a cold validator that read the elevated row") {
+        // Nothing is cached for the token: the held validation reads the durable row itself.
+    }
+    SECTION("a validator that copied a cached HIT") {
+        const auto warm = a->validate_session(token); // cold read: caches the elevated copy
+        REQUIRE(warm.has_value());
+        REQUIRE(yuzu::server::auth::is_elevated(*warm));
+    }
+
+    HeldValidation held;
+    held.install(*a);
+    held.start([&] { return a->validate_session(token); });
+
+    const auto cleared = a->revoke_user_elevations("alice");
+    REQUIRE(cleared.has_value());
+    CHECK(*cleared == 1);
 
     // The held validation is concurrent with the revoke, so what it returns is not asserted.
     (void)held.release_and_join();

@@ -29275,6 +29275,11 @@ McpServer::HandlerFn McpServer::build_handler(
                 // failure, not a client error → kInternalError, not kInvalidParams.
                 auto result = rbac_store->unassign_role("engine", principal_id, role_name);
                 if (!result) {
+                    // audit_token, as on the user arm: the text can carry control bytes and spaces.
+                    const auto tok = [](std::string_view v) { return audit_token(v.substr(0, 256)); };
+                    spdlog::warn("engine_principal.role.unassigned store fault: principal={} "
+                                 "role={} error={}",
+                                 tok(principal_id), tok(role_name), tok(result.error()));
                     res.set_content(a4_error(kInternalError, result.error(), {},
                                              /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                     "application/json");
@@ -29773,8 +29778,10 @@ McpServer::HandlerFn McpServer::build_handler(
                 // only the genuine fault carries a retry hint.
                 auto result = rbac_store->unassign_role_detailed("user", principal_id, role_id);
                 if (!result) {
+                    // flatten_audit_text: a libpq error carries a trailing newline and a
+                    // CONTEXT line, which would otherwise reach the audit row as extra lines.
                     (void)audit_fn(req, "rbac.role.unassigned", "denied", "User", audit_target_id,
-                                   result.error());
+                                   flatten_audit_text(result.error()));
                     if (is_rbac_last_admin_refusal(result.error())) {
                         // retry-hint-exempt: business-rule outcome (last
                         // remaining Administrator), not a store fault.

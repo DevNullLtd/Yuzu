@@ -369,7 +369,7 @@ TEST_CASE("AuthManager+SessionStore: a durable-clear failure fails revoke CLOSED
     CHECK_FALSE(rvu.has_value());
 }
 
-// ── revoke_elevation after elevate_session (the cache is cold: adb-1) ───────────────────────
+// ── revoke_elevation after elevate_session (the cache is cold) ───────────────────────
 
 namespace {
 // Fails `SessionStore::find` (its SELECT names display_name) but not `clear_elevation`, whose
@@ -385,7 +385,7 @@ public:
 } // namespace
 
 TEST_CASE("AuthManager+SessionStore: revoke_elevation after elevate_session still clears when the "
-          "durable find is degraded (adb-1)",
+          "durable find is degraded",
           "[auth][session_store][pg][jit]") {
     // elevate_session drops the cached entry, so the /elevate audit-failure rollback calls
     // revoke_elevation cache-cold. A failing find must not stop the CLEAR: otherwise the
@@ -411,7 +411,7 @@ TEST_CASE("AuthManager+SessionStore: revoke_elevation after elevate_session stil
 
     REQUIRE(rev.has_value()); // the clear succeeded, so success even with the read degraded
     CHECK(*rev);              // was_elevated unknown: reported true because a row existed
-    // g8-sec-1: the caller is told the answer is "unknown", so it cannot audit `was_elevated=true`.
+    // The caller is told the answer is "unknown", so it cannot audit `was_elevated=true`.
     CHECK(lookup_degraded);
     auto b = make_mgr(store); // a fresh replica reads the durable row
     const auto s = b->validate_session(token);
@@ -421,7 +421,7 @@ TEST_CASE("AuthManager+SessionStore: revoke_elevation after elevate_session stil
 }
 
 TEST_CASE("AuthManager+SessionStore: revoke_elevation with BOTH the find and the clear failing "
-          "fails closed and leaves the elevation live (adb-1)",
+          "fails closed and leaves the elevation live",
           "[auth][session_store][pg][jit]") {
     YUZU_REQUIRE_PG_DB_TPL(db, authsess_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -447,7 +447,7 @@ TEST_CASE("AuthManager+SessionStore: revoke_elevation with BOTH the find and the
 }
 
 TEST_CASE("AuthManager+SessionStore: revoke_elevation after elevate_session reports was_elevated "
-          "from the durable read when it works (adb-1)",
+          "from the durable read when it works",
           "[auth][session_store][pg][jit]") {
     YUZU_REQUIRE_PG_DB_TPL(db, authsess_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};

@@ -2384,6 +2384,17 @@ RbacStore::unassign_role_detailed(const std::string& principal_type,
         // (a statement failure) rolled back and changed nothing.
         if (user_admin && !outcome.ok && outcome.err.empty())
             drop_local();
+        // The returned text below is a bare literal on this arm, so the pool's own last error is
+        // the only hint on-call gets at a lease timeout, a failed BEGIN or a lost COMMIT. It is
+        // log-only: `err` stays empty, which is what selects the local drop above.
+        if (!outcome.ok && outcome.err.empty()) {
+            const std::string pool_err = pool_.last_error();
+            spdlog::warn("RbacStore: unassign_role transaction did not complete: user={} role={} "
+                         "pool_error={}",
+                         ::yuzu::log_token(principal_id.substr(0, 256)),
+                         ::yuzu::log_token(role_name.substr(0, 256)),
+                         ::yuzu::log_token(pool_err.substr(0, 256)));
+        }
         // A store fault, not a refusal: the last-Administrator refusal returned above, and a
         // value the owner refused as not clean text is a caller mistake. Fixed literal label.
         if (metrics_ && outcome.err != "invalid role name" && outcome.err != "invalid principal")

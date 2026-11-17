@@ -1117,7 +1117,7 @@ TEST_CASE("MCP unassign_rbac_role: a genuine store fault is kInternalError with 
 }
 
 TEST_CASE("MCP unassign_rbac_role: the store-fault log line neutralises a hostile role, so it "
-          "cannot forge a field (g8-sec-3)",
+          "cannot forge a field",
           "[pg][mcp][rbac][a2]") {
     RbacRoleHarness h;
     h.make_caller_admin(/*rbac_on=*/false);
@@ -1134,7 +1134,7 @@ TEST_CASE("MCP unassign_rbac_role: the store-fault log line neutralises a hostil
     const auto prev = spdlog::default_logger();
     {
         auto lg = std::make_shared<spdlog::logger>(
-            "g8_sec_3_test", std::make_shared<spdlog::sinks::ostream_sink_mt>(oss));
+            "unassign_store_fault_log_test", std::make_shared<spdlog::sinks::ostream_sink_mt>(oss));
         lg->set_level(spdlog::level::trace);
         spdlog::set_default_logger(lg);
     }
@@ -2658,7 +2658,7 @@ TEST_CASE("MCP unassign_rbac_role: a principal_id with a control byte is refused
 }
 
 // ═════════════════════════════════════════════════════════════════════════════════════════════
-// PR-S10 commit E: an Administrator unassign that ENDS live JIT elevations says so, on both
+// An Administrator unassign that ENDS live JIT elevations says so, on both
 // transports: ` elevations_cleared=N` on the rbac.role.unassigned success row and one dedicated
 // role.elevation.revoked row, both only when N > 0. The response is unchanged. The harness's
 // real-session mode (`use_real_sessions`) supplies the elevated durable sessions.
@@ -2853,7 +2853,11 @@ TEST_CASE("unassign Administrator, forced session-store failure: the existing 50
         CHECK(res->body.find("role unassignment store fault") != std::string::npos);
     }
     fault.repair();
-    CHECK(audit_find(h, "rbac.role.unassigned", "denied", "s10e_x") != nullptr);
+    const auto* denied = audit_find(h, "rbac.role.unassigned", "denied", "s10e_x");
+    REQUIRE(denied != nullptr);
+    // The libpq text ends in a newline (and can carry a CONTEXT line): the row is one line.
+    CHECK(denied->detail.find("session row lock failed") != std::string::npos);
+    CHECK(denied->detail.find_first_of("\r\n") == std::string::npos);
     CHECK(audit_find(h, "rbac.role.unassigned", "success", "s10e_x") == nullptr);
     CHECK(audit_count(h, kElevRevoked) == 0);
     CHECK(holds_role(h, "s10e_x", "Administrator"));

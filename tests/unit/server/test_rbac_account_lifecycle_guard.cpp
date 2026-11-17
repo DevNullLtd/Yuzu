@@ -1369,7 +1369,7 @@ TEST_CASE("AuthManager lifecycle guard: concurrent session creates and deactivat
 
 // ═════════════════════════════════════════════════════════════════════════════════════════════
 // Removing a user's Administrator grant ends that user's durable JIT elevation in the SAME
-// transaction (PR-S10). The store runs in its DEFAULT durable mode here (a real SessionStore on
+// transaction. The store runs in its DEFAULT durable mode here (a real SessionStore on
 // the one pool); the oracle reads the session and generation rows raw. Not covered here: a
 // re-elevation after the unassign (`/elevate` is unchanged and stays possible).
 // ═════════════════════════════════════════════════════════════════════════════════════════════
@@ -1897,4 +1897,47 @@ TEST_CASE("unassign: only a store fault counts yuzu_server_rbac_lifecycle_store_
         CHECK(is_rbac_last_admin_refusal(refused.error()));
         CHECK(unassign_faults() == 1.0);
     }
+}
+
+TEST_CASE("unassign Administrator: an elevation write in flight on the target's session row is "
+          "waited for, and the clear then ends it (S10-15)",
+          "[pg][auth_db][lifecycle_guard][session_generation][unassign_elevation]") {
+    // `lock_user_session_rows_in_txn` exists so a writer that holds (or is about to take) a
+    // session row cannot slip an elevation past the clear that follows. A held transaction that
+    // has UPDATEd the row to an elevated state but not committed stands in for that writer (a
+    // real `set_elevation` is one autocommit statement: there is no window to park in). The
+    // unassign must block on the row lock, and once the writer commits its clear must see the
+    // committed elevation and zero it. The other ordering (the unassign takes the row lock first
+    // and the writer waits) cannot be forced from outside the transaction; the lock-before-clear
+    // order is pinned by the source-text tripwire in tests/test_session_account_gate_wiring.py.
+    // The row starts unelevated, so without the lock statement the clear's own UPDATE (which
+    // skips a zero row) would not wait: the case goes red there, at the blocked-backend wait.
+    LIFECYCLE_FIXTURE(store, auth_db);
+    yuzu::server::SessionStore sessions{auth_db.pool()};
+    REQUIRE(sessions.is_open());
+    build_world(auth_db, store, true, {{"s10_adm", Role::user, true}, {"s10_tgt", Role::user, true}});
+    REQUIRE(sessions.create(elev_params("s10-w1", "s10_tgt")).has_value()); // not elevated
+    REQUIRE(elevation_cols(auth_db.pool(), "s10_tgt") == std::vector<std::string>{"0|0"});
+
+    HeldLocks hold(auth_db.pool());
+    hold.run("UPDATE session_store.sessions SET "
+             "elevated_until_ms = (extract(epoch from now()) * 1000)::bigint + 600000, "
+             "elevation_issued_ms = (extract(epoch from now()) * 1000)::bigint "
+             "WHERE username = 's10_tgt'");
+
+    std::expected<RbacStore::UnassignResult, std::string> res = std::unexpected("not run");
+    Workers workers([&] { hold.rollback(); });
+    workers.add([&] { res = store.unassign_role_detailed("user", "s10_tgt", "Administrator"); });
+    // Parked on the writer's row lock: the unassign has neither committed nor failed.
+    REQUIRE(wait_for_blocked_backends(auth_db.dsn(), hold.pid(), 1).size() >= 1);
+    CHECK(has_grant(auth_db.pool(), "user", "s10_tgt"));
+
+    hold.commit(); // the writer's elevation lands first
+    workers.join_all();
+
+    REQUIRE(res.has_value());
+    CHECK(res->removed);
+    CHECK(res->elevations_cleared == 1);
+    CHECK_FALSE(has_grant(auth_db.pool(), "user", "s10_tgt"));
+    CHECK(elevation_cols(auth_db.pool(), "s10_tgt") == std::vector<std::string>{"0|0"});
 }

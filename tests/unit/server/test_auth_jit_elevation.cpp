@@ -25,6 +25,7 @@
 #include "test_route_sink.hpp"
 #include "../../../server/core/src/totp.hpp"
 #include "test_auth_db_pg_helper.hpp"
+#include "test_principal_lock_gate.hpp" // SqlFault
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auth_db.hpp>
 #include <yuzu/server/server.hpp>
@@ -158,7 +159,7 @@ TEST_CASE("AuthManager::elevate_session sets the window; revoke clears it", "[ji
 // ── Follow-up B: clamp to the session's absolute lifetime ──────────────────
 
 TEST_CASE("AuthManager::drop_local_sessions_of_user (store-less) zeroes that user's elevation "
-          "only (PR-S10)",
+          "only",
           "[jit][auth][unassign_elevation]") {
     auto mgr = make_temp_auth();
     mgr->upsert_user("alice", "secret123456", Role::user);
@@ -1047,6 +1048,43 @@ TEST_CASE("POST /api/v1/elevate/revoke reverts the elevation", "[pg][jit][routes
     CHECK(res->status == 200);
     CHECK(h.count_audits("role.elevation.revoked", "alice") == 1);
     CHECK_FALSE(auth::is_elevated(*h.auth_mgr.validate_session(token)));
+}
+
+TEST_CASE("POST /api/v1/elevate/revoke audits was_elevated=unknown when the session lookup degrades "
+          "after the route's own validation, and the clear still ends the elevation",
+          "[pg][jit][routes]") {
+    JitHarness h;
+    auto token = h.session_for("alice");
+    REQUIRE(h.post("/api/v1/elevate", token, R"({"justification":"x"})")->status == 200);
+
+    // The route validates (a cold read that works), then revoke_elevation looks the session up
+    // again. The pre-cache hook runs between the two: it breaks `find` (its SELECT names
+    // display_name; the clear's UPDATE does not) and drops the user's cached sessions, so the
+    // revoke finds no entry to read and its durable lookup fails while its clear succeeds.
+    yuzu::test::SqlFault read_fault{
+        h.auth_db.pool(),
+        "ALTER TABLE session_store.sessions RENAME COLUMN display_name TO display_name_gone",
+        "ALTER TABLE session_store.sessions RENAME COLUMN display_name_gone TO display_name"};
+    int hook_calls = 0;
+    h.auth_mgr.set_validate_pre_cache_hook_for_test([&] {
+        if (++hook_calls != 1)
+            return;
+        read_fault.arm();
+        h.auth_mgr.drop_local_sessions_of_user("alice");
+    });
+    const auto res = h.post("/api/v1/elevate/revoke", token, "");
+    h.auth_mgr.set_validate_pre_cache_hook_for_test(nullptr);
+    read_fault.repair();
+
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(hook_calls == 1);
+    CHECK(h.count_audits("role.elevation.revoked", "alice") == 1);
+    // Never `was_elevated=true`: with the lookup degraded the answer is unknown.
+    CHECK(h.audit_detail("role.elevation.revoked", "alice") == "was_elevated=unknown");
+    const auto after = h.auth_mgr.validate_session(token);
+    REQUIRE(after.has_value());
+    CHECK_FALSE(auth::is_elevated(*after));
 }
 
 TEST_CASE("revoking eligibility terminates an active elevation", "[pg][jit][routes]") {
