@@ -5474,9 +5474,14 @@ static const ToolDef kTools[] = {
      "component_last_confirmed_at. `totals` (instances, devices, devices_unconfirmed, as_of) is "
      "served only to a caller whose read is fleet-wide and only for an exact name (optionally one "
      "kind and one version filter or range); otherwise totals is null and totals_omitted says why "
-     "(scope | filters | building). Results are scoped to the caller's management groups and, for a "
+     "(scope | filters | building). A kind with no version filter or range is the hourly components "
+     "rollup (as_of is its refresh time; totals_omitted is building until the first refresh); any "
+     "version filter or range, or no kind, is a live count and as_of is null. Rows are the stored "
+     "inventory agents reported, not a live probe, and no agent reports components yet, so an empty "
+     "answer is expected until the component producer ships. Results are scoped to the caller's management groups and, for a "
      "service-scoped token, to that token's service-tagged devices; devices_omitted counts devices "
-     "that scope hid on a wide scope. Page with next_cursor passed back as cursor; a malformed "
+     "that scope hid on a wide scope. Page with next_cursor passed back as cursor; on a wide scope a "
+     "page can be empty with a non-null next_cursor, so keep paging until it is null; a malformed "
      "cursor, or one issued for a different filter set, is refused. Input is strict: an unknown "
      "key, a wrongly typed value, an over-long string or an out-of-range limit is refused (the "
      "REST twin clamps); there is no format argument, the CSV export stays on REST. A degraded rows, "
@@ -20409,8 +20414,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 const auto read = software_sync_status_fn_(execution_id);
-                const bool unfiltered =
-                    software_sync_unfiltered_fn_ && software_sync_unfiltered_fn_(*session);
+                const bool unfiltered = read && software_sync_unfiltered_fn_ &&
+                                        software_sync_unfiltered_fn_(*session);
                 const bool owned = read && *read && execution_owner_key(*session).owns(**read);
                 const auto status = ss::sync_status(read, owned, unfiltered);
                 if (!status) {

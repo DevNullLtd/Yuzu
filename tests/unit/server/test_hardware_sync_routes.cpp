@@ -70,6 +70,7 @@ struct SyncHarness {
     std::vector<Execution> executions;
     bool tracker_degraded = false;
     bool status_unfiltered = false;
+    int unfiltered_calls = 0;
 
     // Observations, in call order, so a test can pin audit-BEFORE-dispatch.
     std::vector<std::string> events;
@@ -206,7 +207,10 @@ struct SyncHarness {
                         return std::optional<Execution>(e);
                 return std::optional<Execution>{};
             };
-            deps.sync_unfiltered_fn = [this](const auth::Session&) { return status_unfiltered; };
+            deps.sync_unfiltered_fn = [this](const auth::Session&) {
+                ++unfiltered_calls;
+                return status_unfiltered;
+            };
         }
         deps.write_gate.resolve_session = [this](const httplib::Request&) {
             auth::Session s;
@@ -1052,6 +1056,15 @@ TEST_CASE("sync status: a caller without Execution:Execute is refused; an unwire
         REQUIRE(res);
         CHECK(res->status == 503);
         CHECK(parse(res->body)["error"]["retry_after_ms"].get<int>() > 0);
+        CHECK(h.unfiltered_calls == 0); // the 503 is decided by the read; no RBAC work is spent on it
+    }
+    {
+        // An unknown id still evaluates the unfiltered callback once, so it costs the same as
+        // another caller's run and the not-found answers stay indistinguishable.
+        SyncHarness h;
+        auto res = h.status_of("exec-404");
+        REQUIRE(res);
+        CHECK(h.unfiltered_calls == 1);
     }
     {
         SyncWiring w;

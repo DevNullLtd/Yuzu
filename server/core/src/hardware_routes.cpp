@@ -698,7 +698,8 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
         const auto read = deps_.sync_status_fn(req.matches[1].str());
-        const bool unfiltered = deps_.sync_unfiltered_fn && deps_.sync_unfiltered_fn(*session);
+        const bool unfiltered =
+            read && deps_.sync_unfiltered_fn && deps_.sync_unfiltered_fn(*session);
         // Visibility and the body are software_sync::sync_status's, the same function the MCP
         // tool get_software_sync_status calls.
         const bool owned = read && *read && execution_owner_key(*session).owns(**read);

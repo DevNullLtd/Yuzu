@@ -58012,6 +58012,7 @@ struct Sam21Status {
     bool degraded{false};
     bool unfiltered{false};
     int reads{0};
+    int unfiltered_calls{0};
     void wire(McpTestServer& ts) {
         ts.software_sync_status_fn_for_test =
             [this](const std::string& id)
@@ -58025,6 +58026,7 @@ struct Sam21Status {
             return std::optional<yuzu::server::Execution>{};
         };
         ts.software_sync_unfiltered_fn_for_test = [this](const yuzu::server::auth::Session&) {
+            ++unfiltered_calls;
             return unfiltered;
         };
     }
@@ -58614,6 +58616,17 @@ TEST_CASE("MCP get_software_sync_status: a tracker failure is retryable; an unwi
         REQUIRE(r.contains("error"));
         CHECK(r["error"]["code"] == yuzu::server::mcp::kInternalError);
         CHECK(r["error"]["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpStoreFaultRetryMs);
+        CHECK(rig.unfiltered_calls == 0); // the failed read decides the answer; no RBAC work
+    }
+    {
+        // An unknown id still evaluates the unfiltered callback once, as another caller's run does.
+        Sam21Status rig;
+        McpTestServer ts;
+        rig.wire(ts);
+        ts.start("operator");
+        const auto r = mcp_tool_call(ts, "get_software_sync_status", R"({"execution_id":"exec-404"})");
+        REQUIRE(r.contains("error"));
+        CHECK(rig.unfiltered_calls == 1);
     }
     {
         McpTestServer ts; // no tracker closures wired: wired once at construction, so permanent
