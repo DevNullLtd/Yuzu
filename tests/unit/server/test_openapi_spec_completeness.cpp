@@ -381,6 +381,30 @@ TEST_CASE("openapi_spec_json(): info.description states the cookie-session same-
                            "server state") != std::string::npos);
 }
 
+// #7730: the collation gate's client-visible rules are in the spec, not only the manual. Kills a
+// description edit that drops the restart-the-walk rule, the refused confirm read, or the
+// `details.write_paused` of the paused-decommission 500.
+TEST_CASE("openapi_spec_json(): GET /hardware-ci and DELETE /sle/agents state the collation gate rules",
+          "[openapi]") {
+    json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    const json& get = spec["paths"]["/hardware-ci"]["get"];
+    const std::string d = get["description"].get<std::string>();
+    CHECK(d.find("RESTART the walk from the first page once the read is served again") !=
+          std::string::npos);
+    CHECK(d.find("do not resume the old cursor") != std::string::npos);
+    CHECK(d.find("the ?agent_id=<id> confirm read too") != std::string::npos);
+    const std::string r503 = get["responses"]["503"]["description"].get<std::string>();
+    CHECK(r503.find("restart the walk from the first page") != std::string::npos);
+    CHECK(r503.find("confirm read is refused with this same 503") != std::string::npos);
+
+    const std::string r500 =
+        spec["paths"]["/sle/agents/{agent_id}"]["delete"]["responses"]["500"]["description"]
+            .get<std::string>();
+    CHECK(r500.find("error.details.write_paused") != std::string::npos);
+    CHECK(r500.find("retry_after_ms is 60000") != std::string::npos);
+}
+
 TEST_CASE("openapi_spec_json(): the strict instruction create requests are closed schemas",
           "[openapi]") {
     // The routes refuse an unknown key (build_*_from_*_body), so a schema that omits
@@ -2045,7 +2069,7 @@ TEST_CASE("openapi documents: every operation has a unique, well-formed and pinn
     // docs/user-manual/upgrading.md and in the change's changelog fragment. The count is
     // derived from the document (it is the number of operations); the one hand-kept number
     // for it lives in the typed-response test's exclusion list, not here.
-    static const std::string kOperationIdChecksum = "\"dda20e54896932cc\"";
+    static const std::string kOperationIdChecksum = "\"99bd30518cc89f26\"";
     static const std::regex kShape("^[a-z][A-Za-z0-9]*$");
     for (const bool with_guides : {false, true}) {
         INFO("form: " << form_name(with_guides));

@@ -135,6 +135,7 @@
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 #include "pg/secret_codec.hpp"
+#include "device_ci_read_gate.hpp"
 #include "device_inventory_store.hpp"
 #include "software_inventory_store.hpp"
 #include "software_licensing_store.hpp"
@@ -254,8 +255,10 @@
 #include "device_estate_routes.hpp"
 #include "hardware_routes.hpp"
 #include "hardware_section_integrity.hpp"
+#include "collection_settings_push.hpp"
 #include "software_collection_settings_routes.hpp"
 #include "software_collection_settings_store.hpp"
+#include "software_lifecycle_routes.hpp"
 #include "software_lifecycle_store.hpp"
 #include "software_curation_routes.hpp"
 #include "home_routes.hpp" // Dashboard summary fragment (readout, attention, estate) over injected seams
@@ -2009,7 +2012,7 @@ public:
 
         // #3402: the internal pushes that deliberately BYPASS that gate, seeded
         // across the full capability x result product. Every combination is
-        // reachable — each of the four pushes can fail at the registry seam —
+        // reachable — each of the five pushes can fail at the registry seam —
         // so unlike the per-route targeting seed above, the product is honest
         // here rather than publishing series no code path can produce.
         // `undelivered` at zero is the point: it is the value an operator needs
@@ -2307,7 +2310,8 @@ public:
         metrics_.describe(pg::kCollationCheckCounter,
                           "Total PostgreSQL collation version checks by result (ok, mismatch, "
                           "not_applicable, unreadable); unreadable means the facts could not be "
-                          "read or the operating system reported no version",
+                          "read, the operating system reported no version, or the versions are "
+                          "equal while an invalid index exists in the device inventory schema",
                           "counter");
         metrics_.describe(
             pg::kCollationLastCompletedGauge,
@@ -2319,6 +2323,16 @@ public:
         // Pre-seeded so every result reads 0, not absent, before it first happens
         // (docs/observability-conventions.md): the closed set is pg::all_collation_verdicts().
         pg::seed_collation_metrics(metrics_);
+        // device_ci write pause (a collation mismatch): one increment per refused write. Closed
+        // `op` set, both series pre-seeded so an idle server reads 0, not absent.
+        metrics_.describe("yuzu_device_ci_writes_deferred_total",
+                          "device_ci writes refused because the PostgreSQL collation gate reads "
+                          "mismatch, by op (ingest = a report answered need_full without being "
+                          "stored, delete = a decommission removal not attempted); a sustained "
+                          "rate means device_ci is paused until the collation is repaired",
+                          "counter");
+        for (const auto op : {"ingest", "delete"})
+            metrics_.counter("yuzu_device_ci_writes_deferred_total", {{"op", op}});
         // HA WS-8 (ADR-2002 §12): the runtime reachability probe behind /readyz.
         metrics_.describe("yuzu_server_pg_reachable",
                           "1 when this replica's dedicated reachability probe can reach a writable "
@@ -2352,8 +2366,10 @@ public:
         metrics_.describe("yuzu_inventory_ingest_total",
                           "Inventory-report ingest outcomes by source and outcome "
                           "(stored/touched/need_full/error/dropped/rejected/rejected_depth; deferred = "
-                          "a report skipped because another report for the same agent held its "
-                          "lock, certificate_inventory only - not a failure)",
+                          "a report skipped without being read or written, not a failure: for "
+                          "certificate_inventory because another report for the same agent held "
+                          "its lock, for device_ci because device_ci writes are paused by a "
+                          "PostgreSQL collation mismatch and the agent was told to resend)",
                           "counter");
         // Closed facet x outcome label set, pre-seeded so the first refused section counts.
         seed_section_ingest_series(metrics_);
@@ -5710,7 +5726,9 @@ public:
                 // The probe lease is released here. At start, before any store serves: compare the
                 // database's recorded collation version with the operating system's. Never stops
                 // the server (logs, exports yuzu_pg_collation_version_mismatch), so an operator can
-                // start it to fix the database; a failed check does not either. It gates nothing.
+                // start it to fix the database; a failed check does not either. It does publish
+                // collation_gate_ (pg_collation_check.hpp), which pauses device_ci writes on a
+                // mismatch and refuses the CI reads until a check has found a match.
                 // Like every query this constructor runs before the listener binds, it has no
                 // client-side deadline against a backend that is frozen while its connection keeps
                 // acknowledging data (the 5 s bounds are the pool acquire and server-side
@@ -5720,7 +5738,7 @@ public:
                 // this call leaves in collation_state_. See pg/pg_collation_check.hpp.
                 if (pg_probe_ok)
                     pg::report_collation_check(pg::check_collation_version(*pg_pool_), &metrics_,
-                                               collation_state_);
+                                               collation_state_, &collation_gate_);
             }
         }
 
@@ -8785,6 +8803,9 @@ public:
                 startup_failed_ = true;
             } else {
                 device_inventory_store_->set_metrics(&metrics_);
+                // Pause device_ci writes while the collation gate reads Mismatch. collation_gate_
+                // is declared before every store, so it outlives this borrow.
+                device_inventory_store_->set_write_gate(&collation_gate_);
                 agent_service_.set_device_inventory_store(device_inventory_store_.get());
                 if (gateway_service_)
                     gateway_service_->set_device_inventory_store(device_inventory_store_.get());
@@ -8961,6 +8982,123 @@ public:
                               "created/opened)");
                 startup_failed_ = true;
             }
+        }
+
+        // SAM-39: heartbeat-driven delivery of the effective software collection settings. Built
+        // here because it borrows three stores constructed above; installed on the heartbeat path
+        // before any listener opens, cleared (and reset) in stop() ahead of those stores. There is
+        // no push-on-save and no job: an agent that reports a different version in its heartbeat is
+        // sent the document that applies to it. All state is in memory and rebuilt from heartbeats.
+        // The three stores are fail-closed (a store that cannot open sets startup_failed_ and the
+        // server refuses to serve), so the pusher exists on every server that serves.
+        if (heartbeat_ingestion_ && software_collection_settings_store_ &&
+            software_collection_settings_store_->is_open() && mgmt_group_store_ &&
+            mgmt_group_store_->is_open() && plugin_config_store_ &&
+            plugin_config_store_->is_open() && !startup_failed_) {
+            namespace cset = yuzu::server::collection_settings;
+            metrics_.describe("yuzu_server_inventory_settings_push_total",
+                              "Heartbeat-driven collection settings pushes by result: sent (the "
+                              "frame was accepted; for a gateway-attached agent that is a queue, "
+                              "not a delivery), undelivered (it was not), suppressed (the same "
+                              "version was already sent to the agent inside the re-push gap)",
+                              "counter");
+            for (const auto result : {"sent", "undelivered", "suppressed"})
+                metrics_.counter("yuzu_server_inventory_settings_push_total",
+                                 {{"result", result}});
+            metrics_.describe("yuzu_server_inventory_settings_push_degrade_total",
+                              "Collection settings pushes skipped because a read degraded, by "
+                              "reason: snapshot (documents, group tree or kill switches), "
+                              "membership (the agent's groups) or resolve. Nothing is sent for "
+                              "the agent and the previous snapshot keeps serving",
+                              "counter");
+            for (const auto reason : {"snapshot", "membership", "resolve"})
+                metrics_.counter("yuzu_server_inventory_settings_push_degrade_total",
+                                 {{"reason", reason}});
+            metrics_.describe("yuzu_server_inventory_settings_reconcile_exceptions_total",
+                              "Inventory settings reconcile hook calls that threw into the "
+                              "heartbeat handler (caught there, logged and counted; the rest of "
+                              "heartbeat ingestion continues)",
+                              "counter");
+            metrics_.counter("yuzu_server_inventory_settings_reconcile_exceptions_total");
+
+            cset::CollectionSettingsPusher::Deps deps;
+            deps.read_docs = [this]() -> std::optional<std::vector<cset::StoredDocument>> {
+                auto docs = software_collection_settings_store_->list_all();
+                if (!docs)
+                    return std::nullopt;
+                return std::move(*docs);
+            };
+            deps.read_tree = [this]() -> std::optional<std::vector<cset::GroupNode>> {
+                const auto groups = mgmt_group_store_->list_groups_checked();
+                if (!groups)
+                    return std::nullopt;
+                std::vector<cset::GroupNode> tree;
+                tree.reserve(groups->size());
+                for (const auto& g : *groups)
+                    tree.push_back(cset::GroupNode{g.id, g.parent_id, g.created_at});
+                return tree;
+            };
+            deps.read_killed = [this]() -> std::optional<std::map<std::string, bool>> {
+                std::map<std::string, bool> killed;
+                for (const auto p : cset::kCollectionPlugins) {
+                    const auto ks = plugin_config_store_->get_kill_switch(p, "");
+                    if (!ks) // a degraded read must never read as every collector off
+                        return std::nullopt;
+                    killed[std::string{p}] = !ks->enabled;
+                }
+                return killed;
+            };
+            deps.read_membership =
+                [this](const std::string& agent_id) -> std::optional<std::vector<std::string>> {
+                return mgmt_group_store_->get_agent_groups(agent_id);
+            };
+            deps.now = [] {
+                return std::chrono::duration_cast<std::chrono::seconds>(
+                           std::chrono::system_clock::now().time_since_epoch())
+                    .count();
+            };
+            // The Guardian-push shape: build_classified_command(system) + send_system_reserved +
+            // forward_gateway_pending, NOT dispatch_confined (`__sync__` is a protocol name no
+            // agent advertises as a plugin). `__sync__.settings` is system_reserved, so no RBAC
+            // principal is consulted.
+            deps.send = [this](const std::string& agent_id, const std::string& version,
+                               const std::string& document) -> bool {
+                const auto now_s = std::chrono::duration_cast<std::chrono::seconds>(
+                                       std::chrono::system_clock::now().time_since_epoch())
+                                       .count();
+                const std::string command_id =
+                    "__sync__-settings-" + std::to_string(now_s) + "-" +
+                    auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8));
+                auto classified = build_classified_command(
+                    yuzu::server::DispatchCaller{.system = true}, "__sync__", "settings",
+                    command_id, /*parameters=*/{{"version", version}, {"document", document}});
+                if (classified &&
+                    send_system_reserved(
+                        agent_id, *classified,
+                        yuzu::server::SystemReservedPush::inventory_settings_push)) {
+                    forward_gateway_pending(); // gateway agents are only QUEUED
+                    return true;
+                }
+                return false;
+            };
+            deps.on_degrade = [this](std::string_view reason) {
+                metrics_
+                    .counter("yuzu_server_inventory_settings_push_degrade_total",
+                             {{"reason", std::string{reason}}})
+                    .increment();
+            };
+            deps.on_result = [this](std::string_view result) {
+                metrics_
+                    .counter("yuzu_server_inventory_settings_push_total",
+                             {{"result", std::string{result}}})
+                    .increment();
+            };
+            inventory_settings_pusher_ =
+                std::make_unique<cset::CollectionSettingsPusher>(std::move(deps));
+            heartbeat_ingestion_->set_inventory_settings_reconcile_fn(
+                [this](const std::string& agent_id, const std::string& tag) {
+                    inventory_settings_pusher_->on_heartbeat(agent_id, tag);
+                });
         }
 
         // Fleet-aggregate app-perf projection (B2) + its roll-up query owner — the
@@ -9862,18 +10000,27 @@ public:
                     pg_collation_recheck_ = std::make_unique<PgCollationRecheck>(
                         [this] { return pg::check_collation_version(*pg_pool_); }, &metrics_,
                         kCollationRecheckInterval, collation_state_,
-                        kCollationUnsettledRecheckInterval);
+                        kCollationUnsettledRecheckInterval, &collation_gate_);
                     // The repeat is optional (the start-time check has already reported), so a
                     // refusal to create its thread (a task or thread limit) degrades instead of
-                    // failing the boot: the check only reports. Without the repeat the last-
-                    // completed gauge stops advancing and YuzuPgCollationCheckStale fires.
+                    // failing the boot: the check does not stop the server. Without the repeat the
+                    // last-completed gauge stops advancing and YuzuPgCollationCheckStale fires,
+                    // and collation_gate_ keeps the value the start-time check left. That is not
+                    // harmless: nothing will ever lift the gate, so a Mismatch or Unproven gate
+                    // stays until a restart, with device_ci writes paused (Mismatch) and the CI
+                    // reads refused (either). Hence ERROR, not warn. No retry is attempted.
                     try {
                         pg_collation_recheck_->start();
                     } catch (const std::exception& e) {
-                        spdlog::warn("[PG] could not start the collation version recheck thread "
-                                     "(continuing with the start-time check only; the repeat will "
-                                     "not run): {}",
-                                     ::yuzu::log_key_token(e.what()));
+                        spdlog::error(
+                            "[PG] could not start the collation version recheck thread ({}); the "
+                            "collation gate will NOT be rechecked: a Mismatch or Unproven gate "
+                            "stays until this server restarts, so device_ci writes stay paused "
+                            "(Mismatch) and the device CI reads stay refused (Mismatch or "
+                            "Unproven) until then. Restart this server once the thread or task "
+                            "limit is fixed. See docs/user-manual/server-admin.md, 'PostgreSQL "
+                            "collation version'. The server keeps running.",
+                            ::yuzu::log_key_token(e.what()));
                         pg_collation_recheck_.reset();
                     }
                 }
@@ -11505,7 +11652,7 @@ public:
             if (software_normalization_job_)
                 software_normalization_job_->request_stop();
             // The collation recheck is told to stop here too, without a join: a check in flight can
-            // take about 15 s in practice (up to about 35 s on a network that drops packets, see the join
+            // take about 20 s in practice (up to about 40 s on a network that drops packets, see the join
             // below) and signalled now it overlaps the drain and the web server stop instead of
             // being added after them. Its join is the LAST step before pg_pool_ is reset.
             if (pg_collation_recheck_)
@@ -12076,6 +12223,12 @@ public:
         if (heartbeat_ingestion_)
             heartbeat_ingestion_->set_quarantine_reconcile_fn(nullptr);
         quarantine_reconciler_.reset();
+        // SAM-39: same discipline - clear the heartbeat-side caller (its exclusive lock waits out
+        // an in-flight call) before dropping the pusher, which in turn goes ahead of the
+        // collection settings, management group and plugin config stores it borrows.
+        if (heartbeat_ingestion_)
+            heartbeat_ingestion_->set_inventory_settings_reconcile_fn(nullptr);
+        inventory_settings_pusher_.reset();
         // UpdateRegistry (ADR-0061) borrows pg_pool_ — same discipline: null the
         // borrowed raw pointer in agent_service_'s OTA gRPC handlers
         // (CheckForUpdate/DownloadUpdate) before dropping it, then drop before
@@ -12839,9 +12992,9 @@ public:
         // flush above (an orchestrator kill during the wait would skip them). request_stop() was
         // called at the start of the drain, so the check has been running alongside the drain and
         // the rest of teardown; the join waits only for what is left of it. With the pool defaults
-        // that is about 15 s in practice (the 5 s acquire and two 5 s statements,
+        // that is about 20 s in practice (the 5 s acquire and up to three 5 s statements,
         // pg_collation_check.hpp; the BEGIN and SET LOCAL before them run under the pool's 30 s
-        // statement timeout and normally return at once), up to about 35 s if the network drops packets (a new connection
+        // statement timeout and normally return at once), up to about 40 s if the network drops packets (a new connection
         // adds the pool's 10 s connect timeout and a silent connection is given up on by
         // tcp_user_timeout_ms, 10 s by default, which statement_timeout cannot enforce;
         // pg_pool.hpp). It is NOT bounded against a backend that is frozen while its connection
@@ -21008,8 +21161,14 @@ private:
             // regardless) - mirrors the Hardware CI record's CiDetailFn contract.
             // KNOWN FOLLOW-UP (#1783): the read is still up to roster-size rows per render, unlike
             // the Software tab's hourly rollup (software_catalog_rollup.cpp).
+            // The collation gate (device_ci_read_gate.hpp): while it is not Trusted the keyed read
+            // would answer by the text primary key and miss stored devices, so it is not made and
+            // the columns degrade (`ci_degraded`), exactly as for a failed read.
             apply_ci_read(result, device_inventory_store_
-                                      ? CiKeyedReadFn{[this](const std::vector<std::string>& ids) {
+                                      ? CiKeyedReadFn{[this](const std::vector<std::string>& ids)
+                                                          -> std::optional<std::vector<DeviceCiRecord>> {
+                                            if (device_ci_read_gate::refuses(&collation_gate_))
+                                                return std::nullopt;
                                             return device_inventory_store_->list_device_ci_for(ids);
                                         }}
                                       : CiKeyedReadFn{});
@@ -21091,7 +21250,10 @@ private:
             apply_identity_read(detail, hw_identity_fn(agent_id));
             if (auto sess = registry_.get_session(agent_id))
                 detail.agent_version = sess->agent_version; // immutable identity field, lock-free
-            if (!device_inventory_store_) {
+            // An unwired store, or a collation gate that is not Trusted (device_ci_read_gate.hpp:
+            // the by-id read would miss a stored device), degrades `ci` before either store method
+            // is named; no sections read is made, so the record answers `degraded`, not `absent`.
+            if (!device_inventory_store_ || device_ci_read_gate::refuses(&collation_gate_)) {
                 detail.ci = std::unexpected(CiReadError::kDegraded);
             } else if (ci_read == CiRead::WithSections) {
                 // The v2 per-section statuses and rows (H.7): ONLY the REST record route and the
@@ -21380,6 +21542,7 @@ private:
                              .roster_fn = build_hw_roster,
                              .ci_detail_fn = hw_ci_detail_fn,
                              .ci_page_reader = hw_ci_page_reader,
+                             .ci_collation_gate = &collation_gate_,
                              // Actions lens (generic action runner): the connected
                              // agent's advertised plugins/actions, copied into the
                              // gRPC-free HwPluginActions shape.
@@ -21553,6 +21716,23 @@ private:
                     .store = software_collection_settings_store_.get(),
                     .mgmt_store = mgmt_group_store_.get(),
                     .plugin_config_store = plugin_config_store_.get(),
+                });
+        }
+
+        // Imported software lifecycle rules REST (SAM-24): import, list and clear. Registered
+        // here, ahead of rest_api_v1_->register_routes, for the same reason as the routes above
+        // (the generic GET /api/v1/inventory/{a}/{b} would take the bare path's neighbours). The
+        // routes borrow software_lifecycle_store_ only; stop() joins the web thread ahead of
+        // resetting it, and the class holds no state of its own. A null or closed store answers
+        // 503 on every route.
+        {
+            HttplibRouteSink lifecycle_rules_sink{*web_server_};
+            SoftwareLifecycleRoutes{}.register_routes(
+                lifecycle_rules_sink,
+                SoftwareLifecycleRoutes::Deps{
+                    .perm_fn = perm_fn,
+                    .audit_fn = audit_fn,
+                    .store = software_lifecycle_store_.get(),
                 });
         }
 
@@ -24337,6 +24517,7 @@ private:
             tool_deps.roster_fn = build_hw_roster;
             tool_deps.ci_detail_fn = hw_ci_detail_fn;
             tool_deps.ci_page_reader = hw_ci_page_reader;
+            tool_deps.ci_collation_gate = &collation_gate_;
             tool_deps.dex_score_fn = hw_dex_score_fn;
             tool_deps.quarantine_list_fn = hw_quarantine_list_fn;
             // /crypto widgets: list_crypto_widgets' availability, get_crypto_ca_stats' R2
@@ -25244,6 +25425,14 @@ private:
     /// every Postgres-backed store (declared later) releases its PgPool& and
     /// every ingest thread (agent_service_, declared later) has already stopped.
     std::unique_ptr<pg::PgPool> pg_pool_;
+    /// The collation gate the check publishes (lock-free). Declared right after pg_pool_ and
+    /// BEFORE every borrower on purpose, so it is destroyed after all of them. The borrowers are:
+    /// `device_inventory_store_` (`set_write_gate`, the write pause), `pg_collation_recheck_` (the
+    /// publisher, handed `&collation_gate_`), `hardware_routes_` (`Deps::ci_collation_gate` plus
+    /// the roster and per-id closures that read it) and `mcp_server_` (`ToolDeps::ci_collation_gate`
+    /// plus the same closures). The initialiser is `kInitialCollationGate` (Unproven), never
+    /// Trusted. tests/test_pg_collation_check_wiring_lexical.py pins the order and the initialiser.
+    std::atomic<pg::CollationGate> collation_gate_{pg::kInitialCollationGate};
     detail::EventBus event_bus_;
     detail::AgentRegistry registry_;
     /// Fleet health aggregation (heartbeat status_tags -> yuzu_fleet_* gauges, and the per-device
@@ -25961,6 +26150,10 @@ private:
     // module's evaluator writes it, out-of-server).
     std::unique_ptr<ProductRegistryStore> product_registry_store_;
     std::unique_ptr<SoftwareCollectionSettingsStore> software_collection_settings_store_;
+    // SAM-39: borrows software_collection_settings_store_, mgmt_group_store_ and plugin_config_store_
+    // (declared above, so it destructs first); stop() clears its heartbeat hook and resets it first.
+    std::unique_ptr<yuzu::server::collection_settings::CollectionSettingsPusher>
+        inventory_settings_pusher_;
     // SAM-23 software lifecycle rules + host-declared facts. Declared after pg_pool_ so it
     // destructs before the pool; no route or job reads it yet (only /readyz borrows it).
     std::unique_ptr<SoftwareLifecycleStore> software_lifecycle_store_;

@@ -793,8 +793,8 @@ by each handler.
   class (`kPendingRuling`) for routes whose classification is still being
   decided, which the chokepoint treats as exempt: 73 REST rows today, a count
   pinned in a `static_assert` (`kPendingRulingMax`) that can only shrink. The
-  table has 259 mutating REST rows: 39 `kRequired`, 2 `kFactorCredential`, 3 `kOwnGate`,
-  142 `kExempt` and 73 `kPendingRuling`.
+  table has 261 mutating REST rows: 39 `kRequired`, 2 `kFactorCredential`, 3 `kOwnGate`,
+  144 `kExempt` and 73 `kPendingRuling`.
 - **Where it runs.** In `run_post_read_stage` (`step_up_wiring.hpp`), the
   body of the post-read stage `server.cpp` installs through
   `PostReadStageRegistry` and the route sink runs in front of every handler

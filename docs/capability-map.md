@@ -1564,7 +1564,7 @@ REST parity for the live-snapshot surface — though the REST live read (`POST /
 
 ### 35.1 Sync Framework :white_check_mark: `T2` *(verified 2026-09-07)*
 
-`SyncScheduler` (`agents/core/src/sync_scheduler.{hpp,cpp}`) + `LocalDispatcher` (`local_dispatcher.cpp`) — stable per-agent phase spread, hash-skip when unchanged, server `need_full` resend. Shared ingestion seam wired identically on the direct and gateway paths. All confirmed compiled in `agents/core/meson.build`.
+`SyncScheduler` (`agents/core/src/sync_scheduler.{hpp,cpp}`) + `LocalDispatcher` (`local_dispatcher.cpp`) — stable per-agent phase spread, hash-skip when unchanged, server `need_full` resend. Shared ingestion seam wired identically on the direct and gateway paths. All confirmed compiled in `agents/core/meson.build`. Saved per-management-group collection settings reach agents through the heartbeat reconcile (`server/core/src/collection_settings_push.{hpp,cpp}`, the `__sync__.settings` command applied by `agents/core/src/collection_settings_agent.hpp`); there is no push on save, and a named time zone is applied in machine-local time. Docs: `docs/user-manual/inventory.md`, "How saved settings reach machines".
 
 ### 35.2 Installed-Software Inventory :white_check_mark: `T2` *(verified 2026-09-07)*
 

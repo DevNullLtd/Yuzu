@@ -15,6 +15,7 @@
 
 #include "device_inventory_store.hpp" // DeviceCiRecord
 
+#include <functional>
 #include <string>
 
 namespace yuzu::agent::v1 {
@@ -56,5 +57,21 @@ void ingest_device_ci_report(DeviceInventoryStore& store, const std::string& age
                              const ::yuzu::agent::v1::InventoryReport& report,
                              ::yuzu::agent::v1::InventoryAck& ack,
                              ::yuzu::MetricsRegistry* metrics = nullptr);
+
+/// The outcome counter of one ingest call, as a callable: `outcome` is the `outcome` label of
+/// `yuzu_inventory_ingest_total{source="device_ci"}`.
+using IngestOutcomeEmitFn = std::function<void(const char* outcome)>;
+
+/// `ingest_device_ci_report` with the outcome counter injected, so a test can make it throw and
+/// prove that every need_full nack is appended BEFORE any telemetry runs (a throw out of the
+/// seam is caught by `ReportInventory`, which then acks; a nack added after the telemetry would
+/// be lost and the agent would advance as if the report had been stored). `metrics` still
+/// receives the apply-duration histogram. Production calls `ingest_device_ci_report`, which
+/// builds the counter from `metrics`.
+void ingest_device_ci_report_with_emit(DeviceInventoryStore& store, const std::string& agent_id,
+                                       const ::yuzu::agent::v1::InventoryReport& report,
+                                       ::yuzu::agent::v1::InventoryAck& ack,
+                                       ::yuzu::MetricsRegistry* metrics,
+                                       const IngestOutcomeEmitFn& emit);
 
 } // namespace yuzu::server
