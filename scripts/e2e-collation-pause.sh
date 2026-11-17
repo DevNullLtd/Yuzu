@@ -29,8 +29,12 @@
 # Needs a PostgreSQL superuser (to force the mismatch and to create its own throwaway database) and
 # takes about two minutes. Required environment:
 #   YUZU_E2E_PG_DSN   libpq keyword/value DSN of a superuser on the cluster, WITHOUT dbname
-#                     (e.g. "host=127.0.0.1 port=5432 user=postgres password=..."). Falls back
-#                     to YUZU_TEST_POSTGRES_DSN, whose own dbname (if any) is removed.
+#                     (e.g. "host=127.0.0.1 port=5432 user=postgres password=..."). There is
+#                     deliberately NO fallback to YUZU_TEST_POSTGRES_DSN: that DSN usually names the
+#                     shared unit-test cluster, and this script creates and drops a database on
+#                     whatever it is given. A dbname in the DSN is ignored (the script picks its
+#                     own). The DSN is never put on a command line (visible to `ps`): the server
+#                     gets it through YUZU_POSTGRES_DSN and psql through a 0600 service file.
 # Optional environment:
 #   YUZU_SERVER_BIN   path to yuzu-server (default: build-linux/server/core/yuzu-server)
 #   YUZU_E2E_PSQL     command that runs psql against that cluster as the superuser, accepting extra
@@ -38,17 +42,22 @@
 #                     installed on the host, e.g. YUZU_E2E_PSQL="docker exec -i <container> psql -U postgres".
 #                     The script appends -d <database> itself.
 #
-# Never point it at a shared or production cluster: it creates and drops a database named
-# yuzu_e2e_coll_<pid> and forces a (harmless but alarming) mismatch on it. Start a throwaway one:
+# On any abort the work directory (server logs) is kept and its path printed; the throwaway database
+# is dropped only if this run created it. Never point it at a shared or production cluster: it
+# creates and drops a database named yuzu_e2e_coll_<pid> and forces a (harmless but alarming) mismatch on it. Start a throwaway one:
 #   docker run -d --name yuzu_e2e_coll_pg -e POSTGRES_PASSWORD=pw -p 127.0.0.1:<port>:5432 postgres:18.4-bookworm
 set -euo pipefail
 
-: "${YUZU_E2E_PG_DSN:=${YUZU_TEST_POSTGRES_DSN:-}}"
-: "${YUZU_E2E_PG_DSN:?set YUZU_E2E_PG_DSN (or YUZU_TEST_POSTGRES_DSN) to a superuser DSN on a throwaway cluster}"
+: "${YUZU_E2E_PG_DSN:?set YUZU_E2E_PG_DSN to a superuser DSN on a throwaway cluster (YUZU_TEST_POSTGRES_DSN is deliberately not used as a fallback)}"
 # The script picks the database itself: drop any dbname the caller's DSN carries.
 YUZU_E2E_PG_DSN="$(sed -E 's/(^| )dbname=[^ ]+//g' <<< "$YUZU_E2E_PG_DSN")"
 BIN="${YUZU_SERVER_BIN:-build-linux/server/core/yuzu-server}"
 [ -x "$BIN" ] || { echo "FAIL: $BIN is not executable" >&2; exit 1; }
+# psql needs either the YUZU_E2E_PSQL wrapper or a local psql.
+if [ -z "${YUZU_E2E_PSQL:-}" ] && ! command -v psql >/dev/null; then
+    echo "FAIL: psql is not installed; set YUZU_E2E_PSQL (for example \"docker exec -i <container> psql -U postgres\")" >&2
+    exit 1
+fi
 for tool in curl jq python3; do
     command -v "$tool" >/dev/null || { echo "FAIL: $tool is required" >&2; exit 1; }
 done
@@ -56,6 +65,7 @@ done
 DB="yuzu_e2e_coll_$$"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/yuzu_e2e_coll.XXXXXX")"
 SERVER_PID=""
+DB_CREATED=0  # set to 1 only after CREATE DATABASE succeeded: the cleanup never drops anything else
 PASS=0
 FAILS=0
 
@@ -67,7 +77,8 @@ psql_on() {
         # shellcheck disable=SC2086 # the wrapper command is deliberately word-split
         $YUZU_E2E_PSQL -X -q -v ON_ERROR_STOP=1 -d "$db" "$@"
     else
-        psql "$YUZU_E2E_PG_DSN dbname=$db" -X -q -v ON_ERROR_STOP=1 "$@"
+        # The credentials come from the 0600 service file ($PGSERVICEFILE), not from argv.
+        psql "service=yuzu_e2e dbname=$db" -X -q -v ON_ERROR_STOP=1 "$@"
     fi
 }
 psql_admin() { psql_on postgres "$@"; }
@@ -90,25 +101,74 @@ stop_server() {
     SERVER_PID=""
 }
 cleanup() {
+    local rc=$?
+    trap - EXIT
     stop_server
-    psql_admin -c "DROP DATABASE IF EXISTS \"$DB\" WITH (FORCE)" >/dev/null 2>&1 || true
-    if [ "$FAILS" -ne 0 ]; then
+    if [ "$DB_CREATED" -eq 1 ]; then
+        psql_admin -c "DROP DATABASE IF EXISTS \"$DB\" WITH (FORCE)" >/dev/null 2>&1 || true
+    fi
+    rm -f "$WORK/pg_service.conf" # holds the superuser password: never kept, even with the logs
+    # Keep the logs on ANY failure, including a `set -e` abort or an explicit `exit 1` before the
+    # summary (FAILS counts only the check failures).
+    if [ "$rc" -ne 0 ] || [ "$FAILS" -ne 0 ]; then
         echo "kept $WORK (server logs) for inspection" >&2
     else
         rm -rf "$WORK"
     fi
+    exit "$rc"
 }
+# Armed before anything is created so the work directory and a started server are always handled;
+# the database is dropped only when DB_CREATED says this run created it.
 trap cleanup EXIT
 
+# libpq service file: the superuser DSN as `key=value` lines, mode 0600, read by psql through
+# PGSERVICEFILE so no password is on a command line.
+YUZU_E2E_DSN_IN="$YUZU_E2E_PG_DSN" python3 -c '
+import os, sys
+src, out, i = os.environ["YUZU_E2E_DSN_IN"], [], 0
+while i < len(src):
+    while i < len(src) and src[i].isspace():
+        i += 1
+    if i >= len(src):
+        break
+    j = src.index("=", i)
+    key = src[i:j].strip()
+    i = j + 1
+    if i < len(src) and src[i] == "\x27":  # a single-quoted value with backslash escapes
+        i += 1
+        val = ""
+        while src[i] != "\x27":
+            if src[i] == "\\":
+                i += 1
+            val += src[i]
+            i += 1
+        i += 1
+    else:
+        k = i
+        while k < len(src) and not src[k].isspace():
+            k += 1
+        val, i = src[i:k], k
+    out.append(f"{key}={val}")
+print("[yuzu_e2e]")
+print("\n".join(out))
+' > "$WORK/pg_service.conf"
+chmod 600 "$WORK/pg_service.conf"
+export PGSERVICEFILE="$WORK/pg_service.conf"
+
 # One allocation call: the sockets are all held until the list is printed, so no two are equal.
-read -r WEB_PORT GRPC_PORT MGMT_PORT < <(python3 -c '
+# The ports are released before the server binds them, so another process can still take one in
+# that gap; start_server therefore allocates right before each launch and retries on a bind failure.
+alloc_ports() {
+    read -r WEB_PORT GRPC_PORT MGMT_PORT < <(python3 -c '
 import socket
 s = [socket.socket() for _ in range(3)]
 for x in s:
     x.bind(("127.0.0.1", 0))
 print(*[x.getsockname()[1] for x in s])
 ')
-BASE="http://127.0.0.1:$WEB_PORT"
+    BASE="http://127.0.0.1:$WEB_PORT"
+}
+alloc_ports
 # A per-run random admin password, handed to python through the environment rather than argv.
 ADMIN_PASS="$(head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
 
@@ -121,34 +181,49 @@ print(f"admin:admin:{salt.hex()}:{dk.hex()}")
 ' > "$WORK/yuzu-server.cfg"
 chmod 600 "$WORK/yuzu-server.cfg"
 
-# The server's own DSN: the superuser DSN pointed at the throwaway database.
+# The server's own DSN: the superuser DSN pointed at the throwaway database, handed over through
+# YUZU_POSTGRES_DSN (never --postgres-dsn, which would show the password in `ps`).
 SERVER_DSN="$YUZU_E2E_PG_DSN dbname=$DB"
 BOOT_N=0
 
 start_server() {
     BOOT_N=$((BOOT_N + 1))
     SERVER_LOG="$WORK/server.boot$BOOT_N.log"
-    "$BIN" \
-        --no-tls --no-https \
-        --web-address 127.0.0.1 --web-port "$WEB_PORT" \
-        --listen "127.0.0.1:$GRPC_PORT" --management "127.0.0.1:$MGMT_PORT" \
-        --config "$WORK/yuzu-server.cfg" --data-dir "$WORK/data" --ca-dir "$WORK/ca" \
-        --postgres-dsn "$SERVER_DSN" \
-        --metrics-no-auth --log-level info \
-        > "$SERVER_LOG" 2>&1 &
-    SERVER_PID=$!
-    # A cold start walks every migration and routinely takes 12+ s.
-    for _ in $(seq 1 240); do
-        if curl -sf -m 5 -o /dev/null "$BASE/livez" 2>/dev/null; then
-            log "  boot $BOOT_N: server ready (pid $SERVER_PID)"
-            return 0
-        fi
-        kill -0 "$SERVER_PID" 2>/dev/null || { echo "FAIL: server exited early; tail of $SERVER_LOG:" >&2; tail -30 "$SERVER_LOG" >&2; exit 1; }
-        sleep 0.5
+    local attempt
+    for attempt in 1 2 3; do
+        alloc_ports
+        YUZU_POSTGRES_DSN="$SERVER_DSN" "$BIN" \
+            --no-tls --no-https \
+            --web-address 127.0.0.1 --web-port "$WEB_PORT" \
+            --listen "127.0.0.1:$GRPC_PORT" --management "127.0.0.1:$MGMT_PORT" \
+            --config "$WORK/yuzu-server.cfg" --data-dir "$WORK/data" --ca-dir "$WORK/ca" \
+            --metrics-no-auth --log-level info \
+            > "$SERVER_LOG" 2>&1 &
+        SERVER_PID=$!
+        # A cold start walks every migration and routinely takes 12+ s.
+        local i
+        for i in $(seq 1 240); do
+            if curl -sf -m 5 -o /dev/null "$BASE/livez" 2>/dev/null; then
+                log "  boot $BOOT_N: server ready (pid $SERVER_PID, web :$WEB_PORT)"
+                return 0
+            fi
+            if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+                SERVER_PID=""
+                # A port taken between the allocation and the bind: allocate again and retry.
+                if [ "$attempt" -lt 3 ] && grep -qiE 'address already in use|failed to bind|bind failed|could not bind' "$SERVER_LOG"; then
+                    log "  boot $BOOT_N: a port was taken before the server bound it; retrying ($attempt/3)"
+                    continue 2
+                fi
+                echo "FAIL: server exited early; tail of $SERVER_LOG:" >&2
+                tail -30 "$SERVER_LOG" >&2
+                exit 1
+            fi
+            sleep 0.5
+        done
+        echo "FAIL: server not live within 120 s; tail of $SERVER_LOG:" >&2
+        tail -30 "$SERVER_LOG" >&2
+        exit 1
     done
-    echo "FAIL: server not live within 120 s; tail of $SERVER_LOG:" >&2
-    tail -30 "$SERVER_LOG" >&2
-    exit 1
 }
 
 # Mint an API token from a cookie session (the password goes in on stdin, never on argv).
@@ -194,8 +269,11 @@ row_sum() { # md5 of the whole device_ci row, or ROW-ABSENT
     echo "${out:-ROW-ABSENT}"
 }
 
-log "server $BIN; throwaway database $DB; web :$WEB_PORT grpc :$GRPC_PORT mgmt :$MGMT_PORT"
+log "server $BIN; throwaway database $DB (ports are chosen at each server start)"
+# Plain CREATE DATABASE (no IF NOT EXISTS): a database that already has this name makes it fail, and
+# DB_CREATED stays 0, so the cleanup can never drop a database this run did not create.
 psql_admin -c "CREATE DATABASE \"$DB\""
+DB_CREATED=1
 
 # Precondition: the throwaway database must record a collation version and the host must report one.
 # A database on the C/POSIX collation records none (and reports none), so the forced catalog UPDATE in
