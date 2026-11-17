@@ -296,6 +296,78 @@ TEST_CASE("SoftwareLifecycleStore: reads are empty VALUES on no rows and nullopt
     }
 }
 
+TEST_CASE("SoftwareLifecycleStore: rules_of lists one source, ordered, and degrades rather than truncates",
+          "[pg][store][lifecycle]") {
+    LIFECYCLE_STORE(store);
+    yuzu::MetricsRegistry metrics;
+    store.set_metrics(&metrics);
+    const auto imported = std::vector<LifecycleRule>{
+        rule(LifecycleSource::imported, "product:b", "", LifecycleEvent::end_of_support, "2027-01-01", "f"),
+        rule(LifecycleSource::imported, "product:a", "16", LifecycleEvent::end_of_life, "2028-01-01", "f"),
+        rule(LifecycleSource::imported, "product:a", "", LifecycleEvent::end_of_life, "2029-01-01", "f")};
+    REQUIRE(store.replace_rules(LifecycleSource::imported, imported).value() == 3);
+    REQUIRE(store.replace_rules(LifecycleSource::shipped,
+                                {rule(LifecycleSource::shipped, "product:a", "", LifecycleEvent::end_of_life,
+                                      "2030-01-01", "s")})
+                .value() == 1);
+
+    SECTION("only the requested source, ordered by key, prefix and event, with every field") {
+        const auto got = store.rules_of(LifecycleSource::imported);
+        REQUIRE(got.has_value());
+        REQUIRE(got->size() == 3);
+        CHECK((*got)[0].product_key == "product:a");
+        CHECK((*got)[0].version_prefix.empty());
+        CHECK((*got)[1].version_prefix == "16");
+        CHECK((*got)[2].product_key == "product:b");
+        CHECK((*got)[2].event == LifecycleEvent::end_of_support);
+        CHECK((*got)[2].date == "2027-01-01");
+        CHECK((*got)[2].source == LifecycleSource::imported);
+        CHECK((*got)[2].source_ref == "f");
+        const auto shipped = store.rules_of(LifecycleSource::shipped);
+        REQUIRE(shipped.has_value());
+        CHECK(shipped->size() == 1);
+    }
+    SECTION("a source with no rows is an empty value, not a degrade") {
+        const auto got = store.rules_of(LifecycleSource::external);
+        REQUIRE(got.has_value());
+        CHECK(got->empty());
+    }
+    SECTION("declared is not a rule source") {
+        CHECK_FALSE(store.rules_of(LifecycleSource::declared).has_value());
+    }
+    SECTION("more rows than the per-source bound is a row_cap degrade, never a truncated list") {
+        exec_sql(lifecycle_db_fx_.dsn(),
+                 "INSERT INTO software_lifecycle_store.lifecycle_rule (product_key, version_prefix, "
+                 "event, event_date, source, source_ref, loaded_at) "
+                 "SELECT 'product:bulk' || g, '', 'end_of_life', DATE '2030-01-01', 'external', 'r', 1 "
+                 "FROM generate_series(1, " +
+                     std::to_string(kLifecycleCsvMaxRows + 1) + ") g");
+        CHECK_FALSE(store.rules_of(LifecycleSource::external).has_value());
+        CHECK(metrics
+                  .counter("yuzu_server_software_lifecycle_store_read_degrade_total",
+                           {{"reason", "row_cap"}})
+                  .value() == 1.0);
+        // The other sources are unaffected.
+        CHECK(store.rules_of(LifecycleSource::imported)->size() == 3);
+    }
+    SECTION("a backend failure degrades the read") {
+        exec_sql(lifecycle_db_fx_.dsn(), "DROP SCHEMA software_lifecycle_store CASCADE");
+        CHECK_FALSE(store.rules_of(LifecycleSource::imported).has_value());
+        CHECK(metrics
+                  .counter("yuzu_server_software_lifecycle_store_read_degrade_total",
+                           {{"reason", "query_error"}})
+                  .value() == 1.0);
+    }
+    SECTION("a held pool degrades the read") {
+        store.set_acquire_timeout_for_test(std::chrono::milliseconds{50});
+        auto lease1 = lifecycle_pool_fx_.acquire();
+        auto lease2 = lifecycle_pool_fx_.acquire();
+        REQUIRE(lease1);
+        REQUIRE(lease2);
+        CHECK_FALSE(store.rules_of(LifecycleSource::imported).has_value());
+    }
+}
+
 TEST_CASE("SoftwareLifecycleStore: a store whose schema drifted does not open and degrades every call",
           "[pg][store][lifecycle][migration]") {
     YUZU_REQUIRE_PG_MIGRATION_DB(db);
