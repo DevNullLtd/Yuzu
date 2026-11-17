@@ -62,7 +62,8 @@
   "inputs": [
     {
       "constraints": {
-        "maxLength": 4096
+        "maxLength": 4096,
+        "pattern": "^($|[^\\\\/].*|[\\\\/]([^\\\\/].*)?)$"
       },
       "default": null,
       "definition_id": "crossplatform.storage.free",
@@ -275,7 +276,9 @@
       "agents/plugins/disk_space/src/disk_space_plugin.cpp"
     ],
     "privilege_row": false,
-    "tests": []
+    "tests": [
+      "tests/test_disk_space_definition_pattern.py"
+    ]
   },
   "version": "1.0.0",
   "where_the_data_goes": [

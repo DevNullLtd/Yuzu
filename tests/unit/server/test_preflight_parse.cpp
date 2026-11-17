@@ -175,3 +175,14 @@ TEST_CASE("cmp_version ignores a validated pre-release suffix", "[preflight][par
     CHECK(cmp_version("4.2.1", "4.2.0-rc1") > 0);
     CHECK(cmp_version("4.1.9", "4.2.0+build5") < 0);
 }
+
+// F39: the disk check's `volume` becomes the agent's disk_space.free `path`. A UNC or device spelling
+// would make a Windows LocalSystem agent authenticate to an operator-chosen host.
+TEST_CASE("is_valid_volume: a UNC or device spelling and control bytes are refused",
+          "[preflight][parse][security]") {
+    for (const char* ok : {"", "C:\\", "D:\\data", "/", "/var", "/var/lib/docker", "C:", "relative/dir"})
+        CHECK(is_valid_volume(ok));
+    for (const char* bad : {"\\\\host\\share", "//host/share", "\\\\?\\UNC\\h\\s", "\\\\.\\PhysicalDrive0",
+                            "\\/host", "/\\host", "C:\\a\nb", "/var\t", "\x7f"})
+        CHECK_FALSE(is_valid_volume(bad));
+}

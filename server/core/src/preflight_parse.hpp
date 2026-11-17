@@ -205,6 +205,20 @@ inline std::string format_gib(std::int64_t bytes) {
     return out;
 }
 
+/// Is `v` an acceptable disk-check VOLUME (the `path` the agent's disk_space.free measures)? EMPTY
+/// means "the platform root". A UNC or device spelling (`\\host\share`, `//host/share`,
+/// `\\?\UNC\...`, `\\.\X`) is refused: on a Windows agent it would make the LocalSystem
+/// service authenticate to that host (F39). A control byte is refused too. The agent refuses the
+/// same shapes (agents/shared/local_path_policy.hpp), so this is the server-side half of one rule.
+[[nodiscard]] inline bool is_valid_volume(std::string_view v) {
+    for (const char c : v) {
+        const auto u = static_cast<unsigned char>(c);
+        if (u < 0x20 || u == 0x7f)
+            return false;
+    }
+    return !(v.size() >= 2 && (v[0] == '\\' || v[0] == '/') && (v[1] == '\\' || v[1] == '/'));
+}
+
 /// Is `v` an acceptable version THRESHOLD for the go/no-go gate (#4644)? Dotted-decimal
 /// components (`4.2`, `10.0.19045`, `5.5`), each 1 to 15 digits so none can saturate the 64-bit
 /// compare, with an optional pre-release / build suffix of letters, digits, `-` and `+` that

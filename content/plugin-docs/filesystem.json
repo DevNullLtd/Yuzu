@@ -3681,6 +3681,7 @@
     "privilege_row": true,
     "tests": [
       "tests/test_filesystem_definition.py",
+      "tests/test_filesystem_exists_no_raw_fallback_lexical.py",
       "tests/unit/test_filesystem_acl_parsers.cpp",
       "tests/unit/test_filesystem_actions.cpp",
       "tests/unit/test_filesystem_find_by_hash.cpp",
