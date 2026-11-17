@@ -1,7 +1,7 @@
 #pragma once
 
 /// @file capability_fragments.hpp
-/// The 31 capability fragments, spelled ONCE. A macro because CommandCapabilityRegistry and
+/// The capability fragments, spelled ONCE. A macro because CommandCapabilityRegistry and
 /// enablement::build_unit_overlay take a brace-enclosed initializer_list, which a function cannot
 /// forward. A new fragment is added here (its header AND its accessor in the macro) and nowhere
 /// else; the order is the registry's (core first) and irrelevant to the overlay.
@@ -12,6 +12,9 @@
 /// requires server.cpp to include this header and compose YUZU_ALL_CAPABILITY_FRAGMENTS into
 /// capability_registry_, and requires this header to include every fragment and name every
 /// accessor.
+
+#include <array>
+#include <tuple>
 
 #include "capability_decls/core_dispatch_capabilities.hpp"
 #include "capability_decls/plugin_action_catalogue_a.hpp"
@@ -81,3 +84,13 @@
     ::yuzu::server::capdecls::plugin_action_catalogue_remote_access_audit(),\
     ::yuzu::server::capdecls::plugin_action_catalogue_process_introspect(),\
     ::yuzu::server::capdecls::plugin_action_catalogue_middleware()
+
+// An overflow of CommandCapabilityRegistry::kMaxSources is otherwise only a boot-time throw, and
+// two PRs that each add a fragment off one dev tip must not jointly reach the ceiling. Keeping two
+// slots free means a joint overflow breaks dev's build while the server still has runtime
+// capacity. Every accessor returns std::span<const CommandCapability>, so std::array's deduction
+// guide counts the macro in an unevaluated operand (the accessors need not be constexpr).
+static_assert(std::tuple_size_v<decltype(std::array{YUZU_ALL_CAPABILITY_FRAGMENTS})> + 2 <=
+                  ::yuzu::server::CommandCapabilityRegistry::kMaxSources,
+              "YUZU_ALL_CAPABILITY_FRAGMENTS leaves fewer than two free CommandCapabilityRegistry "
+              "slots: raise kMaxSources in command_capability.hpp and record why");
