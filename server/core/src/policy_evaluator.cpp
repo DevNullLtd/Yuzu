@@ -189,7 +189,7 @@ std::string verdict_for(const StoredResponse& r, const std::string& policy_id,
         spdlog::error("policy_evaluator: policy {} check {} response from agent {} has output "
                      "nested past the depth guard (max {}); treating as evaluation error, "
                      "cannot be safely parsed",
-                     policy_id, instruction_id, r.agent_id, yuzu::server::mcp::kMcpMaxJsonDepth);
+                     policy_id, instruction_id, onbehalf::sanitize_for_log(r.agent_id, 128), yuzu::server::mcp::kMcpMaxJsonDepth);
         if (unevaluable_reason)
             *unevaluable_reason = "depth";
         return "error";
@@ -847,7 +847,7 @@ PolicyEvaluator::remediate(const std::string& policy_id,
         auto r = d_.policy_store->update_agent_status(policy_id, tgt, "fixing", "", claim_gen);
         if (!r)
             spdlog::warn("policy_evaluator: remediate: failed to mark {} fixing for policy {}: {}",
-                        tgt, policy_id, r.error());
+                        onbehalf::sanitize_for_log(tgt, 128), policy_id, r.error());
         else if (!*r && d_.metrics)
             // fenced no-op — a sibling reclaimed this row between our claim and
             // this write (see PolicyStore::update_agent_status); visible so a
@@ -1021,7 +1021,7 @@ void PolicyEvaluator::collect_ready() {
                 } catch (...) {
                     spdlog::error("policy_evaluator: policy {} target {} skipped, check-phase "
                                   "evaluation threw a non-std exception",
-                                  f.policy_id, tgt);
+                                  f.policy_id, onbehalf::sanitize_for_log(tgt, 128));
                     if (d_.metrics)
                         d_.metrics
                             ->counter("yuzu_server_policy_eval_errors_total",
@@ -1062,7 +1062,7 @@ void PolicyEvaluator::collect_ready() {
                         if (!r)
                             spdlog::warn("policy_evaluator: fix-failure status write failed for "
                                         "{}/{}: {}",
-                                        f.policy_id, tgt, r.error());
+                                        f.policy_id, onbehalf::sanitize_for_log(tgt, 128), r.error());
                         else if (!*r && d_.metrics)
                             // fenced no-op: a sibling reclaimed after our
                             // release above — do not stomp its fresh 'fixing'.
@@ -1110,7 +1110,7 @@ void PolicyEvaluator::collect_ready() {
                         if (!r)
                             spdlog::warn("policy_evaluator: verify-dispatch-failed status write "
                                         "failed for {}/{}: {}",
-                                        f.policy_id, tgt, r.error());
+                                        f.policy_id, onbehalf::sanitize_for_log(tgt, 128), r.error());
                         else if (!*r && d_.metrics)
                             d_.metrics
                                 ->counter("yuzu_server_policy_remediation_fence_skip_total")
