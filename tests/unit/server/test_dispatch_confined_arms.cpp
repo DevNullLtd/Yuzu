@@ -1723,3 +1723,26 @@ TEST_CASE("resolve_scope_targets: a result set deleted between gate_scope_dispat
     // Re-create under the SAME id is astronomically unlikely (random suffix,
     // see ResultSetStore::generate_id) so no re-fetch/cleanup is needed here.
 }
+
+// SAM-39: the fifth internal push. The label switch has no default, so a missing case fails to
+// compile; this pins the label (the boot pre-seed and the capability row use the same string) and
+// that the pre-seed array lists every enumerator.
+TEST_CASE("kSystemReservedPushes lists the five internal pushes, labelled",
+          "[server][dispatch][system_reserved]") {
+    using yuzu::server::kSystemReservedPushes;
+    using yuzu::server::SystemReservedPush;
+    using yuzu::server::system_reserved_push_label;
+
+    STATIC_REQUIRE(kSystemReservedPushes.size() == 5);
+    CHECK(system_reserved_push_label(SystemReservedPush::inventory_settings_push) ==
+          "__sync__.settings");
+    CHECK(system_reserved_push_label(SystemReservedPush::inventory_sync_now) == "__sync__.now");
+
+    std::unordered_set<std::string_view> labels;
+    for (const auto push : kSystemReservedPushes)
+        labels.insert(system_reserved_push_label(push));
+    CHECK(labels.size() == 5);
+    CHECK_FALSE(labels.contains("unknown"));
+    CHECK(std::ranges::find(kSystemReservedPushes, SystemReservedPush::inventory_settings_push) !=
+          kSystemReservedPushes.end());
+}

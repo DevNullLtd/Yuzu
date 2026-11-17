@@ -53,6 +53,7 @@ __declspec(allocate(".CRT$XCB"))
 #include "hard_exit.hpp"                 // hard_exit / kOrphanDrainGrace: the detached-collector drain barrier
 #include "log_handoff.hpp"               // drain_log_bounded: breadcrumb before that hard_exit
 #include "command_dedup_decision.hpp"            // dedup claim/replay decision core (pure, unit-tested)
+#include "collection_settings_agent.hpp"       // __sync__.settings decision core (pure, unit-tested)
 #include "sync_now_decision.hpp"               // __sync__.now decision core (pure, unit-tested)
 #include "sync_scheduler.hpp"                 // ADR-0016 daily-sync framework
 #include "sync_source_installed_software.hpp" // ADR-0016 source #1
@@ -889,6 +890,27 @@ public:
             }
         }
 
+        // 1b'. Fleet collection settings (`__sync__.settings`): load the persisted pair and apply it
+        // BEFORE any daily-sync scheduler exists, so the first tick already runs on it. The pair is
+        // re-validated exactly as a live command; one that no longer matches its version (a crash
+        // between the two KV writes, a hand edit) is discarded, the tag reads `none` and the server
+        // re-sends. Loaded under --inventory-disable too: nothing collects there, but the agent
+        // still holds and reports the version, so the server does not re-send it for good.
+        if (kv_store_) {
+            auto stored = load_stored_settings([this](const std::string& k) {
+                return kv_store_->get(kSyncKvNamespace, k);
+            });
+            if (stored) {
+                collector_enabled_->set(stored->plugins);
+                spdlog::info("Collection settings {} restored (interval {}s{})", stored->version,
+                             stored->interval_s, stored->window ? ", windowed" : "");
+                std::lock_guard<std::mutex> lk(settings_mu_);
+                applied_settings_ = std::move(*stored);
+            } else if (stored.error() != kNoStoredSettings) {
+                spdlog::warn("Stored collection settings discarded: {}", stored.error());
+            }
+        }
+
         // 1b''. Pre-rename install step (kept while a pre-rename tar.db can still exist): the activity-record
         // feature was renamed from TAR to Echo. Adopt a pre-rename tar.db as echo.db and re-key its
         // KV namespace, BEFORE any plugin init or dispatch (the plugin scan above only registers
@@ -1336,10 +1358,10 @@ public:
         // See also the member declaration order (spark_engine_ AFTER thread_pool_) so
         // spark is DESTROYED before the pool it may borrow at rung 2.
         // The next-generation event-driven detection engine is stood up here
-        // OBSERVE-ONLY: no consumer is registered at rung 1, so it is not yet wired
-        // to drive Guardian and the legacy IGuard path remains the sole ENFORCING
-        // detection path. Detection cutover is rung 2; enforce is rung 3. Standing it
-        // up now proves the engine runs and reports at rest, so its resource +
+        // OBSERVE-ONLY: Guardian's consumer is wired lifecycle-only (step 1c-ter below)
+        // and prefer_spark_ is false, so no rule is placed on spark and the legacy
+        // IGuard path remains the sole ENFORCING detection path. Detection cutover is
+        // rung 2; enforce is rung 3. Standing it up now proves the engine runs and reports at rest, so its resource +
         // observability envelope can be measured before it carries any load.
         //
         // --spark-disable / YUZU_AGENT_SPARK_DISABLE is a boot-time deploy opt-out:
@@ -1349,7 +1371,7 @@ public:
         // to start (see the DISABLED branch in the heartbeat emit block below).
         // The flag selects exactly one detection path at instantiation, establishing
         // the "old and new never both drive enforce" property the rung-2/3 cutover
-        // leans on (moot at rung 1 - spark has no consumer - but pinned here).
+        // leans on (moot while no rule is placed on spark, but pinned here).
         //
         // spark_detached_workers_ (F3, #2012/#3840 plan "Route A corrected")
         // needs no construction step here - it is already live via its own
@@ -1396,7 +1418,40 @@ public:
                 // counter (it launches no detached workers - only the
                 // Windows SCM half restructures off mech_ops_mu_by_type_).
                 try_register(SparkType::File, make_file_mechanism(spark_detached_workers_));
-                try_register(SparkType::Registry, make_registry_mechanism(spark_detached_workers_));
+                // Registry path verification is OFF unless the operator opted in at boot
+                // (--spark-registry-path-verify-interval, REG-15-I2): the factory's own
+                // default is zero, so passing the clamped config value (0 -> 0) is the
+                // only place the opt-in enters. Ignored off Windows (the factory is null).
+                const auto registry_path_verify = clamp_registry_path_verify(
+                    cfg_.spark_registry_path_verify_interval_s);
+                // ONE effective-state line on every OS, so an operator can read the
+                // verification state of the agent from its log whether or not the
+                // flag applies here. The clamped value is what the factory receives.
+                {
+                    const auto floor_ms = kRegistryPathVerifyFloor.count();
+                    if (registry_path_verify.count() == 0) {
+                        spdlog::info("SparkEngine: Registry path verification: off (default)");
+                    } else {
+#ifdef _WIN32
+                        const auto configured_s = cfg_.spark_registry_path_verify_interval_s;
+                        // 1..4 s was configured and raised to the floor.
+                        const char* note = registry_path_verify.count() > configured_s * 1000
+                                               ? "; the configured value was raised to the floor"
+                                               : "";
+                        spdlog::info("SparkEngine: Registry path verification: every {} ms "
+                                     "(opt-in; floor {} ms){}; each check opens every watched "
+                                     "Registry key",
+                                     registry_path_verify.count(), floor_ms, note);
+#else
+                        spdlog::info("SparkEngine: Registry path verification: every {} ms "
+                                     "(opt-in; floor {} ms) (Windows only; ignored)",
+                                     registry_path_verify.count(), floor_ms);
+#endif
+                    }
+                }
+                try_register(SparkType::Registry,
+                             make_registry_mechanism(spark_detached_workers_,
+                                                     registry_path_verify));
                 try_register(SparkType::Service, make_service_mechanism(spark_detached_workers_));
                 spark_engine_->start();
                 spdlog::info("SparkEngine: instantiated OBSERVE-ONLY (no consumer at rung 1); "
@@ -1424,7 +1479,8 @@ public:
         // or when instantiation threw (records SparkFailed); non-null records
         // Available. The kill-switch flag disambiguates the two null cases. This is
         // the FIRST production call site of wire_spark_engine(); prefer_spark stays
-        // false (2-arg ctor above), so no rule places on spark and detection behavior
+        // false (the explicit prefer_spark=false at GuardianEngine construction
+        // above), so no rule places on spark and detection behavior
         // is unchanged - the wiring exercises construction/shutdown of the spark
         // subsystem before rung 7.7b turns on placement.
         guardian_->wire_spark_engine(
@@ -2612,11 +2668,31 @@ public:
                         // rebuilt on every reconnect while a worker abandoned at its time limit may
                         // still be inside a plugin, so the single-flight flags and the outstanding
                         // count must outlive it (drain_detached_collectors_or_exit reads them).
-                        scheduler.add_source(make_installed_software_source(
-                            sync_plugins, kv_get, kv_set, collector_workers_));
-                        // Publish AFTER the last add_source: request_now() reads sources_
-                        // without the mutex on the append-only-before-publication contract.
+                        // `collector_enabled_` is agent-lifetime for the same reason, and the
+                        // applied fleet settings (loaded at start-up, replaced by each
+                        // `__sync__.settings`) set the cadence BEFORE the scheduler is published,
+                        // so a reconnect keeps them and nothing is re-placed here.
+                        auto installed_software_source = make_installed_software_source(
+                            sync_plugins, kv_get, kv_set, collector_workers_, {},
+                            collector_enabled_);
                         {
+                            // settings_mu_ is held from the read of applied_settings_ to the
+                            // publication below. The `__sync__.settings` hook replaces
+                            // applied_settings_ and reads sync_scheduler_ under the same mutex,
+                            // so a command lands either before this read (the source is built
+                            // on it) or after the publication (the hook hands it to this
+                            // scheduler): the version the heartbeat reports is never one this
+                            // scheduler is not running. Lock order: settings_mu_, then
+                            // sync_sched_mu_.
+                            std::lock_guard<std::mutex> settings_lk(settings_mu_);
+                            if (applied_settings_) {
+                                installed_software_source.interval =
+                                    std::chrono::seconds{applied_settings_->interval_s};
+                                installed_software_source.window = applied_settings_->window;
+                            }
+                            scheduler.add_source(std::move(installed_software_source));
+                            // Publish AFTER the last add_source: request_now() reads sources_
+                            // without the mutex on the append-only-before-publication contract.
                             std::lock_guard<std::mutex> lk(sync_sched_mu_);
                             sync_scheduler_ = scheduler_ptr;
                         }
@@ -2771,6 +2847,12 @@ public:
                             // KV throw must never kill the heartbeat thread.
                             try {
                                 yuzu::agent::emit_plugins_failed_tag(tags, plugins_failed_);
+                                // The applied fleet collection settings: always present, `none`
+                                // until a valid pair is applied.
+                                {
+                                    std::lock_guard<std::mutex> lk(settings_mu_);
+                                    yuzu::agent::emit_settings_tags(tags, applied_settings_);
+                                }
                                 if (kv_store_) {
                                     yuzu::agent::emit_plugin_heartbeat_tags(
                                         tags, plugin_names_,
@@ -3740,8 +3822,47 @@ public:
                         // else about this command (the metrics counter below,
                         // record_command_terminal-before-write, the stream->Write)
                         // stays here, unchanged.
-                        auto decision = decide_sync_now(cmd.action(), source, delay_max_s,
-                                                         cfg_.inventory_disable, sched.get());
+                        // `settings` (fleet collection settings) is decided first, in
+                        // collection_settings_agent.hpp: it persists the pair, then holds it
+                        // (the switches, and the version the heartbeat reports) and hands the
+                        // cadence to the scheduler when one is published. With no scheduler
+                        // (--inventory-disable, or the sync thread of this connection has not
+                        // published yet) the settings are still held and reported, and the
+                        // next scheduler is built on them. It never forces a sync; the wake
+                        // below only re-ticks so the new cadence is applied at once.
+                        auto decision =
+                            cmd.action() == kSettingsAction
+                                ? decide_sync_settings(
+                                      cmd.parameters(),
+                                      SettingsHooks{
+                                          [this](std::string_view key, std::string_view value) {
+                                              return kv_store_ &&
+                                                     kv_store_->set(kSyncKvNamespace, key, value);
+                                          },
+                                          [this](const AgentCollectionSettings& s) {
+                                              collector_enabled_->set(s.plugins);
+                                              // Assign first, THEN read the scheduler, both
+                                              // under settings_mu_ (the sync thread holds it
+                                              // from its read of applied_settings_ to its
+                                              // publication): either that build already read
+                                              // `s`, or its scheduler is visible here.
+                                              // apply_settings only queues under the
+                                              // scheduler's own short mutex.
+                                              std::lock_guard<std::mutex> lk(settings_mu_);
+                                              applied_settings_ = s;
+                                              std::shared_ptr<SyncScheduler> live;
+                                              {
+                                                  std::lock_guard<std::mutex> sl(sync_sched_mu_);
+                                                  live = sync_scheduler_;
+                                              }
+                                              if (live)
+                                                  live->apply_settings(
+                                                      kSettingsSyncSource,
+                                                      std::chrono::seconds{s.interval_s},
+                                                      s.window);
+                                          }})
+                                : decide_sync_now(cmd.action(), source, delay_max_s,
+                                                  cfg_.inventory_disable, sched.get());
                         resp.set_status(decision.status == SyncNowDecision::Status::Success
                                              ? pb::CommandResponse::SUCCESS
                                              : pb::CommandResponse::FAILURE);
@@ -4804,7 +4925,8 @@ private:
     // arms the scheduler through this handle and breaks the sync thread's sleep.
     // sync_scheduler_ is null under --inventory-disable and between connections
     // (published by the 4b-sync thread after its sources are registered, cleared
-    // by that same thread on exit) — the intercept answers FAILURE, never blocks.
+    // by that same thread on exit) — the `now` intercept answers FAILURE, never blocks;
+    // `settings` is held in applied_settings_ and needs no scheduler.
     std::atomic<bool> sync_wake_{false};
     std::mutex sync_sched_mu_;
     std::shared_ptr<SyncScheduler> sync_scheduler_;
@@ -4928,7 +5050,7 @@ private:
     // header's own doc comment ("Ticketing"). Summed into
     // guardian_active_io_workers() below, additively with guardian_'s own
     // count. First consumer: the Windows Registry mechanism (PR-B1, handed in
-    // via make_registry_mechanism(spark_detached_workers_) in the spark boot
+    // via make_registry_mechanism(spark_detached_workers_, ...) in the spark boot
     // block); File (PR-B2) and the Windows Service mechanism (PR-B3) both
     // followed the same shape.
     //
@@ -5060,6 +5182,15 @@ private:
     // (sync_source_installed_software.hpp). Agent-lifetime, NOT per-connection: see the factory
     // call and drain_detached_collectors_or_exit().
     std::shared_ptr<CollectorWorkers> collector_workers_ = std::make_shared<CollectorWorkers>();
+    // The fleet collection settings last applied (`__sync__.settings`, collection_settings_agent.hpp)
+    // and the collector switches they carry. Agent-lifetime like the workers: written by start-up
+    // and the command thread, read by the sync thread (building the source on each connection) and
+    // the heartbeat thread (the version tag). Empty = nothing applied. settings_mu_ also orders a
+    // `__sync__.settings` against the sync thread's source build and scheduler publication; where
+    // both are held it is taken before sync_sched_mu_.
+    std::mutex settings_mu_;
+    std::optional<AgentCollectionSettings> applied_settings_;
+    std::shared_ptr<CollectorEnabledSet> collector_enabled_ = std::make_shared<CollectorEnabledSet>();
 
     // PR 10 / UAT 2026-05-12 — Push-based fleet topology ingestion.
     //

@@ -329,7 +329,7 @@ Each action has its own line shape; there is no uniform row. A line is `name|val
 | `get_value`, `get_user_value` | `value\|...` and `type\|...`; `get_user_value` writes `username\|...` first | one `error\|...` line, rc 1 |
 | `key_exists` | `exists\|true` or `exists\|false` | `error\|...` only for a missing or unknown hive or key parameter |
 | `enumerate_keys`, `enumerate_values` | one `subkey\|<name>` or `value\|<name>\|<type>` line each; no lines for an empty key | `error\|key not found`, rc 1 |
-| `list_profiles` | one `<sid>\|<profile_name>\|<profile_path>\|<hive_state>` row per profile, with no prefix; then `warning\|profile_list_truncated at 512 entries` when the list was cut and `warning\|profile_path_unreadable for <n> profile(s)` when some profile paths could not be read; zero rows is a success | `error\|profile_list_unreadable` or `error\|hku_list_incomplete` (the loaded-hive listing failed or did not settle), rc 1 |
+| `list_profiles` | one `<sid>\|<profile_name>\|<profile_path>\|<hive_state>` row per profile, with no prefix; then `warning\|profile_list_truncated at 512 entries` when the list was cut and `warning\|profile_path_unreadable for <n> profile(s)` when some profile paths could not be read; zero rows is a success | `error\|profile_list_unreadable`, rc 1 |
 | `set_value`, `delete_value` | `audit\|...`, `status\|ok` | `audit\|...`, `error\|<token>`, rc 1 |
 | `delete_key` | `audit\|...`, `status\|ok`, then `counted_keys`, `counted_values`, `dry_run` (1 or 0) and `capped` (1 when a bound was hit and the counts are a lower bound) | `audit\|...`, `error\|<token>`, rc 1 (the counts ride in the audit line) |
 | `set_user_value`, `delete_user_value` | any `warning\|...` lines, `audit\|...` with `hive=HKU` and `sid=<SID>`, `status\|ok` | the hive's own error line when the hive was not reached, `audit\|...`, `error\|<token>`, rc 1 |
@@ -779,7 +779,7 @@ registry|unsupported|Windows registry is not available on this platform
 - Plugin: `agents/plugins/registry/src/registry_core.hpp` · `agents/plugins/registry/src/registry_parsers.hpp` · `agents/plugins/registry/src/registry_plan.hpp` · `agents/plugins/registry/src/registry_plugin.cpp` · `agents/plugins/registry/src/registry_win.cpp`
 - Definitions: `content/definitions/registry.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_a.hpp`
-- Tests: `tests/test_registry_definition.py` · `tests/unit/test_registry_core.cpp` · `tests/unit/test_registry_local_dispatcher.cpp` · `tests/unit/test_registry_parsers.cpp` · `tests/unit/test_registry_plan.cpp` · `tests/unit/test_registry_win_internals.cpp` · `tests/unit/test_registry_write_local_dispatcher.cpp`
+- Tests: `tests/test_registry_definition.py` · `tests/test_registry_verify_default_wiring_lexical.py` · `tests/unit/test_registry_core.cpp` · `tests/unit/test_registry_local_dispatcher.cpp` · `tests/unit/test_registry_parsers.cpp` · `tests/unit/test_registry_plan.cpp` · `tests/unit/test_registry_win_internals.cpp` · `tests/unit/test_registry_write_local_dispatcher.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/7173-echo-registry-live-etw-skip.fixed.md`
+- Changelog: `changelog.d/7173-echo-registry-live-etw-skip.fixed.md` · `changelog.d/8016-spark-registry-rename-deaf-watch.fixed.md`
 <!-- END GENERATED -->
