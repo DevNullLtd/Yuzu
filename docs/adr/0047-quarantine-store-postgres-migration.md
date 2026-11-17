@@ -539,7 +539,7 @@ device after the observation behind that answer would leave a contained device w
 nothing owed. So:
 
 1. `redispatch_stored_containment`, the one chokepoint for a stored-record apply (the reconciler and the
-   MCP `quarantine_device` retry), calls `claim_apply` before the dispatch (`apply_gen + 1` and the claim
+   MCP `quarantine_device` call, first or retry), calls `claim_apply` before the dispatch (`apply_gen + 1` and the claim
    stamp; refused once a release is requested, the record has ended, or another claim is live). A
    dispatch that returned is not a delivery (the gateway path only queues) and a delivered command is not
    a run (the agent executes commands on a thread pool, and the plugin's gate orders them by the order its
@@ -564,8 +564,10 @@ nothing owed. So:
 
 **Residuals, accepted and documented rather than closed.** The rule assumes commands to one device
 arrive in the order one server dispatched them (one stream, a first-in first-out gateway queue). A
-transport that reorders them, an apply and a release dispatched by two different server replicas, and a
-apply that stays unexecuted past the 120-second claim window can still reopen the window. DELETE's own release and
+transport that reorders them, an apply and a release dispatched by two different server replicas, an
+apply that stays unexecuted past the 120-second claim window, and a step of the database clock that
+makes a live claim read expired early (the window is judged on that clock, so a forward step shortens
+it and a backward step lengthens it) can still reopen the window. DELETE's own release and
 the owed-release leg each check the record and then dispatch, with the same narrow window against a new
 quarantine of the same device. The operator-visible trace is a `quarantine.reapply` failure row and a
 device contained under no record or a releasing one; the way back is `firewall.release` through the generic

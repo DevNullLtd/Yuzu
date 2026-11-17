@@ -3269,7 +3269,7 @@ TEST_CASE("reconciler (firewall): a status read sent while the record was confir
 TEST_CASE("reconciler (firewall): an apply that was delivered but has not run keeps its claim, so a "
           "release confirmed by an inactive answer cannot end the record until the apply's reply is "
           "consumed (#8045)",
-          "[pg][quarantine][reconciler][prq2][fence][r1]") {
+          "[pg][quarantine][reconciler][prq2][fence][apply-claim]") {
     RECON_RIG(rig);
     const auto rec = rig.quarantine();
     rig.reply("", "status|inactive"); // the apply gets no reply yet: it is delivered, not run
@@ -3299,7 +3299,7 @@ TEST_CASE("reconciler (firewall): an apply that was delivered but has not run ke
 TEST_CASE("reconciler (firewall): a release requested while an apply is unanswered turns the entry into "
           "a releasing one; the apply's claim survives that reset, no `inactive` read ends the record "
           "until the apply's reply is read, and then it settles (#8045)",
-          "[pg][quarantine][reconciler][prq2][fence][r1][reset]") {
+          "[pg][quarantine][reconciler][prq2][fence][apply-claim][reset]") {
     RECON_RIG(rig);
     const auto rec = rig.quarantine();
     rig.reply("", "status|inactive"); // the device answers every status read inactive; the apply is silent

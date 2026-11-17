@@ -686,7 +686,9 @@ device confirms, and a `DELETE` repeated after that answers `400` (`device is no
 same as for a device that was never quarantined: poll the list. A `202` is also the answer when the
 device did say `inactive` but an apply reached it, or was being sent to it, after that observation: the
 record could not end on a word the apply may have overtaken, so it stays `releasing` and the next
-status read settles it (the audit row's `detail` says `apply_in_flight=1`).
+status read settles it (the audit row's `detail` says `apply_in_flight=1`). The same holds for an apply
+sent before the release whose reply the reconciler has not read yet: about a minute after a reconciler
+apply, and up to 120 seconds after an MCP `quarantine_device` call, which reads no reply.
 
 **The two ways a record ends, and no other:**
 
@@ -883,7 +885,7 @@ contained with no record naming it. Two parts close that:
   reached no device drops its claim at once. The generation outlives the claim. A claim stops counting
   120 seconds after it was stamped, and both the stamp and that test use the database's clock, so a
   server whose own clock steps cannot make a live claim read as expired or a dead one as live. MCP
-  `quarantine_device` reads no reply, so after any call (the first as well as a retry) a second call, a
+  `quarantine_device` reads no reply, so after any call that reached a device (the first as well as a retry) a second call, a
   release's confirmed end and the reconciler's own apply are held back until the claim expires, at most 120
   seconds; the second call answers a retryable fault.
 - Whoever will act on an `inactive` answer reads the generation **before it sends the command whose

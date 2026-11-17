@@ -2591,7 +2591,11 @@ release is dispatched and the answer is `202` without waiting.
 **How a `202` finishes.** There is no callback: the record leaves `GET /api/v1/quarantine` (its
 `status` reads `releasing` until then) when the device confirms. A `DELETE` repeated after that answers
 `400` (`device is not quarantined`), the same as for a device that was never quarantined, so poll the
-list, not the `DELETE`. A device that never confirms stays `releasing`; the way out is `?force=true`.
+list, not the `DELETE`. A `202` within about two minutes of a quarantine call is the normal wait for
+that call's apply (the end lands once its claim window has passed and the next status read has run), so
+poll and do not repeat the `DELETE`. A device that never confirms stays `releasing`; once the record is
+still `releasing` after that window and a few reconciler passes, or the device refuses the release with
+`privilege_unavailable`, the way out is `?force=true`.
 
 **Forced end (`?force=true`, REST only).** For a device that will not return, or one that cannot finish
 a release (a Linux host on the packaged systemd unit refuses every mutating firewall action), the
