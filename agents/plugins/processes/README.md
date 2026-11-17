@@ -89,7 +89,7 @@ On Linux, `list_hashed` and `list_tree` declare a typed status when the agent co
 | Status | Completeness | Provenance | When |
 |---|---|---|---|
 | `UNDECLARED` (default) | UNKNOWN | (empty) | Every Windows and macOS run, and a Linux run where every process was readable. |
-| `CONSTRAINED` | PARTIAL | `processes:exe_unreadable` | `list_hashed` and `list_tree` readlink of `/proc/<pid>/exe` was refused (EACCES/EPERM) for at least one process, so its `path` and `sha256` are empty. Rows are still emitted (a kernel thread also renders with an empty path), so the status, not the rows, says the list is incomplete. Grant `CAP_SYS_PTRACE` to the agent process only if that detail is needed; the packaged unit and the dev installer do not. **Linux only:** a refused read on macOS or Windows can still blank a row while the status stays `OK`, and other `/proc` readers are not tallied; treat `OK` there as not proof of completeness (tracked as a follow-up). |
+| `CONSTRAINED` | PARTIAL | `processes:exe_unreadable` | `list_hashed` and `list_tree` readlink of `/proc/<pid>/exe` was refused (EACCES/EPERM) for at least one process, so its `path` and `sha256` are empty. Rows are still emitted (a kernel thread also renders with an empty path), so the status, not the rows, says the list is incomplete. Grant `CAP_SYS_PTRACE` to the agent process only if that detail is needed; the packaged unit and the dev installer do not. **Linux only:** a refused read on macOS or Windows can still blank a row while the status stays `OK`, and other `/proc` readers are not tallied; treat `OK` there as not proof of completeness (tracked in #8165). |
 
 ### Where the data goes
 

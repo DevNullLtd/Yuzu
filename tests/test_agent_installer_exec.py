@@ -126,7 +126,8 @@ WRAPPER_BODY = "#!/bin/sh\nexit 0\n"
 
 
 def run_script(label, want, args, *, platform="Linux", visudo_ok=True, getcap="empty", setcap=True,
-               wrapper_install_ok=True, layout=None, caps_on_binary=False, extra_env=None):
+               wrapper_install_ok=True, layout=None, caps_on_binary=False, extra_env=None, uid0=False,
+               test_root_override=None, sudoers_mode=None):
     """layout: None (nothing exists), 'healthy', 'old_glob', 'no_wrapper', 'no_wrapper_grant'."""
     me = getpass.getuser()
     with tempfile.TemporaryDirectory(prefix="yuzu_test_installer_run_") as d:
@@ -163,6 +164,7 @@ mkdir -p "$(dirname "$last")" 2>/dev/null; cp "$s" "$last" 2>/dev/null; chmod 75
         if setcap:
             stub(bindir, "setcap", "exit 0")
         root = d / "root"
+        root.mkdir()
         for sub in ("var/lib/yuzu-agent", "var/cache/yuzu-agent", "var/log/yuzu-agent",
                     "Library/Application Support/Yuzu", "Library/Caches/Yuzu", "Library/Logs/Yuzu",
                     "etc/sudoers.d", "usr/libexec/yuzu"):
@@ -188,7 +190,13 @@ mkdir -p "$(dirname "$last")" 2>/dev/null; cp "$s" "$last" 2>/dev/null; chmod 75
             wrapper.write_text(WRAPPER_BODY); wrapper.chmod(0o755)
         elif layout == "mac_bootstrap":
             sudoers.write_text(f"{me} ALL=(root) NOPASSWD: /bin/launchctl bootstrap system *\n")
-        env = {"PATH": str(bindir), "HOME": str(d), "LC_ALL": "C", "YUZU_INSTALLER_TEST_ROOT": str(root), **(extra_env or {})}
+        if uid0:  # simulate a root caller: the installer reads the uid through `id -u`
+            (bindir / "id").unlink()
+            stub(bindir, "id", '[ "$1" = "-u" ] && echo 0 || echo root')
+        if sudoers_mode is not None and sudoers.exists():
+            sudoers.chmod(sudoers_mode)
+        root_value = str(root) if test_root_override is None else test_root_override.replace("@D@", str(d))
+        env = {"PATH": str(bindir), "HOME": str(d), "LC_ALL": "C", "YUZU_INSTALLER_TEST_ROOT": root_value, **(extra_env or {})}
         r = subprocess.run(["/bin/bash", str(SCRIPT), "--account-name", me, "--binary-path", str(binary), *args],
                            capture_output=True, text=True, env=env, timeout=60)
         ok = (r.returncode != 0) if want == "nonzero" else (r.returncode == want)
@@ -210,6 +218,39 @@ _, _, r = run_script("check --no-cap-cleanup with caps => 0 but warns the check 
                      ["--check", "--no-cap-cleanup"], layout="healthy", getcap="caps")
 if "SKIPPED" not in r.stderr:
     errs.append("--check --no-cap-cleanup must warn that the capability check is skipped")
+
+# R4-CHECKGREEN: a sudoers file the caller cannot read means the grants are UNVERIFIED: exit 6, never 0
+_, _, r = run_script("check: sudoers present but unreadable (mode 0000) => 6", 6, ["--check"],
+                     layout="healthy", sudoers_mode=0)
+if "UNVERIFIED" not in r.stderr:
+    errs.append("an unreadable sudoers file must be reported as UNVERIFIED on stderr")
+# a real drift still wins over unverified (1, not 6) is covered by the old-glob case above
+
+# R4-OWNER: state dirs owned by someone other than the account are drift (exit 1)
+run_script("check: state dir owned by another account => 1", 1,
+           ["--check", "--account-name", "someone-else-entirely"], layout="healthy")
+
+# R4-TESTROOT: the escape hatch is refused for root and validated
+_, _, r = run_script("root run with YUZU_INSTALLER_TEST_ROOT set is refused", 1, [], uid0=True)
+if "root run" not in r.stderr:
+    errs.append("the root refusal must say why")
+run_script("root --check with the variable set is refused too", 1, ["--check"], layout="healthy", uid0=True)
+run_script("relative TEST_ROOT refused", 1, [], test_root_override="relative/dir")
+run_script("TEST_ROOT of / refused", 1, [], test_root_override="/")
+run_script("TEST_ROOT of // refused", 1, [], test_root_override="//")
+run_script("non-existent TEST_ROOT refused", 1, [], test_root_override="@D@/does-not-exist")
+run_script("TEST_ROOT not owned by the caller refused", 1, [], test_root_override="/usr")
+_ln = []
+def _symlink_case():
+    with tempfile.TemporaryDirectory(prefix="yuzu_test_installer_lnk_") as t:
+        t = pathlib.Path(t)
+        (t / "real").mkdir()
+        os.symlink(t / "real", t / "link")
+        run_script("symlinked TEST_ROOT refused", 1, [], test_root_override=str(t / "link"))
+_symlink_case()
+_, _, r = run_script("an honoured TEST_ROOT prints the loud banner on stderr", 0, [])
+if "TEST-ONLY MODE" not in r.stderr:
+    errs.append("the TEST-ONLY banner must be printed on stderr when the variable is honoured")
 
 # install matrix through the real dispatch: 0 / 3 / 4 / 5
 run_script("install healthy => 0", 0, [], layout=None)

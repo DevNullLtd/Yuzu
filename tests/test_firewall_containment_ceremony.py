@@ -74,6 +74,19 @@ class Guards(unittest.TestCase):
                 mock.patch.object(fc, "refusal", return_value=None):
             self.assertEqual(fc.main(["--dashboard", "http://127.0.0.1:9"]), fc.EXIT_PRECONDITION)
 
+    def test_unverified_install_check_refuses_and_tells_the_user_to_run_as_root(self):
+        # --check exits 6 when the sudoers file is present but unreadable to this user (R4-CHECKGREEN).
+        # The ceremony must treat that as a failed precondition (never as a pass) and say why.
+        # install_check itself is NOT mocked-away in spirit: the real `--check` exit statuses (0 healthy,
+        # 1 drift, 6 unverified) are asserted against a synthetic layout by tests/test_agent_installer_exec.py,
+        # which can build that layout; this file only owns what the ceremony does with the number.
+        import io
+        err = io.StringIO()
+        with mock.patch.object(fc, "install_check", return_value=(6, "unverified")), \
+                mock.patch.object(fc, "refusal", return_value=None), mock.patch("sys.stderr", err):
+            self.assertEqual(fc.main(["--dashboard", "http://127.0.0.1:9"]), fc.EXIT_PRECONDITION)
+        self.assertIn("as root", err.getvalue())
+
 
 def row(token):
     """The terminal answer: CommandResponse.status SUCCESS (1) carries the plugin output."""

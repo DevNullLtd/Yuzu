@@ -108,14 +108,20 @@
 #
 # EXIT CODES
 # ──────────
-#   0  - install/check/uninstall succeeded
-#   1  - install/check/uninstall failed; details on stderr
-#   2  - argument or precondition error (not run as root, unsupported OS)
+#   0  - install/check/uninstall succeeded (check: everything verified)
+#   1  - failed: not run as root (install/uninstall), a precondition fail(), or --check
+#        found drift; details on stderr
+#   2  - argument error or unsupported OS
 #   3  - sudoers file failed visudo validation; the previous sudoers file was REMOVED
 #        (fail closed: no grants, never the old ones) and nothing new was installed
 #   4  - the systemctl wrapper could not be installed (no systemctl grant was written)
-#   5  - file capabilities could not be stripped or verified absent (setcap/getcap
-#        missing or failing while the binary carries, or may carry, capabilities)
+#   5  - file capabilities may still be live: `setcap` is missing while the binary
+#        carries them (or getcap is also missing, so that cannot be ruled out), `setcap -r`
+#        failed, or getcap still shows them afterwards. A missing getcap ALONE (setcap
+#        present) does not exit 5: the strip runs unverified and --check reports the drift.
+#   6  - --check only: no drift found but part of the install could not be VERIFIED
+#        (the sudoers file is present but unreadable to this user): re-run as root
+#   When several install steps fail the exit status is the first in the order 3, 4, 5.
 #
 # THIS SCRIPT MUST BE RUN AS ROOT.
 # We don't try to be cute about that — every action below requires root.
@@ -204,17 +210,7 @@ done
 ACCOUNT_NAME="${ACCOUNT_NAME:-$DEFAULT_ACCOUNT}"
 BINARY_PATH="${BINARY_PATH:-$DEFAULT_BINARY_PATH}"
 
-# TEST-ONLY (tests/test_agent_installer_exec.py): redirect every root-owned path under a prefix
-# directory and skip the root check, so the real, NON-sourced script (dispatch and exit status
-# included) can run in a temp dir with stub tools. It can only move writes INTO the prefix and
-# relax a check; it grants nothing, and sudo's env reset drops it in normal use.
 TEST_ROOT="${YUZU_INSTALLER_TEST_ROOT:-}"
-if [[ -n "$TEST_ROOT" ]]; then
-    STATE_DIR="$TEST_ROOT$STATE_DIR"; CACHE_DIR="$TEST_ROOT$CACHE_DIR"; LOG_DIR="$TEST_ROOT$LOG_DIR"
-    SUDOERS_TARGET="$TEST_ROOT$SUDOERS_TARGET"
-    SYSTEMCTL_WRAPPER_DIR="$TEST_ROOT$SYSTEMCTL_WRAPPER_DIR"
-    SYSTEMCTL_WRAPPER_PATH="$TEST_ROOT$SYSTEMCTL_WRAPPER_PATH"
-fi
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -238,6 +234,29 @@ warn() { printf '[install-agent-user] WARN: %s\n' "$*" >&2; }
 fail() { printf '[install-agent-user] ERROR: %s\n' "$*" >&2; exit 1; }
 if [[ "$DEPRECATED_NO_SETCAP" -eq 1 ]]; then
     warn "--no-setcap is a deprecated alias of --no-cap-cleanup (the script never SETS file capabilities)"
+fi
+
+# TEST-ONLY escape hatch (tests/test_agent_installer_exec.py): YUZU_INSTALLER_TEST_ROOT redirects
+# every root-owned path under a prefix directory and skips the root check, so the real, NON-sourced
+# script (dispatch and exit status included) can run in a temp dir with stub tools.
+#
+# It is NOT safe to honour in general: an environment variable can be inherited (sudo -E,
+# env_keep, CI, systemd Environment=), and a root run that honoured it would run the real
+# useradd/dscl while the sudoers file and wrapper stayed untouched, exit 0, and leave the old
+# grants in place (WP13 governance R4-TESTROOT). So: it is REFUSED for root, and when honoured it
+# must be an absolute, existing, non-symlink directory owned by the caller, and never `/`.
+# `id -u` (not $EUID, which bash makes read-only) so the root refusal can be tested with a stub.
+if [[ -n "$TEST_ROOT" ]]; then
+    [[ "$(id -u)" -ne 0 ]] || fail "YUZU_INSTALLER_TEST_ROOT is set but this is a root run: refusing (it is a test-only redirect; unset it)"
+    [[ "$TEST_ROOT" == /* && -n "${TEST_ROOT//\//}" ]] || fail "YUZU_INSTALLER_TEST_ROOT must be an absolute path other than /"
+    [[ ! -L "$TEST_ROOT" ]] || fail "YUZU_INSTALLER_TEST_ROOT must not be a symlink"
+    [[ -d "$TEST_ROOT" ]] || fail "YUZU_INSTALLER_TEST_ROOT must be an existing directory"
+    [[ -O "$TEST_ROOT" ]] || fail "YUZU_INSTALLER_TEST_ROOT must be owned by the caller"
+    printf '[install-agent-user] *** TEST-ONLY MODE: every path is redirected under %s and the root check is skipped; this run changes NOTHING on the real host ***\n' "$TEST_ROOT" >&2
+    STATE_DIR="$TEST_ROOT$STATE_DIR"; CACHE_DIR="$TEST_ROOT$CACHE_DIR"; LOG_DIR="$TEST_ROOT$LOG_DIR"
+    SUDOERS_TARGET="$TEST_ROOT$SUDOERS_TARGET"
+    SYSTEMCTL_WRAPPER_DIR="$TEST_ROOT$SYSTEMCTL_WRAPPER_DIR"
+    SYSTEMCTL_WRAPPER_PATH="$TEST_ROOT$SYSTEMCTL_WRAPPER_PATH"
 fi
 
 # require_root — most actions need root; we fail early rather than
@@ -774,7 +793,7 @@ strip_file_capabilities() {
 # the agent).
 
 check_install() {
-    local errs=0
+    local errs=0 unverified=0
 
     # 1. user exists
     if [[ "$PLATFORM" == "macos" ]]; then
@@ -816,8 +835,11 @@ check_install() {
         if [[ ! -f "$SUDOERS_TARGET" ]]; then
             warn "$SUDOERS_TARGET is missing"; ((errs++))
         elif [[ ! -r "$SUDOERS_TARGET" ]]; then
-            log "$SUDOERS_TARGET present but not readable by $(id -un)"
-            log "  (mode 0440 root:wheel/root is correct; rerun --check as root to validate)"
+            # Cannot read it = cannot verify the grants (the old-glob and wrapper-grant checks below
+            # would be skipped), so a green result would be false (WP13 governance R4-CHECKGREEN).
+            warn "$SUDOERS_TARGET is present but not readable by $(id -un): its grants are UNVERIFIED"
+            warn "  (mode 0440 root-owned is correct; re-run --check as root)"
+            unverified=1
         else
             if ! visudo -cf "$SUDOERS_TARGET" >/dev/null 2>&1; then
                 warn "$SUDOERS_TARGET fails visudo validation"; ((errs++))
@@ -887,13 +909,16 @@ check_install() {
         fi
     fi
 
-    if [[ "$errs" -eq 0 ]]; then
-        log "check passed — install looks correct"
-        return 0
-    else
+    if [[ "$errs" -ne 0 ]]; then
         warn "check failed — $errs issue(s) found"
         return 1
     fi
+    if [[ "$unverified" -ne 0 ]]; then
+        warn "check INCOMPLETE — part of the install could not be verified by this user (exit 6)"
+        return 6
+    fi
+    log "check passed — install looks correct"
+    return 0
 }
 
 # ── action dispatch ─────────────────────────────────────────────────────────
