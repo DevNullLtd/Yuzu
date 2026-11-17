@@ -411,6 +411,16 @@ and serves such rows, so in a multi-replica deployment reads routed to an older 
 until every replica is upgraded. The gateway skip, the boot purge and the read filter iterate the
 same one list.
 
+### Fleet application usage (the aggregate read)
+
+`GET /api/v1/dex/apps/usage` is the fleet-level companion of the per-device application-usage read. It has no MCP tool yet. Its posture differs from the per-device route in each of these points:
+
+- **Two gates, in this order.** `GuaranteedState:Read` first (`perm_fn`, the same global gate as `GET /api/v1/dex/apps`: the body carries the Apps crash subjects, and a service-scoped token is refused because `GuaranteedState:Read` is not in the service-scope allow-list), then `Forensics:Read` through the fleet-read gate (`AuthRoutes::require_fleet_read`), which applies the authorization-topology floor: while RBAC is off, `Forensics:Read` is administrator-only. The two name different `(securable, operation)` pairs, so this is not the stacking of one pair that the fleet-read gate forbids. A holder of only `Forensics:Read` (ForensicsAnalyst) is refused at the first gate; a holder of only `GuaranteedState:Read` (Viewer) is refused at the second.
+- **Confined by construction; every admitted caller is unfiltered today.** The fleet-read gate returns a visible-device set with the admit. The aggregate seam filters the connected devices to that set before the model is built, and the set is part of the response cache key, so a confined caller can never be served an entry built for a wider set. The filter is inert today: the first gate refuses service-scoped tokens, `Forensics:Read` has no management-group-scoped tier, and engine and elevated callers are unfiltered. Nothing here claims live per-group confinement.
+- **Audit.** `dex.apps.usage.view` is written before the read, fail-closed (`503` with `Sec-Audit-Failed: true`). It records the admitted request (window, platform, slice, floor), not the outcome, so a later `400` or `503` still leaves the row. It carries no agent id.
+- **No agent id in the answer.** The response holds counts, run seconds and launches per application and cell, and the exposure rate. Cell labels are tag values or group ids supplied by operators or agents, and are escaped.
+- **The disclosure floor protects one table only.** A cell or an application below the floor is merged or withheld, but two slices or windows can be differenced to isolate a small group. Read access to the route is therefore the control for that residue, not the floor.
+
 ## Testing
 
 `tests/unit/server/test_authz_model.cpp` covers:

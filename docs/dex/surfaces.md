@@ -71,8 +71,8 @@ per-device app-usage route (see the map below). Conventions:
   `PUT` and `DELETE` on the score policy and `POST` on the live-info route
   (a `POST` only because it waits for the device to answer).
 - **Failed store reads.** Some routes fail loudly and some do not. The device
-  score, the catalogue, the Apps list, per-device application usage and the
-  retained application-performance reads (the picker, the fleet, group and tag
+  score, the catalogue, the Apps list, per-device application usage, fleet
+  application usage and the retained application-performance reads (the picker, the fleet, group and tag
   trends, the version-devices drill, the version comparison and one device's
   retained history) answer `503` with a `retry_after_ms` hint. The Overview,
   Health score, Trends, the signal rollup, scope and signal drill-down, the
@@ -95,9 +95,9 @@ per-device app-usage route (see the map below). Conventions:
     can see.
   - Both kinds need RBAC enforcement to be on and the service owner role to hold
     the permission.
-  - Every other route is refused, aggregates included, and so is the per-device
-    app-usage route, because the service owner role does not hold
-    `Forensics:Read`.
+  - Every other route is refused, aggregates included, and so are the per-device
+    app-usage route and the fleet application usage route, because the service
+    owner role does not hold `Forensics:Read`.
   - Every refusal on REST and MCP is audited. The overview, the signal and
     application drill-downs, the performance and network device lists, the group
     and tag trends and the version comparison record it under their own verb
@@ -256,6 +256,7 @@ this map; see [network](network.md).
 | Capability | Dashboard | REST | MCP | Fed by | Permission and audit | Page |
 |---|---|---|---|---|---|---|
 | One device's per-executable usage | Device page, Application usage | `GET /api/v1/forensics/agents/{id}/app-usage` | `get_agent_app_usage` | Echo `usage`, `app_usage` plugin, daily sync | `Forensics:Read` scoped to the device; refused to service-scoped tokens, whose role does not hold `Forensics:Read`; audited `app_usage.agent.view`, fails closed | [app usage](app-usage.md) |
+| Fleet usage per application: devices, run time, launches and crashes and hangs per hour of use | Not yet on the Apps page | `GET /api/v1/dex/apps/usage` | Not yet available | Echo `usage`, `app_usage` plugin, daily sync, DEX observer | `Forensics:Read` and `GuaranteedState:Read`, both required (Administrator only while RBAC is off); refused to service-scoped tokens; audited `dex.apps.usage.view` before the read, fails closed | [app usage](app-usage.md#fleet-usage-per-application) |
 
 ### Alerts
 

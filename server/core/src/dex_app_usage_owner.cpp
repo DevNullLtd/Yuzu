@@ -1,5 +1,6 @@
 #include "dex_app_usage_owner.hpp"
 
+#include "guaranteed_state_store.hpp" // kDexAppsConcurrentReads (the budget pin below)
 #include "pg/pg_array.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
@@ -7,7 +8,9 @@
 
 #include <libpq-fe.h>
 #include <spdlog/spdlog.h>
+#include <yuzu/metrics.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <string>
@@ -22,7 +25,14 @@ namespace {
 // saturated pool or a slow plan degrades to a typed failure instead of holding a
 // web worker.
 constexpr std::chrono::milliseconds kAcquireTimeout{3000};
-constexpr const char* kStatementTimeout = "10s";
+
+// The metric source for this owner's faults; the reasons are dex_read_fault_token().
+constexpr const char* kDegradeSource = "dex_usage";
+
+// A usage request also takes one Apps stability read slot (the Apps store's budget), so this
+// owner's own budget can never be wider than that one.
+static_assert(kDexUsageConcurrentReads <= GuaranteedStateStore::kDexAppsConcurrentReads,
+              "the usage read budget must not exceed the Apps read budget");
 
 // Result discriminator (column 0) and column use:
 //   0 = a usage cell:  c1 subject, c2 cell, c3 devices, c4 exact, c5 trunc, c6 launches, c7 seconds
@@ -50,10 +60,11 @@ constexpr const char* kStatementTimeout = "10s";
 // crash-looping device make the interval falsely narrow (the consumer duty at
 // dex_stats.hpp).
 // ponytail: no exe_key index on agent_last_used, so the usage side is a filtered
-// scan bounded by the 10 s statement timeout; add an index (a migration) only when
-// a measured fleet nears that bound. Past the bound every request times out, so the
-// model reads usage_unavailable on every request until the index exists; the fleet
-// size at which that happens has not been measured. The result is bounded by the
+// scan bounded by the statement timeout; add an index (a migration) only when a
+// measured fleet nears that bound. Past the bound every request times out; after
+// kDexUsageTimeoutsBeforeTooLarge in a row over kDexUsageTimeoutRunBeforeTooLarge the
+// owner reports fleet_too_large (not retryable) until the index or a precomputed
+// rollup exists; the fleet size at which that happens has not been measured. The result is bounded by the
 // caller's subject and cell counts (one row per application and cell, one per
 // application, one coverage row).
 const std::string& read_sql() {
@@ -133,24 +144,54 @@ std::vector<std::string_view> views(const std::vector<std::string>& v) {
 
 } // namespace
 
-DexAppUsageOwner::DexAppUsageOwner(pg::PgPool& pool) : pool_(pool) {}
+DexAppUsageOwner::DexAppUsageOwner(pg::PgPool& pool, yuzu::MetricsRegistry* metrics, int concurrent_reads,
+                                   std::chrono::milliseconds statement_timeout)
+    : pool_(pool), metrics_(metrics), budget_(concurrent_reads), statement_timeout_(statement_timeout) {}
 
-std::optional<DexUsageRead> DexAppUsageOwner::read(const DexUsageQuery& q) const {
+const char* DexAppUsageOwner::unavailable_detail(DexReadFault f) const noexcept {
+    const std::int64_t start = timeout_run_start_.load();
+    const auto age = start == 0 ? std::chrono::steady_clock::duration::zero()
+                                : std::chrono::steady_clock::now().time_since_epoch() -
+                                      std::chrono::steady_clock::duration(start);
+    return dex_usage_unavailable_detail(f, consecutive_timeouts_.load(), age);
+}
+
+std::unexpected<DexReadFault> DexAppUsageOwner::fault(DexReadFault f) const {
+    const char* reason = dex_read_fault_token(f);
+    if (metrics_)
+        metrics_->counter("yuzu_server_guardian_read_degrade_total",
+                          {{"reason", reason}, {"source", kDegradeSource}})
+            .increment();
+    // The counter is the continuous signal; the log is a sampled breadcrumb. The text names no
+    // subject, agent or tag.
+    if (log_throttle_.should_warn(reason))
+        spdlog::warn("DexAppUsageOwner: read degraded: {}", reason);
+    else
+        spdlog::debug("DexAppUsageOwner: read degraded: {}", reason);
+    return std::unexpected(f);
+}
+
+std::expected<DexUsageRead, DexReadFault> DexAppUsageOwner::read(const DexUsageQuery& q) const {
     if (q.devices.empty())
         return DexUsageRead{};
 
     // The caller's indices are checked here, so a bad one never reaches the statement.
-    // The warning names no subject and no agent.
     for (const auto& d : q.devices)
-        if (d.cell < 0 || d.cell >= q.cell_count) {
-            spdlog::warn("DexAppUsageOwner: a device cell index is out of range");
-            return std::nullopt;
-        }
+        if (d.cell < 0 || d.cell >= q.cell_count)
+            return fault(DexReadFault::kQueryError);
     for (const auto& k : q.keys)
-        if (k.subject < 0 || static_cast<std::size_t>(k.subject) >= q.subjects.size()) {
-            spdlog::warn("DexAppUsageOwner: a key subject index is out of range");
-            return std::nullopt;
-        }
+        if (k.subject < 0 || static_cast<std::size_t>(k.subject) >= q.subjects.size())
+            return fault(DexReadFault::kQueryError);
+
+    // A refused caller holds its increment until it returns, so a burst can refuse a few reads
+    // more than necessary for an instant; the refusal is retryable and the budget is never exceeded.
+    struct Slot {
+        std::atomic<int>& n;
+        ~Slot() { n.fetch_sub(1); }
+    };
+    const Slot slot{in_flight_};
+    if (in_flight_.fetch_add(1) >= budget_)
+        return fault(DexReadFault::kConcurrencyBudget);
 
     // Views into `q`, which outlives this call.
     std::vector<std::string_view> ids, key_text;
@@ -172,22 +213,25 @@ std::optional<DexUsageRead> DexAppUsageOwner::read(const DexUsageQuery& q) const
         q.since_iso,
         q.until_iso,
         std::to_string(q.fresh_since_epoch)};
+    const std::string set_timeout =
+        "SET LOCAL statement_timeout = '" + std::to_string(statement_timeout_.count()) + "ms'";
 
     std::optional<DexUsageRead> out;
-    bool statement_failed = false;
+    std::optional<DexReadFault> statement_fault;
     // Never names a subject or an agent: both are caller-supplied text.
-    const auto fail = [&statement_failed](const pg::PgResult& res) {
-        statement_failed = true;
+    const auto fail = [&statement_fault](const pg::PgResult& res) {
         const char* state = PQresultErrorField(res.get(), PG_DIAG_SQLSTATE);
-        spdlog::warn("DexAppUsageOwner: statement failed, SQLSTATE {}",
-                     state != nullptr ? state : "unknown");
+        statement_fault = dex_usage_fault_from_sqlstate(state);
+        spdlog::debug("DexAppUsageOwner: statement failed, SQLSTATE {}", state != nullptr ? state : "unknown");
         return false;
     };
-    const bool ok = pool_.with_txn_for(kAcquireTimeout, [&](PGconn* c) -> bool {
-        pg::PgResult t = pg::exec_params(
-            c,
-            std::string("SET LOCAL statement_timeout = '").append(kStatementTimeout).append("'").c_str(),
-            std::vector<std::string>{});
+    // Acquire first, then run the transaction on that lease with nothing in between (the
+    // with_txn_on contract), so an acquire timeout and a failed transaction are told apart.
+    auto lease = pool_.try_acquire_for(kAcquireTimeout);
+    if (!lease)
+        return fault(DexReadFault::kPoolTimeout);
+    const bool ok = pool_.with_txn_on(std::move(lease), [&](PGconn* c) -> bool {
+        pg::PgResult t = pg::exec_params(c, set_timeout.c_str(), std::vector<std::string>{});
         if (t.status() != PGRES_COMMAND_OK)
             return fail(t);
         pg::PgResult r = pg::exec_params(c, read_sql().c_str(), params);
@@ -220,11 +264,21 @@ std::optional<DexUsageRead> DexAppUsageOwner::read(const DexUsageQuery& q) const
         return true;
     });
     if (!ok || !out) {
-        if (!statement_failed)
-            spdlog::warn("DexAppUsageOwner: pool acquire timed out or transaction not committed");
-        return std::nullopt;
+        // A false return with no statement failure is a failed BEGIN or COMMIT: a query error,
+        // never a pool timeout (the lease was acquired).
+        const DexReadFault f = statement_fault.value_or(DexReadFault::kQueryError);
+        if (f == DexReadFault::kStatementTimeout) {
+            // The first timeout of an unbroken run stamps its start; the run is cleared by a success.
+            consecutive_timeouts_.fetch_add(1);
+            std::int64_t none = 0;
+            timeout_run_start_.compare_exchange_strong(
+                none, std::max<std::int64_t>(1, std::chrono::steady_clock::now().time_since_epoch().count()));
+        }
+        return fault(f);
     }
-    return out;
+    consecutive_timeouts_.store(0);
+    timeout_run_start_.store(0);
+    return std::move(*out);
 }
 
 } // namespace yuzu::server

@@ -11,8 +11,12 @@
  */
 #include "dex_usage_model.hpp"
 
+#include "dex_usage_json.hpp"
+#include "dex_window.hpp"
+
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -918,4 +922,193 @@ TEST_CASE("usage builder: a floor below one is applied as one and reported as on
         CHECK(r->apps[0].totals->run_seconds_30d == 3600);
         CHECK(r->apps[0].totals->launches_30d == 2);
     }
+}
+
+// ── The request instant, and the serializer ─────────────────────────────────
+
+TEST_CASE("usage builder: the model records the request instant and shares the window cut",
+          "[dex][usage_model]") {
+    Calls c;
+    const auto r = build_dex_apps_usage_model(apps_of({"alpha.exe"}), fleet_of(), request_at(), sources_of(c));
+    REQUIRE(r.has_value());
+    CHECK(r->as_of_epoch == kNow);
+    CHECK(c.query.since_iso == dex_iso_since_at(kNow, 7));
+    CHECK(c.query.until_iso == dex_iso_at(kNow));
+}
+
+TEST_CASE("dex_iso_since_at: days at or below zero are empty, else the instant minus whole days",
+          "[dex][usage_model]") {
+    CHECK(dex_iso_since_at(kNow, 0).empty());
+    CHECK(dex_iso_since_at(kNow, -1).empty());
+    CHECK(dex_iso_since_at(kNow, 7) == dex_iso_at(kNow - 604800));
+    CHECK(dex_iso_since_at(kNow, 7) == "2023-11-07T22:13:20Z");
+    CHECK(dex_iso_since_at(kNow, 1) == "2023-11-13T22:13:20Z");
+}
+
+namespace {
+
+using json = nlohmann::json;
+
+// The wire body of a model built from a read, parsed.
+json usage_body(const DexAppsModel& apps, const DexFleet& fleet, const DexUsageRequest& req,
+                const DexUsageRead& read) {
+    Calls c;
+    const auto m = build_dex_apps_usage_model(apps, fleet, req, sources_of(c, read));
+    REQUIRE(m.has_value());
+    return json::parse(dex_apps_usage_json(*m));
+}
+
+} // namespace
+
+TEST_CASE("usage serializer: every response states its basis, freshness, floor scope and coverage",
+          "[dex][usage_model]") {
+    DexUsageRead read;
+    read.cells = {cell_row(0, 0, 40, 40, 0, 100, 1'080'000)};
+    read.events = {{0, 4, 1}};
+    read.reporting_devices = 3;
+    read.stale_devices = 1;
+    DexUsageRequest req = request_at();
+    req.slice = {DexUsageSliceKind::Tag, ""};
+    const auto b = usage_body(apps_of({"alpha.exe"}), fleet_of(), req, read);
+    CHECK(b["window"] == "7d");
+    CHECK(b["platform_scope"] == "all");
+    CHECK(b["slice"]["kind"] == "tag");
+    CHECK(b["slice"]["key"] == kDexDefaultCohortKey);
+    CHECK(b["as_of"] == dex_iso_at(kNow));
+    CHECK(b["basis"] == "estimated_from_30_day_usage");
+    CHECK(b["freshness_window_hours"] == 48);
+    CHECK(b["floor"] == 1);
+    CHECK(b["floor_scope"] == "per_table");
+    CHECK(b["population"] == 4);
+    CHECK(b["reporting_devices"] == 3);
+    CHECK(b["stale_devices"] == 1);
+    REQUIRE(b["apps"].size() == 1);
+    const auto& a = b["apps"][0];
+    CHECK(a["subject"] == "alpha.exe");
+    CHECK(a["state"] == "matched");
+    CHECK(a["run_seconds_30d"] == 1'080'000);
+    CHECK(a["launches_30d"] == 100);
+    CHECK(a["rate_withheld"].is_null());
+    // Hand-computed: 1,080,000 x 7/30 / 3,600 = 70 process-hours.
+    CHECK(a["exposure_rate"]["hours"].get<double>() == Approx(70.0));
+    CHECK(a["exposure_rate"]["crashes"] == 4);
+    CHECK(a["exposure_rate"]["hangs"] == 1);
+    CHECK(a["exposure_rate"]["basis"] == "estimated_from_30_day_usage");
+    CHECK(a["exposure_rate"]["per_hour"]["estimate"].get<double>() == Approx(5.0 / 70.0));
+
+    // A fleet or platform slice has no key; a group slice names it.
+    CHECK(usage_body(apps_of({"a"}), fleet_of(), request_at(), read)["slice"]["key"].is_null());
+    DexUsageRequest greq = request_at();
+    greq.slice = {DexUsageSliceKind::Group, "g-1"};
+    const auto g = usage_body(apps_of({"a"}), fleet_of(), greq, read);
+    CHECK(g["slice"]["kind"] == "group");
+    CHECK(g["slice"]["key"] == "g-1");
+}
+
+TEST_CASE("usage serializer: a below-floor application withholds its figures as null, never zero",
+          "[dex][usage_model]") {
+    DexUsageRead read;
+    read.cells = {cell_row(0, 0, 3, 3, 0, 9, 5400)};
+    DexUsageRequest req = request_at();
+    req.floor = 10;
+    const auto b = usage_body(apps_of({"alpha.exe"}), fleet_of(), req, read);
+    CHECK(b["floor"] == 10);
+    const auto& a = b["apps"][0];
+    CHECK(a["state"] == "matched");
+    CHECK(a["devices"] == 3);
+    CHECK(a["run_seconds_30d"].is_null());
+    CHECK(a["launches_30d"].is_null());
+    CHECK(a["cells"].empty());
+    CHECK(a["exposure_rate"].is_null());
+    CHECK(a["rate_withheld"] == "below_floor");
+}
+
+TEST_CASE("usage serializer: ambiguous_name and no_usage rows carry their state and null figures",
+          "[dex][usage_model]") {
+    DexAppsUsageModel m;
+    m.apps.resize(2);
+    m.apps[0].subject = "shared.exe";
+    m.apps[0].state = DexUsageState::AmbiguousName;
+    m.apps[0].rate_withheld = "ambiguous_name";
+    m.apps[1].subject = "idle.exe";
+    m.apps[1].state = DexUsageState::NoUsage;
+    m.apps[1].rate_withheld = "no_usage";
+    const auto b = json::parse(dex_apps_usage_json(m));
+    REQUIRE(b["apps"].size() == 2);
+    CHECK(b["apps"][0]["state"] == "ambiguous_name");
+    CHECK(b["apps"][0]["rate_withheld"] == "ambiguous_name");
+    CHECK(b["apps"][1]["state"] == "no_usage");
+    CHECK(b["apps"][1]["rate_withheld"] == "no_usage");
+    for (const auto& a : b["apps"]) {
+        CHECK(a["run_seconds_30d"].is_null());
+        CHECK(a["launches_30d"].is_null());
+        CHECK(a["exposure_rate"].is_null());
+        CHECK(a["cells"].empty());
+        CHECK(a["devices"] == 0);
+    }
+}
+
+TEST_CASE("usage serializer: a cell is keyed on its kind, so a label that imitates a residual differs",
+          "[dex][usage_model]") {
+    // A Named cell labelled like the residual, a Named cell labelled like the untagged cell, and
+    // the real Untagged and Other cells: four cells, four distinct (kind, label) pairs.
+    const auto d = dex_usage_disclose({raw(DexUsageCellKind::Named, "other", 40),
+                                       raw(DexUsageCellKind::Named, "(untagged)", 35),
+                                       raw(DexUsageCellKind::Untagged, "(untagged)", 12),
+                                       raw(DexUsageCellKind::Other, "other", 32)},
+                                      1);
+    DexAppsUsageModel m;
+    m.apps.resize(1);
+    m.apps[0].subject = "alpha.exe";
+    m.apps[0].state = DexUsageState::Matched;
+    m.apps[0].devices = d.devices;
+    m.apps[0].totals = d.totals;
+    m.apps[0].cells = d.cells;
+    const auto b = json::parse(dex_apps_usage_json(m));
+    const auto& cells = b["apps"][0]["cells"];
+    REQUIRE(cells.size() == 4);
+    std::vector<std::pair<std::string, std::string>> seen;
+    for (const auto& c : cells)
+        seen.emplace_back(c["kind"].get<std::string>(), c["label"].get<std::string>());
+    CHECK(seen[0] == std::pair<std::string, std::string>{"named", "other"});
+    CHECK(seen[1] == std::pair<std::string, std::string>{"named", "(untagged)"});
+    CHECK(seen[2] == std::pair<std::string, std::string>{"untagged", "(untagged)"});
+    CHECK(seen[3] == std::pair<std::string, std::string>{"other", "other"});
+    std::sort(seen.begin(), seen.end());
+    CHECK(std::adjacent_find(seen.begin(), seen.end()) == seen.end());
+    CHECK(cells[0]["small_cohort"] == false); // 40 devices
+    CHECK(cells[2]["small_cohort"] == true);  // 12 devices is below the small-cohort bound
+    CHECK(cells[3]["small_cohort"] == false); // 32 devices
+}
+
+TEST_CASE("usage serializer: a label with invalid UTF-8 and a quote serialises, never throws",
+          "[dex][usage_model]") {
+    DexAppsUsageModel m;
+    m.slice = {DexUsageSliceKind::Group, std::string("grp\xff\"x")};
+    m.apps.resize(1);
+    m.apps[0].subject = std::string("bad\xc3\x28.exe");
+    m.apps[0].state = DexUsageState::Matched;
+    m.apps[0].cells = {{DexUsageCellKind::Named, std::string("v\xff\"q"), 5, {1, 2}, true}};
+    std::string body;
+    REQUIRE_NOTHROW(body = dex_apps_usage_json(m));
+    const auto b = json::parse(body); // valid JSON
+    CHECK(b["apps"][0]["cells"][0]["label"] == "v\xEF\xBF\xBD\"q");
+    CHECK(b["slice"]["key"] == "grp\xEF\xBF\xBD\"x");
+}
+
+TEST_CASE("usage serializer: no agent id appears anywhere in the body", "[dex][usage_model]") {
+    DexFleet fleet;
+    fleet.connected_agents = {{"agent-secret-0001", "windows"}, {"agent-secret-0002", "linux"}};
+    DexUsageRead read;
+    read.cells = {cell_row(0, 0, 2, 1, 1, 4, 7200)};
+    read.events = {{0, 1, 0}};
+    read.reporting_devices = 2;
+    DexUsageRequest req = request_at();
+    req.slice = {DexUsageSliceKind::Platform, ""};
+    Calls c;
+    const auto m = build_dex_apps_usage_model(apps_of({"alpha.exe"}), fleet, req, sources_of(c, read));
+    REQUIRE(m.has_value());
+    const std::string body = dex_apps_usage_json(*m);
+    CHECK(body.find("agent-secret") == std::string::npos);
+    CHECK(body.find("agent_id") == std::string::npos);
 }

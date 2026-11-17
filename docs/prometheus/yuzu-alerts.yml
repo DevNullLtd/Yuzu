@@ -5236,20 +5236,22 @@ groups:
       # with no alert referencing it, so a sustained read degrade silently
       # turned device compliance scores "healthy" (the DEX-score fail-open
       # this counter's guardian_state source also covers) and paged nobody.
-      # Four sources on the SAME counter (guardian_census, #5690, covers the
+      # Five sources on the SAME counter (guardian_census, #5690, covers the
       # two census gauge reads, the pending-evidence count and the
       # unordered-agents count: they serve no empty result, each gauge
       # keeps its last value; guardian_census_device, #7217, covers the
       # per-device unrepresented-pending read and the per-device order read:
       # their degrade is a REST 503 / MCP error, never an empty result, and
-      # does not touch either gauge), each
+      # does not touch either gauge; dex_usage covers the fleet application usage
+      # read behind GET /api/v1/dex/apps/usage: its degrade is a 503, never zero
+      # figures), each
       # keyed by reason
       # (store_not_open/pool_acquire_timeout/query_error, plus concurrency_budget
       # on guardian_state for the Apps list's in-flight budget, and
       # statement_timeout on guardian_census_device for a read that ran past its
       # 5 s budget, most likely because of a large retained pending backlog, and
       # on guardian_state for an Apps read cancelled at the 30 s statement
-      # timeout): "guardian_state"
+      # timeout, and on dex_usage for a usage read cancelled at its 10 s bound): "guardian_state"
       # is the DEX/observation family (dex_read<>/dex_observation) - these
       # fail SOFT, serving an empty/degraded result rather than an error, so
       # this is the ONLY external signal that anything went wrong; "guardian_rules"
@@ -5325,6 +5327,17 @@ groups:
             list read (GET /api/v1/dex/apps, list_dex_apps) was refused with a
             retryable 503 because four were already running; look for a
             caller polling it in parallel.
+            source="dex_usage" means the fleet application usage read behind
+            GET /api/v1/dex/apps/usage is degrading. It fails closed: the
+            request is a 503 naming the reason, never a 200 with zero figures.
+            reason="concurrency_budget" is the same in-flight budget refusal
+            (four at once, retryable). reason="statement_timeout" is the read
+            running past its 10 s bound; three in a row spanning two minutes with
+            no success make the route answer fleet_too_large (503 with no retry
+            hint), which a retry does not clear: the usage side has no index on
+            the executable key, so the fix is that index or a precomputed
+            rollup (see "Fleet usage per application" in the Digital Employee
+            Experience guide).
             See #2659 for the deferred-widening posture behind this metric.
           runbook_url: "https://docs.yuzu.io/runbooks/guardian-read-degraded"
 

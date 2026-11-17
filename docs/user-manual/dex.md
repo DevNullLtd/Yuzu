@@ -652,6 +652,12 @@ does (agentic-first parity):
   names devices fleet-wide.
 - **`GET /api/v1/dex/apps?window=&platform=`**, the application stability list (a distinct
   device count per application, no `agent_id`; not audited).
+- **`GET /api/v1/dex/apps/usage?window=&platform=&slice=&group=&tag_key=&floor=`**, fleet usage per
+  application: for each application on the Apps list, the devices that ran it, its run time and
+  launches over a 30-day basis and its crashes and hangs per hour of use, marked as estimated. It
+  needs `Forensics:Read` as well as `GuaranteedState:Read` (administrators only while RBAC is off) and
+  is audited fail-closed as `dex.apps.usage.view`. The device floor applies per table only. No
+  agent ids appear. See [app usage](../dex/app-usage.md#fleet-usage-per-application).
 - **`GET /api/v1/dex/catalogue?os=&window=`**, the Catalogue family cards, fleet
   coverage and the uncatalogued list, and **`GET /api/v1/dex/catalogue/group?name=&os=&window=`**,
   one signal family's member signals (404 for an unknown family). Aggregates, not

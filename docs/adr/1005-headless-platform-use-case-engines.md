@@ -1947,6 +1947,29 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        `docs/user-manual/security-hardening.md` "Device Quarantine".
      - Recorded by the change author; ADR-owner acceptance pending.
 
+   - **2026-11-17 - fleet application usage (`GET /api/v1/dex/apps/usage`) is
+     REST only for now; its MCP twin is owed and recorded as an exception.**
+     The route serves, for each application on the Apps list, the devices that
+     ran it, its run time and launches over a 30-day basis and its crashes and
+     hangs per hour of use, in the cells of a chosen slice. The routed
+     invariant is "REST and MCP, or a recorded ledger exception", so the absent
+     tool is recorded rather than left implicit.
+     - **A dated exception, not a permanent absence.** Recorded by the
+       v1-keyed `exception:#8096 revisit:2026-12-31` row
+       `get.api-v1-dex-apps-usage` in `scripts/ci/api-parity/dex.json`, pinned
+       in `STRICT_EXCEPTION_PINS` (tracking issue **#8096**), which is why
+       `BASELINE_UNTWINNED` rose by one (196 to 197). The row is retired, and
+       the baseline lowered, when the MCP tool lands; the tool reuses
+       `dex_apps_usage_json` and the `DexApi` `apps_usage` seam, not a second
+       copy of the model.
+     - **The exception relaxes no control.** The route is gated by
+       `GuaranteedState:Read` and `Forensics:Read`, both required, and audited
+       fail-closed as `dex.apps.usage.view` before the read; the device list is
+       filtered to what the caller is admitted to before the figures are
+       built. Wire reference: `docs/user-manual/rest-api.md`, "GET
+       /api/v1/dex/apps/usage"; audit row: `docs/user-manual/audit-log.md`.
+     - Recorded by the change author; ADR-owner acceptance pending.
+
 ## Interim rules (until the named follow-ups ship)
 
 - **No engine principal class exists** until the auth-architecture follow-up lands. Until then, integrations authenticate as themselves via existing API tokens, and the server accepts **no** on-behalf-of assertion on any surface — any such header/field is rejected, not ignored.

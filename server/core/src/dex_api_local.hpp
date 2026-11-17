@@ -13,8 +13,10 @@
 /// lint-enforced: this header is itself in the family's enforced closure set,
 /// so a store `#include` added here fails CI.
 
+#include <expected>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -40,6 +42,25 @@ using FleetFn = std::function<DexFleet()>;
 /// store, so this header needs no registry include. Empty = no observer source (the model's
 /// `observer_state` stays unset).
 using DexObserverFn = std::function<std::vector<DexObserverState>(const std::vector<std::string>& ids)>;
+
+/// The reads behind `DexApi::apps_usage`, assembled in server.cpp (this header names no store).
+/// An empty closure is a failed read, never an empty result.
+///  - `read`: the one cross-store usage statement. The error is the detail token a surface reports
+///    (`concurrency_budget`, `pool_acquire_timeout`, `query_error`, `statement_timeout`,
+///    `fleet_too_large`, `not_wired`).
+///  - `group_members`: the member agent ids of a management group. The error is `unknown_group`
+///    when no such group exists (a 400 for the caller) or `group_unavailable` when it cannot be
+///    read (a retryable 503).
+///  - `tag_values`: agent id -> value for one tag key; nullopt when it cannot be read.
+///  - `observation_retention_days`: the observation store's retention. Unset refuses every usage
+///    read as `invalid_request`: an omitted value would turn the retention guard off.
+struct DexUsageWiring {
+    std::function<std::expected<DexUsageRead, std::string>(const DexUsageQuery&)> read;
+    std::function<std::expected<std::vector<std::string>, std::string>(const std::string& group_id)>
+        group_members;
+    decltype(DexUsageSources::tag_values) tag_values;
+    std::optional<int> observation_retention_days;
+};
 
 /// Factory for the store-backed implementation (`LocalDexApi`, dex_api.cpp —
 /// kept out of the abstract header so that header stays free of store
@@ -72,10 +93,15 @@ using DexObserverFn = std::function<std::vector<DexObserverState>(const std::vec
 /// `observer_fn` may be empty (see `DexObserverFn`). When set it is borrowed like `fleet_fn`: its
 /// captures must outlive every holder of the returned API (server.cpp declares the health store
 /// before them; tests/test_guardian_backend_wiring_lexical.py pins that order).
+///
+/// `usage` is the wiring behind `apps_usage` (see `DexUsageWiring`); a default one answers every
+/// usage read with the refusal `usage_unavailable`/`not_wired`. Its captures are borrowed like
+/// `fleet_fn`'s.
 [[nodiscard]] std::shared_ptr<DexApi> make_local_dex_api(GuaranteedStateStore* store,
                                                          FleetFn fleet_fn,
                                                          DexScorePolicyFn policy_fn = {},
-                                                         DexObserverFn observer_fn = {});
+                                                         DexObserverFn observer_fn = {},
+                                                         DexUsageWiring usage = {});
 
 /// The production `DexScorePolicyProvider::ReadFn`: reads the stored score policy
 /// document (`kDexScorePolicyKey`) from the runtime config store. A stored value is

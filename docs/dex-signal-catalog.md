@@ -594,7 +594,7 @@ crashes, the OOM-killer) are **shipped** — see the Linux collector section abo
   other signals get their own panels. Rates always pair with coverage
   (reporting Windows agents) and show "—" when the denominator is missing.
 - The fleet usage read model (`dex_usage_model.hpp`, with the `DexAppUsageOwner` query owner) is
-  not yet exposed on any surface. Its rules: figures are aggregates and never carry an agent id; a
+  served by `GET /api/v1/dex/apps/usage`; the Apps page and MCP do not show it yet. Its rules: figures are aggregates and never carry an agent id; a
   floor applies to the devices that contributed to a figure, sub-floor cells merge into `other`, and
   a table below the floor publishes the device count only. `other` also holds devices on an
   unrecognised platform, devices outside the chosen group, and tag values beyond the 50 with the

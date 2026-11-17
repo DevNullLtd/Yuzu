@@ -6,8 +6,8 @@
 /// (a 30-day basis), and the exposure rate per hour of use. Header-only and
 /// store-type-free by construction: no store header, no httplib, no JSON, no
 /// clock. Every time value comes from the request (`DexUsageRequest::now_epoch`).
-/// Nothing here is published by any surface yet (REST, MCP and the Apps page
-/// are separate changes); the figures are aggregates and never carry an agent id.
+/// GET /api/v1/dex/apps/usage serves this model; the Apps page and MCP are
+/// separate surfaces. The figures are aggregates and never carry an agent id.
 ///
 /// Honesty rules (each is pinned by a test):
 ///  - Matching. An Apps subject matches a usage name by the ASCII-lowercased
@@ -238,6 +238,9 @@ struct DexAppsUsageModel {
     std::int64_t reporting_devices{0};
     std::int64_t stale_devices{0};
     std::int64_t floor{kDexCohortFloor};
+    /// The request instant the model was built at (epoch seconds), so a cached
+    /// model's age is visible to the consumer.
+    std::int64_t as_of_epoch{0};
     std::vector<DexAppUsage> apps; ///< index-aligned with DexAppsModel::apps
 };
 
@@ -640,9 +643,8 @@ build_dex_apps_usage_model(const DexAppsModel& apps, const DexFleet& fleet, cons
         q.subjects.push_back(a.subject);
     q.keys = dex_usage_match_plan(q.subjects);
     const int days = dex_window_to_days(apps.window);
-    // The same arithmetic as dex_iso_since, from the one request instant.
-    q.since_iso = days > 0 ? dex_iso_at(req.now_epoch - static_cast<std::int64_t>(days) * 86400)
-                           : std::string{};
+    // The one window-cut arithmetic, from the one request instant.
+    q.since_iso = dex_iso_since_at(req.now_epoch, days);
     q.until_iso = dex_iso_at(req.now_epoch);
     q.fresh_since_epoch = req.now_epoch - kDexUsageFreshSecs;
 
@@ -657,6 +659,7 @@ build_dex_apps_usage_model(const DexAppsModel& apps, const DexFleet& fleet, cons
         return unexpected(std::string("usage_unavailable"));
     model->slice = slice;
     model->population = static_cast<std::int64_t>(population.size());
+    model->as_of_epoch = req.now_epoch;
     return std::move(*model);
 }
 

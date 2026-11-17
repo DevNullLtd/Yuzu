@@ -491,3 +491,17 @@ read (no connection in the bounded acquire, a statement error or timeout, an ind
 returns `std::nullopt`, distinct from an engaged empty result. Nothing about the rule changes: the
 owner borrows the pool, issues schema-qualified SQL with bound parameters, and no per-store class
 gained a cross-schema method.
+
+Update (2026-11-17): `read` now returns `std::expected<DexUsageRead, DexReadFault>` and no longer
+returns `std::nullopt`; this supersedes the `std::nullopt` sentence above. The fault is one of
+`pool_acquire_timeout` (no connection within the bounded `try_acquire_for`), `query_error` (an index
+out of range, or a failed statement, `BEGIN` or `COMMIT` on the leased connection),
+`statement_timeout` (SQLSTATE 57014) or `concurrency_budget` (an in-flight budget of 4, never wider
+than the Apps stability read's own, refused at once rather than queued behind the pool). The owner
+takes the lease with `try_acquire_for` and runs the transaction on it with `with_txn_on`, so an
+acquire timeout and a transaction failure are told apart. Each fault counts
+`yuzu_server_guardian_read_degrade_total{reason, source="dex_usage"}`. The owner also keeps a
+sustained-timeout state: three or more consecutive statement timeouts whose unbroken run is at
+least two minutes old (any success resets both) are reported to the surface as `fleet_too_large`
+instead of the retryable `statement_timeout`. A burst of concurrent reads timing out in one stall
+cannot span two minutes, so it stays retryable.
