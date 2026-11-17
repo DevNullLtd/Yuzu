@@ -973,9 +973,16 @@ TEST_CASE("AgentDecommission drops store evidence unless the delete committed",
         d = "must-not-survive";
         throw std::runtime_error("boom");
     });
+    cascade.add_store_with_detail("fills_then_throws_non_std", [](std::string_view, std::string& d) -> bool {
+        d = "must-not-survive";
+        throw 42; // the catch (...) arm
+    });
     const auto result = cascade.decommission("agent-x");
-    REQUIRE(result.stores.size() == 3);
+    REQUIRE(result.stores.size() == 4);
+    CHECK(result.stores[0].outcome == DecommissionOutcome::Deleted);
     CHECK(result.stores[0].detail == "kept");
+    CHECK(result.stores[3].outcome == DecommissionOutcome::Failed);
+    CHECK(result.stores[3].detail.empty());
     CHECK(result.stores[1].outcome == DecommissionOutcome::Failed);
     CHECK(result.stores[1].detail.empty());
     CHECK(result.stores[2].outcome == DecommissionOutcome::Failed);
