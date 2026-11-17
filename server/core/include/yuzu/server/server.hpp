@@ -428,10 +428,14 @@ struct Config {
     // counter resets on a successful login or an admin unlock. Threshold 0
     // disables the feature. The lock is temporary/auto-expiring so it cannot
     // be weaponised to permanently DoS a legitimate principal; OIDC and the
-    // MFA code-verification path (which has its own rate-limit) are out of
+    // MFA code-verification path (own per-account budget, see below) are out of
     // scope. See docs/auth-architecture.md.
     int auth_lockout_threshold{5};     // consecutive failures before lock; 0 disables
     int auth_lockout_window_secs{900}; // lock duration, default 15 min
+    // WP03 perf-F1: concurrent PBKDF2 slots one source address may hold on the unauthenticated
+    // login lane (/login, recovery code behind a pending token). Keyed on the TCP peer address:
+    // behind a proxy/LB/NAT every user shares it, so raise it there. See server-admin.md.
+    int auth_pbkdf2_per_source_cap{4};
 
     // MFA / TOTP — `/auth-and-authz` skill gap matrix P0 #1, SOC 2 CC6.6.
     // See docs/auth-mfa-design.md. PR1 ships enforcement="optional" (self-

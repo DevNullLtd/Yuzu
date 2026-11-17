@@ -20,6 +20,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <optional>
 #include <shared_mutex>
 #include <sstream>
 #include <stdexcept>
@@ -35,7 +36,8 @@
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <sys/stat.h> // umask()
-#include <unistd.h>   // geteuid()
+#include <unistd.h>   // geteuid(), isatty()
+#include <termios.h>  // F44: disable echo on the first-run password prompt
 #endif
 
 namespace yuzu::server::auth {
@@ -391,22 +393,36 @@ static std::string prompt(const std::string& msg, const std::string& default_val
     return input;
 }
 
-static std::string prompt_password(const std::string& msg) {
+// F44: returns nullopt (caller refuses) when echo cannot be disabled on POSIX.
+static std::optional<std::string> prompt_password(const std::string& msg) {
     std::cout << msg << ": ";
     std::cout.flush();
 
-    // Disable echo
 #ifdef _WIN32
     HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
-    DWORD mode;
+    DWORD mode = 0;
     GetConsoleMode(hStdin, &mode);
     SetConsoleMode(hStdin, mode & ~ENABLE_ECHO_INPUT);
 #else
-    // POSIX: use termios to disable echo
-    struct termios_guard {
-        // Simple approach: just read without echo toggle for now.
-        // Full implementation would use tcgetattr/tcsetattr.
-    };
+    // POSIX: refuse unless stdin is a TTY whose echo we can clear. The RAII
+    // guard restores the saved attributes on every exit path (early return,
+    // exception from getline).
+    struct termios saved{};
+    if (!isatty(STDIN_FILENO) || tcgetattr(STDIN_FILENO, &saved) != 0) {
+        std::cerr << "\nstdin is not a terminal; refusing to read a password without echo "
+                     "control.\n";
+        return std::nullopt;
+    }
+    struct termios noecho = saved;
+    noecho.c_lflag &= ~static_cast<tcflag_t>(ECHO);
+    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &noecho) != 0) {
+        std::cerr << "\nCould not disable terminal echo; refusing to read a password.\n";
+        return std::nullopt;
+    }
+    struct EchoRestore {
+        struct termios saved;
+        ~EchoRestore() { tcsetattr(STDIN_FILENO, TCSAFLUSH, &saved); }
+    } restore{saved};
 #endif
 
     std::string pw;
@@ -438,7 +454,10 @@ bool AuthManager::first_run_setup(const std::filesystem::path& cfg_path) {
         std::cerr << "Account name cannot be empty.\n";
         return false;
     }
-    auto admin_pw = prompt_password("Admin password");
+    auto admin_pw_opt = prompt_password("Admin password");
+    if (!admin_pw_opt)
+        return false;
+    auto admin_pw = std::move(*admin_pw_opt);
     if (const auto verdict = check_password_policy(admin_pw);
         verdict != PasswordPolicyVerdict::kOk) {
         if (verdict == PasswordPolicyVerdict::kTooShort)
@@ -449,7 +468,9 @@ bool AuthManager::first_run_setup(const std::filesystem::path& cfg_path) {
         return false;
     }
     auto admin_pw2 = prompt_password("Confirm admin password");
-    if (admin_pw != admin_pw2) {
+    if (!admin_pw2)
+        return false;
+    if (admin_pw != *admin_pw2) {
         std::cerr << "Passwords do not match.\n";
         return false;
     }
@@ -1255,6 +1276,9 @@ std::optional<std::string> AuthManager::authenticate(const std::string& username
             return std::nullopt; // AuthDB unreachable: fail closed, already logged, not a
                                  // bad-username signal (no unknown_user histogram sample)
         spdlog::warn("Auth failed: unknown user '{}'", username);
+        // F38: equalise cost with the known-user path (fixed dummy salt, result
+        // discarded) so latency does not enumerate usernames.
+        (void)pbkdf2_sha256(password, std::vector<uint8_t>(16, 0x5a), kPbkdf2Iterations);
         if (metrics_) {
             const auto elapsed =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
@@ -1350,6 +1374,9 @@ AuthManager::verify_password(const std::string& username, const std::string& pas
         if (entry.error() == UserLookupMiss::DbError)
             return std::unexpected(VerifyFailure::kStoreUnavailable);
         spdlog::warn("verify_password failed: unknown user '{}'", username);
+        // F38: equalise cost with the known-user path (fixed dummy salt, result
+        // discarded) so latency does not enumerate usernames.
+        (void)pbkdf2_sha256(password, std::vector<uint8_t>(16, 0x5a), kPbkdf2Iterations);
         if (metrics_) {
             const auto elapsed =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();

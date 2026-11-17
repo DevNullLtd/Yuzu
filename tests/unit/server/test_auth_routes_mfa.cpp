@@ -24,6 +24,8 @@
 
 #include "rbac_store.hpp"
 #include "auth_routes.hpp"
+#include "pbkdf2_budget.hpp"
+#include "../../../server/core/src/auth_db_sql_helpers.hpp"
 
 #include "analytics_event_store.hpp"
 #include "api_token_store.hpp"
@@ -54,6 +56,7 @@
 #include <libpq-fe.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -1641,6 +1644,10 @@ TEST_CASE("POST /login: concurrent burst for one user cannot exceed the threshol
     const int threshold = 3;
     h.cfg.auth_lockout_threshold = threshold;
     h.cfg.auth_lockout_window_secs = 900;
+    // All 16 threads share ONE remote_addr and the unauthenticated lane holds half the cap: size
+    // the PBKDF2 budget so it does not throttle this lockout-race test (it has its own tests).
+    h.auth_routes->pbkdf2_budget().set_cap(64);
+    h.auth_routes->pbkdf2_budget().set_per_source_cap(64);
 
     constexpr int kThreads = 16;
     // Per-thread result slots (distinct indices → no synchronization needed;
@@ -2832,4 +2839,508 @@ TEST_CASE("POST /login/mfa/enroll on a recovery-code SALT-draw failure: 503, aud
     CHECK_FALSE(status->enrolled);
     CHECK(status->recovery_codes_remaining == 0);
 }
+
+// ---------------------------------------------------------------------------
+// WP03 F8/F15: durable per-account MFA failure budget
+// ---------------------------------------------------------------------------
+namespace {
+bool audit_detail_contains(AuthRoutesHarness& h, const std::string& action,
+                           const std::string& needle) {
+    AuditQuery q;
+    q.action = action;
+    auto rows = h.audit_store->query(q);
+    REQUIRE(rows.has_value());
+    for (const auto& r : *rows)
+        if (r.detail.find(needle) != std::string::npos)
+            return true;
+    return false;
+}
+} // namespace
+
+TEST_CASE("POST /login/mfa: wrong codes across re-minted pending tokens lock the account "
+          "(F15), and a valid code is then refused",
+          "[pg][mfa][routes][auth_routes][lockout]") {
+    AuthRoutesHarness h;
+    h.cfg.auth_lockout_threshold = 3;
+    h.cfg.auth_lockout_window_secs = 900;
+    const auto secret = h.enroll_mfa("admin");
+
+    // One wrong code per FRESH pending token: the per-token cap (5) is never reached, so
+    // only the per-account budget can stop this.
+    for (int i = 0; i < 3; ++i) {
+        const auto pending = login_pending(h, "admin", "adminpassword1");
+        auto r = h.sink.Post("/login/mfa", form({{"mfa_pending_token", pending}, {"code", "000000"}}),
+                             "application/x-www-form-urlencoded");
+        REQUIRE(r);
+        CHECK(r->status == 401);
+    }
+    CHECK(h.count_audits("auth.mfa.lockout.applied", "admin") == 1);
+
+    // The CORRECT code on a fresh token is refused while locked: no cookie, honest audit.
+    const auto pending = login_pending(h, "admin", "adminpassword1");
+    auto locked = h.sink.Post("/login/mfa",
+                              form({{"mfa_pending_token", pending}, {"code", h.totp_at(secret, 1)}}),
+                              "application/x-www-form-urlencoded");
+    REQUIRE(locked);
+    CHECK(locked->status == 401);
+    CHECK(locked->get_header_value("Set-Cookie").empty());
+    CHECK(audit_detail_contains(h, "mfa.login.failed", "mfa locked"));
+}
+
+TEST_CASE("POST /login/mfa: a password success does not reset the MFA failure budget (F15)",
+          "[pg][mfa][routes][auth_routes][lockout]") {
+    AuthRoutesHarness h;
+    h.cfg.auth_lockout_threshold = 5;
+    h.cfg.auth_lockout_window_secs = 900;
+    h.enroll_mfa("admin");
+    for (int i = 0; i < 2; ++i) {
+        const auto pending = login_pending(h, "admin", "adminpassword1");
+        h.sink.Post("/login/mfa", form({{"mfa_pending_token", pending}, {"code", "000000"}}),
+                    "application/x-www-form-urlencoded");
+    }
+    login_pending(h, "admin", "adminpassword1"); // a further password success
+    auto st = h.auth_db->mfa_lockout_status("admin");
+    REQUIRE(st.has_value());
+    CHECK(st->failed_count == 2);
+}
+
+namespace {
+/// Expire the MFA lock DB-side (no sleeping): the window has "passed" 1 h ago.
+void expire_mfa_lock(const std::string& dsn) {
+    yuzu::server::pg::PgConn conn{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    yuzu::server::pg::PgResult r{PQexec(
+        conn.get(),
+        "UPDATE auth.users SET mfa_locked_until = now() - interval '1 hour', "
+        "mfa_last_attempt_at = now() - interval '1 hour'")};
+    REQUIRE(r.ok());
+}
+} // namespace
+
+TEST_CASE("POST /login/mfa: a correct code after the lock window has passed succeeds (F15)",
+          "[pg][mfa][routes][auth_routes][lockout]") {
+    AuthRoutesHarness h;
+    h.cfg.auth_lockout_threshold = 3;
+    h.cfg.auth_lockout_window_secs = 900;
+    const auto secret = h.enroll_mfa("admin");
+    for (int i = 0; i < 3; ++i) {
+        const auto pending = login_pending(h, "admin", "adminpassword1");
+        h.sink.Post("/login/mfa", form({{"mfa_pending_token", pending}, {"code", "000000"}}),
+                    "application/x-www-form-urlencoded");
+    }
+    {
+        auto st = h.auth_db->mfa_lockout_status("admin");
+        REQUIRE(st.has_value());
+        REQUIRE(st->locked); // the lock really armed before we expire it
+        const auto pending = login_pending(h, "admin", "adminpassword1");
+        auto still = h.sink.Post("/login/mfa",
+                                 form({{"mfa_pending_token", pending}, {"code", h.totp_at(secret, 1)}}),
+                                 "application/x-www-form-urlencoded");
+        REQUIRE(still);
+        CHECK(still->status == 401);
+    }
+    expire_mfa_lock(h.auth_db.dsn());
+    const auto pending = login_pending(h, "admin", "adminpassword1");
+    auto ok = h.sink.Post("/login/mfa",
+                          form({{"mfa_pending_token", pending}, {"code", h.totp_at(secret, 1)}}),
+                          "application/x-www-form-urlencoded");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+}
+
+TEST_CASE("POST /login/mfa/stepup: wrong codes lock step-up for the account (F8)",
+          "[pg][mfa][stepup][routes][lockout]") {
+    AuthRoutesHarness h;
+    h.cfg.auth_lockout_threshold = 3;
+    h.cfg.auth_lockout_window_secs = 900;
+    const auto secret = h.enroll_mfa("admin");
+    const auto cookie = login_with_mfa(h, "admin", "adminpassword1", secret);
+
+    for (int i = 0; i < 3; ++i) {
+        auto r = h.sink.dispatch("POST", "/login/mfa/stepup", form({{"code", "000000"}}),
+                                 "application/x-www-form-urlencoded", {{"Cookie", cookie}});
+        REQUIRE(r);
+        CHECK(r->status == 401);
+    }
+    CHECK(h.count_audits("auth.mfa.lockout.applied", "admin") == 1);
+
+    auto locked = h.sink.dispatch("POST", "/login/mfa/stepup", form({{"code", "000000"}}),
+                                  "application/x-www-form-urlencoded", {{"Cookie", cookie}});
+    REQUIRE(locked);
+    CHECK(locked->status == 401);
+    CHECK(audit_detail_contains(h, "mfa.step_up.failed", "mfa locked"));
+}
+
+
+TEST_CASE("POST /login/mfa: an attempt that cannot be counted is never verified (503, fail closed)",
+          "[pg][mfa][routes][auth_routes][lockout][fail-closed]") {
+    AuthRoutesHarness h;
+    h.cfg.auth_lockout_threshold = 3;
+    h.cfg.auth_lockout_window_secs = 900;
+    const auto secret = h.enroll_mfa("admin");
+    const auto pending = login_pending(h, "admin", "adminpassword1");
+    // Break ONLY the budget write: every other users write passes.
+    yuzu::test::block_users_update_when(h.auth_db.dsn(),
+                                        "NEW.mfa_failed_count IS DISTINCT FROM OLD.mfa_failed_count");
+    // A VALID code: if the handler verified before counting, this would mint a session.
+    auto r = h.sink.Post("/login/mfa",
+                         form({{"mfa_pending_token", pending}, {"code", h.totp_at(secret, 1)}}),
+                         "application/x-www-form-urlencoded");
+    REQUIRE(r);
+    CHECK(r->status == 503);
+    CHECK(r->get_header_value("Set-Cookie").empty());
+    CHECK(audit_detail_contains(h, "mfa.login.failed", "could not be counted"));
+}
+
+TEST_CASE("POST /login/mfa/stepup: an attempt that cannot be counted is never verified (503)",
+          "[pg][mfa][stepup][routes][lockout][fail-closed]") {
+    AuthRoutesHarness h;
+    h.cfg.auth_lockout_threshold = 3;
+    h.cfg.auth_lockout_window_secs = 900;
+    const auto secret = h.enroll_mfa("admin");
+    const auto cookie = login_with_mfa(h, "admin", "adminpassword1", secret);
+    yuzu::test::block_users_update_when(h.auth_db.dsn(),
+                                        "NEW.mfa_failed_count IS DISTINCT FROM OLD.mfa_failed_count");
+    auto r = h.sink.dispatch("POST", "/login/mfa/stepup", form({{"code", "000000"}}),
+                             "application/x-www-form-urlencoded", {{"Cookie", cookie}});
+    REQUIRE(r);
+    CHECK(r->status == 503); // not the 401 an uncounted wrong guess used to get
+    CHECK(audit_detail_contains(h, "mfa.step_up.failed", "could not be counted"));
+    // Recovery-code shaped input takes the same gate.
+    auto rc = h.sink.dispatch("POST", "/login/mfa/stepup", form({{"code", "AAAA-BBBB-CCCC-DDDD"}}),
+                              "application/x-www-form-urlencoded", {{"Cookie", cookie}});
+    REQUIRE(rc);
+    CHECK(rc->status == 503);
+}
+
+TEST_CASE("POST /login/mfa: a verified code refunds its own reservation only",
+          "[pg][mfa][routes][auth_routes][lockout]") {
+    AuthRoutesHarness h;
+    h.cfg.auth_lockout_threshold = 2;
+    h.cfg.auth_lockout_window_secs = 900;
+    const auto secret = h.enroll_mfa("admin");
+    auto p1 = login_pending(h, "admin", "adminpassword1");
+    h.sink.Post("/login/mfa", form({{"mfa_pending_token", p1}, {"code", "000000"}}),
+                "application/x-www-form-urlencoded");
+    // The threshold-th reservation arms the lock but the code is still verified; success must
+    // give back just that one reservation: the earlier failure stays counted, the lock lifts.
+    auto p2 = login_pending(h, "admin", "adminpassword1");
+    auto ok = h.sink.Post("/login/mfa",
+                          form({{"mfa_pending_token", p2}, {"code", h.totp_at(secret, 1)}}),
+                          "application/x-www-form-urlencoded");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    auto st = h.auth_db->mfa_lockout_status("admin");
+    REQUIRE(st.has_value());
+    CHECK(st->failed_count == 1);
+    CHECK_FALSE(st->locked);
+}
+
+TEST_CASE("POST /login/mfa: a concurrent burst of wrong codes verifies at most `threshold` of them",
+          "[pg][mfa][routes][auth_routes][lockout][concurrency]") {
+    AuthRoutesHarness h;
+    const int threshold = 3;
+    h.cfg.auth_lockout_threshold = threshold;
+    h.cfg.auth_lockout_window_secs = 900;
+    h.enroll_mfa("admin");
+    constexpr int kThreads = 12;
+    std::vector<std::string> pendings;
+    for (int i = 0; i < kThreads; ++i)
+        pendings.push_back(login_pending(h, "admin", "adminpassword1"));
+    std::vector<int> statuses(kThreads, 0);
+    std::vector<std::thread> ts;
+    for (int i = 0; i < kThreads; ++i)
+        ts.emplace_back([&, i] {
+            auto r = h.sink.Post("/login/mfa",
+                                 form({{"mfa_pending_token", pendings[i]}, {"code", "000000"}}),
+                                 "application/x-www-form-urlencoded");
+            if (r)
+                statuses[i] = r->status;
+        });
+    for (auto& t : ts)
+        t.join();
+    for (int s : statuses)
+        CHECK(s == 401);
+    // Only `threshold` guesses reached verification; the rest were refused as locked.
+    AuditQuery q;
+    q.action = "mfa.login.failed";
+    auto rows = h.audit_store->query(q);
+    REQUIRE(rows.has_value());
+    int verified_wrong = 0, locked = 0;
+    for (const auto& r : *rows) {
+        if (r.detail.find("totp code rejected") != std::string::npos)
+            ++verified_wrong;
+        if (r.detail.find("mfa locked") != std::string::npos)
+            ++locked;
+    }
+    CHECK(verified_wrong == threshold);
+    CHECK(locked == kThreads - threshold);
+    CHECK(h.count_audits("auth.mfa.lockout.applied", "admin") == 1);
+}
+
+
+TEST_CASE("MFA budget: threshold 0 does NOT disable it (falls back to 5 / default window)",
+          "[pg][mfa][routes][auth_routes][lockout]") {
+    AuthRoutesHarness h;
+    h.cfg.auth_lockout_threshold = 0; // password lockout off
+    h.enroll_mfa("admin");
+    for (int i = 0; i < 5; ++i) {
+        const auto pending = login_pending(h, "admin", "adminpassword1");
+        h.sink.Post("/login/mfa", form({{"mfa_pending_token", pending}, {"code", "000000"}}),
+                    "application/x-www-form-urlencoded");
+    }
+    auto st = h.auth_db->mfa_lockout_status("admin");
+    REQUIRE(st.has_value());
+    CHECK(st->locked);
+    CHECK(h.count_audits("auth.mfa.lockout.applied", "admin") == 1);
+}
+
+TEST_CASE("MFA budget: wrong RECOVERY codes spend the same budget",
+          "[pg][mfa][routes][auth_routes][lockout]") {
+    AuthRoutesHarness h;
+    h.cfg.auth_lockout_threshold = 2;
+    h.cfg.auth_lockout_window_secs = 900;
+    h.enroll_mfa("admin");
+    for (int i = 0; i < 2; ++i) {
+        const auto pending = login_pending(h, "admin", "adminpassword1");
+        auto r = h.sink.Post("/login/mfa",
+                             form({{"mfa_pending_token", pending}, {"code", "AAAA-BBBB-CCCC-DDDD"}}),
+                             "application/x-www-form-urlencoded");
+        REQUIRE(r);
+        CHECK(r->status == 401);
+    }
+    auto st = h.auth_db->mfa_lockout_status("admin");
+    REQUIRE(st.has_value());
+    CHECK(st->locked);
+}
+
+TEST_CASE("MFA budget: operator unlock, admin reset and break-glass arming all lift the lock",
+          "[pg][mfa][routes][auth_routes][lockout]") {
+    AuthRoutesHarness h;
+    h.cfg.auth_lockout_threshold = 2;
+    h.cfg.auth_lockout_window_secs = 900;
+    h.enroll_mfa("admin");
+    auto lock = [&] {
+        for (int i = 0; i < 2; ++i) {
+            const auto pending = login_pending(h, "admin", "adminpassword1");
+            h.sink.Post("/login/mfa", form({{"mfa_pending_token", pending}, {"code", "000000"}}),
+                        "application/x-www-form-urlencoded");
+        }
+        auto st = h.auth_db->mfa_lockout_status("admin");
+        REQUIRE(st.has_value());
+        REQUIRE(st->locked);
+    };
+    auto unlocked = [&] {
+        auto st = h.auth_db->mfa_lockout_status("admin");
+        REQUIRE(st.has_value());
+        CHECK_FALSE(st->locked);
+        CHECK(st->failed_count == 0);
+    };
+    lock();
+    REQUIRE(h.auth_db->clear_account_lockouts("admin").has_value()); // REST + MCP unlock
+    unlocked();
+    lock();
+    h.admin_reset("admin", "adminpassword2"); // admin reset
+    unlocked();
+    h.sink.Post("/login", form({{"username", "admin"}, {"password", "adminpassword2"}}),
+                "application/x-www-form-urlencoded");
+    for (int i = 0; i < 2; ++i) {
+        const auto pending = login_pending(h, "admin", "adminpassword2");
+        h.sink.Post("/login/mfa", form({{"mfa_pending_token", pending}, {"code", "000000"}}),
+                    "application/x-www-form-urlencoded");
+    }
+    REQUIRE(h.auth_db->mfa_lockout_status("admin")->locked);
+    REQUIRE(h.auth_db->arm_break_glass("admin", 60).has_value()); // out-of-band recovery
+    unlocked();
+}
+
+TEST_CASE("POST /login answers a uniform 429 when the PBKDF2 budget is full (perf-F1)",
+          "[pg][mfa][routes][auth_routes][concurrency]") {
+    AuthRoutesHarness h;
+    auto& budget = h.auth_routes->pbkdf2_budget();
+    budget.set_cap(2);
+    auto s1 = budget.try_acquire();
+    auto s2 = budget.try_acquire();
+    REQUIRE(s1.ok());
+    REQUIRE(s2.ok());
+    // Same shape for a real and an unknown username: no enumeration through the refusal.
+    for (const char* user : {"alice", "no-such-user-xyz"}) {
+        auto r = h.sink.Post("/login", form({{"username", user}, {"password", "whatever"}}),
+                             "application/x-www-form-urlencoded");
+        REQUIRE(r);
+        CHECK(r->status == 429);
+        CHECK(r->get_header_value("Retry-After") == "2");
+        CHECK(r->get_header_value("Set-Cookie").empty());
+    }
+    {
+        auto released = std::move(s2); // free one slot
+        (void)released;
+    }
+    auto ok = h.sink.Post("/login", form({{"username", "alice"}, {"password", "alicepassword1"}}),
+                          "application/x-www-form-urlencoded");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+}
+
+TEST_CASE("Pbkdf2Budget: concurrent acquirers never exceed the cap", "[mfa][concurrency]") {
+    yuzu::server::Pbkdf2Budget b{3};
+    std::atomic<int> peak{0}, cur{0};
+    std::vector<std::thread> ts;
+    for (int i = 0; i < 16; ++i)
+        ts.emplace_back([&] {
+            for (int k = 0; k < 200; ++k) {
+                auto slot = b.try_acquire();
+                if (!slot.ok())
+                    continue;
+                const int now = ++cur;
+                int p = peak.load();
+                while (now > p && !peak.compare_exchange_weak(p, now)) {}
+                --cur;
+            }
+        });
+    for (auto& t : ts)
+        t.join();
+    CHECK(peak.load() <= 3);
+    CHECK(b.in_flight() == 0);
+}
+
+
+TEST_CASE("reserve_mfa_attempt SQL: `reserved` comes from the pre-update lock state, not timestamps",
+          "[pg][mfa][routes][auth_routes][lockout]") {
+    AuthRoutesHarness h;
+    // Two reservations inside ONE transaction share now(). The second must see the lock the first
+    // armed and report reserved=false; a `mfa_last_attempt_at = now()` derivation reads it as
+    // reserved (a verification admitted past a live lock).
+    yuzu::server::pg::PgConn conn{PQconnectdb(h.auth_db.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    REQUIRE(yuzu::server::pg::PgResult{PQexec(conn.get(), "BEGIN")}.ok());
+    const char* params[3] = {"1", "900", "admin"}; // threshold 1: one reservation arms the lock
+    auto run = [&] {
+        return yuzu::server::pg::PgResult{PQexecParams(
+            conn.get(), yuzu::server::auth_sql::kReserveMfaAttemptSql, 3, nullptr, params,
+            nullptr, nullptr, 0)};
+    };
+    auto first = run();
+    REQUIRE(PQresultStatus(first.get()) == PGRES_TUPLES_OK);
+    REQUIRE(PQntuples(first.get()) == 1);
+    CHECK(std::string(PQgetvalue(first.get(), 0, 1)) == "t"); // reserved
+    CHECK(std::string(PQgetvalue(first.get(), 0, 2)) == "t"); // locked by it
+    auto second = run();
+    REQUIRE(PQresultStatus(second.get()) == PGRES_TUPLES_OK);
+    CHECK(std::string(PQgetvalue(second.get(), 0, 1)) == "f"); // NOT reserved: row was locked
+    CHECK(std::string(PQgetvalue(second.get(), 0, 0)) == "1"); // and nothing was spent
+    // Control: the retired derivation, `mfa_last_attempt_at = now()`, reads this LOCKED row as
+    // "reserved" inside the same transaction. That is the defect the pre-update CTE removes.
+    yuzu::server::pg::PgResult old_way{PQexec(
+        conn.get(),
+        "SELECT (mfa_last_attempt_at = now()) FROM auth.users WHERE username = 'admin'")};
+    REQUIRE(PQresultStatus(old_way.get()) == PGRES_TUPLES_OK);
+    CHECK(std::string(PQgetvalue(old_way.get(), 0, 0)) == "t");
+    yuzu::server::pg::PgResult rb{PQexec(conn.get(), "ROLLBACK")};
+}
+
+TEST_CASE("PBKDF2 budget exhaustion is a uniform 429 for locked and unlocked accounts alike",
+          "[pg][mfa][routes][auth_routes][lockout][concurrency]") {
+    AuthRoutesHarness h;
+    h.cfg.auth_lockout_threshold = 2;
+    h.cfg.auth_lockout_window_secs = 900;
+    h.enroll_mfa("admin");
+    // Lock admin's second factor AND alice's password.
+    for (int i = 0; i < 2; ++i) {
+        const auto pending = login_pending(h, "admin", "adminpassword1");
+        h.sink.Post("/login/mfa", form({{"mfa_pending_token", pending}, {"code", "000000"}}),
+                    "application/x-www-form-urlencoded");
+        h.sink.Post("/login", form({{"username", "alice"}, {"password", "wrong"}}),
+                    "application/x-www-form-urlencoded");
+    }
+    REQUIRE(h.auth_db->mfa_lockout_status("admin")->locked);
+    REQUIRE(h.auth_db->lockout_status("alice")->locked);
+    const auto p_locked = login_pending(h, "admin", "adminpassword1"); // taken before saturating
+    auto& budget = h.auth_routes->pbkdf2_budget();
+    budget.set_cap(2);
+    auto s1 = budget.try_acquire();
+    auto s2 = budget.try_acquire();
+    REQUIRE(s1.ok());
+    REQUIRE(s2.ok());
+    // Locked password account, unlocked password account, unknown name: all 429.
+    for (const char* user : {"alice", "admin", "no-such-user-xyz"}) {
+        auto r = h.sink.Post("/login", form({{"username", user}, {"password", "adminpassword1"}}),
+                             "application/x-www-form-urlencoded");
+        REQUIRE(r);
+        CHECK(r->status == 429);
+    }
+    // Locked second factor + recovery-shaped code: 429, not the locked 401.
+    auto rl = h.sink.Post("/login/mfa",
+                          form({{"mfa_pending_token", p_locked}, {"code", "AAAA-BBBB-CCCC-DDDD"}}),
+                          "application/x-www-form-urlencoded");
+    REQUIRE(rl);
+    CHECK(rl->status == 429);
+}
+
+TEST_CASE("Pbkdf2Budget fairness: an unauthenticated flood cannot starve authenticated callers",
+          "[mfa][concurrency]") {
+    using namespace yuzu::server;
+    Pbkdf2Budget b{4, /*per_source_cap=*/1}; // reserve 2 for authenticated, unauth max 2
+    auto a1 = b.try_acquire(Pbkdf2Class::kUnauthenticated, "10.0.0.1");
+    REQUIRE(a1.ok());
+    auto a1b = b.try_acquire(Pbkdf2Class::kUnauthenticated, "10.0.0.1");
+    CHECK_FALSE(a1b.ok()); // per-source sub-budget
+    CHECK(a1b.refusal() == Pbkdf2Refusal::kPerSource);
+    auto a2 = b.try_acquire(Pbkdf2Class::kUnauthenticated, "10.0.0.2");
+    REQUIRE(a2.ok());
+    auto a3 = b.try_acquire(Pbkdf2Class::kUnauthenticated, "10.0.0.3");
+    CHECK_FALSE(a3.ok()); // class cap: unauthenticated may hold at most cap - reserve
+    CHECK(a3.refusal() == Pbkdf2Refusal::kClassFull);
+    // The flood cannot take the reserved slots: authenticated callers still get two.
+    auto u1 = b.try_acquire(Pbkdf2Class::kAuthenticated);
+    auto u2 = b.try_acquire(Pbkdf2Class::kAuthenticated);
+    CHECK(u1.ok());
+    CHECK(u2.ok());
+    CHECK_FALSE(b.try_acquire(Pbkdf2Class::kAuthenticated).ok()); // global cap still holds
+    { auto gone = std::move(a1); }
+    CHECK(b.try_acquire(Pbkdf2Class::kUnauthenticated, "10.0.0.1").refusal() !=
+          Pbkdf2Refusal::kPerSource); // per-source entry released
+}
+
+
+TEST_CASE("Pbkdf2Budget: the break-glass lane uses the reserve but is capped at one slot",
+          "[mfa][concurrency]") {
+    using namespace yuzu::server;
+    Pbkdf2Budget b{4, 4};
+    auto u1 = b.try_acquire(Pbkdf2Class::kUnauthenticated, "a");
+    auto u2 = b.try_acquire(Pbkdf2Class::kUnauthenticated, "b");
+    REQUIRE(u1.ok());
+    REQUIRE(u2.ok());
+    CHECK_FALSE(b.try_acquire(Pbkdf2Class::kUnauthenticated, "c").ok()); // ordinary lane full
+    auto bg = b.try_acquire(Pbkdf2Class::kBreakGlass, "x");
+    CHECK(bg.ok()); // the flood on the ordinary lane cannot lock the escape hatch out
+    auto bg2 = b.try_acquire(Pbkdf2Class::kBreakGlass, "y");
+    CHECK_FALSE(bg2.ok()); // but naming that account is not a way to take the whole reserve
+    CHECK(bg2.refusal() == Pbkdf2Refusal::kClassFull);
+    CHECK(b.try_acquire(Pbkdf2Class::kAuthenticated).ok()); // one reserved slot left
+}
+
+TEST_CASE("POST /login/mfa: a 429 on a recovery code leaves the pending token usable",
+          "[pg][mfa][routes][auth_routes][concurrency]") {
+    AuthRoutesHarness h;
+    const auto secret = h.enroll_mfa("admin");
+    const auto pending = login_pending(h, "admin", "adminpassword1");
+    auto& budget = h.auth_routes->pbkdf2_budget();
+    budget.set_cap(2);
+    auto s1 = budget.try_acquire();
+    auto s2 = budget.try_acquire(); // global full
+    REQUIRE(s2.ok());
+    auto busy = h.sink.Post("/login/mfa",
+                            form({{"mfa_pending_token", pending}, {"code", "AAAA-BBBB-CCCC-DDDD"}}),
+                            "application/x-www-form-urlencoded");
+    REQUIRE(busy);
+    CHECK(busy->status == 429);
+    { auto gone1 = std::move(s1); auto gone2 = std::move(s2); }
+    auto ok = h.sink.Post("/login/mfa",
+                          form({{"mfa_pending_token", pending}, {"code", h.totp_at(secret, 1)}}),
+                          "application/x-www-form-urlencoded");
+    REQUIRE(ok);
+    CHECK(ok->status == 200); // the same token still works: the Retry-After hint is honest
+}
+
 #endif // !_WIN32

@@ -374,3 +374,26 @@ TEST_CASE("sso-only: wrong password against an armed break-glass user is a norma
     CHECK(h.count_audits("auth.breakglass.login", "admin") == 0);
     CHECK(h.count_audits("auth.login_failed") >= 1);
 }
+
+TEST_CASE("sso-only: a saturated PBKDF2 budget does not tell the break-glass name apart (429 vs 401)",
+          "[pg][auth][hardened][routes][concurrency]") {
+    HardenedHarness h("sso-only", "admin");
+    h.enroll_mfa("admin");
+    // Fill every slot: the whole process-wide budget is in use.
+    auto& budget = h.auth_routes->pbkdf2_budget();
+    budget.set_cap(2);
+    auto s1 = budget.try_acquire();
+    auto s2 = budget.try_acquire();
+    REQUIRE(s1.ok());
+    REQUIRE(s2.ok());
+    // UNARMED break-glass name and any other name: the same generic 401, never a 429, because
+    // the sso-only gate refuses before a slot is taken. (Before the gate moved ahead of the slot,
+    // `alice` got 429 and the break-glass name got 401: an oracle for the name.)
+    for (const char* user : {"alice", "admin", "no-such-user-xyz"}) {
+        auto res = h.sink.Post("/login", form({{"username", user}, {"password", "whatever-123456"}}),
+                               kFormCt);
+        REQUIRE(res);
+        CHECK(res->status == 401);
+        CHECK(res->get_header_value("Retry-After").empty());
+    }
+}

@@ -3885,7 +3885,7 @@ static const ToolDef kTools[] = {
     // lockout lifecycle; this is the first. New "Account lockout" family in
     // mcp_orientation.cpp.
     {"unlock_account",
-     "Clear a local account's failed-login lockout counter (SOC 2 CC6.3 operability path — the "
+     "Clear a local account's failed-login lockout counter AND its second-factor (MFA) failure lock (SOC 2 CC6.3 operability path — the "
      "lockout also auto-expires on its own after the lockout window). Self-target is permitted: "
      "clearing your own lockout is recoverable. Requires the Postgres auth store (AuthDB) — "
      "answers 'lockout subsystem unavailable' if it is not wired, same as the REST route. "

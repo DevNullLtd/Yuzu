@@ -11,6 +11,21 @@ A statement elsewhere on this page that a rollback, a mixed fleet or an in-place
 
 Running `dev` between releases? Some entries below describe changes on `dev` that are not in a release yet. For what a `git pull` of `dev` changed, run the repository script `python3 scripts/whats-new.py` (`--versions` for the version bumps, rebuild notes and Docker image bumps); see `changelog.d/README.md`.
 
+## ⚠️ Breaking: second-factor failure budget (auth schema v4), first-run password prompt needs a terminal on Linux and macOS
+
+This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page): every writer runs this build, and this page is not a procedure for a rolling or mixed-version upgrade.
+
+**In short.** Affects every local account with TOTP MFA, and any automation that pipes the administrator password into the first-run `yuzu-server` prompt.
+
+**What this build does.**
+
+- **Failure budget.** Wrong TOTP/recovery codes at `/login/mfa` and `/login/mfa/stepup` are counted per account and lock the second factor for `--auth-lockout-window-secs` (default 900 s) after `--auth-lockout-threshold` of them. It **cannot be disabled**: threshold `0` falls back to 5 attempts. See [Second-factor failure budget](authentication.md#second-factor-failure-budget).
+- **Auth schema v4.** The `auth` store's migration list ends at v4, which adds `mfa_failed_count`, `mfa_locked_until` and `mfa_last_attempt_at` to `auth.users` (inert defaults). A v4 that cannot apply (the `ALTER TABLE` has a 3 s `lock_timeout`) stops the auth store opening, so the server does not start; see the [recovery runbook](../ops-runbooks/auth-db-recovery.md#second-factor-mfa-lock-429-and-503-on-sign-in).
+- **Process-wide PBKDF2 cap.** Concurrent password hashing is capped by lane (a quarter of the HTTP worker pool, at least 8); a full lane answers `429` + `Retry-After: 2`. `--auth-pbkdf2-per-source-cap` tunes the per-address share.
+- **First-run prompt (Linux, macOS).** The administrator password is read with echo off, and the prompt **refuses (exit without writing a config) when stdin is not a terminal** or echo cannot be turned off. Windows still accepts a piped password. A container entrypoint that pipes the password into first-run exits, and under a restart policy crash-loops.
+
+**What to do.** Run first-run interactively once, or pre-create the configuration; tell operators a locked second factor clears after the window or by an operator unlock (`POST /api/v1/users/{name}/unlock`).
+
 ## ⚠️ Breaking: on-demand software sync asks for confirmation, is paced instead of capped at 500 devices, and cools down per group
 
 **In short.** Affected: anything that calls `POST /api/v1/hardware/sync` or the MCP tool `sync_hardware_software` for a whole group or the whole fleet (the Software page's **Whole fleet** choice, scripts and agentic workers). To do: send `"confirm": true` with a `group:<id>` or `__all__` scope, give the caller the global `ManagementGroup:Write` grant if it names the whole fleet, and stop relying on the 500-device refusal and the 60-second per-operator gap.

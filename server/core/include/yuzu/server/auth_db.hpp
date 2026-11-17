@@ -701,6 +701,45 @@ public:
     /// rows. Returns InvalidUsername for malformed input.
     std::expected<void, AuthDBError> clear_failed_logins(const std::string& username);
 
+    // ── Per-account second-factor (MFA) failure budget (WP03 F8/F15) ─────
+    //
+    // A durable, DB-clock (`now()`) counter SEPARATE from the password
+    // lockout columns above, so a successful password step cannot reset it
+    // (an attacker who knows the password would otherwise re-mint pending
+    // tokens for unlimited guesses). Keyed on the account only: independent
+    // of pending token, session and source address, and shared across
+    // replicas. Time-boxed (`mfa_locked_until`), never a permanent lock.
+    // Reuses LockoutStatus / LockoutRecord.
+
+    /// Read the MFA failure budget. Unlike `lockout_status` the caller MUST
+    /// fail CLOSED on an error (MFA is the credential path itself).
+    std::expected<LockoutStatus, AuthDBError> mfa_lockout_status(const std::string& username);
+
+    struct MfaReservation {
+        int failed_count{0};     // counter AFTER this reservation
+        bool reserved{true};     // false: the account was already locked, nothing was spent
+        bool locked{false};      // account is locked after this statement
+        bool just_locked{false}; // this reservation crossed the threshold
+    };
+
+    /// RESERVE one second-factor attempt BEFORE the code is verified (check and increment in ONE
+    /// statement, DB clock). `reserved == false` means refuse without verifying. Any error means
+    /// the attempt could not be counted: the caller MUST NOT verify (fail closed, 503).
+    std::expected<MfaReservation, AuthDBError>
+    reserve_mfa_attempt(const std::string& username, int threshold, int window_secs);
+
+    /// Give back ONE reservation after a verified code (or a store outage that proved nothing).
+    /// Decrement, never reset: failures consumed concurrently stay counted. A crash before the
+    /// refund errs toward counting.
+    std::expected<void, AuthDBError> refund_mfa_attempt(const std::string& username, int threshold);
+
+    /// Operator unlock: clear the password-lockout columns AND the MFA failure budget in ONE
+    /// statement (no window where one is lifted and the other is not). Idempotent.
+    std::expected<void, AuthDBError> clear_account_lockouts(const std::string& username);
+
+    /// Reset the MFA failure budget (a verified second factor). Idempotent.
+    std::expected<void, AuthDBError> clear_mfa_failures(const std::string& username);
+
     // ── Break-glass arming (hardened mode) ───────────────────────────────
     //
     // SOC 2 CC6.6. See docs/auth-architecture.md "Hardened mode". The single

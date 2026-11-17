@@ -566,11 +566,12 @@ exists. This writes no audit row; record it in your change-management system, as
 ```bash
 # Inspect first.
 psql "$YUZU_POSTGRES_DSN" -c \
-  "SELECT username, failed_login_count, locked_until FROM auth.users WHERE username = 'alice';"
+  "SELECT username, failed_login_count, locked_until, mfa_failed_count, mfa_locked_until FROM auth.users WHERE username = 'alice';"
 
 # Clear one account.
 psql "$YUZU_POSTGRES_DSN" -c \
-  "UPDATE auth.users SET failed_login_count = 0, last_failed_login_at = NULL, locked_until = NULL WHERE username = 'alice';"
+  "UPDATE auth.users SET failed_login_count = 0, last_failed_login_at = NULL, locked_until = NULL,
+   mfa_failed_count = 0, mfa_locked_until = NULL, mfa_last_attempt_at = NULL WHERE username = 'alice';"
 ```
 
 Mass-unlock is a threshold-misconfiguration remedy only (e.g. someone deployed
@@ -579,7 +580,8 @@ you will be back:
 
 ```bash
 psql "$YUZU_POSTGRES_DSN" -c \
-  "UPDATE auth.users SET failed_login_count = 0, last_failed_login_at = NULL, locked_until = NULL;"
+  "UPDATE auth.users SET failed_login_count = 0, last_failed_login_at = NULL, locked_until = NULL,
+   mfa_failed_count = 0, mfa_locked_until = NULL, mfa_last_attempt_at = NULL;"
 ```
 
 **Bulk unlock after an auth-store blip.** Before #5342 a login whose account
@@ -609,6 +611,41 @@ psql "$YUZU_POSTGRES_DSN" -c \
 Like the single-account fallback, this writes no audit row; record it. The
 locks expire on their own after `--auth-lockout-window-secs`, so waiting is
 still the zero-risk choice.
+
+## Second-factor (MFA) lock, `429` and `503` on sign-in
+
+**Second factor locked.** Wrong TOTP or recovery codes spend a durable per-account budget
+(`auth.users.mfa_failed_count` / `mfa_locked_until` / `mfa_last_attempt_at`, added by schema
+migration **v4**). A locked account answers the uniform `401` at `/login/mfa` and `/login/mfa/stepup`
+until `--auth-lockout-window-secs` passes (audit: `auth.mfa.lockout.applied`, then
+`mfa.login.failed` / `mfa.step_up.failed` with detail `mfa locked`). Remedies, cheapest first:
+
+1. **Wait the window** (default 900 s): zero risk.
+2. **Another administrator**, or an admin API/MCP token: `POST /api/v1/users/{name}/unlock` or the
+   MCP `unlock_account` tool (clears the password lock and the MFA lock in one statement).
+3. **Host CLI**: `yuzu-server --break-glass-arm` resets the lock, but ONLY for the configured
+   break-glass user; `yuzu-server --mfa-reset <user>` removes the factor (and the lock) and the user
+   re-enrols.
+4. **Direct SQL** (last resort, writes no audit row; see the fallback above, which now clears the
+   three MFA columns too).
+
+**Sole-administrator wedge.** If the only administrator's second factor is locked, they hold no API
+token and no break-glass account is configured, options 2 and `--break-glass-arm` are unavailable:
+use `--mfa-reset <user>` and re-enrol, or wait out the window. A self-service password change does
+**not** clear the lock; an administrative reset does.
+
+**`503` with `Retry-After` and audit detail `mfa attempt could not be counted`.** The attempt could
+not be reserved in the auth store, so the code was deliberately NOT checked (fail closed). Treat it
+as an auth-store outage (see the store sections above), not a wrong code.
+
+**`429` with `Retry-After: 2` at `/login`, `/login/mfa` or the password-change proof.** The
+process-wide concurrent password-hash cap is full for that lane (metric
+`yuzu_auth_pbkdf2_budget_rejected_total{route,class,reason}`). Nothing was hashed or counted. A
+sustained rate from many addresses is unauthenticated load; behind a proxy, raise
+`--auth-pbkdf2-per-source-cap`.
+
+**v4 migration did not apply** ("Migration lock timeout" above): the `ALTER TABLE` uses a 3 s
+`lock_timeout` and the next boot retries it. Until it applies the auth store does not open and the server refuses to start (fail closed).
 
 ## Password reset
 

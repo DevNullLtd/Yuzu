@@ -457,7 +457,7 @@ constexpr std::array<ToolFamily, 43> kFamilies{{
     {"RBAC role assignments", "fleet-wide listing of every current RBAC role assignment -- "
                               "who currently holds which role, across every principal type",
      kRbacAssignmentsList},
-    {"Account lockout", "clear a local account's failed-login lockout counter (SOC 2 CC6.3)",
+    {"Account lockout", "clear a local account's failed-login lockout and its MFA failure lock (SOC 2 CC6.3)",
      kAccountLockout},
     {"Offload targets", "configure event-forwarding webhook targets and inspect their delivery "
                         "history",

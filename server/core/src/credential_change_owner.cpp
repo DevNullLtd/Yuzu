@@ -73,7 +73,7 @@ constexpr const char* kSelfUpdateSql = YUZU_CRED_UPDATE_HEAD YUZU_CRED_UPDATE_TA
 // unlock are one recorded act, not a write followed by a best-effort unlock.
 constexpr const char* kAdminUpdateSql =
     YUZU_CRED_UPDATE_HEAD
-    ", failed_login_count = 0, last_failed_login_at = NULL, locked_until = NULL" YUZU_CRED_UPDATE_TAIL;
+    ", failed_login_count = 0, last_failed_login_at = NULL, locked_until = NULL, mfa_failed_count = 0, mfa_locked_until = NULL, mfa_last_attempt_at = NULL" YUZU_CRED_UPDATE_TAIL;
 #undef YUZU_CRED_UPDATE_HEAD
 #undef YUZU_CRED_UPDATE_TAIL
 

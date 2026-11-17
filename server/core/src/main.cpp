@@ -631,6 +631,15 @@ int main(int argc, char* argv[]) {
         ->check(CLI::PositiveNumber)
         ->envname("YUZU_AUTH_LOCKOUT_WINDOW_SECS");
 
+    app.add_option("--auth-pbkdf2-per-source-cap", cfg.auth_pbkdf2_per_source_cap,
+                   "Concurrent password-hash (PBKDF2) slots one client address may hold on the "
+                   "unauthenticated login lane (default: 4, range 1-64). The address is the TCP "
+                   "peer: behind a reverse proxy, load balancer or NAT every user shares it, so "
+                   "raise this to the expected concurrent-login burst through that address.")
+        ->default_val(4)
+        ->check(CLI::Range(1, 64))
+        ->envname("YUZU_AUTH_PBKDF2_PER_SOURCE_CAP");
+
     // JIT admin elevation — SOC 2 CC6.3/CC6.6. See docs/auth-architecture.md.
     app.add_option("--jit-max-elevation-secs", cfg.jit_max_elevation_secs,
                    "Maximum lifetime (seconds) of a time-boxed admin elevation granted via "
@@ -2212,7 +2221,7 @@ int main(int argc, char* argv[]) {
         ev.target_id = cfg.break_glass_user;
         ev.result = "success";
         ev.detail = std::format("break-glass armed until {} ({}s window) via --break-glass-arm "
-                                "CLI (os_identity={})",
+                                "CLI (os_identity={}); any MFA failure lock on the account was reset",
                                 armed->armed_until, cfg.break_glass_window_secs, os_user);
         if (!audit->log(ev)) {
             // COMPENSATING UN-ARM (review #1735 HIGH-2): the mandatory evidence

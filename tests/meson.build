@@ -4689,6 +4689,14 @@ test('same-site gate production wiring lexical gate',
   suite: 'docs',
   timeout: 30,
 )
+# WP03: both second-factor code verifiers are called only from the two budgeted handlers
+# (source-text only, so Python; suite 'docs').
+test('mfa failure budget wiring lexical gate',
+  _python3_test,
+  args: [files('test_mfa_budget_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
 # #4160: pins the sso-only runtime-wiring check + provider gauges in ServerImpl (source-text only;
 # its own in-file selftest mutates each pinned statement, so no separate selftest entry).
 test('sso-only runtime wiring lexical gate',

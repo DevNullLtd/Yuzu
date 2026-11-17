@@ -119,14 +119,16 @@ clear_mfa_factor_in_txn(PGconn* c, const std::string& username,
         "WITH pre AS (SELECT id, (mfa_enrolled_at IS NOT NULL) AS was_enrolled "
         "FROM auth.users WHERE username = $1 AND is_active = TRUE FOR UPDATE) "
         "UPDATE auth.users u SET mfa_totp_secret = NULL, mfa_enrolled_at = NULL, "
-        "mfa_disabled_at = now(), mfa_last_counter = 0, updated_at = now() "
+        "mfa_disabled_at = now(), mfa_last_counter = 0, updated_at = now(), "
+        "mfa_failed_count = 0, mfa_locked_until = NULL, mfa_last_attempt_at = NULL "
         "FROM pre WHERE u.id = pre.id RETURNING pre.was_enrolled";
     static constexpr const char* kClearAtGenSql =
         "WITH pre AS (SELECT id, (mfa_enrolled_at IS NOT NULL) AS was_enrolled "
         "FROM auth.users WHERE username = $1 AND is_active = TRUE "
         "AND mfa_factor_gen = $2::bigint FOR UPDATE) "
         "UPDATE auth.users u SET mfa_totp_secret = NULL, mfa_enrolled_at = NULL, "
-        "mfa_disabled_at = now(), mfa_last_counter = 0, updated_at = now() "
+        "mfa_disabled_at = now(), mfa_last_counter = 0, updated_at = now(), "
+        "mfa_failed_count = 0, mfa_locked_until = NULL, mfa_last_attempt_at = NULL "
         "FROM pre WHERE u.id = pre.id RETURNING pre.was_enrolled";
     MfaClearReport report;
     std::vector<std::string> params{username};
@@ -212,5 +214,31 @@ inline std::optional<std::int64_t> count_active_local_admin_accounts(PGconn* c, 
     }
     return static_cast<std::int64_t>(std::strtoll(PQgetvalue(r.get(), 0, 0), nullptr, 10));
 }
+
+/// WP03 F8/F15: the ONE statement behind `AuthDB::reserve_mfa_attempt`. $1 threshold, $2 window
+/// secs, $3 username. The CTE reads the PRE-update lock state under the row lock (FOR UPDATE);
+/// `reserved` is `NOT pre.was_locked`, never a timestamp comparison, so it stays correct when
+/// several reservations share one transaction timestamp. A live lock changes nothing. Otherwise
+/// the count restarts at 1 when the last reservation is older than the window (exactly when a
+/// lock set by it has expired), else increments; the lock arms (DB `now()`) when the count
+/// reaches the threshold. No row (unknown/inactive user) returns zero rows.
+inline constexpr const char* kReserveMfaAttemptSql =
+    "WITH pre AS (SELECT id, (mfa_locked_until IS NOT NULL AND mfa_locked_until > now()) "
+    "             AS was_locked FROM auth.users WHERE username = $3 AND is_active = TRUE "
+    "             FOR UPDATE) "
+    "UPDATE auth.users u SET "
+    "mfa_failed_count = CASE WHEN pre.was_locked THEN u.mfa_failed_count "
+    "    WHEN u.mfa_last_attempt_at IS NULL "
+    "         OR u.mfa_last_attempt_at <= now() - make_interval(secs => $2::int) THEN 1 "
+    "    ELSE u.mfa_failed_count + 1 END, "
+    "mfa_last_attempt_at = CASE WHEN pre.was_locked THEN u.mfa_last_attempt_at ELSE now() END, "
+    "mfa_locked_until = CASE WHEN pre.was_locked THEN u.mfa_locked_until "
+    "    WHEN (CASE WHEN u.mfa_last_attempt_at IS NULL "
+    "               OR u.mfa_last_attempt_at <= now() - make_interval(secs => $2::int) THEN 1 "
+    "          ELSE u.mfa_failed_count + 1 END) >= $1::int "
+    "    THEN now() + make_interval(secs => $2::int) ELSE NULL END "
+    "FROM pre WHERE u.id = pre.id "
+    "RETURNING u.mfa_failed_count, (NOT pre.was_locked) AS reserved, "
+    "(u.mfa_locked_until IS NOT NULL AND u.mfa_locked_until > now()) AS locked";
 
 } // namespace yuzu::server::auth_sql

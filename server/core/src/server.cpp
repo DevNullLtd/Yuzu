@@ -1100,6 +1100,22 @@ public:
                           "clamped to the worker pool). Utilisation = responses / capacity",
                           "gauge");
         metrics_.describe("yuzu_http_worker_pool_size", "Shared HTTP worker pool size", "gauge");
+        metrics_.describe("yuzu_auth_mfa_lockout_applied_total",
+                          "Accounts whose second factor was locked by the per-account failure budget",
+                          "counter");
+        metrics_.describe("yuzu_auth_mfa_lockout_blocked_total",
+                          "Second-factor attempts refused because the account budget was already spent",
+                          "counter");
+        metrics_.describe("yuzu_auth_mfa_budget_unavailable_total",
+                          "Second-factor attempts refused 503 because the attempt could not be "
+                          "reserved in the auth store (nothing was verified)",
+                          "counter");
+        metrics_.describe("yuzu_auth_pbkdf2_budget_rejected_total",
+                          "Password-hash requests refused 429 by the concurrency budget "
+                          "(labels: route, class, reason)",
+                          "counter");
+        metrics_.describe("yuzu_auth_pbkdf2_budget_capacity",
+                          "Process-wide cap on concurrent password-hash (PBKDF2) work", "gauge");
         metrics_.gauge("yuzu_http_held_open_responses").set(0);
         metrics_.describe("yuzu_mcp_streams_handover_pending",
                           "Superseded MCP SSE streams still draining - each still pins a worker",
@@ -16600,6 +16616,16 @@ private:
         // its sibling above, from the same post-clamp number.
         metrics_.gauge("yuzu_mcp_streams_cap").set(static_cast<double>(effective_streams));
         metrics_.gauge("yuzu_http_worker_pool_size").set(static_cast<double>(pool_max));
+        // WP03 perf-F1: cap concurrent PBKDF2 (login / recovery-code) work at a quarter of the
+        // worker pool (min 2) so unauthenticated hashing can never pin every worker.
+        if (auth_routes_) {
+            // Floor 8: a tiny --http-worker-threads must not shrink the cap to 2, where a single
+            // source address could otherwise fill the whole unauthenticated lane.
+            const int pbkdf2_cap = static_cast<int>(std::max<std::size_t>(8, pool_max / 4));
+            auth_routes_->set_pbkdf2_cap(pbkdf2_cap);
+            auth_routes_->pbkdf2_budget().set_per_source_cap(cfg_.auth_pbkdf2_per_source_cap);
+            metrics_.gauge("yuzu_auth_pbkdf2_budget_capacity").set(static_cast<double>(pbkdf2_cap));
+        }
         // A security-relevant toggle nobody can confirm the state of is an operability
         // gap. --max-sse-streams already surfaces its resolved value as a gauge; this
         // does the same, so an operator can answer "is streamed POST live on this box"
@@ -24065,7 +24091,8 @@ private:
             // Empty/null auth_db ⇒ false ⇒ the route 500s and audits the failure.
             [this](const std::string& username) -> bool {
                 auto* db = auth_mgr_.auth_db_ptr();
-                return db && db->clear_failed_logins(username).has_value();
+                // WP03: ONE statement lifts both the password lockout and the MFA failure budget.
+                return db && db->clear_account_lockouts(username).has_value();
             },
             // Baseline-anchored per-device Guardian status route (trailing optional deps).
             baseline_store_.get(),
@@ -24938,7 +24965,8 @@ private:
                 // reports "lockout subsystem unavailable".
                 [this](const std::string& username) -> bool {
                     auto* db = auth_mgr_.auth_db_ptr();
-                    return db && db->clear_failed_logins(username).has_value();
+                    // WP03: ONE statement lifts both the password lockout and the MFA failure budget.
+                    return db && db->clear_account_lockouts(username).has_value();
                 },
                 // B5 (api-parity #2146) — the SAME offload_target_store_ instance
                 // OffloadRoutes::register_routes wires above (a real, non-dormant

@@ -1908,6 +1908,25 @@ account policy)"* — this ships **both** halves.
   the password is never evaluated; wrong attempts are still audited
   (`auth.login_failed`) + per-IP rate-limited. Normal lockout still applies in
   standard mode.
+- **The second-factor failure budget is NOT exempted for break-glass (WP03).** The
+  lockout exemption above covers failed *passwords* only. Wrong TOTP/recovery codes
+  count against the durable per-account MFA budget (`auth.users.mfa_failed_count` /
+  `mfa_locked_until` / `mfa_last_attempt_at`; reserve-before-verify in ONE row-locked DB
+  statement, so an attempt that cannot be counted is never verified and answers 503;
+  a verified code refunds only its own reservation) for the break-glass account like
+  any other, because exempting it would leave the only protected factor of the
+  highest-value account open to online guessing by anyone who knows the password.
+  Accepted trade-off: an attacker who already knows the break-glass PASSWORD can keep
+  its MFA locked for one window at a time (`auth.mfa.lockout.applied`). The lock is
+  time-boxed and self-clearing. What clears it early: an operator unlock
+  (`POST /api/v1/users/{name}/unlock` / MCP `unlock_account`), an administrative
+  password reset, reactivation, `--mfa-reset`, and **`--break-glass-arm`** (the
+  out-of-band recovery: it resets the budget in the same statement that arms, and its
+  `auth.breakglass.armed` audit row says so). A self-service password change does NOT
+  clear it. Sole-administrator wedge (sole admin, enrolled factor, no API token, locked
+  at step-up): the only host-CLI remedies are `--break-glass-arm` (if that account is the
+  configured break-glass user) or `--mfa-reset <user>` then re-enrol; otherwise wait out
+  the window.
 - **Arming is an out-of-band host operation, never a session route.** The IdP
   being down is *why* you break the glass, so arming cannot depend on a login.
   `yuzu-server --break-glass-arm` (with `--break-glass-user` + `--postgres-dsn`

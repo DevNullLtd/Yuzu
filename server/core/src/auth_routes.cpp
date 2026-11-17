@@ -2176,6 +2176,33 @@ PasswordCheckResult AuthRoutes::verify_password_with_lockout(const std::string& 
         login_lk = std::unique_lock<std::mutex>(login_lock_for(username));
     }
 
+    // The caller's pre-verify gate (the sso-only local-login gate) runs BEFORE any PBKDF2 slot is
+    // taken: a refused attempt never hashes, so it must never consume (or be refused for lack of)
+    // a slot. Under sso-only every name but an ARMED break-glass account is rejected here, so an
+    // anonymous flood cannot fill any lane, and a full lane is only ever visible to a caller that
+    // already named an armed break-glass account (no username oracle from lane saturation).
+    if (opts.pre_verify_gate && !opts.pre_verify_gate())
+        return {PasswordCheckOutcome::kGateRejected, std::nullopt, {}};
+
+    // WP03 perf-F1: verify_password spends a PBKDF2 even for an unknown username (F38), so bound
+    // the concurrent hashing process-wide, by class and per source. Taken AFTER the stripe (so a
+    // slot is never held while only waiting on another request for the same name) but BEFORE the
+    // lockout pre-check, so a full budget answers 429 the same for a locked and an unlocked
+    // account (no lock-state oracle). The slot IS then held across the pre-check's one DB read
+    // and the hash, which is the work it bounds. Full => no hash, no strike. The break-glass
+    // account (lockout_exempt under sso-only) has its own capped lane that may use the reserved
+    // slots, so an unauthenticated flood on the ordinary lane cannot lock the escape hatch out.
+    std::optional<Pbkdf2Budget::Slot> pbkdf2_slot;
+    if (!auth::password_exceeds_max(password)) {
+        const bool login_route = opts.metric_route == "login";
+        pbkdf2_slot.emplace(acquire_pbkdf2(!login_route         ? Pbkdf2Class::kAuthenticated
+                                           : opts.lockout_exempt ? Pbkdf2Class::kBreakGlass
+                                                                 : Pbkdf2Class::kUnauthenticated,
+                                           req, opts.metric_route));
+        if (!pbkdf2_slot->ok())
+            return {PasswordCheckOutcome::kBusy, std::nullopt, {}};
+    }
+
     // ── Account-lockout pre-check (SOC 2 CC6.3) ──────────────────────
     // Brute-force / credential-stuffing guard. When the account is currently
     // locked the caller rejects with the SAME generic response as a bad
@@ -2232,8 +2259,6 @@ PasswordCheckResult AuthRoutes::verify_password_with_lockout(const std::string& 
         }
     }
 
-    if (opts.pre_verify_gate && !opts.pre_verify_gate())
-        return {PasswordCheckOutcome::kGateRejected, std::nullopt, {}};
 
     // #5342: an over-max password can never match a stored hash (no setting
     // site accepts one), so it is answered exactly like a wrong password — same
@@ -2366,6 +2391,97 @@ PasswordCheckResult AuthRoutes::verify_password_with_lockout(const std::string& 
     }
     // Lockout-critical section complete; the stripe releases on return.
     return {PasswordCheckOutcome::kVerified, verified->role, std::move(verified->hash_hex)};
+}
+
+Pbkdf2Budget::Slot AuthRoutes::acquire_pbkdf2(Pbkdf2Class cls, const httplib::Request& req,
+                                              const std::string& route) {
+    auto slot = pbkdf2_budget_.try_acquire(cls, req.remote_addr);
+    if (!slot.ok()) {
+        if (auto* m = auth_mgr_.metrics_registry())
+            m->counter("yuzu_auth_pbkdf2_budget_rejected_total",
+                       {{"route", route},
+                        {"class", cls == Pbkdf2Class::kUnauthenticated ? "unauthenticated"
+                                    : cls == Pbkdf2Class::kBreakGlass   ? "break_glass"
+                                                                        : "authenticated"},
+                        {"reason", to_string(slot.refusal())}})
+                .increment();
+    }
+    return slot;
+}
+
+namespace {
+/// Exactly 6 ASCII digits is a TOTP code; anything else takes the recovery-code (PBKDF2) path.
+bool mfa_code_is_totp_shape(const std::string& code) {
+    if (code.size() != 6)
+        return false;
+    for (char c : code)
+        if (c < '0' || c > '9')
+            return false;
+    return true;
+}
+} // namespace
+
+void AuthRoutes::refuse_pbkdf2_busy(httplib::Response& res) {
+    res.status = 429;
+    res.set_header("Retry-After", "2");
+    res.set_content(detail::a4_error(res, "too many concurrent authentication attempts, retry shortly",
+                                     {.retry_after_ms = 2000}),
+                    "application/json");
+}
+
+int AuthRoutes::mfa_budget_threshold() const {
+    return cfg_.auth_lockout_threshold > 0 ? cfg_.auth_lockout_threshold
+                                           : kMfaBudgetDefaultThreshold;
+}
+int AuthRoutes::mfa_budget_window() const {
+    return cfg_.auth_lockout_window_secs > 0 ? cfg_.auth_lockout_window_secs
+                                             : kMfaBudgetDefaultWindowSecs;
+}
+
+AuthRoutes::MfaReserved AuthRoutes::mfa_budget_reserve(const std::string& username) {
+    auto* db = auth_mgr_.auth_db_ptr();
+    if (!db)
+        return {MfaBudget::kStoreUnavailable, false};
+    auto r = db->reserve_mfa_attempt(username, mfa_budget_threshold(), mfa_budget_window());
+    if (!r) {
+        spdlog::error("reserve_mfa_attempt failed for '{}' (error={}) - refusing before "
+                      "verification (fail-closed)",
+                      username, static_cast<int>(r.error()));
+        if (auto* m = auth_mgr_.metrics_registry())
+            m->counter("yuzu_auth_mfa_budget_unavailable_total").increment();
+        return {MfaBudget::kStoreUnavailable, false};
+    }
+    if (!r->reserved) {
+        if (auto* m = auth_mgr_.metrics_registry())
+            m->counter("yuzu_auth_mfa_lockout_blocked_total").increment();
+        return {MfaBudget::kLocked, false};
+    }
+    return {MfaBudget::kOpen, r->just_locked};
+}
+
+void AuthRoutes::mfa_budget_note_failure(const httplib::Request& req, const std::string& username,
+                                         const std::string& role_str, const MfaReserved& r) {
+    if (!r.just_locked)
+        return;
+    if (!audit_log_for_principal(req, "auth.mfa.lockout.applied", "ok", username, role_str,
+                                 "User", username,
+                                 "threshold=" + std::to_string(mfa_budget_threshold()) +
+                                     " window_secs=" + std::to_string(mfa_budget_window()))) {
+        spdlog::error("audit emission FAILED for auth.mfa.lockout.applied user='{}'", username);
+    }
+    emit_event("auth.mfa.lockout.applied", req,
+               {{"source_ip", req.remote_addr}, {"username", username}}, {}, Severity::kWarn);
+    if (auto* m = auth_mgr_.metrics_registry())
+        m->counter("yuzu_auth_mfa_lockout_applied_total").increment();
+}
+
+void AuthRoutes::mfa_budget_refund(const std::string& username) {
+    if (auto* db = auth_mgr_.auth_db_ptr()) {
+        // A failed refund errs toward counting (the reservation stays spent): logged, not fatal.
+        if (auto rf = db->refund_mfa_attempt(username, mfa_budget_threshold()); !rf)
+            spdlog::warn("refund_mfa_attempt failed for '{}': error={} (attempt stays counted)",
+                         username, static_cast<int>(rf.error()));
+    }
 }
 
 PasswordVerifyFn AuthRoutes::password_change_verify_fn() {
@@ -2614,6 +2730,9 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             res.status = 401;
             res.set_content(detail::a4_error(res, "Invalid username or password"),
                             "application/json");
+            return;
+        case PasswordCheckOutcome::kBusy:
+            refuse_pbkdf2_busy(res);
             return;
         case PasswordCheckOutcome::kGateRejected:
             return; // the sso-only gate above wrote the 401
@@ -3123,6 +3242,49 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             return;
         }
 
+        // Recovery-code verification scans PBKDF2 hashes: take the process-wide slot BEFORE the
+        // lock check and the reservation, so a full budget is a 429 for locked and unlocked
+        // accounts alike (no lock-state oracle), and nothing needs refunding.
+        std::optional<Pbkdf2Budget::Slot> recovery_slot;
+        if (!mfa_code_is_totp_shape(code)) {
+            recovery_slot.emplace(acquire_pbkdf2(Pbkdf2Class::kUnauthenticated, req, "mfa_recovery"));
+            if (!recovery_slot->ok()) {
+                // Nothing was verified or counted: give the pending token back (if still within
+                // its TTL) so the Retry-After hint is honest.
+                if (std::chrono::steady_clock::now() < entry.expires_at) {
+                    std::lock_guard lock(mfa_pending_mu_);
+                    mfa_pending_[pending] = std::move(entry);
+                }
+                refuse_pbkdf2_busy(res);
+                return;
+            }
+        }
+        // WP03 F15: RESERVE a durable per-account attempt BEFORE verifying (one DB statement:
+        // lock check + increment). A locked account gets the SAME uniform 401 as a wrong code
+        // (no lock oracle; the pending entry is already consumed); an attempt that cannot be
+        // counted is never verified (503, fail closed).
+        const auto reservation = mfa_budget_reserve(entry.username);
+        if (reservation.budget == MfaBudget::kStoreUnavailable) {
+            res.status = 503;
+            res.set_header("Retry-After", "2");
+            res.set_content(detail::a4_error(res, "authentication store is temporarily unavailable",
+                                             {.retry_after_ms = 2000}),
+                            "application/json");
+            audit_log_for_principal(req, "mfa.login.failed", "error", entry.username,
+                                    auth::role_to_string(entry.role), "User", entry.username,
+                                    "mfa attempt could not be counted (fail-closed, nothing "
+                                    "verified, no session minted)");
+            return;
+        }
+        if (reservation.budget == MfaBudget::kLocked) {
+            res.status = 401;
+            res.set_content(kFailureBody(res), "application/json");
+            audit_log_for_principal(req, "mfa.login.failed", "error", entry.username,
+                                    auth::role_to_string(entry.role), "User", entry.username,
+                                    "mfa locked (failure budget exhausted)");
+            return;
+        }
+
         bool matched = false;
         bool used_recovery = false;
         bool store_unavailable = false;
@@ -3176,6 +3338,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         }
 
         if (store_unavailable) {
+            mfa_budget_refund(entry.username); // an outage proved nothing: not a spent guess
             res.status = 503;
             res.set_content(detail::a4_error(res, "authentication store is temporarily unavailable"),
                             "application/json");
@@ -3194,6 +3357,12 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                        {}, Severity::kCritical);
             return;
         }
+
+        if (!matched)
+            mfa_budget_note_failure(req, entry.username, auth::role_to_string(entry.role),
+                                    reservation);
+        else
+            mfa_budget_refund(entry.username);
 
         if (!matched) {
             // Bump attempts counter and re-insert if still under the cap.
@@ -3752,6 +3921,39 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 }
             }
         }
+        // Recovery-code verification scans PBKDF2 hashes: take the process-wide slot BEFORE the
+        // lock check and the reservation, so a full budget is a 429 for locked and unlocked
+        // accounts alike (no lock-state oracle), and nothing needs refunding.
+        std::optional<Pbkdf2Budget::Slot> recovery_slot;
+        if (!mfa_code_is_totp_shape(code)) {
+            recovery_slot.emplace(acquire_pbkdf2(Pbkdf2Class::kAuthenticated, req, "mfa_recovery"));
+            if (!recovery_slot->ok()) {
+                refuse_pbkdf2_busy(res);
+                return;
+            }
+        }
+        // WP03 F8: the same reserve-before-verify per-account budget as /login/mfa, so a
+        // hijacked cookie session cannot guess step-up codes online. Uniform 401 when locked;
+        // 503 (fail closed, nothing verified) when the attempt cannot be counted.
+        const auto reservation = mfa_budget_reserve(session->username);
+        if (reservation.budget != MfaBudget::kOpen) {
+            const bool locked = reservation.budget == MfaBudget::kLocked;
+            res.status = locked ? 401 : 503;
+            if (!locked)
+                res.set_header("Retry-After", "2");
+            res.set_content(locked ? kFailureBody(res)
+                                   : detail::a4_error(
+                                         res, "authentication store is temporarily unavailable",
+                                         {.retry_after_ms = 2000}),
+                            "application/json");
+            audit_log_for_principal(req, "mfa.step_up.failed", "error", session->username,
+                                    auth::role_to_string(session->role), "User",
+                                    session->username,
+                                    locked ? "mfa locked (failure budget exhausted)"
+                                           : "mfa attempt could not be counted (fail-closed, "
+                                             "nothing verified)");
+            return;
+        }
         bool matched = false;
         bool used_recovery = false;
         bool store_unavailable = false;
@@ -3781,6 +3983,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         }
 
         if (store_unavailable) {
+            mfa_budget_refund(session->username); // an outage proved nothing
             res.status = 503;
             res.set_content(detail::a4_error(res, "authentication store is temporarily unavailable"),
                             "application/json");
@@ -3800,6 +4003,12 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                        {}, Severity::kCritical);
             return;
         }
+
+        if (!matched)
+            mfa_budget_note_failure(req, session->username, auth::role_to_string(session->role),
+                                    reservation);
+        else
+            mfa_budget_refund(session->username);
 
         if (!matched) {
             res.status = 401;

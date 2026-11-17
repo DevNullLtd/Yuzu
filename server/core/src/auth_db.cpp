@@ -507,6 +507,12 @@ const std::vector<pg::PgMigration>& migrations() {
         // every new users query on a running peer queues behind them, so a short cap keeps that
         // stall short. A failed attempt rolls back and the next boot retries it.
         {3, migration_v3_sql()},
+        // v4 (WP03 F8/F15): durable per-account MFA failure budget, separate from the password
+        // lockout columns so a password success cannot reset it. Additive; defaults are inert.
+        {4,
+         "SET LOCAL lock_timeout = '3s'; "
+         "ALTER TABLE users ADD COLUMN mfa_failed_count INTEGER NOT NULL DEFAULT 0, "
+         "ADD COLUMN mfa_locked_until TIMESTAMPTZ, ADD COLUMN mfa_last_attempt_at TIMESTAMPTZ;"},
     };
     return kMigrations;
 }
@@ -1533,7 +1539,7 @@ std::expected<void, AuthDBError> AuthDB::reactivate_user(const std::string& user
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "UPDATE auth.users SET is_active = TRUE, updated_at = now(), failed_login_count = 0, "
-        "last_failed_login_at = NULL, locked_until = NULL WHERE username = $1 RETURNING id",
+        "last_failed_login_at = NULL, locked_until = NULL, mfa_failed_count = 0, mfa_locked_until = NULL, mfa_last_attempt_at = NULL WHERE username = $1 RETURNING id",
         std::vector<std::string>{username});
     if (res.status() != PGRES_TUPLES_OK)
         return std::unexpected(AuthDBError::WriteFailed);
@@ -1672,6 +1678,113 @@ std::expected<void, AuthDBError> AuthDB::clear_failed_logins(const std::string& 
     return {};
 }
 
+// ── Per-account MFA failure budget (WP03 F8/F15) ─────────────────────────────
+
+std::expected<AuthDB::LockoutStatus, AuthDBError>
+AuthDB::mfa_lockout_status(const std::string& username) {
+    if (!is_valid_username(username))
+        return std::unexpected(AuthDBError::InvalidUsername);
+    auto lease = impl_->pool.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::unexpected(AuthDBError::StoreBusy);
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT mfa_failed_count, COALESCE((mfa_locked_until AT TIME ZONE 'UTC')::text, ''), "
+        "(mfa_locked_until IS NOT NULL AND mfa_locked_until > now()) "
+        "FROM auth.users WHERE username = $1 AND is_active = TRUE",
+        std::vector<std::string>{username});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected(AuthDBError::QueryFailed);
+    LockoutStatus out;
+    if (PQntuples(res.get()) > 0) {
+        out.failed_count = static_cast<int>(to_i64(col(res.get(), 0, 0)));
+        out.locked_until = col_str(res.get(), 0, 1);
+        out.locked = to_bool(col(res.get(), 0, 2));
+    }
+    return out;
+}
+
+std::expected<AuthDB::MfaReservation, AuthDBError>
+AuthDB::reserve_mfa_attempt(const std::string& username, int threshold, int window_secs) {
+    MfaReservation out;
+    if (threshold <= 0 || window_secs <= 0)
+        return std::unexpected(AuthDBError::WriteFailed); // misconfigured: refuse, never fail open
+    if (!is_valid_username(username))
+        return std::unexpected(AuthDBError::InvalidUsername);
+    auto lease = impl_->pool.try_acquire_for(kWriteTimeout);
+    if (!lease)
+        return std::unexpected(AuthDBError::StoreBusy);
+    // ONE statement is the authority (kReserveMfaAttemptSql): the row lock serialises concurrent
+    // reservations (across replicas too) and `reserved` comes from the PRE-update state
+    // read under that lock, never from comparing timestamps.
+    pg::PgResult res = pg::exec_params(
+        lease.get(), auth_sql::kReserveMfaAttemptSql,
+        std::vector<std::string>{std::to_string(threshold), std::to_string(window_secs), username});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected(AuthDBError::WriteFailed);
+    if (PQntuples(res.get()) == 0)
+        return out; // no such active user: no budget to spend (reserved stays true, count 0)
+    out.failed_count = static_cast<int>(to_i64(col(res.get(), 0, 0)));
+    out.reserved = to_bool(col(res.get(), 0, 1));
+    out.locked = to_bool(col(res.get(), 0, 2));
+    out.just_locked = out.reserved && out.locked && out.failed_count == threshold;
+    return out;
+}
+
+std::expected<void, AuthDBError> AuthDB::refund_mfa_attempt(const std::string& username,
+                                                             int threshold) {
+    if (!is_valid_username(username))
+        return std::unexpected(AuthDBError::InvalidUsername);
+    auto lease = impl_->pool.try_acquire_for(kWriteTimeout);
+    if (!lease)
+        return std::unexpected(AuthDBError::StoreBusy);
+    // Give back exactly ONE reservation (never a reset: concurrent failures stay counted) and
+    // lift the lock only if the count falls back under the threshold.
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "UPDATE auth.users SET mfa_failed_count = GREATEST(mfa_failed_count - 1, 0), "
+        "mfa_locked_until = CASE WHEN GREATEST(mfa_failed_count - 1, 0) < $1::int "
+        "    THEN NULL ELSE mfa_locked_until END "
+        "WHERE username = $2 AND is_active = TRUE",
+        std::vector<std::string>{std::to_string(threshold), username});
+    if (res.status() != PGRES_COMMAND_OK)
+        return std::unexpected(AuthDBError::WriteFailed);
+    return {};
+}
+
+std::expected<void, AuthDBError> AuthDB::clear_account_lockouts(const std::string& username) {
+    if (!is_valid_username(username))
+        return std::unexpected(AuthDBError::InvalidUsername);
+    auto lease = impl_->pool.try_acquire_for(kWriteTimeout);
+    if (!lease)
+        return std::unexpected(AuthDBError::StoreBusy);
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "UPDATE auth.users SET failed_login_count = 0, last_failed_login_at = NULL, "
+        "locked_until = NULL, mfa_failed_count = 0, mfa_locked_until = NULL, "
+        "mfa_last_attempt_at = NULL WHERE username = $1 AND is_active = TRUE",
+        std::vector<std::string>{username});
+    if (res.status() != PGRES_COMMAND_OK)
+        return std::unexpected(AuthDBError::WriteFailed);
+    return {};
+}
+
+std::expected<void, AuthDBError> AuthDB::clear_mfa_failures(const std::string& username) {
+    if (!is_valid_username(username))
+        return std::unexpected(AuthDBError::InvalidUsername);
+    auto lease = impl_->pool.try_acquire_for(kWriteTimeout);
+    if (!lease)
+        return std::unexpected(AuthDBError::StoreBusy);
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "UPDATE auth.users SET mfa_failed_count = 0, mfa_locked_until = NULL, "
+        "mfa_last_attempt_at = NULL WHERE username = $1 AND is_active = TRUE",
+        std::vector<std::string>{username});
+    if (res.status() != PGRES_COMMAND_OK)
+        return std::unexpected(AuthDBError::WriteFailed);
+    return {};
+}
+
 // ── Break-glass arming (hardened mode) ───────────────────────────────────────
 
 std::expected<AuthDB::BreakGlassStatus, AuthDBError>
@@ -1711,7 +1824,10 @@ AuthDB::arm_break_glass(const std::string& username, int window_secs) {
         return std::unexpected(AuthDBError::WriteFailed);
     pg::PgResult res = pg::exec_params(
         lease.get(),
-        "UPDATE auth.users SET break_glass_armed_until = now() + make_interval(secs => $1::int) "
+        "UPDATE auth.users SET break_glass_armed_until = now() + make_interval(secs => $1::int), "
+        // Out-of-band recovery: arming also lifts any MFA failure lock, so a password-holder's
+        // guessing cannot keep the break-glass account's second factor wedged (WP03).
+        "mfa_failed_count = 0, mfa_locked_until = NULL, mfa_last_attempt_at = NULL "
         "WHERE username = $2 AND is_active = TRUE "
         "RETURNING COALESCE((break_glass_armed_until AT TIME ZONE 'UTC')::text, ''), "
         "          (break_glass_armed_until IS NOT NULL AND break_glass_armed_until > now())",

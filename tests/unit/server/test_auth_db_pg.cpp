@@ -1622,7 +1622,7 @@ TEST_CASE("AuthDB migrates v1 -> v2: clean enrollment/pending shape + import_met
     REQUIRE(adb.is_open()); // the v2 and v3 steps applied
 
     PgConn conn = connect(db.dsn());
-    CHECK(scalar(conn.get(), "SELECT version FROM public.schema_meta WHERE store='auth'") == "3");
+    CHECK(scalar(conn.get(), "SELECT version FROM public.schema_meta WHERE store='auth'") == "4");
 
     // v1 dead shapes gone, clean shape present (no `is_used`, has `max_uses`/`token_id`).
     CHECK(scalar(conn.get(), "SELECT count(*) FROM auth.enrollment_tokens") == "0");
@@ -3021,6 +3021,35 @@ void remove_commit_failer(PGconn* c, const std::string& table) {
 
 } // namespace
 
+TEST_CASE("AuthDB migrates v3 -> v4: the MFA failure-budget columns arrive inert on existing rows",
+          "[pg][auth_db][migration][mfa_budget]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    {
+        yuzu::test::TempDir keys{"yuzu_test_keys_"};
+        FileKeyProvider provider(keys.path);
+        SecretCodec codec(provider);
+        PgConn conn = connect(db.dsn());
+        REQUIRE(codec.init(conn.get()).has_value());
+        AuthDB first{pool, codec, 0};
+        REQUIRE(first.is_open());
+    }
+    PgConn conn = connect(db.dsn());
+    // Rewind to the v3 shape and seed a row that predates the columns.
+    run_sql(conn.get(), "ALTER TABLE auth.users DROP COLUMN mfa_failed_count, "
+                        "DROP COLUMN mfa_locked_until, DROP COLUMN mfa_last_attempt_at");
+    run_sql(conn.get(), "UPDATE public.schema_meta SET version = 3 WHERE store = 'auth'");
+    run_sql(conn.get(), "INSERT INTO auth.users (username) VALUES ('seed_v3')");
+    CHECK(second_store_opens(db.dsn())); // applies v4
+    CHECK(scalar(conn.get(), "SELECT version FROM public.schema_meta WHERE store='auth'") == "4");
+    CHECK(scalar(conn.get(), "SELECT mfa_failed_count FROM auth.users WHERE username='seed_v3'") ==
+          "0");
+    CHECK(scalar(conn.get(),
+                 "SELECT (mfa_locked_until IS NULL AND mfa_last_attempt_at IS NULL)::text FROM "
+                 "auth.users WHERE username='seed_v3'") == "true");
+}
+
 TEST_CASE(
     "AuthDB migrates v2 -> v3: existing rows start at generation 0 (hard cutover, no seed) and "
     "the trigger is ENABLE ALWAYS",
@@ -3038,18 +3067,20 @@ TEST_CASE(
         REQUIRE(first.is_open());
     }
     PgConn conn = connect(db.dsn());
-    CHECK(scalar(conn.get(), "SELECT version FROM public.schema_meta WHERE store='auth'") == "3");
+    CHECK(scalar(conn.get(), "SELECT version FROM public.schema_meta WHERE store='auth'") == "4");
 
-    // Rewind to the v2 shape: no column, no trigger, schema_meta at 2.
+    // Rewind to the v2 shape (also drop the v4 MFA-budget columns, which a v2 database lacks): no column, no trigger, schema_meta at 2.
     run_sql(conn.get(), "DROP TRIGGER users_mfa_factor_gen ON auth.users");
     run_sql(conn.get(), "DROP FUNCTION auth.users_mfa_factor_gen()");
     run_sql(conn.get(), "ALTER TABLE auth.users DROP COLUMN mfa_factor_gen");
+    run_sql(conn.get(), "ALTER TABLE auth.users DROP COLUMN mfa_failed_count, "
+                        "DROP COLUMN mfa_locked_until, DROP COLUMN mfa_last_attempt_at");
     run_sql(conn.get(), "UPDATE public.schema_meta SET version = 2 WHERE store = 'auth'");
     run_sql(conn.get(), "INSERT INTO auth.users (username, mfa_enrolled_at) VALUES "
                         "('seed_enrolled', now()), ('seed_never', NULL)");
 
-    CHECK(second_store_opens(db.dsn())); // applies v3
-    CHECK(scalar(conn.get(), "SELECT version FROM public.schema_meta WHERE store='auth'") == "3");
+    CHECK(second_store_opens(db.dsn())); // applies v3 then v4
+    CHECK(scalar(conn.get(), "SELECT version FROM public.schema_meta WHERE store='auth'") == "4");
     // No seed: a row that was already enrolled when the migration ran reads generation 0, which
     // every gate refuses until the account is re-enrolled (the cutover starts from a fresh
     // database). The next enrolment change assigns it a fresh value.

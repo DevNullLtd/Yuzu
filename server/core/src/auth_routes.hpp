@@ -1,5 +1,8 @@
 #pragma once
 
+#include "pbkdf2_budget.hpp"
+#include <thread>
+#include <algorithm>
 #include <yuzu/server/auth.hpp>
 
 #include "analytics_event.hpp"
@@ -127,6 +130,9 @@ enum class PasswordCheckOutcome : std::uint8_t {
     /// rejection would be an UNcounted attempt — a free guess while the store
     /// is degraded (Hermes p2 MEDIUM).
     kStoreUnavailable,
+    /// WP03 perf-F1: the process-wide PBKDF2 concurrency budget was full, so no hash ran and
+    /// nothing was counted. Answer 429 + Retry-After (uniform: reveals nothing about the name).
+    kBusy,
     /// #5342 Gate 7 (sec-3): the password could not be VERIFIED at all — an
     /// AuthDB read failed (`VerifyFailure::kStoreUnavailable`) or the stored
     /// credential changed mid-verify (`kCredentialChanged`, a concurrent
@@ -215,6 +221,11 @@ public:
                AnalyticsEventStore* analytics_store, std::shared_mutex& oidc_mu,
                std::unique_ptr<oidc::OidcProvider>& oidc_provider,
                saml::SamlProvider* saml_provider = nullptr);
+
+    /// Size the process-wide PBKDF2 concurrency budget (server.cpp: a conservative fraction of
+    /// the httplib worker pool). Default is hardware_concurrency/4, min 2.
+    void set_pbkdf2_cap(int cap) { pbkdf2_budget_.set_cap(cap); }
+    Pbkdf2Budget& pbkdf2_budget() { return pbkdf2_budget_; }
 
     // -- Auth helpers (called by server.cpp to create callbacks for other modules) --
 
@@ -1227,6 +1238,44 @@ private:
     static constexpr std::size_t kLoginLockStripes = 256;
     std::array<std::mutex, kLoginLockStripes> login_locks_;
     std::mutex& login_lock_for(const std::string& username);
+    Pbkdf2Budget pbkdf2_budget_{static_cast<int>(
+        std::max(2u, std::thread::hardware_concurrency() / 4))};
+    /// Uniform 429 + Retry-After for a full PBKDF2 budget (A4 envelope; same shape for any name).
+    void refuse_pbkdf2_busy(httplib::Response& res);
+    /// Acquire a PBKDF2 slot of `cls` for `req`'s source; counts a refusal by route/class/reason.
+    /// Callers take it BEFORE any account-state decision (lock, reservation) so a full budget
+    /// answers 429 identically for locked and unlocked accounts (no lock-state oracle).
+    Pbkdf2Budget::Slot acquire_pbkdf2(Pbkdf2Class cls, const httplib::Request& req,
+                                      const std::string& route);
+
+    // ── Per-account durable MFA failure budget (WP03 F8/F15) ──────────────────
+    // The ONE chokepoint for second-factor guess limiting, shared by
+    // POST /login/mfa and POST /login/mfa/stepup. An attempt is RESERVED in the
+    // auth store (one DB-clock statement: lock check + increment) BEFORE the code
+    // is verified, and refunded (decrement by one) only on a verified code or a
+    // store outage. A guess that cannot be counted is therefore never verified:
+    // kStoreUnavailable must be answered 503 with no verification attempted
+    // (fail closed). The DB statement is the authority (multi-replica safe); no
+    // in-process lock is needed. Counts per ACCOUNT, independent of pending
+    // token, session and source address; time-boxed, never permanent.
+    // POST /login/mfa/enroll is deliberately NOT under this budget: its code is
+    // checked against a provisional secret the caller was just shown (the caller
+    // must already know the password to be shown it), so guessing gains nothing.
+    enum class MfaBudget { kOpen, kLocked, kStoreUnavailable };
+    struct MfaReserved {
+        MfaBudget budget{MfaBudget::kStoreUnavailable};
+        bool just_locked{false}; // this reservation crossed the threshold
+    };
+    static constexpr int kMfaBudgetDefaultThreshold = 5;
+    static constexpr int kMfaBudgetDefaultWindowSecs = 300;
+    int mfa_budget_threshold() const;
+    int mfa_budget_window() const;
+    MfaReserved mfa_budget_reserve(const std::string& username);
+    /// A wrong code consumed its reservation; audit once when it tripped the lock.
+    void mfa_budget_note_failure(const httplib::Request& req, const std::string& username,
+                                 const std::string& role_str, const MfaReserved& r);
+    /// Verified code / store outage: give the reservation back.
+    void mfa_budget_refund(const std::string& username);
 };
 
 } // namespace yuzu::server
