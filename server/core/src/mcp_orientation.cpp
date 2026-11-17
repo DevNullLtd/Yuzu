@@ -205,8 +205,8 @@ constexpr std::string_view kDiscovery[] = {"discover_permissions", "discover_ins
 // #7217: get_guardian_device_compliance carries the per-guard flags and uncertain_guards too, and
 // both per-device reads (it and get_guardian_device_guards) report unrepresented_pending_guards.
 // UP-14: get_guardian_status reports unordered_agents / unordered_agent_ids and
-// get_guardian_device_guards reports its ordering block (the stored emit-order pair state; stored
-// and counted, not yet compared).
+// get_guardian_device_guards reports its ordering block (the agent's emit-order pair clock and
+// counters, which the census ordering decides by).
 // #2146 Batch B1 extends this family with the rule CRUD/push mutations
 // (create/get/update/delete_guardian_rule, push_guardian_rules) and the two
 // per-agent reads #4037 deliberately deferred (get_guardian_agent_status,

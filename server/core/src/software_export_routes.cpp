@@ -31,15 +31,16 @@ constexpr const char* kTargetType = "Inventory";
 // How a stream ended. The default is kAborted: the response's resource-releaser can run with
 // nothing recorded when the client went away, the transport failed, or the server began shutting
 // down mid-stream.
-enum class Outcome { kAborted, kCompleted, kDegraded, kDeadline };
+enum class Outcome { kAborted, kCompleted, kDegraded, kDeadline, kLimit };
 
 // Indexes swe::kResults.
 [[nodiscard]] std::string_view outcome_label(Outcome o) noexcept {
-    static_assert(swe::kResults.size() == 4);
+    static_assert(swe::kResults.size() == 5);
     switch (o) {
     case Outcome::kCompleted: return swe::kResults[0];
     case Outcome::kDegraded: return swe::kResults[1];
     case Outcome::kDeadline: return swe::kResults[2];
+    case Outcome::kLimit: return swe::kResults[4];
     case Outcome::kAborted: break;
     }
     return swe::kResults[3];
@@ -54,6 +55,7 @@ struct Ctx {
     yuzu::MetricsRegistry* metrics{nullptr};
     detail::StreamBudget* budget{nullptr}; ///< borrowed; the one held-open budget (ADR-0034)
     std::size_t concurrency{0};            ///< the export cap: the lease's per-key cap
+    swe::Limits limits{};                  ///< the size limits, already clamped
     bool ready{false};
 
     [[nodiscard]] std::int64_t seconds() const {
@@ -79,6 +81,8 @@ struct Stream {
     swc::DevicesOps::Anchor after{};
     std::unordered_map<std::string, std::string> hostnames;
     std::int64_t deadline{0};
+    std::int64_t rows_written{0};  ///< data rows written so far (the CSV header is not a row)
+    std::int64_t bytes_written{0}; ///< body bytes written so far
     bool first_chunk{true};
     Outcome outcome{Outcome::kAborted};
     std::string cid;
@@ -181,8 +185,22 @@ bool pump(Stream& st, httplib::DataSink& sink) {
     // the peer before every provider call, so a client that closed is noticed on the next turn.
     const auto chunk = swe::format_chunk(rows, *facts, st.request.format, st.first_chunk);
     st.first_chunk = false;
+    // The size limits are true maxima: a chunk that would pass either is not written, and the
+    // transfer is cut like a deadline (no terminating chunk), so a file that ends cleanly is
+    // always the whole answer.
+    if (!swe::within_limits(st.ctx->limits, st.rows_written, st.bytes_written, rows.size(),
+                            chunk.size())) {
+        st.outcome = Outcome::kLimit;
+        spdlog::warn("{}: size limit reached ({}/{} rows, {}/{} bytes written, next page +{} rows "
+                     "+{} bytes); aborting; cid={}",
+                     kVerb, st.rows_written, st.ctx->limits.max_rows, st.bytes_written,
+                     st.ctx->limits.max_bytes, rows.size(), chunk.size(), st.cid);
+        return false;
+    }
     if (!chunk.empty() && !sink.write(chunk.data(), chunk.size()))
         return false; // client gone: outcome stays kAborted
+    st.rows_written += static_cast<std::int64_t>(rows.size());
+    st.bytes_written += static_cast<std::int64_t>(chunk.size());
     if (!step->resume) { // the ONLY end of the data
         st.outcome = Outcome::kCompleted;
         sink.done();
@@ -203,7 +221,8 @@ void SoftwareExportRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
               .reads = std::move(deps.reads),
               .metrics = deps.metrics,
               .budget = deps.stream_budget,
-              .concurrency = swe::clamp_concurrency(deps.concurrency)};
+              .concurrency = swe::clamp_concurrency(deps.concurrency),
+              .limits = swe::clamp_limits(deps.limits)};
     built.ready = reads_complete(built.reads);
     const auto ctx = std::make_shared<const Ctx>(std::move(built));
 

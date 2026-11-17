@@ -24,7 +24,7 @@
 ///
 /// WHAT THIS IS NOT: a place that DECLARES `plugin.action` rows. The real
 /// catalogue ships as several per-group fragment headers under
-/// `capability_decls/` (this package owns only the four system-initiated
+/// `capability_decls/` (this package owns only the five system-initiated
 /// ones — see `capability_decls/core_dispatch_capabilities.hpp`); every other
 /// plugin's rows are authored elsewhere and injected into a
 /// `CommandCapabilityRegistry` instance at composition time. This header

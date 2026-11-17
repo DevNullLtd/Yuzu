@@ -250,8 +250,11 @@ FRAGMENT_FILES = [
 # ReadOnly, quarantine_allow Mutating) on top of runtime_posture's 250 = 254, then component_inventory (scan, +1,
 # ReadOnly, Inventory:Read, gate None) = 255, less the old containment plugin's four rows that PRQ.2 removed = 251, re-derived by running parse_fragment_gate_rows over FRAGMENT_FILES,
 # not by adding to a baseline.
-# process_introspect (inspect, +1, ReadOnly, Forensics:Read, gate AdminOrApproval) on top of that 251 = 252, re-derived by running parse_fragment_gate_rows over FRAGMENT_FILES
-EXPECTED_TOTAL_ROWS = 252
+# SAM-39 __sync__.settings: +1 core (Mutating/Reversible, Inventory:Write, system_reserved, gate None) on top of
+# PRQ.2's 251 = 252, re-derived by running this test (parse_fragment_gate_rows over FRAGMENT_FILES), not by adding
+# to a baseline.
+# process_introspect (inspect, +1, ReadOnly, Forensics:Read, gate AdminOrApproval) on top of SAM-39's 252 = 253, re-derived by running parse_fragment_gate_rows over FRAGMENT_FILES
+EXPECTED_TOTAL_ROWS = 253
 
 # Decision 1 (#1398 design doc): the ONLY prefixes a content-declared pair
 # with no catalogue row may carry — server-side handlers with no
