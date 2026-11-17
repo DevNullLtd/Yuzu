@@ -115,6 +115,7 @@ ModuleSignVerdict SigningCache::get(const std::string& full_path, const FileVers
 #include <spdlog/spdlog.h>
 
 #include <atomic>
+#include <cstddef> // offsetof
 #include <cstring> // std::memset (stale-session props reset)
 #include <thread>
 #include <type_traits>
@@ -524,14 +525,20 @@ FileVersionStamp read_image_version_stamp(void* image) noexcept {
                          &returned, nullptr) ||
         returned < sizeof(USN_RECORD_COMMON_HEADER))
         return out;
-    const auto* hdr = reinterpret_cast<const USN_RECORD_COMMON_HEADER*>(&buf);
-    if (hdr->RecordLength > returned)
+    // Read the fields with memcpy out of the byte buffer instead of casting it to a record type:
+    // no strict-aliasing or alignment assumption is needed (the buffer is also alignas(8)), and
+    // each read is bounds-checked against `returned`. Record layouts: USN_RECORD_V2/V3 both
+    // start with USN_RECORD_COMMON_HEADER {RecordLength, MajorVersion, MinorVersion} and carry a
+    // LONGLONG Usn at a fixed offset (offsetof), taken from the SDK definitions.
+    USN_RECORD_COMMON_HEADER hdr{};
+    std::memcpy(&hdr, buf.bytes, sizeof(hdr));
+    if (hdr.RecordLength > returned)
         return out;
     USN usn = 0;
-    if (hdr->MajorVersion == 2 && returned >= sizeof(USN_RECORD_V2)) {
-        usn = reinterpret_cast<const USN_RECORD_V2*>(&buf)->Usn;
-    } else if (hdr->MajorVersion == 3 && returned >= sizeof(USN_RECORD_V3)) {
-        usn = reinterpret_cast<const USN_RECORD_V3*>(&buf)->Usn;
+    if (hdr.MajorVersion == 2 && returned >= sizeof(USN_RECORD_V2)) {
+        std::memcpy(&usn, buf.bytes + offsetof(USN_RECORD_V2, Usn), sizeof(usn));
+    } else if (hdr.MajorVersion == 3 && returned >= sizeof(USN_RECORD_V3)) {
+        std::memcpy(&usn, buf.bytes + offsetof(USN_RECORD_V3, Usn), sizeof(usn));
     } else {
         return out;
     }
