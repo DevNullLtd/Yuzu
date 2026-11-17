@@ -49,6 +49,18 @@ fuzz_targets = {
     ),
     'deps': [nlohmann_dep],
   },
+  'fuzz_file_search_cursor': {
+    'sources': files('fuzz_file_search_cursor.cpp'),
+    'deps': [],
+  },
+  'fuzz_file_search_names': {
+    'sources': files('fuzz_file_search_names.cpp'),
+    'deps': [],
+  },
+  'fuzz_file_search_glob': {
+    'sources': files('fuzz_file_search_glob.cpp'),
+    'deps': [],
+  },
 }
 
 foreach name, spec : fuzz_targets
