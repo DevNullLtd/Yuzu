@@ -29,7 +29,6 @@
  *    fails the health sequence; the walker reading a listing on a zero budget fails the same-position check.
  *  - case 7 (coverage carried): CoverageEnvelope::complete() ignoring prior_gaps, or next_cursor dropping
  *    the slice's gap count (or its saturating sum), makes the final envelope read complete.
- *  - case 8 (tokens): any of the six OrderedGap::Cause spellings drifting from its GapCause twin fails.
  *  - case 1b (completing slice): the driver validating a cursor on the slice that completes the walk fails
  *    the row-cap sweep (max_rows landing on the root's final entry), the empty root and the unlistable
  *    root, where that slice returns the resume position itself; a completing slice issuing a cursor
@@ -72,18 +71,6 @@ constexpr fsr::QueryHash kHash{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15
 
 DirEntry D(std::string n) { return {std::move(n), T::dir}; }
 DirEntry F(std::string n) { return {std::move(n), T::file}; }
-
-fsr::GapCause gap_cause(OrderedGap::Cause c) {
-    switch (c) {
-    case OrderedGap::Cause::depth: return fsr::GapCause::depth;
-    case OrderedGap::Cause::dir_unreadable: return fsr::GapCause::dir_unreadable;
-    case OrderedGap::Cause::dir_truncated: return fsr::GapCause::dir_truncated;
-    case OrderedGap::Cause::other_device: return fsr::GapCause::other_device;
-    case OrderedGap::Cause::network_mount: return fsr::GapCause::network_mount;
-    case OrderedGap::Cause::memory_cap: return fsr::GapCause::memory_cap;
-    }
-    return fsr::GapCause::depth;
-}
 
 fsr::Reason reason_of(Stop s) {
     switch (s) {
@@ -156,7 +143,7 @@ struct Search {
         v.reason = reason_of(res.stop);
         env.volumes.push_back(v);
         for (const auto& og : res.gaps)
-            env.add_gap({og.path, gap_cause(og.cause)});
+            env.add_gap({og.path, og.cause});
         env.gaps_dropped = res.gaps_dropped;
         REQUIRE(env.valid());
 
@@ -505,14 +492,4 @@ TEST_CASE("resume contract: a gap in an early slice keeps the final envelope par
     CHECK(clean.envs.back().complete());
     CHECK(last_row(clean) == "coverage|complete|slices=" + std::to_string(clean.results.size()) +
                                  "|prior_gaps=0|consistency=not_a_snapshot");
-}
-
-TEST_CASE("resume contract: every OrderedGap cause spells the token of its GapCause twin",
-          "[file_search][walk_ordered][resume_contract]") {
-    using C = OrderedGap::Cause;
-    constexpr C all[] = {C::depth, C::dir_unreadable, C::dir_truncated,
-                         C::other_device, C::network_mount, C::memory_cap};
-    for (const C c : all)
-        CHECK(std::string(to_token(c)) == fsr::to_token(gap_cause(c)));
-    CHECK(std::size(all) == 6);
 }

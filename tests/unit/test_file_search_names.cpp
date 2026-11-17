@@ -64,32 +64,19 @@ TEST_CASE("encode_name/decode_name: every pair over a hostile alphabet round-tri
 
 TEST_CASE("encode_name/decode_name: 20000 fixed-seed random strings round-trip", "[file_search]") {
     std::mt19937_64 rng(0x5EED'F11E'5EA2'C400ULL);
+    // Odd strings lean on well-formed scalars of every length, so 3- and 4-byte ones reach encode_name.
+    static constexpr std::string_view kScalars[] = {"a",        "%",          "|",
+                                                     "\\",       "/",          "\xc3\xa9",
+                                                     "\xe2\x82\xac", "\xf0\x9f\x98\x80", "\x7f",
+                                                     "\xff"};
     int bad = 0;
     for (int i = 0; i < 20000; ++i) {
-        std::string raw(static_cast<std::size_t>(rng() % 301), '\0');
-        // Half the strings are raw bytes (invalid UTF-8, NUL, controls), half lean on a
-        // multi-byte-heavy alphabet so well-formed scalars appear too.
-        const bool texty = (i & 1) != 0;
-        static constexpr std::string_view kScalars[] = {"a",
-                                                         "%",
-                                                         "|",
-                                                         "\\",
-                                                         "/",
-                                                         "\xc3\xa9",
-                                                         "\xe2\x82\xac",
-                                                         "\xf0\x9f\x98\x80",
-                                                         "\x7f",
-                                                         "\xff"};
-        if (texty) {
-            raw.clear();
-            while (raw.size() < 300) {
+        std::string raw;
+        for (const std::size_t len = rng() % 301; raw.size() < len;) {
+            if ((i & 1) != 0)
                 raw += kScalars[rng() % std::size(kScalars)];
-                if (rng() % 8 == 0)
-                    break;
-            }
-        } else {
-            for (auto& ch : raw)
-                ch = static_cast<char>(rng() & 0xFF);
+            else
+                raw += static_cast<char>(rng() & 0xFF);
         }
         if (!round_trips(raw) || !encoding_is_clean(fs::encode_name(raw)))
             ++bad;
@@ -129,29 +116,14 @@ TEST_CASE("decode_name: refuses every non-canonical or malformed encoding", "[fi
     CHECK(fs::decode_name("") == std::string());
 }
 
-TEST_CASE("file identity: round-trip, zero is '-'", "[file_search]") {
+TEST_CASE("file identity: exact spellings, zero is '-'", "[file_search]") {
     CHECK(fs::format_file_identity({}) == "-");
     CHECK(fs::format_file_identity({1, 2}) == "0000000000000001:0000000000000002");
     CHECK(fs::format_file_identity({0xFEDCBA9876543210ULL, 0xABCDEF0123456789ULL}) ==
           "fedcba9876543210:abcdef0123456789");
-    for (const fs::FileIdentity id : {fs::FileIdentity{0, 1}, fs::FileIdentity{1, 0},
-                                      fs::FileIdentity{~0ULL, ~0ULL}, fs::FileIdentity{0x12, 0x34}}) {
-        const auto back = fs::parse_file_identity(fs::format_file_identity(id));
-        REQUIRE(back);
-        CHECK(back->dev == id.dev);
-        CHECK(back->file_id == id.file_id);
-    }
-    const auto zero = fs::parse_file_identity("-");
-    REQUIRE(zero);
-    CHECK(zero->dev == 0);
-    CHECK(zero->file_id == 0);
-    CHECK_FALSE(fs::parse_file_identity(""));
-    CHECK_FALSE(fs::parse_file_identity("0000000000000000:0000000000000000")); // one spelling: "-"
-    CHECK_FALSE(fs::parse_file_identity("FEDCBA9876543210:abcdef0123456789"));  // uppercase
-    CHECK_FALSE(fs::parse_file_identity("0000000000000001-0000000000000002"));
-    CHECK_FALSE(fs::parse_file_identity("000000000000001:0000000000000002"));    // short
-    CHECK_FALSE(fs::parse_file_identity("0000000000000001:00000000000000020")); // long
-    CHECK_FALSE(fs::parse_file_identity("000000000000000g:0000000000000002"));
+    // A half-known identity is not the unknown one.
+    CHECK(fs::format_file_identity({0, 1}) == "0000000000000000:0000000000000001");
+    CHECK(fs::format_file_identity({1, 0}) == "0000000000000001:0000000000000000");
 }
 
 TEST_CASE("format_match_row: encodes the path component-wise and names the identity", "[file_search]") {

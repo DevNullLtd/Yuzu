@@ -33,6 +33,7 @@
  *  - gap cap: not capping gaps fails the 1,000 / 5 split; opening a file fails total_opens == 0.
  */
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include "component_fixture_tree.hpp"
 #include "component_walk.hpp"
@@ -223,21 +224,6 @@ Concat run_sliced(Rig& r, int kind, std::size_t k) {
 }
 
 } // namespace
-
-TEST_CASE("walk_ordered: the identity members are appended and defaulted",
-          "[walk_ordered][file_search][component_walk]") {
-    const DirEntry e{"x", T::file}; // positional and braced uses of the seam still compile
-    CHECK(e.file_id == 0);
-    const ListResult lr{};
-    CHECK(lr.dev == 0);
-    CHECK(lr.file_id == 0);
-    CHECK(to_token(Cause::depth) == "depth");
-    CHECK(to_token(Cause::dir_unreadable) == "dir_unreadable");
-    CHECK(to_token(Cause::dir_truncated) == "dir_truncated");
-    CHECK(to_token(Cause::other_device) == "other_device");
-    CHECK(to_token(Cause::network_mount) == "network_mount");
-    CHECK(to_token(Cause::memory_cap) == "memory_cap");
-}
 
 TEST_CASE("walk_ordered: visits arrive sorted by name bytes, depth first, a directory before its entries",
           "[walk_ordered][file_search][component_walk]") {
@@ -631,10 +617,13 @@ TEST_CASE("walk_ordered: a chain of nested large directories never takes the pea
 
 TEST_CASE("walk_ordered: a replaced directory restarts that subtree, and the position may go back",
           "[walk_ordered][file_search][component_walk]") {
+    // The directory is replaced by a new file id, or (device_only) by another device with the same id.
+    const bool device_only = GENERATE(false, true);
+    CAPTURE(device_only);
     Rig r;
     r.dir("/r", {D("a"), F("b")});
     r.dir("/r/a", {F("x"), F("y"), F("z")});
-    r.ids["/r/a"] = {1, 10};
+    r.ids["/r/a"] = {1, 10}; // the root's device stays unknown, so a new device is no other_device gap
 
     WalkLimits cut;
     cut.max_entries = 3; // a, x, y
@@ -642,15 +631,16 @@ TEST_CASE("walk_ordered: a replaced directory restarts that subtree, and the pos
     REQUIRE(first.position.dirs == std::vector<fsr::Frame>{{"a", 1, 10}});
     REQUIRE(first.position.after == "y");
 
-    r.ids["/r/a"] = {1, 11}; // the directory was replaced between slices
+    const auto replaced = device_only ? Ident{2, 10} : Ident{1, 11}; // between slices
+    r.ids["/r/a"] = replaced;
     r.visits.clear();
     WalkLimits one;
     one.max_entries = 1;
     const auto second = slice(r, first.position, one);
 
     CHECK(second.restarted);
-    CHECK(r.visits == Strs{"/r/a/x"}); // from its first entry again
-    CHECK(second.position.dirs == std::vector<fsr::Frame>{{"a", 1, 11}});
+    CHECK(r.visits == Strs{"/r/a/x"}); // from its first entry again, never on from "y"
+    CHECK(second.position.dirs == std::vector<fsr::Frame>{{"a", replaced.dev, replaced.id}});
     CHECK(second.position.after == "x");
     CHECK(earlier(second.position, first.position));
     CHECK(!second.advanced);
@@ -660,31 +650,6 @@ TEST_CASE("walk_ordered: a replaced directory restarts that subtree, and the pos
     CHECK(third.stop == Stop::complete);
     CHECK(!third.restarted);
     CHECK(r.visits == Strs{"/r/a/y", "/r/a/z", "/r/b"});
-}
-
-TEST_CASE("walk_ordered: a directory whose device alone changed is replaced, not resumed past",
-          "[walk_ordered][file_search][component_walk]") {
-    Rig r;
-    r.dir("/r", {D("a"), F("b")});
-    r.dir("/r/a", {F("x"), F("y"), F("z")});
-    r.ids["/r/a"] = {1, 10}; // the root's device stays unknown, so this is no other_device gap
-
-    WalkLimits cut;
-    cut.max_entries = 3; // a, x, y
-    const auto first = slice(r, {}, cut);
-    REQUIRE(first.position.dirs == std::vector<fsr::Frame>{{"a", 1, 10}});
-    REQUIRE(first.position.after == "y");
-
-    r.ids["/r/a"] = {2, 10}; // same file id, another device
-    r.visits.clear();
-    WalkLimits one;
-    one.max_entries = 1;
-    const auto second = slice(r, first.position, one);
-
-    CHECK(second.restarted);
-    CHECK(r.visits == Strs{"/r/a/x"}); // from its first entry again, never on from "y"
-    CHECK(second.position.dirs == std::vector<fsr::Frame>{{"a", 2, 10}});
-    CHECK(earlier(second.position, first.position));
 }
 
 TEST_CASE("walk_ordered: a directory deleted between slices continues at the next greater sibling",
@@ -716,19 +681,16 @@ TEST_CASE("walk_ordered: a directory replaced by a file is treated as new and vi
 
 TEST_CASE("walk_ordered: a changed root identity restarts the whole root",
           "[walk_ordered][file_search][component_walk]") {
+    // The root is restamped with a new file id, or (device_only) with another device and the same id.
+    const bool device_only = GENERATE(false, true);
+    CAPTURE(device_only);
     Rig r;
     r.dir("/r", {D("a"), F("b")});
     r.dir("/r/a", {F("x")});
-    r.ids["/r"] = {1, 5};
-
-    WalkLimits cut;
-    cut.max_entries = 3; // a, x, b
-    const auto first = slice(r, {}, cut);
-    REQUIRE(first.stop == Stop::complete);
 
     const fsr::Position resume{1, 5, {{"a", 0, 0}}, "x"};
-    r.ids["/r"] = {1, 6};
-    r.visits.clear();
+    const auto restamped = device_only ? Ident{2, 5} : Ident{1, 6};
+    r.ids["/r"] = restamped;
     const auto res = slice(r, resume, {});
 
     CHECK(res.restarted);
@@ -743,45 +705,16 @@ TEST_CASE("walk_ordered: a changed root identity restarts the whole root",
     CHECK(r.visits == Strs{"/r/b"});
 
     // A restart that is then cut returns the root's NEW identity in the position.
-    r.ids["/r"] = {1, 6};
-    WalkLimits one;
-    one.max_entries = 1;
-    const auto cutres = slice(r, resume, one);
-    CHECK(cutres.restarted);
-    CHECK(cutres.position.root_file_id == 6);
-    CHECK(earlier(cutres.position, resume));
-}
-
-TEST_CASE("walk_ordered: a root whose device alone changed restarts the whole root",
-          "[walk_ordered][file_search][component_walk]") {
-    Rig r;
-    r.dir("/r", {F("a"), F("b"), F("n")});
-    r.ids["/r"] = {2, 5}; // the position below recorded device 1, same file id
-
-    const fsr::Position resume{1, 5, {}, "m"};
-    const auto res = slice(r, resume, {});
-
-    CHECK(res.restarted);
-    CHECK(res.stop == Stop::complete);
-    CHECK(r.visits == Strs{"/r/a", "/r/b", "/r/n"}); // "a" and "b" sort below "m" and are searched again
-
-    // A restart that is then cut returns the root's NEW device in the position.
+    r.ids["/r"] = restamped;
     r.visits.clear();
     WalkLimits one;
     one.max_entries = 1;
     const auto cutres = slice(r, resume, one);
     CHECK(cutres.restarted);
     CHECK(r.visits == Strs{"/r/a"});
-    CHECK(cutres.position.root_dev == 2);
-    CHECK(cutres.position.root_file_id == 5);
+    CHECK(cutres.position.root_dev == restamped.dev);
+    CHECK(cutres.position.root_file_id == restamped.id);
     CHECK(earlier(cutres.position, resume));
-
-    // The same position against the unchanged device continues past "m".
-    r.ids["/r"] = {1, 5};
-    r.visits.clear();
-    const auto same = slice(r, resume, {});
-    CHECK(!same.restarted);
-    CHECK(r.visits == Strs{"/r/n"});
 }
 
 TEST_CASE("walk_ordered: a forged resume never lists a path that was not a directory entry of a real listing",

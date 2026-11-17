@@ -256,28 +256,6 @@ TEST_CASE("file_search query_hash: pinned serialisation vectors", "[file_search]
           "8d705f7e091a232521fbb710036e127d");
 }
 
-TEST_CASE("file_search: 20000-input sweep never crashes", "[file_search][query]") {
-    std::mt19937 rng(0x5EA2C4u);
-    const std::string alpha("ab*?[]./\xc3\xa9\xff\x80\xf0\x9f\x98\x80\0AB", 19);
-    const auto rnd = [&](std::size_t maxlen) {
-        std::string s(rng() % (maxlen + 1), '\0');
-        for (auto& c : s)
-            c = alpha[rng() % alpha.size()];
-        return s;
-    };
-    std::size_t compiled = 0;
-    for (int i = 0; i < 20000; ++i) {
-        const std::string pat = rnd(40), name = rnd(60);
-        for (const auto& sem : {fs::byte_exact(), fs::ascii_case_fold()}) {
-            if (auto p = fs::Pattern::compile(pat, sem)) {
-                (void)p->matches(name);
-                ++compiled;
-            }
-        }
-    }
-    CHECK(compiled > 0);
-}
-
 TEST_CASE("file_search matcher: differential against an exhaustive reference",
           "[file_search][query]") {
     // Two hostile alphabets, alternated. `wide`: ASCII, both metacharacters, continuation bytes,

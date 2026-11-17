@@ -183,11 +183,11 @@ struct Query {
     put_str(q.pattern.semantics_id());
     buf.push_back(static_cast<char>(q.kinds));
     put_str(q.root);
-    const std::string hex = sha256_hex(buf);
-    const auto nib = [](char c) { return c <= '9' ? c - '0' : c - 'a' + 10; };
+    Sha256 sha;
+    sha.update(buf.data(), buf.size());
+    const auto digest = sha.raw_digest();
     std::array<std::uint8_t, 16> out{};
-    for (std::size_t i = 0; i < out.size(); ++i)
-        out[i] = static_cast<std::uint8_t>((nib(hex[2 * i]) << 4) | nib(hex[2 * i + 1]));
+    std::copy_n(digest.begin(), out.size(), out.begin());
     return out;
 }
 

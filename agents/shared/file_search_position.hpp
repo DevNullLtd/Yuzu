@@ -10,6 +10,9 @@
 // joined into a path that is opened, so nothing in this header takes or produces a filesystem
 // path.
 //
+// GapCause is the one vocabulary for a place the walk could not search, shared by the ordered
+// walker (OrderedGap) and the coverage envelope; there is no second gap enum.
+//
 // Platform-agnostic pure C++, no OS call, no I/O: the zero-dependency leaf-helper convention of
 // this directory (docs/cpp-conventions.md).
 #pragma once
@@ -25,6 +28,42 @@ namespace yuzu::shared::file_search {
 
 inline constexpr std::size_t kMaxNameBytes = 255;
 inline constexpr std::size_t kMaxPositionDepth = 64;
+
+enum class GapCause {
+    depth,
+    dir_unreadable,
+    dir_truncated,
+    other_device,
+    network_mount,
+    memory_cap,
+    permission_denied,
+    dataless,
+    private_namespace
+};
+
+[[nodiscard]] constexpr const char* to_token(GapCause c) noexcept {
+    switch (c) {
+    case GapCause::depth:
+        return "depth";
+    case GapCause::dir_unreadable:
+        return "dir_unreadable";
+    case GapCause::dir_truncated:
+        return "dir_truncated";
+    case GapCause::other_device:
+        return "other_device";
+    case GapCause::network_mount:
+        return "network_mount";
+    case GapCause::memory_cap:
+        return "memory_cap";
+    case GapCause::permission_denied:
+        return "permission_denied";
+    case GapCause::dataless:
+        return "dataless";
+    case GapCause::private_namespace:
+        return "private_namespace";
+    }
+    return "unknown";
+}
 
 /// One directory entered below the root: its name and the (dev, file id) seen when it was listed.
 struct Frame {

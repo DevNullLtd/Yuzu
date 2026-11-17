@@ -49,7 +49,6 @@ public:
           deadline_(last_resume_ + limits.slice) {}
 
     [[nodiscard]] Clock::time_point deadline() const noexcept { return deadline_; }
-    [[nodiscard]] std::chrono::milliseconds slept() const noexcept { return slept_; }
 
     void pace() {
         const auto t = env_.now();
@@ -68,7 +67,6 @@ public:
             nap = room;
         if (nap.count() > 0) {
             env_.sleep(nap);
-            slept_ += nap;
             last_resume_ = env_.now();
         } else {
             last_resume_ = t;
@@ -80,7 +78,6 @@ private:
     GovernorEnv env_;
     Clock::time_point last_resume_;
     Clock::time_point deadline_;
-    std::chrono::milliseconds slept_{0};
 };
 
 enum class Health { ok, stalled, unstable };

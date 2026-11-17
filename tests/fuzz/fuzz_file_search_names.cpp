@@ -44,10 +44,6 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
     if (const auto d = fsr::decode_name(in))
         require(fsr::encode_name(*d) == in);
 
-    // Identity: parse is total and accepts only what format produces.
-    if (const auto id = fsr::parse_file_identity(in))
-        require(fsr::format_file_identity(*id) == in);
-
     // A row built from arbitrary bytes keeps exactly three delimiters.
     const auto half = size / 2;
     const std::string row = fsr::format_match_row(in.substr(0, half), size % 2 ? fsr::EntryKind::file : fsr::EntryKind::directory,

@@ -263,128 +263,68 @@ TEST_CASE("cursor token: position errors", "[file_search]") {
 }
 
 TEST_CASE("cursor token: non-canonical base64 spellings are bad_base64", "[file_search]") {
-    using E = fs::CursorError;
+    // test_base64.cpp pins the decoder's rules; this pins that decode_cursor hands the token to that
+    // strict decoder untouched: one spelling per class, no URL-safe mapping, trim or re-padding.
     const auto c = deep_cursor(1);
     const auto good = fs::encode_cursor(c);
-    const auto err = [&](const std::string& t) {
+    const auto bad_base64 = [&](const std::string& t) {
         const auto r = fs::decode_cursor(t, c.query_hash);
         REQUIRE_FALSE(r);
-        return r.error();
+        CHECK(r.error() == fs::CursorError::bad_base64);
     };
     REQUIRE(fs::decode_cursor(good, c.query_hash));
-    std::string payload = good.substr(4);
+    REQUIRE(good.ends_with("==")); // the body is 76 bytes, 1 mod 3
 
-    // alphabet bytes of the URL-safe spelling
-    for (const char bad : {'-', '_'}) {
+    for (const char bad : {'-', '_', '='}) { // URL-safe alphabet, padding mid-token
         auto t = good;
         t[10] = bad;
-        CHECK(err(t) == E::bad_base64);
+        bad_base64(t);
     }
-    // missing padding: build a body whose base64 needs padding, then strip it
-    for (std::size_t extra = 0; extra < 3; ++extra) {
-        auto padded = body_of(c);
-        padded.append(extra, '\0'); // trailing bytes: only the base64 layer is under test below
-        const auto enc = yuzu::shared::base64_encode(padded);
-        if (enc.back() == '=') {
-            auto stripped = enc;
-            while (stripped.back() == '=')
-                stripped.pop_back();
-            CHECK(err(std::string(fs::kCursorPrefix) + stripped) == E::bad_base64);
-        }
-    }
-    // a whitespace byte, a length that is not a multiple of four
-    CHECK(err(good + "\n") == E::bad_base64);
-    CHECK(err(good + "A") == E::bad_base64);
-    CHECK(err(good.substr(0, good.size() - 1)) == E::bad_base64);
-    // non-zero slop bits: take a body that ends in "==" / "=" padding and set the unused bits
-    for (std::size_t extra = 0; extra < 3; ++extra) {
-        auto b = body_of(c);
-        b.append(extra, 'x');
-        auto enc = yuzu::shared::base64_encode(b);
-        if (enc.size() >= 2 && enc[enc.size() - 1] == '=') {
-            const std::size_t at = enc[enc.size() - 2] == '=' ? enc.size() - 3 : enc.size() - 2;
-            const std::string_view alpha = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-            const auto v = alpha.find(enc[at]);
-            enc[at] = alpha[v | 1];
-            if (enc != yuzu::shared::base64_encode(b))
-                CHECK(err(std::string(fs::kCursorPrefix) + enc) == E::bad_base64);
-        }
-    }
-    // padding in the middle
-    {
-        auto t = good;
-        t[8] = '=';
-        CHECK(err(t) == E::bad_base64);
-    }
+    bad_base64(good + "\n");                          // whitespace
+    bad_base64(good.substr(0, good.size() - 2));      // padding stripped
+    auto slop = good;                                 // non-zero slop bit in the last data character
+    ++slop[slop.size() - 3];
+    bad_base64(slop);
 }
 
-TEST_CASE("cursor token: 20000-mutation sweep never crashes and accepted tokens are canonical", "[file_search]") {
+TEST_CASE("cursor token: 20000-mutation sweep: accepted tokens are canonical", "[file_search]") {
     std::mt19937_64 rng(0xC0FFEE'5EED'0001ULL);
     std::vector<fs::Cursor> seeds = {deep_cursor(0), deep_cursor(1), deep_cursor(3), fs::Cursor{hash_of(7)}};
+    const auto mutate = [&](std::string s) {
+        for (int m = 0, n = 1 + static_cast<int>(rng() % 3); m < n; ++m) {
+            const auto at = static_cast<std::size_t>(rng() % s.size());
+            switch (rng() % 4) {
+            case 0:
+                s[at] = static_cast<char>(rng() & 0xFF);
+                break;
+            case 1:
+                s.erase(at, 1);
+                break;
+            case 2:
+                s.insert(at, 1, static_cast<char>(rng() & 0xFF));
+                break;
+            default:
+                s.resize(at);
+                break;
+            }
+            if (s.empty())
+                s = "x";
+        }
+        return s;
+    };
     int bad = 0;
     int accepted = 0;
-    bool threw = false;
-    try {
-        for (int i = 0; i < 20000; ++i) {
-            const auto& c = seeds[rng() % seeds.size()];
-            std::string token;
-            if ((i & 1) == 0) {
-                // mutate the base64 text
-                token = fs::encode_cursor(c);
-                for (int m = 0, n = 1 + static_cast<int>(rng() % 3); m < n; ++m) {
-                    const auto at = static_cast<std::size_t>(rng() % token.size());
-                    switch (rng() % 4) {
-                    case 0:
-                        token[at] = static_cast<char>(rng() & 0xFF);
-                        break;
-                    case 1:
-                        token.erase(at, 1);
-                        break;
-                    case 2:
-                        token.insert(at, 1, static_cast<char>(rng() & 0xFF));
-                        break;
-                    default:
-                        token.resize(at);
-                        break;
-                    }
-                    if (token.empty())
-                        token = "x";
-                }
-            } else {
-                // mutate the body, then re-encode it so the damage reaches the field parser
-                auto body = body_of(c);
-                for (int m = 0, n = 1 + static_cast<int>(rng() % 3); m < n; ++m) {
-                    const auto at = static_cast<std::size_t>(rng() % body.size());
-                    switch (rng() % 4) {
-                    case 0:
-                        body[at] = static_cast<char>(rng() & 0xFF);
-                        break;
-                    case 1:
-                        body.erase(at, 1);
-                        break;
-                    case 2:
-                        body.insert(at, 1, static_cast<char>(rng() & 0xFF));
-                        break;
-                    default:
-                        body.resize(at);
-                        break;
-                    }
-                    if (body.empty())
-                        body = "x";
-                }
-                token = token_of_body(body);
-            }
-            const auto r = fs::decode_cursor(token, c.query_hash);
-            if (r) {
-                ++accepted;
-                if (fs::encode_cursor(*r) != token)
-                    ++bad;
-            }
+    for (int i = 0; i < 20000; ++i) {
+        const auto& c = seeds[rng() % seeds.size()];
+        // even: damage the base64 text; odd: damage the body and re-encode, so it reaches the field parser
+        const auto token = (i & 1) == 0 ? mutate(fs::encode_cursor(c)) : token_of_body(mutate(body_of(c)));
+        const auto r = fs::decode_cursor(token, c.query_hash);
+        if (r) {
+            ++accepted;
+            if (fs::encode_cursor(*r) != token)
+                ++bad;
         }
-    } catch (...) {
-        threw = true;
     }
-    CHECK_FALSE(threw);
     CHECK(bad == 0);
     CHECK(accepted > 0); // the sweep does reach the accept path
 }

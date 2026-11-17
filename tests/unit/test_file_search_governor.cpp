@@ -81,7 +81,6 @@ TEST_CASE("governor: 50 percent duty over a slice of per-entry work", "[file_sea
     milliseconds sum{0};
     for (auto d : c.sleeps)
         sum += d;
-    CHECK(g.slept() == sum);
     CHECK(sum > milliseconds{0});
 }
 
@@ -95,7 +94,6 @@ TEST_CASE("governor: never sleeps at 100 percent duty", "[file_search][governor]
         g.pace();
     }
     CHECK(c.sleeps.empty());
-    CHECK(g.slept() == milliseconds{0});
 }
 
 TEST_CASE("governor: never sleeps at or past the deadline", "[file_search][governor]") {

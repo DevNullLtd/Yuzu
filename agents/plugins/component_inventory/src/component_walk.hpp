@@ -183,22 +183,10 @@ inline void append(std::string& dir, const std::string& name) {
 
 /// A place the ordered walk could not search: the path of the directory (or mount entry) and why.
 struct OrderedGap {
-    enum class Cause { depth, dir_unreadable, dir_truncated, other_device, network_mount, memory_cap };
+    using Cause = yuzu::shared::file_search::GapCause;
     std::string path;
     Cause cause;
 };
-
-[[nodiscard]] constexpr std::string_view to_token(OrderedGap::Cause c) noexcept {
-    switch (c) {
-    case OrderedGap::Cause::depth: return "depth";
-    case OrderedGap::Cause::dir_unreadable: return "dir_unreadable";
-    case OrderedGap::Cause::dir_truncated: return "dir_truncated";
-    case OrderedGap::Cause::other_device: return "other_device";
-    case OrderedGap::Cause::network_mount: return "network_mount";
-    case OrderedGap::Cause::memory_cap: return "memory_cap";
-    }
-    return "other_device"; // unreachable for a valid enumerator
-}
 
 inline constexpr std::size_t kMaxOrderedGaps = 1000;
 inline constexpr std::size_t kMaxOrderedRetainedBytes = 16 * 1024 * 1024;

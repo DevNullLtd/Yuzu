@@ -45,15 +45,6 @@ inline constexpr char kHexLower[] = "0123456789abcdef";
     return -1;
 }
 
-/// Value of one lowercase hex digit, or -1.
-[[nodiscard]] inline int hex_lower_value(char c) noexcept {
-    if (c >= '0' && c <= '9')
-        return c - '0';
-    if (c >= 'a' && c <= 'f')
-        return c - 'a' + 10;
-    return -1;
-}
-
 } // namespace detail
 
 [[nodiscard]] inline std::string encode_name(std::string_view raw) {
@@ -112,27 +103,6 @@ struct FileIdentity {
         out[static_cast<std::size_t>(17 + k)] = detail::kHexLower[(id.file_id >> (60 - 4 * k)) & 0xF];
     }
     return out;
-}
-
-/// Accepts only what format_file_identity produces (so "0000000000000000:0000000000000000" is
-/// refused: that identity has the one spelling "-").
-[[nodiscard]] inline std::optional<FileIdentity> parse_file_identity(std::string_view s) noexcept {
-    if (s == "-")
-        return FileIdentity{};
-    if (s.size() != 33 || s[16] != ':')
-        return std::nullopt;
-    FileIdentity id;
-    for (std::size_t k = 0; k < 16; ++k) {
-        const int d = detail::hex_lower_value(s[k]);
-        const int f = detail::hex_lower_value(s[17 + k]);
-        if (d < 0 || f < 0)
-            return std::nullopt;
-        id.dev = (id.dev << 4) | static_cast<std::uint64_t>(d);
-        id.file_id = (id.file_id << 4) | static_cast<std::uint64_t>(f);
-    }
-    if (id.dev == 0 && id.file_id == 0)
-        return std::nullopt;
-    return id;
 }
 
 enum class EntryKind { file, directory };

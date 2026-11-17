@@ -9,12 +9,13 @@
  * (Cursor::prior_gaps) and any non-zero value makes the search partial. A search of more than
  * one slice is not a point-in-time snapshot and says so (consistency=not_a_snapshot).
  *
- * GapCause spells its first six tokens exactly as OrderedGap::Cause in component_walk.hpp so the
- * plugin maps one to one; permission_denied covers a refused user directory.
+ * GapCause (file_search_position.hpp) is the one gap vocabulary, shared with the ordered walker's
+ * OrderedGap; permission_denied covers a refused user directory.
  */
 #pragma once
 
 #include "file_search_names.hpp"
+#include "file_search_position.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -41,18 +42,6 @@ enum class Reason {
     stalled,
     unstable,
     unsupported
-};
-
-enum class GapCause {
-    depth,
-    dir_unreadable,
-    dir_truncated,
-    other_device,
-    network_mount,
-    memory_cap,
-    permission_denied,
-    dataless,
-    private_namespace
 };
 
 // Extents arrive in a later PR; the field lets the envelope already say a volume cannot report them.
@@ -100,30 +89,6 @@ enum class Extents { not_collected, collected, unsupported };
         return "unstable";
     case Reason::unsupported:
         return "unsupported";
-    }
-    return "unknown";
-}
-
-[[nodiscard]] constexpr const char* to_token(GapCause c) noexcept {
-    switch (c) {
-    case GapCause::depth:
-        return "depth";
-    case GapCause::dir_unreadable:
-        return "dir_unreadable";
-    case GapCause::dir_truncated:
-        return "dir_truncated";
-    case GapCause::other_device:
-        return "other_device";
-    case GapCause::network_mount:
-        return "network_mount";
-    case GapCause::memory_cap:
-        return "memory_cap";
-    case GapCause::permission_denied:
-        return "permission_denied";
-    case GapCause::dataless:
-        return "dataless";
-    case GapCause::private_namespace:
-        return "private_namespace";
     }
     return "unknown";
 }
