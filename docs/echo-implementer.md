@@ -113,6 +113,60 @@ Flow:
    budget from the roll-up declarations with no change (it is listed in
    `budget_hourly_eligible_sources()`, which `test_echo_aggregator.cpp` pins
    to a literal so a new source is a decision).
+5. The weekly dictionary sweep (`run_dictionary_gc`, schedule in the pure
+   `dict_gc_plan`) holds `rollup_mu_` and the fold's `op_mu_` for its whole
+   deadline, or until an agent stop (below). A pass whose live-set scan does
+   not finish deletes nothing and is a starved pass: it bumps `dict_gc_starved_total` and `dict_gc_starved_streak`
+   and stamps `dict_gc_last_attempt_ts`; the next attempt is due a day later
+   (not at the next 15-minute pass) with the deadline doubled, 2 s, 4 s, then
+   8 s. A finished scan resets the streak to 0. Both markers are durable, so a
+   restart keeps the backoff; a crash between the sweep and the marker writes
+   repeats one attempt. A marker ahead of the clock is stale and never postpones
+   a pass. The 8 s ceiling is the bound: a scan that needs longer starves
+   every day (the upgrade is to resume the scan across passes). Both the weekly
+   sweep and an operator `purge_source` (which runs the same sweep under a
+   60 s deadline) pass the agent's stop latch, `yuzu::agent::
+   subprocess_cancel_requested`, to `gc_dictionary`, which polls it where it
+   polls the deadline. The latch is one process-lifetime flag in the
+   agent-core library that `Agent::stop()` raises as soon as the stop is
+   requested, before it joins the command workers (`thread_pool_`) and before
+   the trigger engine and the plugin `shutdown()` loop, so a stop reaches a
+   sweep that those joins would otherwise wait out; a plugin-local flag set in
+   `shutdown()` would arrive too late, after the pool join. A sweep ends at its
+   next check (between batches, or inside a statement at the progress handler's
+   1000-instruction poll); the row delete, a `COMMIT` and the wait for the
+   write lock are not interruptible, and a lost server connection is not a
+   stop. A sweep a stop ended is not a starved one: it is not counted, and the
+   weekly pass stamps neither marker. The same purge reports a final
+   `TRUNCATE` checkpoint that did not complete (busy timeout 0, so a pinned
+   WAL answers at once) as `wal_pending` rather than only logging it; the
+   pages stay in the log until a later checkpoint truncates it, which a rerun
+   of the purge does, and the maintenance pass does only when it evicts rows
+   or the log outgrows its allowance (an automatic retry is not built). The
+   test that drives this wiring is the single-threaded dispatcher case in
+   `test_echo_local_dispatcher.cpp`, which raises the latch for a scope; a
+   stop racing an in-flight action is not covered by a test.
+
+**The `status` row-count scan (#7123), measured.** `status` reads each
+capture source's finest tier for its row count and oldest bucket. In one
+`SELECT COUNT(*), IFNULL(MIN(bucket), 0)` SQLite scans the whole covering
+index. As two statements, a lone `COUNT(*)` is a b-tree count (the `Count`
+opcode: SQLite sums each page's cell count without decoding rows), and the
+shipped `SELECT IFNULL(MIN(bucket), 0)` is one index seek (`EXPLAIN QUERY PLAN`:
+`SEARCH ... USING COVERING INDEX`; the bytecode stops after the first index
+entry). The plan line for the lone `COUNT(*)` still reads `SCAN ... USING
+COVERING INDEX`, because the plan does not show the `Count` opcode; its timing
+is the evidence there. Scope: the `sqlite3` CLI (library 3.51.0,
+`/usr/bin/sqlite3`) on the Mac mini `braga`, one table written to the shape
+`generate_fold_ddl` (`echo_fold_schema.cpp`) emits for `process_hourly_r` (an
+`INTEGER PRIMARY KEY` row table plus the unique `(hour_ts, name_id, user_id,
+parent_name_id)` index; written by hand from that generator, not dumped from a
+live database), 2,000,000 synthetic rows, warm cache, `/usr/bin/time` wall
+clock over three runs: the combined statement with the shipped `IFNULL`
+took 0.04 to 0.05 s (0.06 to 0.08 s with a bare `MIN`), the lone
+`COUNT(*)` 0.01 s, the shipped lone `IFNULL(MIN(...), 0)` under 0.01 s. That is
+one host, one SQLite build and one table shape, not a fleet figure, so
+`status` now issues the two statements.
 
 Two in-memory structures keep the folded event volume down. `HourlySeenSet`
 (`echo_hour_dedup.hpp`) is membership-only, holds at most 20,000 keys, is
@@ -471,21 +525,34 @@ break the all-or-nothing rule and re-enable every source an operator had paused.
 | **Reinstall over an existing data dir** | The new binary opens the existing echo.db, runs migration if the schema version differs, and resumes collection. State in `echo_state` may be stale (see §5). On Windows, files left by a different agent account are refused rather than adopted (`docs/user-manual/echo.md` "Data storage"). |
 | **`data_dir` change** (config update) | The new directory has no echo.db — the next collect_fast creates it from scratch. The old echo.db at the previous path is orphaned but not deleted. Operator concern, not Echo's. |
 | **An older agent on a migrated file (not supported)** | No earlier build checks `schema_version` against a ceiling, so an older agent opens a v10 file without refusing it. Not supported: never run an older agent on a migrated file; there is no return to an earlier agent build. An automatic OTA rollback (the updater rolling back a build that failed to verify) lands on the same file and the same applies (`docs/user-manual/upgrading.md` "Returning to an earlier agent build is not supported"). |
-| **Corruption detected at open** (#559) | `EchoDatabase::open` runs `PRAGMA integrity_check`; on failure the corrupt file and its `-wal`/`-shm`/`-journal` sidecars are renamed to `echo.db.corrupt-<epoch>` in the same directory (collision-safe if a second corruption lands in the same epoch-second) and a fresh database is initialised (the move is `claim_quarantine_name` / `quarantine_corrupt_db` in `agents/shared/sqlite_quarantine.hpp`, shared with the command-dedup store; a sidecar that can't be renamed is copied to its quarantine name and then removed, so the new DB can't replay it and the evidence is kept when the copy succeeds; on Windows the copied sidecar is re-secured with the protected DACL afterwards, best effort and logged (`secure_quarantined_sidecars`; a quarantine sidecar name that is foreign-owned or carries a second hard link is skipped and logged, because re-securing a hard link would rewrite its target's DACL); a sidecar that can be neither renamed nor copied is still removed and the loss is logged; the claim is bound to the regular file the check judged: `open()` reads its `lstat` identity while the connection still holds it, the claim refuses a link at the name, releases a claim whose name is not that file after the link or whose original is not that file right before it is dropped, and the mode change never follows a link, so a swapped-in link or a second recovery's fresh file at the name is left alone and open fails closed). All `echo_state` (collector snapshots, `<source>_enabled` flags) resets to defaults; collection resumes against the empty DB. The agent logs `echo.db.corruption_detected`; the sidecar is **not** auto-deleted (operator recovers it). If the corrupt file can't be moved aside (read-only/locked/perms, or a data directory on a filesystem without hard links: the quarantine name is claimed with a hard link so it can never overwrite an earlier quarantine, and there is deliberately no rename fallback), open **fails closed** — Echo refuses to load rather than trust the corrupt DB. **A busy database is not a corrupt one** (#7286): `busy_timeout` is set before the integrity check, and if another connection still holds the file past it (`SQLITE_BUSY` / `SQLITE_LOCKED`) open returns a busy error, quarantines nothing and leaves the file in place; the next start retries. **Only an explicit integrity failure quarantines** (a non-`ok` integrity row, `SQLITE_CORRUPT` or `SQLITE_NOTADB`, the command-dedup store's rule): any other failure to read the file (an I/O error, `SQLITE_CANTOPEN`, permission, read-only, disk full, WAL lock `PROTOCOL`) is *unreadable*, so open refuses with `echo.db could not be checked (sqlite rc N)`, quarantines nothing and retries on the next start, because a quarantine would replace a healthy file with a fresh database that re-enables every paused source. **A symlink (or, on Windows, any reparse point such as a junction) at `echo.db` or a sidecar is refused** before anything is opened, moved or secured, and again before the reopen that follows a quarantine; both Echo connections (the main one and the read-only query connection) are opened with `SQLITE_OPEN_NOFOLLOW`, which closes the check-to-open window on POSIX (the Windows VFS ignores the flag; that residual and what bounds it are recorded in the DACL block comment in `echo_db.cpp`); the operator removes the link. **Fleet visibility:** the plugin publishes `heartbeat.db_corruption_total` / `heartbeat.db_quarantine_last`, bridged to the `yuzu.plugin.echo.*` heartbeat tags; the server exposes `yuzu_fleet_echo_db_corruption_agents` and writes an `echo.db.corruption_quarantined` audit row — see docs/user-manual/echo.md "Fleet visibility". |
+| **Corruption detected at open** (#559) | `EchoDatabase::open` runs `PRAGMA integrity_check`; on failure the corrupt file and its `-wal`/`-shm`/`-journal` sidecars are renamed to `echo.db.corrupt-<epoch>` in the same directory (collision-safe if a second corruption lands in the same epoch-second) and a fresh database is initialised (the move is `claim_quarantine_name` / `quarantine_corrupt_db` in `agents/shared/sqlite_quarantine.hpp`, shared with the command-dedup store; a sidecar that can't be renamed is copied to its quarantine name and then removed, so the new DB can't replay it and the evidence is kept when the copy succeeds; on Windows the copied sidecar is re-secured with the protected DACL afterwards, best effort and logged (`secure_quarantined_sidecars`; a quarantine sidecar name that is foreign-owned or carries a second hard link is skipped and logged, because re-securing a hard link would rewrite its target's DACL); a sidecar that can be neither renamed nor copied is still removed and the loss is logged; the claim is bound to the regular file the check judged: `open()` reads its `lstat` identity while the connection still holds it, the claim refuses a link at the name, releases a claim whose name is not that file after the link or whose original is not that file right before it is dropped, and the mode change never follows a link, so a swapped-in link or a second recovery's fresh file at the name is left alone and open fails closed). All `echo_state` (collector snapshots, `<source>_enabled` flags) resets to defaults; collection resumes against the empty DB. The agent logs `echo.db.corruption_detected`; the operator recovers the quarantined copy, but only the newest three `echo.db.corrupt-*` groups are kept: each quarantine deletes older ones through `prune_old_quarantines` in `agents/shared/sqlite_quarantine.hpp`, never the group just made (#2155). Groups are ordered by the number in the name, so a name left by a clock once set far ahead sorts newest and holds one of the three slots (the same statement `docs/command-dedup.md` makes for the dedup store). The prune is per file and best effort (a file that cannot be removed is logged and retried at the next recovery) and runs only after a successful quarantine, so open still fails closed. If the corrupt file can't be moved aside (read-only/locked/perms, or a data directory on a filesystem without hard links: the quarantine name is claimed with a hard link so it can never overwrite an earlier quarantine, and there is deliberately no rename fallback), open **fails closed** — Echo refuses to load rather than trust the corrupt DB. **A busy database is not a corrupt one** (#7286): `busy_timeout` is set before the integrity check, and if another connection still holds the file past it (`SQLITE_BUSY` / `SQLITE_LOCKED`) open returns a busy error, quarantines nothing and leaves the file in place; the next start retries. **Only an explicit integrity failure quarantines** (a non-`ok` integrity row, `SQLITE_CORRUPT` or `SQLITE_NOTADB`, the command-dedup store's rule): any other failure to read the file (an I/O error, `SQLITE_CANTOPEN`, permission, read-only, disk full, WAL lock `PROTOCOL`) is *unreadable*, so open refuses with `echo.db could not be checked (sqlite rc N)`, quarantines nothing and retries on the next start, because a quarantine would replace a healthy file with a fresh database that re-enables every paused source. **A symlink (or, on Windows, any reparse point such as a junction) at `echo.db` or a sidecar is refused** before anything is opened, moved or secured, and again before the reopen that follows a quarantine; both Echo connections (the main one and the read-only query connection) are opened with `SQLITE_OPEN_NOFOLLOW`, which closes the check-to-open window on POSIX (the Windows VFS ignores the flag; that residual and what bounds it are recorded in the DACL block comment in `echo_db.cpp`); the operator removes the link. **Fleet visibility:** the plugin publishes `heartbeat.db_corruption_total` / `heartbeat.db_quarantine_last`, bridged to the `yuzu.plugin.echo.*` heartbeat tags; the server exposes `yuzu_fleet_echo_db_corruption_agents` and writes an `echo.db.corruption_quarantined` audit row — see docs/user-manual/echo.md "Fleet visibility". |
 
 The "leave data on uninstall" rule is identical to other Yuzu agent
 state stores. If a customer asks for "delete echo data on uninstall",
 that is a deployment-tooling change (MSI custom action), not an Echo
 plugin change.
 
-> **Collect gate and retention share `canonical_source_enabled`.** Both
-> `source_enabled()` (`echo_aggregator.cpp`) and `run_retention()` decide a
-> source's state through it: `run_retention()` calls `source_enabled()` itself,
-> and `source_enabled()` maps the stored value through
-> `canonical_source_enabled(stored_value)`, which maps anything other than the
+> **Collect gate and retention both read `canonical_source_enabled`.**
+> `source_enabled()` (`echo_aggregator.cpp`) gates collection; retention and the
+> budget pass decide through `source_retention_exempt()`. Decision (#1572): an `errored` source that was never paused
+> (`<source>_paused_at` absent or exactly `0`) gets the normal retention
+> ceiling and budget eviction; `false`, an unreadable flag, and `errored` with
+> `paused_at` above 0, unreadable or malformed stay preserved, so a damaged hold
+> marker never ages out a forensic hold. The rule opens a release path that did
+> not exist before: a user who can write `echo_config` can release the hold on
+> an errored source by setting its flag to a bad value with `paused_at` at `0`.
+> That grants nothing a direct row delete in `echo.db` does not, and the hold on
+> a paused source holds only while its `paused_at` marker is non-zero.
+> **Accepted residual.** A source paused by an agent older than v0.12.0 carries
+> `_enabled=false` with `paused_at` absent or `0`; if its flag is later corrupted
+> to a non-canonical value, the helper cannot tell it from a fresh errored
+> never-paused source and the normal ceiling applies. Every current disable edge
+> stamps `paused_at` above 0, so the remedy is to re-issue
+> `configure <source>_enabled=false` on such a source, which stamps the marker.
+> Treating absent or `0` as a hold would undo #1572. `canonical_source_enabled(stored_value)` maps anything other than the
 > literal `"true"` to non-enabled (`"false"` → disabled, anything else →
 > `"errored"`). This is load-bearing: a value the plugin never writes fails
-> **closed** — collection stops *and* retention preserves the rows — instead of
+> **closed** — collection stops *and* retention keeps the rows of a source paused or errored while paused — instead of
 > a bare `!= "false"` that would treat a tampered/corrupt value as enabled and
 > let retention delete the paused window (#560). `source_enabled()` also fails
 > closed on a failed config read (closed database, SQL error): the registry
@@ -493,12 +560,12 @@ plugin change.
 > source, gate collection on `source_enabled(*db_, "<name>")` and do **not** add
 > a parallel `== "true"`/`== "false"` check or a raw `get_config("<src>_enabled",
 > ...)` read — every collect, retention and purge gate for every registered
-> source goes through the one helper, so the registry's `default_enabled` is
-> the only place a default lives. Collect and retention gates use
-> `source_enabled()` (an unreadable flag skips); discard, drain and purge
-> decisions use `source_enabled_state()`, which distinguishes a confirmed
-> `true`/`false` from an unreadable flag so a destructive path never acts on a
-> failed read.
+> source goes through the helpers below, so the registry's `default_enabled` is
+> the only place a default lives. The collect gate uses `source_enabled()` (an
+> unreadable flag skips); retention and the budget pass use
+> `source_retention_exempt()`; discard, drain and purge decisions use
+> `source_enabled_state()`, which distinguishes a confirmed `true`/`false` from
+> an unreadable flag so a destructive path never acts on a failed read.
 >
 > **`paused_at` is cleared on any non-`true` → `true` re-enable.**
 > `apply_source_enabled_transition` (`echo_aggregator.cpp`) canonicalises the
@@ -608,7 +675,7 @@ Routine debugging entry points:
 | "Echo isn't recording anything for source X" | `echo.status` output → `<source>_enabled` row. Then `compatibility` action to confirm OS support. Then check the agent log for "Echo plugin initialized". |
 | "Query returns 0 rows but I know the event happened" | Check the collect interval (`fast_interval` / `slow_interval`) vs the event lifetime — anything shorter than the interval is sub-resolution. |
 | "TCP collector shows a flood of `connected` events" | Almost always a restart artifact. Confirm against the agent's start time. |
-| "echo.db is huge" | `status` returns `db_size_bytes` (used pages plus the WAL, not the file size) against `db_budget_bytes`. If it's growing without bound, check that the maintenance pass (`echo.rollup`, the budget pass) is running and `budget_over_bytes`: there is no aggregation pass any more, and the tiers grow only through the folds and shrink only through retention and the byte budget; confirm the triggers registered in `init()`. A file that stays large while `db_size_bytes` is within budget is an older database waiting for its one-off `VACUUM` (`db_auto_vacuum|deferred` means a conversion was wanted and could not run: the volume lacked twice the used size free, or the `VACUUM` failed; the marker clears only when a conversion succeeds). `budget_over_bytes` above 0 has several causes: a long `echo.sql` read pinning the log (clears at the next checkpoint), an eviction pass that failed (retried next pass), a pass skipped by the retention clock guard (`retention_guard|__budget__|<n>`), an unreadable setting (`db_budget_bytes|unknown`), a catch-up still draining, or only exempt rows left (hourly rows under 48 hours, daily and monthly rows, the `usage` tables, paused or errored sources and `netconn`, `netqual`, `power`, `removable`, `registry`); see the user manual, "If `budget_over_bytes` stays above 0". |
+| "echo.db is huge" | `status` returns `db_size_bytes` (used pages plus the WAL, not the file size) against `db_budget_bytes`. If it's growing without bound, check that the maintenance pass (`echo.rollup`, the budget pass) is running and `budget_over_bytes`: there is no aggregation pass any more, and the tiers grow only through the folds and shrink only through retention and the byte budget; confirm the triggers registered in `init()`. A file that stays large while `db_size_bytes` is within budget is an older database waiting for its one-off `VACUUM` (`db_auto_vacuum|deferred` means a conversion was wanted and could not run: the volume lacked twice the used size free, or the `VACUUM` failed; the marker clears only when a conversion succeeds). `budget_over_bytes` above 0 has several causes: a long `echo.sql` read pinning the log (clears at the next checkpoint), an eviction pass that failed (retried next pass), a pass skipped by the retention clock guard (`retention_guard|__budget__|<n>`), an unreadable setting (`db_budget_bytes|unknown`), a catch-up still draining, or only exempt rows left (hourly rows under 48 hours, daily and monthly rows, the `usage` tables, paused sources (and errored ones that were paused) and `netconn`, `netqual`, `power`, `removable`, `registry`); see the user manual, "If `budget_over_bytes` stays above 0". |
 | "Schema migration failed at startup" | `agent.log` will show `EchoDatabase: migrated to schema version N` on success or the SQLite error on failure. Migrations are idempotent — fixing the underlying issue and restarting will retry. |
 
 For new-source bring-up, the smallest viable change is: add a
