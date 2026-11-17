@@ -31,6 +31,7 @@
  */
 #pragma once
 
+#include <sudo_argv.hpp>      // yuzu::shared::sudo_wrap (portable two-argument form)
 #include <launchctl_list.hpp> // yuzu::shared::{LaunchctlRow,LaunchctlParseResult,parse_launchctl_list}
 
 #include <yuzu/agent/runner_status.hpp>     // yuzu::agent::classify_runner_failure
@@ -39,6 +40,7 @@
 #include <cctype>
 #include <cstddef>
 #include <format>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility> // std::move
@@ -72,6 +74,35 @@ inline bool is_safe_service_name(std::string_view name) {
         }
     }
     return true;
+}
+
+// ── Linux set_start_mode: the privileged argv (WP13 / F48) ────────────────
+
+/// The root-owned validator scripts/install-agent-user.sh installs. KEEP IN SYNC with
+/// SYSTEMCTL_WRAPPER_PATH there. It takes exactly `<verb> <unit>` and runs
+/// `systemctl <verb> -- <unit>`; it is the ONLY systemctl sudo grant (the former
+/// `systemctl enable *` glob matched `enable --now /path/unit.service`, i.e. root).
+inline constexpr const char* kYuzuSystemctlWrapper = "/usr/libexec/yuzu/yuzu-systemctl";
+
+/// argv for one `systemctl enable|disable|mask|unmask` of `name`.
+///  - root agent (the packaged unit, NoNewPrivileges): `systemctl <verb> -- <unit>` directly.
+///  - non-root agent: `sudo -n -- <wrapper> <verb> <unit>`; a missing wrapper yields nullopt, so
+///    the caller reports "privilege unavailable" and NEVER falls back to a bare
+///    `sudo systemctl ...` that a wildcard grant would have admitted.
+/// `wrapper_path` empty = the wrapper is absent or not trusted (root-owned, not writable by
+/// group/other), as decided by the caller.
+[[nodiscard]] inline std::optional<std::vector<std::string>>
+systemctl_mutation_argv(bool euid_is_root, std::string_view systemctl_path,
+                        std::string_view wrapper_path, std::string_view verb,
+                        std::string_view name) {
+    if (euid_is_root) {
+        return std::vector<std::string>{std::string(systemctl_path), std::string(verb), "--",
+                                        std::string(name)};
+    }
+    if (wrapper_path.empty())
+        return std::nullopt;
+    return yuzu::shared::sudo_wrap(
+        {std::string(wrapper_path), std::string(verb), std::string(name)}, /*euid_is_root=*/false);
 }
 
 /// One row of `systemctl list-units --type=service [--all|--state=running]

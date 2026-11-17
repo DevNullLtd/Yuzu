@@ -33,10 +33,17 @@
 #       place — a syntactically broken sudoers file would brick the
 #       entire sudo subsystem on this host, so we never write to
 #       /etc/sudoers.d/ directly.
-# 5.  (Linux only) Sets file capabilities on the agent binary so plugins
-#       that need raw sockets, ptrace, or ip-route management can do
-#       so without an extra sudo round-trip:
-#         cap_net_admin,cap_net_raw,cap_dac_read_search,cap_sys_ptrace +eip
+# 5.  (Linux only) Installs the root-owned systemctl wrapper
+#       /usr/libexec/yuzu/yuzu-systemctl (the ONLY systemctl sudo grant; it
+#       validates verb and unit name, so no sudoers argument glob is relied
+#       on), and REMOVES any file capabilities from the agent binary.
+#       The installer NEVER sets file capabilities (WP13/F21): a file
+#       capability on a binary any local user can execute is a local
+#       privilege escalation (the invoker chooses --plugin-dir, which the
+#       agent dlopens). Capabilities are granted to the SERVICE only, as
+#       the packaged unit does (deploy/systemd/yuzu-agent.service:
+#       AmbientCapabilities=CAP_DAC_READ_SEARCH), or, for the dev/UAT
+#       launcher, by `setpriv --ambient-caps` in scripts/start-UAT.sh.
 # 6.  (Optional) On both platforms, prints a verifying summary that the
 #       operator can spot-check.
 #
@@ -68,9 +75,9 @@
 #   - removes the agent's filesystem hierarchy (logs are preserved
 #     under /var/log/yuzu-agent.removed-<timestamp>/ for forensics)
 #   - deletes the user account
-# Capabilities applied to the agent binary are NOT removed because the
-# binary itself is not owned by this script — uninstall the package to
-# remove the binary, capabilities go with it.
+# Also removes /usr/libexec/yuzu/yuzu-systemctl (Linux). File capabilities
+# are never set by this script and any found on the binary are stripped on
+# install, so there is nothing to undo on uninstall.
 #
 # ARGUMENTS
 # ─────────
@@ -83,18 +90,20 @@
 #   --uninstall      Remove the user, sudoers file, and state dirs.
 #   --account-name N Override the default account name (_yuzu / yuzu).
 #                    Useful for parallel test environments.
-#   --binary-path P  Override the path to the agent binary for setcap.
+#   --binary-path P  Override the path to the agent binary whose stale file
+#                    capabilities are stripped.
 #                    Default: /usr/local/bin/yuzu-agent (Linux) or
 #                    /Library/Application\ Support/Yuzu/yuzu-agent (macOS).
-#                    On macOS this is a no-op (no setcap equivalent).
+#                    On macOS this is a no-op (no file capabilities).
 #   --no-sudoers     Skip the sudoers file install. Useful in test
 #                    environments where you don't want any privilege
 #                    grants; the agent will still run but the firewall
 #                    containment actions and other privileged plugins will fail at dispatch
 #                    time (which the test ladder catches).
-#   --no-setcap      Skip the setcap step on Linux. Useful if you set
-#                    capabilities via a packaging tool (.deb postinst,
-#                    .rpm %post).
+#   --no-setcap      Skip stripping file capabilities from the binary
+#                    (Linux). The script never GRANTS file capabilities;
+#                    this only skips the cleanup of ones a previous version
+#                    of this script set.
 #
 # EXIT CODES
 # ──────────
@@ -117,6 +126,12 @@ ACCOUNT_NAME=""            # filled in based on platform if not specified
 BINARY_PATH=""             # filled in based on platform if not specified
 SKIP_SUDOERS=0
 SKIP_SETCAP=0
+# Root-owned systemctl validator (Linux, WP13/F48). The ONLY systemctl sudo grant; the
+# services plugin probes this exact path (agents/plugins/services/src/services_parsers.hpp
+# kYuzuSystemctlWrapper) - keep the two in sync.
+SYSTEMCTL_WRAPPER_DIR="/usr/libexec/yuzu"
+SYSTEMCTL_WRAPPER_PATH="$SYSTEMCTL_WRAPPER_DIR/yuzu-systemctl"
+SYSTEMCTL_WRAPPER_OK=1     # set to 0 when the wrapper could not be installed (no grant written)
 
 # ── platform detection ───────────────────────────────────────────────────────
 # We support exactly two platforms in this script: macOS and Linux. The
@@ -470,9 +485,9 @@ $ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -s info
 $ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -s rules
 $ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -s References
 
-# services.set_start_mode — launchd system domain
-$ACCOUNT_NAME ALL=(root) NOPASSWD: /bin/launchctl bootstrap system *
-$ACCOUNT_NAME ALL=(root) NOPASSWD: /bin/launchctl bootout system *
+# services.set_start_mode — launchd system domain. No bootstrap/bootout grant (WP13/F48): no
+# plugin calls them, and \`launchctl bootstrap system <plist>\` loads an arbitrary plist as a
+# root daemon.
 $ACCOUNT_NAME ALL=(root) NOPASSWD: /bin/launchctl enable system/*
 $ACCOUNT_NAME ALL=(root) NOPASSWD: /bin/launchctl disable system/*
 
@@ -500,11 +515,24 @@ $ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/nft -f *
 $ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/nft delete table inet yuzu_quarantine
 $ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/nft list table inet yuzu_quarantine
 
-# services.set_start_mode — systemd unit lifecycle
-$ACCOUNT_NAME ALL=(root) NOPASSWD: /bin/systemctl enable *,  /bin/systemctl disable *
-$ACCOUNT_NAME ALL=(root) NOPASSWD: /bin/systemctl mask *,    /bin/systemctl unmask *
-$ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/bin/systemctl enable *,  /usr/bin/systemctl disable *
-$ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/bin/systemctl mask *,    /usr/bin/systemctl unmask *
+# services.set_start_mode — systemd unit lifecycle, through the root-owned wrapper ONLY
+# (WP13/F48). A \`systemctl enable *\` glob matches \`enable --now /path/unit.service\`, which links
+# and starts an agent-authored unit as root. The wrapper takes exactly <verb> <unit>, checks the
+# verb (enable|disable|mask|unmask) and the unit name against the services plugin's charset, and
+# execs \`systemctl <verb> -- <unit>\`; there is no sudoers regex, so no sudo-version floor.
+EOF
+    if [[ "${SYSTEMCTL_WRAPPER_OK:-1}" -eq 1 ]]; then
+        cat <<EOF
+$ACCOUNT_NAME ALL=(root) NOPASSWD: $SYSTEMCTL_WRAPPER_PATH
+EOF
+    else
+        cat <<EOF
+# NO systemctl grant: the wrapper could not be installed, and the wildcard grant is never
+# written as a fallback. services.set_start_mode reports privilege_unavailable until the
+# installer is re-run successfully.
+EOF
+    fi
+    cat <<EOF
 
 # network_actions.flush_dns
 $ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/bin/systemd-resolve --flush-caches
@@ -572,39 +600,112 @@ remove_sudoers() {
     fi
 }
 
-# ── linux capabilities ──────────────────────────────────────────────────────
-# Capabilities granted to the agent binary directly. These avoid a
-# sudo round-trip for syscalls the agent makes itself (raw sockets,
-# routing-table writes, ptrace). They do NOT transfer through execve,
-# so plugins that shell out to /usr/sbin/iptables still need the
-# sudoers entry above — capabilities cover only the agent's own
-# syscalls, not its child processes.
-#
-# +eip means the capability is in the binary's effective, inheritable,
-# AND permitted sets. eip is the right combination for a daemon
-# binary; +ep alone wouldn't survive setuid (we don't setuid) and +ei
-# alone wouldn't be effective without explicit cap_set_proc().
+# ── systemctl wrapper (Linux, WP13/F48) ─────────────────────────────────────
+# The agent account may change a unit's start mode, but only through this root-owned
+# validator: exactly <verb> <unit>, verb in enable|disable|mask|unmask, unit name in the
+# services plugin's charset (is_safe_service_name: [A-Za-z0-9._@-], 1..256). Anything else is
+# refused with exit 2. `--` always precedes the unit, so a leading '-' is a name, never a flag,
+# and no option (--now, --root, a unit-file path) can ride in. Plain POSIX sh: no regex, no
+# sudo-version dependence.
 
-apply_setcap() {
+generate_systemctl_wrapper_content() {
+    cat <<'WRAPPER_EOF'
+#!/bin/sh
+# yuzu-systemctl - installed by scripts/install-agent-user.sh (WP13/F48). Root-owned; do not edit.
+# Usage: yuzu-systemctl <enable|disable|mask|unmask> <unit>
+SYSTEMCTL=/usr/bin/systemctl
+[ -x "$SYSTEMCTL" ] || SYSTEMCTL=/bin/systemctl
+if [ "$#" -ne 2 ]; then
+    echo "yuzu-systemctl: usage: yuzu-systemctl enable|disable|mask|unmask UNIT" >&2
+    exit 2
+fi
+verb=$1
+unit=$2
+case "$verb" in
+    enable|disable|mask|unmask) ;;
+    *) echo "yuzu-systemctl: refused verb" >&2; exit 2 ;;
+esac
+case "$unit" in
+    ""|*[!A-Za-z0-9@_.-]*) echo "yuzu-systemctl: refused unit name" >&2; exit 2 ;;
+esac
+if [ "${#unit}" -gt 256 ]; then
+    echo "yuzu-systemctl: refused unit name (too long)" >&2
+    exit 2
+fi
+exec "$SYSTEMCTL" "$verb" -- "$unit"
+WRAPPER_EOF
+}
+
+install_systemctl_wrapper() {
     if [[ "$PLATFORM" != "linux" ]]; then return 0; fi
-    if [[ "$SKIP_SETCAP" -eq 1 ]]; then
-        log "skipping setcap (--no-setcap)"
+    if [[ "$SKIP_SUDOERS" -eq 1 ]]; then return 0; fi
+
+    log "installing systemctl wrapper $SYSTEMCTL_WRAPPER_PATH (root:root 0755)"
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        echo "[dry-run] would write the following to $SYSTEMCTL_WRAPPER_PATH:"
+        generate_systemctl_wrapper_content | sed 's/^/[dry-run]   /'
+        run install -d -m 0755 -o root -g root "$SYSTEMCTL_WRAPPER_DIR"
+        run install -m 0755 -o root -g root /dev/null "$SYSTEMCTL_WRAPPER_PATH"
         return 0
     fi
-    if ! command -v setcap >/dev/null 2>&1; then
-        warn "setcap not installed — skipping (apt: libcap2-bin, dnf: libcap)"
+
+    local tmp
+    tmp=$(mktemp -t yuzu-systemctl.XXXXXX) || { SYSTEMCTL_WRAPPER_OK=0; return 0; }
+    generate_systemctl_wrapper_content > "$tmp"
+    if install -d -m 0755 -o root -g root "$SYSTEMCTL_WRAPPER_DIR" \
+        && install -m 0755 -o root -g root "$tmp" "$SYSTEMCTL_WRAPPER_PATH"; then
+        :
+    else
+        warn "could not install $SYSTEMCTL_WRAPPER_PATH - NO systemctl sudo grant will be written"
+        SYSTEMCTL_WRAPPER_OK=0
+    fi
+    rm -f "$tmp"
+}
+
+remove_systemctl_wrapper() {
+    if [[ "$PLATFORM" != "linux" ]]; then return 0; fi
+    if [[ -e "$SYSTEMCTL_WRAPPER_PATH" ]]; then
+        log "removing $SYSTEMCTL_WRAPPER_PATH"
+        run rm -f "$SYSTEMCTL_WRAPPER_PATH"
+        run rmdir "$SYSTEMCTL_WRAPPER_DIR" 2>/dev/null || true
+    fi
+}
+
+# ── linux file capabilities: REMOVE, never grant (WP13/F21) ─────────────────
+# This script used to run `setcap cap_net_admin,cap_net_raw,cap_dac_read_search,cap_sys_ptrace+eip`
+# on the agent binary. The binary is 0755, so ANY local user who executes it received those
+# capabilities, and that user chooses --plugin-dir / YUZU_PLUGIN_DIR, which the agent dlopens:
+# local root. Capabilities now belong to the SERVICE only (systemd AmbientCapabilities in the
+# packaged unit; \`setpriv --ambient-caps\` in scripts/start-UAT.sh --as-user).
+#
+# Removing the grant from this script is not enough: every dev/UAT host provisioned by an older
+# run still carries the file capability. Each run therefore strips them (idempotent).
+
+strip_file_capabilities() {
+    if [[ "$PLATFORM" != "linux" ]]; then return 0; fi
+    if [[ "$SKIP_SETCAP" -eq 1 ]]; then
+        log "skipping file-capability cleanup (--no-setcap)"
         return 0
     fi
     if [[ ! -f "$BINARY_PATH" ]]; then
-        warn "agent binary not found at $BINARY_PATH — skipping setcap"
-        warn "  re-run with --binary-path PATH after the agent is installed,"
-        warn "  or set capabilities from your packaging tool (postinst hook)."
+        log "agent binary not found at $BINARY_PATH - no file capabilities to strip"
         return 0
     fi
-
-    log "applying capabilities to $BINARY_PATH"
-    log "  cap_net_admin, cap_net_raw, cap_dac_read_search, cap_sys_ptrace +eip"
-    run setcap "cap_net_admin,cap_net_raw,cap_dac_read_search,cap_sys_ptrace+eip" "$BINARY_PATH"
+    if command -v getcap >/dev/null 2>&1; then
+        local caps
+        caps=$(getcap "$BINARY_PATH" 2>/dev/null || true)
+        if [[ -z "$caps" ]]; then
+            log "no file capabilities on $BINARY_PATH (good)"
+            return 0
+        fi
+        log "stripping file capabilities from $BINARY_PATH: $caps"
+    fi
+    if ! command -v setcap >/dev/null 2>&1; then
+        warn "setcap not installed - cannot strip file capabilities from $BINARY_PATH"
+        warn "  remove them by hand: setcap -r $BINARY_PATH   (apt: libcap2-bin, dnf: libcap)"
+        return 0
+    fi
+    run setcap -r "$BINARY_PATH"
 }
 
 # ── verification ────────────────────────────────────────────────────────────
@@ -659,15 +760,34 @@ check_install() {
         fi
     fi
 
-    # 4. capabilities (Linux only)
+    # 4. file capabilities (Linux only): their PRESENCE is the drift. A file capability on a
+    #    binary other users can execute is a local privilege escalation (WP13/F21).
     if [[ "$PLATFORM" == "linux" && "$SKIP_SETCAP" -eq 0 && -f "$BINARY_PATH" ]]; then
         if command -v getcap >/dev/null 2>&1; then
             local caps
             caps=$(getcap "$BINARY_PATH" 2>/dev/null || true)
-            if [[ -z "$caps" ]]; then
-                warn "no capabilities set on $BINARY_PATH"; ((errs++))
+            if [[ -n "$caps" ]]; then
+                warn "file capabilities present on $BINARY_PATH: $caps"
+                warn "  re-run this installer (it strips them) or: setcap -r $BINARY_PATH"
+                ((errs++))
             else
-                log "capabilities on $BINARY_PATH: $caps"
+                log "no file capabilities on $BINARY_PATH (correct)"
+            fi
+        fi
+    fi
+
+    # 5. systemctl wrapper (Linux, when sudoers is installed)
+    if [[ "$PLATFORM" == "linux" && "$SKIP_SUDOERS" -eq 0 ]]; then
+        if [[ ! -x "$SYSTEMCTL_WRAPPER_PATH" ]]; then
+            warn "$SYSTEMCTL_WRAPPER_PATH is missing - services.set_start_mode has no privilege"
+            ((errs++))
+        else
+            local wowner wmode
+            wowner=$(stat -c '%u' "$SYSTEMCTL_WRAPPER_PATH" 2>/dev/null || echo "")
+            wmode=$(stat -c '%a' "$SYSTEMCTL_WRAPPER_PATH" 2>/dev/null || echo "")
+            if [[ "$wowner" != "0" || "$wmode" != "755" ]]; then
+                warn "$SYSTEMCTL_WRAPPER_PATH must be root-owned 0755 (found uid=$wowner mode=$wmode)"
+                ((errs++))
             fi
         fi
     fi
@@ -701,8 +821,11 @@ case "$ACTION" in
             fi
         fi
         create_state_dirs
+        # The wrapper goes in BEFORE the sudoers file that grants it (and a failed install
+        # clears SYSTEMCTL_WRAPPER_OK so no systemctl grant is written at all).
+        install_systemctl_wrapper
         install_sudoers
-        apply_setcap
+        strip_file_capabilities
         log "install complete. Verify with: $0 --check"
         ;;
 
@@ -714,6 +837,7 @@ case "$ACTION" in
         require_root
         log "uninstalling Yuzu agent user on $PLATFORM (account: $ACCOUNT_NAME)"
         remove_sudoers
+        remove_systemctl_wrapper
         remove_state_dirs
         if [[ "$PLATFORM" == "macos" ]]; then
             macos_delete_user

@@ -18,6 +18,7 @@
 #include <cstddef>
 #include <format>
 #include <string>
+#include <vector>
 
 using yuzu::agent::SubprocessResult;
 using yuzu::agent::TerminationReason;
@@ -320,4 +321,38 @@ TEST_CASE("decide_set_start_mode_outcome: a nonzero exit's captured output (e.g.
     CHECK_FALSE(outcome.runner_failed);
     CHECK(outcome.message ==
          "error|systemctl command failed for 'sshd' (exit=1): sudo: a password is required");
+}
+
+// ── WP13 / F48: the privileged systemctl argv goes through the root-owned wrapper ──────────
+
+TEST_CASE("systemctl_mutation_argv: a non-root agent calls ONLY the validator wrapper, never "
+          "bare systemctl under sudo",
+          "[services][f48]") {
+    using yuzu::services::kYuzuSystemctlWrapper;
+    using yuzu::services::systemctl_mutation_argv;
+    const auto argv = systemctl_mutation_argv(false, "/usr/bin/systemctl", kYuzuSystemctlWrapper,
+                                              "enable", "ssh.service");
+    REQUIRE(argv.has_value());
+    const std::vector<std::string> expected{"/usr/bin/sudo", "-n", "--", kYuzuSystemctlWrapper,
+                                            "enable", "ssh.service"};
+    CHECK(*argv == expected);
+    for (const auto& a : *argv)
+        CHECK(a != "/usr/bin/systemctl"); // a wildcard systemctl grant is never what this matches
+}
+
+TEST_CASE("systemctl_mutation_argv: an absent/untrusted wrapper is a refusal, not a fallback",
+          "[services][f48]") {
+    CHECK_FALSE(yuzu::services::systemctl_mutation_argv(false, "/usr/bin/systemctl", "", "mask",
+                                                        "ssh.service")
+                    .has_value());
+}
+
+TEST_CASE("systemctl_mutation_argv: a root agent runs systemctl directly with `--` before the unit",
+          "[services][f48]") {
+    const auto argv = yuzu::services::systemctl_mutation_argv(true, "/usr/bin/systemctl", "",
+                                                              "disable", "-weird.service");
+    REQUIRE(argv.has_value());
+    const std::vector<std::string> expected{"/usr/bin/systemctl", "disable", "--",
+                                            "-weird.service"};
+    CHECK(*argv == expected);
 }

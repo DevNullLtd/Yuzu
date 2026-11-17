@@ -85,7 +85,9 @@ ADMIN_PASS='YuzuUatAdmin1!'
 # When `--as-user USER` is passed, the yuzu-agent process is launched
 # via `sudo -u USER -H env ...` instead of as the current user. This
 # exercises the privilege model defined in docs/agent-privilege-model.md
-# end-to-end: the agent itself is unprivileged, but the firewall containment /
+# end-to-end (on Linux through `setpriv --ambient-caps`, so the process holds only
+# cap_dac_read_search and the binary carries NO file capability, WP13/F21): the agent itself is
+# unprivileged, but the firewall containment /
 # services plugins shell out via `sudo -n` to the narrow
 # NOPASSWD entries in /etc/sudoers.d/yuzu-agent.
 #
@@ -825,8 +827,28 @@ start_all() {
         # for _yuzu — that's intentional, the agent doesn't need a HOME).
         # `env -i` would scrub everything; we keep PATH so sudo -n itself
         # works, and propagate YUZU_* envs so debug knobs survive.
-        sudo -u "$AGENT_AS_USER" -H \
-            env PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
+        #
+        # WP13/F21: capabilities are granted to THIS PROCESS only, via an ambient set, never as a
+        # file capability on the binary (a file capability on a world-executable binary is a
+        # local privilege escalation: the invoker picks the plugin dir the agent dlopens).
+        # setpriv drops root to the target uid/gid and leaves only $UAT_AGENT_CAPS (default
+        # dac_read_search, the same single capability the packaged unit grants) ambient. If
+        # setpriv is unavailable the agent runs with NO capabilities (degraded, never unsafe):
+        # serial/UUID read "unknown" and a few Forensics plugins report constrained.
+        local -a launch_prefix
+        local agent_gid
+        agent_gid="$(id -g "$AGENT_AS_USER" 2>/dev/null || true)"
+        if [ "$(uname -s)" = "Linux" ] && command -v setpriv >/dev/null 2>&1 && [ -n "$agent_gid" ]; then
+            local caps="${UAT_AGENT_CAPS:-dac_read_search}"
+            launch_prefix=(sudo -n setpriv --reuid "$AGENT_AS_USER" --regid "$agent_gid" --init-groups
+                           --inh-caps "+${caps//,/,+}" --ambient-caps "+${caps//,/,+}" --)
+            info "  capabilities (ambient, this process only): $caps"
+        else
+            launch_prefix=(sudo -u "$AGENT_AS_USER" -H)
+            warn "  setpriv unavailable (or not Linux): agent runs with no ambient capabilities"
+        fi
+        "${launch_prefix[@]}" \
+            env PATH="/usr/bin:/bin:/usr/sbin:/sbin" HOME=/var/empty \
                 YUZU_AGENT_LAUNCHED_AS="$AGENT_AS_USER" \
             "$BUILDDIR/agents/core/yuzu-agent" \
             --server localhost:50051 \

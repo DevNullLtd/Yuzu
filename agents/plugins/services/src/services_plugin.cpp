@@ -45,6 +45,10 @@
 #else
 #include <sys/wait.h>
 #endif
+#if defined(__linux__)
+#include <sys/stat.h> // stat: the systemctl wrapper trust check (WP13/F48)
+#include <unistd.h>   // geteuid
+#endif
 
 #if defined(__linux__) || defined(__APPLE__)
 #include <chrono>
@@ -467,46 +471,58 @@ int do_set_start_mode_linux(yuzu::CommandContext& ctx, std::string_view name,
     }
 
     // services/set_start_mode_linux#1 (docs/agent-spawn-sink-manifest.md)
-    // Privileged mutation, Decision-8 canonical form (ADR-3002, sudo_argv.hpp):
-    // these four call sites (enable/disable/mask/unmask) previously ran
-    // completely UNWRAPPED -- no sudo at all -- even though
-    // scripts/install-agent-user.sh installs exactly this grant for a
-    // privilege-dropped agent:
-    //   /usr/bin/systemctl enable *,  /usr/bin/systemctl disable *
-    //   /usr/bin/systemctl mask *,    /usr/bin/systemctl unmask *
-    //   (and the /bin/systemctl twin)
-    // A non-root agent's systemctl enable/disable/mask/unmask on a SYSTEM
-    // unit requires root, so the unwrapped call failed outright for every
-    // non-root agent -- the grant existed and was never used. sudo_wrap
-    // builds the exact `sudo -n -- <tool> <args>` argv shape that grant
-    // matches (a no-op when already root). The systemctl-side "--" keeps the
-    // original safety property: is_safe_service_name allows a LEADING '-' in
-    // `name` (needed for e.g. "-foo"-shaped unit names to reach the
-    // pipe-delimited protocol unmangled), so without "--" a crafted name
-    // could still be parsed as a systemctl flag even though there is no
-    // shell involved.
+    // Privileged mutation (WP13 / F48). A root agent (the packaged unit) runs systemctl
+    // directly. A non-root agent (the dev/UAT --as-user path) goes through the root-owned
+    // validator scripts/install-agent-user.sh installs and grants, `sudo -n -- <wrapper> <verb>
+    // <unit>`: the former `systemctl enable *` sudoers glob admitted `enable --now <unit path>`,
+    // which is root. A wrapper that is absent or not root-owned is a refusal with a token,
+    // never a fallback to bare `sudo systemctl`. The wrapper always puts "--" before the unit
+    // (is_safe_service_name allows a LEADING '-'), preserving the flag-injection property.
     //
     // Mode -> systemctl verb:
     //   automatic -> enable  (starts at boot)
     //   manual    -> disable (available but not started at boot)
     //   disabled  -> mask    (cannot be started at all)
-    std::vector<std::string> argv;
-    if (mode == "automatic") {
-        argv = yuzu::shared::sudo_wrap({systemctl_path, "enable", "--", std::string(name)});
-    } else if (mode == "manual") {
+    if (mode != "automatic" && mode != "manual" && mode != "disabled") {
+        ctx.write_output(
+            std::format("error|invalid mode '{}': must be automatic, manual, or disabled", mode));
+        return 1;
+    }
+    const bool is_root = ::geteuid() == 0;
+    std::string wrapper;
+    if (!is_root) {
+        struct stat st {};
+        const char* w = yuzu::services::kYuzuSystemctlWrapper;
+        // Trust the wrapper only if root owns it and neither group nor other can write it: sudo
+        // would run it as root, so an agent-writable file here is root for the agent.
+        if (::stat(w, &st) == 0 && S_ISREG(st.st_mode) && st.st_uid == 0 &&
+            (st.st_mode & (S_IWGRP | S_IWOTH)) == 0 && (st.st_mode & S_IXOTH) != 0) {
+            wrapper = w;
+        }
+    }
+    auto build = [&](std::string_view verb) {
+        return yuzu::services::systemctl_mutation_argv(is_root, systemctl_path, wrapper, verb,
+                                                       name);
+    };
+    const char* verb = mode == "automatic" ? "enable" : mode == "manual" ? "disable" : "mask";
+    auto argv_opt = build(verb);
+    if (!argv_opt) {
+        ctx.set_result_status(YUZU_RESULT_STATUS_PERMISSION_DENIED, YUZU_RESULT_COMPLETENESS_UNKNOWN,
+                              "services:privilege_unavailable");
+        ctx.write_output(std::format(
+            "error|privilege_unavailable: {} is missing or not root-owned; re-run "
+            "scripts/install-agent-user.sh",
+            yuzu::services::kYuzuSystemctlWrapper));
+        return 1;
+    }
+    std::vector<std::string> argv = std::move(*argv_opt);
+    if (mode == "manual") {
         // If the service was previously masked, unmask it first so disable
         // works. Best-effort, same as before: its result is intentionally
         // not inspected (a service that was never masked has nothing to
         // unmask, and the following disable is the actual mode change).
-        run_command(
-            yuzu::shared::sudo_wrap({systemctl_path, "unmask", "--", std::string(name)}));
-        argv = yuzu::shared::sudo_wrap({systemctl_path, "disable", "--", std::string(name)});
-    } else if (mode == "disabled") {
-        argv = yuzu::shared::sudo_wrap({systemctl_path, "mask", "--", std::string(name)});
-    } else {
-        ctx.write_output(
-            std::format("error|invalid mode '{}': must be automatic, manual, or disabled", mode));
-        return 1;
+        if (auto unmask = build("unmask"))
+            run_command(*unmask);
     }
 
     auto res = run_command(argv);

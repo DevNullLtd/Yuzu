@@ -4689,6 +4689,21 @@ test('same-site gate production wiring lexical gate',
   suite: 'docs',
   timeout: 30,
 )
+# WP13/F52: pins that agent.cpp runs the allowlist startup decision (refuse to start) before
+# PluginLoader::scan and passes allowlist_required (source-text only, so Python).
+test('plugin allowlist startup wiring lexical gate',
+  _python3_test,
+  args: [files('test_plugin_allowlist_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+# WP13/F19: the root macOS agent must never exec Homebrew's user-owned brew (source-text only).
+test('installed_apps no-brew lexical gate',
+  _python3_test,
+  args: [files('test_installed_apps_no_brew_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
 # #4160: pins the sso-only runtime-wiring check + provider gauges in ServerImpl (source-text only;
 # its own in-file selftest mutates each pinned statement, so no separate selftest entry).
 test('sso-only runtime wiring lexical gate',
