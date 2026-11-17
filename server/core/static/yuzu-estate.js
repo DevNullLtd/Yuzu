@@ -173,7 +173,8 @@
           'It does not unenrol the device; a connected agent will report again, but Guardian ' +
             'compliance results return when the agent next reports a rule result (after a ' +
             'state change, a restart or a rule push), and when the agent next registers it is added back to the All Devices ' +
-            'group only, not the other management groups it was in. Tags, custom properties, quarantine ' +
+            'group only, not the other management groups it was in. Stop the agent first: a device that is ' +
+            'still connected stays outside every group until it reconnects. Tags, custom properties, quarantine ' +
             'records and property schemas are not removed.'
         ],
         fields: [],

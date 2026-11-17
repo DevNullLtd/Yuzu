@@ -336,7 +336,7 @@ TEST_CASE("ManagementGroupStore: static membership", "[pg][management_group][mem
     CHECK(members2.size() == 1);
 }
 
-// Decommission memberships, characterisation: characterisation of the returning-id question. Nothing in the server
+// Decommission memberships: characterisation of the returning-id question. Nothing in the server
 // deletes an agent's membership rows when it is decommissioned (the cascade names no
 // management-group store), and Register's only membership write is add_member(root), so an agent
 // that registers again with the same id is still a member of every group it was in. This test
@@ -464,7 +464,10 @@ TEST_CASE("ManagementGroupStore::delete_agent removes the agent from every group
     REQUIRE(sorted_ids(store.get_agent_groups("a1").value()) ==
             sorted_ids({f.root, f.s1, f.s2, f.dyn}));
 
-    CHECK(store.delete_agent("a1"));
+    std::vector<std::string> removed;
+    CHECK(store.delete_agent("a1", &removed));
+    // The evidence: exactly the groups the agent was removed from (static, dynamic and root).
+    CHECK(sorted_ids(removed) == sorted_ids({f.root, f.s1, f.s2, f.dyn}));
 
     // A value, not nullopt (no degrade): the agent is in NO group, static, dynamic and root alike.
     auto after = store.get_agent_groups("a1");
@@ -507,6 +510,9 @@ TEST_CASE("ManagementGroupStore::delete_agent refuses an empty or NUL-bearing id
     ManagementGroupStore store{pool};
     const auto f = seed_delete_agent(store);
 
+    std::vector<std::string> removed{"stale"};
+    CHECK_FALSE(store.delete_agent("", &removed));
+    CHECK(removed.empty()); // cleared on a refusal, never left holding stale ids
     CHECK_FALSE(store.delete_agent(""));
     // An embedded NUL must not truncate onto another agent's id ("a1\0x" would otherwise read as "a1").
     CHECK_FALSE(store.delete_agent(std::string_view("a1\0x", 4)));
@@ -533,11 +539,11 @@ TEST_CASE("ManagementGroupStore::delete_agent is point-in-time: a later add puts
     CHECK(sorted_ids(store.get_agent_groups("a1").value()) == sorted_ids({f.s2, f.dyn}));
 }
 
-// A lease that cannot be had within kWriteTimeout is a refusal, never a false erasure (governance T4):
-// the only pooled connection is held, so delete_agent waits out its 4 s lease budget and returns
-// false, and the rows survive.
+// A lease that cannot be had is a refusal, never a false erasure (governance T4): the only pooled
+// connection is held, so a bounded acquire on the saturated pool gives up (the pool fails a bounded
+// acquire fast, well inside kWriteTimeout) and delete_agent returns false, and the rows survive.
 TEST_CASE("ManagementGroupStore::delete_agent returns false when no connection is available",
-          "[pg][management_group][members][decommission][slow]") {
+          "[pg][management_group][members][decommission]") {
     YUZU_REQUIRE_PG_DB_TPL(db, mgmt_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 1}};
     ManagementGroupStore store{pool};

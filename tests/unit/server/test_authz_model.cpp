@@ -27,9 +27,9 @@
 #include "agent_decommission.hpp"
 #include "authz_gates.hpp"
 #include "authz_model.hpp"
-#include "service_scope_policy.hpp"
 #include "management_group_store.hpp"
 #include "rbac_store.hpp"
+#include "service_scope_policy.hpp"
 #include "tag_store.hpp"
 
 #include "../test_helpers.hpp"
@@ -873,11 +873,11 @@ TEST_CASE("authz_model decommission memberships: a group-scoped Decommission:Del
 
 // Governance S1 pin (ADR-0024 Decision 9, owner ruling 2026-11-17). `Decommission:Delete` is the
 // authority to remove the device's membership rows in EVERY group, including groups the caller could
-// not otherwise write: the rows are agent-keyed links to the retired device, removal only narrows
-// reach, and nothing is granted. The asymmetry is deliberate and must not drift silently: a holder
-// of `Decommission:Delete` without `ManagementGroup:Write` is admitted to the cascade, which removes
-// the memberships, while the member-removal routes (global `ManagementGroup:Write`) still refuse
-// it. The seeded ITServiceOwner ceiling admits `Decommission:Delete` for a service-scoped token (the
+// not otherwise write. This pins the INGREDIENTS of that asymmetry, not the route: the grant is
+// split from `ManagementGroup:Write` (check_permission), the seeded ITServiceOwner ceiling admits the
+// decommission pair, the seeded-empty global allow-list refuses the write, and the cascade (which
+// takes no caller) removes the memberships. It does not drive a service-scoped session through
+// `DELETE /api/v1/sle/agents/{id}`; that route-level test is a tracked follow-up. The seeded ITServiceOwner ceiling admits `Decommission:Delete` for a service-scoped token (the
 // device's service tag must also match, a separate check), while the empty
 // `kServiceScopeGlobalSafe` keeps that same token out of the global ManagementGroup:Write gate.
 TEST_CASE("authz_model: Decommission:Delete removes memberships without ManagementGroup:Write "

@@ -48,9 +48,10 @@ std::string render_stored_data_panel(const StoredDataView& v) {
          "<p>It does <b>not</b> unenrol the device. If the agent is still connected it will "
          "report again and the data will come back, except that Guardian compliance results "
          "return when the agent next reports a rule result (after a state change, a restart "
-         "or a rule push), and when the agent next registers it is added back to the All Devices group "
-         "only, not the other management groups it was in. Tags, custom properties, quarantine records and property "
-         "schemas are not removed.</p>"
+         "or a rule push), and when the agent next registers it is added back to the All Devices "
+         "group only, not the other management groups it was in. Stop the agent first: a device "
+         "that is still connected stays outside every group until it reconnects. Tags, custom "
+         "properties, quarantine records and property schemas are not removed.</p>"
          "<p>The attempt is written to the audit log before anything is erased; if the audit "
          "entry cannot be written, nothing is erased.</p>";
     h += "<div id=\"hw-stored-data-result\"></div>";

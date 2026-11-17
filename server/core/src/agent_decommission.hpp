@@ -33,7 +33,7 @@
 /// `agent_decommission.cpp`'s registration list, (c) bump `kCascadeStoreCount` in
 /// `test_agent_decommission.cpp` (the drift guard, the null-store case's two counts, the
 /// unconfigured-store case's skipped count and the real-store fan-out's counts, including the two
-/// failing-census counts: seven numeric sites in five tests, plus `_MIN_FIELDS` in
+/// failing-census counts: nine numeric sites in six tests, plus `_MIN_FIELDS` in
 /// `tests/test_decommission_wiring_lexical.py`), (d) add
 /// the store to the blast-radius lists in `sle_routes.hpp`/`.cpp`, `rest_api_v1.cpp`'s delete
 /// block, ADR-0024 Decisions 9/11, and `rest-api.md`, (e) hand the live pointer over in
@@ -96,6 +96,12 @@ enum class DecommissionOutcome {
              ///< did NOT commit; every OTHER store was still attempted.
 };
 
+/// `<n>:<id>,<id>,...` evidence text for the groups a decommission removed an agent from: the ids
+/// sorted, at most `kMaxGroupEvidenceIds` listed and the rest counted (`+<k>`), so one audit row
+/// stays bounded. An empty set is `0:`. Pure.
+inline constexpr std::size_t kMaxGroupEvidenceIds = 100;
+[[nodiscard]] std::string format_group_evidence(std::vector<std::string> group_ids);
+
 /// Human-readable outcome tag for logs/audit ("deleted"|"skipped"|"failed").
 [[nodiscard]] const char* to_string(DecommissionOutcome o) noexcept;
 
@@ -104,6 +110,10 @@ struct DecommissionStoreResult {
     std::string store; ///< store name, for the audit trail / logs
     DecommissionOutcome outcome{DecommissionOutcome::Skipped};
     std::string error; ///< populated iff outcome == Failed
+    /// Optional evidence the store reports about what it removed (empty = none). Recorded in the
+    /// outcome audit row next to the outcome; today only `management_group_memberships` sets it, to
+    /// `<n>:<group id>,<group id>,...` (see `format_group_evidence`).
+    std::string detail{};
 };
 
 /// Aggregate result of a single `decommission(agent_id)` call — one entry per
@@ -178,6 +188,12 @@ public:
     /// is registered as an always-Skipped target.
     void add_store(std::string name, std::function<bool(std::string_view)> deleter);
 
+    /// As `add_store`, for a store that also reports evidence of what it removed: the deleter
+    /// receives a string to fill, which is kept in `DecommissionStoreResult::detail` when the
+    /// delete committed and dropped otherwise.
+    void add_store_with_detail(std::string name,
+                               std::function<bool(std::string_view, std::string&)> deleter);
+
     /// Fan `delete_agent(agent_id)` across every registered store. Best-effort:
     /// attempts every store even if one throws OR reports failure (a delete that
     /// did not commit). Returns the per-store outcomes.
@@ -194,6 +210,8 @@ private:
         std::string name;
         std::function<bool(std::string_view)> deleter; ///< null ⇒ always Skipped;
                                                        ///< returns true iff committed
+        /// Used instead of `deleter` when set (a store that reports evidence).
+        std::function<bool(std::string_view, std::string&)> detail_deleter{nullptr};
     };
     std::vector<Target> targets_;
 };

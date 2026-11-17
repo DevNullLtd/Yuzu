@@ -4204,9 +4204,10 @@ TEST_CASE("Register: a returning approved id keeps its non-root groups until dec
     REQUIRE(h.svc.Register(/*context=*/nullptr, &req, &first).ok());
     REQUIRE(first.accepted());
 
-    // Remove the match-all auto-approve rule now that the agent is enrolled: from here only the
-    // approved enrolment row (the fast path) can accept it, so the second and third Register below
-    // really prove "no token, no approval" instead of being accepted by auto-approve again.
+    // Remove the match-all auto-approve rule now that the agent is enrolled. The approved-row fast
+    // path already runs before auto-approve, so this does not change today's outcome; it makes the
+    // second and third Register below fail loudly, rather than be quietly re-approved, on the day a
+    // change stops taking the fast path (for example un-enrolling on decommission).
     REQUIRE(!h.auto_approve.list_rules().empty());
     (void)h.auto_approve.remove_rule(0);
     REQUIRE(h.auto_approve.list_rules().empty());

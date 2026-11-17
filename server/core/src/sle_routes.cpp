@@ -221,12 +221,15 @@ void SleRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_perm_fn
     // agent's management-group memberships (#6352, key `management_group_memberships`,
     // read-gated by `ManagementGroup`: every group, static, dynamic and root; the enrolment row is
     // NOT touched, so the same id can reconnect and its next Register attempts to add it back to the
-    // root group only). Owner ruling 2026-11-17 (governance S1): `Decommission:Delete` is the
+    // root group only).
+    // Owner ruling (Dave Rae, 2026-11-17, governance S1, UP-7, UP-8): `Decommission:Delete` is the
     // authority to remove the device's membership rows in every group, including groups the caller
-    // could not otherwise write (for example a service-scoped token admitted for a device in its
-    // service, which cannot hold the global `ManagementGroup:Write` that member-removal routes
-    // require). The rows are agent-keyed links to the retired device, removal only narrows what
-    // anyone can reach, and nothing is granted. Tags stay outside the cascade.
+    // could not otherwise write (a service-scoped token admitted for a device in its service cannot
+    // hold the global `ManagementGroup:Write` that member-removal routes require). The rows are
+    // agent-keyed links to the retired device and nothing is granted; removal narrows reach and also
+    // ends group-targeted compliance policy, Guardian and collection-settings coverage of the
+    // device, which the owner accepted. Tags stay outside the cascade. The outcome audit row records
+    // the groups the device left (`management_group_memberships.groups=<n>:<ids>`).
     // Compat: the seeded
     // matrix is unchanged (Administrator + ITServiceOwner keep the ability, granted
     // via seed_defaults() with no migration); an operator-authored custom role that
@@ -297,6 +300,15 @@ void SleRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_perm_fn
                 breakdown += '=';
                 breakdown += to_string(s.outcome);
                 breakdown += ' ';
+                // Evidence of WHAT a store removed (the groups the device left), as its own
+                // token so a SIEM rule keyed on `<store>=<outcome>` is unchanged. Group ids are
+                // server-generated hex, never caller text.
+                if (!s.detail.empty()) {
+                    breakdown += s.store;
+                    breakdown += ".groups=";
+                    breakdown += s.detail;
+                    breakdown += ' ';
+                }
             }
             // The attempt row above is the fail-closed evidence; a lost OUTCOME row is
             // signalled by Sec-Audit-Failed (set on the 200 and the partial 500 alike), which

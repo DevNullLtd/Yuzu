@@ -164,9 +164,15 @@ public:
     /// exists afterwards: `add_member` and `refresh_dynamic_membership` are `INSERT ... ON CONFLICT
     /// DO NOTHING` with no agent-existence check, so an operator add, or a dynamic or `Service:` group
     /// created later (the tags decommission leaves in place feed `ensure_service_management_group`),
-    /// can insert the id again after this statement has committed, with no race needed. The statement is a plain `DELETE ... WHERE agent_id = $1` (no
-    /// `RETURNING`, no `source` filter); a failure is logged at warn level with the reason.
-    [[nodiscard]] bool delete_agent(std::string_view agent_id);
+    /// can insert the id again after this statement has committed, with no race needed.
+    ///
+    /// The statement is `DELETE ... WHERE agent_id = $1 RETURNING group_id` (no `source` filter). When
+    /// `removed_group_ids` is non-null it is cleared and filled, on success only, with the ids of the
+    /// groups the agent was removed from, so the caller can record WHICH scopes the device left (the
+    /// decommission audit evidence); on any failure it is left empty. A failure is logged at warn
+    /// level with the reason.
+    [[nodiscard]] bool delete_agent(std::string_view agent_id,
+                                    std::vector<std::string>* removed_group_ids = nullptr);
     /// LEGACY fail-soft: `get_members_checked(group_id).value_or({})` — a
     /// store-not-open / pool-acquire-timeout / query-error degrade renders as
     /// an empty vector, INDISTINGUISHABLE from a genuinely empty group (#1762).

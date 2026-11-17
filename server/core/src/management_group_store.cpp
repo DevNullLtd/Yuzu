@@ -541,7 +541,10 @@ std::expected<void, std::string> ManagementGroupStore::remove_member(const std::
     return {};
 }
 
-bool ManagementGroupStore::delete_agent(std::string_view agent_id) {
+bool ManagementGroupStore::delete_agent(std::string_view agent_id,
+                                        std::vector<std::string>* removed_group_ids) {
+    if (removed_group_ids)
+        removed_group_ids->clear();
     if (!open_ || agent_id.empty())
         return false;
     // An operator request: the write budget, not the heartbeat-path one.
@@ -555,16 +558,23 @@ bool ManagementGroupStore::delete_agent(std::string_view agent_id) {
     // returns false below rather than truncating onto another agent's id.
     pg::PgResult r = pg::exec_params(
         lease.get(),
-        "DELETE FROM management_group_store.management_group_members WHERE agent_id = $1",
+        "DELETE FROM management_group_store.management_group_members WHERE agent_id = $1 "
+        "RETURNING group_id",
         std::vector<std::string>{std::string(agent_id)});
-    if (r.status() != PGRES_COMMAND_OK) {
+    if (r.status() != PGRES_TUPLES_OK) {
         spdlog::warn("ManagementGroupStore::delete_agent: delete failed for agent {}: {}",
                      ::yuzu::log_id_token(agent_id),
                      ::yuzu::log_key_token(PQerrorMessage(lease.get())));
         return false;
     }
+    const int rows = PQntuples(r.get());
+    if (removed_group_ids) {
+        removed_group_ids->reserve(static_cast<std::size_t>(rows));
+        for (int i = 0; i < rows; ++i)
+            removed_group_ids->push_back(text_col(r.get(), i, 0));
+    }
     spdlog::info("ManagementGroupStore::delete_agent: agent {} removed from {} group(s)",
-                 ::yuzu::log_id_token(agent_id), PQcmdTuples(r.get()));
+                 ::yuzu::log_id_token(agent_id), rows);
     return true;
 }
 

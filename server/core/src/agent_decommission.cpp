@@ -1,5 +1,6 @@
 #include "agent_decommission.hpp"
 
+#include <algorithm>
 #include <exception>
 #include <utility>
 
@@ -112,17 +113,43 @@ AgentDecommission::AgentDecommission(const AgentDecommissionStores& stores) {
     // The tenth store (#6352): the agent's management-group memberships. Registered LAST.
     // `deleted` means every membership row for the id was removed; the enrolment row is NOT touched,
     // so decommission still does not un-enrol the agent.
-    targets_.push_back(
-        {"management_group_memberships",
-         stores.management_group_memberships
-             ? Fn([p = stores.management_group_memberships](std::string_view id) {
-                   return p->delete_agent(id);
-               })
-             : nullptr});
+    // It reports WHICH groups the agent left (the audit evidence of a scope change).
+    if (stores.management_group_memberships) {
+        add_store_with_detail(
+            "management_group_memberships",
+            [p = stores.management_group_memberships](std::string_view id, std::string& detail) {
+                std::vector<std::string> removed;
+                if (!p->delete_agent(id, &removed))
+                    return false;
+                detail = format_group_evidence(std::move(removed));
+                return true;
+            });
+    } else {
+        targets_.push_back({"management_group_memberships", nullptr, nullptr});
+    }
 }
 
 void AgentDecommission::add_store(std::string name, std::function<bool(std::string_view)> deleter) {
-    targets_.push_back({std::move(name), std::move(deleter)});
+    targets_.push_back({std::move(name), std::move(deleter), nullptr});
+}
+
+void AgentDecommission::add_store_with_detail(
+    std::string name, std::function<bool(std::string_view, std::string&)> deleter) {
+    targets_.push_back({std::move(name), nullptr, std::move(deleter)});
+}
+
+std::string format_group_evidence(std::vector<std::string> group_ids) {
+    std::sort(group_ids.begin(), group_ids.end());
+    std::string out = std::to_string(group_ids.size()) + ":";
+    const std::size_t shown = std::min(group_ids.size(), kMaxGroupEvidenceIds);
+    for (std::size_t i = 0; i < shown; ++i) {
+        if (i)
+            out += ',';
+        out += group_ids[i];
+    }
+    if (group_ids.size() > shown)
+        out += ",+" + std::to_string(group_ids.size() - shown);
+    return out;
 }
 
 DecommissionResult AgentDecommission::decommission(std::string_view agent_id) {
@@ -136,7 +163,7 @@ DecommissionResult AgentDecommission::decommission(std::string_view agent_id) {
         // target is reported Skipped so the audit trail is complete.
         spdlog::warn("AgentDecommission: empty agent_id — nothing to decommission");
         for (const auto& t : targets_) {
-            result.stores.push_back({t.name, DecommissionOutcome::Skipped, {}});
+            result.stores.push_back({t.name, DecommissionOutcome::Skipped, {}, {}});
             ++result.skipped;
         }
         return result;
@@ -145,7 +172,7 @@ DecommissionResult AgentDecommission::decommission(std::string_view agent_id) {
     for (const auto& t : targets_) {
         DecommissionStoreResult r;
         r.store = t.name;
-        if (!t.deleter) {
+        if (!t.deleter && !t.detail_deleter) {
             r.outcome = DecommissionOutcome::Skipped;
             ++result.skipped;
             result.stores.push_back(std::move(r));
@@ -158,7 +185,11 @@ DecommissionResult AgentDecommission::decommission(std::string_view agent_id) {
         // never claims an erasure that did not happen. A throw is the additional
         // exceptional case (an unexpected bug/bad_alloc), likewise Failed.
         try {
-            if (t.deleter(agent_id)) {
+            const bool committed = t.detail_deleter ? t.detail_deleter(agent_id, r.detail)
+                                                    : t.deleter(agent_id);
+            if (!committed)
+                r.detail.clear(); // evidence is kept only for a delete that committed
+            if (committed) {
                 r.outcome = DecommissionOutcome::Deleted;
                 ++result.deleted;
             } else {

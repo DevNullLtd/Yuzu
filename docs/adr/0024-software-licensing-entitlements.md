@@ -489,20 +489,25 @@ Decision numbers are stable, since other documents cite them.
     *(Update 2026-11-16, #6352: the cascade now covers **ten** stores. `ManagementGroupStore` (schema
     `management_group_store`, public key `management_group_memberships`) joined, registered last: its
     `delete_agent` removes the device's rows in every management group (static, dynamic and the root group) in
-    one statement. Its read securable is `ManagementGroup:Read`. Only `management_group_members` is touched:
-    the groups, their role assignments, the device's tags and its enrolment row are not. Decommission therefore
-    still does not unenrol, so the same agent id is accepted again on the approved re-register fast path and its
-    next Register re-adds the root group only; un-enrolling is a separate tracked change. The removal is a point in
-    time (an operator add, or a dynamic or `Service:` group created later from the tags decommission leaves in place, can re-insert the id). The "five
-    per-agent stores" list in Decisions 9 and 11 stays as written; it is history. The authoritative list is
-    `AgentDecommissionStores` in `agent_decommission.hpp`. Owner ruling (2026-11-17, governance finding S1):
-    `Decommission:Delete` is the authority to remove the device's membership rows in every group, including
-    groups the caller could not otherwise write: a service-scoped token admitted for a device in its service
-    cannot hold the global `ManagementGroup:Write` that the member-removal routes require, yet its decommission
-    removes the device from every group. The rows are agent-keyed links to the retired device, removal only
-    narrows what anyone can reach, and nothing is granted. Tags stay outside the cascade. A group-scoped
-    holder, if one could exist, cannot re-issue a partial decommission once the memberships are gone (D4);
-    a tag-confined token is not affected by that, because tags survive.)*
+    one statement and reports which groups it left. Its read securable is `ManagementGroup:Read`. Only
+    `management_group_members` is touched: the groups, their role assignments, the device's tags and its
+    enrolment row are not. Decommission therefore still does not unenrol, so the same agent id is accepted
+    again on the approved re-register fast path and its next Register attempts (best effort) to add it back to
+    the root group only; un-enrolling is a separate planned change. The removal is a point in time (an operator
+    add, or a dynamic or `Service:` group created later from the tags decommission leaves in place, can
+    re-insert the id). The "five per-agent stores" list in Decisions 9 and 11 stays as written; it is history.
+    The authoritative list is `AgentDecommissionStores` in `agent_decommission.hpp`.)*
+    *(Owner ruling, Dave Rae, 2026-11-17, governance findings S1, UP-7 and UP-8, recorded here because it
+    widens what `Decommission:Delete` confers: the grant is the authority to remove the device's membership
+    rows in every group, including groups the caller could not otherwise write. A service-scoped token
+    admitted for a device in its service cannot hold the global `ManagementGroup:Write` that the member-removal
+    routes require, yet its decommission removes the device from every group. The rows are agent-keyed links to
+    the retired device and nothing is granted; removal narrows what anyone can reach. It also ends
+    group-targeted compliance policy, Guardian and collection-settings coverage of the device, a loss the owner
+    accepted. Tags stay outside the cascade. Because the removal changes confinement input, the outcome audit
+    row records the groups the device left (`management_group_memberships.groups=<n>:<ids>`). A group-scoped
+    holder, if one could exist, cannot re-issue a partial decommission once the memberships are gone; a
+    tag-confined token is not affected by that, because tags survive.)*
     There is **no row-level erasure API**, a stated gap. The cascade's
     production trigger is `DELETE /api/v1/sle/agents/{id}`, authorized by the scoped
     `SoftwareLicensing:Delete` **AND** `Inventory:Delete` **AND** `GuaranteedState:Delete`

@@ -45,14 +45,17 @@
 ///     setting is 0 or below never expire), plus the agent's management-group memberships (#6352,
 ///     public key `management_group_memberships`, read-gated by `ManagementGroup`: every group,
 ///     static and dynamic and root, in one statement; the enrolment row is NOT touched, so the same
-///     id can reconnect and its next Register attempts to add it back to the root group only). The
-///     gate deliberately covers this store too: owner ruling 2026-11-17 (governance S1):
-///     `Decommission:Delete` is the authority to remove the device's membership rows in every
-///     group, including groups the caller could not otherwise write (for example a service-scoped
-///     token admitted for a device in its service, which cannot hold the global
-///     `ManagementGroup:Write` that member-removal routes require). The rows are agent-keyed links
-///     to the retired device, removal only narrows what anyone can reach, and nothing is granted.
-///     Tags stay outside the cascade. This was originally a
+///     id can reconnect and its next Register attempts to add it back to the root group only).
+///     The gate deliberately covers this store too (owner ruling, Dave Rae, 2026-11-17, governance
+///     S1, UP-7, UP-8): `Decommission:Delete` is the authority to remove the device's membership
+///     rows in every group, including groups the caller could not otherwise write (a service-scoped
+///     token admitted for a device in its service cannot hold the global `ManagementGroup:Write`
+///     that member-removal routes require). The rows are agent-keyed links to the retired device and
+///     nothing is granted; removal narrows reach and also ends group-targeted compliance policy,
+///     Guardian and collection-settings coverage of the device, which the owner accepted. Tags stay
+///     outside the cascade. The outcome audit row records the groups the device left
+///     (`management_group_memberships.groups=<n>:<ids>`).
+///     This was originally a
 ///     hand-maintained conjunction over the per-store securables (rejected as of
 ///     Decision 9's reversal — see the ADR): it stopped scaling once a fourth
 ///     securable (`Forensics`, via `AppUsageStore`) was set to join the cascade, per

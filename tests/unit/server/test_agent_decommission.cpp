@@ -51,6 +51,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <cstdio>
 #include <vector>
 
 using yuzu::server::AgentDecommission;
@@ -648,6 +649,14 @@ TEST_CASE("AgentDecommission erases an agent from every real store; a bystander 
     CHECK(del_groups->empty());
     CHECK(sorted(management_groups.get_agent_groups("agent-bystander").value()) ==
           sorted(groups.bystander_groups));
+    // UP-7: the result names WHICH groups the agent left, sorted, as `<n>:<ids>`.
+    CHECK(mg->detail ==
+          yuzu::server::format_group_evidence(
+              {groups.root, groups.shared, groups.only_del, groups.dynamic_del}));
+    // Only the membership store reports evidence.
+    for (const auto& st : result.stores)
+        if (st.store != "management_group_memberships")
+            CHECK(st.detail.empty());
 
     // Re-read the table: a Deleted outcome alone would pass an empty-bodied delete_agent.
     auto census_del = guaranteed_state.agent_rule_statuses_for_agent("agent-del");
@@ -893,10 +902,12 @@ TEST_CASE("AgentDecommission reports a failing membership delete as Failed, othe
     CHECK(result.deleted == 9);
     CHECK_FALSE(result.ok());
     for (const auto& st : result.stores) {
-        if (st.store == "management_group_memberships")
+        if (st.store == "management_group_memberships") {
             CHECK(st.outcome == DecommissionOutcome::Failed);
-        else
+            CHECK(st.detail.empty()); // no evidence for a delete that did not commit
+        } else {
             CHECK(st.outcome == DecommissionOutcome::Deleted);
+        }
     }
     // The failed delete rolled back: every membership is still there.
     CHECK(sorted(management_groups.get_agent_groups("agent-del").value()) ==
@@ -911,6 +922,26 @@ TEST_CASE("AgentDecommission reports a failing membership delete as Failed, othe
     CHECK(management_groups.get_agent_groups("agent-del").value().empty());
     CHECK(sorted(management_groups.get_agent_groups("agent-bystander").value()) ==
           sorted(groups.bystander_groups));
+}
+
+// The evidence text is pure: ids sorted, a count prefix, and a bounded list for one audit row.
+TEST_CASE("format_group_evidence sorts, counts and bounds the group id list",
+          "[decommission][management_group]") {
+    using yuzu::server::format_group_evidence;
+    CHECK(format_group_evidence({}) == "0:");
+    CHECK(format_group_evidence({"b2", "a1"}) == "2:a1,b2");
+
+    std::vector<std::string> many;
+    for (std::size_t i = 0; i < yuzu::server::kMaxGroupEvidenceIds + 7; ++i) {
+        char buf[16];
+        std::snprintf(buf, sizeof buf, "g%04zu", i);
+        many.emplace_back(buf);
+    }
+    const auto text = format_group_evidence(many);
+    CHECK(text.rfind(std::to_string(many.size()) + ":g0000,", 0) == 0);
+    CHECK(text.size() >= 2);
+    CHECK(text.substr(text.size() - 3) == ",+7"); // the rest are counted, not listed
+    CHECK(text.find("g0107") == std::string::npos);
 }
 
 // A NUL-bearing id through the cascade: the membership store refuses it (Failed, nothing deleted),

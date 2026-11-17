@@ -100,6 +100,7 @@ struct SleHarness {
 
     std::vector<std::string> audits;     // "action|result"
     std::vector<std::string> audit_full; // "action|result|target_type|target_id"
+    std::vector<std::string> audit_detail; // the detail text of each audit row, same order
     // The (securable_type, operation, agent_id) each SCOPED gate check was ASKED —
     // recorded so a wrong-securable / wrong-op / wrong-scope regression is caught.
     std::vector<std::string> scoped_calls; // "type|op|agent_id"
@@ -136,7 +137,9 @@ struct SleHarness {
             return decommission_result;
         };
         auto audit = [this](const httplib::Request&, const std::string& a, const std::string& r,
-                            const std::string& tt, const std::string& tid, const std::string&) {
+                            const std::string& tt, const std::string& tid,
+                            const std::string& detail) {
+            audit_detail.push_back(detail);
             audits.push_back(a + "|" + r);
             audit_full.push_back(a + "|" + r + "|" + tt + "|" + tid);
             if (!audit_fail_result.empty() && r == audit_fail_result)
@@ -443,6 +446,37 @@ TEST_CASE("sle erase: a ten-entry stores result is passed through per store (rou
         CHECK(res->body.find("\"guaranteed_state\":\"failed\"") != std::string::npos);
         CHECK(res->body.find("\"inventory\":\"deleted\"") != std::string::npos);
     }
+}
+
+// #6352 / governance UP-7: the outcome audit row names WHICH groups the device left, as its own
+// `<store>.groups=<n>:<ids>` token beside the unchanged `<store>=<outcome>` token, and only for a
+// store that reported evidence. The scope change is otherwise unreconstructable from the audit log.
+TEST_CASE("sle erase: the outcome audit row carries the groups the device left (UP-7)",
+          "[sle_routes]") {
+    SleHarness h;
+    h.allow_scoped_all = true;
+    DecommissionResult r;
+    r.agent_id = "agent-1";
+    r.stores.push_back({"inventory", DecommissionOutcome::Deleted, "", ""});
+    r.stores.push_back({"management_group_memberships", DecommissionOutcome::Deleted, "",
+                        "2:000000000000,a1b2c3d4e5f6"});
+    r.deleted = 2;
+    h.decommission_result = r;
+
+    auto res = h.sink.Delete("/api/v1/sle/agents/agent-1");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+
+    // The attempt row, then the outcome row; the detail of the outcome row is the last one.
+    REQUIRE(h.audit_detail.size() == 2);
+    const auto& outcome = h.audit_detail.back();
+    CHECK(contains(outcome, "management_group_memberships=deleted "));
+    CHECK(contains(outcome, "management_group_memberships.groups=2:000000000000,a1b2c3d4e5f6 "));
+    // A store that reported no evidence adds no extra token.
+    CHECK(contains(outcome, "inventory=deleted "));
+    CHECK_FALSE(contains(outcome, "inventory.groups="));
+    // The response body is unchanged: the evidence is audit-only.
+    CHECK_FALSE(contains(res->body, ".groups="));
 }
 
 // Kills: the outcome row's persist failure being invisible (a (void)try_persist_audit that
