@@ -96,6 +96,18 @@ TEST_CASE("governor: never sleeps at 100 percent duty", "[file_search][governor]
     CHECK(c.sleeps.empty());
 }
 
+TEST_CASE("governor: a zero duty is paced as the gentlest setting, never divided by",
+          "[file_search][governor]") {
+    FakeClock c;
+    fs::GovernorLimits l;
+    l.duty_percent = 0; // valid() refuses it; the pacer must still be total
+    fs::SliceGovernor g(l, c.env());
+    c.work(milliseconds{50});
+    g.pace();
+    REQUIRE(c.sleeps.size() == 1);
+    CHECK(c.sleeps[0] == milliseconds{5'000}); // 50 ms of work at 1 %
+}
+
 TEST_CASE("governor: never sleeps at or past the deadline", "[file_search][governor]") {
     FakeClock c;
     fs::SliceGovernor g({}, c.env());

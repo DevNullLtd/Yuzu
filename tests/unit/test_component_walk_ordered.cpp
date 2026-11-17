@@ -31,6 +31,12 @@
  *  - unknown identities: treating 0 as an identity fails the zero-identity cases (false restart, false
  *    other_device).
  *  - gap cap: not capping gaps fails the 1,000 / 5 split; opening a file fails total_opens == 0.
+ *  - issued identity: dropping a known root or frame half on an unknown reading, or not learning a
+ *    listed frame identity on resume, fails the position assertions of the unknown-identity case.
+ *  - resumed other_device, repeated name, depth cap, row count, unmarked oversized listing: skipping
+ *    the device check on the resume path, keeping both entries of a repeated name, not capping
+ *    max_depth at kMaxPositionDepth, counting a row for a visit that returned false, or trusting
+ *    `truncated` alone each fail the case of that name.
  */
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
@@ -42,7 +48,6 @@
 #include <chrono>
 #include <compare>
 #include <cstdint>
-#include <cstdio>
 #include <functional>
 #include <map>
 #include <set>
@@ -411,16 +416,10 @@ TEST_CASE("walk_ordered: the deadline is read before every entry of a flat listi
     Rig r;
     std::vector<DirEntry> es;
     Strs expected;
-    for (int i = 999; i >= 0; --i) { // listed descending
-        char name[8];
-        std::snprintf(name, sizeof name, "e%03d", i);
-        es.push_back(F(name));
-    }
-    for (int i = 0; i < 1000; ++i) {
-        char name[16];
-        std::snprintf(name, sizeof name, "/r/e%03d", i);
-        expected.push_back(name);
-    }
+    for (int i = 1999; i >= 1000; --i) // listed descending; four digits, so byte order is numeric order
+        es.push_back(F("e" + std::to_string(i)));
+    for (int i = 1000; i < 2000; ++i)
+        expected.push_back("/r/e" + std::to_string(i));
     r.dir("/r", std::move(es));
     r.hook = [&r](const std::string&) { r.fs.clock += 1ms; }; // a slow visitor
 
@@ -456,6 +455,14 @@ TEST_CASE("walk_ordered: a truncated listing is one gap and none of its entries 
 
     CHECK(res.stop == Stop::complete);
     CHECK(tokens(res) == Strs{"dir_truncated /r/a"});
+    CHECK(r.visits == Strs{"/r/a", "/r/b", "/r/b/k", "/r/c"});
+
+    // A provider that ignores the cap and returns the whole listing unmarked is refused the same way.
+    auto ops = r.ops();
+    ops.list = [inner = ops.list](const std::string& d, std::size_t) { return inner(d, 1000); };
+    r.visits.clear();
+    const auto unmarked = walk_ordered("/r", {}, lim, ops, r.fs.clock + 1h, r.visitor());
+    CHECK(tokens(unmarked) == Strs{"dir_truncated /r/a"});
     CHECK(r.visits == Strs{"/r/a", "/r/b", "/r/b/k", "/r/c"});
 }
 
@@ -516,41 +523,53 @@ TEST_CASE("walk_ordered: a directory on another device is one gap and none of it
     CHECK(res.stop == Stop::complete);
     CHECK(tokens(res) == Strs{"other_device /r/a"});
     CHECK(r.visits == Strs{"/r/a", "/r/b", "/r/b/y"});
+
+    // The same on the resume path: a frame that names the directory does not exempt it.
+    r.visits.clear();
+    const auto resumed = slice(r, fsr::Position{1, 1, {{"a", 2, 2}}, ""}, {});
+    CHECK(tokens(resumed) == Strs{"other_device /r/a"});
+    CHECK(r.visits == Strs{"/r/b", "/r/b/y"});
 }
 
 TEST_CASE("walk_ordered: unknown identities never trigger other_device or restarted",
           "[walk_ordered][file_search][component_walk]") {
     Rig r;
     r.dir("/r", {D("a")});
-    r.dir("/r/a", {F("x"), F("y")});
+    r.dir("/r/a", {F("x"), F("y"), F("z")});
+    WalkLimits one; // the resumed slices stop inside /r/a, so the issued position still carries its frame
+    one.max_entries = 1;
 
     SECTION("root device unknown, child device known") {
         r.ids["/r/a"] = {5, 5};
         const auto res = slice(r, {}, {});
         CHECK(res.gaps.empty());
-        CHECK(r.visits == Strs{"/r/a", "/r/a/x", "/r/a/y"});
+        CHECK(r.visits == Strs{"/r/a", "/r/a/x", "/r/a/y", "/r/a/z"});
     }
     SECTION("child device unknown, root device known") {
         r.ids["/r"] = {1, 1};
         const auto res = slice(r, {}, {});
         CHECK(res.gaps.empty());
-        CHECK(r.visits.size() == 3);
+        CHECK(r.visits.size() == 4);
     }
     SECTION("recorded frame unknown, listing known") {
         r.ids["/r/a"] = {1, 9};
-        const auto res = slice(r, fsr::Position{0, 0, {{"a", 0, 0}}, "x"}, {});
+        const auto res = slice(r, fsr::Position{0, 0, {{"a", 0, 0}}, "x"}, one);
         CHECK(!res.restarted);
         CHECK(r.visits == Strs{"/r/a/y"});
+        CHECK(res.position.dirs == std::vector<fsr::Frame>{{"a", 1, 9}}); // the reading is learned
     }
     SECTION("recorded frame known, listing unknown") {
-        const auto res = slice(r, fsr::Position{0, 0, {{"a", 1, 9}}, "x"}, {});
+        const auto res = slice(r, fsr::Position{0, 0, {{"a", 1, 9}}, "x"}, one);
         CHECK(!res.restarted);
         CHECK(r.visits == Strs{"/r/a/y"});
+        CHECK(res.position.dirs == std::vector<fsr::Frame>{{"a", 1, 9}}); // the known identity is kept
     }
     SECTION("recorded root known, listing unknown") {
-        const auto res = slice(r, fsr::Position{4, 4, {{"a", 0, 0}}, "x"}, {});
+        const auto res = slice(r, fsr::Position{4, 4, {{"a", 0, 0}}, "x"}, one);
         CHECK(!res.restarted);
         CHECK(r.visits == Strs{"/r/a/y"});
+        CHECK(res.position.root_dev == 4); // kept: the cursor validator refuses known-to-unknown
+        CHECK(res.position.root_file_id == 4);
     }
 }
 
@@ -774,6 +793,58 @@ TEST_CASE("walk_ordered: listings re-read on the resume path are not charged to 
     CHECK(res.advanced);
     CHECK(res.position.dirs.size() == 5);
     CHECK(res.position.after == "one");
+}
+
+TEST_CASE("walk_ordered: a name repeated in one listing keeps its first entry",
+          "[walk_ordered][file_search][component_walk]") {
+    Rig r;
+    r.dir("/r", {F("a"), D("a"), D("b"), F("b"), F("c")}); // "a": the file is first; "b": the directory is
+    r.dir("/r/a", {F("x")});
+    r.dir("/r/b", {F("y")});
+
+    const auto res = slice(r, {}, {});
+
+    CHECK(res.stop == Stop::complete);
+    CHECK(r.visits == Strs{"/r/a", "/r/b", "/r/b/y", "/r/c"});
+    CHECK(r.fs.listed == Strs{"/r", "/r/b"});
+}
+
+TEST_CASE("walk_ordered: max_depth is capped at the deepest directory a Position can name",
+          "[walk_ordered][file_search][component_walk]") {
+    Rig r;
+    std::string path = "/r";
+    for (std::size_t i = 0; i <= fsr::kMaxPositionDepth; ++i, path += "/d")
+        r.dir(path, {D("d")});
+    r.dir(path, {F("leaf")}); // one level deeper than a Position can name
+    WalkLimits lim;
+    lim.max_depth = 100;
+
+    const auto res = slice(r, {}, lim);
+
+    CHECK(res.stop == Stop::complete);
+    CHECK(tokens(res) == Strs{"depth " + path});
+    CHECK(r.fs.listed.size() == fsr::kMaxPositionDepth + 1); // the root and 64 levels below it
+}
+
+TEST_CASE("walk_ordered: only a visit that returns true counts a row",
+          "[walk_ordered][file_search][component_walk]") {
+    Rig r;
+    r.dir("/r", {F("a"), D("b"), F("z")});
+    r.dir("/r/b", {F("c"), F("d")});
+    auto ops = r.ops();
+    Strs seen;
+    const OrderedVisit only_c = [&seen](const std::string& d, const DirEntry& e, std::uint64_t) {
+        seen.push_back(walk_detail::join(d, e.name));
+        return e.name == "c";
+    };
+    WalkLimits lim;
+    lim.max_rows = 1;
+
+    const auto res = walk_ordered("/r", {}, lim, ops, r.fs.clock + 1h, only_c);
+
+    CHECK(res.stop == Stop::section_rows);
+    CHECK(res.rows == 1);
+    CHECK(seen == Strs{"/r/a", "/r/b", "/r/b/c"}); // "a" and "b" made no row and did not end the slice
 }
 
 TEST_CASE("walk_ordered: gaps past kMaxOrderedGaps are counted and no file is ever opened",

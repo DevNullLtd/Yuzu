@@ -38,6 +38,8 @@
 // `network_mount_points` on a malformed line: it counts the line and yields no entry, while the
 // unchanged deny-list parser, which never reads the device field, may still report that line's
 // mount point.
+// The deny-list consumers named above have not moved to this allow-list; for them it is still the
+// durable fix that needs its own review.
 #pragma once
 
 #include <charconv>

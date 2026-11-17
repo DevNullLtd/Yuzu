@@ -7,11 +7,12 @@
  * It reads the clock once and returns at once unless a whole work_quantum of work has passed, so
  * a per-entry call is cheap and a 50,000-entry flat listing is paced like any other work.
  *
- * GovernorState is plain data on purpose: this PR keeps it in memory only; the plugin PR
- * persists it behind a write-ahead marker.
+ * GovernorState is plain data on purpose: nothing here stores it; a caller that needs it across
+ * slices persists it behind a write-ahead marker.
  */
 #pragma once
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <functional>
@@ -21,7 +22,6 @@ namespace yuzu::shared::file_search {
 
 using Clock = std::chrono::steady_clock;
 
-// slice, max_entries, max_rows and duty_percent are the proposed defaults, open to veto.
 struct GovernorLimits {
     std::chrono::milliseconds slice{10'000};
     std::size_t max_entries{400'000};
@@ -59,7 +59,9 @@ public:
             last_resume_ = t;
             return;
         }
-        auto nap = work * (100 - limits_.duty_percent) / limits_.duty_percent;
+        // valid() refuses a zero duty and the caller gates on it; one that still arrives is paced as
+        // 1 %, the gentlest setting, never divided by.
+        auto nap = work * (100 - limits_.duty_percent) / std::max(limits_.duty_percent, 1u);
         // Never sleep to or past the deadline: leave at least 1 ms of slice.
         const auto room = std::chrono::duration_cast<std::chrono::milliseconds>(deadline_ - t) -
                           std::chrono::milliseconds{1};

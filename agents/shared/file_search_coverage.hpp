@@ -44,7 +44,7 @@ enum class Reason {
     unsupported
 };
 
-// Extents arrive in a later PR; the field lets the envelope already say a volume cannot report them.
+// Nothing collects extents yet; the field lets the envelope already say a volume cannot report them.
 enum class Extents { not_collected, collected, unsupported };
 
 [[nodiscard]] constexpr const char* to_token(VolumeState s) noexcept {

@@ -57,7 +57,7 @@ struct NameSemantics {
 
 /// Folds A-Z to a-z and leaves every other byte alone. Full Unicode case folding and
 /// normalisation need OS services (ICU / CharLowerW / CFString), so an OS leg injects those as its
-/// own NameSemantics in a later PR; this one is the portable floor.
+/// own NameSemantics; this one is the portable floor.
 [[nodiscard]] inline NameSemantics ascii_case_fold() {
     return {"ascii_fold", [](std::string_view s) {
                 std::string out(s);
