@@ -5290,6 +5290,53 @@ TEST_CASE("MCP create_api_token: happy path mints a token owned by the caller",
     CHECK(listing->front().principal_id == "test-user"); // always self-issued
 }
 
+TEST_CASE("MCP approval ticket: the bound subject never holds a raw secret argument, and the "
+          "recall still binds the exact secret (WP06 F12)",
+          "[mcp][pg][approval][f12]") {
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
+    McpTestServer ts;
+    ts.approval_manager_for_test = &appr;
+    ts.start("supervised");
+
+    const std::string kSecret = "yuzu_test_sentinel_grant_secret_0123456789";
+    auto call = [&](const std::string& secret, const std::string& approval_id) {
+        nlohmann::json args = {{"plugin", "os_info"},
+                               {"action", "version"},
+                               {"params", {{"grant_secret", secret}, {"path", "/tmp/x"}}}};
+        if (!approval_id.empty())
+            args["approval_id"] = approval_id;
+        nlohmann::json req = {{"jsonrpc", "2.0"},
+                              {"method", "tools/call"},
+                              {"id", 1},
+                              {"params", {{"name", "execute_instruction"}, {"arguments", args}}}};
+        return ts.call(req.dump());
+    };
+
+    auto mint = call(kSecret, "");
+    REQUIRE(mint);
+    auto mint_body = nlohmann::json::parse(mint->body);
+    REQUIRE(mint_body.contains("error"));
+    REQUIRE(mint_body["error"].contains("data"));
+    REQUIRE(mint_body["error"]["data"].contains("approval_id"));
+    const std::string approval_id = mint_body["error"]["data"]["approval_id"].get<std::string>();
+
+    // The persisted subject (what every approvals read returns) holds no raw secret.
+    auto row = appr.get(approval_id);
+    REQUIRE(row.has_value());
+    CHECK(row->scope_expression.find(kSecret) == std::string::npos);
+    CHECK(row->scope_expression.find("<redacted:sha256:") != std::string::npos);
+    CHECK(row->scope_expression.find("/tmp/x") != std::string::npos); // non-secret args stay readable
+
+    // A recall with a DIFFERENT secret does not match the bound subject: the ticket is not spent.
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", ""));
+    (void)call("a-different-secret-value", approval_id);
+    auto after = appr.get(approval_id);
+    REQUIRE(after.has_value());
+    CHECK(after->consumed_at == 0);
+}
+
 TEST_CASE("MCP create_api_token/revoke_api_token/unlock_account/rotate_api_token/"
           "confirm_api_token_rotation: an MCP-tier-less caller is denied - no MFA "
           "step-up and no approval gate would otherwise fire for it",

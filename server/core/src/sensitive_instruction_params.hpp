@@ -34,9 +34,23 @@
 ///
 /// EXTEND this list for the next secret-carrying instruction parameter
 /// — never hand-roll a second per-callsite redaction or rejection.
+///
+/// WP06 F12: the MCP approval ticket's bound subject (`approvals.scope_expression`,
+/// a plain TEXT column returned by every approvals read) used to be the raw
+/// tool arguments. `redact_tool_args_for_ticket` below is the ONE function that
+/// turns tool arguments into that subject's persisted form: every secret-bearing
+/// key at ANY depth (the keys above plus `kRedactedToolArgKeys`) is replaced by
+/// an unkeyed, domain-separated SHA-256 marker. A changed secret still changes
+/// the marker (so a recall with different arguments mismatches), and the same
+/// secret recalls exactly, with no key custody (stable across restarts and
+/// replicas, ADR-0010 posture: never a plain secret column). Fails CLOSED
+/// (nullopt) on over-depth or a digest failure: the caller refuses the mint.
+
+#include "sha256_hex.hpp"
 
 #include <nlohmann/json.hpp>
 
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -51,6 +65,57 @@ inline constexpr std::string_view kRedactedInstructionParamKeys[] = {"grant_secr
         if (key == redacted)
             return true;
     return false;
+}
+
+/// Tool-argument keys redacted in an approval ticket subject beyond the
+/// instruction-param keys above: `secret` is `confirm_engine_rotation` /
+/// `confirm_api_token_rotation`'s raw successor bearer credential.
+inline constexpr std::string_view kRedactedToolArgKeys[] = {"secret"};
+
+[[nodiscard]] inline bool is_redacted_tool_arg_key(std::string_view key) {
+    if (is_redacted_instruction_param_key(key))
+        return true;
+    for (auto redacted : kRedactedToolArgKeys)
+        if (key == redacted)
+            return true;
+    return false;
+}
+
+inline constexpr int kTicketRedactMaxDepth = 64;
+
+namespace detail {
+[[nodiscard]] inline bool redact_ticket_node(nlohmann::json& node, int depth) {
+    if (depth > kTicketRedactMaxDepth)
+        return false;
+    if (node.is_object()) {
+        for (auto it = node.begin(); it != node.end(); ++it) {
+            if (is_redacted_tool_arg_key(it.key())) {
+                const std::string raw =
+                    it.value().is_string() ? it.value().get<std::string>() : it.value().dump();
+                auto h = sha256_hex(std::string("yuzu-ticket-arg-v1\0", 19) + raw);
+                if (!h)
+                    return false;
+                it.value() = "<redacted:sha256:" + *h + ">";
+            } else if (!redact_ticket_node(it.value(), depth + 1)) {
+                return false;
+            }
+        }
+    } else if (node.is_array()) {
+        for (auto& el : node)
+            if (!redact_ticket_node(el, depth + 1))
+                return false;
+    }
+    return true;
+}
+} // namespace detail
+
+/// The persisted/bound form of MCP tool arguments for an approval ticket
+/// subject (WP06 F12). nullopt = could not be computed (over-depth or digest
+/// failure): refuse the mint, never fall back to the raw arguments.
+[[nodiscard]] inline std::optional<nlohmann::json> redact_tool_args_for_ticket(nlohmann::json args) {
+    if (!detail::redact_ticket_node(args, 0))
+        return std::nullopt;
+    return args;
 }
 
 /// Strip every redacted key from a copy of `params`. Call this ONLY at a

@@ -609,6 +609,22 @@ const std::vector<pg::PgMigration>& migrations() {
          "UPDATE approvals SET definition_id = replace(definition_id, "
          "'crossplatform.tar.', 'crossplatform.echo.') WHERE definition_id LIKE 'crossplatform.tar.%';"
          "UPDATE approvals SET target_plugin = 'echo' WHERE target_plugin = 'tar';"},
+        // v5 (WP06 F12, ONE-OFF purge, data only): before this step an MCP approval ticket's
+        // bound subject (scope_expression) was the RAW tool arguments, so a supervised-tier call
+        // to confirm_engine_rotation / confirm_api_token_rotation / execute_instruction* left the
+        // credential (`secret`, `grant_secret`, `grant_id`, `client_secret`) in this plain TEXT
+        // column, readable by every Approval:Read holder and kept in backups. New tickets bind a
+        // SHA-256 marker instead (sensitive_instruction_params.hpp). This blanks the subject of
+        // every existing MCP ticket that names one of those keys and expires the pending ones
+        // (a transition, never a DELETE: ADR-0065). A blanked ticket can never match a recall,
+        // so an approved-but-unconsumed one is simply re-requested. Idempotent. It cannot clean
+        // database backups or replicas: any credential that was ever submitted this way MUST be
+        // rotated (docs/user-manual/upgrading.md).
+        {5,
+         "UPDATE approvals SET scope_expression = '', "
+         "status = CASE WHEN status = 'pending' THEN 'expired' ELSE status END "
+         "WHERE definition_id LIKE 'mcp.%' AND scope_expression ~ "
+         "'\"(secret|grant_secret|grant_id|client_secret)\"[[:space:]]*:';"},
     };
     return kMigrations;
 }

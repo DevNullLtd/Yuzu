@@ -94,3 +94,46 @@ TEST_CASE("schedule_params_contain_sensitive_key fails closed-to-false on malfor
     CHECK_FALSE(schedule_params_contain_sensitive_key("[1,2,3]"));
     CHECK_FALSE(schedule_params_contain_sensitive_key(""));
 }
+
+// ── WP06 F12: approval-ticket subject redaction ──────────────────────────
+
+TEST_CASE("redact_tool_args_for_ticket replaces every secret-bearing value at any depth",
+          "[server][sensitive_params]") {
+    const std::string kSecret = "yuzu_test_sentinel_secret_value";
+    auto args = nlohmann::json::parse(R"({
+        "secret": ")" + kSecret + R"(",
+        "name": "keep-me",
+        "params": {"grant_secret": ")" + kSecret + R"(", "client_secret": ")" + kSecret + R"(", "path": "/x"},
+        "steps": [{"params": {"x": 1}}, {"params": {"grant_id": ")" + kSecret + R"("}},
+                  [{"deep": {"secret": ")" + kSecret + R"("}}]]
+    })");
+    auto out = redact_tool_args_for_ticket(args);
+    REQUIRE(out.has_value());
+    const std::string dumped = out->dump();
+    CHECK(dumped.find(kSecret) == std::string::npos);
+    CHECK(dumped.find("keep-me") != std::string::npos);
+    CHECK(dumped.find("/x") != std::string::npos);
+    CHECK((*out)["secret"].get<std::string>().starts_with("<redacted:sha256:"));
+    // Deterministic, and the input is untouched (taken by value).
+    CHECK(redact_tool_args_for_ticket(args)->dump() == dumped);
+    CHECK(args["secret"] == kSecret);
+}
+
+TEST_CASE("redact_tool_args_for_ticket binds the secret: a different value gives a different "
+          "subject, the same value the same",
+          "[server][sensitive_params]") {
+    nlohmann::json a = {{"secret", "one"}}, b = {{"secret", "two"}}, c = {{"secret", "one"}};
+    CHECK(redact_tool_args_for_ticket(a)->dump() != redact_tool_args_for_ticket(b)->dump());
+    CHECK(redact_tool_args_for_ticket(a)->dump() == redact_tool_args_for_ticket(c)->dump());
+    // Non-string secret values are redacted too.
+    nlohmann::json n = {{"secret", {{"k", "sentinel_obj"}}}};
+    CHECK(redact_tool_args_for_ticket(n)->dump().find("sentinel_obj") == std::string::npos);
+}
+
+TEST_CASE("redact_tool_args_for_ticket fails closed past the depth bound",
+          "[server][sensitive_params]") {
+    nlohmann::json deep = "leaf";
+    for (int i = 0; i < kTicketRedactMaxDepth + 5; ++i)
+        deep = nlohmann::json{{"k", deep}};
+    CHECK_FALSE(redact_tool_args_for_ticket(deep).has_value());
+}

@@ -99,7 +99,7 @@ TEST_CASE("ApprovalManager bound: a row minted before migration v3 survives it a
           "[pg][approval_manager][bound]") {
     yuzu::test::ApprovalManagerPg bundle;
     auto& pool = bundle.pool();
-    REQUIRE(approval_store_version(pool) == 4);
+    REQUIRE(approval_store_version(pool) == 5);
 
     // Rewind the live schema to the state of a database already at #6096's v2: drop the
     // three bound columns and reset the recorded version, then mint an "old" row with only
@@ -125,7 +125,7 @@ TEST_CASE("ApprovalManager bound: a row minted before migration v3 survives it a
     // A fresh manager re-runs the ladder: v3 (and only v3) applies to a POPULATED table.
     ApprovalManager upgraded{pool};
     REQUIRE(upgraded.is_open());
-    CHECK(approval_store_version(pool) == 4);
+    CHECK(approval_store_version(pool) == 5);
     CHECK(approvals_has_column(pool, "request_json") == 1);
     CHECK(approvals_has_column(pool, "request_digest") == 1);
     CHECK(approvals_has_column(pool, "excluded_roots") == 1);
@@ -170,7 +170,7 @@ TEST_CASE("ApprovalManager bound: a database at v1 runs #6096's v2 and then v3, 
 
     ApprovalManager upgraded{pool};
     REQUIRE(upgraded.is_open());
-    CHECK(approval_store_version(pool) == 4);
+    CHECK(approval_store_version(pool) == 5);
     CHECK(approvals_has_column(pool, "request_json") == 1);
     CHECK(approvals_has_column(pool, "excluded_roots") == 1);
 
@@ -211,7 +211,7 @@ TEST_CASE("ApprovalManager bound: a database at v2 that already has the bound co
 
     ApprovalManager upgraded{pool};
     REQUIRE(upgraded.is_open());
-    CHECK(approval_store_version(pool) == 4);
+    CHECK(approval_store_version(pool) == 5);
 
     const auto after = upgraded.get(*bound);
     REQUIRE(after.has_value());
@@ -2432,4 +2432,43 @@ TEST_CASE("approval_state_is_approvable: the one predicate the dashboard and app
     { auto a = bound(); a.request_json = "[1]"; a.request_digest = *sha256_hex(a.request_json);
       CHECK_FALSE(approval_state_is_approvable(a)); }               // matches its digest, unreadable
     { auto a = bound(); a.excluded_roots_unreadable = true; CHECK_FALSE(approval_state_is_approvable(a)); }
+}
+
+TEST_CASE("ApprovalManager v5 (WP06 F12): existing MCP tickets whose subject names a secret key "
+          "are blanked, pending ones expired, others untouched",
+          "[pg][approval_manager][bound]") {
+    yuzu::test::ApprovalManagerPg bundle;
+    auto& pool = bundle.pool();
+    REQUIRE(approval_store_version(pool) == 5);
+
+    set_approval_store_version(pool, 4);
+    REQUIRE(run_sql(pool,
+                    "INSERT INTO approval_manager.approvals (id, definition_id, status, "
+                    "submitted_by, submitted_at, scope_expression, origin) VALUES "
+                    "('leak-pending','mcp.confirm_engine_rotation','pending','a',1,"
+                    "'{\"secret\":\"yuzu_test_sentinel\"}','mcp'),"
+                    "('leak-approved','mcp.execute_instruction','approved','a',1,"
+                    "'{\"params\":{\"grant_secret\": \"yuzu_test_sentinel\"}}','mcp'),"
+                    "('clean','mcp.list_agents','approved','a',1,'{\"limit\":5}','mcp'),"
+                    "('non-mcp','policy.x','pending','a',1,'{\"secret\":\"x\"}','dashboard')")
+                .status() == PGRES_COMMAND_OK);
+
+    ApprovalManager upgraded{pool};
+    REQUIRE(upgraded.is_open());
+    CHECK(approval_store_version(pool) == 5);
+
+    auto p = upgraded.get("leak-pending");
+    REQUIRE(p.has_value());
+    CHECK(p->scope_expression.empty());
+    CHECK(p->status == "expired");
+    auto a = upgraded.get("leak-approved");
+    REQUIRE(a.has_value());
+    CHECK(a->scope_expression.empty());
+    CHECK(a->status == "approved");
+    auto c = upgraded.get("clean");
+    REQUIRE(c.has_value());
+    CHECK(c->scope_expression == "{\"limit\":5}");
+    auto n = upgraded.get("non-mcp");
+    REQUIRE(n.has_value());
+    CHECK(n->scope_expression == "{\"secret\":\"x\"}");
 }
