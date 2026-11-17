@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace yuzu::shared {
 
@@ -97,12 +98,19 @@ namespace proxy_detail {
     return c == ';' || c == ',' || c == ' ' || c == '\t' || c == '\r' || c == '\n';
 }
 
-// A piece starts a NEW list entry only if it carries a scheme or a plain `key=`.
+// A piece starts a NEW list entry only if it is `[key=]scheme://...` or
+// `key=...` where EVERY prefix is a plain name (the same test redact_entry uses).
 [[nodiscard]] inline bool starts_entry(std::string_view piece) {
-    if (piece.find("://") != std::string_view::npos)
-        return true;
+    bool keyed = false;
     const std::size_t eq = piece.find('=');
-    return eq != std::string_view::npos && is_plain_name(piece.substr(0, eq));
+    if (eq != std::string_view::npos && is_plain_name(piece.substr(0, eq))) {
+        keyed = true;
+        piece.remove_prefix(eq + 1);
+    }
+    const std::size_t sch = piece.find("://");
+    if (sch != std::string_view::npos)
+        return is_plain_name(piece.substr(0, sch));
+    return keyed;
 }
 } // namespace proxy_detail
 
@@ -116,47 +124,72 @@ namespace proxy_detail {
 
 /// A proxy LIST (a WinHTTP `ProxyServer` string such as
 /// `http=u:p@h:80;https=h2:443`). Userinfo is located BEFORE any splitting: a
-/// piece that does not start a new entry (no scheme, no plain `key=`) is glued to
-/// the previous entry, so a `;`, `,` or space inside a password cannot detach the
-/// credential from its '@'. Known residual: a password that itself contains
-/// `;key=` or `;scheme://` is indistinguishable from a real entry boundary.
+/// piece that does not start a new entry (no plain `scheme://`, no plain `key=`)
+/// is glued to the previous entry, so a `;`, `,` or space inside a password
+/// cannot detach the credential from its '@'.
+///
+/// A password may still itself contain `;key=` or `;scheme://`, which looks
+/// exactly like an entry boundary. So the entry split is NOT trusted where it
+/// matters: if any '@' exists, and some entry BEFORE the one holding the last '@'
+/// has no '@' of its own (it could be a credential fragment), everything from the
+/// start of the earliest such entry through the LAST '@' of the whole value is
+/// replaced by `REDACTED@`, neighbouring entries included. A list with no '@'
+/// anywhere is returned unchanged, and when every entry before the last '@' has
+/// its own '@' each entry is redacted on its own. Linear in the input.
 [[nodiscard]] inline std::string redact_proxy_value(std::string_view text) {
     using namespace proxy_detail;
-    std::string out;
-    std::string cur;      // current (possibly merged) entry text
-    std::string pending;  // separators seen since cur's last piece
-    bool have = false;
+    struct Entry {
+        std::size_t begin, end;
+    };
+    std::vector<Entry> entries;
     std::size_t i = 0;
     while (i < text.size()) {
         std::size_t j = i;
         const bool sep = is_sep(text[i]);
         while (j < text.size() && is_sep(text[j]) == sep)
             ++j;
-        const std::string_view run = text.substr(i, j - i);
-        i = j;
-        if (sep) {
-            pending.append(run);
-            continue;
+        if (!sep) {
+            if (entries.empty() || starts_entry(text.substr(i, j - i)))
+                entries.push_back({i, j});
+            else
+                entries.back().end = j;
         }
-        if (!have) {
-            out += pending;
-            pending.clear();
-            cur.assign(run);
-            have = true;
-        } else if (starts_entry(run)) {
-            out += redact_entry(cur);
-            out += pending;
-            pending.clear();
-            cur.assign(run);
-        } else {
-            cur += pending;
-            pending.clear();
-            cur.append(run);
+        i = j;
+    }
+    const std::size_t last_at = text.rfind('@');
+    if (last_at == std::string_view::npos)
+        return std::string{text};
+    std::size_t k = 0; // entry holding the last '@'
+    while (k < entries.size() && entries[k].end <= last_at)
+        ++k;
+    std::size_t first_bare = k; // earliest entry before k with no '@'
+    for (std::size_t e = 0; e < k; ++e) {
+        if (text.substr(entries[e].begin, entries[e].end - entries[e].begin).find('@') ==
+            std::string_view::npos) {
+            first_bare = e;
+            break;
         }
     }
-    if (have)
-        out += redact_entry(cur);
-    out += pending;
+    std::string out;
+    std::size_t pos = 0;
+    for (std::size_t e = 0; e < first_bare && e < entries.size(); ++e) {
+        out.append(text.substr(pos, entries[e].begin - pos));
+        out += redact_entry(text.substr(entries[e].begin, entries[e].end - entries[e].begin));
+        pos = entries[e].end;
+    }
+    if (first_bare < k) {
+        out.append(text.substr(pos, entries[first_bare].begin - pos));
+        out += "REDACTED@";
+        out.append(text.substr(last_at + 1));
+        return out;
+    }
+    // every entry before the last '@' carries its own '@': per-entry redaction
+    for (std::size_t e = first_bare; e < entries.size(); ++e) {
+        out.append(text.substr(pos, entries[e].begin - pos));
+        out += redact_entry(text.substr(entries[e].begin, entries[e].end - entries[e].begin));
+        pos = entries[e].end;
+    }
+    out.append(text.substr(pos));
     return out;
 }
 

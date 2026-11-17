@@ -152,8 +152,34 @@ TEST_CASE("proxy redaction: separators and odd characters inside credentials do 
         "http=h:80;https=u2:p,w2@h2:443;ftp=u3:p;3 x@h3:21;socks=h4:1080", ProxyShape::list);
     for (const char* sec : {"u2", "p,w2", "u3", "p;3", "x@"})
         CHECK_FALSE(has(list, sec));
-    CHECK(has(list, "http=h:80;"));
+    // the 1st entry has no '@' of its own and a later one does, so the split is
+    // not trusted: everything up to the last '@' is over-redacted, the tail stays
     CHECK(has(list, "socks=h4:1080"));
+    // a list with no '@' anywhere stays fully readable
+    CHECK(format_proxy_address_row("http=h:80;https=h:443;socks=h4:1080", ProxyShape::list) ==
+          "proxy_address|http=h:80;https=h:443;socks=h4:1080");
+    // a credential that itself contains `;scheme://` or `;key=` (looks like an entry boundary)
+    for (const char* in :
+         {"http=h:80;https=u:pw;x://y@h2:80", "https=user:pw;http://y@h2:80",
+          "https=user:pw;key=z@h2:80", "http=h:80;https=user:pw;x://y@h2:80;ftp=a:b@h3",
+          "http=u:pw\r\nx://y@h", "a=b@c@d@h;https=x:y@z"}) {
+        const auto row = format_proxy_address_row(in, ProxyShape::list);
+        INFO(in << " -> " << row);
+        for (const char* sec : {"u:pw", "user:pw", "a:b", "x:y", "b@", "d@"})
+            CHECK_FALSE(has(row, sec));
+        CHECK(has(row, "REDACTED@"));
+    }
+    // IPv6 literal, percent-encoding and a very long input stay correct and cheap
+    CHECK(format_proxy_address_row("http=[::1]:80;https=[::2]:81", ProxyShape::list) ==
+          "proxy_address|http=[::1]:80;https=[::2]:81");
+    CHECK_FALSE(has(format_proxy_address_row("http=u:p%3Bq@[::1]:80", ProxyShape::list), "p%3Bq"));
+    const std::string many = [] {
+        std::string m;
+        for (int i = 0; i < 100000; ++i)
+            m += "a=b;";
+        return m + "@";
+    }();
+    CHECK(has(format_proxy_address_row(many, ProxyShape::list), "REDACTED@"));
     // a hostile (non-plain) key never survives as an unredacted prefix
     CHECK_FALSE(has(format_proxy_address_row("user:secret=@host", ProxyShape::list), "secret"));
     CHECK_FALSE(has(format_proxy_address_row("us er:pw=x@host", ProxyShape::list), "pw"));
