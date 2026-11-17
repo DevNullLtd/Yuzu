@@ -460,14 +460,11 @@ private:
 /// a directory AFTER its depth and can_enter decisions were applied (so it may be asked about one
 /// that is never opened), and for a regular file; a symlink, junction, FIFO, device or socket is
 /// counted and never reaches it. find_by_hash and search_dir are both thin visitors over this.
-/// On macOS the walker is also the one place that switches the dataless-materialization policy
-/// off (the one OS call the core makes itself), first of all, so it spans the root probe, the
-/// iterator and every per-entry call, and no action riding the walker can omit it.
 template <class VisitFn>
 WalkOutcome walk_bounded(const std::string& root, int max_depth, const WalkLimits& limits,
                          const WalkEnv& env, VisitFn visit) {
 #ifdef __APPLE__
-    const DatalessMaterializationOff dataless_off; // restored when the walk returns
+    const DatalessMaterializationOff dataless_off; // first: it must span the root probe
 #endif
     WalkOutcome out;
     out.mount_table_incomplete = !env.mount_table_complete;

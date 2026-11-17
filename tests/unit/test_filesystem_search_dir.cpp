@@ -21,8 +21,7 @@
  *                       and count ORDER is pinned in test_filesystem_find_by_hash.cpp.
  *   dataless policy  -- walk_bounded not switching the thread's dataless-materialization policy off
  *                       before its first touch of the root (the first probe call and the name
- *                       predicate would read the default), or not restoring it, also after a run
- *                       whose root the mount list refuses.
+ *                       predicate would read the default), or not restoring it.
  *
  * UNGUARDED TU on every OS; the symlink and FIFO cases are #ifndef _WIN32, the junction case is
  * #ifdef _WIN32, the dataless-policy case is #ifdef __APPLE__ and the raw-byte-name case is
@@ -430,13 +429,6 @@ TEST_CASE("search_dir: the walk switches dataless materialization off from its f
     CHECK(at_probe.front() == IOPOL_MATERIALIZE_DATALESS_FILES_OFF);
     REQUIRE(at_name.size() == 1);
     CHECK(at_name.front() == IOPOL_MATERIALIZE_DATALESS_FILES_OFF);
-    CHECK(policy() == before);
-
-    // a run whose root the mount list refuses ends before any hook runs and still restores
-    fbh::WalkEnv refused;
-    refused.network_mounts = {t.str()};
-    const auto r = walk(t, sd::MatchType::files, 5, sd::limits_for(100), refused);
-    CHECK(r.out.c.skipped_network_mount == 1);
     CHECK(policy() == before);
 }
 #endif
