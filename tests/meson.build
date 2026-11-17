@@ -3528,6 +3528,16 @@ test('qa-stack gateway crash signatures',
   suite: 'docs',
   timeout: 30,
 )
+# WP15/S9: the release image vulnerability gate (scripts/ci/image-vuln-gate.sh)
+# fails closed, run against a stub trivy; plus lexical tripwires that every
+# release.yml publish job runs it before its push and pre-release.yml scans
+# every published image. Hermetic, no Docker; the bash cases skip on Windows.
+test('image vulnerability gate',
+  _python3_test,
+  args: [files('test_image_vuln_gate.py')],
+  suite: 'docs',
+  timeout: 60,
+)
 
 # Release artifact gate (#5242): runs scripts/check-release-artifacts.sh
 # against a synthetic complete artifacts directory, then with each expected

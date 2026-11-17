@@ -932,6 +932,61 @@ with no `cache-to`), so it never evicts release layers and adds no cache directo
 likewise has no `cache-to`: it shares one buildkitd instance with the push build,
 so the push hits BuildKit's own solver cache and rebuilds nothing.
 
+### Release image vulnerability gate (`scripts/ci/image-vuln-gate.sh`, WP15/S9)
+
+**What it checks.** Every image `release.yml` publishes (server, gateway, postgres, the three
+chisel variants and the agent bundle) is scanned with a pinned Trivy **before it is pushed**.
+The gate fails when an image has a CRITICAL vulnerability that has a fix available and is not
+accepted in `.trivyignore.yaml`. HIGH findings and unfixed CRITICALs are printed for the record
+and do not fail it. A scan that cannot complete (Trivy error, DB download failure, wrong Trivy
+version, missing ignore file) fails it too: it never reads as a pass.
+
+**Where.** `docker-publish` and `docker-publish-chisel` scan the image their healthcheck
+verification build already loaded (step "Scan image for fixable CRITICAL vulnerabilities
+(pre-push gate)", between the healthcheck probe and the tag re-check). `docker-publish-postgres`
+gains its own no-push build for the scan. `docker-publish-agent-bundle` runs
+`scripts/build-agent-bundle.sh` without `--push`, scans the local image, then pushes it. The
+push build reuses the scanned build's layers from the same buildkitd, so what was scanned is
+what is pushed. `pre-release.yml` `security-scan` runs the same script on all seven published
+tags afterwards with a fresher DB (detective: see "Pre-release QA").
+
+**Current packages.** The Debian and Alpine images upgrade their packages in the final stage
+(`apt-get upgrade`, `apk upgrade`; `yuzu-postgres` holds the PGDG server packages so the
+PostgreSQL minor stays the pinned one), and the chisel images cut their slices from the live
+Ubuntu archive. The Big Tam publish jobs build with a persistent local cache that is never
+pruned for the non-chisel images, so each of those steps reads the `YUZU_PACKAGE_REFRESH`
+build argument, which the workflow sets to `<run_id>-<run_attempt>`: every run attempt takes
+current packages, and the scan build and the push build of one attempt share the layer.
+`tests/test_image_vuln_gate.py` (`docs` suite) pins the gate-before-push order in each publish
+job and the refresh argument on every cached build.
+
+**Trivy.** The script downloads Trivy `0.70.0` and checks it against a sha256 pinned in the
+script (the release's checksums file and tarball were verified with `cosign verify-blob` when
+pinned; re-verify on a bump). It installs into `RUNNER_TEMP` and keeps its DB there, never under
+`$HOME`: the four Big Tam runners share one OS identity (#1871). No marketplace action is used.
+
+**Accepting a finding.** Add an entry to `.trivyignore.yaml` with a `statement` (why it does not
+apply, with the evidence), an `expired_at` about 90 days out, and the narrowest scope Trivy
+allows (`paths` or `purls`). The script refuses a file whose entries lack either field. When an
+entry expires, Trivy stops honouring it and the next release fails on that finding again. Today
+there is one entry: the Go standard library CVE-2025-68121 in the upstream postgres image's
+`gosu` (gosu does not link `crypto/tls`).
+
+**When it fails.** The leg that failed pushed nothing. Its sibling matrix legs are
+`fail-fast: false`, so they may already have pushed `:X.Y.Z`, and the release job does not run
+(same state as any other publish failure; see the release skill's Recovery). Read the table in
+the step log:
+
+- **A distro package with a fix**: the fix usually landed after the run started. "Re-run failed
+  jobs" on the newest run takes current packages (the refresh argument changes per attempt).
+- **A fix that is not in the distro yet, or in a binary the base image ships** (a Go tool, an
+  upstream-built binary): refresh the base image digest if upstream has rebuilt it; otherwise
+  accept it in `.trivyignore.yaml` with the evidence. Either is a commit, so re-tag.
+
+**What it does not see.** Trivy does not identify the Erlang/OTP runtime in the gateway's
+bundled ERTS, so OTP CVEs pass this gate (grype does report them). Nothing in a statically
+linked C++ binary (the server and agent) is visible to either scanner.
+
 ### Pre-release QA (`pre-release.yml`)
 
 **Trigger.** `workflow_run` on a completed `Release` run whose head is a `v*` tag
@@ -976,9 +1031,13 @@ than the tag under test (#5150). The other jobs check the following:
   `.deb` control `Version` equals the tag's Debian spelling (`0.14.0~rc3`); a
   mismatch fails. The RPM metadata step only prints. The ARM64 archive is checked only when the
   release ships one (#5135).
-- **security-scan**: Trivy scans the server and gateway images. Its findings
-  are informational and do not fail the run, but an image that cannot be
-  pulled fails the job.
+- **security-scan**: runs the release image vulnerability gate
+  (`scripts/ci/image-vuln-gate.sh`) on all seven published images (server,
+  gateway, postgres, the three chisel variants, the agent bundle). A CRITICAL
+  with a fix that `.trivyignore.yaml` does not accept fails the job, as does an
+  image that cannot be pulled or scanned; HIGH findings are informational.
+  `release.yml` already ran the same gate before each push, so a failure here
+  usually means a CVE disclosed after the release.
 - **soak-test**: ten minutes on the stack. Every 30s it checks that all four
   services are running with 0 restarts, at least one agent is connected, and
   the gateway is ready. About once a minute it also round-trips a command. At
@@ -3924,9 +3983,10 @@ failed or cancelled chisel leg skips the release.
 
 `docker-publish-agent-bundle` runs **after** `release` (it repackages the
 release's own agent archives, after verifying the release `SHA256SUMS` cosign signature) on a GitHub-hosted runner — no
-compilation, so no self-hosted dependency — and cosign-signs + SBOMs +
-attests the pushed `yuzu-agent-bundle-chisel` image like the other publish
-jobs.
+compilation, so no self-hosted dependency — builds the image without pushing,
+runs the release image vulnerability gate on it, pushes it, and cosign-signs +
+SBOMs + attests the pushed `yuzu-agent-bundle-chisel` image like the other
+publish jobs.
 
 ## vcpkg state corruption — recovery path
 

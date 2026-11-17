@@ -573,6 +573,32 @@ This describes the build in a fresh deployment (see "Deployment contract (hard c
 - **What changed:** the Windows agent now reports the `pkg_inventory` Windows legs in its daily installed-software sync. Each Windows endpoint adds `appx` rows (every Store and inbox app registered for all users, roughly 100-300 rows per host, inbox apps included), `chocolatey` rows (one per Chocolatey package, plus a presence row) and a `winget` presence row.
 - **Affected:** per-device software counts and the `/software` catalogue for Windows devices rise, and a saved filter on `ecosystem` or "Found by" now also matches the new rows. A client that validates `ecosystem` against a fixed list (the MCP `get_crypto_libraries` tool refuses an unknown value) must add `chocolatey`, `winget` and `appx`.
 - **Not affected:** per-user Store packages and anything winget itself installed are not collected. Servers need no setting; the server learns the three ecosystems from its own build, so bring up every server replica before the agents of the same build enroll.
+## Upgrade note: the `yuzu-postgres` image moves to PostgreSQL 18.6, and published images take current packages (WP15)
+
+The `yuzu-postgres` image (and `yuzu-postgres-ha`, which is built on it) moves from PostgreSQL
+18.4 to 18.6, which carries the server security fixes released after 18.4. There was no 18.5:
+PostgreSQL withdrew it before release.
+
+- **No dump or restore.** It is a minor release of the same major version, with the same
+  on-disk format. Pull the new image and recreate the database container on the existing data
+  volume. Checked on 2026-11-17: a volume initialised by the v0.15.0 `yuzu-postgres` image
+  (PostgreSQL 18.4) opened under the new image, and its pgvector HNSW index still answered.
+- **No collation change.** The image stays on Debian bookworm with the same glibc (2.36) and
+  ICU (72.1) packages, so the database's recorded collation version (`2.36`) still equals the
+  actual one and the collation check ([server-admin.md](server-admin.md#postgresql-collation-version))
+  keeps reporting `ok`.
+- **PostgreSQL's own post-update notes.** The 18.6 release notes list actions for databases that
+  use logical decoding output plugins, `pgcrypto` PGP encryption, GIN indexes built in parallel,
+  or `btree_gist`/`ltree` indexes. Yuzu's schemas use none of these. If you added objects of
+  those kinds to the Yuzu database yourself, follow the 18.6 release notes for them.
+- **Rolling back** to the previous image on the same volume works (minor releases share the
+  on-disk format), and reopens the vulnerabilities 18.6 fixes.
+
+Every image the release publishes now takes its distribution's security updates when it is
+built (`apt-get upgrade` / `apk upgrade`; the chisel images already cut current packages), and
+the release refuses to push an image that still has a CRITICAL vulnerability with a fix
+available. No action is needed.
+
 ## Upgrade note: the server now requires a `revocation_source_store` schema (CRL sources, ADR-0070 R1)
 
 This release adds the registered-CRL-source store (`/api/v1/crypto/revocation-sources`). It is

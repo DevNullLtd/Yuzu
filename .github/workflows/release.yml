@@ -1573,6 +1573,7 @@ jobs:
           build-args: |
             TRIPLET=x64-linux
             YUZU_BUILD_JOBS=${{ env.YUZU_BUILD_JOBS }}
+            YUZU_PACKAGE_REFRESH=${{ github.run_id }}-${{ github.run_attempt }}
           cache-from: type=local,src=${{ runner.tool_cache }}/yuzu-docker-buildcache/${{ matrix.image }}
           provenance: false
           sbom: false
@@ -1582,6 +1583,21 @@ jobs:
           ROLE: ${{ matrix.image }}
           IMAGE: yuzu-hc-verify/${{ matrix.image }}:${{ github.sha }}
         run: scripts/ci/verify-healthcheck-invariants.sh "${ROLE}=${IMAGE}"
+
+      # ── Image vulnerability gate (WP15/S9) ─────────────────────────────
+      # Scans the image just built and probed, BEFORE "Build and push": a
+      # CRITICAL vulnerability with a fix, not accepted in .trivyignore.yaml,
+      # fails this leg, so no tag is pushed and the release job (which needs
+      # this job) does not run. The push build reuses this build's layers from
+      # the same buildkitd (see above), so what was scanned is what is pushed.
+      # The script installs its own pinned, checksum-verified Trivy and keeps
+      # the DB under RUNNER_TEMP, never $HOME (one OS identity for all Big Tam
+      # runners, #1871). Recovery: docs/ci-architecture.md "Release image
+      # vulnerability gate".
+      - name: Scan image for fixable CRITICAL vulnerabilities (pre-push gate)
+        env:
+          IMAGE: yuzu-hc-verify/${{ matrix.image }}:${{ github.sha }}
+        run: scripts/ci/image-vuln-gate.sh "$IMAGE"
 
       - name: Remove the verification image
         if: always()
@@ -1613,6 +1629,7 @@ jobs:
           build-args: |
             TRIPLET=x64-linux
             YUZU_BUILD_JOBS=${{ env.YUZU_BUILD_JOBS }}
+            YUZU_PACKAGE_REFRESH=${{ github.run_id }}-${{ github.run_attempt }}
           # Registry cache lives in GHCR itself under a :buildcache tag.
           # mode=max caches intermediate layers too (best hit rate).
           cache-from: type=local,src=${{ runner.tool_cache }}/yuzu-docker-buildcache/${{ matrix.image }}
@@ -1787,6 +1804,41 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.licenses=AGPL-3.0-or-later
 
+      # ── Image vulnerability gate (WP15/S9) ─────────────────────────────
+      # Build WITHOUT pushing and scan before "Build and push", as in
+      # docker-publish. No `cache-to`: this build shares the buildkitd
+      # instance with the push build, which then reuses its layers (the
+      # final stage's apt-get upgrade is not run twice; YUZU_PACKAGE_REFRESH,
+      # identical in both builds, makes it run once per attempt rather than be
+      # served from an earlier release's cache). The tag is salted per run (the
+      # Big Tam runners share one Docker daemon) and uses the yuzu-hc-verify/
+      # prefix so cache-prune.yml's #751 sweep reclaims a leaked one.
+      - name: Build for vulnerability scan (no push)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: deploy/docker/Dockerfile.postgres
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: yuzu-hc-verify/postgres-vuln-scan:${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          build-args: |
+            YUZU_PACKAGE_REFRESH=${{ github.run_id }}-${{ github.run_attempt }}
+          cache-from: type=local,src=${{ runner.tool_cache }}/yuzu-docker-buildcache/postgres
+          provenance: false
+          sbom: false
+
+      - name: Scan image for fixable CRITICAL vulnerabilities (pre-push gate)
+        env:
+          IMAGE: yuzu-hc-verify/postgres-vuln-scan:${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+        run: scripts/ci/image-vuln-gate.sh "$IMAGE"
+
+      - name: Remove the scan image
+        if: always()
+        env:
+          IMAGE: yuzu-hc-verify/postgres-vuln-scan:${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+        run: docker image rm -f "$IMAGE" || true
+
       - name: Refuse to publish if the tag moved (#5282)
         run: bash scripts/ci/check-release-tag-sha.sh
 
@@ -1801,6 +1853,9 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # Same value as the scan build, so this build reuses its layers.
+          build-args: |
+            YUZU_PACKAGE_REFRESH=${{ github.run_id }}-${{ github.run_attempt }}
           # Distinct local buildcache path — never collides with the
           # server/gateway/chisel caches on this runner.
           cache-from: type=local,src=${{ runner.tool_cache }}/yuzu-docker-buildcache/postgres
@@ -2045,6 +2100,7 @@ jobs:
           tags: yuzu-hc-verify/${{ matrix.image }}-chisel:${{ github.sha }}
           build-args: |
             YUZU_BUILD_JOBS=${{ env.YUZU_BUILD_JOBS }}
+            YUZU_PACKAGE_REFRESH=${{ github.run_id }}-${{ github.run_attempt }}
           cache-from: type=local,src=${{ runner.tool_cache }}/yuzu-docker-buildcache/${{ matrix.image }}-chisel
           provenance: false
           sbom: false
@@ -2054,6 +2110,15 @@ jobs:
           ROLE: ${{ matrix.image }}-chisel
           IMAGE: yuzu-hc-verify/${{ matrix.image }}-chisel:${{ github.sha }}
         run: scripts/ci/verify-healthcheck-invariants.sh "${ROLE}=${IMAGE}"
+
+      # Image vulnerability gate (WP15/S9), before the push; see the same step
+      # in docker-publish. The chisel stage cuts its slices from the live
+      # Ubuntu archive (security and updates pockets), so the push build
+      # reuses these layers rather than cutting again.
+      - name: Scan image for fixable CRITICAL vulnerabilities (pre-push gate)
+        env:
+          IMAGE: yuzu-hc-verify/${{ matrix.image }}-chisel:${{ github.sha }}
+        run: scripts/ci/image-vuln-gate.sh "$IMAGE"
 
       - name: Remove the verification image
         if: always()
@@ -2077,6 +2142,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             YUZU_BUILD_JOBS=${{ env.YUZU_BUILD_JOBS }}
+            YUZU_PACKAGE_REFRESH=${{ github.run_id }}-${{ github.run_attempt }}
           # NOTE: deliberately NO TRIPLET build-arg. The server/agent chisel
           # Dockerfiles derive the vcpkg triplet from buildx's per-arch
           # TARGETARCH when TRIPLET is empty
@@ -2249,21 +2315,38 @@ jobs:
       - name: Install cosign
         uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
 
+      # Reuse the maintainer script (download release artifacts -> verify
+      # SHA256SUMS' cosign signature, then each file against its own line -> lay out -> build host-arch (amd64) image -> smoke-test). GH_TOKEN
+      # lets its `gh release download` authenticate against this just-published
+      # release. linux/arm64 dropped (no --multiarch). No --push (WP15/S9): the
+      # script leaves the image in the local daemon as REGISTRY/IMAGE:VERSION,
+      # the gate below scans it, and only then is it pushed.
+      - name: Build agent bundle (amd64, no push)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.ref.outputs.version }}
+          REGISTRY: ghcr.io/${{ steps.owner.outputs.value }}
+          SIGNER_REPO: ${{ github.repository }}
+        run: |
+          bash scripts/build-agent-bundle.sh \
+            --version "$VERSION" \
+            --registry "$REGISTRY" \
+            --signer-repo "$SIGNER_REPO"
+
+      # Image vulnerability gate (WP15/S9), before the push; see the same step
+      # in docker-publish.
+      - name: Scan image for fixable CRITICAL vulnerabilities (pre-push gate)
+        env:
+          IMAGE: ${{ steps.ref.outputs.image }}:${{ steps.ref.outputs.version }}
+        run: scripts/ci/image-vuln-gate.sh "$IMAGE"
+
       - name: Refuse to publish if the tag moved (#5282)
         run: bash scripts/ci/check-release-tag-sha.sh
 
-      # Reuse the maintainer script (download release artifacts -> verify
-      # SHA256SUMS' cosign signature, then each file against its own line -> lay out -> build host-arch (amd64) image -> push). GH_TOKEN
-      # lets its `gh release download` authenticate against this just-published
-      # release. linux/arm64 dropped — pass --push without --multiarch.
-      - name: Build + push agent bundle (amd64)
+      - name: Push agent bundle
         env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          bash scripts/build-agent-bundle.sh \
-            --version "${{ steps.ref.outputs.version }}" \
-            --signer-repo "${{ github.repository }}" \
-            --push
+          IMAGE: ${{ steps.ref.outputs.image }}:${{ steps.ref.outputs.version }}
+        run: docker push "$IMAGE"
 
       - name: Resolve pushed image digest
         id: digest

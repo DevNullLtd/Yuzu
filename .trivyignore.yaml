@@ -1,0 +1,36 @@
+# Accepted vulnerabilities for the release image gate (WP15/S9).
+#
+# Read by scripts/ci/image-vuln-gate.sh, which release.yml runs on every
+# published image BEFORE it is pushed (and pre-release.yml runs again on the
+# published tags). The gate fails on any CRITICAL vulnerability that has a fix
+# and is not accepted here.
+#
+# Rules for an entry (the gate refuses a file that breaks the first two):
+#   - `statement`: why the finding does not apply or cannot be fixed by us yet,
+#     with the evidence.
+#   - `expired_at`: at most about 90 days out. When it passes, Trivy stops
+#     honouring the entry and the next release fails on the finding again, so
+#     it is re-reviewed rather than forgotten.
+#   - Scope it as narrowly as Trivy allows (`paths` or `purls`), never a bare
+#     CVE id that would also hide the same CVE in another package.
+#   - Remove the entry as soon as the upstream image no longer carries it.
+
+vulnerabilities:
+  # yuzu-postgres: /usr/local/bin/gosu is the upstream postgres image's gosu
+  # 1.19, built by its upstream with go1.24.6. Trivy reports the Go standard
+  # library's CVE-2025-68121 (crypto/tls certificate validation on session
+  # resumption, fixed in Go 1.24.13). gosu does not link crypto/tls: the binary
+  # in postgres:18.6-bookworm@sha256:f1ea2a1a4fb7... holds no crypto/tls (or
+  # net/http, crypto/x509) symbol, checked with `strings` on 2026-11-17, while
+  # its os/exec symbols are present. gosu only switches user and execs the
+  # server at container start. Our build cannot replace the binary without
+  # forking the upstream entrypoint; the fix is upstream rebuilding gosu.
+  - id: CVE-2025-68121
+    paths:
+      - "usr/local/bin/gosu"
+    statement: >-
+      gosu 1.19 in the upstream postgres image is built with go1.24.6; gosu does
+      not link crypto/tls (no crypto/tls symbol in the binary), so the
+      session-resumption flaw is unreachable. Accepted until upstream rebuilds
+      gosu. WP15/S9, reviewed 2026-11-17.
+    expired_at: 2027-02-15

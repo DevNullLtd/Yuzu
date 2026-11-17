@@ -48,9 +48,20 @@
 #   false-positive mid-init).
 
 # Global ARG so both stages use the same pinned base.
-# postgres:18.4-bookworm, multi-arch manifest list (amd64 + arm64),
-# resolved 2026-06-18.
-ARG PG_BASE=postgres:18.4-bookworm@sha256:efef99e1558f86089bc84bece29208c0777a185ff717ec7fa288a652ce2d0adf
+# postgres:18.6-bookworm, multi-arch manifest list (amd64 + arm64), built
+# 2026-11-05, resolved 2026-11-17 (WP15/S9: 18.4 lacks the server security
+# fixes released after it). 18.6 is the newest 18.x minor released at least a
+# month before the pin (2026-08-13); 18.7 (2026-11-12) was too new. There is no
+# 18.5: PostgreSQL withdrew it before release, so 18.6 is the first fixed one.
+# Dependabot does not see a digest held in an ARG default, so refresh this one
+# by hand.
+#
+# Stay on bookworm (glibc 2.36). Moving this base to trixie (glibc 2.41) changes
+# the libc collation version under an existing data volume: the server's
+# collation check then reports a mismatch and pauses device-CI writes
+# (docs/user-manual/server-admin.md "PostgreSQL collation version"). That is a
+# data migration with its own upgrade note, never a digest refresh.
+ARG PG_BASE=postgres:18.6-bookworm@sha256:f1ea2a1a4fb7b68d4836be1fdcb8a6466a89b072158bf9d97663600538c294c5
 
 # ── Stage 1: build pgvector against the exact server version ────────────
 FROM ${PG_BASE} AS pgvector-build
@@ -87,6 +98,32 @@ RUN git clone --branch "${PGVECTOR_VERSION}" --depth 1 \
 
 # ── Stage 2: runtime — stock postgres + the extension + init SQL ────────
 FROM ${PG_BASE}
+
+# Current Debian packages (WP15/S9). The base digest is only as fresh as the
+# day upstream built it, and an upstream minor tag stops being rebuilt once the
+# next minor ships, so every release build applies the bookworm security and
+# point-release updates here. The PostgreSQL packages (PGDG, version contains
+# "pgdg") are held: PGDG carries only its newest minor, so an unheld upgrade
+# would silently move the server off the pinned minor. The final check fails
+# the build if the server package moved anyway. The release scans this image for
+# fixable CRITICAL vulnerabilities before pushing it (release.yml,
+# scripts/ci/image-vuln-gate.sh).
+# YUZU_PACKAGE_REFRESH: release.yml passes a value that changes on every run
+# attempt, so the package step below re-runs instead of being served from the
+# runner's persistent build cache (cache-from type=local, never pruned for this
+# image), which would otherwise keep shipping the packages of whichever build
+# first populated it. Local builds leave it empty and cache as usual.
+ARG YUZU_PACKAGE_REFRESH=
+RUN set -eux; \
+    : "package refresh: ${YUZU_PACKAGE_REFRESH}"; \
+    pgdg="$(dpkg-query -W -f '${Package} ${Version}\n' | awk '$2 ~ /pgdg/ { print $1 }')"; \
+    test -n "$pgdg"; \
+    apt-mark hold $pgdg >/dev/null; \
+    apt-get update; \
+    apt-get upgrade -y --no-install-recommends; \
+    apt-mark unhold $pgdg >/dev/null; \
+    rm -rf /var/lib/apt/lists/*; \
+    test "$(dpkg-query -W -f '${Version}' "postgresql-${PG_MAJOR}")" = "${PG_VERSION}"
 
 # vector.so + extension control/SQL files + LLVM bitcode (JIT inlining),
 # captured wholesale via DESTDIR so a pgvector layout change can't silently
