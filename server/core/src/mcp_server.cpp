@@ -13523,6 +13523,8 @@ McpServer::HandlerFn McpServer::build_handler(
                                   kMaxPackBytes == 1048576 && kMaxFieldBytes == 256 &&
                                   kCurationQueueMaxLimit == 500 &&
                                   curation_keys::kMaxKeyBytes == 2402 &&
+                                  (curation_keys::kMaxKeyBytes + 2) / 3 * 4 == 3204 &&
+                                  (curation_keys::kMaxKeyBytes + 24 + 2) / 3 * 4 == 3236 &&
                                   kLifecycleImportFormatTokens.size() == 2 &&
                                   kLifecycleImportFormatTokens[0] == "csv" &&
                                   kLifecycleImportFormatTokens[1] == "cle",
@@ -13532,6 +13534,9 @@ McpServer::HandlerFn McpServer::build_handler(
                     {AT::kString, "name", 0, kLifecycleImportNameMaxBytes},
                     {AT::kString, "format", 0, 8},
                     {AT::kString, "content", 0, lifecycle_import::kImportMaxBytes}};
+                // The cursor bound 3236 is the key bound plus decode_cursor's 24 bytes of
+                // count/separator slack (software_curation_routes.cpp), both as base64url
+                // upper bounds: the encoder is unpadded, so the exact lengths are no larger.
                 static constexpr sra::ArgSpec kQueueArgs[] = {
                     {AT::kString, "status", 0, 16},
                     {AT::kInt, "limit", 1, kCurationQueueMaxLimit},
@@ -13551,11 +13556,10 @@ McpServer::HandlerFn McpServer::build_handler(
                 constexpr std::span<const sra::ArgSpec> kNoArgs{}; // the tools that take none
 
                 const bool lifecycle_family = tool_name.ends_with("_lifecycle_rules");
-                const bool is_write = tool_name == "import_software_lifecycle_rules" ||
-                                      tool_name == "delete_software_lifecycle_rules" ||
-                                      tool_name == "curate_software_alias" ||
-                                      tool_name == "reject_software_curation" ||
-                                      tool_name == "replace_software_normalization_pack";
+                // The write set is built from kWriteToolsRaw, and the boot validator refuses a
+                // non-Read kToolSecurityRows row missing from it (or a Read row in it), so this
+                // cannot disagree with the rows; the name list above is the one hand-kept copy.
+                const bool is_write = catalogue().writes.contains(tool_name);
                 const char* const inv_op = is_write ? "Write" : "Read";
                 if (!tier_allows(tier, "Inventory", inv_op)) {
                     res.set_content(

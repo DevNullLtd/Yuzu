@@ -57800,6 +57800,18 @@ const std::string kSam29Csv =
     "product:postgresql:postgresql,16,end_of_life,2028-11-09,ignored\n"
     "product:postgresql:postgresql,,end_of_support,2027-01-01,ignored\n";
 
+// The CLE fixture of test_software_lifecycle_routes.cpp (ECMA-428 Annex B): two whole-product
+// events and one exact version, which is skipped and counted.
+const std::string kSam29Cle =
+    R"({"$schema":"https://tc54.org/schemas/cle/cle-1.0.0.schema.json",)"
+    R"("identifier":"pkg:npm/example-component","updatedAt":"2021-01-15T00:00:00Z","events":[)"
+    R"({"id":1,"type":"endOfSupport","effective":"2021-01-01T00:00:00Z","published":"2021-01-01T00:00:00Z",)"
+    R"("versions":[{"range":"vers:npm/*"}],"supportId":"standard"},)"
+    R"({"id":2,"type":"endOfLife","effective":"2022-06-30T00:00:00Z","published":"2021-01-01T00:00:00Z",)"
+    R"("versions":[{"range":"vers:npm/*"}],"supportId":"standard"},)"
+    R"({"id":3,"type":"endOfLife","effective":"2023-01-01T00:00:00Z","published":"2021-01-01T00:00:00Z",)"
+    R"("versions":[{"range":"vers:npm/=1.0.0"}],"supportId":"standard"}]})";
+
 // The alias body test_rest_software_curation.cpp curates over a live store.
 const std::string kSam29Alias =
     R"({"ecosystem":"windows","raw_name":"Contoso Studio Standard","raw_publisher":"Contoso Ltd",)"
@@ -58279,7 +58291,57 @@ std::map<std::string, nlohmann::json> sam29_output_schemas(McpTestServer& ts) {
     return schemas;
 }
 
+// One audit row as a sink saw it.
+struct Sam29AuditRow {
+    std::string action_result, target_type, target_id, detail;
+    bool operator==(const Sam29AuditRow&) const = default;
+};
+using Sam29AuditRows = std::vector<Sam29AuditRow>;
+
+// The REST rigs' audit sink: records every row it is handed and accepts it.
+auto sam29_recorder(Sam29AuditRows& rows) {
+    return [&rows](const httplib::Request&, const std::string& action, const std::string& result,
+                   const std::string& target_type, const std::string& target_id,
+                   const std::string& detail) {
+        rows.push_back({action + "|" + result, target_type, target_id, detail});
+        return true;
+    };
+}
+
+Sam29AuditRows sam29_since(const Sam29AuditRows& rows, std::size_t from) {
+    return Sam29AuditRows(rows.begin() + static_cast<std::ptrdiff_t>(from), rows.end());
+}
+
+// The domain rows (the REST verbs) the MCP server recorded from `from` on; the generic mcp.<tool>
+// rows are not domain rows.
+Sam29AuditRows sam29_mcp_domain_rows(const McpTestServer& ts, std::size_t from) {
+    Sam29AuditRows rows;
+    for (std::size_t i = from; i < ts.audit_log.size(); ++i) {
+        if (ts.audit_log[i].starts_with("software_estate.lifecycle_rules.") ||
+            ts.audit_log[i].starts_with("inventory.software.curation."))
+            rows.push_back({ts.audit_log[i], ts.audit_target_types[i], ts.audit_target_ids[i],
+                            ts.audit_details[i]});
+    }
+    return rows;
+}
+
+// One write, two surfaces: the same rows in the same order, each with the same verb, result,
+// target type, target id and detail. The one difference is REST's "; cid=<id>" suffix on a
+// curation `requested` row, which the MCP row never carries.
+void sam29_check_same_audit(const Sam29AuditRows& mcp, Sam29AuditRows rest) {
+    REQUIRE_FALSE(mcp.empty());
+    for (auto& r : rest)
+        if (const auto at = r.detail.find("; cid="); at != std::string::npos)
+            r.detail.erase(at);
+    for (const auto& r : mcp) {
+        INFO(r.action_result << " " << r.detail);
+        CHECK(r.detail.find("cid=") == std::string::npos);
+    }
+    CHECK(mcp == rest);
+}
+
 struct Sam29Lifecycle {
+    Sam29AuditRows rest_audit; // first: outlives the routes that record into it
     yuzu::server::pg::PgPool pool;
     yuzu::server::SoftwareLifecycleStore store{pool};
     yuzu::server::SoftwareLifecycleRoutes routes; // BEFORE the sink that holds handlers capturing it
@@ -58294,9 +58356,7 @@ struct Sam29Lifecycle {
             sink, yuzu::server::SoftwareLifecycleRoutes::Deps{
                       .perm_fn = [](const httplib::Request&, httplib::Response&,
                                     const std::string&, const std::string&) { return true; },
-                      .audit_fn = [](const httplib::Request&, const std::string&,
-                                     const std::string&, const std::string&, const std::string&,
-                                     const std::string&) { return true; },
+                      .audit_fn = sam29_recorder(rest_audit),
                       .store = &store});
         ts.software_lifecycle_store_for_test = &store;
         ts.start();
@@ -58326,6 +58386,7 @@ struct Sam29Lifecycle {
 };
 
 struct Sam29Curation {
+    Sam29AuditRows rest_audit; // first: outlives the routes that record into it
     yuzu::server::pg::PgPool pool;
     yuzu::server::ProductRegistryStore store{pool};
     yuzu::server::SoftwareCurationRoutes routes; // BEFORE the sink that holds handlers capturing it
@@ -58346,9 +58407,7 @@ struct Sam29Curation {
                       },
                       .perm_fn = [](const httplib::Request&, httplib::Response&,
                                     const std::string&, const std::string&) { return true; },
-                      .audit_fn = [](const httplib::Request&, const std::string&,
-                                     const std::string&, const std::string&, const std::string&,
-                                     const std::string&) { return true; },
+                      .audit_fn = sam29_recorder(rest_audit),
                       .registry = &store});
         ts.product_registry_store_for_test = &store;
         ts.start();
@@ -58402,11 +58461,15 @@ TEST_CASE("MCP SAM-29 lifecycle: the payloads equal the REST routes' data, with 
     YUZU_REQUIRE_PG_DB_TPL(db, sam29_lifecycle_tpl);
     Sam29Lifecycle rig{db.dsn()};
 
+    const auto mcp_mark = rig.ts.audit_log.size();
     const auto mcp_import =
         rig.mcp_data("import_software_lifecycle_rules", sam29_import_args().dump());
+    const auto mcp_import_rows = sam29_mcp_domain_rows(rig.ts, mcp_mark);
+    const auto rest_mark = rig.rest_audit.size();
     const auto rest_import = rig.rest_data(
         "POST", kSam29LifecyclePath + "?format=csv&name=rules.csv", kSam29Csv);
     CHECK(mcp_import == rest_import);
+    sam29_check_same_audit(mcp_import_rows, sam29_since(rig.rest_audit, rest_mark));
     CHECK(mcp_import["stored"] == 2);
     CHECK(mcp_import["replaced"] == true);
     CHECK(mcp_import["source_reference"] == "rules.csv");
@@ -58432,15 +58495,42 @@ TEST_CASE("MCP SAM-29 lifecycle: the payloads equal the REST routes' data, with 
     CHECK(rig.mcp_data("list_software_lifecycle_rules", "{}")["count"] == 2);
 
     // The delete answers the count it cleared on both surfaces, then 0.
+    const auto rest_delete_mark = rig.rest_audit.size();
     const auto rest_removed = rig.rest_data("DELETE", kSam29LifecyclePath);
+    const auto rest_delete_rows = sam29_since(rig.rest_audit, rest_delete_mark);
     CHECK(rest_removed == nlohmann::json{{"removed", 2}});
     CHECK(rig.imported().empty());
     rig.mcp_data("import_software_lifecycle_rules", sam29_import_args().dump());
+    const auto mcp_delete_mark = rig.ts.audit_log.size();
     CHECK(rig.mcp_data("delete_software_lifecycle_rules", "{}") == rest_removed);
+    sam29_check_same_audit(sam29_mcp_domain_rows(rig.ts, mcp_delete_mark), rest_delete_rows);
     CHECK(rig.imported().empty());
     CHECK(rig.mcp_data("delete_software_lifecycle_rules", "{}") == nlohmann::json{{"removed", 0}});
     CHECK(mcp_audits(rig.ts, "software_estate.lifecycle_rules.delete|requested") == 2);
     CHECK(mcp_audits(rig.ts, "software_estate.lifecycle_rules.delete|success") == 2);
+}
+
+TEST_CASE("MCP SAM-29 lifecycle: a CLE import answers REST's body, skipped list included",
+          "[mcp][pg][inventory][software]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, sam29_lifecycle_tpl);
+    Sam29Lifecycle rig{db.dsn()};
+    const auto args =
+        nlohmann::json{{"name", "cle.json"}, {"format", "cle"}, {"content", kSam29Cle}}.dump();
+
+    // mcp_data schema-checks the body, the non-empty `skipped` array included.
+    const auto mcp_import = rig.mcp_data("import_software_lifecycle_rules", args);
+    CHECK(mcp_import["format"] == "cle");
+    CHECK(mcp_import["spec_version"] == "1.0.0");
+    CHECK(mcp_import["stored"] == 2);
+    REQUIRE(mcp_import["skipped"].size() == 1);
+    CHECK(mcp_import["skipped"][0]["reason"] == "exact_version");
+    CHECK(mcp_import["skipped"][0]["count"] == 1);
+    CHECK(rig.imported().size() == 2);
+
+    CHECK(mcp_import ==
+          rig.rest_data("POST", kSam29LifecyclePath + "?format=cle&name=cle.json", kSam29Cle));
+    CHECK(rig.mcp_data("list_software_lifecycle_rules", "{}") ==
+          rig.rest_data("GET", kSam29LifecyclePath));
 }
 
 TEST_CASE("MCP SAM-29 lifecycle: a requested row that cannot be stored refuses the write and writes "
@@ -58525,8 +58615,18 @@ TEST_CASE("MCP SAM-29 curation: the reads and the queue equal the REST routes' d
     const auto key = page1["items"][0]["key"].get<std::string>();
     const auto rest_rejected = rig.rest_data(
         "POST", base + "/queue/" + page2["items"][0]["key"].get<std::string>() + "/reject", 200, "");
+    const auto mcp_reject_mark = rig.ts.audit_log.size();
     CHECK(rig.mcp_data("reject_software_curation", nlohmann::json{{"key", key}}.dump()) ==
           rest_rejected);
+    {
+        // The audit rows carry the queue entry, so REST rejects the same entry over a second
+        // clone to compare them row for row.
+        YUZU_REQUIRE_PG_DB_TPL(db_rest, sam29_registry_tpl);
+        Sam29Curation rest_rig{db_rest.dsn()};
+        rest_rig.queue_row("alpha");
+        rest_rig.rest_data("POST", base + "/queue/" + key + "/reject", 200, "");
+        sam29_check_same_audit(sam29_mcp_domain_rows(rig.ts, mcp_reject_mark), rest_rig.rest_audit);
+    }
     CHECK(sam29_audit_index(rig.ts, "inventory.software.curation.reject|requested") >= 0);
     CHECK(sam29_audit_index(rig.ts, "inventory.software.curation.reject|requested") <
           sam29_audit_index(rig.ts, "mcp.reject_software_curation|success"));
@@ -58550,17 +58650,24 @@ TEST_CASE("MCP SAM-29 curation: the writes equal the REST routes' data and error
     const std::string& alias = kSam29Alias;
 
     // The same title curated through both surfaces binds the same product.
+    const auto mcp_alias_mark = rig.ts.audit_log.size();
     const auto mcp_alias = rig.mcp_data("curate_software_alias", alias);
+    const auto mcp_alias_rows = sam29_mcp_domain_rows(rig.ts, mcp_alias_mark);
+    const auto rest_alias_mark = rig.rest_audit.size();
     CHECK(mcp_alias == rig.rest_data("POST", base + "/aliases", 201, alias));
+    sam29_check_same_audit(mcp_alias_rows, sam29_since(rig.rest_audit, rest_alias_mark));
     CHECK(mcp_alias["alias_source"] == "curated:windows");
     CHECK(mcp_alias["alias_key"] == "contoso studio standard");
+    CHECK(sam29_audit_index(rig.ts, "inventory.software.curation.alias|requested") >= 0);
     CHECK(sam29_audit_index(rig.ts, "inventory.software.curation.alias|requested") <
           sam29_audit_index(rig.ts, "mcp.curate_software_alias|success"));
 
     // The pack: replaced, then the same version is refused with REST's 409 text.
     const std::string csv{yuzu::server::kSoftwareNormalizationSeed};
+    const auto mcp_pack_mark = rig.ts.audit_log.size();
     const auto replaced = rig.mcp_data("replace_software_normalization_pack",
                                        nlohmann::json{{"content", csv}}.dump());
+    const auto mcp_pack_rows = sam29_mcp_domain_rows(rig.ts, mcp_pack_mark);
     CHECK(replaced["pack_version"].is_string());
     CHECK(replaced["sha256"].is_string());
     {
@@ -58569,6 +58676,7 @@ TEST_CASE("MCP SAM-29 curation: the writes equal the REST routes' data and error
         YUZU_REQUIRE_PG_DB_TPL(db_rest, sam29_registry_tpl);
         Sam29Curation rest_rig{db_rest.dsn()};
         CHECK(replaced == rest_rig.rest_data("POST", base + "/pack", 200, csv, "text/csv"));
+        sam29_check_same_audit(mcp_pack_rows, rest_rig.rest_audit);
     }
     CHECK(rig.mcp_data("get_software_normalization_status")["pack_version"] ==
           replaced["pack_version"]);
@@ -58618,4 +58726,38 @@ TEST_CASE("MCP SAM-29 curation: a requested row that cannot be stored leaves the
     CHECK(rig.mcp_data("reject_software_curation", nlohmann::json{{"key", key}}.dump()) ==
           nlohmann::json{{"rejected", true}});
     CHECK(rig.mcp_data("get_software_normalization_status")["queue_open"] == 0);
+}
+
+TEST_CASE("MCP SAM-29: a lost generic row on any write serves the result flagged audit_persisted "
+          "false",
+          "[mcp][pg][inventory][software]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_lifecycle, sam29_lifecycle_tpl);
+    Sam29Lifecycle lifecycle{db_lifecycle.dsn()};
+    YUZU_REQUIRE_PG_DB_TPL(db_curation, sam29_registry_tpl);
+    Sam29Curation curation{db_curation.dsn()};
+    curation.queue_row("alpha");
+    const auto key = *yuzu::server::curation_keys::encode_key({"alpha", "", "rpm"});
+
+    // The generic mcp.<tool> row is the only row that fails: the call still lands and is served
+    // with its data, flagged, and the body still satisfies the tool's outputSchema.
+    const auto flagged = [](auto& rig, const std::string& tool, const std::string& args,
+                            const char* data_field) {
+        INFO(tool);
+        rig.ts.audit_fail_action_result_ = "mcp." + tool + "|success";
+        const auto body = rig.mcp_data(tool, args);
+        rig.ts.audit_fail_action_result_.clear();
+        CHECK(body["audit_persisted"] == false);
+        CHECK(body.contains(data_field));
+    };
+    flagged(lifecycle, "import_software_lifecycle_rules", sam29_import_args("flag.csv").dump(),
+            "stored");
+    flagged(lifecycle, "delete_software_lifecycle_rules", "{}", "removed");
+    flagged(curation, "curate_software_alias", kSam29Alias, "alias_key");
+    flagged(curation, "reject_software_curation", nlohmann::json{{"key", key}}.dump(), "rejected");
+    flagged(curation, "replace_software_normalization_pack",
+            nlohmann::json{{"content", std::string{yuzu::server::kSoftwareNormalizationSeed}}}.dump(),
+            "pack_version");
+    // The writes landed.
+    CHECK(lifecycle.imported().empty());
+    CHECK(curation.mcp_data("get_software_normalization_status")["queue_open"] == 0);
 }
