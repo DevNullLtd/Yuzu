@@ -211,7 +211,7 @@ TEST_CASE("capdecls::core_dispatch_capabilities: exactly the five system-initiat
     CHECK(settings->mutability == Mutability::Reversible);
     CHECK(settings->securable == "Inventory");
     CHECK(settings->operation == authz::Operation::Write);
-    CHECK(settings->risk_tier == authz::RiskTier::Low);
+    CHECK(settings->risk_tier == authz::RiskTier::Medium); // the Write floor
     CHECK(settings->system_reserved);
     CHECK(settings->execute_gate == ExecuteGate::None);
 }
