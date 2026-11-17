@@ -5531,7 +5531,7 @@ static const ToolDef kTools[] = {
      R"j("vendor":{"type":"string","minLength":1,"maxLength":256,"description":"Canonical vendor"},)j"
      R"j("product":{"type":"string","minLength":1,"maxLength":256,"description":"Canonical product"},)j"
      R"j("edition":{"type":"string","maxLength":256,"description":"Canonical edition; omit for none"},)j"
-     R"j("category":{"type":"string","enum":["web_server","database","message_broker","runtime","other"],"maxLength":32,"description":"Product category; omit to keep an existing product's"},)j"
+     R"j("category":{"type":"string","enum":["web_server","database","message_broker","runtime","other"],"maxLength":256,"description":"Product category; omit to keep an existing product's"},)j"
      R"j("cpe_product":{"type":"string","maxLength":256,"description":"CPE product token; omit for none"})j"
      R"j(},"required":["ecosystem","raw_name","vendor","product"],"additionalProperties":false})j",
      R"j({"type":"object","properties":{"product_id":{"type":"integer"},"norm_key":{"type":"string"},"alias_source":{"type":"string"},"alias_key":{"type":"string"},"alias_publisher":{"type":"string"},"audit_persisted":{"type":"boolean","description":"Present and false only when an audit row failed to persist"}},"required":["product_id","norm_key","alias_source","alias_key","alias_publisher"]})j"},
@@ -13522,8 +13522,11 @@ McpServer::HandlerFn McpServer::build_handler(
                                   lifecycle_import::kImportMaxBytes == 4194304 &&
                                   kMaxPackBytes == 1048576 && kMaxFieldBytes == 256 &&
                                   kCurationQueueMaxLimit == 500 &&
-                                  curation_keys::kMaxKeyBytes == 2402,
-                              "the SAM-29 tool schemas spell these bounds as literals");
+                                  curation_keys::kMaxKeyBytes == 2402 &&
+                                  kLifecycleImportFormatTokens.size() == 2 &&
+                                  kLifecycleImportFormatTokens[0] == "csv" &&
+                                  kLifecycleImportFormatTokens[1] == "cle",
+                              "the SAM-29 tool schemas spell these bounds and format tokens as literals");
                 static constexpr sra::ArgSpec kLifecycleListArgs[] = {{AT::kString, "source", 0, 16}};
                 static constexpr sra::ArgSpec kImportArgs[] = {
                     {AT::kString, "name", 0, kLifecycleImportNameMaxBytes},
@@ -13540,7 +13543,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     {AT::kString, "vendor", 0, kMaxFieldBytes},
                     {AT::kString, "product", 0, kMaxFieldBytes},
                     {AT::kString, "edition", 0, kMaxFieldBytes},
-                    {AT::kString, "category", 0, 32},
+                    {AT::kString, "category", 0, kMaxFieldBytes},
                     {AT::kString, "cpe_product", 0, kMaxFieldBytes}};
                 // 3204 = base64url of curation_keys::kMaxKeyBytes, rounded up.
                 static constexpr sra::ArgSpec kRejectArgs[] = {{AT::kString, "key", 0, 3204}};

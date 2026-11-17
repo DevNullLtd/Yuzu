@@ -58261,12 +58261,31 @@ yuzu::test::PgTestTemplate sam29_registry_tpl{"prodreg", [](const std::string& d
         throw std::runtime_error("prodreg template: store failed to migrate");
 }};
 
+// The eight outputSchemas as tools/list serves them. A missing schema fails here, never lets
+// schema_violation pass vacuously.
+std::map<std::string, nlohmann::json> sam29_output_schemas(McpTestServer& ts) {
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":7100})");
+    REQUIRE(res != nullptr);
+    std::map<std::string, nlohmann::json> schemas;
+    for (const auto& t : nlohmann::json::parse(res->body)["result"]["tools"]) {
+        const auto name = t["name"].get<std::string>();
+        if (sam29_is_write(name) ||
+            std::ranges::find(kSam29Reads, name) != std::end(kSam29Reads)) {
+            REQUIRE(t["outputSchema"].is_object());
+            schemas[name] = t["outputSchema"];
+        }
+    }
+    REQUIRE(schemas.size() == 8);
+    return schemas;
+}
+
 struct Sam29Lifecycle {
     yuzu::server::pg::PgPool pool;
     yuzu::server::SoftwareLifecycleStore store{pool};
     yuzu::server::SoftwareLifecycleRoutes routes; // BEFORE the sink that holds handlers capturing it
     yuzu::server::test::TestRouteSink sink;
     McpTestServer ts;
+    std::map<std::string, nlohmann::json> schemas;
 
     explicit Sam29Lifecycle(const std::string& dsn)
         : pool(yuzu::server::pg::PgPool::Options{.conninfo = dsn, .size = 2}) {
@@ -58281,12 +58300,15 @@ struct Sam29Lifecycle {
                       .store = &store});
         ts.software_lifecycle_store_for_test = &store;
         ts.start();
+        schemas = sam29_output_schemas(ts);
     }
     nlohmann::json mcp_data(const std::string& tool, const std::string& args) {
         auto body = mcp_tool_call(ts, tool, args);
         INFO(tool << " " << args.substr(0, 200) << " -> " << body.dump().substr(0, 300));
         REQUIRE_FALSE(body.contains("error"));
-        return body["result"]["structuredContent"];
+        const auto& sc = body["result"]["structuredContent"];
+        CHECK(yuzu::test::schema_violation(schemas.at(tool), sc) == "");
+        return sc;
     }
     nlohmann::json rest_data(const std::string& method, const std::string& path,
                              const std::string& body = {}) {
@@ -58309,6 +58331,7 @@ struct Sam29Curation {
     yuzu::server::SoftwareCurationRoutes routes; // BEFORE the sink that holds handlers capturing it
     yuzu::server::test::TestRouteSink sink;
     McpTestServer ts;
+    std::map<std::string, nlohmann::json> schemas;
 
     explicit Sam29Curation(const std::string& dsn)
         : pool(yuzu::server::pg::PgPool::Options{.conninfo = dsn, .size = 4}) {
@@ -58329,12 +58352,15 @@ struct Sam29Curation {
                       .registry = &store});
         ts.product_registry_store_for_test = &store;
         ts.start();
+        schemas = sam29_output_schemas(ts);
     }
     nlohmann::json mcp_data(const std::string& tool, const std::string& args = "{}") {
         auto body = mcp_tool_call(ts, tool, args);
         INFO(tool << " " << args.substr(0, 200) << " -> " << body.dump().substr(0, 300));
         REQUIRE_FALSE(body.contains("error"));
-        return body["result"]["structuredContent"];
+        const auto& sc = body["result"]["structuredContent"];
+        CHECK(yuzu::test::schema_violation(schemas.at(tool), sc) == "");
+        return sc;
     }
     nlohmann::json rest_data(const std::string& method, const std::string& path,
                              int expected_status, const std::string& body = {},
@@ -58405,8 +58431,12 @@ TEST_CASE("MCP SAM-29 lifecycle: the payloads equal the REST routes' data, with 
           rig.rest_data("GET", kSam29LifecyclePath));
     CHECK(rig.mcp_data("list_software_lifecycle_rules", "{}")["count"] == 2);
 
-    // The delete answers the count it cleared, then 0.
-    CHECK(rig.mcp_data("delete_software_lifecycle_rules", "{}") == nlohmann::json{{"removed", 2}});
+    // The delete answers the count it cleared on both surfaces, then 0.
+    const auto rest_removed = rig.rest_data("DELETE", kSam29LifecyclePath);
+    CHECK(rest_removed == nlohmann::json{{"removed", 2}});
+    CHECK(rig.imported().empty());
+    rig.mcp_data("import_software_lifecycle_rules", sam29_import_args().dump());
+    CHECK(rig.mcp_data("delete_software_lifecycle_rules", "{}") == rest_removed);
     CHECK(rig.imported().empty());
     CHECK(rig.mcp_data("delete_software_lifecycle_rules", "{}") == nlohmann::json{{"removed", 0}});
     CHECK(mcp_audits(rig.ts, "software_estate.lifecycle_rules.delete|requested") == 2);
@@ -58446,6 +58476,16 @@ TEST_CASE("MCP SAM-29 lifecycle: a requested row that cannot be stored refuses t
     CHECK(flagged["stored"] == 2);
     CHECK(rig.imported()[0].source_ref == "next.csv");
 
+    // delete's own outcome row lost after the clear landed: served, flagged, store empty.
+    rig.ts.audit_fail_action_result_ = "software_estate.lifecycle_rules.delete|success";
+    const auto lost_outcome = rig.mcp_data("delete_software_lifecycle_rules", "{}");
+    CHECK(lost_outcome["audit_persisted"] == false);
+    CHECK(lost_outcome["removed"] == 2);
+    CHECK(rig.imported().empty());
+    rig.ts.audit_fail_action_result_.clear();
+    rig.mcp_data("import_software_lifecycle_rules", sam29_import_args("again.csv").dump());
+    REQUIRE(rig.imported().size() == 2);
+
     // The generic mcp.<tool> row lost: the same flag.
     rig.ts.audit_fail_action_result_ = "mcp.delete_software_lifecycle_rules|success";
     const auto cleared = rig.mcp_data("delete_software_lifecycle_rules", "{}");
@@ -58483,8 +58523,10 @@ TEST_CASE("MCP SAM-29 curation: the reads and the queue equal the REST routes' d
 
     // Reject through the key: served, audited ahead of the write, then not found, as REST answers.
     const auto key = page1["items"][0]["key"].get<std::string>();
+    const auto rest_rejected = rig.rest_data(
+        "POST", base + "/queue/" + page2["items"][0]["key"].get<std::string>() + "/reject", 200, "");
     CHECK(rig.mcp_data("reject_software_curation", nlohmann::json{{"key", key}}.dump()) ==
-          nlohmann::json{{"rejected", true}});
+          rest_rejected);
     CHECK(sam29_audit_index(rig.ts, "inventory.software.curation.reject|requested") >= 0);
     CHECK(sam29_audit_index(rig.ts, "inventory.software.curation.reject|requested") <
           sam29_audit_index(rig.ts, "mcp.reject_software_curation|success"));
@@ -58521,6 +58563,13 @@ TEST_CASE("MCP SAM-29 curation: the writes equal the REST routes' data and error
                                        nlohmann::json{{"content", csv}}.dump());
     CHECK(replaced["pack_version"].is_string());
     CHECK(replaced["sha256"].is_string());
+    {
+        // One store cannot take the same version twice, so REST replaces the same CSV over a
+        // second clone; the body is content-derived, so equality is exact.
+        YUZU_REQUIRE_PG_DB_TPL(db_rest, sam29_registry_tpl);
+        Sam29Curation rest_rig{db_rest.dsn()};
+        CHECK(replaced == rest_rig.rest_data("POST", base + "/pack", 200, csv, "text/csv"));
+    }
     CHECK(rig.mcp_data("get_software_normalization_status")["pack_version"] ==
           replaced["pack_version"]);
     auto same = mcp_tool_call(rig.ts, "replace_software_normalization_pack",
