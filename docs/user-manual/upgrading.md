@@ -9260,7 +9260,7 @@ Messages to search for (the cookie value is never printed):
 
 - Container, on stderr (`docker logs` shows it): `[gateway-entrypoint] FATAL: YUZU_GW_COOKIE is unset, empty or the published default value. The Erlang distribution cookie is the sole authentication ...`, `... contains a character outside the allowed set [A-Za-z0-9._~+=-] ...`, `... is shorter than 32 characters ...`, `... contains the published default value.`, `... must not start with - or + ...`, `... is longer than 255 characters ...`
 - systemd: `journalctl -u yuzu-gateway` shows the same text prefixed `yuzu-gateway:` (for example `yuzu-gateway: YUZU_GW_COOKIE is shorter than 32 characters, which is brute-forceable offline from a node that dials out. Use e.g. 'openssl rand -hex 32'.`).
-- A start that bypasses the entrypoint and the unit runs the in-VM guard only: `Refusing to start: Erlang distribution cookie is ...` (logger output, after distribution is listening).
+- A start that bypasses the entrypoint and the unit runs the in-VM guard only: `Refusing to start: Erlang distribution cookie is ...` (logger output, after distribution is listening). Under `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` that guard ALSO accepts an empty, short or literal-containing cookie (unlike the entrypoint), with a warning.
 - Image with no entrypoint (`yuzu-gateway-chisel`, or `bin/yuzu_gw` run by hand): no pre-VM check. The node boots with OTP's per-host `~/.erlang.cookie`, and the in-VM guard then refuses it ("shorter than 32 characters"), after distribution is listening. If `$HOME` is unwritable the VM cannot create that file and crash-loops; set a conforming `YUZU_GW_COOKIE`.
 
 **Rollback.** An older image still accepts the published default and short
@@ -9287,9 +9287,11 @@ shipped together as part of gateway multi-node cluster formation:
   needed if you followed the `#659` guidance above verbatim. Only an
   operator who hand-picked a short custom cookie is affected; the
   `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` override (dev/CI only, never production)
-  tolerates a short cookie only in the in-VM guard; the container entrypoint
-  refuses it even with the override, and the systemd unit has no override (see
-  below).
+  tolerates an empty, short, exactly-default or literal-containing cookie in the
+  in-VM guard, which is all that runs on an entrypoint-less start (`docker run
+  --entrypoint`, hand-run `bin/yuzu_gw`, the chisel image); the container
+  entrypoint refuses a short or literal-prefixed cookie even with the override,
+  and the systemd unit has no override (see below).
 - **Node identity change.** The Erlang node short name changed from a
   hardcoded `yuzu_gw1` to a shared `yuzu_gw` — every gateway replica in a
   cluster now advertises the SAME short name, distinguished only by an

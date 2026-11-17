@@ -2165,6 +2165,8 @@ jobs:
 
       - name: Gateway entrypoint cookie refusal test
         timeout-minutes: 2
+        env:
+          YUZU_REQUIRE_ALL_SHELLS: "1"
         run: bash tests/shell/test_gateway_entrypoint_cookie.sh
 
       # Gateway real-wire gate (#5652, #5653): the REAL yuzu-server under test, the REAL gateway

@@ -4245,6 +4245,15 @@ if _bash_test.found()
       suite: 'docs',
       timeout: 60,
     )
+    # Gateway distribution-cookie policy (F24): the real container entrypoint and the real
+    # systemd ExecStartPre string under bash, dash and busybox sh. Exit 77 (skip) when one
+    # of the three shells is missing; CI's own step sets YUZU_REQUIRE_ALL_SHELLS=1.
+    test('gateway cookie policy (entrypoint + ExecStartPre)',
+      _bash_test,
+      args: [files('shell/test_gateway_entrypoint_cookie.sh')],
+      suite: 'docs',
+      timeout: 120,
+    )
     # The yuzu-server package upgrade pre-flight (RPM %pre / deb preinst): runs the
     # real scriptlet text against synthetic /etc trees under YUZU_PKG_ROOT. No built
     # binary, no Postgres, no root, no rpm/dpkg tooling.

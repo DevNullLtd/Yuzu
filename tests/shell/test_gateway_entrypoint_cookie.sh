@@ -28,6 +28,8 @@
 #   G  ALLOW=1 + a bad-charset cookie     -> still refused
 #   E  a strong cookie                    -> started with that exact cookie
 #   F/H loopback / routable advertise     -> dist pinned / not pinned
+#   B  boundaries 31/32/255/256 chars; the literal at offset 0/1/middle/end, with and without the override
+#      (every refusal also asserts the cookie value is never echoed)
 #   U  the systemd ExecStartPre string    -> same verdicts
 #   T  tripwire: the Docker image, .deb and .rpm build files, and the release tarball step, each install
 #      gateway-cookie-policy.sh (the unit needs it)
@@ -56,13 +58,18 @@ for s in "bash" "dash" "busybox sh"; do
 done
 shells="${shells#|}"
 echo "shells under test: $shells"
-# Fail loudly if a shell is missing: a silent bash-only pass is not a test of the busybox/dash
-# behaviour this policy exists for. YUZU_TEST_ALLOW_MISSING_SHELLS=1 opts out (local runs only).
-if [ "${YUZU_TEST_ALLOW_MISSING_SHELLS:-}" != "1" ]; then
-    for want in bash dash "busybox sh"; do
-        case "|$shells|" in *"|$want|"*) ;; *) echo "FAIL shells: '$want' not available (set YUZU_TEST_ALLOW_MISSING_SHELLS=1 to skip locally)"; exit 1 ;; esac
-    done
-fi
+# A missing shell makes this a SKIP (exit 77, which meson reports as skipped): a silent
+# bash-only pass would not test the busybox/dash behaviour this policy exists for.
+# CI sets YUZU_REQUIRE_ALL_SHELLS=1, which turns the skip into a failure.
+for want in bash dash "busybox sh"; do
+    case "|$shells|" in
+        *"|$want|"*) ;;
+        *) if [ "${YUZU_REQUIRE_ALL_SHELLS:-}" = "1" ]; then
+               echo "FAIL shells: '$want' not available"; exit 1
+           fi
+           echo "SKIP: '$want' not available (set YUZU_REQUIRE_ALL_SHELLS=1 to make this a failure)"; exit 77 ;;
+    esac
+done
 
 fail=0
 pass() { echo "PASS $1"; }
@@ -78,8 +85,15 @@ run() {
 refused() { # name shell expected-message-fragment VAR=...
     name="$1"; sh="$2"; msg="$3"; shift 3
     run 127.0.0.1 "$sh" "$@"
-    if [ $rc -ne 0 ] && [ -z "$out" ] && printf '%s' "$err" | grep -qF -- "$msg"; then pass "$name [$sh]"
-    else bad "$name [$sh]" "rc=$rc out=[$out] err=[$err] (wanted: $msg)"; fi
+    leak=""
+    for kv in "$@"; do
+        v="${kv#YUZU_GW_COOKIE=}"
+        # a secret is never echoed back (values under 12 chars are skipped: "short" is a
+        # substring of the message's own word "shorter")
+        [ "$v" != "$kv" ] && [ "${#v}" -ge 12 ] && printf '%s' "$err$out" | grep -qF -- "$v" && leak=1
+    done
+    if [ $rc -ne 0 ] && [ -z "$out" ] && [ -z "$leak" ] && printf '%s' "$err" | grep -qF -- "$msg"; then pass "$name [$sh]"
+    else bad "$name [$sh]" "rc=$rc leak=[$leak] out=[$out] err=[$err] (wanted: $msg)"; fi
 }
 started_with() { # name shell VAR=...  ; prints cookie in $cookie
     name="$1"; sh="$2"; shift 2
@@ -109,6 +123,22 @@ for sh in $shells; do
     long256="$(printf 'k%.0s' $(seq 256))"; long255="$(printf 'k%.0s' $(seq 255))"
     refused M "$sh" "longer than 255" YUZU_GW_COOKIE="$long256"
     if started_with M255 "$sh" YUZU_GW_COOKIE="$long255"; then pass "M255 [$sh]"; else bad "M255 [$sh]" "rc=$rc err=[$err]"; fi
+    b31="$(printf 'k%.0s' $(seq 31))"; b32="$(printf 'k%.0s' $(seq 32))"
+    refused B31 "$sh" "shorter than 32" YUZU_GW_COOKIE="$b31"
+    if started_with B32 "$sh" YUZU_GW_COOKIE="$b32" && [ "$cookie" = "$b32" ]; then pass "B32 [$sh]"; else bad "B32 [$sh]" "rc=$rc err=[$err]"; fi
+    # the published literal at offset 0 / 1 / middle / end of an otherwise strong cookie
+    pad="$(printf 'z%.0s' $(seq 20))"
+    off0="${default}${pad}"; off1="x${default}${pad}"; offm="${pad}${default}${pad}"; offe="${pad}${default}"
+    for lit in off0 off1 offm offe; do
+        eval "lv=\$$lit"
+        refused "LIT-$lit" "$sh" "contains the published default" YUZU_GW_COOKIE="$lv"
+    done
+    refused "LIT-off0-allow" "$sh" "contains the published default" YUZU_GW_ALLOW_DEFAULT_COOKIE=1 YUZU_GW_COOKIE="$off0"
+    for lit in off1 offm offe; do
+        eval "lv=\$$lit"
+        if started_with "LIT-$lit-allow" "$sh" YUZU_GW_ALLOW_DEFAULT_COOKIE=1 YUZU_GW_COOKIE="$lv" && [ "$cookie" = "$lv" ]; then
+            pass "LIT-$lit-allow [$sh]"; else bad "LIT-$lit-allow [$sh]" "cookie=[$cookie] rc=$rc"; fi
+    done
     refused P "$sh" "contains the published default" YUZU_GW_COOKIE="$embedded"
     refused AP-short "$sh" "shorter than 32" YUZU_GW_ALLOW_DEFAULT_COOKIE=1 YUZU_GW_COOKIE=short
     refused AP-prefix "$sh" "contains the published default" YUZU_GW_ALLOW_DEFAULT_COOKIE=1 "YUZU_GW_COOKIE=${default}abcdefgh"
@@ -131,6 +161,7 @@ for sh in $shells; do
 done
 IFS="$OLDIFS"
 
+# (also: no refusal output of the ExecStartPre contains the cookie value; checked in U-leak below)
 # U: the systemd ExecStartPre line, run for real with the installed path pointed at the repo copy.
 unit="$repo/deploy/systemd/yuzu-gateway.service"
 pre="$(grep '^ExecStartPre=' "$unit" | grep -i 'cookie' | head -n1 | sed 's/^ExecStartPre=//')"
@@ -143,6 +174,7 @@ if [ -z "$pre" ]; then bad U "no cookie ExecStartPre in the unit"; else
     unit_run "YUZU_GW_COOKIE=${strong}\\&";           { [ $rc -ne 0 ] && printf '%s' "$out" | grep -qF "outside the allowed"; } && pass "U-amp" || bad U-amp "rc=$rc $out"
     unit_run YUZU_GW_COOKIE="$embedded";              { [ $rc -eq 1 ] && printf '%s' "$out" | grep -qF "contains the published default"; } && pass "U-embedded" || bad U-embedded "rc=$rc $out"
     unit_run YUZU_GW_COOKIE="$(printf 'k%.0s' $(seq 256))"; { [ $rc -eq 1 ] && printf '%s' "$out" | grep -qF "longer than 255"; } && pass "U-long" || bad U-long "rc=$rc $out"
+    leakv="${strong}\\&secretpart"; unit_run "YUZU_GW_COOKIE=$leakv"; { [ $rc -ne 0 ] && ! printf '%s' "$out" | grep -qF -- "$leakv"; } && pass "U-leak" || bad U-leak "rc=$rc $out"
     unit_run YUZU_GW_COOKIE="$strong";                [ $rc -eq 0 ] && pass "U-ok" || bad U-ok "rc=$rc $out"
 fi
 

@@ -25,6 +25,22 @@ vm_args_has_no_published_cookie_test() ->
             ?assertEqual(["-setcookie ${YUZU_GW_COOKIE:-}"], Cookie)
     end.
 
+%% PINNED CURRENT BEHAVIOUR, not an endorsement: with YUZU_GW_ALLOW_DEFAULT_COOKIE=1 the in-VM
+%% guard tolerates an empty, short, exactly-default or literal-containing cookie on a
+%% distributed node (a start that bypasses the container entrypoint: docker run --entrypoint,
+%% bin/yuzu_gw by hand, the chisel image). The entrypoint is stricter (it refuses short and
+%% literal-prefixed cookies under the override). If this test fails, evaluate_cookie changed:
+%% update gateway.md, upgrading.md and the changelog fragment with it.
+in_vm_guard_override_tolerance_is_pinned_test() ->
+    N = 'yuzu_gw@127.0.0.1',
+    [?assertEqual(ok, yuzu_gw_app:evaluate_cookie(N, C, true))
+     || C <- ['', short, yuzu_gw_secret_change_me,
+              'yuzu_gw_secret_change_meabcdefgh',
+              'zzzzzzzzzzzzzzzzzzzzyuzu_gw_secret_change_mezzzzzzzzzzzzzzzzzzzz']],
+    [?assertEqual({error, insecure_distribution_cookie}, yuzu_gw_app:evaluate_cookie(N, C, false))
+     || C <- ['', short, yuzu_gw_secret_change_me,
+              'zzzzzzzzzzzzzzzzzzzzyuzu_gw_secret_change_mezzzzzzzzzzzzzzzzzzzz']].
+
 %% The published value is still refused by the in-VM guard (defence in depth).
 guard_still_refuses_the_published_default_test() ->
     ?assertEqual({error, insecure_distribution_cookie},

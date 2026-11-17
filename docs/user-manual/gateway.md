@@ -3434,10 +3434,15 @@ choose by hand, and the distribution handshake's initiator sends the cookie
 hash first — a short cookie is brute-forceable offline from a
 legitimately-dialing node, a materially different exposure than a hand-typed
 static seed list carried. `openssl rand -hex 32` above already clears this
-floor with room to spare. The in-VM guard still lets the
-`YUZU_GW_ALLOW_DEFAULT_COOKIE=1` override bypass the length check (a start that
-skips the container entrypoint), but the container entrypoint and the systemd
-unit do not: the entrypoint refuses a short cookie even with the override.
+floor with room to spare. The in-VM guard
+(`yuzu_gw_app:evaluate_cookie`) under `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` tolerates
+an **empty, short, exactly-default or literal-containing** cookie on an
+entrypoint-less start (`docker run --entrypoint`, a hand-run `bin/yuzu_gw`, the
+chisel image). The container entrypoint is stricter, and the systemd unit has no
+override: the entrypoint replaces only an empty or exactly-default cookie and
+refuses a short cookie or one that starts with the literal even with the
+override. A unit test pins the in-VM tolerance, so changing it is a visible
+decision.
 
 **Firewall ports for multi-node clustering (HA WS-4 `#4555`).** Alongside
 EPMD (TCP 4369, above), a clustered gateway also needs the Erlang
