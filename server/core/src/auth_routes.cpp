@@ -5746,6 +5746,59 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             res.set_content(detail::a4_denial(res, 401, "unauthorized"), "application/json");
             return;
         }
+        // Re-read eligibility AFTER the elevation has committed (governance g8p4-UP-1), fail
+        // CLOSED. The eligibility revoke flips the flag BEFORE it clears the user's durable
+        // elevations, so either this re-read sees the flipped flag (and this branch rolls the
+        // elevation back), or the flip comes after this re-read, which means the revoke's clear
+        // runs after the elevation committed and ends it. The check before elevate_session
+        // alone leaves a window in which the clear matches no row and the elevation then
+        // commits. No `role.elevation.granted` row is written in either refusal: no grant was
+        // recorded and none stands.
+        if (auto post = db->is_elevation_eligible(session->username); !post || !*post) {
+            auto undo = auth_mgr_.revoke_elevation(token); // same compensation as the audit arm
+            if (!undo) {
+                // The compensating revoke itself failed durably: the elevation is LIVE for an
+                // account that is no longer eligible (or whose eligibility is unreadable).
+                spdlog::critical("elevation for '{}' committed but eligibility {} AND the "
+                                 "compensating revoke FAILED ({}) - elevation is LIVE; manual "
+                                 "revocation required",
+                                 session->username, post ? "was revoked" : "could not be re-read",
+                                 undo.error());
+                audit_log_for_principal(req, "role.elevation.denied", "error", session->username,
+                                        auth::role_to_string(session->role), "User",
+                                        session->username,
+                                        "eligibility recheck after grant failed; "
+                                        "rollback_failed=true");
+                res.status = 500;
+                res.set_content(
+                    detail::error_json_a4(500,
+                                          "elevation could not be rolled back; it may be active - "
+                                          "revoke it manually and check the stores",
+                                          cid, "revoke manually; check the auth + session stores"),
+                    "application/json");
+                return;
+            }
+            audit_log_for_principal(req, "role.elevation.denied", post ? "denied" : "error",
+                                    session->username, auth::role_to_string(session->role), "User",
+                                    session->username,
+                                    post ? "eligibility revoked during elevation"
+                                         : "eligibility read failed after elevation");
+            if (!post) {
+                res.status = 503;
+                res.set_content(detail::error_json_a4(503, "JIT elevation requires the persistent "
+                                                           "auth store",
+                                                      cid, "retry shortly or contact an "
+                                                           "administrator"),
+                                "application/json");
+                return;
+            }
+            res.status = 403;
+            res.set_content(detail::error_json_a4(403, "not authorized to elevate", cid,
+                                                  "ask an administrator to grant you elevation "
+                                                  "eligibility"),
+                            "application/json");
+            return;
+        }
         // `until` may be CLAMPED to the session's own absolute expiry
         // (follow-up B, security review 2026-06-30) — report the TRUE
         // remaining time, not the requested/capped `duration`. A live window
