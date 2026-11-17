@@ -330,18 +330,9 @@ std::vector<AppInfo> get_installed_apps() {
         }
     }
 
-    // Also check Homebrew packages
-    if (command_exists("brew")) {
-        auto brew_out = run_command("brew list --versions 2>/dev/null");
-        std::istringstream ss(brew_out);
-        std::string line;
-        while (std::getline(ss, line)) {
-            auto sp = line.find(' ');
-            if (sp != std::string::npos) {
-                apps.push_back({line.substr(0, sp), line.substr(sp + 1)});
-            }
-        }
-    }
+    // Homebrew is deliberately NOT enumerated here (WP13c/C-2): the agent runs as root and a
+    // Homebrew prefix is owned by the installing user, so exec'ing its `brew` script would run
+    // a user-controlled file as root. Homebrew data is reported by pkg_inventory (no subprocess).
 
     return apps;
 }
@@ -441,20 +432,19 @@ void output_summary(yuzu::CommandContext& ctx, const std::vector<Finding>& findi
 //     (iptables/nft/ufw) — the leg is genuinely wired throughout, but the
 //     firewall check's acquisition method is the worst (least-native) one
 //     actually exercised, so rung 3.
-//   - macOS: get_installed_apps shells out via popen (system_profiler,
-//     optionally brew); run_macos_checks is almost entirely popen
+//   - macOS: get_installed_apps shells out via popen (system_profiler); run_macos_checks is almost entirely popen
 //     (spctl/fdesetup/csrutil/socketfilterfw/systemsetup/defaults) — rung 3.
 const YuzuActionDescriptor kActionDescriptors[] = {
     {
         "scan",
         {YUZU_SUPPORT_SUPPORTED, 3, "popen(pkg-manager+iptables/nft/ufw)", nullptr},
-        {YUZU_SUPPORT_SUPPORTED, 3, "popen(system_profiler/brew+security-checks)", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 3, "popen(system_profiler+security-checks)", nullptr},
         {YUZU_SUPPORT_SUPPORTED, 1, "win32_registry", nullptr},
     },
     {
         "cve_scan",
         {YUZU_SUPPORT_SUPPORTED, 3, "popen(dpkg-query/rpm/pacman/apk)", nullptr},
-        {YUZU_SUPPORT_SUPPORTED, 3, "popen(system_profiler/brew)", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 3, "popen(system_profiler)", nullptr},
         {YUZU_SUPPORT_SUPPORTED, 1, "win32_registry", nullptr},
     },
     {
@@ -466,13 +456,13 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     {
         "summary",
         {YUZU_SUPPORT_SUPPORTED, 3, "popen(pkg-manager+iptables/nft/ufw)", nullptr},
-        {YUZU_SUPPORT_SUPPORTED, 3, "popen(system_profiler/brew+security-checks)", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 3, "popen(system_profiler+security-checks)", nullptr},
         {YUZU_SUPPORT_SUPPORTED, 1, "win32_registry", nullptr},
     },
     {
         "inventory",
         {YUZU_SUPPORT_SUPPORTED, 3, "popen(dpkg-query/rpm/pacman/apk)", nullptr},
-        {YUZU_SUPPORT_SUPPORTED, 3, "popen(system_profiler/brew)", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 3, "popen(system_profiler)", nullptr},
         {YUZU_SUPPORT_SUPPORTED, 1, "win32_registry", nullptr},
     },
 };

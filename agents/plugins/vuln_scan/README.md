@@ -23,7 +23,7 @@ flowchart LR
   OP["Operator or workflow"] --> SRV["Server: authz Security.Read, or Inventory.Read for inventory"]
   SRV -- "gRPC mTLS" --> HOST["Agent plugin host"] --> EX["vuln_scan.execute"]
   EX --> WIN["Windows leg: registry reads"]
-  EX --> MAC["macOS leg: system_profiler, brew, system commands"]
+  EX --> MAC["macOS leg: system_profiler, system commands"]
   EX --> LIN["Linux leg: package manager, /proc, sshd_config, firewall tools"]
   WIN --> ROWS["Pipe-delimited rows, result status UNDECLARED"]
   MAC --> ROWS
@@ -35,7 +35,7 @@ flowchart LR
 
 | Question | Action | What you get |
 |---|---|---|
-| Which known-bad versions of a short list of common products are installed? | `cve_scan` | Windows: from the registry Uninstall lists (machine-wide, 32-bit, and the agent account's own). macOS: apps from `system_profiler` plus the packages `brew list --versions` reports (formulae, and casks if present). Linux: packages from the first package manager found (`dpkg-query`, else `rpm`, else `pacman`, else `apk`). |
+| Which known-bad versions of a short list of common products are installed? | `cve_scan` | Windows: from the registry Uninstall lists (machine-wide, 32-bit, and the agent account's own). macOS: apps from `system_profiler` only; Homebrew formulae and casks are not scanned (see `pkg_inventory.packages`). Linux: packages from the first package manager found (`dpkg-query`, else `rpm`, else `pacman`, else `apk`). |
 | Is this host's basic hardening in place? | `config_scan` | A fixed per-OS list of checks, listed below. Every check that ran is reported, passing ones as `INFO`. |
 | Both of the above in one call | `scan` | CVE rows, then configuration rows. |
 | How bad is it at a glance? | `summary` | `TOTAL` first, then a count for each of `CRITICAL`, `HIGH`, `MEDIUM`, `LOW`, `INFO`, `UNREADABLE`. `UNREADABLE` and `INFO` are not issues. |
@@ -89,10 +89,10 @@ flowchart LR
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
 | `config_scan` | ✅ supported · rung 1 · win32_registry | ✅ supported · rung 3 · popen(spctl/fdesetup/csrutil/socketfilterfw) | ✅ supported · rung 3 · popen(iptables/nft/ufw)+procfs |
-| `cve_scan` | ✅ supported · rung 1 · win32_registry | ✅ supported · rung 3 · popen(system_profiler/brew) | ✅ supported · rung 3 · popen(dpkg-query/rpm/pacman/apk) |
-| `inventory` | ✅ supported · rung 1 · win32_registry | ✅ supported · rung 3 · popen(system_profiler/brew) | ✅ supported · rung 3 · popen(dpkg-query/rpm/pacman/apk) |
-| `scan` | ✅ supported · rung 1 · win32_registry | ✅ supported · rung 3 · popen(system_profiler/brew+security-checks) | ✅ supported · rung 3 · popen(pkg-manager+iptables/nft/ufw) |
-| `summary` | ✅ supported · rung 1 · win32_registry | ✅ supported · rung 3 · popen(system_profiler/brew+security-checks) | ✅ supported · rung 3 · popen(pkg-manager+iptables/nft/ufw) |
+| `cve_scan` | ✅ supported · rung 1 · win32_registry | ✅ supported · rung 3 · popen(system_profiler) | ✅ supported · rung 3 · popen(dpkg-query/rpm/pacman/apk) |
+| `inventory` | ✅ supported · rung 1 · win32_registry | ✅ supported · rung 3 · popen(system_profiler) | ✅ supported · rung 3 · popen(dpkg-query/rpm/pacman/apk) |
+| `scan` | ✅ supported · rung 1 · win32_registry | ✅ supported · rung 3 · popen(system_profiler+security-checks) | ✅ supported · rung 3 · popen(pkg-manager+iptables/nft/ufw) |
+| `summary` | ✅ supported · rung 1 · win32_registry | ✅ supported · rung 3 · popen(system_profiler+security-checks) | ✅ supported · rung 3 · popen(pkg-manager+iptables/nft/ufw) |
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
@@ -103,7 +103,7 @@ flowchart LR
 | macOS | agent daemon; the shipped LaunchDaemon runs as root today (`docs/agent-privilege-model.md`) | `systemsetup -getremotelogin` needs administrator rights (root has them). No other grant. No row for this plugin | 2026-09-07, bare metal, as an unprivileged user (euid 501), not as root | not observed for a denial; a failed command returns empty or error text, which each check parses as its negative or disabled branch (Remote Login reads `Enabled` when `systemsetup` is refused) |
 | Linux | agent daemon, dedicated unprivileged account by design (`docs/agent-privilege-model.md`) | None for the package list, `/proc` or world-readable files. `iptables`, `nft` and `ufw status` normally need root or `CAP_NET_ADMIN`; a mode-0600 `sshd_config` (the RHEL-family default) needs read access. No row for this plugin | 2026-09-06, container, euid 0 | a failed file read is `UNREADABLE` (both SSH checks on a 0600 `sshd_config`); a failed firewall command returns empty output, read as "no firewall rules detected" |
 
-Windows uses no subprocess: software enumeration and every Windows check are in-process registry calls. Linux and macOS run commands through `popen` and `system()` with fixed strings and no caller input: Linux `dpkg-query`, `rpm`, `pacman`, `apk` (the first one present), `iptables`, `nft`, `ufw`, `ss` or `netstat`; macOS `system_profiler`, `brew` when installed, `spctl`, `fdesetup`, `csrutil`, `socketfilterfw`, `systemsetup`, `defaults`. There is no network access; the firewall and listener commands read local state only.
+Windows uses no subprocess: software enumeration and every Windows check are in-process registry calls. Linux and macOS run commands through `popen` and `system()` with fixed strings and no caller input: Linux `dpkg-query`, `rpm`, `pacman`, `apk` (the first one present), `iptables`, `nft`, `ufw`, `ss` or `netstat`; macOS `system_profiler`, `spctl`, `fdesetup`, `csrutil`, `socketfilterfw`, `systemsetup`, `defaults`. There is no network access; the firewall and listener commands read local state only.
 
 ## Data contract
 
@@ -180,7 +180,7 @@ A Linux config check whose file read fails (EACCES, EIO, ...) emits `UNREADABLE|
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 20c66f1c0618
+**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash bf3f25896c30
 
 ```
 == action=scan
@@ -252,7 +252,7 @@ Defraggler|2.22
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 20c66f1c0618
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash bf3f25896c30
 
 ```
 == action=scan
@@ -306,7 +306,7 @@ Find My|4.0
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash 20c66f1c0618
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash bf3f25896c30
 
 ```
 == action=scan
@@ -379,6 +379,6 @@ bsdutils|1:2.41.5-0+deb13u1
 - Plugin: `agents/plugins/vuln_scan/src/config_checks.hpp` · `agents/plugins/vuln_scan/src/cve_rules.hpp` · `agents/plugins/vuln_scan/src/vuln_scan_plugin.cpp`
 - Definitions: `content/definitions/vuln_scan.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_a.hpp`
-- Tests: none found by name
+- Tests: `tests/test_vuln_scan_no_brew_lexical.py`
 - Privilege row: `docs/agent-privilege-model.md` (no row yet)
 <!-- END GENERATED -->
