@@ -815,7 +815,7 @@ TEST_CASE("process_introspect a zombie stat state is neither read nor emitted",
           "[process_introspect]") {
     // A labelled fixture, not a real zombie: parse_stat never reads the state token, so a stat
     // line carrying Z answers exactly as one carrying S (supported, target row first, no state
-    // field). Pinned pending issue #8068; what a real zombie's /proc files do is the Linux lane
+    // field). Pinned pending issue #8068; what a real zombie's /proc files do is a Linux host
     // probe, not this test.
     for (Facet f : kAll) {
         INFO(facet_name(f));

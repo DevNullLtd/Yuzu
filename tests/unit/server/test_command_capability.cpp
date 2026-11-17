@@ -167,6 +167,24 @@ TEST_CASE("CommandCapabilityRegistry: too many sources throws rather than silent
         std::invalid_argument);
 }
 
+TEST_CASE("CommandCapabilityRegistry: exactly kMaxSources sources construct and the last one "
+          "still classifies",
+          "[server][dispatch][capability]") {
+    // The acceptance side of the ceiling: a cutoff below kMaxSources would pass the 49-source
+    // rejection case above, so pin that the final slot is usable. 47 empty sources, then one
+    // populated source in slot 48.
+    static_assert(CommandCapabilityRegistry::kMaxSources == 48,
+                 "this test hardcodes 48 literal sources (kMaxSources); update the literal "
+                 "list below if kMaxSources changes");
+    const auto e = std::span<const CommandCapability>{};
+    const auto s = std::span<const CommandCapability>(kFragmentAlpha);
+    CommandCapabilityRegistry registry({e, e, e, e, e, e, e, e, e, e, e, e, e, e, e, e,
+                                        e, e, e, e, e, e, e, e, e, e, e, e, e, e, e, e,
+                                        e, e, e, e, e, e, e, e, e, e, e, e, e, e, e, s});
+    auto result = registry.classify("echo", "collect_inventory");
+    REQUIRE(result.has_value());
+}
+
 // ── core_dispatch_capabilities() ─────────────────────────────────────────
 
 TEST_CASE("capdecls::core_dispatch_capabilities: exactly the four system-initiated dispatches, "

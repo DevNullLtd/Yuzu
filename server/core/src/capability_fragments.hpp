@@ -16,6 +16,7 @@
 #include <array>
 #include <tuple>
 
+#include "command_capability.hpp"
 #include "capability_decls/core_dispatch_capabilities.hpp"
 #include "capability_decls/plugin_action_catalogue_a.hpp"
 #include "capability_decls/plugin_action_catalogue_app_control.hpp"
