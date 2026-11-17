@@ -1169,6 +1169,90 @@ slow scenarios (`CH-19`, the process-tree kill, about 2.5 minutes; `CH-23`, sign
 about 35 s) and the rest of the harness are not in CI yet; wiring them into a nightly job,
 and hardening them for the shared-identity runner pools, is #6116.
 
+## Release build environment and provenance (S12)
+
+This states how a release is built today, as checked against `release.yml` on
+2026-11-17. It describes the pipeline; it is not a certification.
+
+**Trigger.** `release.yml` runs on a `v*` tag push or a `workflow_dispatch` on
+a tag ref. Anyone with write access can push such a tag: the repository has
+branch rulesets for `dev` and `main` but no tag ruleset, and nothing checks
+that the tagged commit is on `main`. The `release-guard` job refuses a non-tag
+ref, a malformed tag and a tag that already has a published release
+(see [Release re-publish guard](#release-re-publish-guard-release-guard-5282)).
+
+**Where each job runs.**
+
+| Job | Runner |
+|---|---|
+| `release-guard`, `release` (assembles, checksums and signs the release), `docker-publish-agent-bundle` | GitHub-hosted `ubuntu-24.04` (fresh VM per job) |
+| `build-linux`, `build-gateway`, `docker-publish`, `docker-publish-postgres`, `docker-publish-chisel` | self-hosted `yuzu-bigtam-linux` (Big Tam) |
+| `build-windows` | self-hosted `yuzu-weetam-windows` (Wee Tam) |
+| `build-macos` | self-hosted `yuzu-bigmags-macos` (BigMags) |
+
+The self-hosted runners are persistent (not ephemeral or just-in-time; #1595
+tracks that for Windows) and are the same runner agents that run `ci.yml`,
+`nightly.yml`, `sanitizer-tests.yml` and `codeql.yml` (table below). `ci.yml`
+runs on every pull request to `dev` or `main` from a branch in this
+repository, so code from any write-access branch executes on the hosts that
+later build a release. On Big Tam and Wee Tam the four runner agents of a pool
+share one OS account. Fork pull requests do not run there unless a maintainer
+approves a revision through `trusted-fork-ci.yml`, which isolates its caches
+([Trusted fork pull-request CI](#trusted-fork-pull-request-ci)).
+
+**State that persists into a release build.** Release builds reuse local state
+left by earlier jobs on the same host; none of it comes from the GitHub
+Actions cache service.
+
+- ccache, on all three build platforms, in the same directory the CI jobs on
+  that runner use: per runner agent on Big Tam (each agent has its own
+  `HOME`, [`deploy/linux/`](../deploy/linux/README.md)), one machine-wide
+  `CCACHE_DIR` shared by all four agents on Wee Tam
+  ([`deploy/windows/`](../deploy/windows/README.md)), and the runner's
+  ccache on BigMags.
+- `build-linux` checks out with `clean: false` and deletes only `build-linux/`,
+  so `vcpkg_installed/` survives in the workspace between jobs (validated by
+  the [vcpkg sentinel](#universal-vcpkg-cache-key-contract)). `build-windows`
+  and `build-macos` check out clean and reinstall `vcpkg_installed/`, from
+  vcpkg's default binary cache for the runner account (Windows) or from
+  `runner.tool_cache/yuzu-vcpkg-binary-cache-macos`, which the `ci.yml` macOS
+  leg also fills (macOS).
+- The image jobs read and write a BuildKit layer cache under
+  `runner.tool_cache/yuzu-docker-buildcache/`. Base images are pinned by
+  digest.
+
+**Provenance and signing.**
+
+- Every build job runs `actions/attest-build-provenance` on its own artifacts,
+  inside the same job as the build steps, with `id-token: write` granted to
+  the whole job. Each release asset also gets its provenance bundle as
+  `<asset>.intoto.jsonl`.
+- Every published image is cosign-signed keyless by digest and attested
+  (`push-to-registry: true`). BuildKit's own provenance is turned off
+  (`provenance: false`) in favour of those.
+- `SHA256SUMS` lists every asset, is cosign-signed keyless in the hosted
+  `release` job and is verified there against the exact tag-bound
+  `release.yml` identity before the release is created.
+- Per-platform and per-image CycloneDX and SPDX SBOMs are generated with syft.
+- Authenticode and Apple signing and notarization run only when their
+  secrets are set, and skip silently otherwise. On 2026-11-17 none of
+  `WINDOWS_SIGNING_CERT`, `MACOS_SIGNING_CERT` or the notarization secrets
+  exist in the repository, so the Windows and macOS installers ship unsigned
+  (#239; S7 makes a stable release refuse instead of skipping, held until
+  the secrets exist). Update this bullet when S7 lands.
+
+**SLSA Build level.** Provenance is generated and signed through GitHub's
+attestation service from the workflow's OIDC identity, and the build runs on
+CI infrastructure rather than a developer machine. That is roughly SLSA Build
+L2, and L2 is the most that should be claimed. The pipeline does not meet L3:
+the runners are persistent and shared with CI that runs code from any
+write-access branch; release builds consume caches (ccache, vcpkg, BuildKit,
+the Linux workspace) that those jobs can write; and the build steps run in
+the job that holds the OIDC token used to sign the provenance, so they could
+mint an attestation themselves. Reaching L3 means isolated ephemeral runners
+for release builds with no shared caches, and provenance generated outside
+the build job (for example a reusable workflow on GitHub-hosted runners).
+
 ## Self-hosted runner topology
 
 | Runner | Host | Jobs |
