@@ -176,12 +176,12 @@ public:
     /// the ceiling had zero headroom again, and process_introspect's fragment
     /// made the 33rd. The constructor threw and the server could not start. No
     /// compile caught it, because an overflow is a runtime throw. It surfaced
-    /// only on the branch's first Linux server run (the server is Linux-only,
+    /// only on the first Linux server run of that change (the server is Linux-only,
     /// ADR-0035). 48 restores real headroom, and capability_fragments.hpp now
     /// static_asserts that the production composition leaves at least two slots
-    /// free. The next fragment, or two overlapping PRs off one dev tip (the
-    /// pattern behind both earlier raises), therefore fails the build before it
-    /// can fail a boot.
+    /// free, so a composition of 47 or more sources (for example two overlapping
+    /// PRs off one dev tip, the pattern behind both earlier raises) fails the
+    /// build before it can fail a boot.
     static constexpr std::size_t kMaxSources = 48;
 
     explicit CommandCapabilityRegistry(

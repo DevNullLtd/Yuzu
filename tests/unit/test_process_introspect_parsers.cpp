@@ -217,7 +217,7 @@ const std::string kRealLimits = join_lines({
     "Max realtime timeout      unlimited            unlimited            us        ",
 });
 
-// REAL CAPTURE: the /proc lines of /proc/self/mountinfo in the lane's private mount namespace.
+// REAL CAPTURE: the /proc lines of /proc/self/mountinfo in the capture host's private mount namespace.
 // Two nested proc mounts, neither with hidepid; the last one is the one that counts.
 const std::string kRealMountinfo = join_lines({
     "431 413 0:61 / /proc rw,nosuid,nodev,noexec,noatime - proc proc rw",
