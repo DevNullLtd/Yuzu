@@ -54,7 +54,7 @@ struct MachoBuildVersion {
 struct MachoSlice {
     std::uint64_t offset{0};
     std::uint64_t size{0};
-    std::optional<ParseError> error; // set: the fields below the header may be unset
+    std::optional<ParseError> error; // set: only offset, size, byte_order, cpu_type, cpu_subtype are valid (the fat_arch entry); the rest keep defaults
     bool is64{false};
     std::endian byte_order{std::endian::little};
     std::uint32_t cpu_type{0};

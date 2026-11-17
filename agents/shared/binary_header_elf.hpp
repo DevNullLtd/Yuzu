@@ -107,7 +107,7 @@ template <std::unsigned_integral T>
 }
 
 [[nodiscard]] constexpr std::uint64_t align_up(std::uint64_t v, std::uint64_t a) noexcept {
-    return (v + a - 1) / a * a; // callers pass v < 2^17 and a in {4, 8}
+    return (v + a - 1) / a * a; // v is bounded by the note segment (below 2^17 at the default limit); a in {4, 8}
 }
 
 [[nodiscard]] inline std::string to_hex(std::string_view bytes) {
