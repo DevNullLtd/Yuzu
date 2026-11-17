@@ -570,7 +570,7 @@ TEST_CASE("http_client download: only a complete 2xx body is acceptable", "[shar
     status500.final_status = 500;
     CHECK(hc::download_failure(status500) == "download failed: HTTP 500");
     auto redirect = good_obs(10);
-    redirect.final_status = 302; // 3xx used to count as success
+    redirect.final_status = 302; // a 3xx is not a successful download
     CHECK_FALSE(hc::download_failure(redirect).empty());
 
     auto conn = good_obs(10);

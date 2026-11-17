@@ -213,6 +213,7 @@ httplib::Result run_pinned(const ParsedUrl& parsed, const std::string& ip, int r
                            std::chrono::seconds total_timeout, bool& https_unsupported,
                            Fn&& request) {
     const auto setup = [&](auto& cli) {
+        cli.set_decompress(false); // no transparent decompression of an untrusted body
         cli.set_hostname_addr_map({{parsed.host, ip}});
         cli.set_connection_timeout(30);
         cli.set_read_timeout(read_timeout_s);

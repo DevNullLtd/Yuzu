@@ -129,7 +129,7 @@ TEST_CASE("destination guard: an unresolvable name fails closed", "[outbound_des
 TEST_CASE("destination guard: numeric spellings the resolver accepts are refused at create",
           "[outbound_destination_guard][security]") {
     // Each of these is 169.254.169.254 (or 0.0.0.0) to the OS resolver but not a canonical dotted
-    // quad: create used to answer 201 and delivery then declined it forever.
+    // quad: accepting one at create would store a target delivery can only decline.
     for (const char* u : {"http://2852039166/", "http://0xa9fea9fe/", "http://0251.0376.0251.0376/",
                           "http://0/", "http://0.0/", "http://0x0/", "http://2852039166:8080/x",
                           "https://0xA9.0xFE.0xA9.0xFE/p", "http://169.254.43518/"}) {
