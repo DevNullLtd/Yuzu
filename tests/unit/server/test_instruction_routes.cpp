@@ -50,6 +50,10 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <chrono>
+#include <future>
+#include <memory>
+#include <thread>
 #include <cctype>
 #include <filesystem>
 #include <fstream>
@@ -2270,40 +2274,84 @@ TEST_CASE("instruction_routes: DELETE notes the containing packs on the success 
 
 // WP05 (F13/F14): the editor fragment substitutes in ONE pass over the original template;
 // stored field text containing a placeholder token must stay literal and escaped.
-TEST_CASE("instruction_routes: editor render keeps placeholder tokens in stored fields literal",
-          "[server][routes][instruction_routes][xss]") {
-    extern const char* const kInstructionEditorHtml;
+extern const char* const kInstructionEditorHtml;
+
+namespace {
+using instruction::render_instruction_editor;
+
+InstructionDefinition editor_def() {
     InstructionDefinition d;
-    d.id = "{{DEF_NAME}}";
-    d.name = "{{DEF_DESCRIPTION}}";
-    d.version = "{{SEL_CC_OTHER_OPTION}}";
-    d.plugin = "{{DEF_PLUGIN}}"; // its own key: the old loop never terminated
-    d.action = "{{YAML_SOURCE}}";
-    d.description = "{{DEF_DESCRIPTION}}";
-    d.platforms = "{{TITLE}}";
-    d.yaml_source = "{{YAML_SOURCE}} {{SEL_CC_OTHER_OPTION}}";
     d.type = "question";
     d.approval_mode = "auto";
     d.concurrency_mode = "unlimited";
-    const auto html = instruction::render_instruction_editor(kInstructionEditorHtml, &d);
-    for (const char* tok : {"{{DEF_NAME}}", "{{DEF_DESCRIPTION}}", "{{SEL_CC_OTHER_OPTION}}",
-                            "{{DEF_PLUGIN}}", "{{YAML_SOURCE}}", "{{TITLE}}"})
-        CHECK(html.find(tok) != std::string::npos);
-    // No fifth option was injected for a recognised mode.
-    CHECK(html.find("unrecognized, not enforced") == std::string::npos);
+    return d;
+}
+
+// Render on a worker with a bounded wait so a regression to a non-terminating loop FAILS the
+// test rather than hanging the binary. On timeout the worker is detached (it cannot be
+// cancelled) and keeps spinning until process exit; it owns copies of its inputs so detaching
+// is memory-safe. Only reachable when the code under test is already broken.
+std::optional<std::string> render_bounded(const InstructionDefinition& d) {
+    auto task = std::make_shared<std::packaged_task<std::string()>>(
+        [def = d] { return render_instruction_editor(kInstructionEditorHtml, &def); });
+    auto fut = task->get_future();
+    std::thread([task] { (*task)(); }).detach();
+    if (fut.wait_for(std::chrono::seconds(10)) != std::future_status::ready)
+        return std::nullopt;
+    return fut.get();
+}
+} // namespace
+
+TEST_CASE("instruction_routes: editor render cannot re-expand the fifth-option slot (F13)",
+          "[server][routes][instruction_routes][xss]") {
+    auto d = editor_def();
+    d.name = "{{SEL_CC_OTHER_OPTION}}"; // smuggled slot token in a stored field
+    d.concurrency_mode = "a onfocus=alert(1) autofocus x";
+    const auto html = render_instruction_editor(kInstructionEditorHtml, &d);
+    // The smuggled token stays literal inside the name input's value attribute.
+    CHECK(html.find("name=\"name\" value=\"{{SEL_CC_OTHER_OPTION}}\"") != std::string::npos);
+    // It was NOT expanded to markup inside any value="...".
+    CHECK(html.find("value=\"<option") == std::string::npos);
+    // The one real fifth option sits at the template's own slot, value in a quoted attribute.
+    const std::string opt = "<option value=\"a onfocus=alert(1) autofocus x\" selected>";
+    CHECK(html.find(opt) != std::string::npos);
+    CHECK(html.find(opt) == html.rfind(opt));
+    CHECK(html.find(opt) > html.find("value=\"per-set\""));
+}
+
+TEST_CASE("instruction_routes: editor render shows each stored placeholder literally, "
+          "anchored to its own slot (F13/F14)",
+          "[server][routes][instruction_routes][xss]") {
+    auto d = editor_def();
+    d.id = "{{DEF_NAME}}";
+    d.name = "{{DEF_DESCRIPTION}}";
+    d.version = "{{DEF_PLATFORMS}}";
+    d.plugin = "{{DEF_PLUGIN}}"; // its own key
+    d.action = "{{YAML_SOURCE}}";
+    d.description = "{{DEF_DESCRIPTION}}"; // its own key
+    d.platforms = "{{TITLE}}";
+    d.yaml_source = "{{YAML_SOURCE}} {{SEL_CC_OTHER_OPTION}}";
+    const auto html = render_bounded(d);
+    REQUIRE(html.has_value());
+    CHECK(html->find("name=\"id\" value=\"{{DEF_NAME}}\"") != std::string::npos);
+    CHECK(html->find("name=\"name\" value=\"{{DEF_DESCRIPTION}}\"") != std::string::npos);
+    CHECK(html->find("name=\"version\" value=\"{{DEF_PLATFORMS}}\"") != std::string::npos);
+    CHECK(html->find("name=\"plugin\" value=\"{{DEF_PLUGIN}}\"") != std::string::npos);
+    CHECK(html->find("name=\"action\" value=\"{{YAML_SOURCE}}\"") != std::string::npos);
+    CHECK(html->find("name=\"description\" value=\"{{DEF_DESCRIPTION}}\"") != std::string::npos);
+    CHECK(html->find("name=\"platforms\" value=\"{{TITLE}}\"") != std::string::npos);
+    CHECK(html->find(">{{YAML_SOURCE}} {{SEL_CC_OTHER_OPTION}}</textarea>") != std::string::npos);
+    CHECK(html->find("unrecognized, not enforced") == std::string::npos);
 }
 
 TEST_CASE("instruction_routes: editor render escapes markup in every stored field",
           "[server][routes][instruction_routes][xss]") {
-    extern const char* const kInstructionEditorHtml;
     const std::string x = "<script>alert(1)</script>\"onfocus=x autofocus";
-    InstructionDefinition d;
+    auto d = editor_def();
     d.id = d.name = d.version = d.plugin = d.action = d.description = d.platforms = x;
     d.yaml_source = x;
-    d.type = "question";
-    d.approval_mode = "auto";
-    d.concurrency_mode = x; // free-form, lands in the fifth <option>
-    const auto html = instruction::render_instruction_editor(kInstructionEditorHtml, &d);
+    d.concurrency_mode = x;
+    const auto html = render_instruction_editor(kInstructionEditorHtml, &d);
     CHECK(html.find("<script>alert(1)") == std::string::npos);
     CHECK(html.find("\"onfocus=x") == std::string::npos);
     CHECK(html.find("&lt;script&gt;") != std::string::npos);
@@ -2312,8 +2360,27 @@ TEST_CASE("instruction_routes: editor render escapes markup in every stored fiel
 
 TEST_CASE("instruction_routes: editor render for a new definition fills defaults",
           "[server][routes][instruction_routes][xss]") {
-    extern const char* const kInstructionEditorHtml;
-    const auto html = instruction::render_instruction_editor(kInstructionEditorHtml, nullptr);
+    const auto html = render_instruction_editor(kInstructionEditorHtml, nullptr);
     CHECK(html.find("New Definition") != std::string::npos);
     CHECK(html.find("{{") == std::string::npos);
+}
+
+TEST_CASE("instruction_routes: editor render template edge cases",
+          "[server][routes][instruction_routes][xss]") {
+    auto d = editor_def();
+    d.name = "N";
+    d.version = "V";
+    CHECK(render_instruction_editor("", &d).empty());
+    CHECK(render_instruction_editor("plain", &d) == "plain");
+    CHECK(render_instruction_editor("a {{DEF_NAME", &d) == "a {{DEF_NAME");   // unterminated
+    CHECK(render_instruction_editor("a {{ b", nullptr) == "a {{ b");
+    CHECK(render_instruction_editor("{{DEF_NAME}}{{DEF_VERSION}}", &d) == "NV"); // adjacent
+    CHECK(render_instruction_editor("{{NOPE}}", &d) == "{{NOPE}}");            // unknown
+    CHECK(render_instruction_editor("{{}}", &d) == "{{}}");
+    // `{{{X}}}}`: the first "{{" opens a token named "{X" closed by the first "}}"; the key is
+    // unknown so it stays literal, and the trailing "}}" is plain text.
+    CHECK(render_instruction_editor("{{{DEF_NAME}}}}", &d) == "{{{DEF_NAME}}}}");
+    // Value containing a token is not rescanned.
+    d.name = "{{DEF_VERSION}}";
+    CHECK(render_instruction_editor("{{DEF_NAME}}", &d) == "{{DEF_VERSION}}");
 }
