@@ -1834,6 +1834,87 @@ Five REST v1 reads over the typed installed-software store, all `Inventory:Read`
 
 The MCP twins of the five routes are not part of this change (#7765).
 
+### 2026-11-16 — delivery of the collection settings to agents (`__sync__.settings`)
+
+This closes the hard requirement of the 2026-11-05 Update: the stored settings now reach the agent and change
+what it does. No proto field is added; the document and its version are entries in the command's existing string
+`parameters` map. The server is built and deployed first, then the agents; the contract below is the only one, and
+neither end carries handling for a peer that predates it.
+
+- **Delivery.** The heartbeat is the only trigger; there is no push when a document is saved and no background
+  job. The agent reports `yuzu.inv_settings_version` (the applied version, or the literal `none`) in its status
+  tags. The server accepts only that shape (`none` or 64 lower-case hex), resolves the effective settings for the
+  agent and, when the versions differ, sends one command. A `none` agent whose effective settings are the built-in
+  fleet default is left alone. The server's copy of the stored settings (documents, group tree, kill switches) is
+  re-read when older than 60 seconds (`kSnapshotTtlSecs`); an agent's group membership when older than 600 seconds
+  (`kMembershipTtlSecs`); the same version is not sent to one agent again inside 300 seconds
+  (`kMinRepushGapSecs`), while a changed version is sent at once. All server state is in memory and rebuilt from
+  heartbeats, so a restart loses nothing.
+- **The command.** Plugin `__sync__`, action `settings`, parameters `version` and `document`. The command id is
+  `__sync__-settings-<epoch seconds>-<16 hex characters>`. It is a system-reserved push (the Guardian-push shape:
+  `build_classified_command` with the system caller, `send_system_reserved`, then `forward_gateway_pending`), not
+  a `dispatch_confined` dispatch, because `__sync__` is a protocol name and no agent advertises it as a plugin.
+  No RBAC principal is consulted and the containment gate is bypassed like the other system-reserved pushes; it
+  is counted as `yuzu_server_system_reserved_push_total{capability="__sync__.settings"}`, the fifth member of that
+  closed set.
+- **The document.** Text, every line ended by `\n`, in exactly this order: `v1`; `interval=<seconds>`;
+  `window=<start_min>-<end_min>` or `window=none`; `tz=<IANA name or empty>`; then one
+  `plugin.<name>=0|1` line per collector in ascending name order. The version is the SHA-256 of that text
+  (lower-case hex). It is the effective version of the 2026-11-05 Update, so the server resolves, renders and
+  hashes in one place and the agent recomputes the hash over what it received. Two golden vectors are asserted in
+  both the server and the agent suites: every collector on with a one-day interval, no window and no zone
+  (`666dcf4bcd68fb46f953c27319ea5711cb71023ead925bcd1531a1510f329431`), and the same document with
+  `plugin.installed_apps=0` (`99e0dc3e698549c6cb149543982d0753c6401cbbd5408c29c060d767b3724561`), so a drift on
+  either side fails a test on that side.
+- **Registered apps and the kill switch.** The resolved document keeps `installed_apps` on unless that collector
+  is kill-switched, and the server alone does that: the agent applies every `plugin.<name>` value as sent and
+  adds no override, so a kill switch stops collection on the machine while the agent reports the version it
+  really applied.
+- **Agent refusals.** The agent applies nothing and answers FAILURE exit 2 with a reason when: a parameter is
+  missing; the document is over 4096 bytes, empty or not newline-terminated; the version is not 64 lower-case hex
+  characters; the first four lines are not `v1`, `interval=`, `window=` and `tz=` in place; the interval is not a
+  plain integer from 3600 to 604800; a window is not `<start>-<end>` with `0 <= start < end <= 1440`, or is set
+  with an interval that is not a whole number of days; the zone is over 64 bytes or has a character outside
+  letters, digits, `_`, `/`, `+` and `-`; a plugin line is malformed, has an invalid name, a value other than 0 or
+  1, is repeated or is out of order; one of the six collectors the server can switch has no line; or the version
+  is not the SHA-256 of the document. Names the agent does not know are accepted and stored. It answers FAILURE
+  exit 1, also changing nothing, when a KV write fails. Otherwise SUCCESS `applied|<version>`. Whether daily sync
+  is running is not a refusal: with no scheduler (`--inventory-disable`, or the scheduler of a new connection is
+  not yet published) a valid document is still persisted, held and reported in the version tag, and a scheduler
+  started later runs on it, so the server does not send it again.
+- **Persistence and restart.** The agent writes the document to the `__sync__` KV key `settings.document` and
+  then the version to `settings.version`, and only then makes the settings live. A crash between the two writes
+  leaves a pair whose hash does not match. At start-up the pair is read back and validated exactly like a live
+  command: a valid pair is applied before the scheduler exists, so the first tick already runs on it; an absent
+  pair is the default; an invalid pair is discarded, the tag reads `none` and the server sends the document
+  again. A KV failure leaves the previous settings live. A reconnect keeps the applied settings.
+- **Application.** The scheduler takes the interval and window for the `installed_software` source through
+  `apply_settings`, drained on its own thread. It never forces a sync; when the interval or window changes and a
+  fire is still ahead, that fire is re-placed to the agent's own next slot, and a fire already due is left to go.
+  A windowed source with an interval over a day is placed at the window slot of the day one interval after a
+  clean sync. A collector switched off is not dispatched and not served from the cooldown cache and writes the
+  `disabled` section with the token `switched_off`; a collector that is on but not loaded stays `not_collected`.
+  The `hardware` driver facet has no switch.
+- **Time zone.** A named zone is stored and sent, but the window runs in the machine's own local time; the agent
+  does no zone conversion and reports `yuzu.inv_settings_tz=machine_local` when a zone was sent. Zone conversion
+  is deferred.
+- **Failure handling, server.** A degraded read of the stored documents, the group tree, the kill switches, the
+  agent's groups or the resolve sends nothing for that heartbeat and is counted in
+  `yuzu_server_inventory_settings_push_degrade_total{reason}` (`snapshot`, `membership`, `resolve`); the previous
+  snapshot keeps serving, and a failed refresh is retried after the TTL, not on every heartbeat. A kill-switch read
+  that fails is a degrade, never every collector off. A send the registry did not accept is
+  `yuzu_server_inventory_settings_push_total{result="undelivered"}` and its claim stamp is kept, so it is retried
+  after the re-push gap; `sent` for a gateway agent is a queue, not a delivery. The reconcile hook runs under a
+  shared lock in the heartbeat handler, and an exception from it is caught there, logged and counted in
+  `yuzu_server_inventory_settings_reconcile_exceptions_total`; heartbeat ingestion carries on. A suppressed
+  repeat is `result="suppressed"`. The hook runs synchronously on the heartbeat thread, as the quarantine hook
+  does: one heartbeat per 60 seconds refreshes the snapshot (single flight, each read bounded by the store's
+  acquire timeout), and a failed membership read is not retried for any agent for 60 seconds
+  (`kMembershipRetrySecs`), so a degraded pool costs one acquire timeout per gap, not one per heartbeat.
+- **Not in this change.** Push on save, a settings command for any source but `installed_software`, per-OS
+  withheld collectors, carrying a per-OS or per-action kill switch (only the plugin-wide switch is carried,
+  which is the one the effective-settings route shows), and zone conversion on the agent.
+
 ## Routed-concern invariants
 
 Moved verbatim from the `Agent daily-sync framework` row of `.claude/routed-concerns.md` on 2026-11-12, when that always-loaded row was compressed to its catastrophic clauses plus a pointer here. This text is the authoritative long form of that row.

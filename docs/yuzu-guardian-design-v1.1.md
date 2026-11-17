@@ -998,11 +998,28 @@ fresh, and apply it by arrival, flagged, once the clock is stale; order two unpa
 the census ordering key. A lower pair is a regression candidate, not proof of order: it is
 refused and flagged, and the receiver re-bases to it only after the stale window. A server
 that does not compare the pair ignores it and keeps ordering by the census ordering key.
-The server stores and counts the pair before it compares it (schema v5, section 9); until the
-comparator ships (the UP-14 entry in `docs/spark-flip-gate.md` records the stage), the
-verdict decision is the census ordering key alone. The server change owns the comparator and
-the recovery path for a pinned or lost epoch. Acceptance list for the server change: see the
-UP-14 entry in `docs/spark-flip-gate.md` and issue #5690.
+The server stores and counts the pair on the event and census rows and in the per-agent order
+row (schema v5, section 9), and decides the census verdict by it as the regime rule says. The
+agent's pair clock is fresh for one hour (database time) after an event of a higher epoch, or of
+a higher sequence in the live epoch, or a re-base, last advanced it. While it is fresh a lower
+epoch, a same-epoch lower sequence, an equal pair and an unpaired event against a paired verdict
+are refused and flag the row; once it is stale an event of a lower epoch, or of the live epoch
+with a sequence not above the highest seen, re-bases the clock and is applied by arrival, flagged
+(an equal pair is still refused as a duplicate), and a re-base to a lower epoch retires the former
+epoch so that its late events are refused (the fence is one slot and permanent: it ignores the
+clock's freshness, and a second re-base to a lower epoch replaces it). An unpaired event against a
+paired verdict, once the clock is stale, is applied by arrival, flagged, and does not move the
+clock. The two transitions between the regimes run in opposite directions and are fenced
+differently. Pair to key is fenced by the hold (fresh clock) and applies by arrival once the clock
+is stale. Key to pair is not fenced by the clock or by arrival: a paired event whose mode is a
+current-epoch one applies over a census row that holds no pair whatever the unpaired verdict's key
+or arrival, flagged (only a regression or a retired-epoch event is refused over it), so a late
+repair of an older paired event can replace a newer unpaired verdict. A pair far above any honest one (`emit_seq` of 2^40 or more, or a
+`boot_epoch` over ten years past receipt) is dropped at ingest like an out-of-range one and the
+event is judged as an unpaired event. The server owns the comparison and the recovery path for a pinned or lost epoch; the
+operator reading is in `docs/user-manual/guaranteed-state.md`, "Running the pair regime".
+Acceptance list for the server change: see the UP-14 entry in `docs/spark-flip-gate.md` and
+issue #5690.
 
 Known limits of the boot epoch:
 
@@ -1016,7 +1033,7 @@ Known limits of the boot epoch:
   with `instance_lock=contended` or `failed`) and emits unordered 0/0 events instead of
   colliding with the holder. The lock guards only the epoch claim, not the rest of the data
   directory. Limits:
-  - an agent build that predates the lock does not take it, and it is a same-host guard;
+  - it is a same-host guard;
   - the 5 s wait is shorter than the agent's worst-case shutdown, so a restart that overlaps a
     slow teardown runs unordered until its next restart;
   - on Linux and macOS a lock file removed or replaced after the claim is not detected (it
@@ -1026,7 +1043,7 @@ Known limits of the boot epoch:
     reported as `contended` with `native_error=32`;
   - a local principal that can open the file before the agent starts can hold it (POSIX: lock
     it; Windows: keep it open) and leave the agent at 0/0 for that process lifetime (accepted:
-    the result is ordering by the census ordering key alone, as before the feature, and the agent logs `contended`; on POSIX
+    the result is an unordered agent, not a wrong verdict: the server decides its events as unpaired events by the regime rule above, it shows in `unordered_agents`, and the agent logs `contended`; on POSIX
     the requested mode 0600 limits this to the agent's account and root unless the mode was
     changed or the file already existed with a looser one; on Windows it depends on the data
     directory ACL, which was not measured);
@@ -1046,9 +1063,11 @@ Known limits of the boot epoch:
   boot, so no claim runs.
 - An agent whose epoch claim fails (no store, a read or write failure, a store that reports a
   `PRAGMA synchronous` level below FULL (outcome `durability_below_full`, not expected for the
-  agent's own store, which sets FULL at open; an unreadable pragma is `read_failed`), a clock reading at or above the 2^62 ceiling, or the data-directory lock not held (`instance_lock_not_held`)) sends the pair as 0/0 for the whole process lifetime, ordered by
-  the census ordering key. Today this is visible only as an error-level `Guardian boot_epoch claim` log
-  line.
+  agent's own store, which sets FULL at open; an unreadable pragma is `read_failed`), a clock reading at or above the 2^62 ceiling, or the data-directory lock not held (`instance_lock_not_held`)) sends the pair as 0/0 for the whole process lifetime, and the server decides its
+  events as unpaired events by the regime rule above. This is visible as an error-level
+  `Guardian boot_epoch claim` log line on the agent and, on the server, in `unordered_agents` (an
+  agent whose first deliveries all fail the per-agent order step is the one exception, see the
+  Guaranteed State guide, "Running the pair regime").
 - Events replayed from the lifecycle journal carry 0/0, so a replayed event is not
   byte-identical to its live original in fields 24 and 25.
 - The pair is agent-asserted and not authenticated: a local administrator or a compromised
@@ -1322,9 +1341,9 @@ census write failed stays stored with `projection_pending`, and a redelivery of 
 stored ordering inputs. `order_uncertain` is sticky and disclosed on every read. Schema v5 (UP-14) stores the
 event's `(boot_epoch, emit_seq)` pair on the event row and the census row (NULL when
 unpaired), adds the per-agent table `guardian_agent_order`, and rejects a half-set or
-out-of-range pair at ingest as unpaired, counted; the pair so stored does not yet decide a
-verdict (see section 7.1). A census-bearing first delivery locks the agent's order row first, in its own
-savepoint (a repair runs no such step and takes no order row). Under one `census_upsert`
+out-of-range or implausible pair at ingest as unpaired, counted; the census
+verdict is decided by the pair so stored (see section 7.1). A census-bearing first delivery locks the agent's order row first, in its own
+savepoint (a repair runs no such step: it takes the order row `FOR SHARE` to read the pair clock and never writes the clock or a counter). Under one `census_upsert`
 savepoint a writer then locks every pending event of the pair in `ingest_seq` order in one
 statement, then the census row; `delete_rule` locks the rule's pending events the same way before it retires them and deletes the rule. The
 event-row waits of single-event ingest, repair and `delete_rule` are acyclic; the batch path (no production

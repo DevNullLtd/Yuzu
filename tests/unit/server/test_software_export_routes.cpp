@@ -134,7 +134,7 @@ struct Harness {
     // `global_cap` is the budget's server-wide cap (the --max-sse-streams side); `concurrency` is the
     // export cap (--inventory-export-concurrency). `wire_budget` false leaves Deps::stream_budget null.
     explicit Harness(int concurrency = 2, bool wire_reads = true, bool wire_budget = true,
-                     std::size_t global_cap = 64)
+                     std::size_t global_cap = 64, swe::Limits limits = {})
         : budget(sb::StreamBudget::Config{global_cap}) {
         SoftwareExportRoutes::Deps deps;
         deps.fleet_read_fn = [this](const httplib::Request&, httplib::Response& res,
@@ -166,6 +166,7 @@ struct Harness {
         deps.metrics = &metrics;
         deps.stream_budget = wire_budget ? &budget : nullptr;
         deps.concurrency = concurrency;
+        deps.limits = limits;
         if (wire_reads) {
             auto& r = deps.reads;
             r.installs = [this](const SoftwareFleetQuery& q)
@@ -874,6 +875,66 @@ TEST_CASE("export route: the wall-clock deadline aborts the transfer and frees t
     auto next = h.get("?format=jsonl");
     REQUIRE(next);
     CHECK(next->status == 200);
+}
+
+TEST_CASE("export route: the row limit cuts the stream before the page that would pass it, in both "
+          "formats, and the metric says limit",
+          "[software_export][routes][limit]") {
+    for (const char* format : {"jsonl", "csv"}) {
+        DYNAMIC_SECTION(format) {
+            Harness h(/*concurrency=*/1, true, true, 64,
+                      {.max_rows = swe::kMinMaxRows, .max_bytes = swe::kDefaultMaxBytes});
+            h.generated = 3'500;
+            auto res = h.get(std::string("?format=") + format);
+            REQUIRE(res);
+            const auto cut = drive(*res);
+            CHECK(cut.aborted); // cut: no terminating chunk
+            const auto lines = lines_of(cut.body);
+            // One full page of 1,000 rows (+ the CSV header), never a row of the second.
+            CHECK(lines.size() == 1'000 + (std::string(format) == "csv" ? 1u : 0u));
+            CHECK(h.held() == 1);
+            release(*res, false);
+            CHECK(h.count(format, "limit") == 1);
+            CHECK(h.count(format, "completed") == 0);
+            CHECK(h.held() == 0);
+        }
+    }
+}
+
+TEST_CASE("export route: the byte limit cuts the stream and never lets the body pass it, in both "
+          "formats",
+          "[software_export][routes][limit]") {
+    for (const char* format : {"jsonl", "csv"}) {
+        DYNAMIC_SECTION(format) {
+            Harness h(/*concurrency=*/1, true, true, 64,
+                      {.max_rows = swe::kDefaultMaxRows, .max_bytes = swe::kMinMaxBytes});
+            h.generated = 30'000; // far more than 1 MiB of rows
+            auto res = h.get(std::string("?format=") + format);
+            REQUIRE(res);
+            const auto cut = drive(*res);
+            CHECK(cut.aborted);
+            CHECK(cut.body.size() <= static_cast<std::size_t>(swe::kMinMaxBytes));
+            CHECK(cut.body.size() > 0); // at least one page fitted
+            release(*res, false);
+            CHECK(h.count(format, "limit") == 1);
+        }
+    }
+}
+
+TEST_CASE("export route: a result inside both limits still ends cleanly and counts completed",
+          "[software_export][routes][limit]") {
+    Harness h(/*concurrency=*/1, true, true, 64,
+              {.max_rows = swe::kMinMaxRows, .max_bytes = swe::kDefaultMaxBytes});
+    h.generated = 1'000; // exactly the row limit: allowed (a cap is a maximum, not a threshold)
+    auto res = h.get("?format=jsonl");
+    REQUIRE(res);
+    const auto cut = drive(*res);
+    CHECK(cut.done);
+    CHECK_FALSE(cut.aborted);
+    CHECK(lines_of(cut.body).size() == 1'000);
+    release(*res, true);
+    CHECK(h.count("jsonl", "completed") == 1);
+    CHECK(h.count("jsonl", "limit") == 0);
 }
 
 TEST_CASE("export route: a client that goes away frees the lease",
