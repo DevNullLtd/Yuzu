@@ -3,7 +3,10 @@
  * establishment moved off the engine's per-type lock in #2012/#3840 PR-B2).
  *
  * Windows: one IOCP + one worker thread multiplexing ReadDirectoryChangesW
- * across every watched PARENT DIRECTORY — O(mechanism), never O(rules). Two
+ * across every watched PARENT DIRECTORY — O(mechanism) threads, never O(rules);
+ * since #5719 item 5 the steady state also costs one short-lived detached
+ * verification thread per watched directory per verify interval (O(watched
+ * directories), see the verification block below). Two
  * file sparks in the same directory share one ReadDirectoryChangesW
  * registration; a raw directory notification is routed back to the matching
  * spark key(s) by changed filename. IOCP (not WaitForMultipleObjects) is
@@ -119,10 +122,13 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <cassert>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <cwctype>
 #include <filesystem>
 #include <functional> // #2839 retire fault hook
@@ -201,6 +207,50 @@ constexpr unsigned kFileWorkerInertAfterFailures = 3;
 
 constexpr std::size_t kProbeLaneCap = 16; ///< concurrent detached discovery-probe workers
 
+/// How often an idle, healthy watch re-opens its directory path to confirm the
+/// path still names the directory its handle was opened on (#5719 item 5). A
+/// SAMPLED check: a rename is noticed up to one interval late (at up to a few hundred
+/// watched directories; beyond that the lag grows with the directory count,
+/// docs/spark-flip-gate.md, cost item), and a rename away
+/// and back between two samples is not noticed at all (nothing was lost). Not a
+/// measured value; the test control FileMechanismTestControls::
+/// path_verify_interval overrides it.
+constexpr std::chrono::milliseconds kFilePathVerifyInterval{5'000};
+/// Concurrent detached verification workers. A separate lane from the discovery
+/// probes so a verification can neither consume a probe slot nor be counted as
+/// a probe; the same F3 counter covers both.
+constexpr std::size_t kVerifyLaneCap = 4;
+/// Consecutive harvested verification results of "could not decide" after which
+/// the watch is reported faulted. Only a RESULT counts: a refused launch, a launch
+/// failure and a verification that never returns are not results (a hung one
+/// leaves the watch unverified and is not covered). A directory that stays
+/// unverifiable but openable re-faults about every (this many intervals + the
+/// ordinary retry), and that retry doubles from 30 s to its 300 s cap across repeated
+/// losses with no decided (Same) verify between them and no failed re-establishment or
+/// shelter commit in between (DirWatch::lost_flaps; the exact scope is in the banner).
+/// "In a row" means no DECIDED result (Same) and no re-establishment in between; it is
+/// NOT time-bounded: results separated by refused launches or by a long quiet stretch
+/// still add up. Every open error other than not-found counts, including resource
+/// exhaustion (handle or memory pressure), so after this many such results a watch whose
+/// handle may still be working is cancelled and dropped and re-established on the ordinary
+/// retry (30 s, doubling to a 300 s cap on repeated failure); excluding resource errors
+/// from the streak is tracked in #7874.
+constexpr unsigned kVerifyUnverifiableFaultStreak = 3;
+/// A due verification that has not been LAUNCHED for this many path_verify_interval()s is
+/// counted (verify_starved) and warned once per episode. Observation only: no fault, no
+/// verdict. Scales with the interval control, so it needs no seam of its own.
+constexpr unsigned kVerifyStarvedIntervals = 3;
+/// Ceiling on DirWatch::lost_flaps (the 300 s retry cap is reached well before it).
+constexpr unsigned kMaxLostFlaps = 8;
+/// How long a lost path may wait for its cancelled read's completion before the
+/// wait is counted and warned once (an observation, not an escalation: the sweep
+/// keeps re-cancelling, and a drained completion still recovers the watch).
+constexpr std::chrono::milliseconds kPathLostStuckDeadline{30'000};
+/// The two fault reasons of a watch whose path stopped naming its directory.
+/// Literals with static storage: DirWatch::fault_reason holds the pointer.
+constexpr const char* kReasonPathLost = "file watch parent directory renamed or replaced";
+constexpr const char* kReasonUnverifiable = "file watch parent directory unverifiable";
+
 // The caller wait budget is the only one of the five that a Guardian control-path
 // caller can be made to wait through under the per-type lock; it must sit inside
 // Guardian's backend_op deadline. Mirrors spark_registry.cpp's identical check.
@@ -258,6 +308,37 @@ enum class ProbeState : std::uint8_t {
 
 enum class WatchMode : std::uint8_t { Target, Ancestor };
 
+/// Identity of the directory a handle was opened on: volume serial number plus
+/// the 128-bit file id (GetFileInformationByHandleEx FileIdInfo). `valid` is
+/// false when the filesystem gave no usable id (the call failed, or the id is all
+/// zero); a watch whose identity is not valid is never verified. Plain scalars,
+/// so copying it can never throw.
+struct DirIdentity {
+    std::uint64_t volume{0};
+    std::array<std::uint8_t, 16> file{};
+    bool valid{false};
+    [[nodiscard]] bool same_as(const DirIdentity& o) const noexcept {
+        return valid && o.valid && volume == o.volume && file == o.file;
+    }
+};
+
+/// Read the identity of the object `h` is open on. On failure `valid` is false
+/// and `err` is the Win32 error; on success `err` is untouched.
+[[nodiscard]] DirIdentity read_dir_identity(HANDLE h, DWORD& err) noexcept {
+    DirIdentity id;
+    FILE_ID_INFO info{};
+    if (!::GetFileInformationByHandleEx(h, FileIdInfo, &info, sizeof(info))) {
+        err = ::GetLastError();
+        return id;
+    }
+    id.volume = info.VolumeSerialNumber;
+    std::memcpy(id.file.data(), info.FileId.Identifier, id.file.size());
+    id.valid = std::any_of(id.file.begin(), id.file.end(), [](std::uint8_t b) { return b != 0; });
+    if (!id.valid)
+        err = ERROR_NOT_SUPPORTED; // an all-zero id names nothing
+    return id;
+}
+
 /// What one detached discovery probe produced. Every OS resource it opened is
 /// owned here (RAII) so a discarded result closes itself on whichever thread
 /// drops it — never under mu_ by construction of the call sites. The handle is
@@ -276,8 +357,18 @@ struct FileProbeResult {
     bool ok{false};
     DWORD err{0};
     const char* stage{""}; ///< which step failed, for the log / fault reason
+    DirIdentity id;        ///< Target mode: identity of `handle`'s directory (valid=false when the
+                           ///< filesystem gave none). A verification result: identity of whatever
+                           ///< the path named when it was re-opened. An `ok` Target result whose
+                           ///< identity is not valid carries the failed identity read in
+                           ///< `err`/`stage` (diagnostic only: `ok` still decides the commit).
 };
 static_assert(std::is_nothrow_move_constructible_v<FileProbeResult>);
+
+/// Stage name a verification result carries when re-opening the path failed, so
+/// the owner can tell "the path names nothing" (a lost watch) from "the identity
+/// could not be read" (undecided).
+constexpr std::string_view kVerifyOpenStage = "CreateFileW(verify)";
 
 /// The detached discovery probe: try to open `dir` as a directory; on genuine
 /// absence, walk up for the nearest existing, openable ancestor. Run on a
@@ -289,6 +380,13 @@ struct FileProbeJob {
                       ///< always starts from the ORIGINAL target, never the current shelter)
     std::shared_ptr<const std::function<void(std::wstring_view)>> hook; ///< test seam; may be null
     std::chrono::milliseconds traversal_budget{kFileProbeTraversalBudget};
+    /// Identity re-check of an established watch (#5719 item 5): open `dir`, read
+    /// the identity of what it names, close the handle HERE on the worker, and
+    /// return. No ancestor walk, no probe_hook, no handle in the result.
+    bool verify_only{false};
+    /// Test seam for a verification (a null shared_ptr in production): returns 0
+    /// to run the real check, or a Win32 error to fail the open step with. May park.
+    std::shared_ptr<const std::function<DWORD(std::wstring_view)>> verify_hook;
 
     static bool open_dir(const std::wstring& path, DirHandle& out, DWORD& err) {
         DirHandle h(::CreateFileW(
@@ -326,7 +424,28 @@ struct FileProbeJob {
         return 1;
     }
 
+    FileProbeResult verify() const {
+        FileProbeResult r;
+        r.mode = WatchMode::Target;
+        DirHandle h;
+        DWORD err = 0;
+        if (verify_hook && *verify_hook)
+            err = (*verify_hook)(dir);
+        if (err != 0 || !open_dir(dir, h, err)) {
+            r.err = err;
+            r.stage = kVerifyOpenStage.data();
+            return r;
+        }
+        r.id = read_dir_identity(h.get(), err);
+        r.ok = r.id.valid;
+        r.err = r.ok ? 0 : err;
+        r.stage = r.ok ? "" : "FileIdInfo(verify)";
+        return r; // `h` closes here, on this worker, before the result is published
+    }
+
     FileProbeResult operator()() {
+        if (verify_only)
+            return verify();
         FileProbeResult r;
         if (hook && *hook)
             (*hook)(dir); // test seam: may park (a hung/unresponsive path) or throw
@@ -336,6 +455,12 @@ struct FileProbeJob {
         if (cls == 1) {
             DirHandle h;
             if (open_dir(dir, h, err)) {
+                DWORD id_err = 0;
+                r.id = read_dir_identity(h.get(), id_err); // from the exact handle that is returned
+                if (!r.id.valid) { // diagnostic only (the attach logs it); `ok` still commits
+                    r.err = id_err;
+                    r.stage = "FileIdInfo(target)";
+                }
                 r.handle = std::move(h);
                 r.resolved_dir = dir;
                 r.mode = WatchMode::Target;
@@ -432,6 +557,13 @@ struct KeyBinding {
     }
 };
 
+/// A never-reused watch identity. The test-control completion stash names a watch by this,
+/// never by address: an address can be freed and reused, an id cannot.
+inline std::uint64_t next_watch_id() noexcept {
+    static std::atomic<std::uint64_t> counter{0};
+    return counter.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
 /// One watched directory: its overlapped read, its buffer, and (for a real
 /// dir) the set of spark keys interested in each (lower-cased) filename
 /// inside it. Heap-owned and kept alive until its outstanding I/O drains —
@@ -440,6 +572,7 @@ struct KeyBinding {
 /// by whichever code eventually reaps it (run()'s own drop_watch(), or
 /// stop()'s reap loop) — touched only for its OS handles from that point on.
 struct DirWatch {
+    const std::uint64_t id{next_watch_id()}; ///< stash identity only (see next_watch_id)
     DirHandle handle;               ///< CreateFileW(FILE_LIST_DIRECTORY, OVERLAPPED), IOCP-associated
     OVERLAPPED ov{};                ///< distinct per dir — the IOCP key back to this struct
     alignas(DWORD) std::byte buf[32 * 1024]; ///< FILE_NOTIFY_INFORMATION landing buffer
@@ -540,6 +673,56 @@ struct DirWatch {
     SparkCoverage coverage{SparkCoverage::None};
     Clock::time_point coverage_at{};
     bool coverage_report_due{false};
+
+    // Directory-identity verification (#5719 item 5). Real directories in Target
+    // mode only: an ancestor shelter entry is never verified. A watch
+    // whose directory was renamed or replaced keeps a healthy-looking read
+    // outstanding on a handle that follows the OLD directory; nothing completes
+    // and nothing faults. The owner therefore re-opens the PATH periodically on
+    // a detached worker and compares identities. SAMPLED, not continuous: see
+    // kFilePathVerifyInterval. Plain scalars (attach_dir_locked's identity write,
+    // the verification bookkeeping) except verify_call, whose reset cannot throw;
+    // mark_path_lost_locked stamps its scalars first and stages the health edge
+    // (check_health_edge_locked, which allocates and can throw) last.
+    DirIdentity dir_id;                  ///< identity `handle` was opened on; valid=false => never verified
+    std::optional<DetachedCall<FileProbeResult>> verify_call; ///< engaged once a verify launch is published
+    std::uint64_t verify_gen{0};         ///< mechanism-global gen stamped at staging and at every commit
+    Clock::time_point last_verify_at{};  ///< the RETRY clock: restamped at staging and at harvest, so a
+                                         ///< failure to stage is never a hot retry loop; a launch that
+                                         ///< never started (LaunchFailed) moves it back to retry after
+                                         ///< the admission seed. NOT the age of the last decided verify
+    Clock::time_point verified_at{};     ///< AGE: stamped at commit and at a harvested Same only (never
+                                         ///< at Unverifiable or a restamp); orders the admission queue
+    Clock::time_point verify_wait_since{}; ///< first pass this watch was due and not launched; {} = idle
+    /// That wait passed kVerifyStarvedIntervals (counted + warned once per episode). The flag is
+    /// cleared only at a decided Same or at a commit: an episode that ends Unverifiable does not
+    /// re-arm the warn or the count until the next Same or commit. The warn is per WATCH (a
+    /// pinned lane or a post-resume queue can emit one per queued watch in a single pass) and
+    /// the count is a debug counter, not exported (stated residual, no standing gauge).
+    bool verify_starved{false};
+    /// Path-loss damping (#5719 item 5). A loss is a FLAP when this watch was just
+    /// re-established from a path-loss fault and no verify has decided Same since that commit.
+    /// The run is lost_flaps = 0 at the first loss, 1 at the second: it counts REPEATS, and it
+    /// is restarted (the next loss is a first loss, 30 s) by the routes listed in the banner.
+    unsigned lost_flaps{0};              ///< repeat flaps (capped); seeds backend_attempts at the loss
+    /// The last commit re-established a path-lost watch. Read at commit_probe_locked from the
+    /// fault_reason stamped at detection: a re-establishment that failed first
+    /// (fail_backend_locked overwrites fault_reason) or a retry that committed Ancestor shelter
+    /// mode (health cleared there) leaves this false at the eventual commit, which restarts the
+    /// damping run. Under-damps only.
+    bool after_loss_commit{false};
+    bool verified_since_commit{false};   ///< a verify decided Same since the last commit
+    /// Verification found the path no longer names this watch's directory. The
+    /// watch is already faulted (desired + reported) and its read has been
+    /// cancelled; the handle and buffer stay owned here until that read's
+    /// completion is consumed, which then hands the watch to the ordinary retry.
+    /// The primary clear is process_completion_locked()'s drain; commit_probe_locked()
+    /// also clears it (the failed-completion unwind route resets the handle without
+    /// clearing it, so the later probe commit does).
+    bool path_lost{false};
+    Clock::time_point path_lost_since{}; ///< stamped by mark_path_lost_locked
+    bool path_lost_stuck_warned{false};  ///< the stuck-drain observation was already made
+    unsigned unverifiable_streak{0};     ///< consecutive harvested could-not-decide results
 };
 
 /// Everything one pass wants to do OUTSIDE mu_: launches, dispatch, and the
@@ -552,6 +735,11 @@ struct FilePassWork {
         std::optional<FileProbeJob> job;
         DetachedLaunch status{DetachedLaunch::LaunchFailed};
         std::optional<DetachedCall<FileProbeResult>> call;
+        /// An identity verification (launched on verify_lane_, `gen` is the
+        /// watch's verify_gen), not a discovery probe. Deliberately the LAST
+        /// member: every discovery staging site aggregate-initialises the first
+        /// five positionally.
+        bool verify{false};
     };
     struct Notice {
         enum class Kind : std::uint8_t { Emit, Fault } kind{Kind::Emit};
@@ -665,7 +853,7 @@ public:
     static constexpr std::size_t kRetiringCap = 256;
 
     explicit WindowsFileMechanism(std::shared_ptr<std::atomic<std::size_t>> f3_counter)
-        : probe_lane_(std::move(f3_counter), kProbeLaneCap) {}
+        : probe_lane_(f3_counter, kProbeLaneCap), verify_lane_(std::move(f3_counter), kVerifyLaneCap) {}
 
     ~WindowsFileMechanism() override { stop(); }
 
@@ -1069,6 +1257,12 @@ public:
                 probe_discarded_.fetch_add(1, std::memory_order_relaxed);
             }
         }
+        // A verification worker holds no OS handle past its own return (it closes
+        // its temporary handle itself) and its result is scalars only, so
+        // abandoning its call here is non-blocking; not counted as quarantined.
+        for (auto& [dirkey, slot] : dirs_)
+            if (slot)
+                slot->verify_call.reset();
         // NOTE: destroying an abandoned DetachedCall<FileProbeResult> under
         // mu_ here (rather than staging it off-lock like every other path in
         // this file) is a deliberate, narrow exception at shutdown only: a
@@ -1142,6 +1336,8 @@ public:
                           leaked);
             quarantined_.fetch_add(leaked, std::memory_order_relaxed);
         }
+        suppressed_.clear(); // test-seam stash: ids only, nothing was ever posted to the IOCP
+        replay_.clear();
         dirs_.clear();
         ancestors_.clear();
         retiring_gauge_.fetch_sub(retiring_.size(), std::memory_order_relaxed);
@@ -1220,6 +1416,31 @@ public:
             admission_seed_ms_.store(c.admission_backoff_seed.count(), std::memory_order_relaxed);
         if (c.traversal_budget.count() > 0)
             traversal_budget_ms_.store(c.traversal_budget.count(), std::memory_order_relaxed);
+        if (c.path_verify_interval.count() > 0)
+            path_verify_ms_.store(c.path_verify_interval.count(), std::memory_order_relaxed);
+        if (c.path_lost_stuck_deadline.count() > 0)
+            path_lost_stuck_ms_.store(c.path_lost_stuck_deadline.count(), std::memory_order_relaxed);
+        // Verification seam: a shared_ptr so the detached verify worker reads it with no lock.
+        if (c.verify_hook)
+            verify_hook_ = std::make_shared<const std::function<DWORD(std::wstring_view)>>(
+                [h = std::move(c.verify_hook)](std::wstring_view d) { return static_cast<DWORD>(h(d)); });
+        else
+            verify_hook_.reset();
+        // Completion suppression: reserve up front so the worker never allocates to stash.
+        completion_suppress_hook_ = std::move(c.completion_suppress_hook);
+        if (completion_suppress_hook_) {
+            suppressed_.reserve(8);
+            replay_.reserve(8);
+        }
+        if (c.release_suppressed_completions) {
+            // Hand every stashed completion back. Nothing is posted to the IOCP and no
+            // pointer is kept: run() synthesizes each completion from this owned state
+            // (the nudge below wakes it) and drops one whose watch is gone, so a release
+            // is safe at any time, including after an unwatch or a stop.
+            for (const auto& e : suppressed_)
+                replay_.push_back(e);
+            suppressed_.clear();
+        }
         if (iocp_)
             ::PostQueuedCompletionStatus(iocp_.get(), 0, kControlKey, nullptr); // nudge — control changed
     }
@@ -1238,6 +1459,17 @@ public:
         d.resync_retries = resync_retries_.load(std::memory_order_relaxed);
         d.established_failed = established_failed_.load(std::memory_order_relaxed);
         d.pass_failed = pass_failed_.load(std::memory_order_relaxed);
+        d.verify_same = verify_same_.load(std::memory_order_relaxed);
+        d.verify_lost = verify_lost_.load(std::memory_order_relaxed);
+        d.verify_unverifiable = verify_unverifiable_.load(std::memory_order_relaxed);
+        d.verify_refused = verify_refused_.load(std::memory_order_relaxed);
+        d.verify_launch_failed = verify_launch_failed_.load(std::memory_order_relaxed);
+        d.path_lost_stuck = path_lost_stuck_.load(std::memory_order_relaxed);
+        d.path_lost_drained_ok = path_lost_drained_ok_.load(std::memory_order_relaxed);
+        d.path_lost_flaps = path_lost_flaps_.load(std::memory_order_relaxed);
+        d.verify_starved = verify_starved_.load(std::memory_order_relaxed);
+        d.sweep_passes = sweep_passes_.load(std::memory_order_relaxed);
+        d.stash_dropped = stash_dropped_.load(std::memory_order_relaxed);
         d.probe_workers_active = probe_lane_.active_workers();
         std::lock_guard lk(mu_);
         d.pass_failures_consecutive = pass_failures_;
@@ -1275,6 +1507,12 @@ private:
     }
     [[nodiscard]] std::chrono::milliseconds traversal_budget() const {
         return std::chrono::milliseconds(traversal_budget_ms_.load(std::memory_order_relaxed));
+    }
+    [[nodiscard]] std::chrono::milliseconds path_verify_interval() const {
+        return std::chrono::milliseconds(path_verify_ms_.load(std::memory_order_relaxed));
+    }
+    [[nodiscard]] std::chrono::milliseconds path_lost_stuck_deadline() const {
+        return std::chrono::milliseconds(path_lost_stuck_ms_.load(std::memory_order_relaxed));
     }
     [[nodiscard]] std::size_t retiring_cap() const {
         const auto ov = retiring_cap_override_.load(std::memory_order_relaxed);
@@ -1490,7 +1728,7 @@ private:
     /// is still unhealthy by its next sweep pass. State changes are ordered
     /// BEFORE the log line so a throwing spdlog::warn can never leave the
     /// watch un-deferred. Under mu_.
-    void defer_backend_retry_locked(DirWatch& w, const char* reason, DWORD err) {
+    void defer_backend_retry_locked(DirWatch& w, const char* reason, DWORD err, bool log = true) {
         probe_backend_failed_.fetch_add(1, std::memory_order_relaxed);
         w.probe = ProbeState::Deferred;
         w.call.reset();
@@ -1502,9 +1740,10 @@ private:
         // and failure branches, watch()'s Decision #3 fast-resolve path) -
         // mark unconditionally.
         mark_coverage_locked(w, SparkCoverage::None);
-        spdlog::warn("spark_file: establishing '{}' failed ({}, err={}) - watch is deaf until the "
-                     "retry",
-                     ::yuzu::log_key_token(fs::path(w.dir).string()), reason, err);
+        if (log) // false only for the path-lost drain, which logs its own (drain-specific) line
+            spdlog::warn("spark_file: establishing '{}' failed ({}, err={}) - watch is deaf until the "
+                         "retry",
+                         ::yuzu::log_key_token(fs::path(w.dir).string()), reason, err);
     }
 
     /// Genuine backend failure with a dispatch pass behind it: the
@@ -1524,6 +1763,187 @@ private:
         w.health_desired_faulted = true;
         w.fault_reason = "file watch establishment pending past grace";
         check_health_edge_locked(w, work);
+    }
+
+    // ── directory-identity verification (#5719 item 5) ─────────────────────
+    //
+    // Why: a watch holds a handle, and a handle follows its directory when the
+    // directory itself is renamed (measured on local NTFS). The outstanding
+    // ReadDirectoryChangesW then keeps reporting on the OLD directory under the
+    // OLD name, the watch stays Healthy, and a change at the watched PATH is never
+    // seen. Nothing completes, so the completion path cannot notice. The owner
+    // therefore re-opens the path on a detached worker every
+    // path_verify_interval() and compares identities. One detached thread per
+    // verification per interval, per watched directory: steady state is
+    // O(watched directories), not O(rules).
+    //
+    // What it covers: the watched directory renamed or moved away, or replaced by
+    // another directory/file at the same path, on a filesystem that gives a file
+    // id; and a watch whose check could not decide kVerifyUnverifiableFaultStreak
+    // times in a row (reported faulted, kReasonUnverifiable). What it does NOT
+    // cover (documented residuals, not claims): an ANCESTOR SHELTER entry is never
+    // verified, and whether a rename of an ancestor of the watched directory
+    // moves the handle is UNMEASURED here (docs/spark-stage2-guardian-consumer-
+    // design.md records that a parent rename is refused while the handle is
+    // open); a watch whose directory gave no usable identity (never verified); a
+    // rename away and back between two samples (nothing was lost); and a
+    // verification that hangs (it pins one of kVerifyLaneCap slots and that watch
+    // stays unverified). Detection is sampled: up to one interval deaf (at up to a few
+    // hundred watched directories; beyond that the lag grows with the directory count,
+    // docs/spark-flip-gate.md, cost item), then Faulted until the ordinary retry shelters
+    // or re-attaches the watch.
+    //
+    // Damping: a loss is a FLAP when the watch was just re-established from a
+    // path-loss fault and no verify decided Same since that commit (so a genuine
+    // rename after any Same, or the first loss, is not one). Each flap seeds
+    // backend_attempts at the loss, so the drain's retry doubles 30 s, 60, 120,
+    // 240, then the 300 s cap. It adds no fault edge and changes no verdict; the
+    // watch is already Faulted in the same episode. It is NOT reset at commit (that
+    // reset is what made every cycle 30 s).
+    //
+    // Exact damping scope: it covers the loop loss -> drain -> re-establishment commit
+    // -> loss with no decided Same between. The run is restarted (the next loss is
+    // treated as a first loss, 30 s) when (i) the re-establishment itself fails first
+    // (fail_backend_locked overwrites fault_reason before the eventual commit, so
+    // after_loss_commit reads false); (ii) the retry finds the target absent and commits
+    // Ancestor shelter mode (health is cleared there, so the later reappearance commit
+    // sees health clear); or (iii) an unwind recovery of the drain runs (a
+    // completion_hook throw or an allocation failure, on EITHER the failed-completion
+    // arm or the OK-completion arm's failed reissue): both use defer_admission_locked's
+    // 50 ms seed and skip the seeded retry. All three only under-damp. A replace loop
+    // faster than the verify interval is blind up to 300 s per cycle by design: the
+    // Faulted state stays reported and the resync Fired on re-establishment covers the
+    // net state (a change made and reverted inside that window is missed).
+    //
+    // Admission: a due verification is launched only into a free lane slot, the
+    // least-recently-verified (verified_at) first. A watch that stays due and
+    // unlaunched for kVerifyStarvedIntervals is counted (verify_starved) and
+    // warned once per episode (the flag clears at a decided Same or a commit; the warn is
+    // per watch, the count a debug counter, not exported); verify_refused stays 0 in
+    // steady state (it is a tripwire).
+    // LRU turns starvation into lag, it does not remove it; a hung verify of a
+    // watch is not flagged.
+
+    /// A watch is verifiable only while it holds a live read on a directory whose
+    /// identity is known. Under mu_.
+    [[nodiscard]] static bool verify_eligible(const DirWatch& w) noexcept {
+        return w.handle && w.io_pending && !w.removing && w.dir_id.valid;
+    }
+
+    /// The path named by `w` no longer names the directory `w.handle` is open on
+    /// (`reason`: kReasonPathLost or kReasonUnverifiable). Order is load-bearing:
+    /// every scalar fault stamp lands BEFORE anything that can throw or log
+    /// (defer_backend_retry_locked/fail_backend_locked log BEFORE stamping health,
+    /// which is why neither is used here), and the health edge, which allocates
+    /// and can throw, is staged LAST: a throw propagates to the pass unwind with
+    /// every stamp already in place and the sweep's per-visit edge reconciliation
+    /// re-staging it. Deliberately does NOT enter Deferred and does NOT touch the
+    /// handle: the outstanding read still owns w.buf/w.ov until its completion is
+    /// consumed, so the cancelled read's completion (process_completion_locked,
+    /// path_lost) is what hands the watch to the ordinary retry. The damping seed
+    /// (lost_flaps -> backend_attempts, see the banner) is one more scalar stamp. Under mu_.
+    void mark_path_lost_locked(DirWatch& w, FilePassWork& work, const char* reason) {
+        w.path_lost = true;
+        w.path_lost_since = Clock::now();
+        w.path_lost_stuck_warned = false;
+        const bool flap = w.after_loss_commit && !w.verified_since_commit;
+        w.lost_flaps = flap ? std::min(w.lost_flaps + 1, kMaxLostFlaps) : 0;
+        if (flap)
+            path_lost_flaps_.fetch_add(1, std::memory_order_relaxed);
+        w.backend_attempts = w.lost_flaps; // the drain's ++ makes it flaps + 1: 30 s, 60, 120, ...
+        w.needs_resync = true; // cover the gap once coverage (or a shelter) resumes
+        w.resync_epoch = ++resync_epoch_;
+        mark_coverage_locked(w, SparkCoverage::None);
+        w.health_desired_faulted = true;
+        w.fault_reason = reason;
+        if (w.handle && w.io_pending)
+            ::CancelIoEx(w.handle.get(), &w.ov); // the completion is delivered either way
+        check_health_edge_locked(w, work);
+        try {
+            spdlog::warn("spark_file: '{}' watch is deaf and reported faulted: {}",
+                         ::yuzu::log_key_token(fs::path(w.dir).string()), reason);
+        } catch (...) {
+            // diagnostic only; every state write above already landed
+        }
+    }
+
+    /// Stage an identity verification for `w`. last_verify_at is restamped FIRST
+    /// so a throw below (the path copy, the vector insert) can never become a hot
+    /// retry loop; the next attempt is a full interval away. Caller has verified
+    /// eligibility and that no verify call is outstanding, and has pre-reserved
+    /// work.probe_launches' capacity like every other staging site. Under mu_.
+    void stage_verify_locked(DirWatch& w, FilePassWork& work, Clock::time_point now) {
+        w.last_verify_at = now;
+        std::wstring dirkey_copy = w.map_key;
+        FileProbeJob job;
+        job.dir = w.dir;
+        job.verify_only = true;
+        job.verify_hook = verify_hook_;
+        w.verify_gen = ++gen_;
+        work.probe_launches.push_back({std::move(dirkey_copy), w.verify_gen, std::move(job),
+                                       DetachedLaunch::LaunchFailed, std::nullopt, true});
+    }
+
+    /// Consume a finished verification, if any. Same resets the could-not-decide
+    /// streak; Unverifiable counts it (one warn on the first of each RUN of undecided
+    /// results, re-armed whenever a Same or a re-establishment resets the streak; a
+    /// fault at kVerifyUnverifiableFaultStreak in a row); Lost faults the watch. Under
+    /// mu_.
+    void harvest_verify_locked(DirWatch& w, FilePassWork& work) {
+        if (!w.verify_call)
+            return;
+        auto r = w.verify_call->try_take();
+        if (!r)
+            return; // still running
+        w.verify_call.reset();
+        w.last_verify_at = Clock::now();
+        // A result is only meaningful for the handle it was launched against;
+        // every commit resets verify_call, so an engaged handle here is that one.
+        if (!verify_eligible(w) || w.path_lost)
+            return;
+        enum class Verdict { Same, Lost, Unverifiable } v = Verdict::Unverifiable;
+        // What the warn below reports for an undecided result; the worker-threw path has
+        // no result to read (`stage` is a string literal either way).
+        const char* undecided_stage = "verification worker failure or lost result";
+        DWORD undecided_err = 0;
+        if (r->has_value()) {
+            const FileProbeResult& res = **r;
+            undecided_stage = res.stage;
+            undecided_err = res.err;
+            if (res.ok)
+                v = w.dir_id.same_as(res.id) ? Verdict::Same : Verdict::Lost;
+            else if (std::string_view(res.stage) == kVerifyOpenStage &&
+                     (res.err == ERROR_FILE_NOT_FOUND || res.err == ERROR_PATH_NOT_FOUND))
+                v = Verdict::Lost;
+        }
+        switch (v) {
+        case Verdict::Same:
+            verify_same_.fetch_add(1, std::memory_order_relaxed);
+            w.unverifiable_streak = 0;
+            w.verified_since_commit = true; // a decided Same ends any flap run
+            w.verified_at = w.last_verify_at;
+            w.verify_starved = false;
+            break;
+        case Verdict::Unverifiable:
+            verify_unverifiable_.fetch_add(1, std::memory_order_relaxed);
+            if (++w.unverifiable_streak == 1) { // the first of a run: one warn per RUN, not per sample
+                try {
+                    spdlog::warn("spark_file: '{}' directory identity check undecided at {} "
+                                 "(err={}), streak 1/{}; the watch is not faulted unless it stays "
+                                 "undecided",
+                                 ::yuzu::log_key_token(fs::path(w.dir).string()), undecided_stage,
+                                 undecided_err, kVerifyUnverifiableFaultStreak);
+                } catch (...) {
+                }
+            }
+            if (w.unverifiable_streak >= kVerifyUnverifiableFaultStreak)
+                mark_path_lost_locked(w, work, kReasonUnverifiable);
+            break;
+        case Verdict::Lost:
+            verify_lost_.fetch_add(1, std::memory_order_relaxed);
+            mark_path_lost_locked(w, work, kReasonPathLost);
+            break;
+        }
     }
 
     /// Walk the FILE_NOTIFY_INFORMATION records in `bytes` and stage an Emit
@@ -1627,6 +2047,12 @@ private:
     /// finally does observe it (#2012/#3840 review finding 7). Under mu_.
     [[nodiscard]] bool attach_dir_locked(DirWatch& w, FileProbeResult& res, FilePassWork& work,
                                          bool report_health = true) {
+        // Installing a new handle over one with a read still outstanding would
+        // free storage the kernel may still write into. Every path that reaches a
+        // commit has already consumed the old read's completion (and reset the
+        // handle); a path-lost watch is drained by process_completion_locked
+        // BEFORE its Deferred probe can commit (#5719 item 5).
+        assert(!(w.handle && w.io_pending));
         if (attach_fail_hook_ && attach_fail_hook_(w.dir)) {
             // Test seam: model the real CreateIoCompletionPort/
             // ReadDirectoryChangesW calls failing without making them, with
@@ -1672,6 +2098,15 @@ private:
             work.old_handles.push_back(std::move(w.handle)); // nothrow given the reservation
         w.handle = std::move(new_handle);
         w.io_pending = true;
+        w.dir_id = res.id; // scalars: the identity this handle was opened on (#5719 item 5)
+        if (!w.dir_id.valid) {
+            try {
+                spdlog::info("spark_file: '{}' path verification unavailable: no usable directory "
+                             "identity ({}, err={}); a rename of this directory will not be detected",
+                             ::yuzu::log_key_token(fs::path(w.dir).string()), res.stage, res.err);
+            } catch (...) {
+            }
+        }
         release_ancestor_locked(w); // drop the (no longer needed) shelter dependency, if any —
                                     // never touches w.handle/w.ov/w.buf, so safe to run after
         w.confirmation_due = false;
@@ -1875,6 +2310,19 @@ private:
                              bool report_health = true) {
         w.probe = ProbeState::Idle;
         w.call.reset();
+        // A commit supersedes everything a verification knew: any outstanding or
+        // staged verify belonged to the previous handle (verify_gen), a lost path
+        // has been drained (or abandoned with the old handle), and the next
+        // verification is due a full interval after this establishment.
+        w.verify_call.reset();
+        w.verify_gen = ++gen_;
+        w.path_lost = false;
+        w.unverifiable_streak = 0;
+        w.last_verify_at = Clock::now();
+        w.verified_at = w.last_verify_at;  // age of a fresh establishment
+        w.verify_wait_since = {};
+        w.verify_starved = false;
+        w.verified_since_commit = false;   // lost_flaps (the damping seed) is deliberately NOT reset here
         const bool was_reappearance = w.probe_is_reappearance;
         bool committed = false;
         try {
@@ -1929,6 +2377,14 @@ private:
                 w.resync_epoch = ++resync_epoch_;
             }
         }
+        // fault_reason is still the reason stamped at detection here (static literals, so a
+        // pointer compare); read BEFORE the clear below overwrites it. Damping scope: a failed
+        // re-establishment (fail_backend_locked replaced the reason) or an Ancestor shelter
+        // commit (health cleared here, so the later reappearance commit finds it clear) makes
+        // the NEXT commit read false and restarts the run; that only under-damps (see the
+        // banner at the verification section).
+        w.after_loss_commit = w.health_desired_faulted && (w.fault_reason == kReasonPathLost ||
+                                                           w.fault_reason == kReasonUnverifiable);
         if (w.health_desired_faulted) {
             w.health_desired_faulted = false;
             w.fault_reason = "recovered";
@@ -2190,6 +2646,43 @@ private:
             drop_watch(&w); // its aborted completion drained — free it now; do NOT touch w after
             return;
         }
+        if (w.path_lost && !is_anc) {
+            // The read mark_path_lost_locked() cancelled has now drained (run()
+            // already cleared io_pending). Whatever it carries, `ok` or not, is
+            // dropped: never fired and never reissued here (the OK-completion route
+            // in unwind_pass_locked DOES reissue on this handle; it converges
+            // through the sweep's re-cancel). Only now is it safe to drop the handle
+            // and enter the ordinary retry; the fault was stamped and staged at
+            // detection. Why dropping is safe depends on the reason:
+            //  - kReasonPathLost: the completion is evidence about the OLD
+            //    directory under its OLD name, so firing it would report a change
+            //    at the watched path that did not happen there.
+            //  - kReasonUnverifiable: the handle may be open on the RIGHT
+            //    directory, so an `ok` completion dropped here can be a real
+            //    change. It is recovered only by the resync fire (needs_resync,
+            //    set at detection) once the re-established watch commits.
+            // The fault reason is the one detection stamped (nothing else writes
+            // it in between). The retry is not a slow establishment: counting its
+            // wait as one would bump slow_op_total and overwrite the reason on the
+            // next sweep (accepted_at is from the original establishment), so the
+            // grace is marked spent.
+            w.path_lost = false;
+            w.path_lost_stuck_warned = false;
+            if (ok)
+                path_lost_drained_ok_.fetch_add(1, std::memory_order_relaxed);
+            w.handle.reset();
+            defer_backend_retry_locked(w, w.fault_reason, 0, /*log=*/false);
+            w.grace_counted = true;
+            try {
+                spdlog::info("spark_file: '{}' stale read drained after path loss ({}); "
+                             "re-establishment retry scheduled (repeat losses without a "
+                             "decided check: {})",
+                             ::yuzu::log_key_token(fs::path(w.dir).string()), w.fault_reason,
+                             w.lost_flaps);
+            } catch (...) {
+            }
+            return;
+        }
         if (!ok) {
             w.handle.reset();
             if (!is_anc) {
@@ -2354,6 +2847,14 @@ private:
                 ++it;
             }
         }
+        sweep_passes_.fetch_add(1, std::memory_order_relaxed);
+        // Fair admission of verifications: only as many launches as the lane has free slots,
+        // chosen least-recently-verified first; nothing in this pass erases dirs_ entries,
+        // so the pointers stay valid under mu_. Offered below, staged after the loop.
+        std::array<DirWatch*, kVerifyLaneCap> picks{};
+        std::size_t npick = 0;
+        const std::size_t active = verify_lane_.active_workers();
+        const std::size_t room = active < kVerifyLaneCap ? kVerifyLaneCap - active : 0;
         for (auto& [dirkey, slot] : dirs_) {
             if (!slot)
                 continue;
@@ -2395,6 +2896,34 @@ private:
                 }
                 break;
             case ProbeState::Idle:
+                if (w.path_lost) {
+                    // Lost path, waiting for the cancelled read's completion (the
+                    // drain). Nothing else may run: a resync here would be retired
+                    // before coverage resumed. Re-cancel in case the first cancel
+                    // raced the read's own completion posting (idempotent). This
+                    // also converges the OK-completion unwind route that reissued
+                    // a read on the invalidated handle (unwind_pass_locked).
+                    if (w.handle && w.io_pending)
+                        ::CancelIoEx(w.handle.get(), &w.ov);
+                    if (!w.path_lost_stuck_warned && now - w.path_lost_since >= path_lost_stuck_deadline()) {
+                        // A completion that never comes (a driver or redirector that
+                        // never completes the cancelled read): observed once, per
+                        // episode; no escalation, the 20 Hz re-cancel stands.
+                        w.path_lost_stuck_warned = true;
+                        path_lost_stuck_.fetch_add(1, std::memory_order_relaxed);
+                        try {
+                            spdlog::warn("spark_file: '{}' lost-path read has not drained after {} ms; "
+                                         "the watch stays faulted until it does",
+                                         ::yuzu::log_key_token(fs::path(w.dir).string()),
+                                         path_lost_stuck_deadline().count());
+                        } catch (...) {
+                        }
+                    }
+                    break;
+                }
+                harvest_verify_locked(w, work);
+                if (w.path_lost)
+                    break; // harvest just found the path lost: same rule as above
                 if (w.confirmation_due) {
                     // Shelter confirmation (discover/attach race): an
                     // intermediate directory may have appeared between the
@@ -2435,7 +2964,46 @@ private:
                     stage_resync_emit_locked(w, work);
                     resync_retries_.fetch_add(1, std::memory_order_relaxed);
                 }
+                if (w.probe == ProbeState::Idle && !w.verify_call && verify_eligible(w) &&
+                    now - w.last_verify_at >= path_verify_interval()) {
+                    // Due. The wait is anchored to the first pass it was due and unlaunched
+                    // (not to wall age since the last verify), so a clock jump never
+                    // mass-flags. One counted warn per episode.
+                    if (w.verify_wait_since == Clock::time_point{}) {
+                        w.verify_wait_since = now;
+                    } else if (!w.verify_starved &&
+                               now - w.verify_wait_since >=
+                                   kVerifyStarvedIntervals * path_verify_interval()) {
+                        w.verify_starved = true;
+                        verify_starved_.fetch_add(1, std::memory_order_relaxed);
+                        try {
+                            spdlog::warn("spark_file: '{}' directory identity check starved: not "
+                                         "launched for {} ms ({} of {} verification slots busy)",
+                                         ::yuzu::log_key_token(fs::path(w.dir).string()),
+                                         std::chrono::duration_cast<std::chrono::milliseconds>(
+                                             now - w.verify_wait_since).count(),
+                                         active, kVerifyLaneCap);
+                        } catch (...) {
+                        }
+                    }
+                    // Keep the `room` least-recently-verified due watches, ordered ascending.
+                    if (npick < room)
+                        picks[npick++] = &w;
+                    else if (npick != 0 && w.verified_at < picks[npick - 1]->verified_at)
+                        picks[npick - 1] = &w;
+                    for (auto i = npick; i-- > 1 && picks[i]->verified_at < picks[i - 1]->verified_at;)
+                        std::swap(picks[i], picks[i - 1]);
+                }
                 break;
+            }
+        }
+        for (std::size_t i = 0; i < npick; ++i) {
+            DirWatch& p = *picks[i];
+            // Re-checked: nothing above may have changed these for a picked watch, but this
+            // is the only place a verification is staged.
+            if (verify_eligible(p) && !p.verify_call && !p.path_lost && p.probe == ProbeState::Idle) {
+                p.verify_wait_since = {};
+                stage_verify_locked(p, work, now);
             }
         }
     }
@@ -2484,6 +3052,31 @@ private:
                 any = true;
                 break;
             case ProbeState::Idle:
+                if (w.path_lost) {
+                    // Waiting for the cancelled read's completion; its own IOCP
+                    // packet wakes the loop, this cadence only re-issues the
+                    // cancel. No resync/verify clause may run: needs_resync is
+                    // deliberately held back until the watch has drained.
+                    wake = std::min(wake, now + cadence);
+                    any = true;
+                    continue;
+                }
+                if (verify_eligible(w)) {
+                    // An idle healthy watch otherwise waits INFINITE: this is the
+                    // wake that lets the verification run at all. A finished
+                    // verify is polled on the sweep cadence (its worker posts
+                    // nothing to the IOCP).
+                    // A watch already due while every lane slot is taken waits on a slot,
+                    // not on the clock: a zero timeout here would spin the sweep. (Due
+                    // with a free slot but more due than slots keeps the zero timeout:
+                    // the next pass admits the rest.)
+                    auto due = w.last_verify_at + path_verify_interval();
+                    if (!w.verify_call && due <= now &&
+                        verify_lane_.active_workers() >= kVerifyLaneCap)
+                        due = now + cadence;
+                    wake = std::min(wake, w.verify_call ? now + cadence : due);
+                    any = true;
+                }
                 if (w.needs_resync) {
                     wake = std::min(wake, w.resync_retry_at);
                     any = true;
@@ -2558,6 +3151,41 @@ private:
     /// top-of-loop reserve() in run() — see its own comment.
     void reconcile_probe_launches_locked(FilePassWork& work) noexcept {
         for (auto& pl : work.probe_launches) {
+            if (pl.verify) {
+                // An identity verification: no Pending/Deferred bookkeeping. A
+                // launched one is published only if its watch is still the one it
+                // was staged for (verify_gen is mechanism-global and restamped by
+                // every commit and every staging).
+                auto vit = dirs_.find(pl.dirkey);
+                DirWatch* vw = (vit != dirs_.end() && vit->second) ? vit->second.get() : nullptr;
+                if (pl.job || pl.status != DetachedLaunch::Launched || !pl.call) {
+                    // Count only an entry whose launch RETURNED: run_off_lock resets
+                    // `pl.job` once a launch returns, so an engaged job means no launch
+                    // outcome was recorded (the pass threw before or inside the launch
+                    // call) and `status` is only its LaunchFailed default; counting that
+                    // would overstate real launch failures.
+                    if (!pl.job)
+                        (pl.status == DetachedLaunch::Rejected ? verify_refused_
+                                                               : verify_launch_failed_)
+                            .fetch_add(1, std::memory_order_relaxed);
+                    // Safety net for a launch that did not start (LaunchFailed, or a
+                    // pass that threw): retry after the admission seed instead of a
+                    // full interval. A REFUSAL (lane full) is no longer expected: the
+                    // sweep stages only into free slots (picks, sweep_probes_locked),
+                    // so verify_refused staying 0 is the tripwire that admission and
+                    // the lane agree.
+                    if (vw && vw->verify_gen == pl.gen)
+                        vw->last_verify_at =
+                            Clock::now() - path_verify_interval() + admission_seed();
+                    continue;
+                }
+                if (vw && vw->verify_gen == pl.gen && !vw->verify_call && verify_eligible(*vw) &&
+                    !vw->path_lost)
+                    vw->verify_call = std::move(pl.call);
+                else
+                    work.stale_calls.push_back(std::move(*pl.call));
+                continue;
+            }
             if (pl.job) {
                 // Never reached run_off_lock's launch call for this entry.
                 auto it = dirs_.find(pl.dirkey);
@@ -2588,9 +3216,11 @@ private:
 
     /// Off-lock half of a pass: launches, then dispatch in recorded order.
     void run_off_lock(FilePassWork& work) {
-        const bool had_probe_launches = !work.probe_launches.empty();
+        bool had_probe_launches = false; // discovery probes only: the test hook below models a probe
         for (auto& pl : work.probe_launches) {
-            auto lr = probe_lane_.launch(std::move(*pl.job));
+            if (!pl.verify)
+                had_probe_launches = true;
+            auto lr = (pl.verify ? verify_lane_ : probe_lane_).launch(std::move(*pl.job));
             pl.job.reset();
             pl.status = lr.status;
             pl.call = std::move(lr.call);
@@ -3056,6 +3686,13 @@ private:
                             w.needs_resync = true;
                             w.resync_epoch = ++resync_epoch_;
                             defer_admission_locked(w, DetachedLaunch::LaunchFailed);
+                            // A lost path's retry wait is not a slow establishment: the
+                            // drain in process_completion_locked marks the grace spent
+                            // for the same reason (accepted_at is from the original
+                            // establishment, so the next sweep would count slow_op_total
+                            // and overwrite fault_reason). Scalar write, noexcept-safe.
+                            if (w.path_lost)
+                                w.grace_counted = true;
                         }
                     } else if (work.consumed_is_anc) {
                         // Ancestors carry no keys/resync — best effort is keeping it armed.
@@ -3104,6 +3741,12 @@ private:
                         if (!w.io_pending) {
                             w.handle.reset();
                             defer_admission_locked(w, DetachedLaunch::LaunchFailed);
+                            // Same guard as the failed-completion arm above: a lost path's
+                            // retry wait is not a slow establishment, so mark the grace
+                            // spent (else the next sweep counts slow_op_total and overwrites
+                            // fault_reason). Scalar write, noexcept-safe.
+                            if (w.path_lost)
+                                w.grace_counted = true;
                         }
                     }
                 }
@@ -3144,6 +3787,10 @@ private:
             work.stale_calls.push_back(std::move(*w.call));
             w.call.reset();
             probe_discarded_.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (w.verify_call) {
+            work.stale_calls.push_back(std::move(*w.verify_call)); // capacity: reserve_discard_capacity
+            w.verify_call.reset();
         }
         w.probe = ProbeState::Idle; // no further retry is meaningful once retired
         release_ancestor_locked(w);
@@ -3195,6 +3842,28 @@ private:
         return false;
     }
 
+    /// Test seam only (the completion stash), under mu_: the armed watch with this id that can
+    /// accept a handed-back completion, or null. A watch qualifies only when it is in dirs_ or
+    /// ancestors_, is not `removing` and has no read outstanding (`io_pending`): a swallowed
+    /// completion leaves exactly that state. One already retired to retiring_ is deliberately
+    /// not found (its read is cancelled and owned by the drain), and one re-armed since the
+    /// swallow is not either (a second completion for it would be a second one in flight). In
+    /// both cases the handed-back completion is dropped, never replayed. By-construction
+    /// hardening: the removing and io_pending predicates have no test observer (a mutation
+    /// to id-only keeps every case green).
+    static bool can_take_replay(const std::unique_ptr<DirWatch>& slot, std::uint64_t id) noexcept {
+        return slot && slot->id == id && !slot->removing && !slot->io_pending;
+    }
+    DirWatch* find_watch_by_id_locked(std::uint64_t id) const {
+        for (const auto& [k, slot] : dirs_)
+            if (can_take_replay(slot, id))
+                return slot.get();
+        for (const auto& [k, slot] : ancestors_)
+            if (can_take_replay(slot, id))
+                return slot.get();
+        return nullptr;
+    }
+
     void drop_watch(DirWatch* w) {
         for (auto it = dirs_.begin(); it != dirs_.end(); ++it)
             if (it->second.get() == w) {
@@ -3217,7 +3886,7 @@ private:
     void run() {
         std::unique_lock lk(mu_);
         while (!stop_.load(std::memory_order_acquire)) {
-            const DWORD timeout_ms = wait_timeout_locked(Clock::now());
+            const DWORD timeout_ms = replay_.empty() ? wait_timeout_locked(Clock::now()) : 0;
             lk.unlock();
             DWORD bytes = 0;
             ULONG_PTR ckey = 0;
@@ -3226,6 +3895,21 @@ private:
                 ::GetQueuedCompletionStatus(iocp_.get(), &bytes, &ckey, &ov, timeout_ms);
             lk.lock();
 
+            // Test seam: a released stash entry becomes the completion of the watch it
+            // names, when that watch is still armed. An entry whose watch is gone is dropped.
+            StashedCompletion rep{};
+            bool replayed = false;
+            while (ov == nullptr && !replayed && !replay_.empty()) {
+                rep = replay_.front();
+                replay_.erase(replay_.begin());
+                if (DirWatch* rw = find_watch_by_id_locked(rep.id)) {
+                    ckey = reinterpret_cast<ULONG_PTR>(rw);
+                    ov = &rw->ov;
+                    replayed = true;
+                } else {
+                    stash_dropped_.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
             const bool real_completion = (ov != nullptr);
             if (real_completion) {
                 // Consume it BEFORE checking stop_, regardless of whether we
@@ -3239,6 +3923,17 @@ private:
                 if (notify_fail_hook_ && notify_fail_hook_(w->dir))
                     gqcs_ok = FALSE; // test seam: override the kernel's own result; see
                                      // FileMechanismTestControls::notify_fail_hook's doc comment
+                if (replayed) { // a stashed completion handed back: restore what it carried
+                    gqcs_ok = rep.ok;
+                    bytes = rep.bytes;
+                }
+                if (!replayed && completion_suppress_hook_ && !w->removing &&
+                    !stop_.load(std::memory_order_acquire) &&
+                    suppressed_.size() < suppressed_.capacity() &&
+                    completion_suppress_hook_(w->dir, gqcs_ok != FALSE, bytes)) {
+                    suppressed_.push_back({w->id, gqcs_ok, bytes}); // test seam: swallow this completion
+                    continue;
+                }
                 if (stop_.load(std::memory_order_acquire)) {
                     if (w->removing)
                         drop_watch(w);
@@ -3410,6 +4105,7 @@ private:
     std::uint64_t resync_epoch_{0};
 
     SparkDetachedLane probe_lane_;
+    SparkDetachedLane verify_lane_; ///< identity verifications only (#5719 item 5)
 
     /// Pass-failure episode (#4658). Written only by run() (the sole worker),
     /// under mu_; read under mu_ by wait_timeout_locked() and debug_counters().
@@ -3456,6 +4152,17 @@ private:
     std::atomic<std::uint64_t> fault_failed_{0};
     std::atomic<std::uint64_t> resync_retries_{0};
     std::atomic<std::uint64_t> established_failed_{0}; ///< established() threw when invoked
+    std::atomic<std::uint64_t> verify_same_{0};         ///< #5719 item 5 verification outcomes
+    std::atomic<std::uint64_t> verify_lost_{0};
+    std::atomic<std::uint64_t> verify_unverifiable_{0};
+    std::atomic<std::uint64_t> verify_refused_{0};       ///< verify launch refused by a full lane
+    std::atomic<std::uint64_t> verify_launch_failed_{0}; ///< verify launch failed (thread creation)
+    std::atomic<std::uint64_t> path_lost_stuck_{0};      ///< lost paths whose drain exceeded the deadline
+    std::atomic<std::uint64_t> path_lost_drained_ok_{0}; ///< drains whose completion carried `ok`
+    std::atomic<std::uint64_t> path_lost_flaps_{0};      ///< losses counted as flaps (backoff seeded)
+    std::atomic<std::uint64_t> verify_starved_{0};       ///< due verifications unlaunched past the threshold
+    std::atomic<std::uint64_t> sweep_passes_{0};         ///< sweep_probes_locked passes (debug: spin check)
+    std::atomic<std::uint64_t> stash_dropped_{0};        ///< handed-back stash entries dropped, not replayed
 
     std::atomic<std::size_t> retiring_cap_override_{0}; ///< 0 = use kRetiringCap
     std::atomic<std::int64_t> caller_wait_ms_{kFileCallerWaitBudget.count()};
@@ -3464,12 +4171,27 @@ private:
     std::atomic<std::int64_t> backend_retry_base_ms_{kFileBackendRetryBase.count()};
     std::atomic<std::int64_t> admission_seed_ms_{kFileAdmissionBackoffSeed.count()};
     std::atomic<std::int64_t> traversal_budget_ms_{kFileProbeTraversalBudget.count()};
+    std::atomic<std::int64_t> path_verify_ms_{kFilePathVerifyInterval.count()};
+    std::atomic<std::int64_t> path_lost_stuck_ms_{kPathLostStuckDeadline.count()};
 
     std::shared_ptr<const std::function<void(std::wstring_view)>> probe_hook_; ///< test seam
     std::shared_ptr<const std::function<void()>> test_emit_bookkeeping_hook_;  ///< test seam
     /// test seam; read/written only under mu_ (see apply_test_controls's comment).
     std::function<bool(std::wstring_view)> ancestor_rearm_fail_hook_;
     std::function<void(std::wstring_view)> completion_hook_; ///< test seam; only under mu_
+    /// Test seam, read by detached verify workers with no lock (hence a shared_ptr, set under mu_).
+    std::shared_ptr<const std::function<DWORD(std::wstring_view)>> verify_hook_;
+    /// Test seam, only under mu_: a dequeued completion the hook swallowed, and one handed back.
+    /// It names its watch by `id`, never by address (see next_watch_id), so an entry can outlive
+    /// its watch without anything dereferencing it; stop() clears both vectors.
+    struct StashedCompletion {
+        std::uint64_t id;
+        BOOL ok;
+        DWORD bytes;
+    };
+    std::function<bool(std::wstring_view, bool, unsigned long)> completion_suppress_hook_;
+    std::vector<StashedCompletion> suppressed_;
+    std::vector<StashedCompletion> replay_;
     std::function<void()> pass_fail_hook_; ///< test seam (#4658); only under mu_
     /// Test seams added for #2012/#3840 PR-B2 review findings 1/4/5/6/7 - all
     /// read/written only under mu_, same contract as ancestor_rearm_fail_hook_/
