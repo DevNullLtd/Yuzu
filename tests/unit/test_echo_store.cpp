@@ -5224,8 +5224,10 @@ TEST_CASE("EchoDatabase (Windows): a hard link squatted at a quarantine sidecar 
     REQUIRE(fs::exists(squatted));
     REQUIRE(fs::exists(d.dir.path / std::format("echo.db.corrupt-{}", *opened->quarantined_this_open())));
 
-    // Nothing was re-secured through the squat: the target keeps its descriptor and every link.
-    CHECK(fs::hard_link_count(decoy) == kSquats + 1);
+    // Nothing was re-secured through the squat: the target keeps its content and its descriptor.
+    // Retention (`prune_old_quarantines`) may unlink squatted names that parse as old quarantine
+    // groups; that drops links only, so the count may fall but must never rise.
+    CHECK(fs::hard_link_count(decoy) <= kSquats + 1);
     CHECK(read_file(decoy) == "not a wal");
     CHECK_FALSE(dacl_facts(decoy).dacl_protected);
     CHECK(dacl_facts(decoy).allows(kUsers));
