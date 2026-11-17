@@ -3389,8 +3389,10 @@ script loop forever.)
 - `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` (single ephemeral dev/CI node only) no longer
   restores a known cookie: when the cookie is empty or *exactly* the published
   default, the entrypoint substitutes a fresh random per-boot cookie that is never
-  logged. A real shared cookie that merely contains the literal is kept, so
-  replicas still agree. **N replicas on the override are N singletons that cannot
+  logged. The override replaces nothing else: a custom cookie that is shorter
+  than 32 characters, or that **starts with** the published literal, is refused
+  like any other weak cookie. A real shared cookie that contains the literal
+  elsewhere is kept, so replicas still agree. **N replicas on the override are N singletons that cannot
   cluster** (each draws its own cookie). A node advertising `127.0.0.1` (the
   single-node default) also has its distribution listener and EPMD bound to
   loopback; a node advertising a routable address is protected by the random
@@ -3432,8 +3434,10 @@ choose by hand, and the distribution handshake's initiator sends the cookie
 hash first — a short cookie is brute-forceable offline from a
 legitimately-dialing node, a materially different exposure than a hand-typed
 static seed list carried. `openssl rand -hex 32` above already clears this
-floor with room to spare; the same `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` override
-bypasses the length check too.
+floor with room to spare. The in-VM guard still lets the
+`YUZU_GW_ALLOW_DEFAULT_COOKIE=1` override bypass the length check (a start that
+skips the container entrypoint), but the container entrypoint and the systemd
+unit do not: the entrypoint refuses a short cookie even with the override.
 
 **Firewall ports for multi-node clustering (HA WS-4 `#4555`).** Alongside
 EPMD (TCP 4369, above), a clustered gateway also needs the Erlang

@@ -9252,7 +9252,8 @@ always qualifies.
 | Manual / tarball systemd unit | The unit has an `ExecStartPre` and **no override**. If `/opt/yuzu_gw/gateway-cookie-policy.sh` is missing the unit fails at once with `.: cannot open /opt/yuzu_gw/gateway-cookie-policy.sh: No such file` (exit 2) and, after a few restarts, `start-limit-hit`. A unit that previously started with `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` and no cookie, or with a short or odd-character cookie, now fails to start. | The release tarball ships `gateway-cookie-policy.sh` and `yuzu-gateway.service` at its top level: copy the policy file to `/opt/yuzu_gw/` (the tarball upgrade step `rm -rf /opt/yuzu_gw` deletes a copy you installed by hand, so re-install it after every upgrade, or let the tarball extract put it there). Tarballs from before this change do not contain it; take `deploy/docker/gateway-cookie-policy.sh` from the matching source tag. Set a conforming `YUZU_GW_COOKIE` in `/etc/yuzu/gateway.env`. Then `systemctl reset-failed yuzu-gateway && systemctl start yuzu-gateway`. |
 | Container with a short or odd-character cookie | The entrypoint exits 1 before the VM starts (restart loop under `restart:`). | Set a conforming cookie, identical on every replica. |
 | Container on `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` with no cookie | Starts, but with a random per-boot cookie. **N replicas on the override are N singletons that cannot form a cluster** (each draws its own cookie), and the node is no longer reachable with the published value. | Fine for one throwaway node. For a cluster set one shared `YUZU_GW_COOKIE`. |
-| Container on the override with a real shared cookie that contains the old literal | Passed through unchanged (only an empty or *exactly* default cookie is replaced). | None; replace the cookie when convenient. |
+| Container on the override with a real shared cookie that contains the old literal in the middle or at the end | Passed through unchanged (only an empty or *exactly* default cookie is replaced). | None; replace the cookie when convenient. |
+| Container on the override with a custom cookie that is **short** (under 32) or **starts with** the old literal | **Now refused** (`... is shorter than 32 characters ...` or `... contains the published default value.`). Earlier builds let the override accept these. | Drop the cookie to get a random per-boot one (single node), or set a strong shared cookie. |
 | Container **without** the override, real shared cookie that contains the old literal | Refused: `... contains the published default value.` | Generate a fresh cookie and set it on every replica. |
 
 Messages to search for (the cookie value is never printed):
@@ -9286,8 +9287,9 @@ shipped together as part of gateway multi-node cluster formation:
   needed if you followed the `#659` guidance above verbatim. Only an
   operator who hand-picked a short custom cookie is affected; the
   `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` override (dev/CI only, never production)
-  tolerates a short cookie in the container entrypoint and in-VM guard, but the
-  systemd unit has no override (see below).
+  tolerates a short cookie only in the in-VM guard; the container entrypoint
+  refuses it even with the override, and the systemd unit has no override (see
+  below).
 - **Node identity change.** The Erlang node short name changed from a
   hardcoded `yuzu_gw1` to a shared `yuzu_gw` — every gateway replica in a
   cluster now advertises the SAME short name, distinguished only by an

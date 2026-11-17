@@ -26,8 +26,8 @@ YUZU_GW_COOKIE_PUBLISHED_DEFAULT=yuzu_gw_secret_change_me
 #   0  acceptable
 #   10 unset, empty, or EXACTLY the published default (replaceable under the dev/CI override)
 #   11 a character outside the allow-list
-#   12 shorter than the floor (the dev/CI override tolerates it, as the in-VM guard does)
-#   13 contains the published default inside a longer value (the override passes it through)
+#   12 shorter than the floor (refused even under the dev/CI override)
+#   13 contains the published default inside a longer value (the dev/CI override refuses it when it is a PREFIX, passes it through otherwise)
 #   14 starts with - or + (the VM would read it as a flag)
 #   15 longer than the ceiling (never tolerated, not even under the dev/CI override)
 yuzu_gw_cookie_classify() {

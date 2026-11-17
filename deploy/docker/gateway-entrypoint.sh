@@ -54,8 +54,9 @@ log() {
 # YUZU_GW_ALLOW_DEFAULT_COOKIE=1 (single ephemeral node, dev/CI) no longer means
 # "run with the published default": a cookie that is unset, empty or EXACTLY the
 # published default is replaced by a fresh random per-boot value that is never
-# logged. A real shared cookie that merely contains the literal is passed through
-# unchanged, so replicas keep agreeing. N replicas on the override are N
+# logged. Nothing else is tolerated: a short cookie, or one that STARTS with the
+# published literal, is refused. A real shared cookie that contains the literal
+# elsewhere is passed through unchanged, so replicas keep agreeing. N replicas on the override are N
 # singletons that cannot cluster (each draws its own cookie).
 . "$(dirname "$0")/gateway-cookie-policy.sh"
 
@@ -72,7 +73,11 @@ if [ "${YUZU_GW_ALLOW_DEFAULT_COOKIE:-}" = "1" ]; then
             log "YUZU_GW_COOKIE is unset or the published default and YUZU_GW_ALLOW_DEFAULT_COOKIE=1 is set: using a random per-boot cookie (single node only; this node cannot join a cluster)"
             cookie_rc=0
             ;;
-        12|13) cookie_rc=0 ;;   # the override tolerates these, as the in-VM guard does
+        # The override replaces ONLY an empty or exactly-default cookie (code 10). A
+        # short cookie (12) or one that starts with the published literal (13) is
+        # refused; a real shared cookie with the literal elsewhere (13, not a prefix)
+        # passes through unchanged so replicas still agree.
+        13) case "$YUZU_GW_COOKIE" in "$YUZU_GW_COOKIE_PUBLISHED_DEFAULT"*) ;; *) cookie_rc=0 ;; esac ;;
     esac
 fi
 if [ "$cookie_rc" -ne 0 ]; then

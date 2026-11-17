@@ -21,8 +21,10 @@
 #   P  published literal INSIDE a longer cookie, no override -> refused, "contains the published"
 #   D  unset + ALLOW=1                    -> started with a random 64-hex cookie, never logged
 #   D2 exactly the default + ALLOW=1      -> same
-#   R  ALLOW=1 + a real shared cookie that CONTAINS the literal -> passed through UNCHANGED (every
+#   R  ALLOW=1 + a real shared cookie with the literal in the MIDDLE -> passed through UNCHANGED (every
 #                                            replica must keep the shared cookie)
+#   AP ALLOW=1 + a short cookie, or one that STARTS with the published literal -> refused (the override
+#                                            only ever replaces an EMPTY or EXACTLY-default cookie)
 #   G  ALLOW=1 + a bad-charset cookie     -> still refused
 #   E  a strong cookie                    -> started with that exact cookie
 #   F/H loopback / routable advertise     -> dist pinned / not pinned
@@ -108,6 +110,9 @@ for sh in $shells; do
     refused M "$sh" "longer than 255" YUZU_GW_COOKIE="$long256"
     if started_with M255 "$sh" YUZU_GW_COOKIE="$long255"; then pass "M255 [$sh]"; else bad "M255 [$sh]" "rc=$rc err=[$err]"; fi
     refused P "$sh" "contains the published default" YUZU_GW_COOKIE="$embedded"
+    refused AP-short "$sh" "shorter than 32" YUZU_GW_ALLOW_DEFAULT_COOKIE=1 YUZU_GW_COOKIE=short
+    refused AP-prefix "$sh" "contains the published default" YUZU_GW_ALLOW_DEFAULT_COOKIE=1 "YUZU_GW_COOKIE=${default}abcdefgh"
+    refused AP-prefix-long "$sh" "contains the published default" YUZU_GW_ALLOW_DEFAULT_COOKIE=1 "YUZU_GW_COOKIE=${default}${strong}"
     refused G "$sh" "outside the allowed" YUZU_GW_ALLOW_DEFAULT_COOKIE=1 "YUZU_GW_COOKIE=${strong}\\&"
 
     if started_with D "$sh" YUZU_GW_ALLOW_DEFAULT_COOKIE=1 && printf '%s' "$cookie" | grep -Eq '^[0-9a-f]{64}$' \
