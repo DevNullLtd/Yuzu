@@ -22,7 +22,7 @@ std::string software_state_to_json(const std::vector<SoftwareInfo>& apps) {
                        {"publisher", a.publisher},
                        {"install_date", a.install_date}});
     }
-    return arr.dump();
+    return arr.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
 }
 
 std::vector<SoftwareInfo> software_state_from_json(const std::string& s) {

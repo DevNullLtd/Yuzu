@@ -708,3 +708,21 @@ TEST_CASE("software lens links into the Software host view", "[hardware][ui]") {
                   .find("/software#host=") == std::string::npos);
     }
 }
+
+// F7: the stored output is agent bytes. A deeply nested array must never reach
+// the recursive dump() (SIGSEGV on stack exhaustion); it renders as plain text.
+TEST_CASE("hardware action result: deeply nested agent JSON is rendered as text, not dumped (F7)",
+          "[hardware][ui]") {
+    HwActionResultView v;
+    v.phase = HwActionResultView::Phase::Rendered;
+    v.output = std::string(200000, '[') + std::string(200000, ']');
+    std::string html;
+    REQUIRE_NOTHROW(html = render_hardware_action_result("filesystem", "list_dir", v));
+    CHECK(html.find("<pre>") != std::string::npos);
+    CHECK(html.find("<table>") == std::string::npos);
+
+    // Shallow JSON still gets the table / pretty-print path.
+    v.output = R"([{"a":"1","b":[1,2]}])";
+    CHECK(render_hardware_action_result("filesystem", "list_dir", v).find("<table>") !=
+          std::string::npos);
+}

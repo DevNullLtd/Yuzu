@@ -1951,7 +1951,7 @@ private:
             // otherwise persist the full snapshot as before (the poll owns
             // both protocols). Events + baseline commit in ONE transaction.
             const std::string state_json =
-                connections_to_json(nstat_primary ? *diff_current : current).dump();
+                connections_to_json(nstat_primary ? *diff_current : current).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
             const bool ok = typed.empty()
                                 ? db_->set_state(net_key, state_json)
                                 : db_->fold_network_events(
@@ -2072,7 +2072,7 @@ private:
                 // Events + baseline in one transaction (#1654); non-fatal, so a
                 // failure emits no `error|` line (the tick's events_recorded
                 // contract holds) and the ledger records the token.
-                const std::string state_json = arp_to_json(*current).dump();
+                const std::string state_json = arp_to_json(*current).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
                 const bool ok = typed.empty()
                                     ? db_->set_state("arp", state_json)
                                     : db_->fold_arp_events(
@@ -2100,7 +2100,7 @@ private:
             auto current = dns_pre ? std::move(*dns_pre) : yuzu::echo::enumerate_dns();
             auto previous = json_to_dns(db_->get_state("dns"));
             auto typed = yuzu::echo::compute_dns_events(previous, current, ts, snap_id);
-            const std::string state_json = dns_to_json(current).dump();
+            const std::string state_json = dns_to_json(current).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
             const bool ok = typed.empty()
                                 ? db_->set_state("dns", state_json)
                                 : db_->fold_dns_events(
@@ -2495,7 +2495,7 @@ private:
 
                 auto typed = yuzu::echo::compute_service_events(previous, *current, ts, snap_id);
                 // Events + baseline in ONE transaction (#1654).
-                const std::string state_json = services_to_json(*current).dump();
+                const std::string state_json = services_to_json(*current).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
                 const bool ok = typed.empty()
                                     ? db_->set_state(svc_key, state_json)
                                     : db_->fold_service_events(
@@ -2525,7 +2525,7 @@ private:
 
             auto typed = yuzu::echo::compute_user_events(previous, current, ts, snap_id);
             // Events + baseline in ONE transaction (#1654).
-            const std::string state_json = users_to_json(current).dump();
+            const std::string state_json = users_to_json(current).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
             const bool ok = typed.empty()
                                 ? db_->set_state(usr_key, state_json)
                                 : db_->fold_user_events(
@@ -2633,7 +2633,7 @@ private:
                 const std::string md_key{yuzu::echo::diff_state_key("mapdrive")}; // #538
                 auto previous = json_to_mapdrive(db_->get_state(md_key));
                 auto typed = yuzu::echo::compute_mapdrive_events(previous, *current, ts, snap_id);
-                const std::string state_json = mapdrive_to_json(*current).dump();
+                const std::string state_json = mapdrive_to_json(*current).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
                 const bool ok = typed.empty()
                                     ? db_->set_state(md_key, state_json)
                                     : db_->fold_mapdrive_events(
@@ -3622,7 +3622,7 @@ private:
             arr.push_back(std::move(obj));
         }
 
-        ctx.write_output(arr.dump());
+        ctx.write_output(arr.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace));
         return 0;
     }
 

@@ -11,6 +11,7 @@
 #include <nlohmann/json.hpp>
 
 #include <string>
+#include <vector>
 
 using namespace yuzu::server;
 
@@ -306,4 +307,25 @@ TEST_CASE("ResultEnvelope: validate_types string/guid/clob always valid", "[resu
     result.rows.push_back(std::move(row));
 
     CHECK(validate_types(result).empty());
+}
+
+TEST_CASE("ResultEnvelope: parse_result is total over wrong-typed agent JSON (F6)",
+          "[result_envelope]") {
+    const std::string hostile =
+        R"({"columns":[5,{"name":7,"type":[]},{"name":"ok","type":"string"}],)"
+        R"("rows":[{"ok":1,"n":{"a":[1]}},"str",3],)"
+        R"("execution_id":1,"definition_id":[],"agent_id":{},"timestamp":"t","status":false,)"
+        R"("error_code":"x","duration_ms":1.5,"stdout":null,"stderr":7,"warnings":[1,null,"w"]})";
+    InstructionResult r;
+    REQUIRE_NOTHROW(r = parse_result(hostile, ""));
+    CHECK(r.warnings == std::vector<std::string>{"w"});
+    CHECK(r.timestamp == 0);
+    CHECK(r.error_code == 0);
+    REQUIRE(r.rows.size() == 3);
+    CHECK(r.rows[0].values.at("ok") == "1");
+
+    // Out-of-int-range error_code must not wrap or throw.
+    REQUIRE_NOTHROW(parse_result(R"({"columns":[],"rows":[],"error_code":99999999999})", ""));
+    // Malformed schema entries too.
+    REQUIRE_NOTHROW(parse_result(R"({"columns":[],"rows":[]})", R"([{"name":1,"type":2}])"));
 }

@@ -46,6 +46,7 @@ __declspec(allocate(".CRT$XCB"))
 #include "plugin_config_sync.hpp"
 #include "plugin_heartbeat_tags.hpp" // #1567 plugin heartbeat.* KV -> status tags
 #include "local_dispatcher.hpp"
+#include <wire_utf8.hpp>        // F70: yuzu::shared::scrub_wire_bytes at the plugin-output seam
 #include "ctx_slot.hpp"         // CtxSlot / cancel_ctx_slot (unit-tested, #2182)
 #include "command_frames.hpp"   // make_output_frame / make_final_frame (CommandResponse.action)
 #include "ota_update_thread.hpp" // OTA update thread lifecycle (unit-tested, #2182)
@@ -355,6 +356,17 @@ struct CommandContextImpl {
     std::string result_provenance;
 
     void append_output(const char* text) {
+        // F70: plugin text is declared UTF-8 but nothing enforced it, and the
+        // server's proto3 `string` parse rejects the WHOLE frame on one bad
+        // byte (ending this agent's command stream). Enforce the contract once,
+        // here, with the shared RFC 3629 scrubber (bad bytes -> '?'); the copy
+        // is made only when something needs replacing.
+        std::string scrubbed;
+        if (yuzu::shared::count_invalid_wire_bytes(text) != 0) {
+            scrubbed.assign(text);
+            yuzu::shared::scrub_wire_bytes(scrubbed);
+            text = scrubbed.c_str();
+        }
         std::lock_guard lock(buf_mu);
         size_t len = std::strlen(text);
         if (capture) {

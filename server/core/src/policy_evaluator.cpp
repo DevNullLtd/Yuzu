@@ -230,8 +230,15 @@ std::string verdict_for(const StoredResponse& r, const std::string& policy_id,
 std::string make_check_result(const StoredResponse& r) {
     nlohmann::json j;
     j["status"] = r.status;
-    j["output"] = r.output.size() > 1000 ? r.output.substr(0, 1000) : r.output;
-    return j.dump();
+    // Agent-supplied bytes: cut on a UTF-8 boundary (never mid-sequence) and
+    // dump with `replace` so invalid UTF-8 cannot throw type_error 316 (F6).
+    std::size_t n = std::min<std::size_t>(r.output.size(), 1000);
+    if (n < r.output.size()) {
+        while (n > 0 && (static_cast<unsigned char>(r.output[n]) & 0xC0) == 0x80)
+            --n;
+    }
+    j["output"] = r.output.substr(0, n);
+    return j.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
 }
 
 /// HA WS-3 3.4 (fold-in #3, PR #3939 review / #3424 / #3511): `.sent` is a
@@ -921,9 +928,24 @@ void PolicyEvaluator::collect_ready() {
                 if (it == best.end() || it->second.status == kStatusRunning) {
                     status = "unknown"; // no terminal response within the grace window
                 } else {
-                    status = verdict_for(it->second, f.policy_id, f.instruction_id,
-                                         f.compliance_expr, d_.instruction_store);
-                    cr = make_check_result(it->second);
+                    // F6: the response is agent-supplied. One hostile response
+                    // must degrade THIS target to the existing "error" verdict,
+                    // never unwind the pass (in_flight_ entries were already
+                    // moved out, so an escape here drops every later target).
+                    try {
+                        status = verdict_for(it->second, f.policy_id, f.instruction_id,
+                                             f.compliance_expr, d_.instruction_store);
+                        cr = make_check_result(it->second);
+                    } catch (const std::exception& e) {
+                        spdlog::warn("policy_evaluator: policy {} check {} response from agent {} "
+                                     "could not be evaluated ({}); verdict=error",
+                                     f.policy_id, f.instruction_id, tgt, e.what());
+                        status = "error";
+                        cr.clear();
+                    } catch (...) {
+                        status = "error";
+                        cr.clear();
+                    }
                 }
                 if (d_.policy_store) {
                     // Shared Check-phase write: a REMEDIATION verify entry

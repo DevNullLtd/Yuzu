@@ -18,12 +18,15 @@
 #include "echo_status_format.hpp"
 #include "test_helpers.hpp"
 
+#include <yuzu/agent/process_enum.hpp> // detail::parse_proc_status (F16)
+
 #include <sqlite3.h> // second connection: selective config-read fault injection
 
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <sstream>
 #include <chrono>
 #include <format>
 #include <atomic>
@@ -3437,3 +3440,23 @@ TEST_CASE("process baseline: a scrub that cannot write leaves the row and succee
     CHECK(scrub_process_baseline(db)); // the next start
     CHECK(db.get_state("process").find("S3cret") == std::string::npos);
 }
+
+// F16: a process name is attacker-chosen bytes. Strict nlohmann dump() throws type_error 316 on
+// invalid UTF-8, which aborted every collect_fast tick; the baseline must serialise regardless.
+TEST_CASE("process baseline: invalid UTF-8 in a name does not throw on encode (F16)",
+          "[echo][aggregator][process-baseline]") {
+    const auto bad = make_proc(10, 1, std::string("ev\xFF\xC3il"), "", "svc");
+    std::string json;
+    REQUIRE_NOTHROW(json = encode_process_baseline({bad}));
+    CHECK_FALSE(decode_process_baseline(json).empty());
+}
+
+#if defined(__linux__) || defined(__APPLE__)
+TEST_CASE("parse_proc_status: a non-UTF-8 process name is scrubbed at collection (F16)",
+          "[echo][aggregator][process-baseline]") {
+    std::istringstream in(std::string("Name:\tev\xFF\xC3il\nPPid:\t1\nUid:\t0\t0\t0\t0\n"));
+    yuzu::agent::ProcessInfo pi;
+    yuzu::agent::detail::parse_proc_status(in, pi);
+    CHECK(pi.name == "ev??il");
+}
+#endif

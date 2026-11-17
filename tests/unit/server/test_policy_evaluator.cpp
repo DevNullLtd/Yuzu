@@ -318,6 +318,32 @@ TEST_CASE("policy evaluator: compliant + non_compliant verdicts (multi-agent fan
     CHECK(h.status_of(pid, "agentB") == "non_compliant");
 }
 
+TEST_CASE("policy evaluator: one agent's hostile check output cannot abort the pass for the others "
+          "(F6)",
+          "[pg][policy][evaluator]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    REQUIRE(h.mg.add_member(h.group_id, "agentC").has_value());
+    // Wrong JSON types in every typed position parse_result reads.
+    h.canned["agentA|checkp"] = {1, R"({"columns":[5,{"name":7,"type":[]}],"rows":[{"hostname":1}],)"
+                                    R"("warnings":[1,null],"status":3,"error_code":"x",)"
+                                    R"("timestamp":"t","agent_id":{}})"};
+    // Invalid UTF-8 (and over the 1000-byte cap, so truncation could split a scalar).
+    h.canned["agentB|checkp"] = {1, std::string(999, 'a') + "\xC3\xA9\xFF\xFE"};
+    h.canned["agentC|checkp"] = {1, out_json("hostname", "yuzu-c")};
+    auto pid = h.author("result.hostname != ''");
+
+    PolicyEvaluator ev(h.deps());
+    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
+    h.fake_now += 20; // past grace
+    ev.tick(true);
+
+    CHECK(h.status_of(pid, "agentC") == "compliant");
+    CHECK(h.status_of(pid, "agentA") != "<none>");
+    CHECK(h.status_of(pid, "agentB") != "<none>");
+}
+
 TEST_CASE("policy evaluator: an operator evaluate_now completes even when the due-policy "
           "dispatch is fenced off-leader (WS-3 3.2, PR #4134)",
           "[pg][policy][evaluator]") {
