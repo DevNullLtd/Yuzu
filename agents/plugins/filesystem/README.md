@@ -804,9 +804,9 @@ total_lines_after|1
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/filesystem/src/filesystem_acl_parsers.hpp` · `agents/plugins/filesystem/src/filesystem_find_by_hash.hpp` · `agents/plugins/filesystem/src/filesystem_macos_sig.hpp` · `agents/plugins/filesystem/src/filesystem_plugin.cpp`
+- Plugin: `agents/plugins/filesystem/src/filesystem_acl_parsers.hpp` · `agents/plugins/filesystem/src/filesystem_find_by_hash.hpp` · `agents/plugins/filesystem/src/filesystem_macos_sig.hpp` · `agents/plugins/filesystem/src/filesystem_plugin.cpp` · `agents/plugins/filesystem/src/filesystem_reserved_paths.hpp`
 - Definitions: `content/definitions/filesystem.yaml` · `content/definitions/t2_capabilities.yaml` · `content/definitions/t2_chaining_examples.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_a.hpp`
-- Tests: `tests/test_filesystem_definition.py` · `tests/unit/test_filesystem_acl_parsers.cpp` · `tests/unit/test_filesystem_actions.cpp` · `tests/unit/test_filesystem_find_by_hash.cpp` · `tests/unit/test_filesystem_find_by_hash_dispatcher.cpp` · `tests/unit/test_filesystem_get_acl_dispatcher.cpp` · `tests/unit/test_filesystem_local_dispatcher.cpp` · `tests/unit/test_filesystem_macos_sig.cpp` · `tests/unit/test_filesystem_posture_local_dispatcher.cpp` · `tests/unit/test_filesystem_posture_parsers.cpp` · `tests/unit/test_filesystem_read.cpp`
+- Tests: `tests/test_filesystem_definition.py` · `tests/unit/test_filesystem_acl_parsers.cpp` · `tests/unit/test_filesystem_actions.cpp` · `tests/unit/test_filesystem_find_by_hash.cpp` · `tests/unit/test_filesystem_find_by_hash_dispatcher.cpp` · `tests/unit/test_filesystem_get_acl_dispatcher.cpp` · `tests/unit/test_filesystem_local_dispatcher.cpp` · `tests/unit/test_filesystem_macos_sig.cpp` · `tests/unit/test_filesystem_posture_local_dispatcher.cpp` · `tests/unit/test_filesystem_posture_parsers.cpp` · `tests/unit/test_filesystem_read.cpp` · `tests/unit/test_filesystem_reserved_paths.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
 <!-- END GENERATED -->
