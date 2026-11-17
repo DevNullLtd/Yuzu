@@ -4232,6 +4232,16 @@ private:
             changed = true;
         }
         if (slow_secs > 0) {
+            // A stored back-off deadline was computed from the old tick period. A changed
+            // period ends every back-off, so the next tick retries and the schedule restarts
+            // at the new period (a re-assert of the same value keeps it).
+            if (yuzu::echo::parse_tick_seconds(db_->get_config("slow_interval_seconds", "300")) !=
+                slow_secs) {
+                std::lock_guard lock(collect_mu_);
+                for (const auto& [name, retry] : cursor_retry_)
+                    note_next_retry(name, std::nullopt);
+                cursor_retry_.clear();
+            }
             db_->set_config("slow_interval_seconds", std::string{slow_interval});
             ctx.write_output(std::format("config|slow_interval_seconds|{}", slow_interval));
             changed = true;

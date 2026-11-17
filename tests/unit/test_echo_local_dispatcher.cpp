@@ -1357,3 +1357,68 @@ TEST_CASE("echo plugin: a query over a retired $X_Live name fails as an unknown 
     CHECK(ok.rc == 0);
     CHECK(row_with_prefix(rows_of(ok.captured), "__total__|0").has_value()); // empty, not an error
 }
+
+TEST_CASE("echo plugin: a failing cursor source backs off on the real tick, and a changed "
+          "slow_interval ends the back-off",
+          "[echo][local_dispatcher][cursor][retry]") {
+    // The back-off deadline is an absolute time computed from the tick period in force when the
+    // tick failed. After a period change it is stale (hours out after 7200 s, then 30 s), so a
+    // changed slow_interval must end every back-off; a re-assert of the same value keeps it.
+    // The cursor read is made to fail by renaming the echo_cursor table from a second
+    // connection: the source keeps its cursor (nothing is written) and the tick reports
+    // capture_incomplete, then retry_backoff while the delay holds.
+    const auto plugin_path = find_echo_plugin();
+    if (plugin_path.empty()) {
+        if (std::getenv("MESON_BUILD_ROOT") != nullptr)
+            FAIL("echo plugin library not found under meson test");
+        WARN("echo plugin library not found -- skipping (run from the build root or via meson test)");
+        return;
+    }
+    auto handle = yuzu::agent::PluginHandle::load(plugin_path);
+    REQUIRE(handle.has_value());
+    const auto* desc = handle->descriptor();
+    REQUIRE(desc != nullptr);
+    REQUIRE(desc->init != nullptr);
+
+    yuzu::test::TempDir dir_guard{"yuzu_test_echo_cursor_backoff_"};
+    std::error_code ec;
+    fs::create_directories(dir_guard.path, ec);
+    auto kv = yuzu::agent::KvStore::open(dir_guard.path / "kv_store.db");
+    REQUIRE(kv.has_value());
+    yuzu::agent::StandalonePluginContext ctx("echo", {{"agent.data_dir", dir_guard.path.string()}},
+                                             &*kv);
+    REQUIRE(desc->init(ctx.get()) == 0);
+    yuzu::agent::LocalDispatcher d;
+    const yuzu::test::ScopeExit shutdown_on_exit{[&] { desc->shutdown(ctx.get()); }};
+
+    const auto db_path = dir_guard.path / "echo.db";
+    const auto configure = [&](const char* slow) {
+        const YuzuParam p[] = {{"slow_interval", slow}};
+        REQUIRE(d.run(desc, "configure", p).rc == 0);
+    };
+    const auto power_line = [&]() {
+        const auto rows = rows_of(d.run(desc, "collect_slow").captured);
+        return row_with_prefix(rows, "echo|collect_power|");
+    };
+
+    configure("7200");
+    raw_sql(db_path, "ALTER TABLE echo_cursor RENAME TO echo_cursor_hidden");
+
+    CHECK(power_line() == std::optional<std::string>{"echo|collect_power|0|capture_incomplete"});
+    CHECK(power_line() == std::optional<std::string>{"echo|collect_power|0|retry_backoff"});
+    const auto next_retry = [&] {
+        return row_with_prefix(rows_of(d.run(desc, "status").captured),
+                               "config|power_next_retry_at|");
+    };
+    CHECK(next_retry().has_value());
+
+    SECTION("re-asserting the same interval keeps the back-off") {
+        configure("7200");
+        CHECK(power_line() == std::optional<std::string>{"echo|collect_power|0|retry_backoff"});
+    }
+    SECTION("a changed interval ends the back-off: the next tick retries") {
+        configure("30");
+        CHECK_FALSE(next_retry().has_value());
+        CHECK(power_line() == std::optional<std::string>{"echo|collect_power|0|capture_incomplete"});
+    }
+}
