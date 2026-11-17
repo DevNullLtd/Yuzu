@@ -41,7 +41,7 @@ namespace yuzu::server {
     // #3425: endpoint-containment confirmation state (schema v2), 0 = never, matching
     // quarantined_at's own never-happened shape. last_applied_at: a system re-dispatch of the
     // stored whitelist was accepted (agents_reached > 0), NOT proof of containment.
-    // last_confirmed_at: a follow-up quarantine.status read reported state|active.
+    // last_confirmed_at: a follow-up firewall.quarantine_status read reported the device's rules in force.
     o["last_applied_at"] = r.last_applied_at;
     o["last_confirmed_at"] = r.last_confirmed_at;
     return o;

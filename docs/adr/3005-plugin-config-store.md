@@ -175,15 +175,14 @@ informational only.
 ### Update (2026-11-13) — the firewall plugin's four containment actions are protective
 
 `firewall.quarantine`, `firewall.release`, `firewall.quarantine_status` and
-`firewall.quarantine_allow` join the protective set on the owner's decision of 2026-11-12, as a second CLOSED
-four-action predicate (`is_firewall_control_plugin`) behind the same single `is_protective_action`:
+`firewall.quarantine_allow` join the protective set on the owner's decision of 2026-11-12, as a CLOSED
+four-action predicate (`is_firewall_control_plugin`) behind the single `is_protective_action`:
 `firewall.release` is the way out of a firewall containment, so no enablement gate may refuse it.
 The other firewall actions (`state`, `rules`) stay ordinary, so a plugin-level `firewall` kill-switch
 row is labelled `protective_exempt=partial` (not `true`, which means a complete exemption) because it still gates them. Authorization is unchanged (the
 catalogue rows keep their permission and approval gates). The containment-gate exemption
-(`is_quarantine_control_plugin`) is deliberately unchanged: it keeps naming the quarantine plugin
-only until the server's live containment path moves to the firewall plugin (#7437, which re-keys that exemption), so a firewall
-containment is reachable for release only while the quarantine store can be read.
+is the same predicate (`is_firewall_control_plugin`), so a firewall containment is reachable for
+release even while the quarantine store cannot be read.
 
 ### Update (2026-10-03, #5294) — per-OS kill-switch rows
 

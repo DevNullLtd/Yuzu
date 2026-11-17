@@ -11,19 +11,27 @@
 /// `dispatch_target_shape.hpp` exist to prevent for their own chokepoints —
 /// see CLAUDE.md's routed-concerns entries for those two.
 ///
+/// The endpoint is the firewall plugin: `firewall.quarantine` applies,
+/// `firewall.quarantine_status` reads, `firewall.release` lifts. This header
+/// owns the server's side of that contract: the constants naming those
+/// actions, the mapping from the stored whitelist to the plugin's `exceptions`
+/// grammar, and the reading of the plugin's status reply.
+///
 /// Two layers, split by I/O:
 ///
-/// LAYER A (this header, inline, PURE — no I/O, no includes beyond the
-/// standard library): the whitelist validator, the params builder, and the
-/// agent-side status-response parser. Mirrors `quarantine_dispatch_decision.hpp`'s
+/// LAYER A (this header, inline, PURE — no I/O, standard library only; the one
+/// out-of-line helper, `combined_output`, takes a forward-declared
+/// `StoredResponse`): the whitelist mapper, the params builder, and the
+/// agent-side status-reply parser. Mirrors `quarantine_dispatch_decision.hpp`'s
 /// "pure on purpose" discipline — a unit test can exhaust every branch
 /// without a store, an agent, or a build dir.
 ///
 /// LAYER B (declared here, implemented in `quarantine_reapply.cpp` — genuine
 /// I/O: a `QuarantineStore::get_status` read plus an injected dispatch call):
 /// `redispatch_stored_containment` is the ONE place that reads the stored
-/// row, validates it, and drives a re-dispatch. Both callers hand it a thin
-/// adapter closing over their own dispatch shape — MCP's 7-param
+/// row, maps it, and drives a `firewall.quarantine` dispatch for a stored
+/// record (the reconciler and MCP both go through it). Both callers hand it a
+/// thin adapter closing over their own dispatch shape — MCP's 7-param
 /// caller-typed `DispatchFn` (`DispatchCaller` + audit + response shaping
 /// stay in `mcp_server.cpp`) and the reconciler's 6-param
 /// `command_dispatch_fn` (`server.cpp:16466`) — so this file stays
@@ -41,13 +49,29 @@
 /// twice.
 ///
 /// WHY THE WHITELIST IS RE-VALIDATED HERE TOO: the row on disk may have been
-/// written by `POST /api/v1/quarantine` (record-only, no charset/length
-/// validation of its own) and is about to reach the agent's
-/// netsh/iptables/pf sink via THIS dispatch — the request-time validation in
-/// `mcp_server.cpp`'s live-quarantine path does not cover a row written
-/// through the REST twin or read back later by the reconciler.
+/// written by `POST /api/v1/quarantine` (record-only) and is about to reach
+/// the agent's firewall sink via THIS dispatch — the request-time validation
+/// in `mcp_server.cpp`'s live-quarantine path does not cover a row written
+/// through the REST twin or read back later by the reconciler. The mapper is
+/// the one validator: a token it cannot express in the agent's grammar
+/// refuses visibly, never silently dropped.
+///
+/// WHY A RELEASING ROW IS NEVER RE-APPLIED: a record with a release requested
+/// still occupies the store's active slot (so it stays listed and keeps the
+/// dispatch refusal), but dispatching `firewall.quarantine` for it would put
+/// containment back under a release that is in flight. The chokepoint refuses
+/// it (`release_pending`), reading the row it is about to dispatch for.
+///
+/// WHAT "CONFIRMED" MEANS: the device reports its rules in force and
+/// enforcing (`status|active`, or `status|active_unproven` when no probe
+/// target is stored). It is NOT a reachability proof, and the server does not
+/// compare the device's allow-list with the stored whitelist: a
+/// `firewall.quarantine_allow` sent outside the quarantine routes changes the
+/// device and not the record. The one difference the device reports is
+/// `kAllowSetUnchangedNote`; the reconciler header says how it is handled.
 
 #include <cstddef>
+#include <cstdint>
 #include <expected>
 #include <functional>
 #include <optional>
@@ -55,70 +79,116 @@
 #include <string_view>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace yuzu::server {
 
 class QuarantineStore;
 struct QuarantineRecord;
+struct StoredResponse; // response_store.hpp (the .cpp includes it)
 
 // ── Layer A: pure ────────────────────────────────────────────────────────
 
-inline constexpr std::string_view kQuarantinePluginName{"quarantine"};
-inline constexpr std::string_view kQuarantineApplyAction{"quarantine"};
-inline constexpr std::string_view kQuarantineStatusAction{"status"};
-inline constexpr std::string_view kQuarantineWhitelistParam{"whitelist_ips"};
+inline constexpr std::string_view kContainmentPlugin{"firewall"};
+inline constexpr std::string_view kContainmentApplyAction{"quarantine"};
+inline constexpr std::string_view kContainmentStatusAction{"quarantine_status"};
+inline constexpr std::string_view kContainmentReleaseAction{"release"};
+inline constexpr std::string_view kContainmentExceptionsParam{"exceptions"};
+/// The agent accepts 64 exceptions (`kMaxExceptions`, firewall_quarantine_parsers.hpp);
+/// each address is sent twice (`/out` and `/in`), so the server allows 32.
+inline constexpr std::size_t kContainmentMaxAddresses = 32;
 inline constexpr std::size_t kQuarantineWhitelistMaxLen = 512;
 
-/// Mirrors the agent's `is_safe_ip` charset (`[0-9a-fA-F.:]`, <=45 chars per
-/// comma-separated token) — moved verbatim from the MCP handler's lambda
-/// (#3127) so both callers of `redispatch_stored_containment` clear the same
-/// check before a stored whitelist reaches the agent's firewall sink.
-[[nodiscard]] bool quarantine_whitelist_tokens_safe(std::string_view whitelist);
+/// Maps a stored (or request) whitelist onto the firewall plugin's `exceptions`
+/// parameter: each comma-separated address becomes `<ip>/out,<ip>/in`, order kept,
+/// no de-duplication (the agent de-duplicates). IPv6 is sent unbracketed (the agent
+/// takes an unbracketed literal with two or more colons). Spaces around a token are
+/// trimmed and empty tokens skipped. `nullopt` when anything cannot be expressed: a
+/// token that is not a bare IPv4/IPv6 literal (a port, a prefix length, an
+/// IPv4-mapped form, an IPv4 octet with a leading zero, a character outside
+/// `[0-9a-fA-F.:]`, over 45 characters), more than `kContainmentMaxAddresses`
+/// addresses, or a list over `kQuarantineWhitelistMaxLen` characters. An empty or
+/// all-blank list maps to the empty string.
+[[nodiscard]] std::optional<std::string> map_whitelist_to_exceptions(std::string_view whitelist);
 
-/// Builds the dispatch params for a re-application of `stored_whitelist`.
-/// `nullopt` when the stored value fails the server-edge check (oversized or
-/// an unsafe token) — the caller must treat that as a hard stop, never
-/// dispatch anyway. An empty `stored_whitelist` is valid and yields an empty
-/// map (the plugin's `whitelist_ips` param is optional).
+/// Builds the dispatch params for a re-application of `stored_whitelist`:
+/// `{exceptions: <mapped>}`, or an empty map for an empty whitelist (the plugin's
+/// `exceptions` param is optional on `quarantine`). `nullopt` when the mapper refuses
+/// — the caller must treat that as a hard stop, never dispatch anyway.
 [[nodiscard]] std::optional<std::unordered_map<std::string, std::string>>
 build_quarantine_reapply_params(std::string_view stored_whitelist);
 
-/// The agent-side quarantine plugin's `do_status` response vocabulary. Dual:
-/// a pre-#3429 agent emits only `active`/`inactive`; #3429 (agent-side
-/// mutation-serialization hardening, merged) adds `partial`/`uncertain`/
-/// `degraded` and a `status|busy` mutation-gate response. Parsing both
-/// vocabularies here means this fleet-version-skew requirement holds
-/// regardless of merge order — a fleet upgrades agents gradually, so both
-/// vocabularies are live in production simultaneously for as long as any
-/// pre-#3429 agent is deployed.
-enum class QuarantineEndpointState { active, partial, inactive, uncertain, degraded, busy, unknown };
+/// The one row (whole line, exact) the device adds to a `firewall.quarantine` reply when the
+/// device was already contained and the request's operator exceptions differ, as a set, from the
+/// ones in force: the device kept its stored allow set. The device makes the comparison; the
+/// server never parses the allow rows.
+inline constexpr std::string_view kAllowSetUnchangedNote{
+    "note|allow_set_unchanged_use_quarantine_allow=1"};
 
-/// Parses a `quarantine.status` (or a busy mutation response) command
-/// response payload. Scans line by line (the plugin's `do_status` can emit
-/// more than one output line); a line starting `state|` yields its first
-/// pipe-delimited token (a trailing `|note|<text>` is tolerated and
-/// ignored); a line `status|busy` yields `busy`; anything else contributes
-/// nothing. The FIRST recognized token wins. No recognized line anywhere in
-/// `payload` yields `unknown` — never silently treated as `active`.
-[[nodiscard]] QuarantineEndpointState parse_quarantine_endpoint_state(std::string_view payload);
+/// What a `firewall.quarantine_status` reply (or a `firewall.release` reply) says about
+/// the device's containment. `active_unproven` is the plugin's "rules in force and
+/// enforcing, but no completed reachability proof".
+enum class QuarantineEndpointState { active, active_unproven, inactive, busy, unconfirmed };
 
-/// Exhaustive switch, no `default:`, so a future `QuarantineEndpointState`
-/// enumerator fails to compile here instead of silently falling through
-/// (the `should_dispatch_isolation` idiom, `quarantine_dispatch_decision.hpp`).
-/// Only `active` counts as confirmed endpoint containment — `partial`/
-/// `uncertain`/`degraded` are explicitly NOT confirmation (the endpoint may
-/// be half-contained or the agent may not know), and `busy`/`inactive`/
-/// `unknown` obviously are not.
-[[nodiscard]] constexpr bool endpoint_state_confirms_containment(QuarantineEndpointState state) {
-    switch (state) {
+/// A parsed reply: the state, whether a probe target is configured on the device's record,
+/// and whether the device said it kept an earlier allow set (see `kAllowSetUnchangedNote`).
+struct ContainmentReply {
+    QuarantineEndpointState state{QuarantineEndpointState::unconfirmed};
+    bool probe_configured{false};
+    bool allow_set_unchanged{false}; ///< the exact `kAllowSetUnchangedNote` row was present
+    bool status_seen{false}; ///< a `status|` line was present (even a refusal): the device answered
+};
+
+/// The enumerator's name, for audit text: never device text.
+[[nodiscard]] constexpr const char* endpoint_state_name(QuarantineEndpointState s) {
+    switch (s) {
+    case QuarantineEndpointState::active:
+        return "active";
+    case QuarantineEndpointState::active_unproven:
+        return "active_unproven";
+    case QuarantineEndpointState::inactive:
+        return "inactive";
+    case QuarantineEndpointState::busy:
+        return "busy";
+    case QuarantineEndpointState::unconfirmed:
+        return "unconfirmed";
+    }
+    return "unconfirmed";
+}
+
+/// Parses a firewall action's reply payload. Scans line by line (trailing CR stripped
+/// so a CRLF agent still matches); the FIRST line starting `status|` decides — the
+/// plugin renders it first. Its token up to the next `|` maps to active /
+/// active_unproven / inactive / busy; any other token, every refusal
+/// (`status|refused|...`, the privilege refusal included), a partial or degraded
+/// status, and a reply with no status line at all is `unconfirmed` — never silently
+/// treated as `active`. Any `note|probe_target=` row sets `probe_configured`; the exact line
+/// `kAllowSetUnchangedNote` sets `allow_set_unchanged`.
+[[nodiscard]] ContainmentReply parse_containment_reply(std::string_view payload);
+
+/// A command's stored response rows (the store returns them newest first) joined oldest
+/// first with '\n', so a multi-frame reply reads as the one payload `parse_containment_reply`
+/// expects. The reconciler's poll and the DELETE route's confirm wait both read replies this
+/// way.
+[[nodiscard]] std::string combined_output(const std::vector<StoredResponse>& rows);
+
+/// Whether the reply confirms containment. Exhaustive switch, no `default:`, so a
+/// future enumerator fails to compile here instead of silently falling through (the
+/// `should_dispatch_isolation` idiom, `quarantine_dispatch_decision.hpp`). `active` —
+/// confirmed. `active_unproven` — confirmed only when no probe target is configured:
+/// with one, the plugin folds a failed proof (for example `probe_still_reachable`)
+/// into `active_unproven`, and a status read carries no `verify|` row to tell the two
+/// apart, so only a verified proof (`active`) confirms. Everything else is not
+/// confirmation (the endpoint may be half-contained or the agent may not know).
+[[nodiscard]] constexpr bool reply_confirms_containment(const ContainmentReply& reply) {
+    switch (reply.state) {
     case QuarantineEndpointState::active:
         return true;
-    case QuarantineEndpointState::partial:
+    case QuarantineEndpointState::active_unproven:
+        return !reply.probe_configured;
     case QuarantineEndpointState::inactive:
-    case QuarantineEndpointState::uncertain:
-    case QuarantineEndpointState::degraded:
     case QuarantineEndpointState::busy:
-    case QuarantineEndpointState::unknown:
+    case QuarantineEndpointState::unconfirmed:
         return false;
     }
     return false; // fail closed; unreachable while the switch above stays exhaustive
@@ -136,16 +206,17 @@ enum class ContainmentReapplyErrorKind {
     no_active_record,  // get_status succeeded but returned nothing (released
                         // between the caller's read and this call — a narrow
                         // race, not a store failure)
-    whitelist_invalid, // the stored row failed quarantine_whitelist_tokens_safe
+    whitelist_invalid, // the stored whitelist could not be mapped to exceptions
+    release_pending,   // the row has a release requested: containment is not re-applied under it
 };
 
 struct ContainmentReapplyError {
     ContainmentReapplyErrorKind kind;
     // The store's raw error message for `store_error`; a fixed human string
     // ("quarantine record not found on retry read") for `no_active_record`;
-    // empty for `whitelist_invalid` — callers that want a message for that
-    // case supply their own fixed text (the recipe intentionally does not
-    // echo the rejected value back).
+    // empty for `whitelist_invalid` and `release_pending` — callers that want a
+    // message for those cases supply their own fixed text (the recipe
+    // intentionally does not echo the rejected value back).
     std::string detail;
 };
 
@@ -155,22 +226,22 @@ struct ContainmentReapplyResult {
     int agents_reached{0};
 };
 
-/// Caller-supplied dispatch adapter: pre-bound to plugin `quarantine`,
-/// action `quarantine`, target `{agent_id}`, and whatever caller identity /
+/// Caller-supplied dispatch adapter: pre-bound to plugin `firewall`, action
+/// `quarantine`, target `{agent_id}`, and whatever caller identity /
 /// execution_id / DispatchCaller shape that transport needs — this function
-/// only ever calls it with the validated `whitelist_ips` params (or an empty
+/// only ever calls it with the mapped `exceptions` params (or an empty
 /// map). Exceptions thrown by the callee are caught here and reported via
 /// `ContainmentReapplyResult::dispatch_threw`, matching the MCP handler's
 /// existing try/catch around its own dispatch call.
 using ReapplyDispatchFn =
     std::function<std::pair<std::string, int>(const std::unordered_map<std::string, std::string>&)>;
 
-/// The shared recipe: `store.get_status(agent_id)` -> validate the stored
-/// whitelist -> build params -> invoke `dispatch_fn(params)`. `out_record`
-/// receives the stored row on success (the caller typically needs
-/// `quarantined_by`/`reason`/`quarantined_at` for its own response/audit
-/// shaping, which this function does not interpret). Returns `unexpected`
-/// without ever calling `dispatch_fn` on any `ContainmentReapplyError`.
+/// The shared recipe: `store.get_status(agent_id)` -> refuse a releasing row -> map the
+/// stored whitelist -> invoke `dispatch_fn(params)`. `out_record` receives the stored
+/// row on success (the caller typically needs `quarantined_by`/`reason`/
+/// `quarantined_at` for its own response/audit shaping, which this function does not
+/// interpret). Returns `unexpected` without ever calling `dispatch_fn` on any
+/// `ContainmentReapplyError`.
 [[nodiscard]] std::expected<ContainmentReapplyResult, ContainmentReapplyError>
 redispatch_stored_containment(QuarantineStore& store, const std::string& agent_id,
                               const ReapplyDispatchFn& dispatch_fn, QuarantineRecord& out_record);
