@@ -827,7 +827,7 @@ check_install() {
         if [[ ! -f "$SUDOERS_TARGET" ]]; then
             warn "$SUDOERS_TARGET is missing"; ((errs++))
         elif [[ ! -r "$SUDOERS_TARGET" ]]; then
-            # Cannot read it = cannot verify the grants (the old-glob and wrapper-grant checks below
+            # Cannot read it = cannot verify the grants (the glob-grant and wrapper-grant checks below
             # would be skipped), so a green result would be false (WP13 governance R4-CHECKGREEN).
             warn "$SUDOERS_TARGET is present but not readable by $(id -un): its grants are UNVERIFIED"
             warn "  (mode 0440 root-owned is correct; re-run --check as root)"
@@ -851,7 +851,7 @@ check_install() {
                 fi
             else
                 if grep -Eq '^[^#]*launchctl[[:space:]]+(bootstrap|bootout)' "$SUDOERS_TARGET"; then
-                    warn "$SUDOERS_TARGET still carries the launchctl bootstrap/bootout grants - re-run the installer"
+                    warn "$SUDOERS_TARGET carries the launchctl bootstrap|bootout grants - re-run the installer"
                     ((errs++))
                 fi
             fi

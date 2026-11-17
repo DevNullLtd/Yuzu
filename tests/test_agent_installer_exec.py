@@ -128,7 +128,7 @@ WRAPPER_BODY = "#!/bin/sh\nexit 0\n"
 def run_script(label, want, args, *, platform="Linux", visudo_ok=True, getcap="empty", setcap=True,
                wrapper_install_ok=True, layout=None, caps_on_binary=False, extra_env=None, uid0=False,
                test_root_override=None, sudoers_mode=None, cwd_is_dir=False):
-    """layout: None (nothing exists), 'healthy', 'old_glob', 'no_wrapper', 'no_wrapper_grant'."""
+    """layout: None (nothing exists), 'healthy', 'glob_grant', 'no_wrapper', 'no_wrapper_grant'."""
     me = getpass.getuser()
     with tempfile.TemporaryDirectory(prefix="yuzu_test_installer_run_") as d:
         d = pathlib.Path(d)
@@ -180,7 +180,7 @@ mkdir -p "$(dirname "$last")" 2>/dev/null; cp "$s" "$last" 2>/dev/null; chmod 75
             sudoers.write_text(("# c\n" + (f"{me} ALL=(root) NOPASSWD: /bin/launchctl enable system/*\n" if mac else grant)))
             if not mac:
                 wrapper.write_text(WRAPPER_BODY); wrapper.chmod(0o755)
-        elif layout == "old_glob":
+        elif layout == "glob_grant":
             sudoers.write_text(f"{me} ALL=(root) NOPASSWD: /usr/bin/systemctl enable *\n" + grant)
             wrapper.write_text(WRAPPER_BODY); wrapper.chmod(0o755)
         elif layout == "no_wrapper":
@@ -209,7 +209,7 @@ mkdir -p "$(dirname "$last")" 2>/dev/null; cp "$s" "$last" 2>/dev/null; chmod 75
 # --check on a healthy layout MUST exit 0 (a GNU `stat -f` made it always 1), drift MUST exit 1
 run_script("check healthy linux => 0", 0, ["--check"], layout="healthy")
 run_script("check healthy macos => 0", 0, ["--check"], layout="healthy", platform="Darwin")
-run_script("check: glob grant => 1", 1, ["--check"], layout="old_glob")
+run_script("check: glob grant => 1", 1, ["--check"], layout="glob_grant")
 run_script("check: missing wrapper => 1", 1, ["--check"], layout="no_wrapper")
 run_script("check: wrapper grant absent => 1", 1, ["--check"], layout="no_wrapper_grant")
 run_script("check: caps present => 1", 1, ["--check"], layout="healthy", getcap="caps")
@@ -225,7 +225,7 @@ _, _, r = run_script("check: sudoers present but unreadable (mode 0000) => 6", 6
                      layout="healthy", sudoers_mode=0)
 if "UNVERIFIED" not in r.stderr:
     errs.append("an unreadable sudoers file must be reported as UNVERIFIED on stderr")
-# a real drift still wins over unverified (1, not 6) is covered by the old-glob case above
+# a real drift still wins over unverified (1, not 6) is covered by the glob-grant case above
 
 # N5-2: real drift (exit 1) takes precedence over unverified (exit 6) when both are present
 run_script("check: drift AND unreadable sudoers => 1 (drift wins over unverified)", 1,
@@ -273,9 +273,9 @@ _, _, r = run_script("install --no-cap-cleanup with live caps => 0 but LOUD on s
                      ["--no-cap-cleanup"], getcap="caps")
 if "STILL LIVE" not in r.stderr:
     errs.append("--no-cap-cleanup with live capabilities must warn on stderr")
-_, _, r = run_script("install --no-setcap is an unknown flag (exit 2)", 2, ["--no-setcap"])
+_, _, r = run_script("install with an unknown flag exits 2", 2, ["--no-such-flag"])
 if "unknown arg" not in r.stderr:
-    errs.append("--no-setcap must be rejected as an unknown arg")
+    errs.append("an unknown flag must be rejected as an unknown arg")
 # SOURCE_ONLY set on an EXECUTED script must not silently exit 0
 d, root, r = run_script("executed with SOURCE_ONLY still runs (no silent no-op)", 3, [],
                         visudo_ok=False, extra_env={"YUZU_INSTALLER_SOURCE_ONLY": "1"})
