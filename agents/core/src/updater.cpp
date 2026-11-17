@@ -201,6 +201,13 @@ bool iequal(std::string_view a, std::string_view b) {
     });
 }
 
+/// The update-verified marker, beside the executable. ONE definition for its writer
+/// (Updater::mark_update_verified) and its reader (Updater::rollback_if_needed): if the two paths
+/// drift apart, a verified build is rolled back (#7291).
+std::filesystem::path update_verified_marker(const std::filesystem::path& exe_path) {
+    return exe_path.parent_path() / ".yuzu-update-verified";
+}
+
 } // anonymous namespace
 
 // ── current_executable_path ────────────────────────────────────────────────
@@ -1008,7 +1015,7 @@ void Updater::mark_update_verified() {
     if (!config_.enabled) { // self-guarded: a disabled updater writes nothing beside the binary
         return;
     }
-    const auto marker = exe_path_.parent_path() / ".yuzu-update-verified";
+    const auto marker = update_verified_marker(exe_path_);
     std::ofstream out{marker};
     out << "ok";
     out.flush();
@@ -1053,7 +1060,7 @@ bool Updater::rollback_if_needed() {
     // rollback branch is reachable only when that write failed (or an earlier run's marker was
     // never consumed): it is not a crash guard. A build that dies before it registers is never
     // seen by this check at all.
-    auto marker_path = exe_path_.parent_path() / ".yuzu-update-verified";
+    const auto marker_path = update_verified_marker(exe_path_);
 
     if (fs::exists(marker_path, ec)) {
         // The update was verified — clean up the old binary and the marker

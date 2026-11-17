@@ -14,7 +14,9 @@
  * writes, and `unknown` for anything else (a renamed token, an over-long or newline-bearing value).
  * The tokens are duplicated literals of agents/plugins/echo/src/echo_status_format.hpp's
  * offline_reason_token(): there is no shared header between a plugin and the server, so a test on
- * each side pins the strings, and a rename on one side only would surface as reason=unknown.
+ * each side pins the strings, and a rename on one side only would surface as reason=unknown. The
+ * agent-side pin is tests/unit/test_echo_open_retry.cpp, case "offline_reason_token: the literals
+ * the server's gauge parser mirrors".
  *
  * Pure.
  */

@@ -611,7 +611,7 @@ public:
             // changed. The plugin LOADS, offline, so `echo.status` can say why
             // (`storage_state|offline|<reason>`); no trigger is registered and nothing collects
             // until a background retry opens the database (owner ruling 2026-11-16, #7290).
-            if (result.error().find(yuzu::echo::kV10DeadlineMarker) != std::string::npos)
+            if (yuzu::echo::is_deadline_hit(result.error()))
                 ++deadline_hits_;
             go_offline(reason, result.error(), 1);
             open_retry_.start([this](unsigned attempt, const std::function<bool()>& cancelled) {
@@ -1230,11 +1230,16 @@ public:
                 // Loaded but offline (the open failed and is being retried): `status` explains,
                 // every other action refuses with the same error. `error|` leads, as
                 // format_storage_*_lines pins. While an attempt is running next_attempt is in the
-                // past, so the wait clamps to 0 and line 0 reads "Retrying now."
-                const auto wait = std::chrono::duration_cast<std::chrono::seconds>(
-                    offline.next_attempt - std::chrono::steady_clock::now());
+                // past, so the wait clamps to 0 and line 0 reads "Retrying now." Once the retry
+                // loop has ended (collection failed to start after a late open) there is no next
+                // attempt: no wait, and line 0 asks for a restart.
+                std::optional<std::chrono::seconds> wait;
+                if (offline.retry_scheduled)
+                    wait = std::max(std::chrono::duration_cast<std::chrono::seconds>(
+                                        offline.next_attempt - std::chrono::steady_clock::now()),
+                                    std::chrono::seconds{0});
                 const auto lines = yuzu::echo::format_storage_refused_lines(
-                    offline.reason, offline.detail, std::max(wait, std::chrono::seconds{0}));
+                    offline.reason, offline.detail, wait);
                 for (std::size_t i = 0; i < lines.size(); ++i)
                     if (i == 0 || action == "status")
                         ctx.write_output(lines[i]);
@@ -1409,19 +1414,28 @@ public:
     // Record the offline state (the reason `status` reports and the time of the next attempt), publish
     // the heartbeat tag the fleet gauge reads, and log one line. `failed_attempts` counts the
     // attempts that have failed so far (init's own is 1), which also picks the next back-off.
-    void go_offline(yuzu::echo::OfflineReason reason, std::string detail, unsigned failed_attempts) {
+    // `retry_scheduled` is false only when the retry loop is ending on this failure (collection
+    // failed to start after a late open): `status` then asks for a restart instead of promising a
+    // retry.
+    void go_offline(yuzu::echo::OfflineReason reason, std::string detail, unsigned failed_attempts,
+                    bool retry_scheduled = true) {
         const auto delay = yuzu::echo::open_retry_delay(failed_attempts);
         {
             std::lock_guard lock(offline_mu_);
             offline_.reason = reason;
             offline_.detail = detail;
             offline_.next_attempt = std::chrono::steady_clock::now() + delay;
+            offline_.retry_scheduled = retry_scheduled;
         }
         yuzu::PluginContext pctx{plugin_ctx_};
         if (!pctx.storage_set(yuzu::echo::kStorageOfflineKey, yuzu::echo::offline_reason_token(reason)))
             spdlog::warn("ECHO: failed to publish the storage-offline heartbeat tag");
-        spdlog::warn("ECHO: storage offline ({}): {}; the open is retried in {} s",
-                     yuzu::echo::offline_reason_token(reason), detail, delay.count());
+        if (retry_scheduled)
+            spdlog::warn("ECHO: storage offline ({}): {}; the open is retried in {} s",
+                         yuzu::echo::offline_reason_token(reason), detail, delay.count());
+        else
+            spdlog::warn("ECHO: storage offline ({}): {}; the open is not retried, restart the agent",
+                         yuzu::echo::offline_reason_token(reason), detail);
     }
 
     // One background open attempt (the retry thread). Returns true when the loop should end: the
@@ -1445,7 +1459,8 @@ public:
             const auto wal = yuzu::echo::wal_file_bytes(db_path_).value_or(0);
             std::error_code space_ec;
             const auto space = std::filesystem::space(db_path_.parent_path(), space_ec);
-            if (!space_ec && space.available < 2 * file_bytes + static_cast<std::uintmax_t>(wal)) {
+            if (!space_ec && yuzu::echo::free_space_still_short(space.available, file_bytes,
+                                                                static_cast<std::uintmax_t>(wal))) {
                 go_offline(yuzu::echo::OfflineReason::free_space, prior_detail, attempt);
                 return false;
             }
@@ -1459,12 +1474,9 @@ public:
         if (cancelled())
             return true; // shutting down: drop the result (closing it), start nothing
         if (!result) {
-            auto reason = yuzu::echo::classify_open_failure(result.error());
-            if (reason == yuzu::echo::OfflineReason::none)
-                reason = yuzu::echo::OfflineReason::open_failed;
-            if (result.error().find(yuzu::echo::kV10DeadlineMarker) != std::string::npos)
+            if (yuzu::echo::is_deadline_hit(result.error()))
                 ++deadline_hits_;
-            go_offline(reason, result.error(), attempt);
+            go_offline(yuzu::echo::retry_failure_reason(result.error()), result.error(), attempt);
             return false;
         }
         db_ = std::make_unique<yuzu::echo::EchoDatabase>(std::move(*result));
@@ -1472,15 +1484,18 @@ public:
         try {
             if (auto started = start_collection(pctx); !started) {
                 go_offline(yuzu::echo::OfflineReason::open_failed,
-                           "collection start failed after the database opened", attempt);
+                           "collection start failed after the database opened", attempt,
+                           /*retry_scheduled=*/false);
                 return true;
             }
         } catch (const std::exception& e) {
             go_offline(yuzu::echo::OfflineReason::open_failed,
-                       std::format("collection start failed: {}", e.what()), attempt);
+                       std::format("collection start failed: {}", e.what()), attempt,
+                       /*retry_scheduled=*/false);
             return true;
         } catch (...) {
-            go_offline(yuzu::echo::OfflineReason::open_failed, "collection start failed", attempt);
+            go_offline(yuzu::echo::OfflineReason::open_failed, "collection start failed", attempt,
+                       /*retry_scheduled=*/false);
             return true;
         }
         spdlog::info("ECHO: the database opened on retry {}; Echo is online", attempt - 1);
@@ -1508,6 +1523,7 @@ private:
         yuzu::echo::OfflineReason reason{yuzu::echo::OfflineReason::none};
         std::string detail; // the open error's text
         std::chrono::steady_clock::time_point next_attempt{};
+        bool retry_scheduled{true}; // false: the retry loop has ended; only a restart recovers
     };
     std::mutex offline_mu_;
     OfflineState offline_;

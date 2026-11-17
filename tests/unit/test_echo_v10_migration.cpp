@@ -1230,8 +1230,8 @@ TEST_CASE("v10 migration: a deadline that has passed rolls the attempt back and 
     const auto failed = EchoDatabase::open(seeded.tmp.path, seams);
     REQUIRE(!failed.has_value());
     INFO(failed.error());
-    // The marker the plugin counts a deadline hit by is in the text.
-    CHECK(failed.error().find(std::string{kV10DeadlineMarker}) != std::string::npos);
+    // The plugin counts a deadline hit by this text: the consumer reads the producer's real wording.
+    CHECK(is_deadline_hit(failed.error()));
     CHECK(classify_open_failure(failed.error()) == OfflineReason::migration_failed);
     check_untouched_at_v9(seeded.tmp.path, before);
 
@@ -1251,8 +1251,70 @@ TEST_CASE("v10 migration: a shutdown cancel rolls the attempt back and says so",
     REQUIRE(!failed.has_value());
     INFO(failed.error());
     CHECK(failed.error().find("cancelled by shutdown") != std::string::npos);
-    CHECK(failed.error().find(std::string{kV10DeadlineMarker}) == std::string::npos);
+    CHECK_FALSE(is_deadline_hit(failed.error())); // a shutdown is not a deadline hit
     check_untouched_at_v9(seeded.tmp.path, before);
+}
+
+TEST_CASE("v10 migration: a cancel after the migration has started writing interrupts the statement and rolls back",
+          "[echo][v10][migration][failure]") {
+    // The 0 ms and always-true cancel cases above are satisfied by the explicit check before the
+    // migration starts. This one lets the migration begin first: the cancel turns true only once
+    // the connection runs its first write statement, so the explicit check has passed and ONLY
+    // the progress handler (polled every 1000 VM instructions) can stop the run. No clock, no thread.
+    struct Probe {
+        int writes = 0;
+        std::string first_write;
+    } probe;
+    constexpr int64_t kRows = 3000; // the fold's set-based statements run far past 1000 VM instructions
+
+    Seeded seeded;
+    seed(seeded, [&](sqlite3* db) { seed_process_rows(db, kRows, kT0); });
+    const auto before = snapshot(seeded.tmp.path);
+
+    auto seams = roomy_seams();
+    seams.v10_before_begin = [&](sqlite3* db) {
+        const auto trace = [](unsigned, void* ctx, void*, void* sql) -> int {
+            std::string_view text{static_cast<const char*>(sql)};
+            text.remove_prefix(std::min(text.find_first_not_of(" \t\r\n"), text.size()));
+            static constexpr std::string_view kWrites[] = {"ALTER", "CREATE", "DROP", "INSERT", "UPDATE", "DELETE"};
+            for (const auto verb : kWrites) {
+                if (text.starts_with(verb)) {
+                    auto& p = *static_cast<Probe*>(ctx);
+                    if (p.writes++ == 0)
+                        p.first_write = std::string{text.substr(0, 60)};
+                    break;
+                }
+            }
+            return 0;
+        };
+        REQUIRE(sqlite3_trace_v2(db, SQLITE_TRACE_STMT, trace, &probe) == SQLITE_OK);
+    };
+    seams.v10_cancel = [&] { return probe.writes > 0; };
+
+    const auto failed = EchoDatabase::open(seeded.tmp.path, seams);
+    REQUIRE(!failed.has_value());
+    INFO(failed.error());
+    CHECK(failed.error().find("cancelled by shutdown") != std::string::npos);
+    CHECK_FALSE(is_deadline_hit(failed.error()));
+    CHECK(classify_open_failure(failed.error()) == OfflineReason::migration_failed);
+    // the migration really was under way when it was stopped
+    INFO("first write statement: " << probe.first_write);
+    CHECK(probe.writes >= 1);
+
+    // all-or-nothing: the file is exactly as found, at v9 with every retired row intact
+    INFO(snapshot_diff(snapshot(seeded.tmp.path), before));
+    CHECK(snapshot(seeded.tmp.path) == before);
+    {
+        Db check;
+        open_raw(check, seeded.tmp.path);
+        CHECK(count_of(check.db, "SELECT value FROM echo_config WHERE key = 'schema_version'") == 9);
+        CHECK(count_of(check.db, "SELECT COUNT(*) FROM process_live") == kRows);
+    }
+
+    // with the cause gone (no seams) the next open reaches v10 and folds every row
+    auto db = open_ok(seeded.tmp.path, roomy_seams());
+    CHECK(db.get_config("schema_version") == "10");
+    CHECK(n(db, "SELECT SUM(start_count) FROM process_hourly") == kRows);
 }
 
 TEST_CASE("v10 migration: a damaged roll-up mark fails the migration and names it",

@@ -15,7 +15,9 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <future>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -74,13 +76,46 @@ TEST_CASE("classify_open_failure: only the free-space and v10 migration failures
     CHECK(classify_open_failure("") == OfflineReason::none);
 }
 
-TEST_CASE("the deadline marker the plugin counts hits by is in the failure text it classifies",
+TEST_CASE("retry_failure_reason: a failure on a retry is never 'none', it falls back to open_failed",
           "[echo][open_retry]") {
-    const std::string text = std::string{"v10 roll-up migration failed (the schema stays at v9; the "
-                                         "retired tables are intact): the migration "} +
-                             std::string{kV10DeadlineMarker} + " 60 s deadline and was rolled back";
-    CHECK(classify_open_failure(text) == OfflineReason::migration_failed);
-    CHECK(text.find(kV10DeadlineMarker) != std::string::npos);
+    // the classified kinds keep their reason ...
+    CHECK(retry_failure_reason("v10 roll-up migration failed (the schema stays at v9; the retired tables "
+                               "are intact): not enough free disk space to migrate the Echo database") ==
+          OfflineReason::free_space);
+    CHECK(retry_failure_reason("v10 roll-up migration failed (the schema stays at v9; the retired tables "
+                               "are intact): daily bucket out of range") == OfflineReason::migration_failed);
+    CHECK(retry_failure_reason("schema v8: an earlier migration step did not finish (see the log)") ==
+          OfflineReason::migration_failed);
+    // ... and any other failure (which fails a first open outright) stays offline as open_failed
+    CHECK(retry_failure_reason("failed to open echo.db: unable to open database file") == OfflineReason::open_failed);
+    CHECK(retry_failure_reason("echo.db is a symbolic link; refusing to open it") == OfflineReason::open_failed);
+    CHECK(retry_failure_reason("") == OfflineReason::open_failed);
+}
+
+TEST_CASE("is_deadline_hit: only a migration that ran into its deadline counts, not a shutdown cancel",
+          "[echo][open_retry]") {
+    // The producer's own wording is pinned against the real text in test_echo_v10_migration.cpp.
+    CHECK(is_deadline_hit("v10 roll-up migration failed (the schema stays at v9; the retired tables are "
+                          "intact): the migration did not finish inside its 60 s deadline and was rolled back"));
+    CHECK_FALSE(is_deadline_hit("v10 roll-up migration failed (the schema stays at v9; the retired tables are "
+                                "intact): the migration was cancelled by shutdown and rolled back"));
+    CHECK_FALSE(is_deadline_hit("v10 roll-up migration failed: daily bucket out of range"));
+    CHECK_FALSE(is_deadline_hit(""));
+}
+
+TEST_CASE("free_space_still_short: the retry skips the open until twice the file plus the log is free",
+          "[echo][open_retry]") {
+    constexpr std::uintmax_t kFile = 1000;
+    constexpr std::uintmax_t kWal = 300;
+    constexpr std::uintmax_t kNeed = 2 * kFile + kWal;
+    CHECK(free_space_still_short(kNeed - 1, kFile, kWal)); // one byte under is short
+    CHECK_FALSE(free_space_still_short(kNeed, kFile, kWal)); // exactly enough is not short
+    CHECK_FALSE(free_space_still_short(kNeed + 1, kFile, kWal));
+    // the log counts: the same free space is enough without it and short with it
+    CHECK_FALSE(free_space_still_short(2 * kFile, kFile, 0));
+    CHECK(free_space_still_short(2 * kFile, kFile, 1));
+    // an empty file with no log needs nothing
+    CHECK_FALSE(free_space_still_short(0, 0, 0));
 }
 
 TEST_CASE("offline_reason_token: the literals the server's gauge parser mirrors", "[echo][open_retry]") {
@@ -116,6 +151,20 @@ TEST_CASE("format_storage_refused_lines: a wait of zero or less reads 'Retrying 
         CHECK(lines[0].find("in about") == std::string::npos);
         CHECK(lines[0].find('-') == std::string::npos);
     }
+}
+
+TEST_CASE("format_storage_refused_lines: no scheduled retry asks for a restart and never promises one",
+          "[echo][open_retry]") {
+    const auto lines = format_storage_refused_lines(OfflineReason::open_failed, "collection start failed: boom",
+                                                    std::nullopt);
+    REQUIRE(lines.size() == 2);
+    CHECK(lines[0].starts_with("error|")); // the server gates on a leading error|
+    CHECK(lines[0].find("collection start failed: boom") != std::string::npos);
+    CHECK(lines[0].find("restart the agent") != std::string::npos);
+    CHECK(lines[0].find("retried automatically") == std::string::npos);
+    CHECK(lines[0].find("next attempt") == std::string::npos);
+    CHECK(lines[0].find("Retrying now") == std::string::npos);
+    CHECK(lines[1] == "storage_state|offline|open_failed"); // the tag is unchanged
 }
 
 TEST_CASE("OpenRetryLoop: attempts run after each back-off until one succeeds",

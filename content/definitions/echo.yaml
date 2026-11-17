@@ -29,7 +29,9 @@ metadata:
     any other failure seen on a later retry; in each case the file is untouched,
     Echo loads without its database, and the agent retries the open by itself
     (1, 5 and 15 minutes after the first failure, then hourly), so no restart is
-    needed once the cause is gone. The action exits non-zero. The order is REVERSED on that path: error| comes
+    needed once the cause is gone; the one exception is a collection start that
+    fails after a late open, which is not retried, and the error| line then asks
+    for an agent restart. The action exits non-zero. The order is REVERSED on that path: error| comes
     FIRST, because
     server and dashboard consumers key off the output starting with error|, so
     do not assume storage_state is always the first line. Historical data

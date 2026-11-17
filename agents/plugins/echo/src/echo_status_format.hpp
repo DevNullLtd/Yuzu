@@ -22,8 +22,10 @@
 #include <chrono>
 #include <cstdint>
 #include <format>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace yuzu::echo {
@@ -109,22 +111,42 @@ inline constexpr std::string_view kStorageOfflineKey = "heartbeat.storage_offlin
     return OfflineReason::none;
 }
 
+/// Whether an open failure's text says the attempt ran into its wall-clock deadline (the next
+/// attempt's deadline is doubled for each such hit). The text is the v10 migration's own.
+[[nodiscard]] inline bool is_deadline_hit(std::string_view open_error) {
+    return open_error.find(kV10DeadlineMarker) != std::string_view::npos;
+}
+
+/// The reason a RETRY attempt's failure is recorded under: the classified reason, or `open_failed`
+/// for any failure that is not one of the first-open kinds (a failure on a later attempt never
+/// fails the plugin; it stays offline).
+[[nodiscard]] inline OfflineReason retry_failure_reason(std::string_view open_error) {
+    const auto reason = classify_open_failure(open_error);
+    return reason == OfflineReason::none ? OfflineReason::open_failed : reason;
+}
+
 /// The complete `echo status` reply when the database is not open because an open failed with a
 /// retried reason, in the order it must be written (`error|` FIRST, for the reason
 /// format_storage_offline_lines documents). `detail` is the open error. The plugin has loaded but
-/// nothing collects and no trigger is registered; the open is retried automatically.
+/// nothing collects and no trigger is registered. `next_retry_in` is the wait until the next
+/// automatic attempt; `nullopt` means none is scheduled (collection failed to start after a late
+/// open, so only an agent restart recovers) and the reply says so instead of promising a retry.
 [[nodiscard]] inline std::vector<std::string>
 format_storage_refused_lines(OfflineReason reason, std::string_view detail,
-                             std::chrono::seconds next_retry_in) {
-    const auto retry = next_retry_in.count() > 0
-                           ? std::format("The next attempt is in about {} s.", next_retry_in.count())
-                           : std::string{"Retrying now."};
+                             std::optional<std::chrono::seconds> next_retry_in) {
+    std::string line0 = std::string{"error|Echo storage is offline on this endpoint: "}.append(detail);
+    if (!next_retry_in) {
+        // The open itself succeeded (and may have migrated), so no "not changed" claim here.
+        line0.append(". Collection and retention are stopped. The open is not retried; restart the agent.");
+    } else {
+        line0.append(". Collection and retention are stopped and the database was not changed. "
+                     "The open is retried automatically. ")
+            .append(next_retry_in->count() > 0
+                        ? std::format("The next attempt is in about {} s.", next_retry_in->count())
+                        : std::string{"Retrying now."});
+    }
     return {
-        std::string{"error|Echo storage is offline on this endpoint: "}
-            .append(detail)
-            .append(". Collection and retention are stopped and the database was not changed. "
-                    "The open is retried automatically. ")
-            .append(retry),
+        std::move(line0),
         std::format("storage_state|offline|{}", offline_reason_token(reason)),
     };
 }

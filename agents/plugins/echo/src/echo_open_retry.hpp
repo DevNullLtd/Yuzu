@@ -50,6 +50,15 @@ namespace yuzu::echo {
     }
 }
 
+/// Whether `available` bytes are still too few for the v10 migration, which needs twice the
+/// database file plus its write-ahead log (the same need its own free-space check uses). A retry
+/// of a free-space refusal compares this first and skips the open while it holds, so a full-disk
+/// agent does not repeat the whole-file integrity check every attempt.
+[[nodiscard]] constexpr bool free_space_still_short(std::uintmax_t available, std::uintmax_t file_bytes,
+                                                    std::uintmax_t wal_bytes) noexcept {
+    return available < 2 * file_bytes + wal_bytes;
+}
+
 inline constexpr std::chrono::seconds kV10DeadlineCap{3600};
 
 /// The wall-clock bound on one v10 migration attempt over a database file of `file_bytes`.
