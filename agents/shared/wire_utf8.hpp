@@ -55,6 +55,16 @@ namespace yuzu::shared {
     return 0;
 }
 
+/// Length of the longest prefix of `s` that is at most `max_bytes` and does not end inside a UTF-8
+/// scalar (never splits a multi-byte sequence: it backs up to the lead byte). For truncating text
+/// that goes into a proto3 `string` (a mid-scalar cut makes the whole frame unparseable).
+[[nodiscard]] inline std::size_t utf8_prefix_len(std::string_view s, std::size_t max_bytes) noexcept {
+    std::size_t n = s.size() < max_bytes ? s.size() : max_bytes;
+    while (n > 0 && n < s.size() && (static_cast<unsigned char>(s[n]) & 0xC0u) == 0x80u)
+        --n;
+    return n;
+}
+
 /// How many bytes scrub_wire_bytes would replace in `s`, without changing it.
 [[nodiscard]] inline std::size_t count_invalid_wire_bytes(std::string_view s) noexcept {
     std::size_t bad = 0;

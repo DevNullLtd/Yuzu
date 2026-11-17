@@ -298,3 +298,37 @@ TEST_CASE("host scrubs plugin output to well-formed UTF-8 before buffering (F70)
     const auto r = dispatcher.run(&raw, "x");
     CHECK(r.captured == "bad?|x\nover??|ok\nsur???|ok\ncaf\xc3\xa9|fine");
 }
+
+// Dropped plugin output must be VISIBLE (WP07 gate-8 I2/I3): capture consumers trust
+// `rc == 0 && !truncated`, so a write lost to an allocation failure must set `truncated`, must not
+// leave a stray separator, and must report CONSTRAINED/PARTIAL -- never a short blob that looks
+// complete (the server would replace stored rows with it).
+namespace yuzu::agent {
+void arm_output_alloc_failure_for_test(int nth); // agent.cpp test seam
+}
+
+namespace {
+int three_writes_execute(YuzuCommandContext* ctx, const char*, const YuzuParam*, size_t) {
+    yuzu_ctx_write_output(ctx, "a");
+    yuzu_ctx_write_output(ctx, "b"); // armed to fail
+    yuzu_ctx_write_output(ctx, "c");
+    return 0;
+}
+} // namespace
+
+TEST_CASE("a plugin write lost to bad_alloc marks the capture truncated and CONSTRAINED (gate-8)",
+          "[agent][utf8][seam]") {
+    yuzu::agent::LocalDispatcher dispatcher;
+    YuzuPluginDescriptor d{};
+    d.execute = &three_writes_execute;
+    yuzu::agent::arm_output_alloc_failure_for_test(2); // the second capture append fails
+    const auto r = dispatcher.run(&d, "x");
+    yuzu::agent::arm_output_alloc_failure_for_test(0);
+    CHECK(r.rc == 0);
+    CHECK(r.truncated);
+    // No stray '\n' for the chunk that never landed; once truncated, later writes are skipped (the
+    // capture is incomplete, and consumers refuse it).
+    CHECK(r.captured == "a");
+    CHECK(r.result_status == YUZU_RESULT_STATUS_CONSTRAINED);
+    CHECK(r.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+}

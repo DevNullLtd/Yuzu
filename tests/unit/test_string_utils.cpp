@@ -6,6 +6,7 @@
  */
 
 #include <yuzu/string_utils.hpp>
+#include <wire_utf8.hpp> // utf8_prefix_len
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -432,4 +433,15 @@ TEST_CASE("sanitize_utf8: rejects overlong, surrogate and out-of-range forms (F7
     CHECK(sanitize_utf8("\xED\x9F\xBF") == "\xED\x9F\xBF");
     CHECK(sanitize_utf8("\xF0\x90\x80\x80") == "\xF0\x90\x80\x80");
     CHECK(sanitize_utf8("\xF4\x8F\xBF\xBF") == "\xF4\x8F\xBF\xBF");
+}
+
+TEST_CASE("utf8_prefix_len never ends inside a multi-byte scalar (dedup error-message cut)",
+          "[string_utils][utf8]") {
+    using yuzu::shared::utf8_prefix_len;
+    const std::string s = std::string(1023, 'a') + "\xC3\xA9" + "tail"; // e-acute straddles 1024
+    CHECK(utf8_prefix_len(s, 1024) == 1023);
+    CHECK(utf8_prefix_len(s, 1025) == 1025);
+    CHECK(utf8_prefix_len("abc", 1024) == 3);
+    CHECK(utf8_prefix_len("\xF0\x9F\x98\x80x", 2) == 0); // inside a 4-byte scalar: back to 0
+    CHECK(utf8_prefix_len("", 5) == 0);
 }

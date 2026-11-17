@@ -343,6 +343,32 @@ struct CommandContextImpl {
     std::size_t capture_max_bytes{kCaptureMaxBytes};
     bool capture_truncated{false};
 
+    // Set when a plugin write could not be buffered (allocation failure, caught at the C ABI in
+    // yuzu_ctx_write_output). The output is then INCOMPLETE: capture-mode consumers trust
+    // `rc == 0 && !truncated`, so this also sets capture_truncated, and the command's typed status
+    // is forced to CONSTRAINED/PARTIAL (apply_output_drop) so a status-only section keeps the
+    // server's stored rows rather than replacing them with a short blob. noexcept, lock-free.
+    std::atomic<bool> output_dropped{false};
+    void note_output_dropped() noexcept {
+        output_dropped.store(true, std::memory_order_relaxed);
+        capture_truncated = true;
+    }
+    // Read-time mapping: a dropped write is never reported OK/UNDECLARED. A worse reported status
+    // (UNAVAILABLE / PERMISSION_DENIED) stands.
+    void apply_output_drop() noexcept {
+        if (!output_dropped.load(std::memory_order_relaxed))
+            return;
+        if (result_status == YUZU_RESULT_STATUS_UNDECLARED ||
+            result_status == YUZU_RESULT_STATUS_OK)
+            result_status = YUZU_RESULT_STATUS_CONSTRAINED;
+        result_completeness = YUZU_RESULT_COMPLETENESS_PARTIAL;
+        try {
+            if (result_provenance.empty())
+                result_provenance = "host:output_dropped";
+        } catch (...) { // NOLINT(bugprone-empty-catch) -- the typed flags above are authoritative
+        }
+    }
+
     // CC-07 plugin→host typed result seam (ABI4, sdk/include/yuzu/plugin.h).
     // Written at most by the single plugin thread executing this command's
     // execute() call (yuzu_ctx_set_result_status, below) — same single-writer
@@ -354,6 +380,15 @@ struct CommandContextImpl {
     YuzuResultStatus result_status{YUZU_RESULT_STATUS_UNDECLARED};
     YuzuResultCompleteness result_completeness{YUZU_RESULT_COMPLETENESS_UNKNOWN};
     std::string result_provenance;
+
+    // TEST SEAM (production: one relaxed load): throw std::bad_alloc from the Nth next
+    // allocation-bearing step of append_output, to prove a dropped write is made visible.
+    static inline std::atomic<int> alloc_fault_countdown{0};
+    static void maybe_inject_alloc_failure() {
+        const int c = alloc_fault_countdown.load(std::memory_order_relaxed);
+        if (c > 0 && alloc_fault_countdown.fetch_sub(1, std::memory_order_relaxed) == 1)
+            throw std::bad_alloc();
+    }
 
     void append_output(const char* text) {
         // F70: plugin text is declared UTF-8 but nothing enforced it, and the
@@ -393,6 +428,10 @@ struct CommandContextImpl {
                 capture_truncated = true;
                 return;
             }
+            // Reserve FIRST: the only throwing step runs before any mutation, so a bad_alloc leaves
+            // the buffer exactly as it was (no stray '\n' separator for a chunk that never landed).
+            maybe_inject_alloc_failure();
+            capture->reserve(prospective);
             if (!capture->empty())
                 capture->push_back('\n');
             capture->append(text, len);
@@ -548,6 +587,7 @@ int dispatch_with_capture(const YuzuPluginDescriptor* descriptor, const char* ac
     auto* raw_ctx = reinterpret_cast<YuzuCommandContext*>(&ctx_impl);
     int rc = descriptor->execute(raw_ctx, action, params, param_count);
     ctx_impl.flush_output(); // no-op in capture mode
+    ctx_impl.apply_output_drop();
     if (truncated_out)
         *truncated_out = ctx_impl.capture_truncated;
     // BR-001: read back whatever the plugin reported via
@@ -599,6 +639,12 @@ YUZU_EXPORT YuzuResultStatus set_result_status_and_read_back(YuzuResultStatus st
     return ctx_impl.result_status;
 }
 
+// Test seam (no public header, same convention as set_result_status_and_read_back above): make
+// the Nth next capture-mode append_output allocation step throw std::bad_alloc.
+YUZU_EXPORT void arm_output_alloc_failure_for_test(int nth) {
+    CommandContextImpl::alloc_fault_countdown.store(nth, std::memory_order_relaxed);
+}
+
 // C ABI context function implementations
 
 extern "C" {
@@ -611,7 +657,10 @@ YUZU_EXPORT void yuzu_ctx_write_output(YuzuCommandContext* ctx, const char* text
     // the F70 scrub copy); on bad_alloc this write is dropped rather than crossing the ABI.
     try {
         impl->append_output(text);
-    } catch (...) { // NOLINT(bugprone-empty-catch) -- no safe recovery or logging under OOM
+    } catch (...) {
+        // No logging under OOM. The drop is made visible, not silent: capture_truncated (so every
+        // capture consumer reports constrained) and output_dropped (typed CONSTRAINED/PARTIAL).
+        impl->note_output_dropped();
     }
 }
 
@@ -645,7 +694,12 @@ YUZU_EXPORT void yuzu_ctx_set_result_status(YuzuCommandContext* ctx, YuzuResultS
     }
     impl->result_status = status;
     impl->result_completeness = completeness;
-    impl->result_provenance = provenance ? provenance : "";
+    // C ABI: the string assignment allocates; nothing may unwind into the plugin. On failure the
+    // typed status/completeness above stand and the provenance stays as it was.
+    try {
+        impl->result_provenance = provenance ? provenance : "";
+    } catch (...) { // NOLINT(bugprone-empty-catch)
+    }
 }
 
 YUZU_EXPORT const char* yuzu_ctx_get_config(YuzuPluginContext* ctx, const char* key) {
@@ -656,10 +710,14 @@ YUZU_EXPORT const char* yuzu_ctx_get_config(YuzuPluginContext* ctx, const char* 
     // (see PluginContextImpl::server_peer): nullptr until a Register has published it.
     if (std::strcmp(key, "agent.server_peer") == 0)
         return impl->server_peer.load(std::memory_order_acquire);
-    auto it = impl->config.find(key);
-    if (it == impl->config.end())
+    try {
+        auto it = impl->config.find(key); // builds a std::string key: can throw
+        if (it == impl->config.end())
+            return nullptr;
+        return it->second.c_str();
+    } catch (...) {
         return nullptr;
-    return it->second.c_str();
+    }
 }
 
 YUZU_EXPORT const char* yuzu_ctx_get_secret(YuzuPluginContext* ctx, const char* key) {
@@ -676,7 +734,11 @@ YUZU_EXPORT int yuzu_ctx_storage_set(YuzuPluginContext* ctx, const char* key, co
     auto* impl = reinterpret_cast<PluginContextImpl*>(ctx);
     if (!impl->kv_store || impl->plugin_name.empty())
         return -2;
-    return impl->kv_store->set(impl->plugin_name, key, value) ? 0 : 1;
+    try {
+        return impl->kv_store->set(impl->plugin_name, key, value) ? 0 : 1;
+    } catch (...) { // C ABI: no exception into the plugin
+        return 1;
+    }
 }
 
 YUZU_EXPORT const char* yuzu_ctx_storage_get(YuzuPluginContext* ctx, const char* key) {
@@ -685,7 +747,12 @@ YUZU_EXPORT const char* yuzu_ctx_storage_get(YuzuPluginContext* ctx, const char*
     auto* impl = reinterpret_cast<PluginContextImpl*>(ctx);
     if (!impl->kv_store || impl->plugin_name.empty())
         return nullptr;
-    auto val = impl->kv_store->get(impl->plugin_name, key);
+    std::optional<std::string> val;
+    try {
+        val = impl->kv_store->get(impl->plugin_name, key);
+    } catch (...) { // C ABI: no exception into the plugin
+        return nullptr;
+    }
     if (!val.has_value())
         return nullptr;
     // Caller must free with yuzu_free_string()
@@ -702,7 +769,11 @@ YUZU_EXPORT int yuzu_ctx_storage_delete(YuzuPluginContext* ctx, const char* key)
     auto* impl = reinterpret_cast<PluginContextImpl*>(ctx);
     if (!impl->kv_store || impl->plugin_name.empty())
         return -2;
-    return impl->kv_store->del(impl->plugin_name, key) ? 0 : 1;
+    try {
+        return impl->kv_store->del(impl->plugin_name, key) ? 0 : 1;
+    } catch (...) { // C ABI: no exception into the plugin
+        return 1;
+    }
 }
 
 YUZU_EXPORT int yuzu_ctx_storage_exists(YuzuPluginContext* ctx, const char* key) {
@@ -820,6 +891,10 @@ public:
     explicit AgentImpl(Config cfg) : cfg_{std::move(cfg)} {
         metrics_.describe("yuzu_agent_uptime_seconds", "Agent uptime in seconds", "gauge");
         metrics_.describe("yuzu_agent_commands_executed_total", "Total commands executed by plugin",
+                          "counter");
+        metrics_.describe("yuzu_agent_plugin_output_dropped_total",
+                          "Commands where a plugin output write could not be buffered "
+                          "(allocation failure) and the result was marked constrained",
                           "counter");
         metrics_.describe("yuzu_agent_plugins_loaded", "Number of loaded plugins", "gauge");
         metrics_.describe("yuzu_agent_plugin_rejected_total",
@@ -4576,6 +4651,10 @@ private:
         // for the operator log line below. It is a READ-TIME/PRESENTATION
         // derivation ONLY — see derive_effective_result_status(), unit-tested in
         // tests/unit/test_capability_descriptor.cpp.
+        ctx_impl.apply_output_drop();
+        if (ctx_impl.output_dropped.load(std::memory_order_relaxed))
+            metrics_.counter("yuzu_agent_plugin_output_dropped_total", {{"plugin", cmd.plugin()}})
+                .increment();
         YuzuResultStatus effective_result_status =
             derive_effective_result_status(ctx_impl.result_status, rc);
 
@@ -4657,8 +4736,11 @@ private:
                     *slim.mutable_sent_at() = resp.sent_at();
                 if (resp.has_error()) {
                     slim.mutable_error()->set_code(resp.error().code());
+                    // Cut on a scalar boundary: a mid-sequence cut is invalid UTF-8 in a proto3
+                    // string, which would make this stored blob unparseable on replay.
+                    const std::string& em = resp.error().message();
                     slim.mutable_error()->set_message(
-                        resp.error().message().substr(0, kMaxDedupErrorMessageBytes));
+                        em.substr(0, yuzu::shared::utf8_prefix_len(em, kMaxDedupErrorMessageBytes)));
                 }
                 slim.set_output("[output replaced in dedup store: response exceeded size cap; "
                                 "command completed]");
