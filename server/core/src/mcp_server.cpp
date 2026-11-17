@@ -24972,8 +24972,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         // device. The retry is still right. (An apply that reached
                         // the device keeps its claim until its reply is consumed or
                         // the claim window passes, so a retry inside that window is
-                        // refused this
-                        // way; this path consumes no reply and leaves it to expire.)
+                        // refused this way; this path consumes no reply and leaves it to expire.)
                         mcp_audit("failure", "agent_id=" + agent_id + ", " + err.detail +
                                                  (record_pre_existing ? "" : " record_persisted=1"));
                         // A refused claim on a record that already existed is held for the claim

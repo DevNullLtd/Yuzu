@@ -188,12 +188,13 @@
 /// reorders them, or an apply and a release dispatched by two different server replicas, can still
 /// reopen the window. (2) A claim older than `kApplyClaimTtlSecs` (120 s) is ignored, so an apply
 /// that stays unexecuted longer than that reopens it. (3) DELETE's own release has a
-/// check-then-dispatch window
-/// against a re-quarantine of the device, as does the owed-release leg; the new record's re-verify
-/// corrects either within 5 minutes. (4) The same outcome follows when a release sent earlier is run
-/// by the device after a later record's apply, for the same ordering reason: the new record can be
-/// confirmed and the device then released, uncontained until the re-verify re-applies it (up to 5
-/// minutes).
+/// check-then-dispatch window against a re-quarantine of the device, as does the owed-release leg;
+/// the new record's re-verify corrects either within 5 minutes. (4) The same outcome follows when a
+/// release sent earlier is run by the device after a later record's apply, for the same ordering
+/// reason: the new record can be confirmed and the device then released, uncontained until the
+/// re-verify re-applies it (up to 5 minutes). (5) The local guard that keeps an apply claim live
+/// across a step of the database clock belongs to one process: after a restart, or for a claim
+/// another replica stamped, the database clock alone judges the window (ADR-0047 residuals, #8131).
 
 #include <array>
 #include <chrono>
@@ -396,9 +397,9 @@ private:
         // held_claim_gen`), `gen` 0 for none, with the record and command it belongs to. It is
         // dropped when the device's answer to that apply (a `status|` line) is consumed
         // (`release_held_claim`), by the in-flight poll or, after a release request has turned the
-        // entry into a releasing one, by `reconcile_one`'s own look at the command. `reset_for` keeps this whole struct: a
-        // reset must not strand a claim whose apply may not have run yet. An apply that never
-        // answers leaves the claim to expire after `kApplyClaimTtlSecs`.
+        // entry into a releasing one, by `reconcile_one`'s own look at the command. `reset_for`
+        // keeps this whole struct: a reset must not strand a claim whose apply may not have run
+        // yet. An apply that never answers leaves the claim to expire after `kApplyClaimTtlSecs`.
         struct HeldClaim {
             std::int64_t gen{0};
             std::int64_t record_id{0};
