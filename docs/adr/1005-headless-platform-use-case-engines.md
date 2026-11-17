@@ -551,7 +551,7 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        reachability via `execute_instruction`, unaffected by this row.
      - The fleet/group/scope fan-out route `POST /api/v1/hardware/sync` has its MCP twin
        `sync_hardware_software` (owner ruling 2026-10-15: the twin is required, not an
-       exception), sharing the route's cooldown and single in-flight run. Scoping and building
+       exception), sharing the route's run keys, cooldown and pacing budget. Scoping and building
        the list/detail/per-device-sync MCP twins is out of scope for this PR; tracked as
        **#4456**. Until it lands, this row stands as the open exception for those routes.
      - Full design record: the round-3 hardware-ci-view plan

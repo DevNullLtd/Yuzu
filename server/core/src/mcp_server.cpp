@@ -4813,8 +4813,8 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{"name":{"type":"string"},"versions":{"type":"array","items":{"type":"object","properties":{"version":{"type":"string"},"installs":{"type":"integer"},"newest":{"type":"boolean"}},"required":["version","installs","newest"]}},"count":{"type":"integer"},"truncated":{"type":"boolean"},"devices_omitted":{"type":"integer"},"newest_omitted":{"type":"boolean"},"audit_persisted":{"type":"boolean"}},"required":["name","versions","count","truncated","devices_omitted"]})j"},
 
     // ── Software "Sync now": MCP twin of POST /api/v1/hardware/sync. Both call the SAME
-    // software_sync::Runner instance, so the 60 s per-operator cooldown and the single in-flight run
-    // bind both surfaces. Appended at the VERY END of kTools[] per the standing governance note
+    // software_sync::Runner instance, so the run keys, joins, cooldown and pacing budget bind both
+    // surfaces. Appended at the VERY END of kTools[] per the standing governance note
     // above.
     {"sync_hardware_software",
      "Ask connected agents to re-run their installed-software sync now and report (the Software "
@@ -4825,11 +4825,15 @@ static const ToolDef kTools[] = {
      "spread window (delay_max_s; estimated_completion_at is the request time plus that spread, an "
      "estimate, not a promise), within a report-rate budget shared by every run on this server; a "
      "run that cannot be spread inside 24 hours at the share still free is refused, and a busy "
-     "budget is a retryable refusal. One run per operator and scope per cooldown window "
-     "(retry_after_ms says how long); a request that finds the same run still "
-     "spreading JOINS it (joined true, nothing is sent again). A whole group or the whole fleet "
-     "needs confirm true. Naming the whole fleet needs a fleet-wide Execution:Execute grant (a "
-     "management-group-confined operator is refused). last_synced_before keeps only devices whose "
+     "budget is a retryable refusal. One run per run key per cooldown window "
+     "(retry_after_ms says how long). The whole fleet is one key; a group is one key shared by "
+     "every caller whose Execution:Execute is unfiltered (a confined caller has a key of their "
+     "own); a scope expression is keyed by caller and exact text; a single device has no run "
+     "guard. A request that finds the same run still spreading JOINS it (joined true, nothing "
+     "is sent again). A whole group or the whole fleet needs confirm true. Naming the whole "
+     "fleet needs an unfiltered Execution:Execute grant AND the global ManagementGroup:Write "
+     "grant, and an operator-tier token is refused it whatever its creator holds. "
+     "last_synced_before keeps only devices whose "
      "last accepted report is older than that epoch second (skipped_fresh counts the rest); a "
      "failed freshness read refuses the run, it never treats everything as stale. Devices you may "
      "not see are dropped, never reported. Service-scoped API tokens are denied. execution_id is "
@@ -20267,9 +20271,10 @@ McpServer::HandlerFn McpServer::build_handler(
             }
 
             // sync_hardware_software: MCP twin of POST /api/v1/hardware/sync. The whole sequence
-            // (cooldown, in-flight slot, resolve, cap, fail-closed audit, dispatch through the
-            // dispatch_confined_arms system-reserved arm) is software_sync::Runner, the same
-            // instance the REST route calls, so neither bound can be dodged by switching surface.
+            // (fleet check, confirm, run key, join/cooldown, resolve, paced admission, fail-closed
+            // audit, dispatch through the dispatch_confined_arms system-reserved arm, settle) is
+            // software_sync::Runner, the same instance the REST route calls, so no bound can be
+            // dodged by switching surface.
             if (tool_name == "sync_hardware_software") {
                 namespace ss = yuzu::server::software_sync;
                 if (!tier_allows(tier, "Execution", "Execute")) {
@@ -20392,12 +20397,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 const std::string execution_id = param_str(args, "execution_id");
-                const bool id_ok = !execution_id.empty() && execution_id.size() <= 128 &&
-                                   std::ranges::all_of(execution_id, [](char c) {
-                                       return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-                                              (c >= '0' && c <= '9') || c == '_' || c == '-';
-                                   });
-                if (!id_ok) {
+                if (!is_valid_execution_id(execution_id)) {
                     res.set_content(error_response(id, kInvalidParams,
                                                    "execution_id is required (1 to 128 characters "
                                                    "of A-Z, a-z, 0-9, _ and -)"),
