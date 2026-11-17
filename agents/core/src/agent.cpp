@@ -22,6 +22,7 @@ __declspec(allocate(".CRT$XCB"))
 #include <yuzu/agent/kv_store.hpp>
 #include <yuzu/agent/plugin_loader.hpp>
 #include <yuzu/agent/reconnect_backoff.hpp>
+#include <yuzu/agent/server_address_parsers.hpp>
 #include <yuzu/agent/server_address_resolver.hpp>
 #include <yuzu/agent/subprocess_runner.hpp>
 #include <yuzu/agent/trigger_engine.hpp>
@@ -52,6 +53,7 @@ __declspec(allocate(".CRT$XCB"))
 #include "hard_exit.hpp"                 // hard_exit / kOrphanDrainGrace: the detached-collector drain barrier
 #include "log_handoff.hpp"               // drain_log_bounded: breadcrumb before that hard_exit
 #include "command_dedup_decision.hpp"            // dedup claim/replay decision core (pure, unit-tested)
+#include "collection_settings_agent.hpp"       // __sync__.settings decision core (pure, unit-tested)
 #include "sync_now_decision.hpp"               // __sync__.now decision core (pure, unit-tested)
 #include "sync_scheduler.hpp"                 // ADR-0016 daily-sync framework
 #include "sync_source_installed_software.hpp" // ADR-0016 source #1
@@ -70,7 +72,7 @@ __declspec(allocate(".CRT$XCB"))
 #include "guardian_arm_heartbeat.hpp"     // emit_guardian_arm_heartbeat_tags (rung 9c PR-3)
 #include "guardian_backend.hpp"           // GuardianBackend, guardian_backend_from_state/label (F7)
 #include "guardian_health_heartbeat.hpp"  // emit_guardian_health_heartbeat_tags (M1)
-#include "guardian_baseline_heartbeat.hpp" // emit_guardian_baseline_persist_heartbeat_tags (#4045)
+#include "guardian_baseline_heartbeat.hpp" // emit_guardian_baseline_* heartbeat tags (#4045, #5605)
 #include "guardian_baseline_persister.hpp" // kBaselineShutdownGrace (#4045; static_assert below)
 #include "guardian_boot_epoch.hpp"         // claim_guardian_boot_epoch (UP-14)
 #include "guardian_io_ceiling_heartbeat.hpp" // emit_guardian_io_ceiling_heartbeat_tags (rung 9c PR-3)
@@ -95,6 +97,7 @@ __declspec(allocate(".CRT$XCB"))
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstring>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -283,6 +286,14 @@ struct PluginContextImpl {
     KvStore* kv_store{nullptr};             // non-owning; lifetime managed by AgentImpl
     TriggerEngine* trigger_engine{nullptr}; // non-owning; lifetime managed by AgentImpl
     std::string plugin_name;                // set per-plugin during init/execute for KV namespacing
+    // "agent.server_peer": the literal address of the peer the latest successful Register
+    // answered on (grpc_peer_literal of ClientContext::peer()), or nullptr before the first
+    // Register / when the peer is not a usable literal. It is NOT in `config` on purpose:
+    // that map is unsynchronised and yuzu_ctx_get_config hands out raw pointers into it, so a
+    // reconnect-time write would race a plugin's read. The pointer always names an interned,
+    // immortal string (AgentImpl::publish_server_peer), so a read is race-free with no lock.
+    // Written only by the Register thread, read by yuzu_ctx_get_config.
+    std::atomic<const char*> server_peer{nullptr};
 };
 
 // Per-command output is buffered and flushed in a single gRPC Write instead of
@@ -616,6 +627,10 @@ YUZU_EXPORT const char* yuzu_ctx_get_config(YuzuPluginContext* ctx, const char* 
     if (!ctx || !key)
         return nullptr;
     auto* impl = reinterpret_cast<PluginContextImpl*>(ctx);
+    // The live control peer is the one key answered from an atomic, not from `config`
+    // (see PluginContextImpl::server_peer): nullptr until a Register has published it.
+    if (std::strcmp(key, "agent.server_peer") == 0)
+        return impl->server_peer.load(std::memory_order_acquire);
     auto it = impl->config.find(key);
     if (it == impl->config.end())
         return nullptr;
@@ -671,7 +686,14 @@ YUZU_EXPORT int yuzu_ctx_storage_exists(YuzuPluginContext* ctx, const char* key)
     auto* impl = reinterpret_cast<PluginContextImpl*>(ctx);
     if (!impl->kv_store || impl->plugin_name.empty())
         return -2;
-    return impl->kv_store->exists(impl->plugin_name, key) ? 0 : 1;
+    // 0 present, 1 absent, negative on error (plugin.h): a store that could not answer
+    // (closed handle, SQLITE_BUSY after the busy budget, a failed prepare) is -3, never
+    // "absent" -- a plugin that treats absent as "nothing to recover" would otherwise
+    // act on a fault as if it were the answer.
+    const auto present = impl->kv_store->exists_checked(impl->plugin_name, key);
+    if (!present)
+        return -3;
+    return *present ? 0 : 1;
 }
 
 YUZU_EXPORT const char* yuzu_ctx_storage_list(YuzuPluginContext* ctx, const char* prefix) {
@@ -731,7 +753,10 @@ YUZU_EXPORT int yuzu_register_trigger(YuzuPluginContext* ctx, const char* trigge
             // parse_trigger_config already logged the specific reason.
             return -3;
         }
-        impl->trigger_engine->register_trigger(std::move(*cfg));
+        // False = the engine's trigger table is full and nothing was registered; the
+        // caller must hear it (plugin.h: non-zero on failure), not read a silent 0.
+        if (!impl->trigger_engine->register_trigger(std::move(*cfg)))
+            return -5;
         return 0;
     } catch (const std::exception& e) {
         spdlog::error("yuzu_register_trigger('{}'): threw: {}", trigger_id, e.what());
@@ -826,7 +851,7 @@ public:
         plugin_ctx_.config["agent.server_address"] = cfg_.server_address;
         // Resolved ONCE, here, at startup -- see server_address_resolver.hpp
         // for why this must not be re-resolved later by a plugin at
-        // quarantine-dispatch time (the quarantine plugin used to do this
+        // quarantine-dispatch time (a plugin used to do this
         // itself; #3429 round 4 moved it here after round 3's review found
         // that let a possibly-already-compromised host's own DNS resolution
         // decide what survives its own containment).
@@ -862,6 +887,27 @@ public:
             } else {
                 spdlog::error("Failed to open KV store: {}", kv_result.error().message);
                 spdlog::warn("Plugin KV storage will be unavailable");
+            }
+        }
+
+        // 1b'. Fleet collection settings (`__sync__.settings`): load the persisted pair and apply it
+        // BEFORE any daily-sync scheduler exists, so the first tick already runs on it. The pair is
+        // re-validated exactly as a live command; one that no longer matches its version (a crash
+        // between the two KV writes, a hand edit) is discarded, the tag reads `none` and the server
+        // re-sends. Loaded under --inventory-disable too: nothing collects there, but the agent
+        // still holds and reports the version, so the server does not re-send it for good.
+        if (kv_store_) {
+            auto stored = load_stored_settings([this](const std::string& k) {
+                return kv_store_->get(kSyncKvNamespace, k);
+            });
+            if (stored) {
+                collector_enabled_->set(stored->plugins);
+                spdlog::info("Collection settings {} restored (interval {}s{})", stored->version,
+                             stored->interval_s, stored->window ? ", windowed" : "");
+                std::lock_guard<std::mutex> lk(settings_mu_);
+                applied_settings_ = std::move(*stored);
+            } else if (stored.error() != kNoStoredSettings) {
+                spdlog::warn("Stored collection settings discarded: {}", stored.error());
             }
         }
 
@@ -2226,6 +2272,11 @@ public:
                                               .count();
                 plugin_ctx_.config["agent.session_id"] = session_id_;
                 plugin_ctx_.config["agent.connected_since"] = std::to_string(connected_since_ms);
+                // The peer THIS Register answered on (the server, or the gateway that fronts
+                // it), published to the plugins as "agent.server_peer": the address the
+                // control channel really uses, which can differ from the one resolved once at
+                // start (a server that moved since). See publish_server_peer.
+                publish_server_peer(ctx.peer());
 
                 // Measure Register RPC latency
                 auto register_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -2617,11 +2668,31 @@ public:
                         // rebuilt on every reconnect while a worker abandoned at its time limit may
                         // still be inside a plugin, so the single-flight flags and the outstanding
                         // count must outlive it (drain_detached_collectors_or_exit reads them).
-                        scheduler.add_source(make_installed_software_source(
-                            sync_plugins, kv_get, kv_set, collector_workers_));
-                        // Publish AFTER the last add_source: request_now() reads sources_
-                        // without the mutex on the append-only-before-publication contract.
+                        // `collector_enabled_` is agent-lifetime for the same reason, and the
+                        // applied fleet settings (loaded at start-up, replaced by each
+                        // `__sync__.settings`) set the cadence BEFORE the scheduler is published,
+                        // so a reconnect keeps them and nothing is re-placed here.
+                        auto installed_software_source = make_installed_software_source(
+                            sync_plugins, kv_get, kv_set, collector_workers_, {},
+                            collector_enabled_);
                         {
+                            // settings_mu_ is held from the read of applied_settings_ to the
+                            // publication below. The `__sync__.settings` hook replaces
+                            // applied_settings_ and reads sync_scheduler_ under the same mutex,
+                            // so a command lands either before this read (the source is built
+                            // on it) or after the publication (the hook hands it to this
+                            // scheduler): the version the heartbeat reports is never one this
+                            // scheduler is not running. Lock order: settings_mu_, then
+                            // sync_sched_mu_.
+                            std::lock_guard<std::mutex> settings_lk(settings_mu_);
+                            if (applied_settings_) {
+                                installed_software_source.interval =
+                                    std::chrono::seconds{applied_settings_->interval_s};
+                                installed_software_source.window = applied_settings_->window;
+                            }
+                            scheduler.add_source(std::move(installed_software_source));
+                            // Publish AFTER the last add_source: request_now() reads sources_
+                            // without the mutex on the append-only-before-publication contract.
                             std::lock_guard<std::mutex> lk(sync_sched_mu_);
                             sync_scheduler_ = scheduler_ptr;
                         }
@@ -2776,6 +2847,12 @@ public:
                             // KV throw must never kill the heartbeat thread.
                             try {
                                 yuzu::agent::emit_plugins_failed_tag(tags, plugins_failed_);
+                                // The applied fleet collection settings: always present, `none`
+                                // until a valid pair is applied.
+                                {
+                                    std::lock_guard<std::mutex> lk(settings_mu_);
+                                    yuzu::agent::emit_settings_tags(tags, applied_settings_);
+                                }
                                 if (kv_store_) {
                                     yuzu::agent::emit_plugin_heartbeat_tags(
                                         tags, plugin_names_,
@@ -3079,23 +3156,43 @@ public:
                               // Group D2 (after D, its own try so it can neither drop an older
                               // tag nor be dropped by one): #4045, the Spark baseline-persist
                               // aggregate (sparse, 0 omits the tag; every channel is listed on
-                              // GuardianEngine::baseline_persist_failures()). Spark path ONLY:
-                              // a legacy FileGuard persist failure is logged, not counted, so
-                              // an absent tag is NOT evidence that baselines persisted. Not
-                              // gated on prefer_spark_ (0 while Spark is inert). This accessor
-                              // takes no lock (the Group B/C accessors above do take mtx_).
-                              // Deleting THIS call site is not caught by any test, same as
-                              // Group D's: the emitter and the accessor are pinned (E10, E15,
-                              // E23 and the doc-scrape test), the call itself is verified by
-                              // reading. Deliberately no source-grep pin: it would break
-                              // out-of-tree and packaged builds that carry no source tree.
+                              // GuardianEngine::baseline_persist_failures()), plus the two
+                              // #5605 tags described below. Spark path ONLY: a legacy
+                              // FileGuard persist failure is logged, not counted, so an absent
+                              // tag is NOT evidence that baselines persisted. The aggregate is
+                              // not gated on prefer_spark_ (0 while Spark is inert). These
+                              // accessors take no lock (the Group B/C accessors above do take
+                              // mtx_).
+                              // Deleting THIS call site is not caught by any unit test, same
+                              // as Group D's: the emitter and the accessor are pinned (E10,
+                              // E15, E23 and the doc-scrape test). The three emit calls here
+                              // are pinned only by the source-text check
+                              // tests/test_guardian_baseline_fleet_tags_lexical.py, which runs
+                              // in the docs suite against the source tree and so does not run
+                              // in out-of-tree or packaged builds that carry no source tree.
+                              //
+                              // #5605: the same group also carries the CURRENT unpersisted
+                              // backlog (present only on a live prefer_spark agent with a
+                              // published persister; a present 0 means "no capture waiting at
+                              // this persister", NOT "Spark is healthy") and the boot-scan
+                              // count (sparse, live on every agent: a boot re-arm found no
+                              // persisted baseline, which is not proof a capture was lost).
+                              // Both accessors are lock-free. One try for all three: a throw
+                              // skips the group's REMAINING emitters for that tick (tags
+                              // already written stay), counted once. The older persist_failures
+                              // tag is emitted last, so a throw in either new emitter skips it.
                               try {
+                                emit_guardian_baseline_unpersisted_heartbeat_tag(
+                                    tags, guardian_->baseline_unpersisted());
+                                emit_guardian_baseline_rebaselined_heartbeat_tag(
+                                    tags, guardian_->baseline_rebaselined_at_boot());
                                 emit_guardian_baseline_persist_heartbeat_tags(
                                     tags, guardian_->baseline_persist_failures());
                               } catch (...) {
                                   hb_guardian_contain(kHbGuardianBaseline,
                                                       "Guardian heartbeat baseline-persist tag "
-                                                      "failed (the tag was skipped this tick)");
+                                                      "failed (the remaining tags were "
+                                                      "skipped this tick)");
                               }
                             }
 #if defined(_WIN32) || defined(__linux__) || defined(__APPLE__)
@@ -3725,8 +3822,47 @@ public:
                         // else about this command (the metrics counter below,
                         // record_command_terminal-before-write, the stream->Write)
                         // stays here, unchanged.
-                        auto decision = decide_sync_now(cmd.action(), source, delay_max_s,
-                                                         cfg_.inventory_disable, sched.get());
+                        // `settings` (fleet collection settings) is decided first, in
+                        // collection_settings_agent.hpp: it persists the pair, then holds it
+                        // (the switches, and the version the heartbeat reports) and hands the
+                        // cadence to the scheduler when one is published. With no scheduler
+                        // (--inventory-disable, or the sync thread of this connection has not
+                        // published yet) the settings are still held and reported, and the
+                        // next scheduler is built on them. It never forces a sync; the wake
+                        // below only re-ticks so the new cadence is applied at once.
+                        auto decision =
+                            cmd.action() == kSettingsAction
+                                ? decide_sync_settings(
+                                      cmd.parameters(),
+                                      SettingsHooks{
+                                          [this](std::string_view key, std::string_view value) {
+                                              return kv_store_ &&
+                                                     kv_store_->set(kSyncKvNamespace, key, value);
+                                          },
+                                          [this](const AgentCollectionSettings& s) {
+                                              collector_enabled_->set(s.plugins);
+                                              // Assign first, THEN read the scheduler, both
+                                              // under settings_mu_ (the sync thread holds it
+                                              // from its read of applied_settings_ to its
+                                              // publication): either that build already read
+                                              // `s`, or its scheduler is visible here.
+                                              // apply_settings only queues under the
+                                              // scheduler's own short mutex.
+                                              std::lock_guard<std::mutex> lk(settings_mu_);
+                                              applied_settings_ = s;
+                                              std::shared_ptr<SyncScheduler> live;
+                                              {
+                                                  std::lock_guard<std::mutex> sl(sync_sched_mu_);
+                                                  live = sync_scheduler_;
+                                              }
+                                              if (live)
+                                                  live->apply_settings(
+                                                      kSettingsSyncSource,
+                                                      std::chrono::seconds{s.interval_s},
+                                                      s.window);
+                                          }})
+                                : decide_sync_now(cmd.action(), source, delay_max_s,
+                                                  cfg_.inventory_disable, sched.get());
                         resp.set_status(decision.status == SyncNowDecision::Status::Success
                                              ? pb::CommandResponse::SUCCESS
                                              : pb::CommandResponse::FAILURE);
@@ -4656,6 +4792,46 @@ private:
         update_thread_.join();
     }
 
+    /// Publish the live control peer to every plugin context as "agent.server_peer".
+    ///
+    /// TRUST RULE (#3429 round 4, kept): the value is produced here, by agents/core, from
+    /// the stream the server actually answered on (certificate-authenticated when
+    /// tls_enabled); a plugin never resolves a name and admits only a literal published
+    /// here. It is the address the agent reaches the server on RIGHT NOW, not a name the
+    /// host being contained could re-point (the firewall containment reads it at
+    /// quarantine time, so a server that moved after agent start is allowed, not the dead
+    /// address resolved at boot).
+    ///
+    /// A peer that is not a usable literal (grpc_peer_literal: empty), or a 17th distinct
+    /// one, publishes NOTHING (nullptr), so a plugin falls back to the start-resolved set
+    /// rather than keep a stale address. The strings are interned in an append-only,
+    /// capped set and never freed: yuzu_ctx_get_config hands the raw pointer to plugin
+    /// code, so what it names must outlive every possible reader.
+    void publish_server_peer(const std::string& grpc_peer) {
+        const auto literal = yuzu::agent::grpc_peer_literal(grpc_peer);
+        const char* interned = nullptr;
+        if (!literal.empty()) {
+            std::lock_guard lk(peer_intern_mu_);
+            for (const auto& known : peer_interned_)
+                if (*known == literal)
+                    interned = known->c_str();
+            if (!interned && peer_interned_.size() < kMaxInternedPeers) {
+                peer_interned_.push_back(std::make_unique<const std::string>(literal));
+                interned = peer_interned_.back()->c_str();
+            }
+        }
+        if (!literal.empty() && !interned)
+            spdlog::warn("server peer {}: more than {} distinct peers seen, not published to plugins",
+                         literal, kMaxInternedPeers);
+        plugin_ctx_.server_peer.store(interned, std::memory_order_release);
+        for (auto& [name, pctx] : per_plugin_ctx_)
+            pctx->server_peer.store(interned, std::memory_order_release);
+    }
+
+    static constexpr std::size_t kMaxInternedPeers = 16;
+    std::mutex peer_intern_mu_;
+    std::vector<std::unique_ptr<const std::string>> peer_interned_; // append-only, never freed
+
     // The teardown barrier for the installed-software collector. Its actions run on bounded
     // DETACHED workers (agents/shared/bounded_wait.hpp): a caller that gave up at the time limit
     // leaves the worker inside a plugin's dispatcher. Call this AFTER quiesce_run_workers() (the
@@ -4749,7 +4925,8 @@ private:
     // arms the scheduler through this handle and breaks the sync thread's sleep.
     // sync_scheduler_ is null under --inventory-disable and between connections
     // (published by the 4b-sync thread after its sources are registered, cleared
-    // by that same thread on exit) — the intercept answers FAILURE, never blocks.
+    // by that same thread on exit) — the `now` intercept answers FAILURE, never blocks;
+    // `settings` is held in applied_settings_ and needs no scheduler.
     std::atomic<bool> sync_wake_{false};
     std::mutex sync_sched_mu_;
     std::shared_ptr<SyncScheduler> sync_scheduler_;
@@ -5005,6 +5182,15 @@ private:
     // (sync_source_installed_software.hpp). Agent-lifetime, NOT per-connection: see the factory
     // call and drain_detached_collectors_or_exit().
     std::shared_ptr<CollectorWorkers> collector_workers_ = std::make_shared<CollectorWorkers>();
+    // The fleet collection settings last applied (`__sync__.settings`, collection_settings_agent.hpp)
+    // and the collector switches they carry. Agent-lifetime like the workers: written by start-up
+    // and the command thread, read by the sync thread (building the source on each connection) and
+    // the heartbeat thread (the version tag). Empty = nothing applied. settings_mu_ also orders a
+    // `__sync__.settings` against the sync thread's source build and scheduler publication; where
+    // both are held it is taken before sync_sched_mu_.
+    std::mutex settings_mu_;
+    std::optional<AgentCollectionSettings> applied_settings_;
+    std::shared_ptr<CollectorEnabledSet> collector_enabled_ = std::make_shared<CollectorEnabledSet>();
 
     // PR 10 / UAT 2026-05-12 — Push-based fleet topology ingestion.
     //

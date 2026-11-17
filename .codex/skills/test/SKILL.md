@@ -1,6 +1,6 @@
 ---
 name: test
-description: Run or plan Yuzu's `/test` pre-commit and pre-push validation pipeline with quick, default, full, instructions, and quarantine modes. Use when the user says `/test`, `/test --quick`, `/test --full`, asks for the full test gate, or needs the Yuzu test-runs DB workflow.
+description: Run or plan Yuzu's `/test` pre-commit and pre-push validation pipeline with quick, default, full, and instructions modes. Use when the user says `/test`, `/test --quick`, `/test --full`, asks for the full test gate, or needs the Yuzu test-runs DB workflow.
 ---
 
 # Test
@@ -13,7 +13,6 @@ Use this skill for the high-level Yuzu validation pipeline. Route low-level buil
 - `--quick`: build plus offline C++ unit, EUnit, and Dialyzer. No live stack, no synthetic UAT.
 - `--full`: default plus OTA stubs/flows, sanitizer dispatch, coverage, and perf measurement. About 60-120 minutes.
 - `--instructions`: live-stack instruction definition suite only.
-- `--instructions-quarantine`: local quarantine ceremony only. Do not run on remote or SSH-only hosts.
 - `--force-cleanup`: clean this run's dangling containers before start.
 - `--keep-stack`: leave debug stacks running when the script supports it.
 
@@ -37,7 +36,7 @@ they do not share one host-wide SQLite file:
 - Wee Tam: `D:\ci\test-runs\yuzu-weetam-windows-N\test-runs.db`
 
 `ci.yml`'s Linux and Windows jobs initialize and write these databases
-automatically. Schema v3 preserves GitHub rerun attempts separately and stores
+automatically. Schema v4 preserves GitHub rerun attempts separately and stores
 job outcome/duration, platform, runner, commit/branch/event, ccache hit ratio,
 Meson suite result/duration/timeout, and recovered known-flake events. Query one
 on its host by setting `YUZU_TEST_DB`, for example:
@@ -63,6 +62,8 @@ passes CI if an isolated retry recovers; each recovery is also persisted in
 `ci_flake_events` so recurrence can be measured instead of inferred from logs.
 
 Initialize each manual orchestration with a `RUN_ID`, `TEST_DIR=/tmp/yuzu-test-$RUN_ID`, `LOG_DIR=$HOME/.local/share/yuzu/test-runs/$RUN_ID`, `COMMIT`, `BRANCH`, and `BUILDDIR=$(build_dir)` from `scripts/test/_portable.sh`. Record gates with `scripts/test/test-db-write.sh`.
+
+For manual coverage capture, run `bash scripts/test/coverage-gate.sh --capture-baselines`; it generates a fresh run ID for every capture. See `docs/ci-architecture.md` → "Persistent runner-local test history" for schema-v4 compatibility and rollback instructions.
 
 ## Phase Order
 
@@ -96,12 +97,10 @@ Phase 8 must not stop the native UAT stack from `scripts/start-UAT.sh`. A succes
 
 ## Perf Status
 
-Perf is measure-only as of 2026-05-03. `scripts/test/perf-gate.sh` records metrics and exits PASS; humans inspect trend and distribution shape using the test-runs DB and `docs/perf-baseline-calibration-2026-05-03.md`.
+Perf thresholds are measure-only as of 2026-05-03. `scripts/test/perf-gate.sh` records metrics and passes only when every requested suite completes and its metrics are recorded; failed, incomplete or unrecorded execution fails. Humans inspect trend and distribution shape using the test-runs DB and `docs/perf-baseline-calibration-2026-05-03.md`.
 
 ## Mode Shortcuts
 
 For `--quick`, resolve the build directory and run only compile plus offline suites. Do not start UAT and do not invoke synthetic UAT.
 
 For `--instructions`, use `scripts/test/instructions-tests.sh` after bringing up only the required live stack.
-
-For `--instructions-quarantine`, use `scripts/test/instructions-quarantine.sh` only on a local machine where temporary self-disconnect is acceptable.

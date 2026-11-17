@@ -52,7 +52,9 @@ inline constexpr int kWideScopeMaxReads = 4;
 /// the maximum size (250 at limit 100); an export reads up to 10000 rows per request and reaches
 /// the ceiling after a few continuations. The cursor is opaque and unauthenticated, so the same bound holds for
 /// any token a caller presents: no request's OFFSET exceeds it. A cursor past it is refused with
-/// CursorError::kScanLimit; the caller narrows the filter or pages with a smaller scope.
+/// CursorError::kScanLimit; the caller narrows the filter or pages with a smaller scope. The
+/// in-process walk (`read_scoped_step`, the streamed export) mints no cursor and reads at skip 0,
+/// so this bound does not apply to it.
 inline constexpr std::int64_t kWideScopeMaxSkip = 100000;
 inline constexpr std::int64_t kStaleWindowSecs = 172800; ///< 48 h
 inline constexpr std::size_t kSourceMaxBytes = 256;
@@ -354,8 +356,8 @@ struct ScopedPage {
     bool hit_cap{false};               ///< the same condition as next_cursor being non-empty
     /// DISTINCT devices hidden by the post-filter within the scanned window(s) (0 under push-down).
     std::int64_t devices_omitted{0};
-    /// The request named an `agent_id` outside the caller's scope. Under push-down the SQL then
-    /// returns nothing and devices_omitted stays 0; the transports still audit it as a denial.
+    /// The request named an `agent_id` outside the caller's scope: the page is empty (nothing is
+    /// read, devices_omitted 0, no cursor) for every scope class; the transports still audit it.
     bool target_denied{false};
 };
 using DevicesPage = ScopedPage<SoftwareFleetRow>;
@@ -371,8 +373,125 @@ template <class Ops>
 using ScopedReader = std::function<std::optional<std::vector<typename Ops::Row>>(
     const typename Ops::Query&)>;
 
+/// One in-process step of a scoped walk (`read_scoped_step`): the page plus where the walk goes
+/// next. `resume` is the keyset position the next read continues strictly after, or nullopt when
+/// the data has ended. On the wide path it names the last row SCANNED, which may be one the caller
+/// cannot see, so it is for the walking process only: a transport that pages for a caller uses
+/// `read_scoped_page`, whose cursor never carries such a key. `page.next_cursor` is never set here.
+template <class Ops>
+struct ScopedStep {
+    ScopedPage<typename Ops::Row> page;
+    std::optional<typename Ops::Anchor> resume;
+};
+
+namespace detail {
+
+/// What the one scoped-read loop produces: the step, plus the (served-row anchor, scanned count)
+/// pair `read_scoped_page` mints its cursor from when `step.page.hit_cap`.
+template <class Ops>
+struct ScopedCore {
+    ScopedStep<Ops> step;
+    typename Ops::Anchor cursor_after{};
+    std::int64_t cursor_skip{0};
+};
+
+/// THE scoped read, the only copy of the push-down / post-filter logic. `after` is where the walk
+/// starts (the head anchor = from the start) and `skip` the rows to pass over after it; both come
+/// from a decoded cursor (page mode) or are `{head-or-resume, 0}` (in-process). nullopt = degraded.
+/// Resume position, by how the read ended: push-down/TOP page full -> its last row (every row is in
+/// scope); wide page filled mid-read -> the last row SERVED (never the read's last row: rows past
+/// it are unscanned); wide read bound reached -> the last row of the final read; a short read or an
+/// empty push-down page -> nullopt, the end.
+template <class Ops>
+[[nodiscard]] std::optional<ScopedCore<Ops>>
+scoped_core(const ScopedReader<Ops>& read, typename Ops::Query q, const typename Ops::Anchor& after,
+            std::int64_t skip, const authz::VisibleSet& scope) {
+    using Anchor = typename Ops::Anchor;
+    // The head anchor is "from the start", whatever key the store hands out.
+    if (!Ops::is_head(after))
+        q.after = after;
+    ScopedCore<Ops> out;
+    auto& page = out.step.page;
+    page.target_denied = !q.agent_id.empty() && !authz::in_scope(scope, q.agent_id);
+    if (page.target_denied) // every scope class, no read: empty page, devices_omitted 0, no cursor
+        return out;
+    // TOP leaves the query alone; engaged-empty is agent_ids = {} (the store returns empty without
+    // SQL); a bounded set is pushed into SQL; a wider one is post-filtered below.
+    const bool filter = scope && scope->size() > kScopePushdownMaxIds;
+    if (scope && !filter)
+        q.agent_ids.emplace(scope->begin(), scope->end());
+    if (!filter) {
+        // Every returned row is in scope, so the last one is a safe cursor. A skip is only ever
+        // minted by the wide path below; it has no meaning here and is ignored.
+        auto rows = read(q);
+        if (!rows)
+            return std::nullopt;
+        page.hit_cap = !rows->empty() && rows->size() == static_cast<std::size_t>(q.limit);
+        if (page.hit_cap) {
+            out.cursor_after = Ops::key_of(rows->back());
+            out.step.resume = out.cursor_after;
+        }
+        page.rows = std::move(*rows);
+        return out;
+    }
+
+    // Wide scope: post-filter, refilling the page with at most kWideScopeMaxReads bounded reads.
+    const auto limit = static_cast<std::size_t>(q.limit);
+    q.skip = skip;
+    std::int64_t since_anchor = skip;
+    std::unordered_set<std::string> dropped;
+    bool more = false;
+    page.rows.reserve(limit);
+    for (int reads = 1;; ++reads) {
+        auto rows = read(q);
+        if (!rows)
+            return std::nullopt;
+        const bool full = !rows->empty() && rows->size() == limit;
+        std::optional<Anchor> last_scanned; // taken before the rows below are moved out
+        if (full)
+            last_scanned = Ops::key_of(rows->back());
+        std::size_t i = 0;
+        for (; i < rows->size() && page.rows.size() < limit; ++i) {
+            auto& r = (*rows)[i];
+            if (authz::in_scope(scope, r.agent_id)) {
+                page.rows.push_back(std::move(r));
+                since_anchor = 0;
+            } else {
+                dropped.insert(r.agent_id); // each DISTINCT device counts once
+                ++since_anchor;
+            }
+        }
+        if (page.rows.size() >= limit) { // page filled: rows may remain here or beyond
+            more = i < rows->size() || full;
+            if (more)
+                out.step.resume = Ops::key_of(page.rows.back());
+            break;
+        }
+        if (!full) // a short read is the end of the data
+            break;
+        if (reads >= kWideScopeMaxReads) { // bound reached: say there may be more
+            more = true;
+            out.step.resume = std::move(last_scanned);
+            break;
+        }
+        q.after = std::move(*last_scanned);
+        q.skip = 0;
+    }
+    page.devices_omitted = static_cast<std::int64_t>(dropped.size());
+    page.hit_cap = more;
+    if (more) {
+        out.cursor_after = page.rows.empty() ? after : Ops::key_of(page.rows.back());
+        out.cursor_skip = since_anchor;
+    }
+    return out;
+}
+
+} // namespace detail
+
 /// One scoped keyset page: decode the cursor (bound to the filter set, never to the scope), push
-/// the caller's scope into the query, read, then post-filter. The scope: TOP -> unfiltered;
+/// the caller's scope into the query, read, then post-filter. A named `agent_id` outside the scope
+/// is answered first with the empty denied page and no read, whatever the scope's size. The scope:
+/// TOP -> unfiltered;
 /// engaged-empty -> agent_ids = {} (the store returns empty without SQL); engaged and
 /// <= kScopePushdownMaxIds -> agent_ids = the set (complete pages, nothing hidden; one read, the
 /// cursor is the last row); larger -> the rows are filtered here with authz::in_scope and
@@ -386,84 +505,38 @@ template <class Ops>
 [[nodiscard]] std::expected<ScopedPage<typename Ops::Row>, std::optional<CursorError>>
 read_scoped_page(const ScopedReader<Ops>& read, typename Ops::Query q, const std::string& cursor,
                  const std::string& fp, const authz::VisibleSet& scope) {
-    using Anchor = typename Ops::Anchor;
-    Anchor incoming_after{}; // the head: nothing served yet
-    std::int64_t incoming_skip = 0;
+    typename Ops::Anchor after{}; // the head: nothing served yet
+    std::int64_t skip = 0;
     if (!cursor.empty()) {
         auto cur = Ops::decode(cursor, fp);
         if (!cur)
             return std::unexpected(cur.error());
-        incoming_after = std::move(cur->first);
-        incoming_skip = cur->second;
+        after = std::move(cur->first);
+        skip = cur->second;
     }
-    // The head anchor is "from the start", whatever key the store hands out.
-    if (!Ops::is_head(incoming_after))
-        q.after = incoming_after;
-    ScopedPage<typename Ops::Row> out;
-    out.target_denied = !q.agent_id.empty() && !authz::in_scope(scope, q.agent_id);
-    // TOP leaves the query alone; engaged-empty is agent_ids = {} (the store returns empty without
-    // SQL); a bounded set is pushed into SQL; a wider one is post-filtered below.
-    const bool filter = scope && scope->size() > kScopePushdownMaxIds;
-    if (scope && !filter)
-        q.agent_ids.emplace(scope->begin(), scope->end());
-    if (!filter) {
-        // Every returned row is in scope, so the last one is a safe cursor. A skip is only ever
-        // minted by the wide path below; it has no meaning here and is ignored.
-        auto rows = read(q);
-        if (!rows)
-            return std::unexpected(std::nullopt);
-        out.hit_cap = !rows->empty() && rows->size() == static_cast<std::size_t>(q.limit);
-        if (out.hit_cap)
-            out.next_cursor = Ops::encode(Ops::key_of(rows->back()), 0, fp);
-        out.rows = std::move(*rows);
-        return out;
-    }
+    auto core = detail::scoped_core<Ops>(read, std::move(q), after, skip, scope);
+    if (!core)
+        return std::unexpected(std::nullopt);
+    auto page = std::move(core->step.page);
+    if (page.hit_cap)
+        page.next_cursor = Ops::encode(core->cursor_after, core->cursor_skip, fp);
+    return page;
+}
 
-    // Wide scope: post-filter, refilling the page with at most kWideScopeMaxReads bounded reads.
-    const auto limit = static_cast<std::size_t>(q.limit);
-    q.skip = incoming_skip;
-    std::int64_t since_anchor = incoming_skip;
-    std::unordered_set<std::string> dropped;
-    bool more = false;
-    out.rows.reserve(limit);
-    for (int reads = 1;; ++reads) {
-        auto rows = read(q);
-        if (!rows)
-            return std::unexpected(std::nullopt);
-        const bool full = !rows->empty() && rows->size() == limit;
-        Anchor last_scanned{};
-        if (full && reads < kWideScopeMaxReads)
-            last_scanned = Ops::key_of(rows->back());
-        std::size_t i = 0;
-        for (; i < rows->size() && out.rows.size() < limit; ++i) {
-            auto& r = (*rows)[i];
-            if (authz::in_scope(scope, r.agent_id)) {
-                out.rows.push_back(std::move(r));
-                since_anchor = 0;
-            } else {
-                dropped.insert(r.agent_id); // each DISTINCT device counts once
-                ++since_anchor;
-            }
-        }
-        if (out.rows.size() >= limit) { // page filled: rows may remain here or beyond
-            more = i < rows->size() || full;
-            break;
-        }
-        if (!full) // a short read is the end of the data
-            break;
-        if (reads >= kWideScopeMaxReads) { // bound reached: say there may be more
-            more = true;
-            break;
-        }
-        q.after = std::move(last_scanned);
-        q.skip = 0;
-    }
-    out.devices_omitted = static_cast<std::int64_t>(dropped.size());
-    out.hit_cap = more;
-    if (more)
-        out.next_cursor = Ops::encode(
-            out.rows.empty() ? incoming_after : Ops::key_of(out.rows.back()), since_anchor, fp);
-    return out;
+/// One in-process step of a walk over the same scoped read, for a caller that walks to the end
+/// itself (the streamed export) rather than handing a cursor to a client. Starts strictly after
+/// `after` (the head anchor = the start) with skip 0, so no store read ever uses an OFFSET, however
+/// many consecutive rows the scope hides; the next step starts from the returned `resume`. No
+/// cursor is decoded or minted, so the only failure is a degraded read (nullopt). A named
+/// `agent_id` outside the scope is the empty denied page with no resume, as in `read_scoped_page`.
+template <class Ops>
+[[nodiscard]] std::optional<ScopedStep<Ops>>
+read_scoped_step(const ScopedReader<Ops>& read, typename Ops::Query q,
+                 const typename Ops::Anchor& after, const authz::VisibleSet& scope) {
+    auto core = detail::scoped_core<Ops>(read, std::move(q), after, 0, scope);
+    if (!core)
+        return std::nullopt;
+    return std::move(core->step);
 }
 
 /// One raw per-install page (`read_scoped_page` over SoftwareFleetRow, cursor `d2:`). Error as

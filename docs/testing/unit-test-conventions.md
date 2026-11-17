@@ -5,6 +5,8 @@ Loaded by `quality-engineer` on any change under `tests/unit/`.
 The "Shell and source-text gates" section also covers `test()` registrations in `tests/meson.build`, the `tests/test_*.py` source-text gates and `tests/shell/`.
 
 Companion: `docs/testing/integration-tests.md` covers the shell/E2E stack-bring-up layer.
+The opt-in obligation registry and evidence capture are described in
+[`contract-evidence.md`](contract-evidence.md).
 The authoritative statement of each helper's contract is its own doc comment at the source;
 this doc is the index and carries the rules that live nowhere else.
 
@@ -20,6 +22,10 @@ Use `yuzu::test::unique_temp_path(prefix)` / `yuzu::test::TempDbFile` / `yuzu::t
 
 The Linux Service spark case in `test_spark_mechanism.cpp` (a private `dbus-daemon` plus a child process, #5719 item 5) has its own skip-vs-fail contract: it SKIPs when `dbus-daemon` is not installed or the socket path is too long for `sockaddr_un`, and `YUZU_REQUIRE_SPARK_DBUS_TESTS` (non-empty and not `0`) turns that skip into a FAIL; no CI leg sets it yet (tracked in #7901).
 
+## Echo fresh-database opens: `echo_test_db.hpp`
+
+`yuzu::test::open_echo_db(path)` (`tests/unit/echo_test_db.hpp`, `yuzu_echo_tests` only) opens an `EchoDatabase` that starts at the current schema version: it copies a per-process migrated template to `path` first and sets `PRAGMA synchronous=OFF` on the write connection. A fresh `EchoDatabase::open` walks the v2 to v10 ladder as separate commits (about 25 fsyncs), and the suite opens about 470 databases, which made the Windows debug leg fsync-bound and intermittently past its 180 s limit (#7135, #7872). Use it where a test wants "the state a fresh open leaves". **Keep a real `EchoDatabase::open` on a path the test prepared** for anything about the open itself or the ladder (a fresh open's own end state, an upgrade, a corrupt, busy or colliding file, the open's log lines) and for durability or crash behaviour. The helper prints to stderr and falls back to a plain open if the template cannot be built, and `echo_test_db: the migrated template is built...` fails the suite in that case.
+
 ## Route-handler tests — `TestRouteSink`
 
 For route-handler tests, `TestRouteSink` (`tests/unit/server/test_route_sink.hpp`, used by 41 files) mirrors `httplib::Server`'s parsing of the path, the query string, and an `application/x-www-form-urlencoded` body into `req.params` (query first, so query wins) — and **nothing else**: no path percent-decoding, no multipart/chunked, no duplicate headers, and none of the pre/post-routing pipeline. So a gate that moves into pre-routing leaves every sink test green. Two traps: `Post(path, body)` defaults to `application/json` and does NOT populate `req.params` (omitting the content-type silently tests a handler's fallback instead of its production branch — the #1786 false-green, re-armable), and fixtures must declare the sink **after** the route owner it registers (its handlers capture the owner's `this`). Contract pinned by `tests/unit/server/test_route_sink_harness.cpp`.
@@ -31,14 +37,36 @@ For server tests that need a live `ExecutionTracker` in `AgentServiceImpl`, use 
 ## Exception-safe test cleanup — `ScopeExit`
 
 `yuzu::test::ScopeExit` (`tests/unit/test_helpers.hpp`) is a generic RAII cleanup
-that runs on ANY scope exit, including exception unwind from a failing
-`REQUIRE`/`CHECK` — declare it after whatever it releases/reads so it destructs
+that runs on ANY scope exit, including a failing `REQUIRE` or an exception from
+tested code — declare it after whatever it releases/reads so it destructs
 FIRST (reverse declaration order); its callback must not throw, since it can run
 mid-unwind, where a second throw would terminate. Used by `test_thread_pool.cpp`
-(releasing parked pool workers before `~ThreadPool` joins them) and
-`test_guardian_outbox_send_executor.cpp` (#4223 — releasing a detached worker
-parked on a test-owned gate pointer before the pointer's stack storage can be
-destroyed). Promoted from `test_thread_pool.cpp` once a second file needed it.
+(releasing parked pool workers before `~ThreadPool` joins them). Promoted from
+`test_thread_pool.cpp` once a second file needed it.
+
+A bounded drain is not a lifetime guarantee for a detached worker. In
+`test_guardian_outbox_send_executor.cpp`, each stalled callback owns its gate
+through `shared_ptr`; fixture destruction releases the gate even during assertion
+unwind, and the callback keeps it alive until the worker exits. The SSE saturation
+fixture similarly releases held streams and joins every client before destroying
+the server, including partial construction and exception paths.
+
+## Fixture observations must detect the wrong behavior
+
+A fixture needs an observable result from the code under test. For example,
+`test_rest_sessions.cpp` distinguishes a missing session from an authenticated
+session with an empty username so the defensive handler actually runs;
+`test_power_health_parsers.cpp` records the requested power-plan GUID and derives
+read-back state from that argument. A fixed successful read-back could hide a
+wrong command. `KvProbe` in `test_guardian_spark_reapply_skip_engine.cpp` requires
+`SQLITE_DONE` after reading all rows: a database error cannot mean "no writes".
+
+For an assertion repair, preserve a failing baseline or a deliberate faulty copy
+alongside the passing run when practical. Record the source revision and dirty
+patch, exact command and filter, toolchain, prerequisite state, exit status,
+case/assertion/skip counts, and raw native reports. Identify extracted harnesses
+separately from registered test runs. A passing helper probe does not establish
+ADR conformance for its consumers, and a skipped prerequisite is not a pass.
 
 ## Agent-side journal storage tests — `FakeJournalStore`
 
@@ -65,6 +93,8 @@ the concurrency property under test — not the storage engine — is the point 
 For server tests needing live **PostgreSQL**, use `PostgresTestDb` + `YUZU_REQUIRE_PG_DB(var)` from `test_helpers.hpp` (behind `YUZU_TEST_ENABLE_PG`, server suite only). Creates an ephemeral `yuzu_test_<epoch>_<salt>_<n>` DB on `YUZU_TEST_POSTGRES_DSN`, drops it `WITH (FORCE)`; the name-embedded epoch drives a suite-start sweep of databases leaked by killed runs. Skip-vs-fail: env **unset** → skip (local dev); **set but broken** → FAIL (`scripts/ci/ensure-postgres.sh` guarantees a reachable instance on every CI server-test leg). **Store-behaviour tests use the pre-migrated template variant** `YUZU_REQUIRE_PG_DB_TPL(var, tpl)` + a file-local `PgTestTemplate` (clones an already-migrated DB — per-test migration DDL drove the 2026-07-12 Windows server-suite timeout; recipe: `docs/postgres-store-playbook.md` step 7); plain `YUZU_REQUIRE_PG_DB` is only for fresh-DB / pg-substrate behaviour tests. **Migration-in-substance tests** (a real fresh migrate, `!is_open` on failure, backfill/upgrade, drift-detection) use `YUZU_REQUIRE_PG_MIGRATION_DB(var)` instead (#2354, #3443) — same contract, SKIPs on Windows by default (fail-closed; `YUZU_TEST_PG_MIGRATION_DDL=1` overrides), so a new store's migration test belongs on this macro, never plain `YUZU_REQUIRE_PG_DB`. Local: run `postgres:18` on `:5433` with `-c max_connections=400` (what `scripts/ci/ensure-postgres.sh` uses — at the default 100, a full parallel `--suite server` run fails with "too many clients"), then `export YUZU_TEST_POSTGRES_DSN=postgresql://yuzu:yuzu@localhost:5433/yuzu`.
 
 **Clone-strategy knob.** `YUZU_TEST_PG_CLONE_STRATEGY` selects the `STRATEGY` of the template clone (`CREATE DATABASE "<db>" TEMPLATE "<tpl>"`, the `YUZU_REQUIRE_PG_DB_TPL` path): `wal_log` or `file_copy`, case-insensitive, appends ` STRATEGY WAL_LOG` / ` STRATEGY FILE_COPY`. **Unset (or empty) leaves the SQL byte-identical** to the knob not existing, so the server default (`WAL_LOG`) applies. **Any other value FAILS the fixture** (`PostgresTestDb::error()` names the variable and the accepted values; the macro's `REQUIRE` reports it) rather than silently measuring the default. **The `STRATEGY` clause needs PostgreSQL 15 or later**: an older server rejects the `CREATE DATABASE`, which fails the fixture, so leave the variable unset there. **`file_copy` is only faster on a cluster running with `fsync=off`** (as CI's does); on a durable one, such as a default local `postgres:18` container, each clone is several times slower, so leave it unset locally unless your cluster runs that way. Fresh empty databases (plain `YUZU_REQUIRE_PG_DB`) are not affected. The Linux CI test step's pg half sets it to `file_copy` (measured about 6-7% faster on that half than the default; a value already in the runner's environment is overridden there, with a `::warning::`); no other CI job sets it, so the Windows and macOS legs, the nightlies and local runs keep the server default unless you set it (`docs/ci-architecture.md`, "Postgres for server tests"). Parser and its contract: `parse_pg_clone_strategy` in `test_helpers.hpp`, tested in `tests/unit/server/test_pg_template_cleanup.cpp` (the parser on its own, plus a `[pg][template]` case cloning with each value and with an invalid one).
+
+**Census pair harness knobs.** `YUZU_TEST_PAIR_HARNESS_SEEDS=N` (seeds 0..N-1, default 64), `YUZU_TEST_PAIR_HARNESS_ONLY=S` (seed S alone, schedule printed) and `YUZU_TEST_PAIR_HARNESS_DECISIONS=0` (leave the decision-label comparison out) steer `census pair harness: seeds replayed through the store against the model`; a malformed SEEDS or ONLY value fails the case instead of running a default. The replay recipe, the digest table and where the original Python model is (not in the tree) are in the header of `tests/unit/server/test_census_pair_harness.cpp`.
 
 ## Prometheus alert rules — parse vs behaviour
 

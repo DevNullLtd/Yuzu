@@ -291,6 +291,7 @@ agent_test_exe = executable(
     'unit/test_guardian_lifecycle_journal.cpp',
     'unit/test_guardian_journal_heartbeat.cpp',
     'unit/test_guardian_arm_heartbeat.cpp', # rung 9c PR-3
+    'unit/test_guardian_baseline_heartbeat.cpp', # #5605
     'unit/test_guardian_health_heartbeat.cpp',
     'unit/test_guardian_backend_heartbeat.cpp',
     'unit/test_guardian_unsupported_heartbeat.cpp',
@@ -353,6 +354,8 @@ agent_test_exe = executable(
     'unit/test_disk_actions_local_dispatcher.cpp', # Wave 6 PR6.1-a-1: real disk_actions dylib/.so/.dll
     'unit/test_disk_actions_partitions.cpp', # H.5b: pure layer of the Windows partitions leg (runs on every host)
     'unit/test_firewall_local_dispatcher.cpp',
+    'unit/test_firewall_quarantine_parsers.cpp', # PRQ.1: pure quarantine core (allow set, exception grammar, verify/rollback, generations, phases, TTL, state, argv plans), fake seam, unguarded on every OS
+    'unit/test_firewall_quarantine_live.cpp', # PRQ.1: the built firewall plugin's action boundary ([agent][firewall_quarantine], refuses before any OS call, every OS) plus hidden [.] real-host runs; those need YUZU_FIREWALL_QUARANTINE_LIVE=1 and root/admin
     'unit/test_agent_csr.cpp',
     'unit/test_tls_policy.cpp', # #4722: shared TLS cipher policy (common/include/yuzu/tls_policy.hpp), pure
     'unit/test_enrollment_token_file.cpp', # --enrollment-token-file: shared token shape + text parser (common/include/yuzu/enrollment_token_shape.hpp), the no-follow reader and source precedence (agents/core/include/yuzu/agent/enrollment_token_file.hpp)
@@ -365,6 +368,7 @@ agent_test_exe = executable(
     'unit/test_inventory_sync_action_table.cpp',
     'unit/test_agent_sync_command.cpp', # round-3 remediation: decide_sync_now pure-core extraction
                                           # from agent.cpp's __sync__.now reserved-command branch
+    'unit/test_collection_settings_agent.cpp', # settings command parse, golden vectors, scheduler and collector application
     'unit/test_device_ci_sync.cpp',
     'unit/test_sync_source_app_perf.cpp',
     'unit/test_win_str_utils.cpp',
@@ -464,9 +468,7 @@ agent_test_exe = executable(
                                                 # the above -- real staged/copied executable payload, real
                                                 # runner spawn (Windows-only TU guard)
     'unit/test_certificates_x509.cpp',        # Wave 2 WP-B: pure libcrypto PEM/DER field extraction
-    'unit/test_quarantine_parsers.cpp',       # Wave 2 WP-F: pure netsh/iptables/pfctl output parsers
-    'unit/test_quarantine_argv.cpp',          # Wave 2 WP-F remediation: pure mutating-argv construction (FN-03)
-    'unit/test_quarantine_serialization.cpp', # Wave 2 P4: MutationGate bounded-wait serialization (#3286)
+    'unit/test_mutation_gate.cpp',            # MutationGate bounded-wait serialization (#3286)
     'unit/test_reconnect_backoff.cpp',        # HA WS-13 (#291): jittered reconnect delay, pure, random source injected
     'unit/test_server_address_parsers.cpp',   # #3429 round 4: pure host:port / IP-literal helpers for
                                                 # server_address_resolver.cpp's boot-time DNS resolution
@@ -650,6 +652,12 @@ agent_test_exe = executable(
     'unit/test_system_hardening_win_parsers.cpp',        # Wave 8 PR8.1-b: pure mitigation-registry decoder over the-rig REAL CAPTURE fixtures
     'unit/test_system_hardening_local_dispatcher.cpp',   # Wave 8 PR8.1-b: real system_hardening dylib/.so/.dll via LocalDispatcher, unguarded on every OS
     'unit/test_runtimes_parsers.cpp',            # Wave 10 PR10.1-b: pure parsers over REAL CAPTURE fixtures, unguarded on every OS
+    'unit/test_component_zip.cpp',               # component_inventory: bounded zip reader (wave 1)
+    'unit/test_component_java_parsers.cpp',      # component_inventory: Java manifest/pom parsers (wave 1)
+    'unit/test_component_walk.cpp',              # component_inventory: bounded walk policy over an in-memory tree and a fake clock, unguarded on every OS
+    'unit/test_component_scan.cpp',              # component_inventory: portable scan over an in-memory tree and a fake clock, archives built as bytes; one POSIX-only case through the real leg
+    'unit/test_component_fs_posix.cpp',          # component_inventory: POSIX filesystem leg (body POSIX-only)
+    'unit/test_component_inventory_local_dispatcher.cpp',  # component_inventory: real plugin via LocalDispatcher, unguarded on every OS (dispatches scan on Windows only)
     'unit/test_runtimes_linux_parsers.cpp',      # Wave 10 PR10.1-b: Linux walk over materialized tree manifests (REAL CAPTURE structure plus labelled reconstructions; walk bodies POSIX-only)
     'unit/test_runtimes_local_dispatcher.cpp',   # Wave 10 PR10.1-b: real plugin via LocalDispatcher, unguarded on every OS
     'unit/test_runtimes_python_parsers.cpp',     # runtimes python: pure python layer + macOS framework walk over a materialized fixture tree (walk body POSIX-only)
@@ -667,6 +675,7 @@ agent_test_exe = executable(
     'unit/test_middleware_linux_parsers.cpp',       # SAM.2: Linux leg over a materialized tree manifest (REAL registered-install capture plus labelled inline cases; body POSIX-only)
     'unit/test_middleware_local_dispatcher.cpp',    # SAM.2: real middleware plugin via LocalDispatcher and the table-generated descriptors, unguarded on every OS
     '../agents/plugins/middleware/src/middleware_linux.cpp', # SAM.2: run_linux (self-gated to __linux__, empty elsewhere)
+    '../agents/plugins/component_inventory/src/component_fs_posix.cpp',  # SAM-16: POSIX filesystem leg (self-gated to non-Windows, empty on Windows)
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp, config_checks.hpp
@@ -678,6 +687,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/printing/src'),  # printing_ipp.hpp / printing_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/browser_policy/src'),  # browser_policy_*.hpp (Wave 10 PR10.2-b)
     include_directories('../agents/plugins/runtimes/src'),  # runtimes_*parsers.hpp / runtimes_legs.hpp (Wave 10 PR10.1-b pure helpers)
+    include_directories('../agents/plugins/component_inventory/src'),  # component_walk.hpp / component_*.hpp (pure helpers)
     include_directories('../agents/plugins/browser_inventory/src'),  # browser_inventory_*_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/local_security_policy/src'),  # Wave 8 PR8.3
     include_directories('../agents/plugins/power_health/src'),  # power_health_parsers.hpp (pure helpers)
@@ -710,7 +720,6 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/filesystem/src'),    # filesystem_macos_sig.hpp (#2273/1.14); filesystem_acl_parsers.hpp (get_acl parser + dispatcher tests)
     include_directories('../agents/plugins/event_logs/src'),    # event_logs_macos.hpp (BR-08)
     include_directories('../agents/plugins/certificates/src'),  # certificates_macos_parsers.hpp (Gate-7 FIX A: pure helpers shared with the plugin)
-    include_directories('../agents/plugins/quarantine/src'),    # quarantine_parsers.hpp (Wave 2 WP-F)
     include_directories('../agents/plugins/users/src'),         # users_macos_last.hpp (qe-M1 pure parser)
     include_directories('../agents/plugins/content_dist/src'),  # content_dist_upload_parsers.hpp (PR1.6b pure helpers)
     include_directories('../agents/plugins/script_exec/src'),   # script_exec_parsers.hpp (Wave 5 PR5.1 pure helpers)
@@ -783,7 +792,7 @@ agent_test_exe = executable(
   # libxml2_dep: test_autoruns_parsers.cpp #includes autoruns_parsers.hpp,
   # which parses Task Scheduler XML via real libxml2 unconditionally on
   # every platform -- this test TU needs it on its include/link path too.
-  dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, agent_test_proto_dep, nlohmann_dep, catch2_nomain_dep, agent_test_openssl_dep, spdlog_dep, sqlite3_dep, libxml2_dep] + agent_test_native_deps,
+  dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, agent_test_proto_dep, nlohmann_dep, catch2_nomain_dep, agent_test_openssl_dep, spdlog_dep, sqlite3_dep, libxml2_dep, component_inventory_zlib_dep] + agent_test_native_deps,
   # Ensure the fixture plugins are built before the test runs so the lookups
   # inside test_plugin_loader.cpp / test_capability_descriptor.cpp find them
   # under MESON_BUILD_ROOT/tests/.
@@ -835,6 +844,7 @@ agent_test_exe = executable(
   # scripts/ci/check-plugin-spawn-lexical.sh's GRANDFATHERED set.
   link_depends: [
                 abi3_fixture_plugin,
+                abi4_declared_fixture_plugin,
                 agent_actions_plugin_lib,  # #4666 PR-2 W3a: MI-3 loads the real agent_actions plugin by path
                 certificates_plugin_lib,
                 content_dist_plugin_lib,
@@ -889,6 +899,7 @@ agent_test_exe = executable(
                 runtimes_plugin_lib,  # Wave 10 PR10.1-b
                 pkg_inventory_plugin_lib,  # Wave 10 PR10.1-c
                 middleware_plugin_lib,  # SAM.2: test_middleware_local_dispatcher.cpp loads the real plugin by path
+                component_inventory_plugin_lib,  # SAM-16: test_component_inventory_local_dispatcher.cpp loads the real plugin by path
                 ],
 )
 # ONE agent test is [tsan-heavy] as of #4153 (down from three): the #3848 concurrency soak
@@ -1157,7 +1168,10 @@ agent_shard_specs = {
   'B': ','.join(_agent_b_terms),
   'C': _agent_a_excl + _agent_b_excl + agent_shard_suffix,
 }
-agent_shard_deps = [reserved_name_fixture_plugin, invalid_name_fixture_plugin, retired_name_fixture_plugin, abi3_fixture_plugin]
+# firewall_plugin_lib (agents/plugins/firewall/meson.build): the [firewall_quarantine]
+# action-boundary cases load the real plugin by path and FAIL when it is missing under
+# `meson test`, so the shards must build it first.
+agent_shard_deps = [reserved_name_fixture_plugin, invalid_name_fixture_plugin, retired_name_fixture_plugin, abi3_fixture_plugin, abi4_declared_fixture_plugin, firewall_plugin_lib]
 # Per-shard meson timeouts. Only shard C is raised (#7135); A and B keep the old single
 # entry's 240s, because only C was measured to need more.
 #
@@ -1504,6 +1518,7 @@ if build_server
       'unit/server/test_auth_break_glass.cpp',
       'unit/server/test_auth_db_pg.cpp',
       'unit/server/test_auth_password.cpp',   # #5342/#5274: AuthManager password change/reset + DB-first credential read
+      'unit/server/test_mfa_disable_owner.cpp', # #6079 PR 2c: MfaDisableOwner one-transaction factor clear + session end + outcome audit row
       'unit/server/test_auto_approve.cpp',
       'unit/server/test_cidr_match.cpp',
       'unit/server/test_runtime_config_secret_redaction.cpp',
@@ -1655,6 +1670,13 @@ if build_server
       'unit/server/test_list_read_confinement.cpp',
       'unit/server/test_response_execution_scope_authz.cpp', # #1634: response/execution fleet-read confinement
       'unit/server/test_legacy_executions_scope_authz.cpp', # #3789: legacy /api/executions* fleet-read confinement
+      'unit/server/test_execution_owner_key.cpp', # #5557: ExecutionOwnerKey / execution_owner_key() derivation per session class (pure)
+      'unit/server/test_execution_owner_rig_smoke.cpp', # #5557: smoke test of the shared real-gate execution-visibility rig
+      'unit/server/test_execution_owner_legacy.cpp', # #5557: legacy /api/executions* exact-set cases under service-scoped credentials
+      'unit/server/test_execution_owner_rest_v1.cpp', # #5557: REST v1 execution reads and /api/v1/events exact-set cases under service-scoped credentials
+      'unit/server/test_execution_owner_dashboard.cpp', # #5557: dashboard execution fragments and /sse/executions exact-set cases under service-scoped credentials
+      'unit/server/test_service_scope_refusal.cpp', # #5557: service-scoped refusal counter seed + plugin-config list-read consumer (corrupted engine row)
+      'unit/server/test_execution_mutation_owner_key.cpp', # #5557: cancel/rerun admission keys on ExecutionOwnerKey; username stays the audit principal
       'unit/server/test_workflow_executions_list_authz.cpp', # #3526: /fragments/executions real fleet-read confinement
       'unit/server/test_workflow_executions_real_gate_authz.cpp', # GET /api/v1/workflow-executions real fleet-read confinement
       'unit/server/test_oidc_principal_key.cpp',
@@ -1664,6 +1686,8 @@ if build_server
       'unit/server/test_oidc_egress_policy.cpp', # #5692: pure address-class policy for OIDC fetches
       'unit/server/test_oidc_egress.cpp', # #5692: the policy applied to real fetches (pin, refusal, cross-host)
       'unit/server/test_bounded_resolver.cpp', # bounded resolver + resolver error classifier
+      'unit/server/test_resolver_host_admission.cpp', # #7153: the lookup admission in front of the OIDC name lookup: refusal memory (keys, TTL, caps, which outcomes arm a name), per-name limit, lease lifetime, and the doc-figure pin
+      'unit/server/test_resolver_pool_metrics.cpp', # #7153 PR-4b: resolver pool metrics: register pre-seeds all five outcomes at 0, publish mirrors deltas, a baseline hides earlier history, a reset never goes negative
       'unit/server/test_oidc_scim_link.cpp',
       'unit/server/test_sha256_steps.cpp',
       'unit/server/test_oidc_routes.cpp',
@@ -1752,6 +1776,8 @@ if build_server
       'unit/server/test_policy_evaluator.cpp',
       'unit/server/test_guaranteed_state_store.cpp',
       'unit/server/test_census_ordering_store.cpp', # #5690 PR2a-1: census ordering key, durable pending evidence, schema v4
+      'unit/server/test_census_pair_order.cpp', # #5690 UP-14 PR B: census order decision on the agent's (boot_epoch, emit_seq) pair
+      'unit/server/test_census_pair_harness.cpp', # #5690 UP-14 PR B (B4): randomised schedule exploration of that decision against the plan model
       'unit/server/test_guardian_ingest.cpp',
       'unit/server/test_baseline_store.cpp',
       'unit/server/test_guardian_push_builder.cpp',
@@ -1763,12 +1789,14 @@ if build_server
       'unit/server/test_device_routes.cpp',
       'unit/server/test_device_lens_routes.cpp', # ADR-0031 WS-A4 wave 2: DEX/Guardian device lenses (no public twin — outside the seam)
       'unit/server/test_hardware_list_model.cpp', # round-3: Hardware CI list/record pure model
+      'unit/server/test_bulk_ci_page_model.cpp', # bulk device-CI keyset page: params, cursor, scope walk, JSON
       'unit/server/test_quarantine_read_model.cpp', # Seam PR2: shared quarantine list JSON builder (key order, escaping)
       'unit/server/test_hardware_ui.cpp',         # round-3: Hardware CI list/record HTML fragment
       'unit/server/test_hardware_routes.cpp',     # round-3: Hardware CI list/record routes + REST twin
       'unit/server/test_mcp_tools_hardware.cpp',  # Seam PR2: list_hardware_ci / get_hardware_ci MCP twins (REST byte identity, fail-closed audit, confinement)
-      'unit/server/test_software_sync_decision.cpp', # Software "Sync now": pure request grammar, partition, fleet-wide rule, 500 cap, cooldown, audit wording
-      'unit/server/test_software_sync_runner.cpp',   # Software sync: the shared Runner (REST + MCP) - cooldown, lease, bounded partition, audit-before-send
+      'unit/server/test_software_sync_decision.cpp', # Software "Sync now": pure request grammar, partition, fleet-administrator and confirm rules, run key, join, cooldown, audit wording
+      'unit/server/test_software_sync_runner.cpp',   # Software sync: the shared Runner (REST + MCP) - run key and join, cooldown, pacing ledger, live-send bound, audit-before-send
+      'unit/server/test_software_sync_pacing.cpp',   # Software sync: the pure pacing/admission rule (budget, spread, busy, too large)
       'unit/server/test_hardware_sync_routes.cpp', # Software "Sync now": POST /api/v1/hardware/sync route matrix (HwHarness pattern)
       'unit/server/test_home_render.cpp',         # Dashboard summary: pure renderers, partitions, states
       'unit/server/test_home_routes.cpp',         # Dashboard summary: gates, scope, degrade, caller matrix
@@ -1800,6 +1828,7 @@ if build_server
       'unit/server/test_dex_app_perf_model.cpp',
       'unit/server/test_dex_app_perf_failures.cpp', # pure per-version crash/hang join + shared versions[] serializer - no store, no PG
       'unit/server/test_dex_apps_stability.cpp', # pure application/version stability assembly + shared apps JSON serializer - no store, no PG
+      'unit/server/test_dex_usage_model.cpp', # pure fleet usage read model: matching, cells, disclosure, exposure rate, builder - no store, no PG
       'unit/server/test_app_perf_compare.cpp',
       'unit/server/test_dex_app_perf_ui.cpp',
       'unit/server/test_dex_app_perf_version_table.cpp', # per-version crash/hang table renderer + fragment route over the FnDexPerfApi double - no store, no PG
@@ -1824,6 +1853,7 @@ if build_server
       'unit/server/test_dex_score_policy_form.cpp',
       'unit/server/test_dex_catalogue.cpp', # ADR-0031 WS-A4 PR-1: the Catalogue View 1 read model + FnDexApi double
       'unit/server/test_dex_perf_api.cpp', # ADR-0031 WS-A4: the sixth per-family in-process API seam (DEX app-perf-over-time)
+      'unit/server/test_dex_app_usage_owner.cpp', # DexAppUsageOwner: the one-statement fleet usage + exposed-events read ([pg][dex_usage])
       'unit/server/test_schedule_api.cpp', # ADR-0031 WS-A4: the seventh per-family in-process API seam (schedule read)
       'unit/server/test_workflow_api.cpp', # ADR-0031 WS-A4: the eighth per-family in-process API seam (workflow read)
       'unit/server/test_list_keyset.cpp', # pure keyset cursor/int primitives (workflow-execution list)
@@ -1834,6 +1864,7 @@ if build_server
       'unit/server/test_spark_fleet_tags.cpp',
       'unit/server/test_guardian_journal_fleet_tags.cpp',
       'unit/server/test_guardian_arm_fleet_tags.cpp', # rung 9c PR-3 — arm-ledger + io-ceiling fleet rollup pin
+      'unit/server/test_guardian_baseline_fleet_tags.cpp', # #5605: baseline-persistence fleet rollup pin (real agent emitters)
       'unit/server/test_guardian_reconcile_budget.cpp', # #5513: reconcile admission budget (leaky bucket)
       'unit/server/test_guardian_reconcile_gate.cpp', # #5513: reconcile claim map + admit-before-claim ordering
       'unit/server/test_server_guardian_reconcile_options.cpp', # #5513: reconcile budget flags: names, defaults, env, validation
@@ -1883,6 +1914,9 @@ if build_server
       'unit/server/test_secret_column_registration_tripwire.cpp', # #2530 C3 — registered-column trip-wire
       'unit/server/test_key_provider.cpp',
       'unit/server/test_rest_mgmt_group_roles_floor.cpp', # #2376: the mgmt-group role graph needs the floored UserManagement:Read
+      'unit/server/test_rest_mgmt_group_audit_first.cpp', # #7074: REST group create, add member and remove member store their `attempted` audit row first
+      'unit/server/test_rest_mgmt_group_audit_real_auth.cpp', # #7074: the same routes through the production AuthRoutes + AuditStore wiring (no stub in the identity path)
+      'unit/server/test_mgmt_group_agent_known.cpp', # #6967/#7074: add member flags an unknown agent id (pure classification, no PG)
       'unit/server/test_mgmt_group_owner_gate.cpp', # owner-arm predicate: surface, token class, engine, grant rows (pure, no PG)
       'unit/server/test_rest_rbac_role_reads.cpp', # PR-0b: GET /rbac/roles + /rbac/roles/{role}/permissions fail closed (503) and 404 an unknown role
       'unit/server/test_rest_management_group_detail_degrade.cpp', # #1762 governance round-1: GET /management-groups/{id} fails closed on a degraded member read
@@ -1903,7 +1937,8 @@ if build_server
       'unit/server/test_mcp_tools_containment.cpp', # Seam PR2: list_quarantined_devices registry tool (gate, scope, degrade, audit, byte identity with the REST body)
       'unit/server/test_mcp_tools_crypto.cpp',     # #6558 PR2: the seven /crypto MCP tools (gate, confinement, audit-first layout write, retry hints, unwired providers)
       'unit/server/test_mcp_tools_dex.cpp',        # #6087: get/set/reset_dex_score_policy registry tools (gates, tiers, approval, If-Match/dry_run, audit-first, audit_persisted, retry hints, unwired providers)
-      'unit/server/test_delivery_pool_metrics_wiring_lexical.cpp', # #7153: LEXICAL pin (not behaviour) that server.cpp registers the delivery pool metrics once and publishes each store under its own label from its own accessors, scanned from server.cpp at test run time
+      'unit/server/test_revocation_source_degrade_wiring_lexical.cpp', # #7153: LEXICAL check (not behaviour) that server.cpp pre-seeds the CRL source degrade reasons (dns_busy included) and increments the counter under the reason it is handed, and that the service spells dns_busy for both lookup refusals, scanned from the sources at test run time
+      'unit/server/test_delivery_pool_metrics_wiring_lexical.cpp', # #7153: LEXICAL pin (not behaviour) that server.cpp registers the delivery pool metrics once and publishes each store under its own label from its own accessors, and that the OIDC resolver pool publisher is registered once and published once on the same tick and `bounded_resolve` counts through `note_outcome` once, scanned from server.cpp and bounded_resolver.hpp at test run time
       'unit/server/test_hw_ci_detail_wiring_lexical.cpp', # #7163: LEXICAL pin (not behaviour) that the hw_ci_detail_fn closure in server.cpp is the one handed to the REST routes and the MCP tools, and that CiRead::WithSections selects get_device_ci_with_sections, scanned from server.cpp at test run time
       'unit/server/test_store_wiring_order.cpp', # #3261: every agent_service_/gateway_service_ store setter runs after its member's construction, mechanically scanned from server.cpp at test run time
       'unit/server/test_presence_departure.cpp', # #5678: the one departure->presence mirror both disconnect paths share (pure helper cases)
@@ -2047,11 +2082,15 @@ if build_server
       'unit/server/test_agent_registry_log_neutralisation.cpp',   # #5513: register_agent log lines neutralised
       'unit/server/test_secret_codec.cpp',
       'unit/server/test_software_inventory_store.cpp',
+      'unit/server/test_software_inventory_reads_v3.cpp', # SAM-33 reads: hosts, change feed, facet health, summary ([pg][software_inventory][reads_v3], shard E)
       'unit/server/test_inventory_blob_v3.cpp',          # pure blob-v3 grammar + install-type table
       'unit/server/test_purl_compose.cpp',               # pure purl composer (purl-spec vectors)
       'unit/server/test_software_catalog_rules.cpp',
       'unit/server/test_software_catalogue_model.cpp',   # pure shared REST+MCP catalogue model
       'unit/server/test_software_list_model.cpp',        # pure SAM-17 lookup list model (totals, status, range)
+      'unit/server/test_software_hosts_model.cpp',       # SAM-33 pure hosts model
+      'unit/server/test_software_changes_model.cpp',     # SAM-33 pure change-feed model
+      'unit/server/test_software_plugin_health_model.cpp', # SAM-33 pure plugin-health model + gauges
       'unit/server/test_vers_range.cpp',                 # pure vers: parser + interval core (SAM-43)
       'unit/server/test_crypto_cbom.cpp',                # /crypto CBOM export: CycloneDX 1.7 shaper + goldens
       'unit/server/test_crypto_library_model.cpp',       # /crypto slice 1: curated table + shared model
@@ -2075,6 +2114,13 @@ if build_server
       'unit/server/test_software_collection_settings_store.cpp',
       # collection-settings REST routes: null-dep shapes (no PG) + [pg][routes] real AuthRoutes gate over ManagementGroupStorePg/RbacStorePg
       'unit/server/test_software_collection_settings_routes.cpp',
+      # heartbeat-driven settings push: decide_push table, snapshot and memo rules, golden vectors (fake reads, clock and send)
+      'unit/server/test_collection_settings_push.cpp',
+      # SAM-33 read routes (hosts, host detail, change feed, summary, plugin health) over injected store reads: no store, no [pg]
+      'unit/server/test_software_read_routes.cpp',
+      # SAM-36 streamed export: pure parse/chunk/clamp core, then the route over fake page readers (no store, no [pg], no sleeps)
+      'unit/server/test_software_export_stream.cpp',
+      'unit/server/test_software_export_routes.cpp',
       'unit/server/test_software_title_dimension.cpp',
       'unit/server/test_software_licensing_store.cpp',
       'unit/server/test_software_licensing_ingestion.cpp',
@@ -2126,8 +2172,13 @@ if build_server
       # its include_directories('include') and '../../common/include'); no link to
       # yuzu_agent_core.
       #
-      # CONSTRAINT (governance Gate-3 architect). This puts 47 PRIVATE agent headers on
-      # the include path of every server test TU. It is safe TODAY only because there is
+      # #5605: test_guardian_baseline_fleet_tags.cpp is the second such TU: it includes
+      # guardian_baseline_heartbeat.hpp (the agent's real baseline emitters) to bind them to the
+      # server's guardian_baseline_fleet_tags.hpp table.
+      #
+      # CONSTRAINT (governance Gate-3 architect). This puts every PRIVATE agent header
+      # (78 `agents/core/src/*.hpp` files when #5605 was written, not the 47 this comment once
+      # gave) on the include path of every server test TU. It is safe TODAY only because there is
       # zero CASE-INSENSITIVE basename collision (APFS/NTFS resolve case-insensitively,
       # so a Linux-only case-sensitive check under-detects) between agents/core/src/*.hpp
       # and server/core/src/*.hpp,
@@ -3509,6 +3560,13 @@ test('server feature option lint',
   timeout: 300,
 )
 
+test('local test runner platform selftest',
+  _python3_test,
+  args: [files('test_run_tests_platform.py')],
+  suite: 'platform',
+  timeout: 30,
+)
+
 # Windows agent installer trust-anchor lockdown (#5196): the .iss is compiled
 # only by release.yml, so this lints its source text -- no /T on the icacls
 # grant, a Constrained-Language-safe exact SDDL check, the user manual's copy of
@@ -3805,6 +3863,16 @@ test('runtimes definition columns',
   timeout: 30,
 )
 
+# component_inventory's definition-column contract (content/definitions/component_inventory.yaml):
+# row_kind first and the column order match the comp wire row component_scan.hpp emits; parses the
+# YAML directly.
+test('component_inventory definition columns',
+  _python3_test,
+  args: [files('test_component_inventory_definition.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # middleware's definition-column contract (content/definitions/middleware.yaml): row_kind first and the
 # column order match the wire row middleware_parsers.hpp emits; parses the YAML directly.
 test('middleware definition columns',
@@ -3996,14 +4064,22 @@ test('prometheus harness selftest',
   timeout: 60,
 )
 
-# #4800: pins scripts/test_gateway.py's zero-executed guard, the ct --dir that
-# points at apps/yuzu_gw/test/ct, and each gateway suite's wrapper deadline
-# sitting below its meson timeout. Hermetic (parses sources, runs no
-# rebar3), so it needs no Erlang; suite docs, i.e. the Linux leg only.
+# Executes the workflow extractor against selected, missing and ambiguous steps;
+# a uses-only step must never borrow a later step's shell body.
+test('workflow step extractor selftest',
+  _python3_test,
+  args: [files('test_extract_run_block.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# #4800: pins scripts/test_gateway.py's summary/deadline guards and CT directory.
+# Platform placement: native Windows process-tree termination and stdout encoding
+# differ from POSIX. Hermetic children exercise both without needing Erlang.
 test('gateway wrapper guard selftest',
   _python3_test,
   args: [files('test_gateway_test_summary.py')],
-  suite: 'docs',
+  suite: 'platform',
   timeout: 30,
 )
 
@@ -4138,6 +4214,14 @@ if _bash_test.found()
   # macOS/Linux rig (Windows uses scripts/win-start-UAT.sh) and the README
   # touch rule runs on hosted Ubuntu (docs-lint.yml).
   if host_machine.system() != 'windows'
+    # Exercise the actual measure-only gate with private DB/logs and fake CT.
+    # A failed or empty requested scale run must not borrow ordinary perf metrics.
+    test('performance gate verdict selftest',
+      _bash_test,
+      args: [files('shell/test_pr2_gates.sh'), 'CH-6', 'CH-25'],
+      suite: 'docs',
+      timeout: 60,
+    )
     # docs/plugin-readme-standard.md rule 7 — the README touch rule's own
     # fixture run (a fake `git` on PATH; no repository, no network).
     test('plugin readme touch-rule selftest',
@@ -4262,6 +4346,18 @@ test('Echo mapdrive hive-mount pin wiring lexical gate (#5291)',
   timeout: 30,
 )
 
+# firewall containment regression (privilege model step 6): the guards of
+# scripts/test/instructions_firewall_containment.py -- the refusals (SSH, console flag, limit,
+# agent, host binding, login), the status/answer parsing and the whole apply/release flow against a
+# recording fake. No network and no firewall change; the live apply/release needs a UAT stack on a
+# local host.
+test('Firewall containment regression guards (privilege model step 6)',
+  _python3_test,
+  args: [files('test_firewall_containment_ceremony.py')],
+  suite: 'agent',
+  timeout: 30,
+)
+
 # virtualization `wsl`: static lexical gate over the Windows shell's wiring -- the one
 # with_user_hive call (default-on hive-file guard, no check argument), no HKEY_USERS enumeration,
 # REG_OPTION_OPEN_LINK on every registry open, and the SID-bearing mount name only in the agent
@@ -4282,6 +4378,55 @@ test('virtualization wsl Windows shell wiring lexical gate',
 test('agent OTA/ctx-slot wiring lexical gate (#2182)',
   _python3_test,
   args: [files('test_agent_ota_wiring_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
+
+# Static lexical gate pinning that agent.cpp's yuzu_register_trigger still returns -5 when the
+# trigger engine reports a full table (no unit test can call the bridge: PluginContextImpl is
+# TU-local, no seam) and that TriggerEngine::register_trigger keeps its bool return. Carries its
+# own in-memory mutation self-test. No build required; one process, well under a second.
+test('agent trigger-register bridge wiring lexical gate',
+  _python3_test,
+  args: [files('test_agent_trigger_register_wiring_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
+
+# UP-8 (firewall containment): static lexical gate pinning how agent.cpp publishes the live control
+# peer to plugins as "agent.server_peer" (PluginContextImpl and AgentImpl are TU-local, no seam): the
+# atomic member, the get_config branch that reads it (never the unsynchronised config map), the
+# conversion of ClientContext::peer() through grpc_peer_literal before any per-plugin store, and the
+# Register-success call. Carries its own in-memory mutation self-test. No build required; one process,
+# well under a second.
+test('agent server-peer publish wiring lexical gate (UP-8)',
+  _python3_test,
+  args: [files('test_agent_server_peer_wiring_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
+
+# Firewall containment (packaged-Linux privilege refusal): static lexical gate pinning that each of
+# do_quarantine / do_release / do_quarantine_allow / do_repair evaluates privilege_refusal() and
+# returns its refusal BEFORE constructing Containment, and that privilege_refusal()'s Linux branch
+# still calls fq::linux_privilege_refusal with the euid and PR_GET_NO_NEW_PRIVS reads. The helper is
+# `#if defined(__linux__)`, so no macOS or Windows build observes a dropped or reordered call. Carries
+# its own in-memory mutation self-test. No build required; one process, well under a second.
+test('firewall privilege-refusal call-site wiring lexical gate',
+  _python3_test,
+  args: [files('test_firewall_privilege_refusal_wiring_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
+
+# Firewall containment (Windows release guard): static lexical gate pinning that WinLeg::remove()
+# returns release_incomplete when a profile's default action did not restore BEFORE it deletes the
+# allowance rules (a host left block/block with no allowance otherwise). The guard sits in the
+# `_WIN32` COM leg, so no macOS or Linux build observes it deleted or moved below the removal loop.
+# Carries its own in-memory mutation self-test. No build required; well under a second.
+test('firewall Windows release-guard wiring lexical gate',
+  _python3_test,
+  args: [files('test_firewall_release_guard_wiring_lexical.py')],
   suite: 'agent',
   timeout: 30,
 )
@@ -4380,6 +4525,21 @@ test('agent command-dedup fleet telemetry drift gate (#3663)',
   _python3_test,
   args: [files('test_dedup_fleet_tags_lexical.py')],
   suite: 'agent',
+  timeout: 30,
+)
+
+# Guardian baseline-persistence fleet signal (#5605): the agent's `yuzu.guardian_baseline_*`
+# heartbeat tags, the server's kGuardianBaselineMetrics table, the describe loop in server.cpp, the
+# agent.cpp Group D2 call sites, the YuzuGuardianBaselineUnpersisted alert (its expr must name row
+# 0's gauge; no alert may read the monitor-only rows), its promtool cases and the metrics.md table
+# rows. The C++ pin test (test_guardian_baseline_fleet_tags.cpp) binds the emitters to the table but
+# stays green under a coordinated agent+table rename; this gate catches that, the alert and the call
+# site. Carries its own in-memory mutation self-test. No build required. Suite 'docs', like the
+# other server-source lexical gates (see the guardian_backend gate below).
+test('guardian baseline fleet signal drift gate (#5605)',
+  _python3_test,
+  args: [files('test_guardian_baseline_fleet_tags_lexical.py')],
+  suite: 'docs',
   timeout: 30,
 )
 
@@ -4822,6 +4982,16 @@ test('issue lifecycle docs',
   timeout: 10,
 )
 
+# The old standalone containment agent plugin is removed and nothing names it again (device
+# containment is the firewall plugin's four actions): no tracked file outside the history
+# allowlist names its files, actions, rule or chain prefixes or definition ids.
+test('removed containment plugin lexical gate',
+  _python3_test,
+  args: [files('test_legacy_quarantine_plugin_removed_lexical.py')],
+  suite: 'docs',
+  timeout: 120,
+)
+
 # The Windows package-sources upgrade note states the fresh-deployment contract (routed
 # Forensics clause 8): its opening sentence is present and the in-place-upgrade phrasing is absent.
 test('upgrade notes contract',
@@ -4945,11 +5115,38 @@ test('software lookup wiring lexical',
   suite: 'docs',
   timeout: 30,
 )
+# SAM-33: the software v3 read routes must register ahead of the generic inventory route, and the
+# fleet snapshot holder must be attached to the rollup before it starts and read by the routes;
+# either gap leaves every test green and the routes or the alert gauges silently wrong.
+test('software read wiring lexical',
+  _python3_test,
+  args: [files('test_software_read_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
 test('forensics tier wiring lexical selftest',
   _python3_test,
   args: [files('test_forensics_tier_wiring_lexical_selftest.py')],
   suite: 'docs',
   timeout: 30,
+)
+
+# #5557: ownership-based execution admission is keyed on ExecutionOwnerKey and neither list gate
+# hands a service-scoped session unrestricted authority. Best-effort lexical tripwire over the server
+# tree + a selftest that mutates the sources in memory and requires every mutation to fail; both also
+# run in .github/workflows/docs-lint.yml.
+test('execution owner key tripwire',
+  _python3_test,
+  args: [files('test_execution_owner_key_tripwire.py')],
+  suite: 'docs',
+  timeout: 60,
+)
+test('execution owner key tripwire selftest',
+  _python3_test,
+  args: [files('test_execution_owner_key_tripwire_selftest.py')],
+  suite: 'docs',
+  # One scan of the tree plus about a hundred mutations, each re-scanning only the file it changed.
+  timeout: 300,
 )
 
 # yuzu_fleet_plugin_init_failed label catalogue: the one production set_known_plugins(...) line must
@@ -4983,6 +5180,14 @@ test('workflow execute docs lexical',
 test('dashboard audit checked lexical',
   _python3_test,
   args: [files('test_dashboard_audit_checked_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+# #7075/#3864: the Echo process baseline codec and the capture-sources push's session-bound
+# audit writer, both in files no Mac unit binary builds; the script self-checks its detector.
+test('Echo security wiring lexical gate',
+  _python3_test,
+  args: [files('test_echo_security_wiring_lexical.py')],
   suite: 'docs',
   timeout: 30,
 )
@@ -5077,7 +5282,7 @@ test('dex score-policy single-writer tripwire (#6086)',
   timeout: 30,
 )
 
-# Runner-local CI telemetry contract: v2->v3 migration preserves history,
+# Runner-local CI telemetry contract: schema upgrades preserve history,
 # GitHub reruns remain distinct, and Meson suite durations/timeouts plus known
 # flake recoveries land in the persistent per-runner test-runs.db.
 test('ci telemetry selftest',
@@ -5114,3 +5319,36 @@ test('tsan-gdb-capture selftest',
   suite: 'docs',
   timeout: 30,
 )
+
+# Migration pilots are opt-in: these are required executions, so missing live PG
+# or compiled fixtures must fail rather than turn a default developer run green.
+# The collector selftest exercises native process cleanup on every platform.
+test('contract evidence selftest', _python3_test,
+  args: [files('test_contract_evidence.py')], suite: 'platform', timeout: 30)
+test('gateway contract wrapper selftest', _python3_test,
+  args: [files('test_gateway_contract.py')], suite: 'docs', timeout: 30)
+test('contract registry', _python3_test,
+  args: [files('../scripts/test/contract-evidence.py'), 'check'], suite: 'docs', timeout: 30)
+test('contract evidence CI step', _python3_test,
+  args: [files('test_contract_evidence_ci_step.py')], suite: 'docs', timeout: 30)
+if get_option('build_contract_tests')
+  _contract_adapter = files('../scripts/test/contract-evidence.py')
+  test('contract.plugin.loader.reserved-name.reject', _python3_test,
+    args: [_contract_adapter, 'case', '--id', 'plugin.loader.reserved-name.reject', '--binary', agent_test_exe],
+    depends: [agent_test_exe, reserved_name_fixture_plugin, abi3_fixture_plugin],
+    suite: 'contracts', timeout: 120,
+    env: {'MESON_BUILD_ROOT': meson.project_build_root()})
+  test('contract.plugin.loader.duplicate-name.isolate', _python3_test,
+    args: [_contract_adapter, 'case', '--id', 'plugin.loader.duplicate-name.isolate', '--binary', agent_test_exe],
+    depends: [agent_test_exe, abi3_fixture_plugin, abi4_declared_fixture_plugin],
+    suite: 'contracts', timeout: 120,
+    env: {'MESON_BUILD_ROOT': meson.project_build_root()})
+  if build_server
+    test('contract.pg.baseline.members-atomic-replace', _python3_test,
+      args: [_contract_adapter, 'case', '--id', 'pg.baseline.members-atomic-replace', '--binary', server_test_exe],
+      depends: [server_test_exe], suite: 'contracts', timeout: 120)
+    test('contract.pg.retention.cutoff-boundary', _python3_test,
+      args: [_contract_adapter, 'case', '--id', 'pg.retention.cutoff-boundary', '--binary', server_test_exe],
+      depends: [server_test_exe], suite: 'contracts', timeout: 120)
+  endif
+endif

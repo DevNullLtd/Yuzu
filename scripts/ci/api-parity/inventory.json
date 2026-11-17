@@ -1,6 +1,14 @@
 [
   {
     "method": "GET",
+    "path": "/api/v1/inventory/software/export",
+    "capability_id": "get.api-v1-inventory-software-export",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "exception:#7955 revisit:2027-05-31 streamed file export is not a tool call: a chunked JSONL or CSV file download has no JSON-RPC result to carry it, and the installed-software lookup tools already return the same rows page by page"
+  },
+  {
+    "method": "GET",
     "path": "/fragments/inventory/software",
     "capability_id": "get.fragments-inventory-software",
     "rest_v1_twin": {
@@ -14,6 +22,17 @@
     "method": "GET",
     "path": "/fragments/inventory/software/devices",
     "capability_id": "get.fragments-inventory-software-devices",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/inventory/software"
+    },
+    "mcp_twin": "query_installed_software",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/inventory/software/find",
+    "capability_id": "get.fragments-inventory-software-find",
     "rest_v1_twin": {
       "method": "GET",
       "path": "/api/v1/inventory/software"

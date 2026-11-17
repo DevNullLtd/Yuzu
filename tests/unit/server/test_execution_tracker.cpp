@@ -1550,7 +1550,7 @@ TEST_CASE("ExecutionTracker: a store bound to an unreachable pool degrades every
     // collapse to the plain methods' empty-on-degrade shape — a caller that
     // drops rows or writes `denied` audit rows off these results must be
     // able to tell "degraded" from "genuinely nothing here".
-    CHECK_FALSE(closed.query_executions_checked(ExecutionQuery{}).has_value());
+    CHECK_FALSE(closed.query_executions_checked(ExecutionQuery{}, std::nullopt).has_value());
     auto exec_checked = closed.get_execution_checked("exec-1");
     REQUIRE_FALSE(exec_checked.has_value());
     CHECK(exec_checked.error() == "execution tracker not open");
@@ -4659,7 +4659,9 @@ struct DegradeReader {
 std::vector<DegradeReader> degrade_readers() {
     return {
         {"query_executions",
-         [](ExecutionTracker& t) { (void)t.query_executions_checked(ExecutionQuery{}); }},
+         [](ExecutionTracker& t) {
+             (void)t.query_executions_checked(ExecutionQuery{}, std::nullopt);
+         }},
         {"get_execution", [](ExecutionTracker& t) { (void)t.get_execution_checked("exec-1"); }},
         {"get_agent_statuses",
          [](ExecutionTracker& t) { (void)t.get_agent_statuses_checked("exec-1"); }},
@@ -4902,7 +4904,7 @@ TEST_CASE("ExecutionTracker: healthy reads, including empty and not-found ones, 
         MetricsWire wire(tracker, m);
 
         // Populated.
-        CHECK(tracker.query_executions_checked(ExecutionQuery{}).has_value());
+        CHECK(tracker.query_executions_checked(ExecutionQuery{}, std::nullopt).has_value());
         auto found = tracker.get_execution_checked(*parent);
         REQUIRE(found.has_value());
         CHECK(found->has_value());
@@ -4917,7 +4919,7 @@ TEST_CASE("ExecutionTracker: healthy reads, including empty and not-found ones, 
         CHECK_FALSE(missing->has_value());
         ExecutionQuery matches_nothing;
         matches_nothing.definition_id = "no-such-definition";
-        auto none = tracker.query_executions_checked(matches_nothing);
+        auto none = tracker.query_executions_checked(matches_nothing, std::nullopt);
         REQUIRE(none.has_value());
         CHECK(none->empty());
         auto no_statuses = tracker.get_agent_statuses_checked("no-such-execution");

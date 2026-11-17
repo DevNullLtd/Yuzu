@@ -114,11 +114,11 @@ inline constexpr std::array<CommandCapability, 4> kFixture{{
         .system_reserved = false,
         .execute_gate = ExecuteGate::AdminOrApproval,
     },
-    // A protective pair (the quarantine plugin's read-only status), so the plugin-presence
+    // A protective pair (the firewall plugin's read-only quarantine_status), so the plugin-presence
     // carve-out can be driven through the route.
     {
-        .plugin = "quarantine",
-        .action = "status",
+        .plugin = "firewall",
+        .action = "quarantine_status",
         .dispatch_class = DispatchClass::ReadOnly,
         .mutability = Mutability::None,
         .securable = "Security",
@@ -753,11 +753,11 @@ TEST_CASE("/api/command: a protective action reaches an agent whose inventory la
           "[command_routes][protective]") {
     CommandHarness h;
     auto info = make_agent_info("inv-A");
-    info.add_plugins()->set_name("firewall"); // non-empty inventory without quarantine/noop
+    info.add_plugins()->set_name("ioc"); // non-empty inventory without firewall/noop
     (void)h.registry.register_agent(info);
 
     auto protective = h.sink.Post(
-        "/api/command", R"({"plugin":"quarantine","action":"status","agent_ids":["inv-A"]})");
+        "/api/command", R"({"plugin":"firewall","action":"quarantine_status","agent_ids":["inv-A"]})");
     REQUIRE(protective);
     CHECK(protective->status == 200);
     CHECK(h.send_to_ids_called == std::vector<std::string>{"inv-A"});
@@ -765,6 +765,37 @@ TEST_CASE("/api/command: a protective action reaches an agent whose inventory la
     h.send_to_ids_called.clear();
     auto ordinary =
         h.sink.Post("/api/command", R"({"plugin":"noop","action":"run","agent_ids":["inv-A"]})");
+    REQUIRE(ordinary);
+    CHECK(ordinary->status == 503);
+    CHECK(nlohmann::json::parse(ordinary->body)["error"]["reason"] == "plugin_not_found");
+    CHECK(h.send_to_ids_called.empty());
+}
+
+// The firewall plugin's four containment actions are protective too (owner decision 2026-11-12):
+// reached with the plugin missing from the inventory and through a per-OS kill switch, while the
+// plugin's ordinary actions are not. Exhaustive over the closed set.
+TEST_CASE("/api/command: every firewall containment action is protective; an ordinary firewall "
+          "action is withheld",
+          "[command_routes][protective]") {
+    for (const char* action : {"quarantine", "release", "quarantine_status", "quarantine_allow"}) {
+        INFO(action);
+        CommandHarness h;
+        auto info = make_agent_info("inv-A");
+        info.add_plugins()->set_name("noop"); // non-empty inventory without the firewall plugin
+        (void)h.registry.register_agent(info);
+        auto res = h.sink.Post("/api/command",
+                               std::string(R"({"plugin":"firewall","action":")") + action +
+                                   R"(","agent_ids":["inv-A"]})");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(h.send_to_ids_called == std::vector<std::string>{"inv-A"});
+    }
+    CommandHarness h;
+    auto info = make_agent_info("inv-A");
+    info.add_plugins()->set_name("noop");
+    (void)h.registry.register_agent(info);
+    auto ordinary = h.sink.Post("/api/command",
+                                R"({"plugin":"firewall","action":"state","agent_ids":["inv-A"]})");
     REQUIRE(ordinary);
     CHECK(ordinary->status == 503);
     CHECK(nlohmann::json::parse(ordinary->body)["error"]["reason"] == "plugin_not_found");

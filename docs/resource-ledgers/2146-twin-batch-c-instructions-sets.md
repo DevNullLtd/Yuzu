@@ -2,22 +2,15 @@
 
 New or modified owned resources in `server/core/src/` (`instruction_store.cpp`,
 `instruction_authoring_routes.cpp`, `mcp_instruction_authoring.cpp`, `mcp_server.cpp`,
-`instruction_referrers.{hpp,cpp}`, `product_pack_store.cpp`, `policy_store.cpp`,
-`workflow_engine.cpp`, `server.cpp`) and their unit tests, across commits `9d425b09f2` to
-`09dcec48a2`. Fix rounds 6 to 11 added the version-bound delete, the pack advisory and the pre-mint
-reads; the legacy-route and pack-uninstall referrer guards they also added are NOT in this split PR
-(see the scope note below). No file descriptor, `FILE*`, socket, `HANDLE`, subprocess, mapped
-library, temp path, OpenSSL object, BCrypt handle, C string, thread or callback-owned raw pointer is
-added to production code. The owned things are one persisted column, three transaction shapes, a set of
+`instruction_referrers.{hpp,cpp}`, `instruction_routes.cpp`, `workflow_routes.cpp`,
+`product_pack_store.cpp`, `policy_store.cpp`, `workflow_engine.cpp`, `server.cpp`) and their unit
+tests, across commits `9d425b09f2` to `09dcec48a2` (fix rounds 6 to 11 added the legacy-route and
+pack-uninstall referrer guards, the version-bound delete, the pack advisory and the pre-mint
+reads). No file descriptor, `FILE*`, socket, `HANDLE`, subprocess, mapped library, temp path,
+OpenSSL object, BCrypt handle, C string, thread or callback-owned raw pointer is added to
+production code. The owned things are one persisted column, three transaction shapes, a set of
 short read-only pooled leases (each taken and released inside one store method), one shared
 throttle, and some value containers. The test-side resources are listed last.
-
-**Scope note (split PR 1).** This ledger covers the tree of the first PR of the split. The legacy
-`DELETE /api/instructions/{id}` (`instruction_routes.cpp`) and the product-pack uninstall
-(`workflow_routes.cpp`) are unchanged here and do not check referrers. Their guards, the pack
-uninstall pre-check reads, the legacy import creator stamp (`stamp_import_creator`) and the other
-legacy-route changes in `instruction_routes.cpp` and `workflow_routes.cpp`, with their resources,
-are carried by the second PR.
 
 ## Resources
 
@@ -63,13 +56,13 @@ are carried by the second PR.
 - **Site:** `make_definition_referrers_fn` in `instruction_referrers.cpp`, called once from
   `server.cpp` (`DefinitionReferrersFn definition_referrers_fn = make_definition_referrers_fn(
   schedule_engine_.get(), workflow_engine_.get(), policy_store_.get())`, hoisted in round 7 to
-  before `register_instruction_routes`) and copied into TWO consumers in this tree:
-  `authoring_deps.referrers_fn` (v1 REST DELETE, `server.cpp:23364`) and
-  `mcp_server_->set_definition_referrers_fn(...)` (MCP delete, `server.cpp:23476`). The legacy
-  `DELETE /api/instructions/{id}` (`instruction::Deps`) and the pack uninstall (`wf_deps`) receive no
-  referrer closure here and still delete without checking; wiring them is the second PR.
+  before `register_instruction_routes`) and copied into FOUR consumers: `instruction::Deps` (legacy
+  DELETE), `authoring_deps.referrers_fn` (v1 REST DELETE), `wf_deps.referrers_fn` (pack uninstall)
+  and `mcp_server_->set_definition_referrers_fn(...)` (MCP delete).
 - **Owner type:** `DefinitionReferrersFn` is a small class wrapping a type-erased
-  `std::function<Result(const std::string&, const Exclusions&)>` (`fn_`); it owns no raw resource.
+  `std::function<Result(const std::string&, const Exclusions&)>` (`fn_`) and, since #7921, an
+  optional second `std::function` (`batch_`, the batch form `lookup_many` calls; see
+  `7921-pack-uninstall-bounded-precheck.md`); it owns no raw resource.
   Its converting constructors take a callable of either arity and leave `fn_` EMPTY for a null
   function pointer or an empty `std::function` (so `explicit operator bool` reports "unwired").
   The factory creates a `std::shared_ptr<RefusalLogThrottle>` (`std::make_shared<
@@ -79,7 +72,7 @@ are carried by the second PR.
   (`ScheduleEngine*`, `WorkflowEngine*`, `PolicyStore*`) are captured by value in the same lambda.
   `DefinitionReferrerExclusions` is two `std::unordered_set<std::string>` passed by const
   reference per call and not retained.
-- **Release point:** the throttle is freed when the last copy of the closure is destroyed (the two
+- **Release point:** the throttle is freed when the last copy of the closure is destroyed (the four
   consumers' copies and the per-call copy `ports.referrers_fn = definition_referrers_fn_` in
   `mcp_server.cpp`). The raw pointers are never deleted by the function.
 - **Transfer:** the closure is copied (shared throttle), never moved out of its owner. The pointers
@@ -96,9 +89,8 @@ are carried by the second PR.
 
 ### `PolicyStore::fragments_referencing_instruction` and `WorkflowEngine::workflows_referencing_instruction`
 - **Site:** `policy_store.cpp` and `workflow_engine.cpp`. Read-only methods; no new resource type.
-  Round 9 added an `exclude_ids` parameter (`const std::unordered_set<std::string>&`). It is
-  exercised by unit tests here, but no production caller in this tree passes a non-empty exclusion
-  set: its consumer is the pack uninstall, which is in the second PR.
+  Round 9 added an `exclude_ids` parameter (`const std::unordered_set<std::string>&`) used by the
+  pack uninstall.
 - **Owner type:** one pooled connection lease each (`pool_.try_acquire_for(kAcquireTimeout)` /
   `kReadTimeout`), one `pg::PgResult` for the SELECT, and a local `std::vector<std::string>` of
   ids returned by value inside `std::expected`. The exclusion set is a parameter, not owned: it is
@@ -112,10 +104,36 @@ are carried by the second PR.
 - **Failure cleanup:** store not open, no connection in time and a failed query each return
   `std::unexpected(...)` (a degraded read); RAII only, no partial state.
 
+### Pack-uninstall pre-check reads (`workflow_routes.cpp`, `DELETE /api/product-packs/{id}`)
+- **Site:** the `DELETE` handler's block that runs before `product_pack_store->uninstall`.
+- **Owner type:** local value containers only: `own_workflows` and `own_fragments`
+  (`std::unordered_set<std::string>`) filled from `ProductPackStore::get`, a
+  `DefinitionReferrerExclusions`, a `std::unordered_map<std::string, std::vector<HeldByPolicy>>`
+  (`policy_held`, folded policy id and name for the 409 text), and `std::vector<DefinitionReferrer>
+  blocking`, plus two transient `std::vector<std::string>` id lists (`own_fragment_ids`,
+  `definition_ids`). The reads are `ProductPackStore::get` (one lease inside the store), then (only when
+  the pack has own fragments) ONE `PolicyStore::policies_using_fragments` for all of them (one
+  lease), then ONE `referrers_fn.lookup_many` for all the contained definitions (at most three
+  leases inside it, one per source, fewer once the list is full; #7921, replacing one
+  `query_policies` per own fragment and one `referrers_fn` call per definition). They run SEQUENTIALLY,
+  each taking and releasing its own lease; no lease is held across the next read and NONE is held
+  across `uninstall()`, which takes its own. The uninstall callback (`make_item_delete_fn`, also the
+  install compensation callback) adds, only after a bare `false` from `PolicyStore::delete_fragment`
+  or `delete_policy`, up to two more sequential leased reads (`get_fragment` then `query_policies`
+  with `limit` 1, or `get_policy`), each taken and released inside its store method; its inner
+  `db_error` lambda captures the `item_id` reference parameter and runs inside that call.
+- **Release point:** scope exit; every refusal returns before `uninstall()` is reached, so a refused
+  pack is untouched.
+- **Transfer:** the exclusion set is moved into `exclusions` and read by reference per call; blockers
+  are moved into `blocking`.
+- **Failure cleanup:** an unwired closure or policy store, or a failing read, is a 503 with the audit
+  row (`referrer_check_unwired` / `referrer_check_unavailable`); never treated as "no referrers". The
+  check is advisory-not-transactional (a referrer created after the reads is not seen), by design.
+
 ### `ProductPackStore::packs_containing_item` and `DefinitionPackAdvisoryFn`
 - **Site:** `product_pack_store.cpp` (`packs_containing_item`), `instruction_referrers.{hpp,cpp}`
   (`DefinitionPackAdvisoryFn`, `make_definition_pack_advisory_fn`, `pack_advisory_note`), read at the
-  v1 DELETE and MCP `delete_definition` call sites (the legacy DELETE reads it in the second PR).
+  legacy DELETE, v1 DELETE and MCP `delete_definition` call sites.
 - **Owner type:** `packs_containing_item` takes ONE pooled lease (`pool_.try_acquire_for(
   kReadTimeout)`, bounded acquire, no nested lease) and runs ONE bounded SELECT on
   `product_pack_store.product_pack_items` (`ORDER BY pack_id LIMIT $3`, limit 20 from
@@ -126,8 +144,8 @@ are carried by the second PR.
   `make_definition_pack_advisory_fn` (60 second window, at most 4 keys, internally mutex-guarded);
   `pack_advisory_note` builds one `std::string`.
 - **Release point:** scope exit (lease, `PgResult`, vector, string are RAII); the throttle is freed
-  when the last copy of the closure is destroyed (the v1 and MCP consumers' copies and the per-call
-  copy `ports.pack_advisory_fn = definition_pack_advisory_fn_` in `mcp_server.cpp`).
+  when the last copy of the closure is destroyed (the legacy, v1 and MCP consumers' copies and the
+  per-call copy `ports.pack_advisory_fn = definition_pack_advisory_fn_` in `mcp_server.cpp`).
 - **Transfer:** the note string is returned by value and appended to the delete's audit detail.
 - **Failure cleanup:** the lookup is read BEFORE the delete (beside the pre-image read) so a failure
   cannot lose the outcome row; `pack_advisory_note` wraps the call in `try/catch(...)` and returns
@@ -175,6 +193,21 @@ are carried by the second PR.
   failure returns `std::nullopt` before anything is persisted. Cost is linear in the number of
   arguments (hash lookups, not scans), pinned by a scaling-ratio test.
 
+### `stamp_import_creator` (legacy import)
+- **Site:** `instruction_routes.cpp`, called by `POST /api/instructions/import` before
+  `store->import_definition_json`.
+- **Owner type:** a local `nlohmann::json` parse of the request body and one `std::string` produced
+  by `dump(-1, ' ', false, error_handler_t::replace)`.
+- **Release point:** scope exit; the dumped string is a temporary bound to the store's `const
+  std::string&` parameter and lives to the end of that call.
+- **Transfer:** never; a body that is not depth-safe or breadth-safe JSON (the value budget), not
+  parseable or not an object is returned unchanged, which is a copy (one more body-sized string is
+  live while the store runs).
+- **Failure cleanup:** parsing uses `allow_exceptions=false` and `json_exceeds_depth` runs first;
+  only a `std::bad_alloc` can throw. The 16 MiB request cap bounds the input, not the parse tree
+  (a body of `[],[],...` built a 258 to 429 MiB tree); the 100000-value budget (`json_exceeds_value_budget`,
+  checked before the parse here, in the store import and in the v1 body parse) bounds the tree.
+
 ### Ownership changes with no resource
 - `Ports::audit` (`mcp_instruction_authoring.hpp`) is a `std::function` that is now left UNSET when
   the server has no audit sink wired, instead of a stub; it is a handler-scoped borrow of `audit_fn`
@@ -206,6 +239,12 @@ are carried by the second PR.
   `std::thread` or wait out a full lock timeout. `workers` is declared after `delete_txn`, so it is
   destroyed first. The worker records its result in a captured local; no Catch macro runs off the
   main thread. The two-writer race test uses the same `Workers` seam with an empty hook.
+- **Raw libpq connection (N4-3):** `test_workflow_routes.cpp` opens one `PQconnectdb` connection outside
+  the pool to insert a corrupt pack item row; it is adopted into `pg::PgConn` on the same statement
+  and closed at scope exit (it is destroyed before the pool and the database fixture).
+- **Fault helpers (N4-1, N4-2b, N4-5):** `yuzu::test::SqlFault` and `WriteFault` arm a trigger or a
+  table rename on a pooled connection and repair it in their destructor (a bounded acquire), after
+  an explicit `repair()` in each test; they are declared after the pool, so they are destroyed first.
 - **Perf test:** the `ticket_subject` scaling test reads `std::chrono::steady_clock` only; no thread
   or file.
 - **Source-tree read:** none added by this change.

@@ -36,7 +36,7 @@ constexpr const char* kInputSchema =
     R"j({"type":"object","properties":{"limit":{"type":"integer","minimum":1,"maximum":500,"default":200,"description":"Maximum records returned, 1..500 (default 200). This bound exists on the MCP tool only; the REST list is unbounded. When more records are visible, `more` is true."}}})j";
 
 constexpr const char* kOutputSchema =
-    R"j({"type":"object","properties":{"quarantined":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"status":{"type":"string"},"quarantined_by":{"type":"string"},"quarantined_at":{"type":"integer"},"whitelist":{"type":"string"},"reason":{"type":"string"},"last_applied_at":{"type":"integer"},"last_confirmed_at":{"type":"integer"}},"required":["agent_id","status","quarantined_by","quarantined_at","whitelist","reason","last_applied_at","last_confirmed_at"]}},"count":{"type":"integer"},"more":{"type":"boolean"},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit row for this read failed to persist"}},"required":["quarantined","count","more"]})j";
+    R"j({"type":"object","properties":{"quarantined":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"status":{"type":"string","description":"active, or releasing while a release the device has not yet confirmed is in progress"},"quarantined_by":{"type":"string"},"quarantined_at":{"type":"integer"},"whitelist":{"type":"string"},"reason":{"type":"string"},"last_applied_at":{"type":"integer"},"last_confirmed_at":{"type":"integer"}},"required":["agent_id","status","quarantined_by","quarantined_at","whitelist","reason","last_applied_at","last_confirmed_at"]}},"count":{"type":"integer"},"more":{"type":"boolean"},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit row for this read failed to persist"}},"required":["quarantined","count","more"]})j";
 
 // Strict-typed limit: absent selects the default; anything but an in-range JSON integer is
 // refused (never stringified or clamped). enum/minimum/maximum in the advertised schema are
@@ -125,12 +125,13 @@ constexpr ToolRecord kToolRecords[] = {
     {"list_quarantined_devices",
      "List the devices under active quarantine that the caller may see, newest first. Use it "
      "to find what is isolated, who isolated it and why, and to check a device before calling "
-     "quarantine_device (which isolates one). Each record carries agent_id, status, "
+     "quarantine_device (which isolates one). Each record carries agent_id, status (active, "
+     "or releasing while a requested release awaits the device's confirmation), "
      "quarantined_by, quarantined_at, whitelist, reason and the endpoint-containment stamps "
      "last_applied_at / last_confirmed_at (0 = never). A record means the server holds a "
      "quarantine for the device. The stamps are written only by the containment "
      "reconciler, so 0 means it has not recorded it, not that the device is unisolated; to "
-     "verify a device, run a `status` read through execute_instruction (plugin quarantine). "
+     "verify a device, run firewall.quarantine_status through execute_instruction. "
      "Results are narrowed to "
      "the caller's management-group and service-scope visibility, so an empty list means no "
      "visible device is quarantined, not that none is quarantined fleet-wide. `limit` is "

@@ -59,7 +59,7 @@
 /// likely to reach a quarantined agent if this gate were route-scoped instead
 /// of chokepoint-scoped, because it is the one path that was never filtered
 /// by anything else. `ContainmentGate::enforced == false` is a pure no-op —
-/// reserved for the quarantine plugin's OWN control channel, so lifting a
+/// reserved for the firewall plugin's containment actions, so lifting a
 /// quarantine can never be blocked by the quarantine it is lifting.
 namespace yuzu::server {
 
@@ -180,7 +180,7 @@ struct ContainmentGate {
 
     /// Containment off for this dispatch — a pure no-op on every arm,
     /// INCLUDING the unfiltered broadcast fast path. Reserved for the
-    /// quarantine plugin's OWN control channel (`is_quarantine_control_plugin`):
+    /// firewall plugin's containment actions (`is_firewall_control_plugin`):
     /// release must never be blocked by the containment it is lifting.
     [[nodiscard]] static ContainmentGate exempt_control_plugin() {
         return ContainmentGate{false, false, {}};
@@ -195,7 +195,7 @@ struct ContainmentGate {
     }
 
     /// False disables containment entirely for this dispatch. Reserved for the
-    /// quarantine plugin's own control channel — see `exempt_control_plugin()`.
+    /// firewall plugin's containment actions — see `exempt_control_plugin()`.
     bool enforced;
     /// True means the containment READ degraded past its bounded-staleness
     /// budget, or the store is durably unavailable — reach NOBODY on every
@@ -394,16 +394,17 @@ struct ConfinedDispatchOutcome {
     /// reads no cause); dashboard_routes.cpp runs no dry run, so all five of
     /// its readers check this field before their cascade: the execute console,
     /// the Echo re-enable and purge arms, the echo-execute (SQL) arm and the
-    /// echo.status scan. The sibling fragments in echo_tree_routes.cpp,
-    /// dex_routes.cpp and device_routes.cpp, and the REST result-set producers,
-    /// still fold a denial into no-agents.
+    /// echo.status scan. echo_tree_routes.cpp's capture-sources push reads it too
+    /// (a `dispatch_denied` failure row, and the batch stops); its read dispatches,
+    /// dex_routes.cpp, device_routes.cpp and the REST result-set producers still
+    /// fold a denial into no-agents.
     std::optional<detail::DispatchDenial> denied;
 };
 
 // The closed quarantine-control predicate lives in the shared pure header so the
 // agent dispatch gate, which follows, consumes the identical set; re-exported
 // here so existing server-side callers and tests compile unchanged.
-using yuzu::protective::is_quarantine_control_plugin;
+using yuzu::protective::is_firewall_control_plugin;
 
 /// The bounded-staleness budget (#881 spec item 6): a `nullopt` read served
 /// from the last-known-good snapshot is trusted only while the snapshot is
@@ -474,10 +475,18 @@ inline constexpr std::array<std::string_view, 4> kQuarantineGateOutcomes{
 ///     quarantine-gated, same as echo_fleet_snapshot. Three operator surfaces use it:
 ///     `POST /api/v1/hardware/{id}/sync` reaches ONE agent (gated on
 ///     Execution:Execute for that device), and `POST /api/v1/hardware/sync` plus the MCP tool
-///     `sync_hardware_software` reach up to 500 on this server process under ONE command id
-///     (gated by the type-level Execution:Execute check, a per-operator cooldown and a single
-///     in-flight run, with WHO IS REACHED decided here by `dispatch_system_reserved_ids`, the
-///     caller's visible-set intersection taken at send time); the 500-target cap is the Runner's.
+///     `sync_hardware_software` reach the devices they name on this server process under ONE
+///     command id (gated by the type-level Execution:Execute check, a confirmation for a whole group
+///     or the fleet, the fleet-administrator rule for the fleet, a per-key cooldown and the
+///     Runner's paced admission, with WHO IS REACHED decided here by
+///     `dispatch_system_reserved_ids`, the caller's visible-set intersection taken at send time);
+///     the pacing, which spreads the agents' reports, is the Runner's.
+///   - `inventory_settings_push` delivers the effective software collection
+///     settings (`__sync__.settings`, SAM-39) to an agent whose heartbeat reports a
+///     different version. System-initiated and heartbeat-driven only: no operator
+///     reaches it. It carries a bounded document (interval, window, zone and six
+///     collector switches) that changes how the agent schedules its own inventory
+///     collection, nothing else. Not quarantine-gated, same as the other pushes.
 ///   - `guardian_push_rules` delivers Guardian baseline rules the agent may
 ///     ENFORCE, and is therefore the one exempt channel that mutates the
 ///     endpoint. It is NOT arbitrary command execution: the assertion
@@ -495,6 +504,7 @@ enum class SystemReservedPush {
     guardian_push_rules,
     asset_tags_sync,
     inventory_sync_now,
+    inventory_settings_push,
 };
 
 /// Label for one enumerator. A switch with no `default:` so a new enumerator
@@ -510,6 +520,8 @@ system_reserved_push_label(SystemReservedPush push) {
         return "asset_tags.sync";
     case SystemReservedPush::inventory_sync_now:
         return "__sync__.now";
+    case SystemReservedPush::inventory_settings_push:
+        return "__sync__.settings";
     }
     return "unknown"; // unreachable while the switch stays exhaustive
 }
@@ -517,9 +529,10 @@ system_reserved_push_label(SystemReservedPush push) {
 /// Every enumerator, so the boot pre-seed cannot fall out of step with the
 /// call sites — same reason `kQuarantineGateOutcomes` exists. An internal push
 /// that has never fired must read as zero, not as an absent series.
-inline constexpr std::array<SystemReservedPush, 4> kSystemReservedPushes{
+inline constexpr std::array<SystemReservedPush, 5> kSystemReservedPushes{
     SystemReservedPush::echo_fleet_snapshot, SystemReservedPush::guardian_push_rules,
-    SystemReservedPush::asset_tags_sync, SystemReservedPush::inventory_sync_now};
+    SystemReservedPush::asset_tags_sync, SystemReservedPush::inventory_sync_now,
+    SystemReservedPush::inventory_settings_push};
 
 /// The two outcomes a system-reserved push can have at the registry seam.
 /// `sent` means `AgentRegistry::send_to` accepted the frame (for a
@@ -632,11 +645,11 @@ struct QuarantineDegradationResult {
     std::string_view plugin, std::string_view action, bool fail_closed_regardless,
     const std::optional<std::unordered_set<std::string>>& fresh_read,
     QuarantineSnapshot& snapshot /*in/out*/, std::chrono::steady_clock::time_point now) {
-    // The quarantine plugin's own control channel is the ONE exemption:
+    // The firewall plugin's four containment actions are the ONE exemption:
     // release must never be blocked by the containment it is lifting. Decided
     // WITHOUT needing a store read, so a store outage cannot strand a
-    // quarantined host by blocking its own unquarantine.
-    if (is_quarantine_control_plugin(plugin, action))
+    // quarantined host by blocking its own release.
+    if (is_firewall_control_plugin(plugin, action))
         return QuarantineDegradationResult{.gate = ContainmentGate::exempt_control_plugin(),
                                            .refreshed_snapshot = std::nullopt,
                                            .outcome = kQuarantineGateOutcomeExempt};
@@ -742,8 +755,10 @@ dispatch_confined_arms(DispatchArm arm, const ConfinedDispatchTargets& targets,
     // #3424/#3511: the plugin-presence sibling of `contained` above, same
     // shape -- checked AFTER containment (a quarantined+absent agent reports
     // quarantined, not absent) and BEFORE the send. No fail-closed mode: the
-    // registry read behind `plugin_missing` is an in-memory snapshot with no
-    // degraded state to fail closed against, unlike the quarantine store.
+    // local part of `plugin_missing` is an in-memory snapshot, and its
+    // cross-replica part (a presence read confirmed against the route
+    // directory) fails OPEN on any degradation -- an agent is then simply not
+    // withheld -- unlike the quarantine store.
     const auto plugin_absent = [&](const std::string& aid) -> bool {
         if (!plugin_missing.contains(aid))
             return false;

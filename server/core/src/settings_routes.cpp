@@ -37,12 +37,17 @@
 #include "rbac_admin_predicate.hpp" // is_self_target — shared #397/#403 self-target comparison
 #include "rbac_store.hpp"       // access-review read-model direct-grant reads
 #include "rbac_text.hpp"        // rbac_text_is_clean: the shared clean-text predicate
+#include "session_store.hpp" // LocalMfaProof: the enrolment's verified {generation, instant} (#6079)
+#include "step_up_gate.hpp" // StepUpVerdict / render_step_up_refusal: the unwired factor-credential gate (#6079)
 #include "tag_store.hpp" // F2a PR3: TagStore::validate_key for the cohort export key
+#include "mfa_disable_owner.hpp" // #6079 PR 2c: MfaDisableRequest/Result (the Settings disable)
 #include "mfa_qr.hpp"
 #include "password_policy.hpp" // #5342 — the ONE local password length policy
 #include "plugin_signing_helpers.hpp"
 #include "rest_a4_envelope.hpp"      // #4028 — detail::error_json_a4 for the settings read-twins
 #include "audited_write.hpp"          // detail::audit_attempted — audit-first settings.mcp
+#include "mgmt_group_error.hpp"       // mgmt_group_error_is_store_fault (management-group create)
+#include "mgmt_group_limits.hpp"      // name / parent id bounds and the clean-text rule
 #include "auth_routes.hpp"           // AuthRoutes::extract_session_cookie (enrol-confirm proof stamp)
 #include "rest_a4_envelope_http.hpp" // #4028 — detail::a4_error/ensure_correlation_id
 #include "rest_audit.hpp"            // #4028 — detail::emit_behavioral_audit (fail-closed REST reads)
@@ -148,8 +153,9 @@ std::string url_encode(const std::string& s) {
     return out;
 }
 
-// A refused MFA step-up on an htmx form: `step_up_fn_` has already written the refusal (a 401/403/503
-// A4 envelope). htmx swaps no 4xx/5xx body, so without a toast the button looks dead. Show the
+// A refused MFA step-up on an htmx form: `step_up_fn_` (or, on the two factor-credential routes,
+// their own gate) has already written the refusal (a 401/403/503 A4 envelope). htmx swaps no
+// 4xx/5xx body, so without a toast the button looks dead. Show the
 // envelope's own `error.message` (never its `remediation`, which names API-caller steps such as a
 // token or a POST route, not something the form can do); fall back to a fixed message if the body is not an envelope.
 // An in-handler refusal (require_mfa_step_up) already toasts on an htmx request via
@@ -169,6 +175,34 @@ void toast_step_up_refusal(httplib::Response& res) {
     }
     const nlohmann::json toast = {{"showToast", {{"message", message}, {"level", "error"}}}};
     res.set_header("HX-Trigger", toast.dump());
+}
+
+// #6079: the two factor-credential routes have no gate wired (a construction fault, never a
+// production shape): answer the step-up gate's own unwired 503 and mutate nothing, so a missing
+// closure can only deny, never leave the route ungated.
+void refuse_factor_credential_gate_unwired(const httplib::Request& req, httplib::Response& res,
+                                           const auth::Session& session, std::string_view label) {
+    spdlog::error("settings: no factor-credential gate wired; failing closed ({})", label);
+    StepUpVerdict v;
+    v.decision = StepUpDecision::kUnwired;
+    v.user = session.username;
+    render_step_up_refusal(req, res, v, StepUpSurface::kRest);
+    toast_step_up_refusal(res);
+}
+
+// #6079: the gate hands back an admission only for a local interactive session, so a
+// non-local one here is a gate defect, never a production shape. Re-check it where the
+// admission is consumed (the generation it carries is only meaningful for a local account)
+// and answer the gate's own 403, mutating nothing.
+void refuse_factor_credential_not_local(const httplib::Request& req, httplib::Response& res,
+                                        const auth::Session& session, std::string_view label) {
+    spdlog::error("settings: factor-credential admission is not local; failing closed ({})", label);
+    StepUpVerdict v;
+    v.decision = StepUpDecision::kFactorCredentialNonLocal;
+    v.reason = "factor_credential_requires_local_session";
+    v.user = session.username;
+    render_step_up_refusal(req, res, v, StepUpSurface::kRest);
+    toast_step_up_refusal(res);
 }
 
 // True when a Content-Type header names application/json (any parameters, any case).
@@ -1925,6 +1959,26 @@ SettingsRoutes::render_access_review_campaign_fragment(const httplib::Request& r
     return html;
 }
 
+void SettingsRoutes::respond_mfa_factor_changed(httplib::Response& res,
+                                                const auth::Session& session,
+                                                std::string_view route) {
+    if (metrics_registry_) {
+        metrics_registry_
+            ->counter("yuzu_auth_mfa_factor_changed_total", {{"route", std::string(route)}})
+            .increment();
+    }
+    constexpr const char* kMessage =
+        "Your MFA factor changed while this request was in flight. Reload the page; if you are "
+        "asked to sign in again, do so.";
+    res.status = 409;
+    // htmx swaps no 4xx body, so say it in a toast as well (the dashboard's conflict posture,
+    // respond_last_administrator_refused). The constant is safe in the hand-built JSON.
+    const nlohmann::json toast = {{"showToast", {{"message", kMessage}, {"level", "error"}}}};
+    res.set_header("HX-Trigger", toast.dump());
+    res.set_content(render_mfa_fragment(session, {}, {}, {}, {}, kMessage),
+                    "text/html; charset=utf-8");
+}
+
 std::string SettingsRoutes::render_mfa_fragment(const auth::Session& session,
                                                 const std::string& new_otpauth_uri,
                                                 const std::string& new_secret_b32,
@@ -3445,6 +3499,17 @@ void SettingsRoutes::register_routes(
     oidc_provider_ = &oidc_provider;
     metrics_registry_ = metrics_registry;
     step_up_fn_ = std::move(step_up_fn);
+    // The closed route set of the factor-changed refusal, pre-seeded so increase() sees the first
+    // event of each series (#5177). Registered here because only this file increments it.
+    if (metrics_registry_) {
+        metrics_registry_->describe(
+            "yuzu_auth_mfa_factor_changed_total",
+            "Factor-credential requests refused 409 because the account's MFA factor changed "
+            "between the step-up gate and the mutation, by route (recovery_codes|disable)",
+            "counter");
+        for (const char* route : {"recovery_codes", "disable"})
+            metrics_registry_->counter("yuzu_auth_mfa_factor_changed_total", {{"route", route}});
+    }
 
     // -- Settings page (admin only) -------------------------------------------
     sink.Get("/settings", [this](const httplib::Request& req, httplib::Response& res) {
@@ -7005,6 +7070,16 @@ void SettingsRoutes::register_routes(
 
     // -- Settings API: Management Groups (HTMX) --------------------------------
 
+    // Create is audit-first (ADR-0033 section 9, "no audit row, no mutation", #7074); the twins
+    // are POST /api/v1/management-groups and the MCP create_management_group tool. Every refusal
+    // that needs no write to decide (permission, empty name, `validate_new_group`) answers first
+    // and burns no row. The `attempted` row can wait on the audit pool, so the session and the
+    // permission are decided again after it. Failure rows carry a FIXED token and the group name
+    // the `attempted` row carries (`mgmt_group_failure_detail`), never store text, and no store
+    // text reaches the page: a store fault answers a fixed message, a validation refusal echoes
+    // its own closed text, HTML-escaped. The form swaps the response body into
+    // #mgmt-groups-section (htmx drops a 4xx/5xx body), so a refusal that must be seen carries
+    // an HX-Trigger toast too.
     sink.Post("/api/settings/management-groups", [this](const httplib::Request& req,
                                                         httplib::Response& res) {
         if (!perm_fn_(req, res, "ManagementGroup", "Write"))
@@ -7017,29 +7092,138 @@ void SettingsRoutes::register_routes(
                             "text/html; charset=utf-8");
             return;
         }
+        const auto set_toast = [&res](const std::string& message, const char* level) {
+            res.set_header("HX-Trigger",
+                           nlohmann::json{{"showToast", {{"message", message}, {"level", level}}}}
+                               .dump());
+        };
+        const auto refuse_text = [&res](const std::string& text) {
+            res.set_content("<span class=\"feedback-error\">" + html_escape(text) + "</span>",
+                            "text/html; charset=utf-8");
+        };
+        // The name and the parent id are bounded and held to clean text before any store read
+        // or `attempted` row (mgmt_group_limits.hpp). Fixed text, never the caller's value.
+        if (!mgmt_group_name_ok(name)) {
+            refuse_text(std::string(kMgmtGroupNameInvalidText));
+            return;
+        }
+        if (!mgmt_group_id_ok(parent_id)) { // an id like this names no group
+            refuse_text("parent group not found");
+            return;
+        }
+        // A fault of the store itself: fixed text, never the store's own (libpq) message.
+        const auto store_fault = [&]() {
+            static const std::string kMsg = "Management group store unavailable, try again";
+            set_toast(kMsg, "error");
+            refuse_text(kMsg);
+        };
+        // No group store wired: answer the fixed store-unavailable refusal before any use of it
+        // and before any audit row (nothing can be created, so nothing is attempted).
+        if (!mgmt_group_store_) {
+            store_fault();
+            return;
+        }
         ManagementGroup g;
         g.name = name;
         g.parent_id = parent_id;
         g.membership_type = mtype.empty() ? "static" : mtype;
-        auto session = auth_fn_(req, res);
-        if (session)
-            g.created_by = session->username;
-        auto result = mgmt_group_store_->create_group(g);
-        if (!result) {
-            res.set_content("<span class=\"feedback-error\">" + result.error() + "</span>",
-                            "text/html; charset=utf-8");
+
+        // The checks create_group runs before its insert, decided here so a refusal burns no
+        // `attempted` row.
+        if (auto valid = mgmt_group_store_->validate_new_group(g); !valid) {
+            if (mgmt_group_error_is_store_fault(valid.error()))
+                store_fault();
+            else
+                refuse_text(valid.error());
             return;
         }
-        if (audit_store_) {
-            AuditEvent ae;
-            ae.principal = session ? session->username : "unknown";
-            ae.action = "management_group.create";
-            ae.target_type = "ManagementGroup";
-            ae.target_id = *result;
-            ae.detail = name;
-            ae.result = "success";
-            (void)audit_store_->log(ae);
+
+        const auto session = auth_fn_(req, res); // writes its own 401
+        if (!session)
+            return; // no caller to name: no audit row is written and nothing is created
+        g.created_by = session->username;
+        // EVERY row of this route that names the caller (the `attempted` row, the `*_revoked`
+        // failure rows and the outcome row) is stamped from the session resolved here, as the MFA
+        // disable does: each can be written after the session is gone, when the re-resolving
+        // `audit_read_fn_` would stamp an empty principal and break principal-based pairing of
+        // the rows. Without a session writer wired (tests) they use `audit_read_fn_`.
+        const AuditReadFn bound_audit = [&]() -> AuditReadFn {
+            if (!audit_as_session_fn_)
+                return audit_read_fn_;
+            return [writer = audit_as_session_fn_, who = *session,
+                    role = auth::role_to_string(auth::effective_role(*session))](
+                       const httplib::Request& r, const std::string& action,
+                       const std::string& result, const std::string& target_type,
+                       const std::string& target_id, const std::string& detail_text) {
+                return writer(r, who, role, action, result, target_type, target_id, detail_text);
+            };
+        }();
+
+        if (!detail::audit_attempted(bound_audit, req, res, "management_group.create",
+                                     "ManagementGroup", "", g.name)) {
+            // audit_attempted wrote the 503 A4 envelope + Sec-Audit-Failed; the form would show
+            // nothing for it, so add the toast.
+            set_toast("Audit log unavailable: the group was not created", "error");
+            return;
         }
+
+        // The attempted row can wait on the audit pool: authenticate and authorise again, so a
+        // session invalidated or a grant revoked during the wait creates nothing. The username
+        // is compared too: the resolver falls through its credential sources (cookie, Bearer,
+        // X-Yuzu-Token), so with the original session gone a different principal's credential
+        // on the same request would resolve, and the rows (bound to the original session) would
+        // misname the actor. A different principal counts as revoked.
+        // Both refusal arms set a toast: htmx drops a 4xx body, so the operator would otherwise
+        // see nothing.
+        const auto fresh_session = auth_fn_(req, res); // writes its own 401 when gone
+        if (!fresh_session || fresh_session->username != session->username) {
+            (void)detail::emit_behavioral_audit(bound_audit, req, res, "management_group.create",
+                                                "failure", "ManagementGroup", "",
+                                                mgmt_group_failure_detail("session_revoked",
+                                                                          g.name));
+            if (res.status < 400) { // auth_fn_ writes its own 401; cover one that did not
+                res.status = 401;
+                res.set_content(detail::a4_error(res, "authentication required"),
+                                "application/json");
+            }
+            set_toast("Session no longer valid: the group was not created", "error");
+            return;
+        }
+        if (!perm_fn_(req, res, "ManagementGroup", "Write")) { // writes its own 403
+            (void)detail::emit_behavioral_audit(bound_audit, req, res, "management_group.create",
+                                                "failure", "ManagementGroup", "",
+                                                mgmt_group_failure_detail("permission_revoked",
+                                                                          g.name));
+            set_toast("Permission revoked: the group was not created", "error");
+            return;
+        }
+        g.created_by = fresh_session->username;
+
+        auto result = mgmt_group_store_->create_group(g);
+        if (!result) {
+            // The attempted row is stored, so it gets an outcome with a FIXED token, never the
+            // store text (which can carry database error output).
+            const auto token = create_failure_token(result.error());
+            const bool fault = token == kMgmtGroupTokenStoreError;
+            (void)detail::emit_behavioral_audit(bound_audit, req, res, "management_group.create",
+                                                "failure", "ManagementGroup", "",
+                                                mgmt_group_failure_detail(token, g.name));
+            if (fault) {
+                // The cause is logged (sanitised), never shown on the page or audited.
+                spdlog::error("management_group.create store fault: {}",
+                              ::yuzu::log_key_token(result.error()));
+                store_fault();
+            } else {
+                refuse_text(result.error()); // a name conflict or a validation literal: closed text
+            }
+            return;
+        }
+        // The group exists: a lost outcome row keeps the success response, marks it
+        // `Sec-Audit-Failed` and says so in a toast (the `attempted` row stands as "started,
+        // outcome unknown"). Nothing is rolled back.
+        if (!detail::emit_behavioral_audit(bound_audit, req, res, "management_group.create",
+                                           "success", "ManagementGroup", *result, g.name))
+            set_toast("Group created, but its audit record could not be stored", "warning");
         res.set_content(render_management_groups_fragment(), "text/html; charset=utf-8");
     });
 
@@ -7924,6 +8108,72 @@ void SettingsRoutes::register_routes(
                                       "text/html; charset=utf-8");
                       return;
                   }
+                  // #6079: the confirming code commits the factor, so the caller's session must be
+                  // a durable, valid row BEFORE it does; otherwise the enrolment could commit on
+                  // a session that ended, was wiped or never had a row, leaving the account
+                  // enrolled with no usable proof on that session. Only when a session store is
+                  // wired: the store-less (legacy and config-file-user) wiring has no durable
+                  // row to require, and its behaviour is unchanged. The read is the raw
+                  // `read_durable_mfa_proof` (row existence and ownership only; the rebind
+                  // guard concerns a stored generation, which is not judged here). It runs
+                  // BEFORE and OUTSIDE the `auth.users` row lock that `mfa_verify_enrollment`
+                  // takes: AuthDB must never read the session store. Residual, stated plainly:
+                  // a session that ends between this read and the commit still ends in the
+                  // best-effort stamp's `not_stamped` outcome below, and the enrolment stands.
+                  // The provisional secret is untouched on either refusal, so the same code
+                  // can be confirmed from a valid session. An API-token (bearer) caller has no
+                  // session cookie and so no durable row: it is refused here by design, and
+                  // told so (no cookie at all) rather than that a session ended.
+                  if (auth_mgr_->has_session_store()) {
+                      using Source = auth::DurableMfaProof::Source;
+                      const std::string session_cookie = AuthRoutes::extract_session_cookie(req);
+                      const auto durable =
+                          auth_mgr_->read_durable_mfa_proof(session_cookie, session->username);
+                      if (durable.source != Source::kRow) {
+                          const bool unavailable = durable.source == Source::kUnavailable;
+                          const std::string msg =
+                              unavailable
+                                  ? "Session store is temporarily unavailable. Nothing was "
+                                    "enrolled; retry shortly."
+                              : session_cookie.empty()
+                                  ? "This action needs a signed-in browser session. Nothing was "
+                                    "enrolled."
+                                  : "Your session is no longer valid. Nothing was enrolled; "
+                                    "sign in again.";
+                          // The session-bound writer (as the disable route's rows): the row is
+                          // attributed to the session this handler already resolved, not
+                          // re-resolved from the cookie, which is the very thing that may be
+                          // missing or stale here. Unwired (tests), `audit_fn_` is the fallback.
+                          const std::string refusal_detail = unavailable
+                                                                 ? "session_store_unavailable"
+                                                                 : "session_not_durable";
+                          if (audit_as_session_fn_)
+                              (void)audit_as_session_fn_(
+                                  req, *session,
+                                  auth::role_to_string(auth::effective_role(*session)),
+                                  "mfa.enroll.failed", "error", "User", session->username,
+                                  refusal_detail);
+                          else
+                              audit_fn_(req, "mfa.enroll.failed", "error", "User",
+                                        session->username, refusal_detail);
+                          res.status = unavailable ? 503 : 401;
+                          if (unavailable)
+                              res.set_header("Retry-After", "5");
+                          // htmx swaps no 4xx/5xx body, so the toast is what tells the operator.
+                          const nlohmann::json toast = {
+                              {"showToast", {{"message", msg}, {"level", "error"}}}};
+                          res.set_header("HX-Trigger", toast.dump());
+                          set_no_store(res);
+                          // A transient outage keeps the provisional form so the same code can be
+                          // confirmed on retry; a dead session shows the not-enrolled panel.
+                          res.set_content(render_mfa_fragment(*session, {}, {}, {},
+                                                              unavailable ? session->username
+                                                                          : std::string{},
+                                                              msg),
+                                          "text/html; charset=utf-8");
+                          return;
+                      }
+                  }
                   auto codes_res = db->mfa_verify_enrollment(session->username, code,
                                                              /*expected_password_hash_hex=*/std::nullopt);
                   if (!codes_res && codes_res.error() == AuthDBError::CredentialChanged) {
@@ -8026,7 +8276,7 @@ void SettingsRoutes::register_routes(
                   }
                   // Enrolment has just committed, and the code that committed it IS a fresh proof
                   // of the factor: stamp the CURRENT cookie session's step-up proof (the same
-                  // `mark_session_mfa_verified` as POST /login/mfa/stepup, so the DB-clock
+                  // `stamp_session_mfa_proof` as POST /login/mfa/stepup, so the DB-clock
                   // authoring and every replica's cache refresh are that primitive's), so the
                   // operator can regenerate recovery codes or disable MFA from this very session
                   // without a separate step-up. Only a local cookie session is stamped, and only
@@ -8041,9 +8291,9 @@ void SettingsRoutes::register_routes(
                   // again to earn a proof. Never reached on a failed or rejected verification (all
                   // return above).
                   // The audit row below says only `not_stamped`; this line says why. Sampled (1 in
-                  // kStampThrewLogEvery, the first always) so a failing auth store cannot become a log storm.
-                  // `what()` is text an exception chose, so it is sanitised. Guarded: a formatter
-                  // or logger throw must not escape the catch and drop the codes reveal.
+                  // kStampThrewLogEvery, the first always) so a failing auth store cannot become a
+                  // log storm. `what()` is text an exception chose, so it is sanitised. Guarded: a
+                  // formatter or logger throw must not escape the catch and drop the codes reveal.
                   const auto note_stamp_threw = [](const char* what) noexcept {
                       try {
                           static std::atomic<uint64_t> stamp_threw_hits{0};
@@ -8060,7 +8310,14 @@ void SettingsRoutes::register_routes(
                       } catch (...) { // NOLINT(bugprone-empty-catch)
                       }
                   };
+                  // #6079: the stamp carries the enrolment's own proof, the generation its UPDATE
+                  // produced and the database instant its loading statement captured before the
+                  // TOTP check (so it precedes `mfa_enrolled_at`), never the stamp's now(). The
+                  // stamp refuses a future-dated instant and, after it commits, clears itself if
+                  // the factor generation changed since (`factor_changed`); the enrolment and the
+                  // codes below stand either way.
                   bool proof_stamped = false;
+                  const char* not_stamped_why = "";
                   try {
                       if (auth_mgr_ && session->auth_source == "local") {
                           const auto cookie_token = AuthRoutes::extract_session_cookie(req);
@@ -8070,23 +8327,35 @@ void SettingsRoutes::register_routes(
                                   cookie_session->username == session->username) {
                                   if (stamp_fault_hook_) // test seam, empty in production
                                       stamp_fault_hook_();
-                                  proof_stamped = auth_mgr_->mark_session_mfa_verified(cookie_token);
+                                  using Outcome = auth::AuthManager::MfaStampOutcome;
+                                  const auto outcome = auth_mgr_->stamp_session_mfa_proof(
+                                      cookie_token,
+                                      LocalMfaProof{codes_res->factor_gen, codes_res->verified_ms});
+                                  proof_stamped = outcome == Outcome::kStamped;
+                                  if (outcome == Outcome::kFactorChanged)
+                                      not_stamped_why = ";factor_changed";
+                                  else if (outcome == Outcome::kFutureDated)
+                                      not_stamped_why = ";verification_future_dated";
                               }
                           }
                       }
                   } catch (const std::exception& ex) {
                       proof_stamped = false;
+                      not_stamped_why = "";
                       note_stamp_threw(ex.what());
                   } catch (...) {
                       proof_stamped = false;
+                      not_stamped_why = "";
                       note_stamp_threw(nullptr);
                   }
                   audit_fn_(req, "mfa.enroll.verified", "ok", "User", session->username,
-                            proof_stamped ? "step_up_proof=stamped" : "step_up_proof=not_stamped");
+                            proof_stamped
+                                ? std::string("step_up_proof=stamped")
+                                : std::string("step_up_proof=not_stamped") + not_stamped_why);
                   audit_fn_(req, "mfa.recovery_codes.generated", "ok", "User",
                             session->username, "10 codes issued");
                   set_no_store(res);
-                  res.set_content(render_mfa_fragment(*session, {}, {}, *codes_res),
+                  res.set_content(render_mfa_fragment(*session, {}, {}, codes_res->recovery_codes),
                                   "text/html; charset=utf-8");
               });
 
@@ -8103,11 +8372,24 @@ void SettingsRoutes::register_routes(
                       return;
                   }
                   // MFA step-up gate. Minting a fresh recovery-code set hands the caller a
-                  // credential that satisfies the step-up challenge itself, and disabling MFA removes
-                  // the factor the gate checks; both need a fresh proof first. Before any mutation.
-                  if (step_up_fn_ &&
-                      !step_up_fn_(req, res, *session, "POST /api/settings/mfa/recovery-codes")) {
+                  // credential that satisfies the step-up challenge itself, and disabling MFA
+                  // removes the factor the gate checks; both need a fresh proof first. Before any
+                  // mutation. The gate also hands back the factor generation it admitted the
+                  // request at; the regeneration compares it under the users row lock (#6079).
+                  if (!factor_credential_gate_fn_) {
+                      refuse_factor_credential_gate_unwired(
+                          req, res, *session, "POST /api/settings/mfa/recovery-codes");
+                      return;
+                  }
+                  const auto admission = factor_credential_gate_fn_(
+                      req, res, *session, "POST /api/settings/mfa/recovery-codes");
+                  if (!admission) {
                       toast_step_up_refusal(res);
+                      return;
+                  }
+                  if (!admission->local) {
+                      refuse_factor_credential_not_local(req, res, *session,
+                                                         "POST /api/settings/mfa/recovery-codes");
                       return;
                   }
                   auto* db = auth_mgr_ ? auth_mgr_->auth_db_ptr() : nullptr;
@@ -8118,7 +8400,23 @@ void SettingsRoutes::register_routes(
                                       "text/html; charset=utf-8");
                       return;
                   }
-                  auto codes = db->mfa_regenerate_recovery_codes(session->username);
+                  if (factor_credential_barrier_)
+                      factor_credential_barrier_("recovery_codes");
+                  auto codes =
+                      db->mfa_regenerate_recovery_codes(session->username, admission->factor_gen);
+                  if (!codes && codes.error() == AuthDBError::FactorChanged) {
+                      // The factor was replaced after the gate admitted this request: nothing was
+                      // regenerated, so the new factor's codes are untouched.
+                      audit_fn_(req, "mfa.recovery_codes.generated", "denied", "User",
+                                session->username,
+                                std::format("reason=factor_changed expected_gen={}",
+                                            admission->factor_gen));
+                      // #6940: every MFA fragment response is no-store; set here, not in the shared
+                      // helper (the disable handler already sets it once, and set_header appends).
+                      set_no_store(res);
+                      respond_mfa_factor_changed(res, *session, "recovery_codes");
+                      return;
+                  }
                   if (!codes) {
                       // #6995: a refused regeneration is counted like its siblings. A CSPRNG
                       // fault goes to yuzu_secure_random_failure_total; any other store fault to
@@ -8173,9 +8471,22 @@ void SettingsRoutes::register_routes(
                   set_no_store(res);
                   // MFA step-up gate (see recovery-codes above): stripping the factor the gate
                   // checks needs a fresh proof. Before the enforcement guard and any mutation.
-                  if (step_up_fn_ &&
-                      !step_up_fn_(req, res, *session, "POST /api/settings/mfa/disable")) {
+                  // The gate also hands back the factor generation it admitted the request at; the
+                  // clear compares it under the users row lock (#6079).
+                  if (!factor_credential_gate_fn_) {
+                      refuse_factor_credential_gate_unwired(req, res, *session,
+                                                            "POST /api/settings/mfa/disable");
+                      return;
+                  }
+                  const auto admission = factor_credential_gate_fn_(
+                      req, res, *session, "POST /api/settings/mfa/disable");
+                  if (!admission) {
                       toast_step_up_refusal(res);
+                      return;
+                  }
+                  if (!admission->local) {
+                      refuse_factor_credential_not_local(req, res, *session,
+                                                         "POST /api/settings/mfa/disable");
                       return;
                   }
                   auto* db = auth_mgr_ ? auth_mgr_->auth_db_ptr() : nullptr;
@@ -8209,11 +8520,16 @@ void SettingsRoutes::register_routes(
                       return;
                   }
                   // Two rows per disable: an INTENT row ("attempted") written BEFORE the factor is
-                  // touched, and an OUTCOME row after. The outcome row is written AFTER the actor's
-                  // own session is deleted, so both are attributed to the session already
-                  // resolved, not re-resolved from the cookie. Order them by the audit `id`.
+                  // touched, and an OUTCOME row after (written by `MfaDisableOwner` inside the
+                  // clear's own transaction on success, by this handler for denied/error). The
+                  // outcome row is written AFTER the actor's own session is deleted, so both are
+                  // attributed to the session already resolved, not re-resolved from the cookie.
+                  // Order them by the audit `id`.
                   // Returns whether the row persisted; the unwired fallback (tests, other callers)
                   // is a void writer and reports true, so only the production binding can refuse.
+                  // This writer serves the intent, denied and error rows only: the success row is
+                  // written by the owner inside the clear's transaction, through the
+                  // AuditEventForSessionFn seam below.
                   const auto audit = [&](const char* result, const std::string& detail) -> bool {
                       if (audit_as_session_fn_)
                           return audit_as_session_fn_(
@@ -8222,12 +8538,9 @@ void SettingsRoutes::register_routes(
                       audit_fn_(req, "mfa.disabled", result, "User", session->username, detail);
                       return true;
                   };
-                  // Fail closed on the intent row: an MFA clear that cannot be recorded does not
-                  // happen. Nothing has been cleared and no session has been ended.
-                  if (!audit("attempted", "MFA clear requested via Settings")) {
-                      spdlog::error("mfa.disabled: the audit store did not accept the intent row "
-                                    "for '{}'; MFA was NOT changed",
-                                    log_safe(session->username));
+                  // The audit-unavailable answer, shared by the intent row below and the owner's
+                  // outcome row: 503 + `Sec-Audit-Failed`, MFA untouched.
+                  const auto refuse_audit_unavailable = [&] {
                       res.status = 503;
                       res.set_header("Retry-After", "5");
                       res.set_header("Sec-Audit-Failed", "true");
@@ -8240,15 +8553,16 @@ void SettingsRoutes::register_routes(
                           render_mfa_fragment(*session, {}, {}, {}, {},
                                               "Audit store unavailable; MFA was not changed."),
                           "text/html; charset=utf-8");
+                  };
+                  // Fail closed on the intent row: an MFA clear that cannot be recorded does not
+                  // happen. Nothing has been cleared and no session has been ended.
+                  if (!audit("attempted", "MFA clear requested via Settings")) {
+                      spdlog::error("mfa.disabled: the audit store did not accept the intent row "
+                                    "for '{}'; MFA was NOT changed",
+                                    log_safe(session->username));
+                      refuse_audit_unavailable();
                       return;
                   }
-                  // The clear has no undo, so a lost OUTCOME row cannot stop it; it is logged.
-                  const auto audit_outcome = [&](const char* result, const std::string& detail) {
-                      if (!audit(result, detail))
-                          spdlog::error("mfa.disabled: MFA cleared for '{}' but the outcome audit "
-                                        "row failed to persist",
-                                        log_safe(session->username));
-                  };
                   // Same exit as logout: drop the cookie and send the browser to the landing page.
                   const auto sign_out = [&] {
                       res.set_header("Set-Cookie",
@@ -8256,56 +8570,93 @@ void SettingsRoutes::register_routes(
                       res.set_header("HX-Redirect", "/home");
                       res.set_content("", "text/plain");
                   };
-                  // The pre-image comes from the clear's own row lock, so it cannot miss an
-                  // enrolment verified in between. A failed clear leaves it unknown, which counts
-                  // as enrolled: the fail-safe is to end sessions.
-                  auto r = db->mfa_disable_report(session->username);
-                  if (!r) {
-                      // The clear may have committed with its acknowledgement lost, so the
-                      // sessions end anyway (#6079).
-                      const auto ended = auth_mgr_->invalidate_user_sessions(session->username);
-                      audit_outcome("error", "disable failed (sessions_ended=" +
-                                                 (ended.db_persisted ? std::to_string(ended.count)
-                                                                     : std::string("failed")) +
-                                                 ")");
-                      if (ended.db_persisted) {
-                          sign_out();
+                  // #6079 PR 2c: the factor clear, the end of EVERY durable session of the account
+                  // (the caller's included: any of them may hold an MFA proof made under the factor
+                  // just cleared, so the user signs in again) and the OUTCOME audit row commit or
+                  // abort TOGETHER in `MfaDisableOwner`'s one transaction. The `attempted` row above
+                  // stays the caller's: it is written first and stops the clear if it cannot be
+                  // stored. There is no `partial` outcome any more (a clear whose sessions could
+                  // not be ended rolls back whole), and a lost outcome row now fails the clear
+                  // closed instead of being logged after the fact.
+                  if (!audit_event_for_session_fn_) {
+                      // The outcome row cannot be built, so the clear cannot run.
+                      spdlog::error("mfa.disabled: no outcome-row builder wired for '{}'; MFA was "
+                                    "NOT changed",
+                                    log_safe(session->username));
+                      refuse_audit_unavailable();
+                      return;
+                  }
+                  yuzu::server::MfaDisableRequest clear;
+                  clear.username = session->username;
+                  clear.expected_factor_gen = admission->factor_gen;
+                  // action, result and identity are the caller's; the owner completes only the
+                  // detail (empty template: `sessions_ended=<n>`, the text the success row has
+                  // always carried).
+                  clear.audit_template = audit_event_for_session_fn_(
+                      req, *session, auth::role_to_string(auth::effective_role(*session)),
+                      "mfa.disabled", "ok", "User", session->username);
+                  // Cancelling an enrolment that never completed clears no usable factor, so no
+                  // proof can predate one: nothing to end, and the row says so.
+                  clear.end_sessions_if_not_enrolled = false;
+                  clear.detail_if_not_enrolled = "no verified factor to clear";
+                  if (factor_credential_barrier_)
+                      factor_credential_barrier_("disable");
+                  const auto outcome = auth_mgr_->commit_mfa_disable(clear);
+                  switch (outcome.result) {
+                  case yuzu::server::MfaDisableResult::kOk:
+                      // The outcome row is already committed with the clear.
+                      if (!outcome.was_enrolled) {
+                          res.set_content(render_mfa_fragment(*session),
+                                          "text/html; charset=utf-8");
                           return;
                       }
-                      // Neither the clear nor the delete is confirmed: say the state is unknown.
-                      res.set_content(
-                          render_mfa_fragment(
-                              *session, {}, {}, {}, {},
-                              "Could not confirm MFA was disabled, and the account's sessions "
-                              "could not be ended. Its state is unknown: ask an administrator "
-                              "to check it and end the sessions."),
-                          "text/html; charset=utf-8");
+                      sign_out();
                       return;
-                  }
-                  const bool had_factor = *r;
-                  // Cancelling an enrolment that never completed clears no usable factor, so no
-                  // proof can predate one: nothing to end.
-                  if (!had_factor) {
-                      audit_outcome("ok", "no verified factor to clear");
-                      res.set_content(render_mfa_fragment(*session), "text/html; charset=utf-8");
+                  case yuzu::server::MfaDisableResult::kFactorChanged:
+                      // The factor changed after the gate admitted this request (an enrolled
+                      // account rotated, or an un-enrolled one finished enrolling): nothing was
+                      // cleared and no session ends. The session may be legitimate after a
+                      // re-prove. The transaction wrote nothing, so the row is the caller's.
+                      audit("denied", std::format("reason=factor_changed expected_gen={}",
+                                                  admission->factor_gen));
+                      respond_mfa_factor_changed(res, *session, "disable");
                       return;
-                  }
-                  // End EVERY session of the account, the caller's included (#6079): any of them
-                  // may hold an MFA proof made under the factor just cleared. The user signs in
-                  // again; a kept session would be a surviving proof we could not tell apart.
-                  const auto ended = auth_mgr_->invalidate_user_sessions(session->username);
-                  if (!ended.db_persisted) {
-                      audit_outcome("partial", "sessions_ended=failed");
-                      res.set_content(
-                          render_mfa_fragment(
-                              *session, {}, {}, {}, {},
-                              "MFA was disabled, but the account's sessions could not be ended. "
-                              "Ask an administrator to end them."),
-                          "text/html; charset=utf-8");
+                  case yuzu::server::MfaDisableResult::kAuditUnavailable:
+                      // The outcome row could not be written, so the whole clear rolled back.
+                      spdlog::error("mfa.disabled: the audit store did not accept the outcome row "
+                                    "for '{}'; MFA was NOT changed",
+                                    log_safe(session->username));
+                      refuse_audit_unavailable();
                       return;
+                  case yuzu::server::MfaDisableResult::kNotFound:
+                  case yuzu::server::MfaDisableResult::kStoreUnavailable:
+                      break;
                   }
-                  audit_outcome("ok", std::format("sessions_ended={}", ended.count));
-                  sign_out();
+                  // No active row (the account went away mid-request) or a store fault: the
+                  // transaction normally rolled back, so the factor and the sessions are
+                  // unchanged, but a connection lost exactly at COMMIT may have committed all of
+                  // it, so the answer says the factor may not have changed and to check its state
+                  // (and AuthManager::commit_mfa_disable has already dropped this replica's cached
+                  // sessions of the account for that case). The `error` row is the caller's: the
+                  // transaction wrote none.
+                  if (!audit("error", "disable failed")) {
+                      spdlog::error("mfa.disabled: MFA was not changed for '{}' and the error "
+                                    "audit row failed to persist",
+                                    log_safe(session->username));
+                  }
+                  res.status = 503;
+                  res.set_header("Retry-After", "5");
+                  // /settings swaps no 5xx body, so the toast tells the operator on the main page.
+                  res.set_header("HX-Trigger",
+                                 R"({"showToast":{"message":"Could not confirm MFA was )"
+                                 R"(disabled; it may not have been changed. Check its )"
+                                 R"(state.","level":"error"}})");
+                  res.set_content(
+                      render_mfa_fragment(*session, {}, {}, {}, {},
+                                          "Could not disable MFA. It may not have been changed; "
+                                          "check its state and try again. If you were signed out, "
+                                          "sign in and check its state."),
+                      "text/html; charset=utf-8");
               });
 }
 

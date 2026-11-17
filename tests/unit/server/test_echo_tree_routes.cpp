@@ -12,6 +12,7 @@
 
 #include "authz_gates.hpp" // authz::FleetReadGate (#4027 fix round, CDX-P1-01/K4)
 #include "authz_model.hpp"
+#include "dispatch_denial_text.hpp" // describe_dispatch_denial: the mapping server.cpp injects
 #include "secure_random.hpp"
 #include "echo_tree_routes.hpp"
 #include "openapi_spec_access.hpp"
@@ -24,6 +25,7 @@
 
 #include <cctype>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -76,6 +78,7 @@ const std::string kCompatCmd = "echo-c";
 // An EchoTreeRoutes registered over a TestRouteSink with toggleable stubs.
 struct EchoHarness {
     yuzu::server::test::TestRouteSink sink;
+    yuzu::MetricsRegistry metrics; // before `routes`, which borrows it
     EchoTreeRoutes routes;
 
     std::string device = "dev-A";
@@ -117,18 +120,47 @@ struct EchoHarness {
     bool audit_ok = true;      // #1647: flip to drop the evidence row (audit_fn → false)
     bool audit_throws = false; // #1647: simulate a bad_alloc-class throw out of audit_fn
     bool service_scoped = false; // simulate a service-scoped API token session
+    int dispatch_calls = 0;      // every dispatch_fn_ call, whatever it carried
+    /// Set = the dispatch chokepoint refuses every dispatch with this reason (sent 0, #7114).
+    std::optional<yuzu::server::detail::DispatchDenialReason> dispatch_denied;
+    bool dispatch_throws = false; ///< the dispatch itself throws
+    bool dispatch_throws_other = false; ///< the dispatch throws something that is no std::exception
+    bool caller_throws = false; ///< deriving the dispatch caller throws
+    int write_probes = 0; ///< scoped-gate calls for Write, which this stub always refuses
+    /// "audit:<action>/<result>" and "dispatch", in call order: proves the `attempted` row
+    /// precedes every dispatch it covers.
+    std::vector<std::string> order;
 
     struct AuditRow {
         std::string action, result, target_id, detail;
+        std::string principal; ///< stamped by the session-bound writer (the push); empty otherwise
     };
     std::vector<AuditRow> audit_log;
+    /// Whether the audit store persists a given row (read live per row), applied after
+    /// audit_throws. Unset = audit_ok decides for every row.
+    std::function<bool(const AuditRow&)> audit_persists;
+    /// The one store behind both audit writers: records the row, then throws or drops it as
+    /// configured. #1647: recorded before the throw so find_audit still proves the site was reached.
+    bool record_audit(AuditRow row) {
+        audit_log.push_back(std::move(row));
+        order.push_back("audit:" + audit_log.back().action + "/" + audit_log.back().result);
+        if (audit_throws)
+            throw std::runtime_error("audit DB write blew up");
+        if (audit_persists)
+            return audit_persists(audit_log.back());
+        return audit_ok;
+    }
+    double metric(const std::string& name, const std::string& result) {
+        return metrics.counter(name, {{"result", result}}).value();
+    }
     DispatchCaller last_dispatch_caller; // #3133: observes what dispatch actually received
     std::unordered_map<std::string, std::string> last_dispatch_params; // what the last dispatch carried
     // Per command id, the exact frames the store answers (newest first, as the real store does):
     // a long answer is several frames. Overrides the one-frame replies below.
     std::unordered_map<std::string, std::vector<DexAgentResponse>> frames_override;
 
-    EchoHarness() {
+    /// `wire_audit` = false registers an empty audit sink (the unwired posture).
+    explicit EchoHarness(bool wire_audit = true, bool wire_dispatch = true) {
         auto auth = [this](const httplib::Request&,
                            httplib::Response&) -> std::optional<auth::Session> {
             if (session_user.empty())
@@ -169,10 +201,13 @@ struct EchoHarness {
             return authz::FleetReadGate{true, std::nullopt}; // TOP — unfiltered
         };
         // Scoped gate: Execute toggled by allow_execute, Read by allow_read; a non-empty
-        // scope_device denies any other device (mirrors a management-scope miss → 403).
+        // scope_device denies any other device (mirrors a management-scope miss → 403). Write is
+        // counted and refused: no route here may probe it (the dispatch chokepoint decides Write).
         auto scoped = [this](const httplib::Request&, httplib::Response& res, const std::string&,
                              const std::string& op, const std::string& dev) {
-            bool ok = (op == "Execute") ? allow_execute : allow_read;
+            if (op == "Write")
+                ++write_probes;
+            bool ok = (op == "Execute") ? allow_execute : (op != "Write" && allow_read);
             if (ok && !scope_device.empty() && dev != scope_device)
                 ok = false;
             if (!ok)
@@ -201,8 +236,18 @@ struct EchoHarness {
                                const std::unordered_map<std::string, std::string>& params,
                                const DispatchCaller& caller)
             -> yuzu::server::ConfinedDispatchOutcome {
+            ++dispatch_calls;
+            order.push_back("dispatch");
             last_dispatch_caller = caller;
             last_dispatch_params = params;
+            if (dispatch_throws)
+                throw std::runtime_error("dispatch blew up");
+            if (dispatch_throws_other)
+                throw 42;
+            if (dispatch_denied)
+                return {.command_id = "echo-denied",
+                        .denied = yuzu::server::detail::DispatchDenial{
+                            *dispatch_denied, "Infrastructure", authz::Operation::Write}};
             const auto it = params.find("sql");
             const std::string sql = it != params.end() ? it->second : std::string{};
             sql_log.push_back(sql);
@@ -220,6 +265,8 @@ struct EchoHarness {
         // (empty session_user) fails closed with an empty principal, same
         // contract every production CallerFn documents.
         auto caller_fn = [this](const httplib::Request&) -> DispatchCaller {
+            if (caller_throws)
+                throw std::runtime_error("caller derivation blew up");
             if (session_user.empty())
                 return DispatchCaller{.exec_visible = authz::deny_all()};
             return DispatchCaller{.principal = session_user, .system = false};
@@ -247,15 +294,34 @@ struct EchoHarness {
         auto audit = [this](const httplib::Request&, const std::string& a, const std::string& r,
                             const std::string&, const std::string& tid,
                             const std::string& d) -> bool {
-            audit_log.push_back({a, r, tid, d});
-            // #1647: the row is recorded before the throw so find_audit still proves the
-            // site was reached; the throw then exercises the shared helper's catch-arm.
-            if (audit_throws)
-                throw std::runtime_error("audit DB write blew up");
-            return audit_ok; // DexRoutes::AuditFn (aliased by EchoTreeRoutes) is bool-returning (#1549)
+            // DexRoutes::AuditFn (aliased by EchoTreeRoutes) is bool-returning (#1549); #1647:
+            // record_audit records the row before the throw, so the shared helper's catch-arm
+            // is exercised.
+            return record_audit({a, r, tid, d, {}});
         };
-        routes.register_routes(sink, auth, perm, scoped, devices, lookup, dispatch, responses, audit,
+        routes.register_routes(sink, auth, perm, scoped, devices, lookup,
+                               wire_dispatch ? EchoTreeRoutes::DispatchFn{dispatch}
+                                             : EchoTreeRoutes::DispatchFn{},
+                               responses,
+                               wire_audit ? EchoTreeRoutes::AuditFn{audit} : EchoTreeRoutes::AuditFn{},
                                caller_fn);
+        // The capture-sources push writes every row through this session-bound writer; the
+        // unwired posture leaves it unset as well.
+        if (wire_audit)
+            routes.set_audit_as_session_fn(
+                [this](const httplib::Request&, const auth::Session& s, const std::string&,
+                       const std::string& a, const std::string& r, const std::string&,
+                       const std::string& tid, const std::string& d) -> bool {
+                    return record_audit({a, r, tid, d, s.username});
+                });
+        // The status server.cpp injects for a refused push dispatch (403 permission-class, 500 otherwise).
+        routes.set_denial_status_fn([](const ConfinedDispatchOutcome& o) {
+            const auto cls = describe_dispatch_denial(o.denied->reason, "echo", "configure",
+                                                      *o.denied, DenialSurface::kRest)
+                                 .cls;
+            return cls == DispatchDenialClass::kPermissionDenied ? 403 : 500;
+        });
+        routes.set_metrics(&metrics);
         routes.set_fleet_read_fn(fleet_read); // #4027 fix round — REST twins' sole gate
         routes.set_all_devices_fn(all_devices); // #4143 review fix — REST twins' sole row source
     }
@@ -579,6 +645,8 @@ TEST_CASE("echo routes: a throwing audit_fn is caught + flags Sec-Audit-Failed a
         CHECK(h.find_audit("echo.sources.read", "dispatched") != nullptr);
     }
     SECTION("/capture-sources/push — echo.sources.configure") {
+        // The push is audit-first (#7075): the sink throwing on the `attempted` row is a
+        // refusal (503 + Sec-Audit-Failed), nothing is dispatched, and no exception escapes.
         EchoHarness h;
         h.audit_throws = true;
         std::unique_ptr<httplib::Response> r;
@@ -587,9 +655,29 @@ TEST_CASE("echo routes: a throwing audit_fn is caught + flags Sec-Audit-Failed a
             r = h.sink.Post("/fragments/echo/capture-sources/push?device=dev-A&changes=process%3Don",
                             ""));
         REQUIRE(r);
+        CHECK(r->status == 503);
+        CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
+        CHECK(h.find_audit("echo.sources.configure", "attempted") != nullptr);
+        CHECK(h.find_audit("echo.sources.configure", "dispatched") == nullptr);
+        CHECK(h.dispatch_calls == 0);
+    }
+    SECTION("/capture-sources/push — echo.sources.configure outcome row throws") {
+        // The `attempted` row stored, the per-source outcome row throws: set-and-proceed.
+        EchoHarness h;
+        h.audit_persists = [&](const EchoHarness::AuditRow& row) {
+            if (row.result != "attempted")
+                throw std::runtime_error("audit DB write blew up");
+            return true;
+        };
+        std::unique_ptr<httplib::Response> r;
+        CHECK_NOTHROW(
+            r = h.sink.Post("/fragments/echo/capture-sources/push?device=dev-A&changes=process%3Don",
+                            ""));
+        REQUIRE(r);
         CHECK(r->status == 200);
         CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
         CHECK(h.find_audit("echo.sources.configure", "dispatched") != nullptr);
+        CHECK(h.dispatch_calls == 1);
     }
 }
 
@@ -684,7 +772,9 @@ TEST_CASE("echo routes: dropped audit row flags Sec-Audit-Failed once; clean pat
     }
     SECTION("/capture-sources/push two sources both drop — header exactly once over the loop") {
         EchoHarness h;
-        h.audit_ok = false;
+        // The `attempted` row is stored (a dropped one refuses the push, see below); both
+        // per-source outcome rows then fail.
+        h.audit_persists = [](const EchoHarness::AuditRow& row) { return row.result == "attempted"; };
         // Two known sources toggled in one request; the per-source audit loop fails twice.
         auto r = h.sink.Post(
             "/fragments/echo/capture-sources/push?device=dev-A&changes=process%3Don,tcp%3Doff", "");
@@ -694,11 +784,11 @@ TEST_CASE("echo routes: dropped audit row flags Sec-Audit-Failed once; clean pat
         CHECK(r->get_header_value_count("Sec-Audit-Failed") == 1);
         // BOTH loop iterations must have reached the audit chokepoint — otherwise
         // count==1 could mean the loop skipped the second source, not de-duplication.
-        int cfg_rows = 0;
+        int outcome_rows = 0;
         for (const auto& row : h.audit_log)
-            if (row.action == "echo.sources.configure")
-                ++cfg_rows;
-        CHECK(cfg_rows == 2);
+            if (row.action == "echo.sources.configure" && row.result != "attempted")
+                ++outcome_rows;
+        CHECK(outcome_rows == 2);
     }
     SECTION("clean path sets NO Sec-Audit-Failed header") {
         EchoHarness h; // audit_ok=true, audit_throws=false
@@ -1890,4 +1980,447 @@ TEST_CASE("process-tree detail: a malformed node id is a 400",
         REQUIRE(res);
         CHECK(res->status == 400);
     }
+}
+
+// ── #7075: the capture-sources push is audit-first (ADR-0033 section 9) ─────────────────────
+//
+// One `attempted` row listing every validated change is stored BEFORE the first dispatch; if it
+// cannot be stored the push is refused (503 + Sec-Audit-Failed + an error toast) and nothing is
+// dispatched. The page swaps nothing from this response, so the HX-Trigger toast is the signal.
+
+namespace {
+
+constexpr const char* kPushUrl = "/fragments/echo/capture-sources/push?device=dev-A&changes=";
+constexpr const char* kSourcesPushMetric = "yuzu_echo_sources_push_total";
+
+std::unique_ptr<httplib::Response> push(EchoHarness& h, const std::string& changes_encoded) {
+    return h.sink.Post(kPushUrl + changes_encoded, "");
+}
+
+// The decoded HX-Trigger toast: {"message", "level"} or null when the header is absent.
+nlohmann::json toast_of(const httplib::Response& r) {
+    const auto hdr = r.get_header_value("HX-Trigger");
+    if (hdr.empty())
+        return nullptr;
+    const auto j = nlohmann::json::parse(hdr, nullptr, false);
+    REQUIRE_FALSE(j.is_discarded());
+    return j.at("showToast");
+}
+
+const EchoHarness::AuditRow* first_row(const EchoHarness& h, const std::string& result) {
+    for (const auto& r : h.audit_log)
+        if (r.action == "echo.sources.configure" && r.result == result)
+            return &r;
+    return nullptr;
+}
+
+} // namespace
+
+TEST_CASE("capture-sources push: an `attempted` row that is not stored refuses the push",
+          "[echo][routes][capture-sources][audit]") {
+    SECTION("the sink returns false") {
+        EchoHarness h;
+        h.audit_ok = false;
+        auto r = push(h, "process%3Don,tcp%3Doff");
+        REQUIRE(r);
+        CHECK(r->status == 503);
+        CHECK(r->get_header_value_count("Sec-Audit-Failed") == 1);
+        CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
+        CHECK(r->body.find("data-reason=\"audit_unavailable\"") != std::string::npos);
+        const auto toast = toast_of(*r);
+        REQUIRE(toast.is_object());
+        CHECK(toast.at("level") == "error");
+        CHECK(toast.at("message").get<std::string>().find("nothing was sent") != std::string::npos);
+        CHECK(h.dispatch_calls == 0);
+        CHECK(h.audit_log.size() == 1); // the attempted row only: no outcome row for a send that never happened
+        CHECK(h.metric(kSourcesPushMetric, "audit_unavailable") == 1);
+        CHECK(h.metric(kSourcesPushMetric, "pushed") == 0);
+    }
+    SECTION("the sink throws: same refusal, no exception escapes") {
+        EchoHarness h;
+        h.audit_throws = true;
+        std::unique_ptr<httplib::Response> r;
+        CHECK_NOTHROW(r = push(h, "process%3Don"));
+        REQUIRE(r);
+        CHECK(r->status == 503);
+        CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
+        CHECK(h.dispatch_calls == 0);
+        CHECK(h.metric(kSourcesPushMetric, "audit_unavailable") == 1);
+    }
+    SECTION("the sink is unwired: a refusal, never audit-off") {
+        EchoHarness h(/*wire_audit=*/false);
+        auto r = push(h, "process%3Don");
+        REQUIRE(r);
+        CHECK(r->status == 503);
+        CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
+        CHECK(r->body.find("data-reason=\"audit_unavailable\"") != std::string::npos);
+        CHECK(h.dispatch_calls == 0);
+        CHECK(h.metric(kSourcesPushMetric, "audit_unavailable") == 1);
+    }
+}
+
+TEST_CASE("capture-sources push: one attempted row precedes every dispatch, then one outcome per source",
+          "[echo][routes][capture-sources][audit]") {
+    EchoHarness h;
+    auto r = push(h, "process%3Don,tcp%3Doff");
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    CHECK(r->get_header_value("Sec-Audit-Failed").empty());
+    CHECK(r->body.find("2 change(s) pushed") != std::string::npos);
+
+    const std::vector<std::string> expected{
+        "audit:echo.sources.configure/attempted", "dispatch",
+        "audit:echo.sources.configure/dispatched", "dispatch",
+        "audit:echo.sources.configure/dispatched"};
+    CHECK(h.order == expected);
+
+    const auto* attempted = first_row(h, "attempted");
+    REQUIRE(attempted != nullptr);
+    CHECK(attempted->target_id == "dev-A");
+    CHECK(attempted->detail == "process_enabled=true tcp_enabled=false");
+    CHECK(attempted->principal == "alice");
+
+    const auto toast = toast_of(*r);
+    REQUIRE(toast.is_object());
+    CHECK(toast.at("level") == "success");
+    CHECK(toast.at("message") == "2 of 2 change(s) pushed");
+    CHECK(h.metric(kSourcesPushMetric, "pushed") == 1);
+}
+
+TEST_CASE("capture-sources push: outcome rows that are not stored still set the header once and proceed",
+          "[echo][routes][capture-sources][audit]") {
+    EchoHarness h;
+    h.audit_persists = [](const EchoHarness::AuditRow& row) { return row.result == "attempted"; };
+    auto r = push(h, "process%3Don,tcp%3Doff");
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    CHECK(r->get_header_value_count("Sec-Audit-Failed") == 1);
+    CHECK(h.dispatch_calls == 2); // both sources still dispatched
+}
+
+TEST_CASE("capture-sources push: a grant withdrawn during the audit wait dispatches nothing",
+          "[echo][routes][capture-sources][audit]") {
+    SECTION("Execute withdrawn") {
+        EchoHarness h;
+        h.audit_persists = [&h](const EchoHarness::AuditRow& row) {
+            if (row.result == "attempted")
+                h.allow_execute = false; // the grant goes while the row is being stored
+            return true;
+        };
+        auto r = push(h, "process%3Don");
+        REQUIRE(r);
+        CHECK(h.dispatch_calls == 0);
+        const auto* failure = first_row(h, "failure");
+        REQUIRE(failure != nullptr);
+        CHECK(failure->detail == "permission_revoked sent=0 process_enabled=true");
+        CHECK(r->body.find("<b>Execute</b>") != std::string::npos);
+        const auto toast = toast_of(*r);
+        REQUIRE(toast.is_object());
+        CHECK(toast.at("level") == "error");
+        CHECK(h.metric(kSourcesPushMetric, "permission_revoked") == 1);
+        CHECK(h.metric(kSourcesPushMetric, "pushed") == 0);
+    }
+    SECTION("Infrastructure:Read withdrawn: the gate's own 403 stands") {
+        EchoHarness h;
+        h.audit_persists = [&h](const EchoHarness::AuditRow& row) {
+            if (row.result == "attempted")
+                h.allow_read = false;
+            return true;
+        };
+        auto r = push(h, "process%3Don");
+        REQUIRE(r);
+        CHECK(r->status == 403);
+        CHECK(h.dispatch_calls == 0);
+        CHECK(first_row(h, "failure") != nullptr);
+        CHECK(h.metric(kSourcesPushMetric, "permission_revoked") == 1);
+    }
+}
+
+TEST_CASE("capture-sources push: permissions and caller are decided again before each source",
+          "[echo][routes][capture-sources][audit]") {
+    // Each outcome row is a wait in which a grant or the session can go, so the second source is
+    // dispatched on its own decision, not on the one taken for the first.
+    SECTION("Execute withdrawn between two sources stops the rest") {
+        EchoHarness h;
+        h.audit_persists = [&h](const EchoHarness::AuditRow& row) {
+            if (row.result == "dispatched")
+                h.allow_execute = false;
+            return true;
+        };
+        auto r = push(h, "process%3Don,tcp%3Doff");
+        REQUIRE(r);
+        CHECK(h.dispatch_calls == 1);
+        const std::vector<std::string> expected{
+            "audit:echo.sources.configure/attempted", "dispatch",
+            "audit:echo.sources.configure/dispatched", "audit:echo.sources.configure/failure"};
+        CHECK(h.order == expected);
+        const auto* failure = first_row(h, "failure");
+        REQUIRE(failure != nullptr);
+        CHECK(failure->detail == "permission_revoked sent=1 tcp_enabled=false");
+        const auto toast = toast_of(*r);
+        REQUIRE(toast.is_object());
+        CHECK(toast.at("level") == "error");
+        CHECK(toast.at("message").get<std::string>().find("1 of 2") != std::string::npos);
+        CHECK(r->body.find("<b>Execute</b>") != std::string::npos);
+        CHECK(r->body.find("data-applied=\"1\"") != std::string::npos);
+        CHECK(h.metric(kSourcesPushMetric, "permission_revoked") == 1);
+        CHECK(h.metric(kSourcesPushMetric, "pushed") == 0);
+    }
+    SECTION("a session withdrawn between two sources stops the rest, on the gate's own 403") {
+        EchoHarness h;
+        h.audit_persists = [&h](const EchoHarness::AuditRow& row) {
+            if (row.result == "dispatched") {
+                h.allow_read = false; // production: the scoped gate fails at its require_auth
+                h.session_user.clear(); // and the session no longer resolves at all
+            }
+            return true;
+        };
+        auto r = push(h, "process%3Don,tcp%3Doff");
+        REQUIRE(r);
+        CHECK(r->status == 403);
+        CHECK(r->body.empty()); // the gate's answer stands: the route adds no note of its own
+        CHECK(h.dispatch_calls == 1);
+        const auto* failure = first_row(h, "failure");
+        REQUIRE(failure != nullptr);
+        CHECK(failure->detail == "permission_revoked sent=1 tcp_enabled=false");
+        CHECK(failure->principal == "alice"); // the session is gone; the row still names its holder
+        CHECK(toast_of(*r).at("message").get<std::string>().find("1 of 2") != std::string::npos);
+    }
+    SECTION("the caller is derived again for the second source") {
+        EchoHarness h;
+        h.audit_persists = [&h](const EchoHarness::AuditRow& row) {
+            if (row.result == "dispatched")
+                h.session_user = "bob";
+            return true;
+        };
+        auto r = push(h, "process%3Don,tcp%3Doff");
+        REQUIRE(r);
+        CHECK(h.dispatch_calls == 2);
+        CHECK(h.last_dispatch_caller.principal == "bob");
+        REQUIRE(h.audit_log.size() == 3); // attempted, then one outcome row per source
+        CHECK(h.audit_log[1].principal == "alice");
+        CHECK(h.audit_log[2].principal == "bob");
+    }
+    SECTION("no agent reached and then Execute withdrawn counts as permission_revoked only") {
+        EchoHarness h;
+        h.dispatch_sent = 0; // the first source is dispatched and reaches no agent
+        h.audit_persists = [&h](const EchoHarness::AuditRow& row) {
+            if (row.result == "no_agents")
+                h.allow_execute = false;
+            return true;
+        };
+        auto r = push(h, "process%3Don,tcp%3Doff");
+        REQUIRE(r);
+        CHECK(h.dispatch_calls == 1);
+        const std::vector<std::string> expected{
+            "audit:echo.sources.configure/attempted", "dispatch",
+            "audit:echo.sources.configure/no_agents", "audit:echo.sources.configure/failure"};
+        CHECK(h.order == expected);
+        const auto* failure = first_row(h, "failure");
+        REQUIRE(failure != nullptr);
+        // The unreached source is in neither `sent=` nor the pairs: its `no_agents` row has it.
+        CHECK(failure->detail == "permission_revoked sent=0 tcp_enabled=false");
+        const auto toast = toast_of(*r);
+        REQUIRE(toast.is_object());
+        CHECK(toast.at("level") == "error");
+        CHECK(toast.at("message").get<std::string>().find("0 of 2") != std::string::npos);
+        CHECK(h.metric(kSourcesPushMetric, "permission_revoked") == 1);
+        for (const char* result : {"pushed", "none_applied", "audit_unavailable"})
+            CHECK(h.metric(kSourcesPushMetric, result) == 0);
+    }
+}
+
+TEST_CASE("capture-sources push: a request with no valid change writes no row and dispatches nothing",
+          "[echo][routes][capture-sources][audit]") {
+    EchoHarness h;
+    for (const char* changes : {"", "bogus%3Don", "process%3Dmaybe", "process", "registryx%3Doff"}) {
+        INFO("changes=" << changes);
+        auto r = push(h, changes);
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("0 change(s) pushed") != std::string::npos);
+    }
+    CHECK(h.audit_log.empty());
+    CHECK(h.dispatch_calls == 0);
+    for (const char* result : {"pushed", "none_applied", "audit_unavailable", "permission_revoked"})
+        CHECK(h.metric(kSourcesPushMetric, result) == 0);
+}
+
+TEST_CASE("capture-sources push: a repeated source keeps its last value and dispatches once",
+          "[echo][routes][capture-sources][audit]") {
+    EchoHarness h;
+    auto r = push(h, "process%3Don,process%3Doff");
+    REQUIRE(r);
+    CHECK(h.dispatch_calls == 1);
+    REQUIRE(h.last_dispatch_params.contains("process_enabled"));
+    CHECK(h.last_dispatch_params.at("process_enabled") == "false");
+    const auto* attempted = first_row(h, "attempted");
+    REQUIRE(attempted != nullptr);
+    CHECK(attempted->detail == "process_enabled=false"); // one pair, not two
+}
+
+TEST_CASE("capture-sources push: refusals before the attempted row write none and dispatch nothing",
+          "[echo][routes][capture-sources][audit]") {
+    SECTION("no Execute permission") {
+        EchoHarness h;
+        h.allow_execute = false;
+        auto r = push(h, "process%3Don");
+        REQUIRE(r);
+        CHECK(r->body.find("<b>Execute</b>") != std::string::npos);
+        CHECK(toast_of(*r).at("level") == "error");
+        CHECK(h.audit_log.empty());
+        CHECK(h.dispatch_calls == 0);
+    }
+    SECTION("scoped Read denied") {
+        EchoHarness h;
+        h.allow_read = false;
+        auto r = push(h, "process%3Don");
+        REQUIRE(r);
+        CHECK(r->status == 403);
+        CHECK(h.audit_log.empty());
+        CHECK(h.dispatch_calls == 0);
+    }
+    SECTION("no device") {
+        EchoHarness h;
+        auto r = h.sink.Post("/fragments/echo/capture-sources/push?changes=process%3Don", "");
+        REQUIRE(r);
+        CHECK(r->body.find("No device selected.") != std::string::npos);
+        CHECK(h.audit_log.empty());
+        CHECK(h.dispatch_calls == 0);
+    }
+    SECTION("dispatch unwired") {
+        EchoHarness h(/*wire_audit=*/true, /*wire_dispatch=*/false);
+        auto r = push(h, "process%3Don");
+        REQUIRE(r);
+        CHECK(r->body.find("dispatch is unavailable") != std::string::npos);
+        CHECK(toast_of(*r).at("level") == "error");
+        CHECK(h.audit_log.empty());
+        CHECK(h.dispatch_calls == 0);
+    }
+}
+
+TEST_CASE("capture-sources push: a device that no agent reached is reported as not pushed",
+          "[echo][routes][capture-sources][audit]") {
+    EchoHarness h;
+    h.dispatch_sent = 0;
+    auto r = push(h, "process%3Don");
+    REQUIRE(r);
+    CHECK(r->body.find("0 change(s) pushed") != std::string::npos);
+    const auto toast = toast_of(*r);
+    REQUIRE(toast.is_object());
+    CHECK(toast.at("level") == "error");
+    CHECK(toast.at("message") == "0 of 1 change(s) pushed");
+    CHECK(first_row(h, "no_agents") != nullptr);
+    CHECK(h.metric(kSourcesPushMetric, "none_applied") == 1);
+    CHECK(h.write_probes == 0); // the cause is read from the dispatch outcome, never probed
+}
+
+TEST_CASE("capture-sources push: a chokepoint refusal is a dispatch_denied failure and stops the batch",
+          "[echo][routes][capture-sources][audit]") {
+    using Reason = yuzu::server::detail::DispatchDenialReason;
+    EchoHarness h;
+    int status = 403;
+    SECTION("approval_required answers 403") { h.dispatch_denied = Reason::ApprovalRequired; }
+    SECTION("unclassified is a server catalogue fault: 500") {
+        h.dispatch_denied = Reason::Unclassified;
+        status = 500;
+    }
+    const std::string token{yuzu::server::detail::to_string(*h.dispatch_denied)};
+    auto r = push(h, "process%3Don,tcp%3Doff");
+    REQUIRE(r);
+    CHECK(r->status == status);
+    const std::vector<std::string> expected{"audit:echo.sources.configure/attempted", "dispatch",
+                                            "audit:echo.sources.configure/failure"};
+    CHECK(h.order == expected); // the second source is never tried
+    CHECK(first_row(h, "no_agents") == nullptr); // not folded into an unreached agent
+    const auto* failure = first_row(h, "failure");
+    REQUIRE(failure != nullptr);
+    CHECK(failure->detail ==
+          "dispatch_denied reason=" + token + " sent=0 process_enabled=true tcp_enabled=false");
+    const auto toast = toast_of(*r);
+    REQUIRE(toast.is_object());
+    CHECK(toast.at("level") == "error");
+    CHECK(toast.at("message").get<std::string>().find("Not permitted: " + token) !=
+          std::string::npos);
+    CHECK(h.metric(kSourcesPushMetric, "dispatch_denied") == 1);
+    for (const char* result : {"pushed", "none_applied", "permission_revoked"})
+        CHECK(h.metric(kSourcesPushMetric, result) == 0);
+}
+
+TEST_CASE("capture-sources push: a dispatch that throws leaves a failure row and stops the batch",
+          "[echo][routes][capture-sources][audit]") {
+    EchoHarness h;
+    h.dispatch_throws = true;
+    std::unique_ptr<httplib::Response> r;
+    CHECK_NOTHROW(r = push(h, "process%3Don,tcp%3Doff"));
+    REQUIRE(r);
+    CHECK(r->status == 500);
+    CHECK(h.dispatch_calls == 1);
+    const auto* failure = first_row(h, "failure");
+    REQUIRE(failure != nullptr);
+    CHECK(failure->detail == "dispatch_exception sent=0 process_enabled=true tcp_enabled=false");
+    CHECK(toast_of(*r).at("level") == "error");
+    CHECK(h.metric(kSourcesPushMetric, "dispatch_exception") == 1);
+    CHECK(h.metric(kSourcesPushMetric, "none_applied") == 0);
+}
+
+TEST_CASE("capture-sources push: a failure on the second of three sources reports what was sent",
+          "[echo][routes][capture-sources][audit]") {
+    using Reason = yuzu::server::detail::DispatchDenialReason;
+    EchoHarness h;
+    // Armed when the first source's outcome row is written, so the fault meets the second source.
+    std::function<void()> arm;
+    h.audit_persists = [&arm](const EchoHarness::AuditRow& row) {
+        if (row.result == "dispatched")
+            arm();
+        return true;
+    };
+    int status = 500;
+    int dispatches = 2;
+    std::string token = "dispatch_exception";
+    std::string message = "The push failed part-way: 1 of 3 change(s) were sent and the rest may "
+                          "not have been. Reload the sources before pushing again.";
+    SECTION("the dispatch throws") { arm = [&h] { h.dispatch_throws = true; }; }
+    SECTION("the dispatch throws something that is not a std exception") {
+        arm = [&h] { h.dispatch_throws_other = true; };
+    }
+    SECTION("deriving the caller throws: that source is never dispatched") {
+        arm = [&h] { h.caller_throws = true; };
+        dispatches = 1;
+    }
+    SECTION("the chokepoint refuses") {
+        arm = [&h] { h.dispatch_denied = Reason::ApprovalRequired; };
+        status = 403;
+        token = "dispatch_denied reason=approval_required";
+        message =
+            "Not permitted: approval_required. 1 of 3 change(s) were sent, the rest were not.";
+    }
+    std::unique_ptr<httplib::Response> r;
+    CHECK_NOTHROW(r = push(h, "process%3Don,tcp%3Doff,service%3Don"));
+    REQUIRE(r);
+    CHECK(r->status == status);
+    CHECK(h.dispatch_calls == dispatches); // the third source is never tried
+    REQUIRE(h.audit_log.size() == 3);      // attempted, the first source's outcome, the failure
+    const auto& failure = h.audit_log.back();
+    CHECK(failure.result == "failure");
+    CHECK(failure.detail == token + " sent=1 tcp_enabled=false service_enabled=true");
+    CHECK(failure.principal == "alice");
+    const auto toast = toast_of(*r);
+    REQUIRE(toast.is_object());
+    CHECK(toast.at("level") == "error");
+    CHECK(toast.at("message").get<std::string>() == message);
+    const std::string counted = status == 403 ? "dispatch_denied" : "dispatch_exception";
+    for (const char* result : {"pushed", "none_applied", "audit_unavailable", "permission_revoked",
+                               "dispatch_denied", "dispatch_exception"})
+        CHECK(h.metric(kSourcesPushMetric, result) == (counted == result ? 1 : 0));
+}
+
+TEST_CASE("capture-sources push: every result series exists before the first push",
+          "[echo][routes][capture-sources][metrics]") {
+    EchoHarness h; // set_metrics has run; h.metric() is not used: it creates what it reads
+    const auto text = h.metrics.serialize();
+    for (const char* result : {"pushed", "none_applied", "audit_unavailable", "permission_revoked",
+                               "dispatch_denied", "dispatch_exception"})
+        CHECK(text.find(std::string("yuzu_echo_sources_push_total{result=") + '"' + result + '"' +
+                        "}") != std::string::npos);
 }

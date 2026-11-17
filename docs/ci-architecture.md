@@ -339,10 +339,11 @@ the gate drives a headless browser against the running dashboard: it crawls ever
 links to (200, the `Content-Security-Policy` header, no page error, `console.error` or HTTP status of 400 or more), cross-checks the
 discovered routes against `EXPECTED`, a hand-copied list of the nav in `app_shell.cpp`, in both
 directions, checks that submit controls stay inside their form or dialog at two viewport sizes,
-and runs eight scenarios (five that each force their own precondition, with writes answered by a
+and runs nine scenarios (five that each force their own precondition, with writes answered by a
 request stub in the browser so nothing reaches the server; the DEX Apps tab: a live keyboard half
 plus a committed golden page served through a GET stub; a held Apps response superseded by Overview;
-and the DEX controls operated from the keyboard). The gate first runs
+the DEX controls operated from the keyboard; and the Find software panel on `/software`: live
+searches plus Load more served through a GET stub). The gate first runs
 `ui-smoke.mjs --selftest`, which checks against a local fixture (no stack) that each crawl and
 layout check fails when it should, and that the Apps expander check fails on the committed golden when
 its `:has()` rules are removed; a selftest failure fails the gate.
@@ -708,12 +709,30 @@ runs that suite, "Test suites by leg" below), so the ratchet is enforced on the 
 `Linux gcc-15 debug` leg without depending on the advisory job. A PR that changes only `docs/**` or root `*.md` builds nothing (see "Docs-only changes"),
 but it cannot touch `content/` or the baseline, which are classified as code.
 
+### Execution owner key tripwire and self-test (`docs` suite + `docs-lint.yml`, #5557)
+
+`tests/test_execution_owner_key_tripwire.py` is a best-effort lexical check, not a control-flow
+proof, that execution admission is keyed on the owner key and that neither list gate hands a
+service-scoped session unrestricted authority; its self-test
+(`tests/test_execution_owner_key_tripwire_selftest.py`) mutates the server sources in memory and
+proves each mutation is caught. The tripwire runs as a step of the `changelog-order` job (check
+name "CHANGELOG order", the required one). The self-test costs about half a minute of CPU, more on
+a hosted runner, so it is its own job, `execution-owner-key-selftest` (check name "Execution owner
+key tripwire self-test"), which keeps it out of the required check's five minute budget. That job
+is **advisory**: the workflow's own header names only "CHANGELOG order" as required, and the
+repository owner may add the job to branch protection. Both tests are also registered in
+`tests/meson.build` (suite `docs`), and the `linux` job of `ci.yml` lists `--suite docs`, so the
+self-test still gates on the required `Linux gcc-15 debug` leg without depending on the advisory
+job. A red self-test job means a frozen set no longer matches or a mutation went undetected; it is
+fixed by reviewing the edit, not by re-running the job.
+
 ### ClusterFuzzLite (`cflite-pr.yml` + `cflite-batch.yml`)
 
 PR-scoped libFuzzer fuzzing of the untrusted-input parsers (target
 inventory: `.clusterfuzzlite/README.md`). Not a required status check, and
-deliberately path-gated to the fuzzed compile closure — six parser families
-under `server/core/src/` plus `tests/fuzz/` and `.clusterfuzzlite/` — so
+deliberately path-gated to the fuzzed compile closure — seven parser families
+(six under `server/core/src/`, the component_inventory ZIP reader under
+`agents/plugins/component_inventory/src/`) plus `tests/fuzz/` and `.clusterfuzzlite/` — so
 "why did the fuzz check not run on my PR" is almost always "the PR touches
 nothing a harness compiles". The two workflows share one paths list;
 KEEP-IN-SYNC banners in both plus `.clusterfuzzlite/build.sh` bind them.
@@ -1141,8 +1160,11 @@ tooling, not a CI gate (the CI coverage job is `nightly.yml`'s, with its own gco
 invocation). Its behaviour (build-dir lock, inconclusive runs, DB-write handling, the
 Linux-only refusal, option and baseline validation) is pinned by the mock-based harness
 `tests/shell/test_pr2_gates.sh`. Preflight's "Shell gate tests" step runs the fast
-scenarios only, `CH-18 CH-20 CH-21 CH-22 CH-24` (about 25 s; bash, python3 with sqlite3, procps
-and findutils, all on the hosted image; the fixtures stub `ps`, `find` and `ln`). The
+scenarios only, `CH-6 CH-18 CH-20 CH-21 CH-22 CH-24 CH-25 CH-26` (bash, python3 with sqlite3, procps
+and findutils, all on the hosted image). CH-6/CH-25 check performance parser,
+requested-scale and evidence-write verdicts. CH-26 captures coverage at two real
+Git revisions and again at the same revision, retaining distinct evidence identities.
+The coverage fixtures stub disk space as well as `ps`, `find` and `ln`, so host capacity cannot change the expected result. The
 slow scenarios (`CH-19`, the process-tree kill, about 2.5 minutes; `CH-23`, signal bursts,
 about 35 s) and the rest of the harness are not in CI yet; wiring them into a nightly job,
 and hardening them for the shared-identity runner pools, is #6116.
@@ -2938,9 +2960,144 @@ and the names in `tests/test_gateway_test_summary.py` (and the shard count in
 `docs/rhel9-build-setup.md`),
 delete the `NoCover` wrapper from the config script, and delete `gateway ct`'s
 priority; each of the three is separable.
-*Samples.* To be recorded here after the change's own runs.
+*Samples (measured, 2026-11-13 to -14).* Three same-SHA samples per leg on the
+PR #7703 head `f17fcc7c26`, run 43456524845 (Linux attempts 1, 2 and 4, jobs
+131992161922, 132062790009, 132464908320; Windows attempts 1, 3 and 5, jobs
+131992161930, 132075575242, 132467714240). Every gateway entry passed on its
+first attempt in all six.
+
+| Leg | Shard A (s) | Shard B (s) | Shard C (s) | `gateway ct` (s) | non-pg half (s) |
+|---|---|---|---|---|---|
+| Linux | 100, 98, 103 | 107, 103, 113 | 130, 127, 109 | 143, 145, 142 | 411, 401, 394 |
+| Windows | 154, 155, 154 | 149, 152, 145 | 170, 170, 165 | 48, 49, 48 | — |
+
+The cheap-suites invocation's wall is not printed on its own (the half's log is
+written at its end); taking the non-pg half less the server-shard invocation
+(about 95 s to 110 s at two workers, from its entries' durations) gives about
+290 s to 300 s in each Linux sample, against the 362 s to 375 s baseline: rule
+(a) holds (about 19%), and the non-pg half fell from about 480 s to 394 s to
+411 s. Rule (c): the longest shard is 130 s on Linux (22% of its 600 s meson
+timeout) and 170 s on Windows (31% of the wrapper's 540 s deadline). Not
+checked from CI: rule (b) entry by entry, and the EUnit test count (a green run
+uploads no test logs, and meson's summary shows each shard passing, not its
+count); the 2807 is from the local cover-off run. The Windows job took 7.6 to
+10.3 min; its barrier wait is not measured separately.
+
+### Contract migration evidence
+
+The Linux gcc-15 debug leg enables `build_contract_tests` in the dedicated
+`build-linux-contracts-gcc15-debug` directory and runs all six registered
+migration pilots after the regular suites, under the same three-slot
+Big Tam admission limit. PostgreSQL contracts use
+the job's test database; gateway and plugin contracts retain their native
+reports. The collector's default portable bundle is uploaded after success or
+failure with the GitHub run ID and attempt in its artifact name, retained for
+30 days. Raw local inputs are excluded from that upload. A failed contract
+fails the step; its evidence does not replace the regular suite verdicts.
+See `docs/testing/contract-evidence.md` for the obligations and bundle format.
+
+The step compiles the pilots' build targets (the union of `build_targets` in
+`tests/contracts/pilots.json`) at the leg's full `YUZU_BUILD_JOBS` width
+**before** it takes a slot, then runs the collector inside the slot; the
+collector's own `meson compile -j 2` finds nothing to do. Before this, that
+compile ran inside the slot at two jobs: across the 20 gcc-15 debug jobs of
+2026-11-15 and -16 the step took 6 to 50 min (slot wait included), and in one
+sampled run the build was 996 s and the six pilots ran in 26 s, all while
+holding one of the three slots the Linux test step also needs. A compile error
+in the precompile is a warning only: the collector repeats the build and
+records the failure in its evidence. A precompile that runs past the job's
+90-minute limit cancels the job, which uploads no bundle, as a slow collector
+build could before. The Configure step sets `CCACHE_NOHASHDIR=1` for this leg
+only: ccache otherwise hashes the working directory for a `-g` compile, so the
+contract build directory never reused the standard build's objects (the two
+directories' compile commands are identical). The cost is debug info only: an
+object's recorded compile directory may name the other build directory, or,
+for a source compiled with no workspace-specific flag, another runner's
+workspace, and nothing in this leg reads it. The step prints the precompile's
+wall time with its own ccache hit and miss counts (from a per-step stats log,
+since the cache's global counters mix all four runners), and the collector's
+time including its slot wait. The contract build's compiles, previously ccache
+misses, now mostly hit, so the job's overall ccache hit rate is not comparable
+with earlier runs. Each runner compiles each source cold once under the new
+cache keys, in whichever directory compiles it first: the standard build is
+incremental, so on a runner whose standard build directory survived, the
+contract precompile pays it (on 2026-11-16, 393 s with 1% hits on linux-0's
+first run, then 5 s with 100%). Most sources are compiled with include paths that name the
+runner's own workspace, so the runners share few of these entries.
+
+The collector's build-directory lease is an OS lock (`flock`, or
+`msvcrt.locking` on Windows) on `.contract-evidence.lease` in the contract
+build directory, so it ends with the collector however the collector ends. The
+earlier lease was a directory, `.contract-evidence-lock`, which a cancelled job
+could leave behind in this uncleaned workspace; every later contract run on
+that runner then failed within seconds until a branch-switch wipe removed it
+(#7986). A leftover directory of that name is inert and can be deleted. A
+`BuildDirectoryBusy` now means a live collector holds the lease, and clears
+once it exits. When a run ends in ERROR, the step log prints the exception
+type, a fixed explanation for a known type, and which error fields the
+manifest recorded, for example `contract-evidence: ERROR (BuildDirectoryBusy:
+a live collector holds .contract-evidence.lease; retry after it exits);
+recorded: error; error text stays in the private capture`. The portable
+bundle carries the type and the field names, as `error_kind` and
+`error_fields`. The error text
+itself stays in the private capture on the runner, because it can carry
+values derived from the environment.
 
 ### Persistent runner-local test history
+
+The local `/test` recorder now uses schema v4. `test_gates` remains the latest
+observation for each run/gate, while `test_gate_attempts` appends every recorded
+write in the same transaction. An observation is not necessarily a fresh test
+execution: repeated reporting also creates an entry. `--latest` shows repeated
+gate history and JSON exports include `gate_attempts`. Migration preserves each
+surviving v3 gate with an unknown recording time; it cannot reconstruct results
+already overwritten by older clients.
+
+**Compatibility and rollback:** schema v4 is a one-way local test-history
+migration, not a product database migration. Older v3 recorders reject v4;
+older `/test` preflight checks fail, and nonblocking CI telemetry may warn and
+skip recording. Before the first upgrade, take a consistent SQLite backup
+(using SQLite's backup API or `.backup`, not a lone copy of a live WAL-mode
+file). When switching to an older checkout, set `YUZU_TEST_DB` to a separate
+v3 database. To restore pre-upgrade history instead, stop its writers, retain
+the v4 database and its logs separately, and restore the pre-upgrade backup;
+there is no in-place downgrade or automatic merge of later v4 observations.
+The newer recorder can still read and migrate the retained v3 history.
+
+Finalization keeps earlier gate FAIL/ABORTED/WARN evidence, treats unfinished gates or
+an empty run as ABORTED, and reports an all-skipped run as SKIP. An explicit
+`run-finish --status` can worsen the result but cannot improve it; its floor
+survives refinalization and late gate observations. A late observation reopens
+the run until it is finalized again. Manual run IDs keep their original source
+identity and start time; writes from another revision require a new run ID.
+An ABORTED observation remains ABORTED after a later PASS; an ordinary
+RUNNING → PASS transition completes the gate. For hand-run coverage captures,
+`bash scripts/test/coverage-gate.sh --capture-baselines` generates a fresh
+`manual-<UUID>` when `--run-id` is omitted. This preserves separate captures on
+the same revision as well as across revisions.
+The recorder still cannot detect a required gate that was never recorded: a
+declared execution plan is future work. Metrics/timings still replace values,
+and preserving a log path does not preserve overwritten log bytes.
+
+The gateway's Meson, local, `/test` and release EUnit entrypoints share strict
+summary grading: nonzero exits, cancellation, failed summaries and zero executed
+tests fail. The old `cancel-tolerant` CLI spelling remains a strict compatibility
+alias. The wrapper retains its deadline after output EOF and shares one budget
+across retries/backoff, leaving separate bounded cleanup headroom. This does not
+yet establish a complete per-case execution inventory.
+
+The Instructions gate requires terminal SUCCESS from every agent counted in an
+untargeted dispatch's `agents_reached`, reads response pages, validates command
+and agent identities, and rejects any failure or malformed/incomplete evidence.
+Earlier RUNNING chunks are allowed when that agent has terminal success. The
+opt-in destructive/forensic path retains its separate stricter grading. These
+checks establish reported execution success, not action-specific postconditions.
+
+The performance gate remains measure-only: thresholds are not enforced. A failed
+requested perf/scale process, missing metrics from either requested suite, or a
+failed evidence write cannot produce PASS. Workflow shell tests select actual
+YAML `jobs.*.steps` entries using the already-required PyYAML dependency; missing
+or ambiguous selectors and step-shaped text inside script literals are refused.
 
 Every self-hosted runner agent owns a separate `test-runs.db` outside its
 checkout. Big Tam stores it below that agent's registered tool cache at
@@ -2952,7 +3109,7 @@ deliberately per-agent rather than per-host: telemetry must not introduce a
 shared SQLite writer lock between the four jobs whose contention it measures.
 
 The Linux and Windows jobs in `ci.yml` call `scripts/ci/ci-telemetry.py` near
-job start and from an `always()` finalizer. Schema v3 records GitHub run attempt,
+job start and from an `always()` finalizer. Schema v4 retains the v3 GitHub run attempt,
 job/platform/runner, commit/branch/event, conclusion and wall time, ccache ratio,
 each Meson test entry's result/duration/timeout, and any listed flake recovered
 by `flake-retry`. A cancelled job normally finalizes as `cancelled`; a hard kill
@@ -3103,8 +3260,8 @@ Which contexts are required is a repository ruleset setting ("Protect Main",
 
 The meson `docs` suite is OS-independent (lexical gates, selftests, lint
 tests) and runs on the **Linux leg only**. Its "runs on every leg" premise was
-false at the test-file level: nine entries pin OS-specific behaviour inside the
-test file or script itself, not behind a meson guard. Those nine carry the
+false at the test-file level: platform entries pin OS-specific behaviour inside
+the test file or script itself, not behind a meson guard. Twelve entries now carry the
 `platform` suite instead, which every leg runs (except where an entry is not
 registered: since ADR-0035 ladder step 1 the Windows and macOS legs configure
 agent-only (the `server` option is off for a non-Linux target), so a `build_server`-gated entry runs on Linux only):
@@ -3114,6 +3271,9 @@ agent-only (the `server` option is off for a non-Linux target), so a `build_serv
 | `gateway build wrapper` | the Windows-only taskkill case and win32 branches in `tests/test_build_gateway.py`; its POSIX stdio and Ctrl-C behaviour must also keep running on Linux |
 | `gateway OTP pin resolution` | pins the `erl.exe` resolution that `scripts/erlang_toolchain.py` branches on for win32 (`tests/test_erlang_toolchain_otp.py`) |
 | `instructions runner hardening` | `WindowsConsoleBreak` (win32) next to about two thousand lines of POSIX tests |
+| `gateway wrapper guard selftest` | exercises the real wrapper subprocess, native exit/status handling and diagnostic captures on each OS, including Windows pipe decoding |
+| `contract evidence selftest` | exercises subprocess deadlines, child cleanup and native-path evidence handling; Windows task-tree termination and POSIX signals need separate observations |
+| `local test runner platform selftest` | drives bash with native fixture paths (MSYS2 `cygpath` on Windows), UTF-8 output and the per-OS supported target selection |
 | `windows sdk contract` | exercises the MSYS2 bash setup contract on win32 |
 | `Windows toolchain contract` | registered only where `pwsh` is installed (not the Linux image) |
 | `build_examples=false gating smoke test` | selects the per-OS vcpkg triplet with `uname -s` and configures a real build on each leg |

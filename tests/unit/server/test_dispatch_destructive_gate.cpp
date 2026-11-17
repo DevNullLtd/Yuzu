@@ -53,6 +53,7 @@
 #include "capability_decls/plugin_action_catalogue_update_source_trust.hpp"
 #include "capability_decls/plugin_action_catalogue_app_control.hpp"
 #include "capability_decls/plugin_action_catalogue_firmware_posture.hpp"
+#include "capability_decls/plugin_action_catalogue_component_inventory.hpp"
 #include "capability_decls/plugin_action_catalogue_runtimes.hpp"
 #include "capability_decls/plugin_action_catalogue_platform_security.hpp"
 #include "capability_decls/plugin_action_catalogue_browser_inventory.hpp"
@@ -649,7 +650,7 @@ TEST_CASE("catalogue-consistency tripwire: the live Destructive row count is 21,
           "[server][dispatch][security]") {
     namespace capdecls = yuzu::server::capdecls;
 
-    const std::array<std::span<const CommandCapability>, 29> sources{{
+    const std::array<std::span<const CommandCapability>, 30> sources{{
         capdecls::plugin_action_catalogue_content_dist(),
         capdecls::plugin_action_catalogue_a(),
         capdecls::plugin_action_catalogue_b(),
@@ -668,6 +669,7 @@ TEST_CASE("catalogue-consistency tripwire: the live Destructive row count is 21,
         capdecls::plugin_action_catalogue_update_source_trust(),
         capdecls::plugin_action_catalogue_app_control(),
         capdecls::plugin_action_catalogue_firmware_posture(),
+        capdecls::plugin_action_catalogue_component_inventory(),
         capdecls::plugin_action_catalogue_runtimes(),
         capdecls::plugin_action_catalogue_platform_security(),
         capdecls::plugin_action_catalogue_browser_inventory(),
@@ -702,7 +704,9 @@ TEST_CASE("catalogue-consistency tripwire: the live Destructive row count is 21,
     // comment above) rather than carried forward unchecked — a FUTURE
     // Destructive row in any fragment must land with the aggregate tripwire
     // still passing, which is exactly the drift this test's own title
-    // forbids. (19 + registry.delete_user_value and registry.apply, registry 2.1.0.)
+    // forbids. (19 + registry.delete_user_value and registry.apply, registry 2.1.0,
+    // + firewall.quarantine, firewall 1.0.0; minus the removed containment plugin's
+    // Destructive row (PRQ.2).)
     CHECK(destructive_count == 21);
     // D4's rationale (dispatch_destructive_gate.hpp doc comment): exactly
     // the four Execution:Execute rows rely on the chokepoint's
@@ -736,6 +740,7 @@ TEST_CASE("catalogue-consistency tripwire: the live Destructive row count is 21,
         capdecls::plugin_action_catalogue_update_source_trust(),
         capdecls::plugin_action_catalogue_app_control(),
         capdecls::plugin_action_catalogue_firmware_posture(),
+        capdecls::plugin_action_catalogue_component_inventory(),
         capdecls::plugin_action_catalogue_runtimes(),
         capdecls::plugin_action_catalogue_platform_security(),
         capdecls::plugin_action_catalogue_browser_inventory(),

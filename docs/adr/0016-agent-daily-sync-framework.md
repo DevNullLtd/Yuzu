@@ -5,7 +5,8 @@
 **Component:** Agent core (sync scheduler) · Server (inventory ingest + Postgres store) · Gateway (proxy)
 **Authors:** Dave Rae
 
-> **Amendment pending: ADR-3006 (plugin management, proposed 2026-10-06).** ADR-3006 sets
+> **Amendment pending delivery: ADR-3006 (plugin management, 2026-10-06; accepted, status
+> reconciled 2026-11-14).** ADR-3006 sets
 > the direction that `--inventory-disable` stops being the collection toggle: it becomes a
 > one-time starting-state input that the server adopts as a visible off-rule, and each daily-sync
 > source becomes a unit that can be switched off on its own. Nothing has changed in the product
@@ -155,7 +156,7 @@ envelope, so it is the natural **baseline store for the whole sync framework**
 (many data types will sync — not just software).
 
 Therefore we **coexist, not replace**:
-- Keep the generic `InventoryStore` (SQLite today) **untouched** — the
+- Keep the generic `InventoryStore` (SQLite at the time; Postgres-native since ADR-0037) **untouched** — the
   sync-framework baseline + the scope/eval surface. (Porting it to Postgres
   under the sync framework is a follow-on, aligned with ADR-0006.)
 - Add a **new born-on-Postgres `SoftwareInventoryStore`** (schema
@@ -1806,6 +1807,113 @@ routes accept a `vers:` range. No schema change: the `purl` column and its parti
 - **Export width.** The maximum-width installs export is now 23 columns with a `purl` of up to
   2048 bytes, about 245 MB per request by the same cap arithmetic as above (22 x 1024 + 2048
   bytes, 10,000 rows).
+
+### 2026-11-14 — the host, change-feed, summary and plugin-health read surface
+
+Five REST v1 reads over the typed installed-software store, all `Inventory:Read` through the fleet-read gate as the sole authority, all audited per page, all `503` with a retry hint on a degraded read and never an empty `200` (§7):
+
+- `GET /api/v1/inventory/software/hosts` and `/hosts/{agent_id}`: reporting devices ordered by `agent_id`, each with its facet state rows. The host detail answers an unknown device, a device that has never reported and a device outside the caller's scope with the same `404`, decided before any store read for the out-of-scope case, so the response does not say whether a device outside the scope exists.
+- `GET /api/v1/inventory/software/changes`: the change ledger, scoped on every page.
+- `GET /api/v1/inventory/software/summary` and `/plugin-health`: fleet aggregates.
+
+**Settle window and feed order.** The feed publishes a row only once its `observed_at` is more than 60 seconds old (`stable_before` = now minus 60 seconds, returned in the response) and is ordered `(observed_at, change_id)`; the keyset anchor is that pair taken from the last row served. `change_id` is assigned at insert and `observed_at` is the writing replica's clock, so a `change_id`-only anchor could step over a lower id that becomes visible later. The cursor is bound to `since`, `agent_id` and `kind` but not to `stable_before` (which moves on every request), so it stays valid on the next request.
+
+**Lateness contract (decided, not a defect).** There is no watermark. A row that commits more than 60 seconds after its own `observed_at` lands behind a cursor that has already passed it and is not delivered to a consumer walking forward. Recovery is a re-read with `since`, de-duplicating on `change_id`. Ruled at the plan gate in preference to a watermark. Nothing yet counts rows that breach the window; that measurement is tracked by #7766, and the window or a watermark is revisited from it.
+
+**Known limits (tracked, not defects).** The hosts `q` search matches the device roster (seen in the last 30 days, the newest 100,000), so a roster cut at the cap is served with `roster_truncated` and `roster_cap` and a device quiet for over 30 days is listed with a null hostname and not matched; matching agent ids in the store is #7790. For a caller confined to more than 10,000 devices the change feed continues on the shared wide-scope cursor (last row served plus a count of passed-over rows, refused above 100,000 as a `400`), so a row deleted inside the passed-over span between two pages can make the next page skip a row; recovery is a re-read from an earlier `since`, de-duplicating on `change_id`, and the replacement is #7789.
+
+**Snapshot and confinement rule.** The summary and plugin-health figures for an unconfined caller come from one in-memory fleet snapshot, recomputed by the catalogue rollup thread on its hourly tick; a failed recompute publishes nothing and the last good snapshot stays, and the same tick sets the `yuzu_software_facet_*` gauges. The snapshot is fleet-wide and is therefore served ONLY to a caller whose scope is unconfined. A confined caller is never given a figure derived from the snapshot: with up to 10,000 visible devices the figure is computed live over exactly those devices, with the scope pushed into the query; with more, the blocks are `null` with `omitted` of `scope`. A block whose input is absent renders `null` with `omitted` of `scope` or `building`, never zeros. The catalogue block is the fleet rollup's own figure and is given to unconfined callers only.
+
+**Dropped from the earlier read-model plan, with reasons.**
+
+- Tombstones for removed packages: dropped. A removal is already a hard delete plus a `remove` ledger row carrying the name, publisher and version, so no read needs a `removed_at` filter and the change feed is the record of removals.
+- Reading the reserved slot 14 (`uninstall_string`): dropped. The slot stays reserved and empty in the v3 record (#5186), stays in the hash as an empty slot, and no read exposes it; nothing in the host or feed views needs it.
+- A separate freshness field per row: dropped. The row `status` (`current`, `unconfirmed`, `disabled`) and `last_confirmed_at`, derived from the facet state, already say how fresh a row is, and the hosts read exposes both per facet.
+- Device record fields on the host rows (OS, serial, system UUID, MAC addresses, agent version): dropped. A host row carries `agent_id`, the roster `hostname`, `last_seen` and the facet states, the same hostname join the lookup rows use. The full device record is served by the hardware list under the behavioural-PII access audit (`emit_behavioral_audit`), while these five routes audit set-and-proceed, so joining those fields here would change this route's audit contract and data tier, which this change neither planned nor reviewed. The runbook sends the operator to `GET /api/v1/devices/{id}` for the OS and the agent version. Which fields belong on a host row is tracked by #7784.
+- A `scope` parameter on the hosts list: dropped as unbacked, the same ruling that leaves `scope=expr` off the installs route; nothing in this read model resolves a scope expression. The hosts list reads `q`, `last_synced_before`, `limit` and `cursor` only, and the caller's gate scope is applied on every page, so a request cannot widen or narrow it.
+
+The MCP twins of the five routes are not part of this change (#7765).
+
+### 2026-11-16 — delivery of the collection settings to agents (`__sync__.settings`)
+
+This closes the hard requirement of the 2026-11-05 Update: the stored settings now reach the agent and change
+what it does. No proto field is added; the document and its version are entries in the command's existing string
+`parameters` map. The server is built and deployed first, then the agents; the contract below is the only one, and
+neither end carries handling for a peer that predates it.
+
+- **Delivery.** The heartbeat is the only trigger; there is no push when a document is saved and no background
+  job. The agent reports `yuzu.inv_settings_version` (the applied version, or the literal `none`) in its status
+  tags. The server accepts only that shape (`none` or 64 lower-case hex), resolves the effective settings for the
+  agent and, when the versions differ, sends one command. A `none` agent whose effective settings are the built-in
+  fleet default is left alone. The server's copy of the stored settings (documents, group tree, kill switches) is
+  re-read when older than 60 seconds (`kSnapshotTtlSecs`); an agent's group membership when older than 600 seconds
+  (`kMembershipTtlSecs`); the same version is not sent to one agent again inside 300 seconds
+  (`kMinRepushGapSecs`), while a changed version is sent at once. All server state is in memory and rebuilt from
+  heartbeats, so a restart loses nothing.
+- **The command.** Plugin `__sync__`, action `settings`, parameters `version` and `document`. The command id is
+  `__sync__-settings-<epoch seconds>-<16 hex characters>`. It is a system-reserved push (the Guardian-push shape:
+  `build_classified_command` with the system caller, `send_system_reserved`, then `forward_gateway_pending`), not
+  a `dispatch_confined` dispatch, because `__sync__` is a protocol name and no agent advertises it as a plugin.
+  No RBAC principal is consulted and the containment gate is bypassed like the other system-reserved pushes; it
+  is counted as `yuzu_server_system_reserved_push_total{capability="__sync__.settings"}`, the fifth member of that
+  closed set.
+- **The document.** Text, every line ended by `\n`, in exactly this order: `v1`; `interval=<seconds>`;
+  `window=<start_min>-<end_min>` or `window=none`; `tz=<IANA name or empty>`; then one
+  `plugin.<name>=0|1` line per collector in ascending name order. The version is the SHA-256 of that text
+  (lower-case hex). It is the effective version of the 2026-11-05 Update, so the server resolves, renders and
+  hashes in one place and the agent recomputes the hash over what it received. Two golden vectors are asserted in
+  both the server and the agent suites: every collector on with a one-day interval, no window and no zone
+  (`666dcf4bcd68fb46f953c27319ea5711cb71023ead925bcd1531a1510f329431`), and the same document with
+  `plugin.installed_apps=0` (`99e0dc3e698549c6cb149543982d0753c6401cbbd5408c29c060d767b3724561`), so a drift on
+  either side fails a test on that side.
+- **Registered apps and the kill switch.** The resolved document keeps `installed_apps` on unless that collector
+  is kill-switched, and the server alone does that: the agent applies every `plugin.<name>` value as sent and
+  adds no override, so a kill switch stops collection on the machine while the agent reports the version it
+  really applied.
+- **Agent refusals.** The agent applies nothing and answers FAILURE exit 2 with a reason when: a parameter is
+  missing; the document is over 4096 bytes, empty or not newline-terminated; the version is not 64 lower-case hex
+  characters; the first four lines are not `v1`, `interval=`, `window=` and `tz=` in place; the interval is not a
+  plain integer from 3600 to 604800; a window is not `<start>-<end>` with `0 <= start < end <= 1440`, or is set
+  with an interval that is not a whole number of days; the zone is over 64 bytes or has a character outside
+  letters, digits, `_`, `/`, `+` and `-`; a plugin line is malformed, has an invalid name, a value other than 0 or
+  1, is repeated or is out of order; one of the six collectors the server can switch has no line; or the version
+  is not the SHA-256 of the document. Names the agent does not know are accepted and stored. It answers FAILURE
+  exit 1, also changing nothing, when a KV write fails. Otherwise SUCCESS `applied|<version>`. Whether daily sync
+  is running is not a refusal: with no scheduler (`--inventory-disable`, or the scheduler of a new connection is
+  not yet published) a valid document is still persisted, held and reported in the version tag, and a scheduler
+  started later runs on it, so the server does not send it again.
+- **Persistence and restart.** The agent writes the document to the `__sync__` KV key `settings.document` and
+  then the version to `settings.version`, and only then makes the settings live. A crash between the two writes
+  leaves a pair whose hash does not match. At start-up the pair is read back and validated exactly like a live
+  command: a valid pair is applied before the scheduler exists, so the first tick already runs on it; an absent
+  pair is the default; an invalid pair is discarded, the tag reads `none` and the server sends the document
+  again. A KV failure leaves the previous settings live. A reconnect keeps the applied settings.
+- **Application.** The scheduler takes the interval and window for the `installed_software` source through
+  `apply_settings`, drained on its own thread. It never forces a sync; when the interval or window changes and a
+  fire is still ahead, that fire is re-placed to the agent's own next slot, and a fire already due is left to go.
+  A windowed source with an interval over a day is placed at the window slot of the day one interval after a
+  clean sync. A collector switched off is not dispatched and not served from the cooldown cache and writes the
+  `disabled` section with the token `switched_off`; a collector that is on but not loaded stays `not_collected`.
+  The `hardware` driver facet has no switch.
+- **Time zone.** A named zone is stored and sent, but the window runs in the machine's own local time; the agent
+  does no zone conversion and reports `yuzu.inv_settings_tz=machine_local` when a zone was sent. Zone conversion
+  is deferred.
+- **Failure handling, server.** A degraded read of the stored documents, the group tree, the kill switches, the
+  agent's groups or the resolve sends nothing for that heartbeat and is counted in
+  `yuzu_server_inventory_settings_push_degrade_total{reason}` (`snapshot`, `membership`, `resolve`); the previous
+  snapshot keeps serving, and a failed refresh is retried after the TTL, not on every heartbeat. A kill-switch read
+  that fails is a degrade, never every collector off. A send the registry did not accept is
+  `yuzu_server_inventory_settings_push_total{result="undelivered"}` and its claim stamp is kept, so it is retried
+  after the re-push gap; `sent` for a gateway agent is a queue, not a delivery. The reconcile hook runs under a
+  shared lock in the heartbeat handler, and an exception from it is caught there, logged and counted in
+  `yuzu_server_inventory_settings_reconcile_exceptions_total`; heartbeat ingestion carries on. A suppressed
+  repeat is `result="suppressed"`. The hook runs synchronously on the heartbeat thread, as the quarantine hook
+  does: one heartbeat per 60 seconds refreshes the snapshot (single flight, each read bounded by the store's
+  acquire timeout), and a failed membership read is not retried for any agent for 60 seconds
+  (`kMembershipRetrySecs`), so a degraded pool costs one acquire timeout per gap, not one per heartbeat.
+- **Not in this change.** Push on save, a settings command for any source but `installed_software`, per-OS
+  withheld collectors, carrying a per-OS or per-action kill switch (only the plugin-wide switch is carried,
+  which is the one the effective-settings route shows), and zone conversion on the agent.
 
 ## Routed-concern invariants
 

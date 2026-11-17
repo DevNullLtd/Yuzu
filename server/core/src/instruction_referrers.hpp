@@ -20,8 +20,9 @@
 /// keeps its recorded definition id), and instruction-set membership (the store unlinks that
 /// itself). Product-pack item records are ADVISORY, not a referrer: `DefinitionPackAdvisoryFn`
 /// below names the packs that contain the definition in the delete's audit detail and never
-/// blocks. The v1 `DELETE /api/v1/instructions/{id}` and MCP `delete_definition` take the same
-/// `DefinitionReferrersFn`.
+/// blocks. The legacy `DELETE /api/instructions/{id}` takes the same `DefinitionReferrersFn`, and
+/// so does a product-pack uninstall for every InstructionDefinition item the pack carries
+/// (workflow_routes.cpp).
 
 #include <concepts>
 #include <cstddef>
@@ -40,14 +41,13 @@ class ProductPackStore;
 class ScheduleEngine;
 class WorkflowEngine;
 
-/// The most policies a refusal names per held fragment; the rest are counted (`+N`). A caller that
-/// fills `held_by` reads one policy more than this per fragment, so `N` is a LOWER BOUND (it never
-/// exceeds 1): it says "at least one more", not how many.
+/// The most policies a pack-uninstall refusal names per held fragment; the rest are counted
+/// (`+N`). The uninstall handler reads one policy more than this per fragment, so `N` is a LOWER
+/// BOUND (it never exceeds 1): it says "at least one more", not how many.
 inline constexpr std::size_t kMaxHeldByPoliciesNamed = 3;
 
-/// A policy that uses a policy fragment that is still a referrer. The refusal names it
-/// `<id> (<name>)`: the id is what the delete route takes, the name is what the operator
-/// recognises.
+/// A policy that uses a pack-own policy fragment. The refusal names it `<id> (<name>)`: the id is
+/// what the delete route takes, the name is what the operator recognises.
 struct HeldByPolicy {
     std::string id;
     std::string name; ///< may be empty (then only the id is named)
@@ -56,16 +56,15 @@ struct HeldByPolicy {
 struct DefinitionReferrer {
     std::string kind; ///< "schedule", "workflow" or "policy fragment"
     std::string id;
-    /// Filled by a caller that wants to name the policies that keep a policy fragment alive (the
-    /// lookup itself never sets it). Empty everywhere else.
+    /// Only the pack uninstall sets it: the policies that use this policy fragment, which is why
+    /// it survives the uninstall. Empty everywhere else.
     std::vector<HeldByPolicy> held_by{};
 };
 
 /// Items the lookup must NOT count, applied INSIDE each source's capped query so an excluded row
 /// never takes a slot of the per-source window (a filter applied after the cap would let a pack's
-/// own rows fill the window and hide a foreign referrer). A caller that removes related rows in
-/// the same operation passes the workflow ids and policy fragment ids it is about to remove; the
-/// v1 and MCP deletes pass none.
+/// own rows fill the window and hide a foreign referrer). Only the pack uninstall passes one:
+/// workflow ids and policy fragment ids of the pack's own items that the same uninstall removes.
 struct DefinitionReferrerExclusions {
     std::unordered_set<std::string> workflow_ids;
     std::unordered_set<std::string> fragment_ids;
@@ -73,9 +72,10 @@ struct DefinitionReferrerExclusions {
 
 /// Every referrer of `definition_id`, or the reason the question could not be answered (a fixed
 /// internal text: the caller does not echo it). An empty vector means "looked, nothing found".
-/// ONE closure, two call forms: `fn(id)` counts everything; `fn(id, exclusions)` leaves the named
-/// workflows and policy fragments out. It can be built from a callable taking just the id (the
-/// exclusions are then ignored) or from one taking both.
+/// ONE closure, three call forms: `fn(id)` counts everything; `fn(id, exclusions)` leaves the named
+/// workflows and policy fragments out; `fn.lookup_many(ids, exclusions, limit)` asks about a whole
+/// list of definitions in a bounded number of reads (the pack uninstall). It can be built from a
+/// callable taking just the id (the exclusions are then ignored) or from one taking both.
 class DefinitionReferrersFn {
 public:
     using Result = std::expected<std::vector<DefinitionReferrer>, std::string>;
@@ -118,7 +118,24 @@ public:
         };
     }
 
+    /// A batch form: the distinct referrers of ANY of `definition_ids` at once, at most `limit` of
+    /// them, read in a number of store reads that does not grow with `definition_ids`.
+    using BatchFn = std::function<Result(const std::vector<std::string>&, const Exclusions&,
+                                         std::size_t)>;
+
+    /// `single` with `batch` attached for `lookup_many`. An unwired `single` stays unwired.
+    [[nodiscard]] static DefinitionReferrersFn with_batch(DefinitionReferrersFn single,
+                                                          BatchFn batch) {
+        if (single)
+            single.batch_ = std::move(batch);
+        return single;
+    }
+
     explicit operator bool() const noexcept { return static_cast<bool>(fn_); }
+    /// True when this function carries a batch form (`make_definition_referrers_fn` attaches one
+    /// with `with_batch`; so can a test). A function rebuilt from a callable that wraps another loses it silently and
+    /// `lookup_many` then asks per id, so a wiring test asserts this on the production closure.
+    [[nodiscard]] bool has_batch() const noexcept { return static_cast<bool>(batch_); }
     [[nodiscard]] Result operator()(const std::string& definition_id) const {
         return fn_(definition_id, Exclusions{});
     }
@@ -127,8 +144,19 @@ public:
         return fn_(definition_id, exclusions);
     }
 
+    /// The distinct referrers (one per kind and id) of ANY of `definition_ids`, at most `limit`
+    /// of them (a caller that lists `n` passes `n + 1`, which is enough to know the list is longer
+    /// than it shows). An empty id names nothing and is left out (the sources would read it as "no
+    /// filter"); with no id left the answer is empty without a read. A function built with
+    /// `with_batch` (the real one, `make_definition_referrers_fn`) answers from its batch form;
+    /// any other asks the one-id form per id, stops once `limit` referrers are in hand and
+    /// de-duplicates with a hash set. An unwired function answers an error (never "none found").
+    [[nodiscard]] Result lookup_many(const std::vector<std::string>& definition_ids,
+                                     const Exclusions& exclusions, std::size_t limit) const;
+
 private:
     std::function<Result(const std::string&, const Exclusions&)> fn_;
+    BatchFn batch_;
 };
 
 /// The most referrers a refusal names; the rest are counted ("and N more").
@@ -136,8 +164,9 @@ inline constexpr std::size_t kMaxReferrersListed = 20;
 
 /// Builds the one lookup over the real stores. A null or closed source makes the lookup an error
 /// (fail closed), so wire exactly the stores the build has. Each source is asked for at most
-/// `kMaxReferrersListed + 1` rows (after any exclusions): enough to know the list is longer than
-/// it shows.
+/// `kMaxReferrersListed + 1` rows (after any exclusions) per call: enough to know the list is
+/// longer than it shows. The batch form (`lookup_many`) reads each source ONCE for the whole id
+/// list and stops reading further sources once `limit` referrers are in hand.
 [[nodiscard]] DefinitionReferrersFn make_definition_referrers_fn(ScheduleEngine* schedules,
                                                                  WorkflowEngine* workflows,
                                                                  PolicyStore* policies);
@@ -158,7 +187,7 @@ inline constexpr std::size_t kMaxPacksNoted = 5;
 /// The audit-detail fragment `packs=<id>,<id>,...[,+N]` for `definition_id` (at most
 /// `kMaxPacksNoted` ids, each folded through `log_token`, CWE-117), or an empty string when `fn` is
 /// unwired, the read failed, or no pack contains the definition. NEVER throws and never changes a
-/// delete's outcome. The two call sites (v1 and MCP) read it BEFORE the delete (so a failed read cannot lose
+/// delete's outcome. The three call sites read it BEFORE the delete (so a failed read cannot lose
 /// the outcome row) and append it to the success detail only if the delete then succeeds. `N` is a
 /// lower bound (the lookup itself is capped).
 [[nodiscard]] std::string pack_advisory_note(const DefinitionPackAdvisoryFn& fn,
@@ -169,5 +198,13 @@ inline constexpr std::size_t kMaxPacksNoted = 5;
 /// through `log_token`, CWE-117), then "and N more" for the rest, then how to unlink. `N` counts
 /// what the sources returned, so it is a lower bound when a source was itself capped.
 [[nodiscard]] std::string describe_definition_referrers(const std::vector<DefinitionReferrer>& referrers);
+
+/// The 409 message of a product-pack uninstall refused because `referrers` still use one of the
+/// pack's definitions: the same bounded `<kind> <id>` list, led by "the pack was NOT uninstalled"
+/// and closed with how to proceed (remove or repoint each, then retry the uninstall). A referrer
+/// with `held_by` set (a pack-own policy fragment a policy still uses) names up to
+/// `kMaxHeldByPoliciesNamed` of those policies as `<id> (<name>)` (`, +N` for more, N a lower
+/// bound) and the message says to delete the policy first.
+[[nodiscard]] std::string describe_pack_uninstall_blockers(const std::vector<DefinitionReferrer>& referrers);
 
 } // namespace yuzu::server

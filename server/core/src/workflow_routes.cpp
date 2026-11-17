@@ -7,6 +7,7 @@
 #include "dispatch_destructive_gate.hpp" // BR-001: evaluate_destructive_targeting / requires_explicit_targets
 #include "dispatch_target_shape.hpp" // check_targeting_shape — the omitted-vs-supplied rule (#2500)
 #include "event_bus.hpp"
+#include "json_value_budget.hpp" // json_exceeds_value_count: the JSON-form body breadth bound
 #include "forensics_read_audit.hpp" // #4990: response.forensics.read
 #include "executions_page_render.hpp" // Operate O1: view=page renderers
 #include "workflows_page_render.hpp" // Operate WF-A: workflows + schedules page renderers
@@ -45,15 +46,21 @@
 #include <limits>
 #include <map>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
 namespace yuzu::server {
 
 namespace {
+/// The most structural JSON values of the JSON form of `POST /api/workflows` and `POST
+/// /api/product-packs` (`{"yaml_source": "..."}`, one field): the central body-cap stage does not
+/// scan these two classes because their other form is raw YAML, not JSON.
+constexpr std::size_t kYamlEnvelopeMaxJsonValues = 1'000;
 constexpr const char* kParamRejectRoute = "instruction_execute";
 constexpr const char* kParamRejectReasons[] = {"shape", "violation", "schema_invalid"};
 
@@ -187,8 +194,12 @@ void seed_instruction_param_rejected_metrics(yuzu::MetricsRegistry& metrics) {
 // unavailability, not "this item doesn't exist"; using the tolerated not_found prefix here
 // would let the caller (ProductPackStore::uninstall()/install()'s compensation path) proceed
 // as if the item were already gone while it's still live underneath. PolicyFragment/Policy's
-// origin stores are still bool-only — `false` there maps to a tolerated not_found, matching
-// pre-ADR-0058 behaviour for those kinds.
+// origin stores are still bool-only: `delete_fragment`/`delete_policy` answer a bare `false` for
+// "absent", for "a policy still uses this fragment" (a refusal) and for a database fault alike. A
+// `false` is therefore read back (get_fragment/get_policy, and for a fragment the policies that
+// use it) so only the first two stay a tolerated not_found; a fault, or a read that cannot tell,
+// is a db_error and aborts the uninstall before the pack is tombstoned. Without the read-back a
+// lost lease on the fragment delete answered 200 and left a fragment naming a deleted definition.
 static ItemUninstallFn make_item_delete_fn(InstructionStore* instruction_store,
                                            PolicyStore* policy_store,
                                            WorkflowEngine* workflow_engine) {
@@ -201,13 +212,40 @@ static ItemUninstallFn make_item_delete_fn(InstructionStore* instruction_store,
                                        "instruction store unavailable");
             return instruction_store->delete_definition(item_id);
         } else if (kind == "PolicyFragment") {
-            if (policy_store && policy_store->delete_fragment(item_id))
+            if (!policy_store)
+                return std::unexpected("not_found: policy fragment '" + item_id + "'");
+            if (policy_store->delete_fragment(item_id))
                 return {};
-            return std::unexpected("not_found: policy fragment '" + item_id + "'");
+            const auto db_error = [&](const char* why) {
+                return std::unexpected(std::string(kProductPackDbErrorPrefix) +
+                                       "policy fragment '" + item_id + "' " + why);
+            };
+            const auto present = policy_store->get_fragment(item_id);
+            if (!present)
+                return db_error("could not be confirmed after a failed delete");
+            if (!*present)
+                return std::unexpected("not_found: policy fragment '" + item_id + "'");
+            const auto used = policy_store->query_policies(
+                PolicyQuery{.fragment_filter = item_id, .limit = 1});
+            if (!used)
+                return db_error("could not be checked for policies that use it");
+            if (!used->empty())
+                return std::unexpected("not_found: policy fragment '" + item_id +
+                                       "' is still used by a policy");
+            return db_error("was not deleted and no policy uses it");
         } else if (kind == "Policy") {
-            if (policy_store && policy_store->delete_policy(item_id))
+            if (!policy_store)
+                return std::unexpected("not_found: policy '" + item_id + "'");
+            if (policy_store->delete_policy(item_id))
                 return {};
-            return std::unexpected("not_found: policy '" + item_id + "'");
+            const auto present = policy_store->get_policy(item_id);
+            if (!present)
+                return std::unexpected(std::string(kProductPackDbErrorPrefix) + "policy '" +
+                                       item_id + "' could not be confirmed after a failed delete");
+            if (!*present)
+                return std::unexpected("not_found: policy '" + item_id + "'");
+            return std::unexpected(std::string(kProductPackDbErrorPrefix) + "policy '" + item_id +
+                                   "' was not deleted");
         } else if (kind == "Workflow") {
             if (!workflow_engine)
                 return std::unexpected(std::string(kProductPackDbErrorPrefix) +
@@ -261,6 +299,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     auto* product_pack_store = deps.product_pack_store;
     auto* instruction_store = deps.instruction_store;
     auto* policy_store = deps.policy_store;
+    auto referrers_fn = deps.referrers_fn; // M2: the pack uninstall's definition-referrer guard
     auto* approval_manager = deps.approval_manager;
     auto* response_store = deps.response_store;
     const auto* forensics_plugins = deps.forensics_plugins; // #4990
@@ -302,9 +341,9 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // Confinement (ADR-0017): the SOLE gate is `fleet_read_fn`
     // (require_fleet_read) -- never stacked with perm_fn on the same
     // (Execution, Read) pair. A confined caller gets the SAME owner-or-visible
-    // view as the v1 twin GET /api/v1/executions, except service-scoped
-    // sessions, which get visible-only (the owner rule would expose the
-    // minter's identity; #5557): the admission predicate is pushed into SQL
+    // view as the v1 twin GET /api/v1/executions; a service-scoped session's
+    // owner key is empty (execution_owner_key), so it is visible-only on every
+    // execution surface (#5557): the admission predicate is pushed into SQL
     // BEFORE the LIMIT (a page of 50 invisible rows must not starve the
     // visible ones), each surviving row's counters and error preview are
     // recomputed from the in-scope agent rows only (so neither the preview
@@ -412,6 +451,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
 
         ExecutionScope scope_arg; // nullopt = unrestricted
         std::string username;
+        ExecutionOwnerKey owner; // empty unless a confined, resolved session
         if (gate.scope) {
             auto session = auth_fn(req, res);
             if (!session)
@@ -427,19 +467,12 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                                         "Contact an administrator if this persists.");
                 return;
             }
-            // A service-scoped token's session username is its MINTER's identity, so the
-            // owner disjunct (dispatched_by == username) would list every execution the
-            // minter dispatched, outside the token's service tag scope (ADR-1006: the
-            // token must never see more than its tag scope). Suppress the owner disjunct
-            // for such a session, in SQL and in the per-row check below: it sees only
-            // executions that touched an in-scope agent. The other execution surfaces
-            // still carry the minter-keyed disjunct for service tokens (tracked in #5557).
-            if (!session->token_scope_service.empty())
-                username.clear();
-            ExecutionListScope s;
-            s.owner = username;
-            s.visible_agents.assign(gate.scope->begin(), gate.scope->end());
-            scope_arg = std::move(s);
+            // #5557: the owner key is empty for a service-scoped session (its username is the
+            // MINTER's identity, so a minter-keyed disjunct would list every execution the minter
+            // dispatched outside the token's service tag scope, ADR-1006). Such a session sees
+            // only executions that touched an in-scope agent, in SQL and in the per-row check.
+            owner = execution_owner_key(*session);
+            scope_arg = confined_list_scope(owner, gate.scope);
         }
 
         auto execs_opt = execution_tracker->query_executions_checked(q, scope_arg);
@@ -469,7 +502,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             for (const auto& e : execs) {
                 auto it = statuses_opt->find(e.id);
                 const auto& statuses = it != statuses_opt->end() ? it->second : kEmptyStatuses;
-                if (!execution_visible(e, statuses, gate.scope, username))
+                if (!execution_visible(e, statuses, gate.scope, owner))
                     continue;
                 auto counts = confined_projection(statuses, gate.scope);
                 Execution row = e;
@@ -812,8 +845,10 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 for (const auto& a : agents)
                     has_visible_agent = authz::in_scope(gate.scope, a.agent_id) || has_visible_agent;
             }
+            // #5557: the owner KEY, never the raw username (a service-scoped session's username
+            // is its minter's).
             const bool owns_execution =
-                exec_opt && exec_opt->dispatched_by == session->username;
+                exec_opt && execution_owner_key(*session).owns(*exec_opt);
             if (!exec_opt || (gate.scope && !owns_execution && !has_visible_agent)) {
                 // #1634 (governance Gate 6 compliance-officer finding): a
                 // suppressed cross-operator read attempt is CC7.2-evidence-worthy
@@ -1461,8 +1496,9 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                          has_visible_agent =
                              authz::in_scope(gate.scope, a.agent_id) || has_visible_agent;
                  }
+                 // #5557: the owner KEY, never the raw username.
                  const bool owns_execution =
-                     exec_opt && exec_opt->dispatched_by == session->username;
+                     exec_opt && execution_owner_key(*session).owns(*exec_opt);
                  if (!exec_opt || (gate.scope && !owns_execution && !has_visible_agent)) {
                      // #1634 (governance Gate 6 compliance-officer finding): a
                      // suppressed cross-operator subscribe attempt is
@@ -2311,6 +2347,10 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         std::string yaml_source;
         if (req.get_header_value("Content-Type").find("application/json") != std::string::npos) {
             try {
+                // The JSON form is a one-field envelope; the central body-cap stage does not scan
+                // this class (the raw-YAML form is not JSON), so the breadth bound lives here.
+                if (json_exceeds_value_count(req.body, kYamlEnvelopeMaxJsonValues))
+                    throw std::invalid_argument("too many JSON values");
                 auto j = nlohmann::json::parse(req.body);
                 yaml_source = j.value("yaml_source", "");
             } catch (const std::exception&) {
@@ -4282,6 +4322,9 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         std::string yaml_bundle;
         if (req.get_header_value("Content-Type").find("application/json") != std::string::npos) {
             try {
+                // As for the workflow create: the JSON form is a one-field envelope.
+                if (json_exceeds_value_count(req.body, kYamlEnvelopeMaxJsonValues))
+                    throw std::invalid_argument("too many JSON values");
                 auto j = nlohmann::json::parse(req.body);
                 yaml_bundle = j.value("yaml_source", "");
             } catch (const std::exception&) {
@@ -4477,9 +4520,9 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
 
     // DELETE /api/product-packs/:id -- uninstall product pack
     sink.Delete(R"(/api/product-packs/([^/]+))", [perm_fn, audit_fn, emit_fn, product_pack_store,
-                                                  instruction_store, policy_store,
-                                                  workflow_engine](const httplib::Request& req,
-                                                                   httplib::Response& res) {
+                                                  instruction_store, policy_store, workflow_engine,
+                                                  referrers_fn](const httplib::Request& req,
+                                                                httplib::Response& res) {
         if (!perm_fn(req, res, "ProductPack", "Delete"))
             return;
         if (!product_pack_store) {
@@ -4490,10 +4533,144 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
 
         auto id = req.matches[1].str();
 
+        // M2: refuse BEFORE the first item is deleted (uninstall() deletes items one at a time, so
+        // a refusal part-way would leave a pack with some items gone and the rest left). A pack
+        // whose InstructionDefinition is still named by a schedule, a workflow or a policy
+        // fragment is not uninstalled; the pack's OWN workflow items and the own policy fragments
+        // no policy uses do not count, they are removed by this same uninstall. A pack that
+        // carries no InstructionDefinition item skips the lookup. Advisory-not-transactional: a
+        // schedule created after the check is not seen.
+        {
+            auto pack = product_pack_store->get(id);
+            if (!pack) {
+                // Same classification and audit as the uninstall's own read failure below; the
+                // check could not run, so nothing is deleted.
+                const std::string client_msg = product_pack_client_message(
+                    "DELETE /api/product-packs/:id", pack.error());
+                audit_fn(req, "product_pack.uninstall", "denied", "ProductPack", id, client_msg);
+                res.status = product_pack_error_status(pack.error());
+                // Nothing has been deleted yet, so a 503 here (a database or lease failure) is a
+                // transient a caller can retry as is.
+                detail::A4ErrorOpts opts;
+                if (res.status == 503)
+                    opts.retry_after_ms = 5000;
+                res.set_content(detail::a4_error(res, client_msg, opts), "application/json");
+                return;
+            }
+            if (*pack) {
+                std::unordered_set<std::string> own_workflows, own_fragments;
+                bool has_definition = false;
+                for (const auto& item : (*pack)->items) {
+                    if (item.kind == "Workflow")
+                        own_workflows.insert(item.item_id);
+                    else if (item.kind == "PolicyFragment")
+                        own_fragments.insert(item.item_id);
+                    else if (item.kind == "InstructionDefinition")
+                        has_definition = true;
+                }
+                std::vector<DefinitionReferrer> blocking;
+                // `retry`: the failure is a read fault the caller can retry (nothing was
+                // deleted, so a retry is safe), so the answer carries `retry_after_ms`. An unwired
+                // check never gets it (that is `referrer_check_unwired`, decided before the
+                // lookup), but a null store INSIDE the batch closure reaches this site through
+                // the same error channel as a failed read and so carries it too; that case is
+                // unreachable in production (the closure is built over live stores), and a typed
+                // error that separates it is #7921 item 2.
+                const auto refuse = [&](int status, const char* audit_result,
+                                        const char* audit_detail, std::string_view message,
+                                        bool retry = false) {
+                    audit_fn(req, "product_pack.uninstall", audit_result, "ProductPack", id,
+                             audit_detail);
+                    // An unwired lookup is a server wiring fault, not a transient: say so in the
+                    // log (a fixed text, no request data), since the 503 reads like any other.
+                    if (std::string_view(audit_detail) == "referrer_check_unwired")
+                        spdlog::error("DELETE /api/product-packs/:id refused: the definition "
+                                      "reference check is not wired (a server wiring fault)");
+                    res.status = status;
+                    detail::A4ErrorOpts opts;
+                    if (retry)
+                        opts.retry_after_ms = 5000;
+                    res.set_content(detail::a4_error(res, message, opts), "application/json");
+                };
+                if (has_definition) {
+                    if (!referrers_fn)
+                        return refuse(503, "error", "referrer_check_unwired",
+                                      "definition reference check not configured; the pack was "
+                                      "not uninstalled");
+                    // The pack's own items are left out of the lookup INSIDE its capped queries
+                    // (a filter applied to the capped answer would let a pack with many own
+                    // workflows fill the window and hide a foreign referrer). Workflows go in the
+                    // same uninstall (a soft delete that never refuses). A fragment does NOT when
+                    // a policy still uses it (PolicyStore::delete_fragment refuses and the
+                    // uninstall tolerates that), so it stays live and is counted like any other
+                    // referrer; a policy read that fails is a 503, never "unreferenced".
+                    //
+                    // The reads are BOUNDED: one batched read of the policies that use any own
+                    // fragment, then (for the real lookup, which has a batch form) at most one read
+                    // per referrer source for ALL the pack's definitions together
+                    // (`lookup_many`), stopping once the list is longer than the refusal shows.
+                    // Neither grows with the pack's item count. A lookup without a batch form
+                    // (a test double) is asked once per definition, still stopping at that point.
+                    DefinitionReferrerExclusions exclusions;
+                    exclusions.workflow_ids = std::move(own_workflows);
+                    // fragment id -> the policies that use it (id and name), for the 409 text
+                    std::unordered_map<std::string, std::vector<HeldByPolicy>> policy_held;
+                    if (!own_fragments.empty()) {
+                        if (!policy_store)
+                            return refuse(503, "error", "referrer_check_unwired",
+                                          "definition reference check not configured; the pack was "
+                                          "not uninstalled");
+                        const std::vector<std::string> own_fragment_ids(own_fragments.begin(),
+                                                                        own_fragments.end());
+                        auto used = policy_store->policies_using_fragments(
+                            own_fragment_ids, static_cast<int>(kMaxHeldByPoliciesNamed) + 1);
+                        if (!used)
+                            return refuse(503, "error", "referrer_check_unavailable",
+                                          "definition reference check unavailable; the pack was "
+                                          "not uninstalled",
+                                          /*retry=*/true);
+                        for (const auto& use : *used)
+                            policy_held[use.fragment_id].push_back({use.policy_id, use.policy_name});
+                        for (const auto& fragment_id : own_fragments)
+                            if (!policy_held.contains(fragment_id))
+                                exclusions.fragment_ids.insert(fragment_id);
+                    }
+                    std::vector<std::string> definition_ids;
+                    for (const auto& item : (*pack)->items)
+                        if (item.kind == "InstructionDefinition")
+                            definition_ids.push_back(item.item_id);
+                    // No definition has an empty id, and the referrer sources treat an empty id as
+                    // "no filter" (they would answer unrelated schedules and fragments); the
+                    // lookup leaves a corrupt empty-id item out. A foreign referrer that names
+                    // two of the pack's definitions is listed (and counted) once, and the list
+                    // stops at one more than the refusal names.
+                    auto referrers = referrers_fn.lookup_many(definition_ids, exclusions,
+                                                              kMaxReferrersListed + 1);
+                    if (!referrers)
+                        return refuse(503, "error", "referrer_check_unavailable",
+                                      "definition reference check unavailable; the pack was "
+                                      "not uninstalled",
+                                      /*retry=*/true);
+                    for (auto& r : *referrers) {
+                        if (r.kind == "policy fragment") {
+                            if (const auto held = policy_held.find(r.id); held != policy_held.end())
+                                r.held_by = held->second;
+                        }
+                        blocking.push_back(std::move(r));
+                    }
+                }
+                if (!blocking.empty())
+                    return refuse(409, "denied", "referenced",
+                                  describe_pack_uninstall_blockers(blocking));
+            }
+        }
+
         // Uninstall callback: delegate to the appropriate store (same dispatch install's
         // compensate_fn uses — see make_item_delete_fn's doc comment for the per-kind
-        // db_error/not_found split, currently unreachable here since instruction_store_ and
-        // product_pack_store_ share one boot latch, kept as defense-in-depth).
+        // db_error/not_found split: reachable for PolicyFragment and Policy items (a failed
+        // delete is read back), unreachable for InstructionDefinition and Workflow items since
+        // instruction_store_ and product_pack_store_ share one boot latch, kept as
+        // defense-in-depth).
         auto uninstall_fn = make_item_delete_fn(instruction_store, policy_store, workflow_engine);
 
         auto result = product_pack_store->uninstall(id, uninstall_fn);

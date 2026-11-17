@@ -13,6 +13,7 @@
 
 #include "echo_cursor.hpp"
 #include "echo_db.hpp"
+#include "echo_test_db.hpp"
 #include "echo_fold_schema.hpp"
 #include "echo_registry_parsers.hpp"
 #include "echo_registry_source.hpp"
@@ -1440,7 +1441,7 @@ void record_committed(const std::vector<RegistryEvent>& rows) {
 TestDb make_db() {
     committed_rows().clear();
     auto tmp = yuzu::test::unique_temp_path("yuzu_test_echo_registry_");
-    auto r = EchoDatabase::open(tmp);
+    auto r = yuzu::test::open_echo_db(tmp);
     REQUIRE(r.has_value());
     return TestDb{std::move(*r), tmp};
 }
@@ -1627,13 +1628,14 @@ RegistryCursor read_cursor(EchoDatabase& db) {
 }
 
 // Fails every INSERT into the registry hourly tier from a second connection until released.
+// `table` names another table to fail instead (an upsert is an INSERT too).
 struct InsertTrap {
     sqlite3* h{nullptr};
-    explicit InsertTrap(const fs::path& p) {
+    explicit InsertTrap(const fs::path& p, const std::string& table = "registry_hourly_r") {
         REQUIRE(sqlite3_open(p.string().c_str(), &h) == SQLITE_OK);
         REQUIRE(sqlite3_exec(h,
-                             "CREATE TRIGGER yuzu_test_trap BEFORE INSERT ON registry_hourly_r "
-                             "BEGIN SELECT RAISE(ABORT, 'trap'); END",
+                             ("CREATE TRIGGER yuzu_test_trap BEFORE INSERT ON " + table +
+                              " BEGIN SELECT RAISE(ABORT, 'trap'); END").c_str(),
                              nullptr, nullptr, nullptr) == SQLITE_OK);
     }
     void release() {
@@ -5013,6 +5015,413 @@ TEST_CASE("registry offline: a restart does not mount a settled offline hive aga
     CHECK(r.f.offline_calls.size() == 1);   // no mount: it is not the hourly tick
     CHECK(r.f.offline_profile_calls == 2);  // the profile list IS re-walked (cheap, no mount)
     CHECK(nonempty_baseline(r.state(root)));
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Sensitive value names (#6634): a stored credential is never kept in any form
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+// Synthetic autologon password; every persisted path below is searched for it.
+constexpr const char* kLogonSecret = "Hunter2-synthetic-logon-secret";
+
+std::string hex_of(std::string_view bytes) {
+    static constexpr char d[] = "0123456789abcdef";
+    std::string out;
+    for (unsigned char c : bytes) {
+        out += d[c >> 4];
+        out += d[c & 0xF];
+    }
+    return out;
+}
+
+// True when `hay` carries the secret as UTF-8 text, as the hex of its UTF-16 bytes, or as the
+// SHA-256 prefix baseline_entry_from_bytes would have stored for those bytes.
+bool carries_secret(std::string_view hay, std::string_view secret) {
+    const std::string bytes = utf16(secret);
+    const std::string hash = baseline_entry_from_bytes(1, bytes.size(), bytes, false).h;
+    return hay.find(secret) != std::string_view::npos ||
+           hay.find(hex_of(bytes)) != std::string_view::npos ||
+           hay.find(hex_of(secret)) != std::string_view::npos ||
+           hay.find(hash) != std::string_view::npos;
+}
+
+const std::string kWinlogon = "HKLM\\SOFTWARE\\yuzu_test_r\\Winlogon";
+
+SubtreeRead logon_read(std::string_view secret, std::uint32_t type = 1) {
+    return complete({{kWinlogon,
+                      {{"DefaultUserName", vread(1, utf16("svc-account"))},
+                       {"DefaultPassword", vread(type, utf16(secret))}}}});
+}
+
+} // namespace
+
+TEST_CASE("is_sensitive_reg_value: a closed, case-insensitive, name-only list",
+          "[echo][registry][pure]") {
+    CHECK(is_sensitive_reg_value("DefaultPassword"));
+    CHECK(is_sensitive_reg_value("defaultpassword"));
+    CHECK(is_sensitive_reg_value("ALTDEFAULTPASSWORD"));
+    CHECK(is_sensitive_reg_value("AltDefaultPassword"));
+    CHECK_FALSE(is_sensitive_reg_value("DefaultUserName"));
+    CHECK_FALSE(is_sensitive_reg_value("AutoAdminLogon"));
+    CHECK_FALSE(is_sensitive_reg_value("DefaultPassword2"));
+    CHECK_FALSE(is_sensitive_reg_value(""));
+}
+
+TEST_CASE("diff: a sensitive value added is masked, sized 0 and baselined by type only",
+          "[echo][registry][pure]") {
+    const std::string root = "HKLM\\SOFTWARE\\yuzu_test_r";
+    const auto d = diff_registry_snapshot({}, logon_read(kLogonSecret), root, "notify", {10, 20}, 20);
+    std::map<std::string, RegistryCandidate> by;
+    for (const auto& c : d.candidates)
+        by[c.value] = c;
+    REQUIRE(by.size() == 2);
+    const auto& pw = by.at("DefaultPassword");
+    CHECK(pw.action == "added");
+    CHECK(pw.data == kRegistryMaskedData);
+    CHECK(pw.size == 0);
+    CHECK_FALSE(pw.data_truncated);
+    CHECK(pw.type == 1);
+    CHECK(d.baseline.keys.at(kWinlogon).at("DefaultPassword") == BaselineEntry{1, 0, "", "", false});
+    // The neighbouring value is rendered, sized and hashed exactly as before.
+    const auto& user = by.at("DefaultUserName");
+    CHECK(user.data == "svc-account");
+    CHECK(user.size == utf16("svc-account").size());
+    const auto& ub = d.baseline.keys.at(kWinlogon).at("DefaultUserName");
+    CHECK(ub.s == utf16("svc-account").size());
+    CHECK_FALSE(ub.h.empty());
+}
+
+TEST_CASE("diff: a content-only change of a sensitive value is no change; type change and removal are",
+          "[echo][registry][pure]") {
+    const std::string root = "HKLM\\SOFTWARE\\yuzu_test_r";
+    const auto first = diff_registry_snapshot({}, logon_read(kLogonSecret), root, "reconcile", {10, 20},
+                                              20, /*suppress=*/true);
+
+    SECTION("content-only: no candidate, baseline unchanged") {
+        const auto d = diff_registry_snapshot(first.baseline, logon_read("a-different-secret"), root,
+                                              "notify", {10, 20}, 20);
+        CHECK(d.candidates.empty());
+        CHECK_FALSE(d.changed);
+    }
+    SECTION("type change: one masked `changed` candidate") {
+        const auto d = diff_registry_snapshot(first.baseline, logon_read(kLogonSecret, 2), root,
+                                              "notify", {10, 20}, 20);
+        REQUIRE(d.candidates.size() == 1);
+        const auto& c = d.candidates[0];
+        CHECK(c.action == "changed");
+        CHECK(c.data == kRegistryMaskedData);
+        CHECK(c.size == 0);
+        CHECK(c.has_prev);
+        CHECK(c.prev_type == 1);
+        CHECK(c.prev_size == 0);
+        CHECK(c.prev_data.empty());
+    }
+    SECTION("removal: one `removed` candidate with no previous size or data") {
+        auto gone = logon_read(kLogonSecret);
+        gone.keys.at(kWinlogon).erase("DefaultPassword");
+        const auto d = diff_registry_snapshot(first.baseline, gone, root, "notify", {10, 20}, 20);
+        REQUIRE(d.candidates.size() == 1);
+        CHECK(d.candidates[0].action == "removed");
+        CHECK(d.candidates[0].prev_size == 0);
+        CHECK(d.candidates[0].prev_data.empty());
+        CHECK(d.candidates[0].data.empty());
+    }
+}
+
+TEST_CASE("diff: a legacy baseline entry for a sensitive name fabricates no row and is rewritten masked",
+          "[echo][registry][pure]") {
+    const std::string root = "HKLM\\SOFTWARE\\yuzu_test_r";
+    const std::string bytes = utf16(kLogonSecret);
+    RegistryBaseline legacy;
+    legacy.keys[kWinlogon]["DefaultPassword"] =
+        baseline_entry_from_bytes(1, bytes.size(), bytes, false);
+    legacy.keys[kWinlogon]["DefaultPassword"].d = kLogonSecret; // an older build's rendered prefix
+    legacy.keys[kWinlogon]["DefaultUserName"] =
+        baseline_entry_from_bytes(1, utf16("svc-account").size(), utf16("svc-account"), false);
+
+    const auto d = diff_registry_snapshot(legacy, logon_read(kLogonSecret), root, "notify", {10, 20}, 20);
+    CHECK(d.candidates.empty()); // same value read: nothing changed
+    CHECK(d.changed);            // but the stored entry is rewritten
+    const auto encoded = encode_registry_baseline(d.baseline);
+    CHECK_FALSE(carries_secret(encoded, kLogonSecret));
+}
+
+TEST_CASE("diff: a Capped read that does not visit a sensitive key masks the retained entry",
+          "[echo][registry][pure]") {
+    const std::string root = "HKLM\\SOFTWARE\\yuzu_test_r";
+    const std::string bytes = utf16(kLogonSecret);
+    RegistryBaseline legacy;
+    legacy.keys[kWinlogon]["DefaultPassword"] =
+        baseline_entry_from_bytes(1, bytes.size(), bytes, false);
+    SubtreeRead capped;
+    capped.status = RegistryReadStatus::Capped; // visited nothing
+    const auto d = diff_registry_snapshot(legacy, capped, root, "notify", {10, 20}, 20);
+    CHECK(d.candidates.empty());
+    CHECK(d.baseline.keys.at(kWinlogon).at("DefaultPassword") == BaselineEntry{1, 0, "", "", false});
+    CHECK(d.changed);
+}
+
+TEST_CASE("baseline_from_read masks a sensitive value", "[echo][registry][pure]") {
+    const auto b = baseline_from_read(logon_read(kLogonSecret));
+    CHECK(b.keys.at(kWinlogon).at("DefaultPassword") == BaselineEntry{1, 0, "", "", false});
+    CHECK_FALSE(b.keys.at(kWinlogon).at("DefaultUserName").h.empty());
+}
+
+TEST_CASE("encode_registry_baseline writes the masked form for a sensitive name whatever the entry holds",
+          "[echo][registry][pure]") {
+    const std::string bytes = utf16(kLogonSecret);
+    RegistryBaseline b;
+    b.keys[kWinlogon]["DefaultPassword"] = baseline_entry_from_bytes(1, bytes.size(), bytes, false);
+    b.keys[kWinlogon]["DefaultPassword"].d = kLogonSecret;
+    b.keys[kWinlogon]["altdefaultpassword"] = baseline_entry_from_bytes(1, bytes.size(), bytes, false);
+    const auto json = encode_registry_baseline(b);
+    CHECK_FALSE(carries_secret(json, kLogonSecret));
+    const auto back = decode_registry_baseline(json);
+    REQUIRE_FALSE(back.malformed);
+    CHECK(back.baseline.keys.at(kWinlogon).at("DefaultPassword") == BaselineEntry{1, 0, "", "", false});
+}
+
+TEST_CASE("cursor row: a held candidate under a sensitive name is written masked, including a legacy one",
+          "[echo][registry][pure]") {
+    RegistryCursor cur;
+    cur.present = true;
+    auto held = cand("added", "DefaultPassword", 1, utf16(kLogonSecret).size(), 10, 20);
+    held.key = kWinlogon;
+    held.data = kLogonSecret;
+    held.has_prev = true;
+    held.prev_size = 99;
+    held.prev_data = kLogonSecret;
+    cur.held = {held};
+
+    const auto json = encode_registry_cursor(cur);
+    CHECK_FALSE(carries_secret(json, kLogonSecret));
+    const auto back = decode_registry_cursor(json);
+    REQUIRE(back.held.size() == 1);
+    CHECK(back.held[0].data == kRegistryMaskedData);
+    CHECK(back.held[0].size == 0);
+
+    // A cursor written by an earlier build holds the cleartext: decoded and stitched, the row is masked.
+    auto legacy = nlohmann::json::parse(json);
+    legacy["held"][0]["d"] = kLogonSecret;
+    legacy["held"][0]["s"] = utf16(kLogonSecret).size();
+    const auto old = decode_registry_cursor(legacy.dump());
+    REQUIRE_FALSE(old.malformed);
+    REQUIRE(old.held.size() == 1);
+    const auto r = stitch_registry_tick(old.held, {}, {}, StitchFlags{true, 0}, 1000 * SEC, 1);
+    REQUIRE(r.rows.size() == 1);
+    CHECK(r.rows[0].data == kRegistryMaskedData);
+    CHECK(r.rows[0].data_size == 0);
+    CHECK_FALSE(carries_secret(r.rows[0].data + r.rows[0].prev_data, kLogonSecret));
+}
+
+TEST_CASE("registry_row_from_candidate masks an unmasked candidate under a sensitive name",
+          "[echo][registry][pure]") {
+    auto c = cand("changed", "DefaultPassword", 1, 62, 10, 20);
+    c.key = kWinlogon;
+    c.data = kLogonSecret;
+    c.has_prev = true;
+    c.prev_size = 40;
+    c.prev_data = kLogonSecret;
+    const auto row = registry_row_from_candidate(c, 0, {}, "attr:none", 1);
+    CHECK(row.data == kRegistryMaskedData);
+    CHECK(row.data_size == 0);
+    CHECK(row.prev_data_size == 0);
+    CHECK(row.prev_data.empty());
+
+    // An ordinary value keeps everything.
+    auto ok = cand("changed", "DefaultUserName", 1, 62, 10, 20);
+    ok.data = "svc-account";
+    CHECK(registry_row_from_candidate(ok, 0, {}, "attr:none", 1).data == "svc-account");
+    CHECK(registry_row_from_candidate(ok, 0, {}, "attr:none", 1).data_size == 62);
+}
+
+TEST_CASE("attribute_candidate: a sensitive value is correlated without its size",
+          "[echo][registry][pure]") {
+    // The masked candidate has size 0; the writer's event has the real length.
+    const auto masked = cand("changed", "DefaultPassword", 1, 0, 100, 200);
+    const auto a = attribute_candidate(
+       masked, {ev(150, 812, RegistryEtwOp::Set, "DefaultPassword", 1, 62, "winlogon.exe")});
+    CHECK(a.kind == AttributionKind::Corr);
+    CHECK(a.pid == 812);
+    // Type still has to match.
+    CHECK(attribute_candidate(masked, {ev(150, 812, RegistryEtwOp::Set, "DefaultPassword", 4, 62)}).kind ==
+          AttributionKind::None);
+    // An ordinary candidate still requires the size to match.
+    CHECK(attribute_candidate(cand("changed", "Start", 4, 4, 100, 200),
+                              {ev(150, 1, RegistryEtwOp::Set, "Start", 4, 8)})
+              .kind == AttributionKind::None);
+}
+
+TEST_CASE("registry source: a Winlogon DefaultPassword leaves no trace in any row, state or cursor",
+          "[echo][registry][lifecycle]") {
+    auto t = make_db();
+    Fake f;
+    auto src = make_registry_cursor_source(scope1(), f.reader());
+
+    // Everything the database persisted that could carry a value: state rows, the cursor row, the
+    // roll-up tiers and the dictionary behind them, and the rows the tick committed.
+    const auto everything = [&] {
+        std::string all;
+        for (const char* sql : {"SELECT state_json FROM echo_state", "SELECT cursor_json FROM echo_cursor",
+                                "SELECT last_data FROM registry_hourly",
+                                "SELECT last_data FROM registry_daily", "SELECT text FROM echo_dict"})
+            for (const auto& row : q(t.db, sql).rows)
+                for (const auto& cell : row)
+                    all += cell + "\n";
+        for (const auto& e : committed_rows())
+            all += e.data + "\n" + e.prev_data + "\n" + e.detail + "\n" + e.value_name + "\n";
+        return all;
+    };
+    // One tick, then a second after the settle interval so a held change lands.
+    const auto step = [&](std::int64_t at, SubtreeRead read) {
+        f.clock = T0 + at * SEC;
+        f.reads[kRoot] = std::move(read);
+        burst(f, kRoot, T0 + (at - 3) * SEC, T0 + (at - 2) * SEC);
+        tick(t.db, *src);
+        f.clock += kEtwSettle100ns + SEC;
+        tick(t.db, *src);
+    };
+
+    f.reads[kRoot] = complete({{kWinlogon, {{"DefaultUserName", vread(1, utf16("svc-account"))}}}});
+    REQUIRE(tick(t.db, *src).outcome == CursorOutcome::Baseline);
+
+    step(100, logon_read(kLogonSecret)); // add
+    CHECK_FALSE(carries_secret(everything(), kLogonSecret));
+    const auto after_add = q(t.db, "SELECT last_data FROM registry_hourly WHERE value_name = 'DefaultPassword'");
+    REQUIRE(after_add.rows.size() == 1);
+    CHECK(after_add.rows[0][0] == kRegistryMaskedData);
+
+    const auto rows_before = count_rows(t.db);
+    step(800, logon_read("changed-synthetic-secret")); // content only: no row
+    CHECK(count_rows(t.db) == rows_before);
+    CHECK_FALSE(carries_secret(everything(), kLogonSecret));
+    CHECK_FALSE(carries_secret(everything(), "changed-synthetic-secret"));
+
+    step(1500, logon_read("changed-synthetic-secret", 2)); // type change
+    CHECK(count_rows(t.db) == rows_before + 1);
+    CHECK_FALSE(carries_secret(everything(), "changed-synthetic-secret"));
+
+    step(2200, complete({{kWinlogon, {{"DefaultUserName", vread(1, utf16("svc-account"))}}}})); // removed
+    CHECK(count_rows(t.db) == rows_before + 2);
+    CHECK_FALSE(carries_secret(everything(), kLogonSecret));
+    CHECK_FALSE(carries_secret(everything(), "changed-synthetic-secret"));
+}
+
+namespace {
+
+// The cursor text an earlier build wrote for a held DefaultPassword change, with state in every
+// field a rewrite has to carry over: the encoder of this build masks the candidate, so the legacy
+// fields are written back over the encoded form.
+std::string legacy_cursor_with_secret() {
+    RegistryCursor cur;
+    cur.present = true;
+    cur.tick = 7;
+    cur.ccs = "ControlSet002";
+    cur.roots[kRoot] =
+        RegistryRootState{true, 100, 110, 120, "capped", false, {kRoot + "\\Denied"}, true};
+    cur.loss = {{30, 40}};
+    cur.hku = {"S-1-5-21-1"};
+    cur.offline = {{"S-1-5-21-2", "C:\\Users\\jsmith"}};
+    auto held = cand("added", "DefaultPassword", 1, utf16(kLogonSecret).size(), 10, 20);
+    held.key = kWinlogon;
+    cur.held = {held};
+    auto j = nlohmann::json::parse(encode_registry_cursor(cur));
+    j["held"][0]["d"] = kLogonSecret;
+    j["held"][0]["s"] = utf16(kLogonSecret).size();
+    j["held"][0]["pd"] = kLogonSecret;
+    return j.dump();
+}
+
+// `rewritten` is `legacy` with only the held value's bytes masked: every other field of every
+// member (tick, ccs, roots, held, loss, hku, offline) is equal.
+void check_same_position(const std::string& legacy, const std::string& rewritten) {
+    auto want = nlohmann::json::parse(legacy);
+    // The fixture has state in every member, so a rewrite that drops one cannot pass.
+    for (const char* member : {"roots", "held", "loss", "hku", "offline"})
+        REQUIRE_FALSE(want.at(member).empty());
+    want["held"][0] =
+        registry_detail::candidate_to_json(registry_detail::candidate_from_json(want["held"][0]));
+    CHECK(want["held"][0]["d"] == std::string{kRegistryMaskedData});
+    CHECK(nlohmann::json::parse(rewritten) == want);
+}
+
+} // namespace
+
+TEST_CASE("masked_registry_cursor: rewrites a legacy cursor at the same position and nothing else",
+          "[echo][registry][pure]") {
+    const std::string legacy = legacy_cursor_with_secret();
+    REQUIRE(carries_secret(legacy, kLogonSecret));
+
+    const auto clean = masked_registry_cursor(legacy);
+    REQUIRE(clean.has_value());
+    CHECK_FALSE(carries_secret(*clean, kLogonSecret));
+    check_same_position(legacy, *clean);
+
+    CHECK_FALSE(masked_registry_cursor(*clean).has_value()); // its own output: nothing to rewrite
+
+    // A held change under an ordinary name, or no held change at all: left byte for byte alone.
+    RegistryCursor other;
+    other.present = true;
+    other.held = {cand("changed", "DefaultUserName", 1, 22, 10, 20)};
+    CHECK_FALSE(masked_registry_cursor(encode_registry_cursor(other)).has_value());
+    CHECK_FALSE(masked_registry_cursor(encode_registry_cursor(RegistryCursor{})).has_value());
+    // A cursor that does not decode is collect()'s to report, never replaced here.
+    CHECK_FALSE(masked_registry_cursor("{not json").has_value());
+}
+
+TEST_CASE("registry source: start() masks a legacy cursor with no tick, which a disabled source never has",
+          "[echo][registry][lifecycle]") {
+    const std::string legacy = legacy_cursor_with_secret();
+    auto t = make_db();
+    REQUIRE(t.db.insert_registry_events_and_cursor({}, legacy, {}).has_value());
+    REQUIRE(carries_secret(*t.db.get_cursor("registry").value(), kLogonSecret)); // seeded
+
+    Fake f;
+    auto src = make_registry_cursor_source(scope1(), f.reader());
+    src->start(t.db); // no collect: a disabled source never ticks, so start() is the only chance
+    const std::string stored = *t.db.get_cursor("registry").value();
+    CHECK_FALSE(carries_secret(stored, kLogonSecret));
+    check_same_position(legacy, stored);
+    // Nothing is replayed or re-baselined: no event, no tier row, no baseline for the root.
+    CHECK(committed_rows().empty());
+    CHECK(count_rows(t.db) == 0);
+    CHECK_FALSE(t.db.try_get_state("registry:" + kRoot).value().has_value());
+
+    // A second start finds nothing to rewrite: the row is byte-identical.
+    Fake f2;
+    auto src2 = make_registry_cursor_source(scope1(), f2.reader());
+    src2->start(t.db);
+    CHECK(*t.db.get_cursor("registry").value() == stored);
+
+    // A cursor that does not decode stays exactly as stored: collect() reports and re-baselines it.
+    auto bad = make_db();
+    REQUIRE(bad.db.insert_registry_events_and_cursor({}, "{not json", {}).has_value());
+    Fake f3;
+    auto src3 = make_registry_cursor_source(scope1(), f3.reader());
+    src3->start(bad.db);
+    CHECK(*bad.db.get_cursor("registry").value() == "{not json");
+}
+
+TEST_CASE("registry source: a failed cursor rewrite at start() changes nothing and is retried",
+          "[echo][registry][lifecycle]") {
+    const std::string legacy = legacy_cursor_with_secret();
+    auto t = make_db();
+    REQUIRE(t.db.insert_registry_events_and_cursor({}, legacy, {}).has_value());
+    Fake f;
+    {
+        InsertTrap trap(t.path, "echo_cursor"); // the cursor upsert fails; reads still work
+        auto src = make_registry_cursor_source(scope1(), f.reader());
+        REQUIRE_NOTHROW(src->start(t.db)); // logged, and the start goes on
+        CHECK(*t.db.get_cursor("registry").value() == legacy); // the disclosed residual: unchanged
+    }
+    auto src = make_registry_cursor_source(scope1(), f.reader()); // the next start
+    src->start(t.db);
+    const std::string stored = *t.db.get_cursor("registry").value();
+    CHECK_FALSE(carries_secret(stored, kLogonSecret));
+    check_same_position(legacy, stored);
 }
 
 

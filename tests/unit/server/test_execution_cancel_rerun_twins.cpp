@@ -168,6 +168,11 @@ ExecutionMutationRequest req(ExecutionMutation what, const std::string& user,
     r.what = what;
     r.execution_id = "exec-1";
     r.username = user;
+    // The surfaces set the OWNERSHIP key from the session (#5557); this helper models an ordinary
+    // non-service session, whose key is its own username.
+    yuzu::server::auth::Session session;
+    session.username = user;
+    r.owner = execution_owner_key(session);
     r.scope = std::move(scope);
     r.audit_context = "surface=test";
     return r;

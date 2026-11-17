@@ -15,7 +15,12 @@
  *      hw_ci_detail_fn`), and no third `ci_detail_fn` composition exists in the file;
  *   2. inside its body, `CiRead::WithSections` selects `get_device_ci_with_sections` (and the
  *      integrity count after it), and every other read mode selects `get_device_ci`;
- *   3. an unwired `device_inventory_store_` degrades `ci` before either store method is named.
+ *   3. an unwired `device_inventory_store_` degrades `ci` before either store method is named;
+ *   4. the keyset page reader behind the bulk CI read (`hw_ci_page_reader`) is defined once,
+ *      captures only `this` and reads `device_inventory_store_` when it is CALLED (a store pointer
+ *      snapshotted at construction would dangle or be null), degrades an unwired store to nullopt
+ *      (never an empty page), and is the very closure assigned to BOTH `HardwareRoutes::Deps`
+ *      (`.ci_page_reader`) and `ToolDeps` (`tool_deps.ci_page_reader`), and to nothing else.
  * It matches identifiers with whitespace removed, so a reformat does not turn it red; a rename of
  * `hw_ci_detail_fn` or a restructuring that keeps the behaviour does, and the fix is to update the
  * names here. Comments are stripped first, so commented-out code cannot satisfy it. Limits: it
@@ -153,6 +158,32 @@ TEST_CASE("build_hw_roster wiring (LEXICAL pin, not behaviour): the roster read 
     CHECK(count_occurrences(roster_body, "eps->rows") >= 1);
 }
 
+// #7549: the CI join is driven by `apply_ci_read`, keyed by the roster's own ids. Every behavioural
+// test calls that helper directly or feeds a hand-built roster, so deleting the call (or wiring it
+// to an empty reader) would leave the Hardware list with blank CI and `ci_degraded=false` - the
+// exact symptom the issue reports - with every unit test green. This pin is what notices.
+TEST_CASE("build_hw_roster wiring (LEXICAL pin, not behaviour): the CI join is the roster-keyed "
+          "apply_ci_read, after the roster read",
+          "[hardware][wiring][lexical][ci_join]") {
+    const std::string roster_body =
+        lambda_body(comment_free_source("server.cpp"), "build_hw_roster", "-> InventoryDevicesResult");
+    REQUIRE_FALSE(roster_body.empty());
+
+    // The one call, with the real store behind the reader and an unwired store as an empty reader.
+    CHECK(count_occurrences(roster_body, "apply_ci_read(") == 1);
+    CHECK(count_occurrences(roster_body, "apply_ci_read(result,device_inventory_store_?CiKeyedReadFn{") == 1);
+    CHECK(count_occurrences(roster_body, ":CiKeyedReadFn{});") == 1);
+    // The reader asks the store for exactly the ids it was handed; the whole-table read is gone.
+    CHECK(count_occurrences(roster_body, "device_inventory_store_->list_device_ci_for(ids)") == 1);
+    CHECK(count_occurrences(roster_body, "list_device_ci(") == 0);
+    // It runs on the rows the roster read produced, so it comes after `apply_roster_read`.
+    const auto roster = roster_body.find("apply_roster_read(result,eps)");
+    const auto join = roster_body.find("apply_ci_read(");
+    REQUIRE(roster != std::string::npos);
+    REQUIRE(join != std::string::npos);
+    CHECK(roster < join);
+}
+
 TEST_CASE("hw_ci_detail_fn wiring (LEXICAL pin, not behaviour): one closure feeds REST and MCP",
           "[hardware][wiring][lexical]") {
     const std::string& src = comment_free_source("server.cpp");
@@ -232,4 +263,49 @@ TEST_CASE("hw_ci_detail_fn wiring (LEXICAL pin, not behaviour): the integrity me
     CHECK(count_occurrences(flat, "register_section_integrity_metrics(metrics_);") == 1);
     CHECK(count_occurrences(flat, "yuzu_hardware_section_integrity_total") ==
           0); // one home for the name
+}
+
+// The bulk CI read (GET /api/v1/hardware-ci and the MCP list_hardware_ci_records) takes its store
+// read from ONE closure in server.cpp. The route and MCP tests use a fake reader, and ServerImpl
+// is not unit-constructible, so nothing else notices if the closure is dropped from one transport
+// (that transport would answer "unavailable" for every call), duplicated with a different body, or
+// rewritten to capture the store pointer at construction.
+TEST_CASE("hw_ci_page_reader wiring (LEXICAL pin, not behaviour): one closure feeds REST and MCP, "
+          "reads the store at call time and never answers an empty page for an unwired store",
+          "[hardware][wiring][lexical][ci_page]") {
+    const std::string& src = comment_free_source("server.cpp");
+    const std::string flat = squeeze(src);
+
+    // Defined exactly once, capturing `this` only (so `device_inventory_store_` is read when the
+    // closure runs, after construction order has settled), taking the keyset query.
+    REQUIRE(count_occurrences(flat, "autohw_ci_page_reader=") == 1);
+    CHECK(count_occurrences(flat, "autohw_ci_page_reader=[this](constDeviceCiKeysetQuery&q)->std::"
+                                  "optional<std::vector<DeviceCiRecord>>{") == 1);
+
+    // Its body: an unwired store is a degrade (nullopt), then the one store method, called on the
+    // member through `this`, and nothing else.
+    const std::string body =
+        lambda_body(src, "hw_ci_page_reader", "std::optional<std::vector<DeviceCiRecord>>");
+    REQUIRE_FALSE(body.empty());
+    const auto unwired = body.find("if(!device_inventory_store_)returnstd::nullopt;");
+    const auto call = body.find("returndevice_inventory_store_->list_device_ci_after(q);");
+    REQUIRE(unwired != std::string::npos);
+    REQUIRE(call != std::string::npos);
+    CHECK(unwired < call);
+    CHECK(count_occurrences(body, "device_inventory_store_") == 2); // the guard and the call
+    CHECK(count_occurrences(body, "list_device_ci_after(") == 1);
+    CHECK(count_occurrences(body, "std::vector<DeviceCiRecord>{}") == 0); // never an empty page
+    CHECK(count_occurrences(body, "get_device_ci") == 0);                 // not the per-id read
+    // the closure is not a store-pointer snapshot: no by-value or by-reference capture of it
+    CHECK(count_occurrences(flat, "hw_ci_page_reader=[=]") == 0);
+    CHECK(count_occurrences(flat, "hw_ci_page_reader=[&") == 0);
+    CHECK(count_occurrences(flat, "hw_ci_page_reader=[store") == 0);
+
+    // The one closure is handed to BOTH consumers and to nothing else: a second composition (or a
+    // consumer wired to a different closure) would let the transports page different tables.
+    CHECK(count_occurrences(flat, ".ci_page_reader=hw_ci_page_reader,") == 1);
+    CHECK(count_occurrences(flat, "tool_deps.ci_page_reader=hw_ci_page_reader;") == 1);
+    CHECK(count_occurrences(flat, ".ci_page_reader=") == 2);
+    CHECK(count_occurrences(flat, "ci_page_reader=nullptr") == 0);
+    CHECK(count_occurrences(flat, "ci_page_reader={}") == 0);
 }

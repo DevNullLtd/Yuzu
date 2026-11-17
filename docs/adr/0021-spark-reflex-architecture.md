@@ -8,9 +8,16 @@ scope: platform — agent detection layer, Reflex response capability, event spi
 
 # 0021 — Sparks as the sole detection layer; Guardian, DEX, and Reflex as sovereign consumers
 
+> **Implementation status (2026-11-14, against dev @ 2c49b4ea0): Partial.** The Spark engine is built
+> (`agents/core/src/spark_engine.*`, `guardian_spark_*`) and wired unconditionally at boot, but
+> `prefer_spark_` is never true in production (`agent.cpp` constructs the Guardian engine with
+> `prefer_spark=false`), so the legacy `IGuard` path is the live detection path. Reflex is
+> design-only (`docs/reflex-design.md`); no Reflex code exists.
+
 Supersedes the previously-considered incremental-migration posture (converge detection mechanisms opportunistically, one subsystem at a time) in favor of the full-convergence rebuild recorded here. Also supersedes §11.1 of `docs/yuzu-guardian-design-v1.1.md` as the authoritative approval-workflow design (see Decision 9).
 
-> **Amendment pending: ADR-3006 (plugin management, proposed 2026-10-06).** ADR-3006 sets
+> **Amendment pending delivery: ADR-3006 (plugin management, 2026-10-06; accepted, status
+> reconciled 2026-11-14).** ADR-3006 sets
 > the direction that `--spark-disable` stops being the only rollback lever for the Spark
 > engine: it becomes a one-time starting-state input that the server adopts as a visible
 > off-rule, and the engine becomes a unit that is switched off at runtime. Off means the engine

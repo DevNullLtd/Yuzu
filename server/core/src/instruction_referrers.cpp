@@ -36,7 +36,7 @@ DefinitionReferrersFn make_definition_referrers_fn(ScheduleEngine* schedules,
                          "it recovers",
                          what);
     };
-    return [schedules, workflows, policies, source_failed](
+    auto single = [schedules, workflows, policies, source_failed](
                const std::string& definition_id,
                const DefinitionReferrerExclusions& exclude)
                -> std::expected<std::vector<DefinitionReferrer>, std::string> {
@@ -83,6 +83,97 @@ DefinitionReferrersFn make_definition_referrers_fn(ScheduleEngine* schedules,
             out.push_back({"policy fragment", std::move(id)});
         return out;
     };
+
+    // The batch form (the pack uninstall): ONE read per source for the whole id list, in the same
+    // source order, so the number of store reads is at most three however many definitions are
+    // asked about. A source's ids are distinct (one row per schedule, workflow or fragment), and
+    // the three kinds never collide, so no de-duplication is needed here. A later source is not
+    // read once `limit` referrers are in hand: the caller only needs to know the list is longer
+    // than it shows.
+    auto batch = [schedules, workflows, policies, source_failed](
+                     const std::vector<std::string>& definition_ids,
+                     const DefinitionReferrerExclusions& exclude, std::size_t limit)
+        -> std::expected<std::vector<DefinitionReferrer>, std::string> {
+        if (!schedules || !workflows || !policies) {
+            source_failed("unwired", "a referrer source is not wired");
+            return std::unexpected(std::string("a referrer source is not wired"));
+        }
+        std::vector<DefinitionReferrer> out;
+        if (definition_ids.empty() || limit == 0)
+            return out;
+        const int per_source = static_cast<int>(std::min<std::size_t>(limit, 1000000));
+        const auto full = [&] { return out.size() >= limit; };
+
+        auto sched = schedules->schedules_referencing_definitions(definition_ids, per_source);
+        if (!sched) {
+            source_failed("schedule", "the schedule read failed");
+            return std::unexpected(std::string("schedule read failed"));
+        }
+        for (auto& id : *sched)
+            out.push_back({"schedule", std::move(id)});
+
+        if (!full()) {
+            auto wf = workflows->workflows_referencing_instructions(definition_ids, per_source,
+                                                                    exclude.workflow_ids);
+            if (!wf) {
+                source_failed("workflow", "the workflow read failed");
+                return std::unexpected(std::string("workflow read failed"));
+            }
+            for (auto& id : *wf)
+                out.push_back({"workflow", std::move(id)});
+        }
+
+        if (!full()) {
+            auto frag = policies->fragments_referencing_instructions(definition_ids, per_source,
+                                                                     exclude.fragment_ids);
+            if (!frag) {
+                source_failed("policy fragment", "the policy fragment read failed");
+                return std::unexpected(std::string("policy fragment read failed"));
+            }
+            for (auto& id : *frag)
+                out.push_back({"policy fragment", std::move(id)});
+        }
+        if (out.size() > limit)
+            out.resize(limit);
+        return out;
+    };
+    return DefinitionReferrersFn::with_batch(DefinitionReferrersFn(std::move(single)),
+                                             std::move(batch));
+}
+
+DefinitionReferrersFn::Result
+DefinitionReferrersFn::lookup_many(const std::vector<std::string>& definition_ids,
+                                   const Exclusions& exclusions, std::size_t limit) const {
+    if (!fn_)
+        return std::unexpected(std::string("the referrer lookup is not wired"));
+    std::vector<std::string> ids;
+    ids.reserve(definition_ids.size());
+    for (const auto& id : definition_ids)
+        if (!id.empty())
+            ids.push_back(id);
+    if (ids.empty() || limit == 0)
+        return std::vector<DefinitionReferrer>{};
+    if (batch_)
+        return batch_(ids, exclusions, limit);
+
+    // No batch form: one call per id, de-duplicated by (kind, id) with a hash set, stopping as
+    // soon as `limit` distinct referrers are in hand.
+    std::vector<DefinitionReferrer> out;
+    std::unordered_set<std::string> seen;
+    for (const auto& id : ids) {
+        auto found = fn_(id, exclusions);
+        if (!found)
+            return std::unexpected(std::move(found.error()));
+        for (auto& r : *found) {
+            // kind never contains a NUL, so the separator keeps (kind, id) pairs distinct
+            if (!seen.insert(r.kind + '\0' + r.id).second)
+                continue;
+            out.push_back(std::move(r));
+            if (out.size() >= limit)
+                return out;
+        }
+    }
+    return out;
 }
 
 DefinitionPackAdvisoryFn make_definition_pack_advisory_fn(ProductPackStore* packs) {
@@ -124,7 +215,7 @@ std::string pack_advisory_note(const DefinitionPackAdvisoryFn& fn,
 }
 
 namespace {
-/// "(used by policy <id> (<name>), <id>, +N)": the policies holding a policy fragment alive, at
+/// "(used by policy <id> (<name>), <id>, +N)": the policies holding a pack-own fragment alive, at
 /// most `kMaxHeldByPoliciesNamed` of them, each id and name bounded and folded; the name is left
 /// out when empty. `N` is a lower bound (the caller reads one policy past the cap). Empty when
 /// `held_by` is.
@@ -169,6 +260,19 @@ std::string describe_definition_referrers(const std::vector<DefinitionReferrer>&
            (referrers.size() == 1 ? " item" : " items") + " and was NOT deleted: " +
            list_referrers(referrers) +
            ". Remove each of them (or point it at another definition), then delete this one.";
+}
+
+std::string describe_pack_uninstall_blockers(const std::vector<DefinitionReferrer>& referrers) {
+    const bool policy_held = std::any_of(referrers.begin(), referrers.end(), [](const auto& r) {
+        return !r.held_by.empty();
+    });
+    return "the pack was NOT uninstalled; " + std::to_string(referrers.size()) +
+           (referrers.size() == 1 ? " item still uses" : " items still use") +
+           " one of its definitions: " + list_referrers(referrers) +
+           ". Remove each of them (or point it at another definition), then retry the uninstall." +
+           (policy_held ? " A pack policy fragment that a policy uses survives the uninstall: "
+                          "delete that policy, then retry."
+                        : "");
 }
 
 } // namespace yuzu::server

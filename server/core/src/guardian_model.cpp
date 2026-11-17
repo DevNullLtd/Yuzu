@@ -33,9 +33,11 @@ guardian_status_rollup(GuaranteedStateStore& store,
     auto rule_names_result = store.rule_names();
     auto errored_result = store.errored_rule_count(agent_scope);
     auto uncertain_result = store.uncertain_rule_count(agent_scope);
-    // UP-14: the agents whose latest unpaired event is later than their pair clock, under the SAME
-    // agent_scope (applied in SQL by the store, so a hidden agent never appears in the ids or the
-    // count). A failed read degrades the whole rollup like the three above, never a silent zero.
+    // UP-14: the agents whose latest unpaired event is later than their pair clock, or whose pair
+    // clock is recorded more than 300 s in the database's future (the future-clock arm), under the
+    // SAME agent_scope (applied in SQL by the store, so a hidden agent never appears in the ids or
+    // the count). A failed read degrades the whole rollup like the three above, never a silent
+    // zero.
     auto unordered_result = store.unordered_agents(agent_scope);
     if (!rule_names_result || !errored_result || !uncertain_result || !unordered_result)
         return std::nullopt;
