@@ -325,7 +325,20 @@ TEST_CASE("ResultEnvelope: parse_result is total over wrong-typed agent JSON (F6
     CHECK(r.rows[0].values.at("ok") == "1");
 
     // Out-of-int-range error_code must not wrap or throw.
-    REQUIRE_NOTHROW(parse_result(R"({"columns":[],"rows":[],"error_code":99999999999})", ""));
-    // Malformed schema entries too.
-    REQUIRE_NOTHROW(parse_result(R"({"columns":[],"rows":[]})", R"([{"name":1,"type":2}])"));
+    InstructionResult big;
+    REQUIRE_NOTHROW(big = parse_result(
+                        R"({"columns":[],"rows":[],"error_code":99999999999,"duration_ms":7})", ""));
+    CHECK(big.error_code == 0);
+    CHECK(big.duration_ms == 7); // a valid sibling member is still read
+
+    // Malformed schema entries are ignored (the column keeps its own declared type) ...
+    const std::string cols = R"({"columns":[{"name":"a","type":"int32"}],"rows":[]})";
+    InstructionResult bad_schema;
+    REQUIRE_NOTHROW(bad_schema = parse_result(cols, R"([{"name":1,"type":2}])"));
+    REQUIRE(bad_schema.columns.size() == 1);
+    CHECK(bad_schema.columns[0].type == ColumnType::Int32);
+    // ... while a well-formed schema entry still takes precedence.
+    const auto good_schema = parse_result(cols, R"([{"name":"a","type":"string"}])");
+    REQUIRE(good_schema.columns.size() == 1);
+    CHECK(good_schema.columns[0].type == ColumnType::String);
 }

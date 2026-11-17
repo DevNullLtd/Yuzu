@@ -230,9 +230,9 @@ namespace detail {
 /// Strict UTF-8 repair: copies every well-formed sequence (Unicode Table 3-7:
 /// no overlong forms, no surrogates, nothing above U+10FFFF) and replaces each
 /// byte that does not begin or continue one with U+FFFD, setting `replaced`.
-/// yuzu::util::sanitize_utf8 is deliberately NOT used: it only catches lone and
-/// truncated bytes and passes overlong, surrogate and out-of-range sequences,
-/// all of which the protobuf transport rejects.
+/// yuzu::util::sanitize_utf8 is deliberately NOT used here: it used to catch only lone and
+/// truncated bytes (it now rejects overlong, surrogate and out-of-range sequences too, WP07 F70),
+/// and this function replaces with U+FFFD rather than '?'.
 [[nodiscard]] inline std::string repair_utf8(std::string_view s, bool& replaced) {
     const auto in_range = [&s](std::size_t i, unsigned lo, unsigned hi) {
         return i < s.size() && static_cast<unsigned char>(s[i]) >= lo &&

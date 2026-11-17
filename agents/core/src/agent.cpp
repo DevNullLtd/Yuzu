@@ -364,8 +364,16 @@ struct CommandContextImpl {
         std::string scrubbed;
         if (yuzu::shared::count_invalid_wire_bytes(text) != 0) {
             scrubbed.assign(text);
-            yuzu::shared::scrub_wire_bytes(scrubbed);
+            const auto replaced = yuzu::shared::scrub_wire_bytes(scrubbed);
             text = scrubbed.c_str();
+            // Observable, throttled (first and every power-of-two thereafter): a plugin that
+            // keeps emitting non-UTF-8 is a plugin bug or hostile endpoint data worth seeing.
+            static std::atomic<std::uint64_t> scrubbed_writes{0};
+            const auto n = scrubbed_writes.fetch_add(1, std::memory_order_relaxed) + 1;
+            if ((n & (n - 1)) == 0)
+                spdlog::warn("agent: replaced {} non-UTF-8 byte(s) in plugin output for command "
+                             "{} (occurrence #{}, logged on powers of two)",
+                             replaced, yuzu::log_id_token(command_id), n);
         }
         std::lock_guard lock(buf_mu);
         size_t len = std::strlen(text);
@@ -599,7 +607,12 @@ YUZU_EXPORT void yuzu_ctx_write_output(YuzuCommandContext* ctx, const char* text
     if (!ctx || !text)
         return;
     auto* impl = reinterpret_cast<CommandContextImpl*>(ctx);
-    impl->append_output(text);
+    // C ABI boundary: nothing may unwind into the plugin. append_output allocates (buffering, and
+    // the F70 scrub copy); on bad_alloc this write is dropped rather than crossing the ABI.
+    try {
+        impl->append_output(text);
+    } catch (...) { // NOLINT(bugprone-empty-catch) -- no safe recovery or logging under OOM
+    }
 }
 
 YUZU_EXPORT void yuzu_ctx_report_progress(YuzuCommandContext* ctx, int percent) {

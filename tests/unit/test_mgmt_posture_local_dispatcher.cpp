@@ -254,7 +254,7 @@ TEST_CASE("mgmt_posture execute seam: unknown action is escaped; a throwing leg 
 
     // ... and invalid UTF-8 bytes are replaced first (a protobuf string field must be UTF-8),
     // exactly as posture_row does for its values: an invalid byte becomes '?', a valid sequence
-    // survives. sanitize_utf8 does not yet reject overlong or surrogate forms (#4864).
+    // survives. sanitize_utf8 now also rejects overlong and surrogate forms (WP07 F70, #4864).
     const auto binary = dispatcher.run(&throwing, "bad\xff!");
     CHECK(binary.rc == 1);
     const auto brows = captured_rows(binary.captured);
@@ -275,4 +275,26 @@ TEST_CASE("mgmt_posture execute seam: unknown action is escaped; a throwing leg 
     CHECK(d.result_status == YUZU_RESULT_STATUS_PERMISSION_DENIED);
     CHECK(d.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
     CHECK(d.result_provenance == "linux:mgmt_posture:sssd_conf:permission_denied");
+}
+
+// F70: the host enforces the UTF-8 wire contract once, in CommandContextImpl::append_output, for
+// every plugin: a raw plugin write of invalid / overlong / surrogate bytes reaches the (capture)
+// buffer as '?', well-formed text survives, and the row/field boundaries are unchanged.
+namespace {
+int raw_bytes_execute(YuzuCommandContext* ctx, const char*, const YuzuParam*, size_t) {
+    yuzu_ctx_write_output(ctx, "bad\xff|x");
+    yuzu_ctx_write_output(ctx, "over\xc0\x80|ok");
+    yuzu_ctx_write_output(ctx, "sur\xed\xa0\x80|ok");
+    yuzu_ctx_write_output(ctx, "caf\xc3\xa9|fine");
+    return 0;
+}
+} // namespace
+
+TEST_CASE("host scrubs plugin output to well-formed UTF-8 before buffering (F70)",
+          "[agent][utf8][seam]") {
+    yuzu::agent::LocalDispatcher dispatcher;
+    YuzuPluginDescriptor raw{};
+    raw.execute = &raw_bytes_execute;
+    const auto r = dispatcher.run(&raw, "x");
+    CHECK(r.captured == "bad?|x\nover??|ok\nsur???|ok\ncaf\xc3\xa9|fine");
 }
