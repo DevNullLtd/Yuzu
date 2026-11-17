@@ -334,7 +334,11 @@ struct Config {
     std::filesystem::path analytics_jsonl_path; // empty = disabled
 
     // Metrics
-    bool metrics_require_auth{true}; // Require auth for remote /metrics access
+    bool metrics_require_auth{true}; // Require auth for /metrics access
+    // WP06 F57: opt-in. true = a direct loopback peer may read /metrics unauthenticated (no
+    // forwarding headers). Default OFF: a same-host proxy/sidecar makes remote callers look
+    // like 127.0.0.1.
+    bool metrics_trust_loopback{false};
 
     // Security response headers (SOC2-C1)
     // Extra source-list entries appended to script-src, style-src, connect-src,

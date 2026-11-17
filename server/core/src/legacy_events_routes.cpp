@@ -3,9 +3,11 @@
 #include "event_bus.hpp"
 #include "http_route_sink.hpp"
 #include "principal_quota_gate.hpp" // adopt_quota_slot_into_stream
+#include "rest_a4_envelope.hpp"
 #include "stream_budget.hpp"
 
 #include <httplib.h>
+#include <spdlog/spdlog.h>
 
 #include <cstddef>
 #include <memory>
@@ -43,6 +45,41 @@ void register_legacy_events_routes(HttpRouteSink& sink, Deps deps) {
                 req, res, "events.stream.access_denied",
                 "service-scoped tokens may not open the fleet-wide legacy event stream", "", ""))
             return;
+
+        // WP06 F11: authorization. The bus carries every non-Forensics command
+        // output row, status/timing and agent / pending-agent ids with NO
+        // per-agent tagging, so it cannot be narrowed to a caller's visible
+        // set (and `execution_event_scope.hpp` is for the ExecutionEventBus,
+        // not this bus). Admit ONLY unrestricted (TOP) authority on both
+        // Response:Read and Execution:Read via the shared admit-then-filter
+        // chokepoint (`require_fleet_read`: engine principals RBAC-only
+        // default-deny, fail CLOSED on an RBAC degrade). A scoped-but-admitted
+        // caller is refused, never given a partial stream. Checked BEFORE the
+        // lease and the subscribe so a refused caller pins nothing.
+        if (!deps.fleet_read_fn) {
+            spdlog::error("/events: fleet_read_fn unwired -- misconfigured call site; "
+                          "failing closed");
+            res.status = 503;
+            res.set_content(detail::error_json_a4(503, "service unavailable",
+                                                  detail::make_correlation_id()),
+                            "application/json");
+            return;
+        }
+        for (const char* type : {"Response", "Execution"}) {
+            const auto gate = deps.fleet_read_fn(req, res, type, "Read");
+            if (!gate.admitted)
+                return; // the gate rendered its own 401/403/503 and audit row
+            if (gate.scope.has_value()) {
+                res.status = 403;
+                res.set_content(
+                    detail::error_json_a4(
+                        403, std::string("permission denied: ") + type + ":Read",
+                        detail::make_correlation_id(),
+                        detail::A4ErrorOpts{.permission = std::string(type) + ":Read"}),
+                    "application/json");
+                return;
+            }
+        }
 
         std::string principal = "anonymous";
         std::size_t per_principal = detail::kPerPrincipalAnonymous;

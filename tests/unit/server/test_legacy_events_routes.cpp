@@ -38,6 +38,7 @@
 #include <fstream>
 #include <optional>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 using namespace yuzu::server;
@@ -70,6 +71,13 @@ struct Harness {
 
     std::optional<auth::Session> session_to_return;
 
+    // WP06 F11: fake `require_fleet_read`. Default = admitted with TOP scope.
+    bool fleet_wired{true};
+    bool fleet_admit{true};
+    int fleet_deny_status{403};
+    yuzu::server::authz::VisibleSet fleet_scope{std::nullopt};
+    std::vector<std::string> fleet_calls;
+
     yuzu::server::test::TestRouteSink sink;
 
     explicit Harness(EventBus* b) : bus(b) {}
@@ -91,6 +99,18 @@ struct Harness {
             }
             return false;
         };
+        if (fleet_wired)
+            deps.fleet_read_fn = [this](const httplib::Request&, httplib::Response& res,
+                                        const std::string& type,
+                                        const std::string& op) -> authz::FleetReadGate {
+                fleet_calls.push_back(type + ":" + op);
+                if (!fleet_admit) {
+                    res.status = fleet_deny_status;
+                    res.set_content(R"({"error":{"code":403}})", "application/json");
+                    return authz::FleetReadGate{};
+                }
+                return authz::FleetReadGate{.admitted = true, .scope = fleet_scope};
+            };
         deps.resolve_session_fn = [this](const httplib::Request&) { return session_to_return; };
         legacy_events::register_legacy_events_routes(sink, deps);
     }
@@ -129,6 +149,89 @@ TEST_CASE("legacy_events_routes: a service-scoped-token denial 403s before subsc
           "service-scoped tokens may not open the fleet-wide legacy event stream");
     CHECK(h.deny_calls[0].target_type.empty());
     CHECK(h.deny_calls[0].target_id.empty());
+}
+
+// ── WP06 F11: fleet-read authorization ──────────────────────────────────
+
+TEST_CASE("legacy_events_routes: F11 a caller the fleet-read gate refuses never subscribes "
+          "and never takes a lease",
+          "[server][routes][legacy_events_routes]") {
+    EventBus bus;
+    StreamBudget budget{StreamBudget::Config{/*global_cap=*/4}};
+    Harness h{&bus};
+    h.budget = &budget;
+    h.fleet_admit = false;
+    h.wire();
+
+    auto res = h.sink.Get("/events");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(bus.listener_count() == 0);
+    CHECK(budget.active() == 0);
+    REQUIRE(h.fleet_calls.size() == 1);
+    CHECK(h.fleet_calls[0] == "Response:Read");
+}
+
+TEST_CASE("legacy_events_routes: F11 a scoped (non-empty or deny-all) admit is refused 403, "
+          "because the legacy bus cannot be filtered per agent",
+          "[server][routes][legacy_events_routes]") {
+    EventBus bus;
+    Harness h{&bus};
+    SECTION("non-empty scope") {
+        h.fleet_scope = std::unordered_set<std::string>{"agent-a"};
+    }
+    SECTION("empty (deny-all) scope") {
+        h.fleet_scope = yuzu::server::authz::deny_all();
+    }
+    h.wire();
+
+    auto res = h.sink.Get("/events");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(res->body.find("Response:Read") != std::string::npos);
+    CHECK(bus.listener_count() == 0);
+}
+
+TEST_CASE("legacy_events_routes: F11 an unwired fleet_read_fn fails CLOSED (503)",
+          "[server][routes][legacy_events_routes]") {
+    EventBus bus;
+    Harness h{&bus};
+    h.fleet_wired = false;
+    h.wire();
+
+    auto res = h.sink.Get("/events");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(bus.listener_count() == 0);
+}
+
+TEST_CASE("legacy_events_routes: F11 the service-scoped deny still runs before the fleet gate",
+          "[server][routes][legacy_events_routes]") {
+    EventBus bus;
+    Harness h{&bus};
+    h.deny_service_scoped = true;
+    h.wire();
+
+    auto res = h.sink.Get("/events");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(h.fleet_calls.empty());
+}
+
+TEST_CASE("legacy_events_routes: F11 admitted with TOP scope checks both Response and "
+          "Execution Read, then subscribes",
+          "[server][routes][legacy_events_routes]") {
+    EventBus bus;
+    Harness h{&bus};
+    h.wire();
+
+    auto res = h.sink.Get("/events");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(bus.listener_count() == 1);
+    REQUIRE(h.fleet_calls.size() == 2);
+    CHECK(h.fleet_calls[0] == "Response:Read");
+    CHECK(h.fleet_calls[1] == "Execution:Read");
 }
 
 // ── Happy path: subscribes, sets the documented headers ────────────────
@@ -222,4 +325,8 @@ TEST_CASE("legacy_events_routes: wiring -- server.cpp still calls "
     REQUIRE(in.is_open());
     std::string src{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
     CHECK(src.find("register_legacy_events_routes(") != std::string::npos);
+    // WP06 F11: the fleet-read gate must be wired into the Deps (null = 503).
+    const auto at = src.find("legacy_events::Deps{");
+    REQUIRE(at != std::string::npos);
+    CHECK(src.substr(at, 600).find(".fleet_read_fn = fleet_read_fn") != std::string::npos);
 }

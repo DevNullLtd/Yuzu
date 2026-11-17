@@ -665,6 +665,13 @@ int main(int argc, char* argv[]) {
     app.add_flag("--metrics-no-auth", "Allow unauthenticated /metrics access from any source")
         ->each([&cfg](const std::string&) { cfg.metrics_require_auth = false; })
         ->envname("YUZU_METRICS_NO_AUTH");
+    // WP06 F57: the loopback /metrics exemption is opt-in (default OFF).
+    app.add_flag("--metrics-trust-loopback", cfg.metrics_trust_loopback,
+                 "Allow unauthenticated /metrics from a direct loopback (127.0.0.1/::1) peer. "
+                 "Off by default: set it only when nothing on this host (reverse proxy, mesh "
+                 "sidecar, tunnel) forwards requests to the server, or those requests would "
+                 "bypass /metrics authentication")
+        ->envname("YUZU_METRICS_TRUST_LOOPBACK");
 
     // Security response headers (SOC2-C1)
     app.add_option("--csp-extra-sources", cfg.csp_extra_sources,

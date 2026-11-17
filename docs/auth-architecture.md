@@ -5716,7 +5716,7 @@ upgraded before `source_ip` is relied on. See `docs/user-manual/gateway.md`,
 
 - **HTTPS by default** — `https_enabled` defaults to `true`. Operators must provide `--https-cert` and `--https-key`, or use `--no-https` for development. The `--https` flag was replaced with `--no-https`.
 - **Secure bind default** — Web UI binds to `127.0.0.1` by default (not `0.0.0.0`). A startup warning is logged if overridden to all interfaces.
-- **Metrics auth** — `/metrics` allows unauthenticated access from localhost only. Remote access requires authentication. `--metrics-no-auth` overrides for monitoring infrastructure.
+- **Metrics auth** — `/metrics` requires authentication from every peer by default; a loopback peer is NOT exempt (a same-host proxy or sidecar makes remote callers look loopback, WP06 F57). `--metrics-trust-loopback` is the explicit opt-in for a direct loopback peer (still refused when a forwarding header is present); `--metrics-no-auth` overrides for monitoring infrastructure. The one decision is `metrics_loopback_peer_exempt` in `web_utils.hpp`, called from the pre-routing handler.
 - **Private key permission validation** — Server refuses to start if TLS private key files are group/others-readable on Unix. Uses `std::filesystem::perms` check. Skipped on Windows.
 - **CORS on all API endpoints** — CORS headers applied via `set_post_routing_handler` for all `/api/` paths.
 - **JSON error envelope** — All error responses use structured `{"error":{"code":N,"message":"..."},"meta":{"api_version":"v1"}}` envelope. Health probes (`/livez`, `/readyz`) use `{"status":"..."}` contract.

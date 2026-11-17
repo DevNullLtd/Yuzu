@@ -14675,6 +14675,8 @@ backport-aware matching (M1b/OVAL) lands.
 
 #### `GET /events`
 
+**Authorization (WP06 F11).** This legacy stream carries untagged, pre-rendered output rows, command status and agent / pending-agent ids for the whole fleet, so it cannot be narrowed per device. It is therefore opened only by a caller with **unrestricted** `Response:Read` **and** `Execution:Read` authority (the same admit-then-filter gate as `GET /api/v1/events`, `require_fleet_read`): a caller whose read authority is confined to a management group or a service, a role without the grants, and every engine principal get `403` (an unreadable RBAC store, `503`), and a service-scoped token is denied as before. Under the default RBAC-off mode every signed-in human is still admitted. The dashboard console's live panel is unavailable to a scoped role; use the scoped `GET /api/v1/events` stream instead. As with the other two streams, the scope is decided once at connect and is not re-checked for the life of the connection (#7815).
+
 Server-Sent Events stream for real-time dashboard updates. Events include agent connections/disconnections, command responses, and system notifications. Live output events never carry a row written by a Forensics-tier plugin (see "Forensics-tier rows" under Command/Instruction Responses); a Forensics-tier frame publishes nothing to the live output stream (no row, no notice; the timing and command-status events, which carry no plugin output, still go out), so the dashboard Console's results table stays on its "Waiting for results..." placeholder; open the execution results instead.
 
 **Example (curl):**

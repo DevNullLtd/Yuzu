@@ -20,6 +20,7 @@
 
 #include <yuzu/server/auth.hpp>
 
+#include "authz_model.hpp" // authz::VisibleSet (WP06 F4)
 #include "http_route_sink.hpp"
 #include "policy_store.hpp"
 
@@ -55,6 +56,28 @@ public:
                                            const nlohmann::json& attrs,
                                            const nlohmann::json& payload_data)>;
 
+    /// WP06 F4 (interim; #6065 owns the dispatch-identity change and is untouched): the
+    /// REQUEST principal's authority over ONE instruction id. A policy fragment's check /
+    /// postCheck / fix instruction later runs through the evaluator as the SYSTEM caller, so the
+    /// per-action RBAC, the `ExecuteGate` and per-device visibility are never consulted at fire
+    /// time. This closure is the authoring-time (and manual-remediate) check: it resolves the
+    /// instruction id to its (plugin, action), runs the SHARED `authorize_dispatch` dry run for
+    /// the request's principal as a NON-system caller, and reports the principal's per-device
+    /// execution visibility. server.cpp wires it from the same `authorize_dispatch` closure MCP
+    /// and the workflow execute twins use (set after construction: that closure is defined
+    /// later than this route group). Unset or unresolvable = REFUSED (fail closed).
+    struct InstructionAuthority {
+        bool ok{false};
+        int status{403};         ///< HTTP status to answer when !ok (401/403/400/503)
+        std::string message;     ///< operator-facing refusal text when !ok
+        authz::VisibleSet visible{authz::deny_all()}; ///< exec visibility (nullopt = unrestricted)
+    };
+    using AuthorizeInstructionFn =
+        std::function<InstructionAuthority(const httplib::Request&, const std::string& instruction_id)>;
+    void set_authorize_instruction_fn(AuthorizeInstructionFn fn) {
+        authorize_instruction_fn_ = std::move(fn);
+    }
+
     /// Register all policy/fragment mutator routes on the given server.
     ///
     /// Production overload — wraps `httplib::Server&` in an HttplibRouteSink
@@ -88,6 +111,12 @@ private:
     PolicyStore* policy_store_{};
     PolicyEvaluator* policy_evaluator_{};
     yuzu::MetricsRegistry* metrics_{};
+    AuthorizeInstructionFn authorize_instruction_fn_;
+
+    /// WP06 F4: authorize every instruction a fragment YAML names for the request principal.
+    /// Writes the refusal (and a denied audit row) and returns false on any refusal.
+    bool authorize_fragment_instructions(const httplib::Request& req, httplib::Response& res,
+                                         const std::string& yaml_source);
 };
 
 } // namespace yuzu::server

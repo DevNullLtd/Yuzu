@@ -320,6 +320,8 @@ plugin's response row is still stored (it is readable only through the
 default); only the verdict and `check_result` are withheld. A separate
 follow-up (#6065) tracks the dispatch-side authorization of policy checks.
 
+**Interim authoring-time authorization (WP06 F4).** Until #6065 changes the identity a policy's instructions dispatch as (they still run as the system caller, and the quarantine carve-out is untouched), the principal who creates a fragment (`POST /api/policy-fragments`) must be authorized, as an ordinary non-system caller, for the `plugin.action` of every instruction the fragment names: `check`, `postCheck` and `fix`. The same dry run as `execute_instruction` is used (RBAC grant, `ExecuteGate`, kill switch), so an author who may not dispatch an approval-gated pair such as `script_exec.exec` is refused `403` and nothing is stored; an unknown instruction is `400`; an unreadable instruction store is `503`. Manual remediate (`POST /api/policies/{id}/remediate`) re-runs that check for the operator against the fix instruction and limits the targets to devices the operator may execute on (`Execution:Execute` visibility; the exact send set is intersected, never widened). Residuals: a fragment already stored, and one stored by an author who is later demoted, keeps running (there is no author column); fragments installed through a product pack are not covered; the background evaluator is unchanged.
+
 This release stores no check output for such a policy, so there is nothing to
 clean up for it; deleting a policy (`DELETE /api/policies/{id}`, `Policy:Delete`)
 removes its status rows as before. The deployment assumption behind this is the

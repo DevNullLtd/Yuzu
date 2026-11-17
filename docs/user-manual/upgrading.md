@@ -11,6 +11,21 @@ A statement elsewhere on this page that a rollback, a mixed fleet or an in-place
 
 Running `dev` between releases? Some entries below describe changes on `dev` that are not in a release yet. For what a `git pull` of `dev` changed, run the repository script `python3 scripts/whats-new.py` (`--versions` for the version bumps, rebuild notes and Docker image bumps); see `changelog.d/README.md`.
 
+## ⚠️ Breaking: `/metrics` no longer trusts a loopback peer (WP06 F57)
+
+A request to `/metrics` from `127.0.0.1` or `::1` used to skip authentication, so a reverse proxy, mesh sidecar or tunnel on the server host exposed `/metrics` to its remote callers. The exemption is now the explicit `--metrics-trust-loopback` flag (`YUZU_METRICS_TRUST_LOOPBACK`, default off). A host-local Prometheus or `curl http://localhost:8080/metrics` now needs a bearer token, or the flag, or `--metrics-no-auth`. Shipped compose files and UAT launchers already pass `--metrics-no-auth`. See [Metrics](metrics.md#get-metrics).
+
+## Behaviour change: MCP approval tickets redact secret arguments; rotate any credential ever sent through one (WP06 F12)
+
+Approval tickets minted for a supervised-tier MCP call stored the raw tool arguments, so `secret` (`confirm_engine_rotation`, `confirm_api_token_rotation`), `grant_secret`, `grant_id` and `client_secret` were readable by every `Approval:Read` holder and sit in Postgres and its backups. The ticket now binds a `<redacted:sha256:...>` marker, and the approval store's v5 migration blanks the subject of every existing MCP ticket that names one of those keys and expires the pending ones (an approved but unconsumed ticket must be requested again). The migration cannot clean backups or replicas: **rotate every engine credential, API-token rotation secret and Entra `client_secret` that was ever submitted through a supervised MCP call.**
+
+## Behaviour change: the legacy `GET /events` stream, schedules, policy fragments and manual remediate are authorized more strictly (WP06)
+
+- `GET /events` needs unrestricted `Response:Read` and `Execution:Read`; a group- or service-scoped role and engine principals get `403` (the dashboard console's live panel is unavailable to them).
+- With RBAC off, a schedule whose creator is no longer an administrator stops firing mutating actions (Read-class actions still fire).
+- Creating a policy fragment checks the author against each instruction's `plugin.action`; manual remediate re-checks the fix pair and limits targets to the operator's visible devices.
+- The agent's session id is no longer logged (`session=<fingerprint>`); scripts that read `session=` from the agent log still match.
+
 ## ⚠️ Breaking: on-demand software sync asks for confirmation, is paced instead of capped at 500 devices, and cools down per group
 
 **In short.** Affected: anything that calls `POST /api/v1/hardware/sync` or the MCP tool `sync_hardware_software` for a whole group or the whole fleet (the Software page's **Whole fleet** choice, scripts and agentic workers). To do: send `"confirm": true` with a `group:<id>` or `__all__` scope, give the caller the global `ManagementGroup:Write` grant if it names the whole fleet, and stop relying on the 500-device refusal and the 60-second per-operator gap.

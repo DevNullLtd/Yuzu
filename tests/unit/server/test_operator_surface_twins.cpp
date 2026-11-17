@@ -94,8 +94,9 @@ namespace {
 // read unchanged.
 bool compose_arming_check(const CommandCapabilityRegistry& registry, const RbacStore* rbac,
                           const std::string& principal, const std::string& plugin,
-                          const std::string& action) {
-    return yuzu::server::schedule_arming_permitted(registry, rbac, principal, plugin, action);
+                          const std::string& action, bool legacy_admin = true) {
+    return yuzu::server::schedule_arming_permitted(registry, rbac, principal, plugin, action,
+                                                   legacy_admin);
 }
 
 } // namespace
@@ -217,6 +218,27 @@ TEST_CASE("arming_check composition: RBAC off arms for a human but never for an 
     REQUIRE_FALSE(rbac.is_rbac_enabled());
     CHECK(compose_arming_check(registry, &rbac, "alice", "filesystem", "exists"));
     CHECK_FALSE(compose_arming_check(registry, &rbac, "engine:vuln", "filesystem", "exists"));
+}
+
+TEST_CASE("arming_check composition: RBAC off, a creator who is no longer admin cannot arm a "
+          "non-Read pair, but still arms a Read pair (WP06 F53)",
+          "[server][routes][mcp][pg]") {
+    CommandCapabilityRegistry registry{capdecls::plugin_action_catalogue_a()};
+    TWINS_RBAC(rbac);
+    rbac.set_rbac_enabled(false);
+    REQUIRE_FALSE(rbac.is_rbac_enabled());
+    // filesystem.create_temp is a Write-class pair; filesystem.exists is Read.
+    CHECK(compose_arming_check(registry, &rbac, "alice", "filesystem", "create_temp",
+                               /*legacy_admin=*/true));
+    CHECK_FALSE(compose_arming_check(registry, &rbac, "alice", "filesystem", "create_temp",
+                                     /*legacy_admin=*/false));
+    CHECK(compose_arming_check(registry, &rbac, "alice", "filesystem", "exists",
+                               /*legacy_admin=*/false));
+    // An engine principal is never armed under legacy-open, admin bit or not.
+    CHECK_FALSE(compose_arming_check(registry, &rbac, "engine:vuln", "filesystem", "exists",
+                                     /*legacy_admin=*/true));
+    CHECK_FALSE(compose_arming_check(registry, &rbac, "engine:vuln", "filesystem", "create_temp",
+                                     /*legacy_admin=*/true));
 }
 
 TEST_CASE("arming_check composition: RBAC legacy-open (disabled) admits regardless of grant",

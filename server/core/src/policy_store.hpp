@@ -137,6 +137,14 @@ public:
     /// helper because route layers should not own YAML parsing themselves.
     static std::string peek_fragment_name(const std::string& yaml_source);
 
+    /// WP06 F4 (interim): the instruction ids a PolicyFragment YAML names, as
+    /// (role, instruction_id) pairs in check / postCheck / fix order, empty ones
+    /// omitted. `role` is "check", "postCheck" or "fix". Uses the SAME section
+    /// extraction `create_fragment` stores from, so what is authorized at
+    /// authoring time is what the evaluator will later dispatch.
+    static std::vector<std::pair<std::string, std::string>>
+    peek_fragment_instructions(const std::string& yaml_source);
+
     // ── Policies ─────────────────────────────────────────────────────────
     [[nodiscard]] std::expected<std::string, std::string>
     create_policy(const std::string& yaml_source);

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "authz_model.hpp" // authz::VisibleSet (WP06 F4)
+
 #include "dispatch_confined_arms.hpp" // #3424/#3511: ConfinedDispatchOutcome -- DispatchFn/CommandDispatchFn return type
 
 /// @file policy_evaluator.hpp
@@ -199,8 +201,15 @@ public:
     /// fix_instruction (else ok=false). If `agent_ids` is empty, targets every
     /// agent currently non_compliant for the policy. Dispatches the fix, then a
     /// later tick runs the post-check and writes the verified verdict.
+    ///
+    /// WP06 F4 (interim): `caller_visible` is the REQUESTING operator's per-device execution
+    /// visibility; the resolved targets are intersected with it (`authz::filter_to_scope`, the
+    /// shared primitive), so a manual remediate cannot reach a device its caller could not
+    /// dispatch to. nullopt (the default) = unrestricted (an unrestricted caller, or a non-route
+    /// call); present-and-empty = deny-all. The background tick never calls this method.
     RemediateResult remediate(const std::string& policy_id,
-                              const std::vector<std::string>& agent_ids);
+                              const std::vector<std::string>& agent_ids,
+                              const authz::VisibleSet& caller_visible = std::nullopt);
 
 private:
     enum class Phase { Check, FixWait };

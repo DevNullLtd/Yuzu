@@ -455,6 +455,18 @@ extern const char* const kYuzuIconsSvg;
 extern const std::string kHtmxJs;
 extern const std::string kSseJs;
 namespace yuzu::server {
+
+namespace {
+/// WP06 F57: true when `req` carries any proxy-evidence header (web_utils.hpp's
+/// `kForwardingEvidenceHeaders`; kept here because web_utils.hpp is httplib-free by design).
+[[nodiscard]] bool request_has_forwarding_evidence(const httplib::Request& req) {
+    for (auto h : kForwardingEvidenceHeaders)
+        if (req.has_header(std::string(h)))
+            return true;
+    return false;
+}
+} // namespace
+
 extern const std::string kYuzuCss; // server/core/static/yuzu.css (build-time embed)
 extern const std::string kYuzuChartsJs;
 extern const std::string kEChartsJs; // server/core/vendor/echarts.min.js (Apache-2.0)
@@ -14117,6 +14129,17 @@ private:
     /// store error, or no auth store at all — yields an EMPTY-principal,
     /// deny-all caller, which `build_classified_command` refuses as
     /// `AnonymousOperator` before any permission check runs.
+    /// WP06 F53: the creator's CURRENT legacy admin role, resolved from the auth store at fire
+    /// time (never cached). JIT elevation does not count: a background fire has no session to
+    /// carry one (same posture as `derive_dispatch_caller_for_username`). Unresolvable (no
+    /// store, deleted user, store error) = false: fail closed. Feeds `schedule_arming_permitted`.
+    [[nodiscard]] bool schedule_creator_is_legacy_admin(const std::string& username) {
+        if (!auth_db_ || username.empty())
+            return false;
+        auto user = auth_db_->get_user(username);
+        return user && user->role == auth::Role::admin;
+    }
+
     yuzu::server::DispatchCaller derive_dispatch_caller_for_username(const std::string& username) {
         bool principal_resolves = false;
         std::string role_label;
@@ -17224,15 +17247,20 @@ private:
                 return httplib::Server::HandlerResponse::Unhandled;
             }
 
-            // /metrics: localhost always unauthenticated; remote depends on config
+            // /metrics (WP06 F57): authenticated unless `--metrics-no-auth`, or the operator
+            // opted in to trusting a direct loopback peer (`--metrics-trust-loopback`, default
+            // OFF: a same-host proxy/sidecar makes remote callers look loopback). The loopback
+            // decision is web_utils.hpp `metrics_loopback_peer_exempt` (one copy).
             if (req.path == "/metrics") {
-                if (req.remote_addr == "127.0.0.1" || req.remote_addr == "::1") {
+                if (cfg_.metrics_trust_loopback &&
+                    metrics_loopback_peer_exempt(req.remote_addr,
+                                                 request_has_forwarding_evidence(req))) {
                     return httplib::Server::HandlerResponse::Unhandled;
                 }
                 if (!cfg_.metrics_require_auth) {
                     return httplib::Server::HandlerResponse::Unhandled;
                 }
-                // Remote callers fall through to normal auth check below
+                // Everyone else falls through to the normal auth check below
             }
 
             auto session = auth_routes_->resolve_session(req);
@@ -18679,6 +18707,7 @@ private:
         yuzu::server::legacy_events::register_legacy_events_routes(
             inline_sink, yuzu::server::legacy_events::Deps{
                              .deny_service_scoped_fn = deny_service_scoped_fn,
+                             .fleet_read_fn = fleet_read_fn, // WP06 F11
                              .resolve_session_fn = resolve_session_fn,
                              .event_bus = &event_bus_,
                              .stream_budget = stream_budget_.get(),
@@ -19582,9 +19611,9 @@ private:
             // cases and the legacy-open posture are documented there.
             .arming_check = [this](const std::string& principal, const std::string& plugin,
                                    const std::string& action) -> bool {
-                return yuzu::server::schedule_arming_permitted(capability_registry_,
-                                                               rbac_store_.get(), principal,
-                                                               plugin, action);
+                return yuzu::server::schedule_arming_permitted(
+                    capability_registry_, rbac_store_.get(), principal, plugin, action,
+                    schedule_creator_is_legacy_admin(principal));
             },
             // #6096: the outbox as the spent-ticket ledger (clock-free). A missing store
             // is an error, not an empty answer, so the runner holds rather than fires.
@@ -19628,9 +19657,9 @@ private:
                 // between enqueue and delivery), the load-bearing re-authorization.
                 .arming_check = [this](const std::string& principal, const std::string& plugin,
                                        const std::string& action) -> bool {
-                    return yuzu::server::schedule_arming_permitted(capability_registry_,
-                                                                   rbac_store_.get(), principal,
-                                                                   plugin, action);
+                    return yuzu::server::schedule_arming_permitted(
+                        capability_registry_, rbac_store_.get(), principal, plugin, action,
+                        schedule_creator_is_legacy_admin(principal));
                 },
                 .should_stop = [this] { return stop_requested_.load(std::memory_order_acquire); },
                 // #3678 (R4): the dispatch counts (DispatchPosition) the retry limit is
@@ -22586,6 +22615,59 @@ private:
         wf_deps.workflow_run = workflow_run_fn; // same closure MCP execute_workflow gets
         wf_deps.workflow_idempotency_lookup = workflow_idempotency_lookup_fn; // and the same lookup
         wf_deps.authorize_dispatch = authorize_dispatch; // the step-pair dry run (sec-4)
+        // WP06 F4 (interim; #6065 owns the dispatch-identity change and is NOT touched here):
+        // a policy fragment's check/postCheck/fix instruction later runs as the SYSTEM caller,
+        // so the per-action RBAC, ExecuteGate and per-device visibility are never consulted at
+        // fire time. Authorize the AUTHOR (fragment create) and the OPERATOR (manual remediate)
+        // for each instruction's (plugin, action) NOW, through the SAME `authorize_dispatch`
+        // closure MCP and the workflow execute twins share, as a non-system caller. A degraded
+        // instruction read refuses (503), never admits. Residual: a principal demoted AFTER
+        // authoring keeps the stored fragment live (closing that needs an author column).
+        if (policy_admin_routes_)
+            policy_admin_routes_->set_authorize_instruction_fn(
+                [this, authorize_dispatch](const httplib::Request& req,
+                                           const std::string& instruction_id)
+                    -> PolicyAdminRoutes::InstructionAuthority {
+                    PolicyAdminRoutes::InstructionAuthority out;
+                    auto sess = auth_routes_ ? auth_routes_->resolve_session(req) : std::nullopt;
+                    if (!sess) {
+                        out.status = 401;
+                        out.message = "authentication required";
+                        return out;
+                    }
+                    if (!instruction_store_) {
+                        out.status = 503;
+                        out.message = "instruction store unavailable";
+                        return out;
+                    }
+                    auto def = instruction_store_->get_definition(instruction_id);
+                    if (!def) {
+                        out.status = 503;
+                        out.message = "instruction store degraded — try again";
+                        return out;
+                    }
+                    if (!*def || (*def)->plugin.empty() || (*def)->action.empty()) {
+                        out.status = 400;
+                        out.message = "unknown instruction (or one with no plugin.action): " +
+                                      ::yuzu::log_token(instruction_id);
+                        return out;
+                    }
+                    const auto caller = derive_dispatch_caller(*sess);
+                    auto decision = authorize_dispatch(caller, (*def)->plugin, (*def)->action);
+                    if (!decision) {
+                        const auto text = yuzu::server::describe_dispatch_denial(
+                            decision.error().reason, (*def)->plugin, (*def)->action,
+                            decision.error(), yuzu::server::DenialSurface::kRest);
+                        out.status = 403;
+                        out.message = "instruction " + ::yuzu::log_token(instruction_id) + " (" +
+                                      (*def)->plugin + "." + (*def)->action + "): " + text.message;
+                        return out;
+                    }
+                    out.ok = true;
+                    out.status = 200;
+                    out.visible = caller.exec_visible;
+                    return out;
+                });
         // The per-step credential liveness check of the v1 execute run: the SAME function MCP's
         // held-open streams re-validate through (tri-state; an engine principal's Active check
         // included), asked authoritatively: the API-token row and an engine principal are read

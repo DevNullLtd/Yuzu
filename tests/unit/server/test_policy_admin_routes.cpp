@@ -50,6 +50,10 @@ struct PolicyAdminHarness {
     yuzu::server::test::TestRouteSink sink;
     std::vector<AuditCall> audit_calls;
     std::vector<std::string> emitted_events;
+    // WP06 F4: the fake for the instruction-authority closure. Default = admitted, unrestricted.
+    std::vector<std::string> authorized_instructions;
+    PolicyAdminRoutes::InstructionAuthority authority{.ok = true, .status = 200, .message = {},
+                                                      .visible = std::nullopt};
 
     explicit PolicyAdminHarness(PolicyStore* policy_store = nullptr) {
         auto auth_fn = [](const httplib::Request&,
@@ -74,6 +78,11 @@ struct PolicyAdminHarness {
 
         routes.register_routes(sink, auth_fn, perm_fn, audit_fn, emit_fn, policy_store,
                                /*policy_evaluator=*/nullptr, /*metrics=*/nullptr);
+        routes.set_authorize_instruction_fn(
+            [this](const httplib::Request&, const std::string& instruction_id) {
+                authorized_instructions.push_back(instruction_id);
+                return authority;
+            });
     }
 };
 
@@ -484,4 +493,81 @@ TEST_CASE("POST /api/policies/:id/disable|enable: an unknown clean id answers 40
     }
     CHECK(h.audit_calls.empty());
     CHECK(h.emitted_events.empty());
+}
+
+// ── WP06 F4 (interim): authoring-time authorization of a fragment's instructions ─────────────
+
+TEST_CASE("POST /api/policy-fragments: every instruction the fragment names is authorized for "
+          "the author, and a refusal writes nothing (WP06 F4)",
+          "[compliance][admin][f4]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_admin_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    PolicyStore store{pool};
+    REQUIRE(store.is_open());
+    PolicyAdminHarness h{&store};
+
+    const std::string yaml = R"(
+apiVersion: yuzu.io/v1alpha1
+kind: PolicyFragment
+displayName: F4 Fragment
+spec:
+  check:
+    instruction: chk.instr
+    compliance: "result.status == 'running'"
+  postCheck:
+    instruction: post.instr
+    compliance: "result.status == 'running'"
+  fix:
+    instruction: fix.instr
+)";
+    // Refused (the author may not dispatch the fix pair): 403, nothing created, denied audit.
+    h.authority.ok = false;
+    h.authority.status = 403;
+    h.authority.message = "permission denied: Execution:Execute";
+    auto denied = h.sink.Post("/api/policy-fragments", yaml, "text/plain");
+    REQUIRE(denied);
+    CHECK(denied->status == 403);
+    CHECK(denied->body.find("Execution:Execute") != std::string::npos);
+    auto listed = store.query_fragments();
+    REQUIRE(listed.has_value());
+    CHECK(listed->empty());
+    REQUIRE_FALSE(h.audit_calls.empty());
+    CHECK(h.audit_calls.back().result == "denied");
+    CHECK(h.audit_calls.back().detail.find("instruction_not_authorized") != std::string::npos);
+
+    // Admitted: all three instruction ids were checked, in check / postCheck / fix order.
+    h.authority.ok = true;
+    h.authorized_instructions.clear();
+    auto ok = h.sink.Post("/api/policy-fragments", yaml, "text/plain");
+    REQUIRE(ok);
+    CHECK(ok->status == 201);
+    REQUIRE(h.authorized_instructions.size() == 3);
+    CHECK(h.authorized_instructions[0] == "chk.instr");
+    CHECK(h.authorized_instructions[1] == "post.instr");
+    CHECK(h.authorized_instructions[2] == "fix.instr");
+}
+
+TEST_CASE("POST /api/policy-fragments: an unwired authorization closure refuses (fail closed)",
+          "[compliance][admin][f4]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_admin_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    PolicyStore store{pool};
+    REQUIRE(store.is_open());
+    PolicyAdminHarness h{&store};
+    h.routes.set_authorize_instruction_fn(nullptr);
+
+    auto res = h.sink.Post("/api/policy-fragments", kFragmentYaml, "text/plain");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+}
+
+TEST_CASE("PolicyStore::peek_fragment_instructions reads the same three sections create stores",
+          "[compliance][admin][f4]") {
+    const auto none = PolicyStore::peek_fragment_instructions(
+        "apiVersion: yuzu.io/v1alpha1\nkind: PolicyFragment\nspec:\n  check:\n    compliance: x\n");
+    CHECK(none.empty());
+    const auto some = PolicyStore::peek_fragment_instructions(kFragmentYaml);
+    REQUIRE(some.size() == 1);
+    CHECK(some[0].first == "check");
+    CHECK(some[0].second == "get_service_status");
 }

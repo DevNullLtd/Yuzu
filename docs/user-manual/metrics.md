@@ -10,10 +10,20 @@ monitoring tools.
 ### GET /metrics
 
 Returns all server and connected-agent metrics in Prometheus exposition format.
-Localhost requests (`127.0.0.1`, `::1`) are always unauthenticated for
-Prometheus scraping. Remote requests require authentication by default. Use
-`--metrics-no-auth` (env: `YUZU_METRICS_NO_AUTH`) to allow unauthenticated
-remote access for external monitoring infrastructure.
+Every request requires authentication by default, including one from a loopback
+address: a reverse proxy, mesh sidecar or tunnel on the server host makes remote
+callers look like `127.0.0.1`, so a loopback peer is not proof of a local
+caller (WP06 F57). Use `--metrics-trust-loopback` (env:
+`YUZU_METRICS_TRUST_LOOPBACK`) to let a direct loopback peer (`127.0.0.1`,
+`::1`) read `/metrics` unauthenticated: set it only when nothing on the host
+proxies requests to the server (a loopback request that carries `X-Forwarded-For`,
+`Forwarded`, `X-Real-IP`, `Via`, `X-Forwarded-Host` or `X-Forwarded-Proto` is
+still treated as remote, but a proxy that adds no header is not detected, so
+block `/metrics` on any same-host proxy as well). Use `--metrics-no-auth`
+(env: `YUZU_METRICS_NO_AUTH`) to allow unauthenticated access from any source
+for external monitoring infrastructure. A host-local scraper that relied on the
+old implicit exemption must now send a bearer token or run the server with
+`--metrics-trust-loopback`.
 
 ```bash
 curl -s 'http://localhost:8080/metrics'

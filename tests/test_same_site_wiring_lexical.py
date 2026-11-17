@@ -147,7 +147,8 @@ EARLY_UNHANDLED_CHAINS = [
     ['if (yuzu::server::health::is_probe_path(req.path))'],
     ['if (is_login_exempt_path(req.path))'],
     ['if (req.path == "/metrics")',
-     'if (req.remote_addr == "127.0.0.1" || req.remote_addr == "::1")'],
+     'if (cfg_.metrics_trust_loopback && metrics_loopback_peer_exempt(req.remote_addr, '
+     'request_has_forwarding_evidence(req)))'],
     ['if (req.path == "/metrics")', 'if (!cfg_.metrics_require_auth)'],
 ]
 

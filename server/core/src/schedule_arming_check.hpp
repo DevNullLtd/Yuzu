@@ -32,9 +32,18 @@
 ///     provenance is still known;
 ///   * a missing or unopened `RbacStore`.
 ///
-/// RBAC legacy-open (`rbac_enforcement_in_effect()` false) ADMITS, matching
-/// every other authz call site's posture, except for an engine principal (`engine:<slug>`),
-/// whose only authority is an explicit RBAC grant (#6204).
+/// RBAC legacy-open (`rbac_enforcement_in_effect()` false) mirrors `require_permission`'s
+/// legacy rule: a READ-class pair admits any human, but every NON-Read pair needs the
+/// principal's CURRENT legacy admin role (WP06 F53: before this, a creator demoted from admin
+/// - or whose JIT elevation had lapsed - kept firing mutating schedules with fleet reach
+/// forever). An engine principal (`engine:<slug>`) is never admitted there: its only authority
+/// is an explicit RBAC grant (#6204). The admin bit is a RESOLVED INPUT (the caller reads the
+/// creator's role from the auth store AT FIRE TIME, never cached, unresolvable = false), which
+/// keeps this function pure. This is the ONLY place the schedule seam applies that rule: the
+/// dispatch permission binder's and the visibility composer's legacy-open admits are
+/// deliberately left as they are (other surfaces rely on route-level gates), because this check
+/// runs first at every fire and `derive_dispatch_caller_for_username` stamps
+/// `principal_is_admin` fresh for the AdminOrApproval pairs. Do not "fix" it a second way.
 
 #include "command_capability.hpp"
 #include "rbac_store.hpp"
@@ -44,14 +53,15 @@
 namespace yuzu::server {
 
 /// Decide whether `principal` may still arm `plugin.action`. `rbac` may be
-/// null (denies). Pure with respect to its inputs — no metrics, no logging,
+/// null (denies). `principal_is_legacy_admin`: the principal's current legacy role is admin. Pure with respect to its inputs — no metrics, no logging,
 /// no audit: the caller owns those, so this can be exercised directly in a
 /// unit test with a real registry and a `:memory:` store.
 [[nodiscard]] inline bool schedule_arming_permitted(const CommandCapabilityRegistry& registry,
                                                     const RbacStore* rbac,
                                                     const std::string& principal,
                                                     const std::string& plugin,
-                                                    const std::string& action) {
+                                                    const std::string& action,
+                                                    bool principal_is_legacy_admin) {
     const auto classified = registry.classify(plugin, action);
     if (!classified)
         return false;
@@ -60,9 +70,11 @@ namespace yuzu::server {
     if (rbac == nullptr || !rbac->is_open())
         return false;
     if (!rbac_enforcement_in_effect(rbac))
-        // Legacy-open arms for everyone EXCEPT an engine principal, whose only authority is an
-        // explicit RBAC grant (and RBAC is off here).
-        return !yuzu::server::authz::is_engine_principal_name(principal);
+        // Legacy-open (RBAC off): never an engine principal; a non-Read pair needs the
+        // creator's CURRENT admin role (mirrors require_permission's legacy rule, WP06 F53).
+        return !yuzu::server::authz::is_engine_principal_name(principal) &&
+               (classified->operation == yuzu::server::authz::Operation::Read ||
+                principal_is_legacy_admin);
     return rbac->check_permission(principal, std::string(classified->securable),
                                   std::string(yuzu::server::authz::to_string(classified->operation)));
 }

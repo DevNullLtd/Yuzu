@@ -1257,4 +1257,25 @@ template <typename Req>
     return content_length_for_body_cap(req) > 0 || transfer_encoding_present(req);
 }
 
+
+/// WP06 F57: the ONE loopback-exemption decision for `GET /metrics`, called from server.cpp's
+/// pre-routing handler (extend, never fork). A loopback TCP peer is NOT proof of a local
+/// caller: a same-host reverse proxy, mesh sidecar or tunnel relays remote requests that the
+/// server sees as 127.0.0.1. So the exemption is an explicit opt-in (`--metrics-trust-loopback`,
+/// default OFF; the caller checks `cfg_.metrics_trust_loopback` first), and even then a request
+/// carrying forwarding evidence is treated as remote (defence in depth: a header-less proxy is
+/// NOT caught, so the operator must also block /metrics on any same-host proxy). Fails closed:
+/// an empty or unparseable peer address is not loopback. `--metrics-no-auth` is a separate,
+/// unchanged branch in the caller.
+[[nodiscard]] inline bool metrics_loopback_peer_exempt(std::string_view remote_addr,
+                                                       bool has_forwarding_header) noexcept {
+    if (has_forwarding_header)
+        return false;
+    return remote_addr == "127.0.0.1" || remote_addr == "::1";
+}
+
+/// Header names whose presence on a request means it passed through a proxy (WP06 F57).
+inline constexpr std::string_view kForwardingEvidenceHeaders[] = {
+    "X-Forwarded-For", "Forwarded", "X-Real-IP", "Via", "X-Forwarded-Host", "X-Forwarded-Proto"};
+
 } // namespace yuzu::server

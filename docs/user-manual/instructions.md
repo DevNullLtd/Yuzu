@@ -863,7 +863,7 @@ The ScheduleEngine supports recurring instruction executions with four frequency
 A server-side poller checks for due schedules every 30 seconds, so a fire can
 land up to ~30 seconds after its due time — but firing is now two stages, not
 one. At fire time the poller creates a tracked execution (attributed to the
-schedule's creator, appearing immediately in the Executions history) and
+schedule's creator, appearing immediately in the Executions history; the creator is re-authorized at every fire, and with RBAC off a creator who is no longer an administrator can no longer fire a mutating action, while Read-class actions still fire) and
 commits a durable occurrence to the command outbox, emitting an
 `instruction.schedule_fired` audit event with result `queued`. A leader-gated
 delivery loop then drains the outbox and performs the actual dispatch, within

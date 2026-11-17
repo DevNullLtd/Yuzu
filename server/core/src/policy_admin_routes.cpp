@@ -55,6 +55,33 @@ std::string policy_targeting_audit_detail(const PolicyStore& store, const std::s
 
 } // namespace
 
+bool PolicyAdminRoutes::authorize_fragment_instructions(const httplib::Request& req,
+                                                        httplib::Response& res,
+                                                        const std::string& yaml_source) {
+    const auto refuse = [&](int status, const std::string& message, const std::string& detail) {
+        audit_fn_(req, "policy_fragment.create", "denied", "policy_fragment",
+                  PolicyStore::peek_fragment_name(yaml_source), detail);
+        res.status = status;
+        res.set_content(nlohmann::json({{"error", {{"code", status}, {"message", message}}},
+                                        {"meta", {{"api_version", "v1"}}}})
+                            .dump(),
+                        "application/json");
+        return false;
+    };
+    const auto instructions = PolicyStore::peek_fragment_instructions(yaml_source);
+    if (instructions.empty())
+        return true;
+    if (!authorize_instruction_fn_) // unwired = refused, never admitted
+        return refuse(503, "instruction authorization is not available", "reason=authorize_unwired");
+    for (const auto& [role, instruction_id] : instructions) {
+        const auto a = authorize_instruction_fn_(req, instruction_id);
+        if (!a.ok)
+            return refuse(a.status == 0 ? 403 : a.status, a.message,
+                          "reason=instruction_not_authorized role=" + role);
+    }
+    return true;
+}
+
 void PolicyAdminRoutes::register_routes(httplib::Server& svr,
                                         AuthFn auth_fn,
                                         PermFn perm_fn,
@@ -112,6 +139,11 @@ void PolicyAdminRoutes::register_routes(HttpRouteSink& sink,
             } else {
                 yaml_source = req.body;
             }
+
+            // WP06 F4 (interim): the author must be authorized for every instruction the
+            // fragment will later run as the system caller.
+            if (!authorize_fragment_instructions(req, res, yaml_source))
+                return;
 
             auto result = policy_store_->create_fragment(yaml_source);
             if (!result) {
@@ -545,7 +577,55 @@ void PolicyAdminRoutes::register_routes(HttpRouteSink& sink,
                         agent_ids.push_back(a.get<std::string>());
                 }
             }
-            auto result = policy_evaluator_->remediate(id, agent_ids);
+            // WP06 F4 (interim): the operator must be authorized for the FIX pair (the evaluator
+            // dispatches it as the system caller), and the fix reaches only devices the operator
+            // may execute on (the visibility intersection is applied inside remediate()).
+            authz::VisibleSet caller_visible = authz::deny_all();
+            {
+                auto pol = policy_store_->get_policy(id);
+                if (!pol) {
+                    audit_fn_(req, "policy.remediate", "error", "policy", id,
+                              "policy store degraded");
+                    res.status = 503;
+                    res.set_content(R"({"error":{"code":503,"message":"policy store degraded — try again"},"meta":{"api_version":"v1"}})",
+                                    "application/json");
+                    return;
+                }
+                if (*pol) {
+                    auto frag = policy_store_->get_fragment((*pol)->fragment_id);
+                    if (!frag) {
+                        audit_fn_(req, "policy.remediate", "error", "policy", id,
+                                  "policy store degraded");
+                        res.status = 503;
+                        res.set_content(R"({"error":{"code":503,"message":"policy store degraded — try again"},"meta":{"api_version":"v1"}})",
+                                        "application/json");
+                        return;
+                    }
+                    if (*frag && !(*frag)->fix_instruction.empty()) {
+                        InstructionAuthority a;
+                        if (authorize_instruction_fn_)
+                            a = authorize_instruction_fn_(req, (*frag)->fix_instruction);
+                        else {
+                            a.status = 503;
+                            a.message = "instruction authorization is not available";
+                        }
+                        if (!a.ok) {
+                            const int code = a.status == 0 ? 403 : a.status;
+                            audit_fn_(req, "policy.remediate", "denied", "policy", id,
+                                      "reason=fix_instruction_not_authorized");
+                            res.status = code;
+                            res.set_content(nlohmann::json({{"error", {{"code", code}, {"message", a.message}}},
+                                                            {"meta", {{"api_version", "v1"}}}})
+                                                .dump(),
+                                            "application/json");
+                            return;
+                        }
+                        caller_visible = a.visible;
+                    }
+                }
+                // No policy / no fix instruction: remediate() reports the 404 / 409 itself.
+            }
+            auto result = policy_evaluator_->remediate(id, agent_ids, caller_visible);
             if (!result.ok) {
                 // Governance (2026-08-24): a genuine store-degrade error
                 // used to fall through to the 400/"denied" default below —

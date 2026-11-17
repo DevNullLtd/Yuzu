@@ -425,6 +425,20 @@ std::string PolicyStore::peek_fragment_name(const std::string& yaml_source) {
     return extract_yaml_value(yaml_source, "id");
 }
 
+std::vector<std::pair<std::string, std::string>>
+PolicyStore::peek_fragment_instructions(const std::string& yaml_source) {
+    std::vector<std::pair<std::string, std::string>> out;
+    auto add = [&](const char* role, const char* section) {
+        auto id = extract_yaml_value(extract_yaml_section(yaml_source, section), "instruction");
+        if (!id.empty())
+            out.emplace_back(role, std::move(id));
+    };
+    add("check", "spec.check");
+    add("postCheck", "spec.postCheck");
+    add("fix", "spec.fix");
+    return out;
+}
+
 // ── Fragment CRUD ────────────────────────────────────────────────────────────
 
 std::expected<std::string, std::string>

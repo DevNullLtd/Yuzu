@@ -42,6 +42,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -598,6 +599,40 @@ TEST_CASE("policy evaluator: a depth-poisoned response cannot ride along with a 
     // agentB was never targeted: still sitting at "error", never moved to
     // "fixing".
     CHECK(h.status_of(pid, "agentB") == "error");
+}
+
+TEST_CASE("policy evaluator: remediate() is bounded by the operator's visible set (WP06 F4)",
+          "[pg][policy][evaluator]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    h.canned["agentA|checkp"] = {1, out_json("hostname", "")};
+    h.canned["agentB|checkp"] = {1, out_json("hostname", "")};
+    auto pid = h.author("result.hostname != ''", /*with_fix=*/true);
+    h.canned["agentA|fixp"] = {1, "ok"};
+    h.canned["agentB|fixp"] = {1, "ok"};
+
+    PolicyEvaluator ev(h.deps());
+    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
+    h.fake_now += 20;
+    ev.tick(true);
+    REQUIRE(h.status_of(pid, "agentA") == "non_compliant");
+    REQUIRE(h.status_of(pid, "agentB") == "non_compliant");
+
+    // Deny-all visible set (present and empty): nobody is reachable, nothing is dispatched.
+    const int before = h.dispatch_calls;
+    auto none = ev.remediate(pid, {}, authz::deny_all());
+    CHECK_FALSE(none.ok);
+    CHECK(none.error.find("visible device scope") != std::string::npos);
+    CHECK(h.dispatch_calls == before);
+    CHECK(h.status_of(pid, "agentA") == "non_compliant");
+
+    // Visible set {agentA}: the exact send set is agentA only; agentB is untouched.
+    auto some = ev.remediate(pid, {}, authz::VisibleSet{std::unordered_set<std::string>{"agentA"}});
+    REQUIRE(some.ok);
+    CHECK(some.agents == 1);
+    CHECK(h.dispatch_calls == before + 1);
+    CHECK(h.status_of(pid, "agentB") == "non_compliant");
 }
 
 TEST_CASE("policy evaluator: interval throttles re-dispatch", "[pg][policy][evaluator]") {

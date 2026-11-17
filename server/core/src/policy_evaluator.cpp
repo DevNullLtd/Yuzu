@@ -624,7 +624,8 @@ PolicyEvaluator::evaluate_now(const std::string& policy_id) {
 
 PolicyEvaluator::RemediateResult
 PolicyEvaluator::remediate(const std::string& policy_id,
-                           const std::vector<std::string>& agent_ids) {
+                           const std::vector<std::string>& agent_ids,
+                           const authz::VisibleSet& caller_visible) {
     RemediateResult out;
     if (!d_.policy_store) {
         out.error = "policy store unavailable";
@@ -706,6 +707,16 @@ PolicyEvaluator::remediate(const std::string& policy_id,
             // class ADR-0036 exists to close.
             if (!degrade_reason.empty())
                 out.degraded = true;
+            return out;
+        }
+    }
+    // WP06 F4 (interim): the operator's own per-device execution visibility bounds the fix.
+    // nullopt = unrestricted; present (even empty) filters, so deny-all reaches nobody.
+    if (caller_visible.has_value()) {
+        const bool had_targets = !targets.empty();
+        targets = authz::filter_to_scope(targets, caller_visible);
+        if (had_targets && targets.empty()) {
+            out.error = "no in-scope agents to remediate (outside your visible device scope)";
             return out;
         }
     }
