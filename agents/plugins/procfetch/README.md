@@ -26,6 +26,8 @@ flowchart LR
   WIN & MAC & LIN --> ROWS[rows, no typed status] --> RS[(ResponseStore)] --> API[REST /api/responses]
 ```
 
+**Windows image paths are classified and opened handle-relative (F34).** `sha1_of_file` refuses a UNC, device or non-`DRIVE_FIXED` path (`agents/shared/local_path_policy.hpp`; the row keeps an empty `sha1`) and then opens the image with `yuzu::win::open_file_no_reparse` (`NtCreateFile` relative to the volume root with `OBJ_DONT_REPARSE`), so a reparse point in the path cannot redirect the open and the by-name `CreateFileA` is gone (which also removes the ANSI-code-page failure in caveat 1 for the opened path). A CompactOS/WOF-compressed image is opened as itself and may read as an empty `sha1`; this was not measured. Not compiled or run on Windows in the change that made it. The POSIX legs are unchanged.
+
 ## OS capability
 
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->

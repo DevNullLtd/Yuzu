@@ -18,9 +18,14 @@
 #include <yuzu/agent/plugin_loader.hpp> // yuzu::agent::sha256_file
 #include <yuzu/plugin.hpp>
 
+#include <bounded_file_hash.hpp> // yuzu::shared::hash_fd_regular (Linux image hash, F33)
+#include <local_path_policy.hpp> // yuzu::shared::local_path (Windows/macOS image path guard, F33)
+
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <chrono>
+#include <cstddef>
 #include <format>
 #include <string>
 #include <string_view>
@@ -41,8 +46,10 @@
 
 #ifdef __linux__
 #include <dirent.h>
+#include <fcntl.h>    // open (O_NONBLOCK on the exe link)
 #include <fstream>
-#include <unistd.h> // readlink
+#include <sys/stat.h> // fstat (identity key)
+#include <unistd.h>   // readlink, close
 #endif
 
 #ifdef __APPLE__
@@ -222,8 +229,9 @@ std::string resolve_exe_path(unsigned long pid) {
     if (n <= 0)
         return "";
     std::string path(buf.data(), static_cast<size_t>(n));
-    // A replaced/removed binary reads as "<path> (deleted)" — strip the marker;
-    // sha256_file then fails honestly (the on-disk image is gone).
+    // A replaced/removed binary reads as "<path> (deleted)" — strip the marker for DISPLAY only.
+    // This text is never opened (F33): the hash goes through hash_process_image's open of
+    // /proc/<pid>/exe itself, which is the kernel's own reference to the running image.
     if (path.ends_with(" (deleted)"))
         path.erase(path.size() - 10);
     return path;
@@ -239,6 +247,60 @@ std::string resolve_exe_path(unsigned long pid) {
 #else
 std::string resolve_exe_path(unsigned long) {
     return "";
+}
+#endif
+
+// SHA-256 of a process's on-disk image, "" when it cannot be hashed honestly. `cache` maps an
+// image identity to its hash (many PIDs share one executable).
+//
+// The path came from QueryFullProcessImageNameW / readlink / proc_pidpath for a process ANY user
+// can start, so it is attacker-influenced (F33):
+//   Linux   - open /proc/<pid>/exe (a magic link: the open yields the very inode the process runs,
+//             a "(deleted)" image included, and re-resolves no path text), O_NONBLOCK, then
+//             fstat the descriptor and hash only a regular file with a byte cap and a deadline.
+//             The cache is keyed by (dev, ino), not by path text.
+//   Windows/macOS - refuse a network / device / non-fixed-drive path (agents/shared/
+//             local_path_policy.hpp) before anything opens it: a UNC image path would make the
+//             LocalSystem agent authenticate to the share's host.
+constexpr std::size_t kMaxImageHashBytes = 512ull * 1024 * 1024; // 512 MiB cap
+using HashCache = std::unordered_map<std::string, std::string>;
+
+#if defined(__linux__)
+std::string hash_process_image(unsigned long pid, const std::string& path, HashCache& cache) {
+    if (path.empty())
+        return {};
+    const std::string link = "/proc/" + std::to_string(pid) + "/exe";
+    const int fd = ::open(link.c_str(), O_RDONLY | O_NONBLOCK | O_NOCTTY | O_CLOEXEC);
+    if (fd < 0)
+        return {};
+    struct FdCloser {
+        int fd;
+        ~FdCloser() { ::close(fd); }
+    } closer{fd};
+    struct stat st{};
+    if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode))
+        return {};
+    const std::string key = std::format("{}:{}", static_cast<unsigned long long>(st.st_dev),
+                                        static_cast<unsigned long long>(st.st_ino));
+    if (const auto it = cache.find(key); it != cache.end())
+        return it->second;
+    auto r = yuzu::shared::hash_fd_regular(
+        fd, kMaxImageHashBytes, yuzu::shared::HashClock::now() + std::chrono::seconds(30));
+    std::string hash = r.status == yuzu::shared::HashStatus::ok ? std::move(r.hex) : std::string{};
+    cache.emplace(key, hash);
+    return hash;
+}
+#else
+std::string hash_process_image(unsigned long, const std::string& path, HashCache& cache) {
+    if (path.empty())
+        return {};
+    if (yuzu::shared::local_path::refused(yuzu::shared::local_path::local_path_refusal(path)))
+        return {};
+    if (const auto it = cache.find(path); it != cache.end())
+        return it->second;
+    std::string hash = yuzu::agent::sha256_file(path, kMaxImageHashBytes);
+    cache.emplace(path, hash);
+    return hash;
 }
 #endif
 
@@ -348,21 +410,11 @@ private:
     // parent; sha256/path are empty when the path can't be resolved or the image is
     // gone/too large. Hashing mirrors do_list_hashed (per-path cache, bounded read).
     int do_list_tree(yuzu::CommandContext& ctx) {
-        static constexpr std::size_t kMaxHashBytes = 512ull * 1024 * 1024; // 512 MiB cap
         auto procs = enumerate_processes();
-        std::unordered_map<std::string, std::string> hash_cache; // path -> sha256
+        HashCache hash_cache; // image identity -> sha256
         for (const auto& p : procs) {
             std::string path = resolve_exe_path(p.pid);
-            std::string hash;
-            if (!path.empty()) {
-                auto it = hash_cache.find(path);
-                if (it != hash_cache.end()) {
-                    hash = it->second;
-                } else {
-                    hash = yuzu::agent::sha256_file(path, kMaxHashBytes);
-                    hash_cache.emplace(path, hash);
-                }
-            }
+            std::string hash = hash_process_image(p.pid, path, hash_cache);
             ctx.write_output(std::format("proc|{}|{}|{}|{}|{}", p.pid, p.ppid,
                                          sanitize_field(p.name), hash, sanitize_field(path)));
         }
@@ -371,25 +423,15 @@ private:
 
     // proc|pid|name|sha256|path. The on-disk image is hashed (lowercase hex);
     // unique paths are hashed once (many PIDs share one executable). The hash is
-    // bounded (kMaxHashBytes) so an oversized image can't turn a live query into a
+    // bounded (kMaxImageHashBytes) so an oversized image can't turn a live query into a
     // multi-GB read. sha256/path are empty when the path can't be resolved (kernel
     // threads, access-denied) or the file is gone/too large — rendered honestly.
     int do_list_hashed(yuzu::CommandContext& ctx) {
-        static constexpr std::size_t kMaxHashBytes = 512ull * 1024 * 1024; // 512 MiB cap
         auto procs = enumerate_processes();
-        std::unordered_map<std::string, std::string> hash_cache; // path -> sha256
+        HashCache hash_cache; // image identity -> sha256
         for (const auto& p : procs) {
             std::string path = resolve_exe_path(p.pid);
-            std::string hash;
-            if (!path.empty()) {
-                auto it = hash_cache.find(path);
-                if (it != hash_cache.end()) {
-                    hash = it->second;
-                } else {
-                    hash = yuzu::agent::sha256_file(path, kMaxHashBytes);
-                    hash_cache.emplace(path, hash);
-                }
-            }
+            std::string hash = hash_process_image(p.pid, path, hash_cache);
             ctx.write_output(std::format("proc|{}|{}|{}|{}", p.pid, sanitize_field(p.name), hash,
                                          sanitize_field(path)));
         }

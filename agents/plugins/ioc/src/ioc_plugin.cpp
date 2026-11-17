@@ -31,6 +31,7 @@
 #include <array>
 #include <cctype>
 #include <charconv>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <format>
@@ -38,6 +39,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #ifdef _WIN32
@@ -62,6 +64,16 @@
 #include <cstring>
 #include <sys/stat.h>
 #include <macos_socket_walk.hpp>
+#endif
+
+// After the platform headers: local_path_policy.hpp pulls <windows.h> on Windows, which must follow
+// <winsock2.h> (included above).
+#include <bounded_file_hash.hpp> // regular-file-only, capped, deadline-bounded SHA-256 (F36)
+#include <local_path_policy.hpp> // refuse UNC / device / network-mount paths before any open (F36/F65)
+
+#ifndef _WIN32
+#include <fcntl.h>
+#include <unistd.h>
 #endif
 
 namespace {
@@ -431,9 +443,19 @@ bool check_dns_cache(std::string_view domain) {
 struct FileCheckResult {
     bool exists{};
     uint64_t size{};
+    bool refused{}; ///< the path was a network/device path and was never touched
+    std::string refusal;
 };
 
+// A path is judged lexically BEFORE any filesystem call (F65): a UNC path makes a LocalSystem
+// agent authenticate to the named host, and a path under a network mount can pin the worker on a
+// dead server. A refused path is reported as refused (never as "not found": that would read as a
+// clean absence) and the caller's path text is not echoed into the reason.
 FileCheckResult check_file_path(std::string_view path) {
+    if (const auto refusal = yuzu::shared::local_path::local_path_refusal(path);
+        yuzu::shared::local_path::refused(refusal)) {
+        return {false, 0, true, std::string{yuzu::shared::local_path::refusal_token(refusal)}};
+    }
     std::error_code ec;
     auto status = std::filesystem::status(std::filesystem::path(path), ec);
     if (ec || !std::filesystem::exists(status)) {
@@ -447,120 +469,49 @@ FileCheckResult check_file_path(std::string_view path) {
 
 // ── SHA-256 file hash computation ────────────────────────────────────────────
 //
-// Minimal SHA-256 implementation for file hashing. This avoids pulling in
-// OpenSSL or platform crypto just for one hash function in the plugin.
+// A file named by the operator is hashed only if it is a REGULAR file, at most kMaxHashFileBytes
+// long, within a wall-clock deadline (F36): the previous unbounded std::ifstream read blocked a
+// command worker forever on a FIFO or device node and read arbitrarily large files. POSIX opens
+// the leaf no-follow and non-blocking and fstats the DESCRIPTOR; Windows has already refused
+// UNC/device/non-fixed-drive paths (check_file_path / hash_target's caller) and checks the file
+// type and size before opening.
+constexpr std::uint64_t kMaxHashFileBytes = 512ull * 1024 * 1024; // 512 MiB
+constexpr std::size_t kMaxFilePaths = 64;
+constexpr std::size_t kMaxFileHashes = 256;
+constexpr auto kHashDeadline = std::chrono::seconds(60); // one budget for the whole action
 
-struct Sha256 {
-    static constexpr std::array<uint32_t, 64> kK = {
-        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
-        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
-        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
-        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
-        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
-        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
-        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
-        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
-        0xc67178f2};
-
-    uint32_t h_[8] = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
-                      0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
-    uint8_t block_[64]{};
-    size_t block_len_{};
-    uint64_t total_len_{};
-
-    static uint32_t rotr(uint32_t x, int n) { return (x >> n) | (x << (32 - n)); }
-    static uint32_t ch(uint32_t x, uint32_t y, uint32_t z) { return (x & y) ^ (~x & z); }
-    static uint32_t maj(uint32_t x, uint32_t y, uint32_t z) { return (x & y) ^ (x & z) ^ (y & z); }
-    static uint32_t sig0(uint32_t x) { return rotr(x, 2) ^ rotr(x, 13) ^ rotr(x, 22); }
-    static uint32_t sig1(uint32_t x) { return rotr(x, 6) ^ rotr(x, 11) ^ rotr(x, 25); }
-    static uint32_t gam0(uint32_t x) { return rotr(x, 7) ^ rotr(x, 18) ^ (x >> 3); }
-    static uint32_t gam1(uint32_t x) { return rotr(x, 17) ^ rotr(x, 19) ^ (x >> 10); }
-
-    void process_block() {
-        uint32_t w[64]{};
-        for (int i = 0; i < 16; ++i) {
-            w[i] = (static_cast<uint32_t>(block_[i * 4]) << 24) |
-                   (static_cast<uint32_t>(block_[i * 4 + 1]) << 16) |
-                   (static_cast<uint32_t>(block_[i * 4 + 2]) << 8) |
-                   static_cast<uint32_t>(block_[i * 4 + 3]);
-        }
-        for (int i = 16; i < 64; ++i) {
-            w[i] = gam1(w[i - 2]) + w[i - 7] + gam0(w[i - 15]) + w[i - 16];
-        }
-        uint32_t a = h_[0], b = h_[1], c = h_[2], d = h_[3];
-        uint32_t e = h_[4], f = h_[5], g = h_[6], hh = h_[7];
-        for (int i = 0; i < 64; ++i) {
-            uint32_t t1 = hh + sig1(e) + ch(e, f, g) + kK[i] + w[i];
-            uint32_t t2 = sig0(a) + maj(a, b, c);
-            hh = g;
-            g = f;
-            f = e;
-            e = d + t1;
-            d = c;
-            c = b;
-            b = a;
-            a = t1 + t2;
-        }
-        h_[0] += a;
-        h_[1] += b;
-        h_[2] += c;
-        h_[3] += d;
-        h_[4] += e;
-        h_[5] += f;
-        h_[6] += g;
-        h_[7] += hh;
-    }
-
-    void update(const uint8_t* data, size_t len) {
-        total_len_ += len;
-        for (size_t i = 0; i < len; ++i) {
-            block_[block_len_++] = data[i];
-            if (block_len_ == 64) {
-                process_block();
-                block_len_ = 0;
-            }
-        }
-    }
-
-    std::string finalize() {
-        uint64_t bits = total_len_ * 8;
-        block_[block_len_++] = 0x80;
-        if (block_len_ > 56) {
-            while (block_len_ < 64)
-                block_[block_len_++] = 0;
-            process_block();
-            block_len_ = 0;
-        }
-        while (block_len_ < 56)
-            block_[block_len_++] = 0;
-        for (int i = 7; i >= 0; --i) {
-            block_[block_len_++] = static_cast<uint8_t>(bits >> (i * 8));
-        }
-        process_block();
-
-        std::string hex;
-        hex.reserve(64);
-        for (int i = 0; i < 8; ++i) {
-            hex += std::format("{:08x}", h_[i]);
-        }
-        return hex;
-    }
-};
-
-/// Compute SHA-256 hash of a file. Returns empty string on failure.
-std::string sha256_file(const std::filesystem::path& path) {
+yuzu::shared::BoundedHash hash_target(const std::filesystem::path& path,
+                                      yuzu::shared::HashClock::time_point deadline) {
+#ifndef _WIN32
+    const int fd = ::open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY | O_CLOEXEC);
+    if (fd < 0)
+        return {yuzu::shared::HashStatus::unreadable, {}};
+    struct FdCloser {
+        int fd;
+        ~FdCloser() { ::close(fd); }
+    } closer{fd};
+    return yuzu::shared::hash_fd_regular(fd, kMaxHashFileBytes, deadline);
+#else
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(path, ec) || ec)
+        return {yuzu::shared::HashStatus::not_regular, {}};
+    const auto size = std::filesystem::file_size(path, ec);
+    if (ec)
+        return {yuzu::shared::HashStatus::unreadable, {}};
+    if (size > kMaxHashFileBytes)
+        return {yuzu::shared::HashStatus::oversize, {}};
     std::ifstream f(path, std::ios::binary);
     if (!f.is_open())
-        return {};
-
-    Sha256 hasher;
-    std::array<uint8_t, 8192> buf{};
-    while (f.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(buf.size())) ||
-           f.gcount() > 0) {
-        hasher.update(buf.data(), static_cast<size_t>(f.gcount()));
-    }
-    return hasher.finalize();
+        return {yuzu::shared::HashStatus::unreadable, {}};
+    return yuzu::shared::hash_stream_bounded(
+        [&f](unsigned char* buf, std::size_t len) -> long long {
+            f.read(reinterpret_cast<char*>(buf), static_cast<std::streamsize>(len));
+            if (f.bad())
+                return -1;
+            return static_cast<long long>(f.gcount());
+        },
+        kMaxHashFileBytes, deadline);
+#endif
 }
 
 // ── IOC check implementations ────────────────────────────────────────────────
@@ -643,7 +594,27 @@ void check_file_hashes(yuzu::CommandContext& ctx, const std::vector<std::string>
         return;
     }
 
-    // Hash each target file and compare against the IOC hash list
+    // Hash each target file ONCE (not once per IOC hash), within one shared deadline, then compare
+    // every IOC hash against the results. A refused (network/device) path, a non-regular or
+    // oversized file and a timeout leave the path unhashed; the rows say how many were skipped
+    // so "No matching files found" is never read as "every path was checked".
+    const auto deadline = yuzu::shared::HashClock::now() + kHashDeadline;
+    std::unordered_map<std::string, std::string> hash_of_path; // path -> sha256 (hashed only)
+    std::size_t not_hashed = 0;
+    for (const auto& path : search_paths) {
+        if (hash_of_path.contains(path))
+            continue;
+        if (yuzu::shared::local_path::refused(yuzu::shared::local_path::local_path_refusal(path))) {
+            ++not_hashed;
+            continue;
+        }
+        auto r = hash_target(std::filesystem::path(path), deadline);
+        if (r.status == yuzu::shared::HashStatus::ok)
+            hash_of_path.emplace(path, std::move(r.hex));
+        else
+            ++not_hashed;
+    }
+
     for (const auto& hash : hashes) {
         bool matched = false;
         std::string detail;
@@ -654,19 +625,23 @@ void check_file_hashes(yuzu::CommandContext& ctx, const std::vector<std::string>
                        [](unsigned char c) { return std::tolower(c); });
 
         for (const auto& path : search_paths) {
-            auto file_hash = sha256_file(std::filesystem::path(path));
-            if (file_hash.empty())
+            const auto it = hash_of_path.find(path);
+            if (it == hash_of_path.end())
                 continue;
-
-            if (file_hash == search_hash) {
+            if (it->second == search_hash) {
                 matched = true;
                 detail = std::format("Hash match in: {}", path);
                 break;
             }
         }
 
-        if (!matched)
-            detail = "No matching files found";
+        if (!matched) {
+            detail = not_hashed == 0
+                         ? std::string{"No matching files found"}
+                         : std::format("No matching files found ({} path(s) not hashed: refused, "
+                                       "not a regular file, too large or unreadable)",
+                                       not_hashed);
+        }
 
         ctx.write_output(std::format("hash|{}|{}|{}", escape_pipes(hash),
                                      matched ? "true" : "false", escape_pipes(detail)));
@@ -677,7 +652,9 @@ void check_file_paths(yuzu::CommandContext& ctx, const std::vector<std::string>&
     for (const auto& path : paths) {
         auto result = check_file_path(path);
         std::string detail;
-        if (result.exists) {
+        if (result.refused) {
+            detail = result.refusal;
+        } else if (result.exists) {
             detail = std::format("File exists (size: {} bytes)", result.size);
         } else {
             detail = "File not found";
@@ -802,6 +779,15 @@ public:
         if (ip_list.empty() && domain_list.empty() && hash_list.empty() && path_list.empty() &&
             port_list.empty()) {
             ctx.write_output("error|none|false|No IOC parameters provided");
+            return 1;
+        }
+
+        // Bound the file work an operator parameter can request (F36): each path is stat'ed and,
+        // with file_hashes, read; each hash is compared against every path.
+        if (path_list.size() > kMaxFilePaths || hash_list.size() > kMaxFileHashes) {
+            ctx.write_output(std::format(
+                "error|none|false|Too many file_paths ({}, max {}) or file_hashes ({}, max {})",
+                path_list.size(), kMaxFilePaths, hash_list.size(), kMaxFileHashes));
             return 1;
         }
 

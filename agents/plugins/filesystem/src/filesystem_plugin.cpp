@@ -42,6 +42,7 @@
 #include "filesystem_acl_parsers.hpp"
 #include "filesystem_find_by_hash.hpp"
 #include <atomic_file_write.hpp> // yuzu::shared::write_file_atomic
+#include <local_path_policy.hpp> // yuzu::shared::local_path: UNC / device / non-fixed-drive refusal (F35)
 #include <network_fstype.hpp>
 
 #include <spdlog/spdlog.h>
@@ -123,10 +124,27 @@ using yuzu::filesystem::find_by_hash::kMaxHashFileSize;
 
 // ── Path validation ─────────────────────────────────────────────────────
 
+// Windows network/device refusal (F35). The agent runs as LocalSystem, so a `\\host\share\f`
+// path would make the machine account authenticate to that host and read from it, outside the
+// caller's per-device dispatch visibility. The shared predicate (agents/shared/local_path_policy.hpp;
+// find_by_hash applies the same drive-type rule to its root) judges the lexical spelling BEFORE any
+// filesystem call, and again on the canonical result (a junction, directory symlink or mapped drive
+// can resolve to a UNC target). POSIX: no mount-table read here -- validate_path runs several times
+// per action and operators legitimately read NFS paths; find_by_hash keeps its own mount guard.
+[[nodiscard]] bool path_refused_as_network([[maybe_unused]] std::string_view p) {
+#ifdef _WIN32
+    return yuzu::shared::local_path::refused(yuzu::shared::local_path::local_path_refusal(p));
+#else
+    return false;
+#endif
+}
+
 // Canonicalize a path and optionally enforce a base directory restriction.
 // Returns empty string on failure (path doesn't exist, escapes base_dir, etc.)
 std::string validate_path(std::string_view raw_path, std::string_view base_dir) {
     if (raw_path.empty())
+        return {};
+    if (path_refused_as_network(raw_path))
         return {};
 
     std::error_code ec;
@@ -139,6 +157,8 @@ std::string validate_path(std::string_view raw_path, std::string_view base_dir) 
     // Resolve all symlinks and normalize the path
     auto canonical = fs::canonical(path_str, ec);
     if (ec)
+        return {};
+    if (path_refused_as_network(canonical.string()))
         return {};
 
     // If a base_dir is configured, ensure the canonical path is within it
@@ -170,6 +190,8 @@ std::string validate_path(std::string_view raw_path, std::string_view base_dir) 
 std::string validate_path_or_parent(std::string_view raw_path, std::string_view base_dir) {
     if (raw_path.empty())
         return {};
+    if (path_refused_as_network(raw_path))
+        return {};
 
     std::error_code ec;
     std::string path_str{raw_path};
@@ -186,6 +208,8 @@ std::string validate_path_or_parent(std::string_view raw_path, std::string_view 
 
     auto canonical_parent = fs::canonical(parent, ec);
     if (ec)
+        return {};
+    if (path_refused_as_network(canonical_parent.string()))
         return {};
 
     if (!base_dir.empty()) {

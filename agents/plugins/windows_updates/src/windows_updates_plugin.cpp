@@ -19,11 +19,13 @@
 #include <yuzu/plugin.hpp>
 
 #include "windows_updates_parsers.hpp" // pure installed/missing parse+format helpers
+#include <outbound_address_policy.hpp> // address-class refusal for caller-supplied targets (F45)
 
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <format>
@@ -810,6 +812,27 @@ DnsResult test_dns(const std::string& host) {
     return r;
 }
 
+// F45: a resolved address a caller-supplied target may never name -- loopback, unspecified,
+// link-local (cloud metadata 169.254.169.254), multicast or reserved. RFC 1918 stays allowed: a
+// WSUS server is routinely on a private network, and the platform defaults are not judged at all.
+// An unparseable address fails closed.
+bool address_never_probeable(const std::string& ip) {
+    namespace ob = yuzu::shared::outbound;
+    in6_addr a6{};
+    if (inet_pton(AF_INET6, ip.c_str(), &a6) == 1) {
+        ob::Ipv6 b{};
+        std::memcpy(b.data(), &a6, b.size());
+        return ob::never_probeable(ob::classify_ipv6(b));
+    }
+    in_addr a4{};
+    if (inet_pton(AF_INET, ip.c_str(), &a4) == 1) {
+        ob::Ipv4 b{};
+        std::memcpy(b.data(), &a4, b.size());
+        return ob::never_probeable(ob::classify_ipv4(b));
+    }
+    return true;
+}
+
 struct TcpResult {
     bool ok{false};
     int64_t ms{-1};
@@ -958,6 +981,11 @@ int do_patch_connectivity(yuzu::CommandContext& ctx, yuzu::Params params) {
     WSAStartup(MAKEWORD(2, 2), &wsa);
 #endif
 
+    // Caller-supplied targets make this action a network probe from the endpoint (F45): cap how
+    // many one dispatch may name, and refuse the addresses no patch source lives at.
+    constexpr size_t kMaxCallerTargets = 16;
+    const bool caller_supplied = !targets_str.empty();
+
     std::vector<std::string> targets;
     if (targets_str.empty()) {
         targets = get_default_patch_targets();
@@ -977,6 +1005,13 @@ int do_patch_connectivity(yuzu::CommandContext& ctx, yuzu::Params params) {
             if (comma == std::string::npos) break;
             pos = comma + 1;
         }
+        if (targets.size() > kMaxCallerTargets) {
+            ctx.write_output(std::format("error|too many targets (max {})", kMaxCallerTargets));
+#ifdef _WIN32
+            WSACleanup();
+#endif
+            return 1;
+        }
     }
 
     int reachable = 0;
@@ -987,6 +1022,13 @@ int do_patch_connectivity(yuzu::CommandContext& ctx, yuzu::Params params) {
 
         // DNS test
         auto dns = test_dns(target.host);
+        if (dns.ok && caller_supplied && address_never_probeable(dns.ip)) {
+            // No resolved address and no connect attempt: this must not be an oracle for what a
+            // loopback / link-local / metadata name resolves to or listens on.
+            ctx.write_output(std::format("target|{}|refused|address_not_probeable", url));
+            ++failed;
+            continue;
+        }
         ctx.write_output(std::format("target|{}|dns_ok|{}|dns_ms|{}|ip|{}",
             url, dns.ok ? "true" : "false", dns.ms,
             dns.ok ? dns.ip : dns.error));
@@ -994,7 +1036,9 @@ int do_patch_connectivity(yuzu::CommandContext& ctx, yuzu::Params params) {
         if (!dns.ok) { ++failed; continue; }
 
         // TCP test
-        auto tcp = test_tcp(target.host, target.port, timeout_s);
+        // Connect to the address that was just classified, not to the name: a second lookup of
+        // the same name is a rebinding window past the check above.
+        auto tcp = test_tcp(dns.ip, target.port, timeout_s);
         ctx.write_output(std::format("target|{}|tcp_ok|{}|tcp_ms|{}",
             url, tcp.ok ? "true" : "false", tcp.ms));
 

@@ -599,6 +599,7 @@ agent_test_exe = executable(
     'unit/test_posix_dir_walk.cpp',     # PR #4154 round-8 remediation: shared capped
                                         # directory-walk primitive (agents/shared/posix_dir_walk.hpp)
     'unit/test_posix_secure_read.cpp',  # shared O_NOFOLLOW dir-open + bounded no-follow file read (agents/shared/posix_secure_read.hpp), POSIX-only bodies
+    'unit/test_local_path_policy.cpp',  # WP10: shared UNC/device/network-mount path refusal, resolve-once outbound address vetting, bounded regular-file hash; plus ioc/processes plugin round-trips (POSIX bodies)
     'unit/test_sha256.cpp',             # shared in-memory SHA-256 (agents/shared/sha256.hpp), portable
     'unit/test_hmac_sha256.cpp',        # H.5: shared HMAC-SHA-256 (RFC 4231 vectors) + the machine-id hash contract (agents/shared/machine_id_hash.hpp), portable
     'unit/test_hardware_estate_parsers.cpp', # H.5: pure chassis/baseboard/swap/machine_id row formatters + outcome contract (hardware_estate_parsers.hpp), portable

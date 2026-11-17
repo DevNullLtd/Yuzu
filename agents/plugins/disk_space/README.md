@@ -26,6 +26,8 @@ flowchart LR
   WIN & MAC & LIN --> ROWS[disk row, no typed status] --> RS[(ResponseStore)] --> API[REST /api/responses · /auto pre-flight · device-live disk card]
 ```
 
+**A network or device path is refused before any syscall.** `path` is judged by the shared `agents/shared/local_path_policy.hpp` first: on Windows a UNC path (`\\host\share`, `\\?\UNC\...`), a `\\.\` or `\??\` device spelling, a reserved DOS device name and a drive letter whose type is not `DRIVE_FIXED` all answer `error|path_refused:...` (the row names the class, never the path), so the LocalSystem agent never authenticates to an operator-chosen host; on Linux and macOS a path on or under a network mount (NFS, CIFS, autofs and the other types in `network_fstype.hpp`) is refused the same way, and an unreadable mount table refuses (`path_refused:mount_table_unreadable`) rather than reading as "no network mounts". The check is lexical: a symlink inside a local tree that points at a network location is not detected, and a network-rooted `/` refuses every path.
+
 ## OS capability
 
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->

@@ -12,7 +12,15 @@
  * Output: pipe-delimited via write_output()
  *
  * Security: uses cpp-httplib directly — no shell invocation, no command injection.
- *           SSRF protection: blocks requests to private/internal IP ranges.
+ *           SSRF protection: the host is resolved ONCE, every returned address must be a public
+ *           address (agents/shared/outbound_address_policy.hpp), and the connection is pinned to
+ *           the address that was vetted (cpp-httplib's hostname-to-address map, which keeps the
+ *           Host header and TLS SNI/verification on the name) — there is no second lookup to
+ *           rebind (F17).
+ *           Download: the body is held in memory (capped), verified against expected_hash, and only
+ *           then atomically written over the destination; a failed, non-2xx, over-cap or
+ *           unverified transfer writes NOTHING (F18). A destination on a network/device path is
+ *           refused (F65).
  */
 
 #include <yuzu/plugin.hpp>
@@ -27,24 +35,28 @@
 #include <windows.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
-#include <bcrypt.h>
-#pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "ws2_32.lib")
 #else
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <sys/socket.h>
-#include <openssl/evp.h>
 #endif
 
 #include <httplib.h>
 
+#include <atomic_file_write.hpp>      // yuzu::shared::write_file_atomic (F18)
+#include <local_path_policy.hpp>      // refuse a UNC / device / network-mount destination (F65)
+#include <outbound_address_policy.hpp> // resolve-once address vetting (F17)
+#include <sha256.hpp>                  // incremental SHA-256 over the in-memory body (F18)
+
+#include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <format>
 #include <fstream>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -58,84 +70,55 @@ bool is_valid_url(std::string_view url) {
     return url.starts_with("http://") || url.starts_with("https://");
 }
 
-// ── SSRF protection: reject private/internal IP addresses ───────────────────
+// ── SSRF protection: resolve once, vet every address, connect to the vetted one ─────────────
 
-bool is_private_ipv4(const struct sockaddr_in* addr) {
-    uint32_t ip = ntohl(addr->sin_addr.s_addr);
-    // 127.0.0.0/8
-    if ((ip >> 24) == 127) return true;
-    // 10.0.0.0/8
-    if ((ip >> 24) == 10) return true;
-    // 172.16.0.0/12
-    if ((ip >> 20) == (172 << 4 | 1)) return true;  // 172.16-31.x.x
-    if ((ip & 0xFFF00000) == 0xAC100000) return true;
-    // 192.168.0.0/16
-    if ((ip >> 16) == (192 << 8 | 168)) return true;
-    if ((ip & 0xFFFF0000) == 0xC0A80000) return true;
-    // 169.254.0.0/16 (link-local)
-    if ((ip >> 16) == (169 << 8 | 254)) return true;
-    if ((ip & 0xFFFF0000) == 0xA9FE0000) return true;
-    // 100.64.0.0/10 (carrier-grade NAT / RFC 6598)
-    if ((ip & 0xFFC00000) == 0x64400000) return true;
-    // 198.18.0.0/15 (benchmarking / RFC 2544)
-    if ((ip & 0xFFFE0000) == 0xC6120000) return true;
-    // 0.0.0.0
-    if (ip == 0) return true;
-    return false;
-}
-
-bool is_private_ipv6(const struct sockaddr_in6* addr) {
-    const uint8_t* b = addr->sin6_addr.s6_addr;
-    // ::1 (loopback)
-    static const uint8_t loopback[16] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1};
-    if (std::memcmp(b, loopback, 16) == 0) return true;
-    // :: (unspecified)
-    static const uint8_t unspec[16] = {0};
-    if (std::memcmp(b, unspec, 16) == 0) return true;
-    // fd00::/8 (unique local)
-    if (b[0] == 0xfd) return true;
-    // fc00::/7 (unique local, broader)
-    if ((b[0] & 0xfe) == 0xfc) return true;
-    // fe80::/10 (link-local)
-    if (b[0] == 0xfe && (b[1] & 0xc0) == 0x80) return true;
-    // ::ffff:0:0/96 (IPv4-mapped) — check the embedded IPv4
-    static const uint8_t v4mapped_prefix[12] = {0,0,0,0,0,0,0,0,0,0,0xff,0xff};
-    if (std::memcmp(b, v4mapped_prefix, 12) == 0) {
-        struct sockaddr_in sa4{};
-        sa4.sin_family = AF_INET;
-        std::memcpy(&sa4.sin_addr.s_addr, b + 12, 4);
-        return is_private_ipv4(&sa4);
-    }
-    return false;
-}
-
-bool hostname_resolves_to_private(const std::string& hostname) {
+// One getaddrinfo for `host`; every answer as raw bytes plus its numeric text (inet_ntop).
+std::vector<yuzu::shared::outbound::ResolvedAddress> resolve_all(const std::string& host,
+                                                                 std::vector<std::string>& texts) {
+    std::vector<yuzu::shared::outbound::ResolvedAddress> out;
     struct addrinfo hints{};
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
-
     struct addrinfo* result = nullptr;
-    int rc = getaddrinfo(hostname.c_str(), nullptr, &hints, &result);
-    if (rc != 0 || !result) return true; // fail-closed: block on resolution failure
-
-    bool is_private = false;
+    if (getaddrinfo(host.c_str(), nullptr, &hints, &result) != 0 || !result)
+        return out; // empty = resolution failed: the caller fails closed
     for (auto* rp = result; rp != nullptr; rp = rp->ai_next) {
+        yuzu::shared::outbound::ResolvedAddress a;
+        char text[INET6_ADDRSTRLEN]{};
         if (rp->ai_family == AF_INET) {
-            if (is_private_ipv4(reinterpret_cast<struct sockaddr_in*>(rp->ai_addr))) {
-                is_private = true;
-                break;
-            }
+            const auto* sa = reinterpret_cast<const struct sockaddr_in*>(rp->ai_addr);
+            std::memcpy(a.bytes.data(), &sa->sin_addr, 4);
+            inet_ntop(AF_INET, &sa->sin_addr, text, sizeof(text));
         } else if (rp->ai_family == AF_INET6) {
-            if (is_private_ipv6(reinterpret_cast<struct sockaddr_in6*>(rp->ai_addr))) {
-                is_private = true;
-                break;
-            }
+            const auto* sa = reinterpret_cast<const struct sockaddr_in6*>(rp->ai_addr);
+            a.is_v6 = true;
+            std::memcpy(a.bytes.data(), &sa->sin6_addr, 16);
+            inet_ntop(AF_INET6, &sa->sin6_addr, text, sizeof(text));
+        } else {
+            continue;
         }
+        out.push_back(a);
+        texts.emplace_back(text);
     }
-
     freeaddrinfo(result);
-    return is_private;
+    return out;
 }
+
+// Resolve `host` ONCE and judge every answer. On success `vetted_ip` is the numeric address the
+// caller must connect to (and must NOT re-resolve the name); on refusal or a failed lookup the
+// destination is blocked (fail closed).
+bool vet_destination(const std::string& host, std::string& vetted_ip) {
+    std::vector<std::string> texts;
+    std::vector<yuzu::shared::outbound::ResolvedAddress> answers;
+    const auto verdict = yuzu::shared::outbound::vet_host(
+        [&] { return resolve_all(host, texts); }, answers);
+    if (verdict.status != yuzu::shared::outbound::VetStatus::ok || verdict.index >= texts.size())
+        return false;
+    vetted_ip = texts[verdict.index];
+    return true;
+}
+
+constexpr const char* kSsrfBlocked = "SSRF blocked: URL resolves to a private/internal IP address";
 
 // Parse a URL into scheme, host, port, path components
 struct ParsedUrl {
@@ -188,87 +171,37 @@ bool parse_url(std::string_view url, ParsedUrl& out) {
     return !out.host.empty();
 }
 
-// ── SHA-256 file hashing ────────────────────────────────────────────────────
-
-std::string sha256_file(const fs::path& path) {
-    std::ifstream file(path, std::ios::binary);
-    if (!file) return {};
-
-#ifdef _WIN32
-    BCRYPT_ALG_HANDLE alg = nullptr;
-    BCRYPT_HASH_HANDLE hash = nullptr;
-    BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0);
-    DWORD hash_len = 0, result_len = 0;
-    BCryptGetProperty(alg, BCRYPT_HASH_LENGTH, reinterpret_cast<PUCHAR>(&hash_len), sizeof(hash_len), &result_len, 0);
-    BCryptCreateHash(alg, &hash, nullptr, 0, nullptr, 0, 0);
-
-    char buf[8192];
-    while (file.read(buf, sizeof(buf)) || file.gcount() > 0) {
-        BCryptHashData(hash, reinterpret_cast<PUCHAR>(buf), static_cast<ULONG>(file.gcount()), 0);
-    }
-
-    std::vector<UCHAR> digest(hash_len);
-    BCryptFinishHash(hash, digest.data(), hash_len, 0);
-    BCryptDestroyHash(hash);
-    BCryptCloseAlgorithmProvider(alg, 0);
-
-    std::string hex;
-    for (auto b : digest) hex += std::format("{:02x}", b);
-    return hex;
-#else
-    auto* ctx = EVP_MD_CTX_new();
-    EVP_DigestInit_ex(ctx, EVP_sha256(), nullptr);
-
-    char buf[8192];
-    while (file.read(buf, sizeof(buf)) || file.gcount() > 0) {
-        EVP_DigestUpdate(ctx, buf, static_cast<size_t>(file.gcount()));
-    }
-
-    unsigned char digest[EVP_MAX_MD_SIZE];
-    unsigned int len = 0;
-    EVP_DigestFinal_ex(ctx, digest, &len);
-    EVP_MD_CTX_free(ctx);
-
-    std::string hex;
-    for (unsigned i = 0; i < len; ++i) hex += std::format("{:02x}", digest[i]);
-    return hex;
-#endif
-}
-
 // ── Safe HTTP operations using cpp-httplib ───────────────────────────────────
 
-// Download a file via httplib (no shell, no command injection)
-int download_url(std::string_view url, const fs::path& dest, std::string& error) {
+// Fetch a file body into `body` (no shell, no command injection). Nothing touches the filesystem
+// here: only a 2xx answer is accepted (the response handler aborts the transfer for any other
+// status, so an error page is never buffered as "the download"), and the body is capped.
+int download_url(std::string_view url, std::string& body, std::string& error) {
     ParsedUrl parsed;
     if (!parse_url(url, parsed)) {
         error = "invalid URL";
         return 1;
     }
 
-    // SSRF check
-    if (hostname_resolves_to_private(parsed.host)) {
-        error = "SSRF blocked: URL resolves to a private/internal IP address";
+    // SSRF check: resolve once; the connection below is pinned to the vetted address.
+    std::string vetted_ip;
+    if (!vet_destination(parsed.host, vetted_ip)) {
+        error = kSsrfBlocked;
         return 1;
     }
 
-    std::string origin = (parsed.is_https ? "https://" : "http://") + parsed.host + ":" + std::to_string(parsed.port);
-
-    std::ofstream ofs(dest, std::ios::binary);
-    if (!ofs) {
-        error = "failed to open destination file for writing";
-        return 1;
-    }
-
-    size_t total_bytes = 0;
     bool size_exceeded = false;
+    body.clear();
 
+    auto response_handler = [](const httplib::Response& r) {
+        return r.status >= 200 && r.status < 300;
+    };
     auto content_receiver = [&](const char* data, size_t len) {
-        total_bytes += len;
-        if (total_bytes > kMaxDownloadSize) {
+        if (body.size() + len > kMaxDownloadSize) {
             size_exceeded = true;
             return false; // abort download
         }
-        ofs.write(data, static_cast<std::streamsize>(len));
+        body.append(data, len);
         return true;
     };
 
@@ -276,32 +209,31 @@ int download_url(std::string_view url, const fs::path& dest, std::string& error)
     if (parsed.is_https) {
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
         httplib::SSLClient cli(parsed.host, parsed.port);
+        cli.set_hostname_addr_map({{parsed.host, vetted_ip}});
         cli.set_connection_timeout(30);
         cli.set_read_timeout(300);
         cli.enable_server_certificate_verification(true);
-        res = cli.Get(parsed.path, content_receiver);
+        res = cli.Get(parsed.path, response_handler, content_receiver);
 #else
-        ofs.close();
         error = "HTTPS not supported (OpenSSL not available)";
         return 1;
 #endif
     } else {
         httplib::Client cli(parsed.host, parsed.port);
+        cli.set_hostname_addr_map({{parsed.host, vetted_ip}});
         cli.set_connection_timeout(30);
         cli.set_read_timeout(300);
-        res = cli.Get(parsed.path, content_receiver);
+        res = cli.Get(parsed.path, response_handler, content_receiver);
     }
 
-    ofs.close();
-
     if (size_exceeded) {
-        std::error_code ec;
-        std::filesystem::remove(dest, ec);
+        body.clear();
         error = "download aborted: exceeded maximum size limit (100 MB)";
         return 1;
     }
 
-    if (!res || res->status < 200 || res->status >= 400) {
+    if (!res || res->status < 200 || res->status >= 300) {
+        body.clear();
         error = "download failed: HTTP " + (res ? std::to_string(res->status) : "connection error");
         return 1;
     }
@@ -317,16 +249,18 @@ std::string http_get(std::string_view url, int& status_code) {
         return "invalid URL";
     }
 
-    // SSRF check
-    if (hostname_resolves_to_private(parsed.host)) {
+    // SSRF check: resolve once; the connection below is pinned to the vetted address.
+    std::string vetted_ip;
+    if (!vet_destination(parsed.host, vetted_ip)) {
         status_code = 0;
-        return "SSRF blocked: URL resolves to a private/internal IP address";
+        return kSsrfBlocked;
     }
 
     httplib::Result res;
     if (parsed.is_https) {
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
         httplib::SSLClient cli(parsed.host, parsed.port);
+        cli.set_hostname_addr_map({{parsed.host, vetted_ip}});
         cli.set_connection_timeout(30);
         cli.set_read_timeout(60);
         cli.enable_server_certificate_verification(true);
@@ -337,6 +271,7 @@ std::string http_get(std::string_view url, int& status_code) {
 #endif
     } else {
         httplib::Client cli(parsed.host, parsed.port);
+        cli.set_hostname_addr_map({{parsed.host, vetted_ip}});
         cli.set_connection_timeout(30);
         cli.set_read_timeout(60);
         res = cli.Get(parsed.path);
@@ -361,16 +296,18 @@ std::string http_head(std::string_view url, int& status_code) {
         return "invalid URL";
     }
 
-    // SSRF check
-    if (hostname_resolves_to_private(parsed.host)) {
+    // SSRF check: resolve once; the connection below is pinned to the vetted address.
+    std::string vetted_ip;
+    if (!vet_destination(parsed.host, vetted_ip)) {
         status_code = 0;
-        return "SSRF blocked: URL resolves to a private/internal IP address";
+        return kSsrfBlocked;
     }
 
     httplib::Result res;
     if (parsed.is_https) {
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
         httplib::SSLClient cli(parsed.host, parsed.port);
+        cli.set_hostname_addr_map({{parsed.host, vetted_ip}});
         cli.set_connection_timeout(30);
         cli.set_read_timeout(60);
         cli.enable_server_certificate_verification(true);
@@ -381,6 +318,7 @@ std::string http_head(std::string_view url, int& status_code) {
 #endif
     } else {
         httplib::Client cli(parsed.host, parsed.port);
+        cli.set_hostname_addr_map({{parsed.host, vetted_ip}});
         cli.set_connection_timeout(30);
         cli.set_read_timeout(60);
         res = cli.Head(parsed.path);
@@ -479,6 +417,15 @@ private:
             return 1;
         }
 
+        // A destination on a UNC / device / network-mount path is refused before any filesystem
+        // call (F65): fs::canonical below would otherwise reach out to the named host.
+        if (const auto refusal = yuzu::shared::local_path::local_path_refusal(path);
+            yuzu::shared::local_path::refused(refusal)) {
+            ctx.write_output(std::format("error|{}",
+                                         yuzu::shared::local_path::refusal_token(refusal)));
+            return 1;
+        }
+
         // Path traversal protection: reject paths with ".." components
         fs::path dest{std::string{path}};
         {
@@ -490,6 +437,15 @@ private:
                 ctx.write_output(std::format("error|invalid download path: parent directory does not exist"));
                 return 1;
             }
+            // A symlink / junction in the parent can resolve to a network location: judge the
+            // resolved parent too.
+            if (const auto refusal =
+                    yuzu::shared::local_path::local_path_refusal(canonical_parent.string());
+                yuzu::shared::local_path::refused(refusal)) {
+                ctx.write_output(std::format("error|{}",
+                                             yuzu::shared::local_path::refusal_token(refusal)));
+                return 1;
+            }
             dest = canonical_parent / dest.filename();
             // Reject if any component is ".."
             for (const auto& component : fs::path{std::string{path}}) {
@@ -499,22 +455,39 @@ private:
                 }
             }
         }
+
+        // F18: fetch into memory, verify, and only then atomically replace the destination. A
+        // failed, non-2xx, over-cap or hash-mismatched transfer leaves the existing destination
+        // (or its absence) exactly as it was: nothing unverified ever sits at `dest`.
+        std::string body;
         std::string error;
-        if (download_url(url, dest, error) != 0) {
+        if (download_url(url, body, error) != 0) {
             ctx.write_output(std::format("error|{}", error));
             return 1;
         }
 
-        std::error_code ec;
-        auto size = fs::file_size(dest, ec);
-        auto hash = sha256_file(dest);
+        yuzu::shared::Sha256 hasher;
+        hasher.update(body.data(), body.size());
+        const std::string hash = hasher.hex_digest();
 
-        auto expected = params.get("expected_hash");
+        // expected_hash is hex: compare case-insensitively (the plugin emits lowercase).
+        std::string expected{params.get("expected_hash")};
+        for (auto& c : expected)
+            if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
         if (!expected.empty() && hash != expected) {
-            fs::remove(dest, ec);
             ctx.write_output(std::format("error|hash mismatch: expected={}, got={}", expected, hash));
             return 1;
         }
+
+        // 0666 & ~umask like the previous ofstream, carrying an existing file's rwx bits.
+        const auto written =
+            yuzu::shared::write_file_atomic(dest, body, {.owner_only_mode = false});
+        if (!written) {
+            ctx.write_output(std::format("error|failed to write destination: {}",
+                                         written.error().message));
+            return 1;
+        }
+        const auto size = static_cast<std::uintmax_t>(body.size());
 
         ctx.write_output("status|ok");
         ctx.write_output(std::format("path|{}", dest.string()));

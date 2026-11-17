@@ -26,6 +26,8 @@ flowchart LR
   WIN & MAC & LIN --> ROWS[rows, no typed result status] --> RS[(ResponseStore)] --> API[REST /api/responses · /api/v1/dex/devices/id/live]
 ```
 
+**Image hashing no longer re-opens path text (F33).** On Linux `list_hashed`/`list_tree` hash through an open of `/proc/<pid>/exe` itself (the kernel's own reference to the running image, so a `(deleted)` image is hashed from its inode and the readlink text is never opened), with `O_NONBLOCK`, an `fstat` regular-file check, the 512 MiB cap and a 30 s deadline, and cache by `(dev, ino)`; the `path` column still shows the readlink text with the `(deleted)` marker stripped. On Windows and macOS an image path that is a UNC/device/non-fixed-drive/network-mount path is not opened and reads as an empty `sha256`, so a process a standard user launched from a share cannot make the agent authenticate to that share.
+
 ## OS capability
 
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->

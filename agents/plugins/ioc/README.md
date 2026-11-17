@@ -26,6 +26,8 @@ flowchart LR
   WIN & MAC & LIN --> ROWS["pipe rows + UNDECLARED status"] --> RS[("ResponseStore")] --> API["REST /api/responses"]
 ```
 
+**`file_paths`/`file_hashes` are validated and bounded (F36/F65).** Every path is judged by `agents/shared/local_path_policy.hpp` before any filesystem call: a UNC/device path, a non-fixed drive (Windows) or a path under a network mount (Linux/macOS) answers `file|<path>|false|path_refused:...` and is never touched, so the "no outbound network access" statement holds for UNC paths again. File hashing opens the leaf no-follow and non-blocking, hashes only a regular file of at most 512 MiB, hashes each file once for all IOC hashes, and shares one 60 s deadline across the action; a refused, non-regular, oversized or unreadable path is counted in the `hash|...|false|No matching files found (N path(s) not hashed ...)` detail rather than reading as a clean miss. More than 64 `file_paths` or 256 `file_hashes` is refused with an `error` row. The Windows leg was not compiled or run in the change that made this.
+
 ## OS capability
 
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->

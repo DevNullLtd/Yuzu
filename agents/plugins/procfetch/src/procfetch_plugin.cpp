@@ -53,6 +53,8 @@
 // clang-format on
 #include <bcrypt.h>
 #include <win_str.hpp>  // shared yuzu::win wide<->UTF-8 helpers (#1681)
+#include <local_path_policy.hpp>   // refuse UNC / device / non-fixed-drive image paths (F34)
+#include <win_no_reparse_open.hpp> // handle-relative OBJ_DONT_REPARSE open (F34)
 #pragma comment(lib, "bcrypt.lib")
 #include <charconv>
 #include <tlhelp32.h>
@@ -264,17 +266,22 @@ std::string get_process_image_path(DWORD pid) {
 }
 
 std::string sha1_of_file(const std::string& path, BCRYPT_ALG_HANDLE alg) {
-    HANDLE file = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-                              FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file == INVALID_HANDLE_VALUE)
+    // F34: the image path belongs to a process any standard user can start, so it can be a share
+    // (`\\server\share\x.exe`). Opening it as the LocalSystem agent would authenticate the machine
+    // account to that host. Classify BEFORE any open (a refused path reads as an empty hash, the
+    // honest "not hashed" answer), then open handle-relative with no reparse point followed so a
+    // junction or symlink in the path cannot redirect the open either.
+    if (yuzu::shared::local_path::refused(yuzu::shared::local_path::local_path_refusal(path)))
         return {};
+    const auto opened = yuzu::win::open_file_no_reparse(yuzu::win::to_wide(path));
+    if (opened.status != yuzu::win::NoReparseOpen::ok)
+        return {};
+    const HANDLE file = opened.file.get(); // owned by `opened`; closed on every exit path
 
     BCRYPT_HASH_HANDLE hash_handle = nullptr;
     NTSTATUS status = BCryptCreateHash(alg, &hash_handle, nullptr, 0, nullptr, 0, 0);
-    if (status != 0) {
-        CloseHandle(file);
+    if (status != 0)
         return {};
-    }
 
     char buf[65536];
     DWORD bytes_read = 0;
@@ -283,7 +290,6 @@ std::string sha1_of_file(const std::string& path, BCRYPT_ALG_HANDLE alg) {
         if (status != 0)
             break;
     }
-    CloseHandle(file);
 
     unsigned char hash[20]; // SHA-1 is 20 bytes
     status = BCryptFinishHash(hash_handle, hash, sizeof(hash), 0);

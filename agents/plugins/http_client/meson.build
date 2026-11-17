@@ -29,6 +29,7 @@ shared_library(
   files('src/http_client_plugin.cpp'),
   name_prefix: '',
   cpp_args: http_cpp_args,
+  include_directories: include_directories('../../shared'),  # atomic_file_write.hpp, local_path_policy.hpp, outbound_address_policy.hpp
   dependencies: [yuzu_sdk_dep, yuzu_agent_core_dep, httplib_dep] + http_extra_deps,
   install: true,
   install_dir: get_option('libdir') / 'yuzu' / 'plugins',

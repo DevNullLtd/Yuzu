@@ -20,6 +20,8 @@
 
 #include <yuzu/plugin.hpp>
 
+#include <local_path_policy.hpp> // agents/shared: refuse UNC / device / network-mount paths (F39)
+
 #include <format>
 #include <string>
 #include <string_view>
@@ -80,6 +82,16 @@ int do_free(yuzu::CommandContext& ctx, yuzu::Params params) {
         "/";
 #endif
     const auto path = params.get("path", default_path);
+
+    // Refuse a network or device path BEFORE any syscall (F39): a UNC path makes the LocalSystem
+    // agent authenticate to the named host; on POSIX a statvfs under a network mount can block on
+    // a dead server or trigger an automount. The row names the class, never the caller's path.
+    if (const auto refusal = yuzu::shared::local_path::local_path_refusal(path);
+        yuzu::shared::local_path::refused(refusal)) {
+        ctx.write_output(std::format("error|{}",
+                                     yuzu::shared::local_path::refusal_token(refusal)));
+        return 1;
+    }
 
     unsigned long long total_bytes = 0;
     unsigned long long free_bytes = 0;

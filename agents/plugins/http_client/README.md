@@ -26,6 +26,8 @@ flowchart LR
   WIN & MAC & LIN --> ROWS[pipe rows +<br/>typed result status] --> RS[(ResponseStore)] --> API[REST /api/responses]
 ```
 
+**Resolve once, connect to the vetted address; download is verify-then-replace (F17/F18/F65).** Each request resolves the host ONE time, requires EVERY returned address to be a public address (`agents/shared/outbound_address_policy.hpp`: loopback, private, CGNAT, link-local/metadata, multicast, reserved, documentation, IPv4-mapped/compatible, NAT64 and 6to4 forms are judged by their embedded IPv4 address, `64:ff9b:1::/48` and the rest of non-global IPv6 refuse) and pins the connection to the vetted address through cpp-httplib's hostname-to-address map, so a DNS answer that changes between the check and the connect cannot redirect it, while the `Host` header and TLS name verification stay on the original name (#647). `download` buffers the body in memory (capped at 100 MiB), accepts only a 2xx status, verifies `expected_hash` (case-insensitive), and only then replaces the destination atomically (`atomic_file_write.hpp`); a failed, non-2xx, over-cap or unverified transfer writes nothing and leaves an existing destination untouched. A destination `path` on a UNC/device/network-mount path, or whose resolved parent is one, is refused. IPv6 literal hosts (`[::1]`) are still not supported by the URL parser and remain blocked.
+
 ## OS capability
 
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->

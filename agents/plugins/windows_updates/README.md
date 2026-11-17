@@ -46,6 +46,8 @@ flowchart LR
   ROWS -.-> PF["/auto Pre-flight<br/>reboot readiness check"]
 ```
 
+**`patch_connectivity` with a `targets` parameter is a network probe and is bounded accordingly (F45).** At most 16 caller-supplied targets are accepted per dispatch (more is an `error` row), a target whose resolved address is loopback, unspecified, link-local (cloud metadata), multicast or reserved is answered `refused|address_not_probeable` with no resolved address and no connect attempt (RFC 1918 stays allowed because a WSUS server is routinely private), and the TCP probe connects to the address that was just classified rather than resolving the name a second time. The built-in default targets are not judged. The action is still classified `SoftwareDeployment:Read` with no approval gate server-side; moving a caller-supplied `targets` probe under `Infrastructure:Read` or an approval gate is an authorization decision recorded as an open question, not made here.
+
 ## OS capability
 
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
