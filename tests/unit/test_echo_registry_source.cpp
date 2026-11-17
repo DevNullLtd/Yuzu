@@ -5954,24 +5954,37 @@ namespace {
 // window_base or read stamp ever carries the offset; it is reset straight after.
 std::atomic<std::int64_t> g_clock_offset{0};
 
-// Is this process's token elevated? It feeds etw_skip_reason through require_etw_or_skip: a start
-// failure is a SKIP only for a named environment cause, so a broken session can never pass as
-// "not elevated".
-bool is_elevated() {
+// Is this process's token elevated? nullopt, with the Win32 code in `error`, when the token query
+// itself fails: an unestablished elevation is never "not elevated". It feeds etw_skip_reason
+// through require_etw_or_skip: a start failure is a SKIP only for a named environment cause, so a
+// broken session can never pass as "not elevated".
+std::optional<bool> is_elevated(unsigned long& error) {
     HANDLE token = nullptr;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
-        return false;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+        error = GetLastError();
+        return std::nullopt;
+    }
     TOKEN_ELEVATION e{};
     DWORD len = 0;
     const bool ok = GetTokenInformation(token, TokenElevation, &e, sizeof(e), &len) != 0;
+    if (!ok)
+        error = GetLastError();
     CloseHandle(token);
-    return ok && e.TokenIsElevated != 0;
+    if (!ok)
+        return std::nullopt;
+    return e.TokenIsElevated != 0;
 }
 
 // The session did not open: SKIP when the reader's start error is a named environment cause,
-// FAIL with the code otherwise, so a broken session can never pass as "not elevated".
+// FAIL with the code otherwise, so a broken session can never pass as "not elevated". A Win32 5
+// start failure with no established elevation FAILs naming the token-query code.
 void require_etw_or_skip(unsigned long start_rc, const std::string& detail) {
-    if (const auto reason = etw_skip_reason(start_rc, is_elevated()))
+    unsigned long token_error = 0;
+    const auto elevated = is_elevated(token_error);
+    if (start_rc == 5 && !elevated)
+        FAIL("the ETW session did not open (Win32 5) and elevation could not be established "
+             "(token query Win32 " << token_error << "): " << detail);
+    if (const auto reason = etw_skip_reason(start_rc, elevated.value_or(true)))
         SKIP(*reason);
     FAIL("the ETW session did not open (Win32 " << start_rc << "): " << detail);
 }
