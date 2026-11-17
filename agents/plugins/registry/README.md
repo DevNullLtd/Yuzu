@@ -779,7 +779,7 @@ registry|unsupported|Windows registry is not available on this platform
 - Plugin: `agents/plugins/registry/src/registry_core.hpp` · `agents/plugins/registry/src/registry_parsers.hpp` · `agents/plugins/registry/src/registry_plan.hpp` · `agents/plugins/registry/src/registry_plugin.cpp` · `agents/plugins/registry/src/registry_win.cpp`
 - Definitions: `content/definitions/registry.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_a.hpp`
-- Tests: `tests/test_registry_definition.py` · `tests/unit/test_registry_core.cpp` · `tests/unit/test_registry_local_dispatcher.cpp` · `tests/unit/test_registry_parsers.cpp` · `tests/unit/test_registry_plan.cpp` · `tests/unit/test_registry_win_internals.cpp` · `tests/unit/test_registry_write_local_dispatcher.cpp`
+- Tests: `tests/test_registry_definition.py` · `tests/test_registry_verify_default_wiring_lexical.py` · `tests/unit/test_registry_core.cpp` · `tests/unit/test_registry_local_dispatcher.cpp` · `tests/unit/test_registry_parsers.cpp` · `tests/unit/test_registry_plan.cpp` · `tests/unit/test_registry_win_internals.cpp` · `tests/unit/test_registry_write_local_dispatcher.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/7173-echo-registry-live-etw-skip.fixed.md`
+- Changelog: `changelog.d/7173-echo-registry-live-etw-skip.fixed.md` · `changelog.d/8016-spark-registry-rename-deaf-watch.fixed.md`
 <!-- END GENERATED -->

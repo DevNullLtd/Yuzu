@@ -848,7 +848,10 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
         const hardware_ci_page::Request& rq = *parsed;
-        const auto read = hardware_ci_page::read_page(deps_.ci_page_reader, rq, gate.scope);
+        // `deps_.ci_collation_gate` is the collation gate (device_ci_read_gate.hpp): not Trusted
+        // refuses the page before the store is asked. Null means no gate was wired (tests only).
+        const auto read = hardware_ci_page::read_page(deps_.ci_page_reader, rq, gate.scope,
+                                                      deps_.ci_collation_gate);
         if (!read) {
             // ONE answer per failure, shared with MCP (hardware_ci_page::describe_read_error): a
             // scope too wide is TERMINAL (400, no retry hint, audited as a refusal with no count),
@@ -864,6 +867,10 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                     hardware_ci_page::audit_target_type(rq), hardware_ci_page::audit_target_id(rq),
                     f.audit_detail);
             res.status = f.unavailable ? 503 : 400;
+            // The unverified-ordering refusal clears on the recheck's schedule, so the header
+            // agrees with the body's retry_after_ms (the other refusals send the body hint only).
+            if (read.error() == hardware_ci_page::ReadError::kOrderingUnverified)
+                res.set_header("Retry-After", std::to_string(f.retry_after_ms / 1000));
             detail::A4ErrorOpts opts;
             if (f.retry_after_ms >= 0)
                 opts.retry_after_ms = f.retry_after_ms;

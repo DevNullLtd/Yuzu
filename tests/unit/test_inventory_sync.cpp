@@ -6,6 +6,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "collection_settings_agent.hpp" // the golden settings documents feed the collector switches
 #include "installed_apps_inventory.hpp" // the plugin's own row parsers/builder feed the publisher cases
 #include "installed_software_v3.hpp"
 #include "local_dispatcher.hpp"
@@ -1522,6 +1523,9 @@ std::size_t msi_sample_mapped_rows() {
 struct Collector {
     std::map<std::string, std::string> kv;
     std::shared_ptr<CollectorWorkers> workers = std::make_shared<CollectorWorkers>();
+    // The agent-owned collector switches (fleet settings); empty = every collector on.
+    std::shared_ptr<yuzu::agent::CollectorEnabledSet> enabled =
+        std::make_shared<yuzu::agent::CollectorEnabledSet>();
     std::chrono::steady_clock::time_point now =
         std::chrono::steady_clock::time_point{} + std::chrono::hours{1};
     SyncSource src;
@@ -1545,7 +1549,7 @@ struct Collector {
                 return it == kv.end() ? std::string{} : it->second;
             },
             [this](const std::string& k, const std::string& v) { kv[k] = v; }, workers,
-            std::move(tuning));
+            std::move(tuning), enabled);
     }
 
     std::optional<std::pair<std::string, std::string>> collect() { return src.collect(); }
@@ -6181,4 +6185,478 @@ TEST_CASE("SyncScheduler + installed_software: a per-facet nack before any clean
 
     // A clean acknowledgement ends the window: nothing more is owed.
     CHECK_FALSE(c.kv[last_hash_key].empty());
+}
+
+// ---------------------------------------------------------------------------
+// SAM-39: fleet collection settings. The cadence the scheduler applies (a multi-day interval on a
+// windowed source, re-placement on a change) and the collector switches. Fake clock and fake zone:
+// no sleep, no process.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+using yuzu::agent::CollectorEnabledSet;
+using yuzu::agent::LocalClock;
+using yuzu::agent::SyncWindow;
+
+constexpr std::int64_t kDaySecs = 86400;
+constexpr const char* kSam39Source = "installed_software";
+
+// A zone `before_s` seconds ahead of UTC until the instant `at`, `after_s` from then on: the
+// two edges of daylight time. from_local picks the earlier instant of an ambiguous local time and
+// resolves one that does not exist (a spring gap) forward, as the LocalClock contract requires.
+LocalClock edge_clock(std::int64_t at, int before_s, int after_s) {
+    const auto offset_at = [=](std::int64_t t) { return t < at ? before_s : after_s; };
+    const LocalClock utc = utc_clock();
+    LocalClock clock;
+    clock.to_local = [=](std::int64_t t) { return utc.to_local(t + offset_at(t)); };
+    clock.from_local = [=](const std::tm& l) {
+        const std::int64_t naive = utc.from_local(l); // the local fields read as UTC
+        for (const int off : {std::max(before_s, after_s), std::min(before_s, after_s)}) {
+            if (offset_at(naive - off) == off)
+                return naive - off;
+        }
+        return naive - std::min(before_s, after_s);
+    };
+    return clock;
+}
+
+std::int64_t local_day(const LocalClock& clock, std::int64_t t) {
+    namespace c = std::chrono;
+    const std::tm l = clock.to_local(t);
+    return c::sys_days{c::year{l.tm_year + 1900} / c::month{static_cast<unsigned>(l.tm_mon + 1)} /
+                       c::day{static_cast<unsigned>(l.tm_mday)}}
+        .time_since_epoch()
+        .count();
+}
+
+int local_minutes(const LocalClock& clock, std::int64_t t) {
+    const std::tm l = clock.to_local(t);
+    return l.tm_hour * 60 + l.tm_min;
+}
+
+// ONE source named installed_software, driven the way the agent's sync loop drives it: tick, then
+// sleep what tick() asks for. `now` is what the sender and collector see.
+struct CadenceRig {
+    std::map<std::string, std::string> kv;
+    std::vector<std::int64_t> syncs;   // the time of every report
+    std::vector<bool> had_blob;        // ...and whether it carried the blob (a forced send does)
+    std::vector<std::int64_t> collects;
+    std::int64_t now{0};
+    bool skip{false};
+    LocalClock clock;
+    std::unique_ptr<SyncScheduler> sched;
+
+    explicit CadenceRig(LocalClock c = utc_clock()) : clock(std::move(c)) { reset_scheduler(); }
+
+    void reset_scheduler() { // a restart: a new scheduler over the persisted KV
+        sched = std::make_unique<SyncScheduler>(
+            "agent-sam39",
+            [this](const std::string& k) {
+                const auto it = kv.find(k);
+                return it == kv.end() ? std::string{} : it->second;
+            },
+            [this](const std::string& k, const std::string& v) { kv[k] = v; },
+            [this](const std::vector<std::pair<std::string, std::string>>&,
+                   const std::vector<std::pair<std::string, std::string>>& blobs)
+                -> std::optional<std::vector<std::string>> {
+                syncs.push_back(now);
+                had_blob.push_back(!blobs.empty());
+                return std::vector<std::string>{};
+            },
+            clock);
+    }
+    void add(std::chrono::seconds interval, std::optional<SyncWindow> window,
+             bool skip_backoff = false) {
+        SyncSource src;
+        src.name = kSam39Source;
+        src.interval = interval;
+        src.window = window;
+        src.skip_backoff = skip_backoff;
+        src.collect = [this]() -> std::optional<std::pair<std::string, std::string>> {
+            collects.push_back(now);
+            if (skip)
+                return std::nullopt;
+            return std::make_pair(std::string{"blob"}, std::string{"hash"});
+        };
+        sched->add_source(std::move(src));
+    }
+    void run(std::int64_t from, std::int64_t end) {
+        for (now = from; now <= end;)
+            now += sched->tick(now).count();
+    }
+    // One tick at `t`, no sleeping.
+    void tick_at(std::int64_t t) {
+        now = t;
+        (void)sched->tick(now);
+    }
+    std::int64_t next_fire() const {
+        return std::stoll(kv.at(std::string{"sync."} + kSam39Source + ".next_fire"));
+    }
+    std::string kv_of(const char* field) const {
+        return kv.at(std::string{"sync."} + kSam39Source + "." + field);
+    }
+};
+
+const std::chrono::seconds k7d{7 * kDaySecs};
+const std::chrono::seconds k2d{2 * kDaySecs};
+const std::chrono::seconds k1d{kDaySecs};
+const SyncWindow kNight{60, 300};
+
+} // namespace
+
+TEST_CASE("SAM-39: a seven-day interval with a window syncs on days 0, 7 and 14 only, at the slot",
+          "[sync][scheduler][collection_settings]") {
+    CadenceRig r;
+    r.add(k7d, kNight);
+    r.run(kNoon, kNoon + 15 * kDaySecs);
+    REQUIRE(r.syncs.size() == 3);
+    const std::int64_t day0 = kNoon / kDaySecs;
+    CHECK(r.syncs[0] / kDaySecs == day0); // first contact: the start-up spread
+    for (std::size_t i = 1; i < 3; ++i) {
+        INFO("sync " << i);
+        CHECK(r.syncs[i] / kDaySecs == day0 + 7 * static_cast<std::int64_t>(i));
+        CHECK(utc_minutes(r.syncs[i]) >= 60);
+        CHECK(utc_minutes(r.syncs[i]) < 300);
+    }
+    CHECK(r.syncs[2] - r.syncs[1] == 7 * kDaySecs); // the same slot, one interval on
+}
+
+TEST_CASE("SAM-39: a two-day interval with a window syncs on alternate days",
+          "[sync][scheduler][collection_settings]") {
+    CadenceRig r;
+    r.add(k2d, kNight);
+    r.run(kNoon, kNoon + 15 * kDaySecs);
+    REQUIRE(r.syncs.size() == 8); // days 0, 2, ... 14
+    const std::int64_t day0 = kNoon / kDaySecs;
+    for (std::size_t i = 1; i < r.syncs.size(); ++i) {
+        INFO("sync " << i);
+        CHECK(r.syncs[i] / kDaySecs == day0 + 2 * static_cast<std::int64_t>(i));
+        CHECK(utc_minutes(r.syncs[i]) >= 60);
+        CHECK(utc_minutes(r.syncs[i]) < 300);
+    }
+}
+
+TEST_CASE("SAM-39: an interval of a day keeps the merged placement exactly",
+          "[sync][scheduler][collection_settings]") {
+    CadenceRig r;
+    r.add(k1d, kNight);
+    r.run(kNoon, kNoon + 5 * kDaySecs);
+    REQUIRE(r.syncs.size() == 6); // days 0..5
+    for (std::size_t i = 2; i < r.syncs.size(); ++i)
+        CHECK(r.syncs[i] - r.syncs[i - 1] == kDaySecs);
+}
+
+TEST_CASE("SAM-39: a fall-back or spring-forward day does not pull a multi-day fire a day early",
+          "[sync][scheduler][collection_settings]") {
+    struct Edge {
+        const char* name;
+        std::int64_t at;
+        int before, after;
+        std::int64_t start; // noon UTC, a few days before the edge
+    };
+    // 2026-10-25 01:00Z: Europe/London falls back; 2026-03-29 01:00Z it springs forward.
+    for (const Edge& e : {Edge{"fall back", 1'792'890'000, 3600, 0, 1'792'497'600},
+                          Edge{"spring forward", 1'774'746'000, 0, 3600, 1'774'353'600}}) {
+        const LocalClock zone = edge_clock(e.at, e.before, e.after);
+        for (const auto interval : {k7d, k2d}) {
+            for (const std::int64_t shift : {std::int64_t{0}, kDaySecs}) { // the edge falls on either parity of a 2-day run
+                CadenceRig r(zone);
+                r.add(interval, kNight);
+                r.run(e.start + shift, e.start + shift + 16 * kDaySecs);
+                INFO(e.name << " interval " << interval.count() << "s start +" << shift);
+                REQUIRE(r.syncs.size() >= 3);
+                const std::int64_t step = interval.count() / kDaySecs;
+                for (std::size_t i = 1; i < r.syncs.size(); ++i) {
+                    INFO("sync " << i);
+                    CHECK(local_day(zone, r.syncs[i]) - local_day(zone, r.syncs[i - 1]) == step);
+                    CHECK(local_minutes(zone, r.syncs[i]) >= 60);
+                    CHECK(local_minutes(zone, r.syncs[i]) < 300);
+                }
+            }
+        }
+    }
+}
+
+TEST_CASE("SAM-39: a fire five days ahead is not re-armed by catch-up on a seven-day interval",
+          "[sync][scheduler][collection_settings]") {
+    const auto persist = [](CadenceRig& r, std::int64_t next_fire) {
+        r.kv["sync.installed_software.next_fire"] = std::to_string(next_fire);
+        r.kv["sync.installed_software.last_hash"] = "hash";
+        r.kv["sync.installed_software.last_full"] = std::to_string(kNoon);
+        r.kv["sync.installed_software.force_full"] = "0";
+    };
+    SECTION("seven days: five days ahead is left alone") {
+        CadenceRig r;
+        persist(r, kNoon + 5 * kDaySecs);
+        r.add(k7d, kNight);
+        r.tick_at(kNoon);
+        CHECK(r.syncs.empty());
+        CHECK(r.next_fire() == kNoon + 5 * kDaySecs);
+    }
+    SECTION("seven days: a fire beyond an interval and a day is still implausible") {
+        CadenceRig r;
+        persist(r, kNoon + 9 * kDaySecs);
+        r.add(k7d, kNight);
+        r.tick_at(kNoon);
+        CHECK(r.next_fire() >= kNoon);
+        CHECK(r.next_fire() < kNoon + SyncScheduler::kCatchUpWindow.count());
+    }
+    SECTION("two days: the bound grows with the interval, and no further") {
+        CadenceRig r;
+        persist(r, kNoon + 2 * kDaySecs + kDaySecs / 2);
+        r.add(k2d, kNight);
+        r.tick_at(kNoon);
+        CHECK(r.next_fire() == kNoon + 2 * kDaySecs + kDaySecs / 2);
+        CadenceRig far;
+        persist(far, kNoon + 3 * kDaySecs + 1);
+        far.add(k2d, kNight);
+        far.tick_at(kNoon);
+        CHECK(far.next_fire() < kNoon + SyncScheduler::kCatchUpWindow.count());
+    }
+}
+
+TEST_CASE("SAM-39: a skipped run on a multi-day interval retries in the next daily window",
+          "[sync][scheduler][collection_settings]") {
+    CadenceRig r;
+    r.skip = true;
+    r.add(k7d, kNight, /*skip_backoff=*/true);
+    r.run(kNoon, kNoon + 4 * kDaySecs);
+    REQUIRE(r.collects.size() >= 5);
+    for (std::size_t i = 1; i < r.collects.size(); ++i) {
+        INFO("collect " << i);
+        CHECK(r.collects[i] - r.collects[i - 1] <= kDaySecs); // never an interval later
+    }
+    CHECK(r.syncs.empty());
+}
+
+TEST_CASE("SAM-39: apply_settings forces nothing; an identical re-apply changes nothing",
+          "[sync][scheduler][collection_settings]") {
+    CadenceRig r;
+    r.add(k7d, kNight);
+    r.run(kNoon, kNoon + 3600);
+    REQUIRE(r.syncs.size() == 1);
+    const std::int64_t fire = r.next_fire();
+    const std::string kv_before = r.kv_of("force_full") + "|" + r.kv_of("last_hash");
+
+    // The same values the source already runs on, from another thread's point of view.
+    r.sched->apply_settings(kSam39Source, k7d, kNight);
+    r.tick_at(kNoon + 7200);
+    CHECK(r.syncs.size() == 1); // no immediate sync
+    CHECK(r.next_fire() == fire);
+    CHECK(r.kv_of("force_full") + "|" + r.kv_of("last_hash") == kv_before);
+    CHECK(r.kv_of("force_full") == "0");
+
+    // A different value is applied, and still forces nothing.
+    r.sched->apply_settings(kSam39Source, k2d, kNight);
+    r.tick_at(kNoon + 7200 + 900);
+    CHECK(r.syncs.size() == 1);
+    CHECK(r.kv_of("force_full") == "0");
+    CHECK(r.collects.size() == 1);
+}
+
+TEST_CASE("SAM-39: apply_settings is by source name and ignores an unknown one",
+          "[sync][scheduler][collection_settings]") {
+    CadenceRig r;
+    r.add(k7d, kNight);
+    r.run(kNoon, kNoon + 3600);
+    const std::int64_t fire = r.next_fire();
+    r.sched->apply_settings("no_such_source", k1d, std::nullopt);
+    r.tick_at(kNoon + 7200);
+    CHECK(r.next_fire() == fire);
+}
+
+TEST_CASE("SAM-39: shortening seven days to one re-places a future fire to the agent's next slot",
+          "[sync][scheduler][collection_settings]") {
+    CadenceRig r;
+    r.add(k7d, kNight);
+    r.run(kNoon, kNoon + 3600);
+    REQUIRE(r.syncs.size() == 1);
+    const std::int64_t day7_fire = r.next_fire();
+    REQUIRE(day7_fire / kDaySecs == kNoon / kDaySecs + 7);
+    const std::int64_t slot = day7_fire % kDaySecs; // this agent's stable moment in the window
+
+    const std::int64_t t = kNoon + kDaySecs; // day 1, 12:00
+    r.sched->apply_settings(kSam39Source, k1d, kNight);
+    r.tick_at(t);
+    CHECK(r.next_fire() == (t / kDaySecs + 1) * kDaySecs + slot); // tomorrow's slot
+    CHECK(r.syncs.size() == 1);                                   // nothing fired
+
+    // ...and the daily cadence then holds.
+    r.run(t, kNoon + 3 * kDaySecs + 6 * 3600);
+    CHECK(r.syncs.size() == 3); // days 2 and 3
+    CHECK(r.syncs[2] - r.syncs[1] == kDaySecs);
+}
+
+TEST_CASE("SAM-39: lengthening never moves a fire earlier than the agent's next slot",
+          "[sync][scheduler][collection_settings]") {
+    CadenceRig r;
+    r.add(k1d, kNight);
+    r.run(kNoon, kNoon + 3600);
+    REQUIRE(r.syncs.size() == 1);
+    const std::int64_t tomorrow = r.next_fire();
+    REQUIRE(tomorrow / kDaySecs == kNoon / kDaySecs + 1);
+
+    r.sched->apply_settings(kSam39Source, k7d, kNight);
+    r.tick_at(kNoon + 7200);
+    CHECK(r.next_fire() == tomorrow); // not earlier, and the due slot still fires
+    r.run(kNoon + 7200, tomorrow + 3600);
+    REQUIRE(r.syncs.size() == 2);
+    // The sync after that is a seven-day interval on.
+    CHECK(r.next_fire() / kDaySecs == tomorrow / kDaySecs + 7);
+    CHECK(r.next_fire() % kDaySecs == tomorrow % kDaySecs);
+}
+
+TEST_CASE("SAM-39: a window change re-places a future fire into the new window",
+          "[sync][scheduler][collection_settings]") {
+    CadenceRig r;
+    r.add(k1d, kNight);
+    r.run(kNoon, kNoon + 3600);
+    REQUIRE(r.syncs.size() == 1);
+    r.sched->apply_settings(kSam39Source, k1d, SyncWindow{600, 720});
+    r.tick_at(kNoon + 7200);
+    CHECK(utc_minutes(r.next_fire()) >= 600);
+    CHECK(utc_minutes(r.next_fire()) < 720);
+    CHECK(r.next_fire() > kNoon + 7200);
+    CHECK(r.next_fire() - (kNoon + 7200) <= kDaySecs);
+}
+
+TEST_CASE("SAM-39: a fire already due is left alone when settings arrive",
+          "[sync][scheduler][collection_settings]") {
+    CadenceRig r;
+    r.kv["sync.installed_software.next_fire"] = std::to_string(kNoon - 10);
+    r.kv["sync.installed_software.last_hash"] = "hash";
+    r.kv["sync.installed_software.last_full"] = std::to_string(kNoon);
+    r.kv["sync.installed_software.force_full"] = "0";
+    r.add(k1d, kNight);
+    r.sched->apply_settings(kSam39Source, k7d, kNight);
+    r.tick_at(kNoon);
+    REQUIRE(r.syncs.size() == 1); // it went, in this tick, as it was owed
+    CHECK(r.syncs[0] == kNoon);
+    CHECK(r.next_fire() / kDaySecs == kNoon / kDaySecs + 7); // and the new interval placed the next
+}
+
+TEST_CASE("SAM-39: a restart with stored settings keeps the persisted next_fire",
+          "[sync][scheduler][collection_settings]") {
+    CadenceRig r;
+    r.add(k7d, kNight);
+    r.run(kNoon, kNoon + 3600);
+    REQUIRE(r.syncs.size() == 1);
+    const std::int64_t fire = r.next_fire(); // ~six and a half days ahead
+
+    // The agent builds the source from the stored settings BEFORE publishing the scheduler: the
+    // interval and window are on the source, nothing is re-placed.
+    r.reset_scheduler();
+    r.add(k7d, kNight);
+    r.tick_at(kNoon + 7200);
+    CHECK(r.next_fire() == fire);
+    CHECK(r.syncs.size() == 1);
+}
+
+// --- the collector switches ---
+
+TEST_CASE("SAM-39: a switched-off collector reports a disabled section and is not dispatched",
+          "[sync][collector][collection_settings]") {
+    fake_windows();
+    Collector c(all_plugins(), must_complete_tuning());
+
+    // Golden vector B, applied as sent: the registered-apps collector is off.
+    const auto b = yuzu::agent::parse_settings_command(std::map<std::string, std::string>{
+        {"version", "99e0dc3e698549c6cb149543982d0753c6401cbbd5408c29c060d767b3724561"},
+        {"document", "v1\ninterval=86400\nwindow=none\ntz=\n"
+                     "plugin.installed_apps=0\nplugin.middleware=1\nplugin.msi_packages=1\n"
+                     "plugin.pkg_inventory=1\nplugin.runtimes=1\n"
+                     "plugin.windows_optional_features=1\n"}});
+    REQUIRE(b.has_value());
+    c.enabled->set(b->plugins);
+
+    const auto got = c.collect();
+    REQUIRE(got.has_value());
+    CHECK(g_fake[0].calls == 0); // installed_apps was never dispatched
+    const auto secs = sections_of(got->first);
+    const V3Sec* ia = find_sec(secs, "installed_apps.list_inventory");
+    REQUIRE(ia != nullptr);
+    CHECK(ia->status == "disabled");
+    CHECK(ia->adds.empty());
+    // Everything else is collected beside it.
+    REQUIRE(find_sec(secs, "msi_packages.list_inventory") != nullptr);
+    CHECK(find_sec(secs, "msi_packages.list_inventory")->status == "full");
+    CHECK(find_sec(secs, "windows_optional_features.list")->status == "full");
+}
+
+TEST_CASE("SAM-39: a plugin's switch covers every one of its facets, and an unknown name is ignored",
+          "[sync][collector][collection_settings]") {
+    fake_windows();
+    Collector c(all_plugins(), must_complete_tuning());
+    c.enabled->set({{"pkg_inventory", false}, {"a_future_collector", false}});
+    const auto got = c.collect();
+    REQUIRE(got.has_value());
+    const auto secs = sections_of(got->first);
+    for (const char* facet : {"pkg_inventory.managers", "pkg_inventory.packages",
+                              "pkg_inventory.store_packages"}) {
+        INFO(facet);
+        REQUIRE(find_sec(secs, facet) != nullptr);
+        CHECK(find_sec(secs, facet)->status == "disabled");
+    }
+    CHECK(g_fake[1].calls == 0);
+    CHECK(find_sec(secs, "installed_apps.list_inventory")->status == "full");
+}
+
+TEST_CASE("SAM-39: an enabled collector whose plugin is not loaded still reports not_collected",
+          "[sync][collector][collection_settings]") {
+    fake_windows();
+    SyncPluginMap m = all_plugins();
+    m.erase("msi_packages");
+    Collector c(m, must_complete_tuning());
+    c.enabled->set({{"installed_apps", false}, {"msi_packages", true}});
+    const auto got = c.collect();
+    REQUIRE(got.has_value());
+    const auto secs = sections_of(got->first);
+    CHECK(find_sec(secs, "installed_apps.list_inventory")->status == "disabled");
+    const V3Sec* msi = find_sec(secs, "msi_packages.list_inventory");
+    REQUIRE(msi != nullptr);
+    CHECK(msi->status == "not_collected");
+    CHECK(msi->token == "not_loaded");
+}
+
+TEST_CASE("SAM-39: a switch takes effect inside the pass cooldown, both ways",
+          "[sync][collector][collection_settings]") {
+    fake_windows();
+    Collector c(all_plugins(), must_complete_tuning());
+    REQUIRE(c.collect().has_value()); // collected and cached
+    c.ack();
+    REQUIRE(g_fake[0].calls == 1);
+
+    // Off, inside the cooldown: not served from the cache.
+    c.enabled->set({{"installed_apps", false}});
+    auto got = c.collect();
+    REQUIRE(got.has_value());
+    CHECK(find_sec(sections_of(got->first), "installed_apps.list_inventory")->status ==
+          "disabled");
+    CHECK(g_fake[0].calls == 1);
+    c.ack();
+
+    // On again, still inside the cooldown: the plugin is dispatched afresh and the rows come back
+    // in full (the disabled section dropped the acknowledged set).
+    c.enabled->set({});
+    got = c.collect();
+    REQUIRE(got.has_value());
+    CHECK(g_fake[0].calls == 2);
+    const auto secs = sections_of(got->first);
+    REQUIRE(find_sec(secs, "installed_apps.list_inventory") != nullptr);
+    CHECK(find_sec(secs, "installed_apps.list_inventory")->status == "full");
+}
+
+TEST_CASE("SAM-39: a disabled facet is sent once and then left out while it stays disabled",
+          "[sync][collector][collection_settings]") {
+    fake_windows();
+    Collector c(all_plugins(), must_complete_tuning());
+    c.enabled->set({{"installed_apps", false}});
+    auto first = c.collect();
+    REQUIRE(first.has_value());
+    REQUIRE(find_sec(sections_of(first->first), "installed_apps.list_inventory") != nullptr);
+    c.ack();
+    const auto second = c.collect();
+    REQUIRE(second.has_value());
+    CHECK(find_sec(sections_of(second->first), "installed_apps.list_inventory") == nullptr);
 }

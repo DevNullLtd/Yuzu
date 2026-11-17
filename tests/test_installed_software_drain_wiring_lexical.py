@@ -98,7 +98,7 @@ def problems(src):
 
     # 2. The factory is handed the agent-owned workers.
     if not re.search(
-            r"make_installed_software_source\( ?sync_plugins, ?kv_get, ?kv_set, ?collector_workers_ ?\)", t):
+            r"make_installed_software_source\(\s*sync_plugins,\s*kv_get,\s*kv_set,\s*collector_workers_\s*[,)]", t):
         out.append("make_installed_software_source no longer receives "
                    "(sync_plugins, kv_get, kv_set, collector_workers_)")
 
@@ -155,7 +155,7 @@ MUTATIONS = [
     (r"(quiesce_run_workers\(\);)", r"\g<1> quiesce_run_workers();", 0, 1,
      "expected exactly two"),
     # 5. the factory handed a private workers object
-    (r"kv_set, collector_workers_\)", "kv_set, std::make_shared<CollectorWorkers>())", 0, 1,
+    (r"kv_set, collector_workers_,", "kv_set, std::make_shared<CollectorWorkers>(),", 0, 1,
      "no longer receives"),
     # 6. the member re-declared as a local (deeper indent)
     (r"(?m)^    std::shared_ptr<CollectorWorkers> collector_workers_",
