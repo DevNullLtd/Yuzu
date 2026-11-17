@@ -745,7 +745,7 @@ cursor.** What it adds to the pattern:
   are stored through `registry_name_utf8` (injective: a lone surrogate is U+FFFD
   plus four hex digits and a literal U+FFFD is doubled), never the lossy
   `from_wide`; the ETW callback builds its value name through the same function,
-  so a candidate and its writer compare equal. A name already present in a key
+  so a candidate and its writer compare equal, except for a value name holding U+0000: the ETW name is cut at its first NUL while the snapshot name keeps it, so that value is not matched to its own writer and its prefix can match a sibling value (a lead, never proof). A name already present in a key
   keeps the first entry and ends the read Capped.
   A root going Unreadable, the denied set gaining a member, or the overflow count
   growing writes one `gap:unreadable:<root>` row; the set and the count are kept
