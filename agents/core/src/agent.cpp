@@ -825,10 +825,16 @@ public:
         // letting an empty map disable enforcement.
         auto allowlist_load = load_plugin_allowlist(cfg_.plugin_allowlist);
         if (auto refusal = evaluate_allowlist_startup(cfg_.plugin_allowlist, allowlist_load)) {
+            // Return from run() with startup_failed_ (the established fatal-startup path)
+            // instead of std::exit: the log hand-off is ASYNC, so std::exit would race the
+            // queue and could drop this very line, and main() drains the log on its normal
+            // return. main() maps startup_failed() to a non-zero exit, so systemd Restart=,
+            // the SCM and launchd observe the failure; no plugin has been loaded.
             spdlog::critical("{}. Refusing to start: this would silently fail-open (every "
                              "plugin would load unverified).",
                              *refusal);
-            std::exit(EXIT_FAILURE);
+            startup_failed_ = true;
+            return;
         }
         const bool allowlist_required = !cfg_.plugin_allowlist.empty();
         const auto& allowlist = allowlist_load.entries;

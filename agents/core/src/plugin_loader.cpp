@@ -6,6 +6,8 @@
 
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <cstdint> // std::uintmax_t (sha256_file bounded-read counter, used before the #ifdef)
 #include <cstring>
@@ -235,6 +237,13 @@ PluginAllowlistLoad load_plugin_allowlist(const std::filesystem::path& allowlist
     int lineno = 0;
     while (std::getline(f, line)) {
         ++lineno;
+        // A UTF-8 BOM (Windows editors / PowerShell) would otherwise glue itself to the first
+        // hash, so the first real entry fails the shape check and its plugin is refused.
+        if (lineno == 1 && line.size() >= 3 && static_cast<unsigned char>(line[0]) == 0xEF &&
+            static_cast<unsigned char>(line[1]) == 0xBB && static_cast<unsigned char>(line[2]) == 0xBF)
+            line.erase(0, 3);
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back(); // CRLF file
         if (line.empty() || line[0] == '#')
             continue;
         // Format: "hash  filename" or "hash filename" (sha256sum compatible)
@@ -244,11 +253,29 @@ PluginAllowlistLoad load_plugin_allowlist(const std::filesystem::path& allowlist
             spdlog::warn("Allowlist line {} malformed, skipping: {}", lineno, line);
             continue;
         }
+        // sha256sum "binary mode" marks the filename with a leading '*'.
+        if (!filename.empty() && filename.front() == '*')
+            filename.erase(0, 1);
         // Normalize hash to lowercase
         for (auto& c : hash)
             c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        // A SHA-256 is exactly 64 hex digits. Anything else (a wrong-format file, a different
+        // digest, junk) can never match a plugin, so it is NOT an entry: counting it would turn
+        // a bad file into "enforcement on, every plugin refused, agent healthy with no plugins".
+        const bool hex64 = hash.size() == 64 &&
+                           std::all_of(hash.begin(), hash.end(), [](unsigned char c) {
+                               return std::isxdigit(c) != 0;
+                           });
+        if (!hex64 || filename.empty()) {
+            spdlog::warn("Allowlist line {} is not '<64-hex sha256>  <filename>', skipping", lineno);
+            continue;
+        }
         // Strip path prefix if present — match on filename only
         auto fname = std::filesystem::path(filename).filename().string();
+        if (fname.empty()) {
+            spdlog::warn("Allowlist line {} names no file, skipping", lineno);
+            continue;
+        }
         result[fname] = hash;
         spdlog::debug("Allowlist entry: {} -> {}", fname, hash);
     }

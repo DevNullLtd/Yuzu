@@ -20,9 +20,13 @@ def main() -> int:
     if i_eval >= 0 and i_scan >= 0 and i_eval > i_scan:
         errs.append("allowlist startup decision must precede PluginLoader::scan")
     if i_eval >= 0:
-        window = SRC[i_eval:i_eval + 700]
-        if "std::exit(EXIT_FAILURE)" not in window:
-            errs.append("allowlist refusal must std::exit(EXIT_FAILURE)")
+        end = SRC.find("const bool allowlist_required", i_eval)
+        window = "\n".join(l.split("//")[0] for l in SRC[i_eval:end].splitlines())
+        if "startup_failed_ = true" not in window or "return;" not in window:
+            errs.append("allowlist refusal must set startup_failed_ and return from run() "
+                        "(std::exit would race the async log hand-off)")
+        if "std::exit" in window:
+            errs.append("allowlist refusal must not std::exit (loses the critical log line)")
     if not re.search(r"PluginLoader::scan\(cfg_\.plugin_dir,[^;]*allowlist_required\)", SRC):
         errs.append("scan must receive allowlist_required")
     for e in errs:

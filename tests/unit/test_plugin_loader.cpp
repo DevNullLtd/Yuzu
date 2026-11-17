@@ -602,11 +602,45 @@ TEST_CASE("load_plugin_allowlist: unconfigured is distinct from configured-but-u
     CHECK(yuzu::agent::load_plugin_allowlist(tmp.path / "bad.txt").status ==
           AllowlistStatus::NoValidEntries);
 
-    write_allowlist(tmp.path / "ok.txt", "# c\nABCD  /x/y/foo.so\nloneword\n");
+    write_allowlist(tmp.path / "ok.txt", "# c\n" + std::string(64, 'A') + "  /x/y/foo.so\nloneword\n");
     auto ok = yuzu::agent::load_plugin_allowlist(tmp.path / "ok.txt");
     REQUIRE(ok.status == AllowlistStatus::Loaded);
     REQUIRE(ok.entries.size() == 1);
-    CHECK(ok.entries.at("foo.so") == "abcd");
+    CHECK(ok.entries.at("foo.so") == std::string(64, 'a'));
+}
+
+TEST_CASE("load_plugin_allowlist: wrong-format content is NoValidEntries, a BOM does not eat "
+          "the first entry (UP1)",
+          "[plugin_loader][allowlist][f52]") {
+    using yuzu::agent::AllowlistStatus;
+    yuzu::test::TempDir tmp{"yuzu_test_allowlist_shape_"};
+    fs::create_directories(tmp.path);
+    const std::string h(64, 'c');
+
+    // Junk that has two tokens per line but is not a sha256: previously Loaded (enforcement on,
+    // every plugin refused, agent healthy with zero plugins).
+    write_allowlist(tmp.path / "md5.txt", "d41d8cd98f00b204e9800998ecf8427e  foo.so\n");
+    CHECK(yuzu::agent::load_plugin_allowlist(tmp.path / "md5.txt").status ==
+          AllowlistStatus::NoValidEntries);
+    write_allowlist(tmp.path / "words.txt", "plugin foo.so\nanother bar.so\n");
+    CHECK(yuzu::agent::load_plugin_allowlist(tmp.path / "words.txt").status ==
+          AllowlistStatus::NoValidEntries);
+    write_allowlist(tmp.path / "nonhex.txt", std::string(64, 'z') + "  foo.so\n");
+    CHECK(yuzu::agent::load_plugin_allowlist(tmp.path / "nonhex.txt").status ==
+          AllowlistStatus::NoValidEntries);
+
+    // UTF-8 BOM before the first entry: the entry must survive.
+    write_allowlist(tmp.path / "bom.txt", std::string("\xEF\xBB\xBF") + h + "  first.so\n" + h + "  second.so\n");
+    auto bom = yuzu::agent::load_plugin_allowlist(tmp.path / "bom.txt");
+    REQUIRE(bom.status == AllowlistStatus::Loaded);
+    CHECK(bom.entries.count("first.so") == 1);
+    CHECK(bom.entries.count("second.so") == 1);
+
+    // CRLF and sha256sum binary-mode '*' marker.
+    write_allowlist(tmp.path / "crlf.txt", h + " *bin.so\r\n");
+    auto crlf = yuzu::agent::load_plugin_allowlist(tmp.path / "crlf.txt");
+    REQUIRE(crlf.status == AllowlistStatus::Loaded);
+    CHECK(crlf.entries.count("bin.so") == 1);
 }
 
 #ifndef _WIN32
@@ -615,7 +649,7 @@ TEST_CASE("load_plugin_allowlist: an unreadable file is Unreadable, not empty",
     yuzu::test::TempDir tmp{"yuzu_test_allowlist_perm_"};
     fs::create_directories(tmp.path);
     const auto f = tmp.path / "locked.txt";
-    write_allowlist(f, "abcd foo.so\n");
+    write_allowlist(f, std::string(64, 'a') + " foo.so\n");
     fs::permissions(f, fs::perms::none);
     std::ifstream probe(f);
     if (probe) {
