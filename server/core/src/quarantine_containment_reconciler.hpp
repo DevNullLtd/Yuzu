@@ -392,15 +392,17 @@ private:
         // record. 0 only before the first-ever claim.
         std::int64_t pending_record_id{0};
         // The apply claim this entry's last apply still holds (`ContainmentReapplyResult::
-        // held_claim_gen`), 0 for none, with the record and command it belongs to. It is dropped
+        // held_claim_gen`), `gen` 0 for none, with the record and command it belongs to. It is dropped
         // when that apply's terminal reply is consumed (`release_held_claim`), by the in-flight
         // poll or, after a release request has turned the entry into a releasing one,
-        // by `reconcile_one`'s own look at the command. `reset_for` keeps these three fields: a
+        // by `reconcile_one`'s own look at the command. `reset_for` keeps this whole struct: a
         // reset must not strand a claim whose apply may not have run yet. An apply that never
         // answers leaves the claim to expire after `kApplyClaimTtlSecs`.
-        std::int64_t held_claim_gen{0};
-        std::int64_t held_claim_record_id{0};
-        std::string held_claim_command_id;
+        struct HeldClaim {
+            std::int64_t gen{0};
+            std::int64_t record_id{0};
+            std::string command_id;
+        } held_claim;
         // The in-flight apply is for a record that was never confirmed (`last_confirmed_at == 0`
         // when it was sent): a reply saying the device kept other operator exceptions then
         // leaves the record unconfirmed instead of being followed by a status read.

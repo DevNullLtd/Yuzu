@@ -64,13 +64,9 @@ std::chrono::steady_clock::time_point QuarantineContainmentReconciler::steady_no
 
 void QuarantineContainmentReconciler::reset_for(AgentState& st, Kind kind, std::int64_t record_id) {
     // An apply's claim outlives the entry's own state: the apply may not have run yet.
-    auto held_gen = st.held_claim_gen;
-    auto held_record = st.held_claim_record_id;
-    auto held_command = std::move(st.held_claim_command_id);
+    auto held = std::move(st.held_claim);
     st = AgentState{};
-    st.held_claim_gen = held_gen;
-    st.held_claim_record_id = held_record;
-    st.held_claim_command_id = std::move(held_command);
+    st.held_claim = std::move(held);
     st.kind = kind;
     st.record_id = record_id;
     // A releasing or owed entry reads status before it dispatches anything.
@@ -101,23 +97,20 @@ QuarantineContainmentReconciler::poll_command(const std::string& pending_command
 
 void QuarantineContainmentReconciler::release_held_claim(const std::string& agent_id,
                                                          const AgentState& c) {
-    if (c.held_claim_gen == 0 || !d_.quarantine_store)
+    if (c.held_claim.gen == 0 || !d_.quarantine_store)
         return;
     try {
-        if (auto rel = d_.quarantine_store->release_apply_claim(agent_id, c.held_claim_record_id,
-                                                                c.held_claim_gen);
+        if (auto rel = d_.quarantine_store->release_apply_claim(agent_id, c.held_claim.record_id,
+                                                                c.held_claim.gen);
             !rel)
             spdlog::warn("QuarantineContainmentReconciler: could not release the apply claim for "
                          "record {}: {}",
-                         c.held_claim_record_id, rel.error());
+                         c.held_claim.record_id, rel.error());
     } catch (...) {
     }
     std::lock_guard<std::mutex> lk(mu_);
-    if (auto* st = entry_for(agent_id, c)) {
-        st->held_claim_gen = 0;
-        st->held_claim_record_id = 0;
-        st->held_claim_command_id.clear();
-    }
+    if (auto* st = entry_for(agent_id, c))
+        st->held_claim = {};
 }
 
 void QuarantineContainmentReconciler::back_off(const std::string& agent_id, const AgentState& c,
@@ -1107,9 +1100,7 @@ bool QuarantineContainmentReconciler::send_apply(const std::string& agent_id, co
             // verify -> mark_endpoint_confirmed call too (the confirm is ABOUT the record whose
             // whitelist was just applied).
             st->pending_record_id = stored.id;
-            st->held_claim_gen = reapply_res->held_claim_gen;
-            st->held_claim_record_id = stored.id;
-            st->held_claim_command_id = reapply_res->command_id;
+            st->held_claim = {reapply_res->held_claim_gen, stored.id, reapply_res->command_id};
             st->apply_for_unconfirmed = stored.last_confirmed_at == 0;
             st->pending_since = steady_now();
         }
@@ -1157,9 +1148,9 @@ bool QuarantineContainmentReconciler::reconcile_one(const std::string& agent_id,
     // request turned the entry into a releasing one before the reply was read): drop the claim
     // once that apply's reply is in. Until then no token is issued and no end is accepted, which
     // is the point of holding it. Nothing is dispatched or decided here.
-    if (c.held_claim_gen != 0 && d_.response_store &&
-        !(c.pending == Pending::apply && c.pending_command_id == c.held_claim_command_id)) {
-        const auto held = poll_command(c.held_claim_command_id, agent_id);
+    if (c.held_claim.gen != 0 && d_.response_store &&
+        !(c.pending == Pending::apply && c.pending_command_id == c.held_claim.command_id)) {
+        const auto held = poll_command(c.held_claim.command_id, agent_id);
         if (held && !held->empty())
             release_held_claim(agent_id, c);
     }
@@ -1206,7 +1197,7 @@ bool QuarantineContainmentReconciler::reconcile_one(const std::string& agent_id,
         const auto reply = parse_containment_reply(combined_output(*resp));
         // The apply's terminal reply is in hand: it ran, so its claim can go and a confirmed end is
         // possible again. (A timed-out apply keeps the claim until it expires: it may not have run.)
-        if (c.pending == Pending::apply && c.pending_command_id == c.held_claim_command_id)
+        if (c.pending == Pending::apply && c.pending_command_id == c.held_claim.command_id)
             release_held_claim(agent_id, c);
         switch (c.pending) {
         case Pending::apply:
