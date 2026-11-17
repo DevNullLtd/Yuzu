@@ -795,6 +795,7 @@ constexpr int kReadTimeoutSec = 5;
     cli.set_address_family(AF_UNIX);
     cli.set_connection_timeout(kConnectTimeoutSec, 0);
     cli.set_read_timeout(kReadTimeoutSec, 0);
+    cli.set_decompress(false);
 
     IppResult result;
     auto res = cli.Post("/", extra_headers, body, "application/ipp");
@@ -813,6 +814,7 @@ constexpr int kReadTimeoutSec = 5;
     httplib::Client cli("localhost", 631);
     cli.set_connection_timeout(kConnectTimeoutSec, 0);
     cli.set_read_timeout(kReadTimeoutSec, 0);
+    cli.set_decompress(false);
 
     IppResult result;
     auto res = cli.Post("/", httplib::Headers{}, body, "application/ipp");

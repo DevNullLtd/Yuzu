@@ -47,12 +47,21 @@
 #include "scoped_env.hpp"
 #include "test_helpers.hpp"
 
+#include <openssl/evp.h>
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <cstdint>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -220,6 +229,136 @@ TEST_CASE("content_dist plugin: cleanup bounds a huge hours value instead of wra
         CHECK(result.captured.find("removed|0") != std::string::npos);
         CHECK(fs::exists(recent));
     }
+}
+
+namespace {
+
+// Hex SHA-256 of `bytes` (test-local; the plugin's own sha256_file is TU-private).
+std::string wp14a_sha256_hex(const std::string& bytes) {
+    unsigned char md[EVP_MAX_MD_SIZE];
+    unsigned int md_len = 0;
+    EVP_Digest(bytes.data(), bytes.size(), md, &md_len, EVP_sha256(), nullptr);
+    static const char* hex = "0123456789abcdef";
+    std::string out;
+    for (unsigned int i = 0; i < md_len; ++i) {
+        out.push_back(hex[md[i] >> 4]);
+        out.push_back(hex[md[i] & 0xF]);
+    }
+    return out;
+}
+
+// A one-shot loopback HTTP/1.1 server on a raw socket (no httplib, so this TU needs no new
+// dependency). Answers its single request with `Content-Encoding: br` and `body`, then closes.
+class OneShotBrotliServer {
+public:
+    explicit OneShotBrotliServer(std::string body) : body_(std::move(body)) {
+        listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+        REQUIRE(listen_fd_ >= 0);
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = 0;
+        REQUIRE(::bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof addr) == 0);
+        socklen_t len = sizeof addr;
+        REQUIRE(::getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&addr), &len) == 0);
+        port_ = ntohs(addr.sin_port);
+        REQUIRE(::listen(listen_fd_, 4) == 0);
+        thread_ = std::thread([this] { serve(); });
+    }
+    ~OneShotBrotliServer() {
+        ::shutdown(listen_fd_, SHUT_RDWR); // unblocks accept() if no client ever came
+        if (thread_.joinable())
+            thread_.join();
+        ::close(listen_fd_);
+    }
+    OneShotBrotliServer(const OneShotBrotliServer&) = delete;
+    OneShotBrotliServer& operator=(const OneShotBrotliServer&) = delete;
+    [[nodiscard]] int port() const noexcept { return port_; }
+
+private:
+    void serve() {
+        const int fd = ::accept(listen_fd_, nullptr, nullptr);
+        if (fd < 0)
+            return;
+        std::string req;
+        char buf[1024];
+        while (req.find("\r\n\r\n") == std::string::npos) {
+            const auto n = ::recv(fd, buf, sizeof buf, 0);
+            if (n <= 0)
+                break;
+            req.append(buf, static_cast<std::size_t>(n));
+        }
+        const std::string head = "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n"
+                                 "Content-Encoding: br\r\nContent-Length: " +
+                                 std::to_string(body_.size()) + "\r\nConnection: close\r\n\r\n";
+        const std::string resp = head + body_;
+        std::size_t off = 0;
+        while (off < resp.size()) {
+            const auto n = ::send(fd, resp.data() + off, resp.size() - off, MSG_NOSIGNAL);
+            if (n <= 0)
+                break;
+            off += static_cast<std::size_t>(n);
+        }
+        ::close(fd);
+    }
+
+    std::string body_;
+    int listen_fd_{-1};
+    int port_{0};
+    std::thread thread_;
+};
+
+// A VALID Brotli stream (one uncompressed meta-block + the final empty block) for `plain`:
+// the decoder accepts it and yields `plain`, while the wire bytes differ from `plain`.
+// Hand-built so the test needs no encoder. WBITS=16 (1 bit), ISLAST=0, MNIBBLES=4,
+// MLEN-1 (16 bits), ISUNCOMPRESSED=1, pad to a byte; then the bytes; then ISLAST+ISLASTEMPTY.
+std::string wp14a_brotli_stored(const std::string& plain) {
+    REQUIRE(!plain.empty());
+    REQUIRE(plain.size() <= 65536);
+    const std::uint32_t hdr = (static_cast<std::uint32_t>(plain.size() - 1) << 4) | (1u << 20);
+    std::string out;
+    out.push_back(static_cast<char>(hdr & 0xFF));
+    out.push_back(static_cast<char>((hdr >> 8) & 0xFF));
+    out.push_back(static_cast<char>((hdr >> 16) & 0xFF));
+    out += plain;
+    out.push_back(static_cast<char>(0x03));
+    return out;
+}
+
+} // namespace
+
+TEST_CASE("content_dist plugin: stage hashes the RAW bytes on the wire, never a Brotli-decoded "
+          "body",
+          "[agent][content_dist][posix_actions][wp14a]") {
+    auto plugin = load_content_dist_plugin();
+    REQUIRE(plugin.has_value());
+
+    const std::string plain = "yuzu-wp14a-plain-payload";
+    const std::string wire = wp14a_brotli_stored(plain);
+    REQUIRE(wire != plain);
+    const std::string wire_hash = wp14a_sha256_hex(wire);
+    const std::string plain_hash = wp14a_sha256_hex(plain);
+    REQUIRE(wire_hash != plain_hash);
+
+    // Un-init()'d plugin stages under temp_directory_path()/"yuzu-staged": private TMPDIR.
+    yuzu::test::TempDir tmp{"yuzu_test_cd_br_"};
+    fs::create_directories(tmp.path);
+    yuzu::test::ScopedEnv scoped_tmpdir{"TMPDIR", tmp.path.string()};
+    yuzu::agent::LocalDispatcher dispatcher;
+
+    OneShotBrotliServer server{wire};
+    const std::string url = "http://127.0.0.1:" + std::to_string(server.port()) + "/payload.bin";
+    // The operator pins the hash of the DECODED content. A client that decoded Brotli would
+    // hash `plain` and match; the hash is of bytes written to disk, so it must hash `wire`.
+    std::vector<YuzuParam> params{
+        {"url", url.c_str()}, {"filename", "wp14a-br.bin"}, {"sha256", plain_hash.c_str()}};
+    auto result = dispatcher.run(plugin->descriptor, "stage", params);
+
+    CHECK(result.rc != 0);
+    CHECK(result.captured.find("error|hash mismatch: expected=" + plain_hash +
+                               ", got=" + wire_hash) != std::string::npos);
+    // The mismatched download is removed, never left staged.
+    CHECK_FALSE(fs::exists(tmp.path / "yuzu-staged" / "wp14a-br.bin"));
 }
 
 #endif // !_WIN32

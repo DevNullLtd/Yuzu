@@ -278,6 +278,7 @@ int download_url(std::string_view url, const fs::path& dest, std::string& error)
         httplib::SSLClient cli(parsed.host, parsed.port);
         cli.set_connection_timeout(30);
         cli.set_read_timeout(300);
+        cli.set_decompress(false);
         cli.enable_server_certificate_verification(true);
         res = cli.Get(parsed.path, content_receiver);
 #else
@@ -289,6 +290,7 @@ int download_url(std::string_view url, const fs::path& dest, std::string& error)
         httplib::Client cli(parsed.host, parsed.port);
         cli.set_connection_timeout(30);
         cli.set_read_timeout(300);
+        cli.set_decompress(false);
         res = cli.Get(parsed.path, content_receiver);
     }
 
@@ -329,6 +331,8 @@ std::string http_get(std::string_view url, int& status_code) {
         httplib::SSLClient cli(parsed.host, parsed.port);
         cli.set_connection_timeout(30);
         cli.set_read_timeout(60);
+        cli.set_decompress(false);
+        cli.set_default_headers({{"Accept-Encoding", "identity"}});
         cli.enable_server_certificate_verification(true);
         res = cli.Get(parsed.path);
 #else
@@ -339,6 +343,8 @@ std::string http_get(std::string_view url, int& status_code) {
         httplib::Client cli(parsed.host, parsed.port);
         cli.set_connection_timeout(30);
         cli.set_read_timeout(60);
+        cli.set_decompress(false);
+        cli.set_default_headers({{"Accept-Encoding", "identity"}});
         res = cli.Get(parsed.path);
     }
 
@@ -373,6 +379,7 @@ std::string http_head(std::string_view url, int& status_code) {
         httplib::SSLClient cli(parsed.host, parsed.port);
         cli.set_connection_timeout(30);
         cli.set_read_timeout(60);
+        cli.set_decompress(false);
         cli.enable_server_certificate_verification(true);
         res = cli.Head(parsed.path);
 #else
@@ -383,6 +390,7 @@ std::string http_head(std::string_view url, int& status_code) {
         httplib::Client cli(parsed.host, parsed.port);
         cli.set_connection_timeout(30);
         cli.set_read_timeout(60);
+        cli.set_decompress(false);
         res = cli.Head(parsed.path);
     }
 

@@ -4392,6 +4392,16 @@ test('virtualization wsl Windows shell wiring lexical gate',
   timeout: 30,
 )
 
+# WP14-A: every httplib::Client / SSLClient built under agents/ calls set_decompress(false) (the
+# agent build defines CPPHTTPLIB_BROTLI_SUPPORT globally, so a client otherwise decodes Brotli from
+# an operator-chosen peer inside a root/SYSTEM process). Lexical; carries its own mutation self-test.
+test('agent httplib clients disable response decompression lexical gate (WP14-A)',
+  _python3_test,
+  args: [files('test_agent_http_no_decompress_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
+
 # #2182: static lexical gate pinning that agent.cpp still CALLS the tested OtaUpdateThread /
 # CtxSlot stop_seen() primitives (no AgentImpl seam exists to test that, #1492) and keeps the
 # flag-then-cancel_ctx() teardown order. Carries its own in-memory mutation self-test. No build
