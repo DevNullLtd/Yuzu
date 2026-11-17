@@ -412,13 +412,29 @@ TEST_CASE("strictly_advances: ordinary transition", "[file_search]") {
     CHECK_FALSE(step([](fs::Cursor& n) { n.sequence = 1; }));                   // repeats
     CHECK_FALSE(step([](fs::Cursor& n) { n.sequence = 3; }));                   // skips
     CHECK_FALSE(step([](fs::Cursor& n) { n.sequence = 0; }));
-    CHECK_FALSE(step([](fs::Cursor& n) { n.position.root_dev = 9; }));          // different root
-    CHECK_FALSE(step([](fs::Cursor& n) { n.position.root_file_id = 0; }));
-    CHECK_FALSE(step([](fs::Cursor& n) {
-        n.position.root_dev = 0;
-        n.position.root_file_id = 0;
-    })); // known root can't become unknown
     CHECK_FALSE(step([](fs::Cursor& n) { n.query_hash = hash_of(2); }));
+
+    // Root identity, 0 = unknown: a half may become known on any slice; a known half may neither
+    // change nor go back to 0 without a generation step.
+    const auto root = [&](std::uint64_t pd, std::uint64_t pi, std::uint64_t nd, std::uint64_t ni) {
+        auto p = first;
+        p.position.root_dev = pd;
+        p.position.root_file_id = pi;
+        auto n = p;
+        n.sequence = 2;
+        n.position.after = "b";
+        n.position.root_dev = nd;
+        n.position.root_file_id = ni;
+        return fs::strictly_advances(p, n);
+    };
+    CHECK(root(5, 0, 5, 6));       // the file id is learned
+    CHECK(root(0, 6, 5, 6));       // the device is learned
+    CHECK(root(5, 0, 5, 0));       // nothing new learned
+    CHECK_FALSE(root(5, 6, 0, 6)); // a known device goes back to unknown
+    CHECK_FALSE(root(5, 6, 5, 0)); // a known file id goes back to unknown
+    CHECK_FALSE(root(5, 0, 9, 6)); // a known device changes while the file id is learned
+    CHECK_FALSE(root(0, 6, 5, 7)); // a known file id changes while the device is learned
+    CHECK_FALSE(root(5, 6, 9, 6)); // a known device changes
 
     auto with_gaps = first;
     with_gaps.prior_gaps = 4;

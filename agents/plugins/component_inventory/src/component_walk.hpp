@@ -226,15 +226,8 @@ namespace fsr = yuzu::shared::file_search;
 using Type = DirEntry::Type;
 using Cause = OrderedGap::Cause;
 
-/// A recorded identity differs from the one just seen, comparing only the halves both sides know.
-[[nodiscard]] constexpr bool identity_changed(std::uint64_t rec_dev, std::uint64_t rec_id, std::uint64_t dev,
-                                              std::uint64_t id) noexcept {
-    return (rec_dev != 0 && dev != 0 && rec_dev != dev) || (rec_id != 0 && id != 0 && rec_id != id);
-}
-
-[[nodiscard]] constexpr std::uint64_t known(std::uint64_t now, std::uint64_t recorded) noexcept {
-    return now != 0 ? now : recorded;
-}
+using fsr::identity_changed; // the ONE identity rule (file_search_position.hpp)
+using fsr::known;
 
 class Walker {
 public:
@@ -338,7 +331,8 @@ private:
 
         bool on_path = true;
         if (depth == 0) {
-            if (identity_changed(resume_.root_dev, resume_.root_file_id, lr.dev, lr.file_id)) {
+            if (identity_changed(resume_.root_dev, resume_.root_file_id, known(lr.dev, resume_.root_dev),
+                                 known(lr.file_id, resume_.root_file_id))) {
                 restart();
                 resume_ = fsr::Position{}; // the whole root starts again
             }
@@ -346,7 +340,8 @@ private:
             pos_root_id_ = known(lr.file_id, resume_.root_file_id);
         } else {
             fsr::Frame& f = stack_.back();
-            if (recorded != nullptr && identity_changed(f.dev, f.file_id, lr.dev, lr.file_id)) {
+            if (recorded != nullptr &&
+                identity_changed(f.dev, f.file_id, known(lr.dev, f.dev), known(lr.file_id, f.file_id))) {
                 restart();
                 f.dev = lr.dev;
                 f.file_id = lr.file_id;

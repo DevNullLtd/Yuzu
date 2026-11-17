@@ -44,6 +44,20 @@ struct Position {
     bool operator==(const Position&) const = default;
 };
 
+/// THE identity rule of a Position, for its root and for every Frame: a half (device or file id) that
+/// is 0 is unknown. The ordered walker and the cursor validator both use these two functions; there is
+/// no other identity comparison.
+/// known(): what a recorded half becomes after a later reading (an unknown half takes the reading).
+[[nodiscard]] constexpr std::uint64_t known(std::uint64_t now, std::uint64_t recorded) noexcept {
+    return now != 0 ? now : recorded;
+}
+/// True when a half the EARLIER identity knows is not the same in the LATER one: another value, or
+/// back to unknown. Unknown-to-known is refinement, never a change.
+[[nodiscard]] constexpr bool identity_changed(std::uint64_t dev, std::uint64_t id, std::uint64_t later_dev,
+                                              std::uint64_t later_id) noexcept {
+    return (dev != 0 && dev != later_dev) || (id != 0 && id != later_id);
+}
+
 /// One directory-entry name: 1..255 bytes, no NUL, no '/', not "." or "..".
 [[nodiscard]] inline bool valid_component(std::string_view s) noexcept {
     if (s.empty() || s.size() > kMaxNameBytes || s == "." || s == "..")

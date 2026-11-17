@@ -23,8 +23,10 @@
 //
 // Transitions: strictly_advances accepts exactly two, each with the same query hash,
 // sequence + 1 (no wrap) and a non-decreasing prior_gaps.
-//   ORDINARY: same generation, same root identity (or the previous one is 0/0, not yet known: the
-//             first slice) and a walk_order strictly later position.
+//   ORDINARY: same generation, every root identity half the previous cursor knows unchanged (a half
+//             that is 0 is unknown and may become known on any slice, not only the first; a known half
+//             that changes or returns to 0 needs a generation step; the rule lives in
+//             file_search_position.hpp) and a walk_order strictly later position.
 //   RESTART:  generation + 1 (no wrap). The position and the root identity are then
 //             unconstrained: the ordered walker restarts a replaced directory from its first entry
 //             and a replaced root from its start, which legitimately returns an EARLIER position or
@@ -244,9 +246,8 @@ private:
         return false;
     const auto& p = previous.position;
     const auto& n = next.position;
-    const bool root_known = p.root_dev != 0 || p.root_file_id != 0;
-    if (root_known && (p.root_dev != n.root_dev || p.root_file_id != n.root_file_id))
-        return false;
+    if (identity_changed(p.root_dev, p.root_file_id, n.root_dev, n.root_file_id))
+        return false; // a known half changed or went back to unknown: that needs a generation step
     return walk_order(p, n) < 0;
 }
 

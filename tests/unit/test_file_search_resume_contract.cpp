@@ -13,6 +13,9 @@
  *    slice as a stall fails consecutive_stalls == 0; next_cursor not stepping the generation on
  *    `restarted` fails generation == 1.
  *  - case 3 (root replaced): a RESTART transition that constrains the root identity fails `advances`.
+ *  - case 3b (root identity learned later): strictly_advances demanding an unchanged root once either
+ *    half is known fails the driver's own `advances` REQUIRE on the slice that reveals the missing half;
+ *    accepting a known half that went back to 0 or became another value fails the forged-cursor CHECKs.
  *  - case 4 (replay and backward): a RESTART transition that accepts an unchanged generation with a
  *    backward position fails the forged-cursor CHECK; accepting an equal or earlier position, or a
  *    repeated sequence, fails the replay CHECKs.
@@ -302,6 +305,44 @@ TEST_CASE("resume contract: a root replaced between slices is a legitimate resta
     for (std::size_t i = 2; i < s.results.size(); ++i)
         CHECK_FALSE(s.results[i].restarted);
     CHECK(s.tail(1) == ref.visits); // every entry of the new root is visited
+    CHECK(s.gov.health == fsr::Health::ok);
+}
+
+TEST_CASE("resume contract: a root identity half learned on a later slice is refinement, not a restart",
+          "[file_search][walk_ordered][resume_contract]") {
+    Search ref;
+    basic_tree(ref);
+    ref.run();
+
+    const bool device_known = GENERATE(true, false); // the half slice 1 could read
+    Search s;
+    basic_tree(s);
+    const std::pair<std::uint64_t, std::uint64_t> full = s.ids["/r"]; // device 1 and the real file id
+    const std::pair<std::uint64_t, std::uint64_t> half{device_known ? full.first : 0,
+                                                       device_known ? 0 : full.second};
+    s.ids["/r"] = half;
+    s.wl.max_entries = 3;
+    s.step();
+    const fsr::Cursor before = s.cursor;
+    REQUIRE(before.position.root_dev == half.first);
+    REQUIRE(before.position.root_file_id == half.second);
+
+    s.ids["/r"] = full; // the missing half is revealed only now
+    s.step();           // the driver's own REQUIRE(strictly_advances) is the acceptance assertion
+    CHECK_FALSE(s.results[1].restarted);
+    CHECK(s.cursor.generation == 0);
+    CHECK(s.cursor.position.root_dev == full.first);
+    CHECK(s.cursor.position.root_file_id == full.second);
+
+    for (const std::uint64_t forged_to : {std::uint64_t{0}, std::uint64_t{99}}) {
+        fsr::Cursor forged = s.cursor; // the half `before` knew, changed with no generation step
+        (device_known ? forged.position.root_dev : forged.position.root_file_id) = forged_to;
+        CHECK_FALSE(fsr::strictly_advances(before, forged));
+    }
+
+    s.run();
+    CHECK(s.visits == ref.visits);
+    CHECK(s.gov.restarts == 0);
     CHECK(s.gov.health == fsr::Health::ok);
 }
 
