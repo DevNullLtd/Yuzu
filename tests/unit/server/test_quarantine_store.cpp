@@ -8,7 +8,8 @@
  *    (agent_id) WHERE status='active' verified race-safe against a live
  *    Postgres instance (docs/postgres-store-playbook.md's explicit warning
  *    that this syntax is easy to get subtly wrong by reasoning alone).
- *  - release_device: success (single guarded UPDATE), not-quarantined.
+ *  - request_release / mark_released: the two-step release (single guarded UPDATEs),
+ *    not-quarantined, the releasing state, the forced end and the owed-release list (schema v4).
  *  - get_status: found, genuinely-absent (nullopt value, not an error), and
  *    empty agent_id (precondition miss, not a store failure).
  *  - list_quarantined / get_history: multiple records, newest-first
@@ -41,11 +42,13 @@
 
 #include <libpq-fe.h>
 
+#include <optional>
 #include <string>
 #include <vector>
 
 using yuzu::server::QuarantineRecord;
 using yuzu::server::QuarantineStore;
+using yuzu::server::ReleaseEnd;
 using yuzu::server::pg::PgConn;
 using yuzu::server::pg::PgPool;
 using yuzu::server::pg::PgResult;
@@ -58,6 +61,28 @@ yuzu::test::PgTestTemplate quarantine_tpl{"quarantinestore", [](const std::strin
     if (!store.is_open())
         throw std::runtime_error("quarantine_store template: store failed to migrate");
 }};
+
+// An ended record: the release asked for, then the device's confirmation recorded.
+void end_record(QuarantineStore& store, const std::string& agent_id) {
+    auto id = store.request_release(agent_id);
+    REQUIRE(id.has_value());
+    REQUIRE(store.mark_released(agent_id, *id, ReleaseEnd::device_confirmed).has_value());
+}
+
+std::optional<QuarantineRecord> active_row(QuarantineStore& store, const std::string& agent_id) {
+    auto st = store.get_status(agent_id);
+    REQUIRE(st.has_value());
+    return *st;
+}
+
+bool owed_contains(QuarantineStore& store, const std::string& agent_id) {
+    auto owed = store.list_release_owed();
+    REQUIRE(owed.has_value());
+    for (const auto& r : *owed)
+        if (r.agent_id == agent_id)
+            return true;
+    return false;
+}
 
 } // namespace
 
@@ -105,8 +130,7 @@ TEST_CASE("QuarantineStore: quarantine and release device", "[pg][quarantine][cr
     CHECK((*status)->whitelist == "10.0.0.1,10.0.0.2");
     CHECK((*status)->quarantined_at > 0);
 
-    auto release = store.release_device("agent-001");
-    REQUIRE(release.has_value());
+    end_record(store, "agent-001");
 
     auto after = store.get_status("agent-001");
     REQUIRE(after.has_value()); // the READ succeeded
@@ -155,18 +179,18 @@ TEST_CASE("QuarantineStore: double quarantine rejected (partial unique index rac
 
     // A device can be re-quarantined after release (the partial index only
     // excludes a SECOND simultaneously-active row, not history).
-    REQUIRE(store.release_device("agent-002").has_value());
+    end_record(store, "agent-002");
     auto third = store.quarantine_device("agent-002", "admin", "Third", "");
     CHECK(third.has_value());
 }
 
-TEST_CASE("QuarantineStore: release non-quarantined device", "[pg][quarantine][crud]") {
+TEST_CASE("QuarantineStore: request_release on a non-quarantined device", "[pg][quarantine][crud]") {
     YUZU_REQUIRE_PG_DB_TPL(db, quarantine_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     QuarantineStore store{pool};
     REQUIRE(store.is_open());
 
-    auto result = store.release_device("agent-nonexistent");
+    auto result = store.request_release("agent-nonexistent");
     CHECK_FALSE(result.has_value());
     CHECK(result.error() == "device is not quarantined");
 }
@@ -223,7 +247,7 @@ TEST_CASE("QuarantineStore: list_quarantined_in pushes the id restriction and th
         CHECK(r->empty());
     }
     {   // a released record is not active
-        REQUIRE(store.release_device("s-d").has_value());
+        end_record(store, "s-d");
         auto r = store.list_quarantined_in(nullptr, 0);
         REQUIRE(r.has_value());
         CHECK(r->size() == 3);
@@ -247,7 +271,7 @@ TEST_CASE("QuarantineStore: list quarantined devices", "[pg][quarantine][list]")
             ++found;
     CHECK(found == 2);
 
-    REQUIRE(store.release_device("agent-list-1").has_value());
+    end_record(store, "agent-list-1");
     auto list2 = store.list_quarantined();
     REQUIRE(list2.has_value());
     bool has_1 = false, has_2 = false;
@@ -269,12 +293,12 @@ TEST_CASE("QuarantineStore: history tracking survives release + re-quarantine cy
     REQUIRE(store.is_open());
 
     REQUIRE(store.quarantine_device("agent-hist", "admin", "First quarantine", "").has_value());
-    REQUIRE(store.release_device("agent-hist").has_value());
+    end_record(store, "agent-hist");
 
     REQUIRE(store.quarantine_device("agent-hist", "security-team", "Second quarantine",
                                     "10.0.0.1")
                 .has_value());
-    REQUIRE(store.release_device("agent-hist").has_value());
+    end_record(store, "agent-hist");
 
     auto history = store.get_history("agent-hist");
     REQUIRE(history.has_value());
@@ -360,7 +384,7 @@ TEST_CASE("QuarantineStore: mark_endpoint_applied/confirmed on a RELEASED (not a
     REQUIRE(before_release.has_value());
     REQUIRE(before_release->has_value());
     const auto record_id = (*before_release)->id;
-    REQUIRE(store.release_device("agent-002").has_value());
+    end_record(store, "agent-002");
 
     // Even with the CORRECT (real, pre-release) id, status != 'active' alone
     // still fails the guarded UPDATE — id-scoping is additive, not a
@@ -388,7 +412,7 @@ TEST_CASE("QuarantineStore: mark_endpoint_applied/confirmed with the WRONG recor
     // Simulates the race: the OLD record is released and a NEW, unrelated
     // active record now exists for the same agent_id by the time the write
     // for the OLD record's dispatch arrives.
-    REQUIRE(store.release_device("agent-003").has_value());
+    end_record(store, "agent-003");
     REQUIRE(
         store.quarantine_device("agent-003", "admin", "NEW-reason", "99.99.99.99").has_value());
     auto new_status = store.get_status("agent-003");
@@ -522,6 +546,11 @@ TEST_CASE("QuarantineStore: a genuine v1->v2 upgrade (real ALTER against a popul
     CHECK((*status)->quarantined_by == "admin"); // untouched by the ALTER
     CHECK((*status)->last_applied_at == 0);
     CHECK((*status)->last_confirmed_at == 0);
+    // v4 (PRQ.2): the same construction call applies the release columns; the pre-existing row
+    // reads 0 for each (never) and keeps its stored status.
+    CHECK((*status)->status == "active");
+    CHECK((*status)->release_requested_at == 0);
+    CHECK((*status)->device_release_owed_at == 0);
 
     // And mark_endpoint_applied/confirmed round-trip through the now-v2
     // schema end-to-end for that same pre-existing row.
@@ -531,7 +560,7 @@ TEST_CASE("QuarantineStore: a genuine v1->v2 upgrade (real ALTER against a popul
     REQUIRE(after->has_value());
     CHECK((*after)->last_applied_at == 5000);
 
-    // v3 (#3623, migrate_from_sqlite retired): the same construction call also runs the
+    // v3 (#3623, migrate_from_sqlite retired) and v4 (PRQ.2): the same construction call also runs the
     // DROP TABLE against quarantine_meta — seeded by the v1 DDL above but never touched by
     // v2's ALTER, so this is the only ladder test that actually exercises the drop landing
     // against a populated (not merely fresh-templated) database.
@@ -543,7 +572,7 @@ TEST_CASE("QuarantineStore: a genuine v1->v2 upgrade (real ALTER against a popul
                             "'quarantine_store'")};
         REQUIRE(ver.ok());
         REQUIRE(PQntuples(ver.get()) == 1);
-        CHECK(std::string(PQgetvalue(ver.get(), 0, 0)) == "3");
+        CHECK(std::string(PQgetvalue(ver.get(), 0, 0)) == "4");
         PgResult tbl{PQexec(conn.get(),
                             "SELECT COUNT(*) FROM information_schema.tables WHERE "
                             "table_schema = 'quarantine_store' AND table_name = "
@@ -551,4 +580,280 @@ TEST_CASE("QuarantineStore: a genuine v1->v2 upgrade (real ALTER against a popul
         REQUIRE(tbl.ok());
         CHECK(std::string(PQgetvalue(tbl.get(), 0, 0)) == "0");
     }
+}
+
+// ── The release (PRQ.2 schema v4) ───────────────────────────────────────────
+
+TEST_CASE("QuarantineStore: v4 applies; the two release columns default to 0 and the owed-release "
+          "partial index exists",
+          "[pg][quarantine][release]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, quarantine_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    QuarantineStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(store.quarantine_device("agent-r1", "admin", "reason", "").has_value());
+    const auto row = active_row(store, "agent-r1");
+    REQUIRE(row.has_value());
+    CHECK(row->status == "active");
+    CHECK(row->release_requested_at == 0);
+    CHECK(row->device_release_owed_at == 0);
+
+    // The partial index the per-tick owed read relies on, and no column for a device-reported limit.
+    PgConn conn{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    PgResult idx{PQexec(conn.get(),
+                        "SELECT indexdef FROM pg_indexes WHERE schemaname = 'quarantine_store' AND "
+                        "indexname = 'idx_quarantine_release_owed'")};
+    REQUIRE(idx.ok());
+    REQUIRE(PQntuples(idx.get()) == 1);
+    const std::string def = PQgetvalue(idx.get(), 0, 0);
+    CHECK(def.find("(agent_id, id)") != std::string::npos);
+    CHECK(def.find("device_release_owed_at <> 0") != std::string::npos);
+    CHECK(def.find("'released'") != std::string::npos);
+    PgResult cols{PQexec(conn.get(),
+                         "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = "
+                         "'quarantine_store' AND table_name = 'quarantine_records' AND column_name IN "
+                         "('release_requested_at', 'device_release_owed_at', 'endpoint_ttl_expires')")};
+    REQUIRE(cols.ok());
+    CHECK(std::string(PQgetvalue(cols.get(), 0, 0)) == "2");
+}
+
+TEST_CASE("QuarantineStore: request_release returns the record id and the record reads releasing but stays listed",
+          "[pg][quarantine][release]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, quarantine_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    QuarantineStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(store.quarantine_device("agent-r2", "admin", "reason", "10.0.0.1").has_value());
+    const auto before = active_row(store, "agent-r2");
+    REQUIRE(before.has_value());
+
+    auto id = store.request_release("agent-r2");
+    REQUIRE(id.has_value());
+    CHECK(*id == before->id);
+
+    const auto after = active_row(store, "agent-r2");
+    REQUIRE(after.has_value()); // still the device's active record
+    CHECK(after->status == "releasing");
+    CHECK(after->release_requested_at > 0);
+    CHECK(after->id == before->id);
+
+    // list_quarantined and list_quarantined_in still return it (the dispatch refusal stays)
+    auto all = store.list_quarantined();
+    REQUIRE(all.has_value());
+    REQUIRE(all->size() == 1);
+    CHECK((*all)[0].status == "releasing");
+    const std::vector<std::string> ids{"agent-r2"};
+    auto scoped = store.list_quarantined_in(&ids, 0);
+    REQUIRE(scoped.has_value());
+    REQUIRE(scoped->size() == 1);
+    CHECK((*scoped)[0].status == "releasing");
+}
+
+TEST_CASE("QuarantineStore: request_release is idempotent: the first timestamp and the same id",
+          "[pg][quarantine][release]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, quarantine_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    QuarantineStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(store.quarantine_device("agent-r3", "admin", "reason", "").has_value());
+
+    auto first = store.request_release("agent-r3");
+    REQUIRE(first.has_value());
+    const auto stamp = active_row(store, "agent-r3")->release_requested_at;
+    auto second = store.request_release("agent-r3");
+    REQUIRE(second.has_value());
+    CHECK(*second == *first);
+    CHECK(active_row(store, "agent-r3")->release_requested_at == stamp);
+}
+
+TEST_CASE("QuarantineStore: request_release with no active record is an unprefixed business error",
+          "[pg][quarantine][release]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, quarantine_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    QuarantineStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto none = store.request_release("never-quarantined");
+    REQUIRE_FALSE(none.has_value());
+    CHECK(none.error() == "device is not quarantined");
+    CHECK_FALSE(none.error().starts_with(yuzu::server::kQuarantineDbErrorPrefix));
+    auto empty = store.request_release("");
+    REQUIRE_FALSE(empty.has_value());
+    CHECK(empty.error() == "agent_id is required");
+
+    // an ended record is not an active one either
+    REQUIRE(store.quarantine_device("agent-r4", "admin", "reason", "").has_value());
+    end_record(store, "agent-r4");
+    auto ended = store.request_release("agent-r4");
+    REQUIRE_FALSE(ended.has_value());
+    CHECK(ended.error() == "device is not quarantined");
+}
+
+TEST_CASE("QuarantineStore: a releasing record still refuses quarantine_device",
+          "[pg][quarantine][release]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, quarantine_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    QuarantineStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(store.quarantine_device("agent-r5", "admin", "reason", "").has_value());
+    REQUIRE(store.request_release("agent-r5").has_value());
+
+    auto again = store.quarantine_device("agent-r5", "admin", "again", "");
+    REQUIRE_FALSE(again.has_value());
+    CHECK(again.error() == "device is already quarantined");
+}
+
+TEST_CASE("QuarantineStore: mark_released(device_confirmed) ends the record and a new quarantine then succeeds",
+          "[pg][quarantine][release]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, quarantine_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    QuarantineStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(store.quarantine_device("agent-r6", "admin", "reason", "").has_value());
+    auto id = store.request_release("agent-r6");
+    REQUIRE(id.has_value());
+
+    REQUIRE(store.mark_released("agent-r6", *id, ReleaseEnd::device_confirmed).has_value());
+    CHECK_FALSE(active_row(store, "agent-r6").has_value());
+    CHECK_FALSE(owed_contains(store, "agent-r6")); // nothing owed on a confirmed end
+    auto history = store.get_history("agent-r6");
+    REQUIRE(history.has_value());
+    REQUIRE(history->size() == 1);
+    CHECK((*history)[0].status == "released");
+    CHECK((*history)[0].released_at > 0);
+    CHECK((*history)[0].device_release_owed_at == 0);
+
+    CHECK(store.quarantine_device("agent-r6", "admin", "again", "").has_value());
+}
+
+TEST_CASE("QuarantineStore: mark_released with a stale record id affects no row",
+          "[pg][quarantine][release]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, quarantine_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    QuarantineStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(store.quarantine_device("agent-r7", "admin", "old", "").has_value());
+    const auto old_id = active_row(store, "agent-r7")->id;
+    end_record(store, "agent-r7");
+    REQUIRE(store.quarantine_device("agent-r7", "admin", "new", "").has_value());
+    const auto new_id = active_row(store, "agent-r7")->id;
+    REQUIRE(new_id != old_id);
+
+    auto stale = store.mark_released("agent-r7", old_id, ReleaseEnd::device_confirmed);
+    REQUIRE_FALSE(stale.has_value());
+    CHECK(stale.error() == "device is not quarantined");
+    auto stale_forced = store.mark_released("agent-r7", old_id, ReleaseEnd::forced);
+    REQUIRE_FALSE(stale_forced.has_value());
+    CHECK(stale_forced.error() == "device is not quarantined");
+    // the new record is untouched
+    const auto row = active_row(store, "agent-r7");
+    REQUIRE(row.has_value());
+    CHECK(row->id == new_id);
+    CHECK(row->status == "active");
+}
+
+TEST_CASE("QuarantineStore: mark_released(forced) ends the record, leaves it out of the active list and owes the device a release",
+          "[pg][quarantine][release]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, quarantine_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    QuarantineStore store{pool};
+    REQUIRE(store.is_open());
+
+    // a releasing record forced
+    REQUIRE(store.quarantine_device("agent-f1", "admin", "reason", "").has_value());
+    auto id = store.request_release("agent-f1");
+    REQUIRE(id.has_value());
+    REQUIRE(store.mark_released("agent-f1", *id, ReleaseEnd::forced).has_value());
+    CHECK_FALSE(active_row(store, "agent-f1").has_value());
+    auto active = store.list_quarantined();
+    REQUIRE(active.has_value());
+    CHECK(active->empty());
+    CHECK(owed_contains(store, "agent-f1"));
+    auto history = store.get_history("agent-f1");
+    REQUIRE(history.has_value());
+    REQUIRE(history->size() == 1);
+    CHECK((*history)[0].status == "released");
+    CHECK((*history)[0].device_release_owed_at > 0);
+
+    // an active (not yet releasing) record can be forced too
+    REQUIRE(store.quarantine_device("agent-f2", "admin", "reason", "").has_value());
+    const auto f2 = active_row(store, "agent-f2")->id;
+    REQUIRE(store.mark_released("agent-f2", f2, ReleaseEnd::forced).has_value());
+    CHECK(owed_contains(store, "agent-f2"));
+}
+
+TEST_CASE("QuarantineStore: list_release_owed leaves out a forced record once the device has a newer record",
+          "[pg][quarantine][release]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, quarantine_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    QuarantineStore store{pool};
+    REQUIRE(store.is_open());
+
+    // newer ACTIVE record
+    REQUIRE(store.quarantine_device("agent-n1", "admin", "old", "").has_value());
+    REQUIRE(store.mark_released("agent-n1", active_row(store, "agent-n1")->id, ReleaseEnd::forced)
+                .has_value());
+    REQUIRE(owed_contains(store, "agent-n1"));
+    REQUIRE(store.quarantine_device("agent-n1", "admin", "new", "").has_value());
+    CHECK_FALSE(owed_contains(store, "agent-n1"));
+
+    // newer RELEASED record
+    REQUIRE(store.quarantine_device("agent-n2", "admin", "old", "").has_value());
+    REQUIRE(store.mark_released("agent-n2", active_row(store, "agent-n2")->id, ReleaseEnd::forced)
+                .has_value());
+    REQUIRE(store.quarantine_device("agent-n2", "admin", "new", "").has_value());
+    end_record(store, "agent-n2");
+    CHECK_FALSE(owed_contains(store, "agent-n2"));
+}
+
+TEST_CASE("QuarantineStore: clear_release_owed removes the mark; a repeat and a stale id affect no row",
+          "[pg][quarantine][release]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, quarantine_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    QuarantineStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(store.quarantine_device("agent-c1", "admin", "reason", "").has_value());
+    const auto id = active_row(store, "agent-c1")->id;
+    REQUIRE(store.mark_released("agent-c1", id, ReleaseEnd::forced).has_value());
+    REQUIRE(owed_contains(store, "agent-c1"));
+
+    auto stale = store.clear_release_owed("agent-c1", id + 1000);
+    REQUIRE_FALSE(stale.has_value());
+    CHECK(stale.error() == "device is not quarantined");
+    CHECK(owed_contains(store, "agent-c1"));
+
+    REQUIRE(store.clear_release_owed("agent-c1", id).has_value());
+    CHECK_FALSE(owed_contains(store, "agent-c1"));
+    auto again = store.clear_release_owed("agent-c1", id);
+    REQUIRE_FALSE(again.has_value());
+    CHECK(again.error() == "device is not quarantined");
+    // a record that was never forced has nothing to clear
+    REQUIRE(store.quarantine_device("agent-c2", "admin", "reason", "").has_value());
+    end_record(store, "agent-c2");
+    auto history = store.get_history("agent-c2");
+    REQUIRE(history.has_value());
+    auto none = store.clear_release_owed("agent-c2", (*history)[0].id);
+    REQUIRE_FALSE(none.has_value());
+}
+
+TEST_CASE("QuarantineStore: mark_endpoint_confirmed stamps last_confirmed_at, the latest confirm wins, and "
+          "a stale record id is refused",
+          "[pg][quarantine][release]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, quarantine_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    QuarantineStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(store.quarantine_device("agent-t1", "admin", "reason", "").has_value());
+    const auto id = active_row(store, "agent-t1")->id;
+
+    REQUIRE(store.mark_endpoint_confirmed("agent-t1", id, 2000).has_value());
+    CHECK(active_row(store, "agent-t1")->last_confirmed_at == 2000);
+    REQUIRE(store.mark_endpoint_confirmed("agent-t1", id, 3000).has_value());
+    CHECK(active_row(store, "agent-t1")->last_confirmed_at == 3000);
+
+    auto stale = store.mark_endpoint_confirmed("agent-t1", id + 1000, 4000);
+    REQUIRE_FALSE(stale.has_value());
+    CHECK(stale.error() == "device is not quarantined");
+    CHECK(active_row(store, "agent-t1")->last_confirmed_at == 3000);
 }

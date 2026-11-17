@@ -2,7 +2,81 @@
 
 This guide covers upgrading Yuzu components (server, agent, gateway) between versions.
 
+**Deploying the MFA factor-binding build (#6079)?** It is a hard cutover: a fresh database only, with no upgrade path
+and no rollback. An enrolled account that reads factor generation `0` (a database this build did not write) is refused
+on the step-up routes, approvals and JIT elevation until `yuzu-server --mfa-reset` clears its factor. A database written by the released v0.15.0 build or by any earlier release is a database
+written by an earlier build: deploy a fresh database. Read
+[the cutover section](#breaking-mfa-proofs-are-bound-to-the-factor-they-were-earned-with-hard-cutover-with-no-upgrade-path-or-rollback-6079).
+A statement elsewhere on this page that a rollback, a mixed fleet or an in-place upgrade is safe or supported describes that one change in an earlier release and does not apply to this build; the "Deployment contract (hard cutover)" governs.
+
 Running `dev` between releases? Some entries below describe changes on `dev` that are not in a release yet. For what a `git pull` of `dev` changed, run the repository script `python3 scripts/whats-new.py` (`--versions` for the version bumps, rebuild notes and Docker image bumps); see `changelog.d/README.md`.
+
+## ⚠️ Breaking: on-demand software sync asks for confirmation, is paced instead of capped at 500 devices, and cools down per group
+
+**In short.** Affected: anything that calls `POST /api/v1/hardware/sync` or the MCP tool `sync_hardware_software` for a whole group or the whole fleet (the Software page's **Whole fleet** choice, scripts and agentic workers). To do: send `"confirm": true` with a `group:<id>` or `__all__` scope, give the caller the global `ManagementGroup:Write` grant if it names the whole fleet, and stop relying on the 500-device refusal and the 60-second per-operator gap.
+
+**What changed.**
+
+- **Confirmation.** A whole group (`group:<id>`) or the whole fleet (`__all__`) is refused with `400` unless the body carries `"confirm": true` (a JSON boolean; a string or a number is a `400` itself). A single device and a scope expression need none. The Software page's dialog and the MCP tool's schema do not send or advertise `confirm` yet, so the page's **Whole fleet** choice, a `group:<id>` typed as its scope, and the tool's group and fleet forms answer `400` naming the confirmation until they do; the tool's `400` is an invalid-parameters error, not an internal one. **This device** and a scope expression keep working. Calling the REST route or the tool directly with `confirm` works today.
+- **The whole fleet needs a fleet administrator.** `"scope":"__all__"` needs an unfiltered `Execution:Execute` **and** the global `ManagementGroup:Write` grant (the administrator role while RBAC enforcement is off); an operator with only the first is refused with `403`.
+- **No 500-device limit.** The `413` at the 501st reachable device is gone. A run is paced: the agents are asked to report inside `delay_max_s` seconds (at most 86,400) under one budget of 50 reports per second per server process, and the `202` carries `delay_max_s` and `estimated_completion_at`. These are **estimates**: the budget bounds what the server asks for, not the rate reports arrive at, because an agent keeps a fire it already armed when that is sooner, so a device whose own scheduled sync is due sooner reports then, as a full send. A run that finds the budget used is `429` with `Retry-After` (a new reason for that status); `413` now means the run could not be spread inside 86,400 seconds at the capacity free.
+- **The gap is per group, not per operator, and is 600 seconds.** It was one run per operator per 60 seconds; it is now one run per group, per operator's scope expression or for the fleet per 600 seconds (`--inventory-sync-cooldown`, `0` for none, range 0-86400). A repeat of a run still spreading **joins** it (`202`, `"joined": true`, nothing sent) instead of being refused with `409`, and the single in-flight slot with its 120-second lease is gone: runs of different groups proceed together, and at most three send loops are alive per process (a fourth is `409`).
+- **New fields.** The `202` gains `execution_id`, `delay_max_s`, `estimated_completion_at`, `skipped_fresh` and `joined`; the request gains `last_synced_before` (epoch seconds: only devices whose last accepted report is older are asked). The whole-fleet pre-dispatch audit row is written as `software_estate.sync.fleet_wide` (see [audit-log.md](audit-log.md)); `inventory.sync.request` keeps every other row, and gains a `joined` result. A whole-fleet run through the MCP tool `sync_hardware_software` is not recorded under the new verb yet: it is still `inventory.sync.request` with `target_id=__all__`.
+- **New operation: `GET /api/v1/hardware/sync/{execution_id}`** (`getHardwareSyncByExecutionId`). It reports how a run is going (`targeted`, `acknowledged`, `failed`, the spread) to the caller who started it, or to any caller with an unfiltered `Execution:Execute`; anyone else, an unknown id and an execution that is not a sync run get the same `404`. It is an addition to the OpenAPI document, not a rename: no existing `operationId` changed. The MCP tool has no status twin yet.
+- **Run state is in memory.** The cooldown, the joins and the pacing budget are per server process and a restart forgets them (agents keep the delays they already armed; the execution records persist).
+
+**Who is affected.** The Software page's **Whole fleet** choice and its group choices (until the page sends the confirmation); any script or agentic worker that syncs a group or the fleet; and anything that parsed the `413` as "narrow the scope" or the `409` as "a run is in progress".
+
+**What to do.** Add `"confirm": true` to group and fleet requests. Give the account that names the whole fleet the global `ManagementGroup:Write` grant, or have it sync groups or a scope expression instead. Treat `joined: true` as success. Read `Retry-After` on a `429` for both the cooldown and a busy budget. Do not treat `estimated_completion_at` as the time every report is stored.
+
+## ⚠️ Breaking: device containment is the firewall plugin's four actions; the `quarantine` agent plugin is removed
+
+This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page): every writer runs this build, and this page is not a procedure for a rolling or mixed-version upgrade.
+
+**What changed.**
+- The `quarantine` agent plugin and its four actions (`quarantine`, `unquarantine`, `status`, `whitelist`) are gone from the agent, the packages, the gateway plugin list and the capability catalogue. There is no alias. Device containment is the `firewall` plugin's four actions: `firewall.quarantine`, `firewall.release`, `firewall.quarantine_status` and `firewall.quarantine_allow`. They are the only actions that reach a contained device, and the kill switches never stop them.
+- The four definition ids are renamed: `security.quarantine.isolate`, `.release`, `.status` and `.whitelist` become `security.firewall.quarantine`, `.release`, `.quarantine_status` and `.quarantine_allow`. The `--instructions-quarantine` mode of `/test` and its ceremony scripts are removed.
+- A release is recorded only on the device's own answer. `DELETE /api/v1/quarantine/{agent_id}` asks the device to lift its rules and waits up to 5 seconds: `200` with `state: released` when the device answers, `202` with `state: releasing` otherwise. A record with a release in flight reads `releasing`, stays listed and keeps refusing commands to the device until the device answers `inactive`. The new `DELETE ...?force=true` (REST only) ends the record without the device's answer and answers `200` with `forced: true, device_confirmed: false`: **it does not release the device, which may still be contained**, and the server still owes it a release (see "Device Quarantine" in [Security Hardening](security-hardening.md)).
+- A record ends in two ways only: the device's `inactive` answer after a release, and an operator's forced end. A device that reads `inactive` while its record is active is treated as drift and re-applied; a time limit on the device (set by a `firewall.quarantine` dispatch outside the quarantine routes) does not end the record.
+- A new record for a device that is already contained is applied differently from before. `firewall.quarantine` to a contained device keeps the exceptions in force, and the old plugin put the new whitelist on the device every time. When the device says it kept other exceptions, a record that was never confirmed stays unconfirmed (audit `quarantine.reapply`, `allow_set_not_applied`; `YuzuQuarantineEndpointUnconfirmed` fires) and its whitelist is not on the device. Release the device and quarantine it again to apply it.
+- The whitelist on `POST /api/v1/quarantine` and the MCP `quarantine_device` tool is stricter. It accepts bare IPv4 and IPv6 addresses only, at most 32, and refuses a port, a prefix length, an IPv4-mapped form, an IPv4 octet with a leading zero and a host name with `400`. It was a charset check before.
+- The reconciler re-reads a confirmed record's status every 5 minutes and re-applies on drift, and a device whose rules were removed is re-contained without waiting for a reconnect. New: gauges `yuzu_server_quarantine_release_pending{reachability}` and `yuzu_server_quarantine_forced_release_owed{reachability}`, alert `YuzuQuarantineReleasePending`, and the `released` and `release_sent` values of `yuzu_server_quarantine_reapply_total{result}`.
+- `scripts/install-agent-user.sh` no longer grants a bare `/sbin/pfctl` (macOS) or `iptables-save`/`iptables-restore`/`ip6tables-save`/`ip6tables-restore` (Linux). The macOS grant is the narrowed `pfctl` argv of the firewall plugin; Linux keeps the bare `iptables` and `ip6tables` grants for the firewall plugin's fallback when `nft` is absent.
+
+**Who is affected.** Anyone who runs the old definition ids or the `quarantine` plugin by name (scripts, saved instructions, schedules, MCP or REST clients, SIEM rules matching `quarantine.*` plugin or action names), anyone who sends `whitelist` entries that are not bare addresses, and anyone who reads `DELETE` as "released". An instruction naming the removed plugin or ids no longer resolves. Audit rows keep the `quarantine.enable`, `quarantine.disable` and `quarantine.reapply` action names; a `quarantine.disable` row with result `pending` now also means a release sent and awaiting the device's answer.
+
+**Not covered.** Earlier agents, earlier hosts and records carried forward from an earlier build are unsupported: reprovision them into a fresh deployment of this build. This build neither removes nor detects containment rules a build with the removed plugin left on a device (the Windows rules named `YuzuQuarantine_*`, the Linux `yuzu-quarantine` chain, on macOS a main ruleset replaced by that plugin); on such a device the firewall plugin's apply fails `anchor_not_referenced` on macOS.
+
+**What to do.**
+- Update scripts and saved instructions to the new definition ids or to `firewall.quarantine`, `firewall.release`, `firewall.quarantine_status` and `firewall.quarantine_allow`.
+- Send whitelist entries as bare addresses, listing both families for the management server.
+- Treat a `202` or `releasing` as "not yet released", and read the device's status before relying on a `200` from a forced end.
+- Alert on `YuzuQuarantineReleasePending` for a device whose release does not finish.
+
+## ⚠️ Breaking: management-group create and member writes are refused (503) while the audit store is unavailable, and REST create answers a store fault with 503 (#7074)
+
+**What changed.**
+
+- **Audit-first.** Creating a management group (REST `POST /api/v1/management-groups`, the MCP tool `create_management_group`, and the Settings **Management Groups** form) and adding or removing a member (REST add and remove; MCP add only, there is no MCP remove tool) now store a `result=attempted` audit row before the change. When that row cannot be stored the request is refused and **nothing is created, added or removed**: REST and Settings answer `503` with `Sec-Audit-Failed: true` (Settings also shows an error toast), and the MCP tool answers a retryable internal error (`audit log unavailable; the change was not made`, with `retry_after_ms`). Before, these writes went ahead with no audit row. A request refused by a check that needs no write (permission, an invalid body or argument, an empty name, a name, parent id or agent id over its bound or holding a control character, an unknown parent, the depth limit, a store fault on the parent read or on the group read, and on add member a group that does not exist, `404`) writes no `attempted` row and no `management_group.*` row. The one exception is an agent id with a control character or invalid UTF-8 (on MCP add member also such a group id): it writes a `result=denied` row with a fixed `detail` (`invalid_agent_id`, or `invalid_group_id` on MCP), never the value, and still no `attempted` row. The session or credential and the permission are decided again after the `attempted` row; a request that no longer passes changes nothing and writes `result=failure` with `detail=session_revoked <key>` or `detail=permission_revoked <key>`. A request whose second look-up resolves a different principal than the first (for example the session cookie was revoked while a bearer token for another account rode along) counts as a revoked session: it writes `session_revoked` naming the original principal and changes nothing. The outcome row is `success`, or `failure` with `detail=<token> <key>`: a fixed token (`name_conflict`, `store_error`, `validation_refused`, `group_not_found`, `session_revoked`, `permission_revoked`; none holds a space), a space, and the same key the `attempted` row carries in its `detail` (the group name for create, the agent id for add member and remove member; the group id stays in `target_id`, and a create has an empty `target_id`). Read the FIRST space-delimited word of a failure `detail` as the token. A lost outcome row never rolls the change back: REST keeps its `2xx` and sets `Sec-Audit-Failed: true`, the MCP result gains `audit_persisted:false`, and Settings shows a warning toast. On REST and Settings every row of a request, including the `attempted` row, carries the same principal, taken from the session resolved before the `attempted` row, so a revoked credential does not leave an empty principal. On MCP this holds only where the session writer is wired, which is where the runtime-config store is open, every Postgres-backed deployment; otherwise each row re-resolves the principal and one written after the credential lapses can carry an empty principal. Where the principal is stamped, `session_id` is the digest of the request's cookie, empty for a call that carries none, such as a bearer-token call (so empty on every row of a bearer request).
+- **Stricter names and agent ids.** REST create and the Settings form refuse a group name over 256 bytes or holding a control character (a tab or newline in a name was accepted before), and a parent id over 256 bytes or holding one (answered `parent group not found`); REST add member and remove member refuse an `agent_id` over 256 bytes (`400`, `agent_id must be at most 256 bytes`; an id of 257 bytes or more was accepted before) and a group id in the path over 256 bytes (`404`); MCP `create_management_group` refuses a name or parent id holding a control character or invalid UTF-8 as invalid params (a name over 256 bytes was already refused by the schema bound). Exactly 256 bytes is accepted. Each refusal is decided before any `attempted` row, so the refused value never reaches an audit row, and the text is fixed, never an echo of the value.
+- **Degraded parent read.** A parent group that cannot be read (the group store is degraded) is no longer answered as `parent group not found`: REST create answers `503` with a retry hint, the Settings form its fixed store-unavailable message and MCP a retryable internal error, and no row is written. A parent confirmed absent is still `400` (MCP invalid params) `parent group not found`.
+- **Add member group read.** If the read that checks the group exists fails, REST add member answers `503` with a retry hint and MCP a retryable internal error; no `management_group.add_member` row is written (on MCP only the generic `mcp.add_management_group_member` row, `result=failure`, `detail=store_error`) and the REST response carries no `Sec-Audit-Failed`, because no audit write failed.
+- **MCP create failure rows.** MCP `create_management_group` failure rows change: `target_id` was the requested name and is now empty, `detail` was the store's text and is now a fixed token followed by a space and the group name (`name_conflict <group name>`, `store_error <group name>`, `validation_refused <group name>`, ...), and a refusal by a check that needs no write (invalid argument, unknown parent, depth) writes no `management_group.create` row. REST and Settings create wrote no failure row before; they now write one for a refusal decided by the create itself, after the `attempted` row, in the same `<token> <group name>` shape, and the add-member and remove-member failure rows carry `<token> <agent id>`. Rules matching on the old `target_id` or on the store's text must change to the token-plus-key shape. The `store_error` token of the add-member and remove-member failure rows is not new, but on dev those rows (REST add and remove, and the MCP add-member `management_group.add_member` row) carried a bare `detail=store_error` and now carry `store_error <agent id>`: a SIEM rule that matches `detail` exactly stops matching, so match on the first word or a prefix, not the whole `detail`.
+- **REST create store fault.** `POST /api/v1/management-groups` answered every failure `400` and returned the store's own error text. A fault of the group store now answers `503` with a fixed message and a retry hint, and the store's text is not returned. A validation refusal and a name conflict stay `400`. Settings now HTML-escapes the refusal text it shows and shows a fixed message for a store fault.
+- **MCP.** `create_management_group` and `add_management_group_member` are approval-gated at the supervised tier, and the `attempted` row is written after the one-time approval is consumed, so a call refused for audit reasons has already used its approval and a retry at that tier needs a new approval as well as a working audit log (the refusal's remediation says so: `retry once the audit log is available; at the supervised tier a new approval is needed`). The burn is counted in `yuzu_mcp_approval_burned_total{tool,reason="handler_reject"}`: a test verifies it for `create_management_group`, and `add_management_group_member` takes the same code path. `audit_persisted:false` on `create_management_group` now means only that the closing outcome row was lost; it used to cover the tool's only audit row. The output schemas of both tools list `audit_persisted` as an optional boolean (additive; the required fields are unchanged). A credential that no longer resolves after the `attempted` row, where the authentication check wrote no response of its own, now answers an A4 error (`authentication required`, HTTP 401) rather than a bare `{"error":"unauthorized"}`.
+- **Add member records whether the agent id has an enrolment record, in the audit row only.** An agent id with no enrolment record is still added, whatever its letter case. The `management_group.add_member` success row's `detail` changes from the bare agent id to `<agent_id> agent_known=<1|0|unreadable>` (`1` when the server holds an enrolment record for the id, whether pending, approved or denied; `0` when it holds none; `unreadable` when the lookup could not be made); the `attempted` row's `detail` stays the bare agent id. Nothing about enrolment status is returned in the REST response or the MCP result. Matching is exact, so an id that differs from an enrolled id only in letter case reads `0`. The flag is point-in-time and is not evidence that the device is enrolled: `0` is also the normal value for a membership staged ahead of the device, and an unknown or wrong-case id is still added, so the flag does not by itself protect a group's scope. This relates to #6967 and is not a fix for it.
+
+**Who is affected.** Operators and automation that create groups or change membership during an audit-store outage: those requests now stop instead of running unaudited. REST clients that read a create `400` as any failure, or parsed its message for a store fault. SIEM rules and parsers that read the `management_group.add_member` success `detail` as the bare agent id, and rules on `management_group.create`, `management_group.add_member` or `management_group.remove_member` that now also see `result=attempted` rows (a "failures only" filter of `result != "success"` matches them; key on the outcome row, see [`audit-log.md`](audit-log.md), Result vocabulary). MCP clients that read `audit_persisted:false` on `create_management_group` as "the group was not recorded". Callers that created groups with a tab or newline in the name, or that sent a parent id, group id or agent id over its bound. SIEM rules that read the principal of a `management_group.*` row, and rules on the MCP `management_group.create` failure rows (`target_id`, `detail`). SIEM rules that match the `detail` of a `management_group.add_member` or `management_group.remove_member` failure row exactly (a bare `store_error` on dev).
+
+**Not covered by this change.** Only management-group creation and member add and remove are audit-first and refused with `503` when the audit row cannot be stored. Group update, group delete (which also deletes the groups below, their memberships and their role assignments), assign role and unassign role (assign role on REST and MCP, unassign role on REST only), the Settings group delete, and `ensure_service_management_group` (a caller who may write a device's `service` tag creates a dynamic `Service: <value>` group, with no `management_group.*` audit row) still audit after the change or not at all, so they proceed during an audit outage; they are tracked as follow-ups. The dashboard Create Group from results (`group.create_from_results`, audit-first since #3619) is not changed by this entry: its route applies no length or clean-text check to the group name, and it uses its own audit verb and failure tokens.
+
+**What to do.**
+
+- Treat a `503` with `Sec-Audit-Failed: true` on these routes as an audit-store outage, not a permission or connectivity problem; the checks are the same as for the dashboard mutations in the #3619 entry below. A refused request changed nothing.
+- Treat a `503` without that header on create (and the MCP retryable internal error or the Settings store-unavailable message) as a group-store fault, but check whether the group exists before retrying: if the connection to the database is lost after a create commits and before the reply, the request reports `store_error` although the group exists, and a retry then answers a `name_conflict` refusal (REST `400`, MCP invalid params, the Settings refusal text) for the caller's own group.
+- Update a parser of the add-member success `detail` to split off the LAST space-delimited token (`agent_known=...`): the agent id is caller text and may itself contain spaces or the text ` agent_known=1`, so do not parse the id out of the front of the string. Filter on `result=success` first, before applying that last-token rule: an agent id is caller-supplied text, so an `attempted` or failure row can end in the same text (an id such as `x agent_known=1`).
+- At the supervised MCP tier, after a refusal for audit reasons, request a new approval before retrying.
+- An `attempted` row with no outcome row after it means "started, outcome unknown". Pair each outcome row (success or failure) with an earlier `attempted` row of the same verb, earliest first, one outcome per `attempted` row. Create: by principal and group name, ignoring `target_id` on the success row (it carries the new group's id; the `attempted` and failure rows have an empty one). Add member: by principal, `target_id` (the group id) and agent id, where a success row's agent id is its `detail` without the trailing ` agent_known=<flag>` token. Remove member: by principal, `target_id` and agent id (`detail`). A failure row's key is the part of its `detail` after the token. An `attempted` row left without an outcome row is an orphan, so check whether the group or member exists before retrying. There is no per-request correlator, so two concurrent requests by one principal with the same key are paired by count only, and on MCP where the session writer is unwired the principal on a row can be empty.
 
 ## Behaviour change: a service-scoped credential's execution visibility is limited to its service scope (#5557)
 
@@ -36,6 +110,63 @@ Running `dev` between releases? Some entries below describe changes on `dev` tha
 **What to do.** Poll `get_execution_status` (or read `GET /api/v1/events` with the same credential) for the counts the caller may see. Grant `Execution:Read` without a management-group limit only if the caller should see fleet-wide counts.
 
 **Rolling upgrade.** The projection is applied per replica, so a replica that has not been upgraded still sends the fleet-wide counts to such a caller.
+
+## Behaviour change: the bulk device-CI read `GET /api/v1/hardware-ci` and a new index on `device_ci`
+
+**What changed.** This release adds `GET /api/v1/hardware-ci`, the bulk device-CI read: one keyset page of the stored CI records of every device (the scalar CI block, the stored `content_hash` and the `blob_version`, no sections), with the MCP twin `list_hardware_ci_records`. It is a new route and changes no existing one: `GET /api/v1/hardware/{id}` still serves a device whose agent id is literally `ci`.
+
+**Cursors and rolling upgrades.** Start a walk again from the first page after an upgrade instead of resuming a cursor from before it. During a rolling upgrade a replica that is still on the earlier build answers `404` for `GET /api/v1/hardware-ci`, so finish the upgrade of every replica before you rely on the bulk walk, and treat a `404` mid-walk as "restart the walk after the upgrade is complete", not as a cursor to retry.
+
+**Schema change at server start.** The first start of this build adds an index on the device CI table (`device_ci`, on the byte-ordered `agent_id`, named `device_ci_agent_id_c_idx`). The index serves the byte-ordered page query: it makes an index scan available for each page, and the plans measured on a representative table use it (the planner decides). The byte order itself comes from the `COLLATE "C"` spelling in the query and does not depend on the index: without the index the walk stays correct, and each page scans and sorts the table instead. The build takes a lock that blocks writes to that table (reads are not blocked), so device registrations and daily syncs wait while the server starts. Measured on one test machine (PostgreSQL 18.4, one million devices with agent ids of about 36 characters): 0.44 to 0.64 s to build and 36 to 73 MB of disk. A longer id makes the index larger, and build time depends on the storage, so treat these figures as the order of magnitude, not a promise. The build duration is not bounded by the migration: it lifts the pool's statement timeout for the build (`statement_timeout = 0`), and only the wait for the table lock is bounded (30 s). Nothing stops a slow build once it holds the lock, and writes to `device_ci` wait for all of it. For a very large table, or slow storage, build the index yourself before the upgrade in a maintenance window, without blocking writes: run `CREATE INDEX CONCURRENTLY IF NOT EXISTS device_ci_agent_id_c_idx ON device_inventory_store.device_ci ((agent_id COLLATE "C"));` as the table owner (one statement, outside a transaction block; in `psql` that is the default), and wait until it has finished before you start the new server, because the migration's own build and a running concurrent build conflict. This does not need the other replicas stopped: a concurrent build does not block writers (verified on PostgreSQL 18.4 with a writer inserting and updating while it ran), but it waits for transactions that were open when it started, so a transaction left idle holds it up until that session ends (look for it with the lock-holder query in the recovery steps below). If it fails it leaves an INVALID index: check `SELECT indisvalid FROM pg_index WHERE indexrelid = 'device_inventory_store.device_ci_agent_id_c_idx'::regclass;` and, when it is `f`, run `SET lock_timeout = '30s';` and then `DROP INDEX device_inventory_store.device_ci_agent_id_c_idx;` in the same session (a plain `DROP INDEX` takes an `ACCESS EXCLUSIVE` lock on the table, so it queues behind every reader and then blocks all of them, and writers, until it gets the lock; the timeout makes it give up instead), and build it again (`IF NOT EXISTS` would otherwise skip the invalid one). The migration at the first start then finds the index and does nothing.
+
+*Failure mode.* The migration lifts the connection pool's 30 s statement timeout for the build and waits up to 30 s for the table lock. If another session holds a conflicting lock on `device_ci` longer than that (a long ingest transaction on an old replica, a session left idle in a transaction, a prepared transaction), the migration fails, the server refuses to start, and the failure repeats on every restart until the lock holder is gone. The worst case while it waits: a lock request queues behind a holder, so every new write to `device_ci` queues behind the waiting migration for up to 30 s (agent reports retry; reads are unaffected). A second replica that starts while the first is waiting queues on the migration runner's per-store lock, can hit the pool's 10 s lock timeout, refuse to start, and then start normally when restarted after the first has finished. The log lines to search for are `PgMigrationRunner: migration v4 failed for device_inventory_store: ...` (the rest of the line is the PostgreSQL error, `canceling statement due to lock timeout` for the 30 s wait), `DeviceInventoryStore: schema migration failed`, and `[PG] Refusing to start: device inventory store migration/open failed`.
+
+*Manual recovery.* In this order; do not run `CREATE INDEX` first, because a plain `CREATE INDEX` with no `lock_timeout` queues behind the same lock holder, and every `device_ci` writer then queues behind it.
+
+1. Find the lock holder and end it. As a database superuser or the table owner, in `psql` connected to the Yuzu database:
+
+   ```sql
+   -- sessions (and prepared transactions, pid NULL) holding a lock on device_ci that conflicts
+   -- with the SHARE lock the index build needs. A plain reader (ACCESS SHARE, ROW SHARE) does not
+   -- conflict and is not listed. The query column is the session's latest statement, not
+   -- necessarily the one that took the lock.
+   SELECT l.pid, l.mode, a.usename, a.state, a.xact_start, left(a.query, 80) AS query
+   FROM pg_locks l
+   LEFT JOIN pg_stat_activity a ON a.pid = l.pid
+   WHERE l.relation = 'device_inventory_store.device_ci'::regclass
+     AND l.granted
+     AND l.mode IN ('RowExclusiveLock', 'ShareUpdateExclusiveLock', 'ShareRowExclusiveLock',
+                    'ExclusiveLock', 'AccessExclusiveLock')
+     AND l.pid IS DISTINCT FROM pg_backend_pid()
+   ORDER BY a.xact_start NULLS FIRST;
+
+   -- while a build (or the starting server's migration) is waiting: who blocks it
+   SELECT w.pid AS waiting_pid, left(w.query, 60) AS waiting_query, pg_blocking_pids(w.pid) AS blocked_by
+   FROM pg_stat_activity w
+   WHERE w.datname = current_database() AND w.wait_event_type = 'Lock';
+
+   -- sessions left idle inside a transaction
+   SELECT pid, usename, state, xact_start, left(query, 80) AS query
+   FROM pg_stat_activity
+   WHERE datname = current_database()
+     AND state IN ('idle in transaction', 'idle in transaction (aborted)')
+   ORDER BY xact_start;
+
+   -- prepared transactions (they hold their locks across restarts until committed or rolled back)
+   SELECT gid, owner, prepared FROM pg_prepared_xacts WHERE database = current_database();
+   ```
+
+   The first query was checked on PostgreSQL 18.4 against sessions holding `ROW EXCLUSIVE`, `ROW SHARE` and `ACCESS SHARE` on the table and a waiting `CREATE INDEX`: it listed only the `ROW EXCLUSIVE` holder, and the second query named the same session as the blocker (the prepared-transaction row was not exercised). End only a session that these queries show as blocking the build. Sessions that merely read the table (a plain `SELECT`, `SELECT ... FOR UPDATE` or reporting query) are compatible with the build: do not terminate them, and an unrelated idle-in-transaction session in the same database is not the cause either: leave it alone. End a blocker with `SELECT pg_terminate_backend(<pid>);` (its transaction rolls back) and an abandoned prepared transaction with `ROLLBACK PREPARED '<gid>';`. A live ingest transaction on a replica that is still running should be allowed to finish: stop that replica instead.
+2. In one `psql` session, as the table owner, bound the wait and then build: `SET lock_timeout = '30s';` and then `CREATE INDEX IF NOT EXISTS device_ci_agent_id_c_idx ON device_inventory_store.device_ci ((agent_id COLLATE "C"));`. For a very large table use `CREATE INDEX CONCURRENTLY IF NOT EXISTS ...` with the same name and expression instead (one statement, outside a transaction block; see the INVALID-index check above).
+3. Restart the server. The migration finds the index and does nothing; the start logs `PgMigrationRunner: device_inventory_store migrated to v4` once.
+
+The role that runs the server's migrations must own `device_ci`, exactly as it did for the earlier device CI migrations.
+
+*A development or UAT database that applied an earlier build of this change.* An earlier build of this branch applied a different text of v4 (the same `CREATE INDEX`, without the lock-wait settings), so a database it migrated records a different hash for v4 and the server refuses to start with `PgMigrationRunner: store 'device_inventory_store' recorded migration v4 with SHA-256 ...` (see "a Postgres store refuses to open when its recorded migration differs from this build"). For pre-release builds only, and only after you have checked that the index exists with the byte-ordered definition (`SELECT pg_get_indexdef('device_inventory_store.device_ci_agent_id_c_idx'::regclass);` shows `COLLATE "C"` on `agent_id`), the narrow recovery is: back up the database, stop every replica, and delete that one record, `DELETE FROM public.yuzu_schema_migrations WHERE store = 'device_inventory_store' AND version = 4;`. The next start finds `device_inventory_store` at v4 with no recorded hash for it, records this build's text as first seen (`recorded_by = 'tofu'`) and opens the store. That start logs `had 1 applied migration(s) with no recorded hash; recorded this build's text as first seen (trust on first use)`, not `migrated to v4`, because no migration runs. This is safe here because the only difference between the two texts is the lock settings; the index the earlier text created is the one this build expects. Do not use it for any other version or store. The alternative is the generic reset under "a Postgres store refuses to open when its recorded migration differs from this build" further down this page, which drops the store's data.
+
+*Verify it.* The start logs `PgMigrationRunner: device_inventory_store migrated to v4` once. To check the index afterwards, run `SELECT indexname FROM pg_indexes WHERE schemaname='device_inventory_store' AND indexname='device_ci_agent_id_c_idx'`; it returns one row. A database restored from a backup, or an index dropped by hand, is not rebuilt by the migration, which only runs once. At every start the server checks that the index exists with the byte-ordered definition and, if not, logs a WARN naming the `CREATE INDEX` statement above. The walk stays correct without the index, but each page then reads the whole table and sorts it (about 317 ms per page at one million devices, and a busy pool under concurrent walks), so create it.
+
+*Rollback.* Returning to an earlier build is not a supported path (see "Deployment contract (hard cutover)" in the Forensics section of this page). If it is attempted, an older build run against a database already at `device_inventory_store` v4 applies nothing, logs the schema-ahead warning (see "When a server build finds its database ahead of it (every Postgres store)") and keeps running on a schema it was not written for. The index is harmless to it and can stay; remove it with `DROP INDEX device_inventory_store.device_ci_agent_id_c_idx` if you want the disk back (set `lock_timeout = '30s'` first in the same session: the statement takes an `ACCESS EXCLUSIVE` lock on `device_ci`).
 
 ## ⚠️ Breaking: result sets that are pending, failed or incomplete are refused where they could be misread
 
@@ -274,6 +405,20 @@ This describes the build in a fresh deployment (see "Deployment contract (hard c
 
 **Rollback.** The check writes no state. A return to an earlier build removes the check, the gauges, the counter and the input of the three alerts; the rules in `docs/prometheus/yuzu-alerts.yml` then have no series to read (the mismatch rule stays silent, and `YuzuPgCollationCheckBlind` and `YuzuPgCollationCheckStale` see no series), and nothing in the database needs to be undone.
 
+## Behaviour change: Guardian baseline-persistence heartbeat tags, fleet gauges and alert (#5605)
+
+**What changed.** Additive; nothing is renamed or removed, and no action is needed to keep a deployment working. Agents add two heartbeat tags, `yuzu.guardian_baseline_unpersisted` and `yuzu.guardian_baseline_rebaselined_at_boot`, beside the existing `yuzu.guardian_baseline_persist_failures`. The server rolls the three up into `yuzu_fleet_guardian_baseline_unpersisted`, `yuzu_fleet_guardian_baseline_rebaselined_at_boot` and `yuzu_fleet_guardian_baseline_persist_failures`, plus the coverage gauge `yuzu_fleet_guardian_baseline_reporting` and `yuzu_fleet_guardian_baseline_tag_rejected` (reference: [metrics.md](metrics.md), "Guardian baseline-persistence fleet gauges"), and `docs/prometheus/yuzu-alerts.yml` gains the warning alert `YuzuGuardianBaselineUnpersisted` (group `yuzu-fleet-spark-rung1`). **To get the alert, load `docs/prometheus/yuzu-alerts.yml` into your Prometheus and route `severity=warning` in Alertmanager; no compose or Helm file the project ships does either.**
+
+**Upgrade order.** Agents and servers upgrade in either order: an old agent contributes nothing, and an old server ignores the new tags. With several server replicas, only an upgraded replica publishes these gauges, so during a rolling server upgrade the summed fleet figure under-counts until every replica is upgraded; `yuzu_fleet_guardian_baseline_reporting` (also summed across replicas) shows how many agents are being counted.
+
+**What you will see on a released fleet.** `yuzu_fleet_guardian_baseline_unpersisted` and `yuzu_fleet_guardian_baseline_persist_failures` are absent and `yuzu_fleet_guardian_baseline_reporting` reads `0`, because the Spark path that stages the captures is not enabled in any released agent (`prefer_spark` is off); the alert is dormant until it is. Zero is not absent, and a quiet graph says nothing about baselines while `_reporting` is `0`.
+
+**The exception: `yuzu_fleet_guardian_baseline_rebaselined_at_boot`.** This gauge is live on every upgraded agent, on both detection backends. It ramps up as agents upgrade and restart, and it is monitor-only: never alert on it. On Linux and macOS no file-hash guard arms, so it is non-zero at every boot for every agent that holds an enabled `file-hash-equals` rule with no authored `expected_hash`; meaningful readings come from Windows agents only. The gauge is an unlabelled fleet sum, so the Linux and macOS noise cannot be separated from Windows readings by an os label today. See "Fleet monitoring of baseline persistence" in [guaranteed-state.md](guaranteed-state.md#fleet-monitoring-of-baseline-persistence).
+
+**What it does not cover.** A persist failure on the legacy detection path is still only an agent log line. The alert's threshold and window are not tuned against fleet data.
+
+**Rollback.** The agent keeps the new counts in memory only and the server recomputes the gauges at every sweep, so nothing needs to be undone: a return to an earlier build removes the tags, the gauges and the alert's input.
+
 ## Behaviour change: the webhook and offload drop counters carry a `reason` label, and delivery backlog is published
 
 `yuzu_server_webhook_delivery_dropped_total` and `yuzu_server_offload_delivery_dropped_total` now carry a `reason` label with two values, `queue_full` (the store's delivery queue was full) and `quiescing` (the store was shutting down). Both values of both counters are present at `0` from boot. The earlier unlabelled series no longer exists.
@@ -319,7 +464,7 @@ This describes the build in a fresh deployment (see "Deployment contract (hard c
 
 ## Behaviour change: a Postgres store refuses to open when its recorded migration differs from this build (the server stops, except for three stores)
 
-**Scope of this note.** A supported deployment starts from a fresh database (see "Deployment contract (hard cutover)" in the Forensics section of this page) and is not affected: the refusal can only happen after a migration's text is edited following the point where a database applied it. It matters to a development or UAT database that applied an earlier build of an unreleased migration. It is not a procedure for any other database: if a production database reaches this refusal, stop and do not run the statements below. Keep the log line (it names the store and the version). A build that refuses a production database it did not itself write is a defect in that build, because a supported deployment never holds a record written from different text: keep the build that matches the database in service, report the log line, and expect a corrected build. Do not change the database. A backup taken by the build that wrote the drifted record reproduces the refusal, and restoring one taken under the refusing build into a fresh deployment is the only other exit. This note does not support editing `public.yuzu_schema_migrations` beyond the two recipes' own `DELETE`s: all of one store's rows in the reset recipe, and one version row whose recorded hash is malformed in the not-lowercase-hex recipe. A golden-hash test that would stop shipped migration text being edited at the source is planned (#3895) and is not in the tree yet.
+**Scope of this note.** A supported deployment starts from a fresh database (see "Deployment contract (hard cutover)" in the Forensics section of this page) and is not affected: the refusal can only happen after a migration's text is edited following the point where a database applied it. It matters to a development or UAT database that applied an earlier build of an unreleased migration. It is not a procedure for any other database: if a production database reaches this refusal, stop and do not run the statements below. Keep the log line (it names the store and the version). A build that refuses a production database it did not itself write is a defect in that build, because a supported deployment never holds a record written from different text: keep the build that matches the database in service, report the log line, and expect a corrected build. Do not change the database. A backup taken by the build that wrote the drifted record reproduces the refusal, and restoring one taken under the refusing build into a fresh deployment is the only other exit. This note does not support editing `public.yuzu_schema_migrations` beyond the two recipes' own `DELETE`s: all of one store's rows in the reset recipe, and one version row whose recorded hash is malformed in the not-lowercase-hex recipe (the one other exception is the `device_inventory_store` v4 record named in "Behaviour change: the bulk device-CI read `GET /api/v1/hardware-ci` and a new index on `device_ci`", for a pre-release database only). A golden-hash test that would stop shipped migration text being edited at the source is planned (#3895) and is not in the tree yet.
 
 **What changed.** The migration runner now records the SHA-256 of each migration it applies in `public.yuzu_schema_migrations` (the name is Yuzu-specific because the `public` schema is shared with whatever else lives in the database), and on every start compares it with this build's text for each version the database has already recorded, including on a database that is ahead of this build (a return to an earlier build is outside the supported contract, see "Deployment contract (hard cutover)"; this describes what the check does if it is attempted, and is not a handled case). A difference means the database applied different SQL from what this build expects, so the store does not open. For every store except three, a store that does not open stops the server from starting. The three exceptions boot anyway: `analytics_event_store` (analytics collection is degraded for the run), `crypto_dashboard_layout_store` (the `/crypto` layout routes answer 503 and the dashboard draws the default layout) and `leader_elector` (the server runs with its leader-only background loops paused and `/readyz` stays green, because a replica that cannot lead is a ready follower). The elector re-runs the check on every election cycle and meets the same refusal each time, so it does not recover until the database is repaired; the `[HA] leader_elector could not open its coordination connection` error line says so (a transient connect failure is retried every election cycle, a recorded-migration refusal persists until the database is repaired). **How to tell on those three:** search the log for `PgMigrationRunner: store '<store>' recorded migration`. For `leader_elector` only, also watch `yuzu_server_leader_is_leader` stay at 0 and `yuzu_server_leader_acquire_failures_total{cause="connect"}` rise (the `YuzuLeaderNoLeader` alert). For `analytics_event_store` and `crypto_dashboard_layout_store` there is no metric and no alert: `/readyz` names the store in its non-gating `"degraded"` array (the node stays ready and in rotation), and the log line and the visible symptom (analytics not collected; `/crypto` layouts answering 503 with the default layout drawn) are the other signals, so a server that looks healthy but logged that line for one of them is running degraded, not fixed. While `leader_elector` is refused it retries and logs again every election cycle (a backoff of 2, 4, 8, 16 and then 30 seconds, plus up to 3 seconds of jitter), so the error repeats about every 30 seconds until the database is repaired. The log shows `PgMigrationRunner: store '<store>' recorded migration v<N> with SHA-256 <hash>... but this build's v<N> hashes to <hash>...` (each `<hash>` is the first 12 characters of the SHA-256, to compare against `SELECT sha256 FROM public.yuzu_schema_migrations`), followed by the store's own refusal line. Before this change the store opened and failed at the first query that touched a missing column. A database that predates this change has no recorded hashes: each applied version is recorded as the build's current text on first start (`recorded_by = 'tofu'`), so drift that already exists in such a database is not detected. The same holds for versions applied by a build that predates the hash table, including when that build wins a concurrent first boot: they are recorded as this build's text on first sight, without comparison. That is the trust-on-first-use, one-build-lineage limit, not a further gap. This detects accidental or procedural drift, not tampering by someone who can write to the database. A recorded hash that is not 64 lowercase hex digits is refused with its own message (`the recorded hash of v<N> for <store> is not a lowercase SHA-256 (the record was edited or damaged)`). Only for that message, and only after you have backed up the database and stopped every replica that shares the database (a replica whose elector is not open reconnects every election cycle, and each reconnect re-runs the runner against the same rows), the fix is to delete that single row (`DELETE FROM public.yuzu_schema_migrations WHERE store = '<store>' AND version = <N>;`), which the next start records again as `tofu`, so do not drop the store's schema for it. Do not use this for a row whose hash is well formed but differs from this build's: that is real drift (the drift message above), and deleting the row would make the next start record this build's text over a schema built from different text, hiding the condition this check exists to report. After the delete, drift for that one version can no longer be detected (the trust-on-first-use limit). A malformed row also says nothing about whether it matched before it was damaged: its `recorded_at`, and whether the store was created after the table existed, are the only hints. Success is the store opening on the next start and the refusal line stopping; for `leader_elector`, `yuzu_server_leader_is_leader` returns to 1 within roughly one backoff period (about 30 seconds) of the start, once the replica acquires leadership. Drift is typically reported one store per start (later stores are skipped once one refuses, and the leader elector re-checks on every reconnect, so a record edited while the server runs shows up as `elector non-open`): after you reset one store, another may refuse on the next start. There is no override.
 
@@ -395,7 +540,7 @@ This describes the build in a fresh deployment (see "Deployment contract (hard c
 
 **What to do.** Keep the connector's retry enabled, and configure it to retry a `500`: this case answers `500`, not `503` with `Retry-After` (tracked separately). There is no break-glass: while the session store is degraded a deprovision cannot complete. Wait for PostgreSQL to recover, then re-run the deprovision (the IdP's own retry, or the dashboard delete again). The `YuzuSessionStoreDegraded` alert needs the session-store degrade counter to rise for a full 10 minutes, so a short outage may never fire it; search the audit log for `partial` results on the four actions above (see the SCIM guide, "SCIM failure-mode matrix", and the [runbook](../ops-runbooks/auth-db-recovery.md#scim--dashboard-deprovision-returns-500-sessions_db_error)). Some identity providers pause or quarantine the provisioning app after repeated 5xx responses (Microsoft Entra does); after the store recovers, confirm the provisioning job is running and re-trigger a sync.
 
-**If the session wipe after the deactivation itself fails.** The account is deactivated and the durable session row survives, but a session whose local account is inactive or deleted is now rejected at validation, on every replica, once every replica runs this build (a replica on an earlier build keeps the earlier behaviour; mixed-version operation is outside the deployment contract, see "Deployment contract (hard cutover)" further down this page). A deactivation also advances the durable session generation in the same transaction, so a replica's session cache is cleared on its next poll: about one second on a healthy generation poll, at most about 30 seconds while a replica's poll fails. The deactivation fails as a store error (the account stays active, `503` on the SCIM and dashboard routes) when that generation write cannot complete. The surviving row is removed when the account is reactivated, which now deletes the account's sessions first and fails, leaving the account inactive, when that delete does not persist (SCIM answers `500`). A sign-in after the reactivation is a new sign-in, with one residual: a login whose first factor was verified before the deactivation can still complete after the reactivation, because the post-mint recheck compares only role, credential hash and active state. A SCIM retry of an already-deactivated resource does not re-run the wipe (it meets the role guard's `404` first, [#5214](https://github.com/Tr3kkR/Yuzu/issues/5214)); the dashboard `DELETE` path does re-run it; and `DELETE /api/v1/sessions?username=<name>` removes the row in either case. OIDC and SAML sessions are not checked against an account row (the linked-identity revoke of the deprovision ends them), and API-token sessions are unchanged.
+**If the session wipe after the deactivation itself fails.** The account is deactivated and the durable session row survives, but a session whose local account is inactive or deleted is now rejected at validation, on every replica, once every replica runs this build (a replica on an earlier build keeps the earlier behaviour; mixed-version operation is outside the deployment contract, see "Deployment contract (hard cutover)" further down this page). A deactivation also advances the durable session generation in the same transaction, so a replica's session cache is cleared on its next poll: about one second on a healthy generation poll, at most about 30 seconds while a replica's poll fails. The deactivation fails as a store error (the account stays active, `503` on the SCIM and dashboard routes) when that generation write cannot complete. The surviving row is removed when the account is reactivated, which now deletes the account's sessions first and fails, leaving the account inactive, when that delete does not persist (SCIM answers `500`). A sign-in after the reactivation is a new sign-in, with one residual: a login that carries no bound MFA proof, whose first factor was verified before the deactivation, can still complete after the reactivation, because the post-mint recheck compares the role, credential hash and active state, and for a login whose bound MFA proof was earned before the deactivation also the factor generation, which a deactivation changes. A SCIM retry of an already-deactivated resource does not re-run the wipe (it meets the role guard's `404` first, [#5214](https://github.com/Tr3kkR/Yuzu/issues/5214)); the dashboard `DELETE` path does re-run it; and `DELETE /api/v1/sessions?username=<name>` removes the row in either case. OIDC and SAML sessions are not checked against an account row (the linked-identity revoke of the deprovision ends them), and API-token sessions are unchanged.
 
 **Rollback.** Returning to an earlier build is not supported (see "Deployment contract (hard cutover)" further down this page). If it happens regardless, note that rows this build only refuses, the durable sessions of deactivated local accounts, become servable again on an earlier build until they expire. Before returning, run the lingering-sessions query in the [runbook](../ops-runbooks/auth-db-recovery.md#sessions-of-deactivated-accounts) and end those users' sessions with `DELETE /api/v1/sessions?username=<name>`.
 
@@ -715,7 +860,7 @@ All six `site` series of `yuzu_secure_random_failure_total` (the four token site
 
 **What changed.** ADR-0033 §9 ("no audit row, no mutation") now holds for four mutations served by the dashboard routes: every console command send (`POST /api/dashboard/execute`, whatever its target, read-only instructions included), creating a management group from results (`POST /api/dashboard/group-from-results`), and Echo **Re-enable** and **Purge data** on the retention-paused list. Each writes an `attempted` audit row after its own checks and before it acts. When that row cannot be stored (the audit store is down, the pool cannot lease a connection in time, or the insert fails) the request is answered `503` with `Sec-Audit-Failed: true` and **nothing is sent, created or purged**; before, these actions went ahead with no audit row. The refusal is shown on the console's result line, as a toast on the Create Group form and as a toast on the Echo page. Every other audit row these routes write themselves (refusals, scope narrowing, outcomes, Echo SQL and status-scan sends) keeps the request's own answer but now carries `Sec-Audit-Failed: true` when the row is not stored. The permission-denial row (`auth.permission_required` / `denied`) is not one of them: the shared permission gate writes it, and when it is not stored the refusal is still a plain `403` without the header (tracked in #7096). Because the `attempted` write can wait on the audit store, each of the four decides its own permission again after it (`Execution:Execute` for console sends and Echo re-enable, `ManagementGroup:Write` for Create Group, `Infrastructure:Delete` for Echo purge), and a grant withdrawn meanwhile sends, creates or purges nothing (`failure` / `permission_revoked`, answered by the permission gate). Create Group from results also re-checks the session and visibility (`session_revoked`, `scope_revoked`). The REST twins that write their audit row first (`POST /api/v1/commands`, the instruction-execute twins and `POST /api/v1/echo/retention-paused/purge`) decide their permission again after that row too (#7110; the entry above). Each console send now writes an `attempted` row and then, normally, its outcome row (a dispatch that fails unexpectedly can leave the `attempted` row alone), and a send that reaches no agent now writes a `failure` row too.
 
-Not covered by this change, among others: `POST /api/command`, MCP `execute_instruction`, the legacy command forwarder, management-group creation through REST, MCP and Settings still act first and audit afterwards, so during an audit outage they proceed. They are tracked in #7073 (`POST /api/command`, MCP `execute_instruction` and the legacy forwarder) and #7074 (management-group creation). The Echo **Capture sources** push is covered too: see the section on the Capture sources push above. `POST /api/v1/commands`, the instruction-execute twins and `POST /api/v1/echo/retention-paused/purge` already refused before this change (they write `requested`, not `attempted`).
+Not covered by this change, among others: `POST /api/command`, MCP `execute_instruction` and the legacy command forwarder still act first and audit afterwards, so during an audit outage they proceed. They are tracked in #7073. Management-group creation through REST, MCP and Settings was on this list and is now audit-first: see the entry on management-group create and member writes (#7074). The Echo **Capture sources** push is covered too: see the section on the Capture sources push above. `POST /api/v1/commands`, the instruction-execute twins and `POST /api/v1/echo/retention-paused/purge` already refused before this change (they write `requested`, not `attempted`).
 
 **Who is affected.** Operators who use the dashboard console, Create Group from results, or the Echo retention-paused actions during an audit-store outage: those actions now stop instead of running unaudited. SIEM rules on `command.dispatch`, `group.create_from_results`, `echo.source.reenable` or `echo.source.purge` now also see `result=attempted` rows, and a "failures only" filter of `result != "success"` matches them; key on the outcome row (see [`audit-log.md`](audit-log.md), Result vocabulary). Dashboards or rules on `yuzu_echo_source_reenable_total` or `yuzu_echo_source_purge_total` see a new `result="audit_unavailable"` value, so a `result!="success"` selector now counts these refusals too.
 
@@ -727,7 +872,7 @@ Not covered by this change, among others: `POST /api/command`, MCP `execute_inst
 
 **Who is affected.** SIEM rules that match `user.role_change` with result `denied` or detail `user_not_found` and were (unknowingly) counting outages; scripts that treat a `404` from the role route as permanent; IdP connectors that treated the old `200` as success.
 
-**What to do.** Retry on `503`. Add `store_unavailable` to any `failure` rule on these actions. See the SCIM guide, "When the user store cannot answer a deactivation", for what the SCIM change does not cover. The `404` that a store error in the provenance or role read could still produce when deactivating a resource whose mirror reads active was closed afterwards (#6836, next entry).
+**What to do.** Retry on `503`. Add `store_unavailable` to any `failure` rule on these actions. The one `503` not to retry is the sticky one an enrolled administrator can get on the role route when the account reads factor generation `0` (only a database an earlier build wrote holds one, which is unsupported): its error envelope has `retry_after_ms: null` (a transient step-up 503 has `5000`; neither sets a `Retry-After` header), it is audited as `mfa.step_up.required` (not `user.role_change`) with `reason=mfa_proof_unavailable`, and clears only after `yuzu-server --mfa-reset <user>` (see "Breaking: MFA proofs are bound to the factor they were earned with" below). See the SCIM guide, "When the user store cannot answer a deactivation", for what the SCIM change does not cover. The `404` that a store error in the provenance or role read could still produce when deactivating a resource whose mirror reads active was closed afterwards (#6836, next entry).
 
 ## ⚠️ Breaking: a user-store fault in a SCIM provenance or role check is now a retryable 503, not a 404 (#6836)
 
@@ -1426,7 +1571,8 @@ human roles first and follow the prerequisites in [Role-Based Access Control](rb
 A fresh MFA proof is required on 41 named high-risk routes (the list is in
 [REST API](rest-api.md#step-up-envelope-on-high-risk-endpoints), which also names the three
 JIT-elevation routes) for MFA-enrolled local accounts and OIDC sessions per `--mfa-enforcement`;
-un-enrolled accounts and API-token and MCP-token callers pass, and engine principals are denied.
+un-enrolled accounts and API-token and MCP-token callers pass (except on the two Settings MFA
+routes named below, which accept only a local session), and engine principals are denied.
 "High-risk" names these routes; it is not a claim that every high-risk operation is covered. Other
 mutating routes and all MCP tools are not MFA-step-up gated in this release. The check on those 41
 routes now runs in one place, in the server's request pipeline, instead of inside each handler,
@@ -1443,7 +1589,14 @@ three JIT-elevation routes keep their own handler gate. What an operator or scri
   only, because enrolment confirmation records a fresh proof for that session (the audit row
   `mfa.enroll.verified` says `step_up_proof=stamped`, or `step_up_proof=not_stamped` when the
   session could not be stamped: a bearer principal, an absent or mismatched cookie, or a store
-  failure). An account with no MFA enrolled is not affected.
+  failure). An account with no MFA enrolled is not affected. These two routes are stricter than the
+  rest (#6079): they use the approver window, `min(--mfa-step-up-window-secs, 300)` and 300 when
+  that setting is `0` or less, so `--mfa-step-up-window-secs=0` does not switch them off; only a
+  signed-in local session can use them (an API token, an SSO identity or an engine principal is
+  refused `403`; neither route has a REST v1 or MCP twin, so no documented automation is affected);
+  and a request whose account factor changed after the step-up check admitted it is refused `409`
+  with nothing written. See "Breaking: MFA proofs are bound to the factor they were earned
+  with" below.
 - **What is newly gated, measured against the last release (v0.14.1).** Only the two Settings MFA
   routes above are gated for the first time by this change. Of the other 39, 25 already called the
   step-up check from their handlers in v0.14.1. The remaining fourteen were gated in their handlers
@@ -1508,16 +1661,16 @@ three JIT-elevation routes keep their own handler gate. What an operator or scri
   factor cannot be decrypted, answers `503` to local (password) sessions only, since those are the
   only sessions whose enrollment is read from the store; API-token and MCP-token callers pass
   before any store read, and OIDC sessions are judged on the identity provider's assertion. The
-  `503` still carries `meta.mfa_step_up_required: true`, with no `challenge_url`, and writes an
+  `503` still carries `meta.mfa_step_up_required: true` (the binding refusals that carry a `reason` carry `false`; see the MFA factor-binding cutover section below), with no `challenge_url`, and writes an
   `mfa.step_up.required` audit row whose `detail` names the cause (an unexpected failure inside the
   check itself, or a session that could not be fingerprinted, is recorded as
-  `reason=chokepoint_exception`). Retry; re-proving cannot help. A client
-  must treat a `503` as "retry shortly" and prompt for a code only on a `401`. See the
+  `reason=chokepoint_exception`). Re-proving cannot help. A client
+  must treat a `503` as "retry shortly" only while `error.retry_after_ms` is a number (`5000`), stop on `null`, and prompt for a code only on a `401`. See the
   [recovery runbook](../ops-runbooks/auth-db-recovery.md#step-up-returns-503-while-the-authentication-store-is-unavailable).
   The new alert `YuzuStepUpGateUnavailable` fires on it.
 - **SAML sessions cannot satisfy step-up in this release.** They receive `403` on all 41 routes (reason
   `saml_session_no_mfa_this_release`, see #4935), unless `--mfa-step-up-window-secs` is `0` or less:
-  the disabled window is checked before the SAML refusal, so SAML sessions then pass all 41. A
+  the disabled window is checked before the SAML refusal, so SAML sessions then pass the 39 ordinary routes (the two Settings MFA routes ignore the setting and refuse every non-local session). A
   deployment whose only interactive sign-in is SAML has no session route to any of them. The
   refusal's remediation says SAML sessions cannot satisfy step-up in this release (re-authenticating
   does not help) and to use an existing untiered, unscoped API token where the route accepts one, or
@@ -1548,8 +1701,10 @@ three JIT-elevation routes keep their own handler gate. What an operator or scri
   rolling deployment halts because the new replica never becomes ready. **This can only happen on a
   fork or a custom build:** every stock build is checked by compiled and source-scan tests before it
   ships, so a release binary never trips it. The fix is a row in `step_up_policy.hpp` and a rebuild,
-  never a flag. To recover a deployment in the meantime, roll back to the previous binary or image;
-  nothing is migrated, so a rollback needs no data step.
+  never a flag. Rolling back to the previous binary or
+  image is not supported on this build (see the [hard-cutover section](#breaking-mfa-proofs-are-bound-to-the-factor-they-were-earned-with-hard-cutover-with-no-upgrade-path-or-rollback-6079)):
+  the authentication and session stores are opened before this check, so the `auth` v3 and `session_store` v3
+  migrations have already run.
 - **How a refusal appears in the dashboard.** A refused htmx request (on a dashboard route or an
   `/api/v1/` route, such as Settings > Users "Revoke sessions") now carries an `HX-Trigger` error
   toast, so the button no longer appears to do nothing; MCP never gets one. The Guardian page's
@@ -1578,12 +1733,128 @@ v0.14.1, six existing routes that needed no fresh proof now need one inside the 
 Settings MFA routes (gated by this change) and the four existing routes listed under "What is newly gated"
 above (gated earlier in this release cycle). The ten routes that are new in this release need one too.
 `--mfa-step-up-window-secs 0` (or less) disables
-the stale-proof requirement on the 41 routes and still logs a startup `WARN`. While it is in
+the stale-proof requirement on the 39 ordinary routes (not on the two Settings MFA routes, which use a window of at most 300 s) and still logs a startup `WARN`. While it is in
 force no stale proof is refused (so none is recorded), and the SAML refusal and the
 authentication-store read are skipped too, so SAML sessions also pass; engine denials and
 unwired-store refusals still apply and are still recorded. The JIT-elevation routes keep a 300 s window (the global
 window when it is positive, else 300 s). The new alert `YuzuStepUpWindowDisabled` fires while the
 window is 0 or less. This release has no supported return to v0.14.1 (see "Deployment contract (hard cutover)"). v0.14.1 does not gate the two Settings routes or the four existing routes listed under "What is newly gated" above in their handlers, and it does not have the ten routes that are new in this release. A server whose `/metrics` lacks `yuzu_auth_mfa_step_up_gate_total` and `yuzu_auth_mfa_step_up_window_seconds` has no step-up gate on these routes at all, and `YuzuStepUpGateUnavailable` and `YuzuStepUpWindowDisabled` cannot fire there: their silence is not evidence that the gate is on.
+
+## Breaking: MFA proofs are bound to the factor they were earned with; hard cutover with no upgrade path or rollback (#6079)
+
+**This build is a hard cutover.** It supports initial deployment into a fresh database only (see "Deployment
+contract (hard cutover)" under the Forensics-tier note below). It has no upgrade path, no rolling or mixed-version
+window (mixed-version operation is unsupported) and no rollback of its migrations. A database or backup written by an
+earlier build is outside the supported population, and the executable does not check which build wrote the database it
+opens. Recovery means rolling forward on this build, or restoring this build's own backups into a fresh deployment.
+
+The `auth` v3 migration seeds nothing and starts every existing row at factor generation `0`; the trigger
+assigns a value only from the next enrolment change. So an enrolled account that reads generation `0` (only a
+database written by an earlier build holds one) is refused `503` (audit `reason=mfa_proof_unavailable`; sticky:
+`retry_after_ms` is `null`) on the 41 step-up routes (the 39
+ordinary rows, approve and reject among them, and the 2 factor-credential routes) and on the 3 JIT-elevation
+routes (they probe the same factor state), and stays refused until `yuzu-server --mfa-reset <user>` clears its
+factor. The central check on the 39 ordinary rows refuses only while `--mfa-step-up-window-secs` is above 0 (at 0 it
+passes them without reading the store); approve and reject are two of those 39 but also run the approver rule in their
+own handler, which refuses regardless of the setting, as do the 2 factor-credential routes and the elevation routes. Settings self-disable and recovery-code regeneration are
+two of those routes, so such an account cannot use them to recover. An administrator API token passes the 39
+ordinary rows at the central check (issuing it was the step-up moment), but is refused `403` on the 2
+factor-credential routes and cannot approve or reject; and an administrator at generation `0` cannot mint one while
+the window is above 0, because creating a token is itself an ordinary step-up row.
+
+**Rigs that ran an earlier build of this change.** A development or UAT database that ran an earlier iteration of this branch can already record `auth` 3 and `session_store` 3 with an older trigger body. The version number is the same, so the migration is skipped, and the server refuses to start because the boot check pins the trigger function body byte for byte. Recreate such a database. The trigger repair in the auth-store recovery runbook can restore the trigger bodies, but it does not account for any other difference an earlier iteration left, so it is not a supported way to carry a development database across.
+
+**Not affected.** Accounts that are not enrolled are not refused by the binding (nothing is seeded for them). API-token
+and MCP-token callers pass the 39 ordinary rows as before, and a reset does not touch API tokens (the 2 factor-credential
+routes and approval refuse them, as described above). OIDC sessions are judged on their
+identity-provider assertion, not on the local factor generation, and the session store's rebind guard does not apply to
+them. Endpoint agents and gateways are unchanged.
+
+**If an enrolled account reads generation `0`.** Such an account can exist only in a database that an earlier build
+wrote, which this build does not support: the supported remedy is a fresh deployment. The server does not repair it
+for you, and it refuses the account on the routes above until `yuzu-server --mfa-reset <user>` clears its factor (a
+host-shell command; see [the `--mfa-reset` CLI](../ops-runbooks/auth-db-recovery.md) in the auth store recovery
+runbook). That command clears the factor and ends the account's sessions; it is not a way to carry a database across
+builds. To list the accounts in this state:
+
+```sql
+SELECT username FROM auth.users WHERE is_active AND mfa_enrolled_at IS NOT NULL AND mfa_factor_gen <= 0;
+```
+
+A non-administrator cannot enrol again by itself under `--mfa-enforcement=optional` or `admin-only` (the Settings
+enrolment routes need the administrator role), so after a reset such an account stays refused on approvals and JIT
+elevation until an administrator enrols it
+([Enrolling a non-admin approver](../ops-runbooks/auth-db-recovery.md#enrolling-a-non-admin-approver)). Under
+`--auth-mode=sso-only`, read the runbook's "Break-glass arm (IdP outage under `--auth-mode=sso-only`)" before you
+reset the break-glass account: the next start under `sso-only` refuses to boot until it carries a second factor
+again.
+
+**What changed.** A step-up proof of a local, MFA-enrolled account now counts only for the factor
+that was enrolled when the code was verified. The central step-up check (the 39 ordinary rows), JIT
+elevation and approve and reject all compare a generation stored with the session's proof against the
+account's current one, so disabling MFA and enrolling again, or an administrator clearing the factor
+with `yuzu-server --mfa-reset`, makes every earlier proof stop counting. The generic check also holds a
+local proof to the window on the database clock, to the millisecond, as well as on the server's own
+clock. Two schema migrations run at the first start: `auth` v3 adds `users.mfa_factor_gen` (every row
+starts at `0`) and a trigger that assigns it a fresh random value on every enrolment change, and `session_store` v3 adds two columns and a trigger that
+unbinds a proof written without a generation. Both triggers are checked at every start: a server whose
+database does not have them in force refuses to start (the log says `Failed to open the Postgres auth
+store (migration or MFA trigger check failed; see the preceding AuthDB log line)` or `session store
+migration/open failed`). Only the two host-CLI one-shots `yuzu-server --mfa-reset` and
+`--break-glass-arm` open their bootstrap `AuthDB` past a missing or altered binding trigger (with a loud
+`WARN`; see [MFA binding enforcement failed](../ops-runbooks/auth-db-recovery.md#mfa-binding-enforcement-failed));
+serving and every other mode, `--generate-tokens` for example, refuse to start; `--mfa-reset` also opens
+the session store it uses to end the account's sessions the same way.
+
+**What you will see.**
+
+- **An enrolled operator gets `503` where they used to be asked for a code.** On the step-up routes and JIT
+  elevation, the dashboard shows a toast and a REST caller gets `503` with the message "this account's
+  second-factor state cannot be verified; if it persists, ask an administrator to follow the MFA binding enforcement runbook" (`mfa_step_up_required: false`, a remediation that names the MFA binding enforcement
+  runbook, and `retry_after_ms`: `5000` when a retry may clear it, `null` when there is no retry hint: see below); the `mfa.step_up.required` audit row carries
+  `reason=mfa_proof_unavailable` and `yuzu_auth_secret_unavailable_total{route="mfa_binding"}` rises. Approve and
+  reject answer that central message only while `--mfa-step-up-window-secs` is above 0; at 0 the approver rule
+  answers with its own message, "the approver's MFA binding cannot be verified, so the decision was not recorded"
+  (or "the approver's MFA state could not be read, so the decision was not recorded", with a retry hint, when the
+  cause is transient), and an `approver_assurance:mfa_store_unavailable` audit row. The message does not say
+  whether the cause is permanent; the REST envelope of the central check carries `retry_after_ms`: `5000` for a
+  failed read (a retry may clear it), `null` when there is no hint (a refusal only an administrator repairs, or one this
+  gate cannot tell from a transient one). The MCP rendering is implemented and tested, but no MCP tool is step-up gated
+  yet. A client that retries on `503` must stop on `null`. It is persistent for an enrolled account whose factor generation is not positive (only a database an earlier build
+  wrote holds one, which is unsupported; the query under "If an enrolled account reads generation `0`" above lists it; an administrator then runs
+  `yuzu-server --mfa-reset <user>` on the host, after checking that the account reads `mfa_factor_gen <= 0`, see the
+  runbook) and for a binding trigger that is not in force (`reason=mfa_binding_unenforced` for the account store;
+  restore the auth store's MFA binding triggers and restart the server; this gate cannot tell a trigger seen not in force from a validation that could not run, so it answers `null` for both, and the cause may still clear by itself). It is transient for a failed read, an inconclusive trigger validation (the `binding_inconclusive` latch,
+  which clears on the next valid check) or an unusable database clock reading. The audit `reason=` token and the
+  server log (a warning is logged once per inconclusive episode) tell the causes apart; the
+  `yuzu_auth_mfa_binding_enforcement_ok` gauge shows only the sticky trigger case (it still reads 1 while the
+  latch is set, and only `YuzuStepUpGateUnavailable` fires), and that query shows only generation-0
+  accounts. Retry once; if it persists, follow the runbook and check first: reset only an account that reads
+  `mfa_factor_gen <= 0`, and do not run `--mfa-reset` on the strength of this message alone. A `503` whose message is "authentication store is temporarily unavailable" is
+  the plain transient one.
+- **Clearing a factor is unchanged apart from the generation check.** `yuzu-server --mfa-reset` and Disable in
+  Settings still write an `attempted` intent row first and an outcome row after, clear the factor and the
+  recovery codes in one transaction and end the account's sessions in a separate step (a failed session delete
+  is `result=partial` and `--mfa-reset` then exits non-zero), exactly as described in the `--mfa-reset` notice
+  below. The Settings Disable additionally compares the factor generation the step-up check admitted with the
+  account's current one under the row lock and refuses with `409` (audit `denied`, `reason=factor_changed
+  expected_gen=<n>`) if they differ. `--mfa-reset` opens its bootstrap auth store and the session store it
+  uses to end the sessions without refusing on a missing or altered binding trigger, and prints a `WARN`
+  for each.
+- **Regenerating recovery codes and disabling MFA are local-session-only.** An API token or an SSO
+  session that reached these two Settings routes before now gets `403`, and `--mfa-step-up-window-secs=0`
+  no longer switches their step-up off (they use a window of at most 300 seconds). A request whose factor
+  changed while it was in flight is refused `409`; reload the page and prove again if asked.
+- **New monitoring.** `yuzu_auth_mfa_binding_enforcement_ok{store="auth"|"session"}` should read `1` on
+  every replica once it has started; `0` means a validation observed a trigger not in force, every
+  local binding decision then answers `503` until a restart, and the shipped `YuzuMfaBindingNotEnforced`
+  alert fires. The reason token depends on the store: `mfa_binding_unenforced` for `store="auth"`, but
+  `mfa_proof_unavailable` (plus `yuzu_auth_session_store_degrade_total{op="rebind_guard"}`) for
+  `store="session"`, which SSO sessions do not see; key SIEM rules on both (`mfa_proof_unavailable` is also the
+  answer for an enrolled account whose factor generation is not positive, see
+  [Post-restore verification](../ops-runbooks/auth-db-recovery.md#post-restore-verification)). The alert
+  ships in `docs/prometheus/yuzu-alerts.yml`. The procedure is
+  [MFA binding enforcement failed](../ops-runbooks/auth-db-recovery.md#mfa-binding-enforcement-failed).
 
 ## Behaviour change: /health and /api/health per-source budget
 
@@ -1614,7 +1885,7 @@ window is 0 or less. This release has no supported return to v0.14.1 (see "Deplo
 
 ## ⚠️ Breaking: the OpenAPI document is larger and typed, every operation has an `operationId`, and there is a `/swagger` page
 
-**What changed.** `GET /api/v1/openapi.json` now gives 298 of its 300 operations a success response with a content block (the previous release's document listed 241 operations and did so for 14), and every operation carries an `operationId` (the earlier document had none; the stored-definition execute route is `postInstructionsByIdExecute`). The document also lists 64 operations that the previous release's document did not, among them `GET /config`, `PUT /config/{key}`, `POST /workflows/{id}/execute` (`postWorkflowsByIdExecute`) and `GET`, `PUT` and `DELETE /dex/score-policy`; all 64 are typed. Five operations the previous release's document listed (`GET /tar/capture-sources`, `GET /tar/process-tree`, `GET /tar/retention-paused`, `POST /tar/retention-paused/purge` and `POST /result-sets/from-tar-query`) are no longer listed. The default form of the document, which is also what the MCP resource `yuzu://openapi` serves, grew from about 314 KB (the previous release, v0.14.1) to about 670 KB as served. A second form, `GET /api/v1/openapi.json?guides=true` (the value must be exactly `true` or `1`), adds a prose guide to each of the 48 tag groups. The MCP resource and the discover tools never serve the guide form, short of a build defect. A new dashboard page, `/swagger`, renders the guide form in the browser. Both the route and the page need `Infrastructure:Read`, and the page has no navigation entry. The default form is re-serialised by the server, so its key order and whitespace differ from the guide form. Making the document typed changes the description of the API, not a route, request or response (the routes this release adds and the behaviour it changes are described in their own sections of this document), so the version rule in `docs/api-versioning-policy.md`, which governs routes and fields, does not call for a new version on account of the typing. It is marked Breaking because a generated client, a byte-for-byte pin of the document or a size-limited context stops working as before.
+**What changed.** `GET /api/v1/openapi.json` now gives 301 of its 303 operations a success response with a content block (the previous release's document listed 241 operations and did so for 14), and every operation carries an `operationId` (the earlier document had none; the stored-definition execute route is `postInstructionsByIdExecute`). The document also lists 64 operations that the previous release's document did not, among them `GET /config`, `PUT /config/{key}`, `POST /workflows/{id}/execute` (`postWorkflowsByIdExecute`) and `GET`, `PUT` and `DELETE /dex/score-policy`; all 64 are typed. Five operations the previous release's document listed (`GET /tar/capture-sources`, `GET /tar/process-tree`, `GET /tar/retention-paused`, `POST /tar/retention-paused/purge` and `POST /result-sets/from-tar-query`) are no longer listed. The default form of the document, which is also what the MCP resource `yuzu://openapi` serves, grew from about 314 KB (the previous release, v0.14.1) to about 670 KB as served. A second form, `GET /api/v1/openapi.json?guides=true` (the value must be exactly `true` or `1`), adds a prose guide to each of the 48 tag groups. The MCP resource and the discover tools never serve the guide form, short of a build defect. A new dashboard page, `/swagger`, renders the guide form in the browser. Both the route and the page need `Infrastructure:Read`, and the page has no navigation entry. The default form is re-serialised by the server, so its key order and whitespace differ from the guide form. Making the document typed changes the description of the API, not a route, request or response (the routes this release adds and the behaviour it changes are described in their own sections of this document), so the version rule in `docs/api-versioning-policy.md`, which governs routes and fields, does not call for a new version on account of the typing. It is marked Breaking because a generated client, a byte-for-byte pin of the document or a size-limited context stops working as before.
 
 **Who is affected.** Anyone who generates a client from the document (typed return types, renamed methods and a changed security-scheme model can break generated code), anyone who compares or hash-pins the document byte for byte, and any agentic worker that reads `yuzu://openapi` into its context.
 
@@ -1624,7 +1895,7 @@ window is 0 or less. This release has no supported return to v0.14.1 (see "Deplo
 - **The Echo operations were renamed.** The activity-record routes were renamed from TAR to Echo (`/api/v1/echo/...`), so their `operationId` values changed with them: `getTarCaptureSources`, `getTarProcessTree`, `getTarRetentionPaused`, `postTarRetentionPausedPurge` and `postResultSetsFromTarQuery` are now `getEchoCaptureSources`, `getEchoProcessTree`, `getEchoRetentionPaused`, `postEchoRetentionPausedPurge` and `postResultSetsFromEchoQuery`, and the `Dashboard TAR` tag is `Dashboard Echo`. A generated client needs regenerating.
 - **Byte-for-byte comparisons and hash pins.** The default document is now re-serialised by the server, compact and with its keys in alphabetical order, so it differs from the previous release's bytes almost throughout, not only from the guide form. A snapshot or hash taken from the earlier release must be re-baselined. The response also carries an `ETag` now, which the earlier release did not send.
 - An integration that reads `yuzu://openapi` or `GET /api/v1/openapi.json` into a size-limited context needs about twice the room: the default form grew from about 314 KB to about 670 KB as served before compression, and `?guides=true` is about 980 KB. An agentic worker that wants the routes and not the whole document should call `discover_routes` (or `GET /api/v1/discover/routes`), which returns a projection of the same source (about 192 KB, against about 670 KB for the document): method, path, summary, tags, description and, for an unserved operation, an `unavailable` note. These sizes were measured before later additions, including the #2146 twin operations (among them the nine instruction authoring and instruction set operations), the software normalisation operations and `getRbacEnforcement`, were added; the document is slightly larger with them (an estimate from the added source text is about 3 percent; it was not measured against the served bytes).
-- **Response types.** 229 operations had no success schema (they described the body in prose, and two of them, `GET /ca/root` and `GET /ca/crl`, had a content block with no schema); 227 of them now declare one, and all 59 operations the previous release's document did not list are typed. So a generated client returns model types where it used to return an untyped object. 293 of the 295 operations are typed; the two `DELETE` operations that answer `204` (`DELETE /upload-grants/{grant_id}` and `DELETE /uploads/{upload_id}`) have no body and stay untyped. The models are derived from the handlers, but a client that deserialises strictly will now fail on any place where the document and a handler disagree, which an untyped client never noticed. Report such a mismatch as a defect in the document.
+- **Response types.** 229 operations had no success schema (they described the body in prose, and two of them, `GET /ca/root` and `GET /ca/crl`, had a content block with no schema); 227 of them now declare one, and all 60 operations the previous release's document did not list are typed. So a generated client returns model types where it used to return an untyped object. 294 of the 296 operations are typed; the two `DELETE` operations that answer `204` (`DELETE /upload-grants/{grant_id}` and `DELETE /uploads/{upload_id}`) have no body and stay untyped. The models are derived from the handlers, but a client that deserialises strictly will now fail on any place where the document and a handler disagree, which an untyped client never noticed. Report such a mismatch as a defect in the document.
 - **Security schemes.** The top-level `security` was one requirement that asked for the bearer token, the `X-Yuzu-Token` header and the session cookie together. It is now three alternatives, any one of which authenticates. The `cookieAuth` scheme names the real cookie, `yuzu_session` (it said `session`). `GET /ca/root` and `GET /ca/crl` carry `security: []` because they are public. In builds after 0.15.0 the document marks `POST /elevate`, `POST /elevate/revoke`, `POST /users/me/password` and `POST /users/{username}/password` as accepting the session cookie only (`security: [{cookieAuth}]`), and the five `/uploads` routes name the grant or session header they authenticate with (the new `uploadGrantAuth` and `uploadSessionAuth` schemes), so a generated client no longer sends a bearer token those routes do not accept. An integration that holds only an API token, an MCP token or an engine credential cannot call the four cookie-only routes at all; that was already true, and the document says so from those builds on. A generator or gateway that enforced the old combined requirement, or that copied the cookie name, needs the current document imported again; a gateway that enforced the old top-level requirement would have demanded an operator credential on the agent-authenticated `/uploads` routes.
 - **Operations the server does not serve.** 14 operations in three groups (License Management, Device Tokens and Software Deployment) are in the document but are not registered by the server today, so each carries an `x-yuzu-unavailable` note. A client generated from the document has a method for each of them, and calling one fails because the route does not exist. Skip them, or filter on the marker before generating.
 - **Revalidate instead of refetching.** Send the `ETag` of the last response back in `If-None-Match` and an unchanged document answers `304` with no body. Without it, every request is built and compressed again: on a 32-core host a request that accepts brotli took about 1.4 seconds for the default form and about 2.0 seconds for `?guides=true`, and 24 such requests in parallel did not make `/health` miss a response (it answered in 1.4 to 5.5 ms). The compressed bytes are not cached, so the cost is CPU per uncached request. Hosts with 2 to 4 cores were not measured and will saturate sooner, so a script that polls the document, or a monitor that fetches `/swagger`'s data on a timer, should send `If-None-Match`. A browser loading `/swagger` revalidates by itself. In 0.15.0 the comparison is exact, so a proxy that rewrites the `ETag` to a weak one defeats it. In builds after 0.15.0 a weak validator (`W/"..."`), a list of validators and `*` on its own match too, so a proxy that weakens or merges validators does not defeat it; a header that is not a valid `If-None-Match` is answered with the full document.
@@ -1657,34 +1928,24 @@ upgrading, run the read-only check and rename anything it lists**: see
 
 **2. Approvals schema migration v3 (store `approval_manager`).** It adds three text columns to
 `approvals` (`request_json`, `request_digest`, `excluded_roots`), each `NOT NULL DEFAULT ''`, so
-every existing row reads as "binds no request, excludes nobody" and behaves as before. The
+a row that sets none of them reads as "binds no request, excludes nobody". The
 migration is additive and needs no operator step, but it takes a brief `ACCESS EXCLUSIVE` lock on
-`approvals`. If a long-running or idle-in-transaction session holds that table, the upgraded
-replica cannot finish the migration and refuses to start (`Refusing to start: approval manager
+`approvals`. If a long-running or idle-in-transaction session holds that table, the replica
+cannot finish the migration and refuses to start (`Refusing to start: approval manager
 migration/open failed`) rather than serve with a half-migrated schema; end the session and start
 it again. It follows the data-only v2 step of the scheduled-approval change (#6096, below), which
-claimed v2 first, so a database upgraded from a build with neither change runs v2 and then v3 in
-two separate transactions, and one already at v2 runs only v3. The v3 step is idempotent
-(`ADD COLUMN IF NOT EXISTS`), so a development or UAT database that ran an earlier build of this
-branch, which recorded the same columns as version 2, upgrades cleanly instead of failing on a
-column that already exists.
+claimed v2 first, so a fresh database applies each approvals step in its own transaction. The v3
+step is idempotent (`ADD COLUMN IF NOT EXISTS`).
 
-- **Rolling upgrade.** An older replica never touches the new columns and keeps redeeming the
-  tickets it and this build mint, all of which are unbound. The migration runner applies only
-  versions above the one stored for the store and has no newer-schema refusal, so an older binary
-  starts against a newer database: a build with neither change against a v2 or v3 database, and a
-  build with the #6096 change but not this one (highest version 2) against a v3 database. That is
-  established by reading the runner; it has not been exercised as a live rolling restart.
-- **Rollback to the previous build** is therefore expected to work while no bound ticket exists,
-  which is the case for this whole release: the previous build ignores the columns and the
-  default-empty values lose nothing. Rolling back across the #6096 change as well has its own
-  consequences, described in that section.
-- **Rollback is NOT supported once a bound ticket exists.** The previous build does not read
-  `excluded_roots`, so a reviewer who was barred from a bound ticket could approve it, and it
-  redeems without comparing the frozen request. The change that first creates a bound ticket
-  (#6063) must not do so until every replica runs a build that includes this migration, and must
-  define what rollback means after that point. Until it does, a row with a non-empty
-  `request_json` is not expected to exist; if you find one, do not roll back.
+- **Mixed builds are outside the contract.** This release supports a fresh database only (see
+  "Deployment contract (hard cutover)" in the Forensics section of this page), so running this build
+  beside an earlier one is not supported.
+- **A return to the previous build** is outside the "Deployment contract (hard cutover)" in the
+  Forensics section of this page, so it is not a supported operation.
+- **A bound ticket needs every replica on this build.** The change that first creates a bound ticket
+  (#6063) must not mint one on a deployment where any replica runs an earlier build; that is outside the
+  "Deployment contract (hard cutover)". Until it ships, a row with a non-empty `request_json` is not expected
+  to exist; if you find one, the database was written outside that contract.
 
 **3. A new audit action and metric: `approval.precondition_denied` and
 `yuzu_approval_precondition_denied_total{origin}`.** When an approved ticket is refused at
@@ -1891,7 +2152,7 @@ bounded at 1 MiB per device, so a large fleet is storage- and WAL-heavy (see
 | Source | REST | MCP |
 |---|---|---|
 | `installed_software` | `GET /api/v1/inventory/software` | `query_installed_software` |
-| `device_ci` | `GET /api/v1/hardware/{id}` | `get_hardware_ci`, `list_hardware_ci` |
+| `device_ci` | `GET /api/v1/hardware/{id}`, `GET /api/v1/hardware-ci` (bulk) | `get_hardware_ci`, `list_hardware_ci`, `list_hardware_ci_records` (bulk) |
 | `app_perf` | `GET /api/v1/dex/perf/apps` and the other `/api/v1/dex/perf/app*` routes | `list_dex_perf_apps`, `get_dex_app_perf` |
 | `software_licensing` | `GET /api/v1/sle/agents/{agent_id}` | `query_software_licenses` |
 | `app_usage` | `GET /api/v1/forensics/agents/{agent_id}/app-usage` | `get_agent_app_usage` |
@@ -1970,15 +2231,15 @@ A refused request writes no quarantine record and releases none. The `403` bodie
 
 ## ⚠️ Breaking: approving or rejecting a request now needs an interactive session and an enrolled MFA factor with a fresh proof; MCP cannot approve (#6061, #6079)
 
-**Before you upgrade (checklist).**
+**Before you bring approvers into service (checklist).**
 
-1. List your administrators and everyone who holds `Approval:Approve` (see "Find affected automation before you upgrade" below). With RBAC enforcement off (the shipped default) the approvers are exactly the accounts with `role = 'admin'`; the step-0 query in step 2 returns the local ones that are not yet enrolled.
+1. List your administrators and everyone who holds `Approval:Approve` (see "Find automation that approves without a signed-in browser session" below). With RBAC enforcement off (the shipped default) the approvers are exactly the accounts with `role = 'admin'`; the step-0 query in step 2 returns the local ones that are not yet enrolled.
 2. Check who is enrolled: run the step-0 SQL, the first block of [Path A in the recovery runbook](../ops-runbooks/auth-db-recovery.md#path-a-an-enrolment-sign-in-window). On a Linux package install the `psql "$YUZU_POSTGRES_DSN"` blocks in this section fail in an interactive shell, because the DSN lives only in the env file, which is readable only by root and the `yuzu` account; read the value into a shell variable (do not source the file, because a DSN containing `&` or spaces breaks as shell) with `YUZU_POSTGRES_DSN=$(sudo sed -n 's/^YUZU_POSTGRES_DSN=//p' /etc/yuzu/yuzu-server.env)` and then run each block as written.
 3. Enrol each administrator in Settings → Security and sign-in → Two-factor sign-in; another administrator cannot do it for them.
 4. Plan each non-administrator approver (possible only once RBAC enforcement is on): it needs the runbook path, not Settings.
 5. A SAML deployment has no approver path (#6098); give those approvers a local or OIDC account first.
 6. Have at least two enrolled approvers: a submitter cannot review their own request, so a single enrolled approver cannot decide that approver's own requests.
-7. After the upgrade, run the approvals-refused query (step 6 of "After upgrading, verify approvals on a test request" below) to see whether approvals are being refused and why.
+7. Once the deployment is running, run the approvals-refused query (step 6 of "Verify approvals on a test request" below) to see whether approvals are being refused and why.
 8. Owners of scripts that run `yuzu-server --mfa-reset`, and of SIEM rules on `mfa.disabled` or `mfa.reset.breakglass`: `--mfa-reset` now exits `1` when ending the sessions fails (`result=partial`), when the audit store refuses its intent row, and when the clear itself fails; every clear writes two audit rows; a failed session delete is `result=partial`, not `success` (details in the `--mfa-reset` notice below).
 
 **What changed.** Approve and reject (`POST /api/approvals/{id}/approve`, `POST /api/approvals/{id}/reject`,
@@ -2006,9 +2267,10 @@ principal and not an engine principal. The existing rule that the reviewer canno
   generic step-up gate can only ask for a factor the account has, so it passed an account with none; approve and
   reject now use their own rule, in every `--mfa-enforcement` mode:
   - **Local account:** it must have an enrolled TOTP factor, or the decision is refused `403`
-    `approver_assurance_required:mfa_not_enrolled`. The proof must also be no older than the window and must not
-    predate the account's current enrolment (disabling MFA and enrolling again invalidates older proofs; the
-    response is the usual step-up `401`).
+    `approver_assurance_required:mfa_not_enrolled`. The proof must also be no older than the window and must be
+    bound to the factor enrolled now (disabling MFA and enrolling again replaces the factor, so older proofs
+    stop counting; the response is the usual step-up `401`, with `reason=proof_factor_mismatch`,
+    `proof_factor_unbound` or `mfa_proof_missing` in the `mfa.step_up.required` audit detail).
   - **OIDC session:** the identity provider must have asserted an MFA-method `amr` (with an `iat`) on the ID
     token at sign-in. If it did not (no MFA `amr`, or `iat` missing or not positive), the decision is refused
     `403` `approver_assurance_required:mfa_proof_missing` (with step-up on, typed only when `--mfa-enforcement` does not
@@ -2039,13 +2301,13 @@ principal and not an engine principal. The existing rule that the reviewer canno
   - **A non-admin cannot enrol itself** under `--mfa-enforcement=optional` or `admin-only` (login enrols only the
     accounts the mode protects, and the Settings enrolment routes are administrator-only). The seeded `Operator`
     role holds `Approval:Approve`, so with RBAC enforcement on, every such approver is refused `mfa_not_enrolled`
-    after the upgrade until an administrator enrols them, either with a temporary enrolment sign-in window or by promoting each account to
+    until an administrator enrols them, either with a temporary enrolment sign-in window or by promoting each account to
     administrator just long enough to enrol and then demoting it; see
     [Enrolling a non-admin approver](../ops-runbooks/auth-db-recovery.md#enrolling-a-non-admin-approver),
     including the identity-proofing step (under the window, whoever signs in first with the password enrols the
-    factor) and each path's consequences. Plan this **before** upgrading, and make sure at least one
-    enrolled, authorised approver exists who is not the submitter of each request you expect to be decided: until
-    then nothing can be approved. A seeded administrator that has never enrolled is in the same position. Self-service
+    factor) and each path's consequences. Plan this before the first decision is needed, and make sure at least two
+    enrolled, authorised approvers exist, so that for each request you expect to be decided one of them is not its
+    submitter: until then nothing can be approved. A seeded administrator that has never enrolled is in the same position. Self-service
     enrolment for non-admins is a planned follow-up and is not part of this change. `yuzu-server --mfa-reset`
     ends the account's sessions, and disabling MFA in Settings ends every session of the account, the one you
     are using included (neither ends API tokens). **`--mfa-reset` now exits non-zero when ending the sessions fails**
@@ -2061,9 +2323,9 @@ principal and not an engine principal. The existing rule that the reviewer canno
     approver achieves nothing until RBAC enforcement is turned on.
   - **When the approver rule's own read fails** (an unreadable stored session proof for any approver, or, for a local
     approver, an MFA-store fault at the approver's own read: with the step-up window at `0` or negative, or a fault
-    between the central check's read and that one), the answer is `503` with `retry_after_ms`, counted as
+    between the central check's read and that one; or a binding condition), the answer is `503` with `retry_after_ms: 5000` for the transient causes, and with **no** `retry_after_ms` for the three persistent ones, which no retry clears until an operator repairs them (the account-store binding trigger observed not in force, `mfa_binding_unenforced`; the session store's rebind guard latched not in force, `mfa_proof_unavailable`; and an enrolled account whose factor generation is not positive, `mfa_proof_unavailable`), counted as
     `yuzu_auth_secret_unavailable_total{route="approval"}`; nothing is decided. While step-up is on, a local approver
-    whose MFA store is unreadable is refused first by the central check: `503` without `retry_after_ms`, counted as
+    whose MFA store is unreadable is refused first by the central check: `503` (`retry_after_ms: 5000` for a failed read, `null` where there is no retry hint (a cause only an administrator repairs, or one this gate cannot tell from a transient one)), counted as
     `yuzu_auth_secret_unavailable_total{route="mfa_stepup"}` and
     `yuzu_auth_mfa_step_up_gate_total{outcome="unavailable"}`.
   - **An OIDC approver whose stored MFA proof is dated after the database clock** (the replica that took the sign-in ran
@@ -2111,14 +2373,13 @@ non-admin approver under `optional` or `admin-only` is in the same position and 
 
 **If you set `--mfa-step-up-window-secs=0`,** approval no longer loses its MFA requirement: approve and reject use a
 300-second window instead, and still require an enrolled factor. The setting still switches the step-up gate off for
-the other step-up endpoints. Decisions made **before** the upgrade, and in particular any made with the setting at
-`0`, gain no retroactive assurance: review every `approval.approve` audit row with `result=success` from that period,
-and check every `attempted` row that has no outcome row (compare counts per `target_id`). A build that has #6061
-also writes a `result=attempted` row first, so do not count both, and a decision whose outcome row failed to write
-leaves only the `attempted` row (see [Audit Log](audit-log.md)). A build that predates #6061 writes no
-`attempted` row, only the outcome row.
+the other step-up endpoints. Decisions already in the audit log gain no retroactive assurance, in particular any made with the setting at
+`0`: review every `approval.approve` audit row with `result=success` from that period,
+and check every `attempted` row that has no outcome row (compare counts per `target_id`). The approver gate
+writes a `result=attempted` row first, so do not count both, and a decision whose outcome row failed to write
+leaves only the `attempted` row (see [Audit Log](audit-log.md)).
 
-**Find affected automation before you upgrade.** Nothing is listed for you, so search the audit log for
+**Find automation that approves without a signed-in browser session.** Nothing is listed for you, so search the audit log for
 callers that approved or rejected without a signed-in browser session.
 
 - **Over MCP.** Audit rows with action `mcp.approve_request` or `mcp.reject_request` are MCP approvals. The
@@ -2141,19 +2402,18 @@ callers that approved or rejected without a signed-in browser session.
   `user_agent` and `source_ip` for those.
 
 The search only sees what the audit retention window still holds, so an empty result is not proof that nothing
-approves by token. Before upgrading, also check which service accounts and API tokens hold `Approval:Approve`
+approves by token. Also check which service accounts and API tokens hold `Approval:Approve`
 and move each approval step to a person on a signed-in session. No audit query lists a token or service account
-that holds `Approval:Approve` but has never approved: after this change it is refused anyway, so the check is
+that holds `Approval:Approve` but has never approved: it is refused anyway, so the check is
 about finding automation to move, not about finding exposure. To list what is granted, read the RBAC grants
 (`GET /api/v1/rbac/roles/assignments`, or the Access Reviews export `GET /api/v1/access-reviews/export`; both
 need `AccessReview:Read`) and match each principal's roles against the roles that carry `Approval:Approve`.
 `GET /api/v1/tokens` lists only the calling user's own tokens, so check each token owner's grants.
 
 **What that search cannot see.** The audit query finds token and MCP approvers only. The approvers most likely
-to hit the new behaviour are human accounts, which carry `principal_class = 'human'` and so look the same before
-and after the upgrade: SAML users (refused), OIDC users whose identity provider asserts no MFA-method
-`amr` (now refused `mfa_proof_missing`; before this change they passed unless `--mfa-enforcement=required`), and local
-accounts with no enrolled factor (now refused `mfa_not_enrolled`; before this change they passed without a second factor). To
+to hit the new behaviour are human accounts, which carry `principal_class = 'human'`, so that query does not single them out: SAML users (refused), OIDC users whose identity provider asserts no MFA-method
+`amr` (refused `mfa_proof_missing`), and local
+accounts with no enrolled factor (refused `mfa_not_enrolled`). To
 list the SAML and `amr`-less OIDC operators who have signed in, query the login rows in the audit store (the
 retention window applies):
 
@@ -2182,11 +2442,11 @@ ORDER BY username;
 ```
 
 `role` is the account's legacy role column, not its RBAC grants, so compare the result with who holds
-`Approval:Approve`. An account listed here is refused as an approver (`mfa_not_enrolled`) after the upgrade, so enrol it first if it is meant to approve; a non-admin needs the enrolment sign-in window described above.
+`Approval:Approve`. An account listed here is refused as an approver (`mfa_not_enrolled`), so enrol it first if it is meant to approve; a non-admin needs the enrolment sign-in window described above.
 With RBAC enforcement off (the shipped default), a non-admin account is refused `403` "admin role required" before
 the MFA check, so `mfa_not_enrolled` is what an administrator sees, and a non-admin sees it only once enforcement is on.
 
-**After upgrading, verify approvals on a test request.** Use a test device and a harmless, read-only
+**Verify approvals on a test request.** Use a test device and a harmless, read-only
 instruction, and do not skip the safety notes in step 1: an execute call that is not held for approval really
 dispatches.
 
@@ -2272,158 +2532,19 @@ dispatches.
    being refused `503` because their proof is dated after the database clock; the fix is clock synchronisation (see
    [OIDC approvers refused with a clock-skew 503](../ops-runbooks/auth-db-recovery.md#oidc-approvers-refused-with-a-clock-skew-503)).
 
-**Rolling back, or running mixed versions.** The approver-assurance change itself adds no schema; the separate
-scheduled-approval change (#6096, below) adds a data-only approvals step and a command-outbox index, both of which an
-older binary ignores, so a rollback starts cleanly. What changes is which checks run.
+**Schema and agents.** The approver-assurance change adds two schema migrations, in the `auth` schema (a
+`users.mfa_factor_gen` column and a trigger that assigns it) and in the session store (the `mfa_factor_gen`
+and `mfa_bind_seq` columns on `sessions` and a guard trigger). They run at the first start of a fresh deployment, like the
+other schema migrations of this build. The
+separate scheduled-approval change (#6096, below) adds a data-only approvals step and a command-outbox index.
 
-> **Warning: mixed versions silently weaken the approver control.** The enrolled-factor and fresh-proof
-> requirement (#6079) is in force **only while every replica that serves `/api/approvals/*` runs a build that
-> has it.** Behind one load balancer, an old replica keeps the weaker gate: it passes an approver who has no
-> enrolled factor, and a build that predates #6061 also accepts bearer and MCP approvals. The same person can
-> therefore get `403` `mfa_not_enrolled` from one replica and succeed on the next request, and nothing in the
-> response says which replica answered. Rolling those replicas first shortens the exposure window; the gap closes
-> only when approval traffic reaches upgraded replicas only (pin or drain approvals), and stop-all, upgrade, start-all is
-> the default recommendation. Running more than one server replica is unsupported today (the safe-to-scale gate,
-> `docs/ha-delivery-matrix.md`), so this describes a rolling upgrade and is not a statement that a multi-replica
-> deployment is supported. **Rolling back to an
-> older build is a security-policy downgrade**, not only a convenience: it re-opens the weaker gate, and tickets
-> decided before the upgrade gain no retroactive assurance.
->
-> If you are about to roll, write down each replica's upgrade time (in UTC) in the change ticket as you go; see
-> "Mixed-version admission" below for why it matters and for the queries that use it.
-
-- A replica or a rolled-back binary that predates this change still accepts bearer and MCP approvals, and does
-  not check an approved ticket's age when it is consumed or when `ScheduleRunner` fires it. While any such
-  replica serves traffic, the assurance is only as strong as that replica; drain it, or send approval traffic
-  to upgraded replicas only.
 - Endpoint agents need no change.
-- An older binary does not write the `result=attempted` row, and does not read it. Rows written by the new
-  binary stay in the audit store and are ignored by the old one; a `denied` row with
-  `detail=approver_assurance:<reason>` simply stops appearing.
-- **Telling old and new rows apart.** The `attempted` and `success` rows of an approve or reject written by a
-  build with #6079 carry `detail=approver_assurance:enrolled_fresh_mfa`. A row without it was written before
-  the control, or by a replica that does not have it. Use that token as the cutover marker when sampling
-  decisions, and to spot an old replica still serving approvals during a roll. The audit row does not name the
-  replica; your load balancer's access log is the place to find which one answered.
-- **Mixed versions and clearing a factor.** Until every replica and the CLI image run this build, an old binary's
-  `--mfa-reset` or Settings disable clears the factor without ending the account's sessions, so its existing
-  sessions stay live. Afterwards run the new
-  binary's `--mfa-reset` (before the user enrols again, because it clears the factor) or
-  `DELETE /api/v1/sessions?username=<name>`. To find the accounts cleared during the mixed window, list the
-  `mfa.disabled` and `mfa.reset.breakglass` rows in it. The bounds follow the same rules as the approval query below
-  (UTC, an explicit `+00` on each, widened by a margin for clock skew). A row written by an old binary has no
-  `sessions_ended=` in its `detail`; every `ok` or `success` outcome row from this build has one, except `no verified factor to clear`
-  (a cancelled, unfinished enrolment, which cleared nothing); an `error` row from the CLI has none. This build also writes an `attempted` intent row before it
-  clears anything, and that row has no `sessions_ended=` either; the `result IN ('ok', 'success')` filter is what keeps
-  those rows out of the list, so do not drop it.
-
-  ```bash
-  psql -q "$YUZU_POSTGRES_DSN" -c \
-    "SET TIME ZONE 'UTC';
-     SELECT to_timestamp(timestamp) AS at, principal, action, result, target_id, detail
-       FROM audit_store.audit_events
-      WHERE action IN ('mfa.disabled', 'mfa.reset.breakglass')
-        AND result IN ('ok', 'success')
-        AND COALESCE(detail, '') NOT LIKE '%sessions_ended=%'
-        AND COALESCE(detail, '') <> 'no verified factor to clear'
-        AND timestamp >= extract(epoch FROM timestamptz '<first replica upgraded, minus margin, UTC with +00>')
-        AND timestamp <  extract(epoch FROM timestamptz '<last replica upgraded, plus margin, UTC with +00>')
-      ORDER BY timestamp;"
-  ```
-
-  Each row's `target_id` is an account whose sessions were left live. End them as above. An empty list is not
-  evidence that none were cleared: it has the same blind spots as the approval query below (bounds that miss the
-  window, an audit store restored or purged, a lost audit write), so run the same count control over the same bounds.
-- **Mixed-version admission is a documented known limitation of a rolling upgrade.** The approver
-  gate is stateless and no minimum-version check exists, so while a rolling upgrade is in progress an old replica
-  can admit a decision the new gate would refuse. The Yuzu project maintainer accepted this on 2026-10-28 as inherent to
-  the upgrade method, on the condition that the upgrade is controlled; the acceptance is recorded in the ADR-1005
-  exception ledger (`docs/adr/1005-headless-platform-use-case-engines.md`, entry of 2026-10-28) as a working-session
-  statement, not a signed decision. The condition is: record each
-  replica's upgrade timestamp (in UTC) in the change ticket (SOC 2 CC8.1) **as you roll**, because the audit row does
-  not name the replica. A decision row **without**
-  `approver_assurance:enrolled_fresh_mfa` was written before the control existed, by a replica that did not have
-  it, or after a rollback. To list the decisions in a window that carry no marker, set the start to the first
-  replica's upgrade time minus a margin and the end to the last replica's upgrade time plus a margin, or to the
-  present time if a rollback happened or a replica may still be old. **Both bounds are UTC.** The command's first
-  statement pins the session to UTC, because `psql` otherwise reads a bare `timestamptz` literal in the session's
-  own time zone (the server default, the role's setting, `PGTZ` or a DSN option), which shifts the window by whole
-  hours and returns no rows without any error; write each bound with an explicit `+00`, for example
-  `2026-10-20 09:55+00`. If the times in your change ticket are local times, convert them to UTC first.
-
-  ```bash
-  psql -q "$YUZU_POSTGRES_DSN" -c \
-    "SET TIME ZONE 'UTC';
-     SELECT to_timestamp(timestamp) AS at, principal, action, target_type, target_id, result, source_ip, detail
-       FROM audit_store.audit_events
-      WHERE (   (action IN ('approval.approve', 'approval.reject')
-                 AND result IN ('attempted', 'success')
-                 AND detail <> 'approver_assurance:enrolled_fresh_mfa')
-             OR (action IN ('mcp.approve_request', 'mcp.reject_request')
-                 AND result = 'success'))
-        AND timestamp >= extract(epoch FROM timestamptz '<first replica upgraded, minus margin, UTC with +00>')
-        AND timestamp <  extract(epoch FROM timestamptz '<last replica upgraded, plus margin, UTC with +00>')
-      ORDER BY timestamp;"
-  ```
-
-  The `at` column is shown in UTC. Match each row against the ticket's per-replica timestamps and the load balancer
-  log, and review the decision it records. Only `attempted` and `success` rows are listed for the REST actions,
-  because a refusal (`denied`) never carries the marker. Rows before the window are pre-upgrade decisions and gain no
-  retroactive assurance. Rows inside the leading margin, before the first replica was upgraded, are also
-  pre-upgrade decisions: expect them in the list, they are not old-replica admissions.
-
-  **A list with no rows is not evidence of a clean upgrade.** The same output appears when the bounds miss the
-  window, when the audit store is empty or was restored from an earlier copy, and when an audit write was lost (the
-  `success` row of a REST decision is best effort). Run this control over the SAME bounds. It counts every audit row
-  in the window, whatever the action:
-
-  ```bash
-  psql -q "$YUZU_POSTGRES_DSN" -c \
-    "SET TIME ZONE 'UTC';
-     SELECT count(*), to_timestamp(min(timestamp)) AS earliest, to_timestamp(max(timestamp)) AS latest
-       FROM audit_store.audit_events
-      WHERE timestamp >= extract(epoch FROM timestamptz '<first replica upgraded, minus margin, UTC with +00>')
-        AND timestamp <  extract(epoch FROM timestamptz '<last replica upgraded, plus margin, UTC with +00>');"
-  ```
-
-  For a window in which the deployment was running, `count` must be above zero and `earliest` and `latest` must
-  fall inside the bounds. A `count` of zero means the bounds or the audit store are wrong (check that both bounds
-  are UTC, that the start is earlier than the end, and that the audit store was not restored or purged), not that
-  the upgrade was clean; do not use an empty list as evidence until the control is above zero. A non-zero count shows
-  the bounds select audit rows, not that every decision left a row. Attach both command texts, with the bounds
-  filled in, and their output to the change ticket.
-
-  The `mcp.approve_request` and `mcp.reject_request` rows are listed for a different reason. A decision made
-  over MCP never carries the marker, because the upgraded binaries refuse MCP approvals and rejections, so any
-  `success` row for these actions inside the window came from a replica that had not been upgraded yet, or from
-  a rollback. For those rows `target_type` is `mcp_tool` and `target_id` is the tool name; the approval ticket id
-  is in `detail`. The MCP query in "Find affected automation before you upgrade", above, finds the same actions
-  across the whole retention period; this one limits them to the window.
-
-  The `timestamp` column is written from the clock of the replica that wrote the row, while the bounds you
-  recorded in the change ticket come from wherever you read the time, so widen both bounds by a margin that
-  covers the NTP skew between your replicas (the observed skew, or a few minutes if you have not measured it).
-  The margin covers clock skew only. It does not cover a time-zone offset, which is why the bounds must be UTC
-  and the session is pinned to UTC. A replica that wrote no row is invisible to these queries, so also attach
-  the load balancer log excerpt for the window, together with the per-replica upgrade timestamps.
-  Re-run both commands, with the end bound set to the present time, until every replica is confirmed upgraded and
-  no rollback or re-creation from an old image is possible, and attach the final run.
-- A ticket approved by an older replica carries a `reviewed_at` stamped from that replica's own clock. The new
-  binaries judge it against database time, so a replica whose clock runs more than 5 minutes ahead of the
-  database produces a ticket the new binaries treat as not yet live (a recall over MCP answers
-  `approval expired (past its 7-day lifetime)`, although the ticket is in fact ahead of the clock), and a replica
-  running behind shortens the ticket's life by the same amount. Once the next accepted approval submission on any
-  replica has run, such a ticket is `expired` for good, with only an info log line as a trace, and correcting the
-  clock does not bring it back, so request approval again. Until that submission has run nothing has been
-  written, so correcting the clock first makes the ticket live again: if the query in `docs/clock-guarded-retention.md` finds
-  held-back tickets, fix the clock before anyone submits an approval request. (A submission refused because the pending queue is full
-  rolls its sweeps back, so the ticket stays `approved` and unusable until a later submission is accepted.) A
-  query that lists approved tickets ahead of the database clock (until that sweep runs) is in `docs/clock-guarded-retention.md`, "ApprovalManager ticket liveness". The same applies to a
-  database host whose own clock is stepped backwards by more than 5 minutes: an approved, unused ticket whose review
-  time is more than 5 minutes ahead of the new database time (roughly, one reviewed within the last
-  (step size minus 5 minutes) before the step) is expired permanently once an accepted submission has swept it
-  (until then correcting the clock restores it), and older approved tickets stay live
-  (observability tracked in #6098).
+- Review time (`reviewed_at`) is stamped from the database clock. A database host whose own clock is stepped
+  backwards by more than 5 minutes expires an approved, unused ticket whose review time is more than 5 minutes ahead
+  of the new database time (roughly, one reviewed within the last (step size minus 5 minutes) before the step)
+  permanently, once an accepted submission has swept it (until then correcting the clock restores it); older
+  approved tickets stay live (observability tracked in #6098). A query that lists approved tickets ahead of the
+  database clock is in `docs/clock-guarded-retention.md`, "ApprovalManager ticket liveness".
 - Submission time (`submitted_at`) now also comes from the database, like the review and use times, so a server
   whose own clock is wrong can no longer lengthen or shorten how long its pending requests live. A recurring
   schedule no longer decides that an approval is spent by comparing clocks: when the occurrence an approved ticket
@@ -2431,51 +2552,36 @@ older binary ignores, so a rollback starts cleanly. What changes is which checks
   occurrence), so one approval runs at most one occurrence whatever the clocks say (#6096). A used ticket keeps its
   status (`approved` or `rejected`); only its use time and user are filled in. The schedule's own run times are
   still stamped by the server that advances it; they only decide when an occurrence is due.
-- **Scheduled approvals are retired once on upgrade (#6096).** Before this release a spent scheduled ticket was
-  never marked used; it was recognised as spent by comparing clocks. The approvals schema step (v2) therefore marks
-  every outstanding approved or rejected ticket that belongs to a schedule as used, once per database, with no clock
-  comparison. A schedule that was holding an occurrence for an approval you had already given (approved but not yet
-  fired when you upgraded) asks again for that held occurrence, and a rejection you had already given no longer skips
-  that occurrence: the schedule asks again. Pending requests, requests from the dashboard and MCP, and tickets
-  already used are untouched. Nothing to do. The step is data only (no table or column changes). It touches
-  every unsettled approved or rejected scheduled ticket, including old rejected ones (rejected tickets never expire
-  and are never swept); that is normally small. It runs inside the upgrade transaction under a 300 s statement
-  timeout and is skipped on every later start. If the 300 s timeout is hit the step fails, nothing is applied,
-  and the approvals store does not open (the server logs a schema migration failure for that store); investigate
-  the table size and restart. The command outbox also gains a small index on its approval id
-  (`outbox_approval_idx`) at the same upgrade; its build is bounded by the same 300 s timeout.
-- **Upgrade one replica first when the outbox table is large (#6096).** Building `outbox_approval_idx` takes a share
-  lock on the outbox table for up to 300 s, so enqueue and claim on other replicas wait meanwhile. A second replica
-  that boots at the same time waits on the migration advisory lock under the pool's default lock and statement
-  timeouts and may fail its boot closed; restarting it recovers, because the migration is then applied. The
-  recommendation is to start ONE replica, wait for it to finish migrating, then start the others. These are not
-  measured numbers.
-- **Where the legacy marker lives (#6096).** The retired tickets carry `consumed_by = 'schedule:legacy-6096'` in
-  `approval_manager.approvals`. It is readable only by SQL; no API returns it. Tickets the outbox showed had already
-  been used by an earlier occurrence carry the related marker `consumed_by = 'schedule:ledger-spent:<schedule id>:<n>'`;
-  tickets settled by a normal fire or skip carry `schedule:<schedule id>:<n>`. To list the legacy ones:
+- **The approvals v2 step is data only (#6096).** A scheduled ticket is marked used when its occurrence is queued
+  (a rejected ticket when it skips its occurrence), not recognised as spent by comparing clocks. The approvals
+  schema step (v2) marks every outstanding approved or rejected ticket that belongs to a schedule as used, once per
+  database, with no clock comparison. On a fresh deployment the table is empty, so it changes nothing. It is data
+  only (no table or column changes), runs inside the migration transaction under a 300 s statement timeout and is
+  skipped on every later start. If the 300 s timeout is hit the step fails, nothing is applied, and the approvals
+  store does not open (the server logs a schema migration failure for that store); investigate the table size and
+  restart. The command outbox gains a small index on its approval id (`outbox_approval_idx`) in its own schema
+  step (outbox v2, also under a 300 s statement timeout); if that build fails, it is the outbox store that does not open.
+- **Start one replica first (#6096).** Building `outbox_approval_idx` takes a share lock on the outbox table for up
+  to 300 s on a large table, so enqueue and claim on other replicas wait meanwhile. A second replica that boots at
+  the same time waits on the migration advisory lock under the pool's default lock and statement timeouts and may
+  fail its boot closed; restarting it recovers, because the migration is then applied. Start ONE replica, wait for
+  it to finish migrating, then start the others. These are not measured numbers. A fresh database has no large
+  outbox, so the index build is short there; the concurrent-boot wait still applies.
+- **Where the used marker lives (#6096).** A ticket's `consumed_by` in `approval_manager.approvals` records what
+  settled it. It is readable only by SQL; no API returns it. A ticket the outbox showed had already been used by an
+  earlier occurrence carries `consumed_by = 'schedule:ledger-spent:<schedule id>:<n>'`; a ticket settled by a normal
+  fire or skip carries `schedule:<schedule id>:<n>`. The value `schedule:legacy-6096` is written only by the v2
+  step, so a fresh deployment has none. To list the scheduled tickets and what settled them:
 
   ```sql
-  SELECT id, status, schedule_id, consumed_at
+  SELECT id, status, schedule_id, consumed_at, consumed_by
   FROM approval_manager.approvals
-  WHERE consumed_by = 'schedule:legacy-6096';
+  WHERE schedule_id <> '' AND consumed_by LIKE 'schedule:%';
   ```
-- **Mixed versions and rollback for scheduled approvals (#6096).** Recommended practice: drain or stop every replica
-  that predates this change before anyone approves scheduled work. The command outbox records which approval ticket
-  each scheduled run used, and the new binary refuses to fire a ticket the outbox shows was already used by an
-  earlier occurrence, so a ticket fired by an older leader is inert after the upgrade. A rolled-back binary does
-  not consult the outbox ledger or the used marker, so an older binary can re-fire a ticket the new binary marked
-  used (the old clock comparison); rolling back restores the old behaviour, including that exposure. After a rollback
-  followed by a second upgrade, run this once, because a rejected ticket spent under the older binary would
-  otherwise skip one occurrence. It also retires approved-but-unfired scheduled tickets, which then ask again:
-
-  ```sql
-  UPDATE approval_manager.approvals
-  SET consumed_at = EXTRACT(EPOCH FROM now())::bigint, consumed_by = 'schedule:legacy-6096'
-  WHERE schedule_id <> '' AND consumed_at = 0 AND status IN ('approved','rejected');
-  ```
-- Tickets already approved when you upgrade keep their original `reviewed_at`; the seven days are counted
-  from it.
+- This build records in the command outbox which approval ticket each scheduled run used, and refuses to fire a
+  ticket the outbox shows was already used by an earlier occurrence. Running it beside an earlier build is outside
+  the "Deployment contract (hard cutover)" and not supported.
+- The seven days of an approved ticket are counted from its `reviewed_at`.
 
 ## Behaviour change: plugin-enablement tables and the continuity anchor (`plugin_config_store` schema v3, ADR-3006)
 
@@ -2597,7 +2703,7 @@ customer-distribution lane. Before switching lanes, read the
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **`WorkflowEngine` now runs on PostgreSQL (ADR-0064).** `/api/workflows*` and `/api/workflow-executions/*` moved off `workflows.db` SQLite onto the shared Postgres substrate (schema `workflow_engine`). **No data carries over from a pre-Postgres install** (fresh-start-by-default, ADR-0009) — any workflow definition and its execution history that existed before upgrade is gone; re-create workflows via `POST /api/workflows` (or product-pack re-install). Server startup now fails closed if the `workflow_engine` schema can't be created/opened — a posture upgrade from the SQLite era, where construction was unconditional/best-effort and no caller ever checked whether the store had actually opened; confirm success via `/readyz` (already reported before this release) and `/healthz` (newly reported — was absent before this release). **Delete semantics changed: `DELETE /api/workflows/:id` now soft-deletes.** The response shape is unchanged (`{"deleted": true|false}`), but a deleted workflow's row and its execution history are now retained internally rather than orphaned — this is not operator-visible today (no "show deleted workflows" surface exists), but a deleted workflow's `id` can never be reused. No operator action required. |
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **Guardian file-hash `max_bytes` now has a hard ceiling (#2233).** An authored `file-hash-equals` rule's `max_bytes` (the hashing-DoS cap) was previously accepted unbounded from the authoring API. It is now clamped to 1 GiB (`kMaxFileHashBytes`) on the agent, and the server rejects a new/edited rule authoring a value above that ceiling in either JSON wire form (400). **Operator-visible only if you have a PRE-EXISTING `file-hash-equals` rule authored (before this release) with `max_bytes` above 1 GiB, watching a file at or above that size:** after upgrade, that file reports `<oversize>` instead of being hashed — a compliance-verdict change with no authoring-time signal (the rule already exists, so the new server-side reject cannot retroactively catch it). List your rules via `GET /api/v1/guaranteed-state/rules` (the route returns every rule; there is no server-side filter), check any `file-hash-equals` rule for `max_bytes` over 1073741824, and re-author within the ceiling if the larger cap was intentional. No operator action required otherwise. **DEX and management-group reads now fail closed on a degraded read instead of answering a healthy/empty result (#4855, #1762)** — see "Behaviour change: DEX device score and management-group member reads now fail closed on a degraded read (#4855, #1762)" below. |
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **`BatchHeartbeatResponse` gains `unknown_session_ids` and `unknown_session_ids_truncated` (#1197), and the gateway now acts on them - restart the gateway to deploy (this disconnects every agent it holds, and released v0.13.0 and v0.14.0-rc6 agents stayed wedged after a graceful gateway restart in testing, so upgrade agents to a build with the #5183 fix first or expect to restart the agent service on them; see "Agent dependency" in [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts)); no wire change and no new required configuration.** The server lists, per `BatchHeartbeat`, the session ids it does not hold, and the new gateway reads that list and re-registers exactly the sessions it still holds (the registration-replay drip, bounded by a per-session guard and a queue cap). The behavioural change is that, after a server restart, agents behind a new gateway become known to the server again without operator action; before, they stayed unknown (`/health` `agents.online` stayed 0 in the observed runs). Any pairing interoperates: an OLD server never sends the fields, so a new gateway sees an empty list and does nothing; an OLD gateway ignores the added response fields (proto3 unknown fields, field numbers 2 and 3) and keeps the old behaviour. Recovery needs the new gateway and a server that sends the fields. Observed on a local rig: the agent was known again about 17 s after the server was healthy, on its first heartbeat after that; after an outage long enough to open the gateway circuit breaker, recovery waits for the breaker's remaining backoff (58 s observed after a 300 s outage with 1 agent; with 10 and 30 agents the breaker opened in later runs and the breaker's own replay recovered them, with all agents online 85.2 s and 50.4 s after the server was healthy; the backoff is capped at 300 s, and steps above 160 s were not observed). A second operator-visible change is a new `yuzu_server_gateway_route_desync_total{op="batch_heartbeat",outcome="malformed_session_id"}` series (pre-seeded at 0, expected to stay 0, no alert): over-length (more than 64 bytes) unknown session ids in a `BatchHeartbeat` are now counted under that series, per entry, instead of under `op="renew_leases", outcome="unknown_session"`. The gateway adds three counters and two optional application-env tunables, described under [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts), which also states what the reconcile does not promise (fleet completion inside a route lease, dispatch reachability after the session is adopted, several core replicas). |
-| 0.15.x (next) | 0.12.0 | 0.12.0 | **Gateway session ids are now resolved against the durable Postgres route directory (HA WS-5 slice 2, ADR-2002 §7f); server restart only, no gateway restart, no flag, no proto field.** (This release also carries a separate `gateway_route_store` v5 migration, a one-time exclusive lock at the first start: see [the v5 section below](#behaviour-change-gateway-sessions-are-unique-per-agent-a-one-time-migration-gateway_route_store-v5-5683).) Heartbeat, inventory and stream-status RPCs look a presented `session_id` up in `gateway_route_store.agent_routes` instead of one replica's in-memory map. After a server-only restart the server still lists directory-known sessions in `unknown_session_ids` so the gateway replays `ProxyRegister` and rebuilds the local registry (drip-paced; ~1200 s for 10k agents at 100 ms), while leases keep renewing; this needs a gateway with the #1197 reconcile (an older gateway gives the pre-reconcile behaviour). **Rolling deploy:** an old replica reports directory-known sessions as unknown, so drain old replicas first. Run exactly ONE server replica until the safe-to-scale gate lifts (ADR-2002 §7c); this change does not lift it. Rollback is safe (the previous binary boots; see the v5 section's rollback bullet for what it does on a race). A degraded directory read is fail-soft for heartbeats; a `NotifyStreamStatus` CONNECTED during it is accepted only for a session this replica holds locally and is otherwise refused (`connected_unverified`; the agent regains dispatch at its next reconnect). A session id matching more than one live row is refused and pages `YuzuGatewaySessionAmbiguous`; a `ProxyRegister` replay presenting an id another agent's row holds is refused and pages `YuzuGatewaySessionHeldByOtherAgent`. See [gateway.md](gateway.md#what-happens-when-the-server-restarts). |
+| 0.15.x (next) | 0.12.0 | 0.12.0 | **Gateway session ids are now resolved against the durable Postgres route directory (HA WS-5 slice 2, ADR-2002 §7f); server restart only, no gateway restart, no flag, no proto field.** (This release also carries a separate `gateway_route_store` v5 migration, a one-time exclusive lock at the first start: see [the v5 section below](#behaviour-change-gateway-sessions-are-unique-per-agent-a-one-time-migration-gateway_route_store-v5-5683).) Heartbeat, inventory and stream-status RPCs look a presented `session_id` up in `gateway_route_store.agent_routes` instead of one replica's in-memory map. After a server-only restart the server still lists directory-known sessions in `unknown_session_ids` so the gateway replays `ProxyRegister` and rebuilds the local registry (drip-paced; ~1200 s for 10k agents at 100 ms), while leases keep renewing; this needs a gateway with the #1197 reconcile (an older gateway gives the pre-reconcile behaviour). **Rolling deploy:** an old replica reports directory-known sessions as unknown, so drain old replicas first. Run exactly ONE server replica until the safe-to-scale gate lifts (ADR-2002 §7c); this change does not lift it. A return to an earlier build is outside the deployment contract (see "Deployment contract (hard cutover)"). A degraded directory read is fail-soft for heartbeats; a `NotifyStreamStatus` CONNECTED during it is always refused (`connected_unverified`; **changed since 0.15.0**, which accepted a session the replica held locally, and also on a single replica). A gateway from 0.15.0 or later (it includes #5695) resends it and it is accepted once the directory reads, so a replica is undispatchable for the outage plus up to 60 s, or up to 10 minutes after a 15-minute outage; a gateway older than 0.15.0 (the table's minimum is 0.12.0) never resends, so that agent stays undispatchable until it reconnects: upgrade every gateway before relying on this. Only a session registered just before the outage, or a pool-acquire timeout (500 ms), reaches this. A session id matching more than one live row is refused and pages `YuzuGatewaySessionAmbiguous`; a `ProxyRegister` replay presenting an id another agent's row holds is refused and pages `YuzuGatewaySessionHeldByOtherAgent`. See [gateway.md](gateway.md#what-happens-when-the-server-restarts). |
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **Gateway heartbeat admission is now bound to the connection that opened the session (gateway restart required; breaking for L7-fronted gateways).** The gateway admits an agent `Heartbeat` only on the HTTP/2 connection that opened the session's `Subscribe` stream; any other heartbeat is answered `NOT_FOUND` and not forwarded. Deploy with a gateway restart, and check for an HTTP/2-terminating hop in front of `:50051` first. A rejected agent recovers by re-registering. That logic exists from v0.13.0, but the released v0.13.0 and v0.14.0-rc6 agents wedge in their reconnect path with default settings (bug #2182, fixed by PR #5183, shipped in 0.15.0) and recover only with `--no-auto-update`; v0.12.0 never recovers by itself (observed; older versions were not tested; v0.14.1 does not contain the fix and was not tested). Upgrade the agents first, then the gateway, with 0.15.0 or later (the #2182 fix); until the agents are upgraded, restart an agent that stays rejected. Agents that do not connect through the gateway are not affected by this requirement (see Older agents). No wire or server change. See the section "Breaking: gateways fronted by an HTTP/2-terminating proxy or mesh sidecar" below and [Heartbeat admission](gateway.md#heartbeat-admission). |
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **`--gateway-upstream` now refuses to start without gateway peer authorization (breaking for own-certificate and plaintext installs).** The gateway-upstream service admits only a gateway whose certificate key (SPKI SHA-256) is pinned, which carries `serverAuth` and is inside its validity window; the server exits at boot, before binding a port, when `--gateway-upstream` is set and that cannot be arranged. Generated default certificates are pinned automatically; your own certificates need `--gateway-peer-pin` / `--gateway-peer-pin-file` first; a plaintext (`--no-tls`) rig needs `--insecure-gateway-peer`; the Linux package unit passes `--gateway-upstream` unconditionally. Agents and gateways are unaffected on the wire. See the section "Breaking: `--gateway-upstream` now refuses to start without gateway peer authorization" below. |
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **The gateway now holds stream-status notifications instead of dropping them (#4632; gateway restart required).** Deploy it with a gateway restart, which disconnects every agent the node holds, so read "Upgrade day" and "Agent dependency" in [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts) first (released v0.13.0 and v0.14.0-rc6 agents do not recover by themselves after a gateway restart). **Read the [Gateway upgrade note for #4632](#gateway-upgrade-note-stream-status-notifications-and-startup-checks-4632) before you restart: a gateway whose configured `cluster_id` cannot be represented as UTF-8 now refuses to start.** There is no hot code load for this change: the upstream client's `code_change` is the identity function while its state gained fields, so deploy it by restart, not by a hot upgrade (INFERRED from the code, not run). No wire change and no change to the minimum agent or server version: `NotifyStreamStatus` is unchanged, so any pairing interoperates. What changes: a `CONNECTED` or `DISCONNECTED` notification that arrives while 10 are in flight or the circuit breaker is open is held in a bounded, memory-only store and sent first in first out, where the old gateway dropped it; when the breaker goes half open the new gateway sends one held notification as the probe, where the old one let up to 10 notifications through; and an agent-supplied peer address is sanitised and capped before it is held (a value that is not valid UTF-8 becomes `invalid`, and one over 255 bytes is cut at a character boundary). New settings `notify_pending_max` (default derived from the agent listeners: three per connection they admit, the sum of their `limits.max_connections`, at least 15000, so 15000 on a listener without a ceiling and 180000 with the 60000 ceiling the packaged, production and reference configs set; `sys.config.prod` and the reference compose config also set 180000 explicitly; valid range 1 to 1000000; a value outside the range or not an integer falls back to the default with a WARN that names the key; see "Upstream client tuning" in [gateway.md](gateway.md)); size it at least as large as the largest `Subscribe` burst you expect; and `notify_probe_timeout_ms` (default 15000, valid range 100 to 300000, not present in any shipped `sys.config`, same fallback rule), the gateway's own deadline for the half-open notification probe: a probe worker that has not reported by then is killed and the probe fails like any failed probe. The other behaviour changes of the same restart are listed in the upgrade note below the table. Metrics: new gauges `yuzu_gw_upstream_notify_pending` and `yuzu_gw_upstream_notify_inflight` and counter `yuzu_gw_upstream_notify_coalesced_total`. The `reason` label of `yuzu_gw_upstream_notify_dropped_total` is now the closed set `at_capacity` and `unknown`: the value `circuit_open` is retired, so during a rolling upgrade old nodes still export `circuit_open` and new nodes export `at_capacity`, and a rule or dashboard that sums the family sees both. A rule or panel of your own that selects `reason="circuit_open"` stops matching once every node is upgraded: use `yuzu_gw_upstream_notify_pending` for held notifications and `reason="at_capacity"` for lost ones. The rollback is the previous gateway release. A rollback is itself a gateway restart: it disconnects every agent the node holds and carries the same agent-reconnect cost as the upgrade (see "Upgrade day" and "Agent dependency" in [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts), and the released-agent caveat above), so weigh it against the problem you are fixing. It also brings back the earlier behaviours: notifications dropped at 10 in flight or with the breaker open, a request that the gateway's own validation or encoder rejected (or a server status that means the request itself was wrong) counted as an upstream failure that can open the breaker, and no `cluster_id` boot refusal. The pending store is memory only, so nothing persists and nothing needs to be cleaned up; the notifications held at that moment are lost, as they were dropped before. Runbook rows and the measured evidence: [Stream Status Notification](gateway.md#stream-status-notification) and the [evidence record](../security-reviews/gateway-notify-pending-store-2026-10-05.md). |
@@ -2608,7 +2714,8 @@ customer-distribution lane. Before switching lanes, read the
 | after 0.15.x (next) | 0.12.0 | 0.12.0 | **Gateway: the shipped reference configs now admit the server by its identity (#6016, release N+1; gateway restart required, breaking for own-certificate installs that take the new config).** The reference gateway configs (`gateway/config/sys.config.prod`, `deploy/docker/reference-gateway-sys.config`) set `{mgmt_peer_auth_mode, identity}` with no pin. An unset mode is still `pin` (the boot logs a WARN), so a config of your own that does not set the key is unchanged. Bring-your-own certificates, `--no-default-certs` and a server given its own `--cert`/`--key` carry no identity: **set `{mgmt_peer_auth_mode, pin}` and keep your pin before you take the new config**, or every command is refused `no_uri_san`. Upgrade the server first (the gateway needs a server that mints the identity, #6072). Read "Behaviour change: the shipped gateway configs admit the server by its identity" below. |
 | 0.16.x (next) | 0.12.0 | 0.12.0 | **Gateway: the reference gateway config now reads the CA's CRL and refuses a withdrawn server certificate (#6016 PR 4b; gateway restart required; breaking for a gateway on the reference config whose server's 8443 certificate is not issued by the install CA or lacks the URL host in its names: every management stream is refused `revocation_unknown`).** `deploy/docker/reference-gateway-sys.config` sets `{mgmt_crl_source, {url, "https://server:8443/api/v1/ca/crl"}}`; `sys.config.prod` carries it commented. This is a **gateway** release change: a `0.15.0` gateway image ignores the key (no CRL check, no warning, and `YuzuGatewayMgmtCrlNotLoaded` cannot fire because the series is absent), so mount the new config only with a gateway image that carries it, and pin `YUZU_VERSION` accordingly. Upgrade the server first: it serves the CRL on 8443 (a pre-48-hour server's 7-day CRL also works). A gateway with no source logs a WARN under `identity` or `identity_or_pin` (on a management listener that enforces peer authorization) and reads no CRL; a later release will refuse to boot there. The gateway now also needs an outbound path to the server's HTTPS port (8443) and waits up to about 5.5 seconds at start for the first CRL. Alerts: `YuzuGatewayMgmtCrlNotLoaded` (critical), `YuzuGatewayMgmtCrlStale` and `YuzuGatewayMgmtCrlRefreshStalled` (warning). |
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **Breaking, fresh deployment only: stored responses of Forensics-tier plugins are served only to callers holding `Forensics:Read` (#4990).** Applies to every stored-response read path (REST, MCP, dashboard) and to the server-side consumers of those rows (bundle collation, result-set membership, policy checks, the live output stream, execution error text), with the limits listed under "Known limits" in that section; other readers see the rows as absent, with counts and caps computed over what they may read, so an empty result no longer implies no data. Viewer, Operator, PlatformEngineer and ITServiceOwner, and with RBAC off every non-administrator session, no longer see these rows. New built-in `ForensicsAnalyst` role (read-only, assign it fleet-wide with RBAC on) and new audit action `response.forensics.read`. A read whose authority cannot be determined is refused with a retryable error rather than a partial result. This release is a hard cutover: it supports initial deployment into a fresh database only and provides no upgrade path from an earlier server's database (see "Deployment contract" in the section; the agent and gateway columns above are the minimum agent and gateway versions, not a supported upgrade starting point for the database). See "Behaviour change: stored responses of Forensics-tier plugins need `Forensics:Read` (#4990, fresh deployment only)". |
-| 0.15.x (next) | 0.12.0 | 0.12.0 | **MFA step-up is enforced by one central check on 41 named routes, before the route's own checks (breaking order of checks; server restart only, no agent or gateway change, no migration).** A stale or missing MFA proof is now answered with the `401` step-up envelope before the route's own `403` (permission, `token_session`, `not_local`; a cross-site cookie write is answered `403` by the server-wide same-site check before the step-up check); engine principals receive `403` on every step-up-gated route regardless of grants (audited as `mfa.step_up.required`, no longer as the per-route handler denial row); a server with no wired authentication store answers `503` on these routes, and an unreadable store answers `503` to local sessions; `POST /api/settings/mfa/recovery-codes` and `POST /api/settings/mfa/disable` are newly gated; SAML sessions still cannot satisfy step-up (`403`, unless the window is disabled with `--mfa-step-up-window-secs 0`). The server now exits with status `1` at boot when a mutating route has no step-up classification, which can only happen on a fork or custom build (a restart policy turns it into a restart loop; roll back to recover). Other mutating routes and all MCP tools are not MFA-step-up gated in this release. New metric `yuzu_auth_mfa_step_up_gate_total` and alerts `YuzuStepUpGateUnavailable` and `YuzuStepUpWindowDisabled`. See [Breaking: MFA step-up is checked once](#breaking-mfa-step-up-is-checked-once-before-the-routes-own-checks-and-two-more-routes-need-a-fresh-proof). |
+| 0.16.x (next) | 0.12.0 | 0.12.0 | **MFA step-up is enforced by one central check on 41 named routes, before the route's own checks (breaking order of checks; server restart only, no agent or gateway change, no migration).** A stale or missing MFA proof is now answered with the `401` step-up envelope before the route's own `403` (permission, `token_session`, `not_local`; a cross-site cookie write is answered `403` by the server-wide same-site check before the step-up check); engine principals receive `403` on every step-up-gated route regardless of grants (audited as `mfa.step_up.required`, no longer as the per-route handler denial row); a server with no wired authentication store answers `503` on these routes, and an unreadable store answers `503` to local sessions; `POST /api/settings/mfa/recovery-codes` and `POST /api/settings/mfa/disable` are newly gated; SAML sessions still cannot satisfy step-up (`403`, unless the window is disabled with `--mfa-step-up-window-secs 0`). The server now exits with status `1` at boot when a mutating route has no step-up classification, which can only happen on a fork or custom build (a restart policy turns it into a restart loop; the fix is a row in `step_up_policy.hpp` and a rebuild). Other mutating routes and all MCP tools are not MFA-step-up gated in this release. New metric `yuzu_auth_mfa_step_up_gate_total` and alerts `YuzuStepUpGateUnavailable` and `YuzuStepUpWindowDisabled`. See [Breaking: MFA step-up is checked once](#breaking-mfa-step-up-is-checked-once-before-the-routes-own-checks-and-two-more-routes-need-a-fresh-proof). |
+| 0.16.x (next) | 0.12.0 | 0.12.0 | **MFA proofs are bound to the factor they were earned with, and approve and reject require an enrolled factor (hard cutover: fresh database only, no upgrade path, no rollback, no rolling or mixed-version window; no agent or gateway change; #6079).** An enrolled account that reads factor generation `0` (only a database an earlier build wrote holds one, which this build does not support) is refused `503` (audit `reason=mfa_proof_unavailable`) on the 41 step-up routes (the 39 ordinary rows only while `--mfa-step-up-window-secs` is above 0; approve, reject and the 2 factor-credential routes regardless) and on the 3 JIT-elevation routes until `yuzu-server --mfa-reset <user>` clears its factor. See "Breaking: MFA proofs are bound to the factor they were earned with" above. |
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **Seven runtime-config keys are administrator-only on `PUT /api/config/{key}` (breaking for non-administrator and MCP-tier callers; server restart only, no agent or gateway change, no migration).** `plugin_signing_required`, `dex_alert_routing`, `dex_blast_min_devices`, `dex_blast_window_seconds`, `dex_blast_cooldown_seconds`, `dex_cohort_export_key` and `audit_retention_days` now answer `403` to a supervised-tier MCP token and, with RBAC on, to a non-administrator role that holds `Infrastructure:Write`; every other config key is unchanged. Server restart only; see the first section on this page. |
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **The runtime-configuration read shows a caller only the overrides it could write (breaking for MCP-tier and non-administrator readers; server restart only, no agent or gateway change, no migration).** `GET /api/config`, `GET /api/v1/config` and the MCP tool `get_runtime_config` leave out the `oidc_*`, `plugin_signing_required`, DEX alert and `audit_retention_days` overrides unless the caller could write them; an administrator account's `GET /api/config` body is unchanged apart from `log_level` reading `warn`. `heartbeat_timeout` is limited to 30 to 86400 seconds on every write route. Mixed-version fleets are not a concern (server-side only). |
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **The Settings Engine Principals panel needs EnginePrincipal:Read (breaking for an account administrator without it; server restart only, no agent or gateway change, no migration).** See the section above. |
@@ -3003,8 +3110,10 @@ API-token Create and Revoke buttons) now apply the same step-up check as the RES
   it has not (under `sso-only` it is enrolled by construction), and it must hold an administrator
   role). If a deployment has neither an existing token nor a usable break-glass
   account, the only remaining route is to restart with `--mfa-step-up-window-secs 0` as a
-  temporary measure: it disables the stale-proof requirement on every gated endpoint, not only
-  these two (see [Authentication](authentication.md)), so restore the window afterwards.
+  temporary measure: it disables the stale-proof requirement on every ordinary gated endpoint, not only
+  these two (see [Authentication](authentication.md)), so restore the window afterwards. It does not
+  switch off approval approve/reject or the two factor-credential rows (recovery-code regeneration and
+  MFA disable), which keep a window of at most 300 s.
 - **OIDC sessions** are gated only when the identity provider attests MFA (`amr`) or
   `--mfa-enforcement` protects the role. An OIDC-only `--auth-mode=sso-only` deployment is not
   exempt: with no `amr` claim and `--mfa-enforcement=admin-only` or `required`, the session fails
@@ -3853,28 +3962,25 @@ plugin and action rows read back unchanged, so nothing flips on upgrade.
 
 ## Behaviour change: protective actions exempt from plugin enablement
 
-**What changed.** Nine `plugin.action` pairs are now *protective*: the quarantine plugin's
-`quarantine.quarantine`, `quarantine.unquarantine`, `quarantine.status` and `quarantine.whitelist`,
-the firewall plugin's four containment actions `firewall.quarantine`, `firewall.release`,
-`firewall.quarantine_status` and `firewall.quarantine_allow`, and the Guardian rule push
-`__guard__.push_rules`. No plugin-enablement gate refuses them any more:
-not the per-plugin/action kill switch, not the per-OS kill switch (or its agent-presence read), not
-the plugin-presence filter, and not a degraded plugin-config store. The set is closed: the other
-firewall actions (`firewall.state`, `firewall.rules`) stay ordinary. The four quarantine actions are
-**newly** exempt; before this change only the containment gate exempted them. The firewall four were
-added to the set later, so a kill-switch row you hold on one of them stops taking effect on
-upgrade. The containment gate's own exemption is a separate, narrower predicate and still names the
-quarantine plugin only: while the quarantine store cannot be read for longer than a minute, that gate
-refuses every non-exempt dispatch, whichever device it names, including the four firewall actions, until
-the store answers again (the follow-up that moves the containment gate onto the firewall plugin is #7437).
-Decision record: the 2026-10-12 and 2026-11-13 updates in
-[ADR-3005](../adr/3005-plugin-config-store.md).
+**What changed.** Five `plugin.action` pairs are *protective*: the firewall plugin's four containment
+actions `firewall.quarantine`, `firewall.release`, `firewall.quarantine_status` and
+`firewall.quarantine_allow`, and the Guardian rule push `__guard__.push_rules`. No plugin-enablement
+gate refuses them: not the per-plugin/action kill switch, not the per-OS kill switch (or its
+agent-presence read), not the plugin-presence filter, and not a degraded plugin-config store. The set
+is closed: the other firewall actions (`firewall.state`, `firewall.rules`) stay ordinary. The firewall
+four were added to the set in 2026-11, so a kill-switch row you hold on one of them stops taking
+effect on upgrade. The same predicate is the containment gate's exemption, so a quarantined device
+still accepts all four: while the quarantine store cannot be read for longer than a minute, that gate
+refuses every other dispatch, whichever device it names, and still lets those four through. (The
+earlier `quarantine` plugin's own four actions were protective too; that plugin is removed, see
+"Breaking: device containment is the firewall plugin's four actions" above.) Decision record: the
+2026-10-12 and 2026-11-13 updates in [ADR-3005](../adr/3005-plugin-config-store.md).
 
 A kill-switch row for one of these pairs is still accepted and displayed, but it is **kept and
-inert**: it no longer stops dispatch. A plugin-level `quarantine` / `firewall` / `__guard__` row never stops the
+inert**: it no longer stops dispatch. A plugin-level `firewall` / `__guard__` row never stops the
 plugin's protective actions either, and still gates any non-protective action the plugin declares
-(`quarantine` declares only its four and `__guard__` dispatches only `push_rules`; a plugin-level
-`firewall` row still gates `firewall.state` and `firewall.rules`). A
+(`__guard__` dispatches only `push_rules`; a plugin-level `firewall` row still gates `firewall.state`
+and `firewall.rules`). A
 `PUT` on one is audited with `protective_exempt=true` in the `plugin_config.kill_switch.set`
 detail (`protective_exempt=partial` for a plugin-level `firewall` row, which still gates `state` and
 `rules`) and logs a warning. If you stopped Guardian rule delivery by switching
@@ -3885,8 +3991,8 @@ deploy or heartbeat reconcile.
 
 1. **Find held rows.** There is no list route. Search the audit log for
    `plugin_config.kill_switch.set` entries whose `target_id` is `__guard__.push_rules`,
-   `quarantine.<action>`, `firewall.<action>` (one of the four containment actions) or the plugin-level
-   `__guard__` / `quarantine` / `firewall`, each with an optional `@<os>` suffix. Each write leaves two rows (`attempted`, then `success` or `failure`) and a later
+   `firewall.<action>` (one of the four containment actions) or the plugin-level
+   `__guard__` / `firewall`, each with an optional `@<os>` suffix. Each write leaves two rows (`attempted`, then `success` or `failure`) and a later
    `enabled=true` supersedes an earlier OFF, so take the latest `result=success` row per `target_id`.
    Confirm each with `GET /api/v1/plugin-config/<plugin>/kill-switch` at every layer: the
    plugin row, the action row (`?action=<action>`) and each `?os=windows|linux|darwin` variant, reading `source` in the response: it names the row that wins.
@@ -3897,7 +4003,7 @@ deploy or heartbeat reconcile.
    already in flight. No lever stops delivery while leaving armed Guards armed: the old switch did
    that, but disabling or removing a rule disarms it on the next reconcile. It needs `GuaranteedState:Write` (disable) or `GuaranteedState:Delete`
    (remove). `PluginConfig:Write` alone no longer stops anything, and a service-scoped token is
-   denied on rule writes. A `quarantine.*` or `firewall.<containment action>` hold has no
+   denied on rule writes. A `firewall.<containment action>` hold has no
    replacement switch: those actions are governed by their permission (`Security:Execute` on the
    catalogue rows) and any approval policy, not by enablement. A plugin-level `firewall` row you hold
    keeps gating `firewall.state` and `firewall.rules`.
@@ -3911,13 +4017,12 @@ Also be aware of:
   plugin-inventory gap) and refuses a protective dispatch while an upgraded replica delivers it, so the outcome depends on which replica serves the
   heartbeat or the reconcile. Lifting a hold arms rules fleet-wide on the next reconcile, including
   `enforce` rules, so expect a burst of arming rather than a gradual one.
-- **Agents without the quarantine or firewall plugin.** The server no longer withholds a protective
+- **Agents without the firewall plugin.** The server no longer withholds a protective
   dispatch because the agent's reported plugin inventory lacks the plugin. `dispatch_confirmed` means the
   plugin registry **accepted the frame**; it is never proof of isolation. A
   device whose agent lacks the plugin answers its own "plugin not found", and
-  `YuzuQuarantineEndpointUnconfirmed` can fire for a quarantine-plugin containment of it (no alert covers a firewall containment yet). Verify containment with `quarantine.status` (or
-  `firewall.quarantine_status` for a firewall containment), and upgrade agents before you rely on
-  quarantine.
+  `YuzuQuarantineEndpointUnconfirmed` fires for the record that never confirms. Verify containment with
+  `firewall.quarantine_status`, and upgrade agents before you rely on quarantine.
 - **Integrations.** The kill-switch `GET` and `PUT` responses are unchanged: `enabled=false` for a
   protective pair is a stored row, not the dispatch decision. The `os_gate_unreadable`,
   `plugin_not_found` and `kill_switched_os` zero-reach causes are never produced for a protective
@@ -4420,7 +4525,8 @@ No config or data migration is required.
 
 **Not a Breaking lead:** no flag, wire format or API shape changes. In 0.14.0 a graceful agent disconnect deleted the device's `endpoint_state` row, so the device vanished from `/hardware` instead of showing as Offline. A graceful disconnect now clears only the row's presence session, so the device stays listed with its real last-seen time.
 
-- **Migration v4 runs automatically** at server start. It is additive (`CREATE TABLE IF NOT EXISTS endpoint_state.retention_meta`), so rolling back to the previous server binary is safe: the old binary ignores the table.
+- **Migration v4 runs automatically** at server start. It is additive (`CREATE TABLE IF NOT EXISTS endpoint_state.retention_meta`) and removes no schema. A return to an earlier build is outside the "Deployment contract (hard cutover)" in the Forensics section of this page.
+- **`offline_endpoint_store` migration v5 runs automatically** at server start (HA WS-5, plugin-capability visibility, #5685 follow-up; not the `gateway_route_store` v5 described elsewhere in this release). It is additive (`CREATE TABLE IF NOT EXISTS endpoint_state.endpoint_plugins`) and removes no schema; a return to an earlier build is outside the deployment contract. An agent that registered before the upgrade has no stored plugin list until it re-registers, and is treated as unknown (a dispatch to a plugin it lacks is not withheld on a replica that does not hold its session) until then.
 - **Devices that disconnected under 0.14.0 were deleted and are not restored.** Each reappears on `/hardware` the next time it connects.
 - **`/viz/fleet` and MCP `get_fleet_topology`** now also show a departed device, flagged stale, for 7 days, so `yuzu_viz_offline_hosts_total` rises after the upgrade.
 - **Retention.** A row is deleted 37 days after its device was last seen (the 30-day roster window plus a 7-day margin). Each replica runs the prune hourly and deletes at most 12,000 rows per hour. The first pass runs about a minute after the server starts. On the first start after the upgrade it only records its clock anchor, so deletions begin with the next hourly pass; on every later start it already deletes; a large backlog inherited from an older release drains at that rate (100,000 rows in about 8 hours).
@@ -7936,6 +8042,8 @@ The check warns rather than refusing so that a start in a situation outside the 
 
 ### Linux (systemd)
 
+> **Fresh deployment only.** The in-place recipe below is historical and is not a supported upgrade procedure for an earlier build's database (see "Deployment contract (hard cutover)" in the Forensics section of this page).
+
 ```bash
 # 1. Stop the server
 sudo systemctl stop yuzu-server
@@ -9479,7 +9587,7 @@ behave identically.
 cleanly into `failed` instead of spinning. Recovery procedure:
 [`docs/ops-runbooks/auth-db-recovery.md`](../ops-runbooks/auth-db-recovery.md).
 
-**Rollback to a pre-AuthDB release** (only if you have not yet
+**Rollback to a pre-AuthDB release** (historical: v0.12.0, the retired SQLite `auth.db`; not a supported rollback for this build. Applies only if you have not yet
 written user state via the new dashboard):
 
 1. Stop the v0.12.0 server.
@@ -9569,17 +9677,15 @@ The `quarantine` plugin's Windows/Linux/macOS `netsh`/`iptables`/`pfctl` invocat
 
 **If your automation alerts on `status|failed`/`status|release_uncertain`/`status|update_uncertain` from `quarantine` actions, you may see these fire more often after upgrading** — this is expected. Nothing got more broken; the plugin's failure reporting simply got more honest about cases it previously reported as clean success. No action is required beyond expecting the change.
 
-> **Fresh deployment only for 0.15.0.** See the banner at the top of this page: the steps below are not a supported upgrade path from an earlier build's database.
+> **Fresh deployment only for 0.15.0.** See the banner at the top of this page: the steps below are not a supported upgrade, rollback or restore path for an earlier build's database or backups (see "Deployment contract (hard cutover)" in the Forensics section of this page).
 
 ## Rollback
 
-If an upgrade causes issues:
-
-1. Stop the new version
-2. Restore the backed-up `.db` and `.cfg` files
-3. Start the previous version binary
-
-**Important:** Rolling back after a schema migration requires restoring the database files from backup. The old binary cannot read the new schema.
+A return to an earlier build is outside the "Deployment contract (hard cutover)" in the Forensics section of this
+page, and this page documents no rollback procedure. Recovery is to roll forward on the build that wrote the
+database, or to restore a backup taken from this deployment into a fresh deployment (see "Backup recommendation" in [Server Administration](server-admin.md));
+a database or backup written by an earlier build is unsupported. Whether an earlier binary works against a newer
+schema depends on the migration (see "When a server build finds its database ahead of it").
 
 ## Troubleshooting
 

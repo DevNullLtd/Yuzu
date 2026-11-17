@@ -30,11 +30,12 @@
 ///     to an agent. Mutating-but-reversible for the same reason: a later
 ///     sync simply supersedes the prior one.
 ///   - `__sync__.now` (hardware_routes.cpp `POST /api/v1/hardware/{id}/sync` for ONE
-///     agent, and `POST /api/v1/hardware/sync` for up to 500 under one command id,
-///     gated by the type-level Execution:Execute check, the caller's visible-set
-///     intersection, the 500-target cap, a per-operator cooldown and a single
-///     in-flight run) — operator-requested inventory sync-on-demand (ADR-0016
-///     update). Read-only: the agent re-runs a daily-sync source and reports.
+///     agent, and `POST /api/v1/hardware/sync` for the devices a request names under one
+///     command id, gated by the type-level Execution:Execute check, the caller's
+///     visible-set intersection, a confirmation for a whole group or the fleet, the
+///     fleet-administrator rule for the fleet, a per-key cooldown and a paced admission
+///     that spreads the agents' reports) — operator-requested inventory sync-on-demand
+///     (ADR-0016 update). Read-only: the agent re-runs a daily-sync source and reports.
 ///   - `__sync__.settings` (SAM-39, heartbeat reconcile in server.cpp) — the effective software
 ///     collection settings sent to an agent whose reported version differs. Mutating-but-
 ///     reversible: a later push supersedes it and a replay is idempotent.

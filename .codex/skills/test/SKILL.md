@@ -1,6 +1,6 @@
 ---
 name: test
-description: Run or plan Yuzu's `/test` pre-commit and pre-push validation pipeline with quick, default, full, instructions, and quarantine modes. Use when the user says `/test`, `/test --quick`, `/test --full`, asks for the full test gate, or needs the Yuzu test-runs DB workflow.
+description: Run or plan Yuzu's `/test` pre-commit and pre-push validation pipeline with quick, default, full, and instructions modes. Use when the user says `/test`, `/test --quick`, `/test --full`, asks for the full test gate, or needs the Yuzu test-runs DB workflow.
 ---
 
 # Test
@@ -13,7 +13,6 @@ Use this skill for the high-level Yuzu validation pipeline. Route low-level buil
 - `--quick`: build plus offline C++ unit, EUnit, and Dialyzer. No live stack, no synthetic UAT.
 - `--full`: default plus OTA stubs/flows, sanitizer dispatch, coverage, and perf measurement. About 60-120 minutes.
 - `--instructions`: live-stack instruction definition suite only.
-- `--instructions-quarantine`: local quarantine ceremony only. Do not run on remote or SSH-only hosts.
 - `--force-cleanup`: clean this run's dangling containers before start.
 - `--keep-stack`: leave debug stacks running when the script supports it.
 
@@ -105,5 +104,3 @@ Perf thresholds are measure-only as of 2026-05-03. `scripts/test/perf-gate.sh` r
 For `--quick`, resolve the build directory and run only compile plus offline suites. Do not start UAT and do not invoke synthetic UAT.
 
 For `--instructions`, use `scripts/test/instructions-tests.sh` after bringing up only the required live stack.
-
-For `--instructions-quarantine`, use `scripts/test/instructions-quarantine.sh` only on a local machine where temporary self-disconnect is acceptable.

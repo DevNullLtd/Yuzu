@@ -289,12 +289,12 @@ TEST_CASE("iptables -S: real capture — policies, new chain, appends", "[firewa
     constexpr std::string_view out = "-P INPUT ACCEPT\n"
                                      "-P FORWARD ACCEPT\n"
                                      "-P OUTPUT ACCEPT\n"
-                                     "-N yuzu-quarantine\n"
-                                     "-A INPUT -j yuzu-quarantine\n"
-                                     "-A yuzu-quarantine -i lo -j ACCEPT\n"
-                                     "-A yuzu-quarantine -m state --state RELATED,ESTABLISHED -j ACCEPT\n"
-                                     "-A yuzu-quarantine -s 10.0.0.5/32 -j ACCEPT\n"
-                                     "-A yuzu-quarantine -j DROP\n";
+                                     "-N fixture-chain\n"
+                                     "-A INPUT -j fixture-chain\n"
+                                     "-A fixture-chain -i lo -j ACCEPT\n"
+                                     "-A fixture-chain -m state --state RELATED,ESTABLISHED -j ACCEPT\n"
+                                     "-A fixture-chain -s 10.0.0.5/32 -j ACCEPT\n"
+                                     "-A fixture-chain -j DROP\n";
     auto rules = parse_iptables_save(out);
     REQUIRE(rules.size() == 9);
 
@@ -306,19 +306,19 @@ TEST_CASE("iptables -S: real capture — policies, new chain, appends", "[firewa
     CHECK(rules[2].spec == "ACCEPT");
 
     CHECK(rules[3].type == IptablesEntryType::new_chain);
-    CHECK(rules[3].chain == "yuzu-quarantine");
+    CHECK(rules[3].chain == "fixture-chain");
     CHECK(rules[3].spec.empty());
 
     CHECK(rules[4].type == IptablesEntryType::append);
     CHECK(rules[4].chain == "INPUT");
-    CHECK(rules[4].spec == "-j yuzu-quarantine");
+    CHECK(rules[4].spec == "-j fixture-chain");
 
     CHECK(rules[6].type == IptablesEntryType::append);
-    CHECK(rules[6].chain == "yuzu-quarantine");
+    CHECK(rules[6].chain == "fixture-chain");
     CHECK(rules[6].spec == "-m state --state RELATED,ESTABLISHED -j ACCEPT");
 
     CHECK(rules[8].type == IptablesEntryType::append);
-    CHECK(rules[8].chain == "yuzu-quarantine");
+    CHECK(rules[8].chain == "fixture-chain");
     CHECK(rules[8].spec == "-j DROP");
 }
 

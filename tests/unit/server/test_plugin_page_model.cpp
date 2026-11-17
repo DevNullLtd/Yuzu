@@ -111,7 +111,7 @@ TEST_CASE("clip_for_display never cuts a UTF-8 sequence", "[plugin_page][plugins
 
 TEST_CASE("kill switch panel: no plugin entered is the lookup form and a hint", "[plugin_page][plugins][ui]") {
     KillSwitchPanel p;
-    p.known_plugins = {"processes", "quarantine"};
+    p.known_plugins = {"processes", "firewall"};
     const auto h = render_kill_switch_panel(p);
     CHECK_THAT(h, ContainsSubstring("hx-get=\"/fragments/settings/kill-switch\""));
     CHECK_THAT(h, ContainsSubstring("<option value=\"processes\">"));
@@ -170,7 +170,7 @@ TEST_CASE("kill switch panel: a blank action says action-level switches are not 
 
 TEST_CASE("kill switch panel: protective note and unseen-name warning", "[plugin_page][plugins][ui]") {
     KillSwitchPanel p;
-    p.plugin = "quarantine";
+    p.plugin = "firewall";
     p.protective = true;
     p.layers = {layer("", SwitchState::Enabled)};
     CHECK_THAT(render_kill_switch_panel(p),

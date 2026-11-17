@@ -27,7 +27,7 @@ Each capability is rated on two axes:
 | Default | As shipped | Row | Issue |
 |---|---|---|---|
 | RBAC | RBAC ships disabled (`rbac_store.cpp` seeds `rbac_enabled='false'`), so the legacy admin/user model is in force until an administrator enables it. | §18.2 | — |
-| MFA step-up | Step-up is enforced on 41 `kRequired` REST/dashboard routes only; 73 `kPendingRuling` routes and every MCP tool are not step-up gated. | §18.10 | — |
+| MFA step-up | Step-up is enforced on 41 REST/dashboard routes only (39 `kRequired` and 2 `kFactorCredential`); 73 `kPendingRuling` routes and every MCP tool are not step-up gated. | §18.10 | — |
 | Gateway agent listener | Every gateway release artefact (tarball, .deb/.rpm, both GHCR images) serves `:50051` in plaintext on `0.0.0.0` with no boot guard; TLS is only in `sys.config.prod` and the docker reference config. | §37.5 | #6598 |
 | Plugin signatures | An unsigned plugin loads on a default agent install, because the trust bundle and `--plugin-require-signature` both default off. | §24.1 | #4915 |
 | Gateway management-plane CRL | The CRL check is opt-in: `gateway/config/sys.config.prod` sets no `mgmt_crl_source`, so withdrawal is the serial deny-list plus a restart. | §37.7 | — |
@@ -627,7 +627,7 @@ collisions possible; vendor precision pending ADR-0018). See
 
 ### 9.6 Device Quarantine (Network Isolation) :white_check_mark: `T2`
 
-`quarantine` plugin (cross-platform). `quarantine` action isolates device from network, whitelisting management server and optional IPs via firewall rules (prefixed `YuzuQuarantine_`). `unquarantine` removes rules and restores access. `status` checks active quarantine state. `whitelist` adds/removes IPs from active quarantine. Server side (ADR-0047): the containment gate in the shared dispatch path (`dispatch_confined_arms.hpp`), the `QuarantineContainmentReconciler` and the stored-whitelist re-dispatch (`quarantine_reapply.hpp`) are shipped; a degraded containment read fails closed. *(Evidence: `server/core/src/quarantine_containment_reconciler.{hpp,cpp}`, `quarantine_reapply.{hpp,cpp}`.)*
+The `firewall` plugin's four containment actions (cross-platform). `quarantine` isolates a device from the network, allowing the management server and optional exceptions, through an own rule group, table or anchor. `release` removes the rules and restores access. `quarantine_status` reports whether containment is in force. `quarantine_allow` adds or removes exceptions on an active quarantine. Server side (ADR-0047): the containment gate in the shared dispatch path (`dispatch_confined_arms.hpp`), the `QuarantineContainmentReconciler` and the stored-whitelist re-dispatch (`quarantine_reapply.hpp`) are shipped; a degraded containment read fails closed. *(Evidence: `server/core/src/quarantine_containment_reconciler.{hpp,cpp}`, `quarantine_reapply.{hpp,cpp}`.)*
 
 ### 9.7 Indicator of Compromise (IOC) Checking :large_orange_diamond: `T2` *(verified 2026-11-14)*
 
@@ -981,7 +981,7 @@ Session-cookie auth with PBKDF2-hashed passwords.
 
 ### 18.10 Two-Factor Authentication :white_check_mark: `T2` *(verified 2026-09-07)*
 
-Shipped (SOC 2 CC6.6 privileged-access MFA ladder). RFC 6238 TOTP + RFC 4648 base32 + `otpauth://` URI builder (`totp.cpp`), per-user enrolment with QR code (`mfa_qr.cpp`), and a step-up gate (`mfa_step_up.cpp`) that blocks high-risk REST/Settings handlers unless `Session::mfa_verified_at` is fresh within `mfa_step_up_window_secs` - API-token/MCP-token principals skip step-up by design (the bearer credential is the step-up moment). Retitled from "...for Approvals" - the shipped scope is login-time TOTP + step-up on privileged handlers generally. The instruction-approval workflow (#285) is now covered as well: approve/reject require an interactive session and an enrolled MFA factor with a fresh proof (#6061, #6079), under their own stricter rule on top of the generic gate. Email-based OTP fallback not found; scope narrower than the original row's aspiration in that respect. The step-up check is now one central chokepoint (`step_up_gate.cpp`, table `step_up_policy.hpp`) enforcing 41 named REST/dashboard routes; it is REST/dashboard only, so MCP tools and the 73 routes still classified `kPendingRuling` are not step-up gated (`docs/auth-architecture.md` "MFA step-up chokepoint"). An MCP step-up table exists (`step_up_mcp_policy.hpp`) but is data only: no production code consults it. **A SAML session cannot satisfy step-up** — it is refused `403` at every step-up-gated route, approvals included (`saml_mfa_unsupported`, #4935), unless the window is disabled; SAML deployments rely on IdP MFA. *(Evidence: `server/core/src/totp.{hpp,cpp}`, `mfa_qr.{hpp,cpp}`, `mfa_step_up.{hpp,cpp}`; verified 2026-09-07 - previously mis-graded Not Started.)*
+Shipped (SOC 2 CC6.6 privileged-access MFA ladder). RFC 6238 TOTP + RFC 4648 base32 + `otpauth://` URI builder (`totp.cpp`), per-user enrolment with QR code (`mfa_qr.cpp`), and a step-up gate (`mfa_step_up.cpp`) that blocks high-risk REST/Settings handlers unless `Session::mfa_verified_at` is fresh within `mfa_step_up_window_secs` - API-token/MCP-token principals pass step-up on the 39 ordinary rows by design (the bearer credential is the step-up moment; the two factor-credential rows refuse them). Retitled from "...for Approvals" - the shipped scope is login-time TOTP + step-up on privileged handlers generally. The instruction-approval workflow (#285) is now covered as well: approve/reject require an interactive session and an enrolled MFA factor with a fresh proof (#6061, #6079), under their own stricter rule on top of the generic gate. Email-based OTP fallback not found; scope narrower than the original row's aspiration in that respect. The step-up check is now one central chokepoint (`step_up_gate.cpp`, table `step_up_policy.hpp`) enforcing 41 named REST/dashboard routes; it is REST/dashboard only, so MCP tools and the 73 routes still classified `kPendingRuling` are not step-up gated (`docs/auth-architecture.md` "MFA step-up chokepoint"). An MCP step-up table exists (`step_up_mcp_policy.hpp`) but is data only: no production code consults it. **A SAML session cannot satisfy step-up** — it is refused `403` at every step-up-gated route, approvals included (`saml_mfa_unsupported`, #4935), unless the window is disabled, which lets SAML through the 39 ordinary rows only (the two factor-credential rows and approve and reject still refuse it); SAML deployments rely on IdP MFA. *(Evidence: `server/core/src/totp.{hpp,cpp}`, `mfa_qr.{hpp,cpp}`, `mfa_step_up.{hpp,cpp}`; verified 2026-09-07 - previously mis-graded Not Started.)*
 
 ### 18.11 SAML 2.0 SSO :white_check_mark: `T2` *(new row, v4.1)*
 
@@ -1480,7 +1480,7 @@ Partial. The Guardian dashboard shipped at `/guardian` (`server/core/src/guardia
 
 ### 31.10 Rule Signing :x: `T2` *(verified 2026-11-14)*
 
-Not implemented (PR 12). HMAC rule signing (HKDF per design §11.2) with per-tenant key stored in `CredWrite`/`CredRead` (Windows), Linux Secret Service / kernel keyring (Linux), Keychain (macOS); agent-side signature validation before activating a rule prevents unauthenticated rule injection. The wire field exists but is unused (`bytes signature = 7; // ... (contract G3, deferred)` in `proto/yuzu/guardian/v1/guaranteed_state.proto`), and `guardian_rule_spec.cpp:394`'s own comment says "full RFC-8785 canonicalisation lands with rule signing"; no HKDF or signed rule-activation code exists in `guardian_rule_spec.*`, `baseline_store.*` or `guardian_engine.*`. **Retitled 2026-11-14** from "Rule Signing and Quarantine Integration": device quarantine shipped outside Guardian — the `quarantine` plugin (`quarantine`/`unquarantine`/`whitelist`/`status`) and the server-side `QuarantineStore`, containment gate and reconciler (§9.6, §9.9, ADR-0047). The original design text for a Guardian-integrated quarantine (WFP block-all at weight 65535, `quarantine.add_exception | remove_exception | lift`, resilience reset on lift) is not what shipped.
+Not implemented (PR 12). HMAC rule signing (HKDF per design §11.2) with per-tenant key stored in `CredWrite`/`CredRead` (Windows), Linux Secret Service / kernel keyring (Linux), Keychain (macOS); agent-side signature validation before activating a rule prevents unauthenticated rule injection. The wire field exists but is unused (`bytes signature = 7; // ... (contract G3, deferred)` in `proto/yuzu/guardian/v1/guaranteed_state.proto`), and `guardian_rule_spec.cpp:394`'s own comment says "full RFC-8785 canonicalisation lands with rule signing"; no HKDF or signed rule-activation code exists in `guardian_rule_spec.*`, `baseline_store.*` or `guardian_engine.*`. **Retitled 2026-11-14** from "Rule Signing and Quarantine Integration": device quarantine shipped outside Guardian — the `firewall` plugin's four containment actions (`quarantine`/`release`/`quarantine_status`/`quarantine_allow`) and the server-side `QuarantineStore`, containment gate and reconciler (§9.6, §9.9, ADR-0047). The original design text for a Guardian-integrated quarantine (WFP block-all at weight 65535, `quarantine.add_exception | remove_exception | lift`, resilience reset on lift) is not what shipped.
 
 ---
 
@@ -1868,6 +1868,7 @@ ADR-0070 D5/R1: operators register third-party CRL sources through `/api/v1/cryp
 | msi_packages | Y | - | Y | Software |
 | pkg_inventory | Y | Y | Y | Software |
 | middleware | - | Y | - | Software |
+| component_inventory | - | Y | Y | Software |
 | windows_updates | Y | Y | Y | Patch |
 | software_actions | Y | Y | Y | Software |
 | sccm | Y | - | - | Software |
@@ -1879,7 +1880,6 @@ ADR-0070 D5/R1: operators register third-party CRL sources through `/api/v1/cryp
 | event_logs | Y | Y | Y | Security |
 | vuln_scan | Y | Y | Y | Security |
 | ioc | Y | Y | Y | Security |
-| quarantine | Y | Y | Y | Security |
 | certificates | Y | Y | Y | Security |
 | rdp_control | Y | - | - | Security |
 | autoruns | Y | Y | Y | Security |
@@ -1917,7 +1917,7 @@ ADR-0070 D5/R1: operators register third-party CRL sources through `/api/v1/cryp
 | chargen | Y | Y | Y | Test/Debug |
 | example | Y | Y | Y | Test/Debug |
 
-**73 plugin directories: 71 production plugins plus the two test/debug plugins (`chargen`, `example`)**, which appear in the table but are excluded from the headline count (`ls -d agents/plugins/*/` = 73 at HEAD, 2026-11-14). Coverage spans hardware, peripherals, network, security posture, filesystem, registry, WMI, WiFi, WoL, IOC, quarantine, certificates, content distribution, user interaction and more, across cross-platform and Windows-only plugins. Corrections in this pass: `pkg_inventory` Windows is supported (was shown `-`); constrained legs are now shown `🟡` instead of `Y`; and the former `software_usage` "planned" row is removed — usage metering shipped as `app_usage` (§27.2, §35.6). The previous recount history (51 → 71 between 2026-09-15 and 2026-11) is in git history.
+**73 plugin directories: 71 production plugins plus the two test/debug plugins (`chargen`, `example`)**, which appear in the table but are excluded from the headline count (`ls -d agents/plugins/*/` = 73 at HEAD, 2026-11-16, after the earlier device-containment plugin was removed: containment is now the `firewall` plugin's four actions). Coverage spans hardware, peripherals, network, security posture, filesystem, registry, WMI, WiFi, WoL, IOC, device containment, certificates, content distribution, user interaction and more, across cross-platform and Windows-only plugins. Corrections in this pass: `pkg_inventory` Windows is supported (was shown `-`); constrained legs are now shown `🟡` instead of `Y`; and the former `software_usage` "planned" row is removed — usage metering shipped as `app_usage` (§27.2, §35.6). The previous recount history (51 → 71 between 2026-09-15 and 2026-11) is in git history.
 ---
 
 ## Appendix B: Foundation Tier Status

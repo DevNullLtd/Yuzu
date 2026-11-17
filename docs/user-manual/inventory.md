@@ -412,6 +412,83 @@ cadences.
   installed-software inventory. Deploy-time opt-out; not a server-side runtime
   toggle. It does not gate the operator `list`/`query`/`list_per_user` actions.
 
+### Java components (`component_inventory`)
+
+The `component_inventory` plugin's `scan` action (instruction `crossplatform.components.scan`) lists
+software that no package manager owns: Java archives (`.jar`, `.war`, `.ear`) found in application
+trees, and the libraries nested one level inside them (`BOOT-INF/lib/`, `WEB-INF/lib/` or `lib/`).
+It reads the archive files themselves in-process; no process is started and no nested archive is
+unpacked (the archive's directory and, when needed, two small entries are read).
+
+- **Where.** Linux and macOS only, in machine-wide locations only, walked in this order. Linux:
+  `/usr/lib/jvm`, `/usr/share/java`, `/usr/share/maven`, `/usr/local/lib`, `/usr/local/share` and
+  `/opt`. macOS: `/Library/Java`, `/usr/local`, `/opt/homebrew` and `/Applications`. The root list
+  holds no per-user location, so an archive under a home directory is not looked for (a property of
+  the list: an archive found under a root is read wherever it sits). Windows is not read yet: it
+  answers one `unsupported` status row (`windows:planned`). Python and Node components are not
+  collected.
+- **What a row holds.** Kind (`java`), name, version, where the version came from (`filename`,
+  `pom`, `manifest`, or `unreadable` when no source gives one), path (a nested library is
+  `<archive path>!<entry>`), size, modification time and the application folder it sits under.
+- **How the version is read.** From the file name: a pre-release or build qualifier stays in it
+  (`my-app-1.0.0-rc1.jar` reads `1.0.0-rc1`, `spring-core-6.0.0-M1.jar` reads `6.0.0-M1`), while
+  other trailing words are classifiers (`netty-...-4.1.77.Final-linux-x86_64.jar` reads
+  `4.1.77.Final`; `guava-31.1-jre.jar` reads `31.1` from the name alone). When the name gave no
+  version, or is ambiguous (a word follows the version that is not one of the qualifiers above, such
+  as a classifier, or the name holds more than one version-like part), the scan asks the archive:
+  its `pom.properties`, then its manifest. An
+  archive value replaces the name's split only when the file name carries it (`guava-31.1-jre.jar`
+  with a pom version `31.1-jre` reads `31.1-jre`, source `pom`). A `pom` version is read from the
+  archive's only `pom.properties` or, when it holds several, the one named for the archive. An
+  archive with no pom of its own that bundles exactly one dependency's reads that dependency's
+  version, when its file name has no version (`app.jar`, `ROOT.war`); a name that carries a version
+  keeps it (`myapp-2.0.jar` is not affected) unless the archive's value sits in the name.
+  A nested row, and an archive with no pom or manifest, take the file name's word.
+- **Bounds.** One scan stops at 400,000 directory entries or 45 seconds, reads at most 32
+  directory levels, 50,000 entries per directory, 3,000 rows per application folder under each root and 20,000 rows
+  in all, and reads at most a 16 MiB archive directory and 64 KiB per version entry.
+- **When the list may be incomplete.** The status row reads `constrained` when any bound was
+  reached (`budget_entries`, `budget_time`, `section_rows`, `anchor_rows`, `depth`), a directory
+  could not be listed (`dir_unreadable`) or was cut at its cap (`dir_truncated`), an archive could
+  not be enumerated or changed while it was read (`archive_unenumerated`, `archive_changed`), or the
+  mount table could not be read so nothing was walked (`mount_table_unreadable`). Each token is
+  prefixed `<os>:component_inventory:`. The rows already read are still returned, but when time
+  runs out archives not yet read give no rows, and a walk that used the whole budget returns none.
+  Only `supported` means the scan finished: no bound was reached and every directory and archive
+  it opened was read in full.
+- **Reading `budget_entries`.** The 400,000-entry budget is shared by every root, which is why the
+  roots are walked cheapest first. A host whose early roots use it all (a Mac with many large
+  applications under `/Applications`, which is walked last on macOS) answers `constrained` with
+  `budget_entries` and the later roots are not walked, so read the list as the part of the host
+  reached, not as everything. Re-running gives the same answer.
+- **Reported without blocking the answer.** On a `supported` answer, a root dropped because it is a
+  link (`root_link_skipped`), a link met inside a tree (`link_skipped`: the scan follows no link, so
+  the link is neither entered nor listed), a root or directory on a network mount that was passed
+  over (`network_fs_skipped`) and a row with no readable version (`version_unreadable`) ride the
+  status row as information. A `constrained` answer names its one cause only. A missing root is
+  skipped silently.
+- **What to do about a token.** Terminal (a repeat gives the same answer): `budget_entries`,
+  `section_rows`, `anchor_rows`, `depth`, `dir_truncated`, and `archive_unenumerated` for that
+  archive. Retryable: `budget_time` (run again off-peak), `archive_changed`,
+  `mount_table_unreadable`, `dir_unreadable` (after checking what the agent account may read) and
+  `internal_error` (retry once, then report). The informational tokens need no action.
+- **Who can run it, and what it costs.** The roles that may run instructions on a device
+  (`endpoint-admin`, `endpoint-operator`) with the `Inventory` read grant; the result is an
+  ordinary instruction result, read over the responses API like any other. A scan is a live read
+  made when the instruction runs, and it can take up to 45 seconds and 400,000 directory entries
+  on one device. It cannot be cancelled once started: the budget is checked between directories and
+  between archives, so one blocked read is not interrupted. On the packaged Linux unit the agent
+  holds `CAP_DAC_READ_SEARCH`, so permission-restricted directories are readable there and
+  `dir_unreadable` is rare.
+- **Switching it off.** The per-plugin kill switch (`component_inventory/scan`,
+  `PUT /api/v1/plugin-config/component_inventory/kill-switch`) turns the action off. The permanent
+  customer opt-out of ADR-0028 Decisions 2 and 8 is still open (#7737).
+- **What the rows reveal.** Names, versions, paths and application folder names as they appear on
+  disk, which is a detailed software inventory for the device; the names of nested libraries can
+  reveal a customer's internal dependency names.
+- **When it runs.** On demand only, as an instruction. The daily report does not carry these rows
+  yet, so they do not appear in the software inventory views.
+
 ### Install type, scope and location, and the sectioned report
 
 Each stored software row carries four more attributes. They are read-side facts today: the
@@ -557,8 +634,11 @@ whole source name.
 - **Sync now can be spread too.** The agent's `__sync__.now` command takes a
   list of sources and an optional `delay_max_s` (0 to 86400 seconds); with it
   the agent reports at a stable offset within that many seconds instead of
-  immediately. Nothing in the console sends either yet, so Sync now is
-  immediate today. If its first send fails (the server is unreachable), the
+  immediately. A Sync now for a group, a scope or the whole fleet sends
+  `delay_max_s` whenever the run needs spreading: an estimate of the spread
+  that keeps the fleet's reports under one budget (the agent keeps a sync it
+  already armed sooner, so a device may still report earlier). A single device
+  stays immediate. If its first send fails (the server is unreachable), the
   retries follow the pattern in Gentle catch-up, so it can arrive up to about
   45 minutes after the click.
 - **Sections and deltas.** The installed-software report is sectioned per source (see "The
@@ -690,6 +770,11 @@ The delivery is counted by `yuzu_server_inventory_settings_push_total`,
 `yuzu_server_inventory_settings_reconcile_exceptions_total` (see
 [Metrics](metrics.md)), and an alert, `YuzuInventorySettingsPushLoop`, fires when
 the server keeps re-sending settings.
+
+The same documents are reachable by agentic clients over MCP, and each tool returns what its REST
+route returns: `list_software_collection_settings`, `get_software_collection_settings`,
+`set_software_collection_settings` (supervised tier, approval-gated, audited ahead of the write
+like the REST `PUT`) and `get_software_host_collection_settings`.
 
 ## Reading the inventory
 
@@ -978,6 +1063,35 @@ a position count, so a long run of out-of-scope rows costs proportionally more t
 a statement timeout there degrades the page to a 503 (tracked in #5698). A continuation that would pass over more than 100 000 out-of-scope rows since the last row served is refused (the dashboard shows the same text as a notice) (`cursor refused: more than 100000 rows outside the caller's scope were passed since the last row served; narrow the filter (name, version or agent_id) and restart from the first page, or page with a scope of at most 10000 devices`): in page mode that is 25 consecutive empty pages of the maximum size, and an export, which reads up to 10 000 rows per request, reaches it after a few continuations. The limit is checked when a cursor is presented, so a `next_cursor` the server handed out can itself be refused on use; narrow the filter and restart from the first page, or page with a scope of at most 10 000 devices. Keep paging until
 `next_cursor` is `null`.
 
+### Exporting the installed-software inventory
+
+`GET /api/v1/inventory/software/export?format=jsonl|csv` writes every installed-software row
+that matches your filters as one download, with no row cap: JSONL is one JSON object per line,
+CSV is the 23 columns of the list under a single header row. It takes the filters of the
+route above (`format=json` is not accepted, and `cursor` and `limit` are refused). It is
+confined to your scope like the rest of the Inventory reads; a wide scope is filtered on the
+server, so those exports read more rows than they return.
+
+```bash
+# The whole inventory visible to you, as a spreadsheet file
+curl -H "Authorization: Bearer $TOKEN" -o software.csv \
+  "$SERVER/api/v1/inventory/software/export?format=csv"
+
+# One title, as lines for a script
+curl -H "Authorization: Bearer $TOKEN" \
+  "$SERVER/api/v1/inventory/software/export?format=jsonl&name=OpenSSL"
+```
+
+A few rules for what you build on it:
+
+- **A cut-short transfer is an incomplete file.** The server cannot change the status after the first byte, so a failed read, a run past 900 seconds or a server shutdown ends the response without its final chunk and your HTTP client reports an aborted transfer. Start again; do not use the partial file. A clean end means complete.
+- **Two exports at a time by default.** Each open export holds a server worker and one lease from the server's held-open stream budget, so a third request gets `503` with `retry_after_ms` 5000. The limit is `--inventory-export-concurrency`, shared by every caller of the server ([Server administration](server-admin.md)). The same `503` is returned when the server's whole held-open budget (`--max-sse-streams`) is full; retry shortly.
+- **It is a live walk, not a snapshot.** A device that reports while the export runs can have rows repeated or missed.
+- **Audited once, up front** as `inventory.software.export` (see [Audit log](audit-log.md)), and counted in `yuzu_server_software_export_total` ([Metrics](metrics.md)).
+- **REST only.** A streamed file is not a tool call, so there is no MCP tool; an agentic worker pages the same rows with `query_installed_software`.
+
+Wire reference: [REST API](rest-api.md#get-apiv1inventorysoftwareexport).
+
 ### REST: software title catalogue
 
 `GET /api/v1/inventory/software/catalogue` returns one row per software title across the
@@ -997,6 +1111,8 @@ Three REST reads show how installed-software collection is going. Parameters and
 - **`GET /api/v1/inventory/software/plugin-health`** is the fleet view: one entry per facet (collector) with the number of devices in each status, the share timing out or failing, collection time and bytes read (p50, p95, max) and the ten slowest devices. Start here.
 - **`GET /api/v1/inventory/software/hosts`** and **`/hosts/{agent_id}`** are the per-device view: each device's last report time and, per facet, the status, the short `token` explaining it, when it was last confirmed, and what the last collection cost. Use `q` to find a device by hostname or agent id among the devices the roster holds (seen in the last 30 days, the newest 100,000: a search that finds nothing proves nothing while `roster_truncated` is `true`, and a device quiet for over 30 days is listed but not matched; tracked by #7790), and `last_synced_before` to list devices that have gone quiet.
 - **`GET /api/v1/inventory/software/summary`** gives devices reporting and stale (no report for 48 hours), install, removal and upgrade counts for the last 24 hours and 7 days, and the catalogue size.
+
+**MCP access.** Each read has an MCP twin that returns the same `data` object as the route: `list_software_hosts`, `get_software_host`, `list_software_changes`, `get_software_summary` and `get_software_plugin_health`. They need the same `Inventory:Read` grant, apply the same management-group scope, and are strict about input: an unknown argument or an out-of-range value is refused where the REST route clamps. A device outside the caller's scope and an unknown device answer the same not-found.
 
 **Reading collection health.**
 
@@ -1252,34 +1368,67 @@ place, **Hardware** and **Software**, each its own page:
     - **Who may.** The route needs `Execution:Execute`, checked as a **global** grant (or
       RBAC off). An operator whose `Execution:Execute` is limited to management groups is
       refused with `403` for every choice, including a single device. A browser (session-cookie) request must carry an `Origin` or `Referer` naming this site (`403` otherwise; token callers are exempt). The route also
-      confines its targets to the caller's own `Execution:Execute` visible set and refuses
-      **Whole fleet** (`403`) unless that set is unfiltered; with a global grant neither
-      changes the outcome today, and both stay in place as defence in depth for when the
-      gate becomes scope-aware.
+      confines its targets to the caller's own `Execution:Execute` visible set. **Whole fleet**
+      needs a **fleet administrator**: an unfiltered `Execution:Execute` and the global
+      `ManagementGroup:Write` grant (`403` otherwise).
+    - **Confirmation.** A whole group (`group:<id>`) and the whole fleet are refused with
+      `400` unless the request carries `"confirm": true`; a single device and a scope
+      expression never need it. The page's dialog does not send the confirmation yet, so
+      its **Whole fleet** choice, and a `group:<id>` typed as the scope, are answered `400`
+      naming it; **This device** and a scope expression run as before. An API or MCP caller
+      sends `"confirm": true` itself.
     - **Which devices.** A run reaches agents attached to **this server process** only.
       `skipped_offline` counts the devices this server process did not reach that are not too old: it has no live session for them (a disconnected device, or one attached to another server), or the send was refused by the live stream (for example a gateway-attached agent whose gateway lacks the dispatch capability).
       Which devices are candidates depends on the scope: a group or a single named device lists its disconnected members too, but an `__all__` or scope-expression run lists only this server's own sessions plus the shared presence record, so a device that is offline everywhere is never counted, and if the presence read is degraded an `__all__` run lists fewer devices (those attached to other servers are not listed) while a scope-expression run is refused with 503 (the scope could not be evaluated) and sends nothing.
       `requested` and `skipped_offline` therefore describe what this server could reach; they are not a census of the fleet. Agents older than 0.13.1 are skipped
-      and counted separately (`skipped_version`). One request reaches at most 500 devices (`413` above that, counted after the skips:
-      narrow the scope). A scope expression may be up to 1,024 bytes and a device or group id
-      up to 256 bytes.
-    - **Limits.** A group, scope or fleet run is limited to one per operator per 60 seconds
-      (`429` with `Retry-After`; an attempt refused for exceeding 500 devices, or with no live target, counts as a run, a send every device refused does not) and one at a time per server process (`409`); a single device
-      is exempt from both. A `409` can follow a slow agent connection: the server sends to its
-      targets one after another, and a connected agent that has stopped reading holds the run
-      for at most 120 seconds, after which the next request takes the run over (`retry_after_ms` on the `409` is the time until that lease lapses; the stalled send itself is not cancelled). At most three runs are alive at once: while three stalled sends are still alive, no further takeover is allowed, the `409` keeps answering, and a WARN line is logged, until one of those sends unwinds (the agent reads, or its connection is cut) or the server restarts. A server clock that steps backwards
-      cannot lock an operator out: a last-run time in the future is ignored. Both limits are
-      held in each server process, not across a cluster: with several active servers every
-      one allows its own run and keeps its own per-operator cooldown, and each run is still
-      bounded by the 500-device cap. One run can make up to 500 agents upload their
-      inventory at nearly the same moment; see the connection-pool note in
-      [Server administration](server-admin.md).
-    - **Audit and result.** The request is audited as `inventory.sync.request` before
-      anything is sent, and is refused if the audit row cannot be written. `202` means the
-      request was sent, not that the devices have synced: the page's figures change when each
-      device reports back. In the `202` body `agents_reached` is the number of agents that
-      accepted the request; the audit row's `reached` is the number the run planned to send
-      to.
+      and counted separately (`skipped_version`). A request may also carry `last_synced_before`
+      (epoch seconds): only devices whose last accepted report is older are asked, and the rest
+      are counted in `skipped_fresh`. A scope expression may be up to 1,024 bytes and a device
+      or group id up to 256 bytes.
+    - **Pacing.** There is no limit on the number of devices. The server sends the request to
+      every reachable device at once, and asks each agent to report at a stable per-device
+      offset inside `delay_max_s` seconds (at most 86,400; `0` for a run small enough to go
+      at once). Every run still spreading shares one budget of 50 reports per second per
+      server process, and a run takes at most half of what is free: a run that finds the
+      budget used is refused with `429` (`Retry-After`), and one that could not be spread
+      inside 86,400 seconds even then is refused with `413`. `delay_max_s` and the
+      `estimated_completion_at` derived from it are **estimates**: the budget bounds what the
+      server asks for, not the rate reports arrive at, because an agent keeps a fire it already
+      armed when that is sooner than the offset it was given, so a device whose own scheduled
+      sync is due sooner reports then, as a full send. A fleet run that lands shortly before
+      the nightly sync window turns that window's scheduled syncs into full sends at the
+      window's own rate. One run can still make many agents upload their inventory within a
+      few seconds; see the connection-pool note in [Server administration](server-admin.md).
+    - **Joining and the cooldown.** A request for a group, scope expression or the fleet that
+      finds a run of the same target still spreading **joins** it: `202` with that run's
+      counts and `"joined": true`, and nothing is sent. Callers share a run only when they
+      are sent the same devices: administrators share the fleet's run, callers with an
+      unfiltered `Execution:Execute` share a group's run, and a caller confined to part of a
+      group has runs of their own and never receives another caller's counts. A scope
+      expression belongs to the operator who sent it and to its exact text. A request the
+      running run does not cover (a later or absent `last_synced_before` over a filtered run)
+      is `409` with the time left in `retry_after_ms`. After a run starts, the same group,
+      scope expression or fleet waits out a cooldown, 600 seconds by default
+      (`--inventory-sync-cooldown`, `0` for none): `429` with `Retry-After`. A run that no
+      device accepted does not start the cooldown. A single device is exempt from the
+      spread, the join and the cooldown. At most three send loops are alive in a server
+      process at once, and a fourth is `409`: the server sends to its targets one after
+      another, and a connected agent that has stopped reading holds its run (the stalled
+      send itself is not cancelled). A server clock that steps backwards cannot lock a key
+      out: a last-run time in the future is ignored. The run state, the cooldown and the
+      budget are held in memory in each server process, not across a cluster: with several
+      active servers every one paces and joins on its own, and a restart forgets them (agents
+      keep the delays they already armed).
+    - **Audit and result.** The request is audited as `inventory.sync.request` (the
+      whole-fleet row as `software_estate.sync.fleet_wide`) before anything is sent, and is
+      refused if the audit row cannot be written. `202` means the request was sent, not that
+      the devices have synced: the page's figures change when each device reports back. In
+      the `202` body `agents_reached` is the number of agents that accepted the request; the
+      audit row's `reached` is the number the run planned to send to. The body also carries
+      an `execution_id`: `GET /api/v1/hardware/sync/{execution_id}` reports the frames
+      accepted and the agents that armed the sync or failed. An agent answers when it arms
+      the sync, not when its report lands, so those figures count requests taken up, not
+      reports received.
   - **Who sees what.** The catalogue is a fleet-wide aggregate that cannot be narrowed to
     a management group, so the fleet view, the strip and the version counts need an
     unfiltered `Inventory:Read`; a management-group-scoped account is told so and refused
@@ -1899,6 +2048,14 @@ sync, defeating the hash-skip protocol.
   Chassis, board and DIMM serial numbers are personal data on the same footing as the
   device serial and system UUID. Agents keep working unchanged; upgrade the server
   before the agents.
+- **Bulk pull.** To read every stored record without one call per device, page through
+  `GET /api/v1/hardware-ci` (MCP: `list_hardware_ci_records`): the scalar `ci` fields of each
+  device plus its stored `content_hash` and `blob_version`, 100 devices per page by default (the MCP tool defaults to 20) and
+  1000 at most, with no sections. It reads the stored records, not the 30-day device roster, so a
+  device that has been offline longer still appears while its record exists. Walk the pages one
+  at a time and off-peak; do not fan pages out in parallel. Every page leases one connection from
+  the server's shared PostgreSQL pool (`--postgres-pool-size`), which also serves RBAC checks and
+  audit writes. Rows are ordered by the byte value of `agent_id`, not by the database's collation, and every `agent_id` comparison it makes (the single-device `?agent_id=` read included) is byte-ordered, so a change to the operating system's collation rules cannot make this READ skip or miss a device; an index on that byte order makes an index scan available for each page (the planner decides, and the representative plans measured use it). Writes, decommission and the per-device reads (`GET /api/v1/hardware/{id}`, `get_hardware_ci`) still go through the primary key, which follows the database collation. If the collation changes and the indexes are not rebuilt, an emulation (20,000 devices, one run; an upper bound, not a prediction for a real upgrade) showed about 6 in 10 existing devices not found by those per-device reads, every report inserting a new row instead of updating the record (about 38,000 rows after four rounds), some reports refused, duplicate and divergent records for one device served by this walk (and for some devices not the newest copy), and a decommission reporting success while removing only about 4 records in 10, so decommissioned devices stayed stored and kept being served. The write-side control (a pause of writes while a mismatch stands) is a later change; every other keyset read still follows the database collation too: see "PostgreSQL collation version" in [Server administration](server-admin.md#postgresql-collation-version). A complete walk is not a snapshot: confirm a device with `?agent_id=<id>` (byte-exact, unaffected by a collation change) before acting on its absence, and treat an empty confirm page as "not found" (no stored record, or outside the credential's scope), not as "deleted". `GET /api/v1/devices/{id}` is no substitute: it answers only for a device with a live session, so a long-offline device is `404` although its record exists. Retire a configuration item only through your own decommission process, never from absence in a walk or a `404` there. See [REST API](rest-api.md#get-apiv1hardware-ci).
 - **What the agent sends.** An agent that carries this change always sends the versioned
   record; there is no flag to fall back to the earlier format, and `--inventory-disable`
   still stops the collection. Each section reports one of four levels:

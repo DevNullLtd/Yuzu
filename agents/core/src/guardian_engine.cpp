@@ -306,10 +306,18 @@ BaselineReadOutcome read_baseline_record(KvStore& kv, const std::string& rule_id
 /// KV-backed read in this file already degrades-and-logs on (put_rule_locked's own
 /// json_to_rule parse-failure sites), not a new weaker posture introduced for
 /// baselines specifically.
+/// `outcome` (#5605), when non-null, receives the raw read outcome so a caller can tell a
+/// genuinely Absent record from a read error, a malformed record or a fingerprint mismatch
+/// (which stays Ok); the return value and logging are unchanged. Only the shared seed block in
+/// reconcile_rule_locked passes it.
 std::optional<std::string> guardian_seed_baseline(KvStore& kv, const std::string& rule_id,
-                                                   const std::string& fingerprint) {
+                                                   const std::string& fingerprint,
+                                                   BaselineReadOutcome* outcome = nullptr) {
     BaselineRecord rec;
-    switch (read_baseline_record(kv, rule_id, rec)) {
+    const BaselineReadOutcome read = read_baseline_record(kv, rule_id, rec);
+    if (outcome)
+        *outcome = read; // #5605: the RAW read outcome (a fingerprint mismatch below stays Ok)
+    switch (read) {
     case BaselineReadOutcome::Absent:
         return std::nullopt; // genuinely no baseline yet - first-ever arm for this rule_id
     case BaselineReadOutcome::ReadError:
@@ -1148,6 +1156,19 @@ std::expected<void, std::string> GuardianEngine::start_local() {
             journal_maint_exceptions_.fetch_add(1, std::memory_order_relaxed);
         }
     };
+
+    // #5605: mark the boot re-arm walk so reconcile_rule_locked's shared seed block counts a
+    // rule whose boot seed lookup found no persisted baseline (boot_rebaselined_). The flag is
+    // mtx_-guarded (start_local and apply_rules both hold it), so apply_rules can never see it
+    // set. The scope guard is function-scoped, so it clears the flag when start_local returns
+    // (including on the catch arms below and an un-firewalled throw; the journal_flush pattern
+    // above; declared after it, so it fires first, with mtx_ still held). The flag therefore
+    // stays set through the summary logging after the loop, which never reaches
+    // reconcile_rule_locked. The handler is assigned BEFORE the flag is set: a throwing
+    // std::function assignment would otherwise leave the flag set with no guard to clear it.
+    GuardianRollback boot_walk_clear;
+    boot_walk_clear.fn = [this] { boot_rearm_walk_ = false; };
+    boot_rearm_walk_ = true;
 
     std::size_t rearmed = 0;
     std::size_t boot_rearm_failed = 0; // #5513: synchronous failures only (Failed or a throw)
@@ -2087,6 +2108,23 @@ std::uint64_t GuardianEngine::baseline_persist_failures() const {
     // tick's OTHER GuardianEngine getters do take mtx_; this one just never adds to the wait.
     const auto* p = baseline_persister_published_.load(std::memory_order_acquire);
     return p ? p->failure_signals() : 0;
+}
+
+std::optional<std::uint64_t> GuardianEngine::baseline_unpersisted() const {
+    // Lock-free by design (never mtx_), like baseline_persist_failures(): prefer_spark_ is a
+    // const bool and the published pointer is atomic, so no lock is needed for the dormancy
+    // gate. nullopt (not 0) when dormant, so the heartbeat omits the tag rather than reporting
+    // a fabricated "live, nothing pending" (the arm_stats() false-present trap).
+    if (!prefer_spark_)
+        return std::nullopt;
+    const auto* p = baseline_persister_published_.load(std::memory_order_acquire);
+    if (!p)
+        return std::nullopt;
+    return p->pending_captures();
+}
+
+std::uint64_t GuardianEngine::baseline_rebaselined_at_boot() const noexcept {
+    return boot_rebaselined_.load(std::memory_order_relaxed);
 }
 
 std::uint64_t GuardianEngine::baseline_persist_refusals() const {
@@ -3727,8 +3765,19 @@ GuardianEngine::reconcile_rule_locked(const gpb::GuaranteedStateRule& rule) {
         if (auto it = rule.assertion().params().find("path"); it != rule.assertion().params().end())
             path = it->second;
         const auto fingerprint = guardian_baseline_fingerprint("file-hash-equals", path);
-        if (auto seeded = guardian_seed_baseline(*kv_, rule.rule_id(), fingerprint))
+        // #5605: the ONE place a boot re-arm's "no persisted baseline" is counted. This block is
+        // before the backend fork, so it runs once per rule on BOTH backends (the legacy branch
+        // seeds a second time inside start_guard_for_rule_locked, which is deliberately NOT
+        // instrumented: counting there would double-count) and before the Unwired/SparkFailed
+        // return below. Only a genuinely Absent record counts. A read error and a malformed
+        // record already log, and a fingerprint mismatch (a retarget) reads as Ok here and is
+        // not counted; a retarget whose new capture was never persisted before a crash reads
+        // the same way, so a lost capture of that kind moves no signal (documented gap).
+        BaselineReadOutcome seed_outcome = BaselineReadOutcome::Ok;
+        if (auto seeded = guardian_seed_baseline(*kv_, rule.rule_id(), fingerprint, &seed_outcome))
             assertion->expected_hash = *seeded;
+        else if (boot_rearm_walk_ && seed_outcome == BaselineReadOutcome::Absent)
+            boot_rebaselined_.fetch_add(1, std::memory_order_relaxed);
         if (seed_read_hook_for_test_)
             seed_read_hook_for_test_(rule.rule_id());
     }
@@ -4051,8 +4100,10 @@ void GuardianEngine::wire_spark_engine(SparkEngine* engine, bool spark_disabled_
                       "anything but a real KvStore (see kv_store.hpp's IJournalStore doc)");
         lifecycle_journal_ = std::make_shared<GuardianLifecycleJournal>(kv_);
         baseline_persister_ = std::make_shared<GuardianBaselinePersister>(
-            kv_, spark_runtime_->staged_baseline_drops_source()); // #4045
-        // Published for the lock-free heartbeat getters; never cleared (see the member's doc).
+            kv_, spark_runtime_->staged_baseline_drops_source(),
+            spark_runtime_->staged_baseline_count_source()); // #4045, #5605
+        // Published for the lock-free heartbeat getters; only rollback_spark_wiring_locked ever
+        // unpublishes it (see the member's doc).
         baseline_persister_published_.store(baseline_persister_.get(), std::memory_order_release);
 
         auto id = engine->register_consumer("guardian-spark",
@@ -4159,6 +4210,11 @@ void GuardianEngine::rollback_spark_wiring_locked(SparkEngine* engine, bool regi
     spark_runtime_.reset();
     spark_backend_.reset();
     spark_reader_.reset();
+    // #5605: unpublish the persister (the object, baseline_persister_, stays alive until the
+    // destructor). A wiring that failed AFTER the publish leaves this agent SparkFailed, where
+    // nothing can ever stage: the lock-free heartbeat getters must read "no persister", not a
+    // live 0 that baseline_unpersisted() would report as "Spark path live, nothing pending".
+    baseline_persister_published_.store(nullptr, std::memory_order_release);
     if (registered)
         engine->unregister_consumer(consumer_id);
     spark_engine_ = nullptr;

@@ -25,6 +25,7 @@ The `echo` plugin was named `tar` before 2026-10 (`tar.dll`, `tar.so`, `tar.dyli
 | `browser_policy` | 🟡 🟡 ✅ | Enterprise-managed Chrome, Chromium and Edge browser policy inventory | [README](../../agents/plugins/browser_policy/README.md) |
 | `certificates` | ✅ ✅ ✅ | Certificate inventory and management for system stores | [README](../../agents/plugins/certificates/README.md) |
 | `chargen` | ✅ ✅ ✅ | RFC 864 character generator — streams rotating ASCII lines | [README](../../agents/plugins/chargen/README.md) |
+| `component_inventory` | 🟡 ✅ ✅ | Installed software components found in application trees (Java archives) | [README](../../agents/plugins/component_inventory/README.md) |
 | `content_dist` | ✅ ✅ ✅ | Content staging — download, verify, execute, and manage staged files (no shell-out) | [README](../../agents/plugins/content_dist/README.md) |
 | `device_identity` | ✅ ✅ ✅ | Reports device hostname, domain membership, and AD organizational unit | [README](../../agents/plugins/device_identity/README.md) |
 | `diagnostics` | ✅ ✅ ✅ | Agent diagnostics — log level, certificates, connection info | [README](../../agents/plugins/diagnostics/README.md) |
@@ -63,7 +64,6 @@ The `echo` plugin was named `tar` before 2026-10 (`tar.dll`, `tar.so`, `tar.dyli
 | `privacy_permissions` | 🟡 🟡 🟡 | Per-app sensitive-permission grants -- camera, microphone, location, full-disk-access equivalents (read-only) | [README](../../agents/plugins/privacy_permissions/README.md) |
 | `processes` | ✅ ✅ ✅ | Process listing — enumerate and query running processes | [README](../../agents/plugins/processes/README.md) |
 | `procfetch` | ✅ ✅ ✅ | Enumerates running processes with SHA-1 hashes of executables | [README](../../agents/plugins/procfetch/README.md) |
-| `quarantine` | ✅ ✅ ✅ | Device network isolation (quarantine) with per-IP whitelisting | [README](../../agents/plugins/quarantine/README.md) |
 | `rdp_control` | ✅ ⛔ ⛔ | Remote Desktop control — enable/disable RDP (registry + firewall + TermService) | [README](../../agents/plugins/rdp_control/README.md) |
 | `registry` | ✅ 🟡 🟡 | Windows Registry -- get, set (six types, verified), delete value, delete key (optionally recursive), enumerate, per-user reads and writes, bulk apply with an undo manifest | [README](../../agents/plugins/registry/README.md) |
 | `remote_access_audit` | 🟡 ✅ 🟡 | SSH inbound-access audit: sshd_config as written, per-account authorized_keys fingerprints, sshd service state; never key comments, option values or paths | [README](../../agents/plugins/remote_access_audit/README.md) |
