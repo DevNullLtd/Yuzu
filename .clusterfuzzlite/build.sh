@@ -46,3 +46,12 @@ build_target fuzz_guardian_rule_spec \
   "$SRC_DIR/server/core/src/guardian_rule_spec.cpp" \
   "$SRC_DIR/server/core/src/guardian_resilience_schema.cpp" \
   "$SRC_DIR/server/core/src/guardian_schema_registry.cpp"
+
+build_target fuzz_file_search_cursor \
+  "$SRC_DIR/tests/fuzz/fuzz_file_search_cursor.cpp"
+
+build_target fuzz_file_search_names \
+  "$SRC_DIR/tests/fuzz/fuzz_file_search_names.cpp"
+
+build_target fuzz_file_search_glob \
+  "$SRC_DIR/tests/fuzz/fuzz_file_search_glob.cpp"
