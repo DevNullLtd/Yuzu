@@ -5316,6 +5316,9 @@ test('contract registry', _python3_test,
   args: [files('../scripts/test/contract-evidence.py'), 'check'], suite: 'docs', timeout: 30)
 test('contract evidence CI step', _python3_test,
   args: [files('test_contract_evidence_ci_step.py')], suite: 'docs', timeout: 30)
+# One CCACHE_MAXSIZE per self-hosted pool: a smaller cap trims the shared cache.
+test('ci ccache cap', _python3_test,
+  args: [files('test_ci_ccache_cap.py')], suite: 'docs', timeout: 30)
 if get_option('build_contract_tests')
   _contract_adapter = files('../scripts/test/contract-evidence.py')
   test('contract.plugin.loader.reserved-name.reject', _python3_test,

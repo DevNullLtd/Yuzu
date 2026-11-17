@@ -248,6 +248,10 @@ Self-hosted runners (the `yuzu-bigtam-linux`, `yuzu-weetam-windows` and `yuzu-bi
 
 If two matrix legs build the same triplet (e.g., `gcc-13 debug` and `gcc-13 release` both build `x64-linux`), share the cache directory keyed on the **triplet**, not the matrix axis. The CI overhaul commit on 2026-04-28b establishes this — cumulative first-warm cost dropped ~5 h → ~2 h 20 min by collapsing per-matrix scopes into per-triplet scopes.
 
+**One `CCACHE_MAXSIZE` per pool:**
+
+A self-hosted runner keeps one ccache directory for every workflow that runs on it, and ccache trims that directory to the cap of whichever job is writing. A new self-hosted job that uses ccache MUST set the same `CCACHE_MAXSIZE` as the other jobs on its pool (30G today) and must not change it in a step. A smaller cap empties the cache the other jobs rely on: `codeql.yml` and `sanitizer-tests.yml` at 500M did exactly that until 2026-11-17 (`docs/ci-architecture.md` "Build speed (Big Tam)"). `tests/test_ci_ccache_cap.py` enforces this. A job that must not use cached objects (a compiler-tracing build) sets `CCACHE_DISABLE=true` on that step; it must not use `CCACHE_RECACHE`, which still runs a cache cleanup on every call.
+
 **Sentinel-driven invalidation:**
 
 Self-hosted caches stay until something invalidates them. `scripts/ci/vcpkg-triplet-sentinel.sh` is the canonical invalidator: it computes the cache key from `vcpkg.json` + `vcpkg-configuration.json` + overlay triplets + `VCPKG_COMMIT`, compares against the stored sentinel, and wipes the triplet tree (and the orphaned-registry `vcpkg/info/` directory — see #741) on drift. Always run the sentinel before `vcpkg install` on self-hosted.

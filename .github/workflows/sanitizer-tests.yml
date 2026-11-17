@@ -52,7 +52,12 @@ concurrency:
 
 env:
   VCPKG_COMMIT: "9eec002df1cd109f8f104cd966a763daf9751489"
-  CCACHE_MAXSIZE: "500M"
+  # Must equal every other self-hosted job's CCACHE_MAXSIZE: these legs
+  # write to the Big Tam runner's own ccache, which ci.yml, nightly.yml
+  # and release.yml also use, and ccache trims that directory to the cap
+  # of whichever job is writing. 500M cut the runner's ~30 GB cache to a
+  # few GB on every dispatch (tests/test_ci_ccache_cap.py).
+  CCACHE_MAXSIZE: "30G"
   CCACHE_COMPRESS: "true"
   # Big Tam allocates one 8C/16T L3 domain to each runner.
   YUZU_BUILD_JOBS: "16"

@@ -1226,18 +1226,32 @@ versioned source and verification commands are in
 
 ### Build speed (Big Tam)
 
-The `runner` user (shared `HOME=/home/runner` across r0–r3) is provisioned once
-for fast, download-free builds:
+All four runners run as the `runner` user, but each runner's `.env` sets its own
+`HOME` (`/home/runner/rN/home`, checked 2026-11-17), so jobs see a per-runner
+home directory. The user is provisioned once for fast, download-free builds:
 
-- **ccache** `max_size=50G`, compression on — the host default is 5 GiB, far too
-  small for ~700 TUs × variants. ci.yml/nightly cap at 30G via the
-  `CCACHE_MAXSIZE` env; release.yml now sets `CCACHE_MAXSIZE=30G` too (it had been
-  inheriting the host default).
+- **ccache**: one cache per runner, at `/home/runner/rN/home/.cache/ccache`.
+  Every self-hosted job that runs ccache sets `CCACHE_MAXSIZE=30G`, with
+  compression on. ccache's built-in default of 5 GiB is far too small for
+  ~700 TUs × variants, and the `max_size=50G` in `/home/runner/.config/ccache`
+  is not read, because jobs don't run with that home directory. **Every job
+  on a pool must use the same cap.** ccache trims the directory to the cap of
+  whichever job is writing, so one job with a smaller cap empties the cache
+  the other jobs rely on. Until 2026-11-17, `codeql.yml` and
+  `sanitizer-tests.yml` set 500M. Each daily CodeQL trace cut its runner's
+  cache from about 30 GB to 3-4 GB. For the next 12 hours that runner's CI
+  hit rate ran 13-20 points below the other runners' (four of five trims
+  measured 2026-11-12 to -17). `tests/test_ci_ccache_cap.py` now requires one cap per
+  pool, and the CodeQL-traced build runs with `CCACHE_DISABLE` (see the
+  comment on that step). At 30G a runner's cache keeps about two days of
+  objects and sits at the cap. That limit is not what costs hits: r3,
+  which no trim reached in that window, ended every job at the cap and had the same
+  hit rate as the best of the other runners (79.1%, against 73.8-79.8%).
 - **mold** linker (`apt install mold`), wired via `-fuse-ld=mold` in the gcc-15 /
   clang-21 native files — large cut in link time on the big `yuzu-server` /
   `yuzu-agent` binaries and the release LTO link.
-- **meson** 1.12.0 + the rest of `requirements-ci.txt` persist in the runner
-  user's `~/.local`, so the per-job `pip install --user --require-hashes` is a
+- **meson** 1.12.0 + the rest of `requirements-ci.txt` persist in each runner's
+  `~/.local`, so the per-job `pip install --user --require-hashes` is a
   no-op (no re-download).
 - **rpm** (rpmbuild) installed for release.yml's packaging step — absent on a
   fresh 26.04 (it was the first-Big-Tam-release blocker). Note: Big Tam ships RPM

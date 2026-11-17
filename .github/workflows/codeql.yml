@@ -152,7 +152,14 @@ permissions:
 env:
   VCPKG_COMMIT: "9eec002df1cd109f8f104cd966a763daf9751489"
   VCPKG_BINARY_SOURCES: "default"
-  CCACHE_MAXSIZE: "500M"
+  # Must equal every other self-hosted job's CCACHE_MAXSIZE: ccache trims a
+  # cache directory to the cap of whichever job is writing to it, and this
+  # job shares the runner's cache with ci.yml, nightly.yml and release.yml
+  # (tests/test_ci_ccache_cap.py). At 500M the daily trace cut a Big Tam
+  # runner's ~30 GB cache to 3-4 GB (ccache -s, 2026-11-14 to -16: 1588
+  # cleanups per run), and that runner's next 12 h of CI ran 13-20 points
+  # below the other runners' hit rate.
+  CCACHE_MAXSIZE: "30G"
   CCACHE_COMPRESS: "true"
 
 jobs:
@@ -552,7 +559,7 @@ jobs:
         # its database. Full graph traversal required — no --no-rebuild,
         # no partial target selection.
         #
-        # CCACHE_RECACHE=true is load-bearing for CodeQL coverage. The
+        # CCACHE_DISABLE=true is load-bearing for CodeQL coverage. The
         # tracer attaches to compiler processes; if ccache returns a
         # cached object file without invoking the compiler, the tracer
         # never sees that translation unit and CodeQL's database omits
@@ -560,13 +567,16 @@ jobs:
         # this silently dropped 98% of TUs from the database (e.g. only
         # 1 of 47 plugin .cpp files was reaching analysis), making most
         # custom and standard queries report 0 alerts on plugin code.
-        # `RECACHE` forces the compiler to actually run while still
-        # updating the cache, so non-CodeQL CI builds keep their cache
-        # warm. `CCACHE_DISABLE=true` would also work but would skip
-        # the cache update and degrade subsequent CI builds.
+        # DISABLE runs the compiler for every TU and never reads or
+        # writes the cache. This step used CCACHE_RECACHE so that it
+        # would refresh the cache for the other CI jobs, but under the
+        # tracer ccache found the Linux compiles uncacheable (1581 of
+        # 1590 calls, 2026-11-14 to -16), so it stored nothing, and every
+        # call still ran a cache cleanup against the runner's shared
+        # cache.
         env:
-          CCACHE_RECACHE: "true"
-        # Essential because CCACHE_RECACHE forces every TU to compile. Both
+          CCACHE_DISABLE: "true"
+        # Essential because CCACHE_DISABLE forces every TU to compile. Both
         # hosts are one-CCD-per-runner, so cap Ninja to that 16-thread domain.
         run: meson compile -C ${{ matrix.build_dir }} -j "$YUZU_BUILD_JOBS"
 
