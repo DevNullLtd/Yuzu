@@ -16,7 +16,7 @@
 # has the full rules and the side effects),
 # server-internal (catalog-only definitions the dispatch chokepoint denies, so they
 # cannot pass),
-# interactive, and network-disrupt (the quarantine ceremony, PR B).
+# interactive, and network-disrupt (the firewall containment actions).
 # scripts/test/instructions-risk-classification.json is the authority.
 #
 # A destructive/forensic run is by hand, on a dedicated disposable stack. NOTE: --risks

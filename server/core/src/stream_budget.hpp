@@ -33,10 +33,11 @@ namespace yuzu::server::detail {
 ///
 /// This is a real reserve, not an aspiration: EVERY surface that holds a response open
 /// leases from the one budget below — MCP's GET channel, MCP streamed POST, `GET
-/// /api/v1/events`, the dashboard executions drawer, the legacy `/events` stream, and a
-/// synchronous workflow run (which pins its worker for the run, not for an SSE stream).
-/// A surface that held a worker without a lease would make the arithmetic here a
-/// fiction.
+/// /api/v1/events`, the dashboard executions drawer, the legacy `/events` stream, a
+/// synchronous workflow run (which pins its worker for the run, not for an SSE stream), and
+/// the streamed installed-software export (which pins its worker for up to 900 s, not for an
+/// SSE stream either). A surface that held a worker without a lease would make the arithmetic
+/// here a fiction.
 inline constexpr std::size_t kPlainRestReserveDefault = 8;
 
 /// Workers a single permitted stream can pin at once. A stream is normally one provider on
@@ -140,6 +141,14 @@ inline constexpr std::size_t kPerPrincipalMcpPost = 4;
 /// meaningful share of the 128 held-open workers (owner ruling D3, 2026-11-04).
 inline constexpr std::size_t kPerPrincipalWorkflowRun = 2;
 
+/// The key every `SseSurface::kSoftwareExport` lease is counted under. It is NOT a principal. The
+/// export's cap (`--inventory-export-concurrency`) is SERVER-WIDE, so the leases are keyed by this
+/// one constant and the caller's per-key cap IS that flag: one counter, atomic under the budget's
+/// mutex, no parallel limiter. The consequence is deliberate and stated: there is no per-principal
+/// share, so one principal can hold every export slot. The key cannot collide with a real
+/// principal because counting is keyed by (surface, key) and no other surface uses this surface.
+inline constexpr char kSoftwareExportSurfaceKey[] = "software_export";
+
 /// The surfaces that hold a response open. A CLOSED set — it is the metric label, and it is
 /// the list ADR-0034 says must be exhaustive. Adding a new streaming route means adding a
 /// value here and taking a lease; there is no third option.
@@ -151,6 +160,9 @@ enum class SseSurface {
     kLegacyEvents,    ///< GET /events           — the legacy dashboard stream
     kWorkflowRun,     ///< a SYNCHRONOUS workflow run (REST v1 execute, MCP execute_workflow): not an
                       ///< SSE stream, but the response is held open and a worker pinned for the run
+    kSoftwareExport,  ///< GET /api/v1/inventory/software/export: a streamed file, not an SSE stream; the
+                      ///< chunked response pins a worker for up to 900 s (software_export::kExportMaxSeconds).
+                      ///< Counted under kSoftwareExportSurfaceKey, not a principal.
 };
 
 inline const char* to_string(SseSurface s) {
@@ -167,6 +179,8 @@ inline const char* to_string(SseSurface s) {
         return "legacy_events";
     case SseSurface::kWorkflowRun:
         return "workflow_run";
+    case SseSurface::kSoftwareExport:
+        return "software_export";
     }
     return "unknown";
 }

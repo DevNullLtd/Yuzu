@@ -12,6 +12,7 @@
 
 #include "quarantine_store.hpp"
 #include "agent_registry.hpp"
+#include "response_store.hpp"
 #include "authz_gates.hpp"
 #include "command_capability.hpp"
 #include "rest_api_v1.hpp"
@@ -22,6 +23,7 @@
 #include "pg/pg_raii.hpp"
 
 #include "../test_helpers.hpp"
+#include "test_forensics_tier_fixture.hpp"
 #include "test_route_sink.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -51,6 +53,29 @@ yuzu::test::PgTestTemplate quarantine_route_tpl{"quarantinestore", [](const std:
     if (!store.is_open())
         throw std::runtime_error("quarantinestore template: store failed to migrate");
 }};
+
+yuzu::test::PgTestTemplate responsestore_route_tpl{"responsestore", [](const std::string& dsn) {
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    ResponseStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("responsestore template: store failed to migrate");
+}};
+
+// The DELETE route reads the device's reply for a bounded number of polls: no sleeping between
+// them, and a small budget, so a "no reply" case costs two reads and no wall time. Process-global
+// test seams (detail::live_poll_interval_ms / release_confirm_max_polls), restored on exit.
+struct ReleasePollSeams {
+    int saved_interval{detail::live_poll_interval_ms().load()};
+    int saved_polls{detail::release_confirm_max_polls().load()};
+    explicit ReleasePollSeams(int polls) {
+        detail::live_poll_interval_ms().store(0);
+        detail::release_confirm_max_polls().store(polls);
+    }
+    ~ReleasePollSeams() {
+        detail::live_poll_interval_ms().store(saved_interval);
+        detail::release_confirm_max_polls().store(saved_polls);
+    }
+};
 
 struct AuditCall {
     std::string action;
@@ -129,8 +154,29 @@ struct QuarantineRouteHarness {
     // The counter the denial path increments; a real registry so a case reads it back.
     yuzu::MetricsRegistry metrics;
 
+    // The release the DELETE route sends (firewall.release) and what the device answers.
+    // `release_reply` is stored under the command id the moment the dispatch is made ("" = the
+    // device never answers); `dispatch_sent` is the agents-reached count; `wire_dispatch` false
+    // registers no dispatch function at all.
+    struct DispatchCall {
+        std::string plugin;
+        std::string action;
+        std::vector<std::string> agent_ids;
+        DispatchCaller caller;
+    };
+    std::vector<DispatchCall> dispatch_calls;
+    int dispatch_sent{1};
+    bool dispatch_throws{false};
+    std::string release_reply;
+    // Runs inside the dispatch, after the reply is stored: the deterministic way to land a
+    // concurrent change (the reconciler ending the record, a store outage) between the route's
+    // release request and its own follow-up write.
+    std::function<void()> on_dispatch;
+    ResponseStore* response_store{nullptr};
+    ReleasePollSeams poll_seams{2};
+
     static AuthorizeResult admitted_capability() {
-        return CommandCapability{.plugin = "quarantine",
+        return CommandCapability{.plugin = "firewall",
                                  .action = "quarantine",
                                  .dispatch_class = DispatchClass::Destructive,
                                  .mutability = Mutability::Irreversible,
@@ -142,9 +188,11 @@ struct QuarantineRouteHarness {
     }
 
     explicit QuarantineRouteHarness(pg::PgPool& pool, bool wire_scope = true, bool wire_fleet = true,
-                                    bool wire_authorize = true)
-        : quarantine_store(pool) {
+                                    bool wire_authorize = true, ResponseStore* rstore = nullptr,
+                                    bool wire_dispatch = true)
+        : quarantine_store(pool), response_store(rstore) {
         REQUIRE(quarantine_store.is_open());
+        api.set_forensics_plugin_set(&yuzu::server::test::forensics_plugin_set());
 
         auto auth_fn = [this](const httplib::Request&,
                               httplib::Response& res) -> std::optional<auth::Session> {
@@ -248,11 +296,36 @@ struct QuarantineRouteHarness {
         }
         RestApiV1::ExecVisibleFn exec_visible_wired =
             [this](const auth::Session& s) { return exec_visible_fn(s); };
+        RestApiV1::CommandDispatchFn dispatch_fn{};
+        if (wire_dispatch) {
+            dispatch_fn = [this](const std::string& plugin, const std::string& action,
+                                 const std::vector<std::string>& agent_ids, const std::string&,
+                                 const std::unordered_map<std::string, std::string>&,
+                                 const std::string&,
+                                 const DispatchCaller& caller) -> ConfinedDispatchOutcome {
+                dispatch_calls.push_back({plugin, action, agent_ids, caller});
+                if (dispatch_throws)
+                    throw std::runtime_error("dispatch failed");
+                const std::string command_id = "cmd-" + std::to_string(dispatch_calls.size());
+                if (response_store && dispatch_sent > 0 && !release_reply.empty()) {
+                    StoredResponse sr;
+                    sr.instruction_id = command_id;
+                    sr.agent_id = agent_ids.front();
+                    sr.status = 1;
+                    sr.output = release_reply;
+                    sr.plugin = plugin;
+                    response_store->store(sr);
+                }
+                if (on_dispatch)
+                    on_dispatch();
+                return ConfinedDispatchOutcome{.sent = dispatch_sent, .command_id = command_id};
+            };
+        }
 
         api.register_routes(sink, auth_fn, perm_fn, audit_fn,
                             /*rbac_store=*/nullptr, /*mgmt_store=*/nullptr,
                             /*token_store=*/nullptr, &quarantine_store,
-                            /*response_store=*/nullptr, /*instruction_store=*/nullptr,
+                            response_store, /*instruction_store=*/nullptr,
                             /*execution_tracker=*/nullptr, /*schedule_engine=*/nullptr,
                             /*approval_manager=*/nullptr, /*tag_store=*/nullptr,
                             /*audit_store=*/nullptr, /*service_group_fn=*/{},
@@ -261,7 +334,7 @@ struct QuarantineRouteHarness {
                             /*device_token_store=*/nullptr, /*license_store=*/nullptr,
                             /*guaranteed_state_store=*/nullptr, /*metrics_registry=*/&metrics,
                             /*session_revoke_fn=*/{}, /*execution_event_bus=*/nullptr,
-                            /*result_set_store=*/nullptr, /*command_dispatch_fn=*/{},
+                            /*result_set_store=*/nullptr, dispatch_fn,
                             /*step_up_fn=*/{}, /*guardian_push_fn=*/{}, /*dex_perf_fn=*/{},
                             /*network_api=*/{}, /*lockout_clear_fn=*/{},
                             /*baseline_store=*/nullptr, scoped_fn,
@@ -280,8 +353,8 @@ struct QuarantineRouteHarness {
     auto post(const std::string& body) {
         return sink.Post("/api/v1/quarantine", body, "application/json");
     }
-    auto del(const std::string& agent) {
-        return sink.Delete("/api/v1/quarantine/" + agent);
+    auto del(const std::string& agent, const std::string& query = "") {
+        return sink.Delete("/api/v1/quarantine/" + agent + query);
     }
     auto get() {
         return sink.Get("/api/v1/quarantine");
@@ -346,7 +419,12 @@ TEST_CASE("REST POST/DELETE /api/v1/quarantine write an attempt row first, then 
           "[rest][quarantine][audit][pg]") {
     YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_route_tpl);
     pg::PgPool qpool{{.conninfo = qdb.dsn(), .size = 4}};
-    QuarantineRouteHarness h(qpool);
+    YUZU_REQUIRE_PG_DB_TPL(rdb, responsestore_route_tpl);
+    pg::PgPool rpool{{.conninfo = rdb.dsn(), .size = 4}};
+    ResponseStore rstore{rpool};
+    REQUIRE(rstore.is_open());
+    QuarantineRouteHarness h(qpool, true, true, true, &rstore);
+    h.release_reply = "status|inactive";
     auto res = h.post(kBody);
     REQUIRE(res);
     CHECK(res->status == 201);
@@ -362,7 +440,7 @@ TEST_CASE("REST POST/DELETE /api/v1/quarantine write an attempt row first, then 
     REQUIRE(h.audit_calls.size() == 2);
     CHECK(h.audit_calls[0].result == "attempt");
     CHECK(h.audit_calls[1].result == "failure");
-    // Release: attempt then success.
+    // Release: attempt then success (the device answered inactive).
     h.audit_calls.clear();
     auto del = h.del("agent-B");
     REQUIRE(del);
@@ -378,7 +456,12 @@ TEST_CASE("REST POST /api/v1/quarantine flags a lost outcome row with Sec-Audit-
           "[rest][quarantine][audit][pg]") {
     YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_route_tpl);
     pg::PgPool qpool{{.conninfo = qdb.dsn(), .size = 4}};
-    QuarantineRouteHarness h(qpool);
+    YUZU_REQUIRE_PG_DB_TPL(rdb, responsestore_route_tpl);
+    pg::PgPool rpool{{.conninfo = rdb.dsn(), .size = 4}};
+    ResponseStore rstore{rpool};
+    REQUIRE(rstore.is_open());
+    QuarantineRouteHarness h(qpool, true, true, true, &rstore);
+    h.release_reply = "status|inactive";
     h.audit_fail_result = "success";
     auto res = h.post(kBody);
     REQUIRE(res);
@@ -486,6 +569,8 @@ TEST_CASE("REST POST /api/v1/quarantine rejects an unsafe whitelist (400, no wri
         auto res = h.post(R"({"agent_id":"agent-B","reason":"test","whitelist":"10.0.0.0/24"})");
         REQUIRE(res);
         CHECK(res->status == 400);
+        CHECK(res->body.find("whitelist must be comma-separated IPv4 or IPv6 addresses, at most 32") !=
+              std::string::npos);
         CHECK(h.scope_fn_called); // scope gate runs before the validator, same order as agent_id
         CHECK_FALSE(h.is_quarantined("agent-B")); // rejected, never written
     }
@@ -498,12 +583,34 @@ TEST_CASE("REST POST /api/v1/quarantine rejects an unsafe whitelist (400, no wri
         CHECK(res->status == 400);
         CHECK_FALSE(h.is_quarantined("agent-B"));
     }
-    SECTION("a valid whitelist still succeeds (201)") {
+    SECTION("a port, a leading-zero octet and 33 addresses are refused too") {
+        for (const char* wl : {"10.0.0.5:443", "010.0.0.1", "::ffff:1.2.3.4"}) {
+            auto res = h.post(std::string(R"({"agent_id":"agent-B","reason":"test","whitelist":")") +
+                              wl + R"("})");
+            REQUIRE(res);
+            CAPTURE(wl);
+            CHECK(res->status == 400);
+        }
+        std::string many;
+        for (int i = 1; i <= 33; ++i)
+            many += (i > 1 ? "," : "") + std::string("10.0.0.") + std::to_string(i);
+        auto res = h.post(std::string(R"({"agent_id":"agent-B","reason":"test","whitelist":")") +
+                          many + R"("})");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK_FALSE(h.is_quarantined("agent-B"));
+        // a refused whitelist writes a failure row and no attempt row, and nothing is dispatched
+        for (const auto& a : h.audit_calls)
+            CHECK(a.result != "attempt");
+        CHECK(h.dispatch_calls.empty());
+    }
+    SECTION("a valid whitelist still succeeds (201) and POST dispatches nothing") {
         auto res = h.post(
             R"({"agent_id":"agent-B","reason":"test","whitelist":"10.0.0.1,10.0.0.2"})");
         REQUIRE(res);
         CHECK(res->status == 201);
         CHECK(h.is_quarantined("agent-B"));
+        CHECK(h.dispatch_calls.empty()); // record-only: the reconciler applies it on its next tick
     }
 }
 
@@ -648,8 +755,13 @@ TEST_CASE("REST DELETE /api/v1/quarantine admits in-scope and fails closed when 
           "[rest][quarantine][authz][pg]") {
     YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_route_tpl);
     pg::PgPool qpool{{.conninfo = qdb.dsn(), .size = 4}};
-    SECTION("in-scope delete releases the device") {
-        QuarantineRouteHarness h(qpool);
+    SECTION("in-scope delete releases the device once it confirms") {
+        YUZU_REQUIRE_PG_DB_TPL(rdb, responsestore_route_tpl);
+        pg::PgPool rpool{{.conninfo = rdb.dsn(), .size = 4}};
+        ResponseStore rstore{rpool};
+        REQUIRE(rstore.is_open());
+        QuarantineRouteHarness h(qpool, true, true, true, &rstore);
+        h.release_reply = "status|inactive";
         REQUIRE(h.quarantine_store.quarantine_device("agent-B", "seed", "pre-seeded", ""));
         auto res = h.del("agent-B");
         REQUIRE(res);
@@ -676,21 +788,26 @@ TEST_CASE("REST DELETE /api/v1/quarantine admits in-scope and fails closed when 
     }
 }
 
-TEST_CASE("REST DELETE /api/v1/quarantine runs the dispatch chokepoint for (quarantine, "
-          "unquarantine): the pair, the ordering, the unwired 500 and the second-session 401 "
+TEST_CASE("REST DELETE /api/v1/quarantine runs the dispatch chokepoint for (firewall, "
+          "release): the pair, the ordering, the unwired 500 and the second-session 401 "
           "(#6065 PR-Q)",
           "[rest][quarantine][authz][pg]") {
     YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_route_tpl);
     pg::PgPool qpool{{.conninfo = qdb.dsn(), .size = 4}};
-    SECTION("consults the chokepoint for the unquarantine pair with the resolved session") {
-        QuarantineRouteHarness h(qpool);
+    SECTION("consults the chokepoint for the release pair with the resolved session") {
+        YUZU_REQUIRE_PG_DB_TPL(rdb, responsestore_route_tpl);
+        pg::PgPool rpool{{.conninfo = rdb.dsn(), .size = 4}};
+        ResponseStore rstore{rpool};
+        REQUIRE(rstore.is_open());
+        QuarantineRouteHarness h(qpool, true, true, true, &rstore);
+        h.release_reply = "status|inactive";
         REQUIRE(h.quarantine_store.quarantine_device("agent-B", "seed", "pre-seeded", ""));
         auto res = h.del("agent-B");
         REQUIRE(res);
         CHECK(res->status == 200);
         CHECK(h.authorize_calls == 1);
-        CHECK(h.authorize_plugin == "quarantine");
-        CHECK(h.authorize_action == "unquarantine");
+        CHECK(h.authorize_plugin == "firewall");
+        CHECK(h.authorize_action == "release");
         CHECK(h.authorize_caller.principal == "alice");
         CHECK_FALSE(h.authorize_caller.system);
         CHECK_FALSE(h.is_quarantined("agent-B"));
@@ -735,7 +852,7 @@ TEST_CASE("REST DELETE /api/v1/quarantine runs the dispatch chokepoint for (quar
 }
 
 // gov Gate 3 (quality-engineer): a store-level test proving
-// quarantine_device()/release_device() return a db_error:-prefixed message
+// quarantine_device()/request_release() return a db_error:-prefixed message
 // on a genuine failure does NOT prove the ROUTE actually maps that to 503 --
 // the whole is_quarantine_db_error/kQuarantineDbErrorPrefix classification
 // chain, plus the is_open()-guard and audit-on-failure fixes from this same
@@ -829,7 +946,7 @@ TEST_CASE("REST POST/DELETE audit a business-error (400) failure, not just succe
 
 // ---------------------------------------------------------------------------
 // #6065 PR-Q: POST /api/v1/quarantine runs the shared dispatch chokepoint
-// pre-check ("quarantine","quarantine") AFTER the scoped gate and the whitelist
+// pre-check ("firewall","quarantine") AFTER the scoped gate and the whitelist
 // validation and BEFORE the attempt audit and the store write. These cases pin
 // the route wiring; the composed exact-recipient cases (real registry, real
 // RbacStore, real reconciler) live in test_rest_quarantine_create_gate.cpp.
@@ -858,7 +975,7 @@ bool has_audit(const QuarantineRouteHarness& h, const std::string& result) {
 
 } // namespace
 
-TEST_CASE("REST POST /api/v1/quarantine consults the chokepoint for (quarantine, quarantine) "
+TEST_CASE("REST POST /api/v1/quarantine consults the chokepoint for (firewall, quarantine) "
           "with the resolved session as the caller (#6065 PR-Q)",
           "[rest][quarantine][authz][pg]") {
     YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_route_tpl);
@@ -871,7 +988,7 @@ TEST_CASE("REST POST /api/v1/quarantine consults the chokepoint for (quarantine,
     REQUIRE(res);
     CHECK(res->status == 201);
     CHECK(h.authorize_calls == 1);
-    CHECK(h.authorize_plugin == "quarantine");
+    CHECK(h.authorize_plugin == "firewall");
     CHECK(h.authorize_action == "quarantine");
     CHECK(h.authorize_caller.principal == "alice");
     CHECK_FALSE(h.authorize_caller.system);
@@ -991,7 +1108,7 @@ TEST_CASE("REST POST /api/v1/quarantine: a chokepoint ApprovalRequired denial is
     const auto& err = error_obj(j);
     REQUIRE(err.contains("message"));
     const std::string message = err.value("message", std::string());
-    CHECK(message.find("approval required for quarantine.quarantine") != std::string::npos);
+    CHECK(message.find("approval required for firewall.quarantine") != std::string::npos);
     CHECK(message.find("admin caller or a redeemed approval ticket") != std::string::npos);
     REQUIRE(err.contains("remediation"));
     CHECK_FALSE(err.value("remediation", std::string()).empty());
@@ -1088,3 +1205,526 @@ TEST_CASE("REST POST /api/v1/quarantine: an admitted chokepoint decision writes 
         CHECK(h.metrics.counter("yuzu_server_dispatch_denied_total", {{"reason", label}})
                   .value() == 0);
 }
+
+// ---------------------------------------------------------------------------
+// PRQ.2: DELETE /api/v1/quarantine/{agent_id} is a real release. It asks the device to lift its
+// firewall rules (firewall.release) and ends the record only on the DEVICE's `status|inactive`
+// (200); anything else leaves the record releasing (202) for the reconciler. `?force=true` ends it
+// without the device's word and says so.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+std::optional<QuarantineRecord> active_record(QuarantineStore& store, const std::string& agent) {
+    auto st = store.get_status(agent);
+    REQUIRE(st.has_value());
+    return *st;
+}
+
+std::vector<QuarantineRecord> owed_list(QuarantineStore& store) {
+    auto owed = store.list_release_owed();
+    REQUIRE(owed.has_value());
+    return *owed;
+}
+
+const AuditCall* find_audit(const QuarantineRouteHarness& h, const std::string& result) {
+    for (const auto& a : h.audit_calls)
+        if (a.action == "quarantine.disable" && a.result == result)
+            return &a;
+    return nullptr;
+}
+
+bool has_attempt_row(const QuarantineRouteHarness& h) {
+    return find_audit(h, "attempt") != nullptr;
+}
+
+// Ends the active record the way `end` says: `device_confirmed` as the reconciler does once it
+// reads `inactive`; `forced` as a concurrent forced DELETE does (no device answer, the device
+// still owed a release).
+void end_record_as(QuarantineStore& store, const std::string& agent, ReleaseEnd end) {
+    auto rec = store.get_status(agent);
+    REQUIRE(rec.has_value());
+    REQUIRE(rec->has_value());
+    REQUIRE(store.mark_released(agent, (*rec)->id, end).has_value());
+}
+
+// Runs one statement on a fresh connection to the test database, for the races that need the
+// store's own table changed underneath a request.
+void exec_sql(const std::string& dsn, const char* sql) {
+    pg::PgConn conn{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    pg::PgResult r{PQexec(conn.get(), sql)};
+    REQUIRE(r.ok());
+}
+
+} // namespace
+
+#define RELEASE_RIG(h, scripted_reply)                                                             \
+    YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_route_tpl);                                             \
+    pg::PgPool qpool{{.conninfo = qdb.dsn(), .size = 4}};                                          \
+    YUZU_REQUIRE_PG_DB_TPL(rdb, responsestore_route_tpl);                                          \
+    pg::PgPool rpool{{.conninfo = rdb.dsn(), .size = 4}};                                          \
+    ResponseStore rstore{rpool};                                                                   \
+    REQUIRE(rstore.is_open());                                                                     \
+    QuarantineRouteHarness h(qpool, true, true, true, &rstore);                                    \
+    h.release_reply = scripted_reply;                                                              \
+    REQUIRE(h.quarantine_store.quarantine_device("agent-B", "seed", "pre-seeded", "10.0.0.1"))
+
+TEST_CASE("REST DELETE /api/v1/quarantine: the device answers status|inactive within the wait -> 200 "
+          "released, the record ends, attempt + success rows",
+          "[rest][quarantine][release][pg]") {
+    RELEASE_RIG(h, "status|inactive");
+    auto res = h.del("agent-B");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    const auto body = parse_body(res->body);
+    CHECK(body["data"]["released"] == true);
+    CHECK(body["data"]["state"] == "released");
+    CHECK(body["data"]["forced"] == false);
+    CHECK(body["data"]["device_confirmed"] == true);
+    CHECK_FALSE(h.is_quarantined("agent-B"));
+    CHECK(owed_list(h.quarantine_store).empty());
+    // exactly one firewall.release, to the device, as the operator, no parameters
+    REQUIRE(h.dispatch_calls.size() == 1);
+    CHECK(h.dispatch_calls[0].plugin == "firewall");
+    CHECK(h.dispatch_calls[0].action == "release");
+    CHECK(h.dispatch_calls[0].agent_ids == std::vector<std::string>{"agent-B"});
+    CHECK(h.dispatch_calls[0].caller.principal == "alice");
+    CHECK_FALSE(h.dispatch_calls[0].caller.system);
+    REQUIRE(h.audit_calls.size() == 2);
+    CHECK(h.audit_calls[0].result == "attempt");
+    CHECK(h.audit_calls[1].action == "quarantine.disable");
+    CHECK(h.audit_calls[1].result == "success");
+    CHECK(h.audit_calls[1].detail.find("state=released record_id=") == 0);
+    CHECK(h.audit_calls[1].detail.find("command_id=cmd-1") != std::string::npos);
+}
+
+TEST_CASE("REST DELETE /api/v1/quarantine: a device that is offline -> 202 releasing, the record stays "
+          "listed, attempt + pending rows",
+          "[rest][quarantine][release][pg]") {
+    RELEASE_RIG(h, "");
+    h.dispatch_sent = 0; // nobody reached
+    auto res = h.del("agent-B");
+    REQUIRE(res);
+    CHECK(res->status == 202);
+    const auto body = parse_body(res->body);
+    CHECK(body["data"]["released"] == false);
+    CHECK(body["data"]["state"] == "releasing");
+    CHECK(h.is_quarantined("agent-B"));
+    const auto rec = active_record(h.quarantine_store, "agent-B");
+    REQUIRE(rec.has_value());
+    CHECK(rec->status == "releasing");
+    REQUIRE(h.audit_calls.size() == 2);
+    CHECK(h.audit_calls[0].result == "attempt");
+    CHECK(h.audit_calls[1].result == "pending");
+    CHECK(h.audit_calls[1].detail.find("state=releasing") == 0);
+}
+
+TEST_CASE("REST DELETE /api/v1/quarantine: a privilege refusal, a partial release and no reply all "
+          "leave the record releasing (202), never released",
+          "[rest][quarantine][release][pg]") {
+    const std::string reply = GENERATE(std::string{"status|refused|privilege_unavailable"},
+                                       std::string{"status|partial|release_failed"},
+                                       std::string{"status|active"}, std::string{""});
+    // The record has either never been confirmed or was confirmed once before the release began:
+    // a failed release leaves both kinds releasing.
+    const bool once_confirmed = GENERATE(false, true);
+    CAPTURE(reply, once_confirmed);
+    RELEASE_RIG(h, reply);
+    if (once_confirmed) {
+        const auto seeded = active_record(h.quarantine_store, "agent-B");
+        REQUIRE(seeded.has_value());
+        REQUIRE(h.quarantine_store.mark_endpoint_confirmed("agent-B", seeded->id, /*at=*/1000)
+                    .has_value());
+    }
+    auto res = h.del("agent-B");
+    REQUIRE(res);
+    CHECK(res->status == 202);
+    CHECK(parse_body(res->body)["data"]["state"] == "releasing");
+    const auto rec = active_record(h.quarantine_store, "agent-B");
+    REQUIRE(rec.has_value());
+    CHECK(rec->status == "releasing"); // listed, with the dispatch refusal in force
+    CHECK(owed_list(h.quarantine_store).empty());
+    CHECK(find_audit(h, "pending") != nullptr);
+    CHECK(find_audit(h, "success") == nullptr);
+}
+
+TEST_CASE("REST DELETE /api/v1/quarantine: a reply of inactive for a record another writer ended first is "
+          "also 200, and the success row says it was already ended",
+          "[rest][quarantine][release][pg]") {
+    RELEASE_RIG(h, "status|inactive");
+    h.on_dispatch = [&h] {
+        end_record_as(h.quarantine_store, "agent-B", ReleaseEnd::device_confirmed);
+    };
+    auto res = h.del("agent-B");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(parse_body(res->body)["data"]["released"] == true);
+    const auto* success = find_audit(h, "success");
+    REQUIRE(success != nullptr);
+    CHECK(success->detail.find("already_ended device_confirmed=true") != std::string::npos);
+    CHECK(success->detail.find("ended_by=") == std::string::npos);
+}
+
+TEST_CASE("REST DELETE /api/v1/quarantine: with no in-flight slot the release is dispatched, nothing is "
+          "waited for, and the answer is 202",
+          "[rest][quarantine][release][pg]") {
+    RELEASE_RIG(h, "status|inactive"); // a reply IS stored; it must not be read
+    struct CapGuard {
+        int saved{detail::live_max_inflight().load()};
+        CapGuard() { detail::live_max_inflight().store(0); }
+        ~CapGuard() { detail::live_max_inflight().store(saved); }
+    } cap;
+    auto res = h.del("agent-B");
+    REQUIRE(res);
+    CHECK(res->status == 202);
+    CHECK(h.dispatch_calls.size() == 1);
+    const auto rec = active_record(h.quarantine_store, "agent-B");
+    REQUIRE(rec.has_value());
+    CHECK(rec->status == "releasing");
+}
+
+TEST_CASE("REST DELETE /api/v1/quarantine: with no dispatch or response store wired the answer is 202 "
+          "(the reconciler finishes it)",
+          "[rest][quarantine][release][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_route_tpl);
+    pg::PgPool qpool{{.conninfo = qdb.dsn(), .size = 4}};
+    QuarantineRouteHarness h(qpool, true, true, true, nullptr, /*wire_dispatch=*/false);
+    REQUIRE(h.quarantine_store.quarantine_device("agent-B", "seed", "pre-seeded", ""));
+    auto res = h.del("agent-B");
+    REQUIRE(res);
+    CHECK(res->status == 202);
+    CHECK(h.dispatch_calls.empty());
+    CHECK(h.is_quarantined("agent-B"));
+}
+
+TEST_CASE("REST DELETE /api/v1/quarantine: a throwing dispatch is 202, not a 500",
+          "[rest][quarantine][release][pg]") {
+    RELEASE_RIG(h, "status|inactive");
+    h.dispatch_throws = true;
+    auto res = h.del("agent-B");
+    REQUIRE(res);
+    CHECK(res->status == 202);
+    const auto rec = active_record(h.quarantine_store, "agent-B");
+    REQUIRE(rec.has_value());
+    CHECK(rec->status == "releasing");
+}
+
+TEST_CASE("REST DELETE /api/v1/quarantine: repeated on a releasing record re-dispatches and is not a 400",
+          "[rest][quarantine][release][pg]") {
+    RELEASE_RIG(h, "");
+    auto first = h.del("agent-B");
+    REQUIRE(first);
+    CHECK(first->status == 202);
+    auto second = h.del("agent-B");
+    REQUIRE(second);
+    CHECK(second->status == 202);
+    CHECK(h.dispatch_calls.size() == 2);
+    // and now the device answers: the same call ends it
+    h.release_reply = "status|inactive";
+    auto third = h.del("agent-B");
+    REQUIRE(third);
+    CHECK(third->status == 200);
+    CHECK_FALSE(h.is_quarantined("agent-B"));
+}
+
+TEST_CASE("REST DELETE /api/v1/quarantine: no record -> 400, store failure -> 503, chokepoint denial -> "
+          "403 with the record still active (not releasing) and no attempt row",
+          "[rest][quarantine][release][pg]") {
+    SECTION("no record") {
+        RELEASE_RIG(h, "status|inactive");
+        auto res = h.del("agent-never");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(h.dispatch_calls.empty());
+    }
+    SECTION("denied at the chokepoint") {
+        RELEASE_RIG(h, "status|inactive");
+        h.authorize_fn = [](const DispatchCaller&, std::string_view,
+                            std::string_view) -> QuarantineRouteHarness::AuthorizeResult {
+            return std::unexpected(detail::DispatchDenial{detail::DispatchDenialReason::ApprovalRequired,
+                                                          "Security", authz::Operation::Execute});
+        };
+        auto res = h.del("agent-B");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        const auto rec = active_record(h.quarantine_store, "agent-B");
+        REQUIRE(rec.has_value());
+        CHECK(rec->status == "active"); // not releasing: nothing was requested
+        CHECK(h.dispatch_calls.empty());
+        CHECK_FALSE(has_attempt_row(h));
+        REQUIRE(h.audit_calls.size() == 1);
+        CHECK(h.audit_calls[0].result == "denied");
+        CHECK(h.audit_calls[0].detail == "reason=approval_required securable=Security");
+    }
+}
+
+TEST_CASE("REST DELETE /api/v1/quarantine?force=true: the device offline -> 200 forced, device_confirmed "
+          "false, 'may still be contained'; the record ends and the device is owed a release",
+          "[rest][quarantine][release][force][pg]") {
+    RELEASE_RIG(h, "");
+    h.dispatch_sent = 0;
+    auto res = h.del("agent-B", "?force=true");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    const auto body = parse_body(res->body);
+    CHECK(body["data"]["released"] == true);
+    CHECK(body["data"]["state"] == "released");
+    CHECK(body["data"]["forced"] == true);
+    CHECK(body["data"]["device_confirmed"] == false);
+    const std::string message = body["data"]["message"].get<std::string>();
+    CHECK(message.find("may still be contained") != std::string::npos);
+    CHECK(message.find("without the device's confirmation") != std::string::npos);
+    CHECK_FALSE(h.is_quarantined("agent-B"));
+    const auto owed = owed_list(h.quarantine_store);
+    REQUIRE(owed.size() == 1);
+    CHECK(owed[0].agent_id == "agent-B");
+    // the attempt row names the force, the success row the reason, both under the operator
+    const auto* attempt = find_audit(h, "attempt");
+    REQUIRE(attempt != nullptr);
+    CHECK(attempt->detail == "force=true");
+    const auto* success = find_audit(h, "success");
+    REQUIRE(success != nullptr);
+    CHECK(success->detail.find("state=released reason=forced device_confirmed=false record_id=") == 0);
+    // nothing in the answer or the audit row says the device was released
+    CHECK(res->body.find("\"released\":false") == std::string::npos);
+    CHECK(success->detail.find("state=released reason=forced") != std::string::npos);
+}
+
+TEST_CASE("REST DELETE /api/v1/quarantine?force=true: a reachable device that answers inactive is "
+          "released for real (forced false, device_confirmed true), nothing owed",
+          "[rest][quarantine][release][force][pg]") {
+    RELEASE_RIG(h, "status|inactive");
+    auto res = h.del("agent-B", "?force=true");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    const auto body = parse_body(res->body);
+    CHECK(body["data"]["forced"] == false);
+    CHECK(body["data"]["device_confirmed"] == true);
+    CHECK(owed_list(h.quarantine_store).empty());
+    CHECK_FALSE(h.is_quarantined("agent-B"));
+}
+
+TEST_CASE("REST DELETE /api/v1/quarantine?force=true: a privilege refusal is forced, and the success row "
+          "carries last_status and the command id",
+          "[rest][quarantine][release][force][pg]") {
+    RELEASE_RIG(h, "status|refused|privilege_unavailable");
+    auto res = h.del("agent-B", "?force=true");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    const auto body = parse_body(res->body);
+    CHECK(body["data"]["forced"] == true);
+    CHECK(body["data"]["device_confirmed"] == false);
+    CHECK(body["data"]["command_id"] == "cmd-1");
+    const auto* success = find_audit(h, "success");
+    REQUIRE(success != nullptr);
+    CHECK(success->detail.find("reason=forced") != std::string::npos);
+    CHECK(success->detail.find("command_id=cmd-1") != std::string::npos);
+    CHECK(success->detail.find("last_status=unconfirmed") != std::string::npos);
+    CHECK(owed_list(h.quarantine_store).size() == 1);
+}
+
+TEST_CASE("REST DELETE /api/v1/quarantine?force=true: ends a record already releasing; a record another "
+          "writer ended first answers with that record's real end, never a device-confirmed guess",
+          "[rest][quarantine][release][force][pg]") {
+    SECTION("already releasing") {
+        RELEASE_RIG(h, "");
+        auto plain = h.del("agent-B");
+        REQUIRE(plain);
+        CHECK(plain->status == 202);
+        auto forced = h.del("agent-B", "?force=true");
+        REQUIRE(forced);
+        CHECK(forced->status == 200);
+        CHECK(parse_body(forced->body)["data"]["forced"] == true);
+        CHECK_FALSE(h.is_quarantined("agent-B"));
+        CHECK(owed_list(h.quarantine_store).size() == 1);
+    }
+    SECTION("ended by the reconciler first") {
+        RELEASE_RIG(h, "");
+        h.on_dispatch = [&h] {
+            end_record_as(h.quarantine_store, "agent-B", ReleaseEnd::device_confirmed);
+        };
+        auto res = h.del("agent-B", "?force=true");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        const auto body = parse_body(res->body);
+        CHECK(body["data"]["forced"] == false);
+        CHECK(body["data"]["device_confirmed"] == true);
+        const auto* success = find_audit(h, "success");
+        REQUIRE(success != nullptr);
+        CHECK(success->detail.find("already_ended device_confirmed=true") != std::string::npos);
+        CHECK(success->detail.find("ended_by=") == std::string::npos);
+        CHECK(owed_list(h.quarantine_store).empty()); // the device confirmed: nothing owed
+    }
+    SECTION("ended by a concurrent forced end first") {
+        // The losing call of two forced DELETEs: its guarded mark touches no row, but the device
+        // was never confirmed and is still owed a release, so it must not read as a release.
+        RELEASE_RIG(h, "");
+        h.on_dispatch = [&h] { end_record_as(h.quarantine_store, "agent-B", ReleaseEnd::forced); };
+        auto res = h.del("agent-B", "?force=true");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        const auto body = parse_body(res->body);
+        CHECK(body["data"]["forced"] == true);
+        CHECK(body["data"]["device_confirmed"] == false);
+        CHECK(body["data"]["message"].get<std::string>().find("may still be contained") !=
+              std::string::npos);
+        const auto* success = find_audit(h, "success");
+        REQUIRE(success != nullptr);
+        CHECK(success->detail.find("already_ended device_confirmed=false") != std::string::npos);
+        CHECK(success->detail.find("ended_by=") == std::string::npos);
+        const auto owed = owed_list(h.quarantine_store); // still owed: only the device can clear it
+        REQUIRE(owed.size() == 1);
+        CHECK(owed[0].agent_id == "agent-B");
+    }
+    SECTION("the record's row is gone when the losing call reads its history") {
+        // A zero-row mark proves the record ended, but a row that is not there cannot show how:
+        // a missing row is "not confirmed", never a confirmed release.
+        RELEASE_RIG(h, "");
+        h.on_dispatch = [&h, &qdb] {
+            end_record_as(h.quarantine_store, "agent-B", ReleaseEnd::forced);
+            exec_sql(qdb.dsn(), "DELETE FROM quarantine_store.quarantine_records");
+        };
+        auto res = h.del("agent-B", "?force=true");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        const auto body = parse_body(res->body);
+        CHECK(body["data"]["forced"] == true);
+        CHECK(body["data"]["device_confirmed"] == false);
+        const auto* success = find_audit(h, "success");
+        REQUIRE(success != nullptr);
+        CHECK(success->detail.find("already_ended device_confirmed=false") != std::string::npos);
+        CHECK(success->detail.find("ended_by=") == std::string::npos);
+        const auto history = h.quarantine_store.get_history("agent-B");
+        REQUIRE(history.has_value());
+        CHECK(history->empty()); // the read worked; it just found nothing
+    }
+    SECTION("the history cannot be read when the losing call looks up its record") {
+        // Fail ONLY the history read, after the winning forced end: its CASE compares
+        // release_requested_at with 0, which no longer type-checks once the column is text. The
+        // guarded mark never reads that column, so it still answers "device is not quarantined"
+        // and the handler reaches the history read. An unreadable history is "not confirmed".
+        RELEASE_RIG(h, "");
+        h.on_dispatch = [&h, &qdb] {
+            end_record_as(h.quarantine_store, "agent-B", ReleaseEnd::forced);
+            exec_sql(qdb.dsn(), "ALTER TABLE quarantine_store.quarantine_records "
+                                "ALTER COLUMN release_requested_at DROP DEFAULT, "
+                                "ALTER COLUMN release_requested_at TYPE text "
+                                "USING release_requested_at::text");
+        };
+        auto res = h.del("agent-B", "?force=true");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        const auto body = parse_body(res->body);
+        CHECK(body["data"]["forced"] == true);
+        CHECK(body["data"]["device_confirmed"] == false);
+        const auto* success = find_audit(h, "success");
+        REQUIRE(success != nullptr);
+        CHECK(success->detail.find("already_ended device_confirmed=false") != std::string::npos);
+        CHECK(success->detail.find("ended_by=") == std::string::npos);
+        CHECK(find_audit(h, "failure") == nullptr);
+        CHECK_FALSE(h.quarantine_store.get_history("agent-B").has_value()); // the read is degraded
+    }
+}
+
+TEST_CASE("REST DELETE /api/v1/quarantine?force: no record -> 400; any value but true or false -> 400 "
+          "with a failure row, nothing dispatched and the record unchanged; force=false is the plain call",
+          "[rest][quarantine][release][force][pg]") {
+    SECTION("force=true with no record") {
+        RELEASE_RIG(h, "");
+        auto res = h.del("agent-never", "?force=true");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(h.dispatch_calls.empty());
+    }
+    SECTION("a value that is not exactly true or false") {
+        const std::string q = GENERATE(std::string{"?force=1"}, std::string{"?force=yes"},
+                                       std::string{"?force="}, std::string{"?force=TRUE"});
+        CAPTURE(q);
+        RELEASE_RIG(h, "status|inactive");
+        auto res = h.del("agent-B", q);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(res->body.find("force must be true or false") != std::string::npos);
+        CHECK(h.dispatch_calls.empty());
+        const auto rec = active_record(h.quarantine_store, "agent-B");
+        REQUIRE(rec.has_value());
+        CHECK(rec->status == "active"); // no release was requested
+        CHECK_FALSE(has_attempt_row(h));
+        const auto* failure = find_audit(h, "failure");
+        REQUIRE(failure != nullptr);
+        CHECK(failure->target_id == "agent-B");
+        CHECK(owed_list(h.quarantine_store).empty());
+    }
+    SECTION("force=false behaves as the plain call") {
+        RELEASE_RIG(h, "");
+        h.dispatch_sent = 0;
+        auto res = h.del("agent-B", "?force=false");
+        REQUIRE(res);
+        CHECK(res->status == 202);
+        CHECK(h.is_quarantined("agent-B"));
+        const auto* attempt = find_audit(h, "attempt");
+        REQUIRE(attempt != nullptr);
+        CHECK(attempt->detail.empty());
+    }
+}
+
+TEST_CASE("REST DELETE /api/v1/quarantine?force=true: refused by the scoped gate or the chokepoint (403) "
+          "leaves the record active, dispatches nothing and writes no attempt row",
+          "[rest][quarantine][release][force][pg]") {
+    SECTION("scoped gate") {
+        RELEASE_RIG(h, "status|inactive");
+        h.scope_allow = false;
+        auto res = h.del("agent-B", "?force=true");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        const auto rec = active_record(h.quarantine_store, "agent-B");
+        REQUIRE(rec.has_value());
+        CHECK(rec->status == "active");
+        CHECK(h.dispatch_calls.empty());
+        CHECK_FALSE(has_attempt_row(h));
+        CHECK(owed_list(h.quarantine_store).empty());
+    }
+    SECTION("chokepoint") {
+        RELEASE_RIG(h, "status|inactive");
+        h.authorize_fn = [](const DispatchCaller&, std::string_view,
+                            std::string_view) -> QuarantineRouteHarness::AuthorizeResult {
+            return std::unexpected(detail::DispatchDenial{detail::DispatchDenialReason::Forbidden,
+                                                          "Security", authz::Operation::Execute});
+        };
+        auto res = h.del("agent-B", "?force=true");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        const auto rec = active_record(h.quarantine_store, "agent-B");
+        REQUIRE(rec.has_value());
+        CHECK(rec->status == "active");
+        CHECK(h.dispatch_calls.empty());
+        CHECK_FALSE(has_attempt_row(h));
+        CHECK(owed_list(h.quarantine_store).empty());
+    }
+}
+
+TEST_CASE("REST DELETE /api/v1/quarantine?force=true: a store failure in the forced mark is a retryable "
+          "503 with a failure row, never a 202 that hides it",
+          "[rest][quarantine][release][force][pg]") {
+    RELEASE_RIG(h, "");
+    // The release request has landed by the time the dispatch runs; the schema then disappears, so
+    // the forced mark itself fails with a genuine store error.
+    h.on_dispatch = [&qdb] {
+        pg::PgConn conn{PQconnectdb(qdb.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        pg::PgResult r{PQexec(conn.get(), "DROP SCHEMA quarantine_store CASCADE")};
+        REQUIRE(r.ok());
+    };
+    auto res = h.del("agent-B", "?force=true");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->body.find(R"("retry_after_ms":5000)") != std::string::npos);
+    const auto* failure = find_audit(h, "failure");
+    REQUIRE(failure != nullptr);
+    CHECK(failure->detail.starts_with("db_error: "));
+    CHECK(find_audit(h, "success") == nullptr);
+    CHECK(find_audit(h, "pending") == nullptr);
+}
+
+#undef RELEASE_RIG

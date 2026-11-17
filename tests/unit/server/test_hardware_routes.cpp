@@ -2407,50 +2407,56 @@ TEST_CASE("route: lens-only response carries the Containment tab when the UI is 
     CHECK(contains(res->body, ">Containment</a>"));
 }
 
-// ───────────────────────── Actions lens: quarantine plugin rows ──────────────────────
+// ───────────────────────── Actions lens: firewall containment rows ───────────────────
 
 namespace {
-void report_quarantine_and_firewall_plugins(HwHarness& h) {
+void report_firewall_and_other_plugins(HwHarness& h) {
     h.ci_detail.identity = make_row("agent-1", "HOST-1", "linux", true);
     h.actions_plugins = {
-        {.name = "quarantine", .version = "1", .actions = {"quarantine", "unquarantine", "status", "whitelist"}},
-        {.name = "firewall", .version = "1", .actions = {"rules"}}};
+        {.name = "firewall",
+         .version = "1",
+         .actions = {"state", "rules", "quarantine", "release", "quarantine_status", "quarantine_allow"}},
+        {.name = "processes", .version = "1", .actions = {"list"}}};
 }
 } // namespace
 
-// Kills: a Run button for the quarantine plugin's own actions (quarantine, unquarantine,
-// whitelist) surviving in the Actions lens while the rest of the containment UI is hidden —
-// the owner chose to hide every quarantine control on the Hardware pages. Other plugins stay.
-TEST_CASE("route: actions lens — the quarantine plugin's rows are left out while the UI is hidden",
+// Kills: a Run button for the firewall plugin's four containment actions (quarantine, release,
+// quarantine_status, quarantine_allow) surviving in the Actions lens while the rest of the
+// containment UI is hidden — the owner chose to hide every quarantine control on the Hardware
+// pages (and approved the lens consequence for the four firewall rows, 2026-11-11). Other
+// plugins stay, and so do firewall.state and firewall.rules.
+TEST_CASE("route: actions lens — the four firewall containment rows are left out while the UI is hidden",
           "[hardware][route][quarantine]") {
     HwHarness h;
-    report_quarantine_and_firewall_plugins(h);
+    report_firewall_and_other_plugins(h);
     auto res = h.sink.Get("/fragments/hardware/ci/actions?id=agent-1");
     REQUIRE(res);
     REQUIRE(res->status == 200);
+    CHECK(contains(res->body, "data-plugin=\"firewall\" data-action=\"state\""));
     CHECK(contains(res->body, "data-plugin=\"firewall\" data-action=\"rules\""));
+    CHECK(contains(res->body, "data-plugin=\"processes\" data-action=\"list\""));
     CHECK(contains(res->body, "hwRunAction"));
+    for (const char* action : {"quarantine", "release", "quarantine_status", "quarantine_allow"})
+        CHECK_FALSE(contains(res->body,
+                             std::string("data-plugin=\"firewall\" data-action=\"") + action + "\""));
     CHECK_FALSE(contains(res->body, "data-plugin=\"quarantine\""));
-    CHECK_FALSE(contains(res->body, "<summary>quarantine</summary>"));
-    for (const char* action : {"quarantine.quarantine", "quarantine.unquarantine", "quarantine.status",
-                               "quarantine.whitelist"})
-        CHECK_FALSE(contains(res->body, action));
     REQUIRE_FALSE(h.audit_details.empty());
-    CHECK(contains(h.audit_details.back(), "actions catalogue: 1 rows"));
+    CHECK(contains(h.audit_details.back(), "actions catalogue: 3 rows"));
 }
 
-// Kills: the filter dropping the quarantine rows when the UI is on (the restore path).
-TEST_CASE("route: actions lens — the quarantine plugin's rows are listed when the UI is on",
+// Kills: the filter dropping the firewall containment rows when the UI is on (the restore path).
+TEST_CASE("route: actions lens — all six firewall rows are listed when the UI is on",
           "[hardware][route][quarantine]") {
     HwHarness h(false, false, false, /*containment_ui=*/true);
-    report_quarantine_and_firewall_plugins(h);
+    report_firewall_and_other_plugins(h);
     auto res = h.sink.Get("/fragments/hardware/ci/actions?id=agent-1");
     REQUIRE(res);
     REQUIRE(res->status == 200);
-    for (const char* action : {"quarantine", "unquarantine", "status", "whitelist"})
-        CHECK(contains(res->body, std::string("data-plugin=\"quarantine\" data-action=\"") + action + "\""));
-    CHECK(contains(res->body, "data-plugin=\"firewall\" data-action=\"rules\""));
-    CHECK(contains(h.audit_details.back(), "actions catalogue: 5 rows"));
+    for (const char* action :
+         {"state", "rules", "quarantine", "release", "quarantine_status", "quarantine_allow"})
+        CHECK(contains(res->body,
+                       std::string("data-plugin=\"firewall\" data-action=\"") + action + "\""));
+    CHECK(contains(h.audit_details.back(), "actions catalogue: 7 rows"));
 }
 
 // Remove needs Tag:Delete, which is not Tag:Write: a Write-only viewer is offered Add and no

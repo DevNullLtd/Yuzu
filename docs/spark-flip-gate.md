@@ -933,23 +933,73 @@ flip, with a red-first test each:
   The operator-facing note is the
   hold paragraph in `docs/user-manual/guaranteed-state.md`.
 - **F14 precondition (#4045 governance, added 2026-10-07): a fleet-visible persist-failure
-  signal (gauge + alert + pin test), splitting permanent loss from retryable failures.**
-  `yuzu.guardian_baseline_persist_failures` is a per-agent heartbeat status tag only: there
-  is no server table row, gauge, alert rule or pin test for it, it covers the Spark path
-  only (a legacy-path write failure is logged, not counted, so an absent tag is not
-  evidence that baselines persisted), and its aggregate mixes retryable failures with
-  permanent losses and is cumulative since boot. Until a fleet signal ships, the agent's
-  error log (`failed to persist captured baseline`) is the primary operator signal. Before
-  the flip, ship that signal (a server table row with its pin test and an alert; ideally a
-  current "unpersisted captures" gauge kept apart from a "captures lost" counter) or record
-  an explicit risk acceptance in section 5. A server gauge is a deliberate non-goal of the
-  #4045 change itself. Tracking issue: #5605 (a stop ended by the shutdown watchdog cannot be
-  traced at stop time: the #5604 decision, section 5; #5605 owns only the begin-of-stop
-  sentinel). The
-  agent-side `baseline_persist_refusals` count (a refused write: a live rule possibly judged
-  against re-captured content until its next re-arm, AC-10 case 6) has no tag either and is
-  part of the same fleet-signal decision. A stop ended by the agent's own shutdown watchdog
-  (exit code 4, AC-10 case 2) is logged nowhere on the agent and belongs to that decision too.
+  signal (gauge + alert + pin test), splitting permanent loss from retryable failures.
+  DISPOSITION (#5605): the signal is SHIPPED; the begin-of-stop sentinel and the
+  journal-record loss at stop are covered by the recorded risk acceptance in section 5.**
+  What shipped: two agent heartbeat tags beside the existing cumulative
+  `yuzu.guardian_baseline_persist_failures` (kept apart from it: that tag stays the
+  monitor-only cumulative signal) - `yuzu.guardian_baseline_unpersisted` (a CURRENT backlog:
+  captures staged and not yet written, present only on a `prefer_spark` agent with a
+  published persister, a present 0 meaning "no capture waiting at this persister" and never
+  "Spark is healthy") and `yuzu.guardian_baseline_rebaselined_at_boot` (sparse; rules whose
+  boot re-arm seed lookup found no persisted baseline; live on every agent today, legacy path
+  included, and NOT proof that a capture was lost) - rolled up by the server into three
+  fleet gauges (`yuzu_fleet_guardian_baseline_unpersisted`, `_rebaselined_at_boot`,
+  `_persist_failures`) plus the coverage and rejection gauges
+  (`yuzu_fleet_guardian_baseline_reporting`, `_tag_rejected`), one warning alert
+  (`YuzuGuardianBaselineUnpersisted`, group `yuzu-fleet-spark-rung1`), a pin test
+  (`tests/unit/server/test_guardian_baseline_fleet_tags.cpp`) and promtool cases
+  (`tests/prometheus/yuzu-alerts.test.yml`). The operator runbook is "Fleet monitoring of
+  baseline persistence" in `docs/user-manual/guaranteed-state.md`. Not covered, by design:
+  a legacy-path persist failure is still logged and not counted (so an absent or zero reading
+  is not evidence that baselines persisted); the agent-side `baseline_persist_refusals` count
+  stays DIAGNOSTIC-ONLY (no tag, no gauge); a stop ended by the agent's own shutdown watchdog
+  (exit code 4) is still logged nowhere. The alert is dormant in production until
+  `prefer_spark` is enabled (the gauge is absent fleet-wide before that), so it is shown to
+  fire only by the promtool cases today.
+  **Flip-evidence checklist row (#5605; a canary, before the flip):** on a `prefer_spark`
+  canary, (1) `yuzu_fleet_guardian_baseline_reporting` is above 0, (2)
+  `yuzu_fleet_guardian_baseline_tag_rejected` is 0, and (3) a forced store fault on that
+  canary makes `YuzuGuardianBaselineUnpersisted` fire and then clear once the fault is lifted
+  (allow the 15-minute `for:` to elapse, and up to about 5 minutes for the `[5m]` window to
+  run out after the backlog drains). The alert keeps the `> 0` shape on purpose (a ruled
+  decision); a series of one-scrape backlogs from different agents can hold it above 0, and
+  a promtool case documents that limit.
+  **Flip-time refresh item (#5605; part of the same checklist row):** at the flip, (4)
+  refresh every statement that says Spark or `prefer_spark` is off, or that the gauge is
+  absent, in every released agent today. List them with
+  `git grep -n -i "released agent" -- docs/ server/core/src/ agents/core/ | grep -i -E
+  'baseline|spark|guardian'` and
+  `git grep -n "prefer_spark.*off" -- docs/ server/core/src/ agents/core/ | grep -i -E
+  'baseline|spark|guardian'`. The hits are a superset (they include other Spark families
+  that the flip also refreshes); the files this change owns are: the HELP
+  strings in `server/core/src/guardian_baseline_fleet_tags.hpp`,
+  `docs/user-manual/metrics.md`, `docs/user-manual/guaranteed-state.md`,
+  `docs/user-manual/upgrading.md`, `docs/user-manual/server-admin.md` (the exit-code-4
+  paragraph), `docs/yuzu-guardian-design-v1.1.md` (section 24),
+  `docs/spark-legacy-delta-registry.md` (its "#4045 prose" entry), the alert comment and
+  description in `docs/prometheus/yuzu-alerts.yml`, and the runbook "Fleet monitoring of
+  baseline persistence". The agent side has two comments that state the flag is off or
+  defaults to false: `agents/core/src/guardian_baseline_heartbeat.hpp` (the unpersisted tag
+  is "dormant (prefer_spark off ...)") and `agents/core/include/yuzu/agent/guardian_engine.hpp`
+  ("prefer_spark_ defaults false" and "live in every released agent today"); the switch
+  itself is the hardcoded `/*prefer_spark=*/false` in `agents/core/src/agent.cpp`. To tell
+  which agents are on the Spark path, use the
+  `yuzu.guardian_backend` tag (`guardian_backend` on `GET /api/v1/devices`) and the `path=`
+  field of the `Guardian: full_sync rebuilt` log line.
+  Alert-at-scale revisit (recorded risk, owner Dave): the rule is `sum by (job)
+  (max_over_time(...[5m])) > 0` for 15 minutes, a sum of current counts that stays above 0
+  while ANY agent has a slow or failing store, so on a large fleet one flapping endpoint can
+  keep it firing and an operator may silence the group. The 15-minute `for:` and the 5-minute
+  window were set from reasoning, not from fleet data: **revisit trigger: re-tune the
+  threshold and window against fleet data at the F14 flip.**
+  As found (2026-10-07): `yuzu.guardian_baseline_persist_failures` was a per-agent heartbeat
+  status tag only, with no server table row, gauge, alert rule or pin test; it covers the
+  Spark path only and its aggregate is cumulative since boot and mixes retryable failures with
+  permanent losses. A server gauge was a deliberate non-goal of the #4045 change itself.
+  Tracking issue: #5605 (a stop ended by the shutdown watchdog cannot be traced at stop time:
+  the #5604 decision, section 5; #5605 owned the begin-of-stop sentinel, now covered by the
+  section 5 risk acceptance).
 - **Real-File-mechanism run for #4045: DONE 2026-10-08 (in-process, not a `yuzu-agent.exe`
   restart); PASSED.** The operator required one manual `prefer_spark` run on the Windows test
   box of a baseline-on-arm `file-hash-equals` rule through the real File mechanism before this
@@ -2569,13 +2619,18 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   `legacy` is the correct reading until `prefer_spark` is enabled. Not specific to #2818 (it was a general
   PR-5-readiness gap), so not filed as its own #2818-scoped issue; recorded here since several of
   this PR's own non-blocking dispositions depend on it.
-- **Baseline-persist signal emitted but unread (#4045, F14 precondition).** Same shape as the
-  `yuzu.guardian_backend` gap above: `yuzu.guardian_baseline_persist_failures` is emitted on
-  the heartbeat (Spark path only, cumulative, mixing retryable failures with permanent
-  losses) but no server code reads it, and the refusal counter has no tag at all. Until a
-  fleet signal ships (table row, gauge, alert, pin test; a current "unpersisted captures"
-  gauge kept apart from a "captures lost" counter) the agent error log is the only signal.
-  Tracked in #5605.
+- **Baseline-persist signal emitted but unread (#4045, F14 precondition): CLOSED by #5605.**
+  This was the same shape as the `yuzu.guardian_backend` gap above:
+  `yuzu.guardian_baseline_persist_failures` was emitted on the heartbeat (Spark path only,
+  cumulative, mixing retryable failures with permanent losses) but no server code read it.
+  The server now rolls up that tag and two new ones (`yuzu.guardian_baseline_unpersisted`, the
+  current backlog, and `yuzu.guardian_baseline_rebaselined_at_boot`) into fleet gauges, with one
+  warning alert, a pin test and promtool cases; the runbook is "Fleet monitoring of baseline
+  persistence" in `docs/user-manual/guaranteed-state.md`, and the disposition is in section 3a
+  (the F14 precondition on a fleet-visible persist-failure signal). Residuals that stay open:
+  the refusal counter has no tag (diagnostic-only), a legacy-path persist failure is still not
+  counted, and the alert's threshold and window are untuned (the revisit trigger is in section
+  3a).
 - **Real-File-mechanism run for #4045 (Q4): DONE 2026-10-08, PASSED (in-process harness).**
   The operator required one manual `prefer_spark` run on the Windows test box of a
   baseline-on-arm `file-hash-equals` rule through the real File mechanism before the change
@@ -2650,12 +2705,14 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   predates #5604 and is not fixed here (a pre-existing residual of the store's single
   mutex); tracked as #5642.
   **Trace decision (AC2)**: a watchdog-cut flush stays untraceable at stop time (decided by
-  the implementer, not accepted by a stakeholder; `hard_exit` forbids a log line, and a
-  KV marker would fail on the same store); the
+  the implementer; `hard_exit` forbids a log line, and a KV marker would fail on the same
+  store. AC2 itself was an implementer decision, not a stakeholder one; it is now covered by
+  the section 5 risk acceptance below); the
   evidence is exit code 4 plus the next boot's recapture lines. A recapture logs exactly
   like a first arm, so an operator should treat `file-hash-equals` rules without an authored
   `expected_hash` as possibly re-baselined after an exit-4 event. A begin-of-stop file
-  sentinel is #5605's design.
+  sentinel was #5605's candidate design and is NOT built: #5605 shipped the fleet
+  signal instead and the section 5 risk acceptance below covers the sentinel's absence.
   Measured under real SQLITE_BUSY (a second connection holding `BEGIN IMMEDIATE` through
   the whole stop), production values (5 s lowered to 1 s), Linux debug build, `stop()` entry
   to exit, with the busy handler of this change (count continuity, reset on entry to every
@@ -2681,7 +2738,7 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   still locked (rows C and E). Linux only; the emulated rows are not the real sent-marker
   write. Raw: the harness output for the code before the gate and for the final handler,
   to be attached to the #5604 decision comment.
-  **Trade-off (journal-record loss is an F14 precondition, not yet accepted)**: an external
+  **Trade-off (journal-record loss is an F14 precondition, accepted below)**: an external
   process that holds the kv store locked for 1 to 5 s at the shutdown instant now fails the
   stop-time writes that a 5 s budget would have survived.
   The cost is one recapture of the affected baselines at the next boot (a file that drifted
@@ -2692,11 +2749,42 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   journal one naming the pending count and the flush stage. Every user of the shared store
   runs at the 1 s budget once `stop()` has lowered it, not only plugins' `shutdown()`
   writes: plugin actions, the sync scheduler and the license scan too.
-  **F14 precondition (journal loss)**: the pending-journal ERROR line is agent-local only
-  (the heartbeat has already stopped; no metric, no server row; absent if the watchdog cuts
-  the stop; count and stage only, no rule ids). Before the Spark flip either extend the
-  #5605 fleet signal to journal records lost at stop, or record explicit risk acceptance by
-  the F14 sign-off owner. Owner: to be assigned by the F14 sign-off.
+  **F14 precondition (journal loss): RISK ACCEPTED by Dave Rae, F14 sign-off owner (owner
+  ruling 2026-10-23, Ruling 28 of the #5605 kickoff; sign-off ownership confirmed 2026-11-15),
+  recorded in the acceptance comment on #5605 dated 2026-11-16 (https://github.com/DevNullLtd/Yuzu/issues/5605#issuecomment-6925253547). Scope: F14 only; this is not
+  a SOC 2 exception. The owner is also the author of the change, so no independent approval
+  is implied by this record.** The pending-journal ERROR line is agent-local only (the heartbeat has already
+  stopped; no metric, no server row; absent if the watchdog cuts the stop; count and stage
+  only, no rule ids). The fleet signal shipped by #5605 was NOT extended to journal records
+  lost at stop. ACCEPTED for F14: (1) the begin-of-stop sentinel (the trace decision above:
+  a watchdog-cut stop, exit code 4, stays untraceable at stop time) and (2) the loss of
+  lifecycle-journal records still pending at stop. Compensating control, PARTIAL: the
+  boot-scan tag `yuzu.guardian_baseline_rebaselined_at_boot` (gauge
+  `yuzu_fleet_guardian_baseline_rebaselined_at_boot`) counts only a boot re-arm, of an enabled
+  `file-hash-equals` rule with no authored hash, whose seed read found NO persisted record (an
+  Absent read). It does NOT see:
+
+  - (a) a Malformed record, a boot read error or a fingerprint mismatch (a retarget), all of
+    which also re-baseline;
+  - (b) a retarget whose new capture was never written before a crash (the old record still
+    reads Ok);
+  - (c) a capture that was never staged while an older record under that rule id exists (for
+    an earlier target, or malformed; with no record at all the next boot reads it as Absent and
+    the boot-scan counts it);
+  - (d) a malformed record that is overwritten at boot N, which reads Ok at boot N+1;
+  - (e) a rule that was disabled at boot and enabled later, which is not counted at that boot
+    (a later boot with an absent record would count it).
+
+  The tag also says nothing about journal records. It cannot prove that a capture was lost or
+  that the previous stop was an exit-4 (a never-captured target, a failed arm and a lost
+  capture all read the same). On Linux and macOS no file mechanism arms, so such a rule reads
+  Absent at every boot and the tag is non-zero on every boot there, so it is not a
+  baseline-loss signal there and meaningful readings come from Windows agents only. The only
+  stop-time trace is the agent-local ERROR lines added by PR #5645 (the #5604 stop busy
+  budget), which a watchdog-cut stop does not write. **Revisit trigger: before the first
+  production fleet or the first post-flip exit-4.** (The earlier wording, "Owner: to be
+  assigned by the F14 sign-off", is superseded; the Sign-off row in section 1 is NOT edited
+  here, it remains with its owner.)
   **Exposure split**: the baseline and lifecycle-journal benefits are Spark-gated and dormant
   while `prefer_spark_` is false. The KvStore handler, the 1 s stop budget, the stop-time
   loss-ledger write and the sync scheduler's, license scan's and plugin `shutdown()` writes at
@@ -2736,15 +2824,16 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
 - Milestone: pre-PR-5 hardening package (#4051/#4052/#4053) + two remaining pre-PR-5 GATING items
   from the PR-2d follow-ups (the three sre observability gaps; the
   yuzu.guardian_backend server-side-reader gap, now visible via #2240), plus two items from #4045 (the fleet-visible
-  baseline-persist signal (F14 precondition, section 3a) and the missing
-  remaining-deadline wall in `stop()`); the third PR-2d follow-up, guard.errored census
+  baseline-persist signal (F14 precondition, section 3a; shipped by #5605, so no longer
+  pending) and the missing remaining-deadline wall in `stop()`); the third PR-2d follow-up, guard.errored census
   recognition (C-1), is resolved by #5667 with residuals (a)-(d) carried in the C-1 bullet
   of section 5 (#5674/#5675/#5676; the two still-open PR-2d follow-ups have no issue numbers of their
   own, tracked here; residuals (a)-(d) also gate); those two #4045 items
-  are tracked in #5605 (fleet signal) and #5604 (the `stop()` deadline; the decision closes
-  with the stop busy budget, while the slow-I/O residual stays F14-gating, section 5, and
-  the lifecycle-journal records lost at stop are a further F14 precondition there: a fleet
-  signal or explicit risk acceptance by the F14 sign-off owner). The pre-merge
+  are tracked in #5605 (fleet signal: SHIPPED; section 3a) and #5604 (the `stop()`
+  deadline; the decision closes with the stop busy budget, while the slow-I/O residual stays
+  F14-gating, section 5, and the lifecycle-journal records lost at stop were a further F14
+  precondition there, now recorded as an accepted risk, owner Dave, with its revisit trigger
+  in section 5). The pre-merge
   real-File-mechanism run is DONE (2026-10-08, passed; section 3a).
 - Revisit trigger: before PR-5's sign-off, everything above re-checked; #4051 specifically
   re-checked before any production fleet (dedup races become far more frequent under
@@ -2961,19 +3050,21 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   conditions in the Guardian guide's section 'When a verdict is flagged or does not move'
   holds), and the hold cannot touch it (server side). The agent now also
   stamps a `(boot_epoch, emit_seq)` pair at the point queue order is decided (legacy executor
-  admission; the Spark outbox stamp). A server that compares the pair orders a retained
-  verdict against a newer one by it, and that order depends on neither the wall clock nor
-  arrival order; a server that does not compare it ignores the pair and keeps ordering by its
-  census ordering key (the merge gate below says which stage the server is at). Entries that
+  admission; the Spark outbox stamp). The server orders a retained verdict against a newer
+  one by it between two events that both carry a pair, and that order depends on neither the
+  wall clock nor arrival order outside the flagged recoveries (the merge gate below says which
+  stage the server is at; a server on an earlier stage ignores the pair and keeps ordering by
+  its census ordering key). Entries that
   carry no pair (journal-paged replays, DEX observations, and an agent whose boot epoch could
   not be claimed) are sent with the pair unset (0/0): two such events order by the census
-  ordering key, and against a paired verdict the server change will hold them (item 1). Note on
+  ordering key, and against a paired verdict the server holds them (item 1). Note on
   #5690's acceptance options (factual, not a ruling): a tie policy closes UP-13 but not UP-14
   (the server now flags a tied or mis-ordered pair rather than keeping it silently); a policy
   that ordered by receipt sequence alone would close UP-14 but worsen UP-13; only terminal
-  precedence closes both. The server change below is none of these three: once PR B ships it
-  will order by the pair, fall back to the census ordering key between two unpaired events,
-  and use arrival order only in the flagged recoveries it will define. The test
+  precedence closes both. The server change below is none of these three: from PR B it
+  orders by the pair, falls back to the census ordering key between two unpaired events, and
+  uses arrival order only in the flagged recoveries (a re-base of a stale pair clock, and the
+  transition of an unpaired event over a paired verdict once the hold has expired). The test
   `#3972 chaos: a third sender holding the stream write mutex ...`
   (hidden `[.chaos]`) characterises UP-13 and deliberately asserts no order.
 - UP-14: the five conditions the SERVER change must meet. Actual order of delivery: the census
@@ -2982,9 +3073,13 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   ignored the pair between #7303 and PR A. PR A stores the pair, counts unpaired and rejected
   pairs and exposes the counts, but does not compare the pair: between PR A and PR B the
   verdict decision is the census ordering key alone. PR B adds the comparison, the hold and
-  the recovery. Tracking unit: #5690. The one checkbox per item goes in the server pull
-  requests' descriptions: item 5 on PR A, items 1 to 4 on PR B. Until PR B merges, items 1
-  to 4 are not met and the UP-14 residual stands as described above. The conditions:
+  the recovery: from PR B the verdict of a census row is decided by the pair rules in the
+  Guardian guide's section 'Boot epoch and event ordering' (operator reading: 'Running the
+  pair regime'). Tracking unit: #5690. The one checkbox per item goes in the server pull
+  requests' descriptions: item 5 on PR A, items 1 to 4 on PR B. PR B is the change that meets
+  items 1 to 4: until it merges they are not met and the UP-14 residual stands as described
+  above, and whether each is met is decided by the evidence in its description, not by this
+  paragraph. The conditions:
   1. The comparator orders per (agent_id, rule_id) and compares the pair when both sides
      carry one. An unpaired event against a paired verdict is held (refused, flagged, counted)
      while the agent's pair clock is fresh, and applied by arrival, flagged, once the clock is
@@ -3007,25 +3102,31 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
      shows a duplicate replay does not reapply an obsolete census transition.
   4. The rule for gap repairs (they draw a fresh pair at admission today) and for accepted
      unordered (0/0) events is stated with correctness outcomes and tests: a failed-claim 0/0
-     event against an existing ordered verdict; rollback to a non-stamping binary; the
-     transition from unordered back to ordered; whether an accepted 0/0 clears or retains the
-     stored ordering metadata, and how that metadata stays associated with the verdict it
+     event against an existing ordered verdict, and one from an agent whose instance lock was
+     lost; the transition from unordered back to ordered; whether an accepted 0/0 clears or
+     retains the stored ordering metadata, and how that metadata stays associated with the verdict it
      actually describes; and the timeline of a previously undelivered older replay (an error at
      timestamp 100 replayed as 0/0 after a backward clock step, after a newer live compliant
      verdict at timestamp 90), in both arrival orders and with subsequent live events; and two
      live senders sharing one agent_id, a lock holder stamping a pair while a process that
-     was refused the data-directory lock (`instance_lock_not_held`) or an older build sends
-     0/0: the mixture must not make the comparator non-transitive (a verdict ranked above one
-     that is in turn ranked above it; met as: no apply reversal within a regime, and every
-     transition between regimes is one-way, flagged and time-fenced), the outcome is stated,
+     was refused the data-directory lock (`instance_lock_not_held`) or whose epoch claim failed
+     sends 0/0: the mixture must not make the comparator non-transitive (a verdict ranked above one
+     that is in turn ranked above it; met as: no apply reversal within a regime, and the two
+     transitions between regimes, which run in opposite directions, are each flagged: pair to key
+     is fenced by the hold (a fresh pair clock) and applies by arrival once the clock is stale,
+     while key to pair is not fenced by the clock or by arrival), the outcome is stated,
      and a test covers it. Two
      stamping senders on separate data directories under one fixed agent id (independent
      epochs) still order totally, but their events rank against each other by epochs that
      are unrelated across instances, and the count below cannot see them because both send a
      pair: for that case too the outcome is stated and a test covers it. The server also
      counts accepted events that carry no pair, per agent, and exposes the count (a metric or
-     an API field), so an agent that runs unordered is visible fleet-wide; the agent's own
-     signal is one error-level log line.
+     an API field), so an agent that runs unordered is visible fleet-wide (an agent whose first
+     deliveries all fail the per-agent order step has no order row, so it is not counted
+     until its next successful first delivery; the compensating signals are
+     `yuzu_server_guardian_census_proj_failures_total` and
+     `yuzu_server_guardian_census_pending_events`); the agent's own signal is one error-level
+     log line.
      For every case above, tests show that stale state is not silently presented as the current
      verdict. When the available ordering information cannot establish freshness, the server
      exposes that uncertainty or obtains fresh state; census-ordering-key fallback, metadata retention,

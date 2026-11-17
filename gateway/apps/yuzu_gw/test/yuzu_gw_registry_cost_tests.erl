@@ -8,8 +8,8 @@
 %%%
 %%%  * pg traffic. A registration used to join one `pg' group per plugin plus
 %%%    `all_agents' and `{agent, Id}', each a `gen_server:call' with an
-%%%    infinite timeout made from inside the registry: about 71 synchronous
-%%%    calls for an agent with the 69 plugins a full build ships. Nothing in
+%%%    infinite timeout made from inside the registry: about 70 synchronous
+%%%    calls for an agent with the 68 plugins a full build ships. Nothing in
 %%%    production read the per-plugin or `all_agents' groups. The registry now
 %%%    makes no `pg' call at all; the agent process joins `{agent, Id}' itself.
 %%%
@@ -41,7 +41,7 @@
          <<"netprobe">>, <<"netstat">>, <<"network_actions">>, <<"network_config">>,
          <<"network_diag">>, <<"os_info">>, <<"peripherals">>, <<"pkg_inventory">>,
          <<"platform_security">>, <<"power_health">>, <<"printing">>,
-         <<"privacy_permissions">>, <<"processes">>, <<"procfetch">>, <<"quarantine">>,
+         <<"privacy_permissions">>, <<"processes">>, <<"procfetch">>,
          <<"rdp_control">>, <<"registry">>, <<"runtimes">>, <<"sccm">>, <<"script_exec">>,
          <<"services">>, <<"software_actions">>, <<"status">>, <<"storage">>,
          <<"system_hardening">>, <<"tags">>, <<"echo">>, <<"update_source_trust">>,
@@ -62,7 +62,7 @@ cost_test_() ->
     {setup,
      fun setup/0,
      fun cleanup/1,
-     [{"69 plugins: the registry makes no pg call to register or deregister an agent",
+     [{"68 plugins: the registry makes no pg call to register or deregister an agent",
        fun register_makes_no_pg_calls/0},
       {"the registry joins no pg group on an agent's behalf",
        fun registry_joins_no_group/0},
@@ -74,7 +74,7 @@ cost_test_() ->
                       fun down_is_linear/0}}]}.
 
 setup() ->
-    ?assertEqual(69, length(?PLUGINS)),
+    ?assertEqual(68, length(?PLUGINS)),
     yuzu_gw_test_registry:ensure_fresh(),
     catch meck:unload(telemetry),
     meck:new(telemetry, [passthrough, no_link]),

@@ -594,9 +594,9 @@ TEST_CASE("describe_dispatch_denial: REST and MCP wording is byte-identical for 
     for (const auto reason : kAllDenialReasons) {
         CAPTURE(detail::to_string(reason));
         const auto denial = denial_for(reason);
-        const auto rest = describe_dispatch_denial(reason, "quarantine", "quarantine", denial,
+        const auto rest = describe_dispatch_denial(reason, "firewall", "quarantine", denial,
                                                    DenialSurface::kRest);
-        const auto mcp = describe_dispatch_denial(reason, "quarantine", "quarantine", denial,
+        const auto mcp = describe_dispatch_denial(reason, "firewall", "quarantine", denial,
                                                   DenialSurface::kMcp);
         CHECK(rest.cls == mcp.cls);
         CHECK(rest.message == mcp.message);
@@ -613,7 +613,7 @@ TEST_CASE("describe_dispatch_denial: the six pre-existing MCP strings are preser
           "[server][routes][mcp][quarantine]") {
     using Reason = detail::DispatchDenialReason;
     const auto text = [](Reason reason) {
-        return describe_dispatch_denial(reason, "quarantine", "quarantine", denial_for(reason),
+        return describe_dispatch_denial(reason, "firewall", "quarantine", denial_for(reason),
                                         DenialSurface::kMcp);
     };
 
@@ -644,7 +644,7 @@ TEST_CASE("describe_dispatch_denial: the six pre-existing MCP strings are preser
         const auto t = text(Reason::ApprovalRequired);
         CHECK(t.cls == DispatchDenialClass::kPermissionDenied);
         // The em dash (U+2014, UTF-8 E2 80 94) is part of the pre-existing wire string.
-        CHECK(t.message == "approval required for quarantine.quarantine \xE2\x80\x94 this action "
+        CHECK(t.message == "approval required for firewall.quarantine \xE2\x80\x94 this action "
                            "requires either an admin caller or a redeemed approval ticket that "
                            "this dispatch does not carry");
         CHECK(t.remediation == "re-call using a supervised-tier MCP token, which mints and polls "
@@ -655,7 +655,7 @@ TEST_CASE("describe_dispatch_denial: the six pre-existing MCP strings are preser
         const auto t = text(Reason::KillSwitched);
         CHECK(t.cls == DispatchDenialClass::kPermissionDenied);
         CHECK(t.message ==
-              "dispatch denied: the per-action kill switch is OFF for quarantine.quarantine");
+              "dispatch denied: the per-action kill switch is OFF for firewall.quarantine");
         CHECK(t.remediation == "an operator has thrown an emergency stop for this plugin.action "
                                "(set_plugin_kill_switch / PUT .../kill-switch); it must be "
                                "re-enabled before this call can dispatch");
