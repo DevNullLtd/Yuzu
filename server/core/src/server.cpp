@@ -348,6 +348,7 @@
 #include "event_bus.hpp"
 #include "agent_registry.hpp"
 #include "agent_service_impl.hpp"
+#include "agent_witnessed_leaf.hpp"
 #include "cidr_match.hpp"
 #include "gateway_forward_guard.hpp"
 #include "gateway_mgmt_stub_pool.hpp"
@@ -3675,6 +3676,31 @@ public:
                           "repeatedly attempting to re-provision.",
                           "counter");
         metrics_.counter("yuzu_server_ca_reissue_blocked_total", {{"reason", "revoked_identity"}});
+        // WP01: re-registration of an already-enrolled agent id (both ingest paths).
+        metrics_.describe("yuzu_register_reregistration_total",
+                          "Re-registrations of an already-enrolled agent id, by ingest path "
+                          "(direct | gateway_proxy), the proof-of-identity outcome "
+                          "(no_leaf_on_record | proven_by_leaf | via_token | no_proof | "
+                          "unattested_gateway | revoked_identity | lookup_failed) and the "
+                          "--agent-reregistration-proof mode. In audit mode a no_proof, "
+                          "unattested_gateway, revoked_identity or lookup_failed outcome was "
+                          "ADMITTED; in enforce mode it was refused. A sustained non-zero audit "
+                          "rate for real agents means enforce would lock them out.",
+                          "counter");
+        metrics_.describe("yuzu_register_reenrol_token_refused_total",
+                          "Re-enrolment of an already-enrolled agent id with an enrollment token "
+                          "that was refused (reason: a token-rejection variant, multi_use_token or "
+                          "invalid_input_length). Refused with a gRPC status, never accepted=false.",
+                          "counter");
+        metrics_.describe("yuzu_server_ca_superseded_leaf_total",
+                          "Agent leaves revoked as reenrolled after the agent re-enrolled with a "
+                          "single-use token and was issued a fresh leaf (WP01).",
+                          "counter");
+        metrics_.describe("yuzu_server_ca_supersede_failed_total",
+                          "Failures revoking an agent's older leaves after a token re-enrolment "
+                          "(the agent holds the new leaf; the older one stays valid until it "
+                          "expires or an operator revokes it).",
+                          "counter");
         metrics_.describe("yuzu_server_ca_revocation_sweep_read_failures_total",
                           "Revocation-sweep tick's list_revoked_serials() read failed - that "
                           "tick's sweep was skipped entirely rather than treating every live "
@@ -9733,6 +9759,41 @@ public:
                 // certs as agent identities (foreign certs fall through to bootstrap).
                 agent_service_.set_peer_cert_recognizer(
                     [this](const std::string& peer_cert_pem) { return is_yuzu_issued(peer_cert_pem); });
+                // WP01: proof of identity on re-registration of an already-enrolled id, for the
+                // direct AND gateway-relayed paths (ONE hooks object, ONE decision:
+                // agent_reregistration_gate.hpp). Wired only here, with the issuing CA: an install
+                // with operator-supplied certificates has no ca_issued agent leaf to prove against,
+                // so the gate is inert there (documented, owner decision D7). Same lifetime
+                // contract as the signer above: set before BuildAndStart, cleared in stop().
+                {
+                    const auto proof_mode =
+                        parse_reregistration_proof_mode(cfg_.agent_reregistration_proof)
+                            .value_or(ReregistrationProofMode::Enforce); // CLI11 validated: unreachable, fail closed
+                    auto hooks = std::make_shared<AgentIdentityHooks>();
+                    hooks->leaf_state = [this](const std::string& agent_id) {
+                        return ca_store_->agent_leaf_state(agent_id);
+                    };
+                    hooks->attested_leaf_proves = [this](const std::string& pem,
+                                                         const std::string& agent_id) {
+                        return attested_leaf_proves_identity(pem, agent_id);
+                    };
+                    hooks->supersede_older_leaves = [this](const std::string& agent_id,
+                                                           const std::string& new_cert_pem) {
+                        supersede_older_agent_leaves(agent_id, new_cert_pem);
+                    };
+                    agent_service_.set_agent_identity_hooks(hooks);
+                    agent_service_.set_reregistration_proof_mode(proof_mode);
+                    if (gateway_service_) {
+                        gateway_service_->set_agent_identity_hooks(hooks);
+                        gateway_service_->set_reregistration_proof_mode(proof_mode);
+                    }
+                    spdlog::info("PKI: agent re-registration proof mode = {}{}", to_string(proof_mode),
+                                 proof_mode == ReregistrationProofMode::Audit
+                                     ? " (decide and count, admit as before; set "
+                                       "--agent-reregistration-proof=enforce once gateways are "
+                                       "upgraded)"
+                                     : "");
+                }
                 spdlog::info("PKI: per-agent mTLS issuance active (CA {})",
                              default_cert_set_.ca_fingerprint_sha256.empty()
                                  ? std::string("operator-supplied")
@@ -12102,8 +12163,11 @@ public:
         agent_service_.set_agent_cert_signer(nullptr);
         agent_service_.set_revocation_checker(nullptr);
         agent_service_.set_peer_cert_recognizer(nullptr);
-        if (gateway_service_)
+        agent_service_.set_agent_identity_hooks(nullptr);
+        if (gateway_service_) {
             gateway_service_->set_agent_cert_signer(nullptr);
+            gateway_service_->set_agent_identity_hooks(nullptr);
+        }
 
         // 2f PR 3a: the bridge borrows the bus (unsubscribe on teardown) and the
         // session registry - shut it down and release it BEFORE the tracker/bus
@@ -13205,8 +13269,11 @@ private:
                 // agent-issuance path that records a different/empty purpose
                 // would silently fall out of this filter and reopen the
                 // revocation bypass this check exists to close.
+                // WP01: a leaf the SERVER revoked as `reenrolled` (superseded by a fresh leaf
+                // after a single-use-token re-enrolment) is bookkeeping, not a withdrawn
+                // identity; counting it would refuse the agent's own renewal until it expired.
                 if (rev.purpose == "agent" && rev.subject == agent_id &&
-                    rev.not_after > now_epoch) {
+                    rev.not_after > now_epoch && rev.revocation_reason != kRevokeReasonReenrolled) {
                     spdlog::warn("PKI: refusing to re-issue for agent {} — a revoked, "
                                  "non-expired cert (serial {}) exists; an operator must clear "
                                  "the revocation before this agent can re-provision",
@@ -13741,6 +13808,84 @@ private:
                                   const std::unordered_set<std::string>& revoked_serials) {
         const std::string serial = resolve_yuzu_peer_serial(peer_cert_pem);
         return !serial.empty() && revoked_serials.contains(serial);
+    }
+
+    /// WP01: does a certificate the GATEWAY witnessed in an agent's TLS handshake prove `agent_id`?
+    /// The gateway does not validate the chain (so a stale or foreign leaf cannot abort the
+    /// handshake and lock an agent out), which makes THIS the check: the leaf chains to OUR issuing
+    /// CA (an UNCACHED verify: see agent_witnessed_leaf.hpp), is inside its validity window now, is an AGENT leaf (the install-scoped
+    /// `.../agent/<id>` URI SAN: a code-signing leaf has none), names exactly this agent id in its
+    /// CN, and is not revoked (`is_peer_cert_revoked` fails CLOSED on a degraded read, which here
+    /// means "no proof"). Size-bounded: the PEM comes off the wire.
+    bool attested_leaf_proves_identity(const std::string& cert_pem, const std::string& agent_id) {
+        // The predicate and its rationale live in agent_witnessed_leaf.hpp (unit-tested with real
+        // certificates); this supplies what ServerImpl owns. agent_ca_cert_pem_ is written once
+        // before the gRPC servers start.
+        return witnessed_leaf_proves_agent_identity(
+            cert_pem, agent_id, agent_ca_cert_pem_, std::chrono::system_clock::now(),
+            [this](const std::string& pem) { return is_peer_cert_revoked(pem); },
+            [](std::string_view segment) { return uri_encode_segment(segment); });
+    }
+
+    /// WP01 / owner decision D4: an agent re-enrolled with a single-use enrollment token and was
+    /// just issued `new_cert_pem`; revoke its OTHER live leaves (reason `kRevokeReasonReenrolled`)
+    /// so a lost-or-stolen key does not stay valid beside its replacement. Called only AFTER the new
+    /// leaf exists. Best effort by design (the agent already holds a good credential): a failure is
+    /// logged and counted, never thrown. The CRL is republished so relying parties pick it up.
+    void supersede_older_agent_leaves(const std::string& agent_id, const std::string& new_cert_pem) {
+        if (!ca_store_ || !ca_store_->is_open())
+            return;
+        const auto fresh = pki::parse_certificate(new_cert_pem);
+        std::optional<std::string> fresh_serial;
+        if (fresh)
+            fresh_serial = normalize_serial_hex(fresh->serial_hex);
+        if (!fresh_serial) {
+            spdlog::error("PKI: cannot read the serial of the new leaf for agent {} - older leaves "
+                          "NOT superseded",
+                          ::yuzu::log_id_token(agent_id));
+            return;
+        }
+        auto serials = ca_store_->live_agent_serials(agent_id);
+        if (!serials) {
+            spdlog::error("PKI: live-leaf read failed superseding agent {}: {}",
+                          ::yuzu::log_id_token(agent_id), ::yuzu::log_key_token(serials.error()));
+            metrics_.counter("yuzu_server_ca_supersede_failed_total").increment();
+            return;
+        }
+        bool revoked_any = false;
+        for (const auto& serial : *serials) {
+            if (normalize_serial_hex(serial) == fresh_serial)
+                continue;
+            auto r = ca_store_->revoke_system(serial, kRevokeReasonReenrolled);
+            if (!r) {
+                spdlog::error("PKI: revoking superseded leaf {} of agent {} failed: {}", serial,
+                              ::yuzu::log_id_token(agent_id), ::yuzu::log_key_token(r.error()));
+                metrics_.counter("yuzu_server_ca_supersede_failed_total").increment();
+                continue;
+            }
+            if (!*r)
+                continue;
+            revoked_any = true;
+            metrics_.counter("yuzu_server_ca_superseded_leaf_total").increment();
+            if (audit_store_ && audit_store_->is_open()) {
+                (void)audit_store_->log({.timestamp = std::time(nullptr),
+                                         .principal = "agent:" + agent_id,
+                                         .principal_role = "agent",
+                                         .action = "ca.cert.revoked",
+                                         .target_type = "AgentCertificate",
+                                         .target_id = serial,
+                                         .detail = "reason=reenrolled cn=" +
+                                                   detail::audit_token(agent_id) +
+                                                   " via=token_reenrolment",
+                                         .result = "success"});
+            }
+        }
+        if (revoked_any && !publish_crl(/*background=*/false, /*skipped=*/nullptr,
+                                        CrlTrigger::Operator))
+            spdlog::warn("PKI: CRL republish after superseding agent {}'s older leaves failed; "
+                         "the leaves are revoked in ca_store (mTLS gate) and the next CRL tick "
+                         "publishes them",
+                         ::yuzu::log_id_token(agent_id));
     }
 
     /// PKI PR4 / HA WS-6 CRL follow-ups (#4828-#4831): build + record a new CRL version over the

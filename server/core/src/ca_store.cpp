@@ -387,6 +387,16 @@ const std::vector<pg::PgMigration>& migrations() {
             "(revoked_at, serial_hex) INCLUDE (revocation_reason) WHERE revoked_at > 0; "
             "CREATE INDEX IF NOT EXISTS idx_ca_issued_issued_at_serial ON ca_issued "
             "(issued_at, serial_hex) INCLUDE (revoked_at, revocation_reason);"},
+        // v6 (WP01): the per-agent identity lookup that Register/ProxyRegister make before
+        // re-admitting an already-enrolled agent id (agent_leaf_state). Register is
+        // unauthenticated and hot and ca_issued is never pruned, so this must not be a table
+        // scan. Partial on purpose: only agent leaves are ever looked up by subject. Plain
+        // CREATE INDEX blocks ca_issued writers while it builds - the same accepted exception as
+        // v5 (ADR-0053 "Update (2026-10-20)"), with the same lock_timeout / statement_timeout.
+        {6, "SET LOCAL lock_timeout = '30s'; "
+            "SET LOCAL statement_timeout = 0; "
+            "CREATE INDEX IF NOT EXISTS idx_ca_issued_agent_subject ON ca_issued "
+            "(subject, not_after) WHERE purpose = 'agent';"},
     };
     return kMigrations;
 }
@@ -1196,7 +1206,8 @@ std::string qualify_operator_reason(const std::string& reason) {
     std::string folded = b == std::string::npos ? std::string{} : reason.substr(b, e - b + 1);
     for (auto& c : folded)
         c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    if (folded == kRevokeReasonSuperseded || folded == kRevokeReasonUnpublished)
+    if (folded == kRevokeReasonSuperseded || folded == kRevokeReasonUnpublished ||
+        folded == kRevokeReasonReenrolled)
         return "operator-supplied: " + reason;
     return reason;
 }
@@ -1309,6 +1320,54 @@ std::expected<std::vector<std::string>, std::string> CaStore::list_revoked_seria
     for (int i = 0; i < serial_rows; ++i)
         serials.push_back(text_col(res.get(), i, 0));
     return serials;
+}
+
+std::expected<AgentLeafState, std::string> CaStore::agent_leaf_state(const std::string& agent_id) {
+    if (!open_)
+        return std::unexpected(std::string(kCaDbErrorPrefix) + "database not open");
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::unexpected(std::string(kCaDbErrorPrefix) + "database unavailable — try again");
+    // The database clock decides "unexpired" (never this replica's system_clock, #3715). The
+    // purpose filter is load-bearing: `subject` has no namespace of its own, so a revoked
+    // code-signing leaf whose CN equals an agent id must not read as that agent's identity.
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT COALESCE(bool_or(status = 'active'), false), "
+        "COALESCE(bool_or(status = 'revoked' AND revocation_reason <> $2), false) "
+        "FROM ca_store.ca_issued WHERE purpose = 'agent' AND subject = $1 "
+        "AND not_after > extract(epoch FROM now())::bigint",
+        std::vector<std::string>{sanitize_pg_text(agent_id), std::string(kRevokeReasonReenrolled)});
+    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1)
+        return std::unexpected(std::string(kCaDbErrorPrefix) +
+                               "agent_leaf_state failed: " + PQerrorMessage(lease.get()));
+    AgentLeafState st;
+    st.has_live = text_col(res.get(), 0, 0) == "t";
+    st.has_revoked_unexpired = text_col(res.get(), 0, 1) == "t";
+    return st;
+}
+
+std::expected<std::vector<std::string>, std::string>
+CaStore::live_agent_serials(const std::string& agent_id) {
+    if (!open_)
+        return std::unexpected(std::string(kCaDbErrorPrefix) + "database not open");
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::unexpected(std::string(kCaDbErrorPrefix) + "database unavailable — try again");
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT serial_hex FROM ca_store.ca_issued WHERE purpose = 'agent' AND subject = $1 "
+        "AND status = 'active' AND not_after > extract(epoch FROM now())::bigint",
+        std::vector<std::string>{sanitize_pg_text(agent_id)});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected(std::string(kCaDbErrorPrefix) +
+                               "live_agent_serials failed: " + PQerrorMessage(lease.get()));
+    std::vector<std::string> out;
+    const int n = PQntuples(res.get());
+    out.reserve(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i)
+        out.push_back(text_col(res.get(), i, 0));
+    return out;
 }
 
 bool CaStore::delete_issued_by(const std::string& issued_by) {

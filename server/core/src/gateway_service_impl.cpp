@@ -1,5 +1,7 @@
 #include "gateway_service_impl.hpp"
 
+#include "agent_reregistration_apply.hpp"
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -714,6 +716,26 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
     // still add themselves. Per-gateway agent_id
     // scoping/attestation is #1292 (design: #5578, ADR-0066).
 
+    // WP01: an already-enrolled id whose live leaf is not proven re-enrols through the token block
+    // below, as a re-enrolment (single-use token required, older leaf superseded). See
+    // agent_reregistration_gate.hpp; this is the mirror of the direct Register path.
+    bool reenrol_via_token = false;
+    bool reenrolled_with_token = false;
+    // A gRPC status, NEVER accepted=false (a permanent rejection to the agent): the agent keeps
+    // retrying until it holds a good token.
+    const auto reenrol_token_refusal = [&](std::string_view reason) {
+        if (metrics_) {
+            metrics_
+                ->counter("yuzu_register_reenrol_token_refused_total",
+                          {{"reason", std::string(reason)}})
+                .increment();
+        }
+        spdlog::warn("[gateway] Register: re-enrolment token refused for agent {} ({})",
+                     safe_agent_id, reason);
+        return grpc::Status(grpc::StatusCode::UNAUTHENTICATED,
+                            std::string(yuzu::server::kReregistrationRefusalPublicMessage));
+    };
+
     // Fast path: agent already enrolled from a prior connection
     {
         // WS-6 6.2: five-state read — a store ERROR fails closed with UNAVAILABLE,
@@ -742,7 +764,31 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
         const auto& prior = *prior_result;
         if (prior && *prior == auth::PendingStatus::approved) {
             spdlog::info("[gateway] Agent {} re-registering (already enrolled)", safe_agent_id);
-            goto gw_enrolled;
+            // WP01: the approved row is not proof of WHO is calling (the agent listener is
+            // verify-none by design, so the gateway relayed an unauthenticated claim). The proof
+            // is the leaf the gateway WITNESSED in the agent's TLS handshake. Both fields are
+            // gateway-authoritative (overwritten unconditionally by an upgraded gateway), so they
+            // are read ONLY on this path; the direct Register ignores them. An old gateway sets
+            // neither: `attests` is false and no certificate proof exists.
+            const bool attests = request->gateway_attests_peer_cert();
+            const bool cert_proves =
+                attests && agent_identity_hooks_ && agent_identity_hooks_->attested_leaf_proves &&
+                agent_identity_hooks_->attested_leaf_proves(
+                    request->gateway_attested_peer_cert_pem(), info.agent_id());
+            const auto verdict = yuzu::server::apply_reregistration_gate(
+                reregistration_mode_, agent_identity_hooks_.get(), "gateway_proxy",
+                info.agent_id(), safe_agent_id,
+                yuzu::server::ReregistrationEvidence{
+                    .cert_proves_identity = cert_proves,
+                    .token_presented = !request->enrollment_token().empty(),
+                    .transport_can_prove = attests},
+                metrics_);
+            if (verdict.route == yuzu::server::ReregistrationVerdict::Route::Refuse)
+                return *verdict.refusal;
+            if (verdict.route == yuzu::server::ReregistrationVerdict::Route::TokenReenrol)
+                reenrol_via_token = true; // fall through to the token block
+            else
+                goto gw_enrolled;
         }
         // #1067: reject an admin-DENIED agent BEFORE consuming any enrollment
         // token — same token-depletion DoS as the direct-connect path (W1.4
@@ -804,6 +850,8 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
                                      {"source", "gateway_proxy"}};
                     analytics_store->emit(std::move(ae));
                 }
+                if (reenrol_via_token)
+                    return reenrol_token_refusal("invalid_input_length");
                 response->set_accepted(false);
                 response->set_reject_reason(
                     std::string(yuzu::server::kEnrollmentTokenRejectionPublicMessage));
@@ -929,6 +977,8 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
                     analytics_store->emit(std::move(ae));
                 }
 
+                if (reenrol_via_token)
+                    return reenrol_token_refusal(variant);
                 response->set_accepted(false);
                 response->set_reject_reason(
                     std::string(yuzu::server::kEnrollmentTokenRejectionPublicMessage));
@@ -939,6 +989,13 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
             // transaction, so the success audit row below only describes a
             // completed enrollment.
             const auto& claim = consumed->claim;
+            if (reenrol_via_token) {
+                // WP01 / D5: only a SINGLE-USE token (max_uses == 1) is proof of an existing
+                // identity; a multi-use fleet token is shared by every holder.
+                if (claim.max_uses != 1)
+                    return reenrol_token_refusal("multi_use_token");
+                reenrolled_with_token = true;
+            }
             spdlog::info("[gateway] Agent {} auto-enrolled via enrollment token id={} ({}/{})",
                          safe_agent_id, claim.token_id, claim.use_count_after,
                          claim.max_uses == 0 ? -1 : claim.max_uses);
@@ -965,6 +1022,14 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
                 ev.source_ip = agent_source_ip; // #1064: agent origin, not gateway IP
                 ev.result = "success";
                 enroll_audit_ok = audit_store_->log(ev);
+                if (reenrolled_with_token) {
+                    AuditEvent re = ev;
+                    re.action = "agent.reenrolled_with_token";
+                    re.target_type = "Agent";
+                    re.target_id = info.agent_id();
+                    re.detail = "token_id=" + claim.token_id + " via=gateway_proxy";
+                    enroll_audit_ok = audit_store_->log(re) && enroll_audit_ok;
+                }
             }
             // #1065 / #1063: a dropped SUCCESS audit row is the same
             // evidence-chain degradation as a dropped failure row — was
@@ -1435,6 +1500,17 @@ gw_enrolled:
             response->set_issued_certificate(issued->first);
             response->set_issued_ca_chain(issued->second);
             spdlog::info("[gateway] Issued per-agent client cert for {}", safe_agent_id);
+            // WP01 / D4: see the direct path. After the new leaf exists, never before.
+            if (reenrolled_with_token && agent_identity_hooks_ &&
+                agent_identity_hooks_->supersede_older_leaves) {
+                try {
+                    agent_identity_hooks_->supersede_older_leaves(info.agent_id(), issued->first);
+                } catch (...) {
+                    spdlog::error("[gateway] ProxyRegister: superseding older leaves threw for "
+                                  "agent {}",
+                                  safe_agent_id);
+                }
+            }
         } else {
             spdlog::warn("[gateway] ProxyRegister: client-cert signing failed for agent {}",
                          safe_agent_id);

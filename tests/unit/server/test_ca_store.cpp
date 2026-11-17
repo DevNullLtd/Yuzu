@@ -181,7 +181,7 @@ TEST_CASE("CaStore reports !is_open on a migration failure", "[ca_store][pg]") {
     REQUIRE_FALSE(store.is_open());
 }
 
-TEST_CASE("CaStore migration lands at v5 and drops sqlite_backfill_source (#3623)",
+TEST_CASE("CaStore migration lands at v6 and drops sqlite_backfill_source (#3623)",
           "[ca_store][pg][migration]") {
     YUZU_REQUIRE_PG_MIGRATION_DB(db);
     PgPool pool{{.conninfo = db.dsn(), .size = 1}};
@@ -194,7 +194,7 @@ TEST_CASE("CaStore migration lands at v5 and drops sqlite_backfill_source (#3623
                                     "'ca_store'")};
     REQUIRE(ver.ok());
     REQUIRE(PQntuples(ver.get()) == 1);
-    CHECK(std::string(PQgetvalue(ver.get(), 0, 0)) == "5");
+    CHECK(std::string(PQgetvalue(ver.get(), 0, 0)) == "6");
     PgResult trg{PQexec(conn.get(), "SELECT COUNT(*) FROM pg_trigger t JOIN pg_class c ON c.oid = "
                                     "t.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace "
                                     "WHERE n.nspname = 'ca_store' AND c.relname = 'ca_issued' "
@@ -231,6 +231,15 @@ TEST_CASE("CaStore migration lands at v5 and drops sqlite_backfill_source (#3623
                                     "'sqlite_backfill_source'")};
     REQUIRE(tbl.ok());
     CHECK(std::string(PQgetvalue(tbl.get(), 0, 0)) == "0");
+    // v6 (WP01): the per-agent identity lookup index, partial on purpose (agent leaves only).
+    PgResult agent_idx{PQexec(conn.get(),
+                              "SELECT indexdef FROM pg_indexes WHERE schemaname = 'ca_store' AND "
+                              "tablename = 'ca_issued' AND indexname = 'idx_ca_issued_agent_subject'")};
+    REQUIRE(agent_idx.ok());
+    REQUIRE(PQntuples(agent_idx.get()) == 1);
+    const std::string agent_idx_def = PQgetvalue(agent_idx.get(), 0, 0);
+    CHECK(agent_idx_def.find("(subject, not_after)") != std::string::npos);
+    CHECK(agent_idx_def.find("WHERE (purpose = 'agent'::text)") != std::string::npos);
 }
 
 // ── Root ──────────────────────────────────────────────────────────────────
@@ -2254,4 +2263,132 @@ TEST_CASE("CaStore: the aggregate reads leave revoked rows untouched", "[ca_stor
     auto revoked = store.list_revoked_serials();
     REQUIRE(revoked.has_value());
     CHECK(*revoked == std::vector<std::string>{"C1"});
+}
+
+// ── WP01: the per-agent identity read behind the re-registration gate ─────────────────────────
+
+namespace {
+IssuedCertRecord agent_leaf(const std::string& serial, const std::string& subject,
+                            int64_t not_after, const std::string& purpose = "agent") {
+    IssuedCertRecord r;
+    r.serial_hex = serial;
+    r.subject = subject;
+    r.purpose = purpose;
+    r.not_after = not_after;
+    r.issued_at = now_s() - 3600;
+    return r;
+}
+} // namespace
+
+TEST_CASE("CaStore::agent_leaf_state: live, expired, revoked, mixed, and the purpose filter",
+          "[ca_store][pg][wp01][agent_leaf_state]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    CaStore store{pool};
+    REQUIRE(store.is_open());
+    const auto future = now_s() + 30 * 86400;
+    const auto past = now_s() - 86400;
+
+    SECTION("no row: neither flag") {
+        auto st = store.agent_leaf_state("nobody");
+        REQUIRE(st.has_value());
+        CHECK_FALSE(st->has_live);
+        CHECK_FALSE(st->has_revoked_unexpired);
+    }
+    SECTION("an active unexpired agent leaf is live") {
+        REQUIRE(store.record_issued(agent_leaf("A1", "agent-live", future)).has_value());
+        auto st = store.agent_leaf_state("agent-live");
+        REQUIRE(st.has_value());
+        CHECK(st->has_live);
+        CHECK_FALSE(st->has_revoked_unexpired);
+        // another id is unaffected
+        auto other = store.agent_leaf_state("agent-live-2");
+        REQUIRE(other.has_value());
+        CHECK_FALSE(other->has_live);
+    }
+    SECTION("an expired leaf is neither live nor a revoked identity (owner decision D2)") {
+        REQUIRE(store.record_issued(agent_leaf("A2", "agent-expired", past)).has_value());
+        auto st = store.agent_leaf_state("agent-expired");
+        REQUIRE(st.has_value());
+        CHECK_FALSE(st->has_live);
+        CHECK_FALSE(st->has_revoked_unexpired);
+    }
+    SECTION("a revoked unexpired leaf with nothing live is a revoked identity") {
+        REQUIRE(store.record_issued(agent_leaf("A3", "agent-revoked", future)).has_value());
+        REQUIRE(store.revoke("A3", "compromised").value_or(false));
+        auto st = store.agent_leaf_state("agent-revoked");
+        REQUIRE(st.has_value());
+        CHECK_FALSE(st->has_live);
+        CHECK(st->has_revoked_unexpired);
+    }
+    SECTION("a revoked leaf beside a live one: both flags") {
+        REQUIRE(store.record_issued(agent_leaf("A4", "agent-mixed", future)).has_value());
+        REQUIRE(store.record_issued(agent_leaf("A5", "agent-mixed", future)).has_value());
+        REQUIRE(store.revoke("A4", "compromised").value_or(false));
+        auto st = store.agent_leaf_state("agent-mixed");
+        REQUIRE(st.has_value());
+        CHECK(st->has_live);
+        CHECK(st->has_revoked_unexpired);
+    }
+    SECTION("a leaf the server superseded as 'reenrolled' is bookkeeping, not a revoked identity") {
+        REQUIRE(store.record_issued(agent_leaf("A6", "agent-reenrolled", future)).has_value());
+        REQUIRE(store.record_issued(agent_leaf("A7", "agent-reenrolled", future)).has_value());
+        REQUIRE(store.revoke_system("A6", kRevokeReasonReenrolled).value_or(false));
+        auto st = store.agent_leaf_state("agent-reenrolled");
+        REQUIRE(st.has_value());
+        CHECK(st->has_live); // the fresh leaf
+        CHECK_FALSE(st->has_revoked_unexpired);
+        // ...and an OPERATOR typing the same word does not get the exemption (stored qualified).
+        REQUIRE(store.record_issued(agent_leaf("A8", "agent-spoofed", future)).has_value());
+        REQUIRE(store.revoke("A8", "reenrolled").value_or(false));
+        auto sp = store.agent_leaf_state("agent-spoofed");
+        REQUIRE(sp.has_value());
+        CHECK(sp->has_revoked_unexpired);
+    }
+    SECTION("purpose filter: a revoked code-signing leaf whose CN equals the id does not count") {
+        REQUIRE(store.record_issued(agent_leaf("C1", "agent-collide", future, "code-signing")).has_value());
+        REQUIRE(store.revoke("C1", "retired").value_or(false));
+        REQUIRE(store.record_issued(agent_leaf("C2", "agent-collide2", future, "code-signing")).has_value());
+        for (const char* id : {"agent-collide", "agent-collide2"}) {
+            auto st = store.agent_leaf_state(id);
+            REQUIRE(st.has_value());
+            CHECK_FALSE(st->has_live);
+            CHECK_FALSE(st->has_revoked_unexpired);
+        }
+    }
+}
+
+TEST_CASE("CaStore::live_agent_serials lists only active, unexpired AGENT leaves of that id",
+          "[ca_store][pg][wp01][agent_leaf_state]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    CaStore store{pool};
+    REQUIRE(store.is_open());
+    const auto future = now_s() + 30 * 86400;
+    REQUIRE(store.record_issued(agent_leaf("E1", "agent-x", future)).has_value());
+    REQUIRE(store.record_issued(agent_leaf("E2", "agent-x", future)).has_value());
+    REQUIRE(store.record_issued(agent_leaf("E3", "agent-x", future)).has_value());
+    REQUIRE(store.record_issued(agent_leaf("E4", "agent-x", now_s() - 10)).has_value());       // expired
+    REQUIRE(store.record_issued(agent_leaf("E5", "agent-x", future, "code-signing")).has_value());
+    REQUIRE(store.record_issued(agent_leaf("E6", "agent-y", future)).has_value());
+    REQUIRE(store.revoke("E3", "compromised").value_or(false));
+
+    auto serials = store.live_agent_serials("agent-x");
+    REQUIRE(serials.has_value());
+    std::sort(serials->begin(), serials->end());
+    CHECK(*serials == std::vector<std::string>{"E1", "E2"});
+}
+
+TEST_CASE("CaStore: kRevokeReasonReenrolled is a system marker an operator cannot write",
+          "[ca_store][pg][wp01]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    CaStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(store.record_issued(agent_leaf("F1", "agent-m", now_s() + 86400)).has_value());
+    REQUIRE(store.revoke("F1", "  Reenrolled ").value_or(false));
+    auto rows = store.list_revoked();
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK((*rows)[0].revocation_reason == "operator-supplied:   Reenrolled ");
 }

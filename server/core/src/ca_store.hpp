@@ -116,6 +116,25 @@ std::string cert_status_to_string(CertStatus s);
 /// `unpublished`: the cert was recorded but never published (its write failed).
 inline constexpr std::string_view kRevokeReasonSuperseded = "superseded";
 inline constexpr std::string_view kRevokeReasonUnpublished = "unpublished";
+/// WP01: an agent's older live leaf, revoked by the server right AFTER it issued the agent a fresh
+/// one because the agent re-enrolled with a single-use enrollment token (a lost or stolen key must
+/// not stay valid beside its replacement). Written only by `revoke_system`. It is NOT an
+/// "identity is revoked" signal: `agent_leaf_state()` and `sign_agent_csr`'s HIGH-2 guard skip it,
+/// or the agent's own renewal would be refused until the superseded leaf expired. An
+/// operator-typed "reenrolled" is stored qualified (see `revoke`), so only system code writes it.
+inline constexpr std::string_view kRevokeReasonReenrolled = "reenrolled";
+
+/// What `ca_issued` says about one agent identity (WP01). Both flags are decided by the database
+/// clock in one statement, and only over `purpose = 'agent'` rows (a code-signing leaf whose CN
+/// equals an agent id is a different namespace and never counts).
+struct AgentLeafState {
+    /// An ACTIVE, unexpired agent leaf exists: the identity has a credential in the field, so a
+    /// certificate-less re-registration is a claim, not a proof.
+    bool has_live{false};
+    /// A REVOKED, unexpired agent leaf exists that is not a `kRevokeReasonReenrolled` supersession:
+    /// an operator (or the revocation sweep) withdrew this identity and nothing has cleared it.
+    bool has_revoked_unexpired{false};
+};
 
 struct IssuedCertRecord {
     std::string serial_hex;
@@ -396,6 +415,18 @@ public:
     /// `unexpected(msg)` (prefixed `kCaDbErrorPrefix`) is a genuine write failure.
     [[nodiscard]] std::expected<void, std::string> record_issued(const IssuedCertRecord& rec);
 
+    /// WP01: the live/revoked state of one agent identity, from one indexed read
+    /// (`idx_ca_issued_agent_subject`, schema v6). `unexpected(msg)` (prefixed `kCaDbErrorPrefix`)
+    /// is a genuine read failure: a caller deciding admission must treat it as "cannot tell" and
+    /// refuse, never as "no leaf".
+    [[nodiscard]] std::expected<AgentLeafState, std::string>
+    agent_leaf_state(const std::string& agent_id);
+
+    /// WP01: serials of the ACTIVE, unexpired agent leaves of `agent_id` (DB clock), for the
+    /// post-issuance supersession sweep. Same read-failure contract as `agent_leaf_state`.
+    [[nodiscard]] std::expected<std::vector<std::string>, std::string>
+    live_agent_serials(const std::string& agent_id);
+
     /// `nullopt` = a successful read finding no such serial (or a non-hex serial — there is no
     /// such cert). `unexpected(msg)` (prefixed `kCaDbErrorPrefix`) is a genuine read failure.
     [[nodiscard]] std::expected<std::optional<IssuedCertRecord>, std::string>
@@ -456,7 +487,8 @@ public:
     /// falsely audit a database outage as "serial not found" (a false compliance record).
     ///
     /// `reason` is operator-supplied free text (REST, dashboard, MCP). A reason that collides with
-    /// a SYSTEM revocation marker (`kRevokeReasonSuperseded` / `kRevokeReasonUnpublished`, compared
+    /// a SYSTEM revocation marker (`kRevokeReasonSuperseded` / `kRevokeReasonUnpublished` /
+    /// `kRevokeReasonReenrolled`, compared
     /// trimmed and case-insensitively) is stored qualified as `operator-supplied: <text>`, so an
     /// operator-typed "superseded" can never be mistaken for the bookkeeping revocation the
     /// default-cert upgrade writes (#6016: that upgrade re-certifies a key whose leaf was revoked

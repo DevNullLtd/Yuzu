@@ -61,6 +61,8 @@ agent_service_wire_test_() ->
           fun() -> register_proxy_protocol_untrusted(State) end},
          {"Register: with no origin at all the observation is empty and the stored peer is unknown",
           fun() -> register_without_origin(State) end},
+         {"Register overwrites the witnessed client certificate fields (WP01)",
+          fun() -> register_attestation_overwritten(State) end},
          {"Register: x-forwarded-for from a peer that is not a trusted proxy is ignored",
           fun() -> register_forwarded_for_untrusted(State) end},
          {"Register: a listener with no forwarded_for origin ignores x-forwarded-for",
@@ -259,6 +261,36 @@ register_without_origin(_State) ->
     {_, Info, _} = stored(),
     ?assertEqual(<<"unknown">>, maps:get(peer_addr, Info)),
     ?assertEqual(<<>>, maps:get(gateway_observed_peer, maps:get(register_req, Info))).
+
+%% WP01: gateway_attested_peer_cert_pem / gateway_attests_peer_cert are
+%% gateway-authoritative. An agent that fills them (to name a certificate it does
+%% not hold, or to claim an attestation) has them discarded: with no TLS client
+%% certificate the PEM is EMPTY and the marker is true (this gateway ran the
+%% overwrite); with one, the PEM of exactly that certificate.
+register_attestation_overwritten(_State) ->
+    reset(),
+    ForgedPem = <<"-----BEGIN CERTIFICATE-----\nZm9yZ2Vk\n-----END CERTIFICATE-----\n">>,
+    Request = #{info => #{agent_id => <<"agent-w">>, hostname => <<"h">>},
+                gateway_attested_peer_cert_pem => ForgedPem,
+                gateway_attests_peer_cert => false},
+    NoCert = yuzu_grpc:new_ctx(#{}, self(), undefined, undefined, undefined),
+    ?assertMatch({ok, #{session_id := <<"sess-agent-w">>}, _},
+                 yuzu_gw_agent_service:register(NoCert, Request)),
+    Sent = meck:capture(last, yuzu_gw_upstream, proxy_register, '_', 1),
+    ?assertEqual(<<>>, maps:get(gateway_attested_peer_cert_pem, Sent)),
+    ?assertEqual(true, maps:get(gateway_attests_peer_cert, Sent)),
+    %% and with a witnessed certificate the PEM is that certificate's
+    Der = <<48, 3, 2, 1, 1>>,
+    WithCert = yuzu_grpc:new_ctx(#{}, self(), undefined, undefined, Der),
+    reset(),
+    ?assertMatch({ok, #{session_id := <<"sess-agent-w">>}, _},
+                 yuzu_gw_agent_service:register(WithCert, Request)),
+    Sent2 = meck:capture(last, yuzu_gw_upstream, proxy_register, '_', 1),
+    ?assertEqual(public_key:pem_encode([{'Certificate', Der, not_encrypted}]),
+                 maps:get(gateway_attested_peer_cert_pem, Sent2)),
+    ?assertEqual(true, maps:get(gateway_attests_peer_cert, Sent2)),
+    {_, Info, _} = stored(),
+    ?assertEqual(true, maps:get(gateway_attests_peer_cert, maps:get(register_req, Info))).
 
 register_forwarded_for_untrusted(#{other := Chan}) ->
     reset(),

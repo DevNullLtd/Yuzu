@@ -5767,6 +5767,8 @@ gateway specifics (the agent↔gateway hop is one-way TLS in M1, so through the 
 agent's address is attributed by the app-layer `gateway_observed_peer` — attribution, not
 authentication — until gateway mTLS lands).
 
+**Re-registration proof (WP01).** An already-`approved` agent id is not re-admitted on the caller's say-so: when the id holds a live leaf in `ca_issued`, `Register` and `ProxyRegister` require the current leaf (direct: the mTLS peer certificate; through the gateway: the certificate the gateway witnessed, `RegisterRequest.gateway_attested_peer_cert_pem`) or a fresh single-use enrollment token, and refuse a revoked identity, with a gRPC status before any session state is touched. One shared decision (`agent_reregistration_gate.hpp`); `--agent-reregistration-proof off|audit|enforce` (default `audit`). Full statement and the not-covered list (`--no-tls`, plain TLS, operator-CA agents, expired leaves): `docs/pki-architecture.md` "Re-registration proof (WP01)".
+
 **Bootstrap (chicken-and-egg) — resolved on one port.** The agent has no client
 cert on first boot, but the data plane requires one. Resolution:
 

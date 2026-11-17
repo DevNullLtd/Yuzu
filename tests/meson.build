@@ -1896,6 +1896,8 @@ if build_server
       'unit/server/test_cert_reloader.cpp',
       'unit/server/test_x509_ca.cpp',
       'unit/server/test_ca_store.cpp',
+      'unit/server/test_agent_reregistration_gate.cpp', # WP01: re-registration proof-of-identity decision
+      'unit/server/test_agent_witnessed_leaf.cpp', # WP01: witnessed-gateway-leaf proof predicate (real certs)
       'unit/server/test_ca_routes.cpp',
       'unit/server/test_crl_publisher.cpp', # HA WS-6 CRL follow-ups (#4828/#4831)
       'unit/server/test_kek_routes.cpp', # #2395 track D — KEK rotation REST surface
