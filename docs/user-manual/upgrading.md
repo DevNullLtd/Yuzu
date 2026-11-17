@@ -13,13 +13,14 @@ Running `dev` between releases? Some entries below describe changes on `dev` tha
 
 ## ⚠️ Breaking: regex `replace` is limited to 64 KiB files, regex `search` skips long lines, and `ioc.check` accepts at most 100 domains
 
-**In short.** Affected: any script, instruction or agentic worker that runs `filesystem.replace` with `regex=true` on a file over 64 KiB, relies on `filesystem.search` with `regex=true` seeing every line, or sends more than 100 `domains` to `ioc.check`. Agents on the new build refuse or skip these where the old build ran them.
+**In short.** Affected: any script, instruction or agentic worker that runs `filesystem.replace` with `regex=true` on a file over 64 KiB, relies on `filesystem.search` with `regex=true` seeing every line, sends more than 100 `domains` to `ioc.check`, or reads Windows `ioc.check` domain results as clean (they can now be constrained, meaning unknown). Agents on the new build refuse or skip these where the old build ran them.
 
 **What changed.**
 
 - **`filesystem.replace`, `regex=true`.** A file over 64 KiB (65,536 bytes) is refused with `error|regex replace refused: file exceeds 65536 bytes (use a literal search)` and rc 1; the file is not changed. The old limit was the 100 MiB file cap.
 - **`filesystem.search`, `regex=true`.** A line over 64 KiB is not searched. It is reported as `skipped|<line number>|line exceeds regex limit (65536 bytes)` and the search continues. The `total_matches` count covers only the lines that were searched.
 - **`ioc.check`.** More than 100 entries in `domains` are refused whole: one `error|domains|false|Too many domains (N, max 100)` row, rc 1, no header row and no check of any kind (IPs, hashes, paths and ports in the same call are not checked either). The old build accepted any number.
+- **Windows `ioc.check` `domains`.** An unreadable DNS resolver cache is now a **constrained / partial** result (`windows:ioc:dns_cache_unreadable`, row detail `DNS resolver cache could not be read`) instead of `Not in DNS cache`. Some Windows 11 builds (seen on build 26200) return failure from the cache API on every call, so every domain answer there is now constrained. Constrained means the cache is UNKNOWN, not clean; do not read it as a negative. A distinct token for an API that is unsupported on a build is not provided: a permanent failure cannot be told from a transient one.
 - Literal (non-regex) `replace` and `search` are unchanged.
 
 **This is a size limit, not a safety bound.** A regex over a long subject can still overflow the agent's stack with the standard library's engine, well under 64 KiB; a linear-time engine is the real fix and is tracked in issue #3866.

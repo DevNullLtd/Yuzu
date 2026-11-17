@@ -15,6 +15,9 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <memory>
+#include <new>
+#include <unordered_set>
 #include <set>
 #include <string>
 #include <vector>
@@ -184,7 +187,7 @@ TEST_CASE("dns cache list release: frees every node and name once", "[wp12][dns_
     CHECK(yuzu::shared::release_dns_cache_list(&n[0], std::ref(log)) == 3);
     CHECK(log.order.size() == 6);
     CHECK_FALSE(log.any_double_free());
-    CHECK(yuzu::shared::release_dns_cache_list<FakeNode>(nullptr, std::ref(log)) == 0);
+    CHECK(yuzu::shared::release_dns_cache_list(static_cast<FakeNode*>(nullptr), std::ref(log)) == 0);
 }
 
 TEST_CASE("dns cache list release: a cyclic list is never freed twice", "[wp12][dns_cache_list]") {
@@ -199,30 +202,79 @@ TEST_CASE("dns cache list release: a cyclic list is never freed twice", "[wp12][
     CHECK_FALSE(log.any_double_free());
 }
 
-TEST_CASE("dns cache list release: a shared node or a shared name stops the walk",
+TEST_CASE("dns cache list release: a shared name is freed once and the walk continues",
           "[wp12][dns_cache_list]") {
-    SECTION("two names alias one buffer") {
-        wchar_t shared_name[2] = {L'a', 0};
-        FakeNode n[3];
-        for (int i = 0; i < 3; ++i) {
-            n[i].pszName = shared_name;
-            n[i].pNext = i < 2 ? &n[i + 1] : nullptr;
-        }
-        FreeLog log;
-        yuzu::shared::release_dns_cache_list(&n[0], std::ref(log));
-        CHECK_FALSE(log.any_double_free());
+    wchar_t shared_name[2] = {L'a', 0};
+    FakeNode n[3];
+    for (int i = 0; i < 3; ++i) {
+        n[i].pszName = shared_name;
+        n[i].pNext = i < 2 ? &n[i + 1] : nullptr;
     }
-    SECTION("one node reachable twice") {
-        wchar_t a[2] = {L'a', 0}, b[2] = {L'b', 0};
-        FakeNode x, y;
-        x.pszName = a;
-        y.pszName = b;
-        x.pNext = &y;
-        y.pNext = &y; // self loop
-        FreeLog log;
-        yuzu::shared::release_dns_cache_list(&x, std::ref(log));
-        CHECK_FALSE(log.any_double_free());
+    FreeLog log;
+    // Two healthy nodes aliasing one name buffer is not corruption: all three nodes are freed
+    // (not a leaked tail) and the shared buffer exactly once.
+    CHECK(yuzu::shared::release_dns_cache_list(&n[0], std::ref(log)) == 3);
+    CHECK_FALSE(log.any_double_free());
+    CHECK(log.order.size() == 4); // 3 nodes + 1 name
+}
+
+TEST_CASE("dns cache list release: a self-looping node stops the walk", "[wp12][dns_cache_list]") {
+    wchar_t a[2] = {L'a', 0}, b[2] = {L'b', 0};
+    FakeNode x, y;
+    x.pszName = a;
+    y.pszName = b;
+    x.pNext = &y;
+    y.pNext = &y; // self loop
+    FreeLog log;
+    CHECK(yuzu::shared::release_dns_cache_list(&x, std::ref(log)) == 2);
+    CHECK_FALSE(log.any_double_free());
+}
+
+namespace {
+
+// A visited-set whose allocator throws bad_alloc after `budget` allocations (g8-1).
+struct Budget {
+    static inline int remaining = 0;
+};
+template <typename T>
+struct ThrowingAlloc {
+    using value_type = T;
+    ThrowingAlloc() = default;
+    template <typename U>
+    ThrowingAlloc(const ThrowingAlloc<U>&) {}
+    T* allocate(std::size_t n) {
+        if (Budget::remaining-- <= 0)
+            throw std::bad_alloc();
+        return std::allocator<T>{}.allocate(n);
     }
+    void deallocate(T* p, std::size_t n) { std::allocator<T>{}.deallocate(p, n); }
+    template <typename U>
+    bool operator==(const ThrowingAlloc<U>&) const { return true; }
+};
+using ThrowingSet = std::unordered_set<const void*, std::hash<const void*>,
+                                       std::equal_to<const void*>, ThrowingAlloc<const void*>>;
+
+} // namespace
+
+TEST_CASE("dns cache list release: an allocation failure leaks the rest and never throws",
+          "[wp12][dns_cache_list]") {
+    std::vector<FakeNode> nodes(50);
+    std::vector<wchar_t> names(50);
+    for (std::size_t i = 0; i < nodes.size(); ++i) {
+        nodes[i].pszName = &names[i];
+        nodes[i].pNext = i + 1 < nodes.size() ? &nodes[i + 1] : nullptr;
+    }
+    Budget::remaining = 6; // enough for a few nodes, then bad_alloc inside the walk
+    FreeLog log;
+    std::size_t freed = 0;
+    REQUIRE_NOTHROW(freed = yuzu::shared::release_dns_cache_list<ThrowingSet>(&nodes[0], std::ref(log)));
+    CHECK(freed < nodes.size()); // stopped early: the remainder leaks
+    CHECK_FALSE(log.any_double_free());
+    Budget::remaining = 0; // immediately failing allocator: nothing freed, still no throw
+    FreeLog none;
+    REQUIRE_NOTHROW(freed = yuzu::shared::release_dns_cache_list<ThrowingSet>(&nodes[0], std::ref(none)));
+    CHECK(freed == 0);
+    CHECK(none.order.empty());
 }
 
 TEST_CASE("dns cache list release: the node ceiling bounds a long list", "[wp12][dns_cache_list]") {

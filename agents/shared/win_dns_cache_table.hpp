@@ -13,8 +13,13 @@
  * a stop at the first node or name seen twice so a cyclic or shared-node list is never freed
  * twice) is the portable, unit-tested `release_dns_cache_list` in dns_cache_list.hpp.
  *
- * COMPILED ONLY ON WINDOWS (checked with MSVC 14.44 on a Windows 11 host; the portable walk is
- * also covered by a unit test that runs everywhere).
+ * COMPILED ONLY ON WINDOWS. This revision (portable walk, static_asserts, and the ioc /
+ * network_config callers using LoadLibraryExW) was compiled with MSVC 14.44 on a Windows 11 build
+ * 26200 host and run in standalone harnesses: ioc `check` and network_config `dns_cache` 2000
+ * calls each (no crash, no growth beyond noise), and the owner against a stand-in list allocated
+ * from the process heap. NOT verified: freeing a REAL DnsGetCacheDataTable list. That API returned
+ * FALSE with an empty list on every call on that host, and the assumption that DnsFree(...,
+ * DnsFreeFlat) matches its allocator rests on echo_dns_collector.cpp's existing contract.
  */
 #pragma once
 

@@ -892,6 +892,8 @@ curl -s -X POST http://localhost:8080/api/v1/executions \
   }'
 ```
 
+**Domain checks and the Windows DNS cache.** On Windows a `domains` check reads the resolver cache once per command. If the cache cannot be read (the DNS API is unavailable, or returns failure, which some Windows 11 builds do on every call), the result is marked **constrained / partial** with provenance `windows:ioc:dns_cache_unreadable`, and each domain row says `DNS resolver cache could not be read`. Treat that as **unknown, not clean**: a constrained domain answer says nothing about whether the endpoint resolved the domain. Earlier builds reported `Not in DNS cache` in this case. At most 100 domains are accepted per command; more is refused whole with `error|domains|false|Too many domains (N, max 100)`.
+
 IOC checks run locally on each endpoint, querying active connections (Windows: `GetExtendedTcpTable`, Linux: `/proc/net/tcp`, macOS: `lsof`), DNS cache, and filesystem state. Results include matched indicators and the source of the match.
 
 ## Certificate Inventory

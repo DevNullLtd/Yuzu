@@ -8,8 +8,8 @@ buffer the first is still reading (WP12 F40/F63). The reentrant `_r` forms into 
 buffer are the only forms allowed here.
 
 BEST-EFFORT TRIPWIRE, not proof: comments and string literals are stripped and the remaining text
-is scanned for a bare call; it cannot see a call spelled through a macro, a function pointer or a
-wrapper, and it does not cover other plugins (extend DIRS when one is fixed). It is the ONLY
+is scanned for a bare call (C++ raw string literals and digit separators are handled); it cannot
+see a call spelled through a macro, a function pointer or a wrapper, and it does not cover other plugins (extend DIRS when one is fixed). It is the ONLY
 regression check for these call sites in a plain build: the concurrency tests exercise the code
 but detect the race only under ThreadSanitizer (the nightly TSan job on main).
 
@@ -22,7 +22,7 @@ from pathlib import Path
 
 ROOT = Path(sys.argv[1]) if len(sys.argv) > 1 and Path(sys.argv[1]).is_dir() else Path(__file__).resolve().parent.parent
 DIRS = ["agents/plugins/tags/src", "agents/plugins/users/src", "agents/plugins/filesystem/src"]
-FORBIDDEN = ("getpwuid", "getpwnam", "getgrnam", "getgrgid")
+FORBIDDEN = ("getpwuid", "getpwnam", "getgrnam", "getgrgid", "getpwent", "getgrent")
 CALL = re.compile(r"(?<![A-Za-z0-9_])(" + "|".join(FORBIDDEN) + r")\s*\(")
 
 
@@ -40,6 +40,20 @@ def strip_comments_and_strings(src: str) -> str:
             j = n if j < 0 else j + 2
             out.append("\n" * src.count("\n", i, j))
             i = j
+        elif c == "R" and src[i + 1:i + 2] == '"' and not (out and (out[-1].isalnum() or out[-1] == "_")):
+            # raw string literal R"delim( ... )delim"
+            m = re.match(r'R"([^()\\ \t\n]{0,16})\(', src[i:])
+            if not m:
+                out.append(c)
+                i += 1
+                continue
+            end = src.find(")" + m.group(1) + '"', i + m.end())
+            end = n if end < 0 else end + len(m.group(1)) + 2
+            out.append('""' + "\n" * src.count("\n", i, end))
+            i = end
+        elif c == "'" and out and out[-1].isalnum() and src[i + 1:i + 2].isalnum():
+            out.append(c)  # digit separator (1'000), not a char literal
+            i += 1
         elif c in "\"'":
             q = c
             i += 1
@@ -78,6 +92,11 @@ class ReentrantLibc(unittest.TestCase):
         self.assertEqual(problems("getpwuid_r(0, &p, b, n, &r); getgrnam_r(a,b,c,d,e);"), [])
         self.assertEqual(problems('// getpwuid(0)\n/* getgrnam(x) */ s = "getpwnam(x)";'), [])
         self.assertEqual(problems("my_getpwuid(0); xgetpwnam(1);"), [])
+        self.assertEqual(problems("getpwent(); getgrent();"), [(1, "getpwent"), (1, "getgrent")])
+        # raw string: contents are not code, but code after it is
+        self.assertEqual(problems('s = R"x(getpwuid(0) " )x"; getgrnam(a);'), [(1, "getgrnam")])
+        # digit separator must not open a char literal that swallows a real call
+        self.assertEqual(problems("n = 1'000; getpwuid(0);"), [(1, "getpwuid")])
 
 
 if __name__ == "__main__":

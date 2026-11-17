@@ -395,7 +395,7 @@ using DnsGetCacheDataTableFn = BOOL(WINAPI*)(yuzu::shared::DnsCacheNode**);
 /// released by the guard, so a failure is never cached for the life of the process.
 std::optional<std::vector<std::wstring>> read_dns_cache_names() {
     struct Module {
-        HMODULE h = LoadLibraryA("dnsapi.dll");
+        HMODULE h = LoadLibraryExW(L"dnsapi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
         ~Module() {
             if (h)
                 FreeLibrary(h);

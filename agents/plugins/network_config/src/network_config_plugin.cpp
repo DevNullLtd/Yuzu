@@ -1767,7 +1767,7 @@ private:
         // Dynamically load DnsGetCacheDataTable from dnsapi.dll
         using DnsGetCacheDataTableFn = BOOL(WINAPI*)(yuzu::shared::DnsCacheNode**);
 
-        auto hDnsApi = LoadLibraryA("dnsapi.dll");
+        auto hDnsApi = LoadLibraryExW(L"dnsapi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
         if (!hDnsApi) {
             ctx.write_output("dns_cache|not_available|dnsapi.dll not found");
             return 0;

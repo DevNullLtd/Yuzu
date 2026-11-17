@@ -468,11 +468,12 @@ yuzu::filesystem::find_by_hash::MountList find_by_hash_network_mounts(const std:
 // ── Regex subject SIZE limit (F9) ──────────────────────────────────────
 // Operator-pattern regex runs only on subjects up to this size. This is a SIZE limit and nothing
 // more: it does NOT prevent stack exhaustion. libstdc++'s std::regex executor recurses per matched
-// character, and measured on libstdc++ at -O0 it overflowed the worker stack (SIGSEGV, not
-// catchable by the dispatch try/catch) at 24 KiB for `(a|b)*c` and 48 KiB for `a*b` on an 8 MiB
-// stack, at 4 to 8 KiB on a 1 MiB stack, and at 64 KiB under every pattern tried. Optimised builds
-// and other patterns shift those figures; none is a safe bound. It also does not bound
-// catastrophic backtracking time (see has_nested_quantifiers, a heuristic). The real fix is a
+// character; measured with a subject of 'a' characters on an 8 MiB stack it overflowed the worker
+// stack (SIGSEGV, not catchable by the dispatch try/catch) at 24 KiB for `(a|b)*c` and 48 KiB for
+// `a*b` with g++ -O2, at 12 KiB and 24 KiB with -O0 (an independent probe saw -O0 at 16 and
+// 32 KiB), and at 4 to 8 KiB on a 1 MiB stack (-O0). The threshold depends on pattern and flags;
+// none is a safe bound. It also does not bound catastrophic backtracking time (see
+// has_nested_quantifiers, a heuristic). The real fix is a
 // linear-time, non-recursive engine (RE2); lowering this cap or running regex on a large-stack
 // thread is an open owner decision. Issue #3866 stays open.
 constexpr std::size_t kMaxRegexSubjectBytes = 64 * 1024;

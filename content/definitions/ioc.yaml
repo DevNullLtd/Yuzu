@@ -50,8 +50,10 @@ spec:
           to check. On Windows this queries the DNS resolver cache; on
           Linux/macOS it is a substring search over /etc/hosts lines
           (comments stripped), so a short domain can match more than
-          intended. At most 100 domains per command; more is refused with
-          an error row and nothing is checked.
+          intended. At most 100 domains per command (counted after splitting on
+          commas, trimming whitespace and dropping empty entries;
+          duplicates count); more is refused with an error row and
+          nothing is checked.
       file_hashes:
         type: string
         displayName: File Hashes (SHA-256)
