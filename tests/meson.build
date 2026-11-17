@@ -1771,6 +1771,8 @@ if build_server
       'unit/server/test_yaml_scan.cpp',
       'unit/server/test_policy_store.cpp',
       'unit/server/test_policy_evaluator.cpp',
+      # G01: the refusal seam policy evaluation applies before it dispatches a pair (pure, no store, no [pg])
+      'unit/server/test_policy_dispatch_seam.cpp',
       'unit/server/test_guaranteed_state_store.cpp',
       'unit/server/test_census_ordering_store.cpp', # #5690 PR2a-1: census ordering key, durable pending evidence, schema v4
       'unit/server/test_guardian_ingest.cpp',
