@@ -622,7 +622,8 @@ whole source name.
   where its users are. A laptop that is off during its window syncs when it next
   wakes (see Gentle catch-up) and then returns to the next window. The window
   is a collection setting (see Collection settings below); the agent's own
-  moment between 01:00 and 05:00 applies until the settings push lands.
+  moment between 01:00 and 05:00 applies until the agent has applied a saved
+  document.
 - **Gentle catch-up.** An agent that was switched off, or a laptop that slept
   through its sync, does not report the moment it wakes. A sync more than 15
   minutes overdue is spread over the next 30 minutes by a stable per-agent
@@ -689,10 +690,86 @@ always win over a document, and registered apps collection cannot be turned off
 by a document. A window needs a whole-day interval because the agent fires a
 window once per local day.
 
-Settings take effect on agents only when the settings push lands. Until then the
-server stores and resolves them, shows the effective result for a device
+The server shows the effective result for a device
 (`GET /api/v1/inventory/software/hosts/{agent_id}/collection-settings`), and
-saving a document never starts a collection.
+saving a document never starts a collection. How a saved document reaches the
+machines is described next.
+
+### How saved settings reach machines
+
+Delivery is driven by the agent's heartbeat; there is no push when a document is
+saved and no background job. Each heartbeat carries the version of the settings
+the agent last applied (the status tag `yuzu.inv_settings_version`: a 64-character
+hex digest, or `none` when nothing has been applied). The server works out which
+document applies to that agent and, when the two versions differ, sends it once.
+The agent checks the document, stores it, and from then on reports the new version.
+
+- **How soon.** A change reaches a device on its first heartbeat after the server
+  re-reads the stored settings, which it does when its copy is older than 60
+  seconds. A change in a device's group membership is picked up when the server's
+  copy of that device's groups is older than 10 minutes. Settings and kill
+  switches are therefore effective on machines within about a minute of a save,
+  plus one heartbeat, and a membership change within about ten.
+- **The fleet default is not pushed.** A device that has never applied a document
+  and whose effective settings are the built-in default (24 hours, 01:00 to
+  05:00, every collector on) is left alone: it already behaves that way. When the
+  last document that applied to a device is removed, the default is sent so the
+  device returns to it.
+- **Gateway-attached agents.** The server hands the document to the gateway, which
+  queues it for the agent. A send that the server counts as `sent` is accepted,
+  not confirmed; the heartbeat that follows is the confirmation, because the
+  agent then reports the new version.
+- **The re-push gap.** The same version is not sent to one agent again within 5
+  minutes. A document that changed in the meantime is sent at once. If a send is
+  lost, or the agent could not apply it, the next heartbeat after the gap sends
+  it again. An agent whose daily sync is not running (disabled with
+  `--inventory-disable`, or still starting after a reconnect) stores the document
+  and reports its version all the same, so it is not sent again; with
+  `--inventory-disable` nothing is collected, whatever the document says.
+- **Restarts.** Server state is in memory and is rebuilt from heartbeats, so a
+  restart loses nothing; an agent whose version differs is simply sent the
+  document. The agent keeps the applied document across a restart and re-checks it
+  at start-up; a stored copy that fails the check is dropped, the agent reports
+  `none` and the server sends it again.
+- **Agents refuse what they cannot apply.** A document that is malformed, over 4096
+  bytes, out of range, missing a collector switch, or whose version is not the
+  SHA-256 of its text is refused, nothing changes, and the agent keeps the
+  settings it had. Nothing is ever partly applied.
+
+**What the agent does with a document.** It sets how often installed software is
+collected and in which window, and which collectors run. It does not start a
+collection: an interval or window that changes re-places a future sync to the
+agent's own next slot, and a sync that is already due still goes. A collector
+switched off is not run, its rows are not served from a cache, and its section of
+the report is `disabled` (switched off on purpose, not a failure). A collector
+that is on but whose plugin is not loaded, or that has nothing to collect on the
+OS, is `not_collected`. Switching a collector back on collects afresh.
+
+**Registered apps and the kill switch.** A document cannot turn registered apps
+collection off, but a plugin kill switch on it is carried into the delivered
+settings, and the agent honours it as sent: collection stops on the machine and
+the agent still reports the version it really applied. Only the plugin-wide kill
+switch is carried: a switch set for one operating system or one action does not
+stop that collector's daily collection.
+
+**Intervals of several days.** Without a window, a device syncs one interval after
+its last clean sync, at the agent's own offset. With a window (which needs a
+whole-day interval), the device syncs inside the window on the day one interval
+after its last clean sync, at the agent's own moment in it; a 7-day interval with
+a 01:00 to 05:00 window therefore syncs once a week, overnight. A retry after a
+skipped sync still comes in the next daily window.
+
+**Time zones.** In this release a named time zone is stored, delivered and shown,
+but the window runs in the machine's own local time; the agent does not convert
+between zones. A device given a named zone reports `yuzu.inv_settings_tz` as
+`machine_local` in its heartbeat to say so. Choose windows with that in mind for
+fleets that span zones.
+
+The delivery is counted by `yuzu_server_inventory_settings_push_total`,
+`yuzu_server_inventory_settings_push_degrade_total` and
+`yuzu_server_inventory_settings_reconcile_exceptions_total` (see
+[Metrics](metrics.md)), and an alert, `YuzuInventorySettingsPushLoop`, fires when
+the server keeps re-sending settings.
 
 The same documents are reachable by agentic clients over MCP, and each tool returns what its REST
 route returns: `list_software_collection_settings`, `get_software_collection_settings`,
