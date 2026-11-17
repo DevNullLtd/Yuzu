@@ -189,8 +189,21 @@ runs at 10:00 UTC on the 1st of each month (and is
    baseline that was reviewed at the time. The workflow file keeps the
    authoritative active list and fails loudly if a listed file still has the
    old SHA after the sed.
-5. Opens a PR via `peter-evans/create-pull-request@v7` with label
-   `dependencies,ci`.
+5. Opens a PR via `peter-evans/create-pull-request` with labels
+   `dependencies,ci`, authenticated with the repository secret
+   `VCPKG_BASELINE_PR_TOKEN`, never `GITHUB_TOKEN`. The bump rewrites files
+   under `.github/workflows/`, and GitHub refuses a push that changes a
+   workflow file unless the credential holds the `workflows` permission,
+   which `GITHUB_TOKEN` can never hold. That refusal is why every scheduled
+   run from May to November 2026 failed at "Create pull request" (`git`
+   exited 1) and no PR was ever opened. The token must be scoped to this
+   repository with Contents, Pull requests and Workflows read/write. A PR
+   opened with it also triggers CI; one opened by `GITHUB_TOKEN` would not.
+   If the secret is unset, the run fails before the bump with an error
+   naming it.
+6. On any failure, opens (or comments on) a `vcpkg-baseline-broken` issue,
+   the `nightly-broken` pattern. It is a repair prompt, not a merge gate;
+   close it by hand after the next green run.
 
 CI on the PR re-resolves every downstream vcpkg port against the new
 baseline — if anything breaks, the PR is left open for manual

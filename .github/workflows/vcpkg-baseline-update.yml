@@ -5,6 +5,25 @@ name: vcpkg baseline update
 # builtin-baseline (and the VCPKG_COMMIT workflow env var that must stay in
 # sync) to the current vcpkg master HEAD. CI on the PR re-resolves every
 # port against the new baseline so regressions are caught before merge.
+#
+# TOKEN (S10). The bump rewrites files under .github/workflows/, and GitHub
+# refuses any push that creates or updates a workflow file unless the pushing
+# credential holds the `workflows` permission. GITHUB_TOKEN can never be
+# granted that permission, so every run from May to November 2026 failed at
+# "Create pull request" with `git` exiting 1 (the branch push) and never
+# opened a PR. The PR is therefore opened with the repository secret
+# VCPKG_BASELINE_PR_TOKEN: a fine-grained token scoped to this repository
+# with Contents, Pull requests and Workflows read/write (or a classic PAT
+# with `repo` + `workflow`). Do NOT "fix" this by dropping the workflow files
+# from the bump list: VCPKG_COMMIT must move with builtin-baseline. A PR
+# opened with that token also triggers CI, which one opened by GITHUB_TOKEN
+# would not. When the secret is unset the run fails before the bump, naming
+# it, and the `alert` job below files the issue.
+#
+# FAILURE SIGNAL. A scheduled run emails nobody, so any failure opens (or
+# comments on) a `vcpkg-baseline-broken` issue, the nightly-broken pattern
+# from nightly.yml. No merge discipline is attached: the issue is a repair
+# prompt. Close it by hand after the next green run.
 
 on:
   schedule:
@@ -106,10 +125,24 @@ jobs:
             exit 1
           fi
 
+      # Fail before the action, naming the secret, rather than letting the
+      # push die as a bare `git` exit 1 (see TOKEN in the header).
+      - name: Require the PR token
+        if: steps.check.outputs.changed == 'true'
+        env:
+          HAS_PR_TOKEN: ${{ secrets.VCPKG_BASELINE_PR_TOKEN != '' }}
+        run: |
+          if [[ "$HAS_PR_TOKEN" != "true" ]]; then
+            echo "::error::Repository secret VCPKG_BASELINE_PR_TOKEN is not set. The bump edits .github/workflows/*.yml, which GITHUB_TOKEN cannot push (no 'workflows' permission). Create a fine-grained token for this repository with Contents, Pull requests and Workflows read/write and store it as VCPKG_BASELINE_PR_TOKEN."
+            exit 1
+          fi
+
       - name: Create pull request
         if: steps.check.outputs.changed == 'true'
         uses: peter-evans/create-pull-request@15733dbdfeedb4f7fdb73d13c6f5ac83b710fab8 # v8.1.2
         with:
+          # Not GITHUB_TOKEN: see TOKEN in the header.
+          token: ${{ secrets.VCPKG_BASELINE_PR_TOKEN }}
           commit-message: "build(deps): bump vcpkg baseline to ${{ steps.latest.outputs.sha }}"
           branch: "deps/vcpkg-baseline-${{ steps.latest.outputs.sha }}"
           delete-branch: true
@@ -147,3 +180,66 @@ jobs:
           labels: |
             dependencies
             ci
+
+  # Opens or comments on a `vcpkg-baseline-broken` issue when the bump job
+  # fails, or ends cancelled (its timeout) while the run itself was not
+  # cancelled. CLAUDE.md: a failure-path `if:` must carry an explicit status
+  # function, or the implicit success() makes it unsatisfiable.
+  alert:
+    name: "Open vcpkg-baseline-broken on failure"
+    needs: [propose-bump]
+    if: ${{ failure() || (!cancelled() && needs.propose-bump.result == 'cancelled') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      issues: write   # open or comment on the vcpkg-baseline-broken issue
+    steps:
+      - name: Open or update vcpkg-baseline-broken issue
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          JOB_RESULT: ${{ needs.propose-bump.result }}
+        with:
+          script: |
+            const label = 'vcpkg-baseline-broken';
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const sha = context.sha;
+            const body = [
+              `The monthly vcpkg baseline bump failed (job result: \`${process.env.JOB_RESULT}\`) @ \`${sha.substring(0, 7)}\`.`,
+              ``,
+              `**Run:** ${runUrl}`,
+              ``,
+              `Until this is fixed the vcpkg baseline is not being bumped automatically.`,
+              `If the failing step is "Require the PR token", or "Create pull request"`,
+              `with \`git\` exiting 1, check the VCPKG_BASELINE_PR_TOKEN secret: it must`,
+              `exist, be unexpired, and hold Contents, Pull requests and Workflows`,
+              `read/write on this repository (header of the workflow file).`,
+              `Not a merge gate.`,
+              ``,
+              `(auto-posted by .github/workflows/vcpkg-baseline-update.yml; close after a green run.)`,
+            ].join('\n');
+
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: label,
+              state: 'open',
+              per_page: 5,
+            });
+            if (existing.data.length > 0) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existing.data[0].number,
+                body,
+              });
+              core.notice(`Commented on existing vcpkg-baseline-broken issue #${existing.data[0].number}`);
+            } else {
+              const created = await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: 'vcpkg baseline update workflow is broken',
+                labels: [label],
+                body,
+              });
+              core.notice(`Opened vcpkg-baseline-broken issue #${created.data.number}`);
+            }
