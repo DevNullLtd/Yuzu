@@ -1977,11 +1977,11 @@
       "runs_as": "**root** (LaunchDaemon, no `UserName`; see the TL;DR and the `echo.*` row of `docs/agent-privilege-model.md`)"
     },
     {
-      "grant": "A file capability on the binary does not take effect under the packaged unit's `NoNewPrivileges=true`, so the packaged unit grants `CAP_DAC_READ_SEARCH` as an ambient capability by default. Without it (an operator opt-out, a dev install without the capability, or a manual launch; see `docs/user-manual/upgrading.md`, \"Behaviour change: the packaged Linux agent can read root-only files\") reads of root-only files are refused. The grant is not measured for this plugin. Service enumeration (`systemctl`) runs as bounded argv under the agent account, not elevated.",
+      "grant": "A file capability on the binary does not take effect under the packaged unit's `NoNewPrivileges=true`, so the packaged unit grants `CAP_DAC_READ_SEARCH` as an ambient capability by default. Without it (an operator opt-out, a dev run without the capability, or a manual launch; see `docs/user-manual/upgrading.md`, \"Behaviour change: the packaged Linux agent can read root-only files\") reads of root-only files are refused. The grant is not measured for this plugin. Service enumeration (`systemctl`) runs as bounded argv under the agent account, not elevated.",
       "if_refused": "Not observed in this capture.",
       "measured": "2026-09-06, container, captured at **euid 0 (root)** — broader than the deployed unprivileged account.",
       "os": "Linux",
-      "runs_as": "Agent account (`yuzu-agent` on the packaged unit); not root. The `echo.*` row of `docs/agent-privilege-model.md` assumes `cap_dac_read_search` set on the binary by `scripts/install-agent-user.sh`"
+      "runs_as": "Agent account (`yuzu-agent` on the packaged unit); not root. The `echo.*` row of `docs/agent-privilege-model.md` assumes `cap_dac_read_search` held by the agent process (the packaged unit's ambient capability, or `setpriv --ambient-caps` from `scripts/start-UAT.sh --as-user`; `scripts/install-agent-user.sh` sets no file capability, WP13/F21)"
     }
   ],
   "readme": "agents/plugins/echo/README.md",
@@ -2830,7 +2830,8 @@
       "changelog.d/7420-echo-followups-mixed.changed.md",
       "changelog.d/7420-echo-followups-mixed.fixed.md",
       "changelog.d/7466-echo-mcp-hourly-rows.changed.md",
-      "changelog.d/7507-echo-drop-live-shims.removed.md"
+      "changelog.d/7507-echo-drop-live-shims.removed.md",
+      "changelog.d/wp13-echo-module-signing-cache-usn.security.md"
     ],
     "definitions": [
       "content/definitions/echo.yaml",
