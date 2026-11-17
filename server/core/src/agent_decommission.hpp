@@ -19,11 +19,11 @@
 /// device was erased. It does not for `guaranteed_state` (#5675): that store deletes the device's
 /// per-agent order row and the compliance census rows and retires the pending census evidence,
 /// and the Guardian event log and the DEX observations are retained until retention expiry (never,
-/// when the retention setting is 0 or below). For `management_group_memberships` (MG PR-5a) it
+/// when the retention setting is 0 or below). For `management_group_memberships` (#6352) it
 /// means the agent's rows in every management group (static, dynamic and root) were removed in one
 /// statement; the enrolment row is untouched, so the same id can still reconnect and its next
-/// Register re-adds the ROOT group only, and a concurrent add can re-insert it (point-in-time, see
-/// `ManagementGroupStore::delete_agent`). The Art.17 reading of a result must therefore go
+/// Register attempts to add the ROOT group back (best effort) and no other, and a later add can
+/// re-insert the id (point-in-time, see `ManagementGroupStore::delete_agent`). The Art.17 reading of a result must therefore go
 /// through each store's own contract, not through the word `Deleted` alone.
 ///
 /// STANDING RULE — the gate is the single `Decommission:Delete` securable, so
@@ -149,7 +149,7 @@ struct AgentDecommissionStores {
     /// PG guardian_agent_order row + guardian_agent_rule_status census rows + pending-evidence retire (#5675)
     GuaranteedStateStore* guaranteed_state{nullptr};
     /// PG management_group_members rows for the agent: every group, static and dynamic, root included
-    /// (MG PR-5a). Registered LAST. `Deleted` means the membership rows are gone, nothing more: the
+    /// (#6352). Registered LAST. `Deleted` means the membership rows are gone, nothing more: the
     /// enrolment row, the groups, their role assignments and the agent's tags are not touched.
     ManagementGroupStore* management_group_memberships{nullptr};
 };

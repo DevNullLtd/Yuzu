@@ -25,7 +25,9 @@
  */
 
 #include "agent_decommission.hpp"
+#include "authz_gates.hpp"
 #include "authz_model.hpp"
+#include "service_scope_policy.hpp"
 #include "management_group_store.hpp"
 #include "rbac_store.hpp"
 #include "tag_store.hpp"
@@ -742,7 +744,7 @@ TEST_CASE("authz_model meet: commutative and associative", "[authz_model][meet]"
     CHECK(left_assoc->contains("a_3"));
 }
 
-// ── MG PR-5a: decommission narrows what a group-confined caller sees ─────────────────────────────
+// ── #6352: decommission narrows what a group-confined caller sees ─────────────────────────────
 //
 // The removal is driven through AgentDecommission (the feature's entry point), not a bare store call.
 // Exact sets, never "non-empty". Two visibility semantics are asserted separately because they
@@ -763,7 +765,7 @@ std::vector<std::string> sorted_vec(std::vector<std::string> v) {
 }
 } // namespace
 
-TEST_CASE("authz_model MG PR-5a: decommission removes the agent from a group-confined caller's "
+TEST_CASE("authz_model decommission memberships: decommission removes the agent from a group-confined caller's "
           "RBAC-visible set (hierarchical)",
           "[pg][authz][decommission]") {
     Rig r;
@@ -793,7 +795,7 @@ TEST_CASE("authz_model MG PR-5a: decommission removes the agent from a group-con
     CHECK(r.mgmt.get_agent_groups("a_s").value() == std::vector<std::string>{r.gS});
 }
 
-TEST_CASE("authz_model MG PR-5a: decommission removes the agent from the legacy direct-membership "
+TEST_CASE("authz_model decommission memberships: decommission removes the agent from the legacy direct-membership "
           "visible set",
           "[pg][authz][decommission]") {
     Rig r;
@@ -818,10 +820,14 @@ TEST_CASE("authz_model MG PR-5a: decommission removes the agent from the legacy 
 }
 
 // D2 consequence, pinned so it is a known property and not a surprise. With RBAC enforcement OFF the
-// legacy path answers `all_member_agents()` (every agent that has at least one membership row), so an
-// agent with NO membership rows, such as a decommissioned but still-connected agent, drops out of
-// every legacy-open operator's visible set until its next Register re-adds the ROOT group.
-TEST_CASE("authz_model MG PR-5a: with RBAC off, a decommissioned agent drops out of the legacy "
+// legacy `get_visible_agents` answers `all_member_agents()` (every agent that has at least one
+// membership row), so an agent with NO membership rows, such as a decommissioned but still-connected
+// agent, drops out of the visible set of the callers that read `get_visible_agents` DIRECTLY
+// (`confine_destructive_targets` on the generic dispatch routes, the dashboard execute console,
+// instruction execute, Echo scan/re-enable/purge) until its next Register re-adds the ROOT group.
+// It does NOT drop out of `visible_agents_json` or `infrastructure_visible_set`, which return the
+// unfiltered registry with RBAC off, so the main device lists are unaffected.
+TEST_CASE("authz_model decommission memberships: with RBAC off, a decommissioned agent drops out of the legacy "
           "visible set until it registers again",
           "[pg][authz][decommission]") {
     Rig r;
@@ -840,7 +846,7 @@ TEST_CASE("authz_model MG PR-5a: with RBAC off, a decommissioned agent drops out
     REQUIRE(r.mgmt.add_member(r.gP, "a_c1").has_value());
     auto back = r.mgmt.get_visible_agents("any-operator");
     REQUIRE(back.has_value());
-    CHECK(back->size() == 4);
+    CHECK(sorted_vec(*back) == sorted_vec({"a_p", "a_c1", "a_c2", "a_s"}));
 }
 
 // D4 pin. A caller whose ONLY Decommission:Delete is group-scoped passes the scoped check while the
@@ -849,7 +855,7 @@ TEST_CASE("authz_model MG PR-5a: with RBAC off, a decommissioned agent drops out
 // out-of-band authority: no shipped route can create such a holder (group scope assigns only
 // Operator/Viewer, neither seeded with Decommission:Delete, and set_permission has no route caller),
 // so this is a tripwire for the day one can.
-TEST_CASE("authz_model MG PR-5a: a group-scoped Decommission:Delete holder is denied once the "
+TEST_CASE("authz_model decommission memberships: a group-scoped Decommission:Delete holder is denied once the "
           "memberships are gone (D4 pin)",
           "[pg][authz][decommission]") {
     Rig r;
@@ -863,4 +869,38 @@ TEST_CASE("authz_model MG PR-5a: a group-scoped Decommission:Delete holder is de
     decommission_memberships(r.mgmt, "a_c1");
 
     CHECK_FALSE(r.rbac.check_scoped_permission("erin", "Decommission", "Delete", "a_c1", &r.mgmt));
+}
+
+// Governance S1 pin (ADR-0024 Decision 9, owner ruling 2026-11-17). `Decommission:Delete` is the
+// authority to remove the device's membership rows in EVERY group, including groups the caller could
+// not otherwise write: the rows are agent-keyed links to the retired device, removal only narrows
+// reach, and nothing is granted. The asymmetry is deliberate and must not drift silently: a holder
+// of `Decommission:Delete` without `ManagementGroup:Write` is admitted to the cascade, which removes
+// the memberships, while the member-removal routes (global `ManagementGroup:Write`) still refuse
+// it. The seeded ITServiceOwner ceiling admits `Decommission:Delete` for a service-scoped token (the
+// device's service tag must also match, a separate check), while the empty
+// `kServiceScopeGlobalSafe` keeps that same token out of the global ManagementGroup:Write gate.
+TEST_CASE("authz_model: Decommission:Delete removes memberships without ManagementGroup:Write "
+          "(S1 pin)",
+          "[pg][authz][decommission]") {
+    Rig r;
+    REQUIRE(r.rbac.create_role({"DecomOnly", "", false, 0}).has_value());
+    REQUIRE(r.rbac.set_permission({"DecomOnly", "Decommission", "Delete", "allow"}).has_value());
+    REQUIRE(r.rbac.assign_role({"user", "fay", "DecomOnly"}).has_value());
+
+    CHECK(r.rbac.check_permission("fay", "Decommission", "Delete"));
+    CHECK_FALSE(r.rbac.check_permission("fay", "ManagementGroup", "Write"));
+    CHECK_FALSE(r.rbac.check_permission("fay", "ManagementGroup", "Delete"));
+
+    // The seeded ITServiceOwner ceiling admits the decommission pair for a service-scoped token, and
+    // the seeded-empty global allow-list refuses that token the global member-removal gate.
+    CHECK(yuzu::server::authz::service_ceiling_check(r.rbac, "Decommission", "Delete").verdict ==
+          yuzu::server::authz::CeilingVerdict::Admit);
+    CHECK_FALSE(yuzu::server::authz::service_scope_global_safe("ManagementGroup", "Write"));
+
+    // The cascade (the effect of that grant) removes the memberships, whatever the caller's own
+    // group authority: the device ends up in no group.
+    REQUIRE(r.mgmt.get_agent_groups("a_c1").value() == std::vector<std::string>{r.gC1});
+    decommission_memberships(r.mgmt, "a_c1");
+    CHECK(r.mgmt.get_agent_groups("a_c1").value().empty());
 }

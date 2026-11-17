@@ -51,7 +51,7 @@
 #include "response_store.hpp"
 #include "test_auth_db_pg_helper.hpp" // WS-6 6.2: enrollment state is PG-backed
 #include "test_forensics_tier_fixture.hpp" // #4990: the catalogue-derived Forensics plugin set
-#include "test_mgmt_group_pg_helper.hpp" // MG PR-5a: real PG ManagementGroupStore for Register
+#include "test_mgmt_group_pg_helper.hpp" // #6352: real PG ManagementGroupStore for Register
 #include "test_offload_target_store_pg_helper.hpp"
 #include "test_provenance_fake.hpp" // #4990: harness record source when no tracker is wired
 #include "test_tracker_scope.hpp"
@@ -4155,7 +4155,7 @@ TEST_CASE("Register: notification fires once on first enrollment; webhook/offloa
     CHECK(off_after_reauth.size() == 2);
 }
 
-// ── MG PR-5a: a returning approved agent id keeps its management-group memberships ─────────
+// ── #6352: a returning approved agent id keeps its management-group memberships ─────────
 //
 // The Register-side half of the returning-id question. Registering is not membership-neutral for
 // the ROOT group only: Register's one membership write is add_member(root) (agent_service_impl.cpp,
@@ -4163,7 +4163,7 @@ TEST_CASE("Register: notification fires once on first enrollment; webhook/offloa
 // no approval), so every non-root membership it already had is still in place afterwards. Driven
 // through the real service with a real Postgres ManagementGroupStore; only the transport context is
 // null. Characterisation test: it passes before the decommission fix because nothing removes the rows.
-TEST_CASE("Register: a returning approved agent id keeps its non-root group memberships until decommission (MG PR-5a)",
+TEST_CASE("Register: a returning approved id keeps its non-root groups until decommission",
           "[pg][agent_service][management_group][decommission]") {
     yuzu::test::ManagementGroupStorePg mg_bundle;
     yuzu::server::ManagementGroupStore& mg = *mg_bundle;
@@ -4203,6 +4203,13 @@ TEST_CASE("Register: a returning approved agent id keeps its non-root group memb
     apb::RegisterResponse first;
     REQUIRE(h.svc.Register(/*context=*/nullptr, &req, &first).ok());
     REQUIRE(first.accepted());
+
+    // Remove the match-all auto-approve rule now that the agent is enrolled: from here only the
+    // approved enrolment row (the fast path) can accept it, so the second and third Register below
+    // really prove "no token, no approval" instead of being accepted by auto-approve again.
+    REQUIRE(!h.auto_approve.list_rules().empty());
+    (void)h.auto_approve.remove_rule(0);
+    REQUIRE(h.auto_approve.list_rules().empty());
 
     REQUIRE(mg.add_member(g1, "returning-agent").has_value());
     REQUIRE(mg.add_member(g2, "returning-agent").has_value());

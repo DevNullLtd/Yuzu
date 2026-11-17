@@ -39,6 +39,7 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -148,7 +149,7 @@ public:
                                                 const std::string& agent_id);
     std::expected<void, std::string> remove_member(const std::string& group_id,
                                                    const std::string& agent_id);
-    /// Decommission erasure (MG PR-5a, `AgentDecommissionStores::management_group_memberships`):
+    /// Decommission erasure (#6352, `AgentDecommissionStores::management_group_memberships`):
     /// removes the agent from EVERY group in one statement, whatever the `source` (static or
     /// dynamic) and including the root group, unlike `remove_member`, which is one group and
     /// `source = 'static'` only. Returns true iff the DELETE committed (zero rows included, so an
@@ -156,14 +157,14 @@ public:
     /// is not open, no lease within `kWriteTimeout`, or any SQL failure (a deadlock or lock timeout
     /// included), so the cascade records `Failed`, never a false erasure. It touches ONLY
     /// `management_group_members`: groups, group role assignments, tags and the enrolment row are
-    /// untouched, so decommission still does not un-enrol the agent and its next Register re-adds
-    /// the ROOT group only.
+    /// untouched, so decommission still does not un-enrol the agent and its next Register attempts to
+    /// add the ROOT group back (best effort: Register ignores the result of that write) and no other.
     ///
     /// POINT-IN-TIME, not a tombstone. `true` means a DELETE committed, not that no membership
     /// exists afterwards: `add_member` and `refresh_dynamic_membership` are `INSERT ... ON CONFLICT
-    /// DO NOTHING` with no agent-existence check, so a concurrent operator add, or a dynamic group
-    /// creation whose matching set was computed before the delete, can insert the id again once this
-    /// statement has committed. The statement is a plain `DELETE ... WHERE agent_id = $1` (no
+    /// DO NOTHING` with no agent-existence check, so an operator add, or a dynamic or `Service:` group
+    /// created later (the tags decommission leaves in place feed `ensure_service_management_group`),
+    /// can insert the id again after this statement has committed, with no race needed. The statement is a plain `DELETE ... WHERE agent_id = $1` (no
     /// `RETURNING`, no `source` filter); a failure is logged at warn level with the reason.
     [[nodiscard]] bool delete_agent(std::string_view agent_id);
     /// LEGACY fail-soft: `get_members_checked(group_id).value_or({})` — a

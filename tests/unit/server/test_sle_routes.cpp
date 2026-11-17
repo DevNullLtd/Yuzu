@@ -398,7 +398,7 @@ TEST_CASE("sle erase: all-Deleted → 200 decommissioned, attempt+success audite
     CHECK(h.audited("sle.agent.decommission|success"));
 }
 
-// #5675 / MG PR-5a: route passthrough only. The handler reports whatever stores the injected cascade
+// #5675 / #6352: route passthrough only. The handler reports whatever stores the injected cascade
 // result names, so this pins the ten-entry JSON shape and that a Failed Guardian line is not rolled up
 // into a success. It does not prove the cascade registers or wires the Guardian store: that is
 // the real-store fan-out in test_agent_decommission.cpp and

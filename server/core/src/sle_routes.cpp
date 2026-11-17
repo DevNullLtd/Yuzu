@@ -218,9 +218,15 @@ void SleRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_perm_fn
     // inventory; read securable arrives in PR 2a-2b), and GuaranteedStateStore (#5675: the
     // Guardian compliance census, read-gated by `GuaranteedState`; the device's pending census
     // evidence is retired, its Guardian event log and DEX observations are not erased), and the
-    // agent's management-group memberships (MG PR-5a, key `management_group_memberships`,
+    // agent's management-group memberships (#6352, key `management_group_memberships`,
     // read-gated by `ManagementGroup`: every group, static, dynamic and root; the enrolment row is
-    // NOT touched, so the same id can reconnect and its next Register re-adds the root group only).
+    // NOT touched, so the same id can reconnect and its next Register attempts to add it back to the
+    // root group only). Owner ruling 2026-11-17 (governance S1): `Decommission:Delete` is the
+    // authority to remove the device's membership rows in every group, including groups the caller
+    // could not otherwise write (for example a service-scoped token admitted for a device in its
+    // service, which cannot hold the global `ManagementGroup:Write` that member-removal routes
+    // require). The rows are agent-keyed links to the retired device, removal only narrows what
+    // anyone can reach, and nothing is granted. Tags stay outside the cascade.
     // Compat: the seeded
     // matrix is unchanged (Administrator + ITServiceOwner keep the ability, granted
     // via seed_defaults() with no migration); an operator-authored custom role that

@@ -34,7 +34,7 @@ SRC = ROOT / "server" / "core" / "src"
 _RAW_OPEN = re.compile(r'"([^ ()\\\t\v\f\n"]{0,16})\(')
 # A struct member of the shape `Type* name{nullptr};`.
 _FIELD = re.compile(r"\b\w+\s*\*\s*(\w+)\s*\{\s*nullptr\s*\}\s*;")
-_MIN_FIELDS = 10  # the tenth store (management_group_memberships, MG PR-5a) joined a nine-store cascade
+_MIN_FIELDS = 10  # the tenth store (management_group_memberships, #6352) joined a nine-store cascade
 
 
 def strip_comments(text: str) -> str:

@@ -36,6 +36,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -335,7 +336,7 @@ TEST_CASE("ManagementGroupStore: static membership", "[pg][management_group][mem
     CHECK(members2.size() == 1);
 }
 
-// MG PR-5a, commit 1: characterisation of the returning-id question. Nothing in the server
+// Decommission memberships, characterisation: characterisation of the returning-id question. Nothing in the server
 // deletes an agent's membership rows when it is decommissioned (the cascade names no
 // management-group store), and Register's only membership write is add_member(root), so an agent
 // that registers again with the same id is still a member of every group it was in. This test
@@ -408,7 +409,7 @@ TEST_CASE("ManagementGroupStore: a re-registered agent id keeps every group memb
     CHECK(sorted_groups("a2") == want_a2);
 }
 
-// MG PR-5a: ManagementGroupStore::delete_agent, the tenth decommission cascade store.
+// #6352: ManagementGroupStore::delete_agent, the tenth decommission cascade store.
 namespace {
 struct DeleteAgentFixture {
     std::string root;
@@ -509,6 +510,44 @@ TEST_CASE("ManagementGroupStore::delete_agent refuses an empty or NUL-bearing id
     CHECK_FALSE(store.delete_agent(""));
     // An embedded NUL must not truncate onto another agent's id ("a1\0x" would otherwise read as "a1").
     CHECK_FALSE(store.delete_agent(std::string_view("a1\0x", 4)));
+    CHECK(sorted_ids(store.get_agent_groups("a1").value()) ==
+          sorted_ids({f.root, f.s1, f.s2, f.dyn}));
+}
+
+// Point-in-time pin (governance T6/S4): delete_agent is not a tombstone. add_member and
+// refresh_dynamic_membership are INSERT ... ON CONFLICT DO NOTHING with no agent-existence check, so
+// the id can be put back in a group after the delete returned, for example by an operator add or by
+// a dynamic group created later. The deterministic, non-racing form of the documented residual.
+TEST_CASE("ManagementGroupStore::delete_agent is point-in-time: a later add puts the id back",
+          "[pg][management_group][members][decommission]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mgmt_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ManagementGroupStore store{pool};
+    const auto f = seed_delete_agent(store);
+
+    REQUIRE(store.delete_agent("a1"));
+    REQUIRE(store.get_agent_groups("a1").value().empty());
+
+    REQUIRE(store.add_member(f.s2, "a1").has_value());
+    store.refresh_dynamic_membership(f.dyn, {"a1"});
+    CHECK(sorted_ids(store.get_agent_groups("a1").value()) == sorted_ids({f.s2, f.dyn}));
+}
+
+// A lease that cannot be had within kWriteTimeout is a refusal, never a false erasure (governance T4):
+// the only pooled connection is held, so delete_agent waits out its 4 s lease budget and returns
+// false, and the rows survive.
+TEST_CASE("ManagementGroupStore::delete_agent returns false when no connection is available",
+          "[pg][management_group][members][decommission][slow]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mgmt_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+    const auto f = seed_delete_agent(store);
+
+    auto held = pool.try_acquire_for(std::chrono::seconds(2));
+    REQUIRE(held);
+    CHECK_FALSE(store.delete_agent("a1"));
+    held = {}; // release the only connection
     CHECK(sorted_ids(store.get_agent_groups("a1").value()) ==
           sorted_ids({f.root, f.s1, f.s2, f.dyn}));
 }

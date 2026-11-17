@@ -109,7 +109,7 @@ AgentDecommission::AgentDecommission(const AgentDecommissionStores& stores) {
                                        return p->delete_agent(id);
                                    })
                                  : nullptr});
-    // The tenth store (MG PR-5a): the agent's management-group memberships. Registered LAST.
+    // The tenth store (#6352): the agent's management-group memberships. Registered LAST.
     // `deleted` means every membership row for the id was removed; the enrolment row is NOT touched,
     // so decommission still does not un-enrol the agent.
     targets_.push_back(

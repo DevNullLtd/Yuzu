@@ -12,7 +12,7 @@
 //     through the `add_store` seam with recording/throwing/failing fakes (no
 //     database needed);
 //   * a real-store fan-out ([pg][decommission][software_licensing]) — populate
-//     all nine stores (all born-on-PG), decommission one agent, and assert its
+//     all ten stores (all born-on-PG), decommission one agent, and assert its
 //     rows are gone from EVERY store while a bystander survives, including the
 //     software_licensing, app_usage and offline_endpoint (#5682) stores.
 
@@ -256,7 +256,7 @@ TEST_CASE("AgentDecommission null-store constructor registers every store as Ski
     AgentDecommission cascade{AgentDecommissionStores{}};
     CHECK(cascade.target_count() == 10); // inventory + 5 typed projections + presence + certs +
                                          // the Guardian census (guaranteed_state, #5675) +
-                                         // management-group memberships (MG PR-5a)
+                                         // management-group memberships (#6352)
 
     const auto result = cascade.decommission("agent-x");
     CHECK(result.deleted == 0);
@@ -289,8 +289,9 @@ yuzu::test::PgTestTemplate decommission_tpl{"decommission", [](const std::string
     yuzu::server::OfflineEndpointStore offline_endpoint{pool};
     yuzu::server::CertificateInventoryStore certificate_inventory{pool};
     yuzu::server::GuaranteedStateStore guaranteed_state{pool}; // #5675: the ninth store
-    yuzu::server::ManagementGroupStore management_groups{pool}; // MG PR-5a: the tenth store
-    if (!management_groups.is_open() || !guaranteed_state.is_open() || !certificate_inventory.is_open() || !inventory.is_open() ||
+    yuzu::server::ManagementGroupStore management_groups{pool}; // #6352: the tenth store
+    if (!management_groups.is_open() || !guaranteed_state.is_open() ||
+        !certificate_inventory.is_open() || !inventory.is_open() ||
         !software_inventory.is_open() || !app_perf_daily.is_open() || !device_inventory.is_open() ||
         !software_licensing.is_open() || !app_usage.is_open() || !offline_endpoint.is_open())
         throw std::runtime_error("decommission template: a store failed to migrate");
@@ -495,7 +496,7 @@ void seed_census(yuzu::server::GuaranteedStateStore& gs, const std::string& agen
     REQUIRE(gs.insert_event_classified(e).outcome == yuzu::server::EventInsertOutcome::Inserted);
 }
 
-// MG PR-5a: management-group memberships. The root group is created by ServerImpl at boot, not by
+// #6352: management-group memberships. The root group is created by ServerImpl at boot, not by
 // the store migration, so a bare store has none; bootstrap it the way server.cpp does.
 struct MembershipSeed {
     std::string root;
@@ -596,7 +597,7 @@ TEST_CASE("AgentDecommission erases an agent from every real store; a bystander 
     seed_census(guaranteed_state, "agent-bystander", "r1", "guard.compliant");
     REQUIRE(guaranteed_state.agent_rule_statuses_for_agent("agent-del").value().size() == 2);
 
-    // MG PR-5a: management-group memberships. agent-del is in the root group, two static groups
+    // #6352: management-group memberships. agent-del is in the root group, two static groups
     // (one shared with the bystander) and one dynamic group; the bystander is in the shared group
     // and the root group. The seed is shared with the fan-out assertions below.
     const MembershipSeed groups = seed_memberships(management_groups);
@@ -839,10 +840,9 @@ TEST_CASE("AgentDecommission reports a failing Guardian census delete as Failed,
     CHECK(guaranteed_state.agent_rule_statuses_for_agent("agent-del").value().empty());
 }
 
-// #5682: unlike the session-guarded remove_if_session, delete_agent removes the
-// row whatever its session_id, including a blank one remove_if_session can never match.
-// MG PR-5a: a membership store whose DELETE fails is reported Failed (never Deleted), the other nine
-// stores still erase, the membership rows are still present, and the re-issue completes the erasure.
+// #6352: a membership store whose DELETE fails is reported Failed (never Deleted), the other nine
+// stores still erase, the membership rows are still present, and the re-issue completes the
+// erasure.
 // The membership store is registered last, so this proves the Failed aggregation, not that the loop
 // continues AFTER it; the generic continuation tests above cover that property.
 TEST_CASE("AgentDecommission reports a failing membership delete as Failed, others Deleted",
@@ -913,6 +913,33 @@ TEST_CASE("AgentDecommission reports a failing membership delete as Failed, othe
           sorted(groups.bystander_groups));
 }
 
+// A NUL-bearing id through the cascade: the membership store refuses it (Failed, nothing deleted),
+// it never truncates onto the agent whose id is the prefix (governance T7).
+TEST_CASE("AgentDecommission reports a NUL-bearing id as Failed for the membership store",
+          "[pg][decommission][management_group]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, decommission_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ManagementGroupStore management_groups{pool};
+    REQUIRE(management_groups.is_open());
+    const MembershipSeed groups = seed_memberships(management_groups);
+
+    AgentDecommission cascade{
+        AgentDecommissionStores{.management_group_memberships = &management_groups}};
+    const auto result = cascade.decommission(std::string("agent-del\0x", 11));
+    CHECK(result.failed == 1);
+    CHECK(result.deleted == 0);
+    CHECK(sorted(management_groups.get_agent_groups("agent-del").value()) ==
+          sorted({groups.root, groups.shared, groups.only_del, groups.dynamic_del}));
+
+    // An id the store never saw is a successful no-op through the cascade.
+    const auto unknown = cascade.decommission("never-seen");
+    CHECK(unknown.ok());
+    CHECK(unknown.deleted == 1);
+}
+
+// #5682: unlike the session-guarded remove_if_session, delete_agent removes the
+// row whatever its session_id, including a blank one remove_if_session can never match.
 TEST_CASE("OfflineEndpointStore::delete_agent erases regardless of session and is idempotent",
           "[pg][decommission][offline]") {
     YUZU_REQUIRE_PG_DB_TPL(db, decommission_tpl);
