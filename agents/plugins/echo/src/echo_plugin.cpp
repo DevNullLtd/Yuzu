@@ -1610,6 +1610,10 @@ private:
                     pe.ppid = e.ppid;
                     pe.name = e.image_name;
                     pe.user = e.user;
+                    // Stream-leg image names/users are raw OS bytes (ETW / ES): well-formed UTF-8 at
+                    // collection, like every other Echo identity string (echo_wire_scrub.hpp).
+                    yuzu::echo::scrub_wire_strings(pe.name);
+                    yuzu::echo::scrub_wire_strings(pe.user);
                     pe.exit_code = e.exit_code;
                     pe.parent_name = yuzu::echo::pid_name_lookup(pid_name_, e.ppid, e.ts_unix);
                     typed.push_back(std::move(pe));

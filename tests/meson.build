@@ -1554,6 +1554,7 @@ if build_server
       'unit/server/test_background_jobs.cpp',
       'unit/server/test_pg_retention_guard.cpp',
       'unit/server/test_pg_collation_check.cpp',
+      'unit/server/test_pg_server_encoding.cpp', # WP07: boot-time UTF8 database-encoding check (warn-only)
       'unit/server/test_pg_collation_recheck.cpp',
       'unit/server/test_audit_retention_rules.cpp',
       'unit/server/test_log_token.cpp',
@@ -4337,6 +4338,16 @@ endif
 test('log handoff wiring lexical gate (#4666 PR-2 W3a)',
   _python3_test,
   args: [files('test_log_handoff_wiring_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
+
+# WP07: static lexical gate that every Echo diff source scrubs its identity strings at collection
+# (echo_plugin.cpp's scrub_wire_strings call sites); deleting one fabricates phantom events every
+# tick and no unit test can reach the anonymous helpers. Source text only, so Python, no build needed.
+test('Echo scrub-wiring lexical gate (WP07)',
+  _python3_test,
+  args: [files('test_echo_scrub_wiring_lexical.py')],
   suite: 'agent',
   timeout: 30,
 )

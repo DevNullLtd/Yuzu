@@ -29,6 +29,7 @@ REQUIRED = [
     ("arp", r"scrub_wire_strings\(\*current\);[^\n]*\n\s*auto previous = json_to_arp"),
     ("services", r"scrub_wire_strings\(\*current\);[^\n]*\n\s*const std::string svc_key"),
     ("mapdrive", r"scrub_wire_strings\(\*current\);[^\n]*\n\s*const std::string md_key"),
+    ("process stream leg", r"pe\.user = e\.user;[^\n]*\n(?:\s*//[^\n]*\n)+\s*yuzu::echo::scrub_wire_strings\(pe\.name\);\s*yuzu::echo::scrub_wire_strings\(pe\.user\);"),
     ("pid_name_ map", r"scrub_wire_strings\(clean\);\s*pid_name_\[pid\]"),
 ]
 
