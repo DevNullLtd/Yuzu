@@ -612,7 +612,7 @@ public:
     /// `removed == false` and `elevations_cleared == 0`, ends no elevation, and does not run the
     /// local drop. A user whose elevated access rests on eligibility alone (no grant) is not
     /// affected by this call; revoking elevation eligibility is what ends that access. (Pinned by
-    /// test case S10-11 in tests/unit/server/test_rbac_account_lifecycle_guard.cpp.)
+    /// the no-op unassign case in tests/unit/server/test_rbac_account_lifecycle_guard.cpp.)
     ///
     /// After a confirmed commit that removed a row, or after a failure with an empty error text
     /// (see the comment at the call site: that includes, but is wider than, a lost COMMIT

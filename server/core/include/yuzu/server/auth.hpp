@@ -925,8 +925,9 @@ public:
     /// devices). Called when an admin removes a user's elevation eligibility so
     /// an in-flight elevation is terminated (at once on this replica, and on the others at
     /// their next session-generation poll: about 1 s, up to about 30 s while that read is
-    /// failing or slow), symmetric with the session wipe on demote/delete (governance
-    /// UP-1). On success the value is
+    /// failing or slow; neither bound holds after a database restore or a failover to a
+    /// lagging standby, which can bring a cleared elevation back: restart every replica),
+    /// symmetric with the session wipe on demote/delete (governance UP-1). On success the value is
     /// the number of sessions whose elevation was cleared. Returns `unexpected`
     /// ONLY when the durable `SessionStore` clear FAILED — the route MUST fail
     /// closed (an in-flight elevation may still be live durably; the eligibility

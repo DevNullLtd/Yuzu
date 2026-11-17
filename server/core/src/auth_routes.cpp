@@ -5413,7 +5413,10 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         }
         // Revoking eligibility must terminate any in-flight elevation (governance UP-1):
         // at once on this replica, and on the others at their next session-generation poll
-        // (about 1 s, up to about 30 s while that read is failing or slow). Symmetric with the
+        // (about 1 s, up to about 30 s while that read is failing or slow; neither bound holds
+        // after a database restore or a failover to a lagging standby, which can bring a cleared
+        // elevation back: restart every replica, see docs/ops-runbooks/auth-db-recovery.md,
+        // "Sessions are durable"). Symmetric with the
         // session wipe on demote/delete, so an incident-response "revoke now" actually drops
         // the operator's admin access rather than leaving it standing for up to the window.
         int cleared = 0;
@@ -5746,14 +5749,14 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             res.set_content(detail::a4_denial(res, 401, "unauthorized"), "application/json");
             return;
         }
-        // Re-read eligibility AFTER the elevation has committed (governance g8p4-UP-1), fail
-        // CLOSED. The eligibility revoke flips the flag BEFORE it clears the user's durable
+        // Re-read eligibility AFTER the elevation has committed, fail CLOSED. The eligibility revoke flips the flag BEFORE it clears the user's durable
         // elevations, so either this re-read sees the flipped flag (and this branch rolls the
         // elevation back), or the flip comes after this re-read, which means the revoke's clear
         // runs after the elevation committed and ends it. The check before elevate_session
         // alone leaves a window in which the clear matches no row and the elevation then
-        // commits. No `role.elevation.granted` row is written in either refusal: no grant was
-        // recorded and none stands.
+        // commits. No `role.elevation.granted` row is written in any of the three outcomes (403,
+        // 503, 500). In the first two the elevation was rolled back; in the third (the
+        // compensating revoke failed) it may still be live.
         if (auto post = db->is_elevation_eligible(session->username); !post || !*post) {
             auto undo = auth_mgr_.revoke_elevation(token); // same compensation as the audit arm
             if (!undo) {
@@ -5771,10 +5774,11 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                                         "rollback_failed=true");
                 res.status = 500;
                 res.set_content(
-                    detail::error_json_a4(500,
-                                          "elevation could not be rolled back; it may be active - "
-                                          "revoke it manually and check the stores",
-                                          cid, "revoke manually; check the auth + session stores"),
+                    detail::error_json_a4(
+                        500, "elevation could not be rolled back; it may be active", cid,
+                        "end it with POST /api/v1/elevate/revoke from this session, or have an "
+                        "administrator send POST /api/v1/users/{name}/elevation-eligibility with "
+                        "{\"eligible\": false}; then check the auth + session stores"),
                     "application/json");
                 return;
             }
@@ -5785,8 +5789,9 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                                          : "eligibility read failed after elevation");
             if (!post) {
                 res.status = 503;
-                res.set_content(detail::error_json_a4(503, "JIT elevation requires the persistent "
-                                                           "auth store",
+                res.set_content(detail::error_json_a4(503, "eligibility could not be confirmed "
+                                                           "after the elevation; the elevation "
+                                                           "was rolled back",
                                                       cid, "retry shortly or contact an "
                                                            "administrator"),
                                 "application/json");

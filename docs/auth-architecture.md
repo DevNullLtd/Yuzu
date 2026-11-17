@@ -1475,7 +1475,11 @@ auto-reverts — so a compromised everyday session is not a standing admin sessi
   Either the re-read sees the flipped flag, and the route
   compensates with `revoke_elevation` and answers `403` (`503` when the re-read fails;
   `500` plus a CRITICAL log when the compensation itself fails, with a
-  `role.elevation.denied` row carrying `rollback_failed=true`), or the flip comes after
+  `role.elevation.denied` row carrying `rollback_failed=true`; the elevation may then be
+  live until the user ends it with `POST /api/v1/elevate/revoke` from the session that
+  holds it, which needs only that session, or an administrator sends the eligibility
+  revoke (which also removes eligibility), and the 500 body names both; beyond the generic session-store degrade counter,
+  no dedicated counter or alert rule ships for that arm), or the flip comes after
   the re-read, which puts the revoke's clear after the elevation committed so the clear
   matches the row and ends it. The check before `elevate_session` alone left a window in
   which the clear matched no row and the elevation then committed and stood with
@@ -1521,8 +1525,8 @@ auto-reverts — so a compromised everyday session is not a standing admin sessi
   elevates through eligibility alone holds no `Administrator` grant, so
   unassigning `Administrator` for that user is an idempotent no-op (success,
   audit `removed=false`, no clear, no local drop) and the elevation stays; the way
-  to end that user's access is to revoke eligibility (test S10-11 in
-  `test_rbac_account_lifecycle_guard.cpp` pins the no-op). Other replicas converge
+  to end that user's access is to revoke eligibility (the no-op unassign case in
+  `test_rbac_account_lifecycle_guard.cpp` pins it). Other replicas converge
   on their next generation poll (about 1 s). While a replica's generation read is
   failing or slow it keeps serving its cached elevation until the 30 s stale-serve
   bound after its last successful read (`kSessionGenStaleServeBoundMs`); this is an
@@ -1790,7 +1794,10 @@ auto-reverts — so a compromised everyday session is not a standing admin sessi
   #1859, tracked).** Until a deprovisioning sweep ships, stopping a
   compromised SSO operator's privileged access is two manual levers, both
   immediate on the replica that handles the call (other replicas converge on their next
-  session-generation poll, about 1 s, up to about 30 s while that read is failing or slow):
+  session-generation poll, about 1 s, up to about 30 s while that read is failing or slow;
+  neither bound holds after a database restore or a failover to a lagging standby, which can
+  bring a cleared elevation back: restart every replica, as the "Sessions are durable"
+  section of `docs/ops-runbooks/auth-db-recovery.md` says):
   (1) `POST /api/v1/users/{principal}/elevation-eligibility
   {"eligible":false}` — stops future JIT elevation and drops any
   currently-active elevation window (`AuthManager::revoke_user_elevations`);

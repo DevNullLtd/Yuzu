@@ -1102,7 +1102,7 @@ TEST_CASE("revoking eligibility terminates an active elevation", "[pg][jit][rout
     CHECK_FALSE(auth::is_elevated(*h.auth_mgr.validate_session(alice))); // elevation cleared
 }
 
-// g8p4-UP-1: the eligibility revoke flips the flag, then clears the durable elevations. If its
+// The eligibility revoke flips the flag, then clears the durable elevations. If its
 // clear runs before an in-flight /elevate commits, the clear matches no row and the elevation
 // would stand with eligible=false. The route re-reads eligibility after the commit and rolls it
 // back. The post-durable-write hook flips the flag at exactly that point ("elevate" op, after
@@ -1140,8 +1140,8 @@ TEST_CASE("POST /api/v1/elevate: eligibility revoked after the durable write com
     CHECK(auth::effective_role(*s) != Role::admin);
 }
 
-// g8p4-UP-1, the failed re-read: eligibility cannot be confirmed after the commit, so the
-// elevation is rolled back and the route answers 503, never a grant.
+// The failed re-read: eligibility cannot be confirmed after the commit, so the elevation is
+// rolled back and the route answers 503, never a grant.
 TEST_CASE("POST /api/v1/elevate: an unreadable eligibility after the durable write commits rolls "
           "the elevation back with a 503 and records no grant",
           "[pg][jit][routes][elevate_race]") {
@@ -1168,6 +1168,63 @@ TEST_CASE("POST /api/v1/elevate: an unreadable eligibility after the durable wri
     REQUIRE(found.has_value());
     REQUIRE(found->has_value());
     CHECK((*found)->row.elevated_until_ms == 0);
+    auto s = h.auth_mgr.validate_session(alice);
+    REQUIRE(s.has_value());
+    CHECK_FALSE(auth::is_elevated(*s));
+}
+
+// The compensating revoke fails too: eligibility was revoked after the elevation committed, and
+// the durable clear that would roll the elevation back cannot be done. The elevation may then be
+// live, so the route answers 500 (never 200 or 403), names the means of ending it, logs and
+// audits `rollback_failed=true`, and writes no grant row. The hook flips the flag (the
+// re-read still works, so the 403 branch is reached) and arms a column rename that breaks the
+// session UPDATE of `clear_elevation` and the `find` before it.
+TEST_CASE("POST /api/v1/elevate: a failed rollback after the durable write answers 500 naming the "
+          "manual remedy, audits rollback_failed and records no grant",
+          "[pg][jit][routes][elevate_race]") {
+    JitHarness h;
+    auto alice = h.session_for("alice");
+    yuzu::test::SqlFault clear_fault{
+        h.auth_db.pool(),
+        "ALTER TABLE session_store.sessions RENAME COLUMN elevation_issued_ms TO "
+        "elevation_issued_ms_gone",
+        "ALTER TABLE session_store.sessions RENAME COLUMN elevation_issued_ms_gone TO "
+        "elevation_issued_ms"};
+    int hook_calls = 0;
+    h.auth_mgr.set_post_durable_write_hook_for_test([&](std::string_view op) {
+        if (op != "elevate")
+            return;
+        ++hook_calls;
+        REQUIRE(h.auth_db->set_elevation_eligible("alice", false).has_value());
+        clear_fault.arm();
+    });
+    auto res = h.post("/api/v1/elevate", alice, R"({"justification":"race"})");
+    h.auth_mgr.set_post_durable_write_hook_for_test(nullptr);
+    clear_fault.repair();
+
+    REQUIRE(res);
+    CHECK(hook_calls == 1);
+    CHECK(res->status == 500);
+    const auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE(body.is_object());
+    CHECK(body["error"]["message"].get<std::string>().find("it may be active") !=
+          std::string::npos);
+    const auto remediation = body["error"]["remediation"].get<std::string>();
+    CHECK(remediation.find("POST /api/v1/elevate/revoke") != std::string::npos);
+    CHECK(remediation.find("elevation-eligibility") != std::string::npos);
+    CHECK(h.count_audits("role.elevation.granted", "alice") == 0);
+    CHECK(h.count_audits("role.elevation.denied", "alice") == 1);
+    CHECK(h.audit_detail("role.elevation.denied", "alice").find("rollback_failed=true") !=
+          std::string::npos);
+    // The compensation did not land: the durable row is still elevated.
+    auto found = h.sessions.find(auth::AuthManager::sha256_hex(alice));
+    REQUIRE(found.has_value());
+    REQUIRE(found->has_value());
+    CHECK((*found)->row.elevated_until_ms != 0);
+    // The named means works once the store is readable again: the user ends it themselves.
+    auto revoke = h.post("/api/v1/elevate/revoke", alice, "");
+    REQUIRE(revoke);
+    CHECK(revoke->status == 200);
     auto s = h.auth_mgr.validate_session(alice);
     REQUIRE(s.has_value());
     CHECK_FALSE(auth::is_elevated(*s));

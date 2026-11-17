@@ -1371,7 +1371,8 @@ TEST_CASE("AuthManager lifecycle guard: concurrent session creates and deactivat
 // Removing a user's Administrator grant ends that user's durable JIT elevation in the SAME
 // transaction. The store runs in its DEFAULT durable mode here (a real SessionStore on
 // the one pool); the oracle reads the session and generation rows raw. Not covered here: a
-// re-elevation after the unassign (`/elevate` is unchanged and stays possible).
+// re-elevation after the unassign (the unassign does not change who may elevate, so it stays
+// possible).
 // ═════════════════════════════════════════════════════════════════════════════════════════════
 
 namespace {
