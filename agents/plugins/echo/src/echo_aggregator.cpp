@@ -388,7 +388,7 @@ bool source_retention_exempt(EchoDatabase& db, std::string_view source) {
         return true;
     if (!pa->has_value())
         return false; // errored, never paused
-    return **pa != "0"; // the plugin only ever writes the literal "0"; anything else is damaged
+    return **pa != "0"; // a pause timestamp exempts the source; "0" is the re-enable marker
 }
 
 namespace {
