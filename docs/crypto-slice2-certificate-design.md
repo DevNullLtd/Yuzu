@@ -1398,7 +1398,8 @@ A caller holding `Inventory:Read` but not `CertificateInventory:Read` gets the l
   loopback or own address is refused like its plain form. A local-use NAT64 address
   (`64:ff9b:1::/48`) that no declared prefix covers is refused with no override, because its
   embedded position depends on a prefix length the address does not carry: an operator whose CRL
-  host sits behind a local-use prefix declares it.
+  host sits behind a local-use prefix declares it, with its exact length (a wrong length decodes
+  the wrong IPv4 address).
 - **`PUT` replaces** the source's name, keys and URLs. This is how a renewed CA key is added. A
   `PUT` that drops a URL deletes that URL's `source_url` and `fetch_status` rows, and every held
   `crl` row fetched from it, in the same transaction. A `PUT` that drops a key deletes every held

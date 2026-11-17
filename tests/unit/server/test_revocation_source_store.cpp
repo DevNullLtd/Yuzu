@@ -205,6 +205,25 @@ TEST_CASE("RevocationSourceStore: one source per CA, the conflict names the exis
     CHECK(store.list()->size() == 2);
 }
 
+TEST_CASE("RevocationSourceStore: a failed read-back inside create commits nothing",
+          "[revocation_source_store][pg]") {
+    RS_STORE(store);
+    store.set_read_fault_for_test([](std::string_view op) -> std::optional<RKind> {
+        if (op == "create.reread")
+            return RKind::kQueryError;
+        return std::nullopt;
+    });
+    const auto failed = create_id(store, make_source("Corp CA", '1'), "alice");
+    REQUIRE_FALSE(failed.has_value());
+    CHECK(failed.error().kind == RKind::kQueryError);
+    store.set_read_fault_for_test(nullptr);
+    // Rolled back: nothing is listed, and a retry is a fresh registration, not a conflict.
+    CHECK(store.list()->empty());
+    const auto retry = create_id(store, make_source("Corp CA", '1'), "alice");
+    REQUIRE(retry.has_value());
+    CHECK(store.list()->size() == 1);
+}
+
 TEST_CASE("RevocationSourceStore: at most 64 sources", "[revocation_source_store][pg]") {
     RS_STORE(store);
     for (int i = 0; i < 64; ++i) {

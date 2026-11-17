@@ -568,6 +568,9 @@ RevocationSourceStore::create(const NewRevocationSource& src, const std::string&
             return std::unexpected(r.error());
     // Read the new source back INSIDE this transaction, as `replace` does: a re-read on a second
     // lease after COMMIT can time out, which would report a committed registration as a failure.
+    if (read_fault_)
+        if (const auto k = read_fault_("create.reread"))
+            return fail(*k, "injected read fault"); // the open transaction rolls back
     auto reread = load_sources(conn, id);
     if (!reread)
         return std::unexpected(reread.error());

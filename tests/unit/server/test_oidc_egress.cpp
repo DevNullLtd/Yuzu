@@ -1275,6 +1275,7 @@ struct LookupState {
     std::atomic<int> others{0};
     net::ResolveStatus other_status{net::ResolveStatus::kOk}; // set before the lookup is installed
     std::string other_answer{"93.184.216.34"};
+    std::vector<std::string> other_extra; // further addresses in the same answer
 };
 
 net::LookupFn make_lookup(std::shared_ptr<LookupState> st) {
@@ -1303,7 +1304,9 @@ net::LookupFn make_lookup(std::shared_ptr<LookupState> st) {
         st->others.fetch_add(1);
         if (st->other_status != net::ResolveStatus::kOk)
             return resolve_result(st->other_status, {});
-        return resolve_result(net::ResolveStatus::kOk, {st->other_answer});
+        std::vector<std::string> all{st->other_answer};
+        all.insert(all.end(), st->other_extra.begin(), st->other_extra.end());
+        return resolve_result(net::ResolveStatus::kOk, std::move(all));
     };
 }
 
@@ -1728,6 +1731,53 @@ TEST_CASE("OIDC resolver: a probe refused by a full pool is not remembered - the
     // The answered probe is cached again.
     CHECK_FALSE(vet_name(kLiteralTarget).has_value());
     CHECK(st->probes.load() == 2);
+    CHECK(wait_for([&] { return pool->in_flight.load() == 0; }));
+}
+
+TEST_CASE("OIDC resolver: a local-use address refused only because the prefix probe could not "
+          "start is a busy refusal, never a remembered policy refusal",
+          "[oidc][oidc_egress][oidc_resolver][oidc_nat64]") {
+    Nat64CacheReset cache;
+    auto pool = std::make_shared<net::ResolverPool>(4);
+    auto st = std::make_shared<LookupState>();
+    st->other_answer = "64:ff9b:1::808:808"; // uncovered local-use NAT64
+    st->probe_mode = kProbeBusy;
+    BoundedLookupGuard guard(make_lookup(st), pool);
+    const auto vet = [] {
+        return OidcProvider::vet_egress_target_for_test("local-use.example", true, false, 2000, {},
+                                                        false);
+    };
+
+    // The probe never started: the address might be decodable once it does, so the refusal is
+    // the lookup-busy reason (which discovery does not remember), not the policy refusal.
+    const auto busy = vet();
+    REQUIRE_FALSE(busy.has_value());
+    CHECK(busy.error() == kBusyReason);
+    CHECK(st->probes.load() == 1);
+
+    // The probe answers and learns no local-use prefix: now it is a policy refusal.
+    st->probe_mode = kProbeAnswer;
+    const auto refused = vet();
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error() == OidcProvider::kEgressRefused);
+    CHECK(st->probes.load() == 2);
+    CHECK(wait_for([&] { return pool->in_flight.load() == 0; }));
+}
+
+TEST_CASE("OIDC resolver: a busy local-use refusal does not mask a policy refusal in the same "
+          "answer",
+          "[oidc][oidc_egress][oidc_resolver][oidc_nat64]") {
+    Nat64CacheReset cache;
+    auto pool = std::make_shared<net::ResolverPool>(4);
+    auto st = std::make_shared<LookupState>();
+    st->other_answer = "64:ff9b:1::808:808";
+    st->other_extra = {"169.254.169.254"};
+    st->probe_mode = kProbeBusy;
+    BoundedLookupGuard guard(make_lookup(st), pool);
+    const auto mixed = OidcProvider::vet_egress_target_for_test("mixed.example", true, false, 2000,
+                                                                {}, false);
+    REQUIRE_FALSE(mixed.has_value());
+    CHECK(mixed.error() == OidcProvider::kEgressRefused); // the metadata address is the reason
     CHECK(wait_for([&] { return pool->in_flight.load() == 0; }));
 }
 

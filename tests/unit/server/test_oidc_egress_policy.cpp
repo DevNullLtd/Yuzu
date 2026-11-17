@@ -140,7 +140,7 @@ TEST_CASE("OIDC egress: IPv6 ranges and the embedded IPv4 forms", "[oidc][oidc_e
         {"::7f00:1", AddressClass::Loopback},
         {"::a9fe:a9fe", AddressClass::LinkLocal},          // 169.254.169.254
         {"::a64:6464", AddressClass::Private},             // 10.100.100.100
-        {"::6464:64c8", AddressClass::CloudMetadata},      // 100.100.100.200
+        {"::6464:64c8", AddressClass::CloudMetadata}, // 100.100.100.200 personal-data-ok: cloud metadata test vector
         {"::808:808", AddressClass::OtherNonGlobal},       // public 8.8.8.8 stays non-global
         {"::1:0:0:808:808", AddressClass::OtherNonGlobal}, // outside ::/96
         // SIIT ::ffff:0:0:0/96: the same rule

@@ -240,8 +240,11 @@ public:
 
     /// Test seam (empty in production): the read-side twin of `set_write_fault_for_test`, called
     /// with the operation name (`list`, `get`, `crl_past_next_update_count`) at the start of every
-    /// read; a returned kind fails the read with it before any lease is taken. Lets a test prove a
-    /// write path does not depend on a separate read after its commit.
+    /// read, where a returned kind fails the read with it before any lease is taken; and with
+    /// `create.reread` just before `create` reads its new row back inside its open transaction,
+    /// where a returned kind fails the create and the transaction rolls back. Lets a test prove a
+    /// write path does not depend on a separate read after its commit, and that a failed read-back
+    /// leaves nothing committed.
     void set_read_fault_for_test(std::function<std::optional<RevocationSourceStoreError::Kind>(
                                      std::string_view op)> f) {
         read_fault_ = std::move(f);

@@ -624,7 +624,8 @@ host_classes(const UrlParts& parts, Ctx& ctx, const std::string& param) {
             }))
             return invalid(param, "the host resolves to an address in the local-use NAT64 prefix "
                                   "64:ff9b:1::/48 that no --oidc-nat64-prefix declares; declare "
-                                  "the prefix so the IPv4 address it stands for can be checked");
+                                  "the translator's exact prefix and length (a wrong length "
+                                  "decodes the wrong IPv4 address) so it can be checked");
         const auto c = a->v4 ? classify_addr(*a)
                              : eg::classify_ipv6(a->b, std::span<const eg::Nat64Prefix>(declared));
         if (c == eg::AddressClass::Loopback || eg::detail::never_allowed(c))

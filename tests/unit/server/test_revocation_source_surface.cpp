@@ -2131,6 +2131,8 @@ TEST_CASE("RevocationSource: a committed registration is answered from its own t
     fx.admin(false);
     std::vector<std::string> reads;
     fx.store.set_read_fault_for_test([&](std::string_view op) -> std::optional<SK> {
+        if (op == "create.reread")
+            return std::nullopt; // the read-back inside create's own transaction is the fix
         reads.emplace_back(op);
         return SK::kPoolAcquireTimeout;
     });
