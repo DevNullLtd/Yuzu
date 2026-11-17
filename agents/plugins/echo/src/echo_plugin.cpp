@@ -603,8 +603,7 @@ public:
             spdlog::error("ECHO: failed to open db: {}", result.error());
             const auto reason = yuzu::echo::classify_open_failure(result.error());
             if (reason == yuzu::echo::OfflineReason::none) {
-                if (ctx.storage_exists(yuzu::echo::kStorageOfflineKey))
-                    ctx.storage_delete(yuzu::echo::kStorageOfflineKey);
+                ctx.storage_delete(yuzu::echo::kStorageOfflineKey);
                 return std::unexpected(yuzu::PluginError{
                     1, std::format("ECHO: failed to open db: {}", result.error())});
             }
@@ -1100,8 +1099,7 @@ public:
         spdlog::info("Echo plugin initialized (fast={}s, slow={}s, db={})", fast_interval,
                      slow_interval, db_path_.string());
         // Leave the offline state and open the dispatch gate, in that order, last.
-        if (ctx.storage_exists(yuzu::echo::kStorageOfflineKey))
-            ctx.storage_delete(yuzu::echo::kStorageOfflineKey);
+        ctx.storage_delete(yuzu::echo::kStorageOfflineKey);
         {
             std::lock_guard lock(offline_mu_);
             offline_ = {};
