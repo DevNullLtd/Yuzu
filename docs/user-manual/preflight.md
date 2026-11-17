@@ -18,7 +18,7 @@ applies your thresholds server-side:
 | **Target App** | app name + min / max version (optional) | the named app is installed and its version is within `[min, max]` |
 | **OS version** | minimum OS version | the device OS version is at or above the floor |
 | **Arch** | required architecture (`x86_64` / `arm64` / `any`) | the device architecture matches |
-| **Free disk** | minimum free GiB (+ optional volume) | free space on the volume is at or above the floor |
+| **Free disk** | minimum free GiB (+ optional volume) | free space on the volume is at or above the floor. The volume must be a local path: a UNC or device spelling (two leading separators, `\\?\`, `\\.\`) or a control byte is refused with `400`, and the agent itself answers a network-mounted, non-fixed-drive or symlinked-into-a-network-mount path with `path_refused:...`, so that device reads as incomplete rather than passing. There is no override; a diskless-NFS-root host needs an explicit local volume |
 | **Pending reboot** | block or warn | no reboot is pending (a pending reboot fails when *block*, or warns when *warn*) |
 
 The Target App check only runs when you give it an app name; the rest always run.
