@@ -29,6 +29,7 @@
 
 #include "test_helpers.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <filesystem>
@@ -202,7 +203,14 @@ struct HiveCleanup {
             rc = RegUnLoadKeyW(HKEY_USERS, wide.c_str());
             if (rc == ERROR_SUCCESS) return;
         }
-        FAIL_CHECK("the mount " << report.mount_name << " stayed loaded: RegUnLoadKeyW rc=" << rc);
+        // with_user_hive may already have unloaded the mount, so a failed unload is a leak only
+        // when the mount is still listed (or the listing itself failed).
+        const auto hku = yuzu::win::enumerate_hku_subkeys_checked();
+        const bool still_listed =
+            std::find(hku.names.begin(), hku.names.end(), report.mount_name) != hku.names.end();
+        if (still_listed || !hku.error.empty())
+            FAIL_CHECK("the mount " << report.mount_name
+                                    << " stayed loaded: RegUnLoadKeyW rc=" << rc);
     }
     ~HiveCleanup() { run(); }
 };
