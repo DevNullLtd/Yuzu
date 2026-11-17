@@ -1358,10 +1358,10 @@ public:
         // See also the member declaration order (spark_engine_ AFTER thread_pool_) so
         // spark is DESTROYED before the pool it may borrow at rung 2.
         // The next-generation event-driven detection engine is stood up here
-        // OBSERVE-ONLY: no consumer is registered at rung 1, so it is not yet wired
-        // to drive Guardian and the legacy IGuard path remains the sole ENFORCING
-        // detection path. Detection cutover is rung 2; enforce is rung 3. Standing it
-        // up now proves the engine runs and reports at rest, so its resource +
+        // OBSERVE-ONLY: Guardian's consumer is wired lifecycle-only (step 1c-ter below)
+        // and prefer_spark_ is false, so no rule is placed on spark and the legacy
+        // IGuard path remains the sole ENFORCING detection path. Detection cutover is
+        // rung 2; enforce is rung 3. Standing it up now proves the engine runs and reports at rest, so its resource +
         // observability envelope can be measured before it carries any load.
         //
         // --spark-disable / YUZU_AGENT_SPARK_DISABLE is a boot-time deploy opt-out:
@@ -1371,7 +1371,7 @@ public:
         // to start (see the DISABLED branch in the heartbeat emit block below).
         // The flag selects exactly one detection path at instantiation, establishing
         // the "old and new never both drive enforce" property the rung-2/3 cutover
-        // leans on (moot at rung 1 - spark has no consumer - but pinned here).
+        // leans on (moot while no rule is placed on spark, but pinned here).
         //
         // spark_detached_workers_ (F3, #2012/#3840 plan "Route A corrected")
         // needs no construction step here - it is already live via its own
@@ -1418,7 +1418,40 @@ public:
                 // counter (it launches no detached workers - only the
                 // Windows SCM half restructures off mech_ops_mu_by_type_).
                 try_register(SparkType::File, make_file_mechanism(spark_detached_workers_));
-                try_register(SparkType::Registry, make_registry_mechanism(spark_detached_workers_));
+                // Registry path verification is OFF unless the operator opted in at boot
+                // (--spark-registry-path-verify-interval, REG-15-I2): the factory's own
+                // default is zero, so passing the clamped config value (0 -> 0) is the
+                // only place the opt-in enters. Ignored off Windows (the factory is null).
+                const auto registry_path_verify = clamp_registry_path_verify(
+                    cfg_.spark_registry_path_verify_interval_s);
+                // ONE effective-state line on every OS, so an operator can read the
+                // verification state of the agent from its log whether or not the
+                // flag applies here. The clamped value is what the factory receives.
+                {
+                    const auto floor_ms = kRegistryPathVerifyFloor.count();
+                    if (registry_path_verify.count() == 0) {
+                        spdlog::info("SparkEngine: Registry path verification: off (default)");
+                    } else {
+#ifdef _WIN32
+                        const auto configured_s = cfg_.spark_registry_path_verify_interval_s;
+                        // 1..4 s was configured and raised to the floor.
+                        const char* note = registry_path_verify.count() > configured_s * 1000
+                                               ? "; the configured value was raised to the floor"
+                                               : "";
+                        spdlog::info("SparkEngine: Registry path verification: every {} ms "
+                                     "(opt-in; floor {} ms){}; each check opens every watched "
+                                     "Registry key",
+                                     registry_path_verify.count(), floor_ms, note);
+#else
+                        spdlog::info("SparkEngine: Registry path verification: every {} ms "
+                                     "(opt-in; floor {} ms) (Windows only; ignored)",
+                                     registry_path_verify.count(), floor_ms);
+#endif
+                    }
+                }
+                try_register(SparkType::Registry,
+                             make_registry_mechanism(spark_detached_workers_,
+                                                     registry_path_verify));
                 try_register(SparkType::Service, make_service_mechanism(spark_detached_workers_));
                 spark_engine_->start();
                 spdlog::info("SparkEngine: instantiated OBSERVE-ONLY (no consumer at rung 1); "
@@ -1446,7 +1479,8 @@ public:
         // or when instantiation threw (records SparkFailed); non-null records
         // Available. The kill-switch flag disambiguates the two null cases. This is
         // the FIRST production call site of wire_spark_engine(); prefer_spark stays
-        // false (2-arg ctor above), so no rule places on spark and detection behavior
+        // false (the explicit prefer_spark=false at GuardianEngine construction
+        // above), so no rule places on spark and detection behavior
         // is unchanged - the wiring exercises construction/shutdown of the spark
         // subsystem before rung 7.7b turns on placement.
         guardian_->wire_spark_engine(
@@ -5016,7 +5050,7 @@ private:
     // header's own doc comment ("Ticketing"). Summed into
     // guardian_active_io_workers() below, additively with guardian_'s own
     // count. First consumer: the Windows Registry mechanism (PR-B1, handed in
-    // via make_registry_mechanism(spark_detached_workers_) in the spark boot
+    // via make_registry_mechanism(spark_detached_workers_, ...) in the spark boot
     // block); File (PR-B2) and the Windows Service mechanism (PR-B3) both
     // followed the same shape.
     //

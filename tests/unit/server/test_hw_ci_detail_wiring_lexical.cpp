@@ -15,7 +15,9 @@
  *      hw_ci_detail_fn`), and no third `ci_detail_fn` composition exists in the file;
  *   2. inside its body, `CiRead::WithSections` selects `get_device_ci_with_sections` (and the
  *      integrity count after it), and every other read mode selects `get_device_ci`;
- *   3. an unwired `device_inventory_store_` degrades `ci` before either store method is named;
+ *   3. an unwired `device_inventory_store_`, or a collation gate that is not Trusted
+ *      (`device_ci_read_gate::refuses(&collation_gate_)`), degrades `ci` before either store method
+ *      is named;
  *   4. the keyset page reader behind the bulk CI read (`hw_ci_page_reader`) is defined once,
  *      captures only `this` and reads `device_inventory_store_` when it is CALLED (a store pointer
  *      snapshotted at construction would dangle or be null), degrades an unwired store to nullopt
@@ -175,6 +177,12 @@ TEST_CASE("build_hw_roster wiring (LEXICAL pin, not behaviour): the CI join is t
     CHECK(count_occurrences(roster_body, ":CiKeyedReadFn{});") == 1);
     // The reader asks the store for exactly the ids it was handed; the whole-table read is gone.
     CHECK(count_occurrences(roster_body, "device_inventory_store_->list_device_ci_for(ids)") == 1);
+    // ... and only after the collation gate, which must be the production gate (never null).
+    const auto roster_gate = roster_body.find("if(device_ci_read_gate::refuses(&collation_gate_))returnstd::nullopt;");
+    const auto roster_read = roster_body.find("device_inventory_store_->list_device_ci_for(ids)");
+    REQUIRE(roster_gate != std::string::npos);
+    CHECK(roster_gate < roster_read);
+    CHECK(count_occurrences(roster_body, "device_ci_read_gate::") == 1);
     CHECK(count_occurrences(roster_body, "list_device_ci(") == 0);
     // It runs on the rows the roster read produced, so it comes after `apply_roster_read`.
     const auto roster = roster_body.find("apply_roster_read(result,eps)");
@@ -214,9 +222,10 @@ TEST_CASE(
     };
     const auto npos = std::string::npos;
 
-    // An unwired store degrades `ci` first, before either store method is named.
-    const auto unwired =
-        pos("if(!device_inventory_store_){detail.ci=std::unexpected(CiReadError::kDegraded);}");
+    // An unwired store or an untrusted collation gate degrades `ci` first, before either store
+    // method is named.
+    const auto unwired = pos("if(!device_inventory_store_||device_ci_read_gate::refuses(&collation_gate_)){"
+                             "detail.ci=std::unexpected(CiReadError::kDegraded);}");
     REQUIRE(unwired != npos);
 
     // The WithSections arm reads the record and sections together (one snapshot), then counts.
@@ -308,4 +317,33 @@ TEST_CASE("hw_ci_page_reader wiring (LEXICAL pin, not behaviour): one closure fe
     CHECK(count_occurrences(flat, ".ci_page_reader=") == 2);
     CHECK(count_occurrences(flat, "ci_page_reader=nullptr") == 0);
     CHECK(count_occurrences(flat, "ci_page_reader={}") == 0);
+}
+
+// #7730: the collation read gate (device_ci_read_gate.hpp). Every device_ci read that can answer
+// wrongly while the gate is not Trusted asks it, and a NULL gate means "no gate wired" and serves,
+// so a closure that silently defaulted to null would serve wrong answers with every unit test green
+// (the tests build their deps by hand). This pins the production wiring: BOTH bulk-read consumers
+// are handed `&collation_gate_` (never null), and each transport passes its deps' gate to
+// `read_page`. The per-id and roster closures are pinned in the two cases above.
+TEST_CASE("collation read gate wiring (LEXICAL pin, not behaviour): both bulk-read consumers are "
+          "handed the production gate and pass it to read_page",
+          "[hardware][wiring][lexical][collation_gate]") {
+    const std::string flat = squeeze(comment_free_source("server.cpp"));
+
+    CHECK(count_occurrences(flat, ".ci_collation_gate=&collation_gate_,") == 1);
+    CHECK(count_occurrences(flat, "tool_deps.ci_collation_gate=&collation_gate_;") == 1);
+    // The member is assigned in those two places only, and never to null or an empty value.
+    CHECK(count_occurrences(flat, "ci_collation_gate=") == 2);
+    CHECK(count_occurrences(flat, "ci_collation_gate=nullptr") == 0);
+    CHECK(count_occurrences(flat, "ci_collation_gate={}") == 0);
+
+    // Each transport's one `read_page` call passes the gate its deps carry.
+    const std::string rest = squeeze(comment_free_source("hardware_routes.cpp"));
+    CHECK(count_occurrences(rest, "hardware_ci_page::read_page(") == 1);
+    CHECK(count_occurrences(rest, "hardware_ci_page::read_page(deps_.ci_page_reader,rq,gate.scope,"
+                                  "deps_.ci_collation_gate)") == 1);
+    const std::string mcp = squeeze(comment_free_source("mcp_tools_hardware.cpp"));
+    CHECK(count_occurrences(mcp, "hardware_ci_page::read_page(") == 1);
+    CHECK(count_occurrences(mcp, "hardware_ci_page::read_page(deps->ci_page_reader,*rq,gate.scope,"
+                                 "deps->ci_collation_gate)") == 1);
 }

@@ -10,6 +10,7 @@
 
 #include "pg/pg_collation_check.hpp"
 
+#include "device_inventory_store.hpp" // kDeviceInventoryStoreSchema
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
@@ -22,11 +23,15 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <libpq-fe.h>
+#include <spdlog/sinks/base_sink.h>
 
+#include <atomic>
 #include <initializer_list>
 #include <chrono>
 #include <functional>
 #include <memory>
+#include <mutex>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -37,8 +42,8 @@ using namespace yuzu::server::pg;
 namespace {
 
 CollationFacts facts(bool column, std::optional<std::string> recorded,
-                     std::optional<std::string> actual) {
-    return CollationFacts{column, std::move(recorded), std::move(actual)};
+                     std::optional<std::string> actual, bool invalid_index = false) {
+    return CollationFacts{column, std::move(recorded), std::move(actual), invalid_index};
 }
 
 CollationReport report(CollationVerdict v, std::string recorded = "", std::string actual = "") {
@@ -58,6 +63,39 @@ bool has_series(yuzu::MetricsRegistry& m) {
     const std::string sample = std::string("\n") + kCollationMismatchGauge + " ";
     return ("\n" + text).find(sample) != std::string::npos;
 }
+
+// The seam for "the best-effort metric/log work of a report throws": the default logger is
+// swapped for one whose sink throws on every record it is asked to write, and whose error handler
+// rethrows, so the exception leaves the spdlog call inside `report_collation_check` (spdlog would
+// otherwise swallow it). Only records at or above `lvl` reach the sink, so a test picks which log
+// line throws (ERROR: the mismatch entry). `report_collation_check` is noexcept and catches it,
+// leaving `state` behind: the lagging-state condition under test.
+struct ThrowingDefaultLogger {
+    struct ThrowingSink : spdlog::sinks::base_sink<std::mutex> {
+        void sink_it_(const spdlog::details::log_msg&) override {
+            throw std::runtime_error("test sink throws");
+        }
+        void flush_() override {}
+    };
+    explicit ThrowingDefaultLogger(spdlog::level::level_enum lvl)
+        : prev_(spdlog::default_logger()) {
+        auto logger =
+            std::make_shared<spdlog::logger>("test_throwing_logger", std::make_shared<ThrowingSink>());
+        logger->set_level(lvl);
+        logger->set_error_handler(
+            [](const std::string&) { throw std::runtime_error("test error handler rethrows"); });
+        spdlog::set_default_logger(logger);
+    }
+    ~ThrowingDefaultLogger() {
+        spdlog::drop("test_throwing_logger");
+        spdlog::set_default_logger(prev_);
+    }
+    ThrowingDefaultLogger(const ThrowingDefaultLogger&) = delete;
+    ThrowingDefaultLogger& operator=(const ThrowingDefaultLogger&) = delete;
+
+private:
+    std::shared_ptr<spdlog::logger> prev_;
+};
 
 // A state reached by a conclusive verdict, optionally followed by an unreadable spell.
 CollationState st(CollationLast last, bool unreadable = false) {
@@ -106,11 +144,154 @@ TEST_CASE("collation verdict: every combination of the three facts", "[pg_collat
     CHECK(decide_collation_verdict(facts(true, "", "2.36")) == CollationVerdict::Mismatch);
 }
 
+// CI-3, the hold-only guard. An invalid index changes the answer ONLY when the versions are equal
+// (Ok becomes Unreadable, so the gate is held and never written); it can never turn any other
+// verdict into Mismatch. Kills: Ok on equal versions while an invalid index exists, a guard that
+// ENTERS Mismatch, and a guard that disturbs a NotApplicable or Mismatch answer.
+TEST_CASE("collation verdict: an invalid index only holds equal versions", "[pg_collation][decision]") {
+    CHECK(decide_collation_verdict(facts(true, "2.36", "2.36", true)) ==
+          CollationVerdict::Unreadable);
+    CHECK(decide_collation_verdict(facts(true, "", "", true)) == CollationVerdict::Unreadable);
+    CHECK(decide_collation_verdict(facts(true, "2.36", "2.36", false)) == CollationVerdict::Ok);
+    // Not equal: still a Mismatch, with or without the invalid index.
+    CHECK(decide_collation_verdict(facts(true, "2.36", "2.39", true)) ==
+          CollationVerdict::Mismatch);
+    // Nothing to compare: the fact is irrelevant.
+    CHECK(decide_collation_verdict(facts(false, "2.36", "2.36", true)) ==
+          CollationVerdict::NotApplicable);
+    CHECK(decide_collation_verdict(facts(true, std::nullopt, "2.39", true)) ==
+          CollationVerdict::NotApplicable);
+    CHECK(decide_collation_verdict(facts(true, "2.36", std::nullopt, true)) ==
+          CollationVerdict::Unreadable);
+    // No combination of the four facts ever yields Mismatch unless both versions are known and
+    // differ: the guard cannot enter Mismatch by itself.
+    for (const bool column : {false, true})
+        for (const bool invalid : {false, true})
+            for (const auto& rec : {std::optional<std::string>{}, std::optional<std::string>{"v"}})
+                for (const auto& act :
+                     {std::optional<std::string>{}, std::optional<std::string>{"v"}}) {
+                    const auto v = decide_collation_verdict(facts(column, rec, act, invalid));
+                    CHECK(v != CollationVerdict::Mismatch);
+                }
+}
+
+TEST_CASE("collation verdict: the invalid-index failure text names the cause and the repair",
+          "[pg_collation][decision]") {
+    const std::string text = invalid_index_failure_text();
+    CHECK(text.find("an invalid index exists in schema device_inventory_store") !=
+          std::string::npos);
+    CHECK(text.find("REINDEX ... CONCURRENTLY") != std::string::npos);
+    CHECK(text.find("drop or rebuild it") != std::string::npos);
+    CHECK(text.find("the gate is held") != std::string::npos);
+}
+
 TEST_CASE("collation verdict: fixed names", "[pg_collation][decision]") {
     CHECK(std::string(to_string(CollationVerdict::Ok)) == "ok");
     CHECK(std::string(to_string(CollationVerdict::NotApplicable)) == "not_applicable");
     CHECK(std::string(to_string(CollationVerdict::Mismatch)) == "mismatch");
     CHECK(std::string(to_string(CollationVerdict::Unreadable)) == "unreadable");
+}
+
+TEST_CASE("collation gate: gate_for maps every CollationLast", "[pg_collation][gate]") {
+    static_assert(gate_for(CollationLast::None) == CollationGate::Unproven);
+    static_assert(gate_for(CollationLast::Ok) == CollationGate::Trusted);
+    static_assert(gate_for(CollationLast::NotApplicable) == CollationGate::Trusted);
+    static_assert(gate_for(CollationLast::Mismatch) == CollationGate::Mismatch);
+
+    CHECK(gate_for(CollationLast::None) == CollationGate::Unproven);
+    CHECK(gate_for(CollationLast::Ok) == CollationGate::Trusted);
+    CHECK(gate_for(CollationLast::NotApplicable) == CollationGate::Trusted);
+    CHECK(gate_for(CollationLast::Mismatch) == CollationGate::Mismatch);
+    CHECK(std::string(to_string(CollationGate::Trusted)) == "trusted");
+    CHECK(std::string(to_string(CollationGate::Mismatch)) == "mismatch");
+    CHECK(std::string(to_string(CollationGate::Unproven)) == "unproven");
+}
+
+TEST_CASE("collation gate: a boot with no conclusive answer is never Trusted",
+          "[pg_collation][gate]") {
+    static_assert(kInitialCollationGate == CollationGate::Unproven);
+    std::atomic<CollationGate> gate{kInitialCollationGate};
+    CHECK(gate.load() == CollationGate::Unproven);
+}
+
+TEST_CASE("collation gate: published from the surviving state, not from the verdict",
+          "[pg_collation][gate]") {
+    const auto run = [](std::initializer_list<CollationVerdict> verdicts) {
+        std::atomic<CollationGate> gate{kInitialCollationGate};
+        CollationState state;
+        for (const auto v : verdicts)
+            report_collation_check(report(v, "a", v == CollationVerdict::Mismatch ? "b" : "a"),
+                                   nullptr, state, &gate);
+        return gate.load();
+    };
+    using V = CollationVerdict;
+    CHECK(run({V::Ok, V::Mismatch}) == CollationGate::Mismatch);
+    // An unreadable check during a standing mismatch must not reopen the gate.
+    CHECK(run({V::Mismatch, V::Unreadable}) == CollationGate::Mismatch);
+    CHECK(run({V::Mismatch, V::Unreadable, V::Unreadable}) == CollationGate::Mismatch);
+    CHECK(run({V::Mismatch, V::Unreadable, V::Ok}) == CollationGate::Trusted);
+    CHECK(run({V::Ok, V::Unreadable}) == CollationGate::Trusted);
+    CHECK(run({V::NotApplicable}) == CollationGate::Trusted);
+    CHECK(run({V::Mismatch, V::NotApplicable}) == CollationGate::Trusted);
+    // Nothing conclusive yet stays Unproven.
+    CHECK(run({V::Unreadable}) == CollationGate::Unproven);
+    CHECK(run({V::Unreadable, V::Unreadable}) == CollationGate::Unproven);
+}
+
+// SG-1 / ARCH-1 / CI-1. `state` advances only after the metric and log work, so a throw there
+// leaves it behind the gate. An Unreadable report recomputed from that stale state would store
+// Trusted over a standing Mismatch (writes resume). Kills: publishing the gate on an Unreadable
+// report. The pin demands Mismatch exactly, not merely "not Trusted".
+TEST_CASE("collation gate: an Unreadable report never writes the gate, so a lagging state cannot "
+          "reopen a standing Mismatch",
+          "[pg_collation][gate]") {
+    std::atomic<CollationGate> gate{kInitialCollationGate};
+    CollationState state;
+
+    SECTION("Ok, a Mismatch whose log work throws, then Unreadable: the gate stays Mismatch") {
+        report_collation_check(report(CollationVerdict::Ok, "a", "a"), nullptr, state, &gate);
+        REQUIRE(gate.load() == CollationGate::Trusted);
+        {
+            // The mismatch ERROR line is the work that throws.
+            ThrowingDefaultLogger throwing(spdlog::level::err);
+            report_collation_check(report(CollationVerdict::Mismatch, "a", "b"), nullptr, state,
+                                   &gate);
+        }
+        // The conclusive verdict was published before the throw; the state was not advanced.
+        REQUIRE(gate.load() == CollationGate::Mismatch);
+        REQUIRE(state.last == CollationLast::Ok);
+
+        report_collation_check(report(CollationVerdict::Unreadable), nullptr, state, &gate);
+        CHECK(gate.load() == CollationGate::Mismatch);
+        report_collation_check(report(CollationVerdict::Unreadable), nullptr, state, &gate);
+        CHECK(gate.load() == CollationGate::Mismatch);
+
+        // A later conclusive verdict still moves it, in both directions.
+        report_collation_check(report(CollationVerdict::Ok, "a", "a"), nullptr, state, &gate);
+        CHECK(gate.load() == CollationGate::Trusted);
+    }
+    SECTION("from a fresh state a first Unreadable leaves Unproven") {
+        report_collation_check(report(CollationVerdict::Unreadable), nullptr, state, &gate);
+        CHECK(gate.load() == CollationGate::Unproven);
+        report_collation_check(report(CollationVerdict::Unreadable), nullptr, state, &gate);
+        CHECK(gate.load() == CollationGate::Unproven);
+    }
+    SECTION("an Unreadable report leaves whatever the gate holds, whatever the state says") {
+        // The gate is not derived from `state` on an Unreadable report at all.
+        gate.store(CollationGate::Mismatch);
+        report_collation_check(report(CollationVerdict::Unreadable), nullptr, state, &gate);
+        CHECK(gate.load() == CollationGate::Mismatch);
+    }
+}
+
+TEST_CASE("collation gate: publishing through a null pointer is a no-op", "[pg_collation][gate]") {
+    CollationState state;
+    REQUIRE_NOTHROW(report_collation_check(report(CollationVerdict::Mismatch, "a", "b"), nullptr,
+                                           state, nullptr));
+    CHECK(state.last == CollationLast::Mismatch);
+    // The default argument is the same no-op.
+    REQUIRE_NOTHROW(report_collation_check(report(CollationVerdict::Ok, "a", "a"), nullptr, state));
+    CHECK(state.last == CollationLast::Ok);
 }
 
 TEST_CASE("collation state machine: every (previous state, verdict) pair",
@@ -672,4 +853,118 @@ TEST_CASE("collation check against a real database: a recorded version with none
     CHECK_FALSE(admin_sql("ALTER DATABASE " + quoted_name + " REFRESH COLLATION VERSION", &error));
     CHECK(error.find("invalid collation version change") != std::string::npos);
     CHECK(check_collation_version(pool).verdict == CollationVerdict::Unreadable);
+}
+
+// CI-3 against a real database. REFRESH COLLATION VERSION makes the recorded version equal the
+// actual one whether or not the indexes were rebuilt, and a REINDEX ... CONCURRENTLY that failed
+// leaves an INVALID index behind. With such an index in the store schema the check must not
+// conclude Ok: Unreadable never writes the gate, so a standing Mismatch holds through the REFRESH,
+// and clearing the invalid flag lets the next check conclude Trusted. An invalid index can never
+// enter Mismatch (a Trusted gate stays Trusted) and one in an unrelated schema changes nothing.
+// A failed REINDEX CONCURRENTLY is emulated by marking a valid index invalid in pg_index, which
+// needs a superuser (skipped otherwise).
+TEST_CASE("collation check against a real database: an invalid index in the store schema holds a "
+          "standing Mismatch through a REFRESH, and clearing it lets the next check conclude "
+          "Trusted",
+          "[pg][pg_collation]") {
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    const auto sql = [&](const std::string& text, std::string* error = nullptr) {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto res = exec_params(lease.get(), text.c_str(), std::vector<std::string>{});
+        if (error != nullptr)
+            *error = PQerrorMessage(lease.get());
+        return res.status() == PGRES_COMMAND_OK;
+    };
+
+    const CollationReport first = check_collation_version(pool);
+    INFO("verdict=" << to_string(first.verdict) << " failure=" << first.failure
+                    << " recorded=" << first.recorded << " actual=" << first.actual);
+    if (first.verdict == CollationVerdict::NotApplicable)
+        SKIP("this PostgreSQL has no recorded collation version for the test database (libc "
+             "C/POSIX locale or a server before 15)");
+    if (first.verdict == CollationVerdict::Mismatch && !first.recorded.empty() &&
+        !first.actual.empty() && first.recorded != first.actual)
+        SKIP("this cluster's template database already has a collation version mismatch; a "
+             "clean start is needed");
+    REQUIRE(first.verdict == CollationVerdict::Ok);
+
+    // The probe tables carry a primary key (a unique index) each: one in the store schema, one in
+    // an unrelated schema.
+    const std::string store_schema = yuzu::server::kDeviceInventoryStoreSchema;
+    std::string error;
+    REQUIRE(sql("CREATE SCHEMA IF NOT EXISTS " + quote_identifier(store_schema), &error));
+    REQUIRE(sql("CREATE SCHEMA IF NOT EXISTS yuzu_test_unrelated", &error));
+    REQUIRE(sql("CREATE TABLE " + quote_identifier(store_schema) +
+                    ".collation_probe (k text PRIMARY KEY)",
+                &error));
+    REQUIRE(sql("CREATE TABLE yuzu_test_unrelated.collation_probe (k text PRIMARY KEY)", &error));
+    const auto set_valid = [&](const std::string& schema, bool valid) {
+        std::string err;
+        const bool ok = sql("UPDATE pg_index SET indisvalid = " + std::string(valid ? "true" : "false") +
+                                " WHERE indexrelid = '" + quote_identifier(schema) +
+                                ".collation_probe_pkey'::regclass",
+                            &err);
+        if (!ok)
+            SKIP("the test role cannot update pg_index (not a superuser): " << err);
+    };
+
+    SECTION("an invalid index in an unrelated schema changes nothing") {
+        set_valid("yuzu_test_unrelated", false);
+        CHECK(check_collation_version(pool).verdict == CollationVerdict::Ok);
+    }
+
+    SECTION("a standing Mismatch holds through REFRESH while the index is invalid") {
+        std::atomic<CollationGate> gate{kInitialCollationGate};
+        CollationState state;
+        report_collation_check(first, nullptr, state, &gate);
+        REQUIRE(gate.load() == CollationGate::Trusted);
+
+        // Drift: the recorded version no longer equals the actual one.
+        if (!sql("UPDATE pg_database SET datcollversion = '0.0.bogus' "
+                 "WHERE datname = current_database()",
+                 &error))
+            SKIP("the test role cannot update pg_database (not a superuser): " << error);
+        const CollationReport drifted = check_collation_version(pool);
+        REQUIRE(drifted.verdict == CollationVerdict::Mismatch);
+        report_collation_check(drifted, nullptr, state, &gate);
+        REQUIRE(gate.load() == CollationGate::Mismatch);
+
+        // The operator's failed REINDEX CONCURRENTLY leaves an invalid index; REFRESH runs anyway.
+        set_valid(store_schema, false);
+        REQUIRE(sql("ALTER DATABASE " + quote_identifier(db.db_name()) +
+                        " REFRESH COLLATION VERSION",
+                    &error));
+        for (int i = 0; i < 2; ++i) {
+            const CollationReport held = check_collation_version(pool);
+            INFO("verdict=" << to_string(held.verdict) << " failure=" << held.failure);
+            CHECK(held.verdict == CollationVerdict::Unreadable);
+            CHECK(held.failure == invalid_index_failure_text());
+            report_collation_check(held, nullptr, state, &gate);
+            CHECK(gate.load() == CollationGate::Mismatch); // held, not reopened
+            CHECK(state.last == CollationLast::Mismatch);
+        }
+
+        // The invalid index is repaired: the next check concludes and the gate lifts.
+        set_valid(store_schema, true);
+        const CollationReport clear = check_collation_version(pool);
+        CHECK(clear.verdict == CollationVerdict::Ok);
+        report_collation_check(clear, nullptr, state, &gate);
+        CHECK(gate.load() == CollationGate::Trusted);
+    }
+
+    SECTION("with no standing Mismatch an invalid index never enters one: a Trusted gate stays "
+            "Trusted") {
+        std::atomic<CollationGate> gate{kInitialCollationGate};
+        CollationState state;
+        report_collation_check(first, nullptr, state, &gate);
+        REQUIRE(gate.load() == CollationGate::Trusted);
+        set_valid(store_schema, false);
+        const CollationReport held = check_collation_version(pool);
+        CHECK(held.verdict == CollationVerdict::Unreadable);
+        report_collation_check(held, nullptr, state, &gate);
+        CHECK(gate.load() == CollationGate::Trusted);
+    }
 }

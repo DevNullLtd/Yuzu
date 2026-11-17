@@ -134,6 +134,7 @@
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 #include "pg/secret_codec.hpp"
+#include "device_ci_read_gate.hpp"
 #include "device_inventory_store.hpp"
 #include "software_inventory_store.hpp"
 #include "software_licensing_store.hpp"
@@ -2308,7 +2309,8 @@ public:
         metrics_.describe(pg::kCollationCheckCounter,
                           "Total PostgreSQL collation version checks by result (ok, mismatch, "
                           "not_applicable, unreadable); unreadable means the facts could not be "
-                          "read or the operating system reported no version",
+                          "read, the operating system reported no version, or the versions are "
+                          "equal while an invalid index exists in the device inventory schema",
                           "counter");
         metrics_.describe(
             pg::kCollationLastCompletedGauge,
@@ -2320,6 +2322,16 @@ public:
         // Pre-seeded so every result reads 0, not absent, before it first happens
         // (docs/observability-conventions.md): the closed set is pg::all_collation_verdicts().
         pg::seed_collation_metrics(metrics_);
+        // device_ci write pause (a collation mismatch): one increment per refused write. Closed
+        // `op` set, both series pre-seeded so an idle server reads 0, not absent.
+        metrics_.describe("yuzu_device_ci_writes_deferred_total",
+                          "device_ci writes refused because the PostgreSQL collation gate reads "
+                          "mismatch, by op (ingest = a report answered need_full without being "
+                          "stored, delete = a decommission removal not attempted); a sustained "
+                          "rate means device_ci is paused until the collation is repaired",
+                          "counter");
+        for (const auto op : {"ingest", "delete"})
+            metrics_.counter("yuzu_device_ci_writes_deferred_total", {{"op", op}});
         // HA WS-8 (ADR-2002 §12): the runtime reachability probe behind /readyz.
         metrics_.describe("yuzu_server_pg_reachable",
                           "1 when this replica's dedicated reachability probe can reach a writable "
@@ -2353,8 +2365,10 @@ public:
         metrics_.describe("yuzu_inventory_ingest_total",
                           "Inventory-report ingest outcomes by source and outcome "
                           "(stored/touched/need_full/error/dropped/rejected/rejected_depth; deferred = "
-                          "a report skipped because another report for the same agent held its "
-                          "lock, certificate_inventory only - not a failure)",
+                          "a report skipped without being read or written, not a failure: for "
+                          "certificate_inventory because another report for the same agent held "
+                          "its lock, for device_ci because device_ci writes are paused by a "
+                          "PostgreSQL collation mismatch and the agent was told to resend)",
                           "counter");
         // Closed facet x outcome label set, pre-seeded so the first refused section counts.
         seed_section_ingest_series(metrics_);
@@ -5699,7 +5713,9 @@ public:
                 // The probe lease is released here. At start, before any store serves: compare the
                 // database's recorded collation version with the operating system's. Never stops
                 // the server (logs, exports yuzu_pg_collation_version_mismatch), so an operator can
-                // start it to fix the database; a failed check does not either. It gates nothing.
+                // start it to fix the database; a failed check does not either. It does publish
+                // collation_gate_ (pg_collation_check.hpp), which pauses device_ci writes on a
+                // mismatch and refuses the CI reads until a check has found a match.
                 // Like every query this constructor runs before the listener binds, it has no
                 // client-side deadline against a backend that is frozen while its connection keeps
                 // acknowledging data (the 5 s bounds are the pool acquire and server-side
@@ -5709,7 +5725,7 @@ public:
                 // this call leaves in collation_state_. See pg/pg_collation_check.hpp.
                 if (pg_probe_ok)
                     pg::report_collation_check(pg::check_collation_version(*pg_pool_), &metrics_,
-                                               collation_state_);
+                                               collation_state_, &collation_gate_);
             }
         }
 
@@ -8786,6 +8802,9 @@ public:
                 startup_failed_ = true;
             } else {
                 device_inventory_store_->set_metrics(&metrics_);
+                // Pause device_ci writes while the collation gate reads Mismatch. collation_gate_
+                // is declared before every store, so it outlives this borrow.
+                device_inventory_store_->set_write_gate(&collation_gate_);
                 agent_service_.set_device_inventory_store(device_inventory_store_.get());
                 if (gateway_service_)
                     gateway_service_->set_device_inventory_store(device_inventory_store_.get());
@@ -9980,18 +9999,27 @@ public:
                     pg_collation_recheck_ = std::make_unique<PgCollationRecheck>(
                         [this] { return pg::check_collation_version(*pg_pool_); }, &metrics_,
                         kCollationRecheckInterval, collation_state_,
-                        kCollationUnsettledRecheckInterval);
+                        kCollationUnsettledRecheckInterval, &collation_gate_);
                     // The repeat is optional (the start-time check has already reported), so a
                     // refusal to create its thread (a task or thread limit) degrades instead of
-                    // failing the boot: the check only reports. Without the repeat the last-
-                    // completed gauge stops advancing and YuzuPgCollationCheckStale fires.
+                    // failing the boot: the check does not stop the server. Without the repeat the
+                    // last-completed gauge stops advancing and YuzuPgCollationCheckStale fires,
+                    // and collation_gate_ keeps the value the start-time check left. That is not
+                    // harmless: nothing will ever lift the gate, so a Mismatch or Unproven gate
+                    // stays until a restart, with device_ci writes paused (Mismatch) and the CI
+                    // reads refused (either). Hence ERROR, not warn. No retry is attempted.
                     try {
                         pg_collation_recheck_->start();
                     } catch (const std::exception& e) {
-                        spdlog::warn("[PG] could not start the collation version recheck thread "
-                                     "(continuing with the start-time check only; the repeat will "
-                                     "not run): {}",
-                                     ::yuzu::log_key_token(e.what()));
+                        spdlog::error(
+                            "[PG] could not start the collation version recheck thread ({}); the "
+                            "collation gate will NOT be rechecked: a Mismatch or Unproven gate "
+                            "stays until this server restarts, so device_ci writes stay paused "
+                            "(Mismatch) and the device CI reads stay refused (Mismatch or "
+                            "Unproven) until then. Restart this server once the thread or task "
+                            "limit is fixed. See docs/user-manual/server-admin.md, 'PostgreSQL "
+                            "collation version'. The server keeps running.",
+                            ::yuzu::log_key_token(e.what()));
                         pg_collation_recheck_.reset();
                     }
                 }
@@ -11623,7 +11651,7 @@ public:
             if (software_normalization_job_)
                 software_normalization_job_->request_stop();
             // The collation recheck is told to stop here too, without a join: a check in flight can
-            // take about 15 s in practice (up to about 35 s on a network that drops packets, see the join
+            // take about 20 s in practice (up to about 40 s on a network that drops packets, see the join
             // below) and signalled now it overlaps the drain and the web server stop instead of
             // being added after them. Its join is the LAST step before pg_pool_ is reset.
             if (pg_collation_recheck_)
@@ -12962,9 +12990,9 @@ public:
         // flush above (an orchestrator kill during the wait would skip them). request_stop() was
         // called at the start of the drain, so the check has been running alongside the drain and
         // the rest of teardown; the join waits only for what is left of it. With the pool defaults
-        // that is about 15 s in practice (the 5 s acquire and two 5 s statements,
+        // that is about 20 s in practice (the 5 s acquire and up to three 5 s statements,
         // pg_collation_check.hpp; the BEGIN and SET LOCAL before them run under the pool's 30 s
-        // statement timeout and normally return at once), up to about 35 s if the network drops packets (a new connection
+        // statement timeout and normally return at once), up to about 40 s if the network drops packets (a new connection
         // adds the pool's 10 s connect timeout and a silent connection is given up on by
         // tcp_user_timeout_ms, 10 s by default, which statement_timeout cannot enforce;
         // pg_pool.hpp). It is NOT bounded against a backend that is frozen while its connection
@@ -21085,8 +21113,14 @@ private:
             // regardless) - mirrors the Hardware CI record's CiDetailFn contract.
             // KNOWN FOLLOW-UP (#1783): the read is still up to roster-size rows per render, unlike
             // the Software tab's hourly rollup (software_catalog_rollup.cpp).
+            // The collation gate (device_ci_read_gate.hpp): while it is not Trusted the keyed read
+            // would answer by the text primary key and miss stored devices, so it is not made and
+            // the columns degrade (`ci_degraded`), exactly as for a failed read.
             apply_ci_read(result, device_inventory_store_
-                                      ? CiKeyedReadFn{[this](const std::vector<std::string>& ids) {
+                                      ? CiKeyedReadFn{[this](const std::vector<std::string>& ids)
+                                                          -> std::optional<std::vector<DeviceCiRecord>> {
+                                            if (device_ci_read_gate::refuses(&collation_gate_))
+                                                return std::nullopt;
                                             return device_inventory_store_->list_device_ci_for(ids);
                                         }}
                                       : CiKeyedReadFn{});
@@ -21168,7 +21202,10 @@ private:
             apply_identity_read(detail, hw_identity_fn(agent_id));
             if (auto sess = registry_.get_session(agent_id))
                 detail.agent_version = sess->agent_version; // immutable identity field, lock-free
-            if (!device_inventory_store_) {
+            // An unwired store, or a collation gate that is not Trusted (device_ci_read_gate.hpp:
+            // the by-id read would miss a stored device), degrades `ci` before either store method
+            // is named; no sections read is made, so the record answers `degraded`, not `absent`.
+            if (!device_inventory_store_ || device_ci_read_gate::refuses(&collation_gate_)) {
                 detail.ci = std::unexpected(CiReadError::kDegraded);
             } else if (ci_read == CiRead::WithSections) {
                 // The v2 per-section statuses and rows (H.7): ONLY the REST record route and the
@@ -21457,6 +21494,7 @@ private:
                              .roster_fn = build_hw_roster,
                              .ci_detail_fn = hw_ci_detail_fn,
                              .ci_page_reader = hw_ci_page_reader,
+                             .ci_collation_gate = &collation_gate_,
                              // Actions lens (generic action runner): the connected
                              // agent's advertised plugins/actions, copied into the
                              // gRPC-free HwPluginActions shape.
@@ -24431,6 +24469,7 @@ private:
             tool_deps.roster_fn = build_hw_roster;
             tool_deps.ci_detail_fn = hw_ci_detail_fn;
             tool_deps.ci_page_reader = hw_ci_page_reader;
+            tool_deps.ci_collation_gate = &collation_gate_;
             tool_deps.dex_score_fn = hw_dex_score_fn;
             tool_deps.quarantine_list_fn = hw_quarantine_list_fn;
             // /crypto widgets: list_crypto_widgets' availability, get_crypto_ca_stats' R2
@@ -25338,6 +25377,14 @@ private:
     /// every Postgres-backed store (declared later) releases its PgPool& and
     /// every ingest thread (agent_service_, declared later) has already stopped.
     std::unique_ptr<pg::PgPool> pg_pool_;
+    /// The collation gate the check publishes (lock-free). Declared right after pg_pool_ and
+    /// BEFORE every borrower on purpose, so it is destroyed after all of them. The borrowers are:
+    /// `device_inventory_store_` (`set_write_gate`, the write pause), `pg_collation_recheck_` (the
+    /// publisher, handed `&collation_gate_`), `hardware_routes_` (`Deps::ci_collation_gate` plus
+    /// the roster and per-id closures that read it) and `mcp_server_` (`ToolDeps::ci_collation_gate`
+    /// plus the same closures). The initialiser is `kInitialCollationGate` (Unproven), never
+    /// Trusted. tests/test_pg_collation_check_wiring_lexical.py pins the order and the initialiser.
+    std::atomic<pg::CollationGate> collation_gate_{pg::kInitialCollationGate};
     detail::EventBus event_bus_;
     detail::AgentRegistry registry_;
     /// Fleet health aggregation (heartbeat status_tags -> yuzu_fleet_* gauges, and the per-device
