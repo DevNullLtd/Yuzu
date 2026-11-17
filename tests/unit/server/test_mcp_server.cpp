@@ -56684,7 +56684,7 @@ TEST_CASE("MCP execute_instruction bridge: a REAL RbacStore mixed grant is proje
 // ── UP-14 server PR A5a: the stored per-agent ordering state on the two MCP twins ──
 // get_guardian_status gains unordered_agents / unordered_agent_ids (scoped by the same
 // require_list_read gate as errored_rules); get_guardian_device_guards gains the `ordering` block.
-// Stored and counted, not yet compared.
+// The census verdicts the pair decides are pinned in test_census_pair_order.cpp.
 namespace {
 
 void mcp_seed_paired(GuaranteedStateStore& store, const std::string& event_id,
@@ -56895,7 +56895,8 @@ TEST_CASE("MCP Guardian: the output schemas declare the ordering fields, require
     const std::string sdesc = status["description"].get<std::string>();
     CHECK(sdesc.size() < 4096);
     CHECK(sdesc.find("unordered_agents") != std::string::npos);
-    CHECK(sdesc.find("not yet compared") != std::string::npos);
+    CHECK(sdesc.find("orders a census verdict by the emit-order pair") != std::string::npos);
+    CHECK(sdesc.find("not yet compared") == std::string::npos); // the pre-B wording is gone
 
     const auto guards = tool("get_guardian_device_guards");
     const auto& gs = guards["outputSchema"];
@@ -56919,7 +56920,8 @@ TEST_CASE("MCP Guardian: the output schemas declare the ordering fields, require
     CHECK(gdesc.size() < 4096);
     CHECK(gdesc.find("ordering") != std::string::npos);
     CHECK(gdesc.find("pair_duplicates") != std::string::npos);
-    CHECK(gdesc.find("not yet compared") != std::string::npos);
+    CHECK(gdesc.find("classify each census-bearing first delivery") != std::string::npos);
+    CHECK(gdesc.find("not yet compared") == std::string::npos); // the pre-B wording is gone
 }
 
 // ═════════════════════════════════════════════════════════════════════════

@@ -64,6 +64,7 @@
 #include "capability_decls/plugin_action_catalogue_mgmt_posture.hpp"
 #include "capability_decls/plugin_action_catalogue_shares.hpp"
 #include "capability_decls/plugin_action_catalogue_remote_access_audit.hpp"
+#include "capability_decls/plugin_action_catalogue_process_introspect.hpp"
 #include "command_capability.hpp"
 #include "dispatch_caller.hpp"
 
@@ -430,6 +431,33 @@ TEST_CASE("remote_access_audit: the REAL catalogue fragment is Forensics-securab
     CommandCapabilityRegistry registry{
         yuzu::server::capdecls::plugin_action_catalogue_remote_access_audit()};
     auto classified = registry.classify("remote_access_audit", "list");
+    REQUIRE(classified.has_value());
+    CHECK(classified->securable == kForensicsSecurable);
+    CHECK(requires_explicit_targets(*classified));
+
+    const auto targeted = evaluate_destructive_targeting(classified,
+                                                          /*valid_nonempty_agent_ids=*/true,
+                                                          /*scope_key_present=*/false,
+                                                          /*agent_id_count=*/1);
+    CHECK(targeted.verdict == DestructiveTargetingVerdict::Targeted);
+    for (const std::size_t n : {std::size_t{0}, std::size_t{2}}) {
+        const auto refused = evaluate_destructive_targeting(classified,
+                                                             /*valid_nonempty_agent_ids=*/n != 0,
+                                                             /*scope_key_present=*/false,
+                                                             /*agent_id_count=*/n);
+        CHECK(refused.verdict == DestructiveTargetingVerdict::RefuseUntargeted);
+        CHECK(refused.refusal_reason == kReasonForensicUntargeted);
+        CHECK(refused.refusal_message == kForensicUntargetedMessage);
+    }
+}
+
+TEST_CASE("process_introspect: the REAL catalogue fragment is Forensics-securable and gates "
+          "as single-target — one agent id is Targeted; zero or two are refused — so a drift in "
+          "the shipped securable string (the Forensics literal the gate keys on) fails here",
+          "[server][dispatch][security]") {
+    CommandCapabilityRegistry registry{
+        yuzu::server::capdecls::plugin_action_catalogue_process_introspect()};
+    auto classified = registry.classify("process_introspect", "inspect");
     REQUIRE(classified.has_value());
     CHECK(classified->securable == kForensicsSecurable);
     CHECK(requires_explicit_targets(*classified));

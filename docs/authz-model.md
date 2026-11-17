@@ -383,7 +383,7 @@ schedule-creation time), never by a broadcast exemption carved into this targeti
 surface may cite this exception; every other caller of a Forensics-classified row stays
 single-target, no exceptions.
 
-**The Forensics plugins.** The capability catalogue holds 10 `Forensics` rows over 5 plugins (`app_usage`, `browser_inventory`, `execution_artifacts`, `privacy_permissions`, `remote_access_audit`); `test_capability_catalogue.cpp` pins the plugin set and the row count. `execution_artifacts`, `browser_inventory`, `privacy_permissions` and `remote_access_audit` are default-off behind a plugin-config kill switch seeded at server start (`PluginConfigStore::seed_kill_switch_default_off`, `server.cpp`); `app_usage` also has a dedicated read surface (below).
+**The Forensics plugins.** The capability catalogue holds 11 `Forensics` rows over 6 plugins (`app_usage`, `browser_inventory`, `execution_artifacts`, `privacy_permissions`, `process_introspect`, `remote_access_audit`); `test_capability_catalogue.cpp` pins the plugin set and the row count. `execution_artifacts`, `browser_inventory`, `privacy_permissions`, `remote_access_audit` and `process_introspect` are default-off behind a plugin-config kill switch seeded at server start (`PluginConfigStore::seed_kill_switch_default_off`, `server.cpp`); `app_usage` also has a dedicated read surface (below).
 
 **Wave 7 PR7b: application usage is the first live `Forensics` consumer, not `execution_artifacts`.**
 The `app_usage` plugin's dedicated read surface (single-target, `Forensics:Read`) is the first row

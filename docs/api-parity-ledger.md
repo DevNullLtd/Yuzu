@@ -196,6 +196,8 @@ stays `twinned` on the paged shape; the gap is recorded here so it is not silent
 
 **Installed-software read model and collection settings (SAM-35).** `GET /api/v1/inventory/software/hosts`, `GET /api/v1/inventory/software/hosts/{agent_id}`, `GET /api/v1/inventory/software/changes`, `GET /api/v1/inventory/software/summary` and `GET /api/v1/inventory/software/plugin-health` have the MCP twins `list_software_hosts`, `get_software_host`, `list_software_changes`, `get_software_summary` and `get_software_plugin_health`; the four collection-settings routes (`GET /api/v1/inventory/software/collection-settings`, `GET`/`PUT .../collection-settings/{group_id}` and `GET .../hosts/{agent_id}/collection-settings`) have `list_software_collection_settings`, `get_software_collection_settings`, `set_software_collection_settings` and `get_software_host_collection_settings`. Each pair calls one shared function, so the MCP result is the REST `data` object. The ledger keys no row on them: only legacy and fragment routes carry rows, and a REST v1 route is tracked by the OpenAPI check (each is in `paths`). The MCP tools are strict where the REST routes clamp: an unknown argument or an out-of-range value is refused.
 
+**Streamed file export with no MCP twin by design (SAM-36).** `GET /api/v1/inventory/software/export` (installed software streamed as JSONL or CSV, up to a configurable size limit) is a REST v1 capability that has no MCP twin and is not expected to get one: a chunked file download has no JSON-RPC result to carry it, and `query_installed_software` already returns the same rows page by page. It is the one row of this shape in the ledger: `scripts/ci/api-parity/inventory.json` keys an `exception:#7955 revisit:2027-05-31` row on the route (the v1-keyed shape described above), pinned in `STRICT_EXCEPTION_PINS`, and the exception is recorded in `docs/adr/1005-headless-platform-use-case-engines.md`. The row counts untwinned, which is why the baseline above rose from 195 to 196: a reviewed decision, not a missing twin.
+
 **Known asymmetry on the audit pair.** `GET /api/v1/audit` and `query_audit_log` share one row set, but the MCP tool also publishes `has_more` and refuses a string filter over 1024 characters; the REST route does neither (a short page is its last page, and its filters are unbounded). The row stays `twinned`; the gap is recorded here and tracked by `#5887` (revisit by 2026-11-15).
 
 **Known asymmetry on the dashboard API-token pair.** `POST /api/settings/api-tokens` and `DELETE /api/settings/api-tokens/{id}` apply the same permission, MFA step-up, store-availability, tier/TTL and ownership rules as `POST /api/v1/tokens` and `DELETE /api/v1/tokens/{id}`. They differ in being narrower or in shape: the form has no `scope_service` (no service-scoped minting) and takes `ttl_hours` where the REST route takes `expires_at`; its audit rows are written through `AuditStore::log` and carry no user-agent, principal-class or session-id stamp; and MCP `create_api_token` has no step-up, by design (an MCP-tier token is required, with approval at the supervised tier). The rows stay `twinned`. The Settings page cannot yet prompt for the step-up code, so an MFA-enrolled operator whose proof has expired is refused, sees only the error toast "MFA step-up required" (no prompt) and must re-authenticate.
@@ -218,7 +220,7 @@ raw route is tracked by `#5856` (revisit by 2026-11-14).
 | Domain | Rows | Twinned | Untwinned |
 |---|---:|---:|---:|
 | devices | 24 | 14 | 10 |
-| inventory | 5 | 5 | 0 |
+| inventory | 6 | 5 | 1 |
 | dex | 31 | 22 | 9 |
 | guardian | 18 | 10 | 8 |
 | echo | 12 | 3 | 9 |
@@ -241,11 +243,11 @@ raw route is tracked by `#5856` (revisit by 2026-11-14).
 | enrollment | 21 | 4 | 17 |
 | crypto | 5 | 5 | 0 |
 | other | 82 | 34 | 48 |
-| **Total** | **352** | **157** | **195** |
+| **Total** | **353** | **157** | **196** |
 
-Registered `/api/vN/*` routes: 303. OpenAPI `paths` entries: 302. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 239.
+Registered `/api/vN/*` routes: 307. OpenAPI `paths` entries: 306. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 239.
 
-Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 195. Generic `planned:#2146` placeholder baseline (shrinks only; a new row names a specific issue): 69.
+Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 196. Generic `planned:#2146` placeholder baseline (shrinks only; a new row names a specific issue): 69.
 
 <!-- END GENERATED -->
 

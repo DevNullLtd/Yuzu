@@ -18,6 +18,7 @@
 #include "guardian_backend_fleet_tags.hpp" // yuzu.guardian_backend fleet rollup + device accessors (#2240)
 #include "guardian_health_fleet_tags.hpp" // Guardian M1 health-stream fleet telemetry table (#2298 gate 3, item 6d)
 #include "guardian_arm_fleet_tags.hpp" // Guardian arm-ledger fleet telemetry table (rung 9c PR-3)
+#include "guardian_baseline_fleet_tags.hpp" // Guardian baseline-persistence fleet telemetry table (#5605)
 #include "guardian_io_ceiling_fleet_tags.hpp" // Guardian io-ceiling fleet telemetry table (rung 9c PR-3)
 #include "guardian_journal_fleet_tags.hpp" // Guardian journal fleet telemetry table (#2298 gate 3)
 #include "network_perf_rules.hpp"
@@ -994,6 +995,14 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
          "evaluated), per-account authorized_keys key fingerprints with option names, and whether "
          "sshd is enabled; never a key comment, option value or key-file path; Linux and macOS, "
          "Windows is planned; read-only, default-off, Forensics:Read single-target"},
+        {"process_introspect.inspect",
+         "Per-process introspection of one pid, one facet per request (resource_limits, "
+         "sigmasks, caps, seccomp, oom, sched): numbers, masks and fixed tokens only, never "
+         "file or memory contents, environment values or command-line arguments; Linux only, macOS "
+         "and Windows are planned; read-only, default-off, Forensics:Read single-target (a "
+         "non-admin also needs approval); pid from crossplatform.process.list; a degraded read is "
+         "CONSTRAINED, never an empty OK; no_such_process* and pid_reused terminal, torn_read "
+         "retryable"},
         // status
         {"status.version", "Agent version, build number, and git commit hash"},
         {"status.info", "Platform OS, architecture, and hostname"},
@@ -2997,6 +3006,11 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
         metrics.clear_gauge_family(m.gauge);
     for (const auto& m : kGuardianIoCeilingMetrics)
         metrics.clear_gauge_family(m.gauge);
+    // #5605: the baseline-persistence trio. Same absent-not-zero rule: row 0 is dormant until
+    // prefer_spark, and rows 1 and 2 are sparse (0 omits the tag), so a sweep nobody reported
+    // must leave all three ABSENT, never a fabricated 0 that reads as "baselines are persisting".
+    for (const auto& m : kGuardianBaselineMetrics)
+        metrics.clear_gauge_family(m.gauge);
     // #3663: the dedup-store capacity MAX is the one dedup gauge that is ABSENT-not-zero (a
     // per-agent reading that nobody may report). The dedup agent COUNTS are server-owned counts
     // published every sweep, 0 included, so they need no clear (same as the OTA gauge).
@@ -3171,6 +3185,19 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
         std::array<std::string, kNGuardianIoCeilingMetrics> keys;
         for (std::size_t i = 0; i < kNGuardianIoCeilingMetrics; ++i)
             keys[i] = kGuardianIoCeilingMetrics[i].tag;
+        return keys;
+    }();
+    // #5605: the baseline-persistence trio (see guardian_baseline_fleet_tags.hpp for the three
+    // shapes). gbp_ (not gb_) because gb_reporting/gb_tag_rejected below already belong to the
+    // yuzu.guardian_backend family. `gbp_reporting` counts an agent only when row 0 parsed.
+    std::array<double, kNGuardianBaselineMetrics> gbp_sum{};
+    std::array<bool, kNGuardianBaselineMetrics> gbp_reported{};
+    int gbp_reporting = 0;
+    int gbp_tag_rejected = 0;
+    static const std::array<std::string, kNGuardianBaselineMetrics> gbp_keys = [] {
+        std::array<std::string, kNGuardianBaselineMetrics> keys;
+        for (std::size_t i = 0; i < kNGuardianBaselineMetrics; ++i)
+            keys[i] = kGuardianBaselineMetrics[i].tag;
         return keys;
     }();
     // #2240: yuzu.guardian_backend. A categorical partition count: each recognised agent is in
@@ -3736,6 +3763,22 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
         }
         if (io_ceiling_reported_any)
             ++gioc_reporting;
+
+        // #5605: baseline-persistence trio. An empty view is "this agent did not report"
+        // (dormant, or a sparse tag at 0), never a rejection. Reporting keys on row 0 ONLY.
+        for (std::size_t i = 0; i < kNGuardianBaselineMetrics; ++i) {
+            const auto raw = get_view(gbp_keys[i]);
+            if (raw.empty())
+                continue;
+            if (auto v = parse_guardian_baseline_count(raw)) {
+                gbp_sum[i] += *v;
+                gbp_reported[i] = true;
+                if (i == kGuardianBaselineUnpersistedIndex)
+                    ++gbp_reporting;
+            } else {
+                ++gbp_tag_rejected;
+            }
+        }
     }
 
     // OTA signature refusals (#416/#3807). Counts AGENTS currently reporting a
@@ -3942,6 +3985,14 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     metrics.gauge(kGuardianIoCeilingReportingGauge).set(static_cast<double>(gioc_reporting));
     metrics.gauge(kGuardianIoCeilingTagRejectedGauge)
         .set(static_cast<double>(gioc_tag_rejected));
+    // #5605: baseline-persistence trio. The three SUM gauges are absent-when-unreported; the two
+    // meta gauges publish every sweep including 0.
+    for (std::size_t i = 0; i < kNGuardianBaselineMetrics; ++i)
+        if (gbp_reported[i])
+            metrics.gauge(kGuardianBaselineMetrics[i].gauge).set(gbp_sum[i]);
+    metrics.gauge(kGuardianBaselineReportingGauge).set(static_cast<double>(gbp_reporting));
+    metrics.gauge(kGuardianBaselineTagRejectedGauge)
+        .set(static_cast<double>(gbp_tag_rejected));
 
     // Guardian M1 health-stream rollup (#2298 gate 3, item 6d). Same absent-not-zero
     // rule as the journal family: cleared at the top, so a signal nobody reported this

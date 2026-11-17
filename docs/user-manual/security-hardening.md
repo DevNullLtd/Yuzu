@@ -798,6 +798,7 @@ Two consequences worth planning for:
   | `echo.fleet_snapshot` | Requests a read-only topology/process snapshot. No state change. |
   | `asset_tags.sync` | Writes device tags. No code execution. |
   | `__sync__.now` | Requests an on-demand inventory sync: it arms the agent's existing sync scheduler and nothing else. |
+  | `__sync__.settings` | Delivers the software collection settings that apply to the device: how often installed software is collected, in which window, and which collectors run. It changes only the agent's own collection schedule and collector switches, and the agent refuses any document that is not exactly the expected shape. No code execution. |
   | `__guard__.push_rules` | Delivers Guardian baseline rules, which the agent may *enforce*. Enforcement is **not arbitrary command execution**. |
 - **If containment state becomes unreadable, dispatch fails closed**: the server refuses *every* target
   rather than guess who is contained. A short store outage is absorbed by a 60-second last-known-good

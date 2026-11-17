@@ -381,6 +381,30 @@ TEST_CASE("openapi_spec_json(): info.description states the cookie-session same-
                            "server state") != std::string::npos);
 }
 
+// #7730: the collation gate's client-visible rules are in the spec, not only the manual. Kills a
+// description edit that drops the restart-the-walk rule, the refused confirm read, or the
+// `details.write_paused` of the paused-decommission 500.
+TEST_CASE("openapi_spec_json(): GET /hardware-ci and DELETE /sle/agents state the collation gate rules",
+          "[openapi]") {
+    json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    const json& get = spec["paths"]["/hardware-ci"]["get"];
+    const std::string d = get["description"].get<std::string>();
+    CHECK(d.find("RESTART the walk from the first page once the read is served again") !=
+          std::string::npos);
+    CHECK(d.find("do not resume the old cursor") != std::string::npos);
+    CHECK(d.find("the ?agent_id=<id> confirm read too") != std::string::npos);
+    const std::string r503 = get["responses"]["503"]["description"].get<std::string>();
+    CHECK(r503.find("restart the walk from the first page") != std::string::npos);
+    CHECK(r503.find("confirm read is refused with this same 503") != std::string::npos);
+
+    const std::string r500 =
+        spec["paths"]["/sle/agents/{agent_id}"]["delete"]["responses"]["500"]["description"]
+            .get<std::string>();
+    CHECK(r500.find("error.details.write_paused") != std::string::npos);
+    CHECK(r500.find("retry_after_ms is 60000") != std::string::npos);
+}
+
 TEST_CASE("openapi_spec_json(): the strict instruction create requests are closed schemas",
           "[openapi]") {
     // The routes refuse an unknown key (build_*_from_*_body), so a schema that omits
@@ -1990,7 +2014,7 @@ TEST_CASE("openapi documents: every operation has a unique, well-formed and pinn
     // docs/user-manual/upgrading.md and in the change's changelog fragment. The count is
     // derived from the document (it is the number of operations); the one hand-kept number
     // for it lives in the typed-response test's exclusion list, not here.
-    static const std::string kOperationIdChecksum = "\"fd2d38d7aedcfd32\"";
+    static const std::string kOperationIdChecksum = "\"c2e0b72911500f27\"";
     static const std::regex kShape("^[a-z][A-Za-z0-9]*$");
     for (const bool with_guides : {false, true}) {
         INFO("form: " << form_name(with_guides));
@@ -2448,8 +2472,8 @@ TEST_CASE("openapi_spec_json(): the #7217 per-device summary properties are type
 }
 
 // UP-14 server PR A5a: the stored per-agent ordering state. The key sets are pinned above; this
-// pins each new property's type, nullability and bound, and that the description says the pair is
-// stored and counted, not yet compared.
+// pins each new property's type, nullability and bound, and that the description says the server
+// orders a census verdict by the pair (the pre-B "not yet compared" wording is gone).
 TEST_CASE("openapi_spec_json(): the per-agent ordering properties are typed, bounded and described",
           "[openapi][guardian][ordering][pair]") {
     for (const bool with_guides : {false, true}) {
@@ -2478,7 +2502,8 @@ TEST_CASE("openapi_spec_json(): the per-agent ordering properties are typed, bou
         CHECK(ids["items"].value("type", "") == "string");
         const std::string sdesc = sget.value("description", "");
         CHECK(sdesc.find("unordered_agents") != std::string::npos);
-        CHECK(sdesc.find("not yet compared") != std::string::npos);
+        CHECK(sdesc.find("orders a census verdict by the emit-order pair") != std::string::npos);
+        CHECK(sdesc.find("not yet compared") == std::string::npos); // the pre-B wording is gone
 
         // Per-device all-guards read.
         const json& gget = spec["paths"].at("/guaranteed-state/agents/{agent_id}/rules").at("get");
@@ -2519,8 +2544,10 @@ TEST_CASE("openapi_spec_json(): the per-agent ordering properties are typed, bou
         }
         const std::string gdesc = gget.value("description", "");
         CHECK(gdesc.find("ordering") != std::string::npos);
-        CHECK(gdesc.find("not yet compared") != std::string::npos);
-        CHECK(p["pair_duplicates"].value("description", "").find("0 until") != std::string::npos);
+        CHECK(gdesc.find("classify each census-bearing first delivery") != std::string::npos);
+        CHECK(gdesc.find("not yet compared") == std::string::npos); // the pre-B wording is gone
+        CHECK(p["pair_duplicates"].value("description", "").find("Equal pairs refused") !=
+              std::string::npos);
         const std::string g200 = gget.at("responses").at("200").value("description", "");
         CHECK(g200.find("ordering") != std::string::npos);
     }
