@@ -81,7 +81,9 @@ namespace yuzu::shared {
     return "REDACTED@" + std::string{text.substr(at + 1)};
 }
 
-/// Same rule; a separate name for single-URL sources kept for call-site clarity.
+/// VESTIGIAL alias of redact_proxy_value: an earlier design treated a single URL
+/// differently from a list; both are now the one fail-closed rule above. Kept
+/// only so existing call sites (including a Windows-only one) need no edit.
 [[nodiscard]] inline std::string redact_proxy_single(std::string_view text) {
     return redact_proxy_value(text);
 }

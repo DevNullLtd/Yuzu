@@ -144,7 +144,8 @@ TEST_CASE("proxy redaction: separators and odd characters inside credentials do 
             const auto row = format_proxy_address_row(c.in, shape);
             for (const char* sec : c.secrets)
                 { INFO(c.in << " -> " << row << " leaks " << sec); CHECK_FALSE(has(row, sec)); }
-            CHECK(has(row, "REDACTED@"));
+            const std::string in{c.in};
+            CHECK(row == "proxy_address|REDACTED@" + in.substr(in.rfind('@') + 1));
         }
     }
     // list values: credentials in the 2nd and 3rd entries, with separators inside
@@ -167,7 +168,8 @@ TEST_CASE("proxy redaction: separators and odd characters inside credentials do 
         INFO(in << " -> " << row);
         for (const char* sec : {"u:pw", "user:pw", "a:b", "x:y", "b@", "d@"})
             CHECK_FALSE(has(row, sec));
-        CHECK(has(row, "REDACTED@"));
+        const std::string sin{in};
+        CHECK(row == "proxy_address|REDACTED@" + sin.substr(sin.rfind('@') + 1));
     }
     // IPv6 literal, percent-encoding and a very long input stay correct and cheap
     CHECK(format_proxy_address_row("http=[::1]:80;https=[::2]:81", ProxyShape::list) ==
@@ -179,10 +181,90 @@ TEST_CASE("proxy redaction: separators and odd characters inside credentials do 
             m += "a=b;";
         return m + "@";
     }();
-    CHECK(has(format_proxy_address_row(many, ProxyShape::list), "REDACTED@"));
+    CHECK(format_proxy_address_row(many, ProxyShape::list) == "proxy_address|REDACTED@");
     // a hostile (non-plain) key never survives as an unredacted prefix
     CHECK_FALSE(has(format_proxy_address_row("user:secret=@host", ProxyShape::list), "secret"));
     CHECK_FALSE(has(format_proxy_address_row("us er:pw=x@host", ProxyShape::list), "pw"));
+}
+
+// A faithful copy of server/core/src/result_parsing.hpp find_unescaped_pipe /
+// unescape_pipes / split_all_pipes: `\|` is an ESCAPED pipe. The agent tests do not
+// link the server, so the decoder logic is reproduced here to prove the columns.
+namespace {
+std::vector<std::string> server_split(const std::string& line) {
+    std::vector<std::string> parts;
+    std::size_t pos = 0;
+    const auto unesc = [](const std::string& s) {
+        std::string o;
+        for (std::size_t i = 0; i < s.size(); ++i) {
+            if (s[i] == '\\' && i + 1 < s.size() && s[i + 1] == '|') {
+                o += '|';
+                ++i;
+            } else {
+                o += s[i];
+            }
+        }
+        return o;
+    };
+    for (;;) {
+        std::size_t p = pos;
+        for (;;) {
+            p = line.find('|', p);
+            if (p == std::string::npos || p == 0 || line[p - 1] != '\\')
+                break;
+            ++p;
+        }
+        if (p == std::string::npos) {
+            parts.push_back(unesc(line.substr(pos)));
+            return parts;
+        }
+        parts.push_back(unesc(line.substr(pos, p - pos)));
+        pos = p + 1;
+    }
+}
+} // namespace
+
+TEST_CASE("processes rows: a name ending in a backslash cannot glue onto the delimiter",
+          "[plugin][row][wp11]") {
+    const std::string hash(64, 'a');
+    // comm `x\` (prctl by an unprivileged process): the old sanitize_field left the
+    // backslash, `\|` was read by the server decoder as an escaped pipe and the
+    // hash merged into the name column.
+    const auto h = yuzu::processes::format_hashed_row(7, "x\\", hash, "/usr/bin/x");
+    const auto cols = server_split(h);
+    REQUIRE(cols.size() == 5);
+    CHECK(cols[2] == "x/");
+    CHECK(cols[3] == hash);
+    CHECK(cols[4] == "/usr/bin/x");
+    const auto t = yuzu::processes::format_tree_row(7, 1, "x\\", hash, "/usr/bin/x");
+    const auto tc = server_split(t);
+    REQUIRE(tc.size() == 6);
+    CHECK(tc[3] == "x/");
+    CHECK(tc[4] == hash);
+    // list / query rows and a path ending in a backslash
+    CHECK(server_split(yuzu::processes::format_query_row(7, "x\\")).size() == 3);
+    CHECK(server_split(yuzu::processes::format_hashed_row(7, "n", hash, "C:\\dir\\")).size() == 5);
+    // interior backslashes (Windows paths) are preserved
+    CHECK(yuzu::processes::format_hashed_row(7, "n", "", "C:\\a\\b.exe") ==
+          "proc|7|n||C:\\a\\b.exe");
+}
+
+TEST_CASE("network_config bypass row neutralises delimiters", "[plugin][row][wp11]") {
+    const auto row = yuzu::network_config::format_bypass_row("*.local\nproxy_type|http\r|x");
+    CHECK(single_line(row));
+    CHECK(delimiters(row) == 1);
+    CHECK(yuzu::network_config::format_bypass_row("*.local,169.254/16") ==
+          "bypass|*.local,169.254/16");
+}
+
+TEST_CASE("installed_apps user_app row covers the system and brew tags", "[plugin][row][wp11]") {
+    namespace ia = yuzu::installed_apps::parsers;
+    for (const char* tag : {"system", "brew"}) {
+        const auto r = ia::format_user_app_row(tag, kHostile, kHostile, kHostile, "");
+        CHECK(single_line(r));
+        CHECK(delimiters(r) == 5);
+    }
+    CHECK(ia::format_user_app_row("brew", "wget", "1.2", "", "") == "user_app|brew|wget|1.2|-|-");
 }
 
 TEST_CASE("update_source_trust redaction still forwards to the shared logic", "[plugin][wp11]") {

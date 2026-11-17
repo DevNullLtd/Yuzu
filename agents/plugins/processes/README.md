@@ -61,7 +61,7 @@ No external binaries, no subprocesses, no network access — every leg is an in-
 
 ### Outputs
 
-Pipe-delimited rows via `write_output()`, one line per process (or, for `query`, one `found|` line plus zero or more matching rows). A field is never omitted for width — `list_hashed`/`list_tree` always carry the full field count, with an empty (not `-`) string where the executable path or hash could not be resolved. A process name containing `|`, CR, or LF has those bytes replaced with a space before emission, so the pipe format can never desync (`processes_plugin.cpp:71-76`).
+Pipe-delimited rows via `write_output()`, one line per process (or, for `query`, one `found|` line plus zero or more matching rows). A field is never omitted for width — `list_hashed`/`list_tree` always carry the full field count, with an empty (not `-`) string where the executable path or hash could not be resolved. A process name (or path) containing `|`, CR, or LF has those bytes replaced with a space, and a trailing backslash is folded to `/` (it would otherwise glue onto the next `|`); other backslashes are kept. This applies to `list`, `query`, `list_hashed` and `list_tree` alike (`processes_rows.hpp`), so the pipe format can never desync.
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
 **`crossplatform.process.list` — `pid|name`**
@@ -69,7 +69,7 @@ Pipe-delimited rows via `write_output()`, one line per process (or, for `query`,
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
 | `pid` | int64 | - | Windows, Linux, macOS | `1936` | The process's numeric identifier, as assigned by the OS kernel at process creation. Values: integer. |
-| `name` | string | - | Windows, Linux, macOS | `svchost.exe` | The process's short name (Windows: PROCESSENTRY32W.szExeFile, the image filename only, no path; Linux: /proc/<pid>/status Name:, kernel-truncated to 15 bytes; macOS: the resolved on-disk executable path when it starts with '/', else the 16-byte-truncated p_comm). '\|', CR and LF are replaced with a space before the row is emitted. Values: free text. |
+| `name` | string | - | Windows, Linux, macOS | `svchost.exe` | The process's short name (Windows: PROCESSENTRY32W.szExeFile, the image filename only, no path; Linux: /proc/<pid>/status Name:, kernel-truncated to 15 bytes; macOS: the resolved on-disk executable path when it starts with '/', else the 16-byte-truncated p_comm). '\|', CR and LF are replaced with a space and a trailing backslash with '/' before the row is emitted. Values: free text. |
 
 **`crossplatform.process.query` — `found|pid|name`**
 

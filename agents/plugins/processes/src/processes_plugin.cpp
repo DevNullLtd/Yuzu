@@ -67,8 +67,6 @@ std::string to_lower(std::string_view sv) {
     return result;
 }
 
-using yuzu::processes::sanitize_field;
-
 #ifdef _WIN32
 std::vector<ProcessInfo> enumerate_processes() {
     std::vector<ProcessInfo> procs;
@@ -330,7 +328,7 @@ private:
     int do_list(yuzu::CommandContext& ctx) {
         auto procs = enumerate_processes();
         for (const auto& p : procs) {
-            ctx.write_output(std::format("proc|{}|{}", p.pid, sanitize_field(p.name)));
+            ctx.write_output(yuzu::processes::format_query_row(p.pid, p.name));
         }
         return 0;
     }
@@ -357,8 +355,7 @@ private:
                     hash_cache.emplace(path, hash);
                 }
             }
-            ctx.write_output(std::format("proc|{}|{}|{}|{}|{}", p.pid, p.ppid,
-                                         sanitize_field(p.name), hash, sanitize_field(path)));
+            ctx.write_output(yuzu::processes::format_tree_row(p.pid, p.ppid, p.name, hash, path));
         }
         return 0;
     }
@@ -384,8 +381,7 @@ private:
                     hash_cache.emplace(path, hash);
                 }
             }
-            ctx.write_output(std::format("proc|{}|{}|{}|{}", p.pid, sanitize_field(p.name), hash,
-                                         sanitize_field(path)));
+            ctx.write_output(yuzu::processes::format_hashed_row(p.pid, p.name, hash, path));
         }
         return 0;
     }

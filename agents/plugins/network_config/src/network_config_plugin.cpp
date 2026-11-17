@@ -1195,7 +1195,7 @@ int do_proxy(yuzu::CommandContext& ctx) {
             GlobalFree(proxy_cfg.lpszProxy);
         }
         if (proxy_cfg.lpszProxyBypass) {
-            ctx.write_output(std::format("bypass|{}", from_wide(proxy_cfg.lpszProxyBypass)));
+            ctx.write_output(yuzu::network_config::format_bypass_row(from_wide(proxy_cfg.lpszProxyBypass)));
             GlobalFree(proxy_cfg.lpszProxyBypass);
         }
         if (!proxy_cfg.lpszAutoConfigUrl && !proxy_cfg.lpszProxy) {
@@ -1217,7 +1217,7 @@ int do_proxy(yuzu::CommandContext& ctx) {
         if (val && *val) {
             if (std::string_view(var).find("no_proxy") != std::string_view::npos ||
                 std::string_view(var).find("NO_PROXY") != std::string_view::npos) {
-                ctx.write_output(std::format("bypass|{}", val));
+                ctx.write_output(yuzu::network_config::format_bypass_row(val));
             } else {
                 ctx.write_output(std::format("proxy_type|{}", var));
                 ctx.write_output(yuzu::network_config::format_proxy_address_row(val));
@@ -1353,7 +1353,7 @@ int do_proxy(yuzu::CommandContext& ctx) {
             // is the acquisition half.
             const std::string joined = yuzu::network_config::join_bypass_list(entries);
             if (!joined.empty())
-                ctx.write_output(std::format("bypass|{}", joined));
+                ctx.write_output(yuzu::network_config::format_bypass_row(joined));
         }
     } else {
         // SCDynamicStoreCopyProxies failed. Falling through to the

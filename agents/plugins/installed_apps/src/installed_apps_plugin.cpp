@@ -1274,11 +1274,8 @@ private:
         if (!report_if_degraded(ctx, apps.degraded, "list_per_user"))
             return 1;
         for (const auto& app : apps.apps) {
-            ctx.write_output(yuzu::util::sanitize_utf8(
-                std::format("user_app|system|{}|{}|{}|{}", app.name,
-                            app.version.empty() ? "-" : app.version,
-                            app.publisher.empty() ? "-" : app.publisher,
-                            app.install_date.empty() ? "-" : app.install_date)));
+            ctx.write_output(yuzu::util::sanitize_utf8(parsers::format_user_app_row(
+                "system", app.name, app.version, app.publisher, app.install_date)));
         }
         return 0;
 
@@ -1289,11 +1286,8 @@ private:
         if (!report_if_degraded(ctx, apps.degraded, "list_per_user"))
             return 1;
         for (const auto& app : apps.apps) {
-            ctx.write_output(yuzu::util::sanitize_utf8(
-                std::format("user_app|system|{}|{}|{}|{}", app.name,
-                            app.version.empty() ? "-" : app.version,
-                            app.publisher.empty() ? "-" : app.publisher,
-                            app.install_date.empty() ? "-" : app.install_date)));
+            ctx.write_output(yuzu::util::sanitize_utf8(parsers::format_user_app_row(
+                "system", app.name, app.version, app.publisher, app.install_date)));
         }
 
         // installed_apps/do_list_per_user#1 (docs/agent-spawn-sink-manifest.md)
@@ -1306,8 +1300,8 @@ private:
                 return 1;
             auto brew_out = std::move(brew_res.output);
             for (auto& rec : parsers::parse_brew_list(brew_out)) {
-                ctx.write_output(yuzu::util::sanitize_utf8(std::format(
-                    "user_app|brew|{}|{}|-|-", rec.name, rec.version.empty() ? "-" : rec.version)));
+                ctx.write_output(yuzu::util::sanitize_utf8(
+                    parsers::format_user_app_row("brew", rec.name, rec.version, "", "")));
             }
         }
         return 0;

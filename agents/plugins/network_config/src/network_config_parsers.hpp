@@ -89,22 +89,32 @@
 
 namespace yuzu::network_config {
 
-/// How a proxy value is shaped: a single URL/host:port (env var, PAC, macOS
-/// address) is never split; a list (WinHTTP ProxyServer) is.
+/// VESTIGIAL. An earlier design treated a single URL and a WinHTTP list
+/// differently; the redaction is now ONE fail-closed rule and both shapes
+/// behave identically. Kept (with the Windows call site that passes `list`)
+/// because that code cannot be recompiled from every build host; do not add
+/// behaviour that depends on it.
 enum class ProxyShape { single, list };
 
 /// One `proxy_address|<value>` row. The value is an endpoint-supplied proxy
-/// setting, which conventionally carries `user:password@` userinfo: the
-/// credential is replaced with `REDACTED@` BEFORE the row is built (userinfo is
-/// located before any list splitting, and a `;` `,` space `=` `:` `/` in a
-/// password cannot hide it), then the value goes through safe_output_field so a
-/// '|', CR or LF cannot forge columns or rows.
+/// setting. If it holds ANY '@' the output is `REDACTED@` plus the text after
+/// the LAST '@' of the whole value (scheme, earlier list entries and a path
+/// '@' are dropped on purpose: yuzu::shared::redact_proxy_value); a value with
+/// no '@' is unchanged. The result goes through safe_output_field so a '|', CR
+/// or LF cannot forge columns or rows. `shape` is vestigial (see ProxyShape).
 [[nodiscard]] inline std::string format_proxy_address_row(std::string_view raw,
                                                           ProxyShape shape = ProxyShape::single) {
     return "proxy_address|" + yuzu::util::safe_output_field(
                                   shape == ProxyShape::list
                                       ? yuzu::shared::redact_proxy_value(raw)
                                       : yuzu::shared::redact_proxy_single(raw));
+}
+
+/// One `bypass|<value>` row (`no_proxy`, the WinHTTP bypass list, the macOS
+/// exceptions list). Endpoint-controlled free text: safe_output_field keeps a
+/// '|', CR or LF from adding columns or forging `proxy_*` rows.
+[[nodiscard]] inline std::string format_bypass_row(std::string_view raw) {
+    return "bypass|" + yuzu::util::safe_output_field(raw);
 }
 
 // ── /proc/net/arp (Linux arp leg) ────────────────────────────────────────
