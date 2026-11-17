@@ -1168,8 +1168,9 @@ jobs:
           # contract build compiled cold. With hash_dir off they share one. The
           # cost is debug info only: an object's recorded compile directory
           # (DW_AT_comp_dir) may name the other sibling, whose generated files
-          # are its own copies, or, for a source compiled with no
-          # workspace-specific flag, another runner's workspace on this box.
+          # are its own copies. Each Big Tam runner has its own cache (its
+          # .env sets a per-runner HOME, deploy/linux/README.md), so it never
+          # names another runner's workspace.
           # Nothing in this leg reads it (no gdb, coverage or symbolizer step;
           # those run in the nightly, which keeps hash_dir on). Every later
           # step in the job inherits the setting through GITHUB_ENV.
@@ -2054,8 +2055,8 @@ jobs:
           contract_targets_list=$(python3 -c 'import json; d = json.load(open("tests/contracts/pilots.json")); ts = [t for r in d["contracts"] for t in r["build_targets"]]; assert all(isinstance(t, str) and t and t[0] != "-" and not any(c.isspace() for c in t) for t in ts); print(" ".join(sorted(set(ts))))') \
             || { echo "::warning::could not read build targets from tests/contracts/pilots.json; skipping the precompile"; contract_targets_list=""; }
           read -r -a contract_targets <<< "$contract_targets_list"
-          # Per-step ccache stats log: the shared cache's global counters mix
-          # all four runners, this log holds only this compile's results.
+          # Per-step ccache stats log: the cache's own counters cover every
+          # compile since the job's reset, this log holds only this compile's.
           precompile_stats="$RUNNER_TEMP/ccache-contract-precompile-$GITHUB_RUN_ID.log"
           rm -f "$precompile_stats"
           precompile_start=$SECONDS
@@ -2067,8 +2068,11 @@ jobs:
           fi
           echo "contract pilot precompile: $(( SECONDS - precompile_start ))s for ${#contract_targets[@]} target(s)"
           if [[ -s "$precompile_stats" ]]; then
-            stats=$(CCACHE_STATSLOG="$precompile_stats" ccache --show-log-stats --verbose 2>/dev/null \
-              | grep -iE 'hits|misses|uncacheable|errors' || true)
+            # ccache repeats Hits/Misses under "Local storage:" (4.12.3, checked on
+            # Big Tam); print only the call totals above that section. A row that
+            # is absent (Uncacheable, Errors) was zero.
+            stats=$(CCACHE_STATSLOG="$precompile_stats" ccache --show-log-stats 2>/dev/null \
+              | awk '/^Local storage:/ { exit } tolower($0) ~ /^[[:space:]]*(hits|misses|uncacheable|errors)/' || true)
             if [[ -n "$stats" ]]; then
               while IFS= read -r line; do echo "  ccache (contract precompile): $line"; done <<< "$stats"
             else

@@ -1,6 +1,7 @@
 #include "heartbeat_ingestion.hpp"
 
 #include "agent_registry.hpp"
+#include "collection_settings_push.hpp"
 #include "fleet_topology_store.hpp"
 #include "offline_endpoint_store.hpp"
 
@@ -15,9 +16,57 @@
 #include <chrono>
 #include <cstdint>
 #include <exception>
+#include <memory>
 #include <string>
+#include <vector>
 
 namespace yuzu::server {
+
+namespace {
+/// #5685 hp-2: how recent a presence row must be to supply the snapshot `os` of an agent this
+/// replica holds no session for. The heartbeat upserting this row has just run, so a row older
+/// than this belongs to an agent that has gone quiet and whose platform this path should not vouch for.
+constexpr std::chrono::hours kPresenceOsFallbackWindow{1};
+
+/// After a failed `publish_plugins` a session does not try again for this long.
+constexpr std::int64_t kPublishPluginsRetryBackoffMs = 60'000;
+
+std::int64_t steady_now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+/// Run one heartbeat reconcile hook so that nothing it throws escapes the heartbeat handler or
+/// skips the rest of ingestion. A throw is counted in `counter` (pre-seeded at server start-up,
+/// so a persistent failure is alertable) and then logged; the count comes first and cannot
+/// itself throw out of the handler. The agent id and the exception text are untrusted, so both
+/// go through the log-token neutralisers.
+template <typename Fn>
+void guarded_reconcile(MetricsRegistry* metrics, const char* counter, std::string_view what,
+                       const std::string& via, const std::string& agent_id, Fn&& fn) {
+    const auto count_throw = [&]() noexcept {
+        try {
+            if (metrics)
+                metrics->counter(counter).increment();
+        } catch (...) {
+            // A lost sample only under-reports; ingestion carries on.
+        }
+    };
+    try {
+        fn();
+    } catch (const std::exception& e) {
+        count_throw();
+        spdlog::warn("[{}] Heartbeat {} reconcile threw for agent={}: {}", via, what,
+                     ::yuzu::log_id_token(agent_id), ::yuzu::log_id_token(e.what()));
+    } catch (...) {
+        count_throw();
+        spdlog::warn("[{}] Heartbeat {} reconcile threw a non-standard exception for agent={}",
+                     via, what, ::yuzu::log_id_token(agent_id));
+    }
+}
+
+} // namespace
 
 void HeartbeatIngestion::ingest(const ::yuzu::agent::v1::HeartbeatRequest& hb,
                                 std::string_view agent_id, std::string_view via,
@@ -43,6 +92,9 @@ void HeartbeatIngestion::ingest(const ::yuzu::agent::v1::HeartbeatRequest& hb,
     // those live on the CommandResponse path, not here.
     // #5686: while the batch is tripped, skip this entry's upsert unless it is
     // a half-open probe (see PresenceBatch).
+    // True only when THIS heartbeat's presence write succeeded; the snapshot-os fallback below
+    // reads the same store and is skipped otherwise (a tripped batch, a skipped or failed write).
+    bool presence_ok = false;
     if (offline_store_ && presence_batch && presence_batch->store_failed &&
         ++presence_batch->skips_since_fail < presence_batch->next_probe) {
         ++presence_batch->skipped; // a later probe or the next batch refreshes this row
@@ -51,11 +103,23 @@ void HeartbeatIngestion::ingest(const ::yuzu::agent::v1::HeartbeatRequest& hb,
         std::string os;
         std::string agent_version;
         std::string arch;
+        // #5685 follow-up: the session's plugin list is published to the presence row ONCE per
+        // session (it changes only at re-registration), so a replica without the session can still
+        // tell a plugin the agent lacks. Marked published only after a successful write (below).
+        std::vector<std::string> plugin_names;
+        std::shared_ptr<detail::AgentSession> published_sess;
         if (auto sess = registry_.get_session(agent_id_str)) {
             hostname = sess->hostname;
             os = sess->os;
             agent_version = sess->agent_version;
             arch = sess->arch;
+            if (!sess->presence_plugins_published.load(std::memory_order_relaxed) &&
+                !sess->plugin_names.empty() &&
+                steady_now_ms() >=
+                    sess->presence_plugins_retry_after_ms.load(std::memory_order_relaxed)) {
+                plugin_names = sess->plugin_names;
+                published_sess = std::move(sess);
+            }
         }
         // HA WS-5: threaded through so a later graceful disconnect can
         // session-guard its presence clear (remove_if_session via presence_departure.hpp) — see
@@ -80,6 +144,27 @@ void HeartbeatIngestion::ingest(const ::yuzu::agent::v1::HeartbeatRequest& hb,
         const bool upserted = offline_store_->upsert(agent_id_str, hostname, os, now_ms,
                                                      /*agent_ts=*/0, agent_version, arch,
                                                      session_id);
+        presence_ok = upserted;
+        // The list goes to its own row (it is written once per session, never on the hot row) and
+        // only for the session that reported it. The flag is set after a SUCCESSFUL write only, so
+        // a failure retries on the next heartbeat.
+        // Only for the CURRENT session: a late heartbeat for an older session does not store the
+        // new session's list under the old id. The check and the write are two steps, though: a
+        // re-registration between them can let the old session's write replace the new session's
+        // row, and the new session, whose flag is already set, does not republish. The read joins
+        // on the endpoint's current session, so that row is ignored and the agent has no usable
+        // list until it re-registers: an under-withhold, never a refusal. A session-fenced write
+        // (written only while the endpoint row still names the supplied session) would close it.
+        // A failed write backs off (no per-heartbeat database round trip while the store is
+        // unhealthy or the list is unpublishable); a mismatch costs nothing and tries again.
+        if (upserted && published_sess && !session_id.empty() &&
+            registry_.session_is(agent_id_str, session_id)) {
+            if (offline_store_->publish_plugins(agent_id_str, session_id, plugin_names))
+                published_sess->presence_plugins_published.store(true, std::memory_order_relaxed);
+            else
+                published_sess->presence_plugins_retry_after_ms.store(
+                    steady_now_ms() + kPublishPluginsRetryBackoffMs, std::memory_order_relaxed);
+        }
         if (presence_batch) {
             if (upserted) {
                 presence_batch->store_failed = false;
@@ -115,35 +200,30 @@ void HeartbeatIngestion::ingest(const ::yuzu::agent::v1::HeartbeatRequest& hb,
             // Require the WHOLE tag to parse (ptr at end) — "123abc" must be
             // rejected, not silently read as 123 (cpp-expert / #1209).
             if (ec == std::errc() && ptr == v.data() + v.size()) {
-                // Defensive, like the quarantine hook below: a throwing reconcile
-                // dependency must not escape the heartbeat handler or skip the rest of
-                // ingestion. The agent id and the exception text are untrusted, so both
-                // go through the log-token neutralisers.
-                // Each throw is counted (the series is pre-seeded at server start-up) as
-                // well as logged, so a persistent failure is alertable. The count comes
-                // first and cannot itself throw out of the handler.
-                const auto count_throw = [this]() noexcept {
-                    try {
-                        if (metrics_)
-                            metrics_->counter("yuzu_server_guardian_reconcile_exceptions_total")
-                                .increment();
-                    } catch (...) {
-                        // A lost sample only under-reports; ingestion carries on.
-                    }
-                };
-                try {
-                    guardian_reconcile_fn_(agent_id_str, gen);
-                } catch (const std::exception& e) {
-                    count_throw();
-                    spdlog::warn("[{}] Heartbeat guardian reconcile threw for agent={}: {}",
-                                 via_str, ::yuzu::log_id_token(agent_id_str),
-                                 ::yuzu::log_id_token(e.what()));
-                } catch (...) {
-                    count_throw();
-                    spdlog::warn("[{}] Heartbeat guardian reconcile threw a non-standard "
-                                 "exception for agent={}",
-                                 via_str, ::yuzu::log_id_token(agent_id_str));
-                }
+                // Defensive, like the quarantine hook below: a throwing reconcile dependency
+                // must not escape the heartbeat handler or skip the rest of ingestion.
+                guarded_reconcile(metrics_, "yuzu_server_guardian_reconcile_exceptions_total",
+                                  "guardian", via_str, agent_id_str,
+                                  [&] { guardian_reconcile_fn_(agent_id_str, gen); });
+            }
+        }
+    }
+
+    // SAM-39: inventory settings reconcile. The agent reports the version of the settings
+    // document it applied (or `none`); only that exact shape is handed on, so a malformed tag
+    // from a buggy agent is ignored. Same discipline as the quarantine hook below: the shared
+    // lock is held for the whole call, a throw is counted and logged with neutralised text, and
+    // the rest of ingestion carries on.
+    {
+        const auto& tags = hb.status_tags();
+        const auto it = tags.find("yuzu.inv_settings_version");
+        if (it != tags.end() && collection_settings::is_reportable_tag(it->second)) {
+            std::shared_lock lock(inventory_settings_reconcile_mu_);
+            if (inventory_settings_reconcile_fn_) {
+                guarded_reconcile(
+                    metrics_, "yuzu_server_inventory_settings_reconcile_exceptions_total",
+                    "inventory settings", via_str, agent_id_str,
+                    [&] { inventory_settings_reconcile_fn_(agent_id_str, it->second); });
             }
         }
     }
@@ -180,6 +260,17 @@ void HeartbeatIngestion::ingest(const ::yuzu::agent::v1::HeartbeatRequest& hb,
         std::string os_from_session;
         if (auto sess = registry_.get_session(agent_id_str))
             os_from_session = sess->os;
+        // HA WS-5 #5685 hp-2: a replica that sees only this agent's NON-OWNER heartbeats holds
+        // no session for it, so the snapshot's `os` was blank. Fall back to the durable presence
+        // row (a primary-key read, never a roster scan). Local wins, and an empty answer or a
+        // failed read stays blank (unknown), which is what this path produced before: a
+        // blank `os` never invents a platform. Skipped while the batch's presence store is
+        // tripped (#5686) so a degraded store is not read once per snapshot heartbeat.
+        if (os_from_session.empty() && offline_store_ && presence_ok) {
+            if (auto ep = offline_store_->find_within(agent_id_str, kPresenceOsFallbackWindow);
+                ep && *ep)
+                os_from_session = (*ep)->os;
+        }
         std::string parse_err;
         auto parsed = FleetTopologyStore::parse_fleet_snapshot_json(
             hb.fleet_snapshot_json(), agent_id_str, os_from_session, &parse_err);

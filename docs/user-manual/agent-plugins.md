@@ -62,9 +62,9 @@ The `echo` plugin was named `tar` before 2026-10 (`tar.dll`, `tar.so`, `tar.dyli
 | `power_health` | ✅ ✅ 🟡 | Battery, thermal, and power-plan inventory, plus a gated power-plan switch | [README](../../agents/plugins/power_health/README.md) |
 | `printing` | ✅ ✅ ✅ | Printer/job inventory plus a single narrowly-scoped clear_queue cancellation | [README](../../agents/plugins/printing/README.md) |
 | `privacy_permissions` | 🟡 🟡 🟡 | Per-app sensitive-permission grants -- camera, microphone, location, full-disk-access equivalents (read-only) | [README](../../agents/plugins/privacy_permissions/README.md) |
+| `process_introspect` | 🟡 🟡 🟡 | Per-process introspection of one pid, one facet per request: resource limits, signal masks, capabilities, seccomp, OOM and scheduling; numbers and masks only | [README](../../agents/plugins/process_introspect/README.md) |
 | `processes` | ✅ ✅ ✅ | Process listing — enumerate and query running processes | [README](../../agents/plugins/processes/README.md) |
 | `procfetch` | ✅ ✅ ✅ | Enumerates running processes with SHA-1 hashes of executables | [README](../../agents/plugins/procfetch/README.md) |
-| `quarantine` | ✅ ✅ ✅ | Device network isolation (quarantine) with per-IP whitelisting | [README](../../agents/plugins/quarantine/README.md) |
 | `rdp_control` | ✅ ⛔ ⛔ | Remote Desktop control — enable/disable RDP (registry + firewall + TermService) | [README](../../agents/plugins/rdp_control/README.md) |
 | `registry` | ✅ 🟡 🟡 | Windows Registry -- get, set (six types, verified), delete value, delete key (optionally recursive), enumerate, per-user reads and writes, bulk apply with an undo manifest | [README](../../agents/plugins/registry/README.md) |
 | `remote_access_audit` | 🟡 ✅ 🟡 | SSH inbound-access audit: sshd_config as written, per-account authorized_keys fingerprints, sshd service state; never key comments, option values or paths | [README](../../agents/plugins/remote_access_audit/README.md) |

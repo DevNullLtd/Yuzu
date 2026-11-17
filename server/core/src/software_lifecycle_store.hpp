@@ -118,6 +118,13 @@ public:
     [[nodiscard]] std::optional<std::vector<LifecycleRule>>
     rules_for(const std::vector<std::string>& product_keys);
 
+    /// Every stored rule of one source (shipped, external or imported; `declared` is not a rule
+    /// source and answers nullopt), ordered by (product_key, version_prefix, event). One bounded
+    /// read of at most `kLifecycleCsvMaxRows` rows, the per-source bound `replace_rules` enforces;
+    /// more than that is a `row_cap` degrade. nullopt = degraded or refused; an empty vector =
+    /// no rows.
+    [[nodiscard]] std::optional<std::vector<LifecycleRule>> rules_of(LifecycleSource source);
+
     /// Every declared fact of the given exact (product_key, version) pairs (at most
     /// `kLifecycleBatchMax`; more is refused). nullopt = degraded, refused, or more than 20,000
     /// rows. An empty vector = no rows.

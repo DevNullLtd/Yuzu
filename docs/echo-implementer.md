@@ -275,7 +275,7 @@ retired tables just gets the roll-up schema installed. Otherwise `migrate_to_v10
 
 1. Pre-check: the volume holds twice the file plus its write-ahead log free, else the open fails
    with a message that begins with `kFreeSpaceRefusalPrefix`; the plugin then loads offline (`storage_state|offline|free_space`,
-   no trigger registered) instead of failing to load. A free-space figure that cannot be read is a refusal too (the 2x check is mandatory, never skipped) and is logged; a database with nothing to migrate needs no room.
+   no trigger registered) instead of failing to load, and retries the open in the background (below). A free-space figure that cannot be read is a refusal too (the 2x check is mandatory, never skipped) and is logged; a database with nothing to migrate needs no room.
 2. Rename each old summary tier to `<name>_legacy`, install the roll-up schema, then convert every
    legacy row into the interned table (an average becomes `avg * samples`, a sum column is rebuilt
    from it, the keys intern through the dictionary).
@@ -408,7 +408,7 @@ held, rows rejected, replay keys seeded, tables dropped, file sizes and the WAL 
 the retired tables' own column lists, which live in `echo_fold_schema.cpp` (`legacy_live_columns`); they
 are the last copy of the raw schema and exist only to read old files.
 
-Three operational facts about the migration. (1) Plugin `init()` blocks for the whole migration:
+Three operational facts about the migration. (1) Plugin `init()` blocks for the first migration attempt, which is bounded by the per-attempt deadline below:
 `agents/core/src/agent.cpp` runs every plugin's init in its load loop (about :1057-1085), before the
 Register RPC and before the heartbeat thread starts (about :2005 and :2582), so the agent registers
 after the migration, and the Windows SCM and systemd (`Type=simple`) have no readiness deadline it can
@@ -416,8 +416,8 @@ trip. Agent-level start-to-registered time is not measured. (2) The transaction'
 the file's size: 325.7 MB on a 241.8 MB file (1.35 times) in the one measurement. The free-space
 pre-check (twice the file plus the log on disk) covers that case (WAL plus new file about 404 MB under the 483 MB demanded); no
 general bound is proven. (3) A failed earlier step (v8) makes `open()` refuse before the roll-up step
-runs; the plugin's init fails (`init_failed` in the heartbeat's `yuzu.plugins_failed`) until a start
-succeeds.
+runs; the plugin loads offline (`storage_state|offline|migration_failed`) and retries the open, as for
+a failed roll-up step (below).
 
 Consequences for code that reads the store:
 - `echo_usage.cpp` is fed the process fold's events inside the process transaction
@@ -458,6 +458,51 @@ roll-up declarations, so the registry's tier lists and the declarations cannot d
 `fold_sources()`; a `*_delta` in `echo_fold.hpp`; the count pins in `test_echo_fold.cpp` (17
 sources, 34 tiers, 18 registry tiers); the capability TSV rows and the regenerated
 `docs/os-capability-matrix.md`.
+
+#### Migration failure: offline with retry (owner ruling 2026-11-16, #7290)
+
+A failure of the v10 step that is not a crash leaves the file exactly as found (all-or-nothing) and does
+not fail the plugin. Echo **loads offline**, answers `echo.status` with the reason, collects nothing
+and registers no trigger, and a background thread retries the whole `EchoDatabase::open`. The
+alternative that was rejected is quarantine-and-start-fresh: it would discard data a repair could save,
+break the all-or-nothing rule and re-enable every source an operator had paused.
+
+- **Reasons.** `free_space` (the pre-check refusal), `migration_failed` (the v10 step failed, ran past
+  its deadline, or an earlier step had not finished), `open_failed` (any other failure seen on a later
+  retry). `classify_open_failure` tells them apart by the open error's text prefix
+  (`echo_status_format.hpp`; `echo_db.cpp` builds the two refusals from the same constants). Every other
+  first-open failure (a planted link, a corrupt file that cannot be moved aside, a busy or unreadable
+  integrity check, an un-adopted `tar.db`) is still a plugin init failure.
+- **First attempt is synchronous.** `init()` makes the first attempt itself, so the agent still
+  registers only after the migration; it is bounded by the deadline below. Later attempts run on the
+  retry thread (`echo_open_retry.hpp`).
+- **Back-off.** 1, 5 and 15 minutes after the first failure, then hourly, for ever
+  (`open_retry_delay`). A `free_space` plugin checks the volume's free bytes against the migration's
+  need (twice the file plus its log) before each attempt and skips the open while short, because every
+  open runs a whole-file `integrity_check`. A deterministic failure (a damaged mark, an out-of-range
+  bucket) still pays a full read and a write-ahead-log write each hour until it is repaired; the repair
+  needs the agent stopped.
+- **Per-attempt deadline.** 60 s plus 2 s per MiB of the database file, doubled for every earlier
+  attempt that ended on the deadline, capped at one hour (`v10_migration_deadline`). The one measured
+  migration took 55 s on a 242 MB file, so a short fixed bound would interrupt every attempt on a
+  full-size database. A hit (or a shutdown, through `v10_cancel`) interrupts the running statement with
+  the progress handler and rolls back. The deadline covers the transaction only: a committed migration
+  is never failed for time, and the post-commit checkpoint and VACUUM are not cancellable.
+- **In-transaction re-read.** Under the write lock the migration reads `schema_version` and the
+  retired-table list again. Version 10 there means a second opener finished first and this open is a
+  no-op; a changed list fails the attempt for the retry to redo. (Two agents on one data directory
+  remain unsupported; a busy file before the migration step is still a hard init failure.)
+- **Going online.** The retry thread assigns `db_`, runs `start_collection` (everything `init` does
+  once the database is open) and only then stores `online_` (release) as that function's last
+  statement. Dispatch loads `online_` (acquire) before touching `db_` or any collector member, and
+  answers with the offline refusal until then. If `start_collection` throws on the retry thread the
+  loop ends (a second start over a half-started source set would double-start sources) and `status`
+  reports `open_failed`; a restart recovers.
+- **Fleet signal.** The plugin KV key `heartbeat.storage_offline` (set to the reason token while
+  offline, deleted when online) reaches the server as the status tag `yuzu.plugin.echo.storage_offline`;
+  the server publishes `yuzu_fleet_echo_storage_offline{reason}` and the alert `YuzuEchoStorageOffline`
+  (warning, 30 minutes) fires on it. The tokens are duplicated literals on the two sides, each pinned
+  by a test.
 
 ---
 

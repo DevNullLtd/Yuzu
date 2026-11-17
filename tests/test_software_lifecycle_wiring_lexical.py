@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SAM-23 lexical gate: the software lifecycle store stays wired, fail-closed and observable.
+"""SAM-23 wiring + SAM-24 routes lexical gate: the software lifecycle store stays wired, fail-closed and observable.
 
 Nothing exercises ServerImpl's boot block in a unit test (docs/testing/unit-test-conventions.md;
 no unit test boots ServerImpl for any fail-closed store), and a dropped or inverted line fails
@@ -13,6 +13,9 @@ silently:
   * HealthRoutes must be handed the store and /readyz must report its real open state, not a
     constant (R5, R8);
   * stop() must drop the store ahead of the pool (R7);
+  * the REST routes (SAM-24) must be registered ahead of RestApiV1::register_routes, with the real
+    store and both gates, or the import, list and clear routes answer 503 forever or fall to the
+    generic inventory GET (R11);
   * each degrade family must be pre-seeded at boot with every reason the store counts under THAT
     family (taken from its note_degrade call sites), so the first degrade reads as an increase
     from 0 (R9, R10).
@@ -46,6 +49,7 @@ FLAG = "startup_failed_ = true"
 # A statement at the start of a line: a `//`-commented flag does not count.
 FLAG_STMT = re.compile(r"^[ \t]*" + re.escape(FLAG) + ";", re.M)
 FLAG_WINDOW = 400
+ROUTES_WINDOW = 400  # the Deps initialiser that follows the register_routes( call
 
 DEPS_WIRING = ".software_lifecycle_store = software_lifecycle_store_.get()"
 # The whole condition: the bare 'seed->empty()' is also a substring of '!seed->empty()'.
@@ -54,6 +58,11 @@ STORE_RESET = "software_lifecycle_store_.reset();"
 POOL_RESET = "pg_pool_.reset();"  # the only occurrence with a semicolon; the rest are comments
 READYZ_ROW = '"software_lifecycle_store"'
 READYZ_EXPR = "deps.software_lifecycle_store && deps.software_lifecycle_store->is_open()"
+ROUTES_REGISTER = "SoftwareLifecycleRoutes{}.register_routes("
+REST_REGISTER = "rest_api_v1_->register_routes("
+# The statement, not a comment that names it: only a line that starts with the call counts.
+REST_STMT = re.compile(r"^[ \t]*" + re.escape(REST_REGISTER), re.M)
+ROUTES_DEPS = (".perm_fn = perm_fn", ".audit_fn = audit_fn", ".store = software_lifecycle_store_.get()")
 FAMILIES = (
     "yuzu_server_software_lifecycle_store_read_degrade_total",
     "yuzu_server_software_lifecycle_store_write_degrade_total",
@@ -100,6 +109,18 @@ def problems(server: str, health: str, store: str) -> list:
         out.append("R8: health_routes.cpp lacks the software_lifecycle_store /readyz row")
     if READYZ_EXPR not in flat:
         out.append(f"R8: the /readyz row is not '{READYZ_EXPR}'")
+
+    routes_at = server.find(ROUTES_REGISTER)
+    if routes_at < 0:
+        out.append(f"R11: server.cpp lacks '{ROUTES_REGISTER}'")
+    else:
+        rest = REST_STMT.search(server)
+        if rest is None or routes_at > rest.start():
+            out.append("R11: the lifecycle routes must register ahead of rest_api_v1_->register_routes")
+        window = server[routes_at : routes_at + ROUTES_WINDOW]
+        for dep in ROUTES_DEPS:
+            if dep not in window:
+                out.append(f"R11: the lifecycle routes Deps lack '{dep}'")
 
     consts = dict(STORE_CONST.findall(store))
     reasons = [v for k, v in consts.items() if k.startswith("kReason")]
@@ -168,6 +189,19 @@ def drop_reason(family: str, reason: str):
     )
 
 
+def edit_routes_dep(dep: str, replacement: str):
+    """Replace `dep` inside the lifecycle routes' Deps initialiser only (other blocks share the names)."""
+
+    def mutate(server: str) -> str:
+        at = server.find(ROUTES_REGISTER)
+        j = server.find(dep, at) if at >= 0 else -1
+        if j < 0 or j - at >= ROUTES_WINDOW:
+            return server
+        return server[:j] + replacement + server[j + len(dep) :]
+
+    return mutate
+
+
 def reset_after_pool(server: str) -> str:
     if STORE_RESET not in server or POOL_RESET not in server:
         return server
@@ -198,6 +232,22 @@ MUTATIONS = [
         (f"arm {n} entered on the inverted condition", "server", invert_condition(cond, arm), f"R{n}")
         for n, (cond, arm) in enumerate(ARMS, 1)
         if cond
+    ),
+    (
+        "routes registration dropped",
+        "server",
+        lambda t: t.replace(ROUTES_REGISTER, "SoftwareLifecycleRoutesGone{}.register_routes(", 1),
+        "R11",
+    ),
+    (
+        "routes registered after the generic inventory GET",
+        "server",
+        lambda t: t.replace(ROUTES_REGISTER, REST_REGISTER + ");\n        " + ROUTES_REGISTER, 1),
+        "R11",
+    ),
+    *(
+        (f"routes Deps lose '{dep}'", "server", edit_routes_dep(dep, dep.split(" = ")[0] + " = nullptr"), "R11")
+        for dep in ROUTES_DEPS
     ),
     ("Deps wiring dropped", "server", lambda t: t.replace(DEPS_WIRING, ".x = nullptr", 1), "R5"),
     (

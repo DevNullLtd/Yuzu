@@ -526,6 +526,24 @@ struct Config {
     /// clamped to whatever the pool you chose can actually carry.
     std::size_t http_worker_threads{0};
 
+    /// Concurrent streamed installed-software exports (--inventory-export-concurrency, 1-16),
+    /// server-wide. Each open export holds one HTTP worker for the life of the stream and is one
+    /// lease from the held-open stream budget (--max-sse-streams); this is the cap on those
+    /// leases. A request over the cap is answered 503 with a retry hint.
+    int inventory_export_concurrency{2};
+    /// Size limits on ONE streamed installed-software export (--inventory-export-max-rows,
+    /// --inventory-export-max-bytes), JSONL and CSV alike: a stream that would pass either is cut
+    /// without its terminating chunk. The defaults equal `software_export::kDefaultMaxRows` and
+    /// `kDefaultMaxBytes`; the ranges are in software_export_stream.hpp (the route clamps them).
+    std::int64_t inventory_export_max_rows{5'000'000};
+    std::int64_t inventory_export_max_bytes{std::int64_t{1} << 30};
+    /// Seconds between two on-demand software-inventory sync runs of the SAME run key (one
+    /// management group, one operator's scope expression, or the whole fleet): `POST
+    /// /api/v1/hardware/sync` and the MCP tool `sync_hardware_software`. 0 turns the gap off.
+    /// Per server process. The default equals `software_sync::kDefaultCooldownSecs` and the range
+    /// is 0..`kMaxCooldownSecs` (--inventory-sync-cooldown; server.cpp clamps it).
+    int inventory_sync_cooldown_s{600};
+
     // Fleet visualization (PR 3 of feat/viz-engine ladder)
     bool viz_disable{false}; // Kill switch: reject all /viz/fleet requests (DEP-1)
 

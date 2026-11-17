@@ -978,7 +978,12 @@ public:
 
     /// Disable MFA for a user. Clears the secret column, stamps
     /// mfa_disabled_at, and deletes all recovery codes. Idempotent on
-    /// not-enrolled rows.
+    /// not-enrolled rows. No production caller since #6079 PR 2c: production clears a factor
+    /// only through `AuthManager::commit_mfa_disable` / `MfaDisableOwner`, which also end the
+    /// account's sessions and write the outcome audit row in the same transaction. This one
+    /// ends no session and writes no audit row; it is retained for tests and as the carrier of
+    /// the shared clear helper, and a production caller fails the factor-credential inventory
+    /// test (test_step_up_route_inventory.cpp).
     std::expected<void, AuthDBError> mfa_disable(const std::string& username);
 
     /// `mfa_disable`, reporting whether the account had a verified factor at the moment of the
@@ -991,7 +996,9 @@ public:
     /// untouched. This is the atomic "still at the admitted generation" condition for BOTH the
     /// enrolled clear and the provisional cancel: an account admitted un-enrolled at generation g
     /// and enrolled in between reads a different value and is refused. `mfa_disable` passes
-    /// `std::nullopt`.
+    /// `std::nullopt`. Like `mfa_disable`, no production caller since #6079 PR 2c (production
+    /// uses `AuthManager::commit_mfa_disable` / `MfaDisableOwner`): it ends no session and
+    /// writes no audit row, and is retained for tests and as the shared-helper carrier.
     [[nodiscard]] std::expected<bool, AuthDBError>
     mfa_disable_report(const std::string& username,
                        std::optional<std::int64_t> expected_factor_gen);

@@ -241,7 +241,7 @@ dispatch as system with `nullopt`, deferred to the #1714/#1715 core chokepoint.
 agent_id)` FIRST (CDX-P1-02 brought REST to parity with MCP, which already threads a `{agent_id}` confined
 `VisibleSet`); since #6065 PR-Q `POST` then also runs the shared dispatch chokepoint
 (`classify_and_authorize_dispatch`), so the scoped gate is no longer the sole gate on creation and a
-global grant alone no longer admits a non-administrator (`DELETE` runs the same check for the `unquarantine` pair; `GET` remains scoped-gate only), and both fail CLOSED — a 500/`kInternalError` — when the scope gate is unwired, never
+global grant alone no longer admits a non-administrator (`DELETE` runs the same check for the `release` pair of the firewall plugin; `GET` remains scoped-gate only), and both fail CLOSED — a 500/`kInternalError` — when the scope gate is unwired, never
 widening to a global grant. `GET /api/v1/quarantine` is scoped the same way (gov-fix, admit-then-filter
 per record via the same `scoped_perm_fn`): a device outside the caller's visible set is dropped from
 the list entirely, not merely blocked from write access — closing the asymmetry where a confined
@@ -383,7 +383,7 @@ schedule-creation time), never by a broadcast exemption carved into this targeti
 surface may cite this exception; every other caller of a Forensics-classified row stays
 single-target, no exceptions.
 
-**The Forensics plugins.** The capability catalogue holds 10 `Forensics` rows over 5 plugins (`app_usage`, `browser_inventory`, `execution_artifacts`, `privacy_permissions`, `remote_access_audit`); `test_capability_catalogue.cpp` pins the plugin set and the row count. `execution_artifacts`, `browser_inventory`, `privacy_permissions` and `remote_access_audit` are default-off behind a plugin-config kill switch seeded at server start (`PluginConfigStore::seed_kill_switch_default_off`, `server.cpp`); `app_usage` also has a dedicated read surface (below).
+**The Forensics plugins.** The capability catalogue holds 11 `Forensics` rows over 6 plugins (`app_usage`, `browser_inventory`, `execution_artifacts`, `privacy_permissions`, `process_introspect`, `remote_access_audit`); `test_capability_catalogue.cpp` pins the plugin set and the row count. `execution_artifacts`, `browser_inventory`, `privacy_permissions`, `remote_access_audit` and `process_introspect` are default-off behind a plugin-config kill switch seeded at server start (`PluginConfigStore::seed_kill_switch_default_off`, `server.cpp`); `app_usage` also has a dedicated read surface (below).
 
 **Wave 7 PR7b: application usage is the first live `Forensics` consumer, not `execution_artifacts`.**
 The `app_usage` plugin's dedicated read surface (single-target, `Forensics:Read`) is the first row

@@ -64,6 +64,7 @@
 #include "capability_decls/plugin_action_catalogue_mgmt_posture.hpp"
 #include "capability_decls/plugin_action_catalogue_shares.hpp"
 #include "capability_decls/plugin_action_catalogue_remote_access_audit.hpp"
+#include "capability_decls/plugin_action_catalogue_process_introspect.hpp"
 #include "command_capability.hpp"
 #include "dispatch_caller.hpp"
 
@@ -450,6 +451,33 @@ TEST_CASE("remote_access_audit: the REAL catalogue fragment is Forensics-securab
     }
 }
 
+TEST_CASE("process_introspect: the REAL catalogue fragment is Forensics-securable and gates "
+          "as single-target — one agent id is Targeted; zero or two are refused — so a drift in "
+          "the shipped securable string (the Forensics literal the gate keys on) fails here",
+          "[server][dispatch][security]") {
+    CommandCapabilityRegistry registry{
+        yuzu::server::capdecls::plugin_action_catalogue_process_introspect()};
+    auto classified = registry.classify("process_introspect", "inspect");
+    REQUIRE(classified.has_value());
+    CHECK(classified->securable == kForensicsSecurable);
+    CHECK(requires_explicit_targets(*classified));
+
+    const auto targeted = evaluate_destructive_targeting(classified,
+                                                          /*valid_nonempty_agent_ids=*/true,
+                                                          /*scope_key_present=*/false,
+                                                          /*agent_id_count=*/1);
+    CHECK(targeted.verdict == DestructiveTargetingVerdict::Targeted);
+    for (const std::size_t n : {std::size_t{0}, std::size_t{2}}) {
+        const auto refused = evaluate_destructive_targeting(classified,
+                                                             /*valid_nonempty_agent_ids=*/n != 0,
+                                                             /*scope_key_present=*/false,
+                                                             /*agent_id_count=*/n);
+        CHECK(refused.verdict == DestructiveTargetingVerdict::RefuseUntargeted);
+        CHECK(refused.refusal_reason == kReasonForensicUntargeted);
+        CHECK(refused.refusal_message == kForensicUntargetedMessage);
+    }
+}
+
 TEST_CASE("Inventory ReadOnly row stays NotDestructive — the single-target rule does not leak "
           "onto every ReadOnly securable",
           "[server][dispatch][security]") {
@@ -645,7 +673,7 @@ TEST_CASE("#3685 defect 4: the two Destructive refusal strings are pinned byte-e
 // so a future catalogue change that adds or removes a Destructive row has
 // to touch this test, not silently drift past #3685's own coverage claim
 // the way the design doc's count already did.
-TEST_CASE("catalogue-consistency tripwire: the live Destructive row count is 22, not the design "
+TEST_CASE("catalogue-consistency tripwire: the live Destructive row count is 21, not the design "
           "doc's stale 14 (#3685) — a new/removed Destructive row must touch this test",
           "[server][dispatch][security]") {
     namespace capdecls = yuzu::server::capdecls;
@@ -700,13 +728,14 @@ TEST_CASE("catalogue-consistency tripwire: the live Destructive row count is 22,
             CHECK_FALSE(row.system_reserved);
         }
     }
-    // 22: re-verified fresh against the merged tree (see the TEST_CASE-level
+    // 21: re-verified fresh against the merged tree (see the TEST_CASE-level
     // comment above) rather than carried forward unchecked — a FUTURE
     // Destructive row in any fragment must land with the aggregate tripwire
     // still passing, which is exactly the drift this test's own title
     // forbids. (19 + registry.delete_user_value and registry.apply, registry 2.1.0,
-    // + firewall.quarantine, firewall 1.0.0.)
-    CHECK(destructive_count == 22);
+    // + firewall.quarantine, firewall 1.0.0; minus the removed containment plugin's
+    // Destructive row (PRQ.2).)
+    CHECK(destructive_count == 21);
     // D4's rationale (dispatch_destructive_gate.hpp doc comment): exactly
     // the four Execution:Execute rows rely on the chokepoint's
     // AdminOrApproval gate as their elevation ceiling. This sub-claim WAS
