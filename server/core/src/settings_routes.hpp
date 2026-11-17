@@ -162,16 +162,34 @@ public:
     /// other route reads it.
     void set_read_perm_fn(PermFn fn) { read_perm_fn_ = std::move(fn); }
 
-    /// Audit writer for a session the handler already resolved (#6079): `mfa.disable` ends the
-    /// actor's own session before it writes its row, so the request-resolving `AuditFn` would
-    /// stamp an empty principal. Same `std::function` type as `AuthRoutes::AuditAsSessionFn`;
-    /// server.cpp binds `AuthRoutes::audit_as_session_fn()`. Left unset (tests, other callers)
-    /// the handler falls back to `AuditFn`.
+    /// Audit writer for a session the handler already resolved (#6079): the Settings MFA
+    /// disable route writes its intent, denied and error rows through it (its success row is
+    /// written by `MfaDisableOwner` inside the clear's transaction, through the
+    /// `AuditEventForSessionFn` seam below), and the enrol-confirm refusal rows
+    /// (`session_not_durable`, `session_store_unavailable`) use it too, because the cookie may
+    /// be missing or stale and the request-resolving `AuditFn` would stamp an empty
+    /// principal. Same `std::function` type as `AuthRoutes::AuditAsSessionFn`; server.cpp binds
+    /// `AuthRoutes::audit_as_session_fn()`. Left unset (tests, other callers) the handler
+    /// falls back to `AuditFn`.
     using AuditAsSessionFn = std::function<bool(
         const httplib::Request&, const auth::Session&, const std::string& principal_role,
         const std::string& action, const std::string& result, const std::string& target_type,
         const std::string& target_id, const std::string& detail)>;
     void set_audit_as_session_fn(AuditAsSessionFn fn) { audit_as_session_fn_ = std::move(fn); }
+
+    /// The identity half of an audit row for a session the handler already resolved, built
+    /// WITHOUT writing it (#6079 PR 2c): `mfa.disable` hands it to `MfaDisableOwner` as the
+    /// outcome-row template, which the owner persists inside its own transaction. Same
+    /// `std::function` type as `AuthRoutes::AuditEventForSessionFn`; server.cpp binds
+    /// `AuthRoutes::audit_event_for_session_fn()`. Left unset the disable route answers 503 and
+    /// changes nothing (the outcome row could not be built, so the clear cannot run).
+    using AuditEventForSessionFn = std::function<AuditEvent(
+        const httplib::Request&, const auth::Session&, const std::string& principal_role,
+        const std::string& action, const std::string& result, const std::string& target_type,
+        const std::string& target_id)>;
+    void set_audit_event_for_session_fn(AuditEventForSessionFn fn) {
+        audit_event_for_session_fn_ = std::move(fn);
+    }
 
     /// The gate for POST /api/settings/mfa/recovery-codes and POST /api/settings/mfa/disable
     /// (#6079): they call it INSTEAD of `step_up_fn`, because they need the admitted factor
@@ -470,6 +488,7 @@ private:
     }
     AuditFn audit_fn_;
     AuditAsSessionFn audit_as_session_fn_;
+    AuditEventForSessionFn audit_event_for_session_fn_;
     AuditReadFn audit_read_fn_; // #4028 — fail-closed REST audit hook, see AuditReadFn doc comment
     std::function<void()> dex_alert_apply_fn_; // F1 live-apply hook (may be empty)
     std::optional<DexScorePolicyWriteDeps> dex_score_policy_writer_; // Scoring tab; see setter

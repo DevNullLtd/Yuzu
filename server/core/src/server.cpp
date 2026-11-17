@@ -52,6 +52,7 @@
 #include "approval_manager.hpp"
 #include "audit_store.hpp"
 #include "credential_change_owner.hpp" // #5342 — one-transaction local credential change
+#include "mfa_disable_owner.hpp"        // #6079 PR 2c: one-transaction local MFA factor clear
 #include "echo_corruption_audit.hpp" // #1567 corruption audit gate
 #include "body_cap_httplib.hpp" // header-derived body-cap arguments read the way httplib reads them
 #include "body_cap_policy.hpp" // #2407: pre-auth request-body cap policy table
@@ -3836,9 +3837,9 @@ public:
             "clear_mfa_proof / rebind_guard / elevate / account_state, the last being the "
             "read of the account store that gates a durable local session); a validate "
             "degrade fails the request closed, and elevate / revoke (via invalidate_user) "
-            "degrades fail the privileged op closed, except "
-            "that an invalidate_user after an already-committed MFA clear leaves the "
-            "clear in place and ends partial",
+            "degrades fail the privileged op closed; the Settings MFA disable and "
+            "--mfa-reset no longer call invalidate_user and are not counted on this "
+            "series (their failures are the 503 / error audit rows)",
             "counter");
         for (auto op : {"validate", "create", "touch", "generation_refresh", "reap",
                         "invalidate_user", "invalidate", "mark_mfa", "clear_mfa_proof",
@@ -6586,6 +6587,14 @@ public:
                     credential_change_owner_ =
                         std::make_unique<CredentialChangeOwner>(*pg_pool_, audit_store_.get());
                     auth_mgr_.set_credential_change_owner(credential_change_owner_.get());
+                    // #6079 PR 2c: the sibling owner for clearing a local account's
+                    // second factor (Settings disable), the factor clear, the
+                    // account's durable sessions and the OUTCOME audit row in ONE
+                    // transaction on the same shared pool and audit store.
+                    // Nulled on auth_mgr_ at teardown beside the credential owner.
+                    mfa_disable_owner_ =
+                        std::make_unique<MfaDisableOwner>(*pg_pool_, audit_store_.get());
+                    auth_mgr_.set_mfa_disable_owner(mfa_disable_owner_.get());
                 }
             }
             // Internal-CA store — PostgreSQL (ADR-0053, schema ca_store): cert inventory + CRL
@@ -11980,6 +11989,9 @@ public:
         // pg_pool_ + audit_store_, both reset below).
         auth_mgr_.set_credential_change_owner(nullptr);
         credential_change_owner_.reset();
+        // #6079 PR 2c: same contract for the MFA-disable owner.
+        auth_mgr_.set_mfa_disable_owner(nullptr);
+        mfa_disable_owner_.reset();
         // #4966: same contract for the borrowed RbacStore (reset further below).
         auth_mgr_.set_rbac_store(nullptr);
 
@@ -18746,9 +18758,12 @@ private:
         // must not write an auth.admin_required row per panel. Mutating routes keep the loud
         // require_admin bound above. Wired before the listener starts.
         // The Settings disable ends the actor's own session (#6079), so the intent row and the
-        // outcome row (ok, partial or error) it writes around the clear need the session-bound
-        // writer, not the request-resolving one.
+        // denied/error outcome rows it writes around the clear need the session-bound writer, not
+        // the request-resolving one.
         settings_routes_->set_audit_as_session_fn(auth_routes_->audit_as_session_fn());
+        // #6079 PR 2c: the success outcome row is written INSIDE MfaDisableOwner's transaction;
+        // this builds its identity half with the same builder the session-bound writer uses.
+        settings_routes_->set_audit_event_for_session_fn(auth_routes_->audit_event_for_session_fn());
         // #6079: the recovery-codes and disable handlers use this gate instead of `step_up_fn`:
         // the same decision (`run_in_handler_step_up`), but it also returns the factor generation
         // it admitted, which the handler compares under the users row lock. Same sources as
@@ -25309,6 +25324,10 @@ private:
     /// stop() also resets it explicitly (after nulling auth_mgr_'s pointer)
     /// before audit_store_/pg_pool_ go.
     std::unique_ptr<CredentialChangeOwner> credential_change_owner_;
+    /// #6079 PR 2c: one-transaction MFA factor-clear query owner. Same borrow and
+    /// lifetime contract as credential_change_owner_ (declared after audit_store_,
+    /// nulled on auth_mgr_ and reset in stop() before audit_store_/pg_pool_).
+    std::unique_ptr<MfaDisableOwner> mfa_disable_owner_;
     std::unique_ptr<TagStore> tag_store_;
 
     // Phase 2: Instruction system

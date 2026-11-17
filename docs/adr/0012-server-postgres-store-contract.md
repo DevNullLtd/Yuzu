@@ -491,3 +491,25 @@ read (no connection in the bounded acquire, a statement error or timeout, an ind
 returns `std::nullopt`, distinct from an engaged empty result. Nothing about the rule changes: the
 owner borrows the pool, issues schema-qualified SQL with bound parameters, and no per-store class
 gained a cross-schema method.
+
+## Update (2026-11-16) -- an eighth query owner: MfaDisableOwner
+
+An eighth query owner: `MfaDisableOwner` (`mfa_disable_owner.{hpp,cpp}`, #6079 PR 2c), the only
+operator-initiated path that clears an ENROLLED factor while leaving the account active (the Settings
+disable and the host break-glass `--mfa-reset`); account deactivation clears it incidentally through
+`soft_delete_user_in_txn` and ends sessions in a separate step. It copies `CredentialChangeOwner`'s shape: one `pool.with_txn_for` on one
+lease, schema-qualified SQL across `auth`, `session_store` and `audit_store`, a txn-scoped
+`lock_timeout`, and no compensating write. In one transaction it clears the factor and deletes the
+recovery codes (`auth_sql::clear_mfa_factor_in_txn` in `auth_db_sql_helpers.hpp`, the ONE copy of
+those statements, which `AuthDB::mfa_disable_report` also runs), deletes every durable session of
+the account (`session_sql::delete_user_sessions_in_txn`), inserts the OUTCOME audit row
+(`AuditStore::log_in_txn`) and LAST bumps the `session_meta` write generation
+(`session_sql::bump_generation_in_txn`). The clear, the session delete and the outcome row therefore
+commit or abort together; the caller's `attempted` intent row is written before, outside the
+transaction, and still fails closed. The one indeterminate case is a connection lost exactly at
+COMMIT. The lock order is `CredentialChangeOwner`'s, with the same acyclicity argument: the
+`auth.users` row, the `session_store.sessions` rows, the `audit_store.audit_events` INSERT, then the
+`session_meta` row last; a clear of an account with no verified factor that leaves its sessions alone
+takes only the first and the audit INSERT. As with the other owners it is correct only because
+`AuthDB`, `SessionStore` and `AuditStore` share ONE pool/database (ADR-0006); a split fails every
+statement closed, never a silent partial write.

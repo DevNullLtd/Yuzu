@@ -21,6 +21,7 @@
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
 #include "acquire_retry.hpp"
+#include "auth_lock_bounds.hpp" // kAuthRecheckLockTimeout: the write budget the owners stay below
 #include "auth_db_sql_helpers.hpp" // one copy of the soft-delete / role-write statements (#4966)
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
@@ -190,9 +191,10 @@ constexpr const char* kStoreName = "auth";
 // statement / mutation paths get a little more room. Neither is unbounded —
 // unbounded `acquire()` is construction-only (used once, in the ctor).
 constexpr std::chrono::milliseconds kReadTimeout{1500};
-constexpr std::chrono::milliseconds kWriteTimeout{2000};
-// Also the lock_timeout of recheck_role_locked; CredentialChangeOwner::kWriteTimeout MUST stay
-// strictly below it (R22e).
+constexpr std::chrono::milliseconds kWriteTimeout{kAuthRecheckLockTimeout};
+// Also the lock_timeout of recheck_role_locked; CredentialChangeOwner::kWriteTimeout and
+// MfaDisableOwner::kWriteTimeout MUST both stay strictly below it (R22e). The value lives in
+// auth_lock_bounds.hpp, where a static_assert beside each owner enforces the ordering.
 
 // Bounded acquire-retry (issue #2396). The shared PG pool arms a short
 // connect-backoff breaker after a connectivity hiccup (pg_pool.cpp): for a
@@ -2608,52 +2610,23 @@ AuthDB::mfa_disable_report(const std::string& username,
     // and reports `true` (unknown counts as enrolled, so the caller fails safe).
     //
     // #6079: with an expected generation the `pre` CTE gains `AND mfa_factor_gen = $2`, so the
-    // admitted generation is compared INSIDE the locking read (READ COMMITTED re-evaluates the
-    // predicate against the row a concurrent writer committed). Two compile-time statement texts,
-    // chosen in C++: `pg::exec_params` passes strings, so no SQL NULL is ever bound.
-    static constexpr const char* kClearSql =
-        "WITH pre AS (SELECT id, (mfa_enrolled_at IS NOT NULL) AS was_enrolled "
-        "FROM auth.users WHERE username = $1 AND is_active = TRUE FOR UPDATE) "
-        "UPDATE auth.users u SET mfa_totp_secret = NULL, mfa_enrolled_at = NULL, "
-        "mfa_disabled_at = now(), mfa_last_counter = 0, updated_at = now() "
-        "FROM pre WHERE u.id = pre.id RETURNING pre.was_enrolled";
-    static constexpr const char* kClearAtGenSql =
-        "WITH pre AS (SELECT id, (mfa_enrolled_at IS NOT NULL) AS was_enrolled "
-        "FROM auth.users WHERE username = $1 AND is_active = TRUE "
-        "AND mfa_factor_gen = $2::bigint FOR UPDATE) "
-        "UPDATE auth.users u SET mfa_totp_secret = NULL, mfa_enrolled_at = NULL, "
-        "mfa_disabled_at = now(), mfa_last_counter = 0, updated_at = now() "
-        "FROM pre WHERE u.id = pre.id RETURNING pre.was_enrolled";
+    // admitted generation is compared INSIDE the locking read. The statements, their
+    // classification and the recovery-code DELETE live in `auth_sql::clear_mfa_factor_in_txn`
+    // (auth_db_sql_helpers.hpp), ONE copy shared with `MfaDisableOwner`.
     bool was_enrolled = true;
     bool factor_changed = false;
     const bool ok = impl_->pool.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
-        std::vector<std::string> params{username};
-        if (expected_factor_gen)
-            params.push_back(std::to_string(*expected_factor_gen));
-        pg::PgResult upd =
-            pg::exec_params(conn, expected_factor_gen ? kClearAtGenSql : kClearSql, params);
-        if (upd.status() != PGRES_TUPLES_OK)
+        std::string sql_err;
+        const auto report =
+            auth_sql::clear_mfa_factor_in_txn(conn, username, expected_factor_gen, sql_err);
+        if (!report)
             return false;
-        if (PQntuples(upd.get()) == 1) {
-            was_enrolled = to_bool(col(upd.get(), 0, 0));
-        } else if (expected_factor_gen) {
-            // Zero rows with a guard engaged: classify in the SAME transaction. An ACTIVE row at
-            // another generation is a refusal (nothing cleared, the recovery codes untouched);
-            // an absent or inactive row keeps the fail-safe below (reports true).
-            pg::PgResult cls = pg::exec_params(
-                conn, "SELECT is_active, mfa_factor_gen FROM auth.users WHERE username = $1",
-                std::vector<std::string>{username});
-            if (cls.status() != PGRES_TUPLES_OK)
-                return false;
-            if (PQntuples(cls.get()) == 1 && to_bool(col(cls.get(), 0, 0)) &&
-                to_i64(col(cls.get(), 0, 1)) != *expected_factor_gen) {
-                factor_changed = true;
-                return false; // roll back before the DELETE
-            }
+        if (report->status == auth_sql::MfaClearStatus::kFactorChanged) {
+            factor_changed = true;
+            return false; // roll back; nothing was cleared and the codes are untouched
         }
-        pg::PgResult del = pg::exec_params(conn, "DELETE FROM auth.mfa_recovery_codes WHERE username = $1",
-                                           std::vector<std::string>{username});
-        return del.status() == PGRES_COMMAND_OK;
+        was_enrolled = report->was_enrolled;
+        return true;
     });
     if (factor_changed)
         return std::unexpected(AuthDBError::FactorChanged);

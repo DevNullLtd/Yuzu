@@ -1588,8 +1588,11 @@ three JIT-elevation routes keep their own handler gate. What an operator or scri
   administrator who has just enrolled is covered inside the window, for the confirming session
   only, because enrolment confirmation records a fresh proof for that session (the audit row
   `mfa.enroll.verified` says `step_up_proof=stamped`, or `step_up_proof=not_stamped` when the
-  session could not be stamped: a bearer principal, an absent or mismatched cookie, or a store
-  failure). An account with no MFA enrolled is not affected. These two routes are stricter than the
+  session could not be stamped: it ended between the durable-session check and the commit, the
+  account's factor changed again, the database clock stepped back, or the store failed). An
+  API-token or cookie-less caller can no longer confirm an enrolment at all: it is refused `401`
+  `session_not_durable` and must confirm from a signed-in browser session (it used to enrol and
+  record `not_stamped`). An account with no MFA enrolled is not affected. These two routes are stricter than the
   rest (#6079): they use the approver window, `min(--mfa-step-up-window-secs, 300)` and 300 when
   that setting is `0` or less, so `--mfa-step-up-window-secs=0` does not switch them off; only a
   signed-in local session can use them (an API token, an SSO identity or an engine principal is
@@ -1832,14 +1835,14 @@ the session store it uses to end the account's sessions the same way.
   accounts. Retry once; if it persists, follow the runbook and check first: reset only an account that reads
   `mfa_factor_gen <= 0`, and do not run `--mfa-reset` on the strength of this message alone. A `503` whose message is "authentication store is temporarily unavailable" is
   the plain transient one.
-- **Clearing a factor is unchanged apart from the generation check.** `yuzu-server --mfa-reset` and Disable in
-  Settings still write an `attempted` intent row first and an outcome row after, clear the factor and the
-  recovery codes in one transaction and end the account's sessions in a separate step (a failed session delete
-  is `result=partial` and `--mfa-reset` then exits non-zero), exactly as described in the `--mfa-reset` notice
-  below. The Settings Disable additionally compares the factor generation the step-up check admitted with the
+- **Clearing a factor is one all-or-nothing transaction, and Disable checks the generation.** `yuzu-server --mfa-reset` and Disable in
+  Settings write an `attempted` intent row first, outside the transaction, and then clear the factor, delete the
+  recovery codes, end the account's sessions and write the outcome row in ONE transaction (there is no
+  `result=partial`: a failed session delete rolls the clear back and `--mfa-reset` exits non-zero with nothing
+  changed), as described in the `--mfa-reset` notice below. The Settings Disable additionally compares the factor generation the step-up check admitted with the
   account's current one under the row lock and refuses with `409` (audit `denied`, `reason=factor_changed
-  expected_gen=<n>`) if they differ. `--mfa-reset` opens its bootstrap auth store and the session store it
-  uses to end the sessions without refusing on a missing or altered binding trigger, and prints a `WARN`
+  expected_gen=<n>`) if they differ. `--mfa-reset` opens its bootstrap auth store and the session store (whose
+  tables the session delete runs against) without refusing on a missing or altered binding trigger, and prints a `WARN`
   for each.
 - **Regenerating recovery codes and disabling MFA are local-session-only.** An API token or an SSO
   session that reached these two Settings routes before now gets `403`, and `--mfa-step-up-window-secs=0`
@@ -2240,7 +2243,7 @@ A refused request writes no quarantine record and releases none. The `403` bodie
 5. A SAML deployment has no approver path (#6098); give those approvers a local or OIDC account first.
 6. Have at least two enrolled approvers: a submitter cannot review their own request, so a single enrolled approver cannot decide that approver's own requests.
 7. Once the deployment is running, run the approvals-refused query (step 6 of "Verify approvals on a test request" below) to see whether approvals are being refused and why.
-8. Owners of scripts that run `yuzu-server --mfa-reset`, and of SIEM rules on `mfa.disabled` or `mfa.reset.breakglass`: `--mfa-reset` now exits `1` when ending the sessions fails (`result=partial`), when the audit store refuses its intent row, and when the clear itself fails; every clear writes two audit rows; a failed session delete is `result=partial`, not `success` (details in the `--mfa-reset` notice below).
+8. Owners of scripts that run `yuzu-server --mfa-reset`, and of SIEM rules on `mfa.disabled` or `mfa.reset.breakglass`: `--mfa-reset` exits `1` when the audit store refuses its intent row and when the clear, the session delete or the outcome row fails (all three roll back and nothing is changed; there is no `result=partial`; rows written by 0.15.x builds can still carry `partial` and `sessions_ended=failed`, so keep those values in queries and rules over retained history); every clear writes two audit rows, the outcome row committing with the clear (details in the `--mfa-reset` notice below).
 
 **What changed.** Approve and reject (`POST /api/approvals/{id}/approve`, `POST /api/approvals/{id}/reject`,
 the dashboard Approvals page, and the MCP tools `approve_request` / `reject_request`) now require all of:
@@ -2310,15 +2313,14 @@ principal and not an engine principal. The existing rule that the reviewer canno
     submitter: until then nothing can be approved. A seeded administrator that has never enrolled is in the same position. Self-service
     enrolment for non-admins is a planned follow-up and is not part of this change. `yuzu-server --mfa-reset`
     ends the account's sessions, and disabling MFA in Settings ends every session of the account, the one you
-    are using included (neither ends API tokens). **`--mfa-reset` now exits non-zero when ending the sessions fails**
-    (the factor is already cleared; it records `result=partial` in its audit row): scripts that run it and treat exit `0`
-    as success must handle that, and end the sessions by hand. It also exits `1` with
+    are using included (neither ends API tokens). **`--mfa-reset` exits non-zero when the clear, the session delete or the
+    outcome row fails** (all three are one transaction, so nothing is changed and no `result=partial` is recorded): scripts
+    that run it and treat exit `0` as success must handle that, and re-run it once the cause is fixed. It also exits `1` with
     `error: audit store did not accept the intent row; nothing was changed` when the audit store refuses its `attempted`
-    intent row (nothing is cleared; a second line on stderr points at the runbook's "Fallback: direct SQL" section), and `1`
-    when the clear itself fails. Every reset, and every Settings disable, now
+    intent row (nothing is cleared; a second line on stderr points at the runbook's "Fallback: direct SQL" section; that line is also printed when the session store did not open, when the outcome row is refused and when the clear itself fails, but not when the account has no active record). Every reset, and every Settings disable, now
     writes an extra `attempted` row before the outcome row, so a SIEM rule that counts one row per clear sees two; do
     not match on `result <> 'success'` without excluding `attempted` and `detail LIKE 'blocked:%'` rows, and key
-    failure rules on `result IN ('partial','error')`. Order the pair by the audit `id`. **With RBAC enforcement off (the shipped default),** the legacy gate requires the `admin` role for
+    failure rules on `result = 'error'`. Order the pair by the audit `id`. **With RBAC enforcement off (the shipped default),** the legacy gate requires the `admin` role for
     approving, so a non-admin is refused `403` "admin role required" before the MFA check and enrolling a non-admin
     approver achieves nothing until RBAC enforcement is turned on.
   - **When the approver rule's own read fails** (an unreadable stored session proof for any approver, or, for a local
