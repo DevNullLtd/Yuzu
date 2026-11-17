@@ -40,8 +40,7 @@ inline std::string extract_server_host(std::string_view target) {
 }
 
 /// Charset-only IP-literal check: an already-literal host needs no DNS
-/// round-trip at all. Deliberately not shape-validating (matches
-/// quarantine_parsers.hpp's is_safe_ip) -- callers only use a positive
+/// round-trip at all. Deliberately not shape-validating -- callers only use a positive
 /// result to SKIP resolution, never to admit an unvalidated value past a
 /// containment boundary on its own.
 inline bool looks_like_ip_literal(std::string_view s) {

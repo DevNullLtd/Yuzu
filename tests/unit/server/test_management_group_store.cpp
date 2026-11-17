@@ -978,6 +978,150 @@ TEST_CASE("ManagementGroupStore: cascade delete removes members and roles",
     CHECK(roles.empty());
 }
 
+// #7074 (C1): validate_new_group exposes the pre-insert refusals of create_group so a caller can refuse
+// BEFORE writing an audit row. create_group runs the same function, so each refusal text is identical.
+TEST_CASE("ManagementGroupStore: validate_new_group refusals match create_group text, write nothing",
+          "[pg][management_group][crud][mgmt-audit-first]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mgmt_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+
+    const auto baseline = store.list_groups_checked();
+    REQUIRE(baseline.has_value());
+
+    // Each case: the input, and the exact text create_group has always returned for it.
+    ManagementGroup empty_name;
+    empty_name.membership_type = "static";
+
+    ManagementGroup self_parent;
+    self_parent.id = "abcdef012345";
+    self_parent.parent_id = self_parent.id;
+    self_parent.name = "SelfParent";
+    self_parent.membership_type = "static";
+
+    ManagementGroup missing_parent;
+    missing_parent.name = "OrphanChild";
+    missing_parent.parent_id = "does-not-exist";
+    missing_parent.membership_type = "static";
+
+    // A chain of six groups (the deepest has five ancestors): a child below it exceeds the cap.
+    std::string prev_id;
+    for (int i = 0; i < 6; ++i) {
+        ManagementGroup g;
+        g.name = "Chain " + std::to_string(i);
+        g.membership_type = "static";
+        g.parent_id = prev_id;
+        auto r = store.create_group(g);
+        REQUIRE(r.has_value());
+        prev_id = *r;
+    }
+    ManagementGroup too_deep;
+    too_deep.name = "Chain 6";
+    too_deep.parent_id = prev_id;
+    too_deep.membership_type = "static";
+
+    const auto after_chain = store.list_groups_checked();
+    REQUIRE(after_chain.has_value());
+    REQUIRE(after_chain->size() == baseline->size() + 6);
+
+    struct Case {
+        const ManagementGroup* group;
+        const char* text;
+    };
+    const Case cases[] = {
+        {&empty_name, "group name cannot be empty"},
+        {&self_parent, "group cannot be its own parent"},
+        {&missing_parent, "parent group not found"},
+        {&too_deep, "maximum hierarchy depth (5) exceeded"},
+    };
+    for (const auto& c : cases) {
+        INFO("expected refusal: " << c.text);
+        auto v = store.validate_new_group(*c.group);
+        REQUIRE(!v.has_value());
+        CHECK(v.error() == c.text);
+
+        // create_group re-runs the same checks and returns the identical text.
+        auto created = store.create_group(*c.group);
+        REQUIRE(!created.has_value());
+        CHECK(created.error() == c.text);
+    }
+
+    // Neither call wrote a row.
+    const auto after = store.list_groups_checked();
+    REQUIRE(after.has_value());
+    CHECK(after->size() == after_chain->size());
+}
+
+TEST_CASE("ManagementGroupStore: validate_new_group accepts valid input without writing",
+          "[pg][management_group][crud][mgmt-audit-first]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mgmt_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+
+    ManagementGroup parent;
+    parent.name = "ValidateParent";
+    parent.membership_type = "static";
+    auto parent_id = store.create_group(parent);
+    REQUIRE(parent_id.has_value());
+
+    const auto baseline = store.list_groups_checked();
+    REQUIRE(baseline.has_value());
+
+    ManagementGroup root;
+    root.name = "ValidateRoot";
+    root.membership_type = "static";
+    ManagementGroup child;
+    child.name = "ValidateChild";
+    child.parent_id = *parent_id;
+    child.membership_type = "static";
+
+    CHECK(store.validate_new_group(root).has_value());
+    CHECK(store.validate_new_group(child).has_value());
+    // A name conflict is a write-time outcome, not a pre-insert check: validation does not see it.
+    ManagementGroup dup;
+    dup.name = "ValidateParent";
+    dup.membership_type = "static";
+    CHECK(store.validate_new_group(dup).has_value());
+
+    const auto after = store.list_groups_checked();
+    REQUIRE(after.has_value());
+    CHECK(after->size() == baseline->size());
+    CHECK(!store.find_group_by_name("ValidateRoot").has_value());
+    CHECK(!store.find_group_by_name("ValidateChild").has_value());
+
+    // create_group still creates on the same inputs, and still reports the conflict itself.
+    auto root_id = store.create_group(root);
+    REQUIRE(root_id.has_value());
+    auto child_id = store.create_group(child);
+    REQUIRE(child_id.has_value());
+    auto child_row = store.get_group(*child_id);
+    REQUIRE(child_row.has_value());
+    CHECK(child_row->parent_id == *parent_id);
+    auto dup_result = store.create_group(dup);
+    REQUIRE(!dup_result.has_value());
+    CHECK(dup_result.error() == "a group with that name already exists");
+}
+
+// No database: the not-open refusal comes first and is the same text from both entry points.
+TEST_CASE("ManagementGroupStore: validate_new_group and create_group refuse a closed store alike",
+          "[management_group][degrade][mgmt-audit-first]") {
+    PgPool pool{{.conninfo = "yuzu_invalid_keyword=1", .size = 1}};
+    ManagementGroupStore store{pool};
+    REQUIRE(!store.is_open());
+
+    ManagementGroup g;
+    g.name = "ClosedStore";
+    g.membership_type = "static";
+    auto v = store.validate_new_group(g);
+    REQUIRE(!v.has_value());
+    CHECK(v.error() == "database not open");
+    auto c = store.create_group(g);
+    REQUIRE(!c.has_value());
+    CHECK(c.error() == "database not open");
+}
+
 // Degrade-distinguishable fail-closed path (ADR-0042). Deliberately NOT [pg]:
 // it needs NO database — a construct-invalid pool makes is_open() false, and
 // every confinement read must then report a degrade (nullopt / unexpected),

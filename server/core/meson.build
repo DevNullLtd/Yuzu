@@ -864,6 +864,7 @@ yuzu_server_core_lib = static_library(
     'src/inventory_ci_join.cpp',
     'src/hardware_list_model.cpp',
     'src/hardware_section_integrity.cpp', # #7159: section-integrity counter + sampled WARN (the pure model stays metrics-free)
+    'src/hardware_ci_page_model.cpp', # bulk device-CI keyset page (GET /api/v1/hardware-ci + MCP twin)
     'src/device_containment_render.cpp',
     'src/device_estate_render.cpp',
     'src/software_catalog_rollup.cpp',
@@ -874,6 +875,8 @@ yuzu_server_core_lib = static_library(
     'src/software_hosts_model.cpp',
     'src/software_changes_model.cpp',
     'src/software_plugin_health_model.cpp',
+    'src/software_read_api.cpp', # SAM-35: transport-neutral body shared by the REST routes and the MCP twins
+    'src/software_collection_settings_api.cpp', # SAM-35: transport-neutral body shared by the REST routes and the MCP twins
     'src/crypto_cbom.cpp',    # /crypto CBOM export: pure CycloneDX 1.7 shaper
     'src/crypto_library_model.cpp', # /crypto slice 1: pure curated table + shared REST/MCP model
     'src/crypto_api.cpp',     # /crypto slice 1: store-backed CryptoApi seam impl
@@ -917,6 +920,7 @@ yuzu_server_core_lib = static_library(
     'src/app_perf_cohort_reader.cpp',
     'src/app_perf_ingestion.cpp',
     'src/app_perf_rollup.cpp',
+    'src/dex_app_usage_owner.cpp',
     'src/dex_app_version_failures_owner.cpp',
     'src/inventory_ingestion.cpp',
     'src/inventory_store.cpp',
@@ -1057,6 +1061,7 @@ yuzu_server_routes_lib = static_library(
     'src/software_collection_settings_routes.cpp',
     'src/software_lifecycle_routes.cpp',
     'src/software_read_routes.cpp',
+    'src/software_export_routes.cpp',
     'src/inventory_ui.cpp',
     'src/device_containment_routes.cpp',
     'src/device_estate_routes.cpp',

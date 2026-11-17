@@ -105,7 +105,7 @@ INTERNAL_CONSUMER_SITES = {
         "plugin list; the grid is scored server-side, never returned as rows)",
     "server/core/src/quarantine_containment_reconciler.cpp:query(pending_command_id)":
         "quarantine_containment_reconciler.cpp: in-flight quarantine command poll (the closed "
-        "protective set, plugin `quarantine`; polls its own dispatch)",
+        "protective set, plugin `firewall`; polls its own dispatch)",
     "server/core/src/server.cpp:query(command_id)":
         "server.cpp: echo.fleet_snapshot topology poll (fixed plugin `echo`; parsed into the "
         "topology graph, never returned as rows)",

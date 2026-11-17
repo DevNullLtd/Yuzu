@@ -560,6 +560,11 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // caller reaching this prefix with a chunked (no Content-Length) body
     // would be uncapped up to httplib's 100 MiB default — the same class the
     // /api/v1/uploads entry above closes.
+    // `GET /api/v1/hardware-ci` (the bulk CI keyset read) is deliberately NOT under this row: it
+    // is a sibling prefix, and matching is on segment boundaries. It is a bodyless GET, so the
+    // catch-all default is the reviewed choice (the same as every other GET read; the
+    // mutating-route inventory covers POST/PUT/PATCH/DELETE only). Do not widen this prefix to
+    // cover it, and do not add a row for it without recording why the catch-all is not enough.
     {kBodyCapAnyMethod, "/api/v1/hardware", 4u * 1024, true, "hardware", kJsonValuesOff},
 
     // /api/v1/rbac/roles/{name}/assignments[/{principal_id}] — A2 global

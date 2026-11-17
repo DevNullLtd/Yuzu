@@ -945,7 +945,11 @@ groups:
       # threshold needs fleet data (the #913 lesson above). NOT covered by
       # YuzuGatewayRouteWriteFailed: presence-store failures
       # (yuzu_server_agent_presence_store_failed_total{op="upsert"}) have no
-      # rule, and a presence upsert gives up at 250 ms against 500 ms for the
+      # rule (nor do the plugin-capability ops, query_without_plugin and
+      # publish_plugins: a failure there fails the plugin withhold OPEN, and a
+      # sustained reason="truncated" on query_without_plugin means more than
+      # 100000 live agents lack the plugin and the cross-replica withhold is off
+      # for it), and a presence upsert gives up at 250 ms against 500 ms for the
       # route-directory ops, so milder pool saturation or a presence-only
       # db_error degrades batches without moving that rule. YuzuPgPoolSaturated
       # and YuzuPgAcquireWaitHigh are the covering pool-level signals. A
@@ -1711,14 +1715,14 @@ groups:
             below. Do not restart the gateway for this:
             the agents register again and are refused again. FIRST: on the
             server, read the NotifyStreamStatus WARN lines ("the directory read
-            degraded and this replica holds no matching local session",
+            degraded; the gateway sends the notice again",
             "unknown session ... for agent", "but the directory names a
             different session" or "is no longer the currently-installed
             session" (stale_connected_session), "claims cluster_id"
             (cluster_affinity_violation)) and
             yuzu_server_gateway_route_desync_total{op="notify_stream_status"}
             by outcome. connected_unverified means the route store cannot be
-            read: fix PostgreSQL or the server's pool
+            read (a CONNECTED is refused whatever this replica holds locally): fix PostgreSQL or the server's pool
             (yuzu_server_gateway_route_write_failed_total{op="session_lookup"},
             YuzuGatewayRouteWriteFailed) and the resends succeed by themselves.
             For the other outcomes, take the agent ids from the gateway WARN
@@ -2335,6 +2339,47 @@ groups:
             for WHO made the change and WHEN, and confirm it was expected.
             See docs/user-manual/rbac.md "Enabling RBAC".
           runbook_url: "https://docs.yuzu.io/runbooks/rbac-enforcement-changed"
+
+      - alert: YuzuMfaBindingNotEnforced
+        # #6079: a validation observed that the trigger which binds an MFA proof to the account's
+        # factor generation (store="auth") or the session rebind guard (store="session") is no
+        # longer in force. From then on every local MFA binding decision answers 503: with
+        # reason=mfa_binding_unenforced for store="auth", and with reason=mfa_proof_unavailable
+        # (plus yuzu_auth_session_store_degrade_total{op="rebind_guard"}) for store="session",
+        # where the guard failure reaches a local session as an unreadable stored proof. SSO
+        # sessions are not affected by the session-store case. Approvals, the step-up-gated
+        # mutations and JIT elevation are refused for local sessions until a server restart
+        # whose boot check passes. A SIEM rule for this condition must key on both tokens. The
+        # gauge is STICKY (a re-enabled trigger cannot reconstruct the changes it missed), so the
+        # value never recovers on its own and `for:` only rides out a scrape gap; it is not a
+        # flap filter.
+        #
+        # What this does NOT cover: the flag flips only when a request-driven validation (a 60 s
+        # memo, run by AuthDB::mfa_status and SessionStore::find) sees the fault, so a tamper that
+        # no request has validated yet still reads 1, and a disable, change and re-enable that
+        # all complete between two validations is never observed. The gauge is published only
+        # after both stores open, so the series is absent before the first sample and an absent()
+        # rule would page every booting replica; none is shipped.
+        expr: |
+          yuzu_auth_mfa_binding_enforcement_ok == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "MFA binding enforcement failed ({{ $labels.store }}) on {{ $labels.instance }}"
+          description: >-
+            yuzu_auth_mfa_binding_enforcement_ok{store="{{ $labels.store }}"} is 0 on this
+            replica: a validation observed the MFA factor-generation trigger (store="auth") or the
+            session rebind guard (store="session") missing, disabled, replica-only or altered.
+            Local MFA binding decisions now fail closed with 503 until the server restarts:
+            store="auth" answers reason=mfa_binding_unenforced, while store="session" reaches local
+            sessions as reason=mfa_proof_unavailable (and counts
+            yuzu_auth_session_store_degrade_total{op="rebind_guard"}); SSO sessions are not
+            affected by the session-store case. Approvals and step-up-gated mutations are refused
+            for local sessions. Sign-in and step-up proving still work. Factor changes made while the
+            trigger was not firing cannot be reconstructed, so after repairing the trigger end
+            the sessions of every account whose factor changed in that window, then restart.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/ops-runbooks/auth-db-recovery.md#mfa-binding-enforcement-failed"
 
   # ── yuzu-scim — ADR-2001 (SCIM ↔ OIDC/SAML identity-link revoke chokepoint,
   # CC6.8) ─────────────────────────────────────────────────────────────────
@@ -3026,15 +3071,10 @@ groups:
             stalled backend pinning the pool every other store shares. A slot
             timeout fails closed deliberately: serving stale containment state
             when nobody asked the store would under-enforce against a healthy
-            one. The quarantine plugin's own control actions stay
+            one. The firewall plugin's four containment actions stay
             reachable throughout - releasing a device does not depend on this
             read - as do the four system-reserved internal pushes
-            (yuzu_server_system_reserved_push_total). The firewall plugin's
-            four containment actions are protective for plugin enablement but
-            are NOT exempt from this gate until #7437, so while this alert
-            fires they are refused too (a firewall containment started with a time
-            limit still ends on the agent; one started without it stays until a
-            release can be dispatched). BE PRECISE ABOUT for: 2m:
+            (yuzu_server_system_reserved_push_total). BE PRECISE ABOUT for: 2m:
             it delays the page by two minutes, it does NOT require a sustained
             episode. increase()[5m] stays true for ~5 minutes after a single
             increment, so one fail-closed evaluation still pages, two minutes
@@ -3110,7 +3150,8 @@ groups:
             REACHABLE (a live AgentSession — the reconciler could dispatch to
             it right now), and QuarantineContainmentReconciler (#3425) has
             not been able to confirm its endpoint firewall via a follow-up
-            `quarantine.status` read returning state|active. The #881
+            `firewall.quarantine_status` read returning status|active (or
+            status|active_unproven with no probe target). The #881
             dispatch gate still refuses operator commands to this device —
             containment holds at the control plane — but the OTHER half,
             the device's own firewall stopping it reaching anything else,
@@ -3142,10 +3183,49 @@ groups:
             YuzuQuarantineGateFailClosed. The audited evidence trail is the
             quarantine.reapply verb (system principal, detail carries
             record_id + command_id + trigger=tick|heartbeat, or "CONFIRMED
-            record_id=... command_id=..." on success).
+            record_id=... command_id=..." once per transition to confirmed,
+            or "drift status=..." when a re-verify no longer confirms).
             This alert also fires when the device's agent lacks the
-            quarantine plugin: the dispatch is accepted but never
-            confirmed, so upgrade the agent.
+            firewall plugin: the dispatch is accepted but never
+            confirmed. An agent without the firewall plugin comes from an
+            earlier build, which is unsupported: reprovision the host into a
+            fresh deployment of this build. On a Linux host running the
+            packaged systemd unit every containment action is refused
+            (privilege_unavailable), so a record there stays unconfirmed.
+
+      - alert: YuzuQuarantineReleasePending
+        expr: |
+          yuzu_server_quarantine_release_pending{reachability="connected"} > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A connected, quarantined device has not confirmed its release"
+          description: >-
+            A release was requested for a device (DELETE /api/v1/quarantine/{agent_id}
+            sent firewall.release), the device is currently REACHABLE, and
+            QuarantineContainmentReconciler has not been able to read
+            status|inactive from firewall.quarantine_status for 15 minutes. The
+            record stays listed as releasing and the #881 dispatch gate keeps
+            refusing operator commands to the device until the device confirms.
+            reachability="offline" is DELIBERATELY EXCLUDED, for the reason
+            YuzuQuarantineEndpointUnconfirmed gives: a device that is off cannot
+            confirm, and paging on that is paging on correct behaviour. Check
+            yuzu_server_quarantine_reconciler_tick_healthy first - if 0 the
+            reconciler's own reads are failing and this gauge is frozen. Then
+            correlate with yuzu_server_quarantine_reapply_total{result}
+            (release_sent says the release went out; unconfirmed says the device
+            did not answer inactive) and the quarantine.disable audit rows
+            (pending release_sent). A common cause is a device that refuses every
+            mutating firewall action (a Linux host on the packaged systemd unit:
+            privilege_unavailable). The way out is
+            DELETE /api/v1/quarantine/{agent_id}?force=true, which ends the record
+            without the device's confirmation. A forced end does NOT release the
+            device: it may still be contained, the server stops refusing commands
+            to it, and the reconciler sends the release it owes once per
+            reconnect (yuzu_server_quarantine_forced_release_owed counts those; no
+            alert fires on it, an offline device that owes a release is an expected
+            state).
 
       - alert: YuzuDispatchTargetRejected
         expr: |
@@ -5371,25 +5451,25 @@ groups:
         annotations:
           summary: "Audit events failing to persist — behavioural-data routes and audit-first mutations are 503ing"
           description: >-
-            yuzu_server_audit_emit_failed_total is rising. Every REST route that uses
+            yuzu_server_audit_emit_failed_total is rising. The REST routes that use
             fail-closed audit-on-open (guardian.device.view, dex.device.view,
             dex.signal.view, dex.perf.device.view, network.device.view, inventory.devices,
-            inventory.device.ci, plus
+            inventory.device.ci, inventory.devices.ci, plus
             response.read on the v1 query, aggregate and export routes and on the
             legacy get, aggregate and export routes, plus response.forensics.read (written
             only when the rows served include a Forensics-tier plugin's) on the v1
             execution-scoped response, response get, export and visualization routes, on
             bundle collation (GET /api/v1/bundles/{id}) and on the legacy get and export
-            routes) is returning 503 and withholding PII or response
+            routes) are returning 503 and withholding PII or response
             data, so a ServiceNow / CMDB poll blackouts fleet-wide. Set-and-proceed reads, including
             crypto.libraries.* and response.forensics.read on the dashboard results fragment, the
             executions drawer, the hardware result poll, the MCP query_responses tool and
             the MCP get_bundle_result tool, keep
             serving data and do not 503: their REST routes and dashboard
             fragments set the Sec-Audit-Failed header, their MCP tools set audit_persisted:false
-            (the hardware CI tools list_hardware_ci and get_hardware_ci, which audit as
-            inventory.devices and inventory.device.ci, fail closed instead: they withhold the
-            data and answer a retryable -32603), and only the /crypto (crypto.libraries.*) pages
+            (the hardware CI tools list_hardware_ci, get_hardware_ci and list_hardware_ci_records,
+            which audit as inventory.devices, inventory.device.ci and inventory.devices.ci,
+            fail closed instead: they withhold the data and answer a retryable -32603), and only the /crypto (crypto.libraries.*) pages
             also show an on-page "Audit not recorded" notice.
             Check audit_store health (/healthz
             stores.audit) and free disk / connection saturation on the PostgreSQL
@@ -5406,7 +5486,10 @@ groups:
             is sent while its "requested" row cannot be stored) 503 the same way, and so do four
             dashboard mutations (#3619): every console send (POST /api/dashboard/execute),
             group-from-results, and the Echo retention-paused re-enable and purge, which send,
-            create or purge nothing while their "attempted" row cannot be stored. Upload-grant
+            create or purge nothing while their "attempted" row cannot be stored. Management-group
+            create (REST, MCP and the Settings form), add member (REST and MCP) and remove member
+            (REST) refuse the same way, with a 503 or a retryable MCP error, and create, add or
+            remove nothing while their "attempted" row cannot be stored. Upload-grant
             revoke refuses on both REST (503) and MCP (retryable -32603), so a leaked grant stays
             redeemable until the outage ends or its TTL expires, whichever is first (#6169).
             Approval approve and reject (approval.approve, approval.reject) 503 with
@@ -7181,6 +7264,73 @@ groups:
             affected agents' warn logs for "SparkEngine: instantiation failed"; a restart
             after resolving host pressure clears the posture within one sweep.
           runbook_url: "https://docs.yuzu.io/runbooks/spark-boot-failed"
+      # YuzuGuardianBaselineUnpersisted (#5605). yuzu_fleet_guardian_baseline_unpersisted is the
+      # fleet SUM of Spark baseline-on-arm captures staged on an agent and not yet written to its
+      # local KV store: a CURRENT, re-statable value (it falls as captures are written), unlike
+      # the latching counter-sums commented out below, so a bare `> 0` is sound for it. It is
+      # absent fleet-wide until an agent runs with prefer_spark (every released agent today), so
+      # the rule is dormant in production and is exercised only by the promtool cases (#2553).
+      #
+      # The expression copies YuzuDedupStoreDegraded: AgentHealthStore::upsert replaces an
+      # agent's whole tag map on every heartbeat and the 90 s staleness prune drops an absent
+      # agent, so a missed heartbeat or a failover to another core replica is a GAP in the
+      # series that would reset a bare `for:`. max_over_time[5m] bridges the gap and
+      # `sum by (job)` drops the per-replica `instance` label from the alert identity. Measured
+      # width: a backlog spanning 10 minutes does not fire, one spanning 11 does (cases T27a and
+      # T27b), so "15 minutes" below is the evaluation clock, not the minimum backlog age.
+      # The value is summed across core replicas, so a failover can count one agent twice for a
+      # few minutes. Same `job` caveat as the dedup rule above.
+      #
+      # severity=warning, deliberately NOT critical: agent-self-reported inside the heartbeat
+      # trust boundary, so ONE forged or buggy agent can keep the alert up (same reasoning as
+      # YuzuSparkBootFailed). Fleet-scale caveat: a sum of current counts stays above 0 while ANY
+      # agent has a slow or failing store, so at ten thousand agents one flapping endpoint keeps
+      # it firing and an operator may silence the group. The threshold and window are not
+      # derived from fleet data: revisit them at the F14 flip (docs/spark-flip-gate.md).
+      - alert: YuzuGuardianBaselineUnpersisted
+        expr: |
+          sum by (job) (max_over_time(yuzu_fleet_guardian_baseline_unpersisted[5m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A Spark baseline persistence backlog of about {{ $value }} capture(s) has persisted across at least 15 minutes of evaluations"
+          description: >-
+            Across the fleet, about {{ $value }} captured file-hash-equals baseline(s) (summed
+            across core replicas, so a failover can count one agent twice for a few minutes)
+            are staged on their agents and not yet written to the agent's local KV store
+            (kv_store.db), and the sum has stayed above 0 across 15 minutes of evaluations. It
+            does not mean any one capture waited that long: an 11 minute backlog fires, and a
+            stream of short backlogs from different agents can keep the sum above 0. This is a
+            persistence BACKLOG, not proof that a write failed: a failing or slow local store, a
+            write pass that ran out of its budget and a worker pass that yielded to a policy
+            push all leave captures staged. It detects a staged-but-unwritten backlog on a live
+            agent and cannot show that a loss happened. It does NOT see a retarget followed by a
+            crash, a capture that was never staged, a Malformed or unreadable baseline record
+            that was re-baselined at boot, or a crash that removes the agent's series (the
+            capture is lost with it). The figure is agent-self-reported, hence a warning. The 5
+            minute window and the sum across replicas exist because a missed heartbeat or a
+            failover to another core replica would otherwise reset the 15 minute clock. The
+            alert clears up to about 5 minutes after the backlog drains (the window is
+            left-open). No per-device view of the underlying tag exists: this gauge is a fleet
+            sum and the alert cannot name the affected endpoints. If you ship agent logs to a
+            central store, search them for "failed to persist captured baseline" and for the
+            ERROR lines logged at stop; otherwise check the logs on the affected hosts. Fix the
+            store first (a full or read-only data directory, permissions, a locked
+            kv_store.db). A graceful restart while the store is still failing loses the staged
+            capture, because the stop-time flush uses the same store. After the store is
+            healthy, the worker retries without a restart (backoff 5 s up to 60 s). A crash
+            or a forced kill loses the capture regardless; the next boot then captures
+            whatever the file holds at that moment, which is the gap this alert exists to
+            expose. An agent whose log shows "Failed to open KV store" at boot arms no
+            Guardian rules at all, so it cannot raise this alert; that is a separate fault:
+            repair the agent data directory and restart the agent. This covers the Spark path
+            only: persist failures on the legacy detection path are logged and are not counted.
+            Read a quiet graph together with yuzu_fleet_guardian_baseline_reporting: while that
+            is 0 (every released agent today) the alert cannot fire for any reason. The 15
+            minute clock and the 5 minute window are not tuned against fleet data; revisit them
+            at the Spark flip.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/guaranteed-state.md#fleet-monitoring-of-baseline-persistence"
   # MASS-ABSENT META-ALERT — COMMENTED until the fleet is past staged rollout (gov UP-12).
   # absent() on yuzu_fleet_spark_reporting would catch "every spark-reporting agent went
   # dark at once" (fleet-wide agent outage / gateway partition) — real alert blindness,
@@ -7587,7 +7737,10 @@ groups:
             A durable session-store operation ({{ $labels.op }}) hit a degraded
             PostgreSQL read/write for 10m. A `validate` degrade fails requests
             closed (401; the approve and reject routes answer 503 when they cannot read
-            the session's stored MFA proof); `create`/`elevate`/`mark_mfa`/`invalidate`/
+            the session's stored MFA proof). A rebind-guard check that could not run is
+            also counted as `validate`: session validation is unaffected, but that one
+            local MFA binding read is refused 503 `mfa_proof_unavailable` and retried on
+            the next read; `create`/`elevate`/`mark_mfa`/`invalidate`/
             `invalidate_user` degrades fail the privileged op closed, except an
             `invalidate_user` after an MFA clear that already committed (Settings MFA
             disable), which leaves the clear in place and ends `partial`;
@@ -7597,8 +7750,18 @@ groups:
             event does not hold this alert's 10m condition, so look for
             `mfa.disabled` rows with result `partial` in the audit log; a sustained
             `generation_refresh` degrade drops the validate cache past the
-            stale-serve bound. Usually PostgreSQL pool saturation / failover —
-            correlate with the pool metrics.
+            stale-serve bound. `op=rebind_guard` means the session rebind guard is
+            not in force: local MFA proofs are refused with `mfa_proof_unavailable`
+            and YuzuMfaBindingNotEnforced{store="session"} co-fires with this alert
+            (see docs/ops-runbooks/auth-db-recovery.md "MFA binding enforcement
+            failed"). `op=clear_mfa_proof` means a proof that had to be withdrawn
+            could not be cleared. After a changed factor the stored proof stays
+            bound to the previous generation, which the binding refuses; after an
+            unverifiable recheck it stays bound to the verifier's current
+            generation, so a binding gate would admit that genuine proof (benign:
+            it was earned with a valid code, and the withdrawal is best-effort).
+            Usually PostgreSQL pool saturation / failover; correlate with the
+            pool metrics.
       - alert: YuzuEnrollmentStoreDegraded
         expr: |
           increase(yuzu_auth_enrollment_store_degrade_total[10m]) > 0
@@ -7620,8 +7783,14 @@ groups:
       # MFA step-up chokepoint (docs/auth-architecture.md "MFA step-up
       # chokepoint"). `unavailable` is a 503 on a step-up route: the auth store
       # could not be read, an enrolled account's second factor could not be
-      # decrypted, the server has no usable auth store, or the check itself threw
-      # or could not fingerprint the session (chokepoint_exception). The counter is
+      # decrypted, the server has no usable auth store, an enrolled local session's
+      # stored proof could not be read, the session rebind guard is not in force, or
+      # the account is enrolled with a non-positive factor generation (all
+      # mfa_proof_unavailable) or the MFA binding
+      # trigger is not observed in force (mfa_binding_unenforced: when the trigger is observed
+      # not in force it persists until repaired and restarted and co-fires YuzuMfaBindingNotEnforced; the
+      # same reason is answered transiently while the trigger validation is inconclusive), or the
+      # check itself threw or could not fingerprint the session (chokepoint_exception). The counter is
       # zero-seeded over its closed label set, so increase() is meaningful from the
       # first scrape. The >= 3 debounce
       # keeps one stray 503 (a single failed read, one request that raced a
@@ -7641,20 +7810,41 @@ groups:
             The central MFA step-up check refused at least three requests in
             ten minutes with 503 because it could not establish the caller's MFA
             state (auth store unreadable, stored second factor undecryptable,
-            no usable auth store, or an unexpected exception inside the check).
-            The gated routes stay closed until the cause is fixed; re-entering a
+            no usable auth store, a stored proof that cannot be read or an
+            enrolled account whose factor generation is not positive
+            (reason=mfa_proof_unavailable), a binding
+            trigger not observed in force (reason=mfa_binding_unenforced; also
+            fires YuzuMfaBindingNotEnforced), or an unexpected exception inside
+            the check). The gated routes stay closed until the cause is fixed; re-entering a
             TOTP code does not help. Each refusal has a best-effort
             `mfa.step_up.required` audit row (lost when the audit store is also
-            down) whose `reason=` token in `detail` names the cause. Usually
+            down) whose `reason=` token in `detail` names the cause. Often
             PostgreSQL or KEK trouble: correlate with
             yuzu_auth_session_store_degrade_total and
             yuzu_server_secret_decrypt_failures_total, and see
-            docs/ops-runbooks/auth-db-recovery.md "Step-up returns 503".
+            docs/ops-runbooks/auth-db-recovery.md "Step-up returns 503". A
+            reason=mfa_proof_unavailable or mfa_binding_unenforced refusal can
+            instead be persistent and is not cured by waiting: an enrolled
+            account at factor generation 0 (only a database an earlier build wrote
+            holds one; an administrator must run yuzu-server --mfa-reset for it), or a
+            binding trigger that is not in force (see "Enrolled accounts at
+            generation 0" under "Post-restore verification" and "MFA binding
+            enforcement failed" in the same runbook). It can also be
+            transient: an inconclusive trigger validation (a catalog check that
+            could not run) latches the binding as not enforced until a later
+            check succeeds, and the binding gauge still reads 1 while it is
+            set, so this alert is then the only signal, and it needs the
+            refusals to hold its rate (at least three in ten minutes on one
+            surface, for five minutes): a replica with less MFA traffic than
+            that raises no alert while the latch is set.
       # The window gauge is the configured --mfa-step-up-window-secs. 0 or less
       # is the documented recovery lever (it disables the stale-proof requirement
-      # on every step-up route except JIT elevation, and also lets SAML sessions
-      # through and skips the store read; engine denials and the unwired-store 503
-      # still apply); it must not be left on.
+      # on the 39 ordinary step-up routes, and also lets SAML sessions through
+      # them and skips the store read there; engine denials and the unwired-store
+      # 503 still apply; approve and reject are two of the 39, and the central
+      # check passes them at 0 but the approver gate still refuses for them; the
+      # two factor-credential rows and the JIT-elevation routes keep their own
+      # windows); it must not be left on.
       - alert: YuzuStepUpWindowDisabled
         expr: |
           yuzu_auth_mfa_step_up_window_seconds <= 0
@@ -7665,11 +7855,15 @@ groups:
           summary: "MFA step-up stale-proof requirement is disabled (--mfa-step-up-window-secs <= 0)"
           description: >-
             The server was started with --mfa-step-up-window-secs 0 (or less),
-            so the stale-proof requirement is disabled on every step-up route
-            except the JIT-elevation routes: no stale proof is refused (so none
-            is recorded), and SAML sessions and the authentication-store read
-            are skipped too, while engine denials and unwired-store refusals
-            still apply and are recorded. This is a recovery lever, not a
+            so the stale-proof requirement is disabled on the 39 ordinary
+            step-up routes: no stale proof is refused (so none is recorded),
+            and SAML sessions and the authentication-store read are skipped
+            too, while engine denials and unwired-store refusals still apply
+            and are recorded. Approval approve and reject are two of the 39:
+            the central check passes them at 0, but the approver gate still
+            refuses a stale proof, a SAML session and an unenrolled account.
+            The two factor-credential rows and the JIT-elevation routes keep
+            their own windows. This is a recovery lever, not a
             steady state: restore the window (default 300) and restart once
             the reason it was set is resolved.
 

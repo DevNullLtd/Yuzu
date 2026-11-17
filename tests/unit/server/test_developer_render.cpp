@@ -141,9 +141,10 @@ TEST_CASE("developer routes table: cap banner and degraded catalogue", "[develop
                         {"summary", ""}, {"tags", json::array()}});
     const json big{{"count", rows.size()}, {"routes", rows}};
     const auto html = render_routes_table(big, "");
-    CHECK(has(html, "Showing 300 of 305. Narrow the filter."));
-    CHECK(has(html, "/api/v1/r299"));
-    CHECK_FALSE(has(html, "/api/v1/r300"));
+    CHECK(has(html, "Showing " + std::to_string(kRoutesCap) + " of " +
+                        std::to_string(kRoutesCap + 5) + ". Narrow the filter."));
+    CHECK(has(html, "/api/v1/r" + std::to_string(kRoutesCap - 1)));
+    CHECK_FALSE(has(html, "/api/v1/r" + std::to_string(kRoutesCap)));
 
     // count 0 with HTTP 200 is how build_routes_catalog reports a parse failure.
     const auto bad = render_routes_table(json{{"count", 0}, {"routes", json::array()}}, "");
