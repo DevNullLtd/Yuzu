@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <initializer_list>
+#include <span>
 #include <unordered_set>
 #include <utility>
 
@@ -476,7 +477,7 @@ std::string host_text(const DeviceFacts& f, const std::string& agent_id) {
 }
 std::string epoch_text(std::int64_t v) { return v > 0 ? std::to_string(v) : std::string{}; }
 
-void append_row(std::string& out, std::initializer_list<std::string> cells) {
+void append_cells(std::string& out, std::span<const std::string> cells) {
     bool first = true;
     for (const auto& c : cells) {
         if (!first)
@@ -485,6 +486,10 @@ void append_row(std::string& out, std::initializer_list<std::string> cells) {
         out += data_export::csv_escape(c);
     }
     out += '\n';
+}
+
+void append_row(std::string& out, std::initializer_list<std::string> cells) {
+    append_cells(out, std::span<const std::string>(cells.begin(), cells.size()));
 }
 
 } // namespace
@@ -558,18 +563,24 @@ nlohmann::json components_response_json(const std::vector<SoftwareComponentRow>&
                      next_cursor, devices_omitted, truncated_by_cap);
 }
 
+std::array<std::string, kListCsvColumns> list_row_cells(const SoftwareFleetRow& r,
+                                                        const DeviceFacts& facts) {
+    const auto& e = r.entry;
+    return {r.agent_id, e.name, e.version, e.publisher, e.install_date, e.kind,
+            e.ecosystem, e.epoch, e.release, e.arch, e.signature_status, e.distro_id,
+            e.distro_version, e.source, host_text(facts, r.agent_id),
+            epoch_text(last_seen_of(facts, r.agent_id)),
+            std::string(derive_status(r.facet_status, r.facet_enabled)),
+            epoch_text(r.last_confirmed_at), e.install_type, e.install_scope,
+            e.install_location, e.instance_key, e.purl};
+}
+
 std::string list_csv(const std::vector<SoftwareFleetRow>& rows, const DeviceFacts& facts) {
     std::string out(kListCsvHeader);
     out += '\n';
     for (const auto& r : rows) {
-        const auto& e = r.entry;
-        append_row(out, {r.agent_id, e.name, e.version, e.publisher, e.install_date, e.kind,
-                         e.ecosystem, e.epoch, e.release, e.arch, e.signature_status, e.distro_id,
-                         e.distro_version, e.source, host_text(facts, r.agent_id),
-                         epoch_text(last_seen_of(facts, r.agent_id)),
-                         std::string(derive_status(r.facet_status, r.facet_enabled)),
-                         epoch_text(r.last_confirmed_at), e.install_type, e.install_scope,
-                         e.install_location, e.instance_key, e.purl});
+        const auto cells = list_row_cells(r, facts);
+        append_cells(out, cells);
     }
     return out;
 }

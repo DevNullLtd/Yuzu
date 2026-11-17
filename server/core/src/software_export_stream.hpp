@@ -2,18 +2,22 @@
 
 /// @file software_export_stream.hpp
 /// The pure core of the streamed installed-software export (SAM-36, roadmap 3.3):
-/// `GET /api/v1/inventory/software/export?format=jsonl|csv`. No httplib, no libpq, no clock: the
+/// `GET /api/v1/inventory/software/export?format=jsonl|csv|xlsx`. No httplib, no libpq, no clock: the
 /// route module injects every read, so the parse, the chunk formatting and the concurrency clamp
 /// are testable from fixture data.
 ///
 /// Rules this file owns (each stated once, here):
 ///  * REQUEST: the list route's filters (software_list::parse_list_params) plus a REQUIRED
-///    `format` of `jsonl` or `csv`. `cursor` and `limit` are refused: a stream has no pages of its
+///    `format` of `jsonl`, `csv` or `xlsx`. `cursor` and `limit` are refused: a stream has no pages of its
 ///    own to resume (the server walks its own cursors), and a page-style row cap belongs to the
 ///    in-memory formats, not to a stream.
 ///  * ROWS: one row is exactly the list route's row (`list_row_json`, or the list CSV writer, which
-///    neutralises formula cells through data_export.hpp). The two formats carry the same columns as
-///    the list route's JSON and CSV, so a consumer can move between them.
+///    neutralises formula cells through data_export.hpp). The formats carry the same columns as
+///    the list route's JSON and CSV, so a consumer can move between them. XLSX carries the CSV's 23
+///    columns from the same projection (`list_row_cells`), every cell as text.
+///  * XLSX is not a stream: a workbook cannot be sent before it is finished, so the route builds it
+///    whole into a temporary file first and sends it with a Content-Length (software_export_xlsx.hpp,
+///    software_export_routes.hpp). It never reaches `format_chunk`.
 ///  * CSV: the header is written once, in the first chunk, even when the stream has no rows.
 ///    JSONL: one JSON object per line, nothing for an empty result.
 ///  * CAP: at most `--inventory-export-concurrency` streams are open at once. A stream holds an HTTP
@@ -34,7 +38,7 @@
 
 namespace yuzu::server::software_export {
 
-enum class ExportFormat { jsonl, csv };
+enum class ExportFormat { jsonl, csv, xlsx };
 
 /// `--inventory-export-concurrency`: default and the accepted range.
 inline constexpr int kDefaultConcurrency = 2;
@@ -50,8 +54,11 @@ inline constexpr std::int64_t kExportMaxSeconds = 900;
 
 /// Size limits on one stream (`--inventory-export-max-rows`, `--inventory-export-max-bytes`): a
 /// stream that would pass either is aborted, like the deadline, so a huge fleet cannot be asked for
-/// one unbounded file. Both apply to JSONL and CSV alike; the bytes counted are the body bytes
-/// written (the CSV header included). The row floor is one page, so a smaller row cap could never
+/// one unbounded file. Both apply to every format; the bytes counted are the body bytes written
+/// (the CSV header included), and for XLSX the UNCOMPRESSED SHEET as accounted by
+/// software_export_xlsx.hpp (markup and escaping included, not the cell text; the finished
+/// workbook is smaller). XLSX also stops at its own sheet row limit (kXlsxMaxDataRows). The row
+/// floor is one page, so a smaller row cap could never
 /// admit a page; the byte floor (1 MiB) is far above a normal 1000-row page, and a page that did
 /// not fit would be cut on its first chunk (the cap is a true maximum).
 inline constexpr std::int64_t kDefaultMaxRows = 5'000'000;
@@ -89,7 +96,8 @@ struct Limits {
 inline constexpr int kRetryAfterMs = 5000;
 
 /// The closed label sets of yuzu_server_software_export_total{format,result}, pre-seeded at boot.
-inline constexpr std::array<ExportFormat, 2> kFormats{ExportFormat::jsonl, ExportFormat::csv};
+inline constexpr std::array<ExportFormat, 3> kFormats{ExportFormat::jsonl, ExportFormat::csv,
+                                                      ExportFormat::xlsx};
 inline constexpr std::array<std::string_view, 5> kResults{"completed", "degraded", "deadline",
                                                            "aborted", "limit"};
 /// The closed label set of yuzu_server_software_export_rejected_total{reason}, pre-seeded at boot:
@@ -101,13 +109,29 @@ inline constexpr std::array<std::string_view, 2> kRejectReasons{"export_concurre
                                                                  "global_stream_cap"};
 
 [[nodiscard]] constexpr std::string_view format_name(ExportFormat f) noexcept {
-    return f == ExportFormat::csv ? "csv" : "jsonl";
+    switch (f) {
+    case ExportFormat::csv: return "csv";
+    case ExportFormat::xlsx: return "xlsx";
+    case ExportFormat::jsonl: break;
+    }
+    return "jsonl";
 }
 [[nodiscard]] constexpr std::string_view content_type(ExportFormat f) noexcept {
-    return f == ExportFormat::csv ? "text/csv; charset=utf-8" : "application/x-ndjson";
+    switch (f) {
+    case ExportFormat::csv: return "text/csv; charset=utf-8";
+    case ExportFormat::xlsx:
+        return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+    case ExportFormat::jsonl: break;
+    }
+    return "application/x-ndjson";
 }
 [[nodiscard]] constexpr std::string_view file_name(ExportFormat f) noexcept {
-    return f == ExportFormat::csv ? "software-installs.csv" : "software-installs.jsonl";
+    switch (f) {
+    case ExportFormat::csv: return "software-installs.csv";
+    case ExportFormat::xlsx: return "software-installs.xlsx";
+    case ExportFormat::jsonl: break;
+    }
+    return "software-installs.jsonl";
 }
 
 struct ExportRequest {
@@ -123,14 +147,16 @@ parse_export_params(const software_list::Params& p) {
     const auto has = [&p](const char* k) { return p.find(k) != p.end(); };
     const auto fmt = p.find("format");
     if (fmt == p.end() || fmt->second.empty())
-        return std::unexpected("format is required (expected jsonl or csv)");
+        return std::unexpected("format is required (expected jsonl, csv or xlsx)");
     ExportFormat format{};
     if (fmt->second == "jsonl")
         format = ExportFormat::jsonl;
     else if (fmt->second == "csv")
         format = ExportFormat::csv;
+    else if (fmt->second == "xlsx")
+        format = ExportFormat::xlsx;
     else
-        return std::unexpected("invalid format (expected jsonl or csv)");
+        return std::unexpected("invalid format (expected jsonl, csv or xlsx)");
     if (has("cursor") || has("limit"))
         return std::unexpected("cursor and limit are not accepted on the export");
     // The list parser's own `format` is the buffered json|csv selector; it never sees ours.
@@ -144,7 +170,8 @@ parse_export_params(const software_list::Params& p) {
 }
 
 /// One chunk for one page. JSONL: a line per row. CSV: the list writer's rows, with its header
-/// line kept on the first chunk only (so there is exactly one writer of a CSV row).
+/// line kept on the first chunk only (so there is exactly one writer of a CSV row). Never called
+/// for XLSX (it is built whole, not chunked); an XLSX call would be read as JSONL.
 [[nodiscard]] inline std::string format_chunk(const std::vector<SoftwareFleetRow>& rows,
                                               const software_list::DeviceFacts& facts,
                                               ExportFormat format, bool first_chunk) {

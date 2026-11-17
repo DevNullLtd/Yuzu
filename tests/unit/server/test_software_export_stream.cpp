@@ -78,7 +78,7 @@ std::vector<std::vector<std::string>> parse_csv(const std::string& text) {
 
 } // namespace
 
-TEST_CASE("export params: format is required and must be jsonl or csv; cursor and limit are refused",
+TEST_CASE("export params: format is required and must be jsonl, csv or xlsx; cursor and limit are refused",
           "[software_export][stream]") {
     SECTION("format is required") {
         const auto none = swe::parse_export_params(params({{"name", "pkg"}}));
@@ -86,15 +86,27 @@ TEST_CASE("export params: format is required and must be jsonl or csv; cursor an
         CHECK(none.error().find("format is required") != std::string::npos);
         CHECK_FALSE(swe::parse_export_params(params({{"format", ""}})));
     }
-    SECTION("only jsonl and csv") {
-        for (const char* bad : {"json", "JSONL", "xlsx", "pdf", "ndjson", " csv"})
+    SECTION("only jsonl, csv and xlsx") {
+        for (const char* bad : {"json", "JSONL", "XLSX", "pdf", "ndjson", " csv", "xlsx ", "xls"})
             CHECK_FALSE(swe::parse_export_params(params({{"format", bad}})));
         const auto j = swe::parse_export_params(params({{"format", "jsonl"}}));
         const auto c = swe::parse_export_params(params({{"format", "csv"}}));
+        const auto x = swe::parse_export_params(params({{"format", "xlsx"}}));
         REQUIRE(j);
         REQUIRE(c);
+        REQUIRE(x);
         CHECK(j->format == swe::ExportFormat::jsonl);
         CHECK(c->format == swe::ExportFormat::csv);
+        CHECK(x->format == swe::ExportFormat::xlsx);
+        CHECK(x->list.base.query.limit == swe::kPageRows);
+    }
+    SECTION("the error texts name all three formats") {
+        const auto none = swe::parse_export_params(params({{"name", "pkg"}}));
+        const auto bad = swe::parse_export_params(params({{"format", "pdf"}}));
+        REQUIRE_FALSE(none);
+        REQUIRE_FALSE(bad);
+        CHECK(none.error().find("jsonl, csv or xlsx") != std::string::npos);
+        CHECK(bad.error().find("jsonl, csv or xlsx") != std::string::npos);
     }
     SECTION("cursor and limit are refused, even present-empty") {
         for (const char* key : {"cursor", "limit"}) {
@@ -220,4 +232,20 @@ TEST_CASE("export limits: a cap is a true maximum, the floor clamps, and 0 never
     const auto def = swe::clamp_limits({});
     CHECK(def.max_rows == swe::kDefaultMaxRows);
     CHECK(def.max_bytes == swe::kDefaultMaxBytes);
+}
+
+TEST_CASE("export formats: name, content type and file name cover xlsx; kFormats holds all three",
+          "[software_export][stream]") {
+    CHECK(swe::format_name(swe::ExportFormat::jsonl) == "jsonl");
+    CHECK(swe::format_name(swe::ExportFormat::csv) == "csv");
+    CHECK(swe::format_name(swe::ExportFormat::xlsx) == "xlsx");
+    CHECK(swe::content_type(swe::ExportFormat::xlsx) ==
+          "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    CHECK(swe::content_type(swe::ExportFormat::csv) == "text/csv; charset=utf-8");
+    CHECK(swe::content_type(swe::ExportFormat::jsonl) == "application/x-ndjson");
+    CHECK(swe::file_name(swe::ExportFormat::xlsx) == "software-installs.xlsx");
+    CHECK(swe::file_name(swe::ExportFormat::csv) == "software-installs.csv");
+    CHECK(swe::file_name(swe::ExportFormat::jsonl) == "software-installs.jsonl");
+    STATIC_REQUIRE(swe::kFormats.size() == 3);
+    CHECK(swe::kFormats[2] == swe::ExportFormat::xlsx);
 }

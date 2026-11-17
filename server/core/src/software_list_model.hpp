@@ -32,6 +32,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <expected>
 #include <functional>
@@ -282,6 +283,12 @@ struct TotalsOutcome {
 void set_totals(nlohmann::json& body, const TotalsOutcome& t, bool components);
 /// `totals: null, totals_omitted: <reason>`.
 void set_totals_omitted(nlohmann::json& body, std::string_view reason);
+
+/// The row's kListCsvColumns raw cells, in kListCsvHeader's order, before any CSV escaping. The ONE
+/// projection of a list row into columns: list_csv and the XLSX export both read it, so the two
+/// formats carry the same columns from one function.
+[[nodiscard]] std::array<std::string, kListCsvColumns> list_row_cells(const SoftwareFleetRow& r,
+                                                                      const DeviceFacts& facts);
 
 [[nodiscard]] std::string list_csv(const std::vector<SoftwareFleetRow>& rows, const DeviceFacts& facts);
 [[nodiscard]] std::string components_csv(const std::vector<SoftwareComponentRow>& rows,
