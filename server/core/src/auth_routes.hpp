@@ -818,6 +818,19 @@ public:
         const std::string& target_id, const std::string& detail)>;
     [[nodiscard]] AuditAsSessionFn audit_as_session_fn();
 
+    /// The `AuditEvent` `audit_log_for_session` would write for `session`, built WITHOUT writing it
+    /// (#6079 PR 2c): the template the MFA-disable owner persists INSIDE its transaction, so the
+    /// outcome row carries exactly the identity fields a session-bound row carries (principal, the
+    /// role the caller captured, the engine class, source IP, user agent, session correlator,
+    /// target). One builder, `make_audit_event_for_principal`, shared with `audit_log_for_session`.
+    /// A factory like `audit_as_session_fn()` so server.cpp wires this and never a hand-rolled
+    /// lambda. The `AuthRoutes` must outlive every call.
+    using AuditEventForSessionFn = std::function<AuditEvent(
+        const httplib::Request&, const auth::Session&, const std::string& principal_role,
+        const std::string& action, const std::string& result, const std::string& target_type,
+        const std::string& target_id)>;
+    [[nodiscard]] AuditEventForSessionFn audit_event_for_session_fn();
+
     /// The `AuditEvent` `audit_log_for_principal` would write, built WITHOUT
     /// writing it (#5342 Gate 8): the identity/request fields (principal,
     /// role, class, source IP, user agent, session correlator, target) for a

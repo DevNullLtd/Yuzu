@@ -211,7 +211,7 @@ canonical list lives here. For broader auth/RBAC/crypto context, defer to the
   `--mfa-reset` and `--break-glass-arm`, may open their bootstrap `AuthDB`
   with `MfaBindingCheck::kBypassForRecovery`: warn, binding reported not
   enforced for the process life; it exists ONLY on the `AuthDB` and `SessionStore`
-  constructors, `--mfa-reset` passes it to both (the session delete) and
+  constructors, `--mfa-reset` passes it to both (the `SessionStore` so the owner's session delete finds its migrated tables) and
   `--break-glass-arm` to `AuthDB`, the serving binary never passes it, any other
   use is CRITICAL); `mfa_status` re-validates behind a
   request-driven 60 s memo and a trigger observed not in force is STICKY
@@ -221,14 +221,23 @@ canonical list lives here. For broader auth/RBAC/crypto context, defer to the
   a defect). `mfa_regenerate_recovery_codes` takes a REQUIRED
   `expected_factor_gen` and compares it under the `auth.users` row lock
   before writing (`FactorChanged`, deliberately NOT a store-unavailable error);
-  a new factor mutation does the same. **The Settings Disable clears through
-  `AuthDB::mfa_disable_report`, which compares the admitted generation under the
-  `auth.users` row lock (`FactorChanged`: nothing cleared) and clears the factor
-  and deletes the recovery codes in ONE transaction; `--mfa-reset` clears through
-  `AuthDB::mfa_disable` (no expected generation).** Both end the account's durable
-  sessions in a separate, later step (`AuthManager::invalidate_user_sessions`; the
-  CLI opens a `SessionStore` and calls `invalidate_user`), so a failed session delete
-  leaves the factor cleared and is recorded as `partial` / `sessions_ended=failed`.
+  a new factor mutation does the same. **The Settings Disable
+  (`AuthManager::commit_mfa_disable`) and `--mfa-reset` clear through
+  `MfaDisableOwner` (`mfa_disable_owner.{hpp,cpp}`, #6079 PR 2c), a cross-store
+  query owner in the same ADR-0012 §3 family as `CredentialChangeOwner` and with
+  the same lock order (the `auth.users` row, the `session_store.sessions` rows, the
+  audit INSERT, the `session_meta` generation row LAST): in ONE transaction it
+  compares the admitted generation under the `auth.users` row lock (`FactorChanged`:
+  nothing cleared; the CLI passes none), clears the factor and deletes the recovery
+  codes (`auth_sql::clear_mfa_factor_in_txn`, the one copy, shared with
+  `AuthDB::mfa_disable_report`, which no production caller uses now), deletes the
+  account's durable sessions, writes the OUTCOME audit row and bumps the session
+  generation. The `attempted` intent row stays the caller's, written first and outside the
+  transaction. There is no `partial` outcome and no compensating write; the one
+  indeterminate case is a connection lost exactly at COMMIT. A change that splits
+  the clear, the session delete or the outcome row into separate commits
+  reintroduces the closed residual (a cleared factor with live sessions, or a lost
+  outcome row).**
   Account deactivation also clears the factor and the recovery codes, through
   `auth_sql::soft_delete_user_in_txn`, and ends sessions in a separate step
   (outcome `deactivated_but_session_wipe_failed`). **A NEW route-reachable factor-clear path
@@ -265,11 +274,14 @@ canonical list lives here. For broader auth/RBAC/crypto context, defer to the
   session-persistence method on `AuthDB` is a design regression** — raise it
   as a HIGH finding requiring an explicit decision (this was a deliberate
   drop, not an oversight; see `docs/auth-architecture.md` "AuthDB —
-  persistent authentication store"). The one cross-store writer is the
-  credential-change owner (`CredentialChangeOwner`, #5342), which deletes a
+  persistent authentication store"). The cross-store writers are the
+  credential-change owner (`CredentialChangeOwner`,
+  `credential_change_owner.{hpp,cpp}`, #5342), which deletes a
   user's `session_store` rows in the same transaction as its `auth.users`
-  credential write — through `session_store_sql_helpers.hpp`, never an
-  `AuthDB` method.
+  credential write, and its sibling the MFA-disable owner (`MfaDisableOwner`,
+  `mfa_disable_owner.{hpp,cpp}`, #6079 PR 2c), which does the same for a factor
+  clear, both through
+  `session_store_sql_helpers.hpp`, never an `AuthDB` method.
 
 - **Cleanup thread now sweeps ONLY stale provisional MFA enrollments** (the
   session-expiry-reaping half of the old cadence is gone along with the

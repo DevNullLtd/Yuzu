@@ -9336,7 +9336,7 @@ tests:
               plugin: echo
             exp_annotations:
               summary: "About 2 agent(s) report plugin echo failed to initialise"
-              description: "For more than 10 minutes, about 2 agent(s) (summed across core replicas, so a failover can count one twice for a few minutes) have reported that plugin echo failed init (heartbeat tag yuzu.plugins_failed); it is loaded but not running, as distinct from not installed. plugin=\"unknown\" sums the well-formed names the server's plugin catalogue does not know, counted as reported names (tokens), so one agent can add several (the agent log names them; yuzu_fleet_plugin_init_failed_rejected counts the agents sending them). The runbook link is the Echo upgrade note; for any other plugin the agent log is the source. For plugin=\"echo\" the usual causes are a failed tar.db adoption after the rename (including a sidecar present under both names) and a corrupt echo.db that could not be moved aside; the upgrade notes cover adoption under 'Two cases the agent refuses, and what to do', and the corrupt-database case is under Corrupt-database quarantine in the Echo manual. An Echo that loads offline for lack of free space is not counted here (#7290). The value and the plugin label are agent-self-reported: the server bounds the label to its catalogue, so an agent cannot displace a real plugin, but it can still report a real plugin's name as failed, or not report a failure, so the signal is not authoritative."
+              description: "For more than 10 minutes, about 2 agent(s) (summed across core replicas, so a failover can count one twice for a few minutes) have reported that plugin echo failed init (heartbeat tag yuzu.plugins_failed); it is loaded but not running, as distinct from not installed. plugin=\"unknown\" sums the well-formed names the server's plugin catalogue does not know, counted as reported names (tokens), so one agent can add several (the agent log names them; yuzu_fleet_plugin_init_failed_rejected counts the agents sending them). The runbook link is the Echo upgrade note; for any other plugin the agent log is the source. For plugin=\"echo\" the usual causes are a failed tar.db adoption after the rename (including a sidecar present under both names) and a corrupt echo.db that could not be moved aside; the upgrade notes cover adoption under 'Two cases the agent refuses, and what to do', and the corrupt-database case is under Corrupt-database quarantine in the Echo manual. An Echo that loads offline (for lack of free space, or after a failed v10 migration) is not counted here; see YuzuEchoStorageOffline (#7290). The value and the plugin label are agent-self-reported: the server bounds the label to its catalogue, so an agent cannot displace a real plugin, but it can still report a real plugin's name as failed, or not report a failure, so the signal is not authoritative."
               runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/upgrading.md#behaviour-change-the-activity-record-feature-is-renamed-echo-tardb-adopted-as-echodb-stored-references-migrated"
     promql_expr_test:
       - expr: 'ALERTS{alertname="YuzuPluginInitFailed", alertstate="firing"}'
@@ -9441,6 +9441,71 @@ tests:
             value: 1
           - labels: 'ALERTS{alertname="YuzuPluginInitFailed", alertstate="firing", job="yuzu", plugin="wmi", severity="warning"}'
             value: 1
+  # CASE M (#7290) -- Echo storage offline: held for the full 30m, quiet at 29m, firing at 30m, with the
+  # reason label and no `instance`. Two replicas report it, so the annotations read "2 agent(s)": RED
+  # if `max by` replaces `sum by`. RED if `for:` is shortened (fires at 29m) or lengthened; the shipped
+  # annotations are pinned here, verbatim.
+  - interval: 1m
+    name: echo storage offline held past 30m fires, not before
+    input_series:
+      - series: 'yuzu_fleet_echo_storage_offline{job="yuzu",instance="s1",reason="migration_failed"}'
+        values: "1x45"
+      - series: 'yuzu_fleet_echo_storage_offline{job="yuzu",instance="s2",reason="migration_failed"}'
+        values: "1x45"
+    alert_rule_test:
+      - eval_time: 31m
+        alertname: YuzuEchoStorageOffline
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: yuzu
+              reason: migration_failed
+            exp_annotations:
+              summary: "About 2 agent(s) have Echo storage offline (migration_failed)"
+              description: "For more than 25 minutes, about 2 agent(s) (summed across core replicas, so a failover can count one twice for a few minutes) have reported that their Echo database could not be opened and Echo is offline (heartbeat tag yuzu.plugin.echo.storage_offline), reason migration_failed: free_space is too little free disk for the v10 roll-up migration, migration_failed is a migration that failed or ran past its deadline and was rolled back with the old data intact, open_failed is any other failure on a retry. reason=\"unknown\" sums values the server does not recognise. Nothing is collected on an affected endpoint, but the agent keeps retrying (1, 5 and 15 minutes, then hourly) and recovers by itself once the cause is gone, except an open_failed where the database opened but collection failed to start: that is not retried and needs an agent restart. The agent log and `echo status` on the device name the cause. The value and the reason are agent-self-reported, so the signal is not authoritative."
+              runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/ops-runbooks/echo-storage-offline.md"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuEchoStorageOffline", alertstate="firing"}'
+        eval_time: 29m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuEchoStorageOffline", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuEchoStorageOffline", alertstate="firing", job="yuzu", reason="migration_failed", severity="warning"}'
+            value: 1
+
+  # CASE N (#7290) -- the fixed label family at 0 for every reason (a healthy fleet) never fires.
+  # RED if the expression loses its `> 0`.
+  - interval: 1m
+    name: echo storage offline - an all-zero family never fires
+    input_series:
+      - series: 'yuzu_fleet_echo_storage_offline{job="yuzu",instance="s1",reason="free_space"}'
+        values: "0x60"
+      - series: 'yuzu_fleet_echo_storage_offline{job="yuzu",instance="s1",reason="migration_failed"}'
+        values: "0x60"
+      - series: 'yuzu_fleet_echo_storage_offline{job="yuzu",instance="s1",reason="open_failed"}'
+        values: "0x60"
+      - series: 'yuzu_fleet_echo_storage_offline{job="yuzu",instance="s1",reason="unknown"}'
+        values: "0x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuEchoStorageOffline"}'
+        eval_time: 45m
+        exp_samples: []
+
+  # CASE O (#7290) -- a replica restart mid-condition (absent a minute, then one sweep at 0) does not
+  # reset the `for:` clock. RED if the max_over_time window is removed or shortened to 1m.
+  - interval: 1m
+    name: echo storage offline - a replica restart mid-condition does not reset for
+    input_series:
+      - series: 'yuzu_fleet_echo_storage_offline{job="yuzu",instance="s1",reason="free_space"}'
+        values: "1x20 _x1 0x1 1x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuEchoStorageOffline", alertstate="firing"}'
+        eval_time: 40m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuEchoStorageOffline", alertstate="firing", job="yuzu", reason="free_space", severity="warning"}'
+            value: 1
+
   # CASE -- the one-minute recheck clears a fixed database: the gauge goes 1 -> 0 while the server keeps
   # running, the alert fires after the hold and is gone once the gauge reads 0. Red if the rule
   # latched (e.g. read a max_over_time) so a fix needed a restart.
@@ -9880,6 +9945,195 @@ tests:
       - expr: 'ALERTS{alertname="YuzuPgCollationCheckStale"}'
         eval_time: 250m
         exp_samples: []
+
+  # CASE -- YuzuDeviceCiWritesPaused: one device refused at the slowest agent cadence (every 15
+  # minutes: 10 min backoff ceiling plus 5 min jitter) while the mismatch gauge reads 1. Refusals
+  # (ingest counter jumps) at 10, 25, 40, 55 and 70 minutes, the last one at 70m; the op="delete"
+  # series stays flat, so the sum over op is exercised. Pending from 10m, firing from about 20m
+  # (the 10m hold), still firing at 54m (just before a jump) and at 85m (the window of [20m]
+  # carries the last refusal to about 88m), quiet at 100m. Asserted below: pending and not firing
+  # at 15m, firing at 22m, 40m, 54m and 85m, nothing at 100m. A window of 15m or less would drop
+  # to 0 between two refusals and reset the hold (a [15m] mutant measured red at 40m, 54m and 85m,
+  # not at 22m); a hold of 4m or less would fire at 15m (red); a window of 32m or more would still
+  # fire at 100m (red). It does not pin the
+  # exact hold or window to the minute.
+  - interval: 1m
+    name: device ci writes paused - refusals at the slowest cadence fire after the hold and resolve
+    input_series:
+      - series: 'yuzu_device_ci_writes_deferred_total{job="yuzu",instance="s1",op="ingest"}'
+        values: "0x9 1x14 2x14 3x14 4x14 5x80"
+      - series: 'yuzu_device_ci_writes_deferred_total{job="yuzu",instance="s1",op="delete"}'
+        values: "0x130"
+      - series: 'yuzu_pg_collation_version_mismatch{job="yuzu",instance="s1"}'
+        values: "1x130"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuDeviceCiWritesPaused", alertstate="pending"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuDeviceCiWritesPaused", alertstate="pending", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuDeviceCiWritesPaused", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuDeviceCiWritesPaused", alertstate="firing"}'
+        eval_time: 22m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuDeviceCiWritesPaused", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuDeviceCiWritesPaused", alertstate="firing"}'
+        eval_time: 40m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuDeviceCiWritesPaused", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuDeviceCiWritesPaused", alertstate="firing"}'
+        eval_time: 54m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuDeviceCiWritesPaused", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuDeviceCiWritesPaused", alertstate="firing"}'
+        eval_time: 85m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuDeviceCiWritesPaused", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuDeviceCiWritesPaused", alertstate=~"firing|pending"}'
+        eval_time: 100m
+        exp_samples: []
+
+  # CASE -- the repair clears the alert at once. Refusals at 10, 25 and 38 minutes; the mismatch
+  # gauge goes 1 -> 0 at 40m (the next collation check found the versions equal and writes
+  # resumed). Firing at 35m; at 45m the [20m] window still holds the 38m refusal (it would stay
+  # true to about 56m), so only the `and yuzu_pg_collation_version_mismatch == 1` conjunct makes
+  # it quiet: red if the conjunct were dropped, or if the rule read another gauge.
+  - interval: 1m
+    name: device ci writes paused - a repaired mismatch clears the alert without waiting out the window
+    input_series:
+      - series: 'yuzu_device_ci_writes_deferred_total{job="yuzu",instance="s1",op="ingest"}'
+        values: "0x9 1x14 2x12 3x100"
+      - series: 'yuzu_pg_collation_version_mismatch{job="yuzu",instance="s1"}'
+        values: "1x39 0x100"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuDeviceCiWritesPaused", alertstate="firing"}'
+        eval_time: 35m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuDeviceCiWritesPaused", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuDeviceCiWritesPaused", alertstate=~"firing|pending"}'
+        eval_time: 45m
+        exp_samples: []
+
+  # CASE -- a mismatched replica that refuses nothing stays quiet (an idle replica, or one with no
+  # connected device: YuzuPgCollationVersionMismatch is its signal). The counters are the
+  # pre-seeded zeros the server exports. Red if the comparison were `>= 0`.
+  - interval: 1m
+    name: device ci writes paused - a mismatch with no refusals stays quiet
+    input_series:
+      - series: 'yuzu_device_ci_writes_deferred_total{job="yuzu",instance="s1",op="ingest"}'
+        values: "0x100"
+      - series: 'yuzu_device_ci_writes_deferred_total{job="yuzu",instance="s1",op="delete"}'
+        values: "0x100"
+      - series: 'yuzu_pg_collation_version_mismatch{job="yuzu",instance="s1"}'
+        values: "1x100"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuDeviceCiWritesPaused"}'
+        eval_time: 60m
+        exp_samples: []
+
+  # CASE -- per replica, and any op counts. s1 refuses ingest, s2 refuses only decommission
+  # removals (op="delete"), s3 has the mismatch but refuses nothing. At 30m s1 and s2 fire, each
+  # keyed on its own instance, and s3 does not. Red if the sum dropped the instance label, if the
+  # rule read only op="ingest", or if the join matched on job alone.
+  - interval: 1m
+    name: device ci writes paused - fires per replica and counts either op
+    input_series:
+      - series: 'yuzu_device_ci_writes_deferred_total{job="yuzu",instance="s1",op="ingest"}'
+        values: "0x9 1x14 2x14 3x100"
+      - series: 'yuzu_device_ci_writes_deferred_total{job="yuzu",instance="s2",op="delete"}'
+        values: "0x11 1x14 2x14 3x100"
+      - series: 'yuzu_device_ci_writes_deferred_total{job="yuzu",instance="s3",op="ingest"}'
+        values: "0x130"
+      - series: 'yuzu_pg_collation_version_mismatch{job="yuzu",instance="s1"}'
+        values: "1x130"
+      - series: 'yuzu_pg_collation_version_mismatch{job="yuzu",instance="s2"}'
+        values: "1x130"
+      - series: 'yuzu_pg_collation_version_mismatch{job="yuzu",instance="s3"}'
+        values: "1x130"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuDeviceCiWritesPaused", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuDeviceCiWritesPaused", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+          - labels: 'ALERTS{alertname="YuzuDeviceCiWritesPaused", alertstate="firing", instance="s2", job="yuzu", severity="warning"}'
+            value: 1
+
+  # CASE -- the shipped scrape configs (deploy/prometheus/*.yml) add component="server" to every
+  # server series, so both the counter and the gauge carry a label the rule's left side drops
+  # (`sum by (job, instance)`). Same shape as the first case (refusals at 10, 25, 40, 55 and 70
+  # minutes, gauge 1) with that extra label on BOTH series. Red if the join were a plain `and`
+  # (it matches on the whole label set, so nothing would ever match and the alert could never
+  # fire). The alert carries only job and instance (the left side's labels).
+  - interval: 1m
+    name: device ci writes paused - fires when the series carry the extra component label
+    input_series:
+      - series: 'yuzu_device_ci_writes_deferred_total{job="yuzu",instance="s1",component="server",op="ingest"}'
+        values: "0x9 1x14 2x14 3x14 4x14 5x80"
+      - series: 'yuzu_device_ci_writes_deferred_total{job="yuzu",instance="s1",component="server",op="delete"}'
+        values: "0x130"
+      - series: 'yuzu_pg_collation_version_mismatch{job="yuzu",instance="s1",component="server"}'
+        values: "1x130"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuDeviceCiWritesPaused", alertstate="firing"}'
+        eval_time: 22m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuDeviceCiWritesPaused", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuDeviceCiWritesPaused", alertstate="firing"}'
+        eval_time: 54m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuDeviceCiWritesPaused", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+
+  # CASE -- the same extra component label, but the gauge reads 0 (no mismatch) while the counter
+  # still rose inside the window: the alert stays quiet. Red if the join ignored the gauge's
+  # value (for example if the `== 1` filter were dropped, the gauge series would still match on
+  # job and instance), and a guard that the extra-label join does not turn into "always true".
+  - interval: 1m
+    name: device ci writes paused - the extra component label with no mismatch stays quiet
+    input_series:
+      - series: 'yuzu_device_ci_writes_deferred_total{job="yuzu",instance="s1",component="server",op="ingest"}'
+        values: "0x9 1x14 2x14 3x100"
+      - series: 'yuzu_pg_collation_version_mismatch{job="yuzu",instance="s1",component="server"}'
+        values: "0x130"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuDeviceCiWritesPaused"}'
+        eval_time: 30m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuDeviceCiWritesPaused"}'
+        eval_time: 50m
+        exp_samples: []
+
+  # CASE -- YuzuInventoryHighNeedFullRatio ignores outcome="deferred" in its denominator. A paused
+  # device_ci fleet counts one deferred per refused report (400 per minute here), while another
+  # source is in a real need_full surge (30 of 100 non-deferred outcomes, 30%). With the deferred
+  # outcomes in the denominator the ratio would read 30 / 500 = 6% and the alert would stay quiet
+  # for the whole pause; without them it is 30% and fires after its 15m hold. Red if the
+  # `outcome!="deferred"` matcher were dropped. The deferred series does not count in the
+  # numerator either (it is not need_full).
+  - interval: 1m
+    name: inventory need_full ratio - deferred outcomes do not dilute the denominator
+    input_series:
+      - series: 'yuzu_inventory_ingest_total{job="yuzu",instance="s1",source="installed_software",outcome="need_full"}'
+        values: "0+30x100"
+      - series: 'yuzu_inventory_ingest_total{job="yuzu",instance="s1",source="installed_software",outcome="stored"}'
+        values: "0+70x100"
+      - series: 'yuzu_inventory_ingest_total{job="yuzu",instance="s1",source="device_ci",outcome="deferred"}'
+        values: "0+400x100"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuInventoryHighNeedFullRatio", alertstate="firing"}'
+        eval_time: 40m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuInventoryHighNeedFullRatio", alertstate="firing", severity="warning"}'
+            value: 1
 
   # SAM-33 plugin-health alerts. Series are the yuzu_software_facet_devices gauge: 30 collecting
   # devices of which 3 time out (10%) and 0 are otherwise failing. Timeout share 10% > 5% but

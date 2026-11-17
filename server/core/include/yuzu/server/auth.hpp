@@ -59,6 +59,9 @@ class CredentialChangeOwner;    // credential_change_owner.hpp — #5342 one-tra
 class RbacStore;                // rbac_store.hpp, #4966 last-Administrator guard for account lifecycle
 struct CredentialChangeRequest; // credential_change_owner.hpp
 struct CredentialChangeOutcome; // credential_change_owner.hpp
+class MfaDisableOwner;          // mfa_disable_owner.hpp: #6079 PR 2c one-transaction MFA factor clear
+struct MfaDisableRequest;       // mfa_disable_owner.hpp
+struct MfaDisableOutcome;       // mfa_disable_owner.hpp
 } // namespace yuzu::server
 
 namespace yuzu::server::auth {
@@ -904,7 +907,10 @@ public:
     /// FAILED — the route MUST fail closed there (the elevation is still live
     /// durably; reporting success would falsely tell an incident responder the
     /// admin was revoked, governance-missed / adversarial C2). Store-less
-    /// (legacy) mode never errors.
+    /// (legacy) mode never errors. On the durable path the in-place clear of a cached
+    /// entry advances `session_cache_epoch_` in the same critical section, whether or not
+    /// the entry is cached (it removes privilege, so a cold validation holding a
+    /// pre-clear, still-elevated copy must not cache it, #8010).
     [[nodiscard]] std::expected<bool, std::string> revoke_elevation(const std::string& token);
 
     /// Clear any active JIT elevation on EVERY session of `username` (all
@@ -914,7 +920,9 @@ public:
     /// the number of sessions whose elevation was cleared. Returns `unexpected`
     /// ONLY when the durable `SessionStore` clear FAILED — the route MUST fail
     /// closed (an in-flight elevation may still be live durably; the eligibility
-    /// flip alone does not drop it). Store-less (legacy) mode never errors.
+    /// flip alone does not drop it). Store-less (legacy) mode never errors. As in
+    /// `revoke_elevation`, the durable path advances `session_cache_epoch_` in the same
+    /// critical section as the in-place clears, whether or not any session is cached.
     [[nodiscard]] std::expected<int, std::string> revoke_user_elevations(const std::string& username);
 
     /// Lazily reap a PASSIVELY-lapsed JIT elevation (residual-risk follow-up A,
@@ -1203,6 +1211,30 @@ public:
     [[nodiscard]] CredentialChangeOutcome
     commit_password_change(const CredentialChangeRequest& request);
 
+    /// Wire the #6079 PR 2c MFA-disable query owner (server.cpp, built beside the
+    /// credential-change owner on the same pool and audit store). Null (the
+    /// default, and cfg-file-only mode) ⇒ `commit_mfa_disable` answers
+    /// `kStoreUnavailable` and writes nothing. The owner must outlive every call;
+    /// server.cpp nulls this at teardown before the owner destructs. Set during
+    /// single-threaded startup only.
+    void set_mfa_disable_owner(MfaDisableOwner* owner) noexcept { mfa_disable_owner_ = owner; }
+
+    /// The ONE local-account factor clear for the Settings disable route (#6079
+    /// PR 2c). Delegates to `MfaDisableOwner::commit`: the factor clear, every
+    /// durable session of the account and the OUTCOME audit row commit or abort
+    /// together in one transaction under the `auth.users` row lock (see
+    /// mfa_disable_owner.hpp). On `kOk` only, AFTER the commit and outside every
+    /// lock it took, drops this process's in-memory `sessions_` entries of the
+    /// account (the durable rows were already deleted in the transaction and the
+    /// bumped write-generation makes every OTHER replica drop its cached copies;
+    /// this is NOT a second durable wipe). The same drop also runs on `kStoreUnavailable`:
+    /// the connection can be lost exactly at COMMIT after everything landed, so this
+    /// replica's cached sessions are over-invalidated (idempotent; a still-valid session
+    /// re-reads its durable row). It does NOT run for `kNotFound`, `kAuditUnavailable` or
+    /// `kFactorChanged`, where nothing was written. Caller must NOT hold `mu_` or any
+    /// database lock.
+    [[nodiscard]] MfaDisableOutcome commit_mfa_disable(const MfaDisableRequest& request);
+
     /// #5274 boot signal (#5342 Gate 7): with AuthDB wired, `yuzu-server.cfg`
     /// is seed-only and the stored credential always wins. Compares every
     /// cfg-seeded `users_` entry against its `auth.users` row and, for each
@@ -1330,6 +1362,13 @@ public:
     /// the same optional-backing pattern as `set_auth_db`. Wired at startup
     /// before any request is served.
     void set_session_store(yuzu::server::SessionStore* s) { session_store_ = s; }
+
+    /// True iff a durable SessionStore is attached. Lets a caller tell the store-less legacy
+    /// wiring (no durable row exists to require) from a degraded read of an attached store:
+    /// `read_durable_mfa_proof` reports both as `kUnavailable`. Read-only. A test and
+    /// legacy-wiring concession: production always wires a store, so no production branch
+    /// should depend on this returning false.
+    [[nodiscard]] bool has_session_store() const noexcept { return session_store_ != nullptr; }
 
     /// True iff a durable SessionStore is set AND reports open. Wired into
     /// /readyz alongside `is_auth_db_ok()`: with sessions durable, a
@@ -1777,7 +1816,7 @@ private:
     /// recheck the stored proof stays bound to the verifier's generation, which a binding gate
     /// would admit unless a change raced; that is benign (the proof was earned with a valid
     /// code) and the withdrawal is best-effort. This replica's cached proof is blanked or
-    /// re-derived in place, not erased. Returns `kHolds` when the generation still matches.
+    /// re-derived in place, not erased (the cache epoch advances with that edit). Returns `kHolds` when the generation still matches.
     [[nodiscard]] StampRecheck post_stamp_factor_recheck(const std::string& username,
                                                          const std::string& token_hash,
                                                          std::int64_t stamped_gen);
@@ -1792,7 +1831,13 @@ private:
     [[nodiscard]] std::optional<LiveMfaState>
     read_live_mfa_state(const std::string& username) const;
 
-    /// Drop the proof from this replica's cached copy of `key` (no durable write).
+    /// Drop the proof from this replica's cached copy of `key` (no durable write). Advances
+    /// `session_cache_epoch_` in the same critical section, whether or not `key` is cached,
+    /// so a validation held across the drop does not cache its pre-drop copy (#8010). It is
+    /// one of the in-place edits that move the epoch; the others are the proof re-derives
+    /// after a stamp or a post-stamp clear and the elevation clears in `revoke_elevation` and
+    /// `revoke_user_elevations`. `elevate_session`'s re-derive (a grant) and the legacy
+    /// no-store stamp tail do not.
     void drop_cached_mfa_proof(const std::string& key);
 
     /// The username of the session behind `key`: the cache first, else the durable row.
@@ -1839,6 +1884,10 @@ private:
     /// #5342: the credential-change query owner (`set_credential_change_owner`).
     /// Borrowed, never owned; null ⇒ no credential writes.
     CredentialChangeOwner* credential_change_owner_{nullptr};
+
+    /// #6079 PR 2c: the MFA-disable query owner (`set_mfa_disable_owner`).
+    /// Borrowed, never owned; null ⇒ no factor clears.
+    MfaDisableOwner* mfa_disable_owner_{nullptr};
 
     /// #4966: the last-Administrator guard (`set_rbac_store`). Borrowed, never owned.
     yuzu::server::RbacStore* rbac_store_{nullptr};
@@ -1981,9 +2030,16 @@ private:
     // Serves as the generation-gated validate cache when `session_store_` is set.
     mutable std::unordered_map<std::string, Session> sessions_;
     // Cache epoch (guarded by `mu_`): incremented in the same unique-lock critical
-    // section as every `sessions_.clear()` (the generation poll) and every targeted
+    // section as every `sessions_.clear()` (the generation poll), every targeted
     // erase that revokes a session (`drop_cached_session_locked`,
-    // `drop_cached_user_sessions_locked`). Expiry and idle hygiene drops do not move it.
+    // `drop_cached_user_sessions_locked`) and every in-place edit of a cached entry that
+    // REMOVES a proof or privilege (`drop_cached_mfa_proof`, the re-derives in
+    // `stamp_session_mfa_proof` and `post_stamp_factor_recheck`, and the elevation clears in
+    // `revoke_elevation` and `revoke_user_elevations`; bumped whether or not the entry is
+    // cached, #8010). It does NOT move for: expiry and idle hygiene drops; `elevate_session`'s
+    // re-derive (a grant: a stale pre-elevation copy under-grants and self-heals at the next
+    // generation poll); `reap_expired_elevation` (clears an already-lapsed elevation only);
+    // and the legacy no-store stamp tail and test helpers (no durable cache to race).
     // `validate_session_durable` captures it under its step-1 shared lock and inserts
     // its session at the tail only if it is unchanged, so a validation that straddles
     // a clear or a revoke cannot put the session back (ADR-0012 section 4, rule 2). The

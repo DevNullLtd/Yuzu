@@ -368,6 +368,7 @@ agent_test_exe = executable(
     'unit/test_inventory_sync_action_table.cpp',
     'unit/test_agent_sync_command.cpp', # round-3 remediation: decide_sync_now pure-core extraction
                                           # from agent.cpp's __sync__.now reserved-command branch
+    'unit/test_collection_settings_agent.cpp', # settings command parse, golden vectors, scheduler and collector application
     'unit/test_device_ci_sync.cpp',
     'unit/test_sync_source_app_perf.cpp',
     'unit/test_win_str_utils.cpp',
@@ -631,6 +632,9 @@ agent_test_exe = executable(
     'unit/test_remote_access_audit_legs.cpp',            # remote_access_audit: OS-free list_posix decision seam over injected fakes; portable
     'unit/test_remote_access_audit_posix_fs.cpp',        # remote_access_audit: the real POSIX fs binding under a TempDir (symlink/FIFO/cap/dirfd/mountinfo); body #if !defined(_WIN32)
     'unit/test_remote_access_audit_local_dispatcher.cpp',  # remote_access_audit: real plugin via LocalDispatcher + execute seam, unguarded on every OS
+    'unit/test_process_introspect_parsers.cpp',          # process_introspect: pure /proc parsers, hidepid mount-table check and row formatters over REAL CAPTURE + labelled fixtures; portable
+    'unit/test_process_introspect_legs.cpp',             # process_introspect: errno classifiers + OS-free inspect_linux decision seam over an in-memory fake /proc; portable
+    'unit/test_process_introspect_local_dispatcher.cpp', # process_introspect: real plugin via LocalDispatcher, unguarded on every OS
     'unit/test_firmware_posture_parsers.cpp',           # Wave 8 PR8.4: pure SMBIOS/DMI/fwupd/IODeviceTree decoders over REAL CAPTURE fixtures
     'unit/test_firmware_posture_local_dispatcher.cpp',  # Wave 8 PR8.4: real firmware_posture plugin via LocalDispatcher, unguarded on every OS
     'unit/test_hardware_local_dispatcher.cpp',  # H.2 scaffold: real hardware dylib/.so/.dll via LocalDispatcher, unguarded on every OS
@@ -698,6 +702,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/virtualization/src'),  # virtualization_parsers.hpp / _legs.hpp
     include_directories('../agents/plugins/registry/src'),  # registry_parsers.hpp / registry_core.hpp (pure layer)
     include_directories('../agents/plugins/remote_access_audit/src'),  # remote_access_audit_*_parsers.hpp / _legs.hpp / _posix_fs.hpp
+    include_directories('../agents/plugins/process_introspect/src'),  # process_introspect_parsers.hpp / _legs.hpp
     include_directories('../agents/plugins/firmware_posture/src'),  # firmware_posture_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/platform_security/src'),  # platform_security_*parsers.hpp / _legs.hpp (pure helpers), Wave 8 PR8.1-a1
     include_directories('../agents/plugins/system_hardening/src'),  # system_hardening_*parsers.hpp (pure helpers), Wave 8 PR8.1-b
@@ -890,6 +895,7 @@ agent_test_exe = executable(
                 virtualization_plugin_lib,  # virtualization
                 registry_plugin_lib,  # test_registry_write_local_dispatcher.cpp loads the real plugin by path
                 remote_access_audit_plugin_lib,  # remote_access_audit
+                process_introspect_plugin_lib,  # process_introspect
                 firmware_posture_plugin_lib,  # Wave 8 PR8.4
                 browser_inventory_plugin_lib,  # Wave 10 P2a
                 local_security_policy_plugin_lib,  # Wave 8 PR8.3
@@ -1004,6 +1010,7 @@ if host_machine.system() != 'windows' and get_option('b_sanitize') == 'none'
                           include_directories('../agents/plugins/shares/src'),
                           include_directories('../agents/plugins/virtualization/src'),
                           include_directories('../agents/plugins/remote_access_audit/src'),
+                          include_directories('../agents/plugins/process_introspect/src'),
                           include_directories('../agents/plugins/update_source_trust/src'),
                           include_directories('../agents/core/include'),  # yuzu/agent/runner_status.hpp, subprocess_runner.hpp (mgmt_posture_legs.hpp; header-only use)
                           include_directories('../agents/shared')],
@@ -1412,6 +1419,7 @@ echo_test_exe = executable(
     'unit/test_echo_fold.cpp',                    # roll-up substrate: bucket math, deltas, merge ops, DDL/view parity, fold writer, replay ring, GC, authorizer
     'unit/test_echo_fold_sizing.cpp',             # roll-up substrate: bytes-per-row ceilings ([fold_sizing], split into its own test() below)
     'unit/test_echo_v10_migration.cpp',           # schema v10: seeded v9 database over all 17 sources, differential per-source check, rollback, free-space refusal, retired names
+    'unit/test_echo_open_retry.cpp',              # #7290: open-retry back-off, v10 deadline, offline-reason classification, status lines, the stoppable retry loop
     'unit/test_fleet_snapshot.cpp',
     '../agents/plugins/echo/src/echo_db.cpp',
     # Wave 6: the cursor seam's factory AND lookback_seconds_or_forward_only,
@@ -1517,6 +1525,7 @@ if build_server
       'unit/server/test_auth_break_glass.cpp',
       'unit/server/test_auth_db_pg.cpp',
       'unit/server/test_auth_password.cpp',   # #5342/#5274: AuthManager password change/reset + DB-first credential read
+      'unit/server/test_mfa_disable_owner.cpp', # #6079 PR 2c: MfaDisableOwner one-transaction factor clear + session end + outcome audit row
       'unit/server/test_auto_approve.cpp',
       'unit/server/test_cidr_match.cpp',
       'unit/server/test_runtime_config_secret_redaction.cpp',
@@ -2106,12 +2115,18 @@ if build_server
       'unit/server/test_software_lifecycle_rules.cpp',
       # SAM-23 lifecycle store (born-on-PG, [pg][store][lifecycle])
       'unit/server/test_software_lifecycle_store.cpp',
+      # SAM-24 lifecycle import parsers (csv dispatch, CLE ECMA-428 1.0.0): pure, no store, no I/O
+      'unit/server/test_software_lifecycle_import.cpp',
+      # SAM-24 lifecycle rules REST routes: fake gates (no PG) + [pg][lifecycle][routes] over the real store
+      'unit/server/test_software_lifecycle_routes.cpp',
       # pure per-group collection settings resolver (collection_settings_resolve.hpp): no store, no I/O, no [pg]
       'unit/server/test_collection_settings_resolve.cpp',
       # per-group collection settings store (born-on-PG, [pg][store])
       'unit/server/test_software_collection_settings_store.cpp',
       # collection-settings REST routes: null-dep shapes (no PG) + [pg][routes] real AuthRoutes gate over ManagementGroupStorePg/RbacStorePg
       'unit/server/test_software_collection_settings_routes.cpp',
+      # heartbeat-driven settings push: decide_push table, snapshot and memo rules, golden vectors (fake reads, clock and send)
+      'unit/server/test_collection_settings_push.cpp',
       # SAM-33 read routes (hosts, host detail, change feed, summary, plugin health) over injected store reads: no store, no [pg]
       'unit/server/test_software_read_routes.cpp',
       # SAM-36 streamed export: pure parse/chunk/clamp core, then the route over fake page readers (no store, no [pg], no sleeps)
@@ -2125,6 +2140,8 @@ if build_server
       'unit/server/test_app_usage_ingestion.cpp',   # Wave 7b PR7b.2
       'unit/server/test_app_usage_routes.cpp',      # Wave 7b PR7b.2
       'unit/server/test_device_inventory_store.cpp',
+      'unit/server/test_device_ci_write_pause.cpp', # #7730: write pause + ingest-seam gate
+      'unit/server/test_device_ci_read_gate.cpp', # #7730: read gate (pure mapping, bulk page refusal, roster degrade)
       'unit/server/test_agent_decommission.cpp',
       'unit/server/test_app_perf_daily_store.cpp',
       'unit/server/test_app_perf_ingestion.cpp',
@@ -3981,6 +3998,16 @@ test('remote_access_audit definition columns',
   timeout: 30,
 )
 
+# process_introspect's definition contract (content/definitions/process_introspect.yaml): the
+# row_kind-first field_1..field_4 columns pinned to the wire rows process_introspect_parsers.hpp
+# emits, the pid/facet/start_time parameter grammar and the never-disclosed wording.
+test('process_introspect definition columns',
+  _python3_test,
+  args: [files('test_process_introspect_definition.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # update_source_trust's failure-token contract (#4874): every `note_failure` literal and every
 # errno_detail token in the plugin headers is named in the README's Result status row and gloss
 # table, and nothing in those tables is undefined in the source.
@@ -4462,6 +4489,18 @@ test('agent command-dedup wiring lexical gate (#3668)',
 test('agent guardian sender-refusal wiring lexical gate (#5690)',
   _python3_test,
   args: [files('test_agent_guardian_refusal_wiring_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
+
+# Registry path verification is OFF unless the operator opts in (REG-15-I2, #7836): the Catch2 cases
+# observe the factory default and the Config field and clamp, but nothing unit-tests that main.cpp
+# defaults the option to 0 with a post-parse range check (not a CLI11 validator, which drops an env
+# value silently) or that agent.cpp passes the clamped operator value to the two-argument factory.
+# Carries its own in-memory mutation self-test. No build required.
+test('registry path-verification default-off wiring lexical gate (REG-15-I2, #7836)',
+  _python3_test,
+  args: [files('test_registry_verify_default_wiring_lexical.py')],
   suite: 'agent',
   timeout: 30,
 )
@@ -5315,6 +5354,9 @@ test('contract registry', _python3_test,
   args: [files('../scripts/test/contract-evidence.py'), 'check'], suite: 'docs', timeout: 30)
 test('contract evidence CI step', _python3_test,
   args: [files('test_contract_evidence_ci_step.py')], suite: 'docs', timeout: 30)
+# One CCACHE_MAXSIZE per self-hosted pool: a smaller cap trims the shared cache.
+test('ci ccache cap', _python3_test,
+  args: [files('test_ci_ccache_cap.py')], suite: 'docs', timeout: 30)
 if get_option('build_contract_tests')
   _contract_adapter = files('../scripts/test/contract-evidence.py')
   test('contract.plugin.loader.reserved-name.reject', _python3_test,

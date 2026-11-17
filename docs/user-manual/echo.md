@@ -381,7 +381,7 @@ constrained via the `NET_RT_FLAGS` sysctl route dump — `entry_type` always
 `unknown` there), so `arp_enabled|true` reports real rows there — run the
 `compatibility` action to distinguish a supported-but-empty source from a
 planned-but-unimplemented one.
-`<source>_rows` counts the rows of the source's finest tier (its hourly tier; `usage_daily` for `usage`), and `<source>_oldest_ts` is the start of that tier's oldest bucket, not an event's own time. For `usage`, `usage_rows` is the `usage_daily` row count and `usage_oldest_ts` the oldest day, not the number of open runs in `usage_live`. `netqual_boot_rows` counts the per-boot baseline table. When the storage is offline the reply leads with `error|` and then `storage_state|offline` (`storage_state|offline|free_space` when a migration was refused for lack of free space, see [Upgrading an existing database](#upgrading-an-existing-database)).
+`<source>_rows` counts the rows of the source's finest tier (its hourly tier; `usage_daily` for `usage`), and `<source>_oldest_ts` is the start of that tier's oldest bucket, not an event's own time. For `usage`, `usage_rows` is the `usage_daily` row count and `usage_oldest_ts` the oldest day, not the number of open runs in `usage_live`. `netqual_boot_rows` counts the per-boot baseline table. When the storage is offline the reply leads with `error|` and then `storage_state|offline`. When Echo loaded offline at open, that line carries the reason as a third field: `storage_state|offline|free_space` (the migration was refused for lack of free space), `storage_state|offline|migration_failed` (the v10 roll-up step, or an earlier step, failed or ran out of time) or `storage_state|offline|open_failed` (any other failure met on a later retry). The `error|` line says the open is retried automatically, 1, 5 and 15 minutes after the first failure and then hourly, so no restart is needed once the cause is cleared (the exception is a collection start that fails after a late open: nothing more is retried and the line asks for an agent restart); see [Upgrading an existing database](#upgrading-an-existing-database).
 `software_last_run_ts` is the wall-clock of the last `collect_software` tick (`0`
 if it has not run yet); it is the heartbeat that distinguishes "healthy but no
 software changed" (where `software_rows` stays low) from "the hourly trigger
@@ -462,7 +462,13 @@ in flight, if it arrives inside the server-wide 60 s back-off that follows any
 failed lookup or write, or if the in-flight set is at capacity. A plugin that
 failed to initialise (including Echo when the corrupt file cannot be moved
 aside) is reported in the `yuzu.plugins_failed` heartbeat tag and `yuzu_fleet_plugin_init_failed{plugin}`,
-which distinguishes "failed to load" from "not installed". The plugin keeps its
+which distinguishes "failed to load" from "not installed". An Echo that loads
+*offline* at open (`free_space`, `migration_failed` or `open_failed`; see
+[Upgrading an existing database](#upgrading-an-existing-database)) did load, so it
+is not counted there: it retries by itself, and it is visible as the
+`yuzu.plugin.echo.storage_offline` heartbeat tag, the
+`yuzu_fleet_echo_storage_offline{reason}` gauge and the `YuzuEchoStorageOffline`
+alert. The plugin keeps its
 count in a private storage record; if that record is present but unreadable the
 plugin logs `ECHO: db_health.ledger unreadable; not overwriting` and stops updating
 the two heartbeat keys rather than resetting the count — `status` still reports
@@ -532,7 +538,7 @@ The first frame surfaces every device × source pair where the collector has bee
 - Viewing the page and the retention-paused list requires `Infrastructure:Read`.
 - **Scan fleet** requires `Execution:Execute` (it dispatches a fleet-wide command).
 - **Re-enable** requires `Execution:Execute` (it dispatches a configure command to a single device).
-- **Purge data** requires `Infrastructure:Delete` — a **higher** tier than Re-enable, because it is destructive. It is management-group scope-checked like Re-enable (out-of-scope `device_id` collapses to the same 404). The "only purge a paused source" rule is enforced **on the agent** (it refuses with `source_not_paused` if the source is enabled, or `config_unreadable` if the enable flag cannot be read so it cannot confirm the source is paused), so a source re-enabled between your scan and the purge is never dropped. Requires an agent that supports the `echo.purge_source` action (v0.14.0+); an older agent silently no-ops the purge — verify with a fresh **Scan fleet**. For the `registry` source the purge also erases its per-key baselines in `echo_state` and its cursor.
+- **Purge data** requires `Infrastructure:Delete` — a **higher** tier than Re-enable, because it is destructive. It is management-group scope-checked like Re-enable (out-of-scope `device_id` collapses to the same 404). The "only purge a paused source" rule is enforced **on the agent** (it refuses with `source_not_paused` if the source is enabled, or `config_unreadable` if the enable flag cannot be read so it cannot confirm the source is paused), so a source re-enabled between your scan and the purge is never dropped. Requires an agent that supports the `echo.purge_source` action (v0.14.0+). Running agents older than the server is not supported (see "Deployment contract (hard cutover)" in `upgrading.md`), so there is no mixed-version behaviour to plan for. For the `registry` source the purge also erases its per-key baselines in `echo_state` and its cursor.
 - The per-device **Re-enable** and **Purge data** endpoints are management-group scope-checked — it rejects out-of-scope `device_id` values with the same 404 response as a not-connected agent (no enumeration oracle). The **Scan dispatch and the rendered list**, however, currently gate only on the *global* `Execution:Execute` / `Infrastructure:Read` permission: management-group confinement of these **list/fan-out** views is **not yet effective** (tracked as the ADR-0017 admit-then-filter gate) — under RBAC a confined operator is denied at the global gate rather than shown a narrowed list. When RBAC is **disabled** (the default), reads return the full enrolled fleet; when RBAC is **enabled**, list views require the global permission and per-device routes additionally enforce your management-group role assignments.
 
 **State persistence:** Scan results are held in the server's memory keyed by your username. Restarting the server clears the last-scan reference; click **Scan fleet** again after a restart. Persistence across restarts and multi-server coordination are planned for Phase 15.G operational hardening.
@@ -740,8 +746,7 @@ condition clears.
 > preserve evidence): run `echo.status` on that agent and record its
 > `config|<source>_enabled|false` lines (and the matching `config|<source>_paused_at|<epoch>`
 > lines), and export what you need with `echo.sql`, which reaches every table and every
-> tier (`echo.query` and `echo.export` read only the live tables, and of these eight only
-> `software`, `arp`, `dns` and `mapdrive` have one). The reset re-enables the source, and retention skips only disabled
+> tier (`echo.query` and `echo.export` return the hourly tier only). The reset re-enables the source, and retention skips only disabled
 > sources, so the exemption ends with it: from the first rollup pass after the
 > upgrade (rollups run every 15 minutes) rows older than their tier cutoff start
 > being pruned, and that cannot be undone. After the upgrade, re-apply
@@ -758,17 +763,18 @@ condition clears.
 > (`process`, `tcp`, `service`, `user`, `perf`, `power`, `removable`, `usage`), are
 > left untouched. The reset runs only once: an opt-out you write **after** the
 > migration has succeeded (`<source>_enabled=false` via `configure`) sticks across
-> restarts. A failed migration is retried on the next start. While it keeps
-> failing, Echo does not open its database at all, so no disable can be written in that
-> window.
+> restarts. A failed migration loads Echo offline (`storage_state|offline|migration_failed`)
+> and is retried in the background (1, 5 and 15 minutes after the failure, then
+> hourly). While it keeps failing, Echo does not open its database at all, so no
+> disable can be written in that window.
 >
 > **If the migration fails.** The success line in the agent log is
 > `EchoDatabase: migrated to schema version 8`; a failure logs
-> `EchoDatabase: v8 migration failed at` followed by the failing step, rolls the whole
-> migration back, and retries it on the next start. Echo refuses to open until a start
-> succeeds (the roll-up migration waits for it), so the old stored values stay in force
-> and nothing can be written in that window: look for the success line before relying
-> on a disable.
+> `EchoDatabase: v8 migration failed at` followed by the failing step and rolls the whole
+> migration back. Echo loads offline (`storage_state|offline|migration_failed`) and
+> retries it in the background until an attempt succeeds (the roll-up migration waits
+> for it), so the old stored values stay in force and nothing can be written in that
+> window: look for the success line before relying on a disable.
 >
 > **What to expect.** `echo.status` reads `<source>_enabled|true` for all eight. New
 > collection starts without operator action, on each OS where the source has a collector
@@ -1119,11 +1125,15 @@ The events folded into the tiers are bounded at the point of writing as well as 
 
 **The roll-up migration (schema v10).** An `echo.db` written by an earlier build holds the sixteen raw `<source>_live` tables and the old hourly, daily and monthly summaries. On the first open by this build, Echo converts all of it in ONE transaction and the old data is either wholly converted or left exactly as it was:
 
-1. It checks that the volume holds twice the database file plus its write-ahead log free. If not, the open is refused, nothing is touched, and Echo stays offline until space is freed and the agent restarts: `status` leads with `error|` and reports `storage_state|offline|free_space`, and the agent log says how much is needed. The Echo plugin loads without its database and runs no trigger, so nothing is collected until the restart.
+1. It checks that the volume holds twice the database file plus its write-ahead log free. If not, the open is refused, nothing is touched, and Echo is offline until space is freed: `status` leads with `error|` and reports `storage_state|offline|free_space`, and the agent log says how much is needed. The Echo plugin loads without its database and runs no trigger, so nothing is collected meanwhile; the agent retries the open on its own (below), so no restart is needed once the space is there.
 2. It renames the old summary tiers aside and converts each row into the interned tiers (an average becomes its sum, so averages stay exact), finishes the roll-ups the old aggregation pass had not yet performed, and folds every raw capture row the old summaries had not yet covered. The 4096 newest record keys of each cursor source (`power`, `removable`, `registry`) are remembered, so a replay after the upgrade does not count an event twice.
 3. It drops the raw tables, the rollup marks and the usage read marker, and sets the schema version to 10. Nothing takes the raw tables' names: a query over one fails with `unknown table`.
 
-A failure at any step, a crash, or a power loss before the commit leaves the old tables intact, and the next open runs the migration again. After the commit, Echo checkpoints and truncates the write-ahead log and, when the volume holds twice the new file free, runs one `VACUUM` to return the freed pages; otherwise it records `auto_vacuum_deferred_at` and the daily maintenance pass retries (`db_auto_vacuum|deferred`). The agent log carries one line with the duration, rows converted, rows folded, rows rejected, replay keys seeded, tables dropped, the file size before and after and the write-ahead log size at commit.
+A failure at any step, a crash, or a power loss before the commit leaves the old tables intact, and the next open runs the migration again (see "When the migration fails" below). After the commit, Echo checkpoints and truncates the write-ahead log and, when the volume holds twice the new file free, runs one `VACUUM` to return the freed pages; otherwise it records `auto_vacuum_deferred_at` and the daily maintenance pass retries (`db_auto_vacuum|deferred`). The agent log carries one line with the duration, rows converted, rows folded, rows rejected, replay keys seeded, tables dropped, the file size before and after and the write-ahead log size at commit.
+
+**When the migration fails: Echo is offline and the agent retries.** A failure of the roll-up step (a damaged mark, a bucket outside years 0001-9999, a locked file, a full volume, an attempt that ran out of time) does not stop the plugin and does not move the file aside. Echo loads offline: `status` leads with `error|` and reports `storage_state|offline|migration_failed` (or `free_space`, as above, or `open_failed` for any other failure met on a later retry), every other action refuses with the same error, and nothing is collected. The agent retries the whole open 1, 5 and 15 minutes after the first failure and then hourly, with no limit on attempts, so the cause (space freed, a lock released) is picked up without a restart; a damaged mark or row still needs the repair in "Upgrading" (`upgrading.md`), made on the stopped agent. Each attempt is bounded by a deadline of 60 seconds plus 2 seconds per MiB of the file, doubled for every attempt that ran out of time and capped at one hour; an attempt that hits it is rolled back and the file is exactly as it was. The first attempt is made while the plugin initialises, so the agent still registers only after it (bounded by that deadline, not unbounded). A repeating failure is not free: every attempt reads the whole file for its integrity check and, when it reaches the migration, writes a write-ahead log that can outgrow the file (measured at 1.35 times the file in one run; no general bound is proven) before the transaction is undone. If an attempt opens the database but collection then fails to start, no further attempt is made: `status` reports `storage_state|offline|open_failed` and its `error|` line asks for an agent restart.
+
+Fleet visibility: an agent in this state reports the heartbeat tag `yuzu.plugin.echo.storage_offline` (the reason), the server publishes `yuzu_fleet_echo_storage_offline{reason}` (agents per reason, 0 included) and the alert `YuzuEchoStorageOffline` fires after 30 minutes. Such an agent is not counted in `yuzu_fleet_plugin_init_failed`: the plugin loaded. The runbook is `docs/ops-runbooks/echo-storage-offline.md`.
 
 **The agent registers after the migration.** Plugin initialisation blocks for the whole migration (55 seconds on a 242 MB file in the one measurement taken). The agent runs every plugin's initialisation before it calls Register and before the heartbeat thread starts, so the server sees the agent only once the migration has finished. The Windows service manager and systemd (`Type=simple`) set no readiness deadline that this wait can trip. The agent-level time from start to registered has not been measured.
 
@@ -1136,11 +1146,11 @@ What does not survive: a raw row's own timestamp, pid, command line and any colu
 Before upgrading an agent whose `echo.db` is near or above 250 MiB:
 
 1. Make sure the volume holds twice the file's size, plus the size of its write-ahead log, free, or the migration is refused.
-2. Read `db_size_bytes` from `echo.status` on the older agent. It counted free pages as well as used pages, so a host that reads under 245,366,784 there cannot be trimmed.
+2. Read `db_size_bytes` from `echo.status` on the agent before the upgrade. It counted free pages as well as used pages, so a host that reads under 245,366,784 there cannot be trimmed.
 3. Export what you need with `echo.sql`, by `ts` range, before the upgrade: the raw columns do not survive it.
 4. Or, within 15 minutes of the restart, send `echo.configure db_budget_bytes=<bytes>` with a larger figure.
 
-The budget cannot be set ahead of the upgrade: an older agent answers `error|no valid configuration parameters provided` when `db_budget_bytes` is the only key, and ignores it beside other keys.
+The budget cannot be set ahead of the upgrade: the agent before the upgrade answers `error|no valid configuration parameters provided` when `db_budget_bytes` is the only key, and ignores it beside other keys.
 
 After the trim, `db_size_bytes` falls at once, but the file shrinks only after the one-off `VACUUM` (it needs twice the used size free; otherwise `db_auto_vacuum|deferred` is reported and the conversion is retried within a day). Watch `budget_evicted_hourly_rows_total`, `budget_over_bytes` and `db_auto_vacuum` in `status`.
 

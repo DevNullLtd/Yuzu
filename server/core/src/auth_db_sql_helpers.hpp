@@ -7,7 +7,9 @@
 /// and the ADR-0012 §3 cross-schema query owner must run lives here ONCE, so
 /// `AuthDB::remove_user` / `AuthDB::update_role` and the owner's
 /// last-Administrator-guarded `deactivate_account` / `set_local_role` cannot
-/// drift into two copies of the soft-delete or of the role write. Not a public
+/// drift into two copies of the soft-delete or of the role write. The MFA factor
+/// clear (`clear_mfa_factor_in_txn`) is likewise shared by `AuthDB::mfa_disable_report`
+/// and `MfaDisableOwner` (mfa_disable_owner.cpp). Not a public
 /// API. Only `auth.*` SQL belongs here: cross-schema SQL (anything naming
 /// `rbac_store.*`) lives in the query owner, in its own translation unit, and
 /// tests/test_rbac_query_owner_seam.py fails if an `rbac_store.` literal
@@ -77,6 +79,97 @@ inline std::optional<bool> soft_delete_user_in_txn(PGconn* c, const std::string&
         return std::nullopt;
     }
     return true;
+}
+
+/// What `clear_mfa_factor_in_txn` found under the row lock.
+enum class MfaClearStatus : std::uint8_t {
+    kCleared,       ///< an active row was locked and its factor columns cleared
+    kNoActiveRow,   ///< no ACTIVE row by that name (unknown or inactive): nothing was cleared
+    kFactorChanged, ///< an active row at another factor generation: nothing cleared, codes kept
+};
+struct MfaClearReport {
+    MfaClearStatus status{MfaClearStatus::kNoActiveRow};
+    /// The pre-image of the same row lock: whether a verified factor existed at the moment of
+    /// the clear. `true` when no active row matched, so a caller deciding whether to end the
+    /// account's sessions fails safe.
+    bool was_enrolled{true};
+};
+
+/// The ONE MFA factor clear, moved verbatim out of `AuthDB::mfa_disable_report` so that
+/// function and `MfaDisableOwner::commit` cannot drift into two copies. Runs inside an
+/// already-open transaction on `c`: it locks the account's row, optionally compares the
+/// admitted factor generation INSIDE that locking read (READ COMMITTED re-evaluates the
+/// predicate against the row a concurrent writer committed), clears `mfa_totp_secret`,
+/// `mfa_enrolled_at`, `mfa_last_counter` (stamping `mfa_disabled_at`) and deletes the account's
+/// `auth.mfa_recovery_codes`. The `users_mfa_factor_gen` trigger redraws the generation on the
+/// enrolment change. Two compile-time statement texts, chosen in C++: `pg::exec_params` passes
+/// strings, so no SQL NULL is ever bound.
+///
+/// With an expected generation, zero updated rows are classified in the SAME transaction: an
+/// ACTIVE row at another generation is `kFactorChanged` and the function returns BEFORE the
+/// recovery-code DELETE (the caller must roll back; the committed code set is untouched);
+/// anything else keeps the fail-safe `was_enrolled = true`. The recovery-code DELETE otherwise
+/// runs even when no active row matched (the historical behaviour, kept byte-identical).
+/// Returns `nullopt` on a statement failure (`err` set from the connection; the caller must
+/// abort the transaction).
+inline std::optional<MfaClearReport>
+clear_mfa_factor_in_txn(PGconn* c, const std::string& username,
+                        std::optional<std::int64_t> expected_factor_gen, std::string& err) {
+    static constexpr const char* kClearSql =
+        "WITH pre AS (SELECT id, (mfa_enrolled_at IS NOT NULL) AS was_enrolled "
+        "FROM auth.users WHERE username = $1 AND is_active = TRUE FOR UPDATE) "
+        "UPDATE auth.users u SET mfa_totp_secret = NULL, mfa_enrolled_at = NULL, "
+        "mfa_disabled_at = now(), mfa_last_counter = 0, updated_at = now() "
+        "FROM pre WHERE u.id = pre.id RETURNING pre.was_enrolled";
+    static constexpr const char* kClearAtGenSql =
+        "WITH pre AS (SELECT id, (mfa_enrolled_at IS NOT NULL) AS was_enrolled "
+        "FROM auth.users WHERE username = $1 AND is_active = TRUE "
+        "AND mfa_factor_gen = $2::bigint FOR UPDATE) "
+        "UPDATE auth.users u SET mfa_totp_secret = NULL, mfa_enrolled_at = NULL, "
+        "mfa_disabled_at = now(), mfa_last_counter = 0, updated_at = now() "
+        "FROM pre WHERE u.id = pre.id RETURNING pre.was_enrolled";
+    MfaClearReport report;
+    std::vector<std::string> params{username};
+    if (expected_factor_gen)
+        params.push_back(std::to_string(*expected_factor_gen));
+    pg::PgResult upd = pg::exec_params(c, expected_factor_gen ? kClearAtGenSql : kClearSql, params);
+    if (upd.status() != PGRES_TUPLES_OK) {
+        err = PQerrorMessage(c);
+        return std::nullopt;
+    }
+    if (PQntuples(upd.get()) == 1) {
+        const char* v = PQgetisnull(upd.get(), 0, 0) ? "" : PQgetvalue(upd.get(), 0, 0);
+        report.status = MfaClearStatus::kCleared;
+        report.was_enrolled = v[0] == 't' || v[0] == 'T' || v[0] == '1';
+    } else if (expected_factor_gen) {
+        // Zero rows with a guard engaged: an ACTIVE row at another generation is a refusal
+        // (nothing cleared, the recovery codes untouched); an absent or inactive row keeps the
+        // fail-safe `was_enrolled = true`.
+        pg::PgResult cls = pg::exec_params(
+            c, "SELECT is_active, mfa_factor_gen FROM auth.users WHERE username = $1",
+            std::vector<std::string>{username});
+        if (cls.status() != PGRES_TUPLES_OK) {
+            err = PQerrorMessage(c);
+            return std::nullopt;
+        }
+        if (PQntuples(cls.get()) == 1) {
+            const char* active = PQgetisnull(cls.get(), 0, 0) ? "" : PQgetvalue(cls.get(), 0, 0);
+            const char* gen = PQgetisnull(cls.get(), 0, 1) ? "" : PQgetvalue(cls.get(), 0, 1);
+            const bool is_active = active[0] == 't' || active[0] == 'T' || active[0] == '1';
+            const std::int64_t stored = gen[0] == '\0' ? 0 : std::strtoll(gen, nullptr, 10);
+            if (is_active && stored != *expected_factor_gen) {
+                report.status = MfaClearStatus::kFactorChanged;
+                return report; // the caller rolls back before any recovery-code DELETE
+            }
+        }
+    }
+    pg::PgResult del = pg::exec_params(c, "DELETE FROM auth.mfa_recovery_codes WHERE username = $1",
+                                       std::vector<std::string>{username});
+    if (del.status() != PGRES_COMMAND_OK) {
+        err = PQerrorMessage(c);
+        return std::nullopt;
+    }
+    return report;
 }
 
 /// The ONE role-column write, shared by `AuthDB::update_role` and the owner's

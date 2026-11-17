@@ -556,6 +556,17 @@ struct OpenSeams {
     /// the real call. A test's `link` runs between the verdict and the claim, which is where a
     /// swapped-in link has to be caught (#1527). Production never sets one.
     yuzu::shared::sqlite_quarantine::FsOps quarantine_ops;
+    /// Called by the v10 migration after its pre-transaction reads, right before BEGIN IMMEDIATE,
+    /// with the migrating connection. It stands in for another process acting in the gap between
+    /// the pre-checks and the write lock (a second opener, a held lock, a full volume). Production
+    /// never sets it.
+    std::function<void(sqlite3*)> v10_before_begin;
+    /// Override of the v10 migration's wall-clock deadline (default: v10_migration_deadline of the
+    /// file size). A test sets 0 to hit it at once; production leaves it empty.
+    std::optional<std::chrono::milliseconds> v10_deadline;
+    /// True = abandon the v10 migration (rolled back, the file untouched). Production: the open
+    /// retry loop's stop flag, so a shutdown does not wait out a long attempt.
+    std::function<bool()> v10_cancel;
 };
 
 /// What `PRAGMA integrity_check` says about echo.db at open (#559, #7286). Only `corrupt` moves the
@@ -571,6 +582,10 @@ enum class IntegrityCheck {
 /// Classify the sqlite result code that a failed `PRAGMA integrity_check` (prepare or step) ended
 /// with. Pure; `rc` may be an extended code, only its primary (low) byte counts. Never returns `ok`.
 IntegrityCheck classify_integrity_rc(int rc) noexcept;
+
+/// The integer in an echo_config `schema_version` value; an unparseable one reads as 0. Shared by
+/// the open path and the v10 migration's in-transaction re-read so both agree on malformed text.
+int parse_schema_version(const std::string& text);
 
 class EchoDatabase {
 public:

@@ -18,6 +18,7 @@
 #include "echo_fold_schema.hpp"
 #include "echo_schema_registry.hpp"
 #include "echo_sqlite_progress.hpp"
+#include "echo_status_format.hpp" // kV10MigrationFailedPrefix, kEarlierStepPrefix
 #include "echo_usage.hpp"
 
 #include <sqlite3.h>
@@ -260,15 +261,6 @@ IntegrityResult check_integrity(sqlite3* db) noexcept {
         return {ok ? IntegrityCheck::ok : IntegrityCheck::corrupt, src};
     }
     return {classify_integrity_rc(src), src};
-}
-
-// The integer in an echo_config `schema_version` value; an unparseable one reads as 0.
-int parse_schema_version(const std::string& text) {
-    try {
-        return std::stoi(text);
-    } catch (...) {
-        return 0;
-    }
 }
 
 // #1527 — refuse a symlink (every OS) or reparse point (Windows: a junction is not a symlink to
@@ -737,6 +729,14 @@ void secure_quarantined_sidecars(const std::filesystem::path& quarantined,
 #endif // _WIN32
 
 } // namespace
+
+int parse_schema_version(const std::string& text) {
+    try {
+        return std::stoi(text);
+    } catch (...) {
+        return 0;
+    }
+}
 
 IntegrityCheck classify_integrity_rc(int rc) noexcept {
     const int primary = rc & 0xff; // an extended code (SQLITE_BUSY_SNAPSHOT, ...) keeps it in the low byte
@@ -1542,14 +1542,14 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
         // roll-up step must not run past it: it would take the version to 10 and the step that
         // failed would never be retried (each is gated on its own version).
         if (version < 9)
-            return std::unexpected(std::format("schema v{}: an earlier migration step did not finish "
+            return std::unexpected(std::format("schema v{}: {} "
                                                "(see the log); the roll-up step waits for it and the "
                                                "next open retries both",
-                                               version));
+                                               version, kEarlierStepPrefix));
         if (auto migrated = migrate_to_v10(db, path, seams); !migrated)
-            return std::unexpected(std::format("v10 roll-up migration failed (the schema stays at "
+            return std::unexpected(std::format("{} (the schema stays at "
                                                "v9; the retired tables are intact): {}",
-                                               migrated.error()));
+                                               kV10MigrationFailedPrefix, migrated.error()));
     }
     // B3 (#6889 review): never publish a connection that is inside a transaction. Writes on it
     // would be reported durable and discarded at close. `db` owns raw_db, so returning closes it.
