@@ -279,8 +279,7 @@ owner's answers to the governance run's findings on 2026-11-16.
 - D6. The change closes #7730 only once the follow-up issue for the other text-keyed stores (D7) exists;
   until then it says "Part of #7730".
 - D7. Other stores' text-keyed unique indexes (`endpoint_state`, written on every heartbeat, is a named
-  example) and agent registration are not gated; a follow-up issue is to be filed (to be filed, none
-  exists yet). This is an exposure statement outside residuals 1 to 4 above.
+  example) and agent registration are not gated; follow-up issue #8104. This is an exposure statement outside residuals 1 to 4 above.
 - 2026-11-16, invalid index: a HOLD-ONLY guard ships in this change (an invalid index in the schema
   `device_inventory_store` holds the gate, never enters Mismatch).
 - 2026-11-16, Unproven for ever: the case where the database records a version and the host reports
@@ -288,7 +287,7 @@ owner's answers to the governance run's findings on 2026-11-16.
 - 2026-11-16, residuals: replica skew, the detection delay of up to about an hour, other text-keyed
   stores including `endpoint_state` and agent registration, and the resume burst of full resends are
   accepted as design limits of this change (owner session decision, not a renewed 2026-11-15
-  acceptance); they are disclosed in the manual and follow-up issues are to be filed (none exist yet).
+  acceptance); they are disclosed in the manual and follow-up issues are #8104 (residuals) and #8105 (the resume burst and the refusal discriminator).
 - 2026-11-16, repeat thread start failure: an ERROR log and the documentation, no retry machinery.
 
 ## Owner acceptance of the residual
