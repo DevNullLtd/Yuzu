@@ -320,6 +320,11 @@ TEST_CASE("query_failure_detail keeps the step and a folded, capped first line (
     CHECK(yuzu::test::stray_control_bytes(f) == 0);
     CHECK(f.size() <= 1 + 3 + 120 + 8);
     CHECK(query_failure_detail("step", "") == "step");
+    // The 120-byte cut backs up over a UTF-8 continuation byte: no dangling lead byte.
+    const auto g = query_failure_detail("s", std::string(119, 'x') + "\xC3\xA9" + "tail");
+    CHECK(g == "s: " + std::string(119, 'x')); // the 2-byte character is dropped whole
+    for (const unsigned char c : g)
+        CHECK(c < 0x80);
 }
 
 TEST_CASE("connect_failure_cause: each branch, and the mis-bucketing cases", "[raii][F56]") {

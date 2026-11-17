@@ -4701,6 +4701,13 @@ if is_variable('pg_canary_exe')
     timeout: 60,
   )
 endif
+# WP04-X: the readiness probe's query-phase sites never use the connect classifier.
+test('pg probe query-phase classifier lexical gate',
+  _python3_test,
+  args: [files('test_pg_probe_query_phase_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
 # #4160: pins the sso-only runtime-wiring check + provider gauges in ServerImpl (source-text only;
 # its own in-file selftest mutates each pinned statement, so no separate selftest entry).
 test('sso-only runtime wiring lexical gate',

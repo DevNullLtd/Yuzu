@@ -4676,12 +4676,13 @@ groups:
             The dedicated Postgres reachability probe on {{ $labels.instance }}
             has failed for over 2 minutes; /readyz reports not ready with a
             `pg` reason (unreachable, stale, or read_only). Check the server log
-            for the "[readyz] Postgres not reachable" line (it carries a FIXED
-            cause such as "server not reachable", "authentication failed", "no free
-            connection slots" (slot exhaustion, the #4943 shape) or "no writable
-            host" (read-only or standby only), not
-            libpq's text, which can quote part of a DSN password; probe from the
-            server host with psql against the same DSN for the detail), the
+            for the "[readyz] Postgres not reachable" line. For a connect failure it
+            carries a FIXED cause ("server not reachable", "authentication failed",
+            "no free connection slots" (slot exhaustion, the #4943 shape) or "no
+            writable host" (read-only or standby only)), never libpq's connect text,
+            which can quote part of a DSN password; for a failed probe query it
+            carries the failing step plus the first line of libpq's message. Probe
+            from the server host with psql against the same DSN for more detail, check the
             database, and the network or proxy path to it.
             read_only means the probe reached a server that refuses writes: a
             standby (check that the proxy routes to the current primary) or a

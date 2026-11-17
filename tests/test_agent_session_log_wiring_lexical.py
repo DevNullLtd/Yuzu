@@ -10,7 +10,7 @@ Best-effort lexical gate, two checks:
      joined, and a `session=` extractor within WINDOW lines of a "Registered with server" mention
      (a separate-line extractor included) fails. A line that carries the marker
      `tripwire-allow: <reason>` is exempt, so each exemption is visible at its own line (the
-     legacy-agent fallbacks and the upgrade note quoting the old line).
+     direct-id fallbacks and the upgrade note quoting the old line).
 The server-side "ProxyRegister succeeded: ... session=" line is the id's source and is not flagged.
 """
 import pathlib

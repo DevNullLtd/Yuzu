@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Runs scripts/lib/agent-session-fp.sh against synthetic agent and server logs (F50): the
 fingerprint join must work on LF and CRLF logs (a native Windows server/agent writes CRLF), fall
-back to a pre-F50 agent's session=<id>, tolerate a missing server log, and FAIL LOUDLY when no
+back to a Registered line carrying session=<id>, tolerate a missing server log, and FAIL LOUDLY when no
 SHA-256 tool exists. Skips when bash is unavailable."""
 import hashlib
 import os
@@ -13,7 +13,7 @@ import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 BASH = shutil.which("bash") or "bash"
-LIB = (ROOT / "scripts/lib/agent-session-fp.sh").as_posix()
+LIB = pathlib.Path(os.environ.get("YUZU_FP_LIB") or (ROOT / "scripts/lib/agent-session-fp.sh")).as_posix()
 SID = "gw-session-0123456789abcdef0123456789abcdef"
 OTHER = "gw-session-ffffffffffffffffffffffffffffffff"
 FP = hashlib.sha256(SID.encode()).hexdigest()[:8]
@@ -46,11 +46,19 @@ def main():
                 bad.append(f"{tag}: expected {SID}, got {r.stdout!r} {r.stderr!r}")
             if bash(f"agent_session_fp '{agent.as_posix()}'").stdout.strip() != FP:
                 bad.append(f"{tag}: agent_session_fp wrong")
+        # NUL byte in a log: without grep -a the match is "binary file matches" and the join reads unknown
+        nul_agent = d / "agent-nul.log"
+        nul_server = d / "server-nul.log"
+        nul_agent.write_bytes(b"garbage\x00\x00 bytes\n" + f"Registered with server (session_fp={FP}, enrollment=enrolled)\n".encode())
+        nul_server.write_bytes(b"\x00junk\n" + f"ProxyRegister succeeded: agent=a2, session={SID}\n".encode())
+        r = bash(f"resolve_agent_session '{nul_agent.as_posix()}' '{nul_server.as_posix()}'")
+        if r.stdout.strip() != SID:
+            bad.append(f"NUL-bearing logs: expected {SID}, got {r.stdout!r}")
         # missing server log: unknown, rc 0 (no abort under set -e)
         r = bash(f"set -e; resolve_agent_session '{(d/'agent-lf.log').as_posix()}' '{(d/'nope.log').as_posix()}'")
         if r.returncode != 0 or r.stdout.strip() != "unknown":
             bad.append(f"missing server log: {r.returncode} {r.stdout!r}")
-        # legacy agent
+        # a Registered line carrying the id directly
         legacy = d / "agent-old.log"
         legacy.write_bytes(f"Registered with server (session={SID}, enrollment=enrolled)\r\n".encode())  # tripwire-allow: legacy-agent fixture
         r = bash(f"resolve_agent_session '{legacy.as_posix()}' '{(d/'server-lf.log').as_posix()}'")

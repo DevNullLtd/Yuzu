@@ -529,7 +529,8 @@ private:
                     read_only = v != nullptr && v[0] == 't';
                 } else if (!result_error) {
                     const char* m = PQresultErrorMessage(r.get());
-                    result_error = (m && *m) ? std::string(m) : std::string("unexpected result");
+                    result_error = (m && *m) ? pg::query_failure_detail("probe query failed", m)
+                                             : std::string("unexpected result");
                 }
             }
             if (done)

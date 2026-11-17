@@ -683,9 +683,8 @@ inline constexpr std::array<CommandCapability, 60> kPluginActionCatalogueB{{
     // `get_log` tails the agent's own log file (do_get_log,
     // agent_logging_plugin.cpp:271-311, tail_file() call at :304), which is
     // the same file agent.cpp writes the "Registered with server
-    // (session_fp={}, ...)" line to. That line is a fingerprint since the F50
-    // fix, but builds before it logged the live session id, so the output can
-    // still carry the credential. Classified under `PluginSecret` rather than plain
+    // (session_fp={}, ...)" line to. That line carries a fingerprint, not the
+    // session id. Classified under `PluginSecret` rather than plain
     // `Inventory` for the same reason as `status.switch` above, not
     // disclosed at Low risk.
     {

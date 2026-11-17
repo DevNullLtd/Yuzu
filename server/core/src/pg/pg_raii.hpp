@@ -124,12 +124,18 @@ inline constexpr const char* kConnectFailureGeneric =
 /// dropped connection or "SSL SYSCALL error: EOF detected" during a failover is not a certificate
 /// problem -- and these messages do not quote the DSN. Returns `step` plus the FIRST line of libpq's
 /// text, folded with log_key_token and capped at kQueryDetailMaxBytes, so on-call still reads "server
-/// closed the connection unexpectedly".
+/// closed the connection unexpectedly". NOT for connect-phase text: that quotes the DSN and must go
+/// through connect_failure_cause.
 inline constexpr std::size_t kQueryDetailMaxBytes = 120;
 [[nodiscard]] inline std::string query_failure_detail(std::string_view step, std::string_view raw) {
     raw = raw.substr(0, raw.find_first_of("\r\n"));
-    if (raw.size() > kQueryDetailMaxBytes)
-        raw = raw.substr(0, kQueryDetailMaxBytes);
+    if (raw.size() > kQueryDetailMaxBytes) {
+        // Cut on a code-point boundary: back up over continuation bytes so no lead byte dangles.
+        std::size_t cut = kQueryDetailMaxBytes;
+        while (cut > 0 && (static_cast<unsigned char>(raw[cut]) & 0xC0) == 0x80)
+            --cut;
+        raw = raw.substr(0, cut);
+    }
     const std::string safe = ::yuzu::log_key_token(raw);
     return safe.empty() ? std::string(step) : std::string(step) + ": " + safe;
 }

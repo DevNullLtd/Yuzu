@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # agent-session-fp.sh -- resolve an agent's session id WITHOUT reading it from the agent log.
 #
 # The agent logs "Registered with server (session_fp=<8 hex>, ...)": the first 8 hex of the
@@ -5,8 +6,8 @@
 # the SERVER side: "[gateway] ProxyRegister succeeded: agent=<id>, session=<id>". A fingerprint
 # is joined back to the id by hashing each server-side candidate. Sourced, not executed.
 #
-# Older agent builds log "(session=<id>, ...)" instead: agent_session_fp prints nothing for them,  # tripwire-allow: legacy-agent
-# and agent_session_id_legacy returns that id, so a mixed-version fleet still resolves.
+# A log line that carries "(session=<id>, ...)" directly (no session_fp): agent_session_fp prints nothing  # tripwire-allow: legacy-agent
+# for it, and agent_session_id_legacy returns that id.
 # grep -a throughout: a NUL byte in a log must not turn matches into "binary file matches".
 # Logs written by a native Windows process end lines in CRLF: every parse strips CR first.
 
@@ -33,11 +34,11 @@ agent_session_fp() {
     tr -d '\r' < "$1" | grep -a "Registered with server" | grep -aoE 'session_fp=[0-9a-f]{8}' | tail -1 | cut -d= -f2 || true
 }
 
-# agent_session_id_legacy AGENT_LOG_FILE : the id from a pre-F50 agent's "session=<id>" Registered  # tripwire-allow: legacy-agent
+# agent_session_id_legacy AGENT_LOG_FILE : the id from a "session=<id>" Registered  # tripwire-allow: legacy-agent
 # line, or empty
 agent_session_id_legacy() {
     [ -r "$1" ] || return 0
-    # tripwire-allow: legacy-agent (a pre-F50 agent's own line, kept for a mixed-version fleet)
+    # tripwire-allow: legacy-agent (a Registered line that carries the id directly)
     tr -d '\r' < "$1" | grep -a "Registered with server" | grep -aoE 'session=[^ ,)]+' | tail -1 | cut -d= -f2 || true  # tripwire-allow: legacy-agent
 }
 

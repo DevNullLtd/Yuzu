@@ -307,7 +307,7 @@ agent_map() { # container,agent id,session per agent (session via the route tabl
             sess="$(psql_q "SELECT session_id FROM gateway_route_store.agent_routes WHERE encode(sha256(convert_to(session_id,'UTF8')),'hex') LIKE '$fp%' LIMIT 1")" \
                 || echo "agent_map: psql failed resolving the session for $name (route table unreadable)" >&2
         else
-            # A pre-F50 agent still logs session=<id>.  # tripwire-allow: legacy-agent
+            # An agent that logs session=<id> directly.  # tripwire-allow: legacy-agent
             sess="$(printf '%s\n' "$alog" | grep -a 'Registered with server' | grep -aoE 'session=[^ ,)]+' | tail -1 | cut -d= -f2)"  # tripwire-allow: legacy-agent
         fi
         echo "$name,$c,$sess"
