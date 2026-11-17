@@ -299,6 +299,7 @@ INERT_OWNER_KEY_HANDLERS = {
     (_SRC + "rest_api_v1.cpp", _RA): 1,
     (_SRC + "rest_api_v1.cpp", _RA + "/cancel"): 1,
     (_SRC + "rest_api_v1.cpp", _RA + "/rerun"): 1,
+    (_SRC + "hardware_routes.cpp", "/api/v1/hardware/sync/([A-Za-z0-9_-]{1,128})"): 1,
     (_SRC + "workflow_routes.cpp", "/fragments/executions/([A-Za-z0-9_-]{1,128})/detail"): 1,
     (_SRC + "workflow_routes.cpp", "/sse/executions/([A-Za-z0-9_-]{1,128})"): 1,
 }

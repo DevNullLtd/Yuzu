@@ -12,6 +12,7 @@
 
 #include "sync_source_app_perf.hpp" // build_app_perf_query (agent-core)
 #include "echo_db.hpp"               // EchoDatabase
+#include "echo_test_db.hpp"
 #include "echo_sql_executor.hpp"     // validate_and_translate_sql
 #include "test_helpers.hpp"
 
@@ -38,8 +39,8 @@ struct TestDb {
     }
 };
 TestDb make_db() {
-    auto tmp = yuzu::test::unique_temp_path("echo_appperf_");
-    auto r = EchoDatabase::open(tmp);
+    auto tmp = yuzu::test::unique_temp_path("yuzu_test_echo_appperf_");
+    auto r = yuzu::test::open_echo_db(tmp);
     REQUIRE(r.has_value());
     return TestDb{std::move(*r), tmp};
 }

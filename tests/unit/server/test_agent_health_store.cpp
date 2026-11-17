@@ -1627,6 +1627,126 @@ TEST_CASE("REAL AgentHealthStore: a torn arm-gauge pair (one key present, its "
     CHECK(unlabelled_series(out, "yuzu_fleet_guardian_arm_tag_rejected") == 0.0);
 }
 
+// ── Guardian baseline-persistence rollup (#5605) ───────────────────────────────────
+// Three SUM gauges (unpersisted / rebaselined_at_boot / persist_failures), each absent-not-zero,
+// plus _reporting (keyed on the unpersisted tag ONLY) and _tag_rejected, both published every
+// sweep including 0.
+
+TEST_CASE("REAL AgentHealthStore: guardian baseline tags sum into unlabelled fleet gauges and "
+          "_reporting counts only agents that carried the unpersisted tag",
+          "[guardian][baseline][fleet][rollup][real]") {
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+
+    auto beat = [&](const std::string& id,
+                    const std::vector<std::pair<std::string, std::string>>& kv) {
+        google::protobuf::Map<std::string, std::string> tags;
+        tags["yuzu.os"] = "linux";
+        for (const auto& [k, v] : kv)
+            tags[k] = v;
+        store.upsert(id, tags);
+    };
+
+    beat("s1", {{"yuzu.guardian_baseline_unpersisted", "2"}});
+    beat("s2", {{"yuzu.guardian_baseline_unpersisted", "3"},
+                {"yuzu.guardian_baseline_rebaselined_at_boot", "1"}});
+    // A legacy agent (prefer_spark off) emits only the cumulative counter: it feeds that gauge
+    // but must NOT count toward _reporting, the denominator of the unpersisted gauge.
+    beat("legacy", {{"yuzu.guardian_baseline_persist_failures", "4"}});
+
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    const std::string out = metrics.serialize();
+
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_baseline_unpersisted") == 5.0);
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_baseline_rebaselined_at_boot") == 1.0);
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_baseline_persist_failures") == 4.0);
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_baseline_reporting") == 2.0); // not 3
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_baseline_tag_rejected") == 0.0);
+    // No agent-controlled label anywhere in this family.
+    CHECK(out.find("yuzu_fleet_guardian_baseline_unpersisted{") == std::string::npos);
+}
+
+TEST_CASE("REAL AgentHealthStore: a malformed baseline tag is counted as rejected and excluded "
+          "from its sum",
+          "[guardian][baseline][fleet][rollup][real]") {
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+
+    google::protobuf::Map<std::string, std::string> honest;
+    honest["yuzu.os"] = "linux";
+    honest["yuzu.guardian_baseline_unpersisted"] = "4";
+    store.upsert("honest", honest);
+
+    google::protobuf::Map<std::string, std::string> rogue;
+    rogue["yuzu.os"] = "linux";
+    rogue["yuzu.guardian_baseline_unpersisted"] = "abc";
+    store.upsert("rogue", rogue);
+
+    google::protobuf::Map<std::string, std::string> huge;
+    huge["yuzu.os"] = "linux";
+    huge["yuzu.guardian_baseline_persist_failures"] = "1000000001"; // above the 1e9 ceiling
+    store.upsert("huge", huge);
+
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    const std::string out = metrics.serialize();
+
+    // Rejected, not clamped: the honest agent's 4 survives; the rogue is not in _reporting.
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_baseline_unpersisted") == 4.0);
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_baseline_reporting") == 1.0);
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_baseline_tag_rejected") == 2.0);
+    CHECK_FALSE(has_unlabelled_series(out, "yuzu_fleet_guardian_baseline_persist_failures"));
+}
+
+TEST_CASE("REAL AgentHealthStore: guardian baseline gauges go absent (not zero) when nobody "
+          "reports, and a stale reporter ages out; the meta gauges still publish 0",
+          "[guardian][baseline][fleet][rollup][real]") {
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+
+    google::protobuf::Map<std::string, std::string> tags;
+    tags["yuzu.os"] = "linux";
+    tags["yuzu.guardian_baseline_unpersisted"] = "6";
+    tags["yuzu.guardian_baseline_rebaselined_at_boot"] = "2";
+    tags["yuzu.guardian_baseline_persist_failures"] = "3";
+    store.upsert("a1", tags);
+
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    auto out = metrics.serialize();
+    REQUIRE(unlabelled_series(out, "yuzu_fleet_guardian_baseline_unpersisted") == 6.0);
+    REQUIRE(unlabelled_series(out, "yuzu_fleet_guardian_baseline_reporting") == 1.0);
+
+    // The reporter is now beyond the staleness window: all three SUM gauges must vanish (the
+    // clear at the top of the sweep), never linger or turn into a fabricated 0.
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    store.recompute_metrics(metrics, std::chrono::seconds{0});
+    out = metrics.serialize();
+    CHECK_FALSE(has_unlabelled_series(out, "yuzu_fleet_guardian_baseline_unpersisted"));
+    CHECK_FALSE(has_unlabelled_series(out, "yuzu_fleet_guardian_baseline_rebaselined_at_boot"));
+    CHECK_FALSE(has_unlabelled_series(out, "yuzu_fleet_guardian_baseline_persist_failures"));
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_baseline_reporting") == 0.0);
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_baseline_tag_rejected") == 0.0);
+}
+
+TEST_CASE("REAL AgentHealthStore: an explicit baseline unpersisted 0 publishes as zero, not "
+          "absent",
+          "[guardian][baseline][fleet][rollup][real]") {
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+
+    google::protobuf::Map<std::string, std::string> tags;
+    tags["yuzu.os"] = "linux";
+    tags["yuzu.guardian_baseline_unpersisted"] = "0";
+    store.upsert("clean", tags);
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+
+    const std::string out = metrics.serialize();
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_baseline_unpersisted") == 0.0);
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_baseline_reporting") == 1.0);
+    // The sparse rows were not reported, so they stay absent.
+    CHECK_FALSE(has_unlabelled_series(out, "yuzu_fleet_guardian_baseline_rebaselined_at_boot"));
+    CHECK_FALSE(has_unlabelled_series(out, "yuzu_fleet_guardian_baseline_persist_failures"));
+}
+
 // ── Guardian M1 health-stream rollup (#2298 gate 3, item 6d) ──────────────────────
 // Same coverage set as the journal family above, scoped to the 3-counter table.
 

@@ -319,12 +319,23 @@ DeviceCiRecord parse_device_ci_blob(const std::string& blob) {
 void ingest_device_ci_report(DeviceInventoryStore& store, const std::string& agent_id,
                              const pb::InventoryReport& report, pb::InventoryAck& ack,
                              ::yuzu::MetricsRegistry* metrics) {
-    const auto emit = [&](const char* outcome) {
-        if (metrics)
-            metrics->counter("yuzu_inventory_ingest_total",
-                             {{"source", kSourceDeviceCi}, {"outcome", outcome}})
-                .increment();
-    };
+    ingest_device_ci_report_with_emit(
+        store, agent_id, report, ack, metrics, [metrics](const char* outcome) {
+            if (metrics)
+                metrics->counter("yuzu_inventory_ingest_total",
+                                 {{"source", kSourceDeviceCi}, {"outcome", outcome}})
+                    .increment();
+        });
+}
+
+void ingest_device_ci_report_with_emit(DeviceInventoryStore& store, const std::string& agent_id,
+                                       const pb::InventoryReport& report, pb::InventoryAck& ack,
+                                       ::yuzu::MetricsRegistry* metrics,
+                                       const IngestOutcomeEmitFn& emit) {
+    // Every need_full nack below is appended BEFORE any telemetry (the counter, the histogram, a
+    // log line): those allocate, and a throw out of this function is caught by ReportInventory,
+    // which then acks without the nack (agent_service_impl.cpp), so the agent would advance as if
+    // the report had been stored.
     if (agent_id.empty())
         return;
     if (report.content_hashes_size() > kMaxSources || report.plugin_data_size() > kMaxSources) {
@@ -344,6 +355,17 @@ void ingest_device_ci_report(DeviceInventoryStore& store, const std::string& age
         return; // device_ci not due this cycle
     const std::string& claimed_hash = hit->second;
 
+    // Write pause (a collation mismatch): decided BEFORE the blob is parsed, so a paused fleet
+    // does not pay a parse of every resent blob (up to kDeviceCiMaxBlobBytes each). Nothing is
+    // read or written; the agent is told to resend later (need_full, no proto change). Shared by
+    // the direct agent path and the gateway path, which both come through this function.
+    if (store.writes_deferred()) {
+        ack.add_need_full(kSourceDeviceCi);
+        store.note_ingest_deferred();
+        emit("deferred");
+        return;
+    }
+
     std::int64_t collected_at = 0;
     if (report.has_collected_at())
         collected_at = report.collected_at().millis_epoch() / 1000;
@@ -355,10 +377,10 @@ void ingest_device_ci_report(DeviceInventoryStore& store, const std::string& age
             // Oversized: a non-conforming sender (a conforming one trims its own rows to fit
             // under the ceiling). Backstop: log once, count, don't store, and nack so the agent
             // resends rather than recording a false success.
+            ack.add_need_full(kSourceDeviceCi);
             spdlog::warn("device_ci: oversized blob from agent={} ({} B > {} B) — dropping + "
                          "nacking",
                          agent_id, bit->second.size(), kDeviceCiMaxBlobBytes);
-            ack.add_need_full(kSourceDeviceCi);
             emit("dropped");
             return;
         }
@@ -373,6 +395,11 @@ void ingest_device_ci_report(DeviceInventoryStore& store, const std::string& age
     const auto ingest_t0 = std::chrono::steady_clock::now();
     const InventoryIngestOutcome outcome =
         store.apply_device_ci(agent_id, claimed_hash, std::move(rec), collected_at);
+    // The nack first (kDeferred here is a write pause that raced in after the seam's own check
+    // above; it is nacked like kNeedFull/kError, shared mapping, inventory_ingest_outcome.hpp),
+    // then the telemetry.
+    if (ingest_outcome_needs_full(outcome))
+        ack.add_need_full(kSourceDeviceCi);
     if (metrics) {
         const double secs =
             std::chrono::duration<double>(std::chrono::steady_clock::now() - ingest_t0).count();
@@ -384,12 +411,8 @@ void ingest_device_ci_report(DeviceInventoryStore& store, const std::string& age
                         yuzu::Histogram::seconds_buckets_60s())
             .observe(secs);
     }
-    emit(outcome == InventoryIngestOutcome::kStored    ? "stored"
-         : outcome == InventoryIngestOutcome::kTouched ? "touched"
-         : outcome == InventoryIngestOutcome::kNeedFull ? "need_full"
-                                                        : "error");
-    if (outcome == InventoryIngestOutcome::kNeedFull || outcome == InventoryIngestOutcome::kError)
-        ack.add_need_full(kSourceDeviceCi);
+    // kDeferred is labelled `deferred` (shared mapping, inventory_ingest_outcome.hpp).
+    emit(ingest_outcome_label(outcome));
 }
 
 } // namespace yuzu::server

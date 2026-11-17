@@ -622,7 +622,8 @@ whole source name.
   where its users are. A laptop that is off during its window syncs when it next
   wakes (see Gentle catch-up) and then returns to the next window. The window
   is a collection setting (see Collection settings below); the agent's own
-  moment between 01:00 and 05:00 applies until the settings push lands.
+  moment between 01:00 and 05:00 applies until the agent has applied a saved
+  document.
 - **Gentle catch-up.** An agent that was switched off, or a laptop that slept
   through its sync, does not report the moment it wakes. A sync more than 15
   minutes overdue is spread over the next 30 minutes by a stable per-agent
@@ -633,8 +634,11 @@ whole source name.
 - **Sync now can be spread too.** The agent's `__sync__.now` command takes a
   list of sources and an optional `delay_max_s` (0 to 86400 seconds); with it
   the agent reports at a stable offset within that many seconds instead of
-  immediately. Nothing in the console sends either yet, so Sync now is
-  immediate today. If its first send fails (the server is unreachable), the
+  immediately. A Sync now for a group, a scope or the whole fleet sends
+  `delay_max_s` whenever the run needs spreading: an estimate of the spread
+  that keeps the fleet's reports under one budget (the agent keeps a sync it
+  already armed sooner, so a device may still report earlier). A single device
+  stays immediate. If its first send fails (the server is unreachable), the
   retries follow the pattern in Gentle catch-up, so it can arrive up to about
   45 minutes after the click.
 - **Sections and deltas.** The installed-software report is sectioned per source (see "The
@@ -686,10 +690,86 @@ always win over a document, and registered apps collection cannot be turned off
 by a document. A window needs a whole-day interval because the agent fires a
 window once per local day.
 
-Settings take effect on agents only when the settings push lands. Until then the
-server stores and resolves them, shows the effective result for a device
+The server shows the effective result for a device
 (`GET /api/v1/inventory/software/hosts/{agent_id}/collection-settings`), and
-saving a document never starts a collection.
+saving a document never starts a collection. How a saved document reaches the
+machines is described next.
+
+### How saved settings reach machines
+
+Delivery is driven by the agent's heartbeat; there is no push when a document is
+saved and no background job. Each heartbeat carries the version of the settings
+the agent last applied (the status tag `yuzu.inv_settings_version`: a 64-character
+hex digest, or `none` when nothing has been applied). The server works out which
+document applies to that agent and, when the two versions differ, sends it once.
+The agent checks the document, stores it, and from then on reports the new version.
+
+- **How soon.** A change reaches a device on its first heartbeat after the server
+  re-reads the stored settings, which it does when its copy is older than 60
+  seconds. A change in a device's group membership is picked up when the server's
+  copy of that device's groups is older than 10 minutes. Settings and kill
+  switches are therefore effective on machines within about a minute of a save,
+  plus one heartbeat, and a membership change within about ten.
+- **The fleet default is not pushed.** A device that has never applied a document
+  and whose effective settings are the built-in default (24 hours, 01:00 to
+  05:00, every collector on) is left alone: it already behaves that way. When the
+  last document that applied to a device is removed, the default is sent so the
+  device returns to it.
+- **Gateway-attached agents.** The server hands the document to the gateway, which
+  queues it for the agent. A send that the server counts as `sent` is accepted,
+  not confirmed; the heartbeat that follows is the confirmation, because the
+  agent then reports the new version.
+- **The re-push gap.** The same version is not sent to one agent again within 5
+  minutes. A document that changed in the meantime is sent at once. If a send is
+  lost, or the agent could not apply it, the next heartbeat after the gap sends
+  it again. An agent whose daily sync is not running (disabled with
+  `--inventory-disable`, or still starting after a reconnect) stores the document
+  and reports its version all the same, so it is not sent again; with
+  `--inventory-disable` nothing is collected, whatever the document says.
+- **Restarts.** Server state is in memory and is rebuilt from heartbeats, so a
+  restart loses nothing; an agent whose version differs is simply sent the
+  document. The agent keeps the applied document across a restart and re-checks it
+  at start-up; a stored copy that fails the check is dropped, the agent reports
+  `none` and the server sends it again.
+- **Agents refuse what they cannot apply.** A document that is malformed, over 4096
+  bytes, out of range, missing a collector switch, or whose version is not the
+  SHA-256 of its text is refused, nothing changes, and the agent keeps the
+  settings it had. Nothing is ever partly applied.
+
+**What the agent does with a document.** It sets how often installed software is
+collected and in which window, and which collectors run. It does not start a
+collection: an interval or window that changes re-places a future sync to the
+agent's own next slot, and a sync that is already due still goes. A collector
+switched off is not run, its rows are not served from a cache, and its section of
+the report is `disabled` (switched off on purpose, not a failure). A collector
+that is on but whose plugin is not loaded, or that has nothing to collect on the
+OS, is `not_collected`. Switching a collector back on collects afresh.
+
+**Registered apps and the kill switch.** A document cannot turn registered apps
+collection off, but a plugin kill switch on it is carried into the delivered
+settings, and the agent honours it as sent: collection stops on the machine and
+the agent still reports the version it really applied. Only the plugin-wide kill
+switch is carried: a switch set for one operating system or one action does not
+stop that collector's daily collection.
+
+**Intervals of several days.** Without a window, a device syncs one interval after
+its last clean sync, at the agent's own offset. With a window (which needs a
+whole-day interval), the device syncs inside the window on the day one interval
+after its last clean sync, at the agent's own moment in it; a 7-day interval with
+a 01:00 to 05:00 window therefore syncs once a week, overnight. A retry after a
+skipped sync still comes in the next daily window.
+
+**Time zones.** In this release a named time zone is stored, delivered and shown,
+but the window runs in the machine's own local time; the agent does not convert
+between zones. A device given a named zone reports `yuzu.inv_settings_tz` as
+`machine_local` in its heartbeat to say so. Choose windows with that in mind for
+fleets that span zones.
+
+The delivery is counted by `yuzu_server_inventory_settings_push_total`,
+`yuzu_server_inventory_settings_push_degrade_total` and
+`yuzu_server_inventory_settings_reconcile_exceptions_total` (see
+[Metrics](metrics.md)), and an alert, `YuzuInventorySettingsPushLoop`, fires when
+the server keeps re-sending settings.
 
 The same documents are reachable by agentic clients over MCP, and each tool returns what its REST
 route returns: `list_software_collection_settings`, `get_software_collection_settings`,
@@ -983,6 +1063,36 @@ a position count, so a long run of out-of-scope rows costs proportionally more t
 a statement timeout there degrades the page to a 503 (tracked in #5698). A continuation that would pass over more than 100 000 out-of-scope rows since the last row served is refused (the dashboard shows the same text as a notice) (`cursor refused: more than 100000 rows outside the caller's scope were passed since the last row served; narrow the filter (name, version or agent_id) and restart from the first page, or page with a scope of at most 10000 devices`): in page mode that is 25 consecutive empty pages of the maximum size, and an export, which reads up to 10 000 rows per request, reaches it after a few continuations. The limit is checked when a cursor is presented, so a `next_cursor` the server handed out can itself be refused on use; narrow the filter and restart from the first page, or page with a scope of at most 10 000 devices. Keep paging until
 `next_cursor` is `null`.
 
+### Exporting the installed-software inventory
+
+`GET /api/v1/inventory/software/export?format=jsonl|csv` writes every installed-software row
+that matches your filters as one download, with no paging: JSONL is one JSON object per line,
+CSV is the 23 columns of the list under a single header row. It takes the filters of the
+route above (`format=json` is not accepted, and `cursor` and `limit` are refused). It is
+confined to your scope like the rest of the Inventory reads; a wide scope is filtered on the
+server, so those exports read more rows than they return.
+
+```bash
+# The whole inventory visible to you, as a spreadsheet file
+curl -H "Authorization: Bearer $TOKEN" -o software.csv \
+  "$SERVER/api/v1/inventory/software/export?format=csv"
+
+# One title, as lines for a script
+curl -H "Authorization: Bearer $TOKEN" \
+  "$SERVER/api/v1/inventory/software/export?format=jsonl&name=OpenSSL"
+```
+
+A few rules for what you build on it:
+
+- **A cut-short transfer is an incomplete file.** The server cannot change the status after the first byte, so a failed read, a run past 900 seconds or a server shutdown ends the response without its final chunk and your HTTP client reports an aborted transfer. Start again; do not use the partial file. A clean end means complete.
+- **Two exports at a time by default.** Each open export holds a server worker and one lease from the server's held-open stream budget, so a third request gets `503` with `retry_after_ms` 5000. The limit is `--inventory-export-concurrency`, shared by every caller of the server ([Server administration](server-admin.md)). The same `503` is returned when the server's whole held-open budget (`--max-sse-streams`) is full; retry shortly.
+- **There is a size limit.** One export writes at most 5,000,000 rows and 1 GiB by default (`--inventory-export-max-rows`, `--inventory-export-max-bytes`, [Server administration](server-admin.md)). Past either, the transfer is cut like any other failure, so an over-large request never produces a file that looks complete. Narrow the filters and export in parts. A spreadsheet may stop at its own row limit (commonly 1,048,576 rows) with no error from the server.
+- **It is a live walk, not a snapshot.** A device that reports while the export runs can have rows repeated or missed.
+- **Audited once, up front** as `inventory.software.export` (see [Audit log](audit-log.md)), and counted in `yuzu_server_software_export_total` ([Metrics](metrics.md)).
+- **REST only.** A streamed file is not a tool call, so there is no MCP tool; an agentic worker pages the same rows with `query_installed_software`.
+
+Wire reference: [REST API](rest-api.md#get-apiv1inventorysoftwareexport).
+
 ### REST: software title catalogue
 
 `GET /api/v1/inventory/software/catalogue` returns one row per software title across the
@@ -1259,34 +1369,67 @@ place, **Hardware** and **Software**, each its own page:
     - **Who may.** The route needs `Execution:Execute`, checked as a **global** grant (or
       RBAC off). An operator whose `Execution:Execute` is limited to management groups is
       refused with `403` for every choice, including a single device. A browser (session-cookie) request must carry an `Origin` or `Referer` naming this site (`403` otherwise; token callers are exempt). The route also
-      confines its targets to the caller's own `Execution:Execute` visible set and refuses
-      **Whole fleet** (`403`) unless that set is unfiltered; with a global grant neither
-      changes the outcome today, and both stay in place as defence in depth for when the
-      gate becomes scope-aware.
+      confines its targets to the caller's own `Execution:Execute` visible set. **Whole fleet**
+      needs a **fleet administrator**: an unfiltered `Execution:Execute` and the global
+      `ManagementGroup:Write` grant (`403` otherwise).
+    - **Confirmation.** A whole group (`group:<id>`) and the whole fleet are refused with
+      `400` unless the request carries `"confirm": true`; a single device and a scope
+      expression never need it. The page's dialog does not send the confirmation yet, so
+      its **Whole fleet** choice, and a `group:<id>` typed as the scope, are answered `400`
+      naming it; **This device** and a scope expression run as before. An API or MCP caller
+      sends `"confirm": true` itself.
     - **Which devices.** A run reaches agents attached to **this server process** only.
       `skipped_offline` counts the devices this server process did not reach that are not too old: it has no live session for them (a disconnected device, or one attached to another server), or the send was refused by the live stream (for example a gateway-attached agent whose gateway lacks the dispatch capability).
       Which devices are candidates depends on the scope: a group or a single named device lists its disconnected members too, but an `__all__` or scope-expression run lists only this server's own sessions plus the shared presence record, so a device that is offline everywhere is never counted, and if the presence read is degraded an `__all__` run lists fewer devices (those attached to other servers are not listed) while a scope-expression run is refused with 503 (the scope could not be evaluated) and sends nothing.
       `requested` and `skipped_offline` therefore describe what this server could reach; they are not a census of the fleet. Agents older than 0.13.1 are skipped
-      and counted separately (`skipped_version`). One request reaches at most 500 devices (`413` above that, counted after the skips:
-      narrow the scope). A scope expression may be up to 1,024 bytes and a device or group id
-      up to 256 bytes.
-    - **Limits.** A group, scope or fleet run is limited to one per operator per 60 seconds
-      (`429` with `Retry-After`; an attempt refused for exceeding 500 devices, or with no live target, counts as a run, a send every device refused does not) and one at a time per server process (`409`); a single device
-      is exempt from both. A `409` can follow a slow agent connection: the server sends to its
-      targets one after another, and a connected agent that has stopped reading holds the run
-      for at most 120 seconds, after which the next request takes the run over (`retry_after_ms` on the `409` is the time until that lease lapses; the stalled send itself is not cancelled). At most three runs are alive at once: while three stalled sends are still alive, no further takeover is allowed, the `409` keeps answering, and a WARN line is logged, until one of those sends unwinds (the agent reads, or its connection is cut) or the server restarts. A server clock that steps backwards
-      cannot lock an operator out: a last-run time in the future is ignored. Both limits are
-      held in each server process, not across a cluster: with several active servers every
-      one allows its own run and keeps its own per-operator cooldown, and each run is still
-      bounded by the 500-device cap. One run can make up to 500 agents upload their
-      inventory at nearly the same moment; see the connection-pool note in
-      [Server administration](server-admin.md).
-    - **Audit and result.** The request is audited as `inventory.sync.request` before
-      anything is sent, and is refused if the audit row cannot be written. `202` means the
-      request was sent, not that the devices have synced: the page's figures change when each
-      device reports back. In the `202` body `agents_reached` is the number of agents that
-      accepted the request; the audit row's `reached` is the number the run planned to send
-      to.
+      and counted separately (`skipped_version`). A request may also carry `last_synced_before`
+      (epoch seconds): only devices whose last accepted report is older are asked, and the rest
+      are counted in `skipped_fresh`. A scope expression may be up to 1,024 bytes and a device
+      or group id up to 256 bytes.
+    - **Pacing.** There is no limit on the number of devices. The server sends the request to
+      every reachable device at once, and asks each agent to report at a stable per-device
+      offset inside `delay_max_s` seconds (at most 86,400; `0` for a run small enough to go
+      at once). Every run still spreading shares one budget of 50 reports per second per
+      server process, and a run takes at most half of what is free: a run that finds the
+      budget used is refused with `429` (`Retry-After`), and one that could not be spread
+      inside 86,400 seconds even then is refused with `413`. `delay_max_s` and the
+      `estimated_completion_at` derived from it are **estimates**: the budget bounds what the
+      server asks for, not the rate reports arrive at, because an agent keeps a fire it already
+      armed when that is sooner than the offset it was given, so a device whose own scheduled
+      sync is due sooner reports then, as a full send. A fleet run that lands shortly before
+      the nightly sync window turns that window's scheduled syncs into full sends at the
+      window's own rate. One run can still make many agents upload their inventory within a
+      few seconds; see the connection-pool note in [Server administration](server-admin.md).
+    - **Joining and the cooldown.** A request for a group, scope expression or the fleet that
+      finds a run of the same target still spreading **joins** it: `202` with that run's
+      counts and `"joined": true`, and nothing is sent. Callers share a run only when they
+      are sent the same devices: administrators share the fleet's run, callers with an
+      unfiltered `Execution:Execute` share a group's run, and a caller confined to part of a
+      group has runs of their own and never receives another caller's counts. A scope
+      expression belongs to the operator who sent it and to its exact text. A request the
+      running run does not cover (a later or absent `last_synced_before` over a filtered run)
+      is `409` with the time left in `retry_after_ms`. After a run starts, the same group,
+      scope expression or fleet waits out a cooldown, 600 seconds by default
+      (`--inventory-sync-cooldown`, `0` for none): `429` with `Retry-After`. A run that no
+      device accepted does not start the cooldown. A single device is exempt from the
+      spread, the join and the cooldown. At most three send loops are alive in a server
+      process at once, and a fourth is `409`: the server sends to its targets one after
+      another, and a connected agent that has stopped reading holds its run (the stalled
+      send itself is not cancelled). A server clock that steps backwards cannot lock a key
+      out: a last-run time in the future is ignored. The run state, the cooldown and the
+      budget are held in memory in each server process, not across a cluster: with several
+      active servers every one paces and joins on its own, and a restart forgets them (agents
+      keep the delays they already armed).
+    - **Audit and result.** The request is audited as `inventory.sync.request` (the
+      whole-fleet row as `software_estate.sync.fleet_wide`) before anything is sent, and is
+      refused if the audit row cannot be written. `202` means the request was sent, not that
+      the devices have synced: the page's figures change when each device reports back. In
+      the `202` body `agents_reached` is the number of agents that accepted the request; the
+      audit row's `reached` is the number the run planned to send to. The body also carries
+      an `execution_id`: `GET /api/v1/hardware/sync/{execution_id}` reports the frames
+      accepted and the agents that armed the sync or failed. An agent answers when it arms
+      the sync, not when its report lands, so those figures count requests taken up, not
+      reports received.
   - **Who sees what.** The catalogue is a fleet-wide aggregate that cannot be narrowed to
     a management group, so the fleet view, the strip and the version counts need an
     unfiltered `Inventory:Read`; a management-group-scoped account is told so and refused
@@ -1344,7 +1487,11 @@ alongside a degraded roster is a `200` carrying both `identity_state` and `ci_st
 `degraded`. The **per-device CI record's Overview lens**, by contrast, has always been
 an authoritative three-state read: found / genuinely-not-yet-synced ("no CI record
 synced yet") / degraded (an explicit "CI record unavailable" banner) are never
-conflated.
+conflated. Both degraded displays also appear while the server's collation gate is not
+Trusted (a PostgreSQL collation mismatch, or no conclusive collation check yet): the CI
+read is then not attempted, so the degrade is the gate and not a failed read, and
+`yuzu_inventory_read_degrade_total` does not move; see "PostgreSQL collation version" in
+[Server administration](server-admin.md#postgresql-collation-version).
 
 The Hardware list and its KPI strip serve at most the 100,000 most recently seen
 endpoints within the 30-day window. A fleet above that sees a **"Partial list"** notice
@@ -1536,7 +1683,7 @@ and it ends when the lagging side upgrades. Deploy **server first, then agents**
 
 **Observability.** The server emits `yuzu_inventory_ingest_total{source,outcome}`
 (outcome ∈ `stored` / `touched` / `need_full` / `error` / `dropped` / `rejected` /
-`rejected_depth`: `rejected` is a whole report rejected at the source-map cap,
+`rejected_depth` / `deferred`: `deferred` is a report skipped without being read or written, not a failure (for `device_ci`, because device-CI writes are paused by a PostgreSQL collation mismatch and the agent was told to resend; see "PostgreSQL collation version" in [Server administration](server-admin.md#postgresql-collation-version)), `rejected` is a whole report rejected at the source-map cap,
 `rejected_depth` is a single generic (non-typed) source blob rejected for
 nesting past `kMcpMaxJsonDepth`, kept as its own outcome specifically so it
 does not page the `YuzuInventoryReportRejected` alert's source-map-cap
@@ -1558,7 +1705,7 @@ ingest is failing. Four further series sharpen the picture:
   `pool_acquire_timeout` / `query_error`, plus `sections_query_error` for `source="device_ci"` only: the hardware record read answered but its v2 sections did not, the case the REST record route answers `503` and the MCP tool with a retryable error, where `query_error` is the record read itself failing; plus `keyed_read_budget` for `source="device_ci"` only: the Hardware list's roster-keyed CI read ran out of its overall budget between chunks, so the list shows "CI columns unavailable" and never partial CI; plus `admission_full` for `source="installed_software"` and `source="ca_issued"` only: a `/crypto` read refused by its in-flight bound before any store call; source ∈ `installed_software` / `device_ci` /
   `software_licensing` / `product_registry` / `app_usage` / `generic`, and the `/crypto` sources `ca_issued` (Yuzu-issued certificate reads) and `crypto_layout` (dashboard layouts), see [metrics.md](metrics.md#crypto-dashboard-metrics)) — an
   **authoritative read** that returned
-  a degrade (no data) rather than a silent empty. `/readyz` stays green under pure
+  a degrade (no data) rather than a silent empty. A degrade caused by the server's collation gate (a mismatch, or no conclusive collation check yet; see [Server administration](server-admin.md#postgresql-collation-version)) is NOT counted here, because that read is refused before the store is called. `/readyz` stays green under pure
   pool saturation, so without this counter a degraded fleet software query is
   otherwise invisible. The per-degrade WARN is sampled per site — the leading edge
   of each outage *episode* (a degrade arriving after a quiet gap), then every 100th
@@ -1704,7 +1851,8 @@ Shipped alert rules live in the `yuzu-inventory` group of
 `docs/prometheus/yuzu-alerts.yml`: `YuzuInventorySustainedIngestErrors` (a non-zero
 `error` rate held for 15m), `YuzuInventoryHighNeedFullRatio` (>20% of ingests are
 `need_full` for 15m — hash-skip is not taking, so agents keep re-sending full
-payloads), `YuzuInventoryDroppedBlobs` (an over-cap blob, or a v3 blob that cannot be split into
+payloads; ingests counted `deferred`, the device-CI writes paused by a collation mismatch, are
+left out of the denominator), `YuzuInventoryDroppedBlobs` (an over-cap blob, or a v3 blob that cannot be split into
 sections, dropped + nacked),
 `YuzuInventoryReportRejected` (a whole report rejected at the source-map cap),
 `YuzuInventoryGenericBlobRejectedDepth` (a generic source blob rejected for
@@ -1753,7 +1901,7 @@ rollout) are not counted, so a zero there does not rule out a skipping collector
 
 **The Hardware list shows "Hardware roster unavailable" (or `GET /api/v1/hardware` answers `503`).** The persisted device roster could not be read. Check `yuzu_server_agent_presence_store_failed_total{op="query_stale_within"}`: `reason="store_unavailable"` means no database connection could be obtained (the pool wait is 0.5-2 s, plus up to 10 s to connect to an unreachable database; see `/readyz` `pg_reachable` and the Postgres pool alerts: `YuzuPgPoolSaturated` with `pg_reachable` green points at pool saturation), `reason="db_error"` means the query itself failed (detail in the server's `query_stale_within failed` warn line). The audit row is `inventory.devices` with `result=failure` and detail `hardware roster read failed`; the REST `503` message `hardware roster unavailable` tells it apart from the audit-persist `503` (`audit subsystem unavailable`), which shares the same `retry_after_ms`. The CI-record symptoms ("Device roster unreadable", "Device identity unavailable", the record `503`) share the counter but audit as `inventory.device.ci` / `inventory.device.software`. The banner clears on the next successful read; no restart is needed. A fleet with more than 100,000 endpoints in the window is **not** this fault: it shows the "Partial list" notice with the table, and `yuzu_server_agent_presence_roster_truncated_total` counts each truncated read (a steady state on such a fleet, so it has no alert). The per-device record's identity lookup counts its own failures under `op="find_within"` of the same failure counter.
 
-**The Hardware list shows "CI columns unavailable".** The device-CI read failed or ran out of its 20-second budget, so a blank CI cell is a failed read, not "no CI". The list reads CI for the listed devices only, in chunks of 10,000 on one connection. Split `yuzu_inventory_read_degrade_total{source="device_ci"}` by `reason`: `keyed_read_budget` or `pool_acquire_timeout` points at pool saturation or a slow database (`yuzu_pg_pool_waiters`, `yuzu_pg_acquire_wait_seconds`, `yuzu_pg_acquire_timeout_total`, the `YuzuPgPoolSaturated` alert); `query_error` has its detail in the `DeviceInventoryStore` warning in the server log; `store_not_open` means the store failed at boot. The banner clears on the next successful render; no restart is needed.
+**The Hardware list shows "CI columns unavailable".** Either the device-CI read failed or ran out of its 20-second budget, so a blank CI cell is a failed read, not "no CI", or the server's collation gate is not Trusted (a PostgreSQL collation mismatch, or no conclusive collation check yet) and the CI read was not attempted. The gate cause does NOT increment `yuzu_inventory_read_degrade_total`, so if the split below returns nothing, check `yuzu_pg_collation_version_mismatch`, the `[PG]` collation lines in the server log and the "What a mismatch pauses and refuses" section of [Server administration](server-admin.md#postgresql-collation-version); it does not clear by retrying and no restart clears it, only a repaired database or a concluded check does. For a failed read: the list reads CI for the listed devices only, in chunks of 10,000 on one connection; split `yuzu_inventory_read_degrade_total{source="device_ci"}` by `reason`: `keyed_read_budget` or `pool_acquire_timeout` points at pool saturation or a slow database (`yuzu_pg_pool_waiters`, `yuzu_pg_acquire_wait_seconds`, `yuzu_pg_acquire_timeout_total`, the `YuzuPgPoolSaturated` alert); `query_error` has its detail in the `DeviceInventoryStore` warning in the server log; `store_not_open` means the store failed at boot. The banner clears on the next successful render; no restart is needed.
 
 **`install_location` is `-` for many Windows applications and every Linux application.** `-` means the OS
 reported no location, not that collection failed. Windows reads each Uninstall key's `InstallLocation`, which many
@@ -1789,7 +1937,7 @@ The server turns every distinct installed-software title into a stable identity 
 
 ### Software lifecycle (server store)
 
-The server keeps the dates after which a software title or an operating system version is past support, so a later software view can say whether an installed version is supported. Only the store and the evaluator exist so far: nothing reads it yet (no REST route, MCP tool, page or background job), and no host reports lifecycle dates yet.
+The server keeps the dates after which a software title or an operating system version is past support, so a later software view can say whether an installed version is supported. The store, the evaluator and the REST routes that import, list and remove the imported rule set exist so far: nothing reads the evaluated state yet (no REST route, MCP tool, page or background job), and no host reports lifecycle dates yet.
 
 - **Two tables, no stored state.** Rules (`lifecycle_rule`) carry a product key, a version prefix, an event (`end_of_support` or `end_of_life`), a date and the public page the date came from. Host-declared facts (`lifecycle_declared`) carry a product key, one exact version, an event, a date and when a host last repeated it. A fact is global: one row per distinct date, never one per host. The state of a version is computed on every read from those two tables, so changing a rule or correcting a date never leaves an old answer behind.
 - **Keys.** A software title is `product:` plus its registry key (for example `product:postgresql:postgresql`). An operating system is `os:<distro id>` on Linux (the version is the distro version), or `os:windows` / `os:macos` with the OS version.
@@ -1798,6 +1946,7 @@ The server keeps the dates after which a software title or an operating system v
 - **A corrected date.** Both dates stay stored, each with its own last-seen time. While hosts keep repeating the old date it stays current; once they stop and 48 hours pass, the old date is stale, never wins again and raises no conflict. A declaration that no host repeats falls below every rule.
 - **The shipped rules.** The server ships rules for PostgreSQL, Python, Node.js, .NET (runtime and SDK), Ubuntu, Debian and Red Hat Enterprise Linux, each row naming the public page its date came from, in `content/software-lifecycle/rules.csv`. The shipped dates were read from those pages in November 2026. A release whose date could not be confirmed is left out and reads `unknown`; Windows and macOS releases are not covered yet. At every start the server replaces its stored shipped rules with the ones in the binary, so a newer server's rules always apply. Rule files are limited to 256 KiB, 5000 rows and 256 bytes per field, and a file with any defect is refused whole.
 - **If the store cannot open.** The schema is created at start, so the database role needs `CREATE` on the database. The server refuses to start, like the other Postgres stores, when the store cannot open or when the shipped rules cannot be parsed, are empty or cannot be loaded; the log line (`[PG] Refusing to start: software lifecycle ...`) states which and why, and `/readyz` lists `software_lifecycle_store` among its checks. An unparseable or empty shipped rule set is a defective build; a failed open or a failed load is a database fault, so check the role's `CREATE` right and then the Postgres log. A read that cannot be answered is reported as unavailable, never as an empty or `supported` answer. The two counters are in [Metrics](metrics.md#software-lifecycle-store-metrics).
+- **Importing rules.** An administrator loads a rule file with `POST /api/v1/inventory/software/lifecycle/rules` (global `Inventory:Write`), lists the stored rules of a source with `GET` (`Inventory:Read`) and removes the imported set with `DELETE` ([REST API](rest-api.md#software-lifecycle-rules)). The formats are `csv` and `cle` only. `csv` is the rule-file grammar above. `cle` is a Common Lifecycle Enumeration document (ECMA-428 1st edition, schema 1.0.0). An import **replaces the whole `imported` set** and never touches the `shipped` or `external` rules. The file is read all or nothing: a `csv` body of at most 256 KiB, a `cle` body of at most 4 MiB, and at most 5000 rules either way. An imported CLE rule applies to every version of its product: a CLE record that names one exact version, or a version range, is skipped and counted in the answer's `skipped` list, never stored as a prefix, because the rule model matches by dot-component prefix (a stored `3.8` would also claim `3.8.10`). A CLE identifier that lists more than 5000 aliases is refused. Because `imported` outranks `shipped` for the same event, an imported rule overrides the shipped date for the versions it covers. OpenEoX import is not offered yet: its published schema does not name a product (follow-up: #8000).
 - **What is not kept.** Superseded declared dates are not deleted yet; nothing writes them until hosts report support-end dates, and their retention ships with that reporting.
 
 ## Device-identity inventory (`device_ci`)
@@ -1913,7 +2062,7 @@ sync, defeating the hash-skip protocol.
   device that has been offline longer still appears while its record exists. Walk the pages one
   at a time and off-peak; do not fan pages out in parallel. Every page leases one connection from
   the server's shared PostgreSQL pool (`--postgres-pool-size`), which also serves RBAC checks and
-  audit writes. Rows are ordered by the byte value of `agent_id`, not by the database's collation, and every `agent_id` comparison it makes (the single-device `?agent_id=` read included) is byte-ordered, so a change to the operating system's collation rules cannot make this READ skip or miss a device; an index on that byte order makes an index scan available for each page (the planner decides, and the representative plans measured use it). Writes, decommission and the per-device reads (`GET /api/v1/hardware/{id}`, `get_hardware_ci`) still go through the primary key, which follows the database collation. If the collation changes and the indexes are not rebuilt, an emulation (20,000 devices, one run; an upper bound, not a prediction for a real upgrade) showed about 6 in 10 existing devices not found by those per-device reads, every report inserting a new row instead of updating the record (about 38,000 rows after four rounds), some reports refused, duplicate and divergent records for one device served by this walk (and for some devices not the newest copy), and a decommission reporting success while removing only about 4 records in 10, so decommissioned devices stayed stored and kept being served. The write-side control (a pause of writes while a mismatch stands) is a later change; every other keyset read still follows the database collation too: see "PostgreSQL collation version" in [Server administration](server-admin.md#postgresql-collation-version). A complete walk is not a snapshot: confirm a device with `?agent_id=<id>` (byte-exact, unaffected by a collation change) before acting on its absence, and treat an empty confirm page as "not found" (no stored record, or outside the credential's scope), not as "deleted". `GET /api/v1/devices/{id}` is no substitute: it answers only for a device with a live session, so a long-offline device is `404` although its record exists. Retire a configuration item only through your own decommission process, never from absence in a walk or a `404` there. See [REST API](rest-api.md#get-apiv1hardware-ci).
+  audit writes. Rows are ordered by the byte value of `agent_id`, not by the database's collation, and every `agent_id` comparison it makes (the single-device `?agent_id=` read included) is byte-ordered, so a change to the operating system's collation rules cannot make this READ skip or miss a device; an index on that byte order makes an index scan available for each page (the planner decides, and the representative plans measured use it). Writes, decommission and the per-device reads (`GET /api/v1/hardware/{id}`, `get_hardware_ci`) still go through the primary key, which follows the database collation. If the collation changes and the indexes are not rebuilt, an emulation (20,000 devices, one run; an upper bound, not a prediction for a real upgrade) showed about 6 in 10 existing devices not found by those per-device reads, every report inserting a new row instead of updating the record (about 38,000 rows after four rounds), some reports refused, duplicate and divergent records for one device served by this walk (and for some devices not the newest copy), and a decommission reporting success while removing only about 4 records in 10, so decommissioned devices stayed stored and kept being served. Once a replica has detected the mismatch, it pauses device-CI writes (ingest is answered `need_full` and not stored, decommission removal is not attempted) and refuses this read with a retryable `503` (`retry_after_ms` 60000); the per-device reads then answer in their degraded state. After such a refusal restart the walk from the first page rather than resuming the old cursor, and compare with your copy. A gate that is Unproven because the check cannot conclude (the database records a collation version while the host reports none, the catalog read is refused, or the versions are equal while an invalid index exists in the schema `device_inventory_store`, a `REINDEX ... CONCURRENTLY` still running included) does not clear on its own and has no override flag: the read stays refused, while writes are not paused. The invalid-index case clears when the index is dropped or rebuilt. The pause does not repair rows duplicated before it began, detection can take up to an hour, and every other keyset read still follows the database collation and is not gated: see "PostgreSQL collation version" in [Server administration](server-admin.md#postgresql-collation-version). A complete walk is not a snapshot: confirm a device with `?agent_id=<id>` (byte-exact; refused too while the collation gate is not Trusted, so retire nothing while you cannot confirm) before acting on its absence, and treat an empty confirm page as "not found" (no stored record, or outside the credential's scope), not as "deleted". `GET /api/v1/devices/{id}` is no substitute: it answers only for a device with a live session, so a long-offline device is `404` although its record exists. Retire a configuration item only through your own decommission process, never from absence in a walk or a `404` there. See [REST API](rest-api.md#get-apiv1hardware-ci).
 - **What the agent sends.** An agent that carries this change always sends the versioned
   record; there is no flag to fall back to the earlier format, and `--inventory-disable`
   still stops the collection. Each section reports one of four levels:

@@ -459,8 +459,10 @@ std::string render_hardware_results_region(const HardwareListPage& page, bool ci
     // the first refresh and leave a blank cell reading as "no CI" / "no tags".
     if (ci_degraded)
         h += "<div class=\"gp-banner hw-degrade\"><b>CI columns unavailable.</b> The device-CI read did not "
-             "complete (the store failed, or a connection or time limit was reached) &mdash; a blank "
-             "cell here is not \"no CI\", it is a degraded read.</div>";
+             "complete: the store failed, a connection or time limit was reached, or the database "
+             "collation check has not verified the text keys (see PostgreSQL collation version in "
+             "the server administration guide) &mdash; a blank cell here is not \"no CI\", it is a "
+             "degraded read.</div>";
     if (tags_degraded)
         h += "<div class=\"gp-banner hw-degrade\"><b>Tags unavailable.</b> The tag store could not be read "
              "&mdash; a blank Tags column here is not \"no tags\", it is a degraded read.</div>";
@@ -675,9 +677,12 @@ std::string render_hardware_lens_body(const std::string& agent_id, const Hardwar
                  "omitted and last-seen is unknown; this is not \"not found\".</div>";
         }
         if (!detail.ci.has_value()) {
-            h += "<div class=\"gp-banner hw-degrade\"><b>CI record unavailable.</b> The device-CI store could "
-                 "not be read (Postgres pool/query degraded). This is <b>not</b> \"no CI record\" "
-                 "&mdash; reads here are authoritative. Retry shortly.</div>";
+            h += "<div class=\"gp-banner hw-degrade\"><b>CI record unavailable.</b> The device-CI read "
+                 "did not complete: the store could not be read (Postgres pool or query degraded), or "
+                 "the database collation check has not verified the text keys, so device-CI reads are "
+                 "held until it concludes (see PostgreSQL collation version in the server "
+                 "administration guide). This is <b>not</b> \"no CI record\" &mdash; reads here are "
+                 "authoritative.</div>";
         } else if (!detail.ci->has_value()) {
             h += "<div class=\"hw-empty\">No CI record synced yet for this device (device-CI daily "
                  "sync, ADR-0016 &mdash; a freshly enrolled agent populates within ~24h, or on "
