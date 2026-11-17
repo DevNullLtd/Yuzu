@@ -748,6 +748,8 @@ yuzu_server_core_lib = static_library(
     'src/audit_store.cpp',
     'src/credential_change_owner.cpp', # #5342: ADR-0012 §3 query owner — one-transaction
                                        # local credential change (auth + session_store + audit_store)
+    'src/mfa_disable_owner.cpp', # #6079 PR 2c: ADR-0012 §3 query owner, one-transaction
+                                 # MFA factor clear + session end + outcome audit row
     'src/tag_store.cpp',
     'src/scope_engine.cpp',
     'src/scope_preview.cpp', # #2146 Batch B2: shared REST v1 + MCP scope-preview builder
@@ -1060,6 +1062,7 @@ yuzu_server_routes_lib = static_library(
     'src/software_curation_routes.cpp',
     'src/software_collection_settings_routes.cpp',
     'src/software_read_routes.cpp',
+    'src/software_export_routes.cpp',
     'src/inventory_ui.cpp',
     'src/device_containment_routes.cpp',
     'src/device_estate_routes.cpp',

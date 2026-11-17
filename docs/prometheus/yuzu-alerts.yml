@@ -5471,6 +5471,9 @@ groups:
             which audit as inventory.devices, inventory.device.ci and inventory.devices.ci,
             fail closed instead: they withhold the data and answer a retryable -32603), and only the /crypto (crypto.libraries.*) pages
             also show an on-page "Audit not recorded" notice.
+            The Settings MFA disable (mfa.disabled) answers 503 with Sec-Audit-Failed
+            when the "attempted" row or the in-transaction outcome row cannot be stored,
+            and nothing is cleared; the CLI --mfa-reset exits 1 for the same condition.
             Check audit_store health (/healthz
             stores.audit) and free disk / connection saturation on the PostgreSQL
             server (ADR-0040 — audit is Postgres-backed, not a local file). Note: a bad_alloc-class
@@ -7264,6 +7267,73 @@ groups:
             affected agents' warn logs for "SparkEngine: instantiation failed"; a restart
             after resolving host pressure clears the posture within one sweep.
           runbook_url: "https://docs.yuzu.io/runbooks/spark-boot-failed"
+      # YuzuGuardianBaselineUnpersisted (#5605). yuzu_fleet_guardian_baseline_unpersisted is the
+      # fleet SUM of Spark baseline-on-arm captures staged on an agent and not yet written to its
+      # local KV store: a CURRENT, re-statable value (it falls as captures are written), unlike
+      # the latching counter-sums commented out below, so a bare `> 0` is sound for it. It is
+      # absent fleet-wide until an agent runs with prefer_spark (every released agent today), so
+      # the rule is dormant in production and is exercised only by the promtool cases (#2553).
+      #
+      # The expression copies YuzuDedupStoreDegraded: AgentHealthStore::upsert replaces an
+      # agent's whole tag map on every heartbeat and the 90 s staleness prune drops an absent
+      # agent, so a missed heartbeat or a failover to another core replica is a GAP in the
+      # series that would reset a bare `for:`. max_over_time[5m] bridges the gap and
+      # `sum by (job)` drops the per-replica `instance` label from the alert identity. Measured
+      # width: a backlog spanning 10 minutes does not fire, one spanning 11 does (cases T27a and
+      # T27b), so "15 minutes" below is the evaluation clock, not the minimum backlog age.
+      # The value is summed across core replicas, so a failover can count one agent twice for a
+      # few minutes. Same `job` caveat as the dedup rule above.
+      #
+      # severity=warning, deliberately NOT critical: agent-self-reported inside the heartbeat
+      # trust boundary, so ONE forged or buggy agent can keep the alert up (same reasoning as
+      # YuzuSparkBootFailed). Fleet-scale caveat: a sum of current counts stays above 0 while ANY
+      # agent has a slow or failing store, so at ten thousand agents one flapping endpoint keeps
+      # it firing and an operator may silence the group. The threshold and window are not
+      # derived from fleet data: revisit them at the F14 flip (docs/spark-flip-gate.md).
+      - alert: YuzuGuardianBaselineUnpersisted
+        expr: |
+          sum by (job) (max_over_time(yuzu_fleet_guardian_baseline_unpersisted[5m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A Spark baseline persistence backlog of about {{ $value }} capture(s) has persisted across at least 15 minutes of evaluations"
+          description: >-
+            Across the fleet, about {{ $value }} captured file-hash-equals baseline(s) (summed
+            across core replicas, so a failover can count one agent twice for a few minutes)
+            are staged on their agents and not yet written to the agent's local KV store
+            (kv_store.db), and the sum has stayed above 0 across 15 minutes of evaluations. It
+            does not mean any one capture waited that long: an 11 minute backlog fires, and a
+            stream of short backlogs from different agents can keep the sum above 0. This is a
+            persistence BACKLOG, not proof that a write failed: a failing or slow local store, a
+            write pass that ran out of its budget and a worker pass that yielded to a policy
+            push all leave captures staged. It detects a staged-but-unwritten backlog on a live
+            agent and cannot show that a loss happened. It does NOT see a retarget followed by a
+            crash, a capture that was never staged, a Malformed or unreadable baseline record
+            that was re-baselined at boot, or a crash that removes the agent's series (the
+            capture is lost with it). The figure is agent-self-reported, hence a warning. The 5
+            minute window and the sum across replicas exist because a missed heartbeat or a
+            failover to another core replica would otherwise reset the 15 minute clock. The
+            alert clears up to about 5 minutes after the backlog drains (the window is
+            left-open). No per-device view of the underlying tag exists: this gauge is a fleet
+            sum and the alert cannot name the affected endpoints. If you ship agent logs to a
+            central store, search them for "failed to persist captured baseline" and for the
+            ERROR lines logged at stop; otherwise check the logs on the affected hosts. Fix the
+            store first (a full or read-only data directory, permissions, a locked
+            kv_store.db). A graceful restart while the store is still failing loses the staged
+            capture, because the stop-time flush uses the same store. After the store is
+            healthy, the worker retries without a restart (backoff 5 s up to 60 s). A crash
+            or a forced kill loses the capture regardless; the next boot then captures
+            whatever the file holds at that moment, which is the gap this alert exists to
+            expose. An agent whose log shows "Failed to open KV store" at boot arms no
+            Guardian rules at all, so it cannot raise this alert; that is a separate fault:
+            repair the agent data directory and restart the agent. This covers the Spark path
+            only: persist failures on the legacy detection path are logged and are not counted.
+            Read a quiet graph together with yuzu_fleet_guardian_baseline_reporting: while that
+            is 0 (every released agent today) the alert cannot fire for any reason. The 15
+            minute clock and the 5 minute window are not tuned against fleet data; revisit them
+            at the Spark flip.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/guaranteed-state.md#fleet-monitoring-of-baseline-persistence"
   # MASS-ABSENT META-ALERT — COMMENTED until the fleet is past staged rollout (gov UP-12).
   # absent() on yuzu_fleet_spark_reporting would catch "every spark-reporting agent went
   # dark at once" (fleet-wide agent outage / gateway partition) — real alert blindness,
@@ -7674,14 +7744,17 @@ groups:
             also counted as `validate`: session validation is unaffected, but that one
             local MFA binding read is refused 503 `mfa_proof_unavailable` and retried on
             the next read; `create`/`elevate`/`mark_mfa`/`invalidate`/
-            `invalidate_user` degrades fail the privileged op closed, except an
-            `invalidate_user` after an MFA clear that already committed (Settings MFA
-            disable), which leaves the clear in place and ends `partial`;
+            `invalidate_user` degrades fail the privileged op closed
+            (`DELETE /api/v1/sessions` and the deprovision paths; look for
+            deprovision rows with `result=partial, db_error=true`). The Settings MFA
+            disable and the CLI `--mfa-reset` no longer call `invalidate_user`, so
+            they are not counted here: their failures are 503 / `result=error`
+            audit rows (docs/ops-runbooks/auth-db-recovery.md, "There is no partial
+            result");
             `account_state` (the read of `auth.users` that gates a durable local
             session) fails the request closed (401), and the failing store for
             that op is the account store, not session_store; a single
-            event does not hold this alert's 10m condition, so look for
-            `mfa.disabled` rows with result `partial` in the audit log; a sustained
+            event does not hold this alert's 10m condition; a sustained
             `generation_refresh` degrade drops the validate cache past the
             stale-serve bound. `op=rebind_guard` means the session rebind guard is
             not in force: local MFA proofs are refused with `mfa_proof_unavailable`

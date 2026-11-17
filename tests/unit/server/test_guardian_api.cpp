@@ -606,6 +606,7 @@ TEST_CASE("guardian order json: every key is present, unset columns are null and
         o.pair_recoveries = 5;
         o.pair_duplicates = 6;
         o.retired_events = 7;
+        o.currently_unordered = true; // the store decides it; the helper renders it
         const auto j = nlohmann::json::parse(render_guardian_agent_order_json(o));
         CHECK(j["epoch"] == 5);
         CHECK(j["emit_seq_hwm"] == 10);
@@ -621,20 +622,20 @@ TEST_CASE("guardian order json: every key is present, unset columns are null and
         CHECK(j["retired_events"] == 7);
         CHECK(j["currently_unordered"] == true); // unpaired later than the clock
     }
-    SECTION("currently_unordered is strict: an equal time is not unordered, a NULL clock reads 0") {
+    SECTION("currently_unordered is rendered as the store set it, whatever the times say") {
+        // The predicate (strict comparison, a NULL clock reading 0, the future-clock arm) is SQL
+        // only; its cases are in test_census_pair_order.cpp. The helper derives nothing.
         o.unpaired_recv_ns = 100;
         CHECK(nlohmann::json::parse(render_guardian_agent_order_json(o))["currently_unordered"] ==
-              true); // NULL clock = 0
-        o.epoch_recv_ns = 100;
-        CHECK(nlohmann::json::parse(render_guardian_agent_order_json(o))["currently_unordered"] ==
-              false); // equal
+              false); // times that look unordered, flag unset
         o.epoch_recv_ns = 101;
+        o.currently_unordered = true;
         CHECK(nlohmann::json::parse(render_guardian_agent_order_json(o))["currently_unordered"] ==
-              false); // the pair clock is later
-        o.epoch_recv_ns = 99;
+              true); // times that look ordered, flag set
+        o.currently_unordered = false;
         CHECK(nlohmann::json::parse(render_guardian_agent_order_json(o))["currently_unordered"] ==
-              true);
-        o.unpaired_recv_ns.reset(); // no unpaired event ever: never unordered
+              false);
+        o.unpaired_recv_ns.reset();
         CHECK(nlohmann::json::parse(render_guardian_agent_order_json(o))["currently_unordered"] ==
               false);
     }
@@ -669,7 +670,7 @@ TEST_CASE("GuardianApi::device_guards: the ordering block is the agent's order r
         CHECK_FALSE(o->epoch_recv_ns.has_value());
         CHECK(o->unpaired_recv_ns.has_value());
         CHECK(o->unpaired_events == 1);
-        CHECK(o->currently_unordered());
+        CHECK(o->currently_unordered);
     }
     SECTION("a paired agent is not currently unordered") {
         const auto o = ordering_of("paired-only");
@@ -679,14 +680,14 @@ TEST_CASE("GuardianApi::device_guards: the ordering block is the agent's order r
         CHECK(o->epoch_recv_ns.has_value());
         CHECK_FALSE(o->unpaired_recv_ns.has_value());
         CHECK(o->unpaired_events == 0);
-        CHECK_FALSE(o->currently_unordered());
+        CHECK_FALSE(o->currently_unordered);
     }
     SECTION("an unpaired event after the pair clock makes a paired agent unordered again") {
         const auto o = ordering_of("paired-then-unpaired");
         REQUIRE(o.has_value());
         CHECK(o->epoch == std::optional<std::int64_t>{5});
         CHECK(o->unpaired_events == 1);
-        CHECK(o->currently_unordered());
+        CHECK(o->currently_unordered);
     }
     SECTION("an agent with no order row has a null ordering and the read still answers") {
         GuardianReadFault fault = GuardianReadFault::kTransient;

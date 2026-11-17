@@ -2010,6 +2010,20 @@ AuthRoutes::AuditAsSessionFn AuthRoutes::audit_as_session_fn() {
     };
 }
 
+AuthRoutes::AuditEventForSessionFn AuthRoutes::audit_event_for_session_fn() {
+    return [this](const httplib::Request& req, const auth::Session& session,
+                  const std::string& principal_role, const std::string& action,
+                  const std::string& result, const std::string& target_type,
+                  const std::string& target_id) {
+        // The same arguments, in the same order, `audit_log_for_session` hands
+        // `audit_log_for_principal` (which builds its row with this very builder).
+        return make_audit_event_for_principal(req, action, result, session.username,
+                                              principal_role, target_type, target_id,
+                                              /*detail=*/{},
+                                              session.is_engine() ? "engine" : std::string{});
+    };
+}
+
 void AuthRoutes::record_enroll_credential_changed(const httplib::Request& req,
                                                   const std::string& username, auth::Role role) {
     audit_log_for_principal(req, "mfa.enroll.failed", "error", username,
