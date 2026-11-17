@@ -332,14 +332,15 @@ public:
     /// and drain worker), staging attempts that failed (an allocation failure, once per
     /// attempt) or displaced a capture (a retarget that replaced a still-unpersisted capture;
     /// GuardianSparkRuntime::staged_baseline_drops), and passes that found a capture staged
-    /// with no KV store to write it to. A stop-time loss that is not a failed write (the stop
-    /// flush ran out of wall budget, or was skipped because it started late AND this stop had
-    /// shown a slow store) is logged, NOT counted here. A capture that could not be
-    /// staged again at stop IS counted (per failed attempt, like any staging failure) and
-    /// logged, but the count dies with the exiting process, so the log line is the evidence;
-    /// the same holds for a flush cut short by a firewalled throw (counted in the persister's
-    /// firewalled-exception count, and logged). A stop cut off by the shutdown watchdog leaves
-    /// not even a log line (exit code 4). Zero while
+    /// with no KV store to write it to (defence in depth: production cannot reach it, because
+    /// an engine without a store arms no rule, so nothing is staged). A stop-time loss that is
+    /// not a failed write (the stop flush ran out of wall budget, or was skipped because it
+    /// started late AND this stop had shown a slow store) is logged, NOT counted here. A
+    /// capture that could not be staged again at stop IS counted (per failed attempt, like any
+    /// staging failure) and logged, but the count dies with the exiting process, so the log
+    /// line is the evidence; the same holds for a flush cut short by a firewalled throw
+    /// (counted in the persister's firewalled-exception count, and logged). A stop cut off by
+    /// the shutdown watchdog leaves not even a log line (exit code 4). Zero while
     /// healthy, quiescent, or inert (prefer_spark off). Surfaced SPARSELY as
     /// `yuzu.guardian_baseline_persist_failures` via emit_guardian_baseline_persist_heartbeat_tags.
     /// Spark path ONLY: a legacy FileGuard persist failure is logged, not counted. Because it
@@ -351,6 +352,35 @@ public:
     /// GuardianEngine getters (policy_generation(), journal_stats(), ...) DO take mtx_, so the
     /// tick as a whole can still wait behind apply_rules; only this read cannot.
     [[nodiscard]] std::uint64_t baseline_persist_failures() const;
+    /// #5605: the number of Spark baseline-on-arm captures CURRENTLY staged on this agent and not
+    /// yet written to its local KV baseline record (the persister's pending_captures(), the
+    /// runtime's staging-map size mirrored). A CURRENT value that falls as captures are written,
+    /// not a cumulative count: unlike baseline_persist_failures() it reads the open backlog even
+    /// when every pass throws before its first write. std::nullopt (tag omitted, the arm_stats()
+    /// dormancy pattern) when no persister is published: prefer_spark_ is false (every released
+    /// agent), wire_spark_engine has not run or ran after stop(), --spark-disable, a null engine,
+    /// or a wiring that failed before the persister was published, or failed after it and was
+    /// rolled back (rollback_spark_wiring_locked unpublishes it). A present 0 means "no capture
+    /// waiting at this persister", NOT "Spark is healthy". After stop() the persister stays
+    /// published, so a heartbeat tick before the thread joins reads the residual the Stop pass
+    /// could not write (captures this process will lose). A capture that could not even be staged
+    /// is not counted here (see baseline_persist_failures()), and a legacy FileGuard persist
+    /// failure is counted nowhere. Lock-free (never mtx_), like baseline_persist_failures().
+    [[nodiscard]] std::optional<std::uint64_t> baseline_unpersisted() const;
+    /// #5605: the number of `file-hash-equals` rules with no authored expected_hash whose boot
+    /// re-arm seed lookup (start_local's walk over the cached rules) found NO persisted baseline
+    /// record, counted once per rule per boot, on BOTH detection backends (the lookup precedes
+    /// the backend choice). Each such rule re-arms, and where the file mechanism can arm
+    /// (Windows today) re-captures the file's CURRENT content as its baseline at that boot. It
+    /// is NOT proof that a capture was lost: a rule never captured, a prior failed arm, a
+    /// platform whose file mechanism cannot arm (the seed read runs before placement is decided,
+    /// so nothing is re-captured there) and a genuinely lost capture all read the same. A read
+    /// error, a malformed record, a fingerprint mismatch (a retarget), a disabled rule and any
+    /// apply_rules after boot are not counted. Written only under mtx_ during the one start_local
+    /// walk (a second start_local is a no-op), so it is a per-boot constant afterwards; read
+    /// lock-free.
+    /// Live on every agent today (not gated on prefer_spark_).
+    [[nodiscard]] std::uint64_t baseline_rebaselined_at_boot() const noexcept;
     /// #4045: cumulative count of staged captures the #4021 overwrite guard REFUSED to write
     /// because a same-target record already existed (first capture wins). Not a failure and not
     /// part of baseline_persist_failures(). DIAGNOSTIC accessor with no production consumer and
@@ -860,8 +890,8 @@ public:
         stop_busy_timeout_ms_.store(budget.count(), std::memory_order_relaxed);
     }
     /// TEST-ONLY (#4045): forget the published persister pointer, as if stop() had read it just
-    /// before wire_spark_engine published it. The heartbeat getters then read 0. No production
-    /// caller.
+    /// before wire_spark_engine published it. baseline_unpersisted() then reads nullopt and
+    /// baseline_persist_failures() reads 0. No production caller.
     void unpublish_baseline_persister_for_test() noexcept {
         baseline_persister_published_.store(nullptr, std::memory_order_release);
     }
@@ -1453,12 +1483,24 @@ private:
     /// both into the single operator-facing guardian_journal_maint_exceptions tag.
     std::atomic<std::uint64_t> journal_maint_exceptions_{0};
     /// #4045: the persister, published for lock-free readers (baseline_persist_failures /
-    /// baseline_persist_refusals). Stored with release by wire_spark_engine (under mtx_) right
-    /// after the persister is constructed, never cleared or replaced (wire is once-only and
-    /// rollback_spark_wiring_locked leaves the persister alone), and the object lives until
-    /// this engine's destructor, so an acquire load that sees non-null may dereference it for
-    /// as long as the engine is alive. Every other member read still needs mtx_.
+    /// baseline_persist_refusals / baseline_unpersisted). Stored with release by
+    /// wire_spark_engine (under mtx_) right after the persister is constructed and never
+    /// replaced (wire is once-only). #5605: rollback_spark_wiring_locked UNPUBLISHES it (stores
+    /// nullptr here) so a wiring that failed after this point reads as "no persister" (the
+    /// Spark path is SparkFailed and nothing can stage), not as a live zero; it leaves the
+    /// persister OBJECT (baseline_persister_) alone, which lives until this engine's destructor,
+    /// so a reader that loaded the pointer before the clear still dereferences a live object,
+    /// and an acquire load that sees non-null may dereference it for as long as the engine is
+    /// alive. Every other member read still needs mtx_.
     std::atomic<GuardianBaselinePersister*> baseline_persister_published_{nullptr};
+    /// #5605: true only while start_local's boot re-arm walk runs. mtx_-guarded (both callers of
+    /// reconcile_rule_locked hold mtx_), set before the walk and cleared by a GuardianRollback
+    /// scope guard on every exit, so apply_rules never sees it set.
+    bool boot_rearm_walk_{false};
+    /// #5605: rules whose boot seed lookup found no persisted baseline (see
+    /// baseline_rebaselined_at_boot()). Incremented only at reconcile_rule_locked's shared seed
+    /// block with boot_rearm_walk_ set (mtx_ held); atomic so the heartbeat reads it lock-free.
+    std::atomic<std::uint64_t> boot_rebaselined_{0};
     /// TEST-ONLY (#4045): see set_apply_post_drain_hook_for_test / set_seed_read_hook_for_test.
     /// mtx_-guarded; null = no-op.
     std::function<void()> apply_post_drain_hook_for_test_;
