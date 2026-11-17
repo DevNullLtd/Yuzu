@@ -1028,7 +1028,8 @@ so "private range" is not the same predicate as "inside my trust zone" (`CONTEXT
 cluster" term already states clusters must not span a DMZ or a WAN) — the cookie is the actual security
 boundary and should be strengthened directly rather than proxied through an address-range heuristic that
 doesn't track the real one. Migrating the distribution protocol itself to `-proto_dist inet_tls` over the
-internal CA is filed as a follow-up, not this slice's scope. `#4555` also pins
+internal CA is a design item, not this slice's scope and not yet shipped: gateway distribution
+remains unencrypted, outside the PKI, and relies on a trusted, firewalled cluster network. `#4555` also pins
 `inet_dist_listen_min`/`inet_dist_listen_max` in the kernel config (today the distribution port is
 randomly chosen per boot and therefore unfirewallable on a bare-VM deployment) and documents that fixed
 range as what an operator firewalls alongside the existing mgmt-plane (`:50063`) and agent-edge

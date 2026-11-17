@@ -220,6 +220,14 @@ new connections wait in the kernel backlog (agents already connected are unaffec
 they reconnect). Limit connections per source address at the L4 balancer or firewall; see
 [Connection ceilings and the unauthenticated ports](gateway.md#grpc-listeners).
 
+**Gateway Erlang distribution is outside the PKI and unencrypted.** Between
+gateway nodes of a cluster, commands and results (including plugin parameters)
+travel over plain TCP guarded only by the shared cookie handshake; there is no
+encryption and no per-message integrity. Keep the cluster network trusted and
+firewalled to the gateway nodes only (EPMD 4369 and the distribution range
+9100-9105), and give every node a strong cookie. See
+[Distribution Cookie](gateway.md#distribution-cookie-required-in-production).
+
 ## Secret Management
 
 **Never pass secrets via CLI flags** — they are visible in `ps aux`.

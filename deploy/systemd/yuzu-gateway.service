@@ -15,10 +15,12 @@ StartLimitBurst=3
 Type=simple
 User=yuzu-gw
 Group=yuzu-gw
-# F24: refuse an unset, published-default or too-short distribution cookie BEFORE
-# the VM starts (the in-VM guard runs only after distribution is listening).
-# The value is never printed; `$$` is systemd's escape for a literal `$`.
-ExecStartPre=/bin/sh -c 'c="$${YUZU_GW_COOKIE:-}"; case "$$c" in ""|*yuzu_gw_secret_change_me*) echo "yuzu-gateway: YUZU_GW_COOKIE is unset or the published default" >&2; exit 1;; esac; [ "$${#c}" -ge 32 ] || { echo "yuzu-gateway: YUZU_GW_COOKIE is shorter than 32 characters" >&2; exit 1; }'
+# F24: refuse an unset, published-default, too-short or unsafe-character
+# distribution cookie BEFORE the VM starts (the in-VM guard runs only after
+# distribution is listening). The policy is the shared
+# deploy/docker/gateway-cookie-policy.sh, installed beside the release; this unit
+# has NO dev/CI override. The value is never printed.
+ExecStartPre=/bin/sh -c '. /opt/yuzu_gw/gateway-cookie-policy.sh && yuzu_gw_cookie_check_strict'
 ExecStart=/opt/yuzu_gw/bin/yuzu_gw foreground
 Restart=on-failure
 RestartSec=5
@@ -49,10 +51,11 @@ WorkingDirectory=/opt/yuzu_gw
 # Erlang VM settings
 Environment=ERL_CRASH_DUMP=/var/log/yuzu/gateway-crash.dump
 Environment=RELX_REPLACE_OS_VARS=true
-# #659: the Erlang distribution cookie is supplied via YUZU_GW_COOKIE. The .deb/
-# .rpm postinst generates a unique cookie into /etc/yuzu/gateway.env on install;
-# the gateway refuses to boot with the default. The leading `-` makes the file
-# optional (container/manual deploys may inject YUZU_GW_COOKIE another way). For a
+# #659: the Erlang distribution cookie is supplied via YUZU_GW_COOKIE (at least
+# 32 characters from [A-Za-z0-9._~+=-]; ExecStartPre above refuses anything else
+# and prints why). The .deb/.rpm postinst generates a 64-hex cookie into
+# /etc/yuzu/gateway.env on install. The leading `-` makes the file optional
+# (container/manual deploys may inject YUZU_GW_COOKIE another way). For a
 # multi-node cluster, set the SAME YUZU_GW_COOKIE on every node.
 EnvironmentFile=-/etc/yuzu/gateway.env
 

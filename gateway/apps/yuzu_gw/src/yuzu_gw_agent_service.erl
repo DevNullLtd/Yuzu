@@ -167,7 +167,8 @@ register_upstream(Ctx, RegisterReq, PeerAddr, Reservation) ->
             %% session. Nothing is stored: a pending row here would let an empty
             %% or guessed x-yuzu-session-id complete a registration the server
             %% rejected (F29). The agent still gets the server's answer verbatim.
-            logger:info("Register not accepted by the server; nothing stored"),
+            yuzu_gw_safe_call:warn_limited(
+              register_rejected, "Register not accepted by the server; nothing stored", []),
             {ok, Response, Ctx};
         {ok, #{session_id := Sid}} when not is_binary(Sid); Sid =:= <<>> ->
             %% accepted but no server-minted session id: unusable as a key.
@@ -220,6 +221,9 @@ register_upstream(Ctx, RegisterReq, PeerAddr, Reservation) ->
                 {error, session_limit} ->
                     session_limit_error();
                 {error, invalid_session} ->
+                    yuzu_gw_safe_call:warn_limited(
+                      register_invalid_session,
+                      "Register failed: the registry refused the session id as a pending key", []),
                     {grpc_error, {?GRPC_STATUS_INTERNAL,
                                   <<"Upstream registration failed: malformed response">>}}
             end;

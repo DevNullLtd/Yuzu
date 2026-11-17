@@ -163,9 +163,11 @@ services:
         max-file: "5"
     environment:
       # Single-node, ephemeral — no operator cookie: the entrypoint generates a
-      # random per-boot cookie (never the published default) and binds
-      # distribution to loopback. NEVER set this in a clustered production
-      # gateway; set a strong YUZU_GW_COOKIE instead.
+      # random per-boot cookie (never the published default). This node advertises
+      # a routable address, so it is protected by that secret cookie, not by a
+      # loopback bind. Replicas on this override are singletons that cannot
+      # cluster. NEVER set this in a clustered production gateway; set a strong
+      # shared YUZU_GW_COOKIE instead.
       YUZU_GW_ALLOW_DEFAULT_COOKIE: "1"
     volumes:
       # The listeners come from sys.config, not env — mount the TLS sys.config (#1291 follow-up).

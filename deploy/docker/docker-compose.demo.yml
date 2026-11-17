@@ -184,11 +184,12 @@ services:
     environment:
       NO_PROXY: "*"
       no_proxy: "*"
-      # #659 boot guard: the gateway refuses to boot (fail-closed) when it sees
-      # the default Erlang distribution cookie. This single-node, ephemeral demo
-      # has no clustering, so accept the default — exactly as the viz/full/
-      # sanitizer UAT composes do. Without it the gateway crash-loops and the
-      # whole stack never comes up. Demo-only — never set this in production.
+      # #659 boot guard: the gateway entrypoint refuses to start without a
+      # strong cookie. This single-node, ephemeral demo has no clustering, so it
+      # takes a random per-boot cookie instead (never the published default) —
+      # exactly as the viz/full/sanitizer UAT composes do. Without it the gateway
+      # crash-loops and the whole stack never comes up. Demo-only — never set
+      # this in production.
       YUZU_GW_ALLOW_DEFAULT_COOKIE: "1"
     ports:
       - "${DEMO_GATEWAY_HEALTH_PORT:-8081}:8081"     # Health/readiness

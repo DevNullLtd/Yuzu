@@ -73,6 +73,10 @@ agent_service_wire_test_() ->
           fun() -> register_upstream_failed(State) end},
          {"Register: a server-rejected Register (accepted=false) stores no pending row",
           fun() -> register_server_rejected(State) end},
+         {"Register: accepted=false stores no pending row even when a session id is present",
+          fun() -> register_rejected_with_sid(State) end},
+         {"Register: a registry refusal of the session key is INTERNAL (13)",
+          fun() -> register_invalid_session(State) end},
          {"Register: an accepted answer with an empty session id stores no pending row",
           fun() -> register_empty_session(State) end},
          {"Subscribe with an empty x-yuzu-session-id is INVALID_ARGUMENT (3), no lookup",
@@ -154,6 +158,10 @@ mock_boundaries() ->
                 fun(#{info := #{agent_id := <<"upstream-fails">>}}, _Opts) -> {error, unavailable};
                    (#{info := #{agent_id := <<"server-rejects">>}}, _Opts) ->
                        {ok, #{session_id => <<>>, accepted => false}};
+                   (#{info := #{agent_id := <<"rejected-with-sid">>}}, _Opts) ->
+                       {ok, #{session_id => <<"sess-minted-anyway">>, accepted => false}};
+                   (#{info := #{agent_id := <<"registry-refuses-key">>}}, _Opts) ->
+                       {ok, #{session_id => <<"sess-refused-key">>, accepted => true}};
                    (#{info := #{agent_id := <<"empty-session">>}}, _Opts) ->
                        {ok, #{session_id => <<>>, accepted => true}};
                    (#{info := #{agent_id := Id}}, _Opts) ->
@@ -164,7 +172,10 @@ mock_boundaries() ->
                    (_Key, <<"registry-down">>) -> {error, registry_unavailable};
                    (_Key, _AgentId) -> {ok, make_ref()}
                 end),
-    meck:expect(yuzu_gw_registry, store_pending, fun(_Session, _Info, _Reservation) -> ok end),
+    meck:expect(yuzu_gw_registry, store_pending,
+                fun(<<"sess-refused-key">>, _Info, _Reservation) -> {error, invalid_session};
+                   (_Session, _Info, _Reservation) -> ok
+                end),
     meck:expect(yuzu_gw_registry, release_session, fun(_Reservation) -> ok end),
     meck:expect(yuzu_gw_registry, take_pending,
                 fun(<<"registry-down">>) -> {error, registry_unavailable};
@@ -311,7 +322,20 @@ register_server_rejected(#{plain := Chan}) ->
 register_empty_session(#{plain := Chan}) ->
     reset(),
     ?assertMatch({error, {<<"13">>, _}, _}, register(Chan, <<"empty-session">>, <<>>)),
-    ?assertEqual(0, meck:num_calls(yuzu_gw_registry, store_pending, '_')).
+    ?assertEqual(0, meck:num_calls(yuzu_gw_registry, store_pending, '_')),
+    ?assertEqual(1, meck:num_calls(yuzu_gw_registry, release_session, '_')).
+
+register_rejected_with_sid(#{plain := Chan}) ->
+    reset(),
+    ?assertMatch({ok, #{accepted := false}, _}, register(Chan, <<"rejected-with-sid">>, <<>>)),
+    ?assertEqual(0, meck:num_calls(yuzu_gw_registry, store_pending, '_')),
+    ?assertEqual(1, meck:num_calls(yuzu_gw_registry, release_session, '_')).
+
+register_invalid_session(#{plain := Chan}) ->
+    reset(),
+    ?assertMatch({error, {<<"13">>, _}, _}, register(Chan, <<"registry-refuses-key">>, <<>>)),
+    ?assertEqual(1, meck:num_calls(yuzu_gw_registry, store_pending, '_')),
+    ?assertEqual(1, meck:num_calls(yuzu_gw_registry, release_session, '_')).
 
 subscribe_empty_session(#{plain := Chan}) ->
     reset(),

@@ -9222,9 +9222,44 @@ overridden.
 > `apt purge` / `rpm -e`** (the `/etc/yuzu` directory may be shared with other
 > Yuzu packages). To remove the cookie after uninstall: `sudo shred -u /etc/yuzu/gateway.env`.
 
-> **Never set `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` in production** — it disables the
-> guard and restores the unauthenticated-RPC surface. It exists only for
-> ephemeral dev/CI stacks.
+> **Never set `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` in production.** It lets a node
+> start without an operator-supplied cookie (the container entrypoint then uses a
+> random per-boot one; see "Gateway cookie is now checked before the VM starts"
+> below). It exists only for ephemeral dev/CI stacks.
+
+### Gateway cookie is now checked before the VM starts (2026-11-17 security scan, F24) — **BREAKING**
+
+The cookie check used to run inside the VM, after distribution was already
+listening, and `vm.args.src` fell back to the published value
+`yuzu_gw_secret_change_me`. The fallback is gone, and the container entrypoint
+and the systemd unit now refuse a bad cookie **before the VM starts**. The
+policy is one file, `gateway-cookie-policy.sh`, installed next to the release.
+A cookie must be **at least 32 characters** from **`[A-Za-z0-9._~+=-]`**, not
+starting with `-` or `+`, and not the published default. Whitespace, CR/LF,
+backslash, `&` and `$` are refused because the release start script mangles
+them differently under busybox and GNU awk (replicas would disagree on the
+cookie) or, for `\&`, loops forever. `openssl rand -hex 32` always qualifies.
+
+| Install type | Effect | Action |
+|---|---|---|
+| `.deb` / `.rpm` (cookie written by the package: 64 hex) | Unaffected | None. The package now also installs `/opt/yuzu_gw/gateway-cookie-policy.sh`, which the unit needs. |
+| Manual / tarball systemd unit | The unit has an `ExecStartPre` and **no override**. A unit that previously started with `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` and no cookie, or with a short or odd-character cookie, now fails to start. | Install `gateway-cookie-policy.sh` to `/opt/yuzu_gw/` and set a conforming `YUZU_GW_COOKIE` in `/etc/yuzu/gateway.env`. Then `systemctl reset-failed yuzu-gateway && systemctl start yuzu-gateway`. |
+| Container with a short or odd-character cookie | The entrypoint exits 1 before the VM starts (restart loop under `restart:`). | Set a conforming cookie, identical on every replica. |
+| Container on `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` with no cookie | Starts, but with a random per-boot cookie. **N replicas on the override are N singletons that cannot form a cluster** (each draws its own cookie), and the node is no longer reachable with the published value. | Fine for one throwaway node. For a cluster set one shared `YUZU_GW_COOKIE`. |
+| Container on the override with a real shared cookie that contains the old literal | Passed through unchanged (only an empty or *exactly* default cookie is replaced). | None; replace the cookie when convenient. |
+
+Messages to search for (the cookie value is never printed):
+
+- Container, on stdout: `[gateway-entrypoint] FATAL: YUZU_GW_COOKIE is unset, empty or the published default value.`, `... contains a character outside the allowed set [A-Za-z0-9._~+=-] ...`, `... is shorter than 32 characters ...`, `... contains the published default value.`, `... must not start with - or + ...`
+- systemd: `journalctl -u yuzu-gateway` shows the same text prefixed `yuzu-gateway:`.
+- Image with no entrypoint (`yuzu-gateway-chisel`, or `bin/yuzu_gw` run by hand): no pre-VM check. The node boots with OTP's per-host `~/.erlang.cookie`, and the in-VM guard then refuses it ("shorter than 32 characters"), after distribution is listening. If `$HOME` is unwritable the VM cannot create that file and crash-loops; set a conforming `YUZU_GW_COOKIE`.
+
+**Rollback.** An older image accepts the old default and short cookies again, so
+rolling back is safe, but a cookie you changed to satisfy this check works on
+both. Do not roll back merely to regain the published default.
+
+Gateway Erlang distribution is plain TCP, outside the PKI, with no encryption:
+keep the cluster network trusted and firewalled (see the gateway manual).
 
 ### Gateway distribution-cookie length floor + shared node identity (HA WS-4 `#4555`) — **BREAKING**
 
@@ -9240,9 +9275,10 @@ shipped together as part of gateway multi-node cluster formation:
   documented cookie-generation path already clears this floor with room to
   spare** (`openssl rand -hex 32` produces 64 characters) — no action
   needed if you followed the `#659` guidance above verbatim. Only an
-  operator who hand-picked a short custom cookie is affected; the same
+  operator who hand-picked a short custom cookie is affected; the
   `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` override (dev/CI only, never production)
-  bypasses this check too.
+  tolerates a short cookie in the container entrypoint and in-VM guard, but the
+  systemd unit has no override (see below).
 - **Node identity change.** The Erlang node short name changed from a
   hardcoded `yuzu_gw1` to a shared `yuzu_gw` — every gateway replica in a
   cluster now advertises the SAME short name, distinguished only by an

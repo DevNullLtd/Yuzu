@@ -47,34 +47,37 @@ log() {
 # in-VM guard (yuzu_gw_app:check_distribution_cookie/0) runs in the application
 # start callback, AFTER the kernel has started net_kernel under the -name in
 # vm.args.src, so a node with a known cookie is reachable for the whole boot
-# window. This check refuses (exit 1) while nothing is listening. The in-VM
-# guard stays as defence in depth for starts that bypass this script.
+# window. This check refuses (exit 1) while nothing is listening. The policy
+# (floor, character allow-list, published default) lives in ONE file shared with
+# the systemd unit: gateway-cookie-policy.sh.
 #
 # YUZU_GW_ALLOW_DEFAULT_COOKIE=1 (single ephemeral node, dev/CI) no longer means
-# "run with the published default": an unset, empty or published-default cookie
-# is replaced by a fresh random per-boot value that is never logged. Such a node
-# cannot join a cluster (every node would draw a different cookie), which is the
-# safe outcome.
-published_default="yuzu_gw_secret_change_me"
-cookie="${YUZU_GW_COOKIE:-}"
-cookie_insecure=0
-case "$cookie" in
-    "") cookie_insecure=1 ;;
-    *"$published_default"*|*'${'*) cookie_insecure=1 ;;
-esac
-if [ "$cookie_insecure" = 1 ]; then
-    if [ "${YUZU_GW_ALLOW_DEFAULT_COOKIE:-}" = "1" ]; then
-        YUZU_GW_COOKIE="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
-        if [ "${#YUZU_GW_COOKIE}" -lt 64 ]; then
-            log "FATAL: could not generate a random distribution cookie"
-            exit 1
-        fi
-        export YUZU_GW_COOKIE
-        log "YUZU_GW_COOKIE is unset or the published default and YUZU_GW_ALLOW_DEFAULT_COOKIE=1 is set: using a random per-boot cookie (single node only; this node cannot join a cluster)"
-    else
-        log "FATAL: YUZU_GW_COOKIE is unset or is the published default. The Erlang distribution cookie is the sole authentication for inter-node RPC. Set a strong unique value (e.g. 'openssl rand -hex 32')."
-        exit 1
-    fi
+# "run with the published default": a cookie that is unset, empty or EXACTLY the
+# published default is replaced by a fresh random per-boot value that is never
+# logged. A real shared cookie that merely contains the literal is passed through
+# unchanged, so replicas keep agreeing. N replicas on the override are N
+# singletons that cannot cluster (each draws its own cookie).
+. "$(dirname "$0")/gateway-cookie-policy.sh"
+
+yuzu_gw_cookie_classify && cookie_rc=0 || cookie_rc=$?
+if [ "${YUZU_GW_ALLOW_DEFAULT_COOKIE:-}" = "1" ]; then
+    case "$cookie_rc" in
+        10)
+            if ! YUZU_GW_COOKIE="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')" \
+               || [ "${#YUZU_GW_COOKIE}" -lt 64 ]; then
+                log "FATAL: could not generate a random distribution cookie (reading /dev/urandom through head/od/tr failed)"
+                exit 1
+            fi
+            export YUZU_GW_COOKIE
+            log "YUZU_GW_COOKIE is unset or the published default and YUZU_GW_ALLOW_DEFAULT_COOKIE=1 is set: using a random per-boot cookie (single node only; this node cannot join a cluster)"
+            cookie_rc=0
+            ;;
+        12|13) cookie_rc=0 ;;   # the override tolerates these, as the in-VM guard does
+    esac
+fi
+if [ "$cookie_rc" -ne 0 ]; then
+    log "FATAL: $(yuzu_gw_cookie_message "$cookie_rc")"
+    exit 1
 fi
 
 # Local, non-loopback IPv4 addresses this container actually owns.
