@@ -57762,6 +57762,9 @@ TEST_CASE("MCP set_software_collection_settings: the supervised tier mints an ap
 
 // G01: `blocked` (policy evaluation refused to dispatch the check or fix) is a status of its own in
 // the compliance reads, counted as failing.
+// The two TOOL outputs build their JSON with the shared compliance_model builders
+// (fleet_compliance_json, compliance_summary_json); this fails if either stops carrying the count.
+// The resource read and the posture tool below have their own serialisers.
 TEST_CASE("MCP Integration: get_fleet_compliance and get_compliance_summary carry the blocked count",
           "[mcp][compliance]") {
     McpTestServer ts;
@@ -57830,4 +57833,64 @@ TEST_CASE("MCP Integration: the compliance read output schemas declare blocked",
         }
     }
     CHECK(seen == 4);
+}
+
+// The resources/read branch and the get_fleet_posture_fast handler each assemble the fleet
+// figures themselves (not through compliance_model), so each needs its own case: a blocked
+// count dropped from either serialiser must fail here, not be masked by the tool cases above.
+TEST_CASE("MCP Integration: resources/read yuzu://compliance/fleet carries the blocked count",
+          "[mcp][compliance]") {
+    McpTestServer ts;
+    auto capi = std::make_shared<yuzu::server::test::FnComplianceApi>();
+    capi->fleet_compliance_fn =
+        []() -> std::expected<yuzu::server::FleetCompliance, yuzu::server::PolicyReadError> {
+        yuzu::server::FleetCompliance fc;
+        fc.total_checks = 10;
+        fc.compliant = 5;
+        fc.non_compliant = 2;
+        fc.blocked = 3;
+        fc.compliance_pct = 50.0;
+        return fc;
+    };
+    ts.compliance_api_for_test = capi;
+    ts.start();
+
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"resources/read","id":9311,)"
+                       R"("params":{"uri":"yuzu://compliance/fleet"}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto fc = nlohmann::json::parse(body["result"]["contents"][0]["text"].get<std::string>());
+    CHECK(fc["total_checks"] == 10);
+    CHECK(fc["non_compliant"] == 2);
+    CHECK(fc["blocked"] == 3);
+}
+
+TEST_CASE("MCP Integration: get_fleet_posture_fast carries the blocked count in its compliance "
+          "projection",
+          "[mcp][compliance]") {
+    McpTestServer ts;
+    auto capi = std::make_shared<yuzu::server::test::FnComplianceApi>();
+    capi->fleet_compliance_fn =
+        []() -> std::expected<yuzu::server::FleetCompliance, yuzu::server::PolicyReadError> {
+        yuzu::server::FleetCompliance fc;
+        fc.total_checks = 10;
+        fc.compliant = 5;
+        fc.non_compliant = 2;
+        fc.blocked = 3;
+        fc.compliance_pct = 50.0;
+        return fc;
+    };
+    ts.compliance_api_for_test = capi;
+    ts.start();
+
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":9312,)"
+                       R"("params":{"name":"get_fleet_posture_fast","arguments":{}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto& compliance = body["result"]["structuredContent"]["compliance"];
+    CHECK_FALSE(compliance.contains("available"));
+    CHECK(compliance["non_compliant"] == 2);
+    CHECK(compliance["blocked"] == 3);
 }
