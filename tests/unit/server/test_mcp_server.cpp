@@ -71,6 +71,8 @@
 #include "response_store.hpp"
 #include "result_set_members.hpp" // kSourceNotSupportedMessage (Forensics-tier source refusal)
 #include "rest_api_v1.hpp"      // M.9 PR-2b: cross-transport cursor walk (REST + MCP)
+#include "software_collection_settings_routes.hpp" // SAM-35: REST parity for the settings tools
+#include "software_read_routes.hpp"                  // SAM-35: REST parity for the read tools
 #include "test_forensics_tier_fixture.hpp" // #4990: the Forensics tier fixture
 #include "test_route_sink.hpp"  // M.9 PR-2b: in-process sink for that REST half
 #include "test_instruction_execute_rig.hpp" // #2146: Ports rig (no Postgres) for execute_instruction_definition
@@ -1267,6 +1269,12 @@ struct McpTestServer {
     /// sync_hardware_software: the shared fleet-run Runner (REST POST /api/v1/hardware/sync uses
     /// the same type). Empty keeps every other test on the "not configured" path.
     std::shared_ptr<yuzu::server::software_sync::Runner> software_sync_runner_for_test;
+    /// SAM-35: the read context behind the five installed-software v3 read tools, and the stores plus
+    /// the RBAC-unavailable-aware probe behind the four collection-settings tools. All default
+    /// unset, so every other case sees those tools answer "unavailable".
+    std::optional<yuzu::server::software_read_api::Ctx> software_read_ctx_for_test;
+    yuzu::server::software_collection_settings_api::Stores collection_settings_stores_for_test;
+    yuzu::server::mcp::McpServer::PermFn collection_settings_probe_for_test;
 
     /// #2146 Batch B2 — optionally wire a real ResultSetStore so the 12
     /// result-set MCP tools can be exercised end-to-end against live
@@ -1942,6 +1950,11 @@ private:
             mcp.set_discovered_devices_reader(discovered_devices_reader_for_test);
         if (software_sync_runner_for_test)
             mcp.set_software_sync_runner(software_sync_runner_for_test);
+        if (software_read_ctx_for_test)
+            mcp.set_software_read_ctx(*software_read_ctx_for_test);
+        if (collection_settings_stores_for_test.store || collection_settings_probe_for_test)
+            mcp.set_collection_settings_deps(collection_settings_stores_for_test,
+                                             collection_settings_probe_for_test);
         // #2146 Batch B2: result_set_store ALSO rides a setter, same pattern
         // as preflight_run_store immediately above — wire before the
         // handlers are built.
@@ -35480,6 +35493,10 @@ TEST_CASE("MCP 2405: every served schema compiles and the gated set is fully cov
         {"execute_workflow",
          nlohmann::json::parse(
              R"({"workflow_id":"wf-1","agent_ids":["agent-1"],"idempotency_key":"key-0123456789"})")},
+        // SAM-35: ManagementGroup:Write is supervised-tier gated, like every management-group write.
+        {"set_software_collection_settings",
+         nlohmann::json::parse(
+             R"({"group_id":"aaaa11112222","interval_s":86400,"plugins":{"installed_apps":true}})")},
     };
 
     // Tether: the gated set derived from security rows + requires_approval()
@@ -46493,12 +46510,14 @@ struct SyncToolRig {
             r.ids = {"d0", "d1", "d2"};
             return r;
         };
-        e.dispatch = [this](const yuzu::server::auth::Session&, const std::vector<std::string>& ids) {
+        e.dispatch = [this](const yuzu::server::auth::Session&, const std::vector<std::string>& ids,
+                            std::int64_t, const std::string&) {
             ++dispatches;
             dispatched = ids;
             return ss::DispatchResult{ids.size(), "__sync__-mcp-test"};
         };
         e.caller_unfiltered = [](const yuzu::server::auth::Session&) { return true; };
+        e.fleet_admin = [](const yuzu::server::auth::Session&) { return true; };
         e.agent_version = [](const std::string& id) -> std::optional<std::string> {
             if (id == "d2")
                 return std::nullopt; // offline
@@ -46511,6 +46530,9 @@ struct SyncToolRig {
 
 constexpr const char* kSyncCall =
     R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"sync_hardware_software","arguments":)";
+// A whole fleet or group must say so; the tool's own schema does not advertise `confirm` yet, but the
+// shared request grammar reads it.
+constexpr const char* kFleetArgs = R"({"scope":"__all__","confirm":true}}})";
 
 } // namespace
 
@@ -46521,7 +46543,7 @@ TEST_CASE("MCP sync_hardware_software: a fleet run is accepted with counts only,
     ts.software_sync_runner_for_test = rig.runner();
     ts.start("");
 
-    auto res = ts.call(std::string(kSyncCall) + R"({"scope":"__all__"}}})");
+    auto res = ts.call(std::string(kSyncCall) + kFleetArgs);
     REQUIRE(res);
     auto body = nlohmann::json::parse(res->body);
     REQUIRE(body.contains("result"));
@@ -46529,27 +46551,66 @@ TEST_CASE("MCP sync_hardware_software: a fleet run is accepted with counts only,
     CHECK(payload["requested"] == 3);
     CHECK(payload["agents_reached"] == 2);
     CHECK(payload["skipped_offline"] == 1);
+    CHECK(payload["skipped_fresh"] == 0);
     CHECK(payload["command_id"] == "__sync__-mcp-test");
+    CHECK(payload["delay_max_s"] == 0);
+    CHECK(payload["joined"] == false);
+    CHECK(payload["execution_id"].is_null()); // this rig wires no tracker
     CHECK(res->body.find("d0") == std::string::npos); // counts only, never a device id
     CHECK(rig.dispatches == 1);
     REQUIRE_FALSE(ts.audit_log.empty());
     CHECK(ts.audit_log.front() == "inventory.sync.request|requested");
 }
 
-TEST_CASE("MCP sync_hardware_software: shares the cooldown with every other caller of the runner",
+TEST_CASE("MCP sync_hardware_software: shares the run state with every other caller of the runner",
           "[mcp][integration][sync_fanout]") {
     SyncToolRig rig;
     McpTestServer ts;
     ts.software_sync_runner_for_test = rig.runner();
     ts.start("");
 
-    REQUIRE(ts.call(std::string(kSyncCall) + R"({"scope":"__all__"}}})"));
-    auto again = ts.call(std::string(kSyncCall) + R"({"scope":"__all__"}}})");
+    REQUIRE(ts.call(std::string(kSyncCall) + kFleetArgs));
+    // The same request while the run is still going JOINS it: success, nothing sent.
+    auto joined = ts.call(std::string(kSyncCall) + kFleetArgs);
+    REQUIRE(joined);
+    auto jbody = nlohmann::json::parse(joined->body);
+    REQUIRE(jbody.contains("result"));
+    CHECK(nlohmann::json::parse(jbody["result"]["content"][0]["text"].get<std::string>())["joined"] == true);
+    CHECK(rig.dispatches == 1);
+
+    // Once the run is over, the key only cools down: a retryable error carrying the wait.
+    rig.wall += 5;
+    auto again = ts.call(std::string(kSyncCall) + kFleetArgs);
     REQUIRE(again);
     auto body = nlohmann::json::parse(again->body);
     REQUIRE(body.contains("error"));
     CHECK(body["error"]["data"]["retry_after_ms"].get<int>() > 0);
     CHECK(rig.dispatches == 1);
+}
+
+TEST_CASE("MCP sync_hardware_software: a group or the fleet without confirm is invalid params naming the confirmation",
+          "[mcp][integration][sync_fanout]") {
+    SyncToolRig rig;
+    McpTestServer ts;
+    ts.software_sync_runner_for_test = rig.runner();
+    ts.start("");
+    for (const char* args : {R"({"scope":"group:g"}}})", R"({"scope":"__all__"}}})"}) {
+        INFO(args);
+        auto res = ts.call(std::string(kSyncCall) + args);
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        // Invalid parameters, never an internal error: the caller can fix it by confirming.
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(body["error"]["message"].get<std::string>().find("confirm") != std::string::npos);
+        CHECK(rig.dispatches == 0);
+    }
+    // A confirmed group, and a device or expression that never needs it, run.
+    CHECK(ts.call(std::string(kSyncCall) + R"({"scope":"group:g","confirm":true}}})"));
+    CHECK(rig.dispatches == 1);
+    auto device = ts.call(std::string(kSyncCall) + R"({"scope":"host-01"}}})");
+    REQUIRE(device);
+    CHECK(nlohmann::json::parse(device->body).contains("result"));
 }
 
 TEST_CASE("MCP sync_hardware_software: refuses a service-scoped token, bad arguments and an unwired runner",
@@ -46560,7 +46621,7 @@ TEST_CASE("MCP sync_hardware_software: refuses a service-scoped token, bad argum
         ts.mock_token_scope_service = "printers";
         ts.software_sync_runner_for_test = rig.runner();
         ts.start("");
-        auto res = ts.call(std::string(kSyncCall) + R"({"scope":"__all__"}}})");
+        auto res = ts.call(std::string(kSyncCall) + kFleetArgs);
         REQUIRE(res);
         auto body = nlohmann::json::parse(res->body);
         REQUIRE(body.contains("error"));
@@ -46583,7 +46644,7 @@ TEST_CASE("MCP sync_hardware_software: refuses a service-scoped token, bad argum
     {
         McpTestServer ts; // no runner wired
         ts.start("");
-        auto res = ts.call(std::string(kSyncCall) + R"({"scope":"__all__"}}})");
+        auto res = ts.call(std::string(kSyncCall) + kFleetArgs);
         REQUIRE(res);
         auto body = nlohmann::json::parse(res->body);
         REQUIRE(body.contains("error"));
@@ -46602,7 +46663,7 @@ TEST_CASE("MCP sync_hardware_software: a lost outcome row is flagged audit_persi
         return action != "mcp.sync_hardware_software";
     };
     ts.start("");
-    auto res = ts.call(std::string(kSyncCall) + R"({"scope":"__all__"}}})");
+    auto res = ts.call(std::string(kSyncCall) + kFleetArgs);
     REQUIRE(res);
     auto body = nlohmann::json::parse(res->body);
     REQUIRE(body.contains("result"));
@@ -46620,20 +46681,14 @@ TEST_CASE("MCP sync_hardware_software: every Runner refusal maps to the intended
         std::function<void(ss::Env&)> tweak;
         int code;
         bool hint;
+        const char* args = R"({"scope":"__all__","confirm":true}}})";
     };
     const std::vector<Case> cases = {
-        {"over the cap -> invalid params, no hint",
+        {"fleet without the administrator grant -> permission denied, no hint",
          [](ss::Env& e) {
-             e.resolve = [](const yuzu::server::auth::Session&, const ss::Selector&) {
-                 ss::Resolved r;
-                 r.status = ss::Resolved::Status::Ok;
-                 r.caller_unfiltered = true;
-                 for (int i = 0; i < 600; ++i)
-                     r.ids.push_back("d" + std::to_string(i));
-                 return r;
-             };
+             e.fleet_admin = [](const yuzu::server::auth::Session&) { return false; };
          },
-         yuzu::server::mcp::kInvalidParams, false},
+         yuzu::server::mcp::kPermissionDenied, false},
         {"confined caller naming the fleet -> permission denied",
          [](ss::Env& e) {
              e.caller_unfiltered = [](const yuzu::server::auth::Session&) { return false; };
@@ -46650,11 +46705,17 @@ TEST_CASE("MCP sync_hardware_software: every Runner refusal maps to the intended
          yuzu::server::mcp::kInternalError, true},
         {"every send refused -> internal error with a hint",
          [](ss::Env& e) {
-             e.dispatch = [](const yuzu::server::auth::Session&, const std::vector<std::string>&) {
-                 return ss::DispatchResult{0, "x"};
-             };
+             e.dispatch = [](const yuzu::server::auth::Session&, const std::vector<std::string>&, std::int64_t,
+                             const std::string&) { return ss::DispatchResult{0, "x"}; };
          },
          yuzu::server::mcp::kInternalError, true},
+        {"the scope's last_synced_before read degraded -> internal error with a hint",
+         [](ss::Env& e) {
+             e.last_seen = [](const std::vector<std::string>&)
+                 -> std::optional<std::unordered_map<std::string, std::int64_t>> { return std::nullopt; };
+         },
+         yuzu::server::mcp::kInternalError, true,
+         R"({"scope":"__all__","confirm":true,"last_synced_before":100}}})"},
     };
     for (const auto& c : cases) {
         INFO(c.name);
@@ -46667,16 +46728,16 @@ TEST_CASE("MCP sync_hardware_software: every Runner refusal maps to the intended
             r.ids = {"d0", "d1"};
             return r;
         };
-        env.dispatch = [](const yuzu::server::auth::Session&, const std::vector<std::string>& ids) {
-            return ss::DispatchResult{ids.size(), "__sync__-t"};
-        };
+        env.dispatch = [](const yuzu::server::auth::Session&, const std::vector<std::string>& ids, std::int64_t,
+                          const std::string&) { return ss::DispatchResult{ids.size(), "__sync__-t"}; };
         env.caller_unfiltered = [](const yuzu::server::auth::Session&) { return true; };
+        env.fleet_admin = [](const yuzu::server::auth::Session&) { return true; };
         env.agent_version = [](const std::string&) { return std::optional<std::string>("0.13.1"); };
         c.tweak(env);
         McpTestServer ts;
         ts.software_sync_runner_for_test = std::make_shared<ss::Runner>(std::move(env));
         ts.start("");
-        auto res = ts.call(std::string(kSyncCall) + R"({"scope":"__all__"}}})");
+        auto res = ts.call(std::string(kSyncCall) + c.args);
         REQUIRE(res);
         auto body = nlohmann::json::parse(res->body);
         REQUIRE(body.contains("error"));
@@ -46685,6 +46746,44 @@ TEST_CASE("MCP sync_hardware_software: every Runner refusal maps to the intended
                               !body["error"]["data"]["retry_after_ms"].is_null();
         CHECK(has_hint == c.hint);
     }
+}
+
+TEST_CASE("MCP sync_hardware_software: a busy pacing budget is answered as a retryable error with its hint",
+          "[mcp][integration][sync_fanout]") {
+    namespace ss = yuzu::server::software_sync;
+    SyncToolRig rig;
+    ss::Env env;
+    env.resolve = [](const yuzu::server::auth::Session&, const ss::Selector&) {
+        ss::Resolved r;
+        r.status = ss::Resolved::Status::Ok;
+        r.caller_unfiltered = true;
+        for (int i = 0; i < 1000; ++i)
+            r.ids.push_back("d" + std::to_string(i));
+        return r;
+    };
+    env.dispatch = [](const yuzu::server::auth::Session&, const std::vector<std::string>& ids, std::int64_t,
+                      const std::string&) { return ss::DispatchResult{ids.size(), "__sync__-t"}; };
+    env.caller_unfiltered = [](const yuzu::server::auth::Session&) { return true; };
+    env.fleet_admin = [](const yuzu::server::auth::Session&) { return true; };
+    env.agent_version = [](const std::string&) { return std::optional<std::string>("0.13.1"); };
+    env.now = [&rig] { return rig.wall; };
+    McpTestServer ts;
+    ts.software_sync_runner_for_test = std::make_shared<ss::Runner>(std::move(env));
+    ts.start("");
+    // Five runs of other groups spread over 40..640 s and leave less than the minimum rate free.
+    for (int i = 0; i < 5; ++i) {
+        auto ok = ts.call(std::string(kSyncCall) + "{\"scope\":\"group:g" + std::to_string(i) +
+                          "\",\"confirm\":true}}}");
+        REQUIRE(ok);
+        REQUIRE(nlohmann::json::parse(ok->body).contains("result"));
+    }
+    auto res = ts.call(std::string(kSyncCall) + R"({"scope":"group:g5","confirm":true}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    // The default branch: a retryable internal error carrying how long to wait, never invalid params.
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["data"]["retry_after_ms"].get<int>() == 40'000);
 }
 
 
@@ -56717,4 +56816,948 @@ TEST_CASE("MCP Guardian: the output schemas declare the ordering fields, require
     CHECK(gdesc.find("pair_duplicates") != std::string::npos);
     CHECK(gdesc.find("classify each census-bearing first delivery") != std::string::npos);
     CHECK(gdesc.find("not yet compared") == std::string::npos); // the pre-B wording is gone
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+// SAM-35: the installed-software read model and the collection settings over MCP.
+// Each tool calls the SAME function its REST route calls (software_read_api.cpp,
+// software_collection_settings_api.cpp), so every case that compares the two surfaces compares
+// one body: a mismatch is a mapping defect in a surface, not a second implementation.
+// ═════════════════════════════════════════════════════════════════════════
+
+namespace {
+namespace sra = yuzu::server::software_read_api;
+namespace sca = yuzu::server::software_collection_settings_api;
+using yuzu::server::authz::VisibleSet;
+
+constexpr std::int64_t kSam35Now = 1'700'000'000;
+
+constexpr const char* kSam35ReadTools[] = {"list_software_hosts", "get_software_host",
+                                           "list_software_changes", "get_software_summary",
+                                           "get_software_plugin_health"};
+constexpr const char* kSam35AllTools[] = {"list_software_hosts",
+                                          "get_software_host",
+                                          "list_software_changes",
+                                          "get_software_summary",
+                                          "get_software_plugin_health",
+                                          "list_software_collection_settings",
+                                          "get_software_collection_settings",
+                                          "set_software_collection_settings",
+                                          "get_software_host_collection_settings"};
+
+// The fakes behind software_read_api::Reads, shared by the REST routes and the MCP tools of a case.
+struct Sam35Fakes {
+    std::vector<yuzu::server::SoftwareHostRow> hosts;
+    std::vector<yuzu::server::SoftwareChangeRow> changes;
+    std::vector<yuzu::server::SoftwareFleetRow> installs;
+    std::shared_ptr<const yuzu::server::SoftwareFleetSnapshot> snapshot;
+    yuzu::server::SoftwareSummary live_summary;
+    std::vector<yuzu::server::FacetHealth> live_facets;
+    yuzu::server::CatalogRollupMeta catalog;
+    int reads{0};          // every store read
+    int snapshot_reads{0}; // every read of the fleet snapshot
+    bool degrade{false};
+
+    Sam35Fakes() {
+        yuzu::server::SoftwareHostRow h1, h2;
+        h1.agent_id = "a1";
+        h2.agent_id = "a2";
+        h1.last_seen = h2.last_seen = 1'699'000'000;
+        h1.facets.push_back({"software.installed", "full", "tok", true, 1'699'000'100, 12, 345});
+        h2.facets.push_back({"software.installed", "full", "tok", true, 1'699'000'100, 12, 345});
+        hosts = {h1, h2};
+        for (std::int64_t i = 1; i <= 2; ++i) {
+            yuzu::server::SoftwareChangeRow c;
+            c.change_id = i;
+            c.agent_id = i == 1 ? "a1" : "a2";
+            c.facet = "software.installed";
+            c.kind = "install";
+            c.name = "pkg-" + std::to_string(i);
+            c.observed_at = 1'699'000'000 + i;
+            changes.push_back(c);
+        }
+        for (const auto& [agent, id] : {std::pair{"a1", 1}, {"a1", 2}, {"a2", 3}}) {
+            yuzu::server::SoftwareFleetRow r;
+            r.agent_id = agent;
+            r.install_id = id;
+            r.entry.name = "pkg";
+            r.entry.version = "1." + std::to_string(id);
+            installs.push_back(r);
+        }
+        yuzu::server::FacetHealth f;
+        f.facet = "software.installed";
+        f.devices_by_status = {{"full", 2}};
+        f.slowest.push_back({"a1", 99});
+        live_facets = {f};
+        live_summary.devices_reporting = 1;
+        auto snap = std::make_shared<yuzu::server::SoftwareFleetSnapshot>();
+        snap->facets = {f};
+        snap->summary.devices_reporting = 2;
+        snap->as_of = 1'699'999'000;
+        snapshot = snap;
+        catalog.refreshed_at = 1'699'000'000;
+        catalog.total_titles = 3;
+        catalog.total_installs = 5;
+        catalog.total_devices = 2;
+    }
+
+    sra::Reads make_reads() {
+        sra::Reads r;
+        r.hosts = [this](const yuzu::server::software_hosts::HostsQuery& q)
+            -> std::optional<std::vector<yuzu::server::SoftwareHostRow>> {
+            ++reads;
+            if (degrade)
+                return std::nullopt;
+            std::vector<yuzu::server::SoftwareHostRow> out;
+            for (const auto& h : hosts) {
+                if (q.agent_ids && std::ranges::find(*q.agent_ids, h.agent_id) == q.agent_ids->end())
+                    continue;
+                if (h.agent_id <= q.after)
+                    continue;
+                if (out.size() >= static_cast<std::size_t>(q.limit))
+                    break;
+                out.push_back(h);
+            }
+            return out;
+        };
+        r.changes = [this](const yuzu::server::software_changes::ChangesQuery& q)
+            -> std::optional<std::vector<yuzu::server::SoftwareChangeRow>> {
+            ++reads;
+            if (degrade)
+                return std::nullopt;
+            std::vector<yuzu::server::SoftwareChangeRow> out;
+            for (const auto& c : changes) {
+                if (q.agent_ids && std::ranges::find(*q.agent_ids, c.agent_id) == q.agent_ids->end())
+                    continue;
+                if (!q.agent_id.empty() && c.agent_id != q.agent_id)
+                    continue;
+                if (!q.kind.empty() && c.kind != q.kind)
+                    continue;
+                if (c.observed_at < q.since || c.observed_at >= q.stable_before)
+                    continue;
+                if (std::tie(c.observed_at, c.change_id) <=
+                    std::tie(q.after.observed_at, q.after.change_id))
+                    continue;
+                if (out.size() >= static_cast<std::size_t>(q.limit))
+                    break;
+                out.push_back(c);
+            }
+            return out;
+        };
+        r.installs = [this](const yuzu::server::SoftwareFleetQuery& q)
+            -> std::optional<std::vector<yuzu::server::SoftwareFleetRow>> {
+            ++reads;
+            if (degrade)
+                return std::nullopt;
+            std::vector<yuzu::server::SoftwareFleetRow> out;
+            for (const auto& i : installs) {
+                if (!q.agent_id.empty() && i.agent_id != q.agent_id)
+                    continue;
+                if (q.agent_ids && std::ranges::find(*q.agent_ids, i.agent_id) == q.agent_ids->end())
+                    continue;
+                if (q.after && i.install_id <= q.after->install_id)
+                    continue;
+                if (out.size() >= static_cast<std::size_t>(q.limit))
+                    break;
+                out.push_back(i);
+            }
+            return out;
+        };
+        r.last_seen = [](const std::vector<std::string>& ids)
+            -> std::optional<std::unordered_map<std::string, std::int64_t>> {
+            std::unordered_map<std::string, std::int64_t> m;
+            for (const auto& id : ids)
+                m[id] = 1'699'000'000;
+            return m;
+        };
+        r.facet_health = [this](const std::optional<std::vector<std::string>>&)
+            -> std::optional<std::vector<yuzu::server::FacetHealth>> {
+            ++reads;
+            if (degrade)
+                return std::nullopt;
+            return live_facets;
+        };
+        r.summary = [this](std::int64_t, const std::optional<std::vector<std::string>>&)
+            -> std::optional<yuzu::server::SoftwareSummary> {
+            ++reads;
+            if (degrade)
+                return std::nullopt;
+            return live_summary;
+        };
+        r.catalog_meta = [this]() -> std::optional<yuzu::server::CatalogRollupMeta> {
+            if (degrade)
+                return std::nullopt;
+            return catalog;
+        };
+        return r;
+    }
+};
+
+// The five reads on both surfaces over one set of fakes and one gate.
+struct Sam35ReadRig {
+    Sam35Fakes fakes;
+    VisibleSet scope;
+    yuzu::server::SoftwareReadRoutes routes; // BEFORE the sink that holds handlers capturing it
+    yuzu::server::test::TestRouteSink sink;
+    McpTestServer ts;
+
+    explicit Sam35ReadRig(VisibleSet s = std::nullopt) : scope(std::move(s)) {
+        const auto roster = [] {
+            yuzu::server::OfflineRoster r;
+            r.rows.push_back({.agent_id = "a1", .hostname = "web-1"});
+            r.rows.push_back({.agent_id = "a2", .hostname = "db-1"});
+            return std::optional<yuzu::server::OfflineRoster>{r};
+        };
+        const auto snap = [this] {
+            ++fakes.snapshot_reads;
+            return fakes.snapshot;
+        };
+        const auto now = [] { return kSam35Now; };
+        const auto gate = [this](const httplib::Request&, httplib::Response&, const std::string&,
+                                 const std::string&) -> yuzu::server::authz::FleetReadGate {
+            return {true, scope};
+        };
+        yuzu::server::SoftwareReadRoutes::Deps deps;
+        deps.fleet_read_fn = gate;
+        deps.roster_fn = roster;
+        deps.snapshot_fn = snap;
+        deps.now_fn = now;
+        deps.reads = fakes.make_reads();
+        routes.register_routes(sink, std::move(deps));
+        ts.fleet_read_fn_for_test = gate;
+        ts.software_read_ctx_for_test = sra::make_ctx(fakes.make_reads(), roster, snap, now, nullptr);
+        ts.start();
+    }
+
+    nlohmann::json mcp_data(const std::string& tool, const std::string& args = "{}") {
+        auto body = mcp_tool_call(ts, tool, args);
+        INFO(tool << " " << args << " -> " << body.dump());
+        REQUIRE_FALSE(body.contains("error"));
+        return body["result"]["structuredContent"];
+    }
+    nlohmann::json rest_data(const std::string& path) {
+        const auto res = sink.Get(path);
+        REQUIRE(res != nullptr);
+        INFO(path << " -> " << res->status << " " << res->body);
+        REQUIRE(res->status == 200);
+        return nlohmann::json::parse(res->body)["data"];
+    }
+};
+} // namespace
+
+TEST_CASE("MCP SAM-35 tools: tools/list advertises all nine, classified and typed",
+          "[mcp][inventory][software]") {
+    McpTestServer ts;
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    const auto tools = nlohmann::json::parse(res->body)["result"]["tools"];
+    int found = 0;
+    for (const auto& t : tools) {
+        const auto name = t["name"].get<std::string>();
+        if (std::ranges::find(kSam35AllTools, name) == std::end(kSam35AllTools))
+            continue;
+        ++found;
+        INFO(name);
+        const bool is_set = name == "set_software_collection_settings";
+        CHECK(t["annotations"]["readOnlyHint"] == !is_set);
+        CHECK(t["annotations"]["destructiveHint"] == is_set);
+        CHECK(t["inputSchema"]["additionalProperties"] == false);
+        CHECK_FALSE(t["outputSchema"]["properties"].empty());
+        CHECK(t["description"].get<std::string>().size() < 4096);
+    }
+    CHECK(found == 9);
+    // The write tool names its required arguments, and nothing else is required.
+    for (const auto& t : tools)
+        if (t["name"] == "set_software_collection_settings")
+            CHECK(t["inputSchema"]["required"] ==
+                  nlohmann::json::array({"group_id", "interval_s", "plugins"}));
+}
+
+TEST_CASE("MCP SAM-35 tools: the orientation families cover all nine",
+          "[mcp][inventory][software]") {
+    for (const char* tool : kSam35AllTools) {
+        INFO(tool);
+        bool covered = false;
+        for (const auto& fam : yuzu::server::mcp::tool_families())
+            covered = covered || std::ranges::find(fam.tools, std::string_view{tool}) != fam.tools.end();
+        CHECK(covered);
+    }
+}
+
+TEST_CASE("MCP SAM-35 tools: an unwired store is an internal error, never an empty success",
+          "[mcp][inventory][software]") {
+    McpTestServer ts; // no read context, no settings stores, no probe
+    ts.start();
+    for (const char* tool : kSam35ReadTools) {
+        auto body = mcp_tool_call(ts, tool, std::string(tool) == "get_software_host"
+                                                ? R"({"agent_id":"a1"})"
+                                                : "{}");
+        INFO(tool << " -> " << body.dump());
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    }
+    for (const auto& [tool, args] :
+         std::vector<std::pair<const char*, const char*>>{
+             {"list_software_collection_settings", "{}"},
+             {"get_software_collection_settings", R"({"group_id":"aaaa11112222"})"},
+             {"set_software_collection_settings",
+              R"({"group_id":"aaaa11112222","interval_s":86400,"plugins":{"installed_apps":true}})"},
+             {"get_software_host_collection_settings", R"({"agent_id":"a1"})"}}) {
+        auto body = mcp_tool_call(ts, tool, args);
+        INFO(tool << " -> " << body.dump());
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    }
+
+    // The loop above stops get/set at the unset probe and the effective read at the unset scope
+    // gate. Wire both (admitting) with the stores still null, so the answer is the store arm: the
+    // message names which arm answered, as the code alone is the same on both.
+    McpTestServer gated;
+    gated.collection_settings_probe_for_test = [](const httplib::Request&, httplib::Response&,
+                                                  const std::string&, const std::string&) {
+        return true;
+    };
+    gated.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                       const std::string&, const std::string&,
+                                       const std::string&) { return true; };
+    gated.start();
+    for (const auto& [tool, args] :
+         std::vector<std::pair<const char*, const char*>>{
+             {"get_software_collection_settings", R"({"group_id":"aaaa11112222"})"},
+             {"set_software_collection_settings",
+              R"({"group_id":"aaaa11112222","interval_s":86400,"plugins":{"installed_apps":true}})"},
+             {"get_software_host_collection_settings", R"({"agent_id":"a1"})"}}) {
+        auto body = mcp_tool_call(gated, tool, args);
+        INFO(tool << " -> " << body.dump());
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+        CHECK(body["error"]["message"] == "Collection settings store unavailable");
+    }
+}
+
+TEST_CASE("MCP SAM-35 reads: the payload equals the REST route's data object for the same input",
+          "[mcp][inventory][software]") {
+    for (const bool confined : {false, true}) {
+        INFO(std::string(confined ? "confined caller" : "unfiltered caller"));
+        Sam35ReadRig rig(confined ? VisibleSet{std::unordered_set<std::string>{"a1"}}
+                                  : VisibleSet{});
+        CHECK(rig.mcp_data("list_software_hosts") ==
+              rig.rest_data("/api/v1/inventory/software/hosts"));
+        CHECK(rig.mcp_data("list_software_hosts", R"({"q":"web"})") ==
+              rig.rest_data("/api/v1/inventory/software/hosts?q=web"));
+        // A page and its continuation: the cursor from one surface walks the other.
+        const auto page = rig.mcp_data("list_software_hosts", R"({"limit":1})");
+        CHECK(page == rig.rest_data("/api/v1/inventory/software/hosts?limit=1"));
+        if (!confined) {
+            REQUIRE(page["next_cursor"].is_string());
+            const auto cursor = page["next_cursor"].get<std::string>();
+            CHECK(rig.mcp_data("list_software_hosts",
+                               R"({"limit":1,"cursor":")" + cursor + R"("})") ==
+                  rig.rest_data("/api/v1/inventory/software/hosts?limit=1&cursor=" + cursor));
+        }
+        CHECK(rig.mcp_data("get_software_host", R"({"agent_id":"a1"})") ==
+              rig.rest_data("/api/v1/inventory/software/hosts/a1"));
+        CHECK(rig.mcp_data("get_software_host", R"({"agent_id":"a1","limit":1})") ==
+              rig.rest_data("/api/v1/inventory/software/hosts/a1?limit=1"));
+        CHECK(rig.mcp_data("list_software_changes") ==
+              rig.rest_data("/api/v1/inventory/software/changes"));
+        CHECK(rig.mcp_data("list_software_changes", R"({"kind":"install","since":0,"limit":5})") ==
+              rig.rest_data("/api/v1/inventory/software/changes?kind=install&since=0&limit=5"));
+        CHECK(rig.mcp_data("get_software_summary") ==
+              rig.rest_data("/api/v1/inventory/software/summary"));
+        CHECK(rig.mcp_data("get_software_plugin_health") ==
+              rig.rest_data("/api/v1/inventory/software/plugin-health"));
+    }
+}
+
+TEST_CASE("MCP SAM-35 reads: a confined caller sees only its scope; out-of-scope equals unknown",
+          "[mcp][inventory][software][security]") {
+    Sam35ReadRig rig(VisibleSet{std::unordered_set<std::string>{"a1"}});
+    const auto hosts = rig.mcp_data("list_software_hosts");
+    REQUIRE(hosts["hosts"].size() == 1);
+    CHECK(hosts["hosts"][0]["agent_id"] == "a1");
+    for (const auto& c : rig.mcp_data("list_software_changes")["changes"])
+        CHECK(c["agent_id"] == "a1");
+
+    // An out-of-scope host (a2) and an unknown one (zz) are the same answer, and the first reads
+    // nothing.
+    const int reads_before = rig.fakes.reads;
+    auto outside = mcp_tool_call(rig.ts, "get_software_host", R"({"agent_id":"a2"})");
+    CHECK(rig.fakes.reads == reads_before);
+    auto unknown = mcp_tool_call(rig.ts, "get_software_host", R"({"agent_id":"zz"})");
+    REQUIRE(outside.contains("error"));
+    REQUIRE(unknown.contains("error"));
+    CHECK(outside["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(outside["error"]["code"] == unknown["error"]["code"]);
+    CHECK(outside["error"]["message"] == unknown["error"]["message"]);
+
+    // Unfiltered: a2 exists and an unknown id answers the same not-found as above.
+    Sam35ReadRig open;
+    CHECK_FALSE(mcp_tool_call(open.ts, "get_software_host", R"({"agent_id":"a2"})").contains("error"));
+    auto none = mcp_tool_call(open.ts, "get_software_host", R"({"agent_id":"zz"})");
+    REQUIRE(none.contains("error"));
+    CHECK(none["error"]["message"] == outside["error"]["message"]);
+}
+
+TEST_CASE("MCP SAM-35 reads: a confined caller's aggregates are live, never the fleet snapshot",
+          "[mcp][inventory][software][security]") {
+    Sam35ReadRig confined(VisibleSet{std::unordered_set<std::string>{"a1"}});
+    const auto summary = confined.mcp_data("get_software_summary");
+    CHECK(summary["catalogue"].is_null()); // the fleet catalogue is not the caller's
+    CHECK(summary["devices"]["reporting"] == 1); // the live aggregate, not the snapshot's 2
+    const auto health = confined.mcp_data("get_software_plugin_health");
+    CHECK(health["facets"].size() == 1);
+    CHECK(confined.fakes.snapshot_reads == 0);
+
+    // A scope wider than the pushdown cap yields nulls with omitted=scope, never the snapshot.
+    std::unordered_set<std::string> wide;
+    for (std::size_t i = 0; i <= yuzu::server::software_catalogue::kScopePushdownMaxIds; ++i)
+        wide.insert("d" + std::to_string(i));
+    Sam35ReadRig over(VisibleSet{std::move(wide)});
+    const auto s = over.mcp_data("get_software_summary");
+    CHECK(s["omitted"] == "scope");
+    CHECK(s["devices"].is_null());
+    const auto h = over.mcp_data("get_software_plugin_health");
+    CHECK(h["omitted"] == "scope");
+    CHECK(h["facets"].is_null());
+    CHECK(over.fakes.snapshot_reads == 0);
+
+    // The unfiltered caller gets the snapshot.
+    Sam35ReadRig open;
+    CHECK(open.mcp_data("get_software_summary")["devices"]["reporting"] == 2);
+    CHECK(open.fakes.snapshot_reads == 1);
+}
+
+TEST_CASE("MCP SAM-35 reads: strict input is kInvalidParams and reads nothing",
+          "[mcp][inventory][software]") {
+    Sam35ReadRig rig;
+    const std::vector<std::pair<const char*, const char*>> bad = {
+        {"list_software_hosts", R"({"bogus":1})"},
+        {"list_software_hosts", R"({"limit":"5"})"},
+        {"list_software_hosts", R"({"limit":0})"},
+        {"list_software_hosts", R"({"limit":1001})"},
+        {"list_software_hosts", R"({"q":5})"},
+        {"get_software_host", "{}"},
+        {"get_software_host", R"({"agent_id":""})"},
+        {"get_software_host", R"({"agent_id":"a1","limit":0})"},
+        {"get_software_host", R"({"agent_id":"a1","bogus":1})"},
+        {"get_software_host", R"({"agent_id":5})"},
+        {"list_software_changes", R"({"kind":"bogus"})"},
+        {"list_software_changes", R"({"since":-1})"},
+        {"list_software_changes", R"({"limit":1001})"},
+        {"list_software_changes", R"({"bogus":1})"},
+        {"list_software_changes", R"({"since":"0"})"},
+        {"list_software_changes", R"({"limit":"5"})"},
+        {"get_software_summary", R"({"x":1})"},
+        {"get_software_plugin_health", R"({"x":1})"},
+        {"list_software_collection_settings", R"({"x":1})"},
+        {"get_software_host_collection_settings", R"({"agent_id":"a1","x":1})"},
+        {"get_software_host_collection_settings", R"({"agent_id":5})"},
+    };
+    for (const auto& [tool, args] : bad) {
+        auto body = mcp_tool_call(rig.ts, tool, args);
+        INFO(tool << " " << args << " -> " << body.dump());
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    }
+    CHECK(rig.fakes.reads == 0);
+}
+
+TEST_CASE("MCP SAM-35 reads: a degraded read is a retryable error, never an empty success",
+          "[mcp][inventory][software]") {
+    // Confined, so the aggregates read the store (an unfiltered caller is served the snapshot).
+    Sam35ReadRig rig(VisibleSet{std::unordered_set<std::string>{"a1", "a2"}});
+    rig.fakes.degrade = true;
+    for (const auto& [tool, args] : std::vector<std::pair<const char*, const char*>>{
+             {"list_software_hosts", "{}"},
+             {"get_software_host", R"({"agent_id":"a1"})"},
+             {"list_software_changes", "{}"},
+             {"get_software_summary", "{}"},
+             {"get_software_plugin_health", "{}"}}) {
+        auto body = mcp_tool_call(rig.ts, tool, args);
+        INFO(tool << " -> " << body.dump());
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+        CHECK(body["error"]["data"]["retry_after_ms"] == 5000);
+    }
+}
+
+TEST_CASE("MCP SAM-35 reads: a service-scoped token is denied the settings tools at C8",
+          "[mcp][inventory][software][security][service_scope]") {
+    McpTestServer ts;
+    ts.mock_token_scope_service = "printers";
+    ts.start("readonly");
+    for (const auto& [tool, args] : std::vector<std::pair<const char*, const char*>>{
+             {"list_software_collection_settings", "{}"},
+             {"get_software_collection_settings", R"({"group_id":"aaaa11112222"})"},
+             {"set_software_collection_settings",
+              R"({"group_id":"aaaa11112222","interval_s":86400,"plugins":{"installed_apps":true}})"}}) {
+        auto body = mcp_tool_call(ts, tool, args);
+        INFO(tool << " -> " << body.dump());
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    }
+}
+
+TEST_CASE("MCP set_software_collection_settings: the readonly and operator tiers are refused "
+          "before the handler",
+          "[mcp][inventory][software][security]") {
+    for (const char* tier : {"readonly", "operator"}) {
+        INFO(tier);
+        McpTestServer ts;
+        ts.start(tier);
+        auto body = mcp_tool_call(
+            ts, "set_software_collection_settings",
+            R"({"group_id":"aaaa11112222","interval_s":86400,"plugins":{"installed_apps":true}})");
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kTierDenied);
+        CHECK(mcp_audits(ts, "software_estate.collection_settings.update|requested") == 0);
+    }
+}
+
+// ── The collection settings over real stores (Postgres) ───────────────────────
+
+namespace {
+// Same name and setup as test_software_collection_settings_routes.cpp: PgTestTemplate is keyed by
+// name, so a byte-identical setup is built once and reused across TUs.
+yuzu::test::PgTestTemplate sam35_settings_tpl{"collectionsettingsroutes", [](const std::string& dsn) {
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    yuzu::server::SoftwareCollectionSettingsStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("collection settings routes template: store failed to migrate");
+}};
+
+yuzu::test::PgTestTemplate sam35_plugincfg_tpl{"plugincfgcs", [](const std::string& dsn) {
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
+    yuzu::server::FileKeyProvider provider(keys.path);
+    yuzu::server::pg::SecretCodec codec(provider);
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    yuzu::server::PluginConfigStore store{pool, codec};
+    if (!store.is_open())
+        throw std::runtime_error("plugincfgcs template: store failed to migrate");
+}};
+
+std::string sam35_put(int interval = 86400, const std::string& expected = "none",
+                      const std::string& window = "") {
+    return R"({"interval_s":)" + std::to_string(interval) +
+           (window.empty() ? std::string{} : R"(,"window":)" + window) +
+           R"(,"priority":3,"expected_version":")" + expected +
+           R"(","plugins":{"installed_apps":true,"middleware":false,"msi_packages":true,)"
+           R"("pkg_inventory":true,"runtimes":true,"windows_optional_features":true}})";
+}
+
+// What the probe answers: 0 admits, anything else is the refusal status (403) or the outage (503).
+struct Sam35Settings {
+    yuzu::server::pg::PgPool settings_pool, mgmt_pool, plugin_pool;
+    yuzu::server::SoftwareCollectionSettingsStore store{settings_pool};
+    yuzu::server::ManagementGroupStore mgmt{mgmt_pool};
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
+    yuzu::server::FileKeyProvider provider{keys.path};
+    yuzu::server::pg::SecretCodec codec{provider};
+    yuzu::server::PluginConfigStore plugins{plugin_pool, codec};
+    std::vector<int> probe_script; // consumed per probe call; empty = admit
+    int probe_calls{0};
+    // The device-scoped Inventory:Read gate both surfaces share: it admits every device except
+    // the ids in scoped_refused, which it answers with its own 403, and records each call.
+    std::unordered_set<std::string> scoped_refused;
+    std::vector<std::string> scoped_seen; // "<securable>|<operation>|<agent_id>" per gate call
+    // The two seams a settings save must never reach, counted: the MCP send function and the
+    // hardware/software sync runner.
+    int dispatch_calls{0};
+    SyncToolRig sync;
+    std::vector<std::string> rest_audit; // "<action>|<result>" rows the REST routes stored
+    yuzu::server::SoftwareCollectionSettingsRoutes routes;
+    yuzu::server::test::TestRouteSink sink;
+    McpTestServer ts;
+    std::string group_a, group_b;
+
+    Sam35Settings(const std::string& sdsn, const std::string& mdsn, const std::string& pdsn)
+        : settings_pool(yuzu::server::pg::PgPool::Options{.conninfo = sdsn, .size = 2}),
+          mgmt_pool(yuzu::server::pg::PgPool::Options{.conninfo = mdsn, .size = 2}),
+          plugin_pool(yuzu::server::pg::PgPool::Options{.conninfo = pdsn, .size = 2}) {
+        REQUIRE(store.is_open());
+        REQUIRE(mgmt.is_open());
+        REQUIRE(plugins.is_open());
+        const auto make_group = [&](const std::string& name) {
+            yuzu::server::ManagementGroup g;
+            g.name = name;
+            g.membership_type = "static";
+            auto id = mgmt.create_group(g);
+            REQUIRE(id.has_value());
+            return *id;
+        };
+        // The server creates the root group at boot; the rig does the same, so the effective read
+        // has a baseline to resolve from.
+        yuzu::server::ManagementGroup root_group;
+        root_group.id = yuzu::server::ManagementGroupStore::kRootGroupId;
+        root_group.name = "All Devices";
+        root_group.membership_type = "dynamic";
+        root_group.scope_expression = "*";
+        REQUIRE(mgmt.create_group(root_group).has_value());
+        group_a = make_group("A");
+        group_b = make_group("B");
+
+        const auto probe = [this](const httplib::Request&, httplib::Response& res,
+                                  const std::string&, const std::string&) {
+            const int status = static_cast<std::size_t>(probe_calls) < probe_script.size()
+                                   ? probe_script[static_cast<std::size_t>(probe_calls)]
+                                   : 0;
+            ++probe_calls;
+            if (status == 0)
+                return true;
+            res.status = status;
+            res.set_content(R"({"error":{"code":)" + std::to_string(status) + "}}",
+                            "application/json");
+            return false;
+        };
+        const auto allow = [](const httplib::Request&, httplib::Response&, const std::string&,
+                              const std::string&) { return true; };
+        const auto scoped = [this](const httplib::Request&, httplib::Response& res,
+                                   const std::string& securable, const std::string& op,
+                                   const std::string& agent_id) {
+            scoped_seen.push_back(securable + "|" + op + "|" + agent_id);
+            if (!scoped_refused.contains(agent_id))
+                return true;
+            res.status = 403;
+            res.set_content(R"({"error":{"code":403}})", "application/json");
+            return false;
+        };
+        routes.register_routes(
+            sink, yuzu::server::SoftwareCollectionSettingsRoutes::Deps{
+                      .auth_fn = [](const httplib::Request&, httplib::Response&)
+                          -> std::optional<yuzu::server::auth::Session> {
+                          yuzu::server::auth::Session s;
+                          s.username = "rest-user";
+                          return s;
+                      },
+                      .perm_fn = allow,
+                      .probe_perm_fn = probe,
+                      .scoped_perm_fn = scoped,
+                      .audit_fn = [this](const httplib::Request&, const std::string& action,
+                                         const std::string& result, const std::string&,
+                                         const std::string&, const std::string&) {
+                          rest_audit.push_back(action + "|" + result);
+                          return true;
+                      },
+                      .store = &store,
+                      .mgmt_store = &mgmt,
+                      .plugin_config_store = &plugins,
+                  });
+        ts.collection_settings_stores_for_test = {&store, &mgmt, &plugins};
+        ts.collection_settings_probe_for_test = probe;
+        ts.scoped_perm_fn_for_test = scoped; // the effective read refuses without a scope gate
+        ts.software_sync_runner_for_test = sync.runner();
+    }
+
+    void start(const std::string& tier = "") {
+        ts.start_with_dispatch(
+            [this](const std::string&, const std::string&, const std::vector<std::string>&,
+                   const std::string&, const std::unordered_map<std::string, std::string>&,
+                   const std::string&, const yuzu::server::DispatchCaller&) {
+                ++dispatch_calls;
+                return yuzu::server::ConfinedDispatchOutcome{};
+            },
+            tier);
+    }
+    std::string path(const std::string& group) const {
+        return "/api/v1/inventory/software/collection-settings/" + group;
+    }
+    nlohmann::json set(const std::string& group, const std::string& body) {
+        auto args = nlohmann::json::parse(body);
+        args["group_id"] = group;
+        return mcp_tool_call(ts, "set_software_collection_settings", args.dump());
+    }
+    bool stored(const std::string& group) {
+        const auto doc = store.get(group);
+        REQUIRE(doc.has_value());
+        return doc->has_value();
+    }
+};
+} // namespace
+
+TEST_CASE("MCP SAM-35 settings: the payloads equal the REST routes' data and errors",
+          "[mcp][pg][inventory][software]") {
+    YUZU_REQUIRE_PG_DB_TPL(sdb, sam35_settings_tpl);
+    YUZU_REQUIRE_PG_DB_TPL(mdb, mcp_mgmt_tpl);
+    YUZU_REQUIRE_PG_DB_TPL(pdb, sam35_plugincfg_tpl);
+    Sam35Settings rig{sdb.dsn(), mdb.dsn(), pdb.dsn()};
+    rig.start();
+    const auto rest = [&](const std::string& method, const std::string& path,
+                          const std::string& body = {}) {
+        auto res = rig.sink.dispatch(method, path, body, "application/json");
+        REQUIRE(res != nullptr);
+        return res;
+    };
+
+    // The list: the fleet default alone, then with a document.
+    {
+        auto mcp = mcp_tool_call(rig.ts, "list_software_collection_settings", "{}");
+        REQUIRE_FALSE(mcp.contains("error"));
+        auto res = rest("GET", "/api/v1/inventory/software/collection-settings");
+        CHECK(mcp["result"]["structuredContent"] == nlohmann::json::parse(res->body)["data"]);
+        CHECK(mcp["result"]["structuredContent"]["documents"].empty());
+    }
+
+    // set creates the document; the REST GET shows exactly what the tool returned.
+    auto created = rig.set(rig.group_a, sam35_put());
+    INFO(created.dump());
+    REQUIRE_FALSE(created.contains("error"));
+    auto doc = created["result"]["structuredContent"];
+    CHECK(doc["previous_version"].is_null());
+    CHECK(doc["updated_by"] == "test-user"); // the session, never a caller-supplied name
+    CHECK(rig.stored(rig.group_a));
+    const auto rest_doc = nlohmann::json::parse(rest("GET", rig.path(rig.group_a))->body)["data"];
+    doc.erase("previous_version");
+    CHECK(doc == rest_doc);
+    {
+        auto mcp = mcp_tool_call(rig.ts, "get_software_collection_settings",
+                                 R"({"group_id":")" + rig.group_a + R"("})");
+        REQUIRE_FALSE(mcp.contains("error"));
+        CHECK(mcp["result"]["structuredContent"] == rest_doc);
+    }
+    {
+        auto mcp = mcp_tool_call(rig.ts, "list_software_collection_settings", "{}");
+        auto res = rest("GET", "/api/v1/inventory/software/collection-settings");
+        CHECK(mcp["result"]["structuredContent"] == nlohmann::json::parse(res->body)["data"]);
+        CHECK(mcp["result"]["structuredContent"]["documents"].size() == 1);
+    }
+
+    // The effective settings of a device: the same body, the kill-switch list included.
+    {
+        auto mcp = mcp_tool_call(rig.ts, "get_software_host_collection_settings",
+                                 R"({"agent_id":"agent-1"})");
+        auto res = rest("GET", "/api/v1/inventory/software/hosts/agent-1/collection-settings");
+        REQUIRE(res->status == 200);
+        REQUIRE_FALSE(mcp.contains("error"));
+        CHECK(mcp["result"]["structuredContent"] == nlohmann::json::parse(res->body)["data"]);
+    }
+
+    // A stale expected_version: the refusal carries the stored document, as REST's error.current.
+    {
+        auto mcp = rig.set(rig.group_a, sam35_put(86400, "none"));
+        REQUIRE(mcp.contains("error"));
+        auto res = rest("PUT", rig.path(rig.group_a), sam35_put(86400, "none"));
+        CHECK(res->status == 409);
+        const auto rest_err = nlohmann::json::parse(res->body)["error"];
+        CHECK(mcp["error"]["message"] == rest_err["message"]);
+        CHECK(mcp["error"]["data"]["current"] == rest_err["current"]);
+        CHECK(mcp["error"]["data"]["current"]["version"] == rest_doc["version"]);
+    }
+
+    // The REST text for an invalid combination, a bad zone and an unknown field.
+    for (const auto& body :
+         {sam35_put(3600, "none", R"({"start_min":60,"end_min":120})"), // window needs whole days
+          std::string(R"({"interval_s":86400,"plugins":{"installed_apps":true},"bogus":1})"),
+          std::string(R"({"interval_s":"x","plugins":{"installed_apps":true}})")}) {
+        auto mcp = rig.set(rig.group_b, body);
+        auto res = rest("PUT", rig.path(rig.group_b), body);
+        INFO(body << " -> " << mcp.dump() << " | " << res->body);
+        CHECK(res->status == 400);
+        REQUIRE(mcp.contains("error"));
+        CHECK(mcp["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(mcp["error"]["message"] == nlohmann::json::parse(res->body)["error"]["message"]);
+    }
+    CHECK_FALSE(rig.stored(rig.group_b));
+
+    // An unknown group and a group with no document are different not-found answers.
+    {
+        auto unknown = mcp_tool_call(rig.ts, "get_software_collection_settings",
+                                     R"({"group_id":"ffffffffffff"})");
+        auto no_doc = mcp_tool_call(rig.ts, "get_software_collection_settings",
+                                    R"({"group_id":")" + rig.group_b + R"("})");
+        REQUIRE(unknown.contains("error"));
+        REQUIRE(no_doc.contains("error"));
+        CHECK(unknown["error"]["message"] ==
+              nlohmann::json::parse(rest("GET", rig.path("ffffffffffff"))->body)["error"]["message"]);
+        CHECK(no_doc["error"]["message"] ==
+              nlohmann::json::parse(rest("GET", rig.path(rig.group_b))->body)["error"]["message"]);
+        CHECK(unknown["error"]["message"] != no_doc["error"]["message"]);
+    }
+
+    // Strict input: a bad group id, a missing one and an unknown key are kInvalidParams, and
+    // nothing is written.
+    for (const auto& [tool, args] : std::vector<std::pair<const char*, std::string>>{
+             {"get_software_collection_settings", R"({"group_id":"NOT-HEX"})"},
+             {"get_software_collection_settings", "{}"},
+             {"get_software_collection_settings", R"({"group_id":5})"},
+             {"get_software_collection_settings",
+              R"({"group_id":")" + rig.group_a + R"(","extra":1})"},
+             {"set_software_collection_settings",
+              R"({"group_id":"NOT-HEX","interval_s":86400,"plugins":{"installed_apps":true}})"},
+             {"set_software_collection_settings",
+              R"({"interval_s":86400,"plugins":{"installed_apps":true}})"}}) {
+        auto body = mcp_tool_call(rig.ts, tool, args);
+        INFO(tool << " " << args << " -> " << body.dump());
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    }
+    CHECK_FALSE(rig.stored(rig.group_b));
+
+    // Saving never dispatches: the send function and the sync runner are both wired and counting,
+    // and the successful set above reached neither.
+    CHECK(rig.dispatch_calls == 0);
+    CHECK(rig.sync.dispatches == 0);
+}
+
+TEST_CASE("MCP set_software_collection_settings: the requested row precedes the store call and a "
+          "lost row refuses the write",
+          "[mcp][pg][inventory][software][audit]") {
+    YUZU_REQUIRE_PG_DB_TPL(sdb, sam35_settings_tpl);
+    YUZU_REQUIRE_PG_DB_TPL(mdb, mcp_mgmt_tpl);
+    YUZU_REQUIRE_PG_DB_TPL(pdb, sam35_plugincfg_tpl);
+    Sam35Settings rig{sdb.dsn(), mdb.dsn(), pdb.dsn()};
+    rig.ts.audit_fail_action_result_ = "software_estate.collection_settings.update|requested";
+    rig.start();
+
+    // The requested row cannot be stored: retryable, and NOTHING was written.
+    auto refused = rig.set(rig.group_a, sam35_put());
+    REQUIRE(refused.contains("error"));
+    CHECK(refused["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(refused["error"]["data"]["retry_after_ms"] == 5000);
+    CHECK_FALSE(rig.stored(rig.group_a));
+    CHECK(mcp_audits(rig.ts, "software_estate.collection_settings.update|success") == 0);
+
+    // With the audit store healthy the sequence is requested -> success, then the generic row.
+    rig.ts.audit_fail_action_result_.clear();
+    auto ok = rig.set(rig.group_a, sam35_put());
+    REQUIRE_FALSE(ok.contains("error"));
+    CHECK(rig.stored(rig.group_a));
+    const auto& log = rig.ts.audit_log;
+    const auto at = [&](const std::string& entry) {
+        return std::ranges::find(log, entry) - log.begin();
+    };
+    CHECK(at("software_estate.collection_settings.update|requested") <
+          at("software_estate.collection_settings.update|success"));
+    CHECK(mcp_audits(rig.ts, "mcp.set_software_collection_settings|success") == 1);
+    // The audit target is the group, with ManagementGroup as its type.
+    CHECK(std::ranges::find(rig.ts.audit_target_types, "ManagementGroup") !=
+          rig.ts.audit_target_types.end());
+    CHECK(std::ranges::find(rig.ts.audit_target_ids, rig.group_a) != rig.ts.audit_target_ids.end());
+}
+
+TEST_CASE("MCP software collection settings: the authority mapping matches REST (403 vs 503), "
+          "and the write grant is re-checked ahead of the write",
+          "[mcp][pg][inventory][software][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(sdb, sam35_settings_tpl);
+    YUZU_REQUIRE_PG_DB_TPL(mdb, mcp_mgmt_tpl);
+    YUZU_REQUIRE_PG_DB_TPL(pdb, sam35_plugincfg_tpl);
+    Sam35Settings rig{sdb.dsn(), mdb.dsn(), pdb.dsn()};
+    rig.start();
+    const std::string get_args = R"({"group_id":")" + rig.group_a + R"("})";
+
+    // A refused read: a denied row and kPermissionDenied (REST: 403).
+    rig.probe_script = {403};
+    rig.probe_calls = 0;
+    auto denied = mcp_tool_call(rig.ts, "get_software_collection_settings", get_args);
+    REQUIRE(denied.contains("error"));
+    CHECK(denied["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    CHECK(mcp_audits(rig.ts, "software_estate.collection_settings.read|denied") == 1);
+
+    // An RBAC read that cannot be completed: retryable, never a refusal (REST: 503).
+    rig.probe_script = {503};
+    rig.probe_calls = 0;
+    auto outage = mcp_tool_call(rig.ts, "get_software_collection_settings", get_args);
+    REQUIRE(outage.contains("error"));
+    CHECK(outage["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(outage["error"]["data"]["retry_after_ms"] == 5000);
+    CHECK(mcp_audits(rig.ts, "software_estate.collection_settings.read|denied") == 1);
+
+    // A write refused at the first check leaves a denied row and no requested row.
+    rig.probe_script = {403};
+    rig.probe_calls = 0;
+    auto no_grant = rig.set(rig.group_a, sam35_put());
+    REQUIRE(no_grant.contains("error"));
+    CHECK(no_grant["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    CHECK(mcp_audits(rig.ts, "software_estate.collection_settings.update|denied") == 1);
+    CHECK(mcp_audits(rig.ts, "software_estate.collection_settings.update|requested") == 0);
+    CHECK_FALSE(rig.stored(rig.group_a));
+
+    // The grant is withdrawn between the first check and the write: the requested row exists, the
+    // write does not happen, and the outcome row says why.
+    rig.probe_script = {0, 403};
+    rig.probe_calls = 0;
+    auto withdrawn = rig.set(rig.group_a, sam35_put());
+    REQUIRE(withdrawn.contains("error"));
+    CHECK(withdrawn["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    CHECK(rig.probe_calls == 2);
+    CHECK(mcp_audits(rig.ts, "software_estate.collection_settings.update|requested") == 1);
+    CHECK(mcp_audits(rig.ts, "software_estate.collection_settings.update|denied") == 2);
+    CHECK_FALSE(rig.stored(rig.group_a));
+
+    // The list takes the shared deny-on-degrade gate: ManagementGroup:Read refusal is the 403.
+    rig.ts.perm_override_for_test = [](const std::string& securable, const std::string& op) {
+        return !(securable == "ManagementGroup" && op == "Read");
+    };
+    auto listed = rig.ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":9,)"
+                              R"("params":{"name":"list_software_collection_settings",)"
+                              R"("arguments":{}}})");
+    REQUIRE(listed != nullptr);
+    CHECK(listed->status == 403);
+}
+
+TEST_CASE("MCP get_software_host_collection_settings: the device-scoped Inventory:Read gate "
+          "refuses an out-of-scope device with its own 403, as REST does, and admits an in-scope one",
+          "[mcp][pg][inventory][software][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(sdb, sam35_settings_tpl);
+    YUZU_REQUIRE_PG_DB_TPL(mdb, mcp_mgmt_tpl);
+    YUZU_REQUIRE_PG_DB_TPL(pdb, sam35_plugincfg_tpl);
+    Sam35Settings rig{sdb.dsn(), mdb.dsn(), pdb.dsn()};
+    rig.start();
+    rig.scoped_refused = {"agent-out"};
+    const auto mcp = [&](const std::string& agent_id) {
+        return rig.ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":9,"params":)"
+                           R"({"name":"get_software_host_collection_settings",)"
+                           R"("arguments":{"agent_id":")" +
+                           agent_id + R"("}}})");
+    };
+    const auto rest = [&](const std::string& agent_id) {
+        return rig.sink.dispatch("GET",
+                                 "/api/v1/inventory/software/hosts/" + agent_id +
+                                     "/collection-settings",
+                                 {}, "application/json");
+    };
+
+    // Out of scope: the gate's 403 on both surfaces, no success row, nothing read for the caller.
+    const auto denied_mcp = mcp("agent-out");
+    const auto denied_rest = rest("agent-out");
+    REQUIRE(denied_mcp != nullptr);
+    REQUIRE(denied_rest != nullptr);
+    CHECK(denied_mcp->status == 403);
+    CHECK(denied_rest->status == 403);
+    CHECK(denied_mcp->body.find("\"result\"") == std::string::npos);
+    CHECK(mcp_audits(rig.ts, "mcp.get_software_host_collection_settings|success") == 0);
+    CHECK(mcp_audits(rig.ts, "mcp.get_software_host_collection_settings|failure") == 0);
+
+    // In scope: the same gate admits, and both surfaces answer.
+    const auto allowed_mcp = mcp("agent-in");
+    const auto allowed_rest = rest("agent-in");
+    REQUIRE(allowed_mcp != nullptr);
+    REQUIRE(allowed_rest != nullptr);
+    CHECK(allowed_mcp->status == 200);
+    CHECK(nlohmann::json::parse(allowed_mcp->body).contains("result"));
+    CHECK(allowed_rest->status == 200);
+    CHECK(mcp_audits(rig.ts, "mcp.get_software_host_collection_settings|success") == 1);
+
+    // The gate saw Inventory / Read / the requested device, once per surface per call.
+    CHECK(rig.scoped_seen == std::vector<std::string>{"Inventory|Read|agent-out",
+                                                       "Inventory|Read|agent-out",
+                                                       "Inventory|Read|agent-in",
+                                                       "Inventory|Read|agent-in"});
+}
+
+TEST_CASE("MCP set_software_collection_settings: the supervised tier mints an approval ticket and "
+          "writes nothing",
+          "[mcp][pg][inventory][software][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(sdb, sam35_settings_tpl);
+    YUZU_REQUIRE_PG_DB_TPL(mdb, mcp_mgmt_tpl);
+    YUZU_REQUIRE_PG_DB_TPL(pdb, sam35_plugincfg_tpl);
+    Sam35Settings rig{sdb.dsn(), mdb.dsn(), pdb.dsn()};
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    rig.ts.approval_manager_for_test = &*appr_bundle;
+    rig.start("supervised");
+    auto minted = rig.set(rig.group_a, sam35_put());
+    REQUIRE(minted.contains("error"));
+    CHECK(minted["error"]["code"] == yuzu::server::mcp::kApprovalRequired);
+    CHECK_FALSE(rig.stored(rig.group_a));
+    CHECK(mcp_audits(rig.ts, "software_estate.collection_settings.update|requested") == 0);
 }

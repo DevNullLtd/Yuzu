@@ -7,20 +7,20 @@
 /// WHY A HEADER OF ITS OWN: the route is a one-click multi-device side effect, so every
 /// rule that bounds it lives here, where a fixture vector can reach it without a process,
 /// a clock, a registry or a store: how a request body selects its targets, who may name
-/// the whole fleet, how a resolved candidate list partitions into reachable / offline /
-/// too-old, the 500-target cap, the per-operator cooldown, the audit wording and the
-/// response summary. `Runner` sequences them (resolve, decide, audit, dispatch) and the surfaces
+/// the whole fleet and what a group or fleet run must confirm, how a resolved candidate list
+/// partitions into reachable / offline / too-old / recently-synced, the run key that decides
+/// which requests share one run, the cooldown rule, the audit wording and the response summary.
+/// `Runner` sequences them (resolve, filter, partition, admit, audit, dispatch) and the surfaces
 /// (`hardware_routes.cpp`, the MCP tool) map each outcome to a status or error code.
 ///
-/// The agent ignores `stagger_seconds` for `__sync__.now`, so the server is the only thing
-/// standing between one click and a thundering herd — hence the hard cap, the cooldown and
-/// the single in-flight run. ponytail: hard cap; ADR-3007 wants a paced, unbounded run,
-/// tracked as a follow-up rather than built here.
+/// There is no ceiling on the number of devices a run may name. What bounds the herd is the
+/// pacing rule (software_sync_pacing.hpp: the run asks the fleet to report inside a spread
+/// window, under one per-process budget), the confirmation a whole group or the whole fleet must
+/// carry, the fleet-administrator gate on the whole fleet, and one run per key at a time.
 ///
-/// The cooldown stamps and the in-flight lease live in `software_sync::Runner` (software_sync_runner.hpp),
-/// so both are per server PROCESS, not cluster-wide: under active-active each replica can run one
-/// fan-out at a time and keeps its own per-operator cooldown. Every run is still bounded by the
-/// 500-target cap, so replicas multiply the ceiling by their number, not without limit.
+/// The cooldown stamps and the live runs live in `software_sync::Runner` (software_sync_runner.hpp),
+/// so they are per server PROCESS, not cluster-wide: under active-active each replica paces and
+/// de-duplicates on its own, and a restart forgets them (agents keep the delays they already armed).
 ///
 /// Nothing here authorises anything. Execution:Execute is checked by the route; targets
 /// arrive already intersected with the caller's Execution:Execute visible set by
@@ -29,6 +29,7 @@
 
 #include "authz_model.hpp"           // authz::VisibleSet, authz::filter_to_scope (std-only header)
 #include "dispatch_target_shape.hpp" // DispatchArm, classify_dispatch_arm, kBroadcastScope
+#include "mcp_policy.hpp"            // mcp::tier_allows (std-only header)
 
 #include <yuzu/log_token.hpp>
 
@@ -39,6 +40,7 @@
 #include <cstdint>
 #include <expected>
 #include <functional>
+#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -48,13 +50,15 @@
 
 namespace yuzu::server::software_sync {
 
-/// Hard ceiling on devices reached by one request (counted AFTER the offline/version
-/// partition — the cap bounds what is dispatched, not what is merely named).
-inline constexpr std::size_t kMaxTargets = 500;
-/// Per-operator gap between two multi-device runs.
-inline constexpr std::int64_t kCooldownSecs = 60;
-/// Bound on the per-operator cooldown map (oldest stamp evicted past it).
+/// Default gap between two runs of one run key (`--inventory-sync-cooldown`, in seconds), and the
+/// largest value that flag accepts (0 turns the gap off).
+inline constexpr std::int64_t kDefaultCooldownSecs = 600;
+inline constexpr std::int64_t kMaxCooldownSecs = 86'400;
+/// Bound on the per-key run-state map (expired entries are evicted first).
 inline constexpr std::size_t kCooldownStateCap = 1024;
+/// The execution definition the tracker rows of a sync run carry; the status route serves only
+/// rows with this value.
+inline constexpr std::string_view kSyncDefinitionId = "__sync__.now";
 /// Same ceiling as `auth::kMaxAgentIdLength` (hardware_routes.cpp static_asserts the match).
 inline constexpr std::size_t kMaxIdLen = 256;
 /// A scope DSL expression is a few atoms; the 4 KiB body cap is the outer bound.
@@ -72,6 +76,11 @@ inline constexpr std::size_t kAuditTokenMax = 128;
 struct Selector {
     DispatchArm arm{DispatchArm::None};
     std::string expr;
+    /// `"confirm": true` in the body. A whole group or the whole fleet is refused without it.
+    bool confirm{false};
+    /// `"last_synced_before"`: epoch seconds. Only devices whose last accepted installed-software
+    /// report is OLDER than this are asked (a device that never reported counts as older).
+    std::optional<std::int64_t> last_synced_before{};
 };
 
 [[nodiscard]] inline bool token_ok(std::string_view s, std::size_t max_len) {
@@ -92,6 +101,11 @@ struct Selector {
 /// `check_targeting_shape`: the executed set must be the requested set, never a
 /// precedence outcome), and naming neither is refused rather than read as "everyone".
 /// A present-but-non-string field is a 400, never a throw out of the JSON library.
+///
+/// `confirm` is a JSON boolean (anything else is a 400, never coerced: `"true"` and `1` do not
+/// confirm) and `last_synced_before` a non-negative integer of epoch seconds (a float, a string,
+/// a negative number or a value past int64 is a 400). Neither selects anything; whether `confirm`
+/// is needed is `confirmation_required`'s rule, applied by the Runner.
 [[nodiscard]] inline std::expected<Selector, std::string> parse_request(const nlohmann::json& body) {
     if (!body.is_object())
         return std::unexpected("body must be a JSON object");
@@ -101,6 +115,31 @@ struct Selector {
             return std::unexpected("source must be a string");
         if (it->get_ref<const std::string&>() != kSource)
             return std::unexpected("source must be installed_software");
+    }
+
+    bool confirm = false;
+    if (const auto it = body.find("confirm"); it != body.end()) {
+        if (!it->is_boolean())
+            return std::unexpected("confirm must be a JSON boolean");
+        confirm = it->get<bool>();
+    }
+    std::optional<std::int64_t> synced_before;
+    if (const auto it = body.find("last_synced_before"); it != body.end()) {
+        constexpr const char* kBadBefore =
+            "last_synced_before must be a non-negative integer (epoch seconds)";
+        if (!it->is_number_integer())
+            return std::unexpected(kBadBefore);
+        if (it->is_number_unsigned()) {
+            const auto v = it->get<std::uint64_t>();
+            if (v > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()))
+                return std::unexpected(kBadBefore);
+            synced_before = static_cast<std::int64_t>(v);
+        } else {
+            const auto v = it->get<std::int64_t>();
+            if (v < 0)
+                return std::unexpected(kBadBefore);
+            synced_before = v;
+        }
     }
 
     const auto field = [&](const char* key) -> std::expected<std::optional<std::string>, std::string> {
@@ -132,7 +171,8 @@ struct Selector {
                                    "characters");
         // classify_dispatch_arm is the one place the arm vocabulary is decided; an
         // expression of `__all__` or `group:<id>` lands on the same arm as via `scope`.
-        sel = {classify_dispatch_arm(false, e), e};
+        sel.arm = classify_dispatch_arm(false, e);
+        sel.expr = e;
     } else {
         const std::string& s = **scope;
         if (!token_ok(s, kMaxIdLen))
@@ -140,12 +180,15 @@ struct Selector {
         const DispatchArm arm = s == kBroadcastScope               ? DispatchArm::Broadcast
                                 : s.starts_with(kGroupScopePrefix) ? DispatchArm::Group
                                                                    : DispatchArm::Ids; // a bare agent id
-        sel = {arm, s};
+        sel.arm = arm;
+        sel.expr = s;
     }
     // Either spelling of a group must name one: `group:` alone would reach the store with an
     // empty id.
     if (sel.arm == DispatchArm::Group && sel.expr.size() == kGroupScopePrefix.size())
         return std::unexpected("group scope needs an id: group:<id>");
+    sel.confirm = confirm;
+    sel.last_synced_before = synced_before;
     return sel;
 }
 
@@ -185,15 +228,104 @@ struct Selector {
     return "none";
 }
 
-/// A single named device needs neither the cooldown nor the in-flight guard — there is no
-/// herd. Group, scope and fleet runs take both.
+/// A single named device needs no run key, cooldown, pacing or live-send count — there is no
+/// herd. Group, scope and fleet runs take all of them.
 [[nodiscard]] inline bool needs_run_guard(DispatchArm arm) { return arm != DispatchArm::Ids; }
 
-/// Only a caller whose Execution:Execute is unfiltered may name the whole fleet. A
-/// confined caller asking for `__all__` is refused outright rather than silently narrowed
-/// to their own devices: the request they made is not the request that would run.
-[[nodiscard]] inline bool fleet_wide_denied(DispatchArm arm, bool caller_unfiltered) {
-    return arm == DispatchArm::Broadcast && !caller_unfiltered;
+/// Only a fleet administrator may name the whole fleet: a caller whose Execution:Execute is
+/// unfiltered AND who holds the global ManagementGroup:Write grant (the same people who may
+/// change collection settings for the whole fleet). Anyone else asking for `__all__` is refused
+/// outright rather than silently narrowed to their own devices: the request they made is not the
+/// request that would run. `fleet_admin` is the Runner's answer for the session (an answer that
+/// could not be determined is `false`).
+/// This is a rule about NAMING the fleet, not a limit on reach (owner ruling 2026-11-16): a scope
+/// expression is the caller's own targeting inside their visible set and takes neither this rule
+/// nor the confirmation, even when it matches every device they can see. What bounds the load of
+/// every arm alike is the pacing budget.
+[[nodiscard]] inline bool fleet_wide_denied(DispatchArm arm, bool caller_unfiltered, bool fleet_admin) {
+    return arm == DispatchArm::Broadcast && !(caller_unfiltered && fleet_admin);
+}
+
+/// What `fleet_admin_answer` needs to know about a session. The three grants are callables so the
+/// store is read only when the gate's order reaches that branch; an unset callable denies.
+struct FleetAdminFacts {
+    bool service_scoped = false;
+    bool elevated = false;
+    bool engine = false;
+    std::string_view mcp_tier; ///< "" when the session is not an MCP token
+    /// ManagementGroup:Write for an engine principal (an undeterminable read is false).
+    std::function<bool()> engine_grant;
+    /// ManagementGroup:Write by RBAC; nullopt while RBAC enforcement is off (an undeterminable read
+    /// is false).
+    std::function<std::optional<bool>()> rbac_grant;
+    bool legacy_admin = false; ///< the legacy rule: the administrator role
+};
+
+/// ManagementGroup:Write as a GLOBAL grant, decided from a session alone: the answer
+/// `require_permission` gives, in its order (elevation, engine principal, MCP tier, RBAC, legacy
+/// role), with a service-scoped token never fleet-wide. The MCP tier precedes RBAC, so a token of a
+/// tier that does not allow the write (the operator tier does not) is refused whatever its creator
+/// holds. Anything that cannot be determined is false.
+[[nodiscard]] inline bool fleet_admin_answer(const FleetAdminFacts& f) {
+    if (f.service_scoped)
+        return false;
+    if (f.elevated)
+        return true;
+    if (f.engine)
+        return f.engine_grant && f.engine_grant();
+    if (!f.mcp_tier.empty() && !mcp::tier_allows(f.mcp_tier, "ManagementGroup", "Write"))
+        return false;
+    if (f.rbac_grant)
+        if (const auto granted = f.rbac_grant())
+            return *granted;
+    return f.legacy_admin;
+}
+
+/// A whole group or the whole fleet is one click for a very large number of devices, so it must
+/// say so: the body carries `"confirm": true`. A single device and a scope expression never need
+/// it. Evaluated after `fleet_wide_denied`, so a caller who may not name the fleet at all is told
+/// 403, not asked to confirm.
+[[nodiscard]] inline bool confirmation_required(DispatchArm arm, bool confirm) {
+    return (arm == DispatchArm::Group || arm == DispatchArm::Broadcast) && !confirm;
+}
+
+/// Which requests share one run. A request that finds a run of its key still spreading JOINS it
+/// (the same answer, nothing sent), so the key must separate every pair of callers who could be
+/// handed a different device set or have a different right to its counts:
+///   - `fleet` — only an administrator names the fleet, and every administrator sees the same one;
+///   - `group:<id>` — for a caller whose Execution:Execute is unfiltered (they all see the whole
+///     group). A confined caller's resolved set is only the group's members they may see, so
+///     their key adds the username (`group:<id>` + 0x1f + username): they never join another
+///     caller's run and never receive its counts, only their own earlier request's;
+///   - `scope:<username>` + 0x1f + the full expression — an expression resolves per caller (a
+///     result-set reference is owner-scoped), so it is keyed by requester and by the exact text,
+///     never hashed, so two different expressions can never share a run.
+/// (Both usernames and expressions are bounded, so a key is a few KiB at most.) A single device has
+/// no run; its key is only a label.
+[[nodiscard]] inline std::string run_key(const Selector& sel, std::string_view username,
+                                         bool caller_unfiltered) {
+    constexpr char kSep = '\x1f';
+    switch (sel.arm) {
+    case DispatchArm::Broadcast: return "fleet";
+    case DispatchArm::Group:
+        return caller_unfiltered ? sel.expr : sel.expr + kSep + std::string(username);
+    case DispatchArm::Scope: return "scope:" + std::string(username) + kSep + sel.expr;
+    case DispatchArm::Ids: return "device:" + sel.expr;
+    case DispatchArm::None: break;
+    }
+    return "none";
+}
+
+/// Does a run already spreading cover a new request? `running_before` is the running run's
+/// `last_synced_before` and `requested_before` the new request's (nullopt = no filter, i.e. every
+/// device). A run with no filter covered every device; one with a filter covered the devices
+/// older than it, which includes everything a request with the same or an older filter wants.
+/// A wider request (a later or no filter) over a filtered run is NOT covered.
+[[nodiscard]] inline bool join_covers(std::optional<std::int64_t> running_before,
+                                      std::optional<std::int64_t> requested_before) {
+    if (!running_before)
+        return true;
+    return requested_before && *requested_before <= *running_before;
 }
 
 // ── resolution (the shapes server.cpp's resolver and dispatcher return) ───────────
@@ -255,9 +387,10 @@ struct Expansion {
             out.detail = "unwired";
             return out;
         }
-        // Only an unfiltered caller may name the fleet (`decide` refuses everyone else), so a
-        // confined caller's answer is empty and the fleet is not read at all.
-        if (fleet_wide_denied(sel.arm, out.caller_unfiltered)) {
+        // Only an unfiltered caller may name the fleet (the Runner has already refused every
+        // non-administrator before any read), so a confined caller's answer is empty and the
+        // fleet is not read at all. The administrator half is the Runner's; it is not known here.
+        if (fleet_wide_denied(sel.arm, out.caller_unfiltered, /*fleet_admin=*/true)) {
             out.status = Resolved::Status::Ok;
             return out;
         }
@@ -339,6 +472,8 @@ template <class MintId, class Prepare, class SendOne>
 // ── partition ─────────────────────────────────────────────────────────────────────
 
 struct Counts {
+    /// Every candidate the resolver named (`requested` = reached + skipped_offline +
+    /// skipped_version + skipped_fresh at the time of the plan).
     std::size_t requested{0};
     std::size_t reached{0};
     /// Candidates this server process did not reach and that are not too old: no live session
@@ -353,23 +488,47 @@ struct Counts {
     /// not a census of the fleet.
     std::size_t skipped_offline{0};
     std::size_t skipped_version{0};
+    /// Candidates left out because their last accepted report is not older than the request's
+    /// `last_synced_before`. Counted before the offline and version split, so a recently synced
+    /// device that is also offline is counted here only.
+    std::size_t skipped_fresh{0};
 };
 
 struct Plan {
     std::vector<std::string> targets; // the live, new-enough subset, in input order
     Counts counts;
-    /// The walk stopped because a reachable target past `kMaxTargets` was found: `counts` is
-    /// then partial (the answer is 413 whatever the rest holds).
-    bool over_cap{false};
 };
+
+/// The candidates a `last_synced_before` request still wants, and how many it dropped.
+struct FreshSplit {
+    std::vector<std::string> stale; // in input order
+    std::size_t fresh{0};
+};
+
+/// Drop the devices whose last accepted report is NOT older than `before`. `last_seen` maps a
+/// device to the server-receipt epoch seconds of its last accepted report; a device with no entry
+/// has never reported and counts as older (it is asked). Pure: the store read is the Runner's.
+[[nodiscard]] inline FreshSplit split_fresh(const std::vector<std::string>& ids,
+                                            const std::unordered_map<std::string, std::int64_t>& last_seen,
+                                            std::int64_t before) {
+    FreshSplit out;
+    out.stale.reserve(ids.size());
+    for (const auto& id : ids) {
+        const auto it = last_seen.find(id);
+        if (it != last_seen.end() && it->second >= before)
+            ++out.fresh;
+        else
+            out.stale.push_back(id);
+    }
+    return out;
+}
 
 /// Split ids into targets / offline / too-old. `version_of(id)` is the agent version of a
 /// session on THIS process or nullopt (a device attached to another replica looks the same as a
 /// disconnected one, and is counted with it - see `Counts::skipped_offline`); `supports(version)`
 /// is the sync-now version floor (`agent_supports_sync_now`: 0.13.1+), and an unparseable version
-/// fails it, so it counts as too old, never as reachable. The walk stops at the first reachable
-/// target past `kMaxTargets` (`Plan::over_cap`), so an `__all__` over a huge fleet costs at most
-/// `kMaxTargets + 1` session lookups plus the offline ones, not one lookup per device.
+/// fails it, so it counts as too old, never as reachable. There is no ceiling on the number of
+/// targets: the run is paced, not refused (software_sync_pacing.hpp).
 template <class VersionFn, class SupportsFn>
 [[nodiscard]] Plan partition(const std::vector<std::string>& ids, VersionFn&& version_of,
                              SupportsFn&& supports) {
@@ -377,17 +536,12 @@ template <class VersionFn, class SupportsFn>
     p.counts.requested = ids.size();
     for (const auto& id : ids) {
         const std::optional<std::string> version = version_of(id);
-        if (!version) {
+        if (!version)
             ++p.counts.skipped_offline;
-        } else if (!supports(std::string_view(*version))) {
+        else if (!supports(std::string_view(*version)))
             ++p.counts.skipped_version;
-        } else {
+        else
             p.targets.push_back(id);
-            if (p.targets.size() > kMaxTargets) {
-                p.over_cap = true;
-                break;
-            }
-        }
     }
     p.counts.reached = p.targets.size();
     return p;
@@ -403,63 +557,35 @@ template <class VersionFn, class SupportsFn>
     return planned;
 }
 
-// ── verdicts ──────────────────────────────────────────────────────────────────────
-
-enum class Verdict { Proceed, FleetWideRequired, TooMany };
-
-[[nodiscard]] inline Verdict decide(DispatchArm arm, bool caller_unfiltered, const Counts& planned) {
-    if (fleet_wide_denied(arm, caller_unfiltered))
-        return Verdict::FleetWideRequired;
-    if (planned.reached > kMaxTargets)
-        return Verdict::TooMany;
-    return Verdict::Proceed;
-}
-
 // ── cooldown ──────────────────────────────────────────────────────────────────────
 
-/// Seconds the operator still has to wait (0 = clear). A stamp from the FUTURE (the clock
-/// stepped backwards since the run) is stale, not a lock-out: it would otherwise hold the
-/// operator for the size of the step plus 60 s. The next run overwrites it (`stamp`).
-[[nodiscard]] inline std::int64_t cooldown_remaining(std::optional<std::int64_t> last_run, std::int64_t now) {
-    if (!last_run)
+/// Seconds a run key still has to wait (0 = clear), `cooldown_secs` after its last run started
+/// (0 turns the gap off). A stamp from the FUTURE (the clock stepped backwards since the run) is
+/// stale, not a lock-out: it would otherwise hold the key for the size of the step plus the gap.
+/// The next run replaces it.
+[[nodiscard]] inline std::int64_t cooldown_remaining(std::optional<std::int64_t> last_run, std::int64_t now,
+                                                     std::int64_t cooldown_secs) {
+    if (!last_run || cooldown_secs <= 0)
         return 0;
     const std::int64_t elapsed = now - *last_run;
     if (elapsed < 0)
         return 0;
-    return elapsed >= kCooldownSecs ? 0 : kCooldownSecs - elapsed;
-}
-
-[[nodiscard]] inline std::optional<std::int64_t>
-last_run_of(const std::unordered_map<std::string, std::int64_t>& state, const std::string& user) {
-    const auto it = state.find(user);
-    return it == state.end() ? std::nullopt : std::optional<std::int64_t>(it->second);
-}
-
-/// Record a run, keeping the map bounded: past the cap the oldest stamp is dropped (an
-/// operator who falls off simply regains an early run — the in-flight guard and the 500
-/// cap still hold).
-inline void stamp(std::unordered_map<std::string, std::int64_t>& state, const std::string& user,
-                  std::int64_t now) {
-    if (state.size() >= kCooldownStateCap && !state.contains(user)) {
-        auto oldest = state.begin();
-        for (auto it = state.begin(); it != state.end(); ++it)
-            if (it->second < oldest->second)
-                oldest = it;
-        state.erase(oldest);
-    }
-    state[user] = now;
+    return elapsed >= cooldown_secs ? 0 : cooldown_secs - elapsed;
 }
 
 // ── wording ───────────────────────────────────────────────────────────────────────
 
-/// The pre-dispatch audit `detail`: scope, arm and the four counts. `reached` here is the
+/// The pre-dispatch audit `detail`: scope, arm, the counts and the spread. `reached` here is the
 /// PLAN (devices the run will send to); the 202's `agents_reached` is what was accepted.
-[[nodiscard]] inline std::string audit_detail(const Selector& sel, const Counts& c) {
+/// `delay_max_s` is the spread window the run was admitted with (0 = immediate).
+[[nodiscard]] inline std::string audit_detail(const Selector& sel, const Counts& c, std::int64_t delay_max_s) {
     return "scope=" + audit_token(sel.expr) + " arm=" + std::string(dispatch_arm_label(sel.arm)) +
            " requested=" + std::to_string(c.requested) +
            " reached=" + std::to_string(c.reached) +
            " skipped_offline=" + std::to_string(c.skipped_offline) +
-           " skipped_version=" + std::to_string(c.skipped_version);
+           " skipped_version=" + std::to_string(c.skipped_version) +
+           " skipped_fresh=" + std::to_string(c.skipped_fresh) +
+           " delay_max_s=" + std::to_string(delay_max_s);
 }
 
 /// "requested" when something will be sent, "no_agents" when nothing can be (the same two
@@ -469,16 +595,27 @@ inline void stamp(std::unordered_map<std::string, std::int64_t>& state, const st
 }
 
 /// The 202 `data` object. Counts only — never a per-device list — so the body cannot
-/// disclose which devices were matched, skipped or hidden.
+/// disclose which devices were matched, skipped or hidden. `execution_id` is null when the run
+/// could not be tracked. `estimated_completion_at` is `requested_at + delay_max_s`: an ESTIMATE of
+/// when the last device the run asked will have fired (a device whose own scheduled sync is due
+/// sooner reports sooner), not a promise that every report is stored by then. `joined` is false
+/// here; the Runner sets it on the answer a joining request receives.
 [[nodiscard]] inline nlohmann::json summary_json(const Counts& c, const std::string& command_id,
-                                                 std::int64_t requested_at) {
-    return {{"requested", c.requested},
-            {"agents_reached", c.reached}, // the name /api/command and the per-device route use
-            {"skipped_offline", c.skipped_offline},
-            {"skipped_version", c.skipped_version},
-            {"command_id", command_id},
-            {"source", std::string(kSource)},
-            {"requested_at", requested_at}};
+                                                 std::int64_t requested_at, const std::string& execution_id,
+                                                 std::int64_t delay_max_s) {
+    nlohmann::json out = {{"requested", c.requested},
+                          {"agents_reached", c.reached}, // the name /api/command and the per-device route use
+                          {"skipped_offline", c.skipped_offline},
+                          {"skipped_version", c.skipped_version},
+                          {"skipped_fresh", c.skipped_fresh},
+                          {"command_id", command_id},
+                          {"source", std::string(kSource)},
+                          {"requested_at", requested_at},
+                          {"delay_max_s", delay_max_s},
+                          {"estimated_completion_at", requested_at + delay_max_s},
+                          {"joined", false}};
+    out["execution_id"] = execution_id.empty() ? nlohmann::json(nullptr) : nlohmann::json(execution_id);
+    return out;
 }
 
 } // namespace yuzu::server::software_sync

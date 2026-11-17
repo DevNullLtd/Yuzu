@@ -64,6 +64,11 @@ using Stmt = std::unique_ptr<sqlite3_stmt, StmtFinalizer>;
 
 void open_raw(Db& d, const fs::path& path) {
     REQUIRE(sqlite3_open(path.string().c_str(), &d.db) == SQLITE_OK);
+    // These handles only seed a database or read one back. The seeding is hundreds of autocommit
+    // statements, and each costs an fsync that is slow on the shared Windows CI disk (#7135). The
+    // pragma is per connection and never persisted, so the migration under test still opens the
+    // file with the shipped durability.
+    REQUIRE(sqlite3_exec(d.db, "PRAGMA synchronous=OFF", nullptr, nullptr, nullptr) == SQLITE_OK);
 }
 
 void exec(sqlite3* db, const std::string& sql) {

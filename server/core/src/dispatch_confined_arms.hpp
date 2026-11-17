@@ -475,10 +475,12 @@ inline constexpr std::array<std::string_view, 4> kQuarantineGateOutcomes{
 ///     quarantine-gated, same as echo_fleet_snapshot. Three operator surfaces use it:
 ///     `POST /api/v1/hardware/{id}/sync` reaches ONE agent (gated on
 ///     Execution:Execute for that device), and `POST /api/v1/hardware/sync` plus the MCP tool
-///     `sync_hardware_software` reach up to 500 on this server process under ONE command id
-///     (gated by the type-level Execution:Execute check, a per-operator cooldown and a single
-///     in-flight run, with WHO IS REACHED decided here by `dispatch_system_reserved_ids`, the
-///     caller's visible-set intersection taken at send time); the 500-target cap is the Runner's.
+///     `sync_hardware_software` reach the devices they name on this server process under ONE
+///     command id (gated by the type-level Execution:Execute check, a confirmation for a whole group
+///     or the fleet, the fleet-administrator rule for the fleet, a per-key cooldown and the
+///     Runner's paced admission, with WHO IS REACHED decided here by
+///     `dispatch_system_reserved_ids`, the caller's visible-set intersection taken at send time);
+///     the pacing, which spreads the agents' reports, is the Runner's.
 ///   - `guardian_push_rules` delivers Guardian baseline rules the agent may
 ///     ENFORCE, and is therefore the one exempt channel that mutates the
 ///     endpoint. It is NOT arbitrary command execution: the assertion
@@ -743,8 +745,10 @@ dispatch_confined_arms(DispatchArm arm, const ConfinedDispatchTargets& targets,
     // #3424/#3511: the plugin-presence sibling of `contained` above, same
     // shape -- checked AFTER containment (a quarantined+absent agent reports
     // quarantined, not absent) and BEFORE the send. No fail-closed mode: the
-    // registry read behind `plugin_missing` is an in-memory snapshot with no
-    // degraded state to fail closed against, unlike the quarantine store.
+    // local part of `plugin_missing` is an in-memory snapshot, and its
+    // cross-replica part (a presence read confirmed against the route
+    // directory) fails OPEN on any degradation -- an agent is then simply not
+    // withheld -- unlike the quarantine store.
     const auto plugin_absent = [&](const std::string& aid) -> bool {
         if (!plugin_missing.contains(aid))
             return false;

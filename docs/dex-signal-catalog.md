@@ -593,6 +593,23 @@ crashes, the OOM-killer) are **shipped** — see the Linux collector section abo
 - The headline dashboard rate stays **crash-free devices** (crash-scoped);
   other signals get their own panels. Rates always pair with coverage
   (reporting Windows agents) and show "—" when the denominator is missing.
+- The fleet usage read model (`dex_usage_model.hpp`, with the `DexAppUsageOwner` query owner) is
+  not yet exposed on any surface. Its rules: figures are aggregates and never carry an agent id; a
+  floor applies to the devices that contributed to a figure, sub-floor cells merge into `other`, and
+  a table below the floor publishes the device count only. `other` also holds devices on an
+  unrecognised platform, devices outside the chosen group, and tag values beyond the 50 with the
+  most devices; devices with no value for the chosen tag key form an explicit `(untagged)` cell. The
+  floor and the `other` merge protect one table only: comparing two slices, two windows, or a slice
+  with the fleet total can still isolate a small group. Usage is a trailing 30-day figure scaled to
+  the window, so every exposure rate is marked `estimated_from_30_day_usage`, and it is withheld for
+  the `all` window and for a window longer than the observation retention. The rate counts crashes
+  and hangs as raw totals, like the Apps rate per 1,000 devices (the per-device cap applies to the
+  stability score only), so events clustered on one crash-looping device make its interval falsely
+  narrow. A usage name shared by two applications (a Linux name cut at 15 bytes, or names that
+  differ only by case) withholds both. A device counts only while the server received its usage
+  within the last 48 hours; stale devices are counted separately and add nothing to the usage
+  totals, the events or the reporting count. A failed read makes the whole model unavailable, never
+  zero.
 
 ## Testing methodology & evidence hygiene
 
