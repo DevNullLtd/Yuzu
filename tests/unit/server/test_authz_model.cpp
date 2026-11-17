@@ -877,7 +877,7 @@ TEST_CASE("authz_model decommission memberships: a group-scoped Decommission:Del
 // split from `ManagementGroup:Write` (check_permission), the seeded ITServiceOwner ceiling admits the
 // decommission pair, the seeded-empty global allow-list refuses the write, and the cascade (which
 // takes no caller) removes the memberships. It does not drive a service-scoped session through
-// `DELETE /api/v1/sle/agents/{id}`; that route-level test is a tracked follow-up. The seeded ITServiceOwner ceiling admits `Decommission:Delete` for a service-scoped token (the
+// `DELETE /api/v1/sle/agents/{id}`; that route-level test is a planned follow-up. The seeded ITServiceOwner ceiling admits `Decommission:Delete` for a service-scoped token (the
 // device's service tag must also match, a separate check), while the empty
 // `kServiceScopeGlobalSafe` keeps that same token out of the global ManagementGroup:Write gate.
 TEST_CASE("authz_model: Decommission:Delete removes memberships without ManagementGroup:Write "

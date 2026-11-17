@@ -497,7 +497,7 @@ Decision numbers are stable, since other documents cite them.
     add, or a dynamic or `Service:` group created later from the tags decommission leaves in place, can
     re-insert the id). The "five per-agent stores" list in Decisions 9 and 11 stays as written; it is history.
     The authoritative list is `AgentDecommissionStores` in `agent_decommission.hpp`.)*
-    *(Owner ruling, Dave Rae, 2026-11-17, governance findings S1, UP-7 and UP-8, recorded here because it
+    *(Owner ruling, Dave Rae, 2026-11-17, from the governance review of this change, recorded here because it
     widens what `Decommission:Delete` confers: the grant is the authority to remove the device's membership
     rows in every group, including groups the caller could not otherwise write. A service-scoped token
     admitted for a device in its service cannot hold the global `ManagementGroup:Write` that the member-removal

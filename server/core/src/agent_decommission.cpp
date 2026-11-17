@@ -122,6 +122,9 @@ AgentDecommission::AgentDecommission(const AgentDecommissionStores& stores) {
                 if (!p->delete_agent(id, &removed))
                     return false;
                 detail = format_group_evidence(std::move(removed));
+                // Also in the server log, so the group set survives a lost outcome audit row.
+                spdlog::info("AgentDecommission: agent={} left management groups {}",
+                             ::yuzu::log_id_token(id), detail);
                 return true;
             });
     } else {
@@ -201,12 +204,14 @@ DecommissionResult AgentDecommission::decommission(std::string_view agent_id) {
                               t.name, ::yuzu::log_id_token(agent_id));
             }
         } catch (const std::exception& e) {
+            r.detail.clear();
             r.outcome = DecommissionOutcome::Failed;
             r.error = e.what();
             ++result.failed;
             spdlog::error("AgentDecommission: store '{}' delete_agent threw for agent={}: {}",
                           t.name, ::yuzu::log_id_token(agent_id), ::yuzu::log_key_token(e.what()));
         } catch (...) {
+            r.detail.clear();
             r.outcome = DecommissionOutcome::Failed;
             r.error = "unknown exception";
             ++result.failed;

@@ -222,7 +222,7 @@ void SleRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_perm_fn
     // read-gated by `ManagementGroup`: every group, static, dynamic and root; the enrolment row is
     // NOT touched, so the same id can reconnect and its next Register attempts to add it back to the
     // root group only).
-    // Owner ruling (Dave Rae, 2026-11-17, governance S1, UP-7, UP-8): `Decommission:Delete` is the
+    // Owner ruling (Dave Rae, 2026-11-17): `Decommission:Delete` is the
     // authority to remove the device's membership rows in every group, including groups the caller
     // could not otherwise write (a service-scoped token admitted for a device in its service cannot
     // hold the global `ManagementGroup:Write` that member-removal routes require). The rows are

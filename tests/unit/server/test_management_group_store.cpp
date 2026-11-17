@@ -520,7 +520,7 @@ TEST_CASE("ManagementGroupStore::delete_agent refuses an empty or NUL-bearing id
           sorted_ids({f.root, f.s1, f.s2, f.dyn}));
 }
 
-// Point-in-time pin (governance T6/S4): delete_agent is not a tombstone. add_member and
+// Point-in-time pin : delete_agent is not a tombstone. add_member and
 // refresh_dynamic_membership are INSERT ... ON CONFLICT DO NOTHING with no agent-existence check, so
 // the id can be put back in a group after the delete returned, for example by an operator add or by
 // a dynamic group created later. The deterministic, non-racing form of the documented residual.
@@ -539,7 +539,7 @@ TEST_CASE("ManagementGroupStore::delete_agent is point-in-time: a later add puts
     CHECK(sorted_ids(store.get_agent_groups("a1").value()) == sorted_ids({f.s2, f.dyn}));
 }
 
-// A lease that cannot be had is a refusal, never a false erasure (governance T4): the only pooled
+// A lease that cannot be had is a refusal, never a false erasure: the only pooled
 // connection is held, so a bounded acquire on the saturated pool gives up (the pool fails a bounded
 // acquire fast, well inside kWriteTimeout) and delete_agent returns false, and the rows survive.
 TEST_CASE("ManagementGroupStore::delete_agent returns false when no connection is available",

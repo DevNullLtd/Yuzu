@@ -27,16 +27,20 @@
 #include "test_route_sink.hpp"
 
 #include "agent_decommission.hpp" // DecommissionResult (the DELETE route)
+#include "management_group_store.hpp"
 #include "rbac_store.hpp"
 #include "software_licensing_store.hpp"
 
 #include "pg/pg_pool.hpp"
 #include "../test_helpers.hpp"
+#include "test_mgmt_group_pg_helper.hpp" // PG-backed ManagementGroupStore
 
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -97,6 +101,8 @@ struct SleHarness {
 
     std::vector<AgentLicenseRow> agent_rows;
     DecommissionResult decommission_result{}; // returned by the injected cascade
+    // When set, the route runs THIS instead of returning `decommission_result` (a real cascade).
+    std::function<DecommissionResult(const std::string&)> decommission_override;
 
     std::vector<std::string> audits;     // "action|result"
     std::vector<std::string> audit_full; // "action|result|target_type|target_id"
@@ -133,7 +139,9 @@ struct SleHarness {
                 return std::nullopt;
             return agent_rows;
         };
-        auto decommission = [this](const std::string&) -> DecommissionResult {
+        auto decommission = [this](const std::string& id) -> DecommissionResult {
+            if (decommission_override)
+                return decommission_override(id);
             return decommission_result;
         };
         auto audit = [this](const httplib::Request&, const std::string& a, const std::string& r,
@@ -448,10 +456,10 @@ TEST_CASE("sle erase: a ten-entry stores result is passed through per store (rou
     }
 }
 
-// #6352 / governance UP-7: the outcome audit row names WHICH groups the device left, as its own
+// #6352: the outcome audit row names WHICH groups the device left, as its own
 // `<store>.groups=<n>:<ids>` token beside the unchanged `<store>=<outcome>` token, and only for a
 // store that reported evidence. The scope change is otherwise unreconstructable from the audit log.
-TEST_CASE("sle erase: the outcome audit row carries the groups the device left (UP-7)",
+TEST_CASE("sle erase: the outcome audit row carries the groups the device left",
           "[sle_routes]") {
     SleHarness h;
     h.allow_scoped_all = true;
@@ -477,6 +485,50 @@ TEST_CASE("sle erase: the outcome audit row carries the groups the device left (
     CHECK_FALSE(contains(outcome, "inventory.groups="));
     // The response body is unchanged: the evidence is audit-only.
     CHECK_FALSE(contains(res->body, ".groups="));
+}
+
+// End to end with the REAL cascade and a real Postgres store behind the route: the audit evidence is
+// produced by `ManagementGroupStore::delete_agent` -> `AgentDecommission` -> the route, not by an
+// injected result, so a break in any of the three links shows here.
+TEST_CASE("sle erase: a real cascade writes the groups the device left into the outcome audit row",
+          "[pg][sle_routes][decommission]") {
+    yuzu::test::ManagementGroupStorePg mg_bundle;
+    yuzu::server::ManagementGroupStore& mg = *mg_bundle;
+
+    yuzu::server::ManagementGroup root;
+    root.id = yuzu::server::ManagementGroupStore::kRootGroupId;
+    root.name = "All Devices";
+    root.membership_type = "dynamic";
+    root.scope_expression = "*";
+    root.created_by = "system";
+    REQUIRE(mg.create_group(root).has_value());
+    yuzu::server::ManagementGroup g;
+    g.name = "Edge";
+    g.membership_type = "static";
+    const auto edge = mg.create_group(g);
+    REQUIRE(edge.has_value());
+    REQUIRE(mg.add_member(yuzu::server::ManagementGroupStore::kRootGroupId, "agent-1").has_value());
+    REQUIRE(mg.add_member(*edge, "agent-1").has_value());
+    REQUIRE(mg.add_member(*edge, "agent-2").has_value()); // a bystander
+
+    AgentDecommission cascade{AgentDecommissionStores{.management_group_memberships = &mg}};
+    SleHarness h;
+    h.allow_scoped_all = true;
+    h.decommission_override = [&](const std::string& id) { return cascade.decommission(id); };
+
+    auto res = h.sink.Delete("/api/v1/sle/agents/agent-1");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+
+    std::vector<std::string> ids{yuzu::server::ManagementGroupStore::kRootGroupId, *edge};
+    std::sort(ids.begin(), ids.end());
+    REQUIRE(h.audit_detail.size() == 2);
+    CHECK(contains(h.audit_detail.back(),
+                   "management_group_memberships.groups=2:" + ids[0] + "," + ids[1] + " "));
+    CHECK_FALSE(contains(res->body, ".groups="));
+    // The effect: agent-1 left both groups, the bystander kept its own.
+    CHECK(mg.get_agent_groups("agent-1").value().empty());
+    CHECK(mg.get_agent_groups("agent-2").value() == std::vector<std::string>{*edge});
 }
 
 // Kills: the outcome row's persist failure being invisible (a (void)try_persist_audit that

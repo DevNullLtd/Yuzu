@@ -569,9 +569,13 @@ bool ManagementGroupStore::delete_agent(std::string_view agent_id,
     }
     const int rows = PQntuples(r.get());
     if (removed_group_ids) {
-        removed_group_ids->reserve(static_cast<std::size_t>(rows));
+        // Built aside and moved in at the end, so a throw while copying (bad_alloc) can never leave
+        // the caller's vector partially filled: it is either empty or complete.
+        std::vector<std::string> ids;
+        ids.reserve(static_cast<std::size_t>(rows));
         for (int i = 0; i < rows; ++i)
-            removed_group_ids->push_back(text_col(r.get(), i, 0));
+            ids.push_back(text_col(r.get(), i, 0));
+        *removed_group_ids = std::move(ids);
     }
     spdlog::info("ManagementGroupStore::delete_agent: agent {} removed from {} group(s)",
                  ::yuzu::log_id_token(agent_id), rows);

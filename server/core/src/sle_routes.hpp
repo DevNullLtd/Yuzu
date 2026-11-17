@@ -46,8 +46,8 @@
 ///     public key `management_group_memberships`, read-gated by `ManagementGroup`: every group,
 ///     static and dynamic and root, in one statement; the enrolment row is NOT touched, so the same
 ///     id can reconnect and its next Register attempts to add it back to the root group only).
-///     The gate deliberately covers this store too (owner ruling, Dave Rae, 2026-11-17, governance
-///     S1, UP-7, UP-8): `Decommission:Delete` is the authority to remove the device's membership
+///     The gate deliberately covers this store too (owner ruling, Dave Rae, 2026-11-17):
+///     `Decommission:Delete` is the authority to remove the device's membership
 ///     rows in every group, including groups the caller could not otherwise write (a service-scoped
 ///     token admitted for a device in its service cannot hold the global `ManagementGroup:Write`
 ///     that member-removal routes require). The rows are agent-keyed links to the retired device and

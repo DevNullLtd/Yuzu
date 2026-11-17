@@ -4240,7 +4240,7 @@ TEST_CASE("Register: a returning approved id keeps its non-root groups until dec
 
     // After the fix: decommission removes every membership, but it does NOT un-enrol the agent. The
     // enrolment row is still approved, so the same id is accepted again on the fast path, and its
-    // Register re-adds the ROOT group only. The un-enrol change is a tracked follow-up.
+    // Register re-adds the ROOT group only. The un-enrol change is a planned follow-up.
     yuzu::server::AgentDecommission cascade{
         yuzu::server::AgentDecommissionStores{.management_group_memberships = &mg}};
     const auto decom = cascade.decommission("returning-agent");

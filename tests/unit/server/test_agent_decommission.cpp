@@ -649,7 +649,7 @@ TEST_CASE("AgentDecommission erases an agent from every real store; a bystander 
     CHECK(del_groups->empty());
     CHECK(sorted(management_groups.get_agent_groups("agent-bystander").value()) ==
           sorted(groups.bystander_groups));
-    // UP-7: the result names WHICH groups the agent left, sorted, as `<n>:<ids>`.
+    // The result names WHICH groups the agent left, sorted, as `<n>:<ids>`.
     CHECK(mg->detail ==
           yuzu::server::format_group_evidence(
               {groups.root, groups.shared, groups.only_del, groups.dynamic_del}));
@@ -941,11 +941,49 @@ TEST_CASE("format_group_evidence sorts, counts and bounds the group id list",
     CHECK(text.rfind(std::to_string(many.size()) + ":g0000,", 0) == 0);
     CHECK(text.size() >= 2);
     CHECK(text.substr(text.size() - 3) == ",+7"); // the rest are counted, not listed
-    CHECK(text.find("g0107") == std::string::npos);
+
+    // Boundaries: exactly the cap lists everything with no suffix; one over adds `,+1`; the sort
+    // is by value, not input order.
+    std::vector<std::string> cap(many.begin(), many.begin() + yuzu::server::kMaxGroupEvidenceIds);
+    std::reverse(cap.begin(), cap.end());
+    const auto at_cap = format_group_evidence(cap);
+    CHECK(at_cap.rfind("100:g0000,g0001,", 0) == 0);
+    CHECK(at_cap.find(",+") == std::string::npos);
+    cap.push_back(many[yuzu::server::kMaxGroupEvidenceIds]);
+    const auto over = format_group_evidence(cap);
+    CHECK(over.substr(over.size() - 3) == ",+1");
+    CHECK(text.find("g0099") != std::string::npos); // the 100th id is listed
+    CHECK(text.find("g0100") == std::string::npos); // the 101st is only counted
+}
+
+// The `add_store_with_detail` contract: evidence a deleter fills is kept only when the delete
+// committed, and never survives a false return or a throw.
+TEST_CASE("AgentDecommission drops store evidence unless the delete committed",
+          "[decommission]") {
+    AgentDecommission cascade;
+    cascade.add_store_with_detail("fills_then_commits", [](std::string_view, std::string& d) {
+        d = "kept";
+        return true;
+    });
+    cascade.add_store_with_detail("fills_then_fails", [](std::string_view, std::string& d) {
+        d = "must-not-survive";
+        return false;
+    });
+    cascade.add_store_with_detail("fills_then_throws", [](std::string_view, std::string& d) -> bool {
+        d = "must-not-survive";
+        throw std::runtime_error("boom");
+    });
+    const auto result = cascade.decommission("agent-x");
+    REQUIRE(result.stores.size() == 3);
+    CHECK(result.stores[0].detail == "kept");
+    CHECK(result.stores[1].outcome == DecommissionOutcome::Failed);
+    CHECK(result.stores[1].detail.empty());
+    CHECK(result.stores[2].outcome == DecommissionOutcome::Failed);
+    CHECK(result.stores[2].detail.empty());
 }
 
 // A NUL-bearing id through the cascade: the membership store refuses it (Failed, nothing deleted),
-// it never truncates onto the agent whose id is the prefix (governance T7).
+// it never truncates onto the agent whose id is the prefix.
 TEST_CASE("AgentDecommission reports a NUL-bearing id as Failed for the membership store",
           "[pg][decommission][management_group]") {
     YUZU_REQUIRE_PG_DB_TPL(db, decommission_tpl);
