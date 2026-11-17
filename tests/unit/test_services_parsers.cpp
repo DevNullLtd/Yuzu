@@ -356,3 +356,19 @@ TEST_CASE("systemctl_mutation_argv: a root agent runs systemctl directly with `-
                                             "-weird.service"};
     CHECK(*argv == expected);
 }
+
+TEST_CASE("start_mode_took_effect: the read-back must match the requested mode, empty fails closed "
+          "(WP13 UP11)",
+          "[services][up11]") {
+    using yuzu::services::start_mode_took_effect;
+    CHECK(start_mode_took_effect("automatic", "enabled\n"));
+    CHECK(start_mode_took_effect("automatic", "static\n"));
+    CHECK_FALSE(start_mode_took_effect("automatic", "disabled\n")); // wrapper did nothing
+    CHECK_FALSE(start_mode_took_effect("automatic", "masked\n"));
+    CHECK(start_mode_took_effect("manual", "disabled\n"));
+    CHECK_FALSE(start_mode_took_effect("manual", "enabled\n"));
+    CHECK(start_mode_took_effect("disabled", "masked\n"));
+    CHECK_FALSE(start_mode_took_effect("disabled", "enabled\n"));
+    CHECK_FALSE(start_mode_took_effect("automatic", "")); // a 0-byte wrapper leaves nothing to read
+    CHECK_FALSE(start_mode_took_effect("bogus", "enabled"));
+}

@@ -85,7 +85,7 @@ inline bool is_safe_service_name(std::string_view name) {
 inline constexpr const char* kYuzuSystemctlWrapper = "/usr/libexec/yuzu/yuzu-systemctl";
 
 /// argv for one `systemctl enable|disable|mask|unmask` of `name`.
-///  - root agent (the packaged unit, NoNewPrivileges): `systemctl <verb> -- <unit>` directly.
+///  - root agent (a manual root launch; the packaged unit is non-root and always privilege_unavailable here): `systemctl <verb> -- <unit>` directly.
 ///  - non-root agent: `sudo -n -- <wrapper> <verb> <unit>`; a missing wrapper yields nullopt, so
 ///    the caller reports "privilege unavailable" and NEVER falls back to a bare
 ///    `sudo systemctl ...` that a wildcard grant would have admitted.
@@ -103,6 +103,32 @@ systemctl_mutation_argv(bool euid_is_root, std::string_view systemctl_path,
         return std::nullopt;
     return yuzu::shared::sudo_wrap(
         {std::string(wrapper_path), std::string(verb), std::string(name)}, /*euid_is_root=*/false);
+}
+
+/// Does `systemctl is-enabled`'s first output line show that the requested start mode took
+/// effect (WP13 governance UP11)? A privileged wrapper that exits 0 without acting (an empty or
+/// replaced file) must not be reported as success. Empty/unrecognised output is NOT a match
+/// (fail closed). `static`/`indirect`/`alias` units cannot be enabled or disabled and are
+/// accepted for automatic/manual, as `systemctl enable` itself exits 0 for them.
+///   automatic -> anything but disabled / masked
+///   manual    -> anything but enabled / masked
+///   disabled  -> masked / masked-runtime
+[[nodiscard]] inline bool start_mode_took_effect(std::string_view mode, std::string_view state) {
+    while (!state.empty() && (state.back() == '\n' || state.back() == '\r' || state.back() == ' '))
+        state.remove_suffix(1);
+    if (const auto nl = state.find('\n'); nl != std::string_view::npos)
+        state = state.substr(0, nl);
+    if (state.empty())
+        return false;
+    const bool masked = state == "masked" || state == "masked-runtime";
+    const bool enabled = state == "enabled" || state == "enabled-runtime";
+    if (mode == "automatic")
+        return !masked && state != "disabled";
+    if (mode == "manual")
+        return !masked && !enabled;
+    if (mode == "disabled")
+        return masked;
+    return false;
 }
 
 /// One row of `systemctl list-units --type=service [--all|--state=running]

@@ -518,6 +518,28 @@ verify_as_user_prereqs() {
         ok "plugin dir readable by '$target_user'"
     fi
 
+    # 4b. WP13 governance R3: the binary ACTUALLY LAUNCHED must carry no file capability. The
+    # installer strips only the --binary-path it is given (default /usr/local/bin), not a
+    # developer's build-tree binary, which may still hold caps from an older install run. A file
+    # capability on a world-executable binary is a local privilege escalation (the invoker chooses
+    # the plugin dir), so refuse rather than launch it.
+    if [ "$(uname -s)" = "Linux" ]; then
+        if command -v getcap >/dev/null 2>&1; then
+            local launched_caps
+            launched_caps="$(getcap "$agent_bin" 2>/dev/null || true)"
+            if [ -n "$launched_caps" ]; then
+                fail "$agent_bin carries file capabilities: $launched_caps"
+                info "  fix: sudo setcap -r \"$agent_bin\"   (the capability is now granted to the process by setpriv)"
+                return 1
+            fi
+            ok "no file capabilities on $agent_bin"
+        else
+            fail "getcap not installed - cannot verify $agent_bin carries no file capabilities"
+            info "  fix: install libcap2-bin (apt) / libcap (dnf)"
+            return 1
+        fi
+    fi
+
     # 5. Test that sudo -n actually works FROM the target user (NOPASSWD
     # in /etc/sudoers.d/yuzu-agent). Run a harmless probe: sudo -u USER -n
     # /sbin/pfctl -s rules (macOS) — that's a read-only command we already

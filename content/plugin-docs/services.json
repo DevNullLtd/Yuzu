@@ -355,7 +355,7 @@
       "runs_as": "agent daemon, root (the shipped LaunchDaemon has no `UserName` key)"
     },
     {
-      "grant": "`list`/`running`: none. `set_start_mode`: the sudoers grant for the root-owned wrapper `/usr/libexec/yuzu/yuzu-systemctl` (no argument glob; the wrapper validates verb and unit name); a missing or non-root-owned wrapper is `privilege_unavailable`, never a fallback to bare `sudo systemctl`. The wrapper is bypassed when the agent is root. Under the packaged unit's `NoNewPrivileges=true`, `sudo` cannot escalate, so this grant takes effect only on a unit without that setting.",
+      "grant": "`list`/`running`: none. `set_start_mode`: the sudoers grant for the root-owned wrapper `/usr/libexec/yuzu/yuzu-systemctl` (no argument glob; the wrapper validates verb and unit name); a missing or non-root-owned wrapper is `privilege_unavailable`, never a fallback to bare `sudo systemctl`. The wrapper is bypassed when the agent is root. After the call the plugin reads `systemctl is-enabled` back and fails the action if the state does not match the requested mode, so a wrapper that exits 0 without acting is not reported as success. The packaged unit (non-root, `NoNewPrivileges`) always answers `privilege_unavailable`. Under the packaged unit's `NoNewPrivileges=true`, `sudo` cannot escalate, so this grant takes effect only on a unit without that setting.",
       "if_refused": "`list`/`running`: a typed `UNAVAILABLE` or `CONSTRAINED` status; the captured sample shows `subprocess_runner:spawn_error` on both because `systemctl` could not be resolved in the capture container, not because of a permission denial. `set_start_mode`: a missing wrapper surfaces as `PERMISSION_DENIED` with `services:privilege_unavailable`; a missing grant surfaces as `error|systemctl command failed for '<name>' (exit=1): sudo: a password is required`.",
       "measured": "2026-09-06, container, captured as root (`euid 0`), not the deployed unprivileged identity",
       "os": "Linux",
@@ -416,7 +416,7 @@
       "completeness": "UNKNOWN",
       "provenance": "`services:privilege_unavailable`",
       "status": "`PERMISSION_DENIED`",
-      "when": "Linux `set_start_mode` from a non-root agent: the root-owned validator `/usr/libexec/yuzu/yuzu-systemctl` (written and granted by `scripts/install-agent-user.sh`) is missing or not root-owned and non-writable. The action refuses and never falls back to `sudo systemctl`; re-run the installer. A root agent (the packaged unit) runs `systemctl` directly and does not need it."
+      "when": "Linux `set_start_mode` from a non-root agent: the root-owned validator `/usr/libexec/yuzu/yuzu-systemctl` (written and granted by `scripts/install-agent-user.sh`) is missing or not root-owned and non-writable. The action refuses and never falls back to `sudo systemctl`; re-run the installer. A root agent (a manual root launch) runs `systemctl` directly and does not need it. The packaged unit runs as the non-root `yuzu-agent` with `NoNewPrivileges`, so on it `set_start_mode` is always `privilege_unavailable`."
     }
   ],
   "samples": {

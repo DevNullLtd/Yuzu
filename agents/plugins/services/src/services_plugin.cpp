@@ -471,8 +471,10 @@ int do_set_start_mode_linux(yuzu::CommandContext& ctx, std::string_view name,
     }
 
     // services/set_start_mode_linux#1 (docs/agent-spawn-sink-manifest.md)
-    // Privileged mutation (WP13 / F48). A root agent (the packaged unit) runs systemctl
-    // directly. A non-root agent (the dev/UAT --as-user path) goes through the root-owned
+    // Privileged mutation (WP13 / F48). A root agent (a manual root launch) runs systemctl
+    // directly. A non-root agent (the dev/UAT --as-user path; ALSO the packaged unit, which runs as
+    // the non-root yuzu-agent with NoNewPrivileges, so there set_start_mode is permanently
+    // privilege_unavailable) goes through the root-owned
     // validator scripts/install-agent-user.sh installs and grants, `sudo -n -- <wrapper> <verb>
     // <unit>`: the former `systemctl enable *` sudoers glob admitted `enable --now <unit path>`,
     // which is root. A wrapper that is absent or not root-owned is a refusal with a token,
@@ -496,7 +498,8 @@ int do_set_start_mode_linux(yuzu::CommandContext& ctx, std::string_view name,
         // Trust the wrapper only if root owns it and neither group nor other can write it: sudo
         // would run it as root, so an agent-writable file here is root for the agent.
         if (::stat(w, &st) == 0 && S_ISREG(st.st_mode) && st.st_uid == 0 &&
-            (st.st_mode & (S_IWGRP | S_IWOTH)) == 0 && (st.st_mode & S_IXOTH) != 0) {
+            (st.st_mode & (S_IWGRP | S_IWOTH)) == 0 && (st.st_mode & S_IXOTH) != 0 &&
+            st.st_size > 0) { // an empty file would exit 0 under sudo without acting (UP11)
             wrapper = w;
         }
     }
@@ -542,6 +545,20 @@ int do_set_start_mode_linux(yuzu::CommandContext& ctx, std::string_view name,
     if (!outcome.ok) {
         ctx.write_output(outcome.message);
         return 1;
+    }
+
+    // WP13 UP11: a root-owned wrapper that exits 0 without acting (empty/replaced file) would
+    // otherwise be reported as success. Read the unit's state back (no privilege needed) and
+    // require it to match the requested mode; unreadable/empty state is a failure.
+    {
+        auto st = run_command({systemctl_path, "is-enabled", "--", std::string(name)});
+        if (!yuzu::services::start_mode_took_effect(mode, st.output)) {
+            ctx.write_output(std::format(
+                "error|set_start_mode reported success but '{}' is not in mode '{}' (is-enabled: "
+                "'{}'); the privileged helper may not have acted",
+                name, mode, st.output.substr(0, st.output.find('\n'))));
+            return 1;
+        }
     }
 
     ctx.write_output("status|ok");
@@ -652,7 +669,7 @@ const YuzuActionDescriptor kActionDescriptors[] = {
      /* windows = */ {YUZU_SUPPORT_SUPPORTED, 1, "win32_service_api", nullptr}},
     {"set_start_mode",
      /* linux   = */
-     {YUZU_SUPPORT_SUPPORTED, 2, "runner argv 'sudo -n -- systemctl enable|disable|mask|unmask'",
+     {YUZU_SUPPORT_SUPPORTED, 2, "runner argv: root systemctl, or sudo -n -- yuzu-systemctl wrapper (verb enable|disable|mask|unmask)",
       nullptr},
      /* macos   = */
      {YUZU_SUPPORT_SUPPORTED, 2, "runner argv 'sudo -n -- launchctl enable|disable'", nullptr},

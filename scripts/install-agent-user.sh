@@ -100,10 +100,11 @@
 #                    grants; the agent will still run but the firewall
 #                    containment actions and other privileged plugins will fail at dispatch
 #                    time (which the test ladder catches).
-#   --no-setcap      Skip stripping file capabilities from the binary
+#   --no-cap-cleanup Skip stripping file capabilities from the binary
 #                    (Linux). The script never GRANTS file capabilities;
 #                    this only skips the cleanup of ones a previous version
-#                    of this script set.
+#                    of this script set. (--no-setcap is the old, misleading
+#                    name, kept as a deprecated alias.)
 #
 # EXIT CODES
 # ──────────
@@ -187,7 +188,8 @@ while [[ $# -gt 0 ]]; do
         --account-name)   ACCOUNT_NAME="$2"; shift 2 ;;
         --binary-path)    BINARY_PATH="$2"; shift 2 ;;
         --no-sudoers)     SKIP_SUDOERS=1; shift ;;
-        --no-setcap)      SKIP_SETCAP=1; shift ;;
+        --no-cap-cleanup) SKIP_SETCAP=1; shift ;;
+        --no-setcap)      SKIP_SETCAP=1; warn "--no-setcap is a deprecated alias of --no-cap-cleanup (the script never SETS file capabilities)"; shift ;;
         -h|--help)        usage; exit 0 ;;
         *)                echo "unknown arg: $1" >&2; echo "use --help for usage." >&2; exit 2 ;;
     esac
@@ -542,8 +544,9 @@ EOF
     fi
 
     cat <<EOF
-# Pre-requisites for daemon-style invocation:
-Defaults:$ACCOUNT_NAME    !requiretty
+# Pre-requisites for daemon-style invocation. (No \`Defaults !requiretty\`: requiretty is OFF by
+# default in every supported sudo, and sudo-rs rejects the flag outright, which made visudo -cf
+# refuse the WHOLE file and left the old grants in place.)
 Defaults:$ACCOUNT_NAME    env_keep += "YUZU_*"
 EOF
 }
@@ -573,6 +576,15 @@ install_sudoers() {
         if ! visudo -cf "$tmp" >/dev/null; then
             warn "sudoers file failed visudo validation — NOT installing"
             visudo -cf "$tmp" >&2 || true
+            # Fail CLOSED (WP13 governance R1): a previous run's file may still carry the old
+            # `systemctl enable *`-style globs, which this change exists to remove. Leaving it
+            # while exiting 0 would keep the exposure and say otherwise, so remove it: the agent
+            # then has NO privileged grants (actions report privilege_unavailable) until a
+            # successful re-run.
+            if [[ -f "$target" ]]; then
+                warn "removing the previous $target so its old grants do not outlive a failed update"
+                run rm -f "$target"
+            fi
             return 3
         fi
     fi
@@ -684,7 +696,7 @@ remove_systemctl_wrapper() {
 strip_file_capabilities() {
     if [[ "$PLATFORM" != "linux" ]]; then return 0; fi
     if [[ "$SKIP_SETCAP" -eq 1 ]]; then
-        log "skipping file-capability cleanup (--no-setcap)"
+        log "skipping file-capability cleanup (--no-cap-cleanup)"
         return 0
     fi
     if [[ ! -f "$BINARY_PATH" ]]; then
@@ -757,6 +769,23 @@ check_install() {
             else
                 log "/etc/sudoers.d/yuzu-agent present and visudo-valid"
             fi
+            # WP13 governance R1: the CONTENT must be the narrowed one. An old file can be
+            # present and valid while still carrying the wildcard grants this change removed.
+            if [[ "$PLATFORM" == "linux" ]]; then
+                if grep -Eq '^[^#]*systemctl[[:space:]]+(enable|disable|mask|unmask)[[:space:]]' /etc/sudoers.d/yuzu-agent; then
+                    warn "/etc/sudoers.d/yuzu-agent still carries the old systemctl glob grants - re-run the installer"
+                    ((errs++))
+                fi
+                if ! grep -Eq "^[^#]*NOPASSWD:[[:space:]]*$SYSTEMCTL_WRAPPER_PATH[[:space:]]*\$" /etc/sudoers.d/yuzu-agent; then
+                    warn "/etc/sudoers.d/yuzu-agent lacks the $SYSTEMCTL_WRAPPER_PATH grant"
+                    ((errs++))
+                fi
+            else
+                if grep -Eq '^[^#]*launchctl[[:space:]]+(bootstrap|bootout)' /etc/sudoers.d/yuzu-agent; then
+                    warn "/etc/sudoers.d/yuzu-agent still carries the launchctl bootstrap/bootout grants - re-run the installer"
+                    ((errs++))
+                fi
+            fi
         fi
     fi
 
@@ -773,6 +802,12 @@ check_install() {
             else
                 log "no file capabilities on $BINARY_PATH (correct)"
             fi
+        else
+            # Cannot verify = drift (WP13 governance R2): a green --check must mean the binary
+            # was inspected, not that the inspector was missing.
+            warn "getcap is not installed - cannot verify $BINARY_PATH carries no file capabilities"
+            warn "  (apt: libcap2-bin, dnf: libcap)"
+            ((errs++))
         fi
     fi
 
@@ -824,8 +859,15 @@ case "$ACTION" in
         # The wrapper goes in BEFORE the sudoers file that grants it (and a failed install
         # clears SYSTEMCTL_WRAPPER_OK so no systemctl grant is written at all).
         install_systemctl_wrapper
-        install_sudoers
+        sudoers_rc=0
+        install_sudoers || sudoers_rc=$?
+        # Always strip file capabilities (safe either way), but a failed sudoers install must
+        # make the script FAIL (exit 3), never report a complete install.
         strip_file_capabilities
+        if [[ "$sudoers_rc" -ne 0 ]]; then
+            warn "install INCOMPLETE: the sudoers file was not installed (exit $sudoers_rc)"
+            exit "$sudoers_rc"
+        fi
         log "install complete. Verify with: $0 --check"
         ;;
 

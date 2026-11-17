@@ -494,6 +494,7 @@ agent_test_exe = executable(
                                                 # attribution action driven end to end via LocalDispatcher
                                                 # (Darwin-only, self-gated) -- same shape as
                                                 # test_wave3_pr31_macos_actions.cpp
+    'unit/test_proc_access.cpp',              # WP13 UP14: /proc refusal tally (agents/shared/proc_access.hpp)
     'unit/test_netstat_parsers.cpp',          # gate-2 remediation: pure escape_pipes() CR/LF handling
                                                 # (netstat_parsers.hpp, portable, every host)
     'unit/test_os_info_macos.cpp',            # Wave 3 PR3.1: os_info_macos.hpp SystemVersion.plist extractor (pure, every host)
@@ -4689,6 +4690,21 @@ test('same-site gate production wiring lexical gate',
   suite: 'docs',
   timeout: 30,
 )
+# WP13 governance Q1: installer grant lint (no file caps, wrapper-only systemctl, sudoers validates,
+# --check strictness). Runs the installer in --dry-run only; nothing is executed as root.
+test('agent installer linux privilege lint (WP13/F21,F48)',
+  _python3_test,
+  args: [files('test_agent_installer_linux_privilege_lint.py')],
+  suite: 'docs',
+  timeout: 90,
+)
+# WP13 UP14: the /proc walkers declare a refused read as CONSTRAINED (source-text only).
+test('proc access status lexical gate (WP13/UP14)',
+  _python3_test,
+  args: [files('test_proc_access_status_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
 # WP13/F52: pins that agent.cpp runs the allowlist startup decision (refuse to start) before
 # PluginLoader::scan and passes allowlist_required (source-text only, so Python).
 test('plugin allowlist startup wiring lexical gate',
@@ -4953,6 +4969,20 @@ if (_bash_test.found() and meson.can_run_host_binaries() and build_agent
     args: [files('shell/test_blocked_log_sink_sigterm.sh'), meson.project_build_root()],
     suite: 'agent',
     timeout: 300,
+    depends: [yuzu_agent_exe],
+  )
+endif
+
+# WP13/F52 EXECUTED refusal: the real yuzu-agent with a missing/empty/junk --plugin-allowlist must
+# log the refusal and exit non-zero without loading a plugin (the lexical test cannot see a lost
+# async log line or an exit code).
+if (_python3_test.found() and meson.can_run_host_binaries() and build_agent
+    and host_machine.system() == 'linux')
+  test('agent plugin allowlist refusal (executed, WP13/F52)',
+    _python3_test,
+    args: [files('test_agent_allowlist_refusal_executed.py'), yuzu_agent_exe],
+    suite: 'agent',
+    timeout: 120,
     depends: [yuzu_agent_exe],
   )
 endif

@@ -78,8 +78,39 @@ def main() -> int:
         if "file capabilities present" not in chk:
             fail("--check must warn when file capabilities are PRESENT")
 
+        # ── governance R1/R2/D6: failure propagation and --check strictness ──────────
+        if "requiretty" in "\n".join(l for l in code.splitlines()
+                                       if "Defaults" in l and not l.lstrip().startswith("#")):
+            fail("sudoers still carries a Defaults requiretty line (sudo-rs rejects the file)")
+        if not re.search(r"install_sudoers \|\| sudoers_rc=\$\?", code) or \
+           'exit "$sudoers_rc"' not in code:
+            fail("a failed sudoers install must make the script exit non-zero")
+        if "rm -f \"$target\"" not in code[code.index("install_sudoers()"):code.index("remove_sudoers()")]:
+            fail("a failed sudoers validation must remove the previous (glob-carrying) file")
+        if "cannot verify" not in chk:
+            fail("--check must treat a missing getcap as drift")
+        if "still carries the old systemctl glob grants" not in chk or \
+           "lacks the $SYSTEMCTL_WRAPPER_PATH grant" not in chk:
+            fail("--check must assert the wrapper grant AND the absence of the glob grants")
+        if "--no-cap-cleanup" not in SRC:
+            fail("--no-cap-cleanup (the honest name for --no-setcap) is missing")
+
         if sys.platform.startswith("linux"):
             out = dry_run("Linux", binary)
+            # The generated Linux sudoers must validate where visudo is available (classic sudo
+            # or sudo-rs): the old `!requiretty` made visudo reject the whole file.
+            vis = subprocess.run(["bash", "-c", "command -v visudo"], capture_output=True, text=True).stdout.strip()
+            if vis:
+                content = subprocess.run(
+                    ["bash", "-c",
+                     "ACCOUNT_NAME=yuzu_lint PLATFORM=linux SYSTEMCTL_WRAPPER_PATH=/usr/libexec/yuzu/yuzu-systemctl;"
+                     f" source <(sed -n '/^generate_sudoers_content()/,/^}}/p' {SCRIPT}); generate_sudoers_content"],
+                    capture_output=True, text=True).stdout
+                sf = pathlib.Path(d) / "sudoers.test"
+                sf.write_text(content)
+                r = subprocess.run([vis, "-cf", str(sf)], capture_output=True, text=True)
+                if r.returncode != 0:
+                    fail(f"generated Linux sudoers fails visudo -cf: {r.stdout}{r.stderr}")
             if re.search(r"\[dry-run\] setcap\s+\S*\+", out):
                 fail("dry-run grants a file capability")
             g = grants(out)
