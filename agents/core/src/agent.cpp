@@ -71,7 +71,7 @@ __declspec(allocate(".CRT$XCB"))
 #include "guardian_arm_heartbeat.hpp"     // emit_guardian_arm_heartbeat_tags (rung 9c PR-3)
 #include "guardian_backend.hpp"           // GuardianBackend, guardian_backend_from_state/label (F7)
 #include "guardian_health_heartbeat.hpp"  // emit_guardian_health_heartbeat_tags (M1)
-#include "guardian_baseline_heartbeat.hpp" // emit_guardian_baseline_persist_heartbeat_tags (#4045)
+#include "guardian_baseline_heartbeat.hpp" // emit_guardian_baseline_* heartbeat tags (#4045, #5605)
 #include "guardian_baseline_persister.hpp" // kBaselineShutdownGrace (#4045; static_assert below)
 #include "guardian_boot_epoch.hpp"         // claim_guardian_boot_epoch (UP-14)
 #include "guardian_io_ceiling_heartbeat.hpp" // emit_guardian_io_ceiling_heartbeat_tags (rung 9c PR-3)
@@ -3074,23 +3074,43 @@ public:
                               // Group D2 (after D, its own try so it can neither drop an older
                               // tag nor be dropped by one): #4045, the Spark baseline-persist
                               // aggregate (sparse, 0 omits the tag; every channel is listed on
-                              // GuardianEngine::baseline_persist_failures()). Spark path ONLY:
-                              // a legacy FileGuard persist failure is logged, not counted, so
-                              // an absent tag is NOT evidence that baselines persisted. Not
-                              // gated on prefer_spark_ (0 while Spark is inert). This accessor
-                              // takes no lock (the Group B/C accessors above do take mtx_).
-                              // Deleting THIS call site is not caught by any test, same as
-                              // Group D's: the emitter and the accessor are pinned (E10, E15,
-                              // E23 and the doc-scrape test), the call itself is verified by
-                              // reading. Deliberately no source-grep pin: it would break
-                              // out-of-tree and packaged builds that carry no source tree.
+                              // GuardianEngine::baseline_persist_failures()), plus the two
+                              // #5605 tags described below. Spark path ONLY: a legacy
+                              // FileGuard persist failure is logged, not counted, so an absent
+                              // tag is NOT evidence that baselines persisted. The aggregate is
+                              // not gated on prefer_spark_ (0 while Spark is inert). These
+                              // accessors take no lock (the Group B/C accessors above do take
+                              // mtx_).
+                              // Deleting THIS call site is not caught by any unit test, same
+                              // as Group D's: the emitter and the accessor are pinned (E10,
+                              // E15, E23 and the doc-scrape test). The three emit calls here
+                              // are pinned only by the source-text check
+                              // tests/test_guardian_baseline_fleet_tags_lexical.py, which runs
+                              // in the docs suite against the source tree and so does not run
+                              // in out-of-tree or packaged builds that carry no source tree.
+                              //
+                              // #5605: the same group also carries the CURRENT unpersisted
+                              // backlog (present only on a live prefer_spark agent with a
+                              // published persister; a present 0 means "no capture waiting at
+                              // this persister", NOT "Spark is healthy") and the boot-scan
+                              // count (sparse, live on every agent: a boot re-arm found no
+                              // persisted baseline, which is not proof a capture was lost).
+                              // Both accessors are lock-free. One try for all three: a throw
+                              // skips the group's REMAINING emitters for that tick (tags
+                              // already written stay), counted once. The older persist_failures
+                              // tag is emitted last, so a throw in either new emitter skips it.
                               try {
+                                emit_guardian_baseline_unpersisted_heartbeat_tag(
+                                    tags, guardian_->baseline_unpersisted());
+                                emit_guardian_baseline_rebaselined_heartbeat_tag(
+                                    tags, guardian_->baseline_rebaselined_at_boot());
                                 emit_guardian_baseline_persist_heartbeat_tags(
                                     tags, guardian_->baseline_persist_failures());
                               } catch (...) {
                                   hb_guardian_contain(kHbGuardianBaseline,
                                                       "Guardian heartbeat baseline-persist tag "
-                                                      "failed (the tag was skipped this tick)");
+                                                      "failed (the remaining tags were "
+                                                      "skipped this tick)");
                               }
                             }
 #if defined(_WIN32) || defined(__linux__) || defined(__APPLE__)
