@@ -3377,7 +3377,7 @@ repository is unauthenticated RCE (#659), and the in-VM boot guard
 already listening, so the refusal is made **before the VM starts**. One shell
 policy, `deploy/docker/gateway-cookie-policy.sh` (installed as
 `/opt/yuzu_gw/gateway-cookie-policy.sh`), is shared by both callers: the cookie
-must be at least 32 characters from `[A-Za-z0-9._~+=-]`, must not start with `-`
+must be 32 to 255 characters from `[A-Za-z0-9._~+=-]`, must not start with `-`
 or `+`, and must not be the published default. (Whitespace, CR/LF, backslash,
 `&` and `$` are refused: busybox and GNU awk disagree on a backslash, so
 replicas would compute different cookies, and a `\&` makes the release start
@@ -3395,11 +3395,22 @@ script loop forever.)
   single-node default) also has its distribution listener and EPMD bound to
   loopback; a node advertising a routable address is protected by the random
   cookie only.
+- **Tarball / manual installs:** the unit needs `/opt/yuzu_gw/gateway-cookie-policy.sh`.
+  The release tarball ships it (and `yuzu-gateway.service`) at its top level; the
+  tarball upgrade step `rm -rf /opt/yuzu_gw` deletes a hand-installed copy, so
+  extract the tarball (or copy the file from `deploy/docker/` of the matching
+  source tag) after every upgrade. If it is missing the unit fails with
+  `.: cannot open /opt/yuzu_gw/gateway-cookie-policy.sh: No such file` (exit 2)
+  and, after the restart limit, `start-limit-hit`.
 - A start that bypasses both (running `bin/yuzu_gw` by hand, the
   `Dockerfile.gateway.chisel` demo image, which has no entrypoint) boots with
   OTP's own per-host random `~/.erlang.cookie`, which the in-VM guard then
   refuses (too short) unless the override is set. If `$HOME` is unwritable the VM
-  cannot create that file and crash-loops; supply `YUZU_GW_COOKIE`.
+  cannot create that file and crash-loops; supply `YUZU_GW_COOKIE`. On these
+  paths there is also no character check: a cookie containing `\&` makes the
+  release script's `replace_os_vars` awk loop forever at 100% CPU with no log, and
+  a backslash is dropped by busybox awk but kept by GNU awk. Keep `YUZU_GW_COOKIE`
+  to `[A-Za-z0-9._~+=-]` there too.
 
 All nodes in a cluster must share the same `YUZU_GW_COOKIE`. A single-node
 deployment sets either a strong cookie, or `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` for
@@ -3411,7 +3422,8 @@ or per-message integrity. Cross-node command traffic (including plugin
 parameters) therefore must only cross a network you trust. Keep EPMD and the
 distribution range on a dedicated cluster network and firewalled to the other
 gateway nodes. There is no encryption and the cluster network must be trusted and
-firewalled; TLS distribution (`-proto_dist inet_tls`) is not shipped. Do not run
+firewalled; TLS distribution (`-proto_dist inet_tls`) is not shipped and is
+tracked as #8158 (decision pending; owner: Fraser Jarvis; review by 2027-02-17). Do not run
 a multi-node gateway cluster across an untrusted network.
 
 The same guard also **refuses a cookie shorter than 32 characters** (HA WS-4

@@ -16,6 +16,8 @@
 #                                            disagree; relx's replace_os_vars awk loops forever
 #                                            at 100% CPU on `\&`)
 #   L  leading - or +                     -> refused (would be read as a VM flag)
+#   M  longer than 255 characters        -> refused, "longer than 255" (erl crashes in auth:init above that);
+#                                            exactly 255 is accepted
 #   P  published literal INSIDE a longer cookie, no override -> refused, "contains the published"
 #   D  unset + ALLOW=1                    -> started with a random 64-hex cookie, never logged
 #   D2 exactly the default + ALLOW=1      -> same
@@ -25,6 +27,8 @@
 #   E  a strong cookie                    -> started with that exact cookie
 #   F/H loopback / routable advertise     -> dist pinned / not pinned
 #   U  the systemd ExecStartPre string    -> same verdicts
+#   T  tripwire: the Docker image, .deb and .rpm build files, and the release tarball step, each install
+#      gateway-cookie-policy.sh (the unit needs it)
 #   X  parity: the Erlang guard's floor and published literal equal the shell policy's
 set -u
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -50,6 +54,13 @@ for s in "bash" "dash" "busybox sh"; do
 done
 shells="${shells#|}"
 echo "shells under test: $shells"
+# Fail loudly if a shell is missing: a silent bash-only pass is not a test of the busybox/dash
+# behaviour this policy exists for. YUZU_TEST_ALLOW_MISSING_SHELLS=1 opts out (local runs only).
+if [ "${YUZU_TEST_ALLOW_MISSING_SHELLS:-}" != "1" ]; then
+    for want in bash dash "busybox sh"; do
+        case "|$shells|" in *"|$want|"*) ;; *) echo "FAIL shells: '$want' not available (set YUZU_TEST_ALLOW_MISSING_SHELLS=1 to skip locally)"; exit 1 ;; esac
+    done
+fi
 
 fail=0
 pass() { echo "PASS $1"; }
@@ -58,7 +69,7 @@ bad()  { echo "FAIL $1: $2"; fail=1; }
 # run <addr> <shell> VAR=value...   -> sets out, err, rc
 run() {
     addr="$1"; sh="$2"; shift 2
-    out="$(env -i PATH="$PATH" YUZU_GW_ADVERTISE_ADDR="$addr" "$@" $sh "$work/opt/gateway-entrypoint.sh" 2>"$work/err")"
+    out="$(env -i PATH="$PATH" YUZU_GW_ADVERTISE_ADDR="$addr" "$@" timeout 20 $sh "$work/opt/gateway-entrypoint.sh" 2>"$work/err")"
     rc=$?
     err="$(cat "$work/err")"
 }
@@ -93,6 +104,9 @@ for sh in $shells; do
     refused W-amp "$sh" "outside the allowed" "YUZU_GW_COOKIE=${strong}\\&x"
     refused L-dash "$sh" "must not start with" "YUZU_GW_COOKIE=-${strong}"
     refused L-plus "$sh" "must not start with" "YUZU_GW_COOKIE=+${strong}"
+    long256="$(printf 'k%.0s' $(seq 256))"; long255="$(printf 'k%.0s' $(seq 255))"
+    refused M "$sh" "longer than 255" YUZU_GW_COOKIE="$long256"
+    if started_with M255 "$sh" YUZU_GW_COOKIE="$long255"; then pass "M255 [$sh]"; else bad "M255 [$sh]" "rc=$rc err=[$err]"; fi
     refused P "$sh" "contains the published default" YUZU_GW_COOKIE="$embedded"
     refused G "$sh" "outside the allowed" YUZU_GW_ALLOW_DEFAULT_COOKIE=1 "YUZU_GW_COOKIE=${strong}\\&"
 
@@ -117,14 +131,23 @@ unit="$repo/deploy/systemd/yuzu-gateway.service"
 pre="$(grep '^ExecStartPre=' "$unit" | grep -i 'cookie' | head -n1 | sed 's/^ExecStartPre=//')"
 if [ -z "$pre" ]; then bad U "no cookie ExecStartPre in the unit"; else
     pre="$(printf '%s' "$pre" | sed "s#/opt/yuzu_gw#$work/opt#g")"
-    unit_run() { out="$(env -i PATH="$PATH" "$@" /bin/sh -c "$pre" 2>&1)"; rc=$?; }
+    unit_run() { out="$(env -i PATH="$PATH" "$@" timeout 20 /bin/sh -c "$pre" 2>&1)"; rc=$?; }
     unit_run;                                         { [ $rc -ne 0 ] && printf '%s' "$out" | grep -qF "is unset, empty or the published default"; } && pass "U-unset" || bad U-unset "rc=$rc $out"
-    unit_run YUZU_GW_ALLOW_DEFAULT_COOKIE=1;          [ $rc -ne 0 ] && pass "U-no-override" || bad U-no-override "the unit must not honour the override"
+    unit_run YUZU_GW_ALLOW_DEFAULT_COOKIE=1;          { [ $rc -eq 1 ] && printf '%s' "$out" | grep -qF "is unset, empty or the published default"; } && pass "U-no-override" || bad U-no-override "the unit must not honour the override: rc=$rc $out"
     unit_run YUZU_GW_COOKIE=short;                    { [ $rc -ne 0 ] && printf '%s' "$out" | grep -qF "shorter than 32"; } && pass "U-short" || bad U-short "rc=$rc $out"
     unit_run "YUZU_GW_COOKIE=${strong}\\&";           { [ $rc -ne 0 ] && printf '%s' "$out" | grep -qF "outside the allowed"; } && pass "U-amp" || bad U-amp "rc=$rc $out"
-    unit_run YUZU_GW_COOKIE="$embedded";              [ $rc -ne 0 ] && pass "U-embedded" || bad U-embedded "rc=$rc"
+    unit_run YUZU_GW_COOKIE="$embedded";              { [ $rc -eq 1 ] && printf '%s' "$out" | grep -qF "contains the published default"; } && pass "U-embedded" || bad U-embedded "rc=$rc $out"
+    unit_run YUZU_GW_COOKIE="$(printf 'k%.0s' $(seq 256))"; { [ $rc -eq 1 ] && printf '%s' "$out" | grep -qF "longer than 255"; } && pass "U-long" || bad U-long "rc=$rc $out"
     unit_run YUZU_GW_COOKIE="$strong";                [ $rc -eq 0 ] && pass "U-ok" || bad U-ok "rc=$rc $out"
 fi
+
+# T: every packaging path that ships the unit must ship the policy file it sources.
+chk() { grep -qF "gateway-cookie-policy.sh" "$repo/$1" && pass "T $1" || bad "T $1" "does not install gateway-cookie-policy.sh"; }
+chk deploy/docker/Dockerfile.gateway
+chk deploy/packaging/debian/build-gateway-deb.sh
+chk deploy/packaging/rpm/build-gateway-rpm.sh
+chk deploy/packaging/rpm/yuzu-gateway.spec
+chk .github/workflows/release.yml
 
 # X: the Erlang in-VM guard and the shell policy must agree on the floor and the literal.
 erl_src="$repo/gateway/apps/yuzu_gw/src/yuzu_gw_app.erl"
