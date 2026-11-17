@@ -19,6 +19,9 @@
  */
 
 #include "agent_registry.hpp"
+#include "capability_fragments.hpp"
+#include "command_capability.hpp"
+#include "dispatch_caller.hpp"
 #include "instruction_store.hpp"
 #include "management_group_store.hpp"
 #include "offline_endpoint_store.hpp"
@@ -111,6 +114,9 @@ struct Harness {
     int64_t fake_now{1000};
     int dispatch_calls{0};
     std::vector<std::string> dispatched_plugins;
+    // "<plugin>.<action>" of every dispatch_fn call, in order (G01 R1: two pairs on the
+    // same plugin, e.g. echo.status and echo.purge_source, are told apart by this).
+    std::vector<std::string> dispatched_pairs;
     // canned[agent + "|" + plugin] -> (status, output)
     std::map<std::string, std::pair<int, std::string>> canned;
     // HA WS-3 3.4 review B1 regression harness: agent ids the fake
@@ -185,12 +191,13 @@ struct Harness {
         d.default_interval_seconds = 3600;
         d.fixing_stale_seconds = 1800;
         d.now_fn = [this] { return fake_now; };
-        d.dispatch_fn = [this](const std::string& plugin, const std::string&,
+        d.dispatch_fn = [this](const std::string& plugin, const std::string& action,
                                const std::vector<std::string>& agents, const std::string&,
                                const std::unordered_map<std::string, std::string>&,
                                const std::string& execid) -> yuzu::server::ConfinedDispatchOutcome {
             ++dispatch_calls;
             dispatched_plugins.push_back(plugin);
+            dispatched_pairs.push_back(plugin + "." + action);
             yuzu::server::ConfinedDispatchOutcome outcome;
             outcome.command_id = "cmd-" + execid;
             if (os_gate_unreadable_outcome) {
@@ -1518,4 +1525,255 @@ TEST_CASE("policy evaluator: an unwired Forensics plugin set scores every check 
     h.fake_now += 20;
     ev.tick(true);
     CHECK(h.status_of(pid, "agentA") == "unknown");
+}
+
+// ---------------------------------------------------------------------------
+// G01 R1: policy evaluation must not dispatch a pair whose execute gate (or
+// destructive class) an interactive caller could not clear. These cases use the
+// harness's own spy dispatch_fn, so the assertion is the authorization effect
+// itself (did the pair reach dispatch?), not a mirror of any decision. The pairs
+// are real capability rows from the full production registry:
+//   content_dist.execute_staged : Destructive, ExecuteGate::AdminOrApproval
+//   echo.purge_source           : Destructive, ExecuteGate::None
+//   echo.status                 : ReadOnly,    ExecuteGate::None   (control)
+// ---------------------------------------------------------------------------
+namespace {
+
+constexpr const char* kGatedPair = "content_dist.execute_staged";
+constexpr const char* kDestructivePair = "echo.purge_source";
+constexpr const char* kReadControlPair = "echo.status";
+
+// Define an instruction on a real <plugin>.<action> pair (id = "pair.<plugin>.<action>").
+std::string define_real_pair(Harness& h, const std::string& plugin, const std::string& action) {
+    InstructionDefinition d;
+    d.id = "pair." + plugin + "." + action;
+    d.name = d.id;
+    d.version = "1.0.0";
+    d.type = "question";
+    d.plugin = plugin;
+    d.action = action;
+    d.enabled = true;
+    REQUIRE(h.is.create_definition(d).has_value());
+    return d.id;
+}
+
+// Fragment + policy bound to the harness's static group: check = check_instruction, and
+// (when fix_instruction is non-empty) fix = fix_instruction with the harness's usual post-check.
+std::string author_real_pairs(Harness& h, const std::string& check_instruction,
+                              const std::string& fix_instruction = {}) {
+    std::string frag = std::string("apiVersion: yuzu.io/v1alpha1\nkind: PolicyFragment\n") +
+                       "spec:\n  check:\n    instruction: " + check_instruction +
+                       "\n    compliance: \"result.hostname != ''\"\n";
+    if (!fix_instruction.empty()) {
+        frag += "  fix:\n    instruction: " + fix_instruction + "\n";
+        frag += "  postCheck:\n    instruction: test.verify\n    compliance: \"result.fixed "
+                "== 'yes'\"\n";
+    }
+    auto fid = h.ps.create_fragment(frag);
+    REQUIRE(fid.has_value());
+    const std::string pol = std::string("apiVersion: yuzu.io/v1alpha1\nkind: Policy\n") +
+                            "spec:\n  fragment: " + *fid + "\n  managementGroups:\n    - " +
+                            h.group_id + "\n";
+    auto pid = h.ps.create_policy(pol);
+    REQUIRE(pid.has_value());
+    return *pid;
+}
+
+bool pair_was_dispatched(const Harness& h, const std::string& pair) {
+    for (const auto& p : h.dispatched_pairs)
+        if (p == pair)
+            return true;
+    return false;
+}
+
+// A plugin response the check CEL ("result.hostname != ''") scores non_compliant.
+void can_non_compliant(Harness& h, const std::string& plugin) {
+    h.canned["agentA|" + plugin] = {1, out_json("hostname", "")};
+    h.canned["agentB|" + plugin] = {1, out_json("hostname", "")};
+}
+
+} // namespace
+
+TEST_CASE("policy dispatch approval: a pair with an execute gate is not dispatched when a "
+          "policy check is evaluated on operator request",
+          "[pg][policy][evaluator][dispatch_approval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    can_non_compliant(h, "content_dist");
+    const auto check = define_real_pair(h, "content_dist", "execute_staged");
+    const auto pid = author_real_pairs(h, check);
+
+    PolicyEvaluator ev(h.deps());
+    auto kicked = ev.evaluate_now(pid);
+    (void)kicked; // the return shape for a refused check is not part of this case
+    h.fake_now += 20;
+    ev.tick(true);
+
+    CHECK_FALSE(pair_was_dispatched(h, kGatedPair));
+    CHECK(h.dispatch_calls == 0);
+}
+
+TEST_CASE("policy dispatch approval: a pair with an execute gate is not dispatched when a "
+          "policy check comes due on a scheduler tick with no operator action",
+          "[pg][policy][evaluator][dispatch_approval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    can_non_compliant(h, "content_dist");
+    const auto check = define_real_pair(h, "content_dist", "execute_staged");
+    const auto pid = author_real_pairs(h, check);
+    (void)pid;
+
+    PolicyEvaluator ev(h.deps());
+    ev.tick(true); // a fresh policy is claimed due on its first tick
+    h.fake_now += 20;
+    ev.tick(true);
+
+    CHECK_FALSE(pair_was_dispatched(h, kGatedPair));
+    CHECK(h.dispatch_calls == 0);
+}
+
+TEST_CASE("policy dispatch approval: a pair with an execute gate is not dispatched as a policy "
+          "fix on operator remediate",
+          "[pg][policy][evaluator][dispatch_approval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    can_non_compliant(h, "echo"); // the read-only control check scores non_compliant
+    const auto check = define_real_pair(h, "echo", "status");
+    const auto fix = define_real_pair(h, "content_dist", "execute_staged");
+    const auto pid = author_real_pairs(h, check, fix);
+
+    PolicyEvaluator ev(h.deps());
+    auto kicked = ev.evaluate_now(pid);
+    (void)kicked;
+    h.fake_now += 20;
+    ev.tick(true);
+    REQUIRE(h.status_of(pid, "agentA") == "non_compliant"); // precondition: the check ran
+    REQUIRE(pair_was_dispatched(h, kReadControlPair));
+
+    auto rr = ev.remediate(pid, {"agentA"});
+    (void)rr; // refusal wording is not part of this case
+
+    CHECK_FALSE(pair_was_dispatched(h, kGatedPair));
+}
+
+TEST_CASE("policy dispatch approval: a destructive pair is not dispatched when a policy check "
+          "is evaluated on operator request",
+          "[pg][policy][evaluator][dispatch_approval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    can_non_compliant(h, "echo");
+    const auto check = define_real_pair(h, "echo", "purge_source");
+    const auto pid = author_real_pairs(h, check);
+
+    PolicyEvaluator ev(h.deps());
+    auto kicked = ev.evaluate_now(pid);
+    (void)kicked;
+    h.fake_now += 20;
+    ev.tick(true);
+
+    CHECK_FALSE(pair_was_dispatched(h, kDestructivePair));
+    CHECK(h.dispatch_calls == 0);
+}
+
+TEST_CASE("policy dispatch approval: a destructive pair is not dispatched when a policy check "
+          "comes due on a scheduler tick with no operator action",
+          "[pg][policy][evaluator][dispatch_approval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    can_non_compliant(h, "echo");
+    const auto check = define_real_pair(h, "echo", "purge_source");
+    const auto pid = author_real_pairs(h, check);
+    (void)pid;
+
+    PolicyEvaluator ev(h.deps());
+    ev.tick(true);
+    h.fake_now += 20;
+    ev.tick(true);
+
+    CHECK_FALSE(pair_was_dispatched(h, kDestructivePair));
+    CHECK(h.dispatch_calls == 0);
+}
+
+TEST_CASE("policy dispatch approval: a destructive pair is not dispatched as a policy fix on "
+          "operator remediate",
+          "[pg][policy][evaluator][dispatch_approval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    can_non_compliant(h, "echo");
+    const auto check = define_real_pair(h, "echo", "status");
+    const auto fix = define_real_pair(h, "echo", "purge_source");
+    const auto pid = author_real_pairs(h, check, fix);
+
+    PolicyEvaluator ev(h.deps());
+    auto kicked = ev.evaluate_now(pid);
+    (void)kicked;
+    h.fake_now += 20;
+    ev.tick(true);
+    REQUIRE(h.status_of(pid, "agentA") == "non_compliant");
+    REQUIRE(pair_was_dispatched(h, kReadControlPair));
+
+    auto rr = ev.remediate(pid, {"agentA"});
+    (void)rr;
+
+    CHECK_FALSE(pair_was_dispatched(h, kDestructivePair));
+}
+
+TEST_CASE("policy dispatch approval: control, a read-only pair with no gate is still "
+          "dispatched by operator evaluate and by a scheduler tick",
+          "[pg][policy][evaluator][dispatch_approval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    h.canned["agentA|echo"] = {1, out_json("hostname", "yuzu-a")};
+    h.canned["agentB|echo"] = {1, out_json("hostname", "")};
+    const auto check = define_real_pair(h, "echo", "status");
+    const auto pid = author_real_pairs(h, check);
+
+    PolicyEvaluator ev(h.deps());
+    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
+    CHECK(pair_was_dispatched(h, kReadControlPair));
+    h.fake_now += 20;
+    ev.tick(true);
+    CHECK(h.status_of(pid, "agentA") == "compliant");
+    CHECK(h.status_of(pid, "agentB") == "non_compliant");
+
+    // A later tick, once the interval has elapsed, dispatches it again with no operator action.
+    const int before = h.dispatch_calls;
+    h.fake_now += 4000;
+    ev.tick(true);
+    CHECK(h.dispatch_calls == before + 1);
+}
+
+TEST_CASE("policy dispatch approval: control, the interactive dispatch chokepoint refuses a "
+          "non-admin caller for the same pairs",
+          "[policy][evaluator][dispatch_approval]") {
+    // The full production registry (no fixture fragment).
+    const CommandCapabilityRegistry registry{YUZU_ALL_CAPABILITY_FRAGMENTS};
+
+    // Gated pair: RBAC grants everything, so only the execute gate can refuse.
+    DispatchCaller operator_caller{.principal = "op", .principal_role = "Operator"};
+    const auto allow_all = [](std::string_view, std::string_view, authz::Operation) {
+        return true;
+    };
+    auto gated = detail::classify_and_authorize_dispatch(registry, operator_caller, "content_dist",
+                                                         "execute_staged", allow_all);
+    REQUIRE_FALSE(gated.has_value());
+    CHECK(gated.error().reason == detail::DispatchDenialReason::ApprovalRequired);
+
+    // Destructive pair with no gate: the interactive refusal is the Operator's missing
+    // Infrastructure:Delete grant.
+    const auto deny_infrastructure_delete = [](std::string_view, std::string_view securable,
+                                               authz::Operation op) {
+        return !(securable == "Infrastructure" && op == authz::Operation::Delete);
+    };
+    auto destructive = detail::classify_and_authorize_dispatch(
+        registry, operator_caller, "echo", "purge_source", deny_infrastructure_delete);
+    REQUIRE_FALSE(destructive.has_value());
+    CHECK(destructive.error().reason == detail::DispatchDenialReason::Forbidden);
 }
