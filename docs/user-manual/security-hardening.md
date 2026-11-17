@@ -227,7 +227,7 @@ encryption and no per-message integrity. Keep the cluster network trusted and
 firewalled to the gateway nodes only (EPMD 4369 and the distribution range
 9100-9105), and give every node a strong cookie. TLS distribution is tracked as
 #8158 (decision pending; owner: Fraser Jarvis; review by 2027-02-17). If a node
-will not start after an upgrade and you cannot reach the vendor docs, read the
+will not start and you cannot reach the vendor docs, read the
 refusal text: the container logs it on stderr (`[gateway-entrypoint] FATAL: ...`)
 and the systemd unit in the journal (`yuzu-gateway: ...`); it names the fix and
 never prints the cookie. A conforming cookie is 32 to 255 characters from

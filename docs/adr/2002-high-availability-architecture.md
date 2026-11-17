@@ -1039,7 +1039,7 @@ range as what an operator firewalls alongside the existing mgmt-plane (`:50063`)
 no `vm.args.src` fallback cookie exists; the container entrypoint and the systemd unit's `ExecStartPre`
 (one shared policy, `deploy/docker/gateway-cookie-policy.sh`) refuse an unset, published-default, short
 (< 32), over-long (> 255) or unsafe-character cookie before the VM starts; and `YUZU_GW_ALLOW_DEFAULT_COOKIE=1`
-no longer means "run with the published default": the entrypoint substitutes a random per-boot cookie, so
+does not mean "run with the published default": the entrypoint substitutes a random per-boot cookie, so
 replicas on the override are singletons that cannot cluster. The `inet_tls` migration is tracked as #8158
 (decision pending; owner: Fraser Jarvis; review by 2027-02-17).
 

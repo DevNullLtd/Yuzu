@@ -3386,8 +3386,8 @@ script loop forever.)
 - The container entrypoint (`deploy/docker/gateway-entrypoint.sh`) exits 1 with
   the reason when the cookie breaks the policy.
 - The systemd unit refuses the same in an `ExecStartPre`, with **no override**.
-- `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` (single ephemeral dev/CI node only) no longer
-  restores a known cookie: when the cookie is empty or *exactly* the published
+- `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` (single ephemeral dev/CI node only) does not
+  restore a known cookie: when the cookie is empty or *exactly* the published
   default, the entrypoint substitutes a fresh random per-boot cookie that is never
   logged. The override replaces nothing else: a custom cookie that is shorter
   than 32 characters, or that **starts with** the published literal, is refused
@@ -3398,10 +3398,10 @@ script loop forever.)
   loopback; a node advertising a routable address is protected by the random
   cookie only.
 - **Tarball / manual installs:** the unit needs `/opt/yuzu_gw/gateway-cookie-policy.sh`.
-  The release tarball ships it (and `yuzu-gateway.service`) at its top level; the
-  tarball upgrade step `rm -rf /opt/yuzu_gw` deletes a hand-installed copy, so
-  extract the tarball (or copy the file from `deploy/docker/` of the matching
-  source tag) after every upgrade. If it is missing the unit fails with
+  The release tarball ships it (and `yuzu-gateway.service`) at its top level; a
+  copy installed by hand outside the tarball does not survive a replaced
+  `/opt/yuzu_gw`, so extract the tarball (or copy `deploy/docker/gateway-cookie-policy.sh`
+  from the source tree) into it. If it is missing the unit fails with
   `.: cannot open /opt/yuzu_gw/gateway-cookie-policy.sh: No such file` (exit 2)
   and, after the restart limit, `start-limit-hit`.
 - A start that bypasses both (running `bin/yuzu_gw` by hand, the

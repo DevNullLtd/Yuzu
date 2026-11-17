@@ -51,7 +51,7 @@ log() {
 # (floor, character allow-list, published default) lives in ONE file shared with
 # the systemd unit: gateway-cookie-policy.sh.
 #
-# YUZU_GW_ALLOW_DEFAULT_COOKIE=1 (single ephemeral node, dev/CI) no longer means
+# YUZU_GW_ALLOW_DEFAULT_COOKIE=1 (single ephemeral node, dev/CI) does not mean
 # "run with the published default": a cookie that is unset, empty or EXACTLY the
 # published default is replaced by a fresh random per-boot value that is never
 # logged. Nothing else is tolerated: a short cookie, or one that STARTS with the
