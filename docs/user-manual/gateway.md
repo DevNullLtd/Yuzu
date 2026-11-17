@@ -3398,16 +3398,20 @@ script loop forever.)
   loopback; a node advertising a routable address is protected by the random
   cookie only.
 - **Tarball / manual installs:** the unit needs `/opt/yuzu_gw/gateway-cookie-policy.sh`.
-  The release tarball ships it (and `yuzu-gateway.service`) at its top level; a
-  copy installed by hand outside the tarball does not survive a replaced
-  `/opt/yuzu_gw`, so extract the tarball (or copy `deploy/docker/gateway-cookie-policy.sh`
-  from the source tree) into it. If it is missing the unit fails with
+  The release tarball ships it (and `yuzu-gateway.service`) inside its single
+  top-level directory `yuzu-gateway-<version>-linux-x64/`, so extract it with
+  `tar xzf yuzu-gateway-linux-x64.tar.gz -C /opt/yuzu_gw --strip-components=1`
+  (or copy `deploy/docker/gateway-cookie-policy.sh` from the source tree into
+  `/opt/yuzu_gw/`). If it is missing the unit fails with
   `.: cannot open /opt/yuzu_gw/gateway-cookie-policy.sh: No such file` (exit 2)
   and, after the restart limit, `start-limit-hit`.
 - A start that bypasses both (running `bin/yuzu_gw` by hand, the
   `Dockerfile.gateway.chisel` demo image, which has no entrypoint) boots with
-  OTP's own per-host random `~/.erlang.cookie`, which the in-VM guard then
-  refuses (too short) unless the override is set. If `$HOME` is unwritable the VM
+  OTP's own per-host random `~/.erlang.cookie` (the empty `-setcookie` line that
+  `vm.args.src` leaves when `YUZU_GW_COOKIE` is unset is accepted by the VM, which
+  creates that 20-character file, mode 0400, and uses it; checked against a real
+  release boot and by case V of `tests/shell/test_gateway_entrypoint_cookie.sh`),
+  which the in-VM guard then refuses (too short) unless the override is set. If `$HOME` is unwritable the VM
   cannot create that file and crash-loops; supply `YUZU_GW_COOKIE`. On these
   paths there is also no character check: a cookie containing `\&` makes the
   release script's `replace_os_vars` awk loop forever at 100% CPU with no log, and
@@ -3467,7 +3471,7 @@ network is still the first line of defense.
 
 > **Never set `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` in production.** It lets a node
 > start without an operator-supplied cookie (a random per-boot one is used by the
-> entrypoint; the in-VM guard is disabled for a start that bypasses it); it
+> entrypoint; the in-VM guard only warns for a start that bypasses the entrypoint); it
 > exists only for ephemeral dev/CI stacks (where it appears in the UAT compose
 > files). On `.deb`/`.rpm` installs the cookie is auto-generated into
 > `/etc/yuzu/gateway.env`. **Rotate** it by writing a new value there — and to

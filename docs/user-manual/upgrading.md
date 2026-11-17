@@ -8203,10 +8203,6 @@ sudo cp /opt/yuzu_gw/releases/*/sys.config /root/yuzu-gw-sys.config.saved
 # 2. Replace the release directory
 sudo rm -rf /opt/yuzu_gw
 sudo tar xzf yuzu-gateway-linux-x64.tar.gz -C /opt/
-#    The tarball carries gateway-cookie-policy.sh (and yuzu-gateway.service) at its top
-#    level; the unit's ExecStartPre sources /opt/yuzu_gw/gateway-cookie-policy.sh.
-#    Confirm it is present before starting:
-test -f /opt/yuzu_gw/gateway-cookie-policy.sh || echo "missing: see the cookie notes below"
 # 3. Restore the config (converted if the release needs it)
 sudo cp /root/yuzu-gw-sys.config.saved /opt/yuzu_gw/releases/*/sys.config
 # 4. Pre-flight the NEW release against that config, with the production YUZU_GW_*
@@ -9251,12 +9247,12 @@ always qualifies.
 | Install type | Effect | Action |
 |---|---|---|
 | `.deb` / `.rpm` (cookie written by the package: 64 hex) | Passes the check | None. The package also installs `/opt/yuzu_gw/gateway-cookie-policy.sh`, which the unit needs. |
-| Manual / tarball systemd unit | The unit has an `ExecStartPre` and **no override**. If `/opt/yuzu_gw/gateway-cookie-policy.sh` is missing the unit fails at once with `.: cannot open /opt/yuzu_gw/gateway-cookie-policy.sh: No such file` (exit 2) and, after a few restarts, `start-limit-hit`. A unit with no cookie (the override does not apply to the unit), a short cookie or an odd-character cookie fails to start. | The release tarball ships `gateway-cookie-policy.sh` and `yuzu-gateway.service` at its top level: copy the policy file to `/opt/yuzu_gw/` (extracting the tarball into `/opt/yuzu_gw` puts it there; a copy installed by hand outside the tarball does not survive a replaced `/opt/yuzu_gw`). The same file is `deploy/docker/gateway-cookie-policy.sh` in the source tree. Set a conforming `YUZU_GW_COOKIE` in `/etc/yuzu/gateway.env`. Then `systemctl reset-failed yuzu-gateway && systemctl start yuzu-gateway`. |
+| Manual / tarball systemd unit | The unit has an `ExecStartPre` and **no override**. If `/opt/yuzu_gw/gateway-cookie-policy.sh` is missing the unit fails at once with `.: cannot open /opt/yuzu_gw/gateway-cookie-policy.sh: No such file` (exit 2) and, after a few restarts, `start-limit-hit`. A unit with no cookie (the override does not apply to the unit), a short cookie or an odd-character cookie fails to start. | The release tarball ships `gateway-cookie-policy.sh` and `yuzu-gateway.service` at its top level: get it into `/opt/yuzu_gw/`: the release tarball has one top-level directory, `yuzu-gateway-<version>-linux-x64/`, containing the release, `gateway-cookie-policy.sh` and `yuzu-gateway.service`, so extract it with `tar xzf yuzu-gateway-linux-x64.tar.gz -C /opt/yuzu_gw --strip-components=1`, then install the bundled unit and run `systemctl daemon-reload`. The same file is `deploy/docker/gateway-cookie-policy.sh` in the source tree. Set a conforming `YUZU_GW_COOKIE` in `/etc/yuzu/gateway.env`. Then `systemctl reset-failed yuzu-gateway && systemctl start yuzu-gateway`. |
 | Container with a short or odd-character cookie | The entrypoint exits 1 before the VM starts (restart loop under `restart:`). | Set a conforming cookie, identical on every replica. |
 | Container on `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` with no cookie | Starts, but with a random per-boot cookie. **N replicas on the override are N singletons that cannot form a cluster** (each draws its own cookie), and the node is not reachable with the published value. | Fine for one throwaway node. For a cluster set one shared `YUZU_GW_COOKIE`. |
-| Container on the override with a real shared cookie that contains the old literal in the middle or at the end | Passed through unchanged (only an empty or *exactly* default cookie is replaced). | None; replace the cookie when convenient. |
-| Container on the override with a custom cookie that is **short** (under 32) or **starts with** the old literal | **Refused** (`... is shorter than 32 characters ...` or `... contains the published default value.`). | Drop the cookie to get a random per-boot one (single node), or set a strong shared cookie. |
-| Container **without** the override, real shared cookie that contains the old literal | Refused: `... contains the published default value.` | Generate a fresh cookie and set it on every replica. |
+| Container on the override with a real shared cookie that contains the published literal in the middle or at the end | Passed through unchanged (only an empty or *exactly* default cookie is replaced). | None; replace the cookie when convenient. |
+| Container on the override with a custom cookie that is **short** (under 32) or **starts with** the published literal | **Refused** (`... is shorter than 32 characters ...` or `... contains the published default value.`). | Drop the cookie to get a random per-boot one (single node), or set a strong shared cookie. |
+| Container **without** the override, real shared cookie that contains the published literal | Refused: `... contains the published default value.` | Generate a fresh cookie and set it on every replica. |
 
 Messages to search for (the cookie value is never printed):
 

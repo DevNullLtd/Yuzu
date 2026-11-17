@@ -31,8 +31,9 @@
 #   B  boundaries 31/32/255/256 chars; the literal at offset 0/1/middle/end, with and without the override
 #      (every refusal also asserts the cookie value is never echoed)
 #   U  the systemd ExecStartPre string    -> same verdicts
-#   T  tripwire: the Docker image, .deb and .rpm build files, and the release tarball step, each install
-#      gateway-cookie-policy.sh (the unit needs it)
+#   T  tripwire: a LIVE (non-comment) copy/install of gateway-cookie-policy.sh and the unit in the Docker
+#      image, .deb, .rpm and release tarball recipes
+#   V  a real BEAM accepts the empty -setcookie and uses its own ~/.erlang.cookie (needs erl)
 #   X  parity: the Erlang guard's floor and published literal equal the shell policy's
 set -u
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -178,13 +179,34 @@ if [ -z "$pre" ]; then bad U "no cookie ExecStartPre in the unit"; else
     unit_run YUZU_GW_COOKIE="$strong";                [ $rc -eq 0 ] && pass "U-ok" || bad U-ok "rc=$rc $out"
 fi
 
-# T: every packaging path that ships the unit must ship the policy file it sources.
-chk() { grep -qF "gateway-cookie-policy.sh" "$repo/$1" && pass "T $1" || bad "T $1" "does not install gateway-cookie-policy.sh"; }
-chk deploy/docker/Dockerfile.gateway
-chk deploy/packaging/debian/build-gateway-deb.sh
-chk deploy/packaging/rpm/build-gateway-rpm.sh
-chk deploy/packaging/rpm/yuzu-gateway.spec
-chk .github/workflows/release.yml
+# T: every packaging path must contain an ACTUAL copy/install/COPY of the policy file to where
+# the unit reads it (a commented-out line, or a bare mention, does not count), and the tarball
+# and both packages must carry the unit too.
+chk() { # file extended-regex-on-a-non-comment-line description
+    if grep -vE '^[[:space:]]*#' "$repo/$1" | grep -qE "$2"; then pass "T $1: $3"; else bad "T $1: $3" "no live line matching: $2"; fi
+}
+chk deploy/docker/Dockerfile.gateway '^[[:space:]]*COPY .*gateway-cookie-policy\.sh /opt/yuzu_gw/gateway-cookie-policy\.sh' "image COPY"
+chk deploy/packaging/debian/build-gateway-deb.sh '^[[:space:]]*install .*gateway-cookie-policy\.sh.*opt/yuzu_gw/gateway-cookie-policy\.sh' "deb install"
+chk deploy/packaging/debian/build-gateway-deb.sh '^[[:space:]]*cp .*yuzu-gateway\.service' "deb unit"
+chk deploy/packaging/rpm/build-gateway-rpm.sh '^[[:space:]]*cp .*gateway-cookie-policy\.sh.*SOURCES' "rpm source stage"
+chk deploy/packaging/rpm/build-gateway-rpm.sh '^[[:space:]]*cp .*yuzu-gateway\.service.*SOURCES' "rpm unit stage"
+chk deploy/packaging/rpm/yuzu-gateway.spec '^[[:space:]]*install .*gateway-cookie-policy\.sh .*opt/yuzu_gw/gateway-cookie-policy\.sh' "rpm spec install"
+chk deploy/packaging/rpm/yuzu-gateway.spec '^[[:space:]]*install .*yuzu-gateway\.service' "rpm spec unit"
+chk .github/workflows/release.yml '^[[:space:]]*cp deploy/docker/gateway-cookie-policy\.sh "\$\{STAGING\}/gateway-cookie-policy\.sh"' "tarball policy"
+chk .github/workflows/release.yml '^[[:space:]]*cp deploy/systemd/yuzu-gateway\.service "\$\{STAGING\}/yuzu-gateway\.service"' "tarball unit"
+
+# V: the empty `-setcookie` that vm.args.src leaves when YUZU_GW_COOKIE is unset is accepted by
+# a real BEAM, which then uses its own per-host random ~/.erlang.cookie (20 chars, created with
+# an isolated HOME here). Skipped when no erl is on PATH. (The in-VM guard then refuses that
+# short cookie unless the dev/CI override is set; the entrypoint-less chisel demo relies on it.)
+if command -v erl >/dev/null 2>&1; then
+    vhome="$work/erlhome"; mkdir -p "$vhome"
+    grep -E '^-(name|setcookie)' "$repo/gateway/config/vm.args.src" | sed 's/\${YUZU_GW_COOKIE:-}//; s/@\${YUZU_GW_ADVERTISE_ADDR:-127.0.0.1}/@127.0.0.1/' > "$work/vm.args"
+    vout="$(cd "$work" && env -i PATH="$PATH" HOME="$vhome" timeout 60 erl -noshell -args_file "$work/vm.args" -eval 'C=atom_to_list(erlang:get_cookie()), {ok,F}=file:read_file(filename:join(os:getenv("HOME"),".erlang.cookie")), io:format("V len=~p filematch=~p~n",[length(C), binary_to_list(F)=:=C]), halt().' 2>&1)"
+    printf '%s' "$vout" | grep -q "^V len=20 filematch=true" && pass "V empty -setcookie uses ~/.erlang.cookie" || bad "V empty -setcookie" "$vout"
+else
+    echo "SKIP V: no erl on PATH"
+fi
 
 # X: the Erlang in-VM guard and the shell policy must agree on the floor and the literal.
 erl_src="$repo/gateway/apps/yuzu_gw/src/yuzu_gw_app.erl"
