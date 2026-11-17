@@ -1430,12 +1430,10 @@ public:
         yuzu::PluginContext pctx{plugin_ctx_};
         if (!pctx.storage_set(yuzu::echo::kStorageOfflineKey, yuzu::echo::offline_reason_token(reason)))
             spdlog::warn("ECHO: failed to publish the storage-offline heartbeat tag");
-        if (retry_scheduled)
-            spdlog::warn("ECHO: storage offline ({}): {}; the open is retried in {} s",
-                         yuzu::echo::offline_reason_token(reason), detail, delay.count());
-        else
-            spdlog::warn("ECHO: storage offline ({}): {}; the open is not retried, restart the agent",
-                         yuzu::echo::offline_reason_token(reason), detail);
+        spdlog::warn("ECHO: storage offline ({}): {}; the open is {}", yuzu::echo::offline_reason_token(reason),
+                     detail,
+                     retry_scheduled ? std::format("retried in {} s", delay.count())
+                                     : std::string{"not retried, restart the agent"});
     }
 
     // One background open attempt (the retry thread). Returns true when the loop should end: the
