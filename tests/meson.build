@@ -5089,6 +5089,23 @@ test('forensics tier wiring lexical selftest',
   suite: 'docs',
   timeout: 30,
 )
+# G01: policy evaluation keeps applying the execute gate before it dispatches. server.cpp must hand
+# the PolicyEvaluator its capability registry (an evaluator without one refuses every dispatch, so a
+# dropped line stops every policy and no unit test notices), and policy_evaluator.cpp must reach
+# dispatch_fn from one place only, after the seam. Lexical gate + a selftest that mutates each
+# required statement in memory; both also run in .github/workflows/docs-lint.yml.
+test('policy dispatch wiring lexical',
+  _python3_test,
+  args: [files('test_policy_dispatch_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+test('policy dispatch wiring lexical selftest',
+  _python3_test,
+  args: [files('test_policy_dispatch_wiring_lexical_selftest.py')],
+  suite: 'docs',
+  timeout: 30,
+)
 
 # #5557: ownership-based execution admission is keyed on ExecutionOwnerKey and neither list gate
 # hands a service-scoped session unrestricted authority. Best-effort lexical tripwire over the server

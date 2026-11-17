@@ -57759,3 +57759,75 @@ TEST_CASE("MCP set_software_collection_settings: the supervised tier mints an ap
     CHECK_FALSE(rig.stored(rig.group_a));
     CHECK(mcp_audits(rig.ts, "software_estate.collection_settings.update|requested") == 0);
 }
+
+// G01: `blocked` (policy evaluation refused to dispatch the check or fix) is a status of its own in
+// the compliance reads, counted as failing.
+TEST_CASE("MCP Integration: get_fleet_compliance and get_compliance_summary carry the blocked count",
+          "[mcp][compliance]") {
+    McpTestServer ts;
+    auto capi = std::make_shared<yuzu::server::test::FnComplianceApi>();
+    capi->fleet_compliance_fn =
+        []() -> std::expected<yuzu::server::FleetCompliance, yuzu::server::PolicyReadError> {
+        yuzu::server::FleetCompliance fc;
+        fc.total_checks = 10;
+        fc.compliant = 5;
+        fc.blocked = 3;
+        fc.compliance_pct = 50.0;
+        return fc;
+    };
+    capi->compliance_summary_fn =
+        [](const std::string& policy_id)
+        -> std::expected<yuzu::server::ComplianceSummary, yuzu::server::PolicyReadError> {
+        yuzu::server::ComplianceSummary cs;
+        cs.policy_id = policy_id;
+        cs.compliant = 1;
+        cs.blocked = 2;
+        cs.total = 3;
+        return cs;
+    };
+    ts.compliance_api_for_test = capi;
+    ts.start();
+
+    auto fleet = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":9301,)"
+                         R"("params":{"name":"get_fleet_compliance","arguments":{}}})");
+    REQUIRE(fleet);
+    auto fleet_text = nlohmann::json::parse(
+        nlohmann::json::parse(fleet->body)["result"]["content"][0]["text"].get<std::string>());
+    CHECK(fleet_text["blocked"] == 3);
+
+    auto summary = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":9302,)"
+                           R"("params":{"name":"get_compliance_summary","arguments":{"policy_id":"pol-1"}}})");
+    REQUIRE(summary);
+    auto summary_text = nlohmann::json::parse(
+        nlohmann::json::parse(summary->body)["result"]["content"][0]["text"].get<std::string>());
+    CHECK(summary_text["blocked"] == 2);
+}
+
+TEST_CASE("MCP Integration: the compliance read output schemas declare blocked",
+          "[mcp][compliance]") {
+    McpTestServer ts;
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":9303})");
+    REQUIRE(res);
+    const auto tools = nlohmann::json::parse(res->body)["result"]["tools"];
+    int seen = 0;
+    for (const auto& t : tools) {
+        const auto name = t["name"].get<std::string>();
+        if (name != "get_compliance_summary" && name != "get_fleet_compliance" &&
+            name != "get_policy" && name != "get_policy_agent_statuses")
+            continue;
+        ++seen;
+        INFO(name);
+        const auto schema_text = t["outputSchema"].dump();
+        CHECK(schema_text.find("\"blocked\":{\"type\":\"integer\"}") != std::string::npos);
+        // The two flat count schemas list every status as required, blocked included.
+        if (name == "get_compliance_summary" || name == "get_fleet_compliance") {
+            const auto& req = t["outputSchema"]["required"];
+            bool has_blocked = false;
+            for (const auto& r : req)
+                has_blocked = has_blocked || r == "blocked";
+            CHECK(has_blocked);
+        }
+    }
+    CHECK(seen == 4);
+}

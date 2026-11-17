@@ -3348,3 +3348,30 @@ TEST_CASE("openapi documents: the score-policy request-size text matches the bod
             CHECK(allowed.contains(it->str()));
     }
 }
+
+// G01: `blocked` is a status of its own in the compliance schemas and the status table.
+TEST_CASE("openapi_spec_json(): the compliance schemas and the status table declare blocked",
+          "[openapi][compliance]") {
+    using json = nlohmann::json;
+    const json spec = json::parse(yuzu::server::openapi_spec_json());
+    const auto& schemas = spec.at("components").at("schemas");
+
+    for (const char* name : {"ComplianceSummaryCounts", "ComplianceFleetSummary"}) {
+        INFO(name);
+        const auto& schema = schemas.at(name);
+        REQUIRE(schema.at("properties").contains("blocked"));
+        CHECK(schema.at("properties").at("blocked").at("type") == "integer");
+        bool required = false;
+        for (const auto& r : schema.at("required"))
+            required = required || r == "blocked";
+        CHECK(required);
+    }
+    const auto status_text =
+        schemas.at("CompliancePolicyAgentStatus").at("properties").at("status").at("description");
+    CHECK(status_text.get<std::string>().find("blocked") != std::string::npos);
+
+    // The "Status values" table is a guide, served in the with-guides document.
+    const auto& with_guides = yuzu::server::openapi_spec_with_guides_json();
+    CHECK(with_guides.find("[\"blocked\", \"Policy evaluation refused to dispatch") !=
+          std::string::npos);
+}

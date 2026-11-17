@@ -104,6 +104,16 @@ jobs:
       - name: Forensics tier wiring gate self-test (#4990)
         run: python3 -I tests/test_forensics_tier_wiring_lexical_selftest.py
 
+      # G01: server.cpp keeps handing the policy evaluator its capability registry (an evaluator
+      # without one refuses every dispatch, so a dropped line stops every policy and no unit test
+      # notices) and policy_evaluator.cpp keeps one dispatch site behind the refusal seam. The
+      # self-test mutates each required statement in memory and proves the gate names it.
+      - name: Policy dispatch wiring gate (G01)
+        run: python3 -I tests/test_policy_dispatch_wiring_lexical.py
+
+      - name: Policy dispatch wiring gate self-test (G01)
+        run: python3 -I tests/test_policy_dispatch_wiring_lexical_selftest.py
+
       # #5557: ownership-based execution admission is keyed on ExecutionOwnerKey, never a
       # service-scoped session's username, and neither list gate hands a service-scoped session
       # unrestricted authority. Best-effort lexical (not a control-flow proof): the dispatched_by
