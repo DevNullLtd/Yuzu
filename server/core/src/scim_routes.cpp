@@ -2251,7 +2251,7 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
         // direct deref, rather than trust a caller-supplied non-null.
         if (!auth_mgr) {
             spdlog::error("ScimRoutes: cannot provision '{}' — no AuthManager configured",
-                         input.user_name);
+                         ::yuzu::log_key_token(input.user_name));
             send_scim_error(res, 500, "SCIM provisioning is unavailable (no AuthManager configured)");
             audit(auth_mgr, audit_store, req, "scim.user.provisioned", "failure", input.user_name);
             record_request(auth_mgr, "create", 500);
@@ -2261,7 +2261,7 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
         if (!db) {
             spdlog::error("ScimRoutes: cannot provision '{}' — no AuthDB configured (SCIM "
                          "provisioning requires durable provenance tracking)",
-                         input.user_name);
+                         ::yuzu::log_key_token(input.user_name));
             send_scim_error(res, 500, "SCIM provisioning is unavailable (no AuthDB configured)");
             audit(auth_mgr, audit_store, req, "scim.user.provisioned", "failure", input.user_name);
             record_request(auth_mgr, "create", 500);
@@ -2350,7 +2350,7 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
             // password).
             if (!auth_mgr->reactivate_user(input.user_name)) {
                 spdlog::error("ScimRoutes: reactivate_user failed reviving '{}'",
-                             input.user_name);
+                             ::yuzu::log_key_token(input.user_name));
                 send_scim_error(res, 500, "failed to revive the underlying account");
                 audit(auth_mgr, audit_store, req, "scim.user.provisioned", "failure",
                      input.user_name);
@@ -2389,7 +2389,7 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                     spdlog::error("ScimRoutes: revive role check — auth store unavailable "
                                   "reading '{}'; undoing the reactivation and answering 503, "
                                   "not a role refusal",
-                                  ::yuzu::log_token(input.user_name));
+                                  ::yuzu::log_token(::yuzu::log_key_token(input.user_name)));
                     // Counted BEFORE the undo: the undo needs the same store, so in a real
                     // outage it is likely to fail too, and that 500 path must still move the
                     // signal YuzuScimGuardStoreUnavailable keys on. (Cost note: each retried
@@ -2401,7 +2401,7 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                     spdlog::warn("ScimRoutes: refusing to revive '{}' via POST — role is not "
                                 "'user' (an operator elevated this account before it was "
                                 "tombstoned)",
-                                input.user_name);
+                                ::yuzu::log_key_token(input.user_name));
                 }
                 // The pre-check above already refused an elevated tombstone, so reaching here
                 // means the role changed in the window between that read and the reactivation (a
@@ -2456,7 +2456,7 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                 // failure — catch rather than let it unwind to a bare 500.
                 spdlog::error(
                     "ScimRoutes: CSPRNG failure minting a discard password for '{}': {}",
-                    input.user_name, e.what());
+                    ::yuzu::log_key_token(input.user_name), e.what());
                 send_scim_error(res, 503, "temporarily unable to provision (CSPRNG unavailable)");
                 audit(auth_mgr, audit_store, req, "scim.user.provisioned", "failure",
                      input.user_name);
@@ -2503,7 +2503,7 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                 spdlog::warn("ScimRoutes: set_identity_source failed for '{}' — the account "
                             "will still function, but the Settings UI may misrender its login "
                             "surface",
-                            input.user_name);
+                            ::yuzu::log_key_token(input.user_name));
             }
 
             // M-ORPHAN (UP-6/B1): set provenance BEFORE creating the
@@ -2516,7 +2516,7 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                                                      std::string(kProvisioningSourceScim));
                 !r) {
                 spdlog::error("ScimRoutes: set_provisioning_source failed for '{}', rolling back",
-                             input.user_name);
+                             ::yuzu::log_key_token(input.user_name));
                 (void)compensate_created_account(auth_mgr, audit_store, analytics_store, req,
                                                  input.user_name, "provisioning_source_failed");
                 send_scim_error(res, 500, "failed to record provisioning provenance");

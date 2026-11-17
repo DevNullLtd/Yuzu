@@ -428,7 +428,11 @@ start_all() {
         fi
     done
     local session_id
-    session_id=$(grep "Registered with server" "$UAT_DIR/agent.log" | python -c "import sys,re; lines=sys.stdin.read(); m=re.findall(r'session=[^ ,)]+', lines); print(m[-1] if m else 'unknown')" 2>/dev/null || echo "unknown")
+    # The agent log carries only a session_fp (F50); the id comes from the server's own
+    # "ProxyRegister succeeded" line, joined on the fingerprint.
+    . "$YUZU_ROOT/scripts/lib/agent-session-fp.sh"
+    session_id=$(session_for_fp "$(agent_session_fp "$UAT_DIR/agent.log")" < "$UAT_DIR/server.log")
+    session_id="${session_id:-unknown}"
     ok "Agent up ($session_id)"
 
     if echo "$session_id" | grep -q "gw-session"; then

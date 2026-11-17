@@ -427,8 +427,11 @@ start_all() {
                 return 1
             fi
         done
-        LAST_SESSION_ID=$(grep "Registered with server" "$log" | \
-            python3 -c "import sys,re; m=re.findall(r'session=[^ ,)]+', sys.stdin.read()); print(m[-1] if m else 'unknown')" 2>/dev/null || echo "unknown")
+        # The agent log carries only a session_fp (F50); the id comes from the server container's
+        # "ProxyRegister succeeded" line, joined on the fingerprint.
+        . "$YUZU_ROOT/scripts/lib/agent-session-fp.sh"
+        LAST_SESSION_ID=$(docker logs yuzu-uat-server 2>&1 | session_for_fp "$(agent_session_fp "$log")")
+        LAST_SESSION_ID="${LAST_SESSION_ID:-unknown}"
         ok "$label agent up ($LAST_SESSION_ID, ${waited}s)"
 
         if echo "$LAST_SESSION_ID" | grep -q "gw-session"; then

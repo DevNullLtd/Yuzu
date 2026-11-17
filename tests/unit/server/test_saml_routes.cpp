@@ -15,6 +15,7 @@
  * the platform-guarded "enabled-but-fails" tests are skipped there.
  */
 
+#include <yuzu/log_token.hpp>
 #include "auth_routes.hpp"
 #include "saml_principal.hpp"
 #include "saml_provider.hpp"
@@ -2416,5 +2417,10 @@ TEST_CASE("SAML ACS error text is neutralised for the log line and the audit det
     CHECK(safe.find(';') == std::string::npos);
     CHECK(safe.find("forged") != std::string::npos);
     // Bounded: a megabyte of attacker text cannot reach the audit row whole.
-    CHECK(yuzu::server::detail::neutralise_saml_error(std::string(1 << 20, 'a')).size() <= 512);
+    // The audit detail / event keeps exactly 128 bytes (head only, no marker); the log keeps 256.
+    const std::string big(1 << 20, 'a');
+    CHECK(yuzu::server::detail::neutralise_saml_error(big).size() == 128);
+    CHECK(yuzu::log_key_token(big).size() == 256);
+    CHECK(yuzu::server::detail::neutralise_saml_error(std::string(128, 'a')).size() == 128);
+    CHECK(yuzu::server::detail::neutralise_saml_error(std::string(127, 'a')).size() == 127);
 }

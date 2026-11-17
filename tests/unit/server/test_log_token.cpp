@@ -256,6 +256,15 @@ TEST_CASE("log_key_token: every C1 control folds to one '_' per code point (F71)
     CHECK(log_key_token("\xC2\xA9") == "\xC2\xA9");
 }
 
+TEST_CASE("log_key_token: documented limit, malformed 8-bit bytes pass (L)",
+          "[log_token][log_key_token]") {
+    // A lone 0x9B or a trailing C2 is not a well-formed sequence: NOT folded (log_token folds them).
+    CHECK(log_key_token("a\x9B" "b") == "a\x9B" "b");
+    CHECK(log_key_token("a\xC2") == "a\xC2");
+    CHECK(log_token("a\x9B" "b") == "a_b");
+    CHECK(log_token("a\xC2") == "a_");
+}
+
 TEST_CASE("log_key_token: over-length input is capped with a UTF-8-aware head~tail cut",
           "[log_token][log_key_token]") {
     constexpr std::size_t kMax = kGuardianLogIdMaxBytes;   // 256

@@ -69,13 +69,26 @@ private:
 /// `last_error()`. The text is inspected only to pick one of these constants; nothing from it is
 /// ever copied out. Substring matching on libpq's stable phrases; anything unrecognised falls to
 /// the generic cause. ASCII, one line.
+inline constexpr const char* kConnectFailureGeneric =
+    "connection failed (details withheld; check host, port and credentials)";
+
 [[nodiscard]] inline const char* connect_failure_cause(std::string_view err) noexcept {
     const auto has = [&](std::string_view needle) { return err.find(needle) != std::string_view::npos; };
+    // ORDER MATTERS: libpq quotes caller-chosen names (a database or role called "SSL_prod" or
+    // "No such file or directory"), so the specific, structural phrases come first and the
+    // does-not-exist test comes before the loose ones. A missing sslrootcert says "does not
+    // exist" too, so the TLS phrases precede it.
     if (has("password authentication failed") || has("authentication failed") ||
         has("no password supplied") || has("password retrieved from file"))
         return "authentication failed (credentials rejected or missing)";
     if (has("no pg_hba.conf entry"))
         return "refused by server access rules (no matching pg_hba.conf entry)";
+    if (has("SSL error") || has("SSL SYSCALL") || has("SSL connection") ||
+        has("SSL is not enabled") || has("does not support SSL") || has("root certificate file") ||
+        has("certificate verify failed") || has("sslmode"))
+        return "TLS negotiation or certificate verification failed";
+    if (has("\" does not exist"))
+        return "database or role does not exist";
     if (has("could not translate host name") || has("Name or service not known") ||
         has("Temporary failure in name resolution"))
         return "host name could not be resolved";
@@ -84,15 +97,11 @@ private:
     if (has("Connection refused") || has("No such file or directory") ||
         has("Is the server running"))
         return "server not reachable (connection refused or no such socket)";
-    if (has("SSL") || has("TLS") || has("certificate"))
-        return "TLS negotiation or certificate verification failed";
-    if (has("does not exist"))
-        return "database or role does not exist";
     if (has("starting up") || has("shutting down") || has("too many clients"))
         return "server not accepting connections (starting, stopping or full)";
     if (has("out of memory"))
         return "out of memory";
-    return "connection failed (details withheld; check host, port and credentials)";
+    return kConnectFailureGeneric;
 }
 
 /// RAII owner for a `PGconn*`. `PQfinish` runs on scope exit. Move-only.

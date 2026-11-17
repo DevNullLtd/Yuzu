@@ -280,7 +280,12 @@ agent_map() {
     for c in $(compose ps -q agent); do
         local name sess
         name="$(docker inspect -f '{{.Name}}' "$c" | tr -d /)"
-        sess="$(docker logs "$c" 2>&1 | sed -n 's/.*Registered with server (session=\([^,]*\),.*/\1/p' | tail -1)"
+        # The agent log carries only session_fp= (F50): the first 8 hex of SHA-256(session id).
+        # Join it to the id in the route table, the same key the rest of this script uses.
+        local fp
+        fp="$(docker logs "$c" 2>&1 | grep 'Registered with server' | grep -oE 'session_fp=[0-9a-f]{8}' | tail -1 | cut -d= -f2)"
+        sess=""
+        [ -z "$fp" ] || sess="$(psql_q "SELECT session_id FROM gateway_route_store.agent_routes WHERE encode(sha256(convert_to(session_id,'UTF8')),'hex') LIKE '$fp%' LIMIT 1")"
         echo "$name,$c,$sess"
     done > "$run/agent_map.csv"
 }

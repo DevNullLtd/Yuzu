@@ -2515,7 +2515,7 @@ applies to these two flags).
 | Action | Result | When |
 |---|---|---|
 | `auth.saml_login` | `ok` | ACS validation passed; session minted |
-| `auth.saml_login_failed` | `error` | ACS validation failed (signature, audience, expiry, replay, etc.) |
+| `auth.saml_login_failed` | `error` | ACS validation failed (signature, audience, expiry, replay, etc.). Detail = `detail::neutralise_saml_error`: `log_key_token` (folds C0/C1/Unicode line separators, caps 256) then `sanitize_detail_value` (`;`/`=` to `_`, head-only clip to 128 bytes, no marker); the log line uses `log_key_token` alone (256) |
 
 ### Security posture
 

@@ -11,6 +11,20 @@ A statement elsewhere on this page that a rollback, a mixed fleet or an in-place
 
 Running `dev` between releases? Some entries below describe changes on `dev` that are not in a release yet. For what a `git pull` of `dev` changed, run the repository script `python3 scripts/whats-new.py` (`--versions` for the version bumps, rebuild notes and Docker image bumps); see `changelog.d/README.md`.
 
+## ⚠️ Breaking: some log lines and audit details changed shape (log parsers and runbooks)
+
+**In short.** Affected: anything that parses the server or agent logs, a runbook that sends on-call to a log line for Postgres detail, and a SIEM rule keyed on a changed string. Alert rules and metrics are unchanged.
+
+**What changed.**
+
+- **The agent's registration line** is now `Registered with server (session_fp=<8 hex>, enrollment=...)`. It was `(session=<id>, enrollment=...)`. The fingerprint is the first 8 hex of the SHA-256 of the session id, which is a bearer credential. A parser that took `session=` from this line must take the id from the server's `[gateway] ProxyRegister succeeded: agent=<id>, session=<id>` line (or the gateway route table) and match on the fingerprint; the bundled UAT and HA scripts do.
+- **Postgres connect failures** (the pool's `PgPool: connection attempt failed:` line, the leader elector's `dedicated connection failed:` line, the `[readyz] Postgres not reachable` line, `yuzu_pg_canary`) now log one of a fixed set of causes (`authentication failed ...`, `server not reachable ...`, `connection timed out`, and so on) instead of libpq's text, and `PgPool::last_error()` returns the same cause. Host, port and database name are no longer printed. Diagnose with `psql` against the same DSN and the PostgreSQL server log. The `YuzuServerPostgresUnreachable` alert is unchanged; its annotation now says this.
+- **`auth.saml_login_failed` audit detail** (and the matching analytics event field) is the rejection reason with control and C1 characters folded, `;` and `=` replaced by `_`, and clipped to its first 128 bytes with no truncation marker; it used to be the raw text. The server log line for the same failure keeps up to 256 bytes.
+- **Login and SSO log lines** that print a user name or NameID (`Auth failed: unknown user '...'`, `Login blocked ...`, `SAML session created ...`, `SamlProvider: assertion accepted (name_id=...)` and similar) now fold control characters, C1 controls and Unicode line separators to `_` in the printed copy; stored values are unchanged.
+- **`audit_token` and `log_key_token`** now fold every well-formed C1 code point (U+0080-U+009F), not just NEL.
+
+**What to do.** Update log parsers and runbooks as above. No data migration.
+
 ## ⚠️ Breaking: on-demand software sync asks for confirmation, is paced instead of capped at 500 devices, and cools down per group
 
 **In short.** Affected: anything that calls `POST /api/v1/hardware/sync` or the MCP tool `sync_hardware_software` for a whole group or the whole fleet (the Software page's **Whole fleet** choice, scripts and agentic workers). To do: send `"confirm": true` with a `group:<id>` or `__all__` scope, give the caller the global `ManagementGroup:Write` grant if it names the whole fleet, and stop relying on the 500-device refusal and the 60-second per-operator gap.

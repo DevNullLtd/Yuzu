@@ -1567,6 +1567,28 @@ TEST_CASE("POST /login: a malformed username never forges a log line (F20)",
     CHECK(text.find("\xC2\x9B") == std::string::npos);
 }
 
+TEST_CASE("POST /login: unknown-user, bad-password and over-length-password lines fold the username (F20)",
+          "[pg][mfa][routes][auth_routes][log_injection]") {
+    AuthRoutesHarness h;
+    const std::string evil = "alice%0A%5BERROR%5D%20forged%1B%5B2J%C2%9B31m";
+    const std::string huge(2048, 'p'); // > kMaxPasswordBytes: the over-length-password site
+    yuzu::test::LogCapture cap{spdlog::level::warn};
+    for (const std::string& body :
+         {"username=" + evil + "&password=wrong",            // unknown user
+          "username=" + evil + "&password=" + huge,           // over-length password
+          std::string("username=alice&password=wrong")}) {    // bad password for a real name
+        auto r = h.sink.Post("/login", body, "application/x-www-form-urlencoded");
+        REQUIRE(r);
+        CHECK(r->status == 401);
+    }
+    cap.stop();
+    const std::string text = cap.text();
+    INFO(text);
+    CHECK(text.find("forged") != std::string::npos);
+    CHECK(yuzu::test::stray_control_bytes(text) == 0);
+    CHECK(text.find("\xC2\x9B") == std::string::npos);
+}
+
 TEST_CASE("POST /login: locked-account 401 body is shape-identical to a bad-password 401 (no oracle)",
           "[pg][mfa][routes][auth_routes][lockout]") {
     AuthRoutesHarness h;

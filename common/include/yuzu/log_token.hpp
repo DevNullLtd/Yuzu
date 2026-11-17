@@ -47,8 +47,7 @@
  *     `C:\Program Files\...` or a legitimate non-ASCII name must survive unchanged wherever
  *     possible, which is exactly why log_token/log_id_token are wrong for this use (both map
  *     space to '_'). It maps only control bytes, DEL, and these UTF-8 byte sequences to '_': every
- *     C1 control U+0080-U+009F (`C2 80`..`C2 9F`, one '_' per code point, so the 8-bit CSI/OSC
- *     forms cannot reach a terminal), including NEL (U+0085, `C2 85`), LINE SEPARATOR (U+2028, `E2 80 A8`) and PARAGRAPH SEPARATOR
+ *     WELL-FORMED C1 control U+0080-U+009F (`C2 80`..`C2 9F`, one '_' per code point), including NEL (U+0085, `C2 85`), LINE SEPARATOR (U+2028, `E2 80 A8`) and PARAGRAPH SEPARATOR
  *     (U+2029, `E2 80 A9`) -- folded even though they are otherwise-passable bytes >= 0x80,
  *     because Python's str.splitlines(), used by the driver script that reads agent logs as
  *     evidence, treats those three code points as line breaks exactly like '\n'; leaving them
@@ -57,6 +56,12 @@
  *     log_id_token, but UTF-8-aware at both cut points (see the function body for why the head
  *     and tail boundary walks go in OPPOSITE directions -- getting that backward silently
  *     produces invalid UTF-8 or blows the byte budget).
+ *
+ * LIMIT (log_key_token only): bytes that are not part of a well-formed sequence are NOT folded -- a lone
+ * 0x80-0x9F byte (the single-byte Latin-1 spelling of a C1 control) or a trailing `C2` passes through
+ * unchanged, as it did before the C1 fold. A UTF-8 terminal does not act on them, but a Latin-1 terminal
+ * could; this function is not a guarantee that no 8-bit control byte reaches a terminal. log_token
+ * folds such bytes one '_' each.
  *
  * All three are lossy by design, so two different raw inputs CAN share one token. For
  * log_token/log_id_token: "a b" and "a_b"; two long ids that share both their head and their

@@ -26,6 +26,7 @@
 int main(int argc, char** argv) {
     using yuzu::server::pg::PgConn;
     using yuzu::server::pg::PgResult;
+    using yuzu::server::pg::connect_failure_cause;
 
     const char* dsn = argc > 1 ? argv[1] : std::getenv("YUZU_POSTGRES_DSN");
     if (dsn == nullptr || dsn[0] == '\0') {
@@ -37,7 +38,7 @@ int main(int argc, char** argv) {
 
     PgConn conn{PQconnectdb(dsn)};
     if (PQstatus(conn.get()) != CONNECTION_OK) {
-        std::fputs(std::format("canary: connect failed: {}", PQerrorMessage(conn.get())).c_str(),
+        std::fputs(std::format("canary: connect failed: {}\n", connect_failure_cause(PQerrorMessage(conn.get()))).c_str(),
                    stderr);
         return 1;
     }

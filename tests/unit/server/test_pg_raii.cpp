@@ -288,7 +288,7 @@ TEST_CASE("PgTxn commit() and an aborted transaction", "[pg][raii]") {
 
 // ── connect_failure_cause (F56): fixed causes, nothing copied from libpq text ──
 
-TEST_CASE("connect_failure_cause never echoes libpq text", "[pg][raii][log_injection][F56]") {
+TEST_CASE("connect_failure_cause never echoes libpq text", "[raii][log_injection][F56]") {
     using yuzu::server::pg::connect_failure_cause;
     // A URI DSN whose password contained '/' leaves a fragment of it in the port/dbname libpq
     // quotes; the cause must be a constant that contains none of it.
@@ -298,15 +298,31 @@ TEST_CASE("connect_failure_cause never echoes libpq text", "[pg][raii][log_injec
     const std::string cause = connect_failure_cause(leaky);
     CHECK(cause.find("s3cr3tfrag") == std::string::npos);
     CHECK(cause.find('\n') == std::string::npos);
-    CHECK(cause == connect_failure_cause("Connection refused"));
 
-    const std::string auth =
-        connect_failure_cause("FATAL:  password authentication failed for user \"app\"\n");
-    CHECK(auth.find("app") == std::string::npos);
-    CHECK(auth != cause);
-
-    // Unrecognised text falls to the generic constant, never to the input.
     const std::string generic = connect_failure_cause("weird\nforged line s3cr3tfrag");
     CHECK(generic.find("s3cr3tfrag") == std::string::npos);
-    CHECK(generic.find('\n') == std::string::npos);
+    CHECK(generic == yuzu::server::pg::kConnectFailureGeneric);
+}
+
+TEST_CASE("connect_failure_cause: each branch, and the mis-bucketing cases", "[raii][F56]") {
+    using yuzu::server::pg::connect_failure_cause;
+    using yuzu::server::pg::kConnectFailureGeneric;
+    const auto is = [](const char* in, std::string_view needle) {
+        return std::string_view{connect_failure_cause(in)}.find(needle) != std::string_view::npos;
+    };
+    CHECK(is("FATAL:  password authentication failed for user \"app\"", "authentication failed"));
+    CHECK(is("FATAL:  no pg_hba.conf entry for host \"1.2.3.4\"", "pg_hba.conf"));
+    CHECK(is("SSL error: certificate verify failed", "TLS"));
+    CHECK(is("FATAL:  database \"x\" does not exist", "does not exist"));
+    CHECK(is("could not translate host name \"h\" to address", "could not be resolved"));
+    CHECK(is("connection to server failed: timeout expired", "timed out"));
+    CHECK(is("connection failed: Connection refused", "not reachable"));
+    CHECK(is("FATAL:  the database system is starting up", "not accepting"));
+    CHECK(is("out of memory", "out of memory"));
+    CHECK(std::string_view{connect_failure_cause("something else")} == kConnectFailureGeneric);
+    // A missing sslrootcert says "does not exist" but is a TLS failure, not a missing database.
+    CHECK(is("root certificate file \"/x/root.crt\" does not exist", "TLS"));
+    // A database or role that merely CONTAINS "SSL" is a missing database, not a TLS failure.
+    CHECK(is("FATAL:  database \"SSL_prod\" does not exist", "does not exist"));
+    CHECK(is("FATAL:  role \"No such file or directory\" does not exist", "does not exist"));
 }

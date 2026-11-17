@@ -2270,7 +2270,7 @@ PasswordCheckResult AuthRoutes::verify_password_with_lockout(const std::string& 
         }
         spdlog::warn("password verification for '{}' could not complete ({}) - transient, not "
                      "counted toward lockout (source {})",
-                     username,
+                     ::yuzu::log_key_token(username),
                      verified.error() == auth::VerifyFailure::kStoreUnavailable
                          ? "auth store unavailable"
                          : "credential changed concurrently",
@@ -2304,7 +2304,7 @@ PasswordCheckResult AuthRoutes::verify_password_with_lockout(const std::string& 
                                 " window_secs=" + std::to_string(cfg_.auth_lockout_window_secs))) {
                         spdlog::error("audit emission FAILED for auth.lockout.applied user='{}' "
                                       "— CC6.3 lock-event evidence lost",
-                                      username);
+                                      ::yuzu::log_key_token(username));
                     }
                     emit_event("auth.lockout.applied", req,
                                {{"source_ip", req.remote_addr}, {"username", username}}, {},
@@ -2354,14 +2354,14 @@ PasswordCheckResult AuthRoutes::verify_password_with_lockout(const std::string& 
     if (cfg_.auth_lockout_threshold > 0 && (prior_failed_count > 0 || lockout_read_failed)) {
         if (auto* db = auth_mgr_.auth_db_ptr()) {
             if (auto cl = db->clear_failed_logins(username); !cl) {
-                spdlog::warn("clear_failed_logins failed for '{}': error={}", username,
+                spdlog::warn("clear_failed_logins failed for '{}': error={}", ::yuzu::log_key_token(username),
                              static_cast<int>(cl.error()));
             } else {
                 if (!audit_log_for_principal(req, "auth.lockout.cleared", "ok", username,
                                              auth::role_to_string(verified->role), "User",
                                              username, opts.cleared_detail)) {
                     spdlog::warn("audit emission failed for auth.lockout.cleared user='{}'",
-                                 username);
+                                 ::yuzu::log_key_token(username));
                 }
                 emit_event("auth.lockout.cleared", req,
                            {{"source_ip", req.remote_addr}, {"username", username}});
@@ -2718,7 +2718,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                            Severity::kCritical);
                 spdlog::error("mfa_status failed for '{}' (error={}) — refusing login "
                               "(fail-closed, architect BLOCK)",
-                              username, static_cast<int>(status.error()));
+                              ::yuzu::log_key_token(username), static_cast<int>(status.error()));
                 return;
             }
         }
@@ -2769,7 +2769,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                           "refusing to offer enrollment (would defeat the second factor). "
                           "Re-enroll it per the break-glass section of "
                           "docs/ops-runbooks/auth-db-recovery.md.",
-                          username, req.remote_addr);
+                          ::yuzu::log_key_token(username), req.remote_addr);
             return;
         }
 
@@ -2793,7 +2793,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             }
             spdlog::warn("BREAK-GLASS login proceeding for '{}' (source {}) under "
                          "auth-mode=sso-only — a second factor is still required",
-                         username, req.remote_addr);
+                         ::yuzu::log_key_token(username), req.remote_addr);
         }
 
         // PR3 enforcement (SOC 2 CC6.6). Under `required` (every role) or
@@ -2825,7 +2825,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                                         "auth_db unavailable (fail-closed)");
                 spdlog::error(
                     "MFA enforcement={} but auth_db unavailable — refusing login for '{}'",
-                    cfg_.mfa_enforcement, username);
+                    cfg_.mfa_enforcement, ::yuzu::log_key_token(username));
                 return;
             }
             // #5342 Gate 8 (F4): anchor the provisional secret to the hash this
@@ -4198,7 +4198,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                                                                    claims.sub, link_claim_value);
             decision.denied) {
             spdlog::warn("OIDC login denied for '{}': linked SCIM resource is deprovisioned",
-                        username);
+                        ::yuzu::log_key_token(username));
             std::string deny_detail = decision.scim_id
                                           ? "reason=linked_scim_resource_inactive;scim_id=" +
                                                 *decision.scim_id
@@ -4257,8 +4257,8 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             if (!oidc::groups_claim_reconcilable(claims)) {
                 const std::string reason =
                     claims.groups_overage ? "groups_overage" : "groups_absent";
-                spdlog::info("OIDC group provisioning skipped for '{}': reason={}", username,
-                            reason);
+                spdlog::info("OIDC group provisioning skipped for '{}': reason={}",
+                             ::yuzu::log_key_token(username), reason);
                 audit_log_for_principal(
                     req, "auth.sso_group_provision", "skipped", username, "user", "", "",
                     "reason=" + reason + ";source=entra" +
@@ -4272,7 +4272,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             } else if (claims.groups.size() > RbacStore::kMaxIdpGroupsPerLogin) {
                 spdlog::warn(
                     "OIDC group provisioning denied for '{}': {} asserted groups exceeds cap {}",
-                    username, claims.groups.size(), RbacStore::kMaxIdpGroupsPerLogin);
+                    ::yuzu::log_key_token(username), claims.groups.size(), RbacStore::kMaxIdpGroupsPerLogin);
                 audit_log_for_principal(
                     req, "auth.sso_group_provision", "error", username, "user", "", "",
                     "reason=group_count_exceeded;count=" +
@@ -4310,8 +4310,9 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 auto reconciled =
                     rbac_store_->reconcile_idp_memberships(username, "entra", asserted);
                 if (!reconciled) {
-                    spdlog::warn("OIDC group provisioning failed for '{}': {}", username,
-                                reconciled.error());
+                    spdlog::warn("OIDC group provisioning failed for '{}': {}",
+                                 ::yuzu::log_key_token(username),
+                                 ::yuzu::log_key_token(reconciled.error()));
                     audit_log_for_principal(
                         req, "auth.sso_group_provision", "error", username, "user", "", "",
                         "reason=" + reconciled.error() + ";source=entra" +
@@ -4507,7 +4508,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             decision.denied) {
             spdlog::warn("OIDC login denied for '{}' on post-mint re-check: linked SCIM resource "
                         "is deprovisioned (concurrent deprovision race)",
-                        username);
+                        ::yuzu::log_key_token(username));
             auto revoke_result = auth_mgr_.invalidate_user_sessions(username);
             // Governance U6 fix: a store-unavailable DENY (`scim_id` absent)
             // is audited as `scim_store_unavailable`, never as
@@ -4873,7 +4874,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                     saml::saml_login_denied_deprovisioned(scim_store_, saml_entity_id, saml_name_id);
                 decision.denied) {
                 spdlog::warn("SAML login denied for '{}': linked SCIM resource is deprovisioned",
-                            saml_principal);
+                            ::yuzu::log_key_token(saml_principal));
                 std::string deny_detail = decision.scim_id
                                               ? "reason=linked_scim_resource_inactive;scim_id=" +
                                                     *decision.scim_id
@@ -4929,7 +4930,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 const auto& asserted_groups = result.value().groups;
                 if (asserted_groups.empty()) {
                     spdlog::info("SAML group provisioning skipped for '{}': no groups asserted",
-                                saml_principal);
+                                ::yuzu::log_key_token(saml_principal));
                     audit_log_for_principal(
                         req, "auth.sso_group_provision", "skipped", saml_principal, "user", "User",
                         saml_principal, "reason=groups_absent;source=saml");
@@ -4947,7 +4948,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                     // group_count_exceeded branch.
                     spdlog::warn(
                         "SAML group provisioning denied for '{}': asserted groups exceeded cap {}",
-                        saml_principal, saml::kMaxGroupValues);
+                        ::yuzu::log_key_token(saml_principal), saml::kMaxGroupValues);
                     audit_log_for_principal(
                         req, "auth.sso_group_provision", "error", saml_principal, "user", "User",
                         saml_principal, "reason=group_count_exceeded;source=saml");
@@ -4978,8 +4979,9 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                     auto reconciled =
                         rbac_store_->reconcile_idp_memberships(saml_principal, "saml", asserted);
                     if (!reconciled) {
-                        spdlog::warn("SAML group provisioning failed for '{}': {}", saml_principal,
-                                    reconciled.error());
+                        spdlog::warn("SAML group provisioning failed for '{}': {}",
+                                     ::yuzu::log_key_token(saml_principal),
+                                     ::yuzu::log_key_token(reconciled.error()));
                         audit_log_for_principal(
                             req, "auth.sso_group_provision", "error", saml_principal, "user",
                             "User", saml_principal,
@@ -5102,7 +5104,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 decision.denied) {
                 spdlog::warn("SAML login denied for '{}' on post-mint re-check: linked SCIM "
                             "resource is deprovisioned (concurrent deprovision race)",
-                            saml_principal);
+                            ::yuzu::log_key_token(saml_principal));
                 auto revoke_result = auth_mgr_.invalidate_user_sessions(saml_principal);
                 // Mirrors the OIDC side's U6 fix: a store-unavailable DENY
                 // (`scim_id` absent) is audited as `scim_store_unavailable`,

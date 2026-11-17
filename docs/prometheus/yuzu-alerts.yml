@@ -4676,14 +4676,17 @@ groups:
             The dedicated Postgres reachability probe on {{ $labels.instance }}
             has failed for over 2 minutes; /readyz reports not ready with a
             `pg` reason (unreachable, stale, or read_only). Check the server log
-            for the "[readyz] Postgres not reachable" line (it carries the libpq
-            detail), the database, and the network or proxy path to it.
+            for the "[readyz] Postgres not reachable" line (it carries a FIXED
+            cause such as "server not reachable" or "authentication failed", not
+            libpq's text, which can quote part of a DSN password; probe from the
+            server host with psql against the same DSN for the detail), the
+            database, and the network or proxy path to it.
             read_only means the probe reached a server that refuses writes: a
             standby (check that the proxy routes to the current primary) or a
             primary with default_transaction_read_only on (often a full disk on
             managed Postgres). With a multi-host DSN (target_session_attrs=read-write)
             libpq refuses read-only hosts itself, so a cluster with no writable
-            host shows as unreachable, with the reason in the log line.
+            host shows as unreachable, with the fixed cause in the log line.
 
       - alert: YuzuPgConnectFailing
         # The pool's connect-failure breaker has armed — NEW pool connections

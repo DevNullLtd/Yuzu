@@ -3223,12 +3223,14 @@ std::string AuthManager::create_saml_session(const std::string& name_id,
     params.session_lifetime_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(kSessionDuration).count();
     if (!persist_new_session(token, params)) {
-        spdlog::error("create_saml_session: durable persist failed for '{}'", stable_username);
+        spdlog::error("create_saml_session: durable persist failed for '{}'", ::yuzu::log_key_token(stable_username));
         return {}; // fail-safe empty token (ADR-0007)
     }
 
-    spdlog::info("SAML session created for '{}' (display={}, email={}, role={})", stable_username,
-                 resolved_display, saml_email, role_to_string(role));
+    // NameID, display name and email are IdP-controlled: fold the LOG copies only.
+    spdlog::info("SAML session created for '{}' (display={}, email={}, role={})",
+                 ::yuzu::log_key_token(stable_username), ::yuzu::log_key_token(resolved_display),
+                 ::yuzu::log_key_token(saml_email), role_to_string(role));
     return token;
 }
 

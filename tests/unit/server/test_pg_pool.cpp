@@ -463,6 +463,9 @@ TEST_CASE("PgPool logs a connect failure's libpq text on one line",
     REQUIRE_FALSE(raw.empty());
     CHECK(raw.find('\n') == std::string::npos);
     CHECK(raw.find("yuzu_test_pg_") == std::string::npos);
+    // The log line carries that same fixed cause and nothing of the socket path.
+    CHECK(cap.text().find(raw) != std::string::npos);
+    CHECK(cap.text().find("yuzu_test_pg_") == std::string::npos);
 
     const std::string text = cap.text();
     const std::string marker = "PgPool: connection attempt failed:";

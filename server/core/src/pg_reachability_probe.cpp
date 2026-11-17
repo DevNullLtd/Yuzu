@@ -214,15 +214,17 @@ std::vector<HostEntry> host_list(PGconn* c) {
     return out;
 }
 
-/// libpq's message on one line (a multi-host failure lists one line per host).
-/// Server log only — never the /readyz body.
+/// A FIXED cause for a libpq failure, never libpq's text (F56): the message quotes the host, port
+/// and dbname libpq parsed from the DSN, and a URI password holding an unescaped '/' or '@' lands
+/// part of itself in those. `fallback` names the failing step when the text matches no known
+/// cause. Server log only -- never the /readyz body.
 std::string pq_error(PGconn* c, const char* fallback) {
     const char* m = c ? PQerrorMessage(c) : nullptr;
-    std::string s = (m && *m) ? std::string(m) : std::string(fallback);
-    std::ranges::replace_if(s, [](char ch) { return ch == '\n' || ch == '\r' || ch == '\t'; }, ' ');
-    while (!s.empty() && s.back() == ' ')
-        s.pop_back();
-    return s;
+    const std::string_view raw = m ? std::string_view{m} : std::string_view{};
+    const char* cause = pg::connect_failure_cause(raw);
+    if (std::string_view{cause} == pg::kConnectFailureGeneric)
+        return std::string(fallback) + " (libpq details withheld)";
+    return cause;
 }
 
 /// The production ping: owns the dedicated connection between ticks.
