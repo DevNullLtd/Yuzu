@@ -67,6 +67,9 @@
 
 namespace {
 
+/// Most `domains` accepted in one `check` (each is matched against one resolver-cache snapshot).
+constexpr std::size_t kMaxDomainsPerCommand = 100;
+
 // ── String utilities ─────────────────────────────────────────────────────────
 
 /// Split a comma-separated string into trimmed tokens.
@@ -381,9 +384,11 @@ std::vector<ConnectionInfo> get_connections() {
 
 using DnsGetCacheDataTableFn = BOOL(WINAPI*)(yuzu::shared::DnsCacheNode**);
 
-/// Query the Windows DNS resolver cache for a domain name. The returned list is caller-owned and
-/// is released by DnsCacheTableOwner on every return path (F66).
-bool check_dns_cache(std::string_view domain) {
+/// Snapshot the names in the Windows DNS resolver cache ONCE per command (F66). The table is
+/// caller-owned, so it is copied into owned strings and released at once (DnsCacheTableOwner)
+/// rather than held across the per-domain matching or re-fetched for each domain. An unavailable
+/// API or failed call yields an empty snapshot, i.e. nothing is found, as before.
+std::vector<std::wstring> read_dns_cache_names() {
     struct Api {
         HMODULE mod = nullptr;
         DnsGetCacheDataTableFn fn = nullptr;
@@ -397,28 +402,20 @@ bool check_dns_cache(std::string_view domain) {
         return a;
     }();
 
+    std::vector<std::wstring> names;
     if (!api.fn)
-        return false;
-
-    // Convert search domain to wide string for comparison
-    // (#1681) shared size-based convert (NUL-excluded), identical to the prior inline;
-    // empty/untranslatable -> {} preserves the old wide_len<=0 early-return.
-    std::wstring wide_domain = yuzu::win::to_wide(domain);
-    if (wide_domain.empty())
-        return false;
-
+        return names;
     yuzu::shared::DnsCacheTableOwner table(api.mod);
     if (!api.fn(table.out()))
-        return false;
-
+        return names;
     std::size_t nodes = 0;
     for (auto* entry = table.head(); entry != nullptr; entry = entry->pNext) {
         if (++nodes > yuzu::shared::kDnsCacheNodeWalkCap)
             break; // corrupted/cyclic list: bound the walk
-        if (entry->pszName && _wcsicmp(entry->pszName, wide_domain.c_str()) == 0)
-            return true;
+        if (entry->pszName)
+            names.emplace_back(entry->pszName);
     }
-    return false;
+    return names;
 }
 
 #endif // _WIN32
@@ -592,9 +589,21 @@ void check_ip_addresses(yuzu::CommandContext& ctx, const std::vector<std::string
 }
 
 void check_domains(yuzu::CommandContext& ctx, const std::vector<std::string>& domains) {
+#ifdef _WIN32
+    const auto cache_names = read_dns_cache_names(); // one snapshot for every requested domain
+#endif
     for (const auto& domain : domains) {
 #ifdef _WIN32
-        bool found = check_dns_cache(domain);
+        bool found = false;
+        const std::wstring wide_domain = yuzu::win::to_wide(domain);
+        if (!wide_domain.empty()) {
+            for (const auto& n : cache_names) {
+                if (_wcsicmp(n.c_str(), wide_domain.c_str()) == 0) {
+                    found = true;
+                    break;
+                }
+            }
+        }
         std::string detail = found ? "Found in DNS resolver cache" : "Not in DNS cache";
         ctx.write_output(std::format("domain|{}|{}|{}", escape_pipes(domain),
                                      found ? "true" : "false", escape_pipes(detail)));
@@ -799,6 +808,14 @@ public:
         if (ip_list.empty() && domain_list.empty() && hash_list.empty() && path_list.empty() &&
             port_list.empty()) {
             ctx.write_output("error|none|false|No IOC parameters provided");
+            return 1;
+        }
+
+        // Bound the per-command domain work (F66): refuse rather than silently truncate, so an
+        // IOC is never dropped without the caller seeing it.
+        if (domain_list.size() > kMaxDomainsPerCommand) {
+            ctx.write_output(std::format("error|domains|false|Too many domains ({}, max {})",
+                                         domain_list.size(), kMaxDomainsPerCommand));
             return 1;
         }
 

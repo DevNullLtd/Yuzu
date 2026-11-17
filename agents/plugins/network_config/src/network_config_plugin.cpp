@@ -1828,49 +1828,6 @@ private:
             }
         }
         FreeLibrary(hDnsApi);
-            ctx.write_output("dns_cache|not_available|DnsGetCacheDataTable not found");
-            return 0;
-        }
-
-        DNS_CACHE_ENTRY root{};
-        if (pFunc(&root)) {
-            int count = 0;
-            for (auto* entry = root.pNext; entry; entry = entry->pNext) {
-                if (entry->pszName) {
-                    auto name = from_wide(entry->pszName);
-                    // wType: 1=A, 28=AAAA, 5=CNAME, etc.
-                    const char* type = "unknown";
-                    switch (entry->wType) {
-                    case 1:
-                        type = "A";
-                        break;
-                    case 28:
-                        type = "AAAA";
-                        break;
-                    case 5:
-                        type = "CNAME";
-                        break;
-                    case 12:
-                        type = "PTR";
-                        break;
-                    case 15:
-                        type = "MX";
-                        break;
-                    case 33:
-                        type = "SRV";
-                        break;
-                    }
-                    ctx.write_output(std::format("cache_entry|{}|{}|0|", name, type));
-                    ++count;
-                }
-            }
-            if (count == 0) {
-                ctx.write_output("dns_cache|empty");
-            }
-        } else {
-            ctx.write_output("dns_cache|not_available|query failed");
-        }
-        FreeLibrary(hDnsApi);
 
 #elif defined(__linux__)
         // Direct argv via the bounded runner (ADR-3002 rung 2) — no `/bin/sh
