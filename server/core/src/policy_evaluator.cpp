@@ -753,6 +753,27 @@ PolicyEvaluator::evaluate_now(const std::string& policy_id) {
     return *k;
 }
 
+PolicyEvaluator::InstructionCheck
+PolicyEvaluator::authorize_instruction(const std::string& instruction_id) const {
+    // No registry or no instruction store is an unavailable answer, not a verdict: an
+    // unwired evaluator reads as degraded (503) here, the same fail-closed posture the
+    // dispatch seam takes (`unwired`), never as an accept.
+    if (!d_.instruction_store || !d_.capability_registry)
+        return {InstructionCheck::Kind::Degraded, std::nullopt};
+    auto def = d_.instruction_store->get_definition(instruction_id);
+    if (!def) {
+        spdlog::warn("policy_evaluator: authorize_instruction: instruction store unavailable");
+        return {InstructionCheck::Kind::Degraded, std::nullopt};
+    }
+    if (!*def)
+        return {InstructionCheck::Kind::Allowed, std::nullopt};
+    auto allowed =
+        authorize_policy_dispatch(*d_.capability_registry, (*def)->plugin, (*def)->action);
+    if (!allowed)
+        return {InstructionCheck::Kind::Refused, allowed.error()};
+    return {InstructionCheck::Kind::Allowed, std::nullopt};
+}
+
 PolicyEvaluator::RemediateResult
 PolicyEvaluator::remediate(const std::string& policy_id,
                            const std::vector<std::string>& agent_ids) {

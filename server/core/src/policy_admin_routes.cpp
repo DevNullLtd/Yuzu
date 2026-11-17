@@ -8,6 +8,7 @@
 
 #include "dispatch_target_shape.hpp" // check_targeting_shape (#2500)
 #include "policy_evaluator.hpp"
+#include "rest_a4_envelope_http.hpp" // detail::a4_error (the refusal 409)
 #include "store_errors.hpp"
 #include "web_utils.hpp" // audit_token
 
@@ -71,6 +72,58 @@ void PolicyAdminRoutes::register_routes(httplib::Server& svr,
                     std::move(emit_event_fn), policy_store, policy_evaluator, metrics);
 }
 
+void PolicyAdminRoutes::answer_dispatch_refused(httplib::Response& res,
+                                                PolicyDispatchDenialReason reason) {
+    // A refusal is its own 409: the shared A4 builder gives it a correlation id and the
+    // retry field, and the remediation text names the reason token. The existing 409 on these
+    // routes ("nothing to dispatch", "already in flight") is a different body, so a client
+    // can tell them apart.
+    res.status = 409;
+    detail::A4ErrorOpts opts;
+    const std::string remediation =
+        "policy_dispatch_refused: " + std::string(to_string(reason)) +
+        ". The policy's check or fix names an action that policy evaluation does not "
+        "dispatch. Change the instruction the policy uses.";
+    opts.remediation = remediation;
+    res.set_content(detail::a4_error(res, "policy dispatch refused", opts), "application/json");
+}
+
+bool PolicyAdminRoutes::refuse_unusable_instructions(
+    const httplib::Request& req, httplib::Response& res,
+    const std::vector<std::string>& instruction_ids, const char* audit_verb,
+    const char* target_type, const std::string& target_id) {
+    if (!policy_evaluator_)
+        return false;
+    for (const auto& id : instruction_ids) {
+        const auto check = policy_evaluator_->authorize_instruction(id);
+        if (check.kind == PolicyEvaluator::InstructionCheck::Kind::Allowed)
+            continue;
+        if (check.kind == PolicyEvaluator::InstructionCheck::Kind::Degraded) {
+            // Never an accept and never a refusal: the lookup could not be answered.
+            res.status = 503;
+            res.set_content(
+                R"({"error":{"code":503,"message":"instruction lookup unavailable, try again"},"meta":{"api_version":"v1"}})",
+                "application/json");
+            return true;
+        }
+        const std::string token(to_string(check.denial->reason));
+        audit_fn_(req, audit_verb, "denied", target_type, target_id,
+                  "reason=" + token + " instruction=" + audit_token(id));
+        res.status = 400;
+        res.set_content(
+            nlohmann::json({{"error",
+                             {{"code", 400},
+                              {"message", "instruction " + id +
+                                              " names an action that policy evaluation does not "
+                                              "dispatch (" + token + ")"}}},
+                            {"meta", {{"api_version", "v1"}}}})
+                .dump(),
+            "application/json");
+        return true;
+    }
+    return false;
+}
+
 void PolicyAdminRoutes::register_routes(HttpRouteSink& sink,
                                         AuthFn auth_fn,
                                         PermFn perm_fn,
@@ -112,6 +165,14 @@ void PolicyAdminRoutes::register_routes(HttpRouteSink& sink,
             } else {
                 yaml_source = req.body;
             }
+
+            // G01: refuse early a fragment that names an instruction policy evaluation will not
+            // dispatch. Advisory: the dispatch check is the control.
+            if (refuse_unusable_instructions(req, res,
+                                             PolicyStore::peek_fragment_instructions(yaml_source),
+                                             "policy_fragment.create", "policy_fragment",
+                                             PolicyStore::peek_fragment_name(yaml_source)))
+                return;
 
             auto result = policy_store_->create_fragment(yaml_source);
             if (!result) {
@@ -199,6 +260,23 @@ void PolicyAdminRoutes::register_routes(HttpRouteSink& sink,
                 yaml_source = req.body;
             }
 
+            // G01: the same advisory check through the policy's fragment. An unknown or
+            // unreadable fragment is left to the store's own create below.
+            if (const auto fragment_ref = PolicyStore::peek_policy_fragment(yaml_source);
+                !fragment_ref.empty()) {
+                auto frag = policy_store_->get_fragment(fragment_ref);
+                if (frag && *frag) {
+                    std::vector<std::string> ids;
+                    for (const auto* instr : {&(*frag)->check_instruction, &(*frag)->fix_instruction,
+                                              &(*frag)->post_check_instruction})
+                        if (!instr->empty())
+                            ids.push_back(*instr);
+                    if (refuse_unusable_instructions(req, res, ids, "policy.create", "policy",
+                                                     PolicyStore::peek_fragment_name(yaml_source)))
+                        return;
+                }
+            }
+
             auto result = policy_store_->create_policy(yaml_source);
             if (!result) {
                 bool is_degraded = is_db_error(result.error());
@@ -259,6 +337,20 @@ void PolicyAdminRoutes::register_routes(HttpRouteSink& sink,
             }
 
             auto id = req.matches[1].str();
+            // G01: enabling is where a policy starts to run, so the advisory check runs here
+            // too (a policy installed by a pack was never checked at install).
+            if (auto pol = policy_store_->get_policy(id); pol && *pol) {
+                auto frag = policy_store_->get_fragment((*pol)->fragment_id);
+                if (frag && *frag) {
+                    std::vector<std::string> ids;
+                    for (const auto* instr : {&(*frag)->check_instruction, &(*frag)->fix_instruction,
+                                              &(*frag)->post_check_instruction})
+                        if (!instr->empty())
+                            ids.push_back(*instr);
+                    if (refuse_unusable_instructions(req, res, ids, "policy.enable", "policy", id))
+                        return;
+                }
+            }
             auto result = policy_store_->enable_policy(id);
             if (!result) {
                 bool is_degraded = is_db_error(result.error());
@@ -441,8 +533,14 @@ void PolicyAdminRoutes::register_routes(HttpRouteSink& sink,
                 return;
             }
             // G01: a refused dispatch comes back as a value with `denial` set and no execution
-            // id; it is answered as its own 409 by the next change to this route. Until then it
-            // reads as the existing "nothing to dispatch" 409 below.
+            // id. It is its own 409, ahead of the "nothing to dispatch" 409 below, and is always
+            // audited (an operator-triggered refusal is evidence of the attempt).
+            if (exec_res->denial) {
+                audit_fn_(req, "policy.evaluate", "denied", "policy", id,
+                          "reason=" + std::string(to_string(exec_res->denial->reason)));
+                answer_dispatch_refused(res, exec_res->denial->reason);
+                return;
+            }
             auto exec_id = exec_res->execution_id;
             if (exec_id.empty()) {
                 res.status = 409;
@@ -549,6 +647,14 @@ void PolicyAdminRoutes::register_routes(HttpRouteSink& sink,
                 }
             }
             auto result = policy_evaluator_->remediate(id, agent_ids);
+            if (!result.ok && result.denial) {
+                // G01: a refused fix is a 409 of its own, decided before any matching on the
+                // error text (which would have made it a 400).
+                audit_fn_(req, "policy.remediate", "denied", "policy", id,
+                          "reason=" + std::string(to_string(result.denial->reason)));
+                answer_dispatch_refused(res, result.denial->reason);
+                return;
+            }
             if (!result.ok) {
                 // Governance (2026-08-24): a genuine store-degrade error
                 // used to fall through to the 400/"denied" default below —

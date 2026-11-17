@@ -12,6 +12,9 @@
  */
 
 #include "agent_registry.hpp"
+#include "capability_fragments.hpp"
+#include "instruction_store.hpp"
+#include "management_group_store.hpp"
 #include "offline_endpoint_store.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
@@ -19,6 +22,7 @@
 #include "policy_admin_routes.hpp"
 #include "policy_evaluator.hpp"
 #include "policy_store.hpp"
+#include "test_mgmt_group_pg_helper.hpp"
 #include "test_route_sink.hpp"
 
 #include "../test_helpers.hpp"
@@ -484,4 +488,285 @@ TEST_CASE("POST /api/policies/:id/disable|enable: an unknown clean id answers 40
     }
     CHECK(h.audit_calls.empty());
     CHECK(h.emitted_events.empty());
+}
+
+// ---------------------------------------------------------------------------
+// G01: a refused dispatch is its own 409, and the authoring routes refuse early
+// ---------------------------------------------------------------------------
+
+namespace {
+
+const CommandCapabilityRegistry& route_full_registry() {
+    static const CommandCapabilityRegistry registry{YUZU_ALL_CAPABILITY_FRAGMENTS};
+    return registry;
+}
+
+// A real PolicyStore, InstructionStore and ManagementGroupStore with one static group of two
+// agents, an evaluator with the FULL registry (or none), and the policy admin routes on top.
+struct RefusalRoutes {
+    yuzu::server::pg::PgPool pool;
+    PolicyStore ps;
+    InstructionStore is;
+    yuzu::test::ManagementGroupStorePg mg_bundle;
+    ManagementGroupStore& mg = *mg_bundle;
+    std::string group_id;
+    std::string empty_group_id;
+    int dispatch_calls{0};
+    std::optional<PolicyEvaluator> evaluator;
+    // Declared before `sink`: the sink captures `routes`'s `this`, so `routes` must outlive it.
+    PolicyAdminRoutes routes;
+    yuzu::server::test::TestRouteSink sink;
+    std::vector<AuditCall> audit_calls;
+
+    RefusalRoutes(const std::string& dsn, const CommandCapabilityRegistry* registry)
+        : pool({.conninfo = dsn, .size = 4}), ps(pool), is(pool) {
+        REQUIRE(ps.is_open());
+        ManagementGroup g;
+        g.name = "grp";
+        g.membership_type = "static";
+        auto gid = mg.create_group(g);
+        REQUIRE(gid.has_value());
+        group_id = *gid;
+        REQUIRE(mg.add_member(group_id, "agentA").has_value());
+        REQUIRE(mg.add_member(group_id, "agentB").has_value());
+        ManagementGroup e;
+        e.name = "empty";
+        e.membership_type = "static";
+        auto eid = mg.create_group(e);
+        REQUIRE(eid.has_value());
+        empty_group_id = *eid;
+
+        PolicyEvaluator::Deps d;
+        d.policy_store = &ps;
+        d.instruction_store = &is;
+        d.mgmt_group_store = &mg;
+        d.capability_registry = registry;
+        d.dispatch_fn = [this](const std::string&, const std::string&,
+                               const std::vector<std::string>& agents, const std::string&,
+                               const std::unordered_map<std::string, std::string>&,
+                               const std::string& execid) -> yuzu::server::ConfinedDispatchOutcome {
+            ++dispatch_calls;
+            yuzu::server::ConfinedDispatchOutcome o;
+            o.command_id = "cmd-" + execid;
+            o.sent = static_cast<int>(agents.size());
+            return o;
+        };
+        evaluator.emplace(d);
+
+        auto auth_fn = [](const httplib::Request&,
+                          httplib::Response&) -> std::optional<auth::Session> {
+            auth::Session s;
+            s.username = "tester";
+            s.role = auth::Role::admin;
+            return s;
+        };
+        auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
+                          const std::string&) -> bool { return true; };
+        auto audit_fn = [this](const httplib::Request&, const std::string& action,
+                               const std::string& result, const std::string& target_type,
+                               const std::string& target_id, const std::string& detail) -> bool {
+            audit_calls.push_back({action, result, target_type, target_id, detail});
+            return true;
+        };
+        auto emit_fn = [](const std::string&, const httplib::Request&, const nlohmann::json&,
+                          const nlohmann::json&) {};
+        routes.register_routes(sink, auth_fn, perm_fn, audit_fn, emit_fn, &ps, &*evaluator, nullptr);
+    }
+
+    std::string define(const std::string& id, const std::string& plugin, const std::string& action) {
+        InstructionDefinition d;
+        d.id = id;
+        d.name = id;
+        d.version = "1.0.0";
+        d.type = "question";
+        d.plugin = plugin;
+        d.action = action;
+        d.enabled = true;
+        REQUIRE(is.create_definition(d).has_value());
+        return id;
+    }
+
+    // A fragment straight into the store (as a pack install would, written straight to the store).
+    std::string fragment(const std::string& name, const std::string& check, const std::string& fix = {}) {
+        std::string y = "apiVersion: yuzu.io/v1alpha1\nkind: PolicyFragment\ndisplayName: " + name +
+                        "\nspec:\n  check:\n    instruction: " + check +
+                        "\n    compliance: \"result.hostname != ''\"\n";
+        if (!fix.empty())
+            y += "  fix:\n    instruction: " + fix + "\n";
+        auto id = ps.create_fragment(y);
+        REQUIRE(id.has_value());
+        return *id;
+    }
+
+    std::string policy(const std::string& name, const std::string& fragment_id, const std::string& group) {
+        auto id = ps.create_policy("apiVersion: yuzu.io/v1alpha1\nkind: Policy\ndisplayName: " + name +
+                                   "\nspec:\n  fragment: " + fragment_id +
+                                   "\n  managementGroups:\n    - " + group + "\n");
+        REQUIRE(id.has_value());
+        return *id;
+    }
+};
+
+std::string fragment_yaml(const std::string& name, const std::string& check) {
+    return "apiVersion: yuzu.io/v1alpha1\nkind: PolicyFragment\ndisplayName: " + name +
+           "\nspec:\n  check:\n    instruction: " + check +
+           "\n    compliance: \"result.hostname != ''\"\n";
+}
+
+} // namespace
+
+TEST_CASE("POST /api/policies/:id/evaluate: a refused dispatch is a 409 of its own, audited with "
+          "the reason, and nothing is sent",
+          "[pg][policy][admin][dispatch_approval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_admin_store_tpl);
+    RefusalRoutes r(db.dsn(), &route_full_registry());
+    const auto gated = r.define("i.gated", "content_dist", "execute_staged");
+    const auto fid = r.fragment("refused", gated);
+    const auto pid = r.policy("refused policy", fid, r.group_id);
+
+    auto res = r.sink.Post("/api/policies/" + pid + "/evaluate", "");
+    REQUIRE(res);
+    CHECK(res->status == 409);
+    CHECK(r.dispatch_calls == 0);
+
+    const auto body = nlohmann::json::parse(res->body);
+    const auto& err = body.at("error");
+    CHECK(err.at("code") == 409);
+    CHECK(err.at("message") == "policy dispatch refused");
+    CHECK(err.contains("correlation_id"));
+    CHECK(err.contains("retry_after_ms"));
+    CHECK(err.at("retry_after_ms").is_null());
+    CHECK(err.at("remediation").get<std::string>().rfind("policy_dispatch_refused: gated", 0) == 0);
+    CHECK_FALSE(res->get_header_value("X-Correlation-Id").empty());
+
+    // Audited as denied, with the token, not as a success and not as an error.
+    bool found = false;
+    for (const auto& c : r.audit_calls)
+        if (c.action == "policy.evaluate") {
+            found = true;
+            CHECK(c.result == "denied");
+            CHECK(c.target_id == pid);
+            CHECK(c.detail == "reason=gated");
+        }
+    CHECK(found);
+}
+
+TEST_CASE("POST /api/policies/:id/evaluate: the refusal 409 is distinguishable from the "
+          "nothing-to-dispatch 409",
+          "[pg][policy][admin][dispatch_approval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_admin_store_tpl);
+    RefusalRoutes r(db.dsn(), &route_full_registry());
+    const auto allowed = r.define("i.status", "echo", "status");
+    const auto fid = r.fragment("allowed", allowed);
+    // An allowed check bound to a group with no members: nothing to dispatch.
+    const auto pid = r.policy("nothing to dispatch", fid, r.empty_group_id);
+
+    auto res = r.sink.Post("/api/policies/" + pid + "/evaluate", "");
+    REQUIRE(res);
+    CHECK(res->status == 409);
+    const auto err = nlohmann::json::parse(res->body).at("error");
+    CHECK(err.at("message").get<std::string>().find("matches no agents") != std::string::npos);
+    CHECK_FALSE(err.contains("remediation"));
+    CHECK_FALSE(err.contains("correlation_id"));
+}
+
+TEST_CASE("POST /api/policies/:id/remediate: a refused fix is a 409 with the same shape, not a 400",
+          "[pg][policy][admin][dispatch_approval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_admin_store_tpl);
+    RefusalRoutes r(db.dsn(), &route_full_registry());
+    const auto check = r.define("i.status", "echo", "status");
+    const auto fix = r.define("i.gated", "content_dist", "execute_staged");
+    const auto fid = r.fragment("fix refused", check, fix);
+    const auto pid = r.policy("fix refused policy", fid, r.group_id);
+
+    auto res = r.sink.Post("/api/policies/" + pid + "/remediate", R"({"agent_ids":["agentA"]})",
+                           "application/json");
+    REQUIRE(res);
+    CHECK(res->status == 409);
+    CHECK(r.dispatch_calls == 0);
+    const auto err = nlohmann::json::parse(res->body).at("error");
+    CHECK(err.at("code") == 409);
+    CHECK(err.at("message") == "policy dispatch refused");
+    CHECK(err.contains("correlation_id"));
+    CHECK(err.at("remediation").get<std::string>().rfind("policy_dispatch_refused: gated", 0) == 0);
+    bool found = false;
+    for (const auto& c : r.audit_calls)
+        if (c.action == "policy.remediate") {
+            found = true;
+            CHECK(c.result == "denied");
+            CHECK(c.detail == "reason=gated");
+        }
+    CHECK(found);
+}
+
+TEST_CASE("authoring routes refuse a fragment, policy or enable that names a gated instruction, "
+          "with a denied audit row",
+          "[pg][policy][admin][dispatch_approval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_admin_store_tpl);
+    RefusalRoutes r(db.dsn(), &route_full_registry());
+    const auto gated = r.define("i.gated", "content_dist", "execute_staged");
+    const auto allowed = r.define("i.status", "echo", "status");
+
+    // Fragment create: refused with a 400 naming the reason; nothing is stored.
+    auto bad = r.sink.Post("/api/policy-fragments", fragment_yaml("bad fragment", gated), "text/plain");
+    REQUIRE(bad);
+    CHECK(bad->status == 400);
+    CHECK(nlohmann::json::parse(bad->body).at("error").at("message").get<std::string>().find("(gated)") !=
+          std::string::npos);
+    REQUIRE_FALSE(r.audit_calls.empty());
+    CHECK(r.audit_calls.back().action == "policy_fragment.create");
+    CHECK(r.audit_calls.back().result == "denied");
+    CHECK(r.audit_calls.back().target_id == "bad fragment");
+    CHECK(r.audit_calls.back().detail == "reason=gated instruction=i.gated");
+    auto frags = r.ps.query_fragments();
+    REQUIRE(frags.has_value());
+    CHECK(frags->empty());
+
+    // An allowed instruction and an id that does not exist yet are both accepted.
+    auto ok = r.sink.Post("/api/policy-fragments", fragment_yaml("ok fragment", allowed), "text/plain");
+    REQUIRE(ok);
+    CHECK(ok->status == 201);
+    auto unknown = r.sink.Post("/api/policy-fragments",
+                               fragment_yaml("pack fragment", "defined.later"), "text/plain");
+    REQUIRE(unknown);
+    CHECK(unknown->status == 201);
+
+    // A fragment that reached the store another way (a pack install does not run the check):
+    // policy create and enable both refuse it.
+    const auto stored = r.fragment("stored gated", gated);
+    auto policy_yaml = "apiVersion: yuzu.io/v1alpha1\nkind: Policy\ndisplayName: p\nspec:\n  fragment: " +
+                       stored + "\n  managementGroups:\n    - " + r.group_id + "\n";
+    auto created = r.sink.Post("/api/policies", policy_yaml, "text/plain");
+    REQUIRE(created);
+    CHECK(created->status == 400);
+    CHECK(r.audit_calls.back().action == "policy.create");
+    CHECK(r.audit_calls.back().result == "denied");
+
+    const auto pid = r.policy("pack policy", stored, r.group_id); // as a pack install would
+    auto enabled = r.sink.Post("/api/policies/" + pid + "/enable", "");
+    REQUIRE(enabled);
+    CHECK(enabled->status == 400);
+    CHECK(r.audit_calls.back().action == "policy.enable");
+    CHECK(r.audit_calls.back().result == "denied");
+    CHECK(r.audit_calls.back().target_id == pid);
+    CHECK(r.dispatch_calls == 0);
+}
+
+TEST_CASE("authoring routes answer 503, never an accept or a 400, when the instruction lookup "
+          "cannot be answered",
+          "[pg][policy][admin][dispatch_approval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_admin_store_tpl);
+    // An evaluator with no registry reads every lookup as degraded.
+    RefusalRoutes r(db.dsn(), nullptr);
+    const auto allowed = r.define("i.status", "echo", "status");
+
+    auto res = r.sink.Post("/api/policy-fragments", fragment_yaml("any", allowed), "text/plain");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    auto frags = r.ps.query_fragments();
+    REQUIRE(frags.has_value());
+    CHECK(frags->empty());
+    // A degraded lookup is not an operator denial: no denied row.
+    for (const auto& c : r.audit_calls)
+        CHECK(c.result != "denied");
 }

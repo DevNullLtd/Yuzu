@@ -119,6 +119,11 @@ public:
     /// reason: route layers should not own YAML parsing.
     static std::vector<std::string> peek_fragment_instructions(const std::string& yaml_source);
 
+    /// The fragment a policy's YAML names (the `fragment:` value `create_policy` reads), or ""
+    /// when it names none. Lets the authoring routes look the fragment up before the policy is
+    /// accepted.
+    static std::string peek_policy_fragment(const std::string& yaml_source);
+
     // ── Policies ─────────────────────────────────────────────────────────
     [[nodiscard]] std::expected<std::string, std::string>
     create_policy(const std::string& yaml_source);

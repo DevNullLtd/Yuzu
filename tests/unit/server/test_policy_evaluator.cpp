@@ -2216,3 +2216,74 @@ TEST_CASE("policy dispatch approval: a refused verify leaves the fix in place an
     REQUIRE(reclaim.has_value());
     CHECK(reclaim->ids.size() == 1);
 }
+
+// ---------------------------------------------------------------------------
+// G01: the authoring-time check (advisory: the dispatch seam is the control)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("policy dispatch approval: authorize_instruction answers allowed, refused or degraded",
+          "[pg][policy][evaluator][dispatch_approval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    h.capability_registry = &full_registry();
+    const auto allowed_id = define_real_pair(h, "echo", "status");
+    const auto gated_id = define_real_pair(h, "content_dist", "execute_staged");
+    const auto destructive_id = define_real_pair(h, "echo", "purge_source");
+    const auto reserved_id = define_real_pair(h, "__guard__", "push_rules");
+    using Kind = PolicyEvaluator::InstructionCheck::Kind;
+
+    PolicyEvaluator ev(h.deps());
+    CHECK(ev.authorize_instruction(allowed_id).kind == Kind::Allowed);
+
+    const auto gated = ev.authorize_instruction(gated_id);
+    CHECK(gated.kind == Kind::Refused);
+    REQUIRE(gated.denial.has_value());
+    CHECK(gated.denial->reason == PolicyDispatchDenialReason::Gated);
+    const auto destructive = ev.authorize_instruction(destructive_id);
+    REQUIRE(destructive.denial.has_value());
+    CHECK(destructive.denial->reason == PolicyDispatchDenialReason::Destructive);
+    const auto reserved = ev.authorize_instruction(reserved_id);
+    REQUIRE(reserved.denial.has_value());
+    CHECK(reserved.denial->reason == PolicyDispatchDenialReason::Reserved);
+
+    // An instruction that does not exist yet is allowed (packs create definitions and
+    // fragments in any order); the dispatch seam still refuses it later if it is bad.
+    CHECK(ev.authorize_instruction("no.such.instruction").kind == Kind::Allowed);
+}
+
+TEST_CASE("policy dispatch approval: authorize_instruction is degraded, never an accept, when "
+          "it cannot answer",
+          "[pg][policy][evaluator][dispatch_approval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    h.capability_registry = &full_registry();
+    const auto gated_id = define_real_pair(h, "content_dist", "execute_staged");
+    using Kind = PolicyEvaluator::InstructionCheck::Kind;
+
+    // No registry: unwired reads as degraded (a 503), not as an accept and not as a 400.
+    {
+        auto deps = h.deps();
+        deps.capability_registry = nullptr;
+        PolicyEvaluator ev(deps);
+        CHECK(ev.authorize_instruction(gated_id).kind == Kind::Degraded);
+    }
+    // No instruction store.
+    {
+        auto deps = h.deps();
+        deps.instruction_store = nullptr;
+        PolicyEvaluator ev(deps);
+        CHECK(ev.authorize_instruction(gated_id).kind == Kind::Degraded);
+    }
+    // An instruction store that cannot be read.
+    {
+        PgPool broken_pool{{.conninfo = "=quohth4eeQu5 garbage =", .size = 1}};
+        REQUIRE_FALSE(broken_pool.valid());
+        InstructionStore broken_is{broken_pool};
+        auto deps = h.deps();
+        deps.instruction_store = &broken_is;
+        PolicyEvaluator ev(deps);
+        CHECK(ev.authorize_instruction(gated_id).kind == Kind::Degraded);
+    }
+}

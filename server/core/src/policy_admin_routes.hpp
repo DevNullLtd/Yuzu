@@ -21,6 +21,7 @@
 #include <yuzu/server/auth.hpp>
 
 #include "http_route_sink.hpp"
+#include "policy_dispatch.hpp"
 #include "policy_store.hpp"
 
 #include <yuzu/metrics.hpp>
@@ -31,6 +32,7 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace yuzu::server {
 
@@ -81,6 +83,21 @@ public:
                          yuzu::MetricsRegistry* metrics = nullptr);
 
 private:
+    /// Authoring-time check (G01), advisory: the dispatch seam is the control. For each
+    /// instruction id a policy or fragment is about to use, ask the evaluator whether a policy
+    /// may dispatch it. A refused pair answers 400 and writes a denied audit row carrying the
+    /// reason token; a degraded lookup answers 503 (never an accept); an instruction that
+    /// does not exist yet is allowed. Returns true when it wrote the response. A no-op when no
+    /// evaluator is wired (nothing would be dispatched either).
+    bool refuse_unusable_instructions(const httplib::Request& req, httplib::Response& res,
+                                      const std::vector<std::string>& instruction_ids,
+                                      const char* audit_verb, const char* target_type,
+                                      const std::string& target_id);
+
+    /// The 409 for a refused dispatch on /evaluate and /remediate, through the shared A4
+    /// builder. The reason token is in the remediation text.
+    static void answer_dispatch_refused(httplib::Response& res, PolicyDispatchDenialReason reason);
+
     AuthFn auth_fn_;
     PermFn perm_fn_;
     AuditFn audit_fn_;

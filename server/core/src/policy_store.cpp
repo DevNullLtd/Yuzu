@@ -426,6 +426,10 @@ std::string PolicyStore::peek_fragment_name(const std::string& yaml_source) {
     return extract_yaml_value(yaml_source, "id");
 }
 
+std::string PolicyStore::peek_policy_fragment(const std::string& yaml_source) {
+    return extract_yaml_value(yaml_source, "fragment");
+}
+
 std::vector<std::string> PolicyStore::peek_fragment_instructions(const std::string& yaml_source) {
     std::vector<std::string> out;
     // The same section paths `create_fragment` reads, so the two cannot disagree on which

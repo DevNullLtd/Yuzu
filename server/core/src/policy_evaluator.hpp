@@ -197,6 +197,20 @@ public:
     [[nodiscard]] std::expected<KickoffOutcome, std::string>
     evaluate_now(const std::string& policy_id);
 
+    /// The authoring-time answer to "may a policy use this instruction?" (G01). ADVISORY: the
+    /// dispatch seam is the control (a definition can be changed after a policy is saved, and
+    /// pack install is not checked at all), so this only lets the authoring routes refuse
+    /// early. `Allowed` includes an instruction id that does not exist yet (packs create
+    /// definitions and fragments in any order); `Degraded` is a store or registry failure and
+    /// must be answered as such (503), never as an accept or a refusal.
+    struct InstructionCheck {
+        enum class Kind : uint8_t { Allowed, Refused, Degraded };
+        Kind kind{Kind::Allowed};
+        std::optional<PolicyDispatchDenial> denial; // set when Refused
+    };
+
+    [[nodiscard]] InstructionCheck authorize_instruction(const std::string& instruction_id) const;
+
     struct RemediateResult {
         bool ok{false};
         std::string error;        // set when !ok
