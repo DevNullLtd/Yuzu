@@ -32,6 +32,7 @@
 #include <catch2/matchers/catch_matchers_string.hpp>
 
 #include <libpq-fe.h>
+#include <nlohmann/json.hpp>
 
 #include <chrono>
 #include <stdexcept>
@@ -2123,4 +2124,396 @@ TEST_CASE("PolicyStore: an explicit policy or fragment id must be a safe path se
         CHECK(p.value() == id);
     }
     CHECK(store.create_policy(make_policy_yaml(frag.value())).has_value());
+}
+
+// ============================================================================
+// `blocked`: policy evaluation refused to dispatch the pair (G01)
+// ============================================================================
+
+namespace {
+
+nlohmann::json check_result_of(PolicyStore& store, const std::string& policy_id,
+                               const std::string& agent_id) {
+    auto st = store.get_agent_status(policy_id, agent_id);
+    REQUIRE(st.has_value());
+    REQUIRE(st->has_value());
+    return nlohmann::json::parse((*st)->check_result);
+}
+
+std::string status_of(PolicyStore& store, const std::string& policy_id, const std::string& agent_id) {
+    auto st = store.get_agent_status(policy_id, agent_id);
+    REQUIRE(st.has_value());
+    if (!*st)
+        return "<none>";
+    return (*st)->status;
+}
+
+} // namespace
+
+TEST_CASE("PolicyStore: peek_fragment_instructions names the check, fix and postCheck instructions",
+          "[policy_store][blocked]") {
+    CHECK(PolicyStore::peek_fragment_instructions(kFullFragment) ==
+          std::vector<std::string>{"get_service_status", "start_service", "get_service_status"});
+    CHECK(PolicyStore::peek_fragment_instructions(kCheckOnlyNoFix) ==
+          std::vector<std::string>{"check_disk_space"});
+    CHECK(PolicyStore::peek_fragment_instructions("kind: PolicyFragment\n").empty());
+    CHECK(PolicyStore::peek_fragment_instructions("").empty());
+}
+
+TEST_CASE("PolicyStore: update_agent_status still rejects blocked, only mark_blocked writes it",
+          "[policy_store][pg][blocked]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PolicyStore store{pool};
+    auto frag = store.create_fragment(kFullFragment);
+    REQUIRE(frag.has_value());
+    auto pol = store.create_policy(make_policy_yaml(frag.value()));
+    REQUIRE(pol.has_value());
+
+    auto r = store.update_agent_status(pol.value(), "agent-1", "blocked");
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().find("invalid status") != std::string::npos);
+    CHECK(status_of(store, pol.value(), "agent-1") == "<none>");
+}
+
+TEST_CASE("PolicyStore: mark_blocked writes on change and reports the changed rows",
+          "[policy_store][pg][blocked]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PolicyStore store{pool};
+    auto frag = store.create_fragment(kFullFragment);
+    REQUIRE(frag.has_value());
+    auto pol = store.create_policy(make_policy_yaml(frag.value()));
+    REQUIRE(pol.has_value());
+    const std::vector<std::string> ids{"agent-1", "agent-2", "agent-3"};
+
+    // First refusal: all three rows are new.
+    auto r1 = store.mark_blocked(pol.value(), ids, "check", "content_dist", "execute_staged", "gated");
+    REQUIRE(r1.has_value());
+    CHECK(r1->changed == 3);
+    CHECK(r1->fenced_out == 0);
+    for (const auto& id : ids) {
+        CHECK(status_of(store, pol.value(), id) == "blocked");
+        const auto j = check_result_of(store, pol.value(), id);
+        CHECK(j["phase"] == "check");
+        CHECK(j["result"] == "blocked");
+        CHECK(j["reason"] == "gated");
+        CHECK(j["plugin"] == "content_dist");
+        CHECK(j["action"] == "execute_staged");
+    }
+
+    // The same refusal again changes nothing: zero rows, in steady state.
+    auto r2 = store.mark_blocked(pol.value(), ids, "check", "content_dist", "execute_staged", "gated");
+    REQUIRE(r2.has_value());
+    CHECK(r2->changed == 0);
+
+    // A different pair, reason or phase is a change; each rewrites every row once.
+    auto pair = store.mark_blocked(pol.value(), ids, "check", "content_dist", "stage", "gated");
+    REQUIRE(pair.has_value());
+    CHECK(pair->changed == 3);
+    auto why = store.mark_blocked(pol.value(), ids, "check", "content_dist", "stage", "destructive");
+    REQUIRE(why.has_value());
+    CHECK(why->changed == 3);
+    auto phase = store.mark_blocked(pol.value(), ids, "verify", "content_dist", "stage", "destructive");
+    REQUIRE(phase.has_value());
+    CHECK(phase->changed == 3);
+    CHECK(check_result_of(store, pol.value(), "agent-1")["phase"] == "verify");
+    auto again = store.mark_blocked(pol.value(), ids, "verify", "content_dist", "stage", "destructive");
+    REQUIRE(again.has_value());
+    CHECK(again->changed == 0);
+
+    // A newly in-scope agent is the only changed row.
+    auto wider = store.mark_blocked(pol.value(), {"agent-1", "agent-4"}, "verify", "content_dist",
+                                    "stage", "destructive");
+    REQUIRE(wider.has_value());
+    CHECK(wider->changed == 1);
+}
+
+TEST_CASE("PolicyStore: mark_blocked takes a row over from another status without touching the fix "
+          "bookkeeping",
+          "[policy_store][pg][blocked]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PolicyStore store{pool};
+    auto frag = store.create_fragment(kFullFragment);
+    REQUIRE(frag.has_value());
+    auto pol = store.create_policy(make_policy_yaml(frag.value()));
+    REQUIRE(pol.has_value());
+
+    // The first write inserts (attempt count 0); the second counts one attempt.
+    REQUIRE(store.update_agent_status(pol.value(), "agent-1", "fixing").has_value());
+    REQUIRE(store.update_agent_status(pol.value(), "agent-1", "fixing").has_value());
+    const auto attempts_of = [&] {
+        auto lease = pool.try_acquire_for(std::chrono::milliseconds{2000});
+        REQUIRE(lease);
+        auto q = yuzu::server::pg::exec_params(
+            lease.get(),
+            "SELECT fix_attempt_count FROM policy_store.policy_status WHERE policy_id = $1 AND agent_id = $2",
+            std::vector<std::string>{pol.value(), std::string("agent-1")});
+        REQUIRE(q.status() == PGRES_TUPLES_OK);
+        REQUIRE(PQntuples(q.get()) == 1);
+        return std::string(PQgetvalue(q.get(), 0, 0));
+    };
+    const auto attempts_before = attempts_of();
+    REQUIRE(attempts_before == "1");
+    const auto before = store.get_agent_status(pol.value(), "agent-1");
+    REQUIRE(before.has_value());
+    REQUIRE(before->has_value());
+    REQUIRE((*before)->last_fix_at > 0);
+
+    auto r = store.mark_blocked(pol.value(), {"agent-1"}, "check", "echo", "purge_source", "destructive");
+    REQUIRE(r.has_value());
+    CHECK(r->changed == 1);
+    const auto after = store.get_agent_status(pol.value(), "agent-1");
+    REQUIRE(after.has_value());
+    REQUIRE(after->has_value());
+    CHECK((*after)->status == "blocked");
+    CHECK((*after)->last_fix_at == (*before)->last_fix_at);
+
+    // fix_attempt_count is not exposed on the status struct; it was read directly above.
+    CHECK(attempts_of() == attempts_before);
+}
+
+TEST_CASE("PolicyStore: mark_blocked writes in chunks and counts distinct ids",
+          "[policy_store][pg][blocked]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PolicyStore store{pool};
+    auto frag = store.create_fragment(kFullFragment);
+    REQUIRE(frag.has_value());
+    auto pol = store.create_policy(make_policy_yaml(frag.value()));
+    REQUIRE(pol.has_value());
+
+    // 1201 ids is three chunks (500, 500, 201); a duplicate must not double count.
+    std::vector<std::string> ids;
+    for (int i = 0; i < 1201; ++i)
+        ids.push_back("agent-" + std::to_string(i));
+    ids.push_back("agent-0");
+
+    auto r = store.mark_blocked(pol.value(), ids, "check", "echo", "purge_source", "destructive");
+    REQUIRE(r.has_value());
+    CHECK(r->changed == 1201);
+    auto again = store.mark_blocked(pol.value(), ids, "check", "echo", "purge_source", "destructive");
+    REQUIRE(again.has_value());
+    CHECK(again->changed == 0);
+
+    auto cs = store.get_compliance_summary(pol.value());
+    REQUIRE(cs.has_value());
+    CHECK(cs->blocked == 1201);
+    CHECK(cs->total == 1201);
+}
+
+TEST_CASE("PolicyStore: mark_blocked never stores an identifier authoring would refuse",
+          "[policy_store][pg][blocked]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PolicyStore store{pool};
+    auto frag = store.create_fragment(kFullFragment);
+    REQUIRE(frag.has_value());
+    auto pol = store.create_policy(make_policy_yaml(frag.value()));
+    REQUIRE(pol.has_value());
+    const std::vector<std::string> ids{"agent-1", "agent-2"};
+
+    const std::string too_long(129, 'a');
+    auto r1 = store.mark_blocked(pol.value(), ids, "check", too_long, "run", "unclassified");
+    REQUIRE(r1.has_value());
+    CHECK(r1->changed == 2);
+    const auto j = check_result_of(store, pol.value(), "agent-1");
+    CHECK(j["reason"] == "dispatch_identifier_invalid");
+    CHECK(j["plugin"].is_null());
+    CHECK(j["action"].is_null());
+    CHECK(j["phase"] == "check");
+    auto st = store.get_agent_status(pol.value(), "agent-1");
+    REQUIRE(st.has_value());
+    REQUIRE(st->has_value());
+    CHECK((*st)->check_result.find(too_long) == std::string::npos);
+
+    // A different invalid pair (off the charset, 128 bytes or fewer) stores the same value, so
+    // moving from one to the other is not a change.
+    auto r2 = store.mark_blocked(pol.value(), ids, "check", "echo", "pur ge", "unclassified");
+    REQUIRE(r2.has_value());
+    CHECK(r2->changed == 0);
+    auto r3 = store.mark_blocked(pol.value(), ids, "check", "ec/ho", "status", "gated");
+    REQUIRE(r3.has_value());
+    CHECK(r3->changed == 0);
+    CHECK(check_result_of(store, pol.value(), "agent-2") == j);
+
+    // 128 bytes is within the limit: stored as given, with the caller's reason.
+    const std::string at_limit(128, 'b');
+    auto r4 = store.mark_blocked(pol.value(), ids, "check", at_limit, "run", "unclassified");
+    REQUIRE(r4.has_value());
+    CHECK(r4->changed == 2);
+    const auto k = check_result_of(store, pol.value(), "agent-1");
+    CHECK(k["reason"] == "unclassified");
+    CHECK(k["plugin"] == at_limit);
+}
+
+TEST_CASE("PolicyStore: mark_blocked refuses bad arguments", "[policy_store][pg][blocked]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PolicyStore store{pool};
+    auto frag = store.create_fragment(kFullFragment);
+    REQUIRE(frag.has_value());
+    auto pol = store.create_policy(make_policy_yaml(frag.value()));
+    REQUIRE(pol.has_value());
+
+    CHECK_FALSE(store.mark_blocked("", {"a"}, "check", "echo", "status", "gated").has_value());
+    CHECK_FALSE(store.mark_blocked(pol.value(), {"a"}, "bogus", "echo", "status", "gated").has_value());
+    CHECK_FALSE(store.mark_blocked(pol.value(), {"a"}, "check", "echo", "status", "").has_value());
+    // 0 would match every unclaimed row.
+    CHECK_FALSE(
+        store.mark_blocked(pol.value(), {"a"}, "fix", "echo", "status", "gated", int64_t{0}).has_value());
+    // No ids is a no-op, not an error.
+    auto none = store.mark_blocked(pol.value(), {}, "check", "echo", "status", "gated");
+    REQUIRE(none.has_value());
+    CHECK(none->changed == 0);
+    CHECK(none->fenced_out == 0);
+}
+
+TEST_CASE("PolicyStore: a fenced mark_blocked never overwrites a row a sibling reclaimed",
+          "[policy_store][pg][blocked]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PolicyStore store{pool};
+    auto frag = store.create_fragment(kFullFragment);
+    REQUIRE(frag.has_value());
+    auto pol = store.create_policy(make_policy_yaml(frag.value()));
+    REQUIRE(pol.has_value());
+    const std::vector<std::string> ids{"agent-1", "agent-2"};
+
+    auto claimA = store.claim_remediation(pol.value(), ids, 1800);
+    REQUIRE(claimA.has_value());
+    REQUIRE(claimA->ids.size() == 2);
+
+    // While the claim is held: the fenced write changes both rows and loses neither.
+    auto w1 = store.mark_blocked(pol.value(), ids, "fix", "content_dist", "execute_staged", "gated",
+                                 claimA->generation);
+    REQUIRE(w1.has_value());
+    CHECK(w1->changed == 2);
+    CHECK(w1->fenced_out == 0);
+    CHECK(check_result_of(store, pol.value(), "agent-1")["phase"] == "fix");
+
+    // The same refusal again: nothing changed, and that is not a lost fence.
+    auto w2 = store.mark_blocked(pol.value(), ids, "fix", "content_dist", "execute_staged", "gated",
+                                 claimA->generation);
+    REQUIRE(w2.has_value());
+    CHECK(w2->changed == 0);
+    CHECK(w2->fenced_out == 0);
+
+    // The fenced write does not release the claim: a sibling still cannot take it.
+    auto sibling = store.claim_remediation(pol.value(), ids, 1800);
+    REQUIRE(sibling.has_value());
+    CHECK(sibling->ids.empty());
+
+    // Release, then a sibling reclaims with a new generation.
+    REQUIRE(store.release_remediation_claim(pol.value(), ids, claimA->generation).has_value());
+    auto claimB = store.claim_remediation(pol.value(), ids, 1800);
+    REQUIRE(claimB.has_value());
+    REQUIRE(claimB->ids.size() == 2);
+    REQUIRE(claimB->generation != claimA->generation);
+
+    // The stale holder's write matches nothing: both targets are reported fenced out and the
+    // rows keep the first refusal's reason.
+    auto stale = store.mark_blocked(pol.value(), ids, "fix", "echo", "purge_source", "destructive",
+                                    claimA->generation);
+    REQUIRE(stale.has_value());
+    CHECK(stale->changed == 0);
+    CHECK(stale->fenced_out == 2);
+    CHECK(check_result_of(store, pol.value(), "agent-1")["reason"] == "gated");
+
+    // The current holder's write goes through.
+    auto fresh = store.mark_blocked(pol.value(), ids, "fix", "echo", "purge_source", "destructive",
+                                    claimB->generation);
+    REQUIRE(fresh.has_value());
+    CHECK(fresh->changed == 2);
+    CHECK(fresh->fenced_out == 0);
+    CHECK(check_result_of(store, pol.value(), "agent-1")["reason"] == "destructive");
+
+    // A fenced write never creates a row: an agent with no row is fenced out, not inserted.
+    auto ghost = store.mark_blocked(pol.value(), {"agent-ghost"}, "fix", "echo", "purge_source",
+                                    "destructive", claimB->generation);
+    REQUIRE(ghost.has_value());
+    CHECK(ghost->changed == 0);
+    CHECK(ghost->fenced_out == 1);
+    CHECK(status_of(store, pol.value(), "agent-ghost") == "<none>");
+}
+
+TEST_CASE("PolicyStore: blocked has its own bucket in every compliance summary",
+          "[policy_store][pg][blocked]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PolicyStore store{pool};
+    auto frag = store.create_fragment(kFullFragment);
+    REQUIRE(frag.has_value());
+    auto p1 = store.create_policy(make_policy_yaml(frag.value(), "Policy One"));
+    auto p2 = store.create_policy(make_policy_yaml(frag.value(), "Policy Two"));
+    REQUIRE(p1.has_value());
+    REQUIRE(p2.has_value());
+
+    REQUIRE(store.update_agent_status(p1.value(), "a1", "compliant").has_value());
+    REQUIRE(store.update_agent_status(p1.value(), "a2", "non_compliant").has_value());
+    REQUIRE(store.mark_blocked(p1.value(), {"a3", "a4", "a5"}, "check", "echo", "purge_source",
+                               "destructive")
+                .has_value());
+    REQUIRE(store.update_agent_status(p2.value(), "a1", "compliant").has_value());
+
+    auto fake_now = std::chrono::steady_clock::time_point{} + std::chrono::hours(1);
+    store.set_cache_clock_for_test([&fake_now] { return fake_now; });
+
+    auto cs = store.get_compliance_summary(p1.value());
+    REQUIRE(cs.has_value());
+    CHECK(cs->compliant == 1);
+    CHECK(cs->non_compliant == 1);
+    CHECK(cs->blocked == 3);
+    CHECK(cs->total == 5);
+
+    auto fc = store.get_fleet_compliance();
+    REQUIRE(fc.has_value());
+    CHECK(fc->blocked == 3);
+    CHECK(fc->total_checks == 6);
+
+    auto by = store.compliance_by_policy_checked();
+    REQUIRE(by.has_value());
+    int64_t by_blocked = 0;
+    int64_t by_total = 0;
+    for (const auto& row : *by) {
+        by_blocked += row.blocked;
+        by_total += row.total;
+        if (row.policy_id == p1.value())
+            CHECK(row.blocked == 3);
+        else
+            CHECK(row.blocked == 0);
+    }
+    // On fresh rows the fleet figure and the by-policy view agree.
+    CHECK(by_blocked == fc->blocked);
+    CHECK(by_total == fc->total_checks);
+}
+
+TEST_CASE("PolicyStore: mark_blocked invalidates the fleet compliance cache",
+          "[policy_store][pg][blocked]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PolicyStore store{pool};
+    auto frag = store.create_fragment(kFullFragment);
+    REQUIRE(frag.has_value());
+    auto pol = store.create_policy(make_policy_yaml(frag.value()));
+    REQUIRE(pol.has_value());
+    REQUIRE(store.update_agent_status(pol.value(), "agent-1", "compliant").has_value());
+
+    // Populate the cache, then change a row without advancing any clock.
+    auto fc1 = store.get_fleet_compliance();
+    REQUIRE(fc1.has_value());
+    CHECK(fc1->blocked == 0);
+
+    REQUIRE(store.mark_blocked(pol.value(), {"agent-2"}, "check", "echo", "purge_source", "destructive")
+                .has_value());
+    auto fc2 = store.get_fleet_compliance();
+    REQUIRE(fc2.has_value());
+    CHECK(fc2->blocked == 1);
+    CHECK(fc2->total_checks == 2);
+
+    // A repeat that changes nothing reports zero changed rows.
+    auto same = store.mark_blocked(pol.value(), {"agent-2"}, "check", "echo", "purge_source", "destructive");
+    REQUIRE(same.has_value());
+    CHECK(same->changed == 0);
 }

@@ -112,6 +112,13 @@ public:
     /// helper because route layers should not own YAML parsing themselves.
     static std::string peek_fragment_name(const std::string& yaml_source);
 
+    /// The instruction ids a fragment's YAML names, in the order check, fix, postCheck,
+    /// empty ones skipped, without parsing or validating the whole fragment. Used by the
+    /// authoring routes to ask the evaluator whether a pair may be dispatched before the
+    /// fragment is accepted. Defined here, beside `peek_fragment_name`, for the same
+    /// reason: route layers should not own YAML parsing.
+    static std::vector<std::string> peek_fragment_instructions(const std::string& yaml_source);
+
     // ── Policies ─────────────────────────────────────────────────────────
     [[nodiscard]] std::expected<std::string, std::string>
     create_policy(const std::string& yaml_source);
@@ -149,6 +156,48 @@ public:
     update_agent_status(const std::string& policy_id, const std::string& agent_id,
                         const std::string& status, const std::string& check_result = "",
                         std::optional<int64_t> expected_gen = std::nullopt);
+
+    /// What `mark_blocked` did. `changed` is the number of rows whose status or
+    /// `check_result` actually changed (zero when the same refusal is recorded again).
+    /// `fenced_out` is the number of requested targets a FENCED call did not match because
+    /// their claim generation no longer owns the row (a sibling reclaimed it); it is always
+    /// zero for the unfenced check-phase write. The two are separate on purpose: "nothing
+    /// changed" and "lost the fence" must not look the same.
+    struct MarkBlockedResult {
+        int64_t changed{0};
+        int64_t fenced_out{0};
+    };
+
+    /// Records that policy evaluation REFUSED to dispatch `phase`'s pair for `agent_ids`:
+    /// sets their status to `blocked` with a `check_result` of
+    /// `{"phase","result":"blocked","reason","plugin","action"}`. This is the only writer of
+    /// `blocked` (`update_agent_status` rejects it), so a fix or check outcome can never be
+    /// recorded as one by accident.
+    ///
+    /// Write on change: a row is written only when it is absent, is not yet `blocked`, or its
+    /// `check_result` differs from the new value, so a refusal that repeats every tick writes
+    /// nothing and `changed` is the number of rows that really changed (zero in a steady
+    /// state). `fix_attempt_count` and `last_fix_at` are never touched.
+    ///
+    /// `plugin` and `action` are stored as two fields, never joined (the identifier charset
+    /// includes '.'), and only when `dispatch_pair_well_formed`: an over-length or off-charset
+    /// part is NEVER stored. In that case the row is written with reason
+    /// `dispatch_identifier_invalid` and null plugin and action, whatever `reason` the caller
+    /// passed, so no caller can store text authoring would refuse.
+    ///
+    /// FENCED when `expected_gen` is set (a fix or verify refusal while the claim is held): a
+    /// plain UPDATE guarded on `remediation_claim_gen`, never an INSERT, exactly like
+    /// `update_agent_status`, so a sibling's reclaim is never overwritten. Unfenced (a check
+    /// refusal) it is the UPSERT, since the first refusal for an agent may be its first row.
+    ///
+    /// Ids are written in chunks of at most 500 and the counts summed. A later chunk failing
+    /// returns an error; earlier chunks stay written, and a retry is idempotent. Invalidates
+    /// the fleet compliance cache when anything changed.
+    [[nodiscard]] std::expected<MarkBlockedResult, std::string>
+    mark_blocked(const std::string& policy_id, const std::vector<std::string>& agent_ids,
+                 std::string_view phase, std::string_view plugin, std::string_view action,
+                 std::string_view reason, std::optional<int64_t> expected_gen = std::nullopt);
+
     [[nodiscard]] std::expected<std::optional<PolicyAgentStatus>, PolicyReadError>
     get_agent_status(const std::string& policy_id, const std::string& agent_id) const;
     [[nodiscard]] std::expected<std::vector<PolicyAgentStatus>, PolicyReadError>
