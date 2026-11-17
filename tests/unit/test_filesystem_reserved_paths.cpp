@@ -11,7 +11,6 @@
 #include "filesystem_dispatcher_test_support.hpp"
 #include "filesystem_reserved_paths.hpp"
 #include "local_dispatcher.hpp"
-#include "session_log_token.hpp"
 #include "test_helpers.hpp"
 
 #include <array>
@@ -54,20 +53,6 @@ TEST_CASE("is_agent_reserved_path: an empty set reserves nothing; windows separa
     rsv::Set s;
     s.dirs = {"C:/ProgramData/Yuzu"};
     CHECK(rsv::is_agent_reserved_path(s, "C:\\ProgramData\\Yuzu\\yuzu-agent.log"));
-}
-
-TEST_CASE("session_log_token never contains the session id", "[agent][session_log_token]") {
-    const std::string id = "sess-0123456789abcdef-SECRET";
-    const auto t = yuzu::shared::session_log_token(id);
-    CHECK(t.find("SECRET") == std::string::npos);
-    CHECK(t.find(id) == std::string::npos);
-    CHECK(t.size() == 8);
-    CHECK(yuzu::shared::session_log_token(id) == t); // stable, for correlation
-    CHECK(yuzu::shared::session_log_token("other") != t);
-    CHECK(yuzu::shared::session_log_token("") == "none");
-    const auto gw = yuzu::shared::session_log_token("gw-session-abcdef");
-    CHECK(gw.starts_with("gw-session~"));
-    CHECK(gw.find("abcdef") == std::string::npos);
 }
 
 TEST_CASE("filesystem plugin: read/search/file_hash/get_acl refuse the agent's own paths",

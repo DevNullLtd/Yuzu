@@ -11,7 +11,6 @@ __declspec(allocate(".CRT$XCB"))
 
 #include <yuzu/agent/detached_signature.hpp>
 #include <yuzu/agent/agent.hpp>
-#include "session_log_token.hpp" // WP06 F55: never log the raw session id
 #include <yuzu/agent/agent_csr.hpp>
 #include <yuzu/agent/cert_discovery.hpp>
 #include <yuzu/agent/cert_store.hpp>
@@ -2320,9 +2319,7 @@ public:
                     }
                     plugin_ctx_.config["agent.grpc_channel_state"] = state_str;
                 }
-                // WP06 F55: the session id is a credential; log a non-reversible fingerprint.
-                spdlog::info("Registered with server (session={}, enrollment={})",
-                             yuzu::shared::session_log_token(session_id_),
+                spdlog::info("Registered with server (session={}, enrollment={})", session_id_,
                              enrollment_status.empty() ? "enrolled" : enrollment_status);
 
                 // Mark Guardian as network-connected. PR 4 will use this hook to

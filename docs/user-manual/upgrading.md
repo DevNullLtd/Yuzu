@@ -24,7 +24,6 @@ Approval tickets minted for a supervised-tier MCP call stored the raw tool argum
 - `GET /events` needs unrestricted `Response:Read` and `Execution:Read`; a group- or service-scoped role and engine principals get `403` (the dashboard console's live panel is unavailable to them).
 - With RBAC off, a schedule whose creator is no longer an administrator stops firing mutating actions (Read-class actions still fire).
 - Creating a policy fragment checks the author against each instruction's `plugin.action`; manual remediate re-checks the fix pair and limits targets to the operator's visible devices.
-- The agent's session id is no longer logged (`session=<fingerprint>`); scripts that read `session=` from the agent log still match.
 
 ## ⚠️ Breaking: on-demand software sync asks for confirmation, is paced instead of capped at 500 devices, and cools down per group
 
