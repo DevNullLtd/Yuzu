@@ -868,7 +868,7 @@ TEST_CASE("QuarantineStore: clear_release_owed removes the mark; a repeat and a 
 }
 
 TEST_CASE("QuarantineStore: mark_endpoint_confirmed refuses a row whose release has been requested "
-          "(#8045 R6)",
+          "(#8045)",
           "[pg][quarantine][release]") {
     YUZU_REQUIRE_PG_DB_TPL(db, quarantine_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};

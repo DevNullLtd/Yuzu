@@ -3260,7 +3260,7 @@ TEST_CASE("reconciler (firewall): a status read sent while the record was confir
 
 TEST_CASE("reconciler (firewall): an apply that was delivered but has not run keeps its claim, so a "
           "release confirmed by an inactive answer cannot end the record until the apply's reply is "
-          "consumed (#8045 R1)",
+          "consumed (#8045)",
           "[pg][quarantine][reconciler][prq2][fence][r1]") {
     RECON_RIG(rig);
     const auto rec = rig.quarantine();
@@ -3290,7 +3290,7 @@ TEST_CASE("reconciler (firewall): an apply that was delivered but has not run ke
 
 TEST_CASE("reconciler (firewall): a release requested while an apply is unanswered turns the entry into "
           "a releasing one; the apply's claim survives that reset, no `inactive` read ends the record "
-          "until the apply's reply is read, and then it settles (#8045 R1)",
+          "until the apply's reply is read, and then it settles (#8045)",
           "[pg][quarantine][reconciler][prq2][fence][r1][reset]") {
     RECON_RIG(rig);
     const auto rec = rig.quarantine();
@@ -3311,7 +3311,7 @@ TEST_CASE("reconciler (firewall): a release requested while an apply is unanswer
 }
 
 TEST_CASE("reconciler (firewall): the marks a heartbeat drain had not reached go back when the pass throws "
-          "(#8045 R4)",
+          "(#8045)",
           "[pg][quarantine][reconciler][prq2][drain]") {
     RECON_RIG(rig);
     rig.quarantine();
@@ -3562,7 +3562,7 @@ TEST_CASE("redispatch_stored_containment claims the apply: the token is empty in
     CHECK_FALSE(inside->has_value()); // a claim is live inside the dispatch
     // The dispatch reached an agent, so the claim is KEPT: the command was only sent, the agent
     // runs it on a thread pool, and an apply that has not run yet can still be overtaken by a
-    // release (#8045 R1). It is handed back for the caller to drop once the reply is consumed.
+    // release (#8045). It is handed back for the caller to drop once the reply is consumed.
     CHECK(first->held_claim_gen == 1);
     auto kept = qstore.apply_fence_token("agent-1", id);
     REQUIRE(kept.has_value());

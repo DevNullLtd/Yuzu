@@ -24956,9 +24956,17 @@ McpServer::HandlerFn McpServer::build_handler(
                         // way; this path consumes no reply and leaves it to expire.)
                         mcp_audit("failure", "agent_id=" + agent_id + ", " + err.detail +
                                                  (record_pre_existing ? "" : " record_persisted=1"));
-                        res.set_content(a4_error(kInternalError, err.detail, "retry the request",
-                                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
-                                        "application/json");
+                        // A refused claim on a record that already existed is held for the claim
+                        // window, so the honest hint is that window, not the store-fault 5 s.
+                        static_assert(mcp::kMcpApplyClaimRetryMs == kApplyClaimTtlSecs * 1000);
+                        const bool claim_held =
+                            err.kind == ContainmentReapplyErrorKind::no_active_record &&
+                            record_pre_existing;
+                        res.set_content(
+                            a4_error(kInternalError, err.detail, "retry the request",
+                                     /*retry_after_ms=*/claim_held ? mcp::kMcpApplyClaimRetryMs
+                                                                   : mcp::kMcpStoreFaultRetryMs),
+                            "application/json");
                         return;
                     }
                     record_id = stored.id;

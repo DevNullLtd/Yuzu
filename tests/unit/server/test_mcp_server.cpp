@@ -36187,7 +36187,7 @@ TEST_CASE("MCP quarantine_device ticket round-trip records + dispatches isolatio
     CHECK(success_row(""));
 
     // The first call's apply reached the device, so its claim is held until a reply is read or 120 s
-    // pass (#8045 R1). MCP reads no reply, so a second call inside that window is refused as a
+    // pass (#8045). MCP reads no reply, so a second call inside that window is refused as a
     // retryable fault; the test stands in for the window passing by dropping the claim, whose
     // generation is 1 (the first apply claimed it once).
     REQUIRE(quar.release_apply_claim("agent-q", (*rec)->id, 1).has_value());

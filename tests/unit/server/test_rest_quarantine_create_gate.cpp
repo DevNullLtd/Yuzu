@@ -1526,7 +1526,7 @@ struct FakeDevice {
 
 // An apply that has claimed the record and is blocked inside its dispatch, on another thread: the
 // MCP quarantine_device re-dispatch, or the reconciler's. `release()` lets the dispatch finish
-// (it queues the apply; the dispatch reached an agent, so the claim is KEPT, #8045 R1), and joins.
+// (it queues the apply; the dispatch reached an agent, so the claim is KEPT, #8045), and joins.
 // `drop_claim()` models the consumer reading the apply's reply once the device has run it, which
 // is what the reconciler does with its own applies. The thread asserts nothing: Catch2
 // assertions are not thread-safe, so the outcome is read after the join. The constructor always
@@ -1648,7 +1648,7 @@ TEST_CASE("quarantine release (p): a late apply -- the device answers inactive t
 
 TEST_CASE("quarantine release (q): an apply already queued when the DELETE reads its token is delivered "
           "BEFORE the release, but it has not been read back, so it keeps its claim and the DELETE answers 202; "
-          "once its reply is consumed the reconciler settles the record (#8045 R1)",
+          "once its reply is consumed the reconciler settles the record (#8045)",
           "[rest][quarantine][release][fence][integration][pg]") {
     YUZU_REQUIRE_PG_DB_TPL(db, create_gate_tpl);
     Rig rig(db.dsn());
