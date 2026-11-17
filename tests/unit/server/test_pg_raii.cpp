@@ -318,6 +318,24 @@ TEST_CASE("connect_failure_cause: each branch, and the mis-bucketing cases", "[r
     CHECK(is("connection to server failed: timeout expired", "timed out"));
     CHECK(is("connection failed: Connection refused", "not reachable"));
     CHECK(is("FATAL:  the database system is starting up", "not accepting"));
+    // #4943 discriminator: the reserve-slots refusal and plain max_connections are NOT generic.
+    using yuzu::server::pg::kConnectNoFreeSlots;
+    using yuzu::server::pg::kConnectNoWritableHost;
+    CHECK(std::string_view{connect_failure_cause(
+              "connection to server at \"h\" (1.2.3.4), port 5432 failed: FATAL:  remaining connection "
+              "slots are reserved for roles with privileges of the \"pg_use_reserved_connections\" role")} ==
+          kConnectNoFreeSlots);
+    CHECK(std::string_view{connect_failure_cause("FATAL:  sorry, too many clients already")} ==
+          kConnectNoFreeSlots);
+    // target_session_attrs=read-write refused every host.
+    CHECK(std::string_view{connect_failure_cause(
+              "connection to server failed: session is read-only")} == kConnectNoWritableHost);
+    CHECK(std::string_view{connect_failure_cause(
+              "connection to server failed: server is in hot standby mode")} == kConnectNoWritableHost);
+    // Ordering: a role merely NAMED like a cause stays a missing role; auth beats slots.
+    CHECK(is("FATAL:  role \"hot standby\" does not exist", "does not exist"));
+    CHECK(is("FATAL:  database \"remaining connection slots\" does not exist", "does not exist"));
+    CHECK(is("FATAL:  password authentication failed ... remaining connection slots", "authentication failed"));
     CHECK(is("out of memory", "out of memory"));
     CHECK(std::string_view{connect_failure_cause("something else")} == kConnectFailureGeneric);
     // A missing sslrootcert says "does not exist" but is a TLS failure, not a missing database.

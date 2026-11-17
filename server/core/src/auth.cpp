@@ -603,7 +603,7 @@ bool AuthManager::wipe_user_sessions_durable(const std::string& username) {
     if (auto r = session_store_->invalidate_user(username); !r) {
         spdlog::error("durable session wipe for user '{}' failed ({}) - session wipe did not "
                       "persist, retry (invalidate_user is idempotent)",
-                      username, r.error().message);
+                      ::yuzu::log_key_token(username), r.error().message);
         note_session_store_degrade("invalidate_user"); // parity with the other degrade sites
         return false; // fail closed — caller must not report success (authdb-BLOCKING)
     }
@@ -2864,7 +2864,7 @@ std::size_t AuthManager::report_stale_cfg_credentials() {
             } else if (row.error() != yuzu::server::AuthDBError::InvalidUsername) {
                 spdlog::warn("#5274 boot check: could not read auth.users row for cfg user '{}' "
                              "(store error) - stale-credential check skipped for it",
-                             name);
+                             ::yuzu::log_key_token(name));
             }
             continue; // no row: the cfg entry is not shadowing anything
         }
@@ -2990,12 +2990,12 @@ UpdateRoleOutcome AuthManager::update_role_checked(const std::string& username, 
         using Kind = LocalRoleChangeResult::Kind;
         switch (res.kind) {
         case Kind::kNotFound:
-            spdlog::warn("update_role: user not found: '{}'", username);
+            spdlog::warn("update_role: user not found: '{}'", ::yuzu::log_key_token(username));
             return UpdateRoleOutcome::NotFound;
         case Kind::kLastAdministratorRefused:
             return UpdateRoleOutcome::LastAdministratorRefused; // nothing changed
         case Kind::kInactivePromotionRefused:
-            spdlog::warn("update_role: refusing to promote inactive account '{}'", username);
+            spdlog::warn("update_role: refusing to promote inactive account '{}'", ::yuzu::log_key_token(username));
             return UpdateRoleOutcome::InactivePromotionRefused;
         case Kind::kStoreFailure:
             spdlog::error("AuthManager::update_role_checked: guarded role write for '{}' failed: {}",

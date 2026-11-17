@@ -460,7 +460,7 @@ psql_in "$PG3" "REVOKE pg_use_reserved_connections FROM app"
 foreign_burst
 if t=$(wait_for /readyz 503 20 '"pg":"unreachable"'); then pass "/readyz 503 pg=unreachable ${t}s after the same kill WITHOUT the grant (probe refused at max_connections; log shows 53300)"
 else fail "/readyz did not go 503 without the grant: $(body /readyz)"; fi
-grep -q "remaining connection slots are reserved" "$RIG/server.log" && pass "server log names the refusal (slots reserved), not the password" || fail "server log lacks the slots-reserved refusal"
+grep -q "no free connection slots" "$RIG/server.log" && pass "server log names the refusal (no free connection slots: the #4943 reserve), not the password" || fail "server log lacks the no-free-connection-slots cause"
 grep -q "$APP_PASS" "$RIG/server.log" && fail "server log contains the app password" || true
 psql_in "$PG3" "GRANT pg_use_reserved_connections TO app"
 if t=$(wait_for /readyz 200 20); then pass "/readyz 200 again ${t}s after re-granting (probe admitted into the reserve)"

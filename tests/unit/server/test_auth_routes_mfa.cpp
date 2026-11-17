@@ -1567,26 +1567,46 @@ TEST_CASE("POST /login: a malformed username never forges a log line (F20)",
     CHECK(text.find("\xC2\x9B") == std::string::npos);
 }
 
-TEST_CASE("POST /login: unknown-user, bad-password and over-length-password lines fold the username (F20)",
+TEST_CASE("POST /login: each username-bearing log site folds the username (F20)",
           "[pg][mfa][routes][auth_routes][log_injection]") {
-    AuthRoutesHarness h;
+    // Each case drives ONE site and asserts that site's own line, so a regression in one cannot hide
+    // behind another. %0A %1B %C2%9B decode to LF, ESC and the C1 CSI.
     const std::string evil = "alice%0A%5BERROR%5D%20forged%1B%5B2J%C2%9B31m";
-    const std::string huge(2048, 'p'); // > kMaxPasswordBytes: the over-length-password site
-    yuzu::test::LogCapture cap{spdlog::level::warn};
-    for (const std::string& body :
-         {"username=" + evil + "&password=wrong",            // unknown user
-          "username=" + evil + "&password=" + huge,           // over-length password
-          std::string("username=alice&password=wrong")}) {    // bad password for a real name
+    const auto run = [&](const std::string& body, auto&& setup) {
+        AuthRoutesHarness h;
+        setup(h);
+        yuzu::test::LogCapture cap{spdlog::level::warn};
         auto r = h.sink.Post("/login", body, "application/x-www-form-urlencoded");
+        cap.stop();
         REQUIRE(r);
-        CHECK(r->status == 401);
+        return cap.text();
+    };
+    const auto none = [](AuthRoutesHarness&) {};
+    const auto lockout = [](AuthRoutesHarness& h) {
+        h.cfg.auth_lockout_threshold = 3;
+        h.cfg.auth_lockout_window_secs = 900;
+    };
+    const auto clean = [](const std::string& text, std::string_view line) {
+        INFO(text);
+        CHECK(text.find(line) != std::string::npos);
+        CHECK(yuzu::test::stray_control_bytes(text) == 0);
+        CHECK(text.find("\xC2\x9B") == std::string::npos);
+    };
+    SECTION("auth.cpp: unknown user") {
+        clean(run("username=" + evil + "&password=wrong", none), "unknown user");
     }
-    cap.stop();
-    const std::string text = cap.text();
-    INFO(text);
-    CHECK(text.find("forged") != std::string::npos);
-    CHECK(yuzu::test::stray_control_bytes(text) == 0);
-    CHECK(text.find("\xC2\x9B") == std::string::npos);
+    SECTION("auth.cpp: bad password for a real account") {
+        // Folding must not mangle a clean name: it survives verbatim.
+        const auto text = run("username=alice&password=wrong", none);
+        CHECK(text.find("bad password for 'alice'") != std::string::npos);
+        CHECK(yuzu::test::stray_control_bytes(text) == 0);
+    }
+    SECTION("auth_routes.cpp: lockout read refused for a malformed name") {
+        clean(run("username=" + evil + "&password=wrong", lockout), "lockout_status read failed");
+    }
+    SECTION("auth_routes.cpp: record_failed_login refused for a malformed name") {
+        clean(run("username=" + evil + "&password=wrong", lockout), "record_failed_login failed");
+    }
 }
 
 TEST_CASE("POST /login: locked-account 401 body is shape-identical to a bad-password 401 (no oracle)",

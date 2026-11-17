@@ -430,8 +430,10 @@ start_all() {
         # The agent log carries only a session_fp (F50); the id comes from the server container's
         # "ProxyRegister succeeded" line, joined on the fingerprint.
         . "$YUZU_ROOT/scripts/lib/agent-session-fp.sh"
-        LAST_SESSION_ID=$(docker logs yuzu-uat-server 2>&1 | session_for_fp "$(agent_session_fp "$log")")
-        LAST_SESSION_ID="${LAST_SESSION_ID:-unknown}"
+        # docker logs of an absent container must not abort under set -e: stage to a file.
+        local srv_log="$UAT_DIR/server-container.log"
+        docker logs yuzu-uat-server > "$srv_log" 2>&1 || true
+        LAST_SESSION_ID=$(resolve_agent_session "$log" "$srv_log")
         ok "$label agent up ($LAST_SESSION_ID, ${waited}s)"
 
         if echo "$LAST_SESSION_ID" | grep -q "gw-session"; then

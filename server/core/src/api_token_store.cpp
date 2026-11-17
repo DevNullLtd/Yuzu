@@ -2,8 +2,6 @@
 #include "engine_principal_store.hpp"
 #include "mcp_policy.hpp"
 #include "pg/pg_exec.hpp"
-
-#include <yuzu/log_token.hpp> // log_key_token: principal ids derived from IdP/SCIM values in log lines
 #include "pg/pg_migration_runner.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
@@ -11,6 +9,7 @@
 #include "rotation_confirm_state.hpp"
 #include "secure_random.hpp"
 
+#include <yuzu/log_token.hpp> // log_key_token: principal ids derived from IdP/SCIM values in log lines
 #include <yuzu/secure_zero.hpp>
 
 #include <libpq-fe.h>

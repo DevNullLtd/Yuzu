@@ -2423,4 +2423,11 @@ TEST_CASE("SAML ACS error text is neutralised for the log line and the audit det
     CHECK(yuzu::log_key_token(big).size() == 256);
     CHECK(yuzu::server::detail::neutralise_saml_error(std::string(128, 'a')).size() == 128);
     CHECK(yuzu::server::detail::neutralise_saml_error(std::string(127, 'a')).size() == 127);
+    // Separates > from >=: 129 bytes clip to 128, and the audit keeps the HEAD.
+    CHECK(yuzu::server::detail::neutralise_saml_error(std::string(129, 'a')).size() == 128);
+    CHECK(yuzu::server::detail::neutralise_saml_error(std::string(100, 'h') + std::string(100, 't')) ==
+          std::string(100, 'h') + std::string(28, 't'));
+    // The log copy: 256 passes whole, 257 is shortened to the 256 cap.
+    CHECK(yuzu::log_key_token(std::string(256, 'a')).size() == 256);
+    CHECK(yuzu::log_key_token(std::string(257, 'a')).size() == 256);
 }

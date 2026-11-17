@@ -45,7 +45,7 @@ int main(int argc, char** argv) {
 
     PgResult res{PQexec(conn.get(), "SELECT 1")};
     if (res.status() != PGRES_TUPLES_OK) {
-        std::fputs(std::format("canary: SELECT 1 failed: {}", PQerrorMessage(conn.get())).c_str(),
+        std::fputs(std::format("canary: SELECT 1 failed: {}\n", PQerrorMessage(conn.get())).c_str(),
                    stderr);
         return 1;
     }

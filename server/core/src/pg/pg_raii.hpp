@@ -62,6 +62,14 @@ private:
     PGresult* r_{nullptr};
 };
 
+/// Distinct causes callers and tests name (the #4943 reserve-slots discriminator among them).
+inline constexpr const char* kConnectNoFreeSlots =
+    "no free connection slots (max_connections or reserved slots exhausted)";
+inline constexpr const char* kConnectNoWritableHost =
+    "no writable host (read-only session or hot standby)";
+inline constexpr const char* kConnectFailureGeneric =
+    "connection failed (details withheld; check host, port and credentials)";
+
 /// Map libpq's connect-failure text to a FIXED, credential-free cause (F56, CWE-532). The raw
 /// `PQerrorMessage` of a failed connect quotes the host, port and dbname libpq parsed out of the
 /// DSN, and a URI DSN whose password holds an unescaped '/' or '@' parses cleanly with part of
@@ -69,9 +77,6 @@ private:
 /// `last_error()`. The text is inspected only to pick one of these constants; nothing from it is
 /// ever copied out. Substring matching on libpq's stable phrases; anything unrecognised falls to
 /// the generic cause. ASCII, one line.
-inline constexpr const char* kConnectFailureGeneric =
-    "connection failed (details withheld; check host, port and credentials)";
-
 [[nodiscard]] inline const char* connect_failure_cause(std::string_view err) noexcept {
     const auto has = [&](std::string_view needle) { return err.find(needle) != std::string_view::npos; };
     // ORDER MATTERS: libpq quotes caller-chosen names (a database or role called "SSL_prod" or
@@ -89,6 +94,14 @@ inline constexpr const char* kConnectFailureGeneric =
         return "TLS negotiation or certificate verification failed";
     if (has("\" does not exist"))
         return "database or role does not exist";
+    // #4943/#4944 discriminator: a probe refused at max_connections because the free slots are
+    // the superuser/pg_use_reserved_connections reserve.
+    if (has("remaining connection slots") || has("too many clients"))
+        return kConnectNoFreeSlots;
+    // target_session_attrs=read-write refused every host: nothing writable behind the DSN.
+    if (has("session is read-only") || has("hot standby") || has("target_session_attrs") ||
+        has("server is in hot standby mode") || has("read-only transaction"))
+        return kConnectNoWritableHost;
     if (has("could not translate host name") || has("Name or service not known") ||
         has("Temporary failure in name resolution"))
         return "host name could not be resolved";
@@ -97,8 +110,8 @@ inline constexpr const char* kConnectFailureGeneric =
     if (has("Connection refused") || has("No such file or directory") ||
         has("Is the server running"))
         return "server not reachable (connection refused or no such socket)";
-    if (has("starting up") || has("shutting down") || has("too many clients"))
-        return "server not accepting connections (starting, stopping or full)";
+    if (has("starting up") || has("shutting down"))
+        return "server not accepting connections (starting up or shutting down)";
     if (has("out of memory"))
         return "out of memory";
     return kConnectFailureGeneric;

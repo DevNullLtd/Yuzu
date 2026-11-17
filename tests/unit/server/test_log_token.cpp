@@ -511,3 +511,26 @@ TEST_CASE("log_token: classifies UTF-8 validity exactly like sanitize_utf8_stric
     }
     CHECK(mismatches == 0);
 }
+
+// ── WP04 waiver list: fold sites with NO dedicated test ─────────────────────────────────────
+// Each is a one-argument wrap of the already-tested log_key_token on a log line whose reaching
+// state needs a fixture this change did not build (an IdP session, an elevation path, a failing
+// store). They are covered by review and by the helper's own tests above, not by a test of the
+// line. If one regresses, the next governance run's grep of "spdlog.*username" is the backstop.
+//   auth_routes.cpp: "Login blocked ... locked", "Account locked after", "password verification
+//     for ... could not complete", "audit emission FAILED ... lockout", "clear_failed_logins
+//     failed", "mfa_status failed", BREAK-GLASS login lines, "MFA enforcement=... refusing
+//     login", OIDC/SAML "login denied", "group provisioning skipped/failed/denied",
+//     "elevation-eligibility: durable elevation clear failed", "role.elevation.granted audit
+//     FAILED" (x2), "elevate/revoke: durable clear failed".
+//   auth.cpp: "Auth failed / verify_password failed: over-length password" (POST /login answers an
+//     over-max password without calling verify_password, #5342, so no route test reaches it),
+//     "SAML session created", "create_saml_session: durable persist failed", "durable
+//     session wipe for user", "#5274 boot check", "update_role: user not found / refusing to
+//     promote".
+//   auth_db.cpp: "upsert_user rejected invalid username", "update_role rejected invalid username".
+//   scim_routes.cpp: the eight `input.user_name` lines (cannot provision / reactivate / revive /
+//     CSPRNG / set_identity_source / set_provisioning_source).
+//   saml_provider.cpp: "assertion accepted (name_id=...)". api_token_store.cpp:
+//     list_active_for_principal_checked pool-timeout and query-failed lines.
+//   dex_linux_collector.cpp emit(): pinned lexically by tests/test_agent_session_log_wiring_lexical.py.

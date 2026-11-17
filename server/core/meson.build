@@ -1166,7 +1166,7 @@ yuzu_server_exe = executable(
 # TARGET stays: the CI link-provenance assertions on all four Tier-1 legs
 # (ldd/otool/dumpbin in ci.yml) inspect this binary path. Do not remove or
 # rename without updating those workflow steps.
-executable(
+pg_canary_exe = executable(
   'yuzu_pg_canary',
   files('src/pg/canary_main.cpp'),
   dependencies: [libpq_dep],

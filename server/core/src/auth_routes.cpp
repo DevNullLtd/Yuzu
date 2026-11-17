@@ -5450,7 +5450,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 // responder the access was dropped (adversarial C2). The
                 // eligibility flip is durable, so a retry re-runs only the clear.
                 spdlog::error("elevation-eligibility: durable elevation clear failed for '{}': {}",
-                              target, rv.error());
+                              ::yuzu::log_key_token(target), ::yuzu::log_key_token(rv.error()));
                 audit_log(req, "user.elevation_eligibility.set", "error", "User", target,
                           "eligible=false elevation_clear_failed=true detail=" + rv.error());
                 res.status = 503;
@@ -5820,7 +5820,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 spdlog::critical("role.elevation.granted audit FAILED for '{}' AND the compensating "
                                  "revoke ALSO FAILED ({}) — elevation is LIVE and UNRECORDED; "
                                  "manual revocation required",
-                                 session->username, rollback.error());
+                                 ::yuzu::log_key_token(session->username), rollback.error());
                 res.status = 500;
                 res.set_header("Sec-Audit-Failed", "true");
                 res.set_content(
@@ -5832,7 +5832,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 return;
             }
             spdlog::error("role.elevation.granted audit FAILED for '{}' — elevation rolled back",
-                          session->username);
+                          ::yuzu::log_key_token(session->username));
             res.status = 500;
             res.set_header("Sec-Audit-Failed", "true");
             res.set_content(detail::error_json_a4(500, "could not record the elevation; not granted",
@@ -5879,7 +5879,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                       // Fail CLOSED (503 + error audit) rather than auditing a
                       // false `role.elevation.revoked ok` (adversarial C2).
                       spdlog::error("elevate/revoke: durable clear failed for '{}': {}",
-                                    session->username, rev.error());
+                                    ::yuzu::log_key_token(session->username), rev.error());
                       audit_log_for_principal(req, "role.elevation.revoked", "error",
                                               session->username,
                                               auth::role_to_string(session->role), "User",

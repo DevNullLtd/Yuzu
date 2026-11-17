@@ -431,8 +431,7 @@ start_all() {
     # The agent log carries only a session_fp (F50); the id comes from the server's own
     # "ProxyRegister succeeded" line, joined on the fingerprint.
     . "$YUZU_ROOT/scripts/lib/agent-session-fp.sh"
-    session_id=$(session_for_fp "$(agent_session_fp "$UAT_DIR/agent.log")" < "$UAT_DIR/server.log")
-    session_id="${session_id:-unknown}"
+    session_id=$(resolve_agent_session "$UAT_DIR/agent.log" "$UAT_DIR/server.log")
     ok "Agent up ($session_id)"
 
     if echo "$session_id" | grep -q "gw-session"; then
