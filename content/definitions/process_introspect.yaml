@@ -45,6 +45,10 @@ metadata:
     status row stating whether the read was complete. On Linux the read is made through
     /proc, so on a host that mounts /proc with hidepid 2 or above another account's process
     reads as no_such_process_or_hidden. macOS and Windows are planned and not yet read.
+    Take the pid from crossplatform.process.list; a degraded read is returned as CONSTRAINED,
+    never as an empty OK, and no_such_process, no_such_process_or_hidden and pid_reused are
+    terminal while torn_read can be retried. Needs Forensics:Read, and a non-administrator
+    also needs an approval.
   tags: [process, introspection, security, posture, forensics]
 
 spec:

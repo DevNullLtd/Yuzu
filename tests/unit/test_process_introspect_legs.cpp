@@ -22,9 +22,11 @@
 #include <cerrno>
 #include <deque>
 #include <map>
+#include <new>
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace yuzu::process_introspect;
@@ -34,9 +36,10 @@ namespace {
 
 // ---- fixtures: LABELLED FIXTURES in the documented kernel layout (see the parsers test) -------
 
-std::string make_stat(std::uint64_t starttime, int nice = 0, unsigned rt = 0, unsigned policy = 0) {
+std::string make_stat(std::uint64_t starttime, int nice = 0, unsigned rt = 0, unsigned policy = 0,
+                      char state = 'S') {
     std::vector<std::string> f(42, "0");
-    f[3] = "S";
+    f[3] = std::string(1, state);
     f[19] = std::to_string(nice);
     f[22] = std::to_string(starttime);
     f[40] = std::to_string(rt);
@@ -75,7 +78,7 @@ RawRead raw(RawErr e) { return RawRead{{}, e, 0}; }
 /// The fake /proc. Each name holds a queue of results consumed in order; the last repeats.
 struct Fake {
     int open_errno = 0;
-    std::map<std::string, std::deque<RawRead>> files;
+    mutable std::map<std::string, std::deque<RawRead>> files; ///< consumed by the const reader
     RawRead boot = ok(kBootId);
     RawRead mount = ok(kProcVisible);
     mutable std::vector<std::string> reads; ///< names read from the pid directory, in order
@@ -105,7 +108,7 @@ struct Fake {
             auto it = files.find(name);
             if (it == files.end())
                 return io(ENOENT);
-            auto& q = const_cast<std::deque<RawRead>&>(it->second);
+            auto& q = it->second;
             RawRead r = q.front();
             if (q.size() > 1)
                 q.pop_front();
@@ -167,6 +170,16 @@ int counting_leg(yuzu::CommandContext& ctx, const Request&) {
     return 0;
 }
 int throwing_leg(yuzu::CommandContext&, const Request&) { throw std::runtime_error("probe"); }
+// A leg that has already written output when it throws (a bad_alloc part-way through a report).
+int status_then_throwing_leg(yuzu::CommandContext& ctx, const Request&) {
+    ctx.write_output("status|inspect|supported|-");
+    throw std::bad_alloc();
+}
+int status_row_then_throwing_leg(yuzu::CommandContext& ctx, const Request&) {
+    ctx.write_output("status|inspect|supported|-");
+    ctx.write_output("target|4242|0123abcd.1|oom");
+    throw std::bad_alloc();
+}
 
 int exec_exec(YuzuCommandContext* raw_ctx, const char*, const YuzuParam*, std::size_t) {
     yuzu::CommandContext ctx{raw_ctx};
@@ -177,6 +190,129 @@ int exec_exec(YuzuCommandContext* raw_ctx, const char*, const YuzuParam*, std::s
 yuzu::agent::LocalDispatcher::Result dispatch(YuzuPluginDescriptor& d) {
     yuzu::agent::LocalDispatcher dispatcher;
     return dispatcher.run(&d, "inspect");
+}
+
+// ---- the bounded fault sweep (see the TEST_CASE) -------------------------------------------
+
+/// One injected fault: the read slot and the errno it answers.
+using Fault = std::pair<std::string, int>;
+
+/// The slots of one inspection in read order. "stat" is the identity read, "stat_reread" the last
+/// one; "mountinfo" is consulted only when the directory open is not found.
+std::vector<std::string> sweep_slots(Facet f) {
+    std::vector<std::string> s{"open", "stat", "boot_id"};
+    switch (f) {
+    case Facet::resource_limits:
+        s.emplace_back("limits");
+        break;
+    case Facet::oom:
+        s.emplace_back("oom_score");
+        s.emplace_back("oom_score_adj");
+        break;
+    case Facet::sigmasks:
+    case Facet::caps:
+    case Facet::seccomp:
+    case Facet::sched:
+        s.emplace_back("status");
+        break;
+    }
+    s.emplace_back("stat_reread");
+    s.emplace_back("mountinfo");
+    return s;
+}
+
+void inject(Fake& fk, const std::string& slot, int err) {
+    if (slot == "open")
+        fk.open_errno = err;
+    else if (slot == "boot_id")
+        fk.boot = io(err);
+    else if (slot == "mountinfo")
+        fk.mount = io(err);
+    else if (slot == "stat")
+        fk.files["stat"].front() = io(err);
+    else if (slot == "stat_reread")
+        fk.files["stat"].back() = io(err);
+    else
+        fk.set(slot, io(err));
+}
+
+int fault_of(const std::vector<Fault>& faults, const char* slot) {
+    for (const auto& [s, e] : faults)
+        if (s == slot)
+            return e;
+    return 0;
+}
+
+/// Every reason token the plugin may emit for `f`, as literals: a unit test does no source-tree
+/// file I/O, so this is not read from the README. A token outside the set escaped the vocabulary.
+std::set<std::string> closed_tokens(Facet f) {
+    std::set<std::string> s;
+    for (const char* t : {"no_such_process", "no_such_process_or_hidden", "permission_denied",
+                          "identity_unreadable", "pid_reused", "torn_read"})
+        s.insert(tok(t));
+    for (const char* c :
+         {"permission_denied", "read_failed", "oversized", "malformed", "unknown_row"})
+        s.insert(tok(std::string{facet_name(f)} + ':' + c));
+    return s;
+}
+
+std::string describe_faults(Facet f, const std::vector<Fault>& faults) {
+    std::string d{facet_name(f)};
+    for (const auto& [s, e] : faults)
+        d += ' ' + s + '=' + std::to_string(e);
+    return d;
+}
+
+/// Invariants only; never a re-implementation of the decision table.
+void check_sweep_invariants(const Fake& fk, const Inspection& r, Facet f,
+                            const std::vector<Fault>& faults) {
+    INFO(describe_faults(f, faults));
+    // reason.empty() iff supported; a refusal that read nothing carries no rows.
+    CHECK(r.reason.empty() == (r.status == StatusState::supported));
+    if (r.status == StatusState::supported) {
+        REQUIRE(r.rows.size() >= 2);
+        CHECK(r.rows.front().rfind("target|", 0) == 0);
+    }
+    if (r.status == StatusState::unavailable)
+        CHECK(r.rows.empty());
+    if (!r.rows.empty())
+        CHECK(r.rows.front().rfind("target|", 0) == 0);
+    // Every comma-joined reason token is in the closed vocabulary.
+    const auto allowed = closed_tokens(f);
+    std::size_t from = 0;
+    while (!r.reason.empty() && from <= r.reason.size()) {
+        const std::size_t comma = r.reason.find(',', from);
+        const std::string t = r.reason.substr(from, comma == std::string::npos ? comma : comma - from);
+        INFO("token: " << t);
+        CHECK(allowed.count(t) == 1);
+        if (comma == std::string::npos)
+            break;
+        from = comma + 1;
+    }
+    // No read after a refused identity slot, and the mount table only for a not-found open.
+    if (fault_of(faults, "open") != 0) {
+        CHECK(fk.reads.empty());
+        CHECK(fk.boot_calls == 0);
+    } else if (fault_of(faults, "stat") != 0) {
+        CHECK(fk.reads == std::vector<std::string>{"stat"});
+        CHECK(fk.boot_calls == 0);
+    } else if (fault_of(faults, "boot_id") != 0) {
+        CHECK(fk.reads == std::vector<std::string>{"stat"});
+        CHECK(fk.boot_calls == 1);
+    }
+    CHECK(fk.mount_calls == (fault_of(faults, "open") == ENOENT ? 1 : 0));
+    // The README's bound: at most five bounded reads (the mount table replaces them all when the
+    // open is not found).
+    CHECK(fk.reads.size() + static_cast<std::size_t>(fk.boot_calls + fk.mount_calls) <= 5);
+}
+
+void sweep_case(Facet f, const std::vector<Fault>& faults) {
+    Fake fk;
+    fk.then("stat", ok(make_stat(987654))); // two stat results: the identity read, then the re-read
+    for (const auto& [slot, err] : faults)
+        inject(fk, slot, err);
+    const auto r = run(fk, f);
+    check_sweep_invariants(fk, r, f, faults);
 }
 
 } // namespace
@@ -265,7 +401,8 @@ TEST_CASE("process_introspect a hidden /proc never asserts the process is gone",
     }
     // An unreadable, oversized or /proc-less mount table is the weaker answer, never a bare gone.
     for (const RawRead& m : {io(EACCES), io(EIO), raw(RawErr::oversized),
-                             ok("1 2 0:1 / /sys rw - sysfs sysfs rw\n"), ok("")}) {
+                             ok("1 2 0:1 / /sys rw - sysfs sysfs rw\n"), ok(""),
+                             ok("23 28 0:21 / /proc rw - tmpfs tmpfs rw\n")}) {
         Fake fk;
         fk.open_errno = ENOENT;
         fk.mount = m;
@@ -332,6 +469,19 @@ TEST_CASE("process_introspect identity failures are mapped and nothing else is r
         CHECK(r.reason == tok("identity_unreadable"));
         CHECK(fk.reads == std::vector<std::string>{"stat"});
     }
+    // A refused boot_id is a refusal, not an unreadable identity (also for a visible pid), and
+    // nothing further is read.
+    for (const RawRead& b : {io(EACCES), io(EPERM)}) {
+        Fake fk;
+        fk.boot = b;
+        const auto r = run(fk, Facet::oom);
+        CHECK(r.status == StatusState::permission_denied);
+        CHECK(r.reason == tok("permission_denied"));
+        CHECK(r.rows.empty());
+        CHECK(fk.reads == std::vector<std::string>{"stat"});
+        CHECK(fk.boot_calls == 1);
+        CHECK(fk.mount_calls == 0);
+    }
 }
 
 TEST_CASE("process_introspect a start_time guard refuses a reused pid before reading anything else",
@@ -378,6 +528,23 @@ TEST_CASE("process_introspect a torn read discards every row", "[process_introsp
         Fake fk; // the second stat is unparseable
         fk.then("stat", ok("garbage"));
         CHECK(run(fk, Facet::oom).reason == tok("torn_read"));
+    }
+    {
+        // One oom file absent beside a readable one, stat stable: the half-built row is discarded
+        // and the answer is torn_read. Pinned current behaviour (issue #8085): a file that is
+        // absent for good reads as transient, exactly like a process that exited.
+        Fake adj_gone;
+        adj_gone.set("oom_score_adj", io(ENOENT));
+        const auto a = run(adj_gone, Facet::oom);
+        CHECK(a.status == StatusState::unavailable);
+        CHECK(a.reason == tok("torn_read"));
+        CHECK(a.rows.empty());
+        Fake score_gone;
+        score_gone.set("oom_score", io(ENOENT));
+        const auto b = run(score_gone, Facet::oom);
+        CHECK(b.status == StatusState::unavailable);
+        CHECK(b.reason == tok("torn_read"));
+        CHECK(b.rows.empty());
     }
     for (Facet f : kAll) { // a facet source vanishing after identity means the process exited
         Fake fk;
@@ -604,6 +771,96 @@ TEST_CASE("process_introspect supported implies at least one facet row", "[proce
                 if (r.status == StatusState::supported)
                     CHECK(facet_rows(r).size() >= 1);
             }
+}
+
+TEST_CASE("process_introspect bounded fault sweep over the read sequence", "[process_introspect]") {
+    // Up to two simultaneous faults at any slots of any facet's read sequence, each one of the
+    // errnos a host under pressure produces. Whatever happens, the answer keeps its shape.
+    constexpr int kErrnos[] = {EMFILE, ENFILE, ENOMEM, EIO, EACCES, ENOENT};
+    for (Facet f : kAll) {
+        const auto slots = sweep_slots(f);
+        sweep_case(f, {});
+        for (std::size_t a = 0; a < slots.size(); ++a)
+            for (int ea : kErrnos) {
+                sweep_case(f, std::vector<Fault>{{slots[a], ea}});
+                for (std::size_t b = a + 1; b < slots.size(); ++b)
+                    for (int eb : kErrnos)
+                        sweep_case(f, std::vector<Fault>{{slots[a], ea}, {slots[b], eb}});
+            }
+    }
+    // Pinned current behaviour (issue #8085): descriptor exhaustion is not told apart from a
+    // permanent failure. EMFILE at the stat re-read reads as a torn read, and EMFILE at the
+    // directory open as an unreadable identity.
+    {
+        Fake fk;
+        fk.then("stat", io(EMFILE));
+        const auto r = run(fk, Facet::oom);
+        CHECK(r.status == StatusState::unavailable);
+        CHECK(r.reason == tok("torn_read"));
+        CHECK(r.rows.empty());
+    }
+    {
+        Fake fk;
+        fk.open_errno = EMFILE;
+        const auto r = run(fk, Facet::oom);
+        CHECK(r.status == StatusState::unavailable);
+        CHECK(r.reason == tok("identity_unreadable"));
+        CHECK(r.rows.empty());
+        CHECK(fk.reads.empty());
+        CHECK(fk.mount_calls == 0);
+    }
+}
+
+TEST_CASE("process_introspect a zombie stat state is neither read nor emitted",
+          "[process_introspect]") {
+    // A labelled fixture, not a real zombie: parse_stat never reads the state token, so a stat
+    // line carrying Z answers exactly as one carrying S (supported, target row first, no state
+    // field). Pinned pending issue #8068; what a real zombie's /proc files do is the Linux lane
+    // probe, not this test.
+    for (Facet f : kAll) {
+        INFO(facet_name(f));
+        const Fake live;
+        Fake zombie;
+        zombie.set("stat", ok(make_stat(987654, 0, 0, 0, 'Z')));
+        const auto a = run(live, f);
+        const auto b = run(zombie, f);
+        CHECK(b.status == StatusState::supported);
+        CHECK(b.reason.empty());
+        REQUIRE_FALSE(b.rows.empty());
+        CHECK(b.rows.front() == "target|4242|" + kToken + "|" + std::string{facet_name(f)});
+        CHECK(b.rows == a.rows);
+    }
+}
+
+TEST_CASE("process_introspect a leg that throws after writing ends on the exception row",
+          "[process_introspect]") {
+    // Pinned shape (issue #8086): rows a leg wrote before it threw stay in front of the exception
+    // status row, so the response can open with a `supported` status row. Consumers read the typed
+    // result status, which is UNAVAILABLE / UNKNOWN here, and the LAST row.
+    YuzuPluginDescriptor d{};
+    d.execute = &exec_exec;
+    const std::vector<std::string> tail{"status|inspect|unsupported|linux:leg:exception"};
+    struct Case {
+        LegFn leg;
+        std::vector<std::string> before;
+    };
+    const Case cases[] = {
+        {&status_then_throwing_leg, {"status|inspect|supported|-"}},
+        {&status_row_then_throwing_leg,
+         {"status|inspect|supported|-", "target|4242|0123abcd.1|oom"}},
+    };
+    for (const auto& c : cases) {
+        g_exec = ExecArgs{};
+        g_exec.leg = c.leg;
+        const auto r = dispatch(d);
+        std::vector<std::string> expected = c.before;
+        expected.insert(expected.end(), tail.begin(), tail.end());
+        CHECK(r.rc == 0); // contained, never unwound
+        CHECK(captured_rows(r.captured) == expected);
+        CHECK(r.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
+        CHECK(r.result_completeness == YUZU_RESULT_COMPLETENESS_UNKNOWN);
+        CHECK(r.result_provenance == "linux:leg:exception");
+    }
 }
 
 TEST_CASE("process_introspect parse_request", "[process_introspect]") {

@@ -4,7 +4,9 @@ row_kind-first, field_1..field_4 name sequence and the row_kind enum) to the row
 process_introspect_parsers.hpp emits, the parameter contract (required pid and facet, the
 closed facet enum, the pid and start_time patterns) and the never-disclosed wording, so a
 reordered or renamed column or a widened parameter fails here rather than only in a dashboard.
-It compares the YAML with the literals below; it does not read the C++.
+It compares the YAML with the literals below, except the facet enum, which it compares with the
+`kFacetNames` initializer in process_introspect_parsers.hpp (the one list the plugin parses
+against), so a facet added to the C++ alone fails here; it reads nothing else from the C++.
 
 Runnable standalone: `python3 tests/test_process_introspect_definition.py` (how meson runs it;
 a bare pytest-style file with no runner would execute zero assertions and always exit 0).
@@ -17,10 +19,20 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFINITION = REPO_ROOT / "content" / "definitions" / "process_introspect.yaml"
+PARSERS = (REPO_ROOT / "agents" / "plugins" / "process_introspect" / "src"
+           / "process_introspect_parsers.hpp")
 
 EXPECTED_COLUMNS = ["row_kind"] + [f"field_{i}" for i in range(1, 5)]
 ROW_KINDS = ["status", "target", "limit", "sigmask", "cap", "seccomp", "oom", "sched"]
-FACETS = ["resource_limits", "sigmasks", "caps", "seccomp", "oom", "sched"]
+
+
+def _facets_from_header() -> list:
+    """The names in `kFacetNames{...}`; an empty capture is a failure, never a vacuous pass."""
+    m = re.search(r"kFacetNames\s*\{([^}]*)\}", PARSERS.read_text(encoding="utf-8"))
+    assert m, "kFacetNames initializer not found in process_introspect_parsers.hpp"
+    names = re.findall(r'"([a-z_]+)"', m.group(1))
+    assert names, "kFacetNames initializer holds no facet names"
+    return names
 
 
 def _definition() -> dict:
@@ -47,13 +59,15 @@ class ProcessIntrospectDefinitionParameters(unittest.TestCase):
         self.assertEqual(self._params()["required"], ["pid", "facet"])
         self.assertEqual(sorted(self._params()["properties"]), ["facet", "pid", "start_time"])
 
-    def test_facet_enum_is_the_six_names(self):
-        self.assertEqual(self._params()["properties"]["facet"]["validation"]["enum"], FACETS)
+    def test_facet_enum_is_kfacetnames(self):
+        self.assertEqual(self._params()["properties"]["facet"]["validation"]["enum"],
+                         _facets_from_header())
 
     def test_pid_and_start_time_patterns(self):
         props = self._params()["properties"]
         pid = re.compile(props["pid"]["validation"]["pattern"])
-        for ok in ("1", "9", "10", "4242", "99999999", "1999999999", "2147483647"):
+        for ok in ("1", "9", "10", "4242", "99999999", "123456789", "999999999", "1000000000",
+                   "1999999999", "2147483647"):
             self.assertTrue(pid.fullmatch(ok), ok)
         for bad in ("", "0", "01", "-1", "1 ", "abc", "12345678901",
                     "2147483648", "2999999999", "3999999999", "9999999999"):

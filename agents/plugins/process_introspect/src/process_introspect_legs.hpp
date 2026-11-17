@@ -9,7 +9,9 @@
  * (process_introspect_linux.cpp) only binds syscalls.
  *
  * What is read, in order (Linux): /proc/<pid> is opened ONCE as a directory descriptor; every
- * read is relative to it, so a recycled pid cannot be read. Identity first (`stat` start time +
+ * per-process read is openat on that descriptor, so a recycled pid cannot be read. The only
+ * absolute-path reads are the host-wide boot_id and, on the not-found path only,
+ * /proc/self/mountinfo. Identity first (`stat` start time +
  * boot id -> token `<boot_id[0:8]>.<starttime>`); a supplied start_time that differs refuses with
  * pid_reused and nothing else is read; then the facet's sources; then `stat` is re-read and any
  * change discards every row (torn_read).
@@ -31,6 +33,7 @@
 #include <cstdint>
 #include <expected>
 #include <functional>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>

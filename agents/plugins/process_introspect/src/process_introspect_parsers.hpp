@@ -26,6 +26,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace yuzu::process_introspect {
@@ -216,7 +217,7 @@ enum class ProcVisibility { visible, hidden, unknown };
 /// A line counts when its mount point (field 5) is exactly `/proc` and the filesystem type
 /// after the ` - ` separator is `proc`. The LAST counting line decides (a later mount covers an
 /// earlier one). In its super-options, `hidepid=<v>`: absent, 0, off, 1 or noaccess -> visible
-/// (hidepid=1 still lets the open succeed; it answers EPERM, not ENOENT); any other value
+/// (under hidepid=1 the open is refused with EPERM, not ENOENT); any other value
 /// (2, invisible, 4, ptraceable, or one this code does not know) -> hidden. Kernels before 5.8
 /// print the number, later ones the name, so both are accepted. No counting line -> unknown.
 [[nodiscard]] inline ProcVisibility proc_visibility(std::string_view mountinfo) {
