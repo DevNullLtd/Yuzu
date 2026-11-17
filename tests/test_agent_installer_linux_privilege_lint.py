@@ -69,7 +69,7 @@ def main() -> int:
         for m in re.finditer(r"(?:^|\brun\s+)\s*setcap\s+(?!-r\b)[^\n]*", code, re.M):
             fail(f"installer invokes setcap other than `setcap -r`: {m.group(0)!r}")
         if "setcap -r" not in code:
-            fail("installer must strip stale file capabilities (`setcap -r`)")
+            fail("installer must strip file capabilities (`setcap -r`)")
         if re.search(r"^apply_setcap\b", code, re.M):
             fail("apply_setcap is back")
         chk = code[code.index("check_install()"):code.index("case \"$ACTION\" in")]
@@ -88,11 +88,11 @@ def main() -> int:
             fail("a failed sudoers validation must remove the existing (glob-carrying) file")
         if "cannot verify" not in chk:
             fail("--check must treat a missing getcap as drift")
-        if "still carries the old systemctl glob grants" not in chk or \
+        if "carries the systemctl enable|disable|mask|unmask glob grants" not in chk or \
            "lacks the $SYSTEMCTL_WRAPPER_PATH grant" not in chk:
             fail("--check must assert the wrapper grant AND the absence of the glob grants")
         if "--no-cap-cleanup" not in SRC:
-            fail("--no-cap-cleanup (the honest name for --no-setcap) is missing")
+            fail("--no-cap-cleanup is missing")
 
         if sys.platform.startswith("linux"):
             out = dry_run("Linux", binary)

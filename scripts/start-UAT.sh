@@ -529,7 +529,7 @@ verify_as_user_prereqs() {
             launched_caps="$(getcap "$agent_bin" 2>/dev/null || true)"
             if [ -n "$launched_caps" ]; then
                 fail "$agent_bin carries file capabilities: $launched_caps"
-                info "  fix: sudo setcap -r \"$agent_bin\"   (the capability is now granted to the process by setpriv)"
+                info "  fix: sudo setcap -r \"$agent_bin\"   (the capability is granted to the process by setpriv)"
                 return 1
             fi
             ok "no file capabilities on $agent_bin"

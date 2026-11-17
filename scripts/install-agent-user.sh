@@ -90,7 +90,7 @@
 #   --uninstall      Remove the user, sudoers file, and state dirs.
 #   --account-name N Override the default account name (_yuzu / yuzu).
 #                    Useful for parallel test environments.
-#   --binary-path P  Override the path to the agent binary whose stale file
+#   --binary-path P  Override the path to the agent binary whose file
 #                    capabilities are stripped.
 #                    Default: /usr/local/bin/yuzu-agent (Linux) or
 #                    /Library/Application\ Support/Yuzu/yuzu-agent (macOS).
@@ -617,7 +617,7 @@ install_sudoers() {
             # update; the agent then has NO privileged grants (actions report
             # privilege_unavailable) until a successful run.
             if [[ -f "$target" ]]; then
-                warn "removing the previous $target so its old grants do not outlive a failed update"
+                warn "removing the existing $target so its grants do not outlive a failed update"
                 run rm -f "$target"
             fi
             return 3
@@ -725,7 +725,7 @@ remove_systemctl_wrapper() {
 # A file capability such as `cap_net_admin,cap_net_raw,cap_dac_read_search,cap_sys_ptrace+eip`
 # on the agent binary is a hazard. The binary is 0755, so ANY local user who executes it would receive those
 # capabilities, and that user chooses --plugin-dir / YUZU_PLUGIN_DIR, which the agent dlopens:
-# local root. Capabilities now belong to the SERVICE only (systemd AmbientCapabilities in the
+# local root. Capabilities belong to the SERVICE only (systemd AmbientCapabilities in the
 # packaged unit; \`setpriv --ambient-caps\` in scripts/start-UAT.sh --as-user).
 #
 # Removing the grant from this script is not enough: This script never grants file capabilities. Each run removes any file capability found on the
@@ -842,7 +842,7 @@ check_install() {
             # present and valid while still carrying wildcard grants.
             if [[ "$PLATFORM" == "linux" ]]; then
                 if grep -Eq '^[^#]*systemctl[[:space:]]+(enable|disable|mask|unmask)[[:space:]]' "$SUDOERS_TARGET"; then
-                    warn "$SUDOERS_TARGET still carries the old systemctl glob grants - re-run the installer"
+                    warn "$SUDOERS_TARGET carries the systemctl enable|disable|mask|unmask glob grants - re-run the installer"
                     ((errs++))
                 fi
                 if ! grep -Eq "^[^#]*NOPASSWD:[[:space:]]*$SYSTEMCTL_WRAPPER_PATH[[:space:]]*\$" "$SUDOERS_TARGET"; then
