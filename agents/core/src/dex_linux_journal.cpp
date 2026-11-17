@@ -57,10 +57,14 @@ bool from_system_manager(const json& j) {
 // sender. NOT yet confirmed against a live capture (none on the measuring host) - see
 // docs/dex-signal-catalog.md.
 bool from_coredump_helper(const json& j) {
+    // Safe superset (WP13 governance S3): root is the load-bearing term; ONE name term binds it
+    // to the helper. The comm is matched by prefix because the kernel truncates it to 15 chars
+    // and a distro may suffix it; the unit form covers a service-launched helper. The identity
+    // is from systemd documentation, NOT a live capture (no coredump entry on the measuring
+    // host), which is why a drop here is counted and logged by the collector.
     if (jstr(j, "_UID") != "0")
         return false;
-    const std::string comm = jstr(j, "_COMM");
-    if (comm == "systemd-coredum" || comm == "systemd-coredump")
+    if (jstr(j, "_COMM").starts_with("systemd-coredum"))
         return true;
     return jstr(j, "_SYSTEMD_UNIT").starts_with("systemd-coredump@");
 }
@@ -107,8 +111,10 @@ JournalLine parse_journal_line(std::string_view line) {
     // core-generating signal), so no intentional-stop filtering is needed. Subject
     // is the comm only — COREDUMP_EXE (a full path) is never shipped.
     if (mid == kMsgIdCoredump) {
-        if (!from_coredump_helper(j))
+        if (!from_coredump_helper(j)) {
+            out.untrusted_dropped = true;
             return out; // forged / untrusted sender: no observation
+        }
         const std::string comm = jstr(j, "COREDUMP_COMM");
         if (comm.empty())
             return out; // no safe subject
@@ -140,8 +146,10 @@ JournalLine parse_journal_line(std::string_view line) {
     // classifier deliberately avoids. UNIT_RESULT (exit-code / signal / core-dump /
     // timeout / oom-kill) is the reason when present; absent → empty reason.
     if (mid == kMsgIdUnitFailed || mid == kMsgIdUnitResult) {
-        if (!from_system_manager(j))
+        if (!from_system_manager(j)) {
+            out.untrusted_dropped = true;
             return out; // forged / user-manager / untrusted sender: no observation
+        }
         const std::string unit = jstr(j, "UNIT");
         if (unit.empty())
             return out;
@@ -190,8 +198,10 @@ JournalLine parse_journal_line(std::string_view line) {
     // `_SYSTEMD_UNIT` (chronyd.service / chrony.service), journald-derived from the sender's
     // cgroup, which an unprivileged process cannot join; `_COMM` stays as a second term.
     if (jstr(j, "_COMM") == "chronyd") {
-        if (!from_chronyd_service(j))
+        if (!from_chronyd_service(j)) {
+            out.untrusted_dropped = true;
             return out; // right comm, wrong/absent service cgroup: forged
+        }
 
         const std::string m = jstr(j, "MESSAGE");
         if (m.find("Can't synchronise: no selectable sources") != std::string::npos ||
@@ -261,7 +271,8 @@ std::optional<std::string> build_journald_after_cursor_query(std::string_view cu
     return cmd;
 }
 
-std::vector<SignalObservation> drain_journal_pipe(std::FILE* pipe, std::string& cursor) {
+std::vector<SignalObservation> drain_journal_pipe(std::FILE* pipe, std::string& cursor,
+                                                  std::size_t* untrusted_dropped) {
     std::vector<SignalObservation> out;
     std::string newest = cursor;
     std::string line;
@@ -269,6 +280,8 @@ std::vector<SignalObservation> drain_journal_pipe(std::FILE* pipe, std::string& 
         JournalLine jl = parse_journal_line(line);
         if (!jl.cursor.empty())
             newest = std::move(jl.cursor); // chronological → last non-empty wins
+        if (jl.untrusted_dropped && untrusted_dropped)
+            ++*untrusted_dropped;
         if (jl.obs)
             out.push_back(std::move(*jl.obs));
     }

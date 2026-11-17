@@ -432,6 +432,9 @@ private:
     // dropped and re-baselined — without that, a stale cursor would silently never match
     // again (permanent silence). A quiet poll with no new entries exits 0, so it keeps its
     // cursor.
+    std::uint64_t journal_untrusted_dropped_{0}; // F58: entries failing the sender check
+    std::uint64_t journal_gap_events_{0};        // UP6: cursor re-baselines (a possible data gap)
+
     void poll_journald() {
         // Evict debounce entries older than the window FIRST, every cycle (the
         // age-keyed analogue of poll_disks()'s std::erase_if on disk_low_reported_):
@@ -460,8 +463,18 @@ private:
         // drain advances journal_cursor_ to the newest entry it reads; a throw or short
         // read leaves it at the last good line, so the same window is re-polled. The
         // debounce collapses a flapping unit/process to one observation per window.
-        auto observations = lnx::drain_journal_pipe(pipe.get(), journal_cursor_);
-        const int rc = pipe.close(); // exit status AFTER draining stdout to EOF
+        std::size_t untrusted = 0;
+        auto observations = lnx::drain_journal_pipe(pipe.get(), journal_cursor_, &untrusted);
+        const int rc = pipe.close();
+        if (untrusted != 0) {
+            // WP13/F58: entries that matched a reliability id but failed the journald-stamped
+            // sender check. A genuine mismatch (an unexpected coredump identity) would otherwise
+            // be silent; forged entries are expected to be counted here too.
+            journal_untrusted_dropped_ += untrusted;
+            spdlog::warn("dex_observer(linux): dropped {} journal entr{} failing the trusted-sender "
+                         "check this poll ({} total since start)",
+                         untrusted, untrusted == 1 ? "y" : "ies", journal_untrusted_dropped_);
+        } // exit status AFTER draining stdout to EOF
         // Emit whatever was read FIRST (a timeout mid-read still yields real events),
         // then re-baseline on a non-zero exit so a cursor the journal rotated past does
         // not wedge the source in permanent silence.
@@ -469,9 +482,15 @@ private:
             if (journal_debounce_.should_emit(obs.obs_type, obs.subject, now))
                 emit(std::move(obs));
         if (rc != 0) {
+            // Gap marker (WP13 governance UP6): the re-baseline continues from the journal END,
+            // so every entry between the old cursor and now is never read. Count and log it so a
+            // rotation/vacuum gap is visible; cursor semantics are unchanged.
+            ++journal_gap_events_;
             spdlog::warn(
-                "dex_observer(linux): journalctl exited {} — dropping journald cursor to re-baseline",
-                rc);
+                "dex_observer(linux): journalctl exited {} — dropping journald cursor to re-baseline; "
+                "journald entries between the old cursor and the journal end are NOT observed "
+                "(gap #{} since start)",
+                rc, journal_gap_events_);
             journal_cursor_.clear();
         }
     }

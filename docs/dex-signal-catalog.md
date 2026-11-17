@@ -472,7 +472,7 @@ asserted free of any path component).
 **journald attribution is by journald-stamped sender fields only (F58 / #3872 / #3871).**
 `MESSAGE_ID`, `COREDUMP_*`, `UNIT` and `UNIT_RESULT` are client-settable, so alone they prove
 nothing. `service.crashed` / `service.hung` require `_PID=1` and `_UID=0` (the system manager;
-a user-manager entry carries `_UID=1000` and `USER_UNIT`, so nothing genuine is dropped);
+a user-manager entry carries `_UID=1000` and `USER_UNIT`, so no entry the old parser mapped from the system manager is dropped; entries the old parser mapped from a per-user manager, a forged sender or a non-PID-1 process are, by design);
 `process.crashed` requires `_UID=0` plus the `systemd-coredump` helper identity (`_COMM`
 `systemd-coredum` - the 15-char comm truncation - or `_SYSTEMD_UNIT=systemd-coredump@*`); the
 `os.time_unsynced` branch requires `_COMM=chronyd` AND `_SYSTEMD_UNIT=chronyd.service|chrony.service`

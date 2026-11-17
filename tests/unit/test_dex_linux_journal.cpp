@@ -550,3 +550,36 @@ TEST_CASE("JournalDebounce: evict_stale drops entries past the window, keeps fre
     CHECK(d.should_emit("service.crashed", "old.service", 1300));
     CHECK(d.size() == 2);
 }
+
+TEST_CASE("journal: an entry failing the trusted-sender check is flagged so the collector counts it "
+          "(WP13 governance S3)",
+          "[guardian][dex][linux][journal][f58]") {
+    const JournalLine forged = parse_journal_line(
+        R"({"__CURSOR":"u1","MESSAGE_ID":"d9b373ed55a64feb8242e02dbe79a49c","_PID":"4242","_UID":"1000","UNIT":"x.service"})");
+    CHECK_FALSE(forged.obs.has_value());
+    CHECK(forged.untrusted_dropped);
+    const JournalLine ok = parse_journal_line(
+        R"({"__CURSOR":"u2","MESSAGE_ID":"d9b373ed55a64feb8242e02dbe79a49c","_PID":"1","_UID":"0","UNIT":"x.service"})");
+    CHECK(ok.obs.has_value());
+    CHECK_FALSE(ok.untrusted_dropped);
+    // An unrelated entry (no reliability id) is not "dropped", just ignored.
+    CHECK_FALSE(parse_journal_line(R"({"__CURSOR":"u3","MESSAGE":"hello"})").untrusted_dropped);
+    // Coredump helper: root + comm prefix (the 15-char truncation, or a longer spelling) maps.
+    for (const char* c : {"systemd-coredum", "systemd-coredump"}) {
+        const std::string l = std::string(R"({"__CURSOR":"u4","MESSAGE_ID":"fc2e22bc6ee647b6b90729ab34a250b1","_UID":"0","_COMM":")") + c + R"(","COREDUMP_COMM":"nginx"})";
+        CHECK(parse_journal_line(l).obs.has_value());
+    }
+}
+
+TEST_CASE("journal: drain_journal_pipe counts untrusted drops without emitting them (WP13 S3)",
+          "[guardian][dex][linux][journal][f58]") {
+    TempPipe tp(
+        R"({"__CURSOR":"c1","MESSAGE_ID":"d9b373ed55a64feb8242e02dbe79a49c","_PID":"9","_UID":"1000","UNIT":"a.service"})" "\n"
+        R"({"__CURSOR":"c2","MESSAGE_ID":"d9b373ed55a64feb8242e02dbe79a49c","_PID":"1","_UID":"0","UNIT":"b.service","UNIT_RESULT":"exit-code"})" "\n");
+    std::string cursor;
+    std::size_t dropped = 0;
+    const auto obs = drain_journal_pipe(tp.get(), cursor, &dropped);
+    CHECK(obs.size() == 1);
+    CHECK(dropped == 1);
+    CHECK(cursor == "c2");
+}
