@@ -10,7 +10,6 @@
 #include <cstddef>
 #include <string>
 #include <string_view>
-#include <vector>
 
 namespace yuzu::shared {
 
@@ -63,134 +62,28 @@ namespace yuzu::shared {
 }
 
 
-namespace proxy_detail {
-// ^[A-Za-z][A-Za-z0-9+.-]*$ -- the only shape a `key=` or `scheme` prefix may have.
-[[nodiscard]] inline bool is_plain_name(std::string_view n) {
-    if (n.empty() || !((n[0] >= 'A' && n[0] <= 'Z') || (n[0] >= 'a' && n[0] <= 'z')))
-        return false;
-    for (const char c : n) {
-        const bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-                        (c >= '0' && c <= '9') || c == '+' || c == '.' || c == '-';
-        if (!ok)
-            return false;
-    }
-    return true;
-}
-
-// One entry (never split): everything up to the LAST '@' anywhere in it is
-// userinfo, whatever characters (`; , space = : /`) it holds. Only a plain
-// `key=` and/or plain `scheme://` prefix that precedes that '@' survives.
-[[nodiscard]] inline std::string redact_entry(std::string_view e) {
-    const std::size_t at = e.rfind('@');
-    if (at == std::string_view::npos)
-        return std::string{e};
-    std::size_t keep = 0;
-    const std::size_t eq = e.find('=');
-    if (eq != std::string_view::npos && eq < at && is_plain_name(e.substr(0, eq)))
-        keep = eq + 1;
-    const std::size_t sch = e.find("://", keep);
-    if (sch != std::string_view::npos && sch < at && is_plain_name(e.substr(keep, sch - keep)))
-        keep = sch + 3;
-    return std::string{e.substr(0, keep)} + "REDACTED@" + std::string{e.substr(at + 1)};
-}
-
-[[nodiscard]] inline bool is_sep(char c) {
-    return c == ';' || c == ',' || c == ' ' || c == '\t' || c == '\r' || c == '\n';
-}
-
-// A piece starts a NEW list entry only if it is `[key=]scheme://...` or
-// `key=...` where EVERY prefix is a plain name (the same test redact_entry uses).
-[[nodiscard]] inline bool starts_entry(std::string_view piece) {
-    bool keyed = false;
-    const std::size_t eq = piece.find('=');
-    if (eq != std::string_view::npos && is_plain_name(piece.substr(0, eq))) {
-        keyed = true;
-        piece.remove_prefix(eq + 1);
-    }
-    const std::size_t sch = piece.find("://");
-    if (sch != std::string_view::npos)
-        return is_plain_name(piece.substr(0, sch));
-    return keyed;
-}
-} // namespace proxy_detail
-
-/// A SINGLE proxy URL / `host:port` / PAC URL (an `*_proxy` environment value, a
-/// macOS address, a PAC URL): never split. Fails toward redaction: everything up
-/// to the LAST '@' of the whole value is dropped (a path '@' is over-redacted on
-/// purpose).
-[[nodiscard]] inline std::string redact_proxy_single(std::string_view text) {
-    return proxy_detail::redact_entry(text);
-}
-
-/// A proxy LIST (a WinHTTP `ProxyServer` string such as
-/// `http=u:p@h:80;https=h2:443`). Userinfo is located BEFORE any splitting: a
-/// piece that does not start a new entry (no plain `scheme://`, no plain `key=`)
-/// is glued to the previous entry, so a `;`, `,` or space inside a password
-/// cannot detach the credential from its '@'.
-///
-/// A password may still itself contain `;key=` or `;scheme://`, which looks
-/// exactly like an entry boundary. So the entry split is NOT trusted where it
-/// matters: if any '@' exists, and some entry BEFORE the one holding the last '@'
-/// has no '@' of its own (it could be a credential fragment), everything from the
-/// start of the earliest such entry through the LAST '@' of the whole value is
-/// replaced by `REDACTED@`, neighbouring entries included. A list with no '@'
-/// anywhere is returned unchanged, and when every entry before the last '@' has
-/// its own '@' each entry is redacted on its own. Linear in the input.
+/// A proxy setting (an `*_proxy` environment value, a WinHTTP `ProxyServer` list
+/// such as `http=h:80;https=h2:443`, a PAC URL, a macOS address) with any
+/// credential removed. FAIL-CLOSED and deliberately simple: if the value holds
+/// ANY '@', the output is `REDACTED@` followed by the text after the LAST '@' of
+/// the WHOLE value, and NOTHING before it survives. No scheme, key, entry or
+/// separator parsing is attempted: a password may contain `; , space = : /` and
+/// even `;key=` or `;scheme://`, so every attempt to find "the credential" by
+/// splitting was a bypass. The cost is deliberate over-redaction: a list with a
+/// credential in one entry loses the readable host/port of every entry before
+/// it, and a path '@' in a PAC URL is treated as userinfo. A value with no '@'
+/// anywhere is returned unchanged (`http=h:80;https=h:443;socks=h4:1080`).
+/// Linear in the input.
 [[nodiscard]] inline std::string redact_proxy_value(std::string_view text) {
-    using namespace proxy_detail;
-    struct Entry {
-        std::size_t begin, end;
-    };
-    std::vector<Entry> entries;
-    std::size_t i = 0;
-    while (i < text.size()) {
-        std::size_t j = i;
-        const bool sep = is_sep(text[i]);
-        while (j < text.size() && is_sep(text[j]) == sep)
-            ++j;
-        if (!sep) {
-            if (entries.empty() || starts_entry(text.substr(i, j - i)))
-                entries.push_back({i, j});
-            else
-                entries.back().end = j;
-        }
-        i = j;
-    }
-    const std::size_t last_at = text.rfind('@');
-    if (last_at == std::string_view::npos)
+    const std::size_t at = text.rfind('@');
+    if (at == std::string_view::npos)
         return std::string{text};
-    std::size_t k = 0; // entry holding the last '@'
-    while (k < entries.size() && entries[k].end <= last_at)
-        ++k;
-    std::size_t first_bare = k; // earliest entry before k with no '@'
-    for (std::size_t e = 0; e < k; ++e) {
-        if (text.substr(entries[e].begin, entries[e].end - entries[e].begin).find('@') ==
-            std::string_view::npos) {
-            first_bare = e;
-            break;
-        }
-    }
-    std::string out;
-    std::size_t pos = 0;
-    for (std::size_t e = 0; e < first_bare && e < entries.size(); ++e) {
-        out.append(text.substr(pos, entries[e].begin - pos));
-        out += redact_entry(text.substr(entries[e].begin, entries[e].end - entries[e].begin));
-        pos = entries[e].end;
-    }
-    if (first_bare < k) {
-        out.append(text.substr(pos, entries[first_bare].begin - pos));
-        out += "REDACTED@";
-        out.append(text.substr(last_at + 1));
-        return out;
-    }
-    // every entry before the last '@' carries its own '@': per-entry redaction
-    for (std::size_t e = first_bare; e < entries.size(); ++e) {
-        out.append(text.substr(pos, entries[e].begin - pos));
-        out += redact_entry(text.substr(entries[e].begin, entries[e].end - entries[e].begin));
-        pos = entries[e].end;
-    }
-    out.append(text.substr(pos));
-    return out;
+    return "REDACTED@" + std::string{text.substr(at + 1)};
+}
+
+/// Same rule; a separate name for single-URL sources kept for call-site clarity.
+[[nodiscard]] inline std::string redact_proxy_single(std::string_view text) {
+    return redact_proxy_value(text);
 }
 
 } // namespace yuzu::shared

@@ -92,9 +92,9 @@ TEST_CASE("network_config proxy row redacts userinfo", "[plugin][row][wp11]") {
         return s.find(needle) != std::string::npos;
     };
     CHECK(format_proxy_address_row("http://bob:SEKR3T@proxy.example:3128/") ==
-          "proxy_address|http://REDACTED@proxy.example:3128/");
+          "proxy_address|REDACTED@proxy.example:3128/");
     CHECK(format_proxy_address_row("http://bob:p%2f@ss@proxy:3128") ==
-          "proxy_address|http://REDACTED@proxy:3128");
+          "proxy_address|REDACTED@proxy:3128");
     CHECK(format_proxy_address_row("proxy.example:3128") == "proxy_address|proxy.example:3128");
     for (const char* in : {"bob:SEKR3T@proxy:3128", "bob@proxy:3128", "socks5://bob:SEKR3T@p:1080"}) {
         const auto row = format_proxy_address_row(in);
@@ -104,7 +104,7 @@ TEST_CASE("network_config proxy row redacts userinfo", "[plugin][row][wp11]") {
     }
     using yuzu::network_config::ProxyShape;
     CHECK(format_proxy_address_row("http=bob:SEKR3T@h:80;https=h2:443", ProxyShape::list) ==
-          "proxy_address|http=REDACTED@h:80;https=h2:443");
+          "proxy_address|REDACTED@h:80;https=h2:443");
     CHECK(format_proxy_address_row("http=h:80;https=h2:443", ProxyShape::list) ==
           "proxy_address|http=h:80;https=h2:443");
     // a hostile value still yields one row
