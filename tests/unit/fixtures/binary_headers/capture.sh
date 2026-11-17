@@ -53,10 +53,16 @@ elf)
     seed elf elf_shared.bin
     ;;
 pe)
+    # MSYS2 rewrites slash-prefixed arguments into paths unless told not to; the MSVC tools need
+    # their options verbatim.
+    MSYS2_ARG_CONV_EXCL='*'
+    export MSYS2_ARG_CONV_EXCL
     cl /nologo /c /GS- "/Fo$work/yuzu_fixture.obj" src/yuzu_fixture.c
     rc /nologo "/fo$work/yuzu_fixture.res" src/yuzu_fixture.rc
+    # The import library and export file go to the scratch directory so nothing but the .bin is
+    # left beside the fixtures.
     link /nologo /dll /noentry /nodefaultlib /machine:x64 "/out:pe_version.bin" \
-        "$work/yuzu_fixture.obj" "$work/yuzu_fixture.res"
+        "/implib:$work/pe_version.lib" "$work/yuzu_fixture.obj" "$work/yuzu_fixture.res"
     seed pe pe_version.bin
     ;;
 esac
