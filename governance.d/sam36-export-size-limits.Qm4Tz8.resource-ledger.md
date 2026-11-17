@@ -1,6 +1,6 @@
 # Resource Ledger: sam36-export-size-limits
 
-Every owning boundary the C++ in `60705905e0..HEAD` (feat/sam-36-export-limits) acquires. The change adds size limits to the streamed installed-software export (`software_export_stream.hpp`, `software_export_routes.{hpp,cpp}`, the two flags in `main.cpp`, the config fields in `server.hpp`, the wiring in `server.cpp`). It acquires no new owning resource: no thread, file descriptor, lock, lease, allocation with its own lifetime, or temporary path. The streamed export's own resources (the `StreamBudget::Lease`, the engine quota slot, the shared `Stream`, the `Ctx`) are recorded in `governance.d/sam36-software-export.dKEERG.resource-ledger.md` and are unchanged.
+Every owning boundary the C++ in `origin/dev..HEAD` (feat/inventory-export-size-limits) acquires. The change adds size limits to the streamed installed-software export (`software_export_stream.hpp`, `software_export_routes.{hpp,cpp}`, the two flags in `main.cpp`, the config fields in `server.hpp`, the wiring in `server.cpp`). It acquires no new owning resource: no thread, file descriptor, lock, lease, allocation with its own lifetime, or temporary path. The streamed export's own resources (the `StreamBudget::Lease`, the engine quota slot, the shared `Stream`, the `Ctx`) are recorded in `governance.d/sam36-software-export.dKEERG.resource-ledger.md` and are unchanged.
 
 | ID | Resource / construct | Owner type | Acquired | Released | Transfer | Failure cleanup |
 |---|---|---|---|---|---|---|
