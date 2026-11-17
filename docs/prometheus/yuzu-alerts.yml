@@ -3129,8 +3129,28 @@ groups:
             incremented: evaluating a policy check response (or the response-store read behind it)
             threw, so that target's or item's verdict was not recorded this cycle and its previous
             status stands. Look in the server log for "policy_evaluator: ... skipped" lines (they
-            carry the policy id and the exception text), check Postgres health and memory
+            carry the policy id and, for a std::exception, its sanitised text; a non-std
+            exception line carries the policy id only), check Postgres health and memory
             pressure, and remember the status shown for the affected devices may be stale.
+
+      # WP07: the server's boot-time check found the PostgreSQL database encoding is not UTF8.
+      # The check is WARN-ONLY (refusing to start is an undecided owner call), so this alert is
+      # the only thing that keeps the condition visible after the one-off log line scrolls away.
+      - alert: YuzuPgServerEncodingNotUtf8
+        expr: |
+          max by (job, instance) (yuzu_pg_server_encoding_not_utf8) == 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "PostgreSQL database encoding is not UTF8 on {{ $labels.instance }}"
+          description: >-
+            yuzu_pg_server_encoding_not_utf8 is 1: at start the server found the database
+            encoding is not UTF8. Postgres then does not reject invalid UTF-8 from agents, and
+            surfaces that re-serialise stored text with a strict JSON writer can throw. Create a
+            new database with ENCODING 'UTF8' and move the data (an existing database's encoding
+            cannot be changed); see server-admin.md "PostgreSQL database encoding". The gauge is
+            set once at start, so restart the server after the move.
 
       - alert: YuzuQuarantineGateServingStaleState
         expr: |

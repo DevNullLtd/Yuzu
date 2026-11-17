@@ -1369,7 +1369,7 @@ inline SharingParse parse_sharing_json(std::string_view text, yuzu::shared::RowB
 
 /// One free wire field: "-" when empty, else scrubbed of NUL and anything outside strictly
 /// well-formed UTF-8 (scrub_wire_bytes, which also replaces NUL; sanitize_utf8 now
-/// rejects overlong, surrogate and out-of-range sequences too but leaves NUL, #4864) then passed through safe_output_field: a
+/// replaces overlong, surrogate and out-of-range sequences too but leaves NUL, #4864) then passed through safe_output_field: a
 /// backslash is folded to '/' (so a Windows path reads C:/Users), CR/LF fold to spaces and a
 /// pipe is escaped.
 [[nodiscard]] inline std::string wire_field(std::string_view v) {

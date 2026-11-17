@@ -254,7 +254,7 @@ TEST_CASE("mgmt_posture execute seam: unknown action is escaped; a throwing leg 
 
     // ... and invalid UTF-8 bytes are replaced first (a protobuf string field must be UTF-8),
     // exactly as posture_row does for its values: an invalid byte becomes '?', a valid sequence
-    // survives. sanitize_utf8 now also rejects overlong and surrogate forms (WP07 F70, #4864).
+    // survives. sanitize_utf8 now also replaces overlong and surrogate forms (WP07 F70, #4864).
     const auto binary = dispatcher.run(&throwing, "bad\xff!");
     CHECK(binary.rc == 1);
     const auto brows = captured_rows(binary.captured);

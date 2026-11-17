@@ -600,7 +600,8 @@ int dispatch_with_capture(const YuzuPluginDescriptor* descriptor, const char* ac
     if (ctx_impl.output_dropped.load(std::memory_order_relaxed)) {
         g_output_dropped_commands.fetch_add(1, std::memory_order_relaxed);
         spdlog::error("local dispatch '{}': a plugin output write was lost to an allocation "
-                      "failure; the capture is reported truncated", action ? action : "");
+                      "failure; the capture is reported truncated",
+                      yuzu::log_id_token(action ? action : ""));
     }
     if (truncated_out)
         *truncated_out = ctx_impl.capture_truncated;
@@ -819,32 +820,32 @@ YUZU_EXPORT const char* yuzu_ctx_storage_list(YuzuPluginContext* ctx, const char
     if (!impl->kv_store || impl->plugin_name.empty())
         return nullptr;
     try {
-    auto keys = impl->kv_store->list(impl->plugin_name, prefix ? prefix : "");
+        auto keys = impl->kv_store->list(impl->plugin_name, prefix ? prefix : "");
 
-    // Build JSON array: ["key1","key2",...]
-    std::string json = "[";
-    for (size_t i = 0; i < keys.size(); ++i) {
-        if (i > 0)
-            json += ',';
-        json += '"';
-        // Escape any quotes in key names
-        for (char c : keys[i]) {
-            if (c == '"')
-                json += "\\\"";
-            else if (c == '\\')
-                json += "\\\\";
-            else
-                json += c;
+        // Build JSON array: ["key1","key2",...]
+        std::string json = "[";
+        for (size_t i = 0; i < keys.size(); ++i) {
+            if (i > 0)
+                json += ',';
+            json += '"';
+            // Escape any quotes in key names
+            for (char c : keys[i]) {
+                if (c == '"')
+                    json += "\\\"";
+                else if (c == '\\')
+                    json += "\\\\";
+                else
+                    json += c;
+            }
+            json += '"';
         }
-        json += '"';
-    }
-    json += ']';
+        json += ']';
 
-    char* result = static_cast<char*>(std::malloc(json.size() + 1));
-    if (!result)
-        return nullptr;
-    std::memcpy(result, json.c_str(), json.size() + 1);
-    return result;
+        char* result = static_cast<char*>(std::malloc(json.size() + 1));
+        if (!result)
+            return nullptr;
+        std::memcpy(result, json.c_str(), json.size() + 1);
+        return result;
     } catch (...) { // C ABI: no exception into the plugin
         return nullptr;
     }

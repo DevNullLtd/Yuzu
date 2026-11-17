@@ -189,7 +189,8 @@ std::string verdict_for(const StoredResponse& r, const std::string& policy_id,
         spdlog::error("policy_evaluator: policy {} check {} response from agent {} has output "
                      "nested past the depth guard (max {}); treating as evaluation error, "
                      "cannot be safely parsed",
-                     policy_id, instruction_id, onbehalf::sanitize_for_log(r.agent_id, 128), yuzu::server::mcp::kMcpMaxJsonDepth);
+                     policy_id, instruction_id, onbehalf::sanitize_for_log(r.agent_id, 128),
+                     yuzu::server::mcp::kMcpMaxJsonDepth);
         if (unevaluable_reason)
             *unevaluable_reason = "depth";
         return "error";
@@ -326,6 +327,10 @@ PolicyEvaluator::PolicyEvaluator(Deps deps) : d_(std::move(deps)) {
                              "counter");
         for (const char* r : {"depth", "exception"})
             d_.metrics->counter("yuzu_server_policy_unevaluable_responses_total", {{"reason", r}});
+        // Pre-seeded so increase() sees the first skip (a series born at 1 contributes no
+        // increase) and the YuzuPolicyCollectSkipped alert can fire on it.
+        for (const char* ph : {"collect_target", "collect_item"})
+            d_.metrics->counter("yuzu_server_policy_eval_errors_total", {{"phase", ph}});
     }
 
     // ADR-0056: the boot-time stranded-'fixing' reset that used to live here

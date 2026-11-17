@@ -7627,7 +7627,6 @@ TEST_CASE("v3: a status-only section writes NO change-ledger rows and deletes no
         return sql_rows(pool, "SELECT count(*)::text FROM software_inventory_store.software_changes "
                               "WHERE agent_id = 'agent-ch21'")[0][0];
     };
-    const auto hash_before = stored_hash(pool, "agent-ch21");
     const auto ledger_before = ledger();
     for (const auto st : {V3Status::kConstrained, V3Status::kTimeout, V3Status::kOversize}) {
         const auto res = store.apply_installed_software_v3(
@@ -7642,5 +7641,4 @@ TEST_CASE("v3: a status-only section writes NO change-ledger rows and deletes no
     }
     // The report hash moves only because the facet left full/delta; it never covers a short set.
     CHECK(stored_hash(pool, "agent-ch21") == SoftwareInventoryStore::v3_report_hash({}));
-    (void)hash_before;
 }
