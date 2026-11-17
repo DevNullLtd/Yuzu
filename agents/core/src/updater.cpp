@@ -13,6 +13,8 @@
 
 #include "updater_rpc_guard.hpp"
 
+#include <atomic_file_write.hpp> // yuzu::shared::write_file_atomic: the update-verified marker
+
 #include <yuzu/metrics.hpp>
 
 // Generated protobuf/gRPC headers (flat output from YuzuProto.cmake)
@@ -1016,11 +1018,16 @@ void Updater::mark_update_verified() {
         return;
     }
     const auto marker = update_verified_marker(exe_path_);
-    std::ofstream out{marker};
-    out << "ok";
-    out.flush();
-    if (!out) {
-        spdlog::warn("Could not write the update verification marker '{}'", marker.string());
+    // REPLACE whatever sits at the name, never write through it: remove() takes a link itself,
+    // never its target, and the shared writer renames an exclusive-create, no-follow temp over
+    // the name. A refused write is not an option here: no marker is exactly what sends
+    // rollback_if_needed down its rollback branch, so a planted link must not leave none.
+    std::error_code ec;
+    std::filesystem::remove(marker, ec);
+    auto written = yuzu::shared::write_file_atomic(marker, "ok");
+    if (!written) {
+        spdlog::warn("Could not write the update verification marker '{}': {}", marker.string(),
+                     written.error().message);
         return;
     }
     spdlog::debug("Wrote update verification marker: {}", marker.string());

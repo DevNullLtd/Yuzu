@@ -337,6 +337,62 @@ TEST_CASE("startup maintenance removes a refused .old and keeps the executable",
     std::ifstream in(exe_path, std::ios::binary);
     REQUIRE(std::string(std::istreambuf_iterator<char>(in), {}) == "fake-binary-content");
 }
+
+// A link planted at the marker name is REPLACED, never written through, and never leaves the
+// marker missing: no marker is what sends rollback_if_needed down its rollback branch, so a
+// refused write would roll back a registered build.
+TEST_CASE("mark_update_verified replaces a planted marker link and writes nothing through it",
+          "[updater][rollback][marker]") {
+    TempUpdaterDir tmp("marker_planted");
+    const auto& dir = tmp.guard.path;
+    auto exe_path = dir / "yuzu-agent";
+    auto old_path = dir / "yuzu-agent.old";
+    auto marker_path = dir / ".yuzu-update-verified";
+    auto target = dir / "planted";
+    write_fake_binary(exe_path);
+    write_fake_binary(old_path);
+
+    UpdateConfig config;
+    config.enabled = true;
+    Updater updater(config, "test-agent", "0.1.0", "darwin", "arm64", exe_path);
+
+    bool target_exists = true;
+    SECTION("a symlink to an existing file") {
+        write_fake_binary(target);
+        fs::create_symlink(target, marker_path);
+    }
+    SECTION("a dangling symlink") {
+        target_exists = false;
+        fs::create_symlink(target, marker_path);
+    }
+    SECTION("a hard link to an existing file") {
+        write_fake_binary(target);
+        fs::create_hard_link(target, marker_path);
+    }
+
+    updater.mark_update_verified();
+
+    // Not written through: the target holds what it held, or still does not exist.
+    if (target_exists) {
+        std::ifstream t(target, std::ios::binary);
+        REQUIRE(std::string(std::istreambuf_iterator<char>(t), {}) == "fake-binary-content");
+        REQUIRE(fs::hard_link_count(target) == 1); // a hard-linked marker was unlinked, not shared
+    } else {
+        REQUIRE_FALSE(fs::exists(fs::symlink_status(target)));
+    }
+    // Replaced: the name is now a regular file this call wrote.
+    REQUIRE(fs::is_regular_file(fs::symlink_status(marker_path)));
+    {
+        std::ifstream m(marker_path, std::ios::binary);
+        REQUIRE(std::string(std::istreambuf_iterator<char>(m), {}) == "ok");
+    }
+
+    // So the registered build is kept: no rollback, the old binary cleaned up.
+    REQUIRE_FALSE(updater.perform_startup_maintenance());
+    REQUIRE_FALSE(fs::exists(old_path));
+    std::ifstream in(exe_path, std::ios::binary);
+    REQUIRE(std::string(std::istreambuf_iterator<char>(in), {}) == "fake-binary-content");
+}
 #endif
 
 TEST_CASE("disabled startup maintenance leaves executable-adjacent rollback files untouched",

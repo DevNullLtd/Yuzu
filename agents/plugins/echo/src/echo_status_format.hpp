@@ -100,21 +100,33 @@ enum class OfflineReason { none, free_space, migration_failed, open_failed };
 /// the tag and the three tokens as literals; a test on each side pins them.
 inline constexpr std::string_view kStorageOfflineKey = "heartbeat.storage_offline";
 
-/// Tell the retried open failures from every other one by their text. The free-space refusal is
-/// checked first: its text is nested inside the v10 wrapper.
+/// Tell the retried open failures from every other one by the wrapper text open() puts at the
+/// START of each: `v10 roll-up migration failed ...` (echo_db.cpp wraps every migrate_to_v10
+/// failure, the free-space refusal included, in it) or `schema vN: an earlier migration step did
+/// not finish ...`. Both are matched at their fixed offset, never anywhere in the text: open()'s
+/// other failures carry the data-directory path, and a directory named after a wrapper phrase must
+/// not turn a fail-init refusal into offline-with-retry. The free-space text is looked for only
+/// under the v10 anchor, because only migrate_to_v10 produces it.
+/// The one limit left: the link refusal leads with the file name (echo_db.cpp), so a RELATIVE data
+/// directory whose own name begins with a wrapper phrase could still match; an absolute path cannot.
 [[nodiscard]] inline OfflineReason classify_open_failure(std::string_view open_error) {
-    if (is_free_space_refusal(open_error))
-        return OfflineReason::free_space;
-    if (open_error.find(kV10MigrationFailedPrefix) != std::string_view::npos ||
-        open_error.find(kEarlierStepPrefix) != std::string_view::npos)
-        return OfflineReason::migration_failed;
+    if (open_error.starts_with(kV10MigrationFailedPrefix))
+        return is_free_space_refusal(open_error) ? OfflineReason::free_space
+                                                 : OfflineReason::migration_failed;
+    if (open_error.starts_with("schema v")) {
+        const auto sep = open_error.find(": ");
+        if (sep != std::string_view::npos && open_error.substr(sep + 2).starts_with(kEarlierStepPrefix))
+            return OfflineReason::migration_failed;
+    }
     return OfflineReason::none;
 }
 
 /// Whether an open failure's text says the attempt ran into its wall-clock deadline (the next
-/// attempt's deadline is doubled for each such hit). The text is the v10 migration's own.
+/// attempt's deadline is doubled for each such hit). The text is the v10 migration's own, so it is
+/// looked for only under the same wrapper anchor as classify_open_failure.
 [[nodiscard]] inline bool is_deadline_hit(std::string_view open_error) {
-    return open_error.find(kV10DeadlineMarker) != std::string_view::npos;
+    return open_error.starts_with(kV10MigrationFailedPrefix) &&
+           open_error.find(kV10DeadlineMarker) != std::string_view::npos;
 }
 
 /// The reason a RETRY attempt's failure is recorded under: the classified reason, or `open_failed`
@@ -131,20 +143,26 @@ inline constexpr std::string_view kStorageOfflineKey = "heartbeat.storage_offlin
 /// nothing collects and no trigger is registered. `next_retry_in` is the wait until the next
 /// automatic attempt; `nullopt` means none is scheduled (collection failed to start after a late
 /// open, so only an agent restart recovers) and the reply says so instead of promising a retry.
+///
+/// The fixed state and the retry or restart clause come BEFORE the detail: the dashboard shows only
+/// the first 400 bytes of line 0 after `error|` (web_utils.hpp agent_error_display), and a real
+/// free-space refusal alone is about 470 bytes, so a detail written first would cut the guidance
+/// off. Keep the fixed text short and free of '-'.
 [[nodiscard]] inline std::vector<std::string>
 format_storage_refused_lines(OfflineReason reason, std::string_view detail,
                              std::optional<std::chrono::seconds> next_retry_in) {
-    std::string line0 = std::string{"error|Echo storage is offline on this endpoint: "}.append(detail);
+    std::string line0 = "error|Echo storage is offline on this endpoint. ";
     if (!next_retry_in) {
         // The open itself succeeded (and may have migrated), so no "not changed" claim here.
-        line0.append(". Collection and retention are stopped. The open is not retried; restart the agent.");
+        line0.append("Collection and retention are stopped. The open is not retried; restart the agent.");
     } else {
-        line0.append(". Collection and retention are stopped and the database was not changed. "
+        line0.append("Collection and retention are stopped and the database was not changed. "
                      "The open is retried automatically. ")
             .append(next_retry_in->count() > 0
                         ? std::format("The next attempt is in about {} s.", next_retry_in->count())
                         : std::string{"Retrying now."});
     }
+    line0.append(" Cause: ").append(detail);
     return {
         std::move(line0),
         std::format("storage_state|offline|{}", offline_reason_token(reason)),

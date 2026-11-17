@@ -1444,12 +1444,24 @@ public:
     // database opened and collection started, or start_collection threw (a second start over a
     // half-started source set would double-start sources; a restart recovers and `status` says why).
     bool retry_open(unsigned attempt, const std::function<bool()>& cancelled) {
+        // An earlier attempt assigned db_ and then threw (go_offline allocates inside the catch
+        // handlers below, and the loop counts a throw as a failed attempt). A second open would
+        // assign db_ over collectors that already hold it, so the loop ends here. Test db_, not
+        // online_: the half-started case (db_ set, gate closed) is the one to protect. Only this
+        // thread writes db_ while the loop runs, and shutdown joins the loop before db_.reset().
+        if (db_) {
+            if (!online_.load(std::memory_order_acquire)) {
+                // Without this `status` could keep saying "Retrying now." after the loop has ended.
+                go_offline(yuzu::echo::OfflineReason::open_failed,
+                           "collection start failed after the database opened", attempt,
+                           /*retry_scheduled=*/false);
+            }
+            return true;
+        }
         yuzu::echo::OfflineReason prior;
-        std::string prior_detail;
         {
             std::lock_guard lock(offline_mu_);
             prior = offline_.reason;
-            prior_detail = offline_.detail;
         }
         std::error_code ec;
         const auto file_bytes = std::filesystem::file_size(db_path_, ec);
@@ -1463,7 +1475,15 @@ public:
             const auto space = std::filesystem::space(db_path_.parent_path(), space_ec);
             if (!space_ec && yuzu::echo::free_space_still_short(space.available, file_bytes,
                                                                 static_cast<std::uintmax_t>(wal))) {
-                go_offline(yuzu::echo::OfflineReason::free_space, prior_detail, attempt);
+                // The figures are this attempt's own, not the first refusal's: the free space
+                // changes between attempts and `status` shows this text.
+                go_offline(yuzu::echo::OfflineReason::free_space,
+                           std::format("{} the Echo database to its roll-up tables: {} bytes are "
+                                       "free; twice the {}-byte database file plus its {}-byte log "
+                                       "are needed",
+                                       yuzu::echo::kFreeSpaceRefusalPrefix, space.available,
+                                       file_bytes, wal),
+                           attempt);
                 return false;
             }
         }

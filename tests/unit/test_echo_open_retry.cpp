@@ -20,6 +20,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -29,6 +30,27 @@ using namespace std::chrono_literals;
 namespace {
 // Generous: only a hang would reach it; every wait below is released by the code under test.
 constexpr auto kBound = 30s;
+
+// The refusal texts EchoDatabase::open really returns for a failure that is not a v10 migration one
+// (echo_db.cpp: the link, unresolvable-directory, unchecked, busy, unmovable-corrupt, WAL, schema
+// and sqlite-open failures), the path-bearing ones carrying `db`. None is retried.
+std::vector<std::string> real_open_refusals(const std::string& db) {
+    return {
+        db + " is a symbolic link or reparse point, and echo.db was not opened: remove it so the "
+             "agent can create a regular file, then restart the agent",
+        "cannot resolve the directory of " + db + ": No such file or directory",
+        "echo.db could not be checked (its identity could not be read after the open): not "
+        "quarantined and not opened; retried on the next start: " + db,
+        "echo.db could not be checked (sqlite rc 10): not quarantined and not opened; retried on "
+        "the next start: " + db,
+        "echo.db is busy (another connection holds it for more than 5000 ms): not quarantined and "
+        "not opened; it is retried on the next start: " + db,
+        "echo.db failed integrity_check and could not be quarantined (corrupt and unmovable): " + db,
+        "failed to open echo.db: unable to open database file",
+        "failed to enable WAL mode: disk I/O error",
+        "failed to create Echo schema: database or disk is full",
+    };
+}
 } // namespace
 
 TEST_CASE("open_retry_delay: 1, 5 and 15 minutes, then hourly for ever", "[echo][open_retry]") {
@@ -70,10 +92,31 @@ TEST_CASE("classify_open_failure: only the free-space and v10 migration failures
                                 "the roll-up step waits for it and the next open retries both") ==
           OfflineReason::migration_failed);
     // every other open failure stays a plugin init failure
-    CHECK(classify_open_failure("failed to open echo.db: unable to open database file") == OfflineReason::none);
-    CHECK(classify_open_failure("echo.db is a symbolic link; refusing to open it") == OfflineReason::none);
-    CHECK(classify_open_failure("echo.db is corrupt and could not be moved aside") == OfflineReason::none);
+    for (const auto& refusal : real_open_refusals("/var/lib/yuzu/agent/echo.db")) {
+        INFO(refusal);
+        CHECK(classify_open_failure(refusal) == OfflineReason::none);
+    }
     CHECK(classify_open_failure("") == OfflineReason::none);
+    // the earlier-step phrase counts only right after "schema vN: "
+    CHECK(classify_open_failure("schema v8: something else; an earlier migration step did not finish") ==
+          OfflineReason::none);
+}
+
+TEST_CASE("classify_open_failure: a data-directory path that holds a wrapper phrase does not steer the label",
+          "[echo][open_retry]") {
+    // open()'s other refusals carry the path; a directory named after a phrase the classifier or
+    // is_deadline_hit reads must not turn a fail-init refusal into offline-with-retry.
+    for (const std::string dir : {"/var/lib/yuzu/v10 roll-up migration failed",
+                                  "/var/lib/yuzu/an earlier migration step did not finish",
+                                  "/var/lib/yuzu/not enough free disk space to migrate",
+                                  "/var/lib/yuzu/did not finish inside its"}) {
+        for (const auto& refusal : real_open_refusals(dir + "/echo.db")) {
+            INFO(refusal);
+            CHECK(classify_open_failure(refusal) == OfflineReason::none);
+            CHECK_FALSE(is_deadline_hit(refusal));
+            CHECK(retry_failure_reason(refusal) == OfflineReason::open_failed);
+        }
+    }
 }
 
 TEST_CASE("retry_failure_reason: a failure on a retry is never 'none', it falls back to open_failed",
@@ -87,8 +130,10 @@ TEST_CASE("retry_failure_reason: a failure on a retry is never 'none', it falls 
     CHECK(retry_failure_reason("schema v8: an earlier migration step did not finish (see the log)") ==
           OfflineReason::migration_failed);
     // ... and any other failure (which fails a first open outright) stays offline as open_failed
-    CHECK(retry_failure_reason("failed to open echo.db: unable to open database file") == OfflineReason::open_failed);
-    CHECK(retry_failure_reason("echo.db is a symbolic link; refusing to open it") == OfflineReason::open_failed);
+    for (const auto& refusal : real_open_refusals("/var/lib/yuzu/agent/echo.db")) {
+        INFO(refusal);
+        CHECK(retry_failure_reason(refusal) == OfflineReason::open_failed);
+    }
     CHECK(retry_failure_reason("") == OfflineReason::open_failed);
 }
 
@@ -153,6 +198,28 @@ TEST_CASE("format_storage_refused_lines: a wait of zero or less reads 'Retrying 
     }
 }
 
+TEST_CASE("format_storage_refused_lines: a long detail never pushes the guidance out of the dashboard window",
+          "[echo][open_retry]") {
+    // web_utils.hpp agent_error_display shows the first 400 bytes of line 0 after `error|`; a real
+    // free-space refusal alone is about 470 bytes, so the retry or restart guidance goes first.
+    constexpr std::size_t kWindow = 400;
+    const std::string detail(400, 'x');
+    const auto check = [&](std::optional<std::chrono::seconds> wait, std::string_view guidance_end) {
+        const auto lines = format_storage_refused_lines(OfflineReason::free_space, detail, wait);
+        REQUIRE(lines[0].starts_with("error|"));
+        const std::string_view text = std::string_view{lines[0]}.substr(std::string_view{"error|"}.size());
+        const auto guidance_at = text.find(guidance_end);
+        const auto detail_at = text.find(detail);
+        REQUIRE(guidance_at != std::string_view::npos);
+        REQUIRE(detail_at != std::string_view::npos);
+        CHECK(guidance_at + guidance_end.size() <= detail_at); // the guidance ends before the detail starts
+        CHECK(guidance_at + guidance_end.size() < kWindow);    // and inside the window
+    };
+    check(3600s, "in about 3600 s.");
+    check(0s, "Retrying now.");
+    check(std::nullopt, "restart the agent.");
+}
+
 TEST_CASE("format_storage_refused_lines: no scheduled retry asks for a restart and never promises one",
           "[echo][open_retry]") {
     const auto lines = format_storage_refused_lines(OfflineReason::open_failed, "collection start failed: boom",
@@ -167,13 +234,15 @@ TEST_CASE("format_storage_refused_lines: no scheduled retry asks for a restart a
     CHECK(lines[1] == "storage_state|offline|open_failed"); // the tag is unchanged
 }
 
+// Every OpenRetryLoop case declares `loop` AFTER the state its lambdas capture, so a failed REQUIRE
+// destroys the loop (which stops and joins its thread) before that state, never the other way round.
 TEST_CASE("OpenRetryLoop: attempts run after each back-off until one succeeds",
           "[echo][open_retry]") {
-    OpenRetryLoop loop;
     std::vector<unsigned> delays_asked;
     std::vector<unsigned> attempts_seen;
     std::promise<void> done;
     auto finished = done.get_future();
+    OpenRetryLoop loop;
     loop.start(
         [&](unsigned attempt, const std::function<bool()>&) {
             attempts_seen.push_back(attempt);
@@ -196,8 +265,8 @@ TEST_CASE("OpenRetryLoop: attempts run after each back-off until one succeeds",
 
 TEST_CASE("OpenRetryLoop: stop() during a long back-off returns without running an attempt",
           "[echo][open_retry]") {
-    OpenRetryLoop loop;
     std::atomic<int> attempts{0};
+    OpenRetryLoop loop;
     loop.start(
         [&](unsigned, const std::function<bool()>&) {
             ++attempts;
@@ -212,11 +281,11 @@ TEST_CASE("OpenRetryLoop: stop() during a long back-off returns without running 
 
 TEST_CASE("OpenRetryLoop: stop() cancels an attempt that is blocked on cancelled()",
           "[echo][open_retry]") {
-    OpenRetryLoop loop;
     std::promise<void> entered;
     auto in_attempt = entered.get_future();
     std::atomic<int> attempts{0};
     std::atomic<bool> saw_cancel{false};
+    OpenRetryLoop loop;
     loop.start(
         [&](unsigned, const std::function<bool()>& cancelled) {
             ++attempts;
@@ -237,10 +306,10 @@ TEST_CASE("OpenRetryLoop: stop() cancels an attempt that is blocked on cancelled
 
 TEST_CASE("OpenRetryLoop: an attempt that throws counts as failed and the loop carries on",
           "[echo][open_retry]") {
-    OpenRetryLoop loop;
     std::promise<void> done;
     auto finished = done.get_future();
     std::atomic<int> calls{0};
+    OpenRetryLoop loop;
     loop.start(
         [&](unsigned, const std::function<bool()>&) -> bool {
             if (++calls == 1)
@@ -256,8 +325,8 @@ TEST_CASE("OpenRetryLoop: an attempt that throws counts as failed and the loop c
 
 TEST_CASE("OpenRetryLoop: with the default back-off the first attempt is a minute away and stop() ends the wait",
           "[echo][open_retry]") {
-    OpenRetryLoop loop;
     std::atomic<int> attempts{0};
+    OpenRetryLoop loop;
     loop.start([&](unsigned, const std::function<bool()>&) {
         ++attempts;
         return true;
