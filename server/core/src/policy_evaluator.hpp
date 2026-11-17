@@ -149,6 +149,10 @@ public:
         // matching every existing production/test Deps that predates this
         // field.
         std::function<bool()> should_stop;
+        /// TEST SEAM (null in production): called once per target with a terminal response,
+        /// immediately before it is evaluated, inside the evaluation failure domain. Lets a test
+        /// make evaluation throw to prove one target's failure cannot drop the others.
+        std::function<void(const std::string& target)> before_evaluate_hook;
     };
 
     explicit PolicyEvaluator(Deps deps);

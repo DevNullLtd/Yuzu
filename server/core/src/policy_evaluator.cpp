@@ -21,6 +21,7 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <new>
 
 #include <chrono>
 #include <format>
@@ -140,7 +141,7 @@ latest_per_agent(const std::vector<StoredResponse>& rows) {
 /// Evaluate one agent's check response into a status string.
 std::string verdict_for(const StoredResponse& r, const std::string& policy_id,
                         const std::string& instruction_id, const std::string& cel,
-                        InstructionStore* istore) {
+                        InstructionStore* istore, std::string* unevaluable_reason = nullptr) {
     if (is_terminal_failure(r.status))
         return "error"; // the check plugin itself failed/timed out/was rejected
 
@@ -188,6 +189,8 @@ std::string verdict_for(const StoredResponse& r, const std::string& policy_id,
                      "nested past the depth guard (max {}); treating as evaluation error, "
                      "cannot be safely parsed",
                      policy_id, instruction_id, r.agent_id, yuzu::server::mcp::kMcpMaxJsonDepth);
+        if (unevaluable_reason)
+            *unevaluable_reason = "depth";
         return "error";
     }
 
@@ -311,6 +314,17 @@ PolicyEvaluator::PolicyEvaluator(Deps deps) : d_(std::move(deps)) {
                        std::chrono::system_clock::now().time_since_epoch())
                 .count();
         };
+    }
+
+    // Closed-set `reason` label (observability-conventions: pre-seed so the family and HELP/TYPE
+    // exist on a healthy server). Reasons: depth (output nested past the depth guard), exception
+    // (parse/evaluate threw on a hostile or malformed response).
+    if (d_.metrics) {
+        d_.metrics->describe("yuzu_server_policy_unevaluable_responses_total",
+                             "Policy check responses that could not be evaluated and scored error",
+                             "counter");
+        for (const char* r : {"depth", "exception"})
+            d_.metrics->counter("yuzu_server_policy_unevaluable_responses_total", {{"reason", r}});
     }
 
     // ADR-0056: the boot-time stranded-'fixing' reset that used to live here
@@ -921,50 +935,94 @@ void PolicyEvaluator::collect_ready() {
                         : std::vector<StoredResponse>{};
         auto best = latest_per_agent(rows);
 
+        // Item-level failure domain: `f` was moved out of in_flight_ above, so an escape would
+        // also abort every later ready item. Log + count + move on (the item is NOT retried;
+        // its policy re-evaluates at its next interval). Fail-closed: nothing is recorded as
+        // compliant here.
+        try {
         if (f.phase == Phase::Check) {
             for (const auto& tgt : f.targets) {
-                auto it = best.find(tgt);
-                std::string status, cr;
-                if (it == best.end() || it->second.status == kStatusRunning) {
-                    status = "unknown"; // no terminal response within the grace window
-                } else {
-                    // F6: the response is agent-supplied. One hostile response
-                    // must degrade THIS target to the existing "error" verdict,
-                    // never unwind the pass (in_flight_ entries were already
-                    // moved out, so an escape here drops every later target).
-                    try {
-                        status = verdict_for(it->second, f.policy_id, f.instruction_id,
-                                             f.compliance_expr, d_.instruction_store);
-                        cr = make_check_result(it->second);
-                    } catch (const std::exception& e) {
-                        spdlog::warn("policy_evaluator: policy {} check {} response from agent {} "
-                                     "could not be evaluated ({}); verdict=error",
-                                     f.policy_id, f.instruction_id, tgt, e.what());
-                        status = "error";
-                        cr.clear();
-                    } catch (...) {
-                        status = "error";
-                        cr.clear();
+                // F6: `f` was already moved out of in_flight_, so an exception escaping this
+                // body would silently drop every LATER target (their verdict never recorded,
+                // never retried). Each target is therefore its own failure domain: whatever
+                // throws (a hostile response, a throwing store write) skips THAT target only.
+                try {
+                    auto it = best.find(tgt);
+                    std::string status, cr;
+                    if (it == best.end() || it->second.status == kStatusRunning) {
+                        status = "unknown"; // no terminal response within the grace window
+                    } else {
+                        // The response is agent-supplied. A response that cannot be evaluated
+                        // degrades THIS target to the existing fail-closed "error" verdict and
+                        // is counted by reason. std::bad_alloc is NOT an evaluation verdict
+                        // (a transient resource fault would overwrite a good verdict with
+                        // `error`): it propagates to the per-target handler below, which logs
+                        // and skips the target so its previous status stands.
+                        std::string why;
+                        try {
+                            if (d_.before_evaluate_hook)
+                                d_.before_evaluate_hook(tgt);
+                            status = verdict_for(it->second, f.policy_id, f.instruction_id,
+                                                 f.compliance_expr, d_.instruction_store, &why);
+                            cr = make_check_result(it->second);
+                        } catch (const std::bad_alloc&) {
+                            throw;
+                        } catch (const std::exception& e) {
+                            spdlog::warn("policy_evaluator: policy {} check {} response from "
+                                         "agent {} could not be evaluated ({}); verdict=error",
+                                         f.policy_id, f.instruction_id, tgt, e.what());
+                            status = "error";
+                            // Evidence for the operator, without echoing the response that
+                            // could not be evaluated.
+                            cr = R"({"reason":"unevaluable_response"})";
+                            why = "exception";
+                        }
+                        if (!why.empty() && d_.metrics)
+                            d_.metrics
+                                ->counter("yuzu_server_policy_unevaluable_responses_total",
+                                          {{"reason", why}})
+                                .increment();
                     }
-                }
-                if (d_.policy_store) {
-                    // Shared Check-phase write: a REMEDIATION verify entry
-                    // carries claim_gen != 0 and its verdict is fenced on it
-                    // (a sibling may have reclaimed while the verify was in
-                    // flight); an ordinary DETECTION entry carries 0 and writes
-                    // unconditionally.
-                    std::optional<int64_t> gen =
-                        f.claim_gen != 0 ? std::optional<int64_t>(f.claim_gen) : std::nullopt;
-                    auto r = d_.policy_store->update_agent_status(f.policy_id, tgt, status, cr, gen);
-                    if (!r)
-                        spdlog::warn("policy_evaluator: update_agent_status failed: {}", r.error());
-                    else if (!*r && d_.metrics)
-                        d_.metrics->counter("yuzu_server_policy_remediation_fence_skip_total")
+                    if (d_.policy_store) {
+                        // Shared Check-phase write: a REMEDIATION verify entry
+                        // carries claim_gen != 0 and its verdict is fenced on it
+                        // (a sibling may have reclaimed while the verify was in
+                        // flight); an ordinary DETECTION entry carries 0 and writes
+                        // unconditionally.
+                        std::optional<int64_t> gen =
+                            f.claim_gen != 0 ? std::optional<int64_t>(f.claim_gen) : std::nullopt;
+                        auto r = d_.policy_store->update_agent_status(f.policy_id, tgt, status, cr,
+                                                                      gen);
+                        if (!r)
+                            spdlog::warn("policy_evaluator: update_agent_status failed: {}",
+                                         r.error());
+                        else if (!*r && d_.metrics)
+                            d_.metrics->counter("yuzu_server_policy_remediation_fence_skip_total")
+                                .increment();
+                    }
+                    if (d_.metrics)
+                        d_.metrics
+                            ->counter("yuzu_server_policy_verdicts_total", {{"status", status}})
+                            .increment();
+                } catch (const std::exception& e) {
+                    spdlog::error("policy_evaluator: policy {} target {} skipped, check-phase "
+                                  "evaluation threw: {}",
+                                  f.policy_id, tgt, e.what());
+                    if (d_.metrics)
+                        d_.metrics
+                            ->counter("yuzu_server_policy_eval_errors_total",
+                                      {{"phase", "collect_target"}})
+                            .increment();
+                } catch (...) {
+                    spdlog::error("policy_evaluator: policy {} target {} skipped, check-phase "
+                                  "evaluation threw a non-std exception",
+                                  f.policy_id, tgt);
+                    if (d_.metrics)
+                        d_.metrics
+                            ->counter("yuzu_server_policy_eval_errors_total",
+                                      {{"phase", "collect_target"}})
                             .increment();
                 }
-                if (d_.metrics)
-                    d_.metrics->counter("yuzu_server_policy_verdicts_total", {{"status", status}})
-                        .increment();
             }
         } else { // Phase::FixWait — fix dispatched; failures error out, the rest go to verify.
             // HA WS-3 3.4: this FixWait entry maturing is the normal,
@@ -1060,6 +1118,20 @@ void PolicyEvaluator::collect_ready() {
                     }
                 }
             }
+        }
+        } catch (const std::exception& e) {
+            spdlog::error("policy_evaluator: collect_ready item for policy {} skipped: {}",
+                          f.policy_id, e.what());
+            if (d_.metrics)
+                d_.metrics->counter("yuzu_server_policy_eval_errors_total", {{"phase", "collect_item"}})
+                    .increment();
+        } catch (...) {
+            spdlog::error("policy_evaluator: collect_ready item for policy {} skipped: "
+                          "non-std exception",
+                          f.policy_id);
+            if (d_.metrics)
+                d_.metrics->counter("yuzu_server_policy_eval_errors_total", {{"phase", "collect_item"}})
+                    .increment();
         }
     }
 }

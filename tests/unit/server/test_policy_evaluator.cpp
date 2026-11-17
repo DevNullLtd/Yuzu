@@ -39,6 +39,7 @@
 #include <libpq-fe.h>
 
 #include <map>
+#include <new>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -342,6 +343,71 @@ TEST_CASE("policy evaluator: one agent's hostile check output cannot abort the p
     CHECK(h.status_of(pid, "agentC") == "compliant");
     CHECK(h.status_of(pid, "agentA") != "<none>");
     CHECK(h.status_of(pid, "agentB") != "<none>");
+}
+
+TEST_CASE("policy evaluator: a throwing evaluation is its own failure domain, later targets "
+          "are processed exactly once (F6 review)",
+          "[pg][policy][evaluator]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    REQUIRE(h.mg.add_member(h.group_id, "agentC").has_value());
+    h.canned["agentA|checkp"] = {1, out_json("hostname", "yuzu-a")};
+    h.canned["agentB|checkp"] = {1, out_json("hostname", "yuzu-b")};
+    h.canned["agentC|checkp"] = {1, out_json("hostname", "yuzu-c")};
+    auto pid = h.author("result.hostname != ''");
+
+    yuzu::MetricsRegistry metrics;
+    std::map<std::string, int> calls;
+    auto deps = h.deps();
+    deps.metrics = &metrics;
+    deps.before_evaluate_hook = [&](const std::string& tgt) {
+        ++calls[tgt];
+        if (tgt == "agentA")
+            throw std::runtime_error("hostile response");
+        if (tgt == "agentB")
+            throw std::bad_alloc();
+    };
+    PolicyEvaluator ev(deps);
+    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
+    h.fake_now += 20;
+    REQUIRE_NOTHROW(ev.tick(true));
+
+    // A: an evaluation failure scores the fail-closed `error` verdict and is counted by reason.
+    CHECK(h.status_of(pid, "agentA") == "error");
+    // B: bad_alloc is not a verdict -- the target is skipped, never scored (and never compliant).
+    CHECK(h.status_of(pid, "agentB") != "compliant");
+    CHECK(h.status_of(pid, "agentB") != "error");
+    // C: processed normally, after both failures.
+    CHECK(h.status_of(pid, "agentC") == "compliant");
+    CHECK(calls["agentA"] == 1);
+    CHECK(calls["agentB"] == 1);
+    CHECK(calls["agentC"] == 1);
+    CHECK(metrics.counter("yuzu_server_policy_unevaluable_responses_total",
+                          {{"reason", "exception"}})
+              .value() == 1);
+}
+
+TEST_CASE("policy evaluator: output nested past the depth guard scores error and is counted "
+          "(F6 review)",
+          "[pg][policy][evaluator]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    h.canned["agentA|checkp"] = {1, std::string(64, '[') + std::string(64, ']')};
+    h.canned["agentB|checkp"] = {1, out_json("hostname", "yuzu-b")};
+    auto pid = h.author("result.hostname != ''");
+    yuzu::MetricsRegistry metrics;
+    auto deps = h.deps();
+    deps.metrics = &metrics;
+    PolicyEvaluator ev(deps);
+    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
+    h.fake_now += 20;
+    ev.tick(true);
+    CHECK(h.status_of(pid, "agentA") == "error");
+    CHECK(h.status_of(pid, "agentB") == "compliant");
+    CHECK(metrics.counter("yuzu_server_policy_unevaluable_responses_total", {{"reason", "depth"}})
+              .value() == 1);
 }
 
 TEST_CASE("policy evaluator: an operator evaluate_now completes even when the due-policy "
