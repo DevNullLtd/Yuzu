@@ -494,8 +494,8 @@ Lock order of that transaction (the owner header banner is authoritative): the `
 when the removed grant was not already in the locked set), then the target's `session_store.sessions`
 rows, then the `rbac_meta` `write_generation` row, then the `session_meta` `write_generation` row LAST,
 then COMMIT. Every statement after the first runs under the lifecycle `lock_timeout` (2000 ms) and a
-15 s `idle_in_transaction_session_timeout` that the unassign installs as its first statement for this
-case only; every other unassign keeps the pool defaults and touches no `session_store` object. Any
+15 s `idle_in_transaction_session_timeout` that the unassign installs as its first statement for every
+attempt at a USER `Administrator` unassign, whether or not its DELETE then removes a row; every other unassign keeps the pool defaults and touches no `session_store` object. Any
 failure aborts the transaction and the grant removal rolls back (fail closed).
 
 The owner reaches `session_store` SQL only through the `session_sql::` helpers in

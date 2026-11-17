@@ -431,7 +431,8 @@ inline constexpr std::string_view kRbacRegimeAuthorityUnavailableAuditReason =
 /// `"; "` that separates `<role>` from `removed=<bool>`, so the detail reads
 /// `<role>; removed=true elevations_cleared=N` and `removed=` must be matched as a token, never
 /// compared to the whole text after it. The verb `role.elevation.revoked` has two writers: the
-/// self-service step-down (principal the user, `detail=was_elevated=<bool>`) and this one
+/// self-service step-down (principal the user, `detail=was_elevated=<bool>`, or
+/// `was_elevated=unknown` after a degraded session lookup) and this one
 /// (principal the operator who removed the grant, `target_id` the user,
 /// `reason=administrator_unassign`). Revoking elevation eligibility also ends elevations but
 /// writes only `user.elevation_eligibility.set` (with its own ` elevations_cleared=N` suffix) and

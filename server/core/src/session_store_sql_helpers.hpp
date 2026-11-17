@@ -39,7 +39,8 @@
 /// order stays acyclic; two multi-row writers on one user's rows (`invalidate_user`, the
 /// reaper's DELETE, `delete_user_sessions_in_txn`, `SessionStore::clear_user_elevations`, which
 /// the eligibility revoke runs) can still deadlock on row order, and
-/// Postgres aborts one victim, which the caller's rollback turns into a retryable failure.
+/// Postgres aborts one victim, which can be either writer; an aborted caller's rollback turns it
+/// into a retryable failure.
 /// There is no per-user cap on session rows, so the row lock and the clear touch as many rows as
 /// the user holds; that count is bounded only by the 8 h absolute session lifetime
 /// (`AuthManager::kSessionDuration`), the session reaper and the per-IP login rate limit, and

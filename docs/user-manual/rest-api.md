@@ -2130,7 +2130,7 @@ Grant or revoke a user's **JIT-admin-elevation eligibility** — who may activat
 
 **Body:** `{"eligible": <bool>}`.
 
-**Side effect:** setting `eligible=false` immediately terminates any in-flight elevation for that user.
+**Side effect:** setting `eligible=false` terminates any in-flight elevation for that user: at once on the replica that handled the call, and on the other replicas on their next poll of the session generation (about 1 second, up to about 30 seconds while that read is failing or slow; neither bound holds after a database restore or a failover to a lagging standby, so restart every replica then).
 
 Two route forms, same handler:
 
@@ -3521,8 +3521,10 @@ It does not change the user's elevation eligibility and does not
 block a later `POST /api/v1/elevate`: an eligible user can open a new window. To
 end elevated access for good, first call
 `POST /api/v1/users/{name}/elevation-eligibility` with `{"eligible": false}`
-(it refuses service-scoped and MCP-tier tokens, and it also ends live
-elevations); for a user with no grant that call is the only step needed. A
+(it refuses service-scoped and MCP-tier tokens, needs the caller's own
+administrator role or an active elevation rather than an `Administrator` grant, and also
+ends live elevations, at once on the replica that handled it and on the others within the
+same bound as above); for a user with no grant that call is the only step needed. A
 request already past its authorization check when the clear lands is not
 recalled, a `POST /api/v1/elevate` that had already passed its eligibility check
 can wait on the unassign's session-row lock and complete just after the unassign
@@ -3530,9 +3532,11 @@ commits (so a new window can stand), and an open event stream is not re-checked
 for elevation. For this
 case the transaction bounds each lock wait at 2000 ms (other unassigns keep the
 pool default), so it can answer a retryable `503` when it cannot take its locks
-in time. A server log warning `rbac.role.unassigned store fault` and the
+in time. A server log warning `rbac.role.unassigned store fault` (a failed unassign of an engine
+principal's role logs `engine_principal.role.unassigned store fault` instead) and the
 counter `yuzu_server_rbac_lifecycle_store_failure_total{op="unassign"}` record
-such a fault. See "Fleet-Wide Role Assignment" in `rbac.md`.
+such a fault; each logged value is capped at 256 bytes and a space, `=` or `,` in it is
+written as `_`. See "Fleet-Wide Role Assignment" in `rbac.md`.
 
 **Permission:** Same dedicated `is_rbac_administrator` check as the `POST`
 above (including the MCP-tier-token structural denial), plus MFA step-up.
