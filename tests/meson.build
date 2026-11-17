@@ -308,6 +308,7 @@ agent_test_exe = executable(
     'unit/test_dex_linux_proc.cpp',
     'unit/test_dex_macos_perf.cpp',
     'unit/test_dex_linux_journal.cpp',
+    'unit/test_session_log_fingerprint.cpp', # F50: session id never logged raw
     'unit/test_dex_linux_kmsg.cpp',
     'unit/test_dex_linux_sysfs.cpp',
     'unit/test_dex_rate_limiter.cpp',

@@ -2404,3 +2404,17 @@ TEST_CASE("SAML ACS — rbac_store absent skips reconcile; coarse --saml-admin-g
 }
 
 #endif // !_WIN32
+
+TEST_CASE("SAML ACS error text is neutralised for the log line and the audit detail (F72)",
+          "[saml][auth_routes][log_injection]") {
+    // An XML character reference (&#10;) in an unsigned attribute decodes to a real line feed and
+    // lands in the SamlProvider error string; C1 CSI and ESC ride along.
+    const std::string raw = "SAML status is not Success: urn:x\nforged\x1b[2J\xC2\x9B" "31m;k=v";
+    const std::string safe = yuzu::server::detail::neutralise_saml_error(raw);
+    CHECK(safe.find_first_of("\r\n\x1b") == std::string::npos);
+    CHECK(safe.find("\xC2\x9B") == std::string::npos);
+    CHECK(safe.find(';') == std::string::npos);
+    CHECK(safe.find("forged") != std::string::npos);
+    // Bounded: a megabyte of attacker text cannot reach the audit row whole.
+    CHECK(yuzu::server::detail::neutralise_saml_error(std::string(1 << 20, 'a')).size() <= 512);
+}

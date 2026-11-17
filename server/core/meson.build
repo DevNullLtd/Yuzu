@@ -625,6 +625,8 @@ yuzu_key_provider_lib = static_library(
   'yuzu_key_provider',
   files('src/key_provider.cpp'),
   dependencies: [spdlog_dep, openssl_dep],
+  # log_token.hpp (F54): header-only, no link edge.
+  include_directories: include_directories('../../common/include'),
 )
 yuzu_key_provider_dep = declare_dependency(
   link_with: yuzu_key_provider_lib,

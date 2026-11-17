@@ -304,6 +304,10 @@ std::string sanitize_detail_value(std::string_view v) {
     return out;
 }
 
+std::string neutralise_saml_error(std::string_view err) {
+    return sanitize_detail_value(::yuzu::log_key_token(err));
+}
+
 } // namespace detail
 
 // ---------------------------------------------------------------------------
@@ -2214,8 +2218,8 @@ PasswordCheckResult AuthRoutes::verify_password_with_lockout(const std::string& 
                     if (auto* m = auth_mgr_.metrics_registry()) {
                         m->counter("yuzu_auth_lockout_blocked_total").increment();
                     }
-                    spdlog::warn("Login blocked: account '{}' is locked (source {})", username,
-                                 req.remote_addr);
+                    spdlog::warn("Login blocked: account '{}' is locked (source {})",
+                                 ::yuzu::log_key_token(username), req.remote_addr);
                     return {PasswordCheckOutcome::kLocked, std::nullopt, {}};
                 }
             } else {
@@ -2227,7 +2231,7 @@ PasswordCheckResult AuthRoutes::verify_password_with_lockout(const std::string& 
                 lockout_read_failed = true;
                 spdlog::warn("lockout_status read failed for '{}' (error={}) — pre-check "
                              "fail-open; brute-force throttle degraded for this attempt",
-                             username, static_cast<int>(st.error()));
+                             ::yuzu::log_key_token(username), static_cast<int>(st.error()));
             }
         }
     }
@@ -2308,11 +2312,11 @@ PasswordCheckResult AuthRoutes::verify_password_with_lockout(const std::string& 
                     if (auto* m = auth_mgr_.metrics_registry()) {
                         m->counter("yuzu_auth_lockout_applied_total").increment();
                     }
-                    spdlog::warn("Account '{}' locked after {} failed login attempts", username,
-                                 cfg_.auth_lockout_threshold);
+                    spdlog::warn("Account '{}' locked after {} failed login attempts",
+                                 ::yuzu::log_key_token(username), cfg_.auth_lockout_threshold);
                 } else if (!rec) {
-                    spdlog::warn("record_failed_login failed for '{}': error={}", username,
-                                 static_cast<int>(rec.error()));
+                    spdlog::warn("record_failed_login failed for '{}': error={}",
+                                 ::yuzu::log_key_token(username), static_cast<int>(rec.error()));
                     if (is_store_unavailable(rec.error())) {
                         // ★ Hermes p2 MEDIUM: the counter could not be
                         // persisted — the caller must refuse fail-closed (503),
@@ -4786,10 +4790,13 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         try {
             auto result = saml_provider_->validate_response(saml_response_b64, binding_cookie);
             if (!result) {
-                spdlog::warn("SAML ACS validation failed: {}", result.error());
-                audit_log(req, "auth.saml_login_failed", "error", {}, {}, result.error());
+                // The error text embeds IdP-document attribute values (unsigned StatusCode,
+                // Assertion ID): neutralise for the log, bound + fold for the audit detail.
+                const std::string saml_err_safe = detail::neutralise_saml_error(result.error());
+                spdlog::warn("SAML ACS validation failed: {}", ::yuzu::log_key_token(result.error()));
+                audit_log(req, "auth.saml_login_failed", "error", {}, {}, saml_err_safe);
                 emit_event("auth.saml_login_failed", req,
-                           {{"source_ip", req.remote_addr}, {"error", result.error()}}, {},
+                           {{"source_ip", req.remote_addr}, {"error", saml_err_safe}}, {},
                            Severity::kWarn);
                 if (auto* m = auth_mgr_.metrics_registry()) {
                     m->counter("yuzu_auth_saml_login_total", {{"result", "error"}, {"role", "none"}}).increment();

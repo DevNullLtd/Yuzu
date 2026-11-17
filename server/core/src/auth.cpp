@@ -1244,7 +1244,7 @@ std::optional<std::string> AuthManager::authenticate(const std::string& username
     // one) — reject without the DB read or PBKDF2, which bounds the hash input.
     // Never log the length.
     if (password_exceeds_max(password)) {
-        spdlog::warn("Auth failed: over-length password for '{}'", username);
+        spdlog::warn("Auth failed: over-length password for '{}'", ::yuzu::log_key_token(username));
         return std::nullopt;
     }
 
@@ -1254,7 +1254,7 @@ std::optional<std::string> AuthManager::authenticate(const std::string& username
         if (entry.error() == UserLookupMiss::DbError)
             return std::nullopt; // AuthDB unreachable: fail closed, already logged, not a
                                  // bad-username signal (no unknown_user histogram sample)
-        spdlog::warn("Auth failed: unknown user '{}'", username);
+        spdlog::warn("Auth failed: unknown user '{}'", ::yuzu::log_key_token(username));
         if (metrics_) {
             const auto elapsed =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
@@ -1270,7 +1270,7 @@ std::optional<std::string> AuthManager::authenticate(const std::string& username
     auto hash = pbkdf2_sha256(password, salt, kPbkdf2Iterations);
 
     if (!constant_time_compare(hash, entry->hash_hex)) {
-        spdlog::warn("Auth failed: bad password for '{}'", username);
+        spdlog::warn("Auth failed: bad password for '{}'", ::yuzu::log_key_token(username));
         if (metrics_) {
             const auto elapsed =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
@@ -1339,7 +1339,7 @@ AuthManager::verify_password(const std::string& username, const std::string& pas
     // AuthRoutes::verify_password_with_lockout already rejects before calling).
     // An over-max password can never match, so it is a credential verdict.
     if (password_exceeds_max(password)) {
-        spdlog::warn("verify_password failed: over-length password for '{}'", username);
+        spdlog::warn("verify_password failed: over-length password for '{}'", ::yuzu::log_key_token(username));
         return std::unexpected(VerifyFailure::kBadCredential);
     }
     auto entry = find_user_or_hydrate(username); // AuthDB-first (#4020/#5274), a COPY
@@ -1349,7 +1349,7 @@ AuthManager::verify_password(const std::string& username, const std::string& pas
         // as a failed guess. Logged by the helper; no unknown_user sample.
         if (entry.error() == UserLookupMiss::DbError)
             return std::unexpected(VerifyFailure::kStoreUnavailable);
-        spdlog::warn("verify_password failed: unknown user '{}'", username);
+        spdlog::warn("verify_password failed: unknown user '{}'", ::yuzu::log_key_token(username));
         if (metrics_) {
             const auto elapsed =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
@@ -1363,7 +1363,7 @@ AuthManager::verify_password(const std::string& username, const std::string& pas
     auto salt = hex_to_bytes(entry->salt_hex);
     auto hash = pbkdf2_sha256(password, salt, kPbkdf2Iterations);
     if (!constant_time_compare(hash, entry->hash_hex)) {
-        spdlog::warn("verify_password failed: bad password for '{}'", username);
+        spdlog::warn("verify_password failed: bad password for '{}'", ::yuzu::log_key_token(username));
         if (metrics_) {
             const auto elapsed =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();

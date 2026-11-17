@@ -2,6 +2,8 @@
 
 #include "dex_linux_kmsg.hpp" // classify_kernel_message — all _TRANSPORT=kernel free-text markers
 
+#include <yuzu/log_token.hpp> // log_key_token: fold CR/LF/C0/C1 in journal-supplied text (F59)
+
 #include <nlohmann/json.hpp>
 
 #include <charconv>
@@ -72,7 +74,7 @@ JournalLine parse_journal_line(std::string_view line) {
     // core-generating signal), so no intentional-stop filtering is needed. Subject
     // is the comm only — COREDUMP_EXE (a full path) is never shipped.
     if (mid == kMsgIdCoredump) {
-        const std::string comm = jstr(j, "COREDUMP_COMM");
+        const std::string comm = ::yuzu::log_key_token(jstr(j, "COREDUMP_COMM"));
         if (comm.empty())
             return out; // no safe subject
         SignalObservation o;
@@ -103,10 +105,10 @@ JournalLine parse_journal_line(std::string_view line) {
     // classifier deliberately avoids. UNIT_RESULT (exit-code / signal / core-dump /
     // timeout / oom-kill) is the reason when present; absent → empty reason.
     if (mid == kMsgIdUnitFailed || mid == kMsgIdUnitResult) {
-        const std::string unit = jstr(j, "UNIT");
+        const std::string unit = ::yuzu::log_key_token(jstr(j, "UNIT"));
         if (unit.empty())
             return out;
-        const std::string result = jstr(j, "UNIT_RESULT");
+        const std::string result = ::yuzu::log_key_token(jstr(j, "UNIT_RESULT"));
         SignalObservation o;
         o.subject = unit;
         o.kind = "unit";

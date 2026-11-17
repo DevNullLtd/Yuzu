@@ -273,6 +273,17 @@ TEST_CASE("SecretCodec init: fail-closed boot verification", "[pg][secrets]") {
         REQUIRE_FALSE(r.has_value());
         REQUIRE(r.error().kind == SecretCodec::InitError::Kind::kek_unresolvable);
     }
+    SECTION("forged kcv_alg is neutralised in the InitError message (F54)") {
+        PgResult upd{PQexec(conn.get(),
+                            "UPDATE secrets.kek_meta SET kcv_alg = E'x\\n[error] forged\\x1b[2J'")};
+        REQUIRE(upd.ok());
+        FileKeyProvider provider(keys.path);
+        SecretCodec codec(provider);
+        auto r = codec.init(conn.get());
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().message.find('\n') == std::string::npos);
+        CHECK(r.error().message.find('\x1b') == std::string::npos);
+    }
     SECTION("corrupt KEK file -> kek_corrupt") {
         // Overwrite the key file with different 32 bytes; fresh provider so
         // no resident cached copy masks the corruption.

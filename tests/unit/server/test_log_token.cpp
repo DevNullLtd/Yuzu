@@ -240,6 +240,22 @@ TEST_CASE("log_key_token: the three Unicode line-separator sequences map to '_'"
     CHECK(log_key_token("\xC3\x85") == "\xC3\x85"); // U+00C5, unrelated to NEL
 }
 
+TEST_CASE("log_key_token: every C1 control folds to one '_' per code point (F71)",
+          "[log_token][log_key_token]") {
+    // CSI U+009B, OSC U+009D, DCS U+0090, ST U+009C: the 8-bit forms of the ESC sequences.
+    CHECK(log_key_token("a\xC2\x9B" "31m" "b") == "a_31mb");
+    CHECK(log_key_token("a\xC2\x9D" "0;t\xC2\x9C" "b") == "a_0;t_b");
+    CHECK(log_key_token("a\xC2\x90" "b") == "a_b");
+    // The full block, one '_' each, and the same result as log_token on those code points.
+    for (unsigned b = 0x80; b <= 0x9F; ++b) {
+        const std::string c1 = std::string("x\xC2") + static_cast<char>(b) + "y";
+        CHECK(log_key_token(c1) == "x_y");
+    }
+    // The neighbours stay: U+00A0 (NBSP) and U+00A9 are ordinary text.
+    CHECK(log_key_token("a\xC2\xA0" "b") == "a\xC2\xA0" "b");
+    CHECK(log_key_token("\xC2\xA9") == "\xC2\xA9");
+}
+
 TEST_CASE("log_key_token: over-length input is capped with a UTF-8-aware head~tail cut",
           "[log_token][log_key_token]") {
     constexpr std::size_t kMax = kGuardianLogIdMaxBytes;   // 256

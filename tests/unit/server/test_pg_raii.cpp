@@ -285,3 +285,28 @@ TEST_CASE("PgTxn commit() and an aborted transaction", "[pg][raii]") {
         CHECK(count_rows(conn.get()) == 1);
     }
 }
+
+// ── connect_failure_cause (F56): fixed causes, nothing copied from libpq text ──
+
+TEST_CASE("connect_failure_cause never echoes libpq text", "[pg][raii][log_injection][F56]") {
+    using yuzu::server::pg::connect_failure_cause;
+    // A URI DSN whose password contained '/' leaves a fragment of it in the port/dbname libpq
+    // quotes; the cause must be a constant that contains none of it.
+    const std::string leaky =
+        "connection to server at \"db\" (10.0.0.1), port s3cr3tfrag failed: Connection refused\n"
+        "\tIs the server running on that host and accepting TCP/IP connections?\n";
+    const std::string cause = connect_failure_cause(leaky);
+    CHECK(cause.find("s3cr3tfrag") == std::string::npos);
+    CHECK(cause.find('\n') == std::string::npos);
+    CHECK(cause == connect_failure_cause("Connection refused"));
+
+    const std::string auth =
+        connect_failure_cause("FATAL:  password authentication failed for user \"app\"\n");
+    CHECK(auth.find("app") == std::string::npos);
+    CHECK(auth != cause);
+
+    // Unrecognised text falls to the generic constant, never to the input.
+    const std::string generic = connect_failure_cause("weird\nforged line s3cr3tfrag");
+    CHECK(generic.find("s3cr3tfrag") == std::string::npos);
+    CHECK(generic.find('\n') == std::string::npos);
+}

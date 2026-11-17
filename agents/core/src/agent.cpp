@@ -41,6 +41,7 @@ __declspec(allocate(".CRT$XCB"))
 // Generated protobuf/gRPC headers (flat output from YuzuProto.cmake)
 #include "agent.grpc.pb.h"
 #include "guaranteed_state.pb.h"
+#include "session_log_fingerprint.hpp" // F50: the session id is a bearer credential; log a fingerprint only
 
 // Local-only helper, exposed for unit testing.
 #include "plugin_config_sync.hpp"
@@ -2273,7 +2274,8 @@ public:
                     }
                     plugin_ctx_.config["agent.grpc_channel_state"] = state_str;
                 }
-                spdlog::info("Registered with server (session={}, enrollment={})", session_id_,
+                spdlog::info("Registered with server (session_fp={}, enrollment={})",
+                             session_log_fingerprint(session_id_),
                              enrollment_status.empty() ? "enrolled" : enrollment_status);
 
                 // Mark Guardian as network-connected. PR 4 will use this hook to

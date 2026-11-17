@@ -23,8 +23,8 @@
  *     a well-formed UTF-8 sequence (no overlong form, no surrogate, nothing above U+10FFFF, the
  *     exact set PostgreSQL's UTF8 accepts) passes through, EXCEPT these, which fold to ONE '_' per
  *     code point: all 32 C1 controls U+0080-U+009F (`C2 80`..`C2 9F`), LINE SEPARATOR U+2028
- *     (`E2 80 A8`) and PARAGRAPH SEPARATOR U+2029 (`E2 80 A9`). That is a SUPERSET of
- *     log_key_token's three folds (NEL U+0085, U+2028, U+2029). Only those three are line breaks
+ *     (`E2 80 A8`) and PARAGRAPH SEPARATOR U+2029 (`E2 80 A9`). That is the same
+ *     non-ASCII fold set as log_key_token's (the C1 block, U+2028, U+2029). Only NEL, U+2028, U+2029 are line breaks
  *     to a splitlines()-style reader (Python's str.splitlines(), used by the evidence readers);
  *     the other 31 C1 controls are folded as controls, not as line breaks. A byte
  *     that is not part of a well-formed sequence (a stray continuation byte, an overlong or
@@ -46,8 +46,9 @@
  *     above, it must NOT mangle spaces or non-ASCII bytes -- a real Windows path like
  *     `C:\Program Files\...` or a legitimate non-ASCII name must survive unchanged wherever
  *     possible, which is exactly why log_token/log_id_token are wrong for this use (both map
- *     space to '_'). It maps only control bytes, DEL, and three UTF-8 byte sequences to '_':
- *     NEL (U+0085, `C2 85`), LINE SEPARATOR (U+2028, `E2 80 A8`) and PARAGRAPH SEPARATOR
+ *     space to '_'). It maps only control bytes, DEL, and these UTF-8 byte sequences to '_': every
+ *     C1 control U+0080-U+009F (`C2 80`..`C2 9F`, one '_' per code point, so the 8-bit CSI/OSC
+ *     forms cannot reach a terminal), including NEL (U+0085, `C2 85`), LINE SEPARATOR (U+2028, `E2 80 A8`) and PARAGRAPH SEPARATOR
  *     (U+2029, `E2 80 A9`) -- folded even though they are otherwise-passable bytes >= 0x80,
  *     because Python's str.splitlines(), used by the driver script that reads agent logs as
  *     evidence, treats those three code points as line breaks exactly like '\n'; leaving them
@@ -197,8 +198,11 @@ namespace detail {
     folded.reserve(s.size());
     for (std::size_t i = 0; i < s.size();) {
         const unsigned char c = static_cast<unsigned char>(s[i]);
-        // NEL, U+0085, UTF-8 `C2 85`.
-        if (c == 0xC2 && i + 1 < s.size() && static_cast<unsigned char>(s[i + 1]) == 0x85) {
+        // The whole C1 block U+0080-U+009F, UTF-8 `C2 80`..`C2 9F`, one '_' per code point: NEL
+        // (U+0085) is a line break to splitlines(), and CSI (U+009B), OSC (U+009D), DCS (U+0090)
+        // and ST (U+009C) are the 8-bit forms of the ESC sequences folded below (F71).
+        if (c == 0xC2 && i + 1 < s.size() && static_cast<unsigned char>(s[i + 1]) >= 0x80 &&
+            static_cast<unsigned char>(s[i + 1]) <= 0x9F) {
             folded.push_back('_');
             i += 2;
             continue;

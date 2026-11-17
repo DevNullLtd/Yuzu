@@ -457,12 +457,12 @@ TEST_CASE("PgPool logs a connect failure's libpq text on one line",
     cap.stop();
     CHECK_FALSE(static_cast<bool>(lease));
 
-    // Precondition: the raw libpq text the pool reports ends in a newline, so without the wrap
-    // that newline would add a second physical line and the line-count check below would fail.
-    // The tab check at the end is a bonus where libpq adds a tab-indented hint; it is not
-    // required to have fired.
+    // F56: the pool reports a FIXED cause, never libpq's raw text (which quotes the parsed
+    // host/port/dbname and can carry part of a URI password). One line, no DSN fragment.
     const std::string raw = pool.last_error();
-    REQUIRE(raw.find('\n') != std::string::npos);
+    REQUIRE_FALSE(raw.empty());
+    CHECK(raw.find('\n') == std::string::npos);
+    CHECK(raw.find("yuzu_test_pg_") == std::string::npos);
 
     const std::string text = cap.text();
     const std::string marker = "PgPool: connection attempt failed:";

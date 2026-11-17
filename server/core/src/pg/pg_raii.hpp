@@ -12,6 +12,7 @@
 /// substrate code and every future Postgres-backed store use.
 
 #include <libpq-fe.h>
+#include <string_view>
 
 namespace yuzu::server::pg {
 
@@ -60,6 +61,39 @@ public:
 private:
     PGresult* r_{nullptr};
 };
+
+/// Map libpq's connect-failure text to a FIXED, credential-free cause (F56, CWE-532). The raw
+/// `PQerrorMessage` of a failed connect quotes the host, port and dbname libpq parsed out of the
+/// DSN, and a URI DSN whose password holds an unescaped '/' or '@' parses cleanly with part of
+/// the password landing in one of those fields -- so the raw text must never reach a log line or
+/// `last_error()`. The text is inspected only to pick one of these constants; nothing from it is
+/// ever copied out. Substring matching on libpq's stable phrases; anything unrecognised falls to
+/// the generic cause. ASCII, one line.
+[[nodiscard]] inline const char* connect_failure_cause(std::string_view err) noexcept {
+    const auto has = [&](std::string_view needle) { return err.find(needle) != std::string_view::npos; };
+    if (has("password authentication failed") || has("authentication failed") ||
+        has("no password supplied") || has("password retrieved from file"))
+        return "authentication failed (credentials rejected or missing)";
+    if (has("no pg_hba.conf entry"))
+        return "refused by server access rules (no matching pg_hba.conf entry)";
+    if (has("could not translate host name") || has("Name or service not known") ||
+        has("Temporary failure in name resolution"))
+        return "host name could not be resolved";
+    if (has("timeout expired") || has("timed out"))
+        return "connection timed out";
+    if (has("Connection refused") || has("No such file or directory") ||
+        has("Is the server running"))
+        return "server not reachable (connection refused or no such socket)";
+    if (has("SSL") || has("TLS") || has("certificate"))
+        return "TLS negotiation or certificate verification failed";
+    if (has("does not exist"))
+        return "database or role does not exist";
+    if (has("starting up") || has("shutting down") || has("too many clients"))
+        return "server not accepting connections (starting, stopping or full)";
+    if (has("out of memory"))
+        return "out of memory";
+    return "connection failed (details withheld; check host, port and credentials)";
+}
 
 /// RAII owner for a `PGconn*`. `PQfinish` runs on scope exit. Move-only.
 ///

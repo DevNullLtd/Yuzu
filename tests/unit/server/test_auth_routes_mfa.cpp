@@ -36,6 +36,7 @@
 #include "pg/pg_pool.hpp"
 #include "test_approver_route_fixture.hpp" // the real approval routes behind the real approver gate
 #include "test_route_sink.hpp"
+#include "../test_log_capture.hpp" // F20: LogCapture / stray_control_bytes
 #include "../../../server/core/src/totp.hpp"
 #include "test_auth_db_pg_helper.hpp"
 #include "test_forced_csprng_failure.hpp"
@@ -1542,6 +1543,28 @@ TEST_CASE("POST /login: N bad passwords locks the account, applied audit fires o
     CHECK(h.count_audits("auth.login", "alice") == 0);
     // Still exactly one applied row — the blocked attempt does not re-audit.
     CHECK(h.count_audits("auth.lockout.applied", "alice") == 1);
+}
+
+TEST_CASE("POST /login: a malformed username never forges a log line (F20)",
+          "[pg][mfa][routes][auth_routes][lockout][log_injection]") {
+    AuthRoutesHarness h;
+    h.cfg.auth_lockout_threshold = 3;
+    h.cfg.auth_lockout_window_secs = 900;
+
+    yuzu::test::LogCapture cap{spdlog::level::warn};
+    // %0A / %1B / %C2%9B decode to LF, ESC and the C1 CSI: AuthDB refuses the name as
+    // InvalidUsername and the failure log used to echo it raw.
+    auto r = h.sink.Post("/login",
+                         "username=bob%0A%5BWARN%5D%20forged%1B%5B2J%C2%9B31m&password=wrong",
+                         "application/x-www-form-urlencoded");
+    cap.stop();
+    REQUIRE(r);
+    CHECK(r->status == 401);
+    const std::string text = cap.text();
+    INFO(text);
+    CHECK(text.find("forged") != std::string::npos); // the line is still emitted, neutralised
+    CHECK(yuzu::test::stray_control_bytes(text) == 0);
+    CHECK(text.find("\xC2\x9B") == std::string::npos);
 }
 
 TEST_CASE("POST /login: locked-account 401 body is shape-identical to a bad-password 401 (no oracle)",

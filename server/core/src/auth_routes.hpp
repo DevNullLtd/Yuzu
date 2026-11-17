@@ -59,6 +59,14 @@ namespace detail {
 /// HTML-safe.
 std::string sanitize_detail_value(std::string_view v);
 
+/// Neutralise a SamlProvider::validate_response error for the log line AND the
+/// `auth.saml_login_failed` audit detail / event (F72, CWE-117). The text embeds values read
+/// from the posted XML (the unsigned samlp:StatusCode/@Value, the Assertion ID), and an XML
+/// character reference such as `&#10;` decodes to a real line feed. Folds CR/LF/C0/C1 and the
+/// Unicode line separators (yuzu::log_key_token, which also caps the length), then the
+/// audit-detail delimiters (sanitize_detail_value).
+std::string neutralise_saml_error(std::string_view err);
+
 } // namespace detail
 
 struct Config;
