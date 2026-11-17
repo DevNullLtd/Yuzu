@@ -1470,19 +1470,17 @@ public:
             // Skip the open while the space is still short: every open runs a whole-file
             // integrity_check first, which a full-disk agent would repeat for nothing. The need is
             // the migration's own: twice the file plus its write-ahead log.
-            const auto wal = yuzu::echo::wal_file_bytes(db_path_).value_or(0);
+            const auto wal = static_cast<std::uintmax_t>(
+                yuzu::echo::wal_file_bytes(db_path_).value_or(0));
             std::error_code space_ec;
             const auto space = std::filesystem::space(db_path_.parent_path(), space_ec);
-            if (!space_ec && yuzu::echo::free_space_still_short(space.available, file_bytes,
-                                                                static_cast<std::uintmax_t>(wal))) {
+            if (!space_ec && yuzu::echo::free_space_still_short(space.available, file_bytes, wal)) {
                 // The figures are this attempt's own, not the first refusal's: the free space
                 // changes between attempts and `status` shows this text.
                 go_offline(yuzu::echo::OfflineReason::free_space,
-                           std::format("{} the Echo database to its roll-up tables: {} bytes are "
-                                       "free; twice the {}-byte database file plus its {}-byte log "
-                                       "are needed",
+                           std::format("{}: {} bytes free, {} needed",
                                        yuzu::echo::kFreeSpaceRefusalPrefix, space.available,
-                                       file_bytes, wal),
+                                       2 * file_bytes + wal),
                            attempt);
                 return false;
             }
