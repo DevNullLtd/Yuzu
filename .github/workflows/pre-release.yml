@@ -2,7 +2,16 @@ name: Pre-release QA
 
 # Runs after a release workflow completes, or manually for any tag.
 on:
-  workflow_run:
+  # workflow_run is safe HERE (zizmor dangerous-triggers reviewed 2026-11-17,
+  # S11): the only workflow it listens to is Release, which runs solely on a
+  # `v*` tag push or a workflow_dispatch, both needing write access, so no
+  # fork or pull request can start the triggering run. Every job checks out
+  # this repository's default branch (never the triggering run's head), and
+  # reads the triggering run only for its conclusion and head_branch (the
+  # tag), which `resolve` binds through env and shape-checks before use. It
+  # downloads the PUBLISHED release assets, verified against SHA256SUMS,
+  # never the triggering run's artifacts.
+  workflow_run:  # zizmor: ignore[dangerous-triggers]
     workflows: ["Release"]
     types: [completed]
   workflow_dispatch:
