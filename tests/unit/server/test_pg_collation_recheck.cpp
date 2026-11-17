@@ -657,6 +657,40 @@ TEST_CASE("PgCollationRecheck: an unsettled state is rechecked sooner than the h
     }
 }
 
+// Review of #8108, item 5. `report_collation_check` stores the gate BEFORE the metric and log work,
+// so a throw in that work leaves the recheck state behind the gate: the state still says Ok (hourly)
+// while the gate already reads Mismatch. The cadence must follow the gate too, or a replica that
+// just detected a mismatch waits up to an hour. That lag is built directly here (a gate that
+// disagrees with the seeded state), because the report's own work cannot be made to throw from a
+// test. Kills: a `next_wait` that reads only `state_`.
+TEST_CASE("PgCollationRecheck: a gate that is not Trusted keeps the recheck on the short interval "
+          "even when the state reads settled",
+          "[pg_collation][recheck][gate]") {
+    CollationState settled;
+    settled.last = CollationLast::Ok;
+
+    SECTION("gate Mismatch with state Ok: the short interval") {
+        ScriptedCheck check;
+        check.script = {CollationVerdict::Mismatch};
+        std::atomic<pg::CollationGate> gate{pg::CollationGate::Mismatch};
+        PgCollationRecheck recheck(check.fn(), nullptr, 1h, settled, 20ms, &gate);
+        recheck.start();
+        for (int i = 0; i < 500 && check.calls.load() < 1; ++i)
+            std::this_thread::sleep_for(10ms);
+        CHECK(check.calls.load() >= 1);
+        recheck.stop();
+    }
+    SECTION("control: gate Trusted with state Ok stays on the long interval") {
+        ScriptedCheck check;
+        std::atomic<pg::CollationGate> gate{pg::CollationGate::Trusted};
+        PgCollationRecheck recheck(check.fn(), nullptr, 1h, settled, 20ms, &gate);
+        recheck.start();
+        std::this_thread::sleep_for(300ms);
+        CHECK(check.calls.load() == 0);
+        recheck.stop();
+    }
+}
+
 // The documented repair, run for real. A forced mismatch sets the gauge to 1; then the statements
 // the runbook gives (REINDEX DATABASE CONCURRENTLY, ALTER DATABASE ... REFRESH COLLATION VERSION)
 // run against the throwaway database, and the recheck loop, with nothing faked after the first

@@ -86,8 +86,8 @@ public:
 
     /// `metrics` may be null and must outlive this object. `initial` is the state left by the
     /// constructor-time report. While the state is unsettled (last conclusive verdict Mismatch or
-    /// none yet, or the latest check unreadable) the loop waits `unsettled_interval` instead of
-    /// `interval` when that is shorter. `gate` (nullable, must outlive this object) is handed to
+    /// none yet, or the latest check unreadable, or the published `gate` is not Trusted) the loop
+    /// waits `unsettled_interval` instead of `interval` when that is shorter. `gate` (nullable, must outlive this object) is handed to
     /// `pg::report_collation_check` on every tick, so the published gate follows the same state
     /// machine; null publishes nothing.
     PgCollationRecheck(

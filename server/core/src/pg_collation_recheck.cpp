@@ -81,11 +81,15 @@ std::chrono::milliseconds PgCollationRecheck::next_wait() const {
     // Fast while the picture is unsettled: a standing Mismatch (the gauge must follow a repair
     // within a minute, not an hour), no conclusive verdict yet (the start-time check was
     // unreadable), or the latest check unreadable. Hourly only when the latest conclusive verdict
-    // is Ok or NotApplicable and the checks since have been readable.
-    bool unsettled = false;
+    // is Ok or NotApplicable and the checks since have been readable. The published gate counts
+    // too: `report_collation_check` stores it before the metric and log work, so a throw there
+    // leaves `state_` behind the gate (still Ok while the gate reads Mismatch), and a replica that
+    // just detected a mismatch must not then wait an hour to look again.
+    bool unsettled = gate_ != nullptr && gate_->load(std::memory_order_acquire) !=
+                                             pg::CollationGate::Trusted;
     {
         std::lock_guard<std::mutex> lk(state_mu_);
-        unsettled = state_.last == pg::CollationLast::Mismatch ||
+        unsettled = unsettled || state_.last == pg::CollationLast::Mismatch ||
                     state_.last == pg::CollationLast::None || state_.unreadable;
     }
     return unsettled ? std::min(interval_, unsettled_interval_) : interval_;
