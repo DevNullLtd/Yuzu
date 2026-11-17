@@ -1253,7 +1253,11 @@ public:
             if (pid_name_.size() >= kPidNameCap)
                 pid_name_.clear(); // wholesale flush, as the ETW consumer's cache does
         }
-        pid_name_[pid] = yuzu::echo::PidName{name, 0};
+        // The stream leg's image names are raw OS bytes; this map labels connection rows that
+        // are then diffed and dumped with replace, so keep it well-formed (see echo_wire_scrub.hpp).
+        std::string clean = name;
+        yuzu::echo::scrub_wire_strings(clean);
+        pid_name_[pid] = yuzu::echo::PidName{std::move(clean), 0};
     }
     // A stop never erases: loads and sockets of a just-exited process still resolve inside
     // kPidNameGraceSec, while a reused pid whose start was missed resolves to "" after it.
@@ -1780,10 +1784,10 @@ private:
             // #538: tcp's diff baseline lives under "network" (see diff_state_key).
             const std::string net_key{yuzu::echo::diff_state_key("tcp")};
             auto current = yuzu::echo::enumerate_connections();
-            yuzu::echo::scrub_wire_strings(current); // baseline round-trips losslessly
             // Label sockets the collector could not name (TIME_WAIT sockets have pid 0 and stay
             // unnamed; the rest resolve through the process source's pid -> name map).
             yuzu::echo::fill_process_names(current, pid_name_, ts);
+            yuzu::echo::scrub_wire_strings(current); // AFTER the fill: baseline round-trips losslessly
 
             // macOS (roadmap 2.2): nstat is the PRIMARY tcp lifecycle source
             // when the plugin's NstatClient is live and system-wide — its
