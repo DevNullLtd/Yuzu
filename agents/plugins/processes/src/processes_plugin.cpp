@@ -17,6 +17,7 @@
 
 #include <yuzu/agent/plugin_loader.hpp> // yuzu::agent::sha256_file
 #include <yuzu/plugin.hpp>
+#include <proc_access.hpp> // WP13 UP14: /proc refusal tally
 
 #include <algorithm>
 #include <array>
@@ -242,6 +243,25 @@ std::string resolve_exe_path(unsigned long) {
 }
 #endif
 
+// WP13 UP14: a non-root agent without CAP_SYS_PTRACE cannot readlink another user's
+// /proc/<pid>/exe (EACCES). The row is still emitted with empty path/hash, which is how
+// kernel threads render too, so declare the gap in the result status instead of leaving a
+// clean `OK` partial list. ENOENT/ESRCH (kernel threads, exited processes) are not counted.
+void note_exe_unreadable([[maybe_unused]] yuzu::shared::ProcAccessTally& tally,
+                         [[maybe_unused]] const std::string& path,
+                         [[maybe_unused]] unsigned long pid) {
+#if defined(__linux__)
+    if (path.empty())
+        yuzu::shared::note_exe_failure(tally, pid);
+#endif
+}
+
+void report_exe_gaps(yuzu::CommandContext& ctx, const yuzu::shared::ProcAccessTally& tally) {
+    if (tally.constrained())
+        ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              "processes:exe_unreadable");
+}
+
 // ABI4 capability declarations (#2204). All four actions call the same
 // enumerate_processes() (and, for the hashed/tree variants, resolve_exe_path
 // + sha256_file) — Linux (/proc), Windows (CreateToolhelp32Snapshot +
@@ -351,8 +371,10 @@ private:
         static constexpr std::size_t kMaxHashBytes = 512ull * 1024 * 1024; // 512 MiB cap
         auto procs = enumerate_processes();
         std::unordered_map<std::string, std::string> hash_cache; // path -> sha256
+        yuzu::shared::ProcAccessTally tally; // WP13 UP14
         for (const auto& p : procs) {
             std::string path = resolve_exe_path(p.pid);
+            note_exe_unreadable(tally, path, p.pid);
             std::string hash;
             if (!path.empty()) {
                 auto it = hash_cache.find(path);
@@ -366,6 +388,7 @@ private:
             ctx.write_output(std::format("proc|{}|{}|{}|{}|{}", p.pid, p.ppid,
                                          sanitize_field(p.name), hash, sanitize_field(path)));
         }
+        report_exe_gaps(ctx, tally);
         return 0;
     }
 
@@ -378,8 +401,10 @@ private:
         static constexpr std::size_t kMaxHashBytes = 512ull * 1024 * 1024; // 512 MiB cap
         auto procs = enumerate_processes();
         std::unordered_map<std::string, std::string> hash_cache; // path -> sha256
+        yuzu::shared::ProcAccessTally tally; // WP13 UP14
         for (const auto& p : procs) {
             std::string path = resolve_exe_path(p.pid);
+            note_exe_unreadable(tally, path, p.pid);
             std::string hash;
             if (!path.empty()) {
                 auto it = hash_cache.find(path);
@@ -393,6 +418,7 @@ private:
             ctx.write_output(std::format("proc|{}|{}|{}|{}", p.pid, sanitize_field(p.name), hash,
                                          sanitize_field(path)));
         }
+        report_exe_gaps(ctx, tally);
         return 0;
     }
 

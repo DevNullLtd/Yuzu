@@ -69,7 +69,12 @@ Pipe-delimited rows, one per process, in the fixed field order `pid|name|path|sh
 
 ### Result status
 
-This plugin does not set a typed result status; the agent records `UNDECLARED` and the sample shows `UNDECLARED / UNKNOWN /`.
+On Linux, `fetch` declare a typed status when the agent could not read another user's `/proc` entries (WP13 UP14). Otherwise the agent records `UNDECLARED` (every other leg and OS; a clean read).
+
+| Status | Completeness | Provenance | When |
+|---|---|---|---|
+| `UNDECLARED` (default) | UNKNOWN | (empty) | Every Windows and macOS run, and a Linux run where every process was readable. |
+| `CONSTRAINED` | PARTIAL | `procfetch:exe_unreadable` | The readlink of `/proc/<pid>/exe` was refused (EACCES/EPERM) for at least one process, so its `path` and `sha1` are empty. Rows are still emitted (a kernel thread also renders with an empty path), so the status, not the rows, says the list is incomplete. Grant `CAP_SYS_PTRACE` to the agent process only if that detail is needed; the packaged unit and the dev installer do not. |
 
 ### Where the data goes
 

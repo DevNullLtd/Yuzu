@@ -84,7 +84,12 @@ Pipe-delimited rows via `write_output()`, one line per process (or, for `query`,
 
 ### Result status
 
-This plugin does not set a typed result status; the agent records `UNDECLARED` and every sample shows `UNDECLARED / UNKNOWN / ` for all four actions on all three OSes (grep confirms no `set_result_status`/`yuzu_ctx_set_result_status` call anywhere in `processes_plugin.cpp`). A failed `enumerate_processes()` (e.g. `CreateToolhelp32Snapshot` or `opendir("/proc")` failing) silently returns zero rows with no distinguishing status — indistinguishable, on the wire, from a host with no processes.
+On Linux, `list_hashed` and `list_tree` declare a typed status when the agent could not read another user's `/proc` entries (WP13 UP14). Otherwise the agent records `UNDECLARED` (every other leg and OS; a clean read).
+
+| Status | Completeness | Provenance | When |
+|---|---|---|---|
+| `UNDECLARED` (default) | UNKNOWN | (empty) | Every Windows and macOS run, and a Linux run where every process was readable. |
+| `CONSTRAINED` | PARTIAL | `processes:exe_unreadable` | `list_hashed` and `list_tree` readlink of `/proc/<pid>/exe` was refused (EACCES/EPERM) for at least one process, so its `path` and `sha256` are empty. Rows are still emitted (a kernel thread also renders with an empty path), so the status, not the rows, says the list is incomplete. Grant `CAP_SYS_PTRACE` to the agent process only if that detail is needed; the packaged unit and the dev installer do not. |
 
 ### Where the data goes
 

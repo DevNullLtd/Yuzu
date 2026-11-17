@@ -22,6 +22,7 @@
  */
 
 #include <yuzu/plugin.hpp>
+#include <proc_access.hpp> // WP13 UP14: /proc refusal tally
 
 #include <cstdio>
 #include <filesystem>
@@ -142,6 +143,7 @@ std::string resolve_exe(const std::filesystem::path& link) {
 void enumerate_and_stream(yuzu::CommandContext& ctx) {
     std::unordered_map<std::string, std::string> sha_cache;
     std::error_code ec;
+    yuzu::shared::ProcAccessTally tally; // WP13 UP14
 
     for (const auto& entry : std::filesystem::directory_iterator("/proc", ec)) {
         if (!entry.is_directory(ec))
@@ -160,6 +162,8 @@ void enumerate_and_stream(yuzu::CommandContext& ctx) {
             continue;
 
         std::string exe_path = resolve_exe(entry.path() / "exe");
+        if (exe_path.empty())
+            yuzu::shared::note_exe_failure(tally, static_cast<unsigned long>(pid));
         std::string sha1;
         if (!exe_path.empty()) {
             std::error_code fe;
@@ -177,6 +181,11 @@ void enumerate_and_stream(yuzu::CommandContext& ctx) {
         ctx.write_output(
             std::format("{}|{}|{}|{}", pid, escape_pipes(name), escape_pipes(exe_path), sha1));
     }
+    // A refused /proc/<pid>/exe (no CAP_SYS_PTRACE) renders as an empty path/hash exactly as a
+    // kernel thread does; declare the gap instead of a clean OK list.
+    if (tally.constrained())
+        ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              "procfetch:exe_unreadable");
 }
 
 // -- macOS implementation -----------------------------------------------------

@@ -153,7 +153,20 @@
     }
   ],
   "readme": "agents/plugins/procfetch/README.md",
-  "result_status": [],
+  "result_status": [
+    {
+      "completeness": "UNKNOWN",
+      "provenance": "(empty)",
+      "status": "`UNDECLARED` (default)",
+      "when": "Every Windows and macOS run, and a Linux run where every process was readable."
+    },
+    {
+      "completeness": "PARTIAL",
+      "provenance": "`procfetch:exe_unreadable`",
+      "status": "`CONSTRAINED`",
+      "when": "The readlink of `/proc/<pid>/exe` was refused (EACCES/EPERM) for at least one process, so its `path` and `sha1` are empty. Rows are still emitted (a kernel thread also renders with an empty path), so the status, not the rows, says the list is incomplete. Grant `CAP_SYS_PTRACE` to the agent process only if that detail is needed; the packaged unit and the dev installer do not."
+    }
+  ],
   "samples": {
     "linux": {
       "actions": [

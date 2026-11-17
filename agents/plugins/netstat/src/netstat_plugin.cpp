@@ -65,6 +65,7 @@
 #endif
 
 #include "netstat_parsers.hpp" // yuzu::netstat::escape_pipes -- pure, unit-tested (test_netstat_parsers.cpp)
+#include <proc_access.hpp>     // WP13 UP14: refusal tally (CAP_SYS_PTRACE-less /proc reads)
 
 namespace {
 
@@ -144,7 +145,7 @@ uint16_t parse_hex_port(std::string_view hex) {
 // shape during this branch's governance gate-3 cpp-safety review -- fixed
 // here to match its sibling rather than leaving one of the two /proc
 // walkers unRAII'd in the same file.
-std::unordered_map<uint64_t, int> build_inode_to_pid_map() {
+std::unordered_map<uint64_t, int> build_inode_to_pid_map(yuzu::shared::ProcAccessTally& tally) {
     std::unordered_map<uint64_t, int> map;
 
     const std::unique_ptr<DIR, int (*)(DIR*)> proc_dir{opendir("/proc"), &closedir};
@@ -160,9 +161,12 @@ std::unordered_map<uint64_t, int> build_inode_to_pid_map() {
             continue;
 
         std::string fd_path = std::format("/proc/{}/fd", pid);
+        errno = 0;
         const std::unique_ptr<DIR, int (*)(DIR*)> fd_dir{opendir(fd_path.c_str()), &closedir};
-        if (!fd_dir)
+        if (!fd_dir) {
+            tally.note(errno); // another user's process without CAP_SYS_PTRACE: unattributable
             continue;
+        }
 
         char link_buf[128];
         struct dirent* fd_entry = nullptr;
@@ -249,13 +253,24 @@ void parse_proc_net_file(const char* path, std::string_view proto,
     }
 }
 
+// WP13 UP14: a walk that could not read another user's /proc/<pid>/fd lists every socket but
+// leaves those rows' pid blank; say so (CONSTRAINED/PARTIAL) instead of presenting it as a clean,
+// complete attribution.
+void report_attribution_gaps(yuzu::CommandContext& ctx, const yuzu::shared::ProcAccessTally& t) {
+    if (t.constrained())
+        ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              "netstat:proc_fd_unreadable");
+}
+
 void enumerate_and_stream(yuzu::CommandContext& ctx) {
-    auto inode_map = build_inode_to_pid_map();
+    yuzu::shared::ProcAccessTally tally;
+    auto inode_map = build_inode_to_pid_map(tally);
 
     parse_proc_net_file("/proc/net/tcp", "tcp", inode_map, ctx, true, false);
     parse_proc_net_file("/proc/net/tcp6", "tcp6", inode_map, ctx, true, true);
     parse_proc_net_file("/proc/net/udp", "udp", inode_map, ctx, false, false);
     parse_proc_net_file("/proc/net/udp6", "udp6", inode_map, ctx, false, true);
+    report_attribution_gaps(ctx, tally);
 }
 
 // -- attribution: /proc inode→pid + pid→process enrichment (ex-sockwho) -----
@@ -277,7 +292,8 @@ struct ProcInfo {
 // for the life of the agent (CLAUDE.md's non-RAII-manual-cleanup floor).
 // Same idiom as echo_proc_perf.cpp's read_proc_counters().
 void build_socket_and_proc_maps(std::unordered_map<uint64_t, int>& inode_map,
-                                std::unordered_map<int, ProcInfo>& proc_map) {
+                                std::unordered_map<int, ProcInfo>& proc_map,
+                                yuzu::shared::ProcAccessTally& tally) {
     const std::unique_ptr<DIR, int (*)(DIR*)> proc_dir{opendir("/proc"), &closedir};
     if (!proc_dir)
         return;
@@ -308,9 +324,12 @@ void build_socket_and_proc_maps(std::unordered_map<uint64_t, int>& inode_map,
             proc_map.emplace(pid, std::move(info));
 
         std::string fd_path = proc_path + "/fd";
+        errno = 0;
         const std::unique_ptr<DIR, int (*)(DIR*)> fd_dir{opendir(fd_path.c_str()), &closedir};
-        if (!fd_dir)
+        if (!fd_dir) {
+            tally.note(errno);
             continue;
+        }
 
         char link_buf[128];
         struct dirent* fd_entry = nullptr;
@@ -399,12 +418,14 @@ void parse_proc_net_file_attributed(const char* path, std::string_view proto,
 void enumerate_and_stream_attribution(yuzu::CommandContext& ctx) {
     std::unordered_map<uint64_t, int> inode_map;
     std::unordered_map<int, ProcInfo> proc_map;
-    build_socket_and_proc_maps(inode_map, proc_map);
+    yuzu::shared::ProcAccessTally tally;
+    build_socket_and_proc_maps(inode_map, proc_map, tally);
 
     parse_proc_net_file_attributed("/proc/net/tcp", "tcp", inode_map, proc_map, ctx, true, false);
     parse_proc_net_file_attributed("/proc/net/tcp6", "tcp6", inode_map, proc_map, ctx, true, true);
     parse_proc_net_file_attributed("/proc/net/udp", "udp", inode_map, proc_map, ctx, false, false);
     parse_proc_net_file_attributed("/proc/net/udp6", "udp6", inode_map, proc_map, ctx, false, true);
+    report_attribution_gaps(ctx, tally);
 }
 
 // -- macOS implementation -----------------------------------------------------

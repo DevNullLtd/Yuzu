@@ -94,7 +94,12 @@ Pipe-delimited rows, one per socket, written via `ctx.write_output()`. `netstat_
 
 ### Result status
 
-This plugin does not set a typed result status; the agent records `UNDECLARED` and the sample shows `UNDECLARED / UNKNOWN /` (no `set_result_status`/`yuzu_ctx_set_result_status` call anywhere in `netstat_plugin.cpp`).
+On Linux, `list` and `attribution` declare a typed status when the agent could not read another user's `/proc` entries (WP13 UP14). Otherwise the agent records `UNDECLARED` (every other leg and OS; a clean read).
+
+| Status | Completeness | Provenance | When |
+|---|---|---|---|
+| `UNDECLARED` (default) | UNKNOWN | (empty) | Every Windows and macOS run, and a Linux run where every process was readable. |
+| `CONSTRAINED` | PARTIAL | `netstat:proc_fd_unreadable` | `/proc/<pid>/fd` could not be opened (EACCES/EPERM) for at least one process, so sockets owned by it carry no `pid` (and, for `attribution`, no process name or path). Rows are still emitted (a kernel thread also renders with an empty path), so the status, not the rows, says the list is incomplete. Grant `CAP_SYS_PTRACE` to the agent process only if that detail is needed; the packaged unit and the dev installer do not. |
 
 ### Where the data goes
 
