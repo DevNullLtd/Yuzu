@@ -33,7 +33,6 @@
 #include <map>
 #include <sstream>
 #include <string>
-#include <optional>
 #include <string_view>
 #include <vector>
 
@@ -44,6 +43,7 @@
 #include <pwd.h>
 #include <shadow.h>
 #include <utmp.h>
+#include "users_group_lookup.hpp" // reentrant getgrnam_r/getpwuid_r copies (F40)
 #endif
 
 #if defined(__APPLE__)
@@ -857,69 +857,35 @@ int do_local_users(yuzu::CommandContext& ctx) {
     return 0;
 }
 
-#ifdef __linux__
-// Reentrant, value-semantics group/passwd lookups (F40). getgrnam()/getpwuid() return pointers
-// into one libc static buffer that any concurrent dispatch-pool thread rewrites, so the result is
-// copied into owned strings before anything else runs. Buffer grows on ERANGE, bounded.
-struct GroupCopy {
-    unsigned gid = 0;
-    std::vector<std::string> members;
-};
-
-std::optional<GroupCopy> lookup_group_copy(const char* name) {
-    std::vector<char> buf(4096);
-    for (;;) {
-        struct group grp{};
-        struct group* res = nullptr;
-        const int rc = getgrnam_r(name, &grp, buf.data(), buf.size(), &res);
-        if (rc == ERANGE && buf.size() < (1u << 20)) {
-            buf.resize(buf.size() * 2);
-            continue;
-        }
-        if (rc != 0 || !res)
-            return std::nullopt;
-        GroupCopy out;
-        out.gid = static_cast<unsigned>(res->gr_gid);
-        for (char** m = res->gr_mem; m && *m; ++m)
-            out.members.emplace_back(*m);
-        return out;
-    }
-}
-
-std::optional<std::string> lookup_user_name(uid_t uid) {
-    std::vector<char> buf(4096);
-    for (;;) {
-        struct passwd pw{};
-        struct passwd* res = nullptr;
-        const int rc = getpwuid_r(uid, &pw, buf.data(), buf.size(), &res);
-        if (rc == ERANGE && buf.size() < (1u << 20)) {
-            buf.resize(buf.size() * 2);
-            continue;
-        }
-        if (rc != 0 || !res)
-            return std::nullopt;
-        return std::string(res->pw_name);
-    }
-}
-#endif
-
 // ── local_admins action ───────────────────────────────────────────────────
 
 int do_local_admins(yuzu::CommandContext& ctx) {
 #ifdef __linux__
     // Check sudo and wheel groups
+    // A group that does not exist is a definite answer and is skipped. A lookup that FAILED is
+    // not: the list would be silently smaller, so the result is declared CONSTRAINED/PARTIAL.
+    bool lookup_failed = false;
     for (const char* group_name : {"sudo", "wheel"}) {
-        auto grp = lookup_group_copy(group_name);
-        if (!grp)
+        const auto grp = yuzu::users::lookup_group_copy(group_name);
+        if (grp.status == yuzu::users::LookupStatus::kError) {
+            lookup_failed = true;
             continue;
-        for (const auto& member : grp->members) {
+        }
+        if (grp.status != yuzu::users::LookupStatus::kOk)
+            continue;
+        for (const auto& member : grp.group.members) {
             ctx.write_output(std::format("admin|{}|user|{}", member, group_name));
         }
     }
     // Also check root (uid 0) in /etc/passwd
-    if (auto root_name = lookup_user_name(0)) {
-        ctx.write_output(std::format("admin|{}|user|root", *root_name));
-    }
+    const auto root = yuzu::users::lookup_user_name(0);
+    if (root.status == yuzu::users::LookupStatus::kOk)
+        ctx.write_output(std::format("admin|{}|user|root", root.name));
+    else if (root.status == yuzu::users::LookupStatus::kError)
+        lookup_failed = true;
+    if (lookup_failed)
+        ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              "linux:users:local_admins:lookup_failed");
 
 #elif defined(__APPLE__)
     bool status_forwarded = false;
@@ -1016,11 +982,19 @@ int do_group_members(yuzu::CommandContext& ctx, yuzu::Params params) {
     }
 
 #ifdef __linux__
-    auto grp = lookup_group_copy(std::string(group_name).c_str());
-    if (!grp) {
+    const auto lookup = yuzu::users::lookup_group_copy(std::string(group_name).c_str());
+    if (lookup.status == yuzu::users::LookupStatus::kError) {
+        // A failed lookup is not "not found": say so, and declare the result degraded.
+        ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              "linux:users:group_members:lookup_failed");
+        ctx.write_output(std::format("group_member|error|Group lookup failed: {}", group_name));
+        return 1;
+    }
+    if (lookup.status != yuzu::users::LookupStatus::kOk) {
         ctx.write_output(std::format("group_member|error|Group not found: {}", group_name));
         return 1;
     }
+    const auto* grp = &lookup.group;
     for (const auto& member : grp->members) {
         ctx.write_output(std::format("group_member|{}|{}|user", member, group_name));
     }
@@ -1488,7 +1462,7 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "local_admins",
         /* .linux_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 1, "getgrnam(sudo/wheel) + getpwuid(0)", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "getgrnam_r(sudo/wheel) + getpwuid_r(0)", nullptr},
         /* .macos_leg   = */
         {YUZU_SUPPORT_SUPPORTED, 2,
          "runner argv 'dscl . -read /Groups/admin GroupMembership'", nullptr},
@@ -1498,7 +1472,7 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "group_members",
         /* .linux_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 1, "getgrnam + /etc/passwd primary-group scan", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "getgrnam_r + /etc/passwd primary-group scan", nullptr},
         /* .macos_leg   = */
         {YUZU_SUPPORT_SUPPORTED, 2,
          "runner argv 'dscl . -read /Groups/<name> GroupMembership'", nullptr},

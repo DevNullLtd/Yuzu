@@ -35,6 +35,7 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -386,28 +387,30 @@ using DnsGetCacheDataTableFn = BOOL(WINAPI*)(yuzu::shared::DnsCacheNode**);
 
 /// Snapshot the names in the Windows DNS resolver cache ONCE per command (F66). The table is
 /// caller-owned, so it is copied into owned strings and released at once (DnsCacheTableOwner)
-/// rather than held across the per-domain matching or re-fetched for each domain. An unavailable
-/// API or failed call yields an empty snapshot, i.e. nothing is found, as before.
-std::vector<std::wstring> read_dns_cache_names() {
-    struct Api {
-        HMODULE mod = nullptr;
-        DnsGetCacheDataTableFn fn = nullptr;
-    };
-    static const Api api = []() -> Api {
-        Api a;
-        a.mod = LoadLibraryA("dnsapi.dll"); // never unloaded: pinned for the process
-        if (a.mod)
-            a.fn = reinterpret_cast<DnsGetCacheDataTableFn>(
-                reinterpret_cast<void*>(GetProcAddress(a.mod, "DnsGetCacheDataTable")));
-        return a;
-    }();
-
+/// rather than held across the per-domain matching or re-fetched for each domain.
+///
+/// nullopt = the cache COULD NOT BE READ (dnsapi.dll will not load, the export is missing, or the
+/// call returned FALSE): the caller must say so, never report "not in cache". An empty vector is a
+/// real answer (the call succeeded and the cache is empty). The module is loaded per command and
+/// released by the guard, so a failure is never cached for the life of the process.
+std::optional<std::vector<std::wstring>> read_dns_cache_names() {
+    struct Module {
+        HMODULE h = LoadLibraryA("dnsapi.dll");
+        ~Module() {
+            if (h)
+                FreeLibrary(h);
+        }
+    } mod; // declared before `table`, so it is destroyed AFTER the owner that calls DnsFree
+    if (!mod.h)
+        return std::nullopt;
+    const auto fn = reinterpret_cast<DnsGetCacheDataTableFn>(
+        reinterpret_cast<void*>(GetProcAddress(mod.h, "DnsGetCacheDataTable")));
+    if (!fn)
+        return std::nullopt;
+    yuzu::shared::DnsCacheTableOwner table(mod.h);
+    if (!fn(table.out()))
+        return std::nullopt;
     std::vector<std::wstring> names;
-    if (!api.fn)
-        return names;
-    yuzu::shared::DnsCacheTableOwner table(api.mod);
-    if (!api.fn(table.out()))
-        return names;
     std::size_t nodes = 0;
     for (auto* entry = table.head(); entry != nullptr; entry = entry->pNext) {
         if (++nodes > yuzu::shared::kDnsCacheNodeWalkCap)
@@ -590,7 +593,14 @@ void check_ip_addresses(yuzu::CommandContext& ctx, const std::vector<std::string
 
 void check_domains(yuzu::CommandContext& ctx, const std::vector<std::string>& domains) {
 #ifdef _WIN32
-    const auto cache_names = read_dns_cache_names(); // one snapshot for every requested domain
+    // One snapshot for every requested domain. If the cache cannot be read, say so (CONSTRAINED
+    // + a detail on every row): "not in cache" would be a false clean answer.
+    const auto cache_snapshot = read_dns_cache_names();
+    const std::vector<std::wstring> no_names;
+    const auto& cache_names = cache_snapshot ? *cache_snapshot : no_names;
+    if (!cache_snapshot)
+        ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              "windows:ioc:dns_cache_unreadable");
 #endif
     for (const auto& domain : domains) {
 #ifdef _WIN32
@@ -604,7 +614,9 @@ void check_domains(yuzu::CommandContext& ctx, const std::vector<std::string>& do
                 }
             }
         }
-        std::string detail = found ? "Found in DNS resolver cache" : "Not in DNS cache";
+        std::string detail = found ? "Found in DNS resolver cache"
+                             : !cache_snapshot ? "DNS resolver cache could not be read"
+                                               : "Not in DNS cache";
         ctx.write_output(std::format("domain|{}|{}|{}", escape_pipes(domain),
                                      found ? "true" : "false", escape_pipes(detail)));
 #else

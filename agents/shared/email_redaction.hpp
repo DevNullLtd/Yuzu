@@ -55,7 +55,7 @@ inline constexpr std::string_view kRedactedEmailPlaceholder = "[redacted-email]"
 /// each followed by an unterminated '(' costs ~n^2/4 steps (minutes at the 1 MiB Local State
 /// read cap). No e-mail address is anywhere near `kEmailScanMaxBytes` (RFC 5321 caps one at 254),
 /// so a LONGER value that contains an '@' is reported as a match WITHOUT scanning: over-match is
-/// the documented safe direction, and this keeps the filter's worst case linear.
+/// the documented safe direction. The scan that remains is bounded: at most ~1 KiB squared steps.
 inline constexpr std::size_t kEmailScanMaxBytes = 1024;
 
 [[nodiscard]] inline bool looks_like_email_address(std::string_view value) {

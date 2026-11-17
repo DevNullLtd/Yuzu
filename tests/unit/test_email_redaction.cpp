@@ -42,3 +42,17 @@ TEST_CASE("email_redaction: the length cap does not redact a long value with no 
         std::string(yuzu::shared::kEmailScanMaxBytes + 1, 'x')));
     CHECK(yuzu::shared::looks_like_email_address("a@example.com"));
 }
+
+// Boundary of the cost cap: exactly kEmailScanMaxBytes is still scanned (and a plain long value
+// with no '@' stays unredacted); one byte over, with an '@', over-matches without scanning.
+TEST_CASE("email_redaction: the cap boundary is exact", "[email_redaction]") {
+    const auto n = yuzu::shared::kEmailScanMaxBytes;
+    // An '@' with no domain ("x@") is NOT an address, so it only matches if the cap fires.
+    std::string at_cap(n - 1, 'x');
+    at_cap += '@'; // size == n: scanned, no domain after '@' -> no match
+    REQUIRE(at_cap.size() == n);
+    CHECK_FALSE(yuzu::shared::looks_like_email_address(at_cap));
+    std::string over_cap = at_cap;
+    over_cap += 'x'; // size == n + 1 and contains '@': over-matches
+    CHECK(yuzu::shared::looks_like_email_address(over_cap));
+}

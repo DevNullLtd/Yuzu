@@ -9,17 +9,21 @@
  *
  * DnsFree is resolved with GetProcAddress from the module the caller already loaded, so no plugin
  * gains a link-time dependency on dnsapi.lib. If it cannot be resolved the list is left alone (a
- * bounded leak is safer than freeing with the wrong allocator). The walk is bounded by a node
- * ceiling, like the echo collector's, so a corrupted or cyclic pNext cannot loop forever; past the
- * ceiling the remaining nodes leak rather than risk an unbounded loop.
+ * bounded leak is safer than freeing with the wrong allocator). The walk itself (node ceiling, and
+ * a stop at the first node or name seen twice so a cyclic or shared-node list is never freed
+ * twice) is the portable, unit-tested `release_dns_cache_list` in dns_cache_list.hpp.
  *
- * COMPILED ONLY ON WINDOWS: not built on the Linux dev host (see the WP12 hand-back).
+ * COMPILED ONLY ON WINDOWS (checked with MSVC 14.44 on a Windows 11 host; the portable walk is
+ * also covered by a unit test that runs everywhere).
  */
 #pragma once
 
 #ifdef _WIN32
 
 #include <cstddef>
+#include <type_traits>
+
+#include <dns_cache_list.hpp> // portable walk + kDnsCacheNodeWalkCap
 
 #include <windows.h> // must precede windns.h
 
@@ -35,9 +39,6 @@ struct DnsCacheNode {
     WORD wDataLength;
     DWORD dwFlags;
 };
-
-/// Ceiling on nodes walked/freed, far above any real resolver cache (same figure as echo).
-inline constexpr std::size_t kDnsCacheNodeWalkCap = 65536;
 
 class DnsCacheTableOwner {
 public:
@@ -62,24 +63,23 @@ public:
     DnsCacheNode* head() const noexcept { return head_; }
 
     void release() noexcept {
-        DnsCacheNode* p = head_;
+        DnsCacheNode* head = head_;
         head_ = nullptr;
         if (!free_fn_)
             return;
-        std::size_t nodes = 0;
-        while (p && ++nodes <= kDnsCacheNodeWalkCap) {
-            DnsCacheNode* next = p->pNext;
-            if (p->pszName)
-                free_fn_(p->pszName, DnsFreeFlat);
-            free_fn_(p, DnsFreeFlat);
-            p = next;
-        }
+        release_dns_cache_list(head, [this](void* p) { free_fn_(p, DnsFreeFlat); });
     }
 
 private:
     DnsCacheNode* head_ = nullptr;
     DnsFreeFn free_fn_ = nullptr;
 };
+
+static_assert(!std::is_copy_constructible_v<DnsCacheTableOwner> &&
+                  !std::is_move_constructible_v<DnsCacheTableOwner> &&
+                  !std::is_copy_assignable_v<DnsCacheTableOwner> &&
+                  !std::is_move_assignable_v<DnsCacheTableOwner>,
+              "DnsCacheTableOwner owns a foreign list: it must be neither copied nor moved");
 
 } // namespace yuzu::shared
 

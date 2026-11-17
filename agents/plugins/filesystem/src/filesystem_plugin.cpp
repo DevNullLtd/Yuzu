@@ -41,6 +41,7 @@
 
 #include "filesystem_acl_parsers.hpp"
 #include "filesystem_find_by_hash.hpp"
+#include "filesystem_posix_names.hpp"
 #include <atomic_file_write.hpp> // yuzu::shared::write_file_atomic
 #include <network_fstype.hpp>
 
@@ -464,12 +465,16 @@ yuzu::filesystem::find_by_hash::MountList find_by_hash_network_mounts(const std:
 
 #endif
 
-// ── Regex subject bound (F9 / CWE-674) ─────────────────────────────────
-// libstdc++'s std::regex executor recurses per matched character, so an unbounded subject
-// overflows the worker thread's stack (SIGSEGV is not catchable by the dispatch try/catch).
-// Operator-pattern regex runs only on subjects up to this size. This bounds STACK depth and the
-// polynomial cost; it does NOT make a hostile pattern terminate quickly (see has_nested_quantifiers
-// below, a heuristic, and the README caveat): that needs a linear-time engine.
+// ── Regex subject SIZE limit (F9) ──────────────────────────────────────
+// Operator-pattern regex runs only on subjects up to this size. This is a SIZE limit and nothing
+// more: it does NOT prevent stack exhaustion. libstdc++'s std::regex executor recurses per matched
+// character, and measured on libstdc++ at -O0 it overflowed the worker stack (SIGSEGV, not
+// catchable by the dispatch try/catch) at 24 KiB for `(a|b)*c` and 48 KiB for `a*b` on an 8 MiB
+// stack, at 4 to 8 KiB on a 1 MiB stack, and at 64 KiB under every pattern tried. Optimised builds
+// and other patterns shift those figures; none is a safe bound. It also does not bound
+// catastrophic backtracking time (see has_nested_quantifiers, a heuristic). The real fix is a
+// linear-time, non-recursive engine (RE2); lowering this cap or running regex on a large-stack
+// thread is an open owner decision. Issue #3866 stays open.
 constexpr std::size_t kMaxRegexSubjectBytes = 64 * 1024;
 
 // ── Regex safety check ─────────────────────────────────────────────────
@@ -1472,21 +1477,10 @@ private:
         }
 
         // Owner info
-        // _r variants into a local buffer, names copied out at once (F63): getpwuid()/getgrgid()
-        // return pointers into libc statics that the concurrent dispatch pool rewrites.
-        std::string owner_name = std::to_string(st.st_uid);
-        std::string group_name = std::to_string(st.st_gid);
-        {
-            std::vector<char> nbuf(16384);
-            passwd pw{};
-            passwd* pres = nullptr;
-            if (getpwuid_r(st.st_uid, &pw, nbuf.data(), nbuf.size(), &pres) == 0 && pres)
-                owner_name = pres->pw_name;
-            group gr{};
-            group* gres = nullptr;
-            if (getgrgid_r(st.st_gid, &gr, nbuf.data(), nbuf.size(), &gres) == 0 && gres)
-                group_name = gres->gr_name;
-        }
+        // Reentrant lookups, names copied out at once, numeric id when unresolved (F63):
+        // see filesystem_posix_names.hpp.
+        const std::string owner_name = yuzu::filesystem::owner_name_or_numeric(st.st_uid);
+        const std::string group_name = yuzu::filesystem::group_name_or_numeric(st.st_gid);
         ctx.write_output(std::format("owner|{}", owner_name));
         ctx.write_output(std::format("group|{}", group_name));
 

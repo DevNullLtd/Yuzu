@@ -814,6 +814,12 @@
     },
     {
       "completeness": "PARTIAL",
+      "provenance": "`linux:users:local_admins:lookup_failed` / `linux:users:group_members:lookup_failed`",
+      "status": "`CONSTRAINED`",
+      "when": "a Linux `getgrnam_r` / `getpwuid_r` lookup failed (an NSS fault, or a record too large for the 1 MiB buffer cap). A group that simply does not exist is not a failure: `local_admins` skips it and `group_members` answers `Group not found`. On failure `local_admins` lists what it could read and `group_members` answers `Group lookup failed` with rc 1"
+    },
+    {
+      "completeness": "PARTIAL",
       "provenance": "`users_win_events:access_denied`",
       "status": "`PERMISSION_DENIED`",
       "when": "Windows Security channel query denied; for `primary_user` only when the ProfileList fallback also failed"
@@ -1295,6 +1301,7 @@
       "content/definitions/users.yaml"
     ],
     "plugin": [
+      "agents/plugins/users/src/users_group_lookup.hpp",
       "agents/plugins/users/src/users_macos_last.hpp",
       "agents/plugins/users/src/users_plugin.cpp",
       "agents/plugins/users/src/users_win_events.hpp"

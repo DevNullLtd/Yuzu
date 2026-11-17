@@ -11,6 +11,23 @@ A statement elsewhere on this page that a rollback, a mixed fleet or an in-place
 
 Running `dev` between releases? Some entries below describe changes on `dev` that are not in a release yet. For what a `git pull` of `dev` changed, run the repository script `python3 scripts/whats-new.py` (`--versions` for the version bumps, rebuild notes and Docker image bumps); see `changelog.d/README.md`.
 
+## ⚠️ Breaking: regex `replace` is limited to 64 KiB files, regex `search` skips long lines, and `ioc.check` accepts at most 100 domains
+
+**In short.** Affected: any script, instruction or agentic worker that runs `filesystem.replace` with `regex=true` on a file over 64 KiB, relies on `filesystem.search` with `regex=true` seeing every line, or sends more than 100 `domains` to `ioc.check`. Agents on the new build refuse or skip these where the old build ran them.
+
+**What changed.**
+
+- **`filesystem.replace`, `regex=true`.** A file over 64 KiB (65,536 bytes) is refused with `error|regex replace refused: file exceeds 65536 bytes (use a literal search)` and rc 1; the file is not changed. The old limit was the 100 MiB file cap.
+- **`filesystem.search`, `regex=true`.** A line over 64 KiB is not searched. It is reported as `skipped|<line number>|line exceeds regex limit (65536 bytes)` and the search continues. The `total_matches` count covers only the lines that were searched.
+- **`ioc.check`.** More than 100 entries in `domains` are refused whole: one `error|domains|false|Too many domains (N, max 100)` row, rc 1, no header row and no check of any kind (IPs, hashes, paths and ports in the same call are not checked either). The old build accepted any number.
+- Literal (non-regex) `replace` and `search` are unchanged.
+
+**This is a size limit, not a safety bound.** A regex over a long subject can still overflow the agent's stack with the standard library's engine, well under 64 KiB; a linear-time engine is the real fix and is tracked in issue #3866.
+
+**Who is affected.** Callers that regex-replace large files, regex-search files with very long lines (minified or single-line data), or batch more than 100 domains into one `ioc.check`.
+
+**What to do.** For a large file use a literal replace, or split the work. For `search`, read the `skipped|` rows and fall back to a literal search for those lines. For `ioc.check`, send the domains in batches of at most 100 and treat a rc 1 `Too many domains` row as an error, not an empty result.
+
 ## ⚠️ Breaking: on-demand software sync asks for confirmation, is paced instead of capped at 500 devices, and cools down per group
 
 **In short.** Affected: anything that calls `POST /api/v1/hardware/sync` or the MCP tool `sync_hardware_software` for a whole group or the whole fleet (the Software page's **Whole fleet** choice, scripts and agentic workers). To do: send `"confirm": true` with a `group:<id>` or `__all__` scope, give the caller the global `ManagementGroup:Write` grant if it names the whole fleet, and stop relying on the 500-device refusal and the 60-second per-operator gap.

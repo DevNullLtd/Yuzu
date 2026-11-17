@@ -646,6 +646,7 @@ agent_test_exe = executable(
     'unit/test_asset_tags_parsers.cpp',   # #232: pure cap/escape/apply_sync/snapshot helpers (asset_tags_parsers.hpp)
     'unit/test_asset_tags_store.cpp',   # #232: atomic state-file lifecycle (asset_tags_store.hpp), TempDir-based
     'unit/test_asset_tags_actions.cpp',   # #232: real asset_tags dylib/.so/.dll via LocalDispatcher, unguarded on every OS
+    'unit/test_wp12_lookup_helpers.cpp', # WP12: injected-lookup/fake-list tests for users_group_lookup.hpp, filesystem_posix_names.hpp, dns_cache_list.hpp
     'unit/test_ioc_domain_cap.cpp', # F66: real ioc plugin, `domains` cap of 100 per command via LocalDispatcher
     'unit/test_tags_concurrency.cpp', # F37: real tags plugin driven from concurrent threads via LocalDispatcher ([tsan])
     'unit/test_tags_plugin.cpp',   # #4728: TU-inclusion seam over tags_plugin.cpp -- save_tags() through the shared atomic write
@@ -4701,6 +4702,16 @@ test('same-site gate production wiring lexical selftest',
   args: [files('test_same_site_wiring_lexical_selftest.py')],
   suite: 'docs',
   timeout: 60,
+)
+
+# WP12: the tags/users/filesystem agent plugins must not call the non-reentrant getpwuid/getpwnam/
+# getgrnam/getgrgid (concurrent dispatch pool). Source-text only; the ONLY plain-build regression
+# check for those call sites (the race itself is caught only by the nightly TSan job).
+test('plugin reentrant libc lookups lexical gate',
+  _python3_test,
+  args: [files('test_plugin_reentrant_libc_lexical.py'), meson.current_source_dir() / '..'],
+  suite: 'docs',
+  timeout: 30,
 )
 
 # A unit-test file marked "Whole file compiled out under TSan" must have nothing after its

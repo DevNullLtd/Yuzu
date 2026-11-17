@@ -64,22 +64,22 @@ No external binaries or subprocesses on any OS — all three legs read OS-native
 
 ### Outputs
 
-Pipe-delimited rows, `type|value|matched|detail` (`ioc_plugin.cpp:809`). Unlike the collector-style plugins, the field-name header is itself written as the first output line whenever at least one check ran — it is not a data row and downstream consumers keying on `type` should skip it. Any literal `|` in `value` or `detail` is escaped to `\|` (`ioc_plugin.cpp:107-118`). There is no empty-row placeholder: a parameter that matches nothing simply gets `matched=false` with an explanatory `detail`, and a `check` call with no parameters at all skips the header and emits exactly one `error` row instead (`ioc_plugin.cpp:802-809`).
+Pipe-delimited rows, `type|value|matched|detail` (`ioc_plugin.cpp:809`). Unlike the collector-style plugins, the field-name header is itself written as the first output line whenever at least one check ran — it is not a data row and downstream consumers keying on `type` should skip it. Any literal `|` in `value` or `detail` is escaped to `\|` (`ioc_plugin.cpp:107-118`). There is no empty-row placeholder: a parameter that matches nothing simply gets `matched=false` with an explanatory `detail`, and a `check` call with no parameters at all, or with more than 100 `domains`, skips the header and emits exactly one `error` row instead (`error|none|false|No IOC parameters provided`, or `error|domains|false|Too many domains (N, max 100)`) with rc 1 and no check run.
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
 **`security.ioc.check` — `type|value|matched|detail`**
 
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
-| `type` | string | `ip` `domain` `hash` `file` `port` `error` | Windows, Linux, macOS | `ip` | Which IOC category this row checked. `error` appears only once, in place of all rows, when no IOC parameter was provided at all. |
+| `type` | string | `ip` `domain` `hash` `file` `port` `error` | Windows, Linux, macOS | `ip` | Which IOC category this row checked. `error` appears only once, in place of all rows (no header row, no check run, rc 1), when no IOC parameter was provided (`error\|none\|false\|...`) or more than 100 domains were (`error\|domains\|false\|Too many domains ...`). |
 | `value` | string | - | Windows, Linux, macOS | `127.0.0.1` | The IOC value that was checked, copied from the input parameter with any literal `\|` escaped to `\\|`. Values: free text. |
 | `matched` | bool | - | Windows, Linux, macOS | `true` | Whether the IOC was found on this endpoint. Always `false` for the single `error` row. Values: true, false. |
-| `detail` | string | - | Windows, Linux, macOS | `Found in /etc/hosts` | Human-readable explanation of the match or non-match (e.g. which PID owns a connection, or why a check could not run). Values: free text. |
+| `detail` | string | - | Windows, Linux, macOS | `Found in /etc/hosts` | Human-readable explanation of the match or non-match (e.g. which PID owns a connection, or why a check could not run; on Windows `DNS resolver cache could not be read` when the cache was unreadable, with the result also marked constrained). Values: free text. |
 <!-- END GENERATED -->
 
 ### Result status
 
-This plugin does not set a typed result status; the agent records `UNDECLARED` and every sample shows `UNDECLARED / UNKNOWN /` (`ioc_plugin.cpp` has no `set_result_status`/`yuzu_ctx_set_result_status` call anywhere in the file; confirmed against `docs/samples/windows.txt:7`, `macos.txt:7`, `linux.txt:7`).
+On Linux and macOS this plugin does not set a typed result status; the agent records `UNDECLARED`. On Windows, `domains` sets `CONSTRAINED` / `PARTIAL` with provenance `windows:ioc:dns_cache_unreadable` when the DNS resolver cache could not be read (`dnsapi.dll` would not load, `DnsGetCacheDataTable` is missing, or it returned FALSE), and every `domain` row then says `DNS resolver cache could not be read` rather than `Not in DNS cache`. Some Windows 11 builds were observed to return FALSE every time, so this can be the normal answer there. The other checks set no status (`ioc_plugin.cpp`; samples in `docs/samples/`).
 
 ### Where the data goes
 
