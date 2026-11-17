@@ -114,6 +114,7 @@ This describes the build in a fresh deployment (see "Deployment contract (hard c
 - The SSE per-connection queue is capped by event count, not bytes (#2235), so one very large agent-supplied row still occupies a slot at full size.
 - The result-set matcher keeps carriage returns in cell text on purpose (it decides result-set membership); see `docs/scope-walking-design.md`.
 - **One-time Echo baseline pair after upgrade.** An Echo baseline stored by an earlier build under a name containing an invalid byte holds U+FFFD, while the upgraded agent reads that name with `?`. The first diff after the upgrade therefore emits one removed/added (or stopped/started) pair for each such entry; it does not repeat.
+- **Old agents on a direct heartbeat.** An agent that has not been upgraded, talking DIRECTLY to the server (no gateway), still sends a `heartbeat.*`-derived tag value with a non-UTF-8 byte as-is. The server rejects that whole unary heartbeat RPC every interval, so the device looks stale (no heartbeat) while its command stream may still work. Gateway-fronted agents are not affected (the gateway repairs tag bytes). Upgrading the agent fixes it.
 - **New agent, old server.** An upgraded agent sends `?` where an old one sent raw bytes, so the old server stores `?`; no old-server change is needed, but the old server still rejects a frame from an agent that has not been upgraded.
 
 ## Behaviour change: MCP `execute_instruction` progress follows the caller's `Execution:Read` scope (#7817)
