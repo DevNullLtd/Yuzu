@@ -453,9 +453,16 @@ struct CommandContextImpl {
         }
     }
 
-    void flush_output() {
-        std::lock_guard lock(buf_mu);
-        flush_output_locked();
+    // Contained: the final flush after execute() builds the concatenated payload (an allocation)
+    // and must not unwind to the dispatch firewall with the drop uncounted. A failure here means
+    // buffered plugin output never reached the wire: mark it exactly like a lost write.
+    void flush_output() noexcept {
+        try {
+            std::lock_guard lock(buf_mu);
+            flush_output_locked();
+        } catch (...) {
+            note_output_dropped();
+        }
     }
 
 private:
@@ -468,6 +475,7 @@ private:
         if (output_buffer.empty())
             return;
 
+        maybe_inject_alloc_failure(); // TEST SEAM (see alloc_fault_countdown)
         // Concatenate all buffered lines into a single payload
         std::string combined;
         combined.reserve(output_buffer_bytes + output_buffer.size()); // +size for newlines
@@ -660,6 +668,19 @@ YUZU_EXPORT void arm_output_alloc_failure_for_test(int nth) {
     CommandContextImpl::alloc_fault_countdown.store(nth, std::memory_order_relaxed);
 }
 
+// Test seam: a stream-mode final flush that hits an allocation failure is contained and counted
+// as a dropped write (returns CommandContextImpl::output_dropped). No stream is needed: the
+// injected failure fires before flush_output_locked touches it.
+YUZU_EXPORT bool stream_flush_alloc_failure_marks_dropped_for_test() {
+    CommandContextImpl ctx_impl{};
+    ctx_impl.output_buffer.emplace_back("buffered plugin output");
+    ctx_impl.output_buffer_bytes = ctx_impl.output_buffer.back().size();
+    CommandContextImpl::alloc_fault_countdown.store(1, std::memory_order_relaxed);
+    ctx_impl.flush_output();
+    CommandContextImpl::alloc_fault_countdown.store(0, std::memory_order_relaxed);
+    return ctx_impl.output_dropped.load(std::memory_order_relaxed);
+}
+
 // C ABI context function implementations
 
 extern "C" {
@@ -712,7 +733,9 @@ YUZU_EXPORT void yuzu_ctx_set_result_status(YuzuCommandContext* ctx, YuzuResultS
     // C ABI: the string assignment allocates; nothing may unwind into the plugin. On failure the
     // typed status/completeness above stand and the provenance stays as it was.
     try {
-        impl->result_provenance = provenance ? provenance : "";
+        std::string prov = provenance ? provenance : "";
+        yuzu::shared::scrub_wire_bytes(prov); // a proto3 string field: well-formed UTF-8 only
+        impl->result_provenance = std::move(prov);
     } catch (...) { // NOLINT(bugprone-empty-catch)
     }
 }

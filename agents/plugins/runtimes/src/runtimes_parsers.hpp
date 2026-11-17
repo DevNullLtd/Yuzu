@@ -269,7 +269,7 @@ struct DotnetEntry {
 
 /// Untrusted OS text becomes one safe field: invalid UTF-8 bytes are replaced first (the
 /// output crosses the wire as a proto3 `string`, and one invalid byte fails the parse of
-/// the whole chunk; overlong, surrogate and out-of-range sequences are replaced too since WP07 F70, #4864), then the
+/// the whole chunk; overlong, surrogate and out-of-range sequences are replaced too, #4864), then the
 /// pipe-grammar escaper runs.
 [[nodiscard]] inline std::string field_or_dash(std::string_view v) {
     return v.empty() ? std::string{"-"}

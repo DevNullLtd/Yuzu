@@ -275,7 +275,7 @@ The policy engine tracks compliance status per agent per policy. Each
 | `non_compliant` | Check failed -- the endpoint is not in the desired state |
 | `unknown` | Not yet evaluated, status invalidated, the agent did not respond to a check within the grace window, or the check instruction runs a Forensics-tier plugin (see below) |
 | `fixing` | Fix instruction is currently running |
-| `error` | Check or fix instruction failed to execute, **or the policy is misconfigured** (e.g. an empty compliance expression — a policy that checks nothing is reported as `error`, never `compliant`), **or the agent's response could not be evaluated** (wrong JSON types, invalid UTF-8 or nesting past the depth guard; counted in `yuzu_server_policy_unevaluable_responses_total{reason}`; only that device is affected) |
+| `error` | Check or fix instruction failed to execute, **or the policy is misconfigured** (e.g. an empty compliance expression — a policy that checks nothing is reported as `error`, never `compliant`), **or the agent's response could not be evaluated** (output nested past the depth guard, or an evaluation that threw; a numeric JSON value is compared as text and does not count; counted in `yuzu_server_policy_unevaluable_responses_total{reason}`; only that device is affected) |
 
 ---
 

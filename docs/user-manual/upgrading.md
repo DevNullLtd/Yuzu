@@ -99,25 +99,24 @@ This describes the build in a fresh deployment (see "Deployment contract (hard c
 
 **Rolling upgrade.** The rule is applied per replica, so a replica that has not been upgraded still shows a service-scoped token its minting account's executions, and a client can see the old and the new answer on consecutive requests; finish the roll promptly. An old replica does not expose the new refusal counter, so its series is absent rather than zero: run `up{job=~"<server job regex>"} == 1 unless on(instance) count by (instance) (yuzu_server_authz_service_scope_unrestricted_refused_total)` to find any scraped replica that has not been upgraded (a replica that is down also lacks the series, and `up == 1` does not list it, so check the replica's health separately).
 
-## Behaviour change: malformed agent data is contained per device, and old agents keep sending frames the server rejects (WP07)
+## Behaviour change: malformed agent data is contained per device (WP07)
 
-**In short.** Affected: everyone who runs policies, reads result rows, or runs agents older than this release. To do: upgrade the agents; nothing else is required on the server.
+This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page): every writer runs this build, and this page is not a procedure for a rolling or mixed-version upgrade.
 
-**What changed on the server.** A policy check response that cannot be evaluated (wrong JSON types, invalid UTF-8, or nesting past the depth guard) now scores that device `error` and increments `yuzu_server_policy_unevaluable_responses_total{reason="depth|exception"}`, instead of aborting the collect pass for every other device. The Hardware action-result fragment renders over-deep agent JSON as plain text. The shared `/events` SSE stream treats a bare CR like LF, and result rows lose every embedded carriage return (not only a trailing one).
+**In short.** Affected: everyone who runs policies or reads result rows. To do: nothing; read "Still open" for the limits.
 
-**What changed on the agent.** The agent daemon replaces non-UTF-8 bytes in plugin output with `?`, and Echo scrubs the identity strings it diffs at collection. An agent that has NOT been upgraded still sends a command response containing a non-UTF-8 byte as-is, and the server rejects that whole frame (the agent's command stream resets); only that one device is affected, and gateway-fronted agents are not affected by the heartbeat tag path (the gateway repairs tag bytes). Upgrade agents to stop the resets.
+**What the server does.** A policy check response nested past the depth guard, or whose evaluation throws, scores that device `error` (the check result carries `{"reason":"unevaluable_response"}` when evaluation threw) and increments `yuzu_server_policy_unevaluable_responses_total{reason="depth|exception"}`; the collect pass carries on with every other device, and each target is its own failure domain. A numeric JSON value in a row is compared as text, as before (`{"hostname":1}` reads as `"1"`). The Hardware action-result fragment renders over-deep agent JSON as plain text. The shared `/events` SSE stream treats a bare CR, CRLF and LF as one line break, and result rows lose every embedded carriage return (not only a trailing one).
+
+**What the agent does.** The agent daemon replaces non-UTF-8 bytes in plugin output with `?`, scrubs plugin `heartbeat.*` tag values the same way, and Echo scrubs the identity strings it diffs at collection.
 
 **Still open.**
 - Filesystem plugin path bytes are not escaped upstream (#6480): the host scrub turns them into `?`, so a name with an invalid byte reads with `?` in it.
 - An exception in one Echo collect leg can still skip the later legs of that fast tick (per-leg isolation is not done).
-- A device that persistently sends an unevaluable policy response scores `error` at every interval; nothing quarantines it or backs off (owner decision pending).
+- A device that persistently sends an unevaluable policy response scores `error` at every interval; nothing quarantines it or backs off (tracked in #8179).
 - The SSE per-connection queue is capped by event count, not bytes (#2235), so one very large agent-supplied row still occupies a slot at full size.
 - The result-set matcher keeps carriage returns in cell text on purpose (it decides result-set membership); see `docs/scope-walking-design.md`.
-- **One-time Echo baseline pair after upgrade.** An Echo baseline stored by an earlier build under a name containing an invalid byte holds U+FFFD, while the upgraded agent reads that name with `?`. The first diff after the upgrade therefore emits one removed/added (or stopped/started) pair for each such entry; it does not repeat.
 - **A non-UTF8 PostgreSQL database.** The server only WARNS at start (log line, gauge `yuzu_pg_server_encoding_not_utf8` = 1, alert `YuzuPgServerEncodingNotUtf8`); it does not refuse to start. On such a database Postgres does not reject invalid UTF-8 agent text; see [server-admin.md](server-admin.md#postgresql-database-encoding).
 - **Where to see the new signals.** A command whose plugin output was lost to an allocation failure reports `constrained`/`partial` (provenance `host:output_dropped`); the agent also reports the heartbeat tag `yuzu.output_dropped` and keeps the agent-local counter `yuzu_agent_plugin_output_dropped_total` (neither has a server rollup yet). Skipped policy targets raise `YuzuPolicyCollectSkipped`.
-- **Old agents on a direct heartbeat.** An agent that has not been upgraded, talking DIRECTLY to the server (no gateway), still sends a `heartbeat.*`-derived tag value with a non-UTF-8 byte as-is. The server rejects that whole unary heartbeat RPC every interval, so the device looks stale (no heartbeat) while its command stream may still work. Gateway-fronted agents are not affected (the gateway repairs tag bytes). Upgrading the agent fixes it.
-- **New agent, old server.** An upgraded agent sends `?` where an old one sent raw bytes, so the old server stores `?`; no old-server change is needed, but the old server still rejects a frame from an agent that has not been upgraded.
 
 ## Behaviour change: MCP `execute_instruction` progress follows the caller's `Execution:Read` scope (#7817)
 

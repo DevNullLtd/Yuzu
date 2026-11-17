@@ -8,11 +8,10 @@
 //
 // The accepted set is exactly RFC 3629 (Unicode Table 3-7): no overlong forms, no UTF-16
 // surrogates, nothing above U+10FFFF, no truncated sequence. Each offending byte is replaced in
-// place with '?', so a row keeps its length and its field boundaries. This is stricter than
-// yuzu::util::sanitize_utf8 was (#4864), which passed overlong, surrogate and out-of-range
-// sequences that protobuf then rejects. sanitize_utf8 now accepts the same RFC 3629 set (WP07
-// F70) but does not replace NUL; this header stays the shared scrubber (it also replaces NUL),
-// and the agent host applies it to all plugin output in CommandContextImpl::append_output.
+// place with '?', so a row keeps its length and its field boundaries. yuzu::util::sanitize_utf8
+// accepts the same RFC 3629 set (#4864) but does not replace NUL; this header is the shared
+// scrubber (it also replaces NUL), and the agent host applies it to all plugin output in
+// CommandContextImpl::append_output.
 //
 // Platform-agnostic pure C++, no OS call, no I/O: the zero-dependency leaf-helper convention of
 // this directory.

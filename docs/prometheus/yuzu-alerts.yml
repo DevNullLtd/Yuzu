@@ -3113,7 +3113,7 @@ groups:
       # WP07: the compliance collect pass skipped a target (collect_target) or a whole ready
       # item (collect_item) because evaluating it threw -- the response-store read, the verdict
       # write or an allocation failure. A skipped target keeps its PREVIOUS status (no verdict is
-      # recorded this cycle), so a sustained rate means compliance data is going stale for
+      # recorded this cycle), so a skip that stays above zero for 15 minutes means compliance data is going stale for
       # someone. The per-device "unevaluable response" case is NOT this alert: it scores that
       # device `error` and is counted by yuzu_server_policy_unevaluable_responses_total{reason}.
       - alert: YuzuPolicyCollectSkipped

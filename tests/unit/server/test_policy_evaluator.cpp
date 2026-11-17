@@ -319,30 +319,41 @@ TEST_CASE("policy evaluator: compliant + non_compliant verdicts (multi-agent fan
     CHECK(h.status_of(pid, "agentB") == "non_compliant");
 }
 
-TEST_CASE("policy evaluator: one agent's hostile check output cannot abort the pass for the others "
-          "(F6)",
+TEST_CASE("policy evaluator: wrong-typed JSON members take their defaults, a number is compared "
+          "as text and invalid UTF-8 is scored on its raw text; none of it aborts the pass (F6)",
           "[pg][policy][evaluator]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     Harness h(pool);
     REQUIRE(h.mg.add_member(h.group_id, "agentC").has_value());
-    // Wrong JSON types in every typed position parse_result reads.
+    // Wrong JSON types in every typed position parse_result reads. Each wrong-typed member keeps
+    // its default; the numeric row value `1` is compared as the text "1", so `hostname != ''`
+    // holds. This is the long-standing number-as-text behaviour, NOT an `error` verdict.
     h.canned["agentA|checkp"] = {1, R"({"columns":[5,{"name":7,"type":[]}],"rows":[{"hostname":1}],)"
                                     R"("warnings":[1,null],"status":3,"error_code":"x",)"
                                     R"("timestamp":"t","agent_id":{}})"};
-    // Invalid UTF-8 (and over the 1000-byte cap, so truncation could split a scalar).
+    // Invalid UTF-8 (and over the 1000-byte cap, so truncation could split a scalar). It is not
+    // JSON, so it is scored on the raw-text fallback, which has no `hostname` field.
     h.canned["agentB|checkp"] = {1, std::string(999, 'a') + "\xC3\xA9\xFF\xFE"};
     h.canned["agentC|checkp"] = {1, out_json("hostname", "yuzu-c")};
     auto pid = h.author("result.hostname != ''");
 
-    PolicyEvaluator ev(h.deps());
+    yuzu::MetricsRegistry metrics;
+    auto deps = h.deps();
+    deps.metrics = &metrics;
+    PolicyEvaluator ev(deps);
     REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
     h.fake_now += 20; // past grace
-    ev.tick(true);
+    REQUIRE_NOTHROW(ev.tick(true));
 
+    CHECK(h.status_of(pid, "agentA") == "compliant");
+    CHECK(h.status_of(pid, "agentB") == "non_compliant");
     CHECK(h.status_of(pid, "agentC") == "compliant");
-    CHECK(h.status_of(pid, "agentA") != "<none>");
-    CHECK(h.status_of(pid, "agentB") != "<none>");
+    // Nothing here is an unevaluable response: parse_result is total, so neither reason counts.
+    CHECK(metrics.counter("yuzu_server_policy_unevaluable_responses_total", {{"reason", "exception"}})
+              .value() == 0);
+    CHECK(metrics.counter("yuzu_server_policy_unevaluable_responses_total", {{"reason", "depth"}})
+              .value() == 0);
 }
 
 TEST_CASE("policy evaluator: a throwing evaluation is its own failure domain - later targets "

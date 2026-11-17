@@ -254,7 +254,7 @@ TEST_CASE("mgmt_posture execute seam: unknown action is escaped; a throwing leg 
 
     // ... and invalid UTF-8 bytes are replaced first (a protobuf string field must be UTF-8),
     // exactly as posture_row does for its values: an invalid byte becomes '?', a valid sequence
-    // survives. sanitize_utf8 now also replaces overlong and surrogate forms (WP07 F70, #4864).
+    // survives. sanitize_utf8 also replaces overlong and surrogate forms (#4864).
     const auto binary = dispatcher.run(&throwing, "bad\xff!");
     CHECK(binary.rc == 1);
     const auto brows = captured_rows(binary.captured);
@@ -305,6 +305,7 @@ TEST_CASE("host scrubs plugin output to well-formed UTF-8 before buffering (F70)
 // complete (the server would replace stored rows with it).
 namespace yuzu::agent {
 void arm_output_alloc_failure_for_test(int nth); // agent.cpp test seam
+bool stream_flush_alloc_failure_marks_dropped_for_test(); // agent.cpp test seam
 }
 
 namespace {
@@ -331,4 +332,28 @@ TEST_CASE("a plugin write lost to bad_alloc marks the capture truncated and CONS
     CHECK(r.captured == "a");
     CHECK(r.result_status == YUZU_RESULT_STATUS_CONSTRAINED);
     CHECK(r.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+}
+
+// Stream mode: the final flush after execute() allocates the concatenated payload. A failure there
+// must be contained inside the context and counted as a dropped write, not unwind to the dispatch
+// firewall with yuzu_agent_plugin_output_dropped_total and yuzu.output_dropped unmoved.
+TEST_CASE("a stream-mode final flush lost to bad_alloc is contained and marked dropped",
+          "[agent][utf8][seam]") {
+    CHECK(yuzu::agent::stream_flush_alloc_failure_marks_dropped_for_test());
+}
+
+namespace {
+int bad_provenance_execute(YuzuCommandContext* ctx, const char*, const YuzuParam*, size_t) {
+    yuzu_ctx_set_result_status(ctx, YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_FULL,
+                               "src\xff:leg");
+    return 0;
+}
+} // namespace
+
+TEST_CASE("a plugin-set result provenance is scrubbed to well-formed UTF-8",
+          "[agent][utf8][seam]") {
+    yuzu::agent::LocalDispatcher dispatcher;
+    YuzuPluginDescriptor d{};
+    d.execute = &bad_provenance_execute;
+    CHECK(dispatcher.run(&d, "x").result_provenance == "src?:leg");
 }
