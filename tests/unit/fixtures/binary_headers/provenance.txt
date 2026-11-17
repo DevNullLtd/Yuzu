@@ -1,0 +1,33 @@
+Directory: tests/unit/fixtures/binary_headers/
+Captured for the shared PE / ELF / Mach-O header readers. Sources are in src/; capture.sh rebuilds
+each family: `sh capture.sh macho|elf|pe`. The .bin extension is deliberate: .gitignore ignores
+*.dll, *.so and *.dylib. The first 4096 bytes of every output are also copied into
+tests/fuzz/corpus/fuzz_binary_header_<pe|elf|macho>/.
+
+Each entry below is filled by whoever captures it; an empty field means not captured yet.
+
+macho_thin.bin, macho_fat.bin
+  Status:
+  host class:
+  toolchain:    (cc --version; xcrun --show-sdk-version)
+  date:
+  command:      sh capture.sh macho
+  notes:        thin = arm64; fat = arm64 + x86_64. install name @rpath/libyuzu_fixture.1.dylib,
+                current_version 1.2.3, compatibility_version 1.0.0.
+
+elf_shared.bin
+  Status:
+  host class:
+  toolchain:    (gcc --version; ld --version)
+  date:
+  command:      sh capture.sh elf
+  notes:        soname libyuzu_fixture.so.1, build-id sha1, max-page-size 4096, -nostdlib.
+
+pe_version.bin
+  Status:
+  host class:
+  toolchain:    (cl, rc and link versions; Windows SDK version)
+  date:
+  command:      sh capture.sh pe
+  notes:        x64 DLL, no entry point, VERSIONINFO from src/yuzu_fixture.rc: file version
+                1.2.3.4, product version 5.6.7.8, string block 040904b0, translation 0x409/1200.
