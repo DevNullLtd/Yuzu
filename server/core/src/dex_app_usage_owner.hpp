@@ -60,6 +60,7 @@
 #include <chrono>
 #include <cstdint>
 #include <expected>
+#include <mutex>
 #include <string_view>
 
 namespace yuzu {
@@ -117,13 +118,16 @@ public:
     [[nodiscard]] std::expected<DexUsageRead, DexReadFault> read(const DexUsageQuery& q) const;
 
     /// Statement timeouts since the last success (the sustained-timeout run).
-    [[nodiscard]] int consecutive_timeouts() const noexcept { return consecutive_timeouts_.load(); }
+    [[nodiscard]] int consecutive_timeouts() const {
+        std::lock_guard lock(run_mu_);
+        return consecutive_timeouts_;
+    }
 
     /// The detail token for a fault `read` just returned (see `dex_usage_unavailable_detail`).
     /// `now` is the instant the run's age is measured at; production passes none.
     [[nodiscard]] const char* unavailable_detail(
         DexReadFault f,
-        std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now()) const noexcept;
+        std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now()) const;
 
 private:
     /// Counts, logs (sampled) and returns `f`.
@@ -135,10 +139,12 @@ private:
     const std::chrono::milliseconds statement_timeout_;
     mutable std::atomic<int> in_flight_{0};
     // The sustained-timeout run: its length and its first timeout's steady_clock tick count
-    // (0 = no run). The two are separate atomics, so a reader can see a new count with the old
-    // start; that only delays `fleet_too_large` by one read.
-    mutable std::atomic<int> consecutive_timeouts_{0};
-    mutable std::atomic<std::int64_t> timeout_run_start_{0};
+    // (0 = no run). The pair is updated and read under `run_mu_`, so a success that overtakes a
+    // concurrent timeout can never leave a count of 0 with a stale start. The lock is never held
+    // across pool, SQL, metrics or log work.
+    mutable std::mutex run_mu_;
+    mutable int consecutive_timeouts_ = 0;
+    mutable std::int64_t timeout_run_start_ = 0;
     mutable RefusalLogThrottle log_throttle_;
 };
 

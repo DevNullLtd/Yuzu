@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -149,11 +150,17 @@ DexAppUsageOwner::DexAppUsageOwner(pg::PgPool& pool, yuzu::MetricsRegistry* metr
     : pool_(pool), metrics_(metrics), budget_(concurrent_reads), statement_timeout_(statement_timeout) {}
 
 const char* DexAppUsageOwner::unavailable_detail(DexReadFault f,
-                                                 std::chrono::steady_clock::time_point now) const noexcept {
-    const std::int64_t start = timeout_run_start_.load();
+                                                 std::chrono::steady_clock::time_point now) const {
+    int count = 0;
+    std::int64_t start = 0;
+    {
+        std::lock_guard lock(run_mu_);
+        count = consecutive_timeouts_;
+        start = timeout_run_start_;
+    }
     const auto age = start == 0 ? std::chrono::steady_clock::duration::zero()
                                 : now.time_since_epoch() - std::chrono::steady_clock::duration(start);
-    return dex_usage_unavailable_detail(f, consecutive_timeouts_.load(), age);
+    return dex_usage_unavailable_detail(f, count, age);
 }
 
 std::unexpected<DexReadFault> DexAppUsageOwner::fault(DexReadFault f) const {
@@ -269,15 +276,20 @@ std::expected<DexUsageRead, DexReadFault> DexAppUsageOwner::read(const DexUsageQ
         const DexReadFault f = statement_fault.value_or(DexReadFault::kQueryError);
         if (f == DexReadFault::kStatementTimeout) {
             // The first timeout of an unbroken run stamps its start; the run is cleared by a success.
-            consecutive_timeouts_.fetch_add(1);
-            std::int64_t none = 0;
-            timeout_run_start_.compare_exchange_strong(
-                none, std::max<std::int64_t>(1, std::chrono::steady_clock::now().time_since_epoch().count()));
+            const std::int64_t now = std::max<std::int64_t>(
+                1, std::chrono::steady_clock::now().time_since_epoch().count());
+            std::lock_guard lock(run_mu_);
+            ++consecutive_timeouts_;
+            if (timeout_run_start_ == 0)
+                timeout_run_start_ = now;
         }
         return fault(f);
     }
-    consecutive_timeouts_.store(0);
-    timeout_run_start_.store(0);
+    {
+        std::lock_guard lock(run_mu_);
+        consecutive_timeouts_ = 0;
+        timeout_run_start_ = 0;
+    }
     return std::move(*out);
 }
 
