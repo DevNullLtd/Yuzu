@@ -43,6 +43,40 @@ log() {
     printf '[gateway-entrypoint] %s\n' "$1" >&2
 }
 
+# F24: the distribution cookie is validated HERE, before the BEAM exists. The
+# in-VM guard (yuzu_gw_app:check_distribution_cookie/0) runs in the application
+# start callback, AFTER the kernel has started net_kernel under the -name in
+# vm.args.src, so a node with a known cookie is reachable for the whole boot
+# window. This check refuses (exit 1) while nothing is listening. The in-VM
+# guard stays as defence in depth for starts that bypass this script.
+#
+# YUZU_GW_ALLOW_DEFAULT_COOKIE=1 (single ephemeral node, dev/CI) no longer means
+# "run with the published default": an unset, empty or published-default cookie
+# is replaced by a fresh random per-boot value that is never logged. Such a node
+# cannot join a cluster (every node would draw a different cookie), which is the
+# safe outcome.
+published_default="yuzu_gw_secret_change_me"
+cookie="${YUZU_GW_COOKIE:-}"
+cookie_insecure=0
+case "$cookie" in
+    "") cookie_insecure=1 ;;
+    *"$published_default"*|*'${'*) cookie_insecure=1 ;;
+esac
+if [ "$cookie_insecure" = 1 ]; then
+    if [ "${YUZU_GW_ALLOW_DEFAULT_COOKIE:-}" = "1" ]; then
+        YUZU_GW_COOKIE="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+        if [ "${#YUZU_GW_COOKIE}" -lt 64 ]; then
+            log "FATAL: could not generate a random distribution cookie"
+            exit 1
+        fi
+        export YUZU_GW_COOKIE
+        log "YUZU_GW_COOKIE is unset or the published default and YUZU_GW_ALLOW_DEFAULT_COOKIE=1 is set: using a random per-boot cookie (single node only; this node cannot join a cluster)"
+    else
+        log "FATAL: YUZU_GW_COOKIE is unset or is the published default. The Erlang distribution cookie is the sole authentication for inter-node RPC. Set a strong unique value (e.g. 'openssl rand -hex 32')."
+        exit 1
+    fi
+fi
+
 # Local, non-loopback IPv4 addresses this container actually owns.
 local_addrs() {
     ip -4 -o addr show scope global 2>/dev/null \
@@ -103,6 +137,15 @@ else
     fi
 
     export YUZU_GW_ADVERTISE_ADDR="$advertise"
+fi
+
+# A node advertising the loopback literal is single-node by construction (no
+# peer can dial 127.0.0.1): keep its distribution listener and epmd off every
+# other interface (F24). A clustered node advertises a routable address and is
+# left alone; its transport is documented in docs/user-manual/gateway.md.
+if [ "$YUZU_GW_ADVERTISE_ADDR" = "127.0.0.1" ]; then
+    export ERL_EPMD_ADDRESS="127.0.0.1"
+    export ERL_AFLAGS="${ERL_AFLAGS:+$ERL_AFLAGS }-kernel inet_dist_use_interface '{127,0,0,1}'"
 fi
 
 exec /opt/yuzu_gw/bin/yuzu_gw "$@"

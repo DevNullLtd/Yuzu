@@ -15,6 +15,10 @@ StartLimitBurst=3
 Type=simple
 User=yuzu-gw
 Group=yuzu-gw
+# F24: refuse an unset, published-default or too-short distribution cookie BEFORE
+# the VM starts (the in-VM guard runs only after distribution is listening).
+# The value is never printed; `$$` is systemd's escape for a literal `$`.
+ExecStartPre=/bin/sh -c 'c="$${YUZU_GW_COOKIE:-}"; case "$$c" in ""|*yuzu_gw_secret_change_me*) echo "yuzu-gateway: YUZU_GW_COOKIE is unset or the published default" >&2; exit 1;; esac; [ "$${#c}" -ge 32 ] || { echo "yuzu-gateway: YUZU_GW_COOKIE is shorter than 32 characters" >&2; exit 1; }'
 ExecStart=/opt/yuzu_gw/bin/yuzu_gw foreground
 Restart=on-failure
 RestartSec=5

@@ -71,6 +71,12 @@ agent_service_wire_test_() ->
           fun() -> register_registry_unavailable(State) end},
          {"Register: a failed upstream is INTERNAL (13) and the reservation is released",
           fun() -> register_upstream_failed(State) end},
+         {"Register: a server-rejected Register (accepted=false) stores no pending row",
+          fun() -> register_server_rejected(State) end},
+         {"Register: an accepted answer with an empty session id stores no pending row",
+          fun() -> register_empty_session(State) end},
+         {"Subscribe with an empty x-yuzu-session-id is INVALID_ARGUMENT (3), no lookup",
+          fun() -> subscribe_empty_session(State) end},
          {"ExecuteCommand is server-streaming and ends with UNIMPLEMENTED (12)",
           fun() -> execute_unimplemented(State) end},
          {"Subscribe without x-yuzu-session-id is INVALID_ARGUMENT (3)",
@@ -146,6 +152,10 @@ cleanup(#{listeners := Listeners, relays := Relays} = State) ->
 mock_boundaries() ->
     meck:expect(yuzu_gw_upstream, proxy_register,
                 fun(#{info := #{agent_id := <<"upstream-fails">>}}, _Opts) -> {error, unavailable};
+                   (#{info := #{agent_id := <<"server-rejects">>}}, _Opts) ->
+                       {ok, #{session_id => <<>>, accepted => false}};
+                   (#{info := #{agent_id := <<"empty-session">>}}, _Opts) ->
+                       {ok, #{session_id => <<>>, accepted => true}};
                    (#{info := #{agent_id := Id}}, _Opts) ->
                        {ok, #{session_id => <<"sess-", Id/binary>>, accepted => true}}
                 end),
@@ -290,6 +300,23 @@ register_upstream_failed(#{plain := Chan}) ->
     ?assertEqual(0, meck:num_calls(yuzu_gw_registry, store_pending, '_')),
     %% the slot reserved for the Register is given back
     ?assertEqual(1, meck:num_calls(yuzu_gw_registry, release_session, '_')).
+
+register_server_rejected(#{plain := Chan}) ->
+    reset(),
+    %% the agent still gets the server's refusal, verbatim
+    ?assertMatch({ok, #{accepted := false}, _}, register(Chan, <<"server-rejects">>, <<>>)),
+    ?assertEqual(0, meck:num_calls(yuzu_gw_registry, store_pending, '_')),
+    ?assertEqual(1, meck:num_calls(yuzu_gw_registry, release_session, '_')).
+
+register_empty_session(#{plain := Chan}) ->
+    reset(),
+    ?assertMatch({error, {<<"13">>, _}, _}, register(Chan, <<"empty-session">>, <<>>)),
+    ?assertEqual(0, meck:num_calls(yuzu_gw_registry, store_pending, '_')).
+
+subscribe_empty_session(#{plain := Chan}) ->
+    reset(),
+    ?assertMatch({<<"3">>, _}, subscribe_status(Chan, <<>>)),
+    ?assertEqual(0, meck:num_calls(yuzu_gw_registry, take_pending, '_')).
 
 %%--------------------------------------------------------------------
 %% ExecuteCommand

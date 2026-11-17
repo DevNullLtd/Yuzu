@@ -162,9 +162,10 @@ services:
         max-size: "50m"
         max-file: "5"
     environment:
-      # Single-node, ephemeral — accept the default Erlang distribution cookie
-      # (the gateway fail-closes on it otherwise). NEVER set this in a clustered
-      # production gateway; set a strong YUZU_GW_COOKIE instead.
+      # Single-node, ephemeral — no operator cookie: the entrypoint generates a
+      # random per-boot cookie (never the published default) and binds
+      # distribution to loopback. NEVER set this in a clustered production
+      # gateway; set a strong YUZU_GW_COOKIE instead.
       YUZU_GW_ALLOW_DEFAULT_COOKIE: "1"
     volumes:
       # The listeners come from sys.config, not env — mount the TLS sys.config (#1291 follow-up).
