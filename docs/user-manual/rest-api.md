@@ -6863,6 +6863,8 @@ corresponding webhook's secret via this store first.
 payload is transmitted in cleartext. Production deployments should use `https://` only. The
 store accepts `http://` for development convenience — same posture as Offload Targets below.
 
+**Destination addresses (F43, #4816).** A URL whose host is a **literal** link-local (`169.254.0.0/16`, which holds the cloud metadata address `169.254.169.254`, and `fe80::/10`), unspecified (`0.0.0.0/8`, `::`), multicast or reserved (`240.0.0.0/4`) address is refused with `400` at create. At delivery the host name is resolved **once**, every returned address is judged (an IPv4-mapped, NAT64 or 6to4 form by its embedded IPv4 address), and the connection is pinned to the address that was judged, so a DNS answer that changes between the check and the connect cannot reach a refused address. A delivery whose destination is in that tier, or whose name does not resolve, is not attempted and is recorded in the delivery log with `error` `destination_refused` or `destination_unresolved`. Loopback and private ranges (RFC 1918, carrier-grade NAT, unique-local) are **not** refused, so a receiver on a private address keeps working; an opt-in policy for those is tracked in #4816.
+
 **URL rules.** A URL with embedded credentials (`https://user:pass@host`) or with control bytes
 (any byte below 0x20, including tab, CR, LF and NUL, and DEL) in the URL or in `event_types` is refused with `400` and nothing is stored. The
 `webhook.created` analytics event and the audit rows carry the scheme and host (plus, in the audit rows, a
@@ -6907,6 +6909,8 @@ Response-offload control plane (issue #255, Phase 8.3). Targets are named extern
 A target is identified by a unique `name` so a definition can reference it via `spec.offload.targets` in YAML (see [yaml-dsl-spec.md](../yaml-dsl-spec.md#specoffload)).
 
 `agent.registered` fires on *every* gRPC reconnect, not only first enrollment — same caveat as the Webhooks section above, and the same event-type table, since both sinks fire off the identical set of events. A target wired to a low-tolerance channel should filter or debounce on the receiving end if reconnect noise matters.
+
+**Destination addresses.** Offload targets follow the same destination-address rules as webhooks (see [Webhooks](#webhooks), "Destination addresses"): a literal link-local/metadata, unspecified, multicast or reserved host is refused with `400` at create, and delivery resolves the host once, vets every answer and connects to the vetted address, recording `destination_refused` or `destination_unresolved` in the delivery log when it declines. Loopback and private ranges are not refused.
 
 All five endpoints require the `Infrastructure` securable type — `Read` for `GET`, `Write` for `POST`/`DELETE`. The `auth_credential` is **never** returned in any response (redacted from `list()` and from `get()`, not even as the encrypted-at-rest blob) — a `has_credential` boolean instead reports whether one is configured. Audit events: `offload_target.create` (success or denied) and `offload_target.delete`. The create row's detail is `name=<name> url=<scheme>://<host>[:<port>] url_fp=<12 hex>`, the same shape as the delete row (the URL's path and query are never recorded), and it follows a `result=attempted` row written before the target is stored. A `url` with embedded `user:password@` is refused with `400`. These targets are also managed from **Settings > Integrations**, which calls these routes.
 

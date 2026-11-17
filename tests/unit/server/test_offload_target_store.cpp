@@ -784,3 +784,45 @@ TEST_CASE("OffloadTargetStore[pg]: deliveries past a full queue count reason=que
     CHECK(store->delivery_pool_pending() == 0);
 }
 #endif // !YUZU_TSAN_BUILD
+
+// ── F43 (#4816, #3870): destination-address guard ─────────────────────────
+
+TEST_CASE("OffloadTargetStore[pg]: a literal link-local or metadata URL is refused at create",
+          "[offload_store][pg][security]") {
+    OffloadTargetStorePg store;
+    for (const char* u : {"http://169.254.169.254/latest/meta-data/", "http://0.0.0.0:22/x",
+                          "http://[fe80::1]/x", "http://224.0.0.1/x"}) {
+        INFO(u);
+        auto r = store->create_target("t", u, OffloadAuthType::None, "", "*");
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == OffloadWriteError::invalid_input);
+    }
+    CHECK(store->create_target("lo", "http://127.0.0.1:1/h", OffloadAuthType::None, "", "*").has_value());
+    CHECK(store->create_target("pv", "http://10.1.2.3/h", OffloadAuthType::None, "", "*").has_value());
+}
+
+TEST_CASE("OffloadTargetStore[pg]: a stored row aimed at a metadata address is never connected to",
+          "[offload_store][pg][security]") {
+    OffloadTargetStorePg store;
+    auto id = store->create_target("t", "http://127.0.0.1:1/h", OffloadAuthType::None, "",
+                                   "agent.registered");
+    REQUIRE(id.has_value());
+    {
+        auto lease = store.pool().acquire();
+        REQUIRE(lease);
+        auto res = yuzu::server::pg::exec_params(
+            lease.get(), "UPDATE offload_target_store.offload_targets SET url = $2 WHERE id = $1::bigint",
+            std::vector<std::string>{std::to_string(*id), "http://169.254.169.254/latest/meta-data/"});
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    }
+    store->fire_event("agent.registered", R"({"k":"v"})");
+    std::vector<OffloadDelivery> d;
+    for (int i = 0; i < 250 && d.empty(); ++i) {
+        d = store->get_deliveries(*id);
+        if (d.empty())
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    REQUIRE(d.size() == 1);
+    CHECK(d[0].error == "destination_refused");
+    CHECK(d[0].status_code == 0);
+}

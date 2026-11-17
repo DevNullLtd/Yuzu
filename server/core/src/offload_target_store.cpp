@@ -2,6 +2,7 @@
 
 #include "delivery_pool_metrics.hpp"
 
+#include "outbound_destination_guard.hpp"
 #include "outbound_url_policy.hpp"
 
 #include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
@@ -434,6 +435,14 @@ std::expected<int64_t, OffloadWriteError> OffloadTargetStore::create_target(
             "OffloadTargetStore: rejected target with control bytes in event_types: {}", name);
         return std::unexpected(OffloadWriteError::invalid_input);
     }
+    // A LITERAL link-local / metadata / unspecified / multicast / reserved destination is refused
+    // here (F43, #4816); names are vetted at delivery (outbound_destination_guard.hpp).
+    if (url_literal_destination_refused(url)) {
+        spdlog::warn("OffloadTargetStore: rejected target whose url is a literal link-local, "
+                     "metadata, unspecified, multicast or reserved address (target name: {})",
+                     name);
+        return std::unexpected(OffloadWriteError::invalid_input);
+    }
 
     // Serial-PK allocate-before-encrypt (ADR-0010 Amendment): reserve the
     // row id on its own short lease (released before encrypting), encrypt
@@ -801,6 +810,24 @@ void OffloadTargetStore::deliver_single(const OffloadDeliveryTarget& tgt,
         return;
     }
 
+    // F43 (#4816): vet the destination before the credential is decrypted or a socket opened. A
+    // name is resolved ONCE and the connect below is pinned to the vetted address; link-local /
+    // metadata, unspecified, multicast and reserved addresses, an unresolvable name and a busy
+    // resolver all skip the delivery. Loopback and private ranges are deliberately NOT refused
+    // (outbound_destination_guard.hpp; the opt-in policy is #4816's separate setting).
+    const VettedDestination vetted = vet_delivery_destination(tgt.url);
+    if (vetted.verdict != DestinationVerdict::Allow) {
+        const bool refused = vetted.verdict == DestinationVerdict::Refused;
+        record_delivery(tgt.id, event_type, event_count, payload_body, 0,
+                        refused ? "destination_refused" : "destination_unresolved");
+        spdlog::warn("OffloadTargetStore: delivery to {} (target {}) skipped - destination {}{}{}",
+                     url_log_host(tgt.url), tgt.id, refused ? "refused: " : "unresolved",
+                     refused ? vetted.refused_class : "", refused ? " address" : "");
+        if (metrics_)
+            metrics_->counter("yuzu_server_offload_delivery_failed_total").increment();
+        return;
+    }
+
     // Decrypt-on-use at the dispatch site, right before the credential is
     // needed for the auth header/signature — never cached/batched across
     // this target's flush lifetime (ADR-0010 §Consequences permits caching
@@ -839,6 +866,8 @@ void OffloadTargetStore::deliver_single(const OffloadDeliveryTarget& tgt,
         const auto [scheme, host_port, path] = url_delivery_parts(tgt.url);
 
         httplib::Client cli(scheme + "://" + host_port);
+        if (!vetted.pinned_ip.empty()) // a resolved name: connect to the address that was vetted
+            cli.set_hostname_addr_map({{vetted.host, vetted.pinned_ip}});
         cli.set_connection_timeout(5);
         cli.set_read_timeout(10);
         cli.set_write_timeout(10);

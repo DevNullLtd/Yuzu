@@ -4559,8 +4559,10 @@ static const ToolDef kTools[] = {
      "immediately, >1 accumulates up to that many events per POST. Additive (mints a new "
      "target, overwrites nothing) but a duplicate name is rejected. url is NOT restricted "
      "to external hosts - a caller with Infrastructure:Write can point deliveries at any "
-     "reachable address, including the server's own loopback/internal network (no SSRF "
-     "guard on this field today, same posture as REST's twin). Requires "
+     "reachable address, including the server's own loopback/internal network (only "
+     "literal link-local/metadata, unspecified, multicast and reserved addresses are refused at "
+     "create, and every resolved address is vetted at delivery; loopback and private ranges "
+     "are not, see #4816). Requires "
      "Infrastructure:Write.",
      R"j({"type":"object","properties":{)j"
      R"j("name":{"type":"string","minLength":1,"maxLength":256,"description":"Unique target name; a duplicate is rejected"},)j"

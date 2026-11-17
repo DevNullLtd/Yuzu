@@ -514,3 +514,41 @@ TEST_CASE("WebhookStore[pg]: deliveries past a full queue count reason=queue_ful
     CHECK(store->delivery_pool_pending() == 0);
 }
 #endif // !YUZU_TSAN_BUILD
+
+// ── F43 (#4816): destination-address guard ────────────────────────────────
+
+TEST_CASE("WebhookStore[pg]: a literal link-local or metadata URL is refused at create",
+          "[webhook_store][pg][security]") {
+    WebhookStorePg store;
+    for (const char* u : {"http://169.254.169.254/latest/meta-data/", "http://0.0.0.0:22/x",
+                          "http://[fe80::1]/x", "http://224.0.0.1/x"}) {
+        INFO(u);
+        auto r = store->create_webhook(u, "agent.registered", "secret");
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == WebhookWriteError::invalid_url);
+    }
+    // Loopback and private receivers are still accepted (owner ruling: not part of this slice).
+    CHECK(store->create_webhook("http://127.0.0.1:1/h", "agent.registered", "").has_value());
+    CHECK(store->create_webhook("http://10.1.2.3/h", "agent.registered", "").has_value());
+}
+
+TEST_CASE("WebhookStore[pg]: a stored row aimed at a metadata address is never connected to",
+          "[webhook_store][pg][security]") {
+    WebhookStorePg store;
+    auto id = store->create_webhook("http://127.0.0.1:1/h", "agent.registered", "");
+    REQUIRE(id.has_value());
+    // A row that bypassed create (manual SQL, legacy data): delivery-time vetting must still refuse.
+    {
+        auto lease = store.pool().acquire();
+        REQUIRE(lease);
+        auto res = yuzu::server::pg::exec_params(
+            lease.get(), "UPDATE webhook_store.webhooks SET url = $2 WHERE id = $1::bigint",
+            std::vector<std::string>{std::to_string(*id), "http://169.254.169.254/latest/meta-data/"});
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    }
+    store->fire_event("agent.registered", R"({"k":"v"})");
+    auto deliveries = wait_for_deliveries(*store, *id, 1);
+    REQUIRE(deliveries.size() == 1);
+    CHECK(deliveries[0].error == "destination_refused"); // never "connection_failed": no connect
+    CHECK(deliveries[0].status_code == 0);
+}

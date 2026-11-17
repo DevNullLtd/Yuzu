@@ -2,6 +2,7 @@
 
 #include "delivery_pool_metrics.hpp"
 
+#include "outbound_destination_guard.hpp"
 #include "outbound_url_policy.hpp"
 
 #include "pg/pg_exec.hpp"
@@ -332,6 +333,13 @@ WebhookStore::create_webhook(const std::string& url, const std::string& event_ty
         spdlog::warn("WebhookStore: rejected webhook with userinfo or control bytes in url/event_types");
         return std::unexpected(WebhookWriteError::invalid_url);
     }
+    // A LITERAL link-local / metadata / unspecified / multicast / reserved destination is refused
+    // here (F43, #4816); names are vetted at delivery (outbound_destination_guard.hpp).
+    if (url_literal_destination_refused(url)) {
+        spdlog::warn("WebhookStore: rejected webhook whose url is a literal link-local, metadata, "
+                     "unspecified, multicast or reserved address");
+        return std::unexpected(WebhookWriteError::invalid_url);
+    }
     if (!open_)
         return std::unexpected(WebhookWriteError::store_unavailable);
 
@@ -590,6 +598,23 @@ void WebhookStore::deliver_single(const WebhookDeliveryTarget& wh, const std::st
     int status_code = 0;
     std::string error;
 
+    // F43 (#4816): vet the destination BEFORE the secret is decrypted or any socket opened. A name
+    // is resolved ONCE here and the connect below is pinned to the vetted address; an address in
+    // the never-allowed tier (link-local/metadata, unspecified, multicast, reserved), an
+    // unresolvable name and a resolver that is busy all skip the delivery and record why.
+    const VettedDestination vetted = vet_delivery_destination(wh.url);
+    if (vetted.verdict != DestinationVerdict::Allow) {
+        const bool refused = vetted.verdict == DestinationVerdict::Refused;
+        spdlog::warn("WebhookStore: delivery to {} (webhook {}) skipped - destination {}{}{}",
+                     url_log_host(wh.url), wh.id, refused ? "refused: " : "unresolved",
+                     refused ? vetted.refused_class : "", refused ? " address" : "");
+        if (metrics_)
+            metrics_->counter("yuzu_server_webhook_delivery_failed_total").increment();
+        record_delivery(wh.id, event_type, payload_json, 0,
+                        refused ? "destination_refused" : "destination_unresolved");
+        return;
+    }
+
     // Decrypt-on-use, right here, before ANY network work, and reduce to the
     // HMAC hex digest immediately below — the raw secret exists in memory
     // only for the hmac_sha256 call itself, never across the connect/write/
@@ -635,6 +660,8 @@ void WebhookStore::deliver_single(const WebhookDeliveryTarget& wh, const std::st
         const auto [scheme, host_port, path] = url_delivery_parts(wh.url);
 
         httplib::Client cli(scheme + "://" + host_port);
+        if (!vetted.pinned_ip.empty()) // a resolved name: connect to the address that was vetted
+            cli.set_hostname_addr_map({{vetted.host, vetted.pinned_ip}});
         cli.set_connection_timeout(5);
         cli.set_read_timeout(10);
         cli.set_write_timeout(10);
