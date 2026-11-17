@@ -26,6 +26,7 @@
 // glue onto the field separator as `\|`.
 
 #include <yuzu/string_utils.hpp>
+#include <wire_utf8.hpp> // yuzu::shared::scrub_wire_bytes
 
 #include <cstddef>
 #include <cstdint>
@@ -44,6 +45,9 @@ inline std::string row_field(std::string_view value) {
         out += (ch == '\r' || ch == '\n') ? ' ' : ch;
     if (!out.empty() && out.back() == '\\')
         out.back() = '/';
+    // A POSIX name is arbitrary bytes: a byte that is not well-formed UTF-8 (or a NUL) would make
+    // the server reject the device's whole response, so it shows as '?'. A no-op for valid UTF-8.
+    yuzu::shared::scrub_wire_bytes(out);
     return yuzu::util::escape_pipes(out);
 }
 

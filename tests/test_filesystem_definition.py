@@ -20,12 +20,21 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFINITION = REPO_ROOT / "content" / "definitions" / "filesystem.yaml"
 DEFINITION_ID = "device.filesystem.find_by_hash"
+SEARCH_DIR_DEFINITION = REPO_ROOT / "content" / "definitions" / "t2_capabilities.yaml"
+SEARCH_DIR_ID = "device.filesystem.search_dir"
 
 
 def _find_by_hash() -> dict:
     docs = [d for d in yaml.safe_load_all(DEFINITION.read_text(encoding="utf-8")) if d]
     matches = [d for d in docs if d["metadata"]["id"] == DEFINITION_ID]
     assert len(matches) == 1, f"expected exactly one {DEFINITION_ID}, found {len(matches)}"
+    return matches[0]
+
+
+def _search_dir() -> dict:
+    docs = [d for d in yaml.safe_load_all(SEARCH_DIR_DEFINITION.read_text(encoding="utf-8")) if d]
+    matches = [d for d in docs if d["metadata"]["id"] == SEARCH_DIR_ID]
+    assert len(matches) == 1, f"expected exactly one {SEARCH_DIR_ID}, found {len(matches)}"
     return matches[0]
 
 
@@ -61,6 +70,39 @@ class FindByHashDefinition(unittest.TestCase):
         row_kind = _find_by_hash()["spec"]["result"]["columns"][0]
         self.assertEqual(row_kind["values"],
                          ["match", "truncated", "matches_found", "network_mount_guard"])
+
+
+class SearchDirDefinition(unittest.TestCase):
+    """search_dir adopts the find_by_hash column shape (#6478): `result|<path>|<entry_type>` is the
+    one three-field row kind; the trailer, total_matches and the guard row never match."""
+
+    def test_runs_the_filesystem_plugins_search_dir_action(self):
+        execution = _search_dir()["spec"]["execution"]
+        self.assertEqual(execution["plugin"], "filesystem")
+        self.assertEqual(execution["action"], "search_dir")
+
+    def test_version_is_0_5_0(self):
+        # 0.4.0 -> 0.5.0 changed the declared columns (row_kind added, total_matches is a row kind).
+        self.assertEqual(_search_dir()["metadata"]["version"], "0.5.0")
+
+    def test_three_columns_in_wire_order(self):
+        columns = _search_dir()["spec"]["result"]["columns"]
+        self.assertEqual([c["name"] for c in columns], ["row_kind", "path", "entry_type"])
+        self.assertEqual([c["type"] for c in columns], ["string", "string", "string"])
+
+    def test_row_kind_is_the_discriminator_on_the_first_column_only(self):
+        columns = _search_dir()["spec"]["result"]["columns"]
+        self.assertIs(columns[0]["discriminator"], True)
+        self.assertEqual([c["name"] for c in columns if "discriminator" in c], ["row_kind"])
+
+    def test_row_kind_values_are_the_wire_row_kinds(self):
+        row_kind = _search_dir()["spec"]["result"]["columns"][0]
+        self.assertEqual(row_kind["values"],
+                         ["result", "truncated", "total_matches", "network_mount_guard"])
+
+    def test_entry_type_values(self):
+        entry_type = _search_dir()["spec"]["result"]["columns"][2]
+        self.assertEqual(entry_type["values"], ["file", "directory"])
 
 
 if __name__ == "__main__":

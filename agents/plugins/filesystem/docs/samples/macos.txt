@@ -1,4 +1,4 @@
-captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-10-04 · euid 501 (jsmith) · leg-hash 802f5467fb09
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-10-04 · euid 501 (jsmith) · leg-hash cc317a696b1d
 == action=exists path=/etc/hosts
 exists|true
 type|file
@@ -135,8 +135,9 @@ matches_found|1
 [result_status] CONSTRAINED / PARTIAL / filesystem:skipped_unreadable
 
 == action=search_dir root=/etc pattern=*hosts*
+truncated|none|visited=273|hashed=0|skipped_unreadable=1|skipped_symlink=4|skipped_not_regular=0|skipped_oversize=0|skipped_network_mount=0
 total_matches|0
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] CONSTRAINED / PARTIAL / filesystem:skipped_unreadable
 
 == action=get_version_info path=/bin/ls
 version_status|not_available

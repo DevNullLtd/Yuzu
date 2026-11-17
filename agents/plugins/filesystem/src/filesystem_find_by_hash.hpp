@@ -402,17 +402,26 @@ struct WalkEnv {
     }
 };
 
-/// Walk `root` to `max_depth` (root's children are depth 1), emitting one `match|...` row per
-/// regular file whose SHA-256 equals `target_lower`. The ORDER of the checks is the safety
-/// property: the mount check is a string comparison that precedes every call touching the path.
-template <class Emit>
-WalkOutcome walk_find_by_hash(const std::string& root, std::string_view target_lower, int max_depth,
-                              const WalkLimits& limits, const WalkEnv& env, Emit emit) {
+/// What the walk found at an entry it hands to a visitor.
+enum class EntryKind { directory, regular };
+
+/// A visitor's verdict: none (not a match), match (counts toward max_results, runs the one-entry
+/// look-ahead), stop (the visitor's own budget tripped: the walk ends with budget.stop()).
+enum class Visit { none, match, stop };
+
+/// THE bounded, symlink-safe walker of the plugin: `root` to `max_depth` (root's children are
+/// depth 1). The ORDER of the checks is the safety property: the mount check is a string comparison
+/// that precedes every call touching the path. `visit(entry, kind, budget, counters)` is called for
+/// a directory AFTER its depth and can_enter decisions were applied (so it may be asked about one
+/// that is never opened), and for a regular file; a symlink, junction, FIFO, device or socket is
+/// counted and never reaches it. find_by_hash and search_dir are both thin visitors over this.
+template <class VisitFn>
+WalkOutcome walk_bounded(const std::string& root, int max_depth, const WalkLimits& limits,
+                         const WalkEnv& env, VisitFn visit) {
     WalkOutcome out;
     out.mount_table_incomplete = !env.mount_table_complete;
     WalkCounters& c = out.c;
     HashBudget budget{limits, env.now, env.cancelled, c};
-    bool over_budget = false; // a file was skipped for want of byte budget
 
     // The root first: a root under a network mount is refused before any syscall names it, and an
     // unreadable root is counted -- skip_permission_denied would otherwise turn it into a clean,
@@ -447,6 +456,7 @@ WalkOutcome walk_find_by_hash(const std::string& root, std::string_view target_l
 
         const fs::directory_entry& entry = *it;
         const fs::path& path = entry.path();
+        Visit verdict = Visit::none;
 
         // A mount point under a walked directory is refused BEFORE lstat can block on it. With no
         // mount list there is nothing to compare, so the path is not even converted to a string
@@ -473,15 +483,53 @@ WalkOutcome walk_find_by_hash(const std::string& root, std::string_view target_l
                 ++c.skipped_unreadable;
                 it.disable_recursion_pending();
             }
+            verdict = visit(entry, EntryKind::directory, budget, c);
         } else if (st.type() != fs::file_type::regular) {
             // FIFO, device, socket: never opened (an open of a FIFO can block).
             ++c.skipped_not_regular;
         } else {
+            verdict = visit(entry, EntryKind::regular, budget, c);
+        }
+
+        if (verdict == Visit::stop) {
+            out.stop = budget.stop();
+            break;
+        }
+        if (verdict == Visit::match && ++out.matches >= limits.max_results) {
+            // Stopping at the cap is only honest if nothing is left to look at: look one entry
+            // ahead, so exactly `max_results` matches in a fully walked tree is clean.
+            it.increment(ec);
+            if (ec)
+                ++c.skipped_unreadable; // the entry that could not be looked at
+            if (ec || it != end)
+                out.stop = StopReason::max_results;
+            break;
+        }
+
+        it.increment(ec);
+        if (ec) { // an enumeration error ends the iterator on every STL
+            ++c.skipped_unreadable;
+            break;
+        }
+    }
+    return out;
+}
+
+/// Walk `root` to `max_depth` (root's children are depth 1), emitting one `match|...` row per
+/// regular file whose SHA-256 equals `target_lower`: a hashing visitor over walk_bounded.
+template <class Emit>
+WalkOutcome walk_find_by_hash(const std::string& root, std::string_view target_lower, int max_depth,
+                              const WalkLimits& limits, const WalkEnv& env, Emit emit) {
+    bool over_budget = false; // a file was skipped for want of byte budget
+    WalkOutcome out = walk_bounded(
+        root, max_depth, limits, env,
+        [&](const fs::directory_entry& entry, EntryKind kind, HashBudget& budget,
+            WalkCounters& c) {
+            if (kind != EntryKind::regular)
+                return Visit::none;
             const HashOutcome h = env.hash_entry(entry, budget, limits);
-            if (h.kind == HashKind::stopped) {
-                out.stop = budget.stop();
-                break;
-            }
+            if (h.kind == HashKind::stopped)
+                return Visit::stop;
             switch (h.kind) {
             case HashKind::symlink:
                 ++c.skipped_symlink;
@@ -504,27 +552,11 @@ WalkOutcome walk_find_by_hash(const std::string& root, std::string_view target_l
                 break;
             }
             if (h.kind == HashKind::hashed && h.hex == target_lower) {
-                emit(format_match_row(path_utf8(path), h.size));
-                if (++out.matches >= limits.max_results) {
-                    // Stopping at the cap is only honest if nothing is left to look at: look one
-                    // entry ahead, so exactly `max_results` matches in a fully walked tree is
-                    // clean.
-                    it.increment(ec);
-                    if (ec)
-                        ++c.skipped_unreadable; // the entry that could not be looked at
-                    if (ec || it != end)
-                        out.stop = StopReason::max_results;
-                    break;
-                }
+                emit(format_match_row(path_utf8(entry.path()), h.size));
+                return Visit::match;
             }
-        }
-
-        it.increment(ec);
-        if (ec) { // an enumeration error ends the iterator on every STL
-            ++c.skipped_unreadable;
-            break;
-        }
-    }
+            return Visit::none;
+        });
     // The walk went on past a file the byte cap kept it from examining: that is a tripped bound,
     // unless an earlier one already ended the walk and named itself.
     if (over_budget && out.stop == StopReason::none)

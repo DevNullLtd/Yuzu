@@ -438,6 +438,12 @@ const char* kSearchSchema =
 const char* kSearchDirSchema =
     R"({"columns":[{"name":"path","type":"string"},{"name":"entry_type","type":"string"},)"
     R"({"name":"total_matches","type":"int32"}]})";
+// search_dir 0.5.0 (#6478): the find_by_hash column shape. A literal copy; the shipped definition is
+// pinned to the same names, types, row_kind values and `discriminator` by
+// tests/test_filesystem_definition.py.
+const char* kSearchDir050Schema =
+    R"({"columns":[{"name":"row_kind","type":"string","discriminator":true},)"
+    R"({"name":"path","type":"string"},{"name":"entry_type","type":"string"}]})";
 
 // The verbatim trailer filesystem_find_by_hash.hpp writes (nine fields).
 const char* kTrailer = "truncated|deadline|visited=5|hashed=9|skipped_unreadable=1|"
@@ -561,6 +567,30 @@ TEST_CASE("matcher: real search and search_dir rows never bind one position off 
     CHECK_FALSE(matches(kSearchDirSchema, "path", "eq", "/tmp/foo", search_dir));
     CHECK_FALSE(matches(kSearchDirSchema, "entry_type", "eq", "/tmp/foo", search_dir));
     CHECK_FALSE(matches(kSearchDirSchema, "entry_type", "eq", "directory", search_dir));
+}
+
+TEST_CASE("matcher: search_dir 0.5.0 result rows are data rows; trailer, count and guard rows never are",
+          "[result_set][matcher]") {
+    const std::string out = "result|/tmp/foo|directory\n"
+                            "network_mount_guard|unavailable\n"
+                            "truncated|deadline|visited=5|hashed=0|skipped_unreadable=1|"
+                            "skipped_symlink=0|skipped_not_regular=0|skipped_oversize=0|"
+                            "skipped_network_mount=0\n"
+                            "total_matches|1";
+    CHECK(matches(kSearchDir050Schema, "path", "eq", "/tmp/foo", out));
+    CHECK(matches(kSearchDir050Schema, "entry_type", "eq", "directory", out));
+    CHECK_FALSE(matches(kSearchDir050Schema, "entry_type", "eq", "file", out));
+    // none of the non-data rows is a row of the three declared columns
+    CHECK_FALSE(matches(kSearchDir050Schema, "path", "eq", "deadline", out));
+    CHECK_FALSE(matches(kSearchDir050Schema, "path", "eq", "unavailable", out));
+    CHECK_FALSE(matches(kSearchDir050Schema, "path", "eq", "1", out));
+    // a device whose only rows are the trailer and the count has no data row
+    const std::string none = "truncated|none|visited=5|hashed=0|skipped_unreadable=0|"
+                             "skipped_symlink=1|skipped_not_regular=0|skipped_oversize=0|"
+                             "skipped_network_mount=0\n"
+                             "total_matches|0";
+    CHECK_FALSE(matches(kSearchDir050Schema, "path", "exists", "", none));
+    // the stored 0.4.0 schema keeps the old never-match behaviour (case above)
 }
 
 TEST_CASE("matcher: a stored find_by_hash 0.3.0 definition keeps the old never-match behaviour",

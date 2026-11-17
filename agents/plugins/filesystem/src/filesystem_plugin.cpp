@@ -41,6 +41,7 @@
 
 #include "filesystem_acl_parsers.hpp"
 #include "filesystem_find_by_hash.hpp"
+#include "filesystem_search_dir.hpp"
 #include <atomic_file_write.hpp> // yuzu::shared::write_file_atomic
 #include <network_fstype.hpp>
 
@@ -55,6 +56,7 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -462,6 +464,16 @@ yuzu::filesystem::find_by_hash::MountList find_by_hash_network_mounts(const std:
     return {};
 }
 
+#endif
+
+#ifdef _WIN32
+// Can the directory be listed? The walker's can_enter probe on Windows, shared by find_by_hash and
+// search_dir: a directory_iterator open, which is what the walk would do next.
+bool can_enter_win(const fs::path& dir) {
+    std::error_code probe_ec;
+    fs::directory_iterator probe{dir, probe_ec};
+    return !probe_ec;
+}
 #endif
 
 // ── Regex safety check ─────────────────────────────────────────────────
@@ -1622,15 +1634,75 @@ private:
 
     // ── search_dir: Find directories/files by name pattern ────────────────
 
+    //
+    // A thin shell over the bounded walk (filesystem_search_dir.hpp, #6478). The ORDER is part of the
+    // safety property, as in do_find_by_hash: validate the parameters without touching the
+    // filesystem, read the mount list and refuse the RAW root (and base_dir) lexically under a
+    // network mount, and only then validate_path, whose exists/canonical would block on a dead hard
+    // mount.
+
     int do_search_dir(yuzu::CommandContext& ctx, yuzu::Params params) {
+        namespace fbh = yuzu::filesystem::find_by_hash;
+        namespace sd = yuzu::filesystem::search_dir;
+
         auto root = params.get("root");
         auto pattern = params.get("pattern");
         if (root.empty() || pattern.empty()) {
             ctx.write_output("error|missing required parameters: root, pattern");
             return 1;
         }
+        if (pattern.size() > sd::kMaxPatternBytes) {
+            ctx.write_output("error|pattern too long (max 256 chars)");
+            return 1;
+        }
+        const auto match_type = sd::parse_match_type(params.get("match_type", "directories"));
+        if (!match_type) {
+            ctx.write_output("error|invalid match_type (expected directories, files or both)");
+            return 1;
+        }
 
+        const bool use_regex = (params.get("regex", "false") == "true");
+        std::regex re;
+        if (use_regex) {
+            std::string pat_str{pattern};
+            if (has_nested_quantifiers(pat_str)) {
+                ctx.write_output("error|regex contains nested quantifiers (potential ReDoS)");
+                return 1;
+            }
+            auto flags = std::regex::ECMAScript | std::regex::optimize;
+#if defined(__GLIBCXX__)
+            // The GNU library's linear-time executor. Without it that library backtracks with no
+            // complexity limit, so one name could outlive the walk deadline. It refuses a
+            // back-reference at compile, which lands in the invalid-regex row below.
+            flags |= std::regex_constants::__polynomial;
+#endif
+            try {
+                re = std::regex(pat_str, flags);
+            } catch (const std::regex_error& e) {
+                ctx.write_output(std::format("error|invalid regex: {}", e.what()));
+                return 1;
+            }
+        }
+
+        // Refuse a root (or base_dir) under a network mount on its spelling, before any call that
+        // touches it.
         auto base_dir = params.get("base_dir");
+        auto mounts = find_by_hash_network_mounts(std::string{root});
+        bool refused = fbh::root_lexically_under_mount(root, mounts.mounts);
+        if (!refused && !base_dir.empty()) {
+            const auto base_mounts = find_by_hash_network_mounts(std::string{base_dir});
+            refused = fbh::root_lexically_under_mount(base_dir, base_mounts.mounts);
+        }
+        if (refused) {
+            fbh::WalkOutcome o;
+            o.c.skipped_network_mount = 1;
+            for (const auto& row : sd::format_closing_rows(o))
+                ctx.write_output(row);
+            ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                  fbh::constrained_reason(o));
+            return 0;
+        }
+
         auto validated = validate_path(root, base_dir);
         if (validated.empty()) {
             ctx.write_output("error|root is not accessible or outside allowed base directory");
@@ -1643,85 +1715,65 @@ private:
             return 1;
         }
 
-        auto use_regex_str = params.get("regex", "false");
-        bool use_regex = (use_regex_str == "true");
-        auto match_type = params.get("match_type", "directories");
-
         int max_depth = 5;
-        auto depth_str = params.get("max_depth", "5");
-        try { max_depth = std::stoi(std::string{depth_str}); } catch (...) {}
+        try { max_depth = std::stoi(std::string{params.get("max_depth", "5")}); } catch (...) {}
         if (max_depth < 1) max_depth = 1;
         if (max_depth > 20) max_depth = 20;
 
         int max_results = 100;
-        auto results_str = params.get("max_results", "100");
-        try { max_results = std::stoi(std::string{results_str}); } catch (...) {}
+        try { max_results = std::stoi(std::string{params.get("max_results", "100")}); } catch (...) {}
         if (max_results < 1) max_results = 1;
         if (max_results > 1000) max_results = 1000;
 
-        // Compile regex if requested
-        std::regex re;
-        if (use_regex) {
-            std::string pat_str{pattern};
-            if (pat_str.size() > 256) {
-                ctx.write_output("error|pattern too long (max 256 chars)");
-                return 1;
-            }
-            if (has_nested_quantifiers(pat_str)) {
-                ctx.write_output("error|regex contains nested quantifiers (potential ReDoS)");
-                return 1;
-            }
+#ifdef __APPLE__
+        const DatalessMaterializationOff dataless_off; // restored when the walk returns
+#endif
+        // Set by the name predicate when the regex library gives up on a name: the walk then ends
+        // through env.cancelled and the shell reports that the answer is not complete.
+        bool regex_gave_up = false;
+        fbh::WalkEnv env;
+        env.cancelled = [&regex_gave_up] {
+            return regex_gave_up || yuzu::agent::subprocess_cancel_requested();
+        };
+#ifdef _WIN32
+        env.can_enter = can_enter_win;
+        // The refusal was decided on the RAW root above; a canonical, real-cased path would not
+        // string-match it, so the walk core is handed no mount list here.
+#else
+        env.can_enter = fbh::can_enter_posix;
+        env.set_mounts(std::move(mounts));
+#endif
+
+        const std::function<bool(std::string_view)> name_matches =
+            [&](std::string_view name) -> bool {
+            if (!use_regex)
+                return glob_match(pattern, name);
             try {
-                re = std::regex(pat_str, std::regex::ECMAScript | std::regex::optimize);
-            } catch (const std::regex_error& e) {
-                ctx.write_output(std::format("error|invalid regex: {}", e.what()));
+                return std::regex_match(std::string{name}, re);
+            } catch (const std::regex_error&) {
+                regex_gave_up = true; // a too-costly match on this library: stop, say so
+                return false;
+            }
+        };
+
+        try {
+            const auto outcome = sd::walk_search_dir(
+                validated, name_matches, *match_type, max_depth, sd::limits_for(max_results), env,
+                [&](const std::string& row) { ctx.write_output(row); });
+            if (regex_gave_up) {
+                ctx.write_output("error|regex too complex for a file name (simplify the pattern)");
                 return 1;
             }
+            for (const auto& row : sd::format_closing_rows(outcome))
+                ctx.write_output(row);
+            if (outcome.constrained())
+                ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED,
+                                      YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                      fbh::constrained_reason(outcome));
+        } catch (const std::exception& e) {
+            ctx.write_output(std::format("error|search_dir failed: {}", e.what()));
+            return 1;
         }
-
-        int found_count = 0;
-        auto base_depth = std::count(validated.begin(), validated.end(), '/') +
-                          std::count(validated.begin(), validated.end(), '\\');
-
-        for (auto it = fs::recursive_directory_iterator(validated,
-                 fs::directory_options::skip_permission_denied, ec);
-             it != fs::recursive_directory_iterator() && found_count < max_results;
-             it.increment(ec)) {
-            if (ec) continue;
-
-            const auto& entry = *it;
-            auto entry_path = entry.path().string();
-            auto depth = std::count(entry_path.begin(), entry_path.end(), '/') +
-                         std::count(entry_path.begin(), entry_path.end(), '\\') - base_depth;
-            if (depth > max_depth) {
-                it.disable_recursion_pending();
-                continue;
-            }
-
-            std::error_code fec;
-            bool is_dir = entry.is_directory(fec);
-            bool is_file = entry.is_regular_file(fec);
-
-            if (match_type == "directories" && !is_dir) continue;
-            if (match_type == "files" && !is_file) continue;
-            if (match_type == "both" && !is_dir && !is_file) continue;
-
-            auto name = entry.path().filename().string();
-            bool matched = false;
-            if (use_regex) {
-                matched = std::regex_match(name, re);
-            } else {
-                matched = glob_match(pattern, name);
-            }
-
-            if (matched) {
-                auto type_str = is_dir ? "directory" : "file";
-                ctx.write_output(std::format("result|{}|{}", entry_path, type_str));
-                ++found_count;
-            }
-        }
-
-        ctx.write_output(std::format("total_matches|{}", found_count));
         return 0;
     }
 
@@ -2423,11 +2475,7 @@ private:
         };
 #ifdef _WIN32
         env.hash_entry = fbh::hash_entry_win;
-        env.can_enter = [](const fs::path& dir) {
-            std::error_code probe_ec;
-            fs::directory_iterator probe{dir, probe_ec};
-            return !probe_ec;
-        };
+        env.can_enter = can_enter_win;
         // The refusal was decided on the RAW root above; a canonical, real-cased path would not
         // string-match it, so the walk core is handed no mount list here.
 #else
