@@ -5,6 +5,7 @@
 #include "custom_properties_store.hpp"
 #include "instruction_store.hpp"
 #include "management_group_store.hpp"
+#include "on_behalf_guard.hpp" // onbehalf::sanitize_for_log (CWE-117: exception text can embed agent bytes)
 #include "mcp_jsonrpc.hpp" // json_exceeds_depth / kMcpMaxJsonDepth (#2437-class depth guard)
 #include "policy_store.hpp"
 #include "response_store.hpp"
@@ -917,6 +918,13 @@ void PolicyEvaluator::collect_ready() {
                          "remaining ready item(s) deferred");
             break;
         }
+        // Item-level failure domain: `f` was moved out of in_flight_ above, so an escape would
+        // also abort every later ready item. Log + count + move on (the item is NOT retried;
+        // its policy re-evaluates at its next interval). Fail-closed: nothing is recorded as
+        // compliant here.
+        try {
+        if (d_.before_item_hook)
+            d_.before_item_hook(f.policy_id);
         // Degrade → empty (ADR-0039 deny-or-benign): a transient read failure
         // reads as "no terminal response yet", the same as a genuinely slow
         // agent — verdict_for() below already treats an unmatched target as
@@ -935,11 +943,6 @@ void PolicyEvaluator::collect_ready() {
                         : std::vector<StoredResponse>{};
         auto best = latest_per_agent(rows);
 
-        // Item-level failure domain: `f` was moved out of in_flight_ above, so an escape would
-        // also abort every later ready item. Log + count + move on (the item is NOT retried;
-        // its policy re-evaluates at its next interval). Fail-closed: nothing is recorded as
-        // compliant here.
-        try {
         if (f.phase == Phase::Check) {
             for (const auto& tgt : f.targets) {
                 // F6: `f` was already moved out of in_flight_, so an exception escaping this
@@ -970,7 +973,8 @@ void PolicyEvaluator::collect_ready() {
                         } catch (const std::exception& e) {
                             spdlog::warn("policy_evaluator: policy {} check {} response from "
                                          "agent {} could not be evaluated ({}); verdict=error",
-                                         f.policy_id, f.instruction_id, tgt, e.what());
+                                         f.policy_id, f.instruction_id, onbehalf::sanitize_for_log(tgt, 128),
+                                         onbehalf::sanitize_for_log(e.what(), 256));
                             status = "error";
                             // Evidence for the operator, without echoing the response that
                             // could not be evaluated.
@@ -1007,7 +1011,8 @@ void PolicyEvaluator::collect_ready() {
                 } catch (const std::exception& e) {
                     spdlog::error("policy_evaluator: policy {} target {} skipped, check-phase "
                                   "evaluation threw: {}",
-                                  f.policy_id, tgt, e.what());
+                                  f.policy_id, onbehalf::sanitize_for_log(tgt, 128),
+                                  onbehalf::sanitize_for_log(e.what(), 256));
                     if (d_.metrics)
                         d_.metrics
                             ->counter("yuzu_server_policy_eval_errors_total",
@@ -1121,7 +1126,7 @@ void PolicyEvaluator::collect_ready() {
         }
         } catch (const std::exception& e) {
             spdlog::error("policy_evaluator: collect_ready item for policy {} skipped: {}",
-                          f.policy_id, e.what());
+                          f.policy_id, onbehalf::sanitize_for_log(e.what(), 256));
             if (d_.metrics)
                 d_.metrics->counter("yuzu_server_policy_eval_errors_total", {{"phase", "collect_item"}})
                     .increment();

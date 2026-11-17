@@ -153,6 +153,10 @@ public:
         /// immediately before it is evaluated, inside the evaluation failure domain. Lets a test
         /// make evaluation throw to prove one target's failure cannot drop the others.
         std::function<void(const std::string& target)> before_evaluate_hook;
+        /// TEST SEAM (null in production): called once per ready item at the START of its
+        /// failure domain, before the response-store read, to prove an escape from that prelude
+        /// cannot abort later items.
+        std::function<void(const std::string& policy_id)> before_item_hook;
     };
 
     explicit PolicyEvaluator(Deps deps);

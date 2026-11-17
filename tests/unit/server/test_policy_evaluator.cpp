@@ -345,7 +345,7 @@ TEST_CASE("policy evaluator: one agent's hostile check output cannot abort the p
     CHECK(h.status_of(pid, "agentB") != "<none>");
 }
 
-TEST_CASE("policy evaluator: a throwing evaluation is its own failure domain, later targets "
+TEST_CASE("policy evaluator: a throwing evaluation is its own failure domain - later targets "
           "are processed exactly once (F6 review)",
           "[pg][policy][evaluator]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
@@ -386,6 +386,33 @@ TEST_CASE("policy evaluator: a throwing evaluation is its own failure domain, la
     CHECK(metrics.counter("yuzu_server_policy_unevaluable_responses_total",
                           {{"reason", "exception"}})
               .value() == 1);
+}
+
+TEST_CASE("policy evaluator: an exception in one item's response-store prelude does not abort "
+          "later ready items (gate-8 UP-2)",
+          "[pg][policy][evaluator]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    h.canned["agentA|checkp"] = {1, out_json("hostname", "yuzu-a")};
+    h.canned["agentB|checkp"] = {1, out_json("hostname", "yuzu-b")};
+    const auto p1 = h.author("result.hostname != ''");
+    const auto p2 = h.author("result.hostname != ''");
+    std::map<std::string, int> items;
+    auto deps = h.deps();
+    deps.before_item_hook = [&](const std::string& pid) {
+        ++items[pid];
+        if (pid == p1)
+            throw std::runtime_error("store prelude failed");
+    };
+    PolicyEvaluator ev(deps);
+    REQUIRE_FALSE(ev.evaluate_now(p1).value_or("").empty());
+    REQUIRE_FALSE(ev.evaluate_now(p2).value_or("").empty());
+    h.fake_now += 20;
+    REQUIRE_NOTHROW(ev.tick(true));
+    CHECK(items[p1] == 1);
+    CHECK(items[p2] == 1);
+    CHECK(h.status_of(p2, "agentA") == "compliant"); // the later item was still processed
 }
 
 TEST_CASE("policy evaluator: output nested past the depth guard scores error and is counted "
