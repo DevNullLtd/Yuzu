@@ -1,0 +1,1 @@
+- **macOS `installed_apps.list_per_user` no longer executes Homebrew's `brew` as root.** The macOS agent runs as root and a Homebrew prefix is owned by the installing user, so running `brew` ran a user-controlled script as root. The action now lists system apps only; Homebrew formulae and casks are in `pkg_inventory.packages`. The `user_app|brew|...` rows are gone.

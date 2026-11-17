@@ -96,7 +96,7 @@ A logged-in user's loaded hive is read with no privilege. A logged-out profile n
 |---|---|---|---|
 | `list` | ✅ supported · rung 1 · Reg*W enumeration of the Uninstall key(s) | ✅ supported · rung 2 · system_profiler via bounded argv runner + native CFBundle enrichment | ✅ supported · rung 2 · dpkg-query/rpm/pacman via bounded argv runner |
 | `list_inventory` | ✅ supported · rung 1 · Reg*W enumeration of the Uninstall key(s) | ✅ supported · rung 2 · system_profiler + pkgutil via bounded argv runner + native SecCode/CFBundle enrichment | ✅ supported · rung 2 · dpkg-query/rpm/pacman/apk via bounded argv runner |
-| `list_per_user` | ✅ supported · rung 1 · Reg*W enumeration of HKU\\<SID>'s Uninstall key, mounting NTUSER.DAT via RegLoadKeyW when not already loaded | ✅ supported · rung 2 · system_profiler + brew via bounded argv runner | ✅ supported · rung 2 · dpkg-query/rpm/pacman via bounded argv runner |
+| `list_per_user` | ✅ supported · rung 1 · Reg*W enumeration of HKU\\<SID>'s Uninstall key, mounting NTUSER.DAT via RegLoadKeyW when not already loaded | ✅ supported · rung 2 · system_profiler via bounded argv runner | ✅ supported · rung 2 · dpkg-query/rpm/pacman via bounded argv runner |
 | `query` | ✅ supported · rung 1 · Reg*W enumeration of the Uninstall key(s) | ✅ supported · rung 2 · system_profiler via bounded argv runner | ✅ supported · rung 2 · dpkg-query/rpm/pacman via bounded argv runner |
 <!-- END GENERATED -->
 
@@ -105,10 +105,10 @@ A logged-in user's loaded hive is read with no privilege. A logged-out profile n
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
 | Windows | Agent service account, LocalSystem today, not the intended virtual service account (`docs/agent-privilege-model.md` Correction). | **None** for `list`, `query` and `list_inventory`: `Reg*W` reads only. `list_per_user`'s offline `NTUSER.DAT` mount for a logged-out profile uses `SeBackupPrivilege` and `SeRestorePrivilege`, which the agent account already holds. | Bare-metal Windows (10.0.26200) as `LocalSystem`, 2026-09-21. The capture predates the typed hive-read status and the default-on hive-file guard, so neither shows in it. | `list_per_user` writes `warning\|privilege_missing: ...` naming how many logged-out profiles could not be read, `warning\|hive_file_refused` per refused hive and `warning\|hive_read_failed` for unreadable Uninstall keys; machine-scope actions are unaffected. An unreadable profile list is `error\|profile_list_unreadable` with rc 1. |
-| macOS | Agent daemon, **root** today (the LaunchDaemon has no `UserName` key, `docs/agent-privilege-model.md`). | **None.** No keychain, TCC or Location Services grant is touched. A missing Security framework at build time turns the signature enrichment into a no-op (empty `publisher` and `signature_status`) rather than an error. | Bare-metal macOS 26.6.2 as an ordinary user (euid 501), 2026-09-21, not the daemon's root identity. In that capture `list_per_user` ended with rc 1 because `brew list --versions` exited non-zero for that account. | No privilege is required, so there is no refusal path; a failed tool is reported as a degraded acquisition (`error\|` row, rc 1). |
+| macOS | Agent daemon, **root** today (the LaunchDaemon has no `UserName` key, `docs/agent-privilege-model.md`). | **None.** No keychain, TCC or Location Services grant is touched. A missing Security framework at build time turns the signature enrichment into a no-op (empty `publisher` and `signature_status`) rather than an error. | Bare-metal macOS 26.6.2 as an ordinary user (euid 501), 2026-09-21, not the daemon's root identity. That capture predates the removal of the `brew` subprocess from `list_per_user`. | No privilege is required, so there is no refusal path; a failed tool is reported as a degraded acquisition (`error\|` row, rc 1). |
 | Linux | Agent daemon, an unprivileged account by design. | **None.** The dpkg, rpm, pacman and apk databases are expected to be world-readable (inferred, not measured as the unprivileged account). | Debian 13 container, euid 0, 2026-09-21; not the intended unprivileged account. | No privilege is required. If no package manager binary is found at its fixed path the collection is empty (not degraded); a found tool that fails is a degraded acquisition. |
 
-Subprocesses: Linux runs `dpkg-query`, `rpm`, `pacman` and (`list_inventory` only) `apk`, found at fixed absolute paths and run without a shell through the bounded runner (20 s deadline each). macOS runs `system_profiler`, `pkgutil` (`list_inventory`) and `brew` (`list_per_user` only) the same way. Windows spawns nothing. No network use on any OS.
+Subprocesses: Linux runs `dpkg-query`, `rpm`, `pacman` and (`list_inventory` only) `apk`, found at fixed absolute paths and run without a shell through the bounded runner (20 s deadline each). macOS runs `system_profiler` and `pkgutil` (`list_inventory`) the same way. The agent never runs Homebrew's `brew`: it is a script owned by the installing user, and the macOS agent is root (WP13/F19). Homebrew formulae and casks are listed by `pkg_inventory.packages`, which reads the Cellar/Caskroom directories without a subprocess; `list_per_user` therefore reports the system apps only on macOS. Windows spawns nothing. No network use on any OS.
 
 ## Data contract
 
@@ -144,11 +144,11 @@ Pipe-delimited rows, one per application, written via `write_output()`. `list`/`
 
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
-| `username` | string | - | Windows, Linux, macOS | `jsmith` | The resolved local profile name on Windows (never the SID), the literal "system" for the machine-scope Linux/macOS leg, or "brew" for macOS per-user Homebrew formulae. Values: profile name, "system", "brew", or "-". |
+| `username` | string | - | Windows, Linux, macOS | `jsmith` | The resolved local profile name on Windows (never the SID), the literal "system" for the machine-scope Linux/macOS leg, or "-". Values: profile name, "system", or "-". |
 | `name` | string | - | Windows, Linux, macOS | `Signal 8.18.0` | The application's display name. Values: free text. |
 | `version` | string | - | Windows, Linux, macOS | `8.18.0` | The installed version string, or "-" when the source reports none. Values: free text or "-". |
-| `publisher` | string | - | Windows, Linux | `Signal Messenger, LLC` | The vendor or maintainer name; always "-" on macOS and for Homebrew rows. Values: free text or "-". |
-| `install_date` | string | - | Windows, macOS | `20260714` | Install date in the OS's native format; "-" when the source reports none, which dpkg-based Linux hosts and Homebrew rows always do. Values: free text or "-". |
+| `publisher` | string | - | Windows, Linux | `Signal Messenger, LLC` | The vendor or maintainer name; always "-" on macOS. Values: free text or "-". |
+| `install_date` | string | - | Windows, macOS | `20260714` | Install date in the OS's native format; "-" when the source reports none, which dpkg-based Linux hosts always do. Values: free text or "-". |
 
 **`crossplatform.software.query` — `found|name|version|publisher`**
 
@@ -190,7 +190,7 @@ Provenance and completeness are agent-log only (the wire carries the status enum
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-21 · LocalSystem (elevated; profile name redacted to jsmith) · leg-hash 3690edc65cda
+**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-21 · LocalSystem (elevated; profile name redacted to jsmith) · leg-hash 1b150809d05d
 
 ```
 == action=list
@@ -255,7 +255,7 @@ inv|DayZ||Bohemia Interactive||app|windows||||||
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-21 · euid 501 (account redacted to jsmith; user-profile paths redacted) · leg-hash 3690edc65cda
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-21 · euid 501 (account redacted to jsmith; user-profile paths redacted) · leg-hash 1b150809d05d
 
 ```
 == action=list
@@ -312,7 +312,7 @@ inv|Grapher|2.8|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-21 · euid 0 · leg-hash 3690edc65cda
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-21 · euid 0 · leg-hash 1b150809d05d
 
 ```
 == action=list
@@ -384,6 +384,6 @@ inv|bsdutils|2.41.5|Chris Hofstaedtler <zeha@debian.org>||package|deb|1|0+deb13u
 - Plugin: `agents/plugins/installed_apps/src/installed_apps_bundle_ids.hpp` · `agents/plugins/installed_apps/src/installed_apps_inventory.hpp` · `agents/plugins/installed_apps/src/installed_apps_macos_enrich.hpp` · `agents/plugins/installed_apps/src/installed_apps_macos_receipts.hpp` · `agents/plugins/installed_apps/src/installed_apps_parsers.hpp` · `agents/plugins/installed_apps/src/installed_apps_plugin.cpp` · `agents/plugins/installed_apps/src/installed_apps_registry_utf8.hpp` · `agents/plugins/installed_apps/src/installed_apps_registry_walk.hpp`
 - Definitions: `content/definitions/installed_apps.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_b.hpp`
-- Tests: `tests/unit/test_installed_apps_actions.cpp` · `tests/unit/test_installed_apps_bundle_ids.cpp` · `tests/unit/test_installed_apps_inventory.cpp` · `tests/unit/test_installed_apps_macos_enrich.cpp` · `tests/unit/test_installed_apps_macos_receipts.cpp` · `tests/unit/test_installed_apps_parsers.cpp` · `tests/unit/test_installed_apps_registry_utf8.cpp` · `tests/unit/test_installed_apps_registry_walk.cpp` · `tests/unit/test_installed_apps_win_actions.cpp`
+- Tests: `tests/test_installed_apps_no_brew_lexical.py` · `tests/unit/test_installed_apps_actions.cpp` · `tests/unit/test_installed_apps_bundle_ids.cpp` · `tests/unit/test_installed_apps_inventory.cpp` · `tests/unit/test_installed_apps_macos_enrich.cpp` · `tests/unit/test_installed_apps_macos_receipts.cpp` · `tests/unit/test_installed_apps_parsers.cpp` · `tests/unit/test_installed_apps_registry_utf8.cpp` · `tests/unit/test_installed_apps_registry_walk.cpp` · `tests/unit/test_installed_apps_win_actions.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
 <!-- END GENERATED -->

@@ -541,7 +541,7 @@ implementation is.
 | installed_apps | query | macos | supported | 2 | system_profiler via bounded argv runner | - |
 | installed_apps | query | windows | supported | 1 | Reg*W enumeration of the Uninstall key(s) | - |
 | installed_apps | list_per_user | linux | supported | 2 | dpkg-query/rpm/pacman via bounded argv runner | - |
-| installed_apps | list_per_user | macos | supported | 2 | system_profiler + brew via bounded argv runner | - |
+| installed_apps | list_per_user | macos | supported | 2 | system_profiler via bounded argv runner | - |
 | installed_apps | list_per_user | windows | supported | 1 | Reg*W enumeration of HKU\\<SID>'s Uninstall key, mounting NTUSER.DAT via RegLoadKeyW when not already loaded | - |
 | installed_apps | list_inventory | linux | supported | 2 | dpkg-query/rpm/pacman/apk via bounded argv runner | - |
 | installed_apps | list_inventory | macos | supported | 2 | system_profiler + pkgutil via bounded argv runner + native SecCode/CFBundle enrichment | - |

@@ -3,7 +3,7 @@
  * (installed_apps_parsers.hpp, Wave 4 PR4.3a de-shell migration).
  *
  * The bounded-runner acquisition is the impure shell; the parsing of
- * dpkg-query/rpm/pacman/system_profiler/brew/pkgutil output is header-pure
+ * dpkg-query/rpm/pacman/system_profiler/pkgutil output is header-pure
  * and pinned here on every host (the firewall_parsers.hpp pattern).
  *
  * Fixture provenance, stated per TEST_CASE:
@@ -336,25 +336,6 @@ TEST_CASE("system_profiler apps: a non-ASCII Location is preserved", "[installed
     const auto apps = parse_system_profiler_apps(out);
     REQUIRE(apps.size() == 1);
     CHECK(apps[0].location == "/Applications/\xC3\x9C" "bersicht.app");
-}
-
-// ── macOS: brew list --versions ─────────────────────────────────────────
-
-TEST_CASE("brew list: name/version split, missing version tolerated — documented-format reconstruction",
-          "[installed_apps]") {
-    constexpr std::string_view out = "wget 1.21.4\ngit 2.43.0\nnode\n";
-    auto apps = parse_brew_list(out);
-    REQUIRE(apps.size() == 3);
-    CHECK(apps[0].name == "wget");
-    CHECK(apps[0].version == "1.21.4");
-    CHECK(apps[1].name == "git");
-    CHECK(apps[1].version == "2.43.0");
-    CHECK(apps[2].name == "node");
-    CHECK(apps[2].version.empty());
-}
-
-TEST_CASE("brew list: empty output yields zero apps", "[installed_apps]") {
-    CHECK(parse_brew_list("").empty());
 }
 
 // ── macOS: pkgutil (#2273 enrichment) ───────────────────────────────────
