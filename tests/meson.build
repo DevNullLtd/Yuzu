@@ -5100,6 +5100,21 @@ test('forensics tier wiring lexical',
   suite: 'docs',
   timeout: 30,
 )
+# WP01: the agent re-registration proof gate must stay wired into BOTH ingest paths, server.cpp
+# must wire/clear the hooks, and the test seam must not leak into production. Unit tests use fake
+# hooks, so only this lexical gate (plus its mutation selftest) guards the production wiring.
+test('reregistration gate wiring lexical',
+  _python3_test,
+  args: [files('test_reregistration_gate_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+test('reregistration gate wiring lexical selftest',
+  _python3_test,
+  args: [files('test_reregistration_gate_wiring_lexical_selftest.py')],
+  suite: 'docs',
+  timeout: 30,
+)
 # SAM-34: the collection-settings routes must register ahead of the generic inventory GET, and the
 # step-up, body-cap, OpenAPI and /readyz rows must exist.
 test('collection settings wiring lexical',

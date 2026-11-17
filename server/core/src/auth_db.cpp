@@ -2859,7 +2859,7 @@ std::expected<AuthDB::ConsumeEnrollResult, StoreError>
 AuthDB::consume_and_enroll(std::string_view raw_token, const std::string& agent_id,
                            const std::string& hostname, const std::string& os,
                            const std::string& arch, const std::string& agent_version,
-                           bool enforce_new_id_charset) {
+                           bool enforce_new_id_charset, bool require_single_use) {
     if (raw_token.empty() || raw_token.size() > auth::kMaxEnrollmentTokenLength ||
         has_embedded_nul(raw_token)) {
         return std::unexpected(StoreError::InvalidInput);
@@ -2896,8 +2896,12 @@ AuthDB::consume_and_enroll(std::string_view raw_token, const std::string& agent_
             "WHERE token_hash = $1 AND NOT revoked "
             "  AND (expires_at IS NULL OR expires_at > now()) "
             "  AND (max_uses = 0 OR use_count < max_uses) "
+            // WP01: a re-enrolment of an id that holds a live leaf accepts only a SINGLE-USE
+            // token. Decided INSIDE this guarded UPDATE so a multi-use token's use_count is
+            // never incremented (no consume-then-refuse burn, no rollback to get wrong).
+            "  AND (NOT $3::boolean OR max_uses = 1) "
             "RETURNING token_id, max_uses, use_count",
-            std::vector<std::string>{token_hash, agent_id});
+            std::vector<std::string>{token_hash, agent_id, require_single_use ? "t" : "f"});
         if (upd.status() != PGRES_TUPLES_OK)
             return false;
 
@@ -2913,7 +2917,7 @@ AuthDB::consume_and_enroll(std::string_view raw_token, const std::string& agent_
                 "SELECT revoked, "
                 "       (expires_at IS NOT NULL AND expires_at <= now()), "
                 "       (max_uses <> 0 AND use_count >= max_uses), "
-                "       last_consumed_by_agent_id "
+                "       last_consumed_by_agent_id, (max_uses <> 1) "
                 "FROM auth.enrollment_tokens WHERE token_hash = $1",
                 std::vector<std::string>{token_hash});
             if (cls.status() != PGRES_TUPLES_OK)
@@ -2923,7 +2927,12 @@ AuthDB::consume_and_enroll(std::string_view raw_token, const std::string& agent_
                     result.token_error = auth::EnrollmentTokenError::revoked;
                 else if (to_bool(col(cls.get(), 0, 1)))
                     result.token_error = auth::EnrollmentTokenError::expired;
-                else {
+                else if (!to_bool(col(cls.get(), 0, 2)) && require_single_use &&
+                         to_bool(col(cls.get(), 0, 4))) {
+                    // A valid multi-use token refused only because single-use was required.
+                    result.token_error = auth::EnrollmentTokenError::not_found;
+                    result.not_single_use = true;
+                } else {
                     // Exhausted — or (defence) the row changed between the
                     // UPDATE and this read; either way the honest label is
                     // "already consumed", never "not found".

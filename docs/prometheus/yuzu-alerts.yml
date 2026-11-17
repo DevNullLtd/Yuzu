@@ -3949,6 +3949,63 @@ groups:
             clear the revocation before re-provisioning can succeed.
           runbook_url: "https://docs.yuzu.io/runbooks/ca-reissue-blocked"
 
+      # WP01: agent re-registration proof-of-identity rollout (--agent-reregistration-proof).
+      # `audit` (the default of the first release) ADMITS what `enforce` would refuse; these rules
+      # are the soak criterion for switching to enforce. All series are seeded to 0 at boot.
+      - alert: YuzuAgentReregistrationWouldRefund
+        expr: |
+          sum by (job, instance) (increase(yuzu_register_reregistration_total{mode="audit",outcome=~"no_proof|unattested_gateway|revoked_identity|lookup_failed"}[1h])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Re-registrations that enforce would refuse were admitted (audit mode)"
+          description: >-
+            yuzu_register_reregistration_total in audit mode counted an unproven re-registration
+            of an already-enrolled agent id (no_proof, unattested_gateway, revoked_identity or
+            lookup_failed). Either a real agent would be locked out by --agent-reregistration-proof=enforce
+            (an un-upgraded or non-witnessing gateway, a lost key), or this is the takeover the
+            control exists to stop. Do not switch to enforce while this fires for real agents.
+          runbook_url: "https://docs.yuzu.io/runbooks/agent-reregistration-proof"
+
+      - alert: YuzuAgentReregistrationUnattestedGateway
+        expr: |
+          sum by (job, instance) (increase(yuzu_register_reregistration_total{path="gateway_proxy",outcome="unattested_gateway"}[30m])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "A gateway cannot witness client certificates: its agents cannot satisfy enforce"
+          description: >-
+            A gateway-relayed re-registration reported gateway_attests_peer_cert=false: the gateway
+            is too old, plaintext, or its agent listener lacks witness_client_cert. Under
+            --agent-reregistration-proof=enforce every leaf-holding agent behind it is refused.
+          runbook_url: "https://docs.yuzu.io/runbooks/agent-reregistration-proof"
+
+      - alert: YuzuAgentLeafSupersedeFailed
+        expr: |
+          increase(yuzu_server_ca_supersede_failed_total[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "An agent's older certificate was NOT revoked after a token re-enrolment"
+          description: >-
+            After a single-use-token re-enrolment issued a fresh leaf, revoking the older live leaf
+            failed (ca.cert.supersede_failed audit row). The possibly lost or stolen leaf stays valid
+            until it expires or an operator revokes it. The re-enrolment itself succeeded.
+          runbook_url: "https://docs.yuzu.io/runbooks/agent-reregistration-proof"
+
+      - alert: YuzuAgentReregistrationModeMixed
+        expr: |
+          count by (job) (count by (job, mode) (yuzu_server_agent_reregistration_proof_mode == 1)) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Server replicas run different --agent-reregistration-proof modes"
+          description: >-
+            The flag is per process. A fleet is only as enforced as its weakest replica; finish the
+            rollout (or roll back) on every replica.
+          runbook_url: "https://docs.yuzu.io/runbooks/agent-reregistration-proof"
+
   # ── yuzu-response-store — LIVE as of the response store's Postgres migration
   # (ADR-0039) ──────────────────────────────────────────────────────────────
   # These replace the old (never-emitted) `yuzu_server_response_store_writes_total`

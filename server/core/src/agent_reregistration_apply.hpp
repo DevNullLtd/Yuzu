@@ -7,6 +7,7 @@
 /// `approved` fast path. One copy: the lookup, the metric, the mode handling and the refusal status
 /// live here, so a handler contributes only its transport's evidence. EXTEND it, never fork it.
 
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -17,6 +18,7 @@
 #include <yuzu/metrics.hpp>
 
 #include "agent_reregistration_gate.hpp"
+#include "bounded_audit_budget.hpp"
 
 namespace yuzu::server {
 
@@ -31,13 +33,41 @@ struct ReregistrationVerdict {
     std::optional<grpc::Status> refusal;
 };
 
+/// How a handler writes the audit row for a re-registration decision (it owns the AuditStore, the
+/// peer address and the principal shape). `action` is one of the two below, `result` the AuditEvent
+/// result, `outcome` the `to_string(ReregistrationOutcome)` token. A refused row must never change
+/// the outcome of the call: the sink's failure is the sink's to count.
+using ReregistrationAuditSink = std::function<void(std::string_view action, std::string_view result,
+                                                   std::string_view outcome, std::string_view mode)>;
+/// `enforce` refused the re-registration (result `denied`; `failure` for a lookup failure).
+inline constexpr std::string_view kAuditActionReregistrationRefused = "agent.reregistration_refused";
+/// `audit` mode ADMITTED a re-registration enforce would have refused (result `success`): the row
+/// that makes a takeover in the default mode reconstructable.
+inline constexpr std::string_view kAuditActionReregistrationUnproven = "agent.reregistration_unproven";
+
+namespace detail {
+/// Rows an unauthenticated caller can provoke are bounded per (outcome, agent id) and per window
+/// (`bounded_audit_budget.hpp`); the unsampled counter `yuzu_register_reregistration_total` still
+/// counts every decision. Log lines get a separate, tighter budget (a restart storm of a whole
+/// fleet re-registering must not flood the log).
+inline DenialAuditBudget& reregistration_audit_budget() {
+    static DenialAuditBudget b;
+    return b;
+}
+inline DenialAuditBudget& reregistration_log_budget() {
+    static DenialAuditBudget b{/*max_rows=*/5, /*window_ms=*/10'000};
+    return b;
+}
+} // namespace detail
+
 /// `path` is the metric label ("direct" | "gateway_proxy"). `hooks` may be null (no CA of our own:
 /// the gate is inert). `metrics` may be null (the gateway service's registry is optional).
 [[nodiscard]] inline ReregistrationVerdict
 apply_reregistration_gate(ReregistrationProofMode mode, const AgentIdentityHooks* hooks,
                           std::string_view path, const std::string& agent_id,
                           const std::string& safe_agent_id, const ReregistrationEvidence& ev,
-                          yuzu::MetricsRegistry* metrics) {
+                          yuzu::MetricsRegistry* metrics,
+                          const ReregistrationAuditSink& audit = {}) {
     if (mode == ReregistrationProofMode::Off || hooks == nullptr || !hooks->leaf_state)
         return {};
 
@@ -58,30 +88,52 @@ apply_reregistration_gate(ReregistrationProofMode mode, const AgentIdentityHooks
     }
 
     const bool problem = is_refusal(outcome) || outcome == ReregistrationOutcome::LookupFailed;
+    const std::string outcome_token(to_string(outcome));
+    const auto log_admitted = [&] {
+        return problem && detail::reregistration_log_budget()
+                              .try_admit(std::string(path) + "|" + outcome_token)
+                              .admitted;
+    };
+    const auto write_audit = [&](std::string_view action, std::string_view result) {
+        if (!audit || !detail::reregistration_audit_budget()
+                           .try_admit(outcome_token + "|" + agent_id, outcome_token + "|*")
+                           .admitted)
+            return;
+        try {
+            audit(action, result, outcome_token, to_string(mode));
+        } catch (...) {
+        }
+    };
     if (mode == ReregistrationProofMode::Audit) {
         // Decide and count exactly as enforce would, admit exactly as before. The id is
         // caller-supplied and arrives already neutralised (log_id_token).
         if (problem) {
-            spdlog::warn("Re-registration of agent {} on the {} path would be REFUSED under "
-                         "--agent-reregistration-proof=enforce: {} (admitted: audit mode)",
-                         safe_agent_id, path, to_string(outcome));
+            if (log_admitted())
+                spdlog::warn("Re-registration of agent {} on the {} path would be REFUSED under "
+                             "--agent-reregistration-proof=enforce: {} (admitted: audit mode)",
+                             safe_agent_id, path, to_string(outcome));
+            write_audit(kAuditActionReregistrationUnproven, "success");
         }
         return {ReregistrationVerdict::Route::Admit, outcome, std::nullopt};
     }
 
     // Enforce.
     if (outcome == ReregistrationOutcome::LookupFailed) {
-        spdlog::error("Re-registration of agent {} on the {} path: identity lookup failed ({}) - "
-                      "refusing, retryable",
-                      safe_agent_id, path, leaf ? "" : ::yuzu::log_key_token(leaf.error()));
+        if (log_admitted())
+            spdlog::error("Re-registration of agent {} on the {} path: identity lookup failed ({}) "
+                          "- refusing, retryable",
+                          safe_agent_id, path, leaf ? "" : ::yuzu::log_key_token(leaf.error()));
+        write_audit(kAuditActionReregistrationRefused, "failure");
         // UNAVAILABLE, like every other store outage on this path: the agent retries on its
         // normal backoff (accepted=false would be a PERMANENT rejection).
         return {ReregistrationVerdict::Route::Refuse, outcome,
                 grpc::Status(grpc::StatusCode::UNAVAILABLE, "registration temporarily unavailable")};
     }
     if (is_refusal(outcome)) {
-        spdlog::warn("Re-registration of agent {} on the {} path refused: {}", safe_agent_id, path,
-                     to_string(outcome));
+        if (log_admitted())
+            spdlog::warn("Re-registration of agent {} on the {} path refused: {}", safe_agent_id,
+                         path, to_string(outcome));
+        write_audit(kAuditActionReregistrationRefused, "denied");
         return {ReregistrationVerdict::Route::Refuse, outcome,
                 grpc::Status(grpc::StatusCode::UNAUTHENTICATED,
                              std::string(kReregistrationRefusalPublicMessage))};

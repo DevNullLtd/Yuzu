@@ -2392,3 +2392,97 @@ TEST_CASE("CaStore: kRevokeReasonReenrolled is a system marker an operator canno
     REQUIRE(rows->size() == 1);
     CHECK((*rows)[0].revocation_reason == "operator-supplied:   Reenrolled ");
 }
+
+// ── WP01 UP-1: concurrent token re-enrolments must not cross-revoke ───────────────────────────
+
+namespace {
+IssuedCertRecord agent_leaf_at(const std::string& serial, const std::string& subject, int64_t not_after,
+                               int64_t issued_at, const std::string& purpose = "agent") {
+    auto r = agent_leaf(serial, subject, not_after, purpose);
+    r.issued_at = issued_at;
+    return r;
+}
+} // namespace
+
+TEST_CASE("CaStore::revoke_older_agent_leaves revokes only OLDER leaves, so concurrent re-enrolments "
+          "converge on the newest and never leave the id with no live leaf",
+          "[ca_store][pg][wp01][agent_leaf_state]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    CaStore store{pool};
+    REQUIRE(store.is_open());
+    const auto future = now_s() + 30 * 86400;
+    const auto t0 = now_s() - 1000;
+
+    // Original leaf O, then two concurrent re-enrolments issued A (older) and B (newer).
+    REQUIRE(store.record_issued(agent_leaf_at("D0", "agent-c", future, t0)).has_value());
+    REQUIRE(store.record_issued(agent_leaf_at("D1", "agent-c", future, t0 + 10)).has_value()); // A
+    REQUIRE(store.record_issued(agent_leaf_at("D2", "agent-c", future, t0 + 20)).has_value()); // B
+
+    SECTION("B supersedes first, then A: the older call must not revoke B") {
+        auto b = store.revoke_older_agent_leaves("agent-c", "D2");
+        REQUIRE(b.has_value());
+        auto a = store.revoke_older_agent_leaves("agent-c", "D1");
+        REQUIRE(a.has_value());
+        CHECK(a->empty()); // nothing older than A is still live
+        auto st = store.agent_leaf_state("agent-c");
+        REQUIRE(st.has_value());
+        CHECK(st->has_live); // B survives: the id is NOT left with no live leaf
+        CHECK_FALSE(st->has_revoked_unexpired); // and the supersessions are bookkeeping
+        auto live = store.live_agent_serials("agent-c");
+        REQUIRE(live.has_value());
+        CHECK(*live == std::vector<std::string>{"D2"});
+    }
+    SECTION("A supersedes first, then B: same end state") {
+        REQUIRE(store.revoke_older_agent_leaves("agent-c", "D1").has_value());
+        REQUIRE(store.revoke_older_agent_leaves("agent-c", "D2").has_value());
+        auto live = store.live_agent_serials("agent-c");
+        REQUIRE(live.has_value());
+        CHECK(*live == std::vector<std::string>{"D2"});
+    }
+    SECTION("never touches another id, a code-signing leaf, or an already revoked or expired one") {
+        REQUIRE(store.record_issued(agent_leaf_at("D3", "agent-other", future, t0)).has_value());
+        auto cs = agent_leaf_at("D4", "agent-c", future, t0, "code-signing");
+        REQUIRE(store.record_issued(cs).has_value());
+        REQUIRE(store.record_issued(agent_leaf_at("D5", "agent-c", now_s() - 10, t0)).has_value());
+        auto revoked = store.revoke_older_agent_leaves("agent-c", "D2");
+        REQUIRE(revoked.has_value());
+        std::sort(revoked->begin(), revoked->end());
+        CHECK(*revoked == std::vector<std::string>{"D0", "D1"});
+        auto other = store.live_agent_serials("agent-other");
+        REQUIRE(other.has_value());
+        CHECK(*other == std::vector<std::string>{"D3"});
+        CHECK_FALSE(store.is_revoked("D4"));
+    }
+    SECTION("an unknown or non-hex keep serial revokes nothing / fails closed") {
+        auto none = store.revoke_older_agent_leaves("agent-c", "FFFF");
+        REQUIRE(none.has_value());
+        CHECK(none->empty()); // keep serial not on record: the join matches nothing
+        CHECK_FALSE(store.revoke_older_agent_leaves("agent-c", "zz").has_value());
+    }
+}
+
+TEST_CASE("CaStore: a leaf revoked as 'reenrolled' counts in the superseded bucket, never 'other'",
+          "[ca_store][pg][wp01][stats]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    CaStore store{pool};
+    REQUIRE(store.is_open());
+    const auto future = now_s() + 30 * 86400;
+    REQUIRE(store.record_issued(agent_leaf("B1", "agent-s", future)).has_value());
+    REQUIRE(store.record_issued(agent_leaf("B2", "agent-s", future)).has_value());
+    REQUIRE(store.record_issued(agent_leaf("B3", "agent-t", future)).has_value());
+    REQUIRE(store.revoke_system("B1", kRevokeReasonReenrolled).value_or(false));
+    REQUIRE(store.revoke_system("B2", kRevokeReasonSuperseded).value_or(false));
+    REQUIRE(store.revoke("B3", "key compromise").value_or(false));
+    const auto count = [&](CaRevokeBucket b) {
+        CaIssuedFilter f{.kind = CaIssuedFilter::Kind::kRevoked, .days = 7};
+        f.revoked_bucket = b;
+        auto rows = store.list_issued_filtered(f, std::nullopt, 50);
+        REQUIRE(rows.has_value());
+        return rows->rows.size();
+    };
+    CHECK(count(CaRevokeBucket::kSuperseded) == 2); // superseded + reenrolled
+    CHECK(count(CaRevokeBucket::kOther) == 1);      // only the genuine, operator-typed revocation
+    CHECK(count(CaRevokeBucket::kUnpublished) == 0);
+}

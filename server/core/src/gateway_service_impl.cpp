@@ -736,6 +736,55 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
                             std::string(yuzu::server::kReregistrationRefusalPublicMessage));
     };
 
+    // Both fields are gateway-authoritative (overwritten unconditionally by an upgraded gateway),
+    // so they are read ONLY here; the direct Register ignores them. `attests` is true only when
+    // the gateway's listener can witness a client certificate; an old gateway, a plaintext
+    // listener and TLS without witness_client_cert all report false (no proof can exist).
+    const auto run_reregistration_gate = [&]() {
+        const bool attests = request->gateway_attests_peer_cert();
+        bool cert_proves = false;
+        if (attests && agent_identity_hooks_ && agent_identity_hooks_->attested_leaf_proves &&
+            reregistration_mode_ != yuzu::server::ReregistrationProofMode::Off) {
+            try {
+                cert_proves = agent_identity_hooks_->attested_leaf_proves(
+                    request->gateway_attested_peer_cert_pem(), info.agent_id());
+            } catch (...) {
+                cert_proves = false; // a throw is no proof
+            }
+        }
+        return yuzu::server::apply_reregistration_gate(
+            reregistration_mode_, agent_identity_hooks_.get(), "gateway_proxy", info.agent_id(),
+            safe_agent_id,
+            yuzu::server::ReregistrationEvidence{
+                .cert_proves_identity = cert_proves,
+                .token_presented = !request->enrollment_token().empty(),
+                .transport_can_prove = attests},
+            metrics_,
+            [&](std::string_view action, std::string_view result, std::string_view outcome,
+                std::string_view mode) {
+                if (!audit_store_ || !audit_store_->is_open())
+                    return;
+                AuditEvent ev;
+                ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                                   std::chrono::system_clock::now().time_since_epoch())
+                                   .count();
+                ev.principal = "agent:" + info.agent_id();
+                ev.principal_role = "agent";
+                ev.action = std::string(action);
+                ev.target_type = "Agent";
+                ev.target_id = info.agent_id();
+                std::string detail = std::string("path=gateway_proxy outcome=")
+                                         .append(outcome)
+                                         .append(" mode=")
+                                         .append(mode);
+                append_origin_detail(detail); // #1064: gateway_ip + origin_observed
+                ev.detail = std::move(detail);
+                ev.source_ip = agent_source_ip; // #1064: agent origin, not gateway IP
+                ev.result = std::string(result);
+                (void)audit_store_->log(ev);
+            });
+    };
+
     // Fast path: agent already enrolled from a prior connection
     {
         // WS-6 6.2: five-state read — a store ERROR fails closed with UNAVAILABLE,
@@ -766,29 +815,23 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
             spdlog::info("[gateway] Agent {} re-registering (already enrolled)", safe_agent_id);
             // WP01: the approved row is not proof of WHO is calling (the agent listener is
             // verify-none by design, so the gateway relayed an unauthenticated claim). The proof
-            // is the leaf the gateway WITNESSED in the agent's TLS handshake. Both fields are
-            // gateway-authoritative (overwritten unconditionally by an upgraded gateway), so they
-            // are read ONLY on this path; the direct Register ignores them. An old gateway sets
-            // neither: `attests` is false and no certificate proof exists.
-            const bool attests = request->gateway_attests_peer_cert();
-            const bool cert_proves =
-                attests && agent_identity_hooks_ && agent_identity_hooks_->attested_leaf_proves &&
-                agent_identity_hooks_->attested_leaf_proves(
-                    request->gateway_attested_peer_cert_pem(), info.agent_id());
-            const auto verdict = yuzu::server::apply_reregistration_gate(
-                reregistration_mode_, agent_identity_hooks_.get(), "gateway_proxy",
-                info.agent_id(), safe_agent_id,
-                yuzu::server::ReregistrationEvidence{
-                    .cert_proves_identity = cert_proves,
-                    .token_presented = !request->enrollment_token().empty(),
-                    .transport_can_prove = attests},
-                metrics_);
+            // is the leaf the gateway WITNESSED in the agent's TLS handshake; see
+            // run_reregistration_gate below.
+            const auto verdict = run_reregistration_gate();
             if (verdict.route == yuzu::server::ReregistrationVerdict::Route::Refuse)
                 return *verdict.refusal;
             if (verdict.route == yuzu::server::ReregistrationVerdict::Route::TokenReenrol)
                 reenrol_via_token = true; // fall through to the token block
             else
                 goto gw_enrolled;
+        }
+        // WP01 / UP-2: the gate keys on the LEAF STATE, not the pending row (see the direct path).
+        if (!prior) {
+            const auto verdict = run_reregistration_gate();
+            if (verdict.route == yuzu::server::ReregistrationVerdict::Route::Refuse)
+                return *verdict.refusal;
+            if (verdict.route == yuzu::server::ReregistrationVerdict::Route::TokenReenrol)
+                reenrol_via_token = true;
         }
         // #1067: reject an admin-DENIED agent BEFORE consuming any enrollment
         // token — same token-depletion DoS as the direct-connect path (W1.4
@@ -876,7 +919,8 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
                           yuzu::server::sanitize_enrollment_text(info.platform().os()),
                           yuzu::server::sanitize_enrollment_text(info.platform().arch()),
                           yuzu::server::sanitize_enrollment_text(info.agent_version()),
-                          /*enforce_new_id_charset=*/true)
+                          /*enforce_new_id_charset=*/true,
+                          /*require_single_use=*/reenrol_via_token)
                     : std::expected<auth::ConsumeEnrollResult, StoreError>{
                           auth::ConsumeEnrollResult{
                               .kind = auth::ConsumeEnrollResult::Kind::token_rejected,
@@ -978,7 +1022,8 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
                 }
 
                 if (reenrol_via_token)
-                    return reenrol_token_refusal(variant);
+                    return reenrol_token_refusal(consumed->not_single_use ? std::string_view{"multi_use_token"}
+                                                                      : std::string_view{variant});
                 response->set_accepted(false);
                 response->set_reject_reason(
                     std::string(yuzu::server::kEnrollmentTokenRejectionPublicMessage));
@@ -1504,7 +1549,11 @@ gw_enrolled:
             if (reenrolled_with_token && agent_identity_hooks_ &&
                 agent_identity_hooks_->supersede_older_leaves) {
                 try {
-                    agent_identity_hooks_->supersede_older_leaves(info.agent_id(), issued->first);
+                    if (!agent_identity_hooks_->supersede_older_leaves(info.agent_id(),
+                                                                       issued->first))
+                        spdlog::warn("agent {}: older leaves not superseded (see "
+                                     "ca.cert.supersede_failed)",
+                                     safe_agent_id);
                 } catch (...) {
                     spdlog::error("[gateway] ProxyRegister: superseding older leaves threw for "
                                   "agent {}",

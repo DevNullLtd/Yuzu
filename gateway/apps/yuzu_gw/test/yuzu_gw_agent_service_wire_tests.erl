@@ -273,15 +273,26 @@ register_attestation_overwritten(_State) ->
     Request = #{info => #{agent_id => <<"agent-w">>, hostname => <<"h">>},
                 gateway_attested_peer_cert_pem => ForgedPem,
                 gateway_attests_peer_cert => false},
-    NoCert = yuzu_grpc:new_ctx(#{}, self(), undefined, undefined, undefined),
+    NoCert = yuzu_grpc:new_ctx(#{}, self(), undefined, undefined, undefined, true),
     ?assertMatch({ok, #{session_id := <<"sess-agent-w">>}, _},
                  yuzu_gw_agent_service:register(NoCert, Request)),
     Sent = meck:capture(last, yuzu_gw_upstream, proxy_register, '_', 1),
     ?assertEqual(<<>>, maps:get(gateway_attested_peer_cert_pem, Sent)),
     ?assertEqual(true, maps:get(gateway_attests_peer_cert, Sent)),
+    %% CH-5: a listener that CANNOT witness (plaintext, or TLS without
+    %% witness_client_cert) must not claim to have: the agent-supplied `true' is
+    %% overwritten with false, so the server logs unattested_gateway, not no_proof.
+    reset(),
+    NoWitness = yuzu_grpc:new_ctx(#{}, self(), undefined, undefined, undefined),
+    ?assertMatch({ok, #{session_id := <<"sess-agent-w">>}, _},
+                 yuzu_gw_agent_service:register(NoWitness, Request#{gateway_attests_peer_cert => true})),
+    SentNW = meck:capture(last, yuzu_gw_upstream, proxy_register, '_', 1),
+    ?assertEqual(false, maps:get(gateway_attests_peer_cert, SentNW)),
+    ?assertEqual(<<>>, maps:get(gateway_attested_peer_cert_pem, SentNW)),
+    reset(),
     %% and with a witnessed certificate the PEM is that certificate's
     Der = <<48, 3, 2, 1, 1>>,
-    WithCert = yuzu_grpc:new_ctx(#{}, self(), undefined, undefined, Der),
+    WithCert = yuzu_grpc:new_ctx(#{}, self(), undefined, undefined, Der, true),
     reset(),
     ?assertMatch({ok, #{session_id := <<"sess-agent-w">>}, _},
                  yuzu_gw_agent_service:register(WithCert, Request)),

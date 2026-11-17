@@ -123,6 +123,14 @@ decide_reregistration(const std::expected<AgentLeafState, std::string>& leaf,
                       const ReregistrationEvidence& ev) {
     if (!leaf)
         return ReregistrationOutcome::LookupFailed;
+    // A revoked, unexpired agent leaf that is not a `reenrolled` supersession means an operator
+    // (or the revocation sweep) withdrew this identity and nothing has cleared it:
+    // `sign_agent_csr`'s HIGH-2 guard will refuse any issuance for the id, so a token would be
+    // consumed for a leaf that can never be issued (UP-5: a live leaf beside a stale revoked one
+    // wedged the agent). Decided BEFORE the token block, whatever else the caller shows, except
+    // the current leaf (a renewal's own CSR is then refused by that guard, as before).
+    if (leaf->has_revoked_unexpired && !ev.cert_proves_identity)
+        return ReregistrationOutcome::RefuseRevokedIdentity;
     if (leaf->has_live) {
         if (ev.cert_proves_identity)
             return ReregistrationOutcome::ProvenByLeaf;
@@ -156,7 +164,9 @@ struct AgentIdentityHooks {
         attested_leaf_proves;
     /// After a token re-enrolment issued `new_cert_pem`: revoke the agent's OTHER live leaves
     /// (`kRevokeReasonReenrolled`). Best effort, logged and audited by the implementation.
-    std::function<void(const std::string& agent_id, const std::string& new_cert_pem)>
+    /// Returns false when the older leaves could NOT be revoked (the agent already holds a good new
+    /// leaf; the caller audits the failure, it does not fail the registration: best effort).
+    std::function<bool(const std::string& agent_id, const std::string& new_cert_pem)>
         supersede_older_leaves;
 };
 

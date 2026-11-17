@@ -685,6 +685,12 @@ public:
     const std::string& unpublished() {
         return bind(unpublished_, [&] { return p_.add_text(kRevokeReasonUnpublished); });
     }
+    /// WP01: a leaf the server revoked as `reenrolled` is lifecycle bookkeeping exactly like
+    /// `superseded` (a fresh leaf replaced it), so it counts in the SUPERSEDED bucket, never in
+    /// "other" (which a reader takes for compromise revocations).
+    const std::string& reenrolled() {
+        return bind(reenrolled_, [&] { return p_.add_text(kRevokeReasonReenrolled); });
+    }
 
 private:
     template <class F> const std::string& bind(std::string& slot, F&& make) {
@@ -695,6 +701,7 @@ private:
     SqlParams& p_;
     std::string superseded_;
     std::string unpublished_;
+    std::string reenrolled_;
 };
 
 // The statement's one-row clock CTE, `t(as_of, week)`: as_of is the caller's pinned value bound
@@ -719,11 +726,12 @@ std::string bucket_predicate(std::optional<CaRevokeBucket> bucket, PredicateRefs
         return {};
     switch (*bucket) {
     case CaRevokeBucket::kSuperseded:
-        return " AND revocation_reason = " + r.superseded();
+        return " AND revocation_reason IN (" + r.superseded() + ", " + r.reenrolled() + ")";
     case CaRevokeBucket::kUnpublished:
         return " AND revocation_reason = " + r.unpublished();
     case CaRevokeBucket::kOther:
-        return " AND revocation_reason NOT IN (" + r.superseded() + ", " + r.unpublished() + ")";
+        return " AND revocation_reason NOT IN (" + r.superseded() + ", " + r.reenrolled() + ", " +
+               r.unpublished() + ")";
     }
     return " AND false"; // unreachable: every enumerator returns above
 }
@@ -731,8 +739,8 @@ std::string bucket_predicate(std::optional<CaRevokeBucket> bucket, PredicateRefs
 // The same three buckets as a value (0 superseded, 1 unpublished, 2 other) for the per-week
 // revoked series' GROUP BY - the CASE arms are bucket_predicate's, in the same order.
 std::string bucket_index(PredicateRefs& r) {
-    return "CASE WHEN revocation_reason = " + r.superseded() +
-           " THEN 0 WHEN revocation_reason = " + r.unpublished() + " THEN 1 ELSE 2 END";
+    return "CASE WHEN revocation_reason IN (" + r.superseded() + ", " + r.reenrolled() +
+           ") THEN 0 WHEN revocation_reason = " + r.unpublished() + " THEN 1 ELSE 2 END";
 }
 
 // An issued count never includes a certificate revoked as unpublished: it was recorded but never
@@ -1365,6 +1373,38 @@ CaStore::live_agent_serials(const std::string& agent_id) {
     std::vector<std::string> out;
     const int n = PQntuples(res.get());
     out.reserve(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i)
+        out.push_back(text_col(res.get(), i, 0));
+    return out;
+}
+
+std::expected<std::vector<std::string>, std::string>
+CaStore::revoke_older_agent_leaves(const std::string& agent_id, const std::string& keep_serial) {
+    if (!open_)
+        return std::unexpected(std::string(kCaDbErrorPrefix) + "database not open");
+    const auto keep = normalize_serial_hex(keep_serial);
+    if (!keep)
+        return std::unexpected(std::string(kCaDbErrorPrefix) + "keep serial is not hex");
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease)
+        return std::unexpected(std::string(kCaDbErrorPrefix) + "database unavailable — try again");
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "UPDATE ca_store.ca_issued o SET status = 'revoked', revocation_reason = $3, "
+        "revoked_at = $4::bigint FROM ca_store.ca_issued n "
+        "WHERE n.serial_hex = $2 AND n.purpose = 'agent' AND n.subject = $1 "
+        "AND o.purpose = 'agent' AND o.subject = $1 AND o.status = 'active' "
+        "AND o.not_after > extract(epoch FROM now())::bigint "
+        "AND (o.issued_at, o.serial_hex) < (n.issued_at, n.serial_hex) "
+        "RETURNING o.serial_hex",
+        std::vector<std::string>{sanitize_pg_text(agent_id), *keep,
+                                 std::string(kRevokeReasonReenrolled),
+                                 std::to_string(now_epoch())});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected(std::string(kCaDbErrorPrefix) +
+                               "revoke_older_agent_leaves failed: " + PQerrorMessage(lease.get()));
+    std::vector<std::string> out;
+    const int n = PQntuples(res.get());
     for (int i = 0; i < n; ++i)
         out.push_back(text_col(res.get(), i, 0));
     return out;

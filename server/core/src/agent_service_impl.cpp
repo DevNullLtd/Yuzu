@@ -387,6 +387,40 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                             std::string(yuzu::server::kReregistrationRefusalPublicMessage));
     };
 
+    const auto run_reregistration_gate = [&]() {
+        return yuzu::server::apply_reregistration_gate(
+            reregistration_mode_, require_client_identity_ ? agent_identity_hooks_.get() : nullptr,
+            "direct", info.agent_id(), safe_agent_id,
+            yuzu::server::ReregistrationEvidence{
+                .cert_proves_identity = cert_proves_identity,
+                .token_presented = !request->enrollment_token().empty(),
+                .transport_can_prove = true},
+            &metrics_,
+            [&](std::string_view action, std::string_view result, std::string_view outcome,
+                std::string_view mode) {
+                // The decision's audit row (bounded by the apply helper). Same actor shape as the
+                // enrollment rows above; a dropped row surfaces on the wire like theirs.
+                if (!audit_store_ || !audit_store_->is_open())
+                    return;
+                AuditEvent ev;
+                ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                                   std::chrono::system_clock::now().time_since_epoch())
+                                   .count();
+                ev.principal = "agent:" + info.agent_id();
+                ev.principal_role = "agent";
+                ev.action = std::string(action);
+                ev.target_type = "Agent";
+                ev.target_id = info.agent_id();
+                ev.detail = std::string("path=direct outcome=").append(outcome).append(" mode=")
+                                .append(mode);
+                if (context)
+                    ev.source_ip = extract_peer_ip(context->peer());
+                ev.result = std::string(result);
+                if (!audit_store_->log(ev))
+                    signal_grpc_audit_failed(context);
+            });
+    };
+
     // Fast path: agent already enrolled from a prior connection — skip enrollment
     {
         // WS-6 6.2: five-state read. A store ERROR must never read as "absent"
@@ -418,21 +452,25 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
             // registry_.register_agent (which would replace the live session and revoke device
             // tokens), so a refused caller cannot displace the real agent. Plain-TLS and
             // --no-tls listeners (no client identity required) have no proof to offer: inert.
-            const auto verdict = yuzu::server::apply_reregistration_gate(
-                reregistration_mode_,
-                require_client_identity_ ? agent_identity_hooks_.get() : nullptr, "direct",
-                info.agent_id(), safe_agent_id,
-                yuzu::server::ReregistrationEvidence{
-                    .cert_proves_identity = cert_proves_identity,
-                    .token_presented = !request->enrollment_token().empty(),
-                    .transport_can_prove = true},
-                &metrics_);
+            const auto verdict = run_reregistration_gate();
             if (verdict.route == yuzu::server::ReregistrationVerdict::Route::Refuse)
                 return *verdict.refusal;
             if (verdict.route == yuzu::server::ReregistrationVerdict::Route::TokenReenrol)
                 reenrol_via_token = true; // fall through to the token block
             else
                 goto enrolled;
+        }
+        // WP01 / UP-2: the gate keys on the LEAF STATE, not on the pending row. An operator who
+        // deleted the enrollment row of an id that still holds a live leaf must not make that id
+        // enrol afresh (auto-approve or a token) and be issued a second live leaf without proof:
+        // an absent row runs the same decision. The result only matters when it refuses or asks
+        // for a single-use token; a proven/no-leaf verdict continues the ordinary flow below.
+        if (!prior) {
+            const auto verdict = run_reregistration_gate();
+            if (verdict.route == yuzu::server::ReregistrationVerdict::Route::Refuse)
+                return *verdict.refusal;
+            if (verdict.route == yuzu::server::ReregistrationVerdict::Route::TokenReenrol)
+                reenrol_via_token = true;
         }
         // #1067: reject an admin-DENIED agent BEFORE consuming any enrollment
         // token. Previously the consume happened first and the admin-deny check
@@ -540,7 +578,8 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                           yuzu::server::sanitize_enrollment_text(info.platform().os()),
                           yuzu::server::sanitize_enrollment_text(info.platform().arch()),
                           yuzu::server::sanitize_enrollment_text(info.agent_version()),
-                          /*enforce_new_id_charset=*/true)
+                          /*enforce_new_id_charset=*/true,
+                          /*require_single_use=*/reenrol_via_token)
                     : std::expected<auth::ConsumeEnrollResult, StoreError>{
                           auth::ConsumeEnrollResult{
                               .kind = auth::ConsumeEnrollResult::Kind::token_rejected,
@@ -657,7 +696,8 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                 }
 
                 if (reenrol_via_token)
-                    return reenrol_token_refusal(variant);
+                    return reenrol_token_refusal(consumed->not_single_use ? std::string_view{"multi_use_token"}
+                                                                      : std::string_view{variant});
                 response->set_accepted(false);
                 response->set_reject_reason(
                     std::string(yuzu::server::kEnrollmentTokenRejectionPublicMessage));
@@ -996,7 +1036,11 @@ enrolled:
             if (reenrolled_with_token && agent_identity_hooks_ &&
                 agent_identity_hooks_->supersede_older_leaves) {
                 try {
-                    agent_identity_hooks_->supersede_older_leaves(info.agent_id(), issued->first);
+                    if (!agent_identity_hooks_->supersede_older_leaves(info.agent_id(),
+                                                                       issued->first))
+                        spdlog::warn("agent {}: older leaves not superseded (see "
+                                     "ca.cert.supersede_failed)",
+                                     safe_agent_id);
                 } catch (...) {
                     spdlog::error("Register: superseding older leaves threw for agent {}",
                                   safe_agent_id);

@@ -11,14 +11,15 @@
 %%%-------------------------------------------------------------------
 -module(yuzu_grpc).
 
--export([headers/1, peer/1, origin/1, peer_cert/1, conn_pid/1]).
--export([new_ctx/5]).
+-export([headers/1, peer/1, origin/1, peer_cert/1, witnessing/1, conn_pid/1]).
+-export([new_ctx/5, new_ctx/6]).
 
 -define(HEADERS, yuzu_grpc_headers).
 -define(CONN, yuzu_grpc_conn).
 -define(PEER, yuzu_grpc_peer).
 -define(ORIGIN, yuzu_grpc_origin).
 -define(CERT, yuzu_grpc_cert).
+-define(WITNESS, yuzu_grpc_witness).
 
 %% @doc The request headers, names lowercased. A header sent more than once is
 %% the values joined by ", ". The pseudo-headers (:path, :authority ...) are not
@@ -54,6 +55,15 @@ origin(Ctx) ->
 peer_cert(Ctx) ->
     ctx:get(Ctx, ?CERT, undefined).
 
+%% @doc Can this listener WITNESS a client certificate (`witness_client_cert' on its
+%% `tls' map)? `false' for plaintext and for TLS without it: such a listener never
+%% asked the client for a certificate, so "no certificate" from it means "not
+%% asked", not "the agent presented none". The Register handler reports it to the
+%% server as `gateway_attests_peer_cert' so the server can tell the two apart.
+-spec witnessing(ctx:t()) -> boolean().
+witnessing(Ctx) ->
+    ctx:get(Ctx, ?WITNESS, false) =:= true.
+
 %% @doc The pid of the HTTP/2 connection process that carries the call: every
 %% call on one connection reports the same pid, calls on different connections
 %% differ. `undefined' for a ctx that carries no call.
@@ -67,5 +77,14 @@ conn_pid(Ctx) ->
               yuzu_grpc_origin:origin() | undefined,
               binary() | undefined) -> ctx:t().
 new_ctx(Headers, ConnPid, Peer, Origin, Cert) ->
+    new_ctx(Headers, ConnPid, Peer, Origin, Cert, false).
+
+%% @doc As new_ctx/5, with whether the listener witnesses client certificates.
+-spec new_ctx(#{binary() => binary()}, pid(),
+              {inet:ip_address(), inet:port_number()} | undefined,
+              yuzu_grpc_origin:origin() | undefined,
+              binary() | undefined, boolean()) -> ctx:t().
+new_ctx(Headers, ConnPid, Peer, Origin, Cert, Witness) ->
     ctx:with_values(#{?HEADERS => Headers, ?CONN => ConnPid,
-                      ?PEER => Peer, ?ORIGIN => Origin, ?CERT => Cert}).
+                      ?PEER => Peer, ?ORIGIN => Origin, ?CERT => Cert,
+                      ?WITNESS => Witness =:= true}).

@@ -45,8 +45,11 @@ TEST_CASE("reregistration gate: a live leaf needs the current leaf or a token",
     // but a token is independent proof and still works.
     CHECK(decide(kLive, false, false, /*can_prove=*/false) == ReregistrationOutcome::RefuseUnattested);
     CHECK(decide(kLive, false, true, /*can_prove=*/false) == ReregistrationOutcome::ViaToken);
-    // A live leaf beside a revoked one is still a live identity.
-    CHECK(decide(kLiveAndRevoked, false, false) == ReregistrationOutcome::RefuseNoProof);
+    // A live leaf beside an operator-revoked one (UP-5 / CH-7a): sign_agent_csr's HIGH-2 guard
+    // would refuse the issuance, so a token must NOT be consumed for it: refuse BEFORE the token
+    // block, token or not. Only the current leaf proves it.
+    CHECK(decide(kLiveAndRevoked, false, false) == ReregistrationOutcome::RefuseRevokedIdentity);
+    CHECK(decide(kLiveAndRevoked, false, true) == ReregistrationOutcome::RefuseRevokedIdentity);
     CHECK(decide(kLiveAndRevoked, true, false) == ReregistrationOutcome::ProvenByLeaf);
 }
 

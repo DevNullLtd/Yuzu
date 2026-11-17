@@ -552,6 +552,9 @@ struct ConsumeEnrollResult {
     EnrollmentClaim claim{};                                        ///< enrolled only
     EnrollmentTokenError token_error{EnrollmentTokenError::not_found}; ///< token_rejected only
     std::string already_consumed_by;                                ///< token_rejected only
+    /// token_rejected only: the token is valid but NOT single-use and the caller asked for
+    /// `require_single_use` (WP01 re-enrolment). Nothing was consumed (the predicate refused it).
+    bool not_single_use{false};
 };
 
 /// Maximum raw enrollment token length accepted at handler entry. Raw
@@ -1530,7 +1533,7 @@ public:
     consume_and_enroll(std::string_view raw_token, const std::string& agent_id,
                        const std::string& hostname, const std::string& os,
                        const std::string& arch, const std::string& agent_version,
-                       bool enforce_new_id_charset = false);
+                       bool enforce_new_id_charset = false, bool require_single_use = false);
 
     /// All enrollment tokens, newest first (admin UI).
     [[nodiscard]] std::expected<std::vector<EnrollmentToken>, StoreError>

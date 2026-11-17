@@ -209,7 +209,8 @@ struct CrlVersionRecord {
 
 /// Which revocations a dashboard revoked count holds (ADR-0070 D13). A Yuzu-CA revocation is
 /// one of three, decided by `revocation_reason` exactly as stored:
-///   kSuperseded   `kRevokeReasonSuperseded` — replaced by a same-key successor (bookkeeping);
+///   kSuperseded   `kRevokeReasonSuperseded` or `kRevokeReasonReenrolled` (WP01) — replaced by a
+///                 successor (bookkeeping, not a compromise);
 ///   kUnpublished  `kRevokeReasonUnpublished` — recorded but never delivered;
 ///   kOther        any other reason, including an operator reason that collided with a system
 ///                 marker and was stored qualified ("operator-supplied: ...") and an empty one.
@@ -426,6 +427,16 @@ public:
     /// post-issuance supersession sweep. Same read-failure contract as `agent_leaf_state`.
     [[nodiscard]] std::expected<std::vector<std::string>, std::string>
     live_agent_serials(const std::string& agent_id);
+
+    /// WP01 (D4 / UP-1): in ONE statement, revoke (reason `kRevokeReasonReenrolled`) every ACTIVE,
+    /// unexpired agent leaf of `agent_id` that is OLDER than `keep_serial` (ordered by
+    /// `(issued_at, serial_hex)`, a total order), and nothing else. Two concurrent re-enrolments of
+    /// one id each call this with their own fresh serial; the ordering makes them converge on the
+    /// newest leaf instead of cross-revoking each other's (which left the id with NO live leaf, so
+    /// a certificate-less Register would be admitted). Returns the revoked serials;
+    /// `unexpected(msg)` is a genuine write failure (nothing was revoked: it is one statement).
+    [[nodiscard]] std::expected<std::vector<std::string>, std::string>
+    revoke_older_agent_leaves(const std::string& agent_id, const std::string& keep_serial);
 
     /// `nullopt` = a successful read finding no such serial (or a non-hex serial — there is no
     /// such cert). `unexpected(msg)` (prefixed `kCaDbErrorPrefix`) is a genuine read failure.

@@ -3687,6 +3687,26 @@ public:
                           "ADMITTED; in enforce mode it was refused. A sustained non-zero audit "
                           "rate for real agents means enforce would lock them out.",
                           "counter");
+        // Seeded to 0 (the #5177 trap: increase() on a series that first appears at its first
+        // increment never fires a rule). Every (path, outcome, mode) the apply helper can emit.
+        for (const char* path : {"direct", "gateway_proxy"})
+            for (const char* outcome :
+                 {"no_leaf_on_record", "proven_by_leaf", "via_token", "no_proof",
+                  "unattested_gateway", "revoked_identity", "lookup_failed"})
+                for (const char* mode : {"off", "audit", "enforce"})
+                    (void)metrics_.counter("yuzu_register_reregistration_total",
+                                           {{"path", path}, {"outcome", outcome}, {"mode", mode}});
+        for (const char* reason : {"multi_use_token", "invalid_input_length", "not_found",
+                                   "expired", "revoked", "already_consumed"})
+            (void)metrics_.counter("yuzu_register_reenrol_token_refused_total",
+                                   {{"reason", reason}});
+        (void)metrics_.counter("yuzu_server_ca_superseded_leaf_total");
+        (void)metrics_.counter("yuzu_server_ca_supersede_failed_total");
+        metrics_.describe("yuzu_server_agent_reregistration_proof_mode",
+                          "Active --agent-reregistration-proof mode of THIS server process "
+                          "(1 for the active mode, 0 for the others). The flag is per process: "
+                          "replicas on different modes are only as enforced as the weakest.",
+                          "gauge");
         metrics_.describe("yuzu_register_reenrol_token_refused_total",
                           "Re-enrolment of an already-enrolled agent id with an enrollment token "
                           "that was refused (reason: a token-rejection variant, multi_use_token or "
@@ -9779,7 +9799,7 @@ public:
                     };
                     hooks->supersede_older_leaves = [this](const std::string& agent_id,
                                                            const std::string& new_cert_pem) {
-                        supersede_older_agent_leaves(agent_id, new_cert_pem);
+                        return supersede_older_agent_leaves(agent_id, new_cert_pem);
                     };
                     agent_service_.set_agent_identity_hooks(hooks);
                     agent_service_.set_reregistration_proof_mode(proof_mode);
@@ -9787,12 +9807,25 @@ public:
                         gateway_service_->set_agent_identity_hooks(hooks);
                         gateway_service_->set_reregistration_proof_mode(proof_mode);
                     }
-                    spdlog::info("PKI: agent re-registration proof mode = {}{}", to_string(proof_mode),
-                                 proof_mode == ReregistrationProofMode::Audit
-                                     ? " (decide and count, admit as before; set "
-                                       "--agent-reregistration-proof=enforce once gateways are "
-                                       "upgraded)"
-                                     : "");
+                    // The mode is per PROCESS: expose it so a replica left on another value is
+                    // visible (a fleet is only as enforced as its weakest replica).
+                    for (const auto m : {ReregistrationProofMode::Off, ReregistrationProofMode::Audit,
+                                         ReregistrationProofMode::Enforce})
+                        metrics_
+                            .gauge("yuzu_server_agent_reregistration_proof_mode",
+                                   {{"mode", std::string(to_string(m))}})
+                            .set(m == proof_mode ? 1.0 : 0.0);
+                    if (proof_mode == ReregistrationProofMode::Enforce) {
+                        spdlog::info("PKI: agent re-registration proof mode = enforce");
+                    } else {
+                        // Audit/off do NOT close the takeover: say so at every boot.
+                        spdlog::warn("PKI: agent re-registration proof mode = {} - a certificate-"
+                                     "less caller that knows an enrolled agent id can STILL "
+                                     "re-register it and be issued a certificate. Upgrade every "
+                                     "gateway, watch yuzu_register_reregistration_total, then set "
+                                     "--agent-reregistration-proof=enforce",
+                                     to_string(proof_mode));
+                    }
                 }
                 spdlog::info("PKI: per-agent mTLS issuance active (CA {})",
                              default_cert_set_.ca_fingerprint_sha256.empty()
@@ -13828,64 +13861,63 @@ private:
     }
 
     /// WP01 / owner decision D4: an agent re-enrolled with a single-use enrollment token and was
-    /// just issued `new_cert_pem`; revoke its OTHER live leaves (reason `kRevokeReasonReenrolled`)
+    /// just issued `new_cert_pem`; revoke its OLDER live leaves (reason `kRevokeReasonReenrolled`)
     /// so a lost-or-stolen key does not stay valid beside its replacement. Called only AFTER the new
     /// leaf exists. Best effort by design (the agent already holds a good credential): a failure is
-    /// logged and counted, never thrown. The CRL is republished so relying parties pick it up.
-    void supersede_older_agent_leaves(const std::string& agent_id, const std::string& new_cert_pem) {
-        if (!ca_store_ || !ca_store_->is_open())
-            return;
-        const auto fresh = pki::parse_certificate(new_cert_pem);
-        std::optional<std::string> fresh_serial;
-        if (fresh)
-            fresh_serial = normalize_serial_hex(fresh->serial_hex);
-        if (!fresh_serial) {
-            spdlog::error("PKI: cannot read the serial of the new leaf for agent {} - older leaves "
-                          "NOT superseded",
-                          ::yuzu::log_id_token(agent_id));
-            return;
-        }
-        auto serials = ca_store_->live_agent_serials(agent_id);
-        if (!serials) {
-            spdlog::error("PKI: live-leaf read failed superseding agent {}: {}",
-                          ::yuzu::log_id_token(agent_id), ::yuzu::log_key_token(serials.error()));
-            metrics_.counter("yuzu_server_ca_supersede_failed_total").increment();
-            return;
-        }
-        bool revoked_any = false;
-        for (const auto& serial : *serials) {
-            if (normalize_serial_hex(serial) == fresh_serial)
-                continue;
-            auto r = ca_store_->revoke_system(serial, kRevokeReasonReenrolled);
-            if (!r) {
-                spdlog::error("PKI: revoking superseded leaf {} of agent {} failed: {}", serial,
-                              ::yuzu::log_id_token(agent_id), ::yuzu::log_key_token(r.error()));
-                metrics_.counter("yuzu_server_ca_supersede_failed_total").increment();
-                continue;
-            }
-            if (!*r)
-                continue;
-            revoked_any = true;
-            metrics_.counter("yuzu_server_ca_superseded_leaf_total").increment();
+    /// audited (`ca.cert.supersede_failed`), counted and logged, never thrown, and returns false.
+    /// The CRL is NOT published inline (handler thread): the leader's freshness tick does it.
+    bool supersede_older_agent_leaves(const std::string& agent_id, const std::string& new_cert_pem) {
+        const auto audit_supersede = [&](std::string_view action, const std::string& target,
+                                         std::string detail_text, std::string_view result) {
             if (audit_store_ && audit_store_->is_open()) {
-                (void)audit_store_->log({.timestamp = std::time(nullptr),
-                                         .principal = "agent:" + agent_id,
-                                         .principal_role = "agent",
-                                         .action = "ca.cert.revoked",
-                                         .target_type = "AgentCertificate",
-                                         .target_id = serial,
-                                         .detail = "reason=reenrolled cn=" +
-                                                   detail::audit_token(agent_id) +
-                                                   " via=token_reenrolment",
-                                         .result = "success"});
+                const bool ok = audit_store_->log({.timestamp = std::time(nullptr),
+                                                   .principal = "agent:" + agent_id,
+                                                   .principal_role = "agent",
+                                                   .action = std::string(action),
+                                                   .target_type = "AgentCertificate",
+                                                   .target_id = target,
+                                                   .detail = std::move(detail_text),
+                                                   .result = std::string(result)});
+                if (!ok)
+                    spdlog::error("PKI: audit write failed for {} (agent {})", action,
+                                  ::yuzu::log_id_token(agent_id));
             }
+        };
+        const auto fail = [&](const std::string& why) {
+            spdlog::error("PKI: older leaves of agent {} NOT superseded after a token "
+                          "re-enrolment: {} (the new leaf was issued; the older one stays valid "
+                          "until it expires or an operator revokes it)",
+                          ::yuzu::log_id_token(agent_id), why);
+            metrics_.counter("yuzu_server_ca_supersede_failed_total").increment();
+            audit_supersede("ca.cert.supersede_failed", agent_id,
+                            "reason=reenrolled cn=" + detail::audit_token(agent_id) +
+                                " via=token_reenrolment cause=" + detail::audit_token(why),
+                            "failure");
+            return false;
+        };
+        if (!ca_store_ || !ca_store_->is_open())
+            return fail("ca store not open");
+        const auto fresh = pki::parse_certificate(new_cert_pem);
+        const auto fresh_serial =
+            fresh ? normalize_serial_hex(fresh->serial_hex) : std::optional<std::string>{};
+        if (!fresh_serial)
+            return fail("cannot read the serial of the new leaf");
+        // ONE statement, older-than-the-new-leaf only: two concurrent re-enrolments converge on
+        // the newest leaf and never cross-revoke each other's (UP-1). The CRL is NOT published
+        // here (this runs on the Register handler thread, inside the agent's RPC deadline): the
+        // revocation is effective for the mTLS gate immediately (is_revoked reads ca_store) and
+        // the leader's freshness/self-heal tick publishes the CRL (has_unpublished_revocations).
+        auto revoked = ca_store_->revoke_older_agent_leaves(agent_id, *fresh_serial);
+        if (!revoked)
+            return fail(::yuzu::log_key_token(revoked.error()));
+        for (const auto& serial : *revoked) {
+            metrics_.counter("yuzu_server_ca_superseded_leaf_total").increment();
+            audit_supersede("ca.cert.revoked", serial,
+                            "reason=reenrolled cn=" + detail::audit_token(agent_id) +
+                                " via=token_reenrolment",
+                            "success");
         }
-        if (revoked_any && !publish_crl(/*background=*/false, /*skipped=*/nullptr,
-                                        CrlTrigger::Operator))
-            spdlog::warn("PKI: CRL republish after superseding agent {}'s older leaves failed; "
-                         "the leaves are revoked in ca_store (mTLS gate) and the next CRL tick "
-                         "publishes them",
-                         ::yuzu::log_id_token(agent_id));
+        return true;
     }
 
     /// PKI PR4 / HA WS-6 CRL follow-ups (#4828-#4831): build + record a new CRL version over the

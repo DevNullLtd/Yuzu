@@ -91,16 +91,17 @@ register_checked(Ctx, RegisterReq0) ->
     %% address its registration is attributed to.
     Origin = origin_text(Ctx),
     %% WP01: the client certificate the agent presented in the TLS handshake, as the
-    %% gateway witnessed it (PEM, empty when none), and the marker that this
-    %% gateway ran the overwrite. Both are gateway-authoritative on the same terms
+    %% gateway witnessed it (PEM, empty when none), and whether THIS LISTENER can
+    %% witness at all (yuzu_grpc:witnessing/1: TLS with witness_client_cert). Both are gateway-authoritative on the same terms
     %% as gateway_observed_peer: set here UNCONDITIONALLY, so whatever the agent put
     %% in them is discarded (an agent must not be able to name a certificate or
-    %% claim an attestation), and the marker is what lets the server tell "an
-    %% upgraded gateway saw no certificate" from "a gateway too old to say". The
+    %% claim an attestation), and the marker is what lets the server tell "a
+    %% witnessing listener saw no certificate" from "a listener that never asked"
+    %% (plaintext, TLS without witness_client_cert, or a gateway too old to say). The
     %% value is evidence, not a verdict: the server checks it against its own CA.
     RegisterReq = RegisterReq0#{gateway_observed_peer => Origin,
                                 gateway_attested_peer_cert_pem => peer_cert_pem(Ctx),
-                                gateway_attests_peer_cert => true},
+                                gateway_attests_peer_cert => yuzu_grpc:witnessing(Ctx)},
     PeerAddr = case Origin of
         <<>> -> <<"unknown">>;
         _ -> Origin

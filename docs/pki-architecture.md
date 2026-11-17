@@ -141,6 +141,11 @@ holds key material, only metadata; see "Key custody + threat model" below. Table
   future migration backfilling a `ca_issued` column must skip revoked rows (or
   disable the trigger inside that migration's own transaction), and pruning
   expired revoked rows would need a deliberate change to the trigger.
+- One more index, WP01 (migration **v6**): the partial `idx_ca_issued_agent_subject` on
+  `(subject, not_after) WHERE purpose = 'agent'`, behind `CaStore::agent_leaf_state`, the
+  per-agent identity read every re-registration of an already-enrolled id makes (measured on
+  200,000 rows: 0.057 ms with the index, 113.7 ms without). Additive; its plain `CREATE INDEX`
+  blocks `ca_issued` writers while it builds, the same accepted exception as v5.
 - Three read-only indexes on `ca_issued` (Postgres migration v5, ADR-0070 D13), additive only:
   `(sort key, serial_hex)` range indexes on `not_after` (active rows), `revoked_at` (revoked rows)
   and `issued_at`, each including the columns its counts read. They back the Yuzu-issued
@@ -200,12 +205,12 @@ session and be issued a CA-signed leaf in its name. Both paths now run ONE decis
 |---|---|
 | no live and no revoked leaf in `ca_issued` for the id (first enrolment completing, **expired** leaf, operator-CA agent) | unchanged, admitted |
 | the current leaf (direct: the mTLS peer certificate; gateway: the certificate the gateway **witnessed**) | admitted |
-| a fresh **single-use** enrollment token | admitted; audited `agent.reenrolled_with_token`; the older live leaf is revoked (reason `reenrolled`) once the new one is issued |
-| a multi-use (fleet) token | refused: a shared token is not proof of an existing identity |
-| a revoked, unexpired identity with nothing live | refused, token or not (clearing a revocation is an operator action) |
+| a fresh **single-use** enrollment token | admitted; audited `agent.reenrolled_with_token`; the OLDER live leaves are revoked (reason `reenrolled`, one statement, only leaves older than the new one by `(issued_at, serial_hex)`, so two concurrent re-enrolments converge on the newest instead of cross-revoking) once the new one is issued; the CRL is published by the leader's freshness tick, never on the handler thread |
+| a multi-use (fleet) token | refused INSIDE the token-consume transaction (`require_single_use`): a shared token is not proof of an existing identity, and its `use_count` is not incremented |
+| a revoked, unexpired identity with nothing live, or a live leaf beside an operator-revoked one (decided BEFORE any token is spent: `sign_agent_csr`'s HIGH-2 guard would refuse the issuance) | refused, token or not (clearing a revocation is an operator action); only the current leaf passes |
 | a live leaf and none of the above | refused with gRPC `UNAUTHENTICATED` (uniform message); never `accepted=false`, which the agent treats as permanent |
 
-Only a **live** leaf (active, unexpired by the database clock) triggers the gate (owner decision D2), so
+The gate keys on the **leaf state, not on the `pending_agents` row**: an id whose enrollment row was deleted but which still holds a live leaf runs the same decision (otherwise auto-approve or a token would issue a second live leaf without proof). Agent ids are byte-exact in the enrollment lookup, the `ca_store` read and the certificate CN match: a case, whitespace or unicode variant is a different id with no row and is never admitted as the victim (pinned by a test). Only a **live** leaf (active, unexpired by the database clock) triggers the gate (owner decision D2), so
 an agent whose leaf expired re-enrols with a token as it always did. The read is `CaStore::agent_leaf_state`
 (one indexed query, `idx_ca_issued_agent_subject`, schema v6, `purpose='agent'` only so a code-signing leaf
 whose CN equals an agent id never counts); a read failure is `UNAVAILABLE` and never "no leaf".
@@ -214,8 +219,8 @@ whose CN equals an agent id never counts); a read failure is `UNAVAILABLE` and n
 certless peers. With `witness_client_cert => true` (`verify_peer`, `fail_if_no_peer_cert => false`; set in
 `sys.config.prod` and the reference configs) it asks for a client certificate and does **not** abort the
 handshake on one it cannot chain, so a stale or foreign leaf cannot lock an agent out; the TLS
-CertificateVerify still proves the agent holds the leaf's key. `yuzu_gw_agent_service:register_checked`
-then sets `RegisterRequest.gateway_attested_peer_cert_pem` and `gateway_attests_peer_cert` **unconditionally**
+CertificateVerify still proves the agent holds the leaf's key (verified empirically: a client presenting an agent leaf signed with a different key is refused with a `bad_certificate` alert in `wait_cert_verify`, `yuzu_grpc_client_tls_tests`). `yuzu_gw_agent_service:register_checked`
+then sets `RegisterRequest.gateway_attested_peer_cert_pem` and `gateway_attests_peer_cert` **unconditionally** (the latter is whether the LISTENER can witness, `yuzu_grpc:witnessing/1`: false for plaintext, TLS without `witness_client_cert` and an old gateway, so the server reports `unattested_gateway`, not `no_proof`)
 (the `gateway_observed_peer` pattern: whatever the agent sent is discarded; the direct `Register` ignores
 both fields). The **server** is the verifier (`attested_leaf_proves_identity`): chains to our CA, inside
 its validity window, an agent leaf (`.../agent/<id>` URI SAN), CN equal to the claimed id, not revoked.
@@ -228,6 +233,10 @@ malicious gateway.
 `enforce` refuses. In `enforce` a gateway-relayed re-registration from a gateway that does not witness
 (`gateway_attests_peer_cert` false: an un-upgraded gateway) has no proof available and is refused
 (`outcome="unattested_gateway"`), so upgrade every gateway before enabling it.
+
+**Token-holder residual (owner ruling, 2026-11-17; the agent-bound token design is a tracked follow-up).** Under `enforce`, any holder of an UNSPENT single-use enrollment token can re-enrol ANY live-leaf agent id: the server issues the holder a leaf for that id and revokes the victim's older leaf, after which the real agent is refused until it too holds proof. This is the accepted token-custody trust (D5), not a defect of the gate; it is bounded by token custody and expiry. Recovery for the victim: an operator mints a new single-use token (`max_uses` 1) and gives it to the real agent, which then re-enrols and supersedes the impostor's leaf. Every such re-enrolment leaves `agent.reenrolled_with_token` and `ca.cert.revoked reason=reenrolled` audit rows.
+
+**Unattested gateways under `enforce` (owner ruling, 2026-11-17).** `enforce` REFUSES a re-registration relayed by a gateway that cannot witness (`outcome="unattested_gateway"`): fail closed. Upgrade and restart every gateway with `witness_client_cert` BEFORE enabling it; in `audit` mode `yuzu_register_reregistration_total{outcome="unattested_gateway"}` and the `YuzuAgentReregistrationUnattestedGateway` alert show exactly which paths would be locked out. `enforce` is not the default until the concurrent re-enrolment, missing-row and gateway-capability cases (CH-1a, CH-2, CH-5) pass in CI.
 
 **Not covered, by design (owner decision D7):** `--no-tls`; plain TLS without a client CA (no client identity
 is required, so the direct gate is inert); agents carrying operator-CA certificates (no `ca_issued` agent

@@ -4469,6 +4469,8 @@ struct HookProbe {
     AgentLeafState state{.has_live = true, .has_revoked_unexpired = false};
     bool lookup_fails = false;
     bool witnessed_proves = false; // what attested_leaf_proves answers
+    bool witness_throws = false;
+    bool supersede_fails = false;
     int lookups = 0;
     int witness_calls = 0;
     std::vector<std::string> witnessed_pems;
@@ -4486,10 +4488,13 @@ std::shared_ptr<AgentIdentityHooks> make_hooks(HookProbe& p) {
     hooks->attested_leaf_proves = [&p](const std::string& pem, const std::string&) {
         ++p.witness_calls;
         p.witnessed_pems.push_back(pem);
+        if (p.witness_throws)
+            throw std::runtime_error("boom");
         return p.witnessed_proves;
     };
     hooks->supersede_older_leaves = [&p](const std::string& id, const std::string& pem) {
         p.superseded.emplace_back(id, pem);
+        return !p.supersede_fails;
     };
     return hooks;
 }
@@ -4732,6 +4737,11 @@ TEST_CASE("WP01: a fresh single-use enrollment token re-enrols an id with a live
         CHECK(h.registry.agent_count() == 0);
         CHECK(h.metrics.counter("yuzu_register_reenrol_token_refused_total",
                                 {{"reason", "multi_use_token"}}).value() == 1.0);
+        // The use is NOT burned: require_single_use is decided inside the store's guarded UPDATE.
+        auto toks = h.auth_mgr.list_enrollment_tokens();
+        REQUIRE(toks.has_value());
+        for (const auto& t : *toks)
+            CHECK(t.use_count == 0);
     }
     SECTION("direct, an unknown token is a status, never a permanent accepted=false") {
         auto req = wp01::request("lost-key-3", std::string(64, 'a'), "NEW-CSR");
@@ -4814,7 +4824,7 @@ TEST_CASE("WP01: the gate stays out of the way of first enrolment, expired leave
         REQUIRE(h.svc.Register(nullptr, &req, &resp).ok());
         CHECK(resp.accepted());
         CHECK(resp.issued_certificate() == "LEAF-brand-new");
-        CHECK(probe.lookups == 0); // no approved row: the gate was never consulted
+        CHECK(probe.lookups == 1); // UP-2: an absent row consults the gate too (no live leaf: proceeds)
     }
     SECTION("approved, no live leaf on record (expired / operator-CA / mid-enrolment): unchanged") {
         wp01::enroll(h, "expired-1");
@@ -4939,4 +4949,154 @@ TEST_CASE("WP01: audit mode decides and counts exactly as enforce would, but adm
         CHECK(resp.accepted());
         CHECK(probe.lookups == before);
     }
+}
+
+TEST_CASE("WP01 UP-2: an id that still holds a live leaf is gated even when its pending row is gone",
+          "[pg][agent_service][register][gateway][wp01][reregistration]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
+    wp01::GatewayUpstreamServiceImpl gw{h.registry, h.bus, h.auth_mgr, h.auto_approve, &h.metrics};
+    wp01::HookProbe probe; // live leaf on record, NO pending_agents row exists for the id
+    int signed_count = 0;
+    auto hooks = wp01::make_hooks(probe);
+    h.svc.set_require_client_identity(true);
+    h.svc.set_agent_identity_hooks(hooks);
+    h.svc.set_reregistration_proof_mode(wp01::ReregistrationProofMode::Enforce);
+    h.svc.set_agent_cert_signer(wp01::counting_signer(signed_count));
+    gw.set_agent_identity_hooks(hooks);
+    gw.set_reregistration_proof_mode(wp01::ReregistrationProofMode::Enforce);
+
+    SECTION("no token, no cert: refused on both paths, nothing signed, no row created") {
+        auto req = wp01::request("orphan-1", {}, "CSR");
+        apb::RegisterResponse resp;
+        CHECK(h.svc.Register(nullptr, &req, &resp).error_code() == grpc::StatusCode::UNAUTHENTICATED);
+        auto greq = req;
+        greq.set_gateway_attests_peer_cert(true);
+        apb::RegisterResponse gresp;
+        CHECK(gw.ProxyRegister(nullptr, &greq, &gresp).error_code() == grpc::StatusCode::UNAUTHENTICATED);
+        CHECK(signed_count == 0);
+        CHECK(h.registry.agent_count() == 0);
+        auto st = h.auth_mgr.get_pending_status("orphan-1");
+        REQUIRE(st.has_value());
+        CHECK_FALSE(st->has_value()); // the refusal did not queue or approve the id
+    }
+    SECTION("a multi-use token is refused and not burned") {
+        const auto token = mint_enrollment_token(h.auth_mgr, "fleet", 0, std::chrono::hours(1));
+        auto req = wp01::request("orphan-2", token, "CSR");
+        apb::RegisterResponse resp;
+        CHECK(h.svc.Register(nullptr, &req, &resp).error_code() == grpc::StatusCode::UNAUTHENTICATED);
+        auto toks = h.auth_mgr.list_enrollment_tokens();
+        REQUIRE(toks.has_value());
+        for (const auto& t : *toks)
+            CHECK(t.use_count == 0);
+        CHECK(signed_count == 0);
+    }
+    SECTION("a single-use token re-enrols it (audited, older leaf superseded)") {
+        const auto token = mint_enrollment_token(h.auth_mgr, "recover", 1, std::chrono::hours(1));
+        auto req = wp01::request("orphan-3", token, "CSR");
+        apb::RegisterResponse resp;
+        REQUIRE(h.svc.Register(nullptr, &req, &resp).ok());
+        CHECK(resp.accepted());
+        CHECK(probe.superseded.size() == 1);
+        CHECK(wp01::has_audit(h, "agent.reenrolled_with_token", "orphan-3"));
+    }
+    SECTION("audit mode: admitted as before, and the takeover is reconstructable from an audit row") {
+        h.svc.set_reregistration_proof_mode(wp01::ReregistrationProofMode::Audit);
+        auto req = wp01::request("orphan-4");
+        apb::RegisterResponse resp;
+        REQUIRE(h.svc.Register(nullptr, &req, &resp).ok());
+        CHECK(wp01::has_audit(h, "agent.reregistration_unproven", "orphan-4"));
+    }
+}
+
+TEST_CASE("WP01: a refusal leaves an audit row, and a throwing witness callback is no proof",
+          "[pg][agent_service][register][gateway][wp01][reregistration]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
+    wp01::GatewayUpstreamServiceImpl gw{h.registry, h.bus, h.auth_mgr, h.auto_approve, &h.metrics};
+    gw.set_audit_store(h.audit.get());
+    wp01::HookProbe probe;
+    probe.witness_throws = true;
+    auto hooks = wp01::make_hooks(probe);
+    h.svc.set_require_client_identity(true);
+    h.svc.set_agent_identity_hooks(hooks);
+    h.svc.set_reregistration_proof_mode(wp01::ReregistrationProofMode::Enforce);
+    gw.set_agent_identity_hooks(hooks);
+    gw.set_reregistration_proof_mode(wp01::ReregistrationProofMode::Enforce);
+    wp01::enroll(h, "audited-1");
+
+    auto req = wp01::request("audited-1");
+    apb::RegisterResponse resp;
+    CHECK(h.svc.Register(nullptr, &req, &resp).error_code() == grpc::StatusCode::UNAUTHENTICATED);
+    CHECK(wp01::has_audit(h, "agent.reregistration_refused", "audited-1"));
+
+    // The gateway's witness callback throws: treated as NO proof (refused), not a crash.
+    auto greq = req;
+    greq.set_gateway_attests_peer_cert(true);
+    greq.set_gateway_attested_peer_cert_pem("PEM");
+    apb::RegisterResponse gresp;
+    CHECK(gw.ProxyRegister(nullptr, &greq, &gresp).error_code() == grpc::StatusCode::UNAUTHENTICATED);
+    CHECK(probe.witness_calls == 1);
+
+    // Off on the GATEWAY path: no lookup and the witness callback is not even consulted.
+    gw.set_reregistration_proof_mode(wp01::ReregistrationProofMode::Off);
+    probe.witness_throws = false;
+    const int lookups = probe.lookups, witness = probe.witness_calls;
+    apb::RegisterResponse off_resp;
+    REQUIRE(gw.ProxyRegister(nullptr, &greq, &off_resp).ok());
+    CHECK(off_resp.accepted());
+    CHECK(probe.lookups == lookups);
+    CHECK(probe.witness_calls == witness);
+}
+
+TEST_CASE("WP01 CH-2b: agent id variants are distinct identities and never inherit an approved row",
+          "[pg][agent_service][register][wp01][reregistration]") {
+    // The enrollment lookup and the ca_store read are byte-exact: a variant of an enrolled id
+    // (case, whitespace, unicode normalisation form) is a DIFFERENT id with no row, so it can never
+    // be admitted as the victim. Pinned here against the real PG-backed pending_agents lookup.
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
+    wp01::enroll(h, "Victim-Agent");
+    const std::vector<std::string> variants = {
+        "victim-agent", "VICTIM-AGENT", "Victim-Agent ", " Victim-Agent", "Victim-Agent\t",
+        "Victim\xE2\x80\x90Agent", // U+2010 hyphen lookalike
+        "Victim-Agent\xE2\x80\x8B", // trailing zero-width space
+        "Vict\xC3\xAFm-Agent"};       // i with diaeresis
+    for (const auto& id : variants) {
+        INFO("variant bytes: " << id);
+        auto st = h.auth_mgr.get_pending_status(id);
+        if (st.has_value())
+            CHECK_FALSE(st->has_value()); // no row: not approved
+        auto req = wp01::request(id);
+        apb::RegisterResponse resp;
+        (void)h.svc.Register(nullptr, &req, &resp);
+        CHECK_FALSE(resp.accepted()); // never admitted as the enrolled id
+    }
+}
+
+TEST_CASE("WP01 CH-7a: a live leaf beside an operator-revoked one refuses BEFORE the token is spent",
+          "[pg][agent_service][register][wp01][reregistration]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
+    wp01::HookProbe probe;
+    probe.state = {.has_live = true, .has_revoked_unexpired = true};
+    int signed_count = 0;
+    h.svc.set_require_client_identity(true);
+    h.svc.set_agent_identity_hooks(wp01::make_hooks(probe));
+    h.svc.set_reregistration_proof_mode(wp01::ReregistrationProofMode::Enforce);
+    h.svc.set_agent_cert_signer(wp01::counting_signer(signed_count));
+    wp01::enroll(h, "wedge-1");
+    const auto token = mint_enrollment_token(h.auth_mgr, "recover", 1, std::chrono::hours(1));
+    auto req = wp01::request("wedge-1", token, "CSR");
+    apb::RegisterResponse resp;
+    CHECK(h.svc.Register(nullptr, &req, &resp).error_code() == grpc::StatusCode::UNAUTHENTICATED);
+    auto toks = h.auth_mgr.list_enrollment_tokens();
+    REQUIRE(toks.has_value());
+    for (const auto& t : *toks)
+        CHECK(t.use_count == 0); // the single-use token is still spendable once an operator clears it
+    CHECK(signed_count == 0);
 }

@@ -10774,3 +10774,70 @@ tests:
       - expr: 'ALERTS{alertname="YuzuCrlSourceResolverBusy", alertstate=~"firing|pending"}'
         eval_time: 17m
         exp_samples: []
+
+  # ── WP01 agent re-registration proof rollout ─────────────────────────────
+  - interval: 1m
+    name: reregistration would-refuse in audit mode fires
+    input_series:
+      - series: 'yuzu_register_reregistration_total{job="yuzu",instance="s1",path="direct",outcome="no_proof",mode="audit"}'
+        values: "0+1x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuAgentReregistrationWouldRefund", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuAgentReregistrationWouldRefund", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+
+  - interval: 1m
+    name: reregistration healthy proven re-registrations stay quiet
+    input_series:
+      - series: 'yuzu_register_reregistration_total{job="yuzu",instance="s1",path="direct",outcome="proven_by_leaf",mode="audit"}'
+        values: "0+5x60"
+      - series: 'yuzu_register_reregistration_total{job="yuzu",instance="s1",path="direct",outcome="no_proof",mode="audit"}'
+        values: "0+0x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuAgentReregistrationWouldRefund", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples: []
+
+  - interval: 1m
+    name: reregistration seeded-at-zero series first incrementing fires (5177 trap)
+    input_series:
+      - series: 'yuzu_register_reregistration_total{job="yuzu",instance="s1",path="gateway_proxy",outcome="unattested_gateway",mode="audit"}'
+        values: "0 0 0 0 0 1 1 1 1 1 1 1 1 1 1 1"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuAgentReregistrationUnattestedGateway", alertstate="firing"}'
+        eval_time: 7m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuAgentReregistrationUnattestedGateway", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+
+  - interval: 1m
+    name: supersede failure fires
+    input_series:
+      - series: 'yuzu_server_ca_supersede_failed_total{job="yuzu",instance="s1"}'
+        values: "0 0 0 1 1 1 1 1 1 1"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuAgentLeafSupersedeFailed", alertstate="firing"}'
+        eval_time: 5m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuAgentLeafSupersedeFailed", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+
+  - interval: 1m
+    name: mixed reregistration modes fire, uniform modes do not
+    input_series:
+      - series: 'yuzu_server_agent_reregistration_proof_mode{job="yuzu",instance="s1",mode="audit"}'
+        values: "1+0x30"
+      - series: 'yuzu_server_agent_reregistration_proof_mode{job="yuzu",instance="s1",mode="enforce"}'
+        values: "0+0x30"
+      - series: 'yuzu_server_agent_reregistration_proof_mode{job="yuzu",instance="s2",mode="audit"}'
+        values: "0+0x30"
+      - series: 'yuzu_server_agent_reregistration_proof_mode{job="yuzu",instance="s2",mode="enforce"}'
+        values: "1+0x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuAgentReregistrationModeMixed", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuAgentReregistrationModeMixed", alertstate="firing", job="yuzu", severity="warning"}'
+            value: 1

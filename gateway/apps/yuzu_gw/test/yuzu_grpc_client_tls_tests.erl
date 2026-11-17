@@ -70,6 +70,8 @@ tls_test_() ->
                   fun() -> witness_no_cert(State) end},
                  {"witness listener (WP01): a certificate the gateway cannot chain is witnessed, not refused",
                   fun() -> witness_foreign_cert(State) end},
+                 {"witness listener (WP01 CH-3): a victim's certificate WITHOUT its private key fails the handshake",
+                  {timeout, 30, fun() -> witness_no_key_possession(State) end}},
                  {"verify_peer without witness: the same foreign certificate aborts the handshake",
                   {timeout, 30, fun() -> request_only_foreign_cert(State) end}},
                  {"TCP_NODELAY is on a live TLS socket by default",
@@ -261,6 +263,30 @@ witness_foreign_cert(#{certs := Certs, witness_port := Port} = S) ->
                      {ok, #{pending_commands := [#{action := Cert}]}, _} = heartbeat(Name, <<"ctx">>),
                      ?assertEqual(<<"cert">>, Cert)
                  end).
+
+%% CH-3 / UP-10: the accept-any verify_fun relaxes CHAIN validation only. The TLS
+%% CertificateVerify message must still prove possession of the presented
+%% certificate's key. A client that presents the victim's leaf ("agent.pem") but signs
+%% with a DIFFERENT key (the self-signed cert's key) must not complete a handshake,
+%% whichever side notices. Raw ssl, not gun, so the handshake result is the assertion.
+witness_no_key_possession(#{certs := #{dir := Dir, ca := Ca}, witness_port := Port}) ->
+    Opts = [{cacertfile, Ca}, {verify, verify_peer}, {versions, ['tlsv1.2']},
+            {server_name_indication, "localhost"},
+            {certfile, filename:join(Dir, "agent.pem")},
+            {keyfile, filename:join(Dir, "selfs.key")}],
+    Result = try ssl:connect("127.0.0.1", Port, Opts, 5000) of
+                 {ok, Sock} ->
+                     %% If the handshake "completed" the server may still tear it down;
+                     %% a read must then fail. Completion without teardown is the defect.
+                     R = ssl:recv(Sock, 0, 2000),
+                     catch ssl:close(Sock),
+                     {connected, R};
+                 {error, Why} ->
+                     {refused, Why}
+             catch C:E -> {refused, {C, E}}
+             end,
+    io:format(user, "CH-3 wrong-key handshake result: ~p~n", [Result]),
+    ?assertMatch({refused, _}, Result).
 
 %% The reason `witness_client_cert' exists: stage 2 of the gateway doc's mTLS ladder
 %% (verify_peer, nothing required) aborts the handshake on such a certificate.

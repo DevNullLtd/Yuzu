@@ -470,6 +470,8 @@ protocol_opts(Entry, Routes) ->
                           listener => role(Entry),
                           auth_fun => maps:get(auth_fun, Entry, undefined),
                           origin => Origin,
+                          %% WP01: does this listener witness client certificates?
+                          witness => witnessing(Entry),
                           limits => Limits},
                  %% Cowboy reads the PROXY header itself, before the TLS
                  %% handshake; the stream handler decides whether to believe it.
@@ -480,6 +482,11 @@ protocol_opts(Entry, Routes) ->
                  %% a client that sends no ALPN at all is parsed as HTTP/2 too.
                  protocols => [http2],
                  alpn_default_protocol => http2}).
+
+%% True iff the entry has a `tls' map with `witness_client_cert => true': the only
+%% case in which "no certificate" from a client means the client had none to give.
+witnessing(#{tls := #{witness_client_cert := true}}) -> true;
+witnessing(_) -> false.
 
 %% The `limits' the stream handler reads. A listener that routes the
 %% ManagementService and does not serve the agent service gets no per-connection

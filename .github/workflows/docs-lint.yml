@@ -104,6 +104,14 @@ jobs:
       - name: Forensics tier wiring gate self-test (#4990)
         run: python3 -I tests/test_forensics_tier_wiring_lexical_selftest.py
 
+      # WP01: the agent re-registration proof gate stays wired into the direct and gateway ingest
+      # paths (unit tests use fake hooks, so a deleted wiring line would leave them green).
+      - name: Re-registration gate wiring gate (WP01)
+        run: python3 -I tests/test_reregistration_gate_wiring_lexical.py
+
+      - name: Re-registration gate wiring gate self-test (WP01)
+        run: python3 -I tests/test_reregistration_gate_wiring_lexical_selftest.py
+
       # #5557: ownership-based execution admission is keyed on ExecutionOwnerKey, never a
       # service-scoped session's username, and neither list gate hands a service-scoped session
       # unrestricted authority. Best-effort lexical (not a control-flow proof): the dispatched_by
