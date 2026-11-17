@@ -513,8 +513,10 @@ int do_set_start_mode_linux(yuzu::CommandContext& ctx, std::string_view name,
         ctx.set_result_status(YUZU_RESULT_STATUS_PERMISSION_DENIED, YUZU_RESULT_COMPLETENESS_UNKNOWN,
                               "services:privilege_unavailable");
         ctx.write_output(std::format(
-            "error|privilege_unavailable: {} is missing or not root-owned; re-run "
-            "scripts/install-agent-user.sh",
+            "error|privilege_unavailable: {} is missing or not root-owned. set_start_mode needs "
+            "that dev/UAT validator (installed by scripts/install-agent-user.sh); the packaged "
+            "unit runs non-root with NoNewPrivileges and never has it, so this action is "
+            "unavailable there",
             yuzu::services::kYuzuSystemctlWrapper));
         return 1;
     }

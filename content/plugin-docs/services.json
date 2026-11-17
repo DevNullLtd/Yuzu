@@ -416,7 +416,7 @@
       "completeness": "UNKNOWN",
       "provenance": "`services:privilege_unavailable`",
       "status": "`PERMISSION_DENIED`",
-      "when": "Linux `set_start_mode` from a non-root agent: the root-owned validator `/usr/libexec/yuzu/yuzu-systemctl` (written and granted by `scripts/install-agent-user.sh`) is missing or not root-owned and non-writable. The action refuses and never falls back to `sudo systemctl`; re-run the installer. A root agent (a manual root launch) runs `systemctl` directly and does not need it. The packaged unit runs as the non-root `yuzu-agent` with `NoNewPrivileges`, so on it `set_start_mode` is always `privilege_unavailable`."
+      "when": "Linux `set_start_mode` from a non-root agent: the root-owned validator `/usr/libexec/yuzu/yuzu-systemctl` (written and granted by `scripts/install-agent-user.sh`) is missing or not root-owned and non-writable. The action refuses and never falls back to `sudo systemctl`. On a dev/UAT host re-run `scripts/install-agent-user.sh`; the packaged unit has no such step (it is non-root with `NoNewPrivileges`), so there the action is permanently unavailable. A root agent (a manual root launch) runs `systemctl` directly and does not need it. The packaged unit runs as the non-root `yuzu-agent` with `NoNewPrivileges`, so on it `set_start_mode` is always `privilege_unavailable`."
     }
   ],
   "samples": {

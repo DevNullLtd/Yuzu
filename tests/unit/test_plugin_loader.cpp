@@ -660,6 +660,35 @@ TEST_CASE("load_plugin_allowlist: an unreadable file is Unreadable, not empty",
 }
 #endif
 
+#ifndef _WIN32
+#include <sys/stat.h>
+TEST_CASE("load_plugin_allowlist: a FIFO is Unreadable and is never opened (no hang) (F5)",
+          "[plugin_loader][allowlist][f52]") {
+    yuzu::test::TempDir tmp{"yuzu_test_allowlist_fifo_"};
+    fs::create_directories(tmp.path);
+    const auto fifo = tmp.path / "allow.fifo";
+    REQUIRE(::mkfifo(fifo.c_str(), 0600) == 0);
+    // Opening a FIFO for read with no writer blocks forever; the loader must refuse it from the
+    // stat result alone.
+    CHECK(yuzu::agent::load_plugin_allowlist(fifo).status ==
+          yuzu::agent::AllowlistStatus::Unreadable);
+}
+#endif
+
+#ifdef __linux__
+TEST_CASE("load_plugin_allowlist: a read error mid-file is Unreadable, not a short allowlist (F5)",
+          "[plugin_loader][allowlist][f52]") {
+    // /proc/self/mem is a regular file that opens but fails every read at offset 0 with EIO,
+    // which sets badbit: the f.bad() branch. A truncated map must not enforce as if complete.
+    std::ifstream probe("/proc/self/mem");
+    std::string x;
+    if (!probe || std::getline(probe, x) || !probe.bad())
+        SKIP("this host does not fail reads of /proc/self/mem with a stream error");
+    CHECK(yuzu::agent::load_plugin_allowlist("/proc/self/mem").status ==
+          yuzu::agent::AllowlistStatus::Unreadable);
+}
+#endif
+
 TEST_CASE("evaluate_allowlist_startup refuses every configured-but-unusable allowlist",
           "[plugin_loader][allowlist][f52]") {
     using yuzu::agent::AllowlistStatus;

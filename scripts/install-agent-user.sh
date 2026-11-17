@@ -111,7 +111,11 @@
 #   0  - install/check/uninstall succeeded
 #   1  - install/check/uninstall failed; details on stderr
 #   2  - argument or precondition error (not run as root, unsupported OS)
-#   3  - sudoers file failed visudo validation; install was rolled back
+#   3  - sudoers file failed visudo validation; the previous sudoers file was REMOVED
+#        (fail closed: no grants, never the old ones) and nothing new was installed
+#   4  - the systemctl wrapper could not be installed (no systemctl grant was written)
+#   5  - file capabilities could not be stripped or verified absent (setcap/getcap
+#        missing or failing while the binary carries, or may carry, capabilities)
 #
 # THIS SCRIPT MUST BE RUN AS ROOT.
 # We don't try to be cute about that — every action below requires root.
@@ -133,6 +137,7 @@ SKIP_SETCAP=0
 SYSTEMCTL_WRAPPER_DIR="/usr/libexec/yuzu"
 SYSTEMCTL_WRAPPER_PATH="$SYSTEMCTL_WRAPPER_DIR/yuzu-systemctl"
 SYSTEMCTL_WRAPPER_OK=1     # set to 0 when the wrapper could not be installed (no grant written)
+SUDOERS_TARGET="/etc/sudoers.d/yuzu-agent"   # a variable so the execution tests can redirect it
 
 # ── platform detection ───────────────────────────────────────────────────────
 # We support exactly two platforms in this script: macOS and Linux. The
@@ -557,11 +562,14 @@ install_sudoers() {
         return 0
     fi
 
-    local target="/etc/sudoers.d/yuzu-agent"
+    local target="$SUDOERS_TARGET"
     local tmp
     tmp=$(mktemp -t yuzu-sudoers.XXXXXX)
     # Cleanup on any exit path: the temp file should never linger.
-    trap 'rm -f "$tmp"' RETURN
+    # `${tmp:-}` and the self-removal matter: a RETURN trap outlives this function, and under
+    # `set -u` it fired on the NEXT function's return with `tmp` out of scope ("unbound variable"),
+    # aborting the installer before it reached the capability strip (WP13 governance N1).
+    trap 'rm -f "${tmp:-}"; trap - RETURN' RETURN
 
     log "generating sudoers file at $tmp"
     if [[ "$DRY_RUN" -eq 1 ]]; then
@@ -605,7 +613,7 @@ install_sudoers() {
 }
 
 remove_sudoers() {
-    local target="/etc/sudoers.d/yuzu-agent"
+    local target="$SUDOERS_TARGET"
     if [[ -f "$target" ]]; then
         log "removing $target"
         run rm -f "$target"
@@ -662,7 +670,7 @@ install_systemctl_wrapper() {
     fi
 
     local tmp
-    tmp=$(mktemp -t yuzu-systemctl.XXXXXX) || { SYSTEMCTL_WRAPPER_OK=0; return 0; }
+    tmp=$(mktemp -t yuzu-systemctl.XXXXXX) || { SYSTEMCTL_WRAPPER_OK=0; return 4; }
     generate_systemctl_wrapper_content > "$tmp"
     if install -d -m 0755 -o root -g root "$SYSTEMCTL_WRAPPER_DIR" \
         && install -m 0755 -o root -g root "$tmp" "$SYSTEMCTL_WRAPPER_PATH"; then
@@ -670,8 +678,11 @@ install_systemctl_wrapper() {
     else
         warn "could not install $SYSTEMCTL_WRAPPER_PATH - NO systemctl sudo grant will be written"
         SYSTEMCTL_WRAPPER_OK=0
+        rm -f "$tmp"
+        return 4
     fi
     rm -f "$tmp"
+    return 0
 }
 
 remove_systemctl_wrapper() {
@@ -703,8 +714,9 @@ strip_file_capabilities() {
         log "agent binary not found at $BINARY_PATH - no file capabilities to strip"
         return 0
     fi
+    local have_getcap=0 caps=""
     if command -v getcap >/dev/null 2>&1; then
-        local caps
+        have_getcap=1
         caps=$(getcap "$BINARY_PATH" 2>/dev/null || true)
         if [[ -z "$caps" ]]; then
             log "no file capabilities on $BINARY_PATH (good)"
@@ -713,11 +725,21 @@ strip_file_capabilities() {
         log "stripping file capabilities from $BINARY_PATH: $caps"
     fi
     if ! command -v setcap >/dev/null 2>&1; then
+        # FAIL (exit 5), never "skip": with the capability possibly still live the install is NOT
+        # safe, and the caller must not report success (WP13 governance N1).
         warn "setcap not installed - cannot strip file capabilities from $BINARY_PATH"
         warn "  remove them by hand: setcap -r $BINARY_PATH   (apt: libcap2-bin, dnf: libcap)"
-        return 0
+        return 5
     fi
-    run setcap -r "$BINARY_PATH"
+    run setcap -r "$BINARY_PATH" || { warn "setcap -r $BINARY_PATH failed"; return 5; }
+    if [[ "$DRY_RUN" -eq 0 && "$have_getcap" -eq 1 ]]; then
+        caps=$(getcap "$BINARY_PATH" 2>/dev/null || true)
+        if [[ -n "$caps" ]]; then
+            warn "file capabilities STILL present on $BINARY_PATH after setcap -r: $caps"
+            return 5
+        fi
+    fi
+    return 0
 }
 
 # ── verification ────────────────────────────────────────────────────────────
@@ -758,31 +780,31 @@ check_install() {
     # condition this user can't resolve here. Detect explicitly and
     # report a SKIP-with-instructions instead of a misleading FAIL.
     if [[ "$SKIP_SUDOERS" -eq 0 ]]; then
-        if [[ ! -f /etc/sudoers.d/yuzu-agent ]]; then
-            warn "/etc/sudoers.d/yuzu-agent is missing"; ((errs++))
-        elif [[ ! -r /etc/sudoers.d/yuzu-agent ]]; then
-            log "/etc/sudoers.d/yuzu-agent present but not readable by $(id -un)"
+        if [[ ! -f "$SUDOERS_TARGET" ]]; then
+            warn "$SUDOERS_TARGET is missing"; ((errs++))
+        elif [[ ! -r "$SUDOERS_TARGET" ]]; then
+            log "$SUDOERS_TARGET present but not readable by $(id -un)"
             log "  (mode 0440 root:wheel/root is correct; rerun --check as root to validate)"
         else
-            if ! visudo -cf /etc/sudoers.d/yuzu-agent >/dev/null 2>&1; then
-                warn "/etc/sudoers.d/yuzu-agent fails visudo validation"; ((errs++))
+            if ! visudo -cf "$SUDOERS_TARGET" >/dev/null 2>&1; then
+                warn "$SUDOERS_TARGET fails visudo validation"; ((errs++))
             else
-                log "/etc/sudoers.d/yuzu-agent present and visudo-valid"
+                log "$SUDOERS_TARGET present and visudo-valid"
             fi
             # WP13 governance R1: the CONTENT must be the narrowed one. An old file can be
             # present and valid while still carrying the wildcard grants this change removed.
             if [[ "$PLATFORM" == "linux" ]]; then
-                if grep -Eq '^[^#]*systemctl[[:space:]]+(enable|disable|mask|unmask)[[:space:]]' /etc/sudoers.d/yuzu-agent; then
-                    warn "/etc/sudoers.d/yuzu-agent still carries the old systemctl glob grants - re-run the installer"
+                if grep -Eq '^[^#]*systemctl[[:space:]]+(enable|disable|mask|unmask)[[:space:]]' "$SUDOERS_TARGET"; then
+                    warn "$SUDOERS_TARGET still carries the old systemctl glob grants - re-run the installer"
                     ((errs++))
                 fi
-                if ! grep -Eq "^[^#]*NOPASSWD:[[:space:]]*$SYSTEMCTL_WRAPPER_PATH[[:space:]]*\$" /etc/sudoers.d/yuzu-agent; then
-                    warn "/etc/sudoers.d/yuzu-agent lacks the $SYSTEMCTL_WRAPPER_PATH grant"
+                if ! grep -Eq "^[^#]*NOPASSWD:[[:space:]]*$SYSTEMCTL_WRAPPER_PATH[[:space:]]*\$" "$SUDOERS_TARGET"; then
+                    warn "$SUDOERS_TARGET lacks the $SYSTEMCTL_WRAPPER_PATH grant"
                     ((errs++))
                 fi
             else
-                if grep -Eq '^[^#]*launchctl[[:space:]]+(bootstrap|bootout)' /etc/sudoers.d/yuzu-agent; then
-                    warn "/etc/sudoers.d/yuzu-agent still carries the launchctl bootstrap/bootout grants - re-run the installer"
+                if grep -Eq '^[^#]*launchctl[[:space:]]+(bootstrap|bootout)' "$SUDOERS_TARGET"; then
+                    warn "$SUDOERS_TARGET still carries the launchctl bootstrap/bootout grants - re-run the installer"
                     ((errs++))
                 fi
             fi
@@ -838,41 +860,65 @@ check_install() {
 
 # ── action dispatch ─────────────────────────────────────────────────────────
 
+# The install sequence is a function so the execution tests can source this file
+# (YUZU_INSTALLER_SOURCE_ONLY=1) and drive it with stub tools. Returns the FIRST failure in the
+# order sudoers (3), wrapper (4), file capabilities (5); success only if every step succeeded.
+do_install() {
+    require_root
+    log "installing Yuzu agent user on $PLATFORM (account: $ACCOUNT_NAME)"
+    # macos_create_user / linux_create_user are themselves idempotent —
+    # they probe existing state, create what's missing, repair what's
+    # broken. Don't short-circuit here (we used to, which meant a
+    # half-installed account couldn't be self-healed by re-running).
+    if [[ "$PLATFORM" == "macos" ]]; then
+        macos_create_user
+    else
+        if linux_user_exists; then
+            log "user $ACCOUNT_NAME already exists — skipping create"
+        else
+            linux_create_user
+        fi
+    fi
+    create_state_dirs
+    # The wrapper goes in BEFORE the sudoers file that grants it (and a failed install
+    # clears SYSTEMCTL_WRAPPER_OK so no systemctl grant is written at all).
+    local wrapper_rc=0 sudoers_rc=0 strip_rc=0
+    install_systemctl_wrapper || wrapper_rc=$?
+    install_sudoers || sudoers_rc=$?
+    # Always attempt the capability strip (safe either way), but no failed step may be reported
+    # as a complete install.
+    strip_file_capabilities || strip_rc=$?
+    if [[ "$sudoers_rc" -ne 0 ]]; then
+        warn "install INCOMPLETE: the sudoers file was not installed (exit $sudoers_rc)"
+        return "$sudoers_rc"
+    fi
+    if [[ "$wrapper_rc" -ne 0 ]]; then
+        warn "install INCOMPLETE: the systemctl wrapper was not installed (exit $wrapper_rc)"
+        return "$wrapper_rc"
+    fi
+    if [[ "$strip_rc" -ne 0 ]]; then
+        warn "install INCOMPLETE: file capabilities may still be present on $BINARY_PATH (exit $strip_rc)"
+        return "$strip_rc"
+    fi
+    log "install complete. Verify with: $0 --check"
+    return 0
+}
+
+if [[ "${YUZU_INSTALLER_SOURCE_ONLY:-0}" == "1" ]]; then
+    return 0 2>/dev/null || exit 0
+fi
+
 case "$ACTION" in
     install)
-        require_root
-        log "installing Yuzu agent user on $PLATFORM (account: $ACCOUNT_NAME)"
-        # macos_create_user / linux_create_user are themselves idempotent —
-        # they probe existing state, create what's missing, repair what's
-        # broken. Don't short-circuit here (we used to, which meant a
-        # half-installed account couldn't be self-healed by re-running).
-        if [[ "$PLATFORM" == "macos" ]]; then
-            macos_create_user
-        else
-            if linux_user_exists; then
-                log "user $ACCOUNT_NAME already exists — skipping create"
-            else
-                linux_create_user
-            fi
-        fi
-        create_state_dirs
-        # The wrapper goes in BEFORE the sudoers file that grants it (and a failed install
-        # clears SYSTEMCTL_WRAPPER_OK so no systemctl grant is written at all).
-        install_systemctl_wrapper
-        sudoers_rc=0
-        install_sudoers || sudoers_rc=$?
-        # Always strip file capabilities (safe either way), but a failed sudoers install must
-        # make the script FAIL (exit 3), never report a complete install.
-        strip_file_capabilities
-        if [[ "$sudoers_rc" -ne 0 ]]; then
-            warn "install INCOMPLETE: the sudoers file was not installed (exit $sudoers_rc)"
-            exit "$sudoers_rc"
-        fi
-        log "install complete. Verify with: $0 --check"
+        do_install
+        exit $?
         ;;
 
     check)
+        # The exit status IS the contract ("exits non-zero on any drift"): the case used to fall
+        # through to the trailing `exit 0`, so --check could never fail (WP13 governance N1).
         check_install
+        exit $?
         ;;
 
     uninstall)

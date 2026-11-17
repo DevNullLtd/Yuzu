@@ -850,7 +850,10 @@ public:
             spdlog::critical("--plugin-require-signature is set but --plugin-trust-bundle "
                              "is empty. Refusing to start: this combination would silently "
                              "fail-open (every plugin would load unverified).");
-            std::exit(EXIT_FAILURE);
+            // Same mechanism as the allowlist refusal above: std::exit raced the async log
+            // hand-off and could drop the line above (WP13 governance N-NC).
+            startup_failed_ = true;
+            return;
         }
         auto scan = PluginLoader::scan(cfg_.plugin_dir, allowlist, signing, allowlist_required);
 

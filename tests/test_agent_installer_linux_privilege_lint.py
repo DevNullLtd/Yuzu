@@ -82,9 +82,8 @@ def main() -> int:
         if "requiretty" in "\n".join(l for l in code.splitlines()
                                        if "Defaults" in l and not l.lstrip().startswith("#")):
             fail("sudoers still carries a Defaults requiretty line (sudo-rs rejects the file)")
-        if not re.search(r"install_sudoers \|\| sudoers_rc=\$\?", code) or \
-           'exit "$sudoers_rc"' not in code:
-            fail("a failed sudoers install must make the script exit non-zero")
+        # (Exit-status behaviour of install/--check is asserted by EXECUTION in
+        # tests/test_agent_installer_exec.py; the text pins here would stay green under a neutered exit.)
         if "rm -f \"$target\"" not in code[code.index("install_sudoers()"):code.index("remove_sudoers()")]:
             fail("a failed sudoers validation must remove the previous (glob-carrying) file")
         if "cannot verify" not in chk:

@@ -4698,6 +4698,14 @@ test('agent installer linux privilege lint (WP13/F21,F48)',
   suite: 'docs',
   timeout: 90,
 )
+# WP13 governance N1: EXECUTED installer exit-status tests with stub setcap/getcap/visudo/install on PATH
+# (sourced via YUZU_INSTALLER_SOURCE_ONLY; nothing outside a temp dir is touched).
+test('agent installer exec exit-status (WP13/N1)',
+  _python3_test,
+  args: [files('test_agent_installer_exec.py')],
+  suite: 'docs',
+  timeout: 90,
+)
 # WP13 UP14: the /proc walkers declare a refused read as CONSTRAINED (source-text only).
 test('proc access status lexical gate (WP13/UP14)',
   _python3_test,

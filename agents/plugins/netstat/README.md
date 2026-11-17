@@ -99,7 +99,7 @@ On Linux, `list` and `attribution` declare a typed status when the agent could n
 | Status | Completeness | Provenance | When |
 |---|---|---|---|
 | `UNDECLARED` (default) | UNKNOWN | (empty) | Every Windows and macOS run, and a Linux run where every process was readable. |
-| `CONSTRAINED` | PARTIAL | `netstat:proc_fd_unreadable` | `/proc/<pid>/fd` could not be opened (EACCES/EPERM) for at least one process, so sockets owned by it carry no `pid` (and, for `attribution`, no process name or path). Rows are still emitted (a kernel thread also renders with an empty path), so the status, not the rows, says the list is incomplete. Grant `CAP_SYS_PTRACE` to the agent process only if that detail is needed; the packaged unit and the dev installer do not. |
+| `CONSTRAINED` | PARTIAL | `netstat:proc_fd_unreadable` | `/proc/<pid>/fd` could not be opened (EACCES/EPERM) for at least one process, so sockets owned by it carry no `pid` (and, for `attribution`, no process name or path). Rows are still emitted (a kernel thread also renders with an empty path), so the status, not the rows, says the list is incomplete. Grant `CAP_SYS_PTRACE` to the agent process only if that detail is needed; the packaged unit and the dev installer do not. **Linux only:** a refused read on macOS or Windows can still blank a row while the status stays `OK`, and other `/proc` readers are not tallied; treat `OK` there as not proof of completeness (tracked as a follow-up). |
 
 ### Where the data goes
 

@@ -17,11 +17,12 @@ import tempfile
 REFUSAL = "Refusing to start"
 
 
-def run(agent, allowlist, tmp, wait):
+def run(agent, allowlist, tmp, wait, extra=()):
     args = [agent, "--server", "127.0.0.1:1", "--no-tls", "--data-dir", str(tmp / "data"),
             "--plugin-dir", str(tmp / "plugins"), "--log-level", "info"]
     if allowlist is not None:
         args += ["--plugin-allowlist", str(allowlist)]
+    args += list(extra)
     p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                          env={**os.environ, "YUZU_AGENT_LOG_FILE": ""})
     try:
@@ -52,6 +53,11 @@ def main():
                 errs.append(f"{name}: exit code 0")
             if REFUSAL not in out or "--plugin-allowlist" not in out:
                 errs.append(f"{name}: refusal line not in output (lost log line?):\n{out[-600:]}")
+        # --plugin-require-signature without a trust bundle (the sibling guard) uses the same
+        # return-from-run mechanism: its line must reach the log and the exit must be non-zero.
+        rc, out, timed_out = run(agent, None, tmp, 60, ["--plugin-require-signature"])
+        if timed_out or rc == 0 or REFUSAL not in out or "--plugin-trust-bundle" not in out:
+            errs.append(f"require-signature without a bundle: rc={rc} timed_out={timed_out}\n{out[-400:]}")
         good = tmp / "good.txt"
         good.write_text("a" * 64 + "  nothing.so\n")
         rc, out, timed_out = run(agent, good, tmp, 6)
