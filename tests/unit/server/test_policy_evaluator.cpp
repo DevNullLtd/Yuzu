@@ -268,7 +268,8 @@ struct Harness {
     // Author a fragment + policy bound to the static group. Returns policy id.
     std::string author(const std::string& check_cel, bool with_fix = false,
                        int64_t interval_seconds = 0,
-                       const std::string& check_instruction = "test.check") {
+                       const std::string& check_instruction = "test.check",
+                       const std::string& instruction_pairs = {}) {
         std::string frag = std::string("apiVersion: yuzu.io/v1alpha1\nkind: PolicyFragment\n") +
                            "spec:\n  check:\n    instruction: " + check_instruction +
                            "\n    compliance: \"" + check_cel + "\"\n";
@@ -277,7 +278,7 @@ struct Harness {
             frag += "  postCheck:\n    instruction: test.verify\n    compliance: \"result.fixed "
                     "== 'yes'\"\n";
         }
-        auto fid = ps.create_fragment(frag);
+        auto fid = ps.create_fragment(frag, instruction_pairs);
         REQUIRE(fid.has_value());
 
         std::string pol = std::string("apiVersion: yuzu.io/v1alpha1\nkind: Policy\n") + "spec:\n  fragment: " +
@@ -633,6 +634,30 @@ TEST_CASE("policy evaluator: remediate() is bounded by the operator's visible se
     CHECK(some.agents == 1);
     CHECK(h.dispatch_calls == before + 1);
     CHECK(h.status_of(pid, "agentB") == "non_compliant");
+}
+
+TEST_CASE("policy evaluator: an instruction whose plugin.action changed since the fragment was "
+          "authored is refused, never dispatched (WP06 F4 TOCTOU)",
+          "[pg][policy][evaluator]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    h.canned["agentA|checkp"] = {1, out_json("hostname", "a")};
+
+    // Authored while test.check resolved to a benign pair; the definition now resolves to
+    // checkp.run (a stand-in for an edit to a gated pair). The snapshot no longer matches.
+    auto stale = h.author("result.hostname != ''", false, 0, "test.check",
+                          R"({"test.check":"benign.run"})");
+    PolicyEvaluator ev(h.deps());
+    const int before = h.dispatch_calls;
+    (void)ev.evaluate_now(stale);
+    CHECK(h.dispatch_calls == before); // refused: nothing dispatched
+
+    // The same fragment authored with the pair that still matches dispatches normally.
+    auto fresh = h.author("result.hostname != ''", false, 0, "test.check",
+                          R"({"test.check":"checkp.run"})");
+    CHECK_FALSE(ev.evaluate_now(fresh).value_or("").empty());
+    CHECK(h.dispatch_calls == before + 1);
 }
 
 TEST_CASE("policy evaluator: interval throttles re-dispatch", "[pg][policy][evaluator]") {

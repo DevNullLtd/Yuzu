@@ -41,6 +41,7 @@
 
 #include "filesystem_acl_parsers.hpp"
 #include "filesystem_find_by_hash.hpp"
+#include <agent_reserved_path_keys.hpp>
 #include "filesystem_reserved_paths.hpp" // WP06 F55: refuse the agent's own secrets
 #include <atomic_file_write.hpp> // yuzu::shared::write_file_atomic
 #include <network_fstype.hpp>
@@ -767,12 +768,11 @@ public:
     yuzu::Result<void> init(yuzu::PluginContext& ctx) override {
         // WP06 F55: capture the agent's own paths once; an absent key simply reserves nothing.
         yuzu::filesystem::reserved::Set set;
-        add_reserved(set, ctx.get_config("agent.data_dir"), /*is_dir=*/true);
-        add_reserved(set, ctx.get_config("agent.cert_dir"), /*is_dir=*/true);
-        add_reserved(set, ctx.get_config("agent.log_file"), /*is_dir=*/false);
-        add_reserved(set, ctx.get_config("agent.tls_ca_cert"), /*is_dir=*/false);
-        add_reserved(set, ctx.get_config("agent.tls_client_cert"), /*is_dir=*/false);
-        add_reserved(set, ctx.get_config("agent.tls_client_key"), /*is_dir=*/false);
+        // Derived from the ONE authoritative list (agent_reserved_path_keys.hpp).
+        for (auto key : yuzu::shared::agent_paths::kReservedDirKeys)
+            add_reserved(set, ctx.get_config(key), /*is_dir=*/true);
+        for (auto key : yuzu::shared::agent_paths::kReservedFileKeys)
+            add_reserved(set, ctx.get_config(key), /*is_dir=*/false);
         std::lock_guard lk(g_reserved_mu);
         g_reserved = std::move(set);
         return {};

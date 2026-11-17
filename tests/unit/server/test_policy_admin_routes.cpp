@@ -53,6 +53,7 @@ struct PolicyAdminHarness {
     // WP06 F4: the fake for the instruction-authority closure. Default = admitted, unrestricted.
     std::vector<std::string> authorized_instructions;
     PolicyAdminRoutes::InstructionAuthority authority{.ok = true, .status = 200, .message = {},
+                                                      .plugin_action = "plug.act",
                                                       .visible = std::nullopt};
 
     explicit PolicyAdminHarness(PolicyStore* policy_store = nullptr) {
@@ -299,6 +300,11 @@ TEST_CASE("POST /api/policies/:id/evaluate and /remediate: a degraded scope "
     PolicyAdminRoutes routes;
     yuzu::server::test::TestRouteSink sink;
     routes.register_routes(sink, auth_fn, perm_fn, audit_fn, emit_fn, &ps, &evaluator, &metrics);
+    routes.set_authorize_instruction_fn(
+        [](const httplib::Request&, const std::string&) -> PolicyAdminRoutes::InstructionAuthority {
+            return {.ok = true, .status = 200, .message = {}, .plugin_action = "p.a",
+                    .visible = std::nullopt};
+        });
 
     auto eval_res = sink.Post("/api/policies/" + *pid + "/evaluate", "");
     REQUIRE(eval_res);
@@ -537,11 +543,18 @@ spec:
 
     // Admitted: all three instruction ids were checked, in check / postCheck / fix order.
     h.authority.ok = true;
+    h.authority.plugin_action = "plug.act";
     h.authorized_instructions.clear();
     auto ok = h.sink.Post("/api/policy-fragments", yaml, "text/plain");
     REQUIRE(ok);
     CHECK(ok->status == 201);
     REQUIRE(h.authorized_instructions.size() == 3);
+    // The authorized plugin.action of each instruction is snapshotted on the stored fragment.
+    auto stored = store.query_fragments();
+    REQUIRE(stored.has_value());
+    REQUIRE(stored->size() == 1);
+    auto pairs = nlohmann::json::parse((*stored)[0].instruction_pairs);
+    CHECK(pairs["fix.instr"] == "plug.act");
     CHECK(h.authorized_instructions[0] == "chk.instr");
     CHECK(h.authorized_instructions[1] == "post.instr");
     CHECK(h.authorized_instructions[2] == "fix.instr");

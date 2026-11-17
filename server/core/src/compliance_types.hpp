@@ -41,6 +41,12 @@ struct PolicyFragment {
     std::string post_check_parameters;
     int64_t created_at{0};
     int64_t updated_at{0};
+    /// WP06 F4 (interim): JSON object {instruction_id: "plugin.action"} snapshotted when the
+    /// fragment was authored and its instructions were authorized for the author. The evaluator
+    /// refuses (verdict error, counted) to dispatch an instruction whose id now resolves to a
+    /// DIFFERENT plugin.action. "" = no snapshot (a fragment authored before this existed, or via
+    /// a path that does not authorize): behaviour unchanged.
+    std::string instruction_pairs;
 };
 
 struct PolicyTrigger {

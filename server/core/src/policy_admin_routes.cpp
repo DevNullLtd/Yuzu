@@ -57,7 +57,8 @@ std::string policy_targeting_audit_detail(const PolicyStore& store, const std::s
 
 bool PolicyAdminRoutes::authorize_fragment_instructions(const httplib::Request& req,
                                                         httplib::Response& res,
-                                                        const std::string& yaml_source) {
+                                                        const std::string& yaml_source,
+                                                        std::string& instruction_pairs_out) {
     const auto refuse = [&](int status, const std::string& message, const std::string& detail) {
         audit_fn_(req, "policy_fragment.create", "denied", "policy_fragment",
                   PolicyStore::peek_fragment_name(yaml_source), detail);
@@ -73,12 +74,20 @@ bool PolicyAdminRoutes::authorize_fragment_instructions(const httplib::Request& 
         return true;
     if (!authorize_instruction_fn_) // unwired = refused, never admitted
         return refuse(503, "instruction authorization is not available", "reason=authorize_unwired");
+    nlohmann::json pairs = nlohmann::json::object();
     for (const auto& [role, instruction_id] : instructions) {
         const auto a = authorize_instruction_fn_(req, instruction_id);
         if (!a.ok)
             return refuse(a.status == 0 ? 403 : a.status, a.message,
                           "reason=instruction_not_authorized role=" + role);
+        // Snapshot WHAT was authorized: an instruction definition can be edited later, and the
+        // evaluator refuses to dispatch an id whose plugin.action no longer matches this.
+        if (a.plugin_action.empty())
+            return refuse(503, "instruction authorization returned no plugin.action",
+                          "reason=authorize_no_pair role=" + role);
+        pairs[instruction_id] = a.plugin_action;
     }
+    instruction_pairs_out = pairs.dump();
     return true;
 }
 
@@ -142,10 +151,11 @@ void PolicyAdminRoutes::register_routes(HttpRouteSink& sink,
 
             // WP06 F4 (interim): the author must be authorized for every instruction the
             // fragment will later run as the system caller.
-            if (!authorize_fragment_instructions(req, res, yaml_source))
+            std::string instruction_pairs;
+            if (!authorize_fragment_instructions(req, res, yaml_source, instruction_pairs))
                 return;
 
-            auto result = policy_store_->create_fragment(yaml_source);
+            auto result = policy_store_->create_fragment(yaml_source, instruction_pairs);
             if (!result) {
                 // #396: store-level kConflictPrefix maps to HTTP 409. Strip
                 // the internal prefix from the operator-facing JSON body

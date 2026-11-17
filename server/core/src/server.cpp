@@ -22665,6 +22665,7 @@ private:
                     }
                     out.ok = true;
                     out.status = 200;
+                    out.plugin_action = (*def)->plugin + "." + (*def)->action;
                     out.visible = caller.exec_visible;
                     return out;
                 });

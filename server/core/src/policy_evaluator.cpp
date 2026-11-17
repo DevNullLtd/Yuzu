@@ -370,7 +370,8 @@ std::vector<std::string> PolicyEvaluator::resolve_targets(const Policy& p,
 std::expected<PolicyEvaluator::DispatchInstructionResult, std::string>
 PolicyEvaluator::dispatch_instruction(const std::string& instruction_id,
                                       const std::unordered_map<std::string, std::string>& parameters,
-                                      const std::vector<std::string>& targets) {
+                                      const std::vector<std::string>& targets,
+                                      const std::string& instruction_pairs) {
     if (targets.empty() || !d_.dispatch_fn)
         return DispatchInstructionResult{};
     // db_error, not a legitimate no-op (gov Gate 3 architect finding): a null
@@ -400,6 +401,27 @@ PolicyEvaluator::dispatch_instruction(const std::string& instruction_id,
         return DispatchInstructionResult{};
     }
     const auto& def = **def_result;
+    // WP06 F4 (interim): the fragment's author was authorized for the plugin.action this id
+    // resolved to AT AUTHORING TIME. If the definition was edited since to a different pair,
+    // the authorization does not carry over: refuse (the same empty result an unknown
+    // instruction gives, so the verdict is "error", never a dispatch), logged and counted.
+    // "" = a fragment with no snapshot: unchanged.
+    if (!instruction_pairs.empty()) {
+        std::string expected;
+        auto pairs = nlohmann::json::parse(instruction_pairs, nullptr, false);
+        if (pairs.is_object() && pairs.contains(instruction_id) && pairs[instruction_id].is_string())
+            expected = pairs[instruction_id].get<std::string>();
+        if (expected != def.plugin + "." + def.action) {
+            spdlog::warn("policy_evaluator: instruction '{}' now resolves to {}.{}, which differs "
+                         "from the pair authorized when its fragment was authored; refusing to "
+                         "dispatch",
+                         instruction_id, def.plugin, def.action);
+            if (d_.metrics)
+                d_.metrics->counter("yuzu_server_policy_instruction_pair_mismatch_total")
+                    .increment();
+            return DispatchInstructionResult{};
+        }
+    }
     auto execid = gen_execution_id();
     auto outcome = d_.dispatch_fn(def.plugin, def.action, targets, /*scope_expr=*/"", parameters,
                                   execid);
@@ -456,7 +478,7 @@ std::expected<std::string, std::string> PolicyEvaluator::kickoff_check(const Pol
     // dispatch_instruction invokes the blocking dispatch_fn — call it WITHOUT mu_.
     // ADR-0058: a genuine InstructionStore error propagates as `unexpected` here
     // too, the same way the degraded-fragment-read path above does.
-    auto dispatch_result = dispatch_instruction(frag.check_instruction, params, targets);
+    auto dispatch_result = dispatch_instruction(frag.check_instruction, params, targets, frag.instruction_pairs);
     if (!dispatch_result)
         // gov Gate 8 (#4981 PR-1 fix-round re-review, security-guardian HIGH):
         // dispatch_result.error() can carry a raw PQerrorMessage() (via
@@ -781,7 +803,7 @@ PolicyEvaluator::remediate(const std::string& policy_id,
     // Dispatch the fix to the CLAIMED subset only (never the full `targets`
     // — a target the claim above did not win must never be dispatched to).
     // dispatch_instruction must run without mu_ held.
-    auto dispatch_result = dispatch_instruction(frag->fix_instruction, fix_params, claimed);
+    auto dispatch_result = dispatch_instruction(frag->fix_instruction, fix_params, claimed, frag->instruction_pairs);
     if (!dispatch_result) {
         // Dispatch never happened — release every claim so it does not sit
         // orphaned until the stale window expires.
@@ -855,6 +877,7 @@ PolicyEvaluator::remediate(const std::string& policy_id,
                                       .dispatched_at = now(),
                                       .claim_gen = claim_gen,
                                       .verify_instruction = std::move(verify_instr),
+                                      .verify_pairs = frag->instruction_pairs,
                                       .verify_compliance = std::move(verify_cel),
                                       .verify_parameters_json = map_to_json_obj(verify_params)});
     }
@@ -1006,7 +1029,7 @@ void PolicyEvaluator::collect_ready() {
             }
             if (!verify_targets.empty()) {
                 auto vparams = params_from_json_obj(f.verify_parameters_json);
-                auto result = dispatch_instruction(f.verify_instruction, vparams, verify_targets);
+                auto result = dispatch_instruction(f.verify_instruction, vparams, verify_targets, f.verify_pairs);
                 if (result && !result->execution_id.empty()) {
                     std::lock_guard<std::mutex> lk(mu_);
                     in_flight_.push_back(InFlight{.phase = Phase::Check,

@@ -95,7 +95,7 @@ public:
 
     // ── Fragments ────────────────────────────────────────────────────────
     [[nodiscard]] std::expected<std::string, std::string>
-    create_fragment(const std::string& yaml_source);
+    create_fragment(const std::string& yaml_source, const std::string& instruction_pairs = {});
     [[nodiscard]] std::expected<std::vector<PolicyFragment>, PolicyReadError>
     query_fragments(const FragmentQuery& q = {}) const;
     [[nodiscard]] std::expected<std::optional<PolicyFragment>, PolicyReadError>

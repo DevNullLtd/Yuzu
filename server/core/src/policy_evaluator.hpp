@@ -231,6 +231,7 @@ private:
         int64_t claim_gen{0};
         // FixWait -> verify hand-off (the post-check to run after the fix):
         std::string verify_instruction;
+        std::string verify_pairs; ///< the fragment's instruction_pairs snapshot (WP06 F4)
         std::string verify_compliance;
         std::string verify_parameters_json;
     };
@@ -296,7 +297,8 @@ private:
     std::expected<DispatchInstructionResult, std::string>
     dispatch_instruction(const std::string& instruction_id,
                          const std::unordered_map<std::string, std::string>& parameters,
-                         const std::vector<std::string>& targets);
+                         const std::vector<std::string>& targets,
+                         const std::string& instruction_pairs = {});
 
     int64_t now() const;
     static std::string gen_execution_id();

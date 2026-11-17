@@ -96,6 +96,10 @@ TEST_CASE("filesystem plugin: read/search/file_hash/get_acl refuse the agent's o
         std::ofstream o(f);
         o << "SECRET-SENTINEL\n";
     }
+    for (const char* n : {"enroll.tok", "trust.pem"}) {
+        std::ofstream o(other / n);
+        o << "SECRET-SENTINEL\n";
+    }
     // A symlink from an innocent place to the key must not bypass the guard.
     const auto link = other / "innocent.txt";
     std::error_code lec;
@@ -105,7 +109,9 @@ TEST_CASE("filesystem plugin: read/search/file_hash/get_acl refuse the agent's o
         "filesystem",
         {{"agent.data_dir", data_dir.string()},
          {"agent.log_file", log.string()},
-         {"agent.tls_client_key", (root.path / "elsewhere.key").string()}}};
+         {"agent.tls_client_key", (root.path / "elsewhere.key").string()},
+         {"agent.enrollment_token_file", (other / "enroll.tok").string()},
+         {"agent.plugin_trust_bundle", (other / "trust.pem").string()}}};
     REQUIRE(handle->descriptor()->init(ctx.get()) == 0);
 
     auto dispatch = [&](const char* action, const fs::path& p) {
@@ -128,6 +134,16 @@ TEST_CASE("filesystem plugin: read/search/file_hash/get_acl refuse the agent's o
             CHECK(r3.rc != 0);
             CHECK(r3.captured.find("SECRET-SENTINEL") == std::string::npos);
         }
+    }
+    // The enrolment token file and the trust bundle (WP06 F55 review), a `..` variant of the
+    // key path, and the refusal never echoes the path.
+    const auto dotdot = other / ".." / "data" / "certs" / ".." / "certs" / "agent-client.key";
+    for (const auto& p : {other / "enroll.tok", other / "trust.pem", dotdot}) {
+        auto r = dispatch("read", p);
+        CHECK(r.rc != 0);
+        CHECK(r.captured.find("SECRET-SENTINEL") == std::string::npos);
+        CHECK(r.captured.find("enroll.tok") == std::string::npos);
+        CHECK(r.captured.find("agent-client") == std::string::npos);
     }
     // A path outside the reserved set still reads.
     auto good = dispatch("read", ok_file);

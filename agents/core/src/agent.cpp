@@ -871,6 +871,10 @@ public:
         plugin_ctx_.config["agent.tls_ca_cert"] = cfg_.tls_ca_cert.string();
         plugin_ctx_.config["agent.tls_client_cert"] = cfg_.tls_client_cert.string();
         plugin_ctx_.config["agent.tls_client_key"] = cfg_.tls_client_key.string();
+        plugin_ctx_.config["agent.enrollment_token_file"] = cfg_.enrollment_token_file.string();
+        plugin_ctx_.config["agent.plugin_allowlist"] = cfg_.plugin_allowlist.string();
+        plugin_ctx_.config["agent.plugin_trust_bundle"] = cfg_.plugin_trust_bundle.string();
+        plugin_ctx_.config["agent.update_trust_bundle"] = cfg_.update_trust_bundle.string();
         plugin_ctx_.config["agent.container_runtime_endpoint"] = cfg_.container_runtime_endpoint;
         plugin_ctx_.config["agent.log_level"] = cfg_.log_level;
         plugin_ctx_.config["agent.debug_mode"] = cfg_.debug_mode ? "true" : "false";

@@ -70,6 +70,7 @@ public:
         bool ok{false};
         int status{403};         ///< HTTP status to answer when !ok (401/403/400/503)
         std::string message;     ///< operator-facing refusal text when !ok
+        std::string plugin_action; ///< "plugin.action" the instruction id resolved to (when ok)
         authz::VisibleSet visible{authz::deny_all()}; ///< exec visibility (nullopt = unrestricted)
     };
     using AuthorizeInstructionFn =
@@ -116,7 +117,8 @@ private:
     /// WP06 F4: authorize every instruction a fragment YAML names for the request principal.
     /// Writes the refusal (and a denied audit row) and returns false on any refusal.
     bool authorize_fragment_instructions(const httplib::Request& req, httplib::Response& res,
-                                         const std::string& yaml_source);
+                                         const std::string& yaml_source,
+                                         std::string& instruction_pairs_out);
 };
 
 } // namespace yuzu::server

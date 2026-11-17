@@ -104,7 +104,7 @@ using yaml_scan::extract_yaml_value;
 constexpr const char* kFragmentCols =
     "id, name, description, yaml_source, check_instruction, check_compliance, "
     "check_parameters, fix_instruction, fix_parameters, post_check_instruction, "
-    "post_check_compliance, post_check_parameters, created_at, updated_at";
+    "post_check_compliance, post_check_parameters, created_at, updated_at, instruction_pairs";
 
 PolicyFragment read_fragment(PGresult* res, int row) {
     PolicyFragment f;
@@ -123,6 +123,7 @@ PolicyFragment read_fragment(PGresult* res, int row) {
     f.post_check_parameters = text_col(res, row, c++);
     f.created_at = to_i64(PQgetvalue(res, row, c++));
     f.updated_at = to_i64(PQgetvalue(res, row, c++));
+    f.instruction_pairs = text_col(res, row, c++);
     return f;
 }
 
@@ -353,6 +354,10 @@ const std::vector<pg::PgMigration>& migrations() {
          "   OR fix_instruction LIKE 'crossplatform.tar.%' "
          "   OR post_check_instruction LIKE 'crossplatform.tar.%' "
          "   OR yaml_source LIKE '%crossplatform.tar.%';"},
+        // v6 (WP06 F4 interim): the authoring-time snapshot of each instruction's resolved
+        // plugin.action. Additive, constant default (instant, no rewrite): every existing row
+        // reads '' = no snapshot = behaviour unchanged.
+        {6, "ALTER TABLE policy_fragments ADD COLUMN instruction_pairs TEXT NOT NULL DEFAULT '';"},
     };
     return kMigrations;
 }
@@ -442,7 +447,7 @@ PolicyStore::peek_fragment_instructions(const std::string& yaml_source) {
 // ── Fragment CRUD ────────────────────────────────────────────────────────────
 
 std::expected<std::string, std::string>
-PolicyStore::create_fragment(const std::string& yaml_source) {
+PolicyStore::create_fragment(const std::string& yaml_source, const std::string& instruction_pairs) {
     if (!open_)
         return std::unexpected(std::string(kPolicyDbErrorPrefix) + "database not open");
     if (yaml_source.empty())
@@ -541,13 +546,13 @@ PolicyStore::create_fragment(const std::string& yaml_source) {
         "INSERT INTO policy_store.policy_fragments "
         "(id, name, description, yaml_source, check_instruction, check_compliance, "
         " check_parameters, fix_instruction, fix_parameters, post_check_instruction, "
-        " post_check_compliance, post_check_parameters, created_at, updated_at) "
-        "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING id",
+        " post_check_compliance, post_check_parameters, created_at, updated_at, instruction_pairs) "
+        "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING id",
         std::vector<std::string>{id, name, description, yaml_source, check_instruction,
                                  check_compliance, check_params_json.dump(), fix_instruction,
                                  fix_params_json.dump(), post_instruction, post_compliance,
                                  post_params_json.dump(), std::to_string(now),
-                                 std::to_string(now)});
+                                 std::to_string(now), instruction_pairs});
     if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0) {
         spdlog::error("PolicyStore: insert failed in create_fragment: {}",
                       PQerrorMessage(lease.get()));
