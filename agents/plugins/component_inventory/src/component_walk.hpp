@@ -31,8 +31,9 @@
  * returns, and the scan's rows, are bounded by count (max_rows), not bytes, at up to max_rows full
  * paths of about max_depth x 256 bytes each.
  *
- * Paths are joined with '/': only the POSIX legs ship. No directory is excluded by name (an OSGi
- * container keeps its bundles in <product>/system, so such names are ordinary application directories).
+ * Paths are joined with '/': only the POSIX legs ship. By default no directory is excluded by name (an
+ * OSGi container keeps its bundles in <product>/system, so such names are ordinary application
+ * directories); a WalkPolicy::skip_dir may exclude whole trees, and each one is counted.
  * Links and network mounts are never listed; each is counted in its own stat. Any other entry type is
  * skipped uncounted.
  */
@@ -108,6 +109,17 @@ struct WalkStats {
     std::size_t entries{0};
     std::size_t links_skipped{0};
     std::size_t mounts_skipped{0};
+    std::size_t dirs_excluded{0}; // directories a WalkPolicy::skip_dir kept the walk out of
+};
+
+/// What a walk collects and what it keeps out of. The default is the Java scan's: archive names, no
+/// directory excluded. The native scan names shared libraries and excludes package-owned trees.
+struct WalkPolicy {
+    /// Whether a file named `leaf` is a candidate row.
+    bool (*is_candidate)(std::string_view leaf) = &is_java_archive_name;
+    /// True for a directory (its full path) the walk must not list. Counted in
+    /// WalkStats::dirs_excluded, never skipped silently. Empty = no directory is excluded.
+    std::function<bool(const std::string& dir_path)> skip_dir;
 };
 
 // archive_unenumerated and archive_changed are set by the scan, never by the walk; the enum lives
@@ -168,9 +180,11 @@ inline void append(std::string& dir, const std::string& name) {
  * caller (the scan reuses the same instant for its archive reads); it and the entry budget are
  * checked before every directory is listed, i.e. after the previous one finished, and the entry
  * budget is also enforced entry by entry so stats.entries never exceeds limits.max_entries.
+ * `policy` defaults to the Java scan's behaviour.
  */
 [[nodiscard]] inline WalkResult walk(std::span<const std::string> roots, const WalkLimits& limits,
-                                     const FsOps& fs, std::chrono::steady_clock::time_point deadline) {
+                                     const FsOps& fs, std::chrono::steady_clock::time_point deadline,
+                                     const WalkPolicy& policy = {}) {
     using Type = DirEntry::Type;
     WalkResult out;
 
@@ -250,6 +264,10 @@ inline void append(std::string& dir, const std::string& name) {
                         record(Stop::depth);
                         continue;
                     }
+                    if (policy.skip_dir && policy.skip_dir(walk_detail::join(cur_path, e.name))) {
+                        ++out.stats.dirs_excluded;
+                        continue;
+                    }
                     nodes.push_back({cur.node, e.name});
                     queue.push_back({nodes.size() - 1, cur.depth + 1,
                                      cur.anchor == kNoNode ? nodes.size() - 1 : cur.anchor});
@@ -258,7 +276,7 @@ inline void append(std::string& dir, const std::string& name) {
                 case Type::file: break;
                 }
 
-                if (!is_java_archive_name(e.name))
+                if (!policy.is_candidate(e.name))
                     continue;
                 const std::string& anchor = cur.anchor == kNoNode ? e.name : nodes[cur.anchor].name;
                 std::size_t& rows = anchor_rows[anchor];

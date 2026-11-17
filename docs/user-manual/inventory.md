@@ -480,14 +480,58 @@ unpacked (the archive's directory and, when needed, two small entries are read).
   between archives, so one blocked read is not interrupted. On the packaged Linux unit the agent
   holds `CAP_DAC_READ_SEARCH`, so permission-restricted directories are readable there and
   `dir_unreadable` is rare.
-- **Switching it off.** The per-plugin kill switch (`component_inventory/scan`,
-  `PUT /api/v1/plugin-config/component_inventory/kill-switch`) turns the action off. The permanent
+- **Switching it off.** The kill switch (`PUT /api/v1/plugin-config/component_inventory/kill-switch`,
+  with `action` set to `scan`) turns the action off. The permanent
   customer opt-out of ADR-0028 Decisions 2 and 8 is still open (#7737).
 - **What the rows reveal.** Names, versions, paths and application folder names as they appear on
   disk, which is a detailed software inventory for the device; the names of nested libraries can
   reveal a customer's internal dependency names.
 - **When it runs.** On demand only, as an instruction. The daily report does not carry these rows
   yet, so they do not appear in the software inventory views.
+
+### Native libraries (`component_inventory`, `native`)
+
+The `component_inventory` plugin's `native` action (instruction `crossplatform.components.native`)
+lists the versioned shared libraries shipped inside applications: ELF `.so` files on Linux and
+Mach-O `.dylib` files on macOS. It reads each library's header in-process; no process is started.
+**It is switched off until an operator enables it** (below).
+
+- **Switching it on.** The server refuses the action until an operator lifts its kill-switch row:
+  `PUT /api/v1/plugin-config/component_inventory/kill-switch` with `action` set to `native` and
+  `enabled` true. The row is separate from `scan`, which stays on. A server restart never overwrites
+  an operator's own setting.
+- **Where.** Linux: `/opt` and `/usr/local/lib`. macOS: `/Applications`, `/usr/local` and
+  `/opt/homebrew`. The package manager's own trees are not read: on Linux `/usr/lib` and the other
+  system library directories are not roots, and on macOS the Homebrew Cellar trees
+  (`/usr/local/Cellar`, `/opt/homebrew/Cellar`) are not entered. Windows is not read yet: it answers
+  one `unsupported` status row (`windows:planned`). Extension-less macOS framework binaries are not
+  listed.
+- **What a row holds.** Kind (`native`), name (the SONAME on Linux or the install name on macOS,
+  without its suffix and version), version, where the version came from (`filename`, `elf`, `macho`
+  or `unreadable`), path, size, modification time and the application folder it sits under.
+- **How the version is read.** From the file name (`libssl.so.3.0.13` reads `3.0.13`); when the
+  name gives none, from the library's SONAME suffix (Linux) or its `current_version` (macOS, when
+  it is not `0.0.0`). A library whose header cannot be read inside the fixed bounds, or that names
+  no version, is still listed from its file name with `version_source` `unreadable`; that is a gap
+  in one row and does not make the scan incomplete. A file whose name looks like a library but
+  whose header says it is not one is not listed.
+- **Bounds.** The scan's (400,000 directory entries, 45 seconds, 32 levels, 50,000 entries per
+  directory, 3,000 rows per application folder) with 5,000 rows in all. Per library, at most 128
+  ELF program headers, 64 KiB of dynamic section, a 255-byte name, 16 fat slices and 4,096 load
+  commands in 256 KiB; a count past one of those makes that library `unreadable`, never a partial
+  answer. A fat Mach-O file is read through its first slice only.
+- **When the list may be incomplete.** The status row reads `constrained` for the same causes as
+  `scan` (`budget_entries`, `budget_time`, `section_rows`, `anchor_rows`, `depth`, `dir_unreadable`,
+  `dir_truncated`, `mount_table_unreadable`), and `archive_changed` when a library changed or
+  vanished while it was read. On a `supported` answer, the Homebrew Cellar trees the scan did not
+  enter are named by the informational token `package_tree_skipped`, beside the `scan` tokens.
+  A Mac with very large application bundles can use the whole entry budget in `/Applications`, so
+  read a `budget_entries` answer as the part of the host reached.
+- **What it costs, and who can run it.** The same roles and `Inventory` read grant as `scan`; a live
+  read of up to 45 seconds on one device that cannot be cancelled once started. `native` publishes
+  no heartbeat cost counters.
+- **When it runs.** On demand only, as an instruction, once enabled. The daily report does not
+  carry these rows yet.
 
 ### Install type, scope and location, and the sectioned report
 

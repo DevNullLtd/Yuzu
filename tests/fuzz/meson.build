@@ -32,6 +32,10 @@ fuzz_targets = {
     'sources': files('fuzz_component_zip.cpp'),
     'deps': [],
   },
+  'fuzz_component_native': {
+    'sources': files('fuzz_component_native.cpp'),
+    'deps': [],
+  },
   'fuzz_deployment_parse': {
     'sources': files('fuzz_deployment_parse.cpp'),
     'deps': [],

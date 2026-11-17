@@ -7,13 +7,16 @@
  * is how a sibling plugin once shipped a compiled-out Windows leg and stayed green). Only the
  * expectations differ per host.
  *
- * `scan` is dispatched on Windows ONLY, where the planned leg answers at once. On Linux and macOS a
- * dispatch would walk this host's real application roots for up to 45 s, which the unit suites must
- * not do; the populated answer is pinned in test_component_scan.cpp over an in-memory tree and a
+ * `scan` and `native` are dispatched on Windows ONLY, where the planned leg answers at once. On Linux
+ * and macOS a dispatch would walk this host's real application roots for up to 45 s, which the unit
+ * suites must not do, and the plugin takes its roots from nothing a request or the environment can
+ * supply, so a test cannot point it at a temporary tree. The populated answers are pinned in
+ * test_component_scan.cpp and test_component_native_scan.cpp over an in-memory tree and a
  * materialised one, and the real end-to-end run is the sample capture taken against a host.
  *
- * MUTATION: adding a second action, changing a declared leg, or loading the wrong plugin fails the
- * descriptor case; removing the report_planned call on the Windows path fails the planned-row case.
+ * MUTATION: adding a third action, changing a declared leg, or loading the wrong plugin fails the
+ * descriptor case; removing the report_planned call on the Windows path, or letting `native` reach
+ * the unknown-action guard, fails the planned-row cases.
  */
 #include <catch2/catch_test_macros.hpp>
 
@@ -118,7 +121,7 @@ std::optional<LoadedPlugin> load_plugin() {
 
 } // namespace
 
-TEST_CASE("component_inventory plugin: exactly one action, `scan`, with the declared legs",
+TEST_CASE("component_inventory plugin: exactly two actions, `scan` and `native`, with the declared legs",
           "[runtime][component_inventory][descriptors]") {
     auto plugin = load_plugin();
     if (!plugin) {
@@ -126,23 +129,26 @@ TEST_CASE("component_inventory plugin: exactly one action, `scan`, with the decl
         return;
     }
     CHECK(std::string_view{plugin->descriptor->name} == "component_inventory");
-    CHECK(std::string_view{plugin->descriptor->version} == "1.0.0");
+    CHECK(std::string_view{plugin->descriptor->version} == "1.1.0");
 
     std::vector<std::string> actions;
     for (const char* const* a = plugin->descriptor->actions; a && *a; ++a)
         actions.emplace_back(*a);
-    REQUIRE(actions.size() == 1);
+    REQUIRE(actions.size() == 2);
     CHECK(actions[0] == "scan");
+    CHECK(actions[1] == "native");
 
     REQUIRE(plugin->descriptor->action_descriptors != nullptr);
-    REQUIRE(plugin->descriptor->action_descriptor_count == 1);
-    const auto& d = plugin->descriptor->action_descriptors[0];
-    CHECK(std::string_view{d.action} == "scan");
-    CHECK(d.linux_leg.support == YUZU_SUPPORT_SUPPORTED);
-    CHECK(d.linux_leg.rung == 1);
-    CHECK(d.macos_leg.support == YUZU_SUPPORT_SUPPORTED);
-    CHECK(d.macos_leg.rung == 1);
-    CHECK(d.windows_leg.support == YUZU_SUPPORT_PLANNED);
+    REQUIRE(plugin->descriptor->action_descriptor_count == 2);
+    for (std::size_t i = 0; i < 2; ++i) {
+        const auto& d = plugin->descriptor->action_descriptors[i];
+        CHECK(std::string_view{d.action} == actions[i]);
+        CHECK(d.linux_leg.support == YUZU_SUPPORT_SUPPORTED);
+        CHECK(d.linux_leg.rung == 1);
+        CHECK(d.macos_leg.support == YUZU_SUPPORT_SUPPORTED);
+        CHECK(d.macos_leg.rung == 1);
+        CHECK(d.windows_leg.support == YUZU_SUPPORT_PLANNED);
+    }
 }
 
 TEST_CASE("component_inventory plugin: an unknown action is refused with one non-status line",
@@ -168,7 +174,7 @@ TEST_CASE("component_inventory plugin: an unknown action is refused with one non
 }
 
 #if defined(_WIN32)
-TEST_CASE("component_inventory plugin: the Windows leg answers the planned row at once",
+TEST_CASE("component_inventory plugin: the Windows leg answers the planned row at once, for both actions",
           "[component_inventory][actions]") {
     auto plugin = load_plugin();
     if (!plugin) {
@@ -176,12 +182,14 @@ TEST_CASE("component_inventory plugin: the Windows leg answers the planned row a
         return;
     }
     yuzu::agent::LocalDispatcher dispatcher;
-    const auto result = dispatcher.run(plugin->descriptor, "scan");
-    CHECK(result.rc == 0); // a planned leg is not a failed command
-    const auto rows = captured_rows(result.captured);
-    REQUIRE(rows.size() == 1);
-    CHECK(rows[0] == "status|scan|unsupported|windows:planned");
-    CHECK(result.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
-    CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_UNKNOWN);
+    for (const char* action : {"scan", "native"}) {
+        const auto result = dispatcher.run(plugin->descriptor, action);
+        CHECK(result.rc == 0); // a planned leg is not a failed command
+        const auto rows = captured_rows(result.captured);
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0] == std::string{"status|"} + action + "|unsupported|windows:planned");
+        CHECK(result.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
+        CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_UNKNOWN);
+    }
 }
 #endif

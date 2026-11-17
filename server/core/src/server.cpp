@@ -6288,6 +6288,22 @@ public:
             }
         }
 
+        // SAM-22: component_inventory's `native` action ships switched off — an operator must
+        // enable it explicitly via PUT /api/v1/plugin-config/component_inventory/kill-switch with
+        // action=native. An ACTION-level seed: `scan` stays on. ON CONFLICT DO NOTHING, so an
+        // operator's own row is never overwritten on a restart.
+        if (plugin_config_store_ && !startup_failed_) {
+            if (!plugin_config_store_->seed_action_kill_switch_default_off(
+                    "component_inventory", "native",
+                    "default-off: reads every shared library under the application roots; enable per "
+                    "PUT /api/v1/plugin-config/component_inventory/kill-switch with action=native")) {
+                spdlog::error(
+                    "[PG] Refusing to start: component_inventory.native default-off kill-switch "
+                    "seed failed");
+                startup_failed_ = true;
+            }
+        }
+
         // UploadGrantStore (PR1.6a/c) — no secret codec of its own: grant
         // and session credentials are stored as SHA-256 digests, never a
         // sealed SecretCodec blob (upload_grant_store.hpp file header).

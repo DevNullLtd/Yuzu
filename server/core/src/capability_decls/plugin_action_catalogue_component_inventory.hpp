@@ -7,14 +7,21 @@
 #include "../command_capability.hpp"
 
 /// @file plugin_action_catalogue_component_inventory.hpp
-/// One fragment of the command capability catalogue: `component_inventory`'s single
-/// read-only action (`agents/plugins/component_inventory/src/component_inventory_plugin.cpp`).
+/// One fragment of the command capability catalogue: `component_inventory`'s two
+/// read-only actions (`agents/plugins/component_inventory/src/component_inventory_plugin.cpp`).
 /// Classified by READING the implementation.
 ///
 /// `scan` is ReadOnly/None: it lists directories and reads bounded, link-free file bytes
 /// (archive directories, two small entries per archive) under fixed machine roots, plus the
 /// mount table, all in-process with no subprocess. It writes nothing on the host beyond the
 /// plugin's own heartbeat keys, and it takes no parameter, so a request cannot choose a path.
+///
+/// `native` is the same shape for shared libraries (ELF, Mach-O): bounded, link-free, in-process
+/// reads of fixed machine roots, no subprocess, no parameter, nothing written. It is ReadOnly/None
+/// and `ExecuteGate::None` like `scan`; what makes it ship off is NOT a gate but an action-level
+/// kill-switch row seeded at boot (server.cpp, `seed_action_kill_switch_default_off`), which the
+/// dispatch gate already honours and an operator lifts with PUT
+/// /api/v1/plugin-config/component_inventory/kill-switch.
 ///
 /// The `Inventory` securable is deliberate: the Java archives and libraries found are a
 /// software-inventory fact, not a security-posture fact (Security:Read is for posture
@@ -23,10 +30,21 @@ namespace yuzu::server::capdecls {
 
 namespace detail {
 
-inline constexpr std::array<CommandCapability, 1> kPluginActionCatalogueComponentInventory{{
+inline constexpr std::array<CommandCapability, 2> kPluginActionCatalogueComponentInventory{{
     {
         .plugin = "component_inventory",
         .action = "scan",
+        .dispatch_class = DispatchClass::ReadOnly,
+        .mutability = Mutability::None,
+        .securable = "Inventory",
+        .operation = authz::Operation::Read,
+        .risk_tier = authz::RiskTier::Low,
+        .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
+    },
+    {
+        .plugin = "component_inventory",
+        .action = "native",
         .dispatch_class = DispatchClass::ReadOnly,
         .mutability = Mutability::None,
         .securable = "Inventory",

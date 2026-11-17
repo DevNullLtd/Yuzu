@@ -1564,3 +1564,48 @@ capped inflate are covered by unit tests only, not by a fuzz target.
   `component_inventory/scan` exists today, #7737 tracks the rest); and the
   `component_inventory.future_dated_rejected` audit event, which belongs to the store that does not
   exist yet.
+
+## Update (2026-11-17) — second action: native libraries on Linux and macOS, switched off by default
+
+**What shipped.** A second action on the `component_inventory` plugin, `native` (no parameters),
+definition `crossplatform.components.native`, plugin version 1.1.0. Kind: `native`: shared libraries
+(ELF `.so` and `.so.<version>` on Linux, Mach-O `.dylib` on macOS), one row per library, 5,000 rows at
+most. The walk, the one deadline, the one open per file and the completeness rule are `scan`'s; the
+row is `comp|native|name|version|version_source|path|size|mtime|anchor_app`, and the status row names
+`native`. Windows answers `windows:planned`: the plugin has no Windows filesystem leg, and a Windows
+walk (reparse-point safe, network-drive aware) is its own change.
+
+**Roots and exclusions (Decision 1, Decision 4).** Linux `/opt` and `/usr/local/lib`; macOS
+`/Applications`, `/usr/local` and `/opt/homebrew`. The package-owned and OS trees are excluded: on
+Linux by not being roots at all (`/usr/lib` and its siblings are never walked), on macOS by name
+(`/usr/local/Cellar` and `/opt/homebrew/Cellar`, which held most of the native libraries a measured
+host listed). An excluded directory is counted and reported on a `supported` status row by the
+informational token `package_tree_skipped`: never a silent skip. This is the answer to the open
+question of whether package-owned trees are excluded: yes.
+
+**Readers.** The ELF SONAME (program headers, `PT_DYNAMIC`, `DT_SONAME` through the `PT_LOAD`
+mapping) and the Mach-O `LC_ID_DYLIB` (thin 32 and 64 bit, either byte order, fat and fat64) are read
+in-process over a read function bounded by the file size: no struct is cast over file bytes, every
+offset plus length is checked before the read with overflow-safe arithmetic, and every count and size
+has a ceiling (128 program headers, 64 KiB of dynamic section, 255-byte names, 16 fat slices, 4,096
+load commands in 256 KiB). A fat file's first slice inside the file is read through a window rebased to
+that slice, with the slice size as the file size, so no header, load command, command size or name can
+reach into a neighbouring slice. A file whose name matches and whose header says it is not a shared
+library gives no row; one that cannot be read inside the bounds gives a row from its file name, with
+`version_source` `unreadable` (an item-level gap; the scan stays complete). The parsers are fuzzed
+(`tests/fuzz/fuzz_component_native.cpp`, registered where the ZIP target is, path-filtered to
+`component_native_parsers*`) and covered by a deterministic truncation and byte-damage sweep.
+
+**Default off, at the dispatch gate.** `component_inventory.native` ships switched off through an
+action-level kill-switch row that the server seeds at boot (`seed_action_kill_switch_default_off`,
+`ON CONFLICT DO NOTHING`, a failed seed refuses to start). The decision layers compose, so
+`component_inventory.scan` stays on; an operator enables `native` with
+`PUT /api/v1/plugin-config/component_inventory/kill-switch` and `action=native`. Its capability row is
+ReadOnly, `Inventory:Read`, gate `None`: the off-switch is the kill-switch row, not a second gate.
+
+**Cost data.** `native` publishes no heartbeat keys: `scan` already uses six of the eight keys a plugin
+may publish. The fleet cost evidence wanted before the action is ever on by default is therefore not
+collected by this plugin yet.
+
+**Still open.** The Windows leg of both actions; the daily-report section and the permanent customer
+opt-out (above); extension-less macOS framework binaries; a hard per-cycle time bound.

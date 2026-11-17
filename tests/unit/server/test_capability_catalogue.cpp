@@ -759,23 +759,29 @@ TEST_CASE("capability catalogue: runtimes.dotnet, runtimes.jvm and runtimes.pyth
     }
 }
 
-/// Exact-row pin for `component_inventory.scan`, the only row of its fragment. `Inventory`
-/// (a software-inventory fact), not `Infrastructure`: both are seeded securables, so the
-/// generic invariants accept either and only this pin catches a silent re-typing.
-TEST_CASE("capability catalogue: component_inventory.scan pins its exact classification",
+/// Exact-row pin for `component_inventory.scan` and `component_inventory.native`, the two rows of
+/// its fragment. `Inventory` (a software-inventory fact), not `Infrastructure`: both are seeded
+/// securables, so the generic invariants accept either and only this pin catches a silent
+/// re-typing. `native` ships off through an action-level kill-switch seed, so its gate stays None:
+/// a gate here would be a second, different off-switch.
+TEST_CASE("capability catalogue: component_inventory.scan and .native pin their exact classification",
           "[server][dispatch][capability]") {
     const auto rows = capdecls::plugin_action_catalogue_component_inventory();
-    REQUIRE(rows.size() == 1);
-    const auto& row = rows[0];
-    CHECK(row.plugin == "component_inventory");
-    CHECK(row.action == "scan");
-    CHECK(row.dispatch_class == DispatchClass::ReadOnly);
-    CHECK(row.mutability == Mutability::None);
-    CHECK(row.securable == "Inventory");
-    CHECK(row.operation == authz::Operation::Read);
-    CHECK(row.risk_tier == authz::RiskTier::Low);
-    CHECK_FALSE(row.system_reserved);
-    CHECK(row.execute_gate == ExecuteGate::None);
+    REQUIRE(rows.size() == 2);
+    const char* const kActions[] = {"scan", "native"};
+    for (std::size_t i = 0; i < 2; ++i) {
+        const auto& row = rows[i];
+        INFO("action " << kActions[i]);
+        CHECK(row.plugin == "component_inventory");
+        CHECK(row.action == kActions[i]);
+        CHECK(row.dispatch_class == DispatchClass::ReadOnly);
+        CHECK(row.mutability == Mutability::None);
+        CHECK(row.securable == "Inventory");
+        CHECK(row.operation == authz::Operation::Read);
+        CHECK(row.risk_tier == authz::RiskTier::Low);
+        CHECK_FALSE(row.system_reserved);
+        CHECK(row.execute_gate == ExecuteGate::None);
+    }
 }
 
 /// Exact-row pin for `platform_security` (Wave 8): both rows read fixed boot-integrity

@@ -1163,6 +1163,48 @@ TEST_CASE("catch-all: a failure while answering is swallowed, never thrown", "[r
     }
 }
 
+TEST_CASE("row kind: java by default, so every existing comp|java row is byte-identical; native writes its own",
+          "[runtime][component_scan][component_inventory]") {
+    Row r;
+    r.name = "lib";
+    r.version = "1.0";
+    r.version_source = "filename";
+    r.path = "/opt/a/lib-1.0.jar";
+    r.size = 3;
+    r.mtime = 4;
+    r.anchor_app = "a";
+    CHECK(r.kind == "java");
+    CHECK(format_component_row(r) == "comp|java|lib|1.0|filename|/opt/a/lib-1.0.jar|3|4|a");
+    r.kind = "native";
+    CHECK(format_component_row(r) == "comp|native|lib|1.0|filename|/opt/a/lib-1.0.jar|3|4|a");
+}
+
+TEST_CASE("verdict: package_tree_skipped is informational, last, and absent unless a directory was excluded",
+          "[runtime][component_scan][component_inventory]") {
+    const auto none = scan_verdict("linux", Stop::complete, false, 0, 0, 0, 0);
+    CHECK(none.tokens.empty());
+    const auto skipped = scan_verdict("macos", Stop::complete, false, 0, 0, 0, 1, 2);
+    CHECK(skipped.level == StatusLevel::supported);
+    CHECK(skipped.complete);
+    CHECK(skipped.tokens ==
+          "macos:component_inventory:version_unreadable,macos:component_inventory:package_tree_skipped");
+    // A stop cause names itself alone: the informational token never rides a constrained row.
+    const auto stopped = scan_verdict("macos", Stop::budget_time, false, 0, 0, 0, 0, 2);
+    CHECK(stopped.level == StatusLevel::constrained);
+    CHECK(stopped.tokens == "macos:component_inventory:budget_time");
+}
+
+TEST_CASE("catch-all: the action name defaults to scan and is the one given", "[runtime][component_scan][answer][component_inventory]") {
+    FakeCtx dflt;
+    answer_internal_error(dflt, kInternalErrorToken, false);
+    REQUIRE(dflt.out.size() == 1);
+    CHECK(dflt.out[0] == "status|scan|constrained|linux:component_inventory:internal_error");
+    FakeCtx named;
+    answer_internal_error(named, kInternalErrorToken, false, "native");
+    REQUIRE(named.out.size() == 1);
+    CHECK(named.out[0] == "status|native|constrained|linux:component_inventory:internal_error");
+}
+
 #if !defined(_WIN32)
 namespace {
 

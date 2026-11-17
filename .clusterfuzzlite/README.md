@@ -40,6 +40,7 @@ download-miss warnings in the job logs.
 | `fuzz_yaml_scan` | the in-tree YAML-subset scanner | only runtime consumer of `yaml_source`; authorization-load-bearing since #1215 |
 | `fuzz_guardian_rule_spec` | Guardian rule bodies + `dangerous_enforce_*` chokepoints | network-supplied specs gate enforce-mode promotion |
 | `fuzz_component_zip` | a Java archive's end-of-central-directory record and central directory | a planted jar's bytes decide what the agent reads and lists |
+| `fuzz_component_native` | an ELF shared object's SONAME and a Mach-O (thin or fat) library's install name | a planted library's bytes decide what the agent reads and lists |
 
 Every target is deliberately **closure-light** (STL + nlohmann only) so this
 container needs no meson/vcpkg. The same sources build two ways:

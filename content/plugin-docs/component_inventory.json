@@ -1,6 +1,32 @@
 {
   "actions": [
     {
+      "action": "native",
+      "definition_ids": [
+        "crossplatform.components.native"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "versioned shared libraries inside applications only: package-owned trees (/usr/lib and friends) are not walked; machine roots only; the server refuses it until an operator switches it on; any budget, unreadable directory or changed file answers constrained",
+          "mechanism": "bounded read-only walk of /opt and /usr/local/lib for .so and .so.<version> files, at most 5,000 rows; no link followed at any path component; the ELF program headers, dynamic section and SONAME read in-process within fixed bounds; network mounts skipped via /proc/<pid>/mountinfo",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "versioned dynamic libraries inside applications only: extension-less framework binaries are not read; machine roots only; the server refuses it until an operator switches it on; any budget, unreadable directory or changed file answers constrained",
+          "mechanism": "bounded read-only walk of /Applications, /usr/local and /opt/homebrew for .dylib files, at most 5,000 rows; no link followed at any path component; the Mach-O header, load commands and LC_ID_DYLIB (thin, fat or fat64) read in-process within fixed bounds; /usr/local/Cellar and /opt/homebrew/Cellar excluded and counted; network mounts skipped via getmntinfo_r_np",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "not read yet: one unsupported status row, windows:planned",
+          "mechanism": "bounded Program Files walk with the same library reads",
+          "rung": "1",
+          "support": "planned"
+        }
+      }
+    },
+    {
       "action": "scan",
       "definition_ids": [
         "crossplatform.components.scan"
@@ -28,13 +54,33 @@
     }
   ],
   "caveats": [
-    "**Java archives only, machine roots only.** Python and Node components are not read, and the six roots on Linux and four on macOS are fixed: an archive in a per-user location, a home directory or a custom prefix is not looked for.",
-    "**No Windows leg yet.** Windows answers one `unsupported` status row (`windows:planned`); a Program Files walk with the same archive reads follows as a later change.",
-    "**Completeness is bounded, not guaranteed.** A scan that reaches a bound answers `constrained` and returns what it reached; one blocked read inside a directory listing or file read is not interrupted by the 45 second budget. The 400,000-entry budget is shared by every root, so the roots are walked cheapest first (on macOS `/Applications`, whose app bundles hold many entries, is last): a host whose first roots exhaust it answers `constrained` with `budget_entries` and the later roots are not walked. The network-mount guard is a snapshot of a deny-list: a mount that appears after the table was read, a stacked filesystem over a dead mount or a network filesystem type not on the list is not seen.",
-    "**Names are parsed, not proven; nested libraries are listed, not read.** Only `BOOT-INF/lib/`, `WEB-INF/lib/` and `lib/` entries ending `.jar` are listed, from the central directory; their version comes from the entry name alone, so a nested library with an unversioned name reads `unreadable`, and a qualifier word the parser does not know reads as a classifier (nested `guava-31.1-jre.jar` reads `31.1`). An outer archive with no `pom.properties` or manifest takes the file name's word too. A pre-release or build qualifier (`alpha`, `beta`, `rc`, `m`, `ea`, `preview`, `snapshot`, digits and dots) stays in the version. An OSGi-style name (`name_1.2.3...`) keeps everything after the `_` as its version, a classifier word included (`bundle_1.2.3-sources.jar` reads `1.2.3-sources`). Separately, a sole `pom.properties` is trusted: an archive that has no pom of its own but bundles exactly one dependency's reads that dependency's version, marked `pom`, when its file name has no version (`app.jar`, `ROOT.war`); a name that carries a version keeps it (`myapp-2.0.jar` is not affected) unless the archive's value sits in the name; with two or more poms the name rule applies.",
-    "**Not collected yet; one kill switch, no customer opt-out.** The daily report does not carry these rows. The per-plugin kill switch exists (`component_inventory/scan`, `PUT /api/v1/plugin-config/component_inventory/kill-switch`), but the permanent customer opt-out of ADR-0028 Decisions 2 and 8 is still open (#7737)."
+    "**Java archives and shared libraries only, machine roots only.** Python and Node components are not read, and the roots are fixed (`scan`: six on Linux and four on macOS; `native`: two on Linux and three on macOS): a file in a per-user location, a home directory or a custom prefix is not looked for. `native` also leaves out what the package manager owns: on Linux `/usr/lib` and the other system trees are not roots, so a distribution package's libraries are never listed (use `crossplatform.software.inventory`), and on macOS the Homebrew Cellar trees are counted and named by `package_tree_skipped`, not entered; a library copied under `/opt` or `/usr/local/lib` by hand is read. macOS frameworks ship an extension-less binary (`Foo.framework/Versions/A/Foo`) that the `.dylib` rule does not see, so frameworks are not listed.",
+    "**No Windows leg yet, for either action.** Windows answers one `unsupported` status row (`windows:planned`). The plugin has no Windows filesystem leg at all, so a Windows walk (and with it a reparse-point-safe, network-drive-aware one) is its own later change.",
+    "**Completeness is bounded, not guaranteed.** A scan that reaches a bound answers `constrained` and returns what it reached; one blocked read inside a directory listing or file read is not interrupted by the 45 second budget. The 400,000-entry budget is shared by every root, so the roots are walked cheapest first (on macOS `/Applications`, whose app bundles hold many entries, is last): a host whose first roots exhaust it answers `constrained` with `budget_entries` and the later roots are not walked. `native` has the same budget, so on a macOS host whose `/Applications` holds very large bundles it can answer `constrained` with `budget_entries` before `/usr/local` and `/opt/homebrew` are reached (seen on a development Mac, and it returned the libraries reached first). The network-mount guard is a snapshot of a deny-list: a mount that appears after the table was read, a stacked filesystem over a dead mount or a network filesystem type not on the list is not seen.",
+    "**Names are parsed, not proven; nested libraries are listed, not read.** Only `BOOT-INF/lib/`, `WEB-INF/lib/` and `lib/` entries ending `.jar` are listed, from the central directory; their version comes from the entry name alone, so a nested library with an unversioned name reads `unreadable`, and a qualifier word the parser does not know reads as a classifier (nested `guava-31.1-jre.jar` reads `31.1`). An outer archive with no `pom.properties` or manifest takes the file name's word too. A pre-release or build qualifier (`alpha`, `beta`, `rc`, `m`, `ea`, `preview`, `snapshot`, digits and dots) stays in the version. An OSGi-style name (`name_1.2.3...`) keeps everything after the `_` as its version, a classifier word included (`bundle_1.2.3-sources.jar` reads `1.2.3-sources`). Separately, a sole `pom.properties` is trusted: an archive that has no pom of its own but bundles exactly one dependency's reads that dependency's version, marked `pom`, when its file name has no version (`app.jar`, `ROOT.war`); a name that carries a version keeps it (`myapp-2.0.jar` is not affected) unless the archive's value sits in the name; with two or more poms the name rule applies. For `native` the name and version are header and file-name facts, not proof of what the code is: a SONAME or install name is only as honest as whoever built the library; a file named like a library but of another format (a script, a linker script, a thin object) gives no row, while a position-independent executable named `.so` is listed; and a fat Mach-O file is read through its first slice inside the file only, the other slices are not compared.",
+    "**Not collected yet; `native` ships off; no customer opt-out.** The daily report does not carry these rows. The server seeds `component_inventory.native` switched off at boot and refuses it until an operator enables it (`PUT /api/v1/plugin-config/component_inventory/kill-switch` with `action`); `scan` is unaffected and a restart never overwrites an operator's own setting. `native` publishes no cost counters, so the fleet-wide cost evidence wanted before it is ever on by default is not collected by this plugin. The permanent customer opt-out of ADR-0028 Decisions 2 and 8 is still open (#7737)."
   ],
   "definitions": [
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Reports versioned shared libraries (ELF .so on Linux, Mach-O .dylib on macOS) shipped inside applications under the machine-wide application roots: one row per library (name, version and where the version came from, path, size, modification time and the application folder it sits under), at most 5,000 rows. This action is switched off until an operator enables it with PUT /api/v1/plugin-config/component_inventory/kill-switch and action=native; until then the server refuses it. Linux reads /opt and /usr/local/lib and never the package manager's own trees; macOS reads /Applications, /usr/local and /opt/homebrew and does not enter the Homebrew Cellar trees, naming that in the package_tree_skipped token. Extension-less macOS framework binaries are not read; per-user locations are not read; Windows is not read yet. No process is started. A `supported` status means the scan finished with no bound reached; a `constrained` status means a bound was hit or something could not be read in full, so the list may be incomplete, and it names its one cause. A library whose header cannot be read inside the fixed bounds still gets a row from its file name. `supported` with no rows means none was found at those roots, not that none is installed. The result is a live read made when the instruction runs, not a stored snapshot, at a cost of up to 45 seconds and 400,000 directory entries, and it cannot be cancelled once started. For Java archives use crossplatform.components.scan, and for packaged applications crossplatform.software.inventory. Terminal causes (a repeat gives the same answer): budget_entries, section_rows, anchor_rows, depth, dir_truncated. Retryable causes: budget_time, dir_unreadable, archive_changed (a library changed or vanished while read), mount_table_unreadable, internal_error.",
+      "display_name": "Native Library Inventory",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 300
+      },
+      "id": "crossplatform.components.native",
+      "platforms": [
+        "darwin",
+        "linux"
+      ]
+    },
     {
       "approval_mode": "auto",
       "author_roles": [
@@ -56,18 +102,130 @@
       ]
     }
   ],
-  "description": "Installed software components found in application trees (Java archives)",
-  "how_it_works": "`scan` answers one question: which Java archives, and which libraries bundled inside them, sit in the machine-wide application trees of this host. It takes no parameters; the roots come from the OS leg and from nothing a request can supply.\n\nThe leg reads the mount table once, drops any root that is missing, reached through a link or on a network mount, and walks the rest breadth first without following a link at any path component: a link met inside a tree is not entered, and a `supported` status row says so with `link_skipped`. Every file ending `.jar`, `.war` or `.ear` is opened once and read in-process: the archive's central directory is parsed and the libraries nested one level deep (`BOOT-INF/lib/`, `WEB-INF/lib/`, `lib/`) are listed from that directory alone.\n\nThe version comes from the file name. The scan asks the archive (`pom.properties`, then `MANIFEST.MF`) only when the name gave none or is ambiguous, and an archive value replaces the file name's split only when the file name carries it (`<name>-<version>` or `<name>-<version>-...`; `<name>_<version>` for an OSGi `Bundle-Version`). A `pom.properties` is used only when it is the archive's only one or the only one whose artifact segment (`META-INF/maven/<group>/<artifact>/`) equals the archive's name, because a shaded archive carries its dependencies' own; otherwise the manifest decides, else the version is `unreadable`.\n\nNo nested archive is unpacked, no `java` process is started and nothing is written to the host except the plugin's own cost counters. The plugin is not a vulnerability matcher, not a package-manager query and not a view of per-user installs.\n\n### What you can decide with it\n\n| Question | Linux | macOS |\n|---|---|---|\n| Which Java archives are installed under the application trees, at what version? | One row per `.jar`, `.war` or `.ear` under `/opt`, `/usr/share/java`, `/usr/lib/jvm`, `/usr/local/lib`, `/usr/local/share` and `/usr/share/maven` | One row per archive under `/Applications`, `/Library/Java`, `/usr/local` and `/opt/homebrew` |\n| Which libraries ride inside an application archive? | One row per nested library, with the path `<archive>!<entry>` and the application folder it belongs to | The same |\n| Can this list be trusted as complete? | Yes only when the status is `supported` and no token names something passed over (`root_link_skipped`, `link_skipped`, `network_fs_skipped`), which a `supported` answer carries; `constrained` names its one cause | The same |\n\nWhat a result proves. `supported` means the scan finished: no bound was reached and every directory and archive it opened was read in full. What it passed over on purpose (a link, a network mount) is named by an informational token on the status row, never silent. It does not mean nothing is installed outside the roots above, or in a per-user location. `constrained` means a bound was reached or something could not be read in full, so the list may be incomplete; the rows already read are still returned, but when time runs out archives not yet read give no rows, and a walk that used the whole budget returns none. A row whose version no source gives is listed with `version_source` `unreadable`; that is a gap in one row and does not make the scan constrained.",
+  "description": "Installed software components found in application trees (Java archives, native libraries)",
+  "how_it_works": "Two actions, neither takes a parameter; the roots come from the OS leg and from nothing a request can supply.\n\n- `scan` answers one question: which Java archives, and which libraries bundled inside them, sit in the machine-wide application trees of this host.\n- `native` answers the sibling question for compiled code: which versioned shared libraries (ELF `.so` on Linux, Mach-O `.dylib` on macOS) are shipped inside applications. It is **switched off until an operator enables it** (see \"Switching `native` on\" below) and returns at most 5,000 rows.\n\nThe leg reads the mount table once, drops any root that is missing, reached through a link or on a network mount, and walks the rest breadth first without following a link at any path component: a link met inside a tree is not entered, and a `supported` status row says so with `link_skipped`. Every file ending `.jar`, `.war` or `.ear` is opened once and read in-process: the archive's central directory is parsed and the libraries nested one level deep (`BOOT-INF/lib/`, `WEB-INF/lib/`, `lib/`) are listed from that directory alone.\n\nThe version comes from the file name. The scan asks the archive (`pom.properties`, then `MANIFEST.MF`) only when the name gave none or is ambiguous, and an archive value replaces the file name's split only when the file name carries it (`<name>-<version>` or `<name>-<version>-...`; `<name>_<version>` for an OSGi `Bundle-Version`). A `pom.properties` is used only when it is the archive's only one or the only one whose artifact segment (`META-INF/maven/<group>/<artifact>/`) equals the archive's name, because a shaded archive carries its dependencies' own; otherwise the manifest decides, else the version is `unreadable`.\n\nNo nested archive is unpacked, no `java` process is started and nothing is written to the host except the plugin's own cost counters. The plugin is not a vulnerability matcher, not a package-manager query and not a view of per-user installs.\n\n### The `native` action\n\n`native` uses the same walk, the same mount-table guard, the same link refusal and the same bounds as `scan`, with two differences: a 5,000-row cap, and different roots. The roots are Linux `/opt` and `/usr/local/lib`, and macOS `/Applications`, `/usr/local` and `/opt/homebrew`. The package manager's own trees are kept out: on Linux `/usr/lib` and the other system library directories are not roots at all, and on macOS the Homebrew package trees `/usr/local/Cellar` and `/opt/homebrew/Cellar` are not entered. A tree kept out that way is counted and a `supported` status row says so with `package_tree_skipped`; it is never skipped silently.\n\nA candidate is a file named `<stem>.so` or `<stem>.so.<digits and dots>` (Linux) or `<stem>.dylib` (macOS). Each is opened once and its header is read in-process, within fixed bounds (at most 128 ELF program headers, 64 KiB of dynamic section, 4,096 Mach-O load commands in 256 KiB, a 255-byte name). A file is never trusted for a count or an offset it declares: every read is checked against the file size first, and a Mach-O fat or fat64 file is read through its first slice only, with every offset bounded by that slice, so a slice cannot reach into its neighbour.\n\n- A file whose name matches but whose header says it is not a shared library (a script called `libfoo.so`, an executable) gives no row.\n- A shared library whose header cannot be read inside the bounds still gives a row, named from its file name, with the version the file name carries or `unreadable`. That is a gap in one row; the scan stays complete.\n- The name is the SONAME stem (Linux) or the install-name leaf (macOS) without its `.so` or `.dylib` suffix and version. The version is the file name's (`libssl.so.3.0.13` reads `3.0.13`, `version_source` `filename`), else the SONAME's suffix (`elf`), else, on macOS, the library's `current_version` when it is not `0.0.0` (`macho`).\n\n#### Switching `native` on\n\nThe server seeds an action-level kill-switch row for `component_inventory.native` at boot, switched off, and refuses the action until an operator lifts it: `PUT /api/v1/plugin-config/component_inventory/kill-switch` with `action` set to `native` and `enabled` true. `scan` is a separate row and stays on. A restart never overwrites an operator's own row.\n\n### What you can decide with it\n\n| Question | Linux | macOS |\n|---|---|---|\n| Which Java archives are installed under the application trees, at what version? | One row per `.jar`, `.war` or `.ear` under `/opt`, `/usr/share/java`, `/usr/lib/jvm`, `/usr/local/lib`, `/usr/local/share` and `/usr/share/maven` | One row per archive under `/Applications`, `/Library/Java`, `/usr/local` and `/opt/homebrew` |\n| Which libraries ride inside an application archive? | One row per nested library, with the path `<archive>!<entry>` and the application folder it belongs to | The same |\n| Can this list be trusted as complete? | Yes only when the status is `supported` and no token names something passed over (`root_link_skipped`, `link_skipped`, `network_fs_skipped`), which a `supported` answer carries; `constrained` names its one cause | The same |\n| Which versioned shared libraries ship inside applications? (`native`, once switched on) | One row per `.so` or `.so.<version>` under `/opt` and `/usr/local/lib`; `/usr/lib` and the package manager's other trees are not read | One row per `.dylib` under `/Applications`, `/usr/local` and `/opt/homebrew`; the Homebrew Cellar trees are not entered and are named by `package_tree_skipped` |\n\nWhat a result proves. `supported` means the scan finished: no bound was reached and every directory and archive it opened was read in full. What it passed over on purpose (a link, a network mount) is named by an informational token on the status row, never silent. It does not mean nothing is installed outside the roots above, or in a per-user location. `constrained` means a bound was reached or something could not be read in full, so the list may be incomplete; the rows already read are still returned, but when time runs out archives not yet read give no rows, and a walk that used the whole budget returns none. A row whose version no source gives is listed with `version_source` `unreadable`; that is a gap in one row and does not make the scan constrained.",
   "inputs": [],
   "kind": {
     "collector": true,
     "gathered": true,
     "mutating": false
   },
-  "leg_hash": "2f84f2a4c6e7",
+  "leg_hash": "80173557ecbf",
   "manifest_version": 1,
   "name": "component_inventory",
   "outputs": [
+    {
+      "columns": [
+        {
+          "description": "Row shape discriminator (the wire row's leading tag). Values: status (exactly one per result, always first), comp (one per shared library found).",
+          "example": "comp",
+          "name": "row_kind",
+          "platforms": [
+            "darwin",
+            "linux"
+          ],
+          "type": "string",
+          "values": [
+            "status",
+            "comp"
+          ]
+        },
+        {
+          "description": "Component kind. Values: native. Status rows: the action name (native).",
+          "example": "native",
+          "name": "kind",
+          "platforms": [
+            "darwin",
+            "linux"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Library name: the SONAME (Linux) or install-name leaf (macOS) without its .so or .dylib suffix and version, or the file name's equivalent when the library declares none (libssl.so.3 reads libssl). A name with bytes outside printable ASCII is kept with those bytes shown as ?; pipes, backslashes and line breaks are escaped or flattened on the wire. Status rows: the level (supported, constrained or unsupported).",
+          "example": "libssl",
+          "name": "name",
+          "platforms": [
+            "darwin",
+            "linux"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Version from the file name (libssl.so.3.0.13 reads 3.0.13); when the name gives none, from the SONAME suffix (Linux) or the Mach-O current_version when it is not 0.0.0 (macOS); empty when none gives one. Status rows: the comma-joined cause tokens, or -.",
+          "example": "3.0.13",
+          "name": "version",
+          "platforms": [
+            "darwin",
+            "linux"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Where the version came from. Values: filename, elf (the SONAME, Linux), macho (current_version, macOS), unreadable (no source gave a version, or the header could not be read inside the fixed bounds; the row is still listed and the scan is not made incomplete by it).",
+          "example": "filename",
+          "name": "version_source",
+          "platforms": [
+            "darwin",
+            "linux"
+          ],
+          "type": "string",
+          "values": [
+            "filename",
+            "elf",
+            "macho",
+            "unreadable"
+          ]
+        },
+        {
+          "description": "Absolute path of the library file. A NUL or a byte outside valid UTF-8 in a folder or file name is shown as ?.",
+          "example": "/opt/app/lib/libssl.so.3.0.13",
+          "name": "path",
+          "platforms": [
+            "darwin",
+            "linux"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Size of the library file in bytes.",
+          "example": "3086784",
+          "name": "size",
+          "platforms": [
+            "darwin",
+            "linux"
+          ],
+          "type": "int64",
+          "values": null
+        },
+        {
+          "description": "Modification time of the library file as Unix seconds.",
+          "example": "1700000000",
+          "name": "mtime",
+          "platforms": [
+            "darwin",
+            "linux"
+          ],
+          "type": "int64",
+          "values": null
+        },
+        {
+          "description": "First path component below the scanned root: the application folder the library sits under (the file name itself when it sits directly in a root). A NUL or a byte outside valid UTF-8 in the name is shown as ?.",
+          "example": "app",
+          "name": "anchor_app",
+          "platforms": [
+            "darwin",
+            "linux"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "crossplatform.components.native"
+    },
     {
       "columns": [
         {
@@ -181,7 +339,7 @@
       "definition_id": "crossplatform.components.scan"
     }
   ],
-  "outputs_note": "Every row is pipe-delimited. The first row is always `status|scan|<level>|<tokens>` (`level` is `supported`, `constrained` or `unsupported`; `tokens` is comma-joined cause tokens, or `-`). Component rows follow as `comp|java|<name>|<version>|<version_source>|<path>|<size>|<mtime>|<anchor_app>`, one per archive and one per nested library; the first field is `row_kind` (`status` or `comp`) and is the first column below, and on a status row the next columns carry the action name, the level and the tokens. `version` is empty when `version_source` is `unreadable`. `supported` with zero component rows and no informational token means none was found at the roots; `constrained` means the list may be incomplete. Rows are written at both levels.",
+  "outputs_note": "Every row is pipe-delimited. The first row is always `status|<action>|<level>|<tokens>` (`status|scan|...` for `scan`, `status|native|...` for `native`) (`level` is `supported`, `constrained` or `unsupported`; `tokens` is comma-joined cause tokens, or `-`). Component rows follow as `comp|java|<name>|<version>|<version_source>|<path>|<size>|<mtime>|<anchor_app>`, one per archive and one per nested library, or `comp|native|...` with the same columns, one per shared library (`version_source` is then `filename`, `elf`, `macho` or `unreadable`); the first field is `row_kind` (`status` or `comp`) and is the first column below, and on a status row the next columns carry the action name, the level and the tokens. `version` is empty when `version_source` is `unreadable`. `supported` with zero component rows and no informational token means none was found at the roots; `constrained` means the list may be incomplete. Rows are written at both levels.",
   "platforms": {
     "linux": "supported",
     "macos": "supported",
@@ -190,7 +348,7 @@
   "privileges": [
     {
       "grant": "None",
-      "if_refused": "`status|scan|unsupported|windows:planned`, result `UNAVAILABLE`",
+      "if_refused": "`status|scan|unsupported|windows:planned` (and `status|native|unsupported|windows:planned`), result `UNAVAILABLE`",
       "measured": "n/a",
       "os": "Windows",
       "runs_as": "n/a: the leg is planned and reads nothing"
@@ -216,7 +374,7 @@
       "completeness": "full",
       "provenance": "(empty)",
       "status": "`OK`",
-      "when": "The scan finished with no bound reached and every directory and archive it opened read in full, populated or empty. Informational tokens may still ride the status row without changing the level: `<os>:component_inventory:root_link_skipped` (a root was dropped for a link), `<os>:component_inventory:link_skipped` (a link inside a tree was not entered or listed; no link is followed), `<os>:component_inventory:network_fs_skipped` (a root or a directory inside the tree sat on a network mount and was passed over) and `<os>:component_inventory:version_unreadable` (at least one row has no version)"
+      "when": "The scan finished with no bound reached and every directory and archive it opened read in full, populated or empty. Informational tokens may still ride the status row without changing the level: `<os>:component_inventory:root_link_skipped` (a root was dropped for a link), `<os>:component_inventory:link_skipped` (a link inside a tree was not entered or listed; no link is followed), `<os>:component_inventory:network_fs_skipped` (a root or a directory inside the tree sat on a network mount and was passed over) `<os>:component_inventory:version_unreadable` (at least one row has no version) and, for `native` only, `<os>:component_inventory:package_tree_skipped` (a package-owned tree, the Homebrew Cellar, was not entered)"
     },
     {
       "completeness": "partial",
@@ -253,12 +411,22 @@
             "comp|java|gradle-wrapper|2.10|manifest|/opt/vcpkg/buildtrees/grpc/src/v1.76.0-c85157dbaa.clean/src/android/test/interop/gradle/wrapper/gradle-wrapper.jar|53636|1760754624|vcpkg"
           ],
           "truncated": false
+        },
+        {
+          "action": "native",
+          "not_captured": "agent-context: TEMPORARY placeholder, replaced by the lane capture",
+          "params": "",
+          "rc": 0,
+          "result_status": null,
+          "row_count": 0,
+          "rows": [],
+          "truncated": false
         }
       ],
       "stamp": {
         "date": "2026-11-15",
         "host_class": "vm",
-        "leg_hash": "2f84f2a4c6e7",
+        "leg_hash": "80173557ecbf",
         "os": "linux",
         "os_version": "Ubuntu 26.04.1 LTS x86_64",
         "privilege": "euid 0"
@@ -283,12 +451,28 @@
             "comp|java|concurrent_ruby||unreadable|/opt/homebrew/Library/Homebrew/vendor/bundle/ruby/4.0.0/gems/concurrent-ruby-1.3.8/lib/concurrent-ruby/concurrent/concurrent_ruby.jar|136802|1787153877|Library"
           ],
           "truncated": false
+        },
+        {
+          "action": "native",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "PARTIAL",
+            "provenance": "macos:component_inventory:budget_entries",
+            "status": "CONSTRAINED"
+          },
+          "row_count": 1,
+          "rows": [
+            "status|native|constrained|macos:component_inventory:budget_entries"
+          ],
+          "truncated": false
         }
       ],
       "stamp": {
-        "date": "2026-11-15",
+        "date": "2026-11-17",
         "host_class": "bare-metal",
-        "leg_hash": "2f84f2a4c6e7",
+        "leg_hash": "80173557ecbf",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
         "privilege": "euid 501"
@@ -298,6 +482,15 @@
   "security": [
     {
       "action": "scan",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Inventory"
+    },
+    {
+      "action": "native",
       "dispatch_class": "ReadOnly",
       "execute_gate": "None",
       "mutability": "None",
@@ -319,6 +512,8 @@
       "agents/plugins/component_inventory/src/component_inventory_plugin.cpp",
       "agents/plugins/component_inventory/src/component_java_parsers.hpp",
       "agents/plugins/component_inventory/src/component_legs.hpp",
+      "agents/plugins/component_inventory/src/component_native_parsers.hpp",
+      "agents/plugins/component_inventory/src/component_native_scan.hpp",
       "agents/plugins/component_inventory/src/component_scan.hpp",
       "agents/plugins/component_inventory/src/component_walk.hpp",
       "agents/plugins/component_inventory/src/zip_directory.hpp"
@@ -329,11 +524,11 @@
       "tests/unit/test_component_inventory_local_dispatcher.cpp"
     ]
   },
-  "version": "1.0.0",
+  "version": "1.1.0",
   "where_the_data_goes": [
     "**Instruction result.** Every row is server instruction-result data, with the standard retention policy, served over REST `/api/responses`. Nothing here is a durable server-side table of its own.",
-    "**Not consumed by** the daily sync, Echo, DEX or metrics: the action runs on demand only. The plugin publishes the cost of its last scan as the agent's `yuzu.plugin.component_inventory.*` heartbeat tags (entries walked, rows, milliseconds, roots skipped, links skipped, mounts skipped).",
-    "**Sensitivity.** Rows name the archives and libraries installed on the device, with their versions, paths and application folder names, which is a detailed software inventory for that device. The root list holds only machine-wide locations and no per-user location is in it; that is a property of the list, not a boundary the scan enforces, so an archive found under a root is read wherever it sits. Names are echoed as they appear on disk (scrubbed for the wire only), and the names of nested libraries can reveal a customer's internal dependency names.",
+    "**Not consumed by** the daily sync, Echo, DEX or metrics: the action runs on demand only. `scan` publishes the cost of its last run as the agent's `yuzu.plugin.component_inventory.*` heartbeat tags (entries walked, rows, milliseconds, roots skipped, links skipped, mounts skipped). `native` publishes none: `scan` already uses 6 of the 8 keys a plugin may publish, so the fleet cost of `native` is not collected by this plugin.",
+    "**Sensitivity.** Rows name the archives and libraries installed on the device (`native`: every shared library found under the application roots, which is why it ships off), with their versions, paths and application folder names, which is a detailed software inventory for that device. The root list holds only machine-wide locations and no per-user location is in it; that is a property of the list, not a boundary the scan enforces, so an archive found under a root is read wherever it sits. Names are echoed as they appear on disk (scrubbed for the wire only), and the names of nested libraries can reveal a customer's internal dependency names.",
     "**Siblings:** `crossplatform.software.inventory` (packaged applications) and `crossplatform.runtimes.jvm` (installed Java runtimes)."
   ]
 }

@@ -80,9 +80,10 @@ inline constexpr std::string_view kSourceUnreadable = "unreadable";
 inline constexpr std::size_t kMaxEntryBytes = 64 * 1024;
 
 struct Row {
+    std::string kind{"java"}; // the wire row's second field: java | native
     std::string name;
     std::string version;
-    std::string version_source; // filename | pom | manifest | unreadable
+    std::string version_source; // java: filename | pom | manifest | unreadable; native: filename | elf | macho | unreadable
     std::string path;           // nested: <outer>!<entry>
     std::uint64_t size{0};
     std::int64_t mtime{0};
@@ -422,11 +423,13 @@ enum class Added { ok, anchor_full, section_full };
     return yuzu::util::safe_output_field(s);
 }
 
-/// comp|java|name|version|version_source|path|size|mtime|anchor_app, every text field scrubbed and
-/// escaped. The Row keeps its raw bytes (the real name is what acquisition opens); only the wire copy
+/// comp|<kind>|name|version|version_source|path|size|mtime|anchor_app, every text field scrubbed and
+/// escaped (kind is java for the scan, native for the native action). The Row keeps its raw bytes (the real name is what acquisition opens); only the wire copy
 /// is changed.
 [[nodiscard]] inline std::string format_component_row(const Row& r) {
-    std::string s = "comp|java|";
+    std::string s = "comp|";
+    s += wire_field(r.kind);
+    s += '|';
     s += wire_field(r.name);
     s += '|';
     s += wire_field(r.version);
@@ -463,11 +466,13 @@ struct ScanVerdict {
  * a complete scan is supported; the informational tokens ride that row and never change the level.
  * `roots_link_skipped` counts roots dropped for a link, `links_skipped` the links the walk passed
  * over inside the trees (it follows none), and `network_skipped` the network roots dropped plus the
- * network mounts the walk passed over.
+ * network mounts the walk passed over. `dirs_excluded` is the package-owned trees a native walk kept
+ * out of (always 0 for the scan): informational `package_tree_skipped`.
  */
 [[nodiscard]] inline ScanVerdict scan_verdict(std::string_view os, Stop stop, bool mount_table_unreadable,
                                               std::size_t roots_link_skipped, std::size_t links_skipped,
-                                              std::size_t network_skipped, std::size_t version_unreadable) {
+                                              std::size_t network_skipped, std::size_t version_unreadable,
+                                              std::size_t dirs_excluded = 0) {
     ScanVerdict v;
     if (mount_table_unreadable || stop != Stop::complete) {
         v.level = yuzu::shared::StatusLevel::constrained;
@@ -487,6 +492,7 @@ struct ScanVerdict {
     info(links_skipped > 0, "link_skipped");
     info(network_skipped > 0, "network_fs_skipped");
     info(version_unreadable > 0, "version_unreadable");
+    info(dirs_excluded > 0, "package_tree_skipped");
     return v;
 }
 
@@ -523,24 +529,32 @@ struct Answer {
  * walked, `make_fs` is not even called, and the answer is constrained with that cause. Pure over
  * its arguments, so a test passes a factory that fails if it is ever reached.
  */
-template <class Targets, class MakeFs>
-[[nodiscard]] inline Answer answer_scan(std::string_view os, const Targets& t, MakeFs&& make_fs,
-                                        const WalkLimits& limits) {
+template <class Targets>
+[[nodiscard]] inline Answer assemble_answer(std::string_view action, std::string_view os, const Targets& t,
+                                            ScanResult res) {
     Answer a;
-    if (!t.mount_table_unreadable) {
-        const FsOps fs = make_fs(t);
-        a.res = scan(t.roots, limits, fs);
-    }
+    a.res = std::move(res);
     a.roots_skipped = t.roots_link_skipped + t.roots_network_skipped;
     a.verdict = scan_verdict(os, a.res.stop, t.mount_table_unreadable, t.roots_link_skipped,
                              a.res.stats.links_skipped,
                              t.roots_network_skipped + a.res.stats.mounts_skipped,
-                             a.res.version_unreadable);
+                             a.res.version_unreadable, a.res.stats.dirs_excluded);
     a.lines.reserve(a.res.rows.size() + 1);
-    a.lines.push_back(yuzu::shared::format_status_row(kScanAction, a.verdict.level, a.verdict.tokens));
+    a.lines.push_back(yuzu::shared::format_status_row(action, a.verdict.level, a.verdict.tokens));
     for (const auto& r : a.res.rows)
         a.lines.push_back(format_component_row(r));
     return a;
+}
+
+template <class Targets, class MakeFs>
+[[nodiscard]] inline Answer answer_scan(std::string_view os, const Targets& t, MakeFs&& make_fs,
+                                        const WalkLimits& limits) {
+    ScanResult res;
+    if (!t.mount_table_unreadable) {
+        const FsOps fs = make_fs(t);
+        res = scan(t.roots, limits, fs);
+    }
+    return assemble_answer(kScanAction, os, t, std::move(res));
 }
 
 /**
@@ -567,17 +581,18 @@ inline void emit_answer(Ctx& ctx, Kv* kv, const Answer& a, bool& wrote) {
 }
 
 /**
- * The catch-all's answer: a constrained status row when no row was written yet, then the typed
- * result, both with `token` (a literal built at compile time, so nothing here allocates outside
+ * The catch-all's answer: a constrained status row for `action` when no row was written yet, then the
+ * typed result, both with `token` (a literal built at compile time, so nothing here allocates outside
  * the guarded calls). Each step is guarded on its own: a second failure while answering is
  * swallowed, never allowed to cross the plugin ABI. The caller returns 1.
  */
 template <class Ctx>
-inline void answer_internal_error(Ctx& ctx, std::string_view token, bool wrote) noexcept {
+inline void answer_internal_error(Ctx& ctx, std::string_view token, bool wrote,
+                                  std::string_view action = kScanAction) noexcept {
     if (!wrote) {
         try {
             ctx.write_output(yuzu::shared::format_status_row(
-                kScanAction, yuzu::shared::StatusLevel::constrained, token));
+                action, yuzu::shared::StatusLevel::constrained, token));
         } catch (...) {
         }
     }
