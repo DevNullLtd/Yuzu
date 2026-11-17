@@ -27,6 +27,7 @@
 #include "app_perf_compare.hpp" // app_perf_param_valid — shared cap + control-char/NUL re-floor
 #include "app_perf_daily_store.hpp" // AppPerfDailyStore::kRetentionDays -- the VERIFY compare window clamp
 #include "dex_read_model.hpp" // #4035: shared REST+MCP model structs + serializers (device score, ...)
+#include "dex_usage_json.hpp" // dex_apps_usage_json: the one usage serializer REST and the MCP twin share
 #include "dex_window.hpp" // dex_window_to_days / dex_iso_since / dex_normalize_os_filter (pure, store-free/httplib-free window resolver — narrower than dex_routes.hpp, which this file no longer needs)
 #include "device_routes.hpp" // device_agent_row_json/device_agent_detail_json — #4033 shared builders
 #include "group_agent_count_preview.hpp" // #4033 — create-group agent-count preview shared model
@@ -1226,6 +1227,9 @@ const std::string& openapi_spec() {
 )json"
         R"json(
       "DexAppsList": {"type": "object", "properties": {"window": {"type": "string", "description": "Echo of the window token.", "enum": ["24h", "7d", "30d", "all"]}, "apps": {"type": "array", "description": "Up to 100 applications, crashes plus hangs descending then name.", "items": {"type": "object", "properties": {"crashes": {"type": "integer", "description": "Window-wide crash events on the platform scope."}, "hangs": {"type": "integer", "description": "Window-wide hang events on the platform scope."}, "distinct_devices": {"type": "integer", "description": "Window-wide devices affected on the platform scope."}, "distinct_devices_online": {"type": "integer", "nullable": true, "description": "Of distinct_devices, those online now (the share's numerator); null when no fleet source is wired."}, "last_seen": {"type": "string", "description": "Newest observation timestamp."}, "share_affected": {"allOf": [{"$ref": "#/components/schemas/DexAppPerfInterval"}], "nullable": true, "description": "Wilson interval of distinct_devices_online over population; null when the population is unknown or zero."}, "rate_per_1000": {"allOf": [{"$ref": "#/components/schemas/DexAppPerfInterval"}], "nullable": true, "description": "Online-device events per 1,000 online devices (exact interval); null when the population is unknown or zero."}, "score": {"$ref": "#/components/schemas/DexAppsStabilityScore"}, "subject": {"type": "string", "description": "Process name."}, "profile": {"type": "string", "enum": ["default", "override"], "description": "override when a per-application score-policy override shaped this row; versions inherit it."}, "versions": {"type": "array", "description": "Up to 20 versions, devices affected descending then version ascending.", "items": {"type": "object", "properties": {"crashes": {"type": "integer", "description": "Window-wide crash events on the platform scope."}, "hangs": {"type": "integer", "description": "Window-wide hang events on the platform scope."}, "distinct_devices": {"type": "integer", "description": "Window-wide devices affected on the platform scope."}, "distinct_devices_online": {"type": "integer", "nullable": true, "description": "Of distinct_devices, those online now (the share's numerator); null when no fleet source is wired."}, "last_seen": {"type": "string", "description": "Newest observation timestamp."}, "share_affected": {"allOf": [{"$ref": "#/components/schemas/DexAppPerfInterval"}], "nullable": true, "description": "Wilson interval of distinct_devices_online over population; null when the population is unknown or zero."}, "rate_per_1000": {"allOf": [{"$ref": "#/components/schemas/DexAppPerfInterval"}], "nullable": true, "description": "Online-device events per 1,000 online devices (exact interval); null when the population is unknown or zero."}, "score": {"$ref": "#/components/schemas/DexAppsStabilityScore"}, "version": {"type": "string", "description": "Canonical version; empty string is the unknown-version bucket."}}, "required": ["crashes", "hangs", "distinct_devices", "distinct_devices_online", "last_seen", "share_affected", "rate_per_1000", "score", "version"]}}, "version_count": {"type": "integer", "description": "Versions seen for the application before the cut."}, "versions_truncated": {"type": "boolean", "description": "True when version_count exceeds the versions listed."}}, "required": ["crashes", "hangs", "distinct_devices", "distinct_devices_online", "last_seen", "share_affected", "rate_per_1000", "score", "subject", "profile", "versions", "version_count", "versions_truncated"]}}, "apps_total": {"type": "integer", "description": "Every application with a crash or hang signal in the window and platform scope, before the top-N cut."}, "apps_truncated": {"type": "boolean", "description": "True when apps_total exceeds the applications listed."}, "population": {"type": "integer", "nullable": true, "description": "Devices in the platform scope online now; null when no fleet source is wired, 0 when none is online."}, "population_basis": {"type": "string", "enum": ["all_online", "windows_online", "macos_online", "linux_online"], "description": "What population counts: the devices in the requested platform scope online now."}, "crash_source_coverage": {"type": "object", "description": "Per platform in scope, whether the crash and hang sources are complete or partial. Windows is complete; Linux and macOS are partial, so an empty list there is not proof of stability. Under all the three platforms are listed; an unrecognised operating system has no entry.", "properties": {"windows": {"type": "string", "enum": ["complete", "partial"]}, "macos": {"type": "string", "enum": ["complete", "partial"]}, "linux": {"type": "string", "enum": ["complete", "partial"]}}, "additionalProperties": false}, "policy": {"type": "object", "description": "The score policy every figure was scored under.", "properties": {"source": {"type": "string", "enum": ["default", "custom"]}, "revision": {"type": "string", "description": "Identifies the stored document; default when none."}, "fault": {"type": "string", "nullable": true, "description": "Why a stored document was refused (shipped defaults then apply); null otherwise."}, "interval_confidence": {"type": "number", "description": "The confidence level of every interval in the list, 0 to 1 (0.95 unless the policy sets model.interval_confidence)."}, "tiers": {"type": "object", "description": "Global tiers only; Poor's edge is the fixed 0.", "properties": {"excellent": {"type": "object", "properties": {"edge": {"type": "number", "description": "Lower edge of the tier."}, "name": {"type": "string", "description": "Display name."}}, "required": ["edge", "name"]}, "good": {"type": "object", "properties": {"edge": {"type": "number", "description": "Lower edge of the tier."}, "name": {"type": "string", "description": "Display name."}}, "required": ["edge", "name"]}, "fair": {"type": "object", "properties": {"edge": {"type": "number", "description": "Lower edge of the tier."}, "name": {"type": "string", "description": "Display name."}}, "required": ["edge", "name"]}, "poor": {"type": "object", "properties": {"edge": {"type": "number", "description": "Fixed at 0."}, "name": {"type": "string", "description": "Display name."}}, "required": ["edge", "name"]}}, "required": ["excellent", "good", "fair", "poor"]}}, "required": ["source", "revision", "fault", "interval_confidence", "tiers"]}, "observer_state": {"type": "object", "nullable": true, "description": "What the online devices in the platform scope report now about the crash and hang observer, counted per platform; null when no observer source is wired. Unlike crash_source_coverage (the shipped design) this is live. An agent that opted out and an agent on a build with no observer both report nothing and count as none_reported, as does a device with no recent heartbeat. Under all the rows are windows, linux, macos and other (any operating system not recognised); a single scope has its one row.", "additionalProperties": {"type": "object", "properties": {"armed": {"type": "integer", "description": "Devices reporting the observer armed."}, "disarmed": {"type": "integer", "description": "Devices reporting the observer not armed: it failed to arm or a channel went deaf."}, "none_reported": {"type": "integer", "description": "Devices that report nothing about the observer."}}, "required": ["armed", "disarmed", "none_reported"]}}}, "required": ["window", "apps", "apps_total", "apps_truncated", "population", "population_basis", "crash_source_coverage", "policy", "observer_state"], "description": "Application stability list for one platform scope (default all), over one population (the devices in that scope online now)."},
+)json"
+        R"json(
+      "DexAppsUsage": {"type": "object", "properties": {"window": {"type": "string", "enum": ["24h", "7d", "30d", "all"]}, "platform_scope": {"type": "string", "enum": ["all", "windows", "macos", "linux"]}, "slice": {"type": "object", "properties": {"kind": {"type": "string", "enum": ["fleet", "platform", "group", "tag"]}, "key": {"type": "string", "nullable": true, "description": "The group id or the tag key; null for fleet and platform."}}, "required": ["kind", "key"]}, "as_of": {"type": "string", "description": "UTC instant the model was built; up to 30 seconds old when served from the cache."}, "basis": {"type": "string", "enum": ["estimated_from_30_day_usage"]}, "freshness_window_hours": {"type": "integer", "description": "A device counts only when the server received its usage state this recently (48)."}, "floor": {"type": "integer", "description": "The floor applied."}, "floor_scope": {"type": "string", "enum": ["per_table"], "description": "The floor protects one table only; slices and windows can be differenced."}, "population": {"type": "integer", "description": "Devices in the platform scope online now and admitted to the caller; 0 is a valid answer."}, "reporting_devices": {"type": "integer", "description": "Population devices with a fresh usage state. A device that has never reported usage is in neither this count nor stale_devices."}, "stale_devices": {"type": "integer", "description": "Population devices with an older usage state; they contribute to no figure. A device that has never reported usage is in neither count."}, "apps": {"type": "array", "description": "One row per Apps application, in the Apps order (at most 100).", "items": {"type": "object", "properties": {"subject": {"type": "string"}, "state": {"type": "string", "enum": ["matched", "no_usage", "ambiguous_name"]}, "devices": {"type": "integer", "nullable": true, "description": "Devices that ran it and reported usage, also when the figures are withheld below the floor; null for ambiguous_name (no count is attributed); 0 for no_usage."}, "run_seconds_30d": {"type": "integer", "nullable": true, "description": "Null when withheld (below the floor, no usage or an ambiguous name), never 0."}, "launches_30d": {"type": "integer", "nullable": true, "description": "Null when withheld, never 0."}, "cells": {"type": "array", "items": {"type": "object", "properties": {"kind": {"type": "string", "enum": ["named", "untagged", "other"], "description": "The key of a cell; the label is data and may equal a residual's label."}, "label": {"type": "string", "description": "A tag value or a group id (JSON-escaped), the slice name, or a platform; not unique."}, "devices": {"type": "integer"}, "run_seconds_30d": {"type": "integer"}, "launches_30d": {"type": "integer"}, "small_cohort": {"type": "boolean", "description": "True below 30 devices: a reliability flag, not a disclosure rule."}}, "required": ["kind", "label", "devices", "run_seconds_30d", "launches_30d", "small_cohort"]}}, "exposure_rate": {"type": "object", "properties": {"per_hour": {"$ref": "#/components/schemas/DexAppPerfInterval"}, "hours": {"type": "number", "description": "The denominator: run seconds scaled to the window, in process-hours."}, "crashes": {"type": "integer"}, "hangs": {"type": "integer"}, "basis": {"type": "string", "enum": ["estimated_from_30_day_usage"]}}, "required": ["per_hour", "hours", "crashes", "hangs", "basis"], "nullable": true, "description": "Crashes plus hangs per process-hour of use; null when withheld, with rate_withheld naming why."}, "rate_withheld": {"type": "string", "nullable": true, "enum": ["below_floor", "no_usage", "ambiguous_name", "unbounded_window", "window_exceeds_retention", "zero_usage", "no_statistic", null]}}, "required": ["subject", "state", "devices", "run_seconds_30d", "launches_30d", "cells", "exposure_rate", "rate_withheld"]}}}, "required": ["window", "platform_scope", "slice", "as_of", "basis", "freshness_window_hours", "floor", "floor_scope", "population", "reporting_devices", "stale_devices", "apps"]},
 )json"
         R"json(
       "DexCatalogue": {"type": "object", "properties": {"os": {"type": "string", "enum": ["all", "windows", "linux", "macos"]}, "window": {"type": "string", "description": "Echo of the window token.", "enum": ["24h", "7d", "30d", "all"]}, "monitored_types": {"type": "integer"}, "total_types": {"type": "integer"}, "families": {"type": "array", "items": {"type": "object", "properties": {"name": {"type": "string"}, "monitored": {"type": "integer", "description": "Types a connected in-scope platform collects."}, "total": {"type": "integer"}, "events": {"type": "integer"}, "health_score": {"type": "number", "description": "0-100; null when the family is unmonitored or there is no online denominator.", "nullable": true}, "top_obs_type": {"type": "string", "description": "Null when the family has no events.", "nullable": true}}, "required": ["name", "monitored", "total", "events", "health_score", "top_obs_type"]}}, "uncatalogued": {"type": "array", "items": {"$ref": "#/components/schemas/DexSignalRollupRow"}}}, "required": ["os", "window", "monitored_types", "total_types", "families", "uncatalogued"]},
@@ -2691,6 +2695,10 @@ const std::string& openapi_spec() {
     "/dex/apps": {
       "get": {"operationId": "getDexApps", "summary": "App-centric stability list", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Every application with a crash/hang signal in the window on the platform scope (platform: all, windows, macos or linux; default all). Under all a subject is ONE row across operating systems (counts and versions merge); a per-platform view is platform=<os>. Applications are the 100 affecting the most devices in scope (then crashes plus hangs, then name), listed by activity (crashes plus hangs descending, then name in byte order); apps_total counts every application with a crash or hang signal in the window and scope, and apps_truncated flags the cut; up to 20 versions each (devices affected descending, then version), versions_truncated flags that cut. Each row carries crashes, hangs and distinct_devices (window-wide), then the figures over one population, the devices in scope online now: distinct_devices_online (the affected devices that are online now; null when no fleet source is wired), share_affected (Wilson interval of those over the population, at the score policy's confidence level: 95 percent unless the policy sets model.interval_confidence), rate_per_1000 (their events per 1,000 online devices, exact interval at the same level) and the stability score with its decomposition, so a device that crashed and went offline is in the counts but not in the share, and the score is withheld as offline_affected while any affected device is offline. population is the devices in scope online now (null = no fleet source wired, 0 = no device in scope online now); population_basis names it (all_online, windows_online, macos_online or linux_online). crash_source_coverage states per platform in scope whether the crash/hang sources are complete or partial: Windows is complete; Linux and macOS are partial, so an empty list there is not proof of stability; the value is the shipped design of the crash sources, not live collector health. observer_state is the live counterpart: per platform in scope, how many online devices report the crash and hang observer armed, not armed or not at all (null when no observer source is wired), so an empty list on a device that is not armed or not reporting is not evidence of stability. all means every connected device, including any whose reported operating system is not recognised, so all can exceed the sum of the three per-platform results. BREAKING: the default scope is now all; pass platform=windows for the former Windows-only figures. The Apps tab takes the platform parameter; the Overview top apps and GET /dex/app still count every platform. No device floor is applied. The version-regression term is not assessed here. No per-agent identity (a distinct-device COUNT per app, never an agent_id) — fleet aggregate, NOT audited. The data.policy block names the score policy every figure was scored under (source default|custom, revision, fault, interval_confidence, and the four tier edges and display names; Poor's edge is the fixed 0); each score carries tier, the display name its band reads as for that row (null when withheld); fault is a reason string when a stored policy document was refused and the shipped defaults are in force, otherwise null. Each application carries profile (default|override): override means a per-application override shaped its tiers or weights; its versions inherit it. A failed read, an invalid score policy, a stored policy that cannot be read within its staleness bound (60 s), a read over its concurrency budget (4 at once) or a read cancelled by the statement timeout returns 503, never an empty list; the message names the reason: concurrency_budget, pool_acquire_timeout, statement_timeout, query_error, store_not_open, score_policy_unavailable or score_policy_invalid.", "parameters": [{"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}, {"name": "platform", "in": "query", "required": false, "schema": {"type": "string", "enum": ["all", "windows", "macos", "linux"], "default": "all"}}], "responses": {"200": {"description": "Apps list (data.window, data.population, data.population_basis, data.crash_source_coverage, data.apps_total, data.apps_truncated, data.observer_state, data.policy.{source, revision, fault, interval_confidence, tiers}, data.apps[].{subject, profile, crashes, hangs, distinct_devices, distinct_devices_online, last_seen, share_affected, rate_per_1000, score, versions[], version_count, versions_truncated})", "content": {"application/json": {"schema": {"type": "object", "properties": {"data": {"$ref": "#/components/schemas/DexAppsList"}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}, "required": ["data", "meta"]}}}}, "400": {"description": "invalid window, or invalid platform"}, "503": {"description": "service unavailable, or the application-stability read degraded or over its concurrency budget (retry_after_ms 2000)"}}}
     },
+    )json"
+        // Split again (MSVC C2026 ~16 KB per-literal cap); concatenated at compile time.
+        // The fleet usage path has its own literal (its trailing "," is its own separator).
+        R"json("/dex/apps/usage": {"get": {"operationId": "getDexAppsUsage", "summary": "Fleet application usage", "tags": ["DEX"], "description": "Requires BOTH GuaranteedState:Read and Forensics:Read; while role-based access control is off, Forensics:Read is Administrator-only, so only an administrator can call it. Digital Employee Experience fleet usage per application: for each application in the GET /dex/apps list (the same rows in the same order, at most 100), how many devices ran it, its run time and launches over a 30-day basis, and its exposure rate (crashes plus hangs per process-hour of use), split into the cells of the chosen slice (slice: fleet, platform, group or tag; default fleet). A parameter outside its slice, an off-enum value and an out-of-range value are each a 400; slice=group requires group (a management group id, at most 256 bytes of text with no control characters, valid UTF-8) and an unknown group is a 400, never a 200 with the whole population in the residual cell; slice=tag reads tag_key (default 'model'). Every request that passes parameter validation is audited as dex.apps.usage.view BEFORE the read, and the route FAILS CLOSED (503 + Sec-Audit-Failed: true header) when that row cannot persist; a parameter 400 leaves no row. The row records the admitted request (window, platform, slice, the tag key or group id asked for, floor), not its outcome, so a later unknown-group 400 or a 503 still leaves it, and it carries no agent id. A service-scoped API token is denied outright (403). THE FLOOR APPLIES PER TABLE: floor (1 to 10000, default 1) is the least devices a published figure needs; a cell below it merges into the residual 'other' cell, and an application whose total is below it publishes its device count only. Two slices or two windows can be differenced to isolate a small group, so the floor protects one table, not the set of tables. Every figure is an ESTIMATE from the agent's trailing 30-day usage (basis: estimated_from_30_day_usage). The rate scales run time to the window; window=all has no length and a window longer than the observation retention would need a second estimate, so rate_withheld names unbounded_window or window_exceeds_retention instead of a rate. Run time is summed per process run, so concurrent instances add up: it is process-hours of use, not user hours. Crash and hang counts are RAW, not capped per device: events clustered on one crash-looping device make the interval falsely narrow. Only devices whose usage state the server received within the last 48 hours (freshness_window_hours) count; reporting_devices and stale_devices count the devices of the population that have reported usage at least once (fresh, and older than that); population minus both is the devices that never have, and a stale device contributes to no figure. population is the devices in the platform scope online now (0 is a valid 200: no application has usage then). A withheld figure is JSON null, never 0. state is matched, no_usage (no reporting device ran it) or ambiguous_name (its usage name is shared by two applications, so neither is attributed). rate_withheld is below_floor, no_usage, ambiguous_name, unbounded_window, window_exceeds_retention, zero_usage or no_statistic. A cell's kind (named, untagged or other) is the key and its label is data (a tag value or a group id, JSON-escaped): a tag value of 'other' is a named cell, never the residual. A response holds at most 100 applications and, per application, at most 52 cells (50 named plus untagged and other). A model is cached for 30 seconds per distinct request, so as_of can be up to 30 seconds old. At most 4 reads run at once; a request over that budget is a retryable 503 (concurrency_budget). A failed read is never a 200 with zero figures: it is a 503 naming the reason (pool_acquire_timeout, query_error, statement_timeout, concurrency_budget, apps_degraded, group_unavailable, tag_unavailable) with retry_after_ms 2000; no_population and invalid_request are 503s with no retry hint. Sustained statement timeouts are fleet_too_large: a 503 with no retry hint, because the on-request read no longer fits its time bound for the fleet; only a narrower platform reduces the read, and the state clears on the first successful read.", "parameters": [{"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}, "description": "Window of the Apps list the usage rows align with."}, {"name": "platform", "in": "query", "required": false, "schema": {"type": "string", "enum": ["all", "windows", "macos", "linux"], "default": "all"}, "description": "Platform scope: the population and every figure are over that scope's online devices."}, {"name": "slice", "in": "query", "required": false, "schema": {"type": "string", "enum": ["fleet", "platform", "group", "tag"], "default": "fleet"}, "description": "How the devices are split into cells."}, {"name": "group", "in": "query", "required": false, "schema": {"type": "string", "minLength": 1, "maxLength": 256}, "description": "Management group id, at most 256 bytes of text with no control characters (valid UTF-8). Required with slice=group and only valid with it."}, {"name": "tag_key", "in": "query", "required": false, "schema": {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[A-Za-z0-9_.:-]+$", "default": "model"}, "description": "Device tag key. Only valid with slice=tag."}, {"name": "floor", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 1, "maximum": 10000, "default": 1}, "description": "Least devices a published figure needs; applies per table."}], "responses": {"200": {"description": "Fleet usage per application (window, platform_scope, slice, as_of, basis, freshness_window_hours, floor, floor_scope, population, reporting_devices, stale_devices, apps[])", "content": {"application/json": {"schema": {"type": "object", "properties": {"data": {"$ref": "#/components/schemas/DexAppsUsage"}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}, "required": ["data", "meta"]}}}}, "400": {"description": "invalid window, platform, slice, group, tag_key or floor; a parameter outside its slice; or an unknown management group"}, "403": {"description": "Missing GuaranteedState:Read or Forensics:Read, or a service-scoped API token."}, "503": {"description": "service unavailable; the fleet usage read could not be completed (retry_after_ms 2000, or no retry hint with fleet_too_large, no_population or invalid_request); or the dex.apps.usage.view audit row could not persist (the latter carries Sec-Audit-Failed: true).", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when fleet usage was withheld because the access-audit row failed to persist."}}}}}},
     )json"
         // Split again (MSVC C2026 ~16 KB per-literal cap); concatenated at compile time.
         // #6086's score-policy path starts a fresh literal (its trailing "," is its own
@@ -21515,6 +21523,163 @@ void RestApiV1::register_routes(
             return;
         }
         res.set_content(ok_json(dex_apps_json(model)), "application/json");
+    });
+
+    // GET /dex/apps/usage?window=&platform=&slice=&group=&tag_key=&floor= -- fleet usage per
+    // Apps application: run time and launches over the 30-day basis and the exposure rate per
+    // hour of use, in the slice's cells.
+    //
+    // Gates, in this order: perm_fn(GuaranteedState, Read), the same global gate as /dex/apps
+    // (the body carries the Apps crash subjects, and the gate refuses service-scoped tokens),
+    // then fleet_read_fn(Forensics, Read) (admit-then-filter, with the topology floor, so
+    // Administrator-only while RBAC is off). The two name different (securable, operation)
+    // pairs, so this is not the same-pair stacking the gates forbid. The gate's scope is handed
+    // to the seam, which filters the fleet snapshot before the usage model is built: the usage
+    // figures are computed over the caller's visible devices only. The application list is the
+    // fleet list GuaranteedState:Read already serves (the seam hands the Apps read the unfiltered
+    // snapshot), so only the usage population is filtered. The filter is inert for every caller
+    // admitted today (gate 1 refuses service-scoped tokens, Forensics:Read has no
+    // management-group-scoped tier, and engine and elevated callers are unfiltered; with RBAC off
+    // only an administrator passes the floor), and it fails closed. This is not live per-group
+    // confinement.
+    //
+    // Audit: every request that passes parameter validation is audited as dex.apps.usage.view
+    // BEFORE the read, fail closed (a failed write is a 503 and the read never runs); a
+    // parameter 400 leaves no row. The row records the admitted request, not the outcome: a
+    // later 400 (unknown group) or 503 still leaves it, as dex.app.view does. It carries the
+    // request shape (the tag key or group id asked for) and no agent id. Unlike the Apps list,
+    // this aggregate is audited: it reads Forensics-tier usage and, at the default floor of 1,
+    // a cell can be one device's figures.
+    //
+    // A figure the model withholds is JSON null, never 0, and a failed read is a 503, never a
+    // 200 with zero figures. Every param outside its slice, and every off-enum value, is a 400.
+    sink.Get("/api/v1/dex/apps/usage", [perm_fn, fleet_read_fn, audit_fn, dex_api](
+                                           const httplib::Request& req, httplib::Response& res) {
+        const auto cid = detail::make_correlation_id();
+        res.set_header("X-Correlation-Id", cid);
+        if (!perm_fn(req, res, "GuaranteedState", "Read"))
+            return;
+        if (!fleet_read_fn) {
+            spdlog::error("GET /api/v1/dex/apps/usage: fleet_read_fn unwired — misconfigured call "
+                          "site; failing closed; cid={}",
+                          cid);
+            res.status = 503;
+            res.set_content(detail::error_json_a4(503, "service unavailable", cid),
+                            "application/json");
+            return;
+        }
+        const authz::FleetReadGate gate = fleet_read_fn(req, res, "Forensics", "Read");
+        if (!gate.admitted)
+            return; // response already written by fleet_read_fn
+        if (!dex_api) {
+            res.status = 503;
+            res.set_content(detail::error_json_a4(503, "service unavailable", cid),
+                            "application/json");
+            return;
+        }
+        const auto bad_request = [&](const std::string& message) {
+            res.status = 400;
+            res.set_content(detail::error_json_a4(400, message, cid), "application/json");
+        };
+        const auto param = [&](const char* name, const char* fallback) {
+            return req.has_param(name) ? req.get_param_value(name) : std::string(fallback);
+        };
+        const std::string window = param("window", "7d");
+        if (window != "24h" && window != "7d" && window != "30d" && window != "all")
+            return bad_request("invalid window (expected 24h|7d|30d|all)");
+        const std::string scope =
+            dex_normalize_apps_scope(param("platform", kDexAppsScopeAll));
+        if (scope.empty())
+            return bad_request("invalid platform (expected all|windows|macos|linux)");
+        const std::string slice_name = param("slice", "fleet");
+        DexUsageSlice slice;
+        if (slice_name == "fleet")
+            slice.kind = DexUsageSliceKind::Fleet;
+        else if (slice_name == "platform")
+            slice.kind = DexUsageSliceKind::Platform;
+        else if (slice_name == "group")
+            slice.kind = DexUsageSliceKind::Group;
+        else if (slice_name == "tag")
+            slice.kind = DexUsageSliceKind::Tag;
+        else
+            return bad_request("invalid slice (expected fleet|platform|group|tag)");
+        if (req.has_param("group") && slice.kind != DexUsageSliceKind::Group)
+            return bad_request("'group' is only valid with slice=group");
+        if (req.has_param("tag_key") && slice.kind != DexUsageSliceKind::Tag)
+            return bad_request("'tag_key' is only valid with slice=tag");
+        if (slice.kind == DexUsageSliceKind::Group) {
+            slice.key = param("group", "");
+            // Refused here, before the audit row and the Apps read: a NUL, another control byte
+            // or invalid UTF-8 cannot name a group (the shared group-id rule: at most 256 bytes
+            // and clean text), so it is the caller's 400, never a retryable 503 from the store.
+            if (slice.key.empty() || !mgmt_group_id_ok(slice.key))
+                return bad_request(
+                    "slice=group requires 'group' (1 to 256 bytes, no control characters, valid UTF-8)");
+        } else if (slice.kind == DexUsageSliceKind::Tag) {
+            slice.key = param("tag_key", kDexDefaultCohortKey);
+            if (!TagStore::validate_key(slice.key))
+                return bad_request("invalid tag_key");
+        }
+        std::int64_t floor = kDexCohortFloor;
+        if (req.has_param("floor")) {
+            const std::string text = req.get_param_value("floor");
+            std::int64_t v = 0;
+            const auto [end, ec] = std::from_chars(text.data(), text.data() + text.size(), v);
+            if (text.empty() || ec != std::errc{} || end != text.data() + text.size() || v < 1 ||
+                v > 10000)
+                return bad_request("invalid floor (expected an integer from 1 to 10000)");
+            floor = v;
+        }
+
+        if (!detail::emit_behavioral_audit(
+                audit_fn, req, res, "dex.apps.usage.view", "success", "Forensics", "",
+                "REST DEX fleet application usage read cid=" + cid + " window=" + window +
+                    " platform=" + scope + " slice=" + slice_name +
+                    " key=" + audit_token(slice.key) + " floor=" + std::to_string(floor))) {
+            res.status = 503;
+            res.set_content(
+                detail::error_json_a4(503,
+                                      "audit subsystem unavailable; refusing to serve fleet "
+                                      "application usage without durable evidence",
+                                      cid, 5000, "retry the request"),
+                "application/json");
+            spdlog::warn("dex.apps.usage.view audit fail-closed (503) cid={}", cid);
+            return;
+        }
+
+        const auto r = dex_api->apps_usage(window, scope, slice, floor, gate.scope);
+        if (r) {
+            res.set_content(ok_json(dex_apps_usage_json(*r)), "application/json");
+            return;
+        }
+        const DexUsageRefusal& f = r.error();
+        if (f.reason == "invalid_slice") {
+            bad_request(f.detail == "unknown_group" ? "unknown management group" : "invalid slice");
+            return;
+        }
+        // Tokens only, never caller text.
+        const std::string message = "fleet application usage unavailable (" + f.reason +
+                                    (f.detail.empty() || f.detail == f.reason ? "" : ": " + f.detail) +
+                                    ")";
+        res.status = 503;
+        if (f.reason == "usage_unavailable" && f.detail == "fleet_too_large") {
+            // Sustained statement timeouts: retrying does not help.
+            res.set_content(
+                detail::error_json_a4(
+                    503, message, cid,
+                    detail::A4ErrorOpts{
+                        .remediation = "the usage read no longer fits its time bound for this fleet; "
+                                       "retrying does not help, only a narrower platform scope "
+                                       "reduces the read, and the state clears on the first "
+                                       "successful read (see 'Fleet usage per application' in the "
+                                       "DEX guide, docs/dex/app-usage.md)"}),
+                "application/json");
+        } else if (f.reason == "no_population" || f.reason == "invalid_request") {
+            res.set_content(detail::error_json_a4(503, message, cid), "application/json");
+        } else {
+            res.set_content(detail::error_json_a4(503, message, cid, 2000, "retry shortly"),
+                            "application/json");
+        }
     });
 
     // ── GET / PUT / DELETE /api/v1/dex/score-policy (#6086) ──
