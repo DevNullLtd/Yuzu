@@ -713,9 +713,11 @@ public:
         // reason exist from boot, so a first rejection reads as an increase from 0.
         metrics_.describe("yuzu_server_software_export_total",
                           "Streamed installed-software exports that ended, by format (jsonl/csv) "
-                          "and result (completed/degraded/deadline/aborted); anything but "
+                          "and result (completed/degraded/deadline/aborted/limit); anything but "
                           "completed is a transfer the client saw truncated; aborted covers a "
-                          "client that went away and a server that began shutting down",
+                          "client that went away and a server that began shutting down; limit is "
+                          "a stream cut at --inventory-export-max-rows or "
+                          "--inventory-export-max-bytes",
                           "counter");
         metrics_.describe("yuzu_server_software_export_rejected_total",
                           "Streamed installed-software exports refused with a 503, by reason: "
@@ -21539,6 +21541,8 @@ private:
                     .metrics = &metrics_,
                     .stream_budget = stream_budget_.get(),
                     .concurrency = cfg_.inventory_export_concurrency,
+                    .limits = {.max_rows = cfg_.inventory_export_max_rows,
+                               .max_bytes = cfg_.inventory_export_max_bytes},
                 });
         }
 
