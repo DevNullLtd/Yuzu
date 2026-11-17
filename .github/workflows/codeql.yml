@@ -154,12 +154,14 @@ env:
   VCPKG_BINARY_SOURCES: "default"
   # Must equal every other self-hosted job's CCACHE_MAXSIZE: ccache trims a
   # cache directory to the cap of whichever job is writing to it, and this
-  # job shares the runner's cache with ci.yml, nightly.yml and release.yml
-  # (tests/test_ci_ccache_cap.py). At 500M the daily trace cut a Big Tam
-  # runner's 18-30 GB cache to 3-4 GB (ccache -s, 2026-11-14 to -16: 1588
-  # cleanups per run). In four of five such trims that runner's next 12 h
-  # of CI hit the cache 13-24 points less often than the other runners did;
-  # the fifth showed no gap (docs/ci-architecture.md "Build speed").
+  # job shares the runner's cache with ci.yml, nightly.yml, release.yml and
+  # sanitizer-tests.yml (tests/test_ci_ccache_cap.py). At 500M the daily
+  # trace cut a Big Tam runner's cache to 2.8-5.2 GB (the trace's ccache -s,
+  # 2026-11-12 to -16; 1588 cleanups in each run checked), from 18-30 GB,
+  # or 7.9 GB on a runner trimmed the day before. In four of five such
+  # trims that runner's next 12 h of CI hit the cache 13-24 points less
+  # often than the other runners did; the fifth showed no gap
+  # (docs/ci-architecture.md "Build speed (Big Tam)").
   CCACHE_MAXSIZE: "30G"
   CCACHE_COMPRESS: "true"
 
@@ -259,8 +261,6 @@ jobs:
             build_dir: build-linux-codeql
             category: "/language:c-cpp-linux"
             languages: "c-cpp,actions"
-            ccache_path: ~/.cache/ccache
-            ccache_key_prefix: ccache-codeql-linux
             disk_min_gb: 40
             shell: bash
           - os: windows
@@ -285,8 +285,6 @@ jobs:
             # .github/workflows/*.yml files; the Linux leg covers
             # actions.
             languages: "c-cpp"
-            ccache_path: ~\AppData\Local\ccache
-            ccache_key_prefix: ccache-codeql-windows
             disk_min_gb: 45
             # The default `shell: bash` on a self-hosted Windows runner
             # resolves to C:\Windows\system32\bash.EXE which is WSL
@@ -385,10 +383,10 @@ jobs:
           # database. Wipe the build dir each run.
           rm -rf ${{ matrix.build_dir }}
 
-      # ccache (matrix.ccache_path: ~/.cache/ccache on Linux,
-      # ~\AppData\Local\ccache on Windows) persists in the runner
-      # user's home dir between jobs on both self-hosted runners.
-      # vcpkg_installed/ persists in the workspace. Issue #569.
+      # ccache persists between jobs: on Big Tam in each runner's own
+      # ~/.cache/ccache (HOME=/home/runner/rN/home), on Wee Tam in one
+      # D:\ci\ccache shared by the pool. vcpkg_installed/ persists in the
+      # workspace. Issue #569.
       - name: Reset ccache stats
         run: ccache -z
 
@@ -577,8 +575,9 @@ jobs:
         # ccache hashes the build directory, and this one is unique. At
         # this job's old 500M cap each store also ran a cleanup, which
         # trimmed the shared cache. On Wee Tam one cache (D:\ci\ccache)
-        # serves all four runners, so the trace held the whole pool's
-        # cache near 2 GB while it ran.
+        # serves all four runners, so the trace kept the whole pool's
+        # cache small while it ran (2026-11-15: ci.yml Windows jobs during
+        # the trace ended at 2.0 of 30 GB).
         env:
           CCACHE_DISABLE: "true"
         # Essential because CCACHE_DISABLE forces every TU to compile. Both
@@ -587,8 +586,9 @@ jobs:
 
       - name: ccache stats
         # Covers Configure's probe compiles only: CCACHE_DISABLE calls are
-        # not counted. On Wee Tam the counters are the pool's, so they also
-        # include other Windows jobs running at the same time.
+        # not counted. On Wee Tam the counters are the pool's: they include
+        # other Windows jobs running at the same time, and any Wee Tam job
+        # that starts during this one resets them (ccache -z).
         if: always()
         run: ccache -s
 

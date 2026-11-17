@@ -6,8 +6,8 @@ A self-hosted runner keeps one ccache directory for every job it picks up
 the cap of the job that is writing, so one job with a smaller cap trims the
 cache every other job on that runner relies on. codeql.yml and
 sanitizer-tests.yml carried 500M while ci.yml, nightly.yml and release.yml
-carried 30G: each daily CodeQL trace cut a Big Tam runner's 18-30 GB cache to
-3-4 GB, and in four of five such trims (2026-11-12 to -17) that runner's next
+carried 30G: each daily CodeQL trace cut a Big Tam runner's cache to 2.8-5.2 GB
+(from as much as 30 GB), and in four of five such trims (2026-11-12 to -17) that runner's next
 12 h of CI hit the cache 13-24 points less often than the other runners did.
 
 Rules, over every workflow job that runs on a self-hosted pool and mentions
@@ -16,13 +16,19 @@ ccache:
   2. every such job on the same pool has the same value;
   3. nothing else in the job sets or changes the cap or empties the cache:
      no CCACHE_MAXSIZE outside the job env (step env, container env,
-     defaults, a $GITHUB_ENV write), no max_size setting, no ccache.conf
-     write, no `ccache -M/-o/-C/--set-config/--max-size/--evict*/--clear`;
-  4. no such job uses CCACHE_RECACHE, and the CodeQL-traced build disables
-     ccache (see the comment on that step in codeql.yml).
+     defaults, a $GITHUB_ENV write), no CCACHE_CONFIGPATH, and no
+     `max_size`/`max-size`/`ccache.conf` or `ccache -M/-F/-o/-C/--set-config/
+     --max-size/--max-files/--evict*/--clear/--cleanup` anywhere in the job.
+     These are matched as text over the whole job, step names and paths
+     included, so a step merely named "max-size report" also fails: rename it;
+  4. no such job uses CCACHE_RECACHE (job, step or workflow env), and the
+     CodeQL-traced build disables ccache (see the comment on that step in
+     codeql.yml).
 
-What it cannot see: a job that reaches ccache only through a script or an
-action and never names it in the workflow (none does today).
+What it cannot see: it reads only the workflow files, so a cap change or a
+wipe made inside a script under scripts/ or inside an action a job calls is
+invisible, and so is a job that reaches ccache only that way and never names
+it. None does today.
 
 Lexical and hermetic: reads .github/workflows/*.yml and *.yaml, runs nothing.
 """
@@ -39,7 +45,8 @@ WORKFLOWS = os.path.join(ROOT, '.github', 'workflows')
 POOL_LABEL = re.compile(r'^yuzu-[a-z0-9]+-(linux|windows|macos)$')
 CAP_CHANGE = re.compile(
     r'max[_-]size|ccache\.conf'
-    r'|ccache\s+(-M|-o\b|-C\b|--set-config|--max-size|--evict|--clear|--cleanup)',
+    r'|CCACHE_CONFIGPATH'
+    r'|ccache\s+(-M|-F\b|-o\b|-C\b|--set-config|--max-size|--max-files|--evict|--clear|--cleanup)',
     re.IGNORECASE)
 
 
@@ -139,12 +146,15 @@ class CcacheCapTests(unittest.TestCase):
                 m = CAP_CHANGE.search(rest)
                 self.assertIsNone(m, f'{wf}:{job_id} changes the ccache cap or empties the '
                                      f'cache ({m.group(0) if m else ""!r})')
-                self.assertFalse('CCACHE_RECACHE' in rest,
+                self.assertFalse('CCACHE_RECACHE' in json.dumps(job),
                                  f'{wf}:{job_id} uses CCACHE_RECACHE; use CCACHE_DISABLE')
         for path in workflow_files():
             doc = load(path)
             rest = json.dumps({k: v for k, v in doc.items() if k not in ('env', 'jobs')})
             with self.subTest(workflow=os.path.basename(path)):
+                self.assertFalse('CCACHE_RECACHE' in json.dumps(doc.get('env') or {}),
+                                 f'{os.path.basename(path)} sets CCACHE_RECACHE in its '
+                                 f'workflow env; use CCACHE_DISABLE on the step that needs it')
                 self.assertFalse('CCACHE_MAXSIZE' in rest,
                                  f'{os.path.basename(path)} sets CCACHE_MAXSIZE outside '
                                  f'its workflow env')

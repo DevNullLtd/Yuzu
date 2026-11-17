@@ -92,7 +92,8 @@ HOME=/home/runner/rN/home
 Jobs inherit it, so each runner has its own ccache
 (`/home/runner/rN/home/.cache/ccache`), its own `~/.local` Python packages and
 its own `.gitconfig`. Nothing in this directory writes that line, so add it by
-hand when a runner is registered or re-registered, then restart the agent.
+hand when a runner is registered or re-registered, then restart the agent in an
+idle window (see above).
 Without it all four runners share `/home/runner`, and so one ccache.
 `docs/ci-architecture.md` "Build speed (Big Tam)" explains how the ccache cap
 (`CCACHE_MAXSIZE`, set by the workflows) applies to these caches.

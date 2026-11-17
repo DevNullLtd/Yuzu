@@ -1239,7 +1239,9 @@ home directory. The user is provisioned once for fast, download-free builds:
   whichever job is writing, so one job with a smaller cap empties the cache
   the other jobs rely on. Until 2026-11-17, `codeql.yml` and
   `sanitizer-tests.yml` set 500M. Each daily CodeQL trace cut its runner's
-  cache from 18-30 GB to 3-4 GB (the trace's own `ccache -s`). In four of
+  cache to 2.8-5.2 GB (the trace's own `ccache -s`), from the 18-30 GB the
+  runner's previous CI job ended at, or 7.9 GB on a runner trimmed the day
+  before. In four of
   the five trims between 2026-11-12 and -17, that runner's CI over the next
   12 hours hit the cache 13-24 points less often than the other three
   runners did, depending on where the window starts; the fifth showed no
@@ -1248,8 +1250,8 @@ home directory. The user is provisioned once for fast, download-free builds:
   doubt. `tests/test_ci_ccache_cap.py` now requires one cap per pool, and
   the CodeQL-traced build runs with `CCACHE_DISABLE` (see the comment on
   that step). At 30G a runner's cache sits at the cap and holds about two
-  days of objects (r3's cache on 2026-11-17: 4.3 GB dated 11-15, the
-  rest 11-16 and 11-17). Nothing measured shows that limit costing
+  days of objects (r3's cache on 2026-11-17: 4.4 GB dated 11-15 or
+  earlier, the rest 11-16 and 11-17). Nothing measured shows that limit costing
   hits: r3, which no trim reached in that window, ended every job at the
   cap and its hit rate (79.1%) was close to the best of the others
   (73.8-79.8%). That does not show a larger cap would not help.
@@ -3022,11 +3024,11 @@ build could before. The Configure step sets `CCACHE_NOHASHDIR=1` for this leg
 only: ccache otherwise hashes the working directory for a `-g` compile, so the
 contract build directory never reused the standard build's objects (the two
 directories' compile commands are identical). The cost is debug info only: an
-object's recorded compile directory may name the other build directory, or,
-for a source compiled with no workspace-specific flag, another runner's
-workspace, and nothing in this leg reads it. The step prints the precompile's
-wall time with its own ccache hit and miss counts (from a per-step stats log,
-since the cache's global counters mix all four runners), and the collector's
+object's recorded compile directory may name the other build directory (each
+runner has its own cache, so never another runner's workspace), and nothing in
+this leg reads it. The step prints the precompile's wall time with its own
+ccache hit and miss counts (from a per-step stats log, since the cache's
+counters cover the whole job), and the collector's
 time including its slot wait. The contract build's compiles, previously ccache
 misses, now mostly hit, so the job's overall ccache hit rate is not comparable
 with earlier runs. Each runner compiles each source cold once under the new
