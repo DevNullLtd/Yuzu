@@ -5782,9 +5782,9 @@ TEST_CASE("EchoDatabase: dictionary sweep: a cancelled pass deletes nothing and 
     auto t = make_test_db();
     seed_orphan_string(t);
     const std::string orphan_sql = "SELECT COUNT(*) FROM echo_dict WHERE text = 'purged.exe'";
-    const auto far = EchoFold::Clock::now() + std::chrono::hours(1);
+    const auto far_off = EchoFold::Clock::now() + std::chrono::hours(1);
 
-    const auto at_once = t.db.fold().gc_dictionary(t.db, far, [] { return true; });
+    const auto at_once = t.db.fold().gc_dictionary(t.db, far_off, [] { return true; });
     REQUIRE(at_once.has_value());
     CHECK(at_once->deadline_hit);
     CHECK(at_once->deleted == 0);
@@ -5797,7 +5797,7 @@ TEST_CASE("EchoDatabase: dictionary sweep: a cancelled pass deletes nothing and 
     // here, so no extra rows are needed; reverting the handler to the deadline alone fails the
     // live_set_built check. Counted in polls, never in elapsed time.
     int polls = 0;
-    const auto midway = t.db.fold().gc_dictionary(t.db, far, [&polls] { return ++polls >= 2; });
+    const auto midway = t.db.fold().gc_dictionary(t.db, far_off, [&polls] { return ++polls >= 2; });
     REQUIRE(midway.has_value());
     CHECK(midway->deadline_hit);
     CHECK_FALSE(midway->live_set_built);
@@ -5805,7 +5805,7 @@ TEST_CASE("EchoDatabase: dictionary sweep: a cancelled pass deletes nothing and 
     CHECK(polls >= 2);
     CHECK(first_cell(t.db, orphan_sql) == "1");
 
-    const auto done = t.db.fold().gc_dictionary(t.db, far);
+    const auto done = t.db.fold().gc_dictionary(t.db, far_off);
     REQUIRE(done.has_value());
     CHECK_FALSE(done->deadline_hit);
     CHECK(first_cell(t.db, orphan_sql) == "0");
