@@ -566,7 +566,8 @@ software is simply deleted from the device's list; the history entry is the reco
 there. History older than 400 days is pruned, and decommissioning a device deletes its history
 and its components with it. The change
 history is read through `GET /api/v1/inventory/software/changes` and the components through
-`GET /api/v1/inventory/software/components` (see the REST API reference); the dashboard shows
+`GET /api/v1/inventory/software/components` (see the REST API reference; the MCP tool
+`query_software_components` answers the same question); the dashboard shows
 neither yet. The agent of this build
 sends v3 (and no longer has a v2 writer). Operators can see the outcome of each section in
 `yuzu_inventory_section_ingest_total{facet,outcome}`, where `outcome` is `stored`, `status_only`,
@@ -910,13 +911,17 @@ active" filter.)
 The **`query_installed_software`** MCP tool exposes the same data to agentic
 workers, gated SOLELY by `AuthRoutes::require_fleet_read` (#3290 Phase 2):
 
-- Filter by software `name` and/or `agent_id`; omit both for a fleet-wide scan.
+- Filter by software `name` and/or `agent_id`; omit both for a fleet-wide scan. The lookup
+  filters of the REST route are accepted too: `q`, `kind`, `ecosystem`, `source`, `match`
+  (`exact`, `prefix` or `contains`), `status` and `version_min` / `version_max`; the rows
+  carry the lookup fields and the result carries `count` and `totals`, exactly as the REST
+  `data` object (both call one function). `purl` and `vers` are REST-only.
 - Returns up to `limit` rows (max 1000; any integer that fits int64 is clamped to 1..1000).
   When `result_truncated_by_cap` is `true` more rows may exist: pass `next_cursor` back as
   `cursor` to continue the keyset walk (the cursor is opaque and bound to the filter set).
   Optional `version` filter; each row also carries `source`. A wrongly typed argument (a
-  non-string `agent_id`, `name`, `version` or `cursor`, or a non-integer `limit`) is refused
-  with `kInvalidParams`, never ignored or converted.
+  non-string `agent_id`, `name`, `version`, `cursor` or lookup filter, or a non-integer
+  `limit`) is refused with `kInvalidParams`, never ignored or converted.
 - **The caller's scope is applied in SQL** — the gate composes management-group
   visibility with the caller's service-scope tag
   (`meet(management-group, service-scope)`), so a management-group-confined
@@ -937,6 +942,11 @@ workers, gated SOLELY by `AuthRoutes::require_fleet_read` (#3290 Phase 2):
   response as "unknown — do **not** proceed as if nothing is installed". A
   genuinely empty result (no error, zero rows) means the query succeeded and
   matched nothing in your scope.
+- **Components and sync runs.** `query_software_components` is the twin of
+  `GET /api/v1/inventory/software/components` (same gate, scope, filters and `totals` rule;
+  strict input, and no CSV export). `sync_hardware_software` starts a paced on-demand sync
+  (`confirm`, `last_synced_before`) and returns an `execution_id`; `get_software_sync_status`
+  reads that run's progress (the twin of `GET /api/v1/hardware/sync/{execution_id}`).
 
 ### REST (for automation / scripts)
 
@@ -983,8 +993,8 @@ curl -H "Authorization: Bearer $TOKEN" -o affected.csv \
   `vers:<scheme>/...` string), `purl` (exact Package URL), `status`, `limit` (max 1000; 10000
   with `format`), `cursor` and `format` (`json` or `csv`: an export). Omit `name` and
   `agent_id` for a fleet-wide scan. The full parameter and error tables are in
-  [rest-api.md](rest-api.md); everything except `name`, `agent_id`, `version`, `limit` and
-  `cursor` is REST-only (the MCP tool takes only those).
+  [rest-api.md](rest-api.md); `format`, `purl` and `vers` are REST-only (the MCP tool takes
+  every other parameter).
 - Success body: `{"data": {"software": [...], "count": N, "devices_omitted": M, "totals":
   {...} | null, ...}, "meta": {"api_version": "v1"}}`. Each REST row has 23 fields: the 14
   package fields `{agent_id, name, version, publisher, install_date, kind, ecosystem, epoch,
@@ -994,7 +1004,7 @@ curl -H "Authorization: Bearer $TOKEN" -o affected.csv \
   (the device's last poll), `status` (`current`, `unconfirmed` or `disabled`),
   `last_confirmed_at`, `install_type`, `install_scope`, `install_location`,
   `instance_key` and `purl` (the canonical Package URL, `null` when the row has none). The MCP
-  tool's rows keep the 14 package fields until its twin catches up.
+  tool's rows carry the same 23 fields.
 - **Searching by Package URL and by `vers:` range.** `purl=` returns the rows whose stored
   purl equals the value byte for byte (no prefix or case matching, and it must start `pkg:`),
   so give the full canonical purl as the row shows it, URL-encoded; it needs no `name`, and it
@@ -1427,7 +1437,8 @@ place, **Hardware** and **Software**, each its own page:
       the `202` body `agents_reached` is the number of agents that accepted the request; the
       audit row's `reached` is the number the run planned to send to. The body also carries
       an `execution_id`: `GET /api/v1/hardware/sync/{execution_id}` reports the frames
-      accepted and the agents that armed the sync or failed. An agent answers when it arms
+      accepted and the agents that armed the sync or failed (the MCP tool
+      `get_software_sync_status` reads the same record). An agent answers when it arms
       the sync, not when its report lands, so those figures count requests taken up, not
       reports received.
   - **Who sees what.** The catalogue is a fleet-wide aggregate that cannot be narrowed to

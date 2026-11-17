@@ -9,6 +9,7 @@
 /// sequencing and the HTTP mapping: gate -> parse -> confirm -> guard -> resolve -> admit -> audit ->
 /// dispatch, that nothing is sent on any refusal, and who may read a run's status.
 
+#include "execution_scope_rules.hpp" // execution_owner_key (what each surface passes as `owned`)
 #include "hardware_routes.hpp"
 #include "test_route_sink.hpp"
 
@@ -1104,4 +1105,102 @@ TEST_CASE("sync route: the per-device sync route is still its own route", "[hard
     auto status = h.status_of("exec-1");
     REQUIRE(status);
     CHECK(status->status == 200);
+}
+
+// ── software_sync::sync_status: the one function the REST route and the MCP tool both call ──
+
+namespace {
+
+Execution sync_run(const std::string& id, const std::string& owner, const std::string& params_json) {
+    Execution e;
+    e.id = id;
+    e.definition_id = std::string(ss::kSyncDefinitionId);
+    e.status = "running";
+    e.dispatched_by = owner;
+    e.dispatched_at = 1'700'000'000;
+    e.agents_targeted = 5;
+    e.agents_success = 3;
+    e.agents_failure = 1;
+    e.parameter_values = params_json;
+    return e;
+}
+
+std::expected<std::optional<Execution>, std::string> found(const Execution& e) {
+    return std::optional<Execution>(e);
+}
+
+// What each surface passes as `owned`: the caller's execution owner key owns the row.
+bool owned_by(const std::string& username, const Execution& e, const std::string& service = {}) {
+    auth::Session s;
+    s.username = username;
+    s.token_scope_service = service;
+    return execution_owner_key(s).owns(e);
+}
+
+} // namespace
+
+TEST_CASE("sync_status: an owned run is served with its counts and the spread",
+          "[hardware][sync_fanout][status]") {
+    const auto run = sync_run("exec-1", "alice", R"({"delay_max_s":120})");
+    const auto r = ss::sync_status(found(run), owned_by("alice", run), false);
+    REQUIRE(r);
+    CHECK(*r == nlohmann::json{{"execution_id", "exec-1"},
+                               {"state", "running"},
+                               {"targeted", 5},
+                               {"acknowledged", 3},
+                               {"failed", 1},
+                               {"dispatched_at", 1'700'000'000},
+                               {"delay_max_s", 120},
+                               {"estimated_completion_at", 1'700'000'120}});
+}
+
+TEST_CASE("sync_status: delay_max_s is read only from a positive integer; the estimate is dispatch plus spread",
+          "[hardware][sync_fanout][status]") {
+    for (const char* params : {"", "not json", "[]", R"({})", R"({"delay_max_s":0})",
+                               R"({"delay_max_s":-5})", R"({"delay_max_s":"60"})",
+                               R"({"delay_max_s":2.5})"}) {
+        INFO(params);
+        const auto run = sync_run("exec-1", "alice", params);
+        const auto r = ss::sync_status(found(run), owned_by("alice", run), false);
+        REQUIRE(r);
+        CHECK((*r)["delay_max_s"] == 0);
+        CHECK((*r)["estimated_completion_at"] == (*r)["dispatched_at"]);
+    }
+    const auto run = sync_run("exec-1", "alice", R"({"delay_max_s":7})");
+    const auto spread = ss::sync_status(found(run), owned_by("alice", run), false);
+    REQUIRE(spread);
+    CHECK((*spread)["delay_max_s"] == 7);
+    CHECK((*spread)["estimated_completion_at"] == 1'700'000'007);
+}
+
+TEST_CASE("sync_status: a read error is Unavailable, never an empty answer",
+          "[hardware][sync_fanout][status]") {
+    const std::expected<std::optional<Execution>, std::string> degraded =
+        std::unexpected(std::string("pool exhausted"));
+    const auto r = ss::sync_status(degraded, false, true);
+    REQUIRE_FALSE(r);
+    CHECK(r.error() == ss::SyncStatusFault::kUnavailable);
+}
+
+TEST_CASE("sync_status: no such run, a non-sync execution and another caller's run are the same NotFound",
+          "[hardware][sync_fanout][status][security]") {
+    const std::expected<std::optional<Execution>, std::string> none = std::optional<Execution>{};
+    auto other_def = sync_run("wf-1", "alice", "{}");
+    other_def.definition_id = "some.workflow";
+    const auto mine = sync_run("exec-1", "alice", "{}");
+
+    const auto unknown = ss::sync_status(none, false, true);
+    const auto not_sync = ss::sync_status(found(other_def), owned_by("alice", other_def), true);
+    const auto not_mine = ss::sync_status(found(mine), owned_by("bob", mine), false);
+    for (const auto& r : {unknown, not_sync, not_mine}) {
+        REQUIRE_FALSE(r);
+        CHECK(r.error() == ss::SyncStatusFault::kNotFound);
+    }
+    // An unfiltered Execution:Execute reads any SYNC run, but still not another kind of execution.
+    CHECK(ss::sync_status(found(mine), owned_by("bob", mine), true));
+    CHECK_FALSE(ss::sync_status(found(other_def), owned_by("bob", other_def), true));
+    // A service-scoped session owns nothing (its key is empty), so it reads only through an
+    // unfiltered grant.
+    CHECK_FALSE(owned_by("alice", mine, "printers"));
+    CHECK_FALSE(ss::sync_status(found(mine), owned_by("alice", mine, "printers"), false));
 }

@@ -59,6 +59,7 @@
 #include "discover_routes.hpp"     // A2 discovery builders (Issue 17.1)
 #include "engine_principal_store.hpp"
 #include "event_bus.hpp"
+#include "execution_scope_rules.hpp" // SAM-21: execution_owner_key (the sync status ownership input)
 #include "execution_tracker.hpp"
 #include "instruction_definition_model.hpp" // #4029: shared row/detail/export builders
 #include "instruction_execute_ports.hpp"
@@ -908,6 +909,9 @@ TEST_CASE("MCP AuditStore: query with mcp_tool field", "[pg][mcp][audit]") {
 
 #include <memory>
 #include <stdexcept>
+#include <tuple>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -1273,6 +1277,13 @@ struct McpTestServer {
     /// the RBAC-unavailable-aware probe behind the four collection-settings tools. All default
     /// unset, so every other case sees those tools answer "unavailable".
     std::optional<yuzu::server::software_read_api::Ctx> software_read_ctx_for_test;
+    /// SAM-21: the lookup reads behind query_installed_software and query_software_components.
+    /// When unset and software_inventory_store_for_test is set, the harness binds the production
+    /// reads over that store (no roster), so the [pg] cases run unchanged; both unset = "store
+    /// unavailable". The sync status closures behind get_software_sync_status default unset.
+    std::optional<yuzu::server::software_list::LookupReads> software_lookup_reads_for_test;
+    yuzu::server::software_sync::StatusReadFn software_sync_status_fn_for_test;
+    yuzu::server::software_sync::UnfilteredFn software_sync_unfiltered_fn_for_test;
     yuzu::server::software_collection_settings_api::Stores collection_settings_stores_for_test;
     yuzu::server::mcp::McpServer::PermFn collection_settings_probe_for_test;
 
@@ -1952,6 +1963,14 @@ private:
             mcp.set_software_sync_runner(software_sync_runner_for_test);
         if (software_read_ctx_for_test)
             mcp.set_software_read_ctx(*software_read_ctx_for_test);
+        if (software_lookup_reads_for_test)
+            mcp.set_software_lookup_reads(*software_lookup_reads_for_test);
+        else if (software_inventory_store_for_test)
+            mcp.set_software_lookup_reads(
+                yuzu::server::software_list::bind_lookup_reads(*software_inventory_store_for_test, {}));
+        if (software_sync_status_fn_for_test || software_sync_unfiltered_fn_for_test)
+            mcp.set_software_sync_status_fns(software_sync_status_fn_for_test,
+                                             software_sync_unfiltered_fn_for_test);
         if (collection_settings_stores_for_test.store || collection_settings_probe_for_test)
             mcp.set_collection_settings_deps(collection_settings_stores_for_test,
                                              collection_settings_probe_for_test);
@@ -27089,13 +27108,14 @@ TEST_CASE("MCP query_installed_software: a degraded store errors, never success+
                        R"("params":{"name":"query_installed_software","arguments":{"name":"Chrome"}}})");
     REQUIRE(res->status == 200);
     CHECK(res->body.find("\"error\"") != std::string::npos); // JSON-RPC error, not a result
-    CHECK(res->body.find("Software inventory store degraded") != std::string::npos);
+    CHECK(res->body.find("software inventory store degraded") != std::string::npos);
     CHECK(res->body.find("-32603") != std::string::npos);    // kInternalError, not kInvalidParams (gov QE)
     CHECK(res->body.find("\"result\"") == std::string::npos); // crucially NOT success+[]
     // the A4 envelope an agent reads, pinned exactly: the message, the remediation and the same
     // retry hint as the REST twin and the two catalogue tools
     const auto degraded = nlohmann::json::parse(res->body).at("error");
-    CHECK(degraded.at("message") == "Software inventory store degraded \xE2\x80\x94 query failed");
+    // The lookup core's text, the same words as the REST twin's 503.
+    CHECK(degraded.at("message") == "software inventory store degraded \xE2\x80\x94 query failed");
     CHECK(degraded.at("data").at("remediation") == "retry the request");
     CHECK(degraded.at("data").at("retry_after_ms") == yuzu::server::mcp::kMcpStoreFaultRetryMs);
     CHECK(degraded.at("data").contains("correlation_id"));
@@ -46530,8 +46550,7 @@ struct SyncToolRig {
 
 constexpr const char* kSyncCall =
     R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"sync_hardware_software","arguments":)";
-// A whole fleet or group must say so; the tool's own schema does not advertise `confirm` yet, but the
-// shared request grammar reads it.
+// A whole fleet or group must say so with `confirm` (the shared request grammar's rule).
 constexpr const char* kFleetArgs = R"({"scope":"__all__","confirm":true}}})";
 
 } // namespace
@@ -46559,7 +46578,8 @@ TEST_CASE("MCP sync_hardware_software: a fleet run is accepted with counts only,
     CHECK(res->body.find("d0") == std::string::npos); // counts only, never a device id
     CHECK(rig.dispatches == 1);
     REQUIRE_FALSE(ts.audit_log.empty());
-    CHECK(ts.audit_log.front() == "inventory.sync.request|requested");
+    // A whole-fleet run is written under its own verb, as on REST (software_estate.sync.fleet_wide).
+    CHECK(ts.audit_log.front() == "software_estate.sync.fleet_wide|requested");
 }
 
 TEST_CASE("MCP sync_hardware_software: shares the run state with every other caller of the runner",
@@ -57760,4 +57780,847 @@ TEST_CASE("MCP set_software_collection_settings: the supervised tier mints an ap
     CHECK(minted["error"]["code"] == yuzu::server::mcp::kApprovalRequired);
     CHECK_FALSE(rig.stored(rig.group_a));
     CHECK(mcp_audits(rig.ts, "software_estate.collection_settings.update|requested") == 0);
+}
+
+// ── SAM-21: query_installed_software (widened), query_software_components, get_software_sync_status,
+// sync_hardware_software (advertised) ──────────────────────────────────────────────────────────
+// The lookup tools answer from software_list::lookup_installs / lookup_components, the functions
+// the REST routes call, so every "equals REST" case compares the tool's structuredContent with
+// lookup_body over the SAME fakes. The reads are in-memory fakes: no Postgres, no process, no clock.
+
+namespace {
+namespace swl = yuzu::server::software_list;
+namespace ss21 = yuzu::server::software_sync;
+using yuzu::server::SoftwareComponentRow;
+using yuzu::server::SoftwareFleetRow;
+
+SoftwareFleetRow sam21_install(const std::string& agent, const std::string& version, std::int64_t id) {
+    SoftwareFleetRow r;
+    r.agent_id = agent;
+    r.install_id = id;
+    r.entry.name = "git";
+    r.entry.version = version;
+    r.entry.publisher = "Git SCM";
+    r.entry.kind = "package";
+    r.entry.ecosystem = "brew";
+    r.entry.source = "pkg_inventory.list";
+    r.entry.purl = "pkg:brew/git@" + version;
+    r.facet_status = "full";
+    r.last_confirmed_at = 1'700'000'100;
+    return r;
+}
+
+SoftwareComponentRow sam21_component(const std::string& agent, const std::string& path_hash) {
+    SoftwareComponentRow r;
+    r.agent_id = agent;
+    r.kind = "library";
+    r.name = "libfoo";
+    r.path_hash = path_hash;
+    r.version = "3.0";
+    r.version_source = "manifest";
+    r.path = "/opt/app/libfoo.so";
+    r.anchor_app = "app";
+    r.first_seen = 1'699'000'000;
+    r.facet_status = "full";
+    r.last_confirmed_at = 1'700'000'100;
+    return r;
+}
+
+// Every read of one lookup, faked. Not copied after reads() is taken: the closures hold `this`.
+struct Sam21Reads {
+    std::vector<SoftwareFleetRow> installs;
+    std::vector<SoftwareComponentRow> comps;
+    bool rows_ok{true};
+    bool facts_ok{true};
+    bool totals_ok{true};
+    int page_reads{0};
+    yuzu::server::SoftwareFleetQuery seen_installs;
+
+    Sam21Reads() {
+        installs = {sam21_install("a1", "1.0", 1), sam21_install("a2", "1.5", 2)};
+        comps = {sam21_component("a1", "01"), sam21_component("a2", "02")};
+    }
+
+    swl::LookupReads reads() {
+        swl::LookupReads io;
+        io.installs = [this](const yuzu::server::SoftwareFleetQuery& q)
+            -> std::optional<std::vector<SoftwareFleetRow>> {
+            ++page_reads;
+            if (!rows_ok)
+                return std::nullopt;
+            seen_installs = q;
+            std::vector<SoftwareFleetRow> out;
+            std::int64_t to_skip = q.skip;
+            for (const auto& r : installs) {
+                if (q.agent_ids &&
+                    std::ranges::find(*q.agent_ids, r.agent_id) == q.agent_ids->end())
+                    continue;
+                if (q.after && !(std::tie(r.entry.name, r.agent_id, r.install_id) >
+                                 std::tie(q.after->name, q.after->agent_id, q.after->install_id)))
+                    continue;
+                if (to_skip > 0) {
+                    --to_skip;
+                    continue;
+                }
+                if (static_cast<int>(out.size()) == q.limit)
+                    break;
+                out.push_back(r);
+            }
+            return out;
+        };
+        io.components = [this](const yuzu::server::SoftwareComponentQuery& q)
+            -> std::optional<std::vector<SoftwareComponentRow>> {
+            ++page_reads;
+            if (!rows_ok)
+                return std::nullopt;
+            std::vector<SoftwareComponentRow> out;
+            std::int64_t to_skip = q.skip;
+            for (const auto& r : comps) {
+                if (q.agent_ids &&
+                    std::ranges::find(*q.agent_ids, r.agent_id) == q.agent_ids->end())
+                    continue;
+                if (q.after && !(std::tie(r.name, r.agent_id, r.kind, r.path_hash) >
+                                 std::tie(q.after->name, q.after->agent_id, q.after->kind,
+                                          q.after->path_hash)))
+                    continue;
+                if (to_skip > 0) {
+                    --to_skip;
+                    continue;
+                }
+                if (static_cast<int>(out.size()) == q.limit)
+                    break;
+                out.push_back(r);
+            }
+            return out;
+        };
+        io.install_versions = [](std::string_view, const std::optional<std::vector<std::string>>&)
+            -> std::optional<std::vector<std::string>> {
+            return std::vector<std::string>{"1.0", "1.5", "2.0"};
+        };
+        io.component_versions = [](std::string_view, std::string_view,
+                                   const std::optional<std::vector<std::string>>&)
+            -> std::optional<std::vector<std::string>> {
+            return std::vector<std::string>{"1.0", "3.0"};
+        };
+        io.facts.last_seen = [this](const std::vector<std::string>& ids)
+            -> std::optional<std::unordered_map<std::string, std::int64_t>> {
+            if (!facts_ok)
+                return std::nullopt;
+            std::unordered_map<std::string, std::int64_t> out;
+            for (const auto& id : ids)
+                out[id] = 1'700'000'500;
+            return out;
+        };
+        io.facts.hostnames = [] {
+            return std::unordered_map<std::string, std::string>{{"a1", "host-a"}};
+        };
+        io.totals.catalog_meta = [this]() -> std::optional<yuzu::server::CatalogRollupMeta> {
+            if (!totals_ok)
+                return std::nullopt;
+            yuzu::server::CatalogRollupMeta m;
+            m.refreshed_at = 1'700'000'000;
+            return m;
+        };
+        io.totals.component_meta = [this]() -> std::optional<yuzu::server::ComponentRollupMeta> {
+            if (!totals_ok)
+                return std::nullopt;
+            return yuzu::server::ComponentRollupMeta{1'700'000'000};
+        };
+        io.totals.title_totals =
+            [this](std::string_view) -> std::optional<yuzu::server::SoftwareTotals> {
+            if (!totals_ok)
+                return std::nullopt;
+            return yuzu::server::SoftwareTotals{10, 4, 0};
+        };
+        io.totals.version_set_totals = [this](std::string_view, const std::vector<std::string>&)
+            -> std::optional<yuzu::server::SoftwareTotals> {
+            if (!totals_ok)
+                return std::nullopt;
+            return yuzu::server::SoftwareTotals{7, 2, 0};
+        };
+        io.totals.component_totals =
+            [this](std::string_view, std::string_view,
+                   const std::optional<std::vector<std::string>>&)
+            -> std::optional<yuzu::server::SoftwareTotals> {
+            if (!totals_ok)
+                return std::nullopt;
+            return yuzu::server::SoftwareTotals{9, 3, 2};
+        };
+        return io;
+    }
+};
+
+yuzu::server::mcp::McpServer::FleetReadFn sam21_scoped_gate(std::unordered_set<std::string> ids) {
+    return [ids = std::move(ids)](const httplib::Request&, httplib::Response&, const std::string&,
+                                  const std::string&) -> yuzu::server::authz::FleetReadGate {
+        return {true, ids};
+    };
+}
+
+nlohmann::json sam21_output_schema(McpTestServer& ts, const std::string& tool) {
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":7100})");
+    nlohmann::json schema;
+    for (const auto& t : nlohmann::json::parse(res->body)["result"]["tools"])
+        if (t["name"] == tool)
+            schema = t["outputSchema"];
+    REQUIRE(schema.is_object()); // a missing schema must fail here, never pass schema_violation vacuously
+    return schema;
+}
+
+const char* const kSam21Installs = "query_installed_software";
+const char* const kSam21Components = "query_software_components";
+constexpr const char* kSam21InstallArgs = R"({"name":"git"})";
+constexpr const char* kSam21ComponentArgs = R"({"name":"libfoo","kind":"library"})";
+
+yuzu::server::Execution sam21_run(const std::string& id, const std::string& owner,
+                                  const std::string& params_json) {
+    yuzu::server::Execution e;
+    e.id = id;
+    e.definition_id = std::string(ss21::kSyncDefinitionId);
+    e.status = "running";
+    e.dispatched_by = owner;
+    e.dispatched_at = 1'700'000'000;
+    e.agents_targeted = 5;
+    e.agents_success = 3;
+    e.agents_failure = 1;
+    e.parameter_values = params_json;
+    return e;
+}
+
+// The tracker reads behind get_software_sync_status.
+struct Sam21Status {
+    std::vector<yuzu::server::Execution> runs;
+    bool degraded{false};
+    bool unfiltered{false};
+    int reads{0};
+    void wire(McpTestServer& ts) {
+        ts.software_sync_status_fn_for_test =
+            [this](const std::string& id)
+            -> std::expected<std::optional<yuzu::server::Execution>, std::string> {
+            ++reads;
+            if (degraded)
+                return std::unexpected(std::string("pool exhausted"));
+            for (const auto& e : runs)
+                if (e.id == id)
+                    return std::optional<yuzu::server::Execution>(e);
+            return std::optional<yuzu::server::Execution>{};
+        };
+        ts.software_sync_unfiltered_fn_for_test = [this](const yuzu::server::auth::Session&) {
+            return unfiltered;
+        };
+    }
+};
+} // namespace
+
+
+TEST_CASE("MCP query_installed_software: structuredContent is the lookup core's body for a global and a "
+          "confined caller; both representations are kept",
+          "[mcp][inventory][software][sam21]") {
+    Sam21Reads fakes;
+    const auto rq = swl::parse_list_params(swl::Params{{"name", "git"}});
+    REQUIRE(rq);
+    for (const bool confined : {false, true}) {
+        INFO("confined=" << confined);
+        McpTestServer ts;
+        ts.software_lookup_reads_for_test = fakes.reads();
+        yuzu::server::authz::VisibleSet scope; // nullopt = the global caller
+        if (confined) {
+            scope = std::unordered_set<std::string>{"a1"};
+            ts.fleet_read_fn_for_test = sam21_scoped_gate({"a1"});
+        }
+        ts.start();
+
+        const auto body = mcp_tool_call(ts, kSam21Installs, kSam21InstallArgs);
+        REQUIRE(body.contains("result"));
+        const auto& result = body["result"];
+        const auto core = swl::lookup_installs(fakes.reads(), *rq, scope, true);
+        REQUIRE(core);
+        const auto& structured = result["structuredContent"];
+        CHECK(structured == swl::lookup_body(*core));
+
+        // The legacy representation: content[0].text is the bare rows ARRAY (never the object),
+        // equal row for row to structuredContent.software; the page flags ride at the top level.
+        const auto text = nlohmann::json::parse(result["content"][0]["text"].get<std::string>());
+        REQUIRE(text.is_array());
+        CHECK(text == structured["software"]);
+        CHECK(result["devices_omitted"] == 0);
+        CHECK(result["next_cursor"].is_null());
+        CHECK_FALSE(result.contains("result_truncated_by_cap"));
+        CHECK_FALSE(result.contains("audit_persisted"));
+
+        // The lookup fields and the totals rule (a confined caller never gets a fleet total).
+        REQUIRE_FALSE(structured["software"].empty());
+        const auto& row = structured["software"][0];
+        CHECK(row["agent_id"] == "a1");
+        CHECK(row["hostname"] == "host-a");
+        CHECK(row["last_seen"] == 1'700'000'500);
+        CHECK(row["status"] == "current");
+        CHECK(row["last_confirmed_at"] == 1'700'000'100);
+        CHECK(row["purl"] == "pkg:brew/git@1.0");
+        if (confined) {
+            CHECK(structured["count"] == 1);
+            CHECK(structured["totals"].is_null());
+            CHECK(structured["totals_omitted"] == "scope");
+        } else {
+            CHECK(structured["count"] == 2);
+            CHECK(structured["totals"]["installs"] == 10);
+            CHECK(structured["totals"]["devices"] == 4);
+            CHECK_FALSE(structured.contains("totals_omitted"));
+        }
+        // The other row (a2) has no roster entry: null, never "".
+        if (!confined)
+            CHECK(structured["software"][1]["hostname"].is_null());
+    }
+}
+
+TEST_CASE("MCP query_installed_software: the five original arguments return the original 14 fields "
+          "unchanged and an old cursor still resumes",
+          "[mcp][inventory][software][sam21]") {
+    Sam21Reads fakes;
+    McpTestServer ts;
+    ts.software_lookup_reads_for_test = fakes.reads();
+    ts.start();
+
+    const auto p1 = mcp_tool_call(ts, kSam21Installs, R"({"name":"git","limit":1})");
+    REQUIRE(p1.contains("result"));
+    const auto& row = p1["result"]["structuredContent"]["software"][0];
+    const auto& src = fakes.installs[0];
+    CHECK(row["agent_id"] == src.agent_id);
+    CHECK(row["name"] == src.entry.name);
+    CHECK(row["version"] == src.entry.version);
+    CHECK(row["publisher"] == src.entry.publisher);
+    CHECK(row["kind"] == src.entry.kind);
+    CHECK(row["ecosystem"] == src.entry.ecosystem);
+    CHECK(row["source"] == src.entry.source);
+    for (const char* empty : {"install_date", "epoch", "release", "arch", "signature_status",
+                              "distro_id", "distro_version"})
+        CHECK(row[empty] == "");
+    CHECK(p1["result"]["result_truncated_by_cap"] == true);
+
+    // A cursor in the format the pre-SAM-21 tool issued (bound to devices_fingerprint of the same
+    // filters) resumes after the first row.
+    const auto old = swl::parse_list_params(swl::Params{{"name", "git"}, {"limit", "1"}});
+    REQUIRE(old);
+    const std::string old_cursor = yuzu::server::software_catalogue::encode_devices_cursor(
+        {yuzu::server::SoftwareCursor{"git", "a1", 1}, 0},
+        yuzu::server::software_catalogue::devices_fingerprint(old->base.query));
+    const auto p2 = mcp_tool_call(
+        ts, kSam21Installs, R"({"name":"git","limit":1,"cursor":")" + old_cursor + R"("})");
+    REQUIRE(p2.contains("result"));
+    REQUIRE(p2["result"]["structuredContent"]["software"].size() == 1);
+    CHECK(p2["result"]["structuredContent"]["software"][0]["agent_id"] == "a2");
+
+    // The cursor this build issues resumes too, and the continuation is audited and tagged.
+    const auto issued = p1["result"]["next_cursor"].get<std::string>();
+    const auto p3 = mcp_tool_call(
+        ts, kSam21Installs, R"({"name":"git","limit":1,"cursor":")" + issued + R"("})");
+    CHECK(p3["result"]["structuredContent"]["software"][0]["agent_id"] == "a2");
+    CHECK(mcp_audit_details(ts, "mcp.query_installed_software|success") ==
+          std::vector<std::string>{"name=git", "name=git page=continuation",
+                                   "name=git page=continuation"});
+}
+
+TEST_CASE("MCP query_installed_software: the lookup filters reach the query; a wrongly typed or invalid "
+          "one is refused; unknown arguments, format, purl and vers are not read",
+          "[mcp][inventory][software][sam21]") {
+    Sam21Reads fakes;
+    McpTestServer ts;
+    ts.software_lookup_reads_for_test = fakes.reads();
+    ts.start();
+
+    const auto ok = mcp_tool_call(ts, kSam21Installs,
+                                  R"({"name":"gi","match":"prefix","q":"scm","kind":"package",)"
+                                  R"("ecosystem":"brew","source":"pkg_inventory.list",)"
+                                  R"("status":"current"})");
+    REQUIRE(ok.contains("result"));
+    CHECK(fakes.seen_installs.name == "gi");
+    CHECK(fakes.seen_installs.match == yuzu::server::NameMatch::kPrefix);
+    CHECK(fakes.seen_installs.q == "scm");
+    CHECK(fakes.seen_installs.kind == "package");
+    CHECK(fakes.seen_installs.ecosystem == "brew");
+    CHECK(fakes.seen_installs.source == "pkg_inventory.list");
+    CHECK(fakes.seen_installs.status == "current");
+
+    const auto ranged = mcp_tool_call(
+        ts, kSam21Installs, R"({"name":"git","version_min":"1.0","version_max":"1.5"})");
+    REQUIRE(ranged.contains("result"));
+    REQUIRE(fakes.seen_installs.versions.has_value());
+    CHECK(*fakes.seen_installs.versions == std::vector<std::string>{"1.0", "1.5"});
+
+    const int reads_before = fakes.page_reads;
+    for (const char* bad : {R"({"q":5})", R"({"kind":["package"]})", R"({"match":"regex"})",
+                            R"({"status":"bogus"})", R"({"version_min":2})",
+                            R"({"version_min":"1.0"})", // a range needs name with match=exact
+                            R"({"name":"git","version":"1.0","version_min":"1.0"})"}) {
+        INFO(bad);
+        const auto r = mcp_tool_call(ts, kSam21Installs, bad);
+        REQUIRE(r.contains("error"));
+        CHECK(r["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    }
+    CHECK(fakes.page_reads == reads_before); // refused before any store read
+
+    // Unknown names are ignored, as on the other read tools; format, purl and vers are never read.
+    for (const char* ignored : {R"({"nmae":"x"})", R"({"format":"csv"})",
+                                R"({"purl":"pkg:deb/debian/git@1"})", R"({"vers":"vers:generic/>=1"})"}) {
+        INFO(ignored);
+        const auto r = mcp_tool_call(ts, kSam21Installs, ignored);
+        REQUIRE(r.contains("result"));
+        CHECK(nlohmann::json::parse(r["result"]["content"][0]["text"].get<std::string>()).is_array());
+        CHECK(fakes.seen_installs.purl.empty());
+        CHECK_FALSE(fakes.seen_installs.versions.has_value());
+    }
+}
+
+TEST_CASE("MCP query_software_components: answers in the tool_result form with the lookup core's body; "
+          "strict input is refused before any read",
+          "[mcp][inventory][software][sam21]") {
+    Sam21Reads fakes;
+    const auto rq = swl::parse_components_params(swl::Params{{"name", "libfoo"}, {"kind", "library"}});
+    REQUIRE(rq);
+    for (const bool confined : {false, true}) {
+        INFO("confined=" << confined);
+        McpTestServer ts;
+        ts.software_lookup_reads_for_test = fakes.reads();
+        yuzu::server::authz::VisibleSet scope;
+        if (confined) {
+            scope = std::unordered_set<std::string>{"a1"};
+            ts.fleet_read_fn_for_test = sam21_scoped_gate({"a1"});
+        }
+        ts.start();
+        const auto body = mcp_tool_call(ts, kSam21Components, kSam21ComponentArgs);
+        REQUIRE(body.contains("result"));
+        const auto core = swl::lookup_components(fakes.reads(), *rq, scope, true);
+        REQUIRE(core);
+        const auto& result = body["result"];
+        // The tool_result form: content[0].text IS the object, and structuredContent is the same.
+        const auto text = nlohmann::json::parse(result["content"][0]["text"].get<std::string>());
+        CHECK(text.is_object());
+        CHECK(text == result["structuredContent"]);
+        CHECK(result["structuredContent"] == swl::lookup_body(*core));
+        CHECK(text["components"][0]["hostname"] == "host-a");
+        if (confined) {
+            CHECK(text["totals"].is_null());
+            CHECK(text["totals_omitted"] == "scope");
+        } else {
+            CHECK(text["totals"]["instances"] == 9);
+            CHECK(text["totals"]["devices_unconfirmed"] == 2);
+        }
+    }
+
+    McpTestServer ts;
+    ts.software_lookup_reads_for_test = fakes.reads();
+    ts.start();
+    const int reads_before = fakes.page_reads;
+    const std::string too_long = std::string(R"({"name":")") + std::string(2000, 'a') + R"("})";
+    for (const std::string& bad :
+         {std::string(R"({"nmae":"x"})"), too_long, std::string(R"({"format":"csv"})"),
+          std::string(R"({"vers":"vers:generic/>=1"})"), std::string(R"({"limit":0})"),
+          std::string(R"({"limit":"5"})"), std::string(R"({"kind":3})"),
+          std::string(R"({"match":"regex"})"), std::string(R"({"version_min":"1.0"})")}) {
+        INFO(bad.substr(0, 60));
+        const auto r = mcp_tool_call(ts, kSam21Components, bad);
+        REQUIRE(r.contains("error"));
+        CHECK(r["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    }
+    CHECK(fakes.page_reads == reads_before);
+}
+
+TEST_CASE("MCP lookup tools: a degraded page, facts or totals read is a retryable internal error with a "
+          "failure audit row; a continuation page is audited and tagged",
+          "[mcp][inventory][software][sam21]") {
+    struct Case {
+        const char* tool;
+        const char* args;
+        const char* target;
+    };
+    const std::vector<Case> tools = {{kSam21Installs, kSam21InstallArgs, "name=git"},
+                                     {kSam21Components, kSam21ComponentArgs,
+                                      "components:name=libfoo;kind=library"}};
+    struct Fault {
+        const char* what;
+        const char* detail;
+    };
+    for (const auto& c : tools) {
+        for (const Fault f : {Fault{"rows", "store degraded"}, Fault{"facts", "device facts degraded"},
+                              Fault{"totals", "totals degraded"}}) {
+            INFO(c.tool << " / " << f.what);
+            Sam21Reads fakes;
+            fakes.rows_ok = std::string(f.what) != "rows";
+            fakes.facts_ok = std::string(f.what) != "facts";
+            fakes.totals_ok = std::string(f.what) != "totals";
+            McpTestServer ts;
+            ts.software_lookup_reads_for_test = fakes.reads();
+            ts.start();
+            const auto r = mcp_tool_call(ts, c.tool, c.args);
+            REQUIRE(r.contains("error"));
+            CHECK_FALSE(r.contains("result")); // never an empty success
+            CHECK(r["error"]["code"] == yuzu::server::mcp::kInternalError);
+            CHECK(r["error"]["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpStoreFaultRetryMs);
+            CHECK(r["error"]["data"]["remediation"] == "retry the request");
+            CHECK(mcp_audit_details(ts, std::string("mcp.") + c.tool + "|failure") ==
+                  std::vector<std::string>{std::string(f.detail) + "; " + c.target});
+            CHECK(mcp_audits(ts, std::string("mcp.") + c.tool + "|success") == 0);
+        }
+    }
+
+    // A served first page and its continuation: one success row each, the second tagged.
+    for (const auto& c : std::vector<Case>{
+             {kSam21Installs, R"({"name":"git","limit":1})", "name=git"},
+             {kSam21Components, R"({"name":"libfoo","kind":"library","limit":1})",
+              "components:name=libfoo;kind=library"}}) {
+        INFO(c.tool);
+        Sam21Reads fakes;
+        McpTestServer ts;
+        ts.software_lookup_reads_for_test = fakes.reads();
+        ts.start();
+        const auto p1 = mcp_tool_call(ts, c.tool, c.args);
+        REQUIRE(p1.contains("result"));
+        const auto cursor = p1["result"]["structuredContent"]["next_cursor"];
+        REQUIRE(cursor.is_string());
+        auto args = nlohmann::json::parse(c.args);
+        args["cursor"] = cursor;
+        const auto p2 = mcp_tool_call(ts, c.tool, args.dump());
+        REQUIRE(p2.contains("result"));
+        CHECK(mcp_audit_details(ts, std::string("mcp.") + c.tool + "|success") ==
+              std::vector<std::string>{c.target, std::string(c.target) + " page=continuation"});
+    }
+}
+
+TEST_CASE("MCP lookup tools and the sync status tool: served bodies conform to the output schemas",
+          "[mcp][inventory][software][sam21]") {
+    Sam21Reads fakes;
+    Sam21Status rig;
+    rig.runs = {sam21_run("exec-1", "test-user", R"({"delay_max_s":120})")};
+    McpTestServer ts;
+    ts.software_lookup_reads_for_test = fakes.reads();
+    rig.wire(ts);
+    ts.start("operator");
+    const struct {
+        const char* tool;
+        const char* args;
+    } calls[] = {{kSam21Installs, kSam21InstallArgs},
+                 {kSam21Components, kSam21ComponentArgs},
+                 {"get_software_sync_status", R"({"execution_id":"exec-1"})"}};
+    for (const auto& c : calls) {
+        INFO(c.tool);
+        const auto schema = sam21_output_schema(ts, c.tool);
+        const auto r = mcp_tool_call(ts, c.tool, c.args);
+        REQUIRE(r.contains("result"));
+        CHECK(yuzu::test::schema_violation(schema, r["result"]["structuredContent"]) == "");
+    }
+    // An unscoped query (no totals; a continuation cursor present) conforms too.
+    const auto unscoped = mcp_tool_call(ts, kSam21Installs, R"({"limit":1})");
+    REQUIRE(unscoped.contains("result"));
+    CHECK(yuzu::test::schema_violation(sam21_output_schema(ts, kSam21Installs),
+                                       unscoped["result"]["structuredContent"]) == "");
+}
+
+TEST_CASE("MCP lookup tools: tools/list serves both new tools read-only with typed schemas; the sync tool "
+          "advertises confirm and the new result fields",
+          "[mcp][inventory][software][sam21]") {
+    McpTestServer ts;
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":7101})");
+    const auto tools = nlohmann::json::parse(res->body)["result"]["tools"];
+    int found = 0;
+    for (const auto& t : tools) {
+        const auto name = t["name"].get<std::string>();
+        if (name == kSam21Components || name == "get_software_sync_status") {
+            ++found;
+            CHECK(t["annotations"]["readOnlyHint"] == true);
+            CHECK(t["annotations"]["idempotentHint"] == true);
+            CHECK_FALSE(t["inputSchema"]["properties"].empty());
+            CHECK_FALSE(t["outputSchema"]["properties"].empty());
+            CHECK(t["inputSchema"]["additionalProperties"] == false);
+        }
+        if (name == kSam21Installs) {
+            const auto& in = t["inputSchema"]["properties"];
+            for (const char* key : {"q", "kind", "ecosystem", "source", "match", "status",
+                                    "version_min", "version_max"})
+                CHECK(in.contains(key));
+            CHECK_FALSE(in.contains("purl"));
+            CHECK_FALSE(in.contains("vers"));
+            CHECK_FALSE(in.contains("format"));
+            CHECK(in["match"].contains("enum"));
+            CHECK(in["status"].contains("enum"));
+            const auto& out = t["outputSchema"]["properties"];
+            for (const char* key : {"count", "totals", "totals_omitted"})
+                CHECK(out.contains(key));
+            for (const char* key : {"hostname", "last_seen", "status", "last_confirmed_at",
+                                    "install_type", "install_scope", "install_location",
+                                    "instance_key", "purl"})
+                CHECK(out["software"]["items"]["properties"].contains(key));
+        }
+        if (name == "sync_hardware_software") {
+            CHECK(t["inputSchema"]["properties"]["confirm"]["type"] == "boolean");
+            CHECK(t["inputSchema"]["properties"]["last_synced_before"]["type"] == "integer");
+            for (const char* key : {"skipped_fresh", "delay_max_s", "estimated_completion_at",
+                                    "joined", "execution_id"})
+                CHECK(t["outputSchema"]["properties"].contains(key));
+        }
+    }
+    CHECK(found == 2);
+}
+
+TEST_CASE("MCP lookup tools: a service-scoped token reaches both lookup tools confined; the sync status "
+          "tool refuses it at the generic gate",
+          "[mcp][inventory][software][security][service_scope][sam21]") {
+    Sam21Reads fakes;
+    Sam21Status rig;
+    rig.runs = {sam21_run("exec-1", "test-user", "{}")};
+    McpTestServer ts;
+    ts.mock_token_scope_service = "printers";
+    ts.software_lookup_reads_for_test = fakes.reads();
+    ts.fleet_read_fn_for_test = sam21_scoped_gate({"a1"});
+    rig.wire(ts);
+    ts.start("operator");
+
+    for (const auto& c : std::vector<std::pair<const char*, const char*>>{
+             {kSam21Installs, kSam21InstallArgs}, {kSam21Components, kSam21ComponentArgs}}) {
+        INFO(c.first);
+        const auto r = mcp_tool_call(ts, c.first, c.second);
+        REQUIRE(r.contains("result"));
+        const auto& sc = r["result"]["structuredContent"];
+        CHECK(sc["count"] == 1); // only its own device
+        CHECK(sc["totals"].is_null());
+        CHECK(sc["totals_omitted"] == "scope");
+    }
+    const auto status = mcp_tool_call(ts, "get_software_sync_status", R"({"execution_id":"exec-1"})");
+    REQUIRE(status.contains("error"));
+    CHECK(status["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    CHECK(rig.reads == 0); // refused before the handler ran
+}
+
+TEST_CASE("MCP get_software_sync_status: equals the REST status body for an owned run; every other run is "
+          "the same not-found",
+          "[mcp][software][sync_fanout][sam21]") {
+    Sam21Status rig;
+    rig.runs = {sam21_run("exec-1", "test-user", R"({"delay_max_s":120})"),
+                sam21_run("exec-2", "someone-else", "{}"), sam21_run("wf-1", "test-user", "{}")};
+    rig.runs[2].definition_id = "some.workflow";
+    McpTestServer ts;
+    rig.wire(ts);
+    ts.start("operator");
+
+    const auto ok = mcp_tool_call(ts, "get_software_sync_status", R"({"execution_id":"exec-1"})");
+    REQUIRE(ok.contains("result"));
+    yuzu::server::auth::Session session;
+    session.username = "test-user";
+    const auto expected = ss21::sync_status(
+        std::optional<yuzu::server::Execution>(rig.runs[0]),
+        yuzu::server::execution_owner_key(session).owns(rig.runs[0]), false);
+    REQUIRE(expected);
+    const auto& result = ok["result"];
+    CHECK(result["structuredContent"] == *expected);
+    CHECK(nlohmann::json::parse(result["content"][0]["text"].get<std::string>()) == *expected);
+    CHECK(result["structuredContent"]["targeted"] == 5);
+    CHECK(result["structuredContent"]["acknowledged"] == 3);
+    CHECK(result["structuredContent"]["failed"] == 1);
+    CHECK(result["structuredContent"]["estimated_completion_at"] == 1'700'000'120);
+    CHECK(mcp_audit_details(ts, "mcp.get_software_sync_status|success") ==
+          std::vector<std::string>{"execution=exec-1"});
+
+    // Another caller's run, a non-sync execution and an unknown id answer the same error.
+    std::vector<nlohmann::json> refusals;
+    for (const char* id : {"exec-2", "wf-1", "exec-404"}) {
+        const auto r = mcp_tool_call(ts, "get_software_sync_status",
+                                     std::string(R"({"execution_id":")") + id + R"("})");
+        REQUIRE(r.contains("error"));
+        CHECK(r["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(r["error"]["message"] == "sync run not found");
+        refusals.push_back(r["error"]["message"]);
+    }
+    CHECK(refusals[0] == refusals[1]);
+    CHECK(refusals[1] == refusals[2]);
+
+    // A caller whose Execution:Execute is unfiltered reads any SYNC run, never another kind.
+    rig.unfiltered = true;
+    CHECK(mcp_tool_call(ts, "get_software_sync_status", R"({"execution_id":"exec-2"})")
+              .contains("result"));
+    CHECK(mcp_tool_call(ts, "get_software_sync_status", R"({"execution_id":"wf-1"})")
+              .contains("error"));
+}
+
+TEST_CASE("MCP get_software_sync_status: a tracker failure is retryable; an unwired tracker is too; "
+          "malformed arguments are refused before any read",
+          "[mcp][software][sync_fanout][sam21]") {
+    {
+        Sam21Status rig;
+        rig.runs = {sam21_run("exec-1", "test-user", "{}")};
+        rig.degraded = true;
+        McpTestServer ts;
+        rig.wire(ts);
+        ts.start("operator");
+        const auto r = mcp_tool_call(ts, "get_software_sync_status", R"({"execution_id":"exec-1"})");
+        REQUIRE(r.contains("error"));
+        CHECK(r["error"]["code"] == yuzu::server::mcp::kInternalError);
+        CHECK(r["error"]["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpStoreFaultRetryMs);
+    }
+    {
+        McpTestServer ts; // no tracker closures wired
+        ts.start("operator");
+        const auto r = mcp_tool_call(ts, "get_software_sync_status", R"({"execution_id":"exec-1"})");
+        REQUIRE(r.contains("error"));
+        CHECK(r["error"]["code"] == yuzu::server::mcp::kInternalError);
+        CHECK(r["error"]["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpStoreFaultRetryMs);
+    }
+    {
+        Sam21Status rig;
+        rig.runs = {sam21_run("exec-1", "test-user", "{}")};
+        McpTestServer ts;
+        rig.wire(ts);
+        ts.start("operator");
+        for (const std::string& bad :
+             {std::string("{}"), std::string(R"({"execution_id":""})"),
+              std::string(R"({"execution_id":5})"), std::string(R"({"execution_id":"a/b"})"),
+              std::string(R"({"execution_id":")") + std::string(129, 'a') + R"("})",
+              std::string(R"({"execution_id":"exec-1","extra":1})")}) {
+            INFO(bad.substr(0, 60));
+            const auto r = mcp_tool_call(ts, "get_software_sync_status", bad);
+            REQUIRE(r.contains("error"));
+            CHECK(r["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        }
+        CHECK(rig.reads == 0);
+    }
+}
+
+TEST_CASE("MCP get_software_sync_status: the Execution:Execute permission is enforced by the handler; a "
+          "supervised-tier token reads with no approval ticket",
+          "[mcp][software][sync_fanout][security][sam21]") {
+    {
+        // The row is Execution:Read, so the generic gate lets a read through; what refuses a caller
+        // without Execution:Execute (a readonly-tier token included, as the production permission
+        // gate mirrors the tier) is the handler's own perm_fn(Execution, Execute) call.
+        Sam21Status rig;
+        rig.runs = {sam21_run("exec-1", "test-user", "{}")};
+        McpTestServer ts;
+        rig.wire(ts);
+        ts.perm_override_for_test = [](const std::string& securable, const std::string& op) {
+            return !(securable == "Execution" && op == "Execute");
+        };
+        ts.start("readonly");
+        auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":7,"params":)"
+                           R"({"name":"get_software_sync_status","arguments":{"execution_id":"exec-1"}}})");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(res->body.find("exec-1") == std::string::npos);
+        CHECK(rig.reads == 0);
+    }
+    {
+        Sam21Status rig;
+        rig.runs = {sam21_run("exec-1", "test-user", "{}")};
+        McpTestServer ts;
+        rig.wire(ts);
+        ts.start("supervised");
+        const auto r = mcp_tool_call(ts, "get_software_sync_status", R"({"execution_id":"exec-1"})");
+        // A read: served, no approval_required, no ticket minted.
+        REQUIRE(r.contains("result"));
+        CHECK_FALSE(r.contains("error"));
+        CHECK(r["result"]["structuredContent"]["execution_id"] == "exec-1");
+    }
+}
+
+TEST_CASE("MCP sync_hardware_software: confirm and last_synced_before are advertised and accepted; the "
+          "served result conforms to the output schema, a joined one included",
+          "[mcp][integration][sync_fanout][sam21]") {
+    namespace ss = yuzu::server::software_sync;
+    int dispatches = 0;
+    std::vector<std::string> dispatched;
+    ss::Env env;
+    env.resolve = [](const yuzu::server::auth::Session&, const ss::Selector&) {
+        ss::Resolved r;
+        r.status = ss::Resolved::Status::Ok;
+        r.caller_unfiltered = true;
+        r.ids = {"d0", "d1"};
+        return r;
+    };
+    env.dispatch = [&](const yuzu::server::auth::Session&, const std::vector<std::string>& ids,
+                       std::int64_t, const std::string&) {
+        ++dispatches;
+        dispatched = ids;
+        return ss::DispatchResult{ids.size(), "__sync__-sam21"};
+    };
+    env.caller_unfiltered = [](const yuzu::server::auth::Session&) { return true; };
+    env.fleet_admin = [](const yuzu::server::auth::Session&) { return true; };
+    env.agent_version = [](const std::string&) { return std::optional<std::string>("0.13.1"); };
+    // d0 last reported at 100 (older than the cut), d1 at 300 (fresher): only d0 is asked.
+    env.last_seen = [](const std::vector<std::string>& ids)
+        -> std::optional<std::unordered_map<std::string, std::int64_t>> {
+        std::unordered_map<std::string, std::int64_t> out;
+        for (const auto& id : ids)
+            out[id] = id == "d0" ? 100 : 300;
+        return out;
+    };
+    env.now = [] { return std::int64_t{1'700'000'000}; }; // a fixed clock: the run is still spreading
+    env.track.create = [](const yuzu::server::auth::Session&, const ss::Selector&, std::int64_t) {
+        return std::string("exec-1");
+    };
+    env.track.set_targeted = [](const std::string&, std::size_t) {};
+    env.track.cancel = [](const std::string&, const yuzu::server::auth::Session&) {};
+    McpTestServer ts;
+    ts.software_sync_runner_for_test = std::make_shared<ss::Runner>(std::move(env));
+    ts.start("");
+    const auto schema = sam21_output_schema(ts, "sync_hardware_software");
+
+    const auto first = mcp_tool_call(ts, "sync_hardware_software",
+                                     R"({"scope":"group:g","confirm":true,"last_synced_before":200})");
+    REQUIRE(first.contains("result"));
+    const auto& sc = first["result"]["structuredContent"];
+    CHECK(sc["requested"] == 2);
+    CHECK(sc["skipped_fresh"] == 1);
+    CHECK(sc["agents_reached"] == 1);
+    CHECK(sc["joined"] == false);
+    CHECK(sc["execution_id"] == "exec-1");
+    CHECK(dispatched == std::vector<std::string>{"d0"});
+    CHECK(yuzu::test::schema_violation(schema, sc) == "");
+
+    // The same request while the run still spreads joins it: the same answer, nothing sent again.
+    const auto joined = mcp_tool_call(ts, "sync_hardware_software",
+                                      R"({"scope":"group:g","confirm":true,"last_synced_before":200})");
+    REQUIRE(joined.contains("result"));
+    CHECK(joined["result"]["structuredContent"]["joined"] == true);
+    CHECK(yuzu::test::schema_violation(schema, joined["result"]["structuredContent"]) == "");
+    CHECK(dispatches == 1);
+
+    // A group run keeps the generic verb (only a whole-fleet run has its own).
+    REQUIRE_FALSE(ts.audit_log.empty());
+    CHECK(ts.audit_log.front() == "inventory.sync.request|requested");
+
+    // A group without confirm is refused naming the confirmation; a bad last_synced_before is invalid.
+    const auto unconfirmed = mcp_tool_call(ts, "sync_hardware_software", R"({"scope":"group:other"})");
+    REQUIRE(unconfirmed.contains("error"));
+    CHECK(unconfirmed["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(unconfirmed["error"]["message"].get<std::string>().find("confirm") != std::string::npos);
+    const auto bad_before = mcp_tool_call(
+        ts, "sync_hardware_software", R"({"scope":"host-01","last_synced_before":-1})");
+    REQUIRE(bad_before.contains("error"));
+    CHECK(bad_before["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+}
+
+TEST_CASE("MCP sync_hardware_software: a whole-fleet run writes its pre-dispatch row under the fleet verb "
+          "and is refused when that row cannot be stored",
+          "[mcp][integration][sync_fanout][security][sam21]") {
+    {
+        SyncToolRig rig;
+        McpTestServer ts;
+        ts.software_sync_runner_for_test = rig.runner();
+        ts.start("");
+        const auto r = mcp_tool_call(ts, "sync_hardware_software", R"({"scope":"__all__","confirm":true})");
+        REQUIRE(r.contains("result"));
+        CHECK(mcp_audits(ts, "software_estate.sync.fleet_wide|requested") == 1);
+        CHECK(mcp_audits(ts, "inventory.sync.request|requested") == 0);
+        CHECK(rig.dispatches == 1);
+    }
+    {
+        SyncToolRig rig;
+        McpTestServer ts;
+        ts.software_sync_runner_for_test = rig.runner();
+        ts.audit_fail_action_result_ = "software_estate.sync.fleet_wide|requested";
+        ts.start("");
+        const auto r = mcp_tool_call(ts, "sync_hardware_software", R"({"scope":"__all__","confirm":true})");
+        REQUIRE(r.contains("error"));
+        CHECK(r["error"]["code"] == yuzu::server::mcp::kInternalError);
+        CHECK(r["error"]["data"]["retry_after_ms"].get<int>() > 0);
+        CHECK(rig.dispatches == 0); // nothing sent when the row could not be stored
+    }
 }
