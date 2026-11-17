@@ -259,7 +259,7 @@ proc|1|sh
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/processes/src/processes_plugin.cpp`
+- Plugin: `agents/plugins/processes/src/processes_plugin.cpp` · `agents/plugins/processes/src/processes_rows.hpp`
 - Definitions: `content/definitions/processes.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_b.hpp`
 - Tests: none found by name

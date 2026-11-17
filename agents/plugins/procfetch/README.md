@@ -143,7 +143,7 @@ This plugin does not set a typed result status; the agent records `UNDECLARED` a
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/procfetch/src/procfetch_plugin.cpp`
+- Plugin: `agents/plugins/procfetch/src/procfetch_plugin.cpp` · `agents/plugins/procfetch/src/procfetch_row.hpp`
 - Definitions: `content/definitions/procfetch.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_b.hpp`
 - Tests: none found by name

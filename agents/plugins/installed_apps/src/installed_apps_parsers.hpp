@@ -612,4 +612,35 @@ inline std::string list_field(std::string_view v) {
     return out;
 }
 
+// `app|name|version|publisher` -- the `query` action's row. Every field goes through
+// detail::list_field (CWE-93 / #5208 style: a name, version or publisher carrying
+// '|', CR, LF or NUL cannot forge columns or rows); empty version/publisher
+// render "-" as before. The caller applies sanitize_utf8 to the result.
+[[nodiscard]] inline std::string format_query_row(std::string_view name, std::string_view version,
+                                                  std::string_view publisher) {
+    std::string out = "app|";
+    out += detail::list_field(name);
+    out += '|';
+    out += detail::list_field(version);
+    out += '|';
+    out += detail::list_field(publisher);
+    return out;
+}
+
+// `user_app|username|name|version|publisher|install_date` -- the `list_per_user`
+// row. The fields come from each user's own (user-writable) registry hive, so every
+// one goes through detail::list_field: always exactly six escape-aware tokens.
+[[nodiscard]] inline std::string format_user_app_row(std::string_view username,
+                                                     std::string_view name,
+                                                     std::string_view version,
+                                                     std::string_view publisher,
+                                                     std::string_view install_date) {
+    std::string out = "user_app";
+    for (const auto v : {username, name, version, publisher, install_date}) {
+        out += '|';
+        out += detail::list_field(v);
+    }
+    return out;
+}
+
 } // namespace yuzu::installed_apps::parsers

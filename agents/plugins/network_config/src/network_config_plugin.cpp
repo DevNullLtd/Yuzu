@@ -1184,13 +1184,13 @@ int do_proxy(yuzu::CommandContext& ctx) {
         if (proxy_cfg.lpszAutoConfigUrl) {
             ctx.write_output(std::format("proxy_type|pac"));
             ctx.write_output(
-                std::format("proxy_address|{}", from_wide(proxy_cfg.lpszAutoConfigUrl)));
+                yuzu::network_config::format_proxy_address_row(from_wide(proxy_cfg.lpszAutoConfigUrl)));
             GlobalFree(proxy_cfg.lpszAutoConfigUrl);
         }
         if (proxy_cfg.lpszProxy) {
             auto proxy = from_wide(proxy_cfg.lpszProxy);
             ctx.write_output(std::format("proxy_type|http"));
-            ctx.write_output(std::format("proxy_address|{}", proxy));
+            ctx.write_output(yuzu::network_config::format_proxy_address_row(proxy));
             GlobalFree(proxy_cfg.lpszProxy);
         }
         if (proxy_cfg.lpszProxyBypass) {
@@ -1219,7 +1219,7 @@ int do_proxy(yuzu::CommandContext& ctx) {
                 ctx.write_output(std::format("bypass|{}", val));
             } else {
                 ctx.write_output(std::format("proxy_type|{}", var));
-                ctx.write_output(std::format("proxy_address|{}", val));
+                ctx.write_output(yuzu::network_config::format_proxy_address_row(val));
             }
             found = true;
         }
@@ -1329,7 +1329,7 @@ int do_proxy(yuzu::CommandContext& ctx) {
         const auto choice = yuzu::network_config::select_proxy(candidates);
         if (choice.found) {
             ctx.write_output(std::format("proxy_type|{}", choice.type));
-            ctx.write_output(std::format("proxy_address|{}", choice.address));
+            ctx.write_output(yuzu::network_config::format_proxy_address_row(choice.address));
             emitted = true;
         }
 

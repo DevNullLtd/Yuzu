@@ -395,7 +395,8 @@
       "content/definitions/wmi.yaml"
     ],
     "plugin": [
-      "agents/plugins/wmi/src/wmi_plugin.cpp"
+      "agents/plugins/wmi/src/wmi_plugin.cpp",
+      "agents/plugins/wmi/src/wmi_rows.hpp"
     ],
     "privilege_row": false,
     "tests": [

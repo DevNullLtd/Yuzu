@@ -283,7 +283,7 @@ spec:
         platforms: [windows, linux, darwin]
       - name: proxy_address
         type: string
-        description: "The proxy host:port (http), the PAC URL (pac), or the raw environment-variable value (Linux). Row is omitted entirely when proxy_type is none/auto_detect. Values: 'host:port', a URL, or a raw environment-variable value."
+        description: "The proxy host:port (http), the PAC URL (pac), or the environment-variable value (Linux), credential-scrubbed: any URL userinfo (user:password@) is replaced with REDACTED@ before the row leaves the endpoint. Row is omitted entirely when proxy_type is none/auto_detect. Values: 'host:port', or a URL with any userinfo replaced by REDACTED@."
         example: "not observed in the captured samples — omitted whenever proxy_type is none or auto_detect"
         platforms: [windows, linux, darwin]
       - name: bypass

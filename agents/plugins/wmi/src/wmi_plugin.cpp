@@ -14,6 +14,8 @@
 #include <string>
 #include <string_view>
 
+#include "wmi_rows.hpp"
+
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -157,7 +159,7 @@ private:
         int row = 0;
         for (const auto& r : qres.rows) {
             for (const auto& [k, v] : r)
-                ctx.write_output(std::format("row{}|{}|{}", row, k, v));
+                ctx.write_output(yuzu::wmi::format_row_line(row, k, v));
             ++row;
         }
         if (qres.truncated) {
@@ -200,7 +202,7 @@ private:
         }
         if (!qres.rows.empty()) {
             for (const auto& [k, v] : qres.rows.front())
-                ctx.write_output(std::format("property|{}|{}", k, v));
+                ctx.write_output(yuzu::wmi::format_property_line(k, v));
         }
         return 0;
     }

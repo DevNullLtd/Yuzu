@@ -589,7 +589,8 @@
       "content/definitions/processes.yaml"
     ],
     "plugin": [
-      "agents/plugins/processes/src/processes_plugin.cpp"
+      "agents/plugins/processes/src/processes_plugin.cpp",
+      "agents/plugins/processes/src/processes_rows.hpp"
     ],
     "privilege_row": true,
     "tests": []

@@ -84,7 +84,20 @@
 #include <netinet/in.h>
 #endif
 
+#include <uri_userinfo_redact.hpp> // yuzu::shared::redact_proxy_value
+#include <yuzu/string_utils.hpp>    // safe_output_field
+
 namespace yuzu::network_config {
+
+/// One `proxy_address|<value>` row. The value is an endpoint-supplied proxy
+/// setting (an `*_proxy` environment variable, WinHTTP proxy string, PAC URL),
+/// which conventionally carries `user:password@` userinfo: the credential is
+/// replaced with `REDACTED@` BEFORE the row is built, then the value goes
+/// through safe_output_field so a '|', CR or LF cannot forge columns or rows.
+[[nodiscard]] inline std::string format_proxy_address_row(std::string_view raw) {
+    return "proxy_address|" +
+           yuzu::util::safe_output_field(yuzu::shared::redact_proxy_value(raw));
+}
 
 // ── /proc/net/arp (Linux arp leg) ────────────────────────────────────────
 

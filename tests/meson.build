@@ -268,6 +268,7 @@ agent_test_exe = executable(
     'unit/test_updater.cpp',
     'unit/test_filesystem_read.cpp',
     'unit/test_filesystem_actions.cpp',
+    'unit/test_plugin_row_neutralisation.cpp',  # WP11: pipe/CR/LF in endpoint-derived fields cannot forge rows (filesystem, installed_apps, processes, procfetch, wmi, network_config proxy redaction)
     'unit/test_filesystem_local_dispatcher.cpp', # #4728: real filesystem plugin via LocalDispatcher -- `replace` through the shared atomic write
     'unit/test_filesystem_find_by_hash.cpp',  # #5624: pure find_by_hash walk core (limits, injected clock/cancel/hasher) + real no-follow fd hasher over TempDir
     'unit/test_filesystem_find_by_hash_dispatcher.cpp',  # #5624: real filesystem plugin via LocalDispatcher -- byte-identical clean output, trailer + CONSTRAINED/PARTIAL
@@ -727,6 +728,9 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/wol/src'),             # wol_check_plan.hpp (Wave 2 WP-E)
     include_directories('../agents/plugins/discovery/src'),      # discovery_parsers.hpp (Wave 2 WP-C pure parser)
     include_directories('../agents/plugins/network_config/src'), # network_config_parsers.hpp (PKG-NC pure parser)
+    include_directories('../agents/plugins/wmi/src'),            # wmi_rows.hpp (WP11 pure row formatters)
+    include_directories('../agents/plugins/procfetch/src'),      # procfetch_row.hpp (WP11 pure row formatter)
+    include_directories('../agents/plugins/processes/src'),      # processes_rows.hpp (WP11 pure query-row formatter)
     include_directories('../agents/plugins/os_info/src'),        # os_info_macos.hpp (Wave 3 PR3.1 pure plist parser)
     include_directories('../agents/plugins/device_identity/src'), # device_identity_macos.hpp (Wave 3 PR3.2 pure parser)
     include_directories('../agents/plugins/netstat/src'),        # netstat_parsers.hpp (gate-2 remediation pure parser)

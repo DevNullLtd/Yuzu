@@ -883,7 +883,7 @@ private:
                 entry_type = "symlink";
             }
 
-            ctx.write_output(std::format("entry|{}|{}|{}", entry_name, entry_type, entry_size));
+            ctx.write_output(std::format("entry|{}|{}|{}", yuzu::filesystem::acl::row_field(entry_name), entry_type, entry_size));
             ++count;
         }
 
@@ -1716,7 +1716,7 @@ private:
 
             if (matched) {
                 auto type_str = is_dir ? "directory" : "file";
-                ctx.write_output(std::format("result|{}|{}", entry_path, type_str));
+                ctx.write_output(std::format("result|{}|{}", yuzu::filesystem::acl::row_field(entry_path), type_str));
                 ++found_count;
             }
         }
@@ -1794,7 +1794,7 @@ private:
 
             auto emit = [&](const char* key, const wchar_t* name) {
                 auto val = query_string(name);
-                if (!val.empty()) ctx.write_output(std::format("{}|{}", key, val));
+                if (!val.empty()) ctx.write_output(std::format("{}|{}", key, yuzu::filesystem::acl::row_field(val)));
             };
 
             emit("company_name", L"CompanyName");

@@ -1063,8 +1063,7 @@ int do_query(yuzu::CommandContext& ctx, yuzu::Params params) {
                 found = true;
             }
             ctx.write_output(yuzu::util::sanitize_utf8(
-                std::format("app|{}|{}|{}", app.name, app.version.empty() ? "-" : app.version,
-                            app.publisher.empty() ? "-" : app.publisher)));
+                parsers::format_query_row(app.name, app.version, app.publisher)));
         }
     }
 
@@ -1248,10 +1247,8 @@ private:
                 // registry list_profiles case, where a leading tag caused the
                 // hp-B1 column shift. Do not strip it.
                 ctx.write_output(yuzu::util::sanitize_utf8(
-                    std::format("user_app|{}|{}|{}|{}|{}", username,
-                                app.name, app.version.empty() ? "-" : app.version,
-                                app.publisher.empty() ? "-" : app.publisher,
-                                app.install_date.empty() ? "-" : app.install_date)));
+                    parsers::format_user_app_row(username, app.name, app.version, app.publisher,
+                                                 app.install_date)));
             }
         }
 

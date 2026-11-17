@@ -269,7 +269,8 @@
       "content/definitions/procfetch.yaml"
     ],
     "plugin": [
-      "agents/plugins/procfetch/src/procfetch_plugin.cpp"
+      "agents/plugins/procfetch/src/procfetch_plugin.cpp",
+      "agents/plugins/procfetch/src/procfetch_row.hpp"
     ],
     "privilege_row": false,
     "tests": []
