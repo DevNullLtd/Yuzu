@@ -140,6 +140,7 @@ port|22|false|No listening service on this port
 - Plugin: `agents/plugins/ioc/src/ioc_plugin.cpp`
 - Definitions: `content/definitions/ioc.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_d.hpp`
-- Tests: none found by name
+- Tests: `tests/unit/test_ioc_domain_cap.cpp`
 - Privilege row: `docs/agent-privilege-model.md` (no row yet)
+- Changelog: `changelog.d/wp12-ioc-domain-cap.fixed.md`
 <!-- END GENERATED -->

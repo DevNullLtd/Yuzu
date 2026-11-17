@@ -318,7 +318,9 @@
     "capability_rows": [
       "server/core/src/capability_decls/plugin_action_catalogue_d.hpp"
     ],
-    "changelog": [],
+    "changelog": [
+      "changelog.d/wp12-ioc-domain-cap.fixed.md"
+    ],
     "definitions": [
       "content/definitions/ioc.yaml"
     ],
@@ -326,7 +328,9 @@
       "agents/plugins/ioc/src/ioc_plugin.cpp"
     ],
     "privilege_row": false,
-    "tests": []
+    "tests": [
+      "tests/unit/test_ioc_domain_cap.cpp"
+    ]
   },
   "version": "1.0.0",
   "where_the_data_goes": [
