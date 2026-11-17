@@ -2885,6 +2885,11 @@ public:
                           "Agents whose Echo database has ever been quarantined as corrupt "
                           "(cumulative per agent since install; a rising value is the signal)",
                           "gauge");
+        metrics_.describe("yuzu_fleet_echo_storage_offline",
+                          "Agents whose Echo database is offline and being retried, by reason "
+                          "(free_space, migration_failed, open_failed; anything else sums under "
+                          "unknown). Published for every reason each sweep, 0 included",
+                          "gauge");
         metrics_.describe("yuzu_fleet_plugin_init_failed",
                           "Agents reporting a plugin that failed init, by plugin name (absent "
                           "when none). The label is bounded to the server's plugin catalogue: a "
@@ -6303,6 +6308,20 @@ public:
                     "/api/v1/plugin-config/remote_access_audit/kill-switch")) {
                 spdlog::error(
                     "[PG] Refusing to start: remote_access_audit default-off kill-switch "
+                    "seed failed");
+                startup_failed_ = true;
+            }
+        }
+
+        // process_introspect ships default-off (Forensics class, like remote_access_audit);
+        // enable via PUT /api/v1/plugin-config/process_introspect/kill-switch.
+        if (plugin_config_store_ && !startup_failed_) {
+            if (!plugin_config_store_->seed_kill_switch_default_off(
+                    "process_introspect",
+                    "default-off: forensics class; enable per PUT "
+                    "/api/v1/plugin-config/process_introspect/kill-switch")) {
+                spdlog::error(
+                    "[PG] Refusing to start: process_introspect default-off kill-switch "
                     "seed failed");
                 startup_failed_ = true;
             }
