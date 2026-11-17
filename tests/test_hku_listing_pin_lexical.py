@@ -12,6 +12,11 @@ Echo start-up sweep is pinned by test_echo_mapdrive_pin_lexical.py. For each cal
   2. After each call, `hku.error.empty()` appears before the first `hku.names`: the names are never
      read before the listing is known to be complete.
   3. The failure token `hku_list_incomplete` appears after each call, before the next call.
+  4. Polarity: a refusal-first caller (`!hku.error.empty()`) reports the token before it reads
+     the names; a success-first caller (`hku.error.empty()`) reads the names before the token,
+     which then belongs to its else arm. A flipped condition breaks one of the two orders.
+  5. Terminal outcome: a refusal-first caller in RETURNS leaves the function (`return`) between
+     the check and the first read of the names.
 
 Robustness: `//` and `/* */` comments are blanked (string and character literals are kept) and
 whitespace is collapsed, so a commented-out check cannot satisfy a pin. Lexical only: it cannot
@@ -36,6 +41,12 @@ EXPECTED = {  # file -> number of calls
     "agents/plugins/autoruns/src/autoruns_win.cpp": 1,
     "agents/plugins/privacy_permissions/src/privacy_permissions_win.cpp": 1,
     "agents/plugins/echo/src/echo_mapdrive_collector.cpp": 1,
+}
+RETURNS = {  # callers whose refusal arm ends the function before the names are read
+    "agents/plugins/registry/src/registry_win.cpp",
+    "agents/plugins/installed_apps/src/installed_apps_plugin.cpp",
+    "agents/plugins/license_scan/src/licensing_win.cpp",
+    "agents/plugins/echo/src/echo_mapdrive_collector.cpp",
 }
 ELSEWHERE = {  # the definition, and the sweep (test_echo_mapdrive_pin_lexical.py)
     "agents/shared/win_profiles.hpp",
@@ -66,6 +77,18 @@ def problems(rel, src):
             out.append(f"{rel}: call {i} must test {CHECK} before it reads hku.names")
         if TOKEN not in window:
             out.append(f"{rel}: call {i} must report {TOKEN} on a failed listing")
+            continue
+        tok = window.find(TOKEN)
+        if err < 0 or names < 0:
+            continue
+        negated = err > 0 and window[err - 1] == "!"
+        if negated and tok > names:
+            out.append(f"{rel}: call {i} must report {TOKEN} before it reads hku.names")
+        if not negated and tok < names:
+            out.append(f"{rel}: call {i} tests {CHECK} first, so it must read hku.names before"
+                       f" the {TOKEN} arm")
+        if negated and rel in RETURNS and "return" not in window[err:names]:
+            out.append(f"{rel}: call {i} must return before it reads hku.names on a failed listing")
     return out
 
 
@@ -107,6 +130,13 @@ class HkuListingPin(unittest.TestCase):
                 "names read before the check": mutate(src, CALL + ";", CALL + "; (void)hku.names;",
                                                       "first"),
             }
+            neg = "!" + CHECK
+            cases["polarity flipped"] = (mutate(src, neg, CHECK) if neg in src
+                                         else mutate(src, CHECK, neg))
+            if rel in RETURNS:
+                i = src.index(CALL)
+                cases["refusal does not return"] = (src[:i]
+                                                    + mutate(src[i:], "return", "(void)0", "first"))
             if calls > 1:  # one call alone loses its check (or its token)
                 cases["first call's check removed"] = mutate(src, CHECK, "true", "first")
                 cases["last call's check removed"] = mutate(src, CHECK, "true", "last")
