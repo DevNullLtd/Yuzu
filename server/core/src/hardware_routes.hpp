@@ -25,6 +25,7 @@
 #include "command_capability.hpp"    // CommandCapability, ClassificationError
 #include "device_containment_render.hpp" // kContainmentUi
 #include "dex_routes.hpp"            // DexAgentResponse (ResponsesFn return type)
+#include "execution_tracker.hpp"     // Execution (the sync status read)
 #include "forensics_visibility.hpp"  // ForensicsVisibilityFn (#4990)
 #include "hardware_action_form.hpp"  // ActionFormSpec
 #include "hardware_ci_page_model.hpp" // hardware_ci_page::Reader (the bulk CI page)
@@ -322,6 +323,13 @@ public:
     using SyncPermFn = std::function<bool(const httplib::Request&, httplib::Response&,
                                           const std::string& securable_type,
                                           const std::string& operation)>;
+    /// One tracker row by id for `GET /api/v1/hardware/sync/{execution_id}`: `unexpected` = the read
+    /// degraded (the route answers a retryable 503); an empty optional = no such execution.
+    using SyncStatusFn = std::function<std::expected<std::optional<Execution>, std::string>(
+        const std::string& execution_id)>;
+    /// Does the session hold an unfiltered Execution:Execute (it may read any sync run, not only
+    /// its own)? Empty answers no.
+    using SyncUnfilteredFn = std::function<bool(const auth::Session&)>;
     struct Deps {
         AuthFn auth_fn;
         ScopedPermFn scoped_perm_fn;
@@ -355,14 +363,21 @@ public:
         bool containment_ui{kContainmentUi};
         /// POST /api/v1/hardware/sync — the Software page's fleet/group/scope "Sync now".
         /// `sync_perm_fn` is the type-level Execution:Execute gate (it writes the 401/403).
-        /// `sync_runner` is the fleet run (resolve, cap, cooldown, in-flight lease, audit, send).
+        /// `sync_runner` is the run (confirmation, key state and join, resolve, pacing admission,
+        /// cooldown, audit, send).
         /// `sync_perm_fn`, `auth_fn` or `sync_runner` empty == the route answers an AUDITED 500
         /// (result=failure, nothing sent): a missing derivation is a misconfiguration, not an
         /// outage.
         SyncPermFn sync_perm_fn;
-        /// Shared with the MCP tool `sync_hardware_software` so the per-operator cooldown and
-        /// the single in-flight slot bind BOTH surfaces: production wires one instance into both.
+        /// Shared with the MCP tool `sync_hardware_software` so the run keys, the joins, the
+        /// cooldown and the pacing ledger bind BOTH surfaces: production wires one instance into
+        /// both.
         std::shared_ptr<software_sync::Runner> sync_runner;
+        /// GET /api/v1/hardware/sync/{execution_id}: the tracker read and the "may this caller read
+        /// every sync run" answer. An empty `sync_status_fn` == 503 (never an empty 200); an empty
+        /// `sync_unfiltered_fn` == nobody is unfiltered (a caller reads only the runs it started).
+        SyncStatusFn sync_status_fn;
+        SyncUnfilteredFn sync_unfiltered_fn;
         /// Same-site gate for the cookie-authorised sync POSTs (both the fleet and the
         /// per-device route). Unwired fails closed: a header-less request is refused.
         WriteGate write_gate;

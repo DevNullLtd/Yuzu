@@ -100,6 +100,7 @@
 #include "grpc_on_behalf_interceptor.hpp"
 #include "guardian_arm_fleet_tags.hpp" // Guardian arm-ledger fleet gauge names + HELP (rung 9c PR-3)
 #include "guardian_backend_fleet_tags.hpp" // yuzu.guardian_backend fleet gauge names + HELP (#2240)
+#include "guardian_baseline_fleet_tags.hpp" // Guardian baseline-persistence fleet gauge names + HELP (#5605)
 #include "guardian_health_fleet_tags.hpp" // Guardian M1 health-stream fleet gauge names + HELP (#2298 item 6d)
 #include "guardian_io_ceiling_fleet_tags.hpp" // Guardian io-ceiling fleet gauge names + HELP (rung 9c PR-3)
 #include "guardian_journal_fleet_tags.hpp" // Guardian journal fleet gauge names + HELP (#2298)
@@ -127,6 +128,7 @@
 #include "dex_app_version_failures_owner.hpp"
 #include "dex_app_perf_model.hpp"
 #include "offline_endpoint_store.hpp"
+#include "plugin_absence_confirmation.hpp"
 #include "pg/pg_collation_check.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
@@ -262,6 +264,7 @@
 #include "software_catalog_rollup.hpp"
 #include "software_normalization_job.hpp"
 #include "software_normalization_pack.hpp"
+#include "software_export_routes.hpp"
 #include "software_read_routes.hpp"
 #include "software_title_dimension.hpp"
 #include "device_routes.hpp"
@@ -706,6 +709,29 @@ public:
              {"store_not_open", "pool_acquire_timeout", "query_error", "txn_failed"})
             metrics_.counter("yuzu_server_software_lifecycle_store_write_degrade_total",
                              {{"reason", reason}});
+        // Streamed installed-software export (SAM-36): every format x result and every rejection
+        // reason exist from boot, so a first rejection reads as an increase from 0.
+        metrics_.describe("yuzu_server_software_export_total",
+                          "Streamed installed-software exports that ended, by format (jsonl/csv) "
+                          "and result (completed/degraded/deadline/aborted); anything but "
+                          "completed is a transfer the client saw truncated; aborted covers a "
+                          "client that went away and a server that began shutting down",
+                          "counter");
+        metrics_.describe("yuzu_server_software_export_rejected_total",
+                          "Streamed installed-software exports refused with a 503, by reason: "
+                          "export_concurrency_cap (every --inventory-export-concurrency slot in "
+                          "use) or global_stream_cap (the server-wide --max-sse-streams budget "
+                          "full)",
+                          "counter");
+        for (const auto format : yuzu::server::software_export::kFormats)
+            for (const auto result : yuzu::server::software_export::kResults)
+                metrics_.counter(
+                    "yuzu_server_software_export_total",
+                    {{"format", std::string(yuzu::server::software_export::format_name(format))},
+                     {"result", std::string(result)}});
+        for (const auto reason : yuzu::server::software_export::kRejectReasons)
+            metrics_.counter("yuzu_server_software_export_rejected_total",
+                             {{"reason", std::string(reason)}});
         metrics_.describe("yuzu_server_revocation_source_degrade_total",
                           "CRL source registrations refused for a retryable reason, by reason "
                           "(own_addresses_unavailable/dns_unavailable/dns_timeout/dns_busy/"
@@ -1990,6 +2016,11 @@ public:
                     "yuzu_server_system_reserved_push_total",
                     {{"capability", std::string(yuzu::server::system_reserved_push_label(push))},
                      {"result", std::string(result)}});
+        // On-demand software-inventory sync runs (software_sync::Runner, REST and MCP): one
+        // increment per request by outcome, seeded across the closed label set so a refusal that
+        // has never happened (a busy budget, a run that cannot be spread) reads as zero.
+        for (const auto result : yuzu::server::software_sync::kRunResults)
+            metrics_.counter("yuzu_server_software_sync_runs_total", {{"result", std::string(result)}});
         // ── Dispatch chokepoint + gateway wire-capability denials ─────────
         //
         // These three series answer "did the gate run and refuse?" — a question
@@ -2844,6 +2875,15 @@ public:
                           "gauge");
         metrics_.describe(yuzu::server::kPluginInitFailedRejectedGauge,
                           yuzu::server::kPluginInitFailedRejectedHelp, "gauge");
+        metrics_.describe("yuzu_server_software_sync_runs_total",
+                          "On-demand software-inventory sync requests (POST /api/v1/hardware/sync and "
+                          "the MCP tool sync_hardware_software) by outcome: accepted (a new paced "
+                          "run), joined (a repeat of a run still spreading), cooldown, in_flight, "
+                          "budget_busy (the per-process pacing budget is held by runs still "
+                          "spreading), too_large (cannot be spread inside 86,400 s), bad_request "
+                          "(including a missing confirmation), fleet_denied, unresolved, "
+                          "audit_failed, none_reachable. Per server process",
+                          "counter");
         metrics_.describe("yuzu_fleet_inventory_sync_skipping",
                           "Agents currently reporting heartbeats whose daily-sync source skipped "
                           "its latest collection cycle(s) (heartbeat tag "
@@ -3252,6 +3292,15 @@ public:
                           detail::kGuardianIoCeilingReportingHelp, "gauge");
         metrics_.describe(detail::kGuardianIoCeilingTagRejectedGauge,
                           detail::kGuardianIoCeilingTagRejectedHelp, "gauge");
+        // #5605 baseline-persistence fleet rollup, from the SAME table recompute_metrics clears and
+        // publishes from. Row 0 is a re-statable current gauge (the alerted one); rows 1 and 2 are
+        // monitor-only - see guardian_baseline_fleet_tags.hpp before writing an alert.
+        for (const auto& m : detail::kGuardianBaselineMetrics)
+            metrics_.describe(m.gauge, m.help, "gauge");
+        metrics_.describe(detail::kGuardianBaselineReportingGauge,
+                          detail::kGuardianBaselineReportingHelp, "gauge");
+        metrics_.describe(detail::kGuardianBaselineTagRejectedGauge,
+                          detail::kGuardianBaselineTagRejectedHelp, "gauge");
         // #2240: yuzu.guardian_backend. A categorical {os,backend} partition count plus the two
         // unlabelled meta gauges, all registered from the SAME constants
         // AgentHealthStore::recompute_metrics clears and publishes with
@@ -6807,6 +6856,16 @@ public:
             // production) leaves presence unconfigured: local-only behavior,
             // unchanged from pre-WS-5.
             registry_.configure_presence(offline_endpoint_store_.get(), cfg_.session_timeout);
+            // #5685 follow-up: the CONFIRMATION read for a cross-replica plugin-absence verdict. A
+            // published list is trusted only while the agent's routable directory row still names
+            // the session that published it. Borrowed raw pointer, same lifetime discipline as
+            // the store above: unwired in stop() before `gateway_route_store_` is reset, after
+            // every dispatch thread has been joined. No route store (direct-connect only) leaves
+            // it unset, so no cross-replica absence is ever withheld (fail open).
+            registry_.configure_route_session_reader(
+                gateway_route_store_ && gateway_route_store_->is_open()
+                    ? make_route_session_confirmer(*gateway_route_store_)
+                    : detail::AgentRegistry::RouteSessionReadFn{});
 
             // #5513: reconcile admission outcomes and duration. The counter family is bounded
             // (a closed `result` set), so every value is pre-seeded to 0 per
@@ -11921,6 +11980,7 @@ public:
         // raw-pointer null-out in this block (execution_tracker_,
         // blast_radius_detector, cert callbacks, session_store).
         registry_.configure_presence(nullptr, cfg_.session_timeout);
+        registry_.configure_route_session_reader({}); // before gateway_route_store_ is reset
         offline_endpoint_store_.reset();
         // #3425: same discipline — null the heartbeat-side caller of
         // quarantine_reconciler_ before dropping the object it calls into.
@@ -13977,9 +14037,18 @@ private:
                auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8));
     }
 
-    [[nodiscard]] auto build_sync_now_command(const std::string& command_id, const std::string& source) {
+    /// `delay_max_s` > 0 asks the agent to fire at a stable per-device offset inside that many
+    /// seconds (its parameter range is 0..86400); 0 or absent = now. `execution_id` ties the
+    /// replies to a tracker row (empty = untracked).
+    [[nodiscard]] auto build_sync_now_command(const std::string& command_id, const std::string& source,
+                                              std::int64_t delay_max_s = 0,
+                                              const std::string& execution_id = {}) {
+        std::unordered_map<std::string, std::string> parameters{{"source", source}};
+        if (delay_max_s > 0)
+            parameters["delay_max_s"] = std::to_string(delay_max_s);
         return build_classified_command(yuzu::server::DispatchCaller{.system = true}, "__sync__", "now",
-                                        command_id, /*parameters=*/{{"source", source}});
+                                        command_id, parameters, /*payload=*/{}, /*stagger_seconds=*/0,
+                                        /*delay_seconds=*/0, /*target_arm=*/{}, execution_id);
     }
 
     /// Sync-on-demand (`__sync__.now {source}`): a system-reserved push to each id under ONE
@@ -13989,7 +14058,8 @@ private:
     /// plugin no agent advertises (#3511). Authorization and targeting belong to the caller:
     /// the per-device sync route gates (scoped Execution:Execute) before it gets here; the fleet
     /// fan-out uses `push_sync_now_confined`, whose reach the confined-dispatch seam decides. The
-    /// agent ignores stagger for this action, so the caller bounds the herd. `sent`
+    /// agent ignores stagger for this action; a fleet run spreads the reports with `delay_max_s`
+    /// instead (see `push_sync_now_confined`). `sent`
     /// counts sessions that accepted the frame; a command that cannot be classified sends
     /// nothing and returns the empty result (no command id).
     [[nodiscard]] yuzu::server::software_sync::DispatchResult
@@ -14066,37 +14136,134 @@ private:
                                                ex);
     }
 
+    /// ManagementGroup:Write as a GLOBAL grant, decided from a session alone (the sync Runner has no
+    /// request to hand `require_permission`): the same answer that gate gives while RBAC enforcement
+    /// is on, off, or the session is elevated, an engine principal, a tiered MCP token or
+    /// service-scoped. The ordering is `software_sync::fleet_admin_answer`'s (pure, unit-tested); this
+    /// only supplies the store reads. The Runner ANDs it with its own unfiltered-Execution:Execute
+    /// check; both together are "fleet administrator", the only callers who may name the whole fleet.
+    /// Anything that cannot be determined is false.
+    [[nodiscard]] bool software_sync_fleet_admin(const auth::Session& sess) {
+        yuzu::server::software_sync::FleetAdminFacts facts;
+        facts.service_scoped = !sess.token_scope_service.empty();
+        facts.elevated = auth::is_elevated(sess);
+        facts.engine = sess.is_engine();
+        facts.mcp_tier = sess.mcp_tier;
+        facts.engine_grant = [&] {
+            return engine_grant_checked(rbac_store_.get(), sess.username, "ManagementGroup", "Write")
+                .value_or(false);
+        };
+        facts.rbac_grant = [&]() -> std::optional<bool> {
+            if (!rbac_store_ || !rbac_enforcement_in_effect(rbac_store_.get()))
+                return std::nullopt;
+            return rbac_store_->check_permission_checked(sess.username, "ManagementGroup", "Write")
+                .value_or(false);
+        };
+        // RBAC enforcement off: the legacy rule, a write needs the administrator role.
+        facts.legacy_admin = auth::effective_role(sess) == auth::Role::admin;
+        return yuzu::server::software_sync::fleet_admin_answer(facts);
+    }
+
+    /// The tracker row of one dispatch, created BEFORE it is sent so a fast reply cannot beat it. The
+    /// ONE place this file writes an execution row's dispatcher (the v1 command routes' creator and
+    /// the sync Runner's both go through it). `definition_id` is empty for a plain operator command.
+    [[nodiscard]] std::expected<std::string, std::string>
+    create_execution_row(const std::string& definition_id, const std::string& by,
+                         const std::string& scope, const std::string& parameter_values_json) {
+        if (!execution_tracker_)
+            return std::unexpected(std::string("no execution tracker"));
+        Execution exec;
+        exec.definition_id = definition_id;
+        exec.status = "running";
+        exec.scope_expression = scope;
+        exec.parameter_values = parameter_values_json;
+        exec.dispatched_by = by;
+        return execution_tracker_->create_execution(exec);
+    }
+
     /// The ONE fleet-run instance, shared by `POST /api/v1/hardware/sync` and the MCP tool
-    /// `sync_hardware_software`, so the per-operator cooldown and the single in-flight slot bind
-    /// both surfaces. Built on first use (all members it reads exist by then).
+    /// `sync_hardware_software`, so the run keys, joins, cooldown and pacing ledger bind both
+    /// surfaces. Built on first use (all members it reads exist by then).
     [[nodiscard]] std::shared_ptr<yuzu::server::software_sync::Runner> software_sync_runner() {
         if (!sync_runner_) {
-            yuzu::server::software_sync::Env env;
-            env.resolve = [this](const auth::Session& sess,
-                                 const yuzu::server::software_sync::Selector& sel) {
+            namespace software_sync = yuzu::server::software_sync;
+            software_sync::Env env;
+            env.resolve = [this](const auth::Session& sess, const software_sync::Selector& sel) {
                 return software_sync_resolve(sess, sel);
             };
-            env.dispatch = [this](const auth::Session& sess, const std::vector<std::string>& ids) {
-                return push_sync_now_confined(
-                    sess, ids, std::string(yuzu::server::software_sync::kSource));
+            env.dispatch = [this](const auth::Session& sess, const std::vector<std::string>& ids,
+                                  std::int64_t delay_max_s, const std::string& execution_id) {
+                return push_sync_now_confined(sess, ids, std::string(software_sync::kSource),
+                                              delay_max_s, execution_id);
             };
             env.caller_unfiltered = [this](const auth::Session& sess) {
                 return !derive_exec_visible(sess).has_value();
             };
+            env.fleet_admin = [this](const auth::Session& sess) { return software_sync_fleet_admin(sess); };
             env.agent_version = [this](const std::string& id) -> std::optional<std::string> {
                 auto sess = registry_.get_session(id);
                 if (!sess)
                     return std::nullopt;
                 return sess->agent_version;
             };
-            env.on_takeover_refused = [] {
-                spdlog::warn("software sync: a takeover was refused because the maximum number of "
-                             "stalled runs are still alive; sync stays unavailable until one of their "
-                             "sends unwinds (a stalled agent stream) or the server restarts");
+            // last_synced_before: the server-receipt time of each device's last accepted report,
+            // read in chunks (one `= ANY($n)` statement per chunk). A chunk that degrades degrades
+            // the whole read, so a missing row is only ever "never reported".
+            env.last_seen = [this](const std::vector<std::string>& ids)
+                -> std::optional<std::unordered_map<std::string, std::int64_t>> {
+                if (!software_inventory_store_)
+                    return std::nullopt;
+                constexpr std::size_t kChunk = 1000;
+                std::unordered_map<std::string, std::int64_t> seen;
+                for (std::size_t at = 0; at < ids.size(); at += kChunk) {
+                    const std::vector<std::string> chunk(
+                        ids.begin() + static_cast<std::ptrdiff_t>(at),
+                        ids.begin() + static_cast<std::ptrdiff_t>(std::min(ids.size(), at + kChunk)));
+                    auto part = software_inventory_store_->source_last_seen_bulk(
+                        std::string(software_sync::kSource), chunk);
+                    if (!part)
+                        return std::nullopt;
+                    seen.insert(part->begin(), part->end());
+                }
+                return seen;
             };
-            env.on_takeover = [] {
-                spdlog::warn("software sync: a run took over a lapsed in-flight lease; the previous "
-                             "holder is still sending (a stalled agent stream)");
+            env.track.create = [this](const auth::Session& sess, const software_sync::Selector& sel,
+                                      std::int64_t delay_max_s) -> std::string {
+                nlohmann::json params = {{"source", std::string(software_sync::kSource)}};
+                if (delay_max_s > 0)
+                    params["delay_max_s"] = delay_max_s;
+                auto created = create_execution_row(std::string(software_sync::kSyncDefinitionId),
+                                                    sess.username, sel.expr, params.dump());
+                if (!created) {
+                    spdlog::warn("software sync: execution record not created ({}); the run goes on "
+                                 "untracked",
+                                 ::yuzu::log_key_token(created.error()));
+                    return {};
+                }
+                return *created;
+            };
+            env.track.set_targeted = [this](const std::string& execution_id, std::size_t targeted) {
+                return execution_tracker_ &&
+                       yuzu::server::command_v1::set_targeted_then_refresh(
+                           *execution_tracker_, execution_id, static_cast<int>(targeted));
+            };
+            env.track.cancel = [this](const std::string& execution_id, const auth::Session& sess) {
+                if (!execution_tracker_ || execution_tracker_->mark_cancelled(execution_id, sess.username))
+                    return;
+                spdlog::error("software sync: mark_cancelled failed for execution_id={}", execution_id);
+            };
+            // The flag is range-checked at the CLI; the clamp keeps a Config built any other way
+            // inside the same 0..kMaxCooldownSecs (0 = no gap).
+            env.cooldown_s = std::clamp<std::int64_t>(cfg_.inventory_sync_cooldown_s, 0,
+                                                      software_sync::kMaxCooldownSecs);
+            env.on_live_bound_refused = [] {
+                spdlog::warn("software sync: a run was refused because the maximum number of send loops "
+                             "are already alive; sync stays limited until one of their sends unwinds "
+                             "(a stalled agent stream) or the server restarts");
+            };
+            env.on_result = [this](std::string_view result) {
+                metrics_.counter("yuzu_server_software_sync_runs_total", {{"result", std::string(result)}})
+                    .increment();
             };
             sync_runner_ = std::make_shared<yuzu::server::software_sync::Runner>(std::move(env));
         }
@@ -14109,22 +14276,36 @@ private:
     /// Execution:Execute visible set at send time, so a hidden device is never sent to even if the
     /// list reached this point carrying it. One command id, one gateway flush, like the
     /// per-device path.
+    ///
+    /// `delay_max_s` > 0 spreads the agents' reports over that many seconds (the pacing rule's
+    /// answer); `execution_id` ties the replies to the run's tracker row. The send loop is
+    /// synchronous in the request thread, as the other uncapped fan-outs are. ponytail: a background
+    /// sender would free the request worker for a fleet-sized loop; the Runner's live-send bound
+    /// (kMaxLiveRuns) caps the workers a stalled stream can strand until then.
     [[nodiscard]] yuzu::server::software_sync::DispatchResult
     push_sync_now_confined(const auth::Session& sess, const std::vector<std::string>& ids,
-                           const std::string& source) {
+                           const std::string& source, std::int64_t delay_max_s = 0,
+                           const std::string& execution_id = {}) {
         yuzu::server::software_sync::DispatchResult out;
         if (ids.empty())
             return out;
         const std::string command_id = mint_sync_now_command_id();
-        auto cmd = build_sync_now_command(command_id, source);
+        auto cmd = build_sync_now_command(command_id, source, delay_max_s, execution_id);
         if (!cmd)
             return out; // a command that cannot be classified sends nothing and reports no id
         out.command_id = command_id;
         const auto result = yuzu::server::dispatch_system_reserved_ids(
             ids, derive_exec_visible(sess),
             [this, &cmd](const std::string& id) {
-                return send_system_reserved(id, *cmd,
-                                            yuzu::server::SystemReservedPush::inventory_sync_now);
+                // One failing stream does not abandon the rest of the run: a send that throws is a
+                // frame that was not accepted, and `sent` stays exact.
+                try {
+                    return send_system_reserved(id, *cmd,
+                                                yuzu::server::SystemReservedPush::inventory_sync_now);
+                } catch (const std::exception& e) {
+                    spdlog::warn("software sync: a send threw and counts as not accepted: {}", e.what());
+                    return false;
+                }
             });
         out.sent = static_cast<std::size_t>(result.sent);
         if (out.sent > 0)
@@ -21188,6 +21369,20 @@ private:
                              // against the caller's OWN Execution:Execute visible set.
                              .sync_perm_fn = perm_fn,
                              .sync_runner = software_sync_runner(),
+                             // GET /api/v1/hardware/sync/{execution_id}: the tracker row, and
+                             // whether the caller may read every sync run (an unfiltered
+                             // Execution:Execute) rather than only its own.
+                             .sync_status_fn =
+                                 [this](const std::string& execution_id)
+                                     -> std::expected<std::optional<Execution>, std::string> {
+                                     if (!execution_tracker_)
+                                         return std::unexpected(std::string("no execution tracker"));
+                                     return execution_tracker_->get_execution_checked(execution_id);
+                                 },
+                             .sync_unfiltered_fn =
+                                 [this](const auth::Session& sess) {
+                                     return !derive_exec_visible(sess).has_value();
+                                 },
                              .write_gate = WriteGate{resolve_session_fn, cfg_.csrf_trusted_origins},
                              .forensics_visibility_fn = forensics_visibility_fn,
                              .forensics_plugins = forensics_plugins(),
@@ -21268,6 +21463,36 @@ private:
                     .roster_fn = software_roster_fn,
                     .snapshot_fn = [this] { return software_fleet_snapshot_.get(); },
                     .store = software_inventory_store_.get(),
+                });
+        }
+
+        // Streamed installed-software export (SAM-36): GET /api/v1/inventory/software/export.
+        // Registered here for the same reason as the reads above (the generic
+        // GET /api/v1/inventory/{a}/{b} would take the path). fleet_read_fn is the sole gate. The
+        // route borrows software_inventory_store_, metrics_ and stream_budget_ (every stream is a
+        // lease from the one budget, ADR-0034); an open stream's provider also reads the store,
+        // which is safe because stop() joins the web thread ahead of resetting any of them. The
+        // roster is the same reader the reads above use, read once per stream for the hostnames
+        // only.
+        {
+            HttplibRouteSink software_export_sink{*web_server_};
+            SoftwareExportRoutes{}.register_routes(
+                software_export_sink,
+                SoftwareExportRoutes::Deps{
+                    .fleet_read_fn = fleet_read_fn,
+                    .audit_fn = audit_fn,
+                    .roster_fn = [this]() -> std::optional<OfflineRoster> {
+                        if (!offline_endpoint_store_)
+                            return std::nullopt;
+                        auto roster = offline_endpoint_store_->query_stale_within(kHardwareRosterWindow);
+                        if (!roster)
+                            return std::nullopt;
+                        return std::move(*roster);
+                    },
+                    .store = software_inventory_store_.get(),
+                    .metrics = &metrics_,
+                    .stream_budget = stream_budget_.get(),
+                    .concurrency = cfg_.inventory_export_concurrency,
                 });
         }
 
@@ -23760,14 +23985,7 @@ private:
                              [this](const std::string& by, const std::string& scope,
                                     const std::string& parameter_values_json)
                              -> std::expected<std::string, std::string> {
-                            if (!execution_tracker_)
-                                return std::unexpected(std::string("no execution tracker"));
-                            Execution exec;
-                            exec.status = "running";
-                            exec.scope_expression = scope;
-                            exec.parameter_values = parameter_values_json;
-                            exec.dispatched_by = by;
-                            return execution_tracker_->create_execution(exec);
+                            return create_execution_row({}, by, scope, parameter_values_json);
                         },
                          .mark_cancelled =
                              [this](const std::string& id, const std::string& by) {
