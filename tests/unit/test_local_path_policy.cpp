@@ -85,6 +85,13 @@ TEST_CASE("local_path: a drive letter must be a fixed disk", "[shared][local_pat
     CHECK(win("\\\\?\\Z:\\share\\f") == lp::Refusal::non_fixed_drive);
     CHECK(win("E:\\usb\\f") == lp::Refusal::non_fixed_drive);
     CHECK(win("Q:\\nope") == lp::Refusal::non_fixed_drive);
+    // Drive-relative spellings reach the drive too: the type check must run for them.
+    CHECK(win("Z:file") == lp::Refusal::non_fixed_drive);
+    CHECK(win("Z:") == lp::Refusal::non_fixed_drive);
+    CHECK(win("Z:/x") == lp::Refusal::non_fixed_drive);
+    CHECK(win("E:file.txt") == lp::Refusal::non_fixed_drive);
+    CHECK(win("C:file") == lp::Refusal::none);
+    CHECK(win("1:file") == lp::Refusal::none); // not a drive letter: an ordinary relative name
 }
 
 TEST_CASE("local_path: relative and current-drive-rooted Windows paths pass", "[shared][local_path]") {
@@ -121,7 +128,10 @@ TEST_CASE("local_path: win_drive_letter extracts only a real drive designator", 
     CHECK(lp::win_drive_letter("\\\\?\\UNC\\h\\s") == 0);
     CHECK(lp::win_drive_letter("\\\\h\\s") == 0);
     CHECK(lp::win_drive_letter("1:\\x") == 0);
-    CHECK(lp::win_drive_letter("C:file") == 0); // not a drive-root form: Win32 treats it relatively
+    CHECK(lp::win_drive_letter("C:file") == 'C'); // drive-relative still names drive C
+    CHECK(lp::win_drive_letter("Z:/x") == 'Z');
+    CHECK(lp::win_drive_letter("9:file") == 0);
+    CHECK(lp::win_drive_letter(":x") == 0);
     CHECK(lp::win_drive_letter("") == 0);
 }
 

@@ -826,6 +826,14 @@ private:
 
         auto base_dir = params.get("base_dir");
 
+        // Refuse a network/device path UP FRONT. validate_path_or_parent answers "" both for
+        // "refused" and for "does not exist", and this action falls back to the RAW path below when
+        // base_dir is empty; without this check a refused UNC path would be stat'ed as LocalSystem.
+        if (path_refused_as_network(path)) {
+            ctx.write_output("error|path_refused:network_or_device");
+            return 1;
+        }
+
         // For exists check, use validate_path_or_parent (path may not exist)
         auto validated = validate_path_or_parent(path, base_dir);
         if (validated.empty() && !base_dir.empty()) {
@@ -834,8 +842,10 @@ private:
         }
 
         std::error_code ec;
-        std::string path_str = validated.empty() ? std::string{path} : validated;
-        bool exists = fs::exists(path_str, ec);
+        // No fallback to the raw caller path: an empty `validated` (refused, or neither the path
+        // nor its parent exists) answers "does not exist" without touching it.
+        std::string path_str = validated;
+        bool exists = !path_str.empty() && fs::exists(path_str, ec);
         ctx.write_output(std::format("exists|{}", exists ? "true" : "false"));
 
         if (exists) {
@@ -845,7 +855,12 @@ private:
                 ctx.write_output("error|path resolves outside allowed base directory");
                 return 1;
             }
-            auto& check_path = canon.empty() ? path_str : canon;
+            if (canon.empty()) {
+                // Fail closed: the canonical re-check refused (or could not resolve) the path.
+                ctx.write_output("error|path is not accessible or was refused");
+                return 1;
+            }
+            auto& check_path = canon;
 
             if (fs::is_regular_file(check_path, ec)) {
                 ctx.write_output("type|file");

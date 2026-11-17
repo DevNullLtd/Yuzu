@@ -129,15 +129,17 @@ namespace detail {
 
 } // namespace detail
 
-/// The drive letter of an `X:` / `X:\...` / `\\?\X:\...` spelling, or 0 for every other shape
+/// The drive letter of an `X:` / `X:file` / `X:\...` / `\\?\X:\...` spelling, or 0 for every other shape
 /// (relative, rooted-at-current-drive, UNC, device). The Windows glue asks the OS for the type of
 /// `X:\`.
 [[nodiscard]] inline char win_drive_letter(std::string_view path) noexcept {
     if (path.size() >= 4 && (path[0] == '\\' || path[0] == '/') &&
         (path[1] == '\\' || path[1] == '/') && path[2] == '?' && (path[3] == '\\' || path[3] == '/'))
         path.remove_prefix(4);
-    if (path.size() >= 2 && detail::ascii_alpha(path[0]) && path[1] == ':' &&
-        (path.size() == 2 || path[2] == '\\' || path[2] == '/'))
+    // ANY `X:` prefix names a drive, with or without a separator after it: `Z:file` is relative to
+    // the current directory ON DRIVE Z, so it reaches that drive (a mapped network drive included)
+    // and must face the same drive-type check as `Z:\x`.
+    if (path.size() >= 2 && detail::ascii_alpha(path[0]) && path[1] == ':')
         return path[0];
     return 0;
 }
