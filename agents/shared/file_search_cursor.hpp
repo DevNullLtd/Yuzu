@@ -17,8 +17,9 @@
 //
 // Recovery: the agent keeps no cursor state. The same cursor replayed re-walks the same slice
 // (duplicates possible, never a silent skip). A crash mid-slice issues no cursor, so the caller
-// retries the previous one. One cursor covers one root, so a failing volume never advances
-// another volume's position.
+// retries the previous one. A slice that completes the walk issues no cursor and may return the resume
+// position itself, so strictly_advances applies only to a cursor that is issued. One cursor covers
+// one root, so a failing volume never advances another volume's position.
 //
 // Transitions: strictly_advances accepts exactly two, each with the same query hash,
 // sequence + 1 (no wrap) and a non-decreasing prior_gaps.

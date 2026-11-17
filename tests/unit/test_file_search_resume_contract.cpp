@@ -23,6 +23,10 @@
  *  - case 7 (coverage carried): CoverageEnvelope::complete() ignoring prior_gaps, or next_cursor dropping
  *    the slice's gap count (or its saturating sum), makes the final envelope read complete.
  *  - case 8 (tokens): any of the six OrderedGap::Cause spellings drifting from its GapCause twin fails.
+ *  - case 1b (completing slice): the driver validating a cursor on the slice that completes the walk fails
+ *    the row-cap sweep (max_rows landing on the root's final entry), the empty root and the unlistable
+ *    root, where that slice returns the resume position itself; a completing slice issuing a cursor
+ *    fails issued.size() == results.size().
  *  - case 1 (unchanged tree): any resume, advancement, round-trip or governor rule rejecting an ordinary
  *    transition fails here first; total_opens == 0 fails if a file is ever opened.
  */
@@ -149,7 +153,10 @@ struct Search {
         env.gaps_dropped = res.gaps_dropped;
         REQUIRE(env.valid());
 
-        if (res.advanced || res.restarted) { // not a stall: issue the next cursor
+        // A slice that leaves a cursor and is not a stall issues the next one. A slice that completes the
+        // walk issues none (there is nothing to resume), so its position is never validated: it may be the
+        // resume position itself (the row cap landing on the final entry, an empty or unlistable root).
+        if (res.stop != Stop::complete && (res.advanced || res.restarted)) {
             const fsr::Cursor next =
                 fsr::next_cursor(cursor, res.position, res.restarted, res.gaps.size() + res.gaps_dropped);
             REQUIRE(fsr::strictly_advances(cursor, next));
@@ -158,7 +165,7 @@ struct Search {
             REQUIRE(*back == next);
             cursor = next;
             issued.push_back(next);
-        } // a stall issues nothing: the caller retries `cursor`
+        } // a stall or a completing slice issues nothing: the caller retries `cursor` or is done
         done = res.stop == Stop::complete;
         envs.push_back(std::move(env));
         results.push_back(std::move(res));
@@ -214,11 +221,14 @@ TEST_CASE("resume contract: an unchanged tree cut by entries, rows or the deadli
     s.run();
     CHECK(s.results.size() > 2);
     CHECK(s.results.front().stop == expect);
+    REQUIRE(s.issued.size() == s.results.size()); // the completing slice issues no cursor
     for (std::size_t i = 0; i < s.results.size(); ++i) {
         CHECK_FALSE(s.results[i].restarted);
         CHECK(s.results[i].advanced);
-        CHECK(s.issued[i + 1].generation == 0);
-        CHECK(s.issued[i + 1].sequence == i + 1);
+        if (i + 1 < s.issued.size()) {
+            CHECK(s.issued[i + 1].generation == 0);
+            CHECK(s.issued[i + 1].sequence == i + 1);
+        }
     }
     CHECK(s.gov.health == fsr::Health::ok);
     CHECK(s.gov.restarts == 0);
@@ -256,7 +266,8 @@ TEST_CASE("resume contract: a subtree replaced between slices is a legitimate re
     s.run();
     for (std::size_t i = 2; i < s.results.size(); ++i) {
         CHECK_FALSE(s.results[i].restarted);
-        CHECK(s.issued[i + 1].generation == 1);
+        if (i + 1 < s.issued.size())
+            CHECK(s.issued[i + 1].generation == 1);
     }
     CHECK(s.tail(1) == std::vector<std::string>{"/r/X/a", "/r/X/b", "/r/X/m", "/r/X/z", "/r/X/zz", "/r/Y"});
     CHECK(s.gov.health == fsr::Health::ok);
@@ -292,6 +303,50 @@ TEST_CASE("resume contract: a root replaced between slices is a legitimate resta
         CHECK_FALSE(s.results[i].restarted);
     CHECK(s.tail(1) == ref.visits); // every entry of the new root is visited
     CHECK(s.gov.health == fsr::Health::ok);
+}
+
+TEST_CASE("resume contract: a slice that completes the walk issues no cursor, wherever the cut falls",
+          "[file_search][walk_ordered][resume_contract]") {
+    Search ref;
+    basic_tree(ref);
+    ref.run();
+    REQUIRE(ref.visits.size() == 10);
+
+    SECTION("the row cap lands on every entry, the root's final one included") {
+        const int cap = GENERATE(1, 2, 3, 4, 5, 6, 7, 8, 9, 10);
+        Search s;
+        basic_tree(s);
+        s.wl.max_rows = static_cast<std::size_t>(cap);
+        s.run();
+        CHECK(s.gov.health == fsr::Health::ok);
+        CHECK(s.visits == ref.visits);
+        CHECK(s.results.back().stop == Stop::complete);
+        CHECK(s.issued.size() == s.results.size());
+        CHECK(s.envs.back().complete());
+    }
+    SECTION("an empty root") {
+        Search s;
+        s.dir("/r", {});
+        s.run();
+        CHECK(s.gov.health == fsr::Health::ok);
+        CHECK(s.visits.empty());
+        CHECK(s.results.size() == 1);
+        CHECK(s.issued.size() == 1);
+        CHECK(s.envs.back().complete());
+    }
+    SECTION("a root that cannot be listed is one dir_unreadable gap and a partial envelope") {
+        Search s; // "/r" is never registered, so its listing fails
+        s.run();
+        CHECK(s.gov.health == fsr::Health::ok);
+        CHECK(s.visits.empty());
+        CHECK(s.results.size() == 1);
+        CHECK(s.issued.size() == 1);
+        REQUIRE(s.results[0].gaps.size() == 1);
+        CHECK(s.results[0].gaps[0].cause == OrderedGap::Cause::dir_unreadable);
+        CHECK_FALSE(s.envs.back().complete());
+        CHECK(fsr::format_coverage_rows(s.envs.back()).back() ==
+              "coverage|partial|slices=1|prior_gaps=0|consistency=single_pass");
+    }
 }
 
 TEST_CASE("resume contract: replays and backward steps are never accepted",
@@ -382,7 +437,8 @@ TEST_CASE("resume contract: a gap in an early slice keeps the final envelope par
     CHECK(gap_row);
     for (std::size_t i = 1; i < s.results.size(); ++i) {
         CHECK(s.results[i].gaps.empty()); // slice-local: later slices have no gap of their own
-        CHECK(s.issued[i + 1].prior_gaps == 1);
+        if (i + 1 < s.issued.size())
+            CHECK(s.issued[i + 1].prior_gaps == 1);
     }
     const fsr::CoverageEnvelope& fin = s.envs.back();
     CHECK(fin.gaps.empty());
