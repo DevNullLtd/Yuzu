@@ -1677,8 +1677,15 @@ private:
         auto mounts = find_by_hash_network_mounts(std::string{root});
         bool refused = fbh::root_lexically_under_mount(root, mounts.mounts);
         if (!refused && !base_dir.empty()) {
+#ifdef _WIN32
+            // Windows judges a path by its own spelling, so base_dir gets its own answer.
             const auto base_mounts = find_by_hash_network_mounts(std::string{base_dir});
             refused = fbh::root_lexically_under_mount(base_dir, base_mounts.mounts);
+#else
+            // The table is host-wide: the one read above answers for base_dir too, and a second
+            // read could fail where the first succeeded.
+            refused = fbh::root_lexically_under_mount(base_dir, mounts.mounts);
+#endif
         }
         if (refused) {
             fbh::WalkOutcome o;
