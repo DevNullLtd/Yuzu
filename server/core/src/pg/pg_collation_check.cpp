@@ -46,18 +46,6 @@ const char* to_string(CollationVerdict v) noexcept {
     return "unreadable";
 }
 
-const char* to_string(CollationGate g) noexcept {
-    switch (g) {
-    case CollationGate::Trusted:
-        return "trusted";
-    case CollationGate::Mismatch:
-        return "mismatch";
-    case CollationGate::Unproven:
-        return "unproven";
-    }
-    return "unproven";
-}
-
 void seed_collation_metrics(yuzu::MetricsRegistry& metrics) {
     for (const auto& entry : all_collation_verdicts())
         (void)metrics.counter(kCollationCheckCounter, {{"result", entry.name}});

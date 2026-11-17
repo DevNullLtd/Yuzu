@@ -43,7 +43,9 @@
 // that denylist is a tripwire for the first reach for a store, not a proof. The
 // transitive include closure of every mcp_tools_*.cpp and of this header is held
 // store-free by scripts/ci/check-seam-closure.py's MCP registry lane (#6558),
-// against that script's store-header patterns.
+// against that script's store-header patterns. The collation gate value that
+// ci_collation_gate points at comes from the store-free collation_gate_types.hpp,
+// which that lane enrols by name, never from a pg/ header.
 //
 // Ownership: McpServer holds one ToolDeps by value (set once via
 // McpServer::set_tool_deps before build_handler) and the tools/call lookup site

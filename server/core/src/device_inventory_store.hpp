@@ -26,10 +26,10 @@
 ///   - `last_seen`/`first_seen` are the **SERVER receipt time**, never the
 ///     agent-supplied `collected_at` (the #1685 lesson, baked in from day one).
 
+#include "collation_gate_types.hpp"      // pg::CollationGate (the optional write-pause gate)
 #include "device_inventory_types.hpp"
 #include "digest_fn.hpp"                // DigestFn (the writer's test seam; no OpenSSL here)
 #include "inventory_ingest_outcome.hpp" // InventoryIngestOutcome (shared sync-ingest vocabulary)
-#include "pg/pg_collation_check.hpp"    // pg::CollationGate (the optional write-pause gate)
 
 #include <atomic>
 #include <chrono>

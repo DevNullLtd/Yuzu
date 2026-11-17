@@ -51,6 +51,7 @@
 /// keeps the pool alive until it returns. `request_stop()` and `stop()` are idempotent and sticky
 /// (no restart).
 
+#include "collation_gate_types.hpp"
 #include "pg/pg_collation_check.hpp"
 
 #include <atomic>
@@ -69,12 +70,9 @@ namespace yuzu::server {
 
 /// How often the check is repeated. A constant: there is deliberately no flag for it.
 inline constexpr std::chrono::seconds kCollationRecheckInterval{3600};
-/// How often it is repeated while the picture is UNSETTLED: the last conclusive verdict is
-/// Mismatch (after a repair the gauge must not outlast it by up to an hour), or there is no
-/// conclusive verdict yet (the start-time check was unreadable), or the latest check was
-/// unreadable. One cheap read a minute (the same bounded transaction as the hourly one) is the
-/// price, paid only while unsettled. The rule is `PgCollationRecheck::next_wait`.
-inline constexpr std::chrono::seconds kCollationUnsettledRecheckInterval{60};
+/// The unsettled cadence, `kCollationUnsettledRecheckInterval`, lives in `collation_gate_types.hpp`
+/// (the store-free leaf the readers include); the rule that picks it is
+/// `PgCollationRecheck::next_wait`.
 static_assert(kCollationUnsettledRecheckInterval < kCollationRecheckInterval,
               "the unsettled cadence must be the faster one");
 static_assert(kCollationRecheckInterval == std::chrono::seconds{3600},

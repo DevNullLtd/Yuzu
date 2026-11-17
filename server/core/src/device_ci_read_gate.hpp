@@ -31,8 +31,7 @@
 ///
 /// Pure and header-only: one acquire load of a lock-free atomic, no I/O, no lock.
 
-#include "pg/pg_collation_check.hpp"
-#include "pg_collation_recheck.hpp"
+#include "collation_gate_types.hpp"
 
 #include <atomic>
 #include <chrono>

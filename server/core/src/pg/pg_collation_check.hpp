@@ -63,6 +63,8 @@
 /// itself, and never disturbs a Trusted gate. It covers only the CONCURRENTLY failure form (a
 /// plain `REINDEX` that fails rolls back and leaves no invalid index) and only that one schema.
 
+#include "../collation_gate_types.hpp"
+
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -157,20 +159,6 @@ struct CollationState {
     friend bool operator==(const CollationState&, const CollationState&) = default;
 };
 
-/// What a text-key keyset reader or writer may rely on, as a lock-free value. Derived from
-/// `CollationState.last` AFTER `next_collation_state` (the state that survives an Unreadable),
-/// never from the latest verdict: a verdict-derived gate would reopen on one failed check during a
-/// standing mismatch.
-///   - Trusted: the last conclusive finding was Ok or NotApplicable.
-///   - Mismatch: the last conclusive finding was Mismatch (stays so through Unreadable checks).
-///   - Unproven: no conclusive finding yet (a boot whose checks have all been unreadable).
-enum class CollationGate { Trusted, Mismatch, Unproven };
-
-// The gate is published through `std::atomic<CollationGate>` and read on request paths: it must
-// never fall back to a lock.
-static_assert(std::atomic<CollationGate>::is_always_lock_free,
-              "the published collation gate must be a lock-free atomic");
-
 /// Pure. None -> Unproven, Ok -> Trusted, NotApplicable -> Trusted, Mismatch -> Mismatch.
 [[nodiscard]] constexpr CollationGate gate_for(CollationLast last) noexcept {
     switch (last) {
@@ -184,12 +172,6 @@ static_assert(std::atomic<CollationGate>::is_always_lock_free,
     }
     return CollationGate::Unproven;
 }
-
-/// Fixed text for logs and tests: "trusted", "mismatch", "unproven".
-[[nodiscard]] const char* to_string(CollationGate g) noexcept;
-
-/// The value a published gate holds before any check has concluded: never Trusted.
-inline constexpr CollationGate kInitialCollationGate = CollationGate::Unproven;
 
 enum class GaugeAction { Leave, SetZero, SetOne, Remove };
 enum class LogAction {
