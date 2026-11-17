@@ -309,6 +309,8 @@ TEST_CASE("filesystem search_dir: a UNC root is refused on its spelling, before 
 
 namespace {
 
+// ponytail: second copy of the helper in test_filesystem_find_by_hash_dispatcher.cpp; fold both
+// into filesystem_dispatcher_test_support.hpp (follow-up).
 /// The network mount points in the live kernel mount table, read from the test's side with the same
 /// shared classifiers the plugin uses.
 std::vector<std::string> live_network_mounts() {

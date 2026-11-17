@@ -191,15 +191,21 @@ struct WalkOutcome {
 /// not visible on REST, MCP or CSV, so this row is the operator-visible signal.
 inline constexpr std::string_view kMountGuardUnavailableRow = "network_mount_guard|unavailable";
 
+/// The label of find_by_hash's closing count row. search_dir shares this formatter and passes its
+/// own label (search_dir::kCountLabel).
+inline constexpr std::string_view kCountLabel = "matches_found";
+
 /// The rows that close a walk, in order: the guard-off row when the mount table was unreadable,
-/// the `truncated|...` trailer when anything was skipped or stopped short, then `matches_found|N`.
-[[nodiscard]] inline std::vector<std::string> format_outcome_rows(const WalkOutcome& o) {
+/// the `truncated|...` trailer when anything was skipped or stopped short, then `<count_label>|N`
+/// (`matches_found|N` unless the caller names another label).
+[[nodiscard]] inline std::vector<std::string>
+format_outcome_rows(const WalkOutcome& o, std::string_view count_label = kCountLabel) {
     std::vector<std::string> rows;
     if (o.mount_table_incomplete)
         rows.emplace_back(kMountGuardUnavailableRow);
     if (o.trailer_needed())
         rows.push_back(format_trailer(o));
-    rows.push_back(std::format("matches_found|{}", o.matches));
+    rows.push_back(std::format("{}|{}", count_label, o.matches));
     return rows;
 }
 

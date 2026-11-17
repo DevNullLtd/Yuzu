@@ -14,8 +14,11 @@
  *                       link) instead of symlink_status.
  *   unreadable       -- a probe refusal turned into a silent skip.
  *   mounts           -- the mount check running after a stat, or the guard row missing.
- *   escaping         -- a row built without acl::row_field (separator injection, invalid UTF-8).
- *   closing rows     -- the order guard row, trailer, total_matches.
+ *   escaping         -- a row built without acl::row_field (separator injection, invalid UTF-8,
+ *                       a trailing backslash); the formatter's file suffix.
+ *   closing rows     -- search_dir's count row carrying fbh::format_outcome_rows' default label
+ *                       (matches_found) instead of its own (total_matches); the guard row, trailer
+ *                       and count ORDER is pinned in test_filesystem_find_by_hash.cpp.
  *
  * UNGUARDED TU on every OS; only the symlink / FIFO / permission cases are #ifndef _WIN32.
  */
@@ -24,8 +27,6 @@
 #include "filesystem_dispatcher_test_support.hpp"
 #include "filesystem_search_dir.hpp"
 #include "test_helpers.hpp"
-
-#include <wire_utf8.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -112,21 +113,12 @@ TEST_CASE("search_dir: parse_match_type accepts exactly the three documented val
     CHECK(!sd::parse_match_type("Directories").has_value());
 }
 
-TEST_CASE("search_dir: closing rows are guard, trailer, then total_matches in that order",
+TEST_CASE("search_dir: the closing count row carries search_dir's own label",
           "[filesystem][search_dir]") {
-    fbh::WalkOutcome clean;
-    clean.matches = 3;
-    CHECK(sd::format_closing_rows(clean) == std::vector<std::string>{"total_matches|3"});
-
     fbh::WalkOutcome o;
-    o.matches = 2;
-    o.stop = fbh::StopReason::deadline;
-    o.mount_table_incomplete = true;
-    const auto rows = sd::format_closing_rows(o);
-    REQUIRE(rows.size() == 3);
-    CHECK(rows[0] == "network_mount_guard|unavailable");
-    CHECK(rows[1] == fbh::format_trailer(o));
-    CHECK(rows[2] == "total_matches|2");
+    o.matches = 3;
+    CHECK(fbh::format_outcome_rows(o, sd::kCountLabel) ==
+          std::vector<std::string>{"total_matches|3"});
 }
 
 TEST_CASE("search_dir: limits_for uses the search_dir entry cap and the caller's max_results",
@@ -227,7 +219,7 @@ TEST_CASE("search_dir: an injected clock past the deadline stops the walk and co
     CHECK(w.out.c.visited == 1);
     CHECK(w.out.matches == 1);
     CHECK(w.out.constrained());
-    CHECK(sd::format_closing_rows(w.out).front().rfind("truncated|deadline|visited=1|", 0) == 0);
+    CHECK(fbh::format_outcome_rows(w.out).front().rfind("truncated|deadline|visited=1|", 0) == 0);
 }
 
 TEST_CASE("search_dir: the entry cap trips as file_cap with exact counters; a tree at the cap is clean",
@@ -396,28 +388,20 @@ TEST_CASE("search_dir: mounts are refused before any hook runs and before symlin
         CHECK(w.out.matches == 2);
         CHECK(w.out.mount_table_incomplete);
         CHECK(w.out.constrained());
-        CHECK(sd::format_closing_rows(w.out).front() == "network_mount_guard|unavailable");
+        CHECK(fbh::format_outcome_rows(w.out).front() == "network_mount_guard|unavailable");
     }
 }
 
 // -- Escaping -------------------------------------------------------------------------------------
 
 TEST_CASE("search_dir: result rows go through row_field", "[filesystem][search_dir]") {
-    CHECK(sd::format_result_row("/r/a|b", false) == "result|/r/a\\|b|file");
-    CHECK(sd::format_result_row("/r/line\r\nbreak", true) == "result|/r/line  break|directory");
-    CHECK(sd::format_result_row("C:\\dir\\", true) == "result|C:\\dir/|directory");
-}
-
-TEST_CASE("search_dir: a name with bytes that are not UTF-8 is emitted with '?' for each bad byte",
-          "[filesystem][search_dir]") {
-    const std::string name_ff{"/r/a\xff" "b"};
-    const std::string name_c3{"/r/x\xc3\x28" "y"};
-    const auto r1 = sd::format_result_row(name_ff, false);
-    const auto r2 = sd::format_result_row(name_c3, true);
-    CHECK(r1 == "result|/r/a?b|file");
-    CHECK(r2 == "result|/r/x?(y|directory");
-    CHECK(yuzu::shared::count_invalid_wire_bytes(r1) == 0);
-    CHECK(yuzu::shared::count_invalid_wire_bytes(r2) == 0);
+    // One name with a pipe, CR LF, a byte that is not UTF-8 (0xFF) and a trailing backslash:
+    // row_field escapes the pipe, folds CR LF to two spaces, shows the bad byte as '?' and folds
+    // the backslash to '/' (the split literal stops the hex escape swallowing the 'd').
+    CHECK(sd::format_result_row("/r/a|b\r\nc\xff" "d\\", true) ==
+          "result|/r/a\\|b  c?d/|directory");
+    // the only every-OS literal pin of the file suffix at this level (row_of calls the formatter)
+    CHECK(sd::format_result_row("/r/plain.txt", false) == "result|/r/plain.txt|file");
 }
 
 #ifdef __linux__

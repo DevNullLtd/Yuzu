@@ -476,6 +476,22 @@ bool can_enter_win(const fs::path& dir) {
 }
 #endif
 
+// The one report of a finished (or refused) bounded walk, shared by find_by_hash and search_dir:
+// the closing rows (the guard-off row, the trailer when anything was skipped or stopped short, then
+// the count under `count_label`), then the typed CONSTRAINED/PARTIAL status when part of the tree
+// was not examined.
+int emit_walk_outcome(yuzu::CommandContext& ctx,
+                      const yuzu::filesystem::find_by_hash::WalkOutcome& o,
+                      std::string_view count_label) {
+    namespace fbh = yuzu::filesystem::find_by_hash;
+    for (const auto& row : fbh::format_outcome_rows(o, count_label))
+        ctx.write_output(row);
+    if (o.constrained())
+        ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              fbh::constrained_reason(o));
+    return 0;
+}
+
 // ── Regex safety check ─────────────────────────────────────────────────
 // Reject patterns with nested quantifiers that cause catastrophic backtracking.
 bool has_nested_quantifiers(std::string_view pattern) {
@@ -1696,11 +1712,7 @@ private:
         if (refused) {
             fbh::WalkOutcome o;
             o.c.skipped_network_mount = 1;
-            for (const auto& row : sd::format_closing_rows(o))
-                ctx.write_output(row);
-            ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
-                                  fbh::constrained_reason(o));
-            return 0;
+            return emit_walk_outcome(ctx, o, sd::kCountLabel);
         }
 
         auto validated = validate_path(root, base_dir);
@@ -1764,17 +1776,11 @@ private:
                 ctx.write_output("error|regex too complex for a file name (simplify the pattern)");
                 return 1;
             }
-            for (const auto& row : sd::format_closing_rows(outcome))
-                ctx.write_output(row);
-            if (outcome.constrained())
-                ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED,
-                                      YUZU_RESULT_COMPLETENESS_PARTIAL,
-                                      fbh::constrained_reason(outcome));
+            return emit_walk_outcome(ctx, outcome, sd::kCountLabel);
         } catch (const std::exception& e) {
             ctx.write_output(std::format("error|search_dir failed: {}", e.what()));
             return 1;
         }
-        return 0;
     }
 
     // ── get_version_info: Extract PE version resource (Windows) ─────────
@@ -2425,22 +2431,11 @@ private:
             return 1;
         }
 
-        // The one report of a finished (or refused) walk: the trailer when anything was skipped or
-        // stopped short, the count, then the typed status when part of the tree was not examined.
-        const auto emit_outcome = [&ctx](const fbh::WalkOutcome& o) {
-            for (const auto& row : fbh::format_outcome_rows(o))
-                ctx.write_output(row);
-            if (o.constrained())
-                ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED,
-                                      YUZU_RESULT_COMPLETENESS_PARTIAL, fbh::constrained_reason(o));
-            return 0;
-        };
-
         auto mounts = find_by_hash_network_mounts(std::string{directory});
         if (fbh::root_lexically_under_mount(directory, mounts.mounts)) {
             fbh::WalkOutcome refused;
             refused.c.skipped_network_mount = 1;
-            return emit_outcome(refused);
+            return emit_walk_outcome(ctx, refused, fbh::kCountLabel);
         }
 
         auto validated = validate_path(directory, {});
@@ -2489,7 +2484,7 @@ private:
             fbh::walk_find_by_hash(validated, target, max_depth, fbh::WalkLimits{}, env,
                                    [&](const std::string& row) { ctx.write_output(row); });
 
-        return emit_outcome(outcome);
+        return emit_walk_outcome(ctx, outcome, fbh::kCountLabel);
     }
 };
 

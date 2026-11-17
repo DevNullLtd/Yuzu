@@ -25,7 +25,6 @@
 #include <optional>
 #include <string>
 #include <string_view>
-#include <vector>
 
 namespace yuzu::filesystem::search_dir {
 
@@ -35,6 +34,8 @@ namespace fbh = yuzu::filesystem::find_by_hash;
 inline constexpr std::size_t kMaxEntriesVisited = 400'000;
 /// Longest pattern the action accepts, glob or regex.
 inline constexpr std::size_t kMaxPatternBytes = 256;
+/// The label of the closing count row; the rows come from fbh::format_outcome_rows(o, kCountLabel).
+inline constexpr std::string_view kCountLabel = "total_matches";
 
 enum class MatchType { directories, files, both };
 
@@ -51,18 +52,6 @@ enum class MatchType { directories, files, both };
 /// `result|<path>|<directory|file>`.
 [[nodiscard]] inline std::string format_result_row(std::string_view path_utf8, bool is_dir) {
     return "result|" + acl::row_field(path_utf8) + (is_dir ? "|directory" : "|file");
-}
-
-/// The rows that close a walk, in order: the guard-off row when the mount table was unreadable, the
-/// trailer when anything was skipped or stopped short, then `total_matches|N`.
-[[nodiscard]] inline std::vector<std::string> format_closing_rows(const fbh::WalkOutcome& o) {
-    std::vector<std::string> rows;
-    if (o.mount_table_incomplete)
-        rows.emplace_back(fbh::kMountGuardUnavailableRow);
-    if (o.trailer_needed())
-        rows.push_back(fbh::format_trailer(o));
-    rows.push_back("total_matches|" + std::to_string(o.matches));
-    return rows;
 }
 
 [[nodiscard]] inline fbh::WalkLimits limits_for(int max_results) {
