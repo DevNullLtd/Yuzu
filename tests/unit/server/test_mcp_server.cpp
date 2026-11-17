@@ -57836,8 +57836,15 @@ struct Sam21Reads {
     bool rows_ok{true};
     bool facts_ok{true};
     bool totals_ok{true};
+    bool versions_ok{true};
     int page_reads{0};
     yuzu::server::SoftwareFleetQuery seen_installs;
+    // What the components lookup handed the store: the page query, and the kind, name and scope
+    // ids of the distinct-version read behind a version range.
+    yuzu::server::SoftwareComponentQuery seen_components;
+    std::string seen_cv_kind;
+    std::string seen_cv_name;
+    std::optional<std::vector<std::string>> seen_cv_ids;
 
     Sam21Reads() {
         installs = {sam21_install("a1", "1.0", 1), sam21_install("a2", "1.5", 2)};
@@ -57876,6 +57883,7 @@ struct Sam21Reads {
             ++page_reads;
             if (!rows_ok)
                 return std::nullopt;
+            seen_components = q;
             std::vector<SoftwareComponentRow> out;
             std::int64_t to_skip = q.skip;
             for (const auto& r : comps) {
@@ -57896,13 +57904,21 @@ struct Sam21Reads {
             }
             return out;
         };
-        io.install_versions = [](std::string_view, const std::optional<std::vector<std::string>>&)
+        io.install_versions = [this](std::string_view,
+                                     const std::optional<std::vector<std::string>>&)
             -> std::optional<std::vector<std::string>> {
+            if (!versions_ok)
+                return std::nullopt;
             return std::vector<std::string>{"1.0", "1.5", "2.0"};
         };
-        io.component_versions = [](std::string_view, std::string_view,
-                                   const std::optional<std::vector<std::string>>&)
+        io.component_versions = [this](std::string_view kind, std::string_view name,
+                                       const std::optional<std::vector<std::string>>& ids)
             -> std::optional<std::vector<std::string>> {
+            if (!versions_ok)
+                return std::nullopt;
+            seen_cv_kind = std::string(kind);
+            seen_cv_name = std::string(name);
+            seen_cv_ids = ids;
             return std::vector<std::string>{"1.0", "3.0"};
         };
         io.facts.last_seen = [this](const std::vector<std::string>& ids)
@@ -58228,6 +58244,57 @@ TEST_CASE("MCP query_software_components: answers in the tool_result form with t
     CHECK(fakes.page_reads == reads_before);
 }
 
+TEST_CASE("MCP query_software_components: every advertised filter reaches the core query and a range "
+          "is resolved over the caller's scope",
+          "[mcp][inventory][software][sam21]") {
+    Sam21Reads fakes;
+    {
+        McpTestServer ts;
+        ts.software_lookup_reads_for_test = fakes.reads();
+        ts.start();
+        const auto exact = mcp_tool_call(
+            ts, kSam21Components,
+            R"({"kind":"library","name":"libfo","match":"prefix","q":"opt","status":"current",)"
+            R"("agent_id":"a1","version":"3.0"})");
+        REQUIRE(exact.contains("result"));
+        const auto& q = fakes.seen_components;
+        CHECK(q.kind == "library");
+        CHECK(q.name == "libfo");
+        CHECK(q.match == yuzu::server::NameMatch::kPrefix);
+        CHECK(q.q == "opt");
+        CHECK(q.status == "current");
+        CHECK(q.agent_id == "a1");
+        REQUIRE(q.versions.has_value());
+        CHECK(*q.versions == std::vector<std::string>{"3.0"});
+
+        // A global caller: the version read is over the whole fleet and the range (the fake's
+        // versions are 1.0 and 3.0) is resolved into the page query.
+        const auto ranged = mcp_tool_call(
+            ts, kSam21Components,
+            R"({"kind":"library","name":"libfoo","version_min":"1.0","version_max":"2.0"})");
+        REQUIRE(ranged.contains("result"));
+        CHECK(fakes.seen_cv_kind == "library");
+        CHECK(fakes.seen_cv_name == "libfoo");
+        CHECK_FALSE(fakes.seen_cv_ids.has_value());
+        REQUIRE(fakes.seen_components.versions.has_value());
+        CHECK(*fakes.seen_components.versions == std::vector<std::string>{"1.0"});
+    }
+    {
+        McpTestServer ts; // a confined caller: the version read is handed its scope ids
+        ts.software_lookup_reads_for_test = fakes.reads();
+        ts.fleet_read_fn_for_test = sam21_scoped_gate({"a1"});
+        ts.start();
+        const auto ranged = mcp_tool_call(
+            ts, kSam21Components,
+            R"({"kind":"library","name":"libfoo","version_min":"1.0","version_max":"2.0"})");
+        REQUIRE(ranged.contains("result"));
+        REQUIRE(fakes.seen_cv_ids.has_value());
+        CHECK(*fakes.seen_cv_ids == std::vector<std::string>{"a1"});
+        REQUIRE(fakes.seen_components.versions.has_value());
+        CHECK(*fakes.seen_components.versions == std::vector<std::string>{"1.0"});
+    }
+}
+
 TEST_CASE("MCP lookup tools: a degraded page, facts or totals read is a retryable internal error with a "
           "failure audit row; a continuation page is audited and tagged",
           "[mcp][inventory][software][sam21]") {
@@ -58266,6 +58333,38 @@ TEST_CASE("MCP lookup tools: a degraded page, facts or totals read is a retryabl
         }
     }
 
+    // A failing distinct-version read (a ranged request) is the same retryable error, raised
+    // before any page read; the audit target is the parsed request's own.
+    const auto ranged_installs =
+        swl::parse_list_params(swl::Params{{"name", "git"}, {"version_min", "1.0"}});
+    const auto ranged_components = swl::parse_components_params(
+        swl::Params{{"name", "libfoo"}, {"kind", "library"}, {"version_min", "1.0"}});
+    REQUIRE(ranged_installs);
+    REQUIRE(ranged_components);
+    const std::string installs_key = swl::audit_target(*ranged_installs);
+    const std::string components_key = swl::audit_target(*ranged_components);
+    for (const auto& c : std::vector<Case>{
+             {kSam21Installs, R"({"name":"git","version_min":"1.0"})", installs_key.c_str()},
+             {kSam21Components, R"({"name":"libfoo","kind":"library","version_min":"1.0"})",
+              components_key.c_str()}}) {
+        INFO(c.tool << " / versions");
+        Sam21Reads fakes;
+        fakes.versions_ok = false;
+        McpTestServer ts;
+        ts.software_lookup_reads_for_test = fakes.reads();
+        ts.start();
+        const auto r = mcp_tool_call(ts, c.tool, c.args);
+        REQUIRE(r.contains("error"));
+        CHECK_FALSE(r.contains("result"));
+        CHECK(r["error"]["code"] == yuzu::server::mcp::kInternalError);
+        CHECK(r["error"]["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpStoreFaultRetryMs);
+        CHECK(r["error"]["data"]["remediation"] == "retry the request");
+        CHECK(mcp_audit_details(ts, std::string("mcp.") + c.tool + "|failure") ==
+              std::vector<std::string>{std::string("version read degraded; ") + c.target});
+        CHECK(mcp_audits(ts, std::string("mcp.") + c.tool + "|success") == 0);
+        CHECK(fakes.page_reads == 0);
+    }
+
     // A served first page and its continuation: one success row each, the second tagged.
     for (const auto& c : std::vector<Case>{
              {kSam21Installs, R"({"name":"git","limit":1})", "name=git"},
@@ -58286,6 +58385,63 @@ TEST_CASE("MCP lookup tools: a degraded page, facts or totals read is a retryabl
         REQUIRE(p2.contains("result"));
         CHECK(mcp_audit_details(ts, std::string("mcp.") + c.tool + "|success") ==
               std::vector<std::string>{c.target, std::string(c.target) + " page=continuation"});
+    }
+}
+
+TEST_CASE("MCP query_software_components and get_software_sync_status: a dropped audit row never "
+          "withholds the answer; an out-of-scope agent_id is audited as denied",
+          "[mcp][inventory][software][sync_fanout][security][sam21]") {
+    struct Case {
+        const char* tool;
+        const char* args;
+        const char* row; // the audit row the harness fails
+        bool confined;
+        int rows; // expected rows in the answer, -1 for the status tool
+    };
+    const std::vector<Case> cases = {
+        {kSam21Components, kSam21ComponentArgs, "mcp.query_software_components|success", false, 2},
+        {kSam21Components, R"({"name":"libfoo","agent_id":"a2"})",
+         "mcp.query_software_components|denied", true, 0},
+        {"get_software_sync_status", R"({"execution_id":"exec-1"})",
+         "mcp.get_software_sync_status|success", false, -1}};
+    for (const auto& c : cases) {
+        for (const bool dropped : {true, false}) {
+            INFO(c.row << " dropped=" << dropped);
+            Sam21Reads fakes;
+            Sam21Status rig;
+            rig.runs = {sam21_run("exec-1", "test-user", "{}")};
+            McpTestServer ts;
+            ts.software_lookup_reads_for_test = fakes.reads();
+            rig.wire(ts);
+            if (c.confined)
+                ts.fleet_read_fn_for_test = sam21_scoped_gate({"a1"});
+            if (dropped)
+                ts.audit_fail_action_result_ = c.row;
+            ts.start("operator");
+            const auto r = mcp_tool_call(ts, c.tool, c.args);
+            REQUIRE(r.contains("result"));
+            const auto& structured = r["result"]["structuredContent"];
+            const auto text = nlohmann::json::parse(r["result"]["content"][0]["text"].get<std::string>());
+            if (c.rows >= 0)
+                CHECK(structured["components"].size() == static_cast<std::size_t>(c.rows));
+            else
+                CHECK(structured["targeted"] == 5);
+            if (dropped) {
+                CHECK(structured["audit_persisted"] == false);
+                CHECK(text["audit_persisted"] == false);
+            } else {
+                CHECK_FALSE(structured.contains("audit_persisted"));
+                CHECK_FALSE(text.contains("audit_persisted"));
+            }
+            if (c.confined && !dropped) {
+                const auto parsed = swl::parse_components_params(
+                    swl::Params{{"name", "libfoo"}, {"agent_id", "a2"}});
+                REQUIRE(parsed);
+                CHECK(mcp_audit_details(ts, c.row) ==
+                      std::vector<std::string>{"scope: agent_id outside the caller's scope for " +
+                                               swl::audit_target(*parsed)});
+            }
+        }
     }
 }
 
@@ -58444,8 +58600,8 @@ TEST_CASE("MCP get_software_sync_status: equals the REST status body for an owne
               .contains("error"));
 }
 
-TEST_CASE("MCP get_software_sync_status: a tracker failure is retryable; an unwired tracker is too; "
-          "malformed arguments are refused before any read",
+TEST_CASE("MCP get_software_sync_status: a tracker failure is retryable; an unwired tracker is a "
+          "permanent error with no hint; malformed arguments are refused before any read",
           "[mcp][software][sync_fanout][sam21]") {
     {
         Sam21Status rig;
@@ -58460,12 +58616,12 @@ TEST_CASE("MCP get_software_sync_status: a tracker failure is retryable; an unwi
         CHECK(r["error"]["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpStoreFaultRetryMs);
     }
     {
-        McpTestServer ts; // no tracker closures wired
+        McpTestServer ts; // no tracker closures wired: wired once at construction, so permanent
         ts.start("operator");
         const auto r = mcp_tool_call(ts, "get_software_sync_status", R"({"execution_id":"exec-1"})");
         REQUIRE(r.contains("error"));
         CHECK(r["error"]["code"] == yuzu::server::mcp::kInternalError);
-        CHECK(r["error"]["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpStoreFaultRetryMs);
+        CHECK(r["error"]["data"]["retry_after_ms"].is_null());
     }
     {
         Sam21Status rig;

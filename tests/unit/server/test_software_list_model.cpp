@@ -1136,6 +1136,9 @@ TEST_CASE("lookup_installs / lookup_components: each degraded read is kUnavailab
     REQUIRE(installs);
     REQUIRE(ranged);
     REQUIRE(comps);
+    const auto comp_ranged = parse_components_params(
+        params({{"name", "libfoo"}, {"kind", "library"}, {"version_min", "1.0"}}));
+    REQUIRE(comp_ranged);
 
     SECTION("the page read") {
         FakeLookup f;
@@ -1187,6 +1190,12 @@ TEST_CASE("lookup_installs / lookup_components: each degraded read is kUnavailab
         CHECK(a.error().audit_detail == "version read degraded");
         CHECK(a.error().message == prefix + "version range read failed");
         CHECK(f.page_reads == 0); // the page is never read against an unresolved range
+        const auto c = lookup_components(io, *comp_ranged, kGlobalScope, true);
+        REQUIRE_FALSE(c);
+        CHECK(c.error().fault == LookupFault::kUnavailable);
+        CHECK(c.error().audit_detail == "version read degraded");
+        CHECK(c.error().message == prefix + "version range read failed");
+        CHECK(f.page_reads == 0);
     }
 }
 

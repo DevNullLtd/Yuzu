@@ -5482,7 +5482,9 @@ static const ToolDef kTools[] = {
      "REST twin clamps); there is no format argument, the CSV export stays on REST. A degraded rows, "
      "device-facts, version or totals read is a retryable error, never an empty result. Read-only. "
      "Audited as mcp.query_software_components. Mirrors GET "
-     "/api/v1/inventory/software/components. Requires Inventory:Read.",
+     "/api/v1/inventory/software/components. Use this for the parts inside installed software; for "
+     "the installed titles and versions themselves use query_installed_software, and for the "
+     "fleet-wide title rollup use query_software_catalogue. Requires Inventory:Read.",
      R"j({"type":"object","properties":{)j"
      R"j("kind":{"type":"string","maxLength":16,"description":"Component kind"},)j"
      R"j("name":{"type":"string","maxLength":1024,"description":"Component name; needed for a non-exact match or a version range"},)j"
@@ -12900,7 +12902,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // push-down), the device facts and the totals are the lookup core's, the same
                 // function the REST twin calls.
                 const auto lookup = swl::lookup_installs(*software_lookup_reads_, std::move(*parsed),
-                                                         gate.scope, true);
+                                                         gate.scope, /*want_totals=*/true);
                 if (!lookup) {
                     const auto& err = lookup.error();
                     if (err.fault == swl::LookupFault::kBadRequest) {
@@ -13007,7 +13009,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 const std::string audit_key = swl::audit_target(*parsed);
                 const bool continuation = !parsed->cursor.empty();
                 const auto lookup = swl::lookup_components(*software_lookup_reads_,
-                                                           std::move(*parsed), gate.scope, true);
+                                                           std::move(*parsed), gate.scope,
+                                                           /*want_totals=*/true);
                 if (!lookup) {
                     const auto& err = lookup.error();
                     if (err.fault == swl::LookupFault::kBadRequest) {
@@ -20387,9 +20390,10 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!perm_fn(req, res, "Execution", "Execute"))
                     return;
                 if (!software_sync_status_fn_) {
-                    res.set_content(a4_error(kInternalError, "sync status is unavailable on this server",
-                                             "retry the request", mcp::kMcpStoreFaultRetryMs),
-                                    "application/json");
+                    // Wired once before register_routes: permanent, so no retry hint.
+                    res.set_content(
+                        a4_error(kInternalError, "sync status is unavailable on this server"),
+                        "application/json");
                     return;
                 }
                 if (const auto bad = sra::strict_args_error(args, kSyncStatusArgs)) {

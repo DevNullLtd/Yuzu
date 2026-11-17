@@ -750,8 +750,8 @@ public:
     void set_guardian_push_fn(GuardianPushFn fn) { guardian_push_fn_ = std::move(fn); }
 
     /// The fleet "Sync now" run behind `sync_hardware_software` - the SAME instance
-    /// `POST /api/v1/hardware/sync` uses, so the per-operator cooldown and the single in-flight
-    /// slot bind both surfaces. Wired once before register_routes (permanent when unset).
+    /// `POST /api/v1/hardware/sync` uses, so the run keys, the cooldown window and the pacing
+    /// budget bind both surfaces. Wired once before register_routes (permanent when unset).
     void set_software_sync_runner(std::shared_ptr<software_sync::Runner> runner) {
         software_sync_runner_ = std::move(runner);
     }
@@ -765,9 +765,10 @@ public:
     }
 
     /// The tracker read and the unfiltered-Execution:Execute answer behind get_software_sync_status:
-    /// the SAME two closures `GET /api/v1/hardware/sync/{execution_id}` is given. An unset read
-    /// answers a retryable internal error (never an empty result); an unset unfiltered fn means
-    /// nobody is unfiltered (a caller reads only the runs it started).
+    /// the SAME two closures `GET /api/v1/hardware/sync/{execution_id}` is given. Wired once
+    /// before register_routes (permanent when unset): an unset read answers an internal error with
+    /// no retry hint (never an empty result); an unset unfiltered fn means nobody is unfiltered
+    /// (a caller reads only the runs it started).
     void set_software_sync_status_fns(software_sync::StatusReadFn read,
                                       software_sync::UnfilteredFn unfiltered) {
         software_sync_status_fn_ = std::move(read);
