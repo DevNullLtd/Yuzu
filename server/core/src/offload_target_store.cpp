@@ -436,12 +436,13 @@ std::expected<int64_t, OffloadWriteError> OffloadTargetStore::create_target(
         return std::unexpected(OffloadWriteError::invalid_input);
     }
     // A LITERAL link-local / metadata / unspecified / multicast / reserved destination is refused
-    // here (F43, #4816); names are vetted at delivery (outbound_destination_guard.hpp).
+    // here (#4816); names are vetted at delivery (outbound_destination_guard.hpp).
     if (url_literal_destination_refused(url)) {
-        spdlog::warn("OffloadTargetStore: rejected target whose url is a literal link-local, "
-                     "metadata, unspecified, multicast or reserved address (target name: {})",
+        spdlog::warn("OffloadTargetStore: rejected target whose url host is a link-local, metadata, "
+                     "unspecified, multicast or reserved address or a numeric spelling of one "
+                     "(target name: {})",
                      name);
-        return std::unexpected(OffloadWriteError::invalid_input);
+        return std::unexpected(OffloadWriteError::destination_refused);
     }
 
     // Serial-PK allocate-before-encrypt (ADR-0010 Amendment): reserve the
@@ -810,21 +811,27 @@ void OffloadTargetStore::deliver_single(const OffloadDeliveryTarget& tgt,
         return;
     }
 
-    // F43 (#4816): vet the destination before the credential is decrypted or a socket opened. A
-    // name is resolved ONCE and the connect below is pinned to the vetted address; link-local /
-    // metadata, unspecified, multicast and reserved addresses, an unresolvable name and a busy
-    // resolver all skip the delivery. Loopback and private ranges are deliberately NOT refused
-    // (outbound_destination_guard.hpp; the opt-in policy is #4816's separate setting).
+    // Vet the destination before the credential is decrypted or a socket opened (#4816). A name is
+    // resolved ONCE (through the delivery resolver pool) and the connects below go only to addresses
+    // that were judged; link-local/metadata, unspecified, multicast and reserved addresses, an
+    // unresolvable name and a busy resolver all decline the delivery, record why, and are counted
+    // under `refused_total{cause}` (NOT delivery_failed_total). Loopback and private ranges are
+    // deliberately NOT refused (outbound_destination_guard.hpp; the opt-in policy is #4816's
+    // separate setting).
     const VettedDestination vetted = vet_delivery_destination(tgt.url);
     if (vetted.verdict != DestinationVerdict::Allow) {
-        const bool refused = vetted.verdict == DestinationVerdict::Refused;
-        record_delivery(tgt.id, event_type, event_count, payload_body, 0,
-                        refused ? "destination_refused" : "destination_unresolved");
-        spdlog::warn("OffloadTargetStore: delivery to {} (target {}) skipped - destination {}{}{}",
-                     url_log_host(tgt.url), tgt.id, refused ? "refused: " : "unresolved",
-                     refused ? vetted.refused_class : "", refused ? " address" : "");
+        const char* cause = destination_cause(vetted.verdict);
+        record_delivery(tgt.id, event_type, event_count, payload_body, 0, cause);
         if (metrics_)
-            metrics_->counter("yuzu_server_offload_delivery_failed_total").increment();
+            metrics_->counter("yuzu_server_offload_delivery_refused_total", {{"cause", cause}})
+                .increment();
+        if (refusal_throttle_.admit(tgt.id)) {
+            spdlog::warn("OffloadTargetStore: delivery to {} (target {}) declined - {}{}{}",
+                         url_log_host(tgt.url), tgt.id, cause,
+                         *vetted.refused_class != '\0' ? ": " : "", vetted.refused_class);
+            if (refused_sink_)
+                refused_sink_(tgt.id, cause, vetted.refused_class, url_audit_detail(tgt.url));
+        }
         return;
     }
 
@@ -865,13 +872,6 @@ void OffloadTargetStore::deliver_single(const OffloadDeliveryTarget& tgt,
         // One parser for validation and delivery (outbound_url_policy.hpp).
         const auto [scheme, host_port, path] = url_delivery_parts(tgt.url);
 
-        httplib::Client cli(scheme + "://" + host_port);
-        if (!vetted.pinned_ip.empty()) // a resolved name: connect to the address that was vetted
-            cli.set_hostname_addr_map({{vetted.host, vetted.pinned_ip}});
-        cli.set_connection_timeout(5);
-        cli.set_read_timeout(10);
-        cli.set_write_timeout(10);
-
         httplib::Headers headers;
         headers.emplace("Content-Type", "application/json");
         headers.emplace("X-Yuzu-Event", event_type);
@@ -911,7 +911,22 @@ void OffloadTargetStore::deliver_single(const OffloadDeliveryTarget& tgt,
             break;
         }
 
-        auto result = cli.Post(path, headers, payload_body, "application/json");
+        // A resolved name keeps its dual-stack fallback: each vetted address (IPv4 first) is tried
+        // in turn, every one of them judged above. A literal host has nothing to pin.
+        const std::vector<std::string> targets =
+            vetted.pinned_ips.empty() ? std::vector<std::string>{std::string{}} : vetted.pinned_ips;
+        httplib::Result result;
+        for (const auto& ip : targets) {
+            httplib::Client cli(scheme + "://" + host_port);
+            if (!ip.empty())
+                cli.set_hostname_addr_map({{vetted.host, ip}});
+            cli.set_connection_timeout(5);
+            cli.set_read_timeout(10);
+            cli.set_write_timeout(10);
+            result = cli.Post(path, headers, payload_body, "application/json");
+            if (result)
+                break;
+        }
         if (result) {
             status_code = result->status;
         } else {

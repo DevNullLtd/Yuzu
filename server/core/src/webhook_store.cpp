@@ -334,11 +334,11 @@ WebhookStore::create_webhook(const std::string& url, const std::string& event_ty
         return std::unexpected(WebhookWriteError::invalid_url);
     }
     // A LITERAL link-local / metadata / unspecified / multicast / reserved destination is refused
-    // here (F43, #4816); names are vetted at delivery (outbound_destination_guard.hpp).
+    // here (#4816); names are vetted at delivery (outbound_destination_guard.hpp).
     if (url_literal_destination_refused(url)) {
-        spdlog::warn("WebhookStore: rejected webhook whose url is a literal link-local, metadata, "
-                     "unspecified, multicast or reserved address");
-        return std::unexpected(WebhookWriteError::invalid_url);
+        spdlog::warn("WebhookStore: rejected webhook whose url host is a link-local, metadata, "
+                     "unspecified, multicast or reserved address (or a numeric spelling of one)");
+        return std::unexpected(WebhookWriteError::destination_refused);
     }
     if (!open_)
         return std::unexpected(WebhookWriteError::store_unavailable);
@@ -598,20 +598,25 @@ void WebhookStore::deliver_single(const WebhookDeliveryTarget& wh, const std::st
     int status_code = 0;
     std::string error;
 
-    // F43 (#4816): vet the destination BEFORE the secret is decrypted or any socket opened. A name
-    // is resolved ONCE here and the connect below is pinned to the vetted address; an address in
-    // the never-allowed tier (link-local/metadata, unspecified, multicast, reserved), an
-    // unresolvable name and a resolver that is busy all skip the delivery and record why.
+    // Vet the destination BEFORE the secret is decrypted or any socket opened (#4816). A name is
+    // resolved ONCE here (through the delivery resolver pool) and the connects below go only to
+    // addresses that were judged; an address in the never-allowed tier (link-local/metadata,
+    // unspecified, multicast, reserved), an unresolvable name and a busy resolver all decline the
+    // delivery, record why, and are counted under `refused_total{cause}` (NOT delivery_failed_total).
     const VettedDestination vetted = vet_delivery_destination(wh.url);
     if (vetted.verdict != DestinationVerdict::Allow) {
-        const bool refused = vetted.verdict == DestinationVerdict::Refused;
-        spdlog::warn("WebhookStore: delivery to {} (webhook {}) skipped - destination {}{}{}",
-                     url_log_host(wh.url), wh.id, refused ? "refused: " : "unresolved",
-                     refused ? vetted.refused_class : "", refused ? " address" : "");
+        const char* cause = destination_cause(vetted.verdict);
         if (metrics_)
-            metrics_->counter("yuzu_server_webhook_delivery_failed_total").increment();
-        record_delivery(wh.id, event_type, payload_json, 0,
-                        refused ? "destination_refused" : "destination_unresolved");
+            metrics_->counter("yuzu_server_webhook_delivery_refused_total", {{"cause", cause}})
+                .increment();
+        if (refusal_throttle_.admit(wh.id)) {
+            spdlog::warn("WebhookStore: delivery to {} (webhook {}) declined - {}{}{}",
+                         url_log_host(wh.url), wh.id, cause,
+                         *vetted.refused_class != '\0' ? ": " : "", vetted.refused_class);
+            if (refused_sink_)
+                refused_sink_(wh.id, cause, vetted.refused_class, url_audit_detail(wh.url));
+        }
+        record_delivery(wh.id, event_type, payload_json, 0, cause);
         return;
     }
 
@@ -659,13 +664,6 @@ void WebhookStore::deliver_single(const WebhookDeliveryTarget& wh, const std::st
         // One parser for validation and delivery (outbound_url_policy.hpp).
         const auto [scheme, host_port, path] = url_delivery_parts(wh.url);
 
-        httplib::Client cli(scheme + "://" + host_port);
-        if (!vetted.pinned_ip.empty()) // a resolved name: connect to the address that was vetted
-            cli.set_hostname_addr_map({{vetted.host, vetted.pinned_ip}});
-        cli.set_connection_timeout(5);
-        cli.set_read_timeout(10);
-        cli.set_write_timeout(10);
-
         httplib::Headers headers;
         headers.emplace("Content-Type", "application/json");
         headers.emplace("X-Yuzu-Event", event_type);
@@ -674,7 +672,22 @@ void WebhookStore::deliver_single(const WebhookDeliveryTarget& wh, const std::st
             headers.emplace("X-Yuzu-Signature", "sha256=" + *signature);
         }
 
-        auto result = cli.Post(path, headers, payload_json, "application/json");
+        // A resolved name keeps its dual-stack fallback: each vetted address (IPv4 first) is tried
+        // in turn, every one of them judged above. A literal host has nothing to pin.
+        const std::vector<std::string> targets =
+            vetted.pinned_ips.empty() ? std::vector<std::string>{std::string{}} : vetted.pinned_ips;
+        httplib::Result result;
+        for (const auto& ip : targets) {
+            httplib::Client cli(scheme + "://" + host_port);
+            if (!ip.empty())
+                cli.set_hostname_addr_map({{vetted.host, ip}});
+            cli.set_connection_timeout(5);
+            cli.set_read_timeout(10);
+            cli.set_write_timeout(10);
+            result = cli.Post(path, headers, payload_json, "application/json");
+            if (result)
+                break;
+        }
         if (result) {
             status_code = result->status;
         } else {

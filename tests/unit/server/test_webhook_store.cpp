@@ -525,6 +525,19 @@ TEST_CASE("WebhookStore[pg]: a literal link-local or metadata URL is refused at 
         INFO(u);
         auto r = store->create_webhook(u, "agent.registered", "secret");
         REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == WebhookWriteError::destination_refused); // distinct from a typo
+    }
+    // Numeric spellings the OS resolver reads as such an address are refused too.
+    for (const char* u : {"http://2852039166/", "http://0xa9fea9fe/", "http://0/"}) {
+        INFO(u);
+        auto r = store->create_webhook(u, "agent.registered", "secret");
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == WebhookWriteError::destination_refused);
+    }
+    // A typo is still invalid_url, not destination_refused.
+    {
+        auto r = store->create_webhook("ftp://example.com/x", "agent.registered", "secret");
+        REQUIRE_FALSE(r.has_value());
         CHECK(r.error() == WebhookWriteError::invalid_url);
     }
     // Loopback and private receivers are still accepted (owner ruling: not part of this slice).
@@ -535,6 +548,15 @@ TEST_CASE("WebhookStore[pg]: a literal link-local or metadata URL is refused at 
 TEST_CASE("WebhookStore[pg]: a stored row aimed at a metadata address is never connected to",
           "[webhook_store][pg][security]") {
     WebhookStorePg store;
+    yuzu::MetricsRegistry metrics;
+    store->set_metrics(&metrics);
+    int sink_calls = 0;
+    std::string sink_cause;
+    store->set_delivery_refused_sink([&](std::int64_t, std::string_view cause, std::string_view,
+                                         const std::string&) {
+        ++sink_calls;
+        sink_cause = std::string{cause};
+    });
     auto id = store->create_webhook("http://127.0.0.1:1/h", "agent.registered", "");
     REQUIRE(id.has_value());
     // A row that bypassed create (manual SQL, legacy data): delivery-time vetting must still refuse.
@@ -551,4 +573,10 @@ TEST_CASE("WebhookStore[pg]: a stored row aimed at a metadata address is never c
     REQUIRE(deliveries.size() == 1);
     CHECK(deliveries[0].error == "destination_refused"); // never "connection_failed": no connect
     CHECK(deliveries[0].status_code == 0);
+    // Counted as a refusal, NOT as a failed delivery, and the audit sink saw it.
+    CHECK(metrics.counter("yuzu_server_webhook_delivery_refused_total",
+                          {{"cause", "destination_refused"}}).value() == 1.0);
+    CHECK(metrics.counter("yuzu_server_webhook_delivery_failed_total").value() == 0.0);
+    CHECK(sink_calls == 1);
+    CHECK(sink_cause == "destination_refused");
 }

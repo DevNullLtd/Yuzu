@@ -206,10 +206,13 @@ inline std::string format_gib(std::int64_t bytes) {
 }
 
 /// Is `v` an acceptable disk-check VOLUME (the `path` the agent's disk_space.free measures)? EMPTY
-/// means "the platform root". A UNC or device spelling (`\\host\share`, `//host/share`,
-/// `\\?\UNC\...`, `\\.\X`) is refused: on a Windows agent it would make the LocalSystem
-/// service authenticate to that host (F39). A control byte is refused too. The agent refuses the
-/// same shapes (agents/shared/local_path_policy.hpp), so this is the server-side half of one rule.
+/// means "the platform root". A value that STARTS WITH TWO SEPARATORS (`\\host\share`,
+/// `//host/share`, `\\?\UNC\...`, `\\.\X`) is refused: on a Windows agent it would make the
+/// LocalSystem service authenticate to that host. A control byte is refused too. This is a strict
+/// SUBSET of what the agent refuses (agents/shared/local_path_policy.hpp), not the same rule: it
+/// accepts `\??\...`, `\Device\...`, reserved device names and non-fixed drive letters (the agent
+/// refuses those and is the backstop), and it refuses the `\\?\C:\` long-path form the agent
+/// accepts.
 [[nodiscard]] inline bool is_valid_volume(std::string_view v) {
     for (const char c : v) {
         const auto u = static_cast<unsigned char>(c);

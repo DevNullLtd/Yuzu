@@ -123,7 +123,7 @@ std::optional<preflight::PreflightConfig> config_from_req(const httplib::Request
         return std::nullopt;
     c.min_free_gib = *min_gib;
     c.volume = param(req, "volume");
-    if (!preflight::is_valid_volume(c.volume)) // UNC / device spelling: refused (400), F39
+    if (!preflight::is_valid_volume(c.volume)) // UNC / device spelling: refused (400)
         return std::nullopt;
     c.reboot_block = param(req, "reboot") != "warn"; // default block
     return c;

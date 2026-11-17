@@ -795,6 +795,17 @@ TEST_CASE("OffloadTargetStore[pg]: a literal link-local or metadata URL is refus
         INFO(u);
         auto r = store->create_target("t", u, OffloadAuthType::None, "", "*");
         REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == OffloadWriteError::destination_refused); // distinct from validation
+    }
+    for (const char* u : {"http://2852039166/", "http://0xa9fea9fe/", "http://0/"}) {
+        INFO(u);
+        auto r = store->create_target("t2", u, OffloadAuthType::None, "", "*");
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == OffloadWriteError::destination_refused);
+    }
+    {
+        auto r = store->create_target("t3", "ftp://example.com/x", OffloadAuthType::None, "", "*");
+        REQUIRE_FALSE(r.has_value());
         CHECK(r.error() == OffloadWriteError::invalid_input);
     }
     CHECK(store->create_target("lo", "http://127.0.0.1:1/h", OffloadAuthType::None, "", "*").has_value());
@@ -804,6 +815,11 @@ TEST_CASE("OffloadTargetStore[pg]: a literal link-local or metadata URL is refus
 TEST_CASE("OffloadTargetStore[pg]: a stored row aimed at a metadata address is never connected to",
           "[offload_store][pg][security]") {
     OffloadTargetStorePg store;
+    yuzu::MetricsRegistry metrics;
+    store->set_metrics(&metrics);
+    int sink_calls = 0;
+    store->set_delivery_refused_sink([&](std::int64_t, std::string_view, std::string_view,
+                                         const std::string&) { ++sink_calls; });
     auto id = store->create_target("t", "http://127.0.0.1:1/h", OffloadAuthType::None, "",
                                    "agent.registered");
     REQUIRE(id.has_value());
@@ -825,4 +841,8 @@ TEST_CASE("OffloadTargetStore[pg]: a stored row aimed at a metadata address is n
     REQUIRE(d.size() == 1);
     CHECK(d[0].error == "destination_refused");
     CHECK(d[0].status_code == 0);
+    CHECK(metrics.counter("yuzu_server_offload_delivery_refused_total",
+                          {{"cause", "destination_refused"}}).value() == 1.0);
+    CHECK(metrics.counter("yuzu_server_offload_delivery_failed_total").value() == 0.0);
+    CHECK(sink_calls == 1);
 }

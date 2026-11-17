@@ -181,7 +181,21 @@ void mount(HttpRouteSink& sink, OffloadRoutes::PermFn perm_fn, OffloadRoutes::Au
                       // mistake (400); store_unavailable/db_error are
                       // store/infra degradation (503) — distinct in the
                       // audit record even where the HTTP status collapses.
-                      if (result.error() == OffloadWriteError::invalid_input) {
+                      if (result.error() == OffloadWriteError::destination_refused) {
+                          // Distinct from validation_failed: aiming a target at a link-local /
+                          // cloud-metadata / unspecified / multicast / reserved address (or a
+                          // numeric spelling of one) is a security-relevant event of its own.
+                          (void)detail::emit_behavioral_audit(audit_fn, req, res, "offload_target.create", "denied", "offload_target", audit_token(name),
+                                   "destination_refused");
+                          res.status = 400;
+                          res.set_content(
+                              detail::a4_error(res, "target rejected: url host is a link-local, "
+                                                     "cloud-metadata, unspecified, multicast or "
+                                                     "reserved address (or a numeric spelling of "
+                                                     "one); offload destinations may not be in "
+                                                     "those address classes"),
+                              "application/json");
+                      } else if (result.error() == OffloadWriteError::invalid_input) {
                           (void)detail::emit_behavioral_audit(audit_fn, req, res, "offload_target.create", "denied", "offload_target", audit_token(name),
                                    "validation_failed");
                           res.status = 400;

@@ -2533,13 +2533,15 @@ TEST_CASE("MCP 2g PR2: every tool advertises all four spec hints, coherent with 
         const bool idempotent = a["idempotentHint"];
         const bool open_world = a["openWorldHint"];
 
-        // Closed managed fleet: never open-world, with EXACTLY two exceptions (ADR-0070 R1,
-        // slice 2b-1a): register_revocation_source and update_revocation_source resolve the
-        // administrator-registered CRL host to show its address class, the only outbound reach
-        // any tool has (no tool fetches a CRL; the refresh job does). A third open-world tool is
-        // a new outbound surface and needs its own security review, not an edit here.
+        // Closed managed fleet: never open-world, with EXACTLY three exceptions: (ADR-0070 R1,
+        // slice 2b-1a) register_revocation_source and update_revocation_source resolve the
+        // administrator-registered CRL host to show its address class; and create_offload_target,
+        // whose url the server POSTs fleet events to (the outbound reach is the delivery worker's,
+        // registered by this call; its destination-address guard is #4816). A further open-world
+        // tool is a new outbound surface and needs its own security review, not an edit here.
         CHECK(open_world == (name == "register_revocation_source" ||
-                             name == "update_revocation_source"));
+                             name == "update_revocation_source" ||
+                             name == "create_offload_target"));
         // readOnlyHint is mechanically the Read operation.
         CHECK(read_only == (operation == "Read"));
         // Coherence: a read-only tool is neither destructive, and reads are idempotent.

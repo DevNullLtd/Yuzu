@@ -718,6 +718,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/services/src'),      # services_macos_launchd.hpp (P8 test)
     include_directories('../agents/plugins/msi_packages/src'),  # msi_packages_macos.hpp (P8 test)
     include_directories('../agents/plugins/bitlocker/src'),     # bitlocker_macos_apfs.hpp (P8 test); Wave 3: bitlocker_windows_wmi.hpp, bitlocker_linux_parsers.hpp
+    include_directories('../agents/plugins/http_client/src'),   # http_client_download.hpp (pure completeness/finalize rules)
     include_directories('../agents/plugins/filesystem/src'),    # filesystem_macos_sig.hpp (#2273/1.14); filesystem_acl_parsers.hpp (get_acl parser + dispatcher tests)
     include_directories('../agents/plugins/event_logs/src'),    # event_logs_macos.hpp (BR-08)
     include_directories('../agents/plugins/certificates/src'),  # certificates_macos_parsers.hpp (Gate-7 FIX A: pure helpers shared with the plugin)
@@ -851,11 +852,13 @@ agent_test_exe = executable(
                 content_dist_plugin_lib,
                 disk_actions_plugin_lib,
                 device_identity_plugin_lib,
+                disk_space_plugin_lib,  # WP10: test_local_path_policy.cpp loads the real disk_space plugin by path
                 echo_argv_fixture,
                 event_logs_plugin_lib,
                 filesystem_plugin_lib,  # #4728 test_filesystem_local_dispatcher.cpp and the get_acl dispatcher test load the real filesystem plugin by path
                 filesystem_posture_plugin_lib,
                 hardware_plugin_lib,
+                http_client_plugin_lib,  # WP10: test_local_path_policy.cpp loads the real http_client plugin by path
                 installed_apps_plugin_lib,
                 invalid_name_fixture_plugin,
                 ioc_plugin_lib,
@@ -1684,6 +1687,7 @@ if build_server
       'unit/server/test_oidc_principal.cpp',
       'unit/server/test_oidc_provider.cpp',
       'unit/server/test_oidc_https.cpp', # #5692: discovery + JWKS over TLS, incl. the handler-thread leg
+      'unit/server/test_egress_classifier_parity.cpp', # WP10: server oidc_egress_policy.hpp vs the agent twin outbound_address_policy.hpp over one address table
       'unit/server/test_outbound_destination_guard.cpp', # WP10/F43 (#4816): pure webhook/offload destination-address guard (refused tier, resolve-once pin)
       'unit/server/test_oidc_egress_policy.cpp', # #5692: pure address-class policy for OIDC fetches
       'unit/server/test_oidc_egress.cpp', # #5692: the policy applied to real fetches (pin, refusal, cross-host)
@@ -2159,6 +2163,7 @@ if build_server
       # table matches the agent parser (contract G9 drift guard). Header-only
       # constexpr — no link to yuzu_agent_core, just the include path.
       include_directories('../agents/core/include'),
+      include_directories('../agents/shared'),  # test_egress_classifier_parity.cpp: the agent outbound_address_policy.hpp twin
       # Tag-key pins: test_spark_fleet_tags.cpp includes the agent's
       # spark_heartbeat.hpp (emit_spark_heartbeat_tags),
       # test_guardian_journal_fleet_tags.cpp includes guardian_journal_heartbeat.hpp
@@ -3973,6 +3978,16 @@ test('disk_actions definition columns',
   args: [files('test_disk_actions_definition.py')],
   suite: 'docs',
   timeout: 30,
+)
+
+# filesystem.exists must refuse a network/device path up front and never fall back to the raw
+# caller path (WP10 review finding; the refusal is Windows-only code, so this pins the shape on
+# every host). Also runs in .github/workflows/docs-lint.yml.
+test('filesystem exists no raw fallback',
+  _python3_test,
+  args: [files('test_filesystem_exists_no_raw_fallback_lexical.py')],
+  suite: 'docs',
+  timeout: 10,
 )
 
 # disk_space `path` refuses a UNC / device spelling server-side (F39; the agent refuses it too).

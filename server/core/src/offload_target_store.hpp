@@ -50,11 +50,13 @@
 /// The `fire_event` call path is fire-and-forget and dispatches onto the
 /// bounded worker pool so a slow endpoint can't drown the server.
 
+#include "refusal_throttle.hpp"
 #include "store_worker_pool.hpp"
 
 #include <chrono>
 #include <cstdint>
 #include <expected>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -129,6 +131,8 @@ inline constexpr int kMaxOffloadBatchSize = 10000;
 /// REST seam, mirrors `WebhookWriteError`). `invalid_input` is a CALLER
 /// error (400); the other two are store/infra degradation (503).
 enum class OffloadWriteError {
+    destination_refused, ///< the url host is a link-local/metadata/unspecified/multicast/reserved
+                         ///< address (or a numeric spelling of one) — caller error, 400, audited distinctly
     invalid_input,     ///< empty name/url, bad url scheme, batch_size outside 1..kMaxOffloadBatchSize, duplicate name,
                        ///< or a control byte in a free-text field — caller error, 400
     store_unavailable, ///< not open / pool exhausted / codec unavailable — 503
@@ -177,6 +181,12 @@ public:
     /// Wire a metrics sink for delivery outcome counters. Set-before-traffic
     /// contract, same as DexAlertRouter::set_metrics.
     void set_metrics(yuzu::MetricsRegistry* metrics);
+
+    /// As WebhookStore::set_delivery_refused_sink, for an offload target.
+    using DeliveryRefusedFn = std::function<void(std::int64_t target_id, std::string_view cause,
+                                                 std::string_view destination_class,
+                                                 const std::string& url_detail)>;
+    void set_delivery_refused_sink(DeliveryRefusedFn fn) { refused_sink_ = std::move(fn); }
 
     /// Stop accepting new deliveries and wait up to `timeout` for every
     /// queued/in-flight delivery to finish. Returns true if fully drained.
@@ -284,6 +294,8 @@ private:
     pg::SecretCodec& secret_codec_;
     bool open_{false};
     yuzu::MetricsRegistry* metrics_{nullptr};
+    DeliveryRefusedFn refused_sink_;
+    RefusalThrottle refusal_throttle_;
 
     /// Delivery-time view of one target: carries the still-ENCRYPTED
     /// credential blob (or none), never plaintext — decrypt happens in
