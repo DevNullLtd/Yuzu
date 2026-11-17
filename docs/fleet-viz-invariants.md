@@ -376,6 +376,12 @@ Standing rules:
 
 ## Push-ingestion invariants — PR 10
 
+> **Amendment pending: ADR-0073 (liveness-only heartbeat, proposed 2026-10-29, PR #6704).** ADR-0073
+> moves the topology body off the heartbeat onto `AgentService.ReportTopology` (field 4 deprecated
+> and ignored), derives topology liveness from a heartbeat digest, and replaces evict-on-disconnect
+> with a 300 s retain-on-disconnect (its D5-D7 and D10). Nothing has changed in the product yet:
+> until ADR-0073 is Accepted and lands, this section describes what ships.
+
 - **`fleet_snapshot_json` is additive proto field 4 on
   `HeartbeatRequest`.** Agents push the JSON every 30 s on their
   snapshot-pump cadence; server ingests via

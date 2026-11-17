@@ -2,7 +2,8 @@
 .SYNOPSIS
     Provision the unprivileged Windows account the Yuzu agent runs under,
     plus the narrow privilege grants it needs to operate plugins like
-    quarantine, services.set_start_mode, and registry writes against HKLM.
+    the firewall containment actions, services.set_start_mode, and registry
+    writes against HKLM.
 
 .DESCRIPTION
 
@@ -104,8 +105,8 @@ WHAT THIS SCRIPT DOES NOT DO
     `meson install` (dev) for that.
 - Register the agent service with the SCM (`sc.exe create`). That happens
     at MSI install or in `scripts/start-UAT.ps1`.
-- Configure Windows Firewall rules. The quarantine plugin manages those
-    via `netsh advfirewall` at runtime.
+- Configure Windows Firewall rules. The firewall plugin's containment
+    actions manage those through the Windows Firewall API at runtime.
 - Provision certificates. The agent gets its mTLS material from the
     server enrollment flow.
 

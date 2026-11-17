@@ -11283,3 +11283,567 @@ TEST_CASE("UP-14: the Spark runtime co-owns the engine's emit source and keeps i
     }
     CHECK(weak.expired());
 }
+
+// ── #5605: GuardianEngine::baseline_unpersisted() ─────────────────────────────────────────────
+// The CURRENT staging-map size, read lock-free through the published persister. It is nullopt
+// whenever no persister is published or prefer_spark_ is off (the tag is then omitted), and a
+// present 0 only ever means "no capture waiting at this persister". See the accessor's doc.
+namespace {
+const std::string kHash5605(64, 'a');
+} // namespace
+
+TEST_CASE("#5605 T6: a pass that throws before its first write leaves the backlog visible "
+          "(a pass-end count would read a false 0)",
+          "[spark][guardian][baseline][5605]") {
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    f.engine->drain_worker_for_test()->stop(); // parked: only apply_rules runs a pass
+    auto* persister = f.engine->baseline_persister_for_test();
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(persister != nullptr);
+    REQUIRE(rt != nullptr);
+    REQUIRE(f.engine->baseline_unpersisted() == std::optional<std::uint64_t>{0});
+
+    rt->stage_baseline_for_test("r1", "/yuzu_test_5605_t6", kHash5605);
+    CHECK(f.engine->baseline_unpersisted() == std::optional<std::uint64_t>{1});
+
+    // One thrown Forced pass through the engine firewall (apply_rules' drain): the snapshot
+    // throws before any write and staging is untouched.
+    const auto firewalled_before = persister->firewalled_exceptions();
+    rt->fail_next_snapshot_for_test();
+    Spark4045Target t;
+    f.apply(make_file_hash_rule("r2", t.file().string())); // absent target: stages nothing
+    REQUIRE(persister->firewalled_exceptions() == firewalled_before + 1);
+    CHECK(rt->staged_baseline_count_for_test() == 1);
+    CHECK(f.engine->baseline_unpersisted() == std::optional<std::uint64_t>{1});
+}
+
+TEST_CASE("#5605 T7: a failing store holds the gauge at the backlog and a recovered store "
+          "returns it to a present 0",
+          "[spark][guardian][baseline][5605]") {
+    Spark4045Target t;
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    const fs::path target = t.file(); // ABSENT at apply(): see the ARM-TIME EVAL note
+    f.engine->drain_worker_for_test()->stop();
+
+    f.apply(make_file_hash_rule("r1", target.string()));
+    fail_baseline_writes_4045(f.db_.path);
+    Spark4045Target::write(target, "content A");
+    eval_initial_4045(*f.engine, target); // staged
+    CHECK(f.engine->baseline_unpersisted() == std::optional<std::uint64_t>{1});
+    const auto failed_pass = persist_now_4045(*f.engine);
+    CHECK(failed_pass.failed == 1);
+    CHECK(f.engine->baseline_persist_failures() >= 1);
+    CHECK(f.engine->baseline_unpersisted() == std::optional<std::uint64_t>{1}); // still waiting
+
+    heal_baseline_writes_4045(f.db_.path);
+    const auto ok_pass = persist_now_4045(*f.engine);
+    CHECK(ok_pass.written == 1);
+    CHECK(f.engine->baseline_unpersisted() == std::optional<std::uint64_t>{0}); // present, not nullopt
+}
+
+TEST_CASE("#5605 T8: a refused capture leaves the backlog without counting a failure",
+          "[spark][guardian][baseline][5605]") {
+    Spark4045Target t;
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    const fs::path target = t.file();
+    f.engine->drain_worker_for_test()->stop();
+    f.apply(make_file_hash_rule("r1", target.string()));
+
+    // A same-fingerprint record already exists: the #4021 overwrite guard refuses the capture.
+    nlohmann::json existing;
+    existing["schema"] = 1;
+    existing["fingerprint"] = baseline_fingerprint_4045(target);
+    existing["hash"] = kHash5605;
+    REQUIRE(f.kv->set(GuardianEngine::kv_namespace(), "baseline:r1", existing.dump()));
+    f.engine->spark_runtime_for_test()->stage_baseline_for_test("r1", target.string(),
+                                                                 std::string(64, 'b'));
+    REQUIRE(f.engine->baseline_unpersisted() == std::optional<std::uint64_t>{1});
+
+    const auto failures_before = f.engine->baseline_persist_failures();
+    const auto out = persist_now_4045(*f.engine);
+    CHECK(out.refused == 1);
+    CHECK(f.engine->baseline_unpersisted() == std::optional<std::uint64_t>{0});
+    CHECK(f.engine->baseline_persist_refusals() == 1);
+    CHECK(f.engine->baseline_persist_failures() == failures_before); // cumulative tag unchanged
+}
+
+TEST_CASE("#5605 T9: a re-push that inherits a staged capture does not double-count it",
+          "[spark][guardian][baseline][5605]") {
+    Spark4045Target t;
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    const fs::path target = t.file();
+    f.engine->drain_worker_for_test()->stop();
+    fail_baseline_writes_4045(f.db_.path); // rule and journal writes keep succeeding
+    Spark4045Target::write(target, "content A");
+
+    f.apply(make_file_hash_rule("r1", target.string())); // arm-time eval stages the capture
+    // The arm-time evaluation runs on a convergence lane, so the staging is asynchronous to
+    // apply(): bound the wait instead of reading the count once (a 3-in-560 flake otherwise).
+    REQUIRE(yuzu::test::spin_until(
+        [&] { return f.engine->baseline_unpersisted() == std::optional<std::uint64_t>{1}; }));
+    f.apply(make_file_hash_rule("r1", target.string())); // same id again: attach_core inherits
+    CHECK(f.engine->baseline_unpersisted() == std::optional<std::uint64_t>{1}); // not 2
+
+    heal_baseline_writes_4045(f.db_.path);
+    (void)persist_now_4045(*f.engine);
+    CHECK(f.engine->baseline_unpersisted() == std::optional<std::uint64_t>{0});
+}
+
+TEST_CASE("#5605 T10: prefer_spark=false reports nullopt even with a wired, published persister",
+          "[spark][guardian][baseline][5605]") {
+    auto opened = KvStore::open(unique_kv_path());
+    REQUIRE(opened.has_value());
+    KvStore kv{std::move(*opened)};
+    yuzu::agent::SparkEngine spark_engine;
+    REQUIRE(spark_engine.register_mechanism(SparkType::Service,
+                                            std::make_unique<FakeServiceMechanism>())
+                .has_value());
+    spark_engine.start();
+    GuardianEngine engine{&kv, "agent-test", /*prefer_spark=*/false};
+    REQUIRE(engine.start_local().has_value());
+    engine.wire_spark_engine(&spark_engine, /*spark_disabled_by_config=*/false,
+                             [](const OutboxEntry&) { return SendResult::Sent; });
+    REQUIRE(engine.spark_availability() == GuardianEngine::SparkAvailability::Available);
+    REQUIRE(engine.baseline_persister_for_test() != nullptr); // the persister IS wired...
+    engine.spark_runtime_for_test()->stage_baseline_for_test("r1", "/yuzu_test_5605_t10", kHash5605);
+    CHECK_FALSE(engine.baseline_unpersisted().has_value()); // ...and the gauge is still dormant
+    engine.stop();
+    spark_engine.stop();
+}
+
+TEST_CASE("#5605 T11: prefer_spark=true reports nullopt before wiring and a present 0 after",
+          "[spark][guardian][baseline][5605]") {
+    auto opened = KvStore::open(unique_kv_path());
+    REQUIRE(opened.has_value());
+    KvStore kv{std::move(*opened)};
+    yuzu::agent::SparkEngine spark_engine;
+    REQUIRE(spark_engine.register_mechanism(SparkType::Service,
+                                            std::make_unique<FakeServiceMechanism>())
+                .has_value());
+    spark_engine.start();
+    GuardianEngine engine{&kv, "agent-test", /*prefer_spark=*/true};
+    REQUIRE(engine.start_local().has_value());
+    REQUIRE(engine.spark_availability() == GuardianEngine::SparkAvailability::Unwired);
+    CHECK_FALSE(engine.baseline_unpersisted().has_value());
+
+    engine.wire_spark_engine(&spark_engine, /*spark_disabled_by_config=*/false,
+                             [](const OutboxEntry&) { return SendResult::Sent; });
+    REQUIRE(engine.spark_availability() == GuardianEngine::SparkAvailability::Available);
+    CHECK(engine.baseline_unpersisted() == std::optional<std::uint64_t>{0});
+    engine.stop();
+    spark_engine.stop();
+}
+
+TEST_CASE("#5605 T12: a wiring that fails AFTER the persister was published reads nullopt, "
+          "not a live 0 (Dave's ruling Q1: rollback unpublishes)",
+          "[spark][guardian][baseline][5605]") {
+    auto opened = KvStore::open(unique_kv_path());
+    REQUIRE(opened.has_value());
+    KvStore kv{std::move(*opened)};
+    // A stopped SparkEngine refuses register_consumer ("engine is stopped"), which is the
+    // failure point AFTER the persister is constructed and published and BEFORE the scheduler
+    // and worker exist: the rollback path runs with the persister published.
+    yuzu::agent::SparkEngine spark_engine;
+    spark_engine.start();
+    spark_engine.stop();
+    GuardianEngine engine{&kv, "agent-test", /*prefer_spark=*/true};
+    REQUIRE(engine.start_local().has_value());
+    engine.wire_spark_engine(&spark_engine, /*spark_disabled_by_config=*/false,
+                             [](const OutboxEntry&) { return SendResult::Sent; });
+    REQUIRE(engine.spark_availability() == GuardianEngine::SparkAvailability::SparkFailed);
+    // The persister object was constructed (the failure really was after the publish point)
+    // and is still alive for a reader that loaded the pointer before the clear...
+    CHECK(engine.baseline_persister_for_test() != nullptr);
+    // ...but it is no longer published: the gauge is dormant, and the cumulative reader too.
+    CHECK_FALSE(engine.baseline_unpersisted().has_value());
+    CHECK(engine.baseline_persist_failures() == 0);
+}
+
+TEST_CASE("#5605 T12b: a poller reading the heartbeat getters while a wiring fails after the "
+          "publish never sees a value other than nullopt or a present 0",
+          "[spark][guardian][baseline][5605]") {
+    // Written for ThreadSanitizer as much as for the assertions: the getters are lock-free and
+    // read the published persister pointer while wire_spark_engine's rollback clears it.
+    auto opened = KvStore::open(unique_kv_path());
+    REQUIRE(opened.has_value());
+    KvStore kv{std::move(*opened)};
+    yuzu::agent::SparkEngine spark_engine;
+    spark_engine.start();
+    spark_engine.stop(); // register_consumer will refuse: a failure AFTER the publish point
+    GuardianEngine engine{&kv, "agent-test", /*prefer_spark=*/true};
+    REQUIRE(engine.start_local().has_value());
+
+    std::atomic<bool> stop_poller{false};
+    std::atomic<bool> bad_value{false};
+    std::atomic<std::uint64_t> reads{0};
+    std::thread poller([&] {
+        while (!stop_poller.load(std::memory_order_acquire)) {
+            const auto v = engine.baseline_unpersisted();
+            if (v && *v != 0) // nothing was ever staged: only nullopt or a present 0 is truthful
+                bad_value.store(true);
+            if (engine.baseline_persist_failures() != 0)
+                bad_value.store(true);
+            reads.fetch_add(1, std::memory_order_relaxed);
+        }
+    });
+    Join4045 join{poller};
+    // Declared after the join guard so it runs FIRST on any exit, including a REQUIRE that
+    // throws: the poller loops until stop_poller is set, so without this the join would wait
+    // forever. The normal path also stores it (idempotent) before its explicit join below.
+    yuzu::test::ScopeExit stop_on_unwind{
+        [&] { stop_poller.store(true, std::memory_order_release); }};
+    REQUIRE(yuzu::test::spin_until([&] { return reads.load() > 0; })); // the poller is running
+    engine.wire_spark_engine(&spark_engine, /*spark_disabled_by_config=*/false,
+                             [](const OutboxEntry&) { return SendResult::Sent; });
+    const auto reads_at_wire_end = reads.load();
+    REQUIRE(yuzu::test::spin_until([&] { return reads.load() > reads_at_wire_end + 100; }));
+    stop_poller.store(true, std::memory_order_release);
+    poller.join();
+
+    CHECK(engine.spark_availability() == GuardianEngine::SparkAvailability::SparkFailed);
+    CHECK_FALSE(bad_value.load());
+    CHECK_FALSE(engine.baseline_unpersisted().has_value()); // rolled back: dormant, not a live 0
+}
+
+TEST_CASE("#5605 T13: after stop() the residual a failed Stop pass left is still reported",
+          "[spark][guardian][baseline][5605]") {
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    f.engine->drain_worker_for_test()->stop();
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(rt != nullptr);
+    fail_baseline_writes_4045(f.db_.path);
+    rt->stage_baseline_for_test("r1", "/yuzu_test_5605_t13", kHash5605);
+    REQUIRE(f.engine->baseline_unpersisted() == std::optional<std::uint64_t>{1});
+
+    f.engine->stop(); // the Stop pass fails to write it: the process will lose this capture
+    // The persister stays published past stop(), so a heartbeat tick before the thread joins
+    // truthfully reports what is about to be lost.
+    CHECK(f.engine->baseline_unpersisted() == std::optional<std::uint64_t>{1});
+    heal_baseline_writes_4045(f.db_.path);
+}
+
+TEST_CASE("#5605 T13b: baseline_unpersisted() never waits on mtx_",
+          "[spark][guardian][baseline][5605]") {
+    // Probed from another thread while apply_rules holds mtx_ (the post-drain hook runs with
+    // mtx_ held), bounded by spin_until, so a regression to an mtx_-taking getter fails the
+    // CHECK instead of hanging the binary (the E21 shape).
+    Spark4045Target t;
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    f.engine->drain_worker_for_test()->stop();
+    f.engine->spark_runtime_for_test()->stage_baseline_for_test("r9", "/yuzu_test_5605_t13b",
+                                                                 kHash5605);
+
+    std::atomic<bool> got{false};
+    std::atomic<std::uint64_t> seen{99};
+    std::thread probe;
+    Join4045 join_probe{probe};
+    std::atomic<bool> hook_ok{false};
+    HookGuard4045 hooks{*f.engine};
+    f.engine->set_apply_post_drain_hook_for_test([&] {
+        probe = std::thread([&] {
+            const auto v = f.engine->baseline_unpersisted();
+            seen.store(v ? *v : 1000);
+            got.store(true);
+        });
+        hook_ok.store(yuzu::test::spin_until([&] { return got.load(); }));
+    });
+    f.apply(make_file_hash_rule("r1", t.file().string()));
+    f.engine->set_apply_post_drain_hook_for_test(nullptr);
+    CHECK(hook_ok.load()); // RED if the getter takes mtx_ (it would wait for apply_rules)
+    CHECK(seen.load() <= 1); // r9 may or may not have been drained by apply_rules' own pass
+    if (probe.joinable())
+        probe.join();
+}
+
+// ── #5605: the boot re-arm "no persisted baseline" counter ────────────────────────────────────
+// baseline_rebaselined_at_boot() counts, once per rule per boot, a `file-hash-equals` rule with
+// no authored expected_hash whose boot seed lookup (start_local's walk) found NO record. These
+// pin which read outcomes count, that both backends count once, and that nothing after the
+// walk (apply_rules) does.
+namespace {
+
+/// One restartable incarnation over an existing KV file, with a File mechanism so a
+/// prefer_spark=true engine arms the rule through the real Spark backend. Construction does NOT
+/// wire or start: the test chooses the order.
+struct Boot5605 {
+    std::unique_ptr<KvStore> kv;
+    std::unique_ptr<SparkEngine> spark_engine;
+    FakeServiceMechanism* mechanism{nullptr};
+    std::unique_ptr<GuardianEngine> engine;
+
+    Boot5605(const fs::path& db_path, bool prefer_spark) {
+        auto opened = KvStore::open(db_path);
+        REQUIRE(opened.has_value());
+        kv = std::make_unique<KvStore>(std::move(*opened));
+        spark_engine = std::make_unique<SparkEngine>();
+        auto mech = std::make_unique<FakeServiceMechanism>();
+        mechanism = mech.get();
+        REQUIRE(spark_engine->register_mechanism(SparkType::File, std::move(mech)).has_value());
+        spark_engine->start();
+        engine = std::make_unique<GuardianEngine>(kv.get(), "agent-test", prefer_spark);
+    }
+    Boot5605(const Boot5605&) = delete;
+    Boot5605& operator=(const Boot5605&) = delete;
+    ~Boot5605() {
+        if (mechanism)
+            mechanism->release_all_gates();
+        if (engine &&
+            !yuzu::test::spin_until([this] { return engine->active_io_workers() == 0; },
+                                    std::chrono::seconds{10})) {
+            std::fprintf(stderr, "Boot5605: workers still alive after the bounded wait\n");
+        }
+        engine.reset();
+        spark_engine->stop();
+    }
+    void wire() {
+        engine->wire_spark_engine(spark_engine.get(), /*spark_disabled_by_config=*/false,
+                                  [](const OutboxEntry&) { return SendResult::Sent; });
+        REQUIRE(engine->spark_availability() == GuardianEngine::SparkAvailability::Available);
+    }
+    void put_record(const std::string& rule_id, const std::string& payload) {
+        REQUIRE(kv->set(GuardianEngine::kv_namespace(), "baseline:" + rule_id, payload));
+    }
+    void push(const std::vector<gpb::GuaranteedStateRule>& rules, std::uint64_t generation) {
+        REQUIRE(yuzu::agent::guardian_dispatch_push_bytes_for_test(
+                    *engine, push_bytes_5513(rules, generation))
+                    .exit_code == 0);
+    }
+};
+
+/// Phase 1: persist `rules` (full_sync, generation 1) in a throwaway legacy incarnation whose
+/// target is ABSENT, so no baseline is ever captured. Returns the KV path (owned by `rig`).
+fs::path seed_rules_5605(BootRig5513& rig, const std::vector<gpb::GuaranteedStateRule>& rules) {
+    rig.seed(/*prefer_spark=*/false, /*with_spark=*/false, rules, /*generation=*/1);
+    return rig.db_.path;
+}
+
+std::string baseline_json_5605(const std::string& fingerprint, const std::string& hash) {
+    nlohmann::json j;
+    j["schema"] = 1;
+    j["fingerprint"] = fingerprint;
+    j["hash"] = hash;
+    return j.dump();
+}
+
+} // namespace
+
+TEST_CASE("#5605 T14: an Absent record counts exactly once per rule, on the Spark backend and "
+          "on the legacy backend (whose arm seeds a second time)",
+          "[spark][guardian][baseline][boot][5605]") {
+    Spark4045Target t;
+    const fs::path target = t.file(); // never created: nothing can have been captured
+    const auto rule = make_file_hash_rule("r1", target.string());
+    for (const bool prefer_spark : {true, false}) {
+        CAPTURE(prefer_spark);
+        BootRig5513 rig;
+        const fs::path db = seed_rules_5605(rig, {rule});
+        {
+            // The seed incarnation really left no record, so Absent is what the boot reads.
+            Boot5605 probe{db, false};
+            auto raw = probe.kv->get_entry(GuardianEngine::kv_namespace(), "baseline:r1");
+            REQUIRE(raw.has_value());
+            REQUIRE_FALSE(raw->has_value());
+        }
+        Boot5605 b{db, prefer_spark};
+        CHECK(b.engine->baseline_rebaselined_at_boot() == 0);
+        if (prefer_spark)
+            b.wire(); // the production order: wire BEFORE start_local
+        REQUIRE(b.engine->start_local().has_value());
+        CHECK(b.engine->baseline_rebaselined_at_boot() == 1); // exactly 1, never 2
+    }
+}
+
+TEST_CASE("#5605 T15: a matching persisted record does not count",
+          "[spark][guardian][baseline][boot][5605]") {
+    Spark4045Target t;
+    const fs::path target = t.file();
+    BootRig5513 rig;
+    const fs::path db = seed_rules_5605(rig, {make_file_hash_rule("r1", target.string())});
+    Boot5605 b{db, /*prefer_spark=*/true};
+    b.put_record("r1", baseline_json_5605(baseline_fingerprint_4045(target), kHash5605));
+    b.wire();
+    REQUIRE(b.engine->start_local().has_value());
+    CHECK(b.engine->baseline_rebaselined_at_boot() == 0);
+}
+
+TEST_CASE("#5605 T16: a record for a different target (a retarget) does not count",
+          "[spark][guardian][baseline][boot][5605]") {
+    Spark4045Target t;
+    const fs::path target = t.file();
+    BootRig5513 rig;
+    const fs::path db = seed_rules_5605(rig, {make_file_hash_rule("r1", target.string())});
+    Boot5605 b{db, /*prefer_spark=*/true};
+    b.put_record("r1", baseline_json_5605(baseline_fingerprint_4045(t.file("other.txt")), kHash5605));
+    b.wire();
+    REQUIRE(b.engine->start_local().has_value());
+    CHECK(b.engine->baseline_rebaselined_at_boot() == 0);
+}
+
+TEST_CASE("#5605 T17: a malformed record (bad JSON, or a wrong schema) does not count",
+          "[spark][guardian][baseline][boot][5605]") {
+    // ReadError at boot has no clean seam here (start_local reads the rule list from the same
+    // store, so a dropped table removes the rules too); it is not counted by construction
+    // (only Absent is) and is listed as could-not-verify, not tested.
+    Spark4045Target t;
+    const fs::path target = t.file();
+    const std::string fp = baseline_fingerprint_4045(target);
+    nlohmann::json wrong_schema = nlohmann::json::parse(baseline_json_5605(fp, kHash5605));
+    wrong_schema["schema"] = 999;
+    for (const std::string& payload : {std::string{"{this is not json"}, wrong_schema.dump()}) {
+        CAPTURE(payload);
+        BootRig5513 rig;
+        const fs::path db = seed_rules_5605(rig, {make_file_hash_rule("r1", target.string())});
+        Boot5605 b{db, /*prefer_spark=*/true};
+        b.put_record("r1", payload);
+        b.wire();
+        REQUIRE(b.engine->start_local().has_value());
+        CHECK(b.engine->baseline_rebaselined_at_boot() == 0);
+    }
+}
+
+TEST_CASE("#5605 T18: an apply_rules push after boot does not count",
+          "[spark][guardian][baseline][boot][5605]") {
+    Spark4045Target t;
+    const auto rule = make_file_hash_rule("r1", t.file().string());
+    BootRig5513 rig;
+    const fs::path db = seed_rules_5605(rig, {rule});
+    Boot5605 b{db, /*prefer_spark=*/true};
+    b.wire();
+    REQUIRE(b.engine->start_local().has_value());
+    REQUIRE(b.engine->baseline_rebaselined_at_boot() == 1);
+    // The same rule again, and a brand-new rule with no record: both read Absent in
+    // reconcile_rule_locked, but the boot walk is over, so neither counts.
+    b.push({rule, make_file_hash_rule("r2", t.file("second.txt").string())}, 2);
+    CHECK(b.engine->baseline_rebaselined_at_boot() == 1);
+}
+
+TEST_CASE("#5605 T19: the count survives an Unwired agent and a throw after the seed read, a "
+          "disabled rule is not counted, and the boot flag is cleared on every exit",
+          "[spark][guardian][baseline][boot][5605]") {
+    Spark4045Target t;
+    const auto rule = make_file_hash_rule("r1", t.file().string());
+
+    SECTION("reversed wiring order: start_local before wire_spark_engine still counts") {
+        BootRig5513 rig;
+        const fs::path db = seed_rules_5605(rig, {rule});
+        Boot5605 b{db, /*prefer_spark=*/true};
+        REQUIRE(b.engine->start_local().has_value()); // Unwired: the seed read precedes Inert
+        CHECK(b.engine->spark_availability() == GuardianEngine::SparkAvailability::Unwired);
+        CHECK(b.engine->baseline_rebaselined_at_boot() == 1);
+    }
+    SECTION("a disabled rule is never re-armed, so it is not counted") {
+        auto disabled = rule;
+        disabled.set_enabled(false);
+        BootRig5513 rig;
+        const fs::path db = seed_rules_5605(rig, {disabled});
+        Boot5605 b{db, /*prefer_spark=*/true};
+        b.wire();
+        REQUIRE(b.engine->start_local().has_value());
+        CHECK(b.engine->baseline_rebaselined_at_boot() == 0);
+    }
+    SECTION("a throw AFTER the seed read keeps the count, and the flag is cleared") {
+        BootRig5513 rig;
+        const fs::path db = seed_rules_5605(rig, {rule});
+        Boot5605 b{db, /*prefer_spark=*/true};
+        b.wire();
+        std::atomic<int> thrown{0};
+        b.engine->set_seed_read_hook_for_test([&](const std::string& rule_id) {
+            if (rule_id == "r1" && thrown.fetch_add(1) == 0)
+                throw std::runtime_error("injected after the seed read"); // boot arm only
+        });
+        REQUIRE(b.engine->start_local().has_value()); // the walk degrades the rule, survives
+        REQUIRE(thrown.load() == 1);
+        CHECK(b.engine->baseline_rebaselined_at_boot() == 1); // counted before the throw
+        // A later push re-reads Absent records for a NEW rule: not counted (the flag is clear).
+        b.push({rule, make_file_hash_rule("r2", t.file("second.txt").string())}, 2);
+        CHECK(b.engine->baseline_rebaselined_at_boot() == 1);
+        b.engine->set_seed_read_hook_for_test(nullptr);
+    }
+}
+
+TEST_CASE("#5605 CH-2 characterisation pin: a retarget followed by a crash moves no boot-scan "
+          "signal, and the next boot silently adopts the target's current content",
+          "[spark][guardian][baseline][boot][5605]") {
+    // This PINS A DOCUMENTED GAP, it does not endorse it. yuzu.guardian_baseline_rebaselined_at_
+    // boot counts only a genuinely ABSENT record. A retarget leaves the OLD target's record in
+    // place (fingerprint mismatch reads as Ok, not counted); if the agent dies before the new
+    // target's capture is persisted, the next boot sees that mismatch and re-baselines from
+    // whatever the new target holds then, with no counter moving. A change that starts counting
+    // the mismatch (or persists the capture earlier) must update this case and the operator
+    // docs together.
+    //
+    // Fault injection: the SQLite trigger the #4045 cases use (baseline writes fail, rule and
+    // journal writes keep succeeding), NOT drop_kv_store_table_for_test: dropping the table
+    // would also drop the cached rules, and the boot would have nothing to re-arm (see T17).
+    // The "crash" is the fixture engine's destruction while the store is still failing: its
+    // stop()-time flush uses the same store and fails, so the staged capture is lost exactly as
+    // it is in a kill (the same outcome as a crash for this store state).
+    Spark4045Target t;
+    const fs::path a = t.file("a.txt");
+    const fs::path b = t.file("b.txt");
+    Spark4045Target::write(a, "content A");
+    Spark4045Target::write(b, "content B as retargeted");
+    const std::string h_b_retargeted = hash_of_4045(b);
+
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    f.engine->drain_worker_for_test()->stop(); // the worker cannot persist behind the test's back
+
+    // Incarnation 1: r1 on A, its capture persisted.
+    f.apply(make_file_hash_rule("r1", a.string()));
+    eval_initial_4045(*f.engine, a);
+    // With the drain worker parked the compliant edge is never sent; the capture is awaited
+    // through the staging count instead.
+    REQUIRE(yuzu::test::spin_until(
+        [&] { return f.engine->baseline_unpersisted() == std::optional<std::uint64_t>{1}; }));
+    (void)persist_now_4045(*f.engine);
+    REQUIRE(baseline_record_4045(*f.kv, "r1").has_value());
+    REQUIRE(f.engine->baseline_unpersisted() == std::optional<std::uint64_t>{0});
+
+    // The store starts refusing baseline writes; r1 is retargeted to B (the rule write itself
+    // succeeds, so the cached rule now names B). B's capture is staged and cannot be persisted.
+    fail_baseline_writes_4045(f.db_.path);
+    f.apply(make_file_hash_rule("r1", b.string()), /*full_sync=*/false);
+    eval_initial_4045(*f.engine, b);
+    REQUIRE(yuzu::test::spin_until(
+        [&] { return f.engine->baseline_unpersisted() == std::optional<std::uint64_t>{1}; }));
+    (void)persist_now_4045(*f.engine); // fails against the injected fault
+    CHECK(f.engine->baseline_unpersisted() == std::optional<std::uint64_t>{1});
+    const auto stale = baseline_record_4045(*f.kv, "r1");
+    REQUIRE(stale.has_value());
+    CHECK(stale->value("fingerprint", std::string{}) == baseline_fingerprint_4045(a)); // OLD target
+
+    // The crash: quiesce the workers (so destruction is orderly), then destroy the engine with
+    // the store still failing. The staged capture for B dies with it.
+    REQUIRE(yuzu::test::spin_until([&] { return f.engine->active_io_workers() == 0; },
+                                   std::chrono::seconds{10}));
+    f.engine.reset();
+    heal_baseline_writes_4045(f.db_.path); // the store is healthy again for the next boot
+    const auto after_crash = baseline_record_4045(*f.kv, "r1");
+    REQUIRE(after_crash.has_value());
+    CHECK(after_crash->value("fingerprint", std::string{}) == baseline_fingerprint_4045(a));
+
+    // While the agent was down, the retargeted file changed. Nothing observed it.
+    Spark4045Target::write(b, "content B as tampered while the agent was down");
+    const std::string h_b_now = hash_of_4045(b);
+    REQUIRE(h_b_now != h_b_retargeted);
+
+    // Incarnation 2 on the same KV file.
+    Boot5605 boot{f.db_.path, /*prefer_spark=*/true};
+    boot.wire();
+    REQUIRE(boot.engine->start_local().has_value());
+    CHECK(boot.engine->baseline_rebaselined_at_boot() == 0); // THE PIN: no signal moved
+
+    // The next baseline is B's CURRENT content, not the capture the agent lost.
+    REQUIRE(yuzu::test::spin_until(
+        [&] {
+            (void)persist_now_4045(*boot.engine);
+            const auto rec = baseline_record_4045(*boot.kv, "r1");
+            return rec && rec->value("fingerprint", std::string{}) == baseline_fingerprint_4045(b);
+        },
+        std::chrono::seconds{10}));
+    const auto adopted = baseline_record_4045(*boot.kv, "r1");
+    REQUIRE(adopted.has_value());
+    CHECK(adopted->value("hash", std::string{}) == h_b_now);
+    CHECK(adopted->value("hash", std::string{}) != h_b_retargeted);
+    CHECK(boot.engine->baseline_rebaselined_at_boot() == 0); // still no signal
+}

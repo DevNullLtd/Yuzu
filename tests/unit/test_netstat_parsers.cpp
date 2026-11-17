@@ -10,7 +10,7 @@
  * file pins the '|'-escape and CR/LF-strip behavior directly, hoisted out of
  * netstat_plugin.cpp's former anonymous-namespace copy into
  * netstat_parsers.hpp so it is reachable from a test TU (same shape as
- * test_quarantine_parsers.cpp / test_discovery_parsers.cpp).
+ * test_firewall_parsers.cpp / test_discovery_parsers.cpp).
  */
 #include "netstat_parsers.hpp"
 

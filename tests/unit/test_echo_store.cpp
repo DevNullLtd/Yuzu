@@ -8,6 +8,7 @@
 #include "echo_aggregator.hpp" // run_budget: the failed-measurement case
 #include "echo_db.hpp"
 #include "echo_fold.hpp" // gc_dictionary: the cancellable sweep
+#include "echo_test_db.hpp"
 #include "echo_netqual.hpp"
 #include "echo_netqual_boot.hpp"
 #include "echo_sql_executor.hpp"
@@ -82,7 +83,7 @@ struct TestEchoDb {
 
 static TestEchoDb make_test_db() {
     auto tmp = yuzu::test::unique_temp_path("yuzu_test_echo_");
-    auto result = EchoDatabase::open(tmp);
+    auto result = yuzu::test::open_echo_db(tmp);
     REQUIRE(result.has_value());
     return TestEchoDb{std::move(*result), tmp};
 }
@@ -92,8 +93,13 @@ static TestEchoDb make_test_db() {
 // =============================================================================
 
 TEST_CASE("EchoDatabase: open creates database file", "[echo][store][lifecycle]") {
-    auto t = make_test_db();
-    CHECK(fs::exists(t.path));
+    // About open() itself: a real fresh open, not the copied template (echo_test_db.hpp).
+    const auto path = yuzu::test::unique_temp_path("yuzu_test_echo_");
+    yuzu::test::TempDbFile guard{path};
+    REQUIRE_FALSE(fs::exists(path));
+    auto opened = EchoDatabase::open(path);
+    REQUIRE(opened.has_value());
+    CHECK(fs::exists(path));
 }
 
 TEST_CASE("EchoDatabase: warehouse tables created on open", "[echo][store][lifecycle]") {
@@ -3125,8 +3131,35 @@ void remove_db_files(const fs::path& tmp) {
 } // namespace
 
 TEST_CASE("EchoDatabase: a fresh open lands at schema_version 10", "[echo][store][migration][v10]") {
-    auto t = make_test_db();
-    CHECK(t.db.schema_version() == 10);
+    // About the ladder from nothing: a real fresh open, not the copied template (echo_test_db.hpp).
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_v10_fresh_"};
+    auto opened = EchoDatabase::open(tmp.path);
+    REQUIRE(opened.has_value());
+    CHECK(opened->schema_version() == 10);
+}
+
+// The template helper itself, so a template that silently stops building (every fixture then
+// falls back to a plain open and the CI speed-up is gone) is a failure, not an unobserved slowdown.
+TEST_CASE("echo_test_db: the migrated template is built and a copy opens at schema_version 10",
+          "[echo][store][test_helper]") {
+    REQUIRE(yuzu::test::detail::echo_db_template().ready);
+
+    yuzu::test::TempDbFile copy{"yuzu_test_echo_helper_"};
+    REQUIRE(yuzu::test::seed_echo_db_from_template(copy.path));
+    // The copy is the whole template file, not an empty or truncated one that open() would quietly
+    // rebuild through the full ladder (which would also read schema_version 10).
+    const auto template_bytes = fs::file_size(yuzu::test::detail::echo_db_template().file.path);
+    CHECK(template_bytes > 0);
+    CHECK(fs::file_size(copy.path) == template_bytes);
+    CHECK_FALSE(fs::exists(fs::path{copy.path.string() + ".tmp"}));
+    {
+        auto opened = EchoDatabase::open(copy.path);
+        REQUIRE(opened.has_value());
+        CHECK(opened->schema_version() == 10);
+    }
+    // An existing destination is never overwritten or removed.
+    CHECK_FALSE(yuzu::test::seed_echo_db_from_template(copy.path));
+    CHECK(fs::exists(copy.path));
 }
 
 TEST_CASE("EchoDatabase v7->v8: stored opt-outs of every formerly-off source flip once",

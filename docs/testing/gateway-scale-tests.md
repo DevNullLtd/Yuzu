@@ -16,7 +16,7 @@ Files:
 | `gateway/apps/yuzu_gw/test/yuzu_gw_scale_upstream.erl` | The fake server |
 | `gateway/apps/yuzu_gw/test/yuzu_gw_scale_probe.erl` | The sampler that runs inside the gateway node |
 | `gateway/apps/yuzu_gw/test/yuzu_gw_scale_peer.erl` | Starts, kills and stops the nodes |
-| `gateway/apps/yuzu_gw/test/ct/yuzu_gw_scale_SUITE_data/register_plugins.eterm` | The 69 plugins each agent registers with |
+| `gateway/apps/yuzu_gw/test/ct/yuzu_gw_scale_SUITE_data/register_plugins.eterm` | The 72 plugins each agent registers with |
 | `gateway/apps/yuzu_gw/test/ct/yuzu_gw_scale_SUITE_data/heartbeat_tags.eterm` | The status tags of the `idle_memory` case's heartbeats |
 | `gateway/apps/yuzu_gw/test/ct/yuzu_gw_scale_SUITE_data/idle_mem_ceiling.eterm` | The `idle_memory` ceilings (bytes per connection) |
 | `scripts/test/gen-gateway-scale-register-fixture.py` | Regenerates `register_plugins.eterm` from `agents/plugins/*/src` |

@@ -1983,8 +1983,8 @@ TEST_CASE("execute: a protective action never reports os_gate_unreadable / plugi
           "[instruction_execute][zero_reach]") {
     Rig r;
     auto d = make_def("q");
-    d.plugin = "quarantine";
-    d.action = "status";
+    d.plugin = "firewall";
+    d.action = "quarantine_status";
     r.defs["q"] = d;
     r.stub_outcome = ConfinedDispatchOutcome{.sent = 0, .unknown_plugin_count = 1, .os_gate_unreadable = true};
     auto out = run(r.request("q", json::object(), make_caller("u", true)), r.ports(), r.audit());

@@ -12,6 +12,7 @@
 
 #include "echo_collectors.hpp"
 #include "echo_db.hpp"
+#include "echo_test_db.hpp"
 #include "echo_fold.hpp"
 #include "echo_fold_schema.hpp"
 #include "echo_schema_registry.hpp"
@@ -128,7 +129,7 @@ struct FoldDb {
 
 std::unique_ptr<FoldDb> make_fold_db(bool install = true, EchoFold::NowFn now = nullptr) {
     const auto path = yuzu::test::unique_temp_path("yuzu_test_echo_fold_");
-    auto opened = EchoDatabase::open(path);
+    auto opened = yuzu::test::open_echo_db(path);
     REQUIRE(opened.has_value());
     auto f = std::make_unique<FoldDb>(std::move(*opened), path, std::move(now));
     if (install)
