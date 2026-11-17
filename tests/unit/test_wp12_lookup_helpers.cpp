@@ -328,6 +328,12 @@ TEST_CASE("dns cache list release: a name equal to an earlier VISITED node stops
     CHECK_FALSE(dbl);
 }
 
+// The two tests below make a REAL std::unordered_set allocation fail. MSVC's DEBUG STL (/Od /MDd,
+// what the Windows debug CI leg builds) was measured to abort the process (exit 3) when an
+// allocation fails at certain points inside the container's own construction or cleanup (budgets
+// 2 and 6 abort, the other budgets are caught), independent of the code under test; release and
+// ASan builds catch every budget. They run everywhere else.
+#if !(defined(_MSC_VER) && defined(_DEBUG))
 namespace {
 
 // A visited-set whose allocator throws bad_alloc after `budget` allocations (g8-1).
@@ -374,9 +380,10 @@ TEST_CASE("dns cache list release: an allocation failure leaks the rest and neve
     CHECK(freed == 0);
     CHECK(none.order.empty());
 }
+#endif // !(MSVC debug)
 
 namespace {
-// A set whose CONSTRUCTOR throws (MSVC's containers allocate in the constructor).
+// A set whose CONSTRUCTOR throws (OUR type, independent of the STL: runs on every configuration).
 struct CtorThrowsSet {
     CtorThrowsSet() { throw std::bad_alloc(); }
     struct R { bool second; };

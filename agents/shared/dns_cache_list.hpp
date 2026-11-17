@@ -15,7 +15,8 @@
  *  - the node ceiling bounds a corrupted or cyclic pNext;
  *  - it never throws (the Windows owner's release() is noexcept): constructing the sets and all
  *    bookkeeping for a node happen inside try/catch, BEFORE pNext is read or anything is freed. A
- *    bad_alloc (even from a set's constructor, as on MSVC) stops the walk and the rest leaks.
+ *    bad_alloc stops the walk and the rest leaks (a debug-STL abort inside a container is outside
+ *    this function's control; see the comment in the function).
  * Stopping always leaks the remainder rather than risking a second free. This guards LIST ALIASING
  * only; it says nothing about whether DnsFree(DnsFreeFlat) matches the list's allocator (see
  * WP12-risk-acceptance.md).
@@ -36,9 +37,12 @@ inline constexpr std::size_t kDnsCacheNodeWalkCap = 65536;
 template <typename Set = std::unordered_set<const void*>, typename Node, typename FreeFn>
 std::size_t release_dns_cache_list(Node* head, FreeFn&& free_one) noexcept {
     std::size_t freed = 0;
-    // The sets are constructed INSIDE the try: some standard libraries (MSVC's) allocate in a
-    // container's constructor, and an allocation failure there must leak the list, not reach a
-    // noexcept boundary and terminate the agent.
+    // The sets are constructed inside the try so that a bad_alloc from a container's construction
+    // is caught here and leaks the list instead of reaching this noexcept boundary. That is the
+    // most this function can do: MSVC's DEBUG STL (/Od /MDd) was measured to ABORT (exit 3) when an
+    // allocation fails at certain points inside an unordered container's own construction or
+    // cleanup, which is outside this function's control. Release builds, the ones that ship, catch
+    // the same failures normally.
     try {
         Set seen;  // every node and name pointer seen so far (freed, or recorded just before a free)
         Set names; // the subset of `seen` that was seen AS a name
