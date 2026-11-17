@@ -99,6 +99,16 @@ This describes the build in a fresh deployment (see "Deployment contract (hard c
 
 **Rolling upgrade.** The rule is applied per replica, so a replica that has not been upgraded still shows a service-scoped token its minting account's executions, and a client can see the old and the new answer on consecutive requests; finish the roll promptly. An old replica does not expose the new refusal counter, so its series is absent rather than zero: run `up{job=~"<server job regex>"} == 1 unless on(instance) count by (instance) (yuzu_server_authz_service_scope_unrestricted_refused_total)` to find any scraped replica that has not been upgraded (a replica that is down also lacks the series, and `up == 1` does not list it, so check the replica's health separately).
 
+## Behaviour change: malformed agent data is contained per device, and old agents keep sending frames the server rejects (WP07)
+
+**In short.** Affected: everyone who runs policies, reads result rows, or runs agents older than this release. To do: upgrade the agents; nothing else is required on the server.
+
+**What changed on the server.** A policy check response that cannot be evaluated (wrong JSON types, invalid UTF-8, or nesting past the depth guard) now scores that device `error` and increments `yuzu_server_policy_unevaluable_responses_total{reason="depth|exception"}`, instead of aborting the collect pass for every other device. The Hardware action-result fragment renders over-deep agent JSON as plain text. The shared `/events` SSE stream treats a bare CR like LF, and result rows lose every embedded carriage return (not only a trailing one).
+
+**What changed on the agent.** The agent daemon replaces non-UTF-8 bytes in plugin output with `?`, and Echo scrubs the identity strings it diffs at collection. An agent that has NOT been upgraded still sends a command response containing a non-UTF-8 byte as-is, and the server rejects that whole frame (the agent's command stream resets); only that one device is affected, and gateway-fronted agents are not affected by the heartbeat tag path (the gateway repairs tag bytes). Upgrade agents to stop the resets.
+
+**Still open.** Filesystem plugin path bytes are not escaped upstream (#6480): the host scrub turns them into `?`, so a name with an invalid byte reads with `?` in it. An exception in one Echo collect leg can still skip the later legs of that fast tick.
+
 ## Behaviour change: MCP `execute_instruction` progress follows the caller's `Execution:Read` scope (#7817)
 
 **In short.** Affected: a caller whose `Execution:Read` does not cover the fleet (a management-group-scoped grant, or none), or whose `Execution:Read` check cannot be resolved for that call, when it calls `execute_instruction` with a `_meta.progressToken` on a streaming session. To do: poll `get_execution_status` for the counts it may see. A caller with an unrestricted `Execution:Read` sees the same frames as before.
