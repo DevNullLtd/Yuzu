@@ -256,6 +256,7 @@
 #include "collection_settings_push.hpp"
 #include "software_collection_settings_routes.hpp"
 #include "software_collection_settings_store.hpp"
+#include "software_lifecycle_routes.hpp"
 #include "software_lifecycle_store.hpp"
 #include "software_curation_routes.hpp"
 #include "home_routes.hpp" // Dashboard summary fragment (readout, attention, estate) over injected seams
@@ -21615,6 +21616,23 @@ private:
                     .store = software_collection_settings_store_.get(),
                     .mgmt_store = mgmt_group_store_.get(),
                     .plugin_config_store = plugin_config_store_.get(),
+                });
+        }
+
+        // Imported software lifecycle rules REST (SAM-24): import, list and clear. Registered
+        // here, ahead of rest_api_v1_->register_routes, for the same reason as the routes above
+        // (the generic GET /api/v1/inventory/{a}/{b} would take the bare path's neighbours). The
+        // routes borrow software_lifecycle_store_ only; stop() joins the web thread ahead of
+        // resetting it, and the class holds no state of its own. A null or closed store answers
+        // 503 on every route.
+        {
+            HttplibRouteSink lifecycle_rules_sink{*web_server_};
+            SoftwareLifecycleRoutes{}.register_routes(
+                lifecycle_rules_sink,
+                SoftwareLifecycleRoutes::Deps{
+                    .perm_fn = perm_fn,
+                    .audit_fn = audit_fn,
+                    .store = software_lifecycle_store_.get(),
                 });
         }
 
