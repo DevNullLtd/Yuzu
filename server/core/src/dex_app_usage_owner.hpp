@@ -120,7 +120,10 @@ public:
     [[nodiscard]] int consecutive_timeouts() const noexcept { return consecutive_timeouts_.load(); }
 
     /// The detail token for a fault `read` just returned (see `dex_usage_unavailable_detail`).
-    [[nodiscard]] const char* unavailable_detail(DexReadFault f) const noexcept;
+    /// `now` is the instant the run's age is measured at; production passes none.
+    [[nodiscard]] const char* unavailable_detail(
+        DexReadFault f,
+        std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now()) const noexcept;
 
 private:
     /// Counts, logs (sampled) and returns `f`.

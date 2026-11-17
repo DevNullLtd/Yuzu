@@ -24,8 +24,7 @@
 namespace yuzu::server {
 
 namespace {
-/// The usage cache: a model is reused for this long, and the cache holds at most this many.
-constexpr std::chrono::seconds kUsageCacheTtl{30};
+/// The usage cache holds at most this many models (each is reused for `DexUsageWiring::cache_ttl`).
 constexpr std::size_t kUsageCacheCap = 32;
 } // namespace
 
@@ -107,7 +106,7 @@ public:
         std::optional<DexFleet> fleet;
         if (fleet_fn_)
             fleet.emplace(fleet_fn_());
-        DexAppsModel m = apps_at(window, scope, *policy, fleet, now_epoch());
+        DexAppsModel m = apps_at(window, scope, *policy, fleet, request_instant());
         // The live observer split is read only after a successful read, from the same snapshot and
         // the same ids the population was counted from, so the split and the population cannot
         // disagree. A refused or failed read never pays the pass; no observer source = unknown.
@@ -155,7 +154,7 @@ public:
 
         // ONE instant and ONE fleet snapshot for the whole request: the window cut, the freshness
         // cut, the Apps population and the usage population all derive from them.
-        const std::int64_t now = now_epoch();
+        const std::int64_t now = request_instant();
         const std::optional<DexFleet> snapshot{fleet_fn_()};
         DexFleet visible_fleet = *snapshot;
         std::erase_if(visible_fleet.connected_agents, [&](const auto& agent) {
@@ -287,7 +286,10 @@ private:
         return dex_iso_since(dex_window_to_days(window));
     }
 
-    [[nodiscard]] static std::int64_t now_epoch() {
+    /// The one instant source of this API: Apps and usage reads cut their windows from it.
+    [[nodiscard]] std::int64_t request_instant() const {
+        if (usage_.now_epoch)
+            return usage_.now_epoch();
         return static_cast<std::int64_t>(std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()));
     }
 
@@ -354,7 +356,7 @@ private:
         const auto it = usage_cache_.find(key);
         if (it == usage_cache_.end())
             return std::nullopt;
-        if (std::chrono::steady_clock::now() - it->second.at >= kUsageCacheTtl) {
+        if (std::chrono::steady_clock::now() - it->second.at >= usage_.cache_ttl) {
             usage_cache_.erase(it);
             return std::nullopt;
         }
@@ -368,7 +370,7 @@ private:
         std::lock_guard lock(usage_cache_mu_);
         if (usage_cache_.size() >= kUsageCacheCap && !usage_cache_.contains(key)) {
             std::erase_if(usage_cache_,
-                          [&](const auto& e) { return now - e.second.at >= kUsageCacheTtl; });
+                          [&](const auto& e) { return now - e.second.at >= usage_.cache_ttl; });
             if (usage_cache_.size() >= kUsageCacheCap)
                 usage_cache_.clear();
         }

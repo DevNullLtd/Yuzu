@@ -477,7 +477,8 @@ TEST_CASE("DexAppUsageOwner refuses an out-of-range index on a healthy pool", "[
     YUZU_REQUIRE_PG_DB_TPL(db, dex_usage_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 2}};
     REQUIRE(pool.valid());
-    DexAppUsageOwner owner{pool};
+    yuzu::MetricsRegistry metrics;
+    DexAppUsageOwner owner{pool, &metrics};
     const std::int64_t now = now_epoch();
 
     for (const int subject : {-1, 1}) { // below zero, and at subjects.size()
@@ -493,6 +494,7 @@ TEST_CASE("DexAppUsageOwner refuses an out-of-range index on a healthy pool", "[
         REQUIRE_FALSE(r.has_value());
         CHECK(r.error() == DexReadFault::kQueryError);
     }
+    CHECK(degraded(metrics, "query_error") == 4.0); // each refusal is counted
     CHECK(owner.read(make_query(now, {"d1"}, {"alpha.exe"})).has_value()); // the same pool reads fine
 }
 
@@ -521,6 +523,21 @@ TEST_CASE("DexAppUsageOwner refuses over its in-flight budget before touching th
     // The slot is released on every exit: a second refusal is the same refusal, not a leak.
     CHECK(owner.read(make_query(now_epoch(), {"d1"}, {"alpha.exe"})).error() == DexReadFault::kConcurrencyBudget);
     CHECK(degraded(metrics, "concurrency_budget") == 2.0);
+}
+
+TEST_CASE("DexAppUsageOwner releases its slot on every admitted exit", "[dex_usage]") {
+    // A budget of one and an unreachable pool: each read is admitted, reaches the pool and
+    // times out. A slot that leaked would turn the second read into a budget refusal.
+    PgPool pool{{.conninfo = "yuzu_invalid_keyword=1", .size = 1}};
+    yuzu::MetricsRegistry metrics;
+    DexAppUsageOwner owner{pool, &metrics, /*concurrent_reads=*/1};
+    for (int i = 0; i < 3; ++i) {
+        const auto r = owner.read(make_query(now_epoch(), {"d1"}, {"alpha.exe"}));
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == DexReadFault::kPoolTimeout);
+    }
+    CHECK(degraded(metrics, "concurrency_budget") == 0.0);
+    CHECK(degraded(metrics, "pool_acquire_timeout") == 3.0);
 }
 
 TEST_CASE("DexAppUsageOwner treats no devices as an engaged empty result even with no budget",
@@ -618,38 +635,62 @@ TEST_CASE("DexAppUsageOwner degrades when the statement is blocked", "[pg][dex_u
     CHECK(owner.consecutive_timeouts() == 0);
 }
 
-TEST_CASE("DexAppUsageOwner reports a real statement timeout and a success clears the run",
+TEST_CASE("DexAppUsageOwner reports a real statement timeout, a sustained run and a success that clears it",
           "[pg][dex_usage]") {
-    // The same lock, a pool whose lock timeout (10 s) is far longer than the owner's 20 ms
-    // statement bound: the statement is cancelled with a real SQLSTATE 57014, no sleep.
+    // A lock held on a second connection and a pool whose lock timeout (10 s) is far longer than
+    // the owner's 500 ms statement bound: the statement is cancelled with a real SQLSTATE 57014,
+    // no sleep. The bound is well above a few milliseconds because the success read runs on this
+    // same owner (the run clears per owner) and must not time out on a loaded lane.
+    using namespace std::chrono_literals;
+    using yuzu::server::kDexUsageTimeoutRunBeforeTooLarge;
     YUZU_REQUIRE_PG_DB_TPL(db, dex_usage_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 2}};
     REQUIRE(pool.valid());
     yuzu::MetricsRegistry metrics;
-    DexAppUsageOwner owner{pool, &metrics, yuzu::server::kDexUsageConcurrentReads,
-                           std::chrono::milliseconds{20}};
+    DexAppUsageOwner owner{pool, &metrics, yuzu::server::kDexUsageConcurrentReads, 500ms};
     const std::int64_t now = now_epoch();
+    const auto detail = [&](std::chrono::steady_clock::time_point at) {
+        return std::string(owner.unavailable_detail(DexReadFault::kStatementTimeout, at));
+    };
+    // Three statement timeouts in a row, under a lock that is released on return.
+    const auto timeout_run = [&] {
+        yuzu::server::pg::PgConn locker{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+        REQUIRE(yuzu::server::pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{})
+                    .status() == PGRES_COMMAND_OK);
+        REQUIRE(yuzu::server::pg::exec_params(
+                    locker.get(), "LOCK TABLE app_usage_store.agent_last_used IN ACCESS EXCLUSIVE MODE",
+                    std::vector<std::string>{})
+                    .status() == PGRES_COMMAND_OK);
+        for (int i = 0; i < 3; ++i) {
+            const auto timed_out = owner.read(make_query(now, {"d1"}, {"alpha.exe"}));
+            REQUIRE_FALSE(timed_out.has_value());
+            CHECK(timed_out.error() == DexReadFault::kStatementTimeout);
+        }
+        REQUIRE(yuzu::server::pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{})
+                    .status() == PGRES_COMMAND_OK);
+    };
 
-    yuzu::server::pg::PgConn locker{PQconnectdb(db.dsn().c_str())};
-    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
-    REQUIRE(yuzu::server::pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{})
-                .status() == PGRES_COMMAND_OK);
-    REQUIRE(yuzu::server::pg::exec_params(
-                locker.get(), "LOCK TABLE app_usage_store.agent_last_used IN ACCESS EXCLUSIVE MODE",
-                std::vector<std::string>{})
-                .status() == PGRES_COMMAND_OK);
+    timeout_run();
+    CHECK(owner.consecutive_timeouts() == 3);
+    CHECK(degraded(metrics, "statement_timeout") == 3.0);
+    // Three in a row, but the run is young: still retryable. Two minutes on, the run (stamped by
+    // its first timeout) is sustained. Only a statement timeout is ever too large.
+    const auto at = std::chrono::steady_clock::now();
+    const auto later = at + kDexUsageTimeoutRunBeforeTooLarge + 1s;
+    CHECK(detail(at) == "statement_timeout");
+    CHECK(detail(later) == "fleet_too_large");
+    CHECK(std::string(owner.unavailable_detail(DexReadFault::kQueryError, later)) == "query_error");
 
-    const auto timed_out = owner.read(make_query(now, {"d1"}, {"alpha.exe"}));
-    REQUIRE_FALSE(timed_out.has_value());
-    CHECK(timed_out.error() == DexReadFault::kStatementTimeout);
-    CHECK(owner.consecutive_timeouts() == 1);
-    CHECK(degraded(metrics, "statement_timeout") == 1.0);
-    // One timeout is retryable: the sustained state needs three over two minutes.
-    CHECK(std::string(owner.unavailable_detail(DexReadFault::kStatementTimeout)) == "statement_timeout");
-
-    REQUIRE(yuzu::server::pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{})
-                .status() == PGRES_COMMAND_OK);
-    locker.reset();
+    // A success ends the run: the same far instant is retryable again.
     CHECK(owner.read(make_query(now, {"d1"}, {"alpha.exe"})).has_value());
     CHECK(owner.consecutive_timeouts() == 0);
+    CHECK(detail(later) == "statement_timeout");
+
+    // The next run starts its own clock. The first run began at least a second before `before`
+    // (two more timeouts of 500 ms each) and this one begins at least 500 ms after it, so at
+    // before + 119.5 s a stale start reads as sustained and a fresh one is under two minutes old.
+    const auto before = std::chrono::steady_clock::now();
+    timeout_run();
+    CHECK(detail(before + kDexUsageTimeoutRunBeforeTooLarge - 500ms) == "statement_timeout");
 }

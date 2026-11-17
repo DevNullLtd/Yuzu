@@ -20652,8 +20652,6 @@ private:
             yuzu::server::DexScorePolicyFn dex_policy_fn;
             if (dex_score_policy_provider_)
                 dex_policy_fn = [p = dex_score_policy_provider_] { return p->current(); };
-            // The observer provider borrows health_store_, which is declared before every holder
-            // of this API (rest_api_v1_, mcp_server_, dex_routes_) and so outlives them.
             // The reads behind GET /api/v1/dex/apps/usage. The captures are borrowed: the owner,
             // mgmt_group_store_ and tag_store_ outlive the web threads (stop() joins them first).
             yuzu::server::DexUsageWiring dex_usage;
@@ -20697,6 +20695,8 @@ private:
                 return std::move(*v);
             };
             dex_usage.observation_retention_days = cfg_.guardian_event_retention_days.get();
+            // The observer provider borrows health_store_, which is declared before every holder
+            // of this API (rest_api_v1_, mcp_server_, dex_routes_) and so outlives them.
             dex_api = make_local_dex_api(
                 guaranteed_state_store_.get(), dex_fleet_fn, std::move(dex_policy_fn),
                 [this](const std::vector<std::string>& ids) {

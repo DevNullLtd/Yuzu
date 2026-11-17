@@ -2017,17 +2017,144 @@ TEST_CASE("DexApi: apps_usage never caches a refusal", "[pg][dex_api][usage]") {
     CHECK(probe.reads == 2); // the failure left nothing behind
 }
 
+// The cache is bounded in time and in size. Both bounds are reached through the wiring's test-only
+// fields, so neither case waits or sleeps.
+TEST_CASE("DexApi: a cached usage model expires, and the cache holds 32 models", "[pg][dex_api][usage]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    seed_apps_fixture(store);
+    UsageProbe probe;
+    auto wiring = probe.wiring();
+    SECTION("an entry past its ttl is read again") {
+        wiring.cache_ttl = std::chrono::seconds{0}; // every entry is already expired
+        auto api = make_local_dex_api(&store, fleet23, {}, {}, std::move(wiring));
+        REQUIRE(api->apps_usage("7d", "all", kFleetSlice, 1, std::nullopt).has_value());
+        REQUIRE(api->apps_usage("7d", "all", kFleetSlice, 1, std::nullopt).has_value());
+        CHECK(probe.reads == 2);
+    }
+    SECTION("a 33rd distinct request clears a full cache") {
+        wiring.cache_ttl = std::chrono::hours{1}; // nothing expires: only the cap can evict
+        auto api = make_local_dex_api(&store, fleet23, {}, {}, std::move(wiring));
+        const auto ask = [&](std::int64_t floor) {
+            REQUIRE(api->apps_usage("7d", "all", kFleetSlice, floor, std::nullopt).has_value());
+        };
+        for (std::int64_t floor = 1; floor <= 32; ++floor) // the floor is part of the key
+            ask(floor);
+        REQUIRE(probe.reads == 32);
+        ask(1);
+        CHECK(probe.reads == 32); // a full cache still answers
+        ask(33);
+        CHECK(probe.reads == 33);
+        ask(1); // cleared to admit the 33rd
+        CHECK(probe.reads == 34);
+    }
+}
+
+// The policy revision and each visible device's platform are part of the key: a stale model for
+// another policy or another platform split is never served.
+TEST_CASE("DexApi: apps_usage reads again when the policy revision or a device's platform changes",
+          "[pg][dex_api][usage]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    seed_apps_fixture(store);
+    UsageProbe probe;
+    std::string revision = "r1";
+    DexFleet fleet = fleet23();
+    auto api = make_local_dex_api(
+        &store, [&fleet] { return fleet; },
+        [&revision]() -> std::expected<yuzu::server::DexPolicyInForce, std::string> {
+            yuzu::server::DexPolicyInForce p;
+            p.revision = revision;
+            return p;
+        },
+        {}, probe.wiring());
+    const auto ask = [&] { REQUIRE(api->apps_usage("7d", "all", kFleetSlice, 1, std::nullopt).has_value()); };
+    ask();
+    ask();
+    CHECK(probe.reads == 1);
+    revision = "r2";
+    ask();
+    CHECK(probe.reads == 2);
+    ask();
+    CHECK(probe.reads == 2);
+    fleet.connected_agents.back().second = "linux"; // m1 was macos
+    ask();
+    CHECK(probe.reads == 3);
+    ask();
+    CHECK(probe.reads == 3);
+}
+
+TEST_CASE("DexApi: a tag slice with no tag source or an unreadable one is tag_unavailable",
+          "[pg][dex_api][usage]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    seed_apps_fixture(store);
+    UsageProbe probe;
+    auto wiring = probe.wiring();
+    SECTION("no tag source is wired") {
+        wiring.tag_values = {};
+    }
+    SECTION("the read fails") {
+        wiring.tag_values = [](const std::string&) {
+            return std::optional<std::unordered_map<std::string, std::string>>{};
+        };
+    }
+    auto api = make_local_dex_api(&store, fleet23, {}, {}, std::move(wiring));
+    const auto r = api->apps_usage("7d", "all", {DexUsageSliceKind::Tag, "ring"}, 1, std::nullopt);
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().reason == "tag_unavailable");
+    CHECK(probe.reads == 0); // refused before the usage read
+}
+
+// The injected instant is the API's one clock: the Apps window is cut at it, not at the wall clock.
+TEST_CASE("DexApi: apps_usage cuts the Apps window at the request instant", "[pg][dex_api][usage]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    // The instant is ten days back and the only row is a day before it: inside the 7 day window
+    // cut at that instant, eleven days old at the wall clock.
+    const std::int64_t at = wall_epoch() - 10 * 86400;
+    seed_obs_v(store, "old1", "a1", "old.exe", "process.crashed", "1.0",
+               yuzu::server::dex_iso_at(at - 86400));
+    UsageProbe probe;
+    auto wiring = probe.wiring();
+    wiring.now_epoch = [at] { return at; };
+    auto api = make_local_dex_api(&store, fleet23, {}, {}, std::move(wiring));
+
+    const auto r = api->apps_usage("7d", "all", kFleetSlice, 1, std::nullopt);
+    REQUIRE(r.has_value());
+    CHECK(r->as_of_epoch == at);
+    REQUIRE(r->apps.size() == 1);
+    CHECK(r->apps[0].subject == "old.exe");
+    CHECK(probe.last.until_iso == yuzu::server::dex_iso_at(at));
+    // apps() takes its instant from the same source.
+    const auto apps = api->apps("7d", "all");
+    REQUIRE_FALSE(apps.degraded);
+    REQUIRE(apps.apps.size() == 1);
+}
+
 TEST_CASE("DexApi: apps is unchanged by the shared window cut", "[pg][dex_api][usage]") {
     YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GuaranteedStateStore store(pool);
     REQUIRE(store.is_open());
     seed_apps_fixture(store);
-    auto api = make_local_dex_api(&store, fleet23);
+    // One fixed instant for the seam and the oracle, so a clock tick cannot separate them.
+    const std::int64_t now = wall_epoch();
+    DexUsageWiring wiring;
+    wiring.now_epoch = [now] { return now; };
+    auto api = make_local_dex_api(&store, fleet23, {}, {}, std::move(wiring));
     // The same read through the shared builder at the same cut, over the same fleet.
     const auto fleet = fleet23();
     const auto oracle = yuzu::server::build_dex_apps_model(
-        &store, "7d", yuzu::server::dex_iso_since(7), "all",
+        &store, "7d", yuzu::server::dex_iso_since_at(now, 7), "all",
         std::optional<std::vector<std::string>>{yuzu::server::dex_apps_online_ids(fleet, "all")},
         yuzu::server::DexPolicyInForce{});
     REQUIRE_FALSE(oracle.degraded);

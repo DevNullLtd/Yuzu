@@ -3433,6 +3433,60 @@ TEST_CASE("REST dex/apps/usage: a failed audit write is a 503 and the read never
     CHECK(h.usage_reads == 0);
 }
 
+// The audit row is written before the read, so a model already cached from an earlier request
+// cannot be served once the audit sink is down.
+TEST_CASE("REST dex/apps/usage: a failed audit write refuses even a request the cache could answer",
+          "[pg][rest][dex][apps][usage]") {
+    RestGsHarness h;
+    seed_usage_fixture(h);
+    const auto url = std::string(kUsageRoute) + "?window=all";
+    auto warm = h.sink.Get(url, h.status_route_headers());
+    REQUIRE(warm);
+    REQUIRE(warm->status == 200);
+    REQUIRE(h.usage_reads == 1);
+    REQUIRE(h.audit_log.size() == 1);
+
+    h.audit_succeeds = false;
+    auto res = h.sink.Get(url, h.status_route_headers());
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK(res->body.find("chrome.exe") == std::string::npos);
+    CHECK(res->body.find("\"apps\"") == std::string::npos);
+    CHECK(h.audit_log.size() == 2); // the write was attempted, before anything was served
+    CHECK(h.usage_reads == 1);
+}
+
+TEST_CASE("REST dex/apps/usage: omitted parameters reach the model and the audit row as their defaults",
+          "[pg][rest][dex][apps][usage]") {
+    RestGsHarness h;
+    seed_usage_fixture(h);
+    auto res = h.sink.Get(kUsageRoute, h.status_route_headers());
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    const auto d = nlohmann::json::parse(res->body)["data"];
+    CHECK(d["window"] == "7d");
+    CHECK(d["platform_scope"] == "all");
+    CHECK(d["slice"]["kind"] == "fleet");
+    CHECK(d["floor"] == 1);
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].detail.find("window=7d") != std::string::npos);
+    CHECK(h.audit_log[0].detail.find("platform=all") != std::string::npos);
+    CHECK(h.audit_log[0].detail.find("slice=fleet") != std::string::npos);
+    CHECK(h.audit_log[0].detail.find("floor=1") != std::string::npos);
+
+    // A tag slice with no tag_key is the default cohort key.
+    auto tagged = h.sink.Get(std::string(kUsageRoute) + "?slice=tag", h.status_route_headers());
+    REQUIRE(tagged);
+    REQUIRE(tagged->status == 200);
+    const auto t = nlohmann::json::parse(tagged->body)["data"];
+    CHECK(t["slice"]["kind"] == "tag");
+    CHECK(t["slice"]["key"] == yuzu::server::kDexDefaultCohortKey);
+    REQUIRE(h.audit_log.size() == 2);
+    CHECK(h.audit_log[1].detail.find(std::string("key=") + yuzu::server::kDexDefaultCohortKey) !=
+          std::string::npos);
+}
+
 TEST_CASE("REST dex/apps/usage: a failed read is a retryable 503 that names the reason, never zero figures",
           "[pg][rest][dex][apps][usage]") {
     RestGsHarness h;

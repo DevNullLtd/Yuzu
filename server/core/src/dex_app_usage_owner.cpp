@@ -62,11 +62,11 @@ static_assert(kDexUsageConcurrentReads <= GuaranteedStateStore::kDexAppsConcurre
 // ponytail: no exe_key index on agent_last_used, so the usage side is a filtered
 // scan bounded by the statement timeout; add an index (a migration) only when a
 // measured fleet nears that bound. Past the bound every request times out; after
-// kDexUsageTimeoutsBeforeTooLarge in a row over kDexUsageTimeoutRunBeforeTooLarge the
-// owner reports fleet_too_large (not retryable) until the index or a precomputed
-// rollup exists; the fleet size at which that happens has not been measured. The result is bounded by the
-// caller's subject and cell counts (one row per application and cell, one per
-// application, one coverage row).
+// kDexUsageTimeoutsBeforeTooLarge in a row over kDexUsageTimeoutRunBeforeTooLarge
+// the owner reports fleet_too_large (not retryable) until the index or a
+// precomputed rollup exists; the fleet size at which that happens has not been
+// measured. The result is bounded by the caller's subject and cell counts (one row
+// per application and cell, one per application, one coverage row).
 const std::string& read_sql() {
     static const std::string sql =
         "WITH pop AS ("
@@ -148,11 +148,11 @@ DexAppUsageOwner::DexAppUsageOwner(pg::PgPool& pool, yuzu::MetricsRegistry* metr
                                    std::chrono::milliseconds statement_timeout)
     : pool_(pool), metrics_(metrics), budget_(concurrent_reads), statement_timeout_(statement_timeout) {}
 
-const char* DexAppUsageOwner::unavailable_detail(DexReadFault f) const noexcept {
+const char* DexAppUsageOwner::unavailable_detail(DexReadFault f,
+                                                 std::chrono::steady_clock::time_point now) const noexcept {
     const std::int64_t start = timeout_run_start_.load();
     const auto age = start == 0 ? std::chrono::steady_clock::duration::zero()
-                                : std::chrono::steady_clock::now().time_since_epoch() -
-                                      std::chrono::steady_clock::duration(start);
+                                : now.time_since_epoch() - std::chrono::steady_clock::duration(start);
     return dex_usage_unavailable_detail(f, consecutive_timeouts_.load(), age);
 }
 

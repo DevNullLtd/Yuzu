@@ -13,6 +13,8 @@
 /// lint-enforced: this header is itself in the family's enforced closure set,
 /// so a store `#include` added here fails CI.
 
+#include <chrono>
+#include <cstdint>
 #include <expected>
 #include <functional>
 #include <memory>
@@ -54,12 +56,18 @@ using DexObserverFn = std::function<std::vector<DexObserverState>(const std::vec
 ///  - `tag_values`: agent id -> value for one tag key; nullopt when it cannot be read.
 ///  - `observation_retention_days`: the observation store's retention. Unset refuses every usage
 ///    read as `invalid_request`: an omitted value would turn the retention guard off.
+///  - `cache_ttl`, `now_epoch`: test-only. `cache_ttl` is how long a model is reused (production
+///    leaves the 30 s default); `now_epoch` replaces the wall clock as the API's one instant
+///    source (empty = the wall clock, which is what production wires). A test injects them to
+///    reach the cache expiry and the window cut without waiting.
 struct DexUsageWiring {
     std::function<std::expected<DexUsageRead, std::string>(const DexUsageQuery&)> read;
     std::function<std::expected<std::vector<std::string>, std::string>(const std::string& group_id)>
         group_members;
     decltype(DexUsageSources::tag_values) tag_values;
     std::optional<int> observation_retention_days;
+    std::chrono::seconds cache_ttl{30};
+    std::function<std::int64_t()> now_epoch;
 };
 
 /// Factory for the store-backed implementation (`LocalDexApi`, dex_api.cpp —
