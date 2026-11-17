@@ -203,18 +203,34 @@ std::optional<std::string> verify_plugin_signature(const std::filesystem::path& 
     return std::string{prefix} + ": " + err->detail;
 }
 
-std::unordered_map<std::string, std::string>
-load_plugin_allowlist(const std::filesystem::path& allowlist_path) {
-    std::unordered_map<std::string, std::string> result;
-    if (allowlist_path.empty() || !std::filesystem::exists(allowlist_path))
-        return result;
+PluginAllowlistLoad load_plugin_allowlist(const std::filesystem::path& allowlist_path) {
+    PluginAllowlistLoad out;
+    if (allowlist_path.empty())
+        return out; // NotConfigured
+
+    // error_code overloads only: the throwing exists() raised filesystem_error on a
+    // permission fault in a parent directory, which escaped run() as a crash.
+    std::error_code ec;
+    const auto st = std::filesystem::status(allowlist_path, ec);
+    if (st.type() == std::filesystem::file_type::not_found) {
+        out.status = AllowlistStatus::Missing;
+        out.detail = "file not found";
+        return out;
+    }
+    if (ec || st.type() != std::filesystem::file_type::regular) {
+        out.status = AllowlistStatus::Unreadable;
+        out.detail = ec ? ec.message() : "not a regular file";
+        return out;
+    }
 
     std::ifstream f(allowlist_path);
     if (!f) {
-        spdlog::error("Cannot open plugin allowlist: {}", allowlist_path.string());
-        return result;
+        out.status = AllowlistStatus::Unreadable;
+        out.detail = "cannot open file";
+        return out;
     }
 
+    auto& result = out.entries;
     std::string line;
     int lineno = 0;
     while (std::getline(f, line)) {
@@ -236,10 +252,50 @@ load_plugin_allowlist(const std::filesystem::path& allowlist_path) {
         result[fname] = hash;
         spdlog::debug("Allowlist entry: {} -> {}", fname, hash);
     }
+    if (f.bad()) {
+        // A mid-read I/O fault: a truncated map must not enforce as if it were complete.
+        out.status = AllowlistStatus::Unreadable;
+        out.detail = "read error";
+        out.entries.clear();
+        return out;
+    }
 
+    if (result.empty()) {
+        out.status = AllowlistStatus::NoValidEntries;
+        out.detail = "no valid entries (empty, comments only, or every line malformed)";
+        return out;
+    }
+    out.status = AllowlistStatus::Loaded;
     spdlog::info("Loaded {} plugin allowlist entries from {}", result.size(),
                  allowlist_path.string());
-    return result;
+    return out;
+}
+
+std::optional<std::string> evaluate_allowlist_startup(const std::filesystem::path& configured_path,
+                                                      const PluginAllowlistLoad& load) {
+    if (configured_path.empty())
+        return std::nullopt; // not configured: nothing to enforce
+    if (load.status == AllowlistStatus::Loaded && !load.entries.empty())
+        return std::nullopt;
+    const char* cause = "no valid entries";
+    switch (load.status) {
+    case AllowlistStatus::Missing:
+        cause = "file is missing";
+        break;
+    case AllowlistStatus::Unreadable:
+        cause = "file is unreadable";
+        break;
+    case AllowlistStatus::NoValidEntries:
+        cause = "file has no valid entries";
+        break;
+    default:
+        break;
+    }
+    std::string reason = "--plugin-allowlist '" + configured_path.string() + "' is configured but " +
+                         cause;
+    if (!load.detail.empty())
+        reason += " (" + load.detail + ")";
+    return reason;
 }
 
 // ── PluginHandle ──────────────────────────────────────────────────────────────
@@ -347,7 +403,7 @@ std::expected<PluginHandle, LoadError> PluginHandle::load(const std::filesystem:
 PluginLoader::ScanResult
 PluginLoader::scan(const std::filesystem::path& plugin_dir,
                    const std::unordered_map<std::string, std::string>& allowlist,
-                   const PluginSigningPolicy& signing) {
+                   const PluginSigningPolicy& signing, bool allowlist_required) {
     ScanResult result;
 
     if (!std::filesystem::is_directory(plugin_dir)) {
@@ -372,7 +428,7 @@ PluginLoader::scan(const std::filesystem::path& plugin_dir,
     // the dlopen()-mapped .so stays loaded independently.
     std::vector<int> linux_fd_keepalive; // POSIX-only; empty on macOS, no fd flow there
 
-    const bool enforce_allowlist = !allowlist.empty();
+    const bool enforce_allowlist = allowlist_required || !allowlist.empty();
     const bool enforce_signing = signing.enabled();
     if (enforce_allowlist) {
         spdlog::info("Plugin allowlist enforcement active ({} entries)", allowlist.size());

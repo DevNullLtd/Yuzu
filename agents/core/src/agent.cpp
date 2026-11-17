@@ -820,7 +820,18 @@ public:
         spdlog::info("Yuzu agent starting (id={})", cfg_.agent_id);
 
         // 1. Load plugins (with optional allowlist + code-signing verification)
-        auto allowlist = load_plugin_allowlist(cfg_.plugin_allowlist);
+        // F52: three-state load; a configured allowlist that is missing, unreadable or empty
+        // refuses to start (copy of the --plugin-require-signature guard below) instead of
+        // letting an empty map disable enforcement.
+        auto allowlist_load = load_plugin_allowlist(cfg_.plugin_allowlist);
+        if (auto refusal = evaluate_allowlist_startup(cfg_.plugin_allowlist, allowlist_load)) {
+            spdlog::critical("{}. Refusing to start: this would silently fail-open (every "
+                             "plugin would load unverified).",
+                             *refusal);
+            std::exit(EXIT_FAILURE);
+        }
+        const bool allowlist_required = !cfg_.plugin_allowlist.empty();
+        const auto& allowlist = allowlist_load.entries;
         PluginSigningPolicy signing{cfg_.plugin_trust_bundle, cfg_.plugin_require_signature};
         // Fail-closed guard against silent fail-open. If the operator passed
         // --plugin-require-signature but forgot --plugin-trust-bundle (or
@@ -835,7 +846,7 @@ public:
                              "fail-open (every plugin would load unverified).");
             std::exit(EXIT_FAILURE);
         }
-        auto scan = PluginLoader::scan(cfg_.plugin_dir, allowlist, signing);
+        auto scan = PluginLoader::scan(cfg_.plugin_dir, allowlist, signing, allowlist_required);
 
         // Collect successfully loaded handles first (before init)
         std::vector<PluginHandle> candidates;
