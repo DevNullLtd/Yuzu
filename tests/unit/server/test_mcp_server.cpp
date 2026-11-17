@@ -19285,7 +19285,10 @@ TEST_CASE("#4353 field-bound schemas equal the handler constants", "[mcp][bounds
     // The three software tools' exact property key sets and published vocabulary enums (a dropped
     // or renamed property, or a drifted enum, is an advertisement the handler no longer honours).
     const std::map<std::string, std::set<std::string>> software_keys = {
-        {"query_installed_software", {"name", "agent_id", "version", "cursor", "limit"}},
+        // The five original keys plus the eight lookup filters (SAM-21).
+        {"query_installed_software",
+         {"name", "agent_id", "version", "cursor", "limit", "q", "kind", "ecosystem", "source",
+          "match", "version_min", "version_max", "status"}},
         {"query_software_catalogue",
          {"q", "kind", "ecosystem", "source", "agent_id", "versions_min", "limit", "cursor"}},
         {"get_software_versions", {"name", "kind", "ecosystem", "source", "agent_id", "limit"}},
