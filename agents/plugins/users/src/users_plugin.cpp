@@ -18,6 +18,7 @@
 #include <yuzu/string_utils.hpp> // yuzu::util::safe_output_field (BR-07)
 
 #ifndef _WIN32
+#include <cerrno>
 #include <chrono>
 #include <spdlog/spdlog.h>
 #include <yuzu/agent/runner_status.hpp> // yuzu::agent::forward_runner_failure (ABI4 result seam)
@@ -32,6 +33,7 @@
 #include <map>
 #include <sstream>
 #include <string>
+#include <optional>
 #include <string_view>
 #include <vector>
 
@@ -855,23 +857,68 @@ int do_local_users(yuzu::CommandContext& ctx) {
     return 0;
 }
 
+#ifdef __linux__
+// Reentrant, value-semantics group/passwd lookups (F40). getgrnam()/getpwuid() return pointers
+// into one libc static buffer that any concurrent dispatch-pool thread rewrites, so the result is
+// copied into owned strings before anything else runs. Buffer grows on ERANGE, bounded.
+struct GroupCopy {
+    unsigned gid = 0;
+    std::vector<std::string> members;
+};
+
+std::optional<GroupCopy> lookup_group_copy(const char* name) {
+    std::vector<char> buf(4096);
+    for (;;) {
+        struct group grp{};
+        struct group* res = nullptr;
+        const int rc = getgrnam_r(name, &grp, buf.data(), buf.size(), &res);
+        if (rc == ERANGE && buf.size() < (1u << 20)) {
+            buf.resize(buf.size() * 2);
+            continue;
+        }
+        if (rc != 0 || !res)
+            return std::nullopt;
+        GroupCopy out;
+        out.gid = static_cast<unsigned>(res->gr_gid);
+        for (char** m = res->gr_mem; m && *m; ++m)
+            out.members.emplace_back(*m);
+        return out;
+    }
+}
+
+std::optional<std::string> lookup_user_name(uid_t uid) {
+    std::vector<char> buf(4096);
+    for (;;) {
+        struct passwd pw{};
+        struct passwd* res = nullptr;
+        const int rc = getpwuid_r(uid, &pw, buf.data(), buf.size(), &res);
+        if (rc == ERANGE && buf.size() < (1u << 20)) {
+            buf.resize(buf.size() * 2);
+            continue;
+        }
+        if (rc != 0 || !res)
+            return std::nullopt;
+        return std::string(res->pw_name);
+    }
+}
+#endif
+
 // ── local_admins action ───────────────────────────────────────────────────
 
 int do_local_admins(yuzu::CommandContext& ctx) {
 #ifdef __linux__
     // Check sudo and wheel groups
     for (const char* group_name : {"sudo", "wheel"}) {
-        struct group* grp = getgrnam(group_name);
+        auto grp = lookup_group_copy(group_name);
         if (!grp)
             continue;
-        for (char** member = grp->gr_mem; *member; ++member) {
-            ctx.write_output(std::format("admin|{}|user|{}", *member, group_name));
+        for (const auto& member : grp->members) {
+            ctx.write_output(std::format("admin|{}|user|{}", member, group_name));
         }
     }
     // Also check root (uid 0) in /etc/passwd
-    struct passwd* pw = getpwuid(0);
-    if (pw) {
-        ctx.write_output(std::format("admin|{}|user|root", pw->pw_name));
+    if (auto root_name = lookup_user_name(0)) {
+        ctx.write_output(std::format("admin|{}|user|root", *root_name));
     }
 
 #elif defined(__APPLE__)
@@ -969,13 +1016,13 @@ int do_group_members(yuzu::CommandContext& ctx, yuzu::Params params) {
     }
 
 #ifdef __linux__
-    struct group* grp = getgrnam(std::string(group_name).c_str());
+    auto grp = lookup_group_copy(std::string(group_name).c_str());
     if (!grp) {
         ctx.write_output(std::format("group_member|error|Group not found: {}", group_name));
         return 1;
     }
-    for (char** member = grp->gr_mem; *member; ++member) {
-        ctx.write_output(std::format("group_member|{}|{}|user", *member, group_name));
+    for (const auto& member : grp->members) {
+        ctx.write_output(std::format("group_member|{}|{}|user", member, group_name));
     }
 
     // Also check if any user has this as their primary group (GID match)
@@ -993,11 +1040,11 @@ int do_group_members(yuzu::CommandContext& ctx, yuzu::Params params) {
             try {
                 gid = std::stoi(gid_s);
             } catch (...) {}
-            if (gid == static_cast<int>(grp->gr_gid)) {
+            if (gid == static_cast<int>(grp->gid)) {
                 // Check if already listed as explicit member
                 bool already_listed = false;
-                for (char** member = grp->gr_mem; *member; ++member) {
-                    if (user == *member) {
+                for (const auto& member : grp->members) {
+                    if (user == member) {
                         already_listed = true;
                         break;
                     }

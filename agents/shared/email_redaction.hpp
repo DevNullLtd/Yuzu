@@ -50,7 +50,18 @@ inline constexpr std::string_view kRedactedEmailPlaceholder = "[redacted-email]"
 /// so an escaped `(`/`)` (`alice@(a\(b)example.com`,
 /// `alice@(escaped\)paren)example.com`) does not open/close the comment
 /// early and truncate the domain scan that follows.
+///
+/// COST BOUND (F67, #4836): the CFWS skip below re-scans from each '@', so a value of many '@'
+/// each followed by an unterminated '(' costs ~n^2/4 steps (minutes at the 1 MiB Local State
+/// read cap). No e-mail address is anywhere near `kEmailScanMaxBytes` (RFC 5321 caps one at 254),
+/// so a LONGER value that contains an '@' is reported as a match WITHOUT scanning: over-match is
+/// the documented safe direction, and this keeps the filter's worst case linear.
+inline constexpr std::size_t kEmailScanMaxBytes = 1024;
+
 [[nodiscard]] inline bool looks_like_email_address(std::string_view value) {
+    if (value.size() > kEmailScanMaxBytes && value.find('@') != std::string_view::npos) {
+        return true;
+    }
     auto is_domain_char = [](char c) {
         return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
                c == '-' || c == '.' || c == '_' || static_cast<unsigned char>(c) >= 0x80;

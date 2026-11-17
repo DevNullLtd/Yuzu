@@ -50,6 +50,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <win_dns_cache_table.hpp> // DnsCacheTableOwner (F66: frees the DnsGetCacheDataTable list)
 #include <win_str.hpp> // shared yuzu::win wide<->UTF-8 helpers (#1681)
 #include <iphlpapi.h>
 #include <windns.h>
@@ -378,32 +379,25 @@ std::vector<ConnectionInfo> get_connections() {
 
 #ifdef _WIN32
 
-/// Opaque structure returned by DnsGetCacheDataTable (undocumented but stable).
-struct DNS_CACHE_ENTRY {
-    DNS_CACHE_ENTRY* pNext;
-    PWSTR pszName;
-    WORD wType;
-    WORD wDataLength;
-    DWORD dwFlags;
-};
+using DnsGetCacheDataTableFn = BOOL(WINAPI*)(yuzu::shared::DnsCacheNode**);
 
-using DnsGetCacheDataTableFn = BOOL(WINAPI*)(DNS_CACHE_ENTRY**);
-
-/// Query the Windows DNS resolver cache for a domain name.
+/// Query the Windows DNS resolver cache for a domain name. The returned list is caller-owned and
+/// is released by DnsCacheTableOwner on every return path (F66).
 bool check_dns_cache(std::string_view domain) {
-    static auto fn = []() -> DnsGetCacheDataTableFn {
-        HMODULE mod = LoadLibraryA("dnsapi.dll");
-        if (!mod)
-            return nullptr;
-        return reinterpret_cast<DnsGetCacheDataTableFn>(
-            GetProcAddress(mod, "DnsGetCacheDataTable"));
+    struct Api {
+        HMODULE mod = nullptr;
+        DnsGetCacheDataTableFn fn = nullptr;
+    };
+    static const Api api = []() -> Api {
+        Api a;
+        a.mod = LoadLibraryA("dnsapi.dll"); // never unloaded: pinned for the process
+        if (a.mod)
+            a.fn = reinterpret_cast<DnsGetCacheDataTableFn>(
+                reinterpret_cast<void*>(GetProcAddress(a.mod, "DnsGetCacheDataTable")));
+        return a;
     }();
 
-    if (!fn)
-        return false;
-
-    DNS_CACHE_ENTRY* head = nullptr;
-    if (!fn(&head))
+    if (!api.fn)
         return false;
 
     // Convert search domain to wide string for comparison
@@ -413,15 +407,18 @@ bool check_dns_cache(std::string_view domain) {
     if (wide_domain.empty())
         return false;
 
-    bool found = false;
-    for (auto* entry = head; entry != nullptr; entry = entry->pNext) {
-        if (entry->pszName && _wcsicmp(entry->pszName, wide_domain.c_str()) == 0) {
-            found = true;
-            break;
-        }
-    }
+    yuzu::shared::DnsCacheTableOwner table(api.mod);
+    if (!api.fn(table.out()))
+        return false;
 
-    return found;
+    std::size_t nodes = 0;
+    for (auto* entry = table.head(); entry != nullptr; entry = entry->pNext) {
+        if (++nodes > yuzu::shared::kDnsCacheNodeWalkCap)
+            break; // corrupted/cyclic list: bound the walk
+        if (entry->pszName && _wcsicmp(entry->pszName, wide_domain.c_str()) == 0)
+            return true;
+    }
+    return false;
 }
 
 #endif // _WIN32

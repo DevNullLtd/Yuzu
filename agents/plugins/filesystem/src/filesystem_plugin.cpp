@@ -464,6 +464,14 @@ yuzu::filesystem::find_by_hash::MountList find_by_hash_network_mounts(const std:
 
 #endif
 
+// ── Regex subject bound (F9 / CWE-674) ─────────────────────────────────
+// libstdc++'s std::regex executor recurses per matched character, so an unbounded subject
+// overflows the worker thread's stack (SIGSEGV is not catchable by the dispatch try/catch).
+// Operator-pattern regex runs only on subjects up to this size. This bounds STACK depth and the
+// polynomial cost; it does NOT make a hostile pattern terminate quickly (see has_nested_quantifiers
+// below, a heuristic, and the README caveat): that needs a linear-time engine.
+constexpr std::size_t kMaxRegexSubjectBytes = 64 * 1024;
+
 // ── Regex safety check ─────────────────────────────────────────────────
 // Reject patterns with nested quantifiers that cause catastrophic backtracking.
 bool has_nested_quantifiers(std::string_view pattern) {
@@ -1464,10 +1472,23 @@ private:
         }
 
         // Owner info
-        struct passwd* pw = getpwuid(st.st_uid);
-        struct group* gr = getgrgid(st.st_gid);
-        ctx.write_output(std::format("owner|{}", pw ? pw->pw_name : std::to_string(st.st_uid)));
-        ctx.write_output(std::format("group|{}", gr ? gr->gr_name : std::to_string(st.st_gid)));
+        // _r variants into a local buffer, names copied out at once (F63): getpwuid()/getgrgid()
+        // return pointers into libc statics that the concurrent dispatch pool rewrites.
+        std::string owner_name = std::to_string(st.st_uid);
+        std::string group_name = std::to_string(st.st_gid);
+        {
+            std::vector<char> nbuf(16384);
+            passwd pw{};
+            passwd* pres = nullptr;
+            if (getpwuid_r(st.st_uid, &pw, nbuf.data(), nbuf.size(), &pres) == 0 && pres)
+                owner_name = pres->pw_name;
+            group gr{};
+            group* gres = nullptr;
+            if (getgrgid_r(st.st_gid, &gr, nbuf.data(), nbuf.size(), &gres) == 0 && gres)
+                group_name = gres->gr_name;
+        }
+        ctx.write_output(std::format("owner|{}", owner_name));
+        ctx.write_output(std::format("group|{}", group_name));
 
         // Permission string
         auto perm_char = [](mode_t mode, mode_t bit, char c) { return (mode & bit) ? c : '-'; };
@@ -1986,6 +2007,12 @@ private:
 
             bool matched = false;
             if (use_regex) {
+                if (line.size() > kMaxRegexSubjectBytes) {
+                    // Typed skip, never a silent non-match: the caller must see lines went unsearched.
+                    ctx.write_output(std::format("skipped|{}|line exceeds regex limit ({} bytes)",
+                                                 line_num, kMaxRegexSubjectBytes));
+                    continue;
+                }
                 matched = std::regex_search(line, re);
             } else {
                 if (case_sensitive) {
@@ -2064,6 +2091,12 @@ private:
             }
             if (has_nested_quantifiers(search_s)) {
                 ctx.write_output("error|regex rejected: nested quantifiers risk catastrophic backtracking");
+                return 1;
+            }
+            if (content.size() > kMaxRegexSubjectBytes) {
+                ctx.write_output(std::format(
+                    "error|regex replace refused: file exceeds {} bytes (use a literal search)",
+                    kMaxRegexSubjectBytes));
                 return 1;
             }
             auto flags = std::regex::ECMAScript | std::regex::optimize;
