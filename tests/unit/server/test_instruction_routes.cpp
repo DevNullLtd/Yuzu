@@ -2267,3 +2267,53 @@ TEST_CASE("instruction_routes: DELETE notes the containing packs on the success 
         CHECK(h.audits[0].detail.find("p6") == std::string::npos);
     }
 }
+
+// WP05 (F13/F14): the editor fragment substitutes in ONE pass over the original template;
+// stored field text containing a placeholder token must stay literal and escaped.
+TEST_CASE("instruction_routes: editor render keeps placeholder tokens in stored fields literal",
+          "[server][routes][instruction_routes][xss]") {
+    extern const char* const kInstructionEditorHtml;
+    InstructionDefinition d;
+    d.id = "{{DEF_NAME}}";
+    d.name = "{{DEF_DESCRIPTION}}";
+    d.version = "{{SEL_CC_OTHER_OPTION}}";
+    d.plugin = "{{DEF_PLUGIN}}"; // its own key: the old loop never terminated
+    d.action = "{{YAML_SOURCE}}";
+    d.description = "{{DEF_DESCRIPTION}}";
+    d.platforms = "{{TITLE}}";
+    d.yaml_source = "{{YAML_SOURCE}} {{SEL_CC_OTHER_OPTION}}";
+    d.type = "question";
+    d.approval_mode = "auto";
+    d.concurrency_mode = "unlimited";
+    const auto html = instruction::render_instruction_editor(kInstructionEditorHtml, &d);
+    for (const char* tok : {"{{DEF_NAME}}", "{{DEF_DESCRIPTION}}", "{{SEL_CC_OTHER_OPTION}}",
+                            "{{DEF_PLUGIN}}", "{{YAML_SOURCE}}", "{{TITLE}}"})
+        CHECK(html.find(tok) != std::string::npos);
+    // No fifth option was injected for a recognised mode.
+    CHECK(html.find("unrecognized, not enforced") == std::string::npos);
+}
+
+TEST_CASE("instruction_routes: editor render escapes markup in every stored field",
+          "[server][routes][instruction_routes][xss]") {
+    extern const char* const kInstructionEditorHtml;
+    const std::string x = "<script>alert(1)</script>\"onfocus=x autofocus";
+    InstructionDefinition d;
+    d.id = d.name = d.version = d.plugin = d.action = d.description = d.platforms = x;
+    d.yaml_source = x;
+    d.type = "question";
+    d.approval_mode = "auto";
+    d.concurrency_mode = x; // free-form, lands in the fifth <option>
+    const auto html = instruction::render_instruction_editor(kInstructionEditorHtml, &d);
+    CHECK(html.find("<script>alert(1)") == std::string::npos);
+    CHECK(html.find("\"onfocus=x") == std::string::npos);
+    CHECK(html.find("&lt;script&gt;") != std::string::npos);
+    CHECK(html.find("unrecognized, not enforced") != std::string::npos);
+}
+
+TEST_CASE("instruction_routes: editor render for a new definition fills defaults",
+          "[server][routes][instruction_routes][xss]") {
+    extern const char* const kInstructionEditorHtml;
+    const auto html = instruction::render_instruction_editor(kInstructionEditorHtml, nullptr);
+    CHECK(html.find("New Definition") != std::string::npos);
+    CHECK(html.find("{{") == std::string::npos);
+}
