@@ -2168,11 +2168,22 @@ public:
                 // clearing it would flip the server's enrollment_method label
                 // on a reconnect from "token" to "approval"
                 // (agent_service_impl.cpp, agent.registered analytics event).
-                if (!cfg_.enrollment_token_file.empty() &&
-                    remove_enrollment_token_file("after the accepted registration",
-                                                 "will retry after the next accepted "
-                                                 "registration"))
-                    cfg_.enrollment_token_file.clear();
+                //
+                // WP01: while a certificate is still being provisioned (a CSR is pending) the
+                // token is the agent's only proof of identity if the issued leaf is lost before it
+                // is persisted - the server now refuses a certificate-less re-registration of an
+                // id that holds a live leaf unless a token is presented - so it is removed only
+                // AFTER the leaf is on disk (below), or when provisioning is given up. Without a
+                // pending CSR the registration is complete and it goes now, as before.
+                const auto retire_token_file = [&] {
+                    if (!cfg_.enrollment_token_file.empty() &&
+                        remove_enrollment_token_file("after the accepted registration",
+                                                     "will retry after the next accepted "
+                                                     "registration"))
+                        cfg_.enrollment_token_file.clear();
+                };
+                if (pending_csr_pem.empty())
+                    retire_token_file();
 
                 // PKI PR3: the server signed our CSR. Persist the leaf + key (0600)
                 // + issuing chain, point the config at it, and rebuild the channel
@@ -2193,6 +2204,7 @@ public:
                         pending_key_pem.clear();
                         pending_csr_pem.clear();
                         if (persisted) {
+                            retire_token_file(); // the leaf is on disk: the token's job is done
                             // Pairs with yuzu_agent_cert_provision_failed_total so an
                             // operator can distinguish a provisioned (mutual-TLS) agent
                             // from one that gave up and is running unauthenticated —
@@ -2247,6 +2259,7 @@ public:
                         yuzu::secure_zero(pending_key_pem);
                         pending_key_pem.clear();
                         pending_csr_pem.clear();
+                        retire_token_file(); // provisioning abandoned: nothing left to prove
                         // fall through unauthenticated
                     } else {
                         spdlog::warn("PKI: enrolled but no client cert issued (attempt {}/{}); "
