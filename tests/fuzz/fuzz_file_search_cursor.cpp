@@ -3,8 +3,8 @@
 // controlled, so the decoder must be total, and every accepted token must be the canonical
 // spelling of what it decodes to (the harness aborts otherwise).
 //
-// Registered in tests/fuzz/meson.build AND .clusterfuzzlite/build.sh -- keep the two in sync when
-// adding sources.
+// Not registered yet: this target is added to tests/fuzz/meson.build and .clusterfuzzlite/build.sh
+// separately, after this harness lands -- keep the two in sync when adding it.
 
 #include "../../agents/shared/base64.hpp"
 #include "../../agents/shared/file_search_cursor.hpp"

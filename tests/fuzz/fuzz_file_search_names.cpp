@@ -3,8 +3,8 @@
 // names come from an untrusted volume), so the whole surface must be total and the encoding must
 // stay one-to-one.
 //
-// Registered in tests/fuzz/meson.build AND .clusterfuzzlite/build.sh -- keep the two in sync when
-// adding sources.
+// Not registered yet: this target is added to tests/fuzz/meson.build and .clusterfuzzlite/build.sh
+// separately, after this harness lands -- keep the two in sync when adding it.
 
 #include "../../agents/shared/file_search_names.hpp"
 #include "../../agents/shared/wire_utf8.hpp"

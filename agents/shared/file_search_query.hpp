@@ -7,6 +7,13 @@
 // are not a well-formed scalar); every other byte, '[' and ']' included, is a literal. No classes,
 // no escapes, no regex. Leaf names only: '/' and NUL are refused.
 //
+// The matcher is COMPLETE under exactly those semantics: it accepts a name if and only if SOME
+// way of spending each '*' makes the pattern consume the name. It does not backtrack: it tracks,
+// pattern byte by pattern byte, the set of name offsets the pattern so far can end at, so the work
+// is at most (canonical pattern bytes) * (canonical name bytes + 1) and no recursion or heap use
+// beyond the canonical name. A '?' width depends on the name position, so a single backtrack
+// point (the last star) is NOT enough once a pattern has two stars and a '?'.
+//
 // This hashes the query text, never file content. Platform-agnostic pure C++ with no OS call and
 // no I/O: the zero-dependency leaf-helper convention of this directory.
 #pragma once
@@ -14,6 +21,7 @@
 #include "sha256.hpp"
 #include "wire_utf8.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -101,47 +109,46 @@ public:
         return matches_counted(raw_name, steps);
     }
 
-    /// matches(), also reporting the matcher's loop iterations (bounded by
-    /// (canonical name + 1) * (canonical pattern + 1)); lets a test assert the worst-case bound.
+    /// matches(), also reporting the matcher's work: one step per (pattern byte, name offset) cell
+    /// it visits, so steps grow by at most (canonical pattern bytes) * (canonical name bytes + 1);
+    /// lets a test assert the worst-case bound. A name over the canonical cap costs no steps.
     [[nodiscard]] bool matches_counted(std::string_view raw_name, std::size_t& steps) const {
         const std::string name = canon_fn_ ? canon_fn_(raw_name) : std::string(raw_name);
         if (name.size() > kMaxCanonicalNameBytes)
             return false;
-        const std::string_view pat = canonical_;
-        std::size_t p = 0, n = 0;
-        constexpr auto npos = std::string_view::npos;
-        std::size_t star = npos, star_n = 0; // the one backtrack point: the last star
-        for (;;) {
-            ++steps;
-            if (p < pat.size()) {
-                if (pat[p] == '*') {
-                    star = p++;
-                    star_n = n;
-                    continue;
-                }
-                if (n < name.size()) {
-                    if (pat[p] == '?') {
-                        const std::size_t len = utf8_scalar_len(name, n);
-                        n += len == 0 ? 1 : len;
-                        ++p;
-                        continue;
-                    }
-                    if (pat[p] == name[n]) {
-                        ++p;
-                        ++n;
-                        continue;
-                    }
-                }
-            } else if (n == name.size()) {
-                return true;
+        // rows[r][n]: the pattern bytes consumed so far can end exactly at name offset n.
+        std::array<std::array<bool, kMaxCanonicalNameBytes + 1>, 2> rows{};
+        auto* cur = &rows[0];
+        auto* nxt = &rows[1];
+        (*cur)[0] = true;
+        const std::size_t cells = name.size() + 1;
+        for (const char pc : canonical_) {
+            steps += cells;
+            if (pc == '*') {
+                // Any run of bytes, including none: every offset at or after a reachable one.
+                for (std::size_t n = 1; n < cells; ++n)
+                    (*cur)[n] = (*cur)[n] || (*cur)[n - 1];
+                continue;
             }
-            // Mismatch, or the name ran out with pattern left (a '?' may have swallowed a whole
-            // scalar that the star could have split): retry with the last star one byte longer.
-            if (star == npos || star_n >= name.size())
+            std::fill_n(nxt->begin(), cells, false);
+            bool any = false;
+            for (std::size_t n = 0; n < name.size(); ++n) {
+                if (!(*cur)[n])
+                    continue;
+                if (pc == '?') {
+                    const std::size_t len = utf8_scalar_len(name, n);
+                    (*nxt)[n + (len == 0 ? 1 : len)] = true;
+                    any = true;
+                } else if (pc == name[n]) {
+                    (*nxt)[n + 1] = true;
+                    any = true;
+                }
+            }
+            if (!any)
                 return false;
-            p = star + 1;
-            n = ++star_n;
+            std::swap(cur, nxt);
         }
+        return (*cur)[name.size()];
     }
 
     [[nodiscard]] const std::string& canonical() const noexcept { return canonical_; }

@@ -2,8 +2,8 @@
 // matcher of the on-demand file search. Pattern and name are both attacker-influenced (the pattern
 // from the request, the name from any file on disk), so compile and matches must be total.
 //
-// Registered in tests/fuzz/meson.build AND .clusterfuzzlite/build.sh - keep
-// the two in sync when adding sources.
+// Not registered yet: this target is added to tests/fuzz/meson.build and .clusterfuzzlite/build.sh
+// separately, after this harness lands -- keep the two in sync when adding it.
 
 #include "../../agents/shared/file_search_query.hpp"
 

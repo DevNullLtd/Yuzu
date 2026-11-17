@@ -53,6 +53,23 @@ TEST_CASE("mount_entries: real-shape table parses exactly, in order", "[network_
     CHECK(t.entries[6].source == "/dev/nvme0n1p3");
 }
 
+TEST_CASE("mount_entries: root is octal-decoded like the mount point and source",
+          "[network_fstype]") {
+    // The root is the path inside the filesystem that a bind mount exposes; an escaped one must
+    // reach the entry decoded, whether the escape is mid-field, a backslash, or the last bytes.
+    const auto t = mount_entries(
+        "44 22 8:3 /my\\040dir /mnt/a\\040b rw,relatime shared:2 - ext4 /dev/sda3 rw\n"
+        "45 22 8:3 /a\\134b /bind rw,relatime - ext4 /dev/sda3 rw\n"
+        "46 22 8:3 /trail\\040 /bind2 rw,relatime - ext4 /dev/sda3 rw\n");
+    CHECK(t.malformed == 0);
+    REQUIRE(t.entries.size() == 3);
+    CHECK(t.entries[0].root == "/my dir");
+    CHECK(t.entries[0].mount_point == "/mnt/a b");
+    CHECK(t.entries[1].root == "/a\\b");
+    CHECK(t.entries[2].root == "/trail ");
+    CHECK(t.entries[2].mount_point == "/bind2");
+}
+
 TEST_CASE("mount_entries: each malformed shape counts once and adds no entry", "[network_fstype]") {
     for (const char* line : {
              "22 1 8:2 / / rw,relatime ext4 /dev/sda2 rw",         // no separator
@@ -63,6 +80,9 @@ TEST_CASE("mount_entries: each malformed shape counts once and adds no entry", "
              "22 1 8: / / rw - ext4 /dev/sda2 rw",                 // empty minor
              "22 1 -8:2 / / rw - ext4 /dev/sda2 rw",               // sign
              "22 1 8:2 / / rw - ",                                 // missing fstype
+             "22 1 8:2 / /mnt  - ext4 /dev/sda2 rw",               // doubled space, no options
+             "22 1 8:2  / /mnt rw - ext4 /dev/sda2 rw",            // empty root mid-head
+             "22  8:2 / /mnt rw - ext4 /dev/sda2 rw",              // empty parent id mid-head
          }) {
         INFO("line: " << line);
         const auto t = mount_entries(std::string(line) + "\n");

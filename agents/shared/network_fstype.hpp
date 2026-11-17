@@ -156,8 +156,8 @@ namespace detail {
 } // namespace detail
 
 /// Parses /proc/self/mountinfo text into entries, in table order. A blank line is ignored; a line
-/// with no ` - `, fewer than six head fields, a `maj:min` that is not digits:digits, an empty
-/// mount point or no fstype is counted in `malformed` and yields no entry.
+/// with no ` - `, fewer than six non-empty head fields (a doubled space leaves an empty one), a
+/// `maj:min` that is not digits:digits or no fstype is counted in `malformed` and yields no entry.
 [[nodiscard]] inline MountTable mount_entries(std::string_view mountinfo) {
     MountTable table;
     std::size_t pos = 0;
@@ -182,7 +182,10 @@ namespace detail {
             f[n++] = head.substr(start, end - start);
             start = end + 1;
         }
-        const auto colon = n == 6 ? f[2].find(':') : std::string_view::npos;
+        bool head_complete = n == 6;
+        for (const auto field : f)
+            head_complete = head_complete && !field.empty();
+        const auto colon = head_complete ? f[2].find(':') : std::string_view::npos;
         MountEntry e;
         const std::string_view after = line.substr(sep + 3);
         const auto fs_end = after.find(' ');
@@ -192,7 +195,7 @@ namespace detail {
             const auto rest = after.substr(fs_end + 1);
             source = rest.substr(0, rest.find(' '));
         }
-        if (n < 6 || f[4].empty() || fstype.empty() || colon == std::string_view::npos ||
+        if (!head_complete || fstype.empty() || colon == std::string_view::npos ||
             !detail::parse_dev_number(f[2].substr(0, colon), e.dev_major) ||
             !detail::parse_dev_number(f[2].substr(colon + 1), e.dev_minor)) {
             ++table.malformed;
