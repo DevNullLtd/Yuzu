@@ -1878,6 +1878,59 @@ class SectionAllowlistSelfTest(unittest.TestCase):
                             "no upgrading.md heading starts with: " + prefix)
 
 
+def _read(rel):
+    with open(os.path.join(REPO, rel), encoding="utf-8") as f:
+        return f.read()
+
+
+class HelperSitesAreGovernedInterpreterSites(unittest.TestCase):
+    """The review of the follow-ups PR (R2): both helpers start with `#!/bin/sh`, so under ADR-3002
+    Decision 5 the calls a non-root agent makes through them sit at the interpreter's rung. The
+    manifest registers each such site, and the descriptors that name a helper say rung 3."""
+
+    SITES = ("firewall/sudo_runner#1", "firewall/sudo_runner#4", "firewall/sudo_runner#5",
+             "firewall/sudo_runner#6", "firewall/sudo_runner#7", "firewall/sudo_runner#8",
+             "firewall/sudo_runner#14", "services/set_start_mode_linux#1",
+             "services/set_start_mode_macos#1")
+
+    def test_each_helper_site_is_a_registered_decision_5_interpreter_site(self):
+        rows = {l.split("`")[1]: l for l in _read("docs/agent-spawn-sink-manifest.md").splitlines()
+                if l.startswith("| `")}
+        for site in self.SITES:
+            row = rows[site]
+            self.assertIn("Rung 3 — Decision-5 governed-interpreter site", row, site)
+            self.assertIn("Decision-5 interpreter registration (`sh`:", row, site)
+            self.assertNotIn("| Rung 2 — clean argv", row, site)
+
+    def test_the_descriptors_that_run_a_helper_say_rung_3(self):
+        fw = _read("agents/plugins/firewall/src/firewall_plugin.cpp")
+        svc = _read("agents/plugins/services/src/services_plugin.cpp")
+        for text, name in ((fw, "firewall"), (svc, "services")):
+            for m in re.finditer(r"\{YUZU_SUPPORT_[A-Z]+,\s*(\d),\s*\"((?:[^\"\\]|\\.|\"\s*\")*)", text):
+                mech = m.group(2)
+                if re.search(r"yuzu-(fw|svc)-helper", mech):
+                    self.assertEqual(m.group(1), "3", name + ": " + mech[:60])
+
+
+class InstallerCheckComparesSudoersBytes(unittest.TestCase):
+    """The review of the follow-ups PR (R9): `--check` compares the installed sudoers file with the
+    text the installer would write, as it does for the helpers."""
+
+    def test_check_compares_the_file_with_the_generated_text(self):
+        text = _read(INSTALLER)
+        self.assertRegex(text, r'generate_sudoers_content \| cmp -s - "\$SUDOERS_FILE"')
+        self.assertIn("differs from this installer's text", text)
+
+
+class ReconcilerThreadNamesThePassThatFailed(unittest.TestCase):
+    """The review of the follow-ups PR (R7): a drain failure is not logged as a tick failure."""
+
+    def test_the_catch_blocks_name_the_pass(self):
+        text = _read("server/core/src/server.cpp")
+        self.assertGreaterEqual(text.count('tick_pass ? "tick" : "heartbeat drain"'), 2)
+        self.assertNotIn("quarantine_reconciler: tick threw", text)
+
+
 class DeploymentContractWording(unittest.TestCase):
     """The containment helper docs never describe an upgrade path. The deployment contract (a fresh
     deployment, every writer on this build: upgrading.md "Deployment contract (hard cutover)") makes an

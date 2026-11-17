@@ -1782,6 +1782,14 @@ check_install() {
                 warn "$SUDOERS_FILE fails visudo validation"; ((errs++))
             else
                 log "$SUDOERS_FILE present and visudo-valid"
+                # A valid file is not the file this installer writes: a hand edit that still
+                # validates (an added grant) must not pass --check, as a changed helper does not.
+                if generate_sudoers_content | cmp -s - "$SUDOERS_FILE"; then
+                    log "$SUDOERS_FILE content current"
+                else
+                    warn "$SUDOERS_FILE differs from this installer's text (re-run this installer)"
+                    ((errs++))
+                fi
             fi
         fi
     fi
