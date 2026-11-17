@@ -54,13 +54,18 @@ DexDayWindow dex_day_window(std::int64_t now_epoch, int days) {
     return w;
 }
 
-// ISO-8601 UTC cutoff for "N days ago"; "" for days<=0 (the "all" window, where a
+// ISO-8601 UTC cutoff for "N days before now_epoch"; "" for days<=0 (the "all" window, where a
 // per-device-days rate is ill-defined). Mirrors guardian_ingest's ts_to_iso8601.
-std::string dex_iso_since(int days) {
+std::string dex_iso_since_at(std::int64_t now_epoch, int days) {
     if (days <= 0)
         return {};
-    const auto t = std::chrono::system_clock::now() - std::chrono::hours(24 * days);
-    return dex_iso_at(static_cast<std::int64_t>(std::chrono::system_clock::to_time_t(t)));
+    return dex_iso_at(now_epoch - static_cast<std::int64_t>(days) * 86400);
+}
+
+std::string dex_iso_since(int days) {
+    return dex_iso_since_at(
+        static_cast<std::int64_t>(std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())),
+        days);
 }
 
 std::string dex_normalize_os_filter(const std::string& os) {

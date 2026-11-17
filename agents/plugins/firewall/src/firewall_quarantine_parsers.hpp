@@ -64,11 +64,9 @@ inline constexpr std::string_view kWinDisabledRulesKey = "win.disabled_rules";
 
 /// Windows Firewall rule group every rule we create carries; removal is by group.
 inline constexpr std::string_view kWinGroup = "Yuzu Firewall Quarantine";
-/// Our rule-name prefix. Deliberately NOT the legacy plugin's `YuzuQuarantine_`
-/// prefix: its netsh_matching_rule_names deletes every rule that starts with it.
+/// Our rule-name prefix. Removal sweeps every rule that starts with it (and every
+/// rule in kWinGroup), so nothing else may use it.
 inline constexpr std::string_view kWinRulePrefix = "YuzuFirewall_Quarantine_";
-inline constexpr std::string_view kLegacyWinRulePrefix = "YuzuQuarantine_";
-inline constexpr std::string_view kLegacyIptablesChain = "yuzu-quarantine";
 
 inline constexpr std::string_view kNftTable = "yuzu_quarantine";
 inline constexpr std::string_view kIptablesChainPrefix = "yuzu-fwq-";
@@ -1472,10 +1470,6 @@ struct WinRuleSpec {
     return out;
 }
 
-[[nodiscard]] inline bool is_legacy_marker(std::string_view rule_name) noexcept {
-    return rule_name.starts_with(kLegacyWinRulePrefix);
-}
-
 /// A rule is ours when it is in our group or carries our name prefix; the one
 /// test the disable list, the removal sweep and status all share.
 [[nodiscard]] constexpr bool is_our_win_rule(std::string_view name,
@@ -2406,13 +2400,12 @@ using Argv = std::vector<std::string>;
     return static_cast<std::uint32_t>(*v);
 }
 
-/// What `iptables -S` shows of us (and of the legacy plugin).
+/// What `iptables -S` shows of us.
 inline constexpr std::array<std::string_view, 3> kIptBuiltins{"INPUT", "OUTPUT", "FORWARD"};
 
 struct IptablesListing {
     std::vector<std::string> chains;                          // yuzu-fwq-* user chains
     std::vector<std::pair<std::string, std::string>> jumps;   // {builtin, our chain}
-    bool legacy_chain = false;                                // `yuzu-quarantine` exists
     std::uint32_t max_gen = 0;
     /// The target of the FIRST `-A <builtin>` rule of INPUT / OUTPUT / FORWARD, empty
     /// when that rule has no `-j` (or the chain has no rule). A jump of ours that is
@@ -2445,8 +2438,6 @@ struct IptablesListing {
         const auto line = detail::trim(raw);
         const auto f = detail::split(line, ' ');
         if (f.size() == 2 && f[0] == "-N") {
-            if (f[1] == kLegacyIptablesChain)
-                out.legacy_chain = true;
             if (const auto g = ipt_chain_gen(f[1])) {
                 out.chains.emplace_back(f[1]);
                 out.max_gen = std::max(out.max_gen, *g);
@@ -2912,7 +2903,8 @@ class Leg {
 public:
     virtual ~Leg() = default;
     [[nodiscard]] virtual BackendKind kind() const = 0;
-    /// A reason to refuse before any mutation (a legacy quarantine in force).
+    /// A reason to refuse before any mutation (the iptables leg without a usable IPv6
+    /// path; the Windows leg when the firewall is switched off or under policy).
     [[nodiscard]] virtual std::optional<std::string> preflight(Deadline& dl) = 0;
     /// Make `next` the effective generation. On failure the previously effective
     /// generation must still be in force (an initial apply may leave partial
@@ -3051,26 +3043,13 @@ private:
 
 // ── Linux legs ──────────────────────────────────────────────────────────────
 
-/// Refuse when the retained legacy quarantine plugin's chain is present (its
-/// release would otherwise delete or restore under ours). An unreadable
-/// listing does not block: containment must not depend on a diagnostic read.
-[[nodiscard]] inline std::optional<std::string> linux_legacy_preflight(const Runner& run,
-                                                                       Deadline& dl) {
-    detail::Exec ex(run, dl);
-    const auto r = ex.call({std::string{kIptablesPath}, "-S"});
-    if (!r || !r->ok())
-        return std::nullopt;
-    if (parse_iptables_listing(r->output).legacy_chain)
-        return "legacy_quarantine_active";
-    return std::nullopt;
-}
-
 /// Can the Linux agent run the privileged tool at all? The packaged systemd unit
 /// runs as `yuzu-agent` with NoNewPrivileges=true, a one-capability bounding set and
 /// no sudoers grant, so `sudo` cannot elevate: every containment tool call would
 /// fail AFTER the `applying` record was written, and the failed delete would then
 /// strand it. A non-root agent under no_new_privs is refused up front, before any
-/// record, `privilege_unavailable` (the privilege path is PRQ.2's). `no_new_privs`
+/// record, `privilege_unavailable` (the packaged unit has no privilege path; the
+/// server ends such a record with a forced DELETE). `no_new_privs`
 /// is prctl(PR_GET_NO_NEW_PRIVS): 1 set, 0 clear, negative when it could not be
 /// read, which is NOT a refusal (sudo will say so itself).
 [[nodiscard]] constexpr std::optional<std::string_view> linux_privilege_refusal(bool euid_root,
@@ -3087,9 +3066,9 @@ public:
 
     [[nodiscard]] BackendKind kind() const override { return BackendKind::nft; }
 
-    [[nodiscard]] std::optional<std::string> preflight(Deadline& dl) override {
-        return linux_legacy_preflight(run_, dl);
-    }
+    // Nothing to refuse on: nft tables are ours by name, and an unreadable host state
+    // must not block containment.
+    [[nodiscard]] std::optional<std::string> preflight(Deadline&) override { return std::nullopt; }
 
     [[nodiscard]] StepResult apply(const AllowSet& next, std::uint32_t, std::uint32_t, OsPayload&,
                                    Deadline& dl, const PersistOs&) override {
@@ -3194,10 +3173,10 @@ public:
 
     [[nodiscard]] BackendKind kind() const override { return BackendKind::iptables; }
 
-    [[nodiscard]] std::optional<std::string> preflight(Deadline& dl) override {
+    [[nodiscard]] std::optional<std::string> preflight(Deadline&) override {
         if (const auto why = v6_refusal(v6_); !why.empty())
             return std::string{why};
-        return linux_legacy_preflight(run_, dl);
+        return std::nullopt;
     }
 
     [[nodiscard]] StepResult apply(const AllowSet& next, std::uint32_t gen, std::uint32_t,
@@ -3402,8 +3381,8 @@ public:
 
     [[nodiscard]] BackendKind kind() const override { return BackendKind::pf; }
 
-    // The retained plugin's pf path loads a whole main ruleset and leaves no
-    // marker in `pfctl -s rules` that could be refused on (design note section 3).
+    // Our pf rules live in a sub-anchor and leave no marker in `pfctl -s rules` that
+    // could be refused on (design note section 3).
     [[nodiscard]] std::optional<std::string> preflight(Deadline&) override { return std::nullopt; }
 
     [[nodiscard]] StepResult apply(const AllowSet& next, std::uint32_t, std::uint32_t prev_gen,
@@ -3920,7 +3899,13 @@ struct ApplyRequest {
                 if (o.status != "degraded")
                     o.notes.emplace_back("already_active=1");
             }
-            if (!(cur.allow == req.allow))
+            // Said when the operator EXCEPTIONS differ, as a set (order is not a difference).
+            // Not when only the control peer or the resolvers differ: the live peer leads a
+            // new request's control set and the resolvers are re-read, so those differ on a
+            // healthy retry. The server keys on this note to learn that a new record's
+            // whitelist was not applied (the stored set was kept).
+            if (!std::is_permutation(cur.allow.exceptions.begin(), cur.allow.exceptions.end(),
+                                     req.allow.exceptions.begin(), req.allow.exceptions.end()))
                 o.notes.emplace_back("allow_set_unchanged_use_quarantine_allow=1");
             // Same rule for the TTL: a retry never rewrites a contained host's expiry.
             if (req.ttl_seconds != 0)
@@ -4219,18 +4204,6 @@ struct ReleaseRequest {
             o.notes.emplace_back("ttl_not_expired=1");
             return o;
         }
-        // The TTL has passed. A containment from the retained quarantine plugin may
-        // have been applied underneath ours since; releasing here would restore
-        // rules and defaults under it (a manual release is stopped by the dispatch
-        // gate, this agent-local tick is not). Only a legacy marker defers: any other
-        // preflight answer must not stop a lapsed time limit from ending.
-        if (const auto why = env.leg.preflight(dl); why && *why == "legacy_quarantine_active") {
-            o.status = "partial";
-            o.reason = "legacy_quarantine_active";
-            o.state = loaded.state;
-            o.notes.emplace_back("ttl_deferred_legacy=1");
-            return o;
-        }
         // The limit lapsed and nothing defers it: this release is the expiry. The note
         // rides the outcome into the agent's one log line for it, the ONLY record of an
         // expiry release until the server records them (the trigger's output is dropped).
@@ -4276,7 +4249,7 @@ struct ReleaseRequest {
 
 /// Agent start (init(): after the KV store opens, before Register). Completes an
 /// interrupted release; re-applies an `applying`/`active` record as a generation
-/// update when the OS is not enforcing it (a reboot, a legacy release). It never
+/// update when the OS is not enforcing it (a reboot, a release by hand). It never
 /// rolls back and never releases: an unreachable server at boot must not lift
 /// containment. A re-apply that fails puts the record back as it was (an `active`
 /// one then reads through the leg on every later status; one already `applying`
@@ -4397,9 +4370,7 @@ struct ReleaseRequest {
 ///
 /// Never acts on an unreadable store (a fault is not "no record"), never converges a
 /// record that is not `active`, never re-applies over a read that says a re-apply
-/// cannot help, and defers (no mutation) to a legacy containment that appeared
-/// underneath -- the single-token rule release() uses for an expired limit. One leg
-/// read per call; every outcome carries `repair_tick=1` and every mutation is counted
+/// cannot help. One leg read per call; every outcome carries `repair_tick=1` and every mutation is counted
 /// on the record and says `repaired=1`.
 [[nodiscard]] inline Outcome repair(Env& env, Deadline& dl) {
     Outcome o;
@@ -4425,13 +4396,6 @@ struct ReleaseRequest {
     }
     const auto ls = env.leg.read_status(st.os, dl);
     if (ls.state == OsState::not_enforcing && ls.reapply_helps) {
-        if (const auto why = env.leg.preflight(dl); why && *why == "legacy_quarantine_active") {
-            detail::add_notes(o, ls.notes);
-            o.status = "partial";
-            o.reason = "legacy_quarantine_active";
-            o.notes.emplace_back("repair_deferred_legacy=1");
-            return o;
-        }
         auto r = detail::converge(env, st, st.allow, dl, /*repaired=*/true);
         if (detail::settled(r))
             r.notes.emplace_back("repaired=1");
@@ -4669,8 +4633,7 @@ enum class LogLevel : std::uint8_t { none, info, warn, error };
 /// this onto spdlog). A thrown action is `error`. The two unattended ticks are quiet
 /// unless they did or found something: the 30 s time-limit poll before expiry logs
 /// nothing; a repair tick logs when it re-applied the host (`info`, `repaired=1`) or
-/// when it found the host degraded, deferred to a legacy containment or failed to
-/// repair (`warn`), and stays silent for a healthy host, an operation in progress and a
+/// when it found the host degraded or failed to repair (`warn`), and stays silent for a healthy host, an operation in progress and a
 /// residue the record already carries (a persistent partial must not warn every
 /// minute). Every other action logs a state change at `info` (`quarantine_status` is a
 /// read and logs nothing when it is fine) and anything not OK at `warn`.
@@ -4682,9 +4645,8 @@ enum class LogLevel : std::uint8_t { none, info, warn, error };
     if (detail::has_note(o, "repair_tick=1")) {
         if (detail::has_note(o, "repaired=1"))
             return LogLevel::info;
-        const bool quiet = (o.status == "active" || o.status == "active_unproven" ||
-                            o.status == "inactive" || o.status == "partial") &&
-                           !detail::has_note(o, "repair_deferred_legacy=1");
+        const bool quiet = o.status == "active" || o.status == "active_unproven" ||
+                           o.status == "inactive" || o.status == "partial";
         return quiet ? LogLevel::none : LogLevel::warn;
     }
     if (o.status == "active" || o.status == "inactive")
@@ -4694,7 +4656,7 @@ enum class LogLevel : std::uint8_t { none, info, warn, error };
 
 /// `firewall: <action> -> <status>[:<reason>][ <note>...]`. The notes ride the line:
 /// an expiry release reads `firewall: release -> inactive ttl_expired=1`, and that line
-/// is the only record of it until the server records expiry releases. Notes are `k=v`
+/// is the agent's own record of it (the server's is its own status read). Notes are `k=v`
 /// tokens built by the core and the legs (free text is sanitised at its source).
 [[nodiscard]] inline std::string log_line(std::string_view action, const Outcome& o) {
     if (o.status == "degraded" && o.reason == "exception")

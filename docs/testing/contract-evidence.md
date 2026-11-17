@@ -32,9 +32,13 @@ Linux-only under [ADR-0035](../adr/0035-server-is-linux-only-windows-is-agent-on
 `build_tests=true`, `build_agent=true`, `server=enabled` and the gateway toolchain
 are required. Missing registration is an error, not a smaller successful plan.
 `--only ID` (repeatable) selects a declared subset; the manifest records it.
-`--jobs N` defaults to four. `--build-timeout SECONDS` bounds the native build step; it defaults
-to `YUZU_CONTRACT_BUILD_TIMEOUT_S`, else 1800 (CI sets 3600, because a runner's first build of
-the contract build directory is cold).
+`--jobs N` is the native build's parallelism (`meson compile -j`) and defaults to four; the
+contracts themselves always run one at a time. `--build-timeout SECONDS` bounds the native build
+step; it defaults to `YUZU_CONTRACT_BUILD_TIMEOUT_S`, else 1800 (CI sets 3600, because a runner's
+first build of the contract build directory is cold). CI compiles the pilots' targets at the leg's
+full width before it runs the collector, so the collector's own build finds nothing to do: in a CI
+bundle the build step's duration and `build.log` record that no-op, not the compile cost, which is
+in the CI step log. See `docs/ci-architecture.md` "Contract migration evidence".
 
 On macOS or Windows (MSYS2 bash), select the four plugin/gateway contracts
 explicitly and leave the server disabled:
@@ -61,7 +65,17 @@ generator in a fresh VM using the repository's pinned OTP resolver. This is
 process-state isolation; deleting a shared `_build` is unnecessary.
 
 The collector's build-directory lease excludes another collector, not arbitrary
-`ninja`, Meson or rebar commands. Coordinate ownership before running. It does not
+`ninja`, Meson or rebar commands. Coordinate ownership before running. The lease is
+an operating-system lock on `.contract-evidence.lease` in the build directory, so it
+ends when the collector exits, even when the collector is killed (on Windows, allow a
+few seconds after a kill: the system releases a dead process's locks asynchronously).
+A second collector on the same directory fails at once with `BuildDirectoryBusy`. The
+lease covers the collector process only: a build or test process it started runs in
+its own session and, if it outlives a killed collector, is not covered. The file stays
+in place and means nothing while unlocked; on Linux and macOS a symlink at its path is refused. A
+`.contract-evidence-lock` directory left by an older collector is ignored and can be
+deleted; an older collector and a current one do not exclude each other, so do not run
+both on one build directory. The collector does not
 start PostgreSQL or other services. Live stack validation remains the separate
 `scripts/integration-test.sh --tls --free-ports --gateway-ct` workflow described in
 `integration-tests.md`; a mocked-RPC lifecycle case does not replace that test.
@@ -151,7 +165,9 @@ Raw native logs/reports, source snapshots/patches, command arguments, free-text
 errors, build configuration and history databases remain in the private local
 capture. They are excluded because they may contain credentials or application
 data, even when the Meson reports have been sanitized. The bundle preserves
-statuses, timings, selectors and source/binary hashes; use the retained local
+statuses, timings, selectors and source/binary hashes, and for an ERROR run the
+exception type and the names of the error fields recorded (`error_kind`,
+`error_fields`), never their text; use the retained local
 capture for full reproduction and raw failure diagnostics.
 
 Credential redaction in the portable Meson reports covers known sensitive
@@ -184,7 +200,10 @@ The duplicate-name case includes a distinct working plugin so rejecting every
 candidate after the first cannot satisfy the contract.
 
 On failure, start with `manifest.json`, then `build.log`, `meson.log` and the
-per-contract native report. Distinguish prerequisites, assertion failure, timeout,
+per-contract native report. An ERROR run also prints its exception type (with a fixed
+explanation for a known type such as `BuildDirectoryBusy`) and the names of the error
+fields it recorded to standard error; the portable bundle carries them as `error_kind`
+and `error_fields`, never the error text. Distinguish prerequisites, assertion failure, timeout,
 teardown and recording failure. Reproduce the recorded filter/generator and seed
 against the recorded source and build. Preserve the first attempt before retrying.
 

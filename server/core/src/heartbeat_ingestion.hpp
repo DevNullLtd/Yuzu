@@ -185,6 +185,22 @@ public:
         quarantine_reconcile_fn_ = std::move(fn);
     }
 
+    /// Inventory settings reconcile (SAM-39). Invoked once per heartbeat that carries a
+    /// well-formed `yuzu.inv_settings_version` tag: `none` or 64 lower-case hex characters;
+    /// anything else is ignored. The server wires this to the pusher that compares the reported
+    /// version against the settings that apply to the agent and sends the document when they
+    /// differ. Optional; unset = no reconcile.
+    ///
+    /// Synchronized like the quarantine hook above: stop() clears the fn with the exclusive lock,
+    /// which cannot return while an `ingest()` still holds the shared lock across an in-flight
+    /// call, so the pusher the closure captures is safe to reset afterwards.
+    using InventorySettingsReconcileFn =
+        std::function<void(const std::string& agent_id, const std::string& tag)>;
+    void set_inventory_settings_reconcile_fn(InventorySettingsReconcileFn fn) {
+        std::unique_lock lock(inventory_settings_reconcile_mu_);
+        inventory_settings_reconcile_fn_ = std::move(fn);
+    }
+
 private:
     detail::AgentRegistry& registry_;
     detail::AgentHealthStore* health_store_;
@@ -194,6 +210,8 @@ private:
     GuardianReconcileFn guardian_reconcile_fn_;
     QuarantineReconcileFn quarantine_reconcile_fn_;
     std::shared_mutex quarantine_reconcile_mu_;
+    InventorySettingsReconcileFn inventory_settings_reconcile_fn_;
+    std::shared_mutex inventory_settings_reconcile_mu_;
 };
 
 } // namespace yuzu::server

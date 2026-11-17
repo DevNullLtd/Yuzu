@@ -487,8 +487,35 @@ firewall enforcement (§11.7, out of scope for this store) may still be independ
 The ADR-0012 §2(b) documented exception for a one-time legacy backfill's atomic
 insert-plus-completion stamp is no longer exercised by this store.
 
+## Update (2026-11-11) — schema v4: the release is a confirmed step; `release_device` removed
+
+Device containment is now the firewall plugin's four actions only, and the server records a
+release only on the device's own answer. The store changes with it, appended as migration v4
+after the already-shipped v1-v3 (never edited in place):
+
+- `release_requested_at` (`BIGINT NOT NULL DEFAULT 0`): non-zero marks an active record whose
+  release was asked for and not yet confirmed. The stored `status` stays `active` or `released`;
+  the record reads `releasing` through a `CASE` in the select list, so the partial unique index
+  (`quarantine_records(agent_id) WHERE status='active'`) still allows at most one live record per
+  agent and a releasing record still holds it.
+- `device_release_owed_at` (`BIGINT NOT NULL DEFAULT 0`): non-zero marks a record an operator
+  ended by force before the device confirmed; the reconciler still owes that device a release.
+- `idx_quarantine_release_owed` (`quarantine_records(agent_id, id) WHERE status = 'released' AND
+  device_release_owed_at <> 0`): serves the owed-release read the reconciler makes on every tick.
+  It holds only force-ended records the device has not confirmed, so it stays tiny; adding it
+  after release would cost a further migration.
+- `release_device` is removed. Ending a record is `request_release` (set the marker),
+  `mark_released` with a closed reason (`device_confirmed` or `forced`) and `clear_release_owed`,
+  each a single guarded statement that updates only the row it was read for.
+
+A record ends in exactly two ways: the device answers `inactive` after a release; an operator
+forces it with `DELETE ...?force=true`. A device's own state never ends a record: `inactive` on an
+active record is drift and is re-applied. A forced end does not release the device, which may
+still be contained. Fresh-database deployment contract applies: v4 is
+applied to a new database, with no data carried from earlier builds.
+
 ## Routed-concern invariants
 
-Moved verbatim from the `Device quarantine / containment` row of `.claude/routed-concerns.md` on 2026-11-12, when that always-loaded row was compressed to its catastrophic clauses plus a pointer here. This text is the authoritative long form of that row.
+Moved from the `Device quarantine / containment` row of `.claude/routed-concerns.md` on 2026-11-12, when that always-loaded row was compressed to its catastrophic clauses plus a pointer here. This text is the authoritative long form of that row (updated for the removal of the earlier `quarantine` plugin).
 
-Device quarantine / containment — `QuarantineStore` (Postgres, ADR-0047) + the #881 dispatch gate (`make_containment_gate`/`dispatch_confined_arms.hpp`, fail-closed on a degraded read past a 60s snapshot budget) + `QuarantineContainmentReconciler` (#3425, reconnect re-application) + the agent-side `quarantine` plugin. CATASTROPHIC: (1) any re-dispatch of an EXISTING record (MCP `quarantine_device`'s already_active retry, the reconciler) uses the **stored** whitelist/reason ONLY, via the shared chokepoint `redispatch_stored_containment` (`quarantine_reapply.hpp`) — never a fresh/caller-supplied value, or a retry silently rewrites a contained device's firewall allow-list with no store update and no audit trail; (2) NO synchronous quarantine-store read on the agent registration path (`AgentServiceImpl::Register` returns before `Subscribe` establishes the stream — a dispatch fired from there is silently dropped by `send_to`); (3) the plugin-control exemption (`is_quarantine_control_plugin`, now in `common/include/yuzu/protective_actions.hpp`) stays a closed four-action set (`quarantine`/`unquarantine`/`status`/`whitelist`) — widening it is a security decision, not a routine edit; with `__guard__.push_rules` it forms the protective set (`is_protective_action`) that no enablement gate (kill switch, per-OS withhold and its presence read, plugin-presence filter, degraded store) may refuse — one predicate, never a second list; (4) a degraded containment read (gate OR reconciler) fails CLOSED / aborts observably, never silently treats a read failure as "nothing quarantined".
+Device quarantine / containment — `QuarantineStore` (Postgres, ADR-0047) + the #881 dispatch gate (`make_containment_gate`/`dispatch_confined_arms.hpp`, fail-closed on a degraded read past a 60s snapshot budget) + `QuarantineContainmentReconciler` (#3425, reconnect re-application) + the `firewall` plugin's four containment actions (the earlier `quarantine` agent plugin is removed: hard cut, no alias). CATASTROPHIC: (1) any dispatch of `firewall.quarantine` for a stored record (MCP `quarantine_device`'s already_active retry, the reconciler) uses the **stored** whitelist ONLY, mapped by the shared chokepoint `redispatch_stored_containment` (`quarantine_reapply.hpp`) — never a fresh/caller-supplied value, or a retry silently rewrites a contained device's firewall allow-list with no store update and no audit trail; (2) NO synchronous quarantine-store read on the agent registration path (`AgentServiceImpl::Register` returns before `Subscribe` establishes the stream — a dispatch fired from there is silently dropped by `send_to`); (3) `is_firewall_control_plugin` (`common/include/yuzu/protective_actions.hpp`) stays a closed four-action set on `firewall` only (`quarantine`/`release`/`quarantine_status`/`quarantine_allow`; Alex's ruling 2026-11-11) — widening it is a security decision, not a routine edit; it is BOTH the #881 containment gate's control-plugin exemption and, with `__guard__.push_rules`, the protective set (`is_protective_action`) that no enablement gate (kill switch, per-OS withhold and its presence read, plugin-presence filter, degraded store) may refuse — one predicate, never a second list; (4) a degraded containment read (gate OR reconciler) fails CLOSED / aborts observably, never silently treats a read failure as "nothing quarantined"; (5) a record ends in exactly two ways, a third is a security decision: the device's `inactive` answer after a release; an operator's `DELETE ?force=true` under DELETE's own gates. A device's own state (`inactive` on an ACTIVE record, a time limit it reports) ends nothing: it is drift and is re-applied. Alex-accepted 2026-11-11: a forced end lifts the dispatch refusal while the device may still be contained.

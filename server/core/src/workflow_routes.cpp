@@ -4549,7 +4549,12 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                     "DELETE /api/product-packs/:id", pack.error());
                 audit_fn(req, "product_pack.uninstall", "denied", "ProductPack", id, client_msg);
                 res.status = product_pack_error_status(pack.error());
-                res.set_content(detail::a4_error(res, client_msg), "application/json");
+                // Nothing has been deleted yet, so a 503 here (a database or lease failure) is a
+                // transient a caller can retry as is.
+                detail::A4ErrorOpts opts;
+                if (res.status == 503)
+                    opts.retry_after_ms = 5000;
+                res.set_content(detail::a4_error(res, client_msg, opts), "application/json");
                 return;
             }
             if (*pack) {
@@ -4564,8 +4569,16 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                         has_definition = true;
                 }
                 std::vector<DefinitionReferrer> blocking;
+                // `retry`: the failure is a read fault the caller can retry (nothing was
+                // deleted, so a retry is safe), so the answer carries `retry_after_ms`. An unwired
+                // check never gets it (that is `referrer_check_unwired`, decided before the
+                // lookup), but a null store INSIDE the batch closure reaches this site through
+                // the same error channel as a failed read and so carries it too; that case is
+                // unreachable in production (the closure is built over live stores), and a typed
+                // error that separates it is #7921 item 2.
                 const auto refuse = [&](int status, const char* audit_result,
-                                        const char* audit_detail, std::string_view message) {
+                                        const char* audit_detail, std::string_view message,
+                                        bool retry = false) {
                     audit_fn(req, "product_pack.uninstall", audit_result, "ProductPack", id,
                              audit_detail);
                     // An unwired lookup is a server wiring fault, not a transient: say so in the
@@ -4574,7 +4587,10 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                         spdlog::error("DELETE /api/product-packs/:id refused: the definition "
                                       "reference check is not wired (a server wiring fault)");
                     res.status = status;
-                    res.set_content(detail::a4_error(res, message), "application/json");
+                    detail::A4ErrorOpts opts;
+                    if (retry)
+                        opts.retry_after_ms = 5000;
+                    res.set_content(detail::a4_error(res, message, opts), "application/json");
                 };
                 if (has_definition) {
                     if (!referrers_fn)
@@ -4588,59 +4604,59 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                     // a policy still uses it (PolicyStore::delete_fragment refuses and the
                     // uninstall tolerates that), so it stays live and is counted like any other
                     // referrer; a policy read that fails is a 503, never "unreferenced".
+                    //
+                    // The reads are BOUNDED: one batched read of the policies that use any own
+                    // fragment, then (for the real lookup, which has a batch form) at most one read
+                    // per referrer source for ALL the pack's definitions together
+                    // (`lookup_many`), stopping once the list is longer than the refusal shows.
+                    // Neither grows with the pack's item count. A lookup without a batch form
+                    // (a test double) is asked once per definition, still stopping at that point.
                     DefinitionReferrerExclusions exclusions;
                     exclusions.workflow_ids = std::move(own_workflows);
                     // fragment id -> the policies that use it (id and name), for the 409 text
                     std::unordered_map<std::string, std::vector<HeldByPolicy>> policy_held;
-                    for (const auto& fragment_id : own_fragments) {
+                    if (!own_fragments.empty()) {
                         if (!policy_store)
                             return refuse(503, "error", "referrer_check_unwired",
                                           "definition reference check not configured; the pack was "
                                           "not uninstalled");
-                        auto used = policy_store->query_policies(PolicyQuery{
-                            .fragment_filter = fragment_id,
-                            .limit = static_cast<int>(kMaxHeldByPoliciesNamed) + 1});
+                        const std::vector<std::string> own_fragment_ids(own_fragments.begin(),
+                                                                        own_fragments.end());
+                        auto used = policy_store->policies_using_fragments(
+                            own_fragment_ids, static_cast<int>(kMaxHeldByPoliciesNamed) + 1);
                         if (!used)
                             return refuse(503, "error", "referrer_check_unavailable",
                                           "definition reference check unavailable; the pack was "
-                                          "not uninstalled");
-                        if (used->empty())
-                            exclusions.fragment_ids.insert(fragment_id);
-                        else {
-                            auto& holders = policy_held[fragment_id];
-                            for (const auto& policy : *used)
-                                holders.push_back({policy.id, policy.name});
-                        }
+                                          "not uninstalled",
+                                          /*retry=*/true);
+                        for (const auto& use : *used)
+                            policy_held[use.fragment_id].push_back({use.policy_id, use.policy_name});
+                        for (const auto& fragment_id : own_fragments)
+                            if (!policy_held.contains(fragment_id))
+                                exclusions.fragment_ids.insert(fragment_id);
                     }
-                    for (const auto& item : (*pack)->items) {
-                        if (item.kind != "InstructionDefinition")
-                            continue;
-                        // No definition has an empty id, and the referrer sources treat an empty
-                        // id as "no filter" (they would answer unrelated schedules and fragments),
-                        // so a corrupt empty-id item is left out of the lookup.
-                        if (item.item_id.empty())
-                            continue;
-                        auto referrers = referrers_fn(item.item_id, exclusions);
-                        if (!referrers)
-                            return refuse(503, "error", "referrer_check_unavailable",
-                                          "definition reference check unavailable; the pack was "
-                                          "not uninstalled");
-                        // A foreign referrer can name two of the pack's definitions: list it
-                        // (and count it) once.
-                        for (auto& r : *referrers) {
-                            const bool seen = std::any_of(
-                                blocking.begin(), blocking.end(), [&](const DefinitionReferrer& b) {
-                                    return b.kind == r.kind && b.id == r.id;
-                                });
-                            if (seen)
-                                continue;
-                            if (r.kind == "policy fragment") {
-                                if (const auto held = policy_held.find(r.id);
-                                    held != policy_held.end())
-                                    r.held_by = held->second;
-                            }
-                            blocking.push_back(std::move(r));
+                    std::vector<std::string> definition_ids;
+                    for (const auto& item : (*pack)->items)
+                        if (item.kind == "InstructionDefinition")
+                            definition_ids.push_back(item.item_id);
+                    // No definition has an empty id, and the referrer sources treat an empty id as
+                    // "no filter" (they would answer unrelated schedules and fragments); the
+                    // lookup leaves a corrupt empty-id item out. A foreign referrer that names
+                    // two of the pack's definitions is listed (and counted) once, and the list
+                    // stops at one more than the refusal names.
+                    auto referrers = referrers_fn.lookup_many(definition_ids, exclusions,
+                                                              kMaxReferrersListed + 1);
+                    if (!referrers)
+                        return refuse(503, "error", "referrer_check_unavailable",
+                                      "definition reference check unavailable; the pack was "
+                                      "not uninstalled",
+                                      /*retry=*/true);
+                    for (auto& r : *referrers) {
+                        if (r.kind == "policy fragment") {
+                            if (const auto held = policy_held.find(r.id); held != policy_held.end())
+                                r.held_by = held->second;
                         }
+                        blocking.push_back(std::move(r));
                     }
                 }
                 if (!blocking.empty())

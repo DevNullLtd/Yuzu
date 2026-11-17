@@ -9,6 +9,7 @@
 #include "session_store.hpp"  // HA WS-1/1a — durable operator sessions (ADR-2002 §4)
 #include "rbac_store.hpp"                // #4966: the last-Administrator guard (deactivate_account / set_local_role)
 #include "credential_change_owner.hpp" // #5342 — the one-transaction credential change
+#include "mfa_disable_owner.hpp"        // #6079 PR 2c: the one-transaction MFA factor clear
 
 #include <spdlog/spdlog.h>
 
@@ -1178,6 +1179,11 @@ AuthManager::StampRecheck AuthManager::post_stamp_factor_recheck(const std::stri
     } else if (cleared->has_value()) {
         const auto& a = cleared->value();
         std::unique_lock lock(mu_);
+        // The in-place re-derive below edits a cached entry's MFA proof, so it moves the
+        // cache epoch in this same critical section (even when the entry is absent): a
+        // cold validation that read the row before the clear holds a pre-clear copy and
+        // must not cache it. See the tail of validate_session_durable (#8010).
+        ++session_cache_epoch_;
         if (auto it = sessions_.find(token_hash); it != sessions_.end())
             (void)derive_session_deadlines(it->second, a.created_at_ms, a.expires_at_ms,
                                            a.last_activity_ms, a.mfa_verified_ms,
@@ -1190,6 +1196,11 @@ AuthManager::StampRecheck AuthManager::post_stamp_factor_recheck(const std::stri
 
 void AuthManager::drop_cached_mfa_proof(const std::string& key) {
     std::unique_lock lock(mu_);
+    // The epoch moves whenever this critical section runs, whether or not `key` is cached:
+    // a cold validation in flight holds a copy read before this proof change and must not
+    // cache it (the entry is edited in place, not erased, so the erase paths' bump does
+    // not cover it; #8010).
+    ++session_cache_epoch_;
     if (auto it = sessions_.find(key); it != sessions_.end()) {
         it->second.steady_mfa_verified = {};
         it->second.mfa_verified_at = tp_from_ms(0);
@@ -1750,6 +1761,9 @@ std::optional<std::string> AuthManager::reap_expired_elevation(const std::string
                 is_elevated(it->second))
                 return std::nullopt; // TOCTOU recheck (single-replica exactly-once)
             username = it->second.username;
+            // No epoch bump: this only clears an elevation that has already lapsed (not
+            // is_elevated), so a stale cold copy that still carries it is not elevated
+            // either and grants nothing more than the cleared entry.
             it->second.elevated_until = {};
             it->second.elevation_issued_at = {};
             it->second.steady_elevated_until = {};
@@ -2310,9 +2324,16 @@ std::optional<Session> AuthManager::validate_session_durable(const std::string& 
         std::unique_lock wlock(mu_);
         // Insert only if no cache invalidation ran since this validation started
         // (ADR-0012 section 4, rule 2). The epoch moves with every clear of the cache
-        // (the generation poll) and every targeted erase (drop_cached_session_locked,
-        // drop_cached_user_sessions_locked), so a revoke, wipe, account removal or refusal on
-        // THIS replica also drops a validation held across it. On a mismatch the session is
+        // (the generation poll), every targeted erase (drop_cached_session_locked,
+        // drop_cached_user_sessions_locked) and every in-place edit of a cached entry that
+        // removes a proof or privilege (drop_cached_mfa_proof, the re-derives after a stamp or
+        // a post-stamp clear, and the elevation clears in revoke_elevation and
+        // revoke_user_elevations), so a revoke, wipe, account removal or refusal on THIS
+        // replica, a proof stamp or clear, or an elevation revoke, also drops a validation
+        // held across it. It does not move for an elevation GRANT (elevate_session: a stale
+        // pre-grant copy under-grants and self-heals at the next generation poll), for
+        // reap_expired_elevation (clears an already-lapsed elevation only), for this
+        // function's own expiry and idle evictions, or for the legacy no-store paths. On a mismatch the session is
         // still returned to THIS caller, whose request is concurrent with the invalidation
         // and linearises before it, but it is not cached: a refusal here would reject an
         // unrelated in-flight request whenever any session anywhere is created or revoked,
@@ -2807,6 +2828,44 @@ AuthManager::commit_password_change(const yuzu::server::CredentialChangeRequest&
         it->second.salt_hex = request.new_salt_hex;
     }
     drop_cached_user_sessions_locked(request.username);
+    return outcome;
+}
+
+// ── MFA factor clear (#6079 PR 2c) ──────────────────────────────────────────
+
+yuzu::server::MfaDisableOutcome
+AuthManager::commit_mfa_disable(const yuzu::server::MfaDisableRequest& request) {
+    // No owner (cfg-file-only mode, or a server wired without Postgres): there is
+    // no durable factor to clear. Fail closed, never pretend; nothing is written.
+    // (A default outcome is kStoreUnavailable.)
+    if (!mfa_disable_owner_)
+        return yuzu::server::MfaDisableOutcome{};
+    // The ONE transaction (mfa_disable_owner.hpp). No mu_ is held across it, same
+    // discipline as commit_password_change.
+    auto outcome = mfa_disable_owner_->commit(request);
+    if (outcome.result == yuzu::server::MfaDisableResult::kStoreUnavailable) {
+        // The connection can be lost exactly at COMMIT after everything landed, so the
+        // factor clear and the durable session delete may have committed even though the
+        // owner cannot say so. Drop this replica's cached sessions of the account anyway:
+        // the over-invalidation is idempotent (a session that is still valid re-reads its
+        // durable row on its next request). The other non-kOk results wrote nothing and
+        // keep the cache untouched.
+        std::unique_lock lock(mu_);
+        drop_cached_user_sessions_locked(request.username);
+        return outcome;
+    }
+    if (outcome.result != yuzu::server::MfaDisableResult::kOk)
+        return outcome;
+    // Post-commit cache work only: the durable session rows were already deleted
+    // (and the write-generation bumped) inside the transaction, so this is NOT a
+    // second durable wipe. Drop this replica's in-memory sessions of the account
+    // unless the owner skipped the session delete (an un-enrolled account under
+    // `end_sessions_if_not_enrolled = false`), where those sessions stay valid.
+    // users_ carries no MFA state, so nothing else is cached here.
+    if (outcome.was_enrolled || request.end_sessions_if_not_enrolled) {
+        std::unique_lock lock(mu_);
+        drop_cached_user_sessions_locked(request.username);
+    }
     return outcome;
 }
 
