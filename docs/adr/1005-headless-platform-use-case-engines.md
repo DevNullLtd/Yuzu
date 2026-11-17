@@ -1648,6 +1648,36 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        "Software collection settings".
      - Recorded by the change author; ADR-owner acceptance pending.
 
+   - **2026-11-16 - imported software lifecycle rules (REST only; the MCP twin
+     and the page are separate follow-up changes).** The three routes
+     `POST`, `GET` and `DELETE /api/v1/inventory/software/lifecycle/rules` have
+     no MCP tool and no dashboard page.
+     - **No MCP twin and no page - tracked follow-ups, not permanent
+       exceptions.** Tracked as roadmap row **SAM.7** (rule import) in the
+       software estate roadmap and as issue #8009; **revisit by 2026-12-31**. The MCP twin and the
+       page are each their own change. The twin takes the same store and the
+       same pure parsers (`software_lifecycle_import.hpp`), so there is no
+       second validator. This entry retires when both merge. No parity-ledger
+       row is added: v1 routes are held to the OpenAPI check
+       (`docs/api-parity-ledger.md`).
+     - **What an MCP-only caller can and cannot reach.** The imported, shipped
+       and external rule lists and the import and removal are not reachable
+       over MCP; the OpenAPI document is readable as the `yuzu://openapi`
+       resource.
+     - **The exception relaxes no control.** Rules are fleet-global, so every
+       route takes the global `Inventory` permission (`Write` for the import and
+       the removal, `Read` for the list): a management-group-confined caller is
+       refused and a service-scoped token is denied. The permission is checked
+       ahead of the body. Each write is audited with a `requested` row stored
+       ahead of the write (an audit row that cannot be stored is a `503` and
+       nothing is written) and an outcome row. A degraded or closed store
+       answers `503` with a retry hint, never an empty `200`. The import is
+       all or nothing and accepts the formats `csv` and `cle` only; it replaces
+       the `imported` set and never touches the `shipped` or `external` rules.
+       Wire reference: `docs/user-manual/rest-api.md`, "Software lifecycle
+       rules".
+     - Recorded by the change author; ADR-owner acceptance pending.
+
    - **2026-11-09 - the `firewall` plugin's four containment actions
      (`firewall.quarantine`, `firewall.release`, `firewall.quarantine_status`,
      `firewall.quarantine_allow`, PRQ.1) are reachable only by raw dispatch, with no
@@ -1893,7 +1923,7 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
    - **2026-11-16 - the streamed installed-software export (SAM-36; REST only, no
      MCP twin by design).** `GET /api/v1/inventory/software/export?format=jsonl|csv`
      streams every installed-software row that matches the filters of
-     `GET /api/v1/inventory/software`, as a chunked file with no row cap. A file
+     `GET /api/v1/inventory/software`, as a chunked file, bounded by a configurable size limit. A file
      download has no JSON-RPC result to ride in, and `query_installed_software`
      already returns the same rows page by page, so no tool is planned.
      - **A deliberate absence, not a backlog item.** Recorded by the

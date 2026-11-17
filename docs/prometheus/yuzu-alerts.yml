@@ -3073,7 +3073,7 @@ groups:
             when nobody asked the store would under-enforce against a healthy
             one. The firewall plugin's four containment actions stay
             reachable throughout - releasing a device does not depend on this
-            read - as do the four system-reserved internal pushes
+            read - as do the five system-reserved internal pushes
             (yuzu_server_system_reserved_push_total). BE PRECISE ABOUT for: 2m:
             it delays the page by two minutes, it does NOT require a sustained
             episode. increase()[5m] stays true for ~5 minutes after a single
@@ -5455,6 +5455,36 @@ groups:
             once the store recovers.
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/guaranteed-state.md#4-push-to-agents"
 
+      # Collection settings are delivered by the heartbeat reconcile: an agent that reports a
+      # settings version other than the one that applies to it is sent the document once, and
+      # not again inside the 300 s re-push gap. After a settings change each agent therefore
+      # produces one result="sent" and then reports the new version. A sustained high rate means
+      # agents keep reporting a different version after a send: a delivery fault (the frame is
+      # accepted but never applied, for example a gateway queue that does not drain, or an
+      # agent refusing the document) or an effective version that is not stable between
+      # resolves. The threshold is a starting point for a mid-sized fleet; a very large fleet
+      # converging on a change can sit above it for a while, so tune it to the fleet size.
+      - alert: YuzuInventorySettingsPushLoop
+        expr: sum(rate(yuzu_server_inventory_settings_push_total{result="sent"}[30m])) > 0.2
+        for: 2h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Collection settings are being re-sent to agents continuously"
+          description: >-
+            yuzu_server_inventory_settings_push_total{result="sent"} has stayed above
+            0.2 per second for two hours. A settings change is normally sent to each
+            agent once; a rate that does not fall means agents keep reporting a
+            settings version other than the one sent. Check whether the agent refuses
+            the document (its reply to the `__sync__` `settings` command begins
+            "invalid settings" and it keeps what it had), the gateway queue for gateway-attached agents, and
+            whether the effective settings of an affected device change between reads
+            (GET /api/v1/inventory/software/hosts/{agent_id}/collection-settings).
+            result="undelivered" and yuzu_server_inventory_settings_push_degrade_total
+            are the separate signals for a frame that was not accepted and a store
+            read that failed.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/inventory.md#how-saved-settings-reach-machines"
+
       # yuzu_server_guardian_agent_generation_ahead_total flags an agent that reports a
       # policy generation ABOVE the server's, usually because the Guardian state store
       # was restored to an earlier state or rebuilt while the agents kept the
@@ -5539,6 +5569,9 @@ groups:
             which audit as inventory.devices, inventory.device.ci and inventory.devices.ci,
             fail closed instead: they withhold the data and answer a retryable -32603), and only the /crypto (crypto.libraries.*) pages
             also show an on-page "Audit not recorded" notice.
+            The Settings MFA disable (mfa.disabled) answers 503 with Sec-Audit-Failed
+            when the "attempted" row or the in-transaction outcome row cannot be stored,
+            and nothing is cleared; the CLI --mfa-reset exits 1 for the same condition.
             Check audit_store health (/healthz
             stores.audit) and free disk / connection saturation on the PostgreSQL
             server (ADR-0040 — audit is Postgres-backed, not a local file). Note: a bad_alloc-class
@@ -7815,14 +7848,17 @@ groups:
             also counted as `validate`: session validation is unaffected, but that one
             local MFA binding read is refused 503 `mfa_proof_unavailable` and retried on
             the next read; `create`/`elevate`/`mark_mfa`/`invalidate`/
-            `invalidate_user` degrades fail the privileged op closed, except an
-            `invalidate_user` after an MFA clear that already committed (Settings MFA
-            disable), which leaves the clear in place and ends `partial`;
+            `invalidate_user` degrades fail the privileged op closed
+            (`DELETE /api/v1/sessions` and the deprovision paths; look for
+            deprovision rows with `result=partial, db_error=true`). The Settings MFA
+            disable and the CLI `--mfa-reset` no longer call `invalidate_user`, so
+            they are not counted here: their failures are 503 / `result=error`
+            audit rows (docs/ops-runbooks/auth-db-recovery.md, "There is no partial
+            result");
             `account_state` (the read of `auth.users` that gates a durable local
             session) fails the request closed (401), and the failing store for
             that op is the account store, not session_store; a single
-            event does not hold this alert's 10m condition, so look for
-            `mfa.disabled` rows with result `partial` in the audit log; a sustained
+            event does not hold this alert's 10m condition; a sustained
             `generation_refresh` degrade drops the validate cache past the
             stale-serve bound. `op=rebind_guard` means the session rebind guard is
             not in force: local MFA proofs are refused with `mfa_proof_unavailable`
