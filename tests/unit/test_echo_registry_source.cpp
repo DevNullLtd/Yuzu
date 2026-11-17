@@ -6676,27 +6676,57 @@ const std::string& offline_fake_sid() {
     return sid;
 }
 
-// Any HKEY_USERS subkey CONTAINING the fake sid: the mount name is salted
-// (unique_hive_mount_name), so an exact-name check would never see a leak.
+// The HKEY_USERS subkeys CONTAINING the fake sid: the mount name is salted
+// (unique_hive_mount_name), so an exact-name check would never see a leak. A failed listing is
+// retried; one that never succeeds is recorded as a failure and reports listed=false, so it is
+// never read as "no mount".
+struct OfflineMounts {
+    std::vector<std::string> names;
+    bool listed{false};
+};
+
+OfflineMounts offline_fake_mounts() {
+    constexpr int kAttempts = 3;
+    for (int attempt = 1; attempt <= kAttempts; ++attempt) {
+        const auto hku = yuzu::win::enumerate_hku_subkeys_checked();
+        if (hku.error.empty()) {
+            OfflineMounts m;
+            m.listed = true;
+            for (const auto& n : hku.names)
+                if (n.find(offline_fake_sid()) != std::string::npos)
+                    m.names.push_back(n);
+            return m;
+        }
+        if (attempt == kAttempts)
+            FAIL_CHECK("the HKEY_USERS listing failed " << kAttempts
+                                                         << " times: " << hku.error);
+    }
+    return {};
+}
+
+// True when a mount is present or the listing could not say (that failure is already recorded).
 bool offline_fake_mount_present() {
-    const auto hku = yuzu::win::enumerate_hku_subkeys_checked();
-    for (const auto& n : hku.names)
-        if (n.find(offline_fake_sid()) != std::string::npos)
-            return true;
-    return false;
+    const auto m = offline_fake_mounts();
+    return !m.listed || !m.names.empty();
 }
 
 // Unconditional on every exit path: the shared box must never keep a mount of ours.
 struct OfflineMountSweep {
     ~OfflineMountSweep() {
-        if (!offline_fake_mount_present())
-            return;
-        const yuzu::win::PrivilegeScope restore(L"SeRestorePrivilege");
-        const yuzu::win::PrivilegeScope backup(L"SeBackupPrivilege");
-        const auto hku = yuzu::win::enumerate_hku_subkeys_checked();
-        for (const auto& n : hku.names)
-            if (n.find(offline_fake_sid()) != std::string::npos)
+        constexpr int kPasses = 3;
+        for (int pass = 0; pass < kPasses; ++pass) {
+            const auto m = offline_fake_mounts();
+            if (!m.listed || m.names.empty())
+                return;
+            const yuzu::win::PrivilegeScope restore(L"SeRestorePrivilege");
+            const yuzu::win::PrivilegeScope backup(L"SeBackupPrivilege");
+            for (const auto& n : m.names)
                 RegUnLoadKeyW(HKEY_USERS, yuzu::win::to_wide(n).c_str());
+        }
+        const auto left = offline_fake_mounts();
+        if (left.listed && !left.names.empty())
+            FAIL_CHECK("a salted YUZU_HIVE mount of this process is still loaded after "
+                       << kPasses << " unload passes: " << left.names.front());
     }
 };
 
