@@ -37,13 +37,6 @@ namespace yuzu::server::mcp {
 /// existing wire value; this is a rename, not a re-tuning.
 inline constexpr std::int64_t kMcpStoreFaultRetryMs = 5000;
 
-/// `retry_after_ms` for a `quarantine_device` call refused because the device's apply claim is held
-/// (#8045): an earlier apply reached the device and its reply has not been read, and the MCP path
-/// reads no reply, so the claim lasts until the claim window (`kApplyClaimTtlSecs`, 120 s) passes.
-/// An upper bound, not a prediction: a claim the reconciler holds clears sooner. A 5 s loop would
-/// fail about 24 times first. mcp_server.cpp static_asserts this equals the window.
-inline constexpr std::int64_t kMcpApplyClaimRetryMs = 120000;
-
 /// The remediation of a /crypto read refused because the Postgres pool is too small to spare it
 /// (CryptoReadError::unavailable_until_restart): no retry hint, a retry fails identically.
 /// Shared by mcp_tools_crypto.cpp and the `list_issued_certs` branch that stays in mcp_server.cpp.

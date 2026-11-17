@@ -36206,7 +36206,7 @@ TEST_CASE("MCP quarantine_device ticket round-trip records + dispatches isolatio
         REQUIRE(refused_body.contains("error"));
         CHECK(refused_body["error"]["code"] == yuzu::server::mcp::kInternalError);
         CHECK(refused_body["error"]["data"]["retry_after_ms"] ==
-              yuzu::server::mcp::kMcpApplyClaimRetryMs);
+              yuzu::server::kApplyClaimTtlSecs * 1000);
     }
     REQUIRE(quar.release_apply_claim("agent-q", (*rec)->id, 1).has_value());
 

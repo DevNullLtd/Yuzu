@@ -44,11 +44,15 @@
 
 #include "quarantine_types.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <expected>
+#include <functional>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace yuzu {
@@ -226,8 +230,20 @@ public:
     /// does not exist. Read BEFORE the command whose `inactive` answer will be acted on is
     /// dispatched, never after the answer is read. `std::unexpected` (prefixed
     /// `kQuarantineDbErrorPrefix`) on a store failure. Any record status.
+    ///
+    /// A claim THIS process stamped also reads live for `kApplyClaimTtlSecs` on the process's own
+    /// monotonic clock, whatever the database clock says: a forward step of the database clock
+    /// cannot make a claim read expired early, so a release's `inactive` answer cannot end a record
+    /// under an apply that is still unexecuted. Only ever fails closed (a longer hold, never a
+    /// shorter one). Not shared across restarts or replicas: after a restart the database clock
+    /// alone judges the window (ADR-0047 residuals).
     [[nodiscard]] std::expected<std::optional<std::int64_t>, std::string>
     apply_fence_token(const std::string& agent_id, std::int64_t record_id);
+
+    /// The monotonic clock the local claim guard reads. Unset = `steady_clock`. A test seam, set
+    /// before the store is used.
+    using SteadyNowFn = std::function<std::chrono::steady_clock::time_point()>;
+    void set_steady_now_fn(SteadyNowFn fn);
 
     /// The current active record for `agent_id`, if any. AUTHORITATIVE read:
     /// `std::unexpected(msg)` on a store/pool/query failure (prefixed
@@ -288,9 +304,23 @@ public:
     get_history(const std::string& agent_id);
 
 private:
+    // The claims this process stamped, by agent, for the monotonic guard in `apply_fence_token`.
+    struct LocalClaim {
+        std::int64_t record_id{0};
+        std::int64_t gen{0};
+        std::chrono::steady_clock::time_point until{};
+    };
+    [[nodiscard]] std::chrono::steady_clock::time_point steady_now() const;
+    void note_local_claim(const std::string& agent_id, std::int64_t record_id, std::int64_t gen);
+    void forget_local_claim(const std::string& agent_id, std::int64_t record_id, std::int64_t gen);
+    [[nodiscard]] bool local_claim_live(const std::string& agent_id, std::int64_t record_id);
+
     pg::PgPool& pool_;
     bool open_{false};
     yuzu::MetricsRegistry* metrics_{nullptr};
+    SteadyNowFn steady_now_fn_;
+    std::mutex claim_mu_;
+    std::unordered_map<std::string, LocalClaim> local_claims_;
 };
 
 } // namespace yuzu::server

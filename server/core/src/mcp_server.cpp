@@ -5415,8 +5415,6 @@ static const ToolDef kTools[] = {
 
 static_assert(software_catalogue::kCursorMaxBytes == mcp::kMcpCursorMaxLen,
               "the catalogue cursor bound must equal the MCP cursor input bound");
-static_assert(mcp::kMcpApplyClaimRetryMs == kApplyClaimTtlSecs * 1000,
-              "the quarantine_device retry hint must equal the apply claim window");
 
 // ── Write/execute tools (blocked by read_only_mode) ──────────────────────
 // These tool names perform Write/Execute/Delete operations.
@@ -24960,13 +24958,14 @@ McpServer::HandlerFn McpServer::build_handler(
                         mcp_audit("failure", "agent_id=" + agent_id + ", " + err.detail +
                                                  (record_pre_existing ? "" : " record_persisted=1"));
                         // A refused claim on a record that already existed is held for the claim
-                        // window, so the honest hint is that window, not the store-fault 5 s.
+                        // window (an upper bound: the reconciler's claim clears sooner), so the
+                        // honest hint is that window, not the store-fault 5 s.
                         const bool claim_held =
                             err.kind == ContainmentReapplyErrorKind::no_active_record &&
                             record_pre_existing;
                         res.set_content(
                             a4_error(kInternalError, err.detail, "retry the request",
-                                     /*retry_after_ms=*/claim_held ? mcp::kMcpApplyClaimRetryMs
+                                     /*retry_after_ms=*/claim_held ? kApplyClaimTtlSecs * 1000
                                                                    : mcp::kMcpStoreFaultRetryMs),
                             "application/json");
                         return;

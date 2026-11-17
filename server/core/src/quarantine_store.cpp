@@ -22,6 +22,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -460,7 +461,9 @@ QuarantineStore::claim_apply(const std::string& agent_id, std::int64_t record_id
                                PQerrorMessage(lease.get()));
     if (PQntuples(res.get()) == 0)
         return std::unexpected(std::string(kQuarantineNotQuarantined));
-    return to_i64(PQgetvalue(res.get(), 0, 0));
+    const std::int64_t gen = to_i64(PQgetvalue(res.get(), 0, 0));
+    note_local_claim(agent_id, record_id, gen);
+    return gen;
 }
 
 std::expected<void, std::string>
@@ -486,6 +489,7 @@ QuarantineStore::release_apply_claim(const std::string& agent_id, std::int64_t r
     if (res.status() != PGRES_COMMAND_OK)
         return std::unexpected(std::string(kQuarantineDbErrorPrefix) +
                                "release_apply_claim failed: " + PQerrorMessage(lease.get()));
+    forget_local_claim(agent_id, record_id, gen);
     return {};
 }
 
@@ -512,7 +516,51 @@ QuarantineStore::apply_fence_token(const std::string& agent_id, std::int64_t rec
                                "apply_fence_token failed: " + PQerrorMessage(lease.get()));
     if (PQntuples(res.get()) == 0)
         return std::optional<std::int64_t>{std::nullopt};
+    // The database says no claim is live; a claim this process stamped and has not released still
+    // reads live on the monotonic clock, so a step of the database clock cannot hide it.
+    if (local_claim_live(agent_id, record_id))
+        return std::optional<std::int64_t>{std::nullopt};
     return std::optional<std::int64_t>{to_i64(PQgetvalue(res.get(), 0, 0))};
+}
+
+void QuarantineStore::set_steady_now_fn(SteadyNowFn fn) {
+    steady_now_fn_ = std::move(fn);
+}
+
+std::chrono::steady_clock::time_point QuarantineStore::steady_now() const {
+    return steady_now_fn_ ? steady_now_fn_() : std::chrono::steady_clock::now();
+}
+
+void QuarantineStore::note_local_claim(const std::string& agent_id, std::int64_t record_id,
+                                       std::int64_t gen) {
+    const auto now = steady_now();
+    std::lock_guard<std::mutex> lk(claim_mu_);
+    // One entry per agent, replaced by the next claim; the expired ones are swept here so a device
+    // that is never claimed again does not keep its entry for the life of the process.
+    std::erase_if(local_claims_, [&](const auto& kv) { return kv.second.until <= now; });
+    local_claims_[agent_id] =
+        LocalClaim{record_id, gen, now + std::chrono::seconds(kApplyClaimTtlSecs)};
+}
+
+void QuarantineStore::forget_local_claim(const std::string& agent_id, std::int64_t record_id,
+                                         std::int64_t gen) {
+    std::lock_guard<std::mutex> lk(claim_mu_);
+    if (auto it = local_claims_.find(agent_id);
+        it != local_claims_.end() && it->second.record_id == record_id && it->second.gen == gen)
+        local_claims_.erase(it);
+}
+
+bool QuarantineStore::local_claim_live(const std::string& agent_id, std::int64_t record_id) {
+    const auto now = steady_now();
+    std::lock_guard<std::mutex> lk(claim_mu_);
+    const auto it = local_claims_.find(agent_id);
+    if (it == local_claims_.end())
+        return false;
+    if (it->second.until <= now) {
+        local_claims_.erase(it);
+        return false;
+    }
+    return it->second.record_id == record_id;
 }
 
 std::expected<std::optional<QuarantineRecord>, std::string>

@@ -42,6 +42,7 @@
 
 #include <libpq-fe.h>
 
+#include <chrono>
 #include <expected>
 #include <optional>
 #include <string>
@@ -1070,6 +1071,8 @@ TEST_CASE("QuarantineStore: apply_fence_token is the generation when no claim is
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     QuarantineStore store{pool};
     REQUIRE(store.is_open());
+    auto steady_now = std::chrono::steady_clock::now();
+    store.set_steady_now_fn([&steady_now] { return steady_now; });
     REQUIRE(store.quarantine_device("agent-a3", "admin", "reason", "").has_value());
     const auto id = active_row(store, "agent-a3")->id;
 
@@ -1090,11 +1093,12 @@ TEST_CASE("QuarantineStore: apply_fence_token is the generation when no claim is
     REQUIRE(after->has_value());
     CHECK(**after == 1); // the bumped generation: a token read before the apply no longer matches
 
-    // an expired claim does not hide the token either
+    // an expired claim does not hide the token either (the claim ages out on both clocks)
     auto again = store.claim_apply("agent-a3", id);
     REQUIRE(again.has_value());
     exec_sql(db.dsn(), "UPDATE quarantine_store.quarantine_records SET apply_claimed_at = 1 WHERE id = " +
                            std::to_string(id));
+    steady_now += std::chrono::seconds(kApplyClaimTtlSecs + 1);
     auto expired = store.apply_fence_token("agent-a3", id);
     REQUIRE(expired.has_value());
     REQUIRE(expired->has_value());
@@ -1114,6 +1118,56 @@ TEST_CASE("QuarantineStore: apply_fence_token is the generation when no claim is
     REQUIRE(ended.has_value());
     REQUIRE(ended->has_value());
     CHECK(**ended == 2);
+}
+
+TEST_CASE("QuarantineStore: a step of the database clock cannot make a claim this process stamped "
+          "read expired; another store instance, which stamped nothing, goes by the database alone",
+          "[pg][quarantine][apply_fence]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, quarantine_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    QuarantineStore store{pool};
+    REQUIRE(store.is_open());
+    auto steady_now = std::chrono::steady_clock::now();
+    store.set_steady_now_fn([&steady_now] { return steady_now; });
+    REQUIRE(store.quarantine_device("agent-s1", "admin", "reason", "").has_value());
+    const auto id = active_row(store, "agent-s1")->id;
+
+    auto claim = store.claim_apply("agent-s1", id);
+    REQUIRE(claim.has_value());
+    // The database clock jumps forward past the window: the stamp now reads two minutes old.
+    exec_sql(db.dsn(), "UPDATE quarantine_store.quarantine_records SET apply_claimed_at = 1 WHERE id = " +
+                           std::to_string(id));
+    const auto hidden = store.apply_fence_token("agent-s1", id);
+    REQUIRE(hidden.has_value());
+    CHECK_FALSE(hidden->has_value()); // the monotonic clock still says the claim is live
+
+    // A process that stamped nothing (a restart) has only the database to go by.
+    {
+        QuarantineStore other{pool};
+        REQUIRE(other.is_open());
+        const auto bare = other.apply_fence_token("agent-s1", id);
+        REQUIRE(bare.has_value());
+        REQUIRE(bare->has_value());
+        CHECK(**bare == *claim);
+    }
+
+    // Once the monotonic window has passed too, the token is readable again.
+    steady_now += std::chrono::seconds(kApplyClaimTtlSecs - 1);
+    CHECK_FALSE(store.apply_fence_token("agent-s1", id)->has_value());
+    steady_now += std::chrono::seconds(2);
+    const auto released = store.apply_fence_token("agent-s1", id);
+    REQUIRE(released.has_value());
+    REQUIRE(released->has_value());
+    CHECK(**released == *claim);
+
+    // A fresh claim is hidden again, and releasing it drops the local entry with the database claim.
+    auto second = store.claim_apply("agent-s1", id);
+    REQUIRE(second.has_value());
+    REQUIRE(store.release_apply_claim("agent-s1", id, *second).has_value());
+    const auto after = store.apply_fence_token("agent-s1", id);
+    REQUIRE(after.has_value());
+    REQUIRE(after->has_value());
+    CHECK(**after == *second);
 }
 
 namespace {
