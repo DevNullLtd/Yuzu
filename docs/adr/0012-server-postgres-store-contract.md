@@ -472,3 +472,44 @@ takes an account or RBAC lock, so nothing that holds `session_meta` waits on one
 The wait on that row is bounded per lock by the lifecycle `lock_timeout` the owner installs; session
 create and revoke writers install no timeout of their own and run under the pool defaults.
 A failed bump aborts the deactivation (the account stays active, a store failure to the caller).
+
+## Update (2026-11-16) -- a seventh query owner: DexAppUsageOwner
+
+A seventh query owner: `DexAppUsageOwner` (`dex_app_usage_owner.{hpp,cpp}`), the read behind the
+fleet application usage model of the Digital Employee Experience (DEX) Apps list. It is a READ join
+across `app_usage_store.agent_last_used`, `app_usage_store.usage_state` and
+`guaranteed_state_store.guardian_observations` on one lease (`pool.with_txn_for`, `SET LOCAL
+statement_timeout`, one statement). One statement matters for the same reason as the fifth owner:
+usage collection can be off per device, so crashes and hangs counted on every online device over
+usage from only the reporting devices would overstate the exposure rate. The usage totals, the
+exposed events and the reporting count therefore come from one population. A device counts only when
+the server received its usage state within the last 48 hours (`usage_state.last_seen`, the server's
+receipt time, never the agent's collection time); stale devices are counted separately and add
+nothing else. Events are cut at both ends of the window, so a future-dated observation never enters
+a numerator. The owner returns aggregates per application and cell and never an agent id. A degraded
+read (no connection in the bounded acquire, a statement error or timeout, an index out of range)
+returns `std::nullopt`, distinct from an engaged empty result. Nothing about the rule changes: the
+owner borrows the pool, issues schema-qualified SQL with bound parameters, and no per-store class
+gained a cross-schema method.
+
+## Update (2026-11-16) -- an eighth query owner: MfaDisableOwner
+
+An eighth query owner: `MfaDisableOwner` (`mfa_disable_owner.{hpp,cpp}`, #6079 PR 2c), the only
+operator-initiated path that clears an ENROLLED factor while leaving the account active (the Settings
+disable and the host break-glass `--mfa-reset`); account deactivation clears it incidentally through
+`soft_delete_user_in_txn` and ends sessions in a separate step. It copies `CredentialChangeOwner`'s shape: one `pool.with_txn_for` on one
+lease, schema-qualified SQL across `auth`, `session_store` and `audit_store`, a txn-scoped
+`lock_timeout`, and no compensating write. In one transaction it clears the factor and deletes the
+recovery codes (`auth_sql::clear_mfa_factor_in_txn` in `auth_db_sql_helpers.hpp`, the ONE copy of
+those statements, which `AuthDB::mfa_disable_report` also runs), deletes every durable session of
+the account (`session_sql::delete_user_sessions_in_txn`), inserts the OUTCOME audit row
+(`AuditStore::log_in_txn`) and LAST bumps the `session_meta` write generation
+(`session_sql::bump_generation_in_txn`). The clear, the session delete and the outcome row therefore
+commit or abort together; the caller's `attempted` intent row is written before, outside the
+transaction, and still fails closed. The one indeterminate case is a connection lost exactly at
+COMMIT. The lock order is `CredentialChangeOwner`'s, with the same acyclicity argument: the
+`auth.users` row, the `session_store.sessions` rows, the `audit_store.audit_events` INSERT, then the
+`session_meta` row last; a clear of an account with no verified factor that leaves its sessions alone
+takes only the first and the audit INSERT. As with the other owners it is correct only because
+`AuthDB`, `SessionStore` and `AuditStore` share ONE pool/database (ADR-0006); a split fails every
+statement closed, never a silent partial write.

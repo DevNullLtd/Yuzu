@@ -308,7 +308,7 @@ fails the CEL → `non_compliant`; one that satisfies it → `compliant`.
 **A check that runs a Forensics-tier plugin scores `unknown`.** The evaluator
 reads each check's stored response with every Forensics-tier plugin
 (`app_usage`, `browser_inventory`, `execution_artifacts`,
-`privacy_permissions`, `remote_access_audit`; the set is derived from the
+`privacy_permissions`, `process_introspect`, `remote_access_audit`; the set is derived from the
 capability catalogue) excluded, because the verdict and the first bytes of the
 check output are shown to readers who do not hold `Forensics:Read`. Such a
 policy therefore shows `unknown` for every agent with an empty `check_result`,

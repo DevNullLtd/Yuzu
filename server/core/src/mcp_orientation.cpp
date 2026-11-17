@@ -85,7 +85,16 @@ constexpr std::string_view kInventory[] = {"query_inventory", "list_inventory_ta
                                            "query_software_catalogue", "get_software_versions",
                                            "get_crypto_libraries", "list_crypto_library_devices",
                                            "export_crypto_cbom", "list_hardware_ci",
-                                           "get_hardware_ci", "list_hardware_ci_records"};
+                                           "get_hardware_ci", "list_hardware_ci_records",
+                                           // SAM-35: the installed-software v3 reads and the
+                                           // collection settings (read, set, per-device effective).
+                                           "list_software_hosts", "get_software_host",
+                                           "list_software_changes", "get_software_summary",
+                                           "get_software_plugin_health",
+                                           "list_software_collection_settings",
+                                           "get_software_collection_settings",
+                                           "set_software_collection_settings",
+                                           "get_software_host_collection_settings"};
 constexpr std::string_view kCompliance[] = {
     "list_policies",    "get_compliance_summary",       "get_fleet_compliance",
     "get_guardian_schemas", "get_policy", "list_policy_fragments",
@@ -196,8 +205,8 @@ constexpr std::string_view kDiscovery[] = {"discover_permissions", "discover_ins
 // #7217: get_guardian_device_compliance carries the per-guard flags and uncertain_guards too, and
 // both per-device reads (it and get_guardian_device_guards) report unrepresented_pending_guards.
 // UP-14: get_guardian_status reports unordered_agents / unordered_agent_ids and
-// get_guardian_device_guards reports its ordering block (the stored emit-order pair state; stored
-// and counted, not yet compared).
+// get_guardian_device_guards reports its ordering block (the agent's emit-order pair clock and
+// counters, which the census ordering decides by).
 // #2146 Batch B1 extends this family with the rule CRUD/push mutations
 // (create/get/update/delete_guardian_rule, push_guardian_rules) and the two
 // per-agent reads #4037 deliberately deferred (get_guardian_agent_status,

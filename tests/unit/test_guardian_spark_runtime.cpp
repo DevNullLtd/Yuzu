@@ -16156,3 +16156,162 @@ TEST_CASE("#4045 R14: the stop-time sweep runs only AFTER the runtime began stop
     (void)rt->stage_unstaged_baselines();
     CHECK(rt->unstaged_sweep_stopping_for_test() == 1);
 }
+
+// ── #5605: the lock-free mirror of the staging map's size ─────────────────────────────────────
+// staged_baseline_count_ is written only under registry_mu_, by store(size()) at the two sites
+// that change the map's size, and read lock-free by the persister. Every case below requires
+// mirror == staged_baseline_count_for_test() (the map's real size) after each operation.
+namespace {
+void check_mirror_matches(const GuardianSparkRuntime& rt) {
+    CHECK(rt.staged_baseline_count_mirror_for_test() == rt.staged_baseline_count_for_test());
+    CHECK(rt.staged_baseline_count_source()->load() == rt.staged_baseline_count_for_test());
+}
+} // namespace
+
+TEST_CASE("#5605 T1: the staging mirror tracks every insert",
+          "[spark][runtime][baseline][mirror]") {
+    auto rt = make_rt(std::make_shared<FakeReader>(), std::make_shared<FakeBackend>());
+    CHECK(rt->staged_baseline_count_mirror_for_test() == 0);
+    rt->stage_baseline_for_test("r1", "/a", "h1");
+    check_mirror_matches(*rt);
+    rt->stage_baseline_for_test("r2", "/b", "h2");
+    check_mirror_matches(*rt);
+    rt->stage_baseline_for_test("r3", "/c", "h3");
+    check_mirror_matches(*rt);
+    CHECK(rt->staged_baseline_count_mirror_for_test() == 3);
+    // First capture wins on one path: a same-path restage is not an insert.
+    rt->stage_baseline_for_test("r1", "/a", "other");
+    check_mirror_matches(*rt);
+    CHECK(rt->staged_baseline_count_mirror_for_test() == 3);
+}
+
+TEST_CASE("#5605 T2: a retarget replace is size-neutral and counts a drop, not a mirror change",
+          "[spark][runtime][baseline][mirror]") {
+    auto rt = make_rt(std::make_shared<FakeReader>(), std::make_shared<FakeBackend>());
+    rt->stage_baseline_for_test("r1", "/a", "h1");
+    REQUIRE(rt->staged_baseline_count_mirror_for_test() == 1);
+    REQUIRE(rt->staged_baseline_drops() == 0);
+    rt->stage_baseline_for_test("r1", "/b", "h2"); // the same rule_id, another path
+    check_mirror_matches(*rt);
+    CHECK(rt->staged_baseline_count_mirror_for_test() == 1);
+    CHECK(rt->staged_baseline_drops() == 1);
+}
+
+TEST_CASE("#5605 T3: the mirror drops on a matching erase and holds on a stale one",
+          "[spark][runtime][baseline][mirror]") {
+    auto rt = make_rt(std::make_shared<FakeReader>(), std::make_shared<FakeBackend>());
+    rt->stage_baseline_for_test("r1", "/a", "h1");
+    rt->stage_baseline_for_test("r2", "/b", "h2");
+    auto got = rt->snapshot_staged_baselines();
+    REQUIRE(got.size() == 2);
+    check_mirror_matches(*rt);
+
+    // A stale tuple (the staged hash differs) erases nothing.
+    auto stale = got;
+    for (auto& c : stale)
+        c.hash += "-changed";
+    rt->erase_staged_baselines_if_unchanged(stale);
+    check_mirror_matches(*rt);
+    CHECK(rt->staged_baseline_count_mirror_for_test() == 2);
+
+    // One matching entry erases exactly one.
+    rt->erase_staged_baselines_if_unchanged(std::span<const CapturedBaseline>{got.data(), 1});
+    check_mirror_matches(*rt);
+    CHECK(rt->staged_baseline_count_mirror_for_test() == 1);
+
+    rt->erase_staged_baselines_if_unchanged(got);
+    check_mirror_matches(*rt);
+    CHECK(rt->staged_baseline_count_mirror_for_test() == 0);
+}
+
+TEST_CASE("#5605 T4: a failed staging does not move the mirror (the committed-but-unstaged "
+          "residual stays out of the gauge and in the cumulative drop counter)",
+          "[spark][runtime][baseline][mirror]") {
+    auto rt = make_rt(std::make_shared<FakeReader>(), std::make_shared<FakeBackend>());
+    rt->stage_baseline_for_test("r1", "/a", "h1");
+    REQUIRE(rt->staged_baseline_count_mirror_for_test() == 1);
+    rt->fail_next_stage_baseline_for_test();
+    rt->stage_baseline_for_test("r2", "/b", "h2"); // allocation-failure seam: not staged
+    check_mirror_matches(*rt);
+    CHECK(rt->staged_baseline_count_mirror_for_test() == 1);
+    CHECK(rt->staged_baseline_drops() == 1);
+}
+
+TEST_CASE("#5605 T5: the mirror equals the map size after concurrent staging, snapshots and "
+          "erases",
+          "[spark][runtime][baseline][mirror]") {
+    auto rt = make_rt(std::make_shared<FakeReader>(), std::make_shared<FakeBackend>());
+    constexpr int kThreads = 4;
+    constexpr int kPerThread = 200;
+    std::atomic<bool> stagers_done{false};
+    std::atomic<int> finished{0};
+    std::vector<std::thread> stagers;
+    std::thread drainer;
+    // Declared BEFORE the first thread is created and destroyed AFTER them: a joinable
+    // std::thread destructor is std::terminate(), so if a later thread constructor throws (or a
+    // check unwinds) this must still stop and join the drainer and every stager already started.
+    yuzu::test::ScopeExit join_all{[&] {
+        stagers_done.store(true);
+        for (auto& th : stagers)
+            if (th.joinable())
+                th.join();
+        if (drainer.joinable())
+            drainer.join();
+    }};
+    for (int t = 0; t < kThreads; ++t) {
+        stagers.emplace_back([&, t] {
+            for (int i = 0; i < kPerThread; ++i)
+                rt->stage_baseline_for_test("r" + std::to_string(t) + "_" + std::to_string(i), "/p",
+                                            "h");
+            if (finished.fetch_add(1) + 1 == kThreads)
+                stagers_done.store(true);
+        });
+    }
+    // One drainer snapshots and erases in a loop, exactly like the persister's pass. The counted
+    // self-heal inside snapshot/erase checks the mirror on every iteration (asserted at the end).
+    drainer = std::thread([&] {
+        while (!stagers_done.load()) {
+            const auto got = rt->snapshot_staged_baselines();
+            rt->erase_staged_baselines_if_unchanged(got);
+        }
+    });
+    for (auto& th : stagers)
+        th.join();
+    drainer.join();
+    check_mirror_matches(*rt);
+    // Drain whatever is left; the mirror must reach exactly zero.
+    rt->erase_staged_baselines_if_unchanged(rt->snapshot_staged_baselines());
+    check_mirror_matches(*rt);
+    CHECK(rt->staged_baseline_count_mirror_for_test() == 0);
+    CHECK(rt->staged_baseline_mirror_resyncs_for_test() == 0); // no write site ever drifted
+}
+
+TEST_CASE("#5605 T6: a mirror that disagrees with the map is repaired and counted, never an abort",
+          "[spark][runtime][baseline][mirror]") {
+    auto rt = make_rt(std::make_shared<FakeReader>(), std::make_shared<FakeBackend>());
+    rt->stage_baseline_for_test("r1", "/a", "h1");
+    rt->stage_baseline_for_test("r2", "/b", "h2");
+    REQUIRE(rt->staged_baseline_mirror_resyncs_for_test() == 0);
+
+    // snapshot_staged_baselines() repairs a skewed mirror (here too high) and counts it once.
+    rt->skew_staged_baseline_mirror_for_test(7);
+    auto got = rt->snapshot_staged_baselines();
+    CHECK(got.size() == 2); // the snapshot is read from the map, not from the mirror
+    check_mirror_matches(*rt);
+    CHECK(rt->staged_baseline_count_mirror_for_test() == 2);
+    CHECK(rt->staged_baseline_mirror_resyncs_for_test() == 1);
+
+    // erase_staged_baselines_if_unchanged() repairs a skew in the other direction (too low) and
+    // increments the counter again. The second occurrence is counted; the log line is not
+    // observable from here, so only the counter is asserted.
+    rt->skew_staged_baseline_mirror_for_test(0);
+    rt->erase_staged_baselines_if_unchanged(std::span<const CapturedBaseline>{got.data(), 1});
+    check_mirror_matches(*rt);
+    CHECK(rt->staged_baseline_count_mirror_for_test() == 1);
+    CHECK(rt->staged_baseline_mirror_resyncs_for_test() == 2);
+
+    // A consistent mirror is left alone: no further count.
+    (void)rt->snapshot_staged_baselines();
+    rt->erase_staged_baselines_if_unchanged(std::span<const CapturedBaseline>{});
+    CHECK(rt->staged_baseline_mirror_resyncs_for_test() == 2);
+}

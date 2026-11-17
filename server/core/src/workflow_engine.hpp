@@ -178,6 +178,14 @@ public:
         const std::string& instruction_id, int limit,
         const std::unordered_set<std::string>& exclude_ids = {}) const;
 
+    /// The same question for ANY of `instruction_ids` at once (one read for the whole list): each
+    /// workflow is listed once however many of the ids its steps run. An empty list answers an
+    /// empty vector without a read. `workflows_referencing_instruction` above is the one-element
+    /// call of this method.
+    std::expected<std::vector<std::string>, std::string> workflows_referencing_instructions(
+        const std::vector<std::string>& instruction_ids, int limit,
+        const std::unordered_set<std::string>& exclude_ids = {}) const;
+
     /// `nullopt` = a successful read finding none (or the workflow is soft-deleted — ADR-0064).
     /// `unexpected(msg)` (prefixed `kDbErrorPrefix`) = a genuine read failure — never treat the
     /// latter as "not found".

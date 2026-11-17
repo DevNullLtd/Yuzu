@@ -114,11 +114,11 @@ inline constexpr std::array<CommandCapability, 4> kFixture{{
         .system_reserved = false,
         .execute_gate = ExecuteGate::AdminOrApproval,
     },
-    // A protective pair (the quarantine plugin's read-only status), so the plugin-presence
+    // A protective pair (the firewall plugin's read-only quarantine_status), so the plugin-presence
     // carve-out can be driven through the route.
     {
-        .plugin = "quarantine",
-        .action = "status",
+        .plugin = "firewall",
+        .action = "quarantine_status",
         .dispatch_class = DispatchClass::ReadOnly,
         .mutability = Mutability::None,
         .securable = "Security",
@@ -753,11 +753,11 @@ TEST_CASE("/api/command: a protective action reaches an agent whose inventory la
           "[command_routes][protective]") {
     CommandHarness h;
     auto info = make_agent_info("inv-A");
-    info.add_plugins()->set_name("firewall"); // non-empty inventory without quarantine/noop
+    info.add_plugins()->set_name("ioc"); // non-empty inventory without firewall/noop
     (void)h.registry.register_agent(info);
 
     auto protective = h.sink.Post(
-        "/api/command", R"({"plugin":"quarantine","action":"status","agent_ids":["inv-A"]})");
+        "/api/command", R"({"plugin":"firewall","action":"quarantine_status","agent_ids":["inv-A"]})");
     REQUIRE(protective);
     CHECK(protective->status == 200);
     CHECK(h.send_to_ids_called == std::vector<std::string>{"inv-A"});

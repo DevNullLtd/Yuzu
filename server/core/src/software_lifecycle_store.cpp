@@ -343,6 +343,64 @@ SoftwareLifecycleStore::rules_for(const std::vector<std::string>& product_keys) 
     return out;
 }
 
+std::optional<std::vector<LifecycleRule>> SoftwareLifecycleStore::rules_of(LifecycleSource source) {
+    if (source == LifecycleSource::declared) {
+        spdlog::warn("SoftwareLifecycleStore: rules_of refused the declared source");
+        return std::nullopt;
+    }
+    if (!open_) {
+        if (note_degrade(metrics_, kReadFamily, kReasonStoreNotOpen))
+            spdlog::warn("SoftwareLifecycleStore: rules_of degraded - store not open");
+        return std::nullopt;
+    }
+    auto lease = pool_.try_acquire_for(timeout_);
+    if (!lease) {
+        if (note_degrade(metrics_, kReadFamily, kReasonPoolTimeout))
+            spdlog::warn("SoftwareLifecycleStore: rules_of degraded - no connection ({})",
+                         pool_.last_error());
+        return std::nullopt;
+    }
+    // One row past the per-source bound replace_rules enforces: seeing it means the table was
+    // written outside this class, and the answer is a degrade, never a truncated list.
+    const std::string sql =
+        "SELECT product_key, version_prefix, event, to_char(event_date, 'YYYY-MM-DD'), source, "
+        "source_ref, loaded_at FROM software_lifecycle_store.lifecycle_rule WHERE source = $1 "
+        "ORDER BY product_key, version_prefix, event LIMIT " +
+        std::to_string(kLifecycleCsvMaxRows + 1);
+    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(),
+                                       std::vector<std::string>{std::string{to_string(source)}});
+    if (res.status() != PGRES_TUPLES_OK) {
+        if (note_degrade(metrics_, kReadFamily, kReasonQueryError))
+            spdlog::warn("SoftwareLifecycleStore: rules_of degraded - query failed (SQLSTATE {})",
+                         sqlstate(res));
+        return std::nullopt;
+    }
+    const int n = PQntuples(res.get());
+    if (n > static_cast<int>(kLifecycleCsvMaxRows)) {
+        if (note_degrade(metrics_, kReadFamily, kReasonRowCap))
+            spdlog::error("SoftwareLifecycleStore: rules_of found more than {} {} rules",
+                          kLifecycleCsvMaxRows, to_string(source));
+        return std::nullopt;
+    }
+    std::vector<LifecycleRule> out;
+    out.reserve(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i) {
+        const auto ev = parse_lifecycle_event(PQgetvalue(res.get(), i, 2));
+        const auto src = parse_lifecycle_source(PQgetvalue(res.get(), i, 4));
+        if (!ev || !src || *src != source) {
+            if (note_degrade(metrics_, kReadFamily, kReasonCorruptRow))
+                spdlog::error("SoftwareLifecycleStore: rules_of found a row with an unknown "
+                              "event or source for {}",
+                              PQgetvalue(res.get(), i, 0));
+            return std::nullopt;
+        }
+        out.push_back(LifecycleRule{PQgetvalue(res.get(), i, 0), PQgetvalue(res.get(), i, 1), *ev,
+                                    PQgetvalue(res.get(), i, 3), *src, PQgetvalue(res.get(), i, 5),
+                                    cell_i64(res, i, 6)});
+    }
+    return out;
+}
+
 std::optional<std::vector<DeclaredFact>>
 SoftwareLifecycleStore::declared_for(const std::vector<LifecycleLookup>& lookups) {
     if (!open_) {

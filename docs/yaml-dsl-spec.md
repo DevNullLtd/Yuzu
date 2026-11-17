@@ -1702,7 +1702,7 @@ This section enumerates the stable builtin primitives that content authors targe
 | `network.wifi.list` | `wifi` | Y | Y | Y | Verified |
 | `network.wol.wake` | `wol` | Y | Y | Y | Verified |
 | `network.wol.check` | `wol` | Y | Y | Y | Verified |
-| `network.quarantine` | `quarantine` | Y | Y | - | Planned |
+| `network.quarantine` | `firewall` (`quarantine` action) | Y | Y | - | Planned |
 
 ### 14.6 Software and Patching
 

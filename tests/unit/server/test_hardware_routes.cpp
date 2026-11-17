@@ -64,6 +64,12 @@ InventoryDeviceRow make_row(std::string id, std::string host, std::string os, bo
 // action_descriptions) are left unwired — the Actions lens and its result poll are
 // out of scope for this file (the CI list/record + REST twins are the named gap).
 struct HwHarness {
+    // The collation gate the bulk read consults (production wires &collation_gate_). Trusted by
+    // default and mutable after construction (the route reads it per request); the constructor's
+    // `unwire_ci_gate_ctor` leaves the deps pointer null (no gate), which serves. Declared FIRST,
+    // before `routes` which borrows it, so it is destroyed after everything that holds the pointer.
+    std::atomic<pg::CollationGate> ci_gate{pg::CollationGate::Trusted};
+
     yuzu::server::test::TestRouteSink sink;
     HardwareRoutes routes;
 
@@ -149,7 +155,8 @@ struct HwHarness {
     explicit HwHarness(bool unwire_sync_dispatch_ctor = false, bool unwire_agent_version_fn_ctor = false,
                        bool quarantine_list_wired_ctor = false,
                        bool containment_ui_ctor = kContainmentUi,
-                       ResponseStore* response_store = nullptr, bool unwire_ci_page_ctor = false) {
+                       ResponseStore* response_store = nullptr, bool unwire_ci_page_ctor = false,
+                       bool unwire_ci_gate_ctor = false) {
         ci_page_unwired = unwire_ci_page_ctor;
         quarantine_list_wired = quarantine_list_wired_ctor;
         unwire_sync_dispatch = unwire_sync_dispatch_ctor;
@@ -253,6 +260,8 @@ struct HwHarness {
         deps.ci_detail_fn = ci_fn;
         if (!ci_page_unwired)
             deps.ci_page_reader = ci_store.reader();
+        if (!unwire_ci_gate_ctor)
+            deps.ci_collation_gate = &ci_gate;
         deps.scoped_probe_fn = probe;
         deps.dex_score_fn = dex_fn;
         if (quarantine_list_wired) {
@@ -2398,50 +2407,56 @@ TEST_CASE("route: lens-only response carries the Containment tab when the UI is 
     CHECK(contains(res->body, ">Containment</a>"));
 }
 
-// ───────────────────────── Actions lens: quarantine plugin rows ──────────────────────
+// ───────────────────────── Actions lens: firewall containment rows ───────────────────
 
 namespace {
-void report_quarantine_and_firewall_plugins(HwHarness& h) {
+void report_firewall_and_other_plugins(HwHarness& h) {
     h.ci_detail.identity = make_row("agent-1", "HOST-1", "linux", true);
     h.actions_plugins = {
-        {.name = "quarantine", .version = "1", .actions = {"quarantine", "unquarantine", "status", "whitelist"}},
-        {.name = "firewall", .version = "1", .actions = {"rules"}}};
+        {.name = "firewall",
+         .version = "1",
+         .actions = {"state", "rules", "quarantine", "release", "quarantine_status", "quarantine_allow"}},
+        {.name = "processes", .version = "1", .actions = {"list"}}};
 }
 } // namespace
 
-// Kills: a Run button for the quarantine plugin's own actions (quarantine, unquarantine,
-// whitelist) surviving in the Actions lens while the rest of the containment UI is hidden —
-// the owner chose to hide every quarantine control on the Hardware pages. Other plugins stay.
-TEST_CASE("route: actions lens — the quarantine plugin's rows are left out while the UI is hidden",
+// Kills: a Run button for the firewall plugin's four containment actions (quarantine, release,
+// quarantine_status, quarantine_allow) surviving in the Actions lens while the rest of the
+// containment UI is hidden — the owner chose to hide every quarantine control on the Hardware
+// pages (and approved the lens consequence for the four firewall rows, 2026-11-11). Other
+// plugins stay, and so do firewall.state and firewall.rules.
+TEST_CASE("route: actions lens — the four firewall containment rows are left out while the UI is hidden",
           "[hardware][route][quarantine]") {
     HwHarness h;
-    report_quarantine_and_firewall_plugins(h);
+    report_firewall_and_other_plugins(h);
     auto res = h.sink.Get("/fragments/hardware/ci/actions?id=agent-1");
     REQUIRE(res);
     REQUIRE(res->status == 200);
+    CHECK(contains(res->body, "data-plugin=\"firewall\" data-action=\"state\""));
     CHECK(contains(res->body, "data-plugin=\"firewall\" data-action=\"rules\""));
+    CHECK(contains(res->body, "data-plugin=\"processes\" data-action=\"list\""));
     CHECK(contains(res->body, "hwRunAction"));
+    for (const char* action : {"quarantine", "release", "quarantine_status", "quarantine_allow"})
+        CHECK_FALSE(contains(res->body,
+                             std::string("data-plugin=\"firewall\" data-action=\"") + action + "\""));
     CHECK_FALSE(contains(res->body, "data-plugin=\"quarantine\""));
-    CHECK_FALSE(contains(res->body, "<summary>quarantine</summary>"));
-    for (const char* action : {"quarantine.quarantine", "quarantine.unquarantine", "quarantine.status",
-                               "quarantine.whitelist"})
-        CHECK_FALSE(contains(res->body, action));
     REQUIRE_FALSE(h.audit_details.empty());
-    CHECK(contains(h.audit_details.back(), "actions catalogue: 1 rows"));
+    CHECK(contains(h.audit_details.back(), "actions catalogue: 3 rows"));
 }
 
-// Kills: the filter dropping the quarantine rows when the UI is on (the restore path).
-TEST_CASE("route: actions lens — the quarantine plugin's rows are listed when the UI is on",
+// Kills: the filter dropping the firewall containment rows when the UI is on (the restore path).
+TEST_CASE("route: actions lens — all six firewall rows are listed when the UI is on",
           "[hardware][route][quarantine]") {
     HwHarness h(false, false, false, /*containment_ui=*/true);
-    report_quarantine_and_firewall_plugins(h);
+    report_firewall_and_other_plugins(h);
     auto res = h.sink.Get("/fragments/hardware/ci/actions?id=agent-1");
     REQUIRE(res);
     REQUIRE(res->status == 200);
-    for (const char* action : {"quarantine", "unquarantine", "status", "whitelist"})
-        CHECK(contains(res->body, std::string("data-plugin=\"quarantine\" data-action=\"") + action + "\""));
-    CHECK(contains(res->body, "data-plugin=\"firewall\" data-action=\"rules\""));
-    CHECK(contains(h.audit_details.back(), "actions catalogue: 5 rows"));
+    for (const char* action :
+         {"state", "rules", "quarantine", "release", "quarantine_status", "quarantine_allow"})
+        CHECK(contains(res->body,
+                       std::string("data-plugin=\"firewall\" data-action=\"") + action + "\""));
+    CHECK(contains(h.audit_details.back(), "actions catalogue: 7 rows"));
 }
 
 // Remove needs Tag:Delete, which is not Tag:Write: a Write-only viewer is offered Add and no
@@ -3367,4 +3382,88 @@ TEST_CASE("route: GET /api/v1/hardware-ci lists a device the 30-day roster does 
     auto list = h.sink.Get("/api/v1/hardware");
     REQUIRE(list);
     CHECK(nlohmann::json::parse(list->body)["data"]["devices"].empty());
+}
+
+// ───────────────── GET /api/v1/hardware-ci: the collation read gate (#7730) ─────────────────
+
+// Kills: a bulk page served while the collation gate is not Trusted (duplicate and ghost rows
+// served as truth), a refusal that still asks the store, a refusal that is not the retryable 503
+// with the documented hint, and a refusal that is not audited as a failure.
+TEST_CASE("route: GET /api/v1/hardware-ci is refused with a retryable 503 while the collation gate is not Trusted",
+          "[hardware][route][rest][ci_page][collation_gate]") {
+    for (const auto refused : {pg::CollationGate::Mismatch, pg::CollationGate::Unproven}) {
+        HwHarness h;
+        seed_ci(h, {"a", "b"});
+        h.ci_gate.store(refused);
+        auto res = h.sink.Get("/api/v1/hardware-ci");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(res->get_header_value("Retry-After") == "60");
+        CHECK(res->get_header_value("Cache-Control") != "no-store"); // nothing served
+        const auto body = nlohmann::json::parse(res->body, nullptr, false);
+        REQUIRE_FALSE(body.is_discarded());
+        CHECK_FALSE(body.contains("data"));
+        CHECK(body["error"]["code"] == 503);
+        CHECK(body["error"]["retry_after_ms"] == 60000);
+        const std::string msg = body["error"]["message"].get<std::string>();
+        CHECK(contains(msg, "collation version"));
+        CHECK(contains(msg, "server-admin.md"));
+        CHECK(body["error"]["remediation"].get<std::string>().find("restart the walk from the first page") != std::string::npos);
+        CHECK_FALSE(contains(res->body, "SN-a")); // no record body leaked
+        CHECK(h.ci_store.reads == 0);             // no store round-trip
+        REQUIRE(h.audit_full.size() == 1);
+        CHECK(h.audit_full[0] == "inventory.devices.ci|failure|Inventory|fleet");
+        CHECK(h.audit_details[0] == "hardware CI records (REST) state=collation ordering unverified");
+        CHECK(res->get_header_value("Sec-Audit-Failed").empty()); // the row persisted
+    }
+}
+
+TEST_CASE("route: GET /api/v1/hardware-ci refusal is marked Sec-Audit-Failed when its audit row fails",
+          "[hardware][route][rest][ci_page][collation_gate][security]") {
+    HwHarness h;
+    seed_ci(h, {"a"});
+    h.ci_gate.store(pg::CollationGate::Mismatch);
+    h.audit_should_fail = true;
+    auto res = h.sink.Get("/api/v1/hardware-ci");
+    REQUIRE(res);
+    CHECK(res->status == 503); // the refusal stands
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK(h.ci_store.reads == 0);
+}
+
+TEST_CASE("route: GET /api/v1/hardware-ci serves under a Trusted gate and answers again once it clears",
+          "[hardware][route][rest][ci_page][collation_gate]") {
+    HwHarness h;
+    seed_ci(h, {"a", "b"});
+    h.ci_gate.store(pg::CollationGate::Mismatch);
+    CHECK(h.sink.Get("/api/v1/hardware-ci")->status == 503);
+    h.ci_gate.store(pg::CollationGate::Trusted);
+    auto res = h.sink.Get("/api/v1/hardware-ci");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    CHECK(ci_page_ids(nlohmann::json::parse(res->body)) == std::vector<std::string>{"a", "b"});
+}
+
+// A Deps built without a gate serves (the documented null default); production wiring is pinned
+// lexically (test_hw_ci_detail_wiring_lexical.cpp).
+TEST_CASE("route: GET /api/v1/hardware-ci with no gate wired serves",
+          "[hardware][route][rest][ci_page][collation_gate]") {
+    HwHarness h(false, false, false, kContainmentUi, nullptr, false, /*unwire_ci_gate_ctor=*/true);
+    seed_ci(h, {"a"});
+    h.ci_gate.store(pg::CollationGate::Mismatch); // not wired, so never consulted
+    auto res = h.sink.Get("/api/v1/hardware-ci");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+}
+
+// An argument refusal needs no read and keeps its own answer under a refusing gate.
+TEST_CASE("route: GET /api/v1/hardware-ci keeps a 400 for a malformed cursor while the gate refuses",
+          "[hardware][route][rest][ci_page][collation_gate]") {
+    HwHarness h;
+    seed_ci(h, {"a"});
+    h.ci_gate.store(pg::CollationGate::Mismatch);
+    auto res = h.sink.Get("/api/v1/hardware-ci?cursor=garbage");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    CHECK(h.ci_store.reads == 0);
 }

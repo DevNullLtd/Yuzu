@@ -33,10 +33,12 @@
 /// nothing else, and is bound to the `agent_id` filter, never to the scope or the limit.
 
 #include "authz_model.hpp"
+#include "device_ci_read_gate.hpp"
 #include "device_inventory_types.hpp"
 
 #include <nlohmann/json.hpp>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -151,11 +153,23 @@ struct Page {
 ///  - `kScopeTooWide`: TERMINAL (a 400 / -32602, no retry hint). The caller's scope exceeds
 ///    `kMaxPushdownScopeIds` ids and the request names no `agent_id`. Decided from the scope size
 ///    and the request alone, before any read, and its text carries no count.
+///  - `kOrderingUnverified`: the collation gate is not Trusted (`device_ci_read_gate.hpp`: the
+///    database collation version changed under the stored CI keys, or the check has not yet
+///    concluded). A 503 with `retry_after_ms` `device_ci_read_gate::kOrderingRetryAfterMs`, never
+///    an empty page and not `kDegraded` (that one says the store is unavailable). Decided after
+///    every refusal that needs no read and BEFORE the store is asked, so no read is made.
 ///  - `kCount`: NOT an error. A sentinel one past the last real enumerator, so a test can walk
 ///    every value and a `static_assert` can tie a table to the enumerator count; it is answered
 ///    like any out-of-range value. A new enumerator MUST be inserted BEFORE it: the
 ///    every-enumerator test and the table's `static_assert` count up to `kCount`.
-enum class ReadError { kDegraded, kCursorMalformed, kCursorFilterMismatch, kScopeTooWide, kCount };
+enum class ReadError {
+    kDegraded,
+    kCursorMalformed,
+    kCursorFilterMismatch,
+    kScopeTooWide,
+    kOrderingUnverified,
+    kCount
+};
 
 /// Wire message for a refused request: the cursor messages above, and for `kScopeTooWide` the
 /// same text on REST and MCP (it names the global-read way out and carries no count).
@@ -168,6 +182,12 @@ enum class ReadError { kDegraded, kCursorMalformed, kCursorFilterMismatch, kScop
 inline constexpr std::string_view kScopeTooWideRemediation =
     "use a credential with global read, pass agent_id, or ask an administrator to narrow the "
     "caller's scope";
+
+/// The A4 `remediation` hint for a `kOrderingUnverified` refusal, the same text on REST and MCP.
+inline constexpr std::string_view kOrderingUnverifiedRemediation =
+    "wait retry_after_ms and call once more, then restart the walk from the first page (do not "
+    "resume the old cursor); if it persists, ask an administrator to check the database collation "
+    "state (see PostgreSQL collation version in server-admin.md)";
 
 /// Which transport is answering: it picks the wording of the audit detail and the audit rows the
 /// transport writes (`REST` / `MCP` in the text), nothing else.
@@ -201,10 +221,16 @@ struct ReadFailure {
 /// The answer to a failed read. One `switch` over `ReadError` with no `default`.
 [[nodiscard]] ReadFailure describe_read_error(ReadError e, Surface surface);
 
-/// One page: decode the cursor, apply the scope as described in the file comment, read. A
-/// `rq.limit` outside [1, kPageMax] is clamped into it (the parsers never produce one).
+/// One page: decode the cursor, apply the scope as described in the file comment, check the
+/// collation gate, read. A `rq.limit` outside [1, kPageMax] is clamped into it (the parsers never
+/// produce one). `gate` is `device_ci_read_gate`'s input and has NO default: every caller states
+/// it. Null means "no gate" and the read is served (a unit test that deliberately models no gate
+/// passes an explicit `nullptr`; production passes `&collation_gate_`, pinned by a lexical test).
+/// The gate is checked after the cursor and scope refusals, which need no read and keep
+/// their own answers, and before the one store call.
 [[nodiscard]] std::expected<Page, ReadError>
-read_page(const Reader& read, const Request& rq, const authz::VisibleSet& scope);
+read_page(const Reader& read, const Request& rq, const authz::VisibleSet& scope,
+          const std::atomic<pg::CollationGate>* gate);
 
 /// The production binding of `Reader` is a one-line lambda in server.cpp over
 /// `DeviceInventoryStore::list_device_ci_after`; there is no binder here so this header stays

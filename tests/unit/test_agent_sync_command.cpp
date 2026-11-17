@@ -12,6 +12,7 @@
 // kv_get/kv_set/sender lambda pattern tests/unit/test_inventory_sync.cpp
 // already uses — a real (not mocked) SyncScheduler.
 
+#include "collection_settings_agent.hpp"
 #include "sync_now_decision.hpp"
 #include "sync_scheduler.hpp"
 
@@ -27,10 +28,13 @@
 #include <utility>
 #include <vector>
 
+using yuzu::agent::AgentCollectionSettings;
+using yuzu::agent::SettingsHooks;
 using yuzu::agent::SyncNowDecision;
 using yuzu::agent::SyncScheduler;
 using yuzu::agent::SyncSource;
 using yuzu::agent::decide_sync_now;
+using yuzu::agent::decide_sync_settings;
 
 namespace {
 
@@ -237,4 +241,47 @@ TEST_CASE("decide_sync_now: a source list is all-or-nothing", "[sync][agent_comm
                                         sched.get());
         CHECK(decision.status == SyncNowDecision::Status::Failure);
     }
+}
+
+// ---------------------------------------------------------------------------
+// SAM-39: the `settings` action of the same reserved command (collection_settings_agent.hpp).
+// ---------------------------------------------------------------------------
+
+TEST_CASE("decide_sync_now: settings is not a now-action; it has its own decision",
+          "[sync][agent_command][collection_settings]") {
+    auto decision = decide_sync_now("settings", "all", std::nullopt, /*inventory_disable=*/false, nullptr);
+    CHECK(decision.status == SyncNowDecision::Status::Failure);
+    CHECK(decision.exit_code == 2);
+    CHECK(decision.output == "unknown __sync__ action: settings");
+}
+
+TEST_CASE("decide_sync_settings: a valid command reaches the scheduler and arms no sync",
+          "[sync][agent_command][collection_settings]") {
+    std::map<std::string, int> collects;
+    auto sched = make_counting_scheduler(collects);
+    const std::string doc =
+        "v1\ninterval=172800\nwindow=none\ntz=\n"
+        "plugin.installed_apps=1\nplugin.middleware=1\nplugin.msi_packages=1\n"
+        "plugin.pkg_inventory=1\nplugin.runtimes=1\nplugin.windows_optional_features=1\n";
+    const std::map<std::string, std::string> params{{"version", yuzu::agent::sha256_hex(doc)},
+                                                    {"document", doc}};
+    std::optional<AgentCollectionSettings> applied;
+    std::map<std::string, std::string> kv;
+    const SettingsHooks hooks{
+        [&](std::string_view k, std::string_view v) {
+            kv[std::string{k}] = std::string{v};
+            return true;
+        },
+        [&](const AgentCollectionSettings& s) {
+            applied = s;
+            sched->apply_settings(yuzu::agent::kSettingsSyncSource,
+                                  std::chrono::seconds{s.interval_s}, s.window);
+        }};
+    const auto decision = decide_sync_settings(params, hooks);
+    CHECK(decision.status == SyncNowDecision::Status::Success);
+    CHECK(decision.output == "applied|" + yuzu::agent::sha256_hex(doc));
+    REQUIRE(applied.has_value());
+    CHECK(kv.at("settings.document") == doc);
+    sched->tick(1000); // a forced source would be collected here
+    CHECK(collects.empty());
 }

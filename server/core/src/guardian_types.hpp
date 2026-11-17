@@ -112,9 +112,10 @@ struct GuaranteedStateEventRow {
     // `boot_epoch`/`emit_seq` ONLY when both are set and each is in [1, 2^62): both set or both
     // unset, never one. Unset = unpaired (NULL columns). The store writes them to the event row
     // and to the census row (re-validated by `census_pair`, so a half pair is never stored). The
-    // agent order step reads them and counts how a comparator WOULD decide (the per-agent
-    // regression, straggler, recovery and retired-event counters); no verdict compares them yet.
-    // Like the key inputs above they stay OUT of the duplicate identity.
+    // agent order step decides a MODE from them and the agent's pair clock (counting it on the
+    // per-agent regression, straggler, recovery and retired-event counters), and the census
+    // statements order the verdict by that mode: a paired event over a paired row follows the
+    // pair, not the key. Like the key inputs above they stay OUT of the duplicate identity.
     std::optional<std::int64_t> boot_epoch;
     std::optional<std::int64_t> emit_seq;
 };
@@ -179,17 +180,19 @@ struct GuardianAgentOrder {
     std::int64_t pair_duplicates{0};
     std::int64_t retired_events{0};
 
-    /// "Currently unordered": the latest accepted unpaired census-bearing event is later than the
-    /// pair clock (a NULL clock reads as 0). The store applies the same predicate in SQL for the
-    /// fleet count (`unpaired_recv_ns IS NOT NULL AND unpaired_recv_ns > COALESCE(epoch_recv_ns, 0)`).
-    [[nodiscard]] bool currently_unordered() const noexcept {
-        return unpaired_recv_ns.has_value() && *unpaired_recv_ns > epoch_recv_ns.value_or(0);
-    }
+    /// "Currently unordered" (UP-5), as the DATABASE decided it in the read that produced this row:
+    /// the latest accepted unpaired census-bearing event is later than the pair clock (a NULL clock
+    /// reads as 0), or the pair clock is recorded further than 300 s in the database's future. The
+    /// store sets it from the same SQL text the fleet count and the id list use, so the three
+    /// cannot disagree; nothing in C++ derives it. It depends on the database clock, so it can
+    /// change with no event. A row built without a store carries `false` until a caller sets it.
+    bool currently_unordered{false};
 };
 
-/// Agents "currently unordered" (`unpaired_recv_ns` set and later than `COALESCE(epoch_recv_ns, 0)`)
-/// inside the caller's scope: the exact `count`, and the first `kUnorderedAgentIdCap` agent ids in
-/// byte order. `count > ids.size()` means the list is truncated.
+/// Agents "currently unordered" (see `GuardianAgentOrder::currently_unordered`: one SQL definition,
+/// including the future-clock arm) inside the caller's scope: the exact `count`, and the first
+/// `kUnorderedAgentIdCap` agent ids in byte order. `count > ids.size()` means the list is
+/// truncated.
 struct UnorderedAgentsSummary {
     std::int64_t count{0};
     std::vector<std::string> ids;
@@ -306,7 +309,8 @@ struct GuardianDeviceGuardsReport {
     std::vector<std::string> unrepresented_pending_rule_ids;
     /// The device's `guardian_agent_order` row (the stored emit-order pair clock and its
     /// counters), or `nullopt` when the device never had a census-bearing event accepted (or was
-    /// decommissioned). Stored and counted, not yet compared: no verdict is held or refused on it.
+    /// decommissioned). The clock and counters the census ordering decides by: an unpaired event is
+    /// held, and a pair-mode event refused or re-based, from this row.
     std::optional<GuardianAgentOrder> ordering;
 };
 
