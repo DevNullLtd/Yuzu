@@ -94,7 +94,17 @@ constexpr std::string_view kInventory[] = {"query_inventory", "list_inventory_ta
                                            "list_software_collection_settings",
                                            "get_software_collection_settings",
                                            "set_software_collection_settings",
-                                           "get_software_host_collection_settings"};
+                                           "get_software_host_collection_settings",
+                                           // SAM-29: the lifecycle-rule and normalisation
+                                           // curation twins (three reads, five writes).
+                                           "list_software_lifecycle_rules",
+                                           "import_software_lifecycle_rules",
+                                           "delete_software_lifecycle_rules",
+                                           "get_software_normalization_status",
+                                           "list_software_curation_queue",
+                                           "curate_software_alias",
+                                           "reject_software_curation",
+                                           "replace_software_normalization_pack"};
 constexpr std::string_view kCompliance[] = {
     "list_policies",    "get_compliance_summary",       "get_fleet_compliance",
     "get_guardian_schemas", "get_policy", "list_policy_fragments",

@@ -1422,6 +1422,15 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      a recorded exception).** The five
      `/api/v1/inventory/software/normalization/` routes (`GET status`, `GET queue`,
      `POST aliases`, `POST queue/{key}/reject`, `POST pack`) have no MCP tool.
+     - **Retired 2026-11-17.** The five twins landed under SAM-29
+       (`get_software_normalization_status`, `list_software_curation_queue`,
+       `curate_software_alias`, `reject_software_curation`,
+       `replace_software_normalization_pack`). Each calls the same function as its
+       REST route (`software_curation_api.cpp`), under the same global
+       `Inventory:Read` / `Inventory:Write` grant and the same audit-before-write
+       rows. The step-up class of the three writes mirrors the REST rows, which are
+       exempt pending an owner ruling. The paragraphs below are the record of the
+       exception while it stood.
      - **No MCP twin - tracked follow-up, not a permanent exception.** Tracked
        as roadmap row **4.3-mcp** in the software estate roadmap (executed inside
        delivery row SAM-29, the MCP twins of rule import, catalogue identity and
@@ -1652,6 +1661,19 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      and the page are separate follow-up changes).** The three routes
      `POST`, `GET` and `DELETE /api/v1/inventory/software/lifecycle/rules` have
      no MCP tool and no dashboard page.
+     - **MCP twin retired 2026-11-17; the page remains open.** The three twins
+       landed under SAM-29 (`list_software_lifecycle_rules`,
+       `import_software_lifecycle_rules`, `delete_software_lifecycle_rules`). Each
+       calls the same function as its REST route (`software_lifecycle_api.cpp`),
+       under the same global `Inventory` grant, the same limits and the same
+       `requested` and outcome audit rows; the step-up class of the two writes
+       mirrors the REST rows (exempt pending an owner ruling). The catalogue
+       identity and `package_id` half of the lifecycle surface is held with #6090
+       and is not built; roadmap row SAM.9-mcp stays open for it. Over MCP the
+       whole JSON-RPC request is capped at 4 MiB before routing, so an import file
+       whose JSON-escaped form plus the envelope passes that cap is refused by the
+       transport where REST accepts up to 4 MiB of raw body. The paragraphs below
+       are the record of the exception while it stood.
      - **No MCP twin and no page - tracked follow-ups, not permanent
        exceptions.** Tracked as roadmap row **SAM.7** (rule import) in the
        software estate roadmap and as issue #8009; **revisit by 2026-12-31**. The MCP twin and the

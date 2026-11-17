@@ -24559,6 +24559,9 @@ private:
                                                          mgmt_group_store_.get(),
                                                          plugin_config_store_.get()},
                 collection_settings_probe_fn);
+            // SAM-29 twins: the SAME stores SoftwareLifecycleRoutes and SoftwareCurationRoutes borrow.
+            mcp_server_->set_software_lifecycle_store(software_lifecycle_store_.get());
+            mcp_server_->set_product_registry_store(product_registry_store_.get());
             // #2146 Batch B1 — the SAME BaselineStore GET
             // /guaranteed-state/device-compliance already reads, backing MCP
             // get_guardian_device_compliance's identical baseline lookup.

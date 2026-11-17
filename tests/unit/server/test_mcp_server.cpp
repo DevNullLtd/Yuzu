@@ -72,6 +72,11 @@
 #include "result_set_members.hpp" // kSourceNotSupportedMessage (Forensics-tier source refusal)
 #include "rest_api_v1.hpp"      // M.9 PR-2b: cross-transport cursor walk (REST + MCP)
 #include "software_collection_settings_routes.hpp" // SAM-35: REST parity for the settings tools
+#include "product_registry_store.hpp"        // SAM-29: the curation twins' store
+#include "software_curation_routes.hpp"      // SAM-29: REST parity for the curation tools, curation_keys
+#include "software_lifecycle_routes.hpp"     // SAM-29: REST parity for the lifecycle-rule tools
+#include "software_lifecycle_store.hpp"      // SAM-29: the lifecycle-rule twins' store
+#include "software_normalization_pack.hpp"   // SAM-29: kSoftwareNormalizationSeed
 #include "software_read_routes.hpp"                  // SAM-35: REST parity for the read tools
 #include "test_forensics_tier_fixture.hpp" // #4990: the Forensics tier fixture
 #include "test_route_sink.hpp"  // M.9 PR-2b: in-process sink for that REST half
@@ -153,6 +158,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 
@@ -1275,6 +1281,11 @@ struct McpTestServer {
     std::optional<yuzu::server::software_read_api::Ctx> software_read_ctx_for_test;
     yuzu::server::software_collection_settings_api::Stores collection_settings_stores_for_test;
     yuzu::server::mcp::McpServer::PermFn collection_settings_probe_for_test;
+    /// SAM-29: the lifecycle rule store behind list/import/delete_software_lifecycle_rules and the
+    /// product registry behind the five normalisation tools. Default nullptr keeps every other case
+    /// on the "store unavailable" path.
+    yuzu::server::SoftwareLifecycleStore* software_lifecycle_store_for_test{nullptr};
+    yuzu::server::ProductRegistryStore* product_registry_store_for_test{nullptr};
 
     /// #2146 Batch B2 — optionally wire a real ResultSetStore so the 12
     /// result-set MCP tools can be exercised end-to-end against live
@@ -1955,6 +1966,10 @@ private:
         if (collection_settings_stores_for_test.store || collection_settings_probe_for_test)
             mcp.set_collection_settings_deps(collection_settings_stores_for_test,
                                              collection_settings_probe_for_test);
+        if (software_lifecycle_store_for_test)
+            mcp.set_software_lifecycle_store(software_lifecycle_store_for_test);
+        if (product_registry_store_for_test)
+            mcp.set_product_registry_store(product_registry_store_for_test);
         // #2146 Batch B2: result_set_store ALSO rides a setter, same pattern
         // as preflight_run_store immediately above — wire before the
         // handlers are built.
@@ -57760,4 +57775,798 @@ TEST_CASE("MCP set_software_collection_settings: the supervised tier mints an ap
     CHECK(minted["error"]["code"] == yuzu::server::mcp::kApprovalRequired);
     CHECK_FALSE(rig.stored(rig.group_a));
     CHECK(mcp_audits(rig.ts, "software_estate.collection_settings.update|requested") == 0);
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+// SAM-29: the software lifecycle-rule and normalisation-curation twins over MCP.
+// Each tool calls the SAME function its REST route calls (software_lifecycle_api.cpp,
+// software_curation_api.cpp), so every case that compares the two surfaces compares one body: a
+// mismatch is a mapping defect in a surface, not a second implementation. The cases that need no
+// database run over CLOSED stores (a pool on an unusable conninfo), which proves everything that
+// happens before or around the store; the [pg] cases drive both surfaces over live stores.
+// ═════════════════════════════════════════════════════════════════════════
+
+namespace {
+constexpr const char* kSam29Reads[] = {"list_software_lifecycle_rules",
+                                       "get_software_normalization_status",
+                                       "list_software_curation_queue"};
+constexpr const char* kSam29Writes[] = {"import_software_lifecycle_rules",
+                                        "delete_software_lifecycle_rules", "curate_software_alias",
+                                        "reject_software_curation",
+                                        "replace_software_normalization_pack"};
+
+const std::string kSam29Csv =
+    "product_key,version_prefix,event,date,source_reference\n"
+    "product:postgresql:postgresql,16,end_of_life,2028-11-09,ignored\n"
+    "product:postgresql:postgresql,,end_of_support,2027-01-01,ignored\n";
+
+// The alias body test_rest_software_curation.cpp curates over a live store.
+const std::string kSam29Alias =
+    R"({"ecosystem":"windows","raw_name":"Contoso Studio Standard","raw_publisher":"Contoso Ltd",)"
+    R"("vendor":"Contoso","product":"Studio","category":"other"})";
+
+const std::string kSam29LifecyclePath = "/api/v1/inventory/software/lifecycle/rules";
+const std::string kSam29CurationBase = "/api/v1/inventory/software/normalization";
+
+// A valid call of every tool: it passes every check up to the store.
+const std::vector<std::pair<std::string, std::string>>& sam29_valid_calls() {
+    static const std::vector<std::pair<std::string, std::string>> calls{
+        {"list_software_lifecycle_rules", "{}"},
+        {"import_software_lifecycle_rules",
+         nlohmann::json{{"name", "rules.csv"}, {"format", "csv"}, {"content", kSam29Csv}}.dump()},
+        {"delete_software_lifecycle_rules", "{}"},
+        {"get_software_normalization_status", "{}"},
+        {"list_software_curation_queue", "{}"},
+        {"curate_software_alias",
+         kSam29Alias},
+        {"reject_software_curation", R"({"key":"YWxwaGEfHxJwbQ"})"},
+        {"replace_software_normalization_pack",
+         nlohmann::json{{"content", std::string{yuzu::server::kSoftwareNormalizationSeed}}}.dump()}};
+    return calls;
+}
+
+bool sam29_is_write(std::string_view tool) {
+    return std::ranges::any_of(kSam29Writes, [&](const char* w) { return tool == w; });
+}
+
+// Audit rows the shared functions write under the REST verbs.
+std::size_t sam29_domain_audits(const McpTestServer& ts) {
+    return static_cast<std::size_t>(std::ranges::count_if(ts.audit_log, [](const std::string& e) {
+        return e.starts_with("software_estate.lifecycle_rules.") ||
+               e.starts_with("inventory.software.curation.");
+    }));
+}
+
+std::string sam29_rest_error(yuzu::server::test::TestRouteSink& sink, const std::string& method,
+                             const std::string& path, const std::string& body,
+                             const std::string& content_type) {
+    auto res = sink.dispatch(method, path, body, content_type);
+    REQUIRE(res != nullptr);
+    INFO(path << " -> " << res->status << " " << res->body);
+    const auto j = nlohmann::json::parse(res->body);
+    REQUIRE(j.contains("error"));
+    return j["error"]["message"].get<std::string>();
+}
+
+// Both stores closed, the REST routes over the same stores, and a server wired to them.
+struct Sam29Closed {
+    yuzu::server::pg::PgPool pool{{.conninfo = "=quohth4eeQu5 garbage =", .size = 1}};
+    yuzu::server::SoftwareLifecycleStore lifecycle{pool};
+    yuzu::server::ProductRegistryStore registry{pool};
+    yuzu::server::SoftwareLifecycleRoutes lifecycle_routes; // BEFORE the sinks that capture them
+    yuzu::server::SoftwareCurationRoutes curation_routes;
+    yuzu::server::test::TestRouteSink lifecycle_sink;
+    yuzu::server::test::TestRouteSink curation_sink;
+    McpTestServer ts;
+
+    Sam29Closed() {
+        REQUIRE_FALSE(lifecycle.is_open());
+        REQUIRE_FALSE(registry.is_open());
+        lifecycle_routes.register_routes(
+            lifecycle_sink,
+            yuzu::server::SoftwareLifecycleRoutes::Deps{
+                .perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
+                              const std::string&) { return true; },
+                .audit_fn = [](const httplib::Request&, const std::string&, const std::string&,
+                               const std::string&, const std::string&, const std::string&) {
+                    return true;
+                },
+                .store = &lifecycle});
+        curation_routes.register_routes(
+            curation_sink,
+            yuzu::server::SoftwareCurationRoutes::Deps{
+                .auth_fn = [](const httplib::Request&, httplib::Response&)
+                    -> std::optional<yuzu::server::auth::Session> {
+                    yuzu::server::auth::Session s;
+                    s.username = "rest-user";
+                    return s;
+                },
+                .perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
+                              const std::string&) { return true; },
+                .audit_fn = [](const httplib::Request&, const std::string&, const std::string&,
+                               const std::string&, const std::string&, const std::string&) {
+                    return true;
+                },
+                .registry = &registry});
+        ts.software_lifecycle_store_for_test = &lifecycle;
+        ts.product_registry_store_for_test = &registry;
+    }
+};
+
+nlohmann::json sam29_import_args(const std::string& name = "rules.csv") {
+    return nlohmann::json{{"name", name}, {"format", "csv"}, {"content", kSam29Csv}};
+}
+} // namespace
+
+TEST_CASE("MCP SAM-29 tools: tools/list advertises all eight, classified and typed",
+          "[mcp][inventory][software]") {
+    McpTestServer ts;
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    REQUIRE(res != nullptr);
+    const auto tools = nlohmann::json::parse(res->body)["result"]["tools"];
+    const std::map<std::string, nlohmann::json> required{
+        {"import_software_lifecycle_rules", nlohmann::json::array({"name", "format", "content"})},
+        {"curate_software_alias",
+         nlohmann::json::array({"ecosystem", "raw_name", "vendor", "product"})},
+        {"reject_software_curation", nlohmann::json::array({"key"})},
+        {"replace_software_normalization_pack", nlohmann::json::array({"content"})}};
+    int found = 0;
+    for (const auto& t : tools) {
+        const auto name = t["name"].get<std::string>();
+        const bool is_write = sam29_is_write(name);
+        const bool is_read = std::ranges::find(kSam29Reads, name) != std::end(kSam29Reads);
+        if (!is_write && !is_read)
+            continue;
+        ++found;
+        INFO(name);
+        CHECK(t["annotations"]["readOnlyHint"] == !is_write);
+        CHECK(t["annotations"]["destructiveHint"] == is_write);
+        // delete and reject are idempotent; import, curate and the pack replace are not.
+        const bool idempotent = !is_write || name == "delete_software_lifecycle_rules" ||
+                                name == "reject_software_curation";
+        CHECK(t["annotations"]["idempotentHint"] == idempotent);
+        CHECK(t["inputSchema"]["additionalProperties"] == false);
+        CHECK_FALSE(t["outputSchema"]["properties"].empty());
+        CHECK(t["outputSchema"]["properties"].contains("audit_persisted"));
+        CHECK(t["description"].get<std::string>().size() < 4096);
+        // Every string argument is bounded.
+        for (const auto& [key, prop] : t["inputSchema"]["properties"].items()) {
+            INFO(key);
+            if (prop["type"] == "string")
+                CHECK(prop.contains("maxLength"));
+        }
+        const auto req = required.find(name);
+        if (req != required.end())
+            CHECK(t["inputSchema"]["required"] == req->second);
+        else
+            CHECK_FALSE(t["inputSchema"].contains("required"));
+        if (name == "import_software_lifecycle_rules")
+            CHECK(t["inputSchema"]["properties"]["content"]["maxLength"] == 4194304);
+        if (name == "replace_software_normalization_pack")
+            CHECK(t["inputSchema"]["properties"]["content"]["maxLength"] == 1048576);
+        if (name == "reject_software_curation")
+            CHECK(t["inputSchema"]["properties"]["key"]["maxLength"] == 3204);
+    }
+    CHECK(found == 8);
+}
+
+TEST_CASE("MCP SAM-29 tools: the orientation families cover all eight",
+          "[mcp][inventory][software]") {
+    for (const auto& [tool, args] : sam29_valid_calls()) {
+        INFO(tool);
+        bool covered = false;
+        for (const auto& fam : yuzu::server::mcp::tool_families())
+            covered = covered ||
+                      std::ranges::find(fam.tools, std::string_view{tool}) != fam.tools.end();
+        CHECK(covered);
+    }
+}
+
+TEST_CASE("MCP SAM-29 tools: an unwired store is an internal error with no retry hint",
+          "[mcp][inventory][software]") {
+    McpTestServer ts; // no lifecycle store, no registry
+    ts.start();
+    for (const auto& [tool, args] : sam29_valid_calls()) {
+        auto body = mcp_tool_call(ts, tool, args);
+        INFO(tool << " -> " << body.dump());
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+        // Wired once at construction: permanent, so the envelope carries no hint at all.
+        CHECK_FALSE(body["error"].contains("data"));
+    }
+    CHECK(sam29_domain_audits(ts) == 0);
+}
+
+TEST_CASE("MCP SAM-29 tools: the tier ladder refuses the writes below supervised and asks for no ticket",
+          "[mcp][inventory][software][security]") {
+    for (const char* tier : {"readonly", "operator", "supervised"}) {
+        INFO(tier);
+        McpTestServer ts; // stores unwired: a call that passes every gate answers the store arm
+        ts.start(tier);
+        for (const auto& [tool, args] : sam29_valid_calls()) {
+            auto body = mcp_tool_call(ts, tool, args);
+            INFO(tool << " -> " << body.dump());
+            REQUIRE(body.contains("error"));
+            const bool refused_by_tier = sam29_is_write(tool) && std::string{tier} != "supervised";
+            if (refused_by_tier)
+                CHECK(body["error"]["code"] == yuzu::server::mcp::kTierDenied);
+            else // served at this tier: it reached the handler, with no approval ticket
+                CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+        }
+        CHECK(sam29_domain_audits(ts) == 0);
+    }
+}
+
+TEST_CASE("MCP SAM-29 tools: a caller without the global Inventory grant is refused on every tool",
+          "[mcp][inventory][software][security]") {
+    Sam29Closed rig;
+    rig.ts.perm_override_for_test = [](const std::string& securable, const std::string&) {
+        return securable != "Inventory";
+    };
+    rig.ts.start();
+    for (const auto& [tool, args] : sam29_valid_calls()) {
+        auto res = rig.ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":9,"params":{"name":")" +
+                               tool + R"(","arguments":)" + args + "}}");
+        REQUIRE(res != nullptr);
+        INFO(tool << " -> " << res->status << " " << res->body);
+        bool refused = res->status == 403;
+        if (!refused) {
+            const auto body = nlohmann::json::parse(res->body);
+            refused = body.contains("error") &&
+                      body["error"]["code"] == yuzu::server::mcp::kPermissionDenied;
+        }
+        CHECK(refused);
+    }
+    CHECK(sam29_domain_audits(rig.ts) == 0); // nothing past the gate
+}
+
+TEST_CASE("MCP SAM-29 tools: a service-scoped token is refused at the generic gate on every tool",
+          "[mcp][inventory][software][security][service_scope]") {
+    for (const char* tier : {"readonly", "supervised"}) {
+        INFO(tier);
+        Sam29Closed rig;
+        rig.ts.mock_token_scope_service = "printers";
+        rig.ts.start(tier);
+        for (const auto& [tool, args] : sam29_valid_calls()) {
+            auto body = mcp_tool_call(rig.ts, tool, args);
+            INFO(tool << " -> " << body.dump());
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+        }
+        CHECK(sam29_domain_audits(rig.ts) == 0);
+    }
+}
+
+TEST_CASE("MCP SAM-29 tools: strict arguments are -32602 and reach nothing",
+          "[mcp][inventory][software]") {
+    Sam29Closed rig;
+    rig.ts.start();
+    const std::string long_name(129, 'a');
+    const std::string long_field(257, 'a');
+    const std::string long_cursor(3237, 'a');
+    const std::string long_key(3205, 'a');
+    const std::vector<std::pair<std::string, std::string>> bad{
+        {"list_software_lifecycle_rules", R"({"x":1})"},
+        {"list_software_lifecycle_rules", R"({"source":5})"},
+        {"import_software_lifecycle_rules",
+         nlohmann::json{{"name", long_name}, {"format", "csv"}, {"content", "x"}}.dump()},
+        {"import_software_lifecycle_rules", R"({"name":"r","format":"csv","content":5})"},
+        {"import_software_lifecycle_rules",
+         R"({"name":"r","format":"csv","content":"x","extra":1})"},
+        {"import_software_lifecycle_rules",
+         nlohmann::json{{"name", "r"}, {"format", "csv"}, {"content", std::string(4194305, 'a')}}
+             .dump()},
+        {"import_software_lifecycle_rules", R"({"name":"r","format":"csv"})"},
+        {"delete_software_lifecycle_rules", R"({"x":1})"},
+        {"get_software_normalization_status", R"({"x":1})"},
+        {"list_software_curation_queue", R"({"limit":0})"},
+        {"list_software_curation_queue", R"({"limit":501})"},
+        {"list_software_curation_queue", R"({"limit":"5"})"},
+        {"list_software_curation_queue", R"({"status":5})"},
+        {"list_software_curation_queue", nlohmann::json{{"cursor", long_cursor}}.dump()},
+        {"curate_software_alias",
+         nlohmann::json{{"ecosystem", "windows"},
+                        {"raw_name", long_field},
+                        {"vendor", "v"},
+                        {"product", "p"}}
+             .dump()},
+        {"curate_software_alias",
+         R"({"ecosystem":"windows","raw_name":"a","vendor":"v","product":"p","x":1})"},
+        {"curate_software_alias",
+         R"({"ecosystem":"windows","raw_name":"a","vendor":"v","product":5})"},
+        {"reject_software_curation", nlohmann::json{{"key", long_key}}.dump()},
+        {"reject_software_curation", R"({"key":5})"},
+        {"reject_software_curation", "{}"},
+        {"replace_software_normalization_pack", R"({"content":5})"},
+        {"replace_software_normalization_pack", "{}"}};
+    for (const auto& [tool, args] : bad) {
+        auto body = mcp_tool_call(rig.ts, tool, args);
+        INFO(tool << " -> " << body.dump().substr(0, 300));
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    }
+    CHECK(sam29_domain_audits(rig.ts) == 0);
+}
+
+TEST_CASE("MCP SAM-29 import: a bad name, format or file is refused with the REST message and a "
+          "denied row, and nothing is stored",
+          "[mcp][inventory][software]") {
+    Sam29Closed rig;
+    rig.ts.start();
+    const auto refuse = [&](const nlohmann::json& args, const std::string& expected) {
+        const auto before =
+            mcp_audits(rig.ts, "software_estate.lifecycle_rules.import|denied");
+        auto body = mcp_tool_call(rig.ts, "import_software_lifecycle_rules", args.dump());
+        INFO(args.dump().substr(0, 200) << " -> " << body.dump().substr(0, 300));
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(body["error"]["message"] == expected);
+        CHECK(mcp_audits(rig.ts, "software_estate.lifecycle_rules.import|denied") == before + 1);
+        CHECK(mcp_audits(rig.ts, "software_estate.lifecycle_rules.import|requested") == 0);
+    };
+    refuse({{"name", ""}, {"format", "csv"}, {"content", kSam29Csv}}, "name must be 1 to 128 bytes");
+    refuse({{"name", "a\tb"}, {"format", "csv"}, {"content", kSam29Csv}},
+           "name must not contain control characters");
+    refuse({{"name", "r.csv"}, {"format", "xml"}, {"content", kSam29Csv}},
+           "format must be csv or cle");
+    // A missing name or format is the same refusal as REST's exactly-once rule.
+    refuse({{"format", "csv"}, {"content", kSam29Csv}}, "name is required exactly once");
+    refuse({{"name", "r.csv"}, {"content", kSam29Csv}}, "format must be csv or cle");
+
+    // A parse refusal carries the parser's own reason: the one REST answers for the same file.
+    const std::string rubbish = "this is not a lifecycle rule file";
+    const auto rest_reason = sam29_rest_error(
+        rig.lifecycle_sink, "POST", kSam29LifecyclePath + "?format=csv&name=r.csv", rubbish, "text/csv");
+    refuse({{"name", "r.csv"}, {"format", "csv"}, {"content", rubbish}}, rest_reason);
+}
+
+TEST_CASE("MCP SAM-29 lifecycle tools: a closed store is a retryable error before any audit row",
+          "[mcp][inventory][software]") {
+    Sam29Closed rig;
+    rig.ts.start();
+    for (const auto& [tool, args] : sam29_valid_calls()) {
+        if (std::string_view{tool}.find("lifecycle") == std::string_view::npos)
+            continue;
+        auto body = mcp_tool_call(rig.ts, tool, args);
+        INFO(tool << " -> " << body.dump());
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+        CHECK(body["error"]["message"] == "software lifecycle store not available");
+        CHECK(body["error"]["data"]["retry_after_ms"] == 2000);
+    }
+    // The list refuses an unknown source before the store, with the REST text and a denied row.
+    auto bad = mcp_tool_call(rig.ts, "list_software_lifecycle_rules", R"({"source":"declared"})");
+    REQUIRE(bad.contains("error"));
+    CHECK(bad["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(bad["error"]["message"] == "source must be imported, shipped or external");
+    CHECK(mcp_audits(rig.ts, "software_estate.lifecycle_rules.read|denied") == 1);
+    // No `requested` row exists for a write the store could not take.
+    CHECK(mcp_audits(rig.ts, "software_estate.lifecycle_rules.import|requested") == 0);
+    CHECK(mcp_audits(rig.ts, "software_estate.lifecycle_rules.delete|requested") == 0);
+}
+
+TEST_CASE("MCP SAM-29 curation tools: the refusals are the REST texts, audited denied, and write "
+          "nothing",
+          "[mcp][inventory][software]") {
+    Sam29Closed rig;
+    rig.ts.start();
+    const auto refuse = [&](const std::string& tool, const nlohmann::json& args,
+                            const std::string& verb, const std::string& expected) {
+        const auto before = mcp_audits(rig.ts, verb + "|denied");
+        auto body = mcp_tool_call(rig.ts, tool, args.dump());
+        INFO(tool << " " << args.dump().substr(0, 200) << " -> " << body.dump().substr(0, 300));
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(body["error"]["message"] == expected);
+        CHECK(mcp_audits(rig.ts, verb + "|denied") == before + 1);
+        CHECK(mcp_audits(rig.ts, verb + "|requested") == 0);
+    };
+    const std::string alias = "inventory.software.curation.alias";
+    refuse("curate_software_alias",
+           {{"ecosystem", "windows"}, {"raw_name", "A"}, {"product", "P"}}, alias,
+           "vendor is required");
+    refuse("curate_software_alias",
+           {{"ecosystem", "nonesuch"}, {"raw_name", "A"}, {"vendor", "V"}, {"product", "P"}}, alias,
+           "unknown ecosystem");
+    refuse("curate_software_alias",
+           {{"ecosystem", "windows"},
+            {"raw_name", "A"},
+            {"vendor", "V"},
+            {"product", "P"},
+            {"category", "bogus"}},
+           alias, "unknown category");
+    refuse("curate_software_alias",
+           {{"ecosystem", "windows"},
+            {"raw_name", "A"},
+            {"vendor", "V"},
+            {"product", "P"},
+            {"cpe_product", "-"}},
+           alias, "cpe_product has an invalid character or is a reserved value");
+    // The same refusal text REST gives for the same field.
+    const auto rest_vendor = sam29_rest_error(
+        rig.curation_sink, "POST", kSam29CurationBase + "/aliases",
+        R"({"ecosystem":"windows","raw_name":"A","product":"P"})", "application/json");
+    CHECK(rest_vendor == "vendor is required");
+
+    refuse("reject_software_curation", {{"key", "bad!!"}}, "inventory.software.curation.reject",
+           "invalid queue key");
+
+    // A pack the parser refuses carries the parser's reason, as REST answers it.
+    const auto rest_pack = sam29_rest_error(rig.curation_sink, "POST",
+                                            kSam29CurationBase + "/pack", "x", "text/csv");
+    refuse("replace_software_normalization_pack", {{"content", "x"}},
+           "inventory.software.curation.pack", rest_pack);
+}
+
+TEST_CASE("MCP SAM-29 curation tools: a degraded store is a retryable error, and a write's requested "
+          "row precedes the store call",
+          "[mcp][inventory][software]") {
+    Sam29Closed rig;
+    rig.ts.start();
+    const auto fails = [&](const std::string& tool, const std::string& args,
+                           const std::string& message) {
+        auto body = mcp_tool_call(rig.ts, tool, args);
+        INFO(tool << " -> " << body.dump().substr(0, 300));
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+        CHECK(body["error"]["message"] == message);
+        CHECK(body["error"]["data"]["retry_after_ms"] == 5000);
+    };
+    // Reads: a degraded read is never an empty success.
+    fails("get_software_normalization_status", "{}", "normalisation status read degraded");
+    fails("list_software_curation_queue", "{}", "curation queue read degraded");
+    CHECK(sam29_domain_audits(rig.ts) == 0); // an admitted read writes no domain row
+
+    const auto key = *yuzu::server::curation_keys::encode_key({"alpha", "", "rpm"});
+    const std::vector<std::tuple<std::string, std::string, std::string, std::string>> writes{
+        {"curate_software_alias",
+         kSam29Alias,
+         "inventory.software.curation.alias", "curation write failed"},
+        {"reject_software_curation", nlohmann::json{{"key", key}}.dump(),
+         "inventory.software.curation.reject", "curation write failed"},
+        {"replace_software_normalization_pack",
+         nlohmann::json{{"content", std::string{yuzu::server::kSoftwareNormalizationSeed}}}.dump(),
+         "inventory.software.curation.pack", "pack replace failed"}};
+    for (const auto& [tool, args, verb, write_failure] : writes) {
+        INFO(tool);
+        // The row is stored, then the (closed) store fails the write.
+        fails(tool, args, write_failure);
+        CHECK(mcp_audits(rig.ts, verb + "|requested") == 1);
+        // A row that cannot be stored refuses the call before the store is reached: the message
+        // names which arm answered.
+        rig.ts.audit_fail_action_result_ = verb + "|requested";
+        fails(tool, args, "audit subsystem unavailable - request not served");
+        CHECK(mcp_audits(rig.ts, verb + "|requested") == 2);
+        rig.ts.audit_fail_action_result_.clear();
+    }
+}
+
+// ── The twins over live stores (Postgres) ─────────────────────────────────────
+
+namespace {
+// Same name and setup as test_software_lifecycle_routes.cpp and test_rest_software_curation.cpp:
+// PgTestTemplate is keyed by name, so a byte-identical setup is built once and reused across TUs.
+yuzu::test::PgTestTemplate sam29_lifecycle_tpl{"lifecycleroutes", [](const std::string& dsn) {
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    yuzu::server::SoftwareLifecycleStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("lifecycle routes template: store failed to migrate");
+}};
+
+yuzu::test::PgTestTemplate sam29_registry_tpl{"prodreg", [](const std::string& dsn) {
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    yuzu::server::ProductRegistryStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("prodreg template: store failed to migrate");
+}};
+
+struct Sam29Lifecycle {
+    yuzu::server::pg::PgPool pool;
+    yuzu::server::SoftwareLifecycleStore store{pool};
+    yuzu::server::SoftwareLifecycleRoutes routes; // BEFORE the sink that holds handlers capturing it
+    yuzu::server::test::TestRouteSink sink;
+    McpTestServer ts;
+
+    explicit Sam29Lifecycle(const std::string& dsn)
+        : pool(yuzu::server::pg::PgPool::Options{.conninfo = dsn, .size = 2}) {
+        REQUIRE(store.is_open());
+        routes.register_routes(
+            sink, yuzu::server::SoftwareLifecycleRoutes::Deps{
+                      .perm_fn = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&) { return true; },
+                      .audit_fn = [](const httplib::Request&, const std::string&,
+                                     const std::string&, const std::string&, const std::string&,
+                                     const std::string&) { return true; },
+                      .store = &store});
+        ts.software_lifecycle_store_for_test = &store;
+        ts.start();
+    }
+    nlohmann::json mcp_data(const std::string& tool, const std::string& args) {
+        auto body = mcp_tool_call(ts, tool, args);
+        INFO(tool << " " << args.substr(0, 200) << " -> " << body.dump().substr(0, 300));
+        REQUIRE_FALSE(body.contains("error"));
+        return body["result"]["structuredContent"];
+    }
+    nlohmann::json rest_data(const std::string& method, const std::string& path,
+                             const std::string& body = {}) {
+        auto res = sink.dispatch(method, path, body, "text/csv");
+        REQUIRE(res != nullptr);
+        INFO(path << " -> " << res->status << " " << res->body);
+        REQUIRE(res->status == 200);
+        return nlohmann::json::parse(res->body)["data"];
+    }
+    std::vector<yuzu::server::LifecycleRule> imported() {
+        auto rules = store.rules_of(yuzu::server::LifecycleSource::imported);
+        REQUIRE(rules.has_value());
+        return *rules;
+    }
+};
+
+struct Sam29Curation {
+    yuzu::server::pg::PgPool pool;
+    yuzu::server::ProductRegistryStore store{pool};
+    yuzu::server::SoftwareCurationRoutes routes; // BEFORE the sink that holds handlers capturing it
+    yuzu::server::test::TestRouteSink sink;
+    McpTestServer ts;
+
+    explicit Sam29Curation(const std::string& dsn)
+        : pool(yuzu::server::pg::PgPool::Options{.conninfo = dsn, .size = 4}) {
+        REQUIRE(store.is_open());
+        routes.register_routes(
+            sink, yuzu::server::SoftwareCurationRoutes::Deps{
+                      .auth_fn = [](const httplib::Request&, httplib::Response&)
+                          -> std::optional<yuzu::server::auth::Session> {
+                          yuzu::server::auth::Session s;
+                          s.username = "rest-user";
+                          return s;
+                      },
+                      .perm_fn = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&) { return true; },
+                      .audit_fn = [](const httplib::Request&, const std::string&,
+                                     const std::string&, const std::string&, const std::string&,
+                                     const std::string&) { return true; },
+                      .registry = &store});
+        ts.product_registry_store_for_test = &store;
+        ts.start();
+    }
+    nlohmann::json mcp_data(const std::string& tool, const std::string& args = "{}") {
+        auto body = mcp_tool_call(ts, tool, args);
+        INFO(tool << " " << args.substr(0, 200) << " -> " << body.dump().substr(0, 300));
+        REQUIRE_FALSE(body.contains("error"));
+        return body["result"]["structuredContent"];
+    }
+    nlohmann::json rest_data(const std::string& method, const std::string& path,
+                             int expected_status, const std::string& body = {},
+                             const std::string& content_type = "application/json") {
+        auto res = sink.dispatch(method, path, body, content_type);
+        REQUIRE(res != nullptr);
+        INFO(path << " -> " << res->status << " " << res->body);
+        REQUIRE(res->status == expected_status);
+        return nlohmann::json::parse(res->body)["data"];
+    }
+    std::string count(const char* sql) {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto r = yuzu::server::pg::exec_params(lease.get(), sql, std::vector<std::string>{});
+        REQUIRE(r.status() == PGRES_TUPLES_OK);
+        return std::string{PQgetvalue(r.get(), 0, 0)};
+    }
+    void queue_row(const std::string& raw_name) {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto r = yuzu::server::pg::exec_params(
+            lease.get(),
+            "INSERT INTO product_registry_store.curation_queue VALUES ($1, '', 'rpm', 4, 'open', "
+            "1, 2)",
+            std::vector<std::string>{raw_name});
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    }
+};
+
+std::ptrdiff_t sam29_audit_index(const McpTestServer& ts, const std::string& entry) {
+    const auto it = std::ranges::find(ts.audit_log, entry);
+    return it == ts.audit_log.end() ? -1 : it - ts.audit_log.begin();
+}
+} // namespace
+
+TEST_CASE("MCP SAM-29 lifecycle: the payloads equal the REST routes' data, with the domain rows "
+          "in order",
+          "[mcp][pg][inventory][software]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, sam29_lifecycle_tpl);
+    Sam29Lifecycle rig{db.dsn()};
+
+    const auto mcp_import =
+        rig.mcp_data("import_software_lifecycle_rules", sam29_import_args().dump());
+    const auto rest_import = rig.rest_data(
+        "POST", kSam29LifecyclePath + "?format=csv&name=rules.csv", kSam29Csv);
+    CHECK(mcp_import == rest_import);
+    CHECK(mcp_import["stored"] == 2);
+    CHECK(mcp_import["replaced"] == true);
+    CHECK(mcp_import["source_reference"] == "rules.csv");
+    CHECK_FALSE(mcp_import.contains("audit_persisted"));
+    // The `requested` row precedes the outcome row, and the generic row follows both.
+    const auto requested =
+        sam29_audit_index(rig.ts, "software_estate.lifecycle_rules.import|requested");
+    const auto outcome =
+        sam29_audit_index(rig.ts, "software_estate.lifecycle_rules.import|success");
+    const auto generic = sam29_audit_index(rig.ts, "mcp.import_software_lifecycle_rules|success");
+    CHECK(requested >= 0);
+    CHECK(requested < outcome);
+    CHECK(outcome < generic);
+
+    for (const char* source : {"imported", "shipped", "external"}) {
+        INFO(source);
+        CHECK(rig.mcp_data("list_software_lifecycle_rules",
+                           nlohmann::json{{"source", source}}.dump()) ==
+              rig.rest_data("GET", kSam29LifecyclePath + "?source=" + source));
+    }
+    CHECK(rig.mcp_data("list_software_lifecycle_rules", "{}") ==
+          rig.rest_data("GET", kSam29LifecyclePath));
+    CHECK(rig.mcp_data("list_software_lifecycle_rules", "{}")["count"] == 2);
+
+    // The delete answers the count it cleared, then 0.
+    CHECK(rig.mcp_data("delete_software_lifecycle_rules", "{}") == nlohmann::json{{"removed", 2}});
+    CHECK(rig.imported().empty());
+    CHECK(rig.mcp_data("delete_software_lifecycle_rules", "{}") == nlohmann::json{{"removed", 0}});
+    CHECK(mcp_audits(rig.ts, "software_estate.lifecycle_rules.delete|requested") == 2);
+    CHECK(mcp_audits(rig.ts, "software_estate.lifecycle_rules.delete|success") == 2);
+}
+
+TEST_CASE("MCP SAM-29 lifecycle: a requested row that cannot be stored refuses the write and writes "
+          "nothing; a lost outcome row serves the result with audit_persisted false",
+          "[mcp][pg][inventory][software]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, sam29_lifecycle_tpl);
+    Sam29Lifecycle rig{db.dsn()};
+    rig.mcp_data("import_software_lifecycle_rules", sam29_import_args("kept.csv").dump());
+    REQUIRE(rig.imported().size() == 2);
+
+    const auto refused = [&](const std::string& tool, const std::string& args) {
+        auto body = mcp_tool_call(rig.ts, tool, args);
+        INFO(tool << " -> " << body.dump().substr(0, 300));
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+        CHECK(body["error"]["message"] == "audit subsystem unavailable - request not served");
+        CHECK(body["error"]["data"]["retry_after_ms"] == 5000);
+    };
+    rig.ts.audit_fail_action_result_ = "software_estate.lifecycle_rules.import|requested";
+    refused("import_software_lifecycle_rules", sam29_import_args("new.csv").dump());
+    rig.ts.audit_fail_action_result_ = "software_estate.lifecycle_rules.delete|requested";
+    refused("delete_software_lifecycle_rules", "{}");
+    // The stored set is exactly what the first import left.
+    const auto kept = rig.imported();
+    REQUIRE(kept.size() == 2);
+    CHECK(kept[0].source_ref == "kept.csv");
+
+    // The outcome row is lost after the write landed: served, flagged.
+    rig.ts.audit_fail_action_result_ = "software_estate.lifecycle_rules.import|success";
+    const auto flagged =
+        rig.mcp_data("import_software_lifecycle_rules", sam29_import_args("next.csv").dump());
+    CHECK(flagged["audit_persisted"] == false);
+    CHECK(flagged["stored"] == 2);
+    CHECK(rig.imported()[0].source_ref == "next.csv");
+
+    // The generic mcp.<tool> row lost: the same flag.
+    rig.ts.audit_fail_action_result_ = "mcp.delete_software_lifecycle_rules|success";
+    const auto cleared = rig.mcp_data("delete_software_lifecycle_rules", "{}");
+    CHECK(cleared["audit_persisted"] == false);
+    CHECK(cleared["removed"] == 2);
+    CHECK(rig.imported().empty());
+}
+
+TEST_CASE("MCP SAM-29 curation: the reads and the queue equal the REST routes' data",
+          "[mcp][pg][inventory][software]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, sam29_registry_tpl);
+    Sam29Curation rig{db.dsn()};
+    const std::string base = kSam29CurationBase;
+
+    CHECK(rig.mcp_data("get_software_normalization_status") ==
+          rig.rest_data("GET", base + "/status", 200));
+    CHECK(rig.mcp_data("list_software_curation_queue") ==
+          rig.rest_data("GET", base + "/queue", 200));
+    CHECK(sam29_domain_audits(rig.ts) == 0); // admitted reads are never audited
+
+    rig.queue_row("alpha");
+    rig.queue_row("beta");
+    const auto page1 = rig.mcp_data("list_software_curation_queue", R"({"limit":1})");
+    CHECK(page1 == rig.rest_data("GET", base + "/queue?limit=1", 200));
+    REQUIRE(page1["items"].size() == 1);
+    CHECK(page1["items"][0]["raw_name"] == "alpha");
+    REQUIRE(page1["next_cursor"].is_string());
+    // The cursor from one surface walks the other.
+    const auto cursor = page1["next_cursor"].get<std::string>();
+    const auto page2 = rig.mcp_data(
+        "list_software_curation_queue", nlohmann::json{{"limit", 1}, {"cursor", cursor}}.dump());
+    CHECK(page2 == rig.rest_data("GET", base + "/queue?limit=1&cursor=" + cursor, 200));
+    CHECK(page2["items"][0]["raw_name"] == "beta");
+    CHECK(page2["next_cursor"].is_null());
+
+    // Reject through the key: served, audited ahead of the write, then not found, as REST answers.
+    const auto key = page1["items"][0]["key"].get<std::string>();
+    CHECK(rig.mcp_data("reject_software_curation", nlohmann::json{{"key", key}}.dump()) ==
+          nlohmann::json{{"rejected", true}});
+    CHECK(sam29_audit_index(rig.ts, "inventory.software.curation.reject|requested") >= 0);
+    CHECK(sam29_audit_index(rig.ts, "inventory.software.curation.reject|requested") <
+          sam29_audit_index(rig.ts, "mcp.reject_software_curation|success"));
+    auto again = mcp_tool_call(rig.ts, "reject_software_curation", nlohmann::json{{"key", key}}.dump());
+    REQUIRE(again.contains("error"));
+    CHECK(again["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(again["error"]["message"] ==
+          sam29_rest_error(rig.sink, "POST", base + "/queue/" + key + "/reject", "",
+                           "application/json"));
+    CHECK(again["error"]["message"] == "no open queue entry for that key");
+    CHECK(rig.mcp_data("list_software_curation_queue", R"({"status":"rejected"})") ==
+          rig.rest_data("GET", base + "/queue?status=rejected", 200));
+    CHECK(rig.mcp_data("list_software_curation_queue", R"({"status":"all"})")["count"] == 2);
+}
+
+TEST_CASE("MCP SAM-29 curation: the writes equal the REST routes' data and errors",
+          "[mcp][pg][inventory][software]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, sam29_registry_tpl);
+    Sam29Curation rig{db.dsn()};
+    const std::string base = kSam29CurationBase;
+    const std::string& alias = kSam29Alias;
+
+    // The same title curated through both surfaces binds the same product.
+    const auto mcp_alias = rig.mcp_data("curate_software_alias", alias);
+    CHECK(mcp_alias == rig.rest_data("POST", base + "/aliases", 201, alias));
+    CHECK(mcp_alias["alias_source"] == "curated:windows");
+    CHECK(mcp_alias["alias_key"] == "contoso studio standard");
+    CHECK(sam29_audit_index(rig.ts, "inventory.software.curation.alias|requested") <
+          sam29_audit_index(rig.ts, "mcp.curate_software_alias|success"));
+
+    // The pack: replaced, then the same version is refused with REST's 409 text.
+    const std::string csv{yuzu::server::kSoftwareNormalizationSeed};
+    const auto replaced = rig.mcp_data("replace_software_normalization_pack",
+                                       nlohmann::json{{"content", csv}}.dump());
+    CHECK(replaced["pack_version"].is_string());
+    CHECK(replaced["sha256"].is_string());
+    CHECK(rig.mcp_data("get_software_normalization_status")["pack_version"] ==
+          replaced["pack_version"]);
+    auto same = mcp_tool_call(rig.ts, "replace_software_normalization_pack",
+                              nlohmann::json{{"content", csv}}.dump());
+    REQUIRE(same.contains("error"));
+    CHECK(same["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(same["error"]["message"] ==
+          sam29_rest_error(rig.sink, "POST", base + "/pack", csv, "text/csv"));
+    CHECK(same["error"]["message"] ==
+          "the stored pack already has version " + replaced["pack_version"].get<std::string>());
+}
+
+TEST_CASE("MCP SAM-29 curation: a requested row that cannot be stored leaves the stores untouched",
+          "[mcp][pg][inventory][software]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, sam29_registry_tpl);
+    Sam29Curation rig{db.dsn()};
+    rig.queue_row("alpha");
+    const auto key = *yuzu::server::curation_keys::encode_key({"alpha", "", "rpm"});
+    const auto refused = [&](const std::string& tool, const std::string& args,
+                             const std::string& verb) {
+        rig.ts.audit_fail_action_result_ = verb + "|requested";
+        auto body = mcp_tool_call(rig.ts, tool, args);
+        rig.ts.audit_fail_action_result_.clear();
+        INFO(tool << " -> " << body.dump().substr(0, 300));
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+        CHECK(body["error"]["message"] == "audit subsystem unavailable - request not served");
+        CHECK(body["error"]["data"]["retry_after_ms"] == 5000);
+    };
+    refused("curate_software_alias",
+            kSam29Alias,
+            "inventory.software.curation.alias");
+    refused("replace_software_normalization_pack",
+            nlohmann::json{{"content", std::string{yuzu::server::kSoftwareNormalizationSeed}}}.dump(),
+            "inventory.software.curation.pack");
+    refused("reject_software_curation", nlohmann::json{{"key", key}}.dump(),
+            "inventory.software.curation.reject");
+    CHECK(rig.count("SELECT count(*) FROM product_registry_store.products") == "0");
+    CHECK(rig.count("SELECT count(*) FROM product_registry_store.product_aliases") == "0");
+    CHECK(rig.mcp_data("get_software_normalization_status")["queue_open"] == 1);
+
+    // With the row storable, the same calls land.
+    rig.mcp_data("curate_software_alias",
+                 kSam29Alias);
+    CHECK(rig.count("SELECT count(*) FROM product_registry_store.products") == "1");
+    CHECK(rig.mcp_data("reject_software_curation", nlohmann::json{{"key", key}}.dump()) ==
+          nlohmann::json{{"rejected", true}});
+    CHECK(rig.mcp_data("get_software_normalization_status")["queue_open"] == 0);
 }
