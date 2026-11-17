@@ -98,17 +98,17 @@ scenario("setcap missing while the binary carries caps (N1)", 5, getcap="caps", 
 scenario("getcap missing AND setcap missing: cannot verify (N1)", 5, getcap="missing", setcap=False)
 scenario("setcap present but the capability stays live", 5, getcap="caps")  # stub setcap is a no-op
 scenario("visudo rejects the file (R1)", 3, visudo_ok=False)
-d, sud, _ = scenario("visudo rejects and an old glob file exists (R1)", 3, visudo_ok=False,
+d, sud, _ = scenario("visudo rejects and a glob-carrying file exists (R1)", 3, visudo_ok=False,
                      old_sudoers=True)
 if sud.exists():
-    errs.append("a failed sudoers validation left the previous glob-carrying file in place")
+    errs.append("a failed sudoers validation left the existing glob-carrying file in place")
 scenario("wrapper install fails (N-WRAPEXIT)", 4, wrapper_install_ok=False)
 d, sud, _ = scenario("wrapper install fails: no systemctl grant is written", 4,
                      wrapper_install_ok=False)
 if sud.exists() and "yuzu-systemctl" in sud.read_text():
     errs.append("a failed wrapper install still wrote the wrapper grant")
 
-# ── --check: drift must be a non-zero exit (the case used to fall through to exit 0) ────────
+# ── --check: drift must be a non-zero exit (the case must not fall through to exit 0) ────────
 good = ("yuzu_t ALL=(root) NOPASSWD: {W}\n")
 scenario("check: getcap missing is drift (R2)", "nonzero", check=True, getcap="missing",
          sudoers_content="x\n")
@@ -209,7 +209,7 @@ mkdir -p "$(dirname "$last")" 2>/dev/null; cp "$s" "$last" 2>/dev/null; chmod 75
 # --check on a healthy layout MUST exit 0 (a GNU `stat -f` made it always 1), drift MUST exit 1
 run_script("check healthy linux => 0", 0, ["--check"], layout="healthy")
 run_script("check healthy macos => 0", 0, ["--check"], layout="healthy", platform="Darwin")
-run_script("check: old glob grant => 1", 1, ["--check"], layout="old_glob")
+run_script("check: glob grant => 1", 1, ["--check"], layout="old_glob")
 run_script("check: missing wrapper => 1", 1, ["--check"], layout="no_wrapper")
 run_script("check: wrapper grant absent => 1", 1, ["--check"], layout="no_wrapper_grant")
 run_script("check: caps present => 1", 1, ["--check"], layout="healthy", getcap="caps")
@@ -273,9 +273,9 @@ _, _, r = run_script("install --no-cap-cleanup with live caps => 0 but LOUD on s
                      ["--no-cap-cleanup"], getcap="caps")
 if "STILL LIVE" not in r.stderr:
     errs.append("--no-cap-cleanup with live capabilities must warn on stderr")
-_, _, r = run_script("install --no-setcap is accepted with a deprecation warning", 0, ["--no-setcap"])
-if "deprecated alias" not in r.stderr:
-    errs.append("--no-setcap must print the deprecation warning (it used to be emitted before warn() existed)")
+_, _, r = run_script("install --no-setcap is an unknown flag (exit 2)", 2, ["--no-setcap"])
+if "unknown arg" not in r.stderr:
+    errs.append("--no-setcap must be rejected as an unknown arg")
 # SOURCE_ONLY set on an EXECUTED script must not silently exit 0
 d, root, r = run_script("executed with SOURCE_ONLY still runs (no silent no-op)", 3, [],
                         visudo_ok=False, extra_env={"YUZU_INSTALLER_SOURCE_ONLY": "1"})

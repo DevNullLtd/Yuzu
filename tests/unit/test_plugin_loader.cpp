@@ -621,8 +621,7 @@ TEST_CASE("load_plugin_allowlist: wrong-format content is NoValidEntries, a BOM 
     fs::create_directories(tmp.path);
     const std::string h(64, 'c');
 
-    // Junk that has two tokens per line but is not a sha256: previously Loaded (enforcement on,
-    // every plugin refused, agent healthy with zero plugins).
+    // Junk that has two tokens per line but is not a sha256 must refuse.
     write_allowlist(tmp.path / "md5.txt", "d41d8cd98f00b204e9800998ecf8427e  foo.so\n");
     CHECK(yuzu::agent::load_plugin_allowlist(tmp.path / "md5.txt").status ==
           AllowlistStatus::NoValidEntries);

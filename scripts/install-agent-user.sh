@@ -102,9 +102,7 @@
 #                    time (which the test ladder catches).
 #   --no-cap-cleanup Skip stripping file capabilities from the binary
 #                    (Linux). The script never GRANTS file capabilities;
-#                    this only skips the cleanup of ones a previous version
-#                    of this script set. (--no-setcap is the old, misleading
-#                    name, kept as a deprecated alias.)
+#                    this only skips stripping file capabilities from the binary.
 #
 # EXIT CODES
 # ──────────
@@ -112,8 +110,8 @@
 #   1  - failed: not run as root (install/uninstall), a precondition fail(), or --check
 #        found drift; details on stderr
 #   2  - argument error or unsupported OS
-#   3  - sudoers file failed visudo validation; the previous sudoers file was REMOVED
-#        (fail closed: no grants, never the old ones) and nothing new was installed
+#   3  - sudoers file failed visudo validation; any existing sudoers file was REMOVED
+#        (fail closed: no grants) and nothing new was installed
 #   4  - the systemctl wrapper could not be installed (no systemctl grant was written)
 #   5  - file capabilities may still be live: `setcap` is missing while the binary
 #        carries them (or getcap is also missing, so that cannot be ruled out), `setcap -r`
@@ -137,7 +135,6 @@ ACCOUNT_NAME=""            # filled in based on platform if not specified
 BINARY_PATH=""             # filled in based on platform if not specified
 SKIP_SUDOERS=0
 SKIP_SETCAP=0
-DEPRECATED_NO_SETCAP=0
 # Root-owned systemctl validator (Linux, WP13/F48). The ONLY systemctl sudo grant; the
 # services plugin probes this exact path (agents/plugins/services/src/services_parsers.hpp
 # kYuzuSystemctlWrapper) - keep the two in sync.
@@ -201,7 +198,6 @@ while [[ $# -gt 0 ]]; do
         --binary-path)    BINARY_PATH="$2"; shift 2 ;;
         --no-sudoers)     SKIP_SUDOERS=1; shift ;;
         --no-cap-cleanup) SKIP_SETCAP=1; shift ;;
-        --no-setcap)      SKIP_SETCAP=1; DEPRECATED_NO_SETCAP=1; shift ;;
         -h|--help)        usage; exit 0 ;;
         *)                echo "unknown arg: $1" >&2; echo "use --help for usage." >&2; exit 2 ;;
     esac
@@ -232,9 +228,6 @@ run() {
 log() { printf '[install-agent-user] %s\n' "$*"; }
 warn() { printf '[install-agent-user] WARN: %s\n' "$*" >&2; }
 fail() { printf '[install-agent-user] ERROR: %s\n' "$*" >&2; exit 1; }
-if [[ "$DEPRECATED_NO_SETCAP" -eq 1 ]]; then
-    warn "--no-setcap is a deprecated alias of --no-cap-cleanup (the script never SETS file capabilities)"
-fi
 
 # TEST-ONLY escape hatch (tests/test_agent_installer_exec.py): YUZU_INSTALLER_TEST_ROOT redirects
 # every root-owned path under a prefix directory and skips the root check, so the real, NON-sourced
@@ -586,7 +579,7 @@ EOF
     cat <<EOF
 # Pre-requisites for daemon-style invocation. (No \`Defaults !requiretty\`: requiretty is OFF by
 # default in every supported sudo, and sudo-rs rejects the flag outright, which made visudo -cf
-# refuse the WHOLE file and left the old grants in place.)
+# refuse the WHOLE file.)
 Defaults:$ACCOUNT_NAME    env_keep += "YUZU_*"
 EOF
 }
@@ -619,11 +612,10 @@ install_sudoers() {
         if ! visudo -cf "$tmp" >/dev/null; then
             warn "sudoers file failed visudo validation — NOT installing"
             visudo -cf "$tmp" >&2 || true
-            # Fail CLOSED (WP13 governance R1): a previous run's file may still carry the old
-            # `systemctl enable *`-style globs, which this change exists to remove. Leaving it
-            # while exiting 0 would keep the exposure and say otherwise, so remove it: the agent
-            # then has NO privileged grants (actions report privilege_unavailable) until a
-            # successful re-run.
+            # Fail CLOSED (WP13 governance R1): on validation failure the existing $target is
+            # removed rather than left in place, so a grant-carrying file never outlives a failed
+            # update; the agent then has NO privileged grants (actions report
+            # privilege_unavailable) until a successful run.
             if [[ -f "$target" ]]; then
                 warn "removing the previous $target so its old grants do not outlive a failed update"
                 run rm -f "$target"
@@ -730,14 +722,14 @@ remove_systemctl_wrapper() {
 }
 
 # ── linux file capabilities: REMOVE, never grant (WP13/F21) ─────────────────
-# This script used to run `setcap cap_net_admin,cap_net_raw,cap_dac_read_search,cap_sys_ptrace+eip`
-# on the agent binary. The binary is 0755, so ANY local user who executes it received those
+# A file capability such as `cap_net_admin,cap_net_raw,cap_dac_read_search,cap_sys_ptrace+eip`
+# on the agent binary is a hazard. The binary is 0755, so ANY local user who executes it would receive those
 # capabilities, and that user chooses --plugin-dir / YUZU_PLUGIN_DIR, which the agent dlopens:
 # local root. Capabilities now belong to the SERVICE only (systemd AmbientCapabilities in the
 # packaged unit; \`setpriv --ambient-caps\` in scripts/start-UAT.sh --as-user).
 #
-# Removing the grant from this script is not enough: every dev/UAT host provisioned by an older
-# run still carries the file capability. Each run therefore strips them (idempotent).
+# Removing the grant from this script is not enough: This script never grants file capabilities. Each run removes any file capability found on the
+# binary at `--binary-path` (idempotent).
 
 strip_file_capabilities() {
     if [[ "$PLATFORM" != "linux" ]]; then return 0; fi
@@ -809,8 +801,8 @@ check_install() {
         fi
         local owner
         # Branch on the platform: GNU `stat -f` means "filesystem status" (it prints a report and
-        # exits 1 for a path), so the old `stat -f ... || stat -c ...` never reached `-c` and --check
-        # failed on every healthy Linux host. BSD/macOS `stat` has no `-c`.
+        # exits 1 for a path), so a `stat -f ... || stat -c ...` chain never reaches `-c` and --check
+        # would fail on every healthy Linux host. BSD/macOS `stat` has no `-c`.
         if [[ "$PLATFORM" == "macos" ]]; then
             owner=$(stat -f '%Su' "$dir" 2>/dev/null || echo "")
         else
@@ -846,8 +838,8 @@ check_install() {
             else
                 log "$SUDOERS_TARGET present and visudo-valid"
             fi
-            # WP13 governance R1: the CONTENT must be the narrowed one. An old file can be
-            # present and valid while still carrying the wildcard grants this change removed.
+            # WP13 governance R1: the CONTENT must be the narrowed one. A file can be
+            # present and valid while still carrying wildcard grants.
             if [[ "$PLATFORM" == "linux" ]]; then
                 if grep -Eq '^[^#]*systemctl[[:space:]]+(enable|disable|mask|unmask)[[:space:]]' "$SUDOERS_TARGET"; then
                     warn "$SUDOERS_TARGET still carries the old systemctl glob grants - re-run the installer"
@@ -931,7 +923,7 @@ do_install() {
     log "installing Yuzu agent user on $PLATFORM (account: $ACCOUNT_NAME)"
     # macos_create_user / linux_create_user are themselves idempotent —
     # they probe existing state, create what's missing, repair what's
-    # broken. Don't short-circuit here (we used to, which meant a
+    # broken. Don't short-circuit here (short-circuiting would mean a
     # half-installed account couldn't be self-healed by re-running).
     if [[ "$PLATFORM" == "macos" ]]; then
         macos_create_user
@@ -982,8 +974,8 @@ case "$ACTION" in
         ;;
 
     check)
-        # The exit status IS the contract ("exits non-zero on any drift"): the case used to fall
-        # through to the trailing `exit 0`, so --check could never fail (WP13 governance N1).
+        # The exit status IS the contract ("exits non-zero on any drift"): the case must not fall
+        # through to the trailing `exit 0`, or --check could never fail (WP13 governance N1).
         check_install
         exit $?
         ;;

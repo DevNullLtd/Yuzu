@@ -520,7 +520,7 @@ verify_as_user_prereqs() {
 
     # 4b. WP13 governance R3: the binary ACTUALLY LAUNCHED must carry no file capability. The
     # installer strips only the --binary-path it is given (default /usr/local/bin), not a
-    # developer's build-tree binary, which may still hold caps from an older install run. A file
+    # build-tree binary that carries a file capability. A file
     # capability on a world-executable binary is a local privilege escalation (the invoker chooses
     # the plugin dir), so refuse rather than launch it.
     if [ "$(uname -s)" = "Linux" ]; then

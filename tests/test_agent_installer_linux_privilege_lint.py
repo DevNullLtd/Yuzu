@@ -85,7 +85,7 @@ def main() -> int:
         # (Exit-status behaviour of install/--check is asserted by EXECUTION in
         # tests/test_agent_installer_exec.py; the text pins here would stay green under a neutered exit.)
         if "rm -f \"$target\"" not in code[code.index("install_sudoers()"):code.index("remove_sudoers()")]:
-            fail("a failed sudoers validation must remove the previous (glob-carrying) file")
+            fail("a failed sudoers validation must remove the existing (glob-carrying) file")
         if "cannot verify" not in chk:
             fail("--check must treat a missing getcap as drift")
         if "still carries the old systemctl glob grants" not in chk or \
@@ -97,7 +97,7 @@ def main() -> int:
         if sys.platform.startswith("linux"):
             out = dry_run("Linux", binary)
             # The generated Linux sudoers must validate where visudo is available (classic sudo
-            # or sudo-rs): the old `!requiretty` made visudo reject the whole file.
+            # or sudo-rs): a `!requiretty` line makes visudo reject the whole file.
             vis = subprocess.run(["bash", "-c", "command -v visudo"], capture_output=True, text=True).stdout.strip()
             if vis:
                 content = subprocess.run(

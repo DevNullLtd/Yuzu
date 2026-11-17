@@ -220,7 +220,7 @@ static_assert(!is_valid_plugin_name(std::string_view{"nul\0byte", 8}));
 
 /// Outcome of loading a plugin allowlist. Three-state on purpose (WP13/F52): "no allowlist
 /// configured" must be distinguishable from "configured but unusable", because an empty map
-/// used to mean both and the second silently disabled enforcement.
+/// cannot say which of the two it is.
 enum class AllowlistStatus {
     NotConfigured,  ///< empty path: the operator did not ask for an allowlist
     Loaded,         ///< at least one valid entry parsed
