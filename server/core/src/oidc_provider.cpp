@@ -1479,6 +1479,10 @@ vet_egress_target(const std::string& host, bool allow_private, bool cleartext, i
     std::optional<std::vector<egress::Nat64Prefix>> active_prefixes;
     bool nat64_overflow = false;
     const auto classify_v6 = [&](const egress::Ipv6& bytes) {
+        // Plain http to a SIIT or IPv4-compatible form of a public address is plain http to that
+        // public address once translated: refused by the cleartext rule, like the address itself.
+        if (cleartext && egress::embeds_public_ipv4(bytes))
+            return egress::AddressClass::Public;
         const auto cls = egress::classify_ipv6(bytes, nat64_prefixes);
         if (egress::decision(cls, allow_private, cleartext) != egress::Verdict::Allow)
             return cls;
@@ -1493,6 +1497,18 @@ vet_egress_target(const std::string& host, bool allow_private, bool cleartext, i
                 if (std::find(active_prefixes->begin(), active_prefixes->end(), learned) ==
                     active_prefixes->end())
                     active_prefixes->push_back(learned);
+        }
+        // A local-use NAT64 address (64:ff9b:1::/48) that neither a configured nor a learned
+        // prefix covers cannot be decoded, so the destination behind it cannot be checked: it is
+        // refused whatever the switch says, rather than admitted as plain non-global IPv6.
+        if (egress::in_local_use_nat64(bytes) &&
+            std::none_of(active_prefixes->begin(), active_prefixes->end(),
+                         [&](const egress::Nat64Prefix& p) { return egress::matches(bytes, p); })) {
+            spdlog::warn("OIDC egress: refused host '{}': a local-use NAT64 address "
+                         "(64:ff9b:1::/48) that no configured or learned prefix covers (never "
+                         "allowed; set --oidc-nat64-prefix to the network's prefix)",
+                         ::yuzu::log_key_token(host));
+            return egress::AddressClass::Reserved;
         }
         return egress::classify_ipv6(bytes, *active_prefixes);
     };

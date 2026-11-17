@@ -440,6 +440,9 @@ std::expected<std::vector<RevocationSourceRecord>, RevocationSourceStoreError>
 RevocationSourceStore::list() {
     if (!open_)
         return fail(Kind::kNotOpen, "revocation source store is not open");
+    if (read_fault_)
+        if (const auto k = read_fault_("list"))
+            return fail(*k, "injected read fault");
     auto lease = pool_.try_acquire_for(timeout_);
     if (!lease) {
         warn_no_connection("list", timeout_);
@@ -457,6 +460,9 @@ std::expected<RevocationSourceRecord, RevocationSourceStoreError>
 RevocationSourceStore::get(std::int64_t id) {
     if (!open_)
         return fail(Kind::kNotOpen, "revocation source store is not open");
+    if (read_fault_)
+        if (const auto k = read_fault_("get"))
+            return fail(*k, "injected read fault");
     auto lease = pool_.try_acquire_for(timeout_);
     if (!lease) {
         warn_no_connection("get", timeout_);
@@ -478,6 +484,9 @@ std::expected<std::int64_t, RevocationSourceStoreError>
 RevocationSourceStore::crl_past_next_update_count() {
     if (!open_)
         return fail(Kind::kNotOpen, "revocation source store is not open");
+    if (read_fault_)
+        if (const auto k = read_fault_("crl_past_next_update_count"))
+            return fail(*k, "injected read fault");
     auto lease = pool_.try_acquire_for(timeout_);
     if (!lease) {
         warn_no_connection("crl_past_next_update_count", timeout_);
@@ -497,7 +506,7 @@ RevocationSourceStore::crl_past_next_update_count() {
     return to_i64(res, 0, 0);
 }
 
-std::expected<std::int64_t, RevocationSourceStoreError>
+std::expected<RevocationSourceRecord, RevocationSourceStoreError>
 RevocationSourceStore::create(const NewRevocationSource& src, const std::string& created_by) {
     if (!open_)
         return fail(Kind::kNotOpen, "revocation source store is not open");
@@ -557,11 +566,18 @@ RevocationSourceStore::create(const NewRevocationSource& src, const std::string&
     for (const auto& u : src.urls)
         if (auto r = insert_url(conn, id, u); !r)
             return std::unexpected(r.error());
+    // Read the new source back INSIDE this transaction, as `replace` does: a re-read on a second
+    // lease after COMMIT can time out, which would report a committed registration as a failure.
+    auto reread = load_sources(conn, id);
+    if (!reread)
+        return std::unexpected(reread.error());
+    if (reread->size() != 1)
+        return fail(Kind::kQueryError, "create: source vanished");
     if (!txn.commit()) {
         const bool lost = PQstatus(conn) == CONNECTION_BAD;
         return fail(lost ? Kind::kOutcomeUnknown : Kind::kQueryError, "create: commit failed");
     }
-    return id;
+    return std::move(reread->front());
 }
 
 std::expected<RevocationSourceUpdate, RevocationSourceStoreError>

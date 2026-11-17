@@ -133,8 +133,25 @@ TEST_CASE("OIDC egress: IPv6 ranges and the embedded IPv4 forms", "[oidc][oidc_e
     const std::vector<Row> rows = {
         {"::", AddressClass::Unspecified},
         {"::1", AddressClass::Loopback},
-        {"::2", AddressClass::OtherNonGlobal},
-        {"::127.0.0.1", AddressClass::OtherNonGlobal}, // IPv4-compatible (deprecated)
+        // IPv4-compatible ::/96 (deprecated): classified by the embedded IPv4 address, never wider
+        // than non-global
+        {"::2", AddressClass::Unspecified},                // 0.0.0.2
+        {"::127.0.0.1", AddressClass::Loopback},
+        {"::7f00:1", AddressClass::Loopback},
+        {"::a9fe:a9fe", AddressClass::LinkLocal},          // 169.254.169.254
+        {"::a64:6464", AddressClass::Private},             // 10.100.100.100
+        {"::6464:64c8", AddressClass::CloudMetadata},      // 100.100.100.200
+        {"::808:808", AddressClass::OtherNonGlobal},       // public 8.8.8.8 stays non-global
+        {"::1:0:0:808:808", AddressClass::OtherNonGlobal}, // outside ::/96
+        // SIIT ::ffff:0:0:0/96: the same rule
+        {"::ffff:0:a9fe:a9fe", AddressClass::LinkLocal},
+        {"::ffff:0:169.254.169.254", AddressClass::LinkLocal},
+        {"::ffff:0:7f00:1", AddressClass::Loopback},
+        {"::ffff:0:a00:1", AddressClass::Private},
+        {"::ffff:0:0:0", AddressClass::Unspecified},
+        {"::ffff:0:808:808", AddressClass::OtherNonGlobal},
+        {"::fffe:0:a9fe:a9fe", AddressClass::OtherNonGlobal}, // one bit off the SIIT prefix
+        {"::1:ffff:0:a9fe:a9fe", AddressClass::OtherNonGlobal}, // outside ::ffff:0:0:0/96
         // IPv4-mapped: classified by the embedded IPv4 address
         {"::ffff:127.0.0.1", AddressClass::Loopback},
         {"::ffff:7f00:1", AddressClass::Loopback},
@@ -149,6 +166,7 @@ TEST_CASE("OIDC egress: IPv6 ranges and the embedded IPv4 forms", "[oidc][oidc_e
         {"64:ff9b::a9fe:a9fe", AddressClass::LinkLocal},
         {"64:ff9b::808:808", AddressClass::Public},
         {"64:ff9b:1::1", AddressClass::OtherNonGlobal}, // the local-use prefix is not translated
+        {"64:ff9b:1::a9fe:a9fe", AddressClass::OtherNonGlobal}, // no prefix length, no decode
         // 6to4
         {"2002:a9fe:a9fe::1", AddressClass::LinkLocal},
         {"2002:7f00:1::", AddressClass::Loopback},
@@ -1055,4 +1073,66 @@ TEST_CASE("OIDC egress: the Windows token POST decision needs the host AND the p
     // A zero vetted port (an unparseable explicit port) never matches, not even a zero cracked one.
     CHECK_FALSE(cracked_endpoint_is_vetted(L"idp.example.test", 0, "idp.example.test", 0));
     CHECK_FALSE(cracked_endpoint_is_vetted(L"idp.example.test", 443, "idp.example.test", 0));
+}
+
+TEST_CASE("OIDC egress: an embedded never-allowed address is refused even with private networks "
+          "allowed",
+          "[oidc][oidc_egress]") {
+    for (const char* text : {"::a9fe:a9fe", "::ffff:0:a9fe:a9fe", "::6464:64c8",
+                             "::ffff:0:6464:64c8", "::ffff:0:0:0", "::e000:1"}) {
+        CAPTURE(text);
+        const auto c = classify_literal(text);
+        REQUIRE(c.has_value());
+        CHECK(decision(*c, true) == Verdict::Refuse);
+        CHECK(decision(*c, false) == Verdict::Refuse);
+    }
+    // Loopback and private stay behind the operator's switch, exactly as their plain forms do.
+    for (const char* text : {"::7f00:1", "::ffff:0:7f00:1", "::a00:1", "::ffff:0:a00:1"}) {
+        CAPTURE(text);
+        const auto c = classify_literal(text);
+        REQUIRE(c.has_value());
+        CHECK(decision(*c, true) == Verdict::Allow);
+        CHECK(decision(*c, false) == Verdict::Refuse);
+    }
+    // A public embedded address in these blocks is still not a public destination.
+    CHECK(decision(*classify_literal("::808:808"), false) == Verdict::Refuse);
+    CHECK(decision(*classify_literal("::ffff:0:808:808"), false) == Verdict::Refuse);
+}
+
+TEST_CASE("OIDC egress: the local-use NAT64 prefix is recognised, and decoded only with a known "
+          "prefix",
+          "[oidc][oidc_egress]") {
+    const auto v6 = [](std::string_view t) { return *parse_ipv6(t); };
+    CHECK(in_local_use_nat64(v6("64:ff9b:1::")));
+    CHECK(in_local_use_nat64(v6("64:ff9b:1:ffff:ffff:ffff:ffff:ffff")));
+    CHECK(in_local_use_nat64(v6("64:ff9b:1:abcd::a9fe:a9fe")));
+    CHECK_FALSE(in_local_use_nat64(v6("64:ff9b::a9fe:a9fe"))); // the well-known /96
+    CHECK_FALSE(in_local_use_nat64(v6("64:ff9b:2::1")));
+    CHECK_FALSE(in_local_use_nat64(v6("64:ff9a:1::1")));
+    // Without a prefix it is plain non-global; with its /96 declared it is classified.
+    CHECK(classify_ipv6(v6("64:ff9b:1::a9fe:a9fe")) == AddressClass::OtherNonGlobal);
+    const std::vector<Nat64Prefix> declared{*parse_nat64_prefix("64:ff9b:1::/96")};
+    CHECK(classify_ipv6(v6("64:ff9b:1::a9fe:a9fe"), declared) == AddressClass::LinkLocal);
+}
+
+TEST_CASE("OIDC egress policy: embeds_public_ipv4 marks the SIIT and IPv4-compatible forms of a "
+          "public address only",
+          "[oidc][oidc_egress][security]") {
+    using namespace yuzu::server::oidc::egress;
+    const auto v6 = [](const char* t) { return *parse_ipv6(t); };
+    CHECK(embeds_public_ipv4(v6("::ffff:0:808:808")));
+    CHECK(embeds_public_ipv4(v6("::808:808")));
+    CHECK_FALSE(embeds_public_ipv4(v6("::ffff:0:a9fe:a9fe"))); // link-local
+    CHECK_FALSE(embeds_public_ipv4(v6("::ffff:0:a00:1")));     // private
+    CHECK_FALSE(embeds_public_ipv4(v6("::7f00:1")));           // loopback
+    CHECK_FALSE(embeds_public_ipv4(v6("::")));
+    CHECK_FALSE(embeds_public_ipv4(v6("::1")));
+    // Other embedding forms are classified Public directly; this predicate is for the two that
+    // classify_ipv6 narrows.
+    CHECK_FALSE(embeds_public_ipv4(v6("::ffff:808:808")));     // IPv4-mapped
+    CHECK_FALSE(embeds_public_ipv4(v6("64:ff9b::808:808")));   // well-known NAT64
+    CHECK_FALSE(embeds_public_ipv4(v6("64:ff9b:1::808:808"))); // local-use NAT64
+    CHECK_FALSE(embeds_public_ipv4(v6("::1:0:0:808:808")));
+    CHECK_FALSE(embeds_public_ipv4(v6("2001:4860::8888")));
+    static_assert(embeds_public_ipv4(Ipv6{0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 8, 8, 8, 8}));
 }

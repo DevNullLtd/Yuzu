@@ -1036,6 +1036,81 @@ TEST_CASE("OIDC egress: the strict vet mode refuses a mixed answer the pinning m
     }
 }
 
+TEST_CASE("OIDC egress: SIIT and IPv4-compatible answers are vetted by the embedded address",
+          "[oidc][oidc_egress][security]") {
+    namespace egress = yuzu::server::oidc::egress;
+    Nat64CacheReset cache;
+    const std::string refused_text = OidcProvider::kEgressRefused;
+    const auto vet = [](std::vector<std::string> answer, bool allow_private,
+                        std::span<const egress::Nat64Prefix> prefixes = {},
+                        bool cleartext = false) {
+        ResolverGuard resolver([answer = std::move(answer)](const std::string&) { return answer; });
+        return OidcProvider::vet_egress_target_for_test("embedded.test", allow_private, cleartext,
+                                                        1000, prefixes, false);
+    };
+
+    SECTION("an embedded metadata or link-local address is refused even with the switch on") {
+        for (const char* a : {"::ffff:0:a9fe:a9fe", "::a9fe:a9fe", "::ffff:0:6464:64c8"}) {
+            CAPTURE(a);
+            const auto r = vet({a}, true);
+            REQUIRE_FALSE(r.has_value());
+            CHECK(r.error() == refused_text);
+        }
+    }
+    SECTION("an embedded loopback address keeps OIDC's loopback contract: allowed only with the "
+            "switch") {
+        for (const char* a : {"::ffff:0:7f00:1", "::7f00:1"}) {
+            CAPTURE(a);
+            CHECK_FALSE(vet({a}, false).has_value());
+            const auto r = vet({a}, true);
+            REQUIRE(r.has_value());
+            CHECK(*r == std::vector<std::string>{a});
+        }
+    }
+    SECTION("an embedded public address is not public over https: refused without the switch") {
+        CHECK_FALSE(vet({"::ffff:0:808:808"}, false).has_value());
+        CHECK(vet({"::ffff:0:808:808"}, true).has_value());
+        CHECK(vet({"::808:808"}, true).has_value());
+    }
+    SECTION("plain http to an embedded public address is plain http to a public address") {
+        const std::string cleartext_text = OidcProvider::kEgressCleartextPublicRefused;
+        for (const char* a : {"::ffff:0:808:808", "::808:808"}) {
+            CAPTURE(a);
+            for (const bool allow_private : {false, true}) {
+                const auto r = vet({a}, allow_private, {}, true);
+                REQUIRE_FALSE(r.has_value());
+                CHECK(r.error() == cleartext_text);
+            }
+        }
+        // An embedded private address over plain http stays behind the switch alone.
+        CHECK(vet({"::ffff:0:a00:5"}, true, {}, true).has_value());
+        CHECK_FALSE(vet({"::ffff:0:a00:5"}, false, {}, true).has_value());
+    }
+    SECTION("a local-use NAT64 address is refused unless a known prefix covers it") {
+        // Uncovered: refused even with the switch on (the embedded destination is unknowable).
+        for (const char* a : {"64:ff9b:1::a9fe:a9fe", "64:ff9b:1::808:808"}) {
+            CAPTURE(a);
+            CHECK_FALSE(vet({a}, false).has_value());
+            const auto r = vet({a}, true);
+            REQUIRE_FALSE(r.has_value());
+            CHECK(r.error() == refused_text);
+        }
+        // In a mixed answer the uncovered member is dropped, a public member is still pinned.
+        const auto mixed = vet({"64:ff9b:1::808:808", "8.8.8.8"}, true);
+        REQUIRE(mixed.has_value());
+        CHECK(*mixed == std::vector<std::string>{"8.8.8.8"});
+        // Declared: decoded. The embedded metadata address is refused, a public one is permitted.
+        const std::vector<egress::Nat64Prefix> declared{
+            *egress::parse_nat64_prefix("64:ff9b:1::/96")};
+        CHECK_FALSE(vet({"64:ff9b:1::a9fe:a9fe"}, true, declared).has_value());
+        CHECK(vet({"64:ff9b:1::808:808"}, false, declared).has_value());
+        // A declared prefix that does not cover the address does not rescue it.
+        const std::vector<egress::Nat64Prefix> other{
+            *egress::parse_nat64_prefix("64:ff9b:1:ab::/96")};
+        CHECK_FALSE(vet({"64:ff9b:1::808:808"}, true, other).has_value());
+    }
+}
+
 TEST_CASE("OIDC egress: the token POST's pre-check - pinned where the connect is pinned, strict "
           "where it cannot be",
           "[oidc][oidc_egress][security]") {

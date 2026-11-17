@@ -200,9 +200,10 @@ public:
     [[nodiscard]] std::expected<std::int64_t, RevocationSourceStoreError>
     crl_past_next_update_count();
 
-    /// Register a source; returns its id. Errors: kConflict (one source per CA), kLimitReached,
-    /// kInvalidInput, kPoolAcquireTimeout, kQueryError, kOutcomeUnknown.
-    [[nodiscard]] std::expected<std::int64_t, RevocationSourceStoreError>
+    /// Register a source; returns it as stored, read back inside the same transaction (so a
+    /// committed registration is never reported as a failure). Errors: kConflict (one source per
+    /// CA), kLimitReached, kInvalidInput, kPoolAcquireTimeout, kQueryError, kOutcomeUnknown.
+    [[nodiscard]] std::expected<RevocationSourceRecord, RevocationSourceStoreError>
     create(const NewRevocationSource& src, const std::string& created_by);
 
     /// Replace the source's name, keys and URLs (a full replace). A body equal to the stored
@@ -237,6 +238,15 @@ public:
         write_fault_ = std::move(f);
     }
 
+    /// Test seam (empty in production): the read-side twin of `set_write_fault_for_test`, called
+    /// with the operation name (`list`, `get`, `crl_past_next_update_count`) at the start of every
+    /// read; a returned kind fails the read with it before any lease is taken. Lets a test prove a
+    /// write path does not depend on a separate read after its commit.
+    void set_read_fault_for_test(std::function<std::optional<RevocationSourceStoreError::Kind>(
+                                     std::string_view op)> f) {
+        read_fault_ = std::move(f);
+    }
+
     /// Test seam: shorten the bounded lease wait so a held-lease test does not sit out the
     /// production timeout. Not for production use.
     void set_acquire_timeout_for_test(std::chrono::milliseconds t) noexcept { timeout_ = t; }
@@ -248,6 +258,7 @@ private:
     pg::PgPool& pool_;
     bool open_{false};
     std::function<std::optional<RevocationSourceStoreError::Kind>(std::string_view)> write_fault_;
+    std::function<std::optional<RevocationSourceStoreError::Kind>(std::string_view)> read_fault_;
 };
 
 } // namespace yuzu::server
