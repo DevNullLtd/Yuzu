@@ -259,6 +259,12 @@ constexpr ExpectedResolution kExpected[] = {
     {"PUT",    "/api/v1/inventory/software/collection-settings/abc123",           16u * 1024, false, "software_collection_settings"},
     {"GET",    "/api/v1/inventory/software/collection-settings",                  16u * 1024, false, "software_collection_settings"},
     {"PUT",    "/api/v1/inventory/software/collection-settingsevil/abc",          4u * 1024 * 1024, false, "default"},
+    // body_cap_policy.hpp software_lifecycle_rules row: the lifecycle rule import (the raw csv or
+    // cle file; the cap is the parser's kImportMaxBytes). ANY method; a lookalike is the default.
+    {"POST",   "/api/v1/inventory/software/lifecycle/rules",                      4u * 1024 * 1024, false, "software_lifecycle_rules"},
+    {"GET",    "/api/v1/inventory/software/lifecycle/rules",                      4u * 1024 * 1024, false, "software_lifecycle_rules"},
+    {"DELETE", "/api/v1/inventory/software/lifecycle/rules",                      4u * 1024 * 1024, false, "software_lifecycle_rules"},
+    {"POST",   "/api/v1/inventory/software/lifecycle/rulesevil",                  4u * 1024 * 1024, false, "default"},
     {"POST",   "/api/v1/inventory/software/normalization/packevil",               64u * 1024, false, "software_curation"},
     {"POST",   "/api/v1/inventory/software/normalizationevil/aliases",            4u * 1024 * 1024, false, "default"},
     // body_cap_policy.hpp commands row - POST /api/v1/commands (the REST v1 twin of MCP
@@ -330,6 +336,7 @@ constexpr std::string_view kExpectedPathClasses[] = {
     "software_curation",
     "software_alias_pack",
     "software_collection_settings",
+    "software_lifecycle_rules",
     "default",
 };
 
@@ -490,11 +497,12 @@ TEST_CASE("kBodyCapTable: the row count is locked", "[body_cap]") {
     // config(1: the /api/v1/config subtree, the runtime-config PUT) +
     // crypto_revocation_sources(1: ADR-0070 R1 registered CRL sources, 192 KiB) +
     // software_curation(1: the curation subtree) + software_alias_pack(1: the pack CSV) +
-    // software_collection_settings(1: the collection settings subtree) + default(1).
+    // software_collection_settings(1: the collection settings subtree) +
+    // software_lifecycle_rules(1: the lifecycle rule import) + default(1).
     // + result_sets(1: POST /api/v1/result-sets, the 200000-value budget of device_ids).
     // + workflow_execute(1: POST under /api/workflows/, the execute subtree, 4 MiB and 30000 values).
     // + upload_commit(1: POST under /api/v1/uploads/, the commit's small JSON body, 4 KiB).
-    CHECK(std::size(kBodyCapTable) == 45);
+    CHECK(std::size(kBodyCapTable) == 46);
 }
 
 // The dex_score_policy_form row is derived from the document's own limits (body_cap_policy.hpp),
@@ -1400,11 +1408,13 @@ TEST_CASE("kBodyCapTable: every row states a JSON value budget; an unscanned cla
           "a named one",
           "[body_cap][json_budget]") {
     // Not scanned, with a cap above 1 MiB: uploads (binary), the YAML-or-JSON creates (guarded at
-    // their JSON branch) and the form-encoded instruction YAML routes. A new such row must be added
-    // here on purpose.
+    // their JSON branch), the form-encoded instruction YAML routes and the lifecycle rule import
+    // (a csv or cle file: the JSON scan would count a csv body's commas, and the cle parser applies
+    // its own depth and value budgets). A new such row must be added here on purpose.
     const std::set<std::string> kUnscannedAbove1MiB = {"upload_session", "ota_upload",
                                                        "workflow_yaml", "product_pack_yaml",
-                                                       "instruction_yaml"};
+                                                       "instruction_yaml",
+                                                       "software_lifecycle_rules"};
     for (const auto& entry : kBodyCapTable) {
         INFO("path_class=" << entry.path_class);
         if (entry.max_json_values == kJsonValuesOff) {
@@ -1434,6 +1444,8 @@ TEST_CASE("resolve_body_cap: the JSON value budgets of the named classes",
     CHECK(resolve_body_cap("POST", "/api/export/json-to-csv").max_body_bytes == 16u * 1024 * 1024);
     CHECK(resolve_body_cap("POST", "/api/export/json-to-csv").max_json_values == 1'000'000);
     CHECK(resolve_body_cap("POST", "/api/workflows").max_json_values == kJsonValuesOff);
+    CHECK(resolve_body_cap("POST", "/api/v1/inventory/software/lifecycle/rules").max_json_values ==
+          kJsonValuesOff); // a csv body is not JSON
     // The create stays on its own unscanned row; the execute subtree has its own scanned one.
     CHECK(resolve_body_cap("POST", "/api/workflows").path_class == "workflow_yaml");
     CHECK(resolve_body_cap("POST", "/api/workflows/wf_abc/execute").path_class == "workflow_execute");

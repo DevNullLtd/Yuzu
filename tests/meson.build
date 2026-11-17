@@ -2108,6 +2108,10 @@ if build_server
       'unit/server/test_software_lifecycle_rules.cpp',
       # SAM-23 lifecycle store (born-on-PG, [pg][store][lifecycle])
       'unit/server/test_software_lifecycle_store.cpp',
+      # SAM-24 lifecycle import parsers (csv dispatch, CLE ECMA-428 1.0.0): pure, no store, no I/O
+      'unit/server/test_software_lifecycle_import.cpp',
+      # SAM-24 lifecycle rules REST routes: fake gates (no PG) + [pg][lifecycle][routes] over the real store
+      'unit/server/test_software_lifecycle_routes.cpp',
       # pure per-group collection settings resolver (collection_settings_resolve.hpp): no store, no I/O, no [pg]
       'unit/server/test_collection_settings_resolve.cpp',
       # per-group collection settings store (born-on-PG, [pg][store])
@@ -2129,6 +2133,8 @@ if build_server
       'unit/server/test_app_usage_ingestion.cpp',   # Wave 7b PR7b.2
       'unit/server/test_app_usage_routes.cpp',      # Wave 7b PR7b.2
       'unit/server/test_device_inventory_store.cpp',
+      'unit/server/test_device_ci_write_pause.cpp', # #7730: write pause + ingest-seam gate
+      'unit/server/test_device_ci_read_gate.cpp', # #7730: read gate (pure mapping, bulk page refusal, roster degrade)
       'unit/server/test_agent_decommission.cpp',
       'unit/server/test_app_perf_daily_store.cpp',
       'unit/server/test_app_perf_ingestion.cpp',
@@ -5331,6 +5337,9 @@ test('contract registry', _python3_test,
   args: [files('../scripts/test/contract-evidence.py'), 'check'], suite: 'docs', timeout: 30)
 test('contract evidence CI step', _python3_test,
   args: [files('test_contract_evidence_ci_step.py')], suite: 'docs', timeout: 30)
+# One CCACHE_MAXSIZE per self-hosted pool: a smaller cap trims the shared cache.
+test('ci ccache cap', _python3_test,
+  args: [files('test_ci_ccache_cap.py')], suite: 'docs', timeout: 30)
 if get_option('build_contract_tests')
   _contract_adapter = files('../scripts/test/contract-evidence.py')
   test('contract.plugin.loader.reserved-name.reject', _python3_test,

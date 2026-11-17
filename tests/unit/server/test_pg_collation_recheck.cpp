@@ -304,7 +304,7 @@ TEST_CASE("PgCollationRecheck: stop waits out a check in flight and reports noth
 }
 
 // request_stop(): the signal half of stop(), so ServerImpl::stop() can tell the loop to wind down
-// at the start of teardown and join it later (a check in flight can take about 15 s). The wait is
+// at the start of teardown and join it later (a check in flight can take about 20 s). The wait is
 // bounded everywhere, and a failure never leaves a spinning loop thread behind (the Finish guard).
 
 TEST_CASE("PgCollationRecheck: request_stop returns while a check is in flight, drops its report "
@@ -493,6 +493,41 @@ TEST_CASE("PgCollationRecheck against a real database: a forced Mismatch, then O
     CHECK(recheck.state() == CollationState{CollationLast::Ok, false});
 }
 
+TEST_CASE("PgCollationRecheck: ticks publish the gate from the surviving state",
+          "[pg_collation][recheck][gate]") {
+    ScriptedCheck check;
+    check.script = {CollationVerdict::Mismatch, CollationVerdict::Unreadable, CollationVerdict::Ok,
+                    CollationVerdict::Unreadable};
+    std::atomic<pg::CollationGate> gate{pg::kInitialCollationGate};
+    PgCollationRecheck recheck(check.fn(), nullptr, 1h, CollationState{}, 60s, &gate);
+    CHECK(gate.load() == pg::CollationGate::Unproven);
+    recheck.tick();
+    CHECK(gate.load() == pg::CollationGate::Mismatch);
+    recheck.tick(); // unreadable: the mismatch stands
+    CHECK(gate.load() == pg::CollationGate::Mismatch);
+    recheck.tick();
+    CHECK(gate.load() == pg::CollationGate::Trusted);
+    recheck.tick(); // unreadable after Ok: still Trusted
+    CHECK(gate.load() == pg::CollationGate::Trusted);
+}
+
+TEST_CASE("PgCollationRecheck: a null gate publishes nothing and a stopped recheck leaves it alone",
+          "[pg_collation][recheck][gate]") {
+    ScriptedCheck check;
+    check.script = {CollationVerdict::Mismatch};
+    PgCollationRecheck no_gate(check.fn(), nullptr, 1h, CollationState{});
+    REQUIRE_NOTHROW(no_gate.tick());
+    CHECK(no_gate.state().last == CollationLast::Mismatch);
+
+    std::atomic<pg::CollationGate> gate{pg::kInitialCollationGate};
+    ScriptedCheck check2;
+    check2.script = {CollationVerdict::Ok};
+    PgCollationRecheck stopped(check2.fn(), nullptr, 1h, CollationState{}, 60s, &gate);
+    stopped.request_stop();
+    stopped.tick(); // dropped: the server is going down
+    CHECK(gate.load() == pg::CollationGate::Unproven);
+}
+
 TEST_CASE("PgCollationRecheck: the state follows every report", "[pg_collation][recheck]") {
     ScriptedCheck check;
     check.script = {CollationVerdict::Mismatch, CollationVerdict::Unreadable, CollationVerdict::Ok,
@@ -618,6 +653,40 @@ TEST_CASE("PgCollationRecheck: an unsettled state is rechecked sooner than the h
         for (int i = 0; i < 500 && check.calls.load() < 2; ++i)
             std::this_thread::sleep_for(10ms);
         CHECK(check.calls.load() >= 2);
+        recheck.stop();
+    }
+}
+
+// Review of #8108, item 5. `report_collation_check` stores the gate BEFORE the metric and log work,
+// so a throw in that work leaves the recheck state behind the gate: the state still says Ok (hourly)
+// while the gate already reads Mismatch. The cadence must follow the gate too, or a replica that
+// just detected a mismatch waits up to an hour. That lag is built directly here (a gate that
+// disagrees with the seeded state), because the report's own work cannot be made to throw from a
+// test. Kills: a `next_wait` that reads only `state_`.
+TEST_CASE("PgCollationRecheck: a gate that is not Trusted keeps the recheck on the short interval "
+          "even when the state reads settled",
+          "[pg_collation][recheck][gate]") {
+    CollationState settled;
+    settled.last = CollationLast::Ok;
+
+    SECTION("gate Mismatch with state Ok: the short interval") {
+        ScriptedCheck check;
+        check.script = {CollationVerdict::Mismatch};
+        std::atomic<pg::CollationGate> gate{pg::CollationGate::Mismatch};
+        PgCollationRecheck recheck(check.fn(), nullptr, 1h, settled, 20ms, &gate);
+        recheck.start();
+        for (int i = 0; i < 500 && check.calls.load() < 1; ++i)
+            std::this_thread::sleep_for(10ms);
+        CHECK(check.calls.load() >= 1);
+        recheck.stop();
+    }
+    SECTION("control: gate Trusted with state Ok stays on the long interval") {
+        ScriptedCheck check;
+        std::atomic<pg::CollationGate> gate{pg::CollationGate::Trusted};
+        PgCollationRecheck recheck(check.fn(), nullptr, 1h, settled, 20ms, &gate);
+        recheck.start();
+        std::this_thread::sleep_for(300ms);
+        CHECK(check.calls.load() == 0);
         recheck.stop();
     }
 }

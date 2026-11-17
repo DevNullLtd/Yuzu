@@ -1062,6 +1062,7 @@ yuzu_server_routes_lib = static_library(
     'src/inventory_routes.cpp',
     'src/software_curation_routes.cpp',
     'src/software_collection_settings_routes.cpp',
+    'src/software_lifecycle_routes.cpp',
     'src/software_read_routes.cpp',
     'src/software_export_routes.cpp',
     'src/inventory_ui.cpp',

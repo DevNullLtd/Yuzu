@@ -264,6 +264,7 @@ EXPECTED_MCP_REGISTRY_HEADERS = [
 # The store-free types headers the lane enrols DIRECTLY (not merely by being reached: a header
 # nothing includes any more would otherwise leave the lane unguarded).
 EXPECTED_MCP_REGISTRY_TYPES_HEADERS = [
+    "server/core/src/collation_gate_types.hpp",
     "server/core/src/device_inventory_types.hpp",
     "server/core/src/discover_catalog_types.hpp",
     "server/core/src/inventory_types.hpp",
