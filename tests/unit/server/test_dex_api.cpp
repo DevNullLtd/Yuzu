@@ -1844,7 +1844,8 @@ TEST_CASE("DexApi: apps_usage reads the Apps list and the usage at one request i
     // Every cut derives from that one instant.
     CHECK(probe.last.until_iso == yuzu::server::dex_iso_at(r->as_of_epoch));
     CHECK(probe.last.since_iso == yuzu::server::dex_iso_since_at(r->as_of_epoch, 7));
-    CHECK(probe.last.fresh_since_epoch == r->as_of_epoch - yuzu::server::kDexUsageFreshSecs);
+    // The freshness cut is a width, measured by the owner against the database clock.
+    CHECK(probe.last.fresh_secs == yuzu::server::kDexUsageFreshSecs);
     CHECK(r->population == 23);
     // A usage read never pays the observer pass.
     CHECK(observer_calls == 0);
@@ -2134,6 +2135,8 @@ TEST_CASE("DexApi: apps_usage cuts the Apps window at the request instant", "[pg
     REQUIRE(r->apps.size() == 1);
     CHECK(r->apps[0].subject == "old.exe");
     CHECK(probe.last.until_iso == yuzu::server::dex_iso_at(at));
+    // A skewed instant moves the observation window only: the freshness width is the constant.
+    CHECK(probe.last.fresh_secs == yuzu::server::kDexUsageFreshSecs);
     // apps() takes its instant from the same source.
     const auto apps = api->apps("7d", "all");
     REQUIRE_FALSE(apps.degraded);

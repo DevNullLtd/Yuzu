@@ -13,10 +13,12 @@
 /// the application) and the denominator (their run time) must come from one
 /// population, one window and one snapshot.
 ///
-/// Freshness: a device counts only while the server received its usage state at
-/// or after `DexUsageQuery::fresh_since_epoch` (`usage_state.last_seen`, server
-/// receipt time, never the agent's collected_at). A stale device contributes no
-/// usage, no events and no reporting count; it is counted in `stale_devices`.
+/// Freshness: a device counts only while the server received its usage state within
+/// `DexUsageQuery::fresh_secs` of the DATABASE clock (`usage_state.last_seen`, server
+/// receipt time authored by the database, never the agent's collected_at; the cut is
+/// `now() - fresh_secs` in the one statement, so a skewed replica clock cannot move it).
+/// A stale device contributes no usage, no events and no reporting count; it is counted
+/// in `stale_devices`. A device with no usage state row is in neither count.
 /// Events are cut at BOTH ends (`since_iso` inclusive, `until_iso` exclusive), so
 /// a future-dated observation never enters a numerator.
 ///
@@ -47,8 +49,8 @@
 /// timeouts whose unbroken run is at least `kDexUsageTimeoutRunBeforeTooLarge` old (any
 /// success resets both) mean the on-request read no longer fits its time bound.
 /// `unavailable_detail` then reports `fleet_too_large` instead of the retryable
-/// `statement_timeout`. A burst of concurrent reads that time out in one stall cannot
-/// meet the 2-minute span, so it stays retryable.
+/// `statement_timeout`. A stall shorter than two minutes stays retryable (only a success
+/// resets the run, so a database-wide stall of two minutes or more can reach it too).
 ///
 /// Read-only, no state written to the database, idempotent per request.
 
@@ -93,7 +95,7 @@ inline constexpr std::chrono::milliseconds kDexUsageStatementTimeout{10000};
 /// PURE: the detail token a surface reports for `f`: `fleet_too_large` iff `f` is a statement
 /// timeout, the run holds at least `kDexUsageTimeoutsBeforeTooLarge` consecutive timeouts and
 /// its first is at least `kDexUsageTimeoutRunBeforeTooLarge` old; otherwise the fault's own
-/// token. A concurrent burst in one stall cannot meet the span, so it stays retryable.
+/// token. A stall shorter than the span stays retryable.
 [[nodiscard]] inline const char* dex_usage_unavailable_detail(DexReadFault f, int consecutive_timeouts,
                                                               std::chrono::steady_clock::duration run_age) noexcept {
     if (f == DexReadFault::kStatementTimeout && consecutive_timeouts >= kDexUsageTimeoutsBeforeTooLarge &&

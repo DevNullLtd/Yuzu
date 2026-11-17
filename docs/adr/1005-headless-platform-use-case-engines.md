@@ -1964,9 +1964,12 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        copy of the model.
      - **The exception relaxes no control.** The route is gated by
        `GuaranteedState:Read` and `Forensics:Read`, both required, and audited
-       fail-closed as `dex.apps.usage.view` before the read; the device list is
-       filtered to what the caller is admitted to before the figures are
-       built. Wire reference: `docs/user-manual/rest-api.md`, "GET
+       fail-closed as `dex.apps.usage.view` before the read; the usage figures
+       are computed over the caller's visible devices only (the application
+       list is the fleet list `GuaranteedState:Read` already serves, and the
+       filter is inert for every caller admitted today). The parity ledger
+       carries the matching paragraph (`docs/api-parity-ledger.md`, "New REST
+       route with its MCP twin pending (fleet application usage)"). Wire reference: `docs/user-manual/rest-api.md`, "GET
        /api/v1/dex/apps/usage"; audit row: `docs/user-manual/audit-log.md`.
      - Recorded by the change author; ADR-owner acceptance pending.
 

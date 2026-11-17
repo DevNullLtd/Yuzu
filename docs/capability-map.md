@@ -1586,7 +1586,7 @@ Other typed sources: the server's one `kTypedInventorySources` list (`server/cor
 
 ### 35.6 App-Usage Inventory Source :white_check_mark: `T2` *(new row, v4.1)*
 
-ADR-0016 source `app_usage`: `agents/core/src/sync_source_app_usage.{hpp,cpp}` reads the `app_usage` plugin's machine-scope fold of Echo's usage data and pushes it daily to the server `AppUsageStore` (`server/core/src/app_usage_store.{hpp,cpp}`). It is a typed source, excluded from generic-store writes and from every generic read. The only read is the Forensics-gated `GET /api/v1/forensics/agents/{id}/app-usage` / MCP `get_agent_app_usage`, with a per-open audit that fails closed (§27.2). *(Evidence: `docs/user-manual/inventory.md`; `docs/adr/0016-agent-daily-sync-framework.md` 2026-09-17 update.)*
+ADR-0016 source `app_usage`: `agents/core/src/sync_source_app_usage.{hpp,cpp}` reads the `app_usage` plugin's machine-scope fold of Echo's usage data and pushes it daily to the server `AppUsageStore` (`server/core/src/app_usage_store.{hpp,cpp}`). It is a typed source, excluded from generic-store writes and from every generic read. The only per-device read is the Forensics-gated `GET /api/v1/forensics/agents/{id}/app-usage` / MCP `get_agent_app_usage`, with a per-open audit that fails closed (§27.2). The fleet aggregate per Apps application is `GET /api/v1/dex/apps/usage` (REST only, no MCP tool yet; `Forensics:Read` and `GuaranteedState:Read`, audited `dex.apps.usage.view`, fails closed). *(Evidence: `docs/user-manual/inventory.md`; `docs/adr/0016-agent-daily-sync-framework.md` 2026-09-17 update.)*
 
 ---
 

@@ -6,15 +6,16 @@
 /// reuses it so the two surfaces cannot diverge.
 ///
 /// Rules the output keeps (each pinned by a test):
-///  - A withheld figure is JSON null, never 0.
+///  - A withheld figure is JSON null, never 0 (an ambiguous name withholds its device count
+///    too; an application nobody ran has a true count of 0).
 ///  - Every cell carries its `kind`; a label is data (a tag value or a group
 ///    id), so a consumer keys on `kind` and escapes the label.
 ///  - Invalid UTF-8 in a label is replaced, never thrown on.
 ///  - No agent id appears: the model holds none.
 
-#include "dex_usage_model.hpp"
-
 #include <string>
+
+#include "dex_usage_model.hpp"
 
 namespace yuzu::server {
 

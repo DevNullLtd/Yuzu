@@ -5334,10 +5334,15 @@ groups:
             (four at once, retryable). reason="statement_timeout" is the read
             running past its 10 s bound; three in a row spanning two minutes with
             no success make the route answer fleet_too_large (503 with no retry
-            hint), which a retry does not clear: the usage side has no index on
-            the executable key, so the fix is that index or a precomputed
-            rollup (see "Fleet usage per application" in the Digital Employee
-            Experience guide).
+            hint), which a retry does not clear. Measured on one test host over a
+            synthetic dataset of about 205 usage rows per device, the read cost
+            4.1 s at 60,000 online devices and reaches the 10 s bound near
+            150,000 by extrapolation (not a guaranteed ceiling); an index on the
+            executable key did not change the plan. Only platform= narrows the
+            read, there is no operator-side fix today, the state clears on the
+            first successful read, and the other DEX routes are unaffected. Runbook:
+            docs/dex/app-usage.md#runbook-fleet_too_large (check
+            yuzu_pg_pool_in_use and yuzu_pg_acquire_wait_seconds as well).
             See #2659 for the deferred-widening posture behind this metric.
           runbook_url: "https://docs.yuzu.io/runbooks/guardian-read-degraded"
 

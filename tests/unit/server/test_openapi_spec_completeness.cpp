@@ -875,6 +875,8 @@ TEST_CASE("openapi_spec_json(): /dex/apps/usage documents its six parameters and
           json::array({"matched", "no_usage", "ambiguous_name"}));
     CHECK(schema_at(usage, "/properties/apps/items/properties/cells/items/properties/kind/enum") ==
           json::array({"named", "untagged", "other"}));
+    // An ambiguous name withholds its device count as null, so the schema says devices can be null.
+    CHECK(schema_at(usage, "/properties/apps/items/properties/devices/nullable") == true);
 }
 
 TEST_CASE("openapi_spec_json(): DexAppsList covers every population basis and the coverage the "

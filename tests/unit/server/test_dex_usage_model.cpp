@@ -830,7 +830,8 @@ TEST_CASE("usage builder: the query carries the scope, the cells and one instant
     // Every cut derives from the one instant 1,700,000,000.
     CHECK(q.since_iso == "2023-11-07T22:13:20Z"); // 7 days back
     CHECK(q.until_iso == "2023-11-14T22:13:20Z");
-    CHECK(q.fresh_since_epoch == kNow - 172800);
+    // The freshness cut is a width (48 h), never an instant: the owner applies it to the database clock.
+    CHECK(q.fresh_secs == 172800);
     CHECK(r->population == 4);
     CHECK(r->window == "7d");
     CHECK(r->platform_scope == "all");
@@ -1044,8 +1045,11 @@ TEST_CASE("usage serializer: ambiguous_name and no_usage rows carry their state 
         CHECK(a["launches_30d"].is_null());
         CHECK(a["exposure_rate"].is_null());
         CHECK(a["cells"].empty());
-        CHECK(a["devices"] == 0);
     }
+    // A withheld figure is null, never 0: an ambiguous name withholds its device count too, while
+    // an application nobody ran has a true count of 0.
+    CHECK(b["apps"][0]["devices"].is_null());
+    CHECK(b["apps"][1]["devices"] == 0);
 }
 
 TEST_CASE("usage serializer: a cell is keyed on its kind, so a label that imitates a residual differs",

@@ -152,8 +152,9 @@ public:
         if (!usage_.read)
             return unexpected(DexUsageRefusal{"usage_unavailable", "not_wired"});
 
-        // ONE instant and ONE fleet snapshot for the whole request: the window cut, the freshness
-        // cut, the Apps population and the usage population all derive from them.
+        // ONE instant and ONE fleet snapshot for the whole request: the observation window cut, the
+        // Apps population and the usage population all derive from them. The usage freshness cut
+        // does not: the owner measures it against the database clock that authored `last_seen`.
         const std::int64_t now = request_instant();
         const std::optional<DexFleet> snapshot{fleet_fn_()};
         DexFleet visible_fleet = *snapshot;

@@ -478,8 +478,8 @@ A failed bump aborts the deactivation (the account stays active, a store failure
 A seventh query owner: `DexAppUsageOwner` (`dex_app_usage_owner.{hpp,cpp}`), the read behind the
 fleet application usage model of the Digital Employee Experience (DEX) Apps list. It is a READ join
 across `app_usage_store.agent_last_used`, `app_usage_store.usage_state` and
-`guaranteed_state_store.guardian_observations` on one lease (`pool.with_txn_for`, `SET LOCAL
-statement_timeout`, one statement). One statement matters for the same reason as the fifth owner:
+`guaranteed_state_store.guardian_observations` on one lease (`try_acquire_for`, then `with_txn_on` on that lease, `SET
+LOCAL statement_timeout`, one statement). One statement matters for the same reason as the fifth owner:
 usage collection can be off per device, so crashes and hangs counted on every online device over
 usage from only the reporting devices would overstate the exposure rate. The usage totals, the
 exposed events and the reporting count therefore come from one population. A device counts only when
@@ -503,5 +503,8 @@ acquire timeout and a transaction failure are told apart. Each fault counts
 `yuzu_server_guardian_read_degrade_total{reason, source="dex_usage"}`. The owner also keeps a
 sustained-timeout state: three or more consecutive statement timeouts whose unbroken run is at
 least two minutes old (any success resets both) are reported to the surface as `fleet_too_large`
-instead of the retryable `statement_timeout`. A burst of concurrent reads timing out in one stall
-cannot span two minutes, so it stays retryable.
+instead of the retryable `statement_timeout`. A stall shorter than two minutes stays retryable; only a
+success resets the run, so a database-wide stall of two minutes or more can reach `fleet_too_large`
+too. The freshness cut is a width (48 hours) applied to the database's own `now()` inside the one
+statement, never an instant taken from a replica clock, so a replica clock that is out of step with
+the database cannot move the fresh and stale counts.

@@ -67,7 +67,9 @@ std::string dex_apps_usage_json(const DexAppsUsageModel& m) {
         json o;
         o["subject"] = a.subject;
         o["state"] = state_token(a.state);
-        o["devices"] = a.devices;
+        // An ambiguous name withholds the device count with the figures (null, never 0); a no_usage
+        // row is a true count of 0, and a below-floor row publishes its real count.
+        o["devices"] = a.state == DexUsageState::AmbiguousName ? json(nullptr) : json(a.devices);
         // null = withheld (below the floor, no usage or an ambiguous name), never 0.
         o["run_seconds_30d"] = a.totals ? json(a.totals->run_seconds_30d) : json(nullptr);
         o["launches_30d"] = a.totals ? json(a.totals->launches_30d) : json(nullptr);

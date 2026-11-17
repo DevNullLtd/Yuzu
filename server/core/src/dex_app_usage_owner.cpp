@@ -44,7 +44,8 @@ static_assert(kDexUsageConcurrentReads <= GuaranteedStateStore::kDexAppsConcurre
 // unique: a repeated id repeats its rows in every sum and in the coverage counts
 // (no DISTINCT here, so this population stays the same list the Apps read took
 // at face value). st: those with a usage_state row, `fresh` against the server
-// receipt time. m: the match keys.
+// receipt time on the DATABASE clock (now() minus the freshness width, never a
+// replica instant). m: the match keys.
 // mu: usage rows of FRESH devices that match a key (an exact key matches any
 // device; a trunc key only a Linux one), with the agent-reported values clamped.
 // agent_last_used is keyed (agent_id, exe_key) and a subject's exact key never
@@ -60,14 +61,17 @@ static_assert(kDexUsageConcurrentReads <= GuaranteedStateStore::kDexAppsConcurre
 // per-device cap applies to the Apps stability score only. Events clustered on one
 // crash-looping device make the interval falsely narrow (the consumer duty at
 // dex_stats.hpp).
-// ponytail: no exe_key index on agent_last_used, so the usage side is a filtered
-// scan bounded by the statement timeout; add an index (a migration) only when a
-// measured fleet nears that bound. Past the bound every request times out; after
-// kDexUsageTimeoutsBeforeTooLarge in a row over kDexUsageTimeoutRunBeforeTooLarge
-// the owner reports fleet_too_large (not retryable) until the index or a
-// precomputed rollup exists; the fleet size at which that happens has not been
-// measured. The result is bounded by the caller's subject and cell counts (one row
-// per application and cell, one per application, one coverage row).
+// ponytail: the usage side is a filtered scan of agent_last_used bounded by the statement
+// timeout, so its cost grows with the number of online devices in the population. Measured on
+// one test host over a synthetic dataset of about 205 usage rows per device: about 68
+// microseconds per device, 4.1 s at 60,000 devices; the 10 s bound is reached near 150,000
+// online devices by extrapolation (not a guaranteed ceiling). An index on the executable key
+// did not change the plan in that measurement. Past the bound every request times out; after
+// kDexUsageTimeoutsBeforeTooLarge in a row over kDexUsageTimeoutRunBeforeTooLarge the owner
+// reports fleet_too_large (not retryable), which clears on the first successful read. Only a
+// narrower platform scope reduces the read; there is no operator-side fix today. The result is
+// bounded by the caller's subject and cell counts (one row per application and cell, one per
+// application, one coverage row).
 const std::string& read_sql() {
     static const std::string sql =
         "WITH pop AS ("
@@ -75,7 +79,7 @@ const std::string& read_sql() {
         " FROM unnest($1::text[], $2::int[], $3::bool[]) AS p(agent_id, cell, is_linux)), "
         "st AS ("
         " SELECT pop.agent_id, pop.cell, pop.is_linux,"
-        "  (us.last_seen >= to_timestamp($10::bigint)) AS fresh"
+        "  (us.last_seen >= now() - $10::bigint * interval '1 second') AS fresh"
         " FROM pop JOIN app_usage_store.usage_state us ON us.agent_id = pop.agent_id), "
         "m AS ("
         " SELECT k.subject, k.match_key, k.is_trunc"
@@ -219,7 +223,7 @@ std::expected<DexUsageRead, DexReadFault> DexAppUsageOwner::read(const DexUsageQ
         pg::to_text_array(views(q.subjects)),
         q.since_iso,
         q.until_iso,
-        std::to_string(q.fresh_since_epoch)};
+        std::to_string(q.fresh_secs)};
     const std::string set_timeout =
         "SET LOCAL statement_timeout = '" + std::to_string(statement_timeout_.count()) + "ms'";
 

@@ -23,7 +23,11 @@ hands what to whom, not of behaviour:
      wiring (`dex_usage`), and that wiring's `read` must capture `dex_app_usage_owner_`. Without
      it GET /api/v1/dex/apps/usage answers a not_wired refusal on a healthy server while every
      route test still passes, since each builds its own wiring. Its four degrade reasons must be
-     pre-seeded at zero on source `dex_usage`, for the same reason as property 3.
+     pre-seeded at zero on source `dex_usage`, for the same reason as property 3. The other three
+     assignments (`group_members`, `tag_values`, `observation_retention_days`) must exist too: a
+     missing one is a refused slice or an `invalid_request` on a healthy server. And the group
+     closure reads the members BEFORE the group's existence, so a group deleted between the two
+     reads is an `unknown_group` 400 and never a cached whole-population 200.
 
 `//` and block comments are stripped before matching, so prose cannot satisfy a check. The
 self-test applies in-memory mutations and requires problems() to report each one.
@@ -69,6 +73,21 @@ def problems(server_text: str) -> list:
     if not re.search(r"\bdex_usage\.read\s*=\s*\[[^\]]*\bdex_app_usage_owner_\b", code):
         found.append("server.cpp: dex_usage.read does not capture dex_app_usage_owner_ (the usage "
                      "route would read from nothing)")
+    gm = re.search(r"\bdex_usage\.group_members\s*=(.*?)(?=\bdex_usage\.\w+\s*=)", code, re.S)
+    if not gm:
+        found.append("server.cpp: no dex_usage.group_members assignment (a group slice would be refused "
+                     "on a healthy server)")
+    else:
+        members_at = gm.group(1).find("get_members_checked(")
+        group_at = gm.group(1).find("get_group_checked(")
+        if members_at < 0 or group_at < 0 or members_at > group_at:
+            found.append("server.cpp: dex_usage.group_members must call get_members_checked( before "
+                         "get_group_checked( (a group deleted in between must be unknown_group, never "
+                         "a cached whole-population 200)")
+    for field in ("tag_values", "observation_retention_days"):
+        if not re.search(rf"\bdex_usage\.{field}\s*=", code):
+            found.append(f"server.cpp: no dex_usage.{field} assignment (the usage route would refuse "
+                         "every read it needs it for)")
     seed = next((m for m in re.finditer(r"for\s*\(\s*const\s+auto\s+reason\s*:\s*\{([^}]*)\}\s*\)\s*"
                                         r"metrics_\.counter\(([^;]*)\);", code)
                  if '"dex_usage"' in m.group(2)), None)
@@ -120,6 +139,16 @@ class DexAppsWiring(unittest.TestCase):
             "dex_usage pre-seed on the wrong source": mutated(
                 '{{"reason", reason}, {"source", "dex_usage"}}', '{{"reason", reason}, {"source", "guardian_state"}}'),
         }
+        i, j = base.index("dex_usage.group_members = [this]"), base.index("dex_usage.tag_values = [this]")
+        region = (base[i:j].replace("get_members_checked", "@@").replace("get_group_checked", "get_members_checked")
+                  .replace("@@", "get_group_checked"))
+        cases["group existence read before the members"] = base[:i] + region + base[j:]
+        cases["group_members assignment removed"] = mutated("dex_usage.group_members = [this]",
+                                                            "dex_usage.group_members_x = [this]")
+        cases["tag_values assignment removed"] = mutated("dex_usage.tag_values = [this]",
+                                                         "dex_usage.tag_values_x = [this]")
+        cases["observation_retention_days assignment removed"] = mutated(
+            "dex_usage.observation_retention_days = ", "dex_usage.observation_retention_days_x = ")
         for label, text in cases.items():
             self.assertTrue(problems(text), f"mutation not reported: {label}")
         # A mention in a comment must not satisfy a pin.

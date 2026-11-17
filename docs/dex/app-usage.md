@@ -86,26 +86,32 @@ Parameters, all optional:
 | `window` | `24h`, `7d`, `30d`, `all` | `7d` |
 | `platform` | `all`, `windows`, `macos`, `linux` | `all` |
 | `slice` | `fleet`, `platform`, `group`, `tag` | `fleet` |
-| `group` | a management group id, 1 to 256 bytes; required with `slice=group`, refused otherwise | none |
+| `group` | a management group id, at most 256 bytes of text with no control characters (valid UTF-8); required with `slice=group`, refused otherwise | none |
 | `tag_key` | a device tag key; refused unless `slice=tag` | `model` |
 | `floor` | an integer from 1 to 10000 | `1` |
 
-An off-enum or out-of-range value, and a parameter given outside its slice, are a
-`400`. A `group` that names no management group is also a `400`
+An off-enum or out-of-range value, a parameter given outside its slice and a
+`group` that cannot name a group (empty, over 256 bytes, a control character or
+invalid UTF-8) are a `400` that leaves no audit row and runs no read. A `group`
+that is well formed but names no management group is also a `400`
 (`unknown management group`); it is never a `200` with the whole fleet in the
-`other` cell.
+`other` cell, and it does leave its audit row (see
+[Fleet permissions and audit](#fleet-permissions-and-audit)).
 
 Each application carries:
 
 - `state`: `matched`, `no_usage` (no reporting device ran it) or `ambiguous_name`
   (its usage name is shared by two applications, so neither is attributed);
 - `devices`, `run_seconds_30d` and `launches_30d`, summed over the devices that
-  reported usage for it;
+  reported usage for it. `devices` is the real count when the figures are below
+  the floor, `0` for `no_usage`, and `null` for `ambiguous_name`;
 - `cells`: the same figures per cell of the slice (`fleet`; a platform; the group
   and everyone else; each tag value);
-- `exposure_rate`: crashes plus hangs per process-hour of use, with an interval
-  at the score policy's confidence level, or `null` with `rate_withheld` naming
-  why.
+- `exposure_rate`: crashes plus hangs per process-hour of use (`per_hour`, an
+  object of `estimate`, `lower`, `upper` and `reliable`, at the score policy's
+  confidence level; `estimate` and `upper` are `null` when not finite), the
+  `hours` of use it divides by, the raw `crashes` and `hangs`, and the `basis`;
+  or `null` with `rate_withheld` naming why.
 
 ### How to read the figures
 
@@ -114,14 +120,19 @@ Each application carries:
   (window days over 30). `window=all` has no length, and a window longer than the
   observation retention would need a second estimate, so those give
   `rate_withheld` of `unbounded_window` or `window_exceeds_retention` and no rate.
-- **A withheld figure is `null`, never `0`.** `rate_withheld` is one of
+- **A withheld figure is `null`, never `0`.** An `ambiguous_name` application
+  withholds its `devices` as well. `rate_withheld` is one of
   `below_floor`, `no_usage`, `ambiguous_name`, `unbounded_window`,
   `window_exceeds_retention`, `zero_usage` or `no_statistic`.
 - **Fresh devices only.** A device counts only when the server received its usage
-  state in the last 48 hours (`freshness_window_hours`). `reporting_devices` and
-  `stale_devices` say how many of the `population` did and did not; a stale
-  device adds to no figure. `population` is the devices in the platform scope
-  online now, and `0` is a valid answer: every application then reads `no_usage`.
+  state in the last 48 hours of the database clock (`freshness_window_hours`), so a
+  replica clock that is out of step cannot change the count. `reporting_devices`
+  and `stale_devices` count the devices that have reported usage at least once (a
+  fresh and an older usage state respectively); `population` minus both is the
+  devices that never have. A stale device adds to no figure. `population` is the
+  devices in the platform scope online now, and `0` is a valid answer: every
+  application then reads `no_usage`. A new fleet reads `no_usage` everywhere until
+  the first daily usage sync lands.
 - **Process-hours, not user hours.** Run time is summed per process run, so
   concurrent instances add up.
 - **Raw crash and hang counts.** They are not capped per device. Events clustered
@@ -131,6 +142,8 @@ Each application carries:
   `untagged` or `other`. A tag value of `other` or `(untagged)` is a `named` cell
   with that label, never the residual, so a consumer keys on `kind` and escapes
   the `label`.
+- **At the default floor of 1 a cell can be one device's figures.** Raise `floor`
+  to publish only cells of at least that many devices.
 
 ### The floor applies to one table only
 
@@ -145,19 +158,27 @@ not on the set of responses a caller can ask for.
 
 The route needs both `GuaranteedState:Read` and `Forensics:Read`, because the body
 names the applications that crash. While RBAC is off, `Forensics:Read` is
-administrator-only, so only an administrator can call it. ForensicsAnalyst holds
-`Forensics:Read` but not `GuaranteedState:Read`, so it is refused. A
-service-scoped token is refused.
+administrator-only, so only an administrator can call it. Under RBAC only the
+Administrator role holds both permissions, so delegating the route means a custom
+role that carries both. ForensicsAnalyst holds `Forensics:Read` but not
+`GuaranteedState:Read`, so it is refused. A service-scoped token is refused.
 
-Every admitted request writes a `dex.apps.usage.view` audit row **before** the
-read, with an empty target, the request shape (window, platform, slice, floor) and
-no agent id. If the row cannot be stored the route answers `503` with
-`Sec-Audit-Failed: true` and does not read. The row records the admitted request,
-not its outcome: a later `400` or `503` still leaves it.
+Every request that passes parameter validation writes a `dex.apps.usage.view`
+audit row **before** the read, with an empty target and the request shape (window,
+platform, slice, the tag key or group id asked for, floor). The row names no
+device and no agent id. If the row cannot be stored the route answers `503` with
+`Sec-Audit-Failed: true` and does not read. The row records the request that was
+admitted, not its outcome: an unknown-group `400` or a `503` after the row still
+leaves it, while a `400` for a malformed parameter is refused before it and leaves
+none. This is the one DEX aggregate that is audited, because it names the
+applications that crash across the whole fleet.
 
-The route filters its device list to what the caller is admitted to, before the
-figures are built. Today that filter is inert: every admitted caller sees the
-whole fleet.
+The usage figures are computed over the caller's visible devices only: the route
+hands the caller's device scope to the model, which filters its device list before
+the figures are built. The application list itself is the fleet list that
+`GuaranteedState:Read` already serves, so it is not filtered. The filter is inert
+for every caller admitted today (with RBAC off only an administrator passes, and
+`Forensics:Read` has no group-scoped tier), so this is not per-group confinement.
 
 ### Cache, budget and failure
 
@@ -168,21 +189,41 @@ whole fleet.
   `concurrency_budget`, retryable. A usage request also takes one slot of the
   Apps list's own read budget, so heavy use of one can make the other answer
   `concurrency_budget`.
-- A failed read is a `503` that names the reason, with `retry_after_ms` 2000,
-  never a `200` with zero figures: `pool_acquire_timeout`, `query_error`,
-  `statement_timeout`, `concurrency_budget`, `apps_degraded`, `group_unavailable`
-  or `tag_unavailable`. Each fleet usage read failure also counts
-  `yuzu_server_guardian_read_degrade_total` with source `dex_usage`.
+- A failed read is a `503` that names the reason, never a `200` with zero figures:
+  `pool_acquire_timeout`, `query_error`, `statement_timeout`, `concurrency_budget`,
+  `apps_degraded`, `group_unavailable` or `tag_unavailable` carry `retry_after_ms`
+  2000. `no_population` (no fleet source wired) and `invalid_request` carry no retry
+  hint, and so does `fleet_too_large` below. The four owner reasons
+  (`pool_acquire_timeout`, `query_error`, `statement_timeout`, `concurrency_budget`)
+  count `yuzu_server_guardian_read_degrade_total` with source `dex_usage`; the other
+  causes count on the underlying store's own degrade family (`apps_degraded` on
+  source `guardian_state`, `group_unavailable` on
+  `yuzu_server_mgmt_group_read_degrade_total`, `tag_unavailable` on
+  `yuzu_server_tag_store_read_degrade_total`).
 
 ### Runbook: `fleet_too_large`
 
 `fleet_too_large` means at least 3 consecutive statement timeouts spanning at
-least 2 minutes with no success in between. The usage side of the read has no index
-on the executable key, so on a large fleet the on-request read no longer fits its
-10-second bound. The `503` carries no `retry_after_ms`, because retrying does not
-clear it. The fix is an index on the executable key of the usage table, or a
-precomputed rollup. A single stall that times out several concurrent reads stays
-a retryable `statement_timeout`, because it cannot span 2 minutes.
+least 2 minutes with no success in between: the on-request read no longer fits its
+10-second bound. A stall shorter than 2 minutes stays a retryable
+`statement_timeout`; a database-wide stall of 2 minutes or more can reach
+`fleet_too_large` too, and the first successful read clears it. The `503` carries
+no `retry_after_ms`, because retrying a read that is over its bound does not help.
+
+- **Scale.** Measured on one test host over a synthetic dataset of about 205 usage
+  rows per device, the read costs about 68 microseconds per online device: 4.1
+  seconds at 60,000 devices. By extrapolation the 10-second bound is reached near
+  150,000 online devices. That is a measurement on one host, not a guaranteed
+  ceiling; the read has not been measured past 60,000 devices.
+- **What helps.** Only `platform=` narrows the read. The `group` and `tag` slices
+  only assign cells, so they read the whole platform scope. An index on the
+  executable key did not change the query plan in that measurement. There is no
+  operator-side fix today; the state clears on the first successful read.
+- **What is unaffected.** Other DEX routes, including the Apps list, keep working.
+- **Pool pressure.** Usage reads and Apps reads have separate budgets of 4, so up
+  to 8 pool leases can be in use at once. If reads time out together with slow
+  acquires, check `yuzu_pg_pool_in_use` and `yuzu_pg_acquire_wait_seconds`, and
+  raise `--postgres-pool-size` if they show pressure.
 
 ## Using the plugin directly
 
@@ -203,7 +244,7 @@ Read the health row of `summary` before treating a result as complete.
 |---|---|---|
 | Per-device REST route, MCP tool, dashboard panel | `Forensics:Read`, scoped to the device. Administrator and ForensicsAnalyst hold it by default. | `app_usage.agent.view`, written before any data is served. If the row cannot be stored the read fails closed: REST answers `503` with `Sec-Audit-Failed: true`, MCP answers with an error and no data, and the dashboard panel shows a note instead of the figures. |
 | `app_usage` plugin actions | `Forensics:Read`, administrator or approval | Standard command audit |
-| Fleet REST route | `Forensics:Read` and `GuaranteedState:Read` | `dex.apps.usage.view`, written before the read and failing closed, as described [above](#fleet-permissions-and-audit) |
+| Fleet REST route | `Forensics:Read` and `GuaranteedState:Read` | `dex.apps.usage.view`, written before the read (after parameter validation) and failing closed, as described [above](#fleet-permissions-and-audit) |
 
 A service-scoped token is refused on the REST route and the MCP tool, and the
 dashboard panel shows a permission note instead of data, because the service

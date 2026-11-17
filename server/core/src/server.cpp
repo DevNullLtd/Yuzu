@@ -20665,20 +20665,22 @@ private:
                 return std::move(*r);
             };
             // unknown_group (no such group: a 400) is told apart from group_unavailable (a failed
-            // read: a retryable 503). A group deleted between the two reads reads as zero members
-            // for that one request.
+            // read: a retryable 503). The members are read FIRST and the group's existence second:
+            // a group that exists after the member read existed during it, so those members are
+            // valid, and a group deleted in between is unknown_group (a 400, never cached) rather
+            // than a whole-population 200 built from zero members.
             dex_usage.group_members = [this](const std::string& id)
                 -> std::expected<std::vector<std::string>, std::string> {
                 if (!mgmt_group_store_)
+                    return std::unexpected(std::string("group_unavailable"));
+                const auto members = mgmt_group_store_->get_members_checked(id);
+                if (!members)
                     return std::unexpected(std::string("group_unavailable"));
                 const auto group = mgmt_group_store_->get_group_checked(id);
                 if (!group)
                     return std::unexpected(std::string("group_unavailable"));
                 if (!*group)
                     return std::unexpected(std::string("unknown_group"));
-                const auto members = mgmt_group_store_->get_members_checked(id);
-                if (!members)
-                    return std::unexpected(std::string("group_unavailable"));
                 std::vector<std::string> ids;
                 ids.reserve(members->size());
                 for (const auto& m : *members)

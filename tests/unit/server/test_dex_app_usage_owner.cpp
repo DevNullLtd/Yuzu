@@ -7,8 +7,8 @@
  * aggregates per (application, cell) and never an agent id.
  *
  * Window used throughout: since = now - 7 days (inclusive), until = now
- * (exclusive); freshness cut = now - 48 hours against the server receipt time
- * (usage_state.last_seen), aged by a direct UPDATE, never by sleeping.
+ * (exclusive); freshness = the last 48 hours of the DATABASE clock against the server
+ * receipt time (usage_state.last_seen), aged by a direct UPDATE, never by sleeping.
  */
 
 #include "dex_app_usage_owner.hpp"
@@ -124,7 +124,7 @@ DexUsageQuery make_query(std::int64_t now, const std::vector<std::string>& agent
     q.keys = yuzu::server::dex_usage_match_plan(subjects);
     q.since_iso = yuzu::server::dex_iso_at(now - 7 * 86400);
     q.until_iso = yuzu::server::dex_iso_at(now);
-    q.fresh_since_epoch = now - yuzu::server::kDexUsageFreshSecs;
+    q.fresh_secs = yuzu::server::kDexUsageFreshSecs;
     return q;
 }
 
@@ -354,15 +354,57 @@ TEST_CASE("DexAppUsageOwner leaves a stale device out of every figure", "[pg][de
     CHECK(stale->reporting_devices == 1);
     CHECK(stale->stale_devices == 1);
 
-    // With the cut moved before the aged row's last_seen the same device counts again.
+    // With the freshness width widened past the aged row's age the same device counts again.
     auto q = make_query(now, {"fresh", "old"}, {"alpha.exe"});
-    q.fresh_since_epoch = now - 10 * 86400;
+    q.fresh_secs = 10 * 86400;
     const auto back = owner.read(q);
     REQUIRE(back.has_value());
     REQUIRE(back->cells.size() == 1);
     CHECK(back->cells[0].devices == 2);
     CHECK(back->reporting_devices == 2);
     CHECK(back->stale_devices == 0);
+}
+
+// Freshness is cut against the database clock (last_seen is authored by it), never the caller's
+// instant: the window instants below are skewed by a day and a half either way and by two days, and
+// the fresh/stale split must not move.
+TEST_CASE("DexAppUsageOwner cuts freshness on the database clock, whatever instant the caller holds",
+          "[pg][dex_usage]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_usage_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AppUsageStore usage{pool};
+    REQUIRE(usage.is_open());
+
+    seed_usage(usage, "fresh", {{"alpha.exe", 1, 100}});
+    seed_usage(usage, "edge", {{"alpha.exe", 2, 200}});
+    seed_usage(usage, "old", {{"alpha.exe", 4, 400}});
+    age_state(db.dsn(), "edge", "47 hours"); // inside the 48 h width
+    age_state(db.dsn(), "old", "50 hours");  // outside it
+    // "never" has no usage_state row at all: it is in neither count.
+
+    DexAppUsageOwner owner{pool};
+    const std::int64_t wall = now_epoch();
+    for (const std::int64_t skew : {std::int64_t{0}, std::int64_t{36 * 3600}, std::int64_t{-36 * 3600},
+                                    std::int64_t{49 * 3600}, std::int64_t{-49 * 3600}}) {
+        CAPTURE(skew);
+        const auto r = owner.read(make_query(wall + skew, {"fresh", "edge", "old", "never"}, {"alpha.exe"}));
+        REQUIRE(r.has_value());
+        CHECK(r->reporting_devices == 2); // fresh and edge
+        CHECK(r->stale_devices == 1);     // old
+        REQUIRE(r->cells.size() == 1);
+        CHECK(r->cells[0].devices == 2);
+        CHECK(r->cells[0].launches == 3); // fresh + edge; old is stale, never has no usage
+        CHECK(r->cells[0].run_seconds == 300);
+    }
+
+    // The width is the only freshness input: narrowing it to 46 hours makes the 47 h device stale.
+    auto q = make_query(wall, {"fresh", "edge", "old", "never"}, {"alpha.exe"});
+    q.fresh_secs = 46 * 3600;
+    const auto narrow = owner.read(q);
+    REQUIRE(narrow.has_value());
+    CHECK(narrow->reporting_devices == 1);
+    CHECK(narrow->stale_devices == 2);
 }
 
 TEST_CASE("DexAppUsageOwner matches a 15-byte prefix on Linux devices only", "[pg][dex_usage]") {
@@ -652,6 +694,8 @@ TEST_CASE("DexAppUsageOwner reports a real statement timeout, a sustained run an
     const auto detail = [&](std::chrono::steady_clock::time_point at) {
         return std::string(owner.unavailable_detail(DexReadFault::kStatementTimeout, at));
     };
+    // The instant right after a run's FIRST timeout (QE-2: the run start is stamped there only).
+    std::chrono::steady_clock::time_point after_first_timeout;
     // Three statement timeouts in a row, under a lock that is released on return.
     const auto timeout_run = [&] {
         yuzu::server::pg::PgConn locker{PQconnectdb(db.dsn().c_str())};
@@ -666,6 +710,8 @@ TEST_CASE("DexAppUsageOwner reports a real statement timeout, a sustained run an
             const auto timed_out = owner.read(make_query(now, {"d1"}, {"alpha.exe"}));
             REQUIRE_FALSE(timed_out.has_value());
             CHECK(timed_out.error() == DexReadFault::kStatementTimeout);
+            if (i == 0)
+                after_first_timeout = std::chrono::steady_clock::now();
         }
         REQUIRE(yuzu::server::pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{})
                     .status() == PGRES_COMMAND_OK);
@@ -680,6 +726,10 @@ TEST_CASE("DexAppUsageOwner reports a real statement timeout, a sustained run an
     const auto later = at + kDexUsageTimeoutRunBeforeTooLarge + 1s;
     CHECK(detail(at) == "statement_timeout");
     CHECK(detail(later) == "fleet_too_large");
+    // The run's start is the FIRST timeout's, not the last: two more real timeouts (500 ms each)
+    // ran after `after_first_timeout`, so a start that moved to the last one would be younger than
+    // two minutes at that instant plus two minutes.
+    CHECK(detail(after_first_timeout + kDexUsageTimeoutRunBeforeTooLarge) == "fleet_too_large");
     CHECK(std::string(owner.unavailable_detail(DexReadFault::kQueryError, later)) == "query_error");
 
     // A success ends the run: the same far instant is retryable again.

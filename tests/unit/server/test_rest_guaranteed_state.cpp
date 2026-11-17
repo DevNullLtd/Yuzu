@@ -665,8 +665,9 @@ struct RestGsHarness {
         std::shared_ptr<yuzu::server::DexApi> dex_api_local;
         if (store && wire_dex_api_) {
             // The usage reads behind GET /api/v1/dex/apps/usage. group_members mirrors server.cpp's
-            // closure over this harness's management group store: unknown_group (no such group)
-            // is told apart from group_unavailable (a failed read).
+            // closure over this harness's management group store, in the same order (members
+            // first, then the group's existence): unknown_group (no such group) is told apart from
+            // group_unavailable (a failed read).
             yuzu::server::DexUsageWiring usage;
             usage.read = [this](const yuzu::server::DexUsageQuery& q)
                 -> std::expected<yuzu::server::DexUsageRead, std::string> {
@@ -678,14 +679,14 @@ struct RestGsHarness {
             };
             usage.group_members = [this](const std::string& id)
                 -> std::expected<std::vector<std::string>, std::string> {
+                const auto members = mgmt_.get_members_checked(id);
+                if (!members)
+                    return std::unexpected(std::string("group_unavailable"));
                 const auto group = mgmt_.get_group_checked(id);
                 if (!group)
                     return std::unexpected(std::string("group_unavailable"));
                 if (!*group)
                     return std::unexpected(std::string("unknown_group"));
-                const auto members = mgmt_.get_members_checked(id);
-                if (!members)
-                    return std::unexpected(std::string("group_unavailable"));
                 std::vector<std::string> ids;
                 for (const auto& m : *members)
                     ids.push_back(m.agent_id);
@@ -3513,7 +3514,7 @@ TEST_CASE("REST dex/apps/usage: a failed read is a retryable 503 that names the 
           "fleet application usage unavailable (usage_unavailable: statement_timeout)");
     CHECK(timeout->body.find("\"apps\"") == std::string::npos);
 
-    // Sustained timeouts: no retry hint, and a remediation that points at the index or rollup.
+    // Sustained timeouts: no retry hint, and a remediation that says retrying does not help.
     h.usage_read_for_test = [](const yuzu::server::DexUsageQuery&)
         -> std::expected<yuzu::server::DexUsageRead, std::string> {
         return std::unexpected(std::string("fleet_too_large"));
@@ -3524,7 +3525,8 @@ TEST_CASE("REST dex/apps/usage: a failed read is a retryable 503 that names the 
     CHECK(j["error"]["retry_after_ms"].is_null());
     CHECK(j["error"]["message"] ==
           "fleet application usage unavailable (usage_unavailable: fleet_too_large)");
-    CHECK(j["error"]["remediation"].get<std::string>().find("index") != std::string::npos);
+    CHECK(j["error"]["remediation"].get<std::string>().find("retrying does not help") != std::string::npos);
+    CHECK(j["error"]["remediation"].get<std::string>().find("index") == std::string::npos);
     CHECK(too_large->body.find("\"apps\"") == std::string::npos);
 
     // An Apps read that cannot be had is a retryable 503 too.
@@ -3564,6 +3566,17 @@ TEST_CASE("REST dex/apps/usage: the group slice is a 400 for an unknown group an
     CHECK(unknown->body.find("\"apps\"") == std::string::npos);
     CHECK(h.audit_log.size() == 1); // the request was admitted; the row records that
 
+    // A 256-byte id is within the documented bound: validation accepts it, so it reaches the
+    // group lookup and is the same unknown-group 400, with its audit row (a 257-byte id is refused
+    // by validation instead, with no row: see the parameter case below).
+    auto longest = h.sink.Get(std::string(kUsageRoute) + "?window=all&slice=group&group=" +
+                                  std::string(256, 'g'),
+                              h.status_route_headers());
+    REQUIRE(longest);
+    CHECK(longest->status == 400);
+    CHECK(nlohmann::json::parse(longest->body)["error"]["message"] == "unknown management group");
+    CHECK(h.audit_log.size() == 2);
+
     auto ok = h.sink.Get(std::string(kUsageRoute) + "?window=all&slice=group&group=" + *gid,
                          h.status_route_headers());
     REQUIRE(ok);
@@ -3599,6 +3612,13 @@ TEST_CASE("REST dex/apps/usage: every off-enum, out-of-range or out-of-slice par
              // The slice's own parameter is required, bounded and valid.
              std::string("slice=group"), std::string("slice=group&group="),
              std::string("slice=group&group=") + too_long_group,
+             // A group id that cannot name a group is refused here, before the audit row and the
+             // read (not a retryable 503 from the store): NUL, a newline, DEL, bytes that are not
+             // UTF-8 (a lone 0xFF, an overlong 0xC0 0x80, a truncated sequence).
+             std::string("slice=group&group=%00"), std::string("slice=group&group=a%00b"),
+             std::string("slice=group&group=a%0Ab"), std::string("slice=group&group=%7F"),
+             std::string("slice=group&group=%FF"), std::string("slice=group&group=%C0%80"),
+             std::string("slice=group&group=ab%C3"),
              std::string("slice=tag&tag_key=bad$key"), std::string("slice=tag&tag_key=") + too_long_key,
              std::string("slice=tag&tag_key=")}) {
         CAPTURE(q);
@@ -3639,6 +3659,18 @@ TEST_CASE("REST dex/apps/usage: valid parameters reach the model", "[pg][rest][d
     CHECK(d["apps"][0]["rate_withheld"].is_null());
     CHECK(d["apps"][0]["exposure_rate"]["crashes"] == 2);
     CHECK(d["apps"][0]["exposure_rate"]["hours"].get<double>() == Catch::Approx(2.0));
+
+    // The documented maxima are accepted: floor 10000 and a 64-byte tag key.
+    auto top_floor = h.sink.Get(std::string(kUsageRoute) + "?window=all&floor=10000", h.status_route_headers());
+    REQUIRE(top_floor);
+    REQUIRE(top_floor->status == 200);
+    CHECK(nlohmann::json::parse(top_floor->body)["data"]["floor"] == 10000);
+    auto long_key = h.sink.Get(std::string(kUsageRoute) + "?window=all&slice=tag&tag_key=" + std::string(64, 'k'),
+                               h.status_route_headers());
+    REQUIRE(long_key);
+    REQUIRE(long_key->status == 200);
+    CHECK(nlohmann::json::parse(long_key->body)["data"]["slice"]["key"] == std::string(64, 'k'));
+    CHECK(h.audit_log.size() == 3);
 }
 
 TEST_CASE("REST dex/apps: the platform scope selects the population and the coverage",
