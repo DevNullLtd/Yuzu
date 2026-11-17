@@ -11,8 +11,12 @@
  *  - case 2 (subtree replaced): strictly_advances losing its RESTART transition fails `advances` (the
  *    restarted slice returns an earlier position under generation + 1); record_slice counting a restarted
  *    slice as a stall fails consecutive_stalls == 0; next_cursor not stepping the generation on
- *    `restarted` fails generation == 1.
+ *    `restarted` fails generation == 1; next_cursor not carrying the generation on a slice that did not restart
+ *    (resetting it to 0) fails generation == 1 on every cursor issued after the restart, and the ORDINARY
+ *    transition refusing a generation above 0 fails the driver's own `advances` REQUIRE on those slices.
  *  - case 3 (root replaced): a RESTART transition that constrains the root identity fails `advances`.
+ *    The ORDINARY transition refusing the root identity the restart recorded fails the driver's `advances`
+ *    REQUIRE on the slices after it; the walker not carrying that identity forward in its position fails root_file_id == 99.
  *  - case 3b (root identity learned later): strictly_advances demanding an unchanged root once either
  *    half is known fails the driver's own `advances` REQUIRE on the slice that reveals the missing half;
  *    accepting a known half that went back to 0 or became another value fails the forged-cursor CHECKs.
@@ -265,13 +269,13 @@ TEST_CASE("resume contract: a subtree replaced between slices is a legitimate re
     CHECK(s.gov.restarts == 1);
     CHECK(s.gov.health == fsr::Health::ok);
 
-    s.wl.max_entries = 100;
+    s.wl.max_entries = 2; // the walk is still unfinished after the restart: ORDINARY transitions under generation 1
     s.run();
-    for (std::size_t i = 2; i < s.results.size(); ++i) {
+    for (std::size_t i = 2; i < s.results.size(); ++i)
         CHECK_FALSE(s.results[i].restarted);
-        if (i + 1 < s.issued.size())
-            CHECK(s.issued[i + 1].generation == 1);
-    }
+    REQUIRE(s.issued.size() > 3); // issued[0..2] precede the first slice after the restart
+    for (std::size_t k = 3; k < s.issued.size(); ++k)
+        CHECK(s.issued[k].generation == 1); // each was validated by the driver as an ORDINARY transition
     CHECK(s.tail(1) == std::vector<std::string>{"/r/X/a", "/r/X/b", "/r/X/m", "/r/X/z", "/r/X/zz", "/r/Y"});
     CHECK(s.gov.health == fsr::Health::ok);
 }
@@ -300,10 +304,15 @@ TEST_CASE("resume contract: a root replaced between slices is a legitimate resta
     CHECK(fsr::strictly_advances(before, s.cursor)); // `advances`
     CHECK(s.gov.consecutive_stalls == 0);
 
-    s.wl.max_entries = 100;
+    s.wl.max_entries = 2; // the walk is still unfinished after the restart: ORDINARY transitions under the new root
     s.run();
     for (std::size_t i = 2; i < s.results.size(); ++i)
         CHECK_FALSE(s.results[i].restarted);
+    REQUIRE(s.issued.size() > 3); // issued[0..2] precede the first slice after the restart
+    for (std::size_t k = 3; k < s.issued.size(); ++k) {
+        CHECK(s.issued[k].generation == 1);
+        CHECK(s.issued[k].position.root_file_id == 99);
+    }
     CHECK(s.tail(1) == ref.visits); // every entry of the new root is visited
     CHECK(s.gov.health == fsr::Health::ok);
 }
