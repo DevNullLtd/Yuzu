@@ -29,9 +29,10 @@ The agent retries the open 1, 5 and 15 minutes after the first failure and then 
 limit. Each migration attempt is bounded by a deadline (60 seconds plus 2 seconds per MiB of the
 file, doubled for every attempt that ran out of time, capped at one hour) and rolls back if it
 hits it. A failure that repeats costs a full read of the file (the integrity check) per attempt
-and, when it reaches the migration, a write-ahead log of up to 1.35 times the file; it does not
-fix itself, so repair or escalate rather than wait. Collection stays stopped until an attempt
-succeeds, then `storage_state|ok` returns on its own.
+and, when it reaches the migration, a write-ahead log that can outgrow the file (measured at 1.35
+times the file in one run; no general bound is proven); it does not fix itself, so repair or
+escalate rather than wait. Collection stays stopped until an attempt succeeds, then
+`storage_state|ok` returns on its own.
 
 ## Symptom
 

@@ -1098,8 +1098,12 @@ public:
 
         spdlog::info("Echo plugin initialized (fast={}s, slow={}s, db={})", fast_interval,
                      slow_interval, db_path_.string());
-        // Leave the offline state and open the dispatch gate, in that order, last.
-        ctx.storage_delete(yuzu::echo::kStorageOfflineKey);
+        // Leave the offline state and open the dispatch gate, in that order, last. A failed tag
+        // delete never keeps Echo offline: the slow collect replays it (do_collect_slow), because
+        // the heartbeat bridge re-reads the key on every beat and would keep reporting offline.
+        if (!ctx.storage_delete(yuzu::echo::kStorageOfflineKey))
+            spdlog::warn("ECHO: the storage-offline heartbeat tag was not cleared; retried on the "
+                         "slow collect");
         {
             std::lock_guard lock(offline_mu_);
             offline_ = {};
@@ -3088,6 +3092,13 @@ private:
         {
             yuzu::PluginContext pctx{plugin_ctx_};
             reconcile_db_health_publish(pctx);
+            // Replay a storage-offline tag delete that failed when the open recovered. Stateless
+            // and safe: this tick runs only past the online_ gate, where nothing legitimately
+            // sets the key (go_offline runs only while offline).
+            if (pctx.storage_exists(yuzu::echo::kStorageOfflineKey) &&
+                !pctx.storage_delete(yuzu::echo::kStorageOfflineKey))
+                spdlog::warn("ECHO: the storage-offline heartbeat tag is still set after "
+                             "recovery and could not be cleared; retried on the next slow collect");
         }
         // §3.8 bounded mapdrive-backfill retry (related issue #5291): above collect_mu_, same as
         // init()'s call site, so hive I/O never runs under the shared lock. Cheap when nothing is
