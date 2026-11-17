@@ -43,7 +43,7 @@
  *     cupsd consults the Unix-domain-socket peer's credentials ONLY when
  *     the request carries header `Authorization: PeerCred <username>` —
  *     hence `clear_queue` sends BOTH
- *     `requesting-user-name=<getpwuid(geteuid())->pw_name>` in the IPP
+ *     `requesting-user-name=<getpwuid_r(geteuid()) pw_name>` in the IPP
  *     request body AND that same header, over the Unix socket ONLY. No
  *     socket -> refused, `<os>:cups:socket_unavailable`, never a TCP
  *     fallback for this action (TCP `localhost:631` is used for READ
@@ -90,6 +90,7 @@
 #include <type_traits>
 #include <vector>
 
+#include "printing_identity.hpp"
 #include "printing_ipp.hpp"
 #include "printing_parsers.hpp"
 
@@ -778,12 +779,10 @@ constexpr int kReadTimeoutSec = 5;
 }
 
 [[nodiscard]] std::string current_username() {
-    // getpwuid(geteuid()) — the real effective-user CUPS's peer-credential
-    // check reads off the Unix socket; not getlogin(), which reads the
-    // controlling terminal's login name and can disagree with euid.
-    if (struct passwd* pw = getpwuid(geteuid()); pw != nullptr && pw->pw_name != nullptr)
-        return std::string(pw->pw_name);
-    return std::string();
+    // The real effective user CUPS's peer-credential check reads off the Unix socket; not
+    // getlogin(), which reads the controlling terminal's login name and can disagree with euid.
+    // Reentrant lookup, name copied out at once (#4679): see printing_identity.hpp.
+    return yuzu::printing::username_for_uid(geteuid());
 }
 
 // Issues one IPP POST over the CUPS Unix socket (set_address_family(AF_UNIX)
