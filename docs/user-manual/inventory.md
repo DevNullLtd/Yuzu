@@ -989,7 +989,7 @@ a statement timeout there degrades the page to a 503 (tracked in #5698). A conti
 ### Exporting the installed-software inventory
 
 `GET /api/v1/inventory/software/export?format=jsonl|csv` writes every installed-software row
-that matches your filters as one download, with no row cap: JSONL is one JSON object per line,
+that matches your filters as one download, with no paging: JSONL is one JSON object per line,
 CSV is the 23 columns of the list under a single header row. It takes the filters of the
 route above (`format=json` is not accepted, and `cursor` and `limit` are refused). It is
 confined to your scope like the rest of the Inventory reads; a wide scope is filtered on the
@@ -1009,6 +1009,7 @@ A few rules for what you build on it:
 
 - **A cut-short transfer is an incomplete file.** The server cannot change the status after the first byte, so a failed read, a run past 900 seconds or a server shutdown ends the response without its final chunk and your HTTP client reports an aborted transfer. Start again; do not use the partial file. A clean end means complete.
 - **Two exports at a time by default.** Each open export holds a server worker and one lease from the server's held-open stream budget, so a third request gets `503` with `retry_after_ms` 5000. The limit is `--inventory-export-concurrency`, shared by every caller of the server ([Server administration](server-admin.md)). The same `503` is returned when the server's whole held-open budget (`--max-sse-streams`) is full; retry shortly.
+- **There is a size limit.** One export writes at most 5,000,000 rows and 1 GiB by default (`--inventory-export-max-rows`, `--inventory-export-max-bytes`, [Server administration](server-admin.md)). Past either, the transfer is cut like any other failure, so an over-large request never produces a file that looks complete. Narrow the filters and export in parts. A spreadsheet may stop at its own row limit (commonly 1,048,576 rows) with no error from the server.
 - **It is a live walk, not a snapshot.** A device that reports while the export runs can have rows repeated or missed.
 - **Audited once, up front** as `inventory.software.export` (see [Audit log](audit-log.md)), and counted in `yuzu_server_software_export_total` ([Metrics](metrics.md)).
 - **REST only.** A streamed file is not a tool call, so there is no MCP tool; an agentic worker pages the same rows with `query_installed_software`.

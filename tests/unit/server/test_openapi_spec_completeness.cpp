@@ -2514,8 +2514,8 @@ TEST_CASE("openapi_spec_json(): the #7217 per-device summary properties are type
 }
 
 // UP-14 server PR A5a: the stored per-agent ordering state. The key sets are pinned above; this
-// pins each new property's type, nullability and bound, and that the description says the pair is
-// stored and counted, not yet compared.
+// pins each new property's type, nullability and bound, and that the description says the server
+// orders a census verdict by the pair (the pre-B "not yet compared" wording is gone).
 TEST_CASE("openapi_spec_json(): the per-agent ordering properties are typed, bounded and described",
           "[openapi][guardian][ordering][pair]") {
     for (const bool with_guides : {false, true}) {
@@ -2544,7 +2544,8 @@ TEST_CASE("openapi_spec_json(): the per-agent ordering properties are typed, bou
         CHECK(ids["items"].value("type", "") == "string");
         const std::string sdesc = sget.value("description", "");
         CHECK(sdesc.find("unordered_agents") != std::string::npos);
-        CHECK(sdesc.find("not yet compared") != std::string::npos);
+        CHECK(sdesc.find("orders a census verdict by the emit-order pair") != std::string::npos);
+        CHECK(sdesc.find("not yet compared") == std::string::npos); // the pre-B wording is gone
 
         // Per-device all-guards read.
         const json& gget = spec["paths"].at("/guaranteed-state/agents/{agent_id}/rules").at("get");
@@ -2585,8 +2586,10 @@ TEST_CASE("openapi_spec_json(): the per-agent ordering properties are typed, bou
         }
         const std::string gdesc = gget.value("description", "");
         CHECK(gdesc.find("ordering") != std::string::npos);
-        CHECK(gdesc.find("not yet compared") != std::string::npos);
-        CHECK(p["pair_duplicates"].value("description", "").find("0 until") != std::string::npos);
+        CHECK(gdesc.find("classify each census-bearing first delivery") != std::string::npos);
+        CHECK(gdesc.find("not yet compared") == std::string::npos); // the pre-B wording is gone
+        CHECK(p["pair_duplicates"].value("description", "").find("Equal pairs refused") !=
+              std::string::npos);
         const std::string g200 = gget.at("responses").at("200").value("description", "");
         CHECK(g200.find("ordering") != std::string::npos);
     }

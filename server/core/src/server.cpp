@@ -52,6 +52,7 @@
 #include "approval_manager.hpp"
 #include "audit_store.hpp"
 #include "credential_change_owner.hpp" // #5342 — one-transaction local credential change
+#include "mfa_disable_owner.hpp"        // #6079 PR 2c: one-transaction local MFA factor clear
 #include "echo_corruption_audit.hpp" // #1567 corruption audit gate
 #include "body_cap_httplib.hpp" // header-derived body-cap arguments read the way httplib reads them
 #include "body_cap_policy.hpp" // #2407: pre-auth request-body cap policy table
@@ -714,9 +715,11 @@ public:
         // reason exist from boot, so a first rejection reads as an increase from 0.
         metrics_.describe("yuzu_server_software_export_total",
                           "Streamed installed-software exports that ended, by format (jsonl/csv) "
-                          "and result (completed/degraded/deadline/aborted); anything but "
+                          "and result (completed/degraded/deadline/aborted/limit); anything but "
                           "completed is a transfer the client saw truncated; aborted covers a "
-                          "client that went away and a server that began shutting down",
+                          "client that went away and a server that began shutting down; limit is "
+                          "a stream cut at --inventory-export-max-rows or "
+                          "--inventory-export-max-bytes",
                           "counter");
         metrics_.describe("yuzu_server_software_export_rejected_total",
                           "Streamed installed-software exports refused with a 503, by reason: "
@@ -3835,9 +3838,9 @@ public:
             "clear_mfa_proof / rebind_guard / elevate / account_state, the last being the "
             "read of the account store that gates a durable local session); a validate "
             "degrade fails the request closed, and elevate / revoke (via invalidate_user) "
-            "degrades fail the privileged op closed, except "
-            "that an invalidate_user after an already-committed MFA clear leaves the "
-            "clear in place and ends partial",
+            "degrades fail the privileged op closed; the Settings MFA disable and "
+            "--mfa-reset no longer call invalidate_user and are not counted on this "
+            "series (their failures are the 503 / error audit rows)",
             "counter");
         for (auto op : {"validate", "create", "touch", "generation_refresh", "reap",
                         "invalidate_user", "invalidate", "mark_mfa", "clear_mfa_proof",
@@ -4551,34 +4554,59 @@ public:
             "until a redelivery of that event repairs the census row or a later event for the "
             "pair arrives. A repair runs no order step, so an event whose first delivery failed "
             "that step never reaches the agent's order clock. A "
-            "repair that fails is counted here again. >0 means the census may be "
-            "stale; the server log line 'census upsert failed' names the agent "
-            "and rule (the order step logs 'agent order step failed' with the agent and event). "
+            "repair that fails is counted here again, and so is a repair shed at the cap on "
+            "concurrent repairs: a shed is a capacity signal, not a fault, and is counted "
+            "separately on yuzu_server_guardian_repairs_shed_total with a 'repair shed' warning "
+            "in the server log (a shed writes no 'census upsert failed' line). >0 means the census "
+            "may be stale; the server log line 'census upsert failed' names the agent "
+            "and rule of a failed census write, and the order step logs 'agent order step failed' "
+            "with the agent and event (a statement timeout, SQLSTATE 57014, under database stress "
+            "is one cause). "
             "A write refused because the rule is not defined on this "
             "server (the census foreign key, SQLSTATE 23503) is a normal "
             "outcome and is not counted; a failure to retire the evidence of "
             "such an event is an ingest error.",
             "counter");
-        metrics_.describe("yuzu_server_guardian_census_projection_total",
-                          "Compliance-census projections by source (first_delivery, repair, "
-                          "batch) and outcome (applied, refused_flagged, refused_noop, "
-                          "pending_retired, rejected, failed, abandoned). A refused outcome means "
-                          "the event was dominated by the stored verdict; refused_flagged also "
-                          "marks the pair order_uncertain. pending_retired is a repair that found "
-                          "its evidence already retired; rejected is a write refused because the "
-                          "rule is gone (not a fault); failed is a fault that leaves pending "
-                          "evidence, except for source batch, whose failure rolls back the whole batch "
-                          "(this count is not rolled back; see "
-                          "..._census_proj_failures_total); a failed per-agent emit-order step is "
-                          "also counted failed (on a first delivery the census write is then "
-                          "skipped); abandoned aborted the "
-                          "transaction (counted again as an ingest error); it includes a failed "
-                          "control statement of the emit-order step's savepoint and, on a first "
-                          "delivery, a failed write of the pending evidence after a failed order "
-                          "step. Counted when the "
-                          "projection returns, before the transaction commits. Resets on server "
-                          "restart.",
+        metrics_.describe(
+            "yuzu_server_guardian_census_projection_total",
+            "Compliance-census projections by source (first_delivery, repair, "
+            "batch) and outcome (applied, refused_flagged, refused_noop, "
+            "pending_retired, rejected, failed, abandoned). A refused outcome "
+            "means "
+            "the event was dominated by the stored verdict; refused_flagged also "
+            "marks the pair order_uncertain. pending_retired is a repair that found "
+            "its evidence already retired; rejected is a write "
+            "refused because the "
+            "rule is gone (not a fault); failed is a fault that leaves pending "
+            "evidence (a repair shed at the cap on concurrent repairs also counts here, as a "
+            "capacity signal and not a fault; see yuzu_server_guardian_repairs_shed_total), "
+            "except for source batch, whose failure rolls back the whole batch "
+            "(this count is not rolled back; see "
+            "..._census_proj_failures_total); a failed per-agent emit-order step is "
+            "also counted failed (on a first delivery the census write is then "
+            "skipped); abandoned aborted the "
+            "transaction (counted again as an ingest error); it includes a failed "
+            "control statement of the emit-order step's savepoint and, on a first "
+            "delivery, a failed write of the pending evidence after a failed order "
+            "step. Counted when the "
+            "projection returns, before the transaction commits. Resets on server "
+            "restart.",
+            "counter");
+        metrics_.describe(detail::kGuardianRepairsShedMetric,
+                          "Redelivery repairs of pending census evidence that the server refused "
+                          "because the cap on concurrent repairs (4 per process) was full. A shed "
+                          "is a capacity signal, not a fault: the event stays stored with pending "
+                          "evidence, nothing is written, and the repair is not retried by the "
+                          "server. The agent does not resend an event it was acknowledged for, so "
+                          "a shed event is stranded until a later applying verdict for its agent "
+                          "and rule, a rule delete, or a decommission (or an agent lifecycle "
+                          "journal replay, when that journal is active). A shed is also counted "
+                          "as outcome=failed on yuzu_server_guardian_census_projection_total and "
+                          "on yuzu_server_guardian_census_proj_failures_total, and logs a "
+                          "'repair shed' warning once per episode and then every 100th. Resets on "
+                          "server restart.",
                           "counter");
+        detail::preseed_guardian_repairs_shed_metric(metrics_);
         metrics_.describe(detail::kGuardianEventsRejectedMetric,
                           "Guardian events refused at the ingest boundary before reaching the "
                           "store, by reason. empty_rule_id: the event carried no rule id, so it "
@@ -4590,14 +4618,44 @@ public:
                                         "pending_retired", "rejected", "failed", "abandoned"})
                 metrics_.counter("yuzu_server_guardian_census_projection_total",
                                  {{"source", source}, {"outcome", outcome}});
+        metrics_.describe(
+            detail::kGuardianCensusPairDecisionsMetric,
+            "Compliance-census decisions by decision label, one per census write that returned a "
+            "decision and whose census_upsert savepoint was released (a write rolled back to it, "
+            "after the upsert, counts nothing): applied_pair (a pair-ordered event became the "
+            "verdict), applied_key (an unpaired event, an unpaired_held one included, became the "
+            "verdict by the key rule over an unpaired or absent row), "
+            "transition_to_pair (a pair-ordered event replaced an unpaired verdict), "
+            "transition_to_key (an unpaired event replaced a paired verdict after the hold "
+            "expired), rebase (a stale pair clock was re-based: applied by arrival and flagged), "
+            "held_unpaired (an unpaired event refused over a paired row: while the pair clock is "
+            "fresh, or after the hold expired when the event is older by arrival than the paired "
+            "verdict), refused_regression (a lower epoch refused while the pair clock is fresh, "
+            "or by a Repair on a stale clock, which never re-bases the clock or fences the live "
+            "epoch), "
+            "refused_retired (an event of the retired epoch refused; both of these, over an "
+            "absent row, are an applied flagged insert), refused_duplicate (an equal "
+            "pair refused: two processes share one epoch) and refused_straggler (a same-epoch "
+            "lower sequence refused while the pair clock is fresh, or by a Repair on a stale "
+            "clock). A Repair of a stored event "
+            "counts its decision too. An unpaired event the key rule refuses has no label and "
+            "counts nothing. Counted when the projection returns, "
+            "after the census_upsert savepoint is released and before the transaction commits, so "
+            "a transaction that later rolls back as a whole (a failed later statement or commit) "
+            "still counts. Resets on server restart.",
+            "counter");
+        detail::preseed_census_pair_decision_metric(metrics_);
         metrics_.counter(detail::kGuardianEventsRejectedMetric, {{"reason", "empty_rule_id"}});
         metrics_.describe(detail::kGuardianPairRejectedMetric,
                           "Guardian events whose emit-order pair (boot_epoch, emit_seq) was "
                           "withheld at ingest, by reason. half_set: exactly one of the two was "
-                          "set. out_of_range: a set pair had a value of 2^62 or more. The event "
-                          "is still stored, unpaired, and its verdict decision is unaffected (the "
-                          "census row's stored pair becomes NULL when that unpaired verdict is applied); "
-                          "this is not a refusal. "
+                          "set. out_of_range: a set pair had a value of 2^62 or more. "
+                          "implausible: a set pair in range whose emit_seq was 2^40 or more or "
+                          "whose boot_epoch was more than ten years past the receipt time. The "
+                          "event is still stored, unpaired; it is not a refusal. An event with "
+                          "a withheld pair of any of the three reasons is judged as an unpaired "
+                          "one (the census row's stored pair becomes NULL only when an unpaired "
+                          "verdict is applied). "
                           "Counted once per withheld pair: a redelivery of the same event does "
                           "not count again. Resets on server restart.",
                           "counter");
@@ -4606,20 +4664,25 @@ public:
         metrics_.describe("yuzu_server_guardian_census_pending_events",
                           "Guardian events stored with pending census evidence: their census "
                           "write, or the per-agent emit-order step before it, failed and no "
-                          "redelivery has repaired it. Not updated while "
+                          "redelivery has retired it (a Repair refused as a regression against "
+                          "an unpaired census row, or a repair shed at the cap on concurrent "
+                          "repairs, keeps it pending). Not updated while "
                           "the store cannot answer. A sustained non-zero value means census "
                           "verdicts are waiting on an agent redelivery that may never come "
                           "(the stranded classes are listed in docs/clock-guarded-retention.md).",
                           "gauge");
-        metrics_.describe(detail::kGuardianCensusUnorderedAgentsMetric,
-                          "Agents whose latest accepted unpaired census-bearing event is later than "
-                          "the time their pair clock last advanced (an agent that never sent a "
-                          "pair counts; accepted means accepted for ordering). The pair is stored "
-                          "and counted, not yet compared: "
-                          "no verdict depends on it. Not updated while the store cannot answer, "
-                          "and absent until the first answered read. Per-agent detail is the "
-                          "ordering field of the per-device all-guards read.",
-                          "gauge");
+        metrics_.describe(
+            detail::kGuardianCensusUnorderedAgentsMetric,
+            "Agents whose latest accepted unpaired census-bearing event is later than "
+            "the time their pair clock last advanced, or whose pair clock is "
+            "recorded more than 300 s in the database's future (an agent that never "
+            "sent a pair counts; accepted means accepted for ordering). The value "
+            "is read against the database clock, so it can change between two "
+            "sweeps with no event. Not updated while the store "
+            "cannot answer, "
+            "and absent until the first answered read. Per-agent detail is the "
+            "ordering field of the per-device all-guards read.",
+            "gauge");
         metrics_.describe("yuzu_server_guardian_observations_reaped_total",
                           "Cumulative DEX observation rows deleted by the retention reaper "
                           "(disposal evidence for the behavioral-PII projection, WS-E)", "counter");
@@ -6537,6 +6600,14 @@ public:
                     credential_change_owner_ =
                         std::make_unique<CredentialChangeOwner>(*pg_pool_, audit_store_.get());
                     auth_mgr_.set_credential_change_owner(credential_change_owner_.get());
+                    // #6079 PR 2c: the sibling owner for clearing a local account's
+                    // second factor (Settings disable), the factor clear, the
+                    // account's durable sessions and the OUTCOME audit row in ONE
+                    // transaction on the same shared pool and audit store.
+                    // Nulled on auth_mgr_ at teardown beside the credential owner.
+                    mfa_disable_owner_ =
+                        std::make_unique<MfaDisableOwner>(*pg_pool_, audit_store_.get());
+                    auth_mgr_.set_mfa_disable_owner(mfa_disable_owner_.get());
                 }
             }
             // Internal-CA store — PostgreSQL (ADR-0053, schema ca_store): cert inventory + CRL
@@ -11933,6 +12004,9 @@ public:
         // pg_pool_ + audit_store_, both reset below).
         auth_mgr_.set_credential_change_owner(nullptr);
         credential_change_owner_.reset();
+        // #6079 PR 2c: same contract for the MFA-disable owner.
+        auth_mgr_.set_mfa_disable_owner(nullptr);
+        mfa_disable_owner_.reset();
         // #4966: same contract for the borrowed RbacStore (reset further below).
         auth_mgr_.set_rbac_store(nullptr);
 
@@ -18700,9 +18774,12 @@ private:
         // must not write an auth.admin_required row per panel. Mutating routes keep the loud
         // require_admin bound above. Wired before the listener starts.
         // The Settings disable ends the actor's own session (#6079), so the intent row and the
-        // outcome row (ok, partial or error) it writes around the clear need the session-bound
-        // writer, not the request-resolving one.
+        // denied/error outcome rows it writes around the clear need the session-bound writer, not
+        // the request-resolving one.
         settings_routes_->set_audit_as_session_fn(auth_routes_->audit_as_session_fn());
+        // #6079 PR 2c: the success outcome row is written INSIDE MfaDisableOwner's transaction;
+        // this builds its identity half with the same builder the session-bound writer uses.
+        settings_routes_->set_audit_event_for_session_fn(auth_routes_->audit_event_for_session_fn());
         // #6079: the recovery-codes and disable handlers use this gate instead of `step_up_fn`:
         // the same decision (`run_in_handler_step_up`), but it also returns the factor generation
         // it admitted, which the handler compares under the users row lock. Same sources as
@@ -21541,6 +21618,8 @@ private:
                     .metrics = &metrics_,
                     .stream_budget = stream_budget_.get(),
                     .concurrency = cfg_.inventory_export_concurrency,
+                    .limits = {.max_rows = cfg_.inventory_export_max_rows,
+                               .max_bytes = cfg_.inventory_export_max_bytes},
                 });
         }
 
@@ -25307,6 +25386,10 @@ private:
     /// stop() also resets it explicitly (after nulling auth_mgr_'s pointer)
     /// before audit_store_/pg_pool_ go.
     std::unique_ptr<CredentialChangeOwner> credential_change_owner_;
+    /// #6079 PR 2c: one-transaction MFA factor-clear query owner. Same borrow and
+    /// lifetime contract as credential_change_owner_ (declared after audit_store_,
+    /// nulled on auth_mgr_ and reset in stop() before audit_store_/pg_pool_).
+    std::unique_ptr<MfaDisableOwner> mfa_disable_owner_;
     std::unique_ptr<TagStore> tag_store_;
 
     // Phase 2: Instruction system

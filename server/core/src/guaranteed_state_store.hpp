@@ -328,10 +328,29 @@ public:
         agent_step_enabled_.store(enabled, std::memory_order_relaxed);
     }
 
-    /// The agent order step's own `lock_timeout`, in milliseconds. It bounds EACH lock wait in the
-    /// step (Ensure, DECIDE, and the one re-run after a concurrent delete), so a step can hold its
-    /// pooled connection for the sum of its waits. See the Timeouts paragraph on `agent_order_step`.
+    /// The agent order step's own `lock_timeout` and `statement_timeout` (this value plus
+    /// `kAgentStepStatementMarginMs`), in milliseconds. The lock bound is per lock wait and the
+    /// statement bound is the whole of each statement (Ensure, DECIDE, and the one re-run after a
+    /// concurrent delete), so a step can hold its pooled connection for the sum of its statements.
+    /// See the Timeouts paragraph on `agent_order_step`.
     static constexpr int kAgentStepLockTimeoutMs = 1000;
+
+    /// The margin by which the step's `statement_timeout` exceeds its `lock_timeout` (so the
+    /// statement bound is 1 s + 2 s = 3 s). It is above the lock bound for two reasons. First, a
+    /// lock wait begins after its statement does, so at equal values the statement timeout would
+    /// always end the wait (57014) and the lock timeout (55P03) could never be reached. Second,
+    /// and the reason it is 2 s and not a few hundred ms: one statement can wait in TWO stages,
+    /// the tuple-lock queue and then the holder's transaction, and each stage has its own
+    /// `lock_timeout`, so a single statement's waits can total two lock bounds even when every
+    /// individual wait is under one. Measured on a toy schema with the real Ensure and DECIDE
+    /// shapes: with a 1.5 s statement bound, a burst of about 50 first deliveries on one agent row,
+    /// each holding the row for a 10 to 20 ms commit, failed 12 to 37 of 50 with 57014 although
+    /// every individual lock wait was under 1 s. A failed delivery is stored pending and is not
+    /// resent (acks are unconditional), so that is a stranded row from plain same-agent contention.
+    /// At 2 s of margin the statement bound covers two full lock bounds. It is still a ceiling, not
+    /// a promise: a same-agent burst whose waits exceed it stores the delivery pending (see the
+    /// Timeouts paragraph on `agent_order_step`).
+    static constexpr int kAgentStepStatementMarginMs = 2000;
 
     /// Test seam: the `lock_timeout` the agent order step applies, in milliseconds (default
     /// `kAgentStepLockTimeoutMs`). A test that parks a delivery behind a held lock and expects the
@@ -341,6 +360,58 @@ public:
     void set_agent_step_lock_timeout_ms_for_test(int ms) noexcept {
         agent_step_lock_timeout_ms_.store(ms, std::memory_order_relaxed);
     }
+
+    /// The statement timeout a Repair of a pending event applies to its census statements, in
+    /// milliseconds, next to the step's lock bound above. A Repair holds the agent's order row
+    /// `FOR SHARE` from its clock read to the end of its transaction, so an unbounded census
+    /// statement (P-1) would hold that lock, and a pooled connection, for the pool's 30 s
+    /// statement timeout. At this bound the Repair is `Failed` instead (SQLSTATE 57014 rolled back
+    /// to its savepoint, the evidence kept for the next redelivery). First deliveries and batch
+    /// rows keep the connection's own statement timeout for their census statements (the first
+    /// delivery's order step has its own 3 s bound).
+    static constexpr int kRepairStatementTimeoutMs = 2000;
+
+    /// Test seam: the statement timeout a Repair applies, in milliseconds (default
+    /// `kRepairStatementTimeoutMs`). A test lowers it to reach SQLSTATE 57014 in a fraction of a
+    /// second. Production never sets it. Atomic, so a setter never races an ingest on another
+    /// thread.
+    void set_repair_statement_timeout_ms_for_test(int ms) noexcept {
+        repair_statement_timeout_ms_.store(ms, std::memory_order_relaxed);
+    }
+
+    /// How many Repairs of pending events may run at once in this process (the cap on a lease
+    /// held across a Repair's statements). A Repair holds a pooled connection for the sum of its
+    /// statements (the Ensure and the clock read, each under the 1 s lock bound per wait, then five
+    /// census statements under 2 s each), and the pool (16 connections) is shared with auth and
+    /// audit, so an unbounded storm of Repairs, which a gateway reconnect replays at up to 50 in
+    /// flight per node, would starve them. Measured on one host with a toy schema: 16 of 18 probe
+    /// acquires failed at a 500 ms probe bound with 50 Repair-like threads parked, and 0 with 8
+    /// parked. (500 ms is the bound of Guardian's own `kIngestTimeout`; the heartbeat's is 250 ms;
+    /// the audit store's are 2 s read and 4 s write.) At the cap, a Repair
+    /// that finds it full is SHED: the event stays pending and untouched, the transaction is rolled
+    /// back and the lease returned at once (see `insert_event_classified`). Repairs only: a first
+    /// delivery or a batch row is never refused by it.
+    static constexpr int kRepairMaxConcurrent = 4;
+
+    /// Test seam: the Repair cap (default `kRepairMaxConcurrent`). A test lowers or raises it to
+    /// reach the shed path with few threads. Production never sets it. Atomic, so a setter never
+    /// races an ingest on another thread.
+    void set_repair_max_concurrent_for_test(int n) noexcept {
+        repair_max_concurrent_.store(n, std::memory_order_relaxed);
+    }
+
+    /// Repairs in flight now (holding an admission), and how many were shed at the cap since
+    /// start. Lock-free reads, for tests.
+    int repairs_in_flight() const noexcept { return repairs_in_flight_.load(); }
+    uint64_t repairs_shed_total() const noexcept { return repairs_shed_.load(); }
+
+    /// The census statements whose PLANS a test pins (P-1), exactly as the store sends them: the
+    /// upsert (`$1`..`$12`) and the fold (`$1`..`$4`). A read of two string constants, no state.
+    struct CensusSqlForTest {
+        const char* upsert;
+        const char* fold;
+    };
+    [[nodiscard]] static CensusSqlForTest census_sql_for_test() noexcept;
 
     /// Test seam for `unrepresented_pending_for_agent` (#7217): while `fn` is set, every call that
     /// reaches the database step invokes it first and returns `std::unexpected` when it returns true,
@@ -584,8 +655,12 @@ public:
     std::expected<std::optional<GuardianAgentOrder>, std::string>
     agent_order_for_agent(std::string_view agent_id) const;
 
-    /// Agents currently unordered (`unpaired_recv_ns IS NOT NULL AND unpaired_recv_ns >
-    /// COALESCE(epoch_recv_ns, 0)`): the exact count and the first `kUnorderedAgentIdCap` ids in
+    /// Agents currently unordered (the latest accepted unpaired census-bearing event is later than
+    /// the pair clock, a NULL clock reading as 0, or the pair clock is recorded more than 300 s in
+    /// the database's future; one SQL definition shared with `agent_order_for_agent`'s
+    /// `currently_unordered` and `unordered_agent_count`, so the value can change with no event
+    /// when the database clock passes a recorded future clock): the exact count and the first
+    /// `kUnorderedAgentIdCap` ids in
     /// `agent_id COLLATE "C"` order. Same scope contract as `uncertain_rule_count`: `nullopt` = the
     /// whole fleet; engaged-empty = `{0, {}}` WITHOUT a query; a non-empty scope is applied IN SQL,
     /// so the count never includes a hidden agent. `std::unexpected`, never a silent zero, on any
@@ -731,6 +806,16 @@ private:
     std::function<void()> apps_read_barrier_;       // test seam, empty in production
     std::atomic<bool> agent_step_enabled_{true};    // test seam, true in production
     std::atomic<int> agent_step_lock_timeout_ms_{kAgentStepLockTimeoutMs}; // test seam, 1000 in production
+    std::atomic<int> repair_statement_timeout_ms_{kRepairStatementTimeoutMs};   // test seam, 2000
+    std::atomic<int> repair_max_concurrent_{kRepairMaxConcurrent};              // test seam, 4
+    // The Repair cap: Repairs holding an admission, Repairs refused at it (also the shed log
+    // sampler's count), and the sampler's last-shed time.
+    std::atomic<int> repairs_in_flight_{0};
+    std::atomic<uint64_t> repairs_shed_{0};
+    std::atomic<int64_t> repair_shed_last_ts_{0};
+    // The census-refusal log sampler (`note_refusal`): refusals counted, and the last one's time.
+    std::atomic<uint64_t> census_refusals_{0};
+    std::atomic<int64_t> census_refusal_last_ts_{0};
     std::function<void(AgentStepGap, const std::string&)> agent_step_gap_hook_; // test seam, empty in production
     std::function<bool()> unrepresented_pending_fault_; // test seam, empty in production
     std::atomic<int> unrepresented_pending_timeout_ms_{5000}; // test seam, 5000 in production
