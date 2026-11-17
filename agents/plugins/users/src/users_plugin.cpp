@@ -1462,7 +1462,10 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "local_admins",
         /* .linux_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 1, "getgrnam_r(sudo/wheel) + getpwuid_r(0)", nullptr},
+        // The mechanism strings below name the libc family (getgrnam/getpwuid); the code uses the
+        // reentrant _r forms. They are part of the capture leg-hash (plugin-readme-standard.md
+        // rule 6), so changing them forces a recapture of every OS leg: left as written.
+        {YUZU_SUPPORT_SUPPORTED, 1, "getgrnam(sudo/wheel) + getpwuid(0)", nullptr},
         /* .macos_leg   = */
         {YUZU_SUPPORT_SUPPORTED, 2,
          "runner argv 'dscl . -read /Groups/admin GroupMembership'", nullptr},
@@ -1472,7 +1475,7 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "group_members",
         /* .linux_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 1, "getgrnam_r + /etc/passwd primary-group scan", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "getgrnam + /etc/passwd primary-group scan", nullptr},
         /* .macos_leg   = */
         {YUZU_SUPPORT_SUPPORTED, 2,
          "runner argv 'dscl . -read /Groups/<name> GroupMembership'", nullptr},
