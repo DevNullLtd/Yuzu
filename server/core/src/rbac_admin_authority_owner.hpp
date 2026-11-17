@@ -56,7 +56,8 @@
 /// writers on one user's sessions (the unassign's row lock, `invalidate_user`, the reaper's
 /// DELETE, `delete_user_sessions_in_txn`, `SessionStore::clear_user_elevations`, which the
 /// eligibility revoke runs) can still deadlock on row order; Postgres aborts one
-/// victim and the unassign then rolls back as a retryable store failure.
+/// victim, which can be either writer (the session reaper, for example, and not the unassign);
+/// when it is the unassign it rolls back as a retryable store failure.
 ///
 /// The user Administrator unassign also ENDS the target's live JIT elevation in this same
 /// transaction (`session_sql::lock_user_session_rows_in_txn`, then

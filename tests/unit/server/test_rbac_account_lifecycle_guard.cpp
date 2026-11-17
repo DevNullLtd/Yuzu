@@ -1912,6 +1912,11 @@ TEST_CASE("unassign Administrator: an elevation write in flight on the target's 
     // order is pinned by the source-text tripwire in tests/test_session_account_gate_wiring.py.
     // The row starts unelevated, so without the lock statement the clear's own UPDATE (which
     // skips a zero row) would not wait: the case goes red there, at the blocked-backend wait.
+    // Timing: this store keeps the default 2000 ms lifecycle lock timeout, so the unassign's
+    // row-lock wait can time out (and `res` then holds the failure) if more than 2000 ms passes
+    // between the unassign blocking (which the blocked-backend poll waits for) and the commit
+    // below; normally that is milliseconds, but a heavily stalled runner (a sanitizer build,
+    // for example) could flake it.
     LIFECYCLE_FIXTURE(store, auth_db);
     yuzu::server::SessionStore sessions{auth_db.pool()};
     REQUIRE(sessions.is_open());

@@ -5411,11 +5411,11 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                             "application/json");
             return;
         }
-        // Revoking eligibility must terminate any in-flight elevation
-        // immediately (governance UP-1) — symmetric with the session
-        // wipe on demote/delete, so an incident-response "revoke now"
-        // actually drops the operator's admin access rather than
-        // leaving it standing for up to the window.
+        // Revoking eligibility must terminate any in-flight elevation (governance UP-1):
+        // at once on this replica, and on the others at their next session-generation poll
+        // (about 1 s, up to about 30 s while that read is failing or slow). Symmetric with the
+        // session wipe on demote/delete, so an incident-response "revoke now" actually drops
+        // the operator's admin access rather than leaving it standing for up to the window.
         int cleared = 0;
         if (!eligible) {
             auto rv = auth_mgr_.revoke_user_elevations(target);

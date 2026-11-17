@@ -1272,7 +1272,7 @@ TEST_CASE("unassign Administrator: the unassigning replica drops the elevation o
           "[auth][session_store][account_active][pg][unassign_elevation]") {
     UnassignWorld w;
     // No real poll may run before the staleness assertions: A's drop must come from the callback
-    // alone and B's staleness must not depend on how fast this runner is (qa-4).
+    // alone and B's staleness must not depend on how fast this runner is.
     w.a.suppress_session_generation_poll_for_test();
     w.b.suppress_session_generation_poll_for_test();
 
@@ -1306,7 +1306,7 @@ TEST_CASE("unassign Administrator: without the callback only the generation poll
           "(the wiring is what makes the unassigning replica immediate) (S10-C2)",
           "[auth][session_store][account_active][pg][unassign_elevation]") {
     UnassignWorld w(/*wire_callback=*/false);
-    w.a.suppress_session_generation_poll_for_test(); // staleness must not race a real poll (qa-4)
+    w.a.suppress_session_generation_poll_for_test(); // staleness must not race a real poll
     REQUIRE(w.f.rbac.unassign_role_detailed("user", "s10c_x", "Administrator").has_value());
 
     CHECK(w.elevated(w.a)); // stale warm cache: the baseline the callback exists to remove
@@ -1384,7 +1384,7 @@ TEST_CASE("unassign Administrator: a real AuthRoutes admin gate admits the eleva
         CHECK(before->status != 401);
     }
 
-    w.a.suppress_session_generation_poll_for_test(); // only the callback may drop A (qa-4)
+    w.a.suppress_session_generation_poll_for_test(); // only the callback may drop A
     REQUIRE(w.f.rbac.unassign_role_detailed("user", "s10c_x", "Administrator").has_value());
 
     const auto after = call();
@@ -1484,7 +1484,7 @@ TEST_CASE("an elevation write that stalls across an Administrator unassign does 
     std::optional<std::chrono::system_clock::time_point> until;
     ParkedWriter parked;
     parked.install(w.a, "elevate");
-    w.a.suppress_session_generation_poll_for_test(); // a real poll would mask a resurrection (qa-4)
+    w.a.suppress_session_generation_poll_for_test(); // a real poll would mask a resurrection
     parked.start([&] { until = w.a.elevate_session(w.token, std::chrono::seconds(300)); });
 
     // The writer's durable grant has committed and it is parked before touching the cache. Now the
@@ -1522,7 +1522,7 @@ TEST_CASE("an MFA stamp that stalls across an Administrator unassign does not re
     auto outcome = AuthManager::MfaStampOutcome::kStoreError;
     ParkedWriter parked;
     parked.install(w.a, "mfa_stamp");
-    w.a.suppress_session_generation_poll_for_test(); // a real poll would mask a resurrection (qa-4)
+    w.a.suppress_session_generation_poll_for_test(); // a real poll would mask a resurrection
     parked.start([&] {
         outcome = w.a.stamp_session_mfa_proof(
             w.token, yuzu::server::LocalMfaProof{0, wall_ms_minus(std::chrono::seconds(5))});

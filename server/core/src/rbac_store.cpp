@@ -2385,8 +2385,11 @@ RbacStore::unassign_role_detailed(const std::string& principal_type,
         if (user_admin && !outcome.ok && outcome.err.empty())
             drop_local();
         // The returned text below is a bare literal on this arm, so the pool's own last error is
-        // the only hint on-call gets at a lease timeout, a failed BEGIN or a lost COMMIT. It is
-        // log-only: `err` stays empty, which is what selects the local drop above.
+        // the only hint on-call gets here, and a best-effort one: `PgPool::last_error_` is set
+        // only on a few events (a lease timeout, a connect failure) and `run_in_txn` never sets
+        // it on a failed BEGIN or COMMIT, so for those the text may be empty or stale (the
+        // last event that did set it). It is log-only: `err` stays empty, which is what selects
+        // the local drop above.
         if (!outcome.ok && outcome.err.empty()) {
             const std::string pool_err = pool_.last_error();
             spdlog::warn("RbacStore: unassign_role transaction did not complete: user={} role={} "

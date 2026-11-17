@@ -1468,6 +1468,20 @@ auto-reverts — so a compromised everyday session is not a standing admin sessi
   the replica that handled the call and on the other replicas on their next poll of
   the session generation (about 1 s; up to about 30 s while that read is failing or
   slow; the restore caveat in the next bullet applies).
+  **An in-flight `POST /api/v1/elevate` is covered by an ordering argument.** The revoke
+  flips the `elevation_eligible` flag durably BEFORE it clears the user's durable
+  elevations, and `POST /api/v1/elevate` re-reads eligibility (fail closed) AFTER
+  `elevate_session` has committed and before it writes `role.elevation.granted`.
+  Either the re-read sees the flipped flag, and the route
+  compensates with `revoke_elevation` and answers `403` (`503` when the re-read fails;
+  `500` plus a CRITICAL log when the compensation itself fails, with a
+  `role.elevation.denied` row carrying `rollback_failed=true`), or the flip comes after
+  the re-read, which puts the revoke's clear after the elevation committed so the clear
+  matches the row and ends it. The check before `elevate_session` alone left a window in
+  which the clear matched no row and the elevation then committed and stood with
+  `eligible=false`. No `role.elevation.granted` row is written in the rolled-back cases.
+  Across replicas the same bound as above applies: the replica that served the revoke
+  converges at once, the others at their next generation poll.
 - **What ends a live elevation, and what does not.** An elevation is two
   durable columns on the user's `session_store.sessions` rows (`elevated_until_ms`,
   `elevation_issued_ms`); anything that zeroes them or deletes the row ends it.
@@ -1569,8 +1583,8 @@ auto-reverts — so a compromised everyday session is not a standing admin sessi
   loses elevation early and never adds access. `revoke_elevation` reads whether the
   session was elevated from this replica's cached copy first, so `was_elevated` in the
   `role.elevation.revoked` row can lag another replica's change by the generation poll
-  lag; the clear does not depend on that read. Follow-ups for these residuals are
-  tracked separately.
+  lag; the clear does not depend on that read. These residuals are known and are not
+  closed here.
 - **Activation** — `POST /api/v1/elevate`
   `{"justification": <required>, "duration_secs": <int>}`. Requires the caller to
   be eligible **and** present a mandatory second factor **and** pass a fresh MFA
@@ -1611,7 +1625,10 @@ auto-reverts — so a compromised everyday session is not a standing admin sessi
   space) and capped (1 KiB) into the audit detail. The `role.elevation.granted`
   audit is **fail-closed**: if it can't persist, the elevation is rolled back
   (compensating `revoke_elevation`) and the call 500s with `Sec-Audit-Failed`
-  — a privileged activation never stands without a record. Audits
+  — a privileged activation never stands without a record. Before that audit row, and
+  after `elevate_session` has committed, the handler re-reads eligibility once more (fail
+  closed) and compensates the same way when it was revoked (`403`) or cannot be read
+  (`503`); see the ordering argument in the eligibility bullet above. Audits
   `role.elevation.granted` (justification + the true post-clamp duration +
   `expires_at` — kept in sync across the audit row, the JSON response, and the
   analytics event); `role.elevation.denied` for an ineligible /
