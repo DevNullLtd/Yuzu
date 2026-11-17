@@ -319,7 +319,7 @@
       "server/core/src/capability_decls/plugin_action_catalogue_d.hpp"
     ],
     "changelog": [
-      "changelog.d/wp12-ioc-domain-cap.fixed.md"
+      "changelog.d/8164-ioc-domain-cap.fixed.md"
     ],
     "definitions": [
       "content/definitions/ioc.yaml"

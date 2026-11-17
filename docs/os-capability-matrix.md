@@ -885,10 +885,10 @@ implementation is.
 | users | local_users | linux | supported | 2 | /etc/passwd read + runner argv 'lastlog -u <user>' per account | - |
 | users | local_users | macos | supported | 2 | runner argv 'dscl . -list/-read UserShell/RealName' + 'last -y -1 <user>' per account | - |
 | users | local_users | windows | supported | 1 | NetUserEnum | - |
-| users | local_admins | linux | supported | 1 | getgrnam(sudo/wheel) + getpwuid(0) | - |
+| users | local_admins | linux | supported | 1 | getgrnam_r(sudo/wheel) + getpwuid_r(0) | - |
 | users | local_admins | macos | supported | 2 | runner argv 'dscl . -read /Groups/admin GroupMembership' | - |
 | users | local_admins | windows | supported | 1 | NetLocalGroupGetMembers | - |
-| users | group_members | linux | supported | 1 | getgrnam + /etc/passwd primary-group scan | - |
+| users | group_members | linux | supported | 1 | getgrnam_r + /etc/passwd primary-group scan | - |
 | users | group_members | macos | supported | 2 | runner argv 'dscl . -read /Groups/<name> GroupMembership' | - |
 | users | group_members | windows | supported | 1 | NetLocalGroupGetMembers | - |
 | users | primary_user | linux | supported | 2 | runner argv 'last -F' (max_lines=200 cap) | - |

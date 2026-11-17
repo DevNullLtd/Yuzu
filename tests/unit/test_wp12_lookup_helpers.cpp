@@ -375,6 +375,27 @@ TEST_CASE("dns cache list release: an allocation failure leaks the rest and neve
     CHECK(none.order.empty());
 }
 
+namespace {
+// A set whose CONSTRUCTOR throws (MSVC's containers allocate in the constructor).
+struct CtorThrowsSet {
+    CtorThrowsSet() { throw std::bad_alloc(); }
+    struct R { bool second; };
+    R insert(const void*) { return {true}; }
+    const void* const* find(const void*) { return nullptr; }
+    const void* const* end() { return nullptr; }
+};
+} // namespace
+
+TEST_CASE("dns cache list release: a throwing set constructor leaks the list and never throws",
+          "[wp12][dns_cache_list]") {
+    FakeNode n;
+    FreeLog log;
+    std::size_t freed = 99;
+    REQUIRE_NOTHROW(freed = yuzu::shared::release_dns_cache_list<CtorThrowsSet>(&n, std::ref(log)));
+    CHECK(freed == 0);
+    CHECK(log.order.empty());
+}
+
 TEST_CASE("dns cache list release: the node ceiling bounds a long list", "[wp12][dns_cache_list]") {
     const std::size_t total = yuzu::shared::kDnsCacheNodeWalkCap + 100;
     std::vector<FakeNode> nodes(total);

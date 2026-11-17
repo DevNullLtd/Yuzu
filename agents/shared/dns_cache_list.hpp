@@ -13,9 +13,9 @@
  *  - a name seen before AS A NAME (two healthy nodes sharing a buffer) is skipped, not freed
  *    again, and the walk continues; a name seen before as anything else ends the walk;
  *  - the node ceiling bounds a corrupted or cyclic pNext;
- *  - it never throws (the Windows owner's release() is noexcept): all bookkeeping for a node is
- *    done, inside try/catch, BEFORE pNext is read or anything is freed. A bad_alloc stops the walk
- *    and the remainder leaks.
+ *  - it never throws (the Windows owner's release() is noexcept): constructing the sets and all
+ *    bookkeeping for a node happen inside try/catch, BEFORE pNext is read or anything is freed. A
+ *    bad_alloc (even from a set's constructor, as on MSVC) stops the walk and the rest leaks.
  * Stopping always leaks the remainder rather than risking a second free. This guards LIST ALIASING
  * only; it says nothing about whether DnsFree(DnsFreeFlat) matches the list's allocator (see
  * WP12-risk-acceptance.md).
@@ -35,18 +35,20 @@ inline constexpr std::size_t kDnsCacheNodeWalkCap = 65536;
 /// a throwing allocator). Returns the number of nodes freed.
 template <typename Set = std::unordered_set<const void*>, typename Node, typename FreeFn>
 std::size_t release_dns_cache_list(Node* head, FreeFn&& free_one) noexcept {
-    Set seen;  // every node and name pointer seen so far (freed, or recorded just before a free)
-    Set names; // the subset of `seen` that was seen AS a name
     std::size_t freed = 0;
-    for (Node* p = head; p != nullptr && freed < kDnsCacheNodeWalkCap;) {
-        void* name = nullptr;
-        bool free_name = false;
-        try {
+    // The sets are constructed INSIDE the try: some standard libraries (MSVC's) allocate in a
+    // container's constructor, and an allocation failure there must leak the list, not reach a
+    // noexcept boundary and terminate the agent.
+    try {
+        Set seen;  // every node and name pointer seen so far (freed, or recorded just before a free)
+        Set names; // the subset of `seen` that was seen AS a name
+        for (Node* p = head; p != nullptr && freed < kDnsCacheNodeWalkCap;) {
             if (!seen.insert(static_cast<const void*>(p)).second)
                 break; // before ANY read of *p: it may already be freed
-            name = static_cast<void*>(p->pszName);
+            void* name = static_cast<void*>(p->pszName);
             if (name == static_cast<void*>(p))
                 break; // name aliases its own node
+            bool free_name = false;
             if (name != nullptr) {
                 if (seen.insert(static_cast<const void*>(name)).second) {
                     names.insert(static_cast<const void*>(name));
@@ -55,15 +57,16 @@ std::size_t release_dns_cache_list(Node* head, FreeFn&& free_one) noexcept {
                     break; // aliases a node already seen
                 }
             }
-        } catch (...) {
-            break; // bookkeeping could not allocate: leak the rest
+            Node* next = p->pNext; // only after the bookkeeping, and before the frees
+            if (free_name)
+                free_one(name);
+            free_one(static_cast<void*>(p));
+            ++freed;
+            p = next;
         }
-        Node* next = p->pNext; // only after the bookkeeping, and before the frees
-        if (free_name)
-            free_one(name);
-        free_one(static_cast<void*>(p));
-        ++freed;
-        p = next;
+    } catch (...) {
+        // bookkeeping could not allocate: whatever is left leaks (record-before-free: nothing
+        // was freed without having been recorded first)
     }
     return freed;
 }

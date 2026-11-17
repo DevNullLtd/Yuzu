@@ -55,8 +55,11 @@ inline constexpr std::string_view kRedactedEmailPlaceholder = "[redacted-email]"
 /// each followed by an unterminated '(' costs ~n^2/4 steps (minutes at the 1 MiB Local State
 /// read cap). No e-mail address is anywhere near `kEmailScanMaxBytes` (RFC 5321 caps one at 254),
 /// so a LONGER value that contains an '@' is reported as a match WITHOUT scanning: over-match is
-/// the documented safe direction. The scan that remains is bounded: at most ~1 KiB squared steps.
-inline constexpr std::size_t kEmailScanMaxBytes = 1024;
+/// the documented safe direction. The cap is 4 KiB, not smaller, because the WSL registry reader
+/// (virtualization_wsl_parsers.hpp, kMaxValueBytes = 4096) deliberately relies on the exact scan
+/// verdict for a value-sized `@(` worst case ("not an address", emitted as is); it static_asserts
+/// that its value cap stays within this one. The scan that remains is bounded: at most ~4 KiB squared steps (about 4M).
+inline constexpr std::size_t kEmailScanMaxBytes = 4096;
 
 [[nodiscard]] inline bool looks_like_email_address(std::string_view value) {
     if (value.size() > kEmailScanMaxBytes && value.find('@') != std::string_view::npos) {
