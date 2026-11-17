@@ -469,6 +469,20 @@ carries usernames / tenant / project names (`/home/jsmith/...`), which must not 
 `storage_low_observation` chokepoint the collector calls (subject / sentence / `detail_json`
 asserted free of any path component).
 
+**journald attribution is by journald-stamped sender fields only (F58 / #3872 / #3871).**
+`MESSAGE_ID`, `COREDUMP_*`, `UNIT` and `UNIT_RESULT` are client-settable, so alone they prove
+nothing. `service.crashed` / `service.hung` require `_PID=1` and `_UID=0` (the system manager;
+a user-manager entry carries `_UID=1000` and `USER_UNIT`, so nothing genuine is dropped);
+`process.crashed` requires `_UID=0` plus the `systemd-coredump` helper identity (`_COMM`
+`systemd-coredum` - the 15-char comm truncation - or `_SYSTEMD_UNIT=systemd-coredump@*`); the
+`os.time_unsynced` branch requires `_COMM=chronyd` AND `_SYSTEMD_UNIT=chronyd.service|chrony.service`
+(`_COMM` alone is settable with `prctl`). A missing or malformed trusted field drops the entry
+(fail closed), and the same terms are in the `journalctl` match so forged entries are not fetched
+or counted against the rate cap. Container journals with remapped uids see the container's root
+as `_UID=0`. UNCONFIRMED: the coredump identity terms come from systemd documentation, not a live
+specimen (none was available); a mismatch would silence `process.crashed`, so capture one on a host
+with an active coredump handler and correct the terms if they differ.
+
 **journald egress is comm/unit-only.** `process.crashed` ships the process **comm**, never
 `COREDUMP_EXE` (a full binary path that can embed a user/tenant directory); `memory.exhausted`
 ships the OOM **victim comm**, never the kernel memory figures (total-vm / anon-rss / file-rss) or

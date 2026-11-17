@@ -63,7 +63,7 @@ private:
 
 TEST_CASE("journal: coredump → process.crashed", "[guardian][dex][linux][journal]") {
     const std::string line =
-        R"({"__CURSOR":"s=ab;i=1;b=cd","MESSAGE_ID":"fc2e22bc6ee647b6b90729ab34a250b1",)"
+        R"({"__CURSOR":"s=ab;i=1;b=cd","MESSAGE_ID":"fc2e22bc6ee647b6b90729ab34a250b1","_UID":"0","_COMM":"systemd-coredum",)"
         R"("COREDUMP_COMM":"nginx","COREDUMP_SIGNAL":"11","COREDUMP_EXE":"/usr/sbin/nginx"})";
     const JournalLine jl = parse_journal_line(line);
     CHECK(jl.cursor == "s=ab;i=1;b=cd");
@@ -78,7 +78,7 @@ TEST_CASE("journal: coredump → process.crashed", "[guardian][dex][linux][journ
 TEST_CASE("journal: coredump without a comm is dropped (no EXE path shipped)",
           "[guardian][dex][linux][journal]") {
     const std::string line =
-        R"({"__CURSOR":"s=ab;i=2;b=cd","MESSAGE_ID":"fc2e22bc6ee647b6b90729ab34a250b1",)"
+        R"({"__CURSOR":"s=ab;i=2;b=cd","MESSAGE_ID":"fc2e22bc6ee647b6b90729ab34a250b1","_UID":"0","_COMM":"systemd-coredum",)"
         R"("COREDUMP_EXE":"/opt/app/secret-path"})";
     const JournalLine jl = parse_journal_line(line);
     CHECK(jl.cursor == "s=ab;i=2;b=cd"); // cursor still advances
@@ -87,7 +87,7 @@ TEST_CASE("journal: coredump without a comm is dropped (no EXE path shipped)",
 
 TEST_CASE("journal: unit failed → service.crashed", "[guardian][dex][linux][journal]") {
     const std::string line =
-        R"({"__CURSOR":"s=ab;i=3;b=cd","MESSAGE_ID":"be02cf6855d2428ba40df7e9d022f03d",)"
+        R"({"__CURSOR":"s=ab;i=3;b=cd","MESSAGE_ID":"be02cf6855d2428ba40df7e9d022f03d","_PID":"1","_UID":"0",)"
         R"("UNIT":"postgresql.service","UNIT_RESULT":"exit-code"})";
     const JournalLine jl = parse_journal_line(line);
     REQUIRE(jl.obs.has_value());
@@ -100,7 +100,7 @@ TEST_CASE("journal: unit failed → service.crashed", "[guardian][dex][linux][jo
 TEST_CASE("journal: unit failed without UNIT_RESULT still emits (empty reason)",
           "[guardian][dex][linux][journal]") {
     const std::string line =
-        R"({"__CURSOR":"x","MESSAGE_ID":"be02cf6855d2428ba40df7e9d022f03d","UNIT":"sshd.service"})";
+        R"({"__CURSOR":"x","MESSAGE_ID":"be02cf6855d2428ba40df7e9d022f03d","_PID":"1","_UID":"0","UNIT":"sshd.service"})";
     const JournalLine jl = parse_journal_line(line);
     REQUIRE(jl.obs.has_value());
     CHECK(jl.obs->obs_type == "service.crashed");
@@ -113,7 +113,7 @@ TEST_CASE("journal: 'Failed with result' (the real failure message) → service.
     // The MESSAGE_ID a simple service failure actually logs (confirmed against a live
     // specimen) — distinct from SD_MESSAGE_UNIT_FAILED, carries UNIT + UNIT_RESULT.
     const std::string line =
-        R"({"__CURSOR":"s=ab;i=9;b=cd","MESSAGE_ID":"d9b373ed55a64feb8242e02dbe79a49c",)"
+        R"({"__CURSOR":"s=ab;i=9;b=cd","MESSAGE_ID":"d9b373ed55a64feb8242e02dbe79a49c","_PID":"1","_UID":"0",)"
         R"("UNIT":"yuzu-smoke.service","UNIT_RESULT":"exit-code"})";
     const JournalLine jl = parse_journal_line(line);
     REQUIRE(jl.obs.has_value());
@@ -128,7 +128,7 @@ TEST_CASE("journal: watchdog timeout → service.hung (routed by UNIT_RESULT, sa
     // with UNIT_RESULT="watchdog" — the service stopped responding, so it routes to
     // service.hung, not service.crashed. One entry, no double-emit.
     const std::string line =
-        R"({"__CURSOR":"x","MESSAGE_ID":"d9b373ed55a64feb8242e02dbe79a49c",)"
+        R"({"__CURSOR":"x","MESSAGE_ID":"d9b373ed55a64feb8242e02dbe79a49c","_PID":"1","_UID":"0",)"
         R"("UNIT":"yz-wd.service","UNIT_RESULT":"watchdog"})";
     const JournalLine jl = parse_journal_line(line);
     REQUIRE(jl.obs.has_value());
@@ -144,7 +144,7 @@ TEST_CASE("journal: chronyd 'no selectable sources' → os.time_unsynced (gated 
     // SYSLOG_IDENTIFIER (forgeable). Custom raw-string delimiter R"j(...)j": the message
     // contains ")" which would otherwise close a plain R"(...)" early.
     const std::string line =
-        R"j({"__CURSOR":"x","_COMM":"chronyd","_TRANSPORT":"stdout","MESSAGE":"Can't synchronise: no selectable sources (5 unreachable sources)"})j";
+        R"j({"__CURSOR":"x","_COMM":"chronyd","_SYSTEMD_UNIT":"chronyd.service","_TRANSPORT":"stdout","MESSAGE":"Can't synchronise: no selectable sources (5 unreachable sources)"})j";
     const JournalLine jl = parse_journal_line(line);
     REQUIRE(jl.obs.has_value());
     CHECK(jl.obs->obs_type == "os.time_unsynced");
@@ -157,7 +157,7 @@ TEST_CASE("journal: privacy — os.time_unsynced ships a fixed sentence, never t
     // subject "clock" + sentence may leave the device. Prove signal_detail_json (the wire
     // payload) is free of any message content even when an IP is embedded in the marker.
     const std::string line =
-        R"j({"__CURSOR":"x","_COMM":"chronyd","MESSAGE":"System clock wrong by 1.5 seconds (source 203.0.113.7)"})j";
+        R"j({"__CURSOR":"x","_COMM":"chronyd","_SYSTEMD_UNIT":"chronyd.service","MESSAGE":"System clock wrong by 1.5 seconds (source 203.0.113.7)"})j";
     const JournalLine jl = parse_journal_line(line);
     REQUIRE(jl.obs.has_value());
     CHECK(jl.obs->obs_type == "os.time_unsynced");
@@ -185,7 +185,7 @@ TEST_CASE("journal: chronyd source online/offline flap is NOT a sync loss",
     // The frequent, noisy chrony lines (which carry source IPs) must produce NO
     // observation — the cursor still advances past them.
     const std::string line =
-        R"({"__CURSOR":"adv","_COMM":"chronyd","MESSAGE":"Source 185.125.190.121 offline"})";
+        R"({"__CURSOR":"adv","_COMM":"chronyd","_SYSTEMD_UNIT":"chronyd.service","MESSAGE":"Source 185.125.190.121 offline"})";
     const JournalLine jl = parse_journal_line(line);
     CHECK(jl.cursor == "adv");
     CHECK_FALSE(jl.obs.has_value());
@@ -280,7 +280,7 @@ TEST_CASE("journal: coredump without COREDUMP_SIGNAL emits with an empty reason"
     // A coredump entry that carries no COREDUMP_SIGNAL is still a crash — emit it with
     // an empty reason and a sentence that omits the "(signal …)" suffix.
     const std::string line =
-        R"({"__CURSOR":"s=ab;i=10;b=cd","MESSAGE_ID":"fc2e22bc6ee647b6b90729ab34a250b1",)"
+        R"({"__CURSOR":"s=ab;i=10;b=cd","MESSAGE_ID":"fc2e22bc6ee647b6b90729ab34a250b1","_UID":"0","_COMM":"systemd-coredum",)"
         R"("COREDUMP_COMM":"worker"})";
     const JournalLine jl = parse_journal_line(line);
     REQUIRE(jl.obs.has_value());
@@ -297,7 +297,7 @@ TEST_CASE("journal: privacy — coredump ships the comm only, never the COREDUMP
     // must not appear in ANY emitted surface (subject, sentence, or detail_json wire
     // payload). This is the [dex][privacy] pin the macOS / storage collectors carry.
     const std::string line =
-        R"({"__CURSOR":"s=ab;i=11;b=cd","MESSAGE_ID":"fc2e22bc6ee647b6b90729ab34a250b1",)"
+        R"({"__CURSOR":"s=ab;i=11;b=cd","MESSAGE_ID":"fc2e22bc6ee647b6b90729ab34a250b1","_UID":"0","_COMM":"systemd-coredum",)"
         R"("COREDUMP_COMM":"acmeapp","COREDUMP_SIGNAL":"6",)"
         R"("COREDUMP_EXE":"/home/alice/acme-secret/acmeapp"})";
     const JournalLine jl = parse_journal_line(line);
@@ -386,6 +386,81 @@ TEST_CASE("build_journald_after_cursor_query: well-formed cursor → bounded, fi
     CHECK(cmd->find("_COMM=chronyd") != std::string::npos); // os.time_unsynced source (trusted field)
 }
 
+TEST_CASE("build_journald_after_cursor_query: pins the exact trusted-field query (WP13/F58, #3871)",
+          "[guardian][dex][linux][journal][query]") {
+    const auto cmd = build_journald_after_cursor_query("s=ab;i=1;b=cd");
+    REQUIRE(cmd.has_value());
+    const std::string expected =
+        std::string("timeout 30 journalctl --after-cursor='s=ab;i=1;b=cd' -o json --no-pager "
+                    "MESSAGE_ID=") +
+        std::string(kMsgIdCoredump) + " _UID=0 + MESSAGE_ID=" + std::string(kMsgIdUnitFailed) +
+        " MESSAGE_ID=" + std::string(kMsgIdUnitResult) +
+        " _PID=1 _UID=0 + _TRANSPORT=kernel + _COMM=chronyd _SYSTEMD_UNIT=chronyd.service "
+        "_SYSTEMD_UNIT=chrony.service 2>/dev/null";
+    CHECK(*cmd == expected);
+}
+
+TEST_CASE("journal: forged client-set fields without journald-trusted sender fields are dropped "
+          "(WP13/F58)",
+          "[guardian][dex][linux][journal][f58]") {
+    // Same MESSAGE_ID/UNIT/COREDUMP_* text a genuine entry carries, but the journald-stamped
+    // sender fields say an unprivileged process wrote it. JSON fixtures only.
+    const char* const forged[] = {
+        // coredump from uid 1000
+        R"({"__CURSOR":"f1","MESSAGE_ID":"fc2e22bc6ee647b6b90729ab34a250b1","_UID":"1000","_COMM":"systemd-coredum","COREDUMP_COMM":"nginx","COREDUMP_SIGNAL":"11"})",
+        // coredump: root but not the coredump helper
+        R"({"__CURSOR":"f2","MESSAGE_ID":"fc2e22bc6ee647b6b90729ab34a250b1","_UID":"0","_COMM":"bash","COREDUMP_COMM":"nginx"})",
+        // coredump: no trusted fields at all
+        R"({"__CURSOR":"f3","MESSAGE_ID":"fc2e22bc6ee647b6b90729ab34a250b1","COREDUMP_COMM":"nginx"})",
+        // unit result from an unprivileged sender
+        R"({"__CURSOR":"f4","MESSAGE_ID":"d9b373ed55a64feb8242e02dbe79a49c","_PID":"4242","_UID":"1000","UNIT":"sshd.service","UNIT_RESULT":"exit-code"})",
+        // right uid, wrong pid (a root process that is not the system manager)
+        R"({"__CURSOR":"f5","MESSAGE_ID":"d9b373ed55a64feb8242e02dbe79a49c","_PID":"4242","_UID":"0","UNIT":"sshd.service","UNIT_RESULT":"watchdog"})",
+        // missing _PID
+        R"({"__CURSOR":"f6","MESSAGE_ID":"d9b373ed55a64feb8242e02dbe79a49c","_UID":"0","UNIT":"sshd.service"})",
+        // malformed _PID / _UID
+        R"({"__CURSOR":"f7","MESSAGE_ID":"be02cf6855d2428ba40df7e9d022f03d","_PID":"1x","_UID":"0","UNIT":"sshd.service"})",
+        R"({"__CURSOR":"f8","MESSAGE_ID":"be02cf6855d2428ba40df7e9d022f03d","_PID":"1","_UID":"","UNIT":"sshd.service"})",
+        // user-manager entry shape (live-measured): uid 1000, USER_UNIT not UNIT
+        R"({"__CURSOR":"f9","MESSAGE_ID":"d9b373ed55a64feb8242e02dbe79a49c","_PID":"2289","_UID":"1000","USER_UNIT":"app.service","UNIT":"app.service"})",
+    };
+    for (const char* line : forged) {
+        INFO(line);
+        const JournalLine jl = parse_journal_line(line);
+        CHECK_FALSE(jl.obs.has_value());
+        CHECK_FALSE(jl.cursor.empty()); // the cursor still advances past a dropped entry
+    }
+}
+
+TEST_CASE("journal: a trusted system-manager entry and coredump-helper entry still map (WP13/F58)",
+          "[guardian][dex][linux][journal][f58]") {
+    // Shape measured on a live systemd host: _PID=1 _UID=0 _SYSTEMD_UNIT=init.scope _COMM=systemd.
+    const JournalLine unit = parse_journal_line(
+        R"({"__CURSOR":"g1","MESSAGE_ID":"d9b373ed55a64feb8242e02dbe79a49c","_PID":"1","_UID":"0","_SYSTEMD_UNIT":"init.scope","_COMM":"systemd","UNIT":"x.service","UNIT_RESULT":"watchdog"})");
+    REQUIRE(unit.obs.has_value());
+    CHECK(unit.obs->obs_type == "service.hung");
+    // Coredump helper identified by unit instead of comm.
+    const JournalLine core = parse_journal_line(
+        R"({"__CURSOR":"g2","MESSAGE_ID":"fc2e22bc6ee647b6b90729ab34a250b1","_UID":"0","_SYSTEMD_UNIT":"systemd-coredump@0-1-0.service","COREDUMP_COMM":"nginx","COREDUMP_SIGNAL":"11"})");
+    REQUIRE(core.obs.has_value());
+    CHECK(core.obs->obs_type == "process.crashed");
+}
+
+TEST_CASE("journal: chronyd branch needs the chrony service cgroup, not just _COMM (#3871)",
+          "[guardian][dex][linux][journal][f58]") {
+    // prctl(PR_SET_NAME,"chronyd") forgery: right comm and message, user-session scope.
+    const JournalLine forged = parse_journal_line(
+        R"j({"__CURSOR":"c1","_COMM":"chronyd","_SYSTEMD_UNIT":"session-3.scope","MESSAGE":"Can't synchronise: no selectable sources"})j");
+    CHECK_FALSE(forged.obs.has_value());
+    const JournalLine nounit = parse_journal_line(
+        R"j({"__CURSOR":"c2","_COMM":"chronyd","MESSAGE":"Can't synchronise: no selectable sources"})j");
+    CHECK_FALSE(nounit.obs.has_value());
+    const JournalLine debian = parse_journal_line(
+        R"j({"__CURSOR":"c3","_COMM":"chronyd","_SYSTEMD_UNIT":"chrony.service","MESSAGE":"Can't synchronise: no selectable sources"})j");
+    REQUIRE(debian.obs.has_value());
+    CHECK(debian.obs->obs_type == "os.time_unsynced");
+}
+
 TEST_CASE("build_journald_after_cursor_query: a cursor with a single quote → nullopt (injection guard)",
           "[guardian][dex][linux][journal][query]") {
     // A real __CURSOR never contains a single quote; one that does could break out of
@@ -407,11 +482,11 @@ TEST_CASE("drain_journal_pipe: classifies a stream and advances the cursor to th
     // coredump (→ obs), a non-OOM kernel line (no obs, advances cursor), unit failure
     // (→ obs). drain returns the 2 observations; the cursor advances to the newest.
     const std::string stream =
-        R"({"__CURSOR":"c1","MESSAGE_ID":"fc2e22bc6ee647b6b90729ab34a250b1","COREDUMP_COMM":"nginx","COREDUMP_SIGNAL":"11"})"
+        R"({"__CURSOR":"c1","MESSAGE_ID":"fc2e22bc6ee647b6b90729ab34a250b1","_UID":"0","_COMM":"systemd-coredum","COREDUMP_COMM":"nginx","COREDUMP_SIGNAL":"11"})"
         "\n"
         R"({"__CURSOR":"c2","_TRANSPORT":"kernel","MESSAGE":"usb 1-1: new device"})"
         "\n"
-        R"({"__CURSOR":"c3","MESSAGE_ID":"d9b373ed55a64feb8242e02dbe79a49c","UNIT":"db.service","UNIT_RESULT":"exit-code"})"
+        R"({"__CURSOR":"c3","MESSAGE_ID":"d9b373ed55a64feb8242e02dbe79a49c","_PID":"1","_UID":"0","UNIT":"db.service","UNIT_RESULT":"exit-code"})"
         "\n";
     TempPipe tp{stream};
     REQUIRE(tp.get());
@@ -440,7 +515,7 @@ TEST_CASE("drain_journal_pipe: a malformed tail line does not advance the cursor
     // The good line advances the cursor; the malformed tail has no __CURSOR, so the
     // cursor stops at the last good entry and that window is re-read next poll.
     const std::string stream =
-        R"({"__CURSOR":"good","MESSAGE_ID":"d9b373ed55a64feb8242e02dbe79a49c","UNIT":"x.service","UNIT_RESULT":"exit-code"})"
+        R"({"__CURSOR":"good","MESSAGE_ID":"d9b373ed55a64feb8242e02dbe79a49c","_PID":"1","_UID":"0","UNIT":"x.service","UNIT_RESULT":"exit-code"})"
         "\n"
         "this is not json\n";
     TempPipe tp{stream};
