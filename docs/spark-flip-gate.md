@@ -3050,19 +3050,21 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   conditions in the Guardian guide's section 'When a verdict is flagged or does not move'
   holds), and the hold cannot touch it (server side). The agent now also
   stamps a `(boot_epoch, emit_seq)` pair at the point queue order is decided (legacy executor
-  admission; the Spark outbox stamp). A server that compares the pair orders a retained
-  verdict against a newer one by it, and that order depends on neither the wall clock nor
-  arrival order; a server that does not compare it ignores the pair and keeps ordering by its
-  census ordering key (the merge gate below says which stage the server is at). Entries that
+  admission; the Spark outbox stamp). The server orders a retained verdict against a newer
+  one by it between two events that both carry a pair, and that order depends on neither the
+  wall clock nor arrival order outside the flagged recoveries (the merge gate below says which
+  stage the server is at; a server on an earlier stage ignores the pair and keeps ordering by
+  its census ordering key). Entries that
   carry no pair (journal-paged replays, DEX observations, and an agent whose boot epoch could
   not be claimed) are sent with the pair unset (0/0): two such events order by the census
-  ordering key, and against a paired verdict the server change will hold them (item 1). Note on
+  ordering key, and against a paired verdict the server holds them (item 1). Note on
   #5690's acceptance options (factual, not a ruling): a tie policy closes UP-13 but not UP-14
   (the server now flags a tied or mis-ordered pair rather than keeping it silently); a policy
   that ordered by receipt sequence alone would close UP-14 but worsen UP-13; only terminal
-  precedence closes both. The server change below is none of these three: once PR B ships it
-  will order by the pair, fall back to the census ordering key between two unpaired events,
-  and use arrival order only in the flagged recoveries it will define. The test
+  precedence closes both. The server change below is none of these three: from PR B it
+  orders by the pair, falls back to the census ordering key between two unpaired events, and
+  uses arrival order only in the flagged recoveries (a re-base of a stale pair clock, and the
+  transition of an unpaired event over a paired verdict once the hold has expired). The test
   `#3972 chaos: a third sender holding the stream write mutex ...`
   (hidden `[.chaos]`) characterises UP-13 and deliberately asserts no order.
 - UP-14: the five conditions the SERVER change must meet. Actual order of delivery: the census
@@ -3071,9 +3073,13 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   ignored the pair between #7303 and PR A. PR A stores the pair, counts unpaired and rejected
   pairs and exposes the counts, but does not compare the pair: between PR A and PR B the
   verdict decision is the census ordering key alone. PR B adds the comparison, the hold and
-  the recovery. Tracking unit: #5690. The one checkbox per item goes in the server pull
-  requests' descriptions: item 5 on PR A, items 1 to 4 on PR B. Until PR B merges, items 1
-  to 4 are not met and the UP-14 residual stands as described above. The conditions:
+  the recovery: from PR B the verdict of a census row is decided by the pair rules in the
+  Guardian guide's section 'Boot epoch and event ordering' (operator reading: 'Running the
+  pair regime'). Tracking unit: #5690. The one checkbox per item goes in the server pull
+  requests' descriptions: item 5 on PR A, items 1 to 4 on PR B. PR B is the change that meets
+  items 1 to 4: until it merges they are not met and the UP-14 residual stands as described
+  above, and whether each is met is decided by the evidence in its description, not by this
+  paragraph. The conditions:
   1. The comparator orders per (agent_id, rule_id) and compares the pair when both sides
      carry one. An unpaired event against a paired verdict is held (refused, flagged, counted)
      while the agent's pair clock is fresh, and applied by arrival, flagged, once the clock is
@@ -3096,25 +3102,31 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
      shows a duplicate replay does not reapply an obsolete census transition.
   4. The rule for gap repairs (they draw a fresh pair at admission today) and for accepted
      unordered (0/0) events is stated with correctness outcomes and tests: a failed-claim 0/0
-     event against an existing ordered verdict; rollback to a non-stamping binary; the
-     transition from unordered back to ordered; whether an accepted 0/0 clears or retains the
-     stored ordering metadata, and how that metadata stays associated with the verdict it
+     event against an existing ordered verdict, and one from an agent whose instance lock was
+     lost; the transition from unordered back to ordered; whether an accepted 0/0 clears or
+     retains the stored ordering metadata, and how that metadata stays associated with the verdict it
      actually describes; and the timeline of a previously undelivered older replay (an error at
      timestamp 100 replayed as 0/0 after a backward clock step, after a newer live compliant
      verdict at timestamp 90), in both arrival orders and with subsequent live events; and two
      live senders sharing one agent_id, a lock holder stamping a pair while a process that
-     was refused the data-directory lock (`instance_lock_not_held`) or an older build sends
-     0/0: the mixture must not make the comparator non-transitive (a verdict ranked above one
-     that is in turn ranked above it; met as: no apply reversal within a regime, and every
-     transition between regimes is one-way, flagged and time-fenced), the outcome is stated,
+     was refused the data-directory lock (`instance_lock_not_held`) or whose epoch claim failed
+     sends 0/0: the mixture must not make the comparator non-transitive (a verdict ranked above one
+     that is in turn ranked above it; met as: no apply reversal within a regime, and the two
+     transitions between regimes, which run in opposite directions, are each flagged: pair to key
+     is fenced by the hold (a fresh pair clock) and applies by arrival once the clock is stale,
+     while key to pair is not fenced by the clock or by arrival), the outcome is stated,
      and a test covers it. Two
      stamping senders on separate data directories under one fixed agent id (independent
      epochs) still order totally, but their events rank against each other by epochs that
      are unrelated across instances, and the count below cannot see them because both send a
      pair: for that case too the outcome is stated and a test covers it. The server also
      counts accepted events that carry no pair, per agent, and exposes the count (a metric or
-     an API field), so an agent that runs unordered is visible fleet-wide; the agent's own
-     signal is one error-level log line.
+     an API field), so an agent that runs unordered is visible fleet-wide (an agent whose first
+     deliveries all fail the per-agent order step has no order row, so it is not counted
+     until its next successful first delivery; the compensating signals are
+     `yuzu_server_guardian_census_proj_failures_total` and
+     `yuzu_server_guardian_census_pending_events`); the agent's own signal is one error-level
+     log line.
      For every case above, tests show that stale state is not silently presented as the current
      verdict. When the available ordering information cannot establish freshness, the server
      exposes that uncertainty or obtains fresh state; census-ordering-key fallback, metadata retention,
