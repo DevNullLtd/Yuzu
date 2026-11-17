@@ -26,7 +26,6 @@
 // glue onto the field separator as `\|`.
 
 #include <row_field.hpp>
-#include <yuzu/string_utils.hpp>
 
 #include <cstddef>
 #include <cstdint>

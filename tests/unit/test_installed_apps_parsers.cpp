@@ -462,7 +462,7 @@ TEST_CASE("format_app_row: a trailing backslash in install_location cannot swall
     // A Windows InstallLocation ends in a backslash (9 of 241 rows in the pre-fix
     // Windows capture). Raw, that backslash plus the following delimiter reads as an
     // escaped pipe: the backslash is deleted and the row loses a field.
-    // safe_output_field folds the backslash to '/', so the row keeps seven fields
+    // row_field folds the TRAILING backslash to '/', so the row keeps seven fields
     // under an escape-aware split.
     const auto row = format_app_row({.name = "7-Zip",
                                      .version = "26.02",

@@ -297,6 +297,29 @@ TEST_CASE("backslash-preserving row field: C:\\x stays C:\\x, a trailing backsla
     CHECK(yuzu::shared::row_field("C:\\a\\|b\r\n\\") == "C:\\a\\\\|b  /");
 }
 
+TEST_CASE("yuzu::shared::row_field: exact output on the thin spots", "[plugin][row][wp11]") {
+    using yuzu::shared::row_field;
+    CHECK(row_field("") == "");
+    CHECK(row_field("\\") == "/");               // just a backslash: trailing, so folded
+    CHECK(row_field("\\\\") == "\\/");          // `\\` -> interior kept, trailing folded
+    CHECK(row_field("C:\\x") == "C:\\x");        // interior kept
+    CHECK(row_field("C:\\x\\") == "C:\\x/");     // trailing folded
+    CHECK(row_field("a|b") == "a\\|b");
+    CHECK(row_field("a\\|b") == "a\\\\|b");      // `\|` input: pipe still escaped
+    CHECK(row_field("|") == "\\|");
+    CHECK(row_field("a\r\nb") == "a  b");
+    CHECK(row_field("a\n") == "a ");
+    CHECK(row_field("caf\xc3\xa9 \xe2\x82\xac\\") == "caf\xc3\xa9 \xe2\x82\xac/");
+    // idempotent on already-safe text, and never leaves a trailing backslash
+    for (const char* in : {"", "\\", "x\\", "a|\\", "\\|\\", "end\r\n\\"}) {
+        const auto out = row_field(in);
+        CHECK((out.empty() || out.back() != '\\'));
+        CHECK(single_line(out));
+    }
+    // a one-field row can never be merged with the next column
+    CHECK(server_split("a|" + row_field("x\\") + "|b").size() == 3);
+}
+
 TEST_CASE("update_source_trust redaction still forwards to the shared logic", "[plugin][wp11]") {
     CHECK(yuzu::update_source_trust::redact_apt_word("http://u:pw@h.example/x") ==
           "http://REDACTED@h.example/x");

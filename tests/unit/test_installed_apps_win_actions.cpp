@@ -141,14 +141,14 @@ bool has_drive_letter_prefix(const std::string& s) {
 struct ScratchUninstallEntry {
     std::wstring sub;
     std::string display_name;
-    std::string expected_location; // as `list` emits it: backslashes folded to '/'
+    std::string expected_location; // as `list` emits it: interior backslashes kept (no trailing one here)
     bool ok{false};
 
     ScratchUninstallEntry() {
         const std::string pid = std::to_string(GetCurrentProcessId());
         const std::string leaf = "YuzuTest_InstalledApps_" + pid;
         display_name = "YuzuTest InstalledApps [" + pid + "]";
-        expected_location = "C:/Program Files/" + leaf;
+        expected_location = "C:\\Program Files\\" + leaf;
         sub = L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\" +
               std::wstring(leaf.begin(), leaf.end());
 

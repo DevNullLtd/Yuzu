@@ -595,10 +595,10 @@ inline std::string list_field(std::string_view v) {
 // EVERY field goes through detail::list_field, so a row is always exactly seven
 // escape-aware tokens (server/core/src/result_parsing.hpp find_unescaped_pipe
 // grammar) whatever bytes a registry value, an Info.plist or a path carries; a
-// value within the 4 KiB bound and free of '\', '|', CR, LF and NUL is emitted
-// byte-identically (in the reference captures the new install_location is the
-// exception: 59 of 241 Windows rows carry a populated one, its backslashes
-// folded to '/'). `query`/`list_per_user` rows are built below by format_query_row /
+// value within the 4 KiB bound and free of '|', CR, LF, NUL and a trailing '\' is
+// emitted byte-identically (interior backslashes are kept; a trailing one folds
+// to '/'). The Windows reference captures predate this and show every backslash
+// folded to '/'; they need a Windows recapture. `query`/`list_per_user` rows are built below by format_query_row /
 // format_user_app_row (same per-field list_field); the ADR-0016 `inv|` rows never pass here.
 // `name` stays "" when empty (the collectors never produce one; the sentinel
 // row sets it); every other empty field renders "-". The caller applies
