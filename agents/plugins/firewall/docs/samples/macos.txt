@@ -1,4 +1,4 @@
-captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-11-09 · euid 501 · leg-hash faeb4c640f7b
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-11-09 · euid 501 · leg-hash 4731564d9d1d
 == action=state
 backend|appfirewall
 state|disabled

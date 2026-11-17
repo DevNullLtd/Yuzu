@@ -8,14 +8,14 @@
       "legs": {
         "linux": {
           "fallback": "the packaged systemd unit (NoNewPrivileges, no sudoers) refuses every containment action privilege_unavailable; needs the installer's sudoers grant on a unit without NoNewPrivileges; contains the host's own IP traffic and traffic the host routes (L2-bridged guests and macvlan/ipvlan containers are not contained); a ttl_seconds limit rides the host wall clock (NTP is blocked while contained) and its expiry release is logged on the agent only",
-          "mechanism": "sudo yuzu-fw-helper nft load of an own inet table applied as one transaction (policy-drop chains); iptables/ip6tables generation chain via run_bounded_subprocess when nft is absent",
-          "rung": "2",
+          "mechanism": "sh: the root-owned yuzu-fw-helper, sudo yuzu-fw-helper nft load of an own inet table applied as one transaction (policy-drop chains); iptables/ip6tables generation chain through the same helper when nft is absent",
+          "rung": "3",
           "support": "constrained"
         },
         "macos": {
           "fallback": "needs Apple's anchor com.apple/* in the main ruleset and no sibling anchor sorting before 000.yuzu_quarantine, else the result is partial or degraded; the state flush cuts every pf connection once and release does not restore them; a ttl_seconds limit rides the host wall clock (NTP is blocked while contained) and its expiry release is logged on the agent only",
-          "mechanism": "sudo yuzu-fw-helper pf load of an own sub-anchor com.apple/000.yuzu_quarantine (the main ruleset is never loaded), sudo pfctl: a pf enable reference (-E), one global pf state flush (-F states)",
-          "rung": "2",
+          "mechanism": "sh: the root-owned yuzu-fw-helper, sudo yuzu-fw-helper pf load of an own sub-anchor com.apple/000.yuzu_quarantine (the main ruleset is never loaded), sudo pfctl: a pf enable reference (-E), one global pf state flush (-F states)",
+          "rung": "3",
           "support": "constrained"
         },
         "windows": {
@@ -34,14 +34,14 @@
       "legs": {
         "linux": {
           "fallback": "the packaged systemd unit (NoNewPrivileges, no sudoers) refuses every containment action privilege_unavailable; needs the installer's sudoers grant on a unit without NoNewPrivileges",
-          "mechanism": "atomic nft reload / iptables build-then-swap of a new generation",
-          "rung": "2",
+          "mechanism": "sh: the root-owned yuzu-fw-helper, atomic nft reload / iptables build-then-swap of a new generation",
+          "rung": "3",
           "support": "constrained"
         },
         "macos": {
           "fallback": "each update flushes every pf state once, so connections not covered by an allowance are cut and not restored",
-          "mechanism": "sudo yuzu-fw-helper pf load: atomic reload of the own sub-anchor, then a global pf state flush (sudo pfctl -F states)",
-          "rung": "2",
+          "mechanism": "sh: the root-owned yuzu-fw-helper, sudo yuzu-fw-helper pf load: atomic reload of the own sub-anchor, then a global pf state flush (sudo pfctl -F states)",
+          "rung": "3",
           "support": "constrained"
         },
         "windows": {
@@ -60,8 +60,8 @@
       "legs": {
         "linux": {
           "fallback": "netlink needs CAP_NET_ADMIN, which the unprivileged agent lacks: the sudo read is the usual path, and on the packaged systemd unit (NoNewPrivileges, no sudoers) it fails, so a host with a stored record reads degraded; needs the installer's sudoers grant on a unit without NoNewPrivileges",
-          "mechanism": "own nftables table over NETLINK_NETFILTER (rung 1), else sudo nft list table (rung 2); iptables chain jumps via argv",
-          "rung": "1",
+          "mechanism": "own nftables table over NETLINK_NETFILTER (rung 1), else sudo nft list table (rung 2); iptables chain listings through sh: the root-owned yuzu-fw-helper",
+          "rung": "3",
           "support": "constrained"
         },
         "macos": {
@@ -86,8 +86,8 @@
       "legs": {
         "linux": {
           "fallback": "the packaged systemd unit (NoNewPrivileges, no sudoers) refuses every containment action privilege_unavailable; needs the installer's sudoers grant on a unit without NoNewPrivileges",
-          "mechanism": "sudo nft delete table / iptables chain removal",
-          "rung": "2",
+          "mechanism": "sh: the root-owned yuzu-fw-helper for the iptables chain removal; sudo nft delete table directly",
+          "rung": "3",
           "support": "constrained"
         },
         "macos": {
@@ -354,7 +354,7 @@
     "gathered": true,
     "mutating": true
   },
-  "leg_hash": "faeb4c640f7b",
+  "leg_hash": "4731564d9d1d",
   "manifest_version": 1,
   "name": "firewall",
   "outputs": [
@@ -750,7 +750,7 @@
       "stamp": {
         "date": "2026-09-06",
         "host_class": "container",
-        "leg_hash": "faeb4c640f7b",
+        "leg_hash": "4731564d9d1d",
         "os": "linux",
         "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
         "privilege": "euid 0 with CAP_NET_ADMIN in the host network namespace"
@@ -841,7 +841,7 @@
       "stamp": {
         "date": "2026-11-09",
         "host_class": "bare-metal",
-        "leg_hash": "faeb4c640f7b",
+        "leg_hash": "4731564d9d1d",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
         "privilege": "euid 501"
@@ -932,7 +932,7 @@
       "stamp": {
         "date": "2026-09-15",
         "host_class": "bare-metal",
-        "leg_hash": "faeb4c640f7b",
+        "leg_hash": "4731564d9d1d",
         "os": "windows",
         "os_version": "Windows 10.0.26200 x86_64",
         "privilege": "interactive user (elevated)"

@@ -146,10 +146,10 @@ An `error|nftables:table:<reason>` row can appear next to a later successful `ba
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
-| `quarantine` | 🟡 constrained · rung 1 · INetFwPolicy2 COM rule group + per-profile default-block; other enabled rules disabled for the duration | 🟡 constrained · rung 2 · sudo yuzu-fw-helper pf load of an own sub-anchor com.apple/000.yuzu_quarantine (the main ruleset is never loaded), sudo pfctl: a pf enable reference (-E), one global pf state flush (-F states) | 🟡 constrained · rung 2 · sudo yuzu-fw-helper nft load of an own inet table applied as one transaction (policy-drop chains); iptables/ip6tables generation chain via run_bounded_subprocess when nft is absent |
-| `quarantine_allow` | ✅ supported · rung 1 · INetFwPolicy2 COM: new generation's rules added first, stale ones removed last | 🟡 constrained · rung 2 · sudo yuzu-fw-helper pf load: atomic reload of the own sub-anchor, then a global pf state flush (sudo pfctl -F states) | 🟡 constrained · rung 2 · atomic nft reload / iptables build-then-swap of a new generation |
-| `quarantine_status` | ✅ supported · rung 1 · INetFwPolicy2 COM rule group presence + per-profile default actions | ✅ supported · rung 2 · sudo pfctl reads: info, main-ruleset anchor reference, own anchor rules, sibling anchors under com.apple, enable references | 🟡 constrained · rung 1 · own nftables table over NETLINK_NETFILTER (rung 1), else sudo nft list table (rung 2); iptables chain jumps via argv |
-| `release` | ✅ supported · rung 1 · INetFwPolicy2 COM rule-group removal, prior-policy restore, disabled rules re-enabled | ✅ supported · rung 2 · sudo pfctl: empty own anchor (-F rules, -F nat), release the enable token (-X) | 🟡 constrained · rung 2 · sudo nft delete table / iptables chain removal |
+| `quarantine` | 🟡 constrained · rung 1 · INetFwPolicy2 COM rule group + per-profile default-block; other enabled rules disabled for the duration | 🟡 constrained · rung 3 · sh: the root-owned yuzu-fw-helper, sudo yuzu-fw-helper pf load of an own sub-anchor com.apple/000.yuzu_quarantine (the main ruleset is never loaded), sudo pfctl: a pf enable reference (-E), one global pf state flush (-F states) | 🟡 constrained · rung 3 · sh: the root-owned yuzu-fw-helper, sudo yuzu-fw-helper nft load of an own inet table applied as one transaction (policy-drop chains); iptables/ip6tables generation chain through the same helper when nft is absent |
+| `quarantine_allow` | ✅ supported · rung 1 · INetFwPolicy2 COM: new generation's rules added first, stale ones removed last | 🟡 constrained · rung 3 · sh: the root-owned yuzu-fw-helper, sudo yuzu-fw-helper pf load: atomic reload of the own sub-anchor, then a global pf state flush (sudo pfctl -F states) | 🟡 constrained · rung 3 · sh: the root-owned yuzu-fw-helper, atomic nft reload / iptables build-then-swap of a new generation |
+| `quarantine_status` | ✅ supported · rung 1 · INetFwPolicy2 COM rule group presence + per-profile default actions | ✅ supported · rung 2 · sudo pfctl reads: info, main-ruleset anchor reference, own anchor rules, sibling anchors under com.apple, enable references | 🟡 constrained · rung 3 · own nftables table over NETLINK_NETFILTER (rung 1), else sudo nft list table (rung 2); iptables chain listings through sh: the root-owned yuzu-fw-helper |
+| `release` | ✅ supported · rung 1 · INetFwPolicy2 COM rule-group removal, prior-policy restore, disabled rules re-enabled | ✅ supported · rung 2 · sudo pfctl: empty own anchor (-F rules, -F nat), release the enable token (-X) | 🟡 constrained · rung 3 · sh: the root-owned yuzu-fw-helper for the iptables chain removal; sudo nft delete table directly |
 | `rules` | ✅ supported · rung 1 · INetFwPolicy2 COM (INetFwRules enumeration) | ✅ supported · rung 2 · pfctl via run_bounded_subprocess | ✅ supported · rung 1 · firewalld sd-bus, else nftables NETLINK_NETFILTER (both rung 1), else ufw/iptables via run_bounded_subprocess (rung 2) |
 | `state` | ✅ supported · rung 1 · INetFwPolicy2 COM (per-profile FirewallEnabled) | ✅ supported · rung 2 · socketfilterfw/pfctl via run_bounded_subprocess | ✅ supported · rung 1 · firewalld sd-bus, else nftables NETLINK_NETFILTER (both rung 1), else ufw/iptables via run_bounded_subprocess (rung 2) |
 
@@ -318,7 +318,7 @@ The second field of `status|<token>|<reason>` and the `note|<k>=<v>` rows carry 
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-15 · interactive user (elevated) · leg-hash faeb4c640f7b
+**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-15 · interactive user (elevated) · leg-hash 4731564d9d1d
 
 ```
 == action=state
@@ -357,7 +357,7 @@ rule|Microsoft Store|enabled|in|allow|7
 [not captured] Mutating/Reversible: not executed on a live host (changes the allow set of a containment in force)
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-11-09 · euid 501 · leg-hash faeb4c640f7b
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-11-09 · euid 501 · leg-hash 4731564d9d1d
 
 ```
 == action=state
@@ -392,7 +392,7 @@ ruleset|unknown
 [not captured] Mutating/Reversible: not executed on a live host (changes the allow set of a containment in force)
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 with CAP_NET_ADMIN in the host network namespace · leg-hash faeb4c640f7b
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 with CAP_NET_ADMIN in the host network namespace · leg-hash 4731564d9d1d
 
 ```
 == action=state

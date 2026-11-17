@@ -60,14 +60,14 @@
       "legs": {
         "linux": {
           "fallback": "",
-          "mechanism": "runner argv 'sudo -n -- yuzu-svc-helper systemctl enable|disable|mask|unmask'",
-          "rung": "2",
+          "mechanism": "sh: the root-owned yuzu-svc-helper, runner argv 'sudo -n -- yuzu-svc-helper systemctl enable|disable|mask|unmask' (a root agent runs systemctl directly)",
+          "rung": "3",
           "support": "supported"
         },
         "macos": {
           "fallback": "",
-          "mechanism": "runner argv 'sudo -n -- yuzu-svc-helper launchctl enable|disable'",
-          "rung": "2",
+          "mechanism": "sh: the root-owned yuzu-svc-helper, runner argv 'sudo -n -- yuzu-svc-helper launchctl enable|disable' (a root agent runs launchctl directly)",
+          "rung": "3",
           "support": "supported"
         },
         "windows": {
@@ -185,7 +185,7 @@
     "gathered": true,
     "mutating": true
   },
-  "leg_hash": "e117e4e5a791",
+  "leg_hash": "69a0749ab7aa",
   "manifest_version": 1,
   "name": "services",
   "outputs": [
@@ -464,7 +464,7 @@
       "stamp": {
         "date": "2026-09-06",
         "host_class": "container",
-        "leg_hash": "e117e4e5a791",
+        "leg_hash": "69a0749ab7aa",
         "os": "linux",
         "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
         "privilege": "euid 0"
@@ -532,7 +532,7 @@
       "stamp": {
         "date": "2026-09-07",
         "host_class": "bare-metal",
-        "leg_hash": "e117e4e5a791",
+        "leg_hash": "69a0749ab7aa",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
         "privilege": "euid 501 (jsmith)"
@@ -600,7 +600,7 @@
       "stamp": {
         "date": "2026-09-07",
         "host_class": "bare-metal",
-        "leg_hash": "e117e4e5a791",
+        "leg_hash": "69a0749ab7aa",
         "os": "windows",
         "os_version": "Microsoft Windows NT 10.0.26200.0 x64",
         "privilege": "SYSTEM"

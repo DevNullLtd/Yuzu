@@ -94,7 +94,7 @@ This shows why the two families of legs fail differently: Windows has no way to 
 |---|---|---|---|
 | `list` | ✅ supported · rung 1 · win32_service_api | ✅ supported · rung 2 · runner argv 'launchctl list' | ✅ supported · rung 2 · runner argv 'systemctl list-units' |
 | `running` | ✅ supported · rung 1 · win32_service_api | ✅ supported · rung 2 · runner argv 'launchctl list' | ✅ supported · rung 2 · runner argv 'systemctl list-units' |
-| `set_start_mode` | ✅ supported · rung 1 · win32_service_api | ✅ supported · rung 2 · runner argv 'sudo -n -- yuzu-svc-helper launchctl enable\|disable' | ✅ supported · rung 2 · runner argv 'sudo -n -- yuzu-svc-helper systemctl enable\|disable\|mask\|unmask' |
+| `set_start_mode` | ✅ supported · rung 1 · win32_service_api | ✅ supported · rung 3 · sh: the root-owned yuzu-svc-helper, runner argv 'sudo -n -- yuzu-svc-helper launchctl enable\|disable' (a root agent runs launchctl directly) | ✅ supported · rung 3 · sh: the root-owned yuzu-svc-helper, runner argv 'sudo -n -- yuzu-svc-helper systemctl enable\|disable\|mask\|unmask' (a root agent runs systemctl directly) |
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
@@ -173,7 +173,7 @@ Rows are pipe-delimited, prefixed `svc|`, one per service. The row **shape** dif
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash e117e4e5a791
+**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 69a0749ab7aa
 
 ```
 == action=list
@@ -214,7 +214,7 @@ error|missing required parameter: name
 [rc] 1
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash e117e4e5a791
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 69a0749ab7aa
 
 ```
 == action=list
@@ -255,7 +255,7 @@ error|missing required parameter: name
 [rc] 1
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash e117e4e5a791
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash 69a0749ab7aa
 
 ```
 == action=list
