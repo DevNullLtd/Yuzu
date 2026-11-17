@@ -250,7 +250,8 @@ TEST_CASE("the Forensics plugin set is derived from the catalogue, not a hand-ke
     // response whose command id has no server dispatch record is Forensics-tier by construction.
     CHECK(set->names() == std::vector<std::string>{"app_usage", "browser_inventory",
                                                    "execution_artifacts", "privacy_permissions",
-                                                   "remote_access_audit", "~unverified"});
+                                                   "process_introspect", "remote_access_audit",
+                                                   "~unverified"});
 }
 
 TEST_CASE("an empty derivation is refused, never an empty exclusion set",

@@ -23,6 +23,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 
 // Editor fragment HTML templates — defined in instruction_ui.cpp (a
 // separate, build-time-embedded TU) and forward-declared here at global
@@ -86,6 +87,99 @@ bool refuse_bad_dispatch_identifier(httplib::Response& res, std::string_view fie
     return true;
 }
 } // namespace
+
+std::string render_instruction_editor(std::string_view tmpl,
+                                      const InstructionDefinition* def) {
+    // SINGLE pass over the ORIGINAL template (F13/F14): substituted values are never
+    // rescanned, so a stored field containing a `{{...}}` token renders as literal text and
+    // cannot re-expand or loop. Every value is HTML-escaped except the pre-built fifth
+    // concurrency <option> (its only variable part is escaped when built).
+    struct Val {
+        std::string text;
+        bool raw{false};
+    };
+    std::unordered_map<std::string, Val> vals;
+    auto put = [&](const char* key, std::string v) { vals[key] = Val{html_escape(v), false}; };
+    auto sel = [&](const char* key, bool on) { put(key, on ? "selected" : ""); };
+
+    if (def) {
+        put("TITLE", "Edit Definition");
+        put("DEF_ID", def->id);
+        put("DEF_UPDATED_AT", std::to_string(def->updated_at));
+        put("DEF_NAME", def->name);
+        put("DEF_VERSION", def->version);
+        put("DEF_PLUGIN", def->plugin);
+        put("DEF_ACTION", def->action);
+        put("DEF_DESCRIPTION", def->description);
+        put("DEF_PLATFORMS", def->platforms);
+        put("YAML_SOURCE", def->yaml_source);
+        sel("SEL_QUESTION", def->type == "question");
+        sel("SEL_ACTION", def->type == "action");
+        sel("SEL_APPR_AUTO", def->approval_mode == "auto");
+        sel("SEL_APPR_ROLE", def->approval_mode == "role-gated");
+        sel("SEL_APPR_ALWAYS", def->approval_mode == "always");
+        sel("SEL_CC_UNLIM", def->concurrency_mode == "unlimited");
+        sel("SEL_CC_DEV", def->concurrency_mode == "per-device");
+        sel("SEL_CC_DEF", def->concurrency_mode == "per-definition");
+        sel("SEL_CC_SET", def->concurrency_mode == "per-set");
+        // Fifth, dynamic option (PR #3784 fix round): the four static options cover every
+        // ENFORCED/documented mode, but the content library also ships `global` /
+        // `global-singleton` (ADR-1007). Without a matching <option> the browser would
+        // display "Unlimited" and a Convert-to-YAML + Save would silently overwrite the real
+        // concurrency_mode. Emitted at the template's own slot only.
+        std::string other_option;
+        if (!def->concurrency_mode.empty() && def->concurrency_mode != "unlimited" &&
+            def->concurrency_mode != "per-device" && def->concurrency_mode != "per-definition" &&
+            def->concurrency_mode != "per-set") {
+            const auto escaped = html_escape(def->concurrency_mode);
+            other_option = "<option value=\"" + escaped + "\" selected>" + escaped +
+                           " (unrecognized, not enforced)</option>";
+        }
+        vals["SEL_CC_OTHER_OPTION"] = Val{std::move(other_option), true};
+    } else {
+        put("TITLE", "New Definition");
+        for (const char* k : {"DEF_ID", "DEF_UPDATED_AT", "DEF_NAME", "DEF_VERSION",
+                              "DEF_PLUGIN", "DEF_ACTION", "DEF_DESCRIPTION", "DEF_PLATFORMS",
+                              "SEL_ACTION", "SEL_APPR_ROLE", "SEL_APPR_ALWAYS", "SEL_CC_DEV",
+                              "SEL_CC_DEF", "SEL_CC_SET", "SEL_CC_OTHER_OPTION"})
+            put(k, "");
+        put("YAML_SOURCE",
+            "apiVersion: yuzu.io/v1alpha1\nkind: InstructionDefinition\n"
+            "metadata:\n  name: \"\"\n  version: \"1.0.0\"\nspec:\n"
+            "  plugin: \"\"\n  action: \"\"\n  type: question\n"
+            "  description: \"\"\n  concurrency: unlimited\n"
+            "  approval: auto\n  parameters:\n    type: object\n"
+            "    additionalProperties:\n      type: string\n"
+            "  results:\n    - name: output\n      type: string\n");
+        sel("SEL_QUESTION", true);
+        sel("SEL_APPR_AUTO", true);
+        sel("SEL_CC_UNLIM", true);
+    }
+
+    std::string out;
+    out.reserve(tmpl.size() + 512);
+    std::size_t pos = 0;
+    while (pos < tmpl.size()) {
+        const auto open = tmpl.find("{{", pos);
+        if (open == std::string_view::npos) {
+            out.append(tmpl.substr(pos));
+            break;
+        }
+        const auto close = tmpl.find("}}", open + 2);
+        if (close == std::string_view::npos) {
+            out.append(tmpl.substr(pos));
+            break;
+        }
+        out.append(tmpl.substr(pos, open - pos));
+        const auto it = vals.find(std::string(tmpl.substr(open + 2, close - open - 2)));
+        if (it != vals.end())
+            out += it->second.text;
+        else
+            out.append(tmpl.substr(open, close + 2 - open)); // unknown token: literal
+        pos = close + 2;
+    }
+    return out;
+}
 
 void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
     // -- Instruction Definitions API --------------------------------------
@@ -916,105 +1010,11 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
             // form falls back to unreplaced placeholders), same as a not-found inner
             // optional did pre-migration.
             auto def_result = deps.store->get_definition(def_id);
-            if (def_result && *def_result) {
-                const auto& def = **def_result;
-                auto replace = [&](const std::string& key, const std::string& val) {
-                    for (auto pos = tmpl.find(key); pos != std::string::npos;
-                         pos = tmpl.find(key))
-                        tmpl.replace(pos, key.size(), html_escape(val));
-                };
-                replace("{{TITLE}}", "Edit Definition");
-                replace("{{DEF_ID}}", def.id);
-                replace("{{DEF_UPDATED_AT}}", std::to_string(def.updated_at));
-                replace("{{DEF_NAME}}", def.name);
-                replace("{{DEF_VERSION}}", def.version);
-                replace("{{DEF_PLUGIN}}", def.plugin);
-                replace("{{DEF_ACTION}}", def.action);
-                replace("{{DEF_DESCRIPTION}}", def.description);
-                replace("{{DEF_PLATFORMS}}", def.platforms);
-                replace("{{YAML_SOURCE}}", def.yaml_source);
-                // Set dropdowns
-                replace("{{SEL_QUESTION}}", def.type == "question" ? "selected" : "");
-                replace("{{SEL_ACTION}}", def.type == "action" ? "selected" : "");
-                replace("{{SEL_APPR_AUTO}}", def.approval_mode == "auto" ? "selected" : "");
-                replace("{{SEL_APPR_ROLE}}",
-                        def.approval_mode == "role-gated" ? "selected" : "");
-                replace("{{SEL_APPR_ALWAYS}}",
-                        def.approval_mode == "always" ? "selected" : "");
-                replace("{{SEL_CC_UNLIM}}",
-                        def.concurrency_mode == "unlimited" ? "selected" : "");
-                replace("{{SEL_CC_DEV}}",
-                        def.concurrency_mode == "per-device" ? "selected" : "");
-                replace("{{SEL_CC_DEF}}",
-                        def.concurrency_mode == "per-definition" ? "selected" : "");
-                replace("{{SEL_CC_SET}}", def.concurrency_mode == "per-set" ? "selected" : "");
-                // Fifth, dynamic option (Gate 6 enterprise-readiness finding, PR #3784 fix
-                // round): the four static options above cover every ENFORCED/documented
-                // mode, but the real content library also ships `global`/`global-singleton`
-                // (42 catalog-only `plugin: server` definitions, ADR-1007) — neither matches
-                // any static <option>, so none was ever `selected` and the browser silently
-                // defaulted to displaying "Unlimited". Form-mode "Convert to YAML" then baked
-                // that displayed default into the generated YAML, so an ordinary Save on one
-                // of those 42 definitions silently overwrote its real concurrency_mode. Fixed
-                // by emitting a raw <option> carrying the actual stored value whenever it
-                // doesn't match one of the four known modes, so round-tripping never discards
-                // it. NOT run through the escaping `replace()` lambda above (it HTML-escapes
-                // the whole substituted string, which would mangle this option's own tags) —
-                // only the stored value itself is escaped, everything else is a literal
-                // template.
-                {
-                    static const std::string kOtherPlaceholder = "{{SEL_CC_OTHER_OPTION}}";
-                    std::string other_option;
-                    if (!def.concurrency_mode.empty() && def.concurrency_mode != "unlimited" &&
-                        def.concurrency_mode != "per-device" &&
-                        def.concurrency_mode != "per-definition" &&
-                        def.concurrency_mode != "per-set") {
-                        const auto escaped = html_escape(def.concurrency_mode);
-                        other_option = "<option value=\"" + escaped + "\" selected>" + escaped +
-                                      " (unrecognized, not enforced)</option>";
-                    }
-                    for (auto pos = tmpl.find(kOtherPlaceholder); pos != std::string::npos;
-                         pos = tmpl.find(kOtherPlaceholder))
-                        tmpl.replace(pos, kOtherPlaceholder.size(), other_option);
-                }
-            }
+            if (def_result && *def_result)
+                tmpl = render_instruction_editor(tmpl, &**def_result);
+            // else: leave the template's placeholders unreplaced (best-effort pre-fill).
         } else {
-            // New definition — clear all placeholders
-            auto clear = [&](const std::string& key) {
-                for (auto pos = tmpl.find(key); pos != std::string::npos; pos = tmpl.find(key))
-                    tmpl.replace(pos, key.size(), "");
-            };
-            auto replace = [&](const std::string& key, const std::string& val) {
-                for (auto pos = tmpl.find(key); pos != std::string::npos; pos = tmpl.find(key))
-                    tmpl.replace(pos, key.size(), val);
-            };
-            replace("{{TITLE}}", "New Definition");
-            clear("{{DEF_ID}}");
-            clear("{{DEF_UPDATED_AT}}");
-            clear("{{DEF_NAME}}");
-            clear("{{DEF_VERSION}}");
-            clear("{{DEF_PLUGIN}}");
-            clear("{{DEF_ACTION}}");
-            clear("{{DEF_DESCRIPTION}}");
-            clear("{{DEF_PLATFORMS}}");
-            replace("{{YAML_SOURCE}}",
-                    "apiVersion: yuzu.io/v1alpha1\nkind: InstructionDefinition\n"
-                    "metadata:\n  name: \"\"\n  version: \"1.0.0\"\nspec:\n"
-                    "  plugin: \"\"\n  action: \"\"\n  type: question\n"
-                    "  description: \"\"\n  concurrency: unlimited\n"
-                    "  approval: auto\n  parameters:\n    type: object\n"
-                    "    additionalProperties:\n      type: string\n"
-                    "  results:\n    - name: output\n      type: string\n");
-            replace("{{SEL_QUESTION}}", "selected");
-            clear("{{SEL_ACTION}}");
-            replace("{{SEL_APPR_AUTO}}", "selected");
-            clear("{{SEL_APPR_ROLE}}");
-            clear("{{SEL_APPR_ALWAYS}}");
-            replace("{{SEL_CC_UNLIM}}", "selected");
-            clear("{{SEL_CC_DEV}}");
-            clear("{{SEL_CC_DEF}}");
-            clear("{{SEL_CC_SET}}");
-            clear("{{SEL_CC_OTHER_OPTION}}");
+            tmpl = render_instruction_editor(tmpl, nullptr);
         }
         res.set_content(tmpl, "text/html; charset=utf-8");
     });

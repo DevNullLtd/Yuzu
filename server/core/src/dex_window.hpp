@@ -55,6 +55,11 @@ DexDayWindow dex_day_window(std::int64_t now_epoch, int days);
 /// "all") — the day-count half of the shared window vocabulary.
 std::string dex_iso_since(int days);
 
+/// The same cutoff for a caller that fixes one request instant: `days` whole days before
+/// `now_epoch`, "" when days<=0. `dex_iso_since` delegates here, so a read that cuts its window
+/// at a fixed instant and one that uses the wall clock share one arithmetic copy.
+std::string dex_iso_since_at(std::int64_t now_epoch, int days);
+
 /// Normalises a REST/MCP `os` filter param to a store-ready platform token:
 /// "windows"/"linux"/"macos" pass through; anything else (including "all" or
 /// empty) returns "" = all-OS. The single source of truth so the machine
