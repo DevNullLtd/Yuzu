@@ -284,12 +284,11 @@ struct ServiceInfo {
     std::string startup_type; // honest automatic|disabled|unknown (C-1.12); never Windows' 5-state taxonomy
 };
 
-// Defensive row cap (mirrors the C-8 row_cap precedent in agents/shared/wmi_bounded.hpp):
-// real macOS systems run in the low hundreds of launchd services, so this
-// bounds worst-case memory/output size without affecting normal enumeration.
-// Rows beyond the cap are still drained from the `launchctl list` pipe (so
-// the child process never blocks writing into a full pipe) -- just not kept.
-constexpr std::size_t kMaxServiceRows = 512;
+// Defensive row cap: yuzu::services::kMaxServiceRows (services_parsers.hpp; it mirrors the C-8
+// row_cap precedent in agents/shared/wmi_bounded.hpp). Real macOS systems run in the low hundreds
+// of launchd services, so this bounds worst-case memory/output size without affecting normal
+// enumeration. Rows beyond the cap are still drained from the `launchctl list` pipe (so the child
+// process never blocks writing into a full pipe) -- just not kept.
 
 
 // total_seen (out) receives the number of services that passed all filters
@@ -616,16 +615,17 @@ int do_set_start_mode_macos(yuzu::CommandContext& ctx, std::string_view name,
 // native Win32 Service Control Manager API throughout, rung 1.
 // linux: systemctl (list-units / enable|disable|mask|unmask) via
 // run_bounded_subprocess(argv, ...) -- shell-free, direct argv[0] exec, no
-// `/bin/sh -c` hop -- rung 2 (ADR-3002) for every action: the read-only
-// list-units enumeration, and enable/disable/mask/unmask through the
-// root-owned yuzu-svc-helper under sudo (matching the installed sudoers
-// grant; a root agent runs systemctl itself). Previously rung 3 (governed
-// shell) throughout -- this migration removed the shell hop entirely, it did
-// not merely add sudo.
+// `/bin/sh -c` hop. The read-only list-units enumeration is rung 2 (ADR-3002).
+// enable/disable/mask/unmask run through the root-owned yuzu-svc-helper under
+// sudo (matching the installed sudoers grant; a root agent runs systemctl
+// itself). The helper is a `#!/bin/sh` script, and a site's rung is set by the
+// deepest interpreter intentionally invoked (ADR-3002 Decision 5), so
+// set_start_mode is a governed rung-3 interpreter site, registered in
+// docs/agent-spawn-sink-manifest.md.
 // macos: launchctl (list, print-disabled, enable|disable) via the same
-// shell-free runner path -- rung 2, same as linux above (enable|disable
-// through yuzu-svc-helper under sudo); the macOS startup_type leg
-// specifically is the bulk `launchctl print-disabled system` parse in
+// shell-free runner path -- rung 2 for the reads, rung 3 for enable|disable
+// through yuzu-svc-helper under sudo, as on linux; the macOS startup_type
+// leg specifically is the bulk `launchctl print-disabled system` parse in
 // services_macos_launchd.hpp.
 const YuzuActionDescriptor kActionDescriptors[] = {
     {"list",
@@ -638,10 +638,14 @@ const YuzuActionDescriptor kActionDescriptors[] = {
      /* windows = */ {YUZU_SUPPORT_SUPPORTED, 1, "win32_service_api", nullptr}},
     {"set_start_mode",
      /* linux   = */
-     {YUZU_SUPPORT_SUPPORTED, 2,
-      "runner argv 'sudo -n -- yuzu-svc-helper systemctl enable|disable|mask|unmask'", nullptr},
+     {YUZU_SUPPORT_SUPPORTED, 3,
+      "sh: the root-owned yuzu-svc-helper, runner argv 'sudo -n -- yuzu-svc-helper systemctl "
+      "enable|disable|mask|unmask' (a root agent runs systemctl directly)",
+      nullptr},
      /* macos   = */
-     {YUZU_SUPPORT_SUPPORTED, 2, "runner argv 'sudo -n -- yuzu-svc-helper launchctl enable|disable'",
+     {YUZU_SUPPORT_SUPPORTED, 3,
+      "sh: the root-owned yuzu-svc-helper, runner argv 'sudo -n -- yuzu-svc-helper launchctl "
+      "enable|disable' (a root agent runs launchctl directly)",
       nullptr},
      /* windows = */ {YUZU_SUPPORT_SUPPORTED, 1, "win32_service_api", nullptr}},
 };

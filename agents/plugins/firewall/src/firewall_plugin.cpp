@@ -38,6 +38,11 @@
  *                 the old single opaque `firewall-cmd --list-all || ufw
  *                 status numbered || iptables -L -n --line-numbers` shell
  *                 chain and its `rule|<raw line>` passthrough.
+ *   Containment calls a non-root agent makes through the root-owned yuzu-fw-helper
+ *   (nft load, iptables, pf load) are rung 3: the helper is a `#!/bin/sh` script, and a
+ *   site's rung is set by the deepest interpreter intentionally invoked (ADR-3002 Decision 5),
+ *   so those sites are registered in docs/agent-spawn-sink-manifest.md. A root agent runs the
+ *   tool directly, at rung 2.
  */
 
 #include <yuzu/plugin.hpp>
@@ -3028,8 +3033,8 @@ int do_quarantine_status(yuzu::CommandContext& ctx, YuzuPluginContext* raw,
 // run_bounded_subprocess argv (rung 2), the fallback once neither native
 // backend is reachable. `state` and `rules` never mutate firewall state. The
 // four containment actions below do: Windows over COM (rung 1), Linux over
-// the root-owned helper's nft load / iptables argv (rung 2, with the status read rung 1 -> 2),
-// macOS over the root-owned helper's pf load and `sudo pfctl` (rung 2): an own sub-anchor plus a pf
+// the root-owned helper's nft load / iptables argv (rung 3, with the status read rung 1 -> 3),
+// macOS over the root-owned helper's pf load and `sudo pfctl` (rung 3): an own sub-anchor plus a pf
 // enable reference.
 const YuzuActionDescriptor kActionDescriptors[] = {
     {
@@ -3059,10 +3064,10 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "quarantine",
         /* .linux_leg   = */
-        {YUZU_SUPPORT_CONSTRAINED, 2,
-         "sudo yuzu-fw-helper nft load of an own inet table applied as one transaction "
-         "(policy-drop chains); iptables/ip6tables generation chain via run_bounded_subprocess "
-         "when nft is absent",
+        {YUZU_SUPPORT_CONSTRAINED, 3,
+         "sh: the root-owned yuzu-fw-helper, sudo yuzu-fw-helper nft load of an own inet table "
+         "applied as one transaction (policy-drop chains); iptables/ip6tables generation chain "
+         "through the same helper when nft is absent",
          "the packaged systemd unit (NoNewPrivileges, no sudoers) refuses every containment action "
          "privilege_unavailable; needs the installer's sudoers grant on a unit without NoNewPrivileges; "
          "contains the host's own IP traffic and traffic the host routes (L2-bridged guests and "
@@ -3070,10 +3075,10 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "wall clock (NTP is blocked while contained) and its expiry release is logged on the "
          "agent only"},
         /* .macos_leg   = */
-        {YUZU_SUPPORT_CONSTRAINED, 2,
-         "sudo yuzu-fw-helper pf load of an own sub-anchor com.apple/000.yuzu_quarantine (the main "
-         "ruleset is never loaded), sudo pfctl: a pf enable reference (-E), one global pf state "
-         "flush (-F states)",
+        {YUZU_SUPPORT_CONSTRAINED, 3,
+         "sh: the root-owned yuzu-fw-helper, sudo yuzu-fw-helper pf load of an own sub-anchor "
+         "com.apple/000.yuzu_quarantine (the main ruleset is never loaded), sudo pfctl: a pf "
+         "enable reference (-E), one global pf state flush (-F states)",
          "needs Apple's anchor com.apple/* in the main ruleset and no sibling anchor sorting before "
          "000.yuzu_quarantine, else the result is partial or degraded; the state flush cuts every pf "
          "connection once and release does not restore them; a ttl_seconds limit rides the host "
@@ -3097,7 +3102,9 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "release",
         /* .linux_leg   = */
-        {YUZU_SUPPORT_CONSTRAINED, 2, "sudo nft delete table / iptables chain removal",
+        {YUZU_SUPPORT_CONSTRAINED, 3,
+         "sh: the root-owned yuzu-fw-helper for the iptables chain removal; sudo nft delete table "
+         "directly",
          "the packaged systemd unit (NoNewPrivileges, no sudoers) refuses every containment action "
          "privilege_unavailable; needs the installer's sudoers grant on a unit without NoNewPrivileges"},
         /* .macos_leg   = */
@@ -3116,9 +3123,9 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "quarantine_status",
         /* .linux_leg   = */
-        {YUZU_SUPPORT_CONSTRAINED, 1,
+        {YUZU_SUPPORT_CONSTRAINED, 3,
          "own nftables table over NETLINK_NETFILTER (rung 1), else sudo nft list table (rung 2); "
-         "iptables chain jumps via argv",
+         "iptables chain listings through sh: the root-owned yuzu-fw-helper",
          "netlink needs CAP_NET_ADMIN, which the unprivileged agent lacks: the sudo read is "
          "the usual path, and on the packaged systemd unit (NoNewPrivileges, no sudoers) it fails, "
          "so a host with a stored record reads degraded; needs the installer's sudoers grant on a "
@@ -3135,14 +3142,15 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "quarantine_allow",
         /* .linux_leg   = */
-        {YUZU_SUPPORT_CONSTRAINED, 2,
-         "atomic nft reload / iptables build-then-swap of a new generation",
+        {YUZU_SUPPORT_CONSTRAINED, 3,
+         "sh: the root-owned yuzu-fw-helper, atomic nft reload / iptables build-then-swap of a new "
+         "generation",
          "the packaged systemd unit (NoNewPrivileges, no sudoers) refuses every containment action "
          "privilege_unavailable; needs the installer's sudoers grant on a unit without NoNewPrivileges"},
         /* .macos_leg   = */
-        {YUZU_SUPPORT_CONSTRAINED, 2,
-         "sudo yuzu-fw-helper pf load: atomic reload of the own sub-anchor, then a global pf state "
-         "flush (sudo pfctl -F states)",
+        {YUZU_SUPPORT_CONSTRAINED, 3,
+         "sh: the root-owned yuzu-fw-helper, sudo yuzu-fw-helper pf load: atomic reload of the own "
+         "sub-anchor, then a global pf state flush (sudo pfctl -F states)",
          "each update flushes every pf state once, so connections not covered by an allowance are "
          "cut and not restored"},
         /* .windows_leg = */
