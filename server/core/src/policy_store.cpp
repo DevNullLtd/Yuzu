@@ -357,7 +357,7 @@ const std::vector<pg::PgMigration>& migrations() {
         // v6 (WP06 F4 interim): the authoring-time snapshot of each instruction's resolved
         // plugin.action. Additive, constant default (instant, no rewrite): every existing row
         // reads '' = no snapshot = behaviour unchanged.
-        {6, "ALTER TABLE policy_fragments ADD COLUMN instruction_pairs TEXT NOT NULL DEFAULT '';"},
+        {6, "ALTER TABLE policy_fragments ADD COLUMN IF NOT EXISTS instruction_pairs TEXT NOT NULL DEFAULT '';"},
     };
     return kMigrations;
 }
