@@ -1230,31 +1230,31 @@ All four runners run as the `runner` user, but each runner's `.env` sets its own
 `HOME` (`/home/runner/rN/home`, checked 2026-11-17), so jobs see a per-runner
 home directory. The user is provisioned once for fast, download-free builds:
 
-- **ccache**: one cache per runner, at `/home/runner/rN/home/.cache/ccache`.
-  Every self-hosted job that runs ccache sets `CCACHE_MAXSIZE=30G`, with
-  compression on. ccache's built-in default of 5 GiB is far too small for
-  ~700 TUs × variants, and the `max_size=50G` in `/home/runner/.config/ccache`
-  is not read, because jobs don't run with that home directory. **Every job
-  on a pool must use the same cap.** ccache trims the directory to the cap of
-  whichever job is writing, so one job with a smaller cap empties the cache
-  the other jobs rely on. Until 2026-11-17, `codeql.yml` and
-  `sanitizer-tests.yml` set 500M. Each daily CodeQL trace cut its runner's
-  cache to 2.8-5.2 GB (the trace's own `ccache -s`), from the 18-30 GB the
-  runner's previous CI job ended at, or 7.9 GB on a runner trimmed the day
-  before. In four of
-  the five trims between 2026-11-12 and -17, that runner's CI over the next
-  12 hours hit the cache 13-24 points less often than the other three
-  runners did, depending on where the window starts; the fifth showed no
-  gap. The windows hold 5-17 jobs and the comparison is observational, so
-  treat the size of the gap as an estimate; the trim itself is not in
-  doubt. `tests/test_ci_ccache_cap.py` now requires one cap per pool, and
-  the CodeQL-traced build runs with `CCACHE_DISABLE` (see the comment on
-  that step). At 30G a runner's cache sits at the cap and holds about two
-  days of objects (r3's cache on 2026-11-17: 4.4 GB dated 11-15 or
-  earlier, the rest 11-16 and 11-17). Nothing measured shows that limit costing
-  hits: r3, which no trim reached in that window, ended every job at the
-  cap and its hit rate (79.1%) was close to the best of the others
-  (73.8-79.8%). That does not show a larger cap would not help.
+- **ccache**: one cache per runner, at `/home/runner/rN/home/.cache/ccache`
+  (with the per-runner `HOME` set, see
+  [`deploy/linux/`](../deploy/linux/README.md)). Every self-hosted job that runs
+  ccache sets `CCACHE_MAXSIZE=30G`, with compression on. ccache's built-in
+  default of 5 GiB is far too small for ~700 TUs × variants, and the
+  `max_size=50G` in `/home/runner/.config/ccache` is not read, because jobs
+  don't run with that home directory. **Every job on a pool must use the same
+  cap.** ccache trims the directory to the cap of whichever job is writing, so
+  one job with a smaller cap empties the cache the other jobs rely on. Until
+  2026-11-17, `codeql.yml` and `sanitizer-tests.yml` set 500M. Each daily CodeQL
+  trace cut its runner's cache to 2.8-5.2 GB (the trace's own `ccache -s`), from
+  the 18-30 GB the runner's previous CI job ended at, or 7.9 GB on a runner
+  trimmed the day before. After four of the five traces from 2026-11-12 to -16,
+  that runner's CI over the next 12 hours hit the cache 13-24 points less often
+  than the other three runners did, depending on where the window starts; the
+  fifth showed no gap. The windows hold 5-17 jobs and the comparison is
+  observational, so treat the size of the gap as an estimate; the trim itself is
+  not in doubt. `tests/test_ci_ccache_cap.py` now requires one cap per pool, and
+  the CodeQL-traced build runs with `CCACHE_DISABLE` (see the comment on that
+  step). At 30G a runner's cache sits at the cap and holds about two days of
+  objects (r3's cache on 2026-11-17: 4.4 GB dated 11-15 or earlier, the rest
+  11-16 and 11-17). Nothing measured shows that limit costing hits: r3, which no
+  trim reached in that window, ended every job at the cap and its hit rate
+  (79.1%) was close to the best of the others (73.8-79.8%). That does not show a
+  larger cap would not help.
 - **mold** linker (`apt install mold`), wired via `-fuse-ld=mold` in the gcc-15 /
   clang-21 native files — large cut in link time on the big `yuzu-server` /
   `yuzu-agent` binaries and the release LTO link.
@@ -3025,7 +3025,8 @@ only: ccache otherwise hashes the working directory for a `-g` compile, so the
 contract build directory never reused the standard build's objects (the two
 directories' compile commands are identical). The cost is debug info only: an
 object's recorded compile directory may name the other build directory (each
-runner has its own cache, so never another runner's workspace), and nothing in
+runner has its own cache, through its per-runner `HOME`, so never another
+runner's workspace), and nothing in
 this leg reads it. The step prints the precompile's wall time with its own
 ccache hit and miss counts (from a per-step stats log, since the cache's
 counters cover the whole job), and the collector's

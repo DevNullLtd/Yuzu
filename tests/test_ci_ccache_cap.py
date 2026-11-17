@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Pin one CCACHE_MAXSIZE per self-hosted runner pool.
 
-A self-hosted runner keeps one ccache directory for every job it picks up
-(on Big Tam, /home/runner/rN/home/.cache/ccache per runner). ccache enforces
-the cap of the job that is writing, so one job with a smaller cap trims the
-cache every other job on that runner relies on. codeql.yml and
-sanitizer-tests.yml carried 500M while ci.yml, nightly.yml and release.yml
-carried 30G: each daily CodeQL trace cut a Big Tam runner's cache to 2.8-5.2 GB
-(from as much as 30 GB), and in four of five such trims (2026-11-12 to -17) that runner's next
-12 h of CI hit the cache 13-24 points less often than the other runners did.
+A self-hosted runner keeps one ccache directory for every job it picks up (on
+Big Tam, /home/runner/rN/home/.cache/ccache per runner). ccache enforces the
+cap of the job that is writing, so one job with a smaller cap trims the cache
+every other job on that runner relies on. codeql.yml and sanitizer-tests.yml
+carried 500M while ci.yml, nightly.yml and release.yml carried 30G: each daily
+CodeQL trace cut a Big Tam runner's cache to 2.8-5.2 GB (from as much as 30
+GB), and in four of five such trims (2026-11-12 to -16) that runner's next 12 h
+of CI hit the cache 13-24 points less often than the other runners did.
 
 Rules, over every workflow job that runs on a self-hosted pool and mentions
 ccache:

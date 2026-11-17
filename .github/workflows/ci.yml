@@ -1168,8 +1168,9 @@ jobs:
           # contract build compiled cold. With hash_dir off they share one. The
           # cost is debug info only: an object's recorded compile directory
           # (DW_AT_comp_dir) may name the other sibling, whose generated files
-          # are its own copies. Each Big Tam runner has its own cache, so it
-          # never names another runner's workspace.
+          # are its own copies. Each Big Tam runner has its own cache (its
+          # .env sets a per-runner HOME, deploy/linux/README.md), so it never
+          # names another runner's workspace.
           # Nothing in this leg reads it (no gdb, coverage or symbolizer step;
           # those run in the nightly, which keeps hash_dir on). Every later
           # step in the job inherits the setting through GITHUB_ENV.
