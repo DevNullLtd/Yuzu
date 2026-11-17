@@ -301,14 +301,38 @@ struct Log {
         });
     }
 };
-bh::Source counting(const Bytes& b, const std::shared_ptr<Log>& log) {
-    bh::Source inner = src_of(b);
+// `visible` bounds the file to its first `visible` bytes without copying them (a truncation prefix).
+bh::Source counting(const Bytes& b, const std::shared_ptr<Log>& log,
+                    std::size_t visible = static_cast<std::size_t>(-1)) {
+    bh::Source inner = bh::span_source(
+        std::as_bytes(std::span<const std::uint8_t>(b).first(std::min(visible, b.size()))));
     return bh::Source{[inner, log](u64 off, std::size_t len) {
                           log->reads.emplace_back(off, len);
                           log->total += len;
                           return inner.read_at(off, len);
                       },
                       inner.size};
+}
+
+// Every logged read stays inside the visible `limit` bytes and inside the default budget.
+void check_reads(const Log& log, std::size_t limit) {
+    const bh::ReadBudget budget;
+    CHECK(log.reads.size() <= budget.max_reads);
+    CHECK(log.total <= budget.max_bytes);
+    const bool inside = std::all_of(log.reads.begin(), log.reads.end(), [limit](const auto& r) {
+        return r.first + r.second <= limit;
+    });
+    CHECK(inside);
+}
+
+Bytes load_shared() {
+    const auto path = fs::path{YUZU_TEST_FIXTURE_DIR} / "binary_headers" / "elf_shared.bin";
+    INFO("fixture path: " << path.string());
+    REQUIRE(fs::exists(path)); // a missing capture is a failure, never a skip
+    std::ifstream f(path, std::ios::binary);
+    Bytes bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    REQUIRE_FALSE(bytes.empty());
+    return bytes;
 }
 
 bh::ElfInfo must_read(const Bytes& b, const bh::ElfLimits& lim = {}) {
@@ -855,9 +879,10 @@ TEST_CASE("elf: truncation sweep", "[binary_header][elf]") {
         const std::size_t ehsz = sh.is64 ? 64 : 52, phent = sh.is64 ? 56 : 32;
         const std::size_t table_end = ehsz + 4 * phent;
         for (std::size_t n = 0; n <= img.size(); ++n) {
-            const Bytes cut(img.begin(), img.begin() + static_cast<std::ptrdiff_t>(n));
-            auto r = bh::read_elf(src_of(cut));
+            auto log = std::make_shared<Log>();
+            auto r = bh::read_elf(counting(img, log, n));
             INFO("prefix " << n);
+            check_reads(*log, n);
             if (n < 4) {
                 REQUIRE_FALSE(r.has_value());
                 CHECK(r.error() == bh::ParseError::not_this_format);
@@ -879,12 +904,36 @@ TEST_CASE("elf: truncation sweep", "[binary_header][elf]") {
     }
 }
 
+TEST_CASE("elf: real capture truncation sweep", "[binary_header][elf]") {
+    const Bytes img = load_shared();
+    for (std::size_t n = 0; n <= img.size(); ++n) {
+        auto log = std::make_shared<Log>();
+        auto r = bh::read_elf(counting(img, log, n));
+        INFO("prefix " << n);
+        check_reads(*log, n);
+        if (r) { // a value or an error is fine; a value must stay inside the limits
+            CHECK(r->program_headers.size() <= bh::ElfLimits{}.max_program_headers);
+            CHECK(r->soname.size() <= bh::ElfLimits{}.max_string_bytes);
+            if (r->dynamic_unreadable)
+                CHECK(r->soname.empty());
+        }
+        if (n == img.size()) {
+            REQUIRE(r.has_value());
+            CHECK(r->soname == "libyuzu_fixture.so.1");
+        }
+    }
+}
+
 TEST_CASE("elf: deterministic mutation sweep", "[binary_header][elf]") {
     std::vector<Bytes> images;
     std::vector<std::size_t> hdr_ends;
     for (const auto& sh : kShapes) {
         images.push_back(build(canonical(sh).spec));
         hdr_ends.push_back((sh.is64 ? 64 : 52) + 4 * (sh.is64 ? 56 : 32));
+    }
+    { // the real 64-bit little-endian capture: header plus its program-header table (e_phnum at 56)
+        images.push_back(load_shared());
+        hdr_ends.push_back(64 + 56 * (images.back()[56] | (images.back()[57] << 8)));
     }
     u64 state = 0x9E3779B97F4A7C15ull;
     const auto next = [&state]() {
@@ -935,13 +984,7 @@ TEST_CASE("elf: deterministic mutation sweep", "[binary_header][elf]") {
 }
 
 TEST_CASE("elf: real capture elf_shared.bin", "[binary_header][elf]") {
-    const auto path = fs::path{YUZU_TEST_FIXTURE_DIR} / "binary_headers" / "elf_shared.bin";
-    INFO("fixture path: " << path.string());
-    REQUIRE(fs::exists(path)); // a missing capture is a failure, never a skip
-    std::ifstream f(path, std::ios::binary);
-    const Bytes bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-    REQUIRE_FALSE(bytes.empty());
-    const auto i = must_read(bytes);
+    const auto i = must_read(load_shared());
     CHECK(i.is64);
     CHECK(i.byte_order == std::endian::little);
     CHECK(i.type == 3); // ET_DYN

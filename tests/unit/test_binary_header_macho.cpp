@@ -221,23 +221,32 @@ std::expected<MachoInfo, ParseError> parse(const Bytes& b, const MachoLimits& li
     return read_macho(span_source(sp), lim, budget);
 }
 
-// A Source over `data` that records every read_at call.
+// A Source over `data` that records every read_at call. `visible` bounds the file to its first
+// `visible` bytes without copying them (a truncation prefix).
 struct Probe {
     Bytes data;
     std::vector<std::pair<std::uint64_t, std::size_t>> reads;
     std::uint64_t bytes{0};
     bool beyond_end{false};
+    std::size_t visible{static_cast<std::size_t>(-1)};
     Source source() {
-        return Source{[this](std::uint64_t off, std::size_t len) -> std::optional<std::string> {
+        const std::size_t end = std::min(visible, data.size());
+        return Source{[this, end](std::uint64_t off, std::size_t len) -> std::optional<std::string> {
                           reads.emplace_back(off, len);
                           bytes += len;
-                          if (off > data.size() || len > data.size() - off)
+                          if (off > end || len > end - off)
                               beyond_end = true;
-                          if (off >= data.size())
+                          if (off >= end)
                               return std::string{};
-                          return data.substr(static_cast<std::size_t>(off), len);
+                          return data.substr(static_cast<std::size_t>(off),
+                                             std::min<std::size_t>(len, end - off));
                       },
-                      data.size()};
+                      end};
+    }
+    void reset() {
+        reads.clear();
+        bytes = 0;
+        beyond_end = false;
     }
 };
 
@@ -739,27 +748,51 @@ TEST_CASE("macho: a header or command area cut short is truncated for a thin fil
     }
 }
 
+namespace {
+// Reads `img` cut at every length: no read crosses the cut, the budget holds, and `check` sees
+// each result. The Probe copies the image once; the prefix is a visible length.
+template <typename Check>
+void sweep_prefixes(const Bytes& img, Check check) {
+    const ReadBudget budget{};
+    Probe p;
+    p.data = img;
+    for (std::size_t n = 0; n < img.size(); ++n) {
+        p.reset();
+        p.visible = n;
+        const auto r = read_macho(p.source());
+        INFO("prefix " << n);
+        CHECK_FALSE(p.beyond_end);
+        CHECK(p.reads.size() <= budget.max_reads);
+        CHECK(p.bytes <= budget.max_bytes);
+        check(r, n);
+    }
+}
+
+// Error or value is fine; every slice that parsed lies inside the prefix.
+void check_slices_inside(const std::expected<MachoInfo, ParseError>& r, std::size_t n) {
+    if (!r)
+        return;
+    for (const auto& s : r->slices) {
+        if (!s.error)
+            CHECK(s.offset + s.size <= n);
+    }
+}
+} // namespace
+
 TEST_CASE("macho: every prefix of the canonical images is handled without a value for a thin cut",
           "[binary_header][macho]") {
     for (const Bytes& img : {canon_thin64(), canon_thin32be()}) {
-        for (std::size_t n = 0; n < img.size(); ++n) {
-            const auto r = parse(img.substr(0, n));
-            INFO("thin prefix " << n);
-            CHECK_FALSE(r.has_value());
-        }
+        sweep_prefixes(img, [](const auto& r, std::size_t) { CHECK_FALSE(r.has_value()); });
         CHECK(parse(img).has_value());
     }
-    for (const Bytes& img : {canon_fat(), canon_fat64()}) {
-        for (std::size_t n = 0; n < img.size(); ++n) {
-            const auto r = parse(img.substr(0, n));
-            INFO("fat prefix " << n);
-            if (!r)
-                continue;
-            for (const auto& s : r->slices) {
-                if (!s.error)
-                    CHECK(s.offset + s.size <= n);
-            }
-        }
+    for (const Bytes& img : {canon_fat(), canon_fat64()})
+        sweep_prefixes(img, check_slices_inside);
+}
+
+TEST_CASE("macho: every prefix of the real captures is bounded", "[binary_header][macho]") {
+    for (const char* name : {"macho_thin.bin", "macho_fat.bin"}) {
+        INFO(name);
+        sweep_prefixes(load_fixture(name), check_slices_inside);
     }
 }
 
@@ -851,7 +884,12 @@ TEST_CASE("macho: the read budget is honoured and a thin parse costs two reads",
 
 TEST_CASE("macho: a deterministic 20,000-mutation sweep never crosses the file, the budget or a slice",
           "[binary_header][macho]") {
-    const std::vector<Bytes> bases = {canon_thin64(), canon_thin32be(), canon_fat(), canon_fat64()};
+    const std::vector<Bytes> bases = {canon_thin64(),
+                                      canon_thin32be(),
+                                      canon_fat(),
+                                      canon_fat64(),
+                                      load_fixture("macho_thin.bin"),
+                                      load_fixture("macho_fat.bin")};
     const ReadBudget budget{};
     std::uint64_t rng = 0x9E3779B97F4A7C15ull;
     constexpr std::array<std::uint8_t, 6> kInteresting = {0x00, 0x01, 0x7F, 0x80, 0xFE, 0xFF};
