@@ -9,9 +9,10 @@
  *
  * DnsFree is resolved with GetProcAddress from the module the caller already loaded, so no plugin
  * gains a link-time dependency on dnsapi.lib. If it cannot be resolved the list is left alone (a
- * bounded leak is safer than freeing with the wrong allocator). The walk itself (node ceiling, and
- * a stop at the first node or name seen twice so a cyclic or shared-node list is never freed
- * twice) is the portable, unit-tested `release_dns_cache_list` in dns_cache_list.hpp.
+ * bounded leak is safer than freeing with the wrong allocator). The walk itself is the portable,
+ * unit-tested `release_dns_cache_list` in dns_cache_list.hpp: it guards against list ALIASING (a
+ * cyclic list, a shared node, a name that aliases any node) and never throws; it does not make
+ * `DnsFree(DnsFreeFlat)` the right allocator match (an accepted risk, WP12-risk-acceptance.md).
  *
  * COMPILED ONLY ON WINDOWS. This revision (portable walk, static_asserts, and the ioc /
  * network_config callers using LoadLibraryExW) was compiled with MSVC 14.44 on a Windows 11 build

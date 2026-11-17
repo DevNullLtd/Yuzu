@@ -13,6 +13,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -228,6 +229,103 @@ TEST_CASE("dns cache list release: a self-looping node stops the walk", "[wp12][
     FreeLog log;
     CHECK(yuzu::shared::release_dns_cache_list(&x, std::ref(log)) == 2);
     CHECK_FALSE(log.any_double_free());
+}
+
+namespace {
+
+// Real heap blocks, so an ASan/UBSan build turns a double free or a use-after-free into an abort.
+// A "block" is freed through `release` exactly like the production free callback (std::free), and
+// the harness frees only what the walk did NOT (tracked in `live`), so the test itself never frees
+// twice and a leak is the allowed outcome of a stopped walk.
+struct HeapList {
+    std::vector<FakeNode*> nodes;
+    std::set<void*> live; // blocks not yet freed
+    FakeNode* make(wchar_t* name = nullptr) {
+        auto* n = static_cast<FakeNode*>(std::calloc(1, sizeof(FakeNode)));
+        n->pszName = name;
+        nodes.push_back(n);
+        live.insert(n);
+        return n;
+    }
+    wchar_t* buf() {
+        auto* b = static_cast<wchar_t*>(std::calloc(4, sizeof(wchar_t)));
+        live.insert(b);
+        return b;
+    }
+    void link() {
+        for (std::size_t i = 0; i + 1 < nodes.size(); ++i)
+            nodes[i]->pNext = nodes[i + 1];
+    }
+    // Returns the number of nodes the walk freed; asserts nothing was freed twice.
+    std::size_t release(bool& double_freed) {
+        double_freed = false;
+        const auto n = yuzu::shared::release_dns_cache_list(nodes[0], [&](void* p) {
+            if (live.erase(p) == 0) {
+                double_freed = true; // not live: a second free (do NOT actually free again)
+                return;
+            }
+            std::free(p);
+        });
+        for (void* p : live) // what the stopped walk leaked
+            std::free(p);
+        return n;
+    }
+};
+
+} // namespace
+
+// The four aliasing shapes below are the round-3 regression (N3-1): with the node and name sets
+// split they were a double free or a use-after-free. They are only MEANINGFUL under
+// -fsanitize=address (the use-after-free is a read of a freed node); the double_freed flag also
+// catches the double free in a plain build.
+TEST_CASE("dns cache list release: a name equal to a LATER node stops the walk",
+          "[wp12][dns_cache_list][asan]") {
+    HeapList h;
+    auto* n0 = h.make();
+    auto* n1 = h.make(h.buf());
+    n0->pszName = reinterpret_cast<wchar_t*>(n1); // n0's "name" is node n1
+    h.link();
+    bool dbl = false;
+    const auto freed = h.release(dbl);
+    CHECK_FALSE(dbl);
+    CHECK(freed == 1); // n0 freed (and n1 as its name); the walk stopped on reaching n1
+}
+
+TEST_CASE("dns cache list release: a name equal to its OWN node stops the walk",
+          "[wp12][dns_cache_list][asan]") {
+    HeapList h;
+    auto* n0 = h.make();
+    n0->pszName = reinterpret_cast<wchar_t*>(n0);
+    h.make(h.buf());
+    h.link();
+    bool dbl = false;
+    CHECK(h.release(dbl) == 0);
+    CHECK_FALSE(dbl);
+}
+
+TEST_CASE("dns cache list release: a later node's name equal to the earlier-freed node stops the walk",
+          "[wp12][dns_cache_list][asan]") {
+    HeapList h;
+    h.make(h.buf());
+    auto* n1 = h.make();
+    n1->pszName = reinterpret_cast<wchar_t*>(h.nodes[0]); // aliases n0, already freed
+    h.link();
+    bool dbl = false;
+    CHECK(h.release(dbl) == 1);
+    CHECK_FALSE(dbl);
+}
+
+TEST_CASE("dns cache list release: a name equal to an earlier VISITED node stops the walk",
+          "[wp12][dns_cache_list][asan]") {
+    HeapList h;
+    h.make(h.buf());
+    h.make(h.buf());
+    auto* n2 = h.make();
+    n2->pszName = reinterpret_cast<wchar_t*>(h.nodes[0]); // aliases n0, visited two nodes ago
+    h.link();
+    bool dbl = false;
+    CHECK(h.release(dbl) == 2);
+    CHECK_FALSE(dbl);
 }
 
 namespace {

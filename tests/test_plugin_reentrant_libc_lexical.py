@@ -23,7 +23,12 @@ from pathlib import Path
 ROOT = Path(sys.argv[1]) if len(sys.argv) > 1 and Path(sys.argv[1]).is_dir() else Path(__file__).resolve().parent.parent
 DIRS = ["agents/plugins/tags/src", "agents/plugins/users/src", "agents/plugins/filesystem/src"]
 FORBIDDEN = ("getpwuid", "getpwnam", "getgrnam", "getgrgid", "getpwent", "getgrent")
-CALL = re.compile(r"(?<![A-Za-z0-9_])(" + "|".join(FORBIDDEN) + r")\s*\(")
+_N = "|".join(FORBIDDEN)
+CALL = re.compile(
+    r"(?<![A-Za-z0-9_])(" + _N + r")\s*\("             # getpwuid(0)
+    r"|&\s*(?:::)?(" + _N + r")(?![A-Za-z0-9_])"       # &getpwuid : address taken
+    r"|\(\s*(" + _N + r")\s*\)\s*\("                  # (getpwuid)(0)
+)
 
 
 def strip_comments_and_strings(src: str) -> str:
@@ -70,7 +75,8 @@ def strip_comments_and_strings(src: str) -> str:
 def problems(text: str):
     """(line, name) for every bare non-reentrant call in `text`."""
     stripped = strip_comments_and_strings(text)
-    return [(stripped.count("\n", 0, m.start()) + 1, m.group(1)) for m in CALL.finditer(stripped)]
+    return [(stripped.count("\n", 0, m.start()) + 1, m.group(1) or m.group(2) or m.group(3))
+            for m in CALL.finditer(stripped)]
 
 
 class ReentrantLibc(unittest.TestCase):
@@ -92,6 +98,9 @@ class ReentrantLibc(unittest.TestCase):
         self.assertEqual(problems("getpwuid_r(0, &p, b, n, &r); getgrnam_r(a,b,c,d,e);"), [])
         self.assertEqual(problems('// getpwuid(0)\n/* getgrnam(x) */ s = "getpwnam(x)";'), [])
         self.assertEqual(problems("my_getpwuid(0); xgetpwnam(1);"), [])
+        self.assertEqual(problems("f = &getpwuid; g = & ::getgrnam;"), [(1, "getpwuid"), (1, "getgrnam")])
+        self.assertEqual(problems("(getpwuid)(0);"), [(1, "getpwuid")])
+        self.assertEqual(problems("f = &getpwuid_r;"), [])
         self.assertEqual(problems("getpwent(); getgrent();"), [(1, "getpwent"), (1, "getgrent")])
         # raw string: contents are not code, but code after it is
         self.assertEqual(problems('s = R"x(getpwuid(0) " )x"; getgrnam(a);'), [(1, "getgrnam")])

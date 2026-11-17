@@ -4,15 +4,21 @@
  * the walk is unit-tested with a fake list on every host. The Windows owner is
  * win_dns_cache_table.hpp.
  *
- * The list is foreign memory from an undocumented API, so the walk does not trust its shape:
- *  - it is bounded by a node ceiling (a corrupted or cyclic pNext cannot loop forever);
- *  - it stops at the first NODE seen twice (a cycle or a shared node would otherwise be a double
- *    free); whatever is left past that point leaks rather than risking a second free;
- *  - a NAME buffer seen twice (two healthy nodes aliasing one buffer) is freed once and skipped
- *    thereafter: that is not evidence the list is corrupt, so the walk continues;
- *  - it never throws (the Windows owner's release() is noexcept): the bookkeeping allocates, and if
- *    that throws the walk stops and the remainder leaks. All bookkeeping for a node is done BEFORE
- *    its blocks are freed, so a throw can never fall between a free and its record.
+ * The list is foreign memory from an undocumented API, so the walk does not trust its shape. It
+ * keeps ONE set of every pointer it has seen, nodes and names alike, because a name may alias a
+ * node (its own, a later one or an earlier one) and each block must be freed at most once:
+ *  - a node already in the set ends the walk, checked BEFORE the node is read (it may already have
+ *    been freed, as a node or as another node's name);
+ *  - a name equal to its own node ends the walk (the node is recorded, not freed: leaked);
+ *  - a name seen before AS A NAME (two healthy nodes sharing a buffer) is skipped, not freed
+ *    again, and the walk continues; a name seen before as anything else ends the walk;
+ *  - the node ceiling bounds a corrupted or cyclic pNext;
+ *  - it never throws (the Windows owner's release() is noexcept): all bookkeeping for a node is
+ *    done, inside try/catch, BEFORE pNext is read or anything is freed. A bad_alloc stops the walk
+ *    and the remainder leaks.
+ * Stopping always leaks the remainder rather than risking a second free. This guards LIST ALIASING
+ * only; it says nothing about whether DnsFree(DnsFreeFlat) matches the list's allocator (see
+ * WP12-risk-acceptance.md).
  */
 #pragma once
 
@@ -29,20 +35,30 @@ inline constexpr std::size_t kDnsCacheNodeWalkCap = 65536;
 /// a throwing allocator). Returns the number of nodes freed.
 template <typename Set = std::unordered_set<const void*>, typename Node, typename FreeFn>
 std::size_t release_dns_cache_list(Node* head, FreeFn&& free_one) noexcept {
-    Set seen_nodes;
-    Set seen_names;
+    Set seen;  // every node and name pointer seen so far (freed, or recorded just before a free)
+    Set names; // the subset of `seen` that was seen AS a name
     std::size_t freed = 0;
     for (Node* p = head; p != nullptr && freed < kDnsCacheNodeWalkCap;) {
-        Node* next = p->pNext;
-        void* name = static_cast<void*>(p->pszName);
+        void* name = nullptr;
         bool free_name = false;
         try {
-            if (!seen_nodes.insert(static_cast<const void*>(p)).second)
-                break; // revisited node: cycle or shared node
-            free_name = name != nullptr && seen_names.insert(name).second;
+            if (!seen.insert(static_cast<const void*>(p)).second)
+                break; // before ANY read of *p: it may already be freed
+            name = static_cast<void*>(p->pszName);
+            if (name == static_cast<void*>(p))
+                break; // name aliases its own node
+            if (name != nullptr) {
+                if (seen.insert(static_cast<const void*>(name)).second) {
+                    names.insert(static_cast<const void*>(name));
+                    free_name = true;
+                } else if (names.find(static_cast<const void*>(name)) == names.end()) {
+                    break; // aliases a node already seen
+                }
+            }
         } catch (...) {
             break; // bookkeeping could not allocate: leak the rest
         }
+        Node* next = p->pNext; // only after the bookkeeping, and before the frees
         if (free_name)
             free_one(name);
         free_one(static_cast<void*>(p));
