@@ -70,7 +70,7 @@ Open **DEX** in the sidebar. The Overview opens first.
 The rates are computed over the Windows agents connected now, the platform with
 the most complete collector. That includes a device whose observer is switched
 off (`--dex-disable`) or not armed: it cannot report a crash, so it counts as
-crash-free. Offline agents are left out of the denominator rather than counted
+crash-free (a known limitation, tracked in #8061). Offline agents are left out of the denominator rather than counted
 as healthy. To see how many connected devices are not feeding crash data, read
 the armed, not armed and not reporting counts on the Apps tab. The
 `yuzu_fleet_agents_dex_observer_disarmed` gauge counts the not-armed ones only;

@@ -92,8 +92,8 @@ would change tier. **Save** writes the policy; **Reset to defaults** removes it
 and every override. If someone else saves while you are editing, your save is
 refused and nothing is overwritten.
 
-Do not save or reset the policy during a rolling upgrade or rollback of the
-server; see [upgrading](../user-manual/upgrading.md).
+DEX requires the hard-cutover deployment contract: a fresh database, every
+server replica on this build, and no return to an earlier build.
 
 ## REST
 

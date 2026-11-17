@@ -19,9 +19,10 @@ rather than copying it.
 - **Measured, not guessed.** Headline figures are real rates with their
   populations beside them, not invented scores.
 - **Honest about gaps.** An offline device is left out of the live figures, and
-  a platform with narrower collection reads as less observed. One gap to know
-  about: a connected device whose observer is switched off or not armed still
-  counts in the crash-free rate, because it cannot report a crash. See
+  a platform with narrower collection reads as less observed. One known
+  limitation, tracked in #8061: a connected device whose observer is switched
+  off or not armed still counts in the crash-free rate, because it cannot
+  report a crash. See
   [fleet health](fleet-health.md#limits-and-privacy).
 - **Edge first.** Measurement happens on the device. What leaves it is signal
   observations, a few device-wide readings on each heartbeat and a once-a-day

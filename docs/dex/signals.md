@@ -136,7 +136,11 @@ routes carry it in the path as `{id}`.
 ## Permissions and audit
 
 All reads need `GuaranteedState:Read`. The live-info route additionally needs
-`Execution:Execute`; both are checked against the device you target.
+`Execution:Execute`; both are checked against the device you target. The two
+actions it dispatches (`os_info` `uptime` and `processes` `list_hashed`) are
+`Inventory:Read` actions, and that permission is checked when the command is
+dispatched, after the request's audit row is written. A custom role needs all
+three.
 
 | Read | Audit verb |
 |---|---|
@@ -163,8 +167,10 @@ See [surfaces](surfaces.md#the-rest-api).
   device before anything is sent: queried DNS names, print document names and
   owners, profile user names and image paths. What is never sent cannot leak.
   See [the privacy and works-council contract](../dex-signal-catalog.md#privacy--works-council-contract).
-- **Rate caps.** Each signal type has an hourly cap per device, so a failing
-  disk or a flapping network cannot flood the store. See
+- **Rate caps.** Event-log signal types have an hourly cap per device. State
+  polls and sustained-performance signals are bounded differently: they report
+  when a device enters a bad state and stay quiet while it lasts. Either way a
+  failing disk or a flapping network cannot flood the store. See
   [rate caps](../dex-signal-catalog.md#rate-caps).
 - **Names are shown as sent.** Application, device and group names that contain
   invisible direction or zero-width characters are printed with a visible

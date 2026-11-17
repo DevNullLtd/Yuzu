@@ -34,9 +34,12 @@ sampler, the per-connection network sampler and the usage fold keep running
 unless you switch each off. It also does not stop the daily sync of
 per-application performance and app usage to the server. `--inventory-disable`
 (environment `YUZU_AGENT_INVENTORY_DISABLE`) does that, and it stops the whole
-daily sync, so the agent collects and sends none of its daily sources. To stop
-DEX data leaving a device, set both flags. To stop collecting it on the device
-as well, switch the Echo sources off.
+daily sync, so the agent collects and sends none of its daily sources. The two
+flags together stop automatic DEX collection and uploads. They do not stop an
+operator asking the device for data: the device panels dispatch Echo's `sql`
+action on demand, and the reply is held in the server's response store. For no
+DEX data to leave a device, also switch the Echo sources off and do not run
+on-demand Echo queries against it.
 
 Switching collection off does not recall what was already captured. The
 per-application performance sync covers the last two completed days, so rows
@@ -44,8 +47,9 @@ captured before the switch can still arrive in the next syncs. Nothing already
 on the server is deleted by any of these switches: it stays for as long as
 [what is kept and for how long](#what-is-kept-and-for-how-long) says.
 
-The agent's own `--help` text for the flag mentions only the crash recorder. The
-checks for the flag in the agent's code show the wider scope given above.
+The agent's own `--help` text for the flag mentions only the crash recorder; the
+scope above is what the flag does. That help text is a known defect, tracked in
+#8028.
 
 ## The DEX observer
 
@@ -59,8 +63,9 @@ no per-category toggle and no server-side switch.
 
 **How it works.** The observer reads operating-system event sources and turns
 each event into a uniform observation (type, subject, reason, component, metric,
-platform, time). It applies a per-type hourly cap so a storm cannot flood the
-store. Observations are sent to the server over the agent's existing connection
+platform, time). So a storm cannot flood the store, event-log observations are
+capped per type per hour, and the state polls and sustained-performance signals
+report only when a device enters a bad state, not on every reading. Observations are sent to the server over the agent's existing connection
 and projected into the DEX read model.
 
 **Health tags.** While enabled, each heartbeat carries two tags: whether the
