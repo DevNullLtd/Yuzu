@@ -455,12 +455,14 @@ if (( red == 0 )) && [[ "$(docker exec "$PG3" psql -U yuzu -d postgres -tAc "SEL
 else fail "/readyz went 503 (or the probe never reconnected) with reserved slots available: $(body /readyz)"; fi
 # Negative control: without the grant the app role is an ordinary client and the
 # same kill leaves the probe refused — the #4943 failure shape.
+# Scope the log assertion below to THIS scenario: record where the log stands now, grep after it.
+SLOG_MARK=$(wc -l < "$RIG/server.log")
 psql_in "$PG3" "REVOKE pg_use_reserved_connections FROM app"
 [[ "$(kill_probe)" == 1 ]] || fail "did not find exactly one probe backend to terminate (control)"
 foreign_burst
 if t=$(wait_for /readyz 503 20 '"pg":"unreachable"'); then pass "/readyz 503 pg=unreachable ${t}s after the same kill WITHOUT the grant (probe refused at max_connections; log shows 53300)"
 else fail "/readyz did not go 503 without the grant: $(body /readyz)"; fi
-grep -q "no free connection slots" "$RIG/server.log" && pass "server log names the refusal (no free connection slots: the #4943 reserve), not the password" || fail "server log lacks the no-free-connection-slots cause"
+tail -n "+$((SLOG_MARK + 1))" "$RIG/server.log" | grep -aq "no free connection slots" && pass "server log names the refusal (no free connection slots: the #4943 reserve), not the password" || fail "server log lacks the no-free-connection-slots cause"
 grep -q "$APP_PASS" "$RIG/server.log" && fail "server log contains the app password" || true
 psql_in "$PG3" "GRANT pg_use_reserved_connections TO app"
 if t=$(wait_for /readyz 200 20); then pass "/readyz 200 again ${t}s after re-granting (probe admitted into the reserve)"

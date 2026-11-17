@@ -1170,6 +1170,7 @@ pg_canary_exe = executable(
   'yuzu_pg_canary',
   files('src/pg/canary_main.cpp'),
   dependencies: [libpq_dep],
+  include_directories: include_directories('../../common/include'), # pg_raii.hpp -> log_token.hpp
   install: false,
 )
 

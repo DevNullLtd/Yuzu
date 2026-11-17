@@ -227,6 +227,11 @@ std::string pq_error(PGconn* c, const char* fallback) {
     return cause;
 }
 
+std::string pq_query_error(PGconn* c, const char* step) {
+    const char* m = c ? PQerrorMessage(c) : nullptr;
+    return pg::query_failure_detail(step, m ? std::string_view{m} : std::string_view{});
+}
+
 /// The production ping: owns the dedicated connection between ticks.
 class LibpqPinger {
 public:
@@ -368,7 +373,7 @@ private:
                     if (auto ok = pg::check_effective_connection(c, hosts.size()); !ok)
                         return ok.error();
                     if (PQsetnonblocking(c, 1) != 0)
-                        return pq_error(c, "could not set non-blocking mode");
+                        return pq_query_error(c, "could not set non-blocking mode");
                     return std::nullopt;
                 }
                 if (st == PGRES_POLLING_FAILED) // libpq ended the walk
@@ -496,20 +501,20 @@ private:
                                                                     : "query timed out");
         };
         if (PQsendQuery(c, sql_.c_str()) == 0)
-            return pq_error(c, "could not send probe query");
+            return pq_query_error(c, "could not send probe query");
         for (;;) {
             const int f = PQflush(c);
             if (f == 0)
                 break;
             if (f < 0)
-                return pq_error(c, "could not flush probe query");
+                return pq_query_error(c, "could not flush probe query");
             if (!wait_socket(PQsocket(c), Want::Write, deadline, stop))
                 return timed_out();
         }
         std::optional<std::string> result_error;
         for (;;) {
             if (PQconsumeInput(c) == 0)
-                return pq_error(c, "connection lost during probe");
+                return pq_query_error(c, "connection lost during probe");
             bool done = false;
             while (PQisBusy(c) == 0) {
                 PGresult* raw = PQgetResult(c);

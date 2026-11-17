@@ -25,9 +25,12 @@ def bash(script, env=None):
 
 
 def main():
-    if shutil.which("bash") is None:
-        print("SKIP: no bash")
-        return 0
+    if shutil.which("bash") is None or not shutil.which("sha256sum") and not shutil.which("shasum"):
+        print("SKIPPED: bash or a sha256 tool is not available on this runner; the join was NOT tested")
+        return 77
+    if sys.platform.startswith("win"):
+        print("SKIPPED: Windows runner; the shell join was NOT tested here")
+        return 77
     bad = []
     with tempfile.TemporaryDirectory(prefix="yuzu_test_fp_") as d:
         d = pathlib.Path(d)

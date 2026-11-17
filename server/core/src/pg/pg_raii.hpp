@@ -12,6 +12,9 @@
 /// substrate code and every future Postgres-backed store use.
 
 #include <libpq-fe.h>
+#include <yuzu/log_token.hpp> // log_key_token: query-phase detail
+
+#include <string>
 #include <string_view>
 
 namespace yuzu::server::pg {
@@ -115,6 +118,20 @@ inline constexpr const char* kConnectFailureGeneric =
     if (has("out of memory"))
         return "out of memory";
     return kConnectFailureGeneric;
+}
+
+/// Query-phase failure detail (the connection existed): the connect classifier does NOT apply -- a
+/// dropped connection or "SSL SYSCALL error: EOF detected" during a failover is not a certificate
+/// problem -- and these messages do not quote the DSN. Returns `step` plus the FIRST line of libpq's
+/// text, folded with log_key_token and capped at kQueryDetailMaxBytes, so on-call still reads "server
+/// closed the connection unexpectedly".
+inline constexpr std::size_t kQueryDetailMaxBytes = 120;
+[[nodiscard]] inline std::string query_failure_detail(std::string_view step, std::string_view raw) {
+    raw = raw.substr(0, raw.find_first_of("\r\n"));
+    if (raw.size() > kQueryDetailMaxBytes)
+        raw = raw.substr(0, kQueryDetailMaxBytes);
+    const std::string safe = ::yuzu::log_key_token(raw);
+    return safe.empty() ? std::string(step) : std::string(step) + ": " + safe;
 }
 
 /// RAII owner for a `PGconn*`. `PQfinish` runs on scope exit. Move-only.

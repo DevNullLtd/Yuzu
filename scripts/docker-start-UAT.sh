@@ -429,6 +429,8 @@ start_all() {
         done
         # The agent log carries only a session_fp (F50); the id comes from the server container's
         # "ProxyRegister succeeded" line, joined on the fingerprint.
+        # shellcheck source=lib/agent-session-fp.sh
+        # shellcheck disable=SC1091
         . "$YUZU_ROOT/scripts/lib/agent-session-fp.sh"
         # docker logs of an absent container must not abort under set -e: stage to a file.
         local srv_log="$UAT_DIR/server-container.log"

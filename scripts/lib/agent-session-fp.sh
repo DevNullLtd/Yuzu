@@ -7,6 +7,7 @@
 #
 # Older agent builds log "(session=<id>, ...)" instead: agent_session_fp prints nothing for them,  # tripwire-allow: legacy-agent
 # and agent_session_id_legacy returns that id, so a mixed-version fleet still resolves.
+# grep -a throughout: a NUL byte in a log must not turn matches into "binary file matches".
 # Logs written by a native Windows process end lines in CRLF: every parse strips CR first.
 
 # _sha256_hex8 : read stdin, print the first 8 hex of its SHA-256. Fails LOUDLY (rc 127) when no
@@ -29,7 +30,7 @@ _sha256_hex8() {
 # agent_session_fp AGENT_LOG_FILE : the last session_fp= in the agent log, or empty
 agent_session_fp() {
     [ -r "$1" ] || return 0
-    tr -d '\r' < "$1" | grep "Registered with server" | grep -oE 'session_fp=[0-9a-f]{8}' | tail -1 | cut -d= -f2 || true
+    tr -d '\r' < "$1" | grep -a "Registered with server" | grep -aoE 'session_fp=[0-9a-f]{8}' | tail -1 | cut -d= -f2 || true
 }
 
 # agent_session_id_legacy AGENT_LOG_FILE : the id from a pre-F50 agent's "session=<id>" Registered  # tripwire-allow: legacy-agent
@@ -37,7 +38,7 @@ agent_session_fp() {
 agent_session_id_legacy() {
     [ -r "$1" ] || return 0
     # tripwire-allow: legacy-agent (a pre-F50 agent's own line, kept for a mixed-version fleet)
-    tr -d '\r' < "$1" | grep "Registered with server" | grep -oE 'session=[^ ,)]+' | tail -1 | cut -d= -f2 || true  # tripwire-allow: legacy-agent
+    tr -d '\r' < "$1" | grep -a "Registered with server" | grep -aoE 'session=[^ ,)]+' | tail -1 | cut -d= -f2 || true  # tripwire-allow: legacy-agent
 }
 
 # session_for_fp FP : read server log text on stdin; print the session id whose SHA-256 begins
@@ -48,7 +49,7 @@ session_for_fp() {
     while IFS= read -r s; do
         h=$(printf '%s' "$s" | _sha256_hex8) || return 127
         [ "$h" = "$fp" ] && found="$s"
-    done < <(tr -d '\r' | grep -oE 'ProxyRegister succeeded: agent=[^,]*, session=[^ ,)]+' | sed 's/.*session=//')
+    done < <(tr -d '\r' | grep -aoE 'ProxyRegister succeeded: agent=[^,]*, session=[^ ,)]+' | sed 's/.*session=//')
     [ -n "$found" ] && printf '%s\n' "$found"
     return 0
 }

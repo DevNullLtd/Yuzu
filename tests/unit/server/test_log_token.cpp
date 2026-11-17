@@ -512,11 +512,14 @@ TEST_CASE("log_token: classifies UTF-8 validity exactly like sanitize_utf8_stric
     CHECK(mismatches == 0);
 }
 
-// ── WP04 waiver list: fold sites with NO dedicated test ─────────────────────────────────────
+// ── WP04 waiver list: PARTIAL, not exhaustive: representative sites only ─────────────────────────────────────
 // Each is a one-argument wrap of the already-tested log_key_token on a log line whose reaching
 // state needs a fixture this change did not build (an IdP session, an elevation path, a failing
 // store). They are covered by review and by the helper's own tests above, not by a test of the
-// line. If one regresses, the next governance run's grep of "spdlog.*username" is the backstop.
+// line. This list is NOT a complete inventory: other usernames in auth.cpp, auth_db.cpp and
+// auth_routes.cpp that were read back from AuthDB (and so passed is_valid_username) are left
+// unfolded on purpose, and the OIDC callback `result.error()` line is left raw because
+// oidc_provider.cpp neutralises its own error text (log_key_token at its quoting sites). If one regresses, the next governance run's grep of "spdlog.*username" is the backstop.
 //   auth_routes.cpp: "Login blocked ... locked", "Account locked after", "password verification
 //     for ... could not complete", "audit emission FAILED ... lockout", "clear_failed_logins
 //     failed", "mfa_status failed", BREAK-GLASS login lines, "MFA enforcement=... refusing

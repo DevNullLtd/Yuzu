@@ -2981,7 +2981,7 @@ UpdateRoleOutcome AuthManager::update_role_checked(const std::string& username, 
         if (lifecycle_guard_unwired(true, rbac_store_ != nullptr)) {
             spdlog::error("AuthManager::update_role_checked('{}'): the last-Administrator guard "
                           "is not wired (no RbacStore) - refusing to change the role without it",
-                          username);
+                          ::yuzu::log_key_token(username));
             note_lifecycle_store_failure("set_role");
             return UpdateRoleOutcome::StoreFailure; // nothing was attempted: no eviction
         }
@@ -2999,7 +2999,7 @@ UpdateRoleOutcome AuthManager::update_role_checked(const std::string& username, 
             return UpdateRoleOutcome::InactivePromotionRefused;
         case Kind::kStoreFailure:
             spdlog::error("AuthManager::update_role_checked: guarded role write for '{}' failed: {}",
-                          username, res.err);
+                          ::yuzu::log_key_token(username), ::yuzu::log_key_token(res.err));
             note_lifecycle_store_failure("set_role");
             // The write MAY have committed (a lost COMMIT ack): do not keep serving the cached
             // role or a session minted at the old one. Fail toward re-authentication.
@@ -3040,7 +3040,7 @@ UpdateRoleOutcome AuthManager::update_role_checked(const std::string& username, 
         if (!wipe_user_sessions_then_drop_cache(username)) {
             spdlog::error("AuthManager::update_role_checked: durable session wipe for '{}' failed "
                           "(the role IS changed)",
-                          username);
+                          ::yuzu::log_key_token(username));
             return UpdateRoleOutcome::UpdatedSessionWipeFailed;
         }
         return UpdateRoleOutcome::Updated;

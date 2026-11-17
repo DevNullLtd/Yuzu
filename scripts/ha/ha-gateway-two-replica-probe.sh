@@ -299,7 +299,7 @@ agent_map() { # container,agent id,session per agent (session via the route tabl
         # Join it to the id in the route table, the same key the rest of this script uses.
         local fp alog
         alog="$(docker logs "$c" 2>&1 | tr -d '\r')"
-        fp="$(printf '%s\n' "$alog" | grep 'Registered with server' | grep -oE 'session_fp=[0-9a-f]{8}' | tail -1 | cut -d= -f2)"
+        fp="$(printf '%s\n' "$alog" | grep -a 'Registered with server' | grep -aoE 'session_fp=[0-9a-f]{8}' | tail -1 | cut -d= -f2)"
         sess=""
         if [ -n "$fp" ]; then
             # The agent log carries only session_fp= (F50): the first 8 hex of SHA-256(session id).
@@ -308,7 +308,7 @@ agent_map() { # container,agent id,session per agent (session via the route tabl
                 || echo "agent_map: psql failed resolving the session for $name (route table unreadable)" >&2
         else
             # A pre-F50 agent still logs session=<id>.  # tripwire-allow: legacy-agent
-            sess="$(printf '%s\n' "$alog" | grep 'Registered with server' | grep -oE 'session=[^ ,)]+' | tail -1 | cut -d= -f2)"  # tripwire-allow: legacy-agent
+            sess="$(printf '%s\n' "$alog" | grep -a 'Registered with server' | grep -aoE 'session=[^ ,)]+' | tail -1 | cut -d= -f2)"  # tripwire-allow: legacy-agent
         fi
         echo "$name,$c,$sess"
     done > "$run/agent_map.csv"

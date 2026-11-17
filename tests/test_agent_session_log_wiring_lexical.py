@@ -21,9 +21,9 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 SELF = pathlib.Path(__file__).resolve()
 SKIP_DIRS = {".git", "build-linux", "build-windows", "build-macos", "node_modules", "vcpkg_installed",
              "scratchpad", "governance.d", ".claude", "changelog.d", "site"}
-WINDOW = 6
-MENTION = re.compile(r"Registered with server")
-EXTRACT = re.compile(r"\bsession=(?!fp)")
+WINDOW = 25  # extractors may sit well after the grep that fetches the line
+MENTION = re.compile(r"Registered\s+with\s+server")
+EXTRACT = re.compile(r"\bsession\\?=(?!fp)")
 ALLOW = "tripwire-allow:"
 
 
@@ -83,7 +83,7 @@ def iter_files():
         if not p.is_file() or p.resolve() == SELF:
             continue
         rel = p.relative_to(ROOT)
-        if SKIP_DIRS & set(rel.parts):
+        if SKIP_DIRS & set(rel.parts[:1]) or "node_modules" in rel.parts or ".git" in rel.parts:
             continue
         try:
             if p.stat().st_size > 2_000_000:
@@ -101,6 +101,9 @@ def selftest():
         'sed -n "s/.*Registered with server (session=\\(.*\\),.*/\\1/p"',
         'grep "Registered with server" "$log" | \\\n    python3 -c "re.findall(r\'session=[^ ]+\')"',
         'grep "Registered with server" x > $t\nm=$(grep -oE "session=[^ ,)]+" $t)',
+        'grep "Registered  with   server" x | sed "s/.*session=//"',
+        'grep "Registered with server" x | sed s/session\\=//',
+        'grep "Registered with server" x > $t\n' + "echo\n" * 15 + 'v=$(grep -oE "session=[^ ]+" $t)',
     ]
     for b in bad:
         assert check_text("x.sh", b), ("selftest: must fire on", b)

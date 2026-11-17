@@ -458,7 +458,8 @@ std::optional<auth::Session> AuthRoutes::synthesize_token_session(const ApiToken
             "synthesize_token_session: token principal_id='{}' has out-of-allowlist "
             "principal_kind='{}' — refusing to synthesize a session (DB corruption or a "
             "bypassed CHECK constraint)",
-            api_token.principal_id, api_token.principal_kind);
+            ::yuzu::log_key_token(api_token.principal_id),
+            ::yuzu::log_key_token(api_token.principal_kind));
         return std::nullopt;
     }
 

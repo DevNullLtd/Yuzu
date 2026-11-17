@@ -4677,7 +4677,9 @@ groups:
             has failed for over 2 minutes; /readyz reports not ready with a
             `pg` reason (unreachable, stale, or read_only). Check the server log
             for the "[readyz] Postgres not reachable" line (it carries a FIXED
-            cause such as "server not reachable" or "authentication failed", not
+            cause such as "server not reachable", "authentication failed", "no free
+            connection slots" (slot exhaustion, the #4943 shape) or "no writable
+            host" (read-only or standby only), not
             libpq's text, which can quote part of a DSN password; probe from the
             server host with psql against the same DSN for the detail), the
             database, and the network or proxy path to it.

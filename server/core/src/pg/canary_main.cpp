@@ -45,6 +45,8 @@ int main(int argc, char** argv) {
 
     PgResult res{PQexec(conn.get(), "SELECT 1")};
     if (res.status() != PGRES_TUPLES_OK) {
+        // A query-phase error on an established connection: it does not quote the DSN, and the canary
+        // is an operator tool whose stderr goes to the operator, so libpq's text is printed as is.
         std::fputs(std::format("canary: SELECT 1 failed: {}\n", PQerrorMessage(conn.get())).c_str(),
                    stderr);
         return 1;

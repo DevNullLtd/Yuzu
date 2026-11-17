@@ -10,6 +10,7 @@
 #include "pg/pg_raii.hpp"
 
 #include "../test_helpers.hpp"
+#include "../test_log_capture.hpp" // stray_control_bytes
 
 #include <libpq-fe.h>
 
@@ -302,6 +303,23 @@ TEST_CASE("connect_failure_cause never echoes libpq text", "[raii][log_injection
     const std::string generic = connect_failure_cause("weird\nforged line s3cr3tfrag");
     CHECK(generic.find("s3cr3tfrag") == std::string::npos);
     CHECK(generic == yuzu::server::pg::kConnectFailureGeneric);
+}
+
+TEST_CASE("query_failure_detail keeps the step and a folded, capped first line (WP04-X)",
+          "[raii][F56]") {
+    using yuzu::server::pg::query_failure_detail;
+    // An ordinary failover is NOT a certificate problem.
+    const auto d = query_failure_detail("connection lost during probe",
+                                        "server closed the connection unexpectedly\n\tThis probably means...");
+    CHECK(d == "connection lost during probe: server closed the connection unexpectedly");
+    const auto e = query_failure_detail("connection lost during probe", "SSL SYSCALL error: EOF detected\n");
+    CHECK(e.find("TLS negotiation") == std::string::npos);
+    CHECK(e.find("EOF detected") != std::string::npos);
+    // Folded and capped; empty text keeps just the step.
+    const auto f = query_failure_detail("s", std::string("a\x1b[2J\xC2\x9B") + std::string(500, 'x'));
+    CHECK(yuzu::test::stray_control_bytes(f) == 0);
+    CHECK(f.size() <= 1 + 3 + 120 + 8);
+    CHECK(query_failure_detail("step", "") == "step");
 }
 
 TEST_CASE("connect_failure_cause: each branch, and the mis-bucketing cases", "[raii][F56]") {
