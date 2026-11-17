@@ -24,6 +24,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -219,8 +220,8 @@ inline void read_soname(Reader& r, const std::vector<ElfProgramHeader>& phs, boo
     if (!seg)
         return unreadable();
 
-    bool have_strtab = false, have_strsz = false, have_soname = false, have_null = false;
-    std::uint64_t strtab = 0, strsz = 0, soname_off = 0;
+    std::optional<std::uint64_t> strtab, strsz, soname_off;
+    bool have_null = false;
     for (std::uint64_t i = 0; i < scan && !have_null; ++i) {
         const std::size_t p = static_cast<std::size_t>(i * es);
         const std::uint64_t tag = is64 ? ld<std::uint64_t>(*seg, p, order)
@@ -229,33 +230,30 @@ inline void read_soname(Reader& r, const std::vector<ElfProgramHeader>& phs, boo
                                        : ld<std::uint32_t>(*seg, p + 4, order);
         if (tag == kDtNull) {
             have_null = true;
-        } else if (tag == kDtStrtab && !have_strtab) {
-            have_strtab = true;
+        } else if (tag == kDtStrtab && !strtab) {
             strtab = val;
-        } else if (tag == kDtStrsz && !have_strsz) {
-            have_strsz = true;
+        } else if (tag == kDtStrsz && !strsz) {
             strsz = val;
-        } else if (tag == kDtSoname && !have_soname) {
-            have_soname = true;
+        } else if (tag == kDtSoname && !soname_off) {
             soname_off = val;
         }
     }
     // Cap or segment end reached without a DT_NULL: the table is not provably complete.
     if (!have_null)
         return unreadable();
-    if (!have_soname)
+    if (!soname_off)
         return;
-    if (!have_strtab || !have_strsz || soname_off >= strsz)
+    if (!strtab || !strsz || *soname_off >= *strsz)
         return unreadable();
 
     // The whole string-table range must sit in one PT_LOAD's file-backed part.
     const ElfProgramHeader* load_seg = nullptr;
     std::uint64_t delta = 0;
     for (const auto& ph : phs) {
-        if (ph.type != kPtLoad || strtab < ph.vaddr)
+        if (ph.type != kPtLoad || *strtab < ph.vaddr)
             continue;
-        const std::uint64_t d = strtab - ph.vaddr;
-        if (d <= ph.filesz && strsz <= ph.filesz - d) {
+        const std::uint64_t d = *strtab - ph.vaddr;
+        if (d <= ph.filesz && *strsz <= ph.filesz - d) {
             load_seg = &ph;
             delta = d;
             break;
@@ -264,15 +262,15 @@ inline void read_soname(Reader& r, const std::vector<ElfProgramHeader>& phs, boo
     if (!load_seg)
         return unreadable();
     const auto table_off = checked_add(load_seg->offset, delta);
-    const auto table_end = table_off ? checked_add(*table_off, strsz) : std::nullopt;
+    const auto table_end = table_off ? checked_add(*table_off, *strsz) : std::nullopt;
     if (!table_end || *table_end > r.size())
         return unreadable();
 
     // Capped at the end of the table: a name with no NUL before it is never completed from the
     // bytes that follow.
-    const std::size_t cap =
-        static_cast<std::size_t>(std::min<std::uint64_t>(lim.max_string_bytes, strsz - soname_off));
-    auto name = r.read_c_string(*table_off + soname_off, cap);
+    const std::size_t cap = static_cast<std::size_t>(
+        std::min<std::uint64_t>(lim.max_string_bytes, *strsz - *soname_off));
+    auto name = r.read_c_string(*table_off + *soname_off, cap);
     if (!name)
         return unreadable();
     info.soname = std::move(*name);

@@ -57,7 +57,6 @@ TEST_CASE("binary_header: to_token names every error", "[binary_header][reader]"
     CHECK(to_token(ParseError::not_this_format) == "not_this_format");
     CHECK(to_token(ParseError::malformed) == "malformed");
     CHECK(to_token(ParseError::limit_exceeded) == "limit_exceeded");
-    CHECK(to_token(ParseError::unsupported) == "unsupported");
 }
 
 TEST_CASE("binary_header: read serves in-range bytes from a span source", "[binary_header][reader]") {
@@ -70,8 +69,6 @@ TEST_CASE("binary_header: read serves in-range bytes from a span source", "[bina
     const auto tail = r.read(12, 4);
     REQUIRE(tail.has_value());
     CHECK(*tail == std::string("\x0d\x0e\x0f\x10", 4));
-    CHECK(r.reads() == 2);
-    CHECK(r.bytes_read() == 8);
 }
 
 TEST_CASE("binary_header: read never calls read_at for overflow, past-size or over-budget requests",
@@ -93,8 +90,6 @@ TEST_CASE("binary_header: read never calls read_at for overflow, past-size or ov
         CHECK(r.read(0, 101).error() == ParseError::truncated);
         CHECK(r.read(1000, 1).error() == ParseError::truncated);
         CHECK(c.calls == 0);
-        CHECK(r.reads() == 0);
-        CHECK(r.bytes_read() == 0);
     }
     SECTION("the exact end of the source is readable") {
         auto c = zero_filled();
@@ -114,7 +109,6 @@ TEST_CASE("binary_header: read never calls read_at for overflow, past-size or ov
         REQUIRE(r.read(0, 4).has_value()); // 6 + 4 == 10 is allowed
         CHECK(r.read(0, 1).error() == ParseError::limit_exceeded);
         CHECK(c.calls == 2);
-        CHECK(r.bytes_read() == 10);
     }
     SECTION("max_reads would be passed") {
         auto c = zero_filled();
@@ -123,7 +117,6 @@ TEST_CASE("binary_header: read never calls read_at for overflow, past-size or ov
         REQUIRE(r.read(1, 1).has_value());
         CHECK(r.read(2, 1).error() == ParseError::limit_exceeded);
         CHECK(c.calls == 2);
-        CHECK(r.reads() == 2);
     }
     SECTION("a size_t-sized len over a huge size is bounded by the byte budget, not allocated") {
         auto c = zero_filled();
@@ -170,7 +163,6 @@ TEST_CASE("binary_header: span_source over an empty span is size 0 and every rea
     CHECK(r.read(0, 1).error() == ParseError::truncated);
     CHECK(r.read(5, 1).error() == ParseError::truncated);
     CHECK(r.read(0, 64).error() == ParseError::truncated);
-    CHECK(r.reads() == 0);
 }
 
 TEST_CASE("binary_header: span_source answers short only at the end of data", "[binary_header][reader]") {

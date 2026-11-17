@@ -2,11 +2,13 @@
  * test_binary_header_pe.cpp -- agents/shared/binary_header_pe.hpp, the bounded PE version-resource
  * reader. Pure logic over in-memory bytes: an in-test builder synthesises PE32 and PE32+ images, and
  * the real capture under tests/unit/fixtures/binary_headers/ (YUZU_TEST_FIXTURE_DIR) is asserted
- * against the strings and versions in src/yuzu_fixture.rc. The capture test FAILS when the file is
- * missing; it never skips.
+ * against the strings and versions recorded in its provenance.txt. The capture test FAILS when the
+ * file is missing; it never skips.
  */
 
 #include <catch2/catch_test_macros.hpp>
+
+#include "binary_header_test_util.hpp"
 
 #include <binary_header_pe.hpp>
 
@@ -15,13 +17,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
-#include <filesystem>
 #include <functional>
-#include <fstream>
 #include <limits>
 #include <optional>
-#include <sstream>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -29,13 +27,9 @@
 
 using namespace yuzu::shared::binary_header;
 
-namespace fs = std::filesystem;
-
-#ifndef YUZU_TEST_FIXTURE_DIR
-#define YUZU_TEST_FIXTURE_DIR "tests/unit/fixtures"
-#endif
-
 namespace {
+
+using bhtest::Probe;
 
 using Result = std::expected<PeVersionInfo, ParseError>;
 using Pair = std::pair<std::u16string, std::u16string>;
@@ -306,38 +300,6 @@ Image canonical_image(bool plus) {
     return build_image(s);
 }
 
-// ---- probing source ---------------------------------------------------------------------------------
-
-// Answers from `bytes` (only the first `visible` of them) and records every read_at call.
-struct Probe {
-    std::string bytes;
-    std::uint64_t visible{0};
-    std::size_t fail_at{std::numeric_limits<std::size_t>::max()};
-    std::size_t calls{0};
-    std::uint64_t total{0};
-    std::uint64_t max_end{0};
-    std::vector<std::pair<std::uint64_t, std::size_t>> reads;
-
-    explicit Probe(std::string b) : bytes(std::move(b)), visible(bytes.size()) {}
-    Probe(std::string b, std::uint64_t vis) : bytes(std::move(b)), visible(vis) {}
-
-    Source source() {
-        return Source{[this](std::uint64_t off, std::size_t len) -> std::optional<std::string> {
-                          const std::size_t idx = calls++;
-                          if (idx == fail_at)
-                              return std::nullopt;
-                          reads.emplace_back(off, len);
-                          total += len;
-                          max_end = std::max<std::uint64_t>(max_end, off + len);
-                          if (off >= visible)
-                              return std::string{};
-                          const std::uint64_t n = std::min<std::uint64_t>(len, visible - off);
-                          return bytes.substr(static_cast<std::size_t>(off), static_cast<std::size_t>(n));
-                      },
-                      visible};
-    }
-};
-
 Result parse(const std::string& img, const PeLimits& lim = {}, ReadBudget b = {}) {
     return read_pe_version(span_source(as_span(img)), lim, b);
 }
@@ -357,17 +319,6 @@ std::size_t wlen_of(const std::string& blob, std::size_t off) {
     const auto lo = static_cast<std::uint8_t>(blob[off]);
     const auto hi = static_cast<std::uint8_t>(blob[off + 1]);
     return static_cast<std::size_t>(lo) | (static_cast<std::size_t>(hi) << 8);
-}
-
-std::string read_fixture(const char* name) {
-    const auto path = fs::path{YUZU_TEST_FIXTURE_DIR} / "binary_headers" / name;
-    INFO("fixture path: " << path.string());
-    REQUIRE(fs::exists(path));
-    std::ifstream f(path, std::ios::binary);
-    std::ostringstream ss;
-    ss << f.rdbuf();
-    REQUIRE(!ss.str().empty());
-    return ss.str();
 }
 
 std::vector<std::pair<std::string, std::string>> expected_pairs() {
@@ -424,12 +375,6 @@ TEST_CASE("binary_header_pe: PE32 and PE32+ builder images parse to the exact va
         CHECK(r->machine == (plus ? 0x8664 : 0x14C));
         check_canonical_values(*r);
     }
-}
-
-TEST_CASE("binary_header_pe: each canonical builder image is at most 4096 bytes",
-          "[binary_header][pe]") {
-    CHECK(canonical_image(false).bytes.size() <= 4096);
-    CHECK(canonical_image(true).bytes.size() <= 4096);
 }
 
 TEST_CASE("binary_header_pe: strings are UTF-8 and an unpaired surrogate becomes U+FFFD",
@@ -505,7 +450,7 @@ TEST_CASE("binary_header_pe: not a PE", "[binary_header][pe]") {
 // ---- the real capture ------------------------------------------------------------------------------------
 
 TEST_CASE("binary_header_pe: the real capture pe_version.bin", "[binary_header][pe]") {
-    const auto bytes = read_fixture("pe_version.bin");
+    const auto bytes = bhtest::load_fixture("pe_version.bin");
     auto r = parse(bytes);
     REQUIRE(r.has_value());
     CHECK(r->machine == 0x8664);
@@ -861,14 +806,7 @@ namespace {
 std::vector<std::pair<std::string, std::string>> sweep_fixtures() {
     return {{"synth-pe32", canonical_image(false).bytes},
             {"synth-pe32plus", canonical_image(true).bytes},
-            {"real", read_fixture("pe_version.bin")}};
-}
-
-std::uint64_t xorshift(std::uint64_t& s) {
-    s ^= s << 13;
-    s ^= s >> 7;
-    s ^= s << 17;
-    return s;
+            {"real", bhtest::load_fixture("pe_version.bin")}};
 }
 
 } // namespace
@@ -877,20 +815,17 @@ TEST_CASE("binary_header_pe: truncation sweep", "[binary_header][pe]") {
     const ReadBudget budget;
     for (const auto& [name, bytes] : sweep_fixtures()) {
         INFO(name);
-        std::size_t over_prefix = 0, over_budget = 0, threw = 0;
+        std::size_t over_prefix = 0, over_budget = 0;
+        Probe p(bytes);
         for (std::size_t len = 0; len <= bytes.size(); ++len) {
-            Probe p(bytes, len);
-            try {
-                (void)read_pe_version(p.source());
-            } catch (...) {
-                ++threw;
-            }
-            if (p.max_end > len)
+            p.reset();
+            p.visible = len;
+            (void)read_pe_version(p.source());
+            if (p.beyond_visible())
                 ++over_prefix;
             if (p.total > budget.max_bytes || p.calls > budget.max_reads)
                 ++over_budget;
         }
-        CHECK(threw == 0);
         CHECK(over_prefix == 0);
         CHECK(over_budget == 0);
         Probe whole(bytes);
@@ -903,46 +838,24 @@ TEST_CASE("binary_header_pe: mutation sweep", "[binary_header][pe]") {
     std::uint64_t rng = 0x9E3779B97F4A7C15ull;
     for (const auto& [name, bytes] : sweep_fixtures()) {
         INFO(name);
-        std::size_t threw = 0, over_budget = 0, out_of_range = 0;
+        std::size_t over_budget = 0, out_of_range = 0;
         const std::array<char, 4> favourites = {'\x00', '\xFF', '\x80', '\x7F'};
         for (int i = 0; i < 20000; ++i) {
             std::string m = bytes;
-            const int edits = 1 + static_cast<int>(xorshift(rng) % 2);
+            const int edits = 1 + static_cast<int>(bhtest::xorshift(rng) % 2);
             for (int e = 0; e < edits; ++e) {
-                const std::size_t pos = static_cast<std::size_t>(xorshift(rng) % m.size());
-                const std::uint64_t pick = xorshift(rng);
+                const std::size_t pos = static_cast<std::size_t>(bhtest::xorshift(rng) % m.size());
+                const std::uint64_t pick = bhtest::xorshift(rng);
                 m[pos] = (pick & 3) == 0 ? static_cast<char>(pick >> 8) : favourites[(pick >> 8) & 3];
             }
             Probe p(std::move(m));
-            try {
-                (void)read_pe_version(p.source());
-            } catch (...) {
-                ++threw;
-            }
+            (void)read_pe_version(p.source());
             if (p.total > budget.max_bytes || p.calls > budget.max_reads)
                 ++over_budget;
-            if (p.max_end > p.bytes.size())
+            if (p.beyond_visible())
                 ++out_of_range;
         }
-        CHECK(threw == 0);
         CHECK(over_budget == 0);
         CHECK(out_of_range == 0);
     }
-}
-
-// ---- fuzz seeds ----------------------------------------------------------------------------------------------
-
-TEST_CASE("binary_header_pe: write fuzz seeds", "[.][binary_header_seeds]") {
-    const char* out = std::getenv("YUZU_FUZZ_SEED_OUT");
-    REQUIRE(out != nullptr);
-    const auto dir = fs::path{out} / "fuzz_binary_header_pe";
-    fs::create_directories(dir);
-    const auto write = [&](const char* name, const std::string& bytes) {
-        REQUIRE(bytes.size() <= 4096);
-        std::ofstream f(dir / name, std::ios::binary);
-        f.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
-        REQUIRE(f.good());
-    };
-    write("seed-synth-pe32.bin", canonical_image(false).bytes);
-    write("seed-synth-pe32plus.bin", canonical_image(true).bytes);
 }

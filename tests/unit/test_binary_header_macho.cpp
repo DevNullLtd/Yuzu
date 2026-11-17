@@ -7,6 +7,8 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "binary_header_test_util.hpp"
+
 #include <binary_header_macho.hpp>
 
 #include <algorithm>
@@ -14,9 +16,6 @@
 #include <bit>
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
-#include <filesystem>
-#include <fstream>
 #include <iterator>
 #include <limits>
 #include <optional>
@@ -25,16 +24,12 @@
 #include <utility>
 #include <vector>
 
-#ifndef YUZU_TEST_FIXTURE_DIR
-#define YUZU_TEST_FIXTURE_DIR "tests/unit/fixtures"
-#endif
-
 using namespace yuzu::shared::binary_header;
-namespace fs = std::filesystem;
 
 namespace {
 
 using Bytes = std::string;
+using bhtest::Probe;
 
 constexpr std::uint32_t kArm64 = 0x0100000C;  // CPU_TYPE_ARM64
 constexpr std::uint32_t kX8664 = 0x01000007;  // CPU_TYPE_X86_64
@@ -221,35 +216,6 @@ std::expected<MachoInfo, ParseError> parse(const Bytes& b, const MachoLimits& li
     return read_macho(span_source(sp), lim, budget);
 }
 
-// A Source over `data` that records every read_at call. `visible` bounds the file to its first
-// `visible` bytes without copying them (a truncation prefix).
-struct Probe {
-    Bytes data;
-    std::vector<std::pair<std::uint64_t, std::size_t>> reads;
-    std::uint64_t bytes{0};
-    bool beyond_end{false};
-    std::size_t visible{static_cast<std::size_t>(-1)};
-    Source source() {
-        const std::size_t end = std::min(visible, data.size());
-        return Source{[this, end](std::uint64_t off, std::size_t len) -> std::optional<std::string> {
-                          reads.emplace_back(off, len);
-                          bytes += len;
-                          if (off > end || len > end - off)
-                              beyond_end = true;
-                          if (off >= end)
-                              return std::string{};
-                          return data.substr(static_cast<std::size_t>(off),
-                                             std::min<std::size_t>(len, end - off));
-                      },
-                      end};
-    }
-    void reset() {
-        reads.clear();
-        bytes = 0;
-        beyond_end = false;
-    }
-};
-
 void require_dylib(const MachoSlice& s, std::string_view name, std::uint32_t ts, std::uint32_t cur,
                    std::uint32_t compat) {
     REQUIRE(s.id_dylib.has_value());
@@ -289,23 +255,6 @@ Bytes fat_at(const std::vector<Arch>& archs, std::size_t total, const std::vecto
     for (const auto& [at, body] : bodies)
         b.replace(at, body.size(), body);
     return b;
-}
-
-Bytes load_fixture(const char* name) {
-    const fs::path path = fs::path{YUZU_TEST_FIXTURE_DIR} / "binary_headers" / name;
-    std::ifstream in(path, std::ios::binary);
-    INFO("fixture missing or unreadable: " << path.string());
-    REQUIRE(in.is_open());
-    Bytes data((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-    REQUIRE(data.size() > 4096);
-    return data;
-}
-
-std::uint64_t xorshift(std::uint64_t& s) {
-    s ^= s << 13;
-    s ^= s >> 7;
-    s ^= s << 17;
-    return s;
 }
 
 } // namespace
@@ -413,7 +362,7 @@ TEST_CASE("macho: a slice may be big-endian 32-bit inside a universal file", "[b
 
 TEST_CASE("macho: the real thin capture reports the fixture's dylib id, versions, uuid and platform",
           "[binary_header][macho][real]") {
-    const Bytes data = load_fixture("macho_thin.bin");
+    const Bytes data = bhtest::load_fixture("macho_thin.bin");
     const auto r = parse(data);
     REQUIRE(r.has_value());
     CHECK_FALSE(r->fat);
@@ -434,7 +383,7 @@ TEST_CASE("macho: the real thin capture reports the fixture's dylib id, versions
 
 TEST_CASE("macho: the real universal capture reports two slices of different cpu_type with one id",
           "[binary_header][macho][real]") {
-    const Bytes data = load_fixture("macho_fat.bin");
+    const Bytes data = bhtest::load_fixture("macho_fat.bin");
     const auto r = parse(data);
     REQUIRE(r.has_value());
     CHECK(r->fat);
@@ -646,7 +595,7 @@ TEST_CASE("macho: a slice cannot be completed from its neighbour's bytes", "[bin
     constexpr std::size_t kS0 = 8 + 2 * 20; // directly after the table
     const std::size_t s0_end = kS0 + slice0.size();
     Probe p;
-    p.data = fat_at({Arch{kArm64, 0, kS0, slice0.size()}, Arch{kX8664, 0, s0_end, slice1.size()}},
+    p.bytes = fat_at({Arch{kArm64, 0, kS0, slice0.size()}, Arch{kX8664, 0, s0_end, slice1.size()}},
                     s0_end + slice1.size(), {{kS0, slice0}, {s0_end, slice1}});
     const auto r = read_macho(p.source());
     REQUIRE(r.has_value());
@@ -664,7 +613,7 @@ TEST_CASE("macho: a slice cannot be completed from its neighbour's bytes", "[bin
         }
     }
     CHECK(touched_slice0);
-    CHECK_FALSE(p.beyond_end);
+    CHECK_FALSE(p.beyond_visible());
 }
 
 TEST_CASE("macho: malformed load commands", "[binary_header][macho]") {
@@ -724,28 +673,13 @@ TEST_CASE("macho: malformed load commands", "[binary_header][macho]") {
     }
 }
 
-TEST_CASE("macho: a header or command area cut short is truncated for a thin file",
+TEST_CASE("macho: a 32-bit header that is exactly 28 bytes parses with zero commands",
           "[binary_header][macho]") {
-    const Bytes img = canon_thin64();
-    SECTION("inside the 32-byte header") {
-        for (const std::size_t n : {4u, 10u, 27u, 28u, 31u}) {
-            const auto r = parse(img.substr(0, n));
-            REQUIRE_FALSE(r.has_value());
-            CHECK(r.error() == ParseError::truncated);
-        }
-    }
-    SECTION("a 32-bit header that is exactly 28 bytes parses with zero commands") {
-        ThinSpec s;
-        s.is64 = false;
-        const auto r = parse(thin(s));
-        REQUIRE(r.has_value());
-        CHECK(r->slices[0].load_command_count == 0);
-    }
-    SECTION("sizeofcmds past the end of the file") {
-        const auto r = parse(img.substr(0, img.size() - 1));
-        REQUIRE_FALSE(r.has_value());
-        CHECK(r.error() == ParseError::truncated);
-    }
+    ThinSpec s;
+    s.is64 = false;
+    const auto r = parse(thin(s));
+    REQUIRE(r.has_value());
+    CHECK(r->slices[0].load_command_count == 0);
 }
 
 namespace {
@@ -755,15 +689,15 @@ template <typename Check>
 void sweep_prefixes(const Bytes& img, Check check) {
     const ReadBudget budget{};
     Probe p;
-    p.data = img;
+    p.bytes = img;
     for (std::size_t n = 0; n < img.size(); ++n) {
         p.reset();
         p.visible = n;
         const auto r = read_macho(p.source());
         INFO("prefix " << n);
-        CHECK_FALSE(p.beyond_end);
-        CHECK(p.reads.size() <= budget.max_reads);
-        CHECK(p.bytes <= budget.max_bytes);
+        CHECK_FALSE(p.beyond_visible());
+        CHECK(p.calls <= budget.max_reads);
+        CHECK(p.total <= budget.max_bytes);
         check(r, n);
     }
 }
@@ -782,7 +716,11 @@ void check_slices_inside(const std::expected<MachoInfo, ParseError>& r, std::siz
 TEST_CASE("macho: every prefix of the canonical images is handled without a value for a thin cut",
           "[binary_header][macho]") {
     for (const Bytes& img : {canon_thin64(), canon_thin32be()}) {
-        sweep_prefixes(img, [](const auto& r, std::size_t) { CHECK_FALSE(r.has_value()); });
+        sweep_prefixes(img, [](const auto& r, std::size_t n) {
+            REQUIRE_FALSE(r.has_value());
+            // The image ends with its last command, so any cut that keeps the magic is truncated.
+            CHECK(r.error() == (n < 4 ? ParseError::not_this_format : ParseError::truncated));
+        });
         CHECK(parse(img).has_value());
     }
     for (const Bytes& img : {canon_fat(), canon_fat64()})
@@ -792,7 +730,7 @@ TEST_CASE("macho: every prefix of the canonical images is handled without a valu
 TEST_CASE("macho: every prefix of the real captures is bounded", "[binary_header][macho]") {
     for (const char* name : {"macho_thin.bin", "macho_fat.bin"}) {
         INFO(name);
-        sweep_prefixes(load_fixture(name), check_slices_inside);
+        sweep_prefixes(bhtest::load_fixture(name), check_slices_inside);
     }
 }
 
@@ -846,31 +784,31 @@ TEST_CASE("macho: the read budget is honoured and a thin parse costs two reads",
     const Bytes img = canon_thin64();
     SECTION("exact budget succeeds") {
         Probe p;
-        p.data = img;
+        p.bytes = img;
         const auto r = read_macho(p.source(), {}, ReadBudget{img.size(), 2});
         REQUIRE(r.has_value());
-        CHECK(p.reads.size() == 2);
-        CHECK(p.bytes == img.size());
+        CHECK(p.calls == 2);
+        CHECK(p.total == img.size());
     }
     SECTION("one read too few") {
         Probe p;
-        p.data = img;
+        p.bytes = img;
         const auto r = read_macho(p.source(), {}, ReadBudget{img.size(), 1});
         REQUIRE_FALSE(r.has_value());
         CHECK(r.error() == ParseError::limit_exceeded);
-        CHECK(p.reads.size() == 1);
+        CHECK(p.calls == 1);
     }
     SECTION("one byte too few") {
         Probe p;
-        p.data = img;
+        p.bytes = img;
         const auto r = read_macho(p.source(), {}, ReadBudget{img.size() - 1, 2});
         REQUIRE_FALSE(r.has_value());
         CHECK(r.error() == ParseError::limit_exceeded);
-        CHECK(p.bytes <= img.size() - 1);
+        CHECK(p.total <= img.size() - 1);
     }
     SECTION("a starved universal parse marks the slices, and never exceeds the budget") {
         Probe p;
-        p.data = canon_fat();
+        p.bytes = canon_fat();
         const auto r = read_macho(p.source(), {}, ReadBudget{4096, 3}); // head, table, slice 0 head
         REQUIRE(r.has_value());
         REQUIRE(r->slices.size() == 2);
@@ -878,7 +816,7 @@ TEST_CASE("macho: the read budget is honoured and a thin parse costs two reads",
             REQUIRE(s.error.has_value());
             CHECK(*s.error == ParseError::limit_exceeded);
         }
-        CHECK(p.reads.size() == 3);
+        CHECK(p.calls == 3);
     }
 }
 
@@ -888,25 +826,25 @@ TEST_CASE("macho: a deterministic 20,000-mutation sweep never crosses the file, 
                                       canon_thin32be(),
                                       canon_fat(),
                                       canon_fat64(),
-                                      load_fixture("macho_thin.bin"),
-                                      load_fixture("macho_fat.bin")};
+                                      bhtest::load_fixture("macho_thin.bin"),
+                                      bhtest::load_fixture("macho_fat.bin")};
     const ReadBudget budget{};
     std::uint64_t rng = 0x9E3779B97F4A7C15ull;
     constexpr std::array<std::uint8_t, 6> kInteresting = {0x00, 0x01, 0x7F, 0x80, 0xFE, 0xFF};
     for (int iter = 0; iter < 20000; ++iter) {
         Probe p;
-        p.data = bases[xorshift(rng) % bases.size()];
-        const std::size_t edits = 1 + xorshift(rng) % 4;
+        p.bytes = bases[bhtest::xorshift(rng) % bases.size()];
+        const std::size_t edits = 1 + bhtest::xorshift(rng) % 4;
         for (std::size_t e = 0; e < edits; ++e) {
-            const std::size_t at = xorshift(rng) % p.data.size();
-            const std::uint64_t v = xorshift(rng);
-            p.data[at] = static_cast<char>(v % 3 == 0 ? kInteresting[(v >> 8) % kInteresting.size()]
+            const std::size_t at = bhtest::xorshift(rng) % p.bytes.size();
+            const std::uint64_t v = bhtest::xorshift(rng);
+            p.bytes[at] = static_cast<char>(v % 3 == 0 ? kInteresting[(v >> 8) % kInteresting.size()]
                                                        : static_cast<std::uint8_t>(v >> 16));
         }
-        if (xorshift(rng) % 8 == 0)
-            p.data.resize(xorshift(rng) % p.data.size());
+        if (bhtest::xorshift(rng) % 8 == 0)
+            p.bytes.resize(bhtest::xorshift(rng) % p.bytes.size());
         const auto r = read_macho(p.source());
-        const bool ok = !p.beyond_end && p.reads.size() <= budget.max_reads && p.bytes <= budget.max_bytes;
+        const bool ok = !p.beyond_visible() && p.calls <= budget.max_reads && p.total <= budget.max_bytes;
         if (!ok) {
             INFO("iteration " << iter);
             REQUIRE(ok);
@@ -920,49 +858,9 @@ TEST_CASE("macho: a deterministic 20,000-mutation sweep never crosses the file, 
         REQUIRE(r->slices.size() <= MachoLimits{}.max_fat_archs);
         for (const auto& s : r->slices) {
             if (!s.error) {
-                REQUIRE(s.offset + s.size <= p.data.size());
+                REQUIRE(s.offset + s.size <= p.bytes.size());
                 REQUIRE(s.load_command_count <= MachoLimits{}.max_load_commands);
             }
         }
-    }
-}
-
-TEST_CASE("macho: the canonical builder images are small, fully parsed seeds",
-          "[binary_header][macho]") {
-    const std::vector<Bytes> all = {canon_thin64(), canon_thin32be(), canon_fat(), canon_fat64()};
-    for (const auto& img : all)
-        CHECK(img.size() <= 4096);
-    for (const Bytes* img : {&all[2], &all[3]}) {
-        const auto r = parse(*img);
-        REQUIRE(r.has_value());
-        CHECK(r->fat);
-        REQUIRE(r->slices.size() == 2);
-        for (const auto& s : r->slices) {
-            CHECK_FALSE(s.error.has_value());
-            CHECK(s.id_dylib.has_value());
-        }
-    }
-    CHECK(parse(all[0]).has_value());
-    CHECK(parse(all[1]).has_value());
-}
-
-// Hidden: the orchestrator runs this once with YUZU_FUZZ_SEED_OUT set and commits the output.
-TEST_CASE("macho: write the synthesised fuzz seeds", "[.][binary_header_seeds]") {
-    const char* out = std::getenv("YUZU_FUZZ_SEED_OUT");
-    INFO("YUZU_FUZZ_SEED_OUT must name the corpus root directory");
-    REQUIRE(out != nullptr);
-    const fs::path dir = fs::path{out} / "fuzz_binary_header_macho";
-    fs::create_directories(dir);
-    const std::vector<std::pair<const char*, Bytes>> seeds = {
-        {"seed-synth-thin64.bin", canon_thin64()},
-        {"seed-synth-thin32be.bin", canon_thin32be()},
-        {"seed-synth-fat.bin", canon_fat()},
-        {"seed-synth-fat64.bin", canon_fat64()}};
-    for (const auto& [name, img] : seeds) {
-        REQUIRE(img.size() <= 4096);
-        std::ofstream f(dir / name, std::ios::binary | std::ios::trunc);
-        REQUIRE(f.is_open());
-        f.write(img.data(), static_cast<std::streamsize>(img.size()));
-        REQUIRE(f.good());
     }
 }

@@ -300,9 +300,7 @@ read_macho(const Source& src, const MachoLimits& lim = {}, ReadBudget budget = {
             s.size = u32(table, at + 12, std::endian::big);
         }
         const auto end = checked_add(s.offset, s.size);
-        if (!end || *end > src.size) {
-            s.error = ParseError::truncated;
-        } else if (s.size < 4) {
+        if (!end || *end > src.size || s.size < 4) {
             s.error = ParseError::truncated;
         } else {
             const std::size_t n =

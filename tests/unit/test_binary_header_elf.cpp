@@ -5,10 +5,12 @@
  * Pure header, no I/O except one real capture: synthesised images come from the builder below
  * (ELF32-LE, ELF64-LE and ELF64-BE), the real elf_shared.bin is loaded through
  * YUZU_TEST_FIXTURE_DIR and its case FAILS when the file is absent. Adjacent-byte cases use a
- * counting Source to prove no byte outside the enclosing region was requested.
+ * recording Source to prove no byte outside the enclosing region was requested.
  */
 
 #include "binary_header_elf.hpp"
+
+#include "binary_header_test_util.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -17,11 +19,6 @@
 #include <bit>
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
-#include <filesystem>
-#include <fstream>
-#include <iterator>
-#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -30,22 +27,17 @@
 #include <utility>
 #include <vector>
 
-#ifndef YUZU_TEST_FIXTURE_DIR
-#define YUZU_TEST_FIXTURE_DIR "tests/unit/fixtures"
-#endif
-
 namespace bh = yuzu::shared::binary_header;
-namespace fs = std::filesystem;
 
 namespace {
 
 using Bytes = std::vector<std::uint8_t>;
+using bhtest::Probe;
 using u16 = std::uint16_t;
 using u32 = std::uint32_t;
 using u64 = std::uint64_t;
 
-constexpr u64 kBase = 0x10000;            // vaddr of the canonical PT_LOAD (file offset 0)
-constexpr std::size_t kMaxSeedBytes = 4096; // fuzz-seed ceiling (the smoke replay's -max_len)
+constexpr u64 kBase = 0x10000; // vaddr of the canonical PT_LOAD (file offset 0)
 
 struct Shape {
     const char* name;
@@ -291,48 +283,17 @@ bh::Source src_of(const Bytes& b) {
     return bh::span_source(std::as_bytes(std::span<const std::uint8_t>(b)));
 }
 
-// Counting Source: every request that reaches read_at is logged.
-struct Log {
-    std::vector<std::pair<u64, u64>> reads; // offset, requested length
-    u64 total{0};
-    bool touched(u64 pos) const {
-        return std::any_of(reads.begin(), reads.end(), [pos](const auto& r) {
-            return pos >= r.first && pos < r.first + r.second;
-        });
-    }
-};
-// `visible` bounds the file to its first `visible` bytes without copying them (a truncation prefix).
-bh::Source counting(const Bytes& b, const std::shared_ptr<Log>& log,
-                    std::size_t visible = static_cast<std::size_t>(-1)) {
-    bh::Source inner = bh::span_source(
-        std::as_bytes(std::span<const std::uint8_t>(b).first(std::min(visible, b.size()))));
-    return bh::Source{[inner, log](u64 off, std::size_t len) {
-                          log->reads.emplace_back(off, len);
-                          log->total += len;
-                          return inner.read_at(off, len);
-                      },
-                      inner.size};
-}
-
-// Every logged read stays inside the visible `limit` bytes and inside the default budget.
-void check_reads(const Log& log, std::size_t limit) {
-    const bh::ReadBudget budget;
-    CHECK(log.reads.size() <= budget.max_reads);
-    CHECK(log.total <= budget.max_bytes);
-    const bool inside = std::all_of(log.reads.begin(), log.reads.end(), [limit](const auto& r) {
-        return r.first + r.second <= limit;
-    });
-    CHECK(inside);
-}
-
 Bytes load_shared() {
-    const auto path = fs::path{YUZU_TEST_FIXTURE_DIR} / "binary_headers" / "elf_shared.bin";
-    INFO("fixture path: " << path.string());
-    REQUIRE(fs::exists(path)); // a missing capture is a failure, never a skip
-    std::ifstream f(path, std::ios::binary);
-    Bytes bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-    REQUIRE_FALSE(bytes.empty());
-    return bytes;
+    const auto s = bhtest::load_fixture("elf_shared.bin");
+    return Bytes(s.begin(), s.end());
+}
+
+// Every read stays inside the visible prefix and inside the default budget.
+void check_reads(const Probe& p) {
+    const bh::ReadBudget budget;
+    CHECK(p.reads.size() <= budget.max_reads);
+    CHECK(p.total <= budget.max_bytes);
+    CHECK_FALSE(p.beyond_visible());
 }
 
 bh::ElfInfo must_read(const Bytes& b, const bh::ElfLimits& lim = {}) {
@@ -364,7 +325,6 @@ TEST_CASE("elf: canonical images give exact fields", "[binary_header][elf]") {
         INFO(sh.name);
         const auto c = canonical(sh);
         const auto img = build(c.spec);
-        CHECK(img.size() <= kMaxSeedBytes);
         const auto i = must_read(img);
         CHECK(i.is64 == sh.is64);
         CHECK(i.byte_order == sh.order);
@@ -500,11 +460,11 @@ TEST_CASE("elf: interpreter degrades, never fails the file", "[binary_header][el
             const std::size_t len = std::string_view(kInterp).size();
             c.spec.phs[kInterpSeg].filesz = len;
             const auto img = build(c.spec);
-            auto log = std::make_shared<Log>();
-            auto r = bh::read_elf(counting(img, log));
+            Probe log(img);
+            auto r = bh::read_elf(log.source());
             REQUIRE(r.has_value());
             CHECK(r->interpreter.empty());
-            CHECK_FALSE(log->touched(c.interp + len));
+            CHECK_FALSE(log.touched(c.interp + len));
             CHECK(r->soname == kSoname);
         }
         { // zero-length segment
@@ -650,12 +610,12 @@ TEST_CASE("elf: DT_SONAME is bounded by the dynamic segment and the string table
             const auto full = c.spec.phs[kDynSeg].filesz;
             c.spec.phs[kDynSeg].filesz = c.spec.phs[kDynSeg].memsz = full - c.es;
             const auto img = build(c.spec);
-            auto log = std::make_shared<Log>();
-            auto r = bh::read_elf(counting(img, log));
+            Probe log(img);
+            auto r = bh::read_elf(log.source());
             REQUIRE(r.has_value());
             CHECK(r->soname.empty());
             CHECK(r->dynamic_unreadable);
-            CHECK_FALSE(log->touched(c.dyn + full - c.es));
+            CHECK_FALSE(log.touched(c.dyn + full - c.es));
         }
         { // DT_STRTAB in no PT_LOAD
             auto c = canonical(sh);
@@ -732,23 +692,23 @@ TEST_CASE("elf: DT_SONAME is bounded by the dynamic segment and the string table
             e[1].second = c.strsz - 1; // table now ends before the name's NUL
             set_dyn(c, e);
             const auto img = build(c.spec);
-            auto log = std::make_shared<Log>();
-            auto r = bh::read_elf(counting(img, log));
+            Probe log(img);
+            auto r = bh::read_elf(log.source());
             REQUIRE(r.has_value());
             CHECK(r->soname.empty());
             CHECK(r->dynamic_unreadable);
-            CHECK_FALSE(log->touched(c.dynstr + c.strsz - 1));
+            CHECK_FALSE(log.touched(c.dynstr + c.strsz - 1));
         }
         { // DT_STRSZ runs one byte past the PT_LOAD's file-backed part
             auto c = canonical(sh);
             c.spec.phs[kLoad].filesz = c.dynstr + c.strsz - 1;
             const auto img = build(c.spec);
-            auto log = std::make_shared<Log>();
-            auto r = bh::read_elf(counting(img, log));
+            Probe log(img);
+            auto r = bh::read_elf(log.source());
             REQUIRE(r.has_value());
             CHECK(r->soname.empty());
             CHECK(r->dynamic_unreadable);
-            CHECK_FALSE(log->touched(c.dynstr + c.strsz - 1));
+            CHECK_FALSE(log.touched(c.dynstr + c.strsz - 1));
             // the exact fit is accepted
             c.spec.phs[kLoad].filesz = c.dynstr + c.strsz;
             CHECK(must_read(build(c.spec)).soname == kSoname);
@@ -825,12 +785,12 @@ TEST_CASE("elf: read budget is honoured and degrades", "[binary_header][elf]") {
     for (const auto& sh : kShapes) {
         INFO(sh.name);
         const auto img = build(canonical(sh).spec);
-        auto log = std::make_shared<Log>();
-        auto full = bh::read_elf(counting(img, log));
+        Probe log(img);
+        auto full = bh::read_elf(log.source());
         REQUIRE(full.has_value());
         CHECK(full->soname == kSoname);
-        const u64 total = log->total;
-        const std::size_t reads = log->reads.size();
+        const u64 total = log.total;
+        const std::size_t reads = log.reads.size();
         CHECK(reads >= 4);
 
         { // exact budget: identical result
@@ -841,33 +801,33 @@ TEST_CASE("elf: read budget is honoured and degrades", "[binary_header][elf]") {
             CHECK_FALSE(r->dynamic_unreadable);
         }
         { // one read fewer: the last read (the soname string) is refused and the result degrades
-            auto l2 = std::make_shared<Log>();
-            auto r = bh::read_elf(counting(img, l2), {}, bh::ReadBudget{total, reads - 1});
+            Probe l2(img);
+            auto r = bh::read_elf(l2.source(), {}, bh::ReadBudget{total, reads - 1});
             REQUIRE(r.has_value());
             CHECK(r->soname.empty());
             CHECK(r->dynamic_unreadable);
-            CHECK(l2->reads.size() == reads - 1);
-            CHECK(l2->total <= total);
+            CHECK(l2.reads.size() == reads - 1);
+            CHECK(l2.total <= total);
         }
         { // a single read: the program-header table is refused BEFORE read_at is called
-            auto l3 = std::make_shared<Log>();
-            auto r = bh::read_elf(counting(img, l3), {}, bh::ReadBudget{total, 1});
+            Probe l3(img);
+            auto r = bh::read_elf(l3.source(), {}, bh::ReadBudget{total, 1});
             REQUIRE_FALSE(r.has_value());
             CHECK(r.error() == bh::ParseError::limit_exceeded);
-            CHECK(l3->reads.size() == 1);
+            CHECK(l3.reads.size() == 1);
         }
         { // byte budget covering only header + table
             // the first read is always min(size, 64) bytes, whatever the class
             const std::size_t phent = sh.is64 ? 56 : 32, covered = 64 + 4 * phent;
-            auto l4 = std::make_shared<Log>();
-            auto r = bh::read_elf(counting(img, l4), {}, bh::ReadBudget{covered, 4096});
+            Probe l4(img);
+            auto r = bh::read_elf(l4.source(), {}, bh::ReadBudget{covered, 4096});
             REQUIRE(r.has_value());
             CHECK(r->interpreter.empty());
             CHECK(r->notes.empty());
             CHECK(r->soname.empty());
             CHECK(r->dynamic_unreadable);
-            CHECK(l4->reads.size() == 2);
-            CHECK(l4->total == covered);
+            CHECK(l4.reads.size() == 2);
+            CHECK(l4.total == covered);
         }
     }
 }
@@ -878,11 +838,13 @@ TEST_CASE("elf: truncation sweep", "[binary_header][elf]") {
         const auto img = build(canonical(sh).spec);
         const std::size_t ehsz = sh.is64 ? 64 : 52, phent = sh.is64 ? 56 : 32;
         const std::size_t table_end = ehsz + 4 * phent;
+        Probe p(img);
         for (std::size_t n = 0; n <= img.size(); ++n) {
-            auto log = std::make_shared<Log>();
-            auto r = bh::read_elf(counting(img, log, n));
+            p.reset();
+            p.visible = n;
+            auto r = bh::read_elf(p.source());
             INFO("prefix " << n);
-            check_reads(*log, n);
+            check_reads(p);
             if (n < 4) {
                 REQUIRE_FALSE(r.has_value());
                 CHECK(r.error() == bh::ParseError::not_this_format);
@@ -906,11 +868,13 @@ TEST_CASE("elf: truncation sweep", "[binary_header][elf]") {
 
 TEST_CASE("elf: real capture truncation sweep", "[binary_header][elf]") {
     const Bytes img = load_shared();
+    Probe p(img);
     for (std::size_t n = 0; n <= img.size(); ++n) {
-        auto log = std::make_shared<Log>();
-        auto r = bh::read_elf(counting(img, log, n));
+        p.reset();
+        p.visible = n;
+        auto r = bh::read_elf(p.source());
         INFO("prefix " << n);
-        check_reads(*log, n);
+        check_reads(p);
         if (r) { // a value or an error is fine; a value must stay inside the limits
             CHECK(r->program_headers.size() <= bh::ElfLimits{}.max_program_headers);
             CHECK(r->soname.size() <= bh::ElfLimits{}.max_string_bytes);
@@ -936,12 +900,7 @@ TEST_CASE("elf: deterministic mutation sweep", "[binary_header][elf]") {
         hdr_ends.push_back(64 + 56 * (images.back()[56] | (images.back()[57] << 8)));
     }
     u64 state = 0x9E3779B97F4A7C15ull;
-    const auto next = [&state]() {
-        state ^= state >> 12;
-        state ^= state << 25;
-        state ^= state >> 27;
-        return state * 0x2545F4914F6CDD1Dull;
-    };
+    const auto next = [&state]() { return bhtest::xorshift(state); };
     const bh::ElfLimits lim;
     const bh::ReadBudget budget;
     std::size_t ok = 0, failed_invariant = 0, first_bad = 0;
@@ -962,11 +921,10 @@ TEST_CASE("elf: deterministic mutation sweep", "[binary_header][elf]") {
                     img[pos + k] = 0xFF;
             }
         }
-        auto log = std::make_shared<Log>();
-        auto r = bh::read_elf(counting(img, log));
-        bool good = log->reads.size() <= budget.max_reads && log->total <= budget.max_bytes;
-        for (const auto& rd : log->reads)
-            good = good && rd.first + rd.second <= img.size();
+        Probe log(img);
+        auto r = bh::read_elf(log.source());
+        bool good = log.reads.size() <= budget.max_reads && log.total <= budget.max_bytes &&
+                    !log.beyond_visible();
         if (r) {
             ++ok;
             good = good && r->program_headers.size() <= lim.max_program_headers &&
@@ -995,26 +953,4 @@ TEST_CASE("elf: real capture elf_shared.bin", "[binary_header][elf]") {
     }));
     CHECK_FALSE(i.dynamic_unreadable);
     CHECK_FALSE(i.notes_truncated);
-}
-
-// Hidden: the orchestrator runs this once and commits the output as fuzz seeds, because the first
-// 4096 bytes of the real capture can end before its dynamic section.
-//   YUZU_FUZZ_SEED_OUT=<corpus root> yuzu_agent_tests "[binary_header_seeds]"
-TEST_CASE("elf: write synthetic fuzz seeds", "[.][binary_header_seeds]") {
-    const char* root = std::getenv("YUZU_FUZZ_SEED_OUT");
-    REQUIRE(root != nullptr); // fails when unset
-    const fs::path dir = fs::path{root} / "fuzz_binary_header_elf";
-    fs::create_directories(dir);
-    constexpr std::array<const char*, 3> names{"seed-synth-elf32le.bin", "seed-synth-elf64le.bin",
-                                               "seed-synth-elf64be.bin"};
-    for (std::size_t k = 0; k < kShapes.size(); ++k) {
-        const auto img = build(canonical(kShapes[k]).spec);
-        REQUIRE(img.size() <= kMaxSeedBytes);
-        const auto i = must_read(img);
-        REQUIRE(i.soname == kSoname); // a seed must reach the deepest path
-        std::ofstream out(dir / names[k], std::ios::binary | std::ios::trunc);
-        out.write(reinterpret_cast<const char*>(img.data()),
-                  static_cast<std::streamsize>(img.size()));
-        REQUIRE(out.good());
-    }
 }

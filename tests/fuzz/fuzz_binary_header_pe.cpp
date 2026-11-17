@@ -18,15 +18,7 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
     const bh::Source src = bh::span_source(bytes);
 
     // 1. Default limits and budget.
-    std::size_t sink = 0;
-    if (auto r = bh::read_pe_version(src); r) {
-        for (const auto& t : r->string_tables)
-            for (const auto& [k, v] : t.strings)
-                sink += k.size() + v.size();
-        sink += r->translations.size();
-    } else {
-        sink += static_cast<std::size_t>(r.error());
-    }
+    (void)bh::read_pe_version(src);
 
     // 2. Tiny limits and a tiny budget: every cap and the budget are reachable on small inputs.
     bh::PeLimits tiny;
@@ -38,8 +30,6 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
     tiny.max_strings_per_table = 2;
     tiny.max_key_units = 4;
     tiny.max_value_units = 8;
-    if (auto r = bh::read_pe_version(src, tiny, bh::ReadBudget{512, 8}); r)
-        sink += r->string_tables.size();
-
-    return sink == static_cast<std::size_t>(-1) ? 1 : 0;
+    (void)bh::read_pe_version(src, tiny, bh::ReadBudget{512, 8});
+    return 0;
 }

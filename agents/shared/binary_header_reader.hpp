@@ -23,7 +23,7 @@
 
 namespace yuzu::shared::binary_header {
 
-enum class ParseError { io, truncated, not_this_format, malformed, limit_exceeded, unsupported };
+enum class ParseError { io, truncated, not_this_format, malformed, limit_exceeded };
 
 [[nodiscard]] constexpr std::string_view to_token(ParseError e) noexcept {
     switch (e) {
@@ -32,7 +32,6 @@ enum class ParseError { io, truncated, not_this_format, malformed, limit_exceede
     case ParseError::not_this_format: return "not_this_format";
     case ParseError::malformed: return "malformed";
     case ParseError::limit_exceeded: return "limit_exceeded";
-    case ParseError::unsupported: return "unsupported";
     }
     return "unknown";
 }
@@ -144,9 +143,6 @@ public:
     }
 
     [[nodiscard]] std::uint64_t size() const noexcept { return src_.size; }
-    // Bytes charged to the budget: the len of every read that reached read_at.
-    [[nodiscard]] std::uint64_t bytes_read() const noexcept { return bytes_; }
-    [[nodiscard]] std::size_t reads() const noexcept { return reads_; }
 
 private:
     Source src_;
