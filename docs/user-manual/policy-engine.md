@@ -301,7 +301,7 @@ boot after a Postgres cutover — when that table is still empty — makes every
 enabled policy due immediately (a freshly authored policy evaluates within
 ~25 seconds of creation, the same as any other newly-due policy).
 
-Verdict semantics: a plugin failure / timeout / rejection / unevaluable response → `error` (an unevaluable response never affects another device's verdict); a
+Verdict semantics: a plugin failure / timeout / rejection / unevaluable response → `error` (an unevaluable response never affects another device's verdict; to act on one, look in the server log for the `could not be evaluated` line naming the device and check the `yuzu_server_policy_unevaluable_responses_total` reason, then fix or reinstall the check plugin on that device); a
 non-responder after the grace window → `unknown`; a successful response that
 fails the CEL → `non_compliant`; one that satisfies it → `compliant`.
 

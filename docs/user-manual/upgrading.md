@@ -107,7 +107,14 @@ This describes the build in a fresh deployment (see "Deployment contract (hard c
 
 **What changed on the agent.** The agent daemon replaces non-UTF-8 bytes in plugin output with `?`, and Echo scrubs the identity strings it diffs at collection. An agent that has NOT been upgraded still sends a command response containing a non-UTF-8 byte as-is, and the server rejects that whole frame (the agent's command stream resets); only that one device is affected, and gateway-fronted agents are not affected by the heartbeat tag path (the gateway repairs tag bytes). Upgrade agents to stop the resets.
 
-**Still open.** Filesystem plugin path bytes are not escaped upstream (#6480): the host scrub turns them into `?`, so a name with an invalid byte reads with `?` in it. An exception in one Echo collect leg can still skip the later legs of that fast tick.
+**Still open.**
+- Filesystem plugin path bytes are not escaped upstream (#6480): the host scrub turns them into `?`, so a name with an invalid byte reads with `?` in it.
+- An exception in one Echo collect leg can still skip the later legs of that fast tick (per-leg isolation is not done).
+- A device that persistently sends an unevaluable policy response scores `error` at every interval; nothing quarantines it or backs off (owner decision pending).
+- The SSE per-connection queue is capped by event count, not bytes (#2235), so one very large agent-supplied row still occupies a slot at full size.
+- The result-set matcher keeps carriage returns in cell text on purpose (it decides result-set membership); see `docs/scope-walking-design.md`.
+- **One-time Echo baseline pair after upgrade.** An Echo baseline stored by an earlier build under a name containing an invalid byte holds U+FFFD, while the upgraded agent reads that name with `?`. The first diff after the upgrade therefore emits one removed/added (or stopped/started) pair for each such entry; it does not repeat.
+- **New agent, old server.** An upgraded agent sends `?` where an old one sent raw bytes, so the old server stores `?`; no old-server change is needed, but the old server still rejects a frame from an agent that has not been upgraded.
 
 ## Behaviour change: MCP `execute_instruction` progress follows the caller's `Execution:Read` scope (#7817)
 
