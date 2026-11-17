@@ -105,17 +105,18 @@ TEST_CASE("step-up policy: kFactorCredential is exactly the two factor-credentia
 
 TEST_CASE("step-up policy: the table's total and per-class row counts are pinned",
           "[stepup][policy]") {
-    // Executable pins for the table counts (259 mutating REST routes: 39 required, 2
-    // factor-credential, 3 own-gate, 142 exempt, 73 pending; #2146 batch C added the eight v1
+    // Executable pins for the table counts (261 mutating REST routes: 39 required, 2
+    // factor-credential, 3 own-gate, 144 exempt, 73 pending; #2146 batch C added the eight v1
     // instruction-definition and instruction-set authoring rows (create, update, delete, import,
     // yaml, validate-yaml, set create, set delete); #2146 batch B added the two v1 execution
     // cancel/rerun rows, the v1 commands row, the v1 instruction-definition execute row and the
     // v1 workflow execute row, the software-title curation routes added the aliases, reject and
-    // pack rows, the per-group collection settings added its PUT row, ADR-0070 R1 added four
-    // revocation-source rows, and the DEX Scoring tab added its save, preview and reset rows).
-    // A row added or reclassified without these numbers moving together fails here.
-    CHECK(kStepUpPolicyCount == 259);
-    CHECK(count_class(StepUpClass::kExempt) == 142);
+    // pack rows, the per-group collection settings added its PUT row, the lifecycle rule import
+    // added its POST and DELETE rows, ADR-0070 R1 added four revocation-source rows, and the DEX
+    // Scoring tab added its save, preview and reset rows). A row added or reclassified without
+    // these numbers moving together fails here.
+    CHECK(kStepUpPolicyCount == 261);
+    CHECK(count_class(StepUpClass::kExempt) == 144);
     CHECK(count_class(StepUpClass::kPendingRuling) == 73);
     CHECK(count_class(StepUpClass::kRequired) + count_class(StepUpClass::kFactorCredential) +
               count_class(StepUpClass::kOwnGate) + count_class(StepUpClass::kStrong) +
@@ -354,7 +355,7 @@ TEST_CASE("step-up policy: every kExempt reason is one of the named exempt class
         kSyncTrigger,          kAgentUploadProtocol,    kScimBearer,      kMcpTransport,
         kContentAuthoring,     kPolicyLifecycle,        kEvidenceCapture, kCancelsRecord,
         kCreatesRerunRecord,   kAlertingConfig,         kMfaEnrolment,    kSchedulingGatedWork,
-        kSelfNotificationState, kReferenceDataReplace,  kCollectionSettings};
+        kSelfNotificationState, kReferenceDataReplace,  kCollectionSettings, kLifecycleRules};
     std::set<std::string_view> used;
     for (const auto& e : kStepUpPolicy) {
         if (e.cls != StepUpClass::kExempt)

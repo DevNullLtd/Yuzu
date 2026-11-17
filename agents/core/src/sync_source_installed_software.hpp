@@ -285,6 +285,29 @@ YUZU_EXPORT bool drain_collector_workers(const CollectorWorkers& workers,
                                          std::chrono::milliseconds grace,
                                          const std::function<void(std::size_t)>& on_stuck);
 
+/// The collector switches the fleet settings carry (`plugin.<name>=0|1`, collection_settings_agent.hpp):
+/// ONE object owned by the agent for its whole life (like CollectorWorkers), written by the
+/// command thread and read by the ticking thread once per collector row. A plugin with no entry
+/// is on: the default before any settings arrive, and for a collector the document does not name
+/// (the hardware driver facet has no switch).
+class CollectorEnabledSet {
+public:
+    /// Replace the whole set.
+    void set(std::map<std::string, bool> plugins) {
+        std::lock_guard<std::mutex> lk(mu_);
+        plugins_ = std::move(plugins);
+    }
+    [[nodiscard]] bool enabled(std::string_view plugin) const {
+        std::lock_guard<std::mutex> lk(mu_);
+        const auto it = plugins_.find(std::string{plugin});
+        return it == plugins_.end() || it->second;
+    }
+
+private:
+    mutable std::mutex mu_;
+    std::map<std::string, bool> plugins_;
+};
+
 /// How long a collected facet is reused before its plugin is dispatched again: a second pass
 /// inside this window (`__sync__.now`, a first contact split over several calls, the resend after
 /// a nack) rebuilds its blob from the rows already collected, against the current acked state.
@@ -335,10 +358,15 @@ struct CollectorTuning {
 /// answers the scheduler's hooks: on_force_full (every facet full next), wants_blob (a section
 /// was emitted), on_ack (commit the acknowledged sections, mark nacked ones full), has_more (a
 /// first contact larger than one call).
-YUZU_EXPORT SyncSource make_installed_software_source(SyncPluginMap plugins,
-                                                      SyncScheduler::KvGetFn kv_get,
-                                                      SyncScheduler::KvSetFn kv_set,
-                                                      std::shared_ptr<CollectorWorkers> workers,
-                                                      CollectorTuning tuning = {});
+///
+/// `enabled` (null = every collector on) is consulted per collector row on every collect(): a
+/// collector switched off is not dispatched and not served from the cooldown cache, and writes the
+/// status-only section `disabled` (token `switched_off`) in its place; switching it back on
+/// collects afresh. A collector that is on but whose plugin is not loaded still reports
+/// `not_collected`.
+YUZU_EXPORT SyncSource make_installed_software_source(
+    SyncPluginMap plugins, SyncScheduler::KvGetFn kv_get, SyncScheduler::KvSetFn kv_set,
+    std::shared_ptr<CollectorWorkers> workers, CollectorTuning tuning = {},
+    std::shared_ptr<CollectorEnabledSet> enabled = nullptr);
 
 } // namespace yuzu::agent

@@ -42,6 +42,18 @@ std::int64_t next_slot(std::int64_t now, std::int64_t interval, std::int64_t off
 // KV value would otherwise stall the source until the wall clock caught up.
 constexpr std::int64_t kFarFutureSlack = 2 * 24 * 60 * 60;
 
+constexpr std::int64_t kDaySeconds = 24 * 60 * 60;
+// The look-up margin of a multi-day windowed placement (next_after_sync): half a day absorbs a DST
+// shift of an hour either way without moving the answer across the agent's slot.
+constexpr std::int64_t kDstMargin = 12 * 60 * 60;
+
+// The furthest ahead a persisted next_fire may be. A source with a multi-day interval is
+// legitimately that far ahead (next_after_sync puts a fire up to one interval and a window day
+// out), so the bound grows with it; for an interval of a day or less it is kFarFutureSlack.
+std::int64_t far_future_bound(std::chrono::seconds interval) {
+    return std::max(kFarFutureSlack, interval.count() + kDaySeconds);
+}
+
 } // namespace
 
 SyncScheduler::SyncScheduler(std::string agent_id, KvGetFn kv_get, KvSetFn kv_set, SenderFn sender,
@@ -86,14 +98,22 @@ std::int64_t SyncScheduler::next_due(std::size_t idx, std::int64_t now_secs) con
                      phase_offset(src.name, src.interval.count()));
 }
 
+std::int64_t SyncScheduler::next_after_sync(std::size_t idx, std::int64_t now_secs) const {
+    const SyncSource& src = sources_[idx];
+    if (src.window && src.interval.count() > kDaySeconds)
+        return next_window_fire(now_secs + src.interval.count() - kDstMargin, *src.window,
+                                fnv1a(agent_id_ + ":window:" + src.name), clock_);
+    return next_due(idx, now_secs);
+}
+
 void SyncScheduler::catch_up_if_overdue(std::size_t idx, std::int64_t now_secs) {
     State& st = states_[idx];
     // Two comparisons, no `now - next_fire`: next_fire comes from strtoll, which saturates a
     // corrupt value to LLONG_MIN/LLONG_MAX, and that subtraction would overflow.
-    if (st.next_fire >= now_secs - kMaxTickSeconds.count() &&
-        st.next_fire <= now_secs + kFarFutureSlack)
-        return;
     const SyncSource& src = sources_[idx];
+    if (st.next_fire >= now_secs - kMaxTickSeconds.count() &&
+        st.next_fire <= now_secs + far_future_bound(src.interval))
+        return;
     const bool overdue = st.next_fire < now_secs;
     st.next_fire = now_secs + static_cast<std::int64_t>(
                                   fnv1a(agent_id_ + ":catchup:" + src.name) %
@@ -238,6 +258,51 @@ std::vector<std::string> SyncScheduler::source_names() const {
     return out;
 }
 
+void SyncScheduler::apply_settings(std::string_view source, std::chrono::seconds interval,
+                                   std::optional<SyncWindow> window) {
+    const auto it = std::find_if(sources_.begin(), sources_.end(),
+                                 [&](const SyncSource& s) { return s.name == source; });
+    if (it == sources_.end())
+        return;
+    const auto idx = static_cast<std::size_t>(it - sources_.begin());
+    std::lock_guard<std::mutex> lk(pending_mu_);
+    const auto pit = std::find_if(pending_settings_.begin(), pending_settings_.end(),
+                                  [idx](const PendingSettings& p) { return p.idx == idx; });
+    if (pit == pending_settings_.end())
+        pending_settings_.push_back({idx, interval, window});
+    else
+        *pit = {idx, interval, window};
+}
+
+void SyncScheduler::drain_settings(std::int64_t now_secs) {
+    std::vector<PendingSettings> armed;
+    {
+        std::lock_guard<std::mutex> lk(pending_mu_);
+        armed.swap(pending_settings_);
+    }
+    for (const PendingSettings& p : armed) {
+        SyncSource& src = sources_[p.idx];
+        const bool same_window =
+            src.window.has_value() == p.window.has_value() &&
+            (!src.window || (src.window->start_min == p.window->start_min &&
+                             src.window->end_min == p.window->end_min));
+        if (src.interval == p.interval && same_window)
+            continue; // an identical re-apply changes nothing
+        src.interval = p.interval;
+        src.window = p.window;
+        State& st = states_[p.idx];
+        // Only a fire still ahead moves, and only to this agent's own next slot under the new
+        // values; a fire already due is left to go. An unloaded source loads its state later.
+        if (st.loaded && st.next_fire > now_secs) {
+            st.next_fire = next_due(p.idx, now_secs);
+            save_state(src, st);
+        }
+        spdlog::info("sync: source '{}' cadence set to {}s{} — next sync at epoch {}", src.name,
+                     src.interval.count(), src.window ? " in a window" : "",
+                     st.loaded ? st.next_fire : 0);
+    }
+}
+
 std::vector<std::size_t> SyncScheduler::drain_pending(std::int64_t now_secs) {
     std::vector<std::pair<std::size_t, std::int64_t>> armed;
     {
@@ -349,7 +414,7 @@ void SyncScheduler::apply_ack(std::size_t idx, const std::string& hash, bool sen
             st.last_full = now_secs;
         // A source that left part of its payload for the next collection comes straight back.
         st.next_fire = (src.has_more && src.has_more()) ? now_secs + kMinTickSeconds.count()
-                                                        : next_due(idx, now_secs);
+                                                        : next_after_sync(idx, now_secs);
         // Once per successful sync per source (about daily): where the next one is placed.
         spdlog::info("sync: source '{}' synced — next sync at epoch {} (in {}s)", src.name,
                      st.next_fire, st.next_fire - now_secs);
@@ -358,7 +423,9 @@ void SyncScheduler::apply_ack(std::size_t idx, const std::string& hash, bool sen
 }
 
 std::chrono::seconds SyncScheduler::tick(std::int64_t now_secs) {
-    // Operator-forced sources first, so they are due in THIS pass.
+    // New cadence first (it re-places a future fire, never forces one), then the operator-forced
+    // sources, so they are due in THIS pass.
+    drain_settings(now_secs);
     const std::vector<std::size_t> forced = drain_pending(now_secs);
 
     // Round-3 item 4: each forced source gets its OWN immediate ReportInventory

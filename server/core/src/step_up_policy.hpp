@@ -118,6 +118,10 @@ inline constexpr std::string_view kCollectionSettings =
     "credentials, identity or authority, but a root document can switch collectors off "
     "fleet-wide; audited ahead of the write; exempt by the project owner's SAM-34 decision while "
     "the owner ruling on the plugin kill-switch route is pending";
+inline constexpr std::string_view kLifecycleRules =
+    "imported software lifecycle rules (replace and clear): not credentials, identity or "
+    "authority, but they steer the lifecycle state shown fleet-wide; audited ahead of the write; "
+    "whether it needs MFA step-up awaits an owner ruling";
 inline constexpr std::string_view kPolicyLifecycle =
     "policy lifecycle: governed by the Policy securable and approval";
 inline constexpr std::string_view kEvidenceCapture = "evidence capture under its own securable";
@@ -290,6 +294,9 @@ inline constexpr StepUpPolicyEntry kStepUpPolicy[] = {
     step_up_detail::exempt("POST",  R"(/api/v1/inventory/software/normalization/pack)",                           step_up_detail::kReferenceDataReplace),
     // software_collection_settings_routes.cpp
     step_up_detail::exempt("PUT",   R"(/api/v1/inventory/software/collection-settings/([a-f0-9]+))",              step_up_detail::kCollectionSettings),
+    // software_lifecycle_routes.cpp
+    step_up_detail::exempt("POST",  R"(/api/v1/inventory/software/lifecycle/rules)",                              step_up_detail::kLifecycleRules),
+    step_up_detail::exempt("DELETE",R"(/api/v1/inventory/software/lifecycle/rules)",                              step_up_detail::kLifecycleRules),
     // instruction_fragment_routes.cpp
     step_up_detail::exempt("POST",  R"(/fragments/instructions/yaml-preview)",                                    step_up_detail::kReadShaped),
     // instruction_routes.cpp

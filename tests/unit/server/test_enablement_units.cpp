@@ -142,6 +142,7 @@ TEST_CASE("enablement units: the non-unit set is exactly the protective and rese
         {"__guard__.push_rules", R::ReservedName},
         {"__sync__", R::ReservedName},
         {"__sync__.now", R::ReservedName},
+        {"__sync__.settings", R::ReservedName},
         // firewall is a MIXED plugin: only its four containment actions are non-units, the
         // plugin row itself and its other actions stay ordinary units (see below).
         {"firewall.quarantine", R::Protective},

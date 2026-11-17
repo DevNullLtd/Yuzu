@@ -622,7 +622,8 @@ whole source name.
   where its users are. A laptop that is off during its window syncs when it next
   wakes (see Gentle catch-up) and then returns to the next window. The window
   is a collection setting (see Collection settings below); the agent's own
-  moment between 01:00 and 05:00 applies until the settings push lands.
+  moment between 01:00 and 05:00 applies until the agent has applied a saved
+  document.
 - **Gentle catch-up.** An agent that was switched off, or a laptop that slept
   through its sync, does not report the moment it wakes. A sync more than 15
   minutes overdue is spread over the next 30 minutes by a stable per-agent
@@ -689,10 +690,86 @@ always win over a document, and registered apps collection cannot be turned off
 by a document. A window needs a whole-day interval because the agent fires a
 window once per local day.
 
-Settings take effect on agents only when the settings push lands. Until then the
-server stores and resolves them, shows the effective result for a device
+The server shows the effective result for a device
 (`GET /api/v1/inventory/software/hosts/{agent_id}/collection-settings`), and
-saving a document never starts a collection.
+saving a document never starts a collection. How a saved document reaches the
+machines is described next.
+
+### How saved settings reach machines
+
+Delivery is driven by the agent's heartbeat; there is no push when a document is
+saved and no background job. Each heartbeat carries the version of the settings
+the agent last applied (the status tag `yuzu.inv_settings_version`: a 64-character
+hex digest, or `none` when nothing has been applied). The server works out which
+document applies to that agent and, when the two versions differ, sends it once.
+The agent checks the document, stores it, and from then on reports the new version.
+
+- **How soon.** A change reaches a device on its first heartbeat after the server
+  re-reads the stored settings, which it does when its copy is older than 60
+  seconds. A change in a device's group membership is picked up when the server's
+  copy of that device's groups is older than 10 minutes. Settings and kill
+  switches are therefore effective on machines within about a minute of a save,
+  plus one heartbeat, and a membership change within about ten.
+- **The fleet default is not pushed.** A device that has never applied a document
+  and whose effective settings are the built-in default (24 hours, 01:00 to
+  05:00, every collector on) is left alone: it already behaves that way. When the
+  last document that applied to a device is removed, the default is sent so the
+  device returns to it.
+- **Gateway-attached agents.** The server hands the document to the gateway, which
+  queues it for the agent. A send that the server counts as `sent` is accepted,
+  not confirmed; the heartbeat that follows is the confirmation, because the
+  agent then reports the new version.
+- **The re-push gap.** The same version is not sent to one agent again within 5
+  minutes. A document that changed in the meantime is sent at once. If a send is
+  lost, or the agent could not apply it, the next heartbeat after the gap sends
+  it again. An agent whose daily sync is not running (disabled with
+  `--inventory-disable`, or still starting after a reconnect) stores the document
+  and reports its version all the same, so it is not sent again; with
+  `--inventory-disable` nothing is collected, whatever the document says.
+- **Restarts.** Server state is in memory and is rebuilt from heartbeats, so a
+  restart loses nothing; an agent whose version differs is simply sent the
+  document. The agent keeps the applied document across a restart and re-checks it
+  at start-up; a stored copy that fails the check is dropped, the agent reports
+  `none` and the server sends it again.
+- **Agents refuse what they cannot apply.** A document that is malformed, over 4096
+  bytes, out of range, missing a collector switch, or whose version is not the
+  SHA-256 of its text is refused, nothing changes, and the agent keeps the
+  settings it had. Nothing is ever partly applied.
+
+**What the agent does with a document.** It sets how often installed software is
+collected and in which window, and which collectors run. It does not start a
+collection: an interval or window that changes re-places a future sync to the
+agent's own next slot, and a sync that is already due still goes. A collector
+switched off is not run, its rows are not served from a cache, and its section of
+the report is `disabled` (switched off on purpose, not a failure). A collector
+that is on but whose plugin is not loaded, or that has nothing to collect on the
+OS, is `not_collected`. Switching a collector back on collects afresh.
+
+**Registered apps and the kill switch.** A document cannot turn registered apps
+collection off, but a plugin kill switch on it is carried into the delivered
+settings, and the agent honours it as sent: collection stops on the machine and
+the agent still reports the version it really applied. Only the plugin-wide kill
+switch is carried: a switch set for one operating system or one action does not
+stop that collector's daily collection.
+
+**Intervals of several days.** Without a window, a device syncs one interval after
+its last clean sync, at the agent's own offset. With a window (which needs a
+whole-day interval), the device syncs inside the window on the day one interval
+after its last clean sync, at the agent's own moment in it; a 7-day interval with
+a 01:00 to 05:00 window therefore syncs once a week, overnight. A retry after a
+skipped sync still comes in the next daily window.
+
+**Time zones.** In this release a named time zone is stored, delivered and shown,
+but the window runs in the machine's own local time; the agent does not convert
+between zones. A device given a named zone reports `yuzu.inv_settings_tz` as
+`machine_local` in its heartbeat to say so. Choose windows with that in mind for
+fleets that span zones.
+
+The delivery is counted by `yuzu_server_inventory_settings_push_total`,
+`yuzu_server_inventory_settings_push_degrade_total` and
+`yuzu_server_inventory_settings_reconcile_exceptions_total` (see
+[Metrics](metrics.md)), and an alert, `YuzuInventorySettingsPushLoop`, fires when
+the server keeps re-sending settings.
 
 The same documents are reachable by agentic clients over MCP, and each tool returns what its REST
 route returns: `list_software_collection_settings`, `get_software_collection_settings`,
@@ -1855,7 +1932,7 @@ The server turns every distinct installed-software title into a stable identity 
 
 ### Software lifecycle (server store)
 
-The server keeps the dates after which a software title or an operating system version is past support, so a later software view can say whether an installed version is supported. Only the store and the evaluator exist so far: nothing reads it yet (no REST route, MCP tool, page or background job), and no host reports lifecycle dates yet.
+The server keeps the dates after which a software title or an operating system version is past support, so a later software view can say whether an installed version is supported. The store, the evaluator and the REST routes that import, list and remove the imported rule set exist so far: nothing reads the evaluated state yet (no REST route, MCP tool, page or background job), and no host reports lifecycle dates yet.
 
 - **Two tables, no stored state.** Rules (`lifecycle_rule`) carry a product key, a version prefix, an event (`end_of_support` or `end_of_life`), a date and the public page the date came from. Host-declared facts (`lifecycle_declared`) carry a product key, one exact version, an event, a date and when a host last repeated it. A fact is global: one row per distinct date, never one per host. The state of a version is computed on every read from those two tables, so changing a rule or correcting a date never leaves an old answer behind.
 - **Keys.** A software title is `product:` plus its registry key (for example `product:postgresql:postgresql`). An operating system is `os:<distro id>` on Linux (the version is the distro version), or `os:windows` / `os:macos` with the OS version.
@@ -1864,6 +1941,7 @@ The server keeps the dates after which a software title or an operating system v
 - **A corrected date.** Both dates stay stored, each with its own last-seen time. While hosts keep repeating the old date it stays current; once they stop and 48 hours pass, the old date is stale, never wins again and raises no conflict. A declaration that no host repeats falls below every rule.
 - **The shipped rules.** The server ships rules for PostgreSQL, Python, Node.js, .NET (runtime and SDK), Ubuntu, Debian and Red Hat Enterprise Linux, each row naming the public page its date came from, in `content/software-lifecycle/rules.csv`. The shipped dates were read from those pages in November 2026. A release whose date could not be confirmed is left out and reads `unknown`; Windows and macOS releases are not covered yet. At every start the server replaces its stored shipped rules with the ones in the binary, so a newer server's rules always apply. Rule files are limited to 256 KiB, 5000 rows and 256 bytes per field, and a file with any defect is refused whole.
 - **If the store cannot open.** The schema is created at start, so the database role needs `CREATE` on the database. The server refuses to start, like the other Postgres stores, when the store cannot open or when the shipped rules cannot be parsed, are empty or cannot be loaded; the log line (`[PG] Refusing to start: software lifecycle ...`) states which and why, and `/readyz` lists `software_lifecycle_store` among its checks. An unparseable or empty shipped rule set is a defective build; a failed open or a failed load is a database fault, so check the role's `CREATE` right and then the Postgres log. A read that cannot be answered is reported as unavailable, never as an empty or `supported` answer. The two counters are in [Metrics](metrics.md#software-lifecycle-store-metrics).
+- **Importing rules.** An administrator loads a rule file with `POST /api/v1/inventory/software/lifecycle/rules` (global `Inventory:Write`), lists the stored rules of a source with `GET` (`Inventory:Read`) and removes the imported set with `DELETE` ([REST API](rest-api.md#software-lifecycle-rules)). The formats are `csv` and `cle` only. `csv` is the rule-file grammar above. `cle` is a Common Lifecycle Enumeration document (ECMA-428 1st edition, schema 1.0.0). An import **replaces the whole `imported` set** and never touches the `shipped` or `external` rules. The file is read all or nothing: a `csv` body of at most 256 KiB, a `cle` body of at most 4 MiB, and at most 5000 rules either way. An imported CLE rule applies to every version of its product: a CLE record that names one exact version, or a version range, is skipped and counted in the answer's `skipped` list, never stored as a prefix, because the rule model matches by dot-component prefix (a stored `3.8` would also claim `3.8.10`). A CLE identifier that lists more than 5000 aliases is refused. Because `imported` outranks `shipped` for the same event, an imported rule overrides the shipped date for the versions it covers. OpenEoX import is not offered yet: its published schema does not name a product (follow-up: #8000).
 - **What is not kept.** Superseded declared dates are not deleted yet; nothing writes them until hosts report support-end dates, and their retention ships with that reporting.
 
 ## Device-identity inventory (`device_ci`)

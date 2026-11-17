@@ -931,6 +931,7 @@ yuzu_server_core_lib = static_library(
     'src/product_normalize.cpp',
     'src/product_registry_store.cpp',
     'src/software_collection_settings_store.cpp',
+    'src/collection_settings_push.cpp', # heartbeat-driven settings push: borrows the settings, group and kill-switch stores
     'src/software_lifecycle_store.cpp',
     'src/software_normalization_pack.cpp',
     'src/software_licensing_store.cpp',
@@ -1061,6 +1062,7 @@ yuzu_server_routes_lib = static_library(
     'src/inventory_routes.cpp',
     'src/software_curation_routes.cpp',
     'src/software_collection_settings_routes.cpp',
+    'src/software_lifecycle_routes.cpp',
     'src/software_read_routes.cpp',
     'src/software_export_routes.cpp',
     'src/inventory_ui.cpp',
