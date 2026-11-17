@@ -45,9 +45,10 @@ struct Shape {
     std::endian order;
     u16 machine;
 };
-const std::array<Shape, 3> kShapes{{{"elf32le", false, std::endian::little, 3},
+const std::array<Shape, 4> kShapes{{{"elf32le", false, std::endian::little, 3},
                                     {"elf64le", true, std::endian::little, 62},
-                                    {"elf64be", true, std::endian::big, 21}}};
+                                    {"elf64be", true, std::endian::big, 21},
+                                    {"elf32be", false, std::endian::big, 20}}};
 
 void put(Bytes& b, std::size_t off, u64 v, std::size_t width, std::endian order) {
     for (std::size_t i = 0; i < width; ++i) {
@@ -406,6 +407,8 @@ TEST_CASE("elf: program-header count, size and table placement", "[binary_header
             bh::ElfLimits tight;
             tight.max_program_headers = 3;
             expect_err(build(canonical(sh).spec), bh::ParseError::limit_exceeded, tight);
+            tight.max_program_headers = 4; // exactly at the cap reads
+            CHECK(must_read(build(canonical(sh).spec), tight).program_headers.size() == 4);
         }
         for (const std::size_t wrong : {std::size_t{0}, phent - 1, phent + 1, std::size_t{56 + 32 - phent}}) {
             auto c = canonical(sh);
@@ -440,6 +443,8 @@ TEST_CASE("elf: interpreter degrades, never fails the file", "[binary_header][el
             lim.max_string_bytes = 5;
             const auto i = must_read(build(canonical(sh).spec), lim);
             CHECK(i.interpreter.empty());
+            lim.max_string_bytes = std::string_view(kInterp).size() + 1; // the cap counts the NUL
+            CHECK(must_read(build(canonical(sh).spec), lim).interpreter == kInterp);
         }
         { // offset past everything, and an offset whose length overflows
             auto c = canonical(sh);
@@ -533,6 +538,13 @@ TEST_CASE("elf: notes, alignment and truncation", "[binary_header][elf]") {
             CHECK(i.notes_truncated);
             CHECK(i.build_id.empty());
             CHECK(i.soname == kSoname);
+            lim.max_note_segment_bytes = canonical(sh).spec.phs[kNoteSeg].filesz; // at the caps
+            lim.max_note_name_bytes = 4;
+            lim.max_note_desc_bytes = 20;
+            const auto j = must_read(build(canonical(sh).spec), lim);
+            CHECK(j.notes.size() == 1);
+            CHECK_FALSE(j.notes_truncated);
+            CHECK(j.build_id == kBuildIdHex);
         }
         { // over-cap namesz keeps the earlier note
             auto c = canonical(sh);
@@ -572,6 +584,10 @@ TEST_CASE("elf: notes, alignment and truncation", "[binary_header][elf]") {
             const auto i = must_read(build(c.spec), lim);
             CHECK(i.notes.size() == 1);
             CHECK(i.notes_truncated);
+            lim.max_notes = 2; // a complete list at exactly the cap is not truncated
+            const auto j = must_read(build(c.spec), lim);
+            CHECK(j.notes.size() == 2);
+            CHECK_FALSE(j.notes_truncated);
         }
         { // segment offset past the end of the file: degraded, header still returned
             auto c = canonical(sh);
@@ -580,6 +596,40 @@ TEST_CASE("elf: notes, alignment and truncation", "[binary_header][elf]") {
             CHECK(i.notes.empty());
             CHECK(i.notes_truncated);
             CHECK(i.program_headers.size() == 4);
+        }
+    }
+}
+
+TEST_CASE("elf: competing segments: the first PT_INTERP and PT_DYNAMIC win, every PT_NOTE is read",
+          "[binary_header][elf]") {
+    for (const auto& sh : kShapes) {
+        INFO(sh.name);
+        { // two PT_NOTE: both listed in table order, the first build id wins
+            auto c = canonical(sh);
+            c.spec.phs[kInterpSeg] = {4, 4, c.interp, kBase + c.interp, 20, 20, 4};
+            c.spec.blobs[bInterp].bytes = note_rec(sh.order, "GNU", 3, Bytes{9, 9, 9, 9});
+            const auto i = must_read(build(c.spec));
+            REQUIRE(i.notes.size() == 2);
+            CHECK(i.notes[0].desc.size() == 4);
+            CHECK(i.notes[1].desc.size() == 20);
+            CHECK(i.build_id == "09090909");
+            CHECK_FALSE(i.notes_truncated);
+        }
+        { // two PT_INTERP: the first
+            auto c = canonical(sh);
+            c.spec.phs[kNoteSeg] = {3, 4, c.note, kBase + c.note, 8, 8, 1};
+            c.spec.blobs[bNote].bytes = Bytes{'/', 's', 'e', 'c', 'o', 'n', 'd', 0};
+            CHECK(must_read(build(c.spec)).interpreter == kInterp);
+        }
+        { // two PT_DYNAMIC (the second broken) and repeated tags: the first of each
+            auto c = canonical(sh);
+            const auto e = canon_dyn(c);
+            set_dyn(c, {e[0], e[1], e[2], {14, 0}, {5, 0xDEADBEEF}, {10, 0}, e[3]});
+            c.spec.phs[kInterpSeg] = c.spec.phs[kDynSeg];
+            c.spec.phs[kDynSeg].filesz = c.es - 1;
+            const auto i = must_read(build(c.spec));
+            CHECK(i.soname == kSoname);
+            CHECK_FALSE(i.dynamic_unreadable);
         }
     }
 }

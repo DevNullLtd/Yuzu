@@ -11,7 +11,8 @@
  *
  * Decoded: the Mach-O header, LC_ID_DYLIB, LC_UUID, LC_BUILD_VERSION, the four
  * LC_VERSION_MIN_* commands and LC_SOURCE_VERSION. Every other command is skipped by its size.
- * When a command kind repeats, the first one wins.
+ * When a command kind repeats, the first one wins. LC_BUILD_VERSION and the LC_VERSION_MIN_*
+ * commands fill the one build_version, so the first of either kind wins.
  */
 
 #pragma once

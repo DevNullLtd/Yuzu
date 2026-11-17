@@ -4,8 +4,10 @@
  * thrown by design (allocation aside).
  *
  * Every offset and length a header field names is attacker-chosen. This file is the single place
- * that decides whether such a read is in range, in budget and answered honestly; the format
- * readers add no bounds arithmetic of their own beyond checked_add / checked_mul.
+ * that decides whether a read of the SOURCE is in range, in budget and answered honestly. The
+ * format readers add only format-level range checks (a range inside one section, segment, slice
+ * or buffer), each written overflow-safe: subtraction form, checked_add / checked_mul, or sums
+ * of values already capped.
  */
 
 #pragma once
@@ -46,7 +48,9 @@ struct Source {
 };
 
 // BORROWS: the returned Source holds a pointer into `bytes`; the caller keeps those bytes alive
-// for as long as the Source (or any Reader built from it) is used.
+// for as long as the Source (or any Reader built from it) is used. The reinterpret_cast is
+// std::byte to char: char may alias any object and has no alignment requirement, and the bytes
+// are only read (const).
 [[nodiscard]] inline Source span_source(std::span<const std::byte> bytes) {
     return Source{[bytes](std::uint64_t offset, std::size_t len) -> std::optional<std::string> {
                       if (offset >= bytes.size())

@@ -31,3 +31,8 @@ pe_version.bin
   contents:   x64 DLL, no entry point. VERSIONINFO: file version 1.2.3.4, product version 5.6.7.8,
               string block 040904b0 with the eight values in kRcStrings
               (test_binary_header_pe.cpp), translation 0x409/1200.
+
+seed-synth-*.bin under tests/fuzz/corpus/fuzz_binary_header_<pe|elf|macho>/: written 2026-11-17
+  from the in-test builders' canonical images (canonical_image in the PE test; canonical() for
+  elf32le, elf64le, elf64be in the ELF test; canon_thin64, canon_thin32be, canon_fat, canon_fat64
+  in the Mach-O test), each at most 4096 bytes, not regenerated automatically.

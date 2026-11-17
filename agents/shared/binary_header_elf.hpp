@@ -5,7 +5,8 @@
  * thrown by design (allocation aside).
  *
  * Every field of an ELF file is attacker-chosen. Both classes (ELF32/ELF64) and both byte orders
- * are read through load(); every offset and length goes through Reader or checked_add/checked_mul.
+ * are read through load(); every read of the file goes through Reader, and the range checks made
+ * in this file are overflow-safe (subtraction form, checked_add / checked_mul, or capped sums).
  * No section headers, symbols, DT_NEEDED or relocations are read, and no file content is hashed.
  *
  * Error policy. A fault in the ELF header or the program-header table (including an I/O error

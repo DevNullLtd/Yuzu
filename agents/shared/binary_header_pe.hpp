@@ -318,7 +318,8 @@ private:
 
 } // namespace pe_detail
 
-// not_this_format: no MZ header or no PE signature. A PE with no resource directory or no
+// not_this_format: no MZ header or no PE signature. truncated: an MZ file that ends before
+// e_lfanew or before the PE header it names. A PE with no resource directory or no
 // RT_VERSION entry is a VALUE with has_version == false. The version resource is the first
 // language of the first RT_VERSION entry.
 [[nodiscard]] inline std::expected<PeVersionInfo, ParseError>

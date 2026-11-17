@@ -299,7 +299,8 @@ TEST_CASE("macho: thin 32-bit big-endian image yields exact fields and the versi
     CHECK(s.build_version->sdk == 0x000A0800);
 }
 
-TEST_CASE("macho: each LC_VERSION_MIN_* maps to its platform and LC_BUILD_VERSION wins",
+TEST_CASE("macho: each LC_VERSION_MIN_* maps to its platform and the first of LC_BUILD_VERSION / "
+          "LC_VERSION_MIN_* wins",
           "[binary_header][macho]") {
     const std::vector<std::pair<std::uint32_t, std::uint32_t>> kinds = {
         {0x24, 1}, {0x25, 2}, {0x2F, 3}, {0x30, 4}}; // MACOSX, IPHONEOS, TVOS, WATCHOS
@@ -320,12 +321,42 @@ TEST_CASE("macho: each LC_VERSION_MIN_* maps to its platform and LC_BUILD_VERSIO
     CHECK(r->slices[0].build_version->platform == 2); // first wins
 }
 
-TEST_CASE("macho: a repeated LC_ID_DYLIB keeps the first", "[binary_header][macho]") {
+TEST_CASE("macho: a repeated command keeps the first of its kind", "[binary_header][macho]") {
     ThinSpec s;
-    s.cmds = {lc_id_dylib(s.order, "first.dylib", 1, 1, 1), lc_id_dylib(s.order, "second.dylib", 2, 2, 2)};
+    s.order = std::endian::big;
+    const auto o = s.order;
+    s.cmds = {lc_id_dylib(o, "first.dylib", 1, 1, 1), lc_id_dylib(o, "second.dylib", 2, 2, 2),
+              lc_uuid(o, 0x10),                       lc_uuid(o, 0x80),
+              lc_source_version(o, 0x0123456789ABCDEF), lc_source_version(o, 2),
+              lc_build_version(o, 2, 5, 6),           lc_build_version(o, 3, 7, 8),
+              lc_version_min(o, 0x24, 9, 10)};
     const auto r = parse(thin(s));
     REQUIRE(r.has_value());
-    CHECK(r->slices[0].id_dylib->name == "first.dylib");
+    const auto& m = r->slices[0];
+    CHECK(m.is64);
+    CHECK(m.byte_order == std::endian::big);
+    CHECK(m.cpu_type == kArm64);
+    CHECK(m.file_type == 6);
+    CHECK(m.flags == 0x85);
+    CHECK(m.load_command_count == 9);
+    require_dylib(m, "first.dylib", 1, 1, 1);
+    REQUIRE(m.uuid.has_value());
+    CHECK((*m.uuid)[0] == 0x10);
+    CHECK((*m.uuid)[15] == 0x1F);
+    REQUIRE(m.source_version.has_value());
+    CHECK(*m.source_version == 0x0123456789ABCDEFull);
+    REQUIRE(m.build_version.has_value());
+    CHECK(m.build_version->platform == 2);
+    CHECK(m.build_version->minos == 5);
+    CHECK(m.build_version->sdk == 6);
+    ThinSpec rev; // the reverse order: the first of either kind still wins
+    rev.cmds = {lc_version_min(rev.order, 0x25, 7, 8), lc_build_version(rev.order, 1, 5, 6)};
+    const auto rr = parse(thin(rev));
+    REQUIRE(rr.has_value());
+    REQUIRE(rr->slices[0].build_version.has_value());
+    CHECK(rr->slices[0].build_version->platform == 2);
+    CHECK(rr->slices[0].build_version->minos == 7);
+    CHECK(rr->slices[0].build_version->sdk == 8);
 }
 
 TEST_CASE("macho: universal images (fat_arch and fat_arch_64) parse two error-free slices",

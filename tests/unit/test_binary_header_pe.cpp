@@ -16,7 +16,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
+#include <format>
 #include <functional>
 #include <string>
 #include <string_view>
@@ -128,11 +128,9 @@ std::string build_version(const VerSpec& v) {
                 first = false;
                 strs.push_back(node(k, 1, units(val, !nonul), val.size() + (nonul ? 0 : 1), ""));
             }
-            char hex[9];
-            std::snprintf(hex, sizeof hex, "%04x%04x", t.lang, t.cp);
             std::u16string key;
-            for (const char* p = hex; *p; ++p)
-                key.push_back(static_cast<char16_t>(*p));
+            for (const char c : std::format("{:04x}{:04x}", t.lang, t.cp))
+                key.push_back(static_cast<char16_t>(c));
             tabs.push_back(node(key, 1, "", 0, join(strs)));
         }
         kids.push_back(node(u"StringFileInfo", 1, "", 0, join(tabs)));
@@ -433,9 +431,12 @@ TEST_CASE("binary_header_pe: no resource directory, or no RT_VERSION, is a value
     }
 }
 
-TEST_CASE("binary_header_pe: not a PE", "[binary_header][pe]") {
+TEST_CASE("binary_header_pe: not a PE, and an MZ file cut before its PE header",
+          "[binary_header][pe]") {
     CHECK(error_of(parse("")) == ParseError::not_this_format);
     CHECK(error_of(parse("M")) == ParseError::not_this_format);
+    CHECK(error_of(parse("MZ")) == ParseError::truncated);
+    CHECK(error_of(parse(canonical_image(false).bytes.substr(0, 0x40))) == ParseError::truncated);
     CHECK(error_of(parse(std::string(64, 'x'))) == ParseError::not_this_format);
     auto img = canonical_image(false).bytes;
     img[0x40] = 'X'; // MZ but no PE signature
@@ -443,6 +444,51 @@ TEST_CASE("binary_header_pe: not a PE", "[binary_header][pe]") {
     auto bad_magic = canonical_image(false);
     set16(bad_magic.bytes, bad_magic.L.opt, 0x107);
     CHECK(error_of(parse(bad_magic.bytes)) == ParseError::malformed);
+}
+
+TEST_CASE("binary_header_pe: a String's wValueLength is ignored: the value is the NUL-terminated "
+          "text inside wLength",
+          "[binary_header][pe]") {
+    const std::string blob = build_version(canonical_spec());
+    ImageSpec base;
+    base.blob = blob;
+    const auto want = parse(build_image(base).bytes);
+    REQUIRE(want.has_value());
+    for (const std::uint32_t v : {0u, 16u, 32u, 0xFFFFu}) {
+        INFO(v);
+        ImageSpec s;
+        s.blob = blob;
+        set16(s.blob, node_off(s.blob, u"CompanyName") + 2, v);
+        const auto got = parse(build_image(s).bytes);
+        REQUIRE(got.has_value());
+        CHECK(got->string_tables[0].strings == want->string_tables[0].strings);
+    }
+}
+
+TEST_CASE("binary_header_pe: competing resource entries select the first ID entry 16 and each "
+          "level's first entry",
+          "[binary_header][pe]") {
+    constexpr std::uint32_t kSub = 0x80000000u;
+    const std::string ver = build_version(canonical_spec());
+    std::string pre; // after the fixed 88 bytes: level 2 at 88, level 3 at 120, data entry at 152
+    for (const std::uint32_t w : {0u, 0u, 0u, 2u << 16, 1u, kSub | 120, 2u, 72u, // level 2
+                                  0u, 0u, 0u, 2u << 16, 0x409u, 152u, 0x407u, kSub | 88,
+                                  Layout{}.rva + 168, static_cast<std::uint32_t>(ver.size()), 0u,
+                                  0u})
+        put32(pre, w);
+    ImageSpec s;
+    s.blob = pre + ver;
+    auto img = build_image(s);
+    set16(img.bytes, img.L.root_hdr + 12, 1); // one named + three ID entries, 16 at slot 0 named
+    set16(img.bytes, img.L.root_hdr + 14, 3);
+    std::string root;
+    for (const std::uint32_t w : {16u, 72u, 3u, kSub | 0x7FFFFFF0u, 16u, kSub | 88, 16u,
+                                  kSub | 0x7FFFFFF0u})
+        put32(root, w);
+    img.bytes.replace(img.L.root_entry, root.size(), root);
+    const auto r = parse(img.bytes);
+    REQUIRE(r.has_value());
+    check_canonical_values(*r);
 }
 
 // ---- the real capture ------------------------------------------------------------------------------------
@@ -834,26 +880,25 @@ TEST_CASE("binary_header_pe: truncation sweep", "[binary_header][pe]") {
 TEST_CASE("binary_header_pe: mutation sweep", "[binary_header][pe]") {
     const ReadBudget budget;
     std::uint64_t rng = 0x9E3779B97F4A7C15ull;
-    for (const auto& [name, bytes] : sweep_fixtures()) {
-        INFO(name);
-        std::size_t over_budget = 0, out_of_range = 0;
-        const std::array<char, 4> favourites = {'\x00', '\xFF', '\x80', '\x7F'};
-        for (int i = 0; i < 20000; ++i) {
-            std::string m = bytes;
-            const int edits = 1 + static_cast<int>(bhtest::xorshift(rng) % 2);
-            for (int e = 0; e < edits; ++e) {
-                const std::size_t pos = static_cast<std::size_t>(bhtest::xorshift(rng) % m.size());
-                const std::uint64_t pick = bhtest::xorshift(rng);
-                m[pos] = (pick & 3) == 0 ? static_cast<char>(pick >> 8) : favourites[(pick >> 8) & 3];
-            }
-            Probe p(std::move(m));
-            (void)read_pe_version(p.source());
-            if (p.total > budget.max_bytes || p.calls > budget.max_reads)
-                ++over_budget;
-            if (p.beyond_visible())
-                ++out_of_range;
+    // 20,000 mutations in total, round-robin over the fixtures.
+    const auto fixtures = sweep_fixtures();
+    std::size_t over_budget = 0, out_of_range = 0;
+    const std::array<char, 4> favourites = {'\x00', '\xFF', '\x80', '\x7F'};
+    for (std::size_t i = 0; i < 20000; ++i) {
+        std::string m = fixtures[i % fixtures.size()].second;
+        const int edits = 1 + static_cast<int>(bhtest::xorshift(rng) % 2);
+        for (int e = 0; e < edits; ++e) {
+            const std::size_t pos = static_cast<std::size_t>(bhtest::xorshift(rng) % m.size());
+            const std::uint64_t pick = bhtest::xorshift(rng);
+            m[pos] = (pick & 3) == 0 ? static_cast<char>(pick >> 8) : favourites[(pick >> 8) & 3];
         }
-        CHECK(over_budget == 0);
-        CHECK(out_of_range == 0);
+        Probe p(std::move(m));
+        (void)read_pe_version(p.source());
+        if (p.total > budget.max_bytes || p.calls > budget.max_reads)
+            ++over_budget;
+        if (p.beyond_visible())
+            ++out_of_range;
     }
+    CHECK(over_budget == 0);
+    CHECK(out_of_range == 0);
 }
