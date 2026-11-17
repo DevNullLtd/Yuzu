@@ -44,6 +44,7 @@ on:
       - 'server/core/src/guardian_resilience_schema*'
       - 'server/core/src/guardian_schema_registry*'
       - 'agents/plugins/component_inventory/src/zip_directory*'
+      - 'agents/shared/binary_header_*'
       - 'tests/fuzz/**'
       - '.clusterfuzzlite/**'
       - '.github/workflows/cflite-pr.yml'
