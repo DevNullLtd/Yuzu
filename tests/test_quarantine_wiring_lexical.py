@@ -3,7 +3,8 @@
 
 1. The apply claim is read and written on the DATABASE clock (#7613, UP-1).
    `apply_claimed_at` is stamped, and "no claim is live" is decided, in SQL against `now()`; the
-   replica's own wall clock never enters. A [pg] case proves the SQL does the right thing, but it
+   replica's own wall clock never enters the SQL judgement (the one replica-side reading is the
+   monotonic deadline in `apply_fence_token`, which can only lengthen a hold). A [pg] case proves the SQL does the right thing, but it
    cannot fail on the old code while the test process and the database agree on the time, so the
    source text is pinned here: quarantine_store.cpp never sets or compares `apply_claimed_at`
    from a bind parameter (or a number spliced into the text), never subtracts
@@ -106,6 +107,11 @@ def claim_clock_problems(src):
                    "fragment and the claim stamp (3 mentions)")
     if "EXTRACT(EPOCH FROM now())" not in text:
         out.append("the database-clock stamp EXTRACT(EPOCH FROM now()) is gone")
+    # The monotonic guard (#8131): each helper is defined once and called once, from the claim, the
+    # token read and the release. A [pg] case proves it, and a [pg] case skips without a DSN.
+    for helper in ("note_local_claim(", "local_claim_live(", "forget_local_claim("):
+        if text.count(helper) != 2:
+            out.append("%s is not defined once and called once (the monotonic claim guard)" % helper)
     return out
 
 

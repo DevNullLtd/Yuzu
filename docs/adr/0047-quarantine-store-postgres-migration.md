@@ -534,7 +534,7 @@ edited). v5 adds no index. The store's indexes are the primary key, `idx_quarant
   one SQL statement of "no live claim" written against `now()` with the TTL in its text. A replica
   whose own clock steps cannot make a live claim read expired, or a dead one live. A step of the
   database's own clock is covered for the claims a process stamped itself: the store also keeps each
-  claim it stamped, by agent, with a deadline on its own monotonic clock, and `apply_fence_token`
+  claim it stamped, by agent and record, with a deadline on its own monotonic clock, and `apply_fence_token`
   returns no token while that deadline has not passed, so a forward step cannot make such a claim read
   expired early. It only ever lengthens a hold. A release drops the entry with the database claim.
   The entry is in memory, so after a restart (and for a claim another replica stamped) the database
@@ -573,8 +573,8 @@ arrive in the order one server dispatched them (one stream, a first-in first-out
 transport that reorders them, an apply and a release dispatched by two different server replicas, an
 apply that stays unexecuted past the 120-second claim window, and a step of the database clock that
 makes a live claim read expired early after a restart or for another replica's claim (a claim this
-process stamped also reads live for 120 seconds on its own monotonic clock; a backward step only
-lengthens a hold, and `?force=true` is unfenced) can still reopen the window. DELETE's own release and
+process stamped also reads live for 120 seconds on its own monotonic clock, and a backward step only
+lengthens a hold) can still reopen the window. `?force=true` is unfenced by design. DELETE's own release and
 the owed-release leg each check the record and then dispatch, with the same narrow window against a new
 quarantine of the same device. The operator-visible trace is a `quarantine.reapply` failure row and a
 device contained under no record or a releasing one; the way back is `firewall.release` through the generic

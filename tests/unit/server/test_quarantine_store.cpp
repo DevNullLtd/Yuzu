@@ -1069,9 +1069,9 @@ TEST_CASE("QuarantineStore: apply_fence_token is the generation when no claim is
           "[pg][quarantine][apply_fence]") {
     YUZU_REQUIRE_PG_DB_TPL(db, quarantine_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    auto steady_now = std::chrono::steady_clock::now(); // outlives the store that reads it
     QuarantineStore store{pool};
     REQUIRE(store.is_open());
-    auto steady_now = std::chrono::steady_clock::now();
     store.set_steady_now_fn([&steady_now] { return steady_now; });
     REQUIRE(store.quarantine_device("agent-a3", "admin", "reason", "").has_value());
     const auto id = active_row(store, "agent-a3")->id;
@@ -1125,9 +1125,9 @@ TEST_CASE("QuarantineStore: a step of the database clock cannot make a claim thi
           "[pg][quarantine][apply_fence]") {
     YUZU_REQUIRE_PG_DB_TPL(db, quarantine_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    auto steady_now = std::chrono::steady_clock::now(); // outlives the store that reads it
     QuarantineStore store{pool};
     REQUIRE(store.is_open());
-    auto steady_now = std::chrono::steady_clock::now();
     store.set_steady_now_fn([&steady_now] { return steady_now; });
     REQUIRE(store.quarantine_device("agent-s1", "admin", "reason", "").has_value());
     const auto id = active_row(store, "agent-s1")->id;
@@ -1153,7 +1153,9 @@ TEST_CASE("QuarantineStore: a step of the database clock cannot make a claim thi
 
     // Once the monotonic window has passed too, the token is readable again.
     steady_now += std::chrono::seconds(kApplyClaimTtlSecs - 1);
-    CHECK_FALSE(store.apply_fence_token("agent-s1", id)->has_value());
+    const auto still = store.apply_fence_token("agent-s1", id);
+    REQUIRE(still.has_value());
+    CHECK_FALSE(still->has_value());
     steady_now += std::chrono::seconds(2);
     const auto released = store.apply_fence_token("agent-s1", id);
     REQUIRE(released.has_value());
@@ -1168,6 +1170,35 @@ TEST_CASE("QuarantineStore: a step of the database clock cannot make a claim thi
     REQUIRE(after.has_value());
     REQUIRE(after->has_value());
     CHECK(**after == *second);
+
+    // The entry belongs to its record, not to the agent: a claim on a later record does not take
+    // over an older record's entry.
+    auto a_claim = store.claim_apply("agent-s1", id);
+    REQUIRE(a_claim.has_value());
+    exec_sql(db.dsn(), "UPDATE quarantine_store.quarantine_records SET apply_claimed_at = 1 WHERE id = " +
+                           std::to_string(id));
+    REQUIRE(store.mark_released("agent-s1", id, ReleaseEnd::forced).has_value());
+    REQUIRE(store.quarantine_device("agent-s1", "admin", "again", "").has_value());
+    const auto b_id = active_row(store, "agent-s1")->id;
+    auto b_claim = store.claim_apply("agent-s1", b_id);
+    REQUIRE(b_claim.has_value());
+    const auto a_hidden = store.apply_fence_token("agent-s1", id);
+    REQUIRE(a_hidden.has_value());
+    CHECK_FALSE(a_hidden->has_value()); // A's entry survived B's claim
+    // A release for a generation the record no longer holds is a no-op: B's entry stays, so with
+    // B's database stamp stepped forward its token is still hidden.
+    REQUIRE(store.release_apply_claim("agent-s1", b_id, *b_claim + 5).has_value());
+    exec_sql(db.dsn(), "UPDATE quarantine_store.quarantine_records SET apply_claimed_at = 1 WHERE id = " +
+                           std::to_string(b_id));
+    const auto b_hidden = store.apply_fence_token("agent-s1", b_id);
+    REQUIRE(b_hidden.has_value());
+    CHECK_FALSE(b_hidden->has_value());
+    // B's own generation releases it: the entry goes and the token is readable.
+    REQUIRE(store.release_apply_claim("agent-s1", b_id, *b_claim).has_value());
+    const auto b_token = store.apply_fence_token("agent-s1", b_id);
+    REQUIRE(b_token.has_value());
+    REQUIRE(b_token->has_value());
+    CHECK(**b_token == *b_claim);
 }
 
 namespace {

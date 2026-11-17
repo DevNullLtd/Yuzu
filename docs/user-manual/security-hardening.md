@@ -886,8 +886,8 @@ contained with no record naming it. Two parts close that:
   120 seconds after it was stamped, and both the stamp and that test use the database's clock, so a
   server whose own clock steps cannot make a live claim read as expired or a dead one as live. The
   server also keeps the claims it stamped on its own monotonic clock for the same 120 seconds, so a
-  step of the database's clock cannot make one of them read expired early; after a restart the
-  database clock alone judges the window. MCP
+  step of the database's clock cannot make one of them read expired early; after a restart (or for a
+  claim another replica stamped) the database clock alone judges the window. MCP
   `quarantine_device` reads no reply, so after any call that reached a device (the first as well as a retry) a second call, a
   release's confirmed end and the reconciler's own apply are held back until the claim expires, at most 120
   seconds; the second call answers a retryable fault.

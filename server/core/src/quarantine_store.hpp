@@ -211,7 +211,8 @@ public:
     // is refused; an apply claimed before it had left the server before the observing command
     // was sent, so the observing command is queued behind it. A crashed holder's claim is never
     // cleared by anyone: it stops counting `kApplyClaimTtlSecs` after it was stamped, both the
-    // stamp and the test being the database's clock (one SQL statement of it, in the store).
+    // stamp and the test being the database's clock (one SQL statement of it, in the store); a claim this process stamped also
+    // holds for that long on the process's own monotonic clock (see `apply_fence_token`).
 
     /// Claim an apply for `record_id`: `apply_gen + 1` and the claim stamp, in one guarded UPDATE.
     /// Returns the generation the caller now owns (pass it to `release_apply_claim`).
@@ -304,12 +305,14 @@ public:
     get_history(const std::string& agent_id);
 
 private:
-    // The claims this process stamped, by agent, for the monotonic guard in `apply_fence_token`.
+    // The claims this process stamped, by agent and record, for the monotonic guard in
+    // `apply_fence_token`.
     struct LocalClaim {
-        std::int64_t record_id{0};
         std::int64_t gen{0};
         std::chrono::steady_clock::time_point until{};
     };
+    [[nodiscard]] static std::string local_claim_key(const std::string& agent_id,
+                                                     std::int64_t record_id);
     [[nodiscard]] std::chrono::steady_clock::time_point steady_now() const;
     void note_local_claim(const std::string& agent_id, std::int64_t record_id, std::int64_t gen);
     void forget_local_claim(const std::string& agent_id, std::int64_t record_id, std::int64_t gen);
