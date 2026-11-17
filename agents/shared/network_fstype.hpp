@@ -19,8 +19,11 @@
 // virtiofs, lustre, beegfs, gfs2, ocfs2, gpfs, panfs, vboxsf, vmhgfs, prl_fs, autofs (a direct-map
 // trigger point blocks on traversal), and the "fuse.<suffix>" types that are network-backed. It does
 // NOT see a STACKED filesystem (an overlay/ecryptfs/loop over a dead network mount reports its own
-// local type) or a bare `fuse` mount (many are local): that needs a bounded-call seam in agent
-// core, not a longer list. Echo's
+// local type: an `overlay` whose lowerdir is NFS is the common container case) or a bare `fuse`
+// mount (many are local) or a `fuse.<suffix>` the list does not name (the suffix list grows with
+// the network-backed FUSE clients; an unlisted one is a residual): that needs a bounded-call seam
+// in agent core, not a longer list. Callers that must not claim more say "network mounts of the
+// listed types", never "network mounts". Echo's
 // echo_mapdrive_collector.cpp keeps a deliberately different, map-drive-specific set.
 //
 // Platform-agnostic pure C++, no OS call, no I/O: the zero-dependency leaf-helper convention of
@@ -38,6 +41,7 @@ namespace yuzu::shared {
 [[nodiscard]] inline bool is_network_fstype(std::string_view fstype) noexcept {
     constexpr std::string_view kExact[] = {"nfs",   "nfs3",      "nfs4",   "cifs",   "smb3",
                                            "smbfs", "afs",       "ceph",   "glusterfs", "9p",
+                                           "ncpfs", "coda",    "smb2",
                                            "virtiofs", "lustre", "beegfs", "gfs2",   "ocfs2",
                                            "gpfs",  "panfs",     "vboxsf", "vmhgfs", "prl_fs",
                                            "autofs"};
@@ -49,7 +53,15 @@ namespace yuzu::shared {
         const auto suffix = fstype.substr(kFusePrefix.size());
         constexpr std::string_view kFuseSuffixes[] = {"sshfs",  "s3fs",      "davfs", "rclone",
                                                       "cephfs", "glusterfs", "nfs",   "smb",
-                                                      "ceph-fuse", "vmhgfs-fuse", "prl_fsd"};
+                                                      "ceph-fuse", "vmhgfs-fuse", "prl_fsd",
+                                                      // object-store / cloud-drive / distributed
+                                                      // FUSE clients whose backing store is remote
+                                                      "gcsfuse", "goofys", "blobfuse", "blobfuse2",
+                                                      "ossfs", "obsfs", "cosfs", "juicefs",
+                                                      "mfsmount", "moosefs", "lizardfs", "seaweedfs",
+                                                      "weed", "curlftpfs", "httpfs2", "s3ql",
+                                                      "onedrive", "google-drive-ocamlfuse",
+                                                      "davfs2", "fuse-nfs"};
         for (const auto s : kFuseSuffixes) {
             if (suffix == s) return true;
         }

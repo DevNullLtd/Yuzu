@@ -55,7 +55,7 @@ spec:
       - name: sha1
         type: string
         description: >-
-          Lowercase hex SHA-1 of the executable file's contents, cached per path so a binary shared by several processes is hashed once; empty when the file could not be opened or its path could not be resolved. Values: 40-char lowercase hex or empty.
+          Lowercase hex SHA-1 of the executable file's contents, cached per path so a binary shared by several processes is hashed once; empty when the file was not hashed for ANY reason: the path could not be resolved, it is a network or device path or not a fixed local drive (refused), it could not be opened, or a read failed part-way (a truncated prefix is never hashed). The row cannot say which. Values: 40-char lowercase hex or empty.
         example: "e5355187cbd952a5bc9dfca430d10383f0f8750c"
         platforms: [windows, linux, darwin]
     aggregation:

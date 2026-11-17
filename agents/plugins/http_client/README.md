@@ -14,7 +14,7 @@
 
 ## How it works
 
-All three actions parse the operator-supplied URL, reject anything but `http://`/`https://`, and run it through an SSRF filter before opening a connection: `hostname_resolves_to_private` resolves the hostname and rejects any IPv4/IPv6 result in a private, loopback, link-local, CGN, benchmarking, or unique-local range, and fails closed — blocking the request — if resolution itself fails. `get` and `head` then issue a single `httplib::Client`/`SSLClient` GET or HEAD and return the status plus body/headers as-is. `download` additionally canonicalizes the destination's parent directory and rejects any path containing a `..` component before streaming the response to disk, capping the transfer at 100 MiB by aborting mid-stream; it then SHA-256-hashes the file (BCrypt on Windows, OpenSSL EVP elsewhere) and, if `expected_hash` was supplied, deletes the file and fails on a mismatch. Every request goes through cpp-httplib's native in-process socket client — no shell invocation on any platform. The plugin deliberately does not follow HTTP redirects, does not accept custom headers/methods/auth, and does not retry a failed request.
+All three actions parse the operator-supplied URL, reject anything but `http://`/`https://`, and vet the destination before opening a connection (`agents/shared/outbound_address_policy.hpp`): the host name is resolved **once**, every address the lookup returned must be a public address, and the connection goes to one of those vetted addresses (IPv4 first, then IPv6, each tried in turn) through cpp-httplib's hostname-to-address map, so the `Host` header and TLS name verification stay on the original name and a DNS answer that changes between the check and the connect cannot redirect it. Loopback, private (RFC 1918, carrier-grade NAT, unique-local), link-local and the cloud metadata addresses (`169.254.169.254`, `168.63.129.16`, `100.100.100.200`, `fd00:ec2::254`), unspecified, multicast, reserved, documentation and other non-global blocks are refused, IPv4-mapped, NAT64 (`64:ff9b::/96`) and 6to4 forms are judged by the IPv4 address they embed, and a failed lookup blocks the request (fail closed). `get` and `head` then issue a single GET or HEAD under a 120 s total deadline and return the status plus body/headers as-is. `download` first refuses a destination on a network or device path (or whose resolved parent is one) and any path containing a `..` component, then fetches the body into memory (capped at 100 MiB, 600 s total deadline) accepting only a **2xx** status, requires the body to be **complete** (it matches `Content-Length`, or the framing is chunked, or an `expected_hash` is given to verify it; a body with none of these is refused because a cut-short close-delimited transfer cannot be told from a finished one), checks `expected_hash` (case-insensitive SHA-256) and only then replaces the destination in one atomic rename. A failed, non-2xx, over-cap, incomplete or unverified transfer writes nothing and leaves an existing destination as it was; the replacement is a new regular file, so a symlink or hard-linked destination is replaced rather than written through. Every request goes through cpp-httplib's native in-process socket client, no shell invocation on any platform. The plugin deliberately does not follow HTTP redirects, does not accept custom headers/methods/auth, and does not retry a failed request.
 
 ```mermaid
 flowchart LR
@@ -25,8 +25,6 @@ flowchart LR
   EX --> LIN[Linux leg<br/>cpp-httplib native sockets]
   WIN & MAC & LIN --> ROWS[pipe rows +<br/>typed result status] --> RS[(ResponseStore)] --> API[REST /api/responses]
 ```
-
-**Resolve once, connect to the vetted address; download is verify-then-replace (F17/F18/F65).** Each request resolves the host ONE time, requires EVERY returned address to be a public address (`agents/shared/outbound_address_policy.hpp`: loopback, private, CGNAT, link-local/metadata, multicast, reserved, documentation, IPv4-mapped/compatible, NAT64 and 6to4 forms are judged by their embedded IPv4 address, `64:ff9b:1::/48` and the rest of non-global IPv6 refuse) and pins the connection to the vetted address through cpp-httplib's hostname-to-address map, so a DNS answer that changes between the check and the connect cannot redirect it, while the `Host` header and TLS name verification stay on the original name (#647). `download` buffers the body in memory (capped at 100 MiB), accepts only a 2xx status, verifies `expected_hash` (case-insensitive), and only then replaces the destination atomically (`atomic_file_write.hpp`); a failed, non-2xx, over-cap or unverified transfer writes nothing and leaves an existing destination untouched. A destination `path` on a UNC/device/network-mount path, or whose resolved parent is one, is refused. IPv6 literal hosts (`[::1]`) are still not supported by the URL parser and remain blocked.
 
 ## OS capability
 
@@ -57,7 +55,7 @@ No subprocess execution on any platform — cpp-httplib's native socket client (
 |---|---|---|---|---|---|---|
 | `agent.http_client.download` | `url` | string | yes | - | - | HTTP or HTTPS URL to download. |
 | `agent.http_client.download` | `path` | string | yes | - | - | Local file path to save the download. |
-| `agent.http_client.download` | `expected_hash` | string | no | - | - | Optional SHA256 hash for verification. |
+| `agent.http_client.download` | `expected_hash` | string | no | - | - | Optional SHA256 hash (hex, case-insensitive) the downloaded body must match before anything is written. Without it the response must declare its length (Content-Length, or chunked framing) so a truncated transfer is refused. |
 | `agent.http_client.get` | `url` | string | yes | - | - | HTTP or HTTPS URL to request. |
 | `agent.http_client.head` | `url` | string | yes | - | - | HTTP or HTTPS URL to request. |
 <!-- END GENERATED -->
@@ -73,8 +71,8 @@ Rows are pipe-delimited `field|value` lines written one at a time via `ctx.write
 |---|---|---|---|---|---|
 | `status` | string | - | Windows, Linux, macOS | `ok` | Literal "ok" on success; a failed download emits a separate error output instead of a non-ok status row. |
 | `path` | string | - | Windows, Linux, macOS | `/tmp/yuzu_capture/yuzu_capture_download.html` | Absolute path the file was written to, after canonicalizing the parent directory and rejecting any ".." component. Values: absolute filesystem path. |
-| `size` | int64 | - | Windows, Linux, macOS | `559` | Size in bytes of the downloaded file on disk, read back with std::filesystem::file_size after the write completes. Values: non-negative integer, bytes. |
-| `hash` | string | - | Windows, Linux, macOS | `ff67a9d764d6a2367a187734e697f6a53217db9a21c101d410a113ca871a299d` | Lowercase hex SHA-256 digest of the downloaded file, computed via BCrypt on Windows and OpenSSL EVP on Linux/macOS. Values: 64-character lowercase hex string. |
+| `size` | int64 | - | Windows, Linux, macOS | `559` | Size in bytes of the downloaded body, which is the size of the file now at the destination (the body is held in memory, verified, then written in one atomic replace). Values: non-negative integer, bytes. |
+| `hash` | string | - | Windows, Linux, macOS | `ff67a9d764d6a2367a187734e697f6a53217db9a21c101d410a113ca871a299d` | Lowercase hex SHA-256 digest of the downloaded body (the shared in-memory SHA-256, identical on every OS), the value compared with expected_hash before anything is written. Values: 64-character lowercase hex string. |
 
 **`agent.http_client.get` — `status|body`**
 
@@ -201,15 +199,15 @@ Date: Sun, 06 Sep 2026 19:18:12 GMT
 ## Caveats and known gaps
 
 1. **`head`'s declared result columns don't match what the code emits.** The definition YAML declares `status|content_length|content_type`; `do_head` actually writes `status|headers`, where `headers` is the full raw header block. A consumer parsing by the declared schema will not find `content_length`/`content_type`.
-2. **`get`'s size cap doesn't stop the transfer.** `download` streams to disk and aborts mid-transfer past 100 MiB (`content_receiver`, lines 265-273). `get` calls `cli.Get(parsed.path)` with no content receiver, so the full body is already downloaded in memory before the `res->body.size() > kMaxDownloadSize` check (line 350) replaces it with an error string — the cap limits what's returned, not what's fetched.
-3. **No redirect following.** Neither `set_follow_location` nor any equivalent is called on any `httplib::Client`/`SSLClient` instance, so a 3xx response is returned as-is (status + whatever body/headers the redirect response itself carries), not followed.
+2. **`get`'s size cap doesn't stop the transfer.** `download` aborts mid-transfer past 100 MiB (its content receiver counts the buffered bytes). `get` calls `cli.Get(parsed.path)` with no content receiver, so the full body is already downloaded in memory before the `res->body.size() > kMaxDownloadSize` check replaces it with an error string — the cap limits what's returned, not what's fetched. `download` holds the whole body in memory (up to 100 MiB, reserved once from `Content-Length` when declared) before writing, and reports an allocation failure as `download aborted: out of memory`.
+3. **No redirect following.** Neither `set_follow_location` nor any equivalent is called on any `httplib::Client`/`SSLClient` instance, so for `get` and `head` a 3xx response is returned as-is (status + whatever body/headers the redirect response itself carries), not followed; for `download` anything but a 2xx status is a failure (`download failed: HTTP <status>`) and writes nothing.
 4. **HTTPS on Windows depends on a build-time OpenSSL find.** Windows OpenSSL discovery is `required: false` (`meson.build`); when it isn't found, `CPPHTTPLIB_OPENSSL_SUPPORT` is undefined and every `https://` call on that build returns `status|0` with an "HTTPS not supported" message instead of connecting (lines 283-287, 334-337, 378-381). Linux/macOS require OpenSSL at configure time and always have it.
 5. **This plugin does not set a typed result status.** Every sample shows `UNDECLARED / UNKNOWN /` regardless of outcome — a caller must parse the `status`/`error` output fields, not the result-status envelope, to detect failure.
 
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/http_client/src/http_client_plugin.cpp`
+- Plugin: `agents/plugins/http_client/src/http_client_download.hpp` · `agents/plugins/http_client/src/http_client_plugin.cpp`
 - Definitions: `content/definitions/http_client.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_c.hpp`
 - Tests: none found by name

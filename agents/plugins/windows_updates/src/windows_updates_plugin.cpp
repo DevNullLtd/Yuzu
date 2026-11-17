@@ -19,7 +19,7 @@
 #include <yuzu/plugin.hpp>
 
 #include "windows_updates_parsers.hpp" // pure installed/missing parse+format helpers
-#include <outbound_address_policy.hpp> // address-class refusal for caller-supplied targets (F45)
+#include <outbound_address_policy.hpp> // address-class refusal for caller-supplied targets 
 
 #include <algorithm>
 #include <array>
@@ -780,6 +780,23 @@ ConnTarget parse_url(const std::string& url) {
     return t;
 }
 
+#ifdef _WIN32
+// WSAStartup / WSACleanup as a scope: the cleanup runs on every return, early ones included.
+struct WsaSession {
+    WsaSession() { WSADATA wsa; WSAStartup(MAKEWORD(2, 2), &wsa); }
+    ~WsaSession() { WSACleanup(); }
+    WsaSession(const WsaSession&) = delete;
+    WsaSession& operator=(const WsaSession&) = delete;
+};
+#endif
+
+// An addrinfo list owned from the moment getaddrinfo returns it: a string allocation (or any other
+// exception) between the lookup and the free cannot leak it.
+struct AddrInfoFree {
+    void operator()(struct addrinfo* p) const noexcept { if (p) freeaddrinfo(p); }
+};
+using AddrInfoList = std::unique_ptr<struct addrinfo, AddrInfoFree>;
+
 struct DnsResult {
     bool ok{false};
     std::string ip;
@@ -790,10 +807,12 @@ struct DnsResult {
 DnsResult test_dns(const std::string& host) {
     DnsResult r;
     auto start = std::chrono::steady_clock::now();
-    struct addrinfo hints{}, *res = nullptr;
+    struct addrinfo hints{}, *raw = nullptr;
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
-    int rc = getaddrinfo(host.c_str(), nullptr, &hints, &res);
+    int rc = getaddrinfo(host.c_str(), nullptr, &hints, &raw);
+    const AddrInfoList list{raw};
+    struct addrinfo* res = raw;
     auto elapsed = std::chrono::steady_clock::now() - start;
     r.ms = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
     if (rc != 0) {
@@ -808,11 +827,10 @@ DnsResult test_dns(const std::string& host) {
         inet_ntop(AF_INET6, &reinterpret_cast<sockaddr_in6*>(res->ai_addr)->sin6_addr, buf, sizeof(buf));
     }
     r.ip = buf;
-    freeaddrinfo(res);
     return r;
 }
 
-// F45: a resolved address a caller-supplied target may never name -- loopback, unspecified,
+// A resolved address a caller-supplied target may never name -- loopback, unspecified,
 // link-local (cloud metadata 169.254.169.254), multicast or reserved. RFC 1918 stays allowed: a
 // WSUS server is routinely on a private network, and the platform defaults are not judged at all.
 // An unparseable address fails closed.
@@ -841,11 +859,14 @@ struct TcpResult {
 
 TcpResult test_tcp(const std::string& host, int port, int timeout_s) {
     TcpResult r;
-    struct addrinfo hints{}, *res = nullptr;
+    struct addrinfo hints{}, *raw = nullptr;
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     auto port_str = std::to_string(port);
-    if (getaddrinfo(host.c_str(), port_str.c_str(), &hints, &res) != 0) {
+    const int gai = getaddrinfo(host.c_str(), port_str.c_str(), &hints, &raw);
+    const AddrInfoList list{raw};
+    struct addrinfo* res = raw;
+    if (gai != 0) {
         r.error = "dns failed";
         return r;
     }
@@ -854,7 +875,7 @@ TcpResult test_tcp(const std::string& host, int port, int timeout_s) {
 
 #ifdef _WIN32
     SOCKET sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (sock == INVALID_SOCKET) { freeaddrinfo(res); r.error = "socket failed"; return r; }
+    if (sock == INVALID_SOCKET) { r.error = "socket failed"; return r; }
     unsigned long mode = 1;
     ioctlsocket(sock, FIONBIO, &mode);
     connect(sock, res->ai_addr, static_cast<int>(res->ai_addrlen));
@@ -879,7 +900,7 @@ TcpResult test_tcp(const std::string& host, int port, int timeout_s) {
     closesocket(sock);
 #else
     int sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (sock < 0) { freeaddrinfo(res); r.error = "socket failed"; return r; }
+    if (sock < 0) { r.error = "socket failed"; return r; }
     int flags = fcntl(sock, F_GETFL, 0);
     fcntl(sock, F_SETFL, flags | O_NONBLOCK);
     connect(sock, res->ai_addr, res->ai_addrlen);
@@ -977,11 +998,10 @@ int do_patch_connectivity(yuzu::CommandContext& ctx, yuzu::Params params) {
     if (timeout_s > 60) timeout_s = 60;
 
 #ifdef _WIN32
-    WSADATA wsa;
-    WSAStartup(MAKEWORD(2, 2), &wsa);
+    const WsaSession wsa_session; // WSACleanup on EVERY exit path (including the early returns)
 #endif
 
-    // Caller-supplied targets make this action a network probe from the endpoint (F45): cap how
+    // Caller-supplied targets make this action a network probe from the endpoint : cap how
     // many one dispatch may name, and refuse the addresses no patch source lives at.
     constexpr size_t kMaxCallerTargets = 16;
     const bool caller_supplied = !targets_str.empty();
@@ -1007,9 +1027,6 @@ int do_patch_connectivity(yuzu::CommandContext& ctx, yuzu::Params params) {
         }
         if (targets.size() > kMaxCallerTargets) {
             ctx.write_output(std::format("error|too many targets (max {})", kMaxCallerTargets));
-#ifdef _WIN32
-            WSACleanup();
-#endif
             return 1;
         }
     }
@@ -1053,10 +1070,6 @@ int do_patch_connectivity(yuzu::CommandContext& ctx, yuzu::Params params) {
 
     ctx.write_output(std::format("summary|targets_tested|{}|targets_reachable|{}|targets_failed|{}",
         targets.size(), reachable, failed));
-
-#ifdef _WIN32
-    WSACleanup();
-#endif
 
     return 0;
 }

@@ -66,7 +66,13 @@ spec:
         description: >
           Comma-separated list of file paths (e.g. `C:\bad.exe` or
           `/tmp/bad.bin`) to check for existence and size. Also used as
-          the target set for file_hashes comparison.
+          the target set for file_hashes comparison. At most 64 paths (more
+          is refused). A network or device path (UNC, `\\.\`, a non-fixed
+          Windows drive, a path under or symlinked into a network mount) and,
+          for hashing, a file under /proc, /sys or /dev is NOT examined: it
+          is named in a `coverage|<path>|not_examined|<cause>` row, never
+          reported as a clean absence. Hashing reads only regular files of
+          at most 512 MiB within one 60 s deadline.
       ports:
         type: string
         displayName: Ports
@@ -80,9 +86,16 @@ spec:
       - name: type
         type: string
         description: >
-          Which IOC category this row checked. `error` appears only once,
-          in place of all rows, when no IOC parameter was provided at all.
-        values: [ip, domain, hash, file, port, error]
+          Which IOC category this row checked. `error` appears in place of
+          all rows when no IOC parameter was provided at all, or when more
+          than 64 file_paths or 256 file_hashes were given. `coverage` rows
+          (only when file_paths was given) say what was NOT examined: one
+          `coverage|<path>|not_examined|<cause>` row per unexamined path
+          (cause: network_or_device, non_fixed_drive, mount_table_unreadable,
+          unresolvable, pseudo_filesystem, symlink, reparse_or_not_a_file,
+          not_regular, too_large, timeout, unreadable) and a closing
+          `coverage|*|complete|...` or `coverage|*|partial|...` row.
+        values: [ip, domain, hash, file, port, coverage, error]
         example: ip
         platforms: [windows, linux, darwin]
       - name: value

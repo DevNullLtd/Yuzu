@@ -26,7 +26,7 @@ flowchart LR
   WIN & MAC & LIN --> ROWS[rows, no typed status] --> RS[(ResponseStore)] --> API[REST /api/responses]
 ```
 
-**Windows image paths are classified and opened handle-relative (F34).** `sha1_of_file` refuses a UNC, device or non-`DRIVE_FIXED` path (`agents/shared/local_path_policy.hpp`; the row keeps an empty `sha1`) and then opens the image with `yuzu::win::open_file_no_reparse` (`NtCreateFile` relative to the volume root with `OBJ_DONT_REPARSE`), so a reparse point in the path cannot redirect the open and the by-name `CreateFileA` is gone (which also removes the ANSI-code-page failure in caveat 1 for the opened path). A CompactOS/WOF-compressed image is opened as itself and may read as an empty `sha1`; this was not measured. Not compiled or run on Windows in the change that made it. The POSIX legs are unchanged.
+**Windows image paths are classified and opened handle-relative.** `sha1_of_file` refuses a UNC, device or non-`DRIVE_FIXED` path (`agents/shared/local_path_policy.hpp`) and then opens the image with `yuzu::win::open_file_no_reparse` (`NtCreateFile` relative to the volume root with `OBJ_DONT_REPARSE`), so a reparse point in the path cannot redirect the open and the by-name `CreateFileA` is gone. A read error part-way through returns an empty hash (never the SHA-1 of a truncated prefix). An empty `sha1` means "not hashed" for any reason (refused, could not be opened, read failure, a CompactOS/WOF-compressed image opened as itself, or an AV filter or locked volume); the row cannot say which. On Linux and macOS an image path on, or symlinked into, a mount of a listed network type is not hashed either.
 
 ## OS capability
 
@@ -66,7 +66,7 @@ Pipe-delimited rows, one per process, in the fixed field order `pid|name|path|sh
 | `pid` | int64 | - | Windows, Linux, macOS | `1052` | The process ID assigned by the OS. Values: integer. |
 | `name` | string | - | Windows, Linux, macOS | `svchost.exe` | The process's short or executable name, as reported by the OS. Values: free text. |
 | `path` | string | - | Windows, Linux, macOS | `/usr/bin/dash` | Absolute path to the process's executable image on disk; empty when the OS refuses or fails to resolve it (a protected process, a permission-denied read, or a pseudo-process with no backing binary). Values: absolute path or empty. |
-| `sha1` | string | - | Windows, Linux, macOS | `e5355187cbd952a5bc9dfca430d10383f0f8750c` | Lowercase hex SHA-1 of the executable file's contents, cached per path so a binary shared by several processes is hashed once; empty when the file could not be opened or its path could not be resolved. Values: 40-char lowercase hex or empty. |
+| `sha1` | string | - | Windows, Linux, macOS | `e5355187cbd952a5bc9dfca430d10383f0f8750c` | Lowercase hex SHA-1 of the executable file's contents, cached per path so a binary shared by several processes is hashed once; empty when the file was not hashed for ANY reason: the path could not be resolved, it is a network or device path or not a fixed local drive (refused), it could not be opened, or a read failed part-way (a truncated prefix is never hashed). The row cannot say which. Values: 40-char lowercase hex or empty. |
 <!-- END GENERATED -->
 
 ### Result status

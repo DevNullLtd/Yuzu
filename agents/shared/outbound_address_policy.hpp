@@ -14,13 +14,15 @@
 // Two tiers for callers:
 //   * `is_public` -- a global unicast address. http_client connects only to these.
 //   * `never_probeable` -- loopback, unspecified, link-local (the cloud metadata address
-//     169.254.169.254 lives here), multicast and reserved. A caller that must still reach a
+//     169.254.169.254 lives here), the other cloud metadata addresses, multicast and reserved. A caller that must still reach a
 //     private network (windows_updates' patch-source probe, where a WSUS server is routinely on
 //     RFC 1918) refuses only these.
 //
 // This is the agent-side twin of server/core/src/oidc_egress_policy.hpp (which the agent cannot
-// include: server tree). The two are deliberately separate files with the same class split; a
-// change to one must be mirrored.
+// include: server tree). The two are separate files and the agent one is a SUBSET of the server's
+// (no NAT64 operator prefixes, no literal parser): the classes and the address blocks they cover
+// must agree, and tests/unit/server/test_egress_classifier_parity.cpp pins server vs agent over
+// one table so a change to either side that is not mirrored fails there.
 #pragma once
 
 #include <array>
@@ -43,10 +45,20 @@ enum class AddressClass : std::uint8_t {
     LinkLocal,
     Multicast,
     Reserved, // 240.0.0.0/4 including the limited broadcast address
+    /// Single well-known cloud metadata endpoints that sit inside otherwise Private or Public
+    /// blocks: 100.100.100.200 (Alibaba, inside 100.64.0.0/10), 168.63.129.16 (Azure WireServer,
+    /// otherwise "public"), fd00:ec2::254 (AWS IMDS over IPv6, inside fc00::/7). 169.254.169.254
+    /// is LinkLocal (the block it lives in).
+    CloudMetadata,
 };
 
 [[nodiscard]] constexpr AddressClass classify_ipv4(const Ipv4& a) noexcept {
     const unsigned a0 = a[0], a1 = a[1], a2 = a[2];
+    // Single addresses first: they sit inside blocks that are otherwise Private or Public.
+    if (a0 == 100 && a1 == 100 && a2 == 100 && a[3] == 200)
+        return AddressClass::CloudMetadata;
+    if (a0 == 168 && a1 == 63 && a2 == 129 && a[3] == 16)
+        return AddressClass::CloudMetadata;
     if (a0 == 0)
         return AddressClass::Unspecified; // 0.0.0.0/8
     if (a0 == 127)
@@ -101,16 +113,37 @@ enum class AddressClass : std::uint8_t {
         return AddressClass::Multicast;
     if (b[0] == 0xfe && (b[1] & 0xc0) == 0x80)
         return AddressClass::LinkLocal; // fe80::/10
-    if ((b[0] & 0xfe) == 0xfc)
-        return AddressClass::Private; // fc00::/7
+    if ((b[0] & 0xfe) == 0xfc) { // fc00::/7
+        bool zeros = true;       // fd00:ec2::254 is the AWS IMDS over IPv6
+        for (std::size_t i = 4; i < 14; ++i)
+            zeros = zeros && b[i] == 0;
+        if (b[0] == 0xfd && b[1] == 0x00 && b[2] == 0x0e && b[3] == 0xc2 && zeros && b[14] == 0x02 &&
+            b[15] == 0x54)
+            return AddressClass::CloudMetadata;
+        return AddressClass::Private;
+    }
     if (b[0] == 0xfe && (b[1] & 0xc0) == 0xc0)
         return AddressClass::OtherNonGlobal; // fec0::/10 site-local (deprecated)
     if ((b[0] & 0xe0) != 0x20)
         return AddressClass::OtherNonGlobal; // outside 2000::/3
     if (b[0] == 0x20 && b[1] == 0x01 && b[2] == 0x0d && b[3] == 0xb8)
         return AddressClass::OtherNonGlobal; // 2001:db8::/32 documentation
-    if (b[0] == 0x20 && b[1] == 0x01 && b[2] == 0x00 && b[3] == 0x00)
-        return AddressClass::OtherNonGlobal; // 2001::/32 Teredo
+    if (b[0] == 0x3f && b[1] == 0xff && (b[2] & 0xf0) == 0x00)
+        return AddressClass::OtherNonGlobal; // 3fff::/20 documentation (RFC 9637)
+    // 2001::/23 IETF protocol assignments (Teredo, benchmarking, ORCHID ...): not global as a
+    // block, EXCEPT the sub-ranges the IANA registry marks globally reachable (the server twin
+    // documents each; unlisted addresses fail closed).
+    if (b[0] == 0x20 && b[1] == 0x01 && (b[2] & 0xfe) == 0x00) {
+        bool mid_zero = true;
+        for (std::size_t i = 4; i < 15; ++i)
+            mid_zero = mid_zero && b[i] == 0;
+        const bool service_anycast = b[2] == 0x00 && b[3] == 0x01 && mid_zero && b[15] >= 1 && b[15] <= 3;
+        const bool amt = b[2] == 0x00 && b[3] == 0x03;
+        const bool as112 = b[2] == 0x00 && b[3] == 0x04 && b[4] == 0x01 && b[5] == 0x12;
+        const bool orchid_v2_or_det = b[2] == 0x00 && ((b[3] & 0xf0) == 0x20 || (b[3] & 0xf0) == 0x30);
+        return (service_anycast || amt || as112 || orchid_v2_or_det) ? AddressClass::Public
+                                                                     : AddressClass::OtherNonGlobal;
+    }
     return AddressClass::Public;
 }
 
@@ -123,7 +156,7 @@ enum class AddressClass : std::uint8_t {
 [[nodiscard]] constexpr bool never_probeable(AddressClass c) noexcept {
     return c == AddressClass::Loopback || c == AddressClass::Unspecified ||
            c == AddressClass::LinkLocal || c == AddressClass::Multicast ||
-           c == AddressClass::Reserved;
+           c == AddressClass::Reserved || c == AddressClass::CloudMetadata;
 }
 
 /// One resolved address as raw bytes (an IPv4 address occupies bytes 0..3). The OS resolver glue
@@ -162,12 +195,37 @@ struct VetResult {
     return {VetStatus::ok, 0};
 }
 
-/// `resolve()` returns the answers of ONE lookup. It is called exactly once: the vetted answer is
-/// the connect target (the DNS-rebinding fix). Returns the verdict plus the answers it judged.
+/// What one judged lookup produced: the verdict and the answers that were judged (the caller picks
+/// its connect target(s) from `answers`, never from a second lookup).
+struct VetOutcome {
+    VetResult verdict;
+    std::vector<ResolvedAddress> answers;
+};
+
+/// `resolve()` returns the answers of ONE lookup. It is called exactly once: the vetted answers are
+/// the connect targets (the DNS-rebinding fix).
 template <class ResolveFn>
-[[nodiscard]] VetResult vet_host(ResolveFn&& resolve, std::vector<ResolvedAddress>& answers_out) {
-    answers_out = resolve();
-    return vet_addresses(answers_out);
+[[nodiscard]] VetOutcome vet_host(ResolveFn&& resolve) {
+    VetOutcome out;
+    out.answers = resolve();
+    out.verdict = vet_addresses(out.answers);
+    return out;
+}
+
+/// The vetted answers in connect order: IPv4 first, then IPv6, each family in resolver order (so a
+/// host that answers both families still falls back to the other when one is unreachable, without
+/// ever connecting to an address that was not judged).
+[[nodiscard]] inline std::vector<ResolvedAddress>
+connect_order(const std::vector<ResolvedAddress>& answers) {
+    std::vector<ResolvedAddress> out;
+    out.reserve(answers.size());
+    for (const auto& a : answers)
+        if (!a.is_v6)
+            out.push_back(a);
+    for (const auto& a : answers)
+        if (a.is_v6)
+            out.push_back(a);
+    return out;
 }
 
 } // namespace yuzu::shared::outbound

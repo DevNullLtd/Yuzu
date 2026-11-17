@@ -15,6 +15,7 @@
 #include "test_helpers.hpp"
 
 #include <bounded_file_hash.hpp>
+#include <http_client_download.hpp>
 #include <local_path_policy.hpp>
 #include <outbound_address_policy.hpp>
 #include <sha256.hpp>
@@ -115,6 +116,28 @@ TEST_CASE("local_path: reserved DOS device names are refused in any component", 
     }
 }
 
+TEST_CASE("local_path: superscript COM/LPT reserved names are refused", "[shared][local_path]") {
+    // U+00B9, U+00B2, U+00B3 in UTF-8: reserved on Windows 10 and later.
+    for (const char* p : {"C:\\x\\COM\xC2\xB9", "COM\xC2\xB2", "lpt\xC2\xB3.txt", "C:\\a\\LPT\xC2\xB9"}) {
+        INFO(p);
+        CHECK(win(p) == lp::Refusal::network_or_device);
+    }
+    // Not reserved: COM with another superscript digit, or a non-superscript two-byte letter.
+    for (const char* p : {"C:\\x\\COM\xC2\xB0", "C:\\x\\COM\xC3\xA9"})
+        CHECK(win(p) == lp::Refusal::none);
+}
+
+TEST_CASE("network_fstype: network-capable FUSE clients and the legacy network types are listed",
+          "[shared][network_fstype]") {
+    for (const char* t : {"fuse.gcsfuse", "fuse.goofys", "fuse.blobfuse2", "fuse.juicefs",
+                          "fuse.s3fs", "fuse.sshfs", "nfs4", "cifs", "ncpfs", "coda", "autofs"})
+        CHECK(yuzu::shared::is_network_fstype(t));
+    // Local filesystems and local FUSE are not listed.
+    for (const char* t : {"ext4", "xfs", "btrfs", "tmpfs", "overlay", "fuse", "fuse.portal",
+                          "fuse.lxcfs", "fuse.gvfsd-fuse", "proc", "sysfs"})
+        CHECK_FALSE(yuzu::shared::is_network_fstype(t));
+}
+
 TEST_CASE("local_path: a leading control character or space is refused rather than guessed at",
           "[shared][local_path]") {
     CHECK(win(" \\\\host\\share") == lp::Refusal::network_or_device);
@@ -158,6 +181,7 @@ TEST_CASE("local_path: refusal tokens are stable and never carry the path", "[sh
 
 // ── POSIX: network mounts from mountinfo text ───────────────────────────────────────────────────
 
+#ifndef _WIN32 // posix_refusal absolutises with std::filesystem::absolute: a drive-prefixed path on MSVC
 TEST_CASE("local_path: a path on or under a network mount is refused; siblings are not",
           "[shared][local_path]") {
     const std::string mountinfo =
@@ -182,6 +206,7 @@ TEST_CASE("local_path: a path on or under a network mount is refused; siblings a
     CHECK(lp::posix_refusal("/", mounts) == lp::Refusal::none);
     CHECK(lp::posix_refusal("", mounts) == lp::Refusal::none);
 }
+#endif
 
 TEST_CASE("local_path: a network root filesystem refuses everything", "[shared][local_path]") {
     CHECK(lp::posix_under_mount("/anything/at/all", {"/"}));
@@ -189,14 +214,82 @@ TEST_CASE("local_path: a network root filesystem refuses everything", "[shared][
     CHECK_FALSE(lp::posix_under_mount("/anything", {""}));
 }
 
-#ifdef __linux__
-TEST_CASE("local_path: the live Linux glue passes an ordinary local temp path", "[shared][local_path]") {
+#ifndef _WIN32
+// posix_judge resolves symlinks. The mount list is injected, so these run the real lstat/readlink
+// walk against a temp tree without needing a real network mount.
+TEST_CASE("local_path: a symlinked PARENT that points under a network mount is refused",
+          "[shared][local_path]") {
     yuzu::test::TempDir tmp{"yuzu_test_lp_"};
     REQUIRE(fs::create_directory(tmp.path));
-    // /proc/self/mountinfo is readable in the test environment; the temp dir is not a network mount.
-    CHECK(lp::local_path_refusal(tmp.path.string()) == lp::Refusal::none);
+    const auto mount = fs::canonical(tmp.path) / "mnt_nfs"; // pretend this is a network mount
+    REQUIRE(fs::create_directory(mount));
+    { std::ofstream(mount / "secret.txt") << "x"; }
+    fs::create_directory_symlink(mount, tmp.path / "link");           // link -> the "mount"
+    fs::create_symlink(mount / "secret.txt", tmp.path / "leaf_link"); // leaf link into the "mount"
+    fs::create_directory(tmp.path / "plain");
+    { std::ofstream(tmp.path / "plain" / "f.txt") << "x"; }
+    const std::vector<std::string> mounts{mount.string()};
+
+    // The reproduced bypass: a LEXICAL judge reads /tmp/x/link/a as local.
+    CHECK(lp::posix_refusal((tmp.path / "link" / "a").string(), mounts) == lp::Refusal::none);
+    // The resolving judge follows the parent link and refuses.
+    CHECK(lp::posix_judge((tmp.path / "link" / "a").string(), mounts).refusal ==
+          lp::Refusal::network_or_device);
+    CHECK(lp::posix_judge((tmp.path / "link" / "secret.txt").string(), mounts).refusal ==
+          lp::Refusal::network_or_device);
+    // A LEAF link into the mount (the open would not follow it, a stat would).
+    CHECK(lp::posix_judge((tmp.path / "leaf_link").string(), mounts).refusal ==
+          lp::Refusal::network_or_device);
+    // `..` is resolved physically: plain/../link/x goes through the link too.
+    CHECK(lp::posix_judge((tmp.path / "plain" / ".." / "link" / "x").string(), mounts).refusal ==
+          lp::Refusal::network_or_device);
+    // A link chain.
+    fs::create_directory_symlink(tmp.path / "link", tmp.path / "link2");
+    CHECK(lp::posix_judge((tmp.path / "link2" / "a").string(), mounts).refusal ==
+          lp::Refusal::network_or_device);
+
+    // Ordinary local paths still pass, and the result is the resolved path.
+    const auto ok = lp::posix_judge((tmp.path / "plain" / "f.txt").string(), mounts);
+    CHECK(ok.refusal == lp::Refusal::none);
+    CHECK(ok.resolved == (fs::canonical(tmp.path) / "plain" / "f.txt").string());
+    // A path that does not exist is judged lexically (nothing to follow).
+    const auto missing = lp::posix_judge((tmp.path / "plain" / "nope" / "x").string(), mounts);
+    CHECK(missing.refusal == lp::Refusal::none);
+    CHECK(missing.resolved == (fs::canonical(tmp.path) / "plain" / "nope" / "x").string());
+    // An empty mount list never refuses.
+    CHECK(lp::posix_judge((tmp.path / "link" / "a").string(), {}).refusal == lp::Refusal::none);
 }
+
+TEST_CASE("local_path: a symlink loop fails closed", "[shared][local_path]") {
+    yuzu::test::TempDir tmp{"yuzu_test_lp_"};
+    REQUIRE(fs::create_directory(tmp.path));
+    fs::create_symlink(tmp.path / "b", tmp.path / "a");
+    fs::create_symlink(tmp.path / "a", tmp.path / "b");
+    CHECK(lp::posix_judge((tmp.path / "a" / "x").string(), {}).refusal == lp::Refusal::unresolvable);
+}
+
+TEST_CASE("local_path: /proc, /sys and /dev paths are pseudo-filesystem paths", "[shared][local_path]") {
+    for (const char* p : {"/proc", "/proc/kmsg", "/proc/self/exe", "/sys/kernel", "/dev/zero", "/dev"})
+        CHECK(lp::posix_pseudo_fs_path(p));
+    for (const char* p : {"/procfs/x", "/system", "/devices/x", "/home/proc/kmsg", "/", "/tmp"})
+        CHECK_FALSE(lp::posix_pseudo_fs_path(p));
+}
+
+TEST_CASE("local_path: a guard snapshot resolves paths and reports the pseudo filesystem",
+          "[shared][local_path]") {
+#if defined(__linux__) || defined(__APPLE__)
+    const lp::LocalPathGuard guard;
+    const auto j = guard.judge("/proc/self/../self/status");
+    if (j.refusal == lp::Refusal::mount_table_unreadable)
+        SKIP("mount table unreadable in this sandbox: the guard fails closed (asserted below)");
+    // Whatever the mount table says about /proc, the resolved text names the pseudo filesystem.
+    if (j.refusal == lp::Refusal::none)
+        CHECK(lp::posix_pseudo_fs_path(j.resolved));
+    CHECK(guard.judge("").refusal == lp::Refusal::none); // empty path: the caller owns that error
 #endif
+}
+#endif // !_WIN32
+
 
 // ── Outbound address classification ─────────────────────────────────────────────────────────────
 
@@ -231,6 +324,9 @@ TEST_CASE("outbound: IPv4 classes", "[shared][outbound]") {
     CHECK(v4(100, 127, 255, 255) == ob::AddressClass::Private);
     CHECK(v4(100, 128, 0, 1) == ob::AddressClass::Public);
     CHECK(v4(169, 254, 169, 254) == ob::AddressClass::LinkLocal); // cloud metadata
+    CHECK(v4(168, 63, 129, 16) == ob::AddressClass::CloudMetadata);   // Azure WireServer (was Public)
+    CHECK(v4(100, 100, 100, 200) == ob::AddressClass::CloudMetadata); // Alibaba (was Private)
+    CHECK(v4(168, 63, 129, 17) == ob::AddressClass::Public);          // only the one address
     CHECK(v4(224, 0, 0, 1) == ob::AddressClass::Multicast);
     CHECK(v4(239, 255, 255, 250) == ob::AddressClass::Multicast);
     CHECK(v4(240, 0, 0, 1) == ob::AddressClass::Reserved);
@@ -250,7 +346,7 @@ TEST_CASE("outbound: IPv6 classes including the embedded-IPv4 forms", "[shared][
     CHECK(v6({0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}) == ob::AddressClass::Unspecified);
     CHECK(v6({0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}) == ob::AddressClass::LinkLocal);
     CHECK(v6({0xfd, 0x00, 0x0e, 0xc2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0x54}) ==
-          ob::AddressClass::Private); // fd00:ec2::254 (AWS IMDS over IPv6)
+          ob::AddressClass::CloudMetadata); // fd00:ec2::254 (AWS IMDS over IPv6)
     CHECK(v6({0xfc, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}) == ob::AddressClass::Private);
     CHECK(v6({0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}) == ob::AddressClass::Multicast);
     CHECK(v6({0xfe, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}) ==
@@ -293,7 +389,7 @@ TEST_CASE("outbound: the two caller tiers", "[shared][outbound]") {
     CHECK_FALSE(ob::never_probeable(ob::AddressClass::OtherNonGlobal));
     for (const auto c : {ob::AddressClass::Loopback, ob::AddressClass::Unspecified,
                          ob::AddressClass::LinkLocal, ob::AddressClass::Multicast,
-                         ob::AddressClass::Reserved})
+                         ob::AddressClass::Reserved, ob::AddressClass::CloudMetadata})
         CHECK(ob::never_probeable(c));
 }
 
@@ -321,7 +417,7 @@ TEST_CASE("outbound: a resolver answer with ANY non-public address is refused", 
 
 TEST_CASE("outbound: a name that resolves public THEN private is judged on ONE lookup",
           "[shared][outbound]") {
-    // The DNS-rebinding case (#647 / F17): the first lookup answers a public address, every later
+    // The DNS-rebinding case (#647): the first lookup answers a public address, every later
     // lookup a private one. vet_host calls the resolver exactly once, and the answer it vetted is
     // the connect target, so the second (private) answer can never be the one connected to.
     int lookups = 0;
@@ -329,12 +425,11 @@ TEST_CASE("outbound: a name that resolves public THEN private is judged on ONE l
         return ++lookups == 1 ? std::vector{addr4(93, 184, 216, 34)}
                               : std::vector{addr4(169, 254, 169, 254)};
     };
-    std::vector<ob::ResolvedAddress> answers;
-    const auto verdict = ob::vet_host(rebinding_resolver, answers);
-    CHECK(verdict.status == ob::VetStatus::ok);
+    const auto outcome = ob::vet_host(rebinding_resolver);
+    CHECK(outcome.verdict.status == ob::VetStatus::ok);
     CHECK(lookups == 1);
-    REQUIRE(answers.size() == 1);
-    CHECK(answers[verdict.index].bytes[0] == 93); // the vetted (public) address is the target
+    REQUIRE(outcome.answers.size() == 1);
+    CHECK(outcome.answers[outcome.verdict.index].bytes[0] == 93); // the vetted address is the target
 
     // And the mirror: a name whose FIRST answer is private is refused outright.
     lookups = 0;
@@ -342,8 +437,20 @@ TEST_CASE("outbound: a name that resolves public THEN private is judged on ONE l
         return ++lookups == 1 ? std::vector{addr4(169, 254, 169, 254)}
                               : std::vector{addr4(93, 184, 216, 34)};
     };
-    CHECK(ob::vet_host(private_first, answers).status == ob::VetStatus::refused);
+    CHECK(ob::vet_host(private_first).verdict.status == ob::VetStatus::refused);
     CHECK(lookups == 1);
+}
+
+TEST_CASE("outbound: connect order tries IPv4 first and only judged addresses", "[shared][outbound]") {
+    ob::ResolvedAddress v6a;
+    v6a.is_v6 = true;
+    v6a.bytes = {0x26, 0x06, 0x47, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x11, 0x11};
+    const auto order = ob::connect_order({v6a, addr4(93, 184, 216, 34), addr4(1, 1, 1, 1)});
+    REQUIRE(order.size() == 3);
+    CHECK_FALSE(order[0].is_v6);
+    CHECK(order[0].bytes[0] == 93);
+    CHECK(order[1].bytes[0] == 1);
+    CHECK(order[2].is_v6);
 }
 
 // ── Bounded regular-file hash ───────────────────────────────────────────────────────────────────
@@ -433,7 +540,131 @@ TEST_CASE("bounded_file_hash: a regular file hashes while a FIFO or a directory 
     }
 }
 
-// ── The real ioc plugin, end to end ─────────────────────────────────────────────────────────────
+#endif // !_WIN32 (the POSIX bounded-hash descriptor tests)
+
+// ── http_client download: completeness and finalize rules (pure) ─────────────────────────────────
+
+namespace hc = yuzu::http_client;
+
+namespace {
+hc::DownloadObservation good_obs(std::uint64_t n) {
+    hc::DownloadObservation o;
+    o.transport_ok = true;
+    o.final_status = 200;
+    o.has_length = true;
+    o.declared_length = n;
+    o.body_size = n;
+    return o;
+}
+} // namespace
+
+TEST_CASE("http_client download: only a complete 2xx body is acceptable", "[shared][http_client]") {
+    CHECK(hc::download_failure(good_obs(10)).empty());
+
+    auto non2xx = good_obs(10);
+    non2xx.rejected_status = 404; // the response handler aborted the transfer
+    non2xx.transport_ok = false;
+    CHECK(hc::download_failure(non2xx) == "download failed: HTTP 404"); // the status, not "connection error"
+
+    auto status500 = good_obs(10);
+    status500.final_status = 500;
+    CHECK(hc::download_failure(status500) == "download failed: HTTP 500");
+    auto redirect = good_obs(10);
+    redirect.final_status = 302; // 3xx used to count as success
+    CHECK_FALSE(hc::download_failure(redirect).empty());
+
+    auto conn = good_obs(10);
+    conn.transport_ok = false;
+    CHECK(hc::download_failure(conn) == "download failed: HTTP connection error");
+
+    auto big = good_obs(10);
+    big.size_exceeded = true;
+    CHECK(hc::download_failure(big).find("maximum size") != std::string::npos);
+    auto oom = good_obs(10);
+    oom.out_of_memory = true;
+    CHECK(hc::download_failure(oom).find("out of memory") != std::string::npos);
+    auto tls = good_obs(10);
+    tls.https_unsupported = true;
+    CHECK(hc::download_failure(tls).find("HTTPS not supported") != std::string::npos);
+}
+
+TEST_CASE("http_client download: a truncated or length-less body is refused unless a hash verifies it",
+          "[shared][http_client]") {
+    // Declared 100, received 40: truncated.
+    auto cut = good_obs(100);
+    cut.body_size = 40;
+    CHECK(hc::download_failure(cut).find("shorter than Content-Length") != std::string::npos);
+
+    // Close-delimited, no Content-Length, no expected_hash: indistinguishable from a cut body.
+    auto no_len = good_obs(0);
+    no_len.has_length = false;
+    no_len.body_size = 40;
+    CHECK(hc::download_failure(no_len).find("not verifiable") != std::string::npos);
+    // ... unless an expected_hash will verify it, or the framing is chunked (httplib verifies it).
+    no_len.hash_will_verify = true;
+    CHECK(hc::download_failure(no_len).empty());
+    no_len.hash_will_verify = false;
+    no_len.chunked = true;
+    CHECK(hc::download_failure(no_len).empty());
+}
+
+TEST_CASE("http_client download: finalize verifies, then replaces atomically, or writes nothing",
+          "[shared][http_client]") {
+    yuzu::test::TempDir tmp{"yuzu_test_hcdl_"};
+    REQUIRE(fs::create_directory(tmp.path));
+    const auto dest = tmp.path / "payload.bin";
+    const std::string good = "new content";
+    const std::string good_hash = yuzu::shared::sha256_hex(good);
+    const auto read_all = [](const fs::path& p) {
+        std::ifstream in(p, std::ios::binary);
+        return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    };
+    const auto entries = [&] {
+        std::size_t n = 0;
+        for ([[maybe_unused]] const auto& e : fs::directory_iterator(tmp.path))
+            ++n;
+        return n;
+    };
+    { std::ofstream(dest, std::ios::binary) << "original"; }
+
+    // Hash MISMATCH: nothing written, the existing file is exactly as it was, no temp left behind.
+    auto bad = hc::finalize_download(good, std::string(64, '0'), dest);
+    CHECK(bad.status == hc::FinalizeStatus::hash_mismatch);
+    CHECK(bad.hash == good_hash);
+    CHECK(read_all(dest) == "original");
+    CHECK(entries() == 1);
+
+    // The pin is case-insensitive.
+    std::string upper = good_hash;
+    for (auto& c : upper)
+        if (c >= 'a' && c <= 'f') c = static_cast<char>(c - 'a' + 'A');
+    auto ok_upper = hc::finalize_download(good, upper, dest);
+    CHECK(ok_upper.status == hc::FinalizeStatus::ok);
+    CHECK(read_all(dest) == good);
+    CHECK(entries() == 1);
+
+    // No pin: the body is written.
+    auto no_pin = hc::finalize_download("other", "", dest);
+    CHECK(no_pin.status == hc::FinalizeStatus::ok);
+    CHECK(read_all(dest) == "other");
+
+    // write_file_atomic FAILURE: the destination's parent is a regular file, so the temp cannot be
+    // created. The failure is reported and the existing file at `dest` is untouched.
+    const auto blocker = tmp.path / "blocker";
+    { std::ofstream(blocker) << "i am a file"; }
+    auto wf = hc::finalize_download(good, "", blocker / "child.bin");
+    CHECK(wf.status == hc::FinalizeStatus::write_failed);
+    CHECK_FALSE(wf.message.empty());
+    CHECK(read_all(dest) == "other");
+}
+
+// ── The real plugins, end to end ────────────────────────────────────────────────────────────────
+//
+// These load the built plugin by path. A plugin library that cannot be found is a FAILURE, not a
+// skip: the plugins are link_depends of the test executable, so "not found" means the build wiring
+// broke, and a skip would turn every assertion below into a silent pass.
+
+#ifndef _WIN32
 
 namespace {
 
@@ -456,29 +687,39 @@ fs::path find_plugin(const std::string& name) {
     return {};
 }
 
+struct LoadedPlugin {
+    yuzu::agent::PluginHandle handle;
+    const YuzuPluginDescriptor* descriptor;
+};
+
+LoadedPlugin load_or_fail(const std::string& name) {
+    const auto path = find_plugin(name);
+    if (path.empty())
+        FAIL("plugin library '" << name << "' not found: it is a link_depends of the test executable");
+    auto handle = yuzu::agent::PluginHandle::load(path);
+    if (!handle.has_value())
+        FAIL("plugin '" << name << "' failed to load");
+    const auto* descriptor = handle->descriptor();
+    if (descriptor == nullptr)
+        FAIL("plugin '" << name << "' has no descriptor");
+    return LoadedPlugin{std::move(*handle), descriptor};
+}
+
+bool contains(const std::string& hay, const std::string& needle) {
+    return hay.find(needle) != std::string::npos;
+}
+
 } // namespace
 
-TEST_CASE("ioc plugin: file_hashes over a FIFO returns promptly and reports the path not hashed",
+TEST_CASE("ioc plugin: a FIFO returns promptly and is named in a coverage row",
           "[shared][local_path][ioc]") {
-    auto path = find_plugin("ioc");
-    if (path.empty()) {
-        WARN("ioc plugin library not found -- skipping");
-        return;
-    }
-    auto handle = yuzu::agent::PluginHandle::load(path);
-    REQUIRE(handle.has_value());
-    const auto* descriptor = handle->descriptor();
-    REQUIRE(descriptor != nullptr);
-
+    auto plugin = load_or_fail("ioc");
     yuzu::test::TempDir tmp{"yuzu_test_iocfifo_"};
     REQUIRE(fs::create_directory(tmp.path));
     const auto fifo = tmp.path / "trap.fifo";
     REQUIRE(::mkfifo(fifo.c_str(), 0600) == 0);
     const auto regular = tmp.path / "real.txt";
-    {
-        std::ofstream o(regular, std::ios::binary);
-        o << "hello world";
-    }
+    { std::ofstream(regular, std::ios::binary) << "hello world"; }
 
     const std::string paths = fifo.string() + "," + regular.string();
     const std::string want = yuzu::shared::sha256_hex("hello world");
@@ -486,111 +727,134 @@ TEST_CASE("ioc plugin: file_hashes over a FIFO returns promptly and reports the 
 
     yuzu::agent::LocalDispatcher dispatcher;
     // The old code opened the FIFO with std::ifstream and blocked the worker forever; the new code
-    // opens non-blocking, fstat()s the descriptor and moves on. Reaching this line IS the test.
-    const auto r = dispatcher.run(descriptor, "check", params);
+    // opens non-blocking and fstat()s the descriptor. Reaching the next line IS part of the test.
+    const auto r = dispatcher.run(plugin.descriptor, "check", params);
     CHECK(r.rc == 0);
     // The regular file still matches: hashing each file once did not drop the good path.
-    CHECK(r.captured.find("hash|" + want + "|true|") != std::string::npos);
+    CHECK(contains(r.captured, "hash|" + want + "|true|"));
+    // The FIFO is named, with its cause, in a structured row, and the summary says partial.
+    CHECK(contains(r.captured, "coverage|" + fifo.string() + "|not_examined|not_regular"));
+    CHECK(contains(r.captured, "coverage|*|partial|1 of 2 file path(s) examined"));
 
-    // With only the FIFO, the row must say a path was not hashed rather than read as a clean miss.
+    // Only the FIFO: the hash row is a miss that says it did not look everywhere.
     const std::string only_fifo = fifo.string();
     std::vector<YuzuParam> p2{{"file_hashes", want.c_str()}, {"file_paths", only_fifo.c_str()}};
-    const auto r2 = dispatcher.run(descriptor, "check", p2);
+    const auto r2 = dispatcher.run(plugin.descriptor, "check", p2);
     CHECK(r2.rc == 0);
-    CHECK(r2.captured.find("hash|" + want + "|false|") != std::string::npos);
-    CHECK(r2.captured.find("1 path(s) not hashed") != std::string::npos);
+    CHECK(contains(r2.captured, "hash|" + want + "|false|"));
+    CHECK(contains(r2.captured, "1 path(s) NOT examined"));
+}
+
+TEST_CASE("ioc plugin: a complete run says so, and a /proc file is never hashed",
+          "[shared][local_path][ioc]") {
+    auto plugin = load_or_fail("ioc");
+    yuzu::test::TempDir tmp{"yuzu_test_iocok_"};
+    REQUIRE(fs::create_directory(tmp.path));
+    const auto regular = tmp.path / "real.txt";
+    { std::ofstream(regular, std::ios::binary) << "hello world"; }
+    const std::string want = yuzu::shared::sha256_hex("hello world");
+    const std::string one = regular.string();
+    yuzu::agent::LocalDispatcher dispatcher;
+
+    std::vector<YuzuParam> ok{{"file_hashes", want.c_str()}, {"file_paths", one.c_str()}};
+    const auto r = dispatcher.run(plugin.descriptor, "check", ok);
+    CHECK(r.rc == 0);
+    CHECK(contains(r.captured, "coverage|*|complete|1 of 1 file path(s) examined"));
+    CHECK_FALSE(contains(r.captured, "not_examined"));
+
+    // /proc/kmsg is S_ISREG with st_size 0 and, read by root, consumes the kernel ring buffer. It
+    // is refused BEFORE any open (so this is deterministic for root and non-root alike).
+    const std::string kmsg = "/proc/kmsg";
+    std::vector<YuzuParam> pr{{"file_hashes", want.c_str()}, {"file_paths", kmsg.c_str()}};
+    const auto r2 = dispatcher.run(plugin.descriptor, "check", pr);
+    CHECK(r2.rc == 0);
+    CHECK(contains(r2.captured, "coverage|/proc/kmsg|not_examined|pseudo_filesystem"));
+    CHECK(contains(r2.captured, "coverage|*|partial|0 of 1 file path(s) examined"));
+}
+
+TEST_CASE("ioc plugin: a symlinked leaf is hashed through its resolved target",
+          "[shared][local_path][ioc]") {
+    // /bin/sh-style links must keep working (the old ifstream followed them); the leaf is opened
+    // no-follow only AFTER it has been resolved and judged.
+    auto plugin = load_or_fail("ioc");
+    yuzu::test::TempDir tmp{"yuzu_test_iocln_"};
+    REQUIRE(fs::create_directory(tmp.path));
+    const auto target = tmp.path / "target.txt";
+    { std::ofstream(target, std::ios::binary) << "hello world"; }
+    fs::create_symlink(target, tmp.path / "link.txt");
+    const std::string want = yuzu::shared::sha256_hex("hello world");
+    const std::string via_link = (tmp.path / "link.txt").string();
+    std::vector<YuzuParam> params{{"file_hashes", want.c_str()}, {"file_paths", via_link.c_str()}};
+    yuzu::agent::LocalDispatcher dispatcher;
+    const auto r = dispatcher.run(plugin.descriptor, "check", params);
+    CHECK(contains(r.captured, "hash|" + want + "|true|"));
+    CHECK(contains(r.captured, "coverage|*|complete|"));
 }
 
 TEST_CASE("ioc plugin: more file_paths than the cap is refused and not silently truncated",
           "[shared][local_path][ioc]") {
-    auto path = find_plugin("ioc");
-    if (path.empty()) {
-        WARN("ioc plugin library not found -- skipping");
-        return;
-    }
-    auto handle = yuzu::agent::PluginHandle::load(path);
-    REQUIRE(handle.has_value());
+    auto plugin = load_or_fail("ioc");
     std::string many;
     for (int i = 0; i < 65; ++i)
         many += (i ? ",/nonexistent/yuzu_test_" : "/nonexistent/yuzu_test_") + std::to_string(i);
     std::vector<YuzuParam> params{{"file_paths", many.c_str()}};
     yuzu::agent::LocalDispatcher dispatcher;
-    const auto r = dispatcher.run(handle->descriptor(), "check", params);
+    const auto r = dispatcher.run(plugin.descriptor, "check", params);
     CHECK(r.rc == 1);
-    CHECK(r.captured.find("Too many file_paths") != std::string::npos);
+    CHECK(contains(r.captured, "Too many file_paths"));
 }
 
-TEST_CASE("http_client plugin: a name that resolves to loopback is blocked and a download writes nothing",
+TEST_CASE("http_client plugin: a name that resolves to loopback is blocked before any request",
           "[shared][outbound][http_client]") {
-    auto path = find_plugin("http_client");
-    if (path.empty()) {
-        WARN("http_client plugin library not found -- skipping");
-        return;
-    }
-    auto handle = yuzu::agent::PluginHandle::load(path);
-    REQUIRE(handle.has_value());
+    auto plugin = load_or_fail("http_client");
     yuzu::agent::LocalDispatcher dispatcher;
 
     // `localhost` resolves (from /etc/hosts) to loopback: refused on the ONE lookup, no connect.
     std::vector<YuzuParam> get_params{{"url", "http://localhost:1/"}};
-    const auto g = dispatcher.run(handle->descriptor(), "get", get_params);
+    const auto g = dispatcher.run(plugin.descriptor, "get", get_params);
     CHECK(g.rc == 1);
-    CHECK(g.captured.find("SSRF blocked") != std::string::npos);
+    CHECK(contains(g.captured, "SSRF blocked"));
 
     // A refused download leaves an existing destination exactly as it was and creates no sibling.
     yuzu::test::TempDir tmp{"yuzu_test_httpdl_"};
     REQUIRE(fs::create_directory(tmp.path));
     const auto dest = tmp.path / "payload.bin";
-    {
-        std::ofstream o(dest, std::ios::binary);
-        o << "original";
-    }
+    { std::ofstream(dest, std::ios::binary) << "original"; }
     const std::string dest_s = dest.string();
-    std::vector<YuzuParam> dl{{"url", "http://localhost:1/x"},
-                              {"path", dest_s.c_str()},
-                              {"expected_hash", "00"}};
-    const auto d = dispatcher.run(handle->descriptor(), "download", dl);
+    std::vector<YuzuParam> dl{{"url", "http://localhost:1/x"}, {"path", dest_s.c_str()}};
+    const auto d = dispatcher.run(plugin.descriptor, "download", dl);
     CHECK(d.rc == 1);
+    CHECK(contains(d.captured, "SSRF blocked"));
     std::ifstream in(dest, std::ios::binary);
-    std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-    CHECK(content == "original");
+    CHECK(std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>()) ==
+          "original");
     std::size_t entries = 0;
     for ([[maybe_unused]] const auto& e : fs::directory_iterator(tmp.path))
         ++entries;
     CHECK(entries == 1);
+    // The completeness/hash/write rules themselves are covered by the pure http_client_download
+    // tests above: a real transfer cannot target loopback (the SSRF guard refuses it by design).
 }
 
-TEST_CASE("disk_space plugin: a local path is still measured",
+TEST_CASE("disk_space plugin: a local path is still measured and a symlink into a network mount is not a bypass",
           "[shared][local_path][disk_space]") {
-    auto path = find_plugin("disk_space");
-    if (path.empty()) {
-        WARN("disk_space plugin library not found -- skipping");
-        return;
-    }
-    auto handle = yuzu::agent::PluginHandle::load(path);
-    REQUIRE(handle.has_value());
+    auto plugin = load_or_fail("disk_space");
     yuzu::test::TempDir tmp{"yuzu_test_disk_"};
     REQUIRE(fs::create_directory(tmp.path));
     const std::string where = tmp.path.string();
     std::vector<YuzuParam> params{{"path", where.c_str()}};
     yuzu::agent::LocalDispatcher dispatcher;
-    const auto r = dispatcher.run(handle->descriptor(), "free", params);
+    const auto r = dispatcher.run(plugin.descriptor, "free", params);
     CHECK(r.rc == 0);
-    CHECK(r.captured.find("disk|") != std::string::npos);
+    CHECK(contains(r.captured, "disk|"));
 }
 
 TEST_CASE("processes plugin: list_hashed hashes this process's own image through the exe link",
           "[shared][local_path][processes]") {
 #ifdef __linux__
-    auto path = find_plugin("processes");
-    if (path.empty()) {
-        WARN("processes plugin library not found -- skipping");
-        return;
-    }
-    auto handle = yuzu::agent::PluginHandle::load(path);
-    REQUIRE(handle.has_value());
+    auto plugin = load_or_fail("processes");
     yuzu::agent::LocalDispatcher dispatcher;
-    const auto r = dispatcher.run(handle->descriptor(), "list_hashed");
+    const auto r = dispatcher.run(plugin.descriptor, "list_hashed");
     CHECK(r.rc == 0);
     const std::string mine = "proc|" + std::to_string(::getpid()) + "|";
     const auto at = r.captured.find(mine);
@@ -599,11 +863,11 @@ TEST_CASE("processes plugin: list_hashed hashes this process's own image through
     const std::string row = r.captured.substr(at, eol == std::string::npos ? std::string::npos : eol - at);
     // proc|pid|name|sha256|path -- the sha256 field is 64 lowercase hex characters.
     std::vector<std::string> f;
-    for (std::size_t s = 0;;) {
-        const auto bar = row.find('|', s);
-        f.push_back(row.substr(s, bar == std::string::npos ? std::string::npos : bar - s));
+    for (std::size_t s2 = 0;;) {
+        const auto bar = row.find('|', s2);
+        f.push_back(row.substr(s2, bar == std::string::npos ? std::string::npos : bar - s2));
         if (bar == std::string::npos) break;
-        s = bar + 1;
+        s2 = bar + 1;
     }
     REQUIRE(f.size() >= 5);
     CHECK(f[3].size() == 64);

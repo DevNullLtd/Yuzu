@@ -42,7 +42,7 @@
 #include "filesystem_acl_parsers.hpp"
 #include "filesystem_find_by_hash.hpp"
 #include <atomic_file_write.hpp> // yuzu::shared::write_file_atomic
-#include <local_path_policy.hpp> // yuzu::shared::local_path: UNC / device / non-fixed-drive refusal (F35)
+#include <local_path_policy.hpp> // yuzu::shared::local_path: UNC / device / non-fixed-drive refusal
 #include <network_fstype.hpp>
 
 #include <spdlog/spdlog.h>
@@ -124,19 +124,25 @@ using yuzu::filesystem::find_by_hash::kMaxHashFileSize;
 
 // ── Path validation ─────────────────────────────────────────────────────
 
-// Windows network/device refusal (F35). The agent runs as LocalSystem, so a `\\host\share\f`
-// path would make the machine account authenticate to that host and read from it, outside the
-// caller's per-device dispatch visibility. The shared predicate (agents/shared/local_path_policy.hpp;
-// find_by_hash applies the same drive-type rule to its root) judges the lexical spelling BEFORE any
-// filesystem call, and again on the canonical result (a junction, directory symlink or mapped drive
-// can resolve to a UNC target). POSIX: no mount-table read here -- validate_path runs several times
-// per action and operators legitimately read NFS paths; find_by_hash keeps its own mount guard.
-[[nodiscard]] bool path_refused_as_network([[maybe_unused]] std::string_view p) {
+// Windows network/device refusal. The agent runs as LocalSystem, so a `\\host\share\f` path would
+// make the machine account authenticate to that host and read from it, outside the caller's
+// per-device dispatch visibility. The shared predicate (agents/shared/local_path_policy.hpp;
+// find_by_hash applies the same drive-type rule to its root) judges the LEXICAL spelling BEFORE any
+// filesystem call, and again on the canonical result. RESIDUAL: the Windows decision is lexical, so
+// a junction or directory symlink to a share is followed by the canonicalising call itself before
+// the re-check can refuse it; this plugin does not open handle-relative. POSIX: no mount-table
+// check here -- validate_path runs several times per action and operators legitimately read NFS
+// paths; find_by_hash keeps its own mount guard.
+[[nodiscard]] yuzu::shared::local_path::Refusal path_refusal([[maybe_unused]] std::string_view p) {
 #ifdef _WIN32
-    return yuzu::shared::local_path::refused(yuzu::shared::local_path::local_path_refusal(p));
+    return yuzu::shared::local_path::local_path_refusal(p);
 #else
-    return false;
+    return yuzu::shared::local_path::Refusal::none;
 #endif
+}
+
+[[nodiscard]] bool path_refused_as_network(std::string_view p) {
+    return yuzu::shared::local_path::refused(path_refusal(p));
 }
 
 // Canonicalize a path and optionally enforce a base directory restriction.
@@ -827,10 +833,11 @@ private:
         auto base_dir = params.get("base_dir");
 
         // Refuse a network/device path UP FRONT. validate_path_or_parent answers "" both for
-        // "refused" and for "does not exist", and this action falls back to the RAW path below when
-        // base_dir is empty; without this check a refused UNC path would be stat'ed as LocalSystem.
-        if (path_refused_as_network(path)) {
-            ctx.write_output("error|path_refused:network_or_device");
+        // "refused" and for "does not exist", and this action used to fall back to the RAW caller
+        // path when base_dir was empty: a refused UNC path would then be stat'ed as LocalSystem.
+        if (const auto refusal = path_refusal(path); yuzu::shared::local_path::refused(refusal)) {
+            ctx.write_output(std::format(
+                "error|{}", yuzu::shared::local_path::refusal_token(refusal)));
             return 1;
         }
 
@@ -841,27 +848,29 @@ private:
             return 1;
         }
 
-        std::error_code ec;
         // No fallback to the raw caller path: an empty `validated` (refused, or neither the path
         // nor its parent exists) answers "does not exist" without touching it.
-        std::string path_str = validated;
-        bool exists = !path_str.empty() && fs::exists(path_str, ec);
-        ctx.write_output(std::format("exists|{}", exists ? "true" : "false"));
+        std::error_code ec;
+        const std::string path_str = validated;
+        const bool exists = !path_str.empty() && fs::exists(path_str, ec);
 
+        // ONE consistent answer: when the path exists, the canonical re-check runs BEFORE any
+        // result row, so a refusal is an error row alone and never `exists|true` followed by an
+        // error (a first-row parser must not see a true that the action then retracts).
+        std::string check_path;
         if (exists) {
-            // Re-validate with canonical now that we know it exists
             auto canon = validate_path(path, base_dir);
-            if (canon.empty() && !base_dir.empty()) {
-                ctx.write_output("error|path resolves outside allowed base directory");
-                return 1;
-            }
             if (canon.empty()) {
-                // Fail closed: the canonical re-check refused (or could not resolve) the path.
-                ctx.write_output("error|path is not accessible or was refused");
+                ctx.write_output(base_dir.empty()
+                                     ? "error|path is not accessible or was refused"
+                                     : "error|path resolves outside allowed base directory");
                 return 1;
             }
-            auto& check_path = canon;
+            check_path = std::move(canon);
+        }
 
+        ctx.write_output(std::format("exists|{}", exists ? "true" : "false"));
+        if (exists) {
             if (fs::is_regular_file(check_path, ec)) {
                 ctx.write_output("type|file");
                 auto sz = fs::file_size(check_path, ec);

@@ -33,7 +33,7 @@
 
 namespace yuzu::shared {
 
-enum class HashStatus : std::uint8_t { ok, unreadable, not_regular, oversize, timeout };
+enum class HashStatus : std::uint8_t { ok, unreadable, not_regular, oversize, timeout, symlink_refused };
 
 struct BoundedHash {
     HashStatus status{HashStatus::unreadable};

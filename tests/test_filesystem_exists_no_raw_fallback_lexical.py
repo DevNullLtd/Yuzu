@@ -16,8 +16,14 @@ class ExistsNoRawFallback(unittest.TestCase):
 
     def test_refusal_precedes_validation(self):
         b = self.body()
-        self.assertIn("path_refused_as_network(path)", b)
-        self.assertLess(b.index("path_refused_as_network(path)"), b.index("validate_path_or_parent("))
+        self.assertIn("path_refusal(path)", b)
+        self.assertLess(b.index("path_refusal(path)"), b.index("validate_path_or_parent("))
+
+    def test_exists_row_follows_the_canonical_recheck(self):
+        # ONE consistent answer: the canonical re-check runs before any `exists|` row, so a refusal
+        # is an error row alone and never `exists|true` followed by an error.
+        b = self.body()
+        self.assertLess(b.index("validate_path(path, base_dir)"), b.index('"exists|{}"'))
 
     def test_no_raw_path_fallback(self):
         b = self.body()

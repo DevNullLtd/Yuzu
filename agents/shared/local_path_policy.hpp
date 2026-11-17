@@ -12,31 +12,45 @@
 // also accepts the `\Device\HarddiskVolume<n>` shape); this header is the one every OTHER
 // plugin path sink extends. EXTEND it, never copy the checks into a plugin.
 //
-// WHAT IT DECIDES (lexically, before any filesystem call):
-//   Windows spelling -- refuse `\\`/`//` (UNC, `\\?\UNC\`, `\\.\`, `\\?\GLOBALROOT\`), the
-//     `\??\` and `\Device\` namespaces, a reserved DOS device name in any component, and a drive
-//     letter whose drive type (injected, GetDriveTypeW in the OS glue) is not DRIVE_FIXED
-//     (a mapped network drive, removable, optical, RAM disk, unknown, no-root all refuse).
-//     `\\?\X:\...` is the long-path spelling of a drive-letter path and is judged like `X:\...`.
-//     A path with no drive letter (relative, or rooted at the current drive) is allowed: it
-//     resolves against the agent's working directory, which is local.
-//   POSIX -- the lexically normalised absolute path on or under a network mount named by the
-//     mount table the caller read (network_fstype.hpp).
+// WHAT IT DECIDES (before any filesystem call that could reach the target):
+//   Windows spelling -- LEXICAL: refuse `\\`/`//` (UNC, `\\?\UNC\`, `\\.\`, `\\?\GLOBALROOT\`),
+//     the `\??\` and `\Device\` namespaces, a reserved DOS device name in any component
+//     (CON PRN AUX NUL COM1-9 LPT1-9 and the superscript COM/LPT 1-3 spellings), and a drive letter
+//     (`X:`, `X:file`, `X:\...`, `\\?\X:\...`) whose drive type (injected; GetDriveTypeW in the OS
+//     glue) is not DRIVE_FIXED (a mapped network drive, removable, optical, RAM disk, unknown,
+//     no-root all refuse). A path with no drive letter (relative, or rooted at the current drive)
+//     is allowed: it resolves against the agent's working directory.
+//   POSIX -- RESOLVING: the absolute path is walked component by component (`lstat`/`readlink`, at
+//     most 40 symlink hops, never a stat below a network mount: each accumulated prefix is judged
+//     against the mount table BEFORE it is stat'ed), so a symlink anywhere in the path, the leaf
+//     included, that points under an NFS/CIFS/autofs/... mount (network_fstype.hpp) is refused.
+//     The resolved path is returned so a caller can apply a further policy to it (ioc refuses
+//     /proc /sys /dev for hashing).
 //
-// WHAT IT DOES NOT DECIDE. A symlink or a Windows junction/directory symlink inside a local
-// tree can still point at a share; a caller that resolves the path (fs::canonical) re-judges the
-// RESULT with the same predicate (the plugins do). A stacked filesystem over a dead network
-// mount, an unlisted network type and a mount that appears after the table was read are the
-// residuals network_fstype.hpp documents. Nothing here replaces an open that does not follow
-// reparse points / symlinks where the caller can use one.
+// WHAT IT DOES NOT DECIDE (residuals, stated so no caller or document claims more):
+//   * Windows link traversal. A junction or directory symlink to a share is FOLLOWED by a path-
+//     resolving open; the Windows decision is lexical and the plugins that re-judge a canonical
+//     result do so AFTER the canonicalising call has already touched the link. Only a caller that
+//     opens handle-relative with no reparse point (win_no_reparse_open.hpp: ioc, procfetch) never
+//     follows one. filesystem (validate_path and its canonical re-check) and disk_space are
+//     lexical-refusal-only on Windows; link traversal is a residual there.
+//   * POSIX: a stacked filesystem (overlay or ecryptfs over a network mount), a network type the
+//     deny-list does not name, a bind-mounted NFS subdirectory whose mount point is not itself in
+//     the table, and a mount that appears after the table was read (network_fstype.hpp).
+//   * Time of check versus use: the judgement is not an open. A caller that opens the path should
+//     still open the leaf no-follow and fstat the descriptor.
 //
-// The decision functions are pure and run in the unit suite on every host; the OS glue at the
-// bottom (`local_path_refusal`) is the one place that asks the OS for a drive type or the mount
-// table, and FAILS CLOSED (`Refusal::mount_table_unreadable`) when the POSIX table cannot be read.
+// Read the mount table ONCE per action: construct a `LocalPathGuard` and judge every path with it
+// (the one-shot `local_path_refusal` re-reads /proc/self/mountinfo, up to 16 MiB, per call). The
+// pure decision functions run in the unit suite on every host; the OS glue is the one place that
+// asks the OS for a drive type or the mount table and FAILS CLOSED
+// (`Refusal::mount_table_unreadable`) when the POSIX table cannot be read.
 #pragma once
 
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <filesystem>
 #include <string>
 #include <string_view>
@@ -44,6 +58,11 @@
 #include <vector>
 
 #include "network_fstype.hpp"
+
+#ifndef _WIN32
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -123,6 +142,13 @@ namespace detail {
     }
     if (stem.size() == 4 && (istarts_with(stem, "com") || istarts_with(stem, "lpt")) &&
         stem[3] >= '1' && stem[3] <= '9')
+        return true;
+    // COM1-3 and LPT1-3 are also reserved in their superscript spellings (U+00B9, U+00B2, U+00B3;
+    // UTF-8 C2 B9 / C2 B2 / C2 B3) on Windows 10 and later.
+    if (stem.size() == 5 && (istarts_with(stem, "com") || istarts_with(stem, "lpt")) &&
+        static_cast<unsigned char>(stem[3]) == 0xC2 &&
+        (static_cast<unsigned char>(stem[4]) == 0xB9 || static_cast<unsigned char>(stem[4]) == 0xB2 ||
+         static_cast<unsigned char>(stem[4]) == 0xB3))
         return true;
     return false;
 }
@@ -231,49 +257,174 @@ template <class DriveTypeFn>
     return posix_under_mount(norm, network_mounts) ? Refusal::network_or_device : Refusal::none;
 }
 
+#ifndef _WIN32
+
+/// A path that lies on or under /proc, /sys or /dev (already resolved). Hashing such a file is not
+/// a file read: /proc/kmsg consumes the kernel ring buffer, a /dev node can block or have side
+/// effects, /proc and /sys pseudo-files report size 0 and are unbounded. Segment boundary.
+[[nodiscard]] inline bool posix_pseudo_fs_path(std::string_view resolved) noexcept {
+    for (const std::string_view root : {"/proc", "/sys", "/dev"}) {
+        if (resolved == root || (resolved.size() > root.size() && resolved.starts_with(root) &&
+                                 resolved[root.size()] == '/'))
+            return true;
+    }
+    return false;
+}
+
+struct Judged {
+    Refusal refusal{Refusal::none};
+    std::string resolved; ///< the fully resolved absolute path (POSIX, only when refusal == none)
+};
+
+/// The POSIX decision with symlink resolution (see the banner). `network_mounts` are mount points
+/// as physical paths. Never stats a component on or under a network mount: each accumulated prefix
+/// is judged before it is lstat'ed. A component that does not exist ends the walk; the remainder
+/// is appended lexically and judged once more. Any other lstat/readlink failure, more than 40
+/// symlink hops, or an uninterpretable path fails closed (`unresolvable`).
+[[nodiscard]] inline Judged posix_judge(std::string_view path,
+                                        const std::vector<std::string>& network_mounts) {
+    if (path.empty())
+        return {};
+    constexpr int kMaxHops = 40;
+    std::error_code ec;
+    const std::filesystem::path abs = std::filesystem::absolute(std::filesystem::path(path), ec);
+    if (ec)
+        return {Refusal::unresolvable, {}};
+
+    std::deque<std::string> pending;
+    for (const auto& part : abs)
+        if (const auto c = part.string(); !c.empty() && c != "/")
+            pending.push_back(c);
+
+    std::string cur = "/";
+    const auto parent_of = [](std::string& p) {
+        if (p == "/")
+            return;
+        const auto slash = p.rfind('/');
+        p = slash == 0 ? "/" : p.substr(0, slash);
+    };
+    int hops = 0;
+    while (!pending.empty()) {
+        const std::string c = std::move(pending.front());
+        pending.pop_front();
+        if (c == "." || c.empty())
+            continue;
+        if (c == "..") {
+            parent_of(cur);
+            continue;
+        }
+        std::string next = cur == "/" ? "/" + c : cur + "/" + c;
+        if (posix_under_mount(next, network_mounts))
+            return {Refusal::network_or_device, {}};
+        struct stat st{};
+        if (::lstat(next.c_str(), &st) != 0) {
+            if (errno != ENOENT && errno != ENOTDIR)
+                return {Refusal::unresolvable, {}};
+            // Nothing exists from here down: the remainder cannot be a link. Judge it lexically.
+            cur = std::move(next);
+            while (!pending.empty()) {
+                const std::string r = std::move(pending.front());
+                pending.pop_front();
+                if (r == "." || r.empty())
+                    continue;
+                if (r == "..")
+                    parent_of(cur);
+                else
+                    cur = cur == "/" ? "/" + r : cur + "/" + r;
+            }
+            if (posix_under_mount(cur, network_mounts))
+                return {Refusal::network_or_device, {}};
+            return {Refusal::none, std::move(cur)};
+        }
+        if (S_ISLNK(st.st_mode)) {
+            if (++hops > kMaxHops)
+                return {Refusal::unresolvable, {}};
+            char buf[4096];
+            const ssize_t n = ::readlink(next.c_str(), buf, sizeof(buf));
+            if (n <= 0 || static_cast<std::size_t>(n) >= sizeof(buf))
+                return {Refusal::unresolvable, {}};
+            const std::string target(buf, static_cast<std::size_t>(n));
+            if (target.front() == '/')
+                cur = "/";
+            // Splice the target's components in front of what is left, in order.
+            std::deque<std::string> parts;
+            std::size_t start = 0;
+            while (start <= target.size()) {
+                const auto slash = target.find('/', start);
+                parts.push_back(target.substr(start, slash == std::string::npos ? std::string::npos
+                                                                                : slash - start));
+                if (slash == std::string::npos)
+                    break;
+                start = slash + 1;
+            }
+            for (auto it = parts.rbegin(); it != parts.rend(); ++it)
+                pending.push_front(*it);
+            continue;
+        }
+        cur = std::move(next);
+    }
+    return {Refusal::none, std::move(cur)};
+}
+
+#endif // !_WIN32
+
 // -- OS glue ------------------------------------------------------------------------------------
 // The one place that asks the OS. Not exercised by the unit suite on Windows/macOS.
 
-#if defined(_WIN32)
-
-[[nodiscard]] inline Refusal local_path_refusal(std::string_view path) {
-    return win_refusal(path, [](char letter) -> unsigned {
-        const wchar_t root[4] = {static_cast<wchar_t>(static_cast<unsigned char>(letter)), L':',
-                                 L'\\', L'\0'};
-        return ::GetDriveTypeW(root);
-    });
-}
-
-#elif defined(__linux__)
-
-[[nodiscard]] inline Refusal local_path_refusal(std::string_view path) {
-    if (path.empty())
-        return Refusal::none;
-    // /proc/self/mountinfo reports st_size 0, so the reader streams to the cap (the 16 MiB bound
-    // find_by_hash and the runtimes walk use). An unreadable or oversized table is a refusal: a
-    // guard that cannot see the mounts must not read as "no network mounts".
-    constexpr std::size_t kMountinfoCap = 16 * 1024 * 1024;
-    const auto table = yuzu::shared::read_file_no_follow("/proc/self/mountinfo", kMountinfoCap);
-    if (!table.ok())
-        return Refusal::mount_table_unreadable;
-    return posix_refusal(path, yuzu::shared::network_mount_points(table.data));
-}
-
+/// One judge per ACTION: the mount table (Linux /proc/self/mountinfo, macOS getmntinfo) is read
+/// ONCE at construction and every path is judged against that snapshot. Windows has no table; the
+/// drive type is asked per drive-letter path (GetDriveTypeW is cheap).
+class LocalPathGuard {
+public:
+    LocalPathGuard() {
+#if defined(__linux__)
+        // /proc/self/mountinfo reports st_size 0, so the reader streams to the cap (the 16 MiB
+        // bound find_by_hash and the runtimes walk use). An unreadable or oversized table is a
+        // refusal: a guard that cannot see the mounts must not read as "no network mounts".
+        constexpr std::size_t kMountinfoCap = 16 * 1024 * 1024;
+        const auto table = yuzu::shared::read_file_no_follow("/proc/self/mountinfo", kMountinfoCap);
+        table_ok_ = table.ok();
+        if (table_ok_)
+            mounts_ = yuzu::shared::network_mount_points(table.data);
 #elif defined(__APPLE__)
-
-[[nodiscard]] inline Refusal local_path_refusal(std::string_view path) {
-    if (path.empty())
-        return Refusal::none;
-    const auto mounts = yuzu::shared::read_macos_network_mounts();
-    if (!mounts)
-        return Refusal::mount_table_unreadable;
-    return posix_refusal(path, *mounts);
-}
-
-#else
-
-[[nodiscard]] inline Refusal local_path_refusal(std::string_view) { return Refusal::none; }
-
+        const auto mounts = yuzu::shared::read_macos_network_mounts();
+        table_ok_ = mounts.has_value();
+        if (mounts)
+            mounts_ = *mounts;
 #endif
+    }
+
+#if defined(_WIN32)
+    [[nodiscard]] Refusal refusal(std::string_view path) const {
+        return win_refusal(path, [](char letter) -> unsigned {
+            const wchar_t root[4] = {static_cast<wchar_t>(static_cast<unsigned char>(letter)), L':',
+                                     L'\\', L'\0'};
+            return ::GetDriveTypeW(root);
+        });
+    }
+#elif defined(__linux__) || defined(__APPLE__)
+    [[nodiscard]] Judged judge(std::string_view path) const {
+        if (path.empty())
+            return {};
+        if (!table_ok_)
+            return {Refusal::mount_table_unreadable, {}};
+        return posix_judge(path, mounts_);
+    }
+    [[nodiscard]] Refusal refusal(std::string_view path) const { return judge(path).refusal; }
+#else
+    [[nodiscard]] Refusal refusal(std::string_view) const { return Refusal::none; }
+#endif
+
+private:
+#if defined(__linux__) || defined(__APPLE__)
+    bool table_ok_{false};
+    std::vector<std::string> mounts_;
+#endif
+};
+
+/// One-shot form for a caller that judges exactly one path (reads the table each call).
+[[nodiscard]] inline Refusal local_path_refusal(std::string_view path) {
+    return LocalPathGuard{}.refusal(path);
+}
 
 } // namespace yuzu::shared::local_path

@@ -32,7 +32,7 @@ spec:
       expected_hash:
         type: string
         displayName: Expected SHA256 Hash
-        description: Optional SHA256 hash for verification.
+        description: Optional SHA256 hash (hex, case-insensitive) the downloaded body must match before anything is written. Without it the response must declare its length (Content-Length, or chunked framing) so a truncated transfer is refused.
   result:
     columns:
       - name: status
@@ -47,12 +47,12 @@ spec:
         platforms: [windows, linux, darwin]
       - name: size
         type: int64
-        description: 'Size in bytes of the downloaded file on disk, read back with std::filesystem::file_size after the write completes. Values: non-negative integer, bytes.'
+        description: 'Size in bytes of the downloaded body, which is the size of the file now at the destination (the body is held in memory, verified, then written in one atomic replace). Values: non-negative integer, bytes.'
         example: 559
         platforms: [windows, linux, darwin]
       - name: hash
         type: string
-        description: 'Lowercase hex SHA-256 digest of the downloaded file, computed via BCrypt on Windows and OpenSSL EVP on Linux/macOS. Values: 64-character lowercase hex string.'
+        description: 'Lowercase hex SHA-256 digest of the downloaded body (the shared in-memory SHA-256, identical on every OS), the value compared with expected_hash before anything is written. Values: 64-character lowercase hex string.'
         example: ff67a9d764d6a2367a187734e697f6a53217db9a21c101d410a113ca871a299d
         platforms: [windows, linux, darwin]
   approval:

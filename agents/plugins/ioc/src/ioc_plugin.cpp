@@ -40,6 +40,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #ifdef _WIN32
@@ -68,12 +69,16 @@
 
 // After the platform headers: local_path_policy.hpp pulls <windows.h> on Windows, which must follow
 // <winsock2.h> (included above).
-#include <bounded_file_hash.hpp> // regular-file-only, capped, deadline-bounded SHA-256 (F36)
-#include <local_path_policy.hpp> // refuse UNC / device / network-mount paths before any open (F36/F65)
+#include <bounded_file_hash.hpp> // regular-file-only, capped, deadline-bounded SHA-256
+#include <local_path_policy.hpp> // refuse UNC / device / network-mount paths before any open
 
 #ifndef _WIN32
 #include <fcntl.h>
 #include <unistd.h>
+
+#include <yuzu/agent/scoped_fd.hpp> // yuzu::agent::ScopedFd: the shared fd owner
+#else
+#include <win_no_reparse_open.hpp> // handle-relative OBJ_DONT_REPARSE open
 #endif
 
 namespace {
@@ -438,77 +443,151 @@ bool check_dns_cache(std::string_view domain) {
 
 #endif // _WIN32
 
-// ── File existence and size check ────────────────────────────────────────────
-
-struct FileCheckResult {
-    bool exists{};
-    uint64_t size{};
-    bool refused{}; ///< the path was a network/device path and was never touched
-    std::string refusal;
-};
-
-// A path is judged lexically BEFORE any filesystem call (F65): a UNC path makes a LocalSystem
-// agent authenticate to the named host, and a path under a network mount can pin the worker on a
-// dead server. A refused path is reported as refused (never as "not found": that would read as a
-// clean absence) and the caller's path text is not echoed into the reason.
-FileCheckResult check_file_path(std::string_view path) {
-    if (const auto refusal = yuzu::shared::local_path::local_path_refusal(path);
-        yuzu::shared::local_path::refused(refusal)) {
-        return {false, 0, true, std::string{yuzu::shared::local_path::refusal_token(refusal)}};
-    }
-    std::error_code ec;
-    auto status = std::filesystem::status(std::filesystem::path(path), ec);
-    if (ec || !std::filesystem::exists(status)) {
-        return {false, 0};
-    }
-    auto fsize = std::filesystem::file_size(std::filesystem::path(path), ec);
-    if (ec)
-        fsize = 0;
-    return {true, fsize};
-}
-
-// ── SHA-256 file hash computation ────────────────────────────────────────────
+// ── File existence, size and hash: judge once, say what was not examined ─────────────────────────
 //
-// A file named by the operator is hashed only if it is a REGULAR file, at most kMaxHashFileBytes
-// long, within a wall-clock deadline (F36): the previous unbounded std::ifstream read blocked a
-// command worker forever on a FIFO or device node and read arbitrarily large files. POSIX opens
-// the leaf no-follow and non-blocking and fstats the DESCRIPTOR; Windows has already refused
-// UNC/device/non-fixed-drive paths (check_file_path / hash_target's caller) and checks the file
-// type and size before opening.
+// Every file_paths entry is judged ONCE per action by agents/shared/local_path_policy.hpp
+// (LocalPathGuard: the mount table is read once, POSIX symlinks are resolved before anything under
+// a network mount is touched) BEFORE any filesystem call that could reach it: a UNC path makes a
+// LocalSystem agent authenticate to the named host, and a path under a network mount can pin the
+// worker on a dead server. A path that was NOT examined is never reported as a clean absence:
+// the `file`/`hash` rows still carry their historical shape and every not-examined path also gets a
+// structured `coverage|<path>|not_examined|<cause>` row, plus a closing `coverage|*|complete|...`
+// or `coverage|*|partial|...` row, so a consumer can tell "checked, not present" from "not
+// checked". `cause` is a closed set: network_or_device, non_fixed_drive, mount_table_unreadable,
+// unresolvable, pseudo_filesystem, symlink, reparse_or_not_a_file, not_regular, too_large,
+// timeout, unreadable.
+//
+// Hashing reads a file only if it is REGULAR, at most kMaxHashFileBytes long, inside one
+// wall-clock deadline for the whole action. POSIX hashes the fully RESOLVED path (leaf included)
+// opened no-follow and non-blocking and fstat()s the DESCRIPTOR; a resolved path under /proc,
+// /sys or /dev is never hashed (/proc/kmsg consumes the kernel ring buffer). Windows opens
+// handle-relative with no reparse point followed (win_no_reparse_open.hpp), so a junction or
+// directory symlink to a share is never traversed (and a directory or reparse-point leaf reads as
+// `reparse_or_not_a_file`).
 constexpr std::uint64_t kMaxHashFileBytes = 512ull * 1024 * 1024; // 512 MiB
 constexpr std::size_t kMaxFilePaths = 64;
 constexpr std::size_t kMaxFileHashes = 256;
 constexpr auto kHashDeadline = std::chrono::seconds(60); // one budget for the whole action
 
-yuzu::shared::BoundedHash hash_target(const std::filesystem::path& path,
-                                      yuzu::shared::HashClock::time_point deadline) {
-#ifndef _WIN32
-    const int fd = ::open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY | O_CLOEXEC);
-    if (fd < 0)
-        return {yuzu::shared::HashStatus::unreadable, {}};
-    struct FdCloser {
-        int fd;
-        ~FdCloser() { ::close(fd); }
-    } closer{fd};
-    return yuzu::shared::hash_fd_regular(fd, kMaxHashFileBytes, deadline);
+/// The closed `cause` vocabulary of a not-examined path.
+std::string_view refusal_cause(yuzu::shared::local_path::Refusal r) {
+    using R = yuzu::shared::local_path::Refusal;
+    switch (r) {
+    case R::network_or_device: return "network_or_device";
+    case R::non_fixed_drive: return "non_fixed_drive";
+    case R::mount_table_unreadable: return "mount_table_unreadable";
+    case R::unresolvable: return "unresolvable";
+    case R::none: break;
+    }
+    return "unreadable";
+}
+
+std::string_view hash_cause(yuzu::shared::HashStatus st) {
+    using S = yuzu::shared::HashStatus;
+    switch (st) {
+    case S::not_regular: return "not_regular";
+    case S::oversize: return "too_large";
+    case S::timeout: return "timeout";
+    case S::symlink_refused: return "symlink";
+    case S::unreadable: return "unreadable";
+    case S::ok: break;
+    }
+    return "unreadable";
+}
+
+/// One file_paths entry after judgement. `cause` empty = judged local and safe to touch.
+struct PathState {
+    std::string path;
+    std::string cause;    ///< non-empty: not examined, and why
+    std::string resolved; ///< POSIX: the fully resolved path to open (hash/stat)
+    bool pseudo{false};   ///< POSIX: resolved under /proc, /sys or /dev (never hashed)
+};
+
+PathState judge_path(const yuzu::shared::local_path::LocalPathGuard& guard, const std::string& path) {
+    PathState st;
+    st.path = path;
+#ifdef _WIN32
+    if (const auto r = guard.refusal(path); yuzu::shared::local_path::refused(r))
+        st.cause = std::string{refusal_cause(r)};
+    st.resolved = path;
+#else
+    const auto j = guard.judge(path);
+    if (yuzu::shared::local_path::refused(j.refusal)) {
+        st.cause = std::string{refusal_cause(j.refusal)};
+    } else {
+        st.resolved = j.resolved.empty() ? path : j.resolved;
+        st.pseudo = yuzu::shared::local_path::posix_pseudo_fs_path(st.resolved);
+    }
+#endif
+    return st;
+}
+
+struct FileCheckResult {
+    bool exists{};
+    uint64_t size{};
+    std::string not_examined; ///< cause, when the path was not examined
+};
+
+FileCheckResult check_file_path(const PathState& st) {
+    if (!st.cause.empty())
+        return {false, 0, st.cause};
+#ifdef _WIN32
+    // Handle-relative, no reparse point followed: a junction or directory symlink to a share is
+    // never traversed. A directory leaf is not a file the IOC check can describe.
+    const auto opened = yuzu::win::open_file_no_reparse(yuzu::win::to_wide(st.resolved));
+    if (opened.status == yuzu::win::NoReparseOpen::absent)
+        return {false, 0, {}};
+    if (opened.status != yuzu::win::NoReparseOpen::ok)
+        return {false, 0, "reparse_or_not_a_file"};
+    LARGE_INTEGER sz{};
+    if (!::GetFileSizeEx(opened.file.get(), &sz))
+        return {true, 0, {}};
+    return {true, static_cast<std::uint64_t>(sz.QuadPart), {}};
 #else
     std::error_code ec;
-    if (!std::filesystem::is_regular_file(path, ec) || ec)
-        return {yuzu::shared::HashStatus::not_regular, {}};
-    const auto size = std::filesystem::file_size(path, ec);
+    auto status = std::filesystem::status(std::filesystem::path(st.resolved), ec);
+    if (ec || !std::filesystem::exists(status)) {
+        return {false, 0, {}};
+    }
+    auto fsize = std::filesystem::file_size(std::filesystem::path(st.resolved), ec);
     if (ec)
+        fsize = 0;
+    return {true, fsize, {}};
+#endif
+}
+
+yuzu::shared::BoundedHash hash_target(const std::string& resolved,
+                                      yuzu::shared::HashClock::time_point deadline) {
+#ifndef _WIN32
+    yuzu::agent::ScopedFd fd{
+        ::open(resolved.c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY | O_CLOEXEC)};
+    if (!fd) {
+        return {errno == ELOOP ? yuzu::shared::HashStatus::symlink_refused
+                               : yuzu::shared::HashStatus::unreadable,
+                {}};
+    }
+    return yuzu::shared::hash_fd_regular(fd.get(), kMaxHashFileBytes, deadline);
+#else
+    const auto opened = yuzu::win::open_file_no_reparse(yuzu::win::to_wide(resolved));
+    if (opened.status != yuzu::win::NoReparseOpen::ok)
+        return {opened.status == yuzu::win::NoReparseOpen::absent
+                    ? yuzu::shared::HashStatus::unreadable
+                    : yuzu::shared::HashStatus::symlink_refused,
+                {}};
+    const HANDLE h = opened.file.get();
+    if (::GetFileType(h) != FILE_TYPE_DISK)
+        return {yuzu::shared::HashStatus::not_regular, {}};
+    LARGE_INTEGER sz{};
+    if (!::GetFileSizeEx(h, &sz))
         return {yuzu::shared::HashStatus::unreadable, {}};
-    if (size > kMaxHashFileBytes)
+    if (static_cast<std::uint64_t>(sz.QuadPart) > kMaxHashFileBytes)
         return {yuzu::shared::HashStatus::oversize, {}};
-    std::ifstream f(path, std::ios::binary);
-    if (!f.is_open())
-        return {yuzu::shared::HashStatus::unreadable, {}};
     return yuzu::shared::hash_stream_bounded(
-        [&f](unsigned char* buf, std::size_t len) -> long long {
-            f.read(reinterpret_cast<char*>(buf), static_cast<std::streamsize>(len));
-            if (f.bad())
+        [h](unsigned char* buf, std::size_t len) -> long long {
+            DWORD got = 0;
+            if (!::ReadFile(h, buf, static_cast<DWORD>(len), &got, nullptr))
                 return -1;
-            return static_cast<long long>(f.gcount());
+            return static_cast<long long>(got);
         },
         kMaxHashFileBytes, deadline);
 #endif
@@ -581,8 +660,13 @@ void check_domains(yuzu::CommandContext& ctx, const std::vector<std::string>& do
     }
 }
 
-void check_file_hashes(yuzu::CommandContext& ctx, const std::vector<std::string>& hashes,
-                       const std::vector<std::string>& search_paths) {
+/// Returns (path, cause) for every path that hashing could NOT examine beyond the judgement
+/// (pseudo filesystem, symlink, not regular, too large, timeout, unreadable).
+using HashCauses = std::vector<std::pair<std::string, std::string>>;
+
+HashCauses check_file_hashes(yuzu::CommandContext& ctx, const std::vector<std::string>& hashes,
+                             const std::vector<PathState>& search_paths) {
+    HashCauses causes;
     // Build a set of paths to scan. If file_paths were provided, hash those.
     // Otherwise report that no target files were specified for hash matching.
     if (search_paths.empty()) {
@@ -591,28 +675,35 @@ void check_file_hashes(yuzu::CommandContext& ctx, const std::vector<std::string>
                 std::format("hash|{}|false|No target file paths specified for hash comparison",
                             escape_pipes(hash)));
         }
-        return;
+        return causes;
     }
 
     // Hash each target file ONCE (not once per IOC hash), within one shared deadline, then compare
-    // every IOC hash against the results. A refused (network/device) path, a non-regular or
-    // oversized file and a timeout leave the path unhashed; the rows say how many were skipped
-    // so "No matching files found" is never read as "every path was checked".
+    // every IOC hash against the results. A path that is not hashed is counted here and ALSO named
+    // with its cause in a `coverage` row (emit_coverage), so "No matching files found" is never
+    // read as "every path was checked".
     const auto deadline = yuzu::shared::HashClock::now() + kHashDeadline;
     std::unordered_map<std::string, std::string> hash_of_path; // path -> sha256 (hashed only)
     std::size_t not_hashed = 0;
-    for (const auto& path : search_paths) {
-        if (hash_of_path.contains(path))
+    for (const auto& st : search_paths) {
+        if (hash_of_path.contains(st.path))
             continue;
-        if (yuzu::shared::local_path::refused(yuzu::shared::local_path::local_path_refusal(path))) {
+        if (!st.cause.empty()) {
             ++not_hashed;
             continue;
         }
-        auto r = hash_target(std::filesystem::path(path), deadline);
-        if (r.status == yuzu::shared::HashStatus::ok)
-            hash_of_path.emplace(path, std::move(r.hex));
-        else
+        if (st.pseudo) {
             ++not_hashed;
+            causes.emplace_back(st.path, "pseudo_filesystem");
+            continue;
+        }
+        auto r = hash_target(st.resolved, deadline);
+        if (r.status == yuzu::shared::HashStatus::ok) {
+            hash_of_path.emplace(st.path, std::move(r.hex));
+        } else {
+            ++not_hashed;
+            causes.emplace_back(st.path, std::string{hash_cause(r.status)});
+        }
     }
 
     for (const auto& hash : hashes) {
@@ -624,13 +715,13 @@ void check_file_hashes(yuzu::CommandContext& ctx, const std::vector<std::string>
         std::transform(search_hash.begin(), search_hash.end(), search_hash.begin(),
                        [](unsigned char c) { return std::tolower(c); });
 
-        for (const auto& path : search_paths) {
-            const auto it = hash_of_path.find(path);
+        for (const auto& st : search_paths) {
+            const auto it = hash_of_path.find(st.path);
             if (it == hash_of_path.end())
                 continue;
             if (it->second == search_hash) {
                 matched = true;
-                detail = std::format("Hash match in: {}", path);
+                detail = std::format("Hash match in: {}", st.path);
                 break;
             }
         }
@@ -638,31 +729,57 @@ void check_file_hashes(yuzu::CommandContext& ctx, const std::vector<std::string>
         if (!matched) {
             detail = not_hashed == 0
                          ? std::string{"No matching files found"}
-                         : std::format("No matching files found ({} path(s) not hashed: refused, "
-                                       "not a regular file, too large or unreadable)",
+                         : std::format("No matching files found ({} path(s) NOT examined: see the "
+                                       "coverage rows)",
                                        not_hashed);
         }
 
         ctx.write_output(std::format("hash|{}|{}|{}", escape_pipes(hash),
                                      matched ? "true" : "false", escape_pipes(detail)));
     }
+    return causes;
 }
 
-void check_file_paths(yuzu::CommandContext& ctx, const std::vector<std::string>& paths) {
-    for (const auto& path : paths) {
-        auto result = check_file_path(path);
+void check_file_paths(yuzu::CommandContext& ctx, const std::vector<PathState>& paths) {
+    for (const auto& st : paths) {
+        auto result = check_file_path(st);
         std::string detail;
-        if (result.refused) {
-            detail = result.refusal;
+        if (!result.not_examined.empty()) {
+            detail = "path_refused:" + result.not_examined;
         } else if (result.exists) {
             detail = std::format("File exists (size: {} bytes)", result.size);
         } else {
             detail = "File not found";
         }
 
-        ctx.write_output(std::format("file|{}|{}|{}", escape_pipes(path),
+        ctx.write_output(std::format("file|{}|{}|{}", escape_pipes(st.path),
                                      result.exists ? "true" : "false", escape_pipes(detail)));
     }
+}
+
+/// The structured completeness signal: one `coverage|<path>|not_examined|<cause>` row per path that
+/// was not examined (by judgement, or by hashing: `hash_causes`), then `coverage|*|complete|...` or
+/// `coverage|*|partial|...`.
+void emit_coverage(yuzu::CommandContext& ctx, const std::vector<PathState>& paths,
+                   const HashCauses& hash_causes) {
+    std::size_t not_examined = 0;
+    for (const auto& st : paths) {
+        std::string cause = st.cause;
+        if (cause.empty()) {
+            for (const auto& [p, c] : hash_causes)
+                if (p == st.path) {
+                    cause = c;
+                    break;
+                }
+        }
+        if (cause.empty())
+            continue;
+        ++not_examined;
+        ctx.write_output(std::format("coverage|{}|not_examined|{}", escape_pipes(st.path), cause));
+    }
+    ctx.write_output(std::format("coverage|*|{}|{} of {} file path(s) examined",
+                                 not_examined == 0 ? "complete" : "partial",
+                                 paths.size() - not_examined, paths.size()));
 }
 
 void check_ports(yuzu::CommandContext& ctx, const std::vector<std::string>& ports,
@@ -782,7 +899,7 @@ public:
             return 1;
         }
 
-        // Bound the file work an operator parameter can request (F36): each path is stat'ed and,
+        // Bound the file work an operator parameter can request: each path is stat'ed and,
         // with file_hashes, read; each hash is compared against every path.
         if (path_list.size() > kMaxFilePaths || hash_list.size() > kMaxFileHashes) {
             ctx.write_output(std::format(
@@ -814,15 +931,26 @@ public:
         }
         ctx.report_progress(50);
 
+        // Judge every file path ONCE (one mount-table snapshot for the whole action).
+        std::vector<PathState> judged;
+        if (!path_list.empty()) {
+            const yuzu::shared::local_path::LocalPathGuard guard;
+            judged.reserve(path_list.size());
+            for (const auto& p : path_list)
+                judged.push_back(judge_path(guard, p));
+        }
+
         // Check file hashes
+        HashCauses hash_causes;
         if (!hash_list.empty()) {
-            check_file_hashes(ctx, hash_list, path_list);
+            hash_causes = check_file_hashes(ctx, hash_list, judged);
         }
         ctx.report_progress(70);
 
         // Check file paths
         if (!path_list.empty()) {
-            check_file_paths(ctx, path_list);
+            check_file_paths(ctx, judged);
+            emit_coverage(ctx, judged, hash_causes);
         }
         ctx.report_progress(90);
 

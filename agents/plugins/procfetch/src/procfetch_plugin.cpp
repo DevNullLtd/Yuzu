@@ -34,6 +34,8 @@
 
 #if defined(__linux__) || defined(__APPLE__)
 #include <openssl/evp.h>
+
+#include <local_path_policy.hpp> // refuse a path on/under (or symlinked into) a network mount
 #endif
 #ifdef __APPLE__
 #include <libproc.h>
@@ -53,8 +55,8 @@
 // clang-format on
 #include <bcrypt.h>
 #include <win_str.hpp>  // shared yuzu::win wide<->UTF-8 helpers (#1681)
-#include <local_path_policy.hpp>   // refuse UNC / device / non-fixed-drive image paths (F34)
-#include <win_no_reparse_open.hpp> // handle-relative OBJ_DONT_REPARSE open (F34)
+#include <local_path_policy.hpp>   // refuse UNC / device / non-fixed-drive image paths
+#include <win_no_reparse_open.hpp> // handle-relative OBJ_DONT_REPARSE open
 #pragma comment(lib, "bcrypt.lib")
 #include <charconv>
 #include <tlhelp32.h>
@@ -102,6 +104,12 @@ std::string sha1_of_file_posix(const std::filesystem::path& path) {
         if (f.gcount() < static_cast<std::streamsize>(sizeof(buf)))
             break;
     }
+    // A read error (badbit) part-way through is not end of file: finishing the digest would return
+    // the SHA-1 of a truncated prefix as the image's hash. "Not hashed" is the honest answer.
+    if (f.bad()) {
+        EVP_MD_CTX_free(ctx);
+        return {};
+    }
 
     unsigned char hash[EVP_MAX_MD_SIZE];
     unsigned int hash_len = 0;
@@ -144,6 +152,7 @@ std::string resolve_exe(const std::filesystem::path& link) {
 void enumerate_and_stream(yuzu::CommandContext& ctx) {
     std::unordered_map<std::string, std::string> sha_cache;
     std::error_code ec;
+    const yuzu::shared::local_path::LocalPathGuard path_guard; // one mount-table snapshot per run
 
     for (const auto& entry : std::filesystem::directory_iterator("/proc", ec)) {
         if (!entry.is_directory(ec))
@@ -163,7 +172,9 @@ void enumerate_and_stream(yuzu::CommandContext& ctx) {
 
         std::string exe_path = resolve_exe(entry.path() / "exe");
         std::string sha1;
-        if (!exe_path.empty()) {
+        // The image path is attacker-influenced: a symlink in it can point under a network mount.
+        // Judge (resolving links, one mount snapshot) BEFORE any stat or open; refused = not hashed.
+        if (!exe_path.empty() && !yuzu::shared::local_path::refused(path_guard.refusal(exe_path))) {
             std::error_code fe;
             if (std::filesystem::exists(exe_path, fe)) {
                 auto it = sha_cache.find(exe_path);
@@ -198,6 +209,7 @@ void enumerate_and_stream(yuzu::CommandContext& ctx) {
     size_t pid_count = static_cast<size_t>(got) / sizeof(pid_t);
 
     std::unordered_map<std::string, std::string> sha_cache;
+    const yuzu::shared::local_path::LocalPathGuard path_guard; // one mount-table snapshot per run
     char path_buf[PROC_PIDPATHINFO_MAXSIZE];
 
     for (size_t i = 0; i < pid_count; ++i) {
@@ -225,7 +237,7 @@ void enumerate_and_stream(yuzu::CommandContext& ctx) {
             continue;
 
         std::string sha1;
-        if (!exe_path.empty()) {
+        if (!exe_path.empty() && !yuzu::shared::local_path::refused(path_guard.refusal(exe_path))) {
             std::error_code fe;
             if (std::filesystem::exists(exe_path, fe)) {
                 auto it = sha_cache.find(exe_path);
@@ -266,29 +278,47 @@ std::string get_process_image_path(DWORD pid) {
 }
 
 std::string sha1_of_file(const std::string& path, BCRYPT_ALG_HANDLE alg) {
-    // F34: the image path belongs to a process any standard user can start, so it can be a share
+    // The image path belongs to a process any standard user can start, so it can be a share
     // (`\\server\share\x.exe`). Opening it as the LocalSystem agent would authenticate the machine
     // account to that host. Classify BEFORE any open (a refused path reads as an empty hash, the
     // honest "not hashed" answer), then open handle-relative with no reparse point followed so a
-    // junction or symlink in the path cannot redirect the open either.
+    // junction or symlink in the path cannot redirect the open either. An empty hash means "not
+    // hashed" for ANY reason (refused, could not be opened, read failure): this action's output has
+    // no column that could say which.
     if (yuzu::shared::local_path::refused(yuzu::shared::local_path::local_path_refusal(path)))
         return {};
     const auto opened = yuzu::win::open_file_no_reparse(yuzu::win::to_wide(path));
     if (opened.status != yuzu::win::NoReparseOpen::ok)
         return {};
     const HANDLE file = opened.file.get(); // owned by `opened`; closed on every exit path
+    if (::GetFileType(file) != FILE_TYPE_DISK)
+        return {};
 
     BCRYPT_HASH_HANDLE hash_handle = nullptr;
     NTSTATUS status = BCryptCreateHash(alg, &hash_handle, nullptr, 0, nullptr, 0, 0);
     if (status != 0)
         return {};
 
+    // A read error or a hash failure part-way through must NOT finish the digest: that would
+    // return the SHA-1 of a truncated prefix as if it were the image's hash. Any failure is "not
+    // hashed" (empty). ReadFile on a synchronous handle returns TRUE with 0 bytes at end of file.
     char buf[65536];
     DWORD bytes_read = 0;
-    while (ReadFile(file, buf, sizeof(buf), &bytes_read, nullptr) && bytes_read > 0) {
+    bool complete = false;
+    for (;;) {
+        if (!ReadFile(file, buf, sizeof(buf), &bytes_read, nullptr))
+            break; // read error: not complete
+        if (bytes_read == 0) {
+            complete = true;
+            break;
+        }
         status = BCryptHashData(hash_handle, reinterpret_cast<PUCHAR>(buf), bytes_read, 0);
         if (status != 0)
             break;
+    }
+    if (!complete) {
+        BCryptDestroyHash(hash_handle);
+        return {};
     }
 
     unsigned char hash[20]; // SHA-1 is 20 bytes
