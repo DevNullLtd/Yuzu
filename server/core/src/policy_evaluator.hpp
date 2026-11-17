@@ -1,6 +1,7 @@
 #pragma once
 
 #include "dispatch_confined_arms.hpp" // #3424/#3511: ConfinedDispatchOutcome -- DispatchFn/CommandDispatchFn return type
+#include "policy_dispatch.hpp"       // G01: the refusal seam, its denial type and DispatchOrigin
 
 /// @file policy_evaluator.hpp
 /// Drives the compliance CHECK -> VERDICT pipeline that was previously dead.
@@ -58,6 +59,7 @@
 #include <expected>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -74,6 +76,7 @@ class PolicyStore;
 class InstructionStore;
 class ResponseStore;
 class ForensicsPluginSet; // #4990 (response_tier_filter.hpp)
+class AuditStore;
 class TagStore;
 class CustomPropertiesStore;
 class ManagementGroupStore;
@@ -149,6 +152,15 @@ public:
         // matching every existing production/test Deps that predates this
         // field.
         std::function<bool()> should_stop;
+        /// The capability registry every pair is classified against before it is dispatched
+        /// (`authorize_policy_dispatch`, policy_dispatch.hpp). Borrowed, must outlive the
+        /// evaluator. UNSET REFUSES EVERY DISPATCH (reason `unwired`): an evaluator with no
+        /// registry fails closed, never open.
+        const CommandCapabilityRegistry* capability_registry{nullptr};
+        /// Optional forensic sink for the `policy.dispatch` / `denied` audit rows written when a
+        /// dispatch is refused. Borrowed, nullable (a harness without one writes none), same
+        /// shape as `ScheduleRunner::Deps::audit_store`.
+        AuditStore* audit_store{nullptr};
     };
 
     explicit PolicyEvaluator(Deps deps);
@@ -171,12 +183,29 @@ public:
     /// or — ADR-0058 — InstructionStore itself errored resolving the check
     /// instruction) — the caller must surface this as degraded (503), not as
     /// "no targets" (409).
-    [[nodiscard]] std::expected<std::string, std::string>
+    ///
+    /// G01: returns a `KickoffOutcome`. A REFUSED dispatch (the pair has an execute gate, is
+    /// Destructive, is reserved, is not classified, ...) is a successful return with `denial`
+    /// set and an empty `execution_id`, never an `unexpected`: nothing was sent and the
+    /// targets are recorded as `blocked`. A caller must test `denial` before it reads an empty
+    /// `execution_id` as the benign no-op.
+    struct KickoffOutcome {
+        std::string execution_id;
+        std::optional<PolicyDispatchDenial> denial;
+    };
+
+    [[nodiscard]] std::expected<KickoffOutcome, std::string>
     evaluate_now(const std::string& policy_id);
 
     struct RemediateResult {
         bool ok{false};
         std::string error;        // set when !ok
+        /// G01: set when the fix was REFUSED (policy_dispatch.hpp). `ok` is false and
+        /// `degraded` stays false (a refusal is not a store failure); nothing was sent; the
+        /// claimed targets were recorded as `blocked` and their claims released; `error` is a
+        /// neutral message. The route answers 409 on `denial`, ahead of any matching on
+        /// `error`.
+        std::optional<PolicyDispatchDenial> denial;
         // Governance (2026-08-24): set explicitly by remediate() at each
         // degrade return point — the caller must not infer this from a
         // string prefix on `error`. A previous route-layer version keyed off
@@ -247,7 +276,22 @@ private:
     struct DispatchInstructionResult {
         std::string execution_id;
         yuzu::server::ConfinedDispatchOutcome outcome;
+        /// Set when the pair was refused: `execution_id` is then empty and no `polchk-` id
+        /// was minted. The pair is carried back so the caller can record it (the seam itself
+        /// never allocates).
+        std::optional<PolicyDispatchDenial> denial;
+        std::string denied_plugin;
+        std::string denied_action;
     };
+
+    /// Record a refused dispatch for `targets`: write the `blocked` status (write on change,
+    /// fenced on `expected_gen` for a fix or verify refusal), count it, log it, and write the
+    /// `policy.dispatch` / `denied` audit row (an operator-triggered refusal always; a tick or
+    /// verify refusal only when a row changed or the status write failed). Never reverses the
+    /// refusal: nothing was sent either way.
+    void record_denial(const std::string& policy_id, std::string_view phase,
+                       const std::vector<std::string>& targets, const DispatchInstructionResult& r,
+                       DispatchOrigin origin, std::optional<int64_t> expected_gen);
 
     // Resolve scope/groups -> unique agent ids. Must be called WITHOUT mu_
     // held (it does store/registry I/O that must not run under the evaluator
@@ -273,7 +317,7 @@ private:
     // acquires mu_ only briefly (dedupe scan, in-flight push) and NEVER holds it
     // across the dispatch call — dispatch_fn does blocking gRPC + gateway
     // forwarding, so it must run lock-free. Caller must NOT hold mu_.
-    std::expected<std::string, std::string> kickoff_check(const Policy& p);
+    std::expected<KickoffOutcome, std::string> kickoff_check(const Policy& p, DispatchOrigin origin);
 
     // Dispatch `instruction_id` to `targets`; returns a fresh execution_id
     // (plus the raw ConfinedDispatchOutcome from dispatch_fn — HA WS-3 3.4,

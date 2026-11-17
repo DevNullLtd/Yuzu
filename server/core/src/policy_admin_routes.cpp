@@ -440,7 +440,10 @@ void PolicyAdminRoutes::register_routes(HttpRouteSink& sink,
                     "application/json");
                 return;
             }
-            auto exec_id = *exec_res;
+            // G01: a refused dispatch comes back as a value with `denial` set and no execution
+            // id; it is answered as its own 409 by the next change to this route. Until then it
+            // reads as the existing "nothing to dispatch" 409 below.
+            auto exec_id = exec_res->execution_id;
             if (exec_id.empty()) {
                 res.status = 409;
                 res.set_content(
