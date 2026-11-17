@@ -433,6 +433,7 @@ private:
     // again (permanent silence). A quiet poll with no new entries exits 0, so it keeps its
     // cursor.
     std::uint64_t journal_untrusted_dropped_{0}; // F58: entries failing the sender check
+    std::int64_t journal_last_drop_warn_{-1};   // steady_now() of the last drop warning
     std::uint64_t journal_gap_events_{0};        // UP6: cursor re-baselines (a possible data gap)
 
     void poll_journald() {
@@ -471,9 +472,14 @@ private:
             // sender check. A genuine mismatch (an unexpected coredump identity) would otherwise
             // be silent; forged entries are expected to be counted here too.
             journal_untrusted_dropped_ += untrusted;
-            spdlog::warn("dex_observer(linux): dropped {} journal entr{} failing the trusted-sender "
-                         "check this poll ({} total since start)",
-                         untrusted, untrusted == 1 ? "y" : "ies", journal_untrusted_dropped_);
+            // Throttled (WP13 N-WARN): a forger could otherwise turn every poll into a log line.
+            // First drop, then at most once per hour with the running total.
+            if (journal_last_drop_warn_ < 0 || now - journal_last_drop_warn_ >= 3600) {
+                journal_last_drop_warn_ = now;
+                spdlog::warn("dex_observer(linux): dropped journal entries failing the trusted-sender "
+                             "check ({} total since start, this poll {}; logged at most hourly)",
+                             journal_untrusted_dropped_, untrusted);
+            }
         } // exit status AFTER draining stdout to EOF
         // Emit whatever was read FIRST (a timeout mid-read still yields real events),
         // then re-baseline on a non-zero exit so a cursor the journal rotated past does

@@ -23,7 +23,7 @@ flowchart LR
   OP["Operator or workflow"] --> SRV["Server<br/>Infrastructure.Read for list and running<br/>Infrastructure.Write with AdminOrApproval for set_start_mode"]
   SRV -- "gRPC mTLS" --> HOST["Agent plugin host"] --> EX["services.execute"]
   EX --> WIN["Windows<br/>EnumServicesStatusExW, QueryServiceConfigW, ChangeServiceConfigW"]
-  EX --> LIN["Linux<br/>systemctl list-units, sudo -n -- systemctl enable, disable, mask, unmask"]
+  EX --> LIN["Linux<br/>systemctl list-units; enable, disable, mask, unmask as root, or via sudo -n -- yuzu-systemctl wrapper"]
   EX --> MAC["macOS<br/>launchctl list, print-disabled, sudo -n -- launchctl enable, disable"]
   WIN & LIN & MAC --> ROWS["pipe rows and result status"] --> RS[("ResponseStore")] --> API["REST /api/responses and MCP"]
 ```
@@ -94,7 +94,7 @@ This shows why the two families of legs fail differently: Windows has no way to 
 |---|---|---|---|
 | `list` | ✅ supported · rung 1 · win32_service_api | ✅ supported · rung 2 · runner argv 'launchctl list' | ✅ supported · rung 2 · runner argv 'systemctl list-units' |
 | `running` | ✅ supported · rung 1 · win32_service_api | ✅ supported · rung 2 · runner argv 'launchctl list' | ✅ supported · rung 2 · runner argv 'systemctl list-units' |
-| `set_start_mode` | ✅ supported · rung 1 · win32_service_api | ✅ supported · rung 2 · runner argv 'sudo -n -- launchctl enable\|disable' | ✅ supported · rung 2 · runner argv 'sudo -n -- systemctl enable\|disable\|mask\|unmask' |
+| `set_start_mode` | ✅ supported · rung 1 · win32_service_api | ✅ supported · rung 2 · runner argv 'sudo -n -- launchctl enable\|disable' | ✅ supported · rung 2 · runner argv: root systemctl, or sudo -n -- yuzu-systemctl wrapper (verb enable\|disable\|mask\|unmask) |
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
@@ -174,7 +174,7 @@ Rows are pipe-delimited, prefixed `svc|`, one per service. The row **shape** dif
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash e724207e0989
+**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 796b8a311657
 
 ```
 == action=list
@@ -215,7 +215,7 @@ error|missing required parameter: name
 [rc] 1
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash e724207e0989
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 796b8a311657
 
 ```
 == action=list
@@ -256,7 +256,7 @@ error|missing required parameter: name
 [rc] 1
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash e724207e0989
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash 796b8a311657
 
 ```
 == action=list

@@ -46,7 +46,7 @@ def main():
         junk = tmp / "junk.txt"
         junk.write_text("d41d8cd98f00b204e9800998ecf8427e  foo.so\n")
         for name, path in (("missing", tmp / "absent.txt"), ("empty", empty), ("junk", junk)):
-            rc, out, timed_out = run(agent, path, tmp, 60)
+            rc, out, timed_out = run(agent, path, tmp, 15)
             if timed_out:
                 errs.append(f"{name}: agent kept running instead of refusing")
             elif rc == 0:
@@ -55,7 +55,7 @@ def main():
                 errs.append(f"{name}: refusal line not in output (lost log line?):\n{out[-600:]}")
         # --plugin-require-signature without a trust bundle (the sibling guard) uses the same
         # return-from-run mechanism: its line must reach the log and the exit must be non-zero.
-        rc, out, timed_out = run(agent, None, tmp, 60, ["--plugin-require-signature"])
+        rc, out, timed_out = run(agent, None, tmp, 15, ["--plugin-require-signature"])
         if timed_out or rc == 0 or REFUSAL not in out or "--plugin-trust-bundle" not in out:
             errs.append(f"require-signature without a bundle: rc={rc} timed_out={timed_out}\n{out[-400:]}")
         good = tmp / "good.txt"

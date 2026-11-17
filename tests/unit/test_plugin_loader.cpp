@@ -31,6 +31,10 @@
 #include <system_error>
 #include <vector>
 
+#ifndef _WIN32
+#include <sys/stat.h> // mkfifo (the FIFO allowlist test)
+#endif
+
 namespace fs = std::filesystem;
 
 namespace {
@@ -661,7 +665,6 @@ TEST_CASE("load_plugin_allowlist: an unreadable file is Unreadable, not empty",
 #endif
 
 #ifndef _WIN32
-#include <sys/stat.h>
 TEST_CASE("load_plugin_allowlist: a FIFO is Unreadable and is never opened (no hang) (F5)",
           "[plugin_loader][allowlist][f52]") {
     yuzu::test::TempDir tmp{"yuzu_test_allowlist_fifo_"};

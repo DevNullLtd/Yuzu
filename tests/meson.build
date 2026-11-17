@@ -4990,7 +4990,7 @@ if (_python3_test.found() and meson.can_run_host_binaries() and build_agent
     _python3_test,
     args: [files('test_agent_allowlist_refusal_executed.py'), yuzu_agent_exe],
     suite: 'agent',
-    timeout: 120,
+    timeout: 180,
     depends: [yuzu_agent_exe],
   )
 endif

@@ -131,6 +131,7 @@ ACCOUNT_NAME=""            # filled in based on platform if not specified
 BINARY_PATH=""             # filled in based on platform if not specified
 SKIP_SUDOERS=0
 SKIP_SETCAP=0
+DEPRECATED_NO_SETCAP=0
 # Root-owned systemctl validator (Linux, WP13/F48). The ONLY systemctl sudo grant; the
 # services plugin probes this exact path (agents/plugins/services/src/services_parsers.hpp
 # kYuzuSystemctlWrapper) - keep the two in sync.
@@ -194,7 +195,7 @@ while [[ $# -gt 0 ]]; do
         --binary-path)    BINARY_PATH="$2"; shift 2 ;;
         --no-sudoers)     SKIP_SUDOERS=1; shift ;;
         --no-cap-cleanup) SKIP_SETCAP=1; shift ;;
-        --no-setcap)      SKIP_SETCAP=1; warn "--no-setcap is a deprecated alias of --no-cap-cleanup (the script never SETS file capabilities)"; shift ;;
+        --no-setcap)      SKIP_SETCAP=1; DEPRECATED_NO_SETCAP=1; shift ;;
         -h|--help)        usage; exit 0 ;;
         *)                echo "unknown arg: $1" >&2; echo "use --help for usage." >&2; exit 2 ;;
     esac
@@ -202,6 +203,18 @@ done
 
 ACCOUNT_NAME="${ACCOUNT_NAME:-$DEFAULT_ACCOUNT}"
 BINARY_PATH="${BINARY_PATH:-$DEFAULT_BINARY_PATH}"
+
+# TEST-ONLY (tests/test_agent_installer_exec.py): redirect every root-owned path under a prefix
+# directory and skip the root check, so the real, NON-sourced script (dispatch and exit status
+# included) can run in a temp dir with stub tools. It can only move writes INTO the prefix and
+# relax a check; it grants nothing, and sudo's env reset drops it in normal use.
+TEST_ROOT="${YUZU_INSTALLER_TEST_ROOT:-}"
+if [[ -n "$TEST_ROOT" ]]; then
+    STATE_DIR="$TEST_ROOT$STATE_DIR"; CACHE_DIR="$TEST_ROOT$CACHE_DIR"; LOG_DIR="$TEST_ROOT$LOG_DIR"
+    SUDOERS_TARGET="$TEST_ROOT$SUDOERS_TARGET"
+    SYSTEMCTL_WRAPPER_DIR="$TEST_ROOT$SYSTEMCTL_WRAPPER_DIR"
+    SYSTEMCTL_WRAPPER_PATH="$TEST_ROOT$SYSTEMCTL_WRAPPER_PATH"
+fi
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -223,13 +236,16 @@ run() {
 log() { printf '[install-agent-user] %s\n' "$*"; }
 warn() { printf '[install-agent-user] WARN: %s\n' "$*" >&2; }
 fail() { printf '[install-agent-user] ERROR: %s\n' "$*" >&2; exit 1; }
+if [[ "$DEPRECATED_NO_SETCAP" -eq 1 ]]; then
+    warn "--no-setcap is a deprecated alias of --no-cap-cleanup (the script never SETS file capabilities)"
+fi
 
 # require_root — most actions need root; we fail early rather than
 # half-running and leaving a partially-installed state. --dry-run and
 # --check are exempt: dry-run only prints what would happen, and check
 # only reads state.
 require_root() {
-    if [[ "$DRY_RUN" -eq 1 ]]; then
+    if [[ "$DRY_RUN" -eq 1 || -n "$TEST_ROOT" ]]; then
         return 0
     fi
     if [[ "$EUID" -ne 0 ]]; then
@@ -708,6 +724,16 @@ strip_file_capabilities() {
     if [[ "$PLATFORM" != "linux" ]]; then return 0; fi
     if [[ "$SKIP_SETCAP" -eq 1 ]]; then
         log "skipping file-capability cleanup (--no-cap-cleanup)"
+        # Loud, on stderr: this flag can leave an exploitable file capability on a binary that
+        # any local user can execute, and the install still exits 0 (WP13 governance R3-NOCAP).
+        if [[ -f "$BINARY_PATH" ]] && command -v getcap >/dev/null 2>&1; then
+            local live
+            live=$(getcap "$BINARY_PATH" 2>/dev/null || true)
+            if [[ -n "$live" ]]; then
+                warn "--no-cap-cleanup: file capabilities are STILL LIVE on $BINARY_PATH: $live"
+                warn "  any local user can run that binary with them; remove with: setcap -r $BINARY_PATH"
+            fi
+        fi
         return 0
     fi
     if [[ ! -f "$BINARY_PATH" ]]; then
@@ -763,7 +789,14 @@ check_install() {
             warn "missing dir: $dir"; ((errs++)); continue
         fi
         local owner
-        owner=$(stat -f '%Su' "$dir" 2>/dev/null || stat -c '%U' "$dir")
+        # Branch on the platform: GNU `stat -f` means "filesystem status" (it prints a report and
+        # exits 1 for a path), so the old `stat -f ... || stat -c ...` never reached `-c` and --check
+        # failed on every healthy Linux host. BSD/macOS `stat` has no `-c`.
+        if [[ "$PLATFORM" == "macos" ]]; then
+            owner=$(stat -f '%Su' "$dir" 2>/dev/null || echo "")
+        else
+            owner=$(stat -c '%U' "$dir" 2>/dev/null || echo "")
+        fi
         if [[ "$owner" != "$ACCOUNT_NAME" ]]; then
             warn "wrong owner on $dir: got $owner, expected $ACCOUNT_NAME"
             ((errs++))
@@ -811,6 +844,9 @@ check_install() {
         fi
     fi
 
+    if [[ "$PLATFORM" == "linux" && "$SKIP_SETCAP" -eq 1 ]]; then
+        warn "--no-cap-cleanup given: the file-capability check is SKIPPED, so a green --check does not prove the binary is capability-free"
+    fi
     # 4. file capabilities (Linux only): their PRESENCE is the drift. A file capability on a
     #    binary other users can execute is a local privilege escalation (WP13/F21).
     if [[ "$PLATFORM" == "linux" && "$SKIP_SETCAP" -eq 0 && -f "$BINARY_PATH" ]]; then
@@ -842,7 +878,9 @@ check_install() {
             local wowner wmode
             wowner=$(stat -c '%u' "$SYSTEMCTL_WRAPPER_PATH" 2>/dev/null || echo "")
             wmode=$(stat -c '%a' "$SYSTEMCTL_WRAPPER_PATH" 2>/dev/null || echo "")
-            if [[ "$wowner" != "0" || "$wmode" != "755" ]]; then
+            local want_uid=0
+            [[ -n "$TEST_ROOT" ]] && want_uid="$(id -u)" # test layout: the temp dir's owner stands in for root
+            if [[ "$wowner" != "$want_uid" || "$wmode" != "755" ]]; then
                 warn "$SYSTEMCTL_WRAPPER_PATH must be root-owned 0755 (found uid=$wowner mode=$wmode)"
                 ((errs++))
             fi
@@ -905,7 +943,11 @@ do_install() {
 }
 
 if [[ "${YUZU_INSTALLER_SOURCE_ONLY:-0}" == "1" ]]; then
-    return 0 2>/dev/null || exit 0
+    if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+        return 0 # sourced by the execution tests: define the functions, run nothing
+    fi
+    # Executed (not sourced) with the test variable set: do NOT silently do nothing and exit 0.
+    warn "YUZU_INSTALLER_SOURCE_ONLY is only for sourcing; ignoring it and running normally"
 fi
 
 case "$ACTION" in

@@ -798,7 +798,7 @@ implementation is.
 | services | running | linux | supported | 2 | runner argv 'systemctl list-units' | - |
 | services | running | macos | supported | 2 | runner argv 'launchctl list' | - |
 | services | running | windows | supported | 1 | win32_service_api | - |
-| services | set_start_mode | linux | supported | 2 | runner argv 'sudo -n -- systemctl enable\|disable\|mask\|unmask' | - |
+| services | set_start_mode | linux | supported | 2 | runner argv: root systemctl, or sudo -n -- yuzu-systemctl wrapper (verb enable\|disable\|mask\|unmask) | - |
 | services | set_start_mode | macos | supported | 2 | runner argv 'sudo -n -- launchctl enable\|disable' | - |
 | services | set_start_mode | windows | supported | 1 | win32_service_api | - |
 | shares | list | linux | supported | 1 | bounded no-follow reads of /etc/exports, /etc/exports.d/*.exports and /etc/samba/smb.conf (pure parsers); one lstat of the usershares directory | configured shares as written, not live nfsd/smbd state; Samba registry backend, include= files and usershares are not read (constrained token); a symlinked config file or exports.d is refused |
