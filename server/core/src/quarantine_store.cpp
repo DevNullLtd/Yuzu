@@ -186,7 +186,7 @@ const std::vector<pg::PgMigration>& migrations() {
          "CREATE INDEX idx_quarantine_release_owed ON quarantine_records(agent_id, id) "
          "WHERE status = 'released' AND device_release_owed_at <> 0;"},
         // #7613: the apply fence. `apply_gen` counts the applies ever claimed for the record;
-        // `apply_claimed_at` marks one whose dispatch has not returned (0 = none). Both: 0 =
+        // `apply_claimed_at` marks one whose reply has not been consumed (0 = none). Both: 0 =
         // never, this table's existing sentinel. v1-v4 above are byte-identical on purpose: the
         // runner pins each applied migration's SHA-256. The ADD COLUMN IF NOT EXISTS makes a
         // re-run after a partial apply safe.

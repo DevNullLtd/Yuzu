@@ -981,6 +981,14 @@ TEST_CASE("QuarantineContainmentReconciler: a released record disappears from th
     reconciler.tick();
     REQUIRE(dispatch.calls.size() == 1);
 
+    // The apply reached the device, so its claim is held until its reply is read. This rig has no
+    // response store to read one from, so the test stands in for the reply by dropping the claim
+    // (generation 1: the first apply claimed it once); a confirmed end is refused while it is live.
+    auto live = qstore.get_status("agent-1");
+    REQUIRE(live.has_value());
+    REQUIRE(live->has_value());
+    REQUIRE(qstore.release_apply_claim("agent-1", (*live)->id, 1).has_value());
+
     end_record(qstore, "agent-1");
     reconciler.tick(); // GC's the now-released agent out of internal state
 

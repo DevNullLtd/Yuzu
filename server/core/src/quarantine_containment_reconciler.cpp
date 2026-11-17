@@ -107,6 +107,9 @@ void QuarantineContainmentReconciler::release_held_claim(const std::string& agen
                          "record {}: {}",
                          c.held_claim.record_id, rel.error());
     } catch (...) {
+        spdlog::warn("QuarantineContainmentReconciler: releasing the apply claim for record {} "
+                     "threw; it expires with the claim window",
+                     c.held_claim.record_id);
     }
     std::lock_guard<std::mutex> lk(mu_);
     if (auto* st = entry_for(agent_id, c))

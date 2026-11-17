@@ -36189,7 +36189,25 @@ TEST_CASE("MCP quarantine_device ticket round-trip records + dispatches isolatio
     // The first call's apply reached the device, so its claim is held until a reply is read or 120 s
     // pass (#8045). MCP reads no reply, so a second call inside that window is refused as a
     // retryable fault; the test stands in for the window passing by dropping the claim, whose
-    // generation is 1 (the first apply claimed it once).
+    // generation is 1 (the first apply claimed it once). First pin the refusal itself: a second call
+    // inside the window is a retryable fault whose hint is the window, not the store-fault 5 s.
+    {
+        auto mint_w = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":2412,"params":{"name":"quarantine_device","arguments":{"agent_id":"agent-q","reason":"inside window"}}})");
+        REQUIRE(mint_w);
+        const std::string approval_w =
+            nlohmann::json::parse(mint_w->body)["error"]["data"]["approval_id"].get<std::string>();
+        REQUIRE(appr.approve(approval_w, "reviewer-bob", ""));
+        auto refused = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":2413,"params":{"name":"quarantine_device","arguments":{"agent_id":"agent-q","reason":"inside window","approval_id":")" +
+            approval_w + R"("}}})");
+        REQUIRE(refused);
+        const auto refused_body = nlohmann::json::parse(refused->body);
+        REQUIRE(refused_body.contains("error"));
+        CHECK(refused_body["error"]["code"] == yuzu::server::mcp::kInternalError);
+        CHECK(refused_body["error"]["data"]["retry_after_ms"] ==
+              yuzu::server::mcp::kMcpApplyClaimRetryMs);
+    }
     REQUIRE(quar.release_apply_claim("agent-q", (*rec)->id, 1).has_value());
 
     // ...and on the pre-existing path: a second call for the same device re-dispatches the stored

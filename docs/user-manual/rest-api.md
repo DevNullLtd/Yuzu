@@ -2581,7 +2581,8 @@ refused or threw, no reply arrived in 5 seconds, or the reply was anything else 
 such as `status|refused|privilege_unavailable`, a partial release). It is also the answer when the
 device did say `inactive` but the record could not end on that word: an apply reached, or was being
 sent to, the device after the observation, or an apply sent before the release has no reply read
-yet (any `DELETE` within 120 seconds of an MCP `quarantine_device` call; the audit row's `detail` then ends `apply_in_flight=1`, or
+yet (after a reconciler apply, until its reply is read; after an MCP `quarantine_device` call that
+reached the device, for up to 120 seconds; the audit row's `detail` then ends `apply_in_flight=1`, or
 `fence_unread=1` when the check could not be read), or the store could not record the end. In those
 cases the record stays `releasing` and the server reads the device again, so a retry is not needed.
 The wait shares the 4-slot live in-flight budget with the DEX live route; with no slot free the

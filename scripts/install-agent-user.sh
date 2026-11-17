@@ -1776,7 +1776,7 @@ check_install() {
             warn "$SUDOERS_FILE is missing"; ((errs++))
         elif [[ ! -r "$SUDOERS_FILE" ]]; then
             log "$SUDOERS_FILE present but not readable by $(id -un)"
-            log "  (mode 0440 root:wheel/root is correct; rerun --check as root to validate)"
+            log "  (mode 0440 root:wheel/root is correct; rerun --check as root to validate; the content check was skipped)"
         else
             if ! visudo -cf "$SUDOERS_FILE" >/dev/null 2>&1; then
                 warn "$SUDOERS_FILE fails visudo validation"; ((errs++))

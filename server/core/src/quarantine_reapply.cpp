@@ -186,8 +186,9 @@ redispatch_stored_containment(QuarantineStore& store, const std::string& agent_i
 
     // Claim the apply BEFORE it can reach the device (#7613). The claim moves the record's apply
     // generation, so a confirmed end resting on an `inactive` answer observed before this point is
-    // refused, and it stays live while the dispatch is in progress, so a mark attempted during the
-    // dispatch is refused too. Refused when the record changed since the read above (ended, a
+    // refused, and it stays live while the dispatch is in progress (and, once the dispatch reached
+    // an agent, until the reply is consumed or the claim window passes), so a mark attempted in
+    // that time is refused too. Refused when the record changed since the read above (ended, a
     // release requested) or another apply holds a live claim: nothing is dispatched, and the
     // callers' no_active_record arms re-derive the record on their next pass.
     auto gen = store.claim_apply(agent_id, out_record.id);

@@ -5415,6 +5415,8 @@ static const ToolDef kTools[] = {
 
 static_assert(software_catalogue::kCursorMaxBytes == mcp::kMcpCursorMaxLen,
               "the catalogue cursor bound must equal the MCP cursor input bound");
+static_assert(mcp::kMcpApplyClaimRetryMs == kApplyClaimTtlSecs * 1000,
+              "the quarantine_device retry hint must equal the apply claim window");
 
 // ── Write/execute tools (blocked by read_only_mode) ──────────────────────
 // These tool names perform Write/Execute/Delete operations.
@@ -24948,8 +24950,9 @@ McpServer::HandlerFn McpServer::build_handler(
                         // report isolated on a record that turned out not to be
                         // there. no_active_record also covers a refused claim:
                         // the record is there and another apply holds it, and
-                        // that apply is the one dispatching the containment, so
-                        // this call has not contained the device. The retry is
+                        // that apply is dispatching the containment or has not had
+                        // its reply read yet, so this call has not contained the
+                        // device. The retry is
                         // still right. (An apply that reached the device keeps its
                         // claim until its reply is consumed or the claim window
                         // passes, so a retry inside that window is refused this
@@ -24958,7 +24961,6 @@ McpServer::HandlerFn McpServer::build_handler(
                                                  (record_pre_existing ? "" : " record_persisted=1"));
                         // A refused claim on a record that already existed is held for the claim
                         // window, so the honest hint is that window, not the store-fault 5 s.
-                        static_assert(mcp::kMcpApplyClaimRetryMs == kApplyClaimTtlSecs * 1000);
                         const bool claim_held =
                             err.kind == ContainmentReapplyErrorKind::no_active_record &&
                             record_pre_existing;
