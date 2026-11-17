@@ -2,8 +2,11 @@
 """test_filesystem_definition.py -- pins the shipped `device.filesystem.find_by_hash` definition
 (content/definitions/filesystem.yaml) to the row contract the plugin writes
 (`match|<path>|<size>`, an optional `network_mount_guard|unavailable` row, an optional
-`truncated|<reason>|visited=N|...` row, `matches_found|<count>`), so a reordered, renamed or
-reverted result column fails here rather than only in a dashboard.
+`truncated|<reason>|visited=N|...` row, `matches_found|<count>`), and the shipped
+`device.filesystem.search_dir` definition (content/definitions/t2_capabilities.yaml) to its rows
+(`result|<path>|<directory|file>`, the same optional guard and trailer rows,
+`total_matches|<count>`), so a reordered, renamed or reverted result column fails here rather than
+only in a dashboard.
 
 tests/unit/server/test_result_set_matcher.cpp keeps its own copy of the schema (the server test
 binary has no YAML loader); the same column names, types, row_kind values and `discriminator` are

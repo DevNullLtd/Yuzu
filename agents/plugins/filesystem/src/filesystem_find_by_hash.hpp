@@ -1,14 +1,20 @@
 #pragma once
 
 // filesystem_find_by_hash.hpp -- the bounded, symlink-safe walk behind the filesystem plugin's
-// find_by_hash action (#5624).
+// find_by_hash action (#5624). The header holds THE bounded walker of the plugin (walk_bounded):
+// search_dir (#6478) rides it too, with a name-only visitor. It keeps its find_by_hash name; the
+// numbers listed below are find_by_hash's limits, and search_dir passes its own
+// (filesystem_search_dir.hpp).
 //
 // The walk is a PURE CORE with every OS interaction injected (WalkEnv): a clock, a cancel
 // predicate, a per-entry hasher, a directory-readability probe and the network mount list. The
 // unit suites drive it with fakes -- no sleep, no real process, no network -- and the production
-// hashers (hash_entry_posix / hash_entry_win, at the bottom) are the thin OS shells.
+// hashers (hash_entry_posix / hash_entry_win, at the bottom) are the thin OS shells. The one OS
+// call the core makes itself is on macOS: walk_bounded switches the thread's dataless-file
+// materialization policy off for the walk (DatalessMaterializationOff), so no action riding the
+// walker can omit it.
 //
-// What is bounded, and why the numbers are what they are:
+// What is bounded, and why the numbers are what they are (find_by_hash's limits):
 //   * wall clock    kWalkDeadline 20 s -- the Instructions gate polls at 30 s and the result still
 //                   has to travel agent -> server -> store -> poll; this leaves a 10 s margin.
 //   * entries       kMaxFilesVisited 50,000 -- about 20 s of stat/open at ~2,500 entries/s on a
@@ -67,6 +73,9 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <sys/resource.h> // getiopolicy_np / setiopolicy_np (DatalessMaterializationOff)
+#endif
 #ifdef __linux__
 #include <sys/syscall.h>
 #include <sys/vfs.h> // fstatfs
@@ -415,15 +424,51 @@ enum class EntryKind { directory, regular };
 /// look-ahead), stop (the visitor's own budget tripped: the walk ends with budget.stop()).
 enum class Visit { none, match, stop };
 
+#ifdef __APPLE__
+// Dataless (iCloud / File Provider) files and directories must not be materialised by a walk: the
+// download runs inside a read the deadline cannot interrupt. The policy is per THREAD and this
+// runs on a shared pool thread, so it is read, switched OFF for the walk and restored on every
+// exit path. With it off a dataless file or directory fails its open with EDEADLK, which the walk
+// already counts as unreadable (CONSTRAINED), and a dataless directory is refused by the
+// directory open before the iterator names its children.
+class DatalessMaterializationOff {
+public:
+    DatalessMaterializationOff() {
+        previous_ = ::getiopolicy_np(IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_THREAD);
+        if (previous_ < 0)
+            previous_ = IOPOL_MATERIALIZE_DATALESS_FILES_DEFAULT;
+        changed_ = ::setiopolicy_np(IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_THREAD,
+                                    IOPOL_MATERIALIZE_DATALESS_FILES_OFF) == 0;
+    }
+    ~DatalessMaterializationOff() {
+        if (changed_)
+            ::setiopolicy_np(IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_THREAD,
+                             previous_);
+    }
+    DatalessMaterializationOff(const DatalessMaterializationOff&) = delete;
+    DatalessMaterializationOff& operator=(const DatalessMaterializationOff&) = delete;
+
+private:
+    int previous_ = IOPOL_MATERIALIZE_DATALESS_FILES_DEFAULT;
+    bool changed_ = false;
+};
+#endif
+
 /// THE bounded, symlink-safe walker of the plugin: `root` to `max_depth` (root's children are
 /// depth 1). The ORDER of the checks is the safety property: the mount check is a string comparison
 /// that precedes every call touching the path. `visit(entry, kind, budget, counters)` is called for
 /// a directory AFTER its depth and can_enter decisions were applied (so it may be asked about one
 /// that is never opened), and for a regular file; a symlink, junction, FIFO, device or socket is
 /// counted and never reaches it. find_by_hash and search_dir are both thin visitors over this.
+/// On macOS the walker is also the one place that switches the dataless-materialization policy
+/// off (the one OS call the core makes itself), first of all, so it spans the root probe, the
+/// iterator and every per-entry call, and no action riding the walker can omit it.
 template <class VisitFn>
 WalkOutcome walk_bounded(const std::string& root, int max_depth, const WalkLimits& limits,
                          const WalkEnv& env, VisitFn visit) {
+#ifdef __APPLE__
+    const DatalessMaterializationOff dataless_off; // restored when the walk returns
+#endif
     WalkOutcome out;
     out.mount_table_incomplete = !env.mount_table_complete;
     WalkCounters& c = out.c;

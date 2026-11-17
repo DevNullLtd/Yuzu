@@ -4,7 +4,9 @@
   longer follows or matches a symlink or junction below the root, and a directory at `max_depth` is
   matched but not opened (the old walk listed it and discarded the children). Result paths are now
   escaped: a pipe character is escaped, CR and LF show as a space and a trailing backslash shows as a
-  slash. When anything was skipped or the walk stopped early, a `truncated|...` row precedes
+  slash. On Windows, names are now compared and reported as UTF-8, as on macOS and Linux (the earlier
+  walk converted them through the system ANSI code page), so a glob `?` or `[...]` matches one byte of
+  a non-ASCII name, not the whole character. When anything was skipped or the walk stopped early, a `truncated|...` row precedes
   `total_matches|N`; the result is `CONSTRAINED`/`PARTIAL` when a bound tripped, a directory could not
   be read, a network mount was refused or the mount table was unreadable, and stays `UNDECLARED` when
   the only skips are by design (a symlink, junction or FIFO). A pattern over 256 bytes is refused in

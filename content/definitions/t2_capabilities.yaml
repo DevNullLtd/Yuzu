@@ -125,12 +125,13 @@ spec:
     # result|<path>|<directory|file>
     # network_mount_guard|unavailable   (only when the mount table could not be read in full)
     # truncated|<reason>|visited=N|hashed=N|skipped_unreadable=N|skipped_symlink=N|skipped_not_regular=N|skipped_oversize=N|skipped_network_mount=N   (only when something was skipped or the walk stopped early)
-    # total_matches|<count>   (always last)
+    # total_matches|<count>   (the last row of every run that returns 0)
+    # error|<message>   (a failed run, return code 1, in place of total_matches; in regex mode on macOS and Windows it can follow result rows already written)
     columns:
       - name: row_kind
         type: string
         discriminator: true
-        description: "Row shape discriminator (the wire row's leading tag). Values: result (one per matched entry), truncated (at most one, only when something was skipped or the walk stopped early), total_matches (exactly one, always last), network_mount_guard (at most one, after any result rows and ahead of the other two, only when the mount table could not be read in full). Only result rows are data rows to column matchers; the other kinds have a different field count and never match."
+        description: "Row shape discriminator (the wire row's leading tag). Values: result (one per matched entry), truncated (at most one, only when something was skipped or the walk stopped early), total_matches (exactly one, and last, on every run that returns 0; a failed run instead ends with a two-field error|<message> row, which is never a data row), network_mount_guard (at most one, after any result rows and ahead of the other two, only when the mount table could not be read in full). Only result rows are data rows to column matchers; the other kinds have a different field count and never match."
         values: [result, truncated, total_matches, network_mount_guard]
         example: result
         platforms: [windows, linux, darwin]

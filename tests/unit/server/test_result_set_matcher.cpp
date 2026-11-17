@@ -435,6 +435,7 @@ const char* kFindByHash030Schema =
 const char* kSearchSchema =
     R"({"columns":[{"name":"line_number","type":"int32"},{"name":"content","type":"string"},)"
     R"({"name":"total_matches","type":"int32"}]})";
+// search_dir 0.4.0 as an upgraded server still stores it: no discriminator.
 const char* kSearchDirSchema =
     R"({"columns":[{"name":"path","type":"string"},{"name":"entry_type","type":"string"},)"
     R"({"name":"total_matches","type":"int32"}]})";

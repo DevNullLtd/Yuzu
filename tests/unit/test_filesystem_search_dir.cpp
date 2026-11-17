@@ -19,8 +19,14 @@
  *   closing rows     -- search_dir's count row carrying fbh::format_outcome_rows' default label
  *                       (matches_found) instead of its own (total_matches); the guard row, trailer
  *                       and count ORDER is pinned in test_filesystem_find_by_hash.cpp.
+ *   dataless policy  -- walk_bounded not switching the thread's dataless-materialization policy off
+ *                       before its first touch of the root (the first probe call and the name
+ *                       predicate would read the default), or not restoring it, also after a run
+ *                       whose root the mount list refuses.
  *
- * UNGUARDED TU on every OS; only the symlink / FIFO / permission cases are #ifndef _WIN32.
+ * UNGUARDED TU on every OS; the symlink and FIFO cases are #ifndef _WIN32, the junction case is
+ * #ifdef _WIN32, the dataless-policy case is #ifdef __APPLE__ and the raw-byte-name case is
+ * #ifdef __linux__.
  */
 #include <catch2/catch_test_macros.hpp>
 
@@ -40,6 +46,9 @@
 #ifndef _WIN32
 #include <sys/stat.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <sys/resource.h> // getiopolicy_np
+#endif
 #endif
 
 namespace fbh = yuzu::filesystem::find_by_hash;
@@ -391,6 +400,46 @@ TEST_CASE("search_dir: mounts are refused before any hook runs and before symlin
         CHECK(fbh::format_outcome_rows(w.out).front() == "network_mount_guard|unavailable");
     }
 }
+
+#ifdef __APPLE__
+TEST_CASE("search_dir: the walk switches dataless materialization off from its first touch and restores it",
+          "[filesystem][search_dir]") {
+    // The policy is per THREAD and the walk runs on this one, so the walk's own hooks (the probe,
+    // the name predicate) can read it while the walk is in progress.
+    const auto policy = [] {
+        return ::getiopolicy_np(IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_THREAD);
+    };
+    const int before = policy();
+    REQUIRE(before != IOPOL_MATERIALIZE_DATALESS_FILES_OFF);
+    Tree t;
+    t.write("only.txt");
+    std::vector<int> at_probe;
+    std::vector<int> at_name;
+    fbh::WalkEnv env;
+    env.can_enter = [&at_probe, &policy](const fs::path&) {
+        at_probe.push_back(policy());
+        return true;
+    };
+    const auto w = walk(t, sd::MatchType::files, 5, sd::limits_for(100), env,
+                        [&at_name, &policy](std::string_view) {
+                            at_name.push_back(policy());
+                            return true;
+                        });
+    REQUIRE(w.rows.size() == 1);
+    REQUIRE(at_probe.size() == 1); // the root probe: the walk's first touch of the filesystem
+    CHECK(at_probe.front() == IOPOL_MATERIALIZE_DATALESS_FILES_OFF);
+    REQUIRE(at_name.size() == 1);
+    CHECK(at_name.front() == IOPOL_MATERIALIZE_DATALESS_FILES_OFF);
+    CHECK(policy() == before);
+
+    // a run whose root the mount list refuses ends before any hook runs and still restores
+    fbh::WalkEnv refused;
+    refused.network_mounts = {t.str()};
+    const auto r = walk(t, sd::MatchType::files, 5, sd::limits_for(100), refused);
+    CHECK(r.out.c.skipped_network_mount == 1);
+    CHECK(policy() == before);
+}
+#endif
 
 // -- Escaping -------------------------------------------------------------------------------------
 

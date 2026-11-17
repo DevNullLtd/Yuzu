@@ -3,9 +3,9 @@
 // filesystem_acl_parsers.hpp -- pure ACL decoders/formatters for the
 // filesystem plugin's get_acl action.
 //
-// Portable and header-only: only the standard library and <yuzu/string_utils.hpp>, no OS
-// headers, so every host compiles and unit-tests all three legs. The OS shells
-// (getxattr / acl_get_file / GetAce) feed these functions raw bytes or text.
+// Portable and header-only: only the standard library, <yuzu/string_utils.hpp> and
+// <wire_utf8.hpp> (itself OS-free), no OS headers, so every host compiles and unit-tests all three
+// legs. The OS shells (getxattr / acl_get_file / GetAce) feed these functions raw bytes or text.
 //
 // Every leg emits ONE cross-OS row shape:
 //
@@ -18,12 +18,12 @@
 //   * macOS   <type> = allow|deny; <flags> = inheritance flags.
 //   * Windows <type> = allow|deny|allow_object|...|other; <flags> = ACE flags.
 //
-// Row-field escaping (row_field below): CR/LF fold to a space, a TRAILING
-// backslash folds to '/', pipes are escaped. safe_output_field() is NOT used:
-// it folds every backslash and would rewrite `BUILTIN\Users`. Interior
-// backslashes survive because the server decoder (result_parsing.hpp) treats a
-// backslash not followed by a pipe as literal data; only a trailing one would
-// glue onto the field separator as `\|`.
+// Row-field escaping (row_field below): CR/LF fold to a space, a TRAILING backslash folds to '/',
+// a byte that is not well-formed UTF-8, or a NUL, shows as '?', pipes are escaped.
+// safe_output_field() is NOT used: it folds every backslash and would rewrite `BUILTIN\Users`.
+// Interior backslashes survive because the server decoder (result_parsing.hpp) treats a backslash
+// not followed by a pipe as literal data; only a trailing one would glue onto the field separator
+// as `\|`.
 
 #include <yuzu/string_utils.hpp>
 #include <wire_utf8.hpp> // yuzu::shared::scrub_wire_bytes

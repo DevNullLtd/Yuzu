@@ -12,7 +12,13 @@
  *                             regex_error escaping the name predicate (the suite timeout is the
  *                             oracle: no sleep, no timer).
  *   shutdown latch         -- search_dir not wired to the agent's cancel signal.
- *   mount refusal          -- validate_path running before the mount check (a dead mount blocks).
+ *   mount refusal          -- validate_path running before the mount check (a dead mount blocks),
+ *                             for the root AND for the base_dir arm (a base_dir on a mount that is
+ *                             not looked at, or looked at after validate_path's canonical call).
+ *   error order            -- a root check that runs before the parameter checks (a bad root with a
+ *                             bad parameter must answer the parameter error).
+ *   dataless policy        -- the restore after the walk; that the walk switches it off at all is
+ *                             pinned at the core, test_filesystem_search_dir.cpp.
  *   trailer / status       -- a skip that is not reported, or reported with the wrong status.
  *
  * UNGUARDED TU on every OS; only the symlink / permission / live-mount cases are #ifndef _WIN32.
@@ -92,6 +98,15 @@ Rows mount_refusal_rows() {
     return {trailer("none", 0, 0, 0, 0, 1), "total_matches|0"};
 }
 
+/// The five checks of a run refused on its mount spelling alone (the root and base_dir cases).
+void check_mount_refusal(const yuzu::agent::LocalDispatcher::Result& r) {
+    CHECK(r.rc == 0);
+    CHECK(captured_rows(r.captured) == mount_refusal_rows());
+    CHECK(r.result_status == YUZU_RESULT_STATUS_CONSTRAINED);
+    CHECK(r.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+    CHECK(r.result_provenance == "filesystem:skipped_network_mount");
+}
+
 } // namespace
 
 TEST_CASE("filesystem search_dir: a clean run writes exactly the result rows then the count",
@@ -161,6 +176,16 @@ TEST_CASE("filesystem search_dir: error rows for bad parameters and roots",
         CHECK(r.rc == 1);
         CHECK(captured_rows(r.captured) ==
               Rows{"error|root is not accessible or outside allowed base directory"});
+    }
+    {
+        // a bad root AND a bad parameter: the parameter is judged first, before validate_path
+        // touches the root
+        const auto r = search_dir(
+            *plugin,
+            {{"root", (t.root / "absent").string()}, {"pattern", "*"}, {"match_type", "dirs"}});
+        CHECK(r.rc == 1);
+        CHECK(captured_rows(r.captured) ==
+              Rows{"error|invalid match_type (expected directories, files or both)"});
     }
 }
 
@@ -296,13 +321,17 @@ TEST_CASE("filesystem search_dir: a UNC root is refused on its spelling, before 
     auto plugin = load_or_fail();
     if (!plugin)
         return;
-    const auto r =
-        search_dir(*plugin, {{"root", "\\\\yuzu-test-nowhere\\share"}, {"pattern", "*"}});
-    CHECK(r.rc == 0);
-    CHECK(captured_rows(r.captured) == mount_refusal_rows());
-    CHECK(r.result_status == YUZU_RESULT_STATUS_CONSTRAINED);
-    CHECK(r.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
-    CHECK(r.result_provenance == "filesystem:skipped_network_mount");
+    check_mount_refusal(
+        search_dir(*plugin, {{"root", "\\\\yuzu-test-nowhere\\share"}, {"pattern", "*"}}));
+}
+
+TEST_CASE("filesystem search_dir: a UNC base_dir is refused on its spelling, before validate_path",
+          "[filesystem][search_dir][dispatcher]") {
+    auto plugin = load_or_fail();
+    if (!plugin)
+        return;
+    Tree t; // a local root: only the base_dir arm can refuse this run
+    check_mount_refusal(search(*plugin, t, "*", {{"base_dir", "\\\\yuzu-test-nowhere\\share"}}));
 }
 
 #else
@@ -348,12 +377,22 @@ TEST_CASE("filesystem search_dir: a root on a live network mount is refused befo
     // A name that exists nowhere under the mount: were validate_path to run first the answer would
     // be an error row (rc 1); the shell must refuse on the table alone.
     const std::string root = (fs::path(mounts.front()) / "yuzu_test_never_touched").string();
-    const auto r = search_dir(*plugin, {{"root", root}, {"pattern", "*"}});
-    CHECK(r.rc == 0);
-    CHECK(captured_rows(r.captured) == mount_refusal_rows());
-    CHECK(r.result_status == YUZU_RESULT_STATUS_CONSTRAINED);
-    CHECK(r.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
-    CHECK(r.result_provenance == "filesystem:skipped_network_mount");
+    check_mount_refusal(search_dir(*plugin, {{"root", root}, {"pattern", "*"}}));
+}
+
+TEST_CASE("filesystem search_dir: a base_dir on a live network mount is refused before it is touched",
+          "[filesystem][search_dir][dispatcher]") {
+    auto plugin = load_or_fail();
+    if (!plugin)
+        return;
+    const auto mounts = live_network_mounts();
+    if (mounts.empty())
+        SKIP("no network mount in the live mount table (the Windows UNC case pins the same rows)");
+    // A local root: only the base_dir arm can refuse this run. Were validate_path to run first,
+    // canonical(base_dir) would touch the mount and the answer would be an error row.
+    Tree t;
+    const std::string base = (fs::path(mounts.front()) / "yuzu_test_never_touched").string();
+    check_mount_refusal(search(*plugin, t, "*", {{"base_dir", base}}));
 }
 
 TEST_CASE("filesystem search_dir: a symlink is skipped by design -- trailer, still UNDECLARED",
@@ -397,7 +436,9 @@ TEST_CASE("filesystem search_dir: an unreadable subdirectory is CONSTRAINED / PA
 TEST_CASE("filesystem search_dir: the dataless-materialization policy is restored after a run",
           "[filesystem][search_dir][dispatcher]") {
     // The walk switches this per-THREAD policy off and LocalDispatcher runs it on this thread, so
-    // a missed restore would show here.
+    // a missed restore would show here. This is the restore half through the real shell; that the
+    // walk switches the policy off DURING the walk is observed at the core, in
+    // test_filesystem_search_dir.cpp, where the walk's own hooks run on the walking thread.
     auto plugin = load_or_fail();
     if (!plugin)
         return;

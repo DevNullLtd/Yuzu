@@ -18,13 +18,14 @@
 //   total_matches|N
 // Name MATCHING uses the raw bytes of the name; only the emitted row is scrubbed.
 
-#include "filesystem_find_by_hash.hpp"
-
 #include <cstddef>
 #include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
+
+#include "filesystem_acl_parsers.hpp" // acl::row_field
+#include "filesystem_find_by_hash.hpp"
 
 namespace yuzu::filesystem::search_dir {
 

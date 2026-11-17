@@ -108,7 +108,6 @@
 #ifdef __APPLE__
 #include <sys/mount.h> // getmntinfo_r_np
 #include <sys/param.h>
-#include <sys/resource.h> // getiopolicy_np / setiopolicy_np
 #endif
 #endif
 
@@ -347,9 +346,9 @@ std::string compute_hash_unix(const std::string& path, std::string_view algorith
 
 #endif
 
-// ── find_by_hash network-mount list (#5624) ─────────────────────────────
+// ── network-mount list of the bounded walk: find_by_hash (#5624) and search_dir (#6478) ──
 
-// The mount points find_by_hash must not touch, acquired ONCE per dispatch BEFORE any call that
+// The mount points the bounded walk must not touch, acquired ONCE per dispatch BEFORE any call that
 // names the caller's path: an open/stat/getdents on a dead hard-mounted server pins one of the
 // agent's shared command workers with no deadline, so the guard has to decide from a source that
 // never reads the target (the kernel's mount table; on Windows the raw path's own spelling).
@@ -391,7 +390,7 @@ yuzu::filesystem::find_by_hash::MountList find_by_hash_network_mounts(const std:
     if (!table.ok()) {
         static std::once_flag warned;
         std::call_once(warned, [&] {
-            spdlog::warn("filesystem find_by_hash: /proc/self/mountinfo unreadable ({}); the "
+            spdlog::warn("filesystem walk: /proc/self/mountinfo unreadable ({}); the "
                          "network-mount guard is off",
                          table.error == yuzu::shared::ReadError::oversized
                              ? std::string{"larger than the 16 MiB read bound"}
@@ -415,7 +414,7 @@ yuzu::filesystem::find_by_hash::MountList find_by_hash_network_mounts(const std:
     if (n <= 0 || raw == nullptr) {
         static std::once_flag warned;
         std::call_once(warned, [] {
-            spdlog::warn("filesystem find_by_hash: getmntinfo_r_np returned no mounts; the "
+            spdlog::warn("filesystem walk: getmntinfo_r_np returned no mounts; the "
                          "network-mount guard is off");
         });
     }
@@ -429,34 +428,6 @@ yuzu::filesystem::find_by_hash::MountList find_by_hash_network_mounts(const std:
     yuzu::filesystem::find_by_hash::add_data_volume_aliases(out);
     return yuzu::filesystem::find_by_hash::mount_list_from(n > 0 && raw != nullptr, std::move(out));
 }
-
-// Dataless (iCloud / File Provider) files and directories must not be materialised by a walk: the
-// download runs inside a read the deadline cannot interrupt. The policy is per THREAD and this
-// runs on a shared pool thread, so it is read, switched OFF for the walk and restored on every
-// exit path. With it off a dataless file or directory fails its open with EDEADLK, which the walk
-// already counts as unreadable (CONSTRAINED), and a dataless directory is refused by the
-// directory open before the iterator names its children.
-class DatalessMaterializationOff {
-public:
-    DatalessMaterializationOff() {
-        previous_ = ::getiopolicy_np(IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_THREAD);
-        if (previous_ < 0)
-            previous_ = IOPOL_MATERIALIZE_DATALESS_FILES_DEFAULT;
-        changed_ = ::setiopolicy_np(IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_THREAD,
-                                    IOPOL_MATERIALIZE_DATALESS_FILES_OFF) == 0;
-    }
-    ~DatalessMaterializationOff() {
-        if (changed_)
-            ::setiopolicy_np(IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_THREAD,
-                             previous_);
-    }
-    DatalessMaterializationOff(const DatalessMaterializationOff&) = delete;
-    DatalessMaterializationOff& operator=(const DatalessMaterializationOff&) = delete;
-
-private:
-    int previous_ = IOPOL_MATERIALIZE_DATALESS_FILES_DEFAULT;
-    bool changed_ = false;
-};
 
 #else
 
@@ -1737,9 +1708,6 @@ private:
         if (max_results < 1) max_results = 1;
         if (max_results > 1000) max_results = 1000;
 
-#ifdef __APPLE__
-        const DatalessMaterializationOff dataless_off; // restored when the walk returns
-#endif
         // Set by the name predicate when the regex library gives up on a name: the walk then ends
         // through env.cancelled and the shell reports that the answer is not complete.
         bool regex_gave_up = false;
@@ -1778,7 +1746,8 @@ private:
             }
             return emit_walk_outcome(ctx, outcome, sd::kCountLabel);
         } catch (const std::exception& e) {
-            ctx.write_output(std::format("error|search_dir failed: {}", e.what()));
+            ctx.write_output("error|search_dir failed: " +
+                             yuzu::filesystem::acl::row_field(e.what()));
             return 1;
         }
     }
@@ -2461,9 +2430,6 @@ private:
         std::transform(target.begin(), target.end(), target.begin(),
                        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
 
-#ifdef __APPLE__
-        const DatalessMaterializationOff dataless_off; // restored when the walk returns
-#endif
         fbh::WalkEnv env;
         env.cancelled = [] {
             return yuzu::agent::subprocess_cancel_requested();
