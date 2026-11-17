@@ -239,6 +239,48 @@ std::vector<DexPerfDeviceRow> dex_perf_device_list(const DexPerfSnapshot& snap, 
                                                    const std::optional<std::string>& cohort_filter,
                                                    int limit);
 
+// ── A4: device perf sparklines (federated Echo query) — hoisted from dex_routes
+//    (#2146 PR A) so the dashboard fragments and any REST/MCP twin share ONE copy of
+//    the canned SQL and the defensive parsers ──────────────────────────────────
+
+/// One parsed hourly perf point out of the device's Echo edge warehouse
+/// (`$Perf_Hourly` — see agents/plugins/echo perf tier, BRD A1).
+struct DexPerfPoint {
+    std::int64_t hour_ts{0};
+    double cpu_avg{0.0};      ///< % busy, clamped 0..100
+    double mem_avg{0.0};      ///< % physical used, clamped 0..100
+    double disk_lat_ms{0.0};  ///< worse of read/write avg per-IO service time
+};
+
+/// The canned per-device warehouse query — last 48 hourly rollups, reversed to
+/// chronological at parse. `$Perf_Hourly` is the operator-SQL dollar name; the agent
+/// translates it and runs it through EchoDatabase::execute_user_query (the read-only
+/// authorizer chokepoint, #760/#631), exactly like operator SQL from the Echo page. The
+/// raw samples never leave the device until this on-demand, per-device,
+/// permission-gated query (ADR-0004 federated model).
+inline constexpr const char* kDexPerfSql =
+    "SELECT hour_ts, cpu_avg, mem_avg, read_lat_us_avg, write_lat_us_avg "
+    "FROM $Perf_Hourly ORDER BY hour_ts DESC LIMIT 48";
+
+/// The canned per-app query (A2 `$ProcPerf_Hourly` tier) — last 24 h aggregated per
+/// application, top 25 by sample-weighted CPU. Runs through the same read-only
+/// authorizer chokepoint (aggregate functions are permitted; #760/#631). The epoch
+/// cutoff is `now_epoch_s - 86400`, computed server-side and embedded as a literal — no
+/// SQL date functions, no user input. AS aliases pin the schema line names
+/// parse_dex_procperf_output locates columns by.
+std::string dex_procperf_sql_at(std::int64_t now_epoch_s);
+
+/// dex_procperf_sql_at() for the current wall-clock time.
+std::string dex_procperf_sql();
+
+/// PURE: parse the `echo.sql` pipe-delimited output (`__schema__|col|…` header +
+/// data rows) into perf points, chronologically sorted. Defensive against
+/// agent-controlled bytes: columns are located by NAME from the schema line,
+/// non-finite/negative numbers are rejected per-field, malformed rows are
+/// skipped, and at most 200 rows are read. Returns empty on an `error|…`
+/// payload or a missing schema line.
+std::vector<DexPerfPoint> parse_dex_perf_output(const std::string& output);
+
 // ── F2a PR2: device drill perf extensions (relocated from dex_routes.hpp,
 //    #4626 Concern B — dex_perf_ui.cpp needs this pure struct without pulling
 //    in the httplib-coupled route header) ──────────────────────────────────
@@ -255,5 +297,12 @@ struct DexProcPerfRow {
     double ws_max_bytes{0.0};
     std::int64_t hours{0}; ///< distinct hourly rollups the app appeared in
 };
+
+/// PURE: parse the canned per-app `echo.sql` output (same defensive contract as
+/// parse_dex_perf_output: columns by NAME from the `__schema__|…` line,
+/// non-finite/negative rejected per-field, malformed rows skipped, ≤100 rows,
+/// empty on `error|…`). cpu percentages clamp to 0..100 (a lie, not an
+/// outlier); working-set bytes above 1 PiB are rejected as forged.
+std::vector<DexProcPerfRow> parse_dex_procperf_output(const std::string& output);
 
 } // namespace yuzu::server

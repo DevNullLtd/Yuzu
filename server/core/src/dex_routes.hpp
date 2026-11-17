@@ -187,22 +187,10 @@ std::string render_dex_observation_fragment(const GuardianObservationRow& obs);
 /// `DexAgentResponse` — hoisted to `dex_view_types.hpp` (store-free; see that
 /// header for the doc comment).
 
-/// One parsed hourly perf point out of the device's Echo edge warehouse
-/// (`$Perf_Hourly` — see agents/plugins/echo perf tier, BRD A1).
-struct DexPerfPoint {
-    std::int64_t hour_ts{0};
-    double cpu_avg{0.0};      ///< % busy, clamped 0..100
-    double mem_avg{0.0};      ///< % physical used, clamped 0..100
-    double disk_lat_ms{0.0};  ///< worse of read/write avg per-IO service time
-};
-
-/// PURE: parse the `echo.sql` pipe-delimited output (`__schema__|col|…` header +
-/// data rows) into perf points, chronologically sorted. Defensive against
-/// agent-controlled bytes: columns are located by NAME from the schema line,
-/// non-finite/negative numbers are rejected per-field, malformed rows are
-/// skipped, and at most 200 rows are read. Returns empty on an `error|…`
-/// payload or a missing schema line.
-std::vector<DexPerfPoint> parse_dex_perf_output(const std::string& output);
+// `DexPerfPoint`, `kDexPerfSql`, `dex_procperf_sql()`, `parse_dex_perf_output` and
+// `parse_dex_procperf_output` live in the pure `dex_perf_model.hpp` (#2146 PR A);
+// re-exported here transitively (it is already included above), so every existing
+// caller of THIS header is unaffected.
 
 /// PURE: render the device-performance panel (per-metric sparkline SVG +
 /// now/min/max facts) from parsed points. Empty input renders the honest
@@ -216,13 +204,6 @@ std::string render_dex_perf_panel(const std::vector<DexPerfPoint>& points);
 // httplib-coupled one. Re-exported here transitively (dex_perf_model.hpp is
 // already included above), so every existing caller of THIS header is
 // unaffected.
-
-/// PURE: parse the canned per-app `echo.sql` output (same defensive contract as
-/// parse_dex_perf_output: columns by NAME from the `__schema__|…` line,
-/// non-finite/negative rejected per-field, malformed rows skipped, ≤100 rows,
-/// empty on `error|…`). cpu percentages clamp to 0..100 (a lie, not an
-/// outlier); working-set bytes above 1 PiB are rejected as forged.
-std::vector<DexProcPerfRow> parse_dex_procperf_output(const std::string& output);
 
 /// PURE: render the per-application panel from parsed rows. App names link to
 /// the existing app reliability drill (per-app perf ↔ per-app crashes cross-
