@@ -945,10 +945,23 @@ version, missing ignore file) fails it too: it never reads as a pass.
 verification build already loaded (step "Scan image for fixable CRITICAL vulnerabilities
 (pre-push gate)", between the healthcheck probe and the tag re-check). `docker-publish-postgres`
 gains its own no-push build for the scan. `docker-publish-agent-bundle` runs
-`scripts/build-agent-bundle.sh` without `--push`, scans the local image, then pushes it. The
-push build reuses the scanned build's layers from the same buildkitd, so what was scanned is
-what is pushed. `pre-release.yml` `security-scan` runs the same script on all seven published
-tags afterwards with a fresher DB (detective: see "Pre-release QA").
+`scripts/build-agent-bundle.sh` without `--push`, scans the local image, then pushes it.
+`pre-release.yml` `security-scan` runs the same script on all seven published tags afterwards
+with a fresher DB (detective: see "Pre-release QA"); it pulls each tag first.
+
+**Scanning the right image.** Four Big Tam runners share one Docker daemon, so a tag is not a
+safe handle. Each verification build gets a tag salted with the commit, run id and run attempt
+(under `yuzu-hc-verify/`, so `cache-prune.yml`'s sweep still reclaims a leaked one), and
+`scripts/ci/image-identity.sh pin` resolves it to its image ID once, right after the build;
+the healthcheck probe and the gate then use the ID. Every Trivy call passes
+`--image-src docker`, so a missing local image fails the gate instead of a same-named image
+being fetched from a registry and scanned. The push build is a second build that normally
+reuses the scanned build's layers, but nothing forces it to: right after the push, before any
+SBOM, attestation or signature, `image-identity.sh verify-pushed` reads the pushed digest's
+layer diff IDs from the registry and fails the job unless they equal the scanned image's (the
+image config, with its labels and timestamps, legitimately differs). The agent bundle is
+pushed from the scanned local image itself, after checking its tag still names the scanned ID.
+A mismatch after the push leaves that tag in GHCR unsigned, and the release job does not run.
 
 **Current packages.** The Debian and Alpine images upgrade their packages in the final stage
 (`apt-get upgrade`, `apk upgrade`; `yuzu-postgres` holds the PGDG server packages so the

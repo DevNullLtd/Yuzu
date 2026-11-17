@@ -1569,7 +1569,7 @@ jobs:
           platforms: linux/amd64
           push: false
           load: true
-          tags: yuzu-hc-verify/${{ matrix.image }}:${{ github.sha }}
+          tags: yuzu-hc-verify/${{ matrix.image }}:${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           build-args: |
             TRIPLET=x64-linux
             YUZU_BUILD_JOBS=${{ env.YUZU_BUILD_JOBS }}
@@ -1578,31 +1578,43 @@ jobs:
           provenance: false
           sbom: false
 
+      # Pin the build by image ID (WP15/S9). The tag is salted per run attempt,
+      # but the Big Tam runners share one Docker daemon, so every check below
+      # uses the ID resolved here, never the tag, and the layer list recorded
+      # here is what "Verify the pushed image is the scanned one" compares
+      # the pushed image against.
+      - name: Pin the built image by ID
+        id: built
+        env:
+          IMAGE: yuzu-hc-verify/${{ matrix.image }}:${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+        run: scripts/ci/image-identity.sh pin "$IMAGE" >> "$GITHUB_OUTPUT"
+
       - name: Verify healthcheck runtime invariant
         env:
           ROLE: ${{ matrix.image }}
-          IMAGE: yuzu-hc-verify/${{ matrix.image }}:${{ github.sha }}
+          IMAGE: ${{ steps.built.outputs.id }}
         run: scripts/ci/verify-healthcheck-invariants.sh "${ROLE}=${IMAGE}"
 
       # ── Image vulnerability gate (WP15/S9) ─────────────────────────────
-      # Scans the image just built and probed, BEFORE "Build and push": a
-      # CRITICAL vulnerability with a fix, not accepted in .trivyignore.yaml,
-      # fails this leg, so no tag is pushed and the release job (which needs
-      # this job) does not run. The push build reuses this build's layers from
-      # the same buildkitd (see above), so what was scanned is what is pushed.
+      # Scans the image just built and probed (by its pinned ID), BEFORE
+      # "Build and push": a CRITICAL vulnerability with a fix, not accepted in
+      # .trivyignore.yaml, fails this leg, so no tag is pushed and the release
+      # job (which needs this job) does not run. The push build normally
+      # reuses this build's layers from the same buildkitd (see above);
+      # "Verify the pushed image is the scanned one" proves it did.
       # The script installs its own pinned, checksum-verified Trivy and keeps
       # the DB under RUNNER_TEMP, never $HOME (one OS identity for all Big Tam
       # runners, #1871). Recovery: docs/ci-architecture.md "Release image
       # vulnerability gate".
       - name: Scan image for fixable CRITICAL vulnerabilities (pre-push gate)
         env:
-          IMAGE: yuzu-hc-verify/${{ matrix.image }}:${{ github.sha }}
+          IMAGE: ${{ steps.built.outputs.id }}
         run: scripts/ci/image-vuln-gate.sh "$IMAGE"
 
       - name: Remove the verification image
         if: always()
         env:
-          IMAGE: yuzu-hc-verify/${{ matrix.image }}:${{ github.sha }}
+          IMAGE: yuzu-hc-verify/${{ matrix.image }}:${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
         run: docker image rm -f "$IMAGE" || true
 
       - name: Refuse to publish if the tag moved (#5282)
@@ -1640,6 +1652,18 @@ jobs:
           # attestation verify` and `cosign verify`.
           provenance: false
           sbom: false
+
+      # WP15/S9: the push build is a second build. It normally reuses the
+      # scanned build's layers, but nothing forces it to, so before the image
+      # is described, attested or signed, prove its filesystem (layer diff
+      # IDs) is the one that was probed and scanned. On a mismatch this job
+      # fails: the tag is already in GHCR but unsigned, and the release job
+      # does not run.
+      - name: Verify the pushed image is the scanned one
+        env:
+          REF: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-${{ matrix.image }}@${{ steps.build.outputs.digest }}
+          LAYERS: ${{ steps.built.outputs.layers }}
+        run: scripts/ci/image-identity.sh verify-pushed "$REF" "$LAYERS"
 
       # ── Docker image SBOM (CycloneDX + SPDX) ────────────────────────
       # Syft scans the pushed image by digest (pulls manifest +
@@ -1807,7 +1831,8 @@ jobs:
       # ── Image vulnerability gate (WP15/S9) ─────────────────────────────
       # Build WITHOUT pushing and scan before "Build and push", as in
       # docker-publish. No `cache-to`: this build shares the buildkitd
-      # instance with the push build, which then reuses its layers (the
+      # instance with the push build, which normally reuses its layers, as
+      # "Verify the pushed image is the scanned one" proves (the
       # final stage's apt-get upgrade is not run twice; YUZU_PACKAGE_REFRESH,
       # identical in both builds, makes it run once per attempt rather than be
       # served from an earlier release's cache). The tag is salted per run (the
@@ -1828,9 +1853,16 @@ jobs:
           provenance: false
           sbom: false
 
-      - name: Scan image for fixable CRITICAL vulnerabilities (pre-push gate)
+      # Pin by image ID; see the same step in docker-publish.
+      - name: Pin the built image by ID
+        id: built
         env:
           IMAGE: yuzu-hc-verify/postgres-vuln-scan:${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+        run: scripts/ci/image-identity.sh pin "$IMAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Scan image for fixable CRITICAL vulnerabilities (pre-push gate)
+        env:
+          IMAGE: ${{ steps.built.outputs.id }}
         run: scripts/ci/image-vuln-gate.sh "$IMAGE"
 
       - name: Remove the scan image
@@ -1865,6 +1897,13 @@ jobs:
           # verification path, same as docker-publish).
           provenance: false
           sbom: false
+
+      # See the same step in docker-publish (WP15/S9).
+      - name: Verify the pushed image is the scanned one
+        env:
+          REF: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-postgres@${{ steps.build.outputs.digest }}
+          LAYERS: ${{ steps.built.outputs.layers }}
+        run: scripts/ci/image-identity.sh verify-pushed "$REF" "$LAYERS"
 
       # ── Docker image SBOM (CycloneDX + SPDX) ────────────────────────
       - name: Generate image SBOM (CycloneDX)
@@ -2097,7 +2136,7 @@ jobs:
           platforms: linux/amd64
           push: false
           load: true
-          tags: yuzu-hc-verify/${{ matrix.image }}-chisel:${{ github.sha }}
+          tags: yuzu-hc-verify/${{ matrix.image }}-chisel:${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           build-args: |
             YUZU_BUILD_JOBS=${{ env.YUZU_BUILD_JOBS }}
             YUZU_PACKAGE_REFRESH=${{ github.run_id }}-${{ github.run_attempt }}
@@ -2105,25 +2144,33 @@ jobs:
           provenance: false
           sbom: false
 
+      # Pin by image ID; see the same step in docker-publish.
+      - name: Pin the built image by ID
+        id: built
+        env:
+          IMAGE: yuzu-hc-verify/${{ matrix.image }}-chisel:${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+        run: scripts/ci/image-identity.sh pin "$IMAGE" >> "$GITHUB_OUTPUT"
+
       - name: Verify healthcheck runtime invariant
         env:
           ROLE: ${{ matrix.image }}-chisel
-          IMAGE: yuzu-hc-verify/${{ matrix.image }}-chisel:${{ github.sha }}
+          IMAGE: ${{ steps.built.outputs.id }}
         run: scripts/ci/verify-healthcheck-invariants.sh "${ROLE}=${IMAGE}"
 
       # Image vulnerability gate (WP15/S9), before the push; see the same step
       # in docker-publish. The chisel stage cuts its slices from the live
-      # Ubuntu archive (security and updates pockets), so the push build
-      # reuses these layers rather than cutting again.
+      # Ubuntu archive (security and updates pockets); the push build normally
+      # reuses these layers rather than cutting again, and "Verify the pushed
+      # image is the scanned one" proves it did.
       - name: Scan image for fixable CRITICAL vulnerabilities (pre-push gate)
         env:
-          IMAGE: yuzu-hc-verify/${{ matrix.image }}-chisel:${{ github.sha }}
+          IMAGE: ${{ steps.built.outputs.id }}
         run: scripts/ci/image-vuln-gate.sh "$IMAGE"
 
       - name: Remove the verification image
         if: always()
         env:
-          IMAGE: yuzu-hc-verify/${{ matrix.image }}-chisel:${{ github.sha }}
+          IMAGE: yuzu-hc-verify/${{ matrix.image }}-chisel:${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
         run: docker image rm -f "$IMAGE" || true
 
       - name: Refuse to publish if the tag moved (#5282)
@@ -2162,6 +2209,13 @@ jobs:
           # attestation verify` and `cosign verify`.
           provenance: false
           sbom: false
+
+      # See the same step in docker-publish (WP15/S9).
+      - name: Verify the pushed image is the scanned one
+        env:
+          REF: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-${{ matrix.image }}-chisel@${{ steps.build.outputs.digest }}
+          LAYERS: ${{ steps.built.outputs.layers }}
+        run: scripts/ci/image-identity.sh verify-pushed "$REF" "$LAYERS"
 
       # ── Docker image SBOM (CycloneDX + SPDX) ────────────────────────
       # Mirrors docker-publish's SBOM steps so the chisel demo images get
@@ -2333,11 +2387,18 @@ jobs:
             --registry "$REGISTRY" \
             --signer-repo "$SIGNER_REPO"
 
-      # Image vulnerability gate (WP15/S9), before the push; see the same step
-      # in docker-publish.
-      - name: Scan image for fixable CRITICAL vulnerabilities (pre-push gate)
+      # Pin by image ID, then gate (WP15/S9); see the same steps in
+      # docker-publish. The push below pushes this local tag, so it is checked
+      # to still name the scanned ID first.
+      - name: Pin the built image by ID
+        id: built
         env:
           IMAGE: ${{ steps.ref.outputs.image }}:${{ steps.ref.outputs.version }}
+        run: scripts/ci/image-identity.sh pin "$IMAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Scan image for fixable CRITICAL vulnerabilities (pre-push gate)
+        env:
+          IMAGE: ${{ steps.built.outputs.id }}
         run: scripts/ci/image-vuln-gate.sh "$IMAGE"
 
       - name: Refuse to publish if the tag moved (#5282)
@@ -2346,7 +2407,14 @@ jobs:
       - name: Push agent bundle
         env:
           IMAGE: ${{ steps.ref.outputs.image }}:${{ steps.ref.outputs.version }}
-        run: docker push "$IMAGE"
+          SCANNED_ID: ${{ steps.built.outputs.id }}
+        run: |
+          now="$(docker image inspect --format '{{.Id}}' "$IMAGE")"
+          if [ "$now" != "$SCANNED_ID" ]; then
+            echo "::error::$IMAGE now names $now, not the scanned image $SCANNED_ID; refusing to push"
+            exit 1
+          fi
+          docker push "$IMAGE"
 
       - name: Resolve pushed image digest
         id: digest
@@ -2356,6 +2424,13 @@ jobs:
             --format '{{.Manifest.Digest}}')"
           echo "value=${DIGEST}" >> "$GITHUB_OUTPUT"
           echo "Resolved ${{ steps.ref.outputs.image }} digest: ${DIGEST}"
+
+      # See the same step in docker-publish (WP15/S9).
+      - name: Verify the pushed image is the scanned one
+        env:
+          REF: ${{ steps.ref.outputs.image }}@${{ steps.digest.outputs.value }}
+          LAYERS: ${{ steps.built.outputs.layers }}
+        run: scripts/ci/image-identity.sh verify-pushed "$REF" "$LAYERS"
 
       - name: Generate bundle SBOM (CycloneDX)
         uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3

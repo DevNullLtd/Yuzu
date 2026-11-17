@@ -18,8 +18,11 @@
 # Usage:
 #   scripts/ci/image-vuln-gate.sh [--report-dir DIR] IMAGE [IMAGE...]
 #
-# IMAGE is anything `trivy image` accepts; a local Docker image is scanned from
-# the daemon (no pull).
+# IMAGE must be in the local Docker daemon: a tag or, better, an image ID (see
+# scripts/ci/image-identity.sh). Every scan passes `--image-src docker`, so
+# Trivy never falls back to containerd, podman or a registry: a missing image
+# fails the gate instead of a same-named image from elsewhere being scanned and
+# passed. pre-release.yml `docker pull`s the published tags first.
 #
 # Environment:
 #   TRIVY_BIN        use this trivy binary instead of installing the pinned one
@@ -117,13 +120,16 @@ for image in "${IMAGES[@]}"; do
     echo "==> $image"
     report=(--format table)
     if [ -n "$REPORT_DIR" ]; then
-        name="$(printf '%s' "$image" | sed 's#.*/##; s#[@:].*##')"
+        case "$image" in
+            sha256:*) name="image-${image:7:12}" ;;
+            *) name="$(printf '%s' "$image" | sed 's#.*/##; s#[@:].*##')" ;;
+        esac
         report+=(--output "$REPORT_DIR/trivy-${name}.txt")
     fi
 
     # The record: HIGH and CRITICAL, fixed or not. Informational, but a scan
     # that cannot complete is a failure, not an empty report.
-    if ! "$TRIVY" image --quiet --scanners vuln --severity HIGH,CRITICAL \
+    if ! "$TRIVY" image --quiet --image-src docker --scanners vuln --severity HIGH,CRITICAL \
             --ignorefile "$IGNORE_FILE" "${report[@]}" "$image"; then
         err "$image: Trivy could not scan the image (treated as a failure)"
         failed=1
@@ -134,7 +140,7 @@ for image in "${IMAGES[@]}"; do
     # The gate. Exit code 3 means findings; anything else non-zero is a Trivy
     # error, which must not read as a pass either.
     rc=0
-    "$TRIVY" image --quiet --scanners vuln --severity CRITICAL --ignore-unfixed \
+    "$TRIVY" image --quiet --image-src docker --scanners vuln --severity CRITICAL --ignore-unfixed \
         --ignorefile "$IGNORE_FILE" --exit-code 3 --format table "$image" || rc=$?
     case "$rc" in
         0) echo "    pass: no fixable CRITICAL vulnerability" ;;
