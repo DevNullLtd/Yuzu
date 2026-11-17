@@ -15,7 +15,12 @@
  *  - slice window: running the thin parser over the whole-file reader instead of the rebased one
  *    returns the NEIGHBOUR's install name in the adjacent-slice cases (asserted directly by the
  *    "unwindowed" check in those cases) and fails the window assertion on the counting reader.
- *  - program-header / dynamic / load-command ceilings: removing any one fails its bounds row.
+ *  - program-header / dynamic / load-command ceilings: removing any one fails its bounds row (each
+ *    fixture holds the bytes the ceiling refuses, so the file-size check cannot stand in for it).
+ *  - ELF program-header entry size: a check that only refuses a size BELOW the format's (56 / 32)
+ *    fails the stride row, whose table sits at that larger stride and parses at the format's own.
+ *  - Mach-O name cap: copying the whole command tail instead of the cap plus its NUL still passes
+ *    the boundary rows (it is result-equivalent); the rows pin the 255 / 256 edge itself.
  *  - overflow-safe arithmetic: replacing range_ok / add_ok with a plain offset + len compare fails the
  *    wrap-around rows.
  *  - not_library vs unreadable: collapsing the two fails the magic / file-type rows.
@@ -297,10 +302,40 @@ TEST_CASE("elf_soname: every bound is unreadable and nothing reads outside the f
         const unsigned w = is64 ? 8 : 4;
         const auto base = make_elf(is64, false, "libfoo.so.1");
 
-        { // program-header count past 128
+        { // program-header count past 128: the file holds all 129 entries (and 128 parse to a
+          // value), so only the ceiling refuses it
             auto e = base;
+            e.b.resize(16 * 1024, '\0');
+            put(e.b, is64 ? 56 : 44, 128, 2, false);
+            const auto at_ceiling = run_elf(e.b);
+            REQUIRE(at_ceiling.has_value());
+            REQUIRE(at_ceiling->has_value());
+            CHECK(**at_ceiling == "libfoo.so.1");
             put(e.b, is64 ? 56 : 44, 129, 2, false);
             expect_error(run_elf(e.b), NativeError::unreadable);
+        }
+        { // program-header entry size above the format's own (56 / 32): the table sits at the end
+          // of the file at that stride, and the same entries parse to a value at the format's own
+          // size, so only the exact-size rule refuses it
+            for (const std::size_t stride : {base.phent, base.phent + 8}) {
+                auto e = base;
+                const std::size_t tbl = e.b.size();
+                e.b.resize(tbl + 2 * stride, '\0');
+                for (std::size_t i = 0; i < 2; ++i)
+                    e.b.replace(tbl + i * stride, e.phent,
+                                base.b.substr(e.ph_off + i * e.phent, e.phent));
+                put(e.b, is64 ? 32 : 28, tbl, w, false);
+                put(e.b, is64 ? 54 : 42, stride, 2, false);
+                INFO("stride=" << stride);
+                if (stride == e.phent) {
+                    const auto r = run_elf(e.b);
+                    REQUIRE(r.has_value());
+                    REQUIRE(r->has_value());
+                    CHECK(**r == "libfoo.so.1");
+                } else {
+                    expect_error(run_elf(e.b), NativeError::unreadable);
+                }
+            }
         }
         { // program-header table past the end of the file
             auto e = base;
@@ -410,8 +445,15 @@ TEST_CASE("macho_dylib_id: every bound is unreadable and nothing reads outside t
     const std::size_t hdr = 32;
     const std::size_t id_at = hdr + 16; // the LC_ID_DYLIB command (after the 16-byte filler)
 
-    { // sizeofcmds past 256 KiB
+    { // sizeofcmds past 256 KiB: the file holds the whole region (and exactly 256 KiB parses to a
+      // value), so only the ceiling refuses it
         auto b = base;
+        b.resize(hdr + 256 * 1024 + 1, '\0');
+        put(b, 20, 256 * 1024, 4, false);
+        const auto at_ceiling = run_macho(b);
+        REQUIRE(at_ceiling.has_value());
+        REQUIRE(at_ceiling->has_value());
+        CHECK((*at_ceiling)->install_name == "@rpath/libfoo.1.dylib");
         put(b, 20, 256 * 1024 + 1, 4, false);
         expect_error(run_macho(b), NativeError::unreadable);
     }
@@ -465,10 +507,20 @@ TEST_CASE("macho_dylib_id: every bound is unreadable and nothing reads outside t
             b[i] = 'a';
         expect_error(run_macho(b), NativeError::unreadable);
     }
-    { // a name over the 255-byte cap
-        MachoSpec s;
-        s.name = std::string(300, 'a');
-        expect_error(run_macho(make_macho(s)), NativeError::unreadable);
+    { // the name cap is 255 bytes: 255 is returned, 256 and 300 are unreadable
+        for (const std::size_t len : {std::size_t{255}, std::size_t{256}, std::size_t{300}}) {
+            MachoSpec s;
+            s.name = std::string(len, 'a');
+            INFO("name length=" << len);
+            if (len <= 255) {
+                const auto r = run_macho(make_macho(s));
+                REQUIRE(r.has_value());
+                REQUIRE(r->has_value());
+                CHECK((*r)->install_name == s.name);
+            } else {
+                expect_error(run_macho(make_macho(s)), NativeError::unreadable);
+            }
+        }
     }
     { // header shorter than the fixed header
         expect_error(run_macho(base.substr(0, 20)), NativeError::unreadable);

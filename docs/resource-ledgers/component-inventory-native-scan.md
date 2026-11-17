@@ -15,14 +15,19 @@ what is listed.
   all**. The walk does not enter an excluded directory (macOS `/usr/local/Cellar`,
   `/opt/homebrew/Cellar`); each is counted, not silently skipped.
 - **Per library:** one open, then only header reads through that descriptor, never the whole file:
-  at most 128 ELF program headers (up to 7 KiB), 64 KiB of dynamic section, a 256-byte name read, and
+  at most 128 ELF program headers of exactly the format's own entry size (56 or 32 bytes, so up to
+  7 KiB; any other `e_phentsize` is `unreadable`), 64 KiB of dynamic section, a 256-byte name read, and
   for Mach-O at most 16 fat slices (up to 512 bytes of architecture table), 4,096 load commands in at
-  most 256 KiB, a 255-byte name. Every offset plus length is checked against the file size (inside a
-  fat file, the slice size) with overflow-safe arithmetic before a read; a count or size past a bound is
-  `unreadable` for that file, never a partial answer.
-- **Memory:** the buffers above are `std::string` owned by the parser's frame, freed at scope end, at
-  most about 330 KiB at the worst for one file; the rows are bounded by count (5,000) and hold paths of
-  at most 32 levels. No allocation persists between runs.
+  most 256 KiB, a 255-byte name (at most 256 bytes copied out of the command buffer). Every offset plus
+  length is checked against the file size (inside a fat file, the slice size) with overflow-safe
+  arithmetic before a read; a count or size past a bound is `unreadable` for that file, never a partial
+  answer.
+- **Memory:** the buffers above are `std::string` owned by the parser's frame, freed at scope end. The
+  worst case for one file, summed from the ceilings: about 74 KiB for ELF (16-byte identification,
+  64-byte header, 7 KiB of program headers, 64 KiB of dynamic section, a 256-byte name, and at most 128
+  program-header summaries of 24 bytes) and about 257 KiB for Mach-O (a 512-byte fat architecture
+  table, a 32-byte thin header, 256 KiB of load commands, a 256-byte name). The rows are bounded by
+  count (5,000) and hold paths of at most 32 levels. No allocation persists between runs.
 - **No subprocess, no thread, no socket, no temp file, no mapped file, no `FILE*`.** The plugin
   context pointer is the one stored in `init` and cleared in `shutdown`, as for `scan`; `native`
   writes no heartbeat key.

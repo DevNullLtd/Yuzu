@@ -1,9 +1,9 @@
 # ClusterFuzzLite — continuous fuzzing of Yuzu's untrusted-input parsers
 
 `cflite-pr.yml` builds this directory's `Dockerfile` + `build.sh` on any PR
-touching the fuzzed compile closure — seven parser families (six under
-`server/core/src/`, the component_inventory ZIP reader under
-`agents/plugins/component_inventory/src/`), plus `tests/fuzz/` and `.clusterfuzzlite/` (see the
+touching the fuzzed compile closure — eight parser families (six under
+`server/core/src/`, the component_inventory ZIP reader and native-library (ELF and Mach-O)
+parsers under `agents/plugins/component_inventory/src/`), plus `tests/fuzz/` and `.clusterfuzzlite/` (see the
 workflow's `paths:`) — and fuzzes **what the PR changed** for a short budget
 (code-change mode, ASan). Findings surface as the workflow's SARIF / crash
 artifacts — file them as issues; don't fix them inside unrelated PRs.

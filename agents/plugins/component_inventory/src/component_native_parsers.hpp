@@ -154,10 +154,11 @@ elf_soname(const ReadAt& rd, std::uint64_t file_size) {
         return bad();
     if (phnum == 0)
         return std::optional<std::string>{};
-    const std::uint64_t min_phent = is64 ? 56 : 32;
-    if (phentsize < min_phent)
+    // The loader's own rule for each class: the entry size is exactly the format's, so the table
+    // read below is at most 128 x 56 bytes (7 KiB), never a size the file chooses.
+    if (phentsize != (is64 ? 56U : 32U))
         return bad();
-    const auto phdrs = read_exact(rd, file_size, phoff, phnum * phentsize); // <= 128 x 65535
+    const auto phdrs = read_exact(rd, file_size, phoff, phnum * phentsize);
     if (!phdrs)
         return bad();
 
@@ -288,8 +289,10 @@ macho_thin_dylib_id(const ReadAt& rd, std::uint64_t size) {
             if (name_off < 24 || name_off >= cmdsize)
                 return bad();
             const auto cur = static_cast<std::uint32_t>(load(*cmds, static_cast<std::size_t>(pos) + 16, 4, big));
-            const auto name =
-                c_string(cmds->substr(static_cast<std::size_t>(pos + name_off), static_cast<std::size_t>(cmdsize - name_off)));
+            // At most the name cap plus its NUL is copied out of the command buffer, as for ELF.
+            const auto room = std::min<std::uint64_t>(cmdsize - name_off, kMaxNativeNameBytes + 1);
+            const auto name = c_string(cmds->substr(static_cast<std::size_t>(pos + name_off),
+                                                    static_cast<std::size_t>(room)));
             if (!name)
                 return bad();
             return std::optional<DylibId>{DylibId{*name, cur}};

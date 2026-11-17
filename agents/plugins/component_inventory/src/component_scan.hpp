@@ -522,13 +522,8 @@ struct Answer {
     std::size_t roots_skipped{0};   // the targets' dropped roots (links plus network)
 };
 
-/**
- * Scan what the OS leg offers, or nothing. `Targets` is the leg's struct (roots,
- * mount_table_unreadable, roots_link_skipped, roots_network_skipped); `make_fs(t)` builds its FsOps.
- * An unreadable mount table means a network mount cannot be told from a local one: nothing is
- * walked, `make_fs` is not even called, and the answer is constrained with that cause. Pure over
- * its arguments, so a test passes a factory that fails if it is ever reached.
- */
+/// The verdict, the status row for `action` and the comp rows of a finished scan: one builder for
+/// `scan` and `native`.
 template <class Targets>
 [[nodiscard]] inline Answer assemble_answer(std::string_view action, std::string_view os, const Targets& t,
                                             ScanResult res) {
@@ -546,6 +541,13 @@ template <class Targets>
     return a;
 }
 
+/**
+ * Scan what the OS leg offers, or nothing. `Targets` is the leg's struct (roots,
+ * mount_table_unreadable, roots_link_skipped, roots_network_skipped); `make_fs(t)` builds its FsOps.
+ * An unreadable mount table means a network mount cannot be told from a local one: nothing is
+ * walked, `make_fs` is not even called, and the answer is constrained with that cause. Pure over
+ * its arguments, so a test passes a factory that fails if it is ever reached.
+ */
 template <class Targets, class MakeFs>
 [[nodiscard]] inline Answer answer_scan(std::string_view os, const Targets& t, MakeFs&& make_fs,
                                         const WalkLimits& limits) {
