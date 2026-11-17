@@ -724,6 +724,14 @@ int main(int argc, char* argv[]) {
         // flag cannot accept a value the pool will silently refuse to honour.
         ->check(CLI::Range(std::size_t{0}, yuzu::server::detail::kMaxHttpWorkerThreads))
         ->envname("YUZU_HTTP_WORKER_THREADS");
+    app.add_option("--inventory-export-concurrency", cfg.inventory_export_concurrency,
+                   "Concurrent streamed installed-software exports, server-wide "
+                   "(GET /api/v1/inventory/software/export). Each open export holds one HTTP "
+                   "worker until it finishes and is one lease from the --max-sse-streams "
+                   "budget; this caps those leases. A request over the cap is answered 503 "
+                   "with a retry hint. Default 2.")
+        ->check(CLI::Range(1, 16))
+        ->envname("YUZU_INVENTORY_EXPORT_CONCURRENCY");
     app.add_option("--inventory-sync-cooldown", cfg.inventory_sync_cooldown_s,
                    "Seconds between two on-demand software-inventory sync runs of the same group, "
                    "scope expression or the whole fleet (POST /api/v1/hardware/sync and the MCP "

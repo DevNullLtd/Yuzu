@@ -4954,6 +4954,8 @@ bool GuardianSparkRuntime::stage_baseline_locked(const std::string& rule_id,
             return true;
         }
         staged_baselines_.emplace(rule_id, CapturedBaseline{rule_id, path, hash});
+        // #5605: still inside the try, so a throwing emplace leaves map and mirror both untouched.
+        staged_baseline_count_->store(staged_baselines_.size(), std::memory_order_relaxed);
         return true;
     } catch (...) {
         // bad_alloc: counted, and reported to the caller, which keeps the committed baseline,
@@ -5016,6 +5018,7 @@ GuardianSparkRuntime::snapshot_staged_baselines() const {
         std::size_t want = 0;
         {
             std::lock_guard<std::mutex> lk{registry_mu_};
+            resync_staged_baseline_mirror_locked();
             want = staged_baselines_.size();
         }
         if (want == 0)
@@ -5031,14 +5034,35 @@ GuardianSparkRuntime::snapshot_staged_baselines() const {
     }
 }
 
+void GuardianSparkRuntime::resync_staged_baseline_mirror_locked() const noexcept {
+    const std::uint64_t real = staged_baselines_.size();
+    if (staged_baseline_count_->load(std::memory_order_relaxed) == real)
+        return;
+    staged_baseline_count_->store(real, std::memory_order_relaxed);
+    // Log once (the 0 -> 1 transition); every later occurrence is counted only. Firewalled:
+    // spdlog's own formatting can allocate and this function is noexcept.
+    if (staged_baseline_mirror_resyncs_.fetch_add(1, std::memory_order_relaxed) == 0) {
+        try {
+            spdlog::error("Guardian spark: the staged-baseline count mirror disagreed with the "
+                          "staging map ({} staged) and was repaired; the unpersisted-capture "
+                          "figure was briefly wrong (further occurrences counted, not logged)",
+                          real);
+        } catch (...) {
+        }
+    }
+}
+
 void GuardianSparkRuntime::erase_staged_baselines_if_unchanged(
     std::span<const CapturedBaseline> done) {
     std::lock_guard<std::mutex> lk{registry_mu_};
+    resync_staged_baseline_mirror_locked();
     for (const CapturedBaseline& d : done) {
         const auto it = staged_baselines_.find(d.rule_id);
         if (it != staged_baselines_.end() && it->second.path == d.path && it->second.hash == d.hash)
             staged_baselines_.erase(it);
     }
+    // #5605: the one erase site; store (not fetch_sub) so the mirror re-syncs to the exact size.
+    staged_baseline_count_->store(staged_baselines_.size(), std::memory_order_relaxed);
 }
 
 void GuardianSparkRuntime::stage_baseline_for_test(const std::string& rule_id,

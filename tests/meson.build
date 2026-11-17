@@ -291,6 +291,7 @@ agent_test_exe = executable(
     'unit/test_guardian_lifecycle_journal.cpp',
     'unit/test_guardian_journal_heartbeat.cpp',
     'unit/test_guardian_arm_heartbeat.cpp', # rung 9c PR-3
+    'unit/test_guardian_baseline_heartbeat.cpp', # #5605
     'unit/test_guardian_health_heartbeat.cpp',
     'unit/test_guardian_backend_heartbeat.cpp',
     'unit/test_guardian_unsupported_heartbeat.cpp',
@@ -1859,6 +1860,7 @@ if build_server
       'unit/server/test_spark_fleet_tags.cpp',
       'unit/server/test_guardian_journal_fleet_tags.cpp',
       'unit/server/test_guardian_arm_fleet_tags.cpp', # rung 9c PR-3 — arm-ledger + io-ceiling fleet rollup pin
+      'unit/server/test_guardian_baseline_fleet_tags.cpp', # #5605: baseline-persistence fleet rollup pin (real agent emitters)
       'unit/server/test_guardian_reconcile_budget.cpp', # #5513: reconcile admission budget (leaky bucket)
       'unit/server/test_guardian_reconcile_gate.cpp', # #5513: reconcile claim map + admit-before-claim ordering
       'unit/server/test_server_guardian_reconcile_options.cpp', # #5513: reconcile budget flags: names, defaults, env, validation
@@ -2110,6 +2112,9 @@ if build_server
       'unit/server/test_software_collection_settings_routes.cpp',
       # SAM-33 read routes (hosts, host detail, change feed, summary, plugin health) over injected store reads: no store, no [pg]
       'unit/server/test_software_read_routes.cpp',
+      # SAM-36 streamed export: pure parse/chunk/clamp core, then the route over fake page readers (no store, no [pg], no sleeps)
+      'unit/server/test_software_export_stream.cpp',
+      'unit/server/test_software_export_routes.cpp',
       'unit/server/test_software_title_dimension.cpp',
       'unit/server/test_software_licensing_store.cpp',
       'unit/server/test_software_licensing_ingestion.cpp',
@@ -2161,8 +2166,13 @@ if build_server
       # its include_directories('include') and '../../common/include'); no link to
       # yuzu_agent_core.
       #
-      # CONSTRAINT (governance Gate-3 architect). This puts 47 PRIVATE agent headers on
-      # the include path of every server test TU. It is safe TODAY only because there is
+      # #5605: test_guardian_baseline_fleet_tags.cpp is the second such TU: it includes
+      # guardian_baseline_heartbeat.hpp (the agent's real baseline emitters) to bind them to the
+      # server's guardian_baseline_fleet_tags.hpp table.
+      #
+      # CONSTRAINT (governance Gate-3 architect). This puts every PRIVATE agent header
+      # (78 `agents/core/src/*.hpp` files when #5605 was written, not the 47 this comment once
+      # gave) on the include path of every server test TU. It is safe TODAY only because there is
       # zero CASE-INSENSITIVE basename collision (APFS/NTFS resolve case-insensitively,
       # so a Linux-only case-sensitive check under-detects) between agents/core/src/*.hpp
       # and server/core/src/*.hpp,
@@ -4497,6 +4507,21 @@ test('agent command-dedup fleet telemetry drift gate (#3663)',
   _python3_test,
   args: [files('test_dedup_fleet_tags_lexical.py')],
   suite: 'agent',
+  timeout: 30,
+)
+
+# Guardian baseline-persistence fleet signal (#5605): the agent's `yuzu.guardian_baseline_*`
+# heartbeat tags, the server's kGuardianBaselineMetrics table, the describe loop in server.cpp, the
+# agent.cpp Group D2 call sites, the YuzuGuardianBaselineUnpersisted alert (its expr must name row
+# 0's gauge; no alert may read the monitor-only rows), its promtool cases and the metrics.md table
+# rows. The C++ pin test (test_guardian_baseline_fleet_tags.cpp) binds the emitters to the table but
+# stays green under a coordinated agent+table rename; this gate catches that, the alert and the call
+# site. Carries its own in-memory mutation self-test. No build required. Suite 'docs', like the
+# other server-source lexical gates (see the guardian_backend gate below).
+test('guardian baseline fleet signal drift gate (#5605)',
+  _python3_test,
+  args: [files('test_guardian_baseline_fleet_tags_lexical.py')],
+  suite: 'docs',
   timeout: 30,
 )
 

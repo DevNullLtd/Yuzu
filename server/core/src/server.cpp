@@ -100,6 +100,7 @@
 #include "grpc_on_behalf_interceptor.hpp"
 #include "guardian_arm_fleet_tags.hpp" // Guardian arm-ledger fleet gauge names + HELP (rung 9c PR-3)
 #include "guardian_backend_fleet_tags.hpp" // yuzu.guardian_backend fleet gauge names + HELP (#2240)
+#include "guardian_baseline_fleet_tags.hpp" // Guardian baseline-persistence fleet gauge names + HELP (#5605)
 #include "guardian_health_fleet_tags.hpp" // Guardian M1 health-stream fleet gauge names + HELP (#2298 item 6d)
 #include "guardian_io_ceiling_fleet_tags.hpp" // Guardian io-ceiling fleet gauge names + HELP (rung 9c PR-3)
 #include "guardian_journal_fleet_tags.hpp" // Guardian journal fleet gauge names + HELP (#2298)
@@ -263,6 +264,7 @@
 #include "software_catalog_rollup.hpp"
 #include "software_normalization_job.hpp"
 #include "software_normalization_pack.hpp"
+#include "software_export_routes.hpp"
 #include "software_read_routes.hpp"
 #include "software_title_dimension.hpp"
 #include "device_routes.hpp"
@@ -707,6 +709,29 @@ public:
              {"store_not_open", "pool_acquire_timeout", "query_error", "txn_failed"})
             metrics_.counter("yuzu_server_software_lifecycle_store_write_degrade_total",
                              {{"reason", reason}});
+        // Streamed installed-software export (SAM-36): every format x result and every rejection
+        // reason exist from boot, so a first rejection reads as an increase from 0.
+        metrics_.describe("yuzu_server_software_export_total",
+                          "Streamed installed-software exports that ended, by format (jsonl/csv) "
+                          "and result (completed/degraded/deadline/aborted); anything but "
+                          "completed is a transfer the client saw truncated; aborted covers a "
+                          "client that went away and a server that began shutting down",
+                          "counter");
+        metrics_.describe("yuzu_server_software_export_rejected_total",
+                          "Streamed installed-software exports refused with a 503, by reason: "
+                          "export_concurrency_cap (every --inventory-export-concurrency slot in "
+                          "use) or global_stream_cap (the server-wide --max-sse-streams budget "
+                          "full)",
+                          "counter");
+        for (const auto format : yuzu::server::software_export::kFormats)
+            for (const auto result : yuzu::server::software_export::kResults)
+                metrics_.counter(
+                    "yuzu_server_software_export_total",
+                    {{"format", std::string(yuzu::server::software_export::format_name(format))},
+                     {"result", std::string(result)}});
+        for (const auto reason : yuzu::server::software_export::kRejectReasons)
+            metrics_.counter("yuzu_server_software_export_rejected_total",
+                             {{"reason", std::string(reason)}});
         metrics_.describe("yuzu_server_revocation_source_degrade_total",
                           "CRL source registrations refused for a retryable reason, by reason "
                           "(own_addresses_unavailable/dns_unavailable/dns_timeout/dns_busy/"
@@ -3267,6 +3292,15 @@ public:
                           detail::kGuardianIoCeilingReportingHelp, "gauge");
         metrics_.describe(detail::kGuardianIoCeilingTagRejectedGauge,
                           detail::kGuardianIoCeilingTagRejectedHelp, "gauge");
+        // #5605 baseline-persistence fleet rollup, from the SAME table recompute_metrics clears and
+        // publishes from. Row 0 is a re-statable current gauge (the alerted one); rows 1 and 2 are
+        // monitor-only - see guardian_baseline_fleet_tags.hpp before writing an alert.
+        for (const auto& m : detail::kGuardianBaselineMetrics)
+            metrics_.describe(m.gauge, m.help, "gauge");
+        metrics_.describe(detail::kGuardianBaselineReportingGauge,
+                          detail::kGuardianBaselineReportingHelp, "gauge");
+        metrics_.describe(detail::kGuardianBaselineTagRejectedGauge,
+                          detail::kGuardianBaselineTagRejectedHelp, "gauge");
         // #2240: yuzu.guardian_backend. A categorical {os,backend} partition count plus the two
         // unlabelled meta gauges, all registered from the SAME constants
         // AgentHealthStore::recompute_metrics clears and publishes with
@@ -21415,6 +21449,36 @@ private:
                     .roster_fn = software_roster_fn,
                     .snapshot_fn = [this] { return software_fleet_snapshot_.get(); },
                     .store = software_inventory_store_.get(),
+                });
+        }
+
+        // Streamed installed-software export (SAM-36): GET /api/v1/inventory/software/export.
+        // Registered here for the same reason as the reads above (the generic
+        // GET /api/v1/inventory/{a}/{b} would take the path). fleet_read_fn is the sole gate. The
+        // route borrows software_inventory_store_, metrics_ and stream_budget_ (every stream is a
+        // lease from the one budget, ADR-0034); an open stream's provider also reads the store,
+        // which is safe because stop() joins the web thread ahead of resetting any of them. The
+        // roster is the same reader the reads above use, read once per stream for the hostnames
+        // only.
+        {
+            HttplibRouteSink software_export_sink{*web_server_};
+            SoftwareExportRoutes{}.register_routes(
+                software_export_sink,
+                SoftwareExportRoutes::Deps{
+                    .fleet_read_fn = fleet_read_fn,
+                    .audit_fn = audit_fn,
+                    .roster_fn = [this]() -> std::optional<OfflineRoster> {
+                        if (!offline_endpoint_store_)
+                            return std::nullopt;
+                        auto roster = offline_endpoint_store_->query_stale_within(kHardwareRosterWindow);
+                        if (!roster)
+                            return std::nullopt;
+                        return std::move(*roster);
+                    },
+                    .store = software_inventory_store_.get(),
+                    .metrics = &metrics_,
+                    .stream_budget = stream_budget_.get(),
+                    .concurrency = cfg_.inventory_export_concurrency,
                 });
         }
 

@@ -986,6 +986,35 @@ a position count, so a long run of out-of-scope rows costs proportionally more t
 a statement timeout there degrades the page to a 503 (tracked in #5698). A continuation that would pass over more than 100 000 out-of-scope rows since the last row served is refused (the dashboard shows the same text as a notice) (`cursor refused: more than 100000 rows outside the caller's scope were passed since the last row served; narrow the filter (name, version or agent_id) and restart from the first page, or page with a scope of at most 10000 devices`): in page mode that is 25 consecutive empty pages of the maximum size, and an export, which reads up to 10 000 rows per request, reaches it after a few continuations. The limit is checked when a cursor is presented, so a `next_cursor` the server handed out can itself be refused on use; narrow the filter and restart from the first page, or page with a scope of at most 10 000 devices. Keep paging until
 `next_cursor` is `null`.
 
+### Exporting the installed-software inventory
+
+`GET /api/v1/inventory/software/export?format=jsonl|csv` writes every installed-software row
+that matches your filters as one download, with no row cap: JSONL is one JSON object per line,
+CSV is the 23 columns of the list under a single header row. It takes the filters of the
+route above (`format=json` is not accepted, and `cursor` and `limit` are refused). It is
+confined to your scope like the rest of the Inventory reads; a wide scope is filtered on the
+server, so those exports read more rows than they return.
+
+```bash
+# The whole inventory visible to you, as a spreadsheet file
+curl -H "Authorization: Bearer $TOKEN" -o software.csv \
+  "$SERVER/api/v1/inventory/software/export?format=csv"
+
+# One title, as lines for a script
+curl -H "Authorization: Bearer $TOKEN" \
+  "$SERVER/api/v1/inventory/software/export?format=jsonl&name=OpenSSL"
+```
+
+A few rules for what you build on it:
+
+- **A cut-short transfer is an incomplete file.** The server cannot change the status after the first byte, so a failed read, a run past 900 seconds or a server shutdown ends the response without its final chunk and your HTTP client reports an aborted transfer. Start again; do not use the partial file. A clean end means complete.
+- **Two exports at a time by default.** Each open export holds a server worker and one lease from the server's held-open stream budget, so a third request gets `503` with `retry_after_ms` 5000. The limit is `--inventory-export-concurrency`, shared by every caller of the server ([Server administration](server-admin.md)). The same `503` is returned when the server's whole held-open budget (`--max-sse-streams`) is full; retry shortly.
+- **It is a live walk, not a snapshot.** A device that reports while the export runs can have rows repeated or missed.
+- **Audited once, up front** as `inventory.software.export` (see [Audit log](audit-log.md)), and counted in `yuzu_server_software_export_total` ([Metrics](metrics.md)).
+- **REST only.** A streamed file is not a tool call, so there is no MCP tool; an agentic worker pages the same rows with `query_installed_software`.
+
+Wire reference: [REST API](rest-api.md#get-apiv1inventorysoftwareexport).
+
 ### REST: software title catalogue
 
 `GET /api/v1/inventory/software/catalogue` returns one row per software title across the
