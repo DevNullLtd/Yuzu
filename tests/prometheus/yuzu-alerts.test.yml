@@ -10774,3 +10774,27 @@ tests:
       - expr: 'ALERTS{alertname="YuzuCrlSourceResolverBusy", alertstate=~"firing|pending"}'
         eval_time: 17m
         exp_samples: []
+
+  # CASE WP07-A -- a sustained stream of skipped collect targets fires YuzuPolicyCollectSkipped.
+  - interval: 1m
+    name: policy collect skipped - a sustained skip fires
+    input_series:
+      - series: 'yuzu_server_policy_eval_errors_total{job="yuzu",instance="s1",phase="collect_target"}'
+        values: "0+1x120"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuPolicyCollectSkipped", alertstate="firing"}'
+        eval_time: 45m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuPolicyCollectSkipped", alertstate="firing", severity="warning"}'
+            value: 1
+
+  # CASE WP07-B -- the other phases of the same counter (dispatch, claim, ...) are NOT this alert.
+  - interval: 1m
+    name: policy collect skipped - other phases stay quiet
+    input_series:
+      - series: 'yuzu_server_policy_eval_errors_total{job="yuzu",instance="s1",phase="dispatch"}'
+        values: "0+1x120"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuPolicyCollectSkipped", alertstate="firing"}'
+        eval_time: 45m
+        exp_samples: []

@@ -3110,6 +3110,28 @@ groups:
             reach 'fixing' after an operator remediate, and review any recent
             change to claim_remediation or the collect_ready gen threading.
 
+      # WP07: the compliance collect pass skipped a target (collect_target) or a whole ready
+      # item (collect_item) because evaluating it threw -- the response-store read, the verdict
+      # write or an allocation failure. A skipped target keeps its PREVIOUS status (no verdict is
+      # recorded this cycle), so a sustained rate means compliance data is going stale for
+      # someone. The per-device "unevaluable response" case is NOT this alert: it scores that
+      # device `error` and is counted by yuzu_server_policy_unevaluable_responses_total{reason}.
+      - alert: YuzuPolicyCollectSkipped
+        expr: |
+          sum(increase(yuzu_server_policy_eval_errors_total{phase=~"collect_item|collect_target"}[1h])) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Policy collect pass is skipping targets ({{ $value }} in 1h)"
+          description: >-
+            yuzu_server_policy_eval_errors_total{phase="collect_target"|"collect_item"}
+            incremented: evaluating a policy check response (or the response-store read behind it)
+            threw, so that target's or item's verdict was not recorded this cycle and its previous
+            status stands. Look in the server log for "policy_evaluator: ... skipped" lines (they
+            carry the policy id and the exception text), check Postgres health and memory
+            pressure, and remember the status shown for the affected devices may be stale.
+
       - alert: YuzuQuarantineGateServingStaleState
         expr: |
           sum(increase(yuzu_server_quarantine_gate_total{outcome="stale"}[10m])) > 0
