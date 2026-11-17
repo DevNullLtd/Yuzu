@@ -825,8 +825,9 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
             else
                 goto gw_enrolled;
         }
-        // WP01 / UP-2: the gate keys on the LEAF STATE, not the pending row (see the direct path).
-        if (!prior) {
+        // WP01 / UP-2: the gate keys on the LEAF STATE, not the pending row (see the direct path):
+        // an absent OR pending row runs it; a pending row with no leaf proceeds unchanged.
+        if (!prior || *prior == auth::PendingStatus::pending) {
             const auto verdict = run_reregistration_gate();
             if (verdict.route == yuzu::server::ReregistrationVerdict::Route::Refuse)
                 return *verdict.refusal;

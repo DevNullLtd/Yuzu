@@ -94,10 +94,19 @@ apply_reregistration_gate(ReregistrationProofMode mode, const AgentIdentityHooks
                               .try_admit(std::string(path) + "|" + outcome_token)
                               .admitted;
     };
+    // Only REFUSAL rows (result denied/failure) are budgeted: they are what an unauthenticated
+    // caller can flood. The ADMITTED row of audit mode (`agent.reregistration_unproven`, result
+    // success) is the evidence that makes a takeover reconstructable (CC7.2), so it is never
+    // dropped by the budget: a caller spreading attempts across many ids could otherwise fill the
+    // per-key table and push the victim's row into a shared overflow bucket. Its volume is that of
+    // the registrations themselves, like the enrollment success rows beside it.
     const auto write_audit = [&](std::string_view action, std::string_view result) {
-        if (!audit || !detail::reregistration_audit_budget()
-                           .try_admit(outcome_token + "|" + agent_id, outcome_token + "|*")
-                           .admitted)
+        if (!audit)
+            return;
+        if (result != "success" &&
+            !detail::reregistration_audit_budget()
+                 .try_admit(outcome_token + "|" + agent_id, outcome_token + "|*")
+                 .admitted)
             return;
         try {
             audit(action, result, outcome_token, to_string(mode));

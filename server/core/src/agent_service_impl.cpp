@@ -463,9 +463,12 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
         // WP01 / UP-2: the gate keys on the LEAF STATE, not on the pending row. An operator who
         // deleted the enrollment row of an id that still holds a live leaf must not make that id
         // enrol afresh (auto-approve or a token) and be issued a second live leaf without proof:
-        // an absent row runs the same decision. The result only matters when it refuses or asks
+        // an absent row runs the same decision, and so does a PENDING one (a leftover or
+        // attacker-provoked pending row, or one created while still in audit mode, must not let a
+        // token or auto-approve issue a second live leaf: a pending row with NO leaf is the
+        // normal first-enrolment path and falls through as NoLeafOnRecord, unchanged). The result only matters when it refuses or asks
         // for a single-use token; a proven/no-leaf verdict continues the ordinary flow below.
-        if (!prior) {
+        if (!prior || *prior == auth::PendingStatus::pending) {
             const auto verdict = run_reregistration_gate();
             if (verdict.route == yuzu::server::ReregistrationVerdict::Route::Refuse)
                 return *verdict.refusal;

@@ -8,6 +8,7 @@
 
 #include <yuzu/server/server.hpp>
 
+#include "agent_reregistration_apply.hpp"
 #include "agent_reregistration_gate.hpp"
 
 using namespace yuzu::server;
@@ -102,4 +103,33 @@ TEST_CASE("reregistration refusal message does not name the reason", "[reregistr
     const std::string m(kReregistrationRefusalPublicMessage);
     for (const char* leak : {"revoked", "leaf", "certificate", "exists", "enrolled"})
         CHECK(m.find(leak) == std::string::npos);
+}
+
+TEST_CASE("reregistration audit budget: refusal rows are bounded, the admitted audit-mode row never is",
+          "[reregistration_gate][wp01]") {
+    const std::expected<AgentLeafState, std::string> live{AgentLeafState{.has_live = true}};
+    AgentIdentityHooks hooks;
+    hooks.leaf_state = [&](const std::string&) { return live; };
+    int refusal_rows = 0, unproven_rows = 0;
+    const ReregistrationAuditSink sink = [&](std::string_view action, std::string_view, std::string_view,
+                                             std::string_view) {
+        (action == kAuditActionReregistrationUnproven ? unproven_rows : refusal_rows)++;
+    };
+    const ReregistrationEvidence ev{};
+    // audit mode: 200 admitted unproven re-registrations spread over 200 distinct ids (more keys than
+    // the budget tracks): EVERY one leaves a row.
+    for (int i = 0; i < 200; ++i) {
+        const std::string id = "audit-id-" + std::to_string(i);
+        (void)apply_reregistration_gate(ReregistrationProofMode::Audit, &hooks, "direct", id, id, ev,
+                                        nullptr, sink);
+    }
+    CHECK(unproven_rows == 200);
+    // enforce: a flood on ONE id is bounded (rows <= the per-key budget), still refused each time.
+    for (int i = 0; i < 100; ++i) {
+        const auto v = apply_reregistration_gate(ReregistrationProofMode::Enforce, &hooks, "direct",
+                                                 "flood-id", "flood-id", ev, nullptr, sink);
+        CHECK(v.route == ReregistrationVerdict::Route::Refuse);
+    }
+    CHECK(refusal_rows > 0);
+    CHECK(refusal_rows <= static_cast<int>(kDefaultAuditMaxRows));
 }

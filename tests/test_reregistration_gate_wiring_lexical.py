@@ -98,7 +98,8 @@ def run(texts):
     for name, text in (("agent_service_impl.cpp", direct), ("gateway_service_impl.cpp", gateway)):
         check(text.count("run_reregistration_gate()") == 2,
               f"{name}: run_reregistration_gate() must be called for the approved row AND the absent row")
-        check("if (!prior)" in text, f"{name}: the absent-row (`if (!prior)`) gate call is missing")
+        check("if (!prior || *prior == auth::PendingStatus::pending)" in text,
+              f"{name}: the absent-or-pending-row gate call is missing")
 
     # 3. the witnessed fields are a gateway-only input
     for field in ("gateway_attests_peer_cert(", "gateway_attested_peer_cert_pem("):

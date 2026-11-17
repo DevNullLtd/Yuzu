@@ -5001,6 +5001,37 @@ TEST_CASE("WP01 UP-2: an id that still holds a live leaf is gated even when its 
         CHECK(probe.superseded.size() == 1);
         CHECK(wp01::has_audit(h, "agent.reenrolled_with_token", "orphan-3"));
     }
+    SECTION("a PENDING row (leftover, or created in audit mode) is gated too: a fleet token or "
+            "auto-approve must not issue a second live leaf") {
+        REQUIRE(h.auth_mgr.add_pending_agent("orphan-5", "h", "linux", "x86_64", "1").value());
+        const auto token = mint_enrollment_token(h.auth_mgr, "fleet", 0, std::chrono::hours(1));
+        auto req = wp01::request("orphan-5", token, "CSR");
+        apb::RegisterResponse resp;
+        CHECK(h.svc.Register(nullptr, &req, &resp).error_code() == grpc::StatusCode::UNAUTHENTICATED);
+        auto greq = req;
+        greq.set_gateway_attests_peer_cert(true);
+        apb::RegisterResponse gresp;
+        CHECK(gw.ProxyRegister(nullptr, &greq, &gresp).error_code() == grpc::StatusCode::UNAUTHENTICATED);
+        CHECK(signed_count == 0);
+        auto toks = h.auth_mgr.list_enrollment_tokens();
+        REQUIRE(toks.has_value());
+        for (const auto& t : *toks)
+            CHECK(t.use_count == 0);
+        auto st = h.auth_mgr.get_pending_status("orphan-5");
+        REQUIRE(st.has_value());
+        REQUIRE(st->has_value());
+        CHECK(**st == yuzu::server::auth::PendingStatus::pending); // never approved
+    }
+    SECTION("a pending row with NO live leaf is ordinary first enrolment and is not wedged") {
+        probe.state = {.has_live = false, .has_revoked_unexpired = false};
+        REQUIRE(h.auth_mgr.add_pending_agent("fresh-1", "h", "linux", "x86_64", "1").value());
+        const auto token = mint_enrollment_token(h.auth_mgr, "first", 0, std::chrono::hours(1));
+        auto req = wp01::request("fresh-1", token, "CSR");
+        apb::RegisterResponse resp;
+        REQUIRE(h.svc.Register(nullptr, &req, &resp).ok());
+        CHECK(resp.accepted());
+        CHECK(signed_count == 1);
+    }
     SECTION("audit mode: admitted as before, and the takeover is reconstructable from an audit row") {
         h.svc.set_reregistration_proof_mode(wp01::ReregistrationProofMode::Audit);
         auto req = wp01::request("orphan-4");
