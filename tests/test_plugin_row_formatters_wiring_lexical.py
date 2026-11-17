@@ -29,7 +29,10 @@ ROOT = Path(__file__).resolve().parent.parent
 
 def strip_comments(src: str) -> str:
     src = re.sub(r"/\*.*?\*/", "", src, flags=re.S)
-    return re.sub(r"//[^\n]*", "", src)
+    src = re.sub(r"//[^\n]*", "", src)
+    # a dead `#if 0 ... #endif` block must not count as a call site (non-nested: the first
+    # #endif ends it, which can only UNDER-strip, i.e. fail toward a louder gate)
+    return re.sub(r"^[ \t]*#[ \t]*if[ \t]+0\b.*?^[ \t]*#[ \t]*endif\b", "", src, flags=re.S | re.M)
 
 
 def check(files: dict) -> list:
@@ -39,12 +42,12 @@ def check(files: dict) -> list:
         if proc.count("yuzu::processes::" + name) != want:
             errs.append(f"processes_plugin.cpp: expected {want} x {name}, got "
                         f"{proc.count('yuzu::processes::' + name)}")
-    if re.search(r'std::format\(\s*"proc\|', proc):
+    if re.search(r'(?:std|fmt)::format\(\s*"proc\|', proc):
         errs.append('processes_plugin.cpp: raw std::format("proc|...") row')
     nc = files["network_config"]
     if nc.count("format_bypass_row(") != 3:
         errs.append(f"network_config_plugin.cpp: expected 3 x format_bypass_row, got {nc.count('format_bypass_row(')}")
-    if re.search(r'std::format\(\s*"bypass\|', nc):
+    if re.search(r'(?:std|fmt)::format\(\s*"bypass\|', nc):
         errs.append('network_config_plugin.cpp: raw std::format("bypass|...") row')
     ia = files["installed_apps"]
     if ia.count("parsers::format_query_row(") != 1:
@@ -57,17 +60,17 @@ def check(files: dict) -> list:
     if nc.count("format_proxy_address_row(") != 4:
         errs.append(f"network_config_plugin.cpp: expected 4 x format_proxy_address_row, got "
                     f"{nc.count('format_proxy_address_row(')}")
-    if re.search(r'std::format\(\s*"proxy_address\|', nc):
+    if re.search(r'(?:std|fmt)::format\(\s*"proxy_address\|', nc):
         errs.append('network_config_plugin.cpp: raw std::format("proxy_address|...") row (credential leak)')
     pf = files["procfetch"]
     if pf.count("yuzu::procfetch::format_row(") != 3:
         errs.append(f"procfetch_plugin.cpp: expected 3 x format_row, got {pf.count('yuzu::procfetch::format_row(')}")
-    if re.search(r'std::format\(\s*"\{\}\|\{\}\|\{\}\|\{\}"', pf):
+    if re.search(r'(?:std|fmt)::format\(\s*"\{\}\|\{\}\|\{\}\|\{\}"', pf):
         errs.append("procfetch_plugin.cpp: raw pid|name|path|sha1 row format")
     wm = files["wmi"]
     if wm.count("yuzu::wmi::format_row_line(") != 1 or wm.count("yuzu::wmi::format_property_line(") != 1:
         errs.append("wmi_plugin.cpp: expected one format_row_line and one format_property_line")
-    if re.search(r'std::format\(\s*"(row\{\}|property)\|', wm):
+    if re.search(r'(?:std|fmt)::format\(\s*"(row\{\}|property)\|', wm):
         errs.append("wmi_plugin.cpp: raw row/property format")
     fsx = files["filesystem"]
     for needle in ("row_field(entry_name)", "row_field(entry_path)", "row_field(val)"):
@@ -79,12 +82,12 @@ def check(files: dict) -> list:
 def load() -> dict:
     p = ROOT / "agents" / "plugins"
     return {
-        "processes": strip_comments((p / "processes/src/processes_plugin.cpp").read_text()),
-        "network_config": strip_comments((p / "network_config/src/network_config_plugin.cpp").read_text()),
-        "installed_apps": strip_comments((p / "installed_apps/src/installed_apps_plugin.cpp").read_text()),
-        "procfetch": strip_comments((p / "procfetch/src/procfetch_plugin.cpp").read_text()),
-        "wmi": strip_comments((p / "wmi/src/wmi_plugin.cpp").read_text()),
-        "filesystem": strip_comments((p / "filesystem/src/filesystem_plugin.cpp").read_text()),
+        "processes": strip_comments((p / "processes/src/processes_plugin.cpp").read_text(encoding="utf-8")),
+        "network_config": strip_comments((p / "network_config/src/network_config_plugin.cpp").read_text(encoding="utf-8")),
+        "installed_apps": strip_comments((p / "installed_apps/src/installed_apps_plugin.cpp").read_text(encoding="utf-8")),
+        "procfetch": strip_comments((p / "procfetch/src/procfetch_plugin.cpp").read_text(encoding="utf-8")),
+        "wmi": strip_comments((p / "wmi/src/wmi_plugin.cpp").read_text(encoding="utf-8")),
+        "filesystem": strip_comments((p / "filesystem/src/filesystem_plugin.cpp").read_text(encoding="utf-8")),
     }
 
 
@@ -113,6 +116,13 @@ def main() -> int:
     bad = dict(files)
     bad["filesystem"] = files["filesystem"].replace("yuzu::filesystem::acl::row_field(entry_name)", "entry_name", 1)
     assert check(bad), "self-check: reverted filesystem site not caught"
+    # dead code and the fmt:: spelling: a call site in `#if 0` does not count, and a raw
+    # fmt::format("proxy_address|...") is as bad as the std:: one
+    dead = strip_comments("#if 0\nyuzu::network_config::format_proxy_address_row(x);\n#endif\nint y;")
+    assert "format_proxy_address_row" not in dead, "self-check: #if 0 block not stripped"
+    bad = dict(files)
+    bad["network_config"] = files["network_config"].replace("yuzu::network_config::format_proxy_address_row(", "fmt::format(\"proxy_address|{}\", ", 1)
+    assert check(bad), "self-check: fmt::format proxy_address row not caught"
     for e in errs:
         print("FAIL:", e)
     if not errs:

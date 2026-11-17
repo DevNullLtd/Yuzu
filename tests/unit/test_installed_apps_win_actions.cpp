@@ -211,7 +211,7 @@ TEST_CASE("installed_apps plugin (Windows): list over the real hive, 7-field app
         REQUIRE(fields.size() == 7);
         // fields: app|name|version|publisher|install_date|install_location|bundle_id.
         // No shape check on arbitrary host rows: a raw REG_EXPAND_SZ
-        // (%ProgramFiles%\Vendor) or UNC (//srv/share) location is legitimate. The
+        // (%ProgramFiles%\Vendor) or UNC (\\srv\share) location is legitimate. The
         // location contract is asserted on the planted fixture row below.
         if (fields[1] != entry.display_name)
             continue;

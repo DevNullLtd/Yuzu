@@ -1889,8 +1889,9 @@ private:
         // plutil hands back the plist value verbatim -- an untrusted
         // Info.plist can embed a pipe, a backslash, or a CR/LF into
         // CFBundleShortVersionString/CFBundleVersion, which would otherwise
-        // corrupt the pipe-delimited output framing. yuzu::util::safe_output_field
-        // is the SDK-canonical escape: it folds a literal '\' to '/' (the
+        // corrupt the pipe-delimited output framing. This macOS leg still uses
+        // yuzu::util::safe_output_field (the rest of the plugin uses row_field,
+        // which keeps interior backslashes): it folds a literal '\' to '/' (the
         // shared server decoder only undoes "\|", so a raw backslash would
         // survive as ambiguous data), folds CR/LF to spaces, and escapes
         // pipes -- stronger than an inline pipe+CRLF-only escape.

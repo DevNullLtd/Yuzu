@@ -19,7 +19,8 @@
 //   * Windows <type> = allow|deny|allow_object|...|other; <flags> = ACE flags.
 //
 // Row-field escaping (row_field below): CR/LF fold to a space, a TRAILING
-// backslash folds to '/', pipes are escaped. safe_output_field() is NOT used:
+// backslash folds to '/', pipes are escaped (yuzu::shared::row_field, shared with
+// procfetch/wmi/installed_apps/network_config). safe_output_field() is NOT used:
 // it folds every backslash and would rewrite `BUILTIN\Users`. Interior
 // backslashes survive because the server decoder (result_parsing.hpp) treats a
 // backslash not followed by a pipe as literal data; only a trailing one would

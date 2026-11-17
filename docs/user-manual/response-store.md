@@ -14,7 +14,7 @@ status, result payload, and timing information.
 
 | Setting | Default | Description |
 |---|---|---|
-| Retention period | 90 days | Responses older than this are deleted by the clock-guarded retention reap (`response_retention_days`) |
+| Retention period | 90 days | Responses older than this are deleted by the clock-guarded retention reap (`--response-retention-days` / `YUZU_RESPONSE_RETENTION_DAYS`; a value of 0 or less disables the reap, so responses never expire) |
 | Reap cadence | ~1 hour | How often the shared maintenance thread runs the expired-response reap |
 
 ## Response structure

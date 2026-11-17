@@ -189,6 +189,8 @@ Provenance and completeness are agent-log only (the wire carries the status enum
 
 ## Sample output
 
+> **Capture predates a row-format change.** The Windows sample below was captured before `list` stopped folding every backslash to `/`: current agents keep interior backslashes (`C:\Program Files\7-Zip/` for an install location ending in a backslash). The sample shows `/` and awaits a Windows recapture.
+
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
 **Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-21 · LocalSystem (elevated; profile name redacted to jsmith) · leg-hash 3690edc65cda
 
