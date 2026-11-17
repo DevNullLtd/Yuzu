@@ -596,8 +596,8 @@ inline std::string list_field(std::string_view v) {
 // value within the 4 KiB bound and free of '\', '|', CR, LF and NUL is emitted
 // byte-identically (in the reference captures the new install_location is the
 // exception: 59 of 241 Windows rows carry a populated one, its backslashes
-// folded to '/'). `query`/`list_per_user` keep their own raw std::format rows
-// and the ADR-0016 `inv|` rows never pass here.
+// folded to '/'). `query`/`list_per_user` rows are built below by format_query_row /
+// format_user_app_row (same per-field list_field); the ADR-0016 `inv|` rows never pass here.
 // `name` stays "" when empty (the collectors never produce one; the sentinel
 // row sets it); every other empty field renders "-". The caller applies
 // sanitize_utf8 to the result (a no-op on the boundary-safe cut).

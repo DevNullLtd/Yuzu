@@ -5164,6 +5164,15 @@ test('plugin init failed wiring lexical selftest',
   timeout: 30,
 )
 
+# WP11: the processes / network_config bypass / installed_apps user_app rows are built by the
+# neutralising formatters at every site (best-effort lexical tripwire, self-checked in memory).
+test('plugin row formatters wiring lexical',
+  _python3_test,
+  args: [files('test_plugin_row_formatters_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # #2146: the workflow-execute zero-reach status list lives in the header, the REST manual and the MCP
 # manual, and an absent command_id is never said to prove a step unsent. Self-checks in memory.
 test('workflow execute docs lexical',
