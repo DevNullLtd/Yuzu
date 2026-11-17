@@ -20,6 +20,7 @@
  *   -> compute diff -> insert events -> save current state
  */
 
+#include "echo_wire_scrub.hpp" // scrub identity strings at collection (baseline round-trip)
 #include "echo_capture_status.hpp" // yuzu::echo::collect_or_retain
 #include "echo_collectors.hpp"
 #include "echo_cursor.hpp" // yuzu::echo::CursorSource, make_cursor_sources
@@ -1668,6 +1669,7 @@ private:
                     // since the fallback. (Mirrors the poll branch's enumerate +
                     // stabilization-exclusion filter, minus the diff/insert.)
                     auto current = yuzu::agent::enumerate_processes();
+                    yuzu::echo::scrub_wire_strings(current); // baseline round-trips losslessly
                     note_pid_names(current, ts);
                     if (!stab_excl.empty()) {
                         std::erase_if(current, [&](const auto& p) {
@@ -1689,6 +1691,7 @@ private:
                 // No active stream (poll-only platform, or stream unavailable):
                 // snapshot-diff poll.
                 auto current = yuzu::agent::enumerate_processes();
+                yuzu::echo::scrub_wire_strings(current); // baseline round-trips losslessly
                 // Before the exclusions: a noisy process still names its sockets.
                 note_pid_names(current, ts);
 
@@ -1777,6 +1780,7 @@ private:
             // #538: tcp's diff baseline lives under "network" (see diff_state_key).
             const std::string net_key{yuzu::echo::diff_state_key("tcp")};
             auto current = yuzu::echo::enumerate_connections();
+            yuzu::echo::scrub_wire_strings(current); // baseline round-trips losslessly
             // Label sockets the collector could not name (TIME_WAIT sockets have pid 0 and stay
             // unnamed; the rest resolve through the process source's pid -> name map).
             yuzu::echo::fill_process_names(current, pid_name_, ts);
@@ -2067,6 +2071,7 @@ private:
                 }
             }
             if (current) {
+                yuzu::echo::scrub_wire_strings(*current); // baseline round-trips losslessly
                 auto previous = json_to_arp(db_->get_state("arp"));
                 auto typed = yuzu::echo::compute_arp_events(previous, *current, ts, snap_id);
                 // Events + baseline in one transaction (#1654); non-fatal, so a
@@ -2098,6 +2103,7 @@ private:
         const auto dns_state = yuzu::echo::source_enabled_state(*db_, "dns");
         if (dns_state.value_or(false)) {
             auto current = dns_pre ? std::move(*dns_pre) : yuzu::echo::enumerate_dns();
+            yuzu::echo::scrub_wire_strings(current); // baseline round-trips losslessly
             auto previous = json_to_dns(db_->get_state("dns"));
             auto typed = yuzu::echo::compute_dns_events(previous, current, ts, snap_id);
             const std::string state_json = dns_to_json(current).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
@@ -2489,6 +2495,7 @@ private:
                 note_health("service", "capture_incomplete");
             }
             if (current) {
+                yuzu::echo::scrub_wire_strings(*current); // baseline round-trips losslessly
                 const std::string svc_key{yuzu::echo::diff_state_key("service")}; // #538
                 auto prev_json = db_->get_state(svc_key);
                 auto previous = json_to_services(prev_json);
@@ -2520,6 +2527,7 @@ private:
         if (user_state.value_or(false)) {
             const std::string usr_key{yuzu::echo::diff_state_key("user")}; // #538
             auto current = yuzu::echo::enumerate_users();
+            yuzu::echo::scrub_wire_strings(current); // baseline round-trips losslessly
             auto prev_json = db_->get_state(usr_key);
             auto previous = json_to_users(prev_json);
 
@@ -2630,6 +2638,7 @@ private:
                 note_health("mapdrive", "capture_incomplete");
             }
             if (current) {
+                yuzu::echo::scrub_wire_strings(*current); // baseline round-trips losslessly
                 const std::string md_key{yuzu::echo::diff_state_key("mapdrive")}; // #538
                 auto previous = json_to_mapdrive(db_->get_state(md_key));
                 auto typed = yuzu::echo::compute_mapdrive_events(previous, *current, ts, snap_id);

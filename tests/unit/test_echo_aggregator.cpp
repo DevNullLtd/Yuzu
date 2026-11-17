@@ -15,11 +15,14 @@
 #include "echo_test_db.hpp"
 #include "echo_fold_schema.hpp"
 #include "echo_schema_registry.hpp"
+#include "echo_software_core.hpp"
 #include "echo_status_format.hpp"
+#include "echo_wire_scrub.hpp" // scrub_wire_strings (F16 follow-up)
 #include "test_helpers.hpp"
 
 #include <yuzu/agent/process_enum.hpp> // detail::parse_proc_status (F16)
 
+#include <nlohmann/json.hpp>
 #include <sqlite3.h> // second connection: selective config-read fault injection
 
 #include <catch2/catch_approx.hpp>
@@ -3460,3 +3463,81 @@ TEST_CASE("parse_proc_status: a non-UTF-8 process name is scrubbed at collection
     CHECK(pi.name == "ev??il");
 }
 #endif
+
+// ── F16 follow-up: an invalid byte must not fabricate events every tick ──────────────────────
+// Baselines are stored via dump(replace) (bad byte -> U+FFFD) but the next enumeration holds the
+// RAW bytes, so a name-keyed diff never matched and emitted a pair per tick. Scrubbing the
+// enumerated set at collection makes the dump lossless; each source must then diff to ZERO.
+namespace {
+constexpr const char* kBadName = "ev\xFF\xC3il";
+} // namespace
+
+TEST_CASE("echo no-phantom: process names round-trip to zero events (F16)",
+          "[echo][aggregator][process-baseline][phantom]") {
+    auto cur = std::vector{make_proc(10, 1, kBadName, "", "svc")};
+    // The failure mode this guards: the decoded baseline (U+FFFD) vs the RAW current.
+    CHECK_FALSE(compute_process_events(decode_process_baseline(encode_process_baseline(cur)), cur,
+                                       1, 1).empty());
+    scrub_wire_strings(cur); // what collection now does
+    CHECK(compute_process_events(decode_process_baseline(encode_process_baseline(cur)), cur, 1, 1)
+              .empty());
+    CHECK(cur[0].name.find('?') != std::string::npos);
+}
+
+TEST_CASE("echo no-phantom: software baseline round-trips to zero events (F16)",
+          "[echo][aggregator][software][phantom]") {
+    std::vector<SoftwareInfo> raw{{kBadName, "1.0", "pub", "20260101"}};
+    const auto seed = software_collect_core("", raw, 1, 1);
+    REQUIRE(seed.kind == SoftwareCollectResult::Kind::kColdStartSeed);
+    const auto next = software_collect_core(seed.new_state_json, raw, 2, 2);
+    REQUIRE(next.kind == SoftwareCollectResult::Kind::kSteady);
+    CHECK(next.events.empty());
+}
+
+TEST_CASE("echo no-phantom: every keyed source's strings survive dump(replace) unchanged (F16)",
+          "[echo][aggregator][phantom]") {
+    const auto lossless = [](const std::string& s) {
+        // strict dump() throws on invalid UTF-8; replace would alter it. Both must be a no-op.
+        std::string strict;
+        REQUIRE_NOTHROW(strict = nlohmann::json(s).dump());
+        return strict == nlohmann::json(s).dump(-1, ' ', false,
+                                               nlohmann::json::error_handler_t::replace);
+    };
+    const std::string bad = kBadName;
+    std::vector<NetConnection> net(1);
+    net[0].proto = net[0].local_addr = net[0].remote_addr = net[0].state = net[0].process_name = bad;
+    std::vector<ServiceInfo> svc(1);
+    svc[0].name = svc[0].display_name = svc[0].status = svc[0].startup_type = bad;
+    std::vector<UserSession> usr(1);
+    usr[0].user = usr[0].domain = usr[0].logon_type = usr[0].session_id = bad;
+    std::vector<ArpEntry> arp(1);
+    arp[0].iface = arp[0].ip_address = arp[0].mac_address = arp[0].entry_type = bad;
+    std::vector<DnsEntry> dns(1);
+    dns[0].name = dns[0].record_type = dns[0].data = dns[0].source = bad;
+    std::vector<MapDriveEntry> md(1);
+    md[0].direction = md[0].local_mount = md[0].remote_path = md[0].remote_host = md[0].username =
+        md[0].provider = bad;
+    scrub_wire_strings(net);
+    scrub_wire_strings(svc);
+    scrub_wire_strings(usr);
+    scrub_wire_strings(arp);
+    scrub_wire_strings(dns);
+    scrub_wire_strings(md);
+    for (const auto* f : {&net[0].proto, &net[0].local_addr, &net[0].remote_addr, &net[0].state,
+                          &net[0].process_name, &svc[0].name, &svc[0].display_name, &svc[0].status,
+                          &svc[0].startup_type, &usr[0].user, &usr[0].domain, &usr[0].logon_type,
+                          &usr[0].session_id, &arp[0].iface, &arp[0].ip_address,
+                          &arp[0].mac_address, &arp[0].entry_type, &dns[0].name,
+                          &dns[0].record_type, &dns[0].data, &dns[0].source, &md[0].direction,
+                          &md[0].local_mount, &md[0].remote_path, &md[0].remote_host,
+                          &md[0].username, &md[0].provider}) {
+        CHECK(lossless(*f));
+        CHECK(*f == "ev??il");
+    }
+    // And the diffs of an unchanged set are empty (previous == the lossless baseline).
+    CHECK(compute_service_events(svc, svc, 1, 1).empty());
+    CHECK(compute_user_events(usr, usr, 1, 1).empty());
+    CHECK(compute_arp_events(arp, arp, 1, 1).empty());
+    CHECK(compute_dns_events(dns, dns, 1, 1).empty());
+    CHECK(compute_mapdrive_events(md, md, 1, 1).empty());
+}
