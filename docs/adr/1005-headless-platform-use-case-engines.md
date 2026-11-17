@@ -1893,7 +1893,7 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
    - **2026-11-16 - the streamed installed-software export (SAM-36; REST only, no
      MCP twin by design).** `GET /api/v1/inventory/software/export?format=jsonl|csv`
      streams every installed-software row that matches the filters of
-     `GET /api/v1/inventory/software`, as a chunked file with no row cap. A file
+     `GET /api/v1/inventory/software`, as a chunked file, bounded by a configurable size limit. A file
      download has no JSON-RPC result to ride in, and `query_installed_software`
      already returns the same rows page by page, so no tool is planned.
      - **A deliberate absence, not a backlog item.** Recorded by the

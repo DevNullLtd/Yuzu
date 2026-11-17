@@ -1,5 +1,6 @@
 #include "schedule_engine.hpp"
 
+#include "pg/pg_array.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
 #include "pg/pg_pool.hpp"
@@ -300,6 +301,31 @@ ScheduleEngine::query_schedules_checked(const ScheduleQuery& q) const {
     for (int i = 0; i < take; ++i)
         out.schedules.push_back(row_to_schedule(res.get(), i));
     return out;
+}
+
+std::expected<std::vector<std::string>, std::string>
+ScheduleEngine::schedules_referencing_definitions(const std::vector<std::string>& definition_ids,
+                                                  int limit) const {
+    if (!open_)
+        return std::unexpected(std::string(kDbErrorPrefix) + "schedule engine not open");
+    if (definition_ids.empty())
+        return std::vector<std::string>{};
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::unexpected(std::string(kDbErrorPrefix) + "pool exhausted");
+    const std::vector<std::string_view> wanted(definition_ids.begin(), definition_ids.end());
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT id FROM schedule_engine.schedules WHERE definition_id = ANY($1::text[]) "
+        "ORDER BY name ASC, id ASC LIMIT $2",
+        std::vector<std::string>{pg::to_text_array(wanted), std::to_string(std::max(limit, 1))});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected(std::string(kDbErrorPrefix) + PQresultErrorMessage(res.get()));
+    std::vector<std::string> ids;
+    ids.reserve(static_cast<std::size_t>(PQntuples(res.get())));
+    for (int i = 0; i < PQntuples(res.get()); ++i)
+        ids.emplace_back(PQgetvalue(res.get(), i, 0));
+    return ids;
 }
 
 // ---------------------------------------------------------------------------
