@@ -3,10 +3,20 @@
  * grammar, start-time token, /proc/<pid>/stat, the /proc mount-table hidepid check,
  * /proc/<pid>/status, /proc/<pid>/limits, the oom values and the row formatters.
  *
- * FIXTURES. Every fixture below is a LABELLED FIXTURE written to the documented kernel layout
- * (proc(5), kernel 6.x): none was captured from a host by this test. The real-host capture is the
- * plugin-capture sample (agents/plugins/process_introspect/docs/samples/linux.txt), taken on a
- * Linux lane. No host is read and nothing is spawned here.
+ * FIXTURES. Each is labelled where it is declared, in one of two kinds.
+ *   REAL CAPTURE     -- pasted byte for byte, never edited, from a throwaway root-owned `sleep 600`
+ *                       (and, for the stat line whose comm holds spaces and parentheses, a process
+ *                       renamed to "(a) (b)" with prctl) on Ubuntu 26.04.1 LTS under WSL2, kernel
+ *                       6.18.58.1-microsoft-standard-WSL2 x86_64, taken 2026-11-17: the stat line,
+ *                       the status and limits files, and the /proc lines of /proc/self/mountinfo.
+ *                       The values asserted against them were counted by hand from the captured
+ *                       text, not produced by make_stat.
+ *   LABELLED FIXTURE -- written to the documented kernel layout (proc(5), kernel 6.x) for the
+ *                       cases a healthy host never prints (every hidepid value, short, malformed,
+ *                       hostile or oversized input); none of these was captured.
+ * The plugin's own end-to-end capture is the plugin-capture sample
+ * (agents/plugins/process_introspect/docs/samples/linux.txt). No host is read and nothing is
+ * spawned here.
  *
  * Tagged [process_introspect] ONLY: a carved tag would move a case to another shard.
  */
@@ -102,6 +112,118 @@ const std::string kLimits = join_lines({
 const std::string kProcLine =
     "23 28 0:21 / /proc rw,nosuid,nodev,noexec,relatime shared:13 - proc proc rw\n";
 
+// REAL CAPTURE (host: file header): /proc/75/stat of a root-owned `sleep 600`, one line.
+const std::string kRealStat =
+    "75 (sleep) S 43 0 0 0 -1 4194304 512 0 0 0 0 0 0 0 25 5 1 0 15539926 "
+    "18075648 2028 18446744073709551615 94570880647168 94570885690349 140732851420640 "
+    "0 0 0 0 6 0 1 0 0 17 6 0 0 0 0 0 94570889964016 94570891452280 94571785936896 "
+    "140732851428499 140732851428509 140732851428509 140732851429353 0\n";
+
+// REAL CAPTURE: /proc/46/stat of a process renamed to "(a) (b)" with prctl(PR_SET_NAME), so the
+// comm field holds spaces and parentheses.
+const std::string kRealStatParens =
+    "46 ((a) (b)) S 43 0 0 34816 0 4194304 1172 0 2 0 1 0 0 0 25 5 1 0 "
+    "15558638 17960960 2762 18446744073709551615 4333568 8024065 140721991279280 "
+    "0 0 0 0 16781318 0 1 0 0 17 3 0 0 0 0 0 11038136 11672456 477278208 "
+    "140721991281601 140721991281654 140721991281654 140721991282663 0\n";
+
+// REAL CAPTURE: /proc/75/status of the same sleeper. Tabs, and the trailing space after `Groups:`,
+// are as the kernel printed them.
+const std::string kRealStatus = join_lines({
+    "Name:\tsleep",
+    "Umask:\t0022",
+    "State:\tS (sleeping)",
+    "Tgid:\t75",
+    "Ngid:\t0",
+    "Pid:\t75",
+    "PPid:\t43",
+    "TracerPid:\t0",
+    "Uid:\t0\t0\t0\t0",
+    "Gid:\t0\t0\t0\t0",
+    "FDSize:\t256",
+    "Groups:\t ",
+    "NStgid:\t75",
+    "NSpid:\t75",
+    "NSpgid:\t0",
+    "NSsid:\t0",
+    "Kthread:\t0",
+    "VmPeak:\t   17652 kB",
+    "VmSize:\t   17652 kB",
+    "VmLck:\t       0 kB",
+    "VmPin:\t       0 kB",
+    "VmHWM:\t    8288 kB",
+    "VmRSS:\t    8288 kB",
+    "RssAnon:\t    1264 kB",
+    "RssFile:\t    7024 kB",
+    "RssShmem:\t       0 kB",
+    "VmData:\t     292 kB",
+    "VmStk:\t     132 kB",
+    "VmExe:\t    4928 kB",
+    "VmLib:\t    3972 kB",
+    "VmPTE:\t      80 kB",
+    "VmSwap:\t       0 kB",
+    "HugetlbPages:\t       0 kB",
+    "CoreDumping:\t0",
+    "THP_enabled:\t1",
+    "untag_mask:\t0xffffffffffffffff",
+    "Threads:\t1",
+    "SigQ:\t2/63937",
+    "SigPnd:\t0000000000000000",
+    "ShdPnd:\t0000000000000000",
+    "SigBlk:\t0000000000000000",
+    "SigIgn:\t0000000000000006",
+    "SigCgt:\t0000000000000000",
+    "CapInh:\t0000000000000000",
+    "CapPrm:\t000001ffffffffff",
+    "CapEff:\t000001ffffffffff",
+    "CapBnd:\t000001ffffffffff",
+    "CapAmb:\t0000000000000000",
+    "NoNewPrivs:\t0",
+    "Seccomp:\t0",
+    "Seccomp_filters:\t0",
+    "Speculation_Store_Bypass:\tthread vulnerable",
+    "SpeculationIndirectBranch:\tconditional enabled",
+    "Cpus_allowed:\tffff",
+    "Cpus_allowed_list:\t0-15",
+    "Mems_allowed:\t00000000,00000000,00000000,00000000,00000000,00000000,"
+    "00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,"
+    "00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,"
+    "00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,"
+    "00000000,00000001",
+    "Mems_allowed_list:\t0",
+    "voluntary_ctxt_switches:\t1",
+    "nonvoluntary_ctxt_switches:\t0",
+});
+
+// REAL CAPTURE: /proc/75/limits of the same sleeper. The padding after each row, and the empty
+// Units column of the two priority rows, are as the kernel printed them.
+const std::string kRealLimits = join_lines({
+    "Limit                     Soft Limit           Hard Limit           Units     ",
+    "Max cpu time              unlimited            unlimited            seconds   ",
+    "Max file size             unlimited            unlimited            bytes     ",
+    "Max data size             unlimited            unlimited            bytes     ",
+    "Max stack size            8388608              unlimited            bytes     ",
+    "Max core file size        0                    unlimited            bytes     ",
+    "Max resident set          unlimited            unlimited            bytes     ",
+    "Max processes             63937                63937                processes ",
+    "Max open files            1024                 1048576              files     ",
+    "Max locked memory         67108864             67108864             bytes     ",
+    "Max address space         unlimited            unlimited            bytes     ",
+    "Max file locks            unlimited            unlimited            locks     ",
+    "Max pending signals       63937                63937                signals   ",
+    "Max msgqueue size         819200               819200               bytes     ",
+    "Max nice priority         0                    0                    ",
+    "Max realtime priority     0                    0                    ",
+    "Max realtime timeout      unlimited            unlimited            us        ",
+});
+
+// REAL CAPTURE: the /proc lines of /proc/self/mountinfo in the lane's private mount namespace.
+// Two nested proc mounts, neither with hidepid; the last one is the one that counts.
+const std::string kRealMountinfo = join_lines({
+    "431 413 0:61 / /proc rw,nosuid,nodev,noexec,noatime - proc proc rw",
+    "616 431 0:85 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw",
+});
+
 std::string proc_line_with(const std::string& super_opts, const std::string& fstype = "proc",
                            const std::string& point = "/proc") {
     return "23 28 0:21 / " + point + " rw,nosuid,nodev,noexec,relatime shared:13 - " + fstype +
@@ -159,6 +281,33 @@ TEST_CASE("process_introspect parse_stat reads the four fields", "[process_intro
     CHECK(st->policy == 2u);
 }
 
+TEST_CASE("process_introspect parse_stat reads the REAL CAPTURE at the proc(5) positions",
+          "[process_introspect]") {
+    // Counted by hand from kRealStat, not through make_stat. After `(sleep)` the tokens are fields
+    // 3 onward: 3 `S`, 18 priority `25`, 19 nice `5` (priority is 20 + nice), 20 num_threads `1`,
+    // 22 starttime `15539926`, 40 rt_priority `0`, 41 policy `0`. The line has 52 fields. This
+    // sleeper ran at the default policy, so 40 and 41 are zero here; make_stat covers non-zero.
+    const auto st = parse_stat(kRealStat);
+    REQUIRE(st.has_value());
+    CHECK(st->nice == 5);
+    CHECK(st->starttime == 15539926u);
+    CHECK(st->rt_priority == 0u);
+    CHECK(st->policy == 0u);
+}
+
+TEST_CASE("process_introspect parse_stat reads the REAL CAPTURE whose comm is `(a) (b)`",
+          "[process_introspect]") {
+    // Same positions, counted by hand from kRealStatParens after its closing `)`: 19 nice `5`,
+    // 22 starttime `15558638`, 40 `0`, 41 `0`. The comm's own spaces and parentheses must not
+    // shift any index: a split at the first `)` or at spaces would read another token.
+    const auto st = parse_stat(kRealStatParens);
+    REQUIRE(st.has_value());
+    CHECK(st->starttime == 15558638u);
+    CHECK(st->nice == 5);
+    CHECK(st->rt_priority == 0u);
+    CHECK(st->policy == 0u);
+}
+
 TEST_CASE("process_introspect parse_stat survives a comm with spaces and parentheses",
           "[process_introspect]") {
     for (const char* comm : {"a b", "x) S 1 2 3", "(((", "))) (", "a (b) c"}) {
@@ -202,6 +351,12 @@ TEST_CASE("process_introspect proc_visibility: no hidepid is visible", "[process
         CHECK(proc_visibility(proc_line_with(v)) == ProcVisibility::visible);
 }
 
+TEST_CASE("process_introspect proc_visibility: the REAL CAPTURE with nested proc mounts is visible",
+          "[process_introspect]") {
+    // Two counting lines, the second covering the first; neither carries hidepid.
+    CHECK(proc_visibility(kRealMountinfo) == ProcVisibility::visible);
+}
+
 TEST_CASE("process_introspect proc_visibility: hidepid 2 and above, and unknown values, hide",
           "[process_introspect]") {
     for (const char* v : {"rw,hidepid=2", "rw,hidepid=invisible", "rw,hidepid=4",
@@ -242,6 +397,31 @@ TEST_CASE("process_introspect parse_status reads every key", "[process_introspec
     CHECK(s.no_new_privs.value == 1u);
     CHECK(s.seccomp.value == 2u);
     CHECK(s.seccomp_filters.value == 3u);
+    CHECK(s.cpus_allowed_list.value == "0-15");
+}
+
+TEST_CASE("process_introspect parse_status reads every required key of the REAL CAPTURE",
+          "[process_introspect]") {
+    const auto s = parse_status(kRealStatus);
+    for (const TextField* f : {&s.sig_pnd, &s.shd_pnd, &s.sig_blk, &s.sig_ign, &s.sig_cgt,
+                               &s.cap_inh, &s.cap_prm, &s.cap_eff, &s.cap_bnd, &s.cap_amb,
+                               &s.cpus_allowed_list})
+        CHECK(f->presence == Presence::ok);
+    CHECK(s.seccomp.presence == Presence::ok);
+    CHECK(s.no_new_privs.presence == Presence::ok);
+    CHECK(s.seccomp_filters.presence == Presence::ok);
+    // Values read off the captured text: a root sleeper with the full capability set and nothing
+    // blocked or caught; SIGINT and SIGQUIT are ignored (0x6).
+    CHECK(s.sig_ign.value == "0000000000000006");
+    CHECK(s.sig_blk.value == "0000000000000000");
+    CHECK(s.cap_prm.value == "000001ffffffffff");
+    CHECK(s.cap_eff.value == "000001ffffffffff");
+    CHECK(s.cap_bnd.value == "000001ffffffffff");
+    CHECK(s.cap_inh.value == "0000000000000000");
+    CHECK(s.cap_amb.value == "0000000000000000");
+    CHECK(s.seccomp.value == 0u);
+    CHECK(s.seccomp_filters.value == 0u);
+    CHECK(s.no_new_privs.value == 0u);
     CHECK(s.cpus_allowed_list.value == "0-15");
 }
 
@@ -357,6 +537,25 @@ TEST_CASE("process_introspect parse_limits reads the 16 rows with units from the
     CHECK(p.rows[7].hard == "1048576");
     CHECK(p.rows[13].name == "nice_priority");
     CHECK(p.rows[13].unit == "none"); // the kernel prints no unit here
+    CHECK(p.rows[15].unit == "microseconds");
+}
+
+TEST_CASE("process_introspect parse_limits reads the REAL CAPTURE: header, 16 rows, none unknown",
+          "[process_introspect]") {
+    const auto p = parse_limits(kRealLimits);
+    REQUIRE(p.header_seen);
+    CHECK(p.unknown_rows == 0);
+    REQUIRE(p.rows.size() == 16);
+    CHECK(p.rows[3].name == "stack_size");
+    CHECK(p.rows[3].soft == "8388608");
+    CHECK(p.rows[3].hard == "unlimited");
+    CHECK(p.rows[6].soft == "63937");
+    CHECK(p.rows[6].unit == "count"); // the kernel says `processes`; the unit is OUR token
+    CHECK(p.rows[7].soft == "1024");
+    CHECK(p.rows[7].hard == "1048576");
+    CHECK(p.rows[8].soft == "67108864"); // locked memory
+    CHECK(p.rows[13].unit == "none");    // the kernel prints no unit on the two priority rows
+    CHECK(p.rows[14].unit == "none");
     CHECK(p.rows[15].unit == "microseconds");
 }
 
