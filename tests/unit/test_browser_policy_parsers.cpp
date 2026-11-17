@@ -357,8 +357,9 @@ TEST_CASE("browser_policy: bytes that are not valid UTF-8 are repaired so the ro
           "transport",
           "[browser_policy][parsers]") {
     // A Linux file name is arbitrary bytes and lands in `source`; every case below is rejected
-    // by the protobuf `string` field raw. The last four are the forms a lone-byte repair (the
-    // sdk's sanitize_utf8) lets through: overlong, surrogate, above U+10FFFF, bad lead byte.
+    // by the protobuf `string` field raw. The last four are the forms the sdk's sanitize_utf8 once
+    // let through (it rejects them too since WP07 F70, but this repair uses U+FFFD, not '?'):
+    // overlong, surrogate, above U+10FFFF, bad lead byte.
     // Each offending byte becomes one U+FFFD. MUTATION: drop repair_utf8 from wire_field ->
     // the raw bytes reach the row and the round trip (and the exact row) fail.
     struct Case {
