@@ -29,6 +29,7 @@
 
 #include <subprocess_degradation.hpp>
 #include <yuzu/plugin.h>         // YUZU_RESULT_STATUS_CONSTRAINED / _COMPLETENESS_PARTIAL
+#include <row_field.hpp>          // yuzu::shared::row_field (backslash-preserving)
 #include <yuzu/string_utils.hpp> // yuzu::util::safe_output_field
 
 namespace yuzu::installed_apps::parsers {
@@ -580,12 +581,13 @@ inline std::string_view cut_utf8(std::string_view v, std::size_t max_bytes) {
 // One `list` field on the wire: cut at the first NUL (write_output hands the row
 // to a C string, so an interior NUL would otherwise truncate the whole ROW and
 // strand the later columns), bound the length at a UTF-8 sequence boundary,
-// then safe_output_field ('\' -> '/', '|' -> "\|", CR/LF -> ' '); "-" if empty.
+// then yuzu::shared::row_field ('|' -> "\|", CR/LF -> ' ', a TRAILING '\' -> '/', interior
+// backslashes kept); "-" if empty.
 // The NUL cut and the bound MUST precede the escape: escaping first can cut
 // between a '\' and its '|', and the stranded '\' then swallows the delimiter.
 inline std::string list_field(std::string_view v) {
     v = cut_utf8(v.substr(0, v.find('\0')), kMaxListFieldBytes);
-    return v.empty() ? std::string("-") : yuzu::util::safe_output_field(v);
+    return v.empty() ? std::string("-") : yuzu::shared::row_field(v);
 }
 } // namespace detail
 

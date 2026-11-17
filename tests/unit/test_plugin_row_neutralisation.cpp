@@ -12,6 +12,7 @@
 #include <installed_apps_parsers.hpp>
 #include <network_config_parsers.hpp>
 #include <processes_rows.hpp>
+#include <row_field.hpp>
 #include <procfetch_row.hpp>
 #include <update_source_trust_parsers.hpp>
 #include <wmi_rows.hpp>
@@ -265,6 +266,35 @@ TEST_CASE("installed_apps user_app row covers the system and brew tags", "[plugi
         CHECK(delimiters(r) == 5);
     }
     CHECK(ia::format_user_app_row("brew", "wget", "1.2", "", "") == "user_app|brew|wget|1.2|-|-");
+}
+
+TEST_CASE("backslash-preserving row field: C:\\x stays C:\\x, a trailing backslash cannot glue",
+          "[plugin][row][wp11]") {
+    // procfetch
+    CHECK(yuzu::procfetch::format_row(7, "svchost.exe", "C:\\Windows\\System32\\svchost.exe", "ab") ==
+          "7|svchost.exe|C:\\Windows\\System32\\svchost.exe|ab");
+    const auto pf = yuzu::procfetch::format_row(7, "x\\", "C:\\dir\\", "ab");
+    CHECK(pf == "7|x/|C:\\dir/|ab");
+    CHECK(server_split(pf).size() == 4);
+    // wmi
+    CHECK(yuzu::wmi::format_row_line(0, "Path", "C:\\x") == "row0|Path|C:\\x");
+    const auto wr = yuzu::wmi::format_row_line(0, "k", "v\\");
+    CHECK(wr == "row0|k|v/");
+    CHECK(yuzu::wmi::format_property_line("Name\\", "C:\\x\\y") == "property|Name/|C:\\x\\y");
+    CHECK(server_split(yuzu::wmi::format_property_line("Name\\", "v")).size() == 3);
+    // installed_apps
+    namespace ia = yuzu::installed_apps::parsers;
+    CHECK(ia::format_query_row("A", "1\\", "C:\\P") == "app|A|1/|C:\\P");
+    CHECK(server_split(ia::format_user_app_row("u\\", "n", "v", "p", "d\\")).size() == 6);
+    CHECK(ia::format_user_app_row("brew", "wget", "C:\\v", "", "") == "user_app|brew|wget|C:\\v|-|-");
+    // network_config
+    CHECK(yuzu::network_config::format_bypass_row("C:\\x,*.local") == "bypass|C:\\x,*.local");
+    CHECK(server_split(yuzu::network_config::format_bypass_row("a\\")).size() == 2);
+    CHECK(yuzu::network_config::format_proxy_address_row("host\\") == "proxy_address|host/");
+    CHECK(yuzu::network_config::format_proxy_address_row("\\\\srv\\share:80") ==
+          "proxy_address|\\\\srv\\share:80");
+    // the shared helper and the filesystem forwarder agree
+    CHECK(yuzu::shared::row_field("C:\\a\\|b\r\n\\") == "C:\\a\\\\|b  /");
 }
 
 TEST_CASE("update_source_trust redaction still forwards to the shared logic", "[plugin][wp11]") {

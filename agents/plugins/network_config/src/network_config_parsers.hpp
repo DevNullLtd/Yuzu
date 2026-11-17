@@ -85,7 +85,7 @@
 #endif
 
 #include <uri_userinfo_redact.hpp> // yuzu::shared::redact_proxy_value
-#include <yuzu/string_utils.hpp>    // safe_output_field
+#include <row_field.hpp>           // yuzu::shared::row_field
 
 namespace yuzu::network_config {
 
@@ -100,21 +100,21 @@ enum class ProxyShape { single, list };
 /// setting. If it holds ANY '@' the output is `REDACTED@` plus the text after
 /// the LAST '@' of the whole value (scheme, earlier list entries and a path
 /// '@' are dropped on purpose: yuzu::shared::redact_proxy_value); a value with
-/// no '@' is unchanged. The result goes through safe_output_field so a '|', CR
+/// no '@' is unchanged. The result goes through yuzu::shared::row_field (backslash-preserving) so a '|', CR
 /// or LF cannot forge columns or rows. `shape` is vestigial (see ProxyShape).
 [[nodiscard]] inline std::string format_proxy_address_row(std::string_view raw,
                                                           ProxyShape shape = ProxyShape::single) {
-    return "proxy_address|" + yuzu::util::safe_output_field(
+    return "proxy_address|" + yuzu::shared::row_field(
                                   shape == ProxyShape::list
                                       ? yuzu::shared::redact_proxy_value(raw)
                                       : yuzu::shared::redact_proxy_single(raw));
 }
 
 /// One `bypass|<value>` row (`no_proxy`, the WinHTTP bypass list, the macOS
-/// exceptions list). Endpoint-controlled free text: safe_output_field keeps a
+/// exceptions list). Endpoint-controlled free text: yuzu::shared::row_field keeps a
 /// '|', CR or LF from adding columns or forging `proxy_*` rows.
 [[nodiscard]] inline std::string format_bypass_row(std::string_view raw) {
-    return "bypass|" + yuzu::util::safe_output_field(raw);
+    return "bypass|" + yuzu::shared::row_field(raw);
 }
 
 // ── /proc/net/arp (Linux arp leg) ────────────────────────────────────────

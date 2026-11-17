@@ -25,6 +25,7 @@
 // backslash not followed by a pipe as literal data; only a trailing one would
 // glue onto the field separator as `\|`.
 
+#include <row_field.hpp>
 #include <yuzu/string_utils.hpp>
 
 #include <cstddef>
@@ -38,13 +39,7 @@
 namespace yuzu::filesystem::acl {
 
 inline std::string row_field(std::string_view value) {
-    std::string out;
-    out.reserve(value.size());
-    for (char ch : value)
-        out += (ch == '\r' || ch == '\n') ? ' ' : ch;
-    if (!out.empty() && out.back() == '\\')
-        out.back() = '/';
-    return yuzu::util::escape_pipes(out);
+    return yuzu::shared::row_field(value); // hoisted to agents/shared/row_field.hpp
 }
 
 namespace detail {

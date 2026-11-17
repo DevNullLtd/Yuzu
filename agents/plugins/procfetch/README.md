@@ -54,7 +54,7 @@ The action takes no parameters.
 
 ### Outputs
 
-Pipe-delimited rows, one per process, in the fixed field order `pid|name|path|sha1`. `name` and `path` are escaped before being written (a literal `|` becomes `\|`, CR and LF become a space, and a literal backslash becomes `/`), so neither the delimiter nor the row boundary can be forged by a process name or executable path. `path` and `sha1` are empty strings, not `-`, when the OS would not hand back an image path or the file could not be opened/hashed — there is no placeholder row for "no processes": the row is only ever missing fields, never absent.
+Pipe-delimited rows, one per process, in the fixed field order `pid|name|path|sha1`. `name` and `path` are escaped before being written (a literal `|` becomes `\|`, CR and LF become a space, interior backslashes are kept and a trailing backslash becomes `/`), so neither the delimiter nor the row boundary can be forged by a process name or executable path. `path` and `sha1` are empty strings, not `-`, when the OS would not hand back an image path or the file could not be opened/hashed — there is no placeholder row for "no processes": the row is only ever missing fields, never absent.
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
 **`crossplatform.process.fetch` — `pid|name|path|sha1`**

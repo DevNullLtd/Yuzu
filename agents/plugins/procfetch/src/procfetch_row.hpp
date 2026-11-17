@@ -5,13 +5,13 @@
  * Row: `<pid>|<name>|<path>|<sha1>`, one per line. `name` and `path` are
  * endpoint-controlled (a Linux /proc/<pid>/exe link text and a macOS
  * proc_pidpath are attacker-chosen file names that may contain '|', CR or LF),
- * so both go through yuzu::util::safe_output_field (CR/LF fold to a space, '|'
- * is escaped, a backslash folds to '/'; the lossy contract of #5208). The pid
+ * so both go through yuzu::shared::row_field (CR/LF fold to a space, '|' is
+ * escaped, interior backslashes are kept, a trailing one folds to '/'). The pid
  * and the hex digest are produced by this plugin and need no escaping.
  */
 #pragma once
 
-#include <yuzu/string_utils.hpp>
+#include <row_field.hpp>
 
 #include <string>
 #include <string_view>
@@ -22,9 +22,9 @@ namespace yuzu::procfetch {
                                             std::string_view exe_path, std::string_view sha1) {
     std::string out = std::to_string(pid);
     out += '|';
-    out += yuzu::util::safe_output_field(name);
+    out += yuzu::shared::row_field(name);
     out += '|';
-    out += yuzu::util::safe_output_field(exe_path);
+    out += yuzu::shared::row_field(exe_path);
     out += '|';
     out.append(sha1);
     return out;
