@@ -379,7 +379,7 @@ constrained via the `NET_RT_FLAGS` sysctl route dump — `entry_type` always
 `unknown` there), so `arp_enabled|true` reports real rows there — run the
 `compatibility` action to distinguish a supported-but-empty source from a
 planned-but-unimplemented one.
-`<source>_rows` counts the rows of the source's finest tier (its hourly tier; `usage_daily` for `usage`), and `<source>_oldest_ts` is the start of that tier's oldest bucket, not an event's own time. For `usage`, `usage_rows` is the `usage_daily` row count and `usage_oldest_ts` the oldest day, not the number of open runs in `usage_live`. `netqual_boot_rows` counts the per-boot baseline table. When the storage is offline the reply leads with `error|` and then `storage_state|offline` (`storage_state|offline|free_space` when a migration was refused for lack of free space, see [Upgrading an existing database](#upgrading-an-existing-database)).
+`<source>_rows` counts the rows of the source's finest tier (its hourly tier; `usage_daily` for `usage`), and `<source>_oldest_ts` is the start of that tier's oldest bucket, not an event's own time. For `usage`, `usage_rows` is the `usage_daily` row count and `usage_oldest_ts` the oldest day, not the number of open runs in `usage_live`. `netqual_boot_rows` counts the per-boot baseline table. When the storage is offline the reply leads with `error|` and then `storage_state|offline`. When Echo loaded offline at open, that line carries the reason as a third field: `storage_state|offline|free_space` (the migration was refused for lack of free space), `storage_state|offline|migration_failed` (the v10 roll-up step, or an earlier step, failed or ran out of time) or `storage_state|offline|open_failed` (any other failure met on a later retry). The `error|` line says the open is retried automatically, 1, 5 and 15 minutes after the first failure and then hourly, so no restart is needed once the cause is cleared; see [Upgrading an existing database](#upgrading-an-existing-database).
 `software_last_run_ts` is the wall-clock of the last `collect_software` tick (`0`
 if it has not run yet); it is the heartbeat that distinguishes "healthy but no
 software changed" (where `software_rows` stays low) from "the hourly trigger
@@ -460,7 +460,13 @@ in flight, if it arrives inside the server-wide 60 s back-off that follows any
 failed lookup or write, or if the in-flight set is at capacity. A plugin that
 failed to initialise (including Echo when the corrupt file cannot be moved
 aside) is reported in the `yuzu.plugins_failed` heartbeat tag and `yuzu_fleet_plugin_init_failed{plugin}`,
-which distinguishes "failed to load" from "not installed". The plugin keeps its
+which distinguishes "failed to load" from "not installed". An Echo that loads
+*offline* at open (`free_space`, `migration_failed` or `open_failed`; see
+[Upgrading an existing database](#upgrading-an-existing-database)) did load, so it
+is not counted there: it retries by itself, and it is visible as the
+`yuzu.plugin.echo.storage_offline` heartbeat tag, the
+`yuzu_fleet_echo_storage_offline{reason}` gauge and the `YuzuEchoStorageOffline`
+alert. The plugin keeps its
 count in a private storage record; if that record is present but unreadable the
 plugin logs `ECHO: db_health.ledger unreadable; not overwriting` and stops updating
 the two heartbeat keys rather than resetting the count — `status` still reports
@@ -755,17 +761,18 @@ condition clears.
 > (`process`, `tcp`, `service`, `user`, `perf`, `power`, `removable`, `usage`), are
 > left untouched. The reset runs only once: an opt-out you write **after** the
 > migration has succeeded (`<source>_enabled=false` via `configure`) sticks across
-> restarts. A failed migration is retried on the next start. While it keeps
-> failing, Echo does not open its database at all, so no disable can be written in that
-> window.
+> restarts. A failed migration loads Echo offline (`storage_state|offline|migration_failed`)
+> and is retried in the background (1, 5 and 15 minutes after the failure, then
+> hourly). While it keeps failing, Echo does not open its database at all, so no
+> disable can be written in that window.
 >
 > **If the migration fails.** The success line in the agent log is
 > `EchoDatabase: migrated to schema version 8`; a failure logs
-> `EchoDatabase: v8 migration failed at` followed by the failing step, rolls the whole
-> migration back, and retries it on the next start. Echo refuses to open until a start
-> succeeds (the roll-up migration waits for it), so the old stored values stay in force
-> and nothing can be written in that window: look for the success line before relying
-> on a disable.
+> `EchoDatabase: v8 migration failed at` followed by the failing step and rolls the whole
+> migration back. Echo loads offline (`storage_state|offline|migration_failed`) and
+> retries it in the background until an attempt succeeds (the roll-up migration waits
+> for it), so the old stored values stay in force and nothing can be written in that
+> window: look for the success line before relying on a disable.
 >
 > **What to expect.** `echo.status` reads `<source>_enabled|true` for all eight. New
 > collection starts without operator action, on each OS where the source has a collector

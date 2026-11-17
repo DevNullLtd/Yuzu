@@ -370,6 +370,33 @@ general bound is proven. (3) A failed earlier step (v8) makes `open()` refuse be
 runs; the plugin loads offline (`storage_state|offline|migration_failed`) and retries the open, as for
 a failed roll-up step (below).
 
+Consequences for code that reads the store:
+- `echo_usage.cpp` is fed the process fold's events inside the process transaction
+  (`usage_fold_in` rides `fold_rows`'s `extra` hook), so there is no read marker and no lag;
+  `PendingBaseline` stamps and folds nothing. A fault in either half rolls back both, and the retried
+  tick folds both once.
+- `purge_source` deletes the source's `_r` rows and `echo_fold_seen` rows and sweeps the dictionary.
+- The status counts (`<src>_rows`, `<src>_oldest_ts`) read the finest tier.
+- `is_fold_view` is case-sensitive: a query that names a view `Process_Hourly` does not reach it.
+- No fold view may gain a WHERE, JOIN or filter: the pinned column-less `_r` read is sound only
+  while every view is a WHERE-less, JOIN-less single-table projection.
+- A `kLast` enrichment column is replaced by a later event that omits the field; a `historical`
+  mapdrive event's identity is remembered, as a hash, in the replay ring under the source
+  `mapdrive_historical`, so a retried enumeration adds no second count; netconn has a high-water
+  mark in `echo_config` and no transactional replay guard through `fold_rows`.
+- Any deleter of `echo_dict` rows goes through `EchoFold`.
+
+**Releases.** Cut no release between the change that introduced v10 and the dashboard change that
+follows it: until then the Echo pages, the process-tree viewer and the canned queries in
+`echo_warehouse.yaml` still read the raw names (empty on v10) or label hourly buckets as raw rows.
+
+**Adding a source or tier.** Five edits, each pinned by a test that fails until it matches: the
+registry row (`build_sources()`, section 8) (the tiers' `GranularityDef`s are derived from the
+roll-up declarations, so the registry's tier lists and the declarations cannot drift); a `FoldSourceDef` at the same index in
+`fold_sources()`; a `*_delta` in `echo_fold.hpp`; the count pins in `test_echo_fold.cpp` (17
+sources, 34 tiers, 18 registry tiers); the capability TSV rows and the regenerated
+`docs/os-capability-matrix.md`.
+
 #### Migration failure: offline with retry (owner ruling 2026-11-16, #7290)
 
 A failure of the v10 step that is not a crash leaves the file exactly as found (all-or-nothing) and does
@@ -414,33 +441,6 @@ break the all-or-nothing rule and re-enable every source an operator had paused.
   the server publishes `yuzu_fleet_echo_storage_offline{reason}` and the alert `YuzuEchoStorageOffline`
   (warning, 30 minutes) fires on it. The tokens are duplicated literals on the two sides, each pinned
   by a test.
-
-Consequences for code that reads the store:
-- `echo_usage.cpp` is fed the process fold's events inside the process transaction
-  (`usage_fold_in` rides `fold_rows`'s `extra` hook), so there is no read marker and no lag;
-  `PendingBaseline` stamps and folds nothing. A fault in either half rolls back both, and the retried
-  tick folds both once.
-- `purge_source` deletes the source's `_r` rows and `echo_fold_seen` rows and sweeps the dictionary.
-- The status counts (`<src>_rows`, `<src>_oldest_ts`) read the finest tier.
-- `is_fold_view` is case-sensitive: a query that names a view `Process_Hourly` does not reach it.
-- No fold view may gain a WHERE, JOIN or filter: the pinned column-less `_r` read is sound only
-  while every view is a WHERE-less, JOIN-less single-table projection.
-- A `kLast` enrichment column is replaced by a later event that omits the field; a `historical`
-  mapdrive event's identity is remembered, as a hash, in the replay ring under the source
-  `mapdrive_historical`, so a retried enumeration adds no second count; netconn has a high-water
-  mark in `echo_config` and no transactional replay guard through `fold_rows`.
-- Any deleter of `echo_dict` rows goes through `EchoFold`.
-
-**Releases.** Cut no release between the change that introduced v10 and the dashboard change that
-follows it: until then the Echo pages, the process-tree viewer and the canned queries in
-`echo_warehouse.yaml` still read the raw names (empty on v10) or label hourly buckets as raw rows.
-
-**Adding a source or tier.** Five edits, each pinned by a test that fails until it matches: the
-registry row (`build_sources()`, section 8) (the tiers' `GranularityDef`s are derived from the
-roll-up declarations, so the registry's tier lists and the declarations cannot drift); a `FoldSourceDef` at the same index in
-`fold_sources()`; a `*_delta` in `echo_fold.hpp`; the count pins in `test_echo_fold.cpp` (17
-sources, 34 tiers, 18 registry tiers); the capability TSV rows and the regenerated
-`docs/os-capability-matrix.md`.
 
 ---
 
