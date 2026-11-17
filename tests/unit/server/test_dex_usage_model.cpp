@@ -2,8 +2,9 @@
  * test_dex_usage_model.cpp -- the PURE fleet usage read model behind the Digital
  * Employee Experience Apps list (dex_usage_model.hpp): matching and ambiguity,
  * cell assignment, the disclosure partition, the exposure rate, the assembly and
- * the builder over injected reads. No store, no PG, no clock, no I/O: every time
- * value derives from one fixed request instant.
+ * the builder over injected reads. No store, no PG, no clock, no I/O: the window
+ * cut derives from one fixed request instant, and the freshness width is a
+ * constant the database clock applies in the owner's statement.
  *
  * Hand-computed anchor (window 7d, 30-day usage of 1,080,000 run seconds, 4
  * crashes + 1 hang): hours = 1,080,000 x 7/30 / 3,600 = 70, so the estimate is

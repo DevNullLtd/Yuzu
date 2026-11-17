@@ -21543,8 +21543,9 @@ void RestApiV1::register_routes(
     // BEFORE the read, fail closed (a failed write is a 503 and the read never runs); a
     // parameter 400 leaves no row. The row records the admitted request, not the outcome: a
     // later 400 (unknown group) or 503 still leaves it, as dex.app.view does. It carries the
-    // request shape (the tag key or group id asked for) and no agent id. This is the audited
-    // aggregate: the other DEX aggregates, which carry no device identity, are not audited.
+    // request shape (the tag key or group id asked for) and no agent id. Unlike the Apps list,
+    // this aggregate is audited: it reads Forensics-tier usage and, at the default floor of 1,
+    // a cell can be one device's figures.
     //
     // A figure the model withholds is JSON null, never 0, and a failed read is a 503, never a
     // 200 with zero figures. Every param outside its slice, and every off-enum value, is a 400.

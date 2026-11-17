@@ -694,7 +694,7 @@ TEST_CASE("DexAppUsageOwner reports a real statement timeout, a sustained run an
     const auto detail = [&](std::chrono::steady_clock::time_point at) {
         return std::string(owner.unavailable_detail(DexReadFault::kStatementTimeout, at));
     };
-    // The instant right after a run's FIRST timeout (QE-2: the run start is stamped there only).
+    // The instant right after a run's FIRST timeout (the run start is stamped there only).
     std::chrono::steady_clock::time_point after_first_timeout;
     // Three statement timeouts in a row, under a lock that is released on return.
     const auto timeout_run = [&] {

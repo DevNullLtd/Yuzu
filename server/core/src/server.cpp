@@ -20666,9 +20666,9 @@ private:
             };
             // unknown_group (no such group: a 400) is told apart from group_unavailable (a failed
             // read: a retryable 503). The members are read FIRST and the group's existence second:
-            // a group that exists after the member read existed during it, so those members are
-            // valid, and a group deleted in between is unknown_group (a 400, never cached) rather
-            // than a whole-population 200 built from zero members.
+            // a group deleted in between is unknown_group (a 400, never cached) rather than a
+            // whole-population 200 built from zero members, and a group created in between reads
+            // as an empty group (a true, if brief, answer).
             dex_usage.group_members = [this](const std::string& id)
                 -> std::expected<std::vector<std::string>, std::string> {
                 if (!mgmt_group_store_)

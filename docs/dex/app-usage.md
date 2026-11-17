@@ -170,8 +170,9 @@ device and no agent id. If the row cannot be stored the route answers `503` with
 `Sec-Audit-Failed: true` and does not read. The row records the request that was
 admitted, not its outcome: an unknown-group `400` or a `503` after the row still
 leaves it, while a `400` for a malformed parameter is refused before it and leaves
-none. This is the one DEX aggregate that is audited, because it names the
-applications that crash across the whole fleet.
+none. Unlike the Apps list, this aggregate is audited, because it reads
+Forensics-tier usage and at the default floor of 1 a cell can be one device's
+figures.
 
 The usage figures are computed over the caller's visible devices only: the route
 hands the caller's device scope to the model, which filters its device list before
@@ -197,7 +198,8 @@ for every caller admitted today (with RBAC off only an administrator passes, and
   (`pool_acquire_timeout`, `query_error`, `statement_timeout`, `concurrency_budget`)
   count `yuzu_server_guardian_read_degrade_total` with source `dex_usage`; the other
   causes count on the underlying store's own degrade family (`apps_degraded` on
-  source `guardian_state`, `group_unavailable` on
+  source `guardian_state` when the Apps read itself degraded, and on none when the
+  score policy was unreadable, `group_unavailable` on
   `yuzu_server_mgmt_group_read_degrade_total`, `tag_unavailable` on
   `yuzu_server_tag_store_read_degrade_total`).
 
@@ -220,7 +222,8 @@ no `retry_after_ms`, because retrying a read that is over its bound does not hel
   executable key did not change the query plan in that measurement. There is no
   operator-side fix today; the state clears on the first successful read.
 - **What is unaffected.** Other DEX routes, including the Apps list, keep working.
-- **Pool pressure.** Usage reads and Apps reads have separate budgets of 4, so up
+- **Pool pressure.** Usage reads and Apps reads each have their own budget of 4 (a
+  usage request holds an Apps slot only while it reads the Apps list), so up
   to 8 pool leases can be in use at once. If reads time out together with slow
   acquires, check `yuzu_pg_pool_in_use` and `yuzu_pg_acquire_wait_seconds`, and
   raise `--postgres-pool-size` if they show pressure.

@@ -86,10 +86,11 @@ per-device app-usage route (see the map below). Conventions:
 - **Audit.** Routes that name individual devices write an audit row before
   they answer, and refuse to answer (`503` with `Sec-Audit-Failed: true`) if
   that row cannot be stored. Aggregates that carry no device identity are not
-  audited, with one exception: fleet application usage names the applications
-  that crash across the whole fleet, so every request that passes validation is
-  audited as `dex.apps.usage.view` before it is read. Each area page lists its
-  verbs.
+  audited, with exceptions: the cohort comparison and fleet application usage
+  are audited aggregates. Fleet usage reads Forensics-tier usage and, at the
+  default floor of 1, a cell can be one device's figures, so every request that
+  passes validation is audited as `dex.apps.usage.view` before it is read. Each
+  area page lists its verbs.
 - **Service-scoped tokens.** A token scoped to one service is refused on
   every DEX route except these:
   - The per-device routes under `/api/v1/dex/devices/{id}` accept it only for a
@@ -266,7 +267,7 @@ this map; see [network](network.md).
 | Capability | Dashboard | REST | MCP | Fed by | Permission and audit | Page |
 |---|---|---|---|---|---|---|
 | One device's per-executable usage | Device page, Application usage | `GET /api/v1/forensics/agents/{id}/app-usage` | `get_agent_app_usage` | Echo `usage`, `app_usage` plugin, daily sync | `Forensics:Read` scoped to the device; refused to service-scoped tokens, whose role does not hold `Forensics:Read`; audited `app_usage.agent.view`, fails closed | [app usage](app-usage.md) |
-| Fleet usage per application: devices, run time, launches and crashes and hangs per hour of use | Not yet on the Apps page | `GET /api/v1/dex/apps/usage` | Not yet available | Echo `usage`, `app_usage` plugin, daily sync, DEX observer | `Forensics:Read` and `GuaranteedState:Read`, both required (Administrator only while RBAC is off); refused to service-scoped tokens; audited `dex.apps.usage.view` before the read, fails closed | [app usage](app-usage.md#fleet-usage-per-application) |
+| Fleet usage per application: devices, run time, launches and crashes and hangs per hour of use | Not yet on the Apps page | `GET /api/v1/dex/apps/usage` | Not yet available | Echo `usage`, `app_usage` plugin, daily sync, DEX observer | `Forensics:Read` and `GuaranteedState:Read`, both required (Administrator only while RBAC is off); refused to service-scoped tokens; audited `dex.apps.usage.view` once parameters validate before the read, fails closed | [app usage](app-usage.md#fleet-usage-per-application) |
 
 ### Alerts
 
