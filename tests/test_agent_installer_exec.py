@@ -127,7 +127,7 @@ WRAPPER_BODY = "#!/bin/sh\nexit 0\n"
 
 def run_script(label, want, args, *, platform="Linux", visudo_ok=True, getcap="empty", setcap=True,
                wrapper_install_ok=True, layout=None, caps_on_binary=False, extra_env=None, uid0=False,
-               test_root_override=None, sudoers_mode=None):
+               test_root_override=None, sudoers_mode=None, cwd_is_dir=False):
     """layout: None (nothing exists), 'healthy', 'old_glob', 'no_wrapper', 'no_wrapper_grant'."""
     me = getpass.getuser()
     with tempfile.TemporaryDirectory(prefix="yuzu_test_installer_run_") as d:
@@ -198,7 +198,8 @@ mkdir -p "$(dirname "$last")" 2>/dev/null; cp "$s" "$last" 2>/dev/null; chmod 75
         root_value = str(root) if test_root_override is None else test_root_override.replace("@D@", str(d))
         env = {"PATH": str(bindir), "HOME": str(d), "LC_ALL": "C", "YUZU_INSTALLER_TEST_ROOT": root_value, **(extra_env or {})}
         r = subprocess.run(["/bin/bash", str(SCRIPT), "--account-name", me, "--binary-path", str(binary), *args],
-                           capture_output=True, text=True, env=env, timeout=60)
+                           capture_output=True, text=True, env=env, timeout=60,
+                           cwd=str(d) if cwd_is_dir else None)
         ok = (r.returncode != 0) if want == "nonzero" else (r.returncode == want)
         if not ok:
             errs.append(f"[non-sourced] {label}: expected exit {want}, got {r.returncode}\n{r.stdout[-400:]}{r.stderr[-300:]}")
@@ -226,6 +227,10 @@ if "UNVERIFIED" not in r.stderr:
     errs.append("an unreadable sudoers file must be reported as UNVERIFIED on stderr")
 # a real drift still wins over unverified (1, not 6) is covered by the old-glob case above
 
+# N5-2: real drift (exit 1) takes precedence over unverified (exit 6) when both are present
+run_script("check: drift AND unreadable sudoers => 1 (drift wins over unverified)", 1,
+           ["--check", "--account-name", "someone-else-entirely"], layout="healthy", sudoers_mode=0)
+
 # R4-OWNER: state dirs owned by someone other than the account are drift (exit 1)
 run_script("check: state dir owned by another account => 1", 1,
            ["--check", "--account-name", "someone-else-entirely"], layout="healthy")
@@ -236,6 +241,12 @@ if "root run" not in r.stderr:
     errs.append("the root refusal must say why")
 run_script("root --check with the variable set is refused too", 1, ["--check"], layout="healthy", uid0=True)
 run_script("relative TEST_ROOT refused", 1, [], test_root_override="relative/dir")
+# N5-1: an EXISTING, caller-owned relative directory passes every other guard, so only the
+# absolute-path check can refuse it (mutating that check turns this red).
+_, _, r = run_script("existing caller-owned RELATIVE TEST_ROOT is refused by the absolute-path check", 1, [],
+                     test_root_override="root", cwd_is_dir=True)
+if "absolute" not in r.stderr:
+    errs.append("a relative TEST_ROOT must be refused with the absolute-path message")
 run_script("TEST_ROOT of / refused", 1, [], test_root_override="/")
 run_script("TEST_ROOT of // refused", 1, [], test_root_override="//")
 run_script("non-existent TEST_ROOT refused", 1, [], test_root_override="@D@/does-not-exist")

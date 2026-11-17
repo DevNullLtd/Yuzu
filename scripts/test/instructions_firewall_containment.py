@@ -406,7 +406,7 @@ def main(argv=None) -> int:
         say(f"precondition failed: install-agent-user.sh --check exited {rc}: {last}", file=sys.stderr)
         if rc == 6:
             say("  exit 6 means the sudoers file exists but this user cannot read it, so the grants are "
-                "UNVERIFIED: run the ceremony as root (or fix the file's mode) and re-run", file=sys.stderr)
+                "UNVERIFIED: the sudoers file is root-only (0440, correct); re-run as root; do not change the mode", file=sys.stderr)
         return EXIT_PRECONDITION
     base = args.dashboard.rstrip("/")
     client = Client(base)

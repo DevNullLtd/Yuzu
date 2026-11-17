@@ -479,9 +479,10 @@ a user-manager entry carries `_UID=1000` and `USER_UNIT`, so no entry the old pa
 (`_COMM` alone is settable with `prctl`). A missing or malformed trusted field drops the entry
 (fail closed), and the same terms are in the `journalctl` match so forged entries are not fetched
 or counted against the rate cap. Container journals with remapped uids see the container's root
-as `_UID=0`. UNCONFIRMED: the coredump identity terms come from systemd documentation, not a live
-specimen (none was available); a mismatch would silence `process.crashed`, so capture one on a host
-with an active coredump handler and correct the terms if they differ.
+as `_UID=0`. The coredump identity terms (systemd-coredump comm/unit) are derived from systemd
+documentation, not from a captured journal entry on every distro family; if they mismatch,
+`process.crashed` signals can be silently absent on that distro; the drop counter/log makes this
+visible. Capturing one specimen per distro family is an open follow-up.
 
 **journald egress is comm/unit-only.** `process.crashed` ships the process **comm**, never
 `COREDUMP_EXE` (a full binary path that can embed a user/tenant directory); `memory.exhausted`

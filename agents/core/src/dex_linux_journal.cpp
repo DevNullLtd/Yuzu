@@ -60,8 +60,9 @@ bool from_coredump_helper(const json& j) {
     // Safe superset (WP13 governance S3): root is the load-bearing term; ONE name term binds it
     // to the helper. The comm is matched by prefix because the kernel truncates it to 15 chars
     // and a distro may suffix it; the unit form covers a service-launched helper. The identity
-    // is from systemd documentation, NOT a live capture (no coredump entry on the measuring
-    // host), which is why a drop here is counted and logged by the collector.
+    // is derived from systemd documentation, not from a captured journal entry on every distro
+    // family; a mismatch would silently drop process.crashed there, which is why a drop here is
+    // counted and logged by the collector. One specimen per distro family is an open follow-up.
     if (jstr(j, "_UID") != "0")
         return false;
     if (jstr(j, "_COMM").starts_with("systemd-coredum"))

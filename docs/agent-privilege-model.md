@@ -239,7 +239,7 @@ Procedure for any change that introduces a new privileged shell-out:
 3. **Update the privilege matrix above.** Add a row with the platform-specific grants.
 4. **Update `install-agent-user.{sh,ps1}` `generate_sudoers_content` / `RequiredPrivileges`.** Both scripts. If the change is platform-specific, only the platform-specific script needs changing, but document that in the matrix.
 5. **Update the plugin's source to use `sudo -n` (Unix) or run inside the elevated service token (Windows).** Code-review for argument quoting: every argv passed to `sudo -n` must come from a trusted source (a YAML-declared parameter that's been validated against its schema), not from raw operator input.
-6. **Add a regression test under `tests/instructions/` (PR C surface) that exercises the new privilege grant on a UAT stack** with the install script's `--check` as a precondition. For the `firewall` plugin's `nft` and `pfctl` grants this is `scripts/test/instructions_firewall_containment.py`: it runs `install-agent-user.sh --check` first, probes `firewall.quarantine_status` on the UAT stack, and with `--apply-containment` (refused over SSH unless `--i-have-console-access`; needs `--agent-id`, which must be registered exactly once under this machine's hostname and OS; POSIX hosts only; the login user needs `Infrastructure:Read`) applies and always releases containment, passing only when its own release command succeeded; its guards are covered by `tests/test_firewall_containment_ceremony.py`. The live round trip is run by hand on a local host, never on a remote one.
+6. **Add a regression test under `tests/instructions/` (PR C surface) that exercises the new privilege grant on a UAT stack** with the install script's `--check` as a precondition. For the `firewall` plugin's `nft` and `pfctl` grants this is `scripts/test/instructions_firewall_containment.py`: it runs `install-agent-user.sh --check` first, probes `firewall.quarantine_status` on the UAT stack, and with `--apply-containment` (refused over SSH unless `--i-have-console-access`; needs `--agent-id`, which must be registered exactly once under this machine's hostname and OS; POSIX hosts only; the login user needs `Infrastructure:Read`) applies and always releases containment, passing only when its own release command succeeded; its guards are covered by `tests/test_firewall_containment_ceremony.py`. The live round trip is run by hand on a local host, never on a remote one. Run that `--check` as root: it exits 6 (unverified) for a non-root caller because the sudoers file is 0440 root-only, which the ceremony treats as a failed precondition.
 7. **File a security-guardian review** referencing this doc. The reviewer's job: confirm the grant is the narrowest that works and the argv-validation in step 5 is sound.
 
 ---
@@ -285,7 +285,7 @@ For a periodic audit, a `security-guardian` agent should:
 ### `sudo: a password is required`
 
 The agent shelled out to `sudo /sbin/pfctl` (or similar) and sudo asked for a password. Either:
-- The sudoers file isn't installed → run `install-agent-user.sh --check`.
+- The sudoers file isn't installed → run `install-agent-user.sh --check` **as root**: the file is root-only (0440, correct), so a non-root `--check` cannot read it and exits **6** ("unverified"), never 0; exit 1 is drift. Do not loosen the file's mode to make it pass.
 - The sudoers file is wrong → re-run `install-agent-user.sh` (it regenerates the file).
 - The agent is running as a different account than the one in sudoers → check `ps -o user= -p $(pgrep yuzu-agent)`.
 
