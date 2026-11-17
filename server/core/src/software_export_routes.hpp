@@ -23,10 +23,11 @@
 /// Sequence: gate -> parse (400) -> lease (refused: 503 + a `denied` audit row, nothing streamed)
 /// -> audit (BEFORE the provider; set-and-proceed with `Sec-Audit-Failed: true` on a miss) ->
 /// headers -> chunked provider. The provider reads one page per call and holds no store lease
-/// between calls. A degraded read, the wall-clock deadline or a server shutdown makes it return
+/// between calls. A degraded read, the wall-clock deadline, a size limit
+/// (--inventory-export-max-rows / -bytes) or a server shutdown makes it return
 /// false, which aborts the chunked response WITHOUT its terminating chunk, so every HTTP client
 /// sees a truncated transfer: after the headers are sent that is the only failure signal there is.
-/// There is no trailer record and no row cap on a streamed format. No second audit row is written
+/// There is no trailer record; the size limits are Deps::limits. No second audit row is written
 /// at stream end.
 ///
 /// ADMISSION (ADR-0034): the stream pins an HTTP worker for up to 900 s, so it is one lease from the
@@ -107,6 +108,8 @@ public:
         /// always wires the one instance, and an export is never served unmetered.
         detail::StreamBudget* stream_budget{nullptr};
         int concurrency{software_export::kDefaultConcurrency}; ///< --inventory-export-concurrency
+        /// --inventory-export-max-rows / --inventory-export-max-bytes (clamped at registration).
+        software_export::Limits limits{};
     };
 
     void register_routes(HttpRouteSink& sink, Deps deps);

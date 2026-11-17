@@ -103,8 +103,11 @@
 //     directory's ACL, which was not measured. A principal with write access to the data
 //     directory can also replace the file before the agent starts (the agent then reports
 //     failed if it cannot open the replacement), but that principal can already rewrite
-//     kv_store.db. Accepted: the result is ordering by the census ordering key alone, as
-//     before the agent stamped the pair.
+//     kv_store.db. Accepted: the result is an unordered agent, not a wrong verdict. Its events
+//     carry no pair, so the server decides them as unpaired events: held (refused, the row
+//     flagged) against a paired verdict while the agent's pair clock is fresh, applied by
+//     arrival and flagged once it is stale, and ordered by the census ordering key over a row
+//     that holds no pair.
 //   * the lock guards the epoch claim only, not the rest of the data directory (the identity
 //     and command-dedup stores have never been exclusive).
 //   * there is no in-process recovery: a process that lost the lock stays at epoch 0 until it
