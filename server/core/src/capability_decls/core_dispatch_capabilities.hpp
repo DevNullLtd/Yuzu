@@ -106,7 +106,7 @@ inline constexpr std::array<CommandCapability, 5> kCoreDispatchCapabilities{{
         .mutability = Mutability::Reversible,
         .securable = "Inventory",
         .operation = authz::Operation::Write,
-        .risk_tier = authz::RiskTier::Low,
+        .risk_tier = authz::RiskTier::Medium,
         .system_reserved = true,
         .execute_gate = ExecuteGate::None,
     },
