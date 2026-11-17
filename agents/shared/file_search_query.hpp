@@ -33,6 +33,8 @@
 
 namespace yuzu::shared::file_search {
 
+// Limits on the RAW pattern, before a run of '*' collapses to one and before canonicalisation:
+// every '*' counts, a run included.
 inline constexpr std::size_t kMaxPatternBytes = 128;
 inline constexpr std::size_t kMaxStars = 4;
 inline constexpr std::size_t kMinLiteralBytes = 3;
@@ -83,9 +85,9 @@ public:
             if (c == '/' || c == '\0')
                 return std::unexpected(PatternError::forbidden_byte);
             if (c == '*') {
+                ++stars;
                 if (!collapsed.empty() && collapsed.back() == '*')
                     continue;
-                ++stars;
             } else if (c != '?') {
                 ++literals;
             }

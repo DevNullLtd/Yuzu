@@ -16,7 +16,7 @@
 // validated query (the query hash must match), which is the accepted design.
 //
 // Recovery: the agent keeps no cursor state. The same cursor replayed re-walks the same slice
-// (duplicates possible, never a silent skip). A crash mid-slice issues no cursor, so the caller
+// (duplicates possible, no skip of its own). A crash mid-slice issues no cursor, so the caller
 // retries the previous one. A slice that completes the walk issues no cursor and may return the resume
 // position itself, so strictly_advances applies only to a cursor that is issued. One cursor covers
 // one root, so a failing volume never advances another volume's position.
@@ -33,6 +33,10 @@
 //             a new root identity.
 // A backward or equal position without a generation step is always refused. How many restarts one
 // search may take is bounded by the governor (max_restarts), not by this validator.
+// Frame identities are NOT compared here, on purpose: the ordered walker is the one place that
+// reads them (it restarts a frame whose known identity changed, and that slice arrives here as a
+// RESTART). A comparison in this validator would be a second copy of the walker's rule. What no
+// resume can detect is listed in the walker's banner (walk_ordered, NOT DETECTED).
 //
 // Coverage: gap rows are slice-local. The cursor carries only their running count (prior_gaps),
 // so a final slice can never report complete after an earlier slice reported a gap. That count is

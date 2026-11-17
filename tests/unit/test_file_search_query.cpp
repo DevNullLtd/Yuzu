@@ -85,6 +85,8 @@ TEST_CASE("file_search pattern: named refusals", "[file_search][query]") {
     CHECK(err("") == fs::PatternError::empty);
     CHECK(err(std::string(129, 'a')) == fs::PatternError::too_long);
     CHECK(err("a*b*c*d*e*fgh") == fs::PatternError::too_many_stars);
+    CHECK(err("abc*****") == fs::PatternError::too_many_stars);         // a run counts every star
+    CHECK(err("a**b**c**d**efgh") == fs::PatternError::too_many_stars); // 8 raw, 4 once collapsed
     CHECK(err("*a?b*") == fs::PatternError::too_few_literals);
     CHECK(err("abc/def") == fs::PatternError::forbidden_byte);
     CHECK(err(std::string_view("ab\0cd", 5)) == fs::PatternError::forbidden_byte);

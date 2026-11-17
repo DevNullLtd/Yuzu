@@ -83,6 +83,10 @@ TEST_CASE("mount_entries: each malformed shape counts once and adds no entry", "
              "22 1 8:2 / /mnt  - ext4 /dev/sda2 rw",               // doubled space, no options
              "22 1 8:2  / /mnt rw - ext4 /dev/sda2 rw",            // empty root mid-head
              "22  8:2 / /mnt rw - ext4 /dev/sda2 rw",              // empty parent id mid-head
+             "22 1 8:2 / / rw - ext4",                             // cut after the fstype
+             "22 1 8:2 / / rw - ext4 ",                            // cut before the source
+             "22 1 8:2 / / rw - ext4 /dev/sd",                     // cut inside the source
+             "22 1 8:2 / / rw - ext4 /dev/sda2 ",                  // cut before the super-options
          }) {
         INFO("line: " << line);
         const auto t = mount_entries(std::string(line) + "\n");
@@ -99,6 +103,12 @@ TEST_CASE("mount_entries: each malformed shape counts once and adds no entry", "
     CHECK(mixed.malformed == 1);
     REQUIRE(mixed.entries.size() == 2);
     CHECK(mixed.entries[1].mount_point == "/b");
+    // An empty source is a field, not a cut: the kernel prints one for a mount made with an empty
+    // device string.
+    const auto unnamed = mount_entries("50 22 0:50 / /mnt/t rw - tmpfs  rw,size=1k\n");
+    CHECK(unnamed.malformed == 0);
+    REQUIRE(unnamed.entries.size() == 1);
+    CHECK(unnamed.entries[0].source.empty());
 }
 
 TEST_CASE("mount_entries: differential with network_mount_points on well-formed input",

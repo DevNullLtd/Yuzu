@@ -501,6 +501,13 @@ private:
  * earlier than `resume`; a restart may. A slice that ends with advanced false and restarted false is a
  * stall (the caller's governor counts it).
  *
+ * NOT DETECTED. Resume goes by name and by the identity of the directories on the resume path, so a
+ * change between slices that moves neither is not seen and leaves no gap: an entry added at or before
+ * the resume point of a directory that kept its identity, a completed directory swapped for another of
+ * the same name, and a replacement that reports the same identity as the directory it replaced (a
+ * filesystem may reuse one) or reports none. Such entries are not visited. A walk of more than one
+ * slice is not a snapshot.
+ *
  * MEMORY. The sorted listings of the directories currently entered are held and the entry budget does
  * NOT bound them (descending through first children counts one entry per level while every level holds
  * a full listing: 32 levels of 50,000 names with the defaults). Each held listing is charged the sum of
@@ -510,6 +517,8 @@ private:
  * visited, and the walk continues with its next sibling. With the default 50,000-entry listing cap and
  * 255-byte names one listing is about 15 MiB, so a single directory always fits and the cap bites only
  * on a chain of very large ancestors. retained_bytes_peak reports the high-water mark.
+ * The cap bounds what is HELD, not peak live memory: a listing is live before it is charged (one a
+ * memory_cap gap then rejects included) and the sort takes scratch, so allow about one more listing.
  */
 [[nodiscard]] inline OrderedResult
 walk_ordered(const std::string& root, const yuzu::shared::file_search::Position& resume,

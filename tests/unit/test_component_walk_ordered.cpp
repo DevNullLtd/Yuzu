@@ -37,6 +37,8 @@
  *    the device check on the resume path, keeping both entries of a repeated name, not capping
  *    max_depth at kMaxPositionDepth, counting a row for a visit that returned false, or trusting
  *    `truncated` alone each fail the case of that name.
+ *  - resumed depth: entering a resume frame deeper than max_depth instead of recording the depth gap
+ *    fails the resumed half of the max_depth case.
  */
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
@@ -492,6 +494,14 @@ TEST_CASE("walk_ordered: a directory past max_depth is one depth gap",
     CHECK(res.stop == Stop::complete);
     CHECK(tokens(res) == Strs{"depth /r/a/deep"});
     CHECK(r.visits == Strs{"/r/a", "/r/a/deep", "/r/a/f", "/r/z"}); // the entry is a row, its contents are not
+    CHECK(r.fs.listed == Strs{"/r", "/r/a"});
+
+    // The same on the resume path: a frame deeper than max_depth is the gap, never an entered directory.
+    r.visits.clear();
+    r.fs.listed.clear();
+    const auto resumed = slice(r, fsr::Position{0, 0, {{"a", 0, 0}, {"deep", 0, 0}}, ""}, lim);
+    CHECK(tokens(resumed) == Strs{"depth /r/a/deep"});
+    CHECK(r.visits == Strs{"/r/a/f", "/r/z"});
     CHECK(r.fs.listed == Strs{"/r", "/r/a"});
 }
 

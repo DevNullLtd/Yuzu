@@ -40,6 +40,9 @@
 // mount point.
 // The deny-list consumers named above have not moved to this allow-list; for them it is still the
 // durable fix that needs its own review.
+// `malformed` cannot see every short read: text cut between two lines, or inside the last line's
+// super-options, still parses clean. A reader that stopped at its size cap or on an error must
+// report the table unreadable itself.
 #pragma once
 
 #include <charconv>
@@ -159,7 +162,9 @@ namespace detail {
 
 /// Parses /proc/self/mountinfo text into entries, in table order. A blank line is ignored; a line
 /// with no ` - `, fewer than six non-empty head fields (a doubled space leaves an empty one), a
-/// `maj:min` that is not digits:digits or no fstype is counted in `malformed` and yields no entry.
+/// `maj:min` that is not digits:digits, no fstype, or a tail that ends before the super-options is
+/// counted in `malformed` and yields no entry. The source may be empty (the kernel writes it as it
+/// was given to mount: ` - tmpfs  rw`); the super-options always start with ro or rw.
 [[nodiscard]] inline MountTable mount_entries(std::string_view mountinfo) {
     MountTable table;
     std::size_t pos = 0;
@@ -192,12 +197,12 @@ namespace detail {
         const std::string_view after = line.substr(sep + 3);
         const auto fs_end = after.find(' ');
         const std::string_view fstype = after.substr(0, fs_end);
-        std::string_view source;
-        if (fs_end != std::string_view::npos) {
-            const auto rest = after.substr(fs_end + 1);
-            source = rest.substr(0, rest.find(' '));
-        }
-        if (!head_complete || fstype.empty() || colon == std::string_view::npos ||
+        // `src_end` is the space between the source and the super-options; a line cut before the
+        // super-options has none, or nothing after it.
+        const auto src_end =
+            fs_end == std::string_view::npos ? fs_end : after.find(' ', fs_end + 1);
+        const bool tail_complete = src_end != std::string_view::npos && src_end + 1 < after.size();
+        if (!head_complete || !tail_complete || fstype.empty() || colon == std::string_view::npos ||
             !detail::parse_dev_number(f[2].substr(0, colon), e.dev_major) ||
             !detail::parse_dev_number(f[2].substr(colon + 1), e.dev_minor)) {
             ++table.malformed;
@@ -206,7 +211,7 @@ namespace detail {
         e.root = unescape_mountinfo(f[3]);
         e.mount_point = unescape_mountinfo(f[4]);
         e.fstype = std::string(fstype);
-        e.source = unescape_mountinfo(source);
+        e.source = unescape_mountinfo(after.substr(fs_end + 1, src_end - fs_end - 1));
         table.entries.push_back(std::move(e));
     }
     return table;
