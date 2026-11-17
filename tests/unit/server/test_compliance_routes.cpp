@@ -1076,3 +1076,64 @@ TEST_CASE("/fragments/compliance/summary: probes Write, Execute and Delete once 
         REQUIRE(h.perm_calls.size() == 1);
     }
 }
+
+namespace {
+
+/// One enabled policy whose devices are all blocked (policy evaluation refused to dispatch its
+/// check), so the summary route has a blocked tally to carry end to end.
+class BlockedPolicyApi final : public ComplianceApi {
+public:
+    std::expected<std::vector<PolicyFragment>, PolicyReadError>
+    list_fragments(const FragmentQuery&) const override {
+        return std::vector<PolicyFragment>{};
+    }
+    std::expected<std::vector<Policy>, PolicyReadError>
+    list_policies(const PolicyQuery&) const override {
+        Policy p;
+        p.id = "pol-blocked";
+        p.name = "blocked policy";
+        p.scope_expression = "tag:env == 'prod'";
+        p.enabled = true;
+        return std::vector<Policy>{p};
+    }
+    std::expected<std::optional<PolicyDetail>, PolicyReadError>
+    get_policy(const std::string&) const override {
+        return std::optional<PolicyDetail>{};
+    }
+    std::expected<FleetCompliance, PolicyReadError> fleet_compliance() const override {
+        FleetCompliance fc;
+        fc.total_checks = 3;
+        fc.blocked = 3;
+        return fc;
+    }
+    std::expected<ComplianceSummary, PolicyReadError>
+    compliance_summary(const std::string&) const override {
+        ComplianceSummary cs;
+        cs.policy_id = "pol-blocked";
+        cs.blocked = 3;
+        cs.total = 3;
+        return cs;
+    }
+    std::expected<std::vector<PolicyAgentStatus>, PolicyReadError>
+    policy_agent_statuses(const std::string&) const override {
+        return std::vector<PolicyAgentStatus>{};
+    }
+    std::expected<std::vector<ComplianceSummary>, PolicyReadError>
+    compliance_by_policy() const override {
+        return std::vector<ComplianceSummary>{};
+    }
+};
+
+} // namespace
+
+TEST_CASE("/fragments/compliance/summary: a policy whose devices are blocked reads as failing, "
+          "not compliant",
+          "[compliance]") {
+    ComplianceHarness h{nullptr, true, std::make_shared<BlockedPolicyApi>()};
+
+    auto res = h.sink.Get("/fragments/compliance/summary");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->body.find("3 failing") != std::string::npos);
+    CHECK(res->body.find("Compliant</span>") == std::string::npos);
+}

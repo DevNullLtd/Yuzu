@@ -126,7 +126,9 @@ std::string compliance_cell(const SummaryView& v) {
     const int pct = clamp_pct(c.pct);
     const std::string cls = compliance_level(c.pct);
     std::string label = fmt_int(c.compliant) + " of " + fmt_int(c.total_checks) + " checks";
-    std::string d = fmt_int(c.non_compliant) + " failing, " + fmt_int(c.unknown) + " unknown";
+    // Failing is non_compliant + error + blocked, the compliance page's own definition.
+    std::string d = fmt_int(c.non_compliant + c.error + c.blocked) + " failing, " +
+                    fmt_int(c.unknown) + " unknown";
     return cell(cls, std::to_string(pct) + "%", label, d);
 }
 

@@ -88,6 +88,20 @@ TEST_CASE("clamp_pct never leaves 0..100", "[home][render]") {
     CHECK(clamp_pct(std::nan("")) == 0);
 }
 
+TEST_CASE("readout: the failing figure counts non_compliant, error and blocked, like the "
+          "compliance page",
+          "[home][render]") {
+    SummaryView v = all_ok();
+    // {total, compliant, non_compliant, unknown, pct, error, blocked}
+    v.compliance = Fact<ComplianceFigure>::make_ok({100, 60, 10, 5, 60.0, 7, 3});
+    const std::string html = render_readout(v);
+    CHECK(has(html, "20 failing, 5 unknown"));
+
+    // An older positional initialiser (five fields) still means no error and no blocked.
+    v.compliance = Fact<ComplianceFigure>::make_ok({100, 60, 10, 5, 60.0});
+    CHECK(has(render_readout(v), "10 failing, 5 unknown"));
+}
+
 TEST_CASE("compliance_level thresholds are 90 and 70", "[home][render]") {
     CHECK(std::string(compliance_level(90.0)) == "ok");
     CHECK(std::string(compliance_level(89.99)) == "warn");

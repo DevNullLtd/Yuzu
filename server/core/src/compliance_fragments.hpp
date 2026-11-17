@@ -60,6 +60,7 @@ struct PolicyRow {
     int64_t unknown{0};
     int64_t fixing{0};
     int64_t error{0};
+    int64_t blocked{0};
     int64_t total{0};
 };
 
@@ -85,12 +86,14 @@ inline std::string act_button(const char* act, const char* label, const std::str
            "\"" + extra + ">" + label + "</button>";
 }
 
-/// Status pill for one policy row. "N failing" counts non_compliant + error,
-/// the same definition as the "Failing checks" readout so the two agree.
+/// Status pill for one policy row. "N failing" counts non_compliant + error + blocked, the same
+/// definition as the "Failing checks" readout and the home tile so the three agree. A device
+/// whose check or fix policy evaluation refused to dispatch is `blocked`: it must stay in a
+/// failing view, not drop out of it.
 inline std::string policy_status_pill(const PolicyRow& p) {
     if (!p.enabled)
         return pill("idle", "Disabled");
-    const int64_t failing = p.non_compliant + p.error;
+    const int64_t failing = p.non_compliant + p.error + p.blocked;
     if (failing > 0)
         return pill("bad", std::to_string(failing) + " failing");
     if (p.fixing > 0)
@@ -108,7 +111,7 @@ inline std::string render_summary(const SummaryView& v) {
         if (p.enabled)
             ++enabled;
     const int fleet_pct = static_cast<int>(v.fleet.compliance_pct);
-    const int64_t failing = v.fleet.non_compliant + v.fleet.error;
+    const int64_t failing = v.fleet.non_compliant + v.fleet.error + v.fleet.blocked;
     const char* fleet_tone = fleet_pct >= 90 ? "ok" : fleet_pct >= 70 ? "warn" : "bad";
 
     std::string html;
@@ -241,6 +244,8 @@ inline std::string agent_status_pill(const std::string& status) {
         return pill("bad", "Non-compliant");
     if (status == "error")
         return pill("bad", "Error");
+    if (status == "blocked")
+        return pill("bad", "Blocked");
     if (status == "unknown")
         return pill("warn", "Unknown");
     if (status == "fixing")
@@ -292,6 +297,7 @@ inline std::string render_detail(const DetailView& v) {
             pill("ok", std::to_string(v.summary.compliant) + " compliant") +
             pill("bad", std::to_string(v.summary.non_compliant) + " non-compliant") +
             pill("bad", std::to_string(v.summary.error) + " error") +
+            pill("bad", std::to_string(v.summary.blocked) + " blocked") +
             pill("warn", std::to_string(v.summary.unknown) + " unknown") +
             pill("info", std::to_string(v.summary.fixing) + " fixing") + "</div>";
     html += "<div class=\"tw\"><table class=\"detail-table\"><thead><tr>"

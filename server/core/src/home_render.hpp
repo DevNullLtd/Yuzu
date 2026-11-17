@@ -59,6 +59,12 @@ struct ComplianceFigure {
     std::int64_t non_compliant{0};
     std::int64_t unknown{0};
     double pct{0.0};
+    /// Appended after `pct` so a positional initialiser written before these existed still
+    /// compiles. Both count as failing, as `non_compliant` does: the compliance pill and this
+    /// tile are defined to agree, and a device policy evaluation refused to dispatch for
+    /// (`blocked`) must not drop out of a failing view.
+    std::int64_t error{0};
+    std::int64_t blocked{0};
 };
 
 /// How exact a failed-executions count is. The read is the newest 100 `failed`

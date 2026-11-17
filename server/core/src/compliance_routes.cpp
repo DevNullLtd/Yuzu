@@ -111,6 +111,7 @@ std::string ComplianceRoutes::render_compliance_summary_fragment(bool can_write,
             row.unknown = cs_j.at("unknown").get<int64_t>();
             row.fixing = cs_j.at("fixing").get<int64_t>();
             row.error = cs_j.at("error").get<int64_t>();
+            row.blocked = cs_j.at("blocked").get<int64_t>();
             row.total = cs_j.at("total").get<int64_t>();
             view.policies.push_back(std::move(row));
         }
@@ -603,6 +604,7 @@ void ComplianceRoutes::register_routes(HttpRouteSink& sink,
                                                  {"unknown", cs.unknown},
                                                  {"fixing", cs.fixing},
                                                  {"error", cs.error},
+                                                 {"blocked", cs.blocked},
                                                  {"total", cs.total}}}})
                     .dump(),
                 "application/json");
@@ -632,7 +634,8 @@ void ComplianceRoutes::register_routes(HttpRouteSink& sink,
                                 {"non_compliant", fc->non_compliant},
                                 {"unknown", fc->unknown},
                                 {"fixing", fc->fixing},
-                                {"error", fc->error}})
+                                {"error", fc->error},
+                                {"blocked", fc->blocked}})
                     .dump(),
                 "application/json");
         });
@@ -679,6 +682,7 @@ void ComplianceRoutes::register_routes(HttpRouteSink& sink,
                                               {"unknown", summary->unknown},
                                               {"fixing", summary->fixing},
                                               {"error", summary->error},
+                                              {"blocked", summary->blocked},
                                               {"total", summary->total}}},
                                 {"agents", agents_arr}})
                     .dump(),
