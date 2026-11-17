@@ -89,14 +89,22 @@
 
 namespace yuzu::network_config {
 
+/// How a proxy value is shaped: a single URL/host:port (env var, PAC, macOS
+/// address) is never split; a list (WinHTTP ProxyServer) is.
+enum class ProxyShape { single, list };
+
 /// One `proxy_address|<value>` row. The value is an endpoint-supplied proxy
-/// setting (an `*_proxy` environment variable, WinHTTP proxy string, PAC URL),
-/// which conventionally carries `user:password@` userinfo: the credential is
-/// replaced with `REDACTED@` BEFORE the row is built, then the value goes
-/// through safe_output_field so a '|', CR or LF cannot forge columns or rows.
-[[nodiscard]] inline std::string format_proxy_address_row(std::string_view raw) {
-    return "proxy_address|" +
-           yuzu::util::safe_output_field(yuzu::shared::redact_proxy_value(raw));
+/// setting, which conventionally carries `user:password@` userinfo: the
+/// credential is replaced with `REDACTED@` BEFORE the row is built (userinfo is
+/// located before any list splitting, and a `;` `,` space `=` `:` `/` in a
+/// password cannot hide it), then the value goes through safe_output_field so a
+/// '|', CR or LF cannot forge columns or rows.
+[[nodiscard]] inline std::string format_proxy_address_row(std::string_view raw,
+                                                          ProxyShape shape = ProxyShape::single) {
+    return "proxy_address|" + yuzu::util::safe_output_field(
+                                  shape == ProxyShape::list
+                                      ? yuzu::shared::redact_proxy_value(raw)
+                                      : yuzu::shared::redact_proxy_single(raw));
 }
 
 // ── /proc/net/arp (Linux arp leg) ────────────────────────────────────────

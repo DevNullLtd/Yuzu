@@ -62,54 +62,101 @@ namespace yuzu::shared {
 }
 
 
-/// A proxy setting (an `*_proxy` environment value, a WinHTTP proxy string such
-/// as `http=u:p@h:80;https=h2:443`, a PAC URL) with every userinfo redacted.
-/// Split on ';', ',' and whitespace; a leading `key=` is kept. A token with a
-/// scheme goes through redact_uri_word; a scheme-less `[user[:pass]@]host:port`
-/// token loses everything before its LAST '@' in the authority. Fails toward
-/// redaction: any '@' before the first '/' of the authority is treated as a
-/// userinfo terminator.
+namespace proxy_detail {
+// ^[A-Za-z][A-Za-z0-9+.-]*$ -- the only shape a `key=` or `scheme` prefix may have.
+[[nodiscard]] inline bool is_plain_name(std::string_view n) {
+    if (n.empty() || !((n[0] >= 'A' && n[0] <= 'Z') || (n[0] >= 'a' && n[0] <= 'z')))
+        return false;
+    for (const char c : n) {
+        const bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                        (c >= '0' && c <= '9') || c == '+' || c == '.' || c == '-';
+        if (!ok)
+            return false;
+    }
+    return true;
+}
+
+// One entry (never split): everything up to the LAST '@' anywhere in it is
+// userinfo, whatever characters (`; , space = : /`) it holds. Only a plain
+// `key=` and/or plain `scheme://` prefix that precedes that '@' survives.
+[[nodiscard]] inline std::string redact_entry(std::string_view e) {
+    const std::size_t at = e.rfind('@');
+    if (at == std::string_view::npos)
+        return std::string{e};
+    std::size_t keep = 0;
+    const std::size_t eq = e.find('=');
+    if (eq != std::string_view::npos && eq < at && is_plain_name(e.substr(0, eq)))
+        keep = eq + 1;
+    const std::size_t sch = e.find("://", keep);
+    if (sch != std::string_view::npos && sch < at && is_plain_name(e.substr(keep, sch - keep)))
+        keep = sch + 3;
+    return std::string{e.substr(0, keep)} + "REDACTED@" + std::string{e.substr(at + 1)};
+}
+
+[[nodiscard]] inline bool is_sep(char c) {
+    return c == ';' || c == ',' || c == ' ' || c == '\t' || c == '\r' || c == '\n';
+}
+
+// A piece starts a NEW list entry only if it carries a scheme or a plain `key=`.
+[[nodiscard]] inline bool starts_entry(std::string_view piece) {
+    if (piece.find("://") != std::string_view::npos)
+        return true;
+    const std::size_t eq = piece.find('=');
+    return eq != std::string_view::npos && is_plain_name(piece.substr(0, eq));
+}
+} // namespace proxy_detail
+
+/// A SINGLE proxy URL / `host:port` / PAC URL (an `*_proxy` environment value, a
+/// macOS address, a PAC URL): never split. Fails toward redaction: everything up
+/// to the LAST '@' of the whole value is dropped (a path '@' is over-redacted on
+/// purpose).
+[[nodiscard]] inline std::string redact_proxy_single(std::string_view text) {
+    return proxy_detail::redact_entry(text);
+}
+
+/// A proxy LIST (a WinHTTP `ProxyServer` string such as
+/// `http=u:p@h:80;https=h2:443`). Userinfo is located BEFORE any splitting: a
+/// piece that does not start a new entry (no scheme, no plain `key=`) is glued to
+/// the previous entry, so a `;`, `,` or space inside a password cannot detach the
+/// credential from its '@'. Known residual: a password that itself contains
+/// `;key=` or `;scheme://` is indistinguishable from a real entry boundary.
 [[nodiscard]] inline std::string redact_proxy_value(std::string_view text) {
+    using namespace proxy_detail;
     std::string out;
+    std::string cur;      // current (possibly merged) entry text
+    std::string pending;  // separators seen since cur's last piece
+    bool have = false;
     std::size_t i = 0;
-    const auto is_sep = [](char c) {
-        return c == ';' || c == ',' || c == ' ' || c == '\t' || c == '\r' || c == '\n';
-    };
     while (i < text.size()) {
-        if (is_sep(text[i])) {
-            out += text[i++];
-            continue;
-        }
         std::size_t j = i;
-        while (j < text.size() && !is_sep(text[j]))
+        const bool sep = is_sep(text[i]);
+        while (j < text.size() && is_sep(text[j]) == sep)
             ++j;
-        std::string_view tok = text.substr(i, j - i);
+        const std::string_view run = text.substr(i, j - i);
         i = j;
-        std::string prefix;
-        const std::size_t scheme = tok.find("://");
-        const std::size_t eq = tok.find('=');
-        const std::size_t first_at = tok.find('@');
-        if (eq != std::string_view::npos && (scheme == std::string_view::npos || eq < scheme) &&
-            (first_at == std::string_view::npos || eq < first_at)) {
-            prefix.assign(tok.substr(0, eq + 1));
-            tok.remove_prefix(eq + 1);
-        }
-        if (tok.find("://") != std::string_view::npos) {
-            out += prefix;
-            out += redact_uri_word(tok);
+        if (sep) {
+            pending.append(run);
             continue;
         }
-        // Scheme-less authority: strip up to the last '@' before the first '/'.
-        const std::size_t slash = tok.find('/');
-        const std::string_view auth = tok.substr(0, slash);
-        const std::size_t at = auth.rfind('@');
-        out += prefix;
-        if (at == std::string_view::npos) {
-            out.append(tok);
+        if (!have) {
+            out += pending;
+            pending.clear();
+            cur.assign(run);
+            have = true;
+        } else if (starts_entry(run)) {
+            out += redact_entry(cur);
+            out += pending;
+            pending.clear();
+            cur.assign(run);
         } else {
-            out.append("REDACTED@").append(tok.substr(at + 1));
+            cur += pending;
+            pending.clear();
+            cur.append(run);
         }
     }
+    if (have)
+        out += redact_entry(cur);
+    out += pending;
     return out;
 }
 

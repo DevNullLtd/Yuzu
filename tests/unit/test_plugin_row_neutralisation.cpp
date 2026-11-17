@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <string>
+#include <vector>
 
 #ifndef _WIN32
 #include "filesystem_dispatcher_test_support.hpp"
@@ -95,19 +96,67 @@ TEST_CASE("network_config proxy row redacts userinfo", "[plugin][row][wp11]") {
     CHECK(format_proxy_address_row("http://bob:p%2f@ss@proxy:3128") ==
           "proxy_address|http://REDACTED@proxy:3128");
     CHECK(format_proxy_address_row("proxy.example:3128") == "proxy_address|proxy.example:3128");
-    for (const char* in : {"bob:SEKR3T@proxy:3128", "bob@proxy:3128", "socks5://bob:SEKR3T@p:1080",
-                           "http=bob:SEKR3T@h:80;https=bob:SEKR3T@h2:443"}) {
+    for (const char* in : {"bob:SEKR3T@proxy:3128", "bob@proxy:3128", "socks5://bob:SEKR3T@p:1080"}) {
         const auto row = format_proxy_address_row(in);
         CHECK_FALSE(has(row, "SEKR3T"));
         CHECK_FALSE(has(row, "bob"));
         CHECK(has(row, "REDACTED@"));
     }
-    CHECK(format_proxy_address_row("http=bob:SEKR3T@h:80;https=h2:443") ==
+    using yuzu::network_config::ProxyShape;
+    CHECK(format_proxy_address_row("http=bob:SEKR3T@h:80;https=h2:443", ProxyShape::list) ==
           "proxy_address|http=REDACTED@h:80;https=h2:443");
+    CHECK(format_proxy_address_row("http=h:80;https=h2:443", ProxyShape::list) ==
+          "proxy_address|http=h:80;https=h2:443");
     // a hostile value still yields one row
     const auto row = format_proxy_address_row("http://u:p@h/\nproxy_type|none");
     CHECK(single_line(row));
     CHECK_FALSE(has(row, "u:p"));
+}
+
+TEST_CASE("proxy redaction: separators and odd characters inside credentials do not leak",
+          "[plugin][row][wp11]") {
+    using yuzu::network_config::format_proxy_address_row;
+    using yuzu::network_config::ProxyShape;
+    const auto has = [](const std::string& s, const char* n) {
+        return s.find(n) != std::string::npos;
+    };
+    // {input, every fragment of the credential that must be absent}
+    struct Case {
+        const char* in;
+        std::vector<const char*> secrets;
+    };
+    const std::vector<Case> cases{
+        {"http://user:pa,ss@proxy:3128", {"user", "pa,", ",ss"}},
+        {"http://user:p;w@host", {"user", "p;", "w@"}},
+        {"http://user:p w@host", {"user", "p ", " w"}},
+        {"http://user:p=w@host", {"user", "p=w"}},
+        {"http://user:a:b@host", {"user", "a:b"}},
+        {"http://user:p/q@host", {"user", "p/q"}},
+        {"http://user:p@q@host", {"user", "p@q"}},
+        {"user:secret=@host:80", {"user", "secret"}},
+        {"user=pw@host:80", {"pw"}},
+        {"a:b=c@host", {"a:b", "c@"}},
+        {"alice:sekret@host:80/path", {"alice", "sekret"}},
+        {"http://x:y@h:1;http://u2:pw2@h2:2", {"pw2", "u2"}},
+    };
+    for (const auto& c : cases) {
+        for (const auto shape : {ProxyShape::single, ProxyShape::list}) {
+            const auto row = format_proxy_address_row(c.in, shape);
+            for (const char* sec : c.secrets)
+                { INFO(c.in << " -> " << row << " leaks " << sec); CHECK_FALSE(has(row, sec)); }
+            CHECK(has(row, "REDACTED@"));
+        }
+    }
+    // list values: credentials in the 2nd and 3rd entries, with separators inside
+    const auto list = format_proxy_address_row(
+        "http=h:80;https=u2:p,w2@h2:443;ftp=u3:p;3 x@h3:21;socks=h4:1080", ProxyShape::list);
+    for (const char* sec : {"u2", "p,w2", "u3", "p;3", "x@"})
+        CHECK_FALSE(has(list, sec));
+    CHECK(has(list, "http=h:80;"));
+    CHECK(has(list, "socks=h4:1080"));
+    // a hostile (non-plain) key never survives as an unredacted prefix
+    CHECK_FALSE(has(format_proxy_address_row("user:secret=@host", ProxyShape::list), "secret"));
+    CHECK_FALSE(has(format_proxy_address_row("us er:pw=x@host", ProxyShape::list), "pw"));
 }
 
 TEST_CASE("update_source_trust redaction still forwards to the shared logic", "[plugin][wp11]") {

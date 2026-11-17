@@ -1190,7 +1190,8 @@ int do_proxy(yuzu::CommandContext& ctx) {
         if (proxy_cfg.lpszProxy) {
             auto proxy = from_wide(proxy_cfg.lpszProxy);
             ctx.write_output(std::format("proxy_type|http"));
-            ctx.write_output(yuzu::network_config::format_proxy_address_row(proxy));
+            ctx.write_output(yuzu::network_config::format_proxy_address_row(
+                                     proxy, yuzu::network_config::ProxyShape::list));
             GlobalFree(proxy_cfg.lpszProxy);
         }
         if (proxy_cfg.lpszProxyBypass) {
