@@ -1201,6 +1201,43 @@ TEST_CASE("QuarantineStore: a step of the database clock cannot make a claim thi
     CHECK(**b_token == *b_claim);
 }
 
+TEST_CASE("QuarantineStore: after a step of the database clock a second claim on the same record "
+          "does not take the first one's guard with it when it is released",
+          "[pg][quarantine][apply_fence]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, quarantine_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    const auto steady_now = std::chrono::steady_clock::now(); // frozen: the window never passes
+    QuarantineStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_steady_now_fn([&steady_now] { return steady_now; });
+    REQUIRE(store.quarantine_device("agent-s2", "admin", "reason", "").has_value());
+    const auto id = active_row(store, "agent-s2")->id;
+
+    // The first apply is delivered and unanswered. The database clock then steps forward, so its
+    // stamp reads two minutes old and the database admits a second claim on the same record.
+    auto first = store.claim_apply("agent-s2", id);
+    REQUIRE(first.has_value());
+    exec_sql(db.dsn(), "UPDATE quarantine_store.quarantine_records SET apply_claimed_at = 1 WHERE id = " +
+                           std::to_string(id));
+    auto second = store.claim_apply("agent-s2", id);
+    REQUIRE(second.has_value());
+    REQUIRE(*second == *first + 1);
+
+    // The second apply ends (it reached no device) and releases its own claim. The first is still
+    // unanswered and still inside its monotonic window, so no token may be read as settled.
+    REQUIRE(store.release_apply_claim("agent-s2", id, *second).has_value());
+    const auto token = store.apply_fence_token("agent-s2", id);
+    REQUIRE(token.has_value());
+    CHECK_FALSE(token->has_value());
+
+    // Only the first apply's own release (or its window passing) lets the token be read again.
+    REQUIRE(store.release_apply_claim("agent-s2", id, *first).has_value());
+    const auto settled = store.apply_fence_token("agent-s2", id);
+    REQUIRE(settled.has_value());
+    REQUIRE(settled->has_value());
+    CHECK(**settled == *second);
+}
+
 namespace {
 // Stamp the record's claim `age_secs` old, counted back from the database's now(). The test host
 // and the database share a clock, so this pins the edges of the window, not which clock the store

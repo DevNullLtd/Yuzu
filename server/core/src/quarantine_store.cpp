@@ -546,20 +546,26 @@ void QuarantineStore::note_local_claim(const std::string& agent_id, std::int64_t
                                        std::int64_t gen) {
     const auto now = steady_now();
     std::lock_guard<std::mutex> lk(claim_mu_);
-    // One entry per agent and record, replaced by the next claim on that record; the expired ones
+    // Every outstanding generation of the record is kept (see the declaration); the expired ones
     // are swept here so a device that is never claimed again does not keep its entry for the life
     // of the process.
-    std::erase_if(local_claims_, [&](const auto& kv) { return kv.second.until <= now; });
-    local_claims_[local_claim_key(agent_id, record_id)] =
-        LocalClaim{gen, now + std::chrono::seconds(kApplyClaimTtlSecs)};
+    std::erase_if(local_claims_, [&](auto& kv) {
+        std::erase_if(kv.second, [&](const LocalClaim& c) { return c.until <= now; });
+        return kv.second.empty();
+    });
+    local_claims_[local_claim_key(agent_id, record_id)].push_back(
+        LocalClaim{gen, now + std::chrono::seconds(kApplyClaimTtlSecs)});
 }
 
 void QuarantineStore::forget_local_claim(const std::string& agent_id, std::int64_t record_id,
                                          std::int64_t gen) {
     std::lock_guard<std::mutex> lk(claim_mu_);
     if (auto it = local_claims_.find(local_claim_key(agent_id, record_id));
-        it != local_claims_.end() && it->second.gen == gen)
-        local_claims_.erase(it);
+        it != local_claims_.end()) {
+        std::erase_if(it->second, [&](const LocalClaim& c) { return c.gen == gen; });
+        if (it->second.empty())
+            local_claims_.erase(it);
+    }
 }
 
 bool QuarantineStore::local_claim_live(const std::string& agent_id, std::int64_t record_id) {
@@ -568,7 +574,8 @@ bool QuarantineStore::local_claim_live(const std::string& agent_id, std::int64_t
     const auto it = local_claims_.find(local_claim_key(agent_id, record_id));
     if (it == local_claims_.end())
         return false;
-    if (it->second.until <= now) {
+    std::erase_if(it->second, [&](const LocalClaim& c) { return c.until <= now; });
+    if (it->second.empty()) {
         local_claims_.erase(it);
         return false;
     }

@@ -307,7 +307,9 @@ public:
 
 private:
     // The claims this process stamped, by agent and record, for the monotonic guard in
-    // `apply_fence_token`.
+    // `apply_fence_token`. Every outstanding generation is kept until it is released or its window
+    // passes: a step of the database clock lets a second claim on the same record in while the
+    // first is still unanswered, and releasing the second must not drop the first's guard.
     struct LocalClaim {
         std::int64_t gen{0};
         std::chrono::steady_clock::time_point until{};
@@ -324,7 +326,7 @@ private:
     yuzu::MetricsRegistry* metrics_{nullptr};
     SteadyNowFn steady_now_fn_;
     std::mutex claim_mu_;
-    std::unordered_map<std::string, LocalClaim> local_claims_;
+    std::unordered_map<std::string, std::vector<LocalClaim>> local_claims_;
 };
 
 } // namespace yuzu::server
