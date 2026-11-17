@@ -732,6 +732,19 @@ int main(int argc, char* argv[]) {
                    "with a retry hint. Default 2.")
         ->check(CLI::Range(1, 16))
         ->envname("YUZU_INVENTORY_EXPORT_CONCURRENCY");
+    app.add_option("--inventory-export-max-rows", cfg.inventory_export_max_rows,
+                   "Most rows one streamed installed-software export may write "
+                   "(GET /api/v1/inventory/software/export, JSONL and CSV). A stream that would "
+                   "pass it is cut without its terminating chunk, so the client sees an aborted "
+                   "transfer, never a file that looks complete. Default 5000000.")
+        ->check(CLI::Range(std::int64_t{1000}, std::int64_t{1'000'000'000}))
+        ->envname("YUZU_INVENTORY_EXPORT_MAX_ROWS");
+    app.add_option("--inventory-export-max-bytes", cfg.inventory_export_max_bytes,
+                   "Most body bytes one streamed installed-software export may write (JSONL and "
+                   "CSV). Cut like --inventory-export-max-rows when passed. Default 1073741824 "
+                   "(1 GiB).")
+        ->check(CLI::Range(std::int64_t{1} << 20, std::int64_t{1} << 40))
+        ->envname("YUZU_INVENTORY_EXPORT_MAX_BYTES");
     app.add_option("--inventory-sync-cooldown", cfg.inventory_sync_cooldown_s,
                    "Seconds between two on-demand software-inventory sync runs of the same group, "
                    "scope expression or the whole fleet (POST /api/v1/hardware/sync and the MCP "
