@@ -156,12 +156,17 @@ TEST_CASE("search_dir: match_type files, directories and both give the exact row
 
     const auto dirs = walk(t, sd::MatchType::directories, 5, sd::limits_for(100), env);
     CHECK(dirs.rows == std::vector<std::string>{row_of(t.root / "d1", true)});
+    CHECK(dirs.out.matches == 1);
+    CHECK(!dirs.out.trailer_needed());
+    CHECK(!dirs.out.constrained());
 
     const auto both = walk(t, sd::MatchType::both, 5, sd::limits_for(100), env);
     CHECK(both.sorted() == sorted_of({row_of(t.root / "top.txt", false),
                                       row_of(t.root / "d1", true),
                                       row_of(t.root / "d1" / "inner.txt", false)}));
+    CHECK(both.out.matches == 3);
     CHECK(!both.out.trailer_needed());
+    CHECK(!both.out.constrained());
 }
 
 TEST_CASE("search_dir: the predicate sees the bare name, not the path", "[filesystem][search_dir]") {

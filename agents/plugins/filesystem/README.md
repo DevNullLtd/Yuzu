@@ -448,7 +448,7 @@ The output never names a skipped path: when a counter is above zero, narrow it d
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-10-04 · LocalSystem (elevated) · leg-hash cc317a696b1d
+**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-10-04 · LocalSystem (elevated) · leg-hash 802f5467fb09
 
 ```
 == action=exists path=C:\Windows\System32\drivers\etc\hosts
@@ -560,7 +560,7 @@ total_lines_after|1
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-10-04 · euid 501 (jsmith) · leg-hash cc317a696b1d
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-11-17 · euid 501 (jsmith) · leg-hash cc317a696b1d
 
 ```
 == action=exists path=/etc/hosts
@@ -592,12 +592,12 @@ size|213
 [result_status] UNDECLARED / UNKNOWN
 
 == action=create_temp
-path|/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T//yuzu-oqRhjd.tmp
+path|/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T//yuzu-qyNWxb.tmp
 persist|true
 [result_status] UNDECLARED / UNKNOWN
 
 == action=create_temp_dir
-path|/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T//yuzu-sPr64l
+path|/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T//yuzu-8C0dp6
 persist|true
 [result_status] UNDECLARED / UNKNOWN
 
@@ -615,7 +615,7 @@ total_lines|9
 file_size|213
 [result_status] UNDECLARED / UNKNOWN
 
-== action=get_acl path=/tmp/yuzu_test_acl_Rw0R2f/acl_file
+== action=get_acl path=/tmp/yuzu_test_acl_ToU95z/acl_file
 owner|jsmith
 group|wheel
 permissions|rw-r--r--
@@ -651,32 +651,32 @@ match|9|::1             localhost
 total_matches|3
 [result_status] UNDECLARED / UNKNOWN
 
-== action=replace path=/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T//yuzu_capture_MaI1z1B3/yuzu_capture_tmp.txt search=yuzu-capture replace=yuzu-replaced
+== action=replace path=/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T//yuzu_capture_TLWTIhRI/yuzu_capture_tmp.txt search=yuzu-capture replace=yuzu-replaced
 replacements_made|2
 file_size_before|37
 file_size_after|13
 [result_status] UNDECLARED / UNKNOWN
 
-== action=write_content path=/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T//yuzu_capture_MaI1z1B3/yuzu_capture_tmp.txt content="yuzu-capture written" overwrite=true
+== action=write_content path=/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T//yuzu_capture_TLWTIhRI/yuzu_capture_tmp.txt content="yuzu-capture written" overwrite=true
 status|ok
 bytes_written|20
-path|/private/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T/yuzu_capture_MaI1z1B3/yuzu_capture_tmp.txt
+path|/private/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T/yuzu_capture_TLWTIhRI/yuzu_capture_tmp.txt
 [result_status] UNDECLARED / UNKNOWN
 
-== action=append path=/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T//yuzu_capture_MaI1z1B3/yuzu_capture_tmp.txt content="yuzu-capture appended"
+== action=append path=/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T//yuzu_capture_TLWTIhRI/yuzu_capture_tmp.txt content="yuzu-capture appended"
 status|ok
 bytes_appended|22
 total_size|20
 [result_status] UNDECLARED / UNKNOWN
 
-== action=delete_lines path=/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T//yuzu_capture_MaI1z1B3/yuzu_capture_tmp.txt start_line=1 end_line=1
+== action=delete_lines path=/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T//yuzu_capture_TLWTIhRI/yuzu_capture_tmp.txt start_line=1 end_line=1
 lines_deleted|1
 total_lines_before|2
 total_lines_after|1
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-10-04 · euid 0 · leg-hash cc317a696b1d
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-10-04 · euid 0 · leg-hash 802f5467fb09
 
 ```
 == action=exists path=/etc/hosts

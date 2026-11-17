@@ -2915,7 +2915,7 @@
       "stamp": {
         "date": "2026-10-04",
         "host_class": "container",
-        "leg_hash": "cc317a696b1d",
+        "leg_hash": "802f5467fb09",
         "os": "linux",
         "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
         "privilege": "euid 0"
@@ -2991,7 +2991,7 @@
           },
           "row_count": 2,
           "rows": [
-            "path|/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T//yuzu-oqRhjd.tmp",
+            "path|/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T//yuzu-qyNWxb.tmp",
             "persist|true"
           ],
           "truncated": false
@@ -3008,7 +3008,7 @@
           },
           "row_count": 2,
           "rows": [
-            "path|/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T//yuzu-sPr64l",
+            "path|/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T//yuzu-8C0dp6",
             "persist|true"
           ],
           "truncated": false
@@ -3036,7 +3036,7 @@
         {
           "action": "get_acl",
           "not_captured": null,
-          "params": "path=/tmp/yuzu_test_acl_Rw0R2f/acl_file",
+          "params": "path=/tmp/yuzu_test_acl_ToU95z/acl_file",
           "rc": 0,
           "result_status": {
             "completeness": "UNKNOWN",
@@ -3142,7 +3142,7 @@
         {
           "action": "replace",
           "not_captured": null,
-          "params": "path=/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T//yuzu_capture_MaI1z1B3/yuzu_capture_tmp.txt search=yuzu-capture replace=yuzu-replaced",
+          "params": "path=/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T//yuzu_capture_TLWTIhRI/yuzu_capture_tmp.txt search=yuzu-capture replace=yuzu-replaced",
           "rc": 0,
           "result_status": {
             "completeness": "UNKNOWN",
@@ -3160,7 +3160,7 @@
         {
           "action": "write_content",
           "not_captured": null,
-          "params": "path=/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T//yuzu_capture_MaI1z1B3/yuzu_capture_tmp.txt content=\"yuzu-capture written\" overwrite=true",
+          "params": "path=/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T//yuzu_capture_TLWTIhRI/yuzu_capture_tmp.txt content=\"yuzu-capture written\" overwrite=true",
           "rc": 0,
           "result_status": {
             "completeness": "UNKNOWN",
@@ -3171,14 +3171,14 @@
           "rows": [
             "status|ok",
             "bytes_written|20",
-            "path|/private/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T/yuzu_capture_MaI1z1B3/yuzu_capture_tmp.txt"
+            "path|/private/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T/yuzu_capture_TLWTIhRI/yuzu_capture_tmp.txt"
           ],
           "truncated": false
         },
         {
           "action": "append",
           "not_captured": null,
-          "params": "path=/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T//yuzu_capture_MaI1z1B3/yuzu_capture_tmp.txt content=\"yuzu-capture appended\"",
+          "params": "path=/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T//yuzu_capture_TLWTIhRI/yuzu_capture_tmp.txt content=\"yuzu-capture appended\"",
           "rc": 0,
           "result_status": {
             "completeness": "UNKNOWN",
@@ -3196,7 +3196,7 @@
         {
           "action": "delete_lines",
           "not_captured": null,
-          "params": "path=/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T//yuzu_capture_MaI1z1B3/yuzu_capture_tmp.txt start_line=1 end_line=1",
+          "params": "path=/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T//yuzu_capture_TLWTIhRI/yuzu_capture_tmp.txt start_line=1 end_line=1",
           "rc": 0,
           "result_status": {
             "completeness": "UNKNOWN",
@@ -3213,7 +3213,7 @@
         }
       ],
       "stamp": {
-        "date": "2026-10-04",
+        "date": "2026-11-17",
         "host_class": "bare-metal",
         "leg_hash": "cc317a696b1d",
         "os": "macos",
@@ -3515,7 +3515,7 @@
       "stamp": {
         "date": "2026-10-04",
         "host_class": "bare-metal",
-        "leg_hash": "cc317a696b1d",
+        "leg_hash": "802f5467fb09",
         "os": "windows",
         "os_version": "Windows 10.0.26200 x86_64",
         "privilege": "LocalSystem (elevated)"
