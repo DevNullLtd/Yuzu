@@ -425,7 +425,9 @@ QuarantineStore::mark_endpoint_confirmed(const std::string& agent_id, std::int64
     return guarded_record_update(pool_, open_, agent_id, record_id,
                                  {.op = "mark_endpoint_confirmed",
                                   .set_sql = "last_confirmed_at = $3::bigint",
-                                  .where_sql = "status = 'active'",
+                                  // A row whose release has been requested is no longer being
+                                  // confirmed as contained (the device is about to be released).
+                                  .where_sql = "status = 'active' AND release_requested_at = 0",
                                   .extra = {std::to_string(at)}});
 }
 

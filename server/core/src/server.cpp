@@ -19189,8 +19189,8 @@ private:
                                 (void)quarantine_reconciler_->drain_heartbeat_due();
                         }
                     } catch (const std::exception& e) {
-                        spdlog::error("quarantine_reconciler: tick threw ({}) — thread continuing",
-                                      e.what());
+                        spdlog::error("quarantine_reconciler: {} threw ({}) — thread continuing",
+                                      tick_pass ? "tick" : "heartbeat drain", e.what());
                         // #3425 governance correction round (cpp-safety
                         // SHOULD + unhappy-path UP-1): an exception here
                         // means this tick did not reach ITS OWN successful
@@ -19200,8 +19200,8 @@ private:
                         // of exposing the outage.
                         quarantine_reconciler_->on_tick_exception();
                     } catch (...) {
-                        spdlog::error(
-                            "quarantine_reconciler: tick threw unknown exception — continuing");
+                        spdlog::error("quarantine_reconciler: {} threw unknown exception — continuing",
+                                      tick_pass ? "tick" : "heartbeat drain");
                         quarantine_reconciler_->on_tick_exception();
                     }
                 }

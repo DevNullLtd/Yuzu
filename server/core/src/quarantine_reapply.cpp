@@ -200,12 +200,20 @@ redispatch_stored_containment(QuarantineStore& store, const std::string& agent_i
             ContainmentReapplyError{ContainmentReapplyErrorKind::store_error, gen.error()});
     }
 
-    // Drop our own claim on EVERY exit, including an exception that is not a std::exception thrown
-    // out of dispatch_fn (the catch below takes only std::exception; anything else passes through
-    // and would otherwise leave the claim live for kApplyClaimTtlSecs). The generation the claim
+    // Drop our own claim on EVERY exit but one: a dispatch that reached an agent keeps it (R1 of
+    // the #8045 review). The command was only SENT; the agent runs it on a thread pool and the
+    // firewall plugin takes its gate inside `execute`, so an earlier apply can still be waiting
+    // when a later release runs. The caller drops the claim once it has consumed the apply's
+    // terminal reply (`held_claim_gen`), and otherwise it expires after kApplyClaimTtlSecs.
+    // The exits that drop it include an exception that is not a std::exception thrown out of
+    // dispatch_fn (the catch below takes only std::exception; anything else passes through and
+    // would otherwise leave the claim live for kApplyClaimTtlSecs). The generation the claim
     // moved outlives it (see the header). A failed release leaves the claim to expire after
     // kApplyClaimTtlSecs, which only delays a confirmed end; the guard's body cannot throw.
+    bool keep_claim = false;
     ScopeExit release_claim{[&]() noexcept {
+        if (keep_claim)
+            return;
         try {
             if (auto rel = store.release_apply_claim(agent_id, out_record.id, *gen); !rel)
                 spdlog::warn("redispatch_stored_containment: could not release the apply claim "
@@ -220,6 +228,10 @@ redispatch_stored_containment(QuarantineStore& store, const std::string& agent_i
         std::tie(result.command_id, result.agents_reached) = dispatch_fn(*params);
     } catch (const std::exception&) {
         result.dispatch_threw = true;
+    }
+    if (!result.dispatch_threw && result.agents_reached > 0) {
+        keep_claim = true;
+        result.held_claim_gen = *gen;
     }
     return result;
 }

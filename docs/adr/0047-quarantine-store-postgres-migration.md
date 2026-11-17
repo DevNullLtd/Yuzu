@@ -527,7 +527,7 @@ edited). v5 adds no index. The store's indexes are the primary key, `idx_quarant
 **The two v5 columns** (`BIGINT NOT NULL DEFAULT 0`, added with `ADD COLUMN IF NOT EXISTS`):
 
 - `apply_gen`: the number of applies ever claimed for the record.
-- `apply_claimed_at`: when an apply's dispatch started and has not yet returned; 0 = none. A claim older
+- `apply_claimed_at`: when an apply was claimed and its reply has not yet been consumed; 0 = none. A claim older
   than 120 seconds (`kApplyClaimTtlSecs`) is ignored by comparison, so a crashed holder needs no cleanup.
   The 120 seconds are measured on the database's clock, not a replica's: the claim is stamped with
   `EXTRACT(EPOCH FROM now())` and every test of it (the claim, the token read, both fenced ends) uses
@@ -540,10 +540,16 @@ nothing owed. So:
 
 1. `redispatch_stored_containment`, the one chokepoint for a stored-record apply (the reconciler and the
    MCP `quarantine_device` retry), calls `claim_apply` before the dispatch (`apply_gen + 1` and the claim
-   stamp; refused once a release is requested, the record has ended, or another claim is live) and
-   `release_apply_claim` after it, which clears the claim only while `apply_gen` is still its own. A
-   dispatch that returned is not a delivery (the gateway path only queues), so the generation, not the
-   claim, outlives the dispatch.
+   stamp; refused once a release is requested, the record has ended, or another claim is live). A
+   dispatch that returned is not a delivery (the gateway path only queues) and a delivered command is not
+   a run (the agent executes commands on a thread pool, and the plugin's gate orders them by the order its
+   workers reach it, review of the follow-ups PR, R1). So a dispatch that reached an agent KEEPS the
+   claim and hands it back (`held_claim_gen`); the reconciler drops it with `release_apply_claim` (which
+   clears the claim only while `apply_gen` is still its own) once it has read the apply's reply, from the
+   in-flight poll or, after a release request has made the entry a releasing one, from its own look at
+   the command. An apply that threw or reached nobody drops it at once, a retry of an apply that never
+   answered drops its predecessor's claim just before taking its own, and a caller that reads no reply
+   (the MCP retry) leaves it to expire. The generation outlives the claim.
 2. Whoever will act on an `inactive` answer reads `apply_fence_token` (the current `apply_gen`, or nothing
    while a claim is live) **before it sends the command whose answer it will use**: the reconciler before
    its status read, `DELETE` before its release.
@@ -556,7 +562,7 @@ nothing owed. So:
 **Residuals, accepted and documented rather than closed.** The rule assumes commands to one device
 arrive in the order one server dispatched them (one stream, a first-in first-out gateway queue). A
 transport that reorders them, an apply and a release dispatched by two different server replicas, and a
-dispatch stalled past the 120-second claim window can still reopen the window. DELETE's own release and
+apply that stays unexecuted past the 120-second claim window can still reopen the window. DELETE's own release and
 the owed-release leg each check the record and then dispatch, with the same narrow window against a new
 quarantine of the same device. The operator-visible trace is a `quarantine.reapply` failure row and a
 device contained under no record or a releasing one; the way back is `firewall.release` through the generic

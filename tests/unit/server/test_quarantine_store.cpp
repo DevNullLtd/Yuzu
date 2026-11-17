@@ -867,6 +867,23 @@ TEST_CASE("QuarantineStore: clear_release_owed removes the mark; a repeat and a 
     REQUIRE_FALSE(none.has_value());
 }
 
+TEST_CASE("QuarantineStore: mark_endpoint_confirmed refuses a row whose release has been requested "
+          "(#8045 R6)",
+          "[pg][quarantine][release]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, quarantine_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    QuarantineStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(store.quarantine_device("agent-r6", "admin", "malware", "").has_value());
+    const auto id = active_row(store, "agent-r6")->id;
+    REQUIRE(store.mark_endpoint_confirmed("agent-r6", id, 1000).has_value()); // active: stamps
+    REQUIRE(store.request_release("agent-r6").has_value());
+    auto refused = store.mark_endpoint_confirmed("agent-r6", id, 2000);
+    REQUIRE_FALSE(refused.has_value()); // releasing: no longer confirmed as contained
+    CHECK(refused.error() == std::string(kQuarantineNotQuarantined));
+    CHECK(active_row(store, "agent-r6")->last_confirmed_at == 1000); // the stamp did not move
+}
+
 TEST_CASE("QuarantineStore: mark_endpoint_confirmed stamps last_confirmed_at, the latest confirm wins, and "
           "a stale record id is refused",
           "[pg][quarantine][release]") {

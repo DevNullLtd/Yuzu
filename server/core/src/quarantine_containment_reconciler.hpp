@@ -164,8 +164,13 @@
 /// device's `inactive` answer, and an apply that reaches the device after the observation that
 /// produced that answer would leave the device contained with no record and nothing owed. The rule:
 ///   * `redispatch_stored_containment` claims the apply first (`claim_apply` moves the record's
-///     `apply_gen` and stamps a claim) and drops the claim when the dispatch returns. The
-///     generation outlives the claim, because a dispatch that returned is not a delivery.
+///     `apply_gen` and stamps a claim). A dispatch that returned is not a delivery and a delivered
+///     command is not a run (the agent runs commands on a thread pool, in the order its workers
+///     reach the plugin's gate), so a dispatch that reached an agent KEEPS the claim: it is dropped
+///     when the apply's terminal reply is consumed (`release_held_claim`), and otherwise it expires
+///     after `kApplyClaimTtlSecs`. While it is live the token is empty, so a confirmed end fails
+///     closed, whether it rests on a release's `inactive` answer or on a status read. A dispatch
+///     that threw or reached nobody drops it at once. The generation outlives the claim.
 ///   * Whoever will act on an `inactive` answer reads `apply_fence_token` BEFORE it sends the
 ///     command whose answer it will use: `send_status` here (stored as `pending_fence` beside the
 ///     command id), DELETE after `request_release` and before its `firewall.release`. The token is
@@ -173,14 +178,16 @@
 ///   * The write that ends the record (`mark_released(device_confirmed)`, `clear_release_owed`)
 ///     presents the token and the store checks it in the same guarded UPDATE: an apply claimed after
 ///     the token was read refuses the end (`apply_in_flight`). An apply claimed before it had left
-///     the server before the observing command was sent, so that command is queued behind it.
+///     the server before the observing command was sent, so that command is queued behind it, and
+///     its claim stays live until its reply is consumed, so no token is issued while it may still
+///     be waiting to run.
 ///   * A refused end backs off and re-reads: the next status read takes a fresh token and settles it.
 ///     `send_release` reads no token, because no answer to a release ends a record here.
 /// Residuals, stated plainly: (1) the rule assumes commands to one device arrive in the order one
 /// server dispatched them (one stream, a first-in first-out gateway queue); a transport that
 /// reorders them, or an apply and a release dispatched by two different server replicas, can still
-/// reopen the window. (2) A claim older than `kApplyClaimTtlSecs` (120 s) is ignored, so a dispatch
-/// stalled longer than that reopens it. (3) DELETE's own release has a check-then-dispatch window
+/// reopen the window. (2) A claim older than `kApplyClaimTtlSecs` (120 s) is ignored, so an apply that stays
+/// unexecuted longer than that reopens it. (3) DELETE's own release has a check-then-dispatch window
 /// against a re-quarantine of the device, as does the owed-release leg; the new record's re-verify
 /// corrects either within 5 minutes. (4) The same outcome follows when a release sent earlier is run
 /// by the device after a later record's apply, for the same ordering reason: the new record can be
@@ -237,6 +244,7 @@ inline constexpr std::array<std::string_view, 14> kQuarantineReapplyResults{
 
 class QuarantineStore;
 class ResponseStore;
+struct StoredResponse; // response_store.hpp
 class AuditStore;
 
 namespace detail {
@@ -383,6 +391,16 @@ private:
         // have the confirmation stamp land on the wrong (never-dispatched)
         // record. 0 only before the first-ever claim.
         std::int64_t pending_record_id{0};
+        // The apply claim this entry's last apply still holds (`ContainmentReapplyResult::
+        // held_claim_gen`), 0 for none, with the record and command it belongs to. It is dropped
+        // when that apply's terminal reply is consumed (`release_held_claim`), by the in-flight
+        // poll or, after a release request has turned the entry into a releasing one,
+        // by `reconcile_one`'s own look at the command. `reset_for` keeps these three fields: a
+        // reset must not strand a claim whose apply may not have run yet. An apply that never
+        // answers leaves the claim to expire after `kApplyClaimTtlSecs`.
+        std::int64_t held_claim_gen{0};
+        std::int64_t held_claim_record_id{0};
+        std::string held_claim_command_id;
         // The in-flight apply is for a record that was never confirmed (`last_confirmed_at == 0`
         // when it was sent): a reply saying the device kept other operator exceptions then
         // leaves the record unconfirmed instead of being followed by a status read.
@@ -463,6 +481,15 @@ private:
     // The only reset of an entry: a fresh AgentState for `record_id`, a releasing or owed one reading
     // status before it dispatches anything. Used at every site that starts an entry over.
     static void reset_for(AgentState& st, Kind kind, std::int64_t record_id);
+
+    /// Drops the apply claim the in-flight apply holds, once its terminal reply has been consumed.
+    /// A failed drop leaves the claim to expire (it only delays a confirmed end).
+    void release_held_claim(const std::string& agent_id, const AgentState& c);
+
+    /// The stored replies to one of our own commands (nullopt: the store is unreadable or absent).
+    /// The only response-store read the reconciler makes, so the read-site tripwire stays at one.
+    [[nodiscard]] std::optional<std::vector<StoredResponse>>
+    poll_command(const std::string& pending_command_id, const std::string& agent_id) const;
     // The live entry for `agent_id` when its kind and record id still equal `c`'s (the copy a pass
     // took at its claim), else nullptr: the entry was reset, replaced or removed since, and the
     // pass's result is dropped. The caller holds `mu_`, and the pointer is valid only while it does.
@@ -518,8 +545,16 @@ private:
     // cache in, notify_agent_heartbeat() reads it and marks devices due, drain_heartbeat_due() takes
     // the marks.
     std::mutex cache_mu_;
-    std::unordered_set<std::string> unconfirmed_cache_; // refreshed by tick()
-    std::unordered_set<std::string> heartbeat_due_;     // marked by heartbeats, drained every second
+    // Looked up by string_view from the heartbeat path, so it hashes and compares transparently.
+    struct StringViewHash {
+        using is_transparent = void;
+        std::size_t operator()(std::string_view s) const noexcept {
+            return std::hash<std::string_view>{}(s);
+        }
+    };
+    using IdSet = std::unordered_set<std::string, StringViewHash, std::equal_to<>>;
+    IdSet unconfirmed_cache_;                       // refreshed by tick()
+    std::unordered_set<std::string> heartbeat_due_; // marked by heartbeats, drained every second
 };
 
 } // namespace yuzu::server

@@ -63,7 +63,14 @@ std::chrono::steady_clock::time_point QuarantineContainmentReconciler::steady_no
 }
 
 void QuarantineContainmentReconciler::reset_for(AgentState& st, Kind kind, std::int64_t record_id) {
+    // An apply's claim outlives the entry's own state: the apply may not have run yet.
+    auto held_gen = st.held_claim_gen;
+    auto held_record = st.held_claim_record_id;
+    auto held_command = std::move(st.held_claim_command_id);
     st = AgentState{};
+    st.held_claim_gen = held_gen;
+    st.held_claim_record_id = held_record;
+    st.held_claim_command_id = std::move(held_command);
     st.kind = kind;
     st.record_id = record_id;
     // A releasing or owed entry reads status before it dispatches anything.
@@ -76,6 +83,41 @@ QuarantineContainmentReconciler::entry_for(const std::string& agent_id, const Ag
     if (it == state_.end() || it->second.kind != c.kind || it->second.record_id != c.record_id)
         return nullptr;
     return &it->second;
+}
+
+std::optional<std::vector<StoredResponse>>
+QuarantineContainmentReconciler::poll_command(const std::string& pending_command_id,
+                                              const std::string& agent_id) const {
+    if (!d_.response_store)
+        return std::nullopt;
+    // #4990: internal consumer. Polls the reply to the reconciler's own firewall dispatch (the
+    // closed protective set), never an operator read surface. The frozen site key in
+    // test_response_store_read_tripwire.py is spelled `query(pending_command_id)`, and this is the
+    // only such call: every poll of a command of ours goes through here.
+    return d_.response_store->query(pending_command_id,
+                                    ResponseTierFilter::unrestricted_internal_consumer(),
+                                    ResponseQuery{.agent_id = agent_id});
+}
+
+void QuarantineContainmentReconciler::release_held_claim(const std::string& agent_id,
+                                                         const AgentState& c) {
+    if (c.held_claim_gen == 0 || !d_.quarantine_store)
+        return;
+    try {
+        if (auto rel = d_.quarantine_store->release_apply_claim(agent_id, c.held_claim_record_id,
+                                                                c.held_claim_gen);
+            !rel)
+            spdlog::warn("QuarantineContainmentReconciler: could not release the apply claim for "
+                         "record {}: {}",
+                         c.held_claim_record_id, rel.error());
+    } catch (...) {
+    }
+    std::lock_guard<std::mutex> lk(mu_);
+    if (auto* st = entry_for(agent_id, c)) {
+        st->held_claim_gen = 0;
+        st->held_claim_record_id = 0;
+        st->held_claim_command_id.clear();
+    }
 }
 
 void QuarantineContainmentReconciler::back_off(const std::string& agent_id, const AgentState& c,
@@ -356,7 +398,7 @@ void QuarantineContainmentReconciler::tick() {
         // released: the two mutexes are never held together, and cache_mu_ (taken by every
         // heartbeat) is held for a swap, not for building a set of every unconfirmed device. The
         // old set is freed outside it.
-        std::unordered_set<std::string> unconfirmed(to_reconcile.begin(), to_reconcile.end());
+        IdSet unconfirmed(to_reconcile.begin(), to_reconcile.end());
         {
             std::lock_guard<std::mutex> lk(cache_mu_);
             unconfirmed_cache_.swap(unconfirmed);
@@ -432,11 +474,12 @@ void QuarantineContainmentReconciler::on_tick_exception() const {
 
 void QuarantineContainmentReconciler::notify_agent_heartbeat(std::string_view agent_id_sv) {
     // A mark and nothing else (#7619): this runs on the heartbeat ingest path, so it must never
-    // wait on a store read, a dispatch, or the lock reconcile work holds.
-    const std::string agent_id(agent_id_sv);
+    // wait on a store read, a dispatch, or the lock reconcile work holds. The cache is looked up
+    // by view, so a heartbeat from a device that is not under an unconfirmed record (nearly all of
+    // them) allocates nothing; only a hit builds the string that is stored.
     std::lock_guard<std::mutex> lk(cache_mu_);
-    if (unconfirmed_cache_.contains(agent_id))
-        heartbeat_due_.insert(agent_id);
+    if (unconfirmed_cache_.contains(agent_id_sv))
+        heartbeat_due_.emplace(agent_id_sv);
 }
 
 std::size_t QuarantineContainmentReconciler::drain_heartbeat_due() {
@@ -453,18 +496,31 @@ std::size_t QuarantineContainmentReconciler::drain_heartbeat_due() {
     // a device already started finishes.
     const auto deadline = steady_now() + kDrainTimeBudget;
     std::size_t dispatched = 0;
-    while (!due.empty()) {
-        if (d_.should_stop && d_.should_stop())
-            break; // shutting down: a device still marked is reconciled by the next heartbeat
-        if (dispatched >= kMaxDispatchesPerTick || steady_now() >= deadline) {
-            // The pass is spent: the rest stay marked for the next drain.
-            std::lock_guard<std::mutex> lk(cache_mu_);
-            heartbeat_due_.merge(due);
-            break;
+    // The marks this pass has not reached go back whether the pass ends on its budget or on an
+    // exception, so a throw partway through delays them only until the next heartbeat or the next
+    // periodic pass instead of dropping them.
+    const auto merge_back = [this, &due]() {
+        std::lock_guard<std::mutex> lk(cache_mu_);
+        heartbeat_due_.merge(due);
+    };
+    try {
+        while (!due.empty()) {
+            if (d_.should_stop && d_.should_stop())
+                break; // shutting down: a device still marked is reconciled by the next heartbeat
+            if (dispatched >= kMaxDispatchesPerTick || steady_now() >= deadline) {
+                merge_back(); // the pass is spent: the rest stay marked for the next drain
+                break;
+            }
+            const auto agent = due.extract(due.begin());
+            if (reconcile_one(agent.value(), "heartbeat"))
+                ++dispatched;
         }
-        const auto agent = due.extract(due.begin());
-        if (reconcile_one(agent.value(), "heartbeat"))
-            ++dispatched;
+    } catch (...) {
+        try {
+            merge_back();
+        } catch (...) {
+        }
+        throw;
     }
     return dispatched;
 }
@@ -951,6 +1007,11 @@ bool QuarantineContainmentReconciler::send_apply(const std::string& agent_id, co
     // Re-drive the STORED whitelist via the one shared recipe (quarantine_reapply.hpp) — the same
     // chokepoint MCP's already_active retry path uses, so the stored-whitelist-only invariant
     // lives in exactly one function. The chokepoint also claims the apply (#7613).
+    //
+    // An apply of ours that timed out unanswered still holds its claim (it may not have run).
+    // This apply replaces it with the same stored list, so the old claim is dropped just before
+    // the new one is taken instead of blocking its own retry for the rest of the claim window.
+    release_held_claim(agent_id, c);
     QuarantineRecord stored{};
     auto reapply_res = redispatch_stored_containment(
         *d_.quarantine_store, agent_id,
@@ -1046,6 +1107,9 @@ bool QuarantineContainmentReconciler::send_apply(const std::string& agent_id, co
             // verify -> mark_endpoint_confirmed call too (the confirm is ABOUT the record whose
             // whitelist was just applied).
             st->pending_record_id = stored.id;
+            st->held_claim_gen = reapply_res->held_claim_gen;
+            st->held_claim_record_id = stored.id;
+            st->held_claim_command_id = reapply_res->command_id;
             st->apply_for_unconfirmed = stored.last_confirmed_at == 0;
             st->pending_since = steady_now();
         }
@@ -1089,17 +1153,20 @@ bool QuarantineContainmentReconciler::reconcile_one(const std::string& agent_id,
     if (c.kind == Kind::owed && c.owed_parked)
         c.verify_first = true;
 
+    // An apply of ours still holds its claim, and the entry is no longer waiting on it (a release
+    // request turned the entry into a releasing one before the reply was read): drop the claim
+    // once that apply's reply is in. Until then no token is issued and no end is accepted, which
+    // is the point of holding it. Nothing is dispatched or decided here.
+    if (c.held_claim_gen != 0 && d_.response_store &&
+        !(c.pending == Pending::apply && c.pending_command_id == c.held_claim_command_id)) {
+        const auto held = poll_command(c.held_claim_command_id, agent_id);
+        if (held && !held->empty())
+            release_held_claim(agent_id, c);
+    }
+
     // ── An in-flight command: poll for its response, dispatch nothing new ──
     if (c.pending != Pending::none) {
-        std::optional<std::vector<StoredResponse>> resp;
-        const std::string& pending_command_id = c.pending_command_id;
-        if (d_.response_store)
-            // #4990: internal consumer. Polls the reply to the reconciler's own firewall
-            // dispatch (the closed protective set), never an operator read surface. The frozen
-            // site key in test_response_store_read_tripwire.py is spelled `query(pending_command_id)`.
-            resp = d_.response_store->query(pending_command_id,
-                                            ResponseTierFilter::unrestricted_internal_consumer(),
-                                            ResponseQuery{.agent_id = agent_id});
+        const auto resp = poll_command(c.pending_command_id, agent_id);
         if (!resp) {
             // #3425 review, sharpened at Gate 5 (gate4-response-store-degradation-freezes-timeout):
             // pending_since is deliberately NOT touched here — the moment response_store recovers,
@@ -1137,6 +1204,10 @@ bool QuarantineContainmentReconciler::reconcile_one(const std::string& agent_id,
         }
 
         const auto reply = parse_containment_reply(combined_output(*resp));
+        // The apply's terminal reply is in hand: it ran, so its claim can go and a confirmed end is
+        // possible again. (A timed-out apply keeps the claim until it expires: it may not have run.)
+        if (c.pending == Pending::apply && c.pending_command_id == c.held_claim_command_id)
+            release_held_claim(agent_id, c);
         switch (c.pending) {
         case Pending::apply:
         case Pending::release:

@@ -68,14 +68,21 @@
 /// answer, and an apply sent while that answer is on its way changes the state the answer
 /// described. Ending the record on the stale answer would leave a contained device with no
 /// record and nothing owed. So this chokepoint calls `QuarantineStore::claim_apply` before the
-/// dispatch (the claim moves the record's apply generation and marks a dispatch in progress) and
-/// `release_apply_claim` after it. A dispatch that returned is NOT a delivery (the gateway path
-/// only queues the command), so the claim is not what protects the record afterwards: the
-/// GENERATION outlives it. Whoever will act on a device's `inactive` answer reads the token
-/// (`apply_fence_token`) BEFORE it sends the command whose answer it will use, and the write that
-/// ends the record presents it; an apply claimed after the read moves the generation and the end
-/// is refused. This relies on commands to one device arriving in the order one server dispatched
-/// them; the residuals are in `quarantine_containment_reconciler.hpp`.
+/// dispatch (the claim moves the record's apply generation and marks an apply in progress). A
+/// dispatch that returned is NOT a delivery (the gateway path only queues the command) and a
+/// delivered command is NOT a run (the agent executes commands on a thread pool, and the plugin's
+/// own gate orders them by the order workers reach it). So when the dispatch reached an agent the
+/// claim is KEPT, and handed back in `ContainmentReapplyResult::held_claim_gen`: it stays live
+/// until the caller has consumed the apply's terminal reply (then it drops it with
+/// `release_apply_claim`) or until `kApplyClaimTtlSecs` passes. While it is live
+/// `apply_fence_token` reads empty, so a confirmed end, whether it rests on a release's `inactive`
+/// answer or on a status read, fails closed. A dispatch that threw or reached nobody delivered
+/// nothing, and the claim is dropped here. The GENERATION outlives the claim: whoever will act on
+/// a device's `inactive` answer reads the token (`apply_fence_token`) BEFORE it sends the command
+/// whose answer it will use, and the write that ends the record presents it; an apply claimed
+/// after the read moves the generation and the end is refused. This relies on commands to one
+/// device arriving in the order one server dispatched them; the residuals are in
+/// `quarantine_containment_reconciler.hpp`.
 ///
 /// WHAT "CONFIRMED" MEANS: the device reports its rules in force and
 /// enforcing (`status|active`, or `status|active_unproven` when no probe
@@ -249,6 +256,12 @@ struct ContainmentReapplyResult {
     bool dispatch_threw{false};
     std::string command_id;
     int agents_reached{0};
+    /// The apply generation whose claim is STILL HELD, non-zero only when the dispatch reached an
+    /// agent. A dispatch that returned is not a delivery and a delivered command is not a run
+    /// (the agent executes commands on a thread pool), so the claim stays live until the caller
+    /// has consumed the apply's terminal reply and drops it with `release_apply_claim`, or until
+    /// `kApplyClaimTtlSecs` passes. A caller with no reply to wait for leaves it to expire.
+    std::int64_t held_claim_gen{0};
 };
 
 /// Caller-supplied dispatch adapter: pre-bound to plugin `firewall`, action
@@ -262,8 +275,9 @@ using ReapplyDispatchFn =
     std::function<std::pair<std::string, int>(const std::unordered_map<std::string, std::string>&)>;
 
 /// The shared recipe: `store.get_status(agent_id)` -> refuse a releasing row -> map the
-/// stored whitelist -> claim the apply (`claim_apply`) -> invoke `dispatch_fn(params)` ->
-/// drop the claim (`release_apply_claim`, whatever the dispatch did). `out_record` receives the stored
+/// stored whitelist -> claim the apply (`claim_apply`) -> invoke `dispatch_fn(params)` -> drop the
+/// claim (`release_apply_claim`) unless the dispatch reached an agent, in which case it is kept and
+/// returned in `held_claim_gen` for the caller to drop once the reply is consumed. `out_record` receives the stored
 /// row on success (the caller typically needs `quarantined_by`/`reason`/
 /// `quarantined_at` for its own response/audit shaping, which this function does not
 /// interpret). Returns `unexpected` without ever calling `dispatch_fn` on any

@@ -874,11 +874,17 @@ apply that reaches the device after the observation that produced that answer wo
 contained with no record naming it. Two parts close that:
 
 - Every stored-record apply (the reconciler's and the MCP `quarantine_device` retry's) first **claims** the
-  record, which moves a durable apply generation, and drops the claim when its dispatch returns. A
-  dispatch that returned is not a delivery (a gateway only queues the command), so the generation, not
-  the claim, is what outlives it. A claim stops counting 120 seconds after it was stamped, and both the
-  stamp and that test use the database's clock, so a server whose own clock steps cannot make a live
-  claim read as expired or a dead one as live.
+  record, which moves a durable apply generation. A dispatch that returned is not a delivery (a gateway
+  only queues the command), and a delivered command is not a run (the agent executes commands on a
+  thread pool, and the firewall plugin takes its own gate in the order its workers reach it). So an apply
+  that reached a device **keeps its claim** until the reconciler has read the apply's reply, and
+  otherwise until the claim stops counting; while it is held no generation is issued and no end is
+  accepted, whether it rests on a release's `inactive` answer or on a status read. An apply that threw or
+  reached no device drops its claim at once. The generation outlives the claim. A claim stops counting
+  120 seconds after it was stamped, and both the stamp and that test use the database's clock, so a
+  server whose own clock steps cannot make a live claim read as expired or a dead one as live. The MCP
+  retry reads no reply, so a release asked for within 120 seconds of one is held back until its claim
+  expires.
 - Whoever will act on an `inactive` answer reads the generation **before it sends the command whose
   answer it will use** (the reconciler before its status read, `DELETE` before its release), and the
   write that ends the record presents it. The store refuses the end when an apply was claimed since
@@ -887,8 +893,8 @@ contained with no record naming it. Two parts close that:
 
 This relies on commands to one device arriving in the order one server dispatched them (one stream, a
 first-in first-out gateway queue). **Still open:** a transport that reorders commands to one device;
-an apply and a release dispatched by two different server replicas; a claim older than 120 seconds (a
-dispatch stalled that long is ignored); and the two check-then-dispatch windows below. In each the
+an apply and a release dispatched by two different server replicas; a claim older than 120 seconds (an
+apply that stays unexecuted that long is ignored); and the two check-then-dispatch windows below. In each the
 trace is the same, a `quarantine.reapply` failure row and a device that is contained under no record or
 a releasing one, and the way back is `firewall.release` sent through the generic command routes.
 

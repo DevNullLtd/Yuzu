@@ -197,8 +197,10 @@ public:
     // while a release is being confirmed. The device's `inactive` answer to the release then
     // describes a state the apply is about to change, and ending the record on it would leave a
     // contained device with no record and nothing owed. `apply_gen` counts the applies ever
-    // claimed for a record; `apply_claimed_at` marks one whose dispatch has not returned. A
-    // dispatch that returned is NOT a delivery (the gateway path only queues the command), so the
+    // claimed for a record; `apply_claimed_at` marks one whose reply has not been consumed. A
+    // dispatch that returned is NOT a delivery (the gateway path only queues the command) and a
+    // delivered command is NOT a run (the agent executes commands on a thread pool), so a caller
+    // that dispatched to an agent holds the claim until it has read the reply, and the
     // generation outlives the claim: whoever will act on a device's `inactive` answer reads the
     // token BEFORE it sends the command whose answer it will use, and the write that ends the
     // record presents it. An apply claimed after the token read moves the generation, so the end

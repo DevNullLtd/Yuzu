@@ -1891,6 +1891,8 @@ struct ReconRig {
     MockDispatch dispatch;
     // What the "device" answers each dispatch ("" = no answer). Called with the call just made.
     std::function<std::string(const DispatchCall&)> script;
+    // The reconciler's should_stop probe; a test sets it to throw, to stop a drain part-way.
+    std::function<bool()> stop_fn;
     std::int64_t clock{1'800'000'000};
     FakeSteady steady; // the reconciler's monotonic clock; a step advances it, nothing waits
     // Timing of the reconciler build() makes; a test that needs a visible backoff sets these
@@ -1934,6 +1936,7 @@ struct ReconRig {
             .dispatch_fn = dispatch.fn(),
             .now_fn = [this] { return clock; },
             .steady_now_fn = steady.fn(),
+            .should_stop = [this] { return stop_fn && stop_fn(); },
             .min_reapply_interval_override = min_interval,
             .response_wait_override = std::chrono::milliseconds(60'000),
             .verify_grace_override = std::chrono::milliseconds(1),
@@ -3234,6 +3237,9 @@ TEST_CASE("reconciler (firewall): a status read sent while the record was confir
         },
         stored);
     REQUIRE(applied.has_value());
+    // The apply reached the device, so its claim is held: this path reads no reply, so here the
+    // test plays the part of the reply being consumed (otherwise the claim expires on its own).
+    REQUIRE(applied->held_claim_gen != 0);
     // ...and the operator then asks for the release.
     REQUIRE(rig.qstore.request_release("agent-1").has_value());
     rig.steady.advance(std::chrono::milliseconds(8));
@@ -3244,10 +3250,60 @@ TEST_CASE("reconciler (firewall): a status read sent while the record was confir
     CHECK(rig.audit("quarantine.disable").empty());    // no row, no counter for a refusal
     CHECK(rig.counter("released") == 0);
     CHECK(rig.rows_with("quarantine.reapply", "drift") == 0);
-    // the next status read takes a fresh token and settles it
+    // the apply's reply is consumed (claim dropped); the next status read takes a fresh token
+    // and settles it
+    REQUIRE(rig.qstore.release_apply_claim("agent-1", rec.id, applied->held_claim_gen).has_value());
     rig.run(4);
     CHECK_FALSE(rig.active().has_value());
     CHECK(rig.has_row("quarantine.disable", "success", "confirmed record_id=" + std::to_string(rec.id)));
+}
+
+TEST_CASE("reconciler (firewall): an apply that was delivered but has not run keeps its claim, so a "
+          "release confirmed by an inactive answer cannot end the record until the apply's reply is "
+          "consumed (#8045 R1)",
+          "[pg][quarantine][reconciler][prq2][fence][r1]") {
+    RECON_RIG(rig);
+    const auto rec = rig.quarantine();
+    rig.reply("", "status|inactive"); // the apply gets no reply yet: it is delivered, not run
+    rig.step();                       // the apply is dispatched; its claim is held
+    REQUIRE(rig.sent() == (std::vector<std::string>{"firewall.quarantine"}));
+    // What DELETE does while the apply is still waiting to run on the device: ask for the release
+    // and read the fence token before sending it.
+    REQUIRE(rig.qstore.request_release("agent-1").has_value());
+    auto token = rig.qstore.apply_fence_token("agent-1", rec.id);
+    REQUIRE(token.has_value());
+    CHECK_FALSE(token->has_value()); // no token while a delivered apply may not have run
+    // An end resting on the device's `inactive` answer fails closed, with or without a token.
+    auto refused = rig.qstore.mark_released("agent-1", rec.id, ReleaseEnd::device_confirmed, *token);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error() == std::string(kQuarantineApplyInFlight));
+    REQUIRE(rig.active().has_value()); // the record is still there
+    // The apply runs and answers; the reconciler consumes the reply and drops the claim.
+    store_status_response(rig.rstore, ReconRig::cmd(1), "agent-1", "status|active_unproven");
+    rig.step();
+    auto after = rig.qstore.apply_fence_token("agent-1", rec.id);
+    REQUIRE(after.has_value());
+    CHECK(after->has_value()); // the token reads again once the reply is consumed
+    rig.run(8);
+    CHECK_FALSE(rig.active().has_value()); // and the release now ends the record the normal way
+}
+
+TEST_CASE("reconciler (firewall): the marks a heartbeat drain had not reached go back when the pass throws "
+          "(#8045 R4)",
+          "[pg][quarantine][reconciler][prq2][drain]") {
+    RECON_RIG(rig);
+    rig.quarantine();
+    rig.reply("", ""); // the apply gets no reply: the entry stays pending and unconfirmed
+    rig.step();        // the apply is dispatched; the unconfirmed cache now holds agent-1
+    REQUIRE(rig.sent() == (std::vector<std::string>{"firewall.quarantine"}));
+    rig.rec->notify_agent_heartbeat("agent-1"); // marked due
+    rig.stop_fn = []() -> bool { throw std::runtime_error("stop probe failed"); };
+    CHECK_THROWS_AS(rig.rec->drain_heartbeat_due(), std::runtime_error); // before the device is reached
+    rig.stop_fn = nullptr;
+    rig.steady.advance(std::chrono::milliseconds(8));
+    const double before = rig.counter("pending");
+    CHECK(rig.rec->drain_heartbeat_due() == 0);  // nothing is dispatched...
+    CHECK(rig.counter("pending") == before + 1); // ...but the mark survived the throw and was read
 }
 
 TEST_CASE("reconciler (firewall): the owed leg: a record ended by force while an apply's claim is live is "
@@ -3482,10 +3538,31 @@ TEST_CASE("redispatch_stored_containment claims the apply: the token is empty in
     REQUIRE(first.has_value());
     REQUIRE(inside.has_value());
     CHECK_FALSE(inside->has_value()); // a claim is live inside the dispatch
+    // The dispatch reached an agent, so the claim is KEPT: the command was only sent, the agent
+    // runs it on a thread pool, and an apply that has not run yet can still be overtaken by a
+    // release (#8045 R1). It is handed back for the caller to drop once the reply is consumed.
+    CHECK(first->held_claim_gen == 1);
+    auto kept = qstore.apply_fence_token("agent-1", id);
+    REQUIRE(kept.has_value());
+    CHECK_FALSE(kept->has_value()); // no token is issued while the delivered apply may not have run
+    REQUIRE(qstore.release_apply_claim("agent-1", id, first->held_claim_gen).has_value());
     auto after = qstore.apply_fence_token("agent-1", id);
     REQUIRE(after.has_value());
     REQUIRE(after->has_value());
-    CHECK(**after == 1); // the claim is dropped, the generation moved
+    CHECK(**after == 1); // the reply was consumed, the claim is dropped, the generation moved
+
+    // a dispatch that reached nobody delivered nothing: its claim is dropped at once
+    auto unreached = redispatch_stored_containment(
+        qstore, "agent-1",
+        [&](const std::unordered_map<std::string, std::string>&) -> std::pair<std::string, int> {
+            return {"cmd-0", 0};
+        },
+        stored);
+    REQUIRE(unreached.has_value());
+    CHECK(unreached->held_claim_gen == 0);
+    auto after_unreached = qstore.apply_fence_token("agent-1", id);
+    REQUIRE(after_unreached.has_value());
+    CHECK(after_unreached->has_value());
 
     // another apply holds a live claim: the chokepoint dispatches nothing
     auto other = qstore.claim_apply("agent-1", id);
