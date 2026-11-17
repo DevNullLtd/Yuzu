@@ -18,6 +18,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <libpq-fe.h>
+#include <nlohmann/json.hpp>
 
 #include <yuzu/metrics.hpp>
 
@@ -5184,4 +5185,43 @@ TEST_CASE("make_tracker_mutation_ports: a CLOSED tracker degrades every port",
                                    audit.fn())
               .status == ExecutionMutationStatus::kStoreDegraded);
     CHECK(audit.rows.empty()); // the admission read failed before any row
+}
+
+// WP07 gate-8 UP1 (independent evidence, not a fix): rows the REST handlers re-dump with a strict
+// nlohmann dump() carry text from PG TEXT columns. Show that invalid UTF-8 cannot become a stored
+// column value (the database encoding rejects it), so those dumps cannot throw on it, including
+// the tracker's `error_detail` (which the writer only NUL-guards). The agent path is also
+// already clean upstream: error_detail arrives in a proto3 `string`, which the server parses as
+// UTF-8-or-reject.
+TEST_CASE("ExecutionTracker: invalid UTF-8 never becomes a stored error_detail (strict dump safe)",
+          "[pg][execution_tracker][utf8]") {
+    YUZU_REQUIRE_PG_DB(db);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto enc = yuzu::server::pg::exec_params(lease.get(), "SHOW server_encoding",
+                                                  std::vector<std::string>{});
+        REQUIRE(enc.status() == PGRES_TUPLES_OK);
+        INFO("server_encoding = " << PQgetvalue(enc.get(), 0, 0));
+        CHECK(std::string(PQgetvalue(enc.get(), 0, 0)) == "UTF8");
+    }
+    ExecutionTracker tracker{pool};
+    REQUIRE(tracker.is_open());
+    auto exec = make_execution();
+    exec.agents_targeted = 1;
+    auto id = tracker.create_execution(exec);
+    REQUIRE(id.has_value());
+
+    AgentExecStatus s;
+    s.agent_id = "agent-utf8";
+    s.status = "failure";
+    s.error_detail = std::string("bad\xff") + "byte";
+    (void)tracker.update_agent_status(*id, s); // accepted or refused: either is fine ...
+    for (const auto& a : tracker.get_agent_statuses(*id)) {
+        // ... but whatever is stored must be strict-dump safe.
+        CHECK_NOTHROW((void)nlohmann::json(a.error_detail).dump());
+        CHECK(a.error_detail.find('\xff') == std::string::npos);
+    }
 }
