@@ -4644,8 +4644,8 @@ row fails to persist, the response carries a `Sec-Audit-Failed: true` header
 | `bundle.collate` | Live-query bundle collated via `GET /api/v1/bundles/{id}`. `target_type=Execution`, `target_id=<correlation id>`. `result=success` (detail `complete=0\|1`), `result=denied` (`not found or not owned` — the 404 covers both an unknown id and a non-owner, so the audit row is where the real reason is recorded), or `result=failure` (`response store degraded` — a 503, distinct from `denied`: the bundle WAS found and owned, the read just could not be served; retryable, `retry_after_ms:5000`). A collation that serves a Forensics-tier step's output also writes `response.forensics.read` with `surface=bundle` (see `response.forensics.read` in the [Audit log](audit-log.md) guide). |
 | `policy_fragment.create` | Policy fragment created. `result` ∈ {`success`, `denied`}. Denied detail value: `duplicate_name` (409, fragment with the same `name` already exists). |
 | `policy.create` | Policy created via `POST /api/policies`. `result` = `success`. Detail (#2123) records the targeting **as stored**: `scope=<scope_expression>` (`-` when empty; cut to 1024 bytes, then `~` appended; the cut can fall inside a multi-byte character) and `groups=<n>` followed by `:<id>,<id>…` (at most 32 ids, then `,~`; each id cut to 64 bytes, then `~`), each value neutralised with `audit_token` (space, `=`, `,` and control bytes become `_`), e.g. `scope=ostype____"windows"_AND_EXISTS_tag:prod groups=1:abc123def456`. `scope=unreadable groups=unreadable` means the read-back after the write failed. A refused create (`400`/`503`) writes no row, and a policy installed from a product pack writes none (#7011). |
-| `policy.evaluate` | Compliance evaluation forced for a policy via `POST /api/policies/{id}/evaluate`. `result` ∈ {`success`, `error`}. Success detail format `execution_id=<id>`. Note: the `409` rejection (no check instruction / no matching agents) returns without emitting an audit row; the `503` degraded-evaluation case (`policy_evaluator_->evaluate_now` returning an error, e.g. an InstructionStore DB/lease failure per ADR-0058, or #4981 PR-1's scope-evaluation abort) DOES audit, `result=error`, detail = the specific underlying-cause string (not a fixed literal — see the route's own 503 documentation) — matches `policy.remediate`'s own `error`-vs-`denied` convention: an infra degrade is not an operator denial. |
-| `policy.remediate` | Manual remediation triggered via `POST /api/policies/{id}/remediate`. `result` ∈ {`success`, `denied`, `error`}. Success detail `execution_id=<id> agents=<n>` (`agents` = delivered count, see the route doc); denied detail carries the reason (e.g. fragment defines no `fix` instruction, no non-compliant agents, a target is already claimed for remediation, or a target has reached its fix-retry cap for this policy); `error` is a genuine store/evaluator degrade, distinct from `denied`. |
+| `policy.evaluate` | Compliance evaluation forced for a policy via `POST /api/policies/{id}/evaluate`. `result` ∈ {`success`, `denied`, `error`}. Success detail format `execution_id=<id>`. A refused dispatch (the check names an action policy evaluation does not run) answers its own `409` and audits `result=denied` with `detail=reason=<token>`. Note: the other `409` rejection (no check instruction / no matching agents) returns without emitting an audit row; the `503` degraded-evaluation case (`policy_evaluator_->evaluate_now` returning an error, e.g. an InstructionStore DB/lease failure per ADR-0058, or #4981 PR-1's scope-evaluation abort) DOES audit, `result=error`, detail = the specific underlying-cause string (not a fixed literal — see the route's own 503 documentation) — matches `policy.remediate`'s own `error`-vs-`denied` convention: an infra degrade is not an operator denial. |
+| `policy.remediate` | Manual remediation triggered via `POST /api/policies/{id}/remediate`. `result` ∈ {`success`, `denied`, `error`}. Success detail `execution_id=<id> agents=<n>` (`agents` = delivered count, see the route doc); denied detail carries the reason (`reason=<token>` when the fix names an action policy evaluation does not run, which answers `409`; or e.g. fragment defines no `fix` instruction, no non-compliant agents, a target is already claimed for remediation, or a target has reached its fix-retry cap for this policy); `error` is a genuine store/evaluator degrade, distinct from `denied`. |
 | `quarantine.enable` | Device quarantined (`attempt`, `success` or `failure`; `denied` when the dispatch approval check refuses the request, with `reason=<label> securable=<name>` in the detail, or when the request's two session look-ups named different principals, with `authenticated principal changed during the request now=<account>` in the detail) |
 | `quarantine.disable` | Device released from quarantine (`attempt`, `success` or `failure`; `denied` in the same two cases as `quarantine.enable`) |
 | `ca.cert.issued` | Internal CA signed a per-agent client certificate at enrollment. `target_type=AgentCertificate`, `target_id=<serial>`, `result=success`. Also emitted by `POST /api/v1/ca/issue-code-signing` (gap-matrix #10) / MCP `issue_code_signing_cert`: `target_type=CodeSigningCertificate`, `target_id=<label>` on a rejected request or `<serial_hex>` on success, `detail` carries `purpose=code-signing`; `result=success`, `result=denied` (no CA root, or a bad/unparseable CSR), or `result=failure` (a genuine 5xx — key-load, signing, or `ca_store` write failure). |
@@ -5581,7 +5581,7 @@ Force an immediate compliance evaluation of a policy, ignoring its interval. The
 server dispatches the bound fragment's `check` instruction to the policy's scope
 and, once responses arrive (within a short grace window), evaluates the CEL
 `check_compliance` per agent and writes `compliant` / `non_compliant` /
-`unknown` / `error` to each agent's status — which is what
+`unknown` / `error` (or `blocked`, see below) to each agent's status — which is what
 `GET /api/compliance` and `GET /api/policies/{id}` then report. Evaluation is
 asynchronous: this returns immediately with the dispatch `execution_id`; the
 verdicts appear a few seconds later.
@@ -5599,7 +5599,14 @@ verdicts appear a few seconds later.
 
 **Response (404):** policy not found. **Response (409):** the policy's fragment
 has no `check` instruction, the policy matches no agents, or a check for this
-policy is already in flight. **Response (503):** either the policy evaluator
+policy is already in flight; or the check names an action that policy evaluation
+does not run (a refused dispatch). The refused dispatch has its own error body,
+built like every other A4 error (`error.code` 409, `message` "policy dispatch
+refused", a `correlation_id`, and a `remediation` text that starts
+`policy_dispatch_refused: ` followed by the reason: `gated`, `destructive`,
+`reserved`, `unclassified`, `ambiguous`, `unwired` or
+`dispatch_identifier_invalid`). Nothing was sent; the policy's devices are
+`blocked` and the attempt is audited as `policy.evaluate` `denied`. **Response (503):** either the policy evaluator
 isn't wired, a genuine internal store failure occurred while reading the policy
 or fragment, recording the dispatch claim, or (ADR-0058) resolving the check
 instruction against InstructionStore, **or (#4981 PR-1) the policy's scope
@@ -5661,7 +5668,10 @@ absent) releases its claim without consuming a retry attempt and is excluded
 from the count, so `agents` may be smaller than the number of `agent_ids`
 requested.
 
-**Response (404):** policy not found. **Response (409):** the fragment defines no
+**Response (404):** policy not found. **Response (409):** the fix names an action
+that policy evaluation does not run (a refused dispatch, with the same error body
+as `/evaluate` above; the targets become `blocked` and their claims are released;
+this is decided before any other business rejection), the fragment defines no
 `fix` instruction, there are no non-compliant agents to remediate, or a target
 could not be claimed — either it is already claimed for remediation (a durable
 per-`(policy, agent)` claim in `PolicyStore`, safe across replicas, HA WS-3
