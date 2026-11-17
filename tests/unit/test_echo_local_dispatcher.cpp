@@ -51,6 +51,7 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <future>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -1356,6 +1357,72 @@ TEST_CASE("echo plugin: a query over a retired $X_Live name fails as an unknown 
     const auto ok = d.run(desc, "sql", live);
     CHECK(ok.rc == 0);
     CHECK(row_with_prefix(rows_of(ok.captured), "__total__|0").has_value()); // empty, not an error
+}
+
+// #7290: the v10 roll-up migration failed. The plugin must LOAD (init succeeds), answer `status`
+// with the reason, refuse everything else with the same error, publish the heartbeat tag the fleet
+// gauge reads, leave the file exactly as found, and stop its retry thread promptly at shutdown
+// (the first retry is a minute away; stop() must not wait it out). The offline -> online
+// transition is not driven here: it needs the production 60 s first delay to be shortened, which
+// would be a test-only knob in shipped code. The pure loop tests cover the retry mechanics.
+TEST_CASE("echo plugin: a failed v10 migration loads Echo offline with the reason and shuts down promptly",
+          "[echo][local_dispatcher][offline]") {
+    const auto plugin_path = find_echo_plugin();
+    if (plugin_path.empty()) {
+        if (std::getenv("MESON_BUILD_ROOT") != nullptr)
+            FAIL("echo plugin library not found under meson test");
+        WARN("echo plugin library not found -- skipping (run from the build root or via meson test)");
+        return;
+    }
+    auto handle = yuzu::agent::PluginHandle::load(plugin_path);
+    REQUIRE(handle.has_value());
+    const auto* desc = handle->descriptor();
+    REQUIRE(desc != nullptr);
+    REQUIRE(desc->init != nullptr);
+
+    yuzu::test::TempDir dir_guard{"yuzu_test_echo_offline_"};
+    std::error_code ec;
+    fs::create_directories(dir_guard.path, ec);
+    auto kv = yuzu::agent::KvStore::open(dir_guard.path / "kv_store.db");
+    REQUIRE(kv.has_value());
+    const auto db_path = dir_guard.path / "echo.db";
+
+    // A v9 file the roll-up migration cannot convert: a retired daily tier holding a bucket
+    // stamped in milliseconds (outside years 0001-9999) beside the schema version marker.
+    raw_sql(db_path,
+            "CREATE TABLE echo_config (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '');"
+            "INSERT INTO echo_config VALUES ('schema_version', '9');"
+            "CREATE TABLE process_daily (id INTEGER PRIMARY KEY AUTOINCREMENT, day_ts INTEGER NOT NULL "
+            "DEFAULT 0, name TEXT NOT NULL DEFAULT '', user TEXT NOT NULL DEFAULT '', start_count "
+            "INTEGER NOT NULL DEFAULT 0, stop_count INTEGER NOT NULL DEFAULT 0);"
+            "INSERT INTO process_daily VALUES (NULL, 1793613600000, 'a', 'u', 3, 1);");
+
+    yuzu::agent::StandalonePluginContext ctx("echo", {{"agent.data_dir", dir_guard.path.string()}}, &*kv);
+    REQUIRE(desc->init(ctx.get()) == 0); // loaded, offline: not a plugin init failure
+    yuzu::agent::LocalDispatcher d;
+
+    const auto status = d.run(desc, "status");
+    CHECK(status.rc == 1);
+    const auto rows = rows_of(status.captured);
+    REQUIRE(rows.size() == 2);
+    CHECK(rows[0].rfind("error|", 0) == 0); // the server gates on a leading error|
+    CHECK(rows[1] == "storage_state|offline|migration_failed");
+    CHECK(kv->get("echo", "heartbeat.storage_offline") == std::optional<std::string>{"migration_failed"});
+
+    // any other action refuses with the error line alone
+    const auto fast = d.run(desc, "collect_fast");
+    CHECK(fast.rc == 1);
+    const auto fast_rows = rows_of(fast.captured);
+    REQUIRE(fast_rows.size() == 1);
+    CHECK(fast_rows[0].rfind("error|", 0) == 0);
+
+    // shutdown ends the retry thread without waiting out its first back-off
+    auto stopped = std::async(std::launch::async, [&] { desc->shutdown(ctx.get()); });
+    REQUIRE(stopped.wait_for(std::chrono::seconds{30}) == std::future_status::ready);
+
+    // the file is still the v9 database with the retired row intact
+    CHECK(raw_sql(db_path, "SELECT value FROM echo_config WHERE key = 'schema_version'")[0][0] == "9");
+    CHECK(raw_sql(db_path, "SELECT COUNT(*) FROM process_daily")[0][0] == "1");
 }
 
 TEST_CASE("echo plugin: a failing cursor source backs off on the real tick, and a changed "
