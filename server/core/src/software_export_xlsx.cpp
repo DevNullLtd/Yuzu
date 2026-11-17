@@ -184,7 +184,7 @@ XlsxSheetWriter::~XlsxSheetWriter() = default;
 
 std::expected<XlsxSheetWriter, std::string>
 XlsxSheetWriter::open(const fs::path& file, const fs::path& tmp_dir, std::string_view sheet_name,
-                      std::span<const std::string_view> header) {
+                      std::span<const std::string_view> header, bool zip64) {
     if (header.empty())
         return std::unexpected("the sheet needs at least one column");
     std::error_code ec;
@@ -200,7 +200,7 @@ XlsxSheetWriter::open(const fs::path& file, const fs::path& tmp_dir, std::string
     lxw_workbook_options options{};
     options.constant_memory = LXW_TRUE;
     options.tmpdir = tmp_s.c_str(); // the library copies it
-    options.use_zip64 = LXW_TRUE;   // a sheet past 4 GiB must still be a valid zip
+    options.use_zip64 = zip64 ? LXW_TRUE : LXW_FALSE; // only an entry that can reach 4 GiB needs it
 
     auto impl = std::make_unique<Impl>();
     impl->file = file;

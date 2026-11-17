@@ -78,10 +78,13 @@ public:
     /// Opens a workbook that will be written to `file` (which may already exist, empty, and is
     /// truncated at close), with its temporary files in `tmp_dir`, and writes the bold, frozen
     /// header row. Nothing is read from or written to disk beyond the library's own files until
-    /// close().
+    /// close(). `zip64` writes a ZIP64 container; it is needed only when one entry can reach 4 GiB,
+    /// and every small entry of such a container carries the extra ZIP64 fields, so it stays off
+    /// otherwise.
     [[nodiscard]] static std::expected<XlsxSheetWriter, std::string>
     open(const std::filesystem::path& file, const std::filesystem::path& tmp_dir,
-         std::string_view sheet_name, std::span<const std::string_view> header);
+         std::string_view sheet_name, std::span<const std::string_view> header,
+         bool zip64 = false);
 
     XlsxSheetWriter(XlsxSheetWriter&&) noexcept;
     XlsxSheetWriter& operator=(XlsxSheetWriter&&) noexcept;

@@ -1356,6 +1356,11 @@ TEST_CASE("export route xlsx: a sized 200 whose body is the workbook, with the f
     const auto t = drive_sized(*res);
     CHECK_FALSE(t.aborted);
     CHECK(t.body.size() == res->content_length_); // Content-Length equals the body
+    // Default limits are far under 4 GiB: an ordinary zip, version-needed 20 in the first local
+    // header (a ZIP64 container would say 45).
+    REQUIRE(t.body.size() >= 6);
+    CHECK((static_cast<unsigned>(static_cast<unsigned char>(t.body[4])) |
+           (static_cast<unsigned>(static_cast<unsigned char>(t.body[5])) << 8)) == 20U);
     const auto xml = sheet_xml(x.root.path / "readback", t.body);
     REQUIRE(xml.has_value()); // the body opens as a workbook
     CHECK(occurrences(*xml, "<row ") == 3); // the header and two rows
@@ -1549,6 +1554,9 @@ TEST_CASE("export route xlsx: the deadline and a closing server during delivery 
         CHECK(x.files_in_dir() == 0);
         CHECK(x.h.count("xlsx", "deadline") == 1);
         CHECK(x.h.count("xlsx", "completed") == 0);
+        auto again = x.h.get("?format=xlsx"); // room for one: only if the grant was returned
+        REQUIRE(again);
+        CHECK(again->status == 200);
     }
     SECTION("the server closes during delivery: counted as aborted the same way") {
         auto res = x.h.get("?format=xlsx");
@@ -1561,6 +1569,15 @@ TEST_CASE("export route xlsx: the deadline and a closing server during delivery 
         CHECK(x.h.held() == 0);
         CHECK(x.files_in_dir() == 0);
         CHECK(x.h.count("xlsx", "aborted") == 1);
+        // begin_closing() is one-way, so a new export is refused as closing whether or not the
+        // grant came back. The grant comes first, so a leaked one would answer the disk 503
+        // (no Retry-After) instead.
+        auto next = x.h.get("?format=xlsx");
+        REQUIRE(next);
+        CHECK(next->status == 503);
+        CHECK(next->get_header_value("Retry-After") == "5");
+        CHECK(next->body.find("not enough free disk space") == std::string::npos);
+        CHECK(x.h.audit_log.back().detail.find("outcome=closing") != std::string::npos);
     }
     SECTION("a client that goes away is aborted, and the grant goes back") {
         {

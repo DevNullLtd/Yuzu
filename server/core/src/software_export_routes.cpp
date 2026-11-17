@@ -451,7 +451,8 @@ void serve_xlsx(const std::shared_ptr<const Ctx>& ctx, const httplib::Request& r
     }
     st->xlsx.path = path;
     if (auto opened = swe::XlsxSheetWriter::open(path, ctx->xlsx_tmp_dir, "Installed software",
-                                                 kXlsxHeader);
+                                                 kXlsxHeader,
+                                                 ctx->limits.max_bytes >= 0xFFFFFFFFLL);
         opened) {
         writer.emplace(std::move(*opened));
     } else {

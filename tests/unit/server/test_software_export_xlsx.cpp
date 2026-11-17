@@ -120,6 +120,39 @@ std::int64_t row_cost(const Cells& cells) {
     return c;
 }
 
+// Version-needed-to-extract of the first local zip header (bytes 4-5, little-endian).
+unsigned first_entry_version_needed(const fs::path& p) {
+    std::ifstream in(p, std::ios::binary);
+    std::array<unsigned char, 6> b{};
+    in.read(reinterpret_cast<char*>(b.data()), static_cast<std::streamsize>(b.size()));
+    REQUIRE(in.gcount() == 6);
+    return static_cast<unsigned>(b[4]) | (static_cast<unsigned>(b[5]) << 8);
+}
+
+struct SheetSize {
+    std::int64_t actual;    // sheet1.xml, uncompressed, from the zip directory
+    std::int64_t accounted; // sheet_bytes() when the last row was appended
+};
+
+// Builds a workbook of `rows` (each appended `reps` times) in its own file and reads back what
+// the library wrote against what the writer accounted.
+SheetSize build_sheet(Fixture& fx, const char* name, const std::vector<Cells>& rows, int reps) {
+    const auto file = fx.dir.path / name;
+    auto opened = swe::XlsxSheetWriter::open(file, fx.dir.path, "Installed software", kHeader);
+    REQUIRE(opened.has_value());
+    auto w = std::move(*opened);
+    for (int rep = 0; rep < reps; ++rep)
+        for (const auto& r : rows)
+            REQUIRE(w.append(r, std::int64_t{1} << 30) == swe::XlsxSheetWriter::Append::ok);
+    const auto accounted = w.sheet_bytes();
+    REQUIRE(w.close().has_value());
+    ZipView zip(file);
+    REQUIRE(zip.ok());
+    const auto actual = zip.usize(kSheet);
+    REQUIRE(actual.has_value());
+    return {static_cast<std::int64_t>(*actual), accounted};
+}
+
 } // namespace
 
 TEST_CASE("xlsx writer: a three-row fixture is a valid workbook with a frozen header",
@@ -154,6 +187,28 @@ TEST_CASE("xlsx writer: a three-row fixture is a valid workbook with a frozen he
     REQUIRE(xml->find("ySplit=\"1\"") != std::string::npos);
     REQUIRE(xml->find("state=\"frozen\"") != std::string::npos);
     REQUIRE(count_of(*xml, "<row ") == 4); // the header and three data rows
+}
+
+TEST_CASE("xlsx writer: ZIP64 is off by default and on only when asked", "[software_export_xlsx]") {
+    Fixture fx;
+    {
+        auto w = fx.writer();
+        REQUIRE(w.close().has_value());
+        REQUIRE(first_entry_version_needed(fx.file) == 20);
+        REQUIRE(ZipView(fx.file).ok());
+    }
+    const auto file64 = fx.dir.path / "zip64.xlsx";
+    auto opened = swe::XlsxSheetWriter::open(file64, fx.dir.path, "Installed software", kHeader, true);
+    REQUIRE(opened.has_value());
+    REQUIRE(opened->append(Cells{"a1", "Alpha", "1.0"}, 1 << 20) ==
+            swe::XlsxSheetWriter::Append::ok);
+    REQUIRE(opened->close().has_value());
+    REQUIRE(first_entry_version_needed(file64) == 45);
+    ZipView zip(file64);
+    REQUIRE(zip.ok());
+    const auto xml = zip.read(kSheet);
+    REQUIRE(xml.has_value());
+    REQUIRE(xml->find(">Alpha<") != std::string::npos);
 }
 
 TEST_CASE("xlsx writer: a cell that begins with = + - or @ is text, never a formula",
@@ -275,6 +330,47 @@ TEST_CASE("xlsx writer: the accounted sheet bytes are an upper bound for adversa
     REQUIRE(swe::xlsx_cell_cost("&") == swe::kXlsxCellOverheadBytes + 5);
     REQUIRE(swe::xlsx_cell_cost("<>") == swe::kXlsxCellOverheadBytes + 8);
     REQUIRE(swe::xlsx_cell_cost("\r") == swe::kXlsxCellOverheadBytes + 7);
+}
+
+TEST_CASE("xlsx writer: the per-cell and per-row accounting terms bound the markup, on differences",
+          "[software_export_xlsx][accounting]") {
+    // The fixed allowance (64 KiB) hides the other two constants in a whole-sheet comparison, so
+    // compare what each row set adds over a header-only workbook with what the writer accounts
+    // for it. A failure here is an accounting defect, not a test to loosen.
+    Fixture fx;
+    const auto base = build_sheet(fx, "base.xlsx", {}, 0);
+    const std::vector<Cells> short_cells{
+        {"a", "b", "c"}, {" lead", "trail ", " both "}, {"", "x", ""}, {"", "", ""}};
+    const std::vector<Cells> adversarial{
+        {std::string(2'000, '&'), std::string(2'000, '<'), std::string(2'000, '>')},
+        {"\t", "\n", "\r"},
+        {"line1\r\nline2", "tab\there", "cr\rcr\rcr"},
+        {std::string(32'767, '&'), std::string(32'767, '\r'), std::string(32'767, '<')},
+        {"\xE2\x82\xAC\xE2\x82\xAC", "\xF0\x9F\x98\x80", "&amp;"},
+        {"q\"uote", "'apos'", "_x0041_"},
+    };
+    std::vector<Cells> all = short_cells;
+    all.insert(all.end(), adversarial.begin(), adversarial.end());
+
+    const auto shorts = build_sheet(fx, "short.xlsx", short_cells, 200);
+    REQUIRE(shorts.actual - base.actual > 0);
+    REQUIRE(shorts.actual - base.actual <= shorts.accounted - base.accounted);
+    const auto full = build_sheet(fx, "all.xlsx", all, 3);
+    REQUIRE(full.actual - base.actual > 0);
+    REQUIRE(full.actual - base.actual <= full.accounted - base.accounted);
+
+    // The sum above leaves slack between the two per-term constants (zeroing the row term still
+    // passes it), so measure each term on its own: rows of one cell against rows of three.
+    REQUIRE(base.actual <= swe::kXlsxSheetFixedBytes);
+    constexpr int reps = 200;
+    const auto one = build_sheet(fx, "one.xlsx", {{"x", "", ""}}, reps);
+    const auto three = build_sheet(fx, "three.xlsx", {{"x", "x", "x"}}, reps);
+    const std::int64_t cell_markup = (three.actual - one.actual) / (2 * reps); // text included
+    const std::int64_t row_markup = (one.actual - base.actual) / reps - cell_markup;
+    REQUIRE(cell_markup > 1);
+    REQUIRE(row_markup > 0);
+    REQUIRE(cell_markup <= swe::kXlsxCellOverheadBytes + 1); // one character of text
+    REQUIRE(row_markup <= swe::kXlsxRowOverheadBytes);
 }
 
 TEST_CASE("xlsx writer: append past the allowance writes nothing and moves no counter",
