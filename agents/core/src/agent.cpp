@@ -302,6 +302,11 @@ struct PluginContextImpl {
 // command to 1-per-command for most plugins.
 static constexpr size_t kOutputFlushThreshold = 64 * 1024; // 64 KB auto-flush
 
+// Commands (since process start) where a plugin output write was lost to an allocation failure.
+// Process-wide so the heartbeat can carry it as `yuzu.output_dropped` (the agent exposes no
+// /metrics endpoint; yuzu_agent_plugin_output_dropped_total is agent-local).
+inline std::atomic<std::uint64_t> g_output_dropped_commands{0};
+
 struct CommandContextImpl {
     std::shared_ptr<SubscribeStream> stream;
     std::mutex* write_mu; // protects concurrent stream->Write()
@@ -341,7 +346,7 @@ struct CommandContextImpl {
     // per-dispatch via `capture_max_bytes` below — see dispatch_with_capture.
     static constexpr std::size_t kCaptureMaxBytes = 2ull * 1024 * 1024;
     std::size_t capture_max_bytes{kCaptureMaxBytes};
-    bool capture_truncated{false};
+    std::atomic<bool> capture_truncated{false};
 
     // Set when a plugin write could not be buffered (allocation failure, caught at the C ABI in
     // yuzu_ctx_write_output). The output is then INCOMPLETE: capture-mode consumers trust
@@ -431,7 +436,11 @@ struct CommandContextImpl {
             // Reserve FIRST: the only throwing step runs before any mutation, so a bad_alloc leaves
             // the buffer exactly as it was (no stray '\n' separator for a chunk that never landed).
             maybe_inject_alloc_failure();
-            capture->reserve(prospective);
+            // Grow geometrically (bounded by the cap): reserve(n) alone may reallocate on every
+            // append for a large run of small writes.
+            if (prospective > capture->capacity())
+                capture->reserve(std::min<std::size_t>(
+                    capture_max_bytes, std::max<std::size_t>(prospective, 2 * capture->capacity())));
             if (!capture->empty())
                 capture->push_back('\n');
             capture->append(text, len);
@@ -588,6 +597,11 @@ int dispatch_with_capture(const YuzuPluginDescriptor* descriptor, const char* ac
     int rc = descriptor->execute(raw_ctx, action, params, param_count);
     ctx_impl.flush_output(); // no-op in capture mode
     ctx_impl.apply_output_drop();
+    if (ctx_impl.output_dropped.load(std::memory_order_relaxed)) {
+        g_output_dropped_commands.fetch_add(1, std::memory_order_relaxed);
+        spdlog::error("local dispatch '{}': a plugin output write was lost to an allocation "
+                      "failure; the capture is reported truncated", action ? action : "");
+    }
     if (truncated_out)
         *truncated_out = ctx_impl.capture_truncated;
     // BR-001: read back whatever the plugin reported via
@@ -786,10 +800,16 @@ YUZU_EXPORT int yuzu_ctx_storage_exists(YuzuPluginContext* ctx, const char* key)
     // (closed handle, SQLITE_BUSY after the busy budget, a failed prepare) is -3, never
     // "absent" -- a plugin that treats absent as "nothing to recover" would otherwise
     // act on a fault as if it were the answer.
-    const auto present = impl->kv_store->exists_checked(impl->plugin_name, key);
-    if (!present)
+    // C ABI: the string_view->string conversions inside can throw; nothing may unwind into the
+    // plugin, and an unanswerable query is -3 (never "absent").
+    try {
+        const auto present = impl->kv_store->exists_checked(impl->plugin_name, key);
+        if (!present)
+            return -3;
+        return *present ? 0 : 1;
+    } catch (...) {
         return -3;
-    return *present ? 0 : 1;
+    }
 }
 
 YUZU_EXPORT const char* yuzu_ctx_storage_list(YuzuPluginContext* ctx, const char* prefix) {
@@ -798,6 +818,7 @@ YUZU_EXPORT const char* yuzu_ctx_storage_list(YuzuPluginContext* ctx, const char
     auto* impl = reinterpret_cast<PluginContextImpl*>(ctx);
     if (!impl->kv_store || impl->plugin_name.empty())
         return nullptr;
+    try {
     auto keys = impl->kv_store->list(impl->plugin_name, prefix ? prefix : "");
 
     // Build JSON array: ["key1","key2",...]
@@ -824,6 +845,9 @@ YUZU_EXPORT const char* yuzu_ctx_storage_list(YuzuPluginContext* ctx, const char
         return nullptr;
     std::memcpy(result, json.c_str(), json.size() + 1);
     return result;
+    } catch (...) { // C ABI: no exception into the plugin
+        return nullptr;
+    }
 }
 
 YUZU_EXPORT int yuzu_register_trigger(YuzuPluginContext* ctx, const char* trigger_id,
@@ -3053,6 +3077,12 @@ public:
                                 tags["yuzu.ota_signature_refused"] =
                                     std::to_string(static_cast<int64_t>(refused));
                             }
+                            // WP07: plugin output writes lost to an allocation failure (the
+                            // command is reported constrained). Omitted while zero.
+                            if (const auto dropped = g_output_dropped_commands.load(
+                                    std::memory_order_relaxed);
+                                dropped != 0)
+                                tags["yuzu.output_dropped"] = std::to_string(dropped);
                             // #5249: the OTA update-signature mode this process
                             // enforces (off / bundle / bundle+require), so a fleet
                             // view CAN find agents that are NOT verifying update
@@ -4652,9 +4682,15 @@ private:
         // derivation ONLY — see derive_effective_result_status(), unit-tested in
         // tests/unit/test_capability_descriptor.cpp.
         ctx_impl.apply_output_drop();
-        if (ctx_impl.output_dropped.load(std::memory_order_relaxed))
+        if (ctx_impl.output_dropped.load(std::memory_order_relaxed)) {
             metrics_.counter("yuzu_agent_plugin_output_dropped_total", {{"plugin", cmd.plugin()}})
                 .increment();
+            g_output_dropped_commands.fetch_add(1, std::memory_order_relaxed);
+            // AFTER unwinding (the allocation failure is long gone): one loud line.
+            spdlog::error("Command {} plugin {}: a plugin output write was lost to an allocation "
+                          "failure; the result is reported constrained/partial",
+                          yuzu::log_id_token(cmd.command_id()), yuzu::log_id_token(cmd.plugin()));
+        }
         YuzuResultStatus effective_result_status =
             derive_effective_result_status(ctx_impl.result_status, rc);
 
