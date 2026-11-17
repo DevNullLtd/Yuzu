@@ -79,6 +79,8 @@ inline constexpr std::string_view kTokUnsupportedOldType = "unsupported_old_type
 inline constexpr std::string_view kTokUnrepresentableName = "unrepresentable_name";
 inline constexpr std::string_view kTokDependentItems = "dependent_items";
 inline constexpr std::string_view kTokInvalidHive = "invalid_hive";
+/// WP06 F62: an ungated read (get_value / key_exists / enumerate_*) of a per-user hive under HKU.
+inline constexpr std::string_view kTokPerUserHiveRequiresGetUserValue = "per_user_hive_requires_get_user_value";
 
 // Win32 codes this layer branches on (registry_win.cpp static_asserts each against the SDK).
 inline constexpr long kErrorSuccess = 0;
@@ -162,6 +164,36 @@ namespace detail {
 }
 
 } // namespace detail
+
+/// WP06 F62: whether an HKU key names MACHINE-scope data, as an ALLOWLIST (anything else under HKU is a
+/// per-user hive or something this layer cannot prove is not one, so the ungated reads refuse it and send the
+/// caller to get_user_value, which is gated AdminOrApproval). Machine-scope first components: `.DEFAULT` and the
+/// three service-account SIDs S-1-5-18/19/20, each also with the `_Classes` suffix; ASCII-case-insensitive.
+/// Leading backslashes are skipped (they cannot hide the first component); an empty first component names the
+/// HKU root itself, which is machine scope. Pure.
+[[nodiscard]] inline bool hku_key_is_machine_scope(std::string_view key) noexcept {
+    while (!key.empty() && key.front() == '\\') key.remove_prefix(1);
+    const auto sep = key.find('\\');
+    const std::string_view first = sep == std::string_view::npos ? key : key.substr(0, sep);
+    if (first.empty()) return true;
+    const auto eq_ci = [&](std::string_view lit) {
+        return first.size() == lit.size() &&
+               std::equal(lit.begin(), lit.end(), first.begin(),
+                          [](char p, char c) { return detail::lower_ascii(p) == detail::lower_ascii(c); });
+    };
+    for (const std::string_view base : {std::string_view{".default"}, std::string_view{"s-1-5-18"},
+                                        std::string_view{"s-1-5-19"}, std::string_view{"s-1-5-20"}}) {
+        if (eq_ci(base)) return true;
+        const std::string with_classes = std::string{base} + "_classes";
+        if (eq_ci(with_classes)) return true;
+    }
+    return false;
+}
+
+/// The read actions' guard (WP06 F62): true when `hive`/`key` name a per-user hive the ungated reads must refuse.
+[[nodiscard]] inline bool read_refuses_per_user_hive(Hive hive, std::string_view key) noexcept {
+    return hive == Hive::hku && !hku_key_is_machine_scope(key);
+}
 
 /// L7: whether an access names a path the agent log should note (the Run keys and the service tree under HKLM).
 /// ASCII-case-insensitive prefix match on the raw, not yet validated, key; no copy of it.

@@ -338,6 +338,14 @@ std::optional<Target> parse_target(yuzu::CommandContext& ctx, yuzu::Params param
     return Target{*p, key, fast_open_hive(*p)};
 }
 
+/// WP06 F62: the four ungated read actions refuse a per-user hive under HKU (get_user_value, gated
+/// AdminOrApproval, is the route to per-user data). Writes its own `error|...` line when it refuses.
+bool refuse_per_user_hku_read(yuzu::CommandContext& ctx, const Target& t) {
+    if (!read_refuses_per_user_hive(t.hive, t.key)) return false;
+    ctx.write_output(std::format("error|{}", kTokPerUserHiveRequiresGetUserValue));
+    return true;
+}
+
 /// A refused single action: the audit line and `error|<token>` with rc 1. `dry_run` is the request's own flag (when it
 /// parsed), which delete_key's audit line and `dry_run|` row report even for a refusal.
 int refuse(yuzu::CommandContext& ctx, const AuditRecord& base, std::string_view reason, bool is_delete_key = false,
@@ -364,6 +372,7 @@ int do_get_value(yuzu::CommandContext& ctx, yuzu::Params params) {
     const auto target = parse_target(ctx, params);
     if (!target) return 1;
     const Target& t = *target;
+    if (refuse_per_user_hku_read(ctx, t)) return 1;
     const auto val_name = params.get("name");
 
     yuzu::win::RegKey opened;
@@ -414,6 +423,7 @@ int do_key_exists(yuzu::CommandContext& ctx, yuzu::Params params) {
     const auto target = parse_target(ctx, params);
     if (!target) return 1;
     const Target& t = *target;
+    if (refuse_per_user_hku_read(ctx, t)) return 1;
     yuzu::win::RegKey opened;
     const bool exists =
         RegOpenKeyExW(hive_root(t.hive), to_wide(t.key).c_str(), 0, KEY_READ, opened.put()) == ERROR_SUCCESS;
@@ -425,6 +435,7 @@ int do_enumerate_keys(yuzu::CommandContext& ctx, yuzu::Params params) {
     const auto target = parse_target(ctx, params);
     if (!target) return 1;
     const Target& t = *target;
+    if (refuse_per_user_hku_read(ctx, t)) return 1;
     yuzu::win::RegKey opened;
     if (RegOpenKeyExW(hive_root(t.hive), to_wide(t.key).c_str(), 0, KEY_ENUMERATE_SUB_KEYS, opened.put()) !=
         ERROR_SUCCESS) {
@@ -444,6 +455,7 @@ int do_enumerate_values(yuzu::CommandContext& ctx, yuzu::Params params) {
     const auto target = parse_target(ctx, params);
     if (!target) return 1;
     const Target& t = *target;
+    if (refuse_per_user_hku_read(ctx, t)) return 1;
     yuzu::win::RegKey opened;
     if (RegOpenKeyExW(hive_root(t.hive), to_wide(t.key).c_str(), 0, KEY_QUERY_VALUE, opened.put()) != ERROR_SUCCESS) {
         ctx.write_output("error|key not found");

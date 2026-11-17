@@ -569,7 +569,8 @@ administrator or an approval; it needs registry 2.1.0 on the agent (see [Upgradi
 #### Recipe: Change One Value in a User's Hive
 
 `hive=HKCU` is the agent's own hive (LocalSystem's `HKU\.DEFAULT`), not the logged-on user's, so a person's setting
-is changed with `windows.registry.set_user_value`. It needs an administrator or an approval and registry 2.1.0 on the
+is read with `windows.registry.get_user_value` (the ungated reads refuse `hive=HKU` with a user SID and answer
+`per_user_hive_requires_get_user_value`) and changed with `windows.registry.set_user_value`. It needs an administrator or an approval and registry 2.1.0 on the
 agent, and it has no dry run: it writes at once. Its twin `windows.registry.delete_user_value` is Destructive, so it
 also takes explicit `agent_ids`.
 

@@ -418,6 +418,7 @@ agent_test_exe = executable(
     'unit/test_filesystem_macos_sig.cpp',     # #2273/1.14: pure codesign/plutil classifiers
     'unit/test_filesystem_acl_parsers.cpp',   # filesystem get_acl: pure posix_acl xattr / acl_to_text / Windows ACE-row decoders over real-capture fixtures (+ real-syscall macOS cases under __APPLE__)
     'unit/test_filesystem_get_acl_dispatcher.cpp',  # filesystem get_acl: real plugin via LocalDispatcher (row order, failure rows, Linux default-ACL-only aggregation)
+    'unit/test_filesystem_reserved_paths.cpp',  # WP06 F55: filesystem plugin refuses the agent's own data dir/log/key paths; session_log_token
     'unit/test_event_logs_macos.cpp',         # BR-08: pure `log show` SubprocessResult classifier
     'unit/test_event_logs_parsers.cpp',       # Wave 4 PR4.2: pure Windows event-XML / journal row parse+format helpers
     'unit/test_event_logs_journalctl.cpp',    # Wave 4 PR4.2: pure Linux journalctl-fallback outcome classifier (runs on every host)
@@ -2080,8 +2081,8 @@ if build_server
       'unit/server/test_offline_endpoint_store.cpp',
       'unit/server/test_agent_registry_presence.cpp',
       'unit/server/test_agent_registry_log_neutralisation.cpp',   # #5513: register_agent log lines neutralised
-      'unit/server/test_secret_codec.cpp',
       'unit/server/test_agent_registry_plugin_meta.cpp',   # WP06 F31: agent-reported plugin metadata bounded at ingest, never served as docs
+      'unit/server/test_secret_codec.cpp',
       'unit/server/test_software_inventory_store.cpp',
       'unit/server/test_software_inventory_reads_v3.cpp', # SAM-33 reads: hosts, change feed, facet health, summary ([pg][software_inventory][reads_v3], shard E)
       'unit/server/test_inventory_blob_v3.cpp',          # pure blob-v3 grammar + install-type table

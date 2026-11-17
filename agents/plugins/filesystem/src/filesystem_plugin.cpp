@@ -41,6 +41,7 @@
 
 #include "filesystem_acl_parsers.hpp"
 #include "filesystem_find_by_hash.hpp"
+#include "filesystem_reserved_paths.hpp" // WP06 F55: refuse the agent's own secrets
 #include <atomic_file_write.hpp> // yuzu::shared::write_file_atomic
 #include <network_fstype.hpp>
 
@@ -123,6 +124,27 @@ using yuzu::filesystem::find_by_hash::kMaxHashFileSize;
 
 // ── Path validation ─────────────────────────────────────────────────────
 
+// WP06 F55: the agent's own data dir, log file and TLS key/cert/CA paths, captured at init and
+// refused by every validate_path* below (best effort, see filesystem_reserved_paths.hpp).
+std::mutex g_reserved_mu;
+yuzu::filesystem::reserved::Set g_reserved;
+
+bool is_reserved_canonical(const std::string& canonical) {
+    std::lock_guard lk(g_reserved_mu);
+    return yuzu::filesystem::reserved::is_agent_reserved_path(g_reserved, canonical);
+}
+
+void add_reserved(yuzu::filesystem::reserved::Set& set, std::string_view raw, bool is_dir) {
+    if (raw.empty())
+        return;
+    std::error_code ec;
+    // weakly_canonical: the key/log may not exist yet; resolves the existing prefix's symlinks.
+    auto c = fs::weakly_canonical(fs::path{std::string{raw}}, ec);
+    if (ec)
+        c = fs::path{std::string{raw}}.lexically_normal(); // never drop a reserved entry
+    (is_dir ? set.dirs : set.files).push_back(c.string());
+}
+
 // Canonicalize a path and optionally enforce a base directory restriction.
 // Returns empty string on failure (path doesn't exist, escapes base_dir, etc.)
 std::string validate_path(std::string_view raw_path, std::string_view base_dir) {
@@ -162,6 +184,10 @@ std::string validate_path(std::string_view raw_path, std::string_view base_dir) 
             return {};
         }
     }
+
+    // WP06 F55: the agent's own secrets are never readable through this plugin.
+    if (is_reserved_canonical(canonical.string()))
+        return {};
 
     return canonical.string();
 }
@@ -205,6 +231,10 @@ std::string validate_path_or_parent(std::string_view raw_path, std::string_view 
             return {};
         }
     }
+
+    // WP06 F55: refuse creating/targeting a not-yet-existing name inside the agent's own dirs.
+    if (is_reserved_canonical((canonical_parent / fs::path(path_str).filename()).string()))
+        return {};
 
     // Return the original path (parent is validated, file just doesn't exist)
     return path_str;
@@ -734,9 +764,27 @@ public:
         return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
-    yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }
+    yuzu::Result<void> init(yuzu::PluginContext& ctx) override {
+        // WP06 F55: capture the agent's own paths once; an absent key simply reserves nothing.
+        yuzu::filesystem::reserved::Set set;
+        add_reserved(set, ctx.get_config("agent.data_dir"), /*is_dir=*/true);
+        add_reserved(set, ctx.get_config("agent.cert_dir"), /*is_dir=*/true);
+        add_reserved(set, ctx.get_config("agent.log_file"), /*is_dir=*/false);
+        add_reserved(set, ctx.get_config("agent.tls_ca_cert"), /*is_dir=*/false);
+        add_reserved(set, ctx.get_config("agent.tls_client_cert"), /*is_dir=*/false);
+        add_reserved(set, ctx.get_config("agent.tls_client_key"), /*is_dir=*/false);
+        std::lock_guard lk(g_reserved_mu);
+        g_reserved = std::move(set);
+        return {};
+    }
 
-    void shutdown(yuzu::PluginContext& /*ctx*/) noexcept override {}
+    void shutdown(yuzu::PluginContext& /*ctx*/) noexcept override {
+        try {
+            std::lock_guard lk(g_reserved_mu);
+            g_reserved = {};
+        } catch (...) { // NOLINT(bugprone-empty-catch)
+        }
+    }
 
     int execute(yuzu::CommandContext& ctx, std::string_view action, yuzu::Params params) override {
         if (action == "exists") {

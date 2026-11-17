@@ -11,6 +11,7 @@ __declspec(allocate(".CRT$XCB"))
 
 #include <yuzu/agent/detached_signature.hpp>
 #include <yuzu/agent/agent.hpp>
+#include "session_log_token.hpp" // WP06 F55: never log the raw session id
 #include <yuzu/agent/agent_csr.hpp>
 #include <yuzu/agent/cert_discovery.hpp>
 #include <yuzu/agent/cert_store.hpp>
@@ -862,6 +863,14 @@ public:
             std::to_string(cfg_.heartbeat_interval.count());
         plugin_ctx_.config["agent.plugin_dir"] = cfg_.plugin_dir.string();
         plugin_ctx_.config["agent.data_dir"] = cfg_.data_dir.string();
+        // WP06 F55: the agent's own credential/log paths, so the filesystem plugin can refuse
+        // them (the agent_logging / status / diagnostics actions are PluginSecret-gated; a
+        // FileRetrieval:Read caller must not reach the same bytes through filesystem.read).
+        plugin_ctx_.config["agent.log_file"] = cfg_.log_file.string();
+        plugin_ctx_.config["agent.cert_dir"] = cfg_.cert_dir.string();
+        plugin_ctx_.config["agent.tls_ca_cert"] = cfg_.tls_ca_cert.string();
+        plugin_ctx_.config["agent.tls_client_cert"] = cfg_.tls_client_cert.string();
+        plugin_ctx_.config["agent.tls_client_key"] = cfg_.tls_client_key.string();
         plugin_ctx_.config["agent.container_runtime_endpoint"] = cfg_.container_runtime_endpoint;
         plugin_ctx_.config["agent.log_level"] = cfg_.log_level;
         plugin_ctx_.config["agent.debug_mode"] = cfg_.debug_mode ? "true" : "false";
@@ -2307,7 +2316,9 @@ public:
                     }
                     plugin_ctx_.config["agent.grpc_channel_state"] = state_str;
                 }
-                spdlog::info("Registered with server (session={}, enrollment={})", session_id_,
+                // WP06 F55: the session id is a credential; log a non-reversible fingerprint.
+                spdlog::info("Registered with server (session={}, enrollment={})",
+                             yuzu::shared::session_log_token(session_id_),
                              enrollment_status.empty() ? "enrolled" : enrollment_status);
 
                 // Mark Guardian as network-connected. PR 4 will use this hook to

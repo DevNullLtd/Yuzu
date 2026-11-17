@@ -821,3 +821,41 @@ TEST_CASE("registry kernel_name_well_formed: a high surrogate pairs only with a 
 // ERROR_INVALID_DATA: what an exact enumeration answers for a raw name that is not well-formed UTF-16
 // (Win32Registry::enumerated_name). registry_win.cpp pins the number on Windows only; this pins it on every host.
 static_assert(kErrorInvalidData == 13, "ERROR_INVALID_DATA");
+
+// ── WP06 F62: per-user hives under HKU are refused by the ungated reads ──────────────────────
+
+TEST_CASE("hku_key_is_machine_scope: only .DEFAULT and the service SIDs are machine scope",
+          "[agent][registry][hku]") {
+    CHECK(hku_key_is_machine_scope(".DEFAULT\\Software\\Microsoft"));
+    CHECK(hku_key_is_machine_scope(".default"));
+    CHECK(hku_key_is_machine_scope(".DEFAULT_Classes\\x"));
+    CHECK(hku_key_is_machine_scope("S-1-5-18\\Environment"));
+    CHECK(hku_key_is_machine_scope("S-1-5-19"));
+    CHECK(hku_key_is_machine_scope("s-1-5-20\\a"));
+    CHECK(hku_key_is_machine_scope("S-1-5-18_Classes\\a"));
+    CHECK(hku_key_is_machine_scope("\\.DEFAULT\\a")); // leading backslash cannot hide the component
+    CHECK(hku_key_is_machine_scope(""));              // the HKU root itself
+}
+
+TEST_CASE("hku_key_is_machine_scope: user, Entra and unknown first components are refused (allowlist)",
+          "[agent][registry][hku]") {
+    CHECK_FALSE(hku_key_is_machine_scope("S-1-5-21-111-222-333-1001\\Software"));
+    CHECK_FALSE(hku_key_is_machine_scope("s-1-5-21-111-222-333-1001_Classes\\Software"));
+    CHECK_FALSE(hku_key_is_machine_scope("S-1-12-1-1-2-3-4\\Software")); // Entra / AAD
+    CHECK_FALSE(hku_key_is_machine_scope("\\S-1-5-21-1-2-3-500\\Software"));
+    CHECK_FALSE(hku_key_is_machine_scope("S-1-5-18x\\a"));  // SID lookalike
+    CHECK_FALSE(hku_key_is_machine_scope("S-1-5-180\\a"));
+    CHECK_FALSE(hku_key_is_machine_scope(".DEFAULTX"));
+    CHECK_FALSE(hku_key_is_machine_scope("alice\\Software"));
+}
+
+TEST_CASE("read_refuses_per_user_hive: only HKU is ever refused, HKLM/HKCU/HKCR are unchanged",
+          "[agent][registry][hku]") {
+    constexpr std::string_view user_key = "S-1-5-21-1-2-3-1001\\Software";
+    CHECK(read_refuses_per_user_hive(Hive::hku, user_key));
+    CHECK_FALSE(read_refuses_per_user_hive(Hive::hku, ".DEFAULT\\Software"));
+    CHECK_FALSE(read_refuses_per_user_hive(Hive::hklm, user_key));
+    CHECK_FALSE(read_refuses_per_user_hive(Hive::hkcu, user_key));
+    CHECK_FALSE(read_refuses_per_user_hive(Hive::hkcr, user_key));
+    CHECK(kTokPerUserHiveRequiresGetUserValue == "per_user_hive_requires_get_user_value");
+}
