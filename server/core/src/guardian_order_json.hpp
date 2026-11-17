@@ -4,7 +4,8 @@
 /// The one JSON rendering of a `GuardianAgentOrder` (the `ordering` object of the per-device
 /// all-guards read). REST (`GET /api/v1/guaranteed-state/agents/{agent_id}/rules`) and MCP
 /// (`get_guardian_device_guards`) both call this, so the two surfaces cannot drift on a key, a
-/// null or the `currently_unordered` derivation. Pure: no store, no I/O.
+/// null or the `currently_unordered` value, which is the one the store computed in SQL
+/// (`GuardianAgentOrder::currently_unordered`). Pure: no store, no I/O.
 
 #include <cstdint>
 #include <format>
@@ -38,7 +39,7 @@ namespace detail {
         "\"pair_recoveries\":{},\"pair_duplicates\":{},\"retired_events\":{}}}",
         detail::order_json_int(o.epoch), detail::order_json_int(o.emit_seq_hwm),
         detail::order_json_int(o.epoch_recv_ns), detail::order_json_int(o.retired_epoch),
-        detail::order_json_int(o.unpaired_recv_ns), o.currently_unordered() ? "true" : "false",
+        detail::order_json_int(o.unpaired_recv_ns), o.currently_unordered ? "true" : "false",
         o.unpaired_events, o.unpaired_held, o.pair_regressions, o.pair_stragglers,
         o.pair_recoveries, o.pair_duplicates, o.retired_events);
 }
