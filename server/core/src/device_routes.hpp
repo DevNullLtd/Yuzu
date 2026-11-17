@@ -45,6 +45,7 @@
 
 #include "device_api.hpp"      // DeviceApi, DeviceListRow, DeviceDetail, DeviceReadError (ADR-0031 WS-A4)
 #include "dex_view_types.hpp"  // DexDispatchFn/DexResponsesFn/DexAuditFn/DexAgentResponse (store-free)
+#include "live_model.hpp"      // Live* row models + the live kind table/parsers (pure; #2146)
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -207,15 +208,6 @@ std::string render_device_guardian_lens(const std::string& agent_id,
 /// Live = queried on the agent NOW (no 30s heartbeat wait).
 std::string render_device_live_shell(const std::string& agent_id);
 
-/// One live process row: PID + name + the SHA-256 of its on-disk image + the
-/// resolved executable path (hash/path empty when unresolved).
-struct LiveProcess {
-    int pid = 0;
-    std::string name;
-    std::string sha256; ///< lowercase hex; "" if unresolved / too large / gone
-    std::string path;   ///< resolved exe path; "" if unresolved
-};
-
 /// PURE: render the live `processes/list_hashed` result — a PID/name/SHA-256
 /// table. The full list renders into the DOM but only the first 10 rows show;
 /// a search box (gpSearchTopN) filters by name/PID/hash/path and expands matches.
@@ -226,46 +218,9 @@ std::string render_device_live_value(const std::string& label, const std::string
 
 // ── Live snapshot v2: Echo-styled collapsible cards (feat/device-live-snapshot) ──
 // Each card is fed by ONE live plugin action (process_tree joins a second), parsed
-// in device_routes.cpp and rendered by the typed PURE renderers below. All agent
-// fields are HTML-escaped at render. Mockup: docs/mockups/device-live-snapshot.html.
-
-/// One node of the live process tree (processes/list_tree → proc|pid|ppid|name|sha256|path).
-struct LiveProcNode {
-    std::uint32_t pid = 0;
-    std::uint32_t ppid = 0;
-    std::string name;
-    std::string sha256; ///< lowercase hex; "" if unresolved
-    std::string path;   ///< resolved exe path; "" if unresolved
-};
-
-/// One live TCP entry joined to a tree node by pid (network_diag/connections, Windows
-/// emits the owning pid). `listening` rows have no remote endpoint.
-struct LiveConn {
-    std::uint32_t pid = 0;
-    std::string remote_addr; ///< "" for a listener
-    int remote_port = 0;
-    int local_port = 0;
-    bool listening = false;
-};
-
-struct LiveArpEntry { std::string iface, ip, mac, type; };
-struct LiveDnsEntry { std::string name, record_type; };
-struct LiveListen { std::string proto, ip; int port = 0; long long pid = 0; };
-struct LiveConnRow { std::string proto, local, remote, state; };
-struct LiveService { std::string name, display, status, startup; };
-struct LiveUserRow { std::string user, host, logon_type, session; };
-struct LiveNetAddr { std::string adapter, ip; int prefix = 0; std::string gateway; };
-/// One volume's capacity reading (disk_space/free → disk|<path>|<total>|<free>|<percent_used>).
-struct LiveDiskVolume { std::string path; long long total = 0, free = 0; int percent_used = 0; };
-/// One Echo capture source's local state (echo/status → config|<src>_enabled / _rows).
-/// `dollar`/`category` are server-side presentation metadata (the agent schema registry
-/// is not linked into the server, so the source list is hand-held in device_routes.cpp;
-/// only sources the agent actually reports are rendered).
-struct LiveCaptureSource {
-    std::string name, dollar, category;
-    bool enabled = false;
-    long long live_rows = -1; ///< -1 = unknown (no count reported)
-};
+// by live_model.hpp (the typed Live* rows) and rendered by the typed PURE renderers
+// below. All agent fields are HTML-escaped at render. Mockup:
+// docs/mockups/device-live-snapshot.html.
 
 /// PURE renderers — one `.ls-tbl`/tree per card body, dark-theme, CSP-safe.
 /// render_device_live_tree reconstructs a parent→child tree from the flat node set
@@ -287,9 +242,9 @@ std::string render_device_live_capture_sources(const std::vector<LiveCaptureSour
 /// hardware-detail live kinds (disks/memory/processors/drivers/battery/thermal/smart/
 /// volumes/adapters/wifi) whose wire format is a flat `<row_prefix>|field1|field2|...`
 /// table with no bespoke typed-row struct. `columns` is the ordered raw column-name
-/// list from live_kinds.hpp's LiveKind::columns (drives both the table header labels
+/// list from live_model.hpp's LiveKind::columns (drives both the table header labels
 /// and each row's expected width); `rows` are the already-split, already-padded field
-/// vectors (device_routes.cpp render_live_result, one per matched line, prefix token
+/// vectors (live::parse_generic_rows, one per matched line, prefix token
 /// dropped). `raw_rows` are lines that did NOT match the row_prefix, preserved
 /// verbatim (full original line text) instead of being silently dropped -- each
 /// renders as its own full-width diagnostic row at the end of the table.

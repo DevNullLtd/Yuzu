@@ -21,6 +21,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cstdint>
 #include <expected>
 #include <memory>
 #include <optional>
@@ -442,7 +443,7 @@ TEST_CASE("device live run: expanded kinds map to the right plugin/action + audi
         {"capture_sources", "echo", "status", "device.live.capture_sources"},
         {"disk", "disk_space", "free", "device.live.disk"},
         // Round-3 item 11: ten physical-hardware "generic pipe-row" kinds
-        // (live_kinds.hpp LiveKind::columns/.row_prefix + device_ui.cpp
+        // (live_model.hpp LiveKind::columns/.row_prefix + device_ui.cpp
         // render_device_live_generic). Same plugin/action/verb mapping as the
         // canonical kind table — see test_device_live_generic_kinds below for
         // render-path coverage of hw_disks + thermal.
@@ -713,13 +714,13 @@ TEST_CASE("device live capture_sources: registry row renders with the System cat
 }
 
 // Round-3 item 11: the ten new physical-hardware live kinds share ONE generic
-// pipe-row path (live_kinds.hpp LiveKind::columns/.row_prefix -> device_routes.cpp
+// pipe-row path (live_model.hpp LiveKind::columns/.row_prefix -> device_routes.cpp
 // render_live_result's `!lk.columns.empty()` branch -> device_ui.cpp
 // render_device_live_generic) instead of a bespoke render_device_live_KIND
 // function each. hw_disks gets the straightforward well-formed-row case;
 // thermal is the one kind whose row width VARIES (the "no zones" shape omits
 // celsius), so it gets both shapes exercised explicitly, matching the shared
-// renderer's pad-short-rows contract (device_routes.cpp: `f.resize(lk.columns.size())`).
+// renderer's pad-short-rows contract (live_model.cpp parse_generic_rows: `f.resize(lk.columns.size())`).
 TEST_CASE("device live: physical-hardware generic-table kinds dispatch + render",
           "[device][routes]") {
     SECTION("hw_disks dispatches hardware/disks, audited, polls hardware-<id>") {
@@ -1048,5 +1049,125 @@ TEST_CASE("device routes: /devices + /device redirect to Hardware CI",
         REQUIRE(r);
         CHECK(r->status == 302);
         CHECK(r->get_header_value("Location") == "/hardware/ci");
+    }
+}
+
+// Behaviour-neutrality pin for the live-result render path (#2146, PR A). Each case
+// feeds one fixed agent output through the REAL /fragments/device/live/result route
+// and pins a 64-bit FNV-1a hash of the full response body (rendered card + OOB
+// count/KPI spans). The hashes were recorded against the code BEFORE the kind table
+// and parsers were hoisted into live_model.{hpp,cpp}; they must not move when a
+// parser is touched without intent. The inputs include malformed, oversized-pid,
+// HTML-special and short-row lines so the defensive branches are covered too.
+namespace {
+
+std::uint64_t fnv1a64(const std::string& s) {
+    std::uint64_t h = 1469598103934665603ULL;
+    for (const unsigned char c : s) {
+        h ^= c;
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+struct LiveGoldenCase {
+    const char* name;
+    const char* kind;
+    const char* plugin;  // the poll command_id prefix the route requires
+    const char* output;
+    const char* output2; // process_tree's joined connections, else ""
+    const char* os;      // device record OS ("" = lookup unavailable)
+    std::uint64_t hash;
+};
+
+} // namespace
+
+TEST_CASE("device live result: every kind renders byte-identically (golden hashes)",
+          "[device][routes][live][golden]") {
+    // clang-format off
+    static const LiveGoldenCase kCases[] = {
+        {"uptime", "uptime", "os_info",
+         "uptime_display|3 days, 2 hours <b>\nuptime_seconds|266400\nnoise\n", "", "", 17714377614741603122ULL},
+        {"uptime_empty", "uptime", "os_info", "", "", "", 13908522961337362132ULL},
+        {"processes", "processes", "processes",
+         "proc|4|System||\nproc|800|svchost.exe|abc123|C:\\Windows\\svchost.exe\r\n"
+         "proc|xx|bad<script>\nproc|5\nproc|7|a|b|c|d|e\nnot-a-proc\n", "", "", 9272368529522833123ULL},
+        {"process_tree", "process_tree", "processes",
+         "proc|4|0|System||\nproc|800|4|svchost.exe|abc123|C:\\svchost.exe\n"
+         "proc|4294967296|4|huge|x|y\nproc|900|notnum|orph<an>|\nproc|1|2\nproc|zz|0|bad|\n",
+         "conn|tcp|10.0.0.5|52000|140.82.112.4|443|800\nconn|tcp|1|2|3|4|4294967296\n"
+         "conn|tcp|1|2|3\n", "", 5608399316293021798ULL},
+        {"process_tree_no_conns", "process_tree", "processes",
+         "proc|4|0|System||\nproc|800|4|svchost.exe|abc|\n", "", "", 17484148619117437842ULL},
+        {"services_windows", "services", "services",
+         "svc|Spooler|Print Spooler|Running|Automatic\nsvc|wuauserv|123|Stopped|Manual\n"
+         "svc|short\nsvc|a|b|c|d|e\nother|x\n", "", "windows", 11273355650890507249ULL},
+        {"services_macos5", "services", "services",
+         "svc|com.apple.a|1234|running|auto\nsvc|com.apple.b|-|stopped|manual\n", "", "darwin", 35018312916660046ULL},
+        {"services_unknown_os", "services", "services",
+         "svc|com.apple.mdworker|1234|running\nsvc|sshd|running|OpenSSH <daemon>\n"
+         "svc|x|-|stopped\nsvc|Win|Display Name|Running|Auto\n", "", "", 4002544976314623930ULL},
+        {"users", "users", "users",
+         "user|alice|host1|interactive|tty1\nuser|bob\nuser\nuser|c<d>|h|t|s|extra\n", "", "", 16842101205548047952ULL},
+        {"netconfig", "netconfig", "network_config",
+         "ip|eth0|10.0.0.5|24|10.0.0.1\nip|eth1|10.0.1.5|abc|-\nip|lo|127.0.0.1|8|0.0.0.0\n"
+         "ip|short\n", "", "", 2495346885234050625ULL},
+        {"arp", "arp", "network_config",
+         "arp|eth0|10.0.0.1|aa:bb:cc:dd:ee:ff|dynamic\narp|eth0|10.0.0.2|-|static\narp|a|b\n",
+         "", "", 10404120183992007253ULL},
+        {"dns_cache", "dns_cache", "network_config",
+         "cache_entry|example.com|A|1.2.3.4\ncache_entry|not_available|x\ncache_entry|only\n",
+         "", "", 14179553637856115045ULL},
+        {"listening", "listening", "network_diag",
+         "listen|tcp|0.0.0.0|22|100\nlisten|tcp|::|443\nlisten|tcp|1|nan|zz\nlisten|tcp\n", "", "", 9997056980947231045ULL},
+        {"connections", "connections", "network_diag",
+         "conn|tcp|10.0.0.5|52000|140.82.112.4|443|800\nconn|tcp|1|2|3\nconn|tcp|a|b|c|d\n",
+         "", "", 13132329531586418674ULL},
+        {"capture_sources", "capture_sources", "echo",
+         "config|process_enabled|true\nconfig|process_rows|42\nconfig|tcp_enabled|false\n"
+         "config|dns_enabled|true\nconfig|dns_rows|notnum\nconfig|bogus_enabled|true\n"
+         "config|registry_enabled|true\nconfig|registry_rows|7\n", "", "", 7383387908523866823ULL},
+        {"disk", "disk", "disk_space",
+         "disk|C:\\|1000|400|60\ndisk|D:\\|0|0|150\ndisk|E:\\|500|100|-5\ndisk|F:\\|x|y|z\n"
+         "disk|short\n", "", "", 11830862051687948488ULL},
+        {"disk_no_measured", "disk", "disk_space", "disk|C:\\|0|0|50\n", "", "", 8722607696415057087ULL},
+        {"hw_disks", "hw_disks", "hardware",
+         "disk|0|Samsung 970 EVO|931|SSD|NVMe\ndisk|1|short\nwarning|something <odd>\n", "", "", 15735852678560545135ULL},
+        {"hw_memory", "hw_memory", "hardware", "dimm|0|8192|DDR4|3200\n", "", "", 2632541226714463539ULL},
+        {"hw_processors", "hw_processors", "hardware", "cpu|0|Intel i7|8|16|3600\n", "", "", 17790793213014768953ULL},
+        {"hw_drivers", "hw_drivers", "hardware",
+         "driver|0|nvlddmkm|31.0|2024-01-01|NVIDIA|DISPLAY\n", "", "", 8425620710457206543ULL},
+        {"battery", "battery", "power_health",
+         "battery|true|charging|88|45|312|91\n", "", "", 9551677740290655581ULL},
+        {"thermal", "thermal", "power_health",
+         "thermal|ok|zone0|45.5\nthermal|no_zones\n", "", "", 12547511890097125445ULL},
+        {"smart", "smart", "disk_actions",
+         "smart|/dev/sda|Model X|sata|ssd|PASSED|3|97|ok\n", "", "", 8890680075107580598ULL},
+        {"volumes", "volumes", "disk_actions",
+         "volume|C:|C:\\|\\\\?\\Vol|NTFS|1000000|\n", "", "", 15657576891079029550ULL},
+        {"adapters", "adapters", "network_config",
+         "adapter|eth0|aa:bb:cc:dd:ee:ff|1000|up\n", "", "", 4018180594806629998ULL},
+        {"wifi", "wifi", "wifi", "connected|Home<Net>|80|WPA2|aa:bb|6\n", "", "", 11256949046592304492ULL},
+        {"generic_empty", "hw_memory", "hardware", "", "", "", 8433749018518019790ULL},
+    };
+    // clang-format on
+    for (const auto& c : kCases) {
+        DYNAMIC_SECTION(c.name) {
+            LiveHarness h;
+            h.device_os = c.os;
+            const std::string cmd = std::string(c.plugin) + "-test";
+            h.rows_by_cmd[cmd] = {{"a-1", 1, c.output, ""}};
+            std::string url = "/fragments/device/live/result?command_id=" + cmd +
+                              "&agent_id=a-1&kind=" + c.kind + "&n=1";
+            if (std::string(c.kind) == "process_tree") {
+                h.rows_by_cmd["network_diag-test"] = {{"a-1", 1, c.output2, ""}};
+                url += "&command_id2=network_diag-test";
+            }
+            auto r = h.sink.Get(url);
+            REQUIRE(r);
+            CHECK(r->status == 200);
+            CAPTURE(r->body);
+            CHECK(fnv1a64(r->body) == c.hash);
+        }
     }
 }
