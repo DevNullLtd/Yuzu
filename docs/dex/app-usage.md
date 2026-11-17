@@ -158,10 +158,12 @@ not on the set of responses a caller can ask for.
 
 The route needs both `GuaranteedState:Read` and `Forensics:Read`, because the body
 names the applications that crash. While RBAC is off, `Forensics:Read` is
-administrator-only, so only an administrator can call it. Under RBAC only the
-Administrator role holds both permissions, so delegating the route means a custom
-role that carries both. ForensicsAnalyst holds `Forensics:Read` but not
-`GuaranteedState:Read`, so it is refused. A service-scoped token is refused.
+administrator-only, so only an administrator can call it. Under RBAC the
+permissions are checked across all of a principal's roles, so the route is open to
+the Administrator role and to a principal assigned both the built-in Viewer role
+(`GuaranteedState:Read`) and the ForensicsAnalyst role (`Forensics:Read`).
+ForensicsAnalyst alone is refused because it lacks `GuaranteedState:Read`. A
+service-scoped token is refused.
 
 Every request that passes parameter validation writes a `dex.apps.usage.view`
 audit row **before** the read, with an empty target and the request shape (window,
