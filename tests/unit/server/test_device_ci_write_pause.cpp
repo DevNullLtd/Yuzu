@@ -366,6 +366,62 @@ TEST_CASE("ingest seam refuses a paused fleet BEFORE parsing and reports the def
     }
 }
 
+// Review of #8108, item 4. A throw out of the ingest seam is caught by ReportInventory, which then
+// acks without whatever the seam had not yet appended, so every need_full nack is appended BEFORE
+// any telemetry. The counter is injected here and made to throw; each refusal path must still
+// carry its nack. Kills: moving `ack.add_need_full` back after the counter (the agent would
+// advance as if the report had been stored).
+TEST_CASE("a throw in the outcome telemetry cannot lose the need_full nack",
+          "[pg][device_ci][collation_gate][ingest]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, pause_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    std::atomic<CollationGate> gate{CollationGate::Mismatch};
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_write_gate(&gate);
+
+    std::vector<std::string> emitted;
+    const yuzu::server::IngestOutcomeEmitFn throwing = [&](const char* outcome) {
+        emitted.emplace_back(outcome);
+        throw std::runtime_error("telemetry failed");
+    };
+    const auto report = [](const std::string& hash, std::optional<std::string> data) {
+        agentpb::InventoryReport r;
+        (*r.mutable_content_hashes())["device_ci"] = hash;
+        if (data)
+            (*r.mutable_plugin_data())["device_ci"] = *data;
+        return r;
+    };
+    const auto run = [&](const agentpb::InventoryReport& r, agentpb::InventoryAck& ack) {
+        CHECK_THROWS_AS(
+            yuzu::server::ingest_device_ci_report_with_emit(store, "a", r, ack, nullptr, throwing),
+            std::runtime_error);
+    };
+
+    SECTION("the write-pause refusal") {
+        agentpb::InventoryAck ack;
+        run(report("h", blob()), ack);
+        REQUIRE(ack.need_full_size() == 1);
+        CHECK(ack.need_full(0) == "device_ci");
+        CHECK(emitted == std::vector<std::string>{"deferred"});
+    }
+    SECTION("the over-cap blob refusal") {
+        gate.store(CollationGate::Trusted);
+        agentpb::InventoryAck ack;
+        run(report("h", std::string(yuzu::server::kDeviceCiMaxBlobBytes + 1, 'x')), ack);
+        REQUIRE(ack.need_full_size() == 1);
+        CHECK(emitted == std::vector<std::string>{"dropped"});
+    }
+    SECTION("the store's own need_full answer (a cold hash-only report)") {
+        gate.store(CollationGate::Trusted);
+        agentpb::InventoryAck ack;
+        run(report("h", std::nullopt), ack);
+        REQUIRE(ack.need_full_size() == 1);
+        CHECK(emitted == std::vector<std::string>{"need_full"});
+    }
+}
+
 // qe-2 / ARCH-4. The branch of `ingest_device_ci_report` where `apply_device_ci` returns kDeferred
 // AFTER the seam's own check (a pause that races in between them) cannot be reached from outside:
 // the gate would have to flip between two adjacent statements. The mapping the seam applies to that
