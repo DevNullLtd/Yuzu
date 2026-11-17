@@ -60,7 +60,9 @@ throttle, and some value containers. The test-side resources are listed last.
   DELETE), `authoring_deps.referrers_fn` (v1 REST DELETE), `wf_deps.referrers_fn` (pack uninstall)
   and `mcp_server_->set_definition_referrers_fn(...)` (MCP delete).
 - **Owner type:** `DefinitionReferrersFn` is a small class wrapping a type-erased
-  `std::function<Result(const std::string&, const Exclusions&)>` (`fn_`); it owns no raw resource.
+  `std::function<Result(const std::string&, const Exclusions&)>` (`fn_`) and, since #7921, an
+  optional second `std::function` (`batch_`, the batch form `lookup_many` calls; see
+  `7921-pack-uninstall-bounded-precheck.md`); it owns no raw resource.
   Its converting constructors take a callable of either arity and leave `fn_` EMPTY for a null
   function pointer or an empty `std::function` (so `explicit operator bool` reports "unwired").
   The factory creates a `std::shared_ptr<RefusalLogThrottle>` (`std::make_shared<
@@ -108,9 +110,12 @@ throttle, and some value containers. The test-side resources are listed last.
   (`std::unordered_set<std::string>`) filled from `ProductPackStore::get`, a
   `DefinitionReferrerExclusions`, a `std::unordered_map<std::string, std::vector<HeldByPolicy>>`
   (`policy_held`, folded policy id and name for the 409 text), and `std::vector<DefinitionReferrer>
-  blocking`. The reads are `ProductPackStore::get` (one lease inside the store), then one
-  `PolicyStore::query_policies` per own fragment (`fragment_filter`, `limit` 4, one lease each), then
-  one `referrers_fn` call per contained definition (three leases inside it). They run SEQUENTIALLY,
+  blocking`, plus two transient `std::vector<std::string>` id lists (`own_fragment_ids`,
+  `definition_ids`). The reads are `ProductPackStore::get` (one lease inside the store), then (only when
+  the pack has own fragments) ONE `PolicyStore::policies_using_fragments` for all of them (one
+  lease), then ONE `referrers_fn.lookup_many` for all the contained definitions (at most three
+  leases inside it, one per source, fewer once the list is full; #7921, replacing one
+  `query_policies` per own fragment and one `referrers_fn` call per definition). They run SEQUENTIALLY,
   each taking and releasing its own lease; no lease is held across the next read and NONE is held
   across `uninstall()`, which takes its own. The uninstall callback (`make_item_delete_fn`, also the
   install compensation callback) adds, only after a bare `false` from `PolicyStore::delete_fragment`
