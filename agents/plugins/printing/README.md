@@ -258,9 +258,10 @@ job|ipp://localhost:631/printers/yuzu_test|1|-|-|pending|2026-09-14T17:27:40Z|10
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/printing/src/printing_ipp.hpp` · `agents/plugins/printing/src/printing_parsers.hpp` · `agents/plugins/printing/src/printing_plugin.cpp`
+- Plugin: `agents/plugins/printing/src/printing_identity.hpp` · `agents/plugins/printing/src/printing_ipp.hpp` · `agents/plugins/printing/src/printing_parsers.hpp` · `agents/plugins/printing/src/printing_plugin.cpp`
 - Definitions: `content/definitions/printing.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_printing.hpp`
-- Tests: `tests/unit/server/test_printing_clear_queue_gate.cpp` · `tests/unit/test_printing_local_dispatcher.cpp` · `tests/unit/test_printing_parsers.cpp`
+- Tests: `tests/unit/server/test_printing_clear_queue_gate.cpp` · `tests/unit/test_printing_identity.cpp` · `tests/unit/test_printing_local_dispatcher.cpp` · `tests/unit/test_printing_parsers.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
+- Changelog: `changelog.d/wp12b-printing-getpwuid-r.fixed.md`
 <!-- END GENERATED -->
