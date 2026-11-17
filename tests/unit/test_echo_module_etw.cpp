@@ -9,6 +9,7 @@
 
 #include "echo_aggregator.hpp"
 #include "echo_db.hpp"
+#include "echo_test_db.hpp"
 #include "echo_hour_dedup.hpp"
 #include "echo_local_image_path.hpp"
 #include "echo_module_etw.hpp"
@@ -341,7 +342,7 @@ TEST_CASE("risk-filter: a boot seed does not consume the slot of a later load",
 
     // And through the real hourly rollup: one loaded row -> load_count 1.
     yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_echo_module_seed_load_"}};
-    auto opened = EchoDatabase::open(tmp.path);
+    auto opened = yuzu::test::open_echo_db(tmp.path);
     REQUIRE(opened.has_value());
     EchoDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
@@ -739,8 +740,8 @@ TEST_CASE("Windows module drain: a WOF-compressed image is not refused and still
 
 TEST_CASE("fold_module_events folds every identity column into module_hourly",
           "[echo][module][store]") {
-    yuzu::test::TempDbFile tmp{std::string_view{"echo-module-insert-"}};
-    auto opened = EchoDatabase::open(tmp.path);
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_echo_module_insert_"}};
+    auto opened = yuzu::test::open_echo_db(tmp.path);
     REQUIRE(opened.has_value());
     EchoDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());

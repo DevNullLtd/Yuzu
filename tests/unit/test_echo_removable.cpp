@@ -17,6 +17,7 @@
 
 #include "echo_cursor.hpp"
 #include "echo_db.hpp"
+#include "echo_test_db.hpp"
 #include "echo_removable_parsers.hpp"
 #include "test_helpers.hpp"
 
@@ -69,7 +70,7 @@ struct TestEchoDb {
 
 TestEchoDb make_test_db() {
     auto tmp = yuzu::test::unique_temp_path("yuzu_test_echo_removable_");
-    auto opened = EchoDatabase::open(tmp);
+    auto opened = yuzu::test::open_echo_db(tmp);
     REQUIRE(opened.has_value());
     return TestEchoDb{std::move(*opened), tmp};
 }
