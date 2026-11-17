@@ -41,8 +41,9 @@
  *   Containment calls a non-root agent makes through the root-owned yuzu-fw-helper
  *   (nft load, iptables, pf load) are rung 3: the helper is a `#!/bin/sh` script, and a
  *   site's rung is set by the deepest interpreter intentionally invoked (ADR-3002 Decision 5),
- *   so those sites are registered in docs/agent-spawn-sink-manifest.md. A root agent runs the
- *   tool directly, at rung 2.
+ *   so those sites are registered in docs/agent-spawn-sink-manifest.md. The descriptor carries the
+ *   worst rung a leg can reach (plugin.h); an agent that runs as root runs the tool directly, which
+ *   is rung 2.
  */
 
 #include <yuzu/plugin.hpp>

@@ -1526,7 +1526,9 @@ struct FakeDevice {
 
 // An apply that has claimed the record and is blocked inside its dispatch, on another thread: the
 // MCP quarantine_device re-dispatch, or the reconciler's. `release()` lets the dispatch finish
-// (it queues the apply and the claim is released), and joins. The thread asserts nothing: Catch2
+// (it queues the apply; the dispatch reached an agent, so the claim is KEPT, #8045 R1), and joins.
+// `drop_claim()` models the consumer reading the apply's reply once the device has run it, which
+// is what the reconciler does with its own applies. The thread asserts nothing: Catch2
 // assertions are not thread-safe, so the outcome is read after the join. The constructor always
 // returns: the worker signals `in_dispatch` from inside the dispatch, or, when the chokepoint
 // refused before dispatching (a claim refused, a store error), right after it returns. The case
@@ -1539,6 +1541,7 @@ struct BlockedApply {
     bool released{false};
     // Written by the worker before it sets `in_dispatch`, read by the test thread after the wait.
     bool dispatch_entered{false};
+    std::int64_t record_id{0}; // the record the apply was built from, set by the worker
     std::expected<ContainmentReapplyResult, ContainmentReapplyError> result{
         std::unexpected(ContainmentReapplyError{ContainmentReapplyErrorKind::store_error, "unset"})};
 
@@ -1558,6 +1561,7 @@ struct BlockedApply {
                     return {out.command_id, out.sent};
                 },
                 stored);
+            record_id = stored.id;
             if (!dispatch_entered)
                 in_dispatch.set_value(); // refused before the dispatch: let the constructor go
         });
@@ -1569,6 +1573,12 @@ struct BlockedApply {
         released = true;
         go.set_value();
         worker.join();
+    }
+    // The apply has run and its reply is consumed: the claim it kept is dropped.
+    void drop_claim() {
+        if (result.has_value() && result->held_claim_gen != 0)
+            REQUIRE(rig.quarantine.release_apply_claim(kAgent, record_id, result->held_claim_gen)
+                        .has_value());
     }
     ~BlockedApply() { release(); }
 };
@@ -1602,8 +1612,9 @@ TEST_CASE("quarantine release (p): a late apply -- the device answers inactive t
     detail::release_confirm_pause_hook() = [&] {
         ++pauses;
         device.deliver();          // the release: the device lifts and answers `inactive`
-        apply.release();           // the late apply is dispatched; its claim is released
-        device.deliver();          // ...and reaches the device
+        apply.release();           // the late apply is dispatched; it keeps its claim
+        device.deliver();          // ...and reaches the device, which answers it
+        apply.drop_claim();        // the reconciler reads that reply: the claim goes
     };
     rig.clear_audits();
     auto del = rig.del();
@@ -1636,7 +1647,8 @@ TEST_CASE("quarantine release (p): a late apply -- the device answers inactive t
 }
 
 TEST_CASE("quarantine release (q): an apply already queued when the DELETE reads its token is delivered "
-          "BEFORE the release, so the device's `inactive` is true and the release ends the record: 200",
+          "BEFORE the release, but it has not been read back, so it keeps its claim and the DELETE answers 202; "
+          "once its reply is consumed the reconciler settles the record (#8045 R1)",
           "[rest][quarantine][release][fence][integration][pg]") {
     YUZU_REQUIRE_PG_DB_TPL(db, create_gate_tpl);
     Rig rig(db.dsn());
@@ -1651,7 +1663,10 @@ TEST_CASE("quarantine release (q): an apply already queued when the DELETE reads
         REQUIRE(res);
         REQUIRE(res->status == 201);
     }
-    // The apply has gone through the chokepoint and returned: it sits undelivered in the queue.
+    // The apply has gone through the chokepoint and returned: it sits undelivered in the queue and
+    // its claim is held, because a command that was only sent has not necessarily run.
+    std::int64_t held_gen = 0;
+    std::int64_t record_id = 0;
     {
         QuarantineRecord stored{};
         auto applied = redispatch_stored_containment(
@@ -1664,22 +1679,36 @@ TEST_CASE("quarantine release (q): an apply already queued when the DELETE reads
             stored);
         REQUIRE(applied.has_value());
         REQUIRE(applied->agents_reached == 1);
+        CHECK(applied->held_claim_gen != 0);
+        held_gen = applied->held_claim_gen;
+        record_id = stored.id;
     }
     CHECK_FALSE(device.contained);
     device.check_invariant();
 
-    // The DELETE queues its release BEHIND the apply; the queue is delivered in order from the pause.
+    // The DELETE queues its release BEHIND the apply; the queue is delivered in order from the
+    // pause. No token can be read while the apply's claim is held, so the end is refused.
     detail::release_confirm_pause_hook() = [&] { device.deliver(); };
     auto del = rig.del();
     REQUIRE(del);
-    CHECK(del->status == 200);
-    CHECK(nlohmann::json::parse(del->body)["data"]["released"] == true);
+    CHECK(del->status == 202);
     CHECK(device.delivered ==
           std::vector<std::string>{"firewall.quarantine", "firewall.release"}); // apply first
     CHECK_FALSE(device.contained);
-    CHECK(rig.quarantined_count() == 0);
-    CHECK(device.owed_count() == 0);
+    CHECK(rig.quarantined_count() == 1); // the record still governs the device
     device.check_invariant();
+
+    // The apply's reply is read back, the claim goes, and the reconciler finishes the release.
+    REQUIRE(rig.quarantine.release_apply_claim(kAgent, record_id, held_gen).has_value());
+    for (int i = 0; i < 24 && rig.quarantined_count() > 0; ++i) {
+        rig.settle_long();
+        REQUIRE(rig.leader_tick());
+        device.deliver();
+        device.check_invariant();
+    }
+    CHECK(rig.quarantined_count() == 0);
+    CHECK_FALSE(device.contained);
+    CHECK(device.owed_count() == 0);
 }
 
 TEST_CASE("quarantine release (r): the late apply with force=true: the record ends by force and is owed, "
@@ -1704,6 +1733,7 @@ TEST_CASE("quarantine release (r): the late apply with force=true: the record en
         device.deliver();
         apply.release();
         device.deliver();
+        apply.drop_claim(); // the apply's reply is consumed
     };
     auto del = rig.del("?force=true");
     REQUIRE(del);

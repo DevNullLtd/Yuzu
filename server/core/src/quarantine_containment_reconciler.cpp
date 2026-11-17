@@ -1001,10 +1001,10 @@ bool QuarantineContainmentReconciler::send_apply(const std::string& agent_id, co
     // chokepoint MCP's already_active retry path uses, so the stored-whitelist-only invariant
     // lives in exactly one function. The chokepoint also claims the apply (#7613).
     //
-    // An apply of ours that timed out unanswered still holds its claim (it may not have run).
-    // This apply replaces it with the same stored list, so the old claim is dropped just before
-    // the new one is taken instead of blocking its own retry for the rest of the claim window.
-    release_held_claim(agent_id, c);
+    // An apply of ours that timed out unanswered still holds its claim (it may not have run), so a
+    // retry inside the claim window is refused by the chokepoint (no_active_record) and the claim
+    // expires on its own; it is deliberately not dropped here, because that apply may still be
+    // waiting to run.
     QuarantineRecord stored{};
     auto reapply_res = redispatch_stored_containment(
         *d_.quarantine_store, agent_id,

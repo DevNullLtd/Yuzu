@@ -543,13 +543,14 @@ nothing owed. So:
    stamp; refused once a release is requested, the record has ended, or another claim is live). A
    dispatch that returned is not a delivery (the gateway path only queues) and a delivered command is not
    a run (the agent executes commands on a thread pool, and the plugin's gate orders them by the order its
-   workers reach it, review of the follow-ups PR, R1). So a dispatch that reached an agent KEEPS the
+   workers reach it, #8045 R1). So a dispatch that reached an agent KEEPS the
    claim and hands it back (`held_claim_gen`); the reconciler drops it with `release_apply_claim` (which
    clears the claim only while `apply_gen` is still its own) once it has read the apply's reply, from the
    in-flight poll or, after a release request has made the entry a releasing one, from its own look at
-   the command. An apply that threw or reached nobody drops it at once, a retry of an apply that never
-   answered drops its predecessor's claim just before taking its own, and a caller that reads no reply
-   (the MCP retry) leaves it to expire. The generation outlives the claim.
+   the command. An apply that threw or reached nobody drops it at once. An apply that never answers, and
+   every `quarantine_device` call on MCP (it reads no reply), leaves it to expire, so a second call or a
+   confirmed end inside those 120 seconds is held back (MCP answers a retryable fault). The generation
+   outlives the claim.
 2. Whoever will act on an `inactive` answer reads `apply_fence_token` (the current `apply_gen`, or nothing
    while a claim is live) **before it sends the command whose answer it will use**: the reconciler before
    its status read, `DELETE` before its release.

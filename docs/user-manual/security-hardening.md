@@ -882,9 +882,10 @@ contained with no record naming it. Two parts close that:
   accepted, whether it rests on a release's `inactive` answer or on a status read. An apply that threw or
   reached no device drops its claim at once. The generation outlives the claim. A claim stops counting
   120 seconds after it was stamped, and both the stamp and that test use the database's clock, so a
-  server whose own clock steps cannot make a live claim read as expired or a dead one as live. The MCP
-  retry reads no reply, so a release asked for within 120 seconds of one is held back until its claim
-  expires.
+  server whose own clock steps cannot make a live claim read as expired or a dead one as live. MCP
+  `quarantine_device` reads no reply, so after any call (the first as well as a retry) a second call, a
+  release's confirmed end and the reconciler's own apply are held back until the claim expires, at most 120
+  seconds; the second call answers a retryable fault.
 - Whoever will act on an `inactive` answer reads the generation **before it sends the command whose
   answer it will use** (the reconciler before its status read, `DELETE` before its release), and the
   write that ends the record presents it. The store refuses the end when an apply was claimed since

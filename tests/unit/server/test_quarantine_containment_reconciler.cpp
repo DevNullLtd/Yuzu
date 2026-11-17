@@ -3288,6 +3288,28 @@ TEST_CASE("reconciler (firewall): an apply that was delivered but has not run ke
     CHECK_FALSE(rig.active().has_value()); // and the release now ends the record the normal way
 }
 
+TEST_CASE("reconciler (firewall): a release requested while an apply is unanswered turns the entry into "
+          "a releasing one; the apply's claim survives that reset, no `inactive` read ends the record "
+          "until the apply's reply is read, and then it settles (#8045 R1)",
+          "[pg][quarantine][reconciler][prq2][fence][r1][reset]") {
+    RECON_RIG(rig);
+    const auto rec = rig.quarantine();
+    rig.reply("", "status|inactive"); // the device answers every status read inactive; the apply is silent
+    rig.step();                       // the apply is dispatched and its claim held
+    REQUIRE(rig.sent() == (std::vector<std::string>{"firewall.quarantine"}));
+    REQUIRE(rig.qstore.request_release("agent-1").has_value()); // the entry becomes a releasing one
+    rig.run(10);
+    CHECK(rig.count_sent("firewall.quarantine_status") >= 1);
+    CHECK(rig.active().has_value()); // every inactive read was refused: no token while the claim is held
+    // The apply runs and answers; the releasing entry reads that reply, drops the claim, and the
+    // next status read (with a fresh token) ends the record.
+    store_status_response(rig.rstore, ReconRig::cmd(1), "agent-1", "status|active_unproven");
+    rig.run(10);
+    CHECK_FALSE(rig.active().has_value());
+    CHECK(rig.owed().empty());
+    CHECK(rig.has_row("quarantine.disable", "success", "confirmed record_id=" + std::to_string(rec.id)));
+}
+
 TEST_CASE("reconciler (firewall): the marks a heartbeat drain had not reached go back when the pass throws "
           "(#8045 R4)",
           "[pg][quarantine][reconciler][prq2][drain]") {
