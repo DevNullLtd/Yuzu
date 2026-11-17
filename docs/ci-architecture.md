@@ -1239,14 +1239,20 @@ home directory. The user is provisioned once for fast, download-free builds:
   whichever job is writing, so one job with a smaller cap empties the cache
   the other jobs rely on. Until 2026-11-17, `codeql.yml` and
   `sanitizer-tests.yml` set 500M. Each daily CodeQL trace cut its runner's
-  cache from about 30 GB to 3-4 GB. For the next 12 hours that runner's CI
-  hit rate ran 13-20 points below the other runners' (four of five trims
-  measured 2026-11-12 to -17). `tests/test_ci_ccache_cap.py` now requires one cap per
-  pool, and the CodeQL-traced build runs with `CCACHE_DISABLE` (see the
-  comment on that step). At 30G a runner's cache keeps about two days of
-  objects and sits at the cap. That limit is not what costs hits: r3,
-  which no trim reached in that window, ended every job at the cap and had the same
-  hit rate as the best of the other runners (79.1%, against 73.8-79.8%).
+  cache from 18-30 GB to 3-4 GB (the trace's own `ccache -s`). In four of
+  the five trims between 2026-11-12 and -17, that runner's CI over the next
+  12 hours hit the cache 13-24 points less often than the other three
+  runners did, depending on where the window starts; the fifth showed no
+  gap. The windows hold 5-17 jobs and the comparison is observational, so
+  treat the size of the gap as an estimate; the trim itself is not in
+  doubt. `tests/test_ci_ccache_cap.py` now requires one cap per pool, and
+  the CodeQL-traced build runs with `CCACHE_DISABLE` (see the comment on
+  that step). At 30G a runner's cache sits at the cap and holds about two
+  days of objects (r3's cache on 2026-11-17: 4.3 GB dated 11-15, the
+  rest 11-16 and 11-17). Nothing measured shows that limit costing
+  hits: r3, which no trim reached in that window, ended every job at the
+  cap and its hit rate (79.1%) was close to the best of the others
+  (73.8-79.8%). That does not show a larger cap would not help.
 - **mold** linker (`apt install mold`), wired via `-fuse-ld=mold` in the gcc-15 /
   clang-21 native files — large cut in link time on the big `yuzu-server` /
   `yuzu-agent` binaries and the release LTO link.

@@ -55,8 +55,9 @@ env:
   # Must equal every other self-hosted job's CCACHE_MAXSIZE: these legs
   # write to the Big Tam runner's own ccache, which ci.yml, nightly.yml
   # and release.yml also use, and ccache trims that directory to the cap
-  # of whichever job is writing. 500M cut the runner's ~30 GB cache to a
-  # few GB on every dispatch (tests/test_ci_ccache_cap.py).
+  # of whichever job is writing. At 500M each dispatch could cut the
+  # runner's cache to a few GB, as the daily CodeQL trace did (see
+  # codeql.yml; tests/test_ci_ccache_cap.py).
   CCACHE_MAXSIZE: "30G"
   CCACHE_COMPRESS: "true"
   # Big Tam allocates one 8C/16T L3 domain to each runner.

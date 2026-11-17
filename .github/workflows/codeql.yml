@@ -156,9 +156,10 @@ env:
   # cache directory to the cap of whichever job is writing to it, and this
   # job shares the runner's cache with ci.yml, nightly.yml and release.yml
   # (tests/test_ci_ccache_cap.py). At 500M the daily trace cut a Big Tam
-  # runner's ~30 GB cache to 3-4 GB (ccache -s, 2026-11-14 to -16: 1588
-  # cleanups per run), and that runner's next 12 h of CI ran 13-20 points
-  # below the other runners' hit rate.
+  # runner's 18-30 GB cache to 3-4 GB (ccache -s, 2026-11-14 to -16: 1588
+  # cleanups per run). In four of five such trims that runner's next 12 h
+  # of CI hit the cache 13-24 points less often than the other runners did;
+  # the fifth showed no gap (docs/ci-architecture.md "Build speed").
   CCACHE_MAXSIZE: "30G"
   CCACHE_COMPRESS: "true"
 
@@ -271,7 +272,7 @@ jobs:
             # to 16 threads, so the Build step passes the job-level
             # -j $YUZU_BUILD_JOBS cap — without it ninja sizes -j from the 64-CPU host
             # and thrashes the 32 MB L3 (the 98-min-timeout failure mode), which
-            # CCACHE_RECACHE's forced full recompile makes acute.
+            # CCACHE_DISABLE's forced full recompile makes acute.
             runner: [self-hosted, Windows, X64, yuzu-weetam-windows]
             triplet: x64-windows
             vcpkg_bin: vcpkg.exe
@@ -567,13 +568,17 @@ jobs:
         # this silently dropped 98% of TUs from the database (e.g. only
         # 1 of 47 plugin .cpp files was reaching analysis), making most
         # custom and standard queries report 0 alerts on plugin code.
-        # DISABLE runs the compiler for every TU and never reads or
-        # writes the cache. This step used CCACHE_RECACHE so that it
-        # would refresh the cache for the other CI jobs, but under the
-        # tracer ccache found the Linux compiles uncacheable (1581 of
-        # 1590 calls, 2026-11-14 to -16), so it stored nothing, and every
-        # call still ran a cache cleanup against the runner's shared
-        # cache.
+        # DISABLE runs the compiler for every TU and never reads, writes
+        # or cleans the cache. This step used CCACHE_RECACHE so that it
+        # would refresh the cache for the other CI jobs. RECACHE stores
+        # every TU (ccache counts these as "Uncacheable calls", 1581 of
+        # 1590 on Linux, 2026-11-14 to -16) and never reads. On Linux no
+        # other job could read those objects either: for a -g compile
+        # ccache hashes the build directory, and this one is unique. At
+        # this job's old 500M cap each store also ran a cleanup, which
+        # trimmed the shared cache. On Wee Tam one cache (D:\ci\ccache)
+        # serves all four runners, so the trace held the whole pool's
+        # cache near 2 GB while it ran.
         env:
           CCACHE_DISABLE: "true"
         # Essential because CCACHE_DISABLE forces every TU to compile. Both
@@ -581,6 +586,9 @@ jobs:
         run: meson compile -C ${{ matrix.build_dir }} -j "$YUZU_BUILD_JOBS"
 
       - name: ccache stats
+        # Covers Configure's probe compiles only: CCACHE_DISABLE calls are
+        # not counted. On Wee Tam the counters are the pool's, so they also
+        # include other Windows jobs running at the same time.
         if: always()
         run: ccache -s
 

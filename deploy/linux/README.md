@@ -79,3 +79,20 @@ YUZU_TEST_DB=/srv/ci/work-0/_tool/yuzu-test-runs/yuzu-bigtam-linux-0/test-runs.d
 YUZU_TEST_DB=/srv/ci/work-0/_tool/yuzu-test-runs/yuzu-bigtam-linux-0/test-runs.db \
   bash scripts/test/test-db-query.sh ci-suite-stats --since 30d
 ```
+
+## Per-runner HOME (ccache, pip, git)
+
+All four agents run as the `runner` user, but each agent's `.env` file
+(`/home/runner/rN/.env`) sets its own home directory:
+
+```text
+HOME=/home/runner/rN/home
+```
+
+Jobs inherit it, so each runner has its own ccache
+(`/home/runner/rN/home/.cache/ccache`), its own `~/.local` Python packages and
+its own `.gitconfig`. Nothing in this directory writes that line, so add it by
+hand when a runner is registered or re-registered, then restart the agent.
+Without it all four runners share `/home/runner`, and so one ccache.
+`docs/ci-architecture.md` "Build speed (Big Tam)" explains how the ccache cap
+(`CCACHE_MAXSIZE`, set by the workflows) applies to these caches.
