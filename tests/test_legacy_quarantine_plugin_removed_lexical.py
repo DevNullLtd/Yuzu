@@ -1900,11 +1900,16 @@ class HelperSitesAreGovernedInterpreterSites(unittest.TestCase):
     def test_the_descriptors_that_run_a_helper_say_rung_3(self):
         fw = read_text("agents/plugins/firewall/src/firewall_plugin.cpp")
         svc = read_text("agents/plugins/services/src/services_plugin.cpp")
-        for text, name in ((fw, "firewall"), (svc, "services")):
+        # The helper-mediated legs today: six firewall descriptors, two services. A layout change
+        # that stops the pattern matching must fail here, not pass with nothing checked.
+        for text, name, floor in ((fw, "firewall", 6), (svc, "services", 2)):
+            seen = 0
             for m in re.finditer(r"\{YUZU_SUPPORT_[A-Z]+,\s*(\d),\s*\"((?:[^\"\\]|\\.|\"\s*\")*)", text):
                 mech = m.group(2)
                 if re.search(r"yuzu-(fw|svc)-helper", mech):
+                    seen += 1
                     self.assertEqual(m.group(1), "3", name + ": " + mech[:60])
+            self.assertGreaterEqual(seen, floor, name + ": helper descriptors matched")
 
 
 class InstallerCheckComparesSudoersBytes(unittest.TestCase):
