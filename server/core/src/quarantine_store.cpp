@@ -106,12 +106,18 @@ QuarantineRecord read_record(PGresult* res, int row) {
     r.reason = text_col(res, row, c++);
     r.last_applied_at = to_i64(PQgetvalue(res, row, c++));
     r.last_confirmed_at = to_i64(PQgetvalue(res, row, c++));
+    r.release_requested_at = to_i64(PQgetvalue(res, row, c++));
+    r.device_release_owed_at = to_i64(PQgetvalue(res, row, c++));
     return r;
 }
 
+// `status` reads "releasing" for an active row with a release requested (no alias: read_record is
+// positional, and every WHERE below keeps binding to the table column, so the partial unique index,
+// ON CONFLICT and the `status = 'active'` filters see the stored active|released value).
 constexpr const char* kRecordCols =
-    "id, agent_id, status, quarantined_by, quarantined_at, released_at, whitelist, reason, "
-    "last_applied_at, last_confirmed_at";
+    "id, agent_id, CASE WHEN status = 'active' AND release_requested_at <> 0 THEN 'releasing' ELSE "
+    "status END, quarantined_by, quarantined_at, released_at, whitelist, reason, "
+    "last_applied_at, last_confirmed_at, release_requested_at, device_release_owed_at";
 
 const std::vector<pg::PgMigration>& migrations() {
     // Unqualified DDL: the runner sets `search_path` to the store schema for
@@ -165,6 +171,19 @@ const std::vector<pg::PgMigration>& migrations() {
         // (PgMigrationRunner applies only version > current — renumbering an already-shipped
         // version re-applies it against a database that already ran it).
         {3, "DROP TABLE IF EXISTS quarantine_meta;"},
+        // PRQ.2: the release is a real, confirmed step. `release_requested_at` marks a record whose
+        // release was asked for (read as status `releasing`; the stored status stays active|released so
+        // the CHECK, the partial unique index and every active-row query are untouched).
+        // `device_release_owed_at` marks a record an operator ended by force before the device
+        // confirmed a release. Both: 0 = never, this table's existing sentinel. The partial index
+        // serves the owed list the reconciler reads every tick: it holds only force-ended records the
+        // device has not confirmed, so it stays tiny.
+        {4,
+         "ALTER TABLE quarantine_records ADD COLUMN release_requested_at BIGINT NOT NULL DEFAULT 0;"
+         "ALTER TABLE quarantine_records ADD COLUMN device_release_owed_at BIGINT NOT NULL DEFAULT "
+         "0;"
+         "CREATE INDEX idx_quarantine_release_owed ON quarantine_records(agent_id, id) "
+         "WHERE status = 'released' AND device_release_owed_at <> 0;"},
     };
     return kMigrations;
 }
@@ -226,7 +245,7 @@ QuarantineStore::quarantine_device(const std::string& agent_id, const std::strin
     return {};
 }
 
-std::expected<void, std::string> QuarantineStore::release_device(const std::string& agent_id) {
+std::expected<std::int64_t, std::string> QuarantineStore::request_release(const std::string& agent_id) {
     if (!open_)
         return std::unexpected(std::string(kQuarantineDbErrorPrefix) + "database not open");
     if (agent_id.empty())
@@ -237,33 +256,37 @@ std::expected<void, std::string> QuarantineStore::release_device(const std::stri
         return std::unexpected(std::string(kQuarantineDbErrorPrefix) +
                                "database unavailable — try again");
 
-    // Single guarded UPDATE (the #3062 cancel_job pattern) — not
-    // lock-then-check. RETURNING replaces sqlite3_changes() (#1033).
+    // Single guarded UPDATE (the #3062 cancel_job pattern) — not lock-then-check. Idempotent: the
+    // CASE keeps the first request's timestamp. RETURNING replaces sqlite3_changes() (#1033) and
+    // hands back the record id the rest of the release is scoped to.
     pg::PgResult res = pg::exec_params(
         lease.get(),
-        "UPDATE quarantine_store.quarantine_records SET status = 'released', released_at = "
-        "$1::bigint "
+        "UPDATE quarantine_store.quarantine_records SET release_requested_at = CASE WHEN "
+        "release_requested_at = 0 THEN $1::bigint ELSE release_requested_at END "
         "WHERE agent_id = $2 AND status = 'active' RETURNING id",
         std::vector<std::string>{std::to_string(now_secs()), sanitize_pg_text(agent_id)});
     if (res.status() != PGRES_TUPLES_OK)
-        return std::unexpected(std::string(kQuarantineDbErrorPrefix) + "release_device failed: " +
+        return std::unexpected(std::string(kQuarantineDbErrorPrefix) + "request_release failed: " +
                                PQerrorMessage(lease.get()));
     if (PQntuples(res.get()) == 0)
         return std::unexpected("device is not quarantined");
-    return {};
+    return to_i64(PQgetvalue(res.get(), 0, 0));
 }
 
 namespace {
-// Shared body for mark_endpoint_applied/mark_endpoint_confirmed — same
-// guarded-UPDATE-WHERE-active shape as release_device (the #3062 cancel_job
-// pattern), differing only in which column is stamped. `record_id` scopes
-// the write to the SPECIFIC row a dispatch/status-read was actually about
-// (governance Gate 4, unhappy-path Finding A) — `agent_id`+`status='active'`
-// alone is not a stable identity across a release-then-requarantine race.
-std::expected<void, std::string> mark_endpoint_column(pg::PgPool& pool, const char* column,
-                                                       const std::string& agent_id,
-                                                       std::int64_t record_id, std::int64_t at,
-                                                       bool open) {
+// Shared body for the record-scoped guarded UPDATEs (mark_endpoint_applied/confirmed, mark_released,
+// clear_release_owed) — the #3062 cancel_job pattern. `record_id` scopes the write to the SPECIFIC
+// row a dispatch/status-read was actually about (governance Gate 4, unhappy-path Finding A):
+// `agent_id`+`status='active'` alone is not a stable identity across a release-then-requarantine
+// race. `set_sql` and `required_status` are string literals chosen by the caller, never input; $1 is
+// the agent, $2 the record id, $3.. the caller's `extra` values.
+std::expected<void, std::string> guarded_record_update(pg::PgPool& pool, bool open, const char* what,
+                                                        const std::string& set_sql,
+                                                        const char* required_status,
+                                                        const std::string& agent_id,
+                                                        std::int64_t record_id,
+                                                        std::vector<std::string> extra,
+                                                        const char* extra_where = "") {
     if (!open)
         return std::unexpected(std::string(kQuarantineDbErrorPrefix) + "database not open");
     if (agent_id.empty())
@@ -274,15 +297,15 @@ std::expected<void, std::string> mark_endpoint_column(pg::PgPool& pool, const ch
         return std::unexpected(std::string(kQuarantineDbErrorPrefix) +
                                "database unavailable — try again");
 
-    std::string sql = std::string("UPDATE quarantine_store.quarantine_records SET ") + column +
-                      " = $1::bigint WHERE agent_id = $2 AND id = $3::bigint AND status = "
-                      "'active' RETURNING id";
-    pg::PgResult res = pg::exec_params(
-        lease.get(), sql.c_str(),
-        std::vector<std::string>{std::to_string(at), sanitize_pg_text(agent_id),
-                                 std::to_string(record_id)});
+    std::string sql = "UPDATE quarantine_store.quarantine_records SET " + set_sql +
+                      " WHERE agent_id = $1 AND id = $2::bigint AND status = '" + required_status +
+                      "'" + extra_where + " RETURNING id";
+    std::vector<std::string> params{sanitize_pg_text(agent_id), std::to_string(record_id)};
+    for (auto& e : extra)
+        params.push_back(std::move(e));
+    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
     if (res.status() != PGRES_TUPLES_OK)
-        return std::unexpected(std::string(kQuarantineDbErrorPrefix) + column +
+        return std::unexpected(std::string(kQuarantineDbErrorPrefix) + what +
                                " update failed: " + PQerrorMessage(lease.get()));
     if (PQntuples(res.get()) == 0)
         return std::unexpected("device is not quarantined");
@@ -291,15 +314,35 @@ std::expected<void, std::string> mark_endpoint_column(pg::PgPool& pool, const ch
 } // namespace
 
 std::expected<void, std::string>
+QuarantineStore::mark_released(const std::string& agent_id, std::int64_t record_id,
+                               ReleaseEnd end) {
+    const std::int64_t now = now_secs();
+    return guarded_record_update(
+        pool_, open_, "mark_released",
+        "status = 'released', released_at = $3::bigint, device_release_owed_at = $4::bigint",
+        "active", agent_id, record_id,
+        {std::to_string(now), std::to_string(end == ReleaseEnd::forced ? now : 0)});
+}
+
+std::expected<void, std::string>
+QuarantineStore::clear_release_owed(const std::string& agent_id, std::int64_t record_id) {
+    return guarded_record_update(pool_, open_, "clear_release_owed", "device_release_owed_at = 0",
+                                 "released", agent_id, record_id, {},
+                                 " AND device_release_owed_at <> 0");
+}
+
+std::expected<void, std::string>
 QuarantineStore::mark_endpoint_applied(const std::string& agent_id, std::int64_t record_id,
                                        std::int64_t at) {
-    return mark_endpoint_column(pool_, "last_applied_at", agent_id, record_id, at, open_);
+    return guarded_record_update(pool_, open_, "last_applied_at", "last_applied_at = $3::bigint",
+                                 "active", agent_id, record_id, {std::to_string(at)});
 }
 
 std::expected<void, std::string>
 QuarantineStore::mark_endpoint_confirmed(const std::string& agent_id, std::int64_t record_id,
                                          std::int64_t at) {
-    return mark_endpoint_column(pool_, "last_confirmed_at", agent_id, record_id, at, open_);
+    return guarded_record_update(pool_, open_, "last_confirmed_at", "last_confirmed_at = $3::bigint",
+                                 "active", agent_id, record_id, {std::to_string(at)});
 }
 
 std::expected<std::optional<QuarantineRecord>, std::string>
@@ -395,6 +438,43 @@ QuarantineStore::list_quarantined_in(const std::vector<std::string>* visible_ids
     if (res.status() != PGRES_TUPLES_OK) {
         if (note_read_degrade(metrics_, kReasonQueryError, sampler))
             spdlog::warn("QuarantineStore: list_quarantined_in degraded — query failed: {}",
+                         PQerrorMessage(lease.get()));
+        return std::nullopt;
+    }
+    const int rows = PQntuples(res.get());
+    std::vector<QuarantineRecord> out;
+    out.reserve(static_cast<std::size_t>(rows));
+    for (int i = 0; i < rows; ++i)
+        out.push_back(read_record(res.get(), i));
+    return out;
+}
+
+std::optional<std::vector<QuarantineRecord>> QuarantineStore::list_release_owed() {
+    static DegradeSampler sampler;
+    if (!open_) {
+        if (note_read_degrade(metrics_, kReasonStoreClosed, sampler))
+            spdlog::warn("QuarantineStore: list_release_owed degraded — store not open");
+        return std::nullopt;
+    }
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease) {
+        if (note_read_degrade(metrics_, kReasonPoolTimeout, sampler))
+            spdlog::warn("QuarantineStore: list_release_owed degraded — pool acquire timed out ({})",
+                         pool_.last_error());
+        return std::nullopt;
+    }
+
+    // A forced record the device has not confirmed, and only while it is the device's LATEST
+    // record: a device quarantined again is governed by its new record and never appears here.
+    std::string sql = std::string("SELECT ") + kRecordCols +
+                      " FROM quarantine_store.quarantine_records q WHERE q.status = 'released' "
+                      "AND q.device_release_owed_at <> 0 AND NOT EXISTS (SELECT 1 FROM "
+                      "quarantine_store.quarantine_records n WHERE n.agent_id = q.agent_id AND "
+                      "n.id > q.id) ORDER BY q.quarantined_at DESC, q.id DESC";
+    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{});
+    if (res.status() != PGRES_TUPLES_OK) {
+        if (note_read_degrade(metrics_, kReasonQueryError, sampler))
+            spdlog::warn("QuarantineStore: list_release_owed degraded — query failed: {}",
                          PQerrorMessage(lease.get()));
         return std::nullopt;
     }

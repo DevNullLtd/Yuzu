@@ -13,6 +13,7 @@
 
 #include "echo_cursor.hpp"
 #include "echo_db.hpp"
+#include "echo_test_db.hpp"
 #include "echo_fold_schema.hpp"
 #include "echo_registry_parsers.hpp"
 #include "echo_registry_source.hpp"
@@ -1440,7 +1441,7 @@ void record_committed(const std::vector<RegistryEvent>& rows) {
 TestDb make_db() {
     committed_rows().clear();
     auto tmp = yuzu::test::unique_temp_path("yuzu_test_echo_registry_");
-    auto r = EchoDatabase::open(tmp);
+    auto r = yuzu::test::open_echo_db(tmp);
     REQUIRE(r.has_value());
     return TestDb{std::move(*r), tmp};
 }

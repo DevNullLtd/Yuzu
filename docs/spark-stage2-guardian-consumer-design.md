@@ -50,7 +50,7 @@ history:
     `guardian_arm_heartbeat.hpp`, `guardian_io_executor.hpp`,
     `guardian_spark_runtime.hpp`), resolving the collision with Guardian's real
     operator-facing network-isolation quarantine (v1.1 §11.7), the shipped
-    `quarantine` plugin/`QuarantineStore`/`quarantine_device` MCP tool, and the
+    firewall containment actions/`QuarantineStore`/`quarantine_device` MCP tool, and the
     `mech_quarantined_total` SparkEngine fault counter - all three left unchanged.
     Earlier entries above now read "wedged" for this state; they said "quarantined"
     when written. Full `/governance` pass (commit 9256f6189): security-guardian,

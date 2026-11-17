@@ -49,7 +49,7 @@
 
 #include <spdlog/spdlog.h> // one line per containment state change / non-OK outcome (SRE)
 
-#include <quarantine_serialization.hpp> // MutationGate; PRQ.2 relocates it to agents/shared
+#include <mutation_gate.hpp> // MutationGate
 
 #include <algorithm>
 #include <chrono>
@@ -411,7 +411,7 @@ void do_state_macos(yuzu::CommandContext& ctx) {
     }
     // Secondary: the pf packet filter (reading /dev/pf needs root;
     // unreadable reports as unknown, never a false-safe value). Absolute
-    // path per the quarantine plugin's kPfctl discipline.
+    // path, as every containment tool call uses.
     auto pf_res =
         run_bounded_subprocess({"/sbin/pfctl", "-s", "info"}, SubprocessOptions{.deadline = kAcqDeadline});
     ctx.write_output(std::format(
@@ -1535,10 +1535,9 @@ namespace fq = yuzu::firewall::quarantine;
 
 /// One in-flight mutating action at a time (quarantine / release /
 /// quarantine_allow). `quarantine_status` never takes it: a read must not queue
-/// behind a multi-step mutation. Same shape and budget as the legacy plugin's
-/// gate (quarantine_serialization.hpp has the rationale for 2 s).
+/// behind a multi-step mutation (mutation_gate.hpp has the rationale for 2 s).
 constexpr std::chrono::milliseconds kQuarantineLockWait{2000};
-yuzu::quarantine::MutationGate g_quarantine_gate{kQuarantineLockWait};
+yuzu::shared::MutationGate g_quarantine_gate{kQuarantineLockWait};
 
 [[nodiscard]] std::int64_t epoch_now() {
     return std::chrono::duration_cast<std::chrono::seconds>(
@@ -1954,26 +1953,16 @@ public:
 
     [[nodiscard]] fq::BackendKind kind() const override { return fq::BackendKind::windows; }
 
-    /// Refuse while the legacy plugin's rules (`YuzuQuarantine_*`) are present.
-    /// An unreadable ruleset does not block here: the apply that follows reads
-    /// the same ruleset and fails loudly if it truly cannot.
-    [[nodiscard]] std::optional<std::string> preflight(fq::Deadline& dl) override {
+    /// Refuse while a profile's firewall is switched off or under policy. An
+    /// unreadable policy store does not block here: the apply that follows reads
+    /// the same store and fails loudly if it truly cannot.
+    [[nodiscard]] std::optional<std::string> preflight(fq::Deadline&) override {
         ComInit com;
         ComPtr<INetFwPolicy2> policy;
         ComPtr<INetFwRules> rules;
         if (!com.ok() || FAILED(get_fw_policy(policy)) || FAILED(policy->get_Rules(rules.put())) ||
             !rules)
             return std::nullopt;
-        bool legacy = false;
-        (void)for_each_rule(*rules.get(), dl, [&](INetFwRule& r) {
-            if (fq::is_legacy_marker(rule_name_of(r))) {
-                legacy = true;
-                return false;
-            }
-            return true;
-        });
-        if (legacy)
-            return std::string{"legacy_quarantine_active"};
         // A profile whose firewall is switched off (or cannot be read) would make every
         // rule below inert, and a profile Group Policy or MDM controls (any of the three)
         // ignores local rules and defaults altogether (`gpo_override:<Profile>`): refuse
@@ -2006,20 +1995,15 @@ public:
             !why.empty())
             return fq::StepResult::fail(why);
 
-        // 1. Read the ruleset once: legacy markers, our group, what to disable.
+        // 1. Read the ruleset once: our group, what to disable.
         std::vector<fq::WinRuleInfo> infos;
-        bool legacy = false;
         if (!for_each_rule(*rules.get(), dl, [&](INetFwRule& r) {
-                fq::WinRuleInfo info = rule_info_of(r);
-                legacy = legacy || fq::is_legacy_marker(info.name);
-                infos.push_back(std::move(info));
+                infos.push_back(rule_info_of(r));
                 return true;
             }))
             return enum_fail(dl);
         if (dl.expired())
             return fq::StepResult::fail("deadline_exceeded");
-        if (legacy)
-            return fq::StepResult::fail("legacy_quarantine_active");
         std::vector<std::string> ours;
         for (const auto& i : infos)
             if (fq::is_our_win_rule(i.name, i.group))
@@ -2361,11 +2345,9 @@ public:
         if (!com.ok() || FAILED(get_fw_policy(policy)) || FAILED(policy->get_Rules(rules.put())) ||
             !rules)
             return st;
-        bool group = false, legacy = false;
+        bool group = false;
         if (!for_each_rule(*rules.get(), dl, [&](INetFwRule& r) {
-                const auto name = rule_name_of(r);
                 group = group || rule_group_of(r) == fq::kWinGroup;
-                legacy = legacy || fq::is_legacy_marker(name);
                 return true;
             }))
             return st; // unreadable (or out of time): never a guess
@@ -2379,8 +2361,6 @@ public:
                 return st; // unreadable, never a guess
             all_block = all_block && in == NET_FW_ACTION_BLOCK && out == NET_FW_ACTION_BLOCK;
         }
-        if (legacy)
-            st.notes.emplace_back("legacy_quarantine_rules_present=1");
         if (!group && all_block)
             st.notes.emplace_back("rules_missing=1"); // block/block with no rules of ours
         // A switched-off profile, an unreadable switch or policy store and a profile Group

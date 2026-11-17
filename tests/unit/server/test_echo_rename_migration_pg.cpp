@@ -810,7 +810,7 @@ TEST_CASE("Echo rename: plugin_config_store v4 moves configs and every kill-swit
                        "FROM plugin_config_store.secrets") == "tar.token|tar|0102");
 
         // The migrated units are judged by the consumer that classifies them, not only read back
-        // as text: they load unquarantined, name nothing this release does not know except the
+        // as text: they load without a quarantine, name nothing this release does not know except the
         // control unit, and switch the echo plugin and its query action off.
         yuzu::server::EnablementStore enablement{pool, make_overlay(), selector_kinds()};
         REQUIRE(enablement.is_open());
