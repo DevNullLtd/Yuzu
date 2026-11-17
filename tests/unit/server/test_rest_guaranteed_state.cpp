@@ -3461,6 +3461,10 @@ TEST_CASE("REST dex/apps/usage: omitted parameters reach the model and the audit
           "[pg][rest][dex][apps][usage]") {
     RestGsHarness h;
     seed_usage_fixture(h);
+    // The fixture's crashes are older than the 7d default window, and the fixture's read names
+    // subject 0; this one is inside the window, so the Apps list has that subject.
+    h.seed_obs("u3", "WS-1", "process.crashed", "fresh.exe", "windows",
+               yuzu::server::dex_iso_since(2));
     auto res = h.sink.Get(kUsageRoute, h.status_route_headers());
     REQUIRE(res);
     REQUIRE(res->status == 200);
