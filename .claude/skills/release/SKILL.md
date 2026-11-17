@@ -270,12 +270,16 @@ yuzu-gateway-X.Y.Z-1.x86_64.rpm
 yuzu-agent_X.Y.Z_amd64.deb
 yuzu-agent-X.Y.Z-1.x86_64.rpm
 yuzu-compose-wizard-X.Y.Z.zip       ← Compose Wizard bundle (PR #405, fjarvis)
+<stem>.cdx.json + <stem>.spdx.json   ← one SBOM pair per archive, .deb, .rpm, .exe and .pkg above (S8); <stem> is the
+                                      file name without .tar.gz/.zip/.deb/.rpm/.exe/.pkg, e.g. yuzu-linux-x64.cdx.json,
+                                      yuzu-agent_X.Y.Z_amd64.spdx.json, YuzuAgentSetup-X.Y.Z.cdx.json (none for the wizard zip)
+yuzu-{server,gateway,postgres}-image.{cdx,spdx}.json, yuzu-{server,gateway,agent}-chisel-image.{cdx,spdx}.json   ← image SBOMs
 SHA256SUMS
 SHA256SUMS.sigstore                   ← cosign keyless signature (v0.12.0+; legacy releases shipped this as SHA256SUMS.bundle)
 <artifact>.intoto.jsonl × N           ← SLSA provenance, one per binary archive/installer (v0.12.0+)
 ```
 
-On a pre-release tag (`vX.Y.Z-rcN`) the names differ: the `.deb` files are `…_X.Y.Z-rcN_amd64.deb` (the package's own `Version:` is `X.Y.Z~rcN`, so it sorts before the final release — the file name uses the tag's form because GitHub rewrites `~` in asset names, #5141), the RPMs are `…-X.Y.Z-0.1.rcN.x86_64.rpm`, and the Windows/macOS installers use `X.Y.Z_rcN`. Every name in `SHA256SUMS` must equal an asset name: `sha256sum -c SHA256SUMS` after downloading all assets is the check.
+On a pre-release tag (`vX.Y.Z-rcN`) the names differ: the `.deb` files are `…_X.Y.Z-rcN_amd64.deb` (the package's own `Version:` is `X.Y.Z~rcN`, so it sorts before the final release — the file name uses the tag's form because GitHub rewrites `~` in asset names, #5141), the RPMs are `…-X.Y.Z-0.1.rcN.x86_64.rpm`, and the Windows/macOS installers use `X.Y.Z_rcN`. Every name in `SHA256SUMS` must equal an asset name: `sha256sum -c SHA256SUMS` after downloading all assets is the check. The per-artifact SBOMs follow the package names (`yuzu-agent_X.Y.Z-rcN_amd64.cdx.json`, `YuzuAgentSetup-X.Y.Z_rcN.cdx.json`); each records its file's SHA-256, and the release job's "Check artifact SBOM scope" step (`scripts/ci/artifact-sbom.py check`) already refused any that did not match, was over its entry bound or listed a checkout path.
 
 If any expected asset is missing, the workflow's `Create GitHub Release` step likely failed silently on a single asset (the `gh release create` call is one big command and a single missing asset returns non-zero). Re-upload the missing one:
 

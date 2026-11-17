@@ -3539,6 +3539,17 @@ test('release artifact gate',
   timeout: 60,
 )
 
+# Per-artifact SBOMs (supply-chain S8): scripts/ci/artifact-sbom.py, with syft
+# stubbed. Pins the vcpkg closure (agent vs server, no test/helper/host ports),
+# the artifact hash and name on the SBOM root, and the release check's bound
+# and forbidden paths. Skips on Windows (the stub is a #! script).
+test('per-artifact SBOM generator',
+  _python3_test,
+  args: [files('test_artifact_sbom.py')],
+  suite: 'docs',
+  timeout: 60,
+)
+
 # Agent-only Windows and macOS releases (ADR-0035 ladder step 2): release.yml's
 # Windows/macOS jobs build no server and no server installer, the old archive
 # names are gone, and every place that names a platform archive agrees on one

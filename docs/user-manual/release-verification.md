@@ -55,8 +55,8 @@ certificate at build time and cannot be restamped.
 | Native installers | `*.deb`, `*.rpm`, `YuzuAgentSetup-*.exe`, `YuzuAgent-*.pkg` (`YuzuServerSetup-*.exe` was discontinued: the server runs on Linux only, ADR-0035) | `sha256sum -c SHA256SUMS` |
 | Checksum manifest | `SHA256SUMS` | `cosign verify-blob` against `SHA256SUMS.sigstore` |
 | Cosign bundle | `SHA256SUMS.sigstore` (legacy filename `SHA256SUMS.bundle`: the only name on v0.7.x; v0.11.0-rc1 to v0.11.0 carry both) | Sigstore OIDC identity |
-| CycloneDX SBOMs | `yuzu-*.cdx.json`, including the images: `yuzu-{server,gateway,postgres}-image.cdx.json` and `yuzu-{server,gateway,agent}-chisel-image.cdx.json` | `cyclonedx validate` |
-| SPDX SBOMs | `yuzu-*.spdx.json`, including the same image set | `spdx-tools validate` |
+| CycloneDX SBOMs | One per archive, package and installer, named after the file without its extension (`yuzu-linux-x64.cdx.json`, `yuzu-agent_X.Y.Z_amd64.cdx.json`, `YuzuAgentSetup-X.Y.Z.cdx.json`, ...), and one per image: `yuzu-{server,gateway,postgres}-image.cdx.json` and `yuzu-{server,gateway,agent}-chisel-image.cdx.json` | `cyclonedx validate` |
+| SPDX SBOMs | `*.spdx.json`, the same set | `spdx-tools validate` |
 | SLSA provenance | `<artifact>.intoto.jsonl` per asset (also in GitHub's attestation registry) | `gh attestation verify` |
 | Docker images | `ghcr.io/${OWNER}/yuzu-{server,gateway,postgres}:<tag>` and `ghcr.io/${OWNER}/yuzu-{server,gateway,agent}-chisel:<tag>` | `cosign verify` |
 
@@ -173,33 +173,57 @@ with `gh attestation download <file> --repo "$SIGNER_REPO" -o
 
 ## 5. Inspect the SBOM
 
-Each platform archive and Docker image ships SBOMs in both CycloneDX
-and SPDX formats. Use whichever your procurement or SCA tool consumes.
+Every archive, `.deb`, `.rpm`, Windows installer and macOS `.pkg`, and every
+Docker image, has its own SBOM in both CycloneDX and SPDX formats. Use
+whichever your procurement or SCA tool consumes. A file's SBOM has the file's
+name with `.cdx.json` or `.spdx.json` in place of `.tar.gz`, `.zip`, `.deb`,
+`.rpm`, `.exe` or `.pkg`, and records the file's name and SHA-256 on its root
+(`metadata.component` in CycloneDX, the described package in SPDX), so you can
+check that an SBOM belongs to the file you hold:
 
-**Known limitations of the platform SBOMs.** They are generated from the whole
-build workspace (the vcpkg ports tree and build trees included), not from the
-archive alone, so they can list components the archive does not ship or load.
-A finding in a component the archive does not contain does not apply to it.
-Since ADR-0035 step 3 the Windows and macOS builds install only the agent's
-dependencies, so the server's dependencies (`libpq`, `drogon`, `xmlsec`) are no
-longer installed on those build machines and the Windows agent archive carries
-none of their DLLs (the Windows release build's "Verify the agent runs from the packaged archive" step
-refuses an archive that does; it has not yet run on a real release tag). What a
-given release's SBOM lists beyond the archive is not asserted here: inspect the
-SBOM of the release you verify.
+```bash
+jq -r '.metadata.component | "\(.name) \(.hashes[0].content)"' yuzu-agent_X.Y.Z_amd64.cdx.json
+sha256sum yuzu-agent_X.Y.Z_amd64.deb
+```
+
+**What a file's SBOM lists.** The release unpacks each file and lists what is
+in it:
+
+- **The C++ libraries its binaries are built with.** They are linked
+  statically (on Windows most ship as DLLs next to the agent instead), and a
+  scanner identifies neither, so the release takes them from the vcpkg
+  installation it built with, with the installed version,
+  the licence, a `pkg:github` (or `pkg:generic`) purl naming the upstream
+  source, and a CPE where NVD has a product for the library. The agent's files
+  list the agent's libraries; a file holding `yuzu-server` also lists the
+  server's (`libpq`, `xmlsec`, `drogon` and what they need). The list is every
+  library the build installs for that component, so it can include one a
+  binary ends up not using; it does not omit one the binary uses.
+- **The gateway's Erlang/OTP release:** its applications (Hex packages carry a
+  `pkg:hex` purl) and the Erlang runtime.
+- **Anything else a scanner recognises in the unpacked file.**
+
+Not listed: the web assets compiled into `yuzu-server` (htmx, ECharts,
+three.js, Cytoscape, qrcodegen, IBM Plex fonts; see `NOTICE`), and libraries
+the binaries load from the operating system (glibc, `libsystemd`, the MSVC
+runtime). The Windows installer is not unpacked by the release; its SBOM lists
+the contents of `yuzu-agent-windows-x64.zip`, which is built from the same
+output, and says so on its root. SBOMs of releases before this change were a
+scan of the whole build workspace and list thousands of components (the vcpkg
+ports catalogue among them) that the release does not ship.
 
 ```bash
 # List all components + versions (CycloneDX, pretty-printed)
-jq -r '.components[] | "\(.name)\t\(.version)"' yuzu-linux-x64.cdx.json | column -t
+jq -r '.components[] | "\(.name)\t\(.version)\t\(.purl // "")"' yuzu-linux-x64.cdx.json | column -t
 
-# Validate CycloneDX 1.6 schema
+# Validate the CycloneDX schema
 cyclonedx validate --input-file yuzu-linux-x64.cdx.json
 
 # Count components
 jq '.components | length' yuzu-linux-x64.cdx.json
 
 # Find all dependencies declaring a specific license
-jq -r '.components[] | select(.licenses[]?.license.id == "MIT") | .name' \
+jq -r '.components[] | select(.licenses[]? | (.license.id // .expression) == "MIT") | .name' \
   yuzu-linux-x64.cdx.json
 ```
 

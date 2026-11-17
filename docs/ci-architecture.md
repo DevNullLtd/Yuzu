@@ -455,6 +455,18 @@ at a release that does not exist until the release is fixed. It fails the
 release when:
 
 - an expected archive, installer glob or SBOM is missing or empty (#362/#408);
+- a `.deb`/`.rpm`/`.exe`/`.pkg` has no SBOM pair of its own
+  (`<name without the extension>.{cdx,spdx}.json`), or an SBOM belongs to no
+  archive, package or image of the release (supply-chain S8);
+- an artifact SBOM (every SBOM but the `*-image` ones) names a file that is not
+  in the release or whose SHA-256 differs, has more entries than the bound in
+  `scripts/ci/artifact-sbom.py` (400; measured locally at 22 to 58, about
+  100 estimated for the Windows agent archive), or
+  lists a path under `vcpkg/`, `site/`, `tests/`, `_build_*`, `.git` or
+  `.github`, the marks of a checkout scan ("Check artifact SBOM scope", S8).
+  The build jobs make these SBOMs with that script: each artifact is unpacked
+  and scanned on its own with a pinned syft, and the vcpkg ports its binaries
+  are built from are added from the installed tree for the release triplet;
 - an asset name contains a character GitHub rewrites on upload (anything but
   letters, digits, `.`, `_`, `-`, or a name not starting with a letter or
   digit), which would make `SHA256SUMS` and the provenance name an asset that

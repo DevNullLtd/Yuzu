@@ -316,6 +316,14 @@ jobs:
       - name: Release artifact gate
         run: python3 tests/test_check_release_artifacts.py
 
+      # Per-artifact SBOMs (supply-chain S8): scripts/ci/artifact-sbom.py
+      # describes one shipped file with its vcpkg closure (agent or server),
+      # never test or helper ports, and its `check` refuses a checkout-scale or
+      # checkout-path SBOM and one whose artifact hash differs. syft is stubbed.
+      # Stdlib only.
+      - name: Per-artifact SBOM generator
+        run: python3 -I tests/test_artifact_sbom.py
+
       # Agent-only Windows and macOS releases (ADR-0035 ladder step 2): no
       # server build or server installer in release.yml's Windows/macOS jobs,
       # no old archive name, and one set of archive names across release.yml,
