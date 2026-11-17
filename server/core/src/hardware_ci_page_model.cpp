@@ -220,11 +220,13 @@ std::string_view read_error_message(ReadError e) {
         return "the caller's scope covers more than 10000 devices and no agent_id was given; a "
                "credential with global read has no such limit";
     case ReadError::kOrderingUnverified:
-        return "hardware CI records are refused: the database collation version is not verified. "
-               "Either it changed under the stored CI keys (a database repair is needed), or no "
-               "check has concluded yet (it has not run, could not read the version, or is held by "
-               "an invalid index, which must be dropped or rebuilt; otherwise no repair may be "
-               "needed). The read is refused until the check concludes (see PostgreSQL collation "
+        // Deliberately generic: this text reaches every Inventory:Read caller, who has no need to
+        // learn the database's collation or index state beyond the runbook pointer. The cause (a changed collation version,
+        // a check that has not concluded, an invalid index) is in the server log, which the
+        // collation check writes on every transition, and in the audit row's detail and the
+        // `yuzu_pg_collation_*` series; the remediation below points an operator at the runbook.
+        return "the device CI data cannot be vouched for right now; retry after the hint and "
+               "restart the walk from the first page (operators: see PostgreSQL collation "
                "version in server-admin.md)";
     case ReadError::kCount: // a sentinel, not an error: answered like an out-of-range value
         break;
