@@ -1056,10 +1056,203 @@ TEST_CASE("v10 migration: the free-space refusal is told apart from every other 
         "v10 roll-up migration failed (the schema stays at v9; the retired tables are intact): "
         "not enough free disk space to migrate the Echo database to its roll-up tables: 10 bytes are free"));
     CHECK(!is_free_space_refusal("failed to open echo.db: unable to open database file"));
-    const auto lines = format_storage_refused_lines("not enough free disk space to migrate x");
+    const auto lines = format_storage_refused_lines(
+        OfflineReason::free_space, "not enough free disk space to migrate x", std::chrono::seconds{60});
     REQUIRE(lines.size() == 2);
     CHECK(lines[0].starts_with("error|")); // the server gates on a leading error|
     CHECK(lines[1] == "storage_state|offline|free_space");
+}
+
+// ── #7290: a failed migration loads Echo offline and is retried (the failure classes) ─────────────
+
+namespace {
+
+// One raw process row on a v9 file: enough for the retired tables to exist and hold data.
+void seed_one_process_row(Seeded& s) {
+    seed(s, [&](sqlite3* db) {
+        insert_raw(db, "process", {I(kT0), I(1), T("started"), I(1), I(0), T("a.exe"), T(""), T("u")});
+    });
+}
+
+OpenSeams roomy_seams() {
+    OpenSeams seams;
+    seams.free_bytes = [](const fs::path&) -> std::optional<std::uintmax_t> { return kRoomy; };
+    return seams;
+}
+
+// Every failure below leaves the file exactly as found: same objects, same rows, version 9, the
+// retired table with its row. Then a plain open, with the cause gone, reaches v10.
+void check_untouched_at_v9(const fs::path& path, const Snapshot& before) {
+    INFO(snapshot_diff(snapshot(path), before));
+    CHECK(snapshot(path) == before);
+    Db check;
+    open_raw(check, path);
+    CHECK(count_of(check.db, "SELECT value FROM echo_config WHERE key = 'schema_version'") == 9);
+    CHECK(count_of(check.db, "SELECT COUNT(*) FROM process_live") == 1);
+}
+
+} // namespace
+
+TEST_CASE("v10 migration: a full volume fails the open as migration_failed and changes nothing",
+          "[echo][v10][migration][failure]") {
+    Seeded seeded;
+    seed_one_process_row(seeded);
+    const auto before = snapshot(seeded.tmp.path);
+
+    auto seams = roomy_seams();
+    seams.v10_before_begin = [](sqlite3* db) {
+        // The page limit is exactly the current size: the transaction's first new page is a real
+        // SQLITE_FULL, the way a volume that fills up mid-migration fails.
+        const auto pages = rows_of(db, "PRAGMA page_count");
+        REQUIRE(pages.size() == 1);
+        exec(db, "PRAGMA max_page_count = " + pages[0][0]);
+    };
+    const auto failed = EchoDatabase::open(seeded.tmp.path, seams);
+    REQUIRE(!failed.has_value());
+    INFO(failed.error());
+    CHECK(classify_open_failure(failed.error()) == OfflineReason::migration_failed);
+    check_untouched_at_v9(seeded.tmp.path, before);
+
+    auto db = open_ok(seeded.tmp.path, roomy_seams());
+    CHECK(db.get_config("schema_version") == "10");
+}
+
+TEST_CASE("v10 migration: a bucket that cannot convert fails the open as migration_failed until it is repaired",
+          "[echo][v10][migration][failure]") {
+    Seeded seeded;
+    seed(seeded, [&](sqlite3* db) {
+        insert_raw(db, "process", {I(kT0), I(1), T("started"), I(1), I(0), T("a.exe"), T(""), T("u")});
+        exec(db, std::format("INSERT INTO process_daily VALUES (NULL, {}, 'a', 'u', 3, 1)", kH0 * 1000));
+        exec(db, std::format("INSERT INTO echo_config VALUES ('rollup_process_daily_at', '{}')", kNextDay));
+    });
+    const auto before = snapshot(seeded.tmp.path);
+
+    const auto failed = EchoDatabase::open(seeded.tmp.path, roomy_seams());
+    REQUIRE(!failed.has_value());
+    INFO(failed.error());
+    CHECK(failed.error().find("is outside years 0001-9999") != std::string::npos);
+    CHECK(classify_open_failure(failed.error()) == OfflineReason::migration_failed);
+    check_untouched_at_v9(seeded.tmp.path, before);
+
+    // the documented repair, then the next (retry) open migrates
+    {
+        Db fix;
+        open_raw(fix, seeded.tmp.path);
+        exec(fix.db, std::format("UPDATE process_daily SET day_ts = {}", kH0));
+    }
+    auto db = open_ok(seeded.tmp.path, roomy_seams());
+    CHECK(db.get_config("schema_version") == "10");
+}
+
+TEST_CASE("v10 migration: a locked file fails the open at once as migration_failed and changes nothing",
+          "[echo][v10][migration][failure]") {
+    Seeded seeded;
+    seed_one_process_row(seeded);
+    const auto before = snapshot(seeded.tmp.path);
+
+    Db holder;
+    auto seams = roomy_seams();
+    seams.v10_before_begin = [&](sqlite3* migrating) {
+        // Another writer takes the lock in the gap before BEGIN IMMEDIATE; the migrating
+        // connection must not wait the real busy timeout out.
+        open_raw(holder, seeded.tmp.path);
+        exec(holder.db, "BEGIN IMMEDIATE");
+        sqlite3_busy_timeout(migrating, 0);
+    };
+    const auto failed = EchoDatabase::open(seeded.tmp.path, seams);
+    REQUIRE(!failed.has_value());
+    INFO(failed.error());
+    CHECK(failed.error().find("locked") != std::string::npos);
+    CHECK(classify_open_failure(failed.error()) == OfflineReason::migration_failed);
+
+    exec(holder.db, "ROLLBACK");
+    check_untouched_at_v9(seeded.tmp.path, before);
+    auto db = open_ok(seeded.tmp.path, roomy_seams());
+    CHECK(db.get_config("schema_version") == "10");
+}
+
+TEST_CASE("v10 migration: a second opener that finishes first makes this open a no-op, folding nothing twice",
+          "[echo][v10][migration][failure]") {
+    Seeded raced;
+    Seeded alone;
+    seed_one_process_row(raced);
+    seed_one_process_row(alone);
+
+    {
+        auto seams = roomy_seams();
+        bool nested_ran = false;
+        seams.v10_before_begin = [&](sqlite3*) {
+            nested_ran = true;
+            auto other = EchoDatabase::open(raced.tmp.path, roomy_seams()); // migrates and closes
+            REQUIRE(other.has_value());
+        };
+        auto db = open_ok(raced.tmp.path, seams);
+        REQUIRE(nested_ran);
+        CHECK(db.get_config("schema_version") == "10");
+    }
+    {
+        auto db = open_ok(alone.tmp.path, roomy_seams());
+        CHECK(db.get_config("schema_version") == "10");
+    }
+    // The tier contents equal a single migration of the same seed.
+    Db a, b;
+    open_raw(a, raced.tmp.path);
+    open_raw(b, alone.tmp.path);
+    for (const char* sql : {"SELECT COUNT(*) FROM process_hourly_r", "SELECT COUNT(*) FROM process_daily_r",
+                            "SELECT COUNT(*) FROM process_monthly_r", "SELECT SUM(start_count) FROM process_hourly",
+                            "SELECT COUNT(*) FROM echo_dict"}) {
+        INFO(sql);
+        CHECK(rows_of(a.db, sql) == rows_of(b.db, sql));
+    }
+}
+
+TEST_CASE("v10 migration: a retired-table set that changed before the write lock fails the attempt",
+          "[echo][v10][migration][failure]") {
+    Seeded seeded;
+    seed_one_process_row(seeded);
+    auto seams = roomy_seams();
+    seams.v10_before_begin = [](sqlite3* db) { exec(db, "DROP TABLE process_live"); };
+    const auto failed = EchoDatabase::open(seeded.tmp.path, seams);
+    REQUIRE(!failed.has_value());
+    INFO(failed.error());
+    CHECK(failed.error().find("changed between the free-space check and the migration") != std::string::npos);
+    CHECK(classify_open_failure(failed.error()) == OfflineReason::migration_failed);
+}
+
+TEST_CASE("v10 migration: a deadline that has passed rolls the attempt back and a longer one succeeds",
+          "[echo][v10][migration][failure]") {
+    Seeded seeded;
+    seed_one_process_row(seeded);
+    const auto before = snapshot(seeded.tmp.path);
+
+    auto seams = roomy_seams();
+    seams.v10_deadline = std::chrono::milliseconds{0};
+    const auto failed = EchoDatabase::open(seeded.tmp.path, seams);
+    REQUIRE(!failed.has_value());
+    INFO(failed.error());
+    // The marker the plugin counts a deadline hit by is in the text.
+    CHECK(failed.error().find(std::string{kV10DeadlineMarker}) != std::string::npos);
+    CHECK(classify_open_failure(failed.error()) == OfflineReason::migration_failed);
+    check_untouched_at_v9(seeded.tmp.path, before);
+
+    auto db = open_ok(seeded.tmp.path, roomy_seams()); // the default deadline is far longer
+    CHECK(db.get_config("schema_version") == "10");
+}
+
+TEST_CASE("v10 migration: a shutdown cancel rolls the attempt back and says so",
+          "[echo][v10][migration][failure]") {
+    Seeded seeded;
+    seed_one_process_row(seeded);
+    const auto before = snapshot(seeded.tmp.path);
+
+    auto seams = roomy_seams();
+    seams.v10_cancel = [] { return true; };
+    const auto failed = EchoDatabase::open(seeded.tmp.path, seams);
+    REQUIRE(!failed.has_value());
+    INFO(failed.error());
+    CHECK(failed.error().find("cancelled by shutdown") != std::string::npos);
+    CHECK(failed.error().find(std::string{kV10DeadlineMarker}) == std::string::npos);
+    check_untouched_at_v9(seeded.tmp.path, before);
 }
 
 TEST_CASE("v10 migration: a damaged roll-up mark fails the migration and names it",

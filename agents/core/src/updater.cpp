@@ -1004,6 +1004,21 @@ void Updater::cleanup_old_binary() {
     }
 }
 
+void Updater::mark_update_verified() {
+    if (!config_.enabled) { // self-guarded: a disabled updater writes nothing beside the binary
+        return;
+    }
+    const auto marker = exe_path_.parent_path() / ".yuzu-update-verified";
+    std::ofstream out{marker};
+    out << "ok";
+    out.flush();
+    if (!out) {
+        spdlog::warn("Could not write the update verification marker '{}'", marker.string());
+        return;
+    }
+    spdlog::debug("Wrote update verification marker: {}", marker.string());
+}
+
 bool Updater::perform_startup_maintenance() {
     if (!config_.enabled) {
         return false;
@@ -1033,8 +1048,11 @@ bool Updater::rollback_if_needed() {
         return false;
     }
 
-    // Check for the verification marker written by the agent after successful
-    // registration following an update
+    // Check for the verification marker the agent writes (mark_update_verified) as soon as
+    // registration succeeds, before this check runs. So with the marker written at registration this
+    // rollback branch is reachable only when that write failed (or an earlier run's marker was
+    // never consumed): it is not a crash guard. A build that dies before it registers is never
+    // seen by this check at all.
     auto marker_path = exe_path_.parent_path() / ".yuzu-update-verified";
 
     if (fs::exists(marker_path, ec)) {

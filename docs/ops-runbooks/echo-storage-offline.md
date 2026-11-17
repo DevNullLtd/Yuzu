@@ -2,12 +2,36 @@
 
 Background: `docs/user-manual/echo.md` "The retention clock guard", issue #2361.
 
-> **There is no alert for this.** The agent has no `/metrics` endpoint, Echo's
-> guard counters are in-memory and reset on agent restart, and the offline state
-> is only visible if someone runs `echo status` against the device or opens its
-> Capture-sources frame. An endpoint whose forensic window has stopped being
-> collected is exactly the endpoint least likely to be interrogated. Treat this
-> runbook as reactive until a fleet-wide signal exists (tracked follow-up).
+> **Alert coverage.** Two different states report `storage_state|offline`:
+>
+> - **Offline at open** (`storage_state|offline|<reason>`: `free_space`, `migration_failed`,
+>   `open_failed`). The agent retries by itself (below) and the fleet sees it: heartbeat tag
+>   `yuzu.plugin.echo.storage_offline`, gauge `yuzu_fleet_echo_storage_offline{reason}`, alert
+>   `YuzuEchoStorageOffline` (held 30 minutes). See "Offline at open: the agent retries".
+> - **Wedged rollback** (bare `storage_state|offline`, the rest of this runbook). **There is no alert
+>   for this.** The agent has no `/metrics` endpoint, Echo's guard counters are in-memory and reset on
+>   agent restart, and the offline state is only visible if someone runs `echo status` against the
+>   device or opens its Capture-sources frame. An endpoint whose forensic window has stopped being
+>   collected is exactly the endpoint least likely to be interrogated. Treat this part as reactive
+>   until a fleet-wide signal exists (tracked follow-up).
+
+## Offline at open: the agent retries
+
+`echo status` replies with `error|` first and then `storage_state|offline|<reason>`:
+
+| Reason | Meaning | What to do |
+|---|---|---|
+| `free_space` | The volume holds less than twice `echo.db` plus its write-ahead log; the v10 migration was refused and nothing changed. | Free the space. The agent checks again at its next retry; no restart is needed. |
+| `migration_failed` | The v10 roll-up step failed (the agent log names the table, key or row), ran past its per-attempt deadline, or waited on an earlier migration step that had not finished. The file is untouched. | Read the agent log. A damaged mark or an out-of-range bucket needs the repair in `docs/user-manual/upgrading.md` ("Behaviour change: Echo stores roll-ups only"), made on the STOPPED agent; a lock or a full volume clears by itself. |
+| `open_failed` | Any other failure met on a retry, or collection failed to start after the database opened. | Read the agent log. If the log says the collection start failed, restart the agent. |
+
+The agent retries the open 1, 5 and 15 minutes after the first failure and then hourly, with no
+limit. Each migration attempt is bounded by a deadline (60 seconds plus 2 seconds per MiB of the
+file, doubled for every attempt that ran out of time, capped at one hour) and rolls back if it
+hits it. A failure that repeats costs a full read of the file (the integrity check) per attempt
+and, when it reaches the migration, a write-ahead log of up to 1.35 times the file; it does not
+fix itself, so repair or escalate rather than wait. Collection stays stopped until an attempt
+succeeds, then `storage_state|ok` returns on its own.
 
 ## Symptom
 

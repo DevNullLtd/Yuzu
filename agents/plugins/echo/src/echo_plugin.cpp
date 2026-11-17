@@ -33,6 +33,7 @@
 #include "echo_fold_schema.hpp"
 #include "echo_usage.hpp"
 #include "echo_fleet_snapshot.hpp"
+#include "echo_open_retry.hpp"
 #include "echo_source_health.hpp"
 #include "echo_status_format.hpp"
 #include "echo_netconn.hpp"
@@ -60,6 +61,7 @@
 #include <chrono>
 #include <filesystem>
 #include <format>
+#include <functional>
 #include <iterator>
 #include <memory>
 #include <mutex>
@@ -568,6 +570,14 @@ public:
 
     yuzu::Result<void> init(yuzu::PluginContext& ctx) override {
         plugin_ctx_ = ctx.raw();
+        // The plugin object outlives shutdown (one instance per process), so a re-init starts from
+        // a closed gate and a clean offline state.
+        online_.store(false, std::memory_order_release);
+        {
+            std::lock_guard lock(offline_mu_);
+            offline_ = {};
+        }
+        deadline_hits_ = 0;
 
         // Determine data directory
         auto data_dir = ctx.get_config("agent.data_dir");
@@ -582,25 +592,47 @@ public:
             db_dir = std::string{data_dir};
         }
 
-        auto db_path = std::filesystem::path{db_dir} / "echo.db";
-        db_path_ = db_path;
-        auto result = yuzu::echo::EchoDatabase::open(db_path);
+        db_path_ = std::filesystem::path{db_dir} / "echo.db";
+        // The first attempt is synchronous, so the agent registers only after the migration (the
+        // documented contract); it is bounded by the migration's own deadline. A failure that is
+        // not one of the retried kinds fails the plugin as it always did.
+        auto result = yuzu::echo::EchoDatabase::open(db_path_);
         if (!result) {
             // The ABI carries only the code, so this line is where the cause (a refused planted
             // file, its owner and the remedy; a corrupt-and-unmovable db) reaches the log.
             spdlog::error("ECHO: failed to open db: {}", result.error());
-            if (yuzu::echo::is_free_space_refusal(result.error())) {
-                // The v10 roll-up migration needs twice the file's size (plus its log) free and the volume has
-                // less. Nothing was changed. The plugin LOADS, offline, so `echo.status` can say why
-                // (`storage_state|offline|free_space`); no trigger is registered and nothing
-                // collects until the agent restarts with the space freed.
-                offline_detail_ = result.error();
-                return {};
+            const auto reason = yuzu::echo::classify_open_failure(result.error());
+            if (reason == yuzu::echo::OfflineReason::none) {
+                if (ctx.storage_exists(yuzu::echo::kStorageOfflineKey))
+                    ctx.storage_delete(yuzu::echo::kStorageOfflineKey);
+                return std::unexpected(yuzu::PluginError{
+                    1, std::format("ECHO: failed to open db: {}", result.error())});
             }
-            return std::unexpected(
-                yuzu::PluginError{1, std::format("ECHO: failed to open db: {}", result.error())});
+            // The v10 roll-up migration failed or lacks the free space it needs. Nothing was
+            // changed. The plugin LOADS, offline, so `echo.status` can say why
+            // (`storage_state|offline|<reason>`); no trigger is registered and nothing collects
+            // until a background retry opens the database (owner ruling 2026-11-16, #7290).
+            if (result.error().find(yuzu::echo::kV10DeadlineMarker) != std::string::npos)
+                ++deadline_hits_;
+            go_offline(reason, result.error(), 1);
+            open_retry_.start([this](unsigned attempt, const std::function<bool()>& cancelled) {
+                return retry_open(attempt, cancelled);
+            });
+            return {};
         }
         db_ = std::make_unique<yuzu::echo::EchoDatabase>(std::move(*result));
+        return start_collection(ctx);
+    }
+
+    // Everything init does once the database is open: health replay, config, triggers, the
+    // collectors and the cursor sources. Runs on the plugin-init thread, or on the retry thread
+    // when the open succeeded late. `online_` is stored LAST (release): init holds no collect_mu_,
+    // so the gate is the only guard between this thread's writes (db_, proc_stream_,
+    // nstat_client_, module_stream_, cursor_sources_, stream_active_, the triggers) and the
+    // dispatch threads that read them. No reader touches any of those before loading online_
+    // (acquire); until then dispatch answers with the offline refusal.
+    yuzu::Result<void> start_collection(yuzu::PluginContext& ctx) {
+        const auto db_dir = db_path_.parent_path();
         reconcile_db_health_publish(ctx); // #1567: replay any unpublished quarantine fact
         // #3864: a process baseline left by an earlier build holds command lines; rewrite it
         // before any trigger can run. The result is advisory (logged inside, retried next start).
@@ -742,7 +774,7 @@ public:
                     spdlog::info(
                         "ECHO: boot-backfill already done this boot (agent restart) — skipped");
                 } else {
-                    const auto etl = (std::filesystem::path{db_dir} / "procboot.etl").string();
+                    const auto etl = (db_dir / "procboot.etl").string();
                     std::error_code ec;
                     if (!std::filesystem::exists(etl, ec)) {
                         // Normal on any install without the boot AutoLogger — e.g.
@@ -1066,11 +1098,25 @@ public:
         std::erase_if(cursor_sources_, [](const auto& s) { return s == nullptr; });
 
         spdlog::info("Echo plugin initialized (fast={}s, slow={}s, db={})", fast_interval,
-                     slow_interval, db_path.string());
+                     slow_interval, db_path_.string());
+        // Leave the offline state and open the dispatch gate, in that order, last.
+        if (ctx.storage_exists(yuzu::echo::kStorageOfflineKey))
+            ctx.storage_delete(yuzu::echo::kStorageOfflineKey);
+        {
+            std::lock_guard lock(offline_mu_);
+            offline_ = {};
+        }
+        online_.store(true, std::memory_order_release);
         return {};
     }
 
     void shutdown(yuzu::PluginContext& ctx) noexcept override {
+        // FIRST: end the open-retry thread (it cancels a migration in flight). After the join no
+        // other thread writes db_ or the collector members.
+        open_retry_.stop();
+        // Close the dispatch gate before anything below is torn down: a late action answers
+        // "not initialized" instead of reading a collector that is being stopped.
+        online_.store(false, std::memory_order_release);
         ctx.unregister_trigger("echo.fast");
         ctx.unregister_trigger("echo.slow");
         ctx.unregister_trigger("echo.perf");
@@ -1162,7 +1208,7 @@ public:
         // Ask for the rollback FIRST (it is noexcept and logs its own result): the logger and
         // the output sink can throw, and a swallowed throw must not skip the rollback request
         // for a transaction the unwind left open on the shared connection.
-        if (db_)
+        if (online_.load(std::memory_order_acquire) && db_)
             db_->rollback_open_transaction();
         try {
             // what() stays in the log only; the wire line is a fixed token because the text can
@@ -1176,12 +1222,21 @@ public:
     }
 
     int execute_dispatch(yuzu::CommandContext& ctx, std::string_view action, yuzu::Params params) {
-        if (!db_) {
-            if (!offline_detail_.empty()) {
-                // Loaded but offline (the migration was refused): `status` explains, every other
-                // action refuses with the same error. `error|` leads, as format_storage_*_lines
-                // pins.
-                const auto lines = yuzu::echo::format_storage_refused_lines(offline_detail_);
+        if (!online_.load(std::memory_order_acquire)) {
+            OfflineState offline;
+            {
+                std::lock_guard lock(offline_mu_);
+                offline = offline_;
+            }
+            if (offline.reason != yuzu::echo::OfflineReason::none) {
+                // Loaded but offline (the open failed and is being retried): `status` explains,
+                // every other action refuses with the same error. `error|` leads, as
+                // format_storage_*_lines pins. While an attempt is running next_attempt is in the
+                // past, so the wait clamps to 0 and line 0 reads "Retrying now."
+                const auto wait = std::chrono::duration_cast<std::chrono::seconds>(
+                    offline.next_attempt - std::chrono::steady_clock::now());
+                const auto lines = yuzu::echo::format_storage_refused_lines(
+                    offline.reason, offline.detail, std::max(wait, std::chrono::seconds{0}));
                 for (std::size_t i = 0; i < lines.size(); ++i)
                     if (i == 0 || action == "status")
                         ctx.write_output(lines[i]);
@@ -1353,6 +1408,87 @@ public:
             spdlog::warn("ECHO: failed to publish db quarantine identity; will retry");
     }
 
+    // Record the offline state (the reason `status` reports and the time of the next attempt), publish
+    // the heartbeat tag the fleet gauge reads, and log one line. `failed_attempts` counts the
+    // attempts that have failed so far (init's own is 1), which also picks the next back-off.
+    void go_offline(yuzu::echo::OfflineReason reason, std::string detail, unsigned failed_attempts) {
+        const auto delay = yuzu::echo::open_retry_delay(failed_attempts);
+        {
+            std::lock_guard lock(offline_mu_);
+            offline_.reason = reason;
+            offline_.detail = detail;
+            offline_.next_attempt = std::chrono::steady_clock::now() + delay;
+        }
+        yuzu::PluginContext pctx{plugin_ctx_};
+        if (!pctx.storage_set(yuzu::echo::kStorageOfflineKey, yuzu::echo::offline_reason_token(reason)))
+            spdlog::warn("ECHO: failed to publish the storage-offline heartbeat tag");
+        spdlog::warn("ECHO: storage offline ({}): {}; the open is retried in {} s",
+                     yuzu::echo::offline_reason_token(reason), detail, delay.count());
+    }
+
+    // One background open attempt (the retry thread). Returns true when the loop should end: the
+    // database opened and collection started, or start_collection threw (a second start over a
+    // half-started source set would double-start sources; a restart recovers and `status` says why).
+    bool retry_open(unsigned attempt, const std::function<bool()>& cancelled) {
+        yuzu::echo::OfflineReason prior;
+        std::string prior_detail;
+        {
+            std::lock_guard lock(offline_mu_);
+            prior = offline_.reason;
+            prior_detail = offline_.detail;
+        }
+        std::error_code ec;
+        const auto file_bytes = std::filesystem::file_size(db_path_, ec);
+        const std::int64_t size = ec ? 0 : static_cast<std::int64_t>(file_bytes);
+        if (prior == yuzu::echo::OfflineReason::free_space && !ec) {
+            // Skip the open while the space is still short: every open runs a whole-file
+            // integrity_check first, which a full-disk agent would repeat for nothing. The need is
+            // the migration's own: twice the file plus its write-ahead log.
+            const auto wal = yuzu::echo::wal_file_bytes(db_path_).value_or(0);
+            std::error_code space_ec;
+            const auto space = std::filesystem::space(db_path_.parent_path(), space_ec);
+            if (!space_ec && space.available < 2 * file_bytes + static_cast<std::uintmax_t>(wal)) {
+                go_offline(yuzu::echo::OfflineReason::free_space, prior_detail, attempt);
+                return false;
+            }
+        }
+
+        yuzu::echo::OpenSeams seams;
+        seams.v10_cancel = cancelled;
+        seams.v10_deadline = std::chrono::duration_cast<std::chrono::milliseconds>(
+            yuzu::echo::v10_migration_deadline(size, deadline_hits_));
+        auto result = yuzu::echo::EchoDatabase::open(db_path_, seams);
+        if (cancelled())
+            return true; // shutting down: drop the result (closing it), start nothing
+        if (!result) {
+            auto reason = yuzu::echo::classify_open_failure(result.error());
+            if (reason == yuzu::echo::OfflineReason::none)
+                reason = yuzu::echo::OfflineReason::open_failed;
+            if (result.error().find(yuzu::echo::kV10DeadlineMarker) != std::string::npos)
+                ++deadline_hits_;
+            go_offline(reason, result.error(), attempt);
+            return false;
+        }
+        db_ = std::make_unique<yuzu::echo::EchoDatabase>(std::move(*result));
+        yuzu::PluginContext pctx{plugin_ctx_};
+        try {
+            if (auto started = start_collection(pctx); !started) {
+                go_offline(yuzu::echo::OfflineReason::open_failed,
+                           "collection start failed after the database opened", attempt);
+                return true;
+            }
+        } catch (const std::exception& e) {
+            go_offline(yuzu::echo::OfflineReason::open_failed,
+                       std::format("collection start failed: {}", e.what()), attempt);
+            return true;
+        } catch (...) {
+            go_offline(yuzu::echo::OfflineReason::open_failed, "collection start failed", attempt);
+            return true;
+        }
+        spdlog::info("ECHO: the database opened on retry {}; Echo is online", attempt - 1);
+        return true;
+    }
+
 private:
     YuzuPluginContext* plugin_ctx_{nullptr};
     std::mutex health_mu_;
@@ -1363,11 +1499,23 @@ private:
     // Guarded by collect_mu_.
     bool proc_poll_seed_pending_{false};
     std::unique_ptr<yuzu::echo::EchoDatabase> db_;
-    // Set when the database could not be opened because the v10 migration needs more free disk
-    // space than the volume has (the plugin loads, offline): the open error's text, which `status`
-    // reports as `storage_state|offline|free_space`. Empty on every other path. Written once in
-    // init(), before any action runs.
-    std::string offline_detail_;
+    // The dispatch gate. False until start_collection has finished (see the invariant there): while
+    // false every action answers with the offline refusal (or "not initialized") and nothing reads
+    // db_ or a collector member. Stored true (release) exactly once, as start_collection's last
+    // statement.
+    std::atomic<bool> online_{false};
+    // Why the plugin is offline and when the retry thread next tries, for `status`. Guarded by
+    // offline_mu_ (written by init and the retry thread, read by dispatch threads).
+    struct OfflineState {
+        yuzu::echo::OfflineReason reason{yuzu::echo::OfflineReason::none};
+        std::string detail; // the open error's text
+        std::chrono::steady_clock::time_point next_attempt{};
+    };
+    std::mutex offline_mu_;
+    OfflineState offline_;
+    // Attempts that ended on the migration deadline; each doubles the next deadline. Touched by init
+    // (before the retry thread starts) and then only by the retry thread.
+    unsigned deadline_hits_{0};
     std::mutex collect_mu_; // Protects the state read-diff-write sequence in collect methods
     // Separate mutex for the software source: its state read-diff-write touches
     // only the "software" KV state (never prev_perf_/prev_proc_/proc_stream_), and
@@ -4837,6 +4985,10 @@ private:
         ctx.write_output(std::format("__total__|{}", result.rows.size()));
         return 0;
     }
+
+    // Declared LAST so it is destroyed first: its destructor joins the retry thread, which uses
+    // the members above.
+    yuzu::echo::OpenRetryLoop open_retry_;
 };
 
 YUZU_PLUGIN_EXPORT(EchoPlugin)

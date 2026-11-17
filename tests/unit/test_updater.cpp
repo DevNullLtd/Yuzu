@@ -197,6 +197,76 @@ TEST_CASE("rollback_if_needed returns true when .old exists but NO verified mark
     REQUIRE_FALSE(fs::exists(old_path));
 }
 
+TEST_CASE("a registered build is not rolled back: mark_update_verified before the startup check",
+          "[updater][rollback]") {
+    TempUpdaterDir tmp("rollback_registered");
+    const auto& dir = tmp.guard.path;
+
+#ifdef _WIN32
+    auto exe_path = dir / "yuzu-agent.exe";
+    auto old_path = dir / "yuzu-agent.old.exe";
+#else
+    auto exe_path = dir / "yuzu-agent";
+    auto old_path = dir / "yuzu-agent.old";
+#endif
+    auto marker_path = dir / ".yuzu-update-verified";
+
+    write_fake_binary(exe_path);
+    write_fake_binary(old_path);
+    REQUIRE_FALSE(fs::exists(marker_path)); // this run's marker is not there until Register succeeds
+
+    UpdateConfig config;
+    Updater updater(config, "test-agent", "0.1.0", "windows", "x86_64", exe_path);
+
+    updater.mark_update_verified(); // the agent calls this right after Register succeeds
+    REQUIRE(fs::exists(marker_path));
+
+    REQUIRE_FALSE(updater.perform_startup_maintenance());
+    REQUIRE(fs::exists(exe_path));          // still the new binary
+    REQUIRE_FALSE(fs::exists(old_path));    // the old one was cleaned up, not promoted
+    REQUIRE_FALSE(fs::exists(marker_path)); // and the marker consumed
+}
+
+TEST_CASE("without mark_update_verified the same layout still rolls back", "[updater][rollback]") {
+    TempUpdaterDir tmp("rollback_unregistered");
+    const auto& dir = tmp.guard.path;
+
+#ifdef _WIN32
+    auto exe_path = dir / "yuzu-agent.exe";
+    auto old_path = dir / "yuzu-agent.old.exe";
+#else
+    auto exe_path = dir / "yuzu-agent";
+    auto old_path = dir / "yuzu-agent.old";
+#endif
+
+    write_fake_binary(exe_path);
+    write_fake_binary(old_path);
+
+    UpdateConfig config;
+    Updater updater(config, "test-agent", "0.1.0", "windows", "x86_64", exe_path);
+
+    REQUIRE(updater.perform_startup_maintenance()); // the contrast: no marker, so it rolls back
+    REQUIRE_FALSE(fs::exists(old_path));
+}
+
+TEST_CASE("mark_update_verified writes nothing when the updater is disabled", "[updater][rollback]") {
+    TempUpdaterDir tmp("rollback_marker_disabled");
+    const auto& dir = tmp.guard.path;
+#ifdef _WIN32
+    auto exe_path = dir / "yuzu-agent.exe";
+#else
+    auto exe_path = dir / "yuzu-agent";
+#endif
+    write_fake_binary(exe_path);
+
+    UpdateConfig config;
+    config.enabled = false; // the no-write mode (a sealed macOS bundle must not gain a file)
+    Updater updater(config, "test-agent", "0.1.0", "windows", "x86_64", exe_path);
+
+    updater.mark_update_verified();
+    REQUIRE_FALSE(fs::exists(dir / ".yuzu-update-verified"));
+}
+
 #ifndef _WIN32
 // PR #4482 governance ch-4: a .old another account could have written is never
 // promoted to the executable, whether group/world-writable or a symlink.

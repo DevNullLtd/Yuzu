@@ -2275,6 +2275,11 @@ public:
                     current_executable_path());
                 set_updater(updater);
 
+                // Register has succeeded, so this build is working: mark it verified BEFORE the
+                // rollback check below, which is the only one and which consumes the marker. (The
+                // marker used to be written at the first command read, after this check, so the
+                // check never saw this run's marker and a registered build could be rolled back.)
+                updater->mark_update_verified();
                 if (updater->perform_startup_maintenance()) {
                     spdlog::warn("OTA rollback was triggered - running previous binary");
                 }
@@ -3528,7 +3533,6 @@ public:
                 // Command replay protection is now durable (command_dedup_, HA
                 // WS-0): it survives reconnect AND restart, so there is no
                 // per-connection reset here.
-                bool update_verified = false;
                 pb::CommandRequest cmd;
                 while (stream->Read(&cmd)) {
                     if (stop_requested_.load(std::memory_order_acquire))
@@ -3619,15 +3623,6 @@ public:
                         // in-flight record (resolved at a terminal write below or
                         // released if the dispatch queue is full); Error runs
                         // undeduplicated for this one command.
-                    }
-
-                    // Write health marker after first successful read (OTA rollback guard)
-                    if (cfg_.auto_update && !update_verified) {
-                        update_verified = true;
-                        auto marker =
-                            current_executable_path().parent_path() / ".yuzu-update-verified";
-                        std::ofstream{marker} << "ok";
-                        spdlog::debug("Wrote update verification marker: {}", marker.string());
                     }
 
                     spdlog::info("Received command: plugin={}, action={}, id={}", cmd.plugin(),

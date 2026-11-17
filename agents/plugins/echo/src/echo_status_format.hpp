@@ -19,7 +19,9 @@
  * exists to let a test assert. See `echo.yaml` and `docs/user-manual/echo.md`.
  */
 
+#include <chrono>
 #include <cstdint>
+#include <format>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -61,18 +63,69 @@ inline constexpr std::string_view kFreeSpaceRefusalPrefix = "not enough free dis
     return open_error.find(kFreeSpaceRefusalPrefix) != std::string_view::npos;
 }
 
-/// The complete `echo status` reply when the database was never opened because the migration was
-/// refused for lack of free disk space, in the order it must be written (`error|` FIRST, for the
-/// reason format_storage_offline_lines documents). The reason is always `free_space`; `detail` is
-/// the open error, which names the two figures. The plugin has loaded but nothing collects and no
-/// trigger is registered: restart the agent once the space is freed.
-[[nodiscard]] inline std::vector<std::string> format_storage_refused_lines(std::string_view detail) {
+/// The prefixes of EchoDatabase::open's two refusals that mean the v10 roll-up step did not
+/// complete (echo_db.cpp builds both messages from these, so the text and the classifier cannot
+/// drift): the step itself failed, or an earlier migration step had not finished so the roll-up
+/// step waited. Both leave the database untouched at its old schema version.
+inline constexpr std::string_view kV10MigrationFailedPrefix = "v10 roll-up migration failed";
+inline constexpr std::string_view kEarlierStepPrefix = "an earlier migration step did not finish";
+/// Inside the v10 failure text when the attempt hit its wall-clock deadline (echo_db_v10_migration.cpp
+/// builds the message from this; the retry loop counts a hit by finding it, to double the next deadline).
+inline constexpr std::string_view kV10DeadlineMarker = "did not finish inside its";
+
+/// Why Echo loaded offline at open (the plugin is present, nothing collects, the open is retried).
+/// `none` = the failure is not one of the retried kinds and `init` fails as it always did.
+/// The tokens are mirrored by server/core/src/echo_storage_offline_tag.hpp.
+enum class OfflineReason { none, free_space, migration_failed, open_failed };
+
+[[nodiscard]] constexpr std::string_view offline_reason_token(OfflineReason reason) noexcept {
+    switch (reason) {
+    case OfflineReason::free_space:
+        return "free_space";
+    case OfflineReason::migration_failed:
+        return "migration_failed";
+    case OfflineReason::open_failed:
+        return "open_failed";
+    case OfflineReason::none:
+        break;
+    }
+    return "";
+}
+
+/// The plugin KV key the agent's heartbeat bridge publishes as the status tag
+/// `yuzu.plugin.echo.storage_offline` (agents/core plugin_heartbeat_tags.hpp); its value is the
+/// reason token. The server's fleet gauge (server/core/src/echo_storage_offline_tag.hpp) mirrors
+/// the tag and the three tokens as literals; a test on each side pins them.
+inline constexpr std::string_view kStorageOfflineKey = "heartbeat.storage_offline";
+
+/// Tell the retried open failures from every other one by their text. The free-space refusal is
+/// checked first: its text is nested inside the v10 wrapper.
+[[nodiscard]] inline OfflineReason classify_open_failure(std::string_view open_error) {
+    if (is_free_space_refusal(open_error))
+        return OfflineReason::free_space;
+    if (open_error.find(kV10MigrationFailedPrefix) != std::string_view::npos ||
+        open_error.find(kEarlierStepPrefix) != std::string_view::npos)
+        return OfflineReason::migration_failed;
+    return OfflineReason::none;
+}
+
+/// The complete `echo status` reply when the database is not open because an open failed with a
+/// retried reason, in the order it must be written (`error|` FIRST, for the reason
+/// format_storage_offline_lines documents). `detail` is the open error. The plugin has loaded but
+/// nothing collects and no trigger is registered; the open is retried automatically.
+[[nodiscard]] inline std::vector<std::string>
+format_storage_refused_lines(OfflineReason reason, std::string_view detail,
+                             std::chrono::seconds next_retry_in) {
+    const auto retry = next_retry_in.count() > 0
+                           ? std::format("The next attempt is in about {} s.", next_retry_in.count())
+                           : std::string{"Retrying now."};
     return {
         std::string{"error|Echo storage is offline on this endpoint: "}
             .append(detail)
             .append(". Collection and retention are stopped and the database was not changed. "
-                    "Restart the agent after freeing the space."),
-        "storage_state|offline|free_space",
+                    "The open is retried automatically. ")
+            .append(retry),
+        std::format("storage_state|offline|{}", offline_reason_token(reason)),
     };
 }
 
