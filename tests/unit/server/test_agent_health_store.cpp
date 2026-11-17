@@ -34,6 +34,7 @@
 #include "plugin_init_failed_labels.hpp" // SHIPPED catalogue bound + rejected-gauge names
 #include "spark_fleet_tags.hpp"   // SHIPPED spark helpers (no parallel repro)
 #include "echo_corruption_audit.hpp" // #1567 SHIPPED audit gate + tag keys
+#include "echo_storage_offline_tag.hpp" // #7290 SHIPPED storage-offline tag + parser
 
 #include <yuzu/metrics.hpp>
 
@@ -1626,6 +1627,126 @@ TEST_CASE("REAL AgentHealthStore: a torn arm-gauge pair (one key present, its "
     CHECK(unlabelled_series(out, "yuzu_fleet_guardian_arm_tag_rejected") == 0.0);
 }
 
+// ── Guardian baseline-persistence rollup (#5605) ───────────────────────────────────
+// Three SUM gauges (unpersisted / rebaselined_at_boot / persist_failures), each absent-not-zero,
+// plus _reporting (keyed on the unpersisted tag ONLY) and _tag_rejected, both published every
+// sweep including 0.
+
+TEST_CASE("REAL AgentHealthStore: guardian baseline tags sum into unlabelled fleet gauges and "
+          "_reporting counts only agents that carried the unpersisted tag",
+          "[guardian][baseline][fleet][rollup][real]") {
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+
+    auto beat = [&](const std::string& id,
+                    const std::vector<std::pair<std::string, std::string>>& kv) {
+        google::protobuf::Map<std::string, std::string> tags;
+        tags["yuzu.os"] = "linux";
+        for (const auto& [k, v] : kv)
+            tags[k] = v;
+        store.upsert(id, tags);
+    };
+
+    beat("s1", {{"yuzu.guardian_baseline_unpersisted", "2"}});
+    beat("s2", {{"yuzu.guardian_baseline_unpersisted", "3"},
+                {"yuzu.guardian_baseline_rebaselined_at_boot", "1"}});
+    // A legacy agent (prefer_spark off) emits only the cumulative counter: it feeds that gauge
+    // but must NOT count toward _reporting, the denominator of the unpersisted gauge.
+    beat("legacy", {{"yuzu.guardian_baseline_persist_failures", "4"}});
+
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    const std::string out = metrics.serialize();
+
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_baseline_unpersisted") == 5.0);
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_baseline_rebaselined_at_boot") == 1.0);
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_baseline_persist_failures") == 4.0);
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_baseline_reporting") == 2.0); // not 3
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_baseline_tag_rejected") == 0.0);
+    // No agent-controlled label anywhere in this family.
+    CHECK(out.find("yuzu_fleet_guardian_baseline_unpersisted{") == std::string::npos);
+}
+
+TEST_CASE("REAL AgentHealthStore: a malformed baseline tag is counted as rejected and excluded "
+          "from its sum",
+          "[guardian][baseline][fleet][rollup][real]") {
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+
+    google::protobuf::Map<std::string, std::string> honest;
+    honest["yuzu.os"] = "linux";
+    honest["yuzu.guardian_baseline_unpersisted"] = "4";
+    store.upsert("honest", honest);
+
+    google::protobuf::Map<std::string, std::string> rogue;
+    rogue["yuzu.os"] = "linux";
+    rogue["yuzu.guardian_baseline_unpersisted"] = "abc";
+    store.upsert("rogue", rogue);
+
+    google::protobuf::Map<std::string, std::string> huge;
+    huge["yuzu.os"] = "linux";
+    huge["yuzu.guardian_baseline_persist_failures"] = "1000000001"; // above the 1e9 ceiling
+    store.upsert("huge", huge);
+
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    const std::string out = metrics.serialize();
+
+    // Rejected, not clamped: the honest agent's 4 survives; the rogue is not in _reporting.
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_baseline_unpersisted") == 4.0);
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_baseline_reporting") == 1.0);
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_baseline_tag_rejected") == 2.0);
+    CHECK_FALSE(has_unlabelled_series(out, "yuzu_fleet_guardian_baseline_persist_failures"));
+}
+
+TEST_CASE("REAL AgentHealthStore: guardian baseline gauges go absent (not zero) when nobody "
+          "reports, and a stale reporter ages out; the meta gauges still publish 0",
+          "[guardian][baseline][fleet][rollup][real]") {
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+
+    google::protobuf::Map<std::string, std::string> tags;
+    tags["yuzu.os"] = "linux";
+    tags["yuzu.guardian_baseline_unpersisted"] = "6";
+    tags["yuzu.guardian_baseline_rebaselined_at_boot"] = "2";
+    tags["yuzu.guardian_baseline_persist_failures"] = "3";
+    store.upsert("a1", tags);
+
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    auto out = metrics.serialize();
+    REQUIRE(unlabelled_series(out, "yuzu_fleet_guardian_baseline_unpersisted") == 6.0);
+    REQUIRE(unlabelled_series(out, "yuzu_fleet_guardian_baseline_reporting") == 1.0);
+
+    // The reporter is now beyond the staleness window: all three SUM gauges must vanish (the
+    // clear at the top of the sweep), never linger or turn into a fabricated 0.
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    store.recompute_metrics(metrics, std::chrono::seconds{0});
+    out = metrics.serialize();
+    CHECK_FALSE(has_unlabelled_series(out, "yuzu_fleet_guardian_baseline_unpersisted"));
+    CHECK_FALSE(has_unlabelled_series(out, "yuzu_fleet_guardian_baseline_rebaselined_at_boot"));
+    CHECK_FALSE(has_unlabelled_series(out, "yuzu_fleet_guardian_baseline_persist_failures"));
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_baseline_reporting") == 0.0);
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_baseline_tag_rejected") == 0.0);
+}
+
+TEST_CASE("REAL AgentHealthStore: an explicit baseline unpersisted 0 publishes as zero, not "
+          "absent",
+          "[guardian][baseline][fleet][rollup][real]") {
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+
+    google::protobuf::Map<std::string, std::string> tags;
+    tags["yuzu.os"] = "linux";
+    tags["yuzu.guardian_baseline_unpersisted"] = "0";
+    store.upsert("clean", tags);
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+
+    const std::string out = metrics.serialize();
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_baseline_unpersisted") == 0.0);
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_baseline_reporting") == 1.0);
+    // The sparse rows were not reported, so they stay absent.
+    CHECK_FALSE(has_unlabelled_series(out, "yuzu_fleet_guardian_baseline_rebaselined_at_boot"));
+    CHECK_FALSE(has_unlabelled_series(out, "yuzu_fleet_guardian_baseline_persist_failures"));
+}
+
 // ── Guardian M1 health-stream rollup (#2298 gate 3, item 6d) ──────────────────────
 // Same coverage set as the journal family above, scoped to the 3-counter table.
 
@@ -1901,6 +2022,73 @@ TEST_CASE("REAL AgentHealthStore: yuzu_fleet_echo_db_corruption_agents counts va
     beat_tags(store, "e", {{k, "-1"}});
     store.recompute_metrics(metrics, std::chrono::seconds{300});
     CHECK(series_val(metrics.serialize(), "yuzu_fleet_echo_db_corruption_agents ") == 1.0);
+}
+
+// #7290: Echo loaded offline (a failed or space-starved v10 migration, retried by the agent). The
+// agent's heartbeat tag maps to a CLOSED label set; the strings below are pinned literally and
+// mirror agents/plugins/echo/src/echo_status_format.hpp's offline_reason_token().
+TEST_CASE("REAL AgentHealthStore: yuzu_fleet_echo_storage_offline counts agents by reason, 0 included",
+          "[health_store][echo][storage_offline][real]") {
+    AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+    const char* const k = "yuzu.plugin.echo.storage_offline";
+    const auto gauge = [&](const char* reason) {
+        return series_val(metrics.serialize(),
+                          std::string{"yuzu_fleet_echo_storage_offline{reason=\""} + reason + "\"} ");
+    };
+    beat_tags(store, "a", {{k, "free_space"}});
+    beat_tags(store, "b", {{k, "migration_failed"}});
+    beat_tags(store, "c", {{k, "migration_failed"}});
+    beat_tags(store, "d", {{k, "open_failed"}});
+    beat_tags(store, "e", {});
+    beat_tags(store, "f", {{k, ""}});
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    CHECK(gauge("free_space") == 1.0);
+    CHECK(gauge("migration_failed") == 2.0);
+    CHECK(gauge("open_failed") == 1.0);
+    CHECK(gauge("unknown") == 0.0);
+
+    // An agent that recovers (its next heartbeat drops the tag) leaves the count.
+    beat_tags(store, "b", {});
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    CHECK(gauge("migration_failed") == 1.0);
+
+    // Every snapshot pruned: all four series are still PUBLISHED, at 0 (server-owned counts).
+    store.recompute_metrics(metrics, std::chrono::seconds{0});
+    CHECK(gauge("free_space") == 0.0);
+    CHECK(gauge("migration_failed") == 0.0);
+    CHECK(gauge("open_failed") == 0.0);
+    CHECK(gauge("unknown") == 0.0);
+}
+
+TEST_CASE("REAL AgentHealthStore: an unrecognised storage-offline value counts under unknown, never as a new label",
+          "[health_store][echo][storage_offline][real]") {
+    AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+    const char* const k = "yuzu.plugin.echo.storage_offline";
+    beat_tags(store, "a", {{k, "disk_on_fire"}});
+    beat_tags(store, "b", {{k, std::string(4096, 'x')}});
+    beat_tags(store, "c", {{k, "migration_failed\nINJECTED"}});
+    beat_tags(store, "d", {{k, "Free_Space"}}); // the match is exact and case sensitive
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    const auto text = metrics.serialize();
+    CHECK(series_val(text, "yuzu_fleet_echo_storage_offline{reason=\"unknown\"} ") == 4.0);
+    CHECK(series_val(text, "yuzu_fleet_echo_storage_offline{reason=\"free_space\"} ") == 0.0);
+    CHECK(series_val(text, "yuzu_fleet_echo_storage_offline{reason=\"migration_failed\"} ") == 0.0);
+    CHECK(text.find("disk_on_fire") == std::string::npos);
+    CHECK(text.find("INJECTED") == std::string::npos);
+}
+
+TEST_CASE("parse_echo_storage_offline: the tag and the three tokens are pinned, anything else is unknown",
+          "[health_store][echo][storage_offline]") {
+    using namespace yuzu::server::detail;
+    CHECK(std::string_view{kEchoTagStorageOffline} == "yuzu.plugin.echo.storage_offline");
+    CHECK(parse_echo_storage_offline("free_space") == std::optional<std::size_t>{0});
+    CHECK(parse_echo_storage_offline("migration_failed") == std::optional<std::size_t>{1});
+    CHECK(parse_echo_storage_offline("open_failed") == std::optional<std::size_t>{2});
+    CHECK(parse_echo_storage_offline("") == std::nullopt);
+    CHECK(parse_echo_storage_offline("garbage") == std::optional<std::size_t>{3});
+    CHECK(kEchoStorageOfflineReasons[3] == "unknown");
 }
 
 // The corruption gate and the fleet gauge read the `yuzu.plugin.echo.` tag keys only: the retired

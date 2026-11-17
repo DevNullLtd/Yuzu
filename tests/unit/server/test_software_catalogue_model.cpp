@@ -580,6 +580,161 @@ TEST_CASE("read_devices_page: push-down and TOP read once and mint skip 0",
     }
 }
 
+namespace {
+
+// Walks `read_scoped_step` from the head to the end of the data, the way the streamed export does.
+struct StepWalk {
+    std::vector<std::int64_t> served; ///< install ids, in the order served
+    std::vector<std::int64_t> resumed_at; ///< install id of each resume position, in step order
+    int steps{0};
+    std::int64_t max_skip{0}; ///< the largest OFFSET any store read was handed
+    bool degraded{false};
+};
+
+StepWalk walk_steps(FakeDevices& f, int limit, const VisibleSet& scope) {
+    StepWalk w;
+    const DevicesReader inner = f.reader();
+    const DevicesReader read = [&](const SoftwareFleetQuery& q) {
+        w.max_skip = std::max(w.max_skip, q.skip);
+        return inner(q);
+    };
+    SoftwareCursor at{}; // the head
+    while (w.steps < 1000) {
+        ++w.steps;
+        auto step = read_scoped_step<DevicesOps>(read, dreq(limit).query, at, scope);
+        if (!step) {
+            w.degraded = true;
+            break;
+        }
+        CHECK(step->page.next_cursor.empty()); // no cursor is ever minted on this path
+        for (const auto& r : step->page.rows)
+            w.served.push_back(r.install_id);
+        if (!step->resume)
+            break;
+        w.resumed_at.push_back(step->resume->install_id);
+        at = *step->resume;
+    }
+    return w;
+}
+
+} // namespace
+
+TEST_CASE("read_scoped_step: the wide path resumes after the last SCANNED row, with skip 0",
+          "[server][software_catalogue_model]") {
+    FakeDevices f;
+    f.keyset = true;
+    const auto scope = wide_scope("m");
+
+    SECTION("bound reached: the resume is the last row of the final read, not the last served") {
+        // The same data as the page-mode test above: m1, then z2..z9 under another name.
+        f.rows = {fleet_row("git", "m", 1)};
+        for (int i = 2; i <= 9; ++i)
+            f.rows.push_back(fleet_row("hub", "z", i, "9.9"));
+        auto step = read_scoped_step<DevicesOps>(f.reader(), dreq(2).query, SoftwareCursor{}, scope);
+        REQUIRE(step);
+        CHECK(f.reads == kWideScopeMaxReads);
+        REQUIRE(step->page.rows.size() == 1);
+        REQUIRE(step->resume.has_value());
+        // read 4 was {z7, z8}: the walk resumes after z8. The page-mode cursor for the same read
+        // is (git/m/1, skip 7) - an anchor and a count, never this key.
+        CHECK(step->resume->name == "hub");
+        CHECK(step->resume->agent_id == "z");
+        CHECK(step->resume->install_id == 8);
+        CHECK(f.seen.skip == 0);
+        // From there the walk reads z9 (a short read) and ends.
+        f.reads = 0;
+        auto last = read_scoped_step<DevicesOps>(f.reader(), dreq(2).query, *step->resume, scope);
+        REQUIRE(last);
+        CHECK(last->page.rows.empty());
+        CHECK_FALSE(last->resume.has_value());
+        REQUIRE(f.seen.after.has_value());
+        CHECK(f.seen.after->install_id == 8);
+        CHECK(f.seen.skip == 0);
+    }
+
+    SECTION("a long hidden run is walked with skip 0 throughout and the late rows arrive") {
+        for (int i = 1; i <= 100; ++i)
+            f.rows.push_back(fleet_row("git", "z", i));
+        f.rows.push_back(fleet_row("zed", "m", 101));
+        f.rows.push_back(fleet_row("zed", "m", 102));
+        const auto w = walk_steps(f, 2, scope);
+        CHECK_FALSE(w.degraded);
+        CHECK(w.served == std::vector<std::int64_t>{101, 102});
+        CHECK(w.max_skip == 0);
+        CHECK(w.steps > 10); // many bounded steps, not one
+    }
+
+    SECTION("a page that fills mid-read resumes after the last SERVED row and loses nothing") {
+        // limit 4. Read 1 is {m1, z2, z3, z4}; read 2 is {m5, m6, m7, m8}, so the page fills on m7
+        // with m8 still unscanned in that read: resuming after the read's last row would drop it.
+        const std::unordered_set<int> own{1, 5, 6, 7, 8, 10, 12};
+        for (int i = 1; i <= 12; ++i)
+            f.rows.push_back(fleet_row(std::string(i < 10 ? "n0" : "n") + std::to_string(i),
+                                       own.contains(i) ? "m" : "z", i));
+        auto first = read_scoped_step<DevicesOps>(f.reader(), dreq(4).query, SoftwareCursor{}, scope);
+        REQUIRE(first);
+        CHECK(f.reads == 2);
+        REQUIRE(first->page.rows.size() == 4);
+        REQUIRE(first->resume.has_value());
+        CHECK(first->resume->install_id == 7); // the last served row, never m8 (the read's last)
+        CHECK(first->resume->name == "n07");
+
+        f.reads = 0;
+        const auto w = walk_steps(f, 4, scope);
+        CHECK_FALSE(w.degraded);
+        CHECK(w.served == std::vector<std::int64_t>{1, 5, 6, 7, 8, 10, 12}); // each once, in order
+        CHECK(w.max_skip == 0);
+    }
+
+    SECTION("an exact multiple of the page size ends on the empty step, not early") {
+        f.rows = {fleet_row("git", "m", 1), fleet_row("git", "m", 2), fleet_row("git", "m", 3),
+                  fleet_row("git", "m", 4)};
+        const auto w = walk_steps(f, 2, scope);
+        CHECK(w.served == std::vector<std::int64_t>{1, 2, 3, 4});
+        CHECK(w.steps == 3); // {1,2} {3,4} {} - a full page is never taken for the end
+        CHECK(w.max_skip == 0);
+    }
+}
+
+TEST_CASE("read_scoped_step: push-down and TOP walk to the end and read once per step",
+          "[server][software_catalogue_model]") {
+    FakeDevices f;
+    f.keyset = true;
+    f.rows = run_of("a", 1, 5);
+    for (const VisibleSet& scope :
+         {VisibleSet{std::nullopt}, VisibleSet{std::unordered_set<std::string>{"a"}}}) {
+        f.reads = 0;
+        const auto w = walk_steps(f, 2, scope);
+        CHECK_FALSE(w.degraded);
+        CHECK(w.served == std::vector<std::int64_t>{1, 2, 3, 4, 5});
+        CHECK(w.resumed_at == std::vector<std::int64_t>{2, 4}); // the last row of each full page
+        CHECK(w.steps == 3);
+        CHECK(f.reads == 3); // one store read per step
+        CHECK(w.max_skip == 0);
+    }
+}
+
+TEST_CASE("read_scoped_step: a degraded read is nullopt and a denied target reads nothing",
+          "[server][software_catalogue_model]") {
+    FakeDevices f;
+    f.rows = {fleet_row("git", "a", 1)};
+    SECTION("degraded, push-down and wide alike") {
+        f.ok = false;
+        CHECK_FALSE(read_scoped_step<DevicesOps>(f.reader(), dreq(2).query, SoftwareCursor{}, std::nullopt));
+        CHECK_FALSE(read_scoped_step<DevicesOps>(f.reader(), dreq(2).query, SoftwareCursor{}, wide_scope("a")));
+    }
+    SECTION("a named agent_id outside the scope: the empty denied step, no read, no resume") {
+        auto query = dreq(2).query;
+        query.agent_id = "z";
+        auto step = read_scoped_step<DevicesOps>(f.reader(), query, SoftwareCursor{}, wide_scope("a"));
+        REQUIRE(step);
+        CHECK(step->page.target_denied);
+        CHECK(step->page.rows.empty());
+        CHECK_FALSE(step->resume.has_value());
+        CHECK(f.reads == 0);
+    }
+}
+
 TEST_CASE("read_devices_page: an explicit agent_id outside the scope is flagged target_denied",
           "[server][software_catalogue_model]") {
     FakeDevices f;

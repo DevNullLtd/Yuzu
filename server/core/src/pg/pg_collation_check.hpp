@@ -13,16 +13,18 @@
 /// (`pg_database.datcollversion`) and can compute the current one
 /// (`pg_database_collation_actual_version(oid)`); a difference is the signal checked here.
 ///
-/// SHAPE. A pure decision (`decide_collation_verdict`) over three facts, and one I/O function
+/// SHAPE. A pure decision (`decide_collation_verdict`) over four facts, and one I/O function
 /// (`check_collation_version`) that fetches them with one short bounded transaction. Neither
 /// throws. The check never stops the server: it logs the result, exports a gauge, and keeps
 /// booting whatever the verdict, because an operator must be able to start the server to fix the
-/// database. It refuses and pauses nothing; the gauge and the log are the whole of its output. It
-/// runs once at start and is repeated by `PgCollationRecheck` (hourly once a conclusive Ok or
-/// NotApplicable stands and the checks are readable; every minute while a Mismatch stands, no
-/// conclusive verdict exists yet, or the latest check was unreadable), so drift that appears while
-/// the server keeps running (a provider maintenance event that changes the host library) is seen,
-/// and a fixed database clears the gauge without a restart.
+/// database. Besides the gauge and the log it publishes a lock-free `CollationGate` (below) that
+/// the consumers read: a Mismatch pauses device_ci writes, and any gate other than Trusted
+/// refuses the device_ci reads that walk the text key. It runs once at start and is repeated by
+/// `PgCollationRecheck` (hourly once a conclusive Ok or NotApplicable stands and the checks are
+/// readable; every minute while a Mismatch stands, no conclusive verdict exists yet, or the latest
+/// check was unreadable), so drift that appears while the server keeps running (a provider
+/// maintenance event that changes the host library) is seen, and a fixed database clears the
+/// gauge without a restart.
 ///
 /// WHAT A REPEAT REPORTS. A second pure function (`next_collation_state`) maps the previous
 /// state and the new verdict to the new state, a gauge action and a log action, so that the gauge
@@ -47,9 +49,24 @@
 ///     builtin provider records a version and is checked, measured on PostgreSQL 18.4).
 ///   - Mismatch: both are known and they differ.
 ///   - Unreadable: the facts could not be read, or the recorded version is set but the operating
-///     system could not report the actual one.
+///     system could not report the actual one, or the two versions are EQUAL but an invalid index
+///     exists in the device inventory store's schema (below).
+///
+/// THE INVALID-INDEX HOLD. `ALTER DATABASE ... REFRESH COLLATION VERSION` makes the recorded
+/// version equal the actual one whether or not the indexes were rebuilt, so equal versions cannot
+/// prove the indexes are sound. A `REINDEX ... CONCURRENTLY` that failed (a duplicate key found
+/// while building the new index) leaves an INVALID index behind (`pg_index.indisvalid = false`)
+/// while the old index stays live. The check therefore reports Unreadable, not Ok, when the
+/// versions match and such an index exists in schema `device_inventory_store`. This can only HOLD:
+/// an Unreadable report never writes the gate (`report_collation_check`), so it keeps a standing
+/// Mismatch (or the boot Unproven) in place and never enters Mismatch, never pauses a write by
+/// itself, and never disturbs a Trusted gate. It covers only the CONCURRENTLY failure form (a
+/// plain `REINDEX` that fails rolls back and leaves no invalid index) and only that one schema.
+
+#include "../collation_gate_types.hpp"
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <optional>
 #include <string>
@@ -87,12 +104,17 @@ all_collation_verdicts() noexcept {
     return kCollationVerdictNames;
 }
 
-/// The three facts the decision is made from.
+/// The facts the decision is made from.
 struct CollationFacts {
     bool column_exists{false};           ///< `pg_database.datcollversion` exists (PostgreSQL 15+)
     std::optional<std::string> recorded; ///< `datcollversion`; nullopt when NULL
     /// `pg_database_collation_actual_version(oid)`; nullopt when NULL.
     std::optional<std::string> actual;
+    /// An invalid index (`pg_index.indisvalid = false`) exists in schema
+    /// `device_inventory_store`. Read only when the two versions are equal (the one case it
+    /// changes the answer); false otherwise, so a row of the decision table that never reads it
+    /// is unaffected.
+    bool invalid_index{false};
 };
 
 /// Pure. No I/O.
@@ -113,6 +135,10 @@ struct CollationFacts {
 [[nodiscard]] std::string unreadable_failure_text(const std::string& failure, bool facts_read,
                                                   const std::string& pool_error);
 
+/// The log text of an Unreadable verdict caused by the invalid-index hold: names the cause and
+/// the repair. Pure.
+[[nodiscard]] std::string invalid_index_failure_text();
+
 /// Fixed text for logs and tests: "ok", "not_applicable", "mismatch", "unreadable".
 [[nodiscard]] const char* to_string(CollationVerdict v) noexcept;
 
@@ -132,6 +158,20 @@ struct CollationState {
     bool unreadable{false};
     friend bool operator==(const CollationState&, const CollationState&) = default;
 };
+
+/// Pure. None -> Unproven, Ok -> Trusted, NotApplicable -> Trusted, Mismatch -> Mismatch.
+[[nodiscard]] constexpr CollationGate gate_for(CollationLast last) noexcept {
+    switch (last) {
+    case CollationLast::None:
+        return CollationGate::Unproven;
+    case CollationLast::Ok:
+    case CollationLast::NotApplicable:
+        return CollationGate::Trusted;
+    case CollationLast::Mismatch:
+        return CollationGate::Mismatch;
+    }
+    return CollationGate::Unproven;
+}
 
 enum class GaugeAction { Leave, SetZero, SetOne, Remove };
 enum class LogAction {
@@ -181,8 +221,16 @@ inline constexpr const char* kCollationLastCompletedGauge =
 /// versions and the remedy. The gauge is absent (not zero) until a conclusive verdict sets it, and
 /// is removed again on NotApplicable. `metrics` may be null. Never throws. Not thread-safe:
 /// `state` is owned by one caller at a time (the constructor, then the recheck loop).
+///
+/// `gate`, when non-null, receives `gate_for(next.last)` with `memory_order_release` on every
+/// CONCLUSIVE report (Ok, NotApplicable, Mismatch), before the metric and log work (so a throw
+/// there cannot withhold it). An Unreadable report never writes it: `state` advances only after
+/// that work, so it can lag the gate, and a value recomputed from it could overwrite a standing
+/// Mismatch with a stale Trusted. Null publishes nothing. The caller initialises the atomic to
+/// `kInitialCollationGate`.
 void report_collation_check(const CollationReport& report, yuzu::MetricsRegistry* metrics,
-                            CollationState& state) noexcept;
+                            CollationState& state,
+                            std::atomic<CollationGate>* gate = nullptr) noexcept;
 
 /// Creates `yuzu_pg_collation_check_total{result}` at 0 for every verdict in
 /// `all_collation_verdicts()`, so each result reads 0 rather than absent before it first happens

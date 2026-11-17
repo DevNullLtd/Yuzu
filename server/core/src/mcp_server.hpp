@@ -30,6 +30,8 @@
 #include "file_retrieval_routes.hpp"
 #include "dex_perf_model.hpp"
 #include "discovered_devices_model.hpp" // list_discovered_devices read seam (DiscoveredDevicesReadFn)
+#include "software_collection_settings_api.hpp" // the four collection-settings tools: the shared REST body
+#include "software_read_api.hpp"       // the five installed-software v3 read tools: the shared REST body
 #include "software_sync_runner.hpp"      // sync_hardware_software: the shared fleet-run (Runner)
 #include "network_api.hpp" // ADR-0031 WS-A4: the public in-process /network API seam
 #include "verify_api.hpp" // ADR-0031 WS-A4 #4250: the public in-process VERIFY API seam
@@ -752,6 +754,24 @@ public:
         software_sync_runner_ = std::move(runner);
     }
 
+    /// The installed-software v3 read context behind list_software_hosts, get_software_host,
+    /// list_software_changes, get_software_summary and get_software_plugin_health: the SAME
+    /// software_read_api::Ctx construction the REST SoftwareReadRoutes get (the store reads, the
+    /// roster and the fleet snapshot), so the two surfaces answer from one body. Unset = those
+    /// tools answer "unavailable" (a build without the software inventory store).
+    void set_software_read_ctx(software_read_api::Ctx ctx) { software_read_ctx_ = std::move(ctx); }
+
+    /// The collection-settings stores behind the four *_software_collection_settings tools (the
+    /// SAME instances SoftwareCollectionSettingsRoutes borrows) and the RBAC-unavailable-aware
+    /// permission probe (AuthRoutes::probe_permission_unavailable_aware) the per-group read and the
+    /// write decide authority from. Unset = those tools answer "unavailable"; an unset probe fails
+    /// the per-group read and the write closed.
+    void set_collection_settings_deps(software_collection_settings_api::Stores stores,
+                                      PermFn probe_perm_fn) {
+        collection_settings_stores_ = stores;
+        collection_settings_probe_perm_fn_ = std::move(probe_perm_fn);
+    }
+
     /// #4143 review fix (external colleague review, BLOCKING, confirmed against
     /// ADR-0017 INV-4/INV-7 by direct source inspection): `list_echo_process_
     /// tree_devices`/`list_echo_capture_sources_devices` previously intersected
@@ -1459,6 +1479,10 @@ private:
     // #2146 Batch B1 — see set_guardian_push_fn above.
     GuardianPushFn guardian_push_fn_;
     std::shared_ptr<software_sync::Runner> software_sync_runner_;
+    // SAM-35 - see set_software_read_ctx / set_collection_settings_deps above.
+    std::optional<software_read_api::Ctx> software_read_ctx_;
+    software_collection_settings_api::Stores collection_settings_stores_;
+    PermFn collection_settings_probe_perm_fn_;
     // #2146 Batch B3 — see set_viz_deps above.
     FleetTopologyStore* fleet_topology_store_{nullptr};
     yuzu::server::OfflineRosterFn offline_roster_fn_;

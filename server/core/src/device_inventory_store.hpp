@@ -26,10 +26,12 @@
 ///   - `last_seen`/`first_seen` are the **SERVER receipt time**, never the
 ///     agent-supplied `collected_at` (the #1685 lesson, baked in from day one).
 
+#include "collation_gate_types.hpp"      // pg::CollationGate (the optional write-pause gate)
 #include "device_inventory_types.hpp"
 #include "digest_fn.hpp"                // DigestFn (the writer's test seam; no OpenSSL here)
 #include "inventory_ingest_outcome.hpp" // InventoryIngestOutcome (shared sync-ingest vocabulary)
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -49,6 +51,11 @@ struct PgMigration;
 } // namespace yuzu::server::pg
 
 namespace yuzu::server {
+
+/// The store's name and PostgreSQL schema (the migration runner's key). The ONE spelling: the
+/// collation check reads it to look for an invalid index in this schema
+/// (`pg::check_collation_version`), so a rename cannot leave that guard looking elsewhere.
+inline constexpr const char* kDeviceInventoryStoreSchema = "device_inventory_store";
 
 /// The store's migration array (schema `device_inventory_store`), so a test can pin the text a
 /// migration carries (the transaction-local settings of v4) without a second copy of it.
@@ -90,6 +97,28 @@ public:
     /// Wire a metrics registry (read-degrade counter). Set ONCE during
     /// single-threaded startup; read without synchronisation on serving threads.
     void set_metrics(yuzu::MetricsRegistry* m) noexcept { metrics_ = m; }
+
+    /// Wire the collation gate that pauses writes (nullable; the DEFAULT is NO gate, and a store
+    /// with none wired writes exactly as it did before the gate existed). While the gate reads
+    /// `Mismatch`, `apply_device_ci` returns `kDeferred` and `delete_agent` returns false, both
+    /// before the pool is touched: a text-keyed write under a changed collation misses its row
+    /// and can add a duplicate. `Unproven` and `Trusted` never pause (a failed collation read is
+    /// not evidence of a mismatch). The pointee is BORROWED and must outlive this store; set it
+    /// ONCE during single-threaded startup, like `set_metrics`.
+    void set_write_gate(const std::atomic<pg::CollationGate>* gate) noexcept { write_gate_ = gate; }
+
+    /// True iff a gate is wired and currently reads `Mismatch`. One acquire load, no lock, no
+    /// allocation: safe on the ingest hot path.
+    [[nodiscard]] bool writes_deferred() const noexcept {
+        return write_gate_ != nullptr &&
+               write_gate_->load(std::memory_order_acquire) == pg::CollationGate::Mismatch;
+    }
+
+    /// Account for a device_ci ingest the SEAM refused on `writes_deferred()` before it called
+    /// `apply_device_ci` (counter `yuzu_device_ci_writes_deferred_total{op="ingest"}` plus the
+    /// once-per-transition log line). `apply_device_ci` does the same for its own refusals, so a
+    /// refusal is counted exactly once whichever site made it.
+    void note_ingest_deferred() noexcept { note_write_deferred("ingest"); }
 
     /// TEST SEAM (#7163): replace the digest provider the full-replace writer hashes section
     /// rows with, so a test can fail it (return std::nullopt, as `sha256_hex` does when
@@ -191,14 +220,22 @@ public:
 
     /// Drop an agent's CI record (e.g. on agent removal). Returns true iff the
     /// DELETE executed (COMMAND_OK); false on a closed store, a lease timeout, or
-    /// a SQL failure — so the decommission cascade records Failed, not a false
-    /// "erased".
+    /// a SQL failure, or while `writes_deferred()` (nothing attempted), so the
+    /// decommission cascade records Failed, not a false "erased".
     [[nodiscard]] bool delete_agent(std::string_view agent_id);
 
 private:
+    /// Count one refused write (`op` is "ingest" or "delete") and log once per entry into the
+    /// refusing state, not once per call.
+    void note_write_deferred(const char* op) noexcept;
+    /// Called when a write finds the gate open: re-arms the once-per-pause log line.
+    void clear_write_pause_flag() noexcept;
+
     pg::PgPool& pool_;
     bool open_{false};
     yuzu::MetricsRegistry* metrics_{nullptr};
+    const std::atomic<pg::CollationGate>* write_gate_{nullptr}; // borrowed; see set_write_gate
+    std::atomic<bool> write_pause_logged_{false}; // true while the pause has already been logged
     DigestFn digest_fn_{nullptr}; // nullptr = sha256_hex; see set_digest_provider_for_test
 };
 

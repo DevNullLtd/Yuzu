@@ -515,7 +515,9 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # 204 -> 195 (instruction authoring twins, #2146 batch C): nine rows flipped from planned to twinned
 # (POST/PUT/DELETE /api/v1/instructions*, import, yaml, validate-yaml and the three /api/v1/instruction-sets
 # routes, with their nine MCP tools).
-BASELINE_UNTWINNED = 195
+# 195 -> 196 (streamed software export, SAM-36): GET /api/v1/inventory/software/export is a v1-keyed
+# `exception:#7955` row. It streams a file, which is not a tool call, so it has no MCP twin by design.
+BASELINE_UNTWINNED = 196
 
 # The generic "planned:#2146" placeholder means "tracked by nobody in particular". It may only
 # SHRINK (a row flipped to a specific issue, a twin, or an exception); a new row names a specific
@@ -629,6 +631,8 @@ STRICT_EXCEPTION_PINS = {
     "post.api-settings-updates-param-param-param-rollout": (6325, "2027-03-31"),
     "post.api-settings-updates-upload": (6325, "2027-03-31"),
     "post.api-settings-users": (6325, "2027-03-31"),
+    # #7955: the streamed software export is a chunked file download, not a tool call; ADR-1005 exception entry (SAM-36).
+    "get.api-v1-inventory-software-export": (7955, "2027-05-31"),
 }
 
 # `exception:` rows must read `exception:#<issue> revisit:<YYYY-MM-DD> <reason>`. The rows named

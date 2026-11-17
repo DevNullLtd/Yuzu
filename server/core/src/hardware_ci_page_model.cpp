@@ -219,6 +219,15 @@ std::string_view read_error_message(ReadError e) {
     case ReadError::kScopeTooWide:
         return "the caller's scope covers more than 10000 devices and no agent_id was given; a "
                "credential with global read has no such limit";
+    case ReadError::kOrderingUnverified:
+        // Deliberately generic: this text reaches every Inventory:Read caller, who has no need to
+        // learn the database's collation or index state beyond the runbook pointer. The cause (a changed collation version,
+        // a check that has not concluded, an invalid index) is in the server log, which the
+        // collation check writes on every transition, and in the audit row's detail and the
+        // `yuzu_pg_collation_*` series; the remediation below points an operator at the runbook.
+        return "the device CI data cannot be vouched for right now; retry after the hint and "
+               "restart the walk from the first page (operators: see PostgreSQL collation "
+               "version in server-admin.md)";
     case ReadError::kCount: // a sentinel, not an error: answered like an out-of-range value
         break;
     }
@@ -255,6 +264,18 @@ ReadFailure describe_read_error(ReadError e, Surface surface) {
         f.audit_outcome = "denied";
         f.audit_detail = audit_detail_scope_too_wide(name);
         return f;
+    case ReadError::kOrderingUnverified:
+        // Not kDegraded: the store answers, but its answer cannot be trusted. Retryable (the
+        // recheck clears it once the database is repaired), audited with an
+        // `inventory.devices.ci` failure row (written best effort on REST: a row that does not
+        // persist marks the response Sec-Audit-Failed, hardware_routes.cpp), and no read ran.
+        f.unavailable = true;
+        f.retry_after_ms = device_ci_read_gate::kOrderingRetryAfterMs;
+        f.remediation = kOrderingUnverifiedRemediation;
+        f.domain_audit_row = true;
+        f.audit_outcome = "failure";
+        f.audit_detail = std::format("hardware CI records ({}) state=collation ordering unverified", name);
+        return f;
     case ReadError::kCount: // a sentinel, not an error: answered like an out-of-range value
         break;
     }
@@ -266,7 +287,8 @@ ReadFailure describe_read_error(ReadError e, Surface surface) {
 }
 
 std::expected<Page, ReadError>
-read_page(const Reader& read, const Request& rq, const authz::VisibleSet& scope) {
+read_page(const Reader& read, const Request& rq, const authz::VisibleSet& scope,
+          const std::atomic<pg::CollationGate>* gate) {
     const std::string fp = filter_fingerprint(rq);
     Position incoming; // the head: nothing served yet
     if (!rq.cursor.empty()) {
@@ -291,6 +313,11 @@ read_page(const Reader& read, const Request& rq, const authz::VisibleSet& scope)
     const bool wide = scope && scope->size() > kMaxPushdownScopeIds;
     if (wide && rq.agent_id.empty())
         return std::unexpected(ReadError::kScopeTooWide);
+
+    // The collation gate, after every refusal above (they run no read and keep their own answers)
+    // and before the one store call: a refused request makes no store round-trip.
+    if (device_ci_read_gate::refuses(gate))
+        return std::unexpected(ReadError::kOrderingUnverified);
 
     DeviceCiKeysetQuery q;
     q.after = incoming.after;

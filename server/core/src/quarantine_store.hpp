@@ -27,8 +27,9 @@
 /// in-process mutex — `quarantine_device` is a single `ON CONFLICT ... DO
 /// NOTHING` statement, race-safe under concurrent Postgres connections in a
 /// way the legacy SQLite `shared_mutex` (scoped to one `sqlite3*` handle)
-/// never had to be. `release_device` is a single guarded `UPDATE ... WHERE
-/// status = 'active'` (the #3062 `cancel_job` pattern), not lock-then-check.
+/// never had to be. `request_release` and `mark_released` are single guarded
+/// `UPDATE ... WHERE status = 'active'` statements (the #3062 `cancel_job`
+/// pattern), not lock-then-check.
 ///
 /// Out of scope: the agent-side quarantine firewall enforcement (§11.7) is
 /// untouched — this store is only the server-side bookkeeping.
@@ -59,7 +60,7 @@ class PgPool;
 
 namespace yuzu::server {
 
-/// Prefix on every `quarantine_device`/`release_device` `unexpected(msg)`
+/// Prefix on every `quarantine_device`/`request_release` `unexpected(msg)`
 /// that reflects a genuine store/pool/query failure (as opposed to a
 /// business/state error like "already quarantined") — the route classifier
 /// (`rest_api_v1.cpp`) keys off this to answer 503 rather than 400, mirroring
@@ -69,6 +70,10 @@ namespace yuzu::server {
 /// prefix must not silently regress every classified 503 back to 400 —
 /// callers key off the shared constant, never a local copy of the literal.
 inline constexpr const char* kQuarantineDbErrorPrefix = "db_error: ";
+
+/// How a record came to end. `device_confirmed`: the device answered `inactive` to a release.
+/// `forced`: an operator ended it without the device's word; the device is then owed a release.
+enum class ReleaseEnd { device_confirmed, forced };
 
 class QuarantineStore {
 public:
@@ -101,12 +106,37 @@ public:
     quarantine_device(const std::string& agent_id, const std::string& by,
                       const std::string& reason, const std::string& whitelist);
 
-    /// Release a device from quarantine. `std::unexpected("device is not
-    /// quarantined")` when no active record exists for `agent_id` (a
-    /// business/state error — 400 at REST); any other `unexpected(msg)` a
-    /// genuine store/pool/query failure, prefixed `kQuarantineDbErrorPrefix`
-    /// so the REST route classifies it 503. AUTHORITATIVE write.
-    [[nodiscard]] std::expected<void, std::string> release_device(const std::string& agent_id);
+    /// Ask for the device's release: stamps `release_requested_at` on the active record
+    /// (the record then reads "releasing", stays listed, and keeps the dispatch refusal
+    /// until the device confirms) and returns the record's id. Idempotent: a second call
+    /// keeps the first timestamp and returns the same id. `std::unexpected("device is not
+    /// quarantined")` when no active record exists for `agent_id` (a business/state error
+    /// — 400 at REST); any other `unexpected(msg)` a genuine store/pool/query failure,
+    /// prefixed `kQuarantineDbErrorPrefix` so the REST route classifies it 503.
+    /// AUTHORITATIVE write. One guarded UPDATE ... RETURNING id.
+    [[nodiscard]] std::expected<std::int64_t, std::string>
+    request_release(const std::string& agent_id);
+
+    /// End the record `record_id` for `agent_id` (status `released`, `released_at` now).
+    /// `ReleaseEnd::forced` also stamps `device_release_owed_at`, so the reconciler keeps
+    /// owing the device a release. Same `record_id` scoping and error contract as
+    /// `mark_endpoint_applied`: `std::unexpected("device is not quarantined")` when the
+    /// guarded UPDATE touched no row (already ended, or superseded by a newer record).
+    [[nodiscard]] std::expected<void, std::string>
+    mark_released(const std::string& agent_id, std::int64_t record_id, ReleaseEnd end);
+
+    /// Records ended by force whose device has not yet confirmed a release, for the
+    /// reconciler's owed-release leg. A device quarantined again since is governed by its
+    /// new record and never appears. `std::nullopt` on a store/pool/query failure — NEVER
+    /// a silent empty.
+    [[nodiscard]] std::optional<std::vector<QuarantineRecord>> list_release_owed();
+
+    /// The device confirmed the release a forced end owed it: sets
+    /// `device_release_owed_at` back to 0. Same `record_id` scoping and error contract as
+    /// `mark_endpoint_applied` (zero rows, including an already-cleared mark, is "device is
+    /// not quarantined").
+    [[nodiscard]] std::expected<void, std::string> clear_release_owed(const std::string& agent_id,
+                                                                      std::int64_t record_id);
 
     /// The current active record for `agent_id`, if any. AUTHORITATIVE read:
     /// `std::unexpected(msg)` on a store/pool/query failure (prefixed
@@ -143,7 +173,7 @@ public:
     /// against the wrong row. `std::unexpected(msg)` prefixed
     /// `kQuarantineDbErrorPrefix` on a genuine store/pool/query failure;
     /// `std::unexpected("device is not quarantined")` (unprefixed business
-    /// error, matching `release_device`) when the guarded UPDATE returned
+    /// error, matching `request_release`) when the guarded UPDATE returned
     /// zero rows — covers BOTH "released, nothing active" and "superseded by
     /// a different active record" identically; every existing caller's
     /// handling (erase in-memory state, let the record re-enter fresh next
@@ -152,10 +182,10 @@ public:
     [[nodiscard]] std::expected<void, std::string>
     mark_endpoint_applied(const std::string& agent_id, std::int64_t record_id, std::int64_t at);
 
-    /// #3425: record that a FOLLOW-UP `quarantine.status` read confirmed
-    /// `state|active` on the device's own firewall — the only signal this
-    /// store treats as proof of endpoint containment. Same `record_id`
-    /// scoping and error contract as `mark_endpoint_applied`.
+    /// #3425: record that a FOLLOW-UP `firewall.quarantine_status` read confirmed
+    /// the device's firewall rules in force — the only signal this store treats as proof
+    /// of endpoint containment. Stamps `last_confirmed_at`. Same `record_id` scoping and
+    /// error contract as `mark_endpoint_applied`.
     [[nodiscard]] std::expected<void, std::string>
     mark_endpoint_confirmed(const std::string& agent_id, std::int64_t record_id, std::int64_t at);
 
