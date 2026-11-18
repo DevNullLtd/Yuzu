@@ -1792,23 +1792,40 @@ AuthDB::break_glass_status(const std::string& username) {
     if (!is_valid_username(username)) {
         return std::unexpected(AuthDBError::InvalidUsername);
     }
-    auto lease = impl_->pool.try_acquire_for(kReadTimeout);
-    if (!lease)
+    // Bounded in time on every axis (the caller is the sso-only login gate, run for every request
+    // naming the break-glass user): the pool acquire, the table-lock wait and the statement are
+    // each capped, so a stuck read surfaces as a failed statement (QueryFailed -> the gate fails
+    // CLOSED), never a parked refresher.
+    std::optional<BreakGlassStatus> out;
+    const bool ok = impl_->pool.with_txn_for(kReadTimeout, [&](PGconn* conn) -> bool {
+        for (const char* guc : {"lock_timeout", "statement_timeout"}) {
+            pg::PgResult set = pg::exec_params(conn, "SELECT set_config($1, '1000', true)",
+                                               std::vector<std::string>{guc});
+            if (set.status() != PGRES_TUPLES_OK)
+                return false;
+        }
+        pg::PgResult res = pg::exec_params(
+            conn,
+            "SELECT COALESCE((break_glass_armed_until AT TIME ZONE 'UTC')::text, ''), "
+            "(break_glass_armed_until IS NOT NULL AND break_glass_armed_until > now()), "
+            "COALESCE(GREATEST(0, (EXTRACT(EPOCH FROM (break_glass_armed_until - now())) * 1000)"
+            "::bigint), 0) "
+            "FROM auth.users WHERE username = $1 AND is_active = TRUE",
+            std::vector<std::string>{username});
+        if (res.status() != PGRES_TUPLES_OK)
+            return false;
+        BreakGlassStatus st;
+        if (PQntuples(res.get()) > 0) {
+            st.armed_until = col_str(res.get(), 0, 0);
+            st.armed = to_bool(col(res.get(), 0, 1));
+            st.remaining_ms = st.armed ? to_i64(col(res.get(), 0, 2)) : 0;
+        }
+        out = st;
+        return true;
+    });
+    if (!ok || !out)
         return std::unexpected(AuthDBError::QueryFailed);
-    pg::PgResult res = pg::exec_params(
-        lease.get(),
-        "SELECT COALESCE((break_glass_armed_until AT TIME ZONE 'UTC')::text, ''), "
-        "(break_glass_armed_until IS NOT NULL AND break_glass_armed_until > now()) "
-        "FROM auth.users WHERE username = $1 AND is_active = TRUE",
-        std::vector<std::string>{username});
-    if (res.status() != PGRES_TUPLES_OK)
-        return std::unexpected(AuthDBError::QueryFailed);
-    BreakGlassStatus out;
-    if (PQntuples(res.get()) > 0) {
-        out.armed_until = col_str(res.get(), 0, 0);
-        out.armed = to_bool(col(res.get(), 0, 1));
-    }
-    return out;
+    return *out;
 }
 
 std::expected<AuthDB::BreakGlassStatus, AuthDBError>

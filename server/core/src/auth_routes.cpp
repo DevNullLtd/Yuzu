@@ -2577,44 +2577,51 @@ SsoOnlyLocalGate AuthRoutes::sso_only_local_password_gate(const std::string& use
         return SsoOnlyLocalGate::kOpen;
     if (cfg_.break_glass_user.empty() || username != cfg_.break_glass_user)
         return SsoOnlyLocalGate::kRefused; // every other name: no database read at all
-    // The break-glass name: the arm state is a database read with a lease wait of up to 1.5 s, and
-    // this gate runs for EVERY request naming that user, before any slot. So the answer is cached
-    // for kBreakGlassArmCacheTtl and refreshed by ONE request at a time (single flight); the
-    // others are answered from the last value at once (or fail CLOSED when there is none), so a
-    // flood naming the break-glass user cannot park workers on this read. An arm or disarm shows
-    // up after at most the TTL (plus one refresh); --break-glass-arm is an out-of-band host
-    // operation, so that lag is the operator-visible cost.
+    // The break-glass name: the arm state is a database read, and this gate runs for EVERY
+    // request naming that user, before any slot. So the answer is cached and refreshed by ONE
+    // request at a time (single flight); every other request is answered at once, FAILING CLOSED:
+    //  - an `armed` answer is honoured only while the cache is younger than
+    //    kBreakGlassArmCacheTtl AND the LOCAL monotonic deadline derived from the database
+    //    clock's remaining arm time has not passed (never the replica's wall clock), so an arm
+    //    window that ends is enforced locally with no refresh at all;
+    //  - a request that arrives while a refresh is in flight and finds a cache that is older than
+    //    the TTL is REFUSED (a stale refusal is harmless; a stale arm never is);
+    //  - the refresh itself is bounded in time (break_glass_status caps the lock wait and the
+    //    statement), and a failed refresh caches nothing, so the next answer is a refusal.
+    // A disarm therefore propagates within kBreakGlassArmCacheTtl (1 second), an arm likewise.
     const auto now = std::chrono::steady_clock::now();
     {
         std::lock_guard lk(bg_arm_mu_);
         if (bg_arm_valid_ && now - bg_arm_at_ < kBreakGlassArmCacheTtl)
-            return bg_arm_armed_ ? SsoOnlyLocalGate::kBreakGlassArmed : SsoOnlyLocalGate::kRefused;
+            return (bg_arm_armed_ && now < bg_arm_deadline_) ? SsoOnlyLocalGate::kBreakGlassArmed
+                                                           : SsoOnlyLocalGate::kRefused;
     }
     bool expected = false;
-    if (bg_arm_refreshing_.compare_exchange_strong(expected, true)) {
-        struct Done {
-            std::atomic<bool>& f;
-            ~Done() { f.store(false); }
-        } done{bg_arm_refreshing_};
-        bool ok = false, armed = false;
-        if (auto* db = auth_mgr_.auth_db_ptr()) {
-            // Fail CLOSED on a read error: unlike lockout (which guards against wrong passwords
-            // and so fails open), this gate is the credential path itself.
-            if (auto bg = db->break_glass_status(username)) {
-                ok = true;
-                armed = bg->armed;
-            }
+    if (!bg_arm_refreshing_.compare_exchange_strong(expected, true))
+        return SsoOnlyLocalGate::kRefused; // a refresh is in flight and the cache is stale
+    struct Done {
+        std::atomic<bool>& f;
+        ~Done() { f.store(false); }
+    } done{bg_arm_refreshing_};
+    bool ok = false, armed = false;
+    std::int64_t remaining_ms = 0;
+    const auto started = std::chrono::steady_clock::now(); // conservative: the deadline counts from here
+    if (auto* db = auth_mgr_.auth_db_ptr()) {
+        // Fail CLOSED on a read error: unlike lockout (which guards against wrong passwords and
+        // so fails open), this gate is the credential path itself.
+        if (auto bg = db->break_glass_status(username)) {
+            ok = true;
+            armed = bg->armed && bg->remaining_ms > 0;
+            remaining_ms = bg->remaining_ms;
         }
-        std::lock_guard lk(bg_arm_mu_);
-        bg_arm_valid_ = ok;
-        bg_arm_armed_ = armed;
-        bg_arm_at_ = std::chrono::steady_clock::now();
-        return armed ? SsoOnlyLocalGate::kBreakGlassArmed : SsoOnlyLocalGate::kRefused;
     }
     std::lock_guard lk(bg_arm_mu_);
-    if (bg_arm_valid_) // stale by at most one refresh: served at once
-        return bg_arm_armed_ ? SsoOnlyLocalGate::kBreakGlassArmed : SsoOnlyLocalGate::kRefused;
-    return SsoOnlyLocalGate::kRefused; // no value and a refresh in flight: fail CLOSED
+    bg_arm_valid_ = ok;
+    bg_arm_armed_ = armed;
+    bg_arm_at_ = std::chrono::steady_clock::now();
+    bg_arm_deadline_ = started + std::chrono::milliseconds(remaining_ms);
+    return (armed && bg_arm_at_ < bg_arm_deadline_) ? SsoOnlyLocalGate::kBreakGlassArmed
+                                                     : SsoOnlyLocalGate::kRefused;
 }
 
 // ---------------------------------------------------------------------------

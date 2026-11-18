@@ -754,6 +754,10 @@ public:
     struct BreakGlassStatus {
         bool armed{false};        // break_glass_armed_until set AND still in the future
         std::string armed_until;  // UTC timestamp text, or "" when dormant
+        /// Milliseconds left of the arm window by the DATABASE clock at read time (0 when not
+        /// armed): a caller derives a LOCAL monotonic deadline from it and never re-adjudicates
+        /// on its own wall clock.
+        std::int64_t remaining_ms{0};
     };
 
     /// Read-only break-glass arm check. Returns a zero-initialised

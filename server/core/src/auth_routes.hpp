@@ -1275,13 +1275,15 @@ private:
     std::string stripe_salt_{std::to_string((static_cast<std::uint64_t>(std::random_device{}()) << 32) ^
                                             std::random_device{}())};
     std::atomic<int> stripe_waiters_{0};
-    /// The break-glass arm state, cached (single flight) so the sso-only gate that runs before
-    /// every slot never parks workers on a slow database read.
+    /// The break-glass arm state, cached (single flight, fail closed, a local monotonic arm
+    /// deadline from the database clock) so the sso-only gate that runs before every slot never
+    /// parks workers on a slow database read.
     static constexpr std::chrono::milliseconds kBreakGlassArmCacheTtl{1000};
     std::mutex bg_arm_mu_;
     bool bg_arm_valid_{false};
     bool bg_arm_armed_{false};
     std::chrono::steady_clock::time_point bg_arm_at_{};
+    std::chrono::steady_clock::time_point bg_arm_deadline_{}; ///< local monotonic end of the arm window
     std::atomic<bool> bg_arm_refreshing_{false};
     /// Most requests allowed to WAIT for a stripe at once (server.cpp: max(2, pool/8)).
     std::atomic<int> stripe_waiter_cap_{4};

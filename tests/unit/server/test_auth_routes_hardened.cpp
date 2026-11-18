@@ -553,3 +553,85 @@ TEST_CASE("break-glass arm-state gate: one request reads the database, the rest 
     // from the stale value at once. (Mutation: no single flight -> all eight park, 0 finished.)
     CHECK(finished_while_locked == kCallers - 1);
 }
+
+namespace {
+/// Holds an exclusive lock on auth.users from a second connection (a stuck arm-state read).
+struct UsersTableLock {
+    yuzu::server::pg::PgConn conn;
+    explicit UsersTableLock(const std::string& dsn) : conn{PQconnectdb(dsn.c_str())} {
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        REQUIRE(yuzu::server::pg::PgResult{PQexec(conn.get(), "BEGIN")}.ok());
+        REQUIRE(yuzu::server::pg::PgResult{
+            PQexec(conn.get(), "LOCK TABLE auth.users IN ACCESS EXCLUSIVE MODE")}.ok());
+    }
+    void release() { (void)yuzu::server::pg::PgResult{PQexec(conn.get(), "COMMIT")}; }
+};
+} // namespace
+
+TEST_CASE("break-glass gate: a stale armed value is never served past the TTL while a refresh is stuck",
+          "[pg][auth][hardened][routes][concurrency][stripe][fail-closed]") {
+    HardenedHarness h("sso-only", "admin");
+    h.enroll_mfa("admin");
+    h.arm("admin", 2); // a 2 s arm window
+    REQUIRE(h.auth_routes->sso_only_local_password_gate("admin") == SsoOnlyLocalGate::kBreakGlassArmed);
+    std::this_thread::sleep_for(std::chrono::milliseconds(2300)); // the window has ended
+    UsersTableLock lock(h.auth_db.dsn()); // the refresh will be stuck on this lock
+    std::vector<SsoOnlyLocalGate> results(4, SsoOnlyLocalGate::kBreakGlassArmed);
+    std::atomic<int> done{0};
+    std::vector<std::jthread> callers;
+    for (int i = 0; i < 4; ++i)
+        callers.emplace_back([&, i] {
+            results[i] = h.auth_routes->sso_only_local_password_gate("admin");
+            ++done;
+        });
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+    const int finished = done.load(); // everyone except the stuck refresher
+    lock.release();
+    callers.clear();
+    // The three non-refreshers answer at once and REFUSE (mutation: serving the stale armed
+    // value -> they answer kBreakGlassArmed past the end of the window).
+    CHECK(finished == 3);
+    for (const auto r : results)
+        CHECK(r == SsoOnlyLocalGate::kRefused);
+}
+
+TEST_CASE("break-glass gate: a stuck refresh fails closed within the bound, never parks",
+          "[pg][auth][hardened][routes][concurrency][stripe][fail-closed]") {
+    HardenedHarness h("sso-only", "admin");
+    h.enroll_mfa("admin");
+    h.arm("admin");
+    UsersTableLock lock(h.auth_db.dsn());
+    std::promise<SsoOnlyLocalGate> p;
+    auto f = p.get_future();
+    std::jthread t([&] { p.set_value(h.auth_routes->sso_only_local_password_gate("admin")); });
+    // The read is bounded (lock and statement timeouts), so the gate answers on its own, REFUSING
+    // although the account is armed. (Mutation: no timeouts -> it parks until the lock ends.)
+    const bool in_time = f.wait_for(std::chrono::milliseconds(2000)) == std::future_status::ready;
+    lock.release();
+    t.join();
+    CHECK(in_time);
+    if (in_time)
+        CHECK(f.get() == SsoOnlyLocalGate::kRefused);
+}
+
+TEST_CASE("break-glass gate: the arm window ends locally, with no refresh, from the database clock",
+          "[pg][auth][hardened][routes][stripe][fail-closed]") {
+    HardenedHarness h("sso-only", "admin");
+    h.arm("admin", 2);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500)); // ~0.5 s of the window left
+    h.auth_routes->reset_break_glass_arm_cache_for_test();
+    CHECK(h.auth_routes->sso_only_local_password_gate("admin") == SsoOnlyLocalGate::kBreakGlassArmed);
+    std::this_thread::sleep_for(std::chrono::milliseconds(700)); // cache still fresh (< 1 s), window over
+    // Mutation: no local deadline check -> still armed from the fresh cache.
+    CHECK(h.auth_routes->sso_only_local_password_gate("admin") == SsoOnlyLocalGate::kRefused);
+}
+
+TEST_CASE("break-glass gate: a disarm propagates within the cache TTL",
+          "[pg][auth][hardened][routes][stripe]") {
+    HardenedHarness h("sso-only", "admin");
+    h.arm("admin");
+    CHECK(h.auth_routes->sso_only_local_password_gate("admin") == SsoOnlyLocalGate::kBreakGlassArmed);
+    REQUIRE(h.auth_db->disarm_break_glass("admin").has_value());
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100)); // past the 1 s TTL
+    CHECK(h.auth_routes->sso_only_local_password_gate("admin") == SsoOnlyLocalGate::kRefused);
+}
