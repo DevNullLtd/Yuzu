@@ -608,8 +608,12 @@ TEST_CASE("SAM-22: seed_action_kill_switch_default_off seeds a disabled ACTION-l
     CHECK_FALSE(entry->enabled);
     CHECK(entry->set_by == "system");
     CHECK(entry->action == "native");
-    // No plugin-level row was written: the plugin itself is not killed.
-    CHECK_FALSE(w.store.get_kill_switch("component_inventory", "").has_value());
+    // No plugin-level row was written: the plugin itself is not killed. A plugin-scope read
+    // resolves to a value even with no row, so "no row" is proved by an empty source.
+    auto plugin_level = w.store.get_kill_switch("component_inventory", "");
+    REQUIRE(plugin_level.has_value());
+    CHECK(plugin_level->enabled);
+    CHECK(plugin_level->source.empty());
 }
 
 TEST_CASE("SAM-22: seed_action_kill_switch_default_off is ON CONFLICT DO NOTHING — an operator's own "
@@ -637,7 +641,11 @@ TEST_CASE("SAM-22: seed_action_kill_switch_default_off refuses an empty action (
     CHECK_FALSE(w.store.seed_action_kill_switch_default_off("component_inventory", "bad action", "default-off seed"));
     CHECK(w.store.action_allowed("component_inventory", "scan"));
     CHECK(w.store.action_allowed("component_inventory", "native"));
-    CHECK_FALSE(w.store.get_kill_switch("component_inventory", "").has_value());
+    // Both seeds were refused, so no row exists at all: enabled, with no source row.
+    auto plugin_level = w.store.get_kill_switch("component_inventory", "");
+    REQUIRE(plugin_level.has_value());
+    CHECK(plugin_level->enabled);
+    CHECK(plugin_level->source.empty());
 }
 
 TEST_CASE("SAM-22: ServerImpl's boot sequence actually calls "
