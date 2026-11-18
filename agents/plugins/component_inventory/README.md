@@ -169,7 +169,7 @@ For `native`, `archive_changed` means a library changed or vanished between bein
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-11-17 · euid 501 · leg-hash 80173557ecbf
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-11-17 · euid 501 (application and library names in the native rows redacted) · leg-hash 80173557ecbf
 
 ```
 == action=scan
@@ -180,10 +180,22 @@ comp|java|concurrent_ruby||unreadable|/opt/homebrew/Library/Homebrew/vendor/bund
 
 == action=native
 status|native|constrained|macos:component_inventory:budget_entries
+comp|native|libredacted1|1.0.0|macho|/Applications/App1.app/Contents/Frameworks/libredacted1.dylib|1667840|1792752729|App1.app
+comp|native|libredacted2|6.2.1|macho|/Applications/App1.app/Contents/Frameworks/libredacted2.18.dylib|3298736|1792752729|App1.app
+comp|native|libredacted1|1.0.0|macho|/Applications/App2.app/Contents/Frameworks/libredacted1.dylib|1667840|1792608728|App2.app
+comp|native|libredacted1|1.0.0|macho|/Applications/App3.app/Contents/Frameworks/libredacted1.dylib|1667840|1794388203|App3.app
+comp|native|libredacted3||unreadable|/Applications/App4.app/Contents/Frameworks/libredacted3.dylib|8679504|1793040832|App4.app
+comp|native|libredacted4||unreadable|/Applications/App4.app/Contents/Frameworks/libredacted4.dylib|717216|1793040832|App4.app
+comp|native|libredacted5||unreadable|/Applications/App4.app/Contents/Frameworks/libredacted5.dylib|22244352|1793040832|App4.app
+comp|native|libredacted6||unreadable|/Applications/App4.app/Contents/Frameworks/libredacted6.dylib|49004576|1793040832|App4.app
+comp|native|libredacted7||unreadable|/Applications/App4.app/Contents/Frameworks/libredacted7.dylib|383520|1793705004|App4.app
+comp|native|libredacted8||unreadable|/Applications/App4.app/Contents/Frameworks/libredacted8.dylib|79632352|1793705004|App4.app
+comp|native|libredacted9||unreadable|/Applications/App4.app/Contents/Frameworks/libredacted9.dylib|865040|1793705004|App4.app
+… 12 of 170 rows shown
 [result_status] CONSTRAINED / PARTIAL / macos:component_inventory:budget_entries
 ```
 
-**Linux** — captured: linux Ubuntu 26.04.1 LTS x86_64 · vm · 2026-11-15 · euid 0 · leg-hash 80173557ecbf
+**Linux** — captured: linux Ubuntu 26.04.1 LTS x86_64 · vm · 2026-11-18 · euid 0 · leg-hash 80173557ecbf
 
 ```
 == action=scan
@@ -196,7 +208,20 @@ comp|java|gradle-wrapper||unreadable|/opt/vcpkg/buildtrees/grpc/src/v1.81.1-f067
 [result_status] OK / FULL
 
 == action=native
-[not captured] agent-context: TEMPORARY placeholder, replaced by the lane capture
+status|native|supported|linux:component_inventory:link_skipped,linux:component_inventory:version_unreadable
+comp|native|erl_gl||unreadable|/opt/erlang/OTP-28.5.0.7/lib/wx-2.5.4.1/priv/erl_gl.so|836168|1790067434|erlang
+comp|native|wxe_driver||unreadable|/opt/erlang/OTP-28.5.0.7/lib/wx-2.5.4.1/priv/wxe_driver.so|5924744|1790067434|erlang
+comp|native|_elementpath.cpython-314-x86_64-linux-gnu||unreadable|/opt/gcovr-venv/lib/python3.14/site-packages/lxml/_elementpath.cpython-314-x86_64-linux-gnu.so|209128|1791929246|gcovr-venv
+comp|native|builder.cpython-314-x86_64-linux-gnu||unreadable|/opt/gcovr-venv/lib/python3.14/site-packages/lxml/builder.cpython-314-x86_64-linux-gnu.so|120912|1791929246|gcovr-venv
+comp|native|etree.cpython-314-x86_64-linux-gnu||unreadable|/opt/gcovr-venv/lib/python3.14/site-packages/lxml/etree.cpython-314-x86_64-linux-gnu.so|5256080|1791929246|gcovr-venv
+comp|native|objectify.cpython-314-x86_64-linux-gnu||unreadable|/opt/gcovr-venv/lib/python3.14/site-packages/lxml/objectify.cpython-314-x86_64-linux-gnu.so|2916792|1791929246|gcovr-venv
+comp|native|sax.cpython-314-x86_64-linux-gnu||unreadable|/opt/gcovr-venv/lib/python3.14/site-packages/lxml/sax.cpython-314-x86_64-linux-gnu.so|182128|1791929246|gcovr-venv
+comp|native|_speedups.cpython-314-x86_64-linux-gnu||unreadable|/opt/gcovr-venv/lib/python3.14/site-packages/markupsafe/_speedups.cpython-314-x86_64-linux-gnu.so|44168|1791929246|gcovr-venv
+comp|native|_yaml.cpython-314-x86_64-linux-gnu||unreadable|/opt/gcovr-venv/lib/python3.14/site-packages/yaml/_yaml.cpython-314-x86_64-linux-gnu.so|2620168|1791929245|gcovr-venv
+comp|native|asn1rt_nif||unreadable|/opt/erlang/OTP-28.5.0.7/lib/asn1-5.4.3.1/priv/lib/asn1rt_nif.so|66376|1790067434|erlang
+comp|native|crypto||unreadable|/opt/erlang/OTP-28.5.0.7/lib/crypto-5.8.3.3/priv/lib/crypto.so|448152|1790067435|erlang
+… 12 of 19 rows shown
+[result_status] OK / FULL
 ```
 <!-- END GENERATED -->
 

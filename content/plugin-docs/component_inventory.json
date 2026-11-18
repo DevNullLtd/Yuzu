@@ -414,17 +414,27 @@
         },
         {
           "action": "native",
-          "not_captured": "agent-context: TEMPORARY placeholder, replaced by the lane capture",
+          "not_captured": null,
           "params": "",
           "rc": 0,
-          "result_status": null,
-          "row_count": 0,
-          "rows": [],
+          "result_status": {
+            "completeness": "FULL",
+            "provenance": "",
+            "status": "OK"
+          },
+          "row_count": 19,
+          "rows": [
+            "status|native|supported|linux:component_inventory:link_skipped,linux:component_inventory:version_unreadable",
+            "comp|native|erl_gl||unreadable|/opt/erlang/OTP-28.5.0.7/lib/wx-2.5.4.1/priv/erl_gl.so|836168|1790067434|erlang",
+            "comp|native|wxe_driver||unreadable|/opt/erlang/OTP-28.5.0.7/lib/wx-2.5.4.1/priv/wxe_driver.so|5924744|1790067434|erlang",
+            "comp|native|_elementpath.cpython-314-x86_64-linux-gnu||unreadable|/opt/gcovr-venv/lib/python3.14/site-packages/lxml/_elementpath.cpython-314-x86_64-linux-gnu.so|209128|1791929246|gcovr-venv",
+            "comp|native|builder.cpython-314-x86_64-linux-gnu||unreadable|/opt/gcovr-venv/lib/python3.14/site-packages/lxml/builder.cpython-314-x86_64-linux-gnu.so|120912|1791929246|gcovr-venv"
+          ],
           "truncated": false
         }
       ],
       "stamp": {
-        "date": "2026-11-15",
+        "date": "2026-11-18",
         "host_class": "vm",
         "leg_hash": "80173557ecbf",
         "os": "linux",
@@ -462,9 +472,13 @@
             "provenance": "macos:component_inventory:budget_entries",
             "status": "CONSTRAINED"
           },
-          "row_count": 1,
+          "row_count": 170,
           "rows": [
-            "status|native|constrained|macos:component_inventory:budget_entries"
+            "status|native|constrained|macos:component_inventory:budget_entries",
+            "comp|native|libredacted1|1.0.0|macho|/Applications/App1.app/Contents/Frameworks/libredacted1.dylib|1667840|1792752729|App1.app",
+            "comp|native|libredacted2|6.2.1|macho|/Applications/App1.app/Contents/Frameworks/libredacted2.18.dylib|3298736|1792752729|App1.app",
+            "comp|native|libredacted1|1.0.0|macho|/Applications/App2.app/Contents/Frameworks/libredacted1.dylib|1667840|1792608728|App2.app",
+            "comp|native|libredacted1|1.0.0|macho|/Applications/App3.app/Contents/Frameworks/libredacted1.dylib|1667840|1794388203|App3.app"
           ],
           "truncated": false
         }
@@ -475,7 +489,7 @@
         "leg_hash": "80173557ecbf",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
-        "privilege": "euid 501"
+        "privilege": "euid 501 (application and library names in the native rows redacted)"
       }
     }
   },

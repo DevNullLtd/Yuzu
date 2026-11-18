@@ -1,4 +1,4 @@
-captured: linux Ubuntu 26.04.1 LTS x86_64 · vm · 2026-11-15 · euid 0 · leg-hash 2f84f2a4c6e7
+captured: linux Ubuntu 26.04.1 LTS x86_64 · vm · 2026-11-18 · euid 0 · leg-hash 80173557ecbf
 == action=scan
 status|scan|supported|linux:component_inventory:link_skipped,linux:component_inventory:version_unreadable
 comp|java|libintl|0.23.2|filename|/usr/share/java/libintl-0.23.2.jar|2594|1763054400|libintl-0.23.2.jar
@@ -6,5 +6,27 @@ comp|java|gradle-wrapper|2.10|manifest|/opt/vcpkg/buildtrees/grpc/src/v1.76.0-c8
 comp|java|gradle-wrapper||unreadable|/opt/vcpkg/buildtrees/grpc/src/v1.81.1-f067b41624.clean/examples/android/helloworld/gradle/wrapper/gradle-wrapper.jar|43764|1780610306|vcpkg
 comp|java|gradle-wrapper|2.10|manifest|/opt/vcpkg/buildtrees/grpc/src/v1.76.0-c85157dbaa.clean/src/android/test/interop/gradle/wrapper/gradle-wrapper.jar|53636|1760754624|vcpkg
 comp|java|gradle-wrapper||unreadable|/opt/vcpkg/buildtrees/grpc/src/v1.81.1-f067b41624.clean/src/android/test/interop/gradle/wrapper/gradle-wrapper.jar|43764|1780610306|vcpkg
+[result_status] OK / FULL / 
+
+== action=native
+status|native|supported|linux:component_inventory:link_skipped,linux:component_inventory:version_unreadable
+comp|native|erl_gl||unreadable|/opt/erlang/OTP-28.5.0.7/lib/wx-2.5.4.1/priv/erl_gl.so|836168|1790067434|erlang
+comp|native|wxe_driver||unreadable|/opt/erlang/OTP-28.5.0.7/lib/wx-2.5.4.1/priv/wxe_driver.so|5924744|1790067434|erlang
+comp|native|_elementpath.cpython-314-x86_64-linux-gnu||unreadable|/opt/gcovr-venv/lib/python3.14/site-packages/lxml/_elementpath.cpython-314-x86_64-linux-gnu.so|209128|1791929246|gcovr-venv
+comp|native|builder.cpython-314-x86_64-linux-gnu||unreadable|/opt/gcovr-venv/lib/python3.14/site-packages/lxml/builder.cpython-314-x86_64-linux-gnu.so|120912|1791929246|gcovr-venv
+comp|native|etree.cpython-314-x86_64-linux-gnu||unreadable|/opt/gcovr-venv/lib/python3.14/site-packages/lxml/etree.cpython-314-x86_64-linux-gnu.so|5256080|1791929246|gcovr-venv
+comp|native|objectify.cpython-314-x86_64-linux-gnu||unreadable|/opt/gcovr-venv/lib/python3.14/site-packages/lxml/objectify.cpython-314-x86_64-linux-gnu.so|2916792|1791929246|gcovr-venv
+comp|native|sax.cpython-314-x86_64-linux-gnu||unreadable|/opt/gcovr-venv/lib/python3.14/site-packages/lxml/sax.cpython-314-x86_64-linux-gnu.so|182128|1791929246|gcovr-venv
+comp|native|_speedups.cpython-314-x86_64-linux-gnu||unreadable|/opt/gcovr-venv/lib/python3.14/site-packages/markupsafe/_speedups.cpython-314-x86_64-linux-gnu.so|44168|1791929246|gcovr-venv
+comp|native|_yaml.cpython-314-x86_64-linux-gnu||unreadable|/opt/gcovr-venv/lib/python3.14/site-packages/yaml/_yaml.cpython-314-x86_64-linux-gnu.so|2620168|1791929245|gcovr-venv
+comp|native|asn1rt_nif||unreadable|/opt/erlang/OTP-28.5.0.7/lib/asn1-5.4.3.1/priv/lib/asn1rt_nif.so|66376|1790067434|erlang
+comp|native|crypto||unreadable|/opt/erlang/OTP-28.5.0.7/lib/crypto-5.8.3.3/priv/lib/crypto.so|448152|1790067435|erlang
+comp|native|crypto_callback||unreadable|/opt/erlang/OTP-28.5.0.7/lib/crypto-5.8.3.3/priv/lib/crypto_callback.so|22912|1790067435|erlang
+comp|native|otp_test_engine||unreadable|/opt/erlang/OTP-28.5.0.7/lib/crypto-5.8.3.3/priv/lib/otp_test_engine.so|41928|1790067435|erlang
+comp|native|dyntrace||unreadable|/opt/erlang/OTP-28.5.0.7/lib/runtime_tools-2.3.1/priv/lib/dyntrace.so|20656|1790067431|erlang
+comp|native|trace_file_drv||unreadable|/opt/erlang/OTP-28.5.0.7/lib/runtime_tools-2.3.1/priv/lib/trace_file_drv.so|36008|1790067431|erlang
+comp|native|trace_ip_drv||unreadable|/opt/erlang/OTP-28.5.0.7/lib/runtime_tools-2.3.1/priv/lib/trace_ip_drv.so|39832|1790067431|erlang
+comp|native|_difflib.cpython-314-x86_64-linux-gnu||unreadable|/opt/gcovr-venv/lib/python3.14/site-packages/lxml/html/_difflib.cpython-314-x86_64-linux-gnu.so|537528|1791929246|gcovr-venv
+comp|native|diff.cpython-314-x86_64-linux-gnu||unreadable|/opt/gcovr-venv/lib/python3.14/site-packages/lxml/html/diff.cpython-314-x86_64-linux-gnu.so|361432|1791929246|gcovr-venv
 [result_status] OK / FULL / 
 
