@@ -10885,6 +10885,10 @@ tests:
       - series: 'yuzu_pg_server_encoding_not_utf8{job="yuzu",instance="s1"}'
         values: "1x30"
     promql_expr_test:
+      # Still inside `for: 5m`: pending, not firing (catches a `for: 0m` regression).
+      - expr: 'ALERTS{alertname="YuzuPgServerEncodingNotUtf8", alertstate="firing"}'
+        eval_time: 3m
+        exp_samples: []
       - expr: 'ALERTS{alertname="YuzuPgServerEncodingNotUtf8", alertstate="firing"}'
         eval_time: 10m
         exp_samples:

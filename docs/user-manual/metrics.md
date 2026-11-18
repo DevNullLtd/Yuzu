@@ -983,7 +983,7 @@ Emitted by the server's policy-compliance evaluator (`PolicyEvaluator`).
 
 | Metric | Type | Meaning |
 |---|---|---|
-| `yuzu_server_policy_unevaluable_responses_total{reason}` | counter | Policy check responses the server could not evaluate and scored `error` (one device, never the whole pass). `reason`: `depth` (output nested past the depth guard) or `exception` (evaluation threw). A numeric JSON value in a row is compared as text and is not counted. |
+| `yuzu_server_policy_unevaluable_responses_total{reason}` | counter | Policy check responses the server could not evaluate and scored `error` (one device, never the whole pass). `reason`: `depth` (output nested past the depth guard), `exception` (evaluation threw) or `expression` (the compliance expression failed to evaluate, e.g. division by zero). A numeric JSON value in a row is compared as text and is not counted. |
 | `yuzu_server_policy_eval_errors_total{phase}` | counter | Evaluator failures by `phase`, a CLOSED set: `claim`, `dispatch`, `remediate_claim`, `fix`, `verify`, `collect_target` (one target in a check pass was skipped because evaluating it threw, so its previous status stands) and `collect_item` (a whole ready item was skipped). `collect_target` and `collect_item` are pre-seeded to 0 and drive the `YuzuPolicyCollectSkipped` alert. |
 
 

@@ -195,7 +195,7 @@ inline std::string format_sse(const SseEvent& ev) {
             if (d[nl] == '\r' && pos < d.size() && d[pos] == '\n')
                 ++pos; // CRLF is ONE break
             if (pos == d.size())
-                break; // a trailing terminator adds no empty data line (as before)
+                break; // a trailing terminator adds no empty data line
         }
     }
     out += '\n'; // blank line terminates the event

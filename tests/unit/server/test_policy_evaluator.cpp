@@ -319,8 +319,8 @@ TEST_CASE("policy evaluator: compliant + non_compliant verdicts (multi-agent fan
     CHECK(h.status_of(pid, "agentB") == "non_compliant");
 }
 
-TEST_CASE("policy evaluator: wrong-typed JSON members take their defaults, a number is compared "
-          "as text and invalid UTF-8 is scored on its raw text; none of it aborts the pass (F6)",
+TEST_CASE("policy evaluator: wrong-typed JSON members take their defaults; a number is compared "
+          "as text; invalid UTF-8 is scored on its raw text; none of it aborts the pass (F6)",
           "[pg][policy][evaluator]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -350,10 +350,13 @@ TEST_CASE("policy evaluator: wrong-typed JSON members take their defaults, a num
     CHECK(h.status_of(pid, "agentB") == "non_compliant");
     CHECK(h.status_of(pid, "agentC") == "compliant");
     // Nothing here is an unevaluable response: parse_result is total, so neither reason counts.
-    CHECK(metrics.counter("yuzu_server_policy_unevaluable_responses_total", {{"reason", "exception"}})
-              .value() == 0);
-    CHECK(metrics.counter("yuzu_server_policy_unevaluable_responses_total", {{"reason", "depth"}})
-              .value() == 0);
+    const auto unevaluable = [&](const char* reason) {
+        return metrics.counter("yuzu_server_policy_unevaluable_responses_total", {{"reason", reason}})
+            .value();
+    };
+    CHECK(unevaluable("exception") == 0);
+    CHECK(unevaluable("depth") == 0);
+    CHECK(unevaluable("expression") == 0);
 }
 
 TEST_CASE("policy evaluator: a throwing evaluation is its own failure domain - later targets "
@@ -397,6 +400,9 @@ TEST_CASE("policy evaluator: a throwing evaluation is its own failure domain - l
     CHECK(metrics.counter("yuzu_server_policy_unevaluable_responses_total",
                           {{"reason", "exception"}})
               .value() == 1);
+    // The bad_alloc target was skipped and counted as a collect_target eval error.
+    CHECK(metrics.counter("yuzu_server_policy_eval_errors_total", {{"phase", "collect_target"}})
+              .value() == 1);
 }
 
 TEST_CASE("policy evaluator: an exception in one item's response-store prelude does not abort "
@@ -410,7 +416,9 @@ TEST_CASE("policy evaluator: an exception in one item's response-store prelude d
     const auto p1 = h.author("result.hostname != ''");
     const auto p2 = h.author("result.hostname != ''");
     std::map<std::string, int> items;
+    yuzu::MetricsRegistry metrics;
     auto deps = h.deps();
+    deps.metrics = &metrics;
     deps.before_item_hook = [&](const std::string& pid) {
         ++items[pid];
         if (pid == p1)
@@ -424,6 +432,8 @@ TEST_CASE("policy evaluator: an exception in one item's response-store prelude d
     CHECK(items[p1] == 1);
     CHECK(items[p2] == 1);
     CHECK(h.status_of(p2, "agentA") == "compliant"); // the later item was still processed
+    CHECK(metrics.counter("yuzu_server_policy_eval_errors_total", {{"phase", "collect_item"}})
+              .value() == 1);
 }
 
 TEST_CASE("policy evaluator: output nested past the depth guard scores error and is counted "
@@ -640,12 +650,19 @@ TEST_CASE("policy evaluator: CEL evaluation error -> error", "[pg][policy][evalu
     h.canned["agentA|checkp"] = {1, out_json2("num", "10", "den", "0")};
     auto pid = h.author("result.num / result.den");
 
-    PolicyEvaluator ev(h.deps());
+    yuzu::MetricsRegistry metrics;
+    auto deps = h.deps();
+    deps.metrics = &metrics;
+    PolicyEvaluator ev(deps);
     REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
     h.fake_now += 20;
     ev.tick(true);
 
     CHECK(h.status_of(pid, "agentA") == "error");
+    // A compliance expression that fails to evaluate is counted under its own closed reason.
+    CHECK(metrics.counter("yuzu_server_policy_unevaluable_responses_total",
+                          {{"reason", "expression"}})
+              .value() == 1);
 }
 
 TEST_CASE("policy evaluator: depth-exceeded r.output -> error, never compliant "

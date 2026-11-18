@@ -487,6 +487,7 @@ private:
         output_buffer.clear();
         output_buffer_bytes = 0;
 
+        maybe_inject_alloc_failure(); // TEST SEAM: a failure AFTER the buffer was cleared
         const auto resp = yuzu::agent::make_output_frame(command_id, action, std::move(combined));
 
         std::lock_guard lock(*write_mu);
@@ -671,11 +672,11 @@ YUZU_EXPORT void arm_output_alloc_failure_for_test(int nth) {
 // Test seam: a stream-mode final flush that hits an allocation failure is contained and counted
 // as a dropped write (returns CommandContextImpl::output_dropped). No stream is needed: the
 // injected failure fires before flush_output_locked touches it.
-YUZU_EXPORT bool stream_flush_alloc_failure_marks_dropped_for_test() {
+YUZU_EXPORT bool stream_flush_alloc_failure_marks_dropped_for_test(int nth) {
     CommandContextImpl ctx_impl{};
     ctx_impl.output_buffer.emplace_back("buffered plugin output");
     ctx_impl.output_buffer_bytes = ctx_impl.output_buffer.back().size();
-    CommandContextImpl::alloc_fault_countdown.store(1, std::memory_order_relaxed);
+    CommandContextImpl::alloc_fault_countdown.store(nth, std::memory_order_relaxed);
     ctx_impl.flush_output();
     CommandContextImpl::alloc_fault_countdown.store(0, std::memory_order_relaxed);
     return ctx_impl.output_dropped.load(std::memory_order_relaxed);

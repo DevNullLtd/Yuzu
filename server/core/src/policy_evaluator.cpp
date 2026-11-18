@@ -228,6 +228,9 @@ std::string verdict_for(const StoredResponse& r, const std::string& policy_id,
     case ComplianceResult::non_compliant:
         return "non_compliant";
     default:
+        // The compliance expression itself failed to evaluate (division by zero, timeout, ...).
+        if (unevaluable_reason)
+            *unevaluable_reason = "expression";
         return "error";
     }
 }
@@ -320,12 +323,12 @@ PolicyEvaluator::PolicyEvaluator(Deps deps) : d_(std::move(deps)) {
 
     // Closed-set `reason` label (observability-conventions: pre-seed so the family and HELP/TYPE
     // exist on a healthy server). Reasons: depth (output nested past the depth guard), exception
-    // (parse/evaluate threw on a hostile or malformed response).
+    // (evaluation threw) and expression (the compliance expression failed to evaluate).
     if (d_.metrics) {
         d_.metrics->describe("yuzu_server_policy_unevaluable_responses_total",
                              "Policy check responses that could not be evaluated and scored error",
                              "counter");
-        for (const char* r : {"depth", "exception"})
+        for (const char* r : {"depth", "exception", "expression"})
             d_.metrics->counter("yuzu_server_policy_unevaluable_responses_total", {{"reason", r}});
         // Pre-seeded so increase() sees the first skip (a series born at 1 contributes no
         // increase) and the YuzuPolicyCollectSkipped alert can fire on it.

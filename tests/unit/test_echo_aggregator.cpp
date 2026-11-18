@@ -3446,6 +3446,15 @@ TEST_CASE("process baseline: a scrub that cannot write leaves the row and succee
 
 // F16: a process name is attacker-chosen bytes. Strict nlohmann dump() throws type_error 316 on
 // invalid UTF-8, which aborted every collect_fast tick; the baseline must serialise regardless.
+TEST_CASE("scrub_wire_strings(ProcessInfo) scrubs the command line too (fleet snapshot)",
+          "[echo][aggregator][process-baseline]") {
+    auto p = make_proc(1, 0, "n\xff", "a\xff", "u\xff");
+    scrub_wire_strings(p);
+    CHECK(p.name == "n?");
+    CHECK(p.user == "u?");
+    CHECK(p.cmdline == "a?");
+}
+
 TEST_CASE("process baseline: invalid UTF-8 in a name does not throw on encode (F16)",
           "[echo][aggregator][process-baseline]") {
     const auto bad = make_proc(10, 1, std::string("ev\xFF\xC3il"), "", "svc");
@@ -3478,7 +3487,7 @@ TEST_CASE("echo no-phantom: process names round-trip to zero events (F16)",
     // The failure mode this guards: the decoded baseline (U+FFFD) vs the RAW current.
     CHECK_FALSE(compute_process_events(decode_process_baseline(encode_process_baseline(cur)), cur,
                                        1, 1).empty());
-    scrub_wire_strings(cur); // what collection now does
+    scrub_wire_strings(cur); // what collection does
     CHECK(compute_process_events(decode_process_baseline(encode_process_baseline(cur)), cur, 1, 1)
               .empty());
     CHECK(cur[0].name.find('?') != std::string::npos);

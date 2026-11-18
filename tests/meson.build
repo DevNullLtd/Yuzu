@@ -4369,6 +4369,15 @@ test('Echo scrub-wiring lexical gate (WP07)',
   timeout: 30,
 )
 
+# WP07: lexical pins for the agent's output-dropped counter increment and the server's boot call to
+# pg::report_server_encoding (neither is reachable from a unit test). Source text only.
+test('WP07 metrics wiring lexical gate',
+  _python3_test,
+  args: [files('test_wp07_metrics_wiring_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
+
 # #5291 / PR #6311: static lexical gate over Echo's Windows-only bounded hive-mount call site --
 # the module must be pinned before the first mount and the walk must stop mounting after a timeout
 # (a detached mount thread, abandoned or not, keeps running plugin code with nothing joining it).

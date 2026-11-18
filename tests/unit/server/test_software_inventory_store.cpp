@@ -7612,7 +7612,7 @@ TEST_CASE("query_software: selects the install_* columns and facet state; the st
     CHECK(store.query_software(q)->size() == 17);
 }
 
-// WP07 gate-8 CH-21: a constrained / timeout / oversize section (what the agent now ships when a
+// WP07 gate-8 CH-21: a constrained / timeout / oversize section (what the agent ships when a
 // capture was truncated by a dropped output write) must be status-only: no row is deleted or
 // inserted, NO change-ledger row (a fabricated "uninstall") is written, and the section hash and
 // the report hash are untouched. Pinned against real Postgres, on top of the status/hash test above.

@@ -7,7 +7,9 @@ phantom pair EVERY tick unless the freshly enumerated set is first passed throug
 yuzu::echo::scrub_wire_strings (echo_wire_scrub.hpp). The per-source behaviour is unit-tested on the
 scrub helpers, but the CALL SITES live in echo_plugin.cpp's collect_fast_impl, behind anonymous
 helpers a unit test cannot reach, so deleting one stays green. This gate pins each call site
-lexically (best-effort: source text, not semantics). Run: python3 tests/test_echo_scrub_wiring_lexical.py
+lexically (best-effort: source text, not semantics). LIMITS: it is lexical and cannot model an
+`#if 0` block, a backslash-continued // comment, or a call that sits inside a string literal.
+Run: python3 tests/test_echo_scrub_wiring_lexical.py
 """
 import pathlib
 import re

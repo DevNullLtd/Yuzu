@@ -305,7 +305,7 @@ TEST_CASE("host scrubs plugin output to well-formed UTF-8 before buffering (F70)
 // complete (the server would replace stored rows with it).
 namespace yuzu::agent {
 void arm_output_alloc_failure_for_test(int nth); // agent.cpp test seam
-bool stream_flush_alloc_failure_marks_dropped_for_test(); // agent.cpp test seam
+bool stream_flush_alloc_failure_marks_dropped_for_test(int nth); // agent.cpp test seam
 }
 
 namespace {
@@ -339,7 +339,11 @@ TEST_CASE("a plugin write lost to bad_alloc marks the capture truncated and CONS
 // firewall with yuzu_agent_plugin_output_dropped_total and yuzu.output_dropped unmoved.
 TEST_CASE("a stream-mode final flush lost to bad_alloc is contained and marked dropped",
           "[agent][utf8][seam]") {
-    CHECK(yuzu::agent::stream_flush_alloc_failure_marks_dropped_for_test());
+    // nth = 1: the failure hits while the payload is being built (buffer still intact).
+    CHECK(yuzu::agent::stream_flush_alloc_failure_marks_dropped_for_test(1));
+    // nth = 2: the failure hits AFTER output_buffer was cleared; the output is gone for good, so
+    // it must be counted just the same.
+    CHECK(yuzu::agent::stream_flush_alloc_failure_marks_dropped_for_test(2));
 }
 
 namespace {
