@@ -4282,6 +4282,14 @@ if _bash_test.found()
       suite: 'docs',
       timeout: 60,
     )
+    # The pull_request diff base (merge commit's first parent) shared by the
+    # README touch rule and the spawn scan; also pins both workflows to it.
+    test('pr merge-parent base selftest',
+      _bash_test,
+      args: [files('../scripts/ci/pr-merge-parent.sh'), '--selftest'],
+      suite: 'docs',
+      timeout: 60,
+    )
     # #6470: the bash-side exit codes (usage error, no working python) of the three
     # CI lints, which their own --selftest cannot reach. Off Windows only: the
     # no-python arm builds a PATH of symlinks, which MSYS2 turns into copies.

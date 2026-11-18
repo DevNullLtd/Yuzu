@@ -636,8 +636,9 @@ It runs as its **own workflow**, not folded into `ci.yml`: a source
 grep needs no build, so it doesn't share `ci.yml`'s build-dependent
 PR fast-path or `changes`-job path filtering — there is nothing
 expensive to skip, so the workflow simply always runs on every PR and
-push to `main`/`dev`. A failing lexical scan is a **merge-blocking**
-required check; remediation is either moving the call into the
+push to `main`/`dev`. A failing lexical scan fails the PR's checks,
+but it is **not a required status check** in the `dev` or `main`
+rulesets today, so it does not by itself block a merge; remediation is either moving the call into the
 registered allowlist (if it is a legitimate, reviewed acquisition
 path) or removing the raw spawn in favour of the sanctioned subprocess
 runner.
@@ -662,7 +663,11 @@ requests only, not a required check today) runs
 must carry a visible `docs-unchanged: <section> — <reason>` line, which
 the job prints. It diffs the `refs/pull/<N>/merge` commit against that
 commit's first parent, so the change it judges is exactly the PR's own,
-however far the target branch has moved since `base.sha` was recorded. Both scripts carry a fixture self-test that the `docs`
+however far the target branch has moved since `base.sha` was recorded;
+the spawn scan's grandfathering base is taken the same way. Both come
+from `scripts/ci/pr-merge-parent.sh`, which fails the job closed when the
+checked-out merge commit does not merge the PR's head (push again for a
+fresh run: a re-run reuses the same event). Both scripts carry a fixture self-test that the `docs`
 suite also runs (the touch-rule one off Windows only, #5428).
 
 A third `docs-lint.yml` gate, the personal-data guard
