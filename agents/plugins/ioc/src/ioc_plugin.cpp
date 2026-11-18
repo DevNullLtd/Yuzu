@@ -616,14 +616,14 @@ Examined examine_path_impl(const yuzu::shared::local_path::LocalPathGuard& guard
     ex.size = static_cast<std::uint64_t>(sb.st_size);
     if (!want_hash)
         return ex;
-    auto rd = lp::posix_open_checked(resolved, O_RDONLY | O_NONBLOCK | O_NOCTTY);
+    auto rd = lp::posix_open_checked(resolved, O_RDONLY | O_NONBLOCK | O_NOCTTY, /*require_regular=*/true);
     if (rd.absent) { // vanished between the two opens: a definitive answer
         ex.exists = false;
         ex.absent = true;
         return ex;
     }
     if (!rd.opened()) {
-        ex.cause = rd.refusal != lp::Refusal::none ? refusal_cause(rd.refusal) : "unreadable";
+        ex.cause = rd.not_regular ? "not_regular" : rd.refusal != lp::Refusal::none ? refusal_cause(rd.refusal) : "unreadable";
         return ex;
     }
     auto r = yuzu::shared::hash_fd_regular(rd.file.fd(), kMaxHashFileBytes, deadline);

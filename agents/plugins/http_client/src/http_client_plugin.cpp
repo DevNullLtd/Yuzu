@@ -205,25 +205,32 @@ bool parse_url(std::string_view url, ParsedUrl& out) {
 constexpr std::chrono::seconds kDownloadTotalTimeout{600}; // whole transfer, not per recv
 constexpr std::chrono::seconds kRequestTotalTimeout{120};
 
+constexpr std::size_t kMaxAttempts = 4; // vetted addresses tried per request, at most
+
 // Run one request through a client pinned to `ip` (the host name stays the Host header and the TLS
 // name). `request` is called with the configured client (Client or SSLClient). An https URL on a
-// build without OpenSSL sets `https_unsupported` and runs nothing.
+// build without OpenSSL sets `https_unsupported` and runs nothing. `remaining` is what is left of
+// the request's ONE total deadline (shared by every attempt). Every client turns httplib's response
+// decompression off right after construction: the body is hashed and stored exactly as sent, and
+// `get`/`head` ask for identity encoding (`identity_encoding`).
 template <class Fn>
 httplib::Result run_pinned(const ParsedUrl& parsed, const std::string& ip, int read_timeout_s,
-                           std::chrono::seconds total_timeout, bool& https_unsupported,
-                           Fn&& request) {
+                           std::chrono::seconds remaining, bool identity_encoding,
+                           bool& https_unsupported, Fn&& request) {
     const auto setup = [&](auto& cli) {
-        cli.set_decompress(false); // no transparent decompression of an untrusted body
         cli.set_hostname_addr_map({{parsed.host, ip}});
         cli.set_connection_timeout(30);
         cli.set_read_timeout(read_timeout_s);
         // A total deadline for the whole exchange: the per-recv timeouts alone let a server that
         // trickles one byte at a time hold a worker (and, for a download, a growing buffer).
-        cli.set_max_timeout(total_timeout);
+        cli.set_max_timeout(remaining);
+        if (identity_encoding)
+            cli.set_default_headers({{"Accept-Encoding", "identity"}});
     };
     if (parsed.is_https) {
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
         httplib::SSLClient cli(parsed.host, parsed.port);
+        cli.set_decompress(false);
         setup(cli);
         cli.enable_server_certificate_verification(true);
         return request(cli);
@@ -233,21 +240,36 @@ httplib::Result run_pinned(const ParsedUrl& parsed, const std::string& ip, int r
 #endif
     }
     httplib::Client cli(parsed.host, parsed.port);
+    cli.set_decompress(false);
     setup(cli);
     return request(cli);
 }
 
-// Try each vetted address in turn (IPv4 first) until one connects: a host that answers both
-// families keeps its dual-stack fallback without a second lookup of the name.
+// Try the vetted addresses in turn (IPv4 first; at most kMaxAttempts) until a connection is made:
+// a host that answers both families keeps its dual-stack fallback without a second lookup of the
+// name. Only a failure to CONNECT moves on to the next address: once a request may have reached the
+// peer (a read error, a timeout after sending, an HTTP answer of any status) the result stands, so
+// an attempt that produced an answer is never overwritten by a later one. One absolute deadline
+// covers all attempts; `request` starts each attempt from clean state.
 template <class Fn>
 httplib::Result try_vetted(const ParsedUrl& parsed, const std::vector<std::string>& ips,
                            int read_timeout_s, std::chrono::seconds total_timeout,
-                           bool& https_unsupported, Fn&& request) {
+                           bool identity_encoding, bool& https_unsupported, Fn&& request) {
+    const auto deadline = std::chrono::steady_clock::now() + total_timeout;
     httplib::Result res;
+    std::size_t attempts = 0;
     for (const auto& ip : ips) {
-        res = run_pinned(parsed, ip, read_timeout_s, total_timeout, https_unsupported, request);
+        if (attempts++ >= kMaxAttempts)
+            break;
+        const auto left = std::chrono::duration_cast<std::chrono::seconds>(
+            deadline - std::chrono::steady_clock::now());
+        if (left.count() <= 0)
+            break;
+        res = run_pinned(parsed, ip, read_timeout_s, left, identity_encoding, https_unsupported, request);
         if (res || https_unsupported)
             break;
+        if (res.error() != httplib::Error::Connection)
+            break; // the request may have been sent: do not try another address
     }
     return res;
 }
@@ -311,9 +333,16 @@ int download_url(std::string_view url, std::string& body, bool hash_will_verify,
     obs.hash_will_verify = hash_will_verify;
     httplib::Result res;
     try {
-        res = try_vetted(parsed, ips, 300, kDownloadTotalTimeout, obs.https_unsupported,
-                         [&](auto& cli) {
+        res = try_vetted(parsed, ips, 300, kDownloadTotalTimeout, /*identity_encoding=*/false,
+                         obs.https_unsupported, [&](auto& cli) {
+                             // Every attempt starts clean: nothing a failed attempt observed may
+                             // describe the next one.
                              body.clear();
+                             size_exceeded = false;
+                             rejected_status = 0;
+                             has_length = false;
+                             chunked = false;
+                             declared_length = 0;
                              return cli.Get(parsed.path, response_handler, content_receiver);
                          });
     } catch (const std::bad_alloc&) {
@@ -354,8 +383,8 @@ std::string http_get(std::string_view url, int& status_code) {
     }
 
     bool https_unsupported = false;
-    auto res = try_vetted(parsed, ips, 60, kRequestTotalTimeout, https_unsupported,
-                          [&](auto& cli) { return cli.Get(parsed.path); });
+    auto res = try_vetted(parsed, ips, 60, kRequestTotalTimeout, /*identity_encoding=*/true,
+                          https_unsupported, [&](auto& cli) { return cli.Get(parsed.path); });
     if (https_unsupported) {
         status_code = 0;
         return "HTTPS not supported (OpenSSL not available)";
@@ -387,8 +416,8 @@ std::string http_head(std::string_view url, int& status_code) {
     }
 
     bool https_unsupported = false;
-    auto res = try_vetted(parsed, ips, 60, kRequestTotalTimeout, https_unsupported,
-                          [&](auto& cli) { return cli.Head(parsed.path); });
+    auto res = try_vetted(parsed, ips, 60, kRequestTotalTimeout, /*identity_encoding=*/true,
+                          https_unsupported, [&](auto& cli) { return cli.Head(parsed.path); });
     if (https_unsupported) {
         status_code = 0;
         return "HTTPS not supported (OpenSSL not available)";

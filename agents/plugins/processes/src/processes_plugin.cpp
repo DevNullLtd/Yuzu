@@ -19,6 +19,7 @@
 #include <yuzu/plugin.hpp>
 
 #include <bounded_file_hash.hpp> // yuzu::shared::hash_fd_regular (Linux image hash)
+#include <bounded_wait.hpp>      // bounded_call_ex: a stalled filesystem cannot hold the command worker
 #include <local_path_policy.hpp> // yuzu::shared::local_path (Windows/macOS image path guard)
 
 #include <algorithm>
@@ -231,7 +232,7 @@ std::string resolve_exe_path(unsigned long pid) {
         return "";
     std::string path(buf.data(), static_cast<size_t>(n));
     // A replaced/removed binary reads as "<path> (deleted)" — strip the marker for DISPLAY only.
-    // This text is never opened: the hash goes through hash_process_image's open of
+    // This text is never opened (Linux): the hash goes through hash_process_image's open of
     // /proc/<pid>/exe itself, which is the kernel's own reference to the running image.
     if (path.ends_with(" (deleted)"))
         path.erase(path.size() - 10);
@@ -266,39 +267,88 @@ std::string resolve_exe_path(unsigned long) {
 constexpr std::size_t kMaxImageHashBytes = 512ull * 1024 * 1024; // 512 MiB cap
 using HashCache = std::unordered_map<std::string, std::string>;
 
+constexpr auto kPerImageBudget = std::chrono::seconds(30);
+constexpr auto kActionBudget = std::chrono::seconds(120); // all images together
+
 #if defined(__linux__)
+// One image on a bounded helper (bounded_wait.hpp): an open or read of a file on a stalled
+// filesystem cannot hold the command worker past the budget (the helper owns its descriptor; at most
+// 64 helpers are outstanding process-wide and a refused or timed-out call reads as an empty hash).
+// The identity key (dev:ino) comes back with the hash so a replaced binary is not conflated.
+struct ImageHash {
+    std::string key;
+    std::string hash;
+};
+
+ImageHash hash_linux_image(unsigned long pid, std::chrono::steady_clock::time_point deadline) {
+    ImageHash out;
+    yuzu::shared::ScopedFile fd{::open(("/proc/" + std::to_string(pid) + "/exe").c_str(),
+                                       O_RDONLY | O_NONBLOCK | O_NOCTTY | O_CLOEXEC)};
+    if (!fd.valid())
+        return out;
+    struct stat st{};
+    if (::fstat(fd.fd(), &st) != 0 || !S_ISREG(st.st_mode))
+        return out;
+    out.key = std::format("{}:{}", static_cast<unsigned long long>(st.st_dev),
+                          static_cast<unsigned long long>(st.st_ino));
+    auto r = yuzu::shared::hash_fd_regular(fd.fd(), kMaxImageHashBytes, deadline);
+    if (r.status == yuzu::shared::HashStatus::ok)
+        out.hash = std::move(r.hex);
+    return out;
+}
+
+// There is NO network-mount judgement on this path: the image is opened through /proc/<pid>/exe, a
+// kernel reference to the running image, never through path text. The bound is the helper.
+struct ImageGuard {}; // Linux needs no mount-table snapshot (see below)
+
 std::string hash_process_image(unsigned long pid, const std::string& path, HashCache& cache,
-                               const yuzu::shared::local_path::LocalPathGuard&) {
+                               const ImageGuard&, std::chrono::steady_clock::time_point action_deadline) {
     if (path.empty())
         return {};
-    const std::string link = "/proc/" + std::to_string(pid) + "/exe";
-    yuzu::agent::ScopedFd fd{::open(link.c_str(), O_RDONLY | O_NONBLOCK | O_NOCTTY | O_CLOEXEC)};
-    if (!fd)
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= action_deadline)
         return {};
-    struct stat st{};
-    if (::fstat(fd.get(), &st) != 0 || !S_ISREG(st.st_mode))
+    const auto budget = std::min<std::chrono::steady_clock::duration>(kPerImageBudget, action_deadline - now);
+    const auto deadline = now + budget;
+    auto result = yuzu::shared::bounded_call_ex(
+        std::chrono::duration_cast<std::chrono::milliseconds>(budget),
+        [pid, deadline]() { return hash_linux_image(pid, deadline); });
+    if (result.status != yuzu::shared::BoundedCallStatus::Completed || !result.value)
         return {};
-    const std::string key = std::format("{}:{}", static_cast<unsigned long long>(st.st_dev),
-                                        static_cast<unsigned long long>(st.st_ino));
-    if (const auto it = cache.find(key); it != cache.end())
+    const auto& img = *result.value;
+    if (img.key.empty())
+        return {};
+    if (const auto it = cache.find(img.key); it != cache.end())
         return it->second;
-    auto r = yuzu::shared::hash_fd_regular(
-        fd.get(), kMaxImageHashBytes, yuzu::shared::HashClock::now() + std::chrono::seconds(30));
-    std::string hash = r.status == yuzu::shared::HashStatus::ok ? std::move(r.hex) : std::string{};
-    cache.emplace(key, hash);
-    return hash;
+    cache.emplace(img.key, img.hash);
+    return img.hash;
 }
 #else
+using ImageGuard = yuzu::shared::local_path::LocalPathGuard;
+
+// Windows and macOS: the image path text is judged (UNC/device/non-fixed drive, or on/symlinked into
+// a listed network mount) before anything opens it, and judge + hash run on a bounded helper.
 std::string hash_process_image(unsigned long, const std::string& path, HashCache& cache,
-                               const yuzu::shared::local_path::LocalPathGuard& guard) {
+                               const ImageGuard& guard,
+                               std::chrono::steady_clock::time_point action_deadline) {
     if (path.empty())
         return {};
     if (const auto it = cache.find(path); it != cache.end())
         return it->second;
-    // Judged once per distinct path with the action's own snapshot (never a per-process table read).
+    const auto now = std::chrono::steady_clock::now();
     std::string hash;
-    if (!yuzu::shared::local_path::refused(guard.refusal(path)))
-        hash = yuzu::agent::sha256_file(path, kMaxImageHashBytes);
+    if (now < action_deadline) {
+        const auto budget =
+            std::min<std::chrono::steady_clock::duration>(kPerImageBudget, action_deadline - now);
+        auto result = yuzu::shared::bounded_call_ex(
+            std::chrono::duration_cast<std::chrono::milliseconds>(budget), [path, guard]() -> std::string {
+                if (yuzu::shared::local_path::refused(guard.refusal(path)))
+                    return {};
+                return yuzu::agent::sha256_file(path, kMaxImageHashBytes);
+            });
+        if (result.status == yuzu::shared::BoundedCallStatus::Completed && result.value)
+            hash = std::move(*result.value);
+    }
     cache.emplace(path, hash);
     return hash;
 }
@@ -412,10 +462,11 @@ private:
     int do_list_tree(yuzu::CommandContext& ctx) {
         auto procs = enumerate_processes();
         HashCache hash_cache; // image identity -> sha256
-        const yuzu::shared::local_path::LocalPathGuard guard; // one mount-table snapshot per action
+        const ImageGuard guard;
+        const auto action_deadline = std::chrono::steady_clock::now() + kActionBudget;
         for (const auto& p : procs) {
             std::string path = resolve_exe_path(p.pid);
-            std::string hash = hash_process_image(p.pid, path, hash_cache, guard);
+            std::string hash = hash_process_image(p.pid, path, hash_cache, guard, action_deadline);
             ctx.write_output(std::format("proc|{}|{}|{}|{}|{}", p.pid, p.ppid,
                                          sanitize_field(p.name), hash, sanitize_field(path)));
         }
@@ -430,10 +481,11 @@ private:
     int do_list_hashed(yuzu::CommandContext& ctx) {
         auto procs = enumerate_processes();
         HashCache hash_cache; // image identity -> sha256
-        const yuzu::shared::local_path::LocalPathGuard guard; // one mount-table snapshot per action
+        const ImageGuard guard;
+        const auto action_deadline = std::chrono::steady_clock::now() + kActionBudget;
         for (const auto& p : procs) {
             std::string path = resolve_exe_path(p.pid);
-            std::string hash = hash_process_image(p.pid, path, hash_cache, guard);
+            std::string hash = hash_process_image(p.pid, path, hash_cache, guard, action_deadline);
             ctx.write_output(std::format("proc|{}|{}|{}|{}", p.pid, sanitize_field(p.name), hash,
                                          sanitize_field(path)));
         }

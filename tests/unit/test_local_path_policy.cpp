@@ -402,6 +402,61 @@ TEST_CASE("local_path: a rename-swap race never opens through the swapped-in lin
 }
 #endif
 
+namespace {
+// Run `fn` on a thread and fail (instead of wedging the suite) if it does not finish in `ms`.
+template <class Fn>
+bool finishes_within(std::chrono::milliseconds ms, Fn fn) {
+    auto done = std::make_shared<std::atomic<bool>>(false);
+    std::thread t([done, fn = std::move(fn)]() mutable { fn(); done->store(true); });
+    const auto limit = std::chrono::steady_clock::now() + ms;
+    while (!done->load() && std::chrono::steady_clock::now() < limit)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    if (done->load()) {
+        t.join();
+        return true;
+    }
+    t.detach(); // a regression leaks one blocked thread, never the whole run
+    return false;
+}
+} // namespace
+
+TEST_CASE("local_path: a FIFO or a /dev/zero symlink is refused promptly, on both the O_PATH and the plain O_RDONLY legs",
+          "[shared][local_path]") {
+    yuzu::test::TempDir tmp{"yuzu_test_lpfifo_"};
+    REQUIRE(fs::create_directory(tmp.path));
+    const auto base = fs::canonical(tmp.path);
+    const auto fifo = base / "trap.fifo";
+    REQUIRE(::mkfifo(fifo.c_str(), 0600) == 0);
+    fs::create_symlink("/dev/zero", base / "zero_link");
+    { std::ofstream(base / "ok.txt") << "x"; }
+
+    // path_flag O_RDONLY forces the macOS (no O_PATH) code path on Linux.
+    for (const int path_flag : {lp::kPathFlag, static_cast<int>(O_RDONLY)}) {
+        INFO("path_flag=" << path_flag);
+        bool fifo_refused = false, zero_refused = false, ok_opens = false;
+        const bool prompt = finishes_within(std::chrono::seconds(5), [&] {
+            auto f = lp::posix_open_checked(fifo.string(), O_RDONLY, /*require_regular=*/true, path_flag);
+            fifo_refused = !f.opened() && f.not_regular;
+            // /dev/zero behind a symlink: the leaf is a link, refused without being followed.
+            auto z = lp::posix_open_checked((base / "zero_link").string(), O_RDONLY, true, path_flag);
+            zero_refused = !z.opened();
+            auto o = lp::posix_open_checked((base / "ok.txt").string(), O_RDONLY, true, path_flag);
+            ok_opens = o.opened();
+        });
+        REQUIRE(prompt); // not hung
+        CHECK(fifo_refused);
+        CHECK(zero_refused);
+        CHECK(ok_opens);
+    }
+    // /dev/zero itself (a device node, not a link) is refused as not regular.
+    bool dev_refused = false;
+    REQUIRE(finishes_within(std::chrono::seconds(5), [&] {
+        auto d = lp::posix_open_checked("/dev/zero", O_RDONLY, true, O_RDONLY);
+        dev_refused = !d.opened();
+    }));
+    CHECK(dev_refused);
+}
+
 TEST_CASE("local_path: a symlink loop fails closed", "[shared][local_path]") {
     yuzu::test::TempDir tmp{"yuzu_test_lp_"};
     REQUIRE(fs::create_directory(tmp.path));
@@ -1064,6 +1119,30 @@ TEST_CASE("windows_updates plugin: the TCP probe path runs to completion (addrin
     CHECK(contains(r.captured, "target|http://10.255.255.1:9/|dns_ok|true"));
     CHECK(contains(r.captured, "tcp_ok|"));
     CHECK(contains(r.captured, "summary|targets_tested|1|"));
+}
+
+TEST_CASE("procfetch plugin: this process's image is hashed through its exe link and the run completes",
+          "[shared][local_path][procfetch]") {
+#ifdef __linux__
+    auto plugin = load_or_fail("procfetch");
+    yuzu::agent::LocalDispatcher dispatcher;
+    const auto r = dispatcher.run(plugin.descriptor, "procfetch_fetch");
+    CHECK(r.rc == 0);
+    const std::string mine = std::to_string(::getpid()) + "|";
+    const auto at = r.captured.find("\n" + mine);
+    const auto row_start = at != std::string::npos ? at + 1 : r.captured.find(mine);
+    REQUIRE(row_start != std::string::npos);
+    const auto eol = r.captured.find('\n', row_start);
+    const std::string row = r.captured.substr(row_start, eol == std::string::npos ? std::string::npos : eol - row_start);
+    // pid|name|path|sha1: the sha1 is the last field, 40 lowercase hex characters.
+    const auto last = row.rfind('|');
+    REQUIRE(last != std::string::npos);
+    const std::string sha1 = row.substr(last + 1);
+    CHECK(sha1.size() == 40);
+    CHECK(sha1.find_first_not_of("0123456789abcdef") == std::string::npos);
+#else
+    SUCCEED("Linux-only");
+#endif
 }
 
 TEST_CASE("processes plugin: list_hashed hashes this process's own image through the exe link",

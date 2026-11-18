@@ -444,6 +444,7 @@ struct CheckedOpen {
     yuzu::shared::ScopedFile file;
     Refusal refusal{Refusal::none};
     bool absent{false};
+    bool not_regular{false}; ///< `require_regular` was set and the leaf is a FIFO/device/socket/directory
     int err{0};
     [[nodiscard]] bool opened() const noexcept { return file.valid(); }
 };
@@ -485,7 +486,16 @@ namespace detail {
 
 } // namespace detail
 
-[[nodiscard]] inline CheckedOpen posix_open_checked(const std::string& resolved, int final_flags) {
+///
+/// The LEAF is always opened with O_NONBLOCK added, whatever `path_flag` is: where there is no
+/// O_PATH (macOS) the leaf is opened O_RDONLY, and a plain O_RDONLY open of a FIFO with no writer
+/// (or a device node) blocks in open(2) before any fstat could refuse it. `require_regular` fstat's
+/// the opened descriptor and refuses (closing it, `not_regular`) anything but a regular file, so a
+/// FIFO, a device, a socket or a symlink-to-/dev/zero is refused without being read. `path_flag` is a
+/// seam: tests pass O_RDONLY to force the non-O_PATH (macOS) code path on Linux.
+[[nodiscard]] inline CheckedOpen posix_open_checked(const std::string& resolved, int final_flags,
+                                                    bool require_regular = false,
+                                                    int path_flag = kPathFlag) {
     CheckedOpen out;
     if (resolved.empty() || resolved.front() != '/') {
         out.refusal = Refusal::unresolvable;
@@ -505,7 +515,7 @@ namespace detail {
             break;
         start = slash + 1;
     }
-    yuzu::shared::ScopedFile dir{::open("/", kPathFlag | O_DIRECTORY | O_CLOEXEC)};
+    yuzu::shared::ScopedFile dir{::open("/", path_flag | O_DIRECTORY | O_CLOEXEC)};
     if (!dir.valid()) {
         out.err = errno;
         out.refusal = Refusal::unresolvable;
@@ -513,8 +523,8 @@ namespace detail {
     }
     for (std::size_t i = 0; i < parts.size(); ++i) {
         const bool last = i + 1 == parts.size();
-        const int flags = last ? (final_flags | O_NOFOLLOW | O_CLOEXEC | O_NOCTTY)
-                               : (kPathFlag | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        const int flags = last ? (final_flags | O_NOFOLLOW | O_CLOEXEC | O_NOCTTY | O_NONBLOCK)
+                               : (path_flag | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
         yuzu::shared::ScopedFile next{::openat(dir.fd(), parts[i].c_str(), flags)};
         if (!next.valid()) {
             out.err = errno;
@@ -535,6 +545,15 @@ namespace detail {
         dir = std::move(next);
     }
     out.file = std::move(dir); // the opened leaf (or the root itself for "/")
+    if (require_regular) {
+        struct stat lst{};
+        if (::fstat(out.file.fd(), &lst) != 0 || !S_ISREG(lst.st_mode)) {
+            out.err = errno;
+            out.file = yuzu::shared::ScopedFile{};
+            out.not_regular = true;
+            return out;
+        }
+    }
 #if defined(__linux__)
     struct statfs sfs{};
     if (::fstatfs(out.file.fd(), &sfs) != 0) {

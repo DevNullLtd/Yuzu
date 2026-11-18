@@ -869,6 +869,7 @@ agent_test_exe = executable(
                 network_diag_plugin_lib,
                 os_info_plugin_lib,
                 processes_plugin_lib,
+                procfetch_plugin_lib,  # WP10: test_local_path_policy.cpp loads the real procfetch plugin by path
                 reserved_name_fixture_plugin,
                 retired_name_fixture_plugin,
                 sccm_plugin_lib,

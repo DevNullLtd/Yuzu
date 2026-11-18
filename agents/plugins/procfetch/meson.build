@@ -6,7 +6,8 @@ if host_machine.system() != 'windows'
   procfetch_deps += openssl_dep
 endif
 
-shared_library(
+# Captured so tests/meson.build can order it ahead of agent_test_exe via link_depends.
+procfetch_plugin_lib = shared_library(
   'procfetch',
   files('src/procfetch_plugin.cpp'),
   name_prefix: '',
