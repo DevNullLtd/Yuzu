@@ -2218,6 +2218,155 @@ TEST_CASE("policy dispatch approval: a refused verify leaves the fix in place an
 }
 
 // ---------------------------------------------------------------------------
+// G01: the `blocked` write of a refused fix or post-fix check is fenced on the claim generation,
+// and a fix refusal writes it BEFORE it releases the claim. These three tests make a sibling
+// replica's reclaim happen at the instant that matters, so removing the fence argument at either
+// call site, or swapping write and release, changes the outcome a test sees.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Runs one statement on its own connection (a trigger definition, or a sibling's reclaim).
+void exec_sql(const std::string& dsn, const char* sql, std::vector<std::string> params = {}) {
+    PgConn conn{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    PgResult r = yuzu::server::pg::exec_params(conn.get(), sql, params);
+    INFO(PQerrorMessage(conn.get()));
+    REQUIRE((r.status() == PGRES_COMMAND_OK || r.status() == PGRES_TUPLES_OK));
+}
+
+// An AFTER UPDATE trigger on policy_status that bumps the row's claim generation, as a sibling
+// replica's reclaim does, when `when_clause` holds. The nested UPDATE changes neither watched
+// column in a way that satisfies the clause again, so it cannot recurse.
+void install_sibling_reclaim_trigger(const std::string& dsn, const char* when_clause) {
+    exec_sql(dsn,
+             "CREATE FUNCTION policy_store.g01_sibling_reclaim() RETURNS trigger LANGUAGE plpgsql AS "
+             "$$ BEGIN "
+             "  UPDATE policy_store.policy_status SET remediation_claim_gen = "
+             "    remediation_claim_gen + 1 "
+             "  WHERE policy_id = NEW.policy_id AND agent_id = NEW.agent_id; "
+             "  RETURN NULL; END $$");
+    const std::string trig =
+        std::string("CREATE TRIGGER g01_sibling_reclaim AFTER UPDATE ON "
+                    "policy_store.policy_status FOR EACH ROW WHEN (") +
+        when_clause + ") EXECUTE FUNCTION policy_store.g01_sibling_reclaim()";
+    exec_sql(dsn, trig.c_str());
+}
+
+double fence_skips(yuzu::MetricsRegistry& m) {
+    return m.counter("yuzu_server_policy_remediation_fence_skip_total").value();
+}
+
+} // namespace
+
+TEST_CASE("policy dispatch approval: a refused fix is written fenced, so a sibling's reclaim "
+          "is not overwritten by blocked",
+          "[pg][policy][evaluator][dispatch_approval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    h.capability_registry = &full_registry();
+    yuzu::MetricsRegistry metrics;
+    can_non_compliant(h, "echo");
+    const auto check = define_real_pair(h, "echo", "status");
+    const auto fix = define_real_pair(h, "echo", "purge_source"); // Destructive: refused
+    const auto pid = author_real_pairs(h, check, fix);
+
+    auto deps = h.deps();
+    deps.metrics = &metrics;
+    PolicyEvaluator ev(deps);
+    REQUIRE_FALSE(exec_id_of(ev.evaluate_now(pid)).empty());
+    h.fake_now += 20;
+    ev.tick(true);
+    REQUIRE(h.status_of(pid, "agentA") == "non_compliant");
+
+    // A sibling reclaims the row the instant this call's claim lands.
+    install_sibling_reclaim_trigger(db.dsn(),
+                                    "OLD.remediation_claim_at = 0 AND NEW.remediation_claim_at <> 0");
+    auto rr = ev.remediate(pid, {"agentA"});
+
+    REQUIRE(rr.denial.has_value());
+    CHECK(rr.denial->reason == PolicyDispatchDenialReason::Destructive);
+    CHECK_FALSE(pair_was_dispatched(h, kDestructivePair));
+    // The fenced write matched no row: the sibling's row is untouched and the skip is counted.
+    // An unfenced write would have overwritten it with blocked.
+    CHECK(h.status_of(pid, "agentA") == "non_compliant");
+    CHECK(fence_skips(metrics) == 1);
+    CHECK(denied(metrics, "destructive") == 1);
+}
+
+TEST_CASE("policy dispatch approval: a refused fix writes blocked before it releases the claim",
+          "[pg][policy][evaluator][dispatch_approval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    h.capability_registry = &full_registry();
+    yuzu::MetricsRegistry metrics;
+    can_non_compliant(h, "echo");
+    const auto check = define_real_pair(h, "echo", "status");
+    const auto fix = define_real_pair(h, "echo", "purge_source");
+    const auto pid = author_real_pairs(h, check, fix);
+
+    auto deps = h.deps();
+    deps.metrics = &metrics;
+    PolicyEvaluator ev(deps);
+    REQUIRE_FALSE(exec_id_of(ev.evaluate_now(pid)).empty());
+    h.fake_now += 20;
+    ev.tick(true);
+    REQUIRE(h.status_of(pid, "agentA") == "non_compliant");
+
+    // A sibling reclaims the row the instant the claim is RELEASED. Written first, blocked
+    // lands under this call's generation; released first, the write would find the sibling's.
+    install_sibling_reclaim_trigger(db.dsn(),
+                                    "OLD.remediation_claim_at <> 0 AND NEW.remediation_claim_at = 0");
+    auto rr = ev.remediate(pid, {"agentA"});
+
+    REQUIRE(rr.denial.has_value());
+    CHECK(h.status_of(pid, "agentA") == "blocked");
+    CHECK(fence_skips(metrics) == 0);
+}
+
+TEST_CASE("policy dispatch approval: a refused verify is written fenced on the claim "
+          "generation, so a sibling's reclaim is not overwritten by blocked",
+          "[pg][policy][evaluator][dispatch_approval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    h.capability_registry = &full_registry();
+    yuzu::MetricsRegistry metrics;
+    can_non_compliant(h, "echo");
+    h.canned["agentA|tags"] = {1, "ok"}; // the fix: an allowed Mutating pair with no gate
+    const auto check = define_real_pair(h, "echo", "status");
+    const auto fix = define_real_pair(h, "tags", "set");
+    const auto verify = define_real_pair(h, "content_dist", "execute_staged"); // refused
+    const auto pid = author_real_pairs(h, check, fix, verify);
+
+    auto deps = h.deps();
+    deps.metrics = &metrics;
+    PolicyEvaluator ev(deps);
+    REQUIRE_FALSE(exec_id_of(ev.evaluate_now(pid)).empty());
+    h.fake_now += 20;
+    ev.tick(true);
+    REQUIRE(h.status_of(pid, "agentA") == "non_compliant");
+    REQUIRE(ev.remediate(pid, {"agentA"}).ok);
+    REQUIRE(h.status_of(pid, "agentA") == "fixing");
+
+    // A sibling reclaims the row after the fix ran and before its verify matures.
+    exec_sql(db.dsn(),
+             "UPDATE policy_store.policy_status SET remediation_claim_gen = "
+             "remediation_claim_gen + 1 WHERE policy_id = $1 AND agent_id = 'agentA'",
+             {pid});
+    h.fake_now += 20;
+    ev.tick(false);
+
+    CHECK_FALSE(pair_was_dispatched(h, kGatedPair));
+    // The refusal is counted, but its fenced write matched no row: the sibling's row stands.
+    CHECK(denied(metrics, "gated") == 1);
+    CHECK(h.status_of(pid, "agentA") == "fixing");
+    CHECK(fence_skips(metrics) == 1);
+}
+
+// ---------------------------------------------------------------------------
 // G01: the authoring-time check (advisory: the dispatch seam is the control)
 // ---------------------------------------------------------------------------
 

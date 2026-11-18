@@ -1137,3 +1137,49 @@ TEST_CASE("/fragments/compliance/summary: a policy whose devices are blocked rea
     CHECK(res->body.find("3 failing") != std::string::npos);
     CHECK(res->body.find("Compliant</span>") == std::string::npos);
 }
+
+// The three legacy `/api/*` producers build their JSON inline (the v1 twins and the MCP tools go
+// through the shared builders), so each needs its own pin that `blocked` reaches the response.
+TEST_CASE("legacy /api/policies/{id}, /api/compliance and /api/compliance/{id} carry the blocked "
+          "tally",
+          "[compliance][rest][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PolicyStore store{pool};
+
+    auto frag = store.create_fragment(kFragmentYaml);
+    REQUIRE(frag.has_value());
+    auto pid = store.create_policy(make_policy_yaml(frag.value(), "Blocked Policy"));
+    REQUIRE(pid.has_value());
+    auto marked = store.mark_blocked(pid.value(), {"agentA", "agentB"}, "check", "content_dist",
+                                     "execute_staged", "gated");
+    REQUIRE(marked.has_value());
+    REQUIRE(marked->changed == 2);
+
+    ComplianceHarness h{&store};
+
+    auto detail = h.sink.Get("/api/policies/" + pid.value());
+    REQUIRE(detail);
+    REQUIRE(detail->status == 200);
+    auto dj = nlohmann::json::parse(detail->body);
+    REQUIRE(dj["compliance"].contains("blocked"));
+    CHECK(dj["compliance"]["blocked"] == 2);
+    CHECK(dj["compliance"]["total"] == 2);
+
+    auto fleet = h.sink.Get("/api/compliance");
+    REQUIRE(fleet);
+    REQUIRE(fleet->status == 200);
+    auto fj = nlohmann::json::parse(fleet->body);
+    REQUIRE(fj.contains("blocked"));
+    CHECK(fj["blocked"] == 2);
+    CHECK(fj["total_checks"] == 2);
+    CHECK(fj["compliant"] == 0);
+
+    auto per_policy = h.sink.Get("/api/compliance/" + pid.value());
+    REQUIRE(per_policy);
+    REQUIRE(per_policy->status == 200);
+    auto pj = nlohmann::json::parse(per_policy->body);
+    REQUIRE(pj["summary"].contains("blocked"));
+    CHECK(pj["summary"]["blocked"] == 2);
+    CHECK(pj["summary"]["total"] == 2);
+}
