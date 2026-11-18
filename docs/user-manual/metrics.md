@@ -3255,7 +3255,7 @@ This data reveals your fleet's attack surface to anyone who can reach the metric
 | `yuzu_server_ca_supersede_failed_total` | counter | none | Revoking the older leaves failed (see `ca.cert.supersede_failed`). |
 | `yuzu_server_agent_reregistration_proof_mode` | gauge | `mode` | 1 for this process's `--agent-reregistration-proof` mode, 0 for the others. The flag is per process. |
 
-Shipped alerts (`docs/prometheus/yuzu-alerts.yml`, group `yuzu-pki`): `YuzuAgentReregistrationWouldRefund`,
+Shipped alerts (`docs/prometheus/yuzu-alerts.yml`, group `yuzu-pki`): `YuzuAgentReregistrationWouldRefuse`,
 `YuzuAgentReregistrationUnattestedGateway`, `YuzuAgentLeafSupersedeFailed`, `YuzuAgentReregistrationModeMixed`.
 
 **Soak criterion for `audit` -> `enforce`.** Run `audit` for at least one full agent restart cycle of the

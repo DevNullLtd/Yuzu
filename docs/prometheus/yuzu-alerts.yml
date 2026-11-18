@@ -3952,7 +3952,7 @@ groups:
       # WP01: agent re-registration proof-of-identity rollout (--agent-reregistration-proof).
       # `audit` (the default of the first release) ADMITS what `enforce` would refuse; these rules
       # are the soak criterion for switching to enforce. All series are seeded to 0 at boot.
-      - alert: YuzuAgentReregistrationWouldRefund
+      - alert: YuzuAgentReregistrationWouldRefuse
         expr: |
           sum by (job, instance) (increase(yuzu_register_reregistration_total{mode="audit",outcome=~"no_proof|unattested_gateway|revoked_identity|lookup_failed"}[1h])) > 0
         labels:
@@ -3978,6 +3978,46 @@ groups:
             A gateway-relayed re-registration reported gateway_attests_peer_cert=false: the gateway
             is too old, plaintext, or its agent listener lacks witness_client_cert. Under
             --agent-reregistration-proof=enforce every leaf-holding agent behind it is refused.
+          runbook_url: "https://docs.yuzu.io/runbooks/agent-reregistration-proof"
+
+      - alert: YuzuAgentReregistrationRefused
+        expr: |
+          sum by (job, instance) (increase(yuzu_register_reregistration_total{mode="enforce",outcome=~"no_proof|unattested_gateway|revoked_identity"}[15m])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Re-registrations of enrolled agent ids are being refused (enforce)"
+          description: >-
+            --agent-reregistration-proof=enforce refused a re-registration (no_proof,
+            unattested_gateway or revoked_identity). Either an agent cannot show its certificate or
+            a single-use token (a lost key, a plaintext or non-witnessing gateway), or this is the
+            takeover attempt the control stops. Check agent.reregistration_refused audit rows.
+          runbook_url: "https://docs.yuzu.io/runbooks/agent-reregistration-proof"
+
+      - alert: YuzuAgentReregistrationLookupFailed
+        expr: |
+          sum by (job, instance) (increase(yuzu_register_reregistration_total{mode="enforce",outcome="lookup_failed"}[10m])) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "Re-registrations are refused UNAVAILABLE: the CA store cannot be read (enforce)"
+          description: >-
+            Under enforce a ca_store read failure refuses every re-registration retryably. Agents
+            keep retrying, but none can re-register until the CA store recovers.
+          runbook_url: "https://docs.yuzu.io/runbooks/agent-reregistration-proof"
+
+      - alert: YuzuAgentReenrolTokenRefusedBurst
+        expr: |
+          sum by (job, instance) (increase(yuzu_register_reenrol_token_refused_total[15m])) > 5
+        labels:
+          severity: warning
+        annotations:
+          summary: "Several token re-enrolments were refused"
+          description: >-
+            More than 5 re-enrolment tokens were refused in 15 minutes (multi_use_token, not_found,
+            expired, revoked, already_consumed). An operator minted the wrong kind of token
+            (re-enrolment needs max_uses 1), an agent is retrying a spent token, or someone is
+            guessing tokens.
           runbook_url: "https://docs.yuzu.io/runbooks/agent-reregistration-proof"
 
       - alert: YuzuAgentLeafSupersedeFailed

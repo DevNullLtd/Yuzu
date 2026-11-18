@@ -10782,10 +10782,10 @@ tests:
       - series: 'yuzu_register_reregistration_total{job="yuzu",instance="s1",path="direct",outcome="no_proof",mode="audit"}'
         values: "0+1x60"
     promql_expr_test:
-      - expr: 'ALERTS{alertname="YuzuAgentReregistrationWouldRefund", alertstate="firing"}'
+      - expr: 'ALERTS{alertname="YuzuAgentReregistrationWouldRefuse", alertstate="firing"}'
         eval_time: 30m
         exp_samples:
-          - labels: 'ALERTS{alertname="YuzuAgentReregistrationWouldRefund", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+          - labels: 'ALERTS{alertname="YuzuAgentReregistrationWouldRefuse", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
             value: 1
 
   - interval: 1m
@@ -10796,7 +10796,7 @@ tests:
       - series: 'yuzu_register_reregistration_total{job="yuzu",instance="s1",path="direct",outcome="no_proof",mode="audit"}'
         values: "0+0x60"
     promql_expr_test:
-      - expr: 'ALERTS{alertname="YuzuAgentReregistrationWouldRefund", alertstate="firing"}'
+      - expr: 'ALERTS{alertname="YuzuAgentReregistrationWouldRefuse", alertstate="firing"}'
         eval_time: 30m
         exp_samples: []
 
@@ -10841,3 +10841,79 @@ tests:
         exp_samples:
           - labels: 'ALERTS{alertname="YuzuAgentReregistrationModeMixed", alertstate="firing", job="yuzu", severity="warning"}'
             value: 1
+
+  # --- proposed killers
+  - interval: 1m
+    name: K uniform audit does not fire
+    input_series:
+      - {series: 'yuzu_server_agent_reregistration_proof_mode{job="yuzu",instance="s1",mode="audit"}', values: "1+0x30"}
+      - {series: 'yuzu_server_agent_reregistration_proof_mode{job="yuzu",instance="s1",mode="enforce"}', values: "0+0x30"}
+      - {series: 'yuzu_server_agent_reregistration_proof_mode{job="yuzu",instance="s1",mode="off"}', values: "0+0x30"}
+      - {series: 'yuzu_server_agent_reregistration_proof_mode{job="yuzu",instance="s2",mode="audit"}', values: "1+0x30"}
+      - {series: 'yuzu_server_agent_reregistration_proof_mode{job="yuzu",instance="s2",mode="enforce"}', values: "0+0x30"}
+      - {series: 'yuzu_server_agent_reregistration_proof_mode{job="yuzu",instance="s2",mode="off"}', values: "0+0x30"}
+    promql_expr_test:
+      - {expr: 'ALERTS{alertname="YuzuAgentReregistrationModeMixed"}', eval_time: 25m, exp_samples: []}
+  - interval: 1m
+    name: K would-refuse unattested_gateway fires
+    input_series:
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="s1",path="direct",outcome="unattested_gateway",mode="audit"}', values: "0+1x60"}
+    promql_expr_test:
+      - {expr: 'count(ALERTS{alertname="YuzuAgentReregistrationWouldRefuse", alertstate="firing"})', eval_time: 30m, exp_samples: [{labels: '{}', value: 1}]}
+  - interval: 1m
+    name: K would-refuse revoked_identity fires
+    input_series:
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="s1",path="direct",outcome="revoked_identity",mode="audit"}', values: "0+1x60"}
+    promql_expr_test:
+      - {expr: 'count(ALERTS{alertname="YuzuAgentReregistrationWouldRefuse", alertstate="firing"})', eval_time: 30m, exp_samples: [{labels: '{}', value: 1}]}
+  - interval: 1m
+    name: K would-refuse lookup_failed fires
+    input_series:
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="s1",path="direct",outcome="lookup_failed",mode="audit"}', values: "0+1x60"}
+    promql_expr_test:
+      - {expr: 'count(ALERTS{alertname="YuzuAgentReregistrationWouldRefuse", alertstate="firing"})', eval_time: 30m, exp_samples: [{labels: '{}', value: 1}]}
+  - interval: 1m
+    name: K enforce mode does not fire audit rule
+    input_series:
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="s1",path="direct",outcome="no_proof",mode="enforce"}', values: "0+1x60"}
+    promql_expr_test:
+      - {expr: 'ALERTS{alertname="YuzuAgentReregistrationWouldRefuse"}', eval_time: 30m, exp_samples: []}
+  - interval: 1m
+    name: K unattested direct path or other outcome does not fire
+    input_series:
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="s1",path="direct",outcome="unattested_gateway",mode="audit"}', values: "0+1x60"}
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="s1",path="gateway_proxy",outcome="no_proof",mode="audit"}', values: "0+1x60"}
+    promql_expr_test:
+      - {expr: 'ALERTS{alertname="YuzuAgentReregistrationUnattestedGateway"}', eval_time: 30m, exp_samples: []}
+
+  # --- enforce-phase alerts and the transient-mixed case (M8: `for:` must hold)
+  - interval: 1m
+    name: enforce refusals fire
+    input_series:
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="s1",path="direct",outcome="no_proof",mode="enforce"}', values: "0+1x60"}
+    promql_expr_test:
+      - {expr: 'count(ALERTS{alertname="YuzuAgentReregistrationRefused", alertstate="firing"})', eval_time: 30m, exp_samples: [{labels: '{}', value: 1}]}
+  - interval: 1m
+    name: enforce lookup_failed fires, audit-mode lookup_failed does not fire the enforce rule
+    input_series:
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="s1",path="direct",outcome="lookup_failed",mode="enforce"}', values: "0+1x60"}
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="s2",path="direct",outcome="lookup_failed",mode="audit"}', values: "0+1x60"}
+    promql_expr_test:
+      - {expr: 'count(ALERTS{alertname="YuzuAgentReregistrationLookupFailed", alertstate="firing"})', eval_time: 30m, exp_samples: [{labels: '{}', value: 1}]}
+  - interval: 1m
+    name: token refusal burst fires above 5 and stays quiet at 3
+    input_series:
+      - {series: 'yuzu_register_reenrol_token_refused_total{job="yuzu",instance="s1",reason="multi_use_token"}', values: "0+1x60"}
+      - {series: 'yuzu_register_reenrol_token_refused_total{job="yuzu",instance="s2",reason="not_found"}', values: "0 0 0 1 2 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3"}
+    promql_expr_test:
+      - {expr: 'ALERTS{alertname="YuzuAgentReenrolTokenRefusedBurst", alertstate="firing", instance="s2"}', eval_time: 20m, exp_samples: []}
+      - {expr: 'count(ALERTS{alertname="YuzuAgentReenrolTokenRefusedBurst", alertstate="firing", instance="s1"})', eval_time: 30m, exp_samples: [{labels: '{}', value: 1}]}
+  - interval: 1m
+    name: mixed modes for less than 10 minutes do not fire (for:10m holds)
+    input_series:
+      - {series: 'yuzu_server_agent_reregistration_proof_mode{job="yuzu",instance="s1",mode="audit"}', values: "1+0x30"}
+      - {series: 'yuzu_server_agent_reregistration_proof_mode{job="yuzu",instance="s1",mode="enforce"}', values: "0+0x30"}
+      - {series: 'yuzu_server_agent_reregistration_proof_mode{job="yuzu",instance="s2",mode="audit"}', values: "0 0 0 0 0 0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1"}
+      - {series: 'yuzu_server_agent_reregistration_proof_mode{job="yuzu",instance="s2",mode="enforce"}', values: "1 1 1 1 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"}
+    promql_expr_test:
+      - {expr: 'ALERTS{alertname="YuzuAgentReregistrationModeMixed", alertstate="firing"}', eval_time: 12m, exp_samples: []}
