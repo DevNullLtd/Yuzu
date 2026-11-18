@@ -45,10 +45,10 @@ metadata:
     skipped, but only the status number is stored on the server: the truncated
     and network_mount_guard rows are the operator-visible signal, and
     total_matches|0 beside either means not found in the part examined. Only
-    result rows are data rows to a column matcher, and a column matcher cannot
-    tell a partly searched device from a fully searched one: a device whose
-    partial search found nothing is left out of the set like any device with no
-    match, and the set is not marked partial (read the output rows for that).
+    result rows are data rows to a column matcher. A device whose constrained
+    answer holds no row that satisfies a result-set column matcher is not left
+    out as a plain non-match: the set counts it in agents_failed and reads
+    partial (a constrained answer with a matching row is a member).
     The bounds are fixed: when the reason is deadline, file_cap or max_results,
     search a narrower root or lower max_depth; max_results means the cap was
     reached while entries remained, whether or not any of them would have
@@ -151,6 +151,9 @@ spec:
     # truncated|<reason>|visited=N|hashed=N|skipped_unreadable=N|skipped_symlink=N|skipped_not_regular=N|skipped_oversize=N|skipped_network_mount=N   (only when something was skipped or the walk stopped early)
     # total_matches|<count>   (the last row of every run that returns 0)
     # error|<message>   (a failed run, return code 1, in place of total_matches; a run that fails part-way -- a regex too costly for a name on macOS and Windows, or an unexpected failure on any OS -- writes it after result rows already written, with no truncated row)
+    # Read by the server (docs/yaml-dsl-spec.md, spec.result): a device whose CONSTRAINED answer
+    # satisfies no result-set column matcher is counted in the set's agents_failed.
+    partialWhenConstrained: true
     columns:
       - name: row_kind
         type: string

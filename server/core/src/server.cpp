@@ -19993,8 +19993,8 @@ private:
                             }
                             if (agents_failed > 0)
                                 spdlog::warn("result set {} materialized partial: {} agent(s) "
-                                             "answered execution {} with a failure and never "
-                                             "matched",
+                                             "answered execution {} with a failure or a partly "
+                                             "completed answer and never matched",
                                              p.id, agents_failed, p.source_execution_id);
                             if (result_set_store_->materialize(p.id, members, agents_failed,
                                                               agents_unanswered)) {

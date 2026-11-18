@@ -4686,13 +4686,14 @@ TEST_CASE("from-instruction-result: a definition that reads a raw capture table 
 namespace {
 
 void put_exec_row(ResponseStore& store, const std::string& execution_id, const std::string& agent,
-                  int status, const std::string& output, int64_t ts) {
+                  int status, const std::string& output, int64_t ts, int plugin_status = 0) {
     StoredResponse r;
     r.instruction_id = "echo-1";
     r.execution_id = execution_id;
     r.agent_id = agent;
     r.plugin = yuzu::server::test::kOrdinaryPlugin;
     r.status = status;
+    r.plugin_result_status = plugin_status;
     r.output = output;
     r.timestamp = ts;
     store.store(r);
@@ -4912,6 +4913,58 @@ TEST_CASE("materialise: a success answer whose schema lacks the matcher column i
     // agent-no-column answered from a table without `pid`: failed. agent-empty answered from a
     // table with it and zero rows: a legitimate empty answer, not failed.
     CHECK(found->agents_failed == 1);
+}
+
+TEST_CASE("materialise: a CONSTRAINED answer with no matching row is a failed agent only when the "
+          "definition opted in (#6478)",
+          "[pg][result_set][async][agents_failed]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResponseStore responses{pool};
+    REQUIRE(responses.is_open());
+    // search_dir answers as stored. The status number is the agent's own verdict: 4 (CONSTRAINED)
+    // when part of the tree was not examined, 0 from an agent that reports no typed status.
+    const std::string cut = "truncated|deadline|visited=5|hashed=0|skipped_unreadable=0|"
+                            "skipped_symlink=0|skipped_not_regular=0|skipped_oversize=0|"
+                            "skipped_network_mount=0\n";
+    const int constrained = rs_matcher::kPluginResultConstrained;
+    put_exec_row(responses, "exec-sd", "agent-full-miss", 1, "total_matches|0", 100, 1);
+    put_exec_row(responses, "exec-sd", "agent-old-miss", 1, "total_matches|0", 100);
+    put_exec_row(responses, "exec-sd", "agent-cut-miss", 1, cut + "total_matches|0", 100,
+                 constrained);
+    put_exec_row(responses, "exec-sd", "agent-cut-hit", 1,
+                 "result|/tmp/foo|file\n" + cut + "total_matches|1", 100, constrained);
+
+    nlohmann::json matcher{{"column", "path"}, {"op", "eq"}, {"value", "/tmp/foo"}};
+    rs_matcher::bind_declared_columns(
+        matcher,
+        R"({"partialWhenConstrained":true,"columns":[{"name":"row_kind","type":"string",)"
+        R"("discriminator":true},{"name":"path","type":"string"},)"
+        R"({"name":"entry_type","type":"string"}]})",
+        "filesystem");
+    PendingSet pending;
+    pending.id = "rs-sd";
+    pending.source_execution_id = "exec-sd";
+    pending.matcher = matcher.dump();
+    const auto* plugins = &yuzu::server::test::forensics_plugin_set();
+    auto found = result_set_members(responses, plugins, pending);
+    REQUIRE(found.has_value());
+    // The cut-short search that found the path is a member; the one that found nothing is failed,
+    // not a clean non-member. A full search and an older agent's answer stay clean non-members.
+    CHECK(std::vector<std::string>(found->begin(), found->end()) ==
+          std::vector<std::string>{"agent-cut-hit"});
+    CHECK(found->agents_failed == 1);
+
+    // The same rows under a matcher bound without the key (find_by_hash, a stored 0.4.0
+    // definition): the membership is the same and nobody is failed.
+    matcher.erase("partial_when_constrained");
+    pending.matcher = matcher.dump();
+    auto plain = result_set_members(responses, plugins, pending);
+    REQUIRE(plain.has_value());
+    CHECK(std::vector<std::string>(plain->begin(), plain->end()) ==
+          std::vector<std::string>{"agent-cut-hit"});
+    CHECK(plain->agents_failed == 0);
 }
 
 #ifndef YUZU_SERVER_SRC_DIR

@@ -20,8 +20,10 @@
   `truncated|...` row precedes `total_matches|N`; the result is `CONSTRAINED`/`PARTIAL` when a bound
   tripped, a directory could not be read, a network mount was refused or the mount table was
   unreadable, and stays `UNDECLARED` when the only skips are by design (a symlink, junction or FIFO). A
-  result-set column matcher cannot tell a partly searched device from a fully searched one: a device
-  whose partial search found nothing is left out of the set, which is not marked partial. In regex
+  result set built with a column matcher does not read a partly searched device as a clean
+  non-match: a device whose `CONSTRAINED` answer holds no matching row is counted in the set's
+  `agents_failed`, so the set reads `partial` (the server reads the new result key
+  `partialWhenConstrained`, set by definition 0.5.0; `find_by_hash` sets are unchanged). In regex
   mode a pattern too costly for a file name ends the run with an error row and no count (with no
   lookahead, a match on Linux takes time linear in the name's length). A name byte that is not valid
   UTF-8 now shows as `?` in `search_dir`, `find_by_hash` and `get_acl` rows instead of making the whole

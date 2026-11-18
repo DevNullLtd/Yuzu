@@ -74,6 +74,11 @@ class FindByHashDefinition(unittest.TestCase):
         self.assertEqual(row_kind["values"],
                          ["match", "truncated", "matches_found", "network_mount_guard"])
 
+    def test_does_not_opt_in_to_partial_when_constrained(self):
+        # find_by_hash stays disclosure only (recorded owner ruling): a partly searched device
+        # with no match is a plain non-member of a result set. Opting it in is a decision.
+        self.assertNotIn("partialWhenConstrained", _find_by_hash()["spec"]["result"])
+
 
 class SearchDirDefinition(unittest.TestCase):
     """search_dir adopts the find_by_hash column shape (#6478): `result|<path>|<entry_type>` is the
@@ -102,6 +107,12 @@ class SearchDirDefinition(unittest.TestCase):
         row_kind = _search_dir()["spec"]["result"]["columns"][0]
         self.assertEqual(row_kind["values"],
                          ["result", "truncated", "total_matches", "network_mount_guard"])
+
+    def test_a_constrained_answer_is_counted_in_agents_failed(self):
+        # The server reads only a boolean true here (result_set_matcher.cpp, bind_declared_columns):
+        # a device whose CONSTRAINED answer satisfies no column matcher is then counted in the
+        # set's agents_failed instead of being a clean non-member (#6478). A typo fails here.
+        self.assertIs(_search_dir()["spec"]["result"]["partialWhenConstrained"], True)
 
     def test_entry_type_values(self):
         entry_type = _search_dir()["spec"]["result"]["columns"][2]

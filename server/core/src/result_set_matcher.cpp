@@ -24,6 +24,7 @@ namespace {
 constexpr const char* kDeclaredColumnsKey = "declared_columns";
 constexpr const char* kPluginKey = "plugin";
 constexpr const char* kRowDiscriminatorKey = "row_discriminator";
+constexpr const char* kPartialWhenConstrainedKey = "partial_when_constrained";
 
 // Split `text` on '\n' into non-owning views, dropping a trailing empty
 // fragment. Bounded by the caller's output size (responses are retention-
@@ -258,6 +259,8 @@ std::optional<std::string> column_shape_defect(const nlohmann::json& m) {
         return "matcher.plugin must be a string";
     if (m.contains(kRowDiscriminatorKey) && !m[kRowDiscriminatorKey].is_boolean())
         return "matcher.row_discriminator must be a boolean";
+    if (m.contains(kPartialWhenConstrainedKey) && !m[kPartialWhenConstrainedKey].is_boolean())
+        return "matcher.partial_when_constrained must be a boolean";
     return std::nullopt;
 }
 
@@ -279,6 +282,11 @@ bool declares_row_discriminator(const std::string& result_schema_json) {
            first["discriminator"].get<bool>();
 }
 
+// True when `j` is an object whose `key` is the boolean true. Never throws on a wrong type.
+bool flag_is_true(const nlohmann::json& j, const char* key) {
+    return j.is_object() && j.contains(key) && j[key].is_boolean() && j[key].get<bool>();
+}
+
 } // namespace
 
 std::optional<std::string> validate_matcher(std::string_view matcher_json) {
@@ -289,7 +297,8 @@ std::optional<std::string> validate_matcher(std::string_view matcher_json) {
         return std::nullopt; // the unrecognised-shape default is unchanged
     if (m.contains("kind") && !m["kind"].is_string())
         return "matcher.kind must be a string";
-    for (const char* key : {kDeclaredColumnsKey, kPluginKey, kRowDiscriminatorKey})
+    for (const char* key :
+         {kDeclaredColumnsKey, kPluginKey, kRowDiscriminatorKey, kPartialWhenConstrainedKey})
         if (m.contains(key))
             return std::string("matcher.") + key + " is server-authored and cannot be supplied";
     if (!m.contains("kind"))
@@ -338,6 +347,11 @@ void bind_declared_columns(nlohmann::json& matcher, const std::string& result_sc
     matcher[kPluginKey] = plugin;
     if (declares_row_discriminator(result_schema_json))
         matcher[kRowDiscriminatorKey] = true;
+    // `partialWhenConstrained: true` on the result schema (object form; search_dir): opt-in only,
+    // so a definition without it, a stored one that predates the key included, binds as before.
+    if (flag_is_true(nlohmann::json::parse(result_schema_json, nullptr, false),
+                     "partialWhenConstrained"))
+        matcher[kPartialWhenConstrainedKey] = true;
 }
 
 int echo_row_count(std::string_view output) {
@@ -371,6 +385,13 @@ bool answer_lacks_matcher_column(std::string_view matcher_json, std::string_view
         !m["column"].is_string())
         return false;
     return echo_schema_lacks_column(output, m["column"].get<std::string>());
+}
+
+bool constrained_answer_is_unresolved(std::string_view matcher_json, int plugin_result_status) {
+    if (plugin_result_status != kPluginResultConstrained || matcher_json.empty())
+        return false;
+    return flag_is_true(nlohmann::json::parse(matcher_json, nullptr, false),
+                        kPartialWhenConstrainedKey);
 }
 
 bool response_matches(std::string_view matcher_json, int status, std::string_view output) {

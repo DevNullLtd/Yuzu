@@ -44,8 +44,10 @@
 // the line is split on every unescaped pipe instead; without the flag a key/value plugin's rows
 // are key + remainder and never match a wider declaration. The index is the declared column
 // position, not the dashboard cell position (for a key/value plugin the dashboard still shows key
-// + remainder under the declared headers). Wrong-typed keys match nobody; a caller may not supply
-// any of the three server-authored keys.
+// + remainder under the declared headers). A fourth key, "partial_when_constrained":true, is stored
+// when the definition's result schema sets `partialWhenConstrained: true`; it never changes who
+// matches (see constrained_answer_is_unresolved). Wrong-typed keys match nobody; a caller may not
+// supply any of the four server-authored keys.
 //
 // `op` ∈ {eq, in, contains, exists}. A non-SUCCESS response NEVER qualifies,
 // regardless of matcher — a plugin that errored is not evidence of a hit.
@@ -70,6 +72,19 @@ bool response_matches(std::string_view matcher_json, int status, std::string_vie
 /// header that names the column over zero data rows (a legitimate empty answer).
 bool answer_lacks_matcher_column(std::string_view matcher_json, std::string_view output);
 
+/// The typed plugin result status meaning the plugin did only part of what it was asked. Mirrors
+/// `CommandResponse::PLUGIN_RESULT_CONSTRAINED` (= 4) in agent.proto.
+inline constexpr int kPluginResultConstrained = 4;
+
+/// True when `matcher_json` carries the server-authored `"partial_when_constrained": true` (stored
+/// by `bind_declared_columns` for a definition whose result schema sets `partialWhenConstrained`)
+/// and the answer's stored `plugin_result_status` is CONSTRAINED: the plugin examined only part of
+/// what it was asked to, so an answer with no matching row is not evidence of absence, and the
+/// membership computation counts the agent as failed rather than a clean non-member. False for
+/// every other matcher and status: a definition without the key (find_by_hash, every other plugin,
+/// a stored search_dir 0.4.0) and a row with no typed status (an older agent) are unaffected.
+bool constrained_answer_is_unresolved(std::string_view matcher_json, int plugin_result_status);
+
 /// Admission check for a caller-supplied matcher (#4644): nullopt when acceptable, else the 400
 /// message. A present `kind` must be a string; on a kind-less matcher a present `column`, `op`
 /// or `value` must be a string and a present `value_set` an array. Only `echo_rows_ge` has a numeric field: its `n`
@@ -93,9 +108,10 @@ std::optional<std::string> validate_matcher_object(const nlohmann::json& matcher
 /// `ResponseTemplatesEngine::synthesise_default` -- the dashboard's own source). When
 /// `matcher.column` is among them, stores `declared_columns` and `plugin` in `matcher` (and
 /// `row_discriminator` when the definition's first column declares `discriminator: true`) so
-/// `response_matches` can resolve the column positionally in plain pipe rows. No-op otherwise.
-/// REST and MCP both call this ONE function. `validate_matcher` refuses all three keys from a
-/// caller.
+/// `response_matches` can resolve the column positionally in plain pipe rows, and
+/// `partial_when_constrained` when the result schema sets `partialWhenConstrained: true`. No-op
+/// otherwise. REST and MCP both call this ONE function. `validate_matcher` refuses all four keys
+/// from a caller.
 void bind_declared_columns(nlohmann::json& matcher, const std::string& result_schema_json,
                            const std::string& plugin);
 

@@ -440,10 +440,11 @@ const char* kSearchDirSchema =
     R"({"columns":[{"name":"path","type":"string"},{"name":"entry_type","type":"string"},)"
     R"({"name":"total_matches","type":"int32"}]})";
 // search_dir 0.5.0 (#6478): the find_by_hash column shape. A literal copy; the shipped definition is
-// pinned to the same names, types, row_kind values and `discriminator` by
+// pinned to the same names, types, row_kind values, `discriminator` and `partialWhenConstrained` by
 // tests/test_filesystem_definition.py.
 const char* kSearchDir050Schema =
-    R"({"columns":[{"name":"row_kind","type":"string","discriminator":true},)"
+    R"({"partialWhenConstrained":true,)"
+    R"("columns":[{"name":"row_kind","type":"string","discriminator":true},)"
     R"({"name":"path","type":"string"},{"name":"entry_type","type":"string"}]})";
 
 // The verbatim trailer filesystem_find_by_hash.hpp writes (nine fields).
@@ -592,6 +593,53 @@ TEST_CASE("matcher: search_dir 0.5.0 result rows are data rows; trailer, count a
                              "total_matches|0";
     CHECK_FALSE(matches(kSearchDir050Schema, "path", "exists", "", none));
     // the stored 0.4.0 schema keeps the old never-match behaviour (case above)
+}
+
+TEST_CASE("matcher: partialWhenConstrained is bound from the definition only and marks only a "
+          "CONSTRAINED answer unresolved (#6478)",
+          "[result_set][matcher]") {
+    nlohmann::json m{{"column", "path"}, {"op", "eq"}, {"value", "/tmp/absent"}};
+    bind_declared_columns(m, kSearchDir050Schema, "filesystem");
+    CHECK(m["partial_when_constrained"] == true);
+    // Who matches is unchanged; only a CONSTRAINED (4) answer is unresolved. 0 is a row with no
+    // typed status (an agent older than the bounded walk, a legacy row), 1 OK, 2 and 3 the others.
+    CHECK_FALSE(response_matches(m.dump(), kOk, "total_matches|0"));
+    CHECK(kPluginResultConstrained == 4);
+    CHECK(constrained_answer_is_unresolved(m.dump(), 4));
+    for (int status : {0, 1, 2, 3, 5}) {
+        CAPTURE(status);
+        CHECK_FALSE(constrained_answer_is_unresolved(m.dump(), status));
+    }
+
+    // Not opted in: find_by_hash, a stored search_dir 0.4.0, a value that is not the boolean true,
+    // and the key on a column or in the array form (it is read from the schema object only).
+    for (const char* schema :
+         {kFindByHashSchema, kSearchDirSchema,
+          R"({"partialWhenConstrained":"true","columns":[{"name":"path","type":"string"}]})",
+          R"({"partialWhenConstrained":false,"columns":[{"name":"path","type":"string"}]})",
+          R"({"columns":[{"name":"path","type":"string","partialWhenConstrained":true}]})",
+          R"([{"name":"path","type":"string","partialWhenConstrained":true}])"}) {
+        CAPTURE(schema);
+        nlohmann::json other{{"column", "path"}, {"op", "exists"}};
+        bind_declared_columns(other, schema, "filesystem");
+        REQUIRE(other.contains("declared_columns"));
+        CHECK_FALSE(other.contains("partial_when_constrained"));
+        CHECK_FALSE(constrained_answer_is_unresolved(other.dump(), 4));
+    }
+    // A matcher that was never bound carries no key: the default, a kind, text that is not JSON.
+    for (const char* unbound : {"", R"({"kind":"any_response"})", R"({"column":"path"})", "{"})
+        CHECK_FALSE(constrained_answer_is_unresolved(unbound, 4));
+
+    // A caller may not supply it; a wrong-typed stored value matches nobody and marks nothing.
+    const auto refused =
+        validate_matcher(R"({"column":"path","op":"exists","partial_when_constrained":true})");
+    REQUIRE(refused.has_value());
+    CHECK(refused->find("partial_when_constrained") != std::string::npos);
+    m["value"] = "/tmp/foo";
+    CHECK(response_matches(m.dump(), kOk, "result|/tmp/foo|file"));
+    m["partial_when_constrained"] = "yes";
+    CHECK_FALSE(response_matches(m.dump(), kOk, "result|/tmp/foo|file"));
+    CHECK_FALSE(constrained_answer_is_unresolved(m.dump(), 4));
 }
 
 TEST_CASE("matcher: a stored find_by_hash 0.3.0 definition keeps the old never-match behaviour",

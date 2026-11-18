@@ -178,6 +178,7 @@ Shipped definitions under `content/definitions/` and `content/packs/` must meet 
 |---|---|---|---|---|
 | `columns` | list of object | Yes | -- | Result column definitions. |
 | `aggregation` | object | No | -- | Server-side aggregation configuration. |
+| `partialWhenConstrained` | boolean | No | `false` | Behavioural (the server reads only a boolean `true`, and only from the object form of the stored schema): when the plugin reports an answer as `CONSTRAINED` (it did only part of what it was asked) and no row of that answer satisfies a result-set column matcher on the instruction, the device is counted in the set's `agents_failed`, so the set reads `partial`, instead of being left out as a clean non-member. A constrained answer with a matching row is a member either way. Set by `device.filesystem.search_dir` and pinned there by `tests/test_filesystem_definition.py`; a stored definition that predates the key keeps the old behaviour. Not rendered into the plugin docs. |
 
 Each column object:
 
