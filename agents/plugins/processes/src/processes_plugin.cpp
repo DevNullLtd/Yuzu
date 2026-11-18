@@ -313,14 +313,14 @@ ImageHash hash_linux_image(unsigned long pid, std::chrono::steady_clock::time_po
 // kernel reference to the running image, never through path text. The bound is the helper.
 struct ImageGuard {}; // Linux needs no mount-table snapshot (see below)
 
-// One identity-keyed cache for the process: images are keyed by (dev, inode, size, mtime) of the
-// opened file, never by path text, so it is safe to share across actions and bounded in size.
-const std::shared_ptr<yuzu::shared::ImageHashCache>& image_cache() {
-    static const std::shared_ptr<yuzu::shared::ImageHashCache> c = std::make_shared<yuzu::shared::ImageHashCache>();
-    return c;
-}
+// A hash cache lives for ONE action (created per dispatch, shared with that action's bounded
+// helpers, gone when the action returns): an image replaced between two dispatches is always
+// re-hashed. Within an action it is keyed by the OPENED image's identity (dev, inode, size, mtime,
+// ctime), never by path text.
+using ActionCache = std::shared_ptr<yuzu::shared::ImageHashCache>;
+ActionCache make_action_cache() { return std::make_shared<yuzu::shared::ImageHashCache>(); }
 
-std::string hash_process_image(unsigned long pid, const std::string& path, HashCache& cache,
+std::string hash_process_image(unsigned long pid, const std::string& path, const ActionCache& cache,
                                const ImageGuard&, std::chrono::steady_clock::time_point action_deadline) {
     if (path.empty())
         return {};
@@ -331,19 +331,20 @@ std::string hash_process_image(unsigned long pid, const std::string& path, HashC
     const auto deadline = now + budget;
     auto result = yuzu::shared::bounded_call_ex(
         std::chrono::duration_cast<std::chrono::milliseconds>(budget),
-        [pid, deadline, cache = image_cache()]() { return hash_linux_image(pid, deadline, cache); });
+        [pid, deadline, cache]() { return hash_linux_image(pid, deadline, cache); });
     if (result.status != yuzu::shared::BoundedCallStatus::Completed || !result.value)
         return {};
     const auto& img = *result.value;
-    (void)cache; // the identity-keyed cache lives inside the helper (image_cache())
     return img.key.empty() ? std::string{} : img.hash;
 }
 #else
 using ImageGuard = yuzu::shared::local_path::LocalPathGuard;
+using ActionCache = HashCache; // Windows/macOS: path text within one action (judged local paths)
+ActionCache make_action_cache() { return {}; }
 
 // Windows and macOS: the image path text is judged (UNC/device/non-fixed drive, or on/symlinked into
 // a listed network mount) before anything opens it, and judge + hash run on a bounded helper.
-std::string hash_process_image(unsigned long, const std::string& path, HashCache& cache,
+std::string hash_process_image(unsigned long, const std::string& path, ActionCache& cache,
                                const ImageGuard& guard,
                                std::chrono::steady_clock::time_point action_deadline) {
     if (path.empty())
@@ -476,7 +477,7 @@ private:
     // gone/too large. Hashing mirrors do_list_hashed (per-path cache, bounded read).
     int do_list_tree(yuzu::CommandContext& ctx) {
         auto procs = enumerate_processes();
-        HashCache hash_cache; // image identity -> sha256
+        auto hash_cache = make_action_cache(); // one action only
         const ImageGuard guard;
         const auto action_deadline = std::chrono::steady_clock::now() + kActionBudget;
         for (const auto& p : procs) {
@@ -495,7 +496,7 @@ private:
     // threads, access-denied) or the file is gone/too large — rendered honestly.
     int do_list_hashed(yuzu::CommandContext& ctx) {
         auto procs = enumerate_processes();
-        HashCache hash_cache; // image identity -> sha256
+        auto hash_cache = make_action_cache(); // one action only
         const ImageGuard guard;
         const auto action_deadline = std::chrono::steady_clock::now() + kActionBudget;
         for (const auto& p : procs) {

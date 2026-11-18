@@ -833,8 +833,8 @@ private:
         auto base_dir = params.get("base_dir");
 
         // Refuse a network/device path UP FRONT. validate_path_or_parent answers "" both for
-        // "refused" and for "does not exist", and this action used to fall back to the RAW caller
-        // path when base_dir was empty: a refused UNC path would then be stat'ed as LocalSystem.
+        // "refused" and for "does not exist", so the refusal is decided here, before it, and the action
+        // never touches the raw caller path (a refused UNC path would be stat'ed as LocalSystem).
         if (const auto refusal = path_refusal(path); yuzu::shared::local_path::refused(refusal)) {
             ctx.write_output(std::format(
                 "error|{}", yuzu::shared::local_path::refusal_token(refusal)));

@@ -517,11 +517,31 @@ TEST_CASE("image hash cache: the key is the opened image's identity, not path te
     CHECK(b.st_size == c.st_size);
     CHECK(key2 != yuzu::shared::image_identity_key(c));
 
+    // The forgery the key must survive: replace the contents in place with the SAME size and put the
+    // old mtime back with utimensat(). mtime and size are the file owner's to forge; ctime is not.
+    { std::ofstream(exe, std::ios::binary | std::ios::trunc) << "z DIFFERENT, LONGER IMAGE"; }
+    struct timespec back[2] = {{c.st_atim.tv_sec, c.st_atim.tv_nsec}, {c.st_mtim.tv_sec, c.st_mtim.tv_nsec}};
+    REQUIRE(::utimensat(AT_FDCWD, exe.c_str(), back, 0) == 0);
+    struct stat d{};
+    REQUIRE(::stat(exe.c_str(), &d) == 0);
+    CHECK(d.st_ino == c.st_ino);
+    CHECK(d.st_size == c.st_size);
+    CHECK(d.st_mtim.tv_sec == c.st_mtim.tv_sec);
+    CHECK(d.st_mtim.tv_nsec == c.st_mtim.tv_nsec);
+    CHECK(yuzu::shared::image_identity_key(c) != yuzu::shared::image_identity_key(d)); // ctime moved
+
     // The cache returns what was stored under a key and nothing for another.
     yuzu::shared::ImageHashCache cache;
     cache.put(key1, "hash-one");
     CHECK(cache.get(key1) == std::optional<std::string>("hash-one"));
     CHECK_FALSE(cache.get(key2).has_value());
+
+    // Bounded: it empties itself at 8192 entries instead of growing with the number of images.
+    yuzu::shared::ImageHashCache bounded;
+    for (int i = 0; i < 8200; ++i)
+        bounded.put("k" + std::to_string(i), "h");
+    CHECK_FALSE(bounded.get("k0").has_value());
+    CHECK(bounded.get("k8199").has_value());
 }
 
 TEST_CASE("local_path: a symlink loop fails closed", "[shared][local_path]") {
