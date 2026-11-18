@@ -539,8 +539,9 @@ script reads each listed file from `build-windows`, checks its SHA-256, copies
 the checked bytes into a scratch tree at the file's path below the build
 directory, and runs syft and the vcpkg closure over that tree, as for any
 other artifact. The manifest is not a release asset (it records the runner's
-paths); the Windows job keeps it for three days as the
-`windows-installer-manifest` workflow artifact.
+paths); the Windows job keeps it for 90 days, the repository maximum, as the
+`windows-installer-manifest` workflow artifact, so it is available as evidence of how the
+installer SBOM was produced (owner decision, 2026-11-18).
 
 **The format,** read from Inno Setup's source at tag `is-6_7_3`, the version
 v0.15.0 was built with:

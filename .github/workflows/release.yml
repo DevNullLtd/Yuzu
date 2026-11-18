@@ -1097,9 +1097,11 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
-      # The ISCC manifest the installer SBOM was made from, for diagnosing an
-      # SBOM refusal. Not named yuzu-*, so the release job does not download
-      # it: it is not a release asset (it records the runner's paths).
+      # The ISCC manifest the installer SBOM was made from: evidence of how the
+      # installer SBOM was produced, and for diagnosing an SBOM refusal. Kept 90
+      # days, the repository maximum (owner decision, 2026-11-18). Not named
+      # yuzu-*, so the release job does not download it: it is not a release
+      # asset (it records the runner's paths).
       - name: Upload the installer manifest
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -1108,7 +1110,7 @@ jobs:
           name: windows-installer-manifest
           path: YuzuAgentSetup-*.manifest.txt
           if-no-files-found: warn
-          retention-days: 3
+          retention-days: 90
 
   # ── macOS ARM64 release build ────────────────────────────────────────
   build-macos:
