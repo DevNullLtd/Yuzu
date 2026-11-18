@@ -2,11 +2,12 @@
 """WP13 lexical pin: Linux `services.set_start_mode` verifies its work through the closed-set,
 ran-to-completion readback and reports the state.
 
-test_services_parsers.cpp tests start_mode_took_effect / start_mode_readback_matches in
-isolation; nothing executes the Linux set_start_mode body (it needs a real systemd and a root
-wrapper), so reverting the CALL SITE to the weak form would stay green. Pinned in
-agents/plugins/services/src/services_plugin.cpp (comments, `#if 0` blocks and string-literal
-contents removed first; tests/cpp_lex_helper.py):
+SECOND LAYER. The Linux set_start_mode body lives in agents/plugins/services/src/
+services_set_start_mode.hpp behind a runner seam and is executed with a FAKE runner by the
+`[setmode]` Catch2 cases in tests/unit/test_services_parsers.cpp (the primary, behavioural
+tests; the 13 negations of the fixes that this gate once let through are RED there). This gate
+pins the same body's shape in the header (comments, `#if 0` blocks and string-literal contents
+removed first; tests/cpp_lex_helper.py) and that the plugin calls the body:
 
   1. the readback verdict is `start_mode_readback_matches(mode, st)` (never the bare state test
      `start_mode_took_effect(`, which cannot see a readback that did not run);
@@ -17,7 +18,7 @@ contents removed first; tests/cpp_lex_helper.py):
   4. INSIDE that unchangeable branch the plugin sets CONSTRAINED/PARTIAL with provenance
      `services:start_mode_unchangeable` (a prose `note|` alone is invisible to a machine reader
      that sees `status|ok`); the return code stays 0. This is checked STRUCTURALLY by
-     u2_problems(): the `do_set_start_mode_linux` body is brace-matched; it must hold exactly one
+     u2_problems(): the `set_start_mode_linux` body is brace-matched; it must hold exactly one
      un-negated `if (start_state_is_unchangeable(state)) {` with no `&&`/`||`; the call must be the
      branch's only set_result_status, at depth 0, with no return/goto/throw/branching before it;
      and after the branch the function must close its block and `return 0;`. A plain regex pin was
@@ -35,7 +36,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import cpp_lex_helper as lexh  # noqa: E402
 
-SRC = ROOT / "agents" / "plugins" / "services" / "src" / "services_plugin.cpp"
+SRC = ROOT / "agents" / "plugins" / "services" / "src" / "services_set_start_mode.hpp"
+PLUGIN = ROOT / "agents" / "plugins" / "services" / "src" / "services_plugin.cpp"
 CALL = "if (!yuzu::services::start_mode_readback_matches(mode, st)) {"
 RUN = '''auto st = run_command({std::string{systemctl_path}, "is-enabled", "--", std::string(name)},
                               /*merge_stderr=*/false);'''
@@ -65,9 +67,9 @@ def u2_problems(src):
     out = []
     if live.count('"services:start_mode_unchangeable"') != 1:
         out.append("provenance token services:start_mode_unchangeable must appear exactly once in live code")
-    m = re.search(r'\bint\s+do_set_start_mode_linux\s*\([^)]*\)\s*\{', t)
+    m = re.search(r'\bint\s+set_start_mode_linux\s*\([^)]*\)\s*\{', t)
     if not m:
-        return out + ["do_set_start_mode_linux not found"]
+        return out + ["set_start_mode_linux not found"]
     fe = _match_brace(t, m.end() - 1)
     fb = t[m.end():fe]
     ifs = list(re.finditer(r'\bif\s*\(\s*yuzu::services::start_state_is_unchangeable\(\s*state\s*\)\s*\)\s*\{', fb))
@@ -161,7 +163,7 @@ def u2_mutations(src):
     the text (a stale anchor fails loudly)."""
     call = re.search(r'ctx\.set_result_status\(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,\s*'
                      r'"services:start_mode_unchangeable"\);', src).group(0)
-    tail = "        }\n    }\n    return 0;\n}\n\n#elif defined(__APPLE__)"
+    tail = "        }\n    }\n    return 0;\n}\n\n} // namespace yuzu::services"
     br = "if (yuzu::services::start_state_is_unchangeable(state)) {"
     first = "        std::string state = st_state.substr(0, st_state.find('\\n'));"
 
@@ -171,10 +173,10 @@ def u2_mutations(src):
 
     no_call = rep(call, "")
     return {
-        "call moved after the branch's closing brace": rep(tail, "        }\n    " + call + "\n    }\n    return 0;\n}\n\n#elif defined(__APPLE__)", no_call),
-        "final return 0 -> return 1": rep("    }\n    return 0;\n}\n\n#elif defined(__APPLE__)", "    }\n    return 1;\n}\n\n#elif defined(__APPLE__)"),
+        "call moved after the branch's closing brace": rep(tail, "        }\n    " + call + "\n    }\n    return 0;\n}\n\n} // namespace yuzu::services", no_call),
+        "final return 0 -> return 1": rep("    }\n    return 0;\n}\n\n} // namespace yuzu::services", "    }\n    return 1;\n}\n\n} // namespace yuzu::services"),
         "early return 0 before the call": rep(call, "return 0;\n            " + call),
-        "call in an else": rep(tail, "        } else {\n            " + call + "\n        }\n    }\n    return 0;\n}\n\n#elif defined(__APPLE__)", no_call),
+        "call in an else": rep(tail, "        } else {\n            " + call + "\n        }\n    }\n    return 0;\n}\n\n} // namespace yuzu::services", no_call),
         "under if (false)": rep(call, "if (false) { " + call + " }"),
         "branch condition inverted": rep(br, "if (!yuzu::services::start_state_is_unchangeable(state)) {"),
         "early return before the branch": rep(first, "        return 0;\n" + first),
@@ -257,9 +259,23 @@ def selftest(src):
     return errs
 
 
+def plugin_problems(plugin_src):
+    code = lexh.code_only(plugin_src)
+    out = []
+    if not re.search(r"return yuzu::services::set_start_mode_linux\(", code):
+        out.append("do_set_start_mode_linux no longer returns yuzu::services::set_start_mode_linux(...)")
+    if re.search(r"start_mode_readback_matches|start_mode_took_effect", code):
+        out.append("services_plugin.cpp carries its own readback logic again; it belongs in the seam header")
+    return out
+
+
 def main():
     src = SRC.read_text(encoding="utf-8")
-    errs = problems(src) + selftest(src)
+    plug = PLUGIN.read_text(encoding="utf-8")
+    errs = problems(src) + plugin_problems(plug) + selftest(src)
+    hidden = plug.replace("return yuzu::services::set_start_mode_linux(", "return 0; // set_start_mode_linux(", 1)
+    if hidden == plug or not plugin_problems(hidden):
+        errs.append("selftest: the plugin no longer calling the seam body was NOT detected")
     for e in errs:
         print("FAIL:", e)
     return 1 if errs else 0

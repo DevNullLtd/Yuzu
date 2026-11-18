@@ -10,11 +10,13 @@
 // ("PID\tStatus\tLabel" header + tab-separated rows) column layouts, not a
 // live capture from a running host.
 #include "services_parsers.hpp"
+#include "services_set_start_mode.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <yuzu/agent/subprocess_runner.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <format>
 #include <string>
@@ -530,4 +532,283 @@ TEST_CASE("start_state_is_runtime_masked: only masked-runtime, which automatic a
     using yuzu::services::start_state_is_masked;
     CHECK_FALSE(start_mode_should_remask("automatic", start_state_is_masked("masked-runtime"), false));
     CHECK(start_mode_should_remask("manual", start_state_is_masked("masked"), false));
+}
+
+// ── the Linux set_start_mode body, driven with a fake runner (WP13) ─────────────────────────────
+// No systemd, no sudo, no subprocess: every systemctl call is answered by the fake below, and the
+// output lines, the typed status and the sequence of calls are asserted. These are the behavioural
+// tests the lexical gate (tests/test_services_readback_wiring_lexical.py) backs up.
+
+
+namespace {
+
+struct FakeCtx {
+    std::vector<std::string> lines;
+    std::vector<std::string> statuses; // "<status>/<completeness>/<provenance>"
+    void write_output(std::string_view t) { lines.emplace_back(t); }
+    void set_result_status(YuzuResultStatus s, YuzuResultCompleteness c, std::string_view p) {
+        statuses.push_back(std::format("{}/{}/{}", static_cast<int>(s), static_cast<int>(c), p));
+    }
+    [[nodiscard]] bool has(std::string_view prefix) const {
+        for (const auto& l : lines)
+            if (l.starts_with(prefix))
+                return true;
+        return false;
+    }
+};
+
+struct FakeSystemctl {
+    // Per-verb scripted answers: exit code and stdout. is_enabled answers are consumed in order
+    // (the prior read, then the readback); the last one repeats.
+    std::vector<std::string> is_enabled_out;
+    int enable_rc = 0, disable_rc = 0, mask_rc = 0, unmask_rc = 0;
+    bool is_enabled_ran = true;
+    std::vector<std::string> calls; // the verb of each call, in order
+    std::size_t is_enabled_n = 0;
+
+    SubprocessResult operator()(const std::vector<std::string>& argv, bool /*merge_stderr*/ = true) {
+        SubprocessResult r;
+        r.tool_ran = true;
+        r.termination_reason = TerminationReason::exited;
+        // root argv: {systemctl, verb, "--", name}
+        const std::string& verb = argv.at(1);
+        calls.push_back(verb);
+        if (verb == "is-enabled") {
+            if (!is_enabled_ran) {
+                r.tool_ran = false;
+                r.termination_reason = TerminationReason::spawn_error;
+                return r;
+            }
+            const std::string out = is_enabled_out.empty()
+                                        ? std::string{}
+                                        : is_enabled_out[std::min(is_enabled_n, is_enabled_out.size() - 1)];
+            ++is_enabled_n;
+            r.output = out;
+            r.exit_code = (out == "enabled\n" || out == "static\n") ? 0 : 1;
+            return r;
+        }
+        r.exit_code = verb == "enable"    ? enable_rc
+                      : verb == "disable" ? disable_rc
+                      : verb == "mask"    ? mask_rc
+                                          : unmask_rc;
+        if (r.exit_code != 0)
+            r.output = "Failed";
+        return r;
+    }
+};
+
+int drive(FakeCtx& ctx, FakeSystemctl& sys, std::string_view mode, std::string_view name = "ssh.service") {
+    std::size_t forwarded = 0;
+    const int rc = yuzu::services::set_start_mode_linux(
+        ctx, [&sys](const std::vector<std::string>& a, bool m = true) { return sys(a, m); },
+        [&forwarded](const SubprocessResult&) { ++forwarded; }, "/usr/bin/systemctl", name, mode,
+        /*euid_is_root=*/true);
+    (void)forwarded;
+    return rc;
+}
+
+std::string joined(const std::vector<std::string>& v) {
+    std::string s;
+    for (const auto& x : v)
+        s += (s.empty() ? "" : ",") + x;
+    return s;
+}
+
+} // namespace
+
+TEST_CASE("set_start_mode_linux: a clean automatic change reads the state back and reports it",
+          "[services][setmode]") {
+    FakeCtx ctx;
+    FakeSystemctl sys;
+    sys.is_enabled_out = {"disabled\n", "enabled\n"};
+    CHECK(drive(ctx, sys, "automatic") == 0);
+    CHECK(joined(sys.calls) == "is-enabled,unmask,enable,is-enabled");
+    REQUIRE(ctx.lines.size() == 4);
+    CHECK(ctx.lines[0] == "status|ok");
+    CHECK(ctx.lines[3] == "state|enabled");
+    CHECK(ctx.statuses.empty());
+    CHECK_FALSE(ctx.has("error|"));
+    CHECK_FALSE(ctx.has("note|"));
+}
+
+TEST_CASE("set_start_mode_linux: verbs follow the mode and disabled never unmasks or reads a prior state",
+          "[services][setmode]") {
+    {
+        FakeCtx ctx;
+        FakeSystemctl sys;
+        sys.is_enabled_out = {"enabled\n", "disabled\n"};
+        CHECK(drive(ctx, sys, "manual") == 0);
+        CHECK(joined(sys.calls) == "is-enabled,unmask,disable,is-enabled");
+    }
+    {
+        FakeCtx ctx;
+        FakeSystemctl sys;
+        sys.is_enabled_out = {"masked\n"};
+        CHECK(drive(ctx, sys, "disabled") == 0);
+        CHECK(joined(sys.calls) == "mask,is-enabled");
+        CHECK(ctx.has("status|ok"));
+    }
+}
+
+TEST_CASE("set_start_mode_linux: a masked unit whose enable fails is masked again and says so",
+          "[services][setmode]") {
+    FakeCtx ctx;
+    FakeSystemctl sys;
+    sys.is_enabled_out = {"masked\n"};
+    sys.enable_rc = 1;
+    CHECK(drive(ctx, sys, "automatic") == 1);
+    CHECK(joined(sys.calls) == "is-enabled,unmask,enable,mask");
+    CHECK(ctx.has("error|"));
+    CHECK(ctx.has("note|remasked:"));
+    CHECK_FALSE(ctx.has("note|remask_failed"));
+    CHECK_FALSE(ctx.has("status|ok"));
+}
+
+TEST_CASE("set_start_mode_linux: a failed re-mask is reported as such, never as restored",
+          "[services][setmode]") {
+    FakeCtx ctx;
+    FakeSystemctl sys;
+    sys.is_enabled_out = {"masked\n"};
+    sys.enable_rc = 1;
+    sys.mask_rc = 1;
+    CHECK(drive(ctx, sys, "automatic") == 1);
+    CHECK(ctx.has("note|remask_failed:"));
+    CHECK_FALSE(ctx.has("note|remasked:"));
+}
+
+TEST_CASE("set_start_mode_linux: a unit that was not masked is never masked by a failure",
+          "[services][setmode]") {
+    FakeCtx ctx;
+    FakeSystemctl sys;
+    sys.is_enabled_out = {"disabled\n"};
+    sys.enable_rc = 1;
+    CHECK(drive(ctx, sys, "automatic") == 1);
+    CHECK(joined(sys.calls) == "is-enabled,unmask,enable");
+    CHECK_FALSE(ctx.has("note|"));
+}
+
+TEST_CASE("set_start_mode_linux: a runtime-masked unit is refused up front, nothing is called",
+          "[services][setmode]") {
+    for (const char* mode : {"automatic", "manual"}) {
+        FakeCtx ctx;
+        FakeSystemctl sys;
+        sys.is_enabled_out = {"masked-runtime\n"};
+        CHECK(drive(ctx, sys, mode) == 1);
+        CHECK(joined(sys.calls) == "is-enabled"); // no unmask, no enable/disable, no mask
+        CHECK(ctx.has("error|"));
+        CHECK_FALSE(ctx.has("note|remasked"));
+        CHECK_FALSE(ctx.has("status|ok"));
+        REQUIRE(ctx.statuses.size() == 1);
+        CHECK(ctx.statuses[0] == std::format("{}/{}/services:start_mode_runtime_mask",
+                                              static_cast<int>(YUZU_RESULT_STATUS_CONSTRAINED),
+                                              static_cast<int>(YUZU_RESULT_COMPLETENESS_PARTIAL)));
+    }
+}
+
+TEST_CASE("set_start_mode_linux: a readback that does not match the mode is a failure, not status|ok",
+          "[services][setmode]") {
+    FakeCtx ctx;
+    FakeSystemctl sys;
+    sys.is_enabled_out = {"disabled\n", "disabled\n"}; // enable exited 0 but acted on nothing
+    CHECK(drive(ctx, sys, "automatic") == 1);
+    CHECK(ctx.has("error|"));
+    CHECK_FALSE(ctx.has("status|ok"));
+    CHECK_FALSE(ctx.has("state|"));
+}
+
+TEST_CASE("set_start_mode_linux: a readback that did not run is a failure", "[services][setmode]") {
+    FakeCtx ctx;
+    FakeSystemctl sys;
+    sys.is_enabled_out = {"disabled\n"};
+    // the prior read runs, the readback does not
+    std::size_t is_enabled_calls = 0;
+    const int rc = yuzu::services::set_start_mode_linux(
+        ctx,
+        [&](const std::vector<std::string>& a, bool m = true) {
+            if (a.at(1) == "is-enabled" && ++is_enabled_calls == 2) {
+                SubprocessResult r;
+                r.tool_ran = false;
+                r.termination_reason = TerminationReason::spawn_error;
+                return r;
+            }
+            return sys(a, m);
+        },
+        [](const SubprocessResult&) {}, "/usr/bin/systemctl", "ssh.service", "automatic", true);
+    CHECK(rc == 1);
+    CHECK_FALSE(ctx.has("status|ok"));
+}
+
+TEST_CASE("set_start_mode_linux: a failed change is an error and forwards a runner failure",
+          "[services][setmode]") {
+    FakeCtx ctx;
+    FakeSystemctl sys;
+    sys.is_enabled_out = {"disabled\n"};
+    sys.enable_rc = 1;
+    CHECK(drive(ctx, sys, "automatic") == 1);
+    CHECK(ctx.has("error|systemctl command failed"));
+    CHECK_FALSE(ctx.has("status|ok"));
+}
+
+TEST_CASE("set_start_mode_linux: an unchangeable unit completes with a state, a note and a CONSTRAINED status",
+          "[services][setmode]") {
+    FakeCtx ctx;
+    FakeSystemctl sys;
+    sys.is_enabled_out = {"static\n", "static\n"};
+    CHECK(drive(ctx, sys, "manual") == 0);
+    CHECK(ctx.has("status|ok"));
+    CHECK(ctx.has("state|static"));
+    CHECK(ctx.has("note|"));
+    REQUIRE(ctx.statuses.size() == 1);
+    CHECK(ctx.statuses[0].ends_with("/services:start_mode_unchangeable"));
+}
+
+TEST_CASE("set_start_mode_linux: an invalid mode runs nothing", "[services][setmode]") {
+    FakeCtx ctx;
+    FakeSystemctl sys;
+    CHECK(drive(ctx, sys, "bogus") == 1);
+    CHECK(sys.calls.empty());
+    CHECK(ctx.has("error|invalid mode"));
+}
+
+TEST_CASE("set_start_mode_linux: a non-root agent calls the helper, never systemctl, for the change",
+          "[services][setmode]") {
+    FakeCtx ctx;
+    std::vector<std::vector<std::string>> argvs;
+    int is_enabled_n = 0;
+    const int rc = yuzu::services::set_start_mode_linux(
+        ctx,
+        [&](const std::vector<std::string>& a, bool = true) {
+            argvs.push_back(a);
+            SubprocessResult r;
+            r.tool_ran = true;
+            r.termination_reason = TerminationReason::exited;
+            r.exit_code = 0;
+            if (a.size() > 1 && a[1] == "is-enabled") {
+                r.output = ++is_enabled_n == 1 ? "disabled\n" : "enabled\n";
+                r.exit_code = r.output == "enabled\n" ? 0 : 1;
+            }
+            return r;
+        },
+        [](const SubprocessResult&) {}, "/usr/bin/systemctl", "ssh.service", "automatic",
+        /*euid_is_root=*/false);
+    CHECK(rc == 0);
+    bool saw_helper = false;
+    for (const auto& a : argvs)
+        for (const auto& t : a)
+            if (t.find("yuzu-svc-helper") != std::string::npos)
+                saw_helper = true;
+    CHECK(saw_helper);
+}
+
+TEST_CASE("set_start_mode_linux: a masked unmaskable-state unit says it was unmasked", "[services][setmode]") {
+    FakeCtx ctx;
+    FakeSystemctl sys;
+    sys.is_enabled_out = {"masked\n", "static\n"};
+    CHECK(drive(ctx, sys, "automatic") == 0);
+    bool said = false;
+    for (const auto& l : ctx.lines)
+        if (l.starts_with("note|") && l.find("was masked before this call and is now unmasked") != std::string::npos)
+            said = true;
+    CHECK(said);
+    CHECK(joined(sys.calls) == "is-enabled,unmask,enable,is-enabled");
 }

@@ -72,7 +72,7 @@ def problems(src):
     h = m_h.group(1)
     # 2. the stamp is read from THAT handle, inside drain()
     m_stamp = re.search(
-        r"(?:const )?FileVersionStamp (\w+) ?= ?read_image_version_stamp\( ?(\w+)\.get\(\) ?\);", body)
+        r"const FileVersionStamp (\w+) ?= ?read_image_version_stamp\( ?(\w+)\.get\(\) ?\);", body)
     if not m_stamp:
         return ["drain() no longer reads `FileVersionStamp x = read_image_version_stamp(<image>.get())`" + HINT]
     var = m_stamp.group(1)
@@ -80,6 +80,9 @@ def problems(src):
         out.append(f"the stamp is read from `{m_stamp.group(2)}`, not the handle `{h}` opened by open_local_image_no_reparse")
     if m_stamp.start() < m_h.start():
         out.append("the stamp is read BEFORE the image handle is opened")
+    # a const stamp that is never reassigned (`stamp = weak_stamp(full);` after the read)
+    if len(re.findall(r"(?<![\w.])" + re.escape(var) + r" ?=(?!=)", body)) != 1:
+        out.append(f"the stamp `{var}` must be assigned exactly once (const, from read_image_version_stamp)")
     # 3. the cache is consulted with that stamp, after it is read, inside drain()
     m_get = re.search(r"sign_cache_\.get\( ?full, ?(\w+) ?,", body)
     if not m_get:
@@ -137,6 +140,10 @@ def selftest(src):
          lambda s: s.replace("read_image_version_stamp(img.get())", "read_image_version_stamp(other.get())", 1)),
         ("handle not from open_local_image_no_reparse",
          lambda s: s.replace("open_local_image_no_reparse(full) : ImageHandle{}", "open_weaker_image(full) : ImageHandle{}", 1)),
+        ("stamp reassigned after the read",
+         lambda s: s.replace("sign_cache_.get(full, stamp,", "stamp = weak_stamp(full); sign_cache_.get(full, stamp,", 1)),
+        ("stamp made non-const",
+         lambda s: s.replace("const FileVersionStamp stamp = read_image_version_stamp(img.get());", "FileVersionStamp stamp = read_image_version_stamp(img.get());", 1)),
         ("usn forced",
          lambda s: s.replace("sign_cache_.get(full, stamp,", "x.usn = 1; sign_cache_.get(full, stamp,", 1)),
     ]

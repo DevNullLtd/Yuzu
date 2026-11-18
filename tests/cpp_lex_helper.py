@@ -156,7 +156,7 @@ def dead_lines(masked: str) -> set[int]:
             elif c is None:  # #else after only-unknown or all-zero branches: live
                 e["skip"], e["all_zero"] = False, False
             elif _ZERO_C.fullmatch(c[1]):
-                e["skip"] = e["all_zero"]  # still dead after all-zero; live (unknown) otherwise
+                e["skip"] = True  # a literal-zero #elif is dead whatever came before it
             elif _ONE_C.fullmatch(c[1]):
                 e["skip"], e["one"], e["all_zero"] = False, True, False
             else:
@@ -201,7 +201,7 @@ def code_only(src: str) -> str:
 # Non-goals (a regex-free tokenizer cannot evaluate them): `#ifdef NEVER` / `#ifndef ALWAYS`
 # style conditions, `#if` expressions other than a literal zero/one (`0 && X`, `defined(X)`),
 # macro-built tokens, trigraphs / digraphs, and backslash-newline SPLICES inside a token or
-# between the two characters of a comment opener (comments are recognised before splicing). A pin that matters must not rely on these being excluded.
+# between the two characters of a comment opener (comments are recognised before splicing). Also not evaluated: `!!0`, `-0`, `0b0` and a `#if` whose zero follows a line splice (`#if \\<newline>0`), which all read as unknown, i.e. live. A pin that matters must not rely on these being excluded.
 
 
 def _selftest() -> list[str]:
@@ -241,7 +241,14 @@ def _selftest() -> list[str]:
         ("#if 0 #elif X drops the dead branch", "#if 0\nb();\n#elif X\nkeep();\n#endif", "b()", False),
         ("#if 0 #elif 1 live", "#if 0\nb();\n#elif 1\nkeep();\n#else\nb2();\n#endif", "keep()", True),
         ("#if 0 #elif 1 kills the else", "#if 0\nb();\n#elif 1\nkeep();\n#else\nb2();\n#endif", "b2()", False),
-        ("#if 1 #elif 0 dead", "#if 1\nkeep();\n#elif X\nb();\n#endif", "b()", False),
+        ("#if 1 #elif X is dead", "#if 1\nkeep();\n#elif X\nb();\n#endif", "b()", False),
+        ("#if 1 #elif 0 is dead", "#if 1\nkeep();\n#elif 0\nb();\n#endif", "b()", False),
+        ("#if X #elif 0 is dead", "#if X\nkeep();\n#elif 0\nb();\n#endif", "b()", False),
+        ("#ifdef X #elif 0 is dead", "#ifdef X\nkeep();\n#elif 0\nb();\n#endif", "b()", False),
+        ("#if 0 #elif X #elif 0 is dead", "#if 0\nb();\n#elif X\nkeep();\n#elif 0\nb2();\n#endif", "b2()", False),
+        ("#if X #elif false is dead", "#if X\nkeep();\n#elif false\nb();\n#endif", "b()", False),
+        ("#if X #elif 0 keeps the live branch", "#if X\nkeep();\n#elif 0\nb();\n#endif", "keep()", True),
+        ("#if 0 #elif X #elif 0 keeps the unknown branch", "#if 0\nb();\n#elif X\nkeep();\n#elif 0\nb2();\n#endif", "keep()", True),
         ("#if 0x0", "#if 0x0\nb();\n#endif\nkeep();", "b()", False),
         ("#if 0x00UL", "#if 0x00UL\nb();\n#endif\nkeep();", "b()", False),
         ("#if 0x1 is live", "#if 0x1\nkeep();\n#else\nb();\n#endif", "b()", False),
