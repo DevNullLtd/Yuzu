@@ -29,7 +29,9 @@ resolve() {
   # shellcheck disable=SC2086 # deliberate word split: "<sha> <parent>..."
   set -- $parents
   if [ "$#" -ne 3 ]; then
-    echo "pr-merge-parent: $MERGE is not a two-parent merge commit — failing closed" >&2
+    # At fetch-depth 1 the merge commit is a shallow boundary and lists no
+    # parents, which reads exactly like a non-merge: name both causes.
+    echo "pr-merge-parent: $MERGE shows $(($# - 1)) parent(s), not two: either it is not a merge commit or the checkout is too shallow (use fetch-depth 2 or more) — failing closed" >&2
     return 1
   fi
   if [ "$3" != "$PRHEAD" ]; then
@@ -42,8 +44,14 @@ resolve() {
 
 selftest() {
   local tmp rc fails=0 out
-  tmp="$(mktemp -d)"
-  trap 'rm -rf "$tmp"' RETURN
+  # Hermetic git: no inherited GIT_* (a hook context sets GIT_DIR and the
+  # fixture commits would land in THAT repo), and no global/system config.
+  local v
+  for v in $(env | sed -n 's/^\(GIT_[A-Za-z0-9_]*\)=.*/\1/p'); do unset "$v"; done
+  export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/yuzu_test_pr_merge_parent.XXXXXX")"
+  # EXIT, not RETURN: a failed fixture setup exits the script under set -e.
+  trap "rm -rf '$tmp'" EXIT
   (
     cd "$tmp"
     git init -q -b main .
@@ -74,11 +82,32 @@ selftest() {
 
   # The pull_request jobs that need this base must take it from here, never
   # from the event's base.sha (a revert to base.sha passes every fixture above).
-  local root wf
+  # The pins match the EXECUTED lines (comments stripped), not a mention.
+  local root wf code want n
   root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-  for wf in docs-lint.yml plugin-spawn-gate.yml; do
-    if ! grep -q 'scripts/ci/pr-merge-parent.sh' "$root/.github/workflows/$wf"; then
-      echo "FAIL: .github/workflows/$wf no longer takes its PR base from pr-merge-parent.sh" >&2
+  pin() { # workflow, fixed-string executed line, description
+    code="$(sed -E 's/^[[:space:]]*#.*$//' "$root/.github/workflows/$1")"
+    if ! grep -qF -- "$2" <<<"$code"; then
+      echo "FAIL: .github/workflows/$1 no longer $3" >&2
+      fails=$((fails + 1))
+    fi
+  }
+  pin docs-lint.yml 'BASE="$(bash scripts/ci/pr-merge-parent.sh "$HEAD_SHA" "$PR_HEAD_SHA")"' \
+    "sets the README touch rule's BASE from pr-merge-parent.sh"
+  pin docs-lint.yml 'scripts/ci/check-plugin-readme-touch.sh "$BASE" "$HEAD_SHA"' \
+    "passes that BASE to check-plugin-readme-touch.sh"
+  pin plugin-spawn-gate.yml 'PR_BASE="$(bash scripts/ci/pr-merge-parent.sh "$HEAD_SHA" "$PR_HEAD_SHA")"' \
+    "sets the spawn scan's PR base from pr-merge-parent.sh"
+  pin plugin-spawn-gate.yml 'echo "ref=$PR_BASE" >> "$GITHUB_OUTPUT"' \
+    "hands that base to the scan step"
+  # The spawn gate must not read the event's base.sha at all; docs-lint keeps
+  # exactly one use, in the changelog-fragments job (see the touch-rule step).
+  for wf in plugin-spawn-gate.yml docs-lint.yml; do
+    code="$(sed -E 's/^[[:space:]]*#.*$//' "$root/.github/workflows/$wf")"
+    want=0; [ "$wf" = docs-lint.yml ] && want=1
+    n="$(grep -cF 'pull_request.base.sha' <<<"$code" || true)"
+    if [ "$n" -ne "$want" ]; then
+      echo "FAIL: .github/workflows/$wf uses pull_request.base.sha $n time(s), expected $want" >&2
       fails=$((fails + 1))
     fi
   done
