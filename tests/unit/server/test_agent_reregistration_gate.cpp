@@ -514,3 +514,150 @@ TEST_CASE("unproven audit budget: sources past the table cap share ONE uncapped-
     REQUIRE(!rows.empty());
     CHECK(rows[0].find("other:") != std::string::npos);
 }
+
+// ---- WP01 Gate 8 pass 5: flush cadence under a slow writer, and the flush counters -----------
+
+namespace {
+/// Simulated flood: `ids_per_s` DISTINCT live-leaf ids per second from one source (admit() closes
+/// windows exactly as production does), a flush round every `interval_ms` against a writer that takes
+/// `latency_ms` per row. Returns {named, unnamed}: ids named in written rows vs counted unnamed.
+std::pair<std::uint64_t, std::uint64_t> simulate_flood(std::int64_t interval_ms, int latency_ms,
+                                                       int ids_per_s, int seconds) {
+    using B = detail::UnprovenAuditBudget;
+    B b;
+    std::int64_t clock = 100'000'000;
+    std::uint64_t named = 0, unnamed = 0;
+    int next_id = 0;
+    // The whole population is seeded as recent so none is sheltered by the reserved bucket.
+    const int population = ids_per_s * seconds;
+    for (int i = 0; i < population; i += 1000) {
+        for (int k = i; k < i + 1000 && k < population; ++k)
+            (void)b.admit("fl-" + std::to_string(k), "seed-" + std::to_string(k / 40), clock);
+        clock += B::kWindowMs + 1;
+    }
+    (void)b.poll_closed(clock, true);
+    (void)b.take_ids_truncated();
+    while (b.take_pending()) {
+    }
+    clock += B::kWindowMs + 1;
+    std::int64_t last_flush = clock;
+    std::int64_t spent = 0; // simulated time the writer used inside the current round
+    const auto write = [&](const std::string& row) {
+        named += ids_in_row(row);
+        spent += latency_ms;
+        return true;
+    };
+    const auto round = [&](bool force) {
+        spent = 0;
+        const std::int64_t base = clock;
+        const auto r = detail::flush_reregistration_budget(
+            b, clock, force, force ? 1'000'000 : detail::kReregistrationFlushDeadlineMs, write,
+            [&] { return base + spent; });
+        unnamed += r.ids_truncated;
+    };
+    for (int s = 0; s < seconds; ++s) {
+        clock += 1000;
+        for (int i = 0; i < ids_per_s; ++i)
+            (void)b.admit("fl-" + std::to_string(next_id++ % population), "one-gateway", clock);
+        if (clock - last_flush >= interval_ms) {
+            round(false);
+            last_flush = clock;
+        }
+    }
+    clock += B::kWindowMs + 1;
+    round(true);
+    return {named, unnamed};
+}
+} // namespace
+
+TEST_CASE("unproven audit budget: at 2000 distinct dropped ids/s and a 20 ms writer the shipped flush cadence "
+          "names (nearly) every id; the old 15 s cadence did not",
+          "[reregistration_gate][wp01][audit_budget][audit][flush_cadence]") {
+    const auto good = simulate_flood(detail::kReregistrationFlushIntervalMs, 20, 2000, 120);
+    const double good_frac = static_cast<double>(good.first) / static_cast<double>(good.first + good.second);
+    INFO("named " << good.first << " unnamed " << good.second);
+    CHECK(good.first + good.second > 200'000);
+    CHECK(good_frac >= 0.99);
+    // The 15 s cadence of the earlier build loses ids (and now COUNTS them): pins that the interval
+    // constant is what keeps the queue ahead of the windows.
+    const auto old = simulate_flood(15'000, 20, 2000, 120);
+    const double old_frac = static_cast<double>(old.first) / static_cast<double>(old.first + old.second);
+    CHECK(old_frac < 0.9);
+    CHECK(old.second > 0); // counted by id, never silent
+    CHECK(detail::kReregistrationFlushIntervalMs <= 5000);
+}
+
+TEST_CASE("unproven audit budget: the flush counts chunks AND ids for every unwritten chunk, per cause",
+          "[reregistration_gate][wp01][audit_budget][audit][flush_cadence]") {
+    using B = detail::UnprovenAuditBudget;
+    const auto fill_window = [](B& b, std::int64_t& t, int ids) {
+        // `ids` DISTINCT dropped ids: one admitted opener per window then repeats of seeded ids.
+        for (int i = 0; i < ids; ++i)
+            (void)b.admit("c-" + std::to_string(i), "atk", t);
+        t += B::kWindowMs + 1;
+    };
+    const auto never = [] { return 0; };
+    SECTION("queue full: ids of the dropped chunks are counted by id") {
+        B b;
+        std::int64_t t = 70'000'000;
+        for (int w = 0; w < 2; ++w) { // 2 x 100 chunks into 128 rows
+            fill_window(b, t, 25'000);
+            (void)b.poll_closed(t, false);
+        }
+        const auto r = detail::flush_reregistration_budget(
+            b, t, false, 0, [](const std::string&) { return true; }, never);
+        // deadline 0: nothing written, nothing lost beyond the 72 chunks that did not fit
+        CHECK(r.queue_full == 200 - B::kMaxPendingRows);
+        CHECK(r.written == 0);
+        CHECK(r.ids_truncated >= r.queue_full * 1); // ids, not chunks
+        CHECK(r.ids_truncated > 4700 * 2);          // the per-window overflow alone is 2 x ~4700
+        CHECK(b.pending_size() == B::kMaxPendingRows);
+    }
+    SECTION("three failed writes drop the chunk: reason write_failed, its ids counted") {
+        B b;
+        std::int64_t t = 80'000'000;
+        fill_window(b, t, 500);
+        (void)b.poll_closed(t, false);
+        std::uint64_t failed = 0, ids = 0;
+        for (int round = 0; round < 3; ++round) {
+            const auto r = detail::flush_reregistration_budget(
+                b, t, false, 1'000'000, [](const std::string&) { return false; }, never);
+            CHECK(r.any_failed);
+            failed += r.write_failed;
+            ids += r.ids_truncated;
+        }
+        CHECK(failed == 1);
+        CHECK(ids == B::kSummaryIds); // the dropped chunk's 200 ids
+        CHECK(b.pending_size() == 0); // 200 dropped ids = ONE chunk, now dropped
+    }
+    SECTION("force=true: whatever is still queued is dropped with reason shutdown, ids counted") {
+        B b;
+        std::int64_t t = 90'000'000;
+        fill_window(b, t, 500);
+        const auto r = detail::flush_reregistration_budget(
+            b, t, /*force=*/true, 0, [](const std::string&) { return true; }, never);
+        CHECK(r.written == 0);
+        CHECK(r.shutdown >= 1);
+        CHECK(r.ids_truncated >= 1);
+        CHECK(b.pending_size() == 0);
+        // a forced flush with time to write loses nothing
+        std::int64_t t2 = 91'000'000;
+        fill_window(b, t2, 500);
+        std::size_t seen = 0;
+        const auto ok = detail::flush_reregistration_budget(
+            b, t2, true, 1'000'000, [&](const std::string&) { ++seen; return true; }, never);
+        CHECK(ok.shutdown == 0);
+        CHECK(ok.ids_truncated == 0);
+        CHECK(seen == ok.written);
+        CHECK(seen >= 1);
+    }
+    SECTION("a throwing writer is a failed write, never an escape") {
+        B b;
+        std::int64_t t = 92'000'000;
+        fill_window(b, t, 500);
+        const auto r = detail::flush_reregistration_budget(
+            b, t, false, 1'000'000, [](const std::string&) -> bool { throw 1; }, never);
+        CHECK(r.any_failed);
+        CHECK(b.pending_size() >= 1);
+    }
+}

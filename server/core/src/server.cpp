@@ -3710,22 +3710,24 @@ public:
         (void)metrics_.counter("yuzu_server_ca_superseded_leaf_total");
         (void)metrics_.counter("yuzu_server_ca_supersede_failed_total");
         (void)metrics_.counter("yuzu_register_reregistration_audit_ids_truncated_total");
-        for (const char* reason : {"queue_full", "write_failed", "shutdown"})
+        for (const char* reason : {"queue_full", "write_failed", "shutdown", "alloc_failed"})
             (void)metrics_.counter("yuzu_register_reregistration_audit_summary_dropped_total",
                                    {{"reason", reason}});
         for (const char* reason : {"no_csr", "no_signer", "signer_failed", "signer_threw"})
             (void)metrics_.counter("yuzu_register_reenrol_token_no_leaf_total",
                                    {{"reason", reason}});
         metrics_.describe("yuzu_register_reregistration_audit_ids_truncated_total",
-                          "Distinct dropped agent ids that could NOT be named in the per-window "
-                          "dropped-row summary (more than 20000 distinct dropped ids in one 10 s "
-                          "window). Non-zero means the audit-mode evidence for those ids is only "
-                          "the unbudgeted decision counter.",
+                          "Dropped agent ids that NO summary row names: the excess over 20000 "
+                          "distinct ids in one 10 s window, and every id of a summary chunk that was "
+                          "dropped (queue full, three failed writes, still queued at shutdown) or "
+                          "never built (allocation failure). For those ids the only record is the "
+                          "unbudgeted decision counter.",
                           "counter");
         metrics_.describe("yuzu_register_reregistration_audit_summary_dropped_total",
                           "Dropped-row summary chunks that were NOT written (reason: queue_full = "
                           "the 128-row pending queue overflowed, write_failed = the audit write "
-                          "failed three times, shutdown = still queued when the server stopped).",
+                          "failed three times, shutdown = still queued when the server stopped, "
+                          "alloc_failed = the window's summary could not be built).",
                           "counter");
         metrics_.describe("yuzu_register_reenrol_token_no_leaf_total",
                           "A single-use enrollment token was CONSUMED to re-enrol an agent id that "
@@ -10489,11 +10491,38 @@ public:
 
         // Spawn fleet health recomputation thread (aggregates agent heartbeat data)
         health_recompute_thread_ = std::thread([this]() {
+            bool reregistration_flush_skip_ = false;
             spdlog::info("Fleet health recomputation thread started (interval=15s)");
             while (!stop_requested_.load(std::memory_order_acquire)) {
                 // Sleep in small increments for responsive shutdown
-                for (int i = 0; i < 3 && !stop_requested_.load(std::memory_order_acquire); ++i) {
-                    std::this_thread::sleep_for(std::chrono::seconds{5});
+                for (int i = 0; i < 15000 / detail::kReregistrationFlushIntervalMs &&
+                                !stop_requested_.load(std::memory_order_acquire);
+                     ++i) {
+                    std::this_thread::sleep_for(
+                        std::chrono::milliseconds{detail::kReregistrationFlushIntervalMs});
+                    // WP01: flush the closed windows' dropped-audit-row summary chunks every 5 s
+                    // (the 15 s sweep cadence spans 1.5 audit windows against a 128-row queue, which
+                    // loses ids above about 1300 distinct ids/s). With stop() the ONLY writer of
+                    // those rows; per-process state, so NOT leader-gated (ReplicaSafe). Contained,
+                    // time-bounded (2 s) and skipped for one round after a failed round so a
+                    // dead audit store cannot stall this thread's real work.
+                    if (stop_requested_.load(std::memory_order_acquire))
+                        break;
+                    if (reregistration_flush_skip_) {
+                        reregistration_flush_skip_ = false;
+                    } else {
+                        try {
+                            YUZU_ASSERT_BACKGROUND_JOB("reregistration_audit.flush_summary"); // WS-10 ReplicaSafe
+                            reregistration_flush_skip_ = flush_reregistration_audit_summary(
+                                audit_store_.get(), &metrics_, /*force=*/false);
+                        } catch (const std::exception& e) {
+                            reregistration_flush_skip_ = true;
+                            spdlog::warn("Re-registration audit summary flush failed: {}", e.what());
+                        } catch (...) {
+                            reregistration_flush_skip_ = true;
+                            spdlog::warn("Re-registration audit summary flush failed: unknown exception");
+                        }
+                    }
                 }
                 if (stop_requested_.load(std::memory_order_acquire))
                     break;
@@ -10928,18 +10957,6 @@ public:
                             }
                         }
                     }
-                }
-                // WP01: flush the closed windows' dropped-audit-row summary chunks (the ONLY writer
-                // besides stop()). Placed AFTER the revocation sweep so a slow audit store can never
-                // delay stream teardown; time-bounded (1 s) and contained. Per-process state, so
-                // NOT leader-gated (ReplicaSafe).
-                try {
-                    YUZU_ASSERT_BACKGROUND_JOB("reregistration_audit.flush_summary"); // WS-10 ReplicaSafe
-                    flush_reregistration_audit_summary(audit_store_.get(), &metrics_, /*force=*/false);
-                } catch (const std::exception& e) {
-                    spdlog::warn("Re-registration audit summary flush failed: {}", e.what());
-                } catch (...) {
-                    spdlog::warn("Re-registration audit summary flush failed: unknown exception");
                 }
                 // Publish cert reload counters to Prometheus
                 if (cert_reloader_) {

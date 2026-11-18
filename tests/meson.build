@@ -969,6 +969,25 @@ if host_machine.system() == 'linux' and get_option('b_sanitize') == 'none'
   )
 endif
 
+# ── WP01 re-registration audit budget under allocation failure (separate binary, deliberately) ──
+# test_reregistration_audit_budget_alloc.cpp replaces the global operator new to inject
+# std::bad_alloc at every allocation point (see its header): absent under sanitizers and on Windows.
+if host_machine.system() != 'windows' and get_option('b_sanitize') == 'none'
+  reregistration_budget_alloc_exe = executable(
+    'yuzu_reregistration_budget_alloc_tests',
+    files('unit/server/test_reregistration_audit_budget_alloc.cpp'),
+    include_directories: [include_directories('../server/core/src')],
+    dependencies: [catch2_dep],
+  )
+  test(
+    'reregistration audit budget allocation failure',
+    reregistration_budget_alloc_exe,
+    args: ['--allow-running-no-tests', '--durations=yes'],
+    suite: 'server',
+    timeout: 60,
+  )
+endif
+
 # ── H.1 SMBIOS walker allocation budget (separate binary, deliberately) ──────
 # test_smbios_alloc_budget.cpp replaces the global operator new/delete (see its header), so it is
 # a separate binary: absent under sanitizers and on Windows.

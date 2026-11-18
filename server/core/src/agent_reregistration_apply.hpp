@@ -28,6 +28,7 @@
 
 #include "agent_reregistration_gate.hpp"
 #include "audit_store.hpp"
+#include "reregistration_audit_budget.hpp"
 #include "bounded_audit_budget.hpp"
 
 namespace yuzu::server {
@@ -79,295 +80,6 @@ inline DenialAuditBudget& reregistration_audit_budget() {
                                &reregistration_audit_now_ms};
     return b;
 }
-/// Budget for the ADMITTED row of audit mode (`agent.reregistration_unproven`, result success): the
-/// evidence that makes a takeover reconstructable (CC7.2), and a row an unauthenticated caller can
-/// provoke. HONEST CLAIM: rows can be DROPPED under load or attack, so the absence of a row is NOT
-/// proof that a re-registration did not happen; the authoritative count is the unbudgeted
-/// `yuzu_register_reregistration_total{outcome=...}`, and every dropped row is counted
-/// (`yuzu_register_reregistration_audit_dropped_total`) and summarised.
-///
-/// Per 10 s window, per server PROCESS (N replicas = N times these numbers):
-///  - repeats of an id seen in the window: `kRepeatRowsPerId` rows, then cut;
-///  - a RESERVED bucket (`kReservedRows`) for ids not seen in the last `kRecentIds` admissions
-///    (first-ever / long-quiet ids): written regardless of source;
-///  - every other new-id row needs BOTH a per-source slot (`kRowsPerSource`) and a global slot
-///    (`kGeneralRows`, the byte backstop). At most `kMaxSources` distinct sources are tracked; the
-///    rest share ONE `other` bucket (no per-source cap, the global slot still applies).
-/// A row that loses the budget is NOT lost as evidence of WHICH ids: its id is remembered, in DROP
-/// order, up to `kMaxDroppedIds` distinct ids per window, and the closed window is written as
-/// CHUNKED aggregate rows (at most `kSummaryIds` ids per row, every chunk repeating the per-source
-/// counts and `ids_truncated=N`). One source naming 300 distinct live-leaf ids in 10 s, a restart
-/// storm behind one origin-less gateway, or 2000 rotating sources therefore still leave every
-/// dropped id on record. Chunks are built OUTSIDE `mu_`, queued in a bounded pending deque
-/// (`kMaxPendingRows`), and written ONLY by the server's health tick and by stop()
-/// (`flush_reregistration_audit_summary`), never on a Register thread.
-/// RESIDUAL (MEDIUM, conditional on this bounded wording and on the alert
-/// `YuzuRegisterReregistrationAuditIdsTruncated`): more than `kMaxDroppedIds` DISTINCT dropped ids
-/// in one window leave the excess unnamed (counted: `ids_truncated=N` on every chunk and
-/// `yuzu_register_reregistration_audit_ids_truncated_total`); a pending queue overflow, a failed
-/// write after `kMaxWriteAttempts`, or a shutdown that runs out of time drops the chunk (counted:
-/// `yuzu_register_reregistration_audit_summary_dropped_total{reason}`). The authoritative decision
-/// count is always the unbudgeted counter.
-class UnprovenAuditBudget {
-public:
-    static constexpr std::size_t kRepeatRowsPerId = 3;
-    static constexpr std::size_t kReservedRows = 250;
-    static constexpr std::size_t kRowsPerSource = 50;
-    static constexpr std::size_t kGeneralRows = 1000;
-    static constexpr std::size_t kRecentIds = 8192;
-    static constexpr std::size_t kMaxTrackedIds = 4096;
-    static constexpr std::size_t kSummaryIds = 200;
-    static constexpr std::size_t kMaxSources = 1024;
-    static constexpr std::size_t kMaxDroppedIds = 20000;
-    static constexpr std::size_t kSummarySources = 10;
-    static constexpr std::size_t kMaxPendingRows = 128;
-    static constexpr int kMaxWriteAttempts = 3;
-    static constexpr std::int64_t kWindowMs = 10'000;
-
-    struct Decision {
-        bool admitted{false};
-        /// Non-empty only on the call that opens a new window: the CLOSED window's chunk rows (one
-        /// element per audit row; the sink does not split on newlines). Already queued for the
-        /// flush: a caller never writes them.
-        std::vector<std::string> closed_summary;
-    };
-
-    struct PendingRow {
-        std::string text;
-        int attempts{0};
-    };
-
-    [[nodiscard]] Decision admit(const std::string& agent_id, const std::string& source,
-                                 std::int64_t now_ms) {
-        Decision d;
-        std::optional<ClosedWindow> closed;
-        {
-            std::lock_guard lk(mu_);
-            closed = roll_locked(now_ms, /*force=*/false);
-            admit_locked(d, agent_id, source);
-        }
-        if (closed)
-            d.closed_summary = enqueue_closed(*closed);
-        return d;
-    }
-
-    /// Time-based flush: closes the window when due (or `force`) and returns the NEW chunk rows
-    /// (already queued for `take_pending`). Empty if the window is still open or nothing was dropped.
-    [[nodiscard]] std::vector<std::string> poll_closed(std::int64_t now_ms, bool force) {
-        std::optional<ClosedWindow> closed;
-        {
-            std::lock_guard lk(mu_);
-            closed = roll_locked(now_ms, force);
-        }
-        if (!closed)
-            return {};
-        return enqueue_closed(*closed);
-    }
-
-    /// The oldest queued chunk, if any. The caller writes it and, on failure, hands it back with
-    /// `requeue_front` (bounded by `kMaxWriteAttempts`).
-    [[nodiscard]] std::optional<PendingRow> take_pending() {
-        std::lock_guard lk(pending_mu_);
-        if (pending_.empty())
-            return std::nullopt;
-        auto r = std::move(pending_.front());
-        pending_.pop_front();
-        return r;
-    }
-    /// Returns false (chunk dropped) once the row has failed `kMaxWriteAttempts` times.
-    [[nodiscard]] bool requeue_front(PendingRow r) {
-        if (++r.attempts >= kMaxWriteAttempts)
-            return false;
-        std::lock_guard lk(pending_mu_);
-        pending_.push_front(std::move(r));
-        return true;
-    }
-    /// Hands a chunk back unchanged (the deadline ran out before it was tried: not a failed attempt).
-    void requeue_front_unconditional(PendingRow r) {
-        std::lock_guard lk(pending_mu_);
-        pending_.push_front(std::move(r));
-    }
-    [[nodiscard]] std::size_t pending_size() const {
-        std::lock_guard lk(pending_mu_);
-        return pending_.size();
-    }
-    /// Discards everything still queued (shutdown out of time); returns how many.
-    [[nodiscard]] std::size_t discard_pending() {
-        std::lock_guard lk(pending_mu_);
-        const auto n = pending_.size();
-        pending_.clear();
-        return n;
-    }
-    /// Counts accumulated since the last call, for the flush to publish as counters (the budget
-    /// holds no MetricsRegistry).
-    [[nodiscard]] std::uint64_t take_ids_truncated() { return ids_truncated_.exchange(0); }
-    [[nodiscard]] std::uint64_t take_queue_full_dropped() { return queue_full_dropped_.exchange(0); }
-
-private:
-    /// The state of a closed window, moved out of the lock so the chunks are built outside it.
-    struct ClosedWindow {
-        std::uint64_t dropped_rows{0};
-        std::map<std::string, std::size_t> by_source;
-        std::vector<std::string> ids; ///< distinct dropped ids in DROP order
-        std::uint64_t ids_overflow{0};
-    };
-
-    void admit_locked(Decision& d, const std::string& agent_id, const std::string& raw_source) {
-        const std::string& src = clamp_source(raw_source);
-        if (const auto it = seen_.find(agent_id); it != seen_.end()) {
-            if (++it->second <= kRepeatRowsPerId)
-                d.admitted = true;
-            else
-                drop_locked(agent_id, src);
-            return;
-        }
-        const bool first_ever = recent_.find(agent_id) == recent_.end();
-        bool ok = false;
-        if (first_ever && reserved_rows_ < kReservedRows) {
-            ++reserved_rows_;
-            ok = true;
-        } else if ((src == kOther || source_rows_[src] < kRowsPerSource) &&
-                   general_rows_ < kGeneralRows) {
-            ++source_rows_[src];
-            ++general_rows_;
-            ok = true;
-        }
-        if (!ok) {
-            drop_locked(agent_id, src);
-            return;
-        }
-        if (seen_.size() < kMaxTrackedIds)
-            seen_.emplace(agent_id, 1);
-        remember_locked(agent_id);
-        d.admitted = true;
-    }
-
-    std::optional<ClosedWindow> roll_locked(std::int64_t now_ms, bool force) {
-        std::optional<ClosedWindow> out;
-        if (open_ && (force || now_ms >= start_ms_ + kWindowMs)) {
-            if (dropped_rows_ > 0) {
-                ClosedWindow w;
-                w.dropped_rows = dropped_rows_;
-                w.by_source = std::move(dropped_by_source_);
-                w.ids = std::move(dropped_order_);
-                w.ids_overflow = dropped_ids_overflow_;
-                out = std::move(w);
-            }
-            open_ = false;
-            reset_window_locked();
-        }
-        if (!open_ && !force) {
-            open_ = true;
-            start_ms_ = now_ms;
-        }
-        return out;
-    }
-    void reset_window_locked() {
-        seen_.clear();
-        source_rows_.clear();
-        general_rows_ = reserved_rows_ = 0;
-        dropped_rows_ = 0;
-        dropped_by_source_.clear();
-        dropped_ids_.clear();
-        dropped_order_.clear();
-        dropped_ids_overflow_ = 0;
-    }
-    void drop_locked(const std::string& id, const std::string& source) {
-        ++dropped_rows_;
-        ++dropped_by_source_[source.substr(0, 45)];
-        if (dropped_ids_.find(id) == dropped_ids_.end()) {
-            if (dropped_ids_.size() < kMaxDroppedIds) {
-                dropped_ids_.insert(id);
-                dropped_order_.push_back(id);
-            } else {
-                ++dropped_ids_overflow_;
-            }
-        }
-    }
-    void remember_locked(const std::string& id) {
-        if (recent_.insert(id).second) {
-            recent_order_.push_back(id);
-            if (recent_order_.size() > kRecentIds) {
-                recent_.erase(recent_order_.front());
-                recent_order_.pop_front();
-            }
-        }
-    }
-    static inline const std::string kOther{"other"};
-    /// A source already tracked keeps its own entry; a NEW one past `kMaxSources` shares `other`.
-    const std::string& clamp_source(const std::string& s) const {
-        if (source_rows_.count(s) || dropped_by_source_.count(s.substr(0, 45)) ||
-            source_rows_.size() + dropped_by_source_.size() < kMaxSources)
-            return s;
-        return kOther;
-    }
-    static std::string neutralise(const std::string& id) {
-        std::string out;
-        for (const char c : id.substr(0, 24))
-            out.push_back((std::isalnum(static_cast<unsigned char>(c)) || c == '.' || c == '_' ||
-                           c == ':' || c == '-')
-                              ? c
-                              : '?');
-        return out;
-    }
-    /// One row per element, each at most `kSummaryIds` ids; every row repeats the head.
-    static std::vector<std::string> build_rows(const ClosedWindow& w) {
-        std::string head = "dropped_rows=" + std::to_string(w.dropped_rows) +
-                           " distinct_dropped_ids=" + std::to_string(w.ids.size() + w.ids_overflow) +
-                           " sources=";
-        std::vector<std::pair<std::size_t, std::string>> by;
-        for (const auto& [src, n] : w.by_source)
-            by.emplace_back(n, src);
-        std::sort(by.rbegin(), by.rend());
-        for (std::size_t i = 0; i < by.size() && i < kSummarySources; ++i)
-            head += (i ? "," : "") + neutralise(by[i].second) + ":" + std::to_string(by[i].first);
-        const std::size_t parts = std::max<std::size_t>(1, (w.ids.size() + kSummaryIds - 1) / kSummaryIds);
-        std::vector<std::string> rows;
-        rows.reserve(parts);
-        for (std::size_t p = 0; p < parts; ++p) {
-            std::string r = head + " ids_truncated=" + std::to_string(w.ids_overflow) +
-                            " part=" + std::to_string(p + 1) + "/" + std::to_string(parts) +
-                            " ids=";
-            for (std::size_t k = p * kSummaryIds; k < w.ids.size() && k < (p + 1) * kSummaryIds; ++k)
-                r += (k % kSummaryIds ? "," : "") + neutralise(w.ids[k]);
-            rows.push_back(std::move(r));
-        }
-        return rows;
-    }
-    /// Builds the chunks (no lock held) and queues them; a full queue drops the new chunk, counted.
-    std::vector<std::string> enqueue_closed(const ClosedWindow& w) {
-        auto rows = build_rows(w);
-        ids_truncated_.fetch_add(w.ids_overflow);
-        std::lock_guard lk(pending_mu_);
-        for (const auto& r : rows) {
-            if (pending_.size() >= kMaxPendingRows)
-                queue_full_dropped_.fetch_add(1);
-            else
-                pending_.push_back(PendingRow{r, 0});
-        }
-        return rows;
-    }
-
-    std::mutex mu_;
-    bool open_{false};
-    std::int64_t start_ms_{0};
-    std::map<std::string, std::size_t> seen_;
-    std::map<std::string, std::size_t> source_rows_;
-    std::size_t general_rows_{0};
-    std::size_t reserved_rows_{0};
-    std::uint64_t dropped_rows_{0};
-    std::map<std::string, std::size_t> dropped_by_source_;
-    std::set<std::string> dropped_ids_;
-    std::vector<std::string> dropped_order_;
-    std::uint64_t dropped_ids_overflow_{0};
-    std::set<std::string> recent_;
-    std::deque<std::string> recent_order_;
-
-    mutable std::mutex pending_mu_;
-    std::deque<PendingRow> pending_;
-    std::atomic<std::uint64_t> ids_truncated_{0};
-    std::atomic<std::uint64_t> queue_full_dropped_{0};
-};
 inline UnprovenAuditBudget& reregistration_unproven_budget() {
     static UnprovenAuditBudget b;
     return b;
@@ -440,54 +152,51 @@ inline DenialAuditBudget& reregistration_log_budget() {
 }
 
 /// Time-based / shutdown flush of the closed windows' dropped-row summary chunks (see
-/// UnprovenAuditBudget). The ONLY writer of those rows: the server's health tick (deadline 1 s) and
+/// UnprovenAuditBudget). The ONLY writer of those rows: the server's health thread, every 5 s
+/// (deadline 2 s, skipped for one round after a failed round), and
 /// stop() (`force`, deadline 2 s). A chunk that fails to write is retried on the next tick up to
 /// `kMaxWriteAttempts`; chunks that cannot be written are counted
 /// (`yuzu_register_reregistration_audit_summary_dropped_total{reason}`), never silently lost.
 /// `store` may be null/closed (counted as a failed attempt). `deadline_ms` bounds the time spent
 /// writing; the remainder stays queued (or, at `force`, is dropped with reason `shutdown`).
-inline void flush_reregistration_audit_summary(AuditStore* store, yuzu::MetricsRegistry* metrics,
+/// Returns true when a write failed this round (the caller may skip the next round).
+inline bool flush_reregistration_audit_summary(AuditStore* store, yuzu::MetricsRegistry* metrics,
                                                bool force, std::int64_t deadline_ms = -1) {
-    auto& budget = detail::reregistration_unproven_budget();
-    const auto count_dropped = [&](std::string_view reason, std::uint64_t n) {
-        if (metrics && n)
-            metrics
-                ->counter("yuzu_register_reregistration_audit_summary_dropped_total",
-                          {{"reason", std::string(reason)}})
-                .increment(static_cast<double>(n));
-    };
-    (void)budget.poll_closed(detail::reregistration_audit_now_ms(), force);
-    if (const auto n = budget.take_ids_truncated(); n && metrics)
-        metrics->counter("yuzu_register_reregistration_audit_ids_truncated_total")
-            .increment(static_cast<double>(n));
-    count_dropped("queue_full", budget.take_queue_full_dropped());
-    if (deadline_ms < 0)
-        deadline_ms = force ? 2000 : 1000;
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(deadline_ms);
-    bool failed = false;
+    bool write_failed = false;
     const auto sink = make_reregistration_audit_sink(store, "server", "*", "", nullptr,
-                                                     [&] { failed = true; }, metrics);
-    while (auto row = budget.take_pending()) {
-        if (std::chrono::steady_clock::now() >= deadline) {
-            budget.requeue_front_unconditional(std::move(*row));
-            break;
-        }
-        failed = !(store && store->is_open());
-        if (!failed) {
-            try {
-                sink(kAuditActionReregistrationUnproven, "success", "aggregate", "audit", row->text);
-            } catch (...) {
-                failed = true;
-            }
-        }
-        if (failed) {
-            if (!budget.requeue_front(std::move(*row)))
-                count_dropped("write_failed", 1);
-            break; // a failing store: retry on the next tick, not in a tight loop
-        }
+                                                     [&] { write_failed = true; }, metrics);
+    const auto r = detail::flush_reregistration_budget(
+        detail::reregistration_unproven_budget(), detail::reregistration_audit_now_ms(), force,
+        deadline_ms < 0 ? detail::kReregistrationFlushDeadlineMs : deadline_ms,
+        [&](const std::string& row) {
+            if (!(store && store->is_open()))
+                return false;
+            write_failed = false;
+            sink(kAuditActionReregistrationUnproven, "success", "aggregate", "audit", row);
+            return !write_failed;
+        },
+        [] {
+            return std::chrono::duration_cast<std::chrono::milliseconds>(
+                       std::chrono::steady_clock::now().time_since_epoch())
+                .count();
+        });
+    if (metrics) {
+        const auto count = [&](std::string_view reason, std::uint64_t n) {
+            if (n)
+                metrics
+                    ->counter("yuzu_register_reregistration_audit_summary_dropped_total",
+                              {{"reason", std::string(reason)}})
+                    .increment(static_cast<double>(n));
+        };
+        count("queue_full", r.queue_full);
+        count("alloc_failed", r.alloc_failed);
+        count("write_failed", r.write_failed);
+        count("shutdown", r.shutdown);
+        if (r.ids_truncated)
+            metrics->counter("yuzu_register_reregistration_audit_ids_truncated_total")
+                .increment(static_cast<double>(r.ids_truncated));
     }
-    if (force)
-        count_dropped("shutdown", budget.discard_pending());
+    return r.any_failed;
 }
 
 /// A single-use token was CONSUMED to re-enrol an id that holds a live leaf, but no new leaf was
@@ -557,9 +266,17 @@ apply_reregistration_gate(ReregistrationProofMode mode, const AgentIdentityHooks
         if (result == "success") {
             // A window this call closes is queued inside the budget and written ONLY by the health
             // tick / stop() (flush_reregistration_audit_summary): never on a Register thread.
-            const auto r = detail::reregistration_unproven_budget().admit(
-                agent_id, std::string(source), detail::reregistration_audit_now_ms());
-            if (!r.admitted) {
+            // admit() contains its own failures (a throw costs this row only); the catch is a
+            // second belt: an exception out of the audit decision must never reach gRPC.
+            bool admitted = false;
+            try {
+                admitted = detail::reregistration_unproven_budget()
+                               .admit(agent_id, std::string(source),
+                                      detail::reregistration_audit_now_ms())
+                               .admitted;
+            } catch (...) {
+            }
+            if (!admitted) {
                 if (metrics)
                     metrics
                         ->counter("yuzu_register_reregistration_audit_dropped_total",

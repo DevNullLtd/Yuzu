@@ -5400,3 +5400,61 @@ TEST_CASE("WP01: the summary chunks reach the audit log through the health-tick 
         }
     CHECK(parts == 2);
 }
+
+TEST_CASE("WP01: the flush wrapper counts an OPEN store whose write fails (write_failed), and a forced flush "
+          "drops what is left with reason shutdown and counts the ids",
+          "[pg][agent_service][wp01][reregistration][audit]") {
+    using yuzu::server::detail::UnprovenAuditBudget;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    yuzu::server::AuditStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::MetricsRegistry metrics;
+    auto& budget = yuzu::server::detail::reregistration_unproven_budget();
+    auto& skew = yuzu::server::detail::reregistration_audit_clock_skew_ms();
+    const auto now = [] { return yuzu::server::detail::reregistration_audit_now_ms(); };
+    const auto queue_window = [&] { // 250 dropped ids from one source = two chunks (200 + 50)
+        skew += UnprovenAuditBudget::kWindowMs + 1;
+        for (int i = 0; i < 300; ++i)
+            (void)budget.admit("wf-" + std::to_string(i), "seed-" + std::to_string(i / 40), now());
+        skew += UnprovenAuditBudget::kWindowMs + 1;
+        for (int i = 0; i < 300; ++i)
+            (void)budget.admit("wf-" + std::to_string(i), "one-gateway", now());
+        skew += UnprovenAuditBudget::kWindowMs + 1;
+        (void)budget.poll_closed(now(), false);
+    };
+    const auto counter = [&](const char* name, const char* reason) {
+        return reason ? metrics.counter(name, {{"reason", reason}}).value()
+                      : metrics.counter(name).value();
+    };
+    skew += 8'000'000;
+    while (budget.take_pending()) {
+    }
+    (void)budget.take_ids_truncated();
+    queue_window();
+    while (budget.pending_size() > 2) // drop any stale leftovers beyond the two fresh chunks
+        (void)budget.take_pending();
+
+    // The pool's only connection is held, so store.log() fails after its write timeout: an OPEN store
+    // whose write fails.
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        const bool failed = yuzu::server::flush_reregistration_audit_summary(&store, &metrics, false);
+        CHECK(failed);
+        CHECK(counter("yuzu_register_reregistration_audit_write_failures_total", "write_failed") >= 1.0);
+        CHECK(budget.pending_size() == 2); // the chunk was handed back, not lost
+    }
+    // Forced flush with no time to write: both chunks are dropped (reason shutdown), their ids counted.
+    const double ids_before = counter("yuzu_register_reregistration_audit_ids_truncated_total", nullptr);
+    (void)yuzu::server::flush_reregistration_audit_summary(&store, &metrics, /*force=*/true, /*deadline_ms=*/0);
+    CHECK(budget.pending_size() == 0);
+    CHECK(counter("yuzu_register_reregistration_audit_summary_dropped_total", "shutdown") == 2.0);
+    CHECK(counter("yuzu_register_reregistration_audit_ids_truncated_total", nullptr) - ids_before == 250.0);
+    // A forced flush WITH time writes them all and drops nothing.
+    queue_window();
+    const double shutdown_before = counter("yuzu_register_reregistration_audit_summary_dropped_total", "shutdown");
+    CHECK_FALSE(yuzu::server::flush_reregistration_audit_summary(&store, &metrics, /*force=*/true));
+    CHECK(budget.pending_size() == 0);
+    CHECK(counter("yuzu_register_reregistration_audit_summary_dropped_total", "shutdown") == shutdown_before);
+}
