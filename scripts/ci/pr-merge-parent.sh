@@ -100,6 +100,10 @@ selftest() {
     "sets the spawn scan's PR base from pr-merge-parent.sh"
   pin plugin-spawn-gate.yml 'echo "ref=$PR_BASE" >> "$GITHUB_OUTPUT"' \
     "hands that base to the scan step"
+  pin plugin-spawn-gate.yml 'BASE_REF: ${{ steps.base.outputs.ref }}' \
+    "feeds the scan step's BASE_REF from that output"
+  pin plugin-spawn-gate.yml 'check-plugin-spawn-lexical.sh --base "$BASE_REF"' \
+    "passes BASE_REF to the scan"
   # The spawn gate must not read the event's base.sha at all; docs-lint keeps
   # exactly one use, in the changelog-fragments job (see the touch-rule step).
   for wf in plugin-spawn-gate.yml docs-lint.yml; do

@@ -664,12 +664,14 @@ must carry a visible `docs-unchanged: <section> — <reason>` line, which
 the job prints. It diffs the `refs/pull/<N>/merge` commit against that
 commit's first parent, so the change it judges is exactly the PR's own,
 however far the target branch has moved since `base.sha` was recorded;
-the spawn scan's grandfathering base is taken the same way. The two bases
-come from `scripts/ci/pr-merge-parent.sh`, which fails the job closed when
-the checked-out merge commit does not merge the PR's head (push again for a
-fresh run: a re-run reuses the same event); its `--selftest`, run by the
-touch-rule job and the `docs` suite, also pins both workflows to it. Both scripts carry a fixture self-test that the `docs`
-suite also runs (the touch-rule one off Windows only, #5428).
+the spawn scan's grandfathering base is taken the same way. The two
+bases come from `scripts/ci/pr-merge-parent.sh`, which fails the job
+closed when the checked-out merge commit does not merge the PR's head
+(push again for a fresh run: a re-run reuses the same event); its
+`--selftest`, run by the touch-rule job and the `docs` suite, also pins
+both workflows to it. All three scripts carry a fixture self-test that
+the `docs` suite also runs (the touch-rule and merge-parent ones off
+Windows only, #5428).
 
 A third `docs-lint.yml` gate, the personal-data guard
 (`scripts/ci/check-personal-data.py`, run `--strict-baseline --ratchet`), keeps
