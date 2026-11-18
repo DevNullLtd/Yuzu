@@ -2222,11 +2222,15 @@ jobs:
         id: owner
         run: echo "value=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
 
+      # Step outputs reach the shell through env, never `${{ }}` in the run
+      # body (zizmor template-injection).
       - name: Compute version + image ref
         id: ref
+        env:
+          OWNER: ${{ steps.owner.outputs.value }}
         run: |
           echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
-          echo "image=ghcr.io/${{ steps.owner.outputs.value }}/yuzu-agent-bundle-chisel" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${OWNER}/yuzu-agent-bundle-chisel" >> "$GITHUB_OUTPUT"
 
       # amd64-only: linux/arm64 (QEMU) dropped — not needed yet. The bundle
       # script builds the host-arch (amd64) image when --multiarch is omitted.
@@ -2265,20 +2269,24 @@ jobs:
       - name: Build + push agent bundle (amd64)
         env:
           GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.ref.outputs.version }}
         run: |
           bash scripts/build-agent-bundle.sh \
-            --version "${{ steps.ref.outputs.version }}" \
+            --version "${VERSION}" \
             --signer-repo "${{ github.repository }}" \
             --push
 
       - name: Resolve pushed image digest
         id: digest
+        env:
+          IMAGE: ${{ steps.ref.outputs.image }}
+          VERSION: ${{ steps.ref.outputs.version }}
         run: |
           DIGEST="$(docker buildx imagetools inspect \
-            '${{ steps.ref.outputs.image }}:${{ steps.ref.outputs.version }}' \
+            "${IMAGE}:${VERSION}" \
             --format '{{.Manifest.Digest}}')"
           echo "value=${DIGEST}" >> "$GITHUB_OUTPUT"
-          echo "Resolved ${{ steps.ref.outputs.image }} digest: ${DIGEST}"
+          echo "Resolved ${IMAGE} digest: ${DIGEST}"
 
       - name: Generate bundle SBOM (CycloneDX)
         uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
