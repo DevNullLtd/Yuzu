@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 
@@ -104,6 +105,9 @@ public:
 
 private:
     std::unique_ptr<const nlohmann::json> matcher_;
+    /// The string entries of `value_set`, put in one ordered set when the matcher is parsed: an
+    /// `in` test looks a cell up and never compares it with every entry. Views into `*matcher_`.
+    std::set<std::string_view> in_set_;
 };
 
 /// The largest caller matcher admission accepts: 64 KiB as compact JSON, the bound the same routes
@@ -138,8 +142,9 @@ static_assert(kMatcherColumnMaxBytes == 128 && kMatcherOpMaxBytes == 32 &&
 /// CLOSED on a malformed `n` or `kind` already stored (including n < 1), so a bad value can never
 /// throw out of the maintenance tick nor admit every responder. A matcher that is present but not
 /// a JSON object is accepted here as the unrecognised-shape default (the serialized text may be
-/// anything): a route holding the parsed value calls `validate_matcher_object` instead. Text over
-/// `kMatcherMaxBytes` is refused first, on its length, before it is parsed.
+/// anything): a route holding the parsed value calls `validate_matcher_object` instead, and only
+/// that form applies the three field bounds. Text over `kMatcherMaxBytes` is refused first, on its
+/// length, before it is parsed.
 std::optional<std::string> validate_matcher(std::string_view matcher_json);
 
 /// The admission check for a PRESENT caller `matcher` value (#4644): nullopt when acceptable,

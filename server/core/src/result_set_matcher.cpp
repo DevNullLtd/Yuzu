@@ -61,7 +61,11 @@ std::vector<std::string_view> split_cells(std::string_view line) {
     return out;
 }
 
-bool cell_satisfies(std::string_view cell, const std::string& op, const nlohmann::json& matcher) {
+// The string entries of a matcher's `value_set`, built once by ParsedMatcher (`in_set_`).
+using ValueSet = std::set<std::string_view>;
+
+bool cell_satisfies(std::string_view cell, const std::string& op, const nlohmann::json& matcher,
+                    const ValueSet& in_set) {
     if (op == "exists")
         return !cell.empty();
     if (op == "eq") {
@@ -74,15 +78,7 @@ bool cell_satisfies(std::string_view cell, const std::string& op, const nlohmann
             return false;
         return cell.find(matcher["value"].get_ref<const std::string&>()) != std::string_view::npos;
     }
-    if (op == "in") {
-        if (!matcher.contains("value_set") || !matcher["value_set"].is_array())
-            return false;
-        for (const auto& v : matcher["value_set"])
-            if (v.is_string() && cell == v.get_ref<const std::string&>())
-                return true;
-        return false;
-    }
-    return false;
+    return op == "in" && in_set.contains(cell);
 }
 
 // True when `output` carries an echo `__schema__` header line that does not name `column`
@@ -104,7 +100,7 @@ bool echo_schema_lacks_column(std::string_view output, const std::string& column
 // Column matcher over the echo `__schema__` / row / `__total__` shape. Returns
 // true iff any data row's named column satisfies the op.
 bool echo_column_match(std::string_view output, const std::string& column, const std::string& op,
-                      const nlohmann::json& matcher) {
+                      const nlohmann::json& matcher, const ValueSet& in_set) {
     auto lines = split_lines(output);
     int col_idx = -1;
     for (const auto& line : lines) {
@@ -127,7 +123,7 @@ bool echo_column_match(std::string_view output, const std::string& column, const
         auto cells = split_cells(line);
         if (static_cast<size_t>(col_idx) >= cells.size())
             continue;
-        if (cell_satisfies(cells[col_idx], op, matcher))
+        if (cell_satisfies(cells[col_idx], op, matcher, in_set))
             return true;
     }
     return false;
@@ -137,7 +133,7 @@ bool echo_column_match(std::string_view output, const std::string& column, const
 // Best-effort fallback for instructions that emit structured JSON rather than
 // the echo pipe format. Returns true iff any object's column satisfies the op.
 bool json_column_match(std::string_view output, const std::string& column, const std::string& op,
-                       const nlohmann::json& matcher) {
+                       const nlohmann::json& matcher, const ValueSet& in_set) {
     auto doc = nlohmann::json::parse(output, nullptr, false);
     if (doc.is_discarded())
         return false;
@@ -165,7 +161,7 @@ bool json_column_match(std::string_view output, const std::string& column, const
             cell = field.get<bool>() ? "true" : "false";
         else
             continue;
-        if (cell_satisfies(cell, op, matcher))
+        if (cell_satisfies(cell, op, matcher, in_set))
             return true;
     }
     return false;
@@ -181,7 +177,7 @@ bool json_column_match(std::string_view output, const std::string& column, const
 // declared width: a line of any other width (status|not_found, not_available|<reason>, a longer
 // trailer, a malformed row) or that equals the header is skipped.
 bool declared_column_match(std::string_view output, const std::string& column, const std::string& op,
-                           const nlohmann::json& matcher) {
+                           const nlohmann::json& matcher, const ValueSet& in_set) {
     std::vector<std::string> declared;
     for (const auto& c : matcher[kDeclaredColumnsKey])
         declared.push_back(c.get<std::string>());
@@ -204,7 +200,7 @@ bool declared_column_match(std::string_view output, const std::string& column, c
                                      : yuzu::server::split_fields(plugin, line);
         if (cells.size() != declared.size() || cells == declared)
             continue;
-        if (cell_satisfies(cells[idx], op, matcher))
+        if (cell_satisfies(cells[idx], op, matcher, in_set))
             return true;
     }
     return false;
@@ -327,7 +323,7 @@ std::optional<std::string> validate_matcher_object(const nlohmann::json& matcher
     if (!matcher.is_object())
         return "matcher must be a JSON object";
     // The per-field bounds, read from the parsed value before it is serialised. Only a string
-    // has a length here; a key of any other type is left to the type checks.
+    // has a length here; a key of any other type is not measured.
     const auto too_long = [&matcher](const char* key, std::size_t bound) {
         const auto it = matcher.find(key);
         return it != matcher.end() && it->is_string() &&
@@ -393,7 +389,14 @@ int echo_row_count(std::string_view output) {
 // held as a discarded value, which every member below reads as the default matcher.
 ParsedMatcher::ParsedMatcher(std::string_view matcher_json)
     : matcher_(std::make_unique<const nlohmann::json>(
-          nlohmann::json::parse(matcher_json, nullptr, false))) {}
+          nlohmann::json::parse(matcher_json, nullptr, false))) {
+    // `value_set` is walked here, once. An entry that is not a string never matched: left out.
+    const auto& m = *matcher_;
+    if (m.is_object() && m.contains("value_set") && m["value_set"].is_array())
+        for (const auto& v : m["value_set"])
+            if (v.is_string())
+                in_set_.insert(v.get_ref<const std::string&>());
+}
 
 ParsedMatcher::~ParsedMatcher() = default;
 
@@ -450,9 +453,11 @@ bool ParsedMatcher::response_matches(int status, std::string_view output) const 
         const auto op = m["op"].get<std::string>();
         // Try the echo pipe shape first (its schema line is unambiguous),
         // then the JSON array-of-objects fallback.
-        if (echo_column_match(output, column, op, m) || json_column_match(output, column, op, m))
+        if (echo_column_match(output, column, op, m, in_set_) ||
+            json_column_match(output, column, op, m, in_set_))
             return true;
-        return m.contains(kDeclaredColumnsKey) && declared_column_match(output, column, op, m);
+        return m.contains(kDeclaredColumnsKey) &&
+               declared_column_match(output, column, op, m, in_set_);
     }
 
     // Matcher present but a recognised key is MISSING (or no recognised key at all) → fall back to

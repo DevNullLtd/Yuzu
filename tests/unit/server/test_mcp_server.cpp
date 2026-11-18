@@ -19263,6 +19263,15 @@ TEST_CASE("#4353 field-bound schemas equal the handler constants", "[mcp][bounds
         CHECK(it->second.at(c.ptr).get<std::size_t>() == c.expected);
     }
 
+    // The REST twin's OpenAPI item states the same three matcher field bounds (#6478).
+    const auto openapi = nlohmann::json::parse(yuzu::server::openapi_spec_json());
+    const auto& rest_matcher = openapi.at(nlohmann::json::json_pointer(
+        "/paths/~1result-sets~1from-instruction-result/post/requestBody/content/application~1json"
+        "/schema/properties/matcher/properties"));
+    CHECK(rest_matcher.at("column").value("maxLength", std::size_t{0}) == kMatcherColumnMaxLen);
+    CHECK(rest_matcher.at("op").value("maxLength", std::size_t{0}) == kMatcherOpMaxLen);
+    CHECK(rest_matcher.at("value").value("maxLength", std::size_t{0}) == kMatcherValueMaxLen);
+
     // The three software tools' exact property key sets and published vocabulary enums (a dropped
     // or renamed property, or a drifted enum, is an advertisement the handler no longer honours).
     const std::map<std::string, std::set<std::string>> software_keys = {

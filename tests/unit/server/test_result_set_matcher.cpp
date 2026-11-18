@@ -671,6 +671,8 @@ TEST_CASE("matcher: admission refuses a matcher over the size bound (#6478)",
 TEST_CASE("matcher: admission refuses a column, op or value over its byte bound (#6478)",
           "[result_set][matcher]") {
     using nlohmann::json;
+    const std::optional<std::string> refused{
+        "a matcher field exceeds its bound (column<=128, op<=32, value<=512 bytes)"};
     struct Field {
         const char* key;
         std::size_t bound;
@@ -682,13 +684,27 @@ TEST_CASE("matcher: admission refuses a column, op or value over its byte bound 
         m[f.key] = std::string(f.bound, 'x');
         CHECK_FALSE(validate_matcher_object(m));
         m[f.key] = std::string(f.bound + 1, 'x');
-        const auto over = validate_matcher_object(m);
-        REQUIRE(over);
-        CHECK(*over == "a matcher field exceeds its bound (column<=128, op<=32, value<=512 bytes)");
-        // The object's own three keys are bounded whatever its kind.
-        m["kind"] = "any_response";
-        CHECK(validate_matcher_object(m) == over);
+        CHECK(validate_matcher_object(m) == refused);
+        // The object's own three keys are bounded whatever its kind: either known kind, an
+        // unknown one and one that is not a string.
+        for (const json& kind : {json("any_response"), json("echo_rows_ge"), json("x"), json(5)}) {
+            m["kind"] = kind;
+            CHECK(validate_matcher_object(m) == refused);
+        }
     }
+    // The bounds count the bytes of the parsed string, not its characters: U+00E9 is two bytes
+    // and U+20AC three, so a field can be over its bound with fewer characters than the bound.
+    const auto of = [](std::string_view character, std::size_t count) {
+        std::string text;
+        while (count-- > 0)
+            text += character;
+        return text;
+    };
+    CHECK_FALSE(validate_matcher_object(json{{"column", of("\xc3\xa9", 64)}}));
+    CHECK(validate_matcher_object(json{{"column", of("\xc3\xa9", 65)}}) == refused);
+    CHECK_FALSE(validate_matcher_object(json{{"value", of("\xc3\xa9", 256)}}));
+    CHECK(validate_matcher_object(json{{"value", of("\xc3\xa9", 257)}}) == refused);
+    CHECK(validate_matcher_object(json{{"column", of("\xe2\x82\xac", 128)}}) == refused);
     // Only those three: a value_set entry and a key the matcher does not read have no bound of
     // their own, and a nested object is not searched.
     const std::string big(kMatcherValueMaxBytes + 1, 'x');

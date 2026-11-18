@@ -44,5 +44,5 @@
   `a matcher field exceeds its bound (column<=128, op<=32, value<=512 bytes)`,
   before anything is dispatched or stored. These are the bounds the MCP tool
   `create_result_set_from_instruction_result` already applied; they bound the size of a matcher
-  field a caller supplies. To do: send a shorter field; a `value_set` entry has no bound of its
-  own.
+  field a caller supplies. To do: send a shorter field; an exact match on a longer value can be
+  written as `"op":"in"` with that value in `value_set`, whose entries have no bound of their own.

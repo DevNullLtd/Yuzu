@@ -194,7 +194,7 @@ struct AsyncHarness {
     explicit AsyncHarness(pg::PgPool& pool, bool with_dispatch = true,
                           InventoryStore* inv = nullptr, bool with_exec_visible = true,
                           bool with_fleet_read_fn = true, bool with_all_agent_ids_fn = true,
-                          bool with_forensics_set = false)
+                          bool with_forensics_set = false, bool with_instruction_store = true)
         : inventory(inv), wire_dispatch(with_dispatch), wire_exec_visible(with_exec_visible),
           wire_fleet_read_fn(with_fleet_read_fn), wire_all_agent_ids_fn(with_all_agent_ids_fn) {
         permit_exec = true; // each harness starts permissive
@@ -296,7 +296,8 @@ struct AsyncHarness {
 
         api.register_routes(sink, auth_fn, perm_fn, audit_fn,
                             /*rbac_store=*/nullptr, /*mgmt_store=*/nullptr, /*token_store=*/nullptr,
-                            /*quarantine_store=*/nullptr, /*response_store=*/nullptr, instr.get(),
+                            /*quarantine_store=*/nullptr, /*response_store=*/nullptr,
+                            with_instruction_store ? instr.get() : nullptr,
                             tracker.get(), /*schedule_engine=*/nullptr,
                             /*approval_manager=*/nullptr,
                             /*tag_store=*/nullptr, /*audit_store=*/nullptr, /*service_group_fn=*/{},
@@ -1172,6 +1173,21 @@ TEST_CASE("from-instruction-result: a malformed or oversized matcher is refused 
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
+    {
+        // The matcher is refused ahead of the instruction store as well: with none wired a field
+        // over its bound is still the permanent 400, and a well-formed request gets the 503.
+        AsyncHarness unwired(pool, true, nullptr, true, true, true, false,
+                             /*with_instruction_store=*/false);
+        const std::string route = "/api/v1/result-sets/from-instruction-result";
+        int status = 0;
+        unwired.post(route,
+                     R"({"instruction_id":"x","matcher":{"op":")" +
+                         std::string(rs_matcher::kMatcherOpMaxBytes + 1, 'x') + R"("}})",
+                     status);
+        CHECK(status == 400);
+        unwired.post(route, R"({"instruction_id":"x","matcher":{"op":"eq"}})", status);
+        CHECK(status == 503);
+    }
     AsyncHarness h(pool);
     auto iid = make_instruction(*h.instr);
     for (const char* n :
@@ -5069,6 +5085,14 @@ TEST_CASE("materialise: the members read parses the matcher once, before the pag
     CHECK(parsed_at < loop_at);
     CHECK(count_in(src, "pending.matcher") == 1);
     CHECK(count_in(src, "ParsedMatcher") == 1);
+    // The same holds for an `in` matcher's entries: the one loop over `value_set` is the parse's
+    // own, and a cell is looked up in the set it fills.
+    const auto matcher_src = normalised_source("result_set_matcher.cpp");
+    const auto entries_at = matcher_src.find("[\"value_set\"])");
+    CHECK(count_in(matcher_src, "[\"value_set\"])") == 1);
+    CHECK(matcher_src.find("ParsedMatcher::ParsedMatcher(") < entries_at);
+    CHECK(entries_at < matcher_src.find("ParsedMatcher::~ParsedMatcher()"));
+    CHECK(count_in(matcher_src, "in_set.contains(cell)") == 1);
 }
 
 TEST_CASE("materialise: the maintenance tick passes agents_failed and fails a truncated read closed",
