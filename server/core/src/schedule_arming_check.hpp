@@ -30,7 +30,7 @@
 ///     the definition ships operator-referencable — and the fire would reach
 ///     the fleet under system authority. Refused here, where the operator's
 ///     provenance is still known;
-///   * a missing or unopened `RbacStore`.
+///   * a missing or unopened `RbacStore` (UNAVAILABLE: the occurrence is held, not denied).
 ///
 /// RBAC legacy-open (`rbac_enforcement_in_effect()` false) applies the legacy rule of
 /// `require_permission` for non-Read operations (a mirror of it for this seam, not a call into
@@ -48,6 +48,8 @@
 #include "command_capability.hpp"
 #include "rbac_store.hpp"
 
+#include <yuzu/server/auth_db.hpp>
+
 #include <expected>
 #include <functional>
 #include <string>
@@ -60,10 +62,27 @@ namespace yuzu::server {
 /// a callback returning `bool` is a valid arming check.
 using ArmingResult = std::expected<bool, std::string>;
 
+/// The most UNAVAILABLE arming answers one background tick spends before it stops asking. Each
+/// costs up to a pooled-connection timeout on the single shared tick thread; with the store
+/// evidently down, a tick that kept asking per held schedule would starve everything behind it
+/// (and the outbox delivery sharing that thread). The remaining occurrences stay due: nothing is
+/// advanced, denied or lost, and the next tick asks again.
+inline constexpr int kMaxArmingUnavailablePerTick = 3;
+
 /// The creator's CURRENT legacy admin role, evaluated LAZILY (only when the decision needs it:
 /// RBAC off, a non-Read pair, a non-engine principal), so the auth store is not read for a Read
 /// pair or under enforced RBAC. `unexpected` = the store could not answer.
 using LegacyAdminFn = std::function<ArmingResult()>;
+
+/// The arming answer for a creator whose auth-store lookup FAILED with `e`. An account that does
+/// not exist, or a stored name the store will never accept, can never resolve: a definitive DENIAL
+/// (the caller audits it and advances), not a fault - holding on it would re-ask forever. Any
+/// other error is a store fault: UNAVAILABLE (held).
+[[nodiscard]] inline ArmingResult legacy_admin_lookup_failure(AuthDBError e) {
+    if (e == AuthDBError::UserNotFound || e == AuthDBError::InvalidUsername)
+        return false;
+    return std::unexpected(std::string("auth store error"));
+}
 
 /// Decide whether `principal` may still arm `plugin.action`. `rbac` may be
 /// null (denies). Pure with respect to its inputs - no metrics, no logging,
@@ -80,8 +99,10 @@ using LegacyAdminFn = std::function<ArmingResult()>;
         return false;
     if (classified->system_reserved)
         return false;
+    // A missing or unopened store cannot ANSWER: HOLD (never a recorded denial for an
+    // infrastructure fault). Nothing is dispatched either way.
     if (rbac == nullptr || !rbac->is_open())
-        return false;
+        return std::unexpected(std::string("rbac store not available"));
     if (!rbac_enforcement_in_effect(rbac)) {
         // Legacy-open (RBAC off): never an engine principal; a non-Read pair needs the creator's
         // CURRENT admin role (the same rule `require_permission`'s legacy branch applies to
@@ -92,8 +113,11 @@ using LegacyAdminFn = std::function<ArmingResult()>;
             return true;
         return legacy_admin ? legacy_admin() : ArmingResult{false};
     }
-    return rbac->check_permission(principal, std::string(classified->securable),
-                                  std::string(yuzu::server::authz::to_string(classified->operation)));
+    // Enforced RBAC: a pool timeout, an open breaker or a query error is UNAVAILABLE (held), a
+    // definitive "no" is a denial. The Boolean `check_permission` would fold both into false.
+    return rbac->check_permission_checked(
+        principal, std::string(classified->securable),
+        std::string(yuzu::server::authz::to_string(classified->operation)));
 }
 
 } // namespace yuzu::server

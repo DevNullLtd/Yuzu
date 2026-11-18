@@ -473,7 +473,8 @@ void PolicyAdminRoutes::register_routes(HttpRouteSink& sink,
                 // below and the rest-api.md contract this route is documented against —
                 // the previous generic "policy evaluation degraded" literal discarded
                 // the specific reason on this route while /remediate already surfaced it.
-                const bool mismatch = exec_res.error().starts_with("instruction_pair_mismatch");
+                const bool mismatch = exec_res.error().starts_with("instruction_pair_mismatch") ||
+                                      exec_res.error().starts_with("instruction_missing");
                 audit_fn_(req, "policy.evaluate", mismatch ? "denied" : "error", "policy", id,
                           exec_res.error());
                 res.status = mismatch ? 409 : 503;
@@ -630,6 +631,34 @@ void PolicyAdminRoutes::register_routes(HttpRouteSink& sink,
                                                             {"meta", {{"api_version", "v1"}}}})
                                                 .dump(),
                                             "application/json");
+                            return;
+                        }
+                        // The pair the caller was just authorized for must be the pair the
+                        // fragment's author authorized (the evaluator checks the same snapshot at
+                        // dispatch). A definition edited since then is refused here too, so the
+                        // route never reports an authorization it cannot honour.
+                        std::string snapshot_pair;
+                        const auto pairs =
+                            nlohmann::json::parse((*frag)->instruction_pairs, nullptr, false);
+                        if (pairs.is_object()) {
+                            const auto it = pairs.find((*frag)->fix_instruction);
+                            if (it != pairs.end() && it->is_string())
+                                snapshot_pair = it->get<std::string>();
+                        }
+                        if (snapshot_pair != a.plugin_action) {
+                            audit_fn_(req, "policy.remediate", "denied", "policy", id,
+                                      "reason=fix_instruction_pair_mismatch");
+                            res.status = 409;
+                            res.set_content(
+                                nlohmann::json({{"error",
+                                                 {{"code", 409},
+                                                  {"message",
+                                                   "instruction_pair_mismatch: the fix instruction "
+                                                   "no longer matches the pair authorized when the "
+                                                   "fragment was stored"}}},
+                                                {"meta", {{"api_version", "v1"}}}})
+                                    .dump(),
+                                "application/json");
                             return;
                         }
                         caller_visible = a.visible;

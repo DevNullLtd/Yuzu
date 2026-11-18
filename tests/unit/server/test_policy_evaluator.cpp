@@ -674,6 +674,35 @@ TEST_CASE("policy evaluator: an instruction whose plugin.action changed since th
     CHECK(h.dispatch_calls == before + 1);
 }
 
+TEST_CASE("policy evaluator: a deleted check instruction writes an explicit per-agent error "
+          "verdict, never a stale compliant", "[pg][policy][evaluator]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    h.canned["agentA|checkp"] = {1, out_json("hostname", "a")};
+    h.canned["agentB|checkp"] = {1, out_json("hostname", "b")};
+    auto pid = h.author("result.hostname != ''");
+    PolicyEvaluator ev(h.deps());
+    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
+    h.fake_now += 20;
+    ev.tick(true); // collect: both compliant
+    CHECK(h.status_of(pid, "agentA") == "compliant");
+
+    REQUIRE(h.is.delete_definition("test.check"));
+    h.fake_now += 4000;
+    const int before = h.dispatch_calls;
+    auto refused = ev.evaluate_now(pid);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().starts_with("instruction_missing"));
+    CHECK(h.dispatch_calls == before);
+    CHECK(h.status_of(pid, "agentA") == "error");
+    CHECK(h.status_of(pid, "agentB") == "error");
+    auto row = h.ps.get_agent_status(pid, "agentA");
+    REQUIRE(row.has_value());
+    REQUIRE(row->has_value());
+    CHECK((*row)->check_result.find("instruction_missing") != std::string::npos);
+}
+
 TEST_CASE("policy evaluator: interval throttles re-dispatch", "[pg][policy][evaluator]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};

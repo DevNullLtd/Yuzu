@@ -275,6 +275,48 @@ TEST_CASE("arming_check composition: tri-state - an auth-store fault is UNAVAILA
     CHECK(lookups == 1);
 }
 
+TEST_CASE("arming_check composition: enforced RBAC with an unreadable grant store is UNAVAILABLE "
+          "(held), never DENIED; a null or unopened store is UNAVAILABLE too (WP06 F53)",
+          "[server][routes][mcp][pg]") {
+    CommandCapabilityRegistry registry{capdecls::plugin_action_catalogue_a()};
+    TWINS_RBAC(rbac);
+    rbac.set_rbac_enabled(true);
+    REQUIRE(rbac.assign_role(PrincipalRole{"user", "alice", "Administrator"}).has_value());
+    auto never = []() -> ArmingResult { return false; };
+    // Healthy: a definitive answer either way.
+    auto granted = schedule_arming_permitted(registry, &rbac, "alice", "filesystem", "exists", never);
+    REQUIRE(granted.has_value());
+    CHECK(*granted);
+    auto denied = schedule_arming_permitted(registry, &rbac, "nobody", "filesystem", "exists", never);
+    REQUIRE(denied.has_value());
+    CHECK_FALSE(*denied);
+    // The role table cannot be read: the question has no answer, so it is not a denial.
+    {
+        yuzu::server::pg::PgConn c{PQconnectdb(twins_db_fx_.dsn().c_str())};
+        REQUIRE(PQstatus(c.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult dr{PQexec(c.get(), "DROP TABLE rbac_store.principal_roles CASCADE")};
+        REQUIRE(dr.ok());
+    }
+    auto faulted = schedule_arming_permitted(registry, &rbac, "bob", "filesystem", "exists", never);
+    CHECK_FALSE(faulted.has_value());
+    // No store wired: also unavailable (held), not a recorded denial.
+    auto none = schedule_arming_permitted(registry, nullptr, "alice", "filesystem", "exists", never);
+    CHECK_FALSE(none.has_value());
+}
+
+TEST_CASE("arming_check composition: a creator the auth store can never resolve is DENIED, an "
+          "auth-store fault is UNAVAILABLE (WP06 F53)",
+          "[server][routes][mcp]") {
+    using yuzu::server::AuthDBError;
+    using yuzu::server::legacy_admin_lookup_failure;
+    for (auto e : {AuthDBError::UserNotFound, AuthDBError::InvalidUsername}) {
+        auto r = legacy_admin_lookup_failure(e);
+        REQUIRE(r.has_value()); // a definitive answer: the caller audits the denial and advances
+        CHECK_FALSE(*r);
+    }
+    CHECK_FALSE(legacy_admin_lookup_failure(AuthDBError::QueryFailed).has_value());
+}
+
 TEST_CASE("arming_check composition: RBAC legacy-open (disabled) admits regardless of grant",
           "[server][routes][mcp][pg]") {
     CommandCapabilityRegistry registry{capdecls::plugin_action_catalogue_a()};

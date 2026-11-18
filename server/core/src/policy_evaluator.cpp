@@ -399,7 +399,12 @@ PolicyEvaluator::dispatch_instruction(const std::string& instruction_id,
     }
     if (!*def_result) {
         spdlog::warn("policy_evaluator: unknown check/fix instruction '{}'", instruction_id);
-        return DispatchInstructionResult{};
+        if (d_.metrics)
+            d_.metrics
+                ->counter("yuzu_server_policy_instruction_missing_total",
+                          {{"phase", std::string(phase)}})
+                .increment();
+        return DispatchInstructionResult{.instruction_missing = true};
     }
     const auto& def = **def_result;
     // WP06 F4 (interim): the fragment's author was authorized for the plugin.action this id
@@ -514,6 +519,22 @@ std::expected<std::string, std::string> PolicyEvaluator::kickoff_check(const Pol
                 .increment();
         return std::unexpected("instruction_pair_mismatch: the check instruction no longer matches "
                                "the pair authorized when the fragment was stored");
+    }
+    if (dispatch_result->instruction_missing) {
+        // A deleted check instruction must not leave the last verdict standing as current: every
+        // target gets an explicit `error` with a named reason, like the mismatch case above.
+        for (const auto& tgt : targets) {
+            auto r = d_.policy_store->update_agent_status(
+                p.id, tgt, "error", R"({"phase":"check","result":"instruction_missing"})",
+                std::nullopt);
+            if (!r)
+                spdlog::warn("policy_evaluator: instruction-missing status write failed for {}/{}: {}",
+                             p.id, tgt, r.error());
+        }
+        if (d_.metrics)
+            d_.metrics->counter("yuzu_server_policy_eval_errors_total", {{"phase", "check"}})
+                .increment();
+        return std::unexpected("instruction_missing: the check instruction no longer exists");
     }
     if (dispatch_result->execution_id.empty())
         return "";
@@ -664,7 +685,8 @@ PolicyEvaluator::evaluate_now(const std::string& policy_id) {
     if (!k) {
         // A refused (mismatched) instruction is an authorization outcome, not a store degrade:
         // pass its text through so the route can answer 409 and not 503.
-        if (k.error().starts_with("instruction_pair_mismatch"))
+        if (k.error().starts_with("instruction_pair_mismatch") ||
+            k.error().starts_with("instruction_missing"))
             return std::unexpected(k.error());
         return std::unexpected("kickoff_check degraded for " + policy_id + ": " + k.error());
     }

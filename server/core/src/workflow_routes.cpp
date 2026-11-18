@@ -4398,15 +4398,24 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 // authorized pairs are snapshotted on the stored fragment. Unwired = refused.
                 nlohmann::json pairs = nlohmann::json::object();
                 const auto named = PolicyStore::peek_fragment_instructions(yaml_source);
+                // The authz_denied:/authz_unavailable: prefixes carry the HTTP class through the
+                // pack's string-typed error (product_pack_error_status: 403 / 503, never 400).
                 if (!named.empty() && !authorize_instruction_fn)
-                    return std::unexpected("instruction authorization is not available");
+                    return std::unexpected(std::string(kProductPackAuthzUnavailablePrefix) +
+                                           "instruction authorization is not available");
                 for (const auto& [role, instruction_id] : named) {
                     const auto a = authorize_instruction_fn(req, instruction_id);
-                    if (!a.ok || a.plugin_action.empty())
-                        return std::unexpected("policy fragment " + role + " instruction " +
-                                               instruction_id + " is not authorized for the "
-                                               "installing principal: " +
-                                               (a.message.empty() ? std::string("refused") : a.message));
+                    if (!a.ok)
+                        return std::unexpected(
+                            std::string(a.status == 503 ? kProductPackAuthzUnavailablePrefix
+                                                        : kProductPackAuthzDeniedPrefix) +
+                            "policy fragment " + role + " instruction " + instruction_id +
+                            " is not authorized for the installing principal: " +
+                            (a.message.empty() ? std::string("refused") : a.message));
+                    if (a.plugin_action.empty())
+                        return std::unexpected(std::string(kProductPackAuthzUnavailablePrefix) +
+                                               "instruction authorization returned no "
+                                               "plugin.action for " + instruction_id);
                     pairs[instruction_id] = a.plugin_action;
                 }
                 return policy_store->create_fragment(yaml_source, pairs.dump());

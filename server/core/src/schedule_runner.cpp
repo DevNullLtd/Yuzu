@@ -1,4 +1,5 @@
 #include <yuzu/log_token.hpp>
+#include "schedule_arming_check.hpp"
 #include "schedule_runner.hpp"
 
 #include "dispatch_target_shape.hpp" // kBroadcastScope (#2500)
@@ -47,7 +48,16 @@ void ScheduleRunner::tick() {
     if (!d_.schedule_engine || !d_.instruction_store || !d_.enqueue_fn)
         return;
 
+    arming_unavailable_this_tick_ = 0;
     for (const auto& s : d_.schedule_engine->evaluate_due()) {
+        // The arming read is evidently failing: stop spending the shared tick thread on it. The
+        // rest stay due and are asked again next tick.
+        if (arming_unavailable_this_tick_ >= kMaxArmingUnavailablePerTick) {
+            spdlog::warn("schedule_runner: {} arming checks unavailable this tick - remaining "
+                         "due schedule(s) deferred to the next tick",
+                         arming_unavailable_this_tick_);
+            break;
+        }
         // #3495: bounds how many MORE schedules a single tick() call fires
         // once shutdown begins — a schedule already firing below still
         // completes cleanly, this only stops the next one from starting.
@@ -119,6 +129,7 @@ void ScheduleRunner::fire(const InstructionSchedule& s) {
         // without advancing, so the schedule is evaluated again on the next tick and the
         // occurrence is not lost.
         count("yuzu_schedule_arming_unavailable_total");
+        ++arming_unavailable_this_tick_;
         spdlog::warn("schedule_runner: schedule '{}' (id={}) arming check unavailable ({}); "
                      "holding, not advancing",
                      s.name, s.id, ::yuzu::log_token(arming.error()));

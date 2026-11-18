@@ -248,6 +248,8 @@ private:
     Deps d_;
     /// Set by `hold_row(systemic)` and read by `tick()`; both run on the one delivery thread.
     bool hold_remaining_{false};
+    // UNAVAILABLE arming answers this tick (see kMaxArmingUnavailablePerTick); reset per tick.
+    int arming_unavailable_this_tick_{0};
 };
 
 } // namespace yuzu::server

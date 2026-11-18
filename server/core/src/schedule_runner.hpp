@@ -151,6 +151,10 @@ public:
     void tick();
 
 private:
+    // UNAVAILABLE arming answers spent by the current tick (reset at the top of tick(); the
+    // runner's tick is single-threaded). See kMaxArmingUnavailablePerTick.
+    int arming_unavailable_this_tick_{0};
+
     // Fire one due schedule: approval gate, tracked dispatch, advance.
     void fire(const InstructionSchedule& s);
 

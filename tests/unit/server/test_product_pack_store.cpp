@@ -27,6 +27,7 @@
  */
 
 #include "instruction_referrers.hpp" // make_definition_pack_advisory_fn / pack_advisory_note (N1-6d)
+#include "product_pack_model.hpp"
 #include "product_pack_store.hpp"
 
 #include "pg/pg_exec.hpp"
@@ -589,6 +590,41 @@ TEST_CASE("ProductPackStore::install: a partial success surfaces which documents
     }
     CHECK(saw_a);
     CHECK(saw_b);
+}
+
+TEST_CASE("pack install: an authorization refusal is a 403, an unavailable authorizer a 503, "
+          "never a 400 (WP06 F4)",
+          "[product_pack_store][pg][f4]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, product_pack_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ProductPackStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_require_signed_packs(false);
+
+    const auto refuse_all = [](std::string_view prefix) {
+        return [prefix](const std::string&, const std::string&) -> std::expected<std::string, std::string> {
+            return std::unexpected(std::string(prefix) + "instruction secret.cmd is not authorized");
+        };
+    };
+    auto denied = store.install(kThreeItemPartialFailureYaml,
+                                refuse_all(yuzu::server::kProductPackAuthzDeniedPrefix));
+    REQUIRE_FALSE(denied.has_value());
+    CHECK(yuzu::server::product_pack_error_status(denied.error()) == 403);
+    const auto denied_msg = yuzu::server::product_pack_client_message("test", denied.error());
+    CHECK(denied_msg.find("authz_denied") == std::string::npos); // the marker selects the status only
+    CHECK(denied_msg.find("not authorized") != std::string::npos);
+
+    auto unavailable = store.install(kThreeItemPartialFailureYaml,
+                                     refuse_all(yuzu::server::kProductPackAuthzUnavailablePrefix));
+    REQUIRE_FALSE(unavailable.has_value());
+    CHECK(yuzu::server::product_pack_error_status(unavailable.error()) == 503);
+
+    // An ordinary validation refusal stays a 400, and the mapper's other classes are unchanged.
+    auto invalid = store.install(kThreeItemPartialFailureYaml,
+                                 refuse_all(""));
+    REQUIRE_FALSE(invalid.has_value());
+    CHECK(yuzu::server::product_pack_error_status(invalid.error()) == 400);
+    CHECK(yuzu::server::product_pack_error_status("not_found: x") == 404);
 }
 
 TEST_CASE("ProductPackStore::install: a total failure surfaces EVERY document's reason, not "

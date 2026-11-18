@@ -153,6 +153,12 @@ namespace yuzu::server {
 /// `product_pack_error_status`).
 inline constexpr std::string_view kProductPackDbErrorPrefix = kDbErrorPrefix;
 
+/// Byte-0 markers for a pack install error that is an AUTHORIZATION outcome, not a validation one:
+/// `product_pack_error_status` maps them to 403 (the installing principal is refused) and 503
+/// (the authorizer is unwired or degraded, retryable); `product_pack_client_message` strips them.
+inline constexpr std::string_view kProductPackAuthzDeniedPrefix = "authz_denied: ";
+inline constexpr std::string_view kProductPackAuthzUnavailablePrefix = "authz_unavailable: ";
+
 // ── Data types ───────────────────────────────────────────────────────────────
 
 struct ProductPackItem {

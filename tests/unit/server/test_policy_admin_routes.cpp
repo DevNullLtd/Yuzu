@@ -303,7 +303,7 @@ TEST_CASE("POST /api/policies/:id/evaluate and /remediate: a degraded scope "
     routes.register_routes(sink, auth_fn, perm_fn, audit_fn, emit_fn, &ps, &evaluator, &metrics);
     routes.set_authorize_instruction_fn(
         [](const httplib::Request&, const std::string&) -> PolicyAdminRoutes::InstructionAuthority {
-            return {.ok = true, .status = 200, .message = {}, .plugin_action = "p.a",
+            return {.ok = true, .status = 200, .message = {}, .plugin_action = "test.pair",
                     .visible = std::nullopt};
         });
 
@@ -324,6 +324,65 @@ TEST_CASE("POST /api/policies/:id/evaluate and /remediate: a degraded scope "
 
     REQUIRE(yuzu::server::pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{})
                 .status() == PGRES_COMMAND_OK);
+}
+
+TEST_CASE("POST /api/policies/:id/remediate: a fix pair that differs from the stored snapshot "
+          "answers 409 and audits denied (WP06 F4)",
+          "[pg][policy][admin][f4]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_admin_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    PolicyStore ps{pool};
+    REQUIRE(ps.is_open());
+    yuzu::MetricsRegistry metrics;
+    PolicyEvaluator::Deps d;
+    d.policy_store = &ps;
+    d.metrics = &metrics;
+    PolicyEvaluator evaluator(d);
+
+    // The snapshot (test.pair, from the helper) is what the author was authorized for.
+    auto fid = yuzu::test::create_fragment_for_test(
+        ps, "apiVersion: yuzu.io/v1alpha1\nkind: PolicyFragment\ndisplayName: Pair Fragment\n"
+            "spec:\n  check:\n    instruction: test.check\n    compliance: \"result.x == 1\"\n"
+            "  fix:\n    instruction: test.fix\n");
+    REQUIRE(fid.has_value());
+    auto pid = ps.create_policy("apiVersion: yuzu.io/v1alpha1\nkind: Policy\ndisplayName: "
+                                "Pair Policy\nfragment: " + *fid + "\nscope: \"ostype == 'linux'\"\n");
+    REQUIRE(pid.has_value());
+
+    std::vector<AuditCall> audit_calls;
+    auto auth_fn = [](const httplib::Request&, httplib::Response&) -> std::optional<auth::Session> {
+        auth::Session s;
+        s.username = "tester";
+        s.role = auth::Role::admin;
+        return s;
+    };
+    auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
+                      const std::string&) -> bool { return true; };
+    auto audit_fn = [&audit_calls](const httplib::Request&, const std::string& action,
+                                   const std::string& result, const std::string& target_type,
+                                   const std::string& target_id, const std::string& detail) -> bool {
+        audit_calls.push_back({action, result, target_type, target_id, detail});
+        return true;
+    };
+    auto emit_fn = [](const std::string&, const httplib::Request&, const nlohmann::json&,
+                      const nlohmann::json&) {};
+    PolicyAdminRoutes routes;
+    yuzu::server::test::TestRouteSink sink;
+    routes.register_routes(sink, auth_fn, perm_fn, audit_fn, emit_fn, &ps, &evaluator, &metrics);
+    routes.set_authorize_instruction_fn(
+        [](const httplib::Request&, const std::string&) -> PolicyAdminRoutes::InstructionAuthority {
+            // The definition now resolves to a DIFFERENT pair than the one snapshotted.
+            return {.ok = true, .status = 200, .message = {}, .plugin_action = "other.pair",
+                    .visible = std::nullopt};
+        });
+    auto r = sink.Post("/api/policies/" + *pid + "/remediate", "");
+    REQUIRE(r);
+    CHECK(r->status == 409);
+    CHECK(r->body.find("instruction_pair_mismatch") != std::string::npos);
+    REQUIRE_FALSE(audit_calls.empty());
+    CHECK(audit_calls.back().action == "policy.remediate");
+    CHECK(audit_calls.back().result == "denied");
+    CHECK(audit_calls.back().detail.find("fix_instruction_pair_mismatch") != std::string::npos);
 }
 
 TEST_CASE("POST /api/policies: the policy.create audit row records the stored targeting (#2123)",

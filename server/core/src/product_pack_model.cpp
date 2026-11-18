@@ -55,6 +55,10 @@ int product_pack_error_status(const std::string& err) {
         return 404;
     if (err.starts_with(yuzu::server::kProductPackDbErrorPrefix))
         return 503;
+    if (err.starts_with(kProductPackAuthzDeniedPrefix))
+        return 403;
+    if (err.starts_with(kProductPackAuthzUnavailablePrefix))
+        return 503;
     return 400;
 }
 
@@ -70,6 +74,10 @@ std::string product_pack_client_message(const char* op, const std::string& err) 
         spdlog::error("{}: {}", op, err);
         return "service unavailable";
     }
+    // The authz prefixes only select the status; the message the caller sees is the reason.
+    for (const std::string_view prefix : {kProductPackAuthzDeniedPrefix, kProductPackAuthzUnavailablePrefix})
+        if (err.starts_with(prefix))
+            return err.substr(prefix.size());
     return err;
 }
 

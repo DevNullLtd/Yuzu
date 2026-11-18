@@ -258,6 +258,8 @@ private:
         /// WP06 F4: the instruction's plugin.action no longer matches the pair authorized when
         /// the fragment was stored (or the fragment carries no snapshot at all): NOT dispatched.
         bool pair_mismatch{false};
+        /// The instruction id no longer resolves to a definition (deleted): NOT dispatched.
+        bool instruction_missing{false};
         std::string execution_id;
         yuzu::server::ConfinedDispatchOutcome outcome;
     };

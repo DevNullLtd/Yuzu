@@ -1,4 +1,5 @@
 #include <yuzu/log_token.hpp>
+#include "schedule_arming_check.hpp"
 #include "command_outbox_delivery.hpp"
 
 #include "audit_store.hpp"
@@ -159,6 +160,7 @@ void CommandOutboxDelivery::tick() {
         return;
     }
     hold_remaining_ = false;
+    arming_unavailable_this_tick_ = 0;
     for (const auto& c : *pending) {
         if (hold_remaining_)
             break; // a systemic R4 hold (sequence unwired/unreadable) already logged once
@@ -193,6 +195,10 @@ void CommandOutboxDelivery::deliver(const OutboxCommand& c, const std::string& l
         // Could not be determined (a transient auth-store fault): NOT a denial. Reschedule with
         // back-off; never mark the occurrence failed as "authority_denied".
         count("yuzu_server_command_outbox_deliver_arming_unavailable_total");
+        // Stop asking once the arming read has failed repeatedly this tick (each ask can cost a
+        // pooled-connection timeout on the shared tick thread); the rest stay pending.
+        if (++arming_unavailable_this_tick_ >= kMaxArmingUnavailablePerTick)
+            hold_remaining_ = true;
         spdlog::warn("command_outbox_delivery: occurrence '{}' arming check unavailable ({}); "
                      "rescheduling",
                      c.occurrence_id, ::yuzu::log_token(arming.error()));

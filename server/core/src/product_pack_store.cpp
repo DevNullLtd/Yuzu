@@ -657,6 +657,8 @@ std::expected<std::string, std::string> ProductPackStore::install(
     // starving theirs (docs/postgres-store-playbook.md "never call another store while holding
     // a lease"). See product_pack_store.hpp file header for the full rationale.
     int installed_count = 0;
+    bool authz_denied = false;      // an item's install was refused by the authorizer (403)
+    bool authz_unavailable = false; // the authorizer could not answer (503)
     std::vector<std::string> errors;
     std::vector<ProductPackItem> items_to_store;
 
@@ -702,7 +704,17 @@ std::expected<std::string, std::string> ProductPackStore::install(
             return std::unexpected(std::string(kProductPackDbErrorPrefix) + "failed to install " +
                                    kind + " item: " + result.error());
         } else {
-            errors.push_back(kind + ": " + result.error());
+            // An authorization refusal keeps its HTTP class through the aggregation below (the
+            // prefix must sit at byte 0 of the final error): strip it here, remember the class.
+            std::string_view detail = result.error();
+            if (detail.starts_with(kProductPackAuthzUnavailablePrefix)) {
+                authz_unavailable = true;
+                detail.remove_prefix(kProductPackAuthzUnavailablePrefix.size());
+            } else if (detail.starts_with(kProductPackAuthzDeniedPrefix)) {
+                authz_denied = true;
+                detail.remove_prefix(kProductPackAuthzDeniedPrefix.size());
+            }
+            errors.push_back(kind + ": " + std::string(detail));
         }
     }
 
@@ -729,7 +741,10 @@ std::expected<std::string, std::string> ProductPackStore::install(
             joined += errors[i];
         }
         populate_partial_result();
-        return std::unexpected("no items installed: " + joined);
+        return std::unexpected(std::string(authz_unavailable ? kProductPackAuthzUnavailablePrefix
+                                           : authz_denied   ? kProductPackAuthzDeniedPrefix
+                                                            : std::string_view{}) +
+                               "no items installed: " + joined);
     }
 
     // F031/#3481 (gov Gate 2 finding, security-guardian): factored out so every failure path

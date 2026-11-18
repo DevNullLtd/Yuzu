@@ -5685,6 +5685,13 @@ public:
                           "plugin.action no longer matches the pair authorized when its fragment "
                           "was stored. Zero means no stored fragment was refused.",
                           "counter");
+        for (const char* phase : {"check", "fix", "verify"})
+            metrics_.counter("yuzu_server_policy_instruction_missing_total", {{"phase", phase}});
+        metrics_.describe("yuzu_server_policy_instruction_missing_total",
+                          "Policy instruction dispatches skipped because the check, fix or verify "
+                          "instruction id no longer resolves to a definition (deleted). A check "
+                          "writes an explicit per-agent error verdict.",
+                          "counter");
         for (const char* field : {"name", "version", "description", "actions", "action", "plugins"})
             metrics_.counter("yuzu_server_agent_registry_plugin_meta_dropped_total",
                              {{"field", field}});
@@ -14168,9 +14175,7 @@ private:
                 auto user = auth_db_->get_user(principal);
                 if (user)
                     return user->role == auth::Role::admin;
-                if (user.error() == AuthDBError::UserNotFound)
-                    return false;
-                return std::unexpected(std::string("auth store error"));
+                return yuzu::server::legacy_admin_lookup_failure(user.error());
             });
     }
 

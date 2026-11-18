@@ -21,6 +21,7 @@
 #include "instruction_store.hpp"
 #include "schedule_engine.hpp"
 #include "schedule_params_parsers.hpp"
+#include "schedule_arming_check.hpp"
 #include "schedule_runner.hpp"
 
 #include "../test_helpers.hpp"
@@ -1770,6 +1771,29 @@ TEST_CASE("ScheduleRunner: an UNAVAILABLE arming answer (auth-store fault) HOLDS
     fault = false; // the store recovers
     h.runner.tick();
     CHECK(h.enqueues.size() == 1); // the held occurrence fires
+}
+
+TEST_CASE("ScheduleRunner: a tick stops asking the arming check after kMaxArmingUnavailablePerTick "
+          "UNAVAILABLE answers, and holds the rest (WP06 F53)",
+          "[schedule][runner][d7][pg]") {
+    int asked = 0;
+    Harness h([&](const std::string&, const std::string&, const std::string&)
+                  -> std::expected<bool, std::string> {
+        ++asked;
+        return std::unexpected(std::string("auth store error"));
+    });
+    std::vector<std::string> ids;
+    for (int i = 0; i < 6; ++i) {
+        auto id = h.make_due("test.def", "interval");
+        ids.push_back(id);
+    }
+    h.runner.tick();
+    CHECK(asked == yuzu::server::kMaxArmingUnavailablePerTick); // not one per due schedule
+    CHECK(h.enqueues.empty());
+    for (const auto& id : ids)
+        CHECK(h.get(id).next_execution_at == 1); // nothing advanced, nothing lost
+    h.runner.tick(); // the counter resets: the next tick asks again
+    CHECK(asked == 2 * yuzu::server::kMaxArmingUnavailablePerTick);
 }
 
 TEST_CASE("ScheduleRunner: D7 a false arming_check blocks the approval-gated fire path",
