@@ -36,7 +36,7 @@ spec:
         displayName: Key Path
         description: >
           Registry key path relative to the hive root, e.g.
-          "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion". A path that passes through a registry link is refused with error|key_is_link; HKLM\SYSTEM\CurrentControlSet is a link, so read HKLM\SYSTEM\ControlSet001 (or the ControlSet00N that HKLM\SYSTEM\Select\Current names).
+          "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion". A path that passes through a registry link is refused with error|key_is_link; HKLM\SYSTEM\CurrentControlSet is a link, so read the ControlSet00N that the Current value of HKLM\SYSTEM\Select names (ControlSet001 is the live set only when Current is 1).
       name:
         type: string
         displayName: Value Name
@@ -374,7 +374,7 @@ spec:
         type: string
         description: >
           Registry key path relative to the hive root, e.g.
-          "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion". A path that passes through a registry link is refused with error|key_is_link; HKLM\SYSTEM\CurrentControlSet is a link, so read HKLM\SYSTEM\ControlSet001 (or the ControlSet00N that HKLM\SYSTEM\Select\Current names).
+          "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion". A path that passes through a registry link is refused with error|key_is_link; HKLM\SYSTEM\CurrentControlSet is a link, so read the ControlSet00N that the Current value of HKLM\SYSTEM\Select names (ControlSet001 is the live set only when Current is 1).
   result:
     columns:
       - name: subkey
@@ -609,7 +609,7 @@ spec:
         type: string
         displayName: Key Path
         description: >
-          Registry key path relative to the hive root. A path that passes through a registry link is refused with error|key_is_link; HKLM\SYSTEM\CurrentControlSet is a link, so read HKLM\SYSTEM\ControlSet001 (or the ControlSet00N that HKLM\SYSTEM\Select\Current names).
+          Registry key path relative to the hive root. A path that passes through a registry link is refused with error|key_is_link; HKLM\SYSTEM\CurrentControlSet is a link, so read the ControlSet00N that the Current value of HKLM\SYSTEM\Select names (ControlSet001 is the live set only when Current is 1).
   result:
     columns:
       - name: exists
@@ -662,7 +662,7 @@ spec:
         type: string
         displayName: Key Path
         description: >
-          Registry key path relative to the hive root. A path that passes through a registry link is refused with error|key_is_link; HKLM\SYSTEM\CurrentControlSet is a link, so read HKLM\SYSTEM\ControlSet001 (or the ControlSet00N that HKLM\SYSTEM\Select\Current names).
+          Registry key path relative to the hive root. A path that passes through a registry link is refused with error|key_is_link; HKLM\SYSTEM\CurrentControlSet is a link, so read the ControlSet00N that the Current value of HKLM\SYSTEM\Select names (ControlSet001 is the live set only when Current is 1).
   result:
     columns:
       - name: name

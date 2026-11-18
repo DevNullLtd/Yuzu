@@ -3756,7 +3756,7 @@ groups:
       # The series is ABSENT while no CRL exists, the CA store is closed (an
       # install with its own certificates has no internal CA), or the scrape
       # fails; these rules need a successful scrape, so they share the
-      # `up == 0` caveat of the yuzu-ha-leader group. Nothing here alerts on a
+      # scrape caveat (YuzuServerMetricsScrapeDown covers a down server) of the yuzu-ha-leader group. Nothing here alerts on a
       # never-published CRL (that state is only visible as a 503 on
       # GET /api/v1/ca/crl, YuzuLeaderNoLeader, or YuzuCaCrlPublishFailing).
       - alert: YuzuCaCrlNearExpiry
@@ -3834,7 +3834,7 @@ groups:
       # reverse holds too, and is the price of `max`: after the fix, a replica whose
       # reads keep failing keeps the OLD future-dated value, `max` selects it, and
       # the alert stays firing until that replica's reads recover or it restarts.
-      # Same `up == 0` caveat as the two rules above. Nothing else detects this
+      # Same scrape caveat as the two rules above. Nothing else detects this
       # today: #6916 (still open) covers only the opposite direction, a clock
       # stepped back.
       - alert: YuzuCaCrlFutureDated
@@ -4883,8 +4883,8 @@ groups:
             the start-time check itself is counted but cannot be seen by increase()).
             Known limits: a check stuck mid-query is covered by YuzuPgCollationCheckStale, not
             by this alert; a replica restarting more often than once a minute while the check
-            keeps failing is not seen by this alert (see YuzuServerRestartLoop and your own
-            `up == 0` rule). Runbook: docs/user-manual/server-admin.md, "PostgreSQL collation
+            keeps failing is not seen by this alert (see YuzuServerRestartLoop and
+            YuzuServerMetricsScrapeDown). Runbook: docs/user-manual/server-admin.md, "PostgreSQL collation
             version".
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#postgresql-collation-version"
 
@@ -5035,10 +5035,8 @@ groups:
   #    primary freezes while its kernel keeps ACKing) the /metrics handler's own
   #    pool queries hang too, the scrape fails, and every yuzu_server_leader_*
   #    series goes stale at once, so every rule below evaluates EMPTY. The
-  #    backstop is an `up == 0` alert on the server job (substitute YOUR scrape
-  #    job name) plus /readyz: NO such rule ships (no rule in this file is a
-  #    dead-man's-switch for the server process; #2956 tracked it and was closed
-  #    without building it), so configure one.
+  #    backstop is YuzuServerMetricsScrapeDown (`up == 0` on a job named
+  #    `yuzu-server`; group yuzu-metrics-scrape) plus /readyz.
   - name: yuzu-ha-leader
     rules:
       - alert: YuzuLeaderSplitBrain
@@ -5191,7 +5189,7 @@ groups:
         # freeze never alerts. last_ok_age is computed at SCRAPE time, so it keeps
         # growing even when the election loop is wedged. BLIND SPOT: in a
         # WHOLE-PRIMARY stall the scrape itself fails (see the group header), so
-        # this rule cannot evaluate; the `up == 0` backstop must catch that. Both
+        # this rule cannot evaluate; YuzuServerMetricsScrapeDown must catch that. Both
         # series carry the same job/instance labels, so default all-label matching
         # applies (no on()).
         expr: |
@@ -5754,10 +5752,8 @@ groups:
       # `Restart=always` with no `RestartSec` crashing before the first tick fires,
       # every time -- writes the gauge AT MOST once per boot no matter how long the
       # loop runs, so `resets()` can never observe more than a handful of
-      # transitions and this rule stays PERMANENTLY silent, not just delayed. No
-      # rule in this file is a dead-man's-switch for the server process itself (an
-      # `up == 0` / `absent_over_time()` companion would be); tracked as #2956, not
-      # closed here.
+      # transitions and this rule stays PERMANENTLY silent, not just delayed. The
+      # dead-man's-switch for the server process itself is YuzuServerMetricsScrapeDown.
       #
       # `resets()` FALSE-NEGATIVES ON A PARTIAL RANGE, the mirror of
       # YuzuAuditRetentionNotRunning's documented `increase()` false-POSITIVE below.

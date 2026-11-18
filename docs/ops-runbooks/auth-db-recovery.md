@@ -435,8 +435,11 @@ psql "$YUZU_POSTGRES_DSN" -c "SELECT store, version FROM public.schema_meta WHER
 #    series that exists on every healthy server (yuzu_server_uptime_seconds)
 #    before the zero check means anything. If any of the three fails, STOP:
 #    the check did not run.
-METRICS=$(curl -sS -o /tmp/yuzu-metrics.txt -w '%{http_code}' \
-  -H "Authorization: Bearer $YUZU_METRICS_TOKEN" http://127.0.0.1:8080/metrics)
+#    With HTTPS on (the default) /metrics is on the HTTPS port, 8443, not on
+#    8080 (which only redirects); -k is for the self-signed default certificate
+#    (use --cacert with your CA otherwise).
+METRICS=$(curl -sSk -o /tmp/yuzu-metrics.txt -w '%{http_code}' \
+  -H "Authorization: Bearer $YUZU_METRICS_TOKEN" https://127.0.0.1:8443/metrics)
 [ "$METRICS" = "200" ] || { echo "FAIL: /metrics answered $METRICS, not 200; the KEK check did not run"; false; }
 grep -q '^yuzu_server_uptime_seconds' /tmp/yuzu-metrics.txt \
   || { echo "FAIL: no yuzu_server_uptime_seconds: the scrape is not a real /metrics"; false; }

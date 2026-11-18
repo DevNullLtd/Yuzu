@@ -356,9 +356,20 @@ has the same effect:
   [Crypto: Deprovision erasure](crypto.md#deprovision-erasure).
 - **Open event streams are NOT closed.** A `GET /events`, `GET /api/v1/events` or
   `GET /sse/executions/{id}` stream that was already open keeps the credential and scope it
-  attached with: deprovisioning does not end it. Add this step to your offboarding runbook: restart
-  the replica holding the stream, or close the connection at the proxy. (The MCP stream
-  re-validates its credential on every heartbeat and does end.)
+  attached with and has no maximum lifetime: deprovisioning does not end it. (The MCP stream
+  re-validates its credential on every heartbeat and does end.) Add these steps to your offboarding
+  runbook, in this order:
+  1. Deprovision first: deactivate or delete the user, and confirm the SCIM call answered `2xx`.
+     Ending streams before this lets the client reconnect with a still-valid credential.
+  2. Find where the stream is held. This build lists no open streams and their owners.
+     `yuzu_http_held_open_responses` (per replica; `yuzu_http_held_open_capacity` is its ceiling)
+     shows which replicas hold any, and your reverse proxy's connection log shows the client
+     address and the replica it reached.
+  3. End it: close the connection at the proxy (this drops that one client), or restart the replica
+     holding it. **A restart drops every held-open stream on that replica, for every operator and
+     service**, so prefer the proxy for a single user and drain the replica first if you must restart.
+  4. Verify: the user's reconnect attempt is refused (`401`), and `yuzu_http_held_open_responses` on
+     that replica no longer counts the stream.
 
 > **API/MCP tokens ARE now revoked on deprovision — including federated
 > (SSO) tokens, if the user is linked.** SCIM deprovisioning (and the

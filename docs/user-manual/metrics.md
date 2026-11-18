@@ -1818,15 +1818,33 @@ the server with `--metrics-no-auth` (any source) or `--metrics-trust-loopback`
 
 This is the one worked recipe; other pages link here.
 
-1. **Mint the token.** Sign in with an account that holds `ApiToken:Write` and
-   call `POST /api/v1/tokens` (see [REST API](rest-api.md); under RBAC the
-   `ApiTokenManager` role carries it). Give it an `expires_at` and put the
-   renewal date in your calendar; a token with no `expires_at` never expires:
+1. **Mint the token.** `/metrics` accepts the token of ANY principal and checks no
+   permission, so mint it from a dedicated local account that holds no other
+   access. Minting needs `ApiToken:Write`; give the account the `ApiTokenManager`
+   role for this one step and remove it afterwards (the grant-mint-remove pattern
+   of the CMDB recipe in [REST API](rest-api.md)). With RBAC enforcement off a
+   token carries its creator's authority, so use RBAC (the account then holds
+   only what you assign). `$ADMIN_TOKEN` below is the API token of an
+   administrator, used only to assign and remove the role (those routes are
+   step-up routes: an API token is never challenged, a cookie session is):
+
+   ```bash
+   curl -sS -X POST "$YUZU_URL/api/v1/rbac/roles/ApiTokenManager/assignments" \
+     -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+     -d '{"principal_type":"user","principal_id":"prometheus-scrape"}'
+   ```
+
+   Then sign in as that account (the token it mints belongs to it), give the token an
+   `expires_at` (a Unix epoch; a token with none never expires) and put the renewal
+   date in your calendar. `date -d '+90 days' +%s` is GNU; on macOS use
+   `date -v+90d +%s`:
 
    ```bash
    curl -sS -X POST "$YUZU_URL/api/v1/tokens" \
-     -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+     -H "Authorization: Bearer $SCRAPE_ACCOUNT_TOKEN" -H 'Content-Type: application/json' \
      -d '{"name":"prometheus-scrape","expires_at":'$(date -d '+90 days' +%s)'}'
+   curl -sS -X DELETE "$YUZU_URL/api/v1/rbac/roles/ApiTokenManager/assignments/prometheus-scrape" \
+     -H "Authorization: Bearer $ADMIN_TOKEN"
    ```
 
    The raw token is in the response and is never shown again.
@@ -1848,7 +1866,8 @@ This is the one worked recipe; other pages link here.
        metrics_path: /metrics
        scheme: https
        tls_config:
-         ca_file: /etc/prometheus/yuzu-ca.pem   # the CA that signed the server's web certificate
+         ca_file: /etc/prometheus/yuzu-ca.pem   # the CA that signed the server's web certificate:
+                                                # with the default certificates, `default-ca.pem` in --ca-dir
        authorization:
          type: Bearer
          credentials_file: /etc/prometheus/yuzu-metrics-token
@@ -1861,6 +1880,11 @@ This is the one worked recipe; other pages link here.
    server's self-signed default certificate in a lab, `tls_config: { insecure_skip_verify: true }`
    replaces `ca_file`; never use it against a production target. A server started with
    `--no-https` serves `/metrics` on `--web-port` over plain `http`.
+   The `targets` host must be a name in the certificate's SANs (the default leaf covers
+   `localhost`, `127.0.0.1`, `::1` and the boot-time hostname; add others with `--cert-san`),
+   or the scrape fails verification. An existing scrape of `http://…:8080/metrics` against a
+   server with HTTPS on now receives a `301` redirect to the HTTPS port, so `up` is 0 until
+   the job is changed to `https` on the HTTPS port.
 
    Create the file BEFORE Prometheus loads this configuration: `promtool check
    config` fails with `error checking authorization credentials or bearer token
@@ -1933,11 +1957,19 @@ curl -s 'http://localhost:9090/api/v1/query?query=yuzu_agents_connected' | jq .
 
 The server exposes a Server-Sent Events (SSE) endpoint for real-time updates.
 The dashboard uses this for live agent status, but any SSE client can consume
-it. This endpoint requires authentication (session cookie).
+it. This endpoint requires authentication (a session cookie or an API token) and a
+fleet-wide read grant: a management-group-confined or service-scoped caller is refused `403`
+(and the refusal is audited as `events.stream.access_denied`). The stream keeps the
+credential and scope it attached with and has no maximum lifetime: revoking the token or
+session, deprovisioning the account or removing the grant does not close it (end it by
+restarting the replica or closing the connection at the proxy).
 
 ```bash
-curl -s -b cookies.txt -N 'http://localhost:8080/events'
+curl -sk -b cookies.txt -N 'https://localhost:8443/events'
 ```
+
+With HTTPS on (the default) the dashboard and this endpoint are on the HTTPS port, `8443`;
+`--web-port` serves them only with `--no-https`.
 
 **Example output:**
 
