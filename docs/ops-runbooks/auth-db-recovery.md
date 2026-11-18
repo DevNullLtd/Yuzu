@@ -627,7 +627,7 @@ until `--auth-lockout-window-secs` passes (audit: `auth.mfa.lockout.applied`, th
 3. **Host CLI**: `yuzu-server --break-glass-arm` resets the lock, but ONLY for the configured
    break-glass user; `yuzu-server --mfa-reset <user>` removes the factor (and the lock) and the user
    re-enrols.
-4. **Direct SQL** (last resort, writes no audit row; see the fallback above, which now clears the
+4. **Direct SQL** (last resort, writes no audit row; see the fallback above, which clears the
    three MFA columns too).
 
 **Clock note.** Lock windows are measured by the Postgres clock (`now()`), so a step of the database clock shifts them: a forward step of at least the REMAINING lock time ends a live lock early and starts a fresh failure count (a new set of guesses), and a backward step lengthens it. An operator unlock still clears a lock. Accepted by the owner (2026-11-18) as a documented residual.
@@ -1298,7 +1298,7 @@ whatever the running service passes in its unit file. Omit it and the command
 exits non-zero with `error: --break-glass-arm requires --break-glass-user`,
 arming nothing.
 
-Break-glass password attempts are bounded without a lockout: they take no per-username stripe; each attempt takes a non-blocking per-source slot in the break-glass lane (one per source address, so a second request from the same address is refused `429` at once; `yuzu_auth_pbkdf2_budget_rejected_total{route="login",class="break_glass"}` with `reason` `per_source` or `class_full`). The lane is `min(4, cap/4)` slots: 4 from a pool of 64, 2 on pools of 16-47, and ONE on pools of 10-15, where a single address that keeps an attempt in flight makes the operator's own attempt answer `429` until it stops; retry, nothing is locked. The lane is per server process (N replicas allow N times as many concurrent attempts). The break-glass exemption is from the **password lockout only**: wrong TOTP or recovery codes still
+Break-glass password attempts are bounded without a lockout: they take no per-username stripe; each attempt takes a non-blocking slot in the break-glass lane (one per TCP peer address, so everyone behind a proxy shares one; so a second request from the same address is refused `429` at once; `yuzu_auth_pbkdf2_budget_rejected_total{route="login",class="break_glass"}` with `reason` `per_source` or `class_full`). The lane is `min(4, cap/4)` slots: 4 from a pool of 64, 2 on pools of 16-47, and ONE on pools of 10-15, where a single address that keeps an attempt in flight makes the operator's own attempt answer `429` until it stops; retry, nothing is locked. The lane is per server process (N replicas allow N times as many concurrent attempts). The break-glass exemption is from the **password lockout only**: wrong TOTP or recovery codes still
 spend the per-account second-factor failure budget, so a break-glass login can be refused with the
 uniform `401` while that account's second factor is locked. Arming resets that lock in the same
 statement (the audit row says so), which is the host-side remedy; see

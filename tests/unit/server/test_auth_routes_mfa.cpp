@@ -3018,7 +3018,7 @@ TEST_CASE("POST /login/mfa/stepup: an attempt that cannot be counted is never ve
     auto r = h.sink.dispatch("POST", "/login/mfa/stepup", form({{"code", "000000"}}),
                              "application/x-www-form-urlencoded", {{"Cookie", cookie}});
     REQUIRE(r);
-    CHECK(r->status == 503); // not the 401 an uncounted wrong guess used to get
+    CHECK(r->status == 503); // 503, never the 401 of an ordinary wrong code
     CHECK(audit_detail_contains(h, "mfa.step_up.failed", "could not be counted"));
     // Recovery-code shaped input takes the same gate.
     auto rc = h.sink.dispatch("POST", "/login/mfa/stepup", form({{"code", "AAAA-BBBB-CCCC-DDDD"}}),
@@ -3373,8 +3373,11 @@ TEST_CASE("live pool of 10: a flood of one unknown name cannot pin the workers",
             if (r)
                 ++answered;
         });
-    // Wait (bounded) until the pool is saturated or the flood has been answered, not a fixed
-    // sleep: with an unbounded wait ten handlers enter and park; with the bounded one they pass.
+    // Wait (bounded) until ten handlers have entered or the flood has been answered, not a fixed
+    // sleep. This test pins the END-TO-END outcome (the pool keeps serving /healthz); it is RED
+    // when the whole bounded-wait block is replaced by a blocking lock. It does NOT isolate the
+    // individual caps (a blocking lock added next to them, or one cap removed, can stay green):
+    // the per-stripe cap and the global ceiling are pinned by their own tests below.
     for (int i = 0; i < 300 && saw_ghost.load() < 10; ++i)
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
@@ -3402,8 +3405,9 @@ TEST_CASE("live pool of 10: a flood of one unknown name cannot pin the workers",
         t.join();
     svr.stop();
     server_thread.join();
-    // With the stripe held for the whole measurement, an UNBOUNDED wait pins all ten workers and
-    // /healthz queues behind them (RED); the bounded wait frees each worker after 150 ms.
+    // With the stripe held for the whole measurement, replacing the bounded wait by a blocking
+    // lock pins all ten workers and /healthz queues behind them; the bounded, capped wait keeps
+    // them free.
     CHECK(health_ok);
     CHECK(health_ms < std::chrono::milliseconds(2500));
     CHECK(other_ok);
@@ -3668,22 +3672,43 @@ TEST_CASE("live pool of 10: unique unknown names with over-length passwords cann
     svr.Get("/healthz", [](const httplib::Request&, httplib::Response& res) {
         res.set_content("ok", "text/plain");
     });
-    const int port = svr.bind_to_any_port("127.0.0.1");
-    REQUIRE(port > 0);
-    std::thread server_thread([&] { svr.listen_after_bind(); });
-    svr.wait_until_ready();
-
+    // Every REQUIRE sits ABOVE the thread start: a throw after it would destroy a joinable
+    // std::thread (std::terminate). The server thread is a jthread behind a stop guard.
     // Make the lockout read SLOW: another connection holds an exclusive lock on auth.users, so
     // every request that reaches the database blocks there (a slow or contended store).
     yuzu::server::pg::PgConn locker{PQconnectdb(h.auth_db.dsn().c_str())};
     REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
-    REQUIRE(yuzu::server::pg::PgResult{PQexec(locker.get(), "BEGIN")}.ok());
-    REQUIRE(yuzu::server::pg::PgResult{
-        PQexec(locker.get(), "LOCK TABLE auth.users IN ACCESS EXCLUSIVE MODE")}.ok());
+    const int port = svr.bind_to_any_port("127.0.0.1");
+    REQUIRE(port > 0);
+    std::jthread server_thread([&] { svr.listen_after_bind(); });
+    struct StopGuard {
+        httplib::Server& s;
+        ~StopGuard() { s.stop(); }
+    } stop_guard{svr};
+    svr.wait_until_ready();
+    {
+        const auto begin = yuzu::server::pg::PgResult{PQexec(locker.get(), "BEGIN")};
+        const auto lock = yuzu::server::pg::PgResult{
+            PQexec(locker.get(), "LOCK TABLE auth.users IN ACCESS EXCLUSIVE MODE")};
+        CHECK(begin.ok());
+        CHECK(lock.ok());
+    }
 
     const std::string over(yuzu::server::auth::kMaxPasswordBytes + 1, 'x');
     constexpr int kFlood = 160; // unique names: distinct stripes, no waiting, no lockout rows
-    std::vector<std::thread> flood;
+    // A SINGLE probe first: it must block on the locked database (this is what proves the lock
+    // really parks a request, so the later "blocked" reading has a lower bound).
+    std::jthread probe([&, port] {
+        httplib::Client c("127.0.0.1", port);
+        c.set_read_timeout(30, 0);
+        (void)c.Post("/login", "username=over-max-probe&password=" + over,
+                     "application/x-www-form-urlencoded");
+    });
+    for (int i = 0; i < 300 && entered.load() < 1; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    CHECK(in_handler.load() == 1); // one probe is parked on the lock: it blocks
+    std::vector<std::jthread> flood;
     std::atomic<int> answered{0};
     for (int i = 0; i < kFlood; ++i)
         flood.emplace_back([&, i, port] {
@@ -3708,16 +3733,16 @@ TEST_CASE("live pool of 10: unique unknown names with over-length passwords cann
         std::chrono::steady_clock::now() - t0);
     // Release the lock so the blocked requests (at most the lane) finish.
     (void)yuzu::server::pg::PgResult{PQexec(locker.get(), "COMMIT")};
-    for (auto& t : flood)
-        t.join();
+    flood.clear(); // jthreads join here, after the lock is released
+    probe.join();
     svr.stop();
-    server_thread.join();
     CHECK(saturated);
     CHECK((health && health->status == 200));
     // With the slot taken for over-length passwords only the unauthenticated lane (3) reaches the
     // blocked database read, the rest are refused 429 at once, so /healthz is served promptly.
     // Without the fix every one of the ten workers blocks on the lock and /healthz waits for it.
     CHECK(health_ms < std::chrono::milliseconds(700));
+    CHECK(blocked_now >= 2); // the lane (3, probe included) really is parked on the database
     CHECK(blocked_now <= 6); // lane 3 + margin; without the fix all 10 workers are parked here
     CHECK(answered.load() == kFlood);
 }

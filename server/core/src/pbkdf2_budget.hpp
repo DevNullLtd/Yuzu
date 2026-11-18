@@ -64,9 +64,25 @@ public:
         std::lock_guard lk(mu_);
         return cap_;
     }
+    /// The lane sizes for a given cap: ONE place, used by the budget itself and by the boot
+    /// sizing (server.cpp), so a documented number cannot drift from the enforced one.
+    struct Lanes {
+        int break_glass;
+        int main;
+        int authenticated;
+        int unauthenticated;
+    };
+    static Lanes lanes_for_cap(int cap) {
+        const int c = cap < 4 ? 4 : cap;
+        const int bg = bg_cap(c);
+        const int main = c - bg;
+        const int auth = std::max(1, main / 2);
+        return {bg, main, auth, std::max(1, main - auth)};
+    }
     /// Slots of the break-glass floor, and the bound on the other two classes together.
     int break_glass_cap() const { return bg_cap(cap()); }
     int main_cap() const { return cap() - bg_cap(cap()); }
+    int unauthenticated_cap() const { return lanes_for_cap(cap()).unauthenticated; }
     int per_principal_cap() const { return per_principal_cap_; }
     void set_per_principal_cap(int c) {
         std::lock_guard lk(mu_);
@@ -124,10 +140,11 @@ public:
                           : cls == Pbkdf2Class::kBreakGlass   ? "bg:" + source
                                                               : source;
         std::lock_guard lk(mu_);
-        const int bgc = bg_cap(cap_);
-        const int main_cap = cap_ - bgc;
-        const int auth_reserve = std::max(1, main_cap / 2);
-        const int unauth_cap = std::max(1, main_cap - auth_reserve);
+        const Lanes ln = lanes_for_cap(cap_);
+        const int bgc = ln.break_glass;
+        const int main_cap = ln.main;
+        const int auth_reserve = ln.authenticated;
+        const int unauth_cap = ln.unauthenticated;
         if (cls == Pbkdf2Class::kBreakGlass) {
             if (break_glass_ >= bgc)
                 return Slot{Pbkdf2Refusal::kClassFull};
@@ -194,6 +211,35 @@ private:
     std::unordered_map<std::string, int> per_principal_;
     std::unordered_map<std::string, int> per_source_;
 };
+
+/// The login concurrency sizing for an HTTP worker pool: PURE (no I/O), so it is unit-tested at
+/// the real pool sizes and is the ONE source for the setter, the gauges, the boot log and the
+/// boot warning in server.cpp.
+struct LoginSizing {
+    int cap;                    // process-wide PBKDF2 slots
+    int break_glass_lane;       // min(4, cap/4), one per source address
+    int unauthenticated_lane;
+    int authenticated_lane;
+    int stripe_waiters;         // global ceiling on requests waiting for a username stripe
+    bool small_pool;            // pool < 64: lanes or waiter ceilings are reduced
+    bool per_source_covers_lane; // per-source cap >= unauthenticated lane: one address can fill it
+    bool pool_crowded;          // cap + waiters >= pool: logins alone can occupy every worker
+};
+
+inline LoginSizing login_sizing(std::size_t pool, int per_source_cap) {
+    const std::size_t cap_want = std::max<std::size_t>(8, pool / 4);
+    const int cap = static_cast<int>(std::min(cap_want, std::max<std::size_t>(4, pool / 2)));
+    const auto ln = Pbkdf2Budget::lanes_for_cap(cap);
+    const int waiters = static_cast<int>(std::max<std::size_t>(2, pool / 8));
+    return {cap,
+            ln.break_glass,
+            ln.unauthenticated,
+            ln.authenticated,
+            waiters,
+            pool < 64 || ln.break_glass < kBreakGlassLaneMax,
+            per_source_cap >= ln.unauthenticated,
+            static_cast<std::size_t>(cap + waiters) >= pool};
+}
 
 inline const char* to_string(Pbkdf2Refusal r) {
     switch (r) {

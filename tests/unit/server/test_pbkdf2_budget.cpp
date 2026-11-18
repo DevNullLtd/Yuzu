@@ -241,3 +241,43 @@ TEST_CASE("Pbkdf2Budget: per-source keys are per class (an unauthenticated hash 
     auto more = b.try_acquire(Pbkdf2Class::kUnauthenticated, "198.51.100.8");
     CHECK(more.ok());
 }
+
+TEST_CASE("login_sizing at the real pool sizes: caps, lanes, waiters and the boot warnings",
+          "[pbkdf2_budget][sizing]") {
+    struct Row {
+        std::size_t pool;
+        int cap, bg, unauth, auth, waiters;
+        bool small, covers, crowded;
+    };
+    // per-source cap 4 (the default): covers the lane while the lane is <= 4.
+    const Row rows[] = {
+        {6, 4, 1, 2, 1, 2, true, true, true},
+        {10, 5, 1, 2, 2, 2, true, true, false},
+        {16, 8, 2, 3, 3, 2, true, true, false},
+        {36, 9, 2, 4, 3, 4, true, true, false},
+        {48, 12, 3, 5, 4, 6, true, false, false},
+        {64, 16, 4, 6, 6, 8, false, false, false},
+        {264, 66, 4, 31, 31, 33, false, false, false},
+    };
+    for (const auto& r : rows) {
+        INFO("pool " << r.pool);
+        const auto z = yuzu::server::login_sizing(r.pool, 4);
+        CHECK(z.cap == r.cap);
+        CHECK(z.break_glass_lane == r.bg);
+        CHECK(z.unauthenticated_lane == r.unauth);
+        CHECK(z.authenticated_lane == r.auth);
+        CHECK(z.stripe_waiters == r.waiters);
+        CHECK(z.small_pool == r.small);
+        CHECK(z.per_source_covers_lane == r.covers);
+        CHECK(z.pool_crowded == r.crowded);
+        // The budget enforces exactly what the sizing reports.
+        Pbkdf2Budget b{z.cap};
+        CHECK(b.break_glass_cap() == z.break_glass_lane);
+        CHECK(b.unauthenticated_cap() == z.unauthenticated_lane);
+        CHECK(Pbkdf2Budget::lanes_for_cap(z.cap).authenticated == z.authenticated_lane);
+    }
+    // A per-source cap below the lane does not warn; at the lane it does.
+    CHECK(yuzu::server::login_sizing(264, 31).per_source_covers_lane);
+    CHECK(yuzu::server::login_sizing(264, 30).per_source_covers_lane == false);
+    CHECK(yuzu::server::login_sizing(10, 1).per_source_covers_lane == false);
+}

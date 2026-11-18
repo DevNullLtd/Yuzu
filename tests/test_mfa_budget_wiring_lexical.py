@@ -93,8 +93,9 @@ def check_gate_order(t, hpp="", server=""):
     if missing:
         return [f"anchors missing: {missing}"]
     bad = []
-    if not gate < bg_slot:
-        bad.append("the sso-only pre_verify_gate must run BEFORE the break-glass slot")
+    if not bg_slot < gate:
+        bad.append("the break-glass slot must be taken BEFORE the sso-only pre_verify_gate "
+                   "(the gate reads the arm state from the database)")
     if not gate < stripe or not gate < slot:
         bad.append("the sso-only pre_verify_gate must run before the stripe and the ordinary slot")
     if not re.search(r"if \(break_glass_attempt\) \{\s*pbkdf2_slot\.emplace\(acquire_pbkdf2\(Pbkdf2Class::kBreakGlass", fn):
@@ -127,9 +128,19 @@ def check_gate_order(t, hpp="", server=""):
         if not re.search(r"kStripeWaitersPerStripe\s*=\s*2\b", hpp):
             bad.append("kStripeWaitersPerStripe must be 2 (auth_routes.hpp)")
     if server:
-        for tok in ("auth_routes_->set_stripe_waiter_cap(", "auth_routes_->set_pbkdf2_cap("):
-            if tok not in server:
-                bad.append(f"server.cpp must call {tok} (production sizing is wired nowhere else)")
+        # Line-anchored statements: a commented-out call, a token inside a string literal and an
+        # altered argument all fail these (the sizing helper is the single source, unit-tested).
+        for pat, what in (
+            (r"(?m)^\s*const auto sz = yuzu::server::login_sizing\(pool_max, cfg_\.auth_pbkdf2_per_source_cap\);",
+             "const auto sz = login_sizing(pool_max, cfg_.auth_pbkdf2_per_source_cap)"),
+            (r"(?m)^\s*auth_routes_->set_pbkdf2_cap\(sz\.cap\);", "auth_routes_->set_pbkdf2_cap(sz.cap)"),
+            (r"(?m)^\s*auth_routes_->set_stripe_waiter_cap\(sz\.stripe_waiters\);",
+             "auth_routes_->set_stripe_waiter_cap(sz.stripe_waiters)"),
+            (r"(?m)^\s*auth_routes_->pbkdf2_budget\(\)\.set_per_source_cap\(cfg_\.auth_pbkdf2_per_source_cap\);",
+             "set_per_source_cap(cfg_.auth_pbkdf2_per_source_cap)"),
+        ):
+            if not re.search(pat, server):
+                bad.append(f"server.cpp must contain the statement {what} (production sizing)")
     return bad
 
 
@@ -244,8 +255,11 @@ def selftest(files):
     mut("try_lock() first dropped", sub_cpp("if (!login_lk.try_lock()) {", "if (true) {"))
     mut("over-length shortcut back on the ordinary slot", sub_cpp("if (!break_glass_attempt) {\n        const bool login_route", "if (!break_glass_attempt && !auth::password_exceeds_max(password)) {\n        const bool login_route"))
     mut("over-length shortcut back on the break-glass slot", sub_cpp("if (break_glass_attempt) {\n        pbkdf2_slot.emplace", "if (break_glass_attempt && !auth::password_exceeds_max(password)) {\n        pbkdf2_slot.emplace"))
-    mut("server.cpp stops calling set_stripe_waiter_cap", sub_cpp("auth_routes_->set_stripe_waiter_cap(", "auth_routes_->set_stripe_waiter_cap_gone(", key="server.cpp"))
-    mut("server.cpp stops calling set_pbkdf2_cap", sub_cpp("auth_routes_->set_pbkdf2_cap(", "auth_routes_->set_pbkdf2_cap_gone(", key="server.cpp"))
+    mut("server.cpp: set_stripe_waiter_cap commented out", sub_cpp("    auth_routes_->set_stripe_waiter_cap(sz.stripe_waiters);", "    // auth_routes_->set_stripe_waiter_cap(sz.stripe_waiters);", key="server.cpp"))
+    mut("server.cpp: set_pbkdf2_cap only inside a string literal", sub_cpp("    auth_routes_->set_pbkdf2_cap(sz.cap);", '    const char* x = "auth_routes_->set_pbkdf2_cap(sz.cap);";', key="server.cpp"))
+    mut("server.cpp: set_pbkdf2_cap altered argument", sub_cpp("auth_routes_->set_pbkdf2_cap(sz.cap);", "auth_routes_->set_pbkdf2_cap(4);", key="server.cpp"))
+    mut("server.cpp: sizing computed with a constant per-source cap", sub_cpp("login_sizing(pool_max, cfg_.auth_pbkdf2_per_source_cap)", "login_sizing(pool_max, 1)", key="server.cpp"))
+    mut("break-glass slot moved after the sso-only gate", lambda m: m.__setitem__("auth_routes.cpp", m["auth_routes.cpp"].replace("if (break_glass_attempt) {\n        pbkdf2_slot.emplace(acquire_pbkdf2(Pbkdf2Class::kBreakGlass", "if (false) {\n        pbkdf2_slot.emplace(acquire_pbkdf2(Pbkdf2Class::kBreakGlass", 1).replace("    // Serialize concurrent attempts for THIS username across the whole", "    if (break_glass_attempt) { pbkdf2_slot.emplace(acquire_pbkdf2(Pbkdf2Class::kBreakGlass, req, opts.metric_route)); }\n    // Serialize concurrent attempts for THIS username across the whole", 1)) or True)
     # A new caller elsewhere must be caught too.
     m = dict(files)
     m["rogue.cpp"] = "void f(){ db->mfa_verify_login_code(u, c); }"

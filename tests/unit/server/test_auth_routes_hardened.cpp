@@ -380,26 +380,29 @@ TEST_CASE("sso-only: wrong password against an armed break-glass user is a norma
     CHECK(h.count_audits("auth.login_failed") >= 1);
 }
 
-TEST_CASE("sso-only: a saturated PBKDF2 budget does not tell the break-glass name apart (429 vs 401)",
+TEST_CASE("sso-only: with every lane full only the break-glass NAME answers 429; other names 401",
           "[pg][auth][hardened][routes][concurrency]") {
-    HardenedHarness h("sso-only", "admin");
+    HardenedHarness h("sso-only", "admin"); // admin is the break-glass name, NOT armed
     h.enroll_mfa("admin");
-    // Fill every slot: the whole process-wide budget is in use.
+    // Fill every slot: the whole process-wide budget is in use, the break-glass lane included.
     auto& budget = h.auth_routes->pbkdf2_budget();
     budget.set_cap(8);
     auto held = yuzu::test::fill_pbkdf2_budget(budget);
     REQUIRE(held.size() == 8);
-    // UNARMED break-glass name and any other name: the same generic 401, never a 429, because
-    // the sso-only gate refuses before a slot is taken. This pins that order: with the gate run
-    // AFTER the slot, `alice` would answer 429 here while the break-glass name answered 401,
-    // an oracle for the name (mutation-checked: moving the gate after the slot turns it RED).
-    for (const char* user : {"alice", "admin", "no-such-user-xyz"}) {
+    // Other and unknown names are refused by the sso-only gate before any slot: the same 401.
+    for (const char* user : {"alice", "no-such-user-xyz"}) {
         auto res = h.sink.Post("/login", form({{"username", user}, {"password", "whatever-123456"}}),
                                kFormCt);
         REQUIRE(res);
         CHECK(res->status == 401);
         CHECK(res->get_header_value("Retry-After").empty());
     }
+    // The break-glass name takes its lane slot first, armed or not: 429, the same either way
+    // (the arm state is not disclosed). Mutation: gate before the slot -> 401 for the unarmed name.
+    auto bg = h.sink.Post("/login", form({{"username", "admin"}, {"password", "whatever-123456"}}),
+                          kFormCt);
+    REQUIRE(bg);
+    CHECK(bg->status == 429);
 }
 
 TEST_CASE("sso-only: the armed break-glass login is not denied by a flood of its own name (stripe skipped)",
@@ -472,15 +475,23 @@ TEST_CASE("sso-only: break-glass guesses are bounded by the lane (exact numbers)
     CHECK(login("adminpassword1") == 202);              // the operator is back in at once
 }
 
-TEST_CASE("sso-only: a saturated break-glass lane does not tell unarmed or unknown names apart",
+TEST_CASE("sso-only: a saturated break-glass lane gives the break-glass NAME the same 429 armed or "
+          "not, and every other name the same 401",
           "[pg][auth][hardened][routes][concurrency][stripe]") {
     HardenedHarness h("sso-only", "admin"); // admin is the break-glass name, NOT armed
     auto& budget = h.auth_routes->pbkdf2_budget();
     budget.set_cap(66);
     auto held = hold_break_glass_lane(budget, budget.break_glass_cap(), "attacker-");
-    // The sso-only gate runs before the lane, so unarmed, other and unknown names never touch it:
-    // the same generic 401, no Retry-After (mutation: gate after the slot -> 429 for admin).
-    for (const char* user : {"alice", "admin", "no-such-user-xyz"}) {
+    // The break-glass user's request takes its lane slot BEFORE the sso-only gate (which reads
+    // the arm state from the database), so an UNARMED flood consumes the lane exactly like an
+    // armed one: the armed-429 versus unarmed-401 difference does not exist. Other and unknown
+    // names never touch the lane. (Mutation: gate before the slot -> the unarmed name answers
+    // 401 here.)
+    auto admin = h.sink.Post("/login", form({{"username", "admin"}, {"password", "whatever-123456"}}),
+                             kFormCt);
+    REQUIRE(admin);
+    CHECK(admin->status == 429);
+    for (const char* user : {"alice", "no-such-user-xyz"}) {
         auto res = h.sink.Post("/login", form({{"username", user}, {"password", "whatever-123456"}}),
                                kFormCt);
         REQUIRE(res);

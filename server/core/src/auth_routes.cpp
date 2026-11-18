@@ -2165,22 +2165,13 @@ PasswordCheckResult AuthRoutes::verify_password_with_lockout(const std::string& 
                                                              const PasswordCheckOptions& opts) {
     const bool lockout_active = cfg_.auth_lockout_threshold > 0 && !opts.lockout_exempt;
 
-    // 1. The caller's pre-verify gate (the sso-only local-login gate) runs FIRST, before any
-    // stripe, slot or gate: a refused attempt never hashes, so it must never consume (or be
-    // refused for lack of) shared capacity. Under sso-only every name but an ARMED break-glass
-    // account is rejected here with the one generic 401, so unarmed, other and unknown names
-    // never touch the break-glass lane or any other lane. (An ARMED break-glass attempt can still
-    // answer 429 where they answer 401: see the residue note at the /login call site.)
-    if (opts.pre_verify_gate && !opts.pre_verify_gate())
-        return {PasswordCheckOutcome::kGateRejected, std::nullopt, {}};
-
-    // 2. The armed break-glass account (lockout-exempt on /login) keeps no lockout counter, so it
-    // takes no stripe; its CONCURRENT guesses are bounded by its budget lane instead: a
-    // NON-blocking slot, ONE per source address (a second request from the same source fails
-    // fast and never queues), in a lane of min(4, cap/4) slots (1 on pools of 10-15 workers).
-    // The slot is taken for EVERY attempt, including an over-length password whose hash is
-    // skipped: that request still does database and audit work, so it must count against the
-    // lane or a flood of them is unbounded.
+    // 1. The BREAK-GLASS NAME (lockout-exempt on /login: the configured break-glass user under
+    // sso-only, armed or not) takes its budget slot FIRST: non-blocking, ONE per source address,
+    // in a lane of min(4, cap/4) slots, keyed on the TCP peer. The slot is taken before the
+    // sso-only gate because that gate reads the arm state from the database (a lease wait of up
+    // to 1.5 s), so a flood naming the break-glass user would otherwise do that read unbounded,
+    // and an unarmed flood would leave the lane free (an armed-429 vs unarmed-401 oracle). It
+    // is taken for EVERY attempt, including an over-length password whose hash is skipped.
     const bool break_glass_attempt = opts.lockout_exempt && opts.metric_route == "login";
     std::optional<Pbkdf2Budget::Slot> pbkdf2_slot;
     if (break_glass_attempt) {
@@ -2188,6 +2179,15 @@ PasswordCheckResult AuthRoutes::verify_password_with_lockout(const std::string& 
         if (!pbkdf2_slot->ok())
             return {PasswordCheckOutcome::kBusy, std::nullopt, {}};
     }
+
+    // 2. The caller's pre-verify gate (the sso-only local-login gate) runs before any stripe or
+    // ordinary slot: a refused attempt never hashes, so it must never consume (or be refused for
+    // lack of) shared capacity. Under sso-only every name except the armed break-glass account
+    // is rejected here with the one generic 401; other and unknown names never touch any lane.
+    // The break-glass name (armed or not) answers 429 when its lane is full, so saturation shows
+    // that a name IS the break-glass name but not whether it is armed.
+    if (opts.pre_verify_gate && !opts.pre_verify_gate())
+        return {PasswordCheckOutcome::kGateRejected, std::nullopt, {}};
 
     // Serialize concurrent attempts for THIS username across the whole
     // lockout-critical section below (pre-check → verify_password →
@@ -2710,12 +2710,12 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // while armed — an out-of-band host operator ran --break-glass-arm
         // within the window. A non-exempt or un-armed attempt is rejected with
         // the SAME generic 401 as a bad password (no "disabled"/"sso-only"
-        // wording, no Retry-After), so nothing in the answer tells them apart; an ARMED
-        // break-glass attempt, though, can answer 429 where every other name answers 401 (a
-        // second same-source request or a full lane), and that answer's STATUS, BODY and
-        // Retry-After all differ. That residue is equivalent in kind to the timing residue
-        // below; the 429 is deliberately NOT turned into a 401 (it is the operator-facing busy
-        // signal). verify_password (PBKDF2) is skipped for the rejected names. The one other
+        // wording, no Retry-After), so nothing in the answer tells them apart; a request naming
+        // the BREAK-GLASS user (armed or not) can answer 429 where every other name answers
+        // 401 (a second same-source request or a full lane), and that answer's STATUS, BODY and
+        // Retry-After all differ. That shows the name IS the break-glass user, not whether it
+        // is armed; it is equivalent in kind to the timing residue below, and the 429 is
+        // deliberately NOT turned into a 401 (it is the operator-facing busy signal). verify_password (PBKDF2) is skipped for the rejected names. The one other
         // residue is response TIMING: an armed break-glass user
         // runs PBKDF2 (slow) while every other username short-circuits (fast),
         // so timing can reveal that the break-glass account is currently armed

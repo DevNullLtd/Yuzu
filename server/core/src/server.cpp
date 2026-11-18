@@ -16654,38 +16654,40 @@ private:
         // WP03 perf-F1: cap concurrent PBKDF2 (login / recovery-code / password-change proof)
         // work at a quarter of the worker pool so hashing can never pin every worker.
         if (auth_routes_) {
-            // Floor 8 so a small pool does not shrink the lanes to nothing, but never more than
-            // half the pool (a pool under 16 workers) so non-auth routes always keep workers.
-            const std::size_t cap_want = std::max<std::size_t>(8, pool_max / 4);
-            const int pbkdf2_cap =
-                static_cast<int>(std::min(cap_want, std::max<std::size_t>(4, pool_max / 2)));
-            auth_routes_->set_pbkdf2_cap(pbkdf2_cap);
+            // One pure sizing function (pbkdf2_budget.hpp, unit-tested at real pool sizes) feeds
+            // the setters, the gauges, the boot log and the boot warning.
+            const auto sz = yuzu::server::login_sizing(pool_max, cfg_.auth_pbkdf2_per_source_cap);
+            auth_routes_->set_pbkdf2_cap(sz.cap);
             auth_routes_->pbkdf2_budget().set_per_source_cap(cfg_.auth_pbkdf2_per_source_cap);
-            // Most requests that may WAIT for a username stripe at once (each pins a worker for
-            // up to 150 ms): an eighth of the pool, at least 2.
-            auth_routes_->set_stripe_waiter_cap(
-                static_cast<int>(std::max<std::size_t>(2, pool_max / 8)));
-            metrics_.gauge("yuzu_auth_pbkdf2_budget_capacity").set(static_cast<double>(pbkdf2_cap));
-            const int stripe_cap_waiters = static_cast<int>(std::max<std::size_t>(2, pool_max / 8));
-            const int bg_lane = auth_routes_->pbkdf2_budget().break_glass_cap();
+            auth_routes_->set_stripe_waiter_cap(sz.stripe_waiters);
+            metrics_.gauge("yuzu_auth_pbkdf2_budget_capacity").set(static_cast<double>(sz.cap));
             metrics_.gauge("yuzu_auth_login_stripe_waiter_cap")
-                .set(static_cast<double>(stripe_cap_waiters));
+                .set(static_cast<double>(sz.stripe_waiters));
             metrics_.gauge("yuzu_auth_pbkdf2_budget_break_glass_lane")
-                .set(static_cast<double>(bg_lane));
+                .set(static_cast<double>(sz.break_glass_lane));
             metrics_.gauge("yuzu_auth_login_stripe_waiters").set(0.0);
             metrics_.gauge("yuzu_auth_pbkdf2_budget_in_flight_peak").set(0.0);
-            spdlog::info("login concurrency limits: worker pool {}, hashing cap {}, stripe waiter cap "
-                         "{} (2 per stripe), break-glass lane {}",
-                         pool_max, pbkdf2_cap, stripe_cap_waiters, bg_lane);
-            if (pool_max < 64 || bg_lane < yuzu::server::kBreakGlassLaneMax ||
-                static_cast<std::size_t>(pbkdf2_cap + stripe_cap_waiters) >= pool_max) {
-                spdlog::warn(
-                    "login concurrency limits are reduced by the small HTTP worker pool ({} "
-                    "workers): hashing cap {}, stripe waiter cap {}, break-glass lane {} (full size "
-                    "{} from a pool of 64). A modest flood of logins can occupy most of the pool and "
-                    "a few addresses can keep the break-glass lane busy; raise --http-worker-threads",
-                    pool_max, pbkdf2_cap, stripe_cap_waiters, bg_lane,
-                    yuzu::server::kBreakGlassLaneMax);
+            spdlog::info("login concurrency limits: worker pool {}, hashing cap {} (unauthenticated "
+                         "lane {}, authenticated lane {}), stripe waiter cap {} (2 per stripe), "
+                         "break-glass lane {}, per-address cap {}",
+                         pool_max, sz.cap, sz.unauthenticated_lane, sz.authenticated_lane,
+                         sz.stripe_waiters, sz.break_glass_lane, cfg_.auth_pbkdf2_per_source_cap);
+            if (sz.small_pool || sz.pool_crowded) {
+                spdlog::warn("login concurrency limits are reduced by the small HTTP worker pool "
+                             "({} workers): hashing cap {}, stripe waiter cap {}, break-glass lane {} "
+                             "(full size {} from a pool of 64). A modest flood of logins can occupy "
+                             "most of the pool and a few addresses can keep the break-glass lane "
+                             "busy; raise --http-worker-threads",
+                             pool_max, sz.cap, sz.stripe_waiters, sz.break_glass_lane,
+                             yuzu::server::kBreakGlassLaneMax);
+            }
+            if (sz.per_source_covers_lane) {
+                spdlog::warn("--auth-pbkdf2-per-source-cap {} is at or above the unauthenticated "
+                             "login lane ({}): one client address (or every user behind one proxy, "
+                             "load balancer or NAT) can hold the whole lane and every other "
+                             "address's login is answered 429. Lower the cap or raise "
+                             "--http-worker-threads",
+                             cfg_.auth_pbkdf2_per_source_cap, sz.unauthenticated_lane);
             }
         }
         // A security-relevant toggle nobody can confirm the state of is an operability
