@@ -2063,9 +2063,9 @@ recommended; they land as the CRL store's migration v2, before 2b-1b accepts any
   the IDP and base-or-delta parts; the CA is in the table's own column (`source_id`,
   `ca_subject_name_sha256`). `rollback_high_water`'s `CHECK` also accepts `'*'`, the CA-level row
   whose permanent `reset_at` scopes first seen later inherit; `crl`'s does not. `crl.is_delta`
-  becomes a column generated from the suffix, so the two cannot disagree. A newer CRL replaces the held one by delete-then-insert inside the acceptance transaction,
-  so `UNIQUE (source_id, scope_key, is_delta)` stays and a reader sees the old CRL or the new one,
-  never both.
+  becomes a column generated from the suffix, so the two cannot disagree. A newer CRL replaces the
+  held one by delete-then-insert inside the acceptance transaction, so `UNIQUE (source_id,
+  scope_key, is_delta)` stays and a reader sees the old CRL or the new one, never both.
 - **`config_version` stays a per-row counter.** Source ids come from an identity column that is
   never reset, so a delete and re-register cannot reproduce an earlier (source id,
   `config_version`) pair; the global `revocation_source.config_seq` is not built.
@@ -2075,6 +2075,13 @@ recommended; they land as the CRL store's migration v2, before 2b-1b accepts any
   percent-encoding is left as sent. The canonical form is what is stored, what `UNIQUE (source_id,
   url)` and replace compare, and what responses return, so a cosmetic `PUT` keeps the URL's fetch
   state.
+- **Proposed, for the migration v2 PR** (implementation points the rulings leave open; a reviewer
+  can change them without re-opening #6590): `keep_key_sha256` names `source_ca_key.cert_sha256`
+  values, the key's identity everywhere else on this surface; the reset body also takes the
+  required `expected_config_version` that `PUT` takes, so a reset built from a stale read cannot
+  delete a key another administrator has just added; and v2 rewrites each stored URL to the
+  canonical form when it opens, refusing to open (naming the source) when two URLs of one source
+  collapse into one, since 2b-1a is in no release and only development databases hold v1 rows.
 
 **Decided by the owner, 2026-10-26 and 2026-10-27** (items raised by governance on 2a-2d, 2a-2e, 2a-3 and 2a-4; the owner took the recommendations on all; each item carries its own date):
 
