@@ -34,6 +34,7 @@
 #include "management_group_types.hpp"
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <functional>
@@ -171,8 +172,15 @@ public:
     /// groups the agent was removed from, so the caller can record WHICH scopes the device left (the
     /// decommission audit evidence); on any failure it is left empty. A failure is logged at warn
     /// level with the reason.
+    ///
+    /// Once the DELETE has committed nothing here may report failure: `removed_count`, when non-null,
+    /// receives the number of rows removed (set before any allocation; 0 on a `false` return), and
+    /// the copy into `removed_group_ids` is best effort. If it throws (out of memory) the id vector is
+    /// left EMPTY while `removed_count` is still the true count and the call still returns true, so a
+    /// caller detects incomplete evidence by `removed_group_ids->size() != *removed_count`.
     [[nodiscard]] bool delete_agent(std::string_view agent_id,
-                                    std::vector<std::string>* removed_group_ids = nullptr);
+                                    std::vector<std::string>* removed_group_ids = nullptr,
+                                    std::size_t* removed_count = nullptr);
     /// LEGACY fail-soft: `get_members_checked(group_id).value_or({})` — a
     /// store-not-open / pool-acquire-timeout / query-error degrade renders as
     /// an empty vector, INDISTINGUISHABLE from a genuinely empty group (#1762).

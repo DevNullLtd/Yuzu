@@ -542,9 +542,12 @@ std::expected<void, std::string> ManagementGroupStore::remove_member(const std::
 }
 
 bool ManagementGroupStore::delete_agent(std::string_view agent_id,
-                                        std::vector<std::string>* removed_group_ids) {
+                                        std::vector<std::string>* removed_group_ids,
+                                        std::size_t* removed_count) {
     if (removed_group_ids)
         removed_group_ids->clear();
+    if (removed_count)
+        *removed_count = 0;
     if (!open_ || agent_id.empty())
         return false;
     // An operator request: the write budget, not the heartbeat-path one.
@@ -567,15 +570,27 @@ bool ManagementGroupStore::delete_agent(std::string_view agent_id,
                      ::yuzu::log_key_token(PQerrorMessage(lease.get())));
         return false;
     }
+    // The DELETE has COMMITTED (a bare autocommit statement). Nothing below may turn that into a
+    // failure: the caller would record the store `Failed` ("the delete did not commit") for rows that
+    // are gone, and lose the groups-left evidence. So the count is published first (no allocation)
+    // and the id copy is best effort.
     const int rows = PQntuples(r.get());
+    if (removed_count)
+        *removed_count = static_cast<std::size_t>(rows);
     if (removed_group_ids) {
-        // Built aside and moved in at the end, so a throw while copying (bad_alloc) can never leave
-        // the caller's vector partially filled: it is either empty or complete.
-        std::vector<std::string> ids;
-        ids.reserve(static_cast<std::size_t>(rows));
-        for (int i = 0; i < rows; ++i)
-            ids.push_back(text_col(r.get(), i, 0));
-        *removed_group_ids = std::move(ids);
+        try {
+            // Built aside and moved in at the end: the caller's vector is either empty or complete.
+            std::vector<std::string> ids;
+            ids.reserve(static_cast<std::size_t>(rows));
+            for (int i = 0; i < rows; ++i)
+                ids.push_back(text_col(r.get(), i, 0));
+            *removed_group_ids = std::move(ids);
+        } catch (...) {
+            removed_group_ids->clear();
+            spdlog::warn("ManagementGroupStore::delete_agent: agent {} removed from {} group(s) but "
+                         "the group ids could not be copied (out of memory)",
+                         ::yuzu::log_id_token(agent_id), rows);
+        }
     }
     spdlog::info("ManagementGroupStore::delete_agent: agent {} removed from {} group(s)",
                  ::yuzu::log_id_token(agent_id), rows);

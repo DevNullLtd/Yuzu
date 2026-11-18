@@ -956,6 +956,17 @@ TEST_CASE("format_group_evidence sorts, counts and bounds the group id list",
     CHECK(text.find("g0100") == std::string::npos); // the 101st is only counted
 }
 
+// Evidence for a store that committed its delete but could not copy the ids (out of memory): the
+// count is still true, the ids are never invented, and a complete list formats as before.
+TEST_CASE("format_group_evidence with a count never claims ids it does not have",
+          "[decommission][management_group]") {
+    using yuzu::server::format_group_evidence;
+    CHECK(format_group_evidence({"b2", "a1"}, 2) == "2:a1,b2");
+    CHECK(format_group_evidence({}, 0) == "0:");
+    CHECK(format_group_evidence({}, 3) == "3:unrecorded");       // ids lost after the commit
+    CHECK(format_group_evidence({"a1"}, 3) == "3:unrecorded");   // partial list is never reported
+}
+
 // The `add_store_with_detail` contract: evidence a deleter fills is kept only when the delete
 // committed, and never survives a false return or a throw.
 TEST_CASE("AgentDecommission drops store evidence unless the delete committed",

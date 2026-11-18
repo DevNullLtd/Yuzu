@@ -101,6 +101,12 @@ enum class DecommissionOutcome {
 /// stays bounded. An empty set is `0:`. Pure.
 inline constexpr std::size_t kMaxGroupEvidenceIds = 100;
 [[nodiscard]] std::string format_group_evidence(std::vector<std::string> group_ids);
+/// Like `format_group_evidence`, for a store that knows how many groups it removed (`group_count`)
+/// but may have been unable to copy the ids (`group_ids.size() != group_count`, out of memory after
+/// the delete committed). Complete ids format as above; incomplete ones give `<group_count>:unrecorded`,
+/// so the audit row never claims a group set it does not have. Pure.
+[[nodiscard]] std::string format_group_evidence(std::vector<std::string> group_ids,
+                                                std::size_t group_count);
 
 /// Human-readable outcome tag for logs/audit ("deleted"|"skipped"|"failed").
 [[nodiscard]] const char* to_string(DecommissionOutcome o) noexcept;

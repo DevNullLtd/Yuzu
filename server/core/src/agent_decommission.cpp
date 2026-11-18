@@ -119,12 +119,24 @@ AgentDecommission::AgentDecommission(const AgentDecommissionStores& stores) {
             "management_group_memberships",
             [p = stores.management_group_memberships](std::string_view id, std::string& detail) {
                 std::vector<std::string> removed;
-                if (!p->delete_agent(id, &removed))
+                std::size_t count = 0;
+                if (!p->delete_agent(id, &removed, &count))
                     return false;
-                detail = format_group_evidence(std::move(removed));
-                // Also in the server log, so the group set survives a lost outcome audit row.
-                spdlog::info("AgentDecommission: agent={} left management groups {}",
-                             ::yuzu::log_id_token(id), detail);
+                // The DELETE has committed: building the evidence must never turn this into a
+                // `Failed` (the contract says Failed means the delete did not commit). An
+                // exception here (out of memory) degrades the evidence, never the outcome.
+                try {
+                    detail = format_group_evidence(std::move(removed), count);
+                    // Also in the server log, so the group set survives a lost outcome audit row.
+                    spdlog::info("AgentDecommission: agent={} left management groups {}",
+                                 ::yuzu::log_id_token(id), detail);
+                } catch (...) {
+                    try {
+                        detail = std::to_string(count) + ":unrecorded";
+                    } catch (...) {
+                        detail.clear();
+                    }
+                }
                 return true;
             });
     } else {
@@ -153,6 +165,12 @@ std::string format_group_evidence(std::vector<std::string> group_ids) {
     if (group_ids.size() > shown)
         out += ",+" + std::to_string(group_ids.size() - shown);
     return out;
+}
+
+std::string format_group_evidence(std::vector<std::string> group_ids, std::size_t group_count) {
+    if (group_ids.size() != group_count)
+        return std::to_string(group_count) + ":unrecorded";
+    return format_group_evidence(std::move(group_ids));
 }
 
 DecommissionResult AgentDecommission::decommission(std::string_view agent_id) {

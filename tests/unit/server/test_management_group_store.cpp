@@ -336,13 +336,13 @@ TEST_CASE("ManagementGroupStore: static membership", "[pg][management_group][mem
     CHECK(members2.size() == 1);
 }
 
-// Decommission memberships: characterisation of the returning-id question. Nothing in the server
-// deletes an agent's membership rows when it is decommissioned (the cascade names no
-// management-group store), and Register's only membership write is add_member(root), so an agent
-// that registers again with the same id is still a member of every group it was in. This test
-// models that Register write directly against the store; the Register-side half (an approved id
-// takes the fast path, no token) is driven through the real service in test_agent_service_impl.cpp.
-TEST_CASE("ManagementGroupStore: a re-registered agent id keeps every group membership",
+// Decommission memberships: the returning-id question, in two phases. Register's only membership
+// write is add_member(root), so an agent that registers again with the same id keeps every group it
+// was in UNLESS a decommission removed its memberships in between (the tenth cascade store), in
+// which case it is back in the ROOT group only. This test models that Register write directly
+// against the store; the Register-side half (an approved id takes the fast path, no token) is
+// driven through the real service in test_agent_service_impl.cpp.
+TEST_CASE("ManagementGroupStore: a re-registered agent id keeps its memberships until decommission, then rejoins root only",
           "[pg][management_group][members][decommission]") {
     YUZU_REQUIRE_PG_DB_TPL(db, mgmt_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -465,9 +465,12 @@ TEST_CASE("ManagementGroupStore::delete_agent removes the agent from every group
             sorted_ids({f.root, f.s1, f.s2, f.dyn}));
 
     std::vector<std::string> removed;
-    CHECK(store.delete_agent("a1", &removed));
-    // The evidence: exactly the groups the agent was removed from (static, dynamic and root).
+    std::size_t removed_count = 99;
+    CHECK(store.delete_agent("a1", &removed, &removed_count));
+    // The evidence: exactly the groups the agent was removed from (static, dynamic and root), and
+    // the count the cascade uses to tell a complete id list from a lost one.
     CHECK(sorted_ids(removed) == sorted_ids({f.root, f.s1, f.s2, f.dyn}));
+    CHECK(removed_count == removed.size());
 
     // A value, not nullopt (no degrade): the agent is in NO group, static, dynamic and root alike.
     auto after = store.get_agent_groups("a1");
