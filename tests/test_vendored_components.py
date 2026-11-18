@@ -15,7 +15,8 @@ check-vendored`:
     third-party file under server/core/vendor/ or server/core/static/ (also
     in a subdirectory, whatever its name), a changed htmx literal in
     static_js_bundle.cpp, a deleted file, a symbolic link (to a file, to a
-    directory, dangling) under a tracked root, an unreadable directory, a
+    directory, dangling) under a tracked root, a tracked root or a NOTICE's
+    parent directory that is a link, an unreadable directory, a
     NOTICE no component names, one recording a hash that is not a file of a
     component naming it, one that is not UTF-8, one whose path leaves the
     checkout, and one whose SPDX licence differs from the manifest each fail,
@@ -260,6 +261,30 @@ class ScratchCopy(unittest.TestCase):
     def test_dangling_link_under_a_tracked_root_fails(self):
         self.symlink(self.tmp / "nowhere.js", self.tmp / "server/core/static/gone.js")
         self.assertFails("server/core/static/gone.js is a symbolic link;")
+
+    # The walk's own link checks see only links BELOW a tracked root's top
+    # directory (os.walk follows the top itself). The two tests below are
+    # links only the per-path check (`_linked_part`) sees: without it, both
+    # trees read as identical copies and pass.
+
+    def test_tracked_root_that_is_a_link_fails(self):
+        outside = Path(tempfile.mkdtemp(prefix="yuzu_test_vendored_outside_"))
+        self.addCleanup(shutil.rmtree, outside, True)
+        vendor = self.tmp / "server/core/vendor"
+        shutil.copytree(vendor, outside / "vendor")
+        shutil.rmtree(vendor)
+        self.symlink(outside / "vendor", vendor, directory=True)
+        self.assertFails("server/core/vendor is a symbolic link;")
+
+    def test_notice_whose_parent_directory_is_a_link_fails(self):
+        # A NOTICE outside the tracked roots (which the walk never visits)
+        # read through a linked parent directory.
+        outside = Path(tempfile.mkdtemp(prefix="yuzu_test_vendored_outside_"))
+        self.addCleanup(shutil.rmtree, outside, True)
+        shutil.copy2(self.tmp / "server/core/static/cytoscape-NOTICE.txt", outside / "cytoscape-NOTICE.txt")
+        self.symlink(outside, self.tmp / "licenses", directory=True)
+        self.name_notice("cytoscape", "licenses/cytoscape-NOTICE.txt")
+        self.assertFails("licenses is a symbolic link;")
 
     def test_unreadable_directory_fails(self):
         if os.name == "nt" or os.geteuid() == 0:

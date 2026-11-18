@@ -94,9 +94,12 @@ under its tracked roots is listed with its SHA-256 and size, first-party by
 name (a first_party_patterns entry: its directory exactly, its glob on the
 file name only, so nothing in a subdirectory is first-party), or an
 attribution file a component names as its `notice`; every listed file exists
-with that hash. Each NOTICE must be UTF-8, its SPDX licence line must be its
-components', and every SHA-256 it records must be one of the files of a
-component naming it. A symbolic link anywhere under a tracked root (or on the
+with that hash. A NOTICE whose bytes are not valid UTF-8 fails; its SPDX
+licence line must be its components', and every SHA-256 it records must be one
+of the files of a component naming it. Valid UTF-8 is not proof of a UTF-8
+text: a BOM-less UTF-16 NOTICE can decode as valid UTF-8, and then its SPDX and
+SHA-256 lines are simply not found, which the check treats like a NOTICE that
+records none. A symbolic link anywhere under a tracked root (or on the
 path of a listed file or NOTICE) and a directory the walk cannot read fail it,
 as does an unlisted, changed or missing file, so a vendor refresh cannot skip
 the manifest.
@@ -867,7 +870,10 @@ def _linked_part(root: Path, rel: str):
     """The first part of `rel` (itself or a directory above it, below `root`)
     that is a symbolic link, or None. A link would let the manifest's check
     read bytes from outside the checkout, or skip a directory os.walk does not
-    descend into."""
+    descend into. It assumes the checkout is not modified while the check
+    runs: the read after this check follows links, so a link swapped in
+    between would be read through (its bytes are still hashed against the
+    manifest)."""
     parts = Path(rel).parts
     for i in range(1, len(parts) + 1):
         sub = "/".join(parts[:i])
@@ -895,8 +901,12 @@ def _first_party(rel: str, patterns) -> bool:
 
 def _notice_text(data: bytes):
     """A NOTICE's text: strict UTF-8 (a leading byte-order mark is allowed), or
-    None. A NOTICE in another encoding would hide its SHA-256 and SPDX lines
-    from the checks below rather than fail them."""
+    None when the bytes are not valid UTF-8, which the caller fails. That
+    catches a NOTICE re-encoded with a byte-order mark (UTF-16 with a BOM is
+    not valid UTF-8), not every other encoding: a BOM-less UTF-16 file of
+    ASCII text decodes as valid UTF-8 (with NULs), and then its SHA-256 and
+    SPDX lines are simply not found, which the checks below treat like a
+    NOTICE that records none."""
     if data.startswith(b"\xef\xbb\xbf"):
         data = data[3:]
     try:

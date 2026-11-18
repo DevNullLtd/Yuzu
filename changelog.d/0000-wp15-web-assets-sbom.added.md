@@ -11,7 +11,8 @@
   files it built from, and a CI check fails a change that adds or alters a file under
   `server/core/vendor/` or `server/core/static/` (other than the server's own
   `yuzu-*.js` and `yuzu.css` directly in `static/`), or the htmx and SSE literals in
-  `static_js_bundle.cpp`, without updating it. Two versions the vendored files do not
+  `static_js_bundle.cpp`, without updating it (a NOTICE the manifest names is checked
+  only for its SPDX and SHA-256 lines). Two versions the vendored files do not
   state are left blank rather than guessed: the htmx SSE extension (upstream `sse.js`
   plus one trailing newline, and `sse.js` is identical in 2.2.2 and 2.2.3) and
   tslib. With these listed, a server file's SBOM is not marked incomplete for them.
