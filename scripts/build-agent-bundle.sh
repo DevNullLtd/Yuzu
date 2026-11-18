@@ -71,11 +71,11 @@ IMAGE_NAME="yuzu-agent-bundle-chisel"
 PUSH=0; MULTIARCH=0; RUN_TEST=1; KEEP_STAGING=0; VERIFY_ONLY=0; SIGNER_REPO=""
 STAGING_OWNED=0
 
-# REPO_SLUG drives THREE things: the registry namespace (below), `gh release
-# download` and `gh attestation verify`. A wrong value silently
-# downloads another project's artifacts and verifies provenance against the
-# wrong repository, so an unresolvable remote is a HARD ERROR here rather than
-# a guessed default -- same fail-loud stance as the GHCR login in release.yml,
+# REPO_SLUG drives TWO things: the registry namespace (below) and `gh release
+# download` (`gh attestation verify` uses SIGNER_REPO, below). A wrong value
+# silently downloads another project's artifacts, so an unresolvable remote is
+# a HARD ERROR here rather than a guessed default -- same fail-loud stance as
+# the GHCR login in release.yml,
 # which this file previously contradicted. Set YUZU_REPO_SLUG to run outside a
 # checkout. Note the old `-n` guard could not catch a non-GitHub remote either:
 # sed passes non-matching input through unchanged, so the whole URL survived as
@@ -355,11 +355,23 @@ if [ "$VERIFY_ONLY" = 1 ]; then
   exit 0
 fi
 
-# Best-effort provenance attestation (does not gate the build).
-if gh attestation verify "$DL/yuzu-linux-x64.tar.gz" --repo "$REPO_SLUG" >/dev/null 2>&1; then
-  ok "SLSA provenance attestation verified (gh attestation)"
+# Best-effort provenance attestation (does not gate the build). The archive was
+# built by release.yml in SIGNER_REPO at TAG (the identity the cosign check above
+# pinned), so the attestation is pinned to exactly that: --repo alone would
+# accept one minted by any workflow in the repository. gh before 2.102.0
+# matches --signer-workflow by prefix and --source-ref case-insensitively
+# (before 2.68.0 it has no --source-ref), so an older gh is not trusted to say
+# "verified".
+GH_VERSION="$(gh --version 2>/dev/null | awk 'NR==1 {print $3}')" || GH_VERSION=""
+if [[ ! "$GH_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+   || [ "$(printf '%s\n' 2.102.0 "$GH_VERSION" | sort -V | head -1)" != 2.102.0 ]; then
+  warn "gh ${GH_VERSION:-<not found>} is missing, not a release version, or older than 2.102.0; provenance attestation not checked — continuing on SHA256 only"
+elif gh attestation verify "$DL/yuzu-linux-x64.tar.gz" --repo "$SIGNER_REPO" \
+       --signer-workflow "$SIGNER_REPO/.github/workflows/release.yml" \
+       --source-ref "refs/tags/$TAG" >/dev/null 2>&1; then
+  ok "SLSA provenance attestation verified (gh attestation: $SIGNER_REPO release.yml @ $TAG)"
 else
-  warn "Could not verify provenance attestation (offline, or gh too old) — continuing on SHA256 only"
+  warn "Could not verify provenance attestation against $SIGNER_REPO release.yml @ $TAG (offline, or none found) — continuing on SHA256 only"
 fi
 
 # ── 2. Lay out the /opt/yuzu-agents tree ───────────────────────────────────

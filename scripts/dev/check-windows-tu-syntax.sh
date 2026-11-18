@@ -85,6 +85,8 @@ tus=(
     agents/plugins/privacy_permissions/src/privacy_permissions_win.cpp
     agents/plugins/privacy_permissions/src/privacy_permissions_plugin.cpp
      agents/plugins/license_scan/src/licensing_win.cpp agents/plugins/registry/src/registry_plugin.cpp agents/plugins/registry/src/registry_win.cpp agents/plugins/installed_apps/src/installed_apps_plugin.cpp agents/plugins/echo/src/echo_mapdrive_collector.cpp agents/plugins/users/src/users_plugin.cpp
+    agents/plugins/ioc/src/ioc_plugin.cpp # DnsCacheTableOwner / once-per-command resolver-cache read (WP12)
+    agents/plugins/network_config/src/network_config_plugin.cpp # do_dns_cache's Windows block (WP12)
 )
 [ "$#" -gt 0 ] && tus+=("$@")
 

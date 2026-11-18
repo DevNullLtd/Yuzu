@@ -138,6 +138,9 @@ metadata:
     regex pattern. Returns matching line numbers and content. Supports
     case-insensitive search, regex mode with backtracking protection, and
     configurable maximum match count. Files larger than 100 MB are rejected.
+    In regex mode a line longer than 64 KiB is not searched: it is reported
+    as a skipped row instead. The 64 KiB figure is a size limit, not a
+    guarantee against stack exhaustion or slow patterns.
   tags: [filesystem, search, log-analysis, diagnostics, compliance]
 
 spec:
@@ -172,7 +175,8 @@ spec:
         description: >
           If "true", interpret the pattern as an ECMAScript regex.
           Patterns with nested quantifiers are rejected to prevent
-          catastrophic backtracking. Default: "false".
+          catastrophic backtracking, and lines over 64 KiB are skipped
+          (reported as a `skipped|<line>|...` row). Default: "false".
         default: "false"
         validation:
           enum: ["true", "false"]
@@ -252,7 +256,9 @@ metadata:
     Supports case-insensitive mode, dry-run (preview without writing), and
     a maximum replacement count. The write is atomic (temp file + rename)
     to prevent corruption. Files larger than 100 MB are rejected. Regex
-    patterns with nested quantifiers are rejected for safety.
+    patterns with nested quantifiers are rejected for safety, and in regex
+    mode a file larger than 64 KiB is refused (error row, rc 1, file
+    unchanged); use a literal replace for larger files.
   tags: [filesystem, action, configuration, remediation]
 
 spec:
@@ -291,7 +297,8 @@ spec:
         type: string
         displayName: Use Regex
         description: >
-          If "true", interpret search as an ECMAScript regex. Default: "false".
+          If "true", interpret search as an ECMAScript regex; the file must
+          then be 64 KiB or smaller. Default: "false".
         default: "false"
         validation:
           enum: ["true", "false"]
