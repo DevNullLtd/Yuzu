@@ -4043,7 +4043,7 @@ groups:
           description: >-
             A re-enrolment consumed a single-use enrollment token for an agent id that holds a live
             leaf, but the server issued no new leaf (reason no_csr: the agent sent no CSR, which
-            happens when it still holds a certificate file it believes is valid; no_signer;
+            happens while its certificate file is inside its first two thirds of life; no_signer;
             signer_failed; signer_threw). The token is spent and the old leaf is not superseded.
             Recovery: remove the agent's cert_dir, restart it and give it a fresh single-use token.
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/security-hardening.md#yuzuagentreenroltokennoleaf"

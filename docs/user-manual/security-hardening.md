@@ -964,7 +964,7 @@ More than five re-enrolment tokens were refused in 15 minutes. Read `yuzu_regist
 
 ### YuzuAgentReenrolTokenNoLeaf
 
-A single-use token was consumed to re-enrol a live-leaf id but no leaf was issued (`yuzu_register_reenrol_token_no_leaf_total{reason}`). `no_csr`: the agent still holds a certificate file it believes valid, so it sent no CSR. On that endpoint remove `cert_dir`, restart the agent and give it a fresh single-use token. `no_signer`: the server has no CA signer wired. `signer_failed` or `signer_threw`: read the server log for the signer error (a per-agent rate limit is one cause). The spent token cannot be reused; the older leaf is not superseded. Tracked: #8252, #8253.
+A single-use token was consumed to re-enrol a live-leaf id but no leaf was issued (`yuzu_register_reenrol_token_no_leaf_total{reason}`). `no_csr`: the agent's certificate file is inside its first two thirds of life, so it sent no CSR (it sends one only when the file is missing, expired or past two thirds of its life). On that endpoint remove `cert_dir`, restart the agent and give it a fresh single-use token. `no_signer`: the server has no CA signer wired. `signer_failed` or `signer_threw`: read the server log for the signer error (a per-agent rate limit is one cause). The spent token cannot be reused; the older leaf is not superseded. Tracked: #8252, #8253.
 
 ### YuzuAgentReregistrationAuditWriteFailed
 
@@ -972,11 +972,11 @@ A re-registration audit row could not be written (`reason` `store_unavailable` o
 
 ### YuzuAgentReregistrationAuditIdsTruncated
 
-More than 20000 DISTINCT agent ids were dropped by the audit budget inside one 10 s window, so the dropped-row summary could not name them all (`ids_truncated=N` on each summary row). Treat it as a sustained flood of re-registrations for ids that hold live leaves. The unbudgeted `yuzu_register_reregistration_total` still counts every one; find the source in the per-source counts of the `agent.reregistration_unproven` aggregate rows (`sources=`) and in gateway and firewall logs.
+Agent ids that no summary row names are being counted: more than 20000 DISTINCT ids were dropped inside one 10 s window (`ids_truncated=N` on each summary row), or a summary chunk was dropped or never built (see the next alert). Treat it as a sustained flood of re-registrations for ids that hold live leaves. The unbudgeted `yuzu_register_reregistration_total` still counts every one; find the source in the per-source counts of the `agent.reregistration_unproven` aggregate rows (`sources=`) and in gateway and firewall logs.
 
 ### YuzuAgentReregistrationAuditSummaryDropped
 
-A dropped-row summary chunk was not written (`reason`: `queue_full`, the 128-row queue overflowed; `write_failed`, three failed writes; `shutdown`, still queued when the server stopped). Restore the audit store if `write_failed`. The ids that chunk named remain counted by `yuzu_register_reregistration_audit_dropped_total`.
+A dropped-row summary chunk was not written (`reason`: `queue_full`, the 128-row queue overflowed; `write_failed`, three failed writes; `shutdown`, still queued when the server stopped; `alloc_failed`, the window's summary could not be built). Restore the audit store if `write_failed`. The ids that chunk would have named are now UNNAMED: they are counted by id in `yuzu_register_reregistration_audit_ids_truncated_total` (`yuzu_register_reregistration_audit_dropped_total` counts rows, not ids), and the unbudgeted `yuzu_register_reregistration_total` still counts every decision.
 
 ### YuzuAgentLeafSupersedeFailed
 
