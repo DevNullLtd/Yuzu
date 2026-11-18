@@ -207,3 +207,13 @@ TEST_CASE("SqliteErrMsg: frees on unwind and never returns null", "[sqlite_raii]
         CHECK(std::string{err.c_str()} != "unknown error");
     }
 }
+
+// Security floor (docs/build-guide.md, "Security dependency pins"): vcpkg.json overrides sqlite3 to
+// 3.54.1 for the CVE batch fixed in 3.54.0. The compile-time check catches a header from an older
+// tree; the runtime one catches a library that disagrees with its header (a stale vcpkg_installed or
+// a system copy picked up by the linker). Raise both numbers when the pin moves; never lower them.
+TEST_CASE("sqlite3: linked SQLite is at least the security-pinned 3.54.1", "[deps][security]") {
+    STATIC_REQUIRE(SQLITE_VERSION_NUMBER >= 3054001);
+    INFO("sqlite3_libversion() = " << sqlite3_libversion());
+    CHECK(sqlite3_libversion_number() >= 3054001);
+}

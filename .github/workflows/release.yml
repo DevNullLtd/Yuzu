@@ -191,12 +191,14 @@ jobs:
           # bison/flex: vcpkg's libpq port builds postgresql from source and
           # cannot auto-acquire them on Linux (gov #1331 — do not rely on the
           # machine-wide side effect of ci.yml's apt step).
-          for cmd in gcc-15 g++-15 cmake ninja meson ccache pkg-config rpmbuild bison flex; do
+          # dpkg-deb/rpm2cpio/cpio: scripts/ci/artifact-sbom.py unpacks the
+          # .deb and .rpm packages to describe what is inside each one.
+          for cmd in gcc-15 g++-15 cmake ninja meson ccache pkg-config rpmbuild bison flex dpkg-deb rpm2cpio cpio; do
             command -v "$cmd" >/dev/null 2>&1 || MISSING="$MISSING $cmd"
           done
           if [ -n "$MISSING" ]; then
             echo "::error::Missing tools on self-hosted runner:$MISSING"
-            echo "Install with: sudo apt-get install -y ccache rpm bison flex libsystemd-dev"
+            echo "Install with: sudo apt-get install -y ccache rpm cpio bison flex libsystemd-dev"
             exit 1
           fi
           # libsystemd-dev (sd-bus) — the Linux Guardian systemd service guard links it;
@@ -381,30 +383,37 @@ jobs:
           bash deploy/packaging/rpm/build-rpm.sh \
             --bin-dir build-linux --version "$RPM_VERSION" $PRE_FLAG --output .
 
-      # ── SBOM (CycloneDX + SPDX) ─────────────────────────────────────
-      # Syft scans the workspace and emits one SBOM covering:
-      #   - vcpkg C++ dependencies (via vcpkg.spdx.json files under
-      #     vcpkg_installed/x64-linux-static/share/<pkg>/)
-      #   - Built ELF binaries under build-linux/ (server, agent, plugins)
-      # Output two formats because customer questionnaires ask for one
-      # or the other inconsistently and both are trivial to emit.
-      - name: Generate SBOM (CycloneDX)
-        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+      # ── SBOMs (CycloneDX + SPDX), one per shipped file ──────────────
+      # scripts/ci/artifact-sbom.py unpacks each artifact, runs syft over that
+      # tree only, and adds the vcpkg ports the binaries in it are built from,
+      # read from the installed x64-linux-static tree (syft cannot see them:
+      # the binaries are static). It never scans the checkout: the old
+      # `path: .` scan listed the vcpkg ports catalogue and test tooling
+      # (40,853 components on v0.15.0) and none of the shipped libraries.
+      # Each SBOM is named after its artifact (yuzu-linux-x64.cdx.json for the
+      # archive, <package without .deb/.rpm>.cdx.json for a package) and
+      # records its SHA-256; the release job checks both.
+      - name: Install syft (pinned)
+        id: syft
+        uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
-          path: .
-          format: cyclonedx-json
-          output-file: yuzu-linux-x64.cdx.json
-          artifact-name: yuzu-linux-x64.cdx.json
-          upload-artifact: false
+          syft-version: v1.57.2
 
-      - name: Generate SBOM (SPDX)
-        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
-        with:
-          path: .
-          format: spdx-json
-          output-file: yuzu-linux-x64.spdx.json
-          artifact-name: yuzu-linux-x64.spdx.json
-          upload-artifact: false
+      - name: Generate per-artifact SBOMs
+        env:
+          SYFT: ${{ steps.syft.outputs.cmd }}
+        run: |
+          # sbom-out/ starts empty: this workspace is reused (clean: false), so
+          # an SBOM left by an earlier release must never be uploaded as this
+          # one's (the same reason the package steps rm old packages).
+          rm -rf sbom-out && mkdir sbom-out
+          VERSION="${GITHUB_REF_NAME#v}"
+          for artifact in yuzu-linux-x64.tar.gz ./*.deb ./*.rpm; do
+            python3 scripts/ci/artifact-sbom.py generate --syft "$SYFT" \
+              --artifact "${artifact#./}" --version "$VERSION" \
+              --vcpkg-installed vcpkg_installed --triplet x64-linux-static \
+              --manifest vcpkg.json --out-dir sbom-out
+          done
 
       # ── SLSA build provenance ───────────────────────────────────────
       # Records that these specific artifacts came from this specific
@@ -447,9 +456,8 @@ jobs:
         continue-on-error: true
         with:
           name: yuzu-linux-x64-sbom
-          path: |
-            yuzu-linux-x64.cdx.json
-            yuzu-linux-x64.spdx.json
+          path: sbom-out/
+          if-no-files-found: error
           retention-days: 3
 
   # ── Linux ARM64 release build — SUSPENDED ────────────────────────────
@@ -607,27 +615,29 @@ jobs:
             --rel-dir gateway/_build/prod/rel/yuzu_gw \
             --version "$RPM_VERSION" $PRE_FLAG --output .
 
-      # ── Gateway SBOM (CycloneDX + SPDX) ─────────────────────────────
-      # Syft reads gateway/rebar.lock for Erlang/OTP dependencies and
-      # walks _build/prod/rel/yuzu_gw/ for compiled beam files + OTP
-      # runtime bundled into the release.
-      - name: Generate gateway SBOM (CycloneDX)
-        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+      # ── Gateway SBOMs (CycloneDX + SPDX), one per shipped file ──────
+      # Each artifact is unpacked and scanned on its own, so the SBOM lists the
+      # OTP release it carries (_build/prod/rel/yuzu_gw: the applications in
+      # lib/ and ERTS) and nothing from gateway/'s test build trees. rebar.lock
+      # only turns each Hex dependency's pkg:otp purl into pkg:hex; it adds no
+      # component. See the Linux job for the script and its naming.
+      - name: Install syft (pinned)
+        id: syft
+        uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
-          path: gateway
-          format: cyclonedx-json
-          output-file: yuzu-gateway-linux-x64.cdx.json
-          artifact-name: yuzu-gateway-linux-x64.cdx.json
-          upload-artifact: false
+          syft-version: v1.57.2
 
-      - name: Generate gateway SBOM (SPDX)
-        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
-        with:
-          path: gateway
-          format: spdx-json
-          output-file: yuzu-gateway-linux-x64.spdx.json
-          artifact-name: yuzu-gateway-linux-x64.spdx.json
-          upload-artifact: false
+      - name: Generate per-artifact gateway SBOMs
+        env:
+          SYFT: ${{ steps.syft.outputs.cmd }}
+        run: |
+          rm -rf sbom-out && mkdir sbom-out
+          VERSION="${GITHUB_REF_NAME#v}"
+          for artifact in yuzu-gateway-linux-x64.tar.gz ./*.deb ./*.rpm; do
+            python3 scripts/ci/artifact-sbom.py generate --syft "$SYFT" \
+              --artifact "${artifact#./}" --version "$VERSION" \
+              --rebar-lock gateway/rebar.lock --out-dir sbom-out
+          done
 
       - name: Attest gateway provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
@@ -666,9 +676,8 @@ jobs:
         continue-on-error: true
         with:
           name: yuzu-gateway-linux-x64-sbom
-          path: |
-            yuzu-gateway-linux-x64.cdx.json
-            yuzu-gateway-linux-x64.spdx.json
+          path: sbom-out/
+          if-no-files-found: error
           retention-days: 3
 
   # ── Windows x64 release build ────────────────────────────────────────
@@ -1003,16 +1012,24 @@ jobs:
           }
           Write-Host "Using ISCC: $iscc"
 
-          # Build agent installer
+          # Build agent installer. yuzu-agent.iss sets OutputManifestFile, so
+          # ISCC also writes the list of the files it packed, with the SHA-256
+          # of each; the installer's SBOM is made from that list (below). The
+          # manifest is removed first and taken only from this run, so the
+          # SBOM never reads one an earlier build left behind.
           Write-Host "=== Building Agent Installer ==="
+          $manifest = "deploy\packaging\windows\output\YuzuAgentSetup.manifest.txt"
+          Remove-Item -Force -ErrorAction SilentlyContinue $manifest, "YuzuAgentSetup-${version}.manifest.txt"
           & $iscc `
             "/DAppVersion=${version}" `
             "/DBuildDir=${{ github.workspace }}\build-windows" `
             "deploy\packaging\windows\yuzu-agent.iss"
           if ($LASTEXITCODE -ne 0) { Write-Error "Agent installer failed"; exit 1 }
+          if (-not (Test-Path $manifest)) { Write-Error "ISCC wrote no manifest ($manifest): the installer SBOM is made from it"; exit 1 }
 
           $agentInstaller = "deploy\packaging\windows\output\YuzuAgentSetup-${version}.exe"
           Copy-Item $agentInstaller "YuzuAgentSetup-${version}.exe"
+          Copy-Item $manifest "YuzuAgentSetup-${version}.manifest.txt"
           Write-Host "Agent installer: $('{0:N1} MB' -f ((Get-Item $agentInstaller).Length / 1MB))"
           # No server installer: YuzuServerSetup was discontinued by ADR-0035.
 
@@ -1050,34 +1067,44 @@ jobs:
 
           Remove-Item $certPath -Force
 
-      # ── Windows SBOM (CycloneDX + SPDX) ─────────────────────────────
-      # Scans vcpkg_installed/x64-windows (C++ deps) + build-windows (PE
-      # binaries). Syft supports PowerShell/Windows runners via the
-      # composite action, which downloads a Windows syft binary.
-      # Known limitation: `path: .` scans the whole workspace (the vcpkg
-      # ports tree and build trees too), so this SBOM can list components the
-      # agent archive does not ship or load. Since ADR-0035 step 3 the vcpkg
-      # install on this runner is agent-only, so the server's dependencies
-      # (libpq, drogon, xmlsec) are no longer installed here; whether Syft
-      # still reports them from the ports tree is unverified until a release
-      # SBOM is inspected. The release notes and release-verification.md say so.
-      - name: Generate Windows SBOM (CycloneDX)
-        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+      # ── Windows SBOMs (CycloneDX + SPDX), one per shipped file ──────
+      # Same script as the Linux job, against the agent-only x64-windows tree
+      # (ADR-0035 step 3). The archive is unpacked and scanned. Nothing here
+      # unpacks an InnoSetup installer: its SBOM lists the files ISCC's own
+      # manifest (written by the "Build Windows installers" step's ISCC run)
+      # says it packed, each read from build-windows and checked against the
+      # SHA-256 ISCC recorded, at its path below build-windows (not its
+      # install path). --inno-build-dir is the /DBuildDir that ISCC run was
+      # given, the prefix of the manifest's paths. The SBOM records the
+      # installer's own name and SHA-256 and is marked incomplete (the
+      # InnoSetup runtime is not listed). The manifest is not a release asset;
+      # it is kept for 90 days as the windows-installer-manifest artifact.
+      - name: Install syft (pinned)
+        id: syft
+        uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
-          path: .
-          format: cyclonedx-json
-          output-file: yuzu-agent-windows-x64.cdx.json
-          artifact-name: yuzu-agent-windows-x64.cdx.json
-          upload-artifact: false
+          syft-version: v1.57.2
 
-      - name: Generate Windows SBOM (SPDX)
-        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
-        with:
-          path: .
-          format: spdx-json
-          output-file: yuzu-agent-windows-x64.spdx.json
-          artifact-name: yuzu-agent-windows-x64.spdx.json
-          upload-artifact: false
+      - name: Generate per-artifact SBOMs
+        shell: pwsh
+        env:
+          SYFT: ${{ steps.syft.outputs.cmd }}
+        run: |
+          $version = "$env:GITHUB_REF_NAME".TrimStart("v")
+          if (Test-Path sbom-out) { Remove-Item -Recurse -Force sbom-out }
+          New-Item -ItemType Directory -Path sbom-out | Out-Null
+          $common = @("--version", $version, "--syft", $env:SYFT, "--out-dir", "sbom-out",
+                      "--vcpkg-installed", "vcpkg_installed", "--triplet", "x64-windows", "--manifest", "vcpkg.json")
+          python scripts/ci/artifact-sbom.py generate --artifact yuzu-agent-windows-x64.zip @common
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $installers = @(Get-ChildItem -File -Filter "YuzuAgentSetup-*.exe")
+          if ($installers.Count -lt 1) { Write-Error "no YuzuAgentSetup-*.exe to describe"; exit 1 }
+          foreach ($exe in $installers) {
+            python scripts/ci/artifact-sbom.py generate --artifact $exe.Name `
+              --inno-manifest "$($exe.BaseName).manifest.txt" --build-dir build-windows `
+              --inno-build-dir "${{ github.workspace }}\build-windows" @common
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
 
       - name: Attest Windows provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
@@ -1108,10 +1135,24 @@ jobs:
         continue-on-error: true
         with:
           name: yuzu-agent-windows-x64-sbom
-          path: |
-            yuzu-agent-windows-x64.cdx.json
-            yuzu-agent-windows-x64.spdx.json
+          path: sbom-out/
+          if-no-files-found: error
           retention-days: 3
+
+      # The ISCC manifest the installer SBOM was made from: evidence of how the
+      # installer SBOM was produced, and for diagnosing an SBOM refusal. Kept 90
+      # days, the repository maximum (owner decision, 2026-11-18). Not named
+      # yuzu-*, so the release job does not download it: it is not a release
+      # asset (it records the runner's paths).
+      - name: Upload the installer manifest
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        continue-on-error: true
+        with:
+          name: windows-installer-manifest
+          path: YuzuAgentSetup-*.manifest.txt
+          if-no-files-found: warn
+          retention-days: 90
 
   # ── macOS ARM64 release build ────────────────────────────────────────
   build-macos:
@@ -1449,29 +1490,29 @@ jobs:
           xcrun stapler staple "${PKG}"
           echo "Notarized and stapled: ${PKG}"
 
-      # ── macOS SBOM (CycloneDX + SPDX) ───────────────────────────────
-      # Scans vcpkg_installed/arm64-osx + build-macos (Mach-O binaries).
-      # Same known limitation as the Windows SBOM: `path: .` covers the
-      # whole workspace, so it can list components the agent archive does not
-      # ship. The vcpkg install is agent-only (ADR-0035 step 3), so the
-      # server's dependencies are not installed on this runner either.
-      - name: Generate macOS SBOM (CycloneDX)
-        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+      # ── macOS SBOMs (CycloneDX + SPDX), one per shipped file ────────
+      # Same script as the Linux job, against the agent-only arm64-osx tree
+      # (ADR-0035 step 3). The .pkg is unpacked with pkgutil --expand-full.
+      # Runs after the .pkg is signed, notarized and stapled, so the SHA-256
+      # each SBOM records is the shipped file's.
+      - name: Install syft (pinned)
+        id: syft
+        uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
-          path: .
-          format: cyclonedx-json
-          output-file: yuzu-agent-macos-arm64.cdx.json
-          artifact-name: yuzu-agent-macos-arm64.cdx.json
-          upload-artifact: false
+          syft-version: v1.57.2
 
-      - name: Generate macOS SBOM (SPDX)
-        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
-        with:
-          path: .
-          format: spdx-json
-          output-file: yuzu-agent-macos-arm64.spdx.json
-          artifact-name: yuzu-agent-macos-arm64.spdx.json
-          upload-artifact: false
+      - name: Generate per-artifact SBOMs
+        env:
+          SYFT: ${{ steps.syft.outputs.cmd }}
+        run: |
+          rm -rf sbom-out && mkdir sbom-out
+          VERSION="${GITHUB_REF_NAME#v}"
+          for artifact in yuzu-agent-macos-arm64.tar.gz ./YuzuAgent-*.pkg; do
+            python3 scripts/ci/artifact-sbom.py generate --syft "$SYFT" \
+              --artifact "${artifact#./}" --version "$VERSION" \
+              --vcpkg-installed vcpkg_installed --triplet arm64-osx \
+              --manifest vcpkg.json --out-dir sbom-out
+          done
 
       - name: Attest macOS provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
@@ -1501,9 +1542,8 @@ jobs:
         continue-on-error: true
         with:
           name: yuzu-agent-macos-arm64-sbom
-          path: |
-            yuzu-agent-macos-arm64.cdx.json
-            yuzu-agent-macos-arm64.spdx.json
+          path: sbom-out/
+          if-no-files-found: error
           retention-days: 3
 
   # ── Docker images — server + gateway published to GHCR ──────────────
@@ -1674,6 +1714,8 @@ jobs:
       - name: Generate image SBOM (CycloneDX)
         uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
+          # The same syft as the per-artifact SBOMs (the action's default is older).
+          syft-version: v1.57.2
           image: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-${{ matrix.image }}@${{ steps.build.outputs.digest }}
           format: cyclonedx-json
           output-file: yuzu-${{ matrix.image }}-image.cdx.json
@@ -1683,6 +1725,8 @@ jobs:
       - name: Generate image SBOM (SPDX)
         uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
+          # The same syft as the per-artifact SBOMs (the action's default is older).
+          syft-version: v1.57.2
           image: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-${{ matrix.image }}@${{ steps.build.outputs.digest }}
           format: spdx-json
           output-file: yuzu-${{ matrix.image }}-image.spdx.json
@@ -1717,6 +1761,16 @@ jobs:
           # release page.
           cosign sign --yes "${IMAGE}@${DIGEST}"
           echo "Signed ${IMAGE}@${DIGEST} with cosign keyless (OIDC)"
+
+      # syft's image scan cannot see the vcpkg libraries linked into yuzu-server
+      # or yuzu-agent, nor what the Erlang emulator vendors: mark the pair
+      # incomplete, with the reason (no-op for an image holding neither).
+      # After attest + sign, like the upload (#5242). The release job's SBOM
+      # check refuses an unmarked pair.
+      - name: Mark the image SBOM incomplete where the scan cannot see
+        env:
+          SBOM: yuzu-${{ matrix.image }}-image
+        run: python3 scripts/ci/artifact-sbom.py mark-image --cdx "$SBOM.cdx.json" --spdx "$SBOM.spdx.json"
 
       - name: Upload image SBOM artifacts
         # After attest + sign (#5242): if this upload fails, the pushed tag is
@@ -1857,6 +1911,8 @@ jobs:
       - name: Generate image SBOM (CycloneDX)
         uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
+          # The same syft as the per-artifact SBOMs (the action's default is older).
+          syft-version: v1.57.2
           image: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-postgres@${{ steps.build.outputs.digest }}
           format: cyclonedx-json
           output-file: yuzu-postgres-image.cdx.json
@@ -1866,6 +1922,8 @@ jobs:
       - name: Generate image SBOM (SPDX)
         uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
+          # The same syft as the per-artifact SBOMs (the action's default is older).
+          syft-version: v1.57.2
           image: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-postgres@${{ steps.build.outputs.digest }}
           format: spdx-json
           output-file: yuzu-postgres-image.spdx.json
@@ -1895,6 +1953,15 @@ jobs:
           # error in v3 (see docker-publish for the #495 history).
           cosign sign --yes "${IMAGE}@${DIGEST}"
           echo "Signed ${IMAGE}@${DIGEST} with cosign keyless (OIDC)"
+
+      # pgvector is built from source: syft lists its vector.so as a file but no
+      # package, so the scan names no pgvector. mark-image marks the pair
+      # pgvector-source because it finds vector.so, and refuses this image
+      # (titled yuzu-postgres) if syft stops listing that file.
+      - name: Mark the image SBOM incomplete where the scan cannot see
+        env:
+          SBOM: yuzu-postgres-image
+        run: python3 scripts/ci/artifact-sbom.py mark-image --cdx "$SBOM.cdx.json" --spdx "$SBOM.spdx.json"
 
       - name: Upload image SBOM artifacts
         # After attest + sign (#5242): if this upload fails, the pushed tag is
@@ -2148,6 +2215,8 @@ jobs:
       - name: Generate image SBOM (CycloneDX)
         uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
+          # The same syft as the per-artifact SBOMs (the action's default is older).
+          syft-version: v1.57.2
           image: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-${{ matrix.image }}-chisel@${{ steps.build.outputs.digest }}
           format: cyclonedx-json
           output-file: yuzu-${{ matrix.image }}-chisel-image.cdx.json
@@ -2157,6 +2226,8 @@ jobs:
       - name: Generate image SBOM (SPDX)
         uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
+          # The same syft as the per-artifact SBOMs (the action's default is older).
+          syft-version: v1.57.2
           image: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-${{ matrix.image }}-chisel@${{ steps.build.outputs.digest }}
           format: spdx-json
           output-file: yuzu-${{ matrix.image }}-chisel-image.spdx.json
@@ -2186,6 +2257,12 @@ jobs:
           # error in v3 (see docker-publish for the #495 history).
           cosign sign --yes "${IMAGE}@${DIGEST}"
           echo "Signed ${IMAGE}@${DIGEST} with cosign keyless (OIDC)"
+
+      # As in docker-publish.
+      - name: Mark the image SBOM incomplete where the scan cannot see
+        env:
+          SBOM: yuzu-${{ matrix.image }}-chisel-image
+        run: python3 scripts/ci/artifact-sbom.py mark-image --cdx "$SBOM.cdx.json" --spdx "$SBOM.spdx.json"
 
       - name: Upload image SBOM artifacts
         # After attest + sign (#5242): if this upload fails, the pushed tag is
@@ -2327,6 +2404,8 @@ jobs:
       - name: Generate bundle SBOM (CycloneDX)
         uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
+          # The same syft as the per-artifact SBOMs (the action's default is older).
+          syft-version: v1.57.2
           image: ${{ steps.ref.outputs.image }}@${{ steps.digest.outputs.value }}
           format: cyclonedx-json
           output-file: yuzu-agent-bundle-chisel-image.cdx.json
@@ -2336,6 +2415,8 @@ jobs:
       - name: Generate bundle SBOM (SPDX)
         uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
+          # The same syft as the per-artifact SBOMs (the action's default is older).
+          syft-version: v1.57.2
           image: ${{ steps.ref.outputs.image }}@${{ steps.digest.outputs.value }}
           format: spdx-json
           output-file: yuzu-agent-bundle-chisel-image.spdx.json
@@ -2379,7 +2460,8 @@ jobs:
             echo ""
             echo "**Tag:** \`${IMAGE}:${VERSION}\`  **Digest:** \`${DIGEST}\`"
             echo ""
-            echo "Three triplets (linux-x64, windows-x64, macos-arm64); cosign keyless + SLSA provenance + SBOM."
+            echo "Three triplets (linux-x64, windows-x64, macos-arm64); cosign keyless + SLSA provenance."
+            echo "Its syft SBOM pair is a 3-day workflow artifact of this run, not a release asset, and is not marked incomplete."
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ── Create GitHub Release ────────────────────────────────────────────
@@ -2480,6 +2562,20 @@ jobs:
           # With the version it also checks every asset name is one GitHub
           # stores unchanged and every package is from this release (#5141).
           bash scripts/check-release-artifacts.sh artifacts "${GITHUB_REF_NAME#v}"
+
+      - name: Check artifact SBOM scope
+        run: |
+          # Every artifact SBOM (all but the *-image ones) must name an artifact
+          # in this release with the SHA-256 it records, have at most the bound
+          # of entries scripts/ci/artifact-sbom.py states, and list no path
+          # under vcpkg/, vcpkg_installed/, build-*/, _build/, _build_*/, site/,
+          # tests/, .git/ or .github/ (the marks of a checkout, build-tree or
+          # test-tree scan, which is what the pre-S8 SBOMs were). Each image
+          # SBOM pair must carry the marker mark-image adds where the image
+          # holds what syft cannot list. A failure here comes after the images
+          # are pushed: see the release skill's failure table (most causes need
+          # a fix and re-tag; a transfer fault needs only a re-run).
+          python3 scripts/ci/artifact-sbom.py check --artifacts-dir artifacts
 
       - name: Generate SHA256SUMS
         run: |
@@ -2673,9 +2769,32 @@ jobs:
           \`yuzu-windows-x64.zip\` and \`yuzu-macos-arm64.tar.gz\` and also
           held the server; update any script that downloads them by name.
 
-          Known limitation: the Windows and macOS SBOMs are generated from the whole build
-          workspace, so they can list components the archive does not ship
-          or load; a finding in one of those does not apply to the agent.
+          Each binary archive, package and installer has its own CycloneDX and SPDX SBOM,
+          named after the file (\`<name without .tar.gz/.zip/.deb/.rpm/.exe/.pkg>.{cdx,spdx}.json\`).
+          It lists what is inside that file: the vcpkg libraries its C++ binaries
+          are built with (from the installed vcpkg tree), for the gateway the
+          Erlang/OTP release, and anything else syft recognises in it. The
+          Windows installer's SBOM lists the files of
+          \`yuzu-agent-windows-x64.zip\` that the installer installs.
+          Not listed yet, though the file holds it: code vendored into the
+          source tree and compiled into \`yuzu-server\` (qrcodegen, and the
+          web assets it embeds: htmx, ECharts, three.js, Cytoscape, IBM Plex
+          fonts), the Windows installer's own InnoSetup runtime, and what the
+          gateway's Erlang emulator (\`beam.smp\`) vendors (PCRE2, asmjit,
+          zstd, Ryu, OpenSSL's MD5). An SBOM whose file or image holds
+          something it does not list says so: a CycloneDX composition with
+          \`aggregate: incomplete\`, in SPDX a \`CONTAINS NOASSERTION\`
+          relationship on its root, and the reason tokens in the
+          \`yuzu:sbom:incomplete-reasons\` note (a CycloneDX property; in SPDX
+          a line of the root's comment). The release's six image SBOMs are
+          marked too: an image scan cannot see the vcpkg libraries linked into
+          \`yuzu-server\` and \`yuzu-agent\`, what the gateway's Erlang
+          emulator vendors, nor pgvector, which the \`yuzu-postgres\` image
+          builds from source. A scanner such as
+          grype reports nothing for the marker, so read it yourself
+          (release-verification.md section 5). Libraries the binaries load
+          from the operating system at run time (glibc, \`libsystemd\`, the
+          MSVC runtime, the host OpenSSL) are not in the file and not listed.
 
           ## Compose Wizard
 
@@ -2719,10 +2838,23 @@ jobs:
 
           ## Supply chain: SBOM, SLSA provenance, signed images
 
-          Every release ships CycloneDX + SPDX SBOMs per platform
-          (\`yuzu-*-{linux-x64,windows-x64,macos-arm64}.{cdx,spdx}.json\`,
-          \`yuzu-{server,gateway,postgres}-image.{cdx,spdx}.json\` and
-          \`yuzu-{server,gateway,agent}-chisel-image.{cdx,spdx}.json\`), GitHub-native
+          Every release ships CycloneDX + SPDX SBOMs per binary archive, package
+          and installer (\`yuzu-linux-x64\`, \`yuzu-gateway-linux-x64\`,
+          \`yuzu-agent-windows-x64\` and \`yuzu-agent-macos-arm64\` with
+          \`.cdx.json\`/\`.spdx.json\` for the archives, the package or installer
+          name for the others) and per release image
+          (\`yuzu-{server,gateway,postgres}-image.{cdx,spdx}.json\` and
+          \`yuzu-{server,gateway,agent}-chisel-image.{cdx,spdx}.json\`: a syft
+          v1.57.2 scan of the image by the digest this release signs). An image
+          scan does not see the C++ libraries linked statically into
+          \`yuzu-server\` and \`yuzu-agent\` (the \`yuzu-linux-x64\`, server
+          and agent package SBOMs list them), what the gateway's Erlang emulator vendors,
+          or the \`yuzu-postgres\` image's source-built pgvector, so each of
+          the six image SBOMs is marked incomplete with its reasons
+          (server: \`server-vendored, image-static-cpp\`; agent:
+          \`image-static-cpp\`; gateway: \`erts-static\`; postgres:
+          \`pgvector-source\`). The agent-bundle image published after the
+          release has no SBOM among the release assets. GitHub-native
           SLSA build provenance attestations for every binary archive
           and Docker image, and cosign keyless signatures on both the
           Docker images and the \`SHA256SUMS\` manifest. See

@@ -27,6 +27,7 @@ DefaultDirName={autopf}\Yuzu
 DefaultGroupName=Yuzu
 OutputBaseFilename=YuzuAgentSetup-{#AppVersion}
 OutputDir=output
+OutputManifestFile=YuzuAgentSetup.manifest.txt
 Compression=lzma2/ultra64
 SolidCompression=yes
 PrivilegesRequired=admin

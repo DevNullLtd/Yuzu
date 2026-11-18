@@ -40,14 +40,19 @@ Third-party attributions
 ------------------------
 This distribution incorporates or links the following third-party
 libraries. Their individual licenses, copyrights and notices apply to
-those components and are retained within the distributed artefacts. This
-section is maintained manually; see `vcpkg.json` and
+those components. This file and the per-component `*-NOTICE.txt` files
+are kept in the source repository; they are not yet packaged with the
+release artefacts. This section is maintained manually; see `vcpkg.json` and
 `gateway/rebar.config` for the authoritative dependency lists.
 
   gRPC .................................. Apache-2.0
   Protocol Buffers ...................... BSD-3-Clause
   Abseil ................................ Apache-2.0
+  c-ares (gRPC dependency) .............. MIT
+  RE2 (gRPC dependency) ................. BSD-3-Clause
+  utf8_range (protobuf dependency) ...... MIT
   spdlog ................................ MIT
+  {fmt} (spdlog dependency) ............. MIT
   nlohmann/json ......................... MIT
   CLI11 ................................. BSD-3-Clause
   Drogon (build canary) ................. MIT AND BSD-3-Clause
@@ -57,7 +62,11 @@ section is maintained manually; see `vcpkg.json` and
       Copyright (c) 2016-2021 Tao An; the Muduo-derived code, Copyright (c) 2010, Shuo Chen
       (the port declares BSD-2-Clause, but its copyright text carries the non-endorsement
       clause, so BSD-3-Clause is recorded)
+  jsoncpp (build canary) ................ Public Domain OR MIT
+  libuuid (build canary) ................ BSD-3-Clause
   cpp-httplib ........................... MIT
+  Brotli ................................ MIT
+  zlib .................................. Zlib
   SQLite ................................ Public Domain
   libpq (PostgreSQL client library) ..... PostgreSQL License (BSD-style)
   libxlsxwriter (server) ................ BSD-2-Clause
@@ -68,6 +77,11 @@ section is maintained manually; see `vcpkg.json` and
       and its source is available from the libxlsxwriter release the vcpkg port builds
   minizip (libxlsxwriter dependency) .... Zlib
   OpenSSL ............................... Apache-2.0 / OpenSSL
+  libxml2 ............................... MIT
+  xmlsec ................................ X11 (MIT with a no-advertising clause)
+      Copyright (C) 2002-2026 Aleksey Sanin. The port declares MPL-1.1 AND X11: upstream
+      records that portions of its xmlsec-nss library were written against MPL-1.1
+      source. vcpkg builds only libxmlsec1 and libxmlsec1-openssl, not xmlsec-nss.
   Catch2 (test only) .................... BSL-1.0
   ctx ................................... Apache-2.0
   accept ................................ MIT
@@ -80,9 +94,15 @@ section is maintained manually; see `vcpkg.json` and
   HTMX (vendored) ....................... 0BSD
   htmx-ext-sse (vendored) ............... 0BSD
   Apache ECharts (vendored) ............. Apache-2.0
+  zrender (bundled in ECharts) .......... BSD-3-Clause
+      Copyright (c) 2013, Baidu Inc.
+  tslib (bundled in ECharts) ............ 0BSD
+      Copyright (c) Microsoft Corporation.
   CycloneDX JSON schemas (vendored) ..... Apache-2.0
+  SPDX 2.3 JSON schema (vendored, test) . CC-BY-3.0 (Copyright 2010-2022 Linux Foundation and its Contributors)
   Three.js r168 (vendored) .............. MIT
   Three.js OrbitControls (vendored) ..... MIT
+  Cytoscape.js 3.33.3 (vendored) ........ MIT
   Nayuki QR-Code-generator (vendored) ... MIT
   IBM Plex Sans / Mono (vendored) ....... SIL OFL 1.1
   Microsoft Visual C++ runtime .......... Microsoft Visual Studio licence terms (Distributable Code)

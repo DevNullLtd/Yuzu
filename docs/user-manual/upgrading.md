@@ -28,6 +28,28 @@ This describes the build in a fresh deployment (see "Deployment contract (hard c
 
 **If an agent stops reporting because `yuzu-agent.exe` cannot start.** The Windows service manager restarts the service every 60 seconds and each start fails the same way. Deploy the agent from the installer or archive of one release (see "Deployment contract (hard cutover)" in the Forensics section of this page).
 
+## Behaviour change: release SBOMs describe each shipped file, and every package and installer has its own
+
+**What changed.** The release used to publish one CycloneDX and one SPDX SBOM per platform, made by scanning the whole build workspace: they listed the vcpkg ports catalogue, docs and test tooling (40,853 components for v0.15.0's Linux SBOM) and not the C++ libraries the binaries link. Each release asset now has its own SBOM pair, made from that file alone:
+
+| Asset | SBOM |
+|---|---|
+| `yuzu-linux-x64.tar.gz`, `yuzu-gateway-linux-x64.tar.gz`, `yuzu-agent-windows-x64.zip`, `yuzu-agent-macos-arm64.tar.gz` | same names as before: `<archive without .tar.gz/.zip>.{cdx,spdx}.json` |
+| each `.deb` and `.rpm` | new: the package name without `.deb`/`.rpm`, e.g. `yuzu-agent_X.Y.Z_amd64.cdx.json`, `yuzu-server-X.Y.Z-1.x86_64.spdx.json` |
+| `YuzuAgentSetup-X.Y.Z.exe` | new: `YuzuAgentSetup-X.Y.Z.{cdx,spdx}.json`, listing the files the installer packs, as the Inno Setup compiler's own manifest names them, at their paths in the build directory (not where they are installed) |
+| `YuzuAgent-X.Y.Z-macos-arm64.pkg` | new: `YuzuAgent-X.Y.Z-macos-arm64.{cdx,spdx}.json` |
+| container images | unchanged names; now made with the same syft version (v1.57.2), and marked incomplete where the image holds what the scan cannot list |
+
+Each SBOM names its file and records its SHA-256, and lists the vcpkg libraries its C++ binaries are built with (version, licence, upstream purl, CPE where NVD has one), the gateway's Erlang/OTP release, and what syft recognises in the file. A pre-release uses the pre-release package names (`yuzu-agent_X.Y.Z-rcN_amd64.cdx.json`, `YuzuAgentSetup-X.Y.Z_rcN.cdx.json`).
+
+**Who is affected.** Anyone who imports the release SBOMs into a dependency scanner or an asset inventory (Dependency-Track, grype, a procurement portal), and anyone who downloads them by name.
+
+**What to do.**
+- Re-baseline scanner findings on the first release with the new SBOMs: the component set changes completely (thousands of workspace entries disappear; the shipped OpenSSL, libpq and other vcpkg libraries appear at their real versions), so findings appear and close that did not change in the product.
+- To describe a package or the installer, use its own SBOM rather than the archive's.
+- Check any script that reads the release's SBOMs. One that downloads every `*.cdx.json` or `*.spdx.json` now gets one pair per asset plus the image SBOMs, not one pair per platform; one that picks a platform's SBOM by name keeps working for the four archives only. Select an asset's SBOM by its stem (the asset's file name without `.tar.gz`, `.zip`, `.deb`, `.rpm`, `.exe` or `.pkg`; image SBOMs end in `-image`), and confirm the pair is that asset's by comparing the SHA-256 on its root (CycloneDX `metadata.component.hashes`, the SPDX described package's `checksums`) with the file's. A script that counted components, or looked for a workspace path, will see far fewer: the SBOM lists the file's contents now. A script that needs to know whether an SBOM is complete reads its `yuzu:sbom:incomplete-reasons` note (or the marker itself: the CycloneDX `compositions` entry, the SPDX `CONTAINS NOASSERTION` relationship), not the component count. Every `yuzu:sbom:` note has the same key in both formats: in CycloneDX it is the `metadata.properties` entry of that name, and in SPDX it is the line of the described package's `comment` that starts with the key, a colon and a space (`yuzu:sbom:incomplete-reasons: erts-static`), so a script that reads only CycloneDX properties finds nothing in an SPDX file. "Reading the `yuzu:sbom:` notes" in [Release verification](release-verification.md) section 5 gives a command for each format. No note means no marker; SBOMs of earlier releases carry neither notes nor marker.
+- Read "What a file's SBOM lists" and "What to expect from a dependency scanner" in [Release verification](release-verification.md) section 5 for what is not listed yet (vendored code in `yuzu-server`, the installer's InnoSetup runtime, what the gateway's Erlang emulator vendors, operating-system libraries) and how an SBOM marks itself incomplete, with the closed list of reason tokens.
+
 ## Behaviour change: verifying a release's provenance needs GitHub CLI 2.102.0 or later
 
 **What changed.** The `gh attestation verify` commands on [Release Verification](release-verification.md) now pin the attestation to `release.yml` at the release's tag (`--signer-workflow`, `--source-ref`). GitHub CLI versions before 2.102.0 do not enforce those flags as written, so the page now requires `gh` 2.102.0 or later, and its end-to-end verification script exits 1, before checking anything, when `gh` is older or reports a version it cannot read.
@@ -295,7 +317,7 @@ The top-level directory inside each archive is renamed the same way (`yuzu-agent
 - If you run the server on Windows or macOS, follow "Moving a Windows or macOS server to Linux" in [Server Administration](server-admin.md): the old server's data cannot be carried over, so you deploy a new Linux server (the container image or the Linux packages), enroll agents with it as new installations, and delete the old server's leftover files, which hold secrets.
 - Do not unpack the new agent archive over a directory a server still runs from.
 
-**Known limitations.** The Windows and macOS SBOMs are generated from the whole build workspace, so they can list components the archive does not ship or load; a dependency scan of an SBOM can therefore report components the agent does not use. (From the release that carries ADR-0035 step 3 the Windows archive no longer contains the server's DLLs such as `libpq.dll`.)
+**Known limitations (releases before the per-file SBOMs).** In the releases this entry first applied to, the Windows and macOS SBOMs were generated from the whole build workspace, so they can list components the archive does not ship or load; a dependency scan of one of those SBOMs can therefore report components the agent does not use. (From the release that carries ADR-0035 step 3 the Windows archive no longer contains the server's DLLs such as `libpq.dll`.) From the release that describes each shipped file (the "release SBOMs describe each shipped file" entry above), each SBOM lists only its own file's contents, and one whose file holds something it does not list is marked incomplete and names why in its `yuzu:sbom:incomplete-reasons` note (see that entry). The workspace SBOMs of the earlier releases carry no such marker, so a missing marker there says nothing about completeness.
 
 ## ⚠️ Breaking: role removal, engine-role assignment, management-group member and role routes and the OTA package delete refuse a control byte
 
