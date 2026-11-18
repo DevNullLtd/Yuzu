@@ -5323,7 +5323,9 @@ Create a new policy fragment from YAML.
 
 **Response (409):** Returned when a fragment with the same `name` already exists. Body is `{"error": "policy fragment named '<name>' already exists"}`. Audit event recorded as `policy_fragment.create / denied / duplicate_name`. Choose a different name (existing fragments are immutable on rename).
 
-**Response (503):** Policy store not yet initialized, or a genuine internal store failure on the write (safe to retry — distinct from the 400/409 rejections above, and the internal error string is never included in the body).
+**Response (400), refused instruction:** a fragment whose `check`, `fix` or `postCheck` instruction names an action policy evaluation will not dispatch (an execute gate, a destructive or reserved action, or one the server cannot classify) is refused before it is stored. Body is `{"error":{"code":400,"message":"instruction <id> names an action that policy evaluation does not dispatch (<reason>)"},"meta":{"api_version":"v1"}}`, where `<reason>` is the token listed under `GET /api/compliance/{policy_id}`. Audit event `policy_fragment.create / denied`, detail `reason=<reason> instruction=<id>`. The check is advisory: an instruction that does not exist yet is accepted, and the dispatch check is the control.
+
+**Response (503):** Policy store not yet initialized, or a genuine internal store failure on the write (safe to retry — distinct from the 400/409 rejections above, and the internal error string is never included in the body). Also `503` with message `instruction lookup unavailable, try again` when the instruction store cannot answer the refused-instruction check; the fragment is never accepted in that case.
 
 ---
 
@@ -5442,7 +5444,9 @@ Create a new policy from YAML.
 
 **Response (400):** YAML missing required fields, unknown `fragment_id`, invalid scope expression, or an explicit `id` that is longer than 128 characters, holds a character other than letters, digits, `.`, `_` and `-`, or consists only of dots. Also `400` (#2123): a `spec.scope.selector.tags` or `managementGroups` list the server cannot read as written — an inline `[ ]` list that does not close on its own line, a `- item` line out of line with the list's other items (including one indented to `selector:`'s own column), a line missing its `- `, an item continued on the next line, an empty-string item, a single value where a list is expected, list lines written after a value on the key line (`tags: null` or `tags: [a]` followed by `- prod`), or a list followed directly by an outer list's next item — and a `managementGroups` entry that is not a management group id (ids are letters, digits and `_ . : * -`). The reason names the field and, except for a `- item` outside `selector:` (which names `spec.scope`), the entry. Body is `{"error": "<reason>"}`.
 
-**Response (503):** A genuine internal store failure on the write — safe to retry, and the internal error string is never included in the body.
+**Response (400), refused instruction:** when the policy's fragment names an instruction policy evaluation will not dispatch, the create is refused with the same body as `POST /api/policy-fragments` (`{"error":{"code":400,"message":"instruction <id> names an action that policy evaluation does not dispatch (<reason>)"},"meta":{"api_version":"v1"}}`) and audited `policy.create / denied`, detail `reason=<reason> instruction=<id>`. A fragment that does not exist yet is left to the store's own check below.
+
+**Response (503):** A genuine internal store failure on the write — safe to retry, and the internal error string is never included in the body. Also `503` with message `instruction lookup unavailable, try again` when the refused-instruction check cannot be answered.
 
 ---
 
@@ -5475,6 +5479,7 @@ Get policy detail including compliance summary.
     "unknown": 5,
     "fixing": 1,
     "error": 0,
+    "blocked": 0,
     "total": 51
   }
 }
@@ -5512,9 +5517,9 @@ Enable a previously disabled policy.
 }
 ```
 
-**Response (400):** `policy not found`. **Response (503):** a genuine internal
+**Response (400):** `policy not found`. **Response (400), refused instruction:** enabling is where a policy starts to run, so the same refused-instruction check runs here (a policy installed by a product pack was never checked at install); same body as `POST /api/policy-fragments`, audited `policy.enable / denied`, detail `reason=<reason> instruction=<id>`. **Response (503):** a genuine internal
 store failure on the write — safe to retry, internal error string never
-included in the body.
+included in the body; also `503` with message `instruction lookup unavailable, try again` when the refused-instruction check cannot be answered.
 
 ---
 
@@ -5749,6 +5754,7 @@ top-level fields (not nested under a `"policy"` key), A4-enveloped. MCP twin:
       "unknown": 5,
       "fixing": 1,
       "error": 0,
+      "blocked": 0,
       "total": 51
     }
   },
@@ -5780,7 +5786,8 @@ Fleet compliance summary across all active policies.
   "non_compliant": 8,
   "unknown": 5,
   "fixing": 2,
-  "error": 0
+  "error": 0,
+  "blocked": 0
 }
 ```
 
@@ -5806,6 +5813,7 @@ Per-policy compliance detail with per-agent statuses.
     "unknown": 5,
     "fixing": 1,
     "error": 0,
+    "blocked": 0,
     "total": 51
   },
   "agents": [
@@ -5819,6 +5827,8 @@ Per-policy compliance detail with per-agent statuses.
   ]
 }
 ```
+
+`blocked` counts devices whose check or fix policy evaluation refused to dispatch, because the instruction names an action with an execute gate, a destructive or reserved action, or one the server cannot classify (see "Action approval and the `blocked` status" in the policy engine manual). It counts as failing, nothing was sent, and the other routes in this section carry the same field. For a `blocked` device `check_result` is not agent output but a JSON string the server wrote: `{"phase":"check","result":"blocked","reason":"gated","plugin":"content_dist","action":"execute_staged"}`. `phase` is `check`, `fix` or `verify`; `reason` is one of `unclassified`, `ambiguous`, `gated`, `destructive`, `reserved`, `unwired` and `dispatch_identifier_invalid`; `plugin` and `action` are `null` when the refused pair was not a well formed identifier (the reason is then `dispatch_identifier_invalid`).
 
 **Response (503):** `policy store degraded`, on either the summary or the
 per-agent-status read.
@@ -5843,7 +5853,8 @@ MCP twin: `get_fleet_compliance`.
     "non_compliant": 8,
     "unknown": 5,
     "fixing": 2,
-    "error": 0
+    "error": 0,
+    "blocked": 0
   },
   "meta": { "api_version": "v1" }
 }
@@ -5878,6 +5889,7 @@ the store's unfiltered fleet-wide aggregate. MCP twin: `get_policy_agent_statuse
       "unknown": 5,
       "fixing": 1,
       "error": 0,
+      "blocked": 0,
       "total": 51
     },
     "agents": [
