@@ -3949,7 +3949,7 @@ groups:
             clear the revocation before re-provisioning can succeed.
           runbook_url: "https://docs.yuzu.io/runbooks/ca-reissue-blocked"
 
-      # WP01: agent re-registration proof-of-identity rollout (--agent-reregistration-proof).
+      # WP01: agent re-registration proof-of-identity modes (--agent-reregistration-proof).
       # `audit` (the default) ADMITS what `enforce` would refuse; these rules
       # are the soak criterion for switching to enforce. All series are seeded to 0 at boot.
       - alert: YuzuAgentReregistrationWouldRefuse
@@ -4018,6 +4018,19 @@ groups:
             expired, revoked, already_consumed). An operator minted the wrong kind of token
             (re-enrolment needs max_uses 1), an agent is retrying a spent token, or someone is
             guessing tokens.
+          runbook_url: "https://docs.yuzu.io/runbooks/agent-reregistration-proof"
+
+      - alert: YuzuAgentReregistrationAuditWriteFailed
+        expr: |
+          sum by (job, instance) (increase(yuzu_register_reregistration_audit_write_failures_total[15m])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Re-registration audit rows could not be written"
+          description: >-
+            An agent.reregistration_unproven or agent.reregistration_refused audit row was not
+            written (reason store_unavailable or write_failed). Absence of a row is not proof that
+            nothing happened: the authoritative count is yuzu_register_reregistration_total.
           runbook_url: "https://docs.yuzu.io/runbooks/agent-reregistration-proof"
 
       - alert: YuzuAgentLeafSupersedeFailed

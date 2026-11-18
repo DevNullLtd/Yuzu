@@ -10909,11 +10909,103 @@ tests:
       - {expr: 'ALERTS{alertname="YuzuAgentReenrolTokenRefusedBurst", alertstate="firing", instance="s2"}', eval_time: 20m, exp_samples: []}
       - {expr: 'count(ALERTS{alertname="YuzuAgentReenrolTokenRefusedBurst", alertstate="firing", instance="s1"})', eval_time: 30m, exp_samples: [{labels: '{}', value: 1}]}
   - interval: 1m
-    name: mixed modes for less than 10 minutes do not fire (for:10m holds)
+    name: mixed modes - for:10m holds exactly (quiet at 9m, firing from 11m, severity warning)
     input_series:
       - {series: 'yuzu_server_agent_reregistration_proof_mode{job="yuzu",instance="s1",mode="audit"}', values: "1+0x30"}
       - {series: 'yuzu_server_agent_reregistration_proof_mode{job="yuzu",instance="s1",mode="enforce"}', values: "0+0x30"}
-      - {series: 'yuzu_server_agent_reregistration_proof_mode{job="yuzu",instance="s2",mode="audit"}', values: "0 0 0 0 0 0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1"}
-      - {series: 'yuzu_server_agent_reregistration_proof_mode{job="yuzu",instance="s2",mode="enforce"}', values: "1 1 1 1 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"}
+      - {series: 'yuzu_server_agent_reregistration_proof_mode{job="yuzu",instance="s2",mode="audit"}', values: "0+0x30"}
+      - {series: 'yuzu_server_agent_reregistration_proof_mode{job="yuzu",instance="s2",mode="enforce"}', values: "1+0x30"}
     promql_expr_test:
-      - {expr: 'ALERTS{alertname="YuzuAgentReregistrationModeMixed", alertstate="firing"}', eval_time: 12m, exp_samples: []}
+      - {expr: 'ALERTS{alertname="YuzuAgentReregistrationModeMixed", alertstate="firing"}', eval_time: 9m, exp_samples: []}
+      - expr: 'ALERTS{alertname="YuzuAgentReregistrationModeMixed", alertstate="firing"}'
+        eval_time: 11m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuAgentReregistrationModeMixed", alertstate="firing", job="yuzu", severity="warning"}'
+            value: 1
+
+  # WP01 Gate 8 pass 3: exact-value cases. Every counter starts at 0 and steps once, so increase() is
+  # exact (no extrapolation) and each window / threshold / severity / alternative mutant changes the
+  # verdict.
+  - interval: 1m
+    name: would-refuse - single step fires within 1h only, severity warning, every alternative
+    input_series:
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="a",path="direct",outcome="no_proof",mode="audit"}', values: "0x10 1 1x150"}
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="b",path="direct",outcome="unattested_gateway",mode="audit"}', values: "0x10 1 1x150"}
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="c",path="direct",outcome="revoked_identity",mode="audit"}', values: "0x10 1 1x150"}
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="d",path="direct",outcome="lookup_failed",mode="audit"}', values: "0x10 1 1x150"}
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="e",path="direct",outcome="proven_by_leaf",mode="audit"}', values: "0x10 1 1x150"}
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuAgentReregistrationWouldRefuse", alertstate="firing"}'
+        eval_time: 25m
+        exp_samples:
+          - {labels: 'ALERTS{alertname="YuzuAgentReregistrationWouldRefuse", alertstate="firing", instance="a", job="yuzu", severity="warning"}', value: 1}
+          - {labels: 'ALERTS{alertname="YuzuAgentReregistrationWouldRefuse", alertstate="firing", instance="b", job="yuzu", severity="warning"}', value: 1}
+          - {labels: 'ALERTS{alertname="YuzuAgentReregistrationWouldRefuse", alertstate="firing", instance="c", job="yuzu", severity="warning"}', value: 1}
+          - {labels: 'ALERTS{alertname="YuzuAgentReregistrationWouldRefuse", alertstate="firing", instance="d", job="yuzu", severity="warning"}', value: 1}
+      - {expr: 'ALERTS{alertname="YuzuAgentReregistrationWouldRefuse", alertstate="firing"}', eval_time: 100m, exp_samples: []}
+
+  - interval: 1m
+    name: enforce refusals - each alternative fires per instance at warning, window 15m, exact threshold
+    input_series:
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="a",path="direct",outcome="no_proof",mode="enforce"}', values: "0x10 1 1x60"}
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="b",path="direct",outcome="unattested_gateway",mode="enforce"}', values: "0x10 1 1x60"}
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="c",path="direct",outcome="revoked_identity",mode="enforce"}', values: "0x10 1 1x60"}
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="d",path="direct",outcome="no_proof",mode="audit"}', values: "0x10 1 1x60"}
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="e",path="direct",outcome="proven_by_leaf",mode="enforce"}', values: "0x10 1 1x60"}
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuAgentReregistrationRefused", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples:
+          - {labels: 'ALERTS{alertname="YuzuAgentReregistrationRefused", alertstate="firing", instance="a", job="yuzu", severity="warning"}', value: 1}
+          - {labels: 'ALERTS{alertname="YuzuAgentReregistrationRefused", alertstate="firing", instance="b", job="yuzu", severity="warning"}', value: 1}
+          - {labels: 'ALERTS{alertname="YuzuAgentReregistrationRefused", alertstate="firing", instance="c", job="yuzu", severity="warning"}', value: 1}
+      - {expr: 'ALERTS{alertname="YuzuAgentReregistrationRefused", alertstate="firing"}', eval_time: 40m, exp_samples: []}
+
+  - interval: 1m
+    name: enforce lookup_failed - critical, enforce only, window 10m
+    input_series:
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="a",path="direct",outcome="lookup_failed",mode="enforce"}', values: "0x10 1 1x60"}
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="b",path="direct",outcome="lookup_failed",mode="audit"}', values: "0x10 1 1x60"}
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="c",path="direct",outcome="no_proof",mode="enforce"}', values: "0x10 1 1x60"}
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuAgentReregistrationLookupFailed", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - {labels: 'ALERTS{alertname="YuzuAgentReregistrationLookupFailed", alertstate="firing", instance="a", job="yuzu", severity="critical"}', value: 1}
+      - {expr: 'ALERTS{alertname="YuzuAgentReregistrationLookupFailed", alertstate="firing"}', eval_time: 30m, exp_samples: []}
+
+  - interval: 1m
+    name: token refusal burst - exact boundary (4 and 5 refusals quiet, 6 fires), window 15m, per instance
+    input_series:
+      - {series: 'yuzu_register_reenrol_token_refused_total{job="yuzu",instance="a",reason="multi_use_token"}', values: "0x5 1 2 3 4 4x60"}
+      - {series: 'yuzu_register_reenrol_token_refused_total{job="yuzu",instance="b",reason="not_found"}', values: "0x5 1 2 3 4 5 5x60"}
+      - {series: 'yuzu_register_reenrol_token_refused_total{job="yuzu",instance="c",reason="expired"}', values: "0x5 1 2 3 4 5 6 6x60"}
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuAgentReenrolTokenRefusedBurst", alertstate="firing"}'
+        eval_time: 14m
+        exp_samples:
+          - {labels: 'ALERTS{alertname="YuzuAgentReenrolTokenRefusedBurst", alertstate="firing", instance="c", job="yuzu", severity="warning"}', value: 1}
+      - {expr: 'ALERTS{alertname="YuzuAgentReenrolTokenRefusedBurst", alertstate="firing"}', eval_time: 60m, exp_samples: []}
+
+  - interval: 1m
+    name: supersede failed - single step fires within 1h at warning, quiet after
+    input_series:
+      - {series: 'yuzu_server_ca_supersede_failed_total{job="yuzu",instance="a"}', values: "0x10 1 1x150"}
+      - {series: 'yuzu_server_ca_superseded_leaf_total{job="yuzu",instance="b"}', values: "0x10 1 1x150"}
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuAgentLeafSupersedeFailed", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples:
+          - {labels: 'ALERTS{alertname="YuzuAgentLeafSupersedeFailed", alertstate="firing", instance="a", job="yuzu", severity="warning"}', value: 1}
+      - {expr: 'ALERTS{alertname="YuzuAgentLeafSupersedeFailed", alertstate="firing"}', eval_time: 100m, exp_samples: []}
+
+  - interval: 1m
+    name: audit write failures fire at warning and stay quiet after the window
+    input_series:
+      - {series: 'yuzu_register_reregistration_audit_write_failures_total{job="yuzu",instance="a",reason="store_unavailable"}', values: "0x10 1 1x60"}
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuAgentReregistrationAuditWriteFailed", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples:
+          - {labels: 'ALERTS{alertname="YuzuAgentReregistrationAuditWriteFailed", alertstate="firing", instance="a", job="yuzu", severity="warning"}', value: 1}
+      - {expr: 'ALERTS{alertname="YuzuAgentReregistrationAuditWriteFailed", alertstate="firing"}', eval_time: 40m, exp_samples: []}
