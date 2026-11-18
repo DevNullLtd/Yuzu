@@ -283,9 +283,10 @@ ReadFailure describe_read_error(ReadError e, Surface surface) {
         return f;
     case ReadError::kBusy:
         // The store is fine and nothing was read: no domain audit row on either transport (the
-        // `yuzu_hardware_ci_read_busy_total` counter is the evidence), so a flood of refused
-        // requests cannot become a flood of audit INSERTs on the shared pool. `audit_detail` is
-        // the text of MCP's one generic row.
+        // `yuzu_hardware_ci_read_busy_total` counter is the evidence). REST writes no row; MCP
+        // writes exactly one generic best-effort row per refused call, so a busy refusal is
+        // cheaper than a served read but not free on the audit path. `audit_detail` is the text
+        // of MCP's one generic row.
         f.unavailable = true;
         f.retry_after_ms = kBusyRetryAfterMs;
         f.retry_after_header = true;

@@ -5694,6 +5694,9 @@ public:
         // Always constructed, so the routes and the MCP tools are never handed a null: an invalid
         // explicit value refuses boot and, defensively, leaves the tightest cap (1).
         {
+            // Config::hardware_ci_read_concurrency's default and kBulkReadCapUnset are two
+            // spellings of one value (Config is not a literal type, so a unit test pins it:
+            // test_bulk_read_slots.cpp).
             const int effective_pool =
                 cfg_.postgres_pool_size > 0 ? cfg_.postgres_pool_size : 16;
             const auto cap =

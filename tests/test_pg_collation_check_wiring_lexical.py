@@ -95,6 +95,13 @@ Invariants:
      green); the `hardware_ci_read_slots_` member is declared before `hardware_routes_` and
      `mcp_server_`, which borrow it; the boot resolution (`resolve_bulk_read_cap(`) is called once
      and its refusal arm sets `startup_failed_` and still constructs the slots object.
+  18. The busy counter is wired at both consumers: `.ci_read_busy_fn = hw_ci_read_busy_fn` (the
+     hardware routes' Deps) and `tool_deps.ci_read_busy_fn = hw_ci_read_busy_fn` (the MCP tools)
+     each appear exactly once, and the closed two-value surface label
+     `surface == hardware_ci_page::Surface::kMcp ? "mcp" : "rest"` is present (a dropped wire
+     leaves `yuzu_hardware_ci_read_busy_total` flat while the 503s still flow). The label
+     check reads the RAW source, because normalisation blanks string literals; it is best effort
+     against a comment, which the structural half (blanked literals) still guards.
 
 `//` and block comments are stripped and whitespace collapsed before matching; string and
 character literals are blanked first so a token in a literal cannot satisfy or break a check, and
@@ -594,6 +601,62 @@ class HardwareCiReadSlotsWiring(unittest.TestCase):
         j = self.src.index("startup_failed_ = true;", i)
         m = self.src[:j] + "(void)0;" + self.src[j + len("startup_failed_ = true;"):]
         self.assertIn(MSG_SLOTS_REFUSE, slots_problems(m))
+
+
+BUSY_REST_WIRE = ".ci_read_busy_fn = hw_ci_read_busy_fn,"
+BUSY_MCP_WIRE = "tool_deps.ci_read_busy_fn = hw_ci_read_busy_fn;"
+BUSY_LABEL_NORM = 'surface == hardware_ci_page::Surface::kMcp ? "" : ""'
+BUSY_LABEL_RAW = 'surface == hardware_ci_page::Surface::kMcp ? "mcp" : "rest"'
+MSG_BUSY_REST_WIRE = ("the hardware routes' Deps is not handed `hw_ci_read_busy_fn` exactly once as "
+                      "`.ci_read_busy_fn` (the busy counter would never move)")
+MSG_BUSY_MCP_WIRE = ("the MCP ToolDeps is not handed `hw_ci_read_busy_fn` exactly once as "
+                     "`tool_deps.ci_read_busy_fn` (the busy counter would never move)")
+MSG_BUSY_LABEL = ("the busy counter's closed surface label ternary "
+                  "`surface == hardware_ci_page::Surface::kMcp ? \"mcp\" : \"rest\"` is missing")
+
+
+def busy_problems(src):
+    """Wiring of the bulk read busy counter (invariant 18)."""
+    t = normalise(src)
+    out = []
+    if len(re.findall(re.escape(BUSY_REST_WIRE), t)) != 1:
+        out.append(MSG_BUSY_REST_WIRE)
+    if len(re.findall(re.escape(BUSY_MCP_WIRE), t)) != 1:
+        out.append(MSG_BUSY_MCP_WIRE)
+    if len(re.findall(re.escape(BUSY_LABEL_NORM), t)) != 1 or BUSY_LABEL_RAW not in src:
+        out.append(MSG_BUSY_LABEL)
+    return out
+
+
+class HardwareCiReadBusyWiring(unittest.TestCase):
+    def setUp(self):
+        self.src = SERVER_CPP.read_text(encoding="utf-8")
+
+    def test_clean(self):
+        self.assertEqual(busy_problems(self.src), [])
+
+    def test_rest_wire_dropped(self):
+        m = self.src.replace(BUSY_REST_WIRE, ".ci_read_busy_fn = nullptr,", 1)
+        self.assertNotEqual(m, self.src)
+        self.assertIn(MSG_BUSY_REST_WIRE, busy_problems(m))
+
+    def test_mcp_wire_dropped_or_doubled(self):
+        m = self.src.replace(BUSY_MCP_WIRE, "(void)0;", 1)
+        self.assertNotEqual(m, self.src)
+        self.assertIn(MSG_BUSY_MCP_WIRE, busy_problems(m))
+        m = self.src.replace(BUSY_MCP_WIRE, BUSY_MCP_WIRE + "\n" + BUSY_MCP_WIRE, 1)
+        self.assertIn(MSG_BUSY_MCP_WIRE, busy_problems(m))
+
+    def test_wire_inside_if_0_does_not_count(self):
+        m = self.src.replace(BUSY_MCP_WIRE, "\n#if 0\n" + BUSY_MCP_WIRE + "\n#endif\n", 1)
+        self.assertIn(MSG_BUSY_MCP_WIRE, busy_problems(m))
+
+    def test_label_ternary_changed(self):
+        m = self.src.replace(BUSY_LABEL_RAW, 'surface == hardware_ci_page::Surface::kMcp ? "mcp" : "other"', 1)
+        self.assertNotEqual(m, self.src)
+        self.assertIn(MSG_BUSY_LABEL, busy_problems(m))
+        m = self.src.replace(BUSY_LABEL_RAW, "std::string{}", 1)
+        self.assertIn(MSG_BUSY_LABEL, busy_problems(m))
 
 
 class PgCollationCheckWiring(unittest.TestCase):

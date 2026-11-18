@@ -2457,7 +2457,7 @@ TEST_CASE("bulk read cap: a saturated cap is a retryable 503 with Retry-After on
     CHECK(body["error"]["remediation"].get<std::string>().find("one page at a time") != std::string::npos);
     CHECK(res->body.find("SN-a") == std::string::npos);
     CHECK(t.ci_store.reads == 0);
-    // Nothing was read, so nothing is audited: a busy flood must not become an INSERT flood.
+    // Nothing was read, so nothing is audited: a busy refusal writes no row on REST (MCP writes one generic row, see the MCP test).
     CHECK(t.domain_rows.empty());
     CHECK(t.generic_rows.empty());
     CHECK(res->get_header_value("Sec-Audit-Failed").empty());
@@ -2571,8 +2571,27 @@ TEST_CASE("bulk read cap: REST and MCP draw on the one shared slot object",
     };
     std::unique_ptr<httplib::Response> rest_res;
     std::thread rest([&] { rest_res = t.sink.Get("/api/v1/hardware-ci"); });
-    while (!parked.load())
+    // Release the parked read and join on every path (a failing REQUIRE below must not leave a
+    // joinable std::thread to terminate the process).
+    struct Guard {
+        std::atomic<bool>& release;
+        std::thread& th;
+        ~Guard() {
+            release = true;
+            if (th.joinable())
+                th.join();
+        }
+    } guard{release, rest};
+    bool parked_in_time = true;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{10};
+    while (!parked.load()) {
+        if (std::chrono::steady_clock::now() > deadline) {
+            parked_in_time = false;
+            break;
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds{2});
+    }
+    REQUIRE(parked_in_time);
     const json mcp_busy = t.call("list_hardware_ci_records");
     release = true;
     rest.join();

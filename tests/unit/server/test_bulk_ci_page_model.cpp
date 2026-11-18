@@ -588,6 +588,9 @@ FakeStore forty_devices(std::set<std::string>& in_scope_real) {
 } // namespace
 
 static_assert(hcp::kMaxPushdownScopeIds == 10000);
+// The literal byte budgets: a silent edit of either changes the response-size bound of a surface.
+static_assert(hcp::kRestRowBudgetBytes == std::size_t{4} * 1024 * 1024);
+static_assert(hcp::kMcpRowBudgetBytes == std::size_t{1} * 1024 * 1024);
 
 // This model keeps its own copy of the push-down ceiling so it does not include the software
 // catalogue model; the two surfaces document the same figure, so a drift is a defect.
@@ -897,8 +900,8 @@ TEST_CASE("hardware ci page: every ReadError has one answer on both transports",
          "resume the old cursor); if it persists, ask an administrator to check the database "
          "collation state (see PostgreSQL collation version in server-admin.md)",
          60000, true},
-        // Busy: nothing was read, so NO domain audit row on either transport (a busy flood must
-        // not become an audit INSERT flood); the 2000 ms hint is pinned here for both surfaces
+        // Busy: nothing was read, so NO domain audit row on either transport (REST writes none;
+        // MCP writes one generic best-effort row); the 2000 ms hint is pinned here for both surfaces
         // (the CI hint script only scans newly added tools).
         {hcp::ReadError::kBusy, true,
          "hardware CI bulk read capacity in use; retry after the hint", false, "failure",

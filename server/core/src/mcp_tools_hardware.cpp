@@ -98,9 +98,10 @@ void answer_roster_unreadable(const ToolCallContext& ctx, const char* verb, cons
 
 // The bulk read was refused as busy (hardware_ci_page::ReadError::kBusy): this replica is at its
 // bulk-read cap and nothing was read. It writes ONLY the generic mcp.<tool> row, never the domain
-// row and never the two-row answer_store_unreadable: a flood of busy refusals must not become a
-// flood of audit INSERTs on the shared pool (the counter is the evidence). The error is retryable
-// with the failure table's hint.
+// row and never the two-row answer_store_unreadable. REST writes no audit row for a busy refusal;
+// MCP writes exactly one generic best-effort row per refused call and no domain row, so a busy
+// refusal is cheaper than a served read but is not free on the audit path (the counter is the
+// evidence). The error is retryable with the failure table's hint.
 void answer_read_busy(const ToolCallContext& ctx, const hardware_ci_page::ReadFailure& f) {
     const bool generic_ok = ctx.audit(std::string(f.audit_outcome), f.audit_detail);
     answer(ctx, ctx.a4_error(kInternalError, std::string(f.message), std::string(f.remediation),
@@ -239,7 +240,7 @@ void handle_list_hardware_ci_records(const ToolCallContext& ctx) {
     if (!read) {
         // ONE answer per failure, shared with REST (hardware_ci_page::describe_read_error).
         const auto f = hardware_ci_page::describe_read_error(read.error(), hardware_ci_page::Surface::kMcp);
-        if (f.unavailable && !f.domain_audit_row) {
+        if (read.error() == hardware_ci_page::ReadError::kBusy) {
             // Busy: nothing was read, so no domain row (see answer_read_busy).
             if (deps->ci_read_busy_fn)
                 deps->ci_read_busy_fn(hardware_ci_page::Surface::kMcp);

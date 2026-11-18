@@ -7,6 +7,7 @@
 // tag [bulk_read_slots]); the real-pool proof is test_hardware_ci_read_cap_pg.cpp.
 
 #include "bulk_read_slots.hpp"
+#include "yuzu/server/server.hpp" // Config
 #include "hardware_ci_page_model.hpp"
 #include "test_fake_ci_keyset_store.hpp"
 
@@ -18,6 +19,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <thread>
 #include <unordered_set>
 #include <vector>
@@ -26,6 +28,17 @@ using namespace yuzu::server;
 namespace hcp = yuzu::server::hardware_ci_page;
 using yuzu::server::pg::CollationGate;
 using namespace std::chrono_literals;
+
+static_assert(!std::is_copy_constructible_v<BulkReadSlots>);
+static_assert(!std::is_copy_assignable_v<BulkReadSlots>);
+static_assert(!std::is_copy_constructible_v<BulkReadSlots::Slot>);
+static_assert(!std::is_copy_assignable_v<BulkReadSlots::Slot>);
+static_assert(std::is_nothrow_move_constructible_v<BulkReadSlots::Slot>);
+
+TEST_CASE("bulk read cap: the Config default is the resolver's unset sentinel", "[bulk_read_slots]") {
+    // Config is not a literal type, so this cannot be a static_assert.
+    CHECK(yuzu::server::Config{}.hardware_ci_read_concurrency == kBulkReadCapUnset);
+}
 
 namespace {
 

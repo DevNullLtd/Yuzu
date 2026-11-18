@@ -4,8 +4,9 @@
 /// The concurrency cap on the bulk device-CI read (`GET /api/v1/hardware-ci` and its MCP twin).
 ///
 /// WHY. One page is `limit + 1` rows read in a single transaction on a pooled Postgres connection
-/// (up to 5 s). The pool is shared by authorization (RbacStore), the access audit (AuditStore),
-/// every other store and AuthDB. A burst of bulk reads that holds the pool saturated makes the
+/// (normally bounded by the statement timeout; a stalled connection can hold a slot longer). The
+/// pool is shared by authorization (RbacStore), the access audit (AuditStore), every other store
+/// and AuthDB. A burst of bulk reads that holds the pool saturated makes the
 /// pool's bounded acquires fail fast, so an unrelated authorised request and the audit row that
 /// every served read needs both lose their connection (#7949). This cap bounds how many pool
 /// connections the bulk read can hold at one instant; it is NOT a reserve, and it does not bound
@@ -120,9 +121,10 @@ struct BulkReadCapResolution {
 /// value, not the flag's raw one), or the boot refusal text.
 ///  - Unset: `min(2, max(1, pool / 4))`. Pool 1, 2 and 4 get 1 (the HA rig boots with
 ///    `--postgres-pool-size 2` and must still boot); pool 8 and above get 2.
-///  - Explicit: must be in [1, kMaxBulkReadSlots] and at most `max(1, pool / 2)`, so that at least
-///    half of the pool (and always at least one connection at pool 1) stays for authorization,
-///    audit and every other reader. Anything else is refused.
+///  - Explicit: must be in [1, kMaxBulkReadSlots] and at most `max(1, pool / 2)`: bulk reads may
+///    hold at most half of the pool (rounded down, minimum one connection; the whole pool at pool
+///    size 1). This is a cap, not a reserve: other traffic can still exhaust the pool. Anything
+///    else is refused.
 /// Pure, so the arithmetic is unit tested without a server.
 [[nodiscard]] inline std::expected<BulkReadCapResolution, std::string>
 resolve_bulk_read_cap(int configured, int pool_size) {
@@ -137,9 +139,8 @@ resolve_bulk_read_cap(int configured, int pool_size) {
         return std::unexpected("--hardware-ci-read-concurrency " + std::to_string(configured) +
                                " is above " + std::to_string(ceiling) + ", half of the " +
                                std::to_string(pool) +
-                               "-connection Postgres pool (--postgres-pool-size): at least half "
-                               "of the pool must stay free for authorization and audit writes; "
-                               "lower it or raise --postgres-pool-size");
+                               "-connection Postgres pool (--postgres-pool-size): bulk reads may hold "
+                               "at most half of the pool; lower it or raise --postgres-pool-size");
     return BulkReadCapResolution{configured, false};
 }
 

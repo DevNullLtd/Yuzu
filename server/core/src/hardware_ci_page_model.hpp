@@ -178,8 +178,10 @@ struct Page {
 ///  - `kBusy`: every bulk-read slot (`bulk_read_slots.hpp`) was taken for the whole bounded wait.
 ///    A 503 with `retry_after_ms` `kBusyRetryAfterMs` and a `Retry-After` header, never an empty
 ///    page and not `kDegraded` (the store is fine, this replica is at its read cap). Nothing was
-///    read, so it writes NO domain audit row (a busy flood must not become an audit INSERT flood
-///    on the shared pool); the `yuzu_hardware_ci_read_busy_total` counter is the evidence.
+///    read, so it writes NO domain audit row. REST writes no row at all; MCP writes exactly one
+///    generic best-effort row per refused call, so a busy refusal is cheaper than a served read
+///    but is not free on the audit path. The `yuzu_hardware_ci_read_busy_total` counter is the
+///    evidence.
 ///  - `kCount`: NOT an error. A sentinel one past the last real enumerator, so a test can walk
 ///    every value and a `static_assert` can tie a table to the enumerator count; it is answered
 ///    like any out-of-range value. A new enumerator MUST be inserted BEFORE it: the
@@ -195,6 +197,8 @@ enum class ReadError {
 };
 
 /// The REST `retry_after_ms` (and, rounded to seconds, `Retry-After`) and the MCP hint of `kBusy`.
+/// Derivation: the 500 ms slot wait plus one typical page read. A slot can be held up to the store
+/// call's own bounds, so 2 s is a typical-contention hint, not a guarantee.
 inline constexpr std::int64_t kBusyRetryAfterMs = 2000;
 
 /// Wire message for a refused request: the cursor messages above, and for `kScopeTooWide` the

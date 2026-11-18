@@ -95,6 +95,20 @@ class BlockedReaders {
     std::atomic<int> holding_{0};
 };
 
+// Unwinds a test safely when a REQUIRE fails with reader threads still parked: release the readers
+// first (they wait on a condition variable), then join every thread. Declare it AFTER the threads
+// vector and the BlockedReaders so it is destroyed first. std::thread only (never std::jthread).
+struct JoinGuard {
+    BlockedReaders& readers;
+    std::vector<std::thread>& threads;
+    ~JoinGuard() {
+        readers.release();
+        for (auto& t : threads)
+            if (t.joinable())
+                t.join();
+    }
+};
+
 AuditEvent a_row() {
     AuditEvent e;
     e.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
@@ -124,6 +138,7 @@ TEST_CASE("bulk read cap [control]: with no cap, bulk readers equal to the pool 
 
     BlockedReaders readers{pool};
     std::vector<std::thread> threads;
+    JoinGuard guard{readers, threads};
     for (int i = 0; i < kPool; ++i)
         threads.emplace_back([&] {
             (void)hcp::read_page(readers.reader(), {}, std::nullopt, nullptr, /*slots=*/nullptr, hcp::kRestRowBudgetBytes);
@@ -158,8 +173,9 @@ TEST_CASE("bulk read cap: a saturated cap leaves connections for authorization a
     BlockedReaders readers{pool};
 
     // Fill the cap with readers that hold real connections.
-    std::vector<std::thread> threads;
     std::vector<std::optional<hcp::ReadError>> outcome(kPool);
+    std::vector<std::thread> threads;
+    JoinGuard guard{readers, threads}; // after everything the reader threads touch
     auto run_reader = [&](int i) {
         const auto page = hcp::read_page(readers.reader(), {}, std::nullopt, nullptr, &slots, hcp::kRestRowBudgetBytes);
         if (!page)

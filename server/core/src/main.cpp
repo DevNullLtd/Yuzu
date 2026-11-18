@@ -356,8 +356,9 @@ int main(int argc, char* argv[]) {
                    "Max bulk device-CI reads (GET /api/v1/hardware-ci and the MCP "
                    "list_hardware_ci_records tool) that may hold a PostgreSQL connection at once on "
                    "this server (1-8). Default: min(2, max(1, pool/4)) for the effective "
-                   "--postgres-pool-size, logged at boot. Refused when above half the pool "
-                   "(at least 1). A read over the cap waits 500 ms, then gets a retryable 503. "
+                   "--postgres-pool-size, logged at boot. Capped at half the pool "
+                   "(rounded down, minimum 1; a higher explicit value refuses boot). A read "
+                   "over the cap waits 500 ms, then gets a retryable 503. "
                    "Fleet-wide capacity is this value x the number of server replicas.")
         ->check(CLI::Range(1, yuzu::server::kMaxBulkReadSlots))
         ->envname("YUZU_HARDWARE_CI_READ_CONCURRENCY");
