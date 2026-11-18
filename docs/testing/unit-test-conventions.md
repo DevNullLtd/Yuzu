@@ -28,6 +28,12 @@ The Linux Service spark case in `test_spark_mechanism.cpp` (a private `dbus-daem
 
 `yuzu::test::open_echo_db(path)` (`tests/unit/echo_test_db.hpp`, `yuzu_echo_tests` only) opens an `EchoDatabase` that starts at the current schema version: it copies a per-process migrated template to `path` first and sets `PRAGMA synchronous=OFF` on the write connection. A fresh `EchoDatabase::open` walks the v2 to v10 ladder as separate commits (about 25 fsyncs), and the suite opens about 470 databases, which made the Windows debug leg fsync-bound and intermittently past its 180 s limit (#7135, #7872). Use it where a test wants "the state a fresh open leaves". **Keep a real `EchoDatabase::open` on a path the test prepared** for anything about the open itself or the ladder (a fresh open's own end state, an upgrade, a corrupt, busy or colliding file, the open's log lines) and for durability or crash behaviour. The helper prints to stderr and falls back to a plain open if the template cannot be built, and `echo_test_db: the migrated template is built...` fails the suite in that case.
 
+## Echo tests
+
+New and changed `tests/unit/**/test_echo*.cpp` follow [echo-test-standard.md](echo-test-standard.md): ten rules (cost and
+determinism, host dependence and honesty) and the lexical gate `tests/test_echo_test_standard_lexical.py` (meson suite `echo`) that
+checks four of them. A finding is waived only by a real `// echo-test-ok: <reason>` comment, justified in the PR.
+
 ## Route-handler tests — `TestRouteSink`
 
 For route-handler tests, `TestRouteSink` (`tests/unit/server/test_route_sink.hpp`, used by 41 files) mirrors `httplib::Server`'s parsing of the path, the query string, and an `application/x-www-form-urlencoded` body into `req.params` (query first, so query wins) — and **nothing else**: no path percent-decoding, no multipart/chunked, no duplicate headers, and none of the pre/post-routing pipeline. So a gate that moves into pre-routing leaves every sink test green. Two traps: `Post(path, body)` defaults to `application/json` and does NOT populate `req.params` (omitting the content-type silently tests a handler's fallback instead of its production branch — the #1786 false-green, re-armable), and fixtures must declare the sink **after** the route owner it registers (its handlers capture the owner's `this`). Contract pinned by `tests/unit/server/test_route_sink_harness.cpp`.
@@ -45,6 +51,13 @@ FIRST (reverse declaration order); its callback must not throw, since it can run
 mid-unwind, where a second throw would terminate. Used by `test_thread_pool.cpp`
 (releasing parked pool workers before `~ThreadPool` joins them). Promoted from
 `test_thread_pool.cpp` once a second file needed it.
+
+A call whose **return** is under test (`OpenRetryLoop::stop()`, a plugin's `shutdown()`) is the
+exception to "guard it with `ScopeExit`": a hung call cannot be unwound, because the owner's
+destructor blocks in it too. Run it through `yuzu::test::must_return_within`
+(`tests/unit/test_bounded_return.hpp`), which runs the call on the calling thread under a watchdog
+that ends the process with the call's name if the bound passes, and prints every call's elapsed
+seconds. Never `std::async` plus `wait_for` for this: the future's destructor blocks in the same call.
 
 A bounded drain is not a lifetime guarantee for a detached worker. In
 `test_guardian_outbox_send_executor.cpp`, each stalled callback owns its gate

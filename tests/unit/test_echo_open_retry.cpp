@@ -5,11 +5,13 @@
  * lines, and the stoppable retry loop.
  *
  * Nothing here sleeps or polls: the loop is driven with a zero delay and waited on through
- * futures, and the long-delay and blocked-attempt cases are woken by stop().
+ * promises, and the long-delay and blocked-attempt cases are woken by stop(). A stop() whose
+ * return is under test runs through yuzu::test::must_return_within.
  */
 
 #include "echo_open_retry.hpp"
 #include "echo_status_format.hpp"
+#include "test_bounded_return.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -30,6 +32,13 @@ using namespace std::chrono_literals;
 namespace {
 // Generous: only a hang would reach it; every wait below is released by the code under test.
 constexpr auto kBound = 30s;
+
+// Wait for a promise a worker sets. Every caller's OpenRetryLoop destructor stops and joins the
+// worker on unwind, so a failed REQUIRE here cannot leave a thread behind.
+bool signalled(std::future<void>& f) {
+    // echo-test-ok: every caller's OpenRetryLoop destructor stops and joins the worker on unwind
+    return f.wait_for(kBound) == std::future_status::ready;
+}
 
 // The refusal texts EchoDatabase::open really returns for a failure that is not a v10 migration one
 // (echo_db.cpp: the link, unresolvable-directory, unchecked, busy, unmovable-corrupt, WAL, schema
@@ -256,7 +265,7 @@ TEST_CASE("OpenRetryLoop: attempts run after each back-off until one succeeds",
             return std::chrono::milliseconds{0};
         },
         /*initial_failures=*/1);
-    REQUIRE(finished.wait_for(kBound) == std::future_status::ready);
+    REQUIRE(signalled(finished));
     loop.stop(); // joins; the thread ended on its own after the success
     // init's own try counts as failed attempt 1, so the first retry is attempt 2
     CHECK(attempts_seen == std::vector<unsigned>{2, 3, 4});
@@ -266,15 +275,25 @@ TEST_CASE("OpenRetryLoop: attempts run after each back-off until one succeeds",
 TEST_CASE("OpenRetryLoop: stop() during a long back-off returns without running an attempt",
           "[echo][open_retry]") {
     std::atomic<int> attempts{0};
+    // Declared before `loop` (see the ordering note above the first case). The loop calls delay()
+    // with its mutex held (echo_open_retry.hpp) and gives the mutex up only by entering the wait,
+    // so once this signal is seen stop() cannot set stop_ until the worker is in its back-off:
+    // the case tests what its name says. delay() is called exactly once here.
+    std::promise<void> waiting;
+    auto in_backoff = waiting.get_future();
     OpenRetryLoop loop;
     loop.start(
         [&](unsigned, const std::function<bool()>&) {
             ++attempts;
             return true;
         },
-        [](unsigned) { return std::chrono::milliseconds{std::chrono::hours{1}}; });
-    auto stopped = std::async(std::launch::async, [&] { loop.stop(); });
-    REQUIRE(stopped.wait_for(kBound) == std::future_status::ready);
+        [&](unsigned) {
+            waiting.set_value();
+            return std::chrono::milliseconds{std::chrono::hours{1}};
+        });
+    REQUIRE(signalled(in_backoff));
+    yuzu::test::must_return_within(yuzu::test::kReturnBound, "OpenRetryLoop::stop() during a long back-off",
+                                   [&] { loop.stop(); });
     CHECK(attempts.load() == 0);
     loop.stop(); // idempotent
 }
@@ -297,9 +316,9 @@ TEST_CASE("OpenRetryLoop: stop() cancels an attempt that is blocked on cancelled
             return false; // would be retried, but the loop is stopped
         },
         [](unsigned) { return std::chrono::milliseconds{0}; });
-    REQUIRE(in_attempt.wait_for(kBound) == std::future_status::ready);
-    auto stopped = std::async(std::launch::async, [&] { loop.stop(); });
-    REQUIRE(stopped.wait_for(kBound) == std::future_status::ready);
+    REQUIRE(signalled(in_attempt));
+    yuzu::test::must_return_within(yuzu::test::kReturnBound, "OpenRetryLoop::stop() of a blocked attempt",
+                                   [&] { loop.stop(); });
     CHECK(saw_cancel.load());
     CHECK(attempts.load() == 1); // no attempt after the cancel
 }
@@ -318,7 +337,7 @@ TEST_CASE("OpenRetryLoop: an attempt that throws counts as failed and the loop c
             return true;
         },
         [](unsigned) { return std::chrono::milliseconds{0}; });
-    REQUIRE(finished.wait_for(kBound) == std::future_status::ready);
+    REQUIRE(signalled(finished));
     loop.stop();
     CHECK(calls.load() == 2);
 }
@@ -331,7 +350,10 @@ TEST_CASE("OpenRetryLoop: with the default back-off the first attempt is a minut
         ++attempts;
         return true;
     });
-    auto stopped = std::async(std::launch::async, [&] { loop.stop(); });
-    REQUIRE(stopped.wait_for(kBound) == std::future_status::ready);
+    // No delay argument, so this case cannot know the worker is already waiting; the long back-off
+    // case above is the one that proves stop() wakes a wait. This one pins only the default
+    // schedule's first delay (a minute, never an attempt) and that stop() returns.
+    yuzu::test::must_return_within(yuzu::test::kReturnBound, "OpenRetryLoop::stop() with the default back-off",
+                                   [&] { loop.stop(); });
     CHECK(attempts.load() == 0);
 }

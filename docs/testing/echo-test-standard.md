@@ -1,0 +1,113 @@
+# Echo test-writing standard
+
+How to write a test under `tests/unit/**/test_echo*.cpp`. It applies to new and changed Echo tests,
+is enforced in part by a lexical gate (see [The gate](#the-gate)), and sits on top of the general
+contract in [unit-test-conventions.md](unit-test-conventions.md).
+
+Echo tests have caused most of the repeat Windows CI flakes and timeouts on the shared runners
+(#7173, #7135, #7177, #7872), so the rules below are about two things: keeping the cost of a test
+machine-independent, and keeping a test honest about the host it ran on.
+
+## Cost and determinism
+
+1. **Open a migrated template database, never build one per test.** Use `yuzu::test::open_echo_db`
+   (`tests/unit/echo_test_db.hpp`): it migrates once per process and clones the file. Per-test
+   migration DDL and per-test fsyncs are what pushed the Windows leg past its limits (f6bfa1f4d4,
+   b85549dbb3).
+2. **Seed cheaply.** Insert fixtures with a recursive CTE or in memory, not row-by-row through the
+   store's public write path, unless the write path is what is under test.
+3. **No real clock, sleep or socket wait in a unit test; inject the boundary.** Take the clock
+   (`EchoFold::NowFn`, `echo_fold.hpp`), the open path (`OpenSeams`, `echo_db.hpp`) and any OS reader
+   as a parameter and feed fixtures. Wait on a future, `std::latch`, condition variable or callback,
+   never `sleep_for` and poll. Two real-time waits are allowed, each with a reason: a **bounded
+   negative wait** (a "did not happen" can only be seen by waiting, and a slow host can make it pass
+   vacuously, never fail), and a **real-OS case** that exists to touch the real socket or process
+   table, with its reason stated in the case comment.
+4. **Every wait is bounded, and the thread it waits on is joined by a guard.** A failed `REQUIRE`
+   unwinds; the unwind destroys what the thread captured. Declare the guard (`yuzu::test::ScopeExit`,
+   `tests/unit/test_helpers.hpp`, or the local `Joiner` in `test_echo_aggregator.cpp`) after what it
+   releases, so it runs first. The raw-thread rule: a `std::thread` with no throwing assertion and no
+   blocking wait between its start and its join needs no guard, because nothing can unwind past it;
+   add one the moment either appears.
+   - A call whose **return** is under test (`OpenRetryLoop::stop()`, a plugin's `shutdown()`) goes
+     through `yuzu::test::must_return_within` (`tests/unit/test_bounded_return.hpp`), never
+     `std::async` plus `wait_for`: the future's destructor blocks in the same hung call.
+5. **A `CHECK` on a size that guards an index is a `REQUIRE`.** `CHECK(rows.size() == 1)` followed by
+   `rows[0]` carries on into an out-of-range read when the size is wrong. (`.at()` throws, a clean
+   failure.)
+
+## Host dependence and honesty
+
+6. **Name the cause, or fail.** A case that depends on ETW, the registry or a real socket classifies
+   the environment failure (`etw_skip_reason`, `require_etw_or_skip`, `test_echo_registry_source.cpp`)
+   and `SKIP`s only on a named cause; any other failure fails with the OS code (47f816f27c,
+   ab3e2a2cf4, fb818a2e19; #7580, #7763).
+7. **Keep real-OS cases off the shared critical path; share no global session.** The agent suite's
+   shards are the bottleneck. A real-OS case lives where its cost is already budgeted, and none
+   holds a session another case reads. Salt every fixed name, port or path (CLAUDE.md, "Test
+   conventions").
+8. **Restore the plugin singleton on unwind, and pass under `--order rand`.** The loaded plugin is a
+   process singleton. `EchoSession` (`tests/unit/test_echo_local_dispatcher.cpp`) owns init and
+   shutdown, restores any source a case paused, and bounds its shutdown on every path, the
+   destructor after a failed `REQUIRE` included. Run a new case with `--order rand` and several seeds
+   before pushing.
+9. **Every timeout and bound cites a recorded measurement.** A limit is set from data and raised only
+   with a new measurement recorded beside it. `tests/meson.build` carries the Echo limits with their
+   figures; #8234 tracks CI keeping no per-case timing, and `must_return_within` prints the real
+   elapsed seconds of every bounded call to the test log so bounds can be re-derived.
+10. **New Echo tests follow this standard, and the gate checks the lexical half.** The PR template
+    carries the checklist line; the gate is [below](#the-gate).
+
+### The bounded-return constant
+
+`yuzu::test::kReturnBound` is **120 s**, derived and not guessed. The slowest single Catch2 leaf of
+the 13 `echo plugin:*` dispatcher cases on native Windows MSVC Debug (a Windows host, 5 runs, a WSL
+VM active, CPU 12-31%) was **38.7 s**. A shutdown happens inside a leaf, so that is an upper bound on
+any shutdown. Shared CI amplifies I/O 3-6x; at the lower end, 3 x 38.7 s = 116.1 s, rounded up to
+**120 s**. On macOS (5 runs) the slowest case took 1.331 s and the offline-shutdown case 0.007 s.
+120 s is below agent shard C's 480 s limit, so a hang still gets a named message before the meson
+timeout. The Windows figure is itself under investigation (#8244). Revise the constant only with a new
+recorded measurement.
+
+One case is tighter on purpose. The real-plugin offline case ("a failed v10 migration loads Echo
+offline ... shuts down promptly") bounds its shutdown by **half of `yuzu::echo::open_retry_delay(1)`**
+(the first retry delay, so 30 s today), taken from the header so it follows the schedule. A shutdown
+that waits out the first back-off is exactly the regression that case exists to catch, and a 120 s
+bound would let it through. Half the delay and not the whole, because the back-off began when init
+returned, before `shutdown()` is called: a shutdown that waits it out returns slightly before a bound
+equal to the delay expires. Measured with the `stop()` wake-up removed, 2 of 4 runs at the full delay
+were not caught; at half the delay, 4 of 4 were.
+
+### What `must_return_within` does on a hang
+
+It runs the call on the **calling** thread (production calls `stop()` and `shutdown()` from the thread
+that ran `start()` and `init()`) while a watchdog waits. If the bound passes, the watchdog flushes
+stdio, prints what hung, and ends the process through `hard_exit(3)`. A hung `stop()` cannot be
+unwound (the owner's destructor blocks in the same call), so a clean test failure is not available;
+ending the process with a message replaces a silent hang to the meson timeout. The CI flake classifier
+reports the abnormal exit as unclassifiable, which is correct for a hang.
+
+## The gate
+
+`tests/test_echo_test_standard_lexical.py` (meson suite `echo`, so it runs on the Windows, Linux and
+macOS legs) scans every `tests/unit/**/test_echo*.cpp` with comments and string and char literals
+blanked, and reports four flags:
+
+| Flag | Fires on | Instead |
+|---|---|---|
+| `[sleep]` | any `sleep_for` / `sleep_until` | wait on a future, latch or callback |
+| `[async]` | any `std::async` | `must_return_within` (rule 4) |
+| `[wait]` | a `wait_for` / `wait_until` with no `ScopeExit` or `Joiner` earlier in the same top-level definition | declare the guard first (rule 4) |
+| `[size-check]` | a `CHECK` on `X.size()` / `X.empty()` followed within 10 lines by `X[`, `X.front()` or `X.back()` | `REQUIRE` (rule 5) |
+
+**Marker.** A finding is waived by `// echo-test-ok: <reason>` in a real `//` line comment, on the
+same line or on the comment-only line directly above, with a non-empty reason. The same text inside a
+string literal or a `/* */` block comment waives nothing. Every marker is visible in review, so
+justify it in the PR. **There is no baseline file:** the tree is clean or the finding is marked.
+
+**Known limits.** The gate is lexical. A guard token that is present but does not protect the wait
+passes. A size `CHECK` more than 10 lines before its index, or through an alias, is missed. A raw
+thread with a throwing assertion before its join is not flagged. The source-health ledger,
+retention-guard counters and pid-name map live in the plugin singleton and cannot be reset from a
+test, so a case asserts on what it changed, never on a count another case could have moved. The gate
+runs its own mutation self-tests, so a pattern that goes stale fails loudly.

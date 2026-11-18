@@ -1694,17 +1694,30 @@ TEST_CASE("fold_rows waits while a GC pass holds op_mu_", "[echo][fold][gc][conc
     process_delta({pev(kT0, "started", "a.exe")}, acc);
     std::atomic<bool> fold_ok{false};
     std::promise<void> folded;
-    std::thread gc([&] { (void)f->fold.gc_dictionary(f->db, std::chrono::steady_clock::now() + kHour); });
-    parked.get_future().wait();
-    std::thread fold([&] {
-        fold_ok = f->fold.fold_rows(f->db, "process", acc).has_value();
-        folded.set_value();
-    });
     auto folded_f = folded.get_future();
-    const auto blocked = folded_f.wait_for(std::chrono::milliseconds(150));
-    release.set_value();
-    gc.join();
-    fold.join();
+    std::future_status blocked{};
+    {
+        // Declared after what it releases and joins, so a failed REQUIRE below still frees the
+        // parked clock and joins both workers before `f`, `acc` and the promises are destroyed.
+        std::thread gc, fold;
+        const yuzu::test::ScopeExit release_and_join{[&] {
+            release.set_value();
+            if (gc.joinable())
+                gc.join();
+            if (fold.joinable())
+                fold.join();
+        }};
+        gc = std::thread(
+            [&] { (void)f->fold.gc_dictionary(f->db, std::chrono::steady_clock::now() + kHour); });
+        REQUIRE(parked.get_future().wait_for(std::chrono::seconds{30}) == std::future_status::ready);
+        fold = std::thread([&] {
+            fold_ok = f->fold.fold_rows(f->db, "process", acc).has_value();
+            folded.set_value();
+        });
+        // A "did not happen" can only be seen by waiting: a slow host can make this pass
+        // vacuously, never fail.
+        blocked = folded_f.wait_for(std::chrono::milliseconds(150));
+    }
     CHECK(blocked == std::future_status::timeout);
     CHECK(fold_ok);
     CHECK(integrity_violations(*f) == 0);
