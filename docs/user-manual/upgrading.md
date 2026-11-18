@@ -27,6 +27,26 @@ Running `dev` between releases? Some entries below describe changes on `dev` tha
 
 **What to do.** Nothing for existing exports. Before relying on XLSX at scale, check that the data volume has the headroom, or lower `--inventory-export-max-bytes`.
 
+## ⚠️ Breaking: regex `replace` is limited to 64 KiB files, regex `search` skips long lines, and `ioc.check` accepts at most 100 domains
+
+**In short.** Affected: any script, instruction or agentic worker that runs `filesystem.replace` with `regex=true` on a file over 64 KiB, relies on `filesystem.search` with `regex=true` seeing every line, sends more than 100 `domains` to `ioc.check`, or reads Windows `ioc.check` domain results as clean (they can now be constrained, meaning unknown). Agents on the new build refuse or skip these where the old build ran them.
+
+**What changed.**
+
+- **`filesystem.replace`, `regex=true`.** A file over 64 KiB (65,536 bytes) is refused with `error|regex replace refused: file exceeds 65536 bytes (use a literal search)` and rc 1; the file is not changed. The old limit was the 100 MiB file cap.
+- **`filesystem.search`, `regex=true`.** A line over 64 KiB is not searched. It is reported as `skipped|<line number>|line exceeds regex limit (65536 bytes)` and the search continues. The `total_matches` count covers only the lines that were searched.
+- **`ioc.check`.** More than 100 entries in `domains` are refused whole: one `error|domains|false|Too many domains (N, max 100)` row, rc 1, no header row and no check of any kind (IPs, hashes, paths and ports in the same call are not checked either). The old build accepted any number.
+- **Windows `ioc.check` `domains`.** An unreadable DNS resolver cache is now a **constrained / partial** result (`windows:ioc:dns_cache_unreadable`, row detail `DNS resolver cache could not be read`) instead of `Not in DNS cache`. Some Windows 11 builds (seen on build 26200) return failure from the cache API on every call, so every domain answer there is now constrained. Constrained means the cache is UNKNOWN, not clean; do not read it as a negative. A distinct token for an API that is unsupported on a build is not provided: a permanent failure cannot be told from a transient one.
+- Literal (non-regex) `replace` and `search` are unchanged.
+
+**This is a size limit, not a safety bound.** A regex over a long subject can still overflow the agent's stack with the standard library's engine, well under 64 KiB; a linear-time engine is the real fix and is tracked in issue #3866.
+
+**A regex that overflows the stack kills the whole agent, and a schedule or policy that re-runs it keeps killing it.** The 64 KiB limit does not prevent that (see above). A crash is a `SIGSEGV` of the agent process, not a failed command. If the regex is in a schedule, a policy or an instruction that fires again, every fire can crash the agent again. On Linux the shipped systemd unit restarts it every 10 seconds and, after 5 restarts in 300 seconds, leaves it in `failed` with the device offline until someone intervenes. Recovery: first stop the source (disable the schedule or policy, or remove the instruction), then run `systemctl reset-failed yuzu-agent && systemctl start yuzu-agent` on the device (see "Crash-loop backstop (systemd)" in [Server Administration](server-admin.md)). This document does not verify restart behaviour under launchd or the Windows service manager; do not assume either enforces a start limit. The only fleet-wide guardrail is the per-plugin kill switch, which disables the whole `filesystem` plugin; there is no regex-only switch. Prefer a literal search where you can.
+
+**Who is affected.** Callers that regex-replace large files, regex-search files with very long lines (minified or single-line data), or batch more than 100 domains into one `ioc.check`.
+
+**What to do.** For a large file use a literal replace, or split the work. For `search`, read the `skipped|` rows and fall back to a literal search for those lines. For `ioc.check`, send the domains in batches of at most 100 and treat a rc 1 `Too many domains` row as an error, not an empty result.
+
 ## ⚠️ Breaking: agent plugin result rows neutralise `|`, CR and LF, and the `network_config` proxy row redacts credentials (WP11)
 
 **In short.** Affected: anything that parses stored results of the `filesystem` (`list_dir`, `search_dir`, Windows `get_version_info`), `installed_apps` (`list`, `query`, `list_per_user`), `processes` (`list`, `query`, `list_hashed`, `list_tree`), `procfetch`, `wmi` (`query`, `get_instance`) and `network_config` (`proxy`, including its `bypass` rows) plugins, or that matched on a raw proxy value.
