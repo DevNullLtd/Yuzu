@@ -545,7 +545,12 @@ inline std::vector<ConfigCheckResult> run_linux_checks() {
 // VERIFIED on macOS 27.0.1 (one Apple Silicon host; 13-15 NOT measured): spctl "assessments
 // enabled", fdesetup "FileVault is On.", csrutil "System Integrity Protection status: enabled.",
 // socketfilterfw "Firewall is disabled. (State = 0)", systemsetup "Remote Login: Off". Exit codes
-// are NOT yet captured. `defaults read ... AutomaticCheckEnabled` on a default install prints
+// MEASURED exit codes (same host): spctl 0 ("assessments enabled"), fdesetup 0, csrutil 0,
+// socketfilterfw 0 ("Firewall is disabled. (State = 0)"), systemsetup -getremotelogin 0 (via sudo),
+// `defaults read ... AutomaticCheckEnabled` 1 (key absent). NOT measured: any tool's exit code in
+// its BAD state (for example `spctl --status` with Gatekeeper disabled). If such a state exits
+// non-zero, requires_exit_zero=true makes that check report Unknown (UNREADABLE) instead of a
+// verdict: it fails closed (a finding is lost, never a false OK). `defaults read ... AutomaticCheckEnabled` on a default install prints
 // "Error: Could not find key 'AutomaticCheckEnabled' in domain 'com.apple.SoftwareUpdate'." (on
 // stderr, so that row merges stderr): the key being ABSENT means the OS default applies, which is
 // neither unreadable nor a bad verdict, so `absent_line` reports INFO for any completed run.

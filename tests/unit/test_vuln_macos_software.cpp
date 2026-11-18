@@ -392,7 +392,9 @@ TEST_CASE("macos config: only the first line is judged and it is trimmed", "[vul
 TEST_CASE("macos config: requires_exit_zero=false would accept a completed non-zero run "
           "(policy seam pending the Mac measurement)",
           "[vuln][macos][config]") {
-    // The shipped table requires exit 0 for every tool; this pins the seam, not a measured fact.
+    // The shipped table requires exit 0 for every tool. A bad-state exit code (spctl with
+    // Gatekeeper disabled) is NOT measured: if it is non-zero the check reads UNREADABLE, so a
+    // finding is lost but a false pass cannot occur. This pins that fail-closed behaviour.
     const CommandRead ran_nonzero{"assessments disabled", false, true};
     CHECK(macos_check_result(MacosCheck::Gatekeeper, ran_nonzero).severity == "UNREADABLE");
 }
@@ -448,6 +450,8 @@ TEST_CASE("macos config: any_config_unreadable keys on severity", "[vuln][macos]
 //    measured; exit codes not yet captured) ────────────────────────────────────────────────────
 
 TEST_CASE("golden macOS 27.0.1: the five status tools' real lines are accepted", "[vuln][macos][golden]") {
+    // MEASURED exit codes on that host: every tool below exited 0 in the state shown, so `good()`
+    // (ok = ran = true) is the real shape; bad-state exit codes are NOT measured.
     const auto r = [](MacosCheck c, const char* line) { return macos_check_result(c, good(line)); };
     auto gk = r(MacosCheck::Gatekeeper, "assessments enabled");
     CHECK(gk.severity == "INFO");
@@ -475,7 +479,8 @@ const char* const kDefaultsAbsent =
 
 TEST_CASE("golden macOS 27.0.1: an absent AutomaticCheckEnabled key is INFO, not unreadable or bad",
           "[vuln][macos][golden]") {
-    // exit code unknown (believed 1): the verdict must not depend on it
+    // MEASURED: `defaults read` exits 1 with the key absent (ran, not ok); the verdict must not
+    // depend on the exit code, so exit 0 is covered too.
     for (const CommandRead& rd : {CommandRead{kDefaultsAbsent, false, true},
                                   CommandRead{kDefaultsAbsent, true, true},
                                   CommandRead{std::string(kDefaultsAbsent) + "\n", false, true}}) {

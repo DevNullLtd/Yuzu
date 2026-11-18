@@ -345,7 +345,8 @@ metadata:
     coverage row, and the coverage status is visible only in the agent log (not
     in REST, MCP or the dashboard): treat the list as "system_profiler
     applications only, Homebrew excluded", and never read an empty macOS list
-    as "no software installed".
+    as "no software installed". A backslash in an application name or version
+    is shown as "/" (lossy by design until a versioned decoder change exists).
   tags: [security, vulnerability, inventory, software]
 
 spec:
