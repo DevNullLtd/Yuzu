@@ -21,7 +21,7 @@ Running `dev` between releases? Some entries below describe changes on `dev` tha
 | each `.deb` and `.rpm` | new: the package name without `.deb`/`.rpm`, e.g. `yuzu-agent_X.Y.Z_amd64.cdx.json`, `yuzu-server-X.Y.Z-1.x86_64.spdx.json` |
 | `YuzuAgentSetup-X.Y.Z.exe` | new: `YuzuAgentSetup-X.Y.Z.{cdx,spdx}.json`, listing the files of the agent zip the installer installs |
 | `YuzuAgent-X.Y.Z-macos-arm64.pkg` | new: `YuzuAgent-X.Y.Z-macos-arm64.{cdx,spdx}.json` |
-| container images | unchanged names; now made with the same syft version (v1.57.2) |
+| container images | unchanged names; now made with the same syft version (v1.57.2), and marked incomplete where the image holds what the scan cannot list |
 
 Each SBOM names its file and records its SHA-256, and lists the vcpkg libraries its C++ binaries are built with (version, licence, upstream purl, CPE where NVD has one), the gateway's Erlang/OTP release, and what syft recognises in the file. A pre-release uses the pre-release package names (`yuzu-agent_X.Y.Z-rcN_amd64.cdx.json`, `YuzuAgentSetup-X.Y.Z_rcN.cdx.json`).
 
@@ -30,7 +30,8 @@ Each SBOM names its file and records its SHA-256, and lists the vcpkg libraries 
 **What to do.**
 - Re-baseline scanner findings on the first release with the new SBOMs: the component set changes completely (thousands of workspace entries disappear; the shipped OpenSSL, libpq and other vcpkg libraries appear at their real versions), so findings appear and close that did not change in the product.
 - To describe a package or the installer, use its own SBOM rather than the archive's.
-- Read "What a file's SBOM lists" and "What to expect from a dependency scanner" in [Release verification](release-verification.md) section 5 for what is not listed yet (vendored code in `yuzu-server`, the installer's InnoSetup runtime, operating-system libraries) and how an SBOM marks itself incomplete.
+- Check any script that reads the release's SBOMs. One that downloads every `*.cdx.json` or `*.spdx.json` now gets one pair per asset plus the image SBOMs, not one pair per platform; one that picks a platform's SBOM by name keeps working for the four archives only. Select an asset's SBOM by its stem (the asset's file name without `.tar.gz`, `.zip`, `.deb`, `.rpm`, `.exe` or `.pkg`; image SBOMs end in `-image`), and confirm the pair is that asset's by comparing the SHA-256 on its root (CycloneDX `metadata.component.hashes`, the SPDX described package's `checksums`) with the file's. A script that counted components, or looked for a workspace path, will see far fewer: the SBOM lists the file's contents now. A script that needs to know whether an SBOM is complete reads the `yuzu:sbom:incomplete-reasons` tokens (or the CycloneDX `compositions` entry), not the component count.
+- Read "What a file's SBOM lists" and "What to expect from a dependency scanner" in [Release verification](release-verification.md) section 5 for what is not listed yet (vendored code in `yuzu-server`, the installer's InnoSetup runtime, what the gateway's Erlang emulator vendors, operating-system libraries) and how an SBOM marks itself incomplete, with the closed list of reason tokens.
 
 ## ⚠️ Breaking: on-demand software sync asks for confirmation, is paced instead of capped at 500 devices, and cools down per group
 

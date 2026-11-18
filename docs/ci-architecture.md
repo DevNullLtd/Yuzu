@@ -466,14 +466,24 @@ release when:
   `vcpkg_installed/`, `build-*/`, `_build/`, `_build_*/`, `site/`, `tests/`,
   `.git/` or `.github/`, the marks of a checkout, build-tree or test-tree scan
   ("Check artifact SBOM scope", S8; a scan of some other wrong directory is
-  caught only by the bound). This step runs after the images are pushed, so a
-  failure here needs a fix and a new tag, not a re-run (the release skill's
-  failure table). The build jobs make these SBOMs with that script: each
-  artifact is unpacked and scanned on its own with syft pinned to v1.57.2 (the
-  image SBOM steps pin the same version), and the vcpkg ports its binaries are
-  built from are added from the installed tree for the release triplet; the
-  Windows installer's SBOM lists the archive files `yuzu-agent.iss` installs.
-  Each `generate` command runs with a timeout;
+  caught only by the bound);
+- an image SBOM pair (`<image>-image.{cdx,spdx}.json`) lacks a half, or lacks
+  the incomplete marker its image calls for: each image-publish job runs
+  `artifact-sbom.py mark-image` on its pair after signing, which marks an image
+  holding `yuzu-server`, `yuzu-agent`, the Erlang emulator or the source-built
+  pgvector (what syft cannot list there), and the same step refuses a pair
+  that describes two different images. These SBOM steps run after the images
+  are pushed: a failure about the SBOM itself needs a fix and a new tag, while
+  a transfer fault (a SHA-256 mismatch, a missing file) needs only a re-run
+  (the release skill's failure table). The build jobs make these SBOMs with
+  that script: each artifact is unpacked and scanned on its own with syft
+  pinned to v1.57.2 (the image SBOM steps pin the same version), and the vcpkg
+  ports its binaries are built from are added from the installed tree for the
+  release triplet; the Windows installer's SBOM lists the archive files
+  `yuzu-agent.iss` installs. Each `generate` command runs with a timeout, and
+  `tests/test_artifact_sbom.py` (Docs Lint, every PR) parses the real
+  `yuzu-agent.iss`, so an installer-script edit the script cannot map fails
+  there rather than at the release's Windows SBOM step;
 - an asset name contains a character GitHub rewrites on upload (anything but
   letters, digits, `.`, `_`, `-`, or a name not starting with a letter or
   digit), which would make `SHA256SUMS` and the provenance name an asset that
