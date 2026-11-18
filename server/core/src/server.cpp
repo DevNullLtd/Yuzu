@@ -126,6 +126,7 @@
 #include "app_perf_cohort_reader.hpp"
 #include "app_perf_group_reader.hpp"
 #include "app_perf_rollup.hpp"
+#include "dex_app_usage_owner.hpp"
 #include "dex_app_version_failures_owner.hpp"
 #include "dex_app_perf_model.hpp"
 #include "offline_endpoint_store.hpp"
@@ -2884,6 +2885,11 @@ public:
                           "Agents whose Echo database has ever been quarantined as corrupt "
                           "(cumulative per agent since install; a rising value is the signal)",
                           "gauge");
+        metrics_.describe("yuzu_fleet_echo_storage_offline",
+                          "Agents whose Echo database is offline and being retried, by reason "
+                          "(free_space, migration_failed, open_failed; anything else sums under "
+                          "unknown). Published for every reason each sweep, 0 included",
+                          "gauge");
         metrics_.describe("yuzu_fleet_plugin_init_failed",
                           "Agents reporting a plugin that failed init, by plugin name (absent "
                           "when none). The label is bounded to the server's plugin catalogue: a "
@@ -4722,7 +4728,12 @@ public:
         // statement timeout; a shorter window or less load clears it). Pre-seeded below (same
         // closed {reason x source} cross-product pre-seed pattern as
         // yuzu_server_kek_operations_total above) so absent()/rate() alerting
-        // is meaningful before the first degrade ever fires.
+        // is meaningful before the first degrade ever fires. "dex_usage" (the fleet
+        // application usage read behind GET /api/v1/dex/apps/usage) counts all four
+        // reasons its owner can return: pool_acquire_timeout, query_error,
+        // statement_timeout and concurrency_budget; it fails closed (503, never a
+        // zero figure) and a sustained run of statement timeouts is the
+        // fleet_too_large state.
         metrics_.describe("yuzu_server_guardian_read_degrade_total",
                           "Guardian rules/status/DEX reads that returned degraded (could not "
                           "read) rather than a genuine result, by reason "
@@ -4741,7 +4752,9 @@ public:
                           "and emit-order reads, fail-hard, the device request is refused and a "
                           "statement_timeout "
                           "most likely means a large retained pending backlog, which a retry usually "
-                          "does not clear). "
+                          "does not clear; dex_usage = the fleet application usage read, fail-hard, "
+                          "the request is refused with a 503 and its reasons are "
+                          "pool_acquire_timeout/query_error/statement_timeout/concurrency_budget). "
                           "A sampled warn accompanies each new degrade episode.",
                           "counter");
         for (const auto source : {"guardian_state", "guardian_rules", "guardian_census",
@@ -4758,6 +4771,11 @@ public:
                          {{"reason", "statement_timeout"}, {"source", "guardian_census_device"}});
         metrics_.counter("yuzu_server_guardian_read_degrade_total",
                          {{"reason", "statement_timeout"}, {"source", "guardian_state"}});
+        // The fleet application usage read (dex_usage): all four reasons its owner returns.
+        for (const auto reason : {"pool_acquire_timeout", "query_error", "statement_timeout",
+                                  "concurrency_budget"})
+            metrics_.counter("yuzu_server_guardian_read_degrade_total",
+                             {{"reason", reason}, {"source", "dex_usage"}});
         metrics_.describe("yuzu_server_guardian_reap_passes_total",
                           "Retention-reaper pass outcomes by result "
                           "(swept/noop/declined/declined_no_anchor/failed/skipped_lock) - the "
@@ -6283,6 +6301,20 @@ public:
                     "/api/v1/plugin-config/remote_access_audit/kill-switch")) {
                 spdlog::error(
                     "[PG] Refusing to start: remote_access_audit default-off kill-switch "
+                    "seed failed");
+                startup_failed_ = true;
+            }
+        }
+
+        // process_introspect ships default-off (Forensics class, like remote_access_audit);
+        // enable via PUT /api/v1/plugin-config/process_introspect/kill-switch.
+        if (plugin_config_store_ && !startup_failed_) {
+            if (!plugin_config_store_->seed_kill_switch_default_off(
+                    "process_introspect",
+                    "default-off: forensics class; enable per PUT "
+                    "/api/v1/plugin-config/process_introspect/kill-switch")) {
+                spdlog::error(
+                    "[PG] Refusing to start: process_introspect default-off kill-switch "
                     "seed failed");
                 startup_failed_ = true;
             }
@@ -8000,6 +8032,8 @@ public:
             } else {
                 dex_app_version_failures_owner_ = std::make_unique<DexAppVersionFailuresOwner>(
                     *pg_pool_, cfg_.guardian_event_retention_days);
+                // Borrows the pool like the owner above; counts its faults on metrics_.
+                dex_app_usage_owner_ = std::make_unique<DexAppUsageOwner>(*pg_pool_, &metrics_);
                 legacy_sqlite_probe::warn_if_legacy_rows(
                     cfg_.db_dir() / "guaranteed-state.db", "GuaranteedStateStore",
                     {"guaranteed_state_rules", "guardian_meta", "guardian_agent_rule_status",
@@ -12417,6 +12451,7 @@ public:
         if (baseline_store_)
             baseline_store_->set_on_baseline_mutation({}); // hook captures `this` (#5513)
         dex_app_version_failures_owner_.reset();
+        dex_app_usage_owner_.reset();
         guaranteed_state_store_.reset();
         // RbacStore (authorization substrate, ADR-0041) borrows pg_pool_ — drop
         // before the pool. Every HTTP/gRPC/MCP handler holding the raw pointer is
@@ -20868,13 +20903,59 @@ private:
             yuzu::server::DexScorePolicyFn dex_policy_fn;
             if (dex_score_policy_provider_)
                 dex_policy_fn = [p = dex_score_policy_provider_] { return p->current(); };
+            // The reads behind GET /api/v1/dex/apps/usage. The captures are borrowed: the owner,
+            // mgmt_group_store_ and tag_store_ outlive the web threads (stop() joins them first).
+            yuzu::server::DexUsageWiring dex_usage;
+            dex_usage.read = [owner = dex_app_usage_owner_.get()](const DexUsageQuery& q)
+                -> std::expected<DexUsageRead, std::string> {
+                if (!owner)
+                    return std::unexpected(std::string("not_wired"));
+                auto r = owner->read(q);
+                if (!r)
+                    return std::unexpected(std::string(owner->unavailable_detail(r.error())));
+                return std::move(*r);
+            };
+            // unknown_group (no such group: a 400) is told apart from group_unavailable (a failed
+            // read: a retryable 503). The members are read FIRST and the group's existence second:
+            // a group deleted in between is unknown_group (a 400, never cached) rather than a
+            // whole-population 200 built from zero members, and a group created in between reads
+            // as an empty group (a true, if brief, answer).
+            dex_usage.group_members = [this](const std::string& id)
+                -> std::expected<std::vector<std::string>, std::string> {
+                if (!mgmt_group_store_)
+                    return std::unexpected(std::string("group_unavailable"));
+                const auto members = mgmt_group_store_->get_members_checked(id);
+                if (!members)
+                    return std::unexpected(std::string("group_unavailable"));
+                const auto group = mgmt_group_store_->get_group_checked(id);
+                if (!group)
+                    return std::unexpected(std::string("group_unavailable"));
+                if (!*group)
+                    return std::unexpected(std::string("unknown_group"));
+                std::vector<std::string> ids;
+                ids.reserve(members->size());
+                for (const auto& m : *members)
+                    ids.push_back(m.agent_id);
+                return ids;
+            };
+            dex_usage.tag_values = [this](const std::string& key)
+                -> std::optional<std::unordered_map<std::string, std::string>> {
+                if (!tag_store_)
+                    return std::nullopt;
+                auto v = tag_store_->get_values_for_key(key);
+                if (!v)
+                    return std::nullopt;
+                return std::move(*v);
+            };
+            dex_usage.observation_retention_days = cfg_.guardian_event_retention_days.get();
             // The observer provider borrows health_store_, which is declared before every holder
             // of this API (rest_api_v1_, mcp_server_, dex_routes_) and so outlives them.
             dex_api = make_local_dex_api(
                 guaranteed_state_store_.get(), dex_fleet_fn, std::move(dex_policy_fn),
                 [this](const std::vector<std::string>& ids) {
                     return health_store_.dex_observer_for(ids, detail::kAgentHealthStaleness);
-                });
+                },
+                std::move(dex_usage));
         }
         // The Apps tab reads the same DexApi::apps model as REST and MCP (null store: its error panel).
         if (dex_routes_)
@@ -25625,6 +25706,9 @@ private:
     /// Cross-schema read owner for the per-version crash and hang join (borrows
     /// the pool; constructed with the same observation retention as the store).
     std::unique_ptr<DexAppVersionFailuresOwner> dex_app_version_failures_owner_;
+    /// Cross-schema read owner for the fleet application usage read (borrows the pool and
+    /// metrics_, like the owner above).
+    std::unique_ptr<DexAppUsageOwner> dex_app_usage_owner_;
     std::unique_ptr<BaselineStore> baseline_store_;
     std::unique_ptr<CaStore> ca_store_;
     // HA WS-6 CRL follow-ups (#4828-#4831): constructed once ca_store_, audit_store_ AND
