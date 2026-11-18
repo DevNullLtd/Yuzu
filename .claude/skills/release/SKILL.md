@@ -311,15 +311,16 @@ docker image inspect "ghcr.io/$OWNER/yuzu-server:latest" --format '{{.RepoDigest
 Verify the cosign signature + GitHub attestation provenance. **Before running either command, gate on the client being installed** — first-time runs on a fresh dev box will hit one or both missing, and burning 30 min to discover "oh, I need cosign" post-release is exactly the gap v0.11.0-rc2 surfaced:
 
 ```bash
-# Preflight: require cosign + gh 2.50+ for attestation verify.
+# Preflight: require cosign + gh 2.102.0+ for the pinned attestation verify
+# (older gh matches --signer-workflow by prefix and --source-ref case-insensitively).
 if ! command -v cosign >/dev/null 2>&1; then
   echo "WARN: cosign not installed — Sigstore signature round-trip skipped"
   echo "     install: curl -sSL https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64 -o ~/.local/bin/cosign && chmod +x ~/.local/bin/cosign"
 fi
 GH_MAJOR=$(gh --version | awk 'NR==1{split($3,a,"."); print a[1]}')
 GH_MINOR=$(gh --version | awk 'NR==1{split($3,a,"."); print a[2]}')
-if [[ "$GH_MAJOR" -lt 2 || ( "$GH_MAJOR" -eq 2 && "$GH_MINOR" -lt 50 ) ]]; then
-  echo "WARN: gh $GH_MAJOR.$GH_MINOR predates attestation subcommand (need 2.50+)"
+if [[ "$GH_MAJOR" -lt 2 || ( "$GH_MAJOR" -eq 2 && "$GH_MINOR" -lt 102 ) ]]; then
+  echo "WARN: gh $GH_MAJOR.$GH_MINOR cannot enforce the pinned attestation check (need 2.102.0+)"
   echo "     upgrade: curl -sSL https://github.com/cli/cli/releases/latest/download/gh_\$(gh api repos/cli/cli/releases/latest --jq .tag_name | sed s/v//)_linux_amd64.tar.gz -o /tmp/gh.tgz && tar xzf /tmp/gh.tgz -C /tmp && install -m755 /tmp/gh_*_linux_amd64/bin/gh ~/.local/bin/gh"
 fi
 
@@ -344,10 +345,13 @@ if command -v cosign >/dev/null 2>&1; then
   done
 fi
 
-# gh attestation: verifies SLSA build provenance bound to the exact workflow run
-if [[ "$GH_MAJOR" -gt 2 || ( "$GH_MAJOR" -eq 2 && "$GH_MINOR" -ge 50 ) ]]; then
-  gh attestation verify yuzu-linux-x64.tar.gz --repo DevNullLtd/Yuzu
-  gh attestation verify "oci://ghcr.io/$OWNER/yuzu-server:X.Y.Z" --repo DevNullLtd/Yuzu
+# gh attestation: verifies SLSA build provenance, pinned to release.yml at the tag
+# (--repo alone accepts an attestation from any workflow in the repository)
+if [[ "$GH_MAJOR" -gt 2 || ( "$GH_MAJOR" -eq 2 && "$GH_MINOR" -ge 102 ) ]]; then
+  gh attestation verify yuzu-linux-x64.tar.gz --repo "$SIGNER_REPO" \
+    --signer-workflow "$SIGNER_REPO/.github/workflows/release.yml" --source-ref refs/tags/vX.Y.Z
+  gh attestation verify "oci://ghcr.io/$OWNER/yuzu-server:X.Y.Z" --repo "$SIGNER_REPO" \
+    --signer-workflow "$SIGNER_REPO/.github/workflows/release.yml" --source-ref refs/tags/vX.Y.Z
 fi
 ```
 

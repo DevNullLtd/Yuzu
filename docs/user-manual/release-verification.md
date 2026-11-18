@@ -63,10 +63,11 @@ certificate at build time and cannot be restamped.
 ## Prerequisites
 
 ```bash
-# GitHub CLI for attestation verification
-#   Ubuntu/Debian: sudo apt install gh
-#   macOS:         brew install gh
-#   Windows:       winget install --id GitHub.cli
+# GitHub CLI 2.102.0 or later, for attestation verification (check: gh --version)
+#   Linux:   GitHub's official packages, https://github.com/cli/cli/blob/trunk/docs/install_linux.md
+#            (a distribution's own gh package is often older than 2.102.0)
+#   macOS:   brew install gh
+#   Windows: winget install --id GitHub.cli
 
 # cosign v2.6.2 or later, for Sigstore signature verification
 #   Ubuntu/Debian: curl -sSLO https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64 && chmod +x cosign-*
@@ -149,9 +150,17 @@ provenance attestation stored in GitHub's native attestation registry.
 The provenance records the exact workflow run, commit, builder, and
 inputs used to produce the artifact.
 
+**Use gh 2.102.0 or later.** Every command below pins the attestation to
+`release.yml` at this release's tag with `--signer-workflow` and
+`--source-ref`; `--repo` alone accepts an attestation from any workflow in the
+repository. Older gh versions do not enforce those two flags as written:
+before 2.68.0 `--source-ref` does not exist; before 2.97.0 the
+`--signer-workflow` value is used as an unescaped regular expression; and
+before 2.102.0 it is matched only against the start of the certificate's
+identity, and `--source-ref` is compared case-insensitively (GitHub CLI
+advisories GHSA-mm27-mwq9-fr5g, GHSA-wjmr-j3rp-mh2g and GHSA-4mq3-hpgx-9cx8).
+
 ```bash
-# --signer-workflow and --source-ref pin the attestation to release.yml at
-# this release's tag; --repo alone accepts one from any workflow in the repo.
 # Binary archives / installers
 gh attestation verify yuzu-linux-x64.tar.gz --repo "${SIGNER_REPO}" \
   --signer-workflow "${SIGNER_REPO}/.github/workflows/release.yml" \
@@ -176,10 +185,31 @@ Success prints the attestation's predicate type
 (`https://github.com/actions/runner`), and the source repository +
 commit SHA that produced the artifact.
 
-**Offline / air-gapped verification.** Download the attestation bundle
-with `gh attestation download <file> --repo "$SIGNER_REPO" -o
-<file>.jsonl`, then verify offline with
-`gh attestation verify --bundle <file>.jsonl <file>`.
+**Offline / air-gapped verification.** On a machine with network access,
+fetch the attestation bundle and the Sigstore trusted root:
+
+```bash
+gh attestation download yuzu-linux-x64.tar.gz --repo "${SIGNER_REPO}"
+#   writes sha256:<digest>.jsonl to the current directory (sha256-<digest>.jsonl on Windows)
+gh attestation trusted-root > trusted_root.jsonl
+```
+
+Some release assets also ship the same bundle as `<asset>.intoto.jsonl`; not
+every asset or release has one, so the download above is the general route.
+Copy the bundle and `trusted_root.jsonl` to the offline machine, then run the
+same pinned check against the local files:
+
+```bash
+gh attestation verify yuzu-linux-x64.tar.gz \
+  --bundle "sha256:$(sha256sum yuzu-linux-x64.tar.gz | cut -d' ' -f1).jsonl" \
+  --custom-trusted-root trusted_root.jsonl \
+  --repo "${SIGNER_REPO}" \
+  --signer-workflow "${SIGNER_REPO}/.github/workflows/release.yml" \
+  --source-ref "refs/tags/${TAG}"
+```
+
+With `--bundle`, gh compares `--repo` only with the repository name recorded
+in the signing certificate when the release was built.
 
 ## 5. Inspect the SBOM
 
@@ -242,8 +272,16 @@ VERSION="${1:?usage: verify.sh <version, e.g. 0.11.0>}"
 OWNER="${OWNER:-tr3kkr}"                   # devnullltd for releases after 2026-09-28
 SIGNER_REPO="${SIGNER_REPO:-Tr3kkR/Yuzu}"  # DevNullLtd/Yuzu for the same
 
-IDENTITY="https://github.com/${SIGNER_REPO}/.github/workflows/release.yml@refs/tags/v${VERSION#v}"
+TAG="v${VERSION#v}"
+IDENTITY="https://github.com/${SIGNER_REPO}/.github/workflows/release.yml@refs/tags/${TAG}"
 OIDC_ISSUER="https://token.actions.githubusercontent.com"
+
+# The pinned attestation check below needs gh 2.102.0 or later (section 4).
+GH_VERSION="$(gh --version | awk 'NR==1 {print $3}')"
+if [[ "$(printf '%s\n' 2.102.0 "$GH_VERSION" | sort -V | head -1)" != 2.102.0 ]]; then
+  echo "gh $GH_VERSION is older than 2.102.0; upgrade it first" >&2
+  exit 1
+fi
 
 echo "→ sha256sum -c SHA256SUMS"
 sha256sum -c SHA256SUMS
@@ -266,7 +304,10 @@ done
 
 echo "→ gh attestation verify (binary archives)"
 for f in yuzu-linux-x64.tar.gz yuzu-gateway-linux-x64.tar.gz; do
-  [[ -f "$f" ]] && gh attestation verify "$f" --repo "${SIGNER_REPO}"
+  [[ -f "$f" ]] || continue
+  gh attestation verify "$f" --repo "${SIGNER_REPO}" \
+    --signer-workflow "${SIGNER_REPO}/.github/workflows/release.yml" \
+    --source-ref "refs/tags/${TAG}"
 done
 
 echo "✓ all checks passed for v${VERSION}"
