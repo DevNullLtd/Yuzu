@@ -1063,8 +1063,7 @@ int do_query(yuzu::CommandContext& ctx, yuzu::Params params) {
                 found = true;
             }
             ctx.write_output(yuzu::util::sanitize_utf8(
-                std::format("app|{}|{}|{}", app.name, app.version.empty() ? "-" : app.version,
-                            app.publisher.empty() ? "-" : app.publisher)));
+                parsers::format_query_row(app.name, app.version, app.publisher)));
         }
     }
 
@@ -1253,10 +1252,8 @@ private:
                 // registry list_profiles case, where a leading tag caused the
                 // hp-B1 column shift. Do not strip it.
                 ctx.write_output(yuzu::util::sanitize_utf8(
-                    std::format("user_app|{}|{}|{}|{}|{}", username,
-                                app.name, app.version.empty() ? "-" : app.version,
-                                app.publisher.empty() ? "-" : app.publisher,
-                                app.install_date.empty() ? "-" : app.install_date)));
+                    parsers::format_user_app_row(username, app.name, app.version, app.publisher,
+                                                 app.install_date)));
             }
         }
 
@@ -1282,11 +1279,8 @@ private:
         if (!report_if_degraded(ctx, apps.degraded, "list_per_user"))
             return 1;
         for (const auto& app : apps.apps) {
-            ctx.write_output(yuzu::util::sanitize_utf8(
-                std::format("user_app|system|{}|{}|{}|{}", app.name,
-                            app.version.empty() ? "-" : app.version,
-                            app.publisher.empty() ? "-" : app.publisher,
-                            app.install_date.empty() ? "-" : app.install_date)));
+            ctx.write_output(yuzu::util::sanitize_utf8(parsers::format_user_app_row(
+                "system", app.name, app.version, app.publisher, app.install_date)));
         }
         return 0;
 
@@ -1297,11 +1291,8 @@ private:
         if (!report_if_degraded(ctx, apps.degraded, "list_per_user"))
             return 1;
         for (const auto& app : apps.apps) {
-            ctx.write_output(yuzu::util::sanitize_utf8(
-                std::format("user_app|system|{}|{}|{}|{}", app.name,
-                            app.version.empty() ? "-" : app.version,
-                            app.publisher.empty() ? "-" : app.publisher,
-                            app.install_date.empty() ? "-" : app.install_date)));
+            ctx.write_output(yuzu::util::sanitize_utf8(parsers::format_user_app_row(
+                "system", app.name, app.version, app.publisher, app.install_date)));
         }
 
         // installed_apps/do_list_per_user#1 (docs/agent-spawn-sink-manifest.md)
@@ -1314,8 +1305,8 @@ private:
                 return 1;
             auto brew_out = std::move(brew_res.output);
             for (auto& rec : parsers::parse_brew_list(brew_out)) {
-                ctx.write_output(yuzu::util::sanitize_utf8(std::format(
-                    "user_app|brew|{}|{}|-|-", rec.name, rec.version.empty() ? "-" : rec.version)));
+                ctx.write_output(yuzu::util::sanitize_utf8(
+                    parsers::format_user_app_row("brew", rec.name, rec.version, "", "")));
             }
         }
         return 0;

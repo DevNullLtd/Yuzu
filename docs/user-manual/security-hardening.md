@@ -220,6 +220,20 @@ new connections wait in the kernel backlog (agents already connected are unaffec
 they reconnect). Limit connections per source address at the L4 balancer or firewall; see
 [Connection ceilings and the unauthenticated ports](gateway.md#grpc-listeners).
 
+**Gateway Erlang distribution is outside the PKI and unencrypted.** Between
+gateway nodes of a cluster, commands and results (including plugin parameters)
+travel over plain TCP guarded only by the shared cookie handshake; there is no
+encryption and no per-message integrity. Keep the cluster network trusted and
+firewalled to the gateway nodes only (EPMD 4369 and the distribution range
+9100-9105), and give every node a strong cookie. TLS distribution is tracked as
+#8158 (decision pending; owner: Fraser Jarvis; review by 2027-02-17). If a node
+will not start and you cannot reach the vendor docs, read the
+refusal text: the container logs it on stderr (`[gateway-entrypoint] FATAL: ...`)
+and the systemd unit in the journal (`yuzu-gateway: ...`); it names the fix and
+never prints the cookie. A conforming cookie is 32 to 255 characters from
+`[A-Za-z0-9._~+=-]` (`openssl rand -hex 32`), identical on every node. See
+[Distribution Cookie](gateway.md#distribution-cookie-required-in-production).
+
 ## Secret Management
 
 **Never pass secrets via CLI flags** — they are visible in `ps aux`.

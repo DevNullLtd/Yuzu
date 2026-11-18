@@ -54,7 +54,7 @@ The action takes no parameters.
 
 ### Outputs
 
-Pipe-delimited rows, one per process, in the fixed field order `pid|name|path|sha1`. `name` and `path` are pipe-escaped (a literal `|` becomes `\|`) before being written, so the delimiter itself is never ambiguous. `path` and `sha1` are empty strings, not `-`, when the OS would not hand back an image path or the file could not be opened/hashed — there is no placeholder row for "no processes": the row is only ever missing fields, never absent.
+Pipe-delimited rows, one per process, in the fixed field order `pid|name|path|sha1`. `name` and `path` are escaped before being written (a literal `|` becomes `\|`, CR and LF become a space, interior backslashes are kept and a trailing backslash becomes `/`), so neither the delimiter nor the row boundary can be forged by a process name or executable path. `path` and `sha1` are empty strings, not `-`, when the OS would not hand back an image path or the file could not be opened/hashed — there is no placeholder row for "no processes": the row is only ever missing fields, never absent.
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
 **`crossplatform.process.fetch` — `pid|name|path|sha1`**
@@ -143,7 +143,7 @@ This plugin does not set a typed result status; the agent records `UNDECLARED` a
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/procfetch/src/procfetch_plugin.cpp`
+- Plugin: `agents/plugins/procfetch/src/procfetch_plugin.cpp` · `agents/plugins/procfetch/src/procfetch_row.hpp`
 - Definitions: `content/definitions/procfetch.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_b.hpp`
 - Tests: none found by name

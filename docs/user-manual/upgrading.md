@@ -11,6 +11,20 @@ A statement elsewhere on this page that a rollback, a mixed fleet or an in-place
 
 Running `dev` between releases? Some entries below describe changes on `dev` that are not in a release yet. For what a `git pull` of `dev` changed, run the repository script `python3 scripts/whats-new.py` (`--versions` for the version bumps, rebuild notes and Docker image bumps); see `changelog.d/README.md`.
 
+## ⚠️ Breaking: agent plugin result rows neutralise `|`, CR and LF, and the `network_config` proxy row redacts credentials (WP11)
+
+**In short.** Affected: anything that parses stored results of the `filesystem` (`list_dir`, `search_dir`, Windows `get_version_info`), `installed_apps` (`list`, `query`, `list_per_user`), `processes` (`list`, `query`, `list_hashed`, `list_tree`), `procfetch`, `wmi` (`query`, `get_instance`) and `network_config` (`proxy`, including its `bypass` rows) plugins, or that matched on a raw proxy value.
+
+**What changed.**
+
+- A file name, registry string, process name, WMI value or proxy setting containing `|`, CR or LF can no longer add columns or forge rows. `|` is escaped (`\|`) (`processes` folds it to a space instead), CR and LF become a space, interior backslashes are kept (`C:\x` stays `C:\x`) and a TRAILING backslash is folded to `/`, because the server decoder would otherwise read `\|` as an escaped pipe and merge the field with the next column. One shared helper (`agents/shared/row_field.hpp`) does this for `filesystem`, `procfetch`, `wmi`, `installed_apps` and `network_config`; `processes` applies the same backslash rule.
+- Against the previous build: `procfetch` already escaped `|` and kept backslashes, so it now also folds CR and LF and a trailing backslash; `wmi` emitted raw values and now escapes them; `installed_apps` `list` folded EVERY backslash to `/` (`C:/Program Files/x`) and now keeps them (`C:\Program Files\x`; a trailing one still reads `/`), and its `query` and `list_per_user` rows, which were raw, are now escaped like `list`; `filesystem` `list_dir`, `search_dir` and the Windows `get_version_info` leg were raw and are now escaped (the macOS `get_version_info` leg already folded every backslash to `/` and still does); in `processes` only the `query` row was raw (`list`, `list_hashed` and `list_tree` were already sanitised, and now also fold a trailing backslash). A `wmi` value that ends in a backslash reads `/` at the end.
+- The `network_config` `proxy_address` value is credential-scrubbed on every OS and fails closed: when the value contains any `@`, the row is `REDACTED@` plus the text after the LAST `@` of the whole value. The scheme, the host of any earlier entry in a Windows proxy list and a path `@` in a PAC URL are dropped too (`http://u:p@proxy:3128` becomes `REDACTED@proxy:3128`). This is deliberate over-redaction: a decoy `@` anywhere in the value (for example in a path) makes the whole value read `REDACTED@<tail>`, which can hide the real proxy host, so treat a `REDACTED@` row as "a credential was present" rather than as the full address. A value with no `@` is reported with the row escape above. Only `user:password@` userinfo is scrubbed: a secret in a PAC URL's query string, in a path, or in a `bypass` / `no_proxy` row is NOT removed (`bypass` rows get the row escape only).
+
+**Who is affected.** Parsers and dashboards that matched `proxy_address` on a scheme or an earlier list entry; anything that matched a `/`-folded `installed_apps` `list` path, or a `procfetch`/`wmi` value containing a CR, LF or trailing backslash; scripts reading file names with `|` or newlines.
+
+**What to do.** Update the parsers. Mixed fleets are safe to run: an agent on the previous build still sends the previous output (raw `wmi` values, raw `installed_apps` `query` and `list_per_user` rows, raw `filesystem` `list_dir` / `search_dir` / Windows `get_version_info` rows, the raw `processes` `query` row, raw proxy and `bypass` values, `/`-folded `installed_apps` `list` paths), so the credential exposure remains for those endpoints until they are upgraded, one fleet can report two spellings of one `installed_apps` path, and an old agent still glues a `processes` row whose name ends in a backslash. **Rows already stored are not rewritten**: a proxy credential that an earlier agent sent stays in the stored responses until they age out, so rotate any proxy credential that was reachable through an `*_proxy` variable. There is no purge for these rows: stored responses are removed by the response retention reap, which defaults to 90 days and is set with `--response-retention-days` (`YUZU_RESPONSE_RETENTION_DAYS`); a value of 0 or less disables the reap (responses never expire). The `response_retention_days` runtime configuration key is stored only and does not change the window of a running server.
+
 ## ⚠️ Breaking: on-demand software sync asks for confirmation, is paced instead of capped at 500 devices, and cools down per group
 
 **In short.** Affected: anything that calls `POST /api/v1/hardware/sync` or the MCP tool `sync_hardware_software` for a whole group or the whole fleet (the Software page's **Whole fleet** choice, scripts and agentic workers). To do: send `"confirm": true` with a `group:<id>` or `__all__` scope, give the caller the global `ManagementGroup:Write` grant if it names the whole fleet, and stop relying on the 500-device refusal and the 60-second per-operator gap.
@@ -9241,16 +9255,59 @@ overridden.
 
 | Symptom | Diagnose | Fix |
 |---|---|---|
-| `systemctl status yuzu-gateway` shows `start-limit-hit` / `failed` | `journalctl -t yuzu-gateway \| grep -i cookie` shows "insecure distribution cookie" (for manual/`foreground` or container runs, check stdout / `gateway.log` instead) | Create `/etc/yuzu/gateway.env` with `YUZU_GW_COOKIE=$(openssl rand -hex 32)` (see above), then `systemctl reset-failed yuzu-gateway && systemctl start yuzu-gateway`. **Do not** use `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` in production. |
+| `systemctl status yuzu-gateway` shows `start-limit-hit` / `failed` | `journalctl -u yuzu-gateway \| grep -i cookie` shows `yuzu-gateway: YUZU_GW_COOKIE is unset, empty or the published default value ...` (the unit's pre-start check) or, for a start that bypassed it, "insecure distribution cookie" / "shorter than 32 characters" (container runs: `[gateway-entrypoint] FATAL: ...` on stderr via `docker logs`; manual `foreground` runs: the terminal / `gateway.log`) | Create `/etc/yuzu/gateway.env` with `YUZU_GW_COOKIE=$(openssl rand -hex 32)` (see above), then `systemctl reset-failed yuzu-gateway && systemctl start yuzu-gateway`. **Do not** use `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` in production. |
 | Gateway container restarts at boot on an AMX-capable Intel host (Sapphire Rapids+, AWS c7i/m7i/r7i) | Container log has `sys_sigaltstack(): Internal error: Failed to set alternate signal stack`; image is 0.13.0 through 0.14.0-rc4 (#2150) | Pull an image that carries the #2150 fix (0.14.0-rc5 or later). Until then, run the gateway on a host without AMX. A single-node gateway may use `yuzu-gateway-chisel` instead; a clustered one may not (it never joins the cluster). Do not roll back to 0.13.0 on that host: it is affected too. |
 
 > The generated `/etc/yuzu/gateway.env` is intentionally **preserved across
 > `apt purge` / `rpm -e`** (the `/etc/yuzu` directory may be shared with other
 > Yuzu packages). To remove the cookie after uninstall: `sudo shred -u /etc/yuzu/gateway.env`.
 
-> **Never set `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` in production** — it disables the
-> guard and restores the unauthenticated-RPC surface. It exists only for
-> ephemeral dev/CI stacks.
+> **Never set `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` in production.** It lets a node
+> start without an operator-supplied cookie (the container entrypoint then uses a
+> random per-boot one; see "Gateway cookie is checked before the VM starts"
+> below). It exists only for ephemeral dev/CI stacks.
+
+### Gateway cookie is checked before the VM starts (2026-11-17 security scan, F24) — **BREAKING**
+
+This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page): every writer runs this build, and this page is not a procedure for a rolling or mixed-version upgrade.
+
+`vm.args.src` has no fallback cookie (the published value is
+`yuzu_gw_secret_change_me`), and the container entrypoint and the systemd unit
+refuse a bad cookie **before the VM starts**; the in-VM guard alone would run
+only after distribution is already listening. The
+policy is one file, `gateway-cookie-policy.sh`, installed next to the release.
+A cookie must be **at least 32 characters** from **`[A-Za-z0-9._~+=-]`**, not
+starting with `-` or `+`, and not the published default. Whitespace, CR/LF,
+backslash, `&` and `$` are refused because the release start script mangles
+them differently under busybox and GNU awk (replicas would disagree on the
+cookie) or, for `\&`, loops forever. A cookie of 256 or more characters is refused too
+(the Erlang VM crashes on it at boot). So the length must be 32 to 255. `openssl rand -hex 32`
+always qualifies.
+
+| Install type | Effect | Action |
+|---|---|---|
+| `.deb` / `.rpm` (cookie written by the package: 64 hex) | Passes the check | None. The package also installs `/opt/yuzu_gw/gateway-cookie-policy.sh`, which the unit needs. |
+| Manual / tarball systemd unit | The unit has an `ExecStartPre` and **no override**. If `/opt/yuzu_gw/gateway-cookie-policy.sh` is missing the unit fails at once with `.: cannot open /opt/yuzu_gw/gateway-cookie-policy.sh: No such file` (exit 2) and, after a few restarts, `start-limit-hit`. A unit with no cookie (the override does not apply to the unit), a short cookie or an odd-character cookie fails to start. | The release tarball has one top-level directory, `yuzu-gateway-<version>-linux-x64/`, containing the release, `gateway-cookie-policy.sh` and `yuzu-gateway.service`. Extract it so that content lands directly in `/opt/yuzu_gw/`: `sudo mkdir -p /opt/yuzu_gw && sudo tar xzf yuzu-gateway-linux-x64.tar.gz -C /opt/yuzu_gw --strip-components=1`. Then install the bundled unit with `sudo install -m 0644 /opt/yuzu_gw/yuzu-gateway.service /etc/systemd/system/yuzu-gateway.service` and run `sudo systemctl daemon-reload`. The same file is `deploy/docker/gateway-cookie-policy.sh` in the source tree. Set a conforming `YUZU_GW_COOKIE` in `/etc/yuzu/gateway.env`. Then `systemctl reset-failed yuzu-gateway && systemctl start yuzu-gateway`. |
+| Container with a short or odd-character cookie | The entrypoint exits 1 before the VM starts (restart loop under `restart:`). | Set a conforming cookie, identical on every replica. |
+| Container on `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` with no cookie | Starts, but with a random per-boot cookie. **N replicas on the override are N singletons that cannot form a cluster** (each draws its own cookie), and the node is not reachable with the published value. | Fine for one throwaway node. For a cluster set one shared `YUZU_GW_COOKIE`. |
+| Container on the override with a real shared cookie that contains the published literal in the middle or at the end | Passed through unchanged (only an empty or *exactly* default cookie is replaced). | None; replace the cookie when convenient. |
+| Container on the override with a custom cookie that is **short** (under 32) or **starts with** the published literal | **Refused** (`... is shorter than 32 characters ...` or `... contains the published default value.`). | Drop the cookie to get a random per-boot one (single node), or set a strong shared cookie. |
+| Container **without** the override, real shared cookie that contains the published literal | Refused: `... contains the published default value.` | Generate a fresh cookie and set it on every replica. |
+
+Messages to search for (the cookie value is never printed):
+
+- Container, on stderr (`docker logs` shows it): `[gateway-entrypoint] FATAL: YUZU_GW_COOKIE is unset, empty or the published default value. The Erlang distribution cookie is the sole authentication ...`, `... contains a character outside the allowed set [A-Za-z0-9._~+=-] ...`, `... is shorter than 32 characters ...`, `... contains the published default value.`, `... must not start with - or + ...`, `... is longer than 255 characters ...`
+- systemd: `journalctl -u yuzu-gateway` shows the same text prefixed `yuzu-gateway:` (for example `yuzu-gateway: YUZU_GW_COOKIE is shorter than 32 characters, which is brute-forceable offline from a node that dials out. Use e.g. 'openssl rand -hex 32'.`).
+- A start that bypasses the entrypoint and the unit runs the in-VM guard only: `Refusing to start: Erlang distribution cookie is ...` (logger output, after distribution is listening). Under `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` that guard ALSO accepts an empty, short or literal-containing cookie (unlike the entrypoint), with a warning.
+- Image with no entrypoint (`yuzu-gateway-chisel`, or `bin/yuzu_gw` run by hand): no pre-VM check. The node boots with OTP's per-host `~/.erlang.cookie`, and the in-VM guard then refuses it ("shorter than 32 characters"), after distribution is listening. If `$HOME` is unwritable the VM cannot create that file and crash-loops; set a conforming `YUZU_GW_COOKIE`.
+
+**No return path.** A return to an earlier build is not a supported path (see
+"Deployment contract (hard cutover)" in the Forensics section of this page).
+Never run with the published default cookie: it is an unauthenticated-RPC
+surface (#659).
+
+Gateway Erlang distribution is plain TCP, outside the PKI, with no encryption:
+keep the cluster network trusted and firewalled (see the gateway manual).
 
 ### Gateway distribution-cookie length floor + shared node identity (HA WS-4 `#4555`) — **BREAKING**
 
@@ -9266,9 +9323,13 @@ shipped together as part of gateway multi-node cluster formation:
   documented cookie-generation path already clears this floor with room to
   spare** (`openssl rand -hex 32` produces 64 characters) — no action
   needed if you followed the `#659` guidance above verbatim. Only an
-  operator who hand-picked a short custom cookie is affected; the same
+  operator who hand-picked a short custom cookie is affected; the
   `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` override (dev/CI only, never production)
-  bypasses this check too.
+  tolerates an empty, short, exactly-default or literal-containing cookie in the
+  in-VM guard, which is all that runs on an entrypoint-less start (`docker run
+  --entrypoint`, hand-run `bin/yuzu_gw`, the chisel image); the container
+  entrypoint refuses a short or literal-prefixed cookie even with the override,
+  and the systemd unit has no override (see below).
 - **Node identity change.** The Erlang node short name changed from a
   hardcoded `yuzu_gw1` to a shared `yuzu_gw` — every gateway replica in a
   cluster now advertises the SAME short name, distinguished only by an
@@ -9285,7 +9346,10 @@ shipped together as part of gateway multi-node cluster formation:
 **Recovery** for the cookie-length case uses the same diagnostic path as
 `#659` above (`journalctl -t yuzu-gateway | grep -i cookie` / stdout /
 `gateway.log`) — the log line names the specific failure (`shorter than 32
-characters`) separately from the known-default rejection.
+characters`) separately from the known-default rejection. With the pre-VM check
+(see "Gateway cookie is checked before the VM starts" above) the message text
+is `YUZU_GW_COOKIE is shorter than 32 characters ...` from the entrypoint
+(`[gateway-entrypoint] FATAL: ...`) or the unit (`yuzu-gateway: ...`).
 
 ### InstructionDefinition import signature enforcement now on-by-default (#1073 / W7.4 sibling-gap) — **BREAKING**
 
