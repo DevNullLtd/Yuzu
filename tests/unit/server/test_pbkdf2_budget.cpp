@@ -229,7 +229,7 @@ TEST_CASE("Pbkdf2Budget: break-glass is limited to ONE slot per source whatever 
     CHECK(b.try_acquire(Pbkdf2Class::kBreakGlass, "198.51.100.8").ok());
 }
 
-TEST_CASE("BoundedGate: capacity 2 admits two holders, refuses the third within the wait",
+TEST_CASE("BoundedGate: capacity 2 admits two holders, refuses a third within the wait",
           "[pbkdf2_budget][concurrency]") {
     BoundedGate g{2};
     auto a = g.try_acquire_for(std::chrono::milliseconds(10));

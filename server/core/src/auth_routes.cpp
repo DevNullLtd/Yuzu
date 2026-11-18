@@ -2164,6 +2164,42 @@ PasswordCheckResult AuthRoutes::verify_password_with_lockout(const std::string& 
                                                              const PasswordCheckOptions& opts) {
     const bool lockout_active = cfg_.auth_lockout_threshold > 0 && !opts.lockout_exempt;
 
+    // 1. The caller's pre-verify gate (the sso-only local-login gate) runs FIRST, before any
+    // stripe, slot or gate: a refused attempt never hashes, so it must never consume (or be
+    // refused for lack of) shared capacity. Under sso-only every name but an ARMED break-glass
+    // account is rejected here, so unarmed and unknown names never touch the break-glass gate
+    // or any lane (no arm-state or username oracle from saturation).
+    if (opts.pre_verify_gate && !opts.pre_verify_gate())
+        return {PasswordCheckOutcome::kGateRejected, std::nullopt, {}};
+
+    // 2. The armed break-glass account (lockout-exempt on /login) keeps no lockout counter, so it
+    // takes no stripe; its CONCURRENT guesses are bounded instead, in this order: first its
+    // budget slot, NON-blocking with one slot per source address (a second request from the
+    // same source fails fast and never queues), and only then the small shared guess gate
+    // (capacity kBreakGlassGuessConcurrency, bounded wait). Per-source limits therefore sit in
+    // FRONT of the shared gate: one source cannot occupy it, and an attacker's attempts never
+    // wait ahead of another source's.
+    const bool break_glass_attempt = opts.lockout_exempt && opts.metric_route == "login";
+    std::optional<Pbkdf2Budget::Slot> pbkdf2_slot;
+    std::optional<BoundedGate::Permit> bg_permit;
+    if (break_glass_attempt && !auth::password_exceeds_max(password)) {
+        pbkdf2_slot.emplace(acquire_pbkdf2(Pbkdf2Class::kBreakGlass, req, opts.metric_route));
+        if (!pbkdf2_slot->ok())
+            return {PasswordCheckOutcome::kBusy, std::nullopt, {}};
+        stripe_waiters_.fetch_add(1, std::memory_order_relaxed);
+        bg_permit.emplace(break_glass_gate_.try_acquire_for(kLoginStripeWait));
+        stripe_waiters_.fetch_sub(1, std::memory_order_relaxed);
+        if (!bg_permit->ok()) {
+            if (auto* m = auth_mgr_.metrics_registry())
+                m->counter("yuzu_auth_pbkdf2_budget_rejected_total",
+                           {{"route", opts.metric_route},
+                            {"class", "break_glass"},
+                            {"reason", "stripe_busy"}})
+                    .increment();
+            return {PasswordCheckOutcome::kBusy, std::nullopt, {}};
+        }
+    }
+
     // Serialize concurrent attempts for THIS username across the whole
     // lockout-critical section below (pre-check → verify_password →
     // record/clear), so a synchronized burst cannot all pass the stale
@@ -2182,24 +2218,6 @@ PasswordCheckResult AuthRoutes::verify_password_with_lockout(const std::string& 
     // logins for ONE unknown name (which never locks) would otherwise queue unboundedly and
     // starve the pool, invisibly to the slot budget. A timeout answers the existing 429
     // (kBusy), uniform for any name.
-    // The lockout-exempt break-glass account instead takes the dedicated, bounded guess gate
-    // (capacity 2, one slot per source in the budget): it keeps no lockout counter, so without a
-    // bound it would be an unthrottled parallel guessing target.
-    std::optional<BoundedGate::Permit> bg_permit;
-    if (opts.lockout_exempt && opts.metric_route == "login") {
-        stripe_waiters_.fetch_add(1, std::memory_order_relaxed);
-        bg_permit.emplace(break_glass_gate_.try_acquire_for(kLoginStripeWait));
-        stripe_waiters_.fetch_sub(1, std::memory_order_relaxed);
-        if (!bg_permit->ok()) {
-            if (auto* m = auth_mgr_.metrics_registry())
-                m->counter("yuzu_auth_pbkdf2_budget_rejected_total",
-                           {{"route", opts.metric_route},
-                            {"class", "break_glass"},
-                            {"reason", "stripe_busy"}})
-                    .increment();
-            return {PasswordCheckOutcome::kBusy, std::nullopt, {}};
-        }
-    }
     std::unique_lock<std::timed_mutex> login_lk;
     if (lockout_active) {
         login_lk = std::unique_lock<std::timed_mutex>(login_lock_for(username), std::defer_lock);
@@ -2221,14 +2239,6 @@ PasswordCheckResult AuthRoutes::verify_password_with_lockout(const std::string& 
         }
     }
 
-    // The caller's pre-verify gate (the sso-only local-login gate) runs BEFORE any PBKDF2 slot is
-    // taken: a refused attempt never hashes, so it must never consume (or be refused for lack of)
-    // a slot. Under sso-only every name but an ARMED break-glass account is rejected here, so an
-    // anonymous flood cannot fill any lane, and a full lane is only ever visible to a caller that
-    // already named an armed break-glass account (no username oracle from lane saturation).
-    if (opts.pre_verify_gate && !opts.pre_verify_gate())
-        return {PasswordCheckOutcome::kGateRejected, std::nullopt, {}};
-
     // WP03 perf-F1: verify_password spends a PBKDF2 even for an unknown username (F38), so bound
     // the concurrent hashing process-wide, by class and per source. Taken AFTER the stripe (so a
     // slot is never held while only waiting on another request for the same name) but BEFORE the
@@ -2237,11 +2247,9 @@ PasswordCheckResult AuthRoutes::verify_password_with_lockout(const std::string& 
     // and the hash, which is the work it bounds. Full => no hash, no strike. The break-glass
     // account (lockout_exempt under sso-only) has its own capped lane that may use the reserved
     // slots, so an unauthenticated flood on the ordinary lane cannot lock the escape hatch out.
-    std::optional<Pbkdf2Budget::Slot> pbkdf2_slot;
-    if (!auth::password_exceeds_max(password)) {
+    if (!break_glass_attempt && !auth::password_exceeds_max(password)) {
         const bool login_route = opts.metric_route == "login";
         pbkdf2_slot.emplace(acquire_pbkdf2(!login_route         ? Pbkdf2Class::kAuthenticated
-                                           : opts.lockout_exempt ? Pbkdf2Class::kBreakGlass
                                                                  : Pbkdf2Class::kUnauthenticated,
                                            req, opts.metric_route,
                                            login_route ? std::string{} : "u:" + username));

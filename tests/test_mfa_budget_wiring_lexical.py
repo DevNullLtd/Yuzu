@@ -73,29 +73,33 @@ def check_routes(t):
 
 
 def check_gate_order(t):
-    """verify_password_with_lockout: the sso-only gate runs BEFORE the PBKDF2 slot, and the
-    stripe acquire (try_lock_for) comes before the slot; both are bounded-wait."""
-    bad = []
+    """verify_password_with_lockout order: the sso-only gate FIRST (before the break-glass gate,
+    the stripe and every slot); for break-glass the non-blocking per-source budget slot BEFORE
+    the shared guess gate; the stripe only for lockout_active and only with a bounded wait."""
     a = t.find("AuthRoutes::verify_password_with_lockout(")
-    b = t.find("Account-lockout pre-check", a) if a >= 0 else -1
     if a < 0:
         return ["verify_password_with_lockout not found"]
-    body = t[a:] if b < 0 else t[a:]
+    body = t[a:]
     gate = body.find("opts.pre_verify_gate()")
-    slot = body.find("acquire_pbkdf2(")
+    bg_slot = body.find("acquire_pbkdf2(Pbkdf2Class::kBreakGlass")
+    bg_gate = body.find("break_glass_gate_.try_acquire_for(")
     stripe = body.find("try_lock_for(")
-    if gate < 0 or slot < 0 or stripe < 0:
-        return [f"gate/slot/stripe anchors missing ({gate},{slot},{stripe})"]
-    if not gate < slot:
-        bad.append("the sso-only pre_verify_gate must run BEFORE the PBKDF2 slot is taken")
-    if not stripe < gate:
-        bad.append("the bounded stripe wait (try_lock_for) must come before the gate/slot")
-    if "break_glass_gate_.try_acquire_for(" not in body[:slot]:
-        bad.append("the lockout-exempt break-glass guess gate must be taken before the slot")
+    slot = body.find("acquire_pbkdf2(!login_route")
+    anchors = {"pre_verify_gate": gate, "break-glass slot": bg_slot, "break-glass gate": bg_gate,
+               "stripe try_lock_for": stripe, "ordinary slot": slot}
+    missing = [k for k, v in anchors.items() if v < 0]
+    if missing:
+        return [f"anchors missing: {missing}"]
+    bad = []
+    if not gate < bg_slot:
+        bad.append("the sso-only pre_verify_gate must run BEFORE the break-glass slot/gate")
+    if not bg_slot < bg_gate:
+        bad.append("the break-glass per-source budget slot must be taken BEFORE the shared gate")
+    if not gate < stripe or not gate < slot:
+        bad.append("the sso-only pre_verify_gate must run before the stripe and the ordinary slot")
     pre = body[:stripe]
     if "if (lockout_active)" not in pre[-400:]:
-        bad.append("the login stripe must be taken only when lockout_active (a lockout-exempt "
-                   "name such as break-glass must never take it)")
+        bad.append("the login stripe must be taken only when lockout_active")
     if "login_lk.lock()" in body[:slot]:
         bad.append("the login stripe must use try_lock_for, never an unbounded lock()")
     return bad
@@ -176,6 +180,16 @@ def selftest(files):
             failures.append("MUTATION NOT DETECTED: stripe taken for lockout-exempt names")
     else:
         failures.append("selftest cannot find the lockout_active stripe condition")
+    m = dict(files)
+    swapped = base.replace("acquire_pbkdf2(Pbkdf2Class::kBreakGlass", "XX_SLOT", 1).replace(
+        "break_glass_gate_.try_acquire_for(", "acquire_pbkdf2(Pbkdf2Class::kBreakGlass", 1).replace(
+        "XX_SLOT", "break_glass_gate_.try_acquire_for(", 1)
+    if swapped != base:
+        m["auth_routes.cpp"] = swapped
+        if not check(m):
+            failures.append("MUTATION NOT DETECTED: break-glass gate taken before the slot")
+    else:
+        failures.append("selftest cannot find the break-glass slot/gate")
     # A new caller elsewhere must be caught too.
     m = dict(files)
     m["rogue.cpp"] = "void f(){ db->mfa_verify_login_code(u, c); }"
