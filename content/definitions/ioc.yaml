@@ -71,7 +71,8 @@ spec:
           Windows drive, a path under or symlinked into a network mount) and,
           for hashing, a file under /proc, /sys or /dev is NOT examined: it
           is named in a `coverage|<path>|not_examined|<cause>` row, never
-          reported as a clean absence. Hashing reads only regular files of
+          reported as a clean absence; a file that does not exist is a
+          definitive answer (examined), so a clean device reads `complete`. Hashing reads only regular files of
           at most 512 MiB within one 60 s deadline.
       ports:
         type: string

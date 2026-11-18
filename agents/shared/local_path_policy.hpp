@@ -37,8 +37,11 @@
 //     resolving open; the Windows decision is lexical and the plugins that re-judge a canonical
 //     result do so AFTER the canonicalising call has already touched the link. Only a caller that
 //     opens handle-relative with no reparse point (win_no_reparse_open.hpp: ioc, procfetch) never
-//     follows one. filesystem (validate_path and its canonical re-check) and disk_space are
-//     lexical-refusal-only on Windows; link traversal is a residual there.
+//     follows one. filesystem (validate_path and its canonical re-check), disk_space, the
+//     http_client download destination (fs::canonical runs before the re-judge) and, on Windows and
+//     macOS, processes/procfetch's path-resolving sha256_file (macOS procfetch opens through
+//     posix_open_checked) are lexical-refusal-only; link traversal is a residual there with no fix in
+//     this build. `posix_refusal` (lexical) has no production caller: tests only.
 //   * POSIX: a stacked filesystem (overlay or ecryptfs over a network mount), a network type the
 //     deny-list does not name, a bind-mounted NFS subdirectory whose mount point is not itself in
 //     the table, and a mount that appears after the table was read (network_fstype.hpp).
