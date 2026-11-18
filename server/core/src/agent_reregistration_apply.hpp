@@ -8,6 +8,10 @@
 /// live here, so a handler contributes only its transport's evidence. EXTEND it, never fork it.
 
 #include <atomic>
+#include <cctype>
+#include <map>
+#include <mutex>
+#include <vector>
 #include <chrono>
 #include <functional>
 #include <optional>
@@ -72,15 +76,102 @@ inline DenialAuditBudget& reregistration_audit_budget() {
                                &reregistration_audit_now_ms};
     return b;
 }
-/// The ADMITTED row of audit mode (`agent.reregistration_unproven`, result success) is the evidence
-/// that makes a takeover reconstructable, so a legitimate first admit for an id in a window always
-/// leaves a row: it is budgeted PER ID (3 rows per id per 10 s, up to 4096 ids tracked) and an
-/// attacker looping on one known id is cut to that, with ONE aggregate row `suppressed=N` per
-/// closed window plus `yuzu_register_reregistration_audit_dropped_total`. Unbudgeted, a loop
-/// wrote one 330-byte row per attempt (about 28 GB/day at 1000 attempts/s).
-inline DenialAuditBudget& reregistration_unproven_budget() {
-    static DenialAuditBudget b{/*max_rows=*/3, /*window_ms=*/10'000, &reregistration_audit_now_ms,
-                               /*max_keys=*/4096};
+/// Budget for the ADMITTED row of audit mode (`agent.reregistration_unproven`, result success): the
+/// evidence that makes a takeover reconstructable (CC7.2), and a row an unauthenticated caller can
+/// provoke. The design, and what it cannot do:
+///  - a FIRST admit for an id in a window ALWAYS leaves its row, whatever else the window holds
+///    (the table of seen ids filling up does not suppress a new id: it only stops tracking its
+///    repeats), up to a GLOBAL cap of `kNewIdRowsPerWindow` such rows per window;
+///  - REPEATS of an id already seen in the window are cut to `kRepeatRowsPerId` rows;
+///  - everything cut (repeats, and new ids past the global cap) is counted per window and
+///    summarised by ONE aggregate row when the next window opens, written under a SYSTEM
+///    principal (never the opening caller's identity) with the totals and a bounded sample of the
+///    suppressed ids, and by `yuzu_register_reregistration_audit_dropped_total`.
+/// RESIDUAL: the global cap bounds bytes (500 new-id rows / 10 s is about 1.4 GB/day at ~330 B, versus
+/// ~28 GB/day uncapped at 1000/s), so an attacker who can name more than 500 live-leaf ids inside one
+/// window can push a victim's FIRST row past the cap: that row is dropped, counted and summarised,
+/// not written. `yuzu_register_reregistration_total{outcome=...}` is NOT budgeted and is the
+/// authoritative count of every decision; the unproven-rows alert fires on it.
+class UnprovenAuditBudget {
+public:
+    static constexpr std::size_t kNewIdRowsPerWindow = 500;
+    static constexpr std::size_t kRepeatRowsPerId = 3;
+    static constexpr std::size_t kMaxTrackedIds = 4096;
+    static constexpr std::size_t kSampleIds = 5;
+    static constexpr std::int64_t kWindowMs = 10'000;
+
+    struct Decision {
+        bool admitted{false};
+        /// Non-empty only on the call that opens a new window: the CLOSED window's summary.
+        std::string closed_summary;
+    };
+
+    [[nodiscard]] Decision admit(const std::string& agent_id, std::int64_t now_ms) {
+        std::lock_guard lk(mu_);
+        Decision d;
+        if (!open_ || now_ms >= start_ms_ + kWindowMs) {
+            if (open_ && (suppressed_repeats_ > 0 || dropped_new_ > 0))
+                d.closed_summary = summary_locked();
+            open_ = true;
+            start_ms_ = now_ms;
+            seen_.clear();
+            window_new_rows_ = 0;
+            suppressed_repeats_ = dropped_new_ = 0;
+            sample_.clear();
+        }
+        if (const auto it = seen_.find(agent_id); it != seen_.end()) {
+            if (++it->second <= kRepeatRowsPerId) {
+                d.admitted = true;
+            } else {
+                ++suppressed_repeats_;
+                note_sample_locked(agent_id);
+            }
+            return d;
+        }
+        if (window_new_rows_ >= kNewIdRowsPerWindow) {
+            ++dropped_new_;
+            note_sample_locked(agent_id);
+            return d;
+        }
+        ++window_new_rows_;
+        if (seen_.size() < kMaxTrackedIds)
+            seen_.emplace(agent_id, 1);
+        d.admitted = true;
+        return d;
+    }
+
+private:
+    static std::string neutralise(const std::string& id) {
+        std::string out;
+        for (const char c : id.substr(0, 24))
+            out.push_back((std::isalnum(static_cast<unsigned char>(c)) || c == '.' || c == '_' ||
+                           c == ':' || c == '-')
+                              ? c
+                              : '?');
+        return out;
+    }
+    void note_sample_locked(const std::string& id) {
+        if (sample_.size() < kSampleIds)
+            sample_.push_back(neutralise(id));
+    }
+    std::string summary_locked() const {
+        std::string s = "suppressed_repeats=" + std::to_string(suppressed_repeats_) +
+                        " dropped_new_ids=" + std::to_string(dropped_new_) + " sample_ids=";
+        for (std::size_t i = 0; i < sample_.size(); ++i)
+            s += (i ? "," : "") + sample_[i];
+        return s;
+    }
+    std::mutex mu_;
+    bool open_{false};
+    std::int64_t start_ms_{0};
+    std::map<std::string, std::size_t> seen_;
+    std::size_t window_new_rows_{0};
+    std::uint64_t suppressed_repeats_{0};
+    std::uint64_t dropped_new_{0};
+    std::vector<std::string> sample_;
+};
+inline UnprovenAuditBudget& reregistration_unproven_budget() {
+    static UnprovenAuditBudget b;
     return b;
 }
 inline DenialAuditBudget& reregistration_log_budget() {
@@ -109,19 +200,22 @@ inline DenialAuditBudget& reregistration_log_budget() {
         ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
                            std::chrono::system_clock::now().time_since_epoch())
                            .count();
-        ev.principal = "agent:" + agent_id;
-        ev.principal_role = "agent";
+        const bool aggregate = outcome == "aggregate";
+        // An aggregate row summarises OTHER ids and sources: it carries no caller identity
+        // (system principal, target `*`, no source address, no path).
+        ev.principal = aggregate ? std::string("system:reregistration-audit") : "agent:" + agent_id;
+        ev.principal_role = aggregate ? "system" : "agent";
         ev.action = std::string(action);
         ev.target_type = "Agent";
-        ev.target_id = agent_id;
-        std::string d = "path=" + path + " outcome=" + std::string(outcome) +
+        ev.target_id = aggregate ? std::string("*") : agent_id;
+        std::string d = (aggregate ? std::string("outcome=aggregate") : "path=" + path + " outcome=" + std::string(outcome)) +
                         " mode=" + std::string(mode);
         if (!extra.empty())
             d.append(" ").append(extra);
-        if (extend_detail)
+        if (extend_detail && !aggregate)
             extend_detail(d);
         ev.detail = std::move(d);
-        ev.source_ip = source_ip;
+        ev.source_ip = aggregate ? std::string{} : source_ip;
         ev.result = std::string(result);
         if (!store->log(ev)) {
             if (metrics)
@@ -181,10 +275,12 @@ apply_reregistration_gate(ReregistrationProofMode mode, const AgentIdentityHooks
         if (!audit)
             return;
         if (result == "success") {
-            const auto r = detail::reregistration_unproven_budget().try_admit(agent_id, "*");
-            if (r.closed_window_suppressed > 0)
-                emit(action, result, "aggregate",
-                     "suppressed=" + std::to_string(r.closed_window_suppressed));
+            const auto r = detail::reregistration_unproven_budget().admit(
+                agent_id, detail::reregistration_audit_now_ms());
+            // The closed window's summary: ONE row under a system principal (the sink keys on
+            // outcome "aggregate"), never stamped with this (opening) caller's identity.
+            if (!r.closed_summary.empty())
+                emit(action, result, "aggregate", r.closed_summary);
             if (!r.admitted) {
                 if (metrics)
                     metrics
