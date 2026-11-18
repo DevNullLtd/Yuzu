@@ -447,6 +447,10 @@ TEST_CASE("macho: not-this-format inputs", "[binary_header][macho]") {
         const auto wide = parse(java, MachoLimits{.max_fat_archs = 64}); // not the caller's cap either
         REQUIRE_FALSE(wide.has_value());
         CHECK(wide.error() == ParseError::not_this_format);
+        java[7] = '\x2D'; // word 45 (minor 0, major 45): the lowest a class file can carry
+        const auto low = parse(java, MachoLimits{.max_fat_archs = 64});
+        REQUIRE_FALSE(low.has_value());
+        CHECK(low.error() == ParseError::not_this_format);
     }
     SECTION("unknown magic") {
         const auto r = parse(Bytes(64, 'A'));
@@ -488,6 +492,10 @@ TEST_CASE("macho: fat and command caps are refused past the limit and accepted a
         const auto r = parse(canon_fat(), lim);
         REQUIRE_FALSE(r.has_value());
         CHECK(r.error() == ParseError::not_this_format);
+        lim.max_fat_archs = 64; // 44 is the most any cap admits (45 is a class-file word)
+        const auto top = parse(fat_table(false, {}, 44) + Bytes(44 * 20, '\0'), lim);
+        REQUIRE(top.has_value());
+        CHECK(top->slices.size() == 44);
     }
     SECTION("a universal table that runs past the file is truncated") {
         const auto r = parse(fat_table(false, {}, 16)); // header only, 16 entries declared

@@ -453,6 +453,7 @@ TEST_CASE("elf: interpreter degrades, never fails the file", "[binary_header][el
             CHECK(must_read(build(c.spec)).interpreter.empty());
             c.spec.phs[kInterpSeg].off = UINT64_MAX - 3;
             CHECK(must_read(build(c.spec)).interpreter.empty());
+            CHECK(must_read(build(c.spec)).interpreter_unreadable);
         }
         { // [offset, offset + filesz) runs past the end of the file even though a NUL is in it
             auto c = canonical(sh);
@@ -460,6 +461,7 @@ TEST_CASE("elf: interpreter degrades, never fails the file", "[binary_header][el
             c.spec.phs[kInterpSeg].filesz = img.size() - c.interp + 1;
             CHECK(must_read(img).interpreter == kInterp);
             CHECK(must_read(build(c.spec)).interpreter.empty());
+            CHECK(must_read(build(c.spec)).interpreter_unreadable);
         }
         { // the terminator lies one byte after p_filesz: degraded, and that byte is never read
             auto c = canonical(sh);
@@ -470,6 +472,7 @@ TEST_CASE("elf: interpreter degrades, never fails the file", "[binary_header][el
             auto r = bh::read_elf(log.source());
             REQUIRE(r.has_value());
             CHECK(r->interpreter.empty());
+            CHECK(r->interpreter_unreadable);
             CHECK_FALSE(log.touched(c.interp + len));
             CHECK(r->soname == kSoname);
         }
@@ -477,6 +480,7 @@ TEST_CASE("elf: interpreter degrades, never fails the file", "[binary_header][el
             auto c = canonical(sh);
             c.spec.phs[kInterpSeg].filesz = 0;
             CHECK(must_read(build(c.spec)).interpreter.empty());
+            CHECK(must_read(build(c.spec)).interpreter_unreadable);
         }
     }
 }
