@@ -24,7 +24,7 @@ inline constexpr std::size_t kMaxNameLen = 64;
 inline constexpr std::size_t kMaxVersionLen = 32;
 inline constexpr std::size_t kMaxDescriptionLen = 200;
 inline constexpr std::size_t kMaxActions = 64;
-inline constexpr std::size_t kMaxPluginsPerAgent = 64; ///< PluginInfo entries kept per agent
+inline constexpr std::size_t kMaxPluginsPerAgent = 128; ///< PluginInfo entries kept per agent; must exceed the shipped plugin count (test_agent_registry_plugin_meta.cpp)
 inline constexpr std::size_t kMaxActionLen = 64;
 
 [[nodiscard]] inline bool is_ident_char(char c) noexcept {

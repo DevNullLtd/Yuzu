@@ -1346,11 +1346,31 @@ select_catalog_entries(const Agents& agents, const AgentRegistry::CatalogueFilte
         std::map<std::string, std::size_t> versions;
     };
     std::map<std::string, std::map<std::string, Cand>> by_name; // name -> action-set key -> cand
+    // `known` is a linear scan of the capability catalogue and the registry's lock is held, so it
+    // runs once per DISTINCT (plugin, action) - not once per agent x plugin x action. Lookups are
+    // by string_view (no allocation per probe).
+    struct SvHash {
+        using is_transparent = void;
+        std::size_t operator()(std::string_view v) const noexcept {
+            return std::hash<std::string_view>{}(v);
+        }
+    };
+    using ActionMemo = std::unordered_map<std::string, bool, SvHash, std::equal_to<>>;
+    std::unordered_map<std::string, ActionMemo, SvHash, std::equal_to<>> known_memo;
+    auto is_known = [&](const std::string& plugin, const std::string& action) {
+        auto pit = known_memo.find(std::string_view(plugin));
+        if (pit == known_memo.end())
+            pit = known_memo.emplace(plugin, ActionMemo{}).first;
+        auto ait = pit->second.find(std::string_view(action));
+        if (ait == pit->second.end())
+            ait = pit->second.emplace(action, known(plugin, action)).first;
+        return ait->second;
+    };
     for (const auto& s : agents | std::views::values) {
         for (const auto& pm : s->plugin_meta) {
             std::vector<std::string> acts;
             for (const auto& a : pm.actions)
-                if (known(pm.name, a))
+                if (is_known(pm.name, a))
                     acts.push_back(a);
             if (acts.empty())
                 continue;

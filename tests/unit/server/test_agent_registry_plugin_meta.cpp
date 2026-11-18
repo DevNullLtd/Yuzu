@@ -14,6 +14,7 @@
 
 #include "agent.pb.h"
 
+#include <filesystem>
 #include <string>
 
 using yuzu::server::detail::AgentRegistry;
@@ -202,6 +203,48 @@ TEST_CASE("a flood of PluginInfo entries is capped per agent and counted", "[age
     REQUIRE(registry.register_agent(flood).has_value());
     auto help = nlohmann::json::parse(registry.help_json());
     CHECK(help["plugins"].size() <= pmr::kMaxPluginsPerAgent);
-    CHECK(metrics.serialize().find("plugin_meta_dropped_total{field=\"plugins\"} 936") !=
+    CHECK(metrics.serialize().find("plugin_meta_dropped_total{field=\"plugins\"} " +
+                                         std::to_string(1000 - pmr::kMaxPluginsPerAgent)) !=
           std::string::npos);
+}
+
+// The catalogue filter is a linear scan of the capability catalogue and runs under the registry's
+// lock: it is asked once per DISTINCT (plugin, action), not once per agent x plugin x action.
+TEST_CASE("the served-catalogue selection asks the filter once per distinct (plugin, action)",
+          "[agent_registry][plugin_meta][31]") {
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    int asked = 0;
+    registry.set_catalogue_filter([&asked](std::string_view, std::string_view) {
+        ++asked;
+        return true;
+    });
+    for (int i = 0; i < 50; ++i) {
+        auto info = make_info("agent-" + std::to_string(i));
+        add_plugin(info, "status", "1", "", {"version", "info"});
+        add_plugin(info, "os_info", "1", "", {"os_name"});
+        REQUIRE(registry.register_agent(info).has_value());
+    }
+    const auto help = nlohmann::json::parse(registry.help_json());
+    CHECK(help["plugins"].size() == 2);
+    CHECK(asked == 3); // (status,version) (status,info) (os_info,os_name): not 150
+}
+
+// An honest agent reports every plugin it ships; the per-agent cap must not drop any of them. The
+// shipped count is derived from the tree (one directory per plugin under agents/plugins).
+#ifndef YUZU_SERVER_SRC_DIR
+#error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build."
+#endif
+TEST_CASE("the per-agent plugin cap exceeds the number of shipped plugins",
+          "[agent_registry][plugin_meta][31]") {
+    namespace fs = std::filesystem;
+    const fs::path plugins = fs::path(YUZU_SERVER_SRC_DIR) / ".." / ".." / ".." / "agents" / "plugins";
+    std::size_t shipped = 0;
+    std::error_code ec;
+    for (const auto& e : fs::directory_iterator(plugins, ec))
+        if (e.is_directory() && fs::exists(e.path() / "meson.build"))
+            ++shipped;
+    REQUIRE(shipped >= 50); // a wrong path scans zero entries: never pass vacuously
+    CHECK(pmr::kMaxPluginsPerAgent >= shipped);
 }
