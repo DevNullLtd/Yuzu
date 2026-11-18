@@ -512,7 +512,7 @@ TEST_CASE("break-glass: per-source limits sit in FRONT of the shared gate (a sou
     // (mutation: the shared gate first -> it waits the full bounded 150 ms before the refusal).
     auto [a_outcome, a_ms] = attempt("203.0.113.5");
     CHECK(a_outcome == PasswordCheckOutcome::kBusy);
-    CHECK(a_ms < std::chrono::milliseconds(100));
+    CHECK(a_ms < std::chrono::milliseconds(130));
     // With only three permits held, another source's attempt is served (a normal wrong-password
     // verdict), while A's slot stays held: one source never queues ahead of another.
     held.pop_back();

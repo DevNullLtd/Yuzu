@@ -2142,7 +2142,8 @@ void AuthRoutes::emit_event(const std::string& event_type, const httplib::Reques
 // Pick the striped login mutex for a username (account-lockout race close).
 // Same-stripe collisions across distinct usernames serialize harmlessly, but an attacker who can
 // COMPUTE a collision could keep a victim's stripe hot through another name, so the index is
-// salted with a per-process random value (stripe_salt_) that never leaves the process.
+// salted with a per-process random value (stripe_salt_) that never leaves the process (salted, not
+// keyed: std::hash is not a keyed hash, so this raises the bar rather than promising secrecy).
 std::size_t AuthRoutes::login_stripe_index(const std::string& username) const {
     return std::hash<std::string>{}(stripe_salt_ + username) % login_locks_.size();
 }
@@ -2167,18 +2168,19 @@ PasswordCheckResult AuthRoutes::verify_password_with_lockout(const std::string& 
     // 1. The caller's pre-verify gate (the sso-only local-login gate) runs FIRST, before any
     // stripe, slot or gate: a refused attempt never hashes, so it must never consume (or be
     // refused for lack of) shared capacity. Under sso-only every name but an ARMED break-glass
-    // account is rejected here, so unarmed and unknown names never touch the break-glass gate
-    // or any lane (no arm-state or username oracle from saturation).
+    // account is rejected here with the one generic 401, so unarmed, other and unknown names
+    // never touch the break-glass gate or any lane. (An ARMED break-glass attempt can still
+    // answer 429 where they answer 401: see the residue note at the /login call site.)
     if (opts.pre_verify_gate && !opts.pre_verify_gate())
         return {PasswordCheckOutcome::kGateRejected, std::nullopt, {}};
 
     // 2. The armed break-glass account (lockout-exempt on /login) keeps no lockout counter, so it
     // takes no stripe; its CONCURRENT guesses are bounded instead, in this order: first its
-    // budget slot, NON-blocking with one slot per source address (a second request from the
+    // budget slot, NON-blocking with ONE slot per source address (a second request from the
     // same source fails fast and never queues), and only then the small shared guess gate
     // (capacity kBreakGlassGuessConcurrency, bounded wait). Per-source limits therefore sit in
     // FRONT of the shared gate: one source cannot occupy it, and an attacker's attempts never
-    // wait ahead of another source's.
+    // wait ahead of another source's. The gate (4), not the lane size, bounds how many run.
     const bool break_glass_attempt = opts.lockout_exempt && opts.metric_route == "login";
     std::optional<Pbkdf2Budget::Slot> pbkdf2_slot;
     std::optional<BoundedGate::Permit> bg_permit;
@@ -2186,16 +2188,9 @@ PasswordCheckResult AuthRoutes::verify_password_with_lockout(const std::string& 
         pbkdf2_slot.emplace(acquire_pbkdf2(Pbkdf2Class::kBreakGlass, req, opts.metric_route));
         if (!pbkdf2_slot->ok())
             return {PasswordCheckOutcome::kBusy, std::nullopt, {}};
-        stripe_waiters_.fetch_add(1, std::memory_order_relaxed);
         bg_permit.emplace(break_glass_gate_.try_acquire_for(kLoginStripeWait));
-        stripe_waiters_.fetch_sub(1, std::memory_order_relaxed);
         if (!bg_permit->ok()) {
-            if (auto* m = auth_mgr_.metrics_registry())
-                m->counter("yuzu_auth_pbkdf2_budget_rejected_total",
-                           {{"route", opts.metric_route},
-                            {"class", "break_glass"},
-                            {"reason", "stripe_busy"}})
-                    .increment();
+            count_budget_refusal(opts.metric_route, "break_glass", "gate_busy");
             return {PasswordCheckOutcome::kBusy, std::nullopt, {}};
         }
     }
@@ -2214,28 +2209,29 @@ PasswordCheckResult AuthRoutes::verify_password_with_lockout(const std::string& 
     // For an ordinary KNOWN name, hammering it with wrong passwords arms the lockout after
     // `threshold` hashes, after which each request holds the stripe only for the cheap
     // pre-check, so a targeted denial is bounded by the existing time-boxed lockout, not new.
-    // The wait is BOUNDED (kLoginStripeWait): a waiter pins an httplib worker, and a flood of
-    // logins for ONE unknown name (which never locks) would otherwise queue unboundedly and
-    // starve the pool, invisibly to the slot budget. A timeout answers the existing 429
-    // (kBusy), uniform for any name.
+    // The wait is BOUNDED (kLoginStripeWait) and the number of WAITERS is capped
+    // (stripe_waiter_cap_, a fraction of the worker pool): a waiter pins an httplib worker, and
+    // a flood of logins for ONE unknown name (which never locks) would otherwise queue and
+    // starve the pool, invisibly to the slot budget. The lock is tried FIRST, so only a request
+    // that would actually WAIT counts against the cap and an unrelated name is never refused
+    // because of someone else's flood. A refusal (cap or timeout) is the existing 429 (kBusy),
+    // uniform for any name. A flood from many addresses can still occupy that many workers for
+    // up to kLoginStripeWait each; the database-atomic reservation (#8215) removes the stripe.
     std::unique_lock<std::timed_mutex> login_lk;
     if (lockout_active) {
         login_lk = std::unique_lock<std::timed_mutex>(login_lock_for(username), std::defer_lock);
-        stripe_waiters_.fetch_add(1, std::memory_order_relaxed);
-        const bool got = login_lk.try_lock_for(kLoginStripeWait);
-        stripe_waiters_.fetch_sub(1, std::memory_order_relaxed);
-        if (!got) {
-            if (auto* m = auth_mgr_.metrics_registry()) {
-                const bool login_route = opts.metric_route == "login";
-                m->counter("yuzu_auth_pbkdf2_budget_rejected_total",
-                           {{"route", opts.metric_route},
-                            {"class", !login_route          ? "authenticated"
-                                      : opts.lockout_exempt ? "break_glass"
-                                                            : "unauthenticated"},
-                            {"reason", "stripe_busy"}})
-                    .increment();
+        if (!login_lk.try_lock()) {
+            StripeWaiterGuard waiter(stripe_waiters_);
+            const bool login_route = opts.metric_route == "login";
+            const char* cls = !login_route ? "authenticated" : "unauthenticated";
+            if (waiter.prior() >= stripe_waiter_cap_.load(std::memory_order_relaxed)) {
+                count_budget_refusal(opts.metric_route, cls, "stripe_cap");
+                return {PasswordCheckOutcome::kBusy, std::nullopt, {}};
             }
-            return {PasswordCheckOutcome::kBusy, std::nullopt, {}};
+            if (!login_lk.try_lock_for(kLoginStripeWait)) {
+                count_budget_refusal(opts.metric_route, cls, "stripe_busy");
+                return {PasswordCheckOutcome::kBusy, std::nullopt, {}};
+            }
         }
     }
 
@@ -2445,6 +2441,14 @@ PasswordCheckResult AuthRoutes::verify_password_with_lockout(const std::string& 
     }
     // Lockout-critical section complete; the stripe releases on return.
     return {PasswordCheckOutcome::kVerified, verified->role, std::move(verified->hash_hex)};
+}
+
+void AuthRoutes::count_budget_refusal(const std::string& route, const char* cls,
+                                      const char* reason) {
+    if (auto* m = auth_mgr_.metrics_registry())
+        m->counter("yuzu_auth_pbkdf2_budget_rejected_total",
+                   {{"route", route}, {"class", cls}, {"reason", reason}})
+            .increment();
 }
 
 Pbkdf2Budget::Slot AuthRoutes::acquire_pbkdf2(Pbkdf2Class cls, const httplib::Request& req,
@@ -2701,9 +2705,12 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // while armed — an out-of-band host operator ran --break-glass-arm
         // within the window. A non-exempt or un-armed attempt is rejected with
         // the SAME generic 401 as a bad password (no "disabled"/"sso-only"
-        // wording, no Retry-After), so the response BODY/STATUS/HEADERS carry no
-        // enumeration/mode/arm-state oracle, and verify_password (PBKDF2) is
-        // skipped. The one residue is response TIMING: an armed break-glass user
+        // wording, no Retry-After), so the BODY and HEADERS carry no oracle; the STATUS
+        // can, because an ARMED break-glass attempt can answer 429 (a second same-source
+        // request, a full gate or lane) where every other name answers 401. That residue is
+        // equivalent in kind to the timing residue below; the 429 is deliberately NOT turned
+        // into a 401 (it is the operator-facing busy signal). verify_password (PBKDF2) is
+        // skipped for the rejected names. The one residue is response TIMING: an armed break-glass user
         // runs PBKDF2 (slow) while every other username short-circuits (fast),
         // so timing can reveal that the break-glass account is currently armed
         // (and, separately, that the deployment is in sso-only mode) —
@@ -2757,7 +2764,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             // break_glass_login stays true → the success audit + metric + warn
             // fire only AFTER verify_password below confirms the credential, so a
             // wrong-password attempt against the armed account audits as a normal
-            // auth.login_failed (and counts toward lockout), never a spurious
+            // auth.login_failed (the break-glass account keeps no lockout counter), never a spurious
             // "ok" break-glass row.
             return true;
         };

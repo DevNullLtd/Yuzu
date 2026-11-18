@@ -164,8 +164,8 @@ struct PasswordCheckOptions {
     /// break-glass exemption — see `POST /login`). The attempt is still
     /// verified; a failure is still the caller's to audit.
     bool lockout_exempt{false};
-    /// Runs inside the per-username stripe BEFORE any PBKDF2 slot is taken and BEFORE the
-    /// lockout pre-check. Return false to refuse (having written the
+    /// Runs FIRST: before any stripe, PBKDF2 slot, break-glass gate or lockout pre-check.
+    /// Return false to refuse (having written the
     /// response) → `kGateRejected`. `/login` uses this for its sso-only gate.
     std::function<bool()> pre_verify_gate;
     /// Runs on a bad credential BEFORE the lockout accounting, so a route's
@@ -232,6 +232,10 @@ public:
     /// Requests now waiting for a per-username login stripe (a gauge source; bounded by
     /// `kLoginStripeWait` each).
     int stripe_waiters() const { return stripe_waiters_.load(std::memory_order_relaxed); }
+    /// Cap on requests that may wait for a username stripe at once (server.cpp: max(2, pool/8)).
+    void set_stripe_waiter_cap(int cap) {
+        stripe_waiter_cap_.store(cap < 1 ? 1 : cap, std::memory_order_relaxed);
+    }
     /// Test seams: the stripe a name maps to (so a test can hold it) and its index.
     std::size_t login_stripe_index_for_test(const std::string& username) const {
         return login_stripe_index(username);
@@ -742,9 +746,12 @@ public:
     /// The ONE lockout-accounted password check (#5342; extracted,
     /// behaviour-preserving, from `POST /login`'s lockout-critical section so
     /// the self-service current-password proof can never drift from it).
-    /// Under the per-username login stripe (`login_lock_for`, held only when lockout is
-    /// enabled): lockout pre-check (fail-OPEN on a read error, remembered so a
-    /// later success clears defensively) → `opts.pre_verify_gate` → the
+    /// Order: `opts.pre_verify_gate` FIRST (before any stripe, slot or gate); for the armed
+    /// break-glass account its non-blocking per-source slot then the guess gate; otherwise,
+    /// under the per-username login stripe (`login_lock_for`, held only when lockout
+    /// accounting applies; waited for at most `kLoginStripeWait`, waiters capped): the PBKDF2
+    /// slot → lockout pre-check (fail-OPEN on a read error, remembered so a
+    /// later success clears defensively) → the
     /// over-max short-circuit (`password_policy.hpp`) → `verify_password` →
     /// on failure `opts.on_bad_credential` then `record_failed_login` (+ the
     /// threshold-crossing `auth.lockout.applied` audit/event/metric; a store
@@ -1259,15 +1266,32 @@ private:
     std::timed_mutex& login_lock_for(const std::string& username);
     std::size_t login_stripe_index(const std::string& username) const;
     /// Per-process random salt for the stripe index, so a name that collides onto a victim's
-    /// stripe cannot be computed offline.
+    /// stripe is not predictable from outside (salted, not keyed).
     std::string stripe_salt_{std::to_string((static_cast<std::uint64_t>(std::random_device{}()) << 32) ^
                                             std::random_device{}())};
     std::atomic<int> stripe_waiters_{0};
+    /// Most requests allowed to WAIT for a stripe at once (server.cpp: max(2, pool/8)).
+    std::atomic<int> stripe_waiter_cap_{4};
+    /// RAII: counts one stripe waiter for its scope; `prior()` is the count before it joined.
+    class StripeWaiterGuard {
+    public:
+        explicit StripeWaiterGuard(std::atomic<int>& c)
+            : c_(c), prior_(c.fetch_add(1, std::memory_order_relaxed)) {}
+        ~StripeWaiterGuard() { c_.fetch_sub(1, std::memory_order_relaxed); }
+        StripeWaiterGuard(const StripeWaiterGuard&) = delete;
+        StripeWaiterGuard& operator=(const StripeWaiterGuard&) = delete;
+        int prior() const { return prior_; }
+
+    private:
+        std::atomic<int>& c_;
+        int prior_;
+    };
+    void count_budget_refusal(const std::string& route, const char* cls, const char* reason);
     /// Bounds CONCURRENT password guesses against the lockout-exempt break-glass account (which
     /// keeps no lockout counter and so takes no stripe): capacity 4, bounded wait, one object so
     /// no name can collide onto it. Capacity 4 with one slot per source address (taken first, non-blocking) means a single
     /// address cannot hold it and the legitimate operator is not starved by one attacker.
-    static constexpr int kBreakGlassGuessConcurrency = 4;
+    static constexpr int kBreakGlassGuessConcurrency = kBreakGlassLaneMax;
     BoundedGate break_glass_gate_{kBreakGlassGuessConcurrency};
     Pbkdf2Budget pbkdf2_budget_{static_cast<int>(
         std::max(2u, std::thread::hardware_concurrency() / 4))};

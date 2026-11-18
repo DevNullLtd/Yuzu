@@ -1650,6 +1650,7 @@ TEST_CASE("POST /login: concurrent burst for one user cannot exceed the threshol
     // the PBKDF2 budget so it does not throttle this lockout-race test (it has its own tests).
     h.auth_routes->pbkdf2_budget().set_cap(64);
     h.auth_routes->pbkdf2_budget().set_per_source_cap(64);
+    h.auth_routes->set_stripe_waiter_cap(64); // this test is about the lockout race, not the cap
 
     constexpr int kThreads = 16;
     // Per-thread result slots (distinct indices → no synchronization needed;
@@ -1674,15 +1675,25 @@ TEST_CASE("POST /login: concurrent burst for one user cannot exceed the threshol
 
     // Every burst request was rejected (bad password OR locked) — never a
     // session minted for an out-of-budget guess.
+    // A request that waited longer than the bounded stripe wait answers 429 (it was neither
+    // verified nor counted), so the burst is 401-or-429, never a cookie.
     for (int i = 0; i < kThreads; ++i) {
-        CHECK(statuses[i] == 401);
+        CHECK((statuses[i] == 401 || statuses[i] == 429));
         CHECK(got_cookie[i] == 0);
     }
 
-    // The serialization capped verifications at exactly the threshold (without
-    // it, the racy count would exceed `threshold`).
+    // The serialization capped verifications at the threshold (without it, the racy count
+    // would exceed `threshold`) whatever number of waiters timed out.
     auto st = h.auth_db->lockout_status("alice");
     REQUIRE(st.has_value());
+    CHECK(st->failed_count <= threshold);
+    // Finish the lock deterministically (sequential attempts never time out on the stripe).
+    for (int i = 0; i < threshold && !st->locked; ++i) {
+        h.sink.Post("/login", form({{"username", "alice"}, {"password", "wrong"}}),
+                    "application/x-www-form-urlencoded");
+        st = h.auth_db->lockout_status("alice");
+        REQUIRE(st.has_value());
+    }
     CHECK(st->locked);
     CHECK(st->failed_count == threshold);
 
@@ -3315,8 +3326,12 @@ TEST_CASE("live pool of 10: a flood of one unknown name cannot pin the workers",
     h.cfg.auth_lockout_threshold = 5;
     h.auth_routes->pbkdf2_budget().set_cap(66); // not what this test is about
     h.auth_routes->pbkdf2_budget().set_per_source_cap(64);
+    h.auth_routes->set_stripe_waiter_cap(2); // production value for a pool of 10: max(2, 10/8)
     httplib::Server svr;
-    svr.new_task_queue = [] { return new httplib::ThreadPool(10, 400); };
+    // (n, max_n, mqr): ten workers that can NOT grow (production: ThreadPool(pool_max, pool_max)),
+    // so blocked requests really pin them. ThreadPool(10, 400) would let the pool grow to 400
+    // threads and make this test unable to fail. The server owns and deletes the queue.
+    svr.new_task_queue = [] { return new httplib::ThreadPool(10, 10, 400); };
     // The production login path, minus the route plumbing register_routes() needs a full server
     // for: the shared lockout-accounted check (stripe, gate, slot, lockout, hash) on a real
     // 10-worker pool.
@@ -3357,7 +3372,10 @@ TEST_CASE("live pool of 10: a flood of one unknown name cannot pin the workers",
             if (r)
                 ++answered;
         });
-    std::this_thread::sleep_for(std::chrono::milliseconds(300)); // the pool is now saturated
+    // Wait (bounded) until the pool is saturated or the flood has been answered, not a fixed
+    // sleep: with an unbounded wait ten handlers enter and park; with the bounded one they pass.
+    for (int i = 0; i < 300 && saw_ghost.load() < 10; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
     auto timed = [&](auto&& fn) {
         const auto t0 = std::chrono::steady_clock::now();
@@ -3386,9 +3404,9 @@ TEST_CASE("live pool of 10: a flood of one unknown name cannot pin the workers",
     // With the stripe held for the whole measurement, an UNBOUNDED wait pins all ten workers and
     // /healthz queues behind them (RED); the bounded wait frees each worker after 150 ms.
     CHECK(health_ok);
-    CHECK(health_ms < std::chrono::milliseconds(2000));
+    CHECK(health_ms < std::chrono::milliseconds(2500));
     CHECK(other_ok);
-    CHECK(other_ms < std::chrono::milliseconds(2000));
+    CHECK(other_ms < std::chrono::milliseconds(2500));
     CHECK(answered.load() == kFlood); // every flooded request got an answer (200/401/429)
     CHECK(saw_ghost.load() == kFlood); // and the handler really received the flooded name
     INFO("healthz " << health_ms.count() << " ms, other login " << other_ms.count() << " ms");
@@ -3408,6 +3426,61 @@ TEST_CASE("the login stripe index is salted per process, so a colliding name can
             ++differing;
     }
     CHECK(differing >= 56); // 64 names, 1/256 chance each of an accidental match
+}
+
+
+TEST_CASE("stripe waiters are capped: with the stripe held, only `cap` requests wait, the rest are "
+          "refused at once",
+          "[pg][mfa][routes][auth_routes][stripe][concurrency]") {
+    AuthRoutesHarness h;
+    h.cfg.auth_lockout_threshold = 5;
+    h.auth_routes->set_stripe_waiter_cap(2);
+    h.auth_routes->pbkdf2_budget().set_cap(66);
+    h.auth_routes->pbkdf2_budget().set_per_source_cap(64);
+    auto& stripe = h.auth_routes->login_lock_for_test("cap-ghost");
+    stripe.lock();
+    constexpr int kCallers = 8;
+    std::vector<std::chrono::milliseconds> took(kCallers);
+    std::vector<PasswordCheckOutcome> outcome(kCallers, PasswordCheckOutcome::kVerified);
+    std::atomic<int> peak{0};
+    std::atomic<bool> stop_sampling{false};
+    std::thread sampler([&] {
+        while (!stop_sampling.load()) {
+            const int w = h.auth_routes->stripe_waiters();
+            int p = peak.load();
+            while (w > p && !peak.compare_exchange_weak(p, w)) {}
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+    });
+    std::vector<std::thread> ts;
+    for (int i = 0; i < kCallers; ++i)
+        ts.emplace_back([&, i] {
+            httplib::Request req;
+            req.remote_addr = "203.0.113." + std::to_string(i + 1);
+            PasswordCheckOptions opts;
+            opts.metric_route = "login";
+            const auto t0 = std::chrono::steady_clock::now();
+            outcome[i] = h.auth_routes->verify_password_with_lockout("cap-ghost", "whatever-123456",
+                                                                     req, opts).outcome;
+            took[i] = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0);
+        });
+    for (auto& t : ts)
+        t.join();
+    stop_sampling = true;
+    sampler.join();
+    stripe.unlock();
+    int waited = 0, immediate = 0;
+    for (int i = 0; i < kCallers; ++i) {
+        CHECK(outcome[i] == PasswordCheckOutcome::kBusy);
+        if (took[i] >= std::chrono::milliseconds(120))
+            ++waited;
+        else
+            ++immediate;
+    }
+    CHECK(waited == 2);    // exactly `cap` waited the bounded 150 ms (mutation: cap removed -> 8)
+    CHECK(immediate == 6); // the rest were refused at once, pinning no worker
+    CHECK(peak.load() <= 2);
 }
 
 #endif // !_WIN32

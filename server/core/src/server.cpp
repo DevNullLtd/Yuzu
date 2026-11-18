@@ -1111,8 +1111,8 @@ public:
                           "reserved in the auth store (nothing was verified)",
                           "counter");
         metrics_.describe("yuzu_auth_pbkdf2_budget_rejected_total",
-                          "Password-hash requests refused 429 by the concurrency budget "
-                          "(labels: route, class, reason)",
+                          "Password-hash requests refused 429 by the concurrency budget, stripe or "
+                          "break-glass gate (labels: route, class, reason)",
                           "counter");
         // Pre-seed so the first lock / refusal reads as an increase from 0, not a new series.
         for (const char* n : {"yuzu_auth_mfa_lockout_applied_total",
@@ -1122,15 +1122,16 @@ public:
         for (const char* route : {"login", "password_change", "mfa_recovery"})
             for (const char* cls : {"unauthenticated", "authenticated", "break_glass"})
                 for (const char* reason : {"per_source", "per_principal", "class_full",
-                                           "global_full", "stripe_busy"})
+                                           "global_full", "stripe_busy", "stripe_cap",
+                                           "gate_busy"})
                     metrics_.counter("yuzu_auth_pbkdf2_budget_rejected_total",
                                      {{"route", route}, {"class", cls}, {"reason", reason}});
-        metrics_.describe("yuzu_auth_pbkdf2_budget_in_flight",
+        metrics_.describe("yuzu_auth_pbkdf2_budget_in_flight_peak",
                           "Peak password-hash (PBKDF2) slots in use since the previous periodic sweep",
                           "gauge");
         metrics_.describe("yuzu_auth_login_stripe_waiters",
                           "Login requests now waiting (at most 150 ms each) for their username's "
-                          "serialisation stripe",
+                          "serialisation stripe (the break-glass gate wait is not counted)",
                           "gauge");
         metrics_.describe("yuzu_auth_pbkdf2_budget_capacity",
                           "Process-wide cap on concurrent password-hash (PBKDF2) work", "gauge");
@@ -10427,7 +10428,7 @@ public:
                     {
                         // Peak since the last sweep: an instantaneous reading is ~0 for a
                         // 50-150 ms hash.
-                        metrics_.gauge("yuzu_auth_pbkdf2_budget_in_flight")
+                        metrics_.gauge("yuzu_auth_pbkdf2_budget_in_flight_peak")
                             .set(static_cast<double>(auth_routes_->pbkdf2_budget().take_peak()));
                         metrics_.gauge("yuzu_auth_login_stripe_waiters")
                             .set(static_cast<double>(auth_routes_->stripe_waiters()));
@@ -16653,6 +16654,10 @@ private:
                 static_cast<int>(std::min(cap_want, std::max<std::size_t>(4, pool_max / 2)));
             auth_routes_->set_pbkdf2_cap(pbkdf2_cap);
             auth_routes_->pbkdf2_budget().set_per_source_cap(cfg_.auth_pbkdf2_per_source_cap);
+            // Most requests that may WAIT for a username stripe at once (each pins a worker for
+            // up to 150 ms): an eighth of the pool, at least 2.
+            auth_routes_->set_stripe_waiter_cap(
+                static_cast<int>(std::max<std::size_t>(2, pool_max / 8)));
             metrics_.gauge("yuzu_auth_pbkdf2_budget_capacity").set(static_cast<double>(pbkdf2_cap));
         }
         // A security-relevant toggle nobody can confirm the state of is an operability

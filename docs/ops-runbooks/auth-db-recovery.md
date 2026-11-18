@@ -630,7 +630,7 @@ until `--auth-lockout-window-secs` passes (audit: `auth.mfa.lockout.applied`, th
 4. **Direct SQL** (last resort, writes no audit row; see the fallback above, which now clears the
    three MFA columns too).
 
-**Clock note.** Lock windows are measured by the Postgres clock (`now()`), so a step of the database clock shifts them: a forward step of at least the REMAINING lock time ends a live lock early and starts a fresh failure count (a new set of guesses), and a backward step lengthens it. An operator unlock still clears a lock.
+**Clock note.** Lock windows are measured by the Postgres clock (`now()`), so a step of the database clock shifts them: a forward step of at least the REMAINING lock time ends a live lock early and starts a fresh failure count (a new set of guesses), and a backward step lengthens it. An operator unlock still clears a lock. Accepted by the owner (2026-11-18) as a documented residual.
 
 **Sole-administrator wedge.** If the only administrator's second factor is locked, they hold no API
 token and no break-glass account is configured, options 2 and `--break-glass-arm` are unavailable:
@@ -641,11 +641,7 @@ use `--mfa-reset <user>` and re-enrol, or wait out the window. A self-service pa
 not be reserved in the auth store, so the code was deliberately NOT checked (fail closed). Treat it
 as an auth-store outage (see the store sections above), not a wrong code.
 
-**`429` with `Retry-After: 2` at `/login`, `/login/mfa` or the password-change proof.** The
-process-wide concurrent password-hash cap is full for that lane (metric
-`yuzu_auth_pbkdf2_budget_rejected_total{route,class,reason}`). Nothing was hashed or counted. A
-sustained rate from many addresses is unauthenticated load; behind a proxy, raise
-`--auth-pbkdf2-per-source-cap`.
+**`429` with `Retry-After: 2` at `/login`, `/login/mfa` or the password-change proof.** A concurrency limit refused the request before any password was checked or counted. Read `reason` on `yuzu_auth_pbkdf2_budget_rejected_total{route,class,reason}`: `per_source` / `per_principal` / `class_full` / `global_full` (a hashing lane is full), `stripe_busy` (waited 150 ms for the per-username stripe), `stripe_cap` (too many requests already waiting for a stripe) or `gate_busy` (waited 150 ms for the break-glass gate). A sustained rate from many addresses is login load, not a store fault; behind a proxy, raise `--auth-pbkdf2-per-source-cap`. The stripe is per server process (N replicas: up to threshold x N guesses; tracked as #8215).
 
 **v4 migration did not apply** ("Migration lock timeout" above): the `ALTER TABLE` uses a 3 s
 `lock_timeout` and the next boot retries it. Until it applies the auth store does not open and the server refuses to start (fail closed).
@@ -1300,7 +1296,7 @@ whatever the running service passes in its unit file. Omit it and the command
 exits non-zero with `error: --break-glass-arm requires --break-glass-user`,
 arming nothing.
 
-Break-glass password attempts are bounded without a lockout: at most 4 in flight, 1 per source address (a second request from the same address is refused at once), each waiting at most 150 ms for the shared gate and otherwise refused `429` (`yuzu_auth_pbkdf2_budget_rejected_total{class="break_glass",reason="stripe_busy"}`), so a flood of attempts at the account from four or more addresses can make the operator's own attempt answer `429` until it stops; retry, nothing is locked. The break-glass exemption is from the **password lockout only**: wrong TOTP or recovery codes still
+Break-glass password attempts are bounded without a lockout: they take no per-username stripe; each attempt first takes a non-blocking per-source slot (one per source address, so a second request from the same address is refused `429` at once), then waits at most 150 ms for a shared gate of 4 attempts in flight (`yuzu_auth_pbkdf2_budget_rejected_total{route="login",class="break_glass"}` with `reason` `per_source`, `class_full`, `global_full` or `gate_busy`). A flood of attempts at the account from four or more addresses can therefore make the operator's own attempt answer `429` until it stops; retry, nothing is locked. The gate is per server process (N replicas allow 4 x N concurrent attempts). The break-glass exemption is from the **password lockout only**: wrong TOTP or recovery codes still
 spend the per-account second-factor failure budget, so a break-glass login can be refused with the
 uniform `401` while that account's second factor is locked. Arming resets that lock in the same
 statement (the audit row says so), which is the host-side remedy; see

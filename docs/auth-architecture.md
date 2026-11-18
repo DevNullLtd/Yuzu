@@ -332,8 +332,11 @@ scope here.
   `AuthRoutes`, not the database, so it still only serializes attempts within
   one server process. A DB-atomic attempt-reservation (now straightforward on
   Postgres — e.g. `UPDATE ... WHERE failed_login_count < threshold RETURNING`)
-  is the multi-replica-correct form and remains a tracked follow-up, not
-  something this migration delivered incidentally. `login_rate_limit` remains
+  is the multi-replica-correct form and remains a tracked follow-up (#8215), not
+  something this migration delivered incidentally. The stripe wait is bounded
+  (150 ms) and the number of waiters capped (`max(2, pool/8)`), so a flood of one
+  name cannot queue unboundedly; the stripe is per process (N replicas: up to
+  threshold x N guesses). `login_rate_limit` remains
   the companion control for the distributed vector.
   - *On failure*: `record_failed_login` increments the counter and arms
     `locked_until` on the threshold-th failure. A window that has **fully
@@ -1933,7 +1936,7 @@ account policy)"* — this ships **both** halves.
   clock of at least the remaining lock time ends a live lock early and starts a fresh failure
   count (a new set of guesses); a backward step lengthens the lock. This is a limit of
   database-clock authority shared with the password lockout; an operator unlock still clears a
-  lock. Owner ruling pending.
+  lock. Accepted by the owner (2026-11-18) as a documented residual.
 - **Arming is an out-of-band host operation, never a session route.** The IdP
   being down is *why* you break the glass, so arming cannot depend on a login.
   `yuzu-server --break-glass-arm` (with `--break-glass-user` + `--postgres-dsn`

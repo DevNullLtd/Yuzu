@@ -13,16 +13,20 @@
 /// FAIRNESS (cap C; the default pool of 264 gives C = 66): the budget is split so no class can
 /// starve another.
 ///   - kBreakGlass (a /login naming the armed break-glass account under sso-only) owns a FLOOR of
-///     `bg_cap = max(1, max(1, C/2)/2)` slots (16 at C = 66) that no other class can consume:
-///     the other two classes together are bounded at `main_cap = C - bg_cap` (50). The lane is
-///     also capped at `bg_cap` and subject to the per-source cap.
+///     `bg_cap = min(4, max(1, max(1, C/2)/2))` slots (4 at C = 66) that no other class can
+///     consume: the other two classes together are bounded at `main_cap = C - bg_cap` (62). The
+///     lane is exactly its size (the guess gate in AuthRoutes admits the same 4 at once) and is
+///     held to ONE slot per source address whatever the configured per-source cap; it takes no
+///     per-username stripe.
 ///   - kUnauthenticated (POST /login, the recovery-code check behind a pending login token) may
-///     hold at most `main_cap - max(1, main_cap/2)` slots (25) and at most `per_source_cap` per
+///     hold at most `main_cap - max(1, main_cap/2)` slots (31) and at most `per_source_cap` per
 ///     source address.
 ///   - kAuthenticated (step-up recovery, the password-change proof) may hold at most
-///     `max(1, main_cap/2)` (25), and at most `per_principal_cap` (3) per principal, so one
+///     `max(1, main_cap/2)` (31), and at most `per_principal_cap` (3) per principal, so one
 ///     session holder cannot fill even that. The split with kUnauthenticated is fixed (no
 ///     borrowing), so neither class can fill the main share and starve /login or step-up.
+/// Per-source keys are per class ("bg:" prefix for break-glass), so an unauthenticated hash from
+/// an address never blocks that address's break-glass attempt and vice versa.
 /// Header-only, no I/O.
 
 #include <algorithm>
@@ -34,6 +38,10 @@
 #include <unordered_map>
 
 namespace yuzu::server {
+
+/// Most concurrent break-glass attempts process-wide: the guess gate size AND the break-glass
+/// lane size, so the lane the budget reserves is exactly the lane that is reachable.
+inline constexpr int kBreakGlassLaneMax = 4;
 
 enum class Pbkdf2Class { kUnauthenticated, kAuthenticated, kBreakGlass };
 enum class Pbkdf2Refusal { kNone, kPerSource, kPerPrincipal, kClassFull, kGlobalFull };
@@ -113,7 +121,9 @@ public:
                                    const std::string& principal = {}) {
         // Build everything that can throw (the key copy) BEFORE touching a counter, so a
         // bad_alloc cannot leak a slot.
-        std::string key = cls == Pbkdf2Class::kAuthenticated ? principal : source;
+        std::string key = cls == Pbkdf2Class::kAuthenticated ? principal
+                          : cls == Pbkdf2Class::kBreakGlass   ? "bg:" + source
+                                                              : source;
         std::lock_guard lk(mu_);
         const int bgc = bg_cap(cap_);
         const int main_cap = cap_ - bgc;
@@ -158,7 +168,9 @@ public:
     }
 
 private:
-    static int bg_cap(int cap) { return std::max(1, std::max(1, cap / 2) / 2); }
+    static int bg_cap(int cap) {
+        return std::min(kBreakGlassLaneMax, std::max(1, std::max(1, cap / 2) / 2));
+    }
 
     void release(Pbkdf2Class cls, const std::string& key) {
         std::lock_guard lk(mu_);

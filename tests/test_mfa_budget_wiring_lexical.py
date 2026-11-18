@@ -83,7 +83,7 @@ def check_gate_order(t):
     gate = body.find("opts.pre_verify_gate()")
     bg_slot = body.find("acquire_pbkdf2(Pbkdf2Class::kBreakGlass")
     bg_gate = body.find("break_glass_gate_.try_acquire_for(")
-    stripe = body.find("try_lock_for(")
+    stripe = body.find("try_lock_for(kLoginStripeWait)")
     slot = body.find("acquire_pbkdf2(!login_route")
     anchors = {"pre_verify_gate": gate, "break-glass slot": bg_slot, "break-glass gate": bg_gate,
                "stripe try_lock_for": stripe, "ordinary slot": slot}
@@ -98,10 +98,22 @@ def check_gate_order(t):
     if not gate < stripe or not gate < slot:
         bad.append("the sso-only pre_verify_gate must run before the stripe and the ordinary slot")
     pre = body[:stripe]
-    if "if (lockout_active)" not in pre[-400:]:
+    if "if (lockout_active)" not in pre[-1200:]:
         bad.append("the login stripe must be taken only when lockout_active")
     if "login_lk.lock()" in body[:slot]:
         bad.append("the login stripe must use try_lock_for, never an unbounded lock()")
+    fn_end = body.find("PasswordVerifyFn AuthRoutes::password_change_verify_fn")
+    fn = body if fn_end < 0 else body[:fn_end]
+    if "std::defer_lock" not in fn:
+        bad.append("the login stripe unique_lock must be constructed with std::defer_lock")
+    if re.search(r"(?:lock_guard|scoped_lock)<std::timed_mutex>", fn):
+        bad.append("no lock_guard/scoped_lock on a login stripe (unbounded wait)")
+    if re.search(r"unique_lock<std::timed_mutex>\s*\w*\s*[({][^)};]*login_lock_for\([^)]*\)\s*[)}]", fn):
+        bad.append("a login stripe unique_lock without std::defer_lock blocks unboundedly")
+    if "try_lock_for(std::chrono" in fn:
+        bad.append("the stripe wait must be kLoginStripeWait, not an ad-hoc duration")
+    if "stripe_waiter_cap_" not in fn or "StripeWaiterGuard" not in fn:
+        bad.append("the stripe waiter cap (StripeWaiterGuard + stripe_waiter_cap_) is missing")
     return bad
 
 
@@ -190,6 +202,19 @@ def selftest(files):
             failures.append("MUTATION NOT DETECTED: break-glass gate taken before the slot")
     else:
         failures.append("selftest cannot find the break-glass slot/gate")
+    for label, a, b in (
+        ("stripe without defer_lock", "login_lock_for(username), std::defer_lock)", "login_lock_for(username))"),
+        ("ad-hoc stripe wait", "try_lock_for(kLoginStripeWait)", "try_lock_for(kLoginStripeWait)) || login_lk.try_lock_for(std::chrono::hours(1)"),
+        ("extra lock_guard", "std::unique_lock<std::timed_mutex> login_lk;", "std::lock_guard<std::timed_mutex> extra(login_lock_for(username)); std::unique_lock<std::timed_mutex> login_lk;"),
+        ("waiter cap dropped", "stripe_waiter_cap_.load", "stripe_cap_gone_.load"),
+    ):
+        if a in base:
+            m = dict(files)
+            m["auth_routes.cpp"] = base.replace(a, b, 1)
+            if not check(m):
+                failures.append(f"MUTATION NOT DETECTED: {label}")
+        else:
+            failures.append(f"selftest cannot find the text for: {label}")
     # A new caller elsewhere must be caught too.
     m = dict(files)
     m["rogue.cpp"] = "void f(){ db->mfa_verify_login_code(u, c); }"
