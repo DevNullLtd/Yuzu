@@ -291,9 +291,10 @@ metadata:
     Homebrew gap). Monitor the COVERAGE rows other than the standing Homebrew text (which every healthy Mac emits), not the UNREADABLE count: the
     UNREADABLE count includes the standing Open Ports row and excludes the
     software-list and CVE-input causes. The counts cover only the
-    software enumerated. On macOS the UNREADABLE count is at least 1 on a
-    healthy host because of the standing "Open Ports" row (the open-port check
-    does not exist there).
+    software enumerated. On macOS the UNREADABLE count is 1 on a healthy host
+    whose status tools all read, because of the standing "Open Ports" row (the
+    open-port check does not exist there), and one more for each configuration
+    read that failed.
   tags: [security, vulnerability, compliance, dashboard]
 
 spec:
