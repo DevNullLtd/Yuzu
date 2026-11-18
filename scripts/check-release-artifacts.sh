@@ -48,13 +48,20 @@
 #   (yuzu-agent-bundle-chisel is built after the release from its assets, so
 #   its SBOM is not a release asset and is not expected here.)
 #
-#   Image vulnerability gate reports (WP15/S9), for the same six images:
-#     trivy-<image>.json + .txt + .gate.txt   (e.g. trivy-yuzu-server.json)
-#   Trivy's are required (the coverage check reads Trivy's report); another
-#   scanner's (grype-<image>.*) are optional, but EVERY *.gate.txt present,
-#   whichever scanner wrote it, must record a pass and no failure.
-#   (the agent bundle's report is attached after the release, for the same
-#   reason as its SBOM: release.yml attach-bundle-gate-report.)
+#   Image vulnerability gate reports (WP15/S9), for the same six images, named
+#   per workflow run attempt (release.yml passes --attempt):
+#     trivy-<image>.attempt-<N>.json + .txt + .gate.txt
+#                                  (e.g. trivy-yuzu-server.attempt-1.json)
+#   A re-run adds its attempt's reports beside the earlier attempts' (which
+#   stay, a refusal's included: they are the evidence that the gate refused).
+#   For each image and scanner, the reports of the HIGHEST attempt present are
+#   the ones the published image passed: Trivy's three are required for it
+#   (the coverage check reads Trivy's report), and its .gate.txt must record a
+#   pass and no other gate result, whichever scanner wrote it (another
+#   scanner's, grype-<image>.attempt-<N>.*, is optional). An earlier attempt's
+#   .gate.txt may record a failure. A gate report not named per attempt is
+#   refused. (The agent bundle's report is attached after the release, for the
+#   same reason as its SBOM: release.yml attach-bundle-gate-report.)
 #
 # Every file's name must also be one GitHub stores unchanged (letters,
 # digits, ".", "_" and "-", starting with a letter or digit), or SHA256SUMS
@@ -179,18 +186,8 @@ GATE_REPORT_IMAGES=(
   "yuzu-agent-chisel"
 )
 
-for img in "${GATE_REPORT_IMAGES[@]}"; do
-  for suffix in json txt gate.txt; do
-    f="trivy-${img}.${suffix}"
-    if [[ ! -s "$ART_DIR/$f" ]]; then
-      echo "::error::missing or empty image vulnerability gate report: $f" >&2
-      fail=1
-    fi
-  done
-done
-
-# Every gate verdict file, whichever scanner wrote it: at least one `gate: pass`
-# line and NO line that records any other gate result (`gate: FAIL...`,
+# A gate verdict file records a pass when it has a `gate: pass` line and NO
+# line that records any other gate result (`gate: FAIL...`,
 # `<scanner> gate: FAIL...`). Requiring only a pass line would let a second
 # scanner's failure, appended to the same file, through.
 gate_verdict_bad() {
@@ -198,13 +195,53 @@ gate_verdict_bad() {
   grep -qx 'gate: pass' "$f" || return 0
   grep -E '(^|[[:space:]])gate:' "$f" | grep -qvE '(^|[[:space:]])gate: pass$'
 }
+
+# Every gate report file must be named <scanner>-<image>.attempt-<N>.<ext>.
+# latest[<scanner>-<image>] is the highest attempt N present.
+declare -A latest=()
 shopt -s nullglob
-gate_files=("$ART_DIR"/trivy-*.gate.txt "$ART_DIR"/grype-*.gate.txt)
+gate_all=("$ART_DIR"/trivy-* "$ART_DIR"/grype-*)
 shopt -u nullglob
-for f in "${gate_files[@]}"; do
-  [[ -s "$f" ]] || continue
-  if gate_verdict_bad "$f"; then
-    echo "::error::${f##*/} does not record a passing gate (a pass line and no other gate result)" >&2
+for f in "${gate_all[@]}"; do
+  [[ -f "$f" ]] || continue
+  name="${f##*/}"
+  if [[ ! "$name" =~ ^((trivy|grype)-[a-z0-9][a-z0-9._-]*)\.attempt-([1-9][0-9]{0,3})\.(json|txt|gate\.txt)$ ]]; then
+    echo "::error::$name is not a gate report named <scanner>-<image>.attempt-<N>.{json,txt,gate.txt}" >&2
+    fail=1
+    continue
+  fi
+  key="${BASH_REMATCH[1]}"
+  n="${BASH_REMATCH[3]}"
+  if [[ -z "${latest[$key]:-}" ]] || (( n > latest[$key] )); then
+    latest[$key]="$n"
+  fi
+done
+
+for img in "${GATE_REPORT_IMAGES[@]}"; do
+  n="${latest[trivy-$img]:-}"
+  if [[ -z "$n" ]]; then
+    echo "::error::missing image vulnerability gate report: trivy-${img}.attempt-<N>.gate.txt" >&2
+    fail=1
+    continue
+  fi
+  for suffix in json txt gate.txt; do
+    f="trivy-${img}.attempt-${n}.${suffix}"
+    if [[ ! -s "$ART_DIR/$f" ]]; then
+      echo "::error::missing or empty image vulnerability gate report: $f (attempt $n is the latest)" >&2
+      fail=1
+    fi
+  done
+done
+
+# The latest attempt's verdict, for every scanner and image present. Earlier
+# attempts' verdicts are evidence and may record a failure.
+for key in "${!latest[@]}"; do
+  f="$ART_DIR/${key}.attempt-${latest[$key]}.gate.txt"
+  if [[ ! -s "$f" ]]; then
+    echo "::error::${f##*/} is missing or empty (attempt ${latest[$key]} is the latest for ${key})" >&2
+    fail=1
+  elif gate_verdict_bad "$f"; then
+    echo "::error::${f##*/} does not record a passing gate (a pass line and no other gate result); it is the latest attempt for ${key}" >&2
     fail=1
   fi
 done

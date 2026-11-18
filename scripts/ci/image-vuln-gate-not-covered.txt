@@ -15,7 +15,10 @@
 # pre-release.yml's tags end in it; it is matched EXACTLY (never a prefix or a
 # substring). approved_by is the GitHub login of the person who accepted that
 # the image ships unscanned, approval_ref the pull request in which they did,
-# approved_on its date. Until that review exists, write `approved_on=-
+# approved_on its date: a recorded reference the gate checks for format only
+# (nothing verifies the pull request or the approver; the control is review of
+# the change to this file; procedure: docs/ci-architecture.md "Recording an
+# approval"). Until it is recorded, write `approved_on=-
 # approval_ref=pending`: a pending listing is not honoured by the release gate
 # (--release), so the image fails there as unscanned. expires is at most 92
 # days out; an expired listing is not honoured anywhere, so the listing is

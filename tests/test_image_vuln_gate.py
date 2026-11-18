@@ -114,6 +114,13 @@ STUB = textwrap.dedent(
         sys.exit(0)
     image = args[-1]
     gate = "--exit-code" in args
+    if mode == "hang" and not gate:
+        # A scan that does not finish: the cancellation tests signal the gate
+        # while it waits here, and check this process is gone afterwards.
+        import time
+        open(os.environ["STUB_LOG"] + ".pid", "w").write(str(os.getpid()))
+        time.sleep(60)
+        sys.exit(0)
     if image in os.environ.get("STUB_MISSING_IMAGES", "").split(","):
         # Like trivy: with `--image-src docker` an image missing from the local
         # daemon is an error; without it trivy falls back to containerd,
@@ -675,10 +682,12 @@ class GateBehaviour(unittest.TestCase):
 
     def test_os_release_with_no_advisories_fails(self):
         # debian:sid-slim with real Trivy 0.70.0: 77 packages, 0 findings,
-        # "covered"; the canary of the same release matches nothing.
+        # "covered"; the canary of the same release matches nothing. (sid is
+        # now refused earlier as a pre-release; a released-looking version
+        # with no advisory bucket still reaches the canary.)
         rep = self.tmp / "rep"
         r = self.run_gate("img:1", extra=("--report-dir", str(rep)),
-                          env_extra={"STUB_OS": "debian:forky/sid", "STUB_CANARY": "none"})
+                          env_extra={"STUB_OS": "debian:99.1", "STUB_CANARY": "none"})
         self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
         self.assertIn("no advisory data", r.stderr)
         gate_txt = (rep / "trivy-img.gate.txt").read_text(encoding="utf-8")
@@ -740,6 +749,103 @@ class GateBehaviour(unittest.TestCase):
         r = self.run_gate("yuzu-server-chisel=img:3", os_pkgs="0", extra=("--release",))
         self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
         self.assertIn("approval_ref is pending", r.stderr)
+
+
+    # ── G8P3-unhappy-path-1: a pre-release OS version is not covered ──
+    def test_pre_release_os_fails_without_a_canary(self):
+        # Trivy trims alpine 3.24.0_alpha... to 3.24 and debian 13.0~rc1 to 13,
+        # so the canary of the released set matches and the image read as
+        # covered (chaos- and unhappy-path-verified with Trivy 0.70.0).
+        for os_ in ("alpine:3.24.0_alpha20260101", "debian:13.0~rc1", "debian:forky/sid"):
+            with self.subTest(os=os_):
+                self.log.unlink(missing_ok=True)
+                rep = self.tmp / ("rep-" + os_.replace(":", "-").replace("/", "-").replace("~", "-"))
+                r = self.run_gate("img:1", extra=("--report-dir", str(rep)), env_extra={"STUB_OS": os_})
+                self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+                self.assertIn("no advisory data for a pre-release", r.stderr)
+                gate_txt = (rep / "trivy-img.gate.txt").read_text(encoding="utf-8")
+                self.assertIn("gate: FAIL: no advisory data for a pre-release OS release", gate_txt)
+                self.assertEqual(self.canaries(), [])
+
+    # ── G8P3-security-guardian-1: a one-word `paths` item is refused ──
+    def test_paths_naming_a_trivy_target_or_type_is_refused(self):
+        # The chaos case: paths ["Python"] hid CVE-2020-14343 (PyYAML 5.3.1)
+        # in a real Trivy 0.70.0 --release run, because Trivy matches `paths`
+        # against the aggregate "Python" target too.
+        for name in ('"Python"', "python", '"Node.js"', "Java", "gobinary", "os-pkgs", "lang-pkgs",
+                     "debian", ".NET", '"python-pkg"'):
+            with self.subTest(paths=name):
+                self.log.unlink(missing_ok=True)
+                r = self.assert_refused("vulnerabilities:\n" + entry(paths=[name]), name)
+                self.assertIn("is a Trivy result target, class or type name", r.stderr)
+
+    def test_paths_without_a_slash_is_refused(self):
+        for name in ('"gosu"', "METADATA", '"x.jar"'):
+            with self.subTest(paths=name):
+                self.log.unlink(missing_ok=True)
+                r = self.assert_refused("vulnerabilities:\n" + entry(paths=[name]), name)
+                self.assertIn("has no '/'", r.stderr)
+
+    # ── G8P3-security-guardian-2: reports are named per run attempt ──
+    def test_attempt_names_the_reports_and_a_rerun_adds_beside_them(self):
+        rep = self.tmp / "rep"
+        r = self.run_gate("img:1", mode="findings", extra=("--report-dir", str(rep), "--attempt", "1"))
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        r = self.run_gate("img:1", extra=("--report-dir", str(rep), "--attempt", "2"))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        names = sorted(p.name for p in rep.iterdir())
+        self.assertEqual(names, [f"trivy-img.attempt-{n}.{s}" for n in (1, 2) for s in ("gate.txt", "json", "txt")])
+        a1 = (rep / "trivy-img.attempt-1.gate.txt").read_text(encoding="utf-8")
+        a2 = (rep / "trivy-img.attempt-2.gate.txt").read_text(encoding="utf-8")
+        self.assertIn("run attempt: 1\n", a1)
+        self.assertIn("gate: FAIL: fixable CRITICAL", a1)
+        self.assertIn("run attempt: 2\n", a2)
+        self.assertIn("gate: pass", a2)
+
+    def test_attempt_is_validated(self):
+        for extra in (("--attempt", "0", "--report-dir", "r"), ("--attempt", "x", "--report-dir", "r"),
+                      ("--attempt", "12345", "--report-dir", "r"), ("--attempt", "1")):
+            with self.subTest(extra=extra):
+                r = self.run_gate("img:1", extra=extra)
+                self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                self.assertEqual(self.calls(), [])
+
+    # ── G8P3-release-deploy-3: a cancelled gate still writes its report ──
+    def start_gate(self, *images, extra=()):
+        env = dict(os.environ)
+        for k in list(env):
+            if k.startswith("TRIVY_") or k.startswith("STUB_") or k.startswith("GITHUB_"):
+                del env[k]
+        env.update(TRIVY_BIN=str(self.stub), STUB_LOG=str(self.log), STUB_MODE="hang",
+                   YUZU_TRIVYIGNORE=str(IGNORE), YUZU_GATE_TEST_DB_DIGEST=DB_DIGEST,
+                   RUNNER_TEMP=str(self.tmp))
+        return subprocess.Popen(["bash", str(GATE), *extra, *images], env=env,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    def test_sigterm_and_sigint_write_a_cancelled_report(self):
+        import signal
+        import time
+        for sig, rc, label in ((signal.SIGTERM, 143, "SIGTERM"), (signal.SIGINT, 130, "SIGINT")):
+            with self.subTest(sig=label):
+                pidfile = Path(str(self.log) + ".pid")
+                pidfile.unlink(missing_ok=True)
+                rep = self.tmp / ("rep-" + label)
+                p = self.start_gate("a=img:1", extra=("--report-dir", str(rep), "--attempt", "3"))
+                deadline = time.monotonic() + 30
+                while not pidfile.exists() and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                self.assertTrue(pidfile.exists(), "the stub scan never started")
+                time.sleep(0.2)
+                started = time.monotonic()
+                p.send_signal(sig)
+                out, err = p.communicate(timeout=30)
+                self.assertLess(time.monotonic() - started, 15, "the trap waited for the scan to finish")
+                self.assertEqual(p.returncode, rc, out + err)
+                t = (rep / "trivy-a.attempt-3.gate.txt").read_text(encoding="utf-8")
+                self.assertIn(f"gate: FAIL: cancelled ({label}) before this image was judged", t)
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(int(pidfile.read_text()), 0)  # the scan was stopped, not left running
+                self.assertEqual(list(self.tmp.glob("yuzu-image-vuln-gate.*")), [], "WORK not removed")
 
 
 @unittest.skipUnless(have_bash(), "uses the gate's checker the same way the gate does")
@@ -900,6 +1006,106 @@ class Checks(unittest.TestCase):
     def test_resolve_digest_refuses_a_malformed_reference(self):
         for ref in ("mirror.gcr.io/aquasec/trivy-db", "http://x/y:2", "a b/c:2"):
             self.assertEqual(self.run_checks("resolve-digest", ref).returncode, 1, ref)
+
+    # ── G8P3-unhappy-path-2: the digest lookup has an overall deadline ──
+    def test_resolve_digest_gives_up_at_its_deadline_on_a_trickling_registry(self):
+        # A registry that answers one byte at a time never trips a per-read
+        # timeout; only the overall deadline ends the lookup.
+        import socket
+        import threading
+        import time
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        stop = threading.Event()
+        self.addCleanup(stop.set)
+        self.addCleanup(srv.close)
+
+        def trickle():
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return
+            with conn:
+                try:
+                    conn.recv(4096)  # the ClientHello
+                    conn.sendall(b"\x16\x03\x03\x40\x00")  # a 16 KiB handshake record...
+                    while not stop.is_set():
+                        conn.sendall(b"\x00")  # ...sent one byte at a time
+                        time.sleep(0.2)
+                except OSError:
+                    return
+
+        threading.Thread(target=trickle, daemon=True).start()
+        ref = f"127.0.0.1:{srv.getsockname()[1]}/aquasec/trivy-db:2"
+        started = time.monotonic()
+        r = subprocess.run([sys.executable, "-I", str(CHECKS), "resolve-digest", ref, "--deadline", "2"],
+                           capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("no answer within the 2s deadline", r.stderr)
+        self.assertLess(time.monotonic() - started, 10)
+
+    def test_resolve_digest_deadline_is_bounded(self):
+        for d in ("0", "3601", "x"):
+            r = self.run_checks("resolve-digest", "ghcr.io/aquasecurity/trivy-db:2", "--deadline", d)
+            self.assertNotEqual(r.returncode, 0, d)
+
+    # ── G8P3-unhappy-path-1: every pre-release spelling ──
+    def test_pre_release_os_versions_are_refused(self):
+        for fam, name in (("alpine", "3.24.0_alpha20260101"), ("alpine", "3.23.0_rc1"),
+                          ("alpine", "3.23.0_beta2"), ("alpine", "3.23.0_pre1"), ("alpine", "3.23.0_git20260101"),
+                          ("alpine", "3.24_RC3"), ("debian", "13.0~rc1"), ("debian", "14.0~alpha1"),
+                          ("debian", "forky/sid"), ("debian", "trixie/testing"), ("ubuntu", "26.10-rc1"),
+                          ("ubuntu", "26.10.beta"), ("ubuntu", "26.10+dev"), ("alpine", "edge"),
+                          ("debian", "13~"), ("ubuntu", "26.10-snapshot1")):
+            with self.subTest(os=f"{fam} {name}"):
+                r = self.run_checks("coverage", self.trivy_report(5, fam, name), "x", self.nc(nc_line()))
+                self.assertEqual(r.returncode, 1, r.stdout)
+                self.assertIn("verdict=pre-release", r.stdout)
+                self.assertIn("no advisory data for a pre-release", r.stderr)
+
+    def test_os_version_must_be_a_released_number(self):
+        for fam, name in (("debian", "12.0+deb12u1"), ("debian", "13.7.1.2"), ("ubuntu", "26.04 LTS"),
+                          ("alpine", "3.23.8a"), ("debian", "v13")):
+            with self.subTest(os=f"{fam} {name}"):
+                r = self.run_checks("coverage", self.trivy_report(5, fam, name), "x", self.nc(nc_line()))
+                self.assertEqual(r.returncode, 1, r.stdout)
+                self.assertIn("verdict=unsupported-os", r.stdout)
+        for fam, name in (("debian", "13.7"), ("debian", "12"), ("ubuntu", "26.04"), ("alpine", "3.23.8")):
+            with self.subTest(os=f"{fam} {name}"):
+                r = self.run_checks("coverage", self.trivy_report(5, fam, name), "x", self.nc(nc_line()))
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                self.assertIn("verdict=covered", r.stdout)
+
+    # ── G8P3-release-deploy-1: the pre-tag pending check ──
+    def test_pending_check(self):
+        ign = self.tmp / "ign.yaml"
+        ign.write_text("vulnerabilities:\n" + entry(id="CVE-2000-0001"), encoding="utf-8")
+        ok_nc = self.nc(nc_line())
+        r = self.run_checks("pending", ign, ok_nc)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        pend = self.tmp / "pend.yaml"
+        pend.write_text("vulnerabilities:\n" + entry(id="CVE-2000-0002", approved_on=None, approval_ref="pending"),
+                        encoding="utf-8")
+        r = self.run_checks("pending", pend, ok_nc)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("CVE-2000-0002: approval_ref is pending", r.stderr)
+        p_nc = self.tmp / "pnc.txt"
+        p_nc.write_text(nc_line(on="-", ref="pending"), encoding="utf-8")
+        r = self.run_checks("pending", ign, p_nc)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("yuzu-server-chisel: approval_ref is pending", r.stderr)
+        # An expired pending entry is not in force anywhere, so not pending.
+        old = self.tmp / "old.yaml"
+        old.write_text("vulnerabilities:\n" + entry(id="CVE-2000-0003", approved_on=None, approval_ref="pending",
+                                                     expired_at=days(-1)), encoding="utf-8")
+        self.assertEqual(self.run_checks("pending", old, ok_nc).returncode, 0)
+        bad = self.tmp / "bad.yaml"
+        bad.write_text("vulnerabilities:\n" + entry(paths=['"**"']), encoding="utf-8")
+        self.assertEqual(self.run_checks("pending", bad, ok_nc).returncode, 1)
+        bad_nc = self.tmp / "bnc.txt"
+        bad_nc.write_text("junk\n", encoding="utf-8")
+        self.assertEqual(self.run_checks("pending", ign, bad_nc).returncode, 1)
 
     def test_emitted_copy_is_the_entries_in_force_only(self):
         src = self.tmp / "src.yaml"
@@ -1245,16 +1451,24 @@ class WorkflowWiring(unittest.TestCase):
             gate = body.find("scripts/ci/image-vuln-gate.sh")
             gate_step = body[body.rfind("- name:", 0, gate):body.find("- name:", gate)]
             self.assertIn(f"NAME: {name}\n", gate_step, job)
+            self.assertIn('exec scripts/ci/image-vuln-gate.sh --release --attempt "$GITHUB_RUN_ATTEMPT"',
+                          gate_step, job)
             self.assertIn('--report-dir "$RUNNER_TEMP/image-vuln-gate" "$NAME=$IMAGE"', gate_step, job)
             check = body.find("scripts/ci/image-identity.sh verify-pushed")
             check_step = body[body.rfind("- name:", 0, check):body.find("- name:", check)]
-            self.assertIn('>> "$RUNNER_TEMP/image-vuln-gate/trivy-$NAME.gate.txt"', check_step, job)
+            self.assertIn('>> "$RUNNER_TEMP/image-vuln-gate/trivy-$NAME.attempt-$GITHUB_RUN_ATTEMPT.gate.txt"',
+                          check_step, job)
             up = body.find("- name: Upload image vulnerability gate report")
             self.assertGreater(up, check, job)
             up_step = body[up:body.find("- name:", up + 1)]
             self.assertIn("path: ${{ runner.temp }}/image-vuln-gate/", up_step, job)
             self.assertIn("retention-days: 90", up_step, job)
             self.assertIn("if-no-files-found: error", up_step, job)
+            # G8P3-security-guardian-2: one artifact per run attempt, never
+            # overwritten, so a re-run cannot erase a refusal's evidence.
+            self.assertRegex(up_step, r"\n\s+name: [^\n]+-image-vuln-gate-attempt-\$\{\{ github\.run_attempt \}\}\n",
+                             job)
+            self.assertNotRegex(up_step, r"\n\s+overwrite:\s*true", job)
         rel = job_block(text, "release")
         self.assertIn("-name 'trivy-*.json'", rel)
         self.assertIn('*.spdx.json "${gate_reports[@]}" > SHA256SUMS', rel)
@@ -1264,7 +1478,8 @@ class WorkflowWiring(unittest.TestCase):
         # C2 / G8-RD-2: the upload runs whenever the gate ran, pass or fail,
         # behind an explicit status function (a bare `if:` is success() only).
         text = RELEASE.read_text(encoding="utf-8")
-        cond = "if: always() && (steps.gate.outcome == 'success' || steps.gate.outcome == 'failure')"
+        cond = ("if: always() && (steps.gate.outcome == 'success' || steps.gate.outcome == 'failure' "
+                "|| steps.gate.outcome == 'cancelled')")
         for job in sorted(j for _, j in GATED_PUSH_JOBS):
             body = job_block(text, job)
             gate = body.find("scripts/ci/image-vuln-gate.sh")
@@ -1299,11 +1514,17 @@ class WorkflowWiring(unittest.TestCase):
         self.assertIn("if: always() && needs.release.result == 'success' && "
                       "needs.docker-publish-agent-bundle.outputs.gate_report == 'true'", att)
         self.assertIn("contents: write", att)
-        self.assertIn("name: yuzu-agent-bundle-chisel-image-vuln-gate", att)
-        self.assertIn("reports=(trivy-yuzu-agent-bundle-chisel.* grype-yuzu-agent-bundle-chisel.*)", att)
+        self.assertIn("gate_attempt: ${{ steps.gate_report_uploaded.outputs.attempt }}", bundle)
+        self.assertIn("name: yuzu-agent-bundle-chisel-image-vuln-gate-attempt-"
+                      "${{ needs.docker-publish-agent-bundle.outputs.gate_attempt }}", att)
+        self.assertIn('stem="yuzu-agent-bundle-chisel.attempt-${ATTEMPT}"', att)
+        self.assertIn('reports=("trivy-${stem}".* "grype-${stem}".*)', att)
+        self.assertIn('sums="yuzu-agent-bundle-chisel-image-vuln-gate.attempt-${ATTEMPT}.SHA256SUMS"', att)
         for needle in ('cosign sign-blob --yes "$sums"', "cosign verify-blob", "--certificate-identity",
-                       'gh release upload "${GITHUB_REF_NAME}" --clobber'):
+                       'gh release upload "${GITHUB_REF_NAME}" "${upload[@]}"', "cmp -s"):
             self.assertIn(needle, att)
+        # Add, never replace (G8P3-security-guardian-2): no --clobber upload.
+        self.assertNotRegex(att, r"gh release upload[^\n]*--clobber")
         self.assertNotRegex(att, r"\bdocker\s+(?:build|buildx|run|push)|actions/checkout",
                             "the job that holds contents: write builds and checks out nothing")
 

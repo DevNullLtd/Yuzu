@@ -19,11 +19,20 @@ Every subcommand fails CLOSED (exit 1) on anything it cannot read.
             approval_ref: "#1234"      required: the pull request that approved
                                        it (`#N` or its URL), or `pending`
 
-      A `paths` item must be one concrete relative path: no empty string, no
-      whitespace, no glob character (`* ? [ ] { } !`), no backslash, no leading
-      `/`, no `.`/`..`/empty component. Trivy matches `paths` as doublestar
-      globs, and an OS package has an empty path, so `**`, `*` or `""` would
-      suppress the CVE in every package. A `purls` item must be a full package
+      approved_by, approved_on and approval_ref are a RECORDED REFERENCE:
+      checked for format only (a login, a past date, `#N` or a pull-request
+      URL). Nothing here asks GitHub whether the pull request exists or was
+      approved by approved_by; the control is review of the change that adds
+      the entry (docs/ci-architecture.md "Recording an approval").
+
+      A `paths` item must be one concrete relative path to a file in the
+      image: it contains a `/`, and has no empty string, no whitespace, no glob
+      character (`* ? [ ] { } !`), no backslash, no leading `/`, no
+      `.`/`..`/empty component, and is not a Trivy result target, class or
+      type name (TRIVY_RESULT_NAMES). Trivy matches `paths` as doublestar
+      globs against a package's path AND its result's target, and an OS
+      package has an empty path, so `**`, `*`, `""` or `Python` would
+      suppress the CVE in every package (of the image, or of a language). A `purls` item must be a full package
       URL with a type, a name and an `@version` (Trivy matches a purl without
       a version against every version), with no glob character.
 
@@ -43,15 +52,25 @@ Every subcommand fails CLOSED (exit 1) on anything it cannot read.
       Validate scripts/ci/image-vuln-gate-not-covered.txt (same approval
       fields; format in that file's header).
 
+  pending IGNORE_FILE NOT_COVERED_FILE
+      The release skills' pre-tag check: validate both files and fail (exit 1)
+      when any ignore entry or not-covered listing that is not expired still
+      has approval_ref `pending`, or when either file is malformed. A release
+      gate does not honour a pending one, so a tag cut with one fails at that
+      image's publish leg after the other legs have pushed.
+
   db-age METADATA_JSON [--downloaded-after EPOCH]
       Read Trivy's DB metadata.json, print UpdatedAt, DownloadedAt and the age,
       and fail when UpdatedAt is older than MAX_DB_AGE_HOURS, lies more than an
       hour in the future, or is unreadable; with --downloaded-after, also when
       DownloadedAt is earlier than EPOCH (the DB was not downloaded by this run).
 
-  resolve-digest REPOSITORY:TAG
+  resolve-digest REPOSITORY:TAG [--deadline SECONDS]
       Resolve a registry tag to its manifest digest (anonymous OCI registry
       API), so the DB download can be pinned to it and the digest recorded.
+      The whole lookup (token and manifest requests) has one overall deadline
+      (default RESOLVE_DEADLINE): the per-request timeout alone restarts on
+      every byte, so a registry trickling bytes could hold it indefinitely.
 
   coverage TRIVY_REPORT_JSON NAME NOT_COVERED_FILE [--require-approved]
       Read a TRIVY JSON report (SchemaVersion 2; another scanner's report is
@@ -62,7 +81,14 @@ Every subcommand fails CLOSED (exit 1) on anything it cannot read.
           NOT_COVERED_FILE (exact name match);
         - Trivy marks the OS release end of service life (Metadata.OS.EOSL);
         - the OS family is not one the gate can prove has advisory data
-          (CANARY_FAMILIES; see canary-rootfs).
+          (CANARY_FAMILIES; see canary-rootfs);
+        - the OS version is a pre-release (`verdict=pre-release`: a marker
+          such as `_alpha`, `_rc`, `~`, `-rc`; PRERELEASE_MARKER) or not a
+          released version number (`verdict=unsupported-os`). Trivy trims a
+          pre-release version into the released advisory set (Alpine
+          3.24.0_alpha... reads as 3.24, Debian 13.0~rc1 as 13), so a canary
+          would match and the image would read as covered without advisory
+          data for what it ships.
 
   canary-rootfs DIR FAMILY OS_NAME
       Write a minimal root filesystem that Trivy detects as FAMILY OS_NAME,
@@ -83,6 +109,7 @@ import hashlib
 import json
 import os
 import re
+import signal
 import sys
 import urllib.error
 import urllib.parse
@@ -116,11 +143,51 @@ PURL = re.compile(
     r"(?:\?[A-Za-z0-9._~%+-]+=[A-Za-z0-9._~%+:/-]+(?:&[A-Za-z0-9._~%+-]+=[A-Za-z0-9._~%+:/-]+)*)?$")
 IMAGE_NAME = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 
+# Names Trivy gives a scan result (Target, Class or Type) rather than a file.
+# Trivy matches an entry's `paths` against the result's Target as well as the
+# package's path, so a `paths` item equal to an aggregate target such as
+# `Python` hides the CVE in every Python package of the image (chaos-verified
+# with Trivy 0.70.0, G8P3-security-guardian-1). Every `paths` item must also
+# contain a '/', which already refuses each name below; this list states the
+# reason. Sources: the Class/Type values Trivy 0.70.0's JSON reports for the
+# published images (os-pkgs, lang-pkgs; debian, ubuntu, alpine, gobinary,
+# checked 2026-11-18; their os-pkgs targets hold a space and are refused as
+# whitespace), the aggregate language targets, and Trivy's documented OS and
+# language package types.
+TRIVY_RESULT_NAMES = frozenset(n.casefold() for n in (
+    # result classes
+    "os-pkgs", "lang-pkgs", "config", "secret", "license", "license-file", "custom",
+    # aggregate language targets (one result for all packages of a language)
+    "Python", "Conda", "Node.js", "Java", "Ruby", "Rust", "Go", ".NET", "PHP", "Dart",
+    "Elixir", "Swift", "Julia", "C++", "Bitnami",
+    # OS types
+    "alma", "alpine", "amazon", "azurelinux", "bottlerocket", "cbl-mariner", "centos", "chainguard",
+    "coreos", "debian", "echo", "fedora", "minimos", "opensuse", "opensuse.leap",
+    "opensuse.tumbleweed", "oracle", "photon", "redhat", "rocky", "sles", "sl-micro", "ubuntu",
+    "wolfi",
+    # language package types
+    "bundler", "gemspec", "cargo", "composer", "composer-vendor", "npm", "yarn", "pnpm", "bun",
+    "node-pkg", "javascript", "nuget", "dotnet-core", "packages-props", "pip", "pipenv", "poetry",
+    "uv", "python-pkg", "conda-pkg", "conda-environment", "jar", "pom", "gradle", "sbt",
+    "gobinary", "gomod", "rustbinary", "conan", "cocoapods", "swift", "pub", "hex", "bitnami",
+    "julia",
+))
+
 # OS families the gate has a canary for (canary-rootfs). Every image the
 # release publishes is on one of these; another family fails the gate until a
 # canary is added for it.
 CANARY_FAMILIES = ("debian", "ubuntu", "alpine")
 OS_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/+~-]{0,63}$")
+# A pre-release marker in an OS version: Alpine `_alpha`/`_beta`/`_pre`/`_rc`/
+# `_git` (edge reports 3.25.0_alpha20260101), Debian's `~` (13.0~rc1), and the
+# `-rc`/`.rc`/`+beta` spellings. Trivy keeps only the leading release of such a
+# version when it looks up advisories (Alpine major.minor, Debian major), so a
+# pre-release reads as covered by the released set (G8P3-unhappy-path-1).
+PRERELEASE_MARKER = re.compile(
+    r"~|[._+-](?:alpha|beta|pre|rc|git|svn|cvs|hg|dev|snapshot)|(?:sid|testing|edge|devel)$", re.I)
+# The released version shapes the canary families use: Debian 12.15, Ubuntu
+# 26.04, Alpine 3.23.8.
+RELEASED_VERSION = re.compile(r"^[0-9]+(?:\.[0-9]+){0,2}$")
 
 
 class Bad(Exception):
@@ -285,7 +352,7 @@ def list_item(raw, where):
 
 
 def path_problem(p):
-    """Why `p` is not one concrete relative path, or None."""
+    """Why `p` is not one concrete relative path to a file in the image, or None."""
     if p != p.strip() or any(c.isspace() for c in p):
         return "contains whitespace"
     if any(c in GLOB_CHARS for c in p):
@@ -294,6 +361,12 @@ def path_problem(p):
         return "contains a backslash"
     if p.startswith("/"):
         return "starts with '/': Trivy's package paths are relative (usr/local/bin/gosu)"
+    if p.casefold() in TRIVY_RESULT_NAMES:
+        return ("is a Trivy result target, class or type name, not a path: Trivy matches `paths` against a "
+                "result's target too, so it would hide the CVE in every package of that result")
+    if "/" not in p:
+        return ("is not a path inside the image (it has no '/'): write the file's path, e.g. "
+                "usr/local/bin/gosu; a one-word value can match a Trivy target such as `Python`")
     for comp in p.split("/"):
         if comp in ("", ".", ".."):
             return "has an empty, '.' or '..' component"
@@ -420,8 +493,9 @@ def cmd_ignore_file(path, emit=None, require_approved=False):
         if pending:
             if require_approved:
                 pending_excluded += 1
-                print(f"NOT IN FORCE: {tag}: approval_ref is pending; a release gate honours only an approved "
-                      f"acceptance (set approval_ref and approved_on from the approving pull request)")
+                print(f"NOT IN FORCE: {tag}: approval_ref is pending; a release gate honours only an acceptance "
+                      f"whose approval is recorded (set approval_ref and approved_on from the approving pull "
+                      f"request: docs/ci-architecture.md \"Recording an approval\")")
                 continue
             pending_honoured += 1
             print(f"warning: {tag}: approval_ref is pending; honoured here, but the release gate "
@@ -437,7 +511,7 @@ def cmd_ignore_file(path, emit=None, require_approved=False):
         except OSError as e:
             print(f"cannot write {emit}: {e}", file=sys.stderr)
             return 1
-    print(f"{path}: {len(entries)} entry(ies), each with a concrete scope, a statement, an expiry and an approval record")
+    print(f"{path}: {len(entries)} entry(ies), each with a concrete scope, a statement, an expiry and approval fields (format-checked only)")
     print(f"in_force={len(in_force)}")
     print(f"pending={pending_excluded + pending_honoured}")
     print(f"pending_not_honoured={pending_excluded}")
@@ -500,7 +574,34 @@ def _bearer_challenge(header):
     return dict(re.findall(r'(\w+)="([^"]*)"', m.group(1)))
 
 
-def cmd_resolve_digest(ref, timeout=30):
+RESOLVE_DEADLINE = 90
+
+
+class Deadline(Exception):
+    pass
+
+
+def _alarm(signum, frame):
+    raise Deadline()
+
+
+def cmd_resolve_digest(ref, timeout=30, deadline=RESOLVE_DEADLINE):
+    if not 1 <= deadline <= 3600:
+        print(f"resolve-digest: deadline {deadline} is outside 1..3600 seconds", file=sys.stderr)
+        return 1
+    old = signal.signal(signal.SIGALRM, _alarm)
+    signal.alarm(deadline)
+    try:
+        return _resolve_digest(ref, timeout)
+    except Deadline:
+        print(f"resolve-digest: {ref}: no answer within the {deadline}s deadline", file=sys.stderr)
+        return 1
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old)
+
+
+def _resolve_digest(ref, timeout):
     m = re.match(r"^([a-z0-9.-]+(?::[0-9]+)?)/([a-z0-9._/-]+):([A-Za-z0-9._-]+)$", ref)
     if not m:
         print(f"resolve-digest: {ref!r} is not REGISTRY/REPOSITORY:TAG", file=sys.stderr)
@@ -615,6 +716,40 @@ def cmd_not_covered(path, require_approved=False):
     return 0
 
 
+def cmd_pending(ignore_path, not_covered_path):
+    """Exit 1 when either file is malformed or anything in force is pending."""
+    found = []
+    try:
+        with open(ignore_path, encoding="utf-8") as f:
+            entries = parse_ignore(f.read())
+    except (OSError, UnicodeDecodeError, Bad) as e:
+        print(f"{ignore_path}: {e}", file=sys.stderr)
+        return 1
+    if cmd_ignore_file(ignore_path) != 0:
+        return 1
+    now = today()
+    for e in entries:
+        exp = parse_date(e.get("expired_at"))
+        if e.get("approval_ref") == PENDING and exp is not None and exp >= now:
+            found.append(f"{ignore_path}:{e['_line']}: {e['id']}: approval_ref is pending")
+    try:
+        listed = read_not_covered(not_covered_path, require_approved=True)
+    except (OSError, UnicodeDecodeError, Bad) as e:
+        print(f"{not_covered_path}: {e}", file=sys.stderr)
+        return 1
+    for name, (_, in_force, why) in listed.items():
+        if not in_force and "pending" in why:
+            found.append(f"{not_covered_path}: {name}: approval_ref is pending")
+    for m in found:
+        print(m, file=sys.stderr)
+    if found:
+        print(f"{len(found)} acceptance(s) or listing(s) pending approval: a release gate does not honour them, "
+              f"so record each approving pull request and date before tagging", file=sys.stderr)
+        return 1
+    print("no pending acceptance or listing")
+    return 0
+
+
 # ── coverage ────────────────────────────────────────────────────────────────
 def load_trivy_report(report):
     with open(report, encoding="utf-8") as f:
@@ -676,6 +811,17 @@ def cmd_coverage(report, name, not_covered, require_approved=False):
         if not OS_NAME.match(os_name):
             print("verdict=unsupported-os")
             print(f"{name or report}: OS version {os_name!r} is not one the gate can name", file=sys.stderr)
+            return 1
+        if PRERELEASE_MARKER.search(os_name):
+            print("verdict=pre-release")
+            print(f"{name or report}: {os_desc} is a pre-release, and there is no advisory data for a "
+                  f"pre-release: Trivy reads it against the released version's advisories, so a clean scan "
+                  f"proves nothing. Build on a released OS version", file=sys.stderr)
+            return 1
+        if not RELEASED_VERSION.match(os_name):
+            print("verdict=unsupported-os")
+            print(f"{name or report}: OS version {os_name!r} is not a released version number "
+                  f"(N, N.N or N.N.N), so the gate cannot show advisory data exists for it", file=sys.stderr)
             return 1
         print("verdict=covered")
         print("coverage=covered")
@@ -798,13 +944,18 @@ def main(argv):
             pos, f = flags(argv[1:], {"--require-approved": False})
             if len(pos) == 1:
                 return cmd_not_covered(pos[0], bool(f.get("--require-approved")))
+        elif len(argv) == 3 and argv[0] == "pending":
+            return cmd_pending(argv[1], argv[2])
         elif argv and argv[0] == "db-age":
             pos, f = flags(argv[1:], {"--downloaded-after": True})
             if len(pos) == 1:
                 after = f.get("--downloaded-after")
                 return cmd_db_age(pos[0], int(after) if after is not None else None)
-        elif len(argv) == 2 and argv[0] == "resolve-digest":
-            return cmd_resolve_digest(argv[1])
+        elif argv and argv[0] == "resolve-digest":
+            pos, f = flags(argv[1:], {"--deadline": True})
+            if len(pos) == 1:
+                d = f.get("--deadline")
+                return cmd_resolve_digest(pos[0], deadline=int(d) if d is not None else RESOLVE_DEADLINE)
         elif argv and argv[0] == "coverage":
             pos, f = flags(argv[1:], {"--require-approved": False})
             if len(pos) == 3:

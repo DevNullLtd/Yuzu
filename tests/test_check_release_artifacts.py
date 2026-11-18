@@ -49,6 +49,13 @@ def script_gate_report_images() -> list:
     return re.findall(r'^\s*"([^"]+)"', block, re.M)
 
 
+def write_reports(d: Path, img: str, attempt: int, verdict: str = "pass", scanner: str = "trivy") -> None:
+    stem = f"{scanner}-{img}.attempt-{attempt}"
+    (d / f"{stem}.json").write_text(json.dumps({"ArtifactName": img}))
+    (d / f"{stem}.txt").write_text("table\n")
+    (d / f"{stem}.gate.txt").write_text(f"image: {img}\nrun attempt: {attempt}\ngate: {verdict}\n")
+
+
 def make_artifacts(d: Path) -> None:
     for name in ARCHIVES + PACKAGES:
         (d / name).write_bytes(b"x")
@@ -56,9 +63,7 @@ def make_artifacts(d: Path) -> None:
         for fmt in ("cdx.json", "spdx.json"):
             (d / f"{base}.{fmt}").write_text(json.dumps({"name": base}))
     for img in script_gate_report_images():
-        (d / f"trivy-{img}.json").write_text(json.dumps({"ArtifactName": img}))
-        (d / f"trivy-{img}.txt").write_text("table\n")
-        (d / f"trivy-{img}.gate.txt").write_text(f"image: {img}\ngate: pass\n")
+        write_reports(d, img, 1)
 
 
 # Not on Windows: there `bash` resolves to the WSL stub, which refuses to run as
@@ -122,32 +127,42 @@ class GateReports(unittest.TestCase):
     def test_each_missing_report_fails(self):
         for img in script_gate_report_images():
             for suffix in ("json", "txt", "gate.txt"):
-                with self.subTest(report=f"trivy-{img}.{suffix}"), \
+                with self.subTest(report=f"trivy-{img}.attempt-1.{suffix}"), \
                         tempfile.TemporaryDirectory(prefix="yuzu_test_rel_") as t:
                     d = Path(t)
                     make_artifacts(d)
-                    (d / f"trivy-{img}.{suffix}").unlink()
+                    (d / f"trivy-{img}.attempt-1.{suffix}").unlink()
                     r = self.run_script(d)
                     self.assertNotEqual(r.returncode, 0)
-                    self.assertIn(f"trivy-{img}.{suffix}", r.stdout + r.stderr)
+                    self.assertIn(f"trivy-{img}.attempt-1.{suffix}", r.stdout + r.stderr)
+
+    def test_an_image_with_no_report_at_all_fails(self):
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_rel_") as t:
+            d = Path(t)
+            make_artifacts(d)
+            for f in d.glob("trivy-yuzu-postgres.*"):
+                f.unlink()
+            r = self.run_script(d)
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("missing image vulnerability gate report: trivy-yuzu-postgres.attempt-<N>", r.stderr)
 
     def test_a_report_without_a_pass_fails(self):
         with tempfile.TemporaryDirectory(prefix="yuzu_test_rel_") as t:
             d = Path(t)
             make_artifacts(d)
-            (d / "trivy-yuzu-server.gate.txt").write_text("gate: FAIL: fixable CRITICAL\n")
+            (d / "trivy-yuzu-server.attempt-1.gate.txt").write_text("gate: FAIL: fixable CRITICAL\n")
             self.assertNotEqual(self.run_script(d).returncode, 0)
 
     def test_any_failing_gate_line_fails_even_beside_a_pass(self):
         # A second scanner's verdict appended to the same file, or its own
         # file (grype-*), must be read: `gate: pass` alone is not enough.
         for name, text in (
-                ("trivy-yuzu-server.gate.txt", "gate: pass\ngrype gate: FAIL: fixable CRITICAL\n"),
-                ("trivy-yuzu-server.gate.txt", "gate: pass\ngate: FAIL: fixable CRITICAL\n"),
-                ("trivy-yuzu-server.gate.txt", "gate: FAIL: x\ngate: pass\n"),
-                ("trivy-yuzu-server.gate.txt", "gate: pass\ngate: skipped\n"),
-                ("grype-yuzu-gateway.gate.txt", "gate: FAIL: fixable CRITICAL\n"),
-                ("grype-yuzu-gateway.gate.txt", "image: x\n")):
+                ("trivy-yuzu-server.attempt-1.gate.txt", "gate: pass\ngrype gate: FAIL: fixable CRITICAL\n"),
+                ("trivy-yuzu-server.attempt-1.gate.txt", "gate: pass\ngate: FAIL: fixable CRITICAL\n"),
+                ("trivy-yuzu-server.attempt-1.gate.txt", "gate: FAIL: x\ngate: pass\n"),
+                ("trivy-yuzu-server.attempt-1.gate.txt", "gate: pass\ngate: skipped\n"),
+                ("grype-yuzu-gateway.attempt-1.gate.txt", "gate: FAIL: fixable CRITICAL\n"),
+                ("grype-yuzu-gateway.attempt-1.gate.txt", "image: x\n")):
             with self.subTest(name=name, text=text), \
                     tempfile.TemporaryDirectory(prefix="yuzu_test_rel_") as t:
                 d = Path(t)
@@ -161,8 +176,8 @@ class GateReports(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="yuzu_test_rel_") as t:
             d = Path(t)
             make_artifacts(d)
-            (d / "grype-yuzu-gateway.gate.txt").write_text("image: yuzu-gateway\ngate: pass\n")
-            (d / "grype-yuzu-gateway.json").write_text("{}")
+            (d / "grype-yuzu-gateway.attempt-1.gate.txt").write_text("image: yuzu-gateway\ngate: pass\n")
+            (d / "grype-yuzu-gateway.attempt-1.json").write_text("{}")
             r = self.run_script(d)
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
 
@@ -172,8 +187,70 @@ class GateReports(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="yuzu_test_rel_") as t:
             d = Path(t)
             make_artifacts(d)
-            (d / "grype-yuzu-gateway.json").write_text("{not json")
+            (d / "grype-yuzu-gateway.attempt-1.json").write_text("{not json")
             self.assertNotEqual(self.run_script(d).returncode, 0)
+
+    # ── G8P3-security-guardian-2: a re-run adds evidence, never replaces it ──
+    def test_refused_earlier_attempt_is_kept_beside_the_passing_one(self):
+        # postgres refused in attempt 1, passed in attempt 2 ("Re-run failed
+        # jobs"); the other legs passed in attempt 1 and were not re-run.
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_rel_") as t:
+            d = Path(t)
+            make_artifacts(d)
+            write_reports(d, "yuzu-postgres", 1, "FAIL: fixable CRITICAL")
+            write_reports(d, "yuzu-postgres", 2)
+            r = self.run_script(d)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertTrue((d / "trivy-yuzu-postgres.attempt-1.gate.txt").exists())
+
+    def test_cancelled_or_refused_earlier_attempt_with_only_a_verdict_is_accepted(self):
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_rel_") as t:
+            d = Path(t)
+            make_artifacts(d)
+            (d / "trivy-yuzu-postgres.attempt-1.json").unlink()
+            (d / "trivy-yuzu-postgres.attempt-1.txt").unlink()
+            (d / "trivy-yuzu-postgres.attempt-1.gate.txt").write_text(
+                "gate: FAIL: cancelled (SIGTERM) before this image was judged\n")
+            write_reports(d, "yuzu-postgres", 3)
+            r = self.run_script(d)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_the_latest_attempt_must_pass(self):
+        # The highest attempt is the one the published image passed; an
+        # earlier pass does not stand in for a later refusal (attempt 10 > 9
+        # numerically, not as text).
+        for passing, failing in ((1, 2), (9, 10)):
+            with self.subTest(passing=passing, failing=failing), \
+                    tempfile.TemporaryDirectory(prefix="yuzu_test_rel_") as t:
+                d = Path(t)
+                make_artifacts(d)
+                write_reports(d, "yuzu-postgres", passing)
+                write_reports(d, "yuzu-postgres", failing, "FAIL: fixable CRITICAL")
+                r = self.run_script(d)
+                self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+                self.assertIn(f"trivy-yuzu-postgres.attempt-{failing}.gate.txt does not record a passing gate",
+                              r.stderr)
+
+    def test_the_latest_attempt_needs_all_three_reports(self):
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_rel_") as t:
+            d = Path(t)
+            make_artifacts(d)
+            (d / "trivy-yuzu-postgres.attempt-2.gate.txt").write_text("gate: pass\n")
+            r = self.run_script(d)
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("trivy-yuzu-postgres.attempt-2.json", r.stderr)
+
+    def test_a_gate_report_not_named_per_attempt_is_refused(self):
+        for stray in ("trivy-yuzu-server.gate.txt", "trivy-yuzu-server.json", "grype-yuzu-gateway.gate.txt",
+                      "trivy-yuzu-server.attempt-0.gate.txt", "trivy-yuzu-server.attempt-x.gate.txt",
+                      "trivy-yuzu-server.attempt-1.html"):
+            with self.subTest(stray=stray), tempfile.TemporaryDirectory(prefix="yuzu_test_rel_") as t:
+                d = Path(t)
+                make_artifacts(d)
+                (d / stray).write_text("gate: pass\n")
+                r = self.run_script(d)
+                self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+                self.assertIn(f"{stray} is not a gate report named", r.stderr)
 
 
 if __name__ == "__main__":
