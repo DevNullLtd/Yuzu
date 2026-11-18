@@ -25,29 +25,48 @@ PROC = r"auto current = yuzu::agent::enumerate_processes\(\);\s*"
 # commenting out any single call leaves exactly one pattern unmatched. Each must match exactly once.
 REQUIRED = [
     # module-load rows: four statements, each pinned with its neighbours.
-    ("module-load process_name", r"r\.is_kernel = e\.is_kernel;\s*" + S + r"\(r\.process_name\);\s*" + S + r"\(r\.module_name\);"),
-    ("module-load module_name", S + r"\(r\.process_name\);\s*" + S + r"\(r\.module_name\);\s*" + S + r"\(r\.module_dir\);"),
-    ("module-load module_dir", S + r"\(r\.module_name\);\s*" + S + r"\(r\.module_dir\);\s*" + S + r"\(r\.signer\);"),
+    ("module-load process_name",
+        r"r\.is_kernel = e\.is_kernel;\s*" + S + r"\(r\.process_name\);\s*" + S +
+        r"\(r\.module_name\);"
+    ),
+    ("module-load module_name",
+        S + r"\(r\.process_name\);\s*" + S + r"\(r\.module_name\);\s*" + S +
+        r"\(r\.module_dir\);"
+    ),
+    ("module-load module_dir",
+        S + r"\(r\.module_name\);\s*" + S + r"\(r\.module_dir\);\s*" + S + r"\(r\.signer\);"
+    ),
     ("module-load signer", S + r"\(r\.module_dir\);\s*" + S + r"\(r\.signer\);\s*mrows\.push_back"),
     ("pid_name_ map", r"std::string clean = name;\s*" + S + r"\(clean\);\s*pid_name_\[pid\]"),
-    ("process stream pe.name", r"pe\.user = e\.user;\s*" + S + r"\(pe\.name\);\s*" + S + r"\(pe\.user\);"),
+    ("process stream pe.name",
+        r"pe\.user = e\.user;\s*" + S + r"\(pe\.name\);\s*" + S + r"\(pe\.user\);"
+    ),
     ("process stream pe.user", S + r"\(pe\.name\);\s*" + S + r"\(pe\.user\);\s*pe\.exit_code"),
     ("process stream-fallback seed",
-     r"stream_active_ = false;\s*" + PROC + S + r"\(current\);\s*note_pid_names\(current, ts\);\s*if \(!stab_excl"),
+     r"stream_active_ = false;\s*" + PROC + S + r"\(current\);\s*"
+     r"note_pid_names\(current, ts\);\s*if \(!stab_excl"),
     ("process poll diff",
-     r"\}\s*else\s*\{\s*" + PROC + S + r"\(current\);\s*note_pid_names\(current, ts\);\s*if \(!stab_excl"),
+     r"\}\s*else\s*\{\s*" + PROC + S + r"\(current\);\s*"
+     r"note_pid_names\(current, ts\);\s*if \(!stab_excl"),
     ("network (after fill_process_names)",
      r"fill_process_names\(current, pid_name_, ts\);\s*" + S + r"\(current\);"),
     ("arp", S + r"\(\*current\);\s*auto previous = json_to_arp"),
     ("dns", r"enumerate_dns\(\);\s*" + S + r"\(current\);\s*auto previous = json_to_dns"),
     ("services", S + r"\(\*current\);\s*const std::string svc_key"),
-    ("users", r"enumerate_users\(\);\s*" + S + r"\(current\);\s*auto prev_json = db_->get_state\(usr_key\)"),
+    ("users",
+        r"enumerate_users\(\);\s*" + S +
+        r"\(current\);\s*auto prev_json = db_->get_state\(usr_key\)"
+    ),
     ("mapdrive", S + r"\(\*current\);\s*const std::string md_key"),
     # fleet_snapshot: four statements, each pinned together with its neighbours so deleting or
     # commenting out any one of them leaves at least one pattern unmatched.
     ("fleet_snapshot processes", r"\}\s*" + S + r"\(processes\);\s*" + S + r"\(connections\);"),
-    ("fleet_snapshot connections", S + r"\(processes\);\s*" + S + r"\(connections\);\s*" + S + r"\(hostname\);"),
-    ("fleet_snapshot hostname", S + r"\(connections\);\s*" + S + r"\(hostname\);\s*" + S + r"\(local_ips\);"),
+    ("fleet_snapshot connections",
+        S + r"\(processes\);\s*" + S + r"\(connections\);\s*" + S + r"\(hostname\);"
+    ),
+    ("fleet_snapshot hostname",
+        S + r"\(connections\);\s*" + S + r"\(hostname\);\s*" + S + r"\(local_ips\);"
+    ),
     ("fleet_snapshot local_ips", S + r"\(hostname\);\s*" + S + r"\(local_ips\);\s*auto redaction"),
 ]
 FLOOR = 19  # call sites in echo_plugin.cpp (stream leg two, fleet_snapshot four, module rows four)

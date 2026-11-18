@@ -11,7 +11,7 @@ ComplianceResult evaluate_compliance(std::string_view expression,
 
     auto result = cel::evaluate_tri(expression, result_fields);
     if (!result.has_value())
-        return ComplianceResult::eval_error; // timeout, missing var, parse error
+        return ComplianceResult::eval_error; // timeout, parse error, over-long or undefined expression
     return *result ? ComplianceResult::compliant : ComplianceResult::non_compliant;
 }
 
