@@ -42,6 +42,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <image_hash_cache.hpp>   // identity-keyed (dev, inode, size, mtime) hash cache
 #include <bounded_wait.hpp>      // bounded_call_ex: a stalled filesystem cannot hold the command worker
 #include <local_path_policy.hpp> // posix_open_checked / the path guard (macOS image path)
 #endif
@@ -137,11 +138,15 @@ std::string sha1_of_fd(int fd, std::chrono::steady_clock::time_point deadline) {
 
 // Hash one process image on a bounded helper: the open and the read of a file on a stalled
 // filesystem cannot hold the command worker past `budget` (bounded_wait.hpp; the helper owns its
-// descriptor and copies). Linux opens /proc/<pid>/exe itself (the kernel's reference to the
-// running image: no path text is re-resolved); macOS opens the judged path handle-relative with no
-// symlink followed. O_NONBLOCK: a FIFO is refused by the fstat, never waited on.
+// descriptor and copies, and shares the identity-keyed cache). Linux opens /proc/<pid>/exe itself
+// (the kernel's reference to the running image: no path text is re-resolved); macOS opens the judged
+// path handle-relative with no symlink followed. O_NONBLOCK: a FIFO is refused, never waited on.
+// The cache key is the OPENED image's identity (dev, inode, size, mtime), looked up after the open and
+// before the read: the readlink text is only shown, never a key, so a replaced or aliased image
+// never receives another process's hash.
 std::string hash_image_bounded(int pid, const std::string& path,
                                const yuzu::shared::local_path::LocalPathGuard& guard,
+                               const std::shared_ptr<yuzu::shared::ImageHashCache>& cache,
                                std::chrono::steady_clock::time_point action_deadline) {
     const auto now = std::chrono::steady_clock::now();
     if (now >= action_deadline)
@@ -150,15 +155,15 @@ std::string hash_image_bounded(int pid, const std::string& path,
     const auto deadline = now + budget;
     auto result = yuzu::shared::bounded_call_ex(
         std::chrono::duration_cast<std::chrono::milliseconds>(budget),
-        [pid, path, guard, deadline]() -> std::string {
+        [pid, path, guard, cache, deadline]() -> std::string {
+            yuzu::shared::ScopedFile fd;
 #if defined(__linux__)
             (void)path;
             (void)guard;
-            yuzu::shared::ScopedFile fd{::open(("/proc/" + std::to_string(pid) + "/exe").c_str(),
-                                               O_RDONLY | O_NONBLOCK | O_NOCTTY | O_CLOEXEC)};
+            fd = yuzu::shared::ScopedFile{::open(("/proc/" + std::to_string(pid) + "/exe").c_str(),
+                                                 O_RDONLY | O_NONBLOCK | O_NOCTTY | O_CLOEXEC)};
             if (!fd.valid())
                 return {};
-            return sha1_of_fd(fd.fd(), deadline);
 #else
             (void)pid;
             namespace lp = yuzu::shared::local_path;
@@ -167,8 +172,20 @@ std::string hash_image_bounded(int pid, const std::string& path,
                 return {};
             auto o = lp::posix_open_checked(j.resolved.empty() ? path : j.resolved,
                                             O_RDONLY | O_NONBLOCK | O_NOCTTY, /*require_regular=*/true);
-            return o.opened() ? sha1_of_fd(o.file.fd(), deadline) : std::string{};
+            if (!o.opened())
+                return {};
+            fd = std::move(o.file);
 #endif
+            struct stat st{};
+            if (::fstat(fd.fd(), &st) != 0 || !S_ISREG(st.st_mode))
+                return {};
+            const auto key = yuzu::shared::image_identity_key(st);
+            if (auto hit = cache->get(key))
+                return *hit;
+            auto hex = sha1_of_fd(fd.fd(), deadline);
+            if (!hex.empty())
+                cache->put(key, hex);
+            return hex;
         });
     return result.status == yuzu::shared::BoundedCallStatus::Completed && result.value
                ? std::move(*result.value)
@@ -198,7 +215,7 @@ std::string resolve_exe(const std::filesystem::path& link) {
 }
 
 void enumerate_and_stream(yuzu::CommandContext& ctx) {
-    std::unordered_map<std::string, std::string> sha_cache;
+    const auto image_cache = std::make_shared<yuzu::shared::ImageHashCache>();
     std::error_code ec;
     const yuzu::shared::local_path::LocalPathGuard path_guard; // one mount-table snapshot per run
     const auto action_deadline = std::chrono::steady_clock::now() + kActionBudget;
@@ -222,15 +239,10 @@ void enumerate_and_stream(yuzu::CommandContext& ctx) {
         std::string exe_path = resolve_exe(entry.path() / "exe");
         std::string sha1;
         // The hash comes from /proc/<pid>/exe itself (never the readlink text, which is only shown),
-        // on a bounded helper, regular files only, capped and deadline-bounded.
-        if (!exe_path.empty()) {
-            if (auto it = sha_cache.find(exe_path); it != sha_cache.end()) {
-                sha1 = it->second;
-            } else {
-                sha1 = hash_image_bounded(pid, exe_path, path_guard, action_deadline);
-                sha_cache.emplace(exe_path, sha1);
-            }
-        }
+        // on a bounded helper, regular files only, capped and deadline-bounded, cached by the
+        // opened image's identity.
+        if (!exe_path.empty())
+            sha1 = hash_image_bounded(pid, exe_path, path_guard, image_cache, action_deadline);
 
         ctx.write_output(
             std::format("{}|{}|{}|{}", pid, escape_pipes(name), escape_pipes(exe_path), sha1));
@@ -253,7 +265,7 @@ void enumerate_and_stream(yuzu::CommandContext& ctx) {
         return;
     size_t pid_count = static_cast<size_t>(got) / sizeof(pid_t);
 
-    std::unordered_map<std::string, std::string> sha_cache;
+    const auto image_cache = std::make_shared<yuzu::shared::ImageHashCache>();
     const yuzu::shared::local_path::LocalPathGuard path_guard; // one mount-table snapshot per run
     const auto action_deadline = std::chrono::steady_clock::now() + kActionBudget;
     char path_buf[PROC_PIDPATHINFO_MAXSIZE];
@@ -283,14 +295,8 @@ void enumerate_and_stream(yuzu::CommandContext& ctx) {
             continue;
 
         std::string sha1;
-        if (!exe_path.empty()) {
-            if (auto it = sha_cache.find(exe_path); it != sha_cache.end()) {
-                sha1 = it->second;
-            } else {
-                sha1 = hash_image_bounded(static_cast<int>(pid), exe_path, path_guard, action_deadline);
-                sha_cache.emplace(exe_path, sha1);
-            }
-        }
+        if (!exe_path.empty())
+            sha1 = hash_image_bounded(static_cast<int>(pid), exe_path, path_guard, image_cache, action_deadline);
 
         ctx.write_output(std::format("{}|{}|{}|{}", static_cast<int>(pid), escape_pipes(name),
                                      escape_pipes(exe_path), sha1));

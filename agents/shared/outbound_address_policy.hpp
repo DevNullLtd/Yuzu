@@ -73,7 +73,6 @@ enum class AddressClass : std::uint8_t {
         (a0 == 100 && (a1 & 0xC0) == 64))
         return AddressClass::Private;
     if ((a0 == 192 && a1 == 0 && (a2 == 0 || a2 == 2)) || // IETF assignments, TEST-NET-1
-        (a0 == 192 && a1 == 88 && a2 == 99) ||            // 6to4 relay anycast
         (a0 == 198 && (a1 & 0xFE) == 18) ||               // benchmarking 198.18.0.0/15
         (a0 == 198 && a1 == 51 && a2 == 100) ||           // TEST-NET-2
         (a0 == 203 && a1 == 0 && a2 == 113))              // TEST-NET-3

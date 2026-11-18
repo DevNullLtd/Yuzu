@@ -181,7 +181,8 @@ TEST_CASE("destination guard: delivery resolves through a pool of its own",
     // An injected, saturated pool declines (Unresolved) without touching any other pool.
     auto tiny = std::make_shared<net::ResolverPool>(0);
     const auto v = vet_delivery_destination("http://busy.example/x", std::chrono::seconds(1), lookup, tiny);
-    CHECK(v.verdict == DestinationVerdict::Unresolved);
+    CHECK(v.verdict == DestinationVerdict::ResolverBusy); // not "the name does not resolve"
+    CHECK(std::string{destination_cause(v.verdict)} == "destination_resolver_busy");
 }
 
 TEST_CASE("destination guard: refusal log and audit are throttled per target",
@@ -197,4 +198,15 @@ TEST_CASE("destination guard: refusal log and audit are throttled per target",
 TEST_CASE("destination guard: the cause labels are the closed pair", "[outbound_destination_guard]") {
     CHECK(std::string{destination_cause(DestinationVerdict::Refused)} == "destination_refused");
     CHECK(std::string{destination_cause(DestinationVerdict::Unresolved)} == "destination_unresolved");
+    CHECK(std::string{destination_cause(DestinationVerdict::ResolverBusy)} == "destination_resolver_busy");
+}
+
+TEST_CASE("destination guard: an empty resolver answer fails closed and a malformed authority is not judged",
+          "[outbound_destination_guard][security]") {
+    CHECK(vet_resolved_addresses("h.example", {}).verdict == DestinationVerdict::Unresolved);
+    CHECK(vet_resolved_addresses("h.example", {"93.184.216.34"}).verdict == DestinationVerdict::Allow);
+    CHECK(detail::bare_host("[]").empty());
+    CHECK(detail::bare_host("[::1]:8080") == "::1");
+    CHECK(detail::bare_host("host.example:8080") == "host.example");
+    CHECK(detail::bare_host("host.example") == "host.example");
 }

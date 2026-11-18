@@ -15,6 +15,9 @@
 #include "test_helpers.hpp"
 
 #include <bounded_file_hash.hpp>
+#ifndef _WIN32
+#include <image_hash_cache.hpp>
+#endif
 #include <http_client_download.hpp>
 #include <local_path_policy.hpp>
 #include <outbound_address_policy.hpp>
@@ -118,7 +121,7 @@ TEST_CASE("local_path: relative and current-drive-rooted Windows paths pass", "[
 }
 
 TEST_CASE("local_path: reserved DOS device names are refused in any component", "[shared][local_path]") {
-    for (const char* p : {"NUL", "con", "C:\\dir\\NUL", "C:\\dir\\nul.txt", "COM1", "lpt9.log",
+    for (const char* p : {"NUL ", "NUL.", "nul . ", "C:\\x\\CON  ", "NUL", "con", "C:\\dir\\NUL", "C:\\dir\\nul.txt", "COM1", "lpt9.log",
                           "C:\\x\\AUX", "CONIN$", "CONOUT$", "C:\\a\\prn.", "dir\\COM3\\f"}) {
         INFO(p);
         CHECK(win(p) == lp::Refusal::network_or_device);
@@ -144,7 +147,8 @@ TEST_CASE("local_path: superscript COM/LPT reserved names are refused", "[shared
 
 TEST_CASE("network_fstype: network-capable FUSE clients and the legacy network types are listed",
           "[shared][network_fstype]") {
-    for (const char* t : {"fuse.gcsfuse", "fuse.goofys", "fuse.blobfuse2", "fuse.juicefs",
+    for (const char* t : {"smb2", "fuse.mfsmount", "fuse.seaweedfs", "fuse.s3ql", "fuse.curlftpfs",
+                          "fuse.juicefs", "fuse.onedrive", "fuse.davfs2", "fuse.gcsfuse", "fuse.goofys", "fuse.blobfuse2", "fuse.juicefs",
                           "fuse.s3fs", "fuse.sshfs", "nfs4", "cifs", "ncpfs", "coda", "autofs"})
         CHECK(yuzu::shared::is_network_fstype(t));
     // Local filesystems and local FUSE are not listed.
@@ -455,6 +459,69 @@ TEST_CASE("local_path: a FIFO or a /dev/zero symlink is refused promptly, on bot
         dev_refused = !d.opened();
     }));
     CHECK(dev_refused);
+}
+
+TEST_CASE("local_path: the hop limit and errno handling of the resolving judge", "[shared][local_path]") {
+    yuzu::test::TempDir tmp{"yuzu_test_lp_"};
+    REQUIRE(fs::create_directory(tmp.path));
+    const auto base = fs::canonical(tmp.path);
+    fs::create_directory(base / "d");
+    // A chain of 5 links resolves; a chain of 45 exceeds the 40-hop limit and fails closed.
+    fs::create_directory_symlink(base / "d", base / "l0");
+    for (int i = 1; i < 45; ++i)
+        fs::create_directory_symlink(base / ("l" + std::to_string(i - 1)), base / ("l" + std::to_string(i)));
+    CHECK(lp::posix_judge((base / "l4" / "x").string(), {}).refusal == lp::Refusal::none);
+    CHECK(lp::posix_judge((base / "l44" / "x").string(), {}).refusal == lp::Refusal::unresolvable);
+
+    // A component that is a regular file: ENOTDIR below it is a clean "nothing there", not a failure.
+    { std::ofstream(base / "file") << "x"; }
+    const auto under_file = lp::posix_judge((base / "file" / "child").string(), {});
+    CHECK(under_file.refusal == lp::Refusal::none);
+    CHECK(under_file.err == 0);
+
+    // An unreadable directory (EACCES on lstat of its child) fails closed WITH the errno.
+    if (::getuid() != 0) {
+        fs::create_directory(base / "locked");
+        { std::ofstream(base / "locked" / "f") << "x"; }
+        fs::permissions(base / "locked", fs::perms::none);
+        const auto j = lp::posix_judge((base / "locked" / "f").string(), {});
+        fs::permissions(base / "locked", fs::perms::owner_all);
+        CHECK(j.refusal == lp::Refusal::unresolvable);
+        CHECK(j.err == EACCES);
+    }
+}
+
+TEST_CASE("image hash cache: the key is the opened image's identity, not path text",
+          "[shared][image_cache]") {
+    yuzu::test::TempDir tmp{"yuzu_test_imgc_"};
+    REQUIRE(fs::create_directory(tmp.path));
+    const auto base = fs::canonical(tmp.path);
+    const auto exe = base / "app";
+    struct stat a{}, b{}, c{};
+    { std::ofstream(exe, std::ios::binary) << "first image"; }
+    REQUIRE(::stat(exe.c_str(), &a) == 0);
+    const auto key1 = yuzu::shared::image_identity_key(a);
+
+    // The SAME path text now names different content (rewritten in place: same inode): a different key.
+    { std::ofstream(exe, std::ios::binary | std::ios::trunc) << "a different, longer image"; }
+    REQUIRE(::stat(exe.c_str(), &b) == 0);
+    CHECK(a.st_ino == b.st_ino);
+    const auto key2 = yuzu::shared::image_identity_key(b);
+    CHECK(key1 != key2);
+
+    // Same size and inode but a different mtime (a same-length rewrite): still a different key.
+    { std::ofstream(exe, std::ios::binary | std::ios::trunc) << "A DIFFERENT, LONGER IMAGE"; }
+    struct timespec times[2] = {{0, 0}, {b.st_mtim.tv_sec + 5, 0}};
+    REQUIRE(::utimensat(AT_FDCWD, exe.c_str(), times, 0) == 0);
+    REQUIRE(::stat(exe.c_str(), &c) == 0);
+    CHECK(b.st_size == c.st_size);
+    CHECK(key2 != yuzu::shared::image_identity_key(c));
+
+    // The cache returns what was stored under a key and nothing for another.
+    yuzu::shared::ImageHashCache cache;
+    cache.put(key1, "hash-one");
+    CHECK(cache.get(key1) == std::optional<std::string>("hash-one"));
+    CHECK_FALSE(cache.get(key2).has_value());
 }
 
 TEST_CASE("local_path: a symlink loop fails closed", "[shared][local_path]") {

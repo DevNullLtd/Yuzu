@@ -19,6 +19,17 @@ class ExistsNoRawFallback(unittest.TestCase):
         self.assertIn("path_refusal(path)", b)
         self.assertLess(b.index("path_refusal(path)"), b.index("validate_path_or_parent("))
 
+    def test_the_refusal_branch_is_live_and_returns(self):
+        # The up-front refusal must be a real condition that returns an error row: neutralising it
+        # (`if (false && ...)`, a removed `return 1`) must fail here.
+        b = self.body()
+        i = b.index("path_refusal(path)")
+        branch = b[i - 40:b.index("validate_path_or_parent(")]
+        self.assertIn("yuzu::shared::local_path::refused(refusal)", branch)
+        self.assertNotRegex(branch, r"if\s*\(\s*(false|0)\b")
+        self.assertIn("return 1;", branch)
+        self.assertIn('"error|{}"', branch)
+
     def test_exists_row_follows_the_canonical_recheck(self):
         # ONE consistent answer: the canonical re-check runs before any `exists|` row, so a refusal
         # is an error row alone and never `exists|true` followed by an error.

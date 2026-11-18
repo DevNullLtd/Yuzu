@@ -83,6 +83,7 @@ TEST_CASE("egress parity: the named IPv4 special addresses", "[egress_parity][se
     agree_v4(198, 19, 255, 255);
     agree_v4(203, 0, 113, 5);
     agree_v4(255, 255, 255, 255);
+    agree_v4(192, 88, 99, 1); // 6to4 relay anycast: neither side lists it as non-global
     // The pinned expectations, so a parity-preserving mistake on BOTH sides still fails.
     CHECK(agt::classify_ipv4({168, 63, 129, 16}) == agt::AddressClass::CloudMetadata);
     CHECK(srv::classify_ipv4({168, 63, 129, 16}) == srv::AddressClass::CloudMetadata);

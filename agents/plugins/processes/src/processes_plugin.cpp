@@ -20,6 +20,9 @@
 
 #include <bounded_file_hash.hpp> // yuzu::shared::hash_fd_regular (Linux image hash)
 #include <bounded_wait.hpp>      // bounded_call_ex: a stalled filesystem cannot hold the command worker
+#ifndef _WIN32
+#include <image_hash_cache.hpp>   // identity-keyed (dev, inode, size, mtime) hash cache
+#endif
 #include <local_path_policy.hpp> // yuzu::shared::local_path (Windows/macOS image path guard)
 
 #include <algorithm>
@@ -280,7 +283,8 @@ struct ImageHash {
     std::string hash;
 };
 
-ImageHash hash_linux_image(unsigned long pid, std::chrono::steady_clock::time_point deadline) {
+ImageHash hash_linux_image(unsigned long pid, std::chrono::steady_clock::time_point deadline,
+                           const std::shared_ptr<yuzu::shared::ImageHashCache>& cache) {
     ImageHash out;
     yuzu::shared::ScopedFile fd{::open(("/proc/" + std::to_string(pid) + "/exe").c_str(),
                                        O_RDONLY | O_NONBLOCK | O_NOCTTY | O_CLOEXEC)};
@@ -289,17 +293,32 @@ ImageHash hash_linux_image(unsigned long pid, std::chrono::steady_clock::time_po
     struct stat st{};
     if (::fstat(fd.fd(), &st) != 0 || !S_ISREG(st.st_mode))
         return out;
-    out.key = std::format("{}:{}", static_cast<unsigned long long>(st.st_dev),
-                          static_cast<unsigned long long>(st.st_ino));
+    // Identity of the OPENED image (dev, inode, size, mtime): looked up after the open and before the
+    // read, so the expensive hash runs once per distinct image and a replaced image never gets a
+    // stale hash.
+    out.key = yuzu::shared::image_identity_key(st);
+    if (auto hit = cache->get(out.key)) {
+        out.hash = std::move(*hit);
+        return out;
+    }
     auto r = yuzu::shared::hash_fd_regular(fd.fd(), kMaxImageHashBytes, deadline);
-    if (r.status == yuzu::shared::HashStatus::ok)
+    if (r.status == yuzu::shared::HashStatus::ok) {
         out.hash = std::move(r.hex);
+        cache->put(out.key, out.hash);
+    }
     return out;
 }
 
 // There is NO network-mount judgement on this path: the image is opened through /proc/<pid>/exe, a
 // kernel reference to the running image, never through path text. The bound is the helper.
 struct ImageGuard {}; // Linux needs no mount-table snapshot (see below)
+
+// One identity-keyed cache for the process: images are keyed by (dev, inode, size, mtime) of the
+// opened file, never by path text, so it is safe to share across actions and bounded in size.
+const std::shared_ptr<yuzu::shared::ImageHashCache>& image_cache() {
+    static const std::shared_ptr<yuzu::shared::ImageHashCache> c = std::make_shared<yuzu::shared::ImageHashCache>();
+    return c;
+}
 
 std::string hash_process_image(unsigned long pid, const std::string& path, HashCache& cache,
                                const ImageGuard&, std::chrono::steady_clock::time_point action_deadline) {
@@ -312,16 +331,12 @@ std::string hash_process_image(unsigned long pid, const std::string& path, HashC
     const auto deadline = now + budget;
     auto result = yuzu::shared::bounded_call_ex(
         std::chrono::duration_cast<std::chrono::milliseconds>(budget),
-        [pid, deadline]() { return hash_linux_image(pid, deadline); });
+        [pid, deadline, cache = image_cache()]() { return hash_linux_image(pid, deadline, cache); });
     if (result.status != yuzu::shared::BoundedCallStatus::Completed || !result.value)
         return {};
     const auto& img = *result.value;
-    if (img.key.empty())
-        return {};
-    if (const auto it = cache.find(img.key); it != cache.end())
-        return it->second;
-    cache.emplace(img.key, img.hash);
-    return img.hash;
+    (void)cache; // the identity-keyed cache lives inside the helper (image_cache())
+    return img.key.empty() ? std::string{} : img.hash;
 }
 #else
 using ImageGuard = yuzu::shared::local_path::LocalPathGuard;
