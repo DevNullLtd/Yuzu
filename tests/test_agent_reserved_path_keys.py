@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-PATH_LIKE = re.compile(r"(_dir|_file|_cert|_key|_bundle|_allowlist|_endpoint|_path|_store|_secret|_token)$")
+PATH_LIKE = re.compile(r"(_dir|_file|_cert|_key|_bundle|_allowlist|_endpoint|_path|_store|_secret|_token|_db|_url|_socket|_pem)$")
 
 
 def keys_in_header():
