@@ -11,6 +11,23 @@ A statement elsewhere on this page that a rollback, a mixed fleet or an in-place
 
 Running `dev` between releases? Some entries below describe changes on `dev` that are not in a release yet. For what a `git pull` of `dev` changed, run the repository script `python3 scripts/whats-new.py` (`--versions` for the version bumps, rebuild notes and Docker image bumps); see `changelog.d/README.md`.
 
+## Behaviour change: the agent's HTTP clients do not decode compressed responses
+
+This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page): every writer runs this build, and this page is not a procedure for a rolling or mixed-version upgrade.
+
+**In short.** Affected: anyone who pins a `sha256` for `content_dist` `stage`, or an `expected_hash` for `http_client` `download`, against a server that compresses its responses. The pinned hash is of the bytes on the wire.
+
+**What this build does.**
+
+- `http_client` `download` and `content_dist` `stage` hash and store exactly the bytes the server sends. A `Content-Encoding` of `br`, `gzip` or `deflate` is neither decoded nor removed: the file on disk is the compressed file.
+- `http_client` `get` sends `Accept-Encoding: identity`. If a peer answers with a `Content-Encoding` anyway, `get` writes `status|N` and `error|peer sent Content-Encoding <token>; body not decoded`, and exits non-zero. It never writes a compressed body. A body that contains a NUL or another control byte (other than tab, carriage return and line feed) is refused with `error|response body contains NUL or control bytes`.
+- `http_client` `head` sends httplib's default `Accept-Encoding` and decodes nothing; it has no body to decode.
+- The `printing` plugin's local IPP calls are unchanged in behaviour.
+
+**How to spot it.** A `stage` or `download` whose pinned hash is of the decompressed content fails with `hash mismatch: expected=<your hash>, got=<hash of the bytes the server sent>`. The file is removed.
+
+**What to do.** Pin the `sha256` of the bytes on the wire. Compute it with `curl -s URL | sha256sum`, without `--compressed` and without an `Accept-Encoding` header. Or serve the artefact uncompressed (`Content-Encoding` absent).
+
 ## ⚠️ Breaking: on-demand software sync asks for confirmation, is paced instead of capped at 500 devices, and cools down per group
 
 **In short.** Affected: anything that calls `POST /api/v1/hardware/sync` or the MCP tool `sync_hardware_software` for a whole group or the whole fleet (the Software page's **Whole fleet** choice, scripts and agentic workers). To do: send `"confirm": true` with a `group:<id>` or `__all__` scope, give the caller the global `ManagementGroup:Write` grant if it names the whole fleet, and stop relying on the 500-device refusal and the 60-second per-operator gap.

@@ -459,6 +459,7 @@ agent_test_exe = executable(
                                                 # script_exec.dll (Windows-only TU guard; proves BR3-001's
                                                 # windows_system_directory() PowerShell resolution end to end)
     'unit/test_script_exec_parsers.cpp',       # Wave 5 PR5.1: pure argv-assembly / PATH-resolution helpers (no I/O)
+    'unit/test_http_client_get_output.cpp',   # WP14-A: pure http_client get/head output decision (Content-Encoding refusal, NUL/control bytes)
     'unit/test_content_dist_actions.cpp',      # Wave 5 PR5.1: content_dist dispatch gates via LocalDispatcher (POSIX-only TU guard)
     'unit/test_content_dist_exec_parsers.cpp', # Wave 5 PR5.1: pure SubprocessResult -> wire mapping + options builder (no I/O)
     'unit/test_content_dist_exec_seam.cpp',    # Wave 5 PR5.1 round-2 remediation (BR-006): real staged-file
@@ -726,6 +727,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/certificates/src'),  # certificates_macos_parsers.hpp (Gate-7 FIX A: pure helpers shared with the plugin)
     include_directories('../agents/plugins/users/src'),         # users_macos_last.hpp (qe-M1 pure parser)
     include_directories('../agents/plugins/content_dist/src'),  # content_dist_upload_parsers.hpp (PR1.6b pure helpers)
+    include_directories('../agents/plugins/http_client/src'),   # http_client_get_output.hpp (WP14-A pure get/head output decision)
     include_directories('../agents/plugins/script_exec/src'),   # script_exec_parsers.hpp (Wave 5 PR5.1 pure helpers)
     include_directories('../agents/plugins/network_actions/src'), # network_actions_parsers.hpp (Wave 2 WP-D)
     include_directories('../agents/plugins/wol/src'),             # wol_check_plan.hpp (Wave 2 WP-E)
@@ -4394,7 +4396,7 @@ test('virtualization wsl Windows shell wiring lexical gate',
 
 # WP14-A: every httplib::Client / SSLClient built under agents/ calls set_decompress(false) (the
 # agent build defines CPPHTTPLIB_BROTLI_SUPPORT globally, so a client otherwise decodes Brotli from
-# an operator-chosen peer inside a root/SYSTEM process). Lexical; carries its own mutation self-test.
+# an operator-chosen peer inside the long-lived agent process). Lexical; carries its own mutation self-test.
 test('agent httplib clients disable response decompression lexical gate (WP14-A)',
   _python3_test,
   args: [files('test_agent_http_no_decompress_lexical.py')],

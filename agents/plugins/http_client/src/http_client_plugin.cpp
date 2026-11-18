@@ -17,6 +17,8 @@
 
 #include <yuzu/plugin.hpp>
 
+#include "http_client_get_output.hpp"
+
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -312,7 +314,7 @@ int download_url(std::string_view url, const fs::path& dest, std::string& error)
 }
 
 // HTTP GET via httplib (no shell, no command injection)
-std::string http_get(std::string_view url, int& status_code) {
+std::string http_get(std::string_view url, int& status_code, std::string& content_encoding) {
     ParsedUrl parsed;
     if (!parse_url(url, parsed)) {
         status_code = 0;
@@ -353,6 +355,7 @@ std::string http_get(std::string_view url, int& status_code) {
         return "connection failed";
     }
     status_code = res->status;
+    content_encoding = res->get_header_value("Content-Encoding");
     if (res->body.size() > kMaxDownloadSize) {
         return "response body exceeds maximum size limit";
     }
@@ -537,10 +540,12 @@ private:
         if (!is_valid_url(url)) { ctx.write_output("error|only http:// and https:// URLs allowed"); return 1; }
 
         int status = 0;
-        auto body = http_get(url, status);
-        ctx.write_output(std::format("status|{}", status));
-        ctx.write_output(std::format("body|{}", body));
-        return status >= 200 && status < 400 ? 0 : 1;
+        std::string content_encoding;
+        auto body = http_get(url, status, content_encoding);
+        const auto out = yuzu::http_client::build_get_output(status, content_encoding, body);
+        for (const auto& line : out.lines)
+            ctx.write_output(line);
+        return out.rc;
     }
 
     int do_head(yuzu::CommandContext& ctx, yuzu::Params params) {
@@ -551,6 +556,10 @@ private:
         int status = 0;
         auto headers = http_head(url, status);
         ctx.write_output(std::format("status|{}", status));
+        if (yuzu::http_client::has_unsafe_bytes(headers)) {
+            ctx.write_output("error|response headers contain NUL or control bytes");
+            return 1;
+        }
         ctx.write_output(std::format("headers|{}", headers));
         return status >= 200 && status < 400 ? 0 : 1;
     }

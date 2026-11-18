@@ -796,6 +796,7 @@ constexpr int kReadTimeoutSec = 5;
     cli.set_connection_timeout(kConnectTimeoutSec, 0);
     cli.set_read_timeout(kReadTimeoutSec, 0);
     cli.set_decompress(false);
+    cli.set_default_headers({{"Accept-Encoding", "identity"}});
 
     IppResult result;
     auto res = cli.Post("/", extra_headers, body, "application/ipp");
@@ -815,6 +816,7 @@ constexpr int kReadTimeoutSec = 5;
     cli.set_connection_timeout(kConnectTimeoutSec, 0);
     cli.set_read_timeout(kReadTimeoutSec, 0);
     cli.set_decompress(false);
+    cli.set_default_headers({{"Accept-Encoding", "identity"}});
 
     IppResult result;
     auto res = cli.Post("/", httplib::Headers{}, body, "application/ipp");

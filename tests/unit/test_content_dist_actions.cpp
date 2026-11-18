@@ -49,19 +49,25 @@
 
 #include <openssl/evp.h>
 
+#include <yuzu/agent/scoped_fd.hpp>
+
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
-#include <cstdint>
+#include <atomic>
+#include <cerrno>
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <optional>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -237,7 +243,7 @@ namespace {
 std::string wp14a_sha256_hex(const std::string& bytes) {
     unsigned char md[EVP_MAX_MD_SIZE];
     unsigned int md_len = 0;
-    EVP_Digest(bytes.data(), bytes.size(), md, &md_len, EVP_sha256(), nullptr);
+    REQUIRE(EVP_Digest(bytes.data(), bytes.size(), md, &md_len, EVP_sha256(), nullptr) == 1);
     static const char* hex = "0123456789abcdef";
     std::string out;
     for (unsigned int i = 0; i < md_len; ++i) {
@@ -247,43 +253,69 @@ std::string wp14a_sha256_hex(const std::string& bytes) {
     return out;
 }
 
-// A one-shot loopback HTTP/1.1 server on a raw socket (no httplib, so this TU needs no new
-// dependency). Answers its single request with `Content-Encoding: br` and `body`, then closes.
-class OneShotBrotliServer {
+// A loopback HTTP/1.1 server on a raw socket (no httplib, so this TU needs no new dependency).
+// Answers each of its first `max_requests` connections with `Content-Encoding: br` and `body`,
+// then closes. The accept loop polls so the destructor never depends on shutdown() waking a
+// blocked accept() (it does not on macOS).
+class BrotliLoopbackServer {
 public:
-    explicit OneShotBrotliServer(std::string body) : body_(std::move(body)) {
-        listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
-        REQUIRE(listen_fd_ >= 0);
+    explicit BrotliLoopbackServer(std::string body, int max_requests = 1)
+        : body_(std::move(body)), max_requests_(max_requests) {
+        listen_fd_.reset(::socket(AF_INET, SOCK_STREAM, 0));
+        REQUIRE(listen_fd_.valid());
         sockaddr_in addr{};
         addr.sin_family = AF_INET;
         addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         addr.sin_port = 0;
-        REQUIRE(::bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof addr) == 0);
+        REQUIRE(::bind(listen_fd_.get(), reinterpret_cast<sockaddr*>(&addr), sizeof addr) == 0);
         socklen_t len = sizeof addr;
-        REQUIRE(::getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&addr), &len) == 0);
+        REQUIRE(::getsockname(listen_fd_.get(), reinterpret_cast<sockaddr*>(&addr), &len) == 0);
         port_ = ntohs(addr.sin_port);
-        REQUIRE(::listen(listen_fd_, 4) == 0);
+        REQUIRE(::listen(listen_fd_.get(), 4) == 0);
         thread_ = std::thread([this] { serve(); });
     }
-    ~OneShotBrotliServer() {
-        ::shutdown(listen_fd_, SHUT_RDWR); // unblocks accept() if no client ever came
+    ~BrotliLoopbackServer() {
+        stop_.store(true);
         if (thread_.joinable())
             thread_.join();
-        ::close(listen_fd_);
     }
-    OneShotBrotliServer(const OneShotBrotliServer&) = delete;
-    OneShotBrotliServer& operator=(const OneShotBrotliServer&) = delete;
+    BrotliLoopbackServer(const BrotliLoopbackServer&) = delete;
+    BrotliLoopbackServer& operator=(const BrotliLoopbackServer&) = delete;
     [[nodiscard]] int port() const noexcept { return port_; }
 
 private:
     void serve() {
-        const int fd = ::accept(listen_fd_, nullptr, nullptr);
-        if (fd < 0)
-            return;
+        for (int served = 0; served < max_requests_ && !stop_.load();) {
+            pollfd pfd{listen_fd_.get(), POLLIN, 0};
+            const int pr = ::poll(&pfd, 1, 100);
+            if (pr < 0 && errno == EINTR)
+                continue;
+            if (pr <= 0)
+                continue;
+            yuzu::agent::ScopedFd conn{::accept(listen_fd_.get(), nullptr, nullptr)};
+            if (!conn.valid())
+                continue;
+#ifdef SO_NOSIGPIPE
+            const int one = 1;
+            ::setsockopt(conn.get(), SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+#endif
+            handle(conn.get());
+            ++served;
+        }
+    }
+
+    void handle(int fd) const {
+#ifdef MSG_NOSIGNAL
+        constexpr int kFlags = MSG_NOSIGNAL;
+#else
+        constexpr int kFlags = 0;
+#endif
         std::string req;
         char buf[1024];
         while (req.find("\r\n\r\n") == std::string::npos) {
             const auto n = ::recv(fd, buf, sizeof buf, 0);
+            if (n < 0 && errno == EINTR)
+                continue;
             if (n <= 0)
                 break;
             req.append(buf, static_cast<std::size_t>(n));
@@ -294,18 +326,21 @@ private:
         const std::string resp = head + body_;
         std::size_t off = 0;
         while (off < resp.size()) {
-            const auto n = ::send(fd, resp.data() + off, resp.size() - off, MSG_NOSIGNAL);
+            const auto n = ::send(fd, resp.data() + off, resp.size() - off, kFlags);
+            if (n < 0 && errno == EINTR)
+                continue;
             if (n <= 0)
                 break;
             off += static_cast<std::size_t>(n);
         }
-        ::close(fd);
     }
 
     std::string body_;
-    int listen_fd_{-1};
+    int max_requests_;
+    yuzu::agent::ScopedFd listen_fd_;
     int port_{0};
-    std::thread thread_;
+    std::atomic<bool> stop_{false};
+    std::thread thread_; // last: started in the constructor body, joined first
 };
 
 // A VALID Brotli stream (one uncompressed meta-block + the final empty block) for `plain`:
@@ -346,7 +381,7 @@ TEST_CASE("content_dist plugin: stage hashes the RAW bytes on the wire, never a 
     yuzu::test::ScopedEnv scoped_tmpdir{"TMPDIR", tmp.path.string()};
     yuzu::agent::LocalDispatcher dispatcher;
 
-    OneShotBrotliServer server{wire};
+    BrotliLoopbackServer server{wire, 2};
     const std::string url = "http://127.0.0.1:" + std::to_string(server.port()) + "/payload.bin";
     // The operator pins the hash of the DECODED content. A client that decoded Brotli would
     // hash `plain` and match; the hash is of bytes written to disk, so it must hash `wire`.
@@ -357,8 +392,17 @@ TEST_CASE("content_dist plugin: stage hashes the RAW bytes on the wire, never a 
     CHECK(result.rc != 0);
     CHECK(result.captured.find("error|hash mismatch: expected=" + plain_hash +
                                ", got=" + wire_hash) != std::string::npos);
+    CHECK(result.captured.find("status|ok") == std::string::npos);
     // The mismatched download is removed, never left staged.
     CHECK_FALSE(fs::exists(tmp.path / "yuzu-staged" / "wp14a-br.bin"));
+
+    // Positive control: the hash of the bytes ON THE WIRE passes the hash gate. (The un-init()'d
+    // plugin then has no KV store to record the hash in, so the run still ends in an error, but
+    // never a hash mismatch.)
+    std::vector<YuzuParam> ok_params{
+        {"url", url.c_str()}, {"filename", "wp14a-br-ok.bin"}, {"sha256", wire_hash.c_str()}};
+    auto ok = dispatcher.run(plugin->descriptor, "stage", ok_params);
+    CHECK(ok.captured.find("hash mismatch") == std::string::npos);
 }
 
 #endif // !_WIN32

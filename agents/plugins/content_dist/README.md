@@ -46,7 +46,7 @@ A successful `stage` proves the bytes match the hash the caller gave, which is o
 
 ### The trust chain for `execute_staged`
 
-1. The hash you pass to `stage` is the root of trust. The URL, the network path and a plain `http://` source are not trusted; the hash is the only integrity check on the download. The agent's HTTP clients never decode a `Content-Encoding` (a `br` or `gzip` response is stored as sent), so the hash is always taken over the bytes written to disk, and a decompression decoder is never run on the peer's data.
+1. The hash you pass to `stage` is the root of trust. The URL, the network path and a plain `http://` source are not trusted; the hash is the only integrity check on the download. The `content_dist` plugin's HTTP clients never decode a `Content-Encoding` (a `br` or `gzip` response is stored as sent), so the hash is taken over the bytes written to disk and no decompression decoder runs on the peer's data inside the long-lived agent process, which holds elevated rights on some platforms (root on macOS, LocalSystem on Windows).
 2. `stage` keeps the file only if its SHA-256 equals that hash, then stores the hash in the agent's key-value store, a separate database outside the staging directory.
 3. `execute_staged` ignores any hash in the call for authorisation. It reads the recorded hash from the key-value store, hashes the file on disk again, and refuses if there is no record or the two differ. A file dropped into the staging directory by anything other than `stage` has no record and does not run.
 4. The optional `expected_hash` parameter is only a drift check: it must equal the recorded hash or the call fails, and it can never authorise anything the record does not.
