@@ -17,7 +17,7 @@ The gateway's Erlang/OTP needs no activation step: Meson resolves the pinned rel
 
 ## Agent-only vcpkg install
 
-`vcpkg.json` defaults to the `server` and `tests` features (libpq, xmlsec, drogon, catch2), so a plain `vcpkg install --triplet x64-windows --x-manifest-root=.` installs the server ports too. A Windows build is always agent-only (ADR-0035), so it opts out and skips them (`libpq` is a from-source PostgreSQL build, `drogon` pulls trantor and jsoncpp):
+`vcpkg.json` defaults to the `server` and `tests` features (libpq, xmlsec, drogon, libxlsxwriter, catch2), so a plain `vcpkg install --triplet x64-windows --x-manifest-root=.` installs the server ports too. A Windows build is always agent-only (ADR-0035), so it opts out and skips them (`libpq` is a from-source PostgreSQL build, `drogon` pulls trantor and jsoncpp):
 
 ```bash
 vcpkg install --triplet x64-windows --x-manifest-root=. --x-no-default-features

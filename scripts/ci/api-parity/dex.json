@@ -312,5 +312,13 @@
     },
     "mcp_twin": "reset_dex_score_policy",
     "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/api/v1/dex/apps/usage",
+    "capability_id": "get.api-v1-dex-apps-usage",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "exception:#8096 revisit:2026-12-31 the MCP twin of the fleet application usage read is owed: it reuses dex_apps_usage_json and the DexApi apps_usage seam, and this row is retired when that tool lands"
   }
 ]

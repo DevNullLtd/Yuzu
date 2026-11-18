@@ -238,7 +238,9 @@ metadata:
     queries the Administrators group via NetLocalGroupGetMembers and
     reports member type (user, group, well_known_group, alias) and domain.
     On Linux checks sudo/wheel groups plus root. On macOS reads the
-    admin group via dscl.
+    admin group via dscl. On Linux, if a group or account lookup fails
+    (as opposed to the group not existing) the result is marked
+    constrained (partial) rather than silently listing fewer members.
   tags: [users, admins, security, compliance, privilege-audit]
 
 spec:
@@ -302,8 +304,10 @@ metadata:
     Lists members of a specified local group. On Windows queries
     NetLocalGroupGetMembers and reports member type (user, group,
     well_known_group, alias). On Linux reads /etc/group and checks
-    primary GID assignments in /etc/passwd. On macOS reads the group
-    via dscl. The group name is a required parameter.
+    primary GID assignments in /etc/passwd; a failed group lookup answers
+    "Group lookup failed" and a constrained (partial) result, distinct from
+    "Group not found". On macOS reads the group via dscl. The group name
+    is a required parameter.
   tags: [users, groups, security, compliance, privilege-audit]
 
 spec:
