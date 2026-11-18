@@ -294,7 +294,9 @@ a vulnerability disclosed after the release is not in them.
 #   macOS:   brew install gh
 #   Windows: winget install --id GitHub.cli
 
-# cosign v2.6.2 or later, for Sigstore signature verification
+# cosign v3.0 or later, for Sigstore signature verification. Releases are signed with
+# cosign v3 (the new bundle format): cosign v2.x reports "no signatures found" for a
+# genuine image unless you add --new-bundle-format to every `cosign verify` below.
 #   Ubuntu/Debian: curl -sSLO https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64 && chmod +x cosign-*
 #   macOS:         brew install cosign
 #   Windows:       winget install --id Sigstore.Cosign
@@ -605,7 +607,7 @@ subject cosign prints. A network error reaching Sigstore's TUF root usually
 clears on a re-run (cosign needs network access to the TUF root, or a local
 `--trusted-root`; there is no offline mode in `scripts/build-agent-bundle.sh`); if
 it persists for about an hour, or cosign reports an expired or unverifiable
-trusted root, update cosign (v2.6.2 or later) instead of waiting.
+trusted root, update cosign (v3.0 or later) instead of waiting.
 
 **`SHA256SUMS.sigstore: no such file`** — the v0.7.x releases ship the
 bundle only under the legacy filename `SHA256SUMS.bundle`; v0.8.0-rc0 to
