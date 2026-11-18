@@ -423,12 +423,6 @@ public:
     [[nodiscard]] std::expected<AgentLeafState, std::string>
     agent_leaf_state(const std::string& agent_id);
 
-    /// WP01 (option 2): true iff `serial_hex` is a REVOKED agent leaf whose reason is
-    /// `kRevokeReasonReenrolled` (the server superseded it: its holder was replaced by a token
-    /// re-enrolment). An operator-revoked leaf is NOT. `unexpected(msg)` is a read failure (the
-    /// caller then treats the leaf as plainly revoked: refuse).
-    [[nodiscard]] std::expected<bool, std::string> is_reenrolled_revoked(const std::string& serial_hex);
-
     /// WP01: serials of the ACTIVE, unexpired agent leaves of `agent_id` (DB clock), for the
     /// post-issuance supersession sweep. Same read-failure contract as `agent_leaf_state`.
     [[nodiscard]] std::expected<std::vector<std::string>, std::string>

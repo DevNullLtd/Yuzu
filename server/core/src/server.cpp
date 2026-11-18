@@ -9795,15 +9795,6 @@ public:
                 // certs as agent identities (foreign certs fall through to bootstrap).
                 agent_service_.set_peer_cert_recognizer(
                     [this](const std::string& peer_cert_pem) { return is_yuzu_issued(peer_cert_pem); });
-                // WP01 (option 2): a leaf the server superseded, presented with a fresh token,
-                // is "no proof" (token path) rather than "revoked" (see AgentServiceImpl).
-                agent_service_.set_superseded_checker([this](const std::string& peer_cert_pem) {
-                    const std::string serial = resolve_yuzu_peer_serial(peer_cert_pem);
-                    if (serial.empty() || !ca_store_ || !ca_store_->is_open())
-                        return false;
-                    auto r = ca_store_->is_reenrolled_revoked(serial);
-                    return r.has_value() && *r; // a read failure keeps the refusal
-                });
                 // WP01: proof of identity on re-registration of an already-enrolled id, for the
                 // direct AND gateway-relayed paths (ONE hooks object, ONE decision:
                 // agent_reregistration_gate.hpp). Wired only here, with the issuing CA: an install
@@ -12226,7 +12217,6 @@ public:
         agent_service_.set_revocation_checker(nullptr);
         agent_service_.set_peer_cert_recognizer(nullptr);
         agent_service_.set_agent_identity_hooks(nullptr);
-        agent_service_.set_superseded_checker(nullptr);
         // WP01: shutdown flush of the dropped-audit-row summary (the audit store is still open).
         flush_reregistration_audit_summary(audit_store_.get(), &metrics_, /*force=*/true);
         if (gateway_service_) {
