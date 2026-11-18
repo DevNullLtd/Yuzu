@@ -3611,6 +3611,18 @@ test('agent installer plugin coverage lint',
   timeout: 30,
 )
 
+# The Windows agent payloads (zip and installer) ship the Visual C++ runtime
+# app-local, and release.yml checks every shipped binary's DLL imports against
+# each payload before ISCC runs. Behavioural over synthetic PE images (stdlib),
+# the staging script under pwsh when present, plus lexical wiring pins with a
+# mutation self-test.
+test('windows payload import closure',
+  _python3_test,
+  args: [files('test_windows_payload_imports.py')],
+  suite: 'docs',
+  timeout: 300,
+)
+
 # Compose certs volume (#5370): every tracked compose that keeps Postgres on a
 # volume must also keep the server's /etc/yuzu/certs (CA + the secrets KEK,
 # registered in Postgres) on a named volume. Stdlib only, no Docker.

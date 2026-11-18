@@ -100,6 +100,18 @@ if [[ "$TARGET" == "agent" ]]; then
     echo "Agent exe:    found"
     echo "Runtime DLLs: $AGENT_DLL_COUNT"
 
+    # The Microsoft Visual C++ runtime, deployed app-local: yuzu-agent.iss
+    # installs $BUILD_DIR/msvc-runtime/*.dll into {app}\bin and fails to
+    # compile if that folder is empty. Same script as release.yml.
+    PWSH=$(command -v pwsh || true)
+    if [[ -z "$PWSH" ]]; then
+        echo "ERROR: pwsh (PowerShell 7+) not found; it stages the Visual C++ runtime" >&2
+        exit 1
+    fi
+    WIN_STAGE=$(cygpath -w "$SCRIPT_DIR/stage-msvc-runtime.ps1" 2>/dev/null || echo "$SCRIPT_DIR/stage-msvc-runtime.ps1")
+    WIN_RUNTIME_DIR=$(cygpath -w "$BUILD_DIR/msvc-runtime" 2>/dev/null || echo "$BUILD_DIR/msvc-runtime")
+    "$PWSH" -NoProfile -ExecutionPolicy Bypass -File "$WIN_STAGE" -Destination "$WIN_RUNTIME_DIR"
+
     WIN_ISS=$(cygpath -w "$SCRIPT_DIR/yuzu-agent.iss" 2>/dev/null || echo "$SCRIPT_DIR/yuzu-agent.iss")
 
     MSYS_NO_PATHCONV=1 "$ISCC" \

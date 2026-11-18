@@ -78,6 +78,13 @@ section is maintained manually; see `vcpkg.json` and
   Three.js OrbitControls (vendored) ..... MIT
   Nayuki QR-Code-generator (vendored) ... MIT
   IBM Plex Sans / Mono (vendored) ....... SIL OFL 1.1
+  Microsoft Visual C++ runtime .......... Microsoft Visual Studio licence terms (Distributable Code)
+      Windows agent archive and installer only: vcruntime140*.dll and msvcp140*.dll from
+      the Visual Studio redistributable directory of the toolset that built the agent,
+      Copyright (c) Microsoft Corporation, redistributed unmodified and installed in the
+      agent's own bin directory ("app-local"), a deployment Microsoft documents for these
+      files (learn.microsoft.com, "Redistributing Visual C++ files"). Not covered by the
+      AGPL; Microsoft's terms apply to them.
 
 Before cutting the first AGPL-era release, run an SBOM / attribution
 aggregator (e.g. scancode-toolkit or OSS Review Toolkit) over the

@@ -111,6 +111,24 @@ on any other distribution. The exception is `yuzu-agent-bundle-chisel`, which de
 agent files: the Linux agent extracted from it has the tarball's requirements. Building the
 native packages to an older baseline is not part of 0.15.0; it is planned under ADR-2003 (#5143).
 
+### Windows agent: Visual C++ runtime
+
+The Windows agent, its plugins and its bundled libraries are built with Microsoft Visual C++
+and need its C++ runtime (`vcruntime140.dll`, `vcruntime140_1.dll`, `msvcp140.dll` and, for
+`yuzu-agent.exe`, `msvcp140_atomic_wait.dll`, which needs Visual C++ Redistributable 14.28 or
+later). From 0.16.0 the release archive (`yuzu-agent-windows-x64.zip`) and the installer
+(`YuzuAgentSetup-<version>.exe`) carry these DLLs in the agent's own `bin` directory, next to
+`yuzu-agent.exe`, so a Windows 10 or later x64 machine needs nothing installed first. The
+agent uses that copy even when the machine also has the Visual C++ Redistributable installed;
+it is updated by installing a newer agent, and Windows Update does not service it.
+
+Releases up to and including 0.15.0 did not carry the runtime: on a machine without the
+Visual C++ 2015-2022 Redistributable (x64), 14.28 or later, `yuzu-agent.exe` does not start
+and Windows reports a missing `VCRUNTIME140.dll` or `MSVCP140.dll`. Install the
+Redistributable from Microsoft, or upgrade the agent. The 0.15.0 installer also left out six
+plugins that the archive carried (`browser_inventory`, `license_scan`, `netprobe`,
+`printing`, `privacy_permissions`, `rdp_control`); later installers include them.
+
 ## Quick Start
 
 1. **Start the server** -- run `yuzu-server` with a configuration file or accept interactive first-run setup.

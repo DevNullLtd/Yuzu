@@ -159,3 +159,22 @@ ladder step 3 the release install is agent-only, so the server ports' DLLs
 shipped, and `release.yml`'s `build-windows` step "Verify the agent runs from
 the packaged archive" fails if any of them appears in the archive. That step
 has not yet run on a real release tag.
+
+Both the release zip and `YuzuAgentSetup` also carry the Microsoft Visual C++
+runtime app-local in `bin`: `release.yml`'s "Package archive" step runs
+`deploy/packaging/windows/stage-msvc-runtime.ps1`, which copies every
+`vcruntime140*.dll` and `msvcp140*.dll` (`vcruntime140.dll`,
+`vcruntime140_1.dll`, `msvcp140.dll` and `msvcp140_atomic_wait.dll` are
+required) from the build machine's Visual Studio redistributable directory
+into the zip's `bin` and into `build-windows\msvc-runtime`, which
+`yuzu-agent.iss` installs into `{app}\bin`. The directory comes from
+`VCToolsRedistDir` (set by `ilammy/msvc-dev-cmd`) or else from `vswhere`; the
+script never runs `vcvars64.bat`, and on Windows it refuses a DLL that is not
+validly signed by Microsoft. The next step, "Check the DLL import closure of
+both payloads", runs `scripts/ci/check-windows-payload-imports.py`: every DLL
+that a shipped `.exe` or `.dll` imports must be in that payload's `bin`, be an
+API set, or be an operating-system DLL in `System32`, except the Visual C++
+runtime, which counts as missing unless the payload carries it (the runner
+has it in `System32`; a customer machine need not). A local
+`deploy/packaging/windows/build-installer.sh` run stages the runtime the same
+way and needs `pwsh`. Neither step has run on a real release tag yet.
