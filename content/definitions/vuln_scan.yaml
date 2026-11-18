@@ -18,7 +18,8 @@ metadata:
     policy, remote desktop config, etc.). Each finding is classified by
     severity (CRITICAL, HIGH, MEDIUM, LOW, INFO, or UNREADABLE when the check
     could not run; not an issue). On macOS, Homebrew formulae and casks are
-    not scanned (use pkg_inventory.packages); the run ends with a row titled
+    not scanned (use pkg_inventory.packages; restoring CVE matching is tracked in
+    #8256); the run ends with a row titled
     "Coverage" saying so (INFO, or UNREADABLE when the software list or a
     configuration read failed), and a result with no CVE rows means only that
     no built-in rule matched the software enumerated. Reports progress at
@@ -42,7 +43,7 @@ spec:
     columns:
       - name: severity
         type: string
-        description: Finding severity assigned by the check that produced this row. UNREADABLE means the check could not run; not an issue.
+        description: Finding severity assigned by the check that produced this row. UNREADABLE means the check could not run, or on macOS that a configuration check row's read failed or a Coverage row says part of the host could not be read; not an issue.
         values: [CRITICAL, HIGH, MEDIUM, LOW, INFO, UNREADABLE]
         example: CRITICAL
         platforms: [windows, linux, darwin]
@@ -111,12 +112,13 @@ metadata:
     Scan installed software against known CVE rules. Enumerates installed
     applications (registry on Windows, dpkg/rpm/pacman on Linux,
     system_profiler on macOS; Homebrew formulae and casks are not scanned,
-    use pkg_inventory.packages) and compares versions against the
+    use pkg_inventory.packages; tracked in #8256) and compares versions against the
     built-in CVE database. Returns only CVE findings, not configuration
     checks. A result with no CVE rows means only that no built-in rule
     matched the software enumerated above; on macOS the run ends with an INFO
     row titled "Coverage" saying so, or an UNREADABLE Coverage row (and no "No
-    vulnerabilities" row) when system_profiler could not be read completely. Use the full "scan" action for combined
+    vulnerabilities" row) when system_profiler could not be read completely or an
+    application matching a built-in rule has no usable version. Use the full "scan" action for combined
     results.
   tags: [security, vulnerability, cve, compliance]
 
@@ -216,7 +218,7 @@ spec:
     columns:
       - name: severity
         type: string
-        description: Finding severity assigned by the compliance check that produced this row. UNREADABLE means the check could not run; not an issue.
+        description: Finding severity assigned by the compliance check that produced this row. UNREADABLE means the check could not run, or on macOS that a configuration check row's read failed or a Coverage row says part of the host could not be read; not an issue.
         values: [CRITICAL, HIGH, MEDIUM, LOW, INFO, UNREADABLE]
         example: HIGH
         platforms: [windows, linux, darwin]
@@ -272,7 +274,7 @@ metadata:
     the endpoint's security posture without the full finding details.
     Returns total findings, total issues, and per-severity counts
     (CRITICAL, HIGH, MEDIUM, LOW, INFO, UNREADABLE; UNREADABLE means the check
-    could not run and is not counted as an issue). On macOS, Homebrew formulae
+    could not run, or on macOS that a configuration read failed, and is not counted as an issue). On macOS, Homebrew formulae
     and casks are not scanned (use pkg_inventory.packages), and the output ends
     with summary|COVERAGE|<text> rows saying so (one per cause); the counts cover only the
     software enumerated. On macOS the UNREADABLE count is at least 1 on a
@@ -342,7 +344,7 @@ metadata:
     client-side CVE scanning that enables the server to perform
     centralized vulnerability correlation against the full NVD database. On
     macOS the list is system_profiler applications only; Homebrew formulae and
-    casks are not included (use pkg_inventory.packages), and a macOS run that
+    casks are not included (use pkg_inventory.packages; tracked in #8256), and a macOS run that
     read nothing returns no rows. The rows are pure name|version pairs with no
     coverage row, and the coverage status is visible only in the agent log (not
     in REST, MCP or the dashboard): treat the list as "system_profiler

@@ -54,7 +54,9 @@ inline std::vector<const Argv*> macos_commands() {
 }
 
 // Bounds: a stalled tool cannot park a pool worker, a runaway cannot grow RSS. One action's worst
-// case is the profiler (60 s) plus six status tools (10 s each) = 120 s.
+// case is the profiler (60 s) plus seven 10 s status reads (five tools, the update-check `defaults`
+// read twice) = 130 s nominal, about 146 s with the runner's 2 s drain grace per command. A
+// waiter behind an overdue flight waits at most 75 s.
 inline constexpr long long kMacosCommandDeadlineMs = 60'000; // system_profiler
 inline constexpr long long kMacosToolDeadlineMs = 10'000;    // spctl/fdesetup/csrutil/...
 inline constexpr std::size_t kMacosCommandMaxOutput = 8u * 1024u * 1024u;
@@ -67,6 +69,7 @@ inline constexpr std::string_view kMacosHomebrewNotScanned = "macos:vuln_scan:ho
 inline constexpr std::string_view kMacosSystemProfilerUnreadable =
     "macos:vuln_scan:system_profiler_unreadable";
 inline constexpr std::string_view kMacosConfigUnreadable = "macos:vuln_scan:config_unreadable";
+inline constexpr std::string_view kMacosCveInputIncomplete = "macos:vuln_scan:cve_input_incomplete";
 
 // In-band coverage notes: the operator-visible half of the result status (the status token itself
 // reaches only the agent log). Emitted as rows in the SAME output as the CONSTRAINED status.
@@ -93,7 +96,40 @@ struct MacosApp {
 struct MacosEnumeration {
     std::vector<MacosApp> apps;
     bool readable = false; // the command ran, exited 0, and yielded at least one app
+    std::size_t suspect_lines = 0; // lines that look like a name or version but were not recognised
 };
+
+/// A version CVE matching can compare: non-empty and starting with an ASCII digit ("17.0.1", not
+/// "", "Unknown", "v100.0.1" or an NBSP-prefixed value).
+inline bool usable_version(std::string_view v) {
+    return !v.empty() && v.front() >= '0' && v.front() <= '9';
+}
+
+/// How many DISTINCT applications match a built-in CVE rule's product text (ASCII
+/// case-insensitive substring, as the matcher does) but have no usable version. `rules` is any
+/// range whose elements have a `product` string_view (yuzu::vuln::kCveRules).
+template <class Rules>
+inline std::size_t count_unusable_cve_apps(const std::vector<MacosApp>& apps, const Rules& rules) {
+    const auto lower = [](std::string_view s) {
+        std::string o(s);
+        for (char& c : o)
+            if (c >= 'A' && c <= 'Z')
+                c = static_cast<char>(c - 'A' + 'a');
+        return o;
+    };
+    std::size_t n = 0;
+    for (const auto& app : apps) {
+        if (usable_version(app.version))
+            continue;
+        const std::string name = lower(app.name);
+        for (const auto& rule : rules)
+            if (name.find(lower(rule.product)) != std::string::npos) {
+                ++n;
+                break;
+            }
+    }
+    return n;
+}
 
 // Per-field bounds: a NUL would cut the row at the C-string plugin ABI and an enormous name would
 // become an oversize frame. NUL bytes are replaced with '?', over-long text is truncated.
@@ -152,6 +188,8 @@ inline MacosEnumeration parse_system_profiler_apps(std::string_view out, bool co
         current_version.clear();
         have_name = have_version = false;
     };
+    if (out.starts_with("\xEF\xBB\xBF")) // a UTF-8 byte-order mark before the first line
+        out.remove_prefix(3);
     size_t pos = 0;
     while (pos <= out.size()) {
         size_t nl = out.find('\n', pos);
@@ -168,14 +206,27 @@ inline MacosEnumeration parse_system_profiler_apps(std::string_view out, bool co
         if (body.empty())
             continue;
         if (indent == 4 && raw[4] != '\t' && body.back() == ':') {
-            if (body.substr(0, 8) == "Version:")
-                continue; // a name line never starts "Version:"
+            if (body.substr(0, 8) == "Version:") {
+                ++r.suspect_lines; // a name line never starts "Version:"
+                continue;
+            }
             flush();
             current_name = std::string(body.substr(0, body.size() - 1));
             have_name = true;
-        } else if (indent > 4 && have_name && !have_version && body.substr(0, 8) == "Version:") {
-            current_version = std::string(detail::trim(body.substr(8)));
-            have_version = true;
+        } else if (indent > 4 && body.substr(0, 8) == "Version:") {
+            if (!have_name) {
+                ++r.suspect_lines; // a Version line before any name
+            } else if (!have_version) {
+                const auto value = detail::trim(body.substr(8));
+                if (!value.empty()) { // an empty value must not consume the app's one version
+                    current_version = std::string(value);
+                    have_version = true;
+                }
+            }
+        } else if (indent == 3 || indent == 5 || (indent == 4 && body.back() != ':')) {
+            // a name or property line at an indent the real output never uses
+            if (body.back() == ':' || indent == 4)
+                ++r.suspect_lines;
         }
     }
     flush();
@@ -183,9 +234,12 @@ inline MacosEnumeration parse_system_profiler_apps(std::string_view out, bool co
     // them and the scan reads clean. English labels only are understood: when MORE THAN HALF of the
     // apps have no recognised version, the read is unreadable (this covers every app unversioned and
     // a report that mixes labels). A real Mac lists nearly every application with a version.
+    // Every unrecognised name/version-shaped line counts as one more unusable application.
     const auto unversioned = std::count_if(r.apps.begin(), r.apps.end(),
-                                           [](const MacosApp& a) { return a.version.empty(); });
-    if (!r.apps.empty() && unversioned * 2 > static_cast<std::ptrdiff_t>(r.apps.size()))
+                                           [](const MacosApp& a) { return a.version.empty(); }) +
+                             static_cast<std::ptrdiff_t>(r.suspect_lines);
+    const auto total = static_cast<std::ptrdiff_t>(r.apps.size() + r.suspect_lines);
+    if (!r.apps.empty() && unversioned * 2 > total)
         r.apps.clear();
     if (!command_ok)
         r.apps.clear();
@@ -199,6 +253,7 @@ struct CoverageState {
     bool macos_software = false;    // the action consumed the macOS software list
     bool sp_readable = true;        // ... and system_profiler ran cleanly and produced applications
     bool config_unreadable = false; // a macOS config check's read failed (UNREADABLE row emitted)
+    std::size_t cve_inputs_unusable = 0; // apps matching a CVE rule that had no usable version
 };
 
 /// Provenance token for the CONSTRAINED/PARTIAL status; empty = declare nothing. The provenance is
@@ -208,6 +263,8 @@ struct CoverageState {
 inline std::string_view coverage_token(const CoverageState& c) {
     if (c.macos_software && !c.sp_readable)
         return kMacosSystemProfilerUnreadable;
+    if (c.cve_inputs_unusable > 0)
+        return kMacosCveInputIncomplete;
     if (c.config_unreadable)
         return kMacosConfigUnreadable;
     if (c.macos_software)
@@ -217,28 +274,36 @@ inline std::string_view coverage_token(const CoverageState& c) {
 
 struct CoverageNote {
     std::string_view severity; // "INFO" (known standing gap) or "UNREADABLE" (a read failed)
-    std::string_view text;
+    std::string text;
 };
+
+/// The note for applications that matched a built-in CVE rule but had no usable version.
+inline std::string cve_input_note(std::size_t n) {
+    return std::to_string(n) + " application(s) matching a built-in CVE rule had no usable version; "
+                               "not a clean result";
+}
 
 /// Every in-band coverage note for this run, in a stable order; empty = nothing to say.
 inline std::vector<CoverageNote> coverage_notes(const CoverageState& c) {
     std::vector<CoverageNote> n;
     if (c.macos_software)
-        n.push_back(c.sp_readable ? CoverageNote{"INFO", kCoverageNoteHomebrew}
-                                  : CoverageNote{"UNREADABLE", kCoverageNoteUnreadable});
+        n.push_back(c.sp_readable ? CoverageNote{"INFO", std::string(kCoverageNoteHomebrew)}
+                                  : CoverageNote{"UNREADABLE", std::string(kCoverageNoteUnreadable)});
+    if (c.cve_inputs_unusable > 0)
+        n.push_back({"UNREADABLE", cve_input_note(c.cve_inputs_unusable)});
     if (c.config_unreadable)
-        n.push_back({"UNREADABLE", kCoverageNoteConfig});
+        n.push_back({"UNREADABLE", std::string(kCoverageNoteConfig)});
     return n;
 }
 
 /// `severity|category|title|detail` row (matches the placeholder row's shape).
 inline std::string coverage_row(const CoverageNote& n) {
-    return std::string(n.severity) + "|scan|Coverage|" + std::string(n.text);
+    return std::string(n.severity) + "|scan|Coverage|" + n.text;
 }
 
 /// `summary|<key>|<value>` row for summary (summary's own row shape; value is text, like TOTAL's).
 inline std::string coverage_summary_row(const CoverageNote& n) {
-    return "summary|COVERAGE|" + std::string(n.text);
+    return "summary|COVERAGE|" + n.text;
 }
 
 } // namespace yuzu::vuln

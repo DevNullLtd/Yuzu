@@ -39,6 +39,10 @@ struct Payload {
     Payload(Payload&&) noexcept = default;
     Payload& operator=(Payload&&) noexcept = default;
 };
+// Disarms the throwing copy on scope exit, so a failed assertion cannot leak the armed state.
+struct DisarmOnExit {
+    ~DisarmOnExit() { g_throw_on_copy = false; }
+};
 } // namespace
 
 TEST_CASE("single flight: the result is cached for the ttl", "[vuln][flight]") {
@@ -74,6 +78,7 @@ TEST_CASE("single flight: a throwing run returns the failed result and does not 
 TEST_CASE("single flight: a throwing result copy (bad_alloc) is survived and does not wedge",
           "[vuln][flight]") {
     SingleFlight<Payload> f;
+    const DisarmOnExit disarm;
     // run() builds its payload, THEN the copy starts throwing: the best-effort cache write (a copy
     // assignment inside the flight) throws, and get() must still return the run's result.
     auto r1 = std::async(std::launch::async, [&] {
@@ -130,6 +135,7 @@ TEST_CASE("single flight: concurrent callers share one run", "[vuln][flight]") {
     SingleFlight<int> f;
     std::atomic<int> runs{0};
     std::vector<std::future<int>> fs;
+    const auto t0 = std::chrono::steady_clock::now();
     for (int i = 0; i < 8; ++i)
         fs.push_back(std::async(std::launch::async, [&] {
             return f.get([&] { ++runs; std::this_thread::sleep_for(100ms); return 7; }, 10s, 5s, -1);
@@ -137,4 +143,6 @@ TEST_CASE("single flight: concurrent callers share one run", "[vuln][flight]") {
     for (auto& x : fs)
         CHECK(x.get() == 7);
     CHECK(runs.load() == 1);
+    // waiters were released by the leader's notify, not by the 5 s wait cap
+    CHECK(std::chrono::steady_clock::now() - t0 < 2s);
 }

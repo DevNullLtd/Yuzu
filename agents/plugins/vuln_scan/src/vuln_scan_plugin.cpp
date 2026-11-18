@@ -383,12 +383,25 @@ std::vector<Finding> do_cve_scan_impl(yuzu::vuln::CoverageState* cov = nullptr) 
     std::vector<Finding> findings;
     auto apps = get_installed_apps(cov);
 
+    // macOS only: an application that matches a built-in rule but has no usable version cannot be
+    // compared, so the run must not read clean (see CoverageState::cve_inputs_unusable).
+    const bool mac_software = cov && cov->macos_software;
+    if (mac_software) {
+        std::vector<yuzu::vuln::MacosApp> view;
+        view.reserve(apps.size());
+        for (const auto& a : apps)
+            view.push_back({a.name, a.version});
+        cov->cve_inputs_unusable = yuzu::vuln::count_unusable_cve_apps(view, yuzu::vuln::kCveRules);
+    }
+
     for (const auto& rule : yuzu::vuln::kCveRules) {
         for (const auto& app : apps) {
             if (!icontains(app.name, rule.product))
                 continue;
             if (app.version.empty())
                 continue;
+            if (mac_software && !yuzu::vuln::usable_version(app.version))
+                continue; // counted above; never string-compared
 
             // Check if installed version is below the fixed version
             if (yuzu::vuln::compare_versions(app.version, rule.affected_below) < 0) {
@@ -456,7 +469,7 @@ void emit_coverage_summary_row(yuzu::CommandContext& ctx, const yuzu::vuln::Cove
 void output_findings(yuzu::CommandContext& ctx, const std::vector<Finding>& findings,
                      const yuzu::vuln::CoverageState& cov = {}) {
     if (findings.empty()) {
-        if (!(cov.macos_software && !cov.sp_readable))
+        if (!(cov.macos_software && !cov.sp_readable) && cov.cve_inputs_unusable == 0)
             ctx.write_output("INFO|scan|No vulnerabilities|No issues detected");
         return;
     }
@@ -496,7 +509,7 @@ void output_summary(yuzu::CommandContext& ctx, const std::vector<Finding>& findi
 //   - macOS: get_installed_apps and run_macos_checks run absolute-path argvs
 //     (/usr/sbin/system_profiler, spctl, fdesetup, csrutil, socketfilterfw, systemsetup, defaults)
 //     through yuzu::agent::run_bounded_subprocess — rung 2, an 8 MB output cap, a 60 s deadline
-//     for system_profiler and 10 s for the status tools. There is no open-port check on macOS
+//     for system_profiler and 10 s for each status read (seven: five tools, `defaults` twice). There is no open-port check on macOS
 //     (reported as an UNREADABLE row), so no macOS leg uses popen.
 //     cve_scan/scan/summary/inventory are CONSTRAINED: Homebrew formulae and casks are never
 //     scanned (see macos_software.hpp), and the same actions report CONSTRAINED + PARTIAL at run

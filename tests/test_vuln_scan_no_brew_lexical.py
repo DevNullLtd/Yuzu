@@ -18,6 +18,8 @@ behavioural test, so they are pinned lexically):
   (a) no string literal in the plugin sources starts with a bare macOS tool name (spctl, fdesetup,
       csrutil, socketfilterfw, systemsetup, system_profiler, defaults);
   (b) every kMacos*Cmd constant defined in macos_software.hpp is USED in another source file;
+  (d) the CVE-input guard is present (count set, unusable versions skipped on macOS, placeholder
+      suppressed);
   (c) in vuln_scan_plugin.cpp each of the five action branches calls declare_coverage(ctx, cov)
       exactly once (five calls in all), every do_*_impl / get_installed_apps call is passed &cov,
       scan/cve_scan/config_scan call emit_coverage_row, summary calls emit_coverage_summary_row,
@@ -229,6 +231,15 @@ def pin_errors(root: pathlib.Path) -> list[str]:
             for m in re.finditer(r"\bdeclare_coverage\s*\(([^)]*)\)", b):
                 if re.sub(r"\s+", "", m.group(1)) != "ctx,cov":
                     errs.append(f"{a}: declare_coverage({m.group(1).strip()}) must be (ctx, cov)")
+        # the CVE-input guard: unusable-version apps are counted from the apps list, unusable
+        # versions are never string-compared on macOS, and the clean placeholder is suppressed
+        for needle, why in (
+            (r"cov->cve_inputs_unusable\s*=\s*yuzu::vuln::count_unusable_cve_apps\(", "the unusable CVE-input count is not set"),
+            (r"mac_software\s*&&\s*!yuzu::vuln::usable_version\(app\.version\)", "an unusable version is not skipped on macOS"),
+            (r"cov\.cve_inputs_unusable\s*==\s*0", "the clean placeholder is not suppressed when CVE inputs were unusable"),
+        ):
+            if not re.search(needle, plug[0]):
+                errs.append(f"vuln_scan_plugin.cpp: {why}")
         if len(re.findall(r"\bdeclare_coverage\s*\(\s*ctx\b", plug[0])) != len(ACTIONS):
             errs.append(f"declare_coverage(ctx, ...) must appear exactly {len(ACTIONS)} times in vuln_scan_plugin.cpp")
     return errs

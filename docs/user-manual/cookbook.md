@@ -686,17 +686,17 @@ print(f"Found {len(critical)} critical/high vulnerabilities across fleet")
 
 #### CEL Compliance Expression
 
-Policy: no critical or high vulnerabilities, and no coverage failure:
+Policy: no critical or high vulnerabilities, and no unreadable macOS software list or unusable CVE input (attach it to `scan`, `cve_scan` or `config_scan`, not to `summary`, whose `summary|CRITICAL|0` row always matches):
 
 ```cel
 !result.output.contains('CRITICAL|') && !result.output.contains('HIGH|') && !result.output.contains('UNREADABLE|scan|Coverage|')
 ```
 
-A policy sees the plugin's whole output as ONE text value, `result.output` (the plugin emits pipe-delimited text, not a column set, so `result.severity` and `result.cvss_score` are not bound: an expression on them is true for every host). The row prefixes are upper case (`CRITICAL|`, `HIGH|`, `UNREADABLE|`) and `contains` is case-sensitive. The third clause marks a macOS host whose software list could not be read as non-compliant (that run ends with an `UNREADABLE|scan|Coverage|...` row). It does not catch an individual unreadable configuration check (`UNREADABLE|config|...`): to find those, read the rows through REST or MCP. On macOS the output of every `scan`, `config_scan` and `summary` includes one `UNREADABLE|config|Open Ports|...` row because the open-port check does not exist there, so do not use a bare `UNREADABLE|` match as a gate; and `summary|UNREADABLE|<n>` is at least 1 on a healthy Mac for the same reason.
+A policy sees the plugin's whole output as ONE text value, `result.output` (the plugin emits pipe-delimited text, not a column set, so `result.severity` and `result.cvss_score` are not bound: an expression on them is true for every host). The row prefixes are upper case (`CRITICAL|`, `HIGH|`, `UNREADABLE|`); CEL `contains` is case-insensitive (both sides are lowercased), so `high|` in any case also matches, while the Python `in` test above is case-sensitive. The third clause marks a macOS host whose software list could not be read, or on which an application matching a built-in rule had no usable version, as non-compliant (that run ends with an `UNREADABLE|scan|Coverage|...` row). A compliant result does not prove every application was matched: an application missing from `system_profiler`'s list, or listed in a shape the parser does not recognise, is not seen. It does not catch an individual unreadable configuration check (`UNREADABLE|config|...`): to find those, read the rows through REST or MCP. On macOS the output of every `scan`, `config_scan` and `summary` includes one `UNREADABLE|config|Open Ports|...` row because the open-port check does not exist there, so do not use a bare `UNREADABLE|` match as a gate; and `summary|UNREADABLE|<n>` is at least 1 on a healthy Mac for the same reason.
 
 #### macOS Homebrew coverage
 
-On macOS, `vuln_scan` reads applications from `system_profiler` only. Homebrew formulae and casks are not scanned, so a macOS result with no CVE rows means only that no built-in rule matched the applications `system_profiler` listed; it says nothing about Homebrew packages, and matched Homebrew CVEs are not available. `pkg_inventory.packages` lists Homebrew packages (machine scope) but does not match them against CVE rules.
+On macOS, `vuln_scan` reads applications from `system_profiler` only. Homebrew formulae and casks are not scanned (restoring CVE matching is tracked in #8256), so a macOS result with no CVE rows means only that no built-in rule matched the applications `system_profiler` listed; it says nothing about Homebrew packages, and matched Homebrew CVEs are not available. `pkg_inventory.packages` lists Homebrew packages (machine scope) but does not match them against CVE rules.
 
 The scan says so in its own output, and every coverage problem is an `UNREADABLE` row or an `INFO` Coverage row, so these rows mark the cases that mean "not assessed":
 

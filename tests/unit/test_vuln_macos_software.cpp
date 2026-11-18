@@ -6,6 +6,7 @@
  */
 
 #include "config_checks.hpp"
+#include "cve_rules.hpp"
 #include "macos_software.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -107,7 +108,7 @@ TEST_CASE("macos commands: every argv[0] is an absolute path (no daemon-PATH res
 TEST_CASE("macos commands: bounds are set", "[vuln][macos]") {
     CHECK(kMacosCommandDeadlineMs == 60'000);
     CHECK(kMacosToolDeadlineMs == 10'000);
-    CHECK(kMacosToolDeadlineMs * 6 + kMacosCommandDeadlineMs <= 120'000); // one action's budget
+    CHECK(kMacosToolDeadlineMs * 7 + kMacosCommandDeadlineMs == 130'000); // one action, nominal
     CHECK(kMacosCommandMaxOutput == 8u * 1024u * 1024u);
 }
 
@@ -548,8 +549,10 @@ TEST_CASE("macos config: any_config_unreadable keys on severity", "[vuln][macos]
     CHECK(any_config_unreadable(v));
 }
 
-// ── golden fixtures: REAL output, verified on macOS 27.0.1 (one Apple Silicon host; 13-15 not
-//    measured; exit codes not yet captured) ────────────────────────────────────────────────────
+// ── golden fixtures: REAL output measured on ONE macOS 27.0.1 host (the five status tools' good-state
+//    lines and the path-form `defaults` key-absent line). Unmeasured: the bare-domain defaults text,
+//    bad-state exit codes, the enabled-Firewall digit, `systemsetup` as a daemon and a non-English
+//    system_profiler. ───────────────────────────────────────────────────────────────────────────
 
 TEST_CASE("golden macOS 27.0.1: the five status tools' real lines are accepted", "[vuln][macos][golden]") {
     // MEASURED exit codes on that host: every tool below exited 0 in the state shown, so `good()`
@@ -683,14 +686,128 @@ TEST_CASE("parse: NUL bytes are replaced and over-long names and versions are ca
     std::string name = "Evil";
     name.push_back('\0');
     name += "Tail";
-    auto e = parse_system_profiler_apps("    " + name + ":\n      Version: 1.0\n", true);
+    std::string ver = "1.";
+    ver.push_back('\0');
+    ver += "2";
+    auto e = parse_system_profiler_apps("    " + name + ":\n      Version: " + ver + "\n", true);
     REQUIRE(e.apps.size() == 1);
     CHECK(e.apps[0].name == "Evil?Tail");
     CHECK(e.apps[0].name.find('\0') == std::string::npos);
+    CHECK(e.apps[0].version == "1.?2");
+    CHECK(e.apps[0].version.find('\0') == std::string::npos);
 
     const std::string huge(5 * 1024 * 1024, 'x'); // a >4 MiB name would be an oversize frame
     auto big = parse_system_profiler_apps("    " + huge + ":\n      Version: " + huge + "\n", true);
     REQUIRE(big.apps.size() == 1);
     CHECK(big.apps[0].name.size() == kMaxNameBytes);
     CHECK(big.apps[0].version.size() == kMaxVersionBytes);
+}
+
+// ── CVE inputs without a usable version must not read clean ─────────────────
+
+TEST_CASE("usable_version: starts with an ASCII digit", "[vuln][macos][cveinput]") {
+    CHECK(usable_version("17.0.1"));
+    CHECK(usable_version("0"));
+    CHECK_FALSE(usable_version(""));
+    CHECK_FALSE(usable_version("Unknown"));
+    CHECK_FALSE(usable_version("v100.0.1"));
+    CHECK_FALSE(usable_version("\xC2\xA0" "17.0"));  // NBSP-prefixed
+    CHECK_FALSE(usable_version(" 17.0"));
+}
+
+TEST_CASE("count_unusable_cve_apps: only apps matching a CVE rule product are counted",
+          "[vuln][macos][cveinput]") {
+    const std::vector<MacosApp> apps = {
+        {"Google Chrome", ""},          // matches "chrome", unusable
+        {"Firefox", "Unknown"},         // matches "firefox", unusable
+        {"Safari", "17.0"},             // no rule, usable
+        {"Zoom", ""},                   // no rule product, unusable but not counted
+        {"Git", "v2.1"},                // matches "git", unusable
+        {"Node.js", "20.1"},            // usable
+    };
+    CHECK(count_unusable_cve_apps(apps, kCveRules) == 3);
+    CHECK(count_unusable_cve_apps(std::vector<MacosApp>{}, kCveRules) == 0);
+    // ASCII case-insensitive, like the matcher
+    CHECK(count_unusable_cve_apps(std::vector<MacosApp>{{"GOOGLE CHROME", ""}}, kCveRules) == 1);
+    // an app is counted once even when several rules match its name
+    CHECK(count_unusable_cve_apps(std::vector<MacosApp>{{"Windows Python Git", ""}}, kCveRules) == 1);
+}
+
+TEST_CASE("coverage: unusable CVE inputs raise their own token and an UNREADABLE note",
+          "[vuln][macos][cveinput]") {
+    CoverageState c;
+    c.macos_software = true;
+    c.cve_inputs_unusable = 2;
+    CHECK(coverage_token(c) == "macos:vuln_scan:cve_input_incomplete");
+    const auto notes = coverage_notes(c);
+    REQUIRE(notes.size() == 2); // Homebrew gap + the new note
+    CHECK(notes[1].severity == "UNREADABLE");
+    CHECK(notes[1].text ==
+          "2 application(s) matching a built-in CVE rule had no usable version; not a clean result");
+    CHECK(coverage_row(notes[1]) ==
+          "UNREADABLE|scan|Coverage|2 application(s) matching a built-in CVE rule had no usable "
+          "version; not a clean result");
+    // precedence: an unreadable software list outranks it, it outranks the config token
+    c.config_unreadable = true;
+    CHECK(coverage_token(c) == kMacosCveInputIncomplete);
+    c.sp_readable = false;
+    CHECK(coverage_token(c) == kMacosSystemProfilerUnreadable);
+    CHECK(kMacosCveInputIncomplete.starts_with("macos:"));
+}
+
+TEST_CASE("parse: the unusable-app threshold is MORE THAN HALF (3 of 6 readable, 4 of 6 not)",
+          "[vuln][macos]") {
+    const auto build = [](int versioned, int bare) {
+        std::string o = "Applications:\n\n";
+        for (int i = 0; i < versioned; ++i)
+            o += "    V" + std::to_string(i) + ":\n\n      Version: 1." + std::to_string(i) + "\n\n";
+        for (int i = 0; i < bare; ++i)
+            o += "    B" + std::to_string(i) + ":\n\n      Obtained from: Apple\n\n";
+        return o;
+    };
+    CHECK(parse_system_profiler_apps(build(3, 3), true).readable);   // 3 of 6: not more than half
+    CHECK_FALSE(parse_system_profiler_apps(build(2, 4), true).readable); // 4 of 6
+    CHECK(parse_system_profiler_apps(build(1, 1), true).readable);   // 1 of 2
+    CHECK(parse_system_profiler_apps(build(2, 2), true).readable);   // 2 of 4
+}
+
+TEST_CASE("parse: reshaped lines count toward the unusable total", "[vuln][macos]") {
+    // a name at indent 3 or 5, a Version before its name, and an empty Version value
+    // the lost name AND its orphaned Version line both count (2 suspect among 7 total: readable)
+    auto indent3 = parse_system_profiler_apps(
+        "   Lost:\n      Version: 9\n    A:\n      Version: 1\n    B:\n      Version: 1\n"
+        "    C:\n      Version: 1\n    D:\n      Version: 1\n",
+        true);
+    CHECK(indent3.suspect_lines == 2);
+    CHECK(indent3.readable);
+    auto before = parse_system_profiler_apps("      Version: 9\n    A:\n      Version: 1\n", true);
+    CHECK(before.suspect_lines == 1);
+    auto many = parse_system_profiler_apps(
+        "   X:\n   Y:\n   Z:\n    A:\n      Version: 1\n", true);
+    CHECK(many.suspect_lines == 3);
+    CHECK_FALSE(many.readable); // 3 suspect of 4 total
+    // an empty Version value does not consume the app's one version
+    auto empty = parse_system_profiler_apps("    A:\n      Version:\n      Version: 2.0\n", true);
+    REQUIRE(empty.apps.size() == 1);
+    CHECK(empty.apps[0].version == "2.0");
+    // a byte-order mark before the first name is skipped
+    auto bom = parse_system_profiler_apps("\xEF\xBB\xBF    A:\n      Version: 1\n", true);
+    REQUIRE(bom.apps.size() == 1);
+    CHECK(bom.apps[0].name == "A");
+    // the real shape has no suspect lines
+    auto real = parse_system_profiler_apps(
+        "Applications:\n\n    App Store:\n\n      Version: 3.0\n      Signed by:\n      Location: /x\n", true);
+    CHECK(real.suspect_lines == 0);
+}
+
+TEST_CASE("end to end shape: Chrome and Firefox unversioned beside Safari and Zoom stays readable "
+          "but is flagged by the CVE inputs",
+          "[vuln][macos][cveinput]") {
+    auto e = parse_system_profiler_apps(
+        "    Google Chrome:\n      Obtained from: Apple\n    Firefox:\n      Kind: x\n"
+        "    Safari:\n      Version: 17.0\n    Zoom:\n      Version: 5.0\n",
+        true);
+    CHECK(e.readable);
+    REQUIRE(e.apps.size() == 4);
+    CHECK(count_unusable_cve_apps(e.apps, kCveRules) == 2);
 }
