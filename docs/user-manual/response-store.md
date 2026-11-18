@@ -14,7 +14,7 @@ status, result payload, and timing information.
 
 | Setting | Default | Description |
 |---|---|---|
-| Retention period | 90 days | Responses older than this are deleted by the clock-guarded retention reap (`response_retention_days`) |
+| Retention period | 90 days | Responses older than this are deleted by the clock-guarded retention reap (`--response-retention-days` / `YUZU_RESPONSE_RETENTION_DAYS`; a value of 0 or less disables the reap, so responses never expire) |
 | Reap cadence | ~1 hour | How often the shared maintenance thread runs the expired-response reap |
 
 ## Response structure
@@ -417,7 +417,10 @@ operator-visible notes:
 Responses are retained for 90 days by default. The server reaps responses
 whose TTL has expired on a periodic guarded sweep (clock-guarded and capped,
 so a skewed clock or a large backlog cannot mass-delete or stall — the same
-retention-guard shape the audit log uses). Deletion is permanent.
+retention-guard shape the audit log uses). Deletion is permanent. The one shorter lifetime is the
+quarantine reconciler's recurring status replies, which are kept 24 hours unless they changed what the
+server holds about the device; with retention set to 0 (keep forever) they are kept like every other
+response.
 
 To preserve data beyond the retention window, set up periodic exports using
 cron or a scheduled task:

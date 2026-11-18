@@ -3,9 +3,9 @@
 // filesystem_acl_parsers.hpp -- pure ACL decoders/formatters for the
 // filesystem plugin's get_acl action.
 //
-// Portable and header-only: only the standard library, <yuzu/string_utils.hpp> and
-// <wire_utf8.hpp> (itself OS-free), no OS headers, so every host compiles and unit-tests all three
-// legs. The OS shells (getxattr / acl_get_file / GetAce) feed these functions raw bytes or text.
+// Portable and header-only: only the standard library, <row_field.hpp> (over
+// <yuzu/string_utils.hpp>) and <wire_utf8.hpp> (both OS-free), no OS headers, so every host
+// compiles and unit-tests all three legs. The OS shells (getxattr / acl_get_file / GetAce) feed these functions raw bytes or text.
 //
 // Every leg emits ONE cross-OS row shape:
 //
@@ -18,14 +18,14 @@
 //   * macOS   <type> = allow|deny; <flags> = inheritance flags.
 //   * Windows <type> = allow|deny|allow_object|...|other; <flags> = ACE flags.
 //
-// Row-field escaping (row_field below): CR/LF fold to a space, a TRAILING backslash folds to '/',
-// a byte that is not well-formed UTF-8, or a NUL, shows as '?', pipes are escaped.
-// safe_output_field() is NOT used: it folds every backslash and would rewrite `BUILTIN\Users`.
-// Interior backslashes survive because the server decoder (result_parsing.hpp) treats a backslash
-// not followed by a pipe as literal data; only a trailing one would glue onto the field separator
-// as `\|`.
+// Row-field escaping (row_field below): a byte that is not well-formed UTF-8, or a NUL, shows as
+// '?'; then yuzu::shared::row_field (shared with procfetch/wmi/installed_apps/network_config): CR/LF
+// fold to a space, a TRAILING backslash folds to '/', pipes are escaped. safe_output_field() is NOT
+// used: it folds every backslash and would rewrite `BUILTIN\Users`. Interior backslashes survive
+// because the server decoder (result_parsing.hpp) treats a backslash not followed by a pipe as
+// literal data; only a trailing one would glue onto the field separator as `\|`.
 
-#include <yuzu/string_utils.hpp>
+#include <row_field.hpp>
 #include <wire_utf8.hpp> // yuzu::shared::scrub_wire_bytes
 
 #include <cstddef>
@@ -39,16 +39,13 @@
 namespace yuzu::filesystem::acl {
 
 inline std::string row_field(std::string_view value) {
-    std::string out;
-    out.reserve(value.size());
-    for (char ch : value)
-        out += (ch == '\r' || ch == '\n') ? ' ' : ch;
-    if (!out.empty() && out.back() == '\\')
-        out.back() = '/';
     // A POSIX name is arbitrary bytes: a byte that is not well-formed UTF-8 (or a NUL) would make
     // the server reject the device's whole response, so it shows as '?'. A no-op for valid UTF-8.
-    yuzu::shared::scrub_wire_bytes(out);
-    return yuzu::util::escape_pipes(out);
+    // Scrubbing first is equivalent to scrubbing the escaped field: it only ever writes '?', never
+    // a CR, LF, '|' or '\' that the shared escaper acts on.
+    std::string scrubbed{value};
+    yuzu::shared::scrub_wire_bytes(scrubbed);
+    return yuzu::shared::row_field(scrubbed); // hoisted to agents/shared/row_field.hpp
 }
 
 namespace detail {

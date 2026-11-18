@@ -3715,6 +3715,24 @@ tests:
           - labels: 'ALERTS{alertname="YuzuGuardianReadDegraded", alertstate="firing", reason="statement_timeout", source="guardian_census_device", severity="warning"}'
             value: 1
 
+  # CASE - a sustained statement_timeout on the fleet application usage read (dex_usage)
+  # pages on its OWN source and reason labels: the unfiltered expr covers the new source
+  # with no expression change. for: 5m pinned both sides, as above.
+  - interval: 1m
+    name: guardian read degraded - a sustained dex_usage statement_timeout pages
+    input_series:
+      - series: 'yuzu_server_guardian_read_degrade_total{job="yuzu",instance="s1",reason="statement_timeout",source="dex_usage"}'
+        values: "0+1x20"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGuardianReadDegraded", alertstate="firing"}'
+        eval_time: 5m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGuardianReadDegraded", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGuardianReadDegraded", alertstate="firing", reason="statement_timeout", source="dex_usage", severity="warning"}'
+            value: 1
+
   # CASE — the boot-time pre-seed alone (the seeded sources x all three reasons
   # present at zero, never incremented) must stay quiet: present-at-zero is
   # the HEALTHY steady state, not a degrade.
@@ -9336,7 +9354,7 @@ tests:
               plugin: echo
             exp_annotations:
               summary: "About 2 agent(s) report plugin echo failed to initialise"
-              description: "For more than 10 minutes, about 2 agent(s) (summed across core replicas, so a failover can count one twice for a few minutes) have reported that plugin echo failed init (heartbeat tag yuzu.plugins_failed); it is loaded but not running, as distinct from not installed. plugin=\"unknown\" sums the well-formed names the server's plugin catalogue does not know, counted as reported names (tokens), so one agent can add several (the agent log names them; yuzu_fleet_plugin_init_failed_rejected counts the agents sending them). The runbook link is the Echo upgrade note; for any other plugin the agent log is the source. For plugin=\"echo\" the usual causes are a failed tar.db adoption after the rename (including a sidecar present under both names) and a corrupt echo.db that could not be moved aside; the upgrade notes cover adoption under 'Two cases the agent refuses, and what to do', and the corrupt-database case is under Corrupt-database quarantine in the Echo manual. An Echo that loads offline for lack of free space is not counted here (#7290). The value and the plugin label are agent-self-reported: the server bounds the label to its catalogue, so an agent cannot displace a real plugin, but it can still report a real plugin's name as failed, or not report a failure, so the signal is not authoritative."
+              description: "For more than 10 minutes, about 2 agent(s) (summed across core replicas, so a failover can count one twice for a few minutes) have reported that plugin echo failed init (heartbeat tag yuzu.plugins_failed); it is loaded but not running, as distinct from not installed. plugin=\"unknown\" sums the well-formed names the server's plugin catalogue does not know, counted as reported names (tokens), so one agent can add several (the agent log names them; yuzu_fleet_plugin_init_failed_rejected counts the agents sending them). The runbook link is the Echo upgrade note; for any other plugin the agent log is the source. For plugin=\"echo\" the usual causes are a failed tar.db adoption after the rename (including a sidecar present under both names) and a corrupt echo.db that could not be moved aside; the upgrade notes cover adoption under 'Two cases the agent refuses, and what to do', and the corrupt-database case is under Corrupt-database quarantine in the Echo manual. An Echo that loads offline (for lack of free space, or after a failed v10 migration) is not counted here; see YuzuEchoStorageOffline (#7290). The value and the plugin label are agent-self-reported: the server bounds the label to its catalogue, so an agent cannot displace a real plugin, but it can still report a real plugin's name as failed, or not report a failure, so the signal is not authoritative."
               runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/upgrading.md#behaviour-change-the-activity-record-feature-is-renamed-echo-tardb-adopted-as-echodb-stored-references-migrated"
     promql_expr_test:
       - expr: 'ALERTS{alertname="YuzuPluginInitFailed", alertstate="firing"}'
@@ -9441,6 +9459,137 @@ tests:
             value: 1
           - labels: 'ALERTS{alertname="YuzuPluginInitFailed", alertstate="firing", job="yuzu", plugin="wmi", severity="warning"}'
             value: 1
+  # CASE M (#7290) -- Echo storage offline: held for the full 30m, quiet at 29m, firing at 30m, with the
+  # reason label and no `instance`. Two replicas report it, so the annotations read "2 agent(s)": RED
+  # if `max by` replaces `sum by`. RED if `for:` is shortened (fires at 29m) or lengthened; the shipped
+  # annotations are pinned here, verbatim.
+  - interval: 1m
+    name: echo storage offline held past 30m fires, not before
+    input_series:
+      - series: 'yuzu_fleet_echo_storage_offline{job="yuzu",instance="s1",reason="migration_failed"}'
+        values: "1x45"
+      - series: 'yuzu_fleet_echo_storage_offline{job="yuzu",instance="s2",reason="migration_failed"}'
+        values: "1x45"
+    alert_rule_test:
+      - eval_time: 31m
+        alertname: YuzuEchoStorageOffline
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: yuzu
+              reason: migration_failed
+            exp_annotations:
+              summary: "About 2 agent(s) have Echo storage offline (migration_failed)"
+              description: "For more than 25 minutes, about 2 agent(s) (summed across core replicas, so a failover can count one twice for a few minutes) have reported that their Echo database could not be opened and Echo is offline (heartbeat tag yuzu.plugin.echo.storage_offline), reason migration_failed: free_space is too little free disk for the v10 roll-up migration, migration_failed is a migration that failed or ran past its deadline and was rolled back with the old data intact, open_failed is any other failure on a retry. reason=\"unknown\" sums values the server does not recognise. Nothing is collected on an affected endpoint, but the agent keeps retrying (1, 5 and 15 minutes, then hourly) and recovers by itself once the cause is gone, except an open_failed where the database opened but collection failed to start: that is not retried and needs an agent restart. The agent log and `echo status` on the device name the cause. The value and the reason are agent-self-reported, so the signal is not authoritative."
+              runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/ops-runbooks/echo-storage-offline.md"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuEchoStorageOffline", alertstate="firing"}'
+        eval_time: 29m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuEchoStorageOffline", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuEchoStorageOffline", alertstate="firing", job="yuzu", reason="migration_failed", severity="warning"}'
+            value: 1
+
+  # CASE N (#7290) -- the fixed label family at 0 for every reason (a healthy fleet) never fires.
+  # RED if the expression loses its `> 0`.
+  - interval: 1m
+    name: echo storage offline - an all-zero family never fires
+    input_series:
+      - series: 'yuzu_fleet_echo_storage_offline{job="yuzu",instance="s1",reason="free_space"}'
+        values: "0x60"
+      - series: 'yuzu_fleet_echo_storage_offline{job="yuzu",instance="s1",reason="migration_failed"}'
+        values: "0x60"
+      - series: 'yuzu_fleet_echo_storage_offline{job="yuzu",instance="s1",reason="open_failed"}'
+        values: "0x60"
+      - series: 'yuzu_fleet_echo_storage_offline{job="yuzu",instance="s1",reason="unknown"}'
+        values: "0x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuEchoStorageOffline"}'
+        eval_time: 45m
+        exp_samples: []
+
+  # CASE O (#7290) -- a replica restart mid-condition (absent a minute, then one sweep at 0) does not
+  # reset the `for:` clock. RED if the max_over_time window is removed or shortened to 1m.
+  - interval: 1m
+    name: echo storage offline - a replica restart mid-condition does not reset for
+    input_series:
+      - series: 'yuzu_fleet_echo_storage_offline{job="yuzu",instance="s1",reason="free_space"}'
+        values: "1x20 _x1 0x1 1x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuEchoStorageOffline", alertstate="firing"}'
+        eval_time: 40m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuEchoStorageOffline", alertstate="firing", job="yuzu", reason="free_space", severity="warning"}'
+            value: 1
+
+
+  # ── YuzuQuarantineDriftRepeated (#7622) ───────────────────────────────────
+  #
+  # `increase(yuzu_server_quarantine_reapply_total{result="drift"}[1h]) >= 3`, no hold, warning.
+  # The counters below start at 5 (a server that has already counted earlier drifts), so the
+  # window's first sample is not 0 and the extrapolation cannot clamp to zero: three drifts read
+  # a little over 3, two read a little over 2, which keeps both sides clear of the threshold.
+
+  # CASE M -- three drifts inside the hour fire; two on another instance do not. RED if the alert
+  # is removed, or its threshold moves to 4 or more (the firing side reads about 3.05 and goes
+  # quiet) or to 2 or less (the other instance reads about 2.03 and fires). It cannot tell >= 3
+  # from > 3: both sit under 3.05.
+  - interval: 1m
+    name: quarantine drift - three drifts in an hour fire, two do not
+    input_series:
+      - series: 'yuzu_server_quarantine_reapply_total{job="yuzu",instance="s1",result="drift"}'
+        values: "5x20 6 7 8 8x20"
+      - series: 'yuzu_server_quarantine_reapply_total{job="yuzu",instance="s2",result="drift"}'
+        values: "5x20 6 7 7x22"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuQuarantineDriftRepeated", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuQuarantineDriftRepeated", alertstate="firing", instance="s1", job="yuzu", result="drift", severity="warning"}'
+            value: 1
+
+  # ── YuzuQuarantineReconcilerStalled (#7623) ───────────────────────────────
+  #
+  # `time() - max by (job) (yuzu_server_quarantine_reconciler_last_tick_unixtime) > 300`,
+  # for: 5m, warning. Under promtool `time()` is the evaluation time in seconds from the start of
+  # the test, so a series whose value equals its own timestamp is a gauge that is being stamped
+  # every scrape ("0+60x40" at a 1m interval) and a series stuck at 0 is a thread that stopped.
+
+  # CASE N -- a gauge that stopped at t=0 fires once it is older than five minutes AND has stayed
+  # so for the hold: quiet at 8m (stale since 5m, still pending), firing at 20m. RED if the age
+  # threshold or the hold is removed.
+  - interval: 1m
+    name: quarantine reconciler stalled - a stale last-tick gauge fires after the hold
+    input_series:
+      - series: 'yuzu_server_quarantine_reconciler_last_tick_unixtime{job="yuzu",instance="s1"}'
+        values: "0x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuQuarantineReconcilerStalled", alertstate="firing"}'
+        eval_time: 8m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuQuarantineReconcilerStalled", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuQuarantineReconcilerStalled", alertstate="firing", job="yuzu", severity="warning"}'
+            value: 1
+
+  # CASE O -- a gauge stamped on every scrape never fires, and neither does a job where ONE of
+  # two instances is stale and the other is fresh (a follower that does not tick: the max over the
+  # job is the leader's). RED if `max by (job)` becomes a per-instance comparison.
+  - interval: 1m
+    name: quarantine reconciler stalled - a fresh instance keeps the job quiet
+    input_series:
+      - series: 'yuzu_server_quarantine_reconciler_last_tick_unixtime{job="yuzu",instance="s1"}'
+        values: "0+60x40"
+      - series: 'yuzu_server_quarantine_reconciler_last_tick_unixtime{job="yuzu",instance="s2"}'
+        values: "0x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuQuarantineReconcilerStalled"}'
+        eval_time: 30m
+        exp_samples: []
+
   # CASE -- the one-minute recheck clears a fixed database: the gauge goes 1 -> 0 while the server keeps
   # running, the alert fires after the hold and is gone once the gauge reads 0. Red if the rule
   # latched (e.g. read a max_over_time) so a fix needed a restart.
