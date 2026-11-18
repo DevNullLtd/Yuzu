@@ -221,8 +221,9 @@ differ, it governs.
 bucket of the Slice 1 summary (`server/core/src/crypto_cbom.*`), validated in CI against the
 vendored `bom-1.7.schema.json`. Algorithms, certificates, keys and protocols are not exported yet;
 they follow their own slices. Separately, release tooling generates SBOMs of Yuzu's release
-artifacts and images with `anchore/sbom-action`, and `scripts/check-release-artifacts.sh` checks
-that they exist.
+artifacts (`scripts/ci/artifact-sbom.py`, one per file) and images (`anchore/sbom-action`), and
+`scripts/check-release-artifacts.sh` and `artifact-sbom.py check` check that they exist and match
+their files.
 
 **Background.** CycloneDX added cryptographic assets in 1.6 (2024-04-09). 1.7 keeps the same model and
 extends it:

@@ -609,6 +609,11 @@ agent_test_exe = executable(
     'unit/test_row_byte_budget.cpp',    # shared row/byte budget (agents/shared/row_byte_budget.hpp), portable
     'unit/test_wall_clock_step.cpp',    # #4503: shared consecutive-sample wall-vs-monotonic clock-step guard (agents/shared/wall_clock_step.hpp), portable
     'unit/test_smbios_parsers.cpp',     # H.1: shared bounds-checked SMBIOS walker (agents/shared/smbios_parsers.hpp) + firmware_posture adapter differential, portable
+    'unit/test_binary_header_reader.cpp',  # shared bounded byte reader + endian loads (agents/shared/binary_header_reader.hpp), portable
+    'unit/test_binary_header_pe.cpp',      # shared PE version-resource reader (agents/shared/binary_header_pe.hpp): synthesised images + a real capture, portable
+    'unit/test_binary_header_elf.cpp',     # shared ELF header/program-header/note/SONAME reader (agents/shared/binary_header_elf.hpp): synthesised images + a real capture, portable
+    'unit/test_binary_header_macho.cpp',   # shared Mach-O thin/universal header + load-command reader (agents/shared/binary_header_macho.hpp): synthesised images + real captures, portable
+    'unit/test_printing_identity.cpp',           # #4679: getpwuid_r-shaped, ERANGE-growing, fail-closed identity lookup (POSIX)
     'unit/test_printing_parsers.cpp',            # Wave 9 PR9.1b
     'unit/test_printing_local_dispatcher.cpp',   # Wave 9 PR9.1b
     'unit/test_browser_policy_parsers.cpp',         # Wave 10 PR10.2-b: pure policy-row model (every OS) + injected-root Linux JSON walk (POSIX-only bodies)
@@ -650,6 +655,9 @@ agent_test_exe = executable(
     'unit/test_asset_tags_parsers.cpp',   # #232: pure cap/escape/apply_sync/snapshot helpers (asset_tags_parsers.hpp)
     'unit/test_asset_tags_store.cpp',   # #232: atomic state-file lifecycle (asset_tags_store.hpp), TempDir-based
     'unit/test_asset_tags_actions.cpp',   # #232: real asset_tags dylib/.so/.dll via LocalDispatcher, unguarded on every OS
+    'unit/test_wp12_lookup_helpers.cpp', # WP12: injected-lookup/fake-list tests for users_group_lookup.hpp, filesystem_posix_names.hpp, dns_cache_list.hpp
+    'unit/test_ioc_domain_cap.cpp', # F66: real ioc plugin, `domains` cap of 100 per command via LocalDispatcher
+    'unit/test_tags_concurrency.cpp', # F37: real tags plugin driven from concurrent threads via LocalDispatcher ([tsan])
     'unit/test_tags_plugin.cpp',   # #4728: TU-inclusion seam over tags_plugin.cpp -- save_tags() through the shared atomic write
     'unit/test_asset_tags_sync_lock.cpp', # #232: TU-inclusion seam over asset_tags_plugin.cpp -- sync writes under g_mu (a condition-variable seam, no per-OS body, runs on every OS)
     'unit/test_system_hardening_parsers.cpp',            # Wave 8 PR8.1-b: pure state mappers + errno classifier over REAL CAPTURE fixtures
@@ -903,6 +911,7 @@ agent_test_exe = executable(
                 firmware_posture_plugin_lib,  # Wave 8 PR8.4
                 browser_inventory_plugin_lib,  # Wave 10 P2a
                 local_security_policy_plugin_lib,  # Wave 8 PR8.3
+                tags_plugin_lib,  # F37: test_tags_concurrency.cpp loads the real plugin by path
                 asset_tags_plugin_lib,  # #232: test_asset_tags_actions.cpp loads the real plugin by path
                 system_hardening_plugin_lib,  # Wave 8 PR8.1-b
                 runtimes_plugin_lib,  # Wave 10 PR10.1-b
@@ -1474,20 +1483,21 @@ echo_test_exe = executable(
 )
 # The sizing cases fold 20,000 distinct keys per source, so they run as their own test() with a
 # longer timeout; the main run excludes them (the same filter-split shape as the server shards below).
-# 180s (#7135; was 90s). Unlike agent shard C above this is not an exception to the budget rule in
-# docs/testing/unit-test-conventions.md: no split is planned, and at 180s the measured passing runs
-# sit under the rule's 50% line. It took 51.04s on a Windows CI runner when
-# it passed (run 41919798385 attempt 5, 28% of 180s) and 82s on a standalone Windows host (#7135
-# comment, 46%), and it timed out at 90.09s on a loaded runner (attempt 4, job 126911227871) in
-# the same job where agent shard C also timed out; both passed on the rerun, so that was load,
-# not a hang. A timeout is a floor, not a measurement: the limit is 2x that floor, and the
-# deepest-load worst case is not measured, so the margin over it may be smaller than 2x. A failed
-# live-registry case adds its own 15s waits on top. Revisit the value once #7173/#7135 settle; there
-# is no commitment to lower it, because the 50% rule is met at 180s.
 # The schema-v10 migration cases ([v10]: a seeded v9 database folded over all 17 sources, chunked
-# folds, rollbacks) are about a quarter of the suite's run time on their own, which pushed the main
-# run past its 90 s limit on the Windows debug runner (about 55 s before them), so they are a
-# third test() too. Together the three filters cover every case exactly once.
+# folds, rollbacks) also get a separate test() entry, because together with the main run they
+# overran its limit on the Windows debug runner. The three filters cover every case exactly once.
+#
+# Limits, with the measurements they were set against. No limit changed in this block, and none is
+# raised without a recorded measurement.
+#  - echo unit tests, 180 s (#7135; was 90 s): 40.1-82.3 s over 17 Windows MSVC debug runs after
+#    PR #8081 (2026-11-17, closing comment on #7135); the worst is 46% of 180 s. The 90 s limit is
+#    history: it timed out at 90.09 s on a loaded runner (job 126911227871), having passed at
+#    51.04 s on another attempt (run 41919798385 attempt 5) and 82 s on a standalone Windows host.
+#    A failed live-registry case adds its own 15 s waits on top.
+#  - echo v10 migration, 300 s: 10.1-38.8 s in the same 17 runs; the worst is 13% of 300 s. Before
+#    PR #8081 it took 34-43 s on a quiet runner and 175-225 s when loaded.
+#  - echo fold sizing, 300 s: 37.32 s on the slowest of those runs (job 133878633910, 2026-11-17),
+#    12% of 300 s, and 40 s on run 42793514851 (2026-11-10).
 test('echo unit tests', echo_test_exe, args: ['~[fold_sizing]~[v10]', '--durations=yes'], suite: 'echo', timeout: 180)
 test('echo fold sizing', echo_test_exe, args: ['[fold_sizing]', '--durations=yes'], suite: 'echo', timeout: 300)
 test('echo v10 migration', echo_test_exe, args: ['[v10]~[fold_sizing]', '--durations=yes'], suite: 'echo', timeout: 300)
@@ -1767,6 +1777,7 @@ if build_server
       'unit/server/test_secure_random.cpp',
       'unit/server/test_quarantine_store.cpp',
       'unit/server/test_quarantine_dispatch_decision.cpp', # #3127: pure write/response classification — no Postgres, no MCP transport, no agent
+      'unit/server/test_quarantine_release_decision.cpp',  # #7585b: pure release-half decision tables, the bounded reply wait and the reply-retention rule — no Postgres
       'unit/server/test_quarantine_dispatch_gate.cpp',     # #881: containment gate at the dispatch chokepoint — pure arm/degradation logic, no store
       'unit/server/test_plugin_presence_dispatch_gate.cpp', # #3424/#3511: plugin-presence filter at the dispatch chokepoint — mirrors test_quarantine_dispatch_gate.cpp
       'unit/server/test_os_kill_switch_dispatch_gate.cpp', # #5294: per-OS kill-switch filter at the dispatch chokepoint — mirrors test_plugin_presence_dispatch_gate.cpp
@@ -2136,6 +2147,8 @@ if build_server
       # SAM-36 streamed export: pure parse/chunk/clamp core, then the route over fake page readers (no store, no [pg], no sleeps)
       'unit/server/test_software_export_stream.cpp',
       'unit/server/test_software_export_routes.cpp',
+      # SAM-36b XLSX writer: real (tiny) workbooks in a yuzu_test_ dir, read back through minizip; the sheet-byte accounting, the read-back check (damaged zips, and failed writes made with RLIMIT_FSIZE), the pure disk budget, exclusive file creation
+      'unit/server/test_software_export_xlsx.cpp',
       'unit/server/test_software_title_dimension.cpp',
       'unit/server/test_software_licensing_store.cpp',
       'unit/server/test_software_licensing_ingestion.cpp',
@@ -2301,7 +2314,9 @@ if build_server
     # it links Catch2 without Catch2Main.
     # cli11_dep: test_server_ota_options.cpp parses real CLI::App argv in-process
     # to pin the OTA flag/env contract (header-only, no link cost).
-    dependencies: [yuzu_server_core_dep, catch2_nomain_dep, cli11_dep, dependency('openssl', required: true, include_type: 'system')],
+    # minizip_dep (server/core/meson.build): test_software_export_xlsx.cpp and the XLSX cases of
+    # test_software_export_routes.cpp read the finished workbook back through minizip's unzip API.
+    dependencies: [yuzu_server_core_dep, catch2_nomain_dep, cli11_dep, dependency('openssl', required: true, include_type: 'system'), minizip_dep],
   )
   # Sharded 2026-07-13 (#2092 — the split the 2026-07-12 recalibration comment
   # promised): test() entries over the SAME binary, partitioned by Catch2
@@ -3543,6 +3558,21 @@ test('release artifact gate',
   timeout: 60,
 )
 
+# Per-artifact SBOMs (supply-chain S8): scripts/ci/artifact-sbom.py, with syft
+# stubbed. Pins the vcpkg closure (agent vs server, no test/helper/host ports),
+# the artifact hash and name on the SBOM root, every artifact kind (the macOS
+# .pkg in its shipped layout, the installer from its compiler's manifest), the
+# incompleteness mark, and the release check's bound and forbidden paths. The
+# generate tests skip on Windows (the stubs are #! scripts); the rest run. When
+# jsonschema is importable, every generated SBOM is also validated against the
+# vendored CycloneDX 1.7 and SPDX 2.3 schemas (YUZU_REQUIRE_JSONSCHEMA=1: required).
+test('per-artifact SBOM generator',
+  _python3_test,
+  args: [files('test_artifact_sbom.py')],
+  suite: 'docs',
+  timeout: 60,
+)
+
 # Agent-only Windows and macOS releases (ADR-0035 ladder step 2): release.yml's
 # Windows/macOS jobs build no server and no server installer, the old archive
 # names are gone, and every place that names a platform archive agrees on one
@@ -3577,9 +3607,24 @@ test('server feature option lint',
   timeout: 300,
 )
 
-test('local test runner platform selftest',
+# Three shards of one selftest (`<index>/<count>` picks every count-th case): it runs the real runner
+# in a fresh set of shells per case, which takes about 19 s on an idle Windows runner and passed the
+# 30 s limit on a loaded one (#8207), the split the CI guard's own warning asks for.
+test('local test runner platform selftest 1 of 3',
   _python3_test,
-  args: [files('test_run_tests_platform.py')],
+  args: [files('test_run_tests_platform.py'), '0/3'],
+  suite: 'platform',
+  timeout: 30,
+)
+test('local test runner platform selftest 2 of 3',
+  _python3_test,
+  args: [files('test_run_tests_platform.py'), '1/3'],
+  suite: 'platform',
+  timeout: 30,
+)
+test('local test runner platform selftest 3 of 3',
+  _python3_test,
+  args: [files('test_run_tests_platform.py'), '2/3'],
   suite: 'platform',
   timeout: 30,
 )
@@ -4257,6 +4302,14 @@ if _bash_test.found()
       suite: 'docs',
       timeout: 60,
     )
+    # The pull_request diff base (merge commit's first parent) shared by the
+    # README touch rule and the spawn scan; also pins both workflows to it.
+    test('pr merge-parent base selftest',
+      _bash_test,
+      args: [files('../scripts/ci/pr-merge-parent.sh'), '--selftest'],
+      suite: 'docs',
+      timeout: 60,
+    )
     # #6470: the bash-side exit codes (usage error, no working python) of the three
     # CI lints, which their own --selftest cannot reach. Off Windows only: the
     # no-python arm builds a PATH of symlinks, which MSYS2 turns into copies.
@@ -4752,6 +4805,16 @@ test('same-site gate production wiring lexical selftest',
   timeout: 60,
 )
 
+# WP12: the tags/users/filesystem agent plugins must not call the non-reentrant getpwuid/getpwnam/
+# getgrnam/getgrgid (concurrent dispatch pool). Source-text only; the ONLY plain-build regression
+# check for those call sites (the race itself is caught only by the nightly TSan job).
+test('plugin reentrant libc lookups lexical gate',
+  _python3_test,
+  args: [files('test_plugin_reentrant_libc_lexical.py'), meson.current_source_dir() / '..'],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # A unit-test file marked "Whole file compiled out under TSan" must have nothing after its
 # `#ifndef YUZU_TSAN_BUILD` guard's closing `#endif`: no PR job builds with TSan, so a case added
 # there compiles everywhere except the nightly's TSan leg (#6419). Source-text only, so Python.
@@ -5030,12 +5093,25 @@ test('issue lifecycle docs',
 
 # The old standalone containment agent plugin is removed and nothing names it again (device
 # containment is the firewall plugin's four actions): no tracked file outside the history
-# allowlist names its files, actions, rule or chain prefixes or definition ids.
+# allowlist names its files, actions, rule or chain prefixes or definition ids. The same file runs
+# the Linux firewall helper under every POSIX shell on the host (a few hundred short processes), so
+# its budget is wider than the source-text gates around it.
 test('removed containment plugin lexical gate',
   _python3_test,
   args: [files('test_legacy_quarantine_plugin_removed_lexical.py')],
   suite: 'docs',
   timeout: 120,
+)
+
+# Two quarantine facts no behavioural test can fail on: the apply claim is stamped and tested on the
+# database clock (quarantine_store.cpp never binds a replica clock reading into it), and server.cpp
+# seeds the reconciler's metric families at boot exactly once. Source-text only; carries its own
+# in-memory mutation self-test.
+test('quarantine wiring lexical gate',
+  _python3_test,
+  args: [files('test_quarantine_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
 )
 
 # The Windows package-sources upgrade note states the fresh-deployment contract (routed
@@ -5246,6 +5322,15 @@ test('Echo security wiring lexical gate',
   suite: 'docs',
   timeout: 30,
 )
+# The Echo test-writing standard (docs/testing/echo-test-standard.md): no sleeps, no std::async,
+# no unguarded wait, no size CHECK before an index in tests/unit/**/test_echo*.cpp. In suite 'echo',
+# not 'docs', because the docs suite is excluded on the Windows and macOS legs and echo runs on all.
+test('Echo test standard lexical gate',
+  _python3_test,
+  args: [files('test_echo_test_standard_lexical.py')],
+  suite: 'echo',
+  timeout: 30,
+)
 
 # Personal-data commit guard (scripts/ci/check-personal-data.py) and its
 # self-test. Both also run in .github/workflows/docs-lint.yml on every PR.
@@ -5389,6 +5474,12 @@ test('contract evidence CI step', _python3_test,
 # One CCACHE_MAXSIZE per self-hosted pool: a smaller cap trims the shared cache.
 test('ci ccache cap', _python3_test,
   args: [files('test_ci_ccache_cap.py')], suite: 'docs', timeout: 30)
+# Each vcpkg.json override has a row in docs/build-guide.md "Security dependency pins".
+test('vcpkg overrides documented', _python3_test,
+  args: [files('test_vcpkg_overrides_documented.py')], suite: 'docs', timeout: 30)
+# Each SHA-256 a vendored *-NOTICE.txt records is the hash of the file it names.
+test('vendored notice hashes', _python3_test,
+  args: [files('test_vendored_notice_hashes.py')], suite: 'docs', timeout: 30)
 if get_option('build_contract_tests')
   _contract_adapter = files('../scripts/test/contract-evidence.py')
   test('contract.plugin.loader.reserved-name.reject', _python3_test,
