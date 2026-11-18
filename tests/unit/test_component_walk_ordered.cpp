@@ -31,8 +31,13 @@
  *  - unknown identities: treating 0 as an identity fails the zero-identity cases (false restart, false
  *    other_device).
  *  - gap cap: not capping gaps fails the 1,000 / 5 split; opening a file fails total_opens == 0.
- *  - issued identity: dropping a known root or frame half on an unknown reading, or not learning a
- *    listed frame identity on resume, fails the position assertions of the unknown-identity case.
+ *  - issued identity: not learning a listed frame identity on resume fails the position assertions of
+ *    the unknown-identity case.
+ *  - known to unknown: re-adding the known() masking of the raw reading (a recorded half kept when the
+ *    listing reads 0) fails the two flipped unknown-identity sections and the replaced-and-lost case.
+ *  - unplaceable names: moving the valid_component check after the budget checks fails the bounded-
+ *    continuation case, and checking only the length fails the slash and NUL case; placing the name in
+ *    the position instead of reporting it fails the name_too_long case.
  *  - resumed other_device, repeated name, depth cap, row count, unmarked oversized listing: skipping
  *    the device check on the resume path, keeping both entries of a repeated name, not capping
  *    max_depth at kMaxPositionDepth, counting a row for a visit that returned false, or trusting
@@ -614,7 +619,7 @@ TEST_CASE("walk_ordered: an entry whose name a Position cannot hold is a name_to
     const std::string wide = "b" + std::string(fsr::kMaxNameBytes, 'w'); // sorts between "a" and "c"
     r.dir("/r", {F("a"), F(wide), F("c")});
     WalkLimits one;
-    one.max_entries = 2; // stops after "a" and the wide entry
+    one.max_entries = 1; // stops on "c" after "a"; the wide entry between them costs no budget
     const auto res = slice(r, {}, one);
     CHECK(r.visits == Strs{"/r/a"}); // the wide name is not searched
     REQUIRE(res.gaps.size() == 1);
@@ -626,8 +631,48 @@ TEST_CASE("walk_ordered: an entry whose name a Position cannot hold is a name_to
     const auto rest = slice(r, res.position, {});
     CHECK(r.visits == Strs{"/r/a", "/r/c"});
     CHECK(rest.stop == Stop::complete);
-    CHECK(!rest.gaps.empty());
+    REQUIRE(!rest.gaps.empty());
     CHECK(rest.gaps[0].cause == Cause::name_too_long);
+}
+
+TEST_CASE("walk_ordered: an unplaceable name never pins bounded continuations, whatever the budget",
+          "[walk_ordered][file_search][component_walk]") {
+    // The unplaceable entry costs no entry budget, so a slice that stops on the NEXT entry still
+    // moves the position past it: repeating the same bounded slice reaches every placeable entry.
+    const std::string wide = "b" + std::string(fsr::kMaxNameBytes, 'w');
+    for (const std::size_t budget : {1u, 2u, 3u}) {
+        Rig r;
+        r.dir("/r", {F("a"), F(wide), F("c"), F("d")});
+        WalkLimits lim;
+        lim.max_entries = budget;
+        fsr::Position p;
+        bool done = false;
+        for (int i = 0; i < 8 && !done; ++i) {
+            const auto out = slice(r, p, lim);
+            CAPTURE(budget, i, out.position.after, out.advanced);
+            CHECK(fsr::valid_position(out.position));
+            if (!done && out.stop != Stop::complete)
+                CHECK(out.advanced); // never a slice that moves nothing
+            done = out.stop == Stop::complete;
+            p = out.position;
+        }
+        CHECK(done);
+        CHECK(r.visits == Strs{"/r/a", "/r/c", "/r/d"});
+    }
+}
+
+TEST_CASE("walk_ordered: a name with a slash or a NUL is not placed either",
+          "[walk_ordered][file_search][component_walk]") {
+    // valid_component refuses these as well as a long name; a listing never carries them from a real
+    // filesystem, but a hostile or broken leg could.
+    Rig r;
+    r.dir("/r", {F("a"), F("b/x"), F(std::string("b\0x", 3)), F("c")});
+    const auto res = slice(r, {}, {});
+    CHECK(r.visits == Strs{"/r/a", "/r/c"});
+    CHECK(res.gaps.size() == 2);
+    for (const auto& g : res.gaps)
+        CHECK(g.cause == Cause::name_too_long);
+    CHECK(fsr::valid_position(res.position));
 }
 
 TEST_CASE("walk_ordered: a listing that does not fit max_retained_bytes is a memory_cap gap, siblings continue",

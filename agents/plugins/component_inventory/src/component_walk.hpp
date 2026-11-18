@@ -382,6 +382,18 @@ private:
                 continue;
             }
 
+            // A name a Position cannot hold (over kMaxNameBytes) is never placed in one, or the
+            // cursor for this slice would be empty and every retry would stall at this directory.
+            // It is not searched and says so. It is judged BEFORE the budget checks and costs none
+            // of the entry budget: charged, it would be consumed again by every retry that stops
+            // on the next entry, with the position never moving past it. After a slice boundary
+            // right here the entry is met and reported again: the gap count may over-count, never
+            // under-count.
+            if (!fsr::valid_component(e.name)) {
+                add_gap(walk_detail::join(path, e.name), Cause::name_too_long);
+                continue;
+            }
+
             if (time_up())
                 return stop(Stop::budget_time);
             if (out_.stats.entries >= limits_.max_entries)
@@ -389,15 +401,6 @@ private:
             if (out_.rows >= limits_.max_rows)
                 return stop(Stop::section_rows);
             ++out_.stats.entries;
-
-            // A name a Position cannot hold (over kMaxNameBytes) is never placed in one, or the
-            // cursor for this slice would be empty and every retry would stall at this directory.
-            // It is not searched and says so. After a slice boundary right here the entry is met
-            // and reported again: the gap count may over-count, never under-count.
-            if (!fsr::valid_component(e.name)) {
-                add_gap(walk_detail::join(path, e.name), Cause::name_too_long);
-                continue;
-            }
 
             switch (e.type) {
             case Type::link: ++out_.stats.links_skipped; complete(e.name); continue;
@@ -500,11 +503,14 @@ private:
  * the innermost directory entries with name <= after are skipped. When a name is missing or no longer a
  * directory the remaining frames are dropped and the walk continues with the first entry >= the name,
  * treated as new. A cursor name is never joined into a path that is listed unless that exact name
- * appeared as a Type::dir entry of the parent's real listing in this call. When a frame and its listing
- * both carry a non-zero identity and differ (the directory was replaced), or a non-zero
- * resume.root_dev/root_file_id differs from the root listing's, `restarted` is set and that subtree (or
- * the root) starts from its first entry: duplicates are possible, a silent skip is not. Unknown (zero)
- * identities never trigger a restart. Listings re-read on the resume path are NOT charged to
+ * appeared as a Type::dir entry of the parent's real listing in this call. When a frame's recorded
+ * identity half (device or file id) is known and the listing reads it as another value OR as unknown (0)
+ * (the directory was replaced), or the same holds for resume.root_dev/root_file_id against the root
+ * listing, `restarted` is set and that subtree (or the root) starts from its first entry: duplicates are
+ * possible, a silent skip is not. The RAW reading is compared, so a half that was known never survives
+ * an unknown reading; a half that was unknown and is now known is refinement, never a restart. A name
+ * a Position cannot hold (valid_component false) is reported as a name_too_long gap, costs no entry
+ * budget and is never placed in the position. Listings re-read on the resume path are NOT charged to
  * max_entries (only entries after the resume point are), so a deep resume cannot exhaust the budget
  * before progressing. `advanced` is true when the returned position is later than `resume` in
  * file_search::walk_order or the walk completed. A slice with restarted false NEVER returns a position
