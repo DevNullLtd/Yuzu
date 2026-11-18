@@ -353,16 +353,14 @@ void ingest_inventory_report(SoftwareInventoryStore& store, const std::string& a
                                yuzu::Histogram::seconds_buckets_60s())
                 .observe(secs);
         }
-        emit(source, outcome == InventoryIngestOutcome::kStored    ? "stored"
-                     : outcome == InventoryIngestOutcome::kTouched  ? "touched"
-                     : outcome == InventoryIngestOutcome::kNeedFull ? "need_full"
-                                                                    : "error");
+        emit(source, ingest_outcome_label(outcome));
         // need_full on cold-cache/drift (kNeedFull) AND on a transient store
         // failure (kError) — otherwise the agent sees an empty need_full, treats
         // the cycle as stored, and silently advances past un-stored data for up
-        // to a week (UP-2). Nacking makes the agent resend a full payload.
-        if (outcome == InventoryIngestOutcome::kNeedFull ||
-            outcome == InventoryIngestOutcome::kError)
+        // to a week (UP-2). Nacking makes the agent resend a full payload. kDeferred
+        // (a write pause) is never produced by this store but is mapped by the same
+        // helper, so a future producer cannot be mislabelled `error` or left un-nacked.
+        if (ingest_outcome_needs_full(outcome))
             ack.add_need_full(source);
     }
 }

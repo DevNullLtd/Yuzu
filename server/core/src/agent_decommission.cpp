@@ -32,6 +32,12 @@ const char* to_string(DecommissionOutcome o) noexcept {
     return "unknown";
 }
 
+namespace {
+constexpr const char* kWritePausedReason =
+    "removal not attempted because device-CI writes are paused by a PostgreSQL collation "
+    "mismatch; retry the decommission after the repair";
+} // namespace
+
 AgentDecommission::AgentDecommission(const AgentDecommissionStores& stores) {
     // Fixed registration order: the generic inventory store first, then each
     // typed projection (all born-on-PG). Every store is registered even when
@@ -64,6 +70,12 @@ AgentDecommission::AgentDecommission(const AgentDecommissionStores& stores) {
                             ? Fn([p = stores.device_inventory](std::string_view id) {
                                   return p->delete_agent(id);
                               })
+                            : nullptr,
+                        // delete_agent returns false without trying while device_ci writes are
+                        // paused (a collation mismatch): report that, not a generic commit failure.
+                        stores.device_inventory
+                            ? std::function<bool()>(
+                                  [p = stores.device_inventory] { return p->writes_deferred(); })
                             : nullptr});
     // The Decision 11 store: its agent_licenses / agent_license_state rows carry
     // the per-user `user_ref` pseudonyms, so a decommission MUST reach it.
@@ -149,12 +161,12 @@ AgentDecommission::AgentDecommission(const AgentDecommissionStores& stores) {
 }
 
 void AgentDecommission::add_store(std::string name, std::function<bool(std::string_view)> deleter) {
-    targets_.push_back({std::move(name), std::move(deleter), nullptr});
+    targets_.push_back({std::move(name), std::move(deleter), nullptr, nullptr});
 }
 
 void AgentDecommission::add_store_with_detail(
     std::string name, std::function<bool(std::string_view, std::string&)> deleter) {
-    targets_.push_back({std::move(name), nullptr, std::move(deleter)});
+    targets_.push_back({std::move(name), nullptr, nullptr, std::move(deleter)});
 }
 
 std::string format_group_evidence(std::vector<std::string> group_ids) {
@@ -217,6 +229,15 @@ DecommissionResult AgentDecommission::decommission(std::string_view agent_id) {
             if (committed) {
                 r.outcome = DecommissionOutcome::Deleted;
                 ++result.deleted;
+            } else if (t.write_paused && t.write_paused()) {
+                r.outcome = DecommissionOutcome::Failed;
+                r.write_paused = true;
+                r.error = kWritePausedReason;
+                ++result.failed;
+                spdlog::warn("AgentDecommission: store '{}' removal for agent={} was not attempted "
+                             "because its writes are paused (collation mismatch), recorded Failed; "
+                             "retry after the repair",
+                             t.name, ::yuzu::log_id_token(agent_id));
             } else {
                 r.outcome = DecommissionOutcome::Failed;
                 r.error = "delete_agent reported failure (delete did not commit)";

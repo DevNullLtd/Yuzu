@@ -119,6 +119,10 @@ struct DecommissionStoreResult {
     std::string store; ///< store name, for the audit trail / logs
     DecommissionOutcome outcome{DecommissionOutcome::Skipped};
     std::string error; ///< populated iff outcome == Failed
+    /// True iff the Failed outcome is a store's WRITE PAUSE (device_ci under a collation
+    /// mismatch): the removal was not attempted, and a retry after the repair is the remedy.
+    /// Distinct from a PostgreSQL fault so the operator is not sent to look for one.
+    bool write_paused{false};
     /// Optional evidence the store reports about what it removed (empty = none, or, after a
     /// committed delete, lost: the last-resort fallback when even `<n>:unrecorded` could not be built). Recorded in the
     /// outcome audit row next to the outcome; today only `management_group_memberships` sets it, to
@@ -220,6 +224,9 @@ private:
         std::string name;
         std::function<bool(std::string_view)> deleter; ///< null ⇒ always Skipped;
                                                        ///< returns true iff committed
+        /// Optional: consulted only after `deleter` returned false; true ⇒ the false was the
+        /// store's write pause, not a failed DELETE. Null for every store without a pause.
+        std::function<bool()> write_paused{};
         /// Used instead of `deleter` when set (a store that reports evidence).
         std::function<bool(std::string_view, std::string&)> detail_deleter{nullptr};
     };

@@ -80,7 +80,8 @@ struct FoldSourceDef {
 [[nodiscard]] bool is_fold_view(std::string_view name);
 
 /// True for echo_dict, echo_fold_seen and every `_r` table: the tables untrusted
-/// operator SQL may reach ONLY through a fold view.
+/// operator SQL may reach only through a fold view, or (the `_r` tables) through a
+/// column-less row-count read (see is_fold_row_table).
 [[nodiscard]] bool is_fold_internal_table(std::string_view name);
 
 /// True for the `_r` roll-up tables only (not the dictionary or the replay ring).
