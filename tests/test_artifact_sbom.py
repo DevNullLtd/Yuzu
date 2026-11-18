@@ -17,8 +17,10 @@ at a time. These tests pin what that means:
   - every artifact kind is unpacked and described: archives, a .deb, an .rpm,
     the macOS .pkg in the layout v0.15.0 shipped (its binaries staged as
     `.yuzu-agent.incoming` and `.libyuzu_agent_core.incoming.dylib`), and the
-    Windows installer, whose SBOM lists only the archive files its .iss
-    installs; rc-named packages pass `check` under their own names;
+    Windows installer, whose SBOM lists the files the Inno Setup compiler's
+    own manifest (OutputManifestFile) lists, each read from the build
+    directory with the SHA-256 the compiler recorded; rc-named packages pass
+    `check` under their own names;
   - an SBOM for a file holding yuzu-server, an installer's SBOM and a
     gateway SBOM (the Erlang emulator, beam.smp, vendors code) say they are
     incomplete (CycloneDX composition, SPDX CONTAINS NOASSERTION) and why, by
@@ -28,15 +30,18 @@ at a time. These tests pin what that means:
     marked pair, and the release check refuses an image pair left unmarked,
     partly marked, marked for nothing, or named as a release image without
     that image's title label;
-  - the real deploy/packaging/windows/yuzu-agent.iss parses under the
-    frozen .iss contract (artifact-sbom.py), whose allowlists are exactly the
-    script's own header names and sections; a script is split into lines
-    where Inno Setup splits it (CR, LF, CR LF), a control byte is refused, a
-    BOM-less script keeps the lines that are mapped ASCII (Inno Setup 6.3+
-    reads it as UTF-8 or ANSI depending on the file, and earlier versions as
-    ANSI), and every form outside the contract found so far (ISS_REFUSED) is
-    refused; the .pkg's staged names are the ones
-    deploy/packaging/macos/build-pkg.sh stages;
+  - the installer manifest contract (artifact-sbom.py): a manifest built in
+    ISCC's format (issrc is-6_7_3) from the real yuzu-agent.iss's [Files]
+    layout is read, and its files copied at their build-relative paths; its
+    paths map onto the build directory as defined (Windows paths, normalised,
+    compared case-insensitively); and every refusal is pinned: the encoding
+    (no UTF-8 byte order mark, not UTF-8), line ends, the header, zero rows,
+    a column count, the Index sequence, the hash form, a path outside the
+    build directory (`..`, another drive, UNC, a symlink or junction), a
+    missing file, a one-byte change; yuzu-agent.iss sets OutputManifestFile
+    and release.yml hands the SBOM step the manifest of the same ISCC run,
+    with the build directory that run was given; the .pkg's staged names are
+    the ones deploy/packaging/macos/build-pkg.sh stages;
   - every `yuzu:sbom:` note the docs name is written under the same key in
     both formats (a CycloneDX property; a line of the SPDX root's comment),
     and the docs' own extraction commands, run with jq, read every reason
@@ -351,140 +356,76 @@ PKG_EXPANDED = {
     "yuzu-agent-component.pkg/Scripts/package-files.list": b"",
 }
 
-# The shape of deploy/packaging/windows/yuzu-agent.iss's [Files] section, with
-# one plugin (`omitted`) left out, as origin/dev's script leaves out six.
-ISS = textwrap.dedent(r'''
-    #ifndef BuildDir
-      #define BuildDir "..\..\..\build-windows"
-    #endif
-    [Setup]
-    AppName=Yuzu Agent
-    [Files]
-    ; --- Core agent ---
-    Source: "{#BuildDir}\agents\core\yuzu-agent.exe"; DestDir: "{app}\bin"; Components: core; Flags: ignoreversion
-    Source: "{#BuildDir}\agents\core\*.dll"; DestDir: "{app}\bin"; Components: core; Flags: ignoreversion
-    Source: "{#BuildDir}\agents\plugins\status\status.dll"; DestDir: "{app}\plugins"; Components: core; Flags: ignoreversion
-    Source: "{#BuildDir}\agents\plugins\echo\echo.dll"; DestDir: "{app}\plugins"; Components: plugins\advanced; Flags: ignoreversion
-    [Dirs]
-    Name: "{app}\logs"
-''')
+# ── The Windows installer's manifest (ISCC's OutputManifestFile) ─────────────
+#
+# The installer SBOM is made from the file list the Inno Setup compiler writes
+# beside the installer, in the format of issrc is-6_7_3
+# (Compiler.SetupCompiler.pas, CreateManifestFile; Shared.FileClass.pas,
+# TTextFileWriter): UTF-8 with a byte order mark, CR LF after every line, one
+# tab-separated row per packed file, the SHA-256 in lowercase hex. The fixture
+# below is built in that format from the real yuzu-agent.iss's [Files] layout
+# and the real hashes of fixture files. The release itself never reads the
+# script; only these fixtures do.
 
-def _iss(*lines) -> str:
-    return "\n".join(lines) + "\n"
+# The build directory as the release's ISCC run is given it (/DBuildDir): a
+# runner workspace path, on a drive the test machine does not have.
+ISCC_BUILD_DIR = r"D:\a\Yuzu\Yuzu\build-windows"
+INNO_HEADER = ("Index\tSourceFilename\tTimeStamp\tVersion\tSHA256Sum\tOriginalSize\tFirstSlice\tLastSlice\t"
+               "StartOffset\tChunkSuboffset\tChunkCompressedSize\tEncrypted\tISSigKeyID")
+# What the script's `{#BuildDir}\agents\core\*.dll` finds in a release build:
+# the agent core and the vcpkg runtime DLLs scripts/deploy_build_dlls.py copies
+# there. ISCC sorts a wildcard's matches by name.
+CORE_DLLS = ("libcrypto-3-x64.dll", "libssl-3-x64.dll", "yuzu_agent_core.dll", "zlib1.dll")
 
 
-_OK = r'Source: "a.dll"; DestDir: "{app}\bin"'
-_OK2 = r'Source: "b.dll"; DestDir: "{app}\bin"'
-_HEADER = ("#ifndef BuildDir", '#define BuildDir "x"', "#endif")
-# Every .iss form refused so far, across all review passes, tagged with the
-# finding (or pass) that found it. The parser is a frozen contract (the header
-# of the .iss section in artifact-sbom.py), not an emulation of the Inno Setup
-# preprocessor or compiler: a new form found to be mis-mapped is added here and
-# must fail. Mutation-tested on scratch copies of the script.
-ISS_REFUSED = [
-    # pass 1-2 (g8-bci-1): what the parser could never map.
-    ("g8-bci-1", "#ifdef in [Files]", _iss("[Files]", "#ifdef X", _OK, "#endif")),
-    ("g8-bci-1", "DestDir outside {app}", _iss("[Files]", r'Source: "a.dll"; DestDir: "{sys}"')),
-    ("g8-bci-1", "recursesubdirs", _iss("[Files]", r'Source: "x\*"; DestDir: "{app}\bin"; Flags: recursesubdirs')),
-    ("g8-bci-1", "DestName", _iss("[Files]", _OK + '; DestName: "b.dll"')),
-    ("g8-bci-1", "unparseable line", _iss("[Files]", r'Source "a.dll" DestDir "{app}\bin"')),
-    ("g8-bci-1", "no [Files] section", _iss("[Setup]", "AppName=x")),
-    # g8-sec-1: #include anywhere, FindFirstFile wildcards fnmatch reads differently.
-    ("g8-sec-1", "#include before the first section", _iss('#include "more.iss"', "[Files]", _OK)),
-    ("g8-sec-1", "#include in another section", _iss("[Setup]", '#include "more.iss"', "[Files]", _OK)),
-    ("g8-sec-1", "*.*", _iss("[Files]", r'Source: "x\*.*"; DestDir: "{app}\bin"')),
-    ("g8-sec-1", "?", _iss("[Files]", r'Source: "x\a?.dll"; DestDir: "{app}\bin"')),
-    ("g8-sec-1", "two stars", _iss("[Files]", r'Source: "x\*core*.dll"; DestDir: "{app}\bin"')),
-    ("pass 2", "directive in [Code]", _iss("[Files]", _OK, "[Code]", '#define Extra "x"')),
-    ("pass 2", "conditional header", _iss("#if Ver > 1", '#define BuildDir "x"', "#endif", "[Files]", _OK)),
-    ("pass 2", "expression define", _iss("#ifndef BuildDir", '#define BuildDir GetEnv("X")', "#endif", "[Files]", _OK)),
-    ("pass 2", "#pragma", _iss("#pragma option -v+", "[Files]", _OK)),
-    ("pass 2", "spaced #include", _iss('#  include "more.iss"', "[Files]", _OK)),
-    ("pass 2", "{#} in the Source name", _iss("[Files]", r'Source: "x\{#BuildDir}.dll"; DestDir: "{app}\bin"')),
-    ("pass 2", "{#} in DestDir", _iss(*_HEADER, "[Files]", r'Source: "x\a.dll"; DestDir: "{app}\{#BuildDir}"')),
-    ("pass 2", "{#} in another parameter",
-     _iss(*_HEADER, "[Files]", r'Source: "x\a.dll"; DestDir: "{app}\bin"; Components: {#BuildDir}')),
-    ("pass 2", "{#} in an unquoted Source", _iss(*_HEADER, "[Files]", r'Source: {#BuildDir}\a.dll; DestDir: "{app}\bin"')),
-    ("pass 2", "header literal with a semicolon",
-     _iss("#ifndef BuildDir", '#define BuildDir "x; Flags: recursesubdirs"', "#endif", "[Files]", _OK)),
-    ("pass 2", "line continuation",
-     _iss("[Files]", _OK + r"; Components: core \\", "; Flags: recursesubdirs")),
-    ("pass 2", "external", _iss("[Files]", r'Source: "{src}\a.dll"; DestDir: "{app}\bin"; Flags: external')),
-    ("pass 2", "createallsubdirs", _iss("[Files]", _OK + "; Flags: createallsubdirs")),
-    ("pass 2", "download", _iss("[Files]", r'Source: "https://x/a.dll"; DestDir: "{app}\bin"; Flags: external download')),
-    ("pass 2", "extractarchive", _iss("[Files]", r'Source: "x\a.zip"; DestDir: "{app}\bin"; Flags: external extractarchive')),
-    ("pass 2", "Excludes", _iss("[Files]", r'Source: "x\*.dll"; DestDir: "{app}\bin"; Excludes: "a.dll"')),
-    ("pass 2", "DestDir with ..", _iss("[Files]", r'Source: "x\a.dll"; DestDir: "{app}\..\win"')),
-    # p3-up-2: control bytes before a parameter, flags and DestDir forms.
-    ("p3-up-2", "form feed before Flags", (_iss("[Files]", _OK) [:-1] + "\x0c; Flags: recursesubdirs\n").encode()),
-    ("p3-up-2", "vertical tab before Flags", (_iss("[Files]", _OK)[:-1] + "\x0b; Flags: recursesubdirs\n").encode()),
-    ("p3-up-2", "0x1c before Flags", (_iss("[Files]", _OK)[:-1] + "\x1c; Flags: recursesubdirs\n").encode()),
-    ("p3-up-2", "dontcopy", _iss("[Files]", _OK + "; Flags: ignoreversion dontcopy")),
-    ("p3-up-2", "{#F} in Flags", _iss("#ifndef F", '#define F "recursesubdirs"', "#endif", "[Files]", _OK + "; Flags: {#F}")),
-    ("p3-up-2", r"DestDir {app}\.\bin", _iss("[Files]", r'Source: "x\a.dll"; DestDir: "{app}\.\bin"')),
-    ("p3-up-2", r"DestDir {app}\{code:X}", _iss("[Files]", r'Source: "x\a.dll"; DestDir: "{app}\{code:Sub}"')),
-    # p3-qe-2: a dotted extension after the `*`.
-    ("p3-qe-2", "*.a.b", _iss("[Files]", r'Source: "x\*.dll.bak"; DestDir: "{app}\bin"')),
-    # p3-sg-2 / UP2-1 / p3-qe-1: non-ASCII on a mapped line with no byte order mark.
-    ("p3-sg-2", "cp1252 Source name", b'[Files]\nSource: "x\\caf\xe9.dll"; DestDir: "{app}\\bin"\n'),
-    ("p3-qe-1", "utf-8 DestDir", b'[Files]\nSource: "x\\a.dll"; DestDir: "{app}\\b\xc3\xa9n"\n'),
-    # p4-sre-1: an unterminated quoted value.
-    ("p4-sre-1", "unterminated quote", _iss("[Files]", r'Source: "x\a.dll; DestDir: "{app}\bin"')),
-    # p4-qe-2 (s5): `*.` (FindFirstFile also matches a name with no extension).
-    ("p4-qe-2", "*.", _iss("[Files]", r'Source: "x\*."; DestDir: "{app}\bin"')),
-    # p4-sg-1: ISPP's one-character directives and {#...} outside [Files].
-    ("p4-sg-1", "#+ (include)", _iss('#+ "more.iss"', "[Files]", _OK)),
-    ("p4-sg-1", "#= (emit)", _iss('#= "[Files]"', "[Files]", _OK)),
-    ("p4-sg-1", "#: (define)", _iss('#: BuildDir "x"', "[Files]", _OK)),
-    ("p4-sg-1", "#? (if)", _iss("#? 1", "[Files]", _OK, "#endif")),
-    ("p4-sg-1", "#emit", _iss('#emit "Source: evil.dll"', "[Files]", _OK)),
-    ("p4-sg-1", "#+ in [Setup]", _iss("[Setup]", '#+ "more.iss"', "[Files]", _OK)),
-    ("p4-sg-1", "{#NewLine} in [Setup]",
-     _iss("[Setup]", r'AppName=X{#NewLine}[Files]{#NewLine}Source: "evil.dll"; DestDir: "{app}\bin"', "[Files]", _OK)),
-    ("p4-sg-1", "{#} in the header comment", _iss("; {#Emit}", "[Files]", _OK)),
-    ("p4-sg-1", "{#expr} in a quoted Source directory",
-     _iss(*_HEADER, "[Files]", r'Source: "{#BuildDir + "\x"}\a.dll"; DestDir: "{app}\bin"')),
-    ("p4-sg-1", "{#function} in a quoted Source directory",
-     _iss(*_HEADER, "[Files]", r'Source: "{#Upper(BuildDir)}\a.dll"; DestDir: "{app}\bin"')),
-    ("p4-sg-1", "{# Name} with a space", _iss(*_HEADER, "[Files]", r'Source: "{# BuildDir}\a.dll"; DestDir: "{app}\bin"')),
-    ("p4-sg-1", "{#=Name}", _iss(*_HEADER, "[Files]", r'Source: "{#=BuildDir}\a.dll"; DestDir: "{app}\bin"')),
-    ("p4-sg-1", "{#} of a name that is not a header name", _iss("[Setup]", "AppName={#Other}", "[Files]", _OK)),
-    ("p4-sg-1", "{#} in [Code]", _iss("[Files]", _OK, "[Code]", "{#Emit}")),
-    # p4-xp-1: section headers ISCC reads differently (it compares the
-    # untrimmed name, case-insensitively, and ignores an unknown section).
-    # Each follows a valid [Files] section, so only the header rule can
-    # refuse it (not the "no Source: lines" check).
-    ("p4-xp-1", "[ Files ]", _iss("[Files]", _OK, "[ Files ]", _OK2)),
-    ("p4-xp-1", "[\\tFILES]", _iss("[Files]", _OK, "[\tFILES]", _OK2)),
-    ("p4-xp-1", "[FILES]", _iss("[Files]", _OK, "[FILES]", _OK2)),
-    ("p4-xp-1", "[files]", _iss("[Files]", _OK, "[files]", _OK2)),
-    ("p4-xp-1", "[/Files] end tag", _iss("[Files]", _OK, "[/Files]")),
-    ("p4-xp-1", "a section this script does not use", _iss("[Files]", _OK, "[Registry]")),
-    ("p4-xp-1", "text after the closing bracket", _iss("[Files]", _OK, "[Files] ; core", _OK2)),
-    ("p4-xp-1", "no closing bracket", _iss("[Files]", _OK, "[Files", _OK2)),
-    # Pass 5 (the frozen contract itself): the header block's exact shape.
-    ("contract", "a header name not in the allowlist", _iss("#ifndef Other", '#define Other "x"', "#endif", "[Files]", _OK)),
-    ("contract", "#define of another name", _iss("#ifndef BuildDir", '#define AppVersion "x"', "#endif", "[Files]", _OK)),
-    ("contract", "#define without #ifndef", _iss('#define BuildDir "x"', "[Files]", _OK)),
-    ("contract", "a header block twice", _iss(*_HEADER, *_HEADER, "[Files]", _OK)),
-    ("contract", "a header block after the first section", _iss("[Setup]", *_HEADER, "[Files]", _OK)),
-    ("contract", "a header block with no #endif", _iss("#ifndef BuildDir", '#define BuildDir "x"', "[Files]", _OK)),
-    ("contract", "a header block the script ends inside", _iss("#ifndef BuildDir")),
-    ("contract", "a blank line inside a header block", _iss("#ifndef BuildDir", "", '#define BuildDir "x"', "#endif", "[Files]", _OK)),
-    ("contract", "text after the #ifndef name", _iss("#ifndef BuildDir x", '#define BuildDir "x"', "#endif", "[Files]", _OK)),
-    ("contract", "text after the #define literal", _iss("#ifndef BuildDir", '#define BuildDir "x" y', "#endif", "[Files]", _OK)),
-    ("contract", "two spaces in #ifndef", _iss("#ifndef  BuildDir", '#define BuildDir "x"', "#endif", "[Files]", _OK)),
-    ("contract", "a tab after #", _iss("#\tifndef BuildDir", '#define BuildDir "x"', "#endif", "[Files]", _OK)),
-    ("contract", "#endif with a comment", _iss("#ifndef BuildDir", '#define BuildDir "x"', "#endif // x", "[Files]", _OK)),
-    ("contract", "header literal with a space", _iss("#ifndef BuildDir", '#define BuildDir "a b"', "#endif", "[Files]", _OK)),
-    ("contract", "header literal with [", _iss("#ifndef BuildDir", '#define BuildDir "[Files]"', "#endif", "[Files]", _OK)),
-    ("contract", "header literal with {", _iss("#ifndef BuildDir", '#define BuildDir "{app}"', "#endif", "[Files]", _OK)),
-    ("contract", "an unquoted header literal", _iss("#ifndef BuildDir", "#define BuildDir x", "#endif", "[Files]", _OK)),
-    ("contract", "text before the first section", _iss("AppName=x", "[Files]", _OK)),
-    ("contract", "a Pascal #13 starting a [Code] line", _iss("[Files]", _OK, "[Code]", "  #13#10 + 'x';")),
-    ("contract", "a Pascal #$0D starting a [Code] line", _iss("[Files]", _OK, "[Code]", "#$0D + 'x';")),
-    ("contract", "a bare #", _iss("#", "[Files]", _OK)),
-]
+def iss_sources() -> list:
+    """The `{#BuildDir}`-relative Source of each [Files] line of the real
+    yuzu-agent.iss that takes a file from the build directory, in order. A
+    fixture input only: the release never parses the script, and a line of
+    another shape is skipped here rather than failing the test."""
+    text = (ROOT / "deploy" / "packaging" / "windows" / "yuzu-agent.iss").read_text(encoding="utf-8-sig")
+    sources = re.findall(r'^Source: "\{#BuildDir\}\\([^"]+)";', text, re.M)
+    assert len(sources) > 40, "yuzu-agent.iss no longer installs the plugins from {#BuildDir}"
+    return sources
+
+
+def make_inno_build(build: Path) -> list:
+    """Fill `build` with the files the real yuzu-agent.iss packs from the build
+    directory, and return [(build-relative Windows path, bytes)] in the order
+    ISCC lists them: one row per source path (ISCC merges an entry naming a
+    path already listed)."""
+    rows, seen = [], set()
+    for src in iss_sources():
+        folder, name = src.rsplit("\\", 1)
+        for n in (CORE_DLLS if name == "*.dll" else (name,)):
+            rel = f"{folder}\\{n}"
+            if rel.lower() in seen:
+                continue
+            seen.add(rel.lower())
+            data = f"MZ\x90\x00 {rel}".encode()
+            path = build.joinpath(*rel.split("\\"))
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+            rows.append((rel, data))
+    return rows
+
+
+def inno_manifest_lines(rows, build_dir: str = ISCC_BUILD_DIR) -> list:
+    """The lines (without CR LF) of the manifest ISCC writes for `rows`."""
+    lines, offset = [INNO_HEADER], 0
+    for i, (rel, data) in enumerate(rows):
+        version = "0.15.0.0" if rel.startswith("agents\\core\\yuzu") else ""
+        lines.append("\t".join((str(i), f"{build_dir}\\{rel}", f"2026-11-18 10:{i // 60:02d}:{i % 60:02d}.000",
+                                version, hashlib.sha256(data).hexdigest(), str(len(data)), "1", "1", "0",
+                                str(offset), "1048576", "no", "")))
+        offset += len(data)
+    return lines
+
+
+def inno_manifest_bytes(lines) -> bytes:
+    """`lines` as TTextFileWriter writes them: a UTF-8 byte order mark, then
+    each line UTF-8 encoded and ended by CR LF."""
+    return b"\xef\xbb\xbf" + "".join(ln + "\r\n" for ln in lines).encode("utf-8")
 
 
 WIN_ZIP = {
@@ -632,153 +573,235 @@ class Units(unittest.TestCase):
         (root / "yuzu-agent-component.pkg/Payload/usr/local/bin/.yuzu-agent.incoming").unlink()
         self.assertEqual(m.yuzu_binaries(root), (True, False))
 
-    def test_iss_files_section(self):
-        iss = self.tmp / "agent.iss"
-        iss.write_text(ISS)
-        entries = self.mod.iss_file_entries(iss)
-        self.assertEqual(entries, [("bin", "yuzu-agent.exe"), ("bin", "*.dll"),
-                                   ("plugins", "status.dll"), ("plugins", "echo.dll")])
+    # ── the installer manifest contract (ISCC's OutputManifestFile) ──
+    def _inno(self, edit=None, mutate=None):
+        """(manifest, build dir, rows): the realistic fixture. `edit(lines)`
+        returns the manifest's lines, or its bytes, from ISCC's; `mutate(build)`
+        changes the build directory after it is filled."""
+        build = self.tmp / "build-windows"
+        rows = make_inno_build(build)
+        if mutate:
+            mutate(build)
+        out = inno_manifest_lines(rows)
+        if edit:
+            out = edit(out)
+        manifest = self.tmp / "YuzuAgentSetup.manifest.txt"
+        manifest.write_bytes(out if isinstance(out, bytes) else inno_manifest_bytes(out))
+        return manifest, build, rows
 
-    def test_iss_refuses_every_form_outside_the_contract(self):
-        # One row per refused form found so far (ISS_REFUSED, each tagged with
-        # the finding or pass that found it): every one must fail, naming its
-        # line, and none may reach the [Files] mapping.
-        for tag, what, text in ISS_REFUSED:
-            with self.subTest(tag=tag, what=what):
-                iss = self.tmp / "x.iss"
-                if isinstance(text, bytes):
-                    iss.write_bytes(text)
-                else:
-                    iss.write_text(text, encoding="utf-8")
-                with self.assertRaises(self.mod.SbomError) as cm:
-                    self.mod.iss_file_entries(iss)
-                self.assertRegex(str(cm.exception), r"^x\.iss(:\d+)?: ")
-        # A script that ends inside a header block says so (it has no [Files]
-        # either, so the message is what tells the two apart).
-        iss.write_text(_iss("; x", "#ifndef BuildDir", '#define BuildDir "x"'), encoding="utf-8")
-        with self.assertRaises(self.mod.SbomError) as cm:
-            self.mod.iss_file_entries(iss)
-        self.assertIn("the #ifndef BuildDir block is not finished", str(cm.exception))
+    def _contents(self, manifest, build, inno_build_dir=ISCC_BUILD_DIR):
+        dest = self.tmp / f"contents{len(list(self.tmp.glob('contents*')))}"
+        dest.mkdir()
+        return dest, self.mod.installer_contents(manifest, build, inno_build_dir, dest)
 
-    def test_iss_accepts_the_contract_shape(self):
-        # What the contract does accept: the header blocks (indented #define,
-        # trailing blanks), {#Name} of a header name outside [Files] and in a
-        # quoted Source directory, comments and blank lines before the first
-        # section, a `#` that does not start a [Code] line, and every section
-        # header in ISS_SECTIONS.
-        sections = "".join(f"[{s}]\n" for s in self.mod.ISS_SECTIONS if s not in ("Files", "Code"))
-        iss = self.tmp / "x.iss"
-        iss.write_text("; comment\n\n#ifndef AppVersion\n  #define AppVersion \"0.7.0\"\n#endif  \n\n"
-                       "#ifndef BuildDir\n\t#define BuildDir \"..\\..\\build-windows\"\n#endif\n"
-                       "[Setup]\nAppVersion={#AppVersion}\nAppVerName=Yuzu {#AppVersion}\n" + sections +
-                       "[Files]\n; {#BuildDir} is expanded in a comment too\n"
-                       "Source: \"{#BuildDir}\\agents\\a.dll\"; DestDir: \"{app}\\bin\"\n"
-                       "[Code]\nconst CRLF = #13#10;\n")
-        self.assertEqual(self.mod.iss_file_entries(iss), [("bin", "a.dll")])
+    def test_installer_manifest_in_the_iscc_format_is_read(self):
+        manifest, build, rows = self._inno()
+        # The script's header constant is the one issrc is-6_7_3 writes.
+        self.assertEqual(self.mod.INNO_MANIFEST_HEADER, INNO_HEADER)
+        self.assertTrue(manifest.read_bytes().startswith(b"\xef\xbb\xbfIndex\tSourceFilename\t"))
+        dest, listed = self._contents(manifest, build)
+        want = [rel.replace("\\", "/") for rel, _ in rows]
+        self.assertEqual(listed, want)
+        self.assertEqual(listed[:2], ["agents/core/yuzu-agent.exe", "agents/core/libcrypto-3-x64.dll"])
+        self.assertIn("agents/core/yuzu_agent_core.dll", listed)
+        self.assertGreater(sum(1 for p in listed if p.startswith("agents/plugins/")), 40)
+        # Each file is copied, byte for byte, to its build-relative path, and
+        # nothing else is.
+        copied = sorted(p.relative_to(dest).as_posix() for p in dest.rglob("*") if p.is_file())
+        self.assertEqual(copied, sorted(want))
+        for rel, data in rows:
+            self.assertEqual(dest.joinpath(*rel.split("\\")).read_bytes(), data)
 
-    def test_iss_is_read_as_inno_setup_reads_it(self):
-        # Inno Setup 6.3.0+ (6.7.3 built v0.15.0's installer) reads a script
-        # with a UTF-8 byte order mark as UTF-8; without one, as UTF-8 when
-        # the whole file is valid UTF-8, else in the build machine's ANSI code
-        # page; before 6.3, ANSI. The release pins neither the version nor the
-        # code page, so a BOM-less script must keep the lines that are mapped
-        # ASCII (read the same under every rule); other lines may hold anything.
+    def test_installer_manifest_paths_are_mapped_as_defined(self):
         m = self.mod
-        body = b'[Files]\nSource: "x\\a.dll"; DestDir: "{app}\\bin"\n'
-        iss = self.tmp / "x.iss"
-        for comment in ("; Yuzu — agent".encode("utf-8"), b"; \xa9 Yuzu \x81\x8d"):
-            with self.subTest(comment=comment):
-                iss.write_bytes(comment + b"\n[Setup]\nAppCopyright=" + comment[2:] + b"\n" + body +
-                                b"[Code]\n{ " + comment[2:] + b" }\n")
-                self.assertEqual(m.iss_file_entries(iss), [("bin", "a.dll")])
-        mapped = {
-            "utf-8 name": b'[Files]\nSource: "x\\caf\xc3\xa9.dll"; DestDir: "{app}\\bin"\n',
-            "cp1252 name": b'[Files]\nSource: "x\\caf\xe9.dll"; DestDir: "{app}\\bin"\n',
-            "destdir": b'[Files]\nSource: "x\\a.dll"; DestDir: "{app}\\b\xc3\xa9n"\n',
-            "header": b'[Fil\xc3\xa9s]\n' + body,
-            "directive": b'#define BuildDir "\xc3\xa9"\n' + body,
-        }
-        for what, data in mapped.items():
+        b = ISCC_BUILD_DIR
+        # Read as Windows paths: normalised (a `..` that stays inside is
+        # resolved), drive and names compared case-insensitively, `/` as `\`.
+        for source, parts in ((b + r"\agents\core\a.dll", ["agents", "core", "a.dll"]),
+                              (b.lower() + r"\agents\a.dll", ["agents", "a.dll"]),
+                              (b.replace("D:", "d:") + r"\a.dll", ["a.dll"]),
+                              (b + r"\agents\..\agents\.\a.dll", ["agents", "a.dll"]),
+                              (b + "/agents/a.dll", ["agents", "a.dll"]),
+                              (b + r"\\agents\a.dll", ["agents", "a.dll"])):
+            with self.subTest(source=source):
+                self.assertEqual(m.inno_build_parts(source, b, "m"), parts)
+        self.assertEqual(m.inno_build_parts(r"C:\b\x.dll", "C:\\b\\", "m"), ["x.dll"])
+        # One path listed twice, in another case, with one hash, is one file
+        # (ISCC merges such entries itself unless told not to).
+        def dup(lines):
+            row = lines[1].split("\t")
+            return lines + ["\t".join([str(len(lines) - 1), row[1].upper()] + row[2:])]
+        manifest, build, rows = self._inno(edit=dup)
+        _dest, listed = self._contents(manifest, build)
+        self.assertEqual(listed, [rel.replace("\\", "/") for rel, _ in rows])
+
+    def test_installer_manifest_refusals(self):
+        # Every refusal of the contract, each loud and naming the problem.
+        # A manifest shape the contract refuses is an expected refusal, not a
+        # finding (docs/ci-architecture.md, "The installer manifest contract").
+        b = ISCC_BUILD_DIR
+        outside = self.tmp / "outside"
+        outside.mkdir()
+
+        def row(n, col, value):
+            def edit(lines):
+                cols = lines[n].split("\t")
+                cols[col] = value(cols[col]) if callable(value) else value
+                return lines[:n] + ["\t".join(cols)] + lines[n + 1:]
+            return edit
+
+        def flip_byte(build):
+            p = build / "agents" / "plugins" / "status" / "status.dll"
+            data = bytearray(p.read_bytes())
+            data[-1] ^= 0x01
+            p.write_bytes(bytes(data))
+
+        def link_out(build):
+            p = build / "agents" / "plugins" / "status" / "status.dll"
+            (outside / "status.dll").write_bytes(p.read_bytes())  # same bytes: only the link is wrong
+            p.unlink()
+            os.symlink(outside / "status.dll", p)
+
+        def link_dir_out(build):
+            d = build / "agents" / "plugins" / "echo"
+            shutil.copytree(d, outside / "echo")
+            shutil.rmtree(d)
+            os.symlink(outside / "echo", d, target_is_directory=True)
+
+        def to_dir(build):
+            p = build / "agents" / "plugins" / "status" / "status.dll"
+            p.unlink()
+            p.mkdir()
+
+        enc = lambda lines: inno_manifest_bytes(lines)  # noqa: E731
+        cases = [
+            # encoding and line ends
+            ("no byte order mark", lambda ls: enc(ls)[3:], None, "does not start with one"),
+            ("UTF-16", lambda ls: "".join(x + "\r\n" for x in ls).encode("utf-16"), None,
+             "does not start with one"),
+            ("not UTF-8 after the mark", lambda ls: enc(ls).replace(b"agents", b"ag\xe9nts", 1), None,
+             "is not UTF-8"),
+            ("LF line ends", lambda ls: b"\xef\xbb\xbf" + "".join(x + "\n" for x in ls).encode(), None,
+             "does not end in CR LF"),
+            ("one bare LF", lambda ls: enc(ls).replace(b"\r\n", b"\n", 2).replace(b"\n", b"\r\n", 1), None,
+             "a CR or LF that is not part of a CR LF"),
+            ("a bare CR", lambda ls: enc(ls).replace(b"\r\n", b"\r", 1), None,
+             "a CR or LF that is not part of a CR LF"),
+            ("no final CR LF", lambda ls: enc(ls)[:-2], None, "does not end in CR LF"),
+            # header and shape
+            ("header column renamed", lambda ls: [ls[0].replace("SHA256Sum", "SHA1Sum")] + ls[1:], None,
+             "the header is not the one"),
+            ("header column added", lambda ls: [ls[0] + "\tExtra"] + ls[1:], None, "the header is not the one"),
+            ("header column dropped", lambda ls: [ls[0].rsplit("\t", 1)[0]] + ls[1:], None,
+             "the header is not the one"),
+            ("header in another case", lambda ls: [ls[0].lower()] + ls[1:], None, "the header is not the one"),
+            ("zero rows", lambda ls: ls[:1], None, "no file rows"),
+            ("an empty file after the mark", lambda ls: b"\xef\xbb\xbf", None, "does not end in CR LF"),
+            ("extra column", lambda ls: ls[:3] + [ls[3] + "\tx"] + ls[4:], None, "14 tab-separated columns"),
+            ("missing column", lambda ls: ls[:3] + [ls[3].rsplit("\t", 1)[0]] + ls[4:], None,
+             "12 tab-separated columns"),
+            ("a blank line at the end", lambda ls: ls + [""], None, "1 tab-separated columns"),
+            ("Index out of sequence", lambda ls: [ls[0], ls[2], ls[1]] + ls[3:], None, "Index '1', not 0"),
+            ("upper-case SHA-256", row(1, 4, str.upper), None, "64 lowercase hex digits"),
+            ("short SHA-256", row(1, 4, lambda h: h[:-1]), None, "64 lowercase hex digits"),
+            ("long SHA-256", row(1, 4, lambda h: h + "0"), None, "64 lowercase hex digits"),
+            # paths
+            ("`..` out of the build directory", row(1, 1, b + r"\..\outside\x.dll"), None,
+             "not strictly inside the build directory"),
+            ("`..` out at the end", row(1, 1, b + r"\agents\..\..\build-windowsx\a.dll"), None,
+             "not strictly inside the build directory"),
+            ("another drive", row(1, 1, lambda p: "E" + p[1:]), None, "not strictly inside the build directory"),
+            ("a sibling with the build directory's name as a prefix", row(1, 1, lambda p: p.replace(
+                "build-windows", "build-windows2", 1)), None, "not strictly inside the build directory"),
+            ("the build directory itself", row(1, 1, b), None, "not strictly inside the build directory"),
+            ("a UNC path", row(1, 1, lambda p: "\\\\runner\\share" + p[2:]), None,
+             "not a drive-absolute Windows path"),
+            ("a device path", row(1, 1, lambda p: "\\\\?\\" + p), None, "not a drive-absolute Windows path"),
+            ("a relative path", row(1, 1, lambda p: p[len(b) + 1:]), None, "not a drive-absolute Windows path"),
+            ("a drive-relative path", row(1, 1, lambda p: "D:" + p[len(b) + 1:]), None,
+             "not a drive-absolute Windows path"),
+            ("an NTFS stream", row(1, 1, lambda p: p + ":evil"), None, "holds a character Windows does not allow"),
+            ("a trailing dot", row(1, 1, lambda p: p + "."), None, "ends in a dot or space"),
+            ("a trailing space", row(1, 1, lambda p: p + " "), None, "ends in a dot or space"),
+            ("one path, two hashes", lambda ls: ls + ["\t".join([str(len(ls) - 1), ls[1].split("\t")[1]] +
+                                                               ls[2].split("\t")[2:])], None,
+             "listed again with another SHA-256"),
+            # the build directory
+            ("a missing file", None, lambda d: (d / "agents" / "plugins" / "status" / "status.dll").unlink(),
+             "is missing from the build directory"),
+            ("a directory, not a file", None, to_dir, "is not a regular file"),
+            ("a one-byte change", None, flip_byte, "not the file the installer holds"),
+        ]
+        if hasattr(os, "symlink") and self._can_symlink():
+            cases += [("a symlink out of the build directory", None, link_out, "outside the build directory"),
+                      ("a symlinked directory out of it", None, link_dir_out, "outside the build directory")]
+        for what, edit, mutate, msg in cases:
             with self.subTest(what=what):
-                iss.write_bytes(data)
-                with self.assertRaises(m.SbomError) as cm:
-                    m.iss_file_entries(iss)
-                self.assertIn("non-ASCII character in a line this maps", str(cm.exception))
-        # With a BOM the script is UTF-8 in every Unicode Inno Setup: a
-        # non-ASCII name maps as written.
-        bom = b"\xef\xbb\xbf"
-        iss.write_bytes(bom + "[Setup]\nAppCopyright=© Yuzu\n[Files]\n"
-                              "Source: \"x\\café.dll\"; DestDir: \"{app}\\bin\"\n".encode("utf-8"))
-        self.assertEqual(m.iss_file_entries(iss), [("bin", "café.dll")])
-        # The byte order mark is not part of the first line: a header block or
-        # a section header right after it is read as one.
-        for first in (b"[Files]\n", b'#ifndef BuildDir\n#define BuildDir "x"\n#endif\n[Files]\n'):
-            with self.subTest(first=first):
-                iss.write_bytes(bom + first + b'Source: "x\\a.dll"; DestDir: "{app}\\bin"\n')
-                self.assertEqual(m.iss_file_entries(iss), [("bin", "a.dll")])
-        for what, data, msg in (("not utf-8", b'[Files]\nSource: "\xff.dll"; DestDir: "{app}"\n',
-                                 "byte order mark but is not UTF-8"),
-                                ("no-break space", '[Files]\nSource: "a.dll";\u00a0DestDir: "{app}"\n'.encode(),
-                                 "U+00A0"),
-                                ("line separator", '; a\u2028[Files]\n'.encode() + body, "U+2028"),
-                                ("C1 control", '; a\u0085b\n'.encode() + body, "U+0085"),
-                                # Every C1 control, not only the one that is a line break.
-                                ("C1 control U+0080", '; a\u0080b\n'.encode() + body, "U+0080"),
-                                ("C1 control U+0090", '[Files]\nSource: "a\u0090.dll"; DestDir: "{app}"\n'.encode(),
-                                 "U+0090"),
-                                ("C1 control U+009F", '; a\u009fb\n'.encode() + body, "U+009F")):
-            with self.subTest(what=what):
-                iss.write_bytes(bom + data)
-                with self.assertRaises(m.SbomError) as cm:
-                    m.iss_file_entries(iss)
+                shutil.rmtree(self.tmp / "build-windows", ignore_errors=True)
+                for p in self.tmp.glob("contents*"):
+                    shutil.rmtree(p)
+                for p in outside.iterdir():
+                    shutil.rmtree(p) if p.is_dir() and not p.is_symlink() else p.unlink()
+                manifest, build, _rows = self._inno(edit=edit, mutate=mutate)
+                with self.assertRaises(self.mod.SbomError) as cm:
+                    self._contents(manifest, build)
                 self.assertIn(msg, str(cm.exception))
-        # Lines end at CR, LF or CR LF, as the compiler splits them.
-        iss.write_bytes(b'[Files]\r\nSource: "x\\a.dll"; DestDir: "{app}\\bin"\r'
-                        b'Source: "x\\b.dll"; DestDir: "{app}\\bin"\n')
-        self.assertEqual(m.iss_file_entries(iss), [("bin", "a.dll"), ("bin", "b.dll")])
+                self.assertTrue(str(cm.exception).startswith(("YuzuAgentSetup.manifest.txt", "--")),
+                                str(cm.exception))
+        # The build directory ISCC was given must itself be drive-absolute.
+        shutil.rmtree(self.tmp / "build-windows")
+        manifest, build, _rows = self._inno()
+        for bad in ("build-windows", r"\a\build-windows", "D:build-windows"):
+            with self.subTest(inno_build_dir=bad):
+                with self.assertRaises(self.mod.SbomError) as cm:
+                    self._contents(manifest, build, inno_build_dir=bad)
+                self.assertIn("--inno-build-dir", str(cm.exception))
 
-    def test_iss_refuses_other_whitespace(self):
-        # Python's splitlines() also splits at a form feed, vertical tab or
-        # \x1c-\x1e; Inno Setup does not, and trims them as blanks. Read
-        # either way, a line could map to something the installer does not
-        # install (a form feed used to drop `recursesubdirs`), so any control
-        # byte but tab is refused, on any line, with or without a BOM.
-        for byte in (b"\x00", b"\x0b", b"\x0c", b"\x1c", b"\x1d", b"\x1e", b"\x1f", b"\x7f"):
-            for bom in (b"", b"\xef\xbb\xbf"):
-                for data in (b'[Files]\nSource: "a.dll"; DestDir: "{app}\\bin"' + byte + b'; Flags: recursesubdirs\n',
-                             b'[Files]\nSource: "a.dll"; DestDir: "{app}\\bin' + byte + b'plugins"\n',
-                             b'[Setup]\n' + byte + b'[Files]\nSource: "a.dll"; DestDir: "{app}\\bin"\n',
-                             b'; a comment' + byte + b'\n[Files]\nSource: "a.dll"; DestDir: "{app}\\bin"\n'):
-                    with self.subTest(byte=byte, bom=bom, data=data):
-                        iss = self.tmp / "x.iss"
-                        iss.write_bytes(bom + data)
-                        with self.assertRaises(self.mod.SbomError) as cm:
-                            self.mod.iss_file_entries(iss)
-                        self.assertIn(f"control byte 0x{byte[0]:02x}", str(cm.exception))
-        iss = self.tmp / "x.iss"
-        iss.write_bytes(b'[Files]\nSource:\t"a.dll";\tDestDir: "{app}\\bin"\t;  Flags: ignoreversion\n')
-        self.assertEqual(self.mod.iss_file_entries(iss), [("bin", "a.dll")])
+    def _can_symlink(self) -> bool:
+        try:
+            os.symlink(self.tmp, self.tmp / "probe-link", target_is_directory=True)
+        except (OSError, NotImplementedError):
+            return False
+        (self.tmp / "probe-link").unlink()
+        return True
 
-    def test_the_real_iss_parses(self):
-        # The installer's script itself, so an edit the parser refuses fails in
-        # PR CI, not at the release's Windows SBOM step after a full build.
-        iss = ROOT / "deploy" / "packaging" / "windows" / "yuzu-agent.iss"
-        entries = self.mod.iss_file_entries(iss)
-        text = iss.read_text(encoding="utf-8-sig", errors="replace")
-        files_section = text.split("[Files]", 1)[1].split("\n[", 1)[0]
-        sources = [ln for ln in files_section.splitlines() if ln.strip().lower().startswith("source:")]
-        self.assertEqual(len(entries), len(sources))
-        self.assertIn(("bin", "yuzu-agent.exe"), entries)
-        self.assertIn(("bin", "*.dll"), entries)
-        self.assertEqual({sub for sub, _ in entries}, {"bin", "plugins"})
-        self.assertGreater(sum(1 for sub, _ in entries if sub == "plugins"), 40)
-        # The contract's allowlists are the script's own shape, no wider: every
-        # header name is one the script defines, and every section one it has.
-        # Widening either is a deliberate edit here and in the script.
-        lines = [ln.strip(" \t") for ln in text.splitlines()]
-        self.assertEqual(sorted(ln.split()[1] for ln in lines if ln.startswith("#ifndef ")),
-                         sorted(self.mod.ISS_HEADER_NAMES))
-        self.assertEqual([ln[1:-1] for ln in lines if ln.startswith("[")], list(self.mod.ISS_SECTIONS))
+    def test_release_feeds_the_installer_sbom_its_own_iscc_manifest(self):
+        # yuzu-agent.iss asks ISCC for the manifest; release.yml's ISCC step
+        # removes any old one first, checks this run wrote one, and copies it
+        # beside the installer; the SBOM step passes that copy, with the same
+        # build directory ISCC was given, and nothing reads the .iss itself.
+        iss = (ROOT / "deploy" / "packaging" / "windows" / "yuzu-agent.iss").read_text(encoding="utf-8-sig")
+        setup = iss.split("\n[Setup]\n", 1)[1].split("\n[", 1)[0].splitlines()
+        self.assertIn("OutputManifestFile=YuzuAgentSetup.manifest.txt", setup)
+        self.assertIn("OutputDir=output", setup)
+        self.assertEqual(sum(1 for ln in iss.splitlines() if ln.startswith("OutputManifestFile=")), 1)
+        wf = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+        # Step names repeat across jobs (each build job has its own
+        # "Generate per-artifact SBOMs"), so steps are a list, not a map.
+        steps = [(s.split("\n", 1)[0].strip(), s) for s in wf.split("\n      - name: ")[1:]]
+        iscc = [s for n, s in steps if n == "Build Windows installers (InnoSetup)"]
+        gen = [s for _n, s in steps if "artifact-sbom.py generate --artifact $exe.Name" in s]
+        self.assertEqual((len(iscc), len(gen)), (1, 1))
+        iscc, gen = iscc[0], gen[0]
+        out = r'"deploy\packaging\windows\output\YuzuAgentSetup.manifest.txt"'
+        self.assertIn(f"$manifest = {out}", iscc)
+        order = [iscc.index(x) for x in ('Remove-Item -Force -ErrorAction SilentlyContinue $manifest, '
+                                         '"YuzuAgentSetup-${version}.manifest.txt"', "& $iscc",
+                                         "if (-not (Test-Path $manifest))",
+                                         'Copy-Item $manifest "YuzuAgentSetup-${version}.manifest.txt"')]
+        self.assertEqual(order, sorted(order))
+        self.assertIn('Copy-Item $agentInstaller "YuzuAgentSetup-${version}.exe"', iscc)
+        build_dir = re.search(r'"/DBuildDir=([^"]+)"', iscc).group(1)
+        self.assertIn('--inno-manifest "$($exe.BaseName).manifest.txt" --build-dir build-windows', gen)
+        self.assertEqual(re.search(r'--inno-build-dir "([^"]+)"', gen).group(1), build_dir)
+        self.assertTrue(build_dir.endswith("\\build-windows"))
+        # Only the ISCC step writes the installer manifest; nothing passes the
+        # retired arguments.
+        writers = [n for n, s in steps if re.search(r"(Copy-Item|Move-Item|Set-Content|Out-File)[^\n]*"
+                                                            r"manifest\.txt", s)]
+        self.assertEqual(writers, ["Build Windows installers (InnoSetup)"])
+        self.assertNotIn("--contents-from", wf)
+        self.assertNotIn("--iss", wf)
 
     def test_pkg_staged_names_are_the_ones_build_pkg_stages(self):
         # The .pkg's payload names come from deploy/packaging/macos/build-pkg.sh,
@@ -805,9 +828,9 @@ class Units(unittest.TestCase):
     def test_reason_vocabulary_is_closed_and_documented(self):
         m = self.mod
         self.assertEqual(m.incomplete_notes([]), {})
-        notes = m.incomplete_notes([("installer-runtime", ""), ("installer-file-missing", "a.iss installs x")])
-        self.assertEqual(notes["incomplete-reasons"], "installer-runtime, installer-file-missing")
-        self.assertIn(": a.iss installs x", notes["incomplete"])
+        notes = m.incomplete_notes([("installer-runtime", ""), ("erts-static", "g/erts-16.4/bin/beam.smp")])
+        self.assertEqual(notes["incomplete-reasons"], "installer-runtime, erts-static")
+        self.assertIn(": g/erts-16.4/bin/beam.smp", notes["incomplete"])
         with self.assertRaises(m.SbomError):
             m.incomplete_notes([("something-new", "")])
         for token, prose in m.INCOMPLETE_REASONS.items():
@@ -1025,24 +1048,6 @@ class Units(unittest.TestCase):
         # The image rule reads the same exact basename.
         with self.assertRaises(self.mod.SbomError):
             self.mod.mark_image(*make_image_pair("yuzu-gateway", ["opt/yuzu_gw/erts-16.4/bin/xbeam.smp"]))
-
-    def test_installer_keeps_only_what_the_iss_installs(self):
-        iss = self.tmp / "agent.iss"
-        iss.write_text(ISS)
-        contents = self.tmp / "contents"
-        for rel, data in WIN_ZIP.items():
-            (contents / rel).parent.mkdir(parents=True, exist_ok=True)
-            (contents / rel).write_bytes(data)
-        kept, dropped, unmatched = self.mod.keep_installed(contents, self.mod.iss_file_entries(iss))
-        self.assertEqual(dropped, ["plugins/omitted.dll"])
-        self.assertEqual(kept, ["bin/libcrypto-3-x64.dll", "bin/yuzu-agent.exe", "bin/yuzu_agent_core.dll",
-                                "plugins/echo.dll", "plugins/status.dll"])
-        self.assertEqual(unmatched, [])
-        self.assertFalse((contents / "yuzu-agent-1.2.3-windows-x64/plugins/omitted.dll").exists())
-        # An entry with nothing behind it in the archive is reported, not hidden.
-        (contents / "yuzu-agent-1.2.3-windows-x64/plugins/echo.dll").unlink()
-        _k, _d, unmatched = self.mod.keep_installed(contents, self.mod.iss_file_entries(iss))
-        self.assertEqual(unmatched, ["{app}\\plugins\\echo.dll"])
 
     def test_forbidden_segments(self):
         bad = ["/vcpkg/ports/zlib/vcpkg.json", "vcpkg_installed/x64-linux/lib/libz.a",
@@ -1682,8 +1687,8 @@ class ArtifactSbom(unittest.TestCase):
     def test_every_documented_note_reads_the_same_from_both_formats(self):
         # The docs tell a script to read the `yuzu:sbom:` notes, and give a
         # command for each format. Generate SBOMs carrying every reason token
-        # (a server archive, a gateway archive, an installer missing a file
-        # its script installs, and the four kinds of marked image), then read
+        # (a server archive, a gateway archive, the installer, and the four
+        # kinds of marked image), then read
         # each documented note from both formats: the CycloneDX property and
         # the SPDX comment line must agree, the marker must agree with the
         # note, and the docs' own commands, run as written, must find it.
@@ -1699,14 +1704,14 @@ class ArtifactSbom(unittest.TestCase):
         server = make_tar(rel / "yuzu-linux-x64.tar.gz", {"y/bin/yuzu-server": b"x", "y/bin/yuzu-agent": b"x"})
         gateway = make_tar(rel / "yuzu-gateway-linux-x64.tar.gz",
                            {"g/erts-16.4/bin/beam.smp": b"x", "g/lib/kernel-10.6/ebin/kernel.app": b"x"})
-        zip_files = {k: v for k, v in WIN_ZIP.items() if not k.endswith("/echo.dll")}
-        zip_path = make_zip(rel / "yuzu-agent-windows-x64.zip", zip_files)
-        iss = self.tmp / "yuzu-agent.iss"
-        iss.write_text(ISS)
+        zip_path = make_zip(rel / "yuzu-agent-windows-x64.zip", WIN_ZIP)
+        build = self.tmp / "build-windows"
+        manifest = self.tmp / "YuzuAgentSetup-1.2.3.manifest.txt"
+        manifest.write_bytes(inno_manifest_bytes(inno_manifest_lines(make_inno_build(build))))
         exe = rel / "YuzuAgentSetup-1.2.3.exe"
         exe.write_bytes(b"MZ installer")
         for art, vcpkg, extra in ((server, True, ()), (gateway, False, ()), (zip_path, True, ()),
-                                  (exe, True, ("--contents-from", zip_path, "--iss", iss))):
+                                  (exe, True, ("--inno-manifest", manifest, "--build-dir", build, "--inno-build-dir", ISCC_BUILD_DIR))):
             r = self.generate(art, vcpkg=vcpkg, extra=extra)
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         for title, files, owned in (("yuzu-server", SERVER_IMAGE_FILES, ()),
@@ -1803,43 +1808,65 @@ class ArtifactSbom(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
         self.assertFalse((self.tmp / "escape").exists())
 
-    def test_installer_lists_only_what_its_script_installs(self):
+    def test_installer_lists_what_its_compiler_manifest_lists(self):
         make_vcpkg_tree(self.tmp)
         rel = self.tmp / "rel"
         rel.mkdir()
-        zip_path = make_zip(rel / "yuzu-agent-windows-x64.zip", WIN_ZIP)
-        iss = self.tmp / "yuzu-agent.iss"
-        iss.write_text(ISS)
+        build = self.tmp / "build-windows"
+        rows = make_inno_build(build)
+        # A file in the build directory the manifest does not list is not
+        # described: the installer does not hold it.
+        (build / "agents" / "plugins" / "omitted").mkdir(parents=True)
+        (build / "agents" / "plugins" / "omitted" / "omitted.dll").write_bytes(b"MZ omitted")
+        manifest = self.tmp / "YuzuAgentSetup-1.2.3_rc1.manifest.txt"
+        manifest.write_bytes(inno_manifest_bytes(inno_manifest_lines(rows)))
         exe = rel / "YuzuAgentSetup-1.2.3_rc1.exe"
         exe.write_bytes(b"MZ installer")
-        r = self.generate(exe, extra=("--contents-from", zip_path, "--iss", iss), env={"STUB_SYFT_FILES": "1"})
+        inno = ("--inno-manifest", manifest, "--build-dir", build, "--inno-build-dir", ISCC_BUILD_DIR)
+        r = self.generate(exe, extra=inno, env={"STUB_SYFT_FILES": "1"})
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertIn("plugins/omitted.dll", r.stderr)  # the warning names what is left out
         cdx, spdx = self.load("YuzuAgentSetup-1.2.3_rc1")
         self.assertEqual(cdx["metadata"]["component"]["name"], exe.name)
         self.assertEqual(cdx["metadata"]["component"]["hashes"][0]["content"],
                          hashlib.sha256(exe.read_bytes()).hexdigest())
         self.assertEqual(self.vcpkg_names(cdx), AGENT_PORTS)
-        listed = {f["fileName"].split("/", 1)[1] for f in spdx["files"]}
-        self.assertEqual(listed, {"bin/yuzu-agent.exe", "bin/yuzu_agent_core.dll", "bin/libcrypto-3-x64.dll",
-                                  "plugins/status.dll", "plugins/echo.dll"})
+        # The files syft was shown are the manifest's, at their build-relative
+        # paths, with the bytes the manifest's hashes name.
+        files = {f["fileName"]: next(c["checksumValue"] for c in f["checksums"] if c["algorithm"] == "SHA256")
+                 for f in spdx["files"]}
+        self.assertEqual(files, {r.replace("\\", "/"): hashlib.sha256(d).hexdigest() for r, d in rows})
         props = self.props(cdx)
-        self.assertIn("the 5 file(s) of yuzu-agent-windows-x64.zip", props["yuzu:sbom:contents"])
-        self.assertIn("yuzu-agent.iss installs", props["yuzu:sbom:contents"])
-        self.assertIn("left out: plugins/omitted.dll", props["yuzu:sbom:contents"])
+        self.assertEqual(props["yuzu:sbom:unpacked-files"], str(len(rows)))
+        self.assertIn(f"the {len(rows)} file(s) the Inno Setup compiler's manifest ({manifest.name}, "
+                      f"OutputManifestFile) lists", props["yuzu:sbom:contents"])
+        self.assertIn("at its path below the build directory, not the path it is installed to",
+                      props["yuzu:sbom:contents"])
         self.assertEqual(cdx["compositions"][0]["aggregate"], "incomplete")
-        self.assertIn("InnoSetup runtime", props["yuzu:sbom:incomplete"])
-        # The `*.dll` entry is resolved against the archive, not the build
-        # directory the installer took it from: said, not hidden.
-        self.assertEqual(props["yuzu:sbom:incomplete-reasons"], "installer-runtime, installer-wildcard")
-        self.assertIn("{app}\\bin\\*.dll", props["yuzu:sbom:incomplete"])
+        self.assertEqual(props["yuzu:sbom:incomplete-reasons"], "installer-runtime")
+        self.assertIn("licence text, icon, compiled [Code] script", props["yuzu:sbom:incomplete"])
         r = self.check_dir(exe)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        # ...and without --contents-from or --iss an installer is refused, not guessed.
-        self.assertNotEqual(self.generate(exe).returncode, 0)
-        r = self.generate(exe, extra=("--contents-from", zip_path))
+        # A refusal of the contract fails the run, naming the problem.
+        (build / "agents" / "plugins" / "echo" / "echo.dll").write_bytes(b"MZ changed")
+        r = self.generate(exe, extra=inno)
+        self.assertEqual(r.returncode, 1)
+        self.assertRegex(r.stderr, r"^::error::YuzuAgentSetup-1\.2\.3_rc1\.manifest\.txt:\d+: agents/plugins/echo/"
+                                   r"echo\.dll in the build directory has SHA-256 [0-9a-f]{64}, not the [0-9a-f]{64} "
+                                   r"ISCC recorded")
+        # ...and an installer is never described without its manifest, nor a
+        # manifest used for anything but an installer.
+        r = self.generate(exe)
         self.assertNotEqual(r.returncode, 0)
-        self.assertIn("--contents-from and --iss go together", r.stderr)
+        self.assertIn("pass --inno-manifest, --build-dir and --inno-build-dir", r.stderr)
+        for drop in (0, 2, 4):
+            with self.subTest(without=inno[drop]):
+                r = self.generate(exe, extra=inno[:drop] + inno[drop + 2:])
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn("--inno-manifest, --build-dir and --inno-build-dir go together", r.stderr)
+        zip_path = make_zip(rel / "yuzu-agent-windows-x64.zip", WIN_ZIP)
+        r = self.generate(zip_path, extra=inno)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("--inno-manifest describes an InnoSetup installer", r.stderr)
 
     def test_generate_refuses_a_forbidden_path(self):
         make_vcpkg_tree(self.tmp)

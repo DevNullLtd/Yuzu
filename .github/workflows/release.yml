@@ -970,16 +970,24 @@ jobs:
           }
           Write-Host "Using ISCC: $iscc"
 
-          # Build agent installer
+          # Build agent installer. yuzu-agent.iss sets OutputManifestFile, so
+          # ISCC also writes the list of the files it packed, with the SHA-256
+          # of each; the installer's SBOM is made from that list (below). The
+          # manifest is removed first and taken only from this run, so the
+          # SBOM never reads one an earlier build left behind.
           Write-Host "=== Building Agent Installer ==="
+          $manifest = "deploy\packaging\windows\output\YuzuAgentSetup.manifest.txt"
+          Remove-Item -Force -ErrorAction SilentlyContinue $manifest, "YuzuAgentSetup-${version}.manifest.txt"
           & $iscc `
             "/DAppVersion=${version}" `
             "/DBuildDir=${{ github.workspace }}\build-windows" `
             "deploy\packaging\windows\yuzu-agent.iss"
           if ($LASTEXITCODE -ne 0) { Write-Error "Agent installer failed"; exit 1 }
+          if (-not (Test-Path $manifest)) { Write-Error "ISCC wrote no manifest ($manifest): the installer SBOM is made from it"; exit 1 }
 
           $agentInstaller = "deploy\packaging\windows\output\YuzuAgentSetup-${version}.exe"
           Copy-Item $agentInstaller "YuzuAgentSetup-${version}.exe"
+          Copy-Item $manifest "YuzuAgentSetup-${version}.manifest.txt"
           Write-Host "Agent installer: $('{0:N1} MB' -f ((Get-Item $agentInstaller).Length / 1MB))"
           # No server installer: YuzuServerSetup was discontinued by ADR-0035.
 
@@ -1020,12 +1028,15 @@ jobs:
       # ── Windows SBOMs (CycloneDX + SPDX), one per shipped file ──────
       # Same script as the Linux job, against the agent-only x64-windows tree
       # (ADR-0035 step 3). The archive is unpacked and scanned. Nothing here
-      # unpacks an InnoSetup installer, so the installer's SBOM takes its
-      # contents from the archive (same build output, both made above), keeping
-      # only the files yuzu-agent.iss's [Files] section installs: a plugin the
-      # archive holds and the installer does not install is left out and named
-      # in a warning. The SBOM records this and the installer's own name and
-      # SHA-256, and is marked incomplete (the InnoSetup runtime is not listed).
+      # unpacks an InnoSetup installer: its SBOM lists the files ISCC's own
+      # manifest (written by the "Build Windows installers" step's ISCC run)
+      # says it packed, each read from build-windows and checked against the
+      # SHA-256 ISCC recorded, at its path below build-windows (not its
+      # install path). --inno-build-dir is the /DBuildDir that ISCC run was
+      # given, the prefix of the manifest's paths. The SBOM records the
+      # installer's own name and SHA-256 and is marked incomplete (the
+      # InnoSetup runtime is not listed). The manifest is not a release asset;
+      # it is kept for three days as the windows-installer-manifest artifact.
       - name: Install syft (pinned)
         id: syft
         uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
@@ -1048,7 +1059,8 @@ jobs:
           if ($installers.Count -lt 1) { Write-Error "no YuzuAgentSetup-*.exe to describe"; exit 1 }
           foreach ($exe in $installers) {
             python scripts/ci/artifact-sbom.py generate --artifact $exe.Name `
-              --contents-from yuzu-agent-windows-x64.zip --iss deploy/packaging/windows/yuzu-agent.iss @common
+              --inno-manifest "$($exe.BaseName).manifest.txt" --build-dir build-windows `
+              --inno-build-dir "${{ github.workspace }}\build-windows" @common
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
 
@@ -1083,6 +1095,19 @@ jobs:
           name: yuzu-agent-windows-x64-sbom
           path: sbom-out/
           if-no-files-found: error
+          retention-days: 3
+
+      # The ISCC manifest the installer SBOM was made from, for diagnosing an
+      # SBOM refusal. Not named yuzu-*, so the release job does not download
+      # it: it is not a release asset (it records the runner's paths).
+      - name: Upload the installer manifest
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        continue-on-error: true
+        with:
+          name: windows-installer-manifest
+          path: YuzuAgentSetup-*.manifest.txt
+          if-no-files-found: warn
           retention-days: 3
 
   # ── macOS ARM64 release build ────────────────────────────────────────

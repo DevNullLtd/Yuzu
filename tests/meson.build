@@ -3542,7 +3542,7 @@ test('release artifact gate',
 # Per-artifact SBOMs (supply-chain S8): scripts/ci/artifact-sbom.py, with syft
 # stubbed. Pins the vcpkg closure (agent vs server, no test/helper/host ports),
 # the artifact hash and name on the SBOM root, every artifact kind (the macOS
-# .pkg in its shipped layout, the installer filtered by its .iss), the
+# .pkg in its shipped layout, the installer from its compiler's manifest), the
 # incompleteness mark, and the release check's bound and forbidden paths. The
 # generate tests skip on Windows (the stubs are #! scripts); the rest run. When
 # jsonschema is importable, every generated SBOM is also validated against the

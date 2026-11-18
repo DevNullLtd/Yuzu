@@ -13,10 +13,11 @@ sees nothing in them. This script makes one SBOM per shipped file instead.
      .pkg is expanded with pkgutil; its payload stages the binaries under
      hidden `.incoming` names (deploy/packaging/macos/build-pkg.sh), which are
      read as the names they are installed under. An InnoSetup installer is
-     not unpacked here: its contents are the files of the archive named by
-     --contents-from that the installer script named by --iss installs (its
-     [Files] `Source:` lines, resolved against the archive's layout); a file
-     the installer does not install is dropped, and the SBOM root says so.
+     not unpacked here: its contents are the files the compiler's own
+     manifest (--inno-manifest, the installer script's OutputManifestFile)
+     lists, each taken from --build-dir and checked against the SHA-256 the
+     compiler recorded, at their paths below the build directory (not the
+     paths they are installed to): see THE INSTALLER MANIFEST CONTRACT.
   2. If the unpacked tree holds a Yuzu C++ binary, add the vcpkg ports it is
      built from, read from the INSTALLED vcpkg tree for the release triplet
      (`vcpkg_installed/vcpkg/status` + `<triplet>/share/<port>/vcpkg.spdx.json`):
@@ -80,9 +81,9 @@ tests/test_artifact_sbom.py.
 from __future__ import annotations
 
 import argparse
-import fnmatch
 import hashlib
 import json
+import ntpath
 import os
 import re
 import shutil
@@ -338,7 +339,8 @@ def extract(path: Path, dest: Path) -> None:
         # pkgutil wants a directory that does not exist yet.
         _run(["pkgutil", "--expand-full", str(path), str(dest / "pkg")])
     else:
-        raise SbomError(f"{name}: cannot unpack this type here; pass --contents-from <archive with the same files>")
+        raise SbomError(f"{name}: cannot unpack this type here; an installer's SBOM is made from the compiler's "
+                        f"manifest: pass --inno-manifest, --build-dir and --inno-build-dir")
 
 
 def installed_name(f: str) -> str:
@@ -376,287 +378,202 @@ def count_files(root: Path) -> int:
     return sum(len(files) for _d, _s, files in os.walk(root))
 
 
-# ── InnoSetup installer contents ─────────────────────────────────────────────
+# ── InnoSetup installer contents: the compiler's own file list ───────────────
 #
-# THE .iss CONTRACT (frozen). The installer SBOM lists the archive files that
-# deploy/packaging/windows/yuzu-agent.iss's [Files] section installs. This
-# parser does NOT emulate the Inno Setup preprocessor (ISPP) or compiler
-# (ISCC). It accepts one small, fixed shape, the shape that script has today,
-# and refuses every line outside it with an error naming the line, so an .iss
-# edit that steps outside the contract fails `generate` (and, before that,
-# docs-lint's test_the_real_iss_parses on the pull request) instead of being
-# mapped silently wrong. Extend the allowlists deliberately; never emulate more
-# ISPP. The contract (docs/ci-architecture.md states the same):
+# THE INSTALLER MANIFEST CONTRACT. An InnoSetup installer is not unpacked here.
+# deploy/packaging/windows/yuzu-agent.iss sets `OutputManifestFile`, so the
+# compiler (ISCC) writes, beside the installer, the list of files it packed,
+# and the installer SBOM is made from that list: each file is taken from the
+# build directory, its SHA-256 checked against the one ISCC recorded, and the
+# verified bytes copied into a scratch tree at their build-relative paths,
+# which syft and the vcpkg closure then read. The installer script itself is
+# never parsed. The format below was read from Inno Setup's source, tag
+# is-6_7_3 (the version v0.15.0 was built with; the release does not pin it):
 #
-#  1. Lines split at CR, LF or CR LF; any other control byte is refused. With a
-#     UTF-8 byte order mark the script must be UTF-8 with no C1 control and no
-#     whitespace but space and tab; without one, a line this maps (a `#` line, a
-#     section header, a [Files] entry) must be ASCII (iss_lines()).
-#  2. Preprocessor lines. A line whose first non-blank character is `#` is
-#     accepted only before the first section, and only as the three-line block
-#         #ifndef <Name>
-#         #define <Name> "<literal>"
-#         #endif
-#     on consecutive lines, one space between the parts (leading and trailing
-#     blanks allowed), <Name> one of ISS_HEADER_NAMES and each defined once,
-#     <literal> made of ISS_HEADER_LITERAL's characters only. Every other `#`
-#     line is refused wherever it is: #include, #if, #pragma, #emit, the
-#     one-character forms (#+, #=, #:, #?, ...), and a Pascal `#13` that starts
-#     a [Code] line (ISPP would read it as a directive too).
-#  3. Inline expansions. `{#` is accepted only as exactly `{#<Name>}` with
-#     <Name> one of ISS_HEADER_NAMES, on any line (yuzu-agent.iss's [Setup] uses
-#     {#AppVersion}); inside [Files], only in the directory part of a quoted
-#     Source. Every other `{#` is refused, on any line, comments included. A
-#     header literal holds no `"`, `;`, `[`, `{` or line break, so its expansion
-#     cannot close a quoted value, start a [Files] parameter or a section, or
-#     expand again. ISPP reads that literal as written: its default
-#     Pascal-style strings have no escape sequences (ISPP.Preprocess.pas,
-#     DefaultOptions, issrc is-6_7_3), and only a `#pragma` could change that.
-#     The contract assumes ISCC runs with ISPP's defaults, as release.yml runs
-#     it (only /DAppVersion=<the tag's version> and /DBuildDir=<the build
-#     directory>); an ISPP switch on that command line (/{#, /$, /P, ...) is
-#     outside it.
-#  4. Section headers. A line whose first non-blank character is `[` must be
-#     exactly one of ISS_SECTIONS as written there: never `[ Files ]`,
-#     `[FILES]` (ISCC compares section names case-insensitively; this does
-#     not), `[/Files]` or a section the script does not use today. Before the
-#     first section only blank lines, `;` comments and the header blocks.
-#  5. A line ending in a backslash is refused. ISPP joins such a line with the
-#     next only once a `#pragma spansymbol` turns line spanning on (it is off
-#     by default: SpanSymbol #0, ISPP.Preprocess.pas), which rule 2 refuses;
-#     the refusal keeps the contract from depending on that.
-#  6. [Files] entries: see iss_file_entries().
-ISS_HEADER_NAMES = ("AppVersion", "BuildDir")
-ISS_SECTIONS = ("Setup", "Languages", "Types", "Components", "Files", "Dirs", "Run", "UninstallRun",
-                "InstallDelete", "UninstallDelete", "Code")
-ISS_HEADER_IFNDEF = re.compile(r"#ifndef ([A-Za-z_]\w*)")
-ISS_HEADER_LITERAL = r"[A-Za-z0-9._\\-]*"
-ISS_HEADER_DEFINE = re.compile(rf'#define ([A-Za-z_]\w*) "({ISS_HEADER_LITERAL})"')
-ISS_HEADER_ENDIF = "#endif"
-ISS_INLINE = re.compile(r"\{#([A-Za-z_]\w*)\}")
-
-ISS_ENTRY = re.compile(r'[ \t]*([A-Za-z]+)[ \t]*:[ \t]*("(?:[^"]|"")*"|[^;]*)[ \t]*(?:;|$)')
-# A Source basename this maps the same way Windows' FindFirstFile (which Inno
-# Setup uses) does: a literal name, or one `*` directly before a literal
-# extension (`*.dll`). `?` and `*.*` (which on Windows also matches a name with
-# no dot) are refused, and so is a dotted extension after the `*` (`*.a.b`).
-# Residual: FindFirstFile also matches a file's 8.3 short name, so on a volume
-# that keeps them `*.dll` would match `x.dllx` too.
-ISS_SOURCE_NAME = re.compile(r"^(?:[^*?]+|[^*?]*\*\.[^*?.]+)$")
-# [Files] flags whose entry is not installed from the build output the way this
-# maps it: `external` (and Inno Setup 6.5's `download`, `extractarchive`) take
-# the file from elsewhere at install time, `dontcopy` never installs it, and
-# `recursesubdirs` (with `createallsubdirs`) installs a tree.
-ISS_UNMAPPED_FLAGS = {"recursesubdirs", "createallsubdirs", "external", "download", "extractarchive", "dontcopy"}
-# [Files] parameters that change which files or names an entry installs.
-ISS_UNMAPPED_PARAMS = {"destname", "excludes"}
-
+#  - Projects/Src/Compiler.SetupCompiler.pas, CreateManifestFile (7942-8005):
+#    a TTextFileWriter, one WriteLine for the header and one per file location
+#    entry, columns joined by a tab; the header is INNO_MANIFEST_HEADER; the
+#    SourceFilename column is the compile-time source path as ISCC built it
+#    (the [Files] Source with {#BuildDir} expanded, concatenated with the
+#    found name, not normalised: 5186, 5789, 5804-5812); SHA256Sum is
+#    SHA256DigestToString of the digest CompressFile took over the file's own
+#    bytes before any compression transform (Compiler.CompressionHandler.pas
+#    243-260). ISCC merges two [Files] entries naming the same source path,
+#    compared case-insensitively, into one location (5193), and writes the
+#    manifest only after a successful compile, having deleted any old one
+#    first (8745-8746, 8905-8907).
+#  - Components/SHA256.pas, SHA256DigestToString (71-): 64 lowercase hex digits.
+#  - Projects/Src/Shared.FileClass.pas, TTextFileWriter (508-573): Write
+#    encodes with Utf8Encode, a new file starts with the UTF-8 byte order mark
+#    (UTF8WithoutBOM is never set for the manifest), and WriteLine appends
+#    CR LF, so every line, the last included, ends in CR LF.
+#
+# Refused, each with an error naming the manifest and the problem: no UTF-8
+# byte order mark, bytes that are not UTF-8, a line not ended by CR LF or a
+# bare CR or LF, a header other than INNO_MANIFEST_HEADER exactly, no rows, a
+# row whose column count is not the header's, an Index out of sequence, a
+# SHA256Sum that is not 64 lowercase hex digits, a SourceFilename that is not a
+# drive-absolute Windows path strictly inside the build directory as ISCC was
+# given it (--inno-build-dir) after normalisation (`..` out of it, another
+# drive, a UNC or device path, the directory itself), a name Windows reads
+# differently (a reserved character, a trailing dot or space), one path listed
+# twice with two hashes, a file absent from --build-dir or not a regular file,
+# a file that resolves outside --build-dir (a symlink or junction), and a
+# SHA-256 that differs. A defect is an accepted row whose listed file differs
+# from the packed bytes; a manifest shape this refuses is an expected refusal.
+INNO_MANIFEST_HEADER = "\t".join((
+    "Index", "SourceFilename", "TimeStamp", "Version", "SHA256Sum", "OriginalSize", "FirstSlice", "LastSlice",
+    "StartOffset", "ChunkSuboffset", "ChunkCompressedSize", "Encrypted", "ISSigKeyID"))
+INNO_MANIFEST_COLUMNS = INNO_MANIFEST_HEADER.count("\t") + 1
 UTF8_BOM = b"\xef\xbb\xbf"
+SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+# A path component Windows would not open as written: a reserved character
+# (an NTFS stream colon among them) or a control character, or a trailing dot
+# or space, which Windows strips.
+WIN_BAD_COMPONENT = re.compile(r'[<>:"|?*\x00-\x1f]|[. ]$')
 
 
-def iss_lines(iss: Path) -> tuple[list[str], bool]:
-    """(lines, has_bom): the script split the way the Inno Setup compiler
-    splits it, at CR, LF or CR LF bytes (TTextFileReader, which splits before
-    it decodes). Any other control byte, a form feed or vertical tab among
-    them, is refused on every line: Python would split a line there, and the
-    compiler would not, so a line could read differently to the two.
+def read_inno_manifest(path: Path) -> list[tuple[str, str]]:
+    """[(SourceFilename, SHA256Sum)] for each row of an ISCC
+    OutputManifestFile, read under THE INSTALLER MANIFEST CONTRACT above (the
+    encoding, line ends, header, column count, Index sequence and hash form;
+    the paths are checked by inno_build_parts())."""
+    name = path.name
+    data = path.read_bytes()
+    if not data.startswith(UTF8_BOM):
+        raise SbomError(f"{name}: not the encoding ISCC writes a manifest in: UTF-8 with a byte order mark "
+                        f"(TTextFileWriter), and this file does not start with one")
+    try:
+        text = data[len(UTF8_BOM):].decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise SbomError(f"{name}: not the encoding ISCC writes a manifest in: it starts with a UTF-8 byte order "
+                        f"mark but is not UTF-8 ({e})") from e
+    if not text.endswith("\r\n"):
+        raise SbomError(f"{name}: the last line does not end in CR LF, as every line ISCC writes does "
+                        f"(a truncated or rewritten manifest?)")
+    lines = text[:-2].split("\r\n")
+    for lineno, line in enumerate(lines, 1):
+        if "\r" in line or "\n" in line:
+            raise SbomError(f"{name}:{lineno}: a CR or LF that is not part of a CR LF: ISCC ends every line in "
+                            f"CR LF (a rewritten manifest?)")
+    if lines[0] != INNO_MANIFEST_HEADER:
+        raise SbomError(f"{name}:1: the header is not the one Inno Setup 6.7.3 writes "
+                        f"({INNO_MANIFEST_HEADER!r}) but {lines[0]!r}: another compiler version changed the "
+                        f"format; update the contract in scripts/ci/artifact-sbom.py and its test fixture "
+                        f"deliberately, after reading the new format in that version's source")
+    rows = lines[1:]
+    if not rows:
+        raise SbomError(f"{name}: a header and no file rows: ISCC lists every file it packs, and an installer "
+                        f"packs at least yuzu-agent.exe")
+    out = []
+    for i, line in enumerate(rows):
+        where = f"{name}:{i + 2}"
+        cols = line.split("\t")
+        if len(cols) != INNO_MANIFEST_COLUMNS:
+            raise SbomError(f"{where}: {len(cols)} tab-separated columns, not the header's {INNO_MANIFEST_COLUMNS}")
+        if cols[0] != str(i):
+            raise SbomError(f"{where}: Index {cols[0]!r}, not {i}: the rows must be ISCC's file locations in order")
+        if not SHA256_HEX.fullmatch(cols[4]):
+            raise SbomError(f"{where}: SHA256Sum {cols[4]!r} is not 64 lowercase hex digits, the form ISCC "
+                            f"writes (SHA256DigestToString)")
+        out.append((cols[1], cols[4]))
+    return out
 
-    Decoding, as Inno Setup 6.3.0 and later read a script (the release runner
-    ran 6.7.3 for v0.15.0; jrsoftware/issrc tag is-6_7_3,
-    Projects/Src/Shared.FileClass.pas, and the 6.3.0 release notes): UTF-8
-    when it starts with a UTF-8 byte order mark; without one, UTF-8 when the
-    whole file is valid UTF-8, otherwise the build machine's ANSI code page.
-    A compiler before 6.3 reads every BOM-less script as ANSI. The release does
-    not pin the compiler (release.yml uses whichever Inno Setup 6 the runner
-    already has, and installs the current one with winget only when it finds
-    none; v0.15.0 used a per-user 6.7.3 install) and this script cannot know
-    the build machine's code page, so with no BOM the lines this parser maps
-    must be ASCII (iss_file_entries refuses any other byte there), which every
-    one of those rules reads the same way; other lines are decoded as Latin-1,
-    byte for byte, and only looked at for a section header, a `#` line or a
-    `{#`: a `[` or `#` byte that starts a line is that character in every
-    encoding, and a `{#` byte pair that a double-byte code page would read as
-    part of another character is refused all the same (over-refusal only).
-    With a BOM the script must be UTF-8 throughout, and a Unicode control
-    character or a whitespace character other than space and tab is refused
-    on every line."""
-    data = iss.read_bytes()
-    bom = data.startswith(UTF8_BOM)
-    if bom:
-        data = data[len(UTF8_BOM):]
-    raw_lines = re.split(rb"\r\n|\r|\n", data)
-    if raw_lines and raw_lines[-1] == b"":
-        raw_lines.pop()
-    lines = []
-    for lineno, raw in enumerate(raw_lines, 1):
-        where = f"{iss.name}:{lineno}"
-        bad = re.search(rb"[\x00-\x08\x0b-\x1f\x7f]", raw)
-        if bad:
-            raise SbomError(f"{where}: control byte 0x{bad.group()[0]:02x}: only space and tab may separate the "
-                            f"parts of a line (the Inno Setup compiler and this parser would read it differently)")
-        if not bom:
-            lines.append(raw.decode("latin-1"))
+
+def _win_parts(p: str):
+    """(drive, [components]) of a drive-absolute Windows path after
+    ntpath.normpath, or None for any other form (relative, drive-relative,
+    UNC, device or `\\\\?\\` paths)."""
+    drive, rest = ntpath.splitdrive(p)
+    if not (len(drive) == 2 and drive[1] == ":" and drive[0].isascii() and drive[0].isalpha()
+            and rest[:1] in ("\\", "/")):
+        return None
+    drive, rest = ntpath.splitdrive(ntpath.normpath(p))
+    return drive.upper(), [c for c in rest.split("\\") if c]
+
+
+def inno_build_parts(source: str, inno_build_dir: str, where: str) -> list[str]:
+    """The components of manifest path `source` below `inno_build_dir` (the
+    build directory as ISCC was given it, /DBuildDir), both read as Windows
+    paths: drive-absolute, normalised by ntpath.normpath (so `..` is resolved
+    lexically), drive and components compared case-insensitively, as Windows
+    compares them. Refuses a path that is not strictly inside, and a component
+    Windows would read differently."""
+    build = _win_parts(inno_build_dir)
+    if build is None:
+        raise SbomError(f"--inno-build-dir {inno_build_dir!r} is not a drive-absolute Windows path (X:\\...)")
+    src = _win_parts(source)
+    if src is None:
+        raise SbomError(f"{where}: SourceFilename {source!r} is not a drive-absolute Windows path, so it is not "
+                        f"inside the build directory {inno_build_dir!r}")
+    (bdrive, bparts), (sdrive, sparts) = build, src
+    n = len(bparts)
+    if (sdrive != bdrive or len(sparts) <= n
+            or [c.casefold() for c in sparts[:n]] != [c.casefold() for c in bparts]):
+        raise SbomError(f"{where}: SourceFilename {source!r} is not strictly inside the build directory "
+                        f"{inno_build_dir!r} (after normalisation it is {sdrive}\\{chr(92).join(sparts)})")
+    rel = sparts[n:]
+    bad = next((c for c in rel if WIN_BAD_COMPONENT.search(c)), None)
+    if bad is not None:
+        raise SbomError(f"{where}: SourceFilename {source!r}: component {bad!r} holds a character Windows does "
+                        f"not allow in a name or ends in a dot or space, which Windows strips")
+    return rel
+
+
+def _copy_hashed(src: Path, dest: Path) -> str:
+    """Copy `src` to the new file `dest`, returning the SHA-256 of the bytes
+    copied, so the hash checked is the hash of what syft reads."""
+    h = hashlib.sha256()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with open(src, "rb") as f, open(dest, "xb") as o:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+            o.write(chunk)
+    return h.hexdigest()
+
+
+def installer_contents(manifest: Path, build_dir: Path, inno_build_dir: str, dest: Path) -> list[str]:
+    """Copy into `dest` every file the ISCC manifest lists, at its path below
+    the build directory, after checking it under THE INSTALLER MANIFEST
+    CONTRACT. Returns the build-relative paths, /-separated, in manifest
+    order, each once."""
+    rows = read_inno_manifest(manifest)
+    if not build_dir.is_dir():
+        raise SbomError(f"--build-dir {build_dir}: no such directory")
+    root = build_dir.resolve(strict=True)
+    seen: dict = {}
+    out = []
+    for i, (source, sha) in enumerate(rows):
+        where = f"{manifest.name}:{i + 2}"
+        rel = inno_build_parts(source, inno_build_dir, where)
+        key = tuple(c.casefold() for c in rel)
+        if key in seen:
+            # ISCC merges these itself unless DontMergeDuplicateFiles is set.
+            if seen[key] != sha:
+                raise SbomError(f"{where}: {source!r} is listed again with another SHA-256 ({seen[key]} and {sha})")
             continue
+        seen[key] = sha
+        shown = "/".join(rel)
+        local = build_dir.joinpath(*rel)
         try:
-            line = raw.decode("utf-8")
-        except UnicodeDecodeError as e:
-            raise SbomError(f"{where}: the script starts with a UTF-8 byte order mark but is not UTF-8 ({e})") from e
-        odd = next((c for c in line if ("\x80" <= c <= "\x9f") or (c.isspace() and c not in " \t")), None)
-        if odd is not None:
-            raise SbomError(f"{where}: character U+{ord(odd):04X}: only space and tab may separate the parts of a line")
-        lines.append(line)
-    return lines, bom
-
-
-def iss_file_entries(iss: Path) -> list[tuple[str, str]]:
-    """[(dest_dir_below_app, source_basename_glob)] for each `Source:` line of
-    the [Files] section of an InnoSetup script, e.g.
-      Source: "{#BuildDir}\\agents\\plugins\\x\\x.dll"; DestDir: "{app}\\plugins"
-    -> ("plugins", "x.dll"). Reads the script under THE .iss CONTRACT above
-    and fails, naming the line, on anything outside it: a line iss_lines()
-    refuses; a non-ASCII byte on a line this maps (a `#` line, a section
-    header, a [Files] entry) of a script without a byte order mark; a line
-    ending in a backslash; a `#` line other than a header block before the
-    first section; a `{#` other than `{#<Name>}` of a header name; a section
-    header other than one of ISS_SECTIONS as written; other text before the
-    first section. In [Files]: an ISPP expansion anywhere but the directory of
-    a quoted Source; a DestDir outside {app}, with a `.` or `..` part or with a
-    constant below {app}; a flag in ISS_UNMAPPED_FLAGS or a parameter in
-    ISS_UNMAPPED_PARAMS; an unterminated quoted value; a Source name with a
-    wildcard other than `*.<ext>`."""
-    lines, bom = iss_lines(iss)
-    entries, section = [], None
-    # The header block being read: (the line expected next, its <Name>).
-    pending, defined = None, set()
-    for lineno, raw in enumerate(lines, 1):
-        line = raw.strip(" \t")
-        where = f"{iss.name}:{lineno}"
-
-        def refuse(why: str):
-            return SbomError(f"{where}: {why}: {line!r} (outside the .iss contract in scripts/ci/artifact-sbom.py; "
-                             f"extend its allowlists deliberately, never emulate more of the preprocessor)")
-        if line.endswith("\\"):
-            raise SbomError(f"{where}: a line ending in a backslash: the preprocessor can join it with the next "
-                            f"line (#pragma spansymbol), which this script does not do")
-        directive = line.startswith("#")
-        header = line.startswith("[")
-        entry = section == "Files" and not directive and not header and bool(line) and not line.startswith(";")
-        if not bom and (directive or header or entry) and not line.isascii():
-            raise SbomError(f"{where}: a non-ASCII character in a line this maps, in a script with no UTF-8 byte "
-                            f"order mark: Inno Setup reads that line as UTF-8 or in the build machine's ANSI code "
-                            f"page depending on its version and the rest of the file; save the script as UTF-8 with "
-                            f"a byte order mark, or keep the line ASCII")
-        for i in (i for i in range(len(line) - 1) if line.startswith("{#", i)):
-            m = ISS_INLINE.match(line, i)
-            if not m or m.group(1) not in ISS_HEADER_NAMES:
-                raise refuse(f"preprocessor expansion at column {i + 1}: only {{#<Name>}} of a header name "
-                             f"({', '.join(ISS_HEADER_NAMES)}) is accepted")
-        if pending is not None:
-            want, name = pending
-            m = (ISS_HEADER_DEFINE.fullmatch(line) if want == "define" else
-                 line == ISS_HEADER_ENDIF if want == "endif" else None)
-            if not m or (want == "define" and m.group(1) != name):
-                raise refuse(f"the #ifndef {name} block must continue with "
-                             + (f'#define {name} "<literal>"' if want == "define" else "#endif")
-                             + " on the next line (literal characters: letters, digits, `.`, `_`, `-`, `\\`)")
-            pending = ("endif", name) if want == "define" else None
-            if want == "endif":
-                defined.add(name)
-            continue
-        if directive:
-            if section is not None:
-                raise refuse("a preprocessor line after the first section")
-            m = ISS_HEADER_IFNDEF.fullmatch(line)
-            if not m or m.group(1) not in ISS_HEADER_NAMES or m.group(1) in defined:
-                raise refuse(f"a preprocessor line other than a header block (#ifndef <Name> / #define <Name> "
-                             f"\"<literal>\" / #endif, <Name> one of {', '.join(ISS_HEADER_NAMES)}, each once)")
-            pending = ("define", m.group(1))
-            continue
-        if header:
-            if not (line.endswith("]") and line[1:-1] in ISS_SECTIONS):
-                raise refuse(f"a section header other than exactly one of "
-                             f"{', '.join(f'[{s}]' for s in ISS_SECTIONS)}")
-            section = line[1:-1]
-            continue
-        if section is None and line and not line.startswith(";"):
-            raise refuse("text before the first section other than a comment or a header block")
-        if not entry:
-            continue
-        fields, quoted = {}, set()
-        pos = 0
-        while pos < len(line):
-            m = ISS_ENTRY.match(line, pos)
-            if not m or m.end() == pos:
-                raise SbomError(f"{where}: cannot parse [Files] line {line!r}")
-            key, val = m.group(1).lower(), m.group(2).strip(" \t")
-            if val.startswith('"'):
-                if len(val) < 2 or not val.endswith('"'):
-                    raise SbomError(f"{where}: unterminated quoted value for {m.group(1)} in {line!r}")
-                val = val[1:-1].replace('""', '"')
-                quoted.add(key)
-            fields[key] = val
-            pos = m.end()
-        if "source" not in fields:
-            raise SbomError(f"{where}: [Files] line without Source: {line!r}")
-        unmapped = sorted(set(fields.get("flags", "").lower().split()) & ISS_UNMAPPED_FLAGS)
-        unmapped += sorted(set(fields) & ISS_UNMAPPED_PARAMS)
-        if unmapped:
-            raise SbomError(f"{where}: {', '.join(unmapped)}: such an entry is not mapped onto the archive")
-        source = fields["source"].replace("/", "\\")
-        name = source.rsplit("\\", 1)[-1]
-        if "{#" in name or ("{#" in source and "source" not in quoted) or any(
-                "{#" in v for k, v in fields.items() if k != "source"):
-            raise SbomError(f"{where}: an ISPP expansion outside a quoted Source's directory is not evaluated here")
-        dest = fields.get("destdir", "").replace("/", "\\")
-        if dest.lower() != "{app}" and not dest.lower().startswith("{app}\\"):
-            raise SbomError(f"{where}: DestDir {dest!r} is not under {{app}}")
-        parts = [p for p in dest[len("{app}"):].split("\\") if p]
-        if any(p in (".", "..") or "{" in p or "}" in p for p in parts):
-            raise SbomError(f"{where}: DestDir {dest!r}: a `.`, `..` or constant below {{app}} is not mapped "
-                            f"onto the archive")
-        if not ISS_SOURCE_NAME.match(name):
-            raise SbomError(f"{where}: Source name {name!r}: only a literal name or `*.<ext>` is mapped "
-                            f"onto the archive the way Inno Setup resolves it")
-        entries.append(("/".join(parts), name))
-    if pending is not None:
-        raise SbomError(f"{iss.name}: the #ifndef {pending[1]} block is not finished at the end of the script "
-                        f"(outside the .iss contract in scripts/ci/artifact-sbom.py)")
-    if not entries:
-        raise SbomError(f"{iss.name}: no Source: lines in a [Files] section")
-    return entries
-
-
-def keep_installed(contents: Path, entries: list[tuple[str, str]]):
-    """Delete from the unpacked archive every file the installer does not
-    install. The archive holds one top-level directory standing for {app}
-    (yuzu-agent-<version>-windows-x64/), so {app}\\plugins is <top>/plugins.
-    Returns (kept, dropped, unmatched_entries) as sorted relative paths."""
-    tops = [p for p in contents.iterdir()]
-    if len(tops) != 1 or not tops[0].is_dir():
-        raise SbomError("--contents-from archive must hold exactly one top-level directory (the install root)")
-    top = tops[0]
-    kept, dropped, used = [], [], set()
-    for dirpath, _dirs, files in os.walk(top):
-        rel_dir = Path(dirpath).relative_to(top).as_posix()
-        rel_dir = "" if rel_dir == "." else rel_dir
-        for f in files:
-            hit = [i for i, (sub, pat) in enumerate(entries)
-                   if sub.lower() == rel_dir.lower() and fnmatch.fnmatch(f.lower(), pat.lower())]
-            rel = f"{rel_dir}/{f}" if rel_dir else f
-            if hit:
-                kept.append(rel)
-                used.update(hit)
-            else:
-                dropped.append(rel)
-                os.remove(os.path.join(dirpath, f))
-    unmatched = [app_path(sub, pat) for i, (sub, pat) in enumerate(entries) if i not in used]
-    return sorted(kept), sorted(dropped), unmatched
-
-
-def app_path(sub: str, pat: str) -> str:
-    """An iss_file_entries() entry as the script names it: ("plugins", "x.dll")
-    -> {app}\\plugins\\x.dll."""
-    return "\\".join(["{app}"] + [p for p in sub.split("/") if p] + [pat])
+            real = local.resolve(strict=True)
+        except OSError:
+            raise SbomError(f"{where}: {source!r} is missing from the build directory {build_dir} "
+                            f"(looked for {local})") from None
+        if real == root or not real.is_relative_to(root):
+            raise SbomError(f"{where}: {source!r} resolves to {real}, outside the build directory {root} "
+                            f"(a symlink or junction)")
+        if not real.is_file():
+            raise SbomError(f"{where}: {source!r} is not a regular file in the build directory ({real})")
+        try:
+            got = _copy_hashed(real, dest.joinpath(*rel))
+        except FileExistsError:
+            raise SbomError(f"{where}: {source!r} maps onto a path already copied ({shown})") from None
+        if got != sha:
+            raise SbomError(f"{where}: {shown} in the build directory has SHA-256 {got}, not the {sha} ISCC "
+                            f"recorded when it packed the installer: not the file the installer holds")
+        out.append(shown)
+    return out
 
 
 # ── vcpkg ────────────────────────────────────────────────────────────────────
@@ -1211,7 +1128,9 @@ def image_pair_errors(adir: Path) -> list[str]:
 # What a file holding yuzu-server carries that no SBOM lists yet.
 SERVER_UNLISTED = ("yuzu-server compiles in vendored C++ (server/core/vendor: qrcodegen) and embeds web "
                    "assets (htmx, ECharts, three.js, Cytoscape, IBM Plex fonts) that this SBOM does not list")
-INSTALLER_UNLISTED = "the installer's own InnoSetup runtime (setup loader and uninstaller) is not listed"
+INSTALLER_UNLISTED = ("the installer's own InnoSetup runtime (setup loader and uninstaller) and what it embeds "
+                      "besides the files its manifest lists (licence text, icon, compiled [Code] script) are not "
+                      "listed")
 
 # Why an SBOM says it is incomplete: a CLOSED set. An SBOM carrying the marker
 # names its reasons by these tokens, comma-separated, in
@@ -1225,11 +1144,6 @@ INSTALLER_UNLISTED = "the installer's own InnoSetup runtime (setup loader and un
 INCOMPLETE_REASONS = {
     "server-vendored": SERVER_UNLISTED,
     "installer-runtime": INSTALLER_UNLISTED,
-    "installer-wildcard": ("the installer's script installs a wildcard Source (a `*.dll` from the build directory), "
-                           "listed here as the archive's matching files, so a file the build directory held "
-                           "beyond the archive's would not be listed"),
-    "installer-file-missing": ("the installer's script installs a file the archive this SBOM is made from does "
-                               "not hold, so it is not listed"),
     "erts-static": ("the bundled Erlang runtime is listed as one component (erlang), but its emulator beam.smp "
                     "links in code it vendors (PCRE2, asmjit, zstd, Ryu, an MD5 taken from OpenSSL) that this "
                     "SBOM does not list"),
@@ -1273,33 +1187,20 @@ def _describe(a, artifact: Path, tmp: Path):
     """Unpack, scan and merge; returns (cdx, spdx, vcomps)."""
     contents = tmp / "contents"
     contents.mkdir()
-    source = Path(a.contents_from) if a.contents_from else artifact
-    extract(source, contents)
     incomplete: list[tuple[str, str]] = []
-    if a.contents_from is None:
-        notes = {"artifact": artifact.name, "contents": f"unpacked from {source.name}"}
+    if a.inno_manifest is None:
+        extract(artifact, contents)
+        notes = {"artifact": artifact.name, "contents": f"unpacked from {artifact.name}"}
     else:
-        iss = Path(a.iss)
-        entries = iss_file_entries(iss)
-        kept, dropped, unmatched = keep_installed(contents, entries)
-        contents_note = (f"{artifact.name} is not unpacked here; its contents are the {len(kept)} file(s) of "
-                         f"{source.name}, built from the same output, that {iss.name} installs (its [Files] "
-                         f"Source: lines, resolved against the archive's layout)")
-        if dropped:
-            shown = ", ".join(dropped[:20]) + (f" and {len(dropped) - 20} more" if len(dropped) > 20 else "")
-            contents_note += f"; {len(dropped)} file(s) of the archive the installer does not install are left out: {shown}"
-            print(f"::warning::{artifact.name}: {len(dropped)} file(s) of {source.name} are not installed by "
-                  f"{iss.name} and are left out of its SBOM: {shown}", file=sys.stderr)
-        notes = {"artifact": artifact.name, "contents": contents_note}
+        manifest = Path(a.inno_manifest)
+        listed = installer_contents(manifest, Path(a.build_dir), a.inno_build_dir, contents)
+        notes = {"artifact": artifact.name,
+                 "contents": (f"{artifact.name} is not unpacked here; its contents are the {len(listed)} file(s) "
+                              f"the Inno Setup compiler's manifest ({manifest.name}, OutputManifestFile) lists for "
+                              f"it, each read from the build directory and matching the SHA-256 the compiler "
+                              f"recorded, listed at its path below the build directory, not the path it is "
+                              f"installed to")}
         incomplete.append(("installer-runtime", ""))
-        wild = [app_path(sub, pat) for sub, pat in entries if "*" in pat]
-        if wild:
-            incomplete.append(("installer-wildcard", ", ".join(wild)))
-        if unmatched:
-            incomplete.append(("installer-file-missing", f"{iss.name} installs {', '.join(unmatched)}, "
-                                                         f"which {source.name} does not hold"))
-            print(f"::warning::{artifact.name}: {iss.name} installs {', '.join(unmatched)}, which {source.name} "
-                  f"does not hold; not listed", file=sys.stderr)
     files = count_files(contents)
     if files < 1:
         raise SbomError(f"{artifact.name}: unpacked to no files")
@@ -1440,10 +1341,12 @@ def main(argv=None) -> int:
     g.add_argument("--version", required=True)
     g.add_argument("--syft", required=True)
     g.add_argument("--out-dir", required=True)
-    g.add_argument("--contents-from", help="an archive built from the same output, for an installer that cannot be "
-                                           "unpacked here (needs --iss)")
-    g.add_argument("--iss", help="the InnoSetup script that built the installer: only the archive files its "
-                                 "[Files] section installs are described")
+    g.add_argument("--inno-manifest", help="for an InnoSetup installer: the manifest the same ISCC run wrote "
+                                           "(OutputManifestFile); its files are described (needs --build-dir and "
+                                           "--inno-build-dir)")
+    g.add_argument("--build-dir", help="the build directory the installer's files are read from")
+    g.add_argument("--inno-build-dir", help="that build directory as ISCC was given it (/DBuildDir), a "
+                                            "drive-absolute Windows path: the prefix of the manifest's paths")
     g.add_argument("--vcpkg-installed", help="the vcpkg_installed directory (holds vcpkg/status)")
     g.add_argument("--triplet")
     g.add_argument("--manifest", help="vcpkg.json")
@@ -1463,9 +1366,12 @@ def main(argv=None) -> int:
         if a.cmd == "generate":
             if a.vcpkg_installed and not (a.triplet and a.manifest):
                 raise SbomError("--vcpkg-installed needs --triplet and --manifest")
-            if bool(a.contents_from) != bool(a.iss):
-                raise SbomError("--contents-from and --iss go together: the installer's SBOM lists only "
-                                "the archive files its script installs")
+            inno = (a.inno_manifest, a.build_dir, a.inno_build_dir)
+            if any(inno) and not all(inno):
+                raise SbomError("--inno-manifest, --build-dir and --inno-build-dir go together: an installer's "
+                                "SBOM is made from the compiler's manifest, read against the build directory")
+            if a.inno_manifest and not Path(a.artifact).name.endswith(".exe"):
+                raise SbomError(f"{Path(a.artifact).name}: --inno-manifest describes an InnoSetup installer (.exe)")
             return cmd_generate(a)
         if a.cmd == "mark-image":
             return cmd_mark_image(a)
