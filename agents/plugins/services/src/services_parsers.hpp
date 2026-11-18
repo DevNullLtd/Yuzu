@@ -141,9 +141,6 @@ systemctl_mutation_argv(bool euid_is_root, std::string_view systemctl_path,
     return false;
 }
 
-/// The read-back as a whole: the `is-enabled` command itself must have RUN to completion (a
-/// spawn failure, deadline, cancel or signal is not a match) and its state must match. Its exit
-/// code is not required to be 0: `is-enabled` exits non-zero for `disabled` and `masked`.
 /// True for the states no verb can change (`static`, `indirect`, `alias`, `generated`): a unit
 /// there is accepted for either mode but does NOT auto-start because of it, so the action
 /// reports the state back to the caller.
@@ -155,6 +152,9 @@ systemctl_mutation_argv(bool euid_is_root, std::string_view systemctl_path,
     return state == "static" || state == "indirect" || state == "alias" || state == "generated";
 }
 
+/// The read-back as a whole: the `is-enabled` command itself must have RUN to completion (a
+/// spawn failure, deadline, cancel or signal is not a match) and its state must match. Its exit
+/// code is not required to be 0: `is-enabled` exits non-zero for `disabled` and `masked`.
 [[nodiscard]] inline bool start_mode_readback_matches(std::string_view mode,
                                                       const yuzu::agent::SubprocessResult& res) {
     if (!res.tool_ran || res.timed_out || yuzu::agent::classify_runner_failure(res).has_value())

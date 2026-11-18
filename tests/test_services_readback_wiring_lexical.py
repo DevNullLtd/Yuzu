@@ -13,7 +13,10 @@ contents removed first; tests/cpp_lex_helper.py):
   2. the `is-enabled` readback runs with stderr NOT merged (`run_command({..}, false)`): a SysV
      unit's "not a native service, redirecting" line is stderr and would otherwise be the first
      line of the state;
-  3. the success path emits the `state|{}` line and consults `start_state_is_unchangeable`.
+  3. the success path emits the `state|{}` line and consults `start_state_is_unchangeable`;
+  4. INSIDE that unchangeable branch the plugin sets CONSTRAINED/PARTIAL with provenance
+     `services:start_mode_unchangeable` (a prose `note|` alone is invisible to a machine reader
+     that sees `status|ok`); the return code stays 0.
 
 The self-test mutates each pin (revert, hide in a block comment / string / `#if 0`) and requires
 a failure. Lexical only.
@@ -46,6 +49,10 @@ def problems(src):
         out.append('the success path no longer emits the "state|{}" line')
     if not re.search(r"start_state_is_unchangeable\(", code):
         out.append("the success path no longer consults start_state_is_unchangeable")
+    if not re.search(
+            r"start_state_is_unchangeable\(state\)\)\s*\{[\s\S]{0,1200}?set_result_status\(\s*YUZU_RESULT_STATUS_CONSTRAINED,"
+            r"\s*YUZU_RESULT_COMPLETENESS_PARTIAL,\s*\"services:start_mode_unchangeable\"\s*\)", live):
+        out.append("the unchangeable branch no longer sets CONSTRAINED/PARTIAL services:start_mode_unchangeable")
     return out
 
 
@@ -67,6 +74,15 @@ def selftest(src):
     weak = src.replace(CALL, "if (!yuzu::services::start_mode_took_effect(mode, st.output)) {", 1)
     if weak == src or not problems(weak):
         errs.append("selftest: reverting to start_mode_took_effect(mode, st.output) was NOT detected")
+    no_status = re.sub(r"ctx\.set_result_status\(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,\s*"
+                       r"\"services:start_mode_unchangeable\"\);", "", src, count=1)
+    if no_status == src or not problems(no_status):
+        errs.append("selftest: deleting the unchangeable CONSTRAINED status was NOT detected")
+    for hname, fn in hide.items():
+        m = re.search(r"ctx\.set_result_status\(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,\s*"
+                      r"\"services:start_mode_unchangeable\"\);", src)
+        if m and not problems(src[:m.start()] + fn(m.group(0)) + src[m.end():]):
+            errs.append(f"selftest: hiding the unchangeable status in a {hname} was NOT detected")
     merged = src.replace("/*merge_stderr=*/false", "/*merge_stderr=*/true", 1)
     if merged == src or not problems(merged):
         errs.append("selftest: merging stderr into the readback was NOT detected")

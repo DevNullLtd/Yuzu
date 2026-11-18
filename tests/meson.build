@@ -4730,6 +4730,14 @@ test('proc access status lexical gate (WP13/UP14)',
   suite: 'docs',
   timeout: 30,
 )
+# WP13: the shared C++ tokenizer used by the lexical gates: direct self-test of the shapes they
+# rely on (escaped-quote and raw strings, comment forms, #if 0 forms).
+test('cpp lex helper self-test (WP13)',
+  _python3_test,
+  args: [files('cpp_lex_helper.py')],
+  suite: 'docs',
+  timeout: 30,
+)
 # WP13: pins that Linux set_start_mode judges the readback with start_mode_readback_matches, runs
 # it with stderr unmerged and reports the state (source-text only).
 test('services set_start_mode readback wiring lexical gate (WP13)',

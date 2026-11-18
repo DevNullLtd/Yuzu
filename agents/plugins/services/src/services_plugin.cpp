@@ -565,8 +565,9 @@ int do_set_start_mode_linux(yuzu::CommandContext& ctx, std::string_view name,
             yuzu::agent::forward_runner_failure(ctx, st);
         if (!yuzu::services::start_mode_readback_matches(mode, st)) {
             ctx.write_output(std::format(
-                "error|set_start_mode reported success but '{}' is not in mode '{}' (is-enabled: "
-                "'{}'); the privileged helper may not have acted",
+                "error|set_start_mode: '{}' is not in mode '{}' after the privileged helper ran "
+                "(is-enabled: '{}'); the helper may not have acted, or the change may already be "
+                "applied and the readback unreadable (re-running is idempotent)",
                 name, mode, st.output.substr(0, st.output.find('\n'))));
             return 1;
         }
@@ -579,12 +580,22 @@ int do_set_start_mode_linux(yuzu::CommandContext& ctx, std::string_view name,
     // The state the unit is actually in (first is-enabled line), so a caller can tell a unit
     // that will auto-start from one that cannot be enabled or disabled.
     {
-        const std::string state = st_state.substr(0, st_state.find('\n'));
+        std::string state = st_state.substr(0, st_state.find('\n'));
+        while (!state.empty() && (state.back() == '\r' || state.back() == ' '))
+            state.pop_back();
         ctx.write_output(std::format("state|{}", state));
-        if (yuzu::services::start_state_is_unchangeable(state))
+        if (yuzu::services::start_state_is_unchangeable(state)) {
             ctx.write_output(std::format(
                 "note|'{}' is '{}': systemctl cannot enable or disable it, so the requested mode "
                 "does not change whether it starts at boot", name, state));
+            // The requested change was accepted but could not be applied to this unit kind: a
+            // typed CONSTRAINED/PARTIAL so a machine reader does not take `status|ok` for "the
+            // unit now starts (or no longer starts) at boot". rc stays 0: the command ran and the
+            // unit is in a state `systemctl enable|disable` itself accepts (the host's
+            // SUCCESS/FAILURE comes from rc; the typed status travels separately).
+            ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                  "services:start_mode_unchangeable");
+        }
     }
     return 0;
 }

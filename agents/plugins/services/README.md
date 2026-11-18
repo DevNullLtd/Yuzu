@@ -16,7 +16,7 @@
 
 `list` and `running` read the host's service registry and return one `svc|` row per service: the Service Control Manager on Windows (Win32 services only, not kernel drivers), `systemctl list-units` on Linux (`--type=service` units that systemd has loaded, which is not every unit file on disk and excludes timers, sockets and other unit types) and `launchctl list` on macOS. `running` is the same read narrowed to services that are up: Windows asks the Service Control Manager for every state except stopped, Linux keeps systemd's `running` sub-state, and macOS keeps rows that have a PID (`launchctl` has no filter of its own, so the plugin filters after parsing). On macOS one extra call, `launchctl print-disabled system`, supplies each row's startup type; a label that domain holds no override for reads `unknown`.
 
-`set_start_mode` is the only mutation. It checks the service name and mode, then changes one service's boot-time start setting and nothing else: it does not start, stop or restart the service. Windows sets the Service Control Manager start type. Linux runs `systemctl enable` for `automatic`, `unmask` then `disable` for `manual`, and `mask` for `disabled`. macOS runs `launchctl enable` or `disable` against `system/<label>` and refuses `manual`, because launchd only has enabled and disabled. Linux and macOS commands run as shell-free argv under a 20 second deadline, prefixed with `sudo -n --` unless the agent is already root. On Linux a non-root agent does not run `systemctl` under sudo at all: it runs the root-owned validator `/usr/libexec/yuzu/yuzu-systemctl <verb> <unit>` (installed by `scripts/install-agent-user.sh`), which accepts only those two arguments and runs `systemctl <verb> -- <unit>` (WP13/F48). The plugin is deliberately not a change history; the Echo service collector does that separately.
+`set_start_mode` is the only mutation. It checks the service name and mode, then changes one service's boot-time start setting and nothing else: it does not start, stop or restart the service. Windows sets the Service Control Manager start type. Linux runs `systemctl enable` for `automatic`, `unmask` then `disable` for `manual`, and `mask` for `disabled`. macOS runs `launchctl enable` or `disable` against `system/<label>` and refuses `manual`, because launchd only has enabled and disabled. Linux and macOS commands run as shell-free argv under a 20 second deadline, prefixed with `sudo -n --` unless the agent is already root. On Linux a non-root agent never runs `sudo systemctl` itself: it runs `sudo -n -- /usr/libexec/yuzu/yuzu-systemctl <verb> <unit>`, the root-owned validator (installed by `scripts/install-agent-user.sh`), which accepts only those two arguments and runs `systemctl <verb> -- <unit>` (WP13/F48). It then reads the unit's state back with `systemctl is-enabled`. The plugin is deliberately not a change history; the Echo service collector does that separately.
 
 ```mermaid
 flowchart LR
@@ -67,10 +67,10 @@ sequenceDiagram
     P->>O: sudo -n -- launchctl enable or disable system/label
   end
   O-->>P: success or failure
-  P-->>S: status ok, service, mode  or  one error line
+  P-->>S: status ok, service, mode (Linux also state, and note)  or  one error line
 ```
 
-The plugin validates input first, then makes exactly one start-setting change per call (Linux `manual` adds a best-effort `unmask` beforehand). Nothing starts or stops the service, and a failure produces a single `error|` line instead of the three success lines.
+The plugin validates input first, then makes exactly one start-setting change per call (Linux `manual` adds a best-effort `unmask` beforehand). Nothing starts or stops the service, and a failure produces a single `error|` line instead of the success lines (`status|`, `service|`, `mode|`, and on Linux `state|`, plus `note|` for a unit that cannot be enabled or disabled).
 
 ```mermaid
 flowchart TD
@@ -140,20 +140,22 @@ Rows are pipe-delimited, prefixed `svc|`, one per service. The row **shape** dif
 | `status` | string | - | Windows, Linux, macOS | `running (windows) · 0 (darwin)` | Column 3, whose meaning is OS-specific. On Windows it is the service's current SCM state (always "running" for this action's filtered result). On Linux it is systemd's SUB state from `systemctl list-units --state=running`. On macOS it is launchctl's raw last-exit-status code for the job -- an integer as a string, NOT a running/stopped word; this action's own running-filter is applied on the PID column, not this one. Values: running (windows, this action always filters to it) · free text systemd SUB state (linux) · integer exit-status code as a string (darwin). |
 | `startup_type` | string | - | Windows, macOS | `automatic (windows) · unknown (darwin)` | Column 4: the service's configured startup type. On Windows this is the SCM's 5-state taxonomy. On macOS it is an honest 3-value read derived from a bulk `launchctl print-disabled` join -- a label with no explicit override reports "unknown" rather than a guessed default. It is NOT emitted on Linux at all (no 4th column on the wire), because the systemctl leg does not derive a startup type. Values: automatic, boot, manual, disabled, system, unknown (windows) · automatic, disabled, unknown (darwin) · field absent (linux). |
 
-**`crossplatform.service.set_start_mode` — `status|service|mode`**
+**`crossplatform.service.set_start_mode` — `status|service|mode|state|note`**
 
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
 | `status` | string | - | Windows, Linux, macOS | `ok` | Literal "ok" on a successful mode change. On any failure the plugin instead writes a single "error\|<message>" line and this row does not appear at all. Values: ok (the only value ever emitted). |
 | `service` | string | - | Windows, Linux, macOS | `-` | The `name` parameter echoed back unmodified, on a successful mode change only. Values: free text — echoes the name parameter. |
 | `mode` | string | - | Windows, Linux, macOS | `-` | The `mode` parameter echoed back unmodified, on a successful mode change only. Values: automatic, disabled (all OS) · manual additionally on windows/linux (darwin rejects it before this row is ever written). |
+| `state` | string | - | Linux | `enabled` | Linux only, on a successful mode change: the unit's state read back with `systemctl is-enabled` (the first line). Values: enabled, disabled, masked, static, indirect, alias, generated (the only states that can follow a successful change). |
+| `note` | string | - | Linux | `-` | Linux only, written only when `state` is static, indirect, alias or generated: those units cannot be enabled or disabled, so the requested mode does not change whether they start at boot. The result status is then CONSTRAINED/PARTIAL (`services:start_mode_unchangeable`) while the exit code stays 0. Values: free text naming the unit and its state. |
 <!-- END GENERATED -->
 
 ### Result status
 
 | Status | Completeness | Provenance | When |
 |---|---|---|---|
-| `UNDECLARED` (default) | UNKNOWN | (empty) | Every Windows read (including a failed one), every Linux/macOS read that completed cleanly, a successful `set_start_mode` on any OS, and every `set_start_mode` validation or platform-decision error (missing `name`/`mode`, unsafe name, invalid mode, macOS `manual`, a command that ran and exited non-zero). The plugin sets no status on these paths. |
+| `UNDECLARED` (default) | UNKNOWN | (empty) | Every Windows read (including a failed one), every Linux/macOS read that completed cleanly, a successful `set_start_mode` on Windows and macOS and on Linux for a unit whose state can change, and every `set_start_mode` validation or platform-decision error (missing `name`/`mode`, unsafe name, invalid mode, macOS `manual`, a command that ran and exited non-zero). The plugin sets no status on these paths. |
 | `UNAVAILABLE` | PARTIAL | `subprocess_runner:spawn_error` | Linux/macOS `list`/`running`/`set_start_mode`: `systemctl`/`launchctl` (or `sudo`) could not be started or was not found; shown in `docs/samples/linux.txt` |
 | `CONSTRAINED` | PARTIAL | `subprocess_runner:deadline` | The 20 second runner deadline elapsed and the child was killed |
 | `CONSTRAINED` | PARTIAL | `subprocess_runner:cancelled` | The `systemctl`/`launchctl` run was cancelled before it finished |
@@ -161,6 +163,7 @@ Rows are pipe-delimited, prefixed `svc|`, one per service. The row **shape** dif
 | `OK` | PARTIAL | `subprocess_runner:line_limit` | Defined by the shared runner for a capped line count. This plugin sets no line limit, so it does not occur here. |
 | `CONSTRAINED` | PARTIAL | `services:output_truncated` | Linux/macOS `list`/`running`: the captured output hit the runner's byte cap but the tool itself exited cleanly |
 | `CONSTRAINED` | PARTIAL | `services:malformed_launchctl_capture` | macOS `list`/`running`: `launchctl list` exited cleanly but its output has no lines or no `PID\tStatus\tLabel` header. No `svc\|` rows are emitted, so a failed read is distinguishable from a host with nothing running. Reported only when no runner failure has already set a status. |
+| `CONSTRAINED` | PARTIAL | `services:start_mode_unchangeable` | Linux `set_start_mode` succeeded (exit 0, `status\|ok`) but the unit's `systemctl is-enabled` state is `static`, `indirect`, `alias` or `generated`: `systemctl` cannot enable or disable such a unit, so the requested mode does not change whether it starts at boot. `state\|` and `note\|` lines say which. |
 | `PERMISSION_DENIED` | UNKNOWN | `services:privilege_unavailable` | Linux `set_start_mode` from a non-root agent: the root-owned validator `/usr/libexec/yuzu/yuzu-systemctl` (written and granted by `scripts/install-agent-user.sh`) is missing or not root-owned and non-writable. The action refuses and never falls back to `sudo systemctl`. On a dev/UAT host re-run `scripts/install-agent-user.sh`; the packaged unit has no such step (it is non-root with `NoNewPrivileges`), so there the action is permanently unavailable. A root agent (a manual root launch) runs `systemctl` directly and does not need it. The packaged unit runs as the non-root `yuzu-agent` with `NoNewPrivileges`, so on it `set_start_mode` is always `privilege_unavailable`. |
 
 ### Where the data goes
@@ -174,7 +177,7 @@ Rows are pipe-delimited, prefixed `svc|`, one per service. The row **shape** dif
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 796b8a311657
+**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash pending
 
 ```
 == action=list
@@ -215,7 +218,7 @@ error|missing required parameter: name
 [rc] 1
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 796b8a311657
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash pending
 
 ```
 == action=list
@@ -256,7 +259,7 @@ error|missing required parameter: name
 [rc] 1
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash 796b8a311657
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash pending
 
 ```
 == action=list
