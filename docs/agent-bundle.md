@@ -343,10 +343,13 @@ the digest form from "Use it (partner)"; `DIGEST` is resolved with the same
 cosign verify "ghcr.io/<owner>/yuzu-agent-bundle-chisel@${DIGEST}" \
   --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
   --certificate-identity='https://github.com/<signer>/.github/workflows/release.yml@refs/tags/v<version>'
-gh attestation verify "oci://ghcr.io/<owner>/yuzu-agent-bundle-chisel@${DIGEST}" --repo <owner>/Yuzu
+gh attestation verify "oci://ghcr.io/<owner>/yuzu-agent-bundle-chisel@${DIGEST}" \
+  --repo <signer> \
+  --signer-workflow <signer>/.github/workflows/release.yml \
+  --source-ref refs/tags/v<version>
 ```
 
-`<signer>` is the repository that ran `release.yml` for that tag (`DevNullLtd/Yuzu` since the 2026-09-28 move, `Tr3kkR/Yuzu` before it); the identity is an exact, tag-bound match, and `<owner>` is the registry owner.
+`<signer>` is the repository that ran `release.yml` for that tag (`DevNullLtd/Yuzu` since the 2026-09-28 move, `Tr3kkR/Yuzu` before it); the identity is an exact, tag-bound match, and `<owner>` is the registry owner. `--signer-workflow` and `--source-ref` bind the provenance to `release.yml` at that tag (`--repo` alone accepts an attestation from any workflow in the repository); they need gh 2.102.0 or later, because older versions match `--signer-workflow` by prefix and `--source-ref` case-insensitively ([Release verification](user-manual/release-verification.md), section 4).
 
 (Manual off-cycle builds via `scripts/build-agent-bundle.sh` are *not* image-signed
 — only the CI job signs. Prefer the released, CI-published image for partners.)
