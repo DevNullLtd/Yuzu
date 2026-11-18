@@ -10774,3 +10774,50 @@ tests:
       - expr: 'ALERTS{alertname="YuzuCrlSourceResolverBusy", alertstate=~"firing|pending"}'
         eval_time: 17m
         exp_samples: []
+
+  # ── YuzuServerMetricsScrapeDown (WP06 /metrics opt-in) ────────────────────
+  #
+  # CASE - a scrape that fails for 5 minutes fires (a job sending no credential reads 401, so
+  # `up` is 0). RED if the comparison is inverted, `for:` is dropped, or the job label drifts
+  # from the shipped prometheus.yml's `yuzu-server`.
+  - interval: 1m
+    name: metrics scrape down - sustained up==0 fires
+    input_series:
+      - series: 'up{job="yuzu-server",instance="s1"}'
+        values: "1x3 0x10"
+      - series: 'up{job="yuzu-server",instance="s2"}'
+        values: "1x13"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuServerMetricsScrapeDown", alertstate="firing"}'
+        eval_time: 12m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuServerMetricsScrapeDown", alertstate="firing", instance="s1", job="yuzu-server", severity="critical"}'
+            value: 1
+
+  # CASE - a one-scrape blip stays quiet, and the gateway job is not this rule's business.
+  - interval: 1m
+    name: metrics scrape down - a blip and other jobs stay quiet
+    input_series:
+      - series: 'up{job="yuzu-server",instance="s1"}'
+        values: "1x5 0 1x10"
+      - series: 'up{job="yuzu-gateway",instance="g1"}'
+        values: "0x15"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuServerMetricsScrapeDown"}'
+        eval_time: 12m
+        exp_samples: []
+
+  # ── YuzuAgentPluginMetaDropped ────────────────────────────────────────────
+  - interval: 1m
+    name: plugin meta dropped - an increase fires per field, a flat counter stays quiet
+    input_series:
+      - series: 'yuzu_server_agent_registry_plugin_meta_dropped_total{job="yuzu-server",instance="s1",field="name"}'
+        values: "0x5 3x10"
+      - series: 'yuzu_server_agent_registry_plugin_meta_dropped_total{job="yuzu-server",instance="s1",field="version"}'
+        values: "0x15"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuAgentPluginMetaDropped", alertstate="firing"}'
+        eval_time: 10m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuAgentPluginMetaDropped", alertstate="firing", field="name", severity="warning"}'
+            value: 1

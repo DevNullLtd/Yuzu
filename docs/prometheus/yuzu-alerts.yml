@@ -2596,14 +2596,13 @@ groups:
             is down, but this rule only fires once Prometheus manages to scrape
             /metrics. Do not rely on it to page DURING a full database outage:
             a remote scrape of the authenticated /metrics resolves its session
-            or API token against Postgres (it can fail, except for a localhost
-            scrape, --metrics-no-auth, or a still-cached token) and the
+            or API token against Postgres (it can fail, except under --metrics-no-auth, a direct
+            loopback scrape with --metrics-trust-loopback, or a still-cached token) and the
             handler itself reads Postgres. YuzuServerPostgresUnreachable and
             YuzuPgConnectFailing need a working scrape too, so they are not an
             honest backstop for a TOTAL outage either; the backstops for that
-            case are the /readyz readiness probe and an operator-defined
-            `up == 0` (scrape target down) alert on the server job (none
-            ships in this file). This rule then fires after recovery from the
+            case are the /readyz readiness probe and an `up == 0` (scrape target down)
+            alert on the server job (YuzuServerMetricsScrapeDown, group yuzu-metrics-scrape). This rule then fires after recovery from the
             increase over the gap, or at once when the fault is partial. If
             the audit store is down as well, the audit row of a mutating
             request's 503 (scim.user.provisioned, scim.user.updated,
@@ -8960,3 +8959,46 @@ groups:
             yuzu_server_revocation_source_resolver_in_flight: a value of 16 means every slot is
             in use.
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#registering-a-crl-source"
+  - name: yuzu-metrics-scrape
+    # /metrics requires authentication from every peer unless the server runs with
+    # --metrics-no-auth or the opt-in --metrics-trust-loopback. A scrape job that sends no
+    # credential is then answered 401, so `up` reads 0 and every other yuzu_* alert in this file
+    # reads ABSENT, which is silence, not health. This rule is the one that says so.
+    rules:
+      - alert: YuzuServerMetricsScrapeDown
+        # `up == 0` for the server job: the scrape failed (401 for a missing or rejected token, a
+        # refused connection, a timeout). A scrape target that vanished from service discovery
+        # does not produce `up == 0` at all; pair it with an absent() alert in a deployment that
+        # uses dynamic discovery.
+        expr: |
+          up{job="yuzu-server"} == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Prometheus cannot scrape the Yuzu server /metrics on {{ $labels.instance }}"
+          description: >-
+            up{job="yuzu-server"} has been 0 on {{ $labels.instance }} for 5 minutes. Every other
+            yuzu_* alert reads absent while this fires. Check the scrape job's credential first:
+            /metrics answers 401 unless the request carries a valid bearer token (an API token of
+            any principal), or the server runs with --metrics-no-auth or --metrics-trust-loopback.
+            deploy/prometheus/prometheus.yml shows the `authorization` block.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/metrics.md#get-metrics"
+      - alert: YuzuAgentPluginMetaDropped
+        # Registration dropped an agent-reported plugin name, version, description or action (or
+        # a plugin entry beyond the per-agent cap) because it fell outside its bound. A healthy
+        # fleet reports nothing out of bounds, so any increase means an agent build or an endpoint
+        # is reporting malformed plugin metadata.
+        expr: |
+          sum by (field) (increase(yuzu_server_agent_registry_plugin_meta_dropped_total[1h])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Agents reported plugin metadata outside its bounds (field {{ $labels.field }})"
+          description: >-
+            yuzu_server_agent_registry_plugin_meta_dropped_total{field="{{ $labels.field }}"}
+            increased in the last hour: an agent's registration carried a plugin name, version,
+            description, action or plugin entry beyond its bound and it was dropped (never
+            truncated). The plugin catalogue is unaffected; find the agent in the server log
+            line "dropping".
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/metrics.md"

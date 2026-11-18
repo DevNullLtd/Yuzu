@@ -80,6 +80,7 @@ start_all() {
         --listen 0.0.0.0:50051 \
         --gateway-upstream 0.0.0.0:50055 \
         --insecure-gateway-peer \
+        --metrics-no-auth \
         --web-port 8080 \
         2>&1 &
     disown

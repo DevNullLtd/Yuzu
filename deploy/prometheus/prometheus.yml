@@ -14,6 +14,15 @@ scrape_configs:
   # Yuzu Server — exposes server + fleet-aggregated agent metrics
   - job_name: 'yuzu-server'
     metrics_path: '/metrics'
+    # /metrics requires authentication from every peer, loopback included, unless the server runs
+    # with --metrics-no-auth or --metrics-trust-loopback. Put an API token (any principal; it
+    # needs no permission) in this file, readable only by the Prometheus user:
+    #   authorization: { type: Bearer, credentials_file: /etc/prometheus/yuzu-metrics-token }
+    # Without a credential the scrape is answered 401, `up` is 0 and the YuzuServerMetricsScrapeDown
+    # alert fires. Remove this block only on a rig started with --metrics-no-auth.
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/yuzu-metrics-token
     static_configs:
       - targets: ['localhost:8080']
         labels:
