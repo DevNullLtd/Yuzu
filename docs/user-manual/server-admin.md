@@ -229,7 +229,7 @@ targets, Directory Read for directory sync), so a fragment is never wider than i
   a delivery history. You can create and delete a webhook; the create confirmation names the
   destination host and the data the chosen events carry. A destination with embedded
   `user:password@`, or with control characters in the URL or event types, is refused. The
-  signing secret is write-only. There is no restriction on the destination address, and the
+  signing secret is write-only. Link-local, cloud-metadata, unspecified, multicast and reserved addresses are refused, including numeric spellings; loopback and private ranges are not refused (see [upgrading](upgrading.md)). The
   confirmation is a click-through, not an approval step.
 - **Offload targets** lists the targets (destination host, events, batch size, last delivery),
   opens a delivery history, and creates and deletes targets under the same rules. The credential

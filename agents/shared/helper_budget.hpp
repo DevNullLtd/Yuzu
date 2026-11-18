@@ -25,8 +25,9 @@ inline constexpr const char* kHashUnavailableTimeout = "hash_unavailable:timeout
 inline constexpr const char* kHashUnavailableSkipped = "hash_unavailable:skipped";
 
 /// The causes a row may carry after `hash_unavailable:`: `timeout` and `skipped` come from a bounded
-/// helper, `not_examined` from a policy refusal, `not_regular`, `too_large`, `access_denied` and
-/// `unreadable` from the open and read. A leg emits only the causes it can tell apart (README).
+/// helper, and the Windows `procfetch` leg adds `not_examined` (a policy refusal), `not_regular`
+/// and `unreadable` (the open or read failed). No leg emits `too_large` or `access_denied` today.
+/// A leg emits only the causes it can tell apart (its README).
 inline constexpr const char* kHashUnavailablePrefix = "hash_unavailable:";
 [[nodiscard]] inline std::string hash_unavailable(std::string_view cause) {
     return std::string{kHashUnavailablePrefix}.append(cause);

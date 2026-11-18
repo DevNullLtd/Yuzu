@@ -119,6 +119,53 @@ struct CommandCapability {
     std::string_view param_escalation_securable{};
 };
 
+/// The ONE well-formedness rule for dispatch parameters (sg10, UP-1). A parameter KEY must hold no
+/// byte below 0x20 and no 0x7F and be valid UTF-8; a VALUE must hold no NUL. The agent hands every
+/// key to a plugin as a C string and the SDK compares C strings, so a key `targets\0x` is read by
+/// the plugin as `targets` while a server-side exact `find("targets")` misses it: a gate keyed on a
+/// parameter name would be silently bypassed. Rejecting (never truncating) such a key at every
+/// ingress and at the chokepoint closes that split. EXTEND this function; never fork a second one.
+[[nodiscard]] inline bool parameter_key_well_formed(std::string_view key) noexcept {
+    std::size_t i = 0;
+    const std::size_t n = key.size();
+    while (i < n) {
+        const auto c = static_cast<unsigned char>(key[i]);
+        if (c < 0x20 || c == 0x7F)
+            return false;
+        std::size_t len = 1;
+        if (c >= 0x80) {
+            if (c >= 0xC2 && c <= 0xDF)
+                len = 2;
+            else if (c >= 0xE0 && c <= 0xEF)
+                len = 3;
+            else if (c >= 0xF0 && c <= 0xF4)
+                len = 4;
+            else
+                return false;
+            if (i + len > n)
+                return false;
+            for (std::size_t k = 1; k < len; ++k)
+                if ((static_cast<unsigned char>(key[i + k]) & 0xC0) != 0x80)
+                    return false;
+            const auto c1 = static_cast<unsigned char>(key[i + 1]);
+            if ((c == 0xE0 && c1 < 0xA0) || (c == 0xED && c1 > 0x9F) ||
+                (c == 0xF0 && c1 < 0x90) || (c == 0xF4 && c1 > 0x8F))
+                return false;
+        }
+        i += len;
+    }
+    return true;
+}
+
+[[nodiscard]] inline bool
+parameters_well_formed(const std::unordered_map<std::string, std::string>& parameters) noexcept {
+    for (const auto& [k, v] : parameters) {
+        if (!parameter_key_well_formed(k) || v.find('\0') != std::string::npos)
+            return false;
+    }
+    return true;
+}
+
 /// The ONE rule for a row's parameter-dependent securable (sg10). Returns
 /// `param_escalation_securable` when the row declares an escalation AND `parameters` carries a
 /// NON-EMPTY value (whitespace counts as non-empty, a non-string value arrives already stringified
@@ -126,13 +173,17 @@ struct CommandCapability {
 /// `parameters == nullptr` = the caller cannot know them: the row's own securable (the escalation
 /// is then NOT evaluated). Used by BOTH `classify_and_authorize_dispatch` (send) and
 /// `schedule_arming_permitted` (schedule/outbox arming) so the two can never judge a dispatch
-/// under different securables, and a `DispatchCaller{.system = true}` dispatch (which skips the
-/// permission check) is still gated by the arming principal's own grant.
+/// under different securables.
 [[nodiscard]] inline std::string_view
 effective_securable(const CommandCapability& cap,
                     const std::unordered_map<std::string, std::string>* parameters) {
     if (parameters != nullptr && !cap.param_escalation_key.empty() &&
         !cap.param_escalation_securable.empty()) {
+        // A malformed parameter set is never truncated or ignored: it is judged under the
+        // escalated (stricter) securable, and the callers additionally DENY it outright
+        // (`parameters_well_formed`).
+        if (!parameters_well_formed(*parameters))
+            return cap.param_escalation_securable;
         if (const auto it = parameters->find(std::string(cap.param_escalation_key));
             it != parameters->end() && !it->second.empty())
             return cap.param_escalation_securable;

@@ -1504,6 +1504,8 @@ TEST_CASE("ioc: a timeout (which includes a throwing helper) and a refused helpe
     CHECK(good.exists);
 }
 
+// The mountinfo-text constructor is a POSIX-only test seam (local_path_policy.hpp).
+#if defined(__linux__) || defined(__APPLE__)
 TEST_CASE("local_path: a guard built from a mountinfo table refuses a path under a network mount",
           "[shared][local_path][disk_space]") {
     // The deterministic form of the disk_space refusal: the plugin refuses before any statvfs.
@@ -1514,3 +1516,4 @@ TEST_CASE("local_path: a guard built from a mountinfo table refuses a path under
     CHECK_FALSE(lp::refused(guard.refusal("/mnt/sharex")));
     CHECK_FALSE(lp::refused(guard.refusal("/")));
 }
+#endif

@@ -15,6 +15,7 @@
 /// (CR/LF/NUL would split an audit row). Existing rows are not rewritten.
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <optional>
 #include <string>
@@ -23,6 +24,14 @@
 #include <openssl/sha.h>
 
 namespace yuzu::server {
+
+/// Bounds on the connect fallback shared by webhook and offload-target delivery (PERF-1): a name
+/// that resolves to many vetted addresses is tried at most `kMaxDeliveryConnectAddresses` of them,
+/// and no new attempt starts once `kDeliveryConnectBudget` has elapsed since the first, so one
+/// unreachable receiver cannot hold a delivery worker for N x the 5 s connect timeout (the worker
+/// pool is shared by every webhook / target). Each attempt still has its own 5 s connect timeout.
+inline constexpr std::size_t kMaxDeliveryConnectAddresses = 4;
+inline constexpr std::chrono::seconds kDeliveryConnectBudget{20};
 
 /// True if `s` contains any byte below 0x20 or DEL.
 [[nodiscard]] inline bool url_has_control_bytes(std::string_view s) noexcept {

@@ -4722,6 +4722,13 @@ test('windows etw cleanup wiring lexical gate',
   suite: 'docs',
   timeout: 30,
 )
+# sg10: both server.cpp arming_check lambdas forward `parameters` (source-text only; in-file selftest).
+test('arming parameter wiring lexical gate',
+  _python3_test,
+  args: [files('test_arming_param_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
 test('same-site gate production wiring lexical selftest',
   _python3_test,
   args: [files('test_same_site_wiring_lexical_selftest.py')],

@@ -19060,7 +19060,7 @@ TEST_CASE("MCP transport body cap admits a maximal execute_instruction and clamp
     // size so adding a reason without documenting it fails here rather than
     // shipping an undocumented label.
     INFO("adding a reason? update docs/user-manual/metrics.md and this count");
-    CHECK(kExecInstrBoundReasons.size() == 14); // +target_conflict (#2500)
+    CHECK(kExecInstrBoundReasons.size() == 15); // +target_conflict (#2500), +param_key_invalid (sg10)
 }
 
 // ── 26d. Schema <-> handler-constant cross-check (#2437) ─────────────────
@@ -44455,6 +44455,32 @@ TEST_CASE("MCP B5: all 14 new tools are advertised in tools/list", "[mcp][integr
 }
 
 // ── Offload targets ─────────────────────────────────────────────────────────
+
+TEST_CASE("MCP B5: create_offload_target refuses a link-local / metadata destination "
+          "(-32602, destination_refused audit row)",
+          "[pg][mcp][integration][b5][security]") {
+    yuzu::test::OffloadTargetStorePg store;
+    McpTestServer ts;
+    ts.offload_target_store_for_test = store.get();
+    ts.start();
+    int id = 0;
+    for (const char* url : {"http://169.254.169.254/latest", "http://2852039166/x"}) {
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":)" + std::to_string(++id) +
+            R"(,"params":{"name":"create_offload_target","arguments":{"name":"meta","url":")" +
+            std::string(url) + R"(","auth_type":"none"}}})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        bool saw = false;
+        for (std::size_t k = 0; k < ts.audit_log.size(); ++k)
+            if (ts.audit_log[k] == "offload_target.create|denied" &&
+                ts.audit_details[k] == "destination_refused")
+                saw = true;
+        CHECK(saw);
+    }
+}
 
 TEST_CASE("MCP B5: offload-target CRUD lifecycle over a LIVE store — "
           "list/create/get/list_offload_target_deliveries/delete",

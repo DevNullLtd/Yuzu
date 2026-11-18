@@ -2083,3 +2083,33 @@ TEST_CASE("ScheduleRunner: the arming check receives the schedule's decoded para
     CHECK(seen.at("targets") == "https://wsus.example.test/");
     CHECK(seen.at("n") == "3"); // a non-string value arrives as its JSON text
 }
+
+TEST_CASE("ScheduleRunner: stored parameters that do not decode deny the arming, never arm on a "
+          "guess",
+          "[schedule][runner][sg10][pg]") {
+    // create_schedule refuses such text, so the row is planted directly (a legacy row, or one
+    // written by another path): the fire must deny, not hold, never ask the arming check, and
+    // never enqueue.
+    for (const std::string bad : {std::string("[1,2]"), std::string("{not json"),
+                                  std::string(R"({"targets\u0000x":"h"})"),
+                                  std::string(R"({"targets\u0001":"h"})")}) {
+        bool asked = false;
+        Harness h([&asked](const std::string&, const std::string&, const std::string&,
+                           const std::unordered_map<std::string, std::string>&) {
+            asked = true;
+            return true;
+        });
+        auto id = h.make_due("test.def", "interval");
+        std::string quoted;
+        for (char c : bad)
+            quoted += (c == '\'') ? std::string("''") : std::string(1, c);
+        h.exec_sql("UPDATE schedule_engine.schedules SET parameter_values = '" + quoted +
+                   "' WHERE id = '" + id + "'");
+
+        h.runner.tick();
+
+        CHECK_FALSE(asked);
+        CHECK(h.enqueues.empty());
+        CHECK(h.get(id).next_execution_at > 1); // advanced: a poisoned row must not spin
+    }
+}

@@ -1,8 +1,8 @@
 // sg10: the schedule/outbox arming check judges the parameter-escalated securable
 // (windows_updates.patch_connectivity + `targets` -> Infrastructure:Read), through the same
-// `effective_securable` rule the send chokepoint uses. A scheduled or queued command fires as a
-// system caller whose chokepoint check does not re-ask the arming principal's grant, so the
-// arming check is where an operator holding only SoftwareDeployment:Read is stopped.
+// `effective_securable` rule the send chokepoint uses. A scheduled or queued command fires as the
+// arming principal's re-resolved caller; the arming check stops an operator holding only
+// SoftwareDeployment:Read at fire and at delivery, before any send.
 
 #include "capability_decls/plugin_action_catalogue_d.hpp"
 #include "command_capability.hpp"
@@ -75,4 +75,8 @@ TEST_CASE("arming: patch_connectivity targets need Infrastructure:Read at arming
     REQUIRE(listy.has_value());
     CHECK_FALSE(arm("sd", *listy));
     CHECK(arm("both", *listy));
+    // UP-1: a NUL-suffixed key is never armed, whatever grants the principal holds.
+    const P evil{{std::string("targets\0x", 9), "10.0.0.1"}};
+    CHECK_FALSE(arm("sd", evil));
+    CHECK_FALSE(arm("both", evil));
 }

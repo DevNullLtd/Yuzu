@@ -1750,3 +1750,27 @@ TEST_CASE("CommandOutboxDelivery[pg]: the arming check receives the row's decode
     CHECK(probe.calls == 0);
     CHECK(fx.raw_state("occ-sg10") == "failed");
 }
+
+// sg10 / UP-1: stored parameters that do not decode (or hold a key the agent would truncate) never
+// reach a dispatch: the row fails permanently with no send.
+TEST_CASE("CommandOutboxDelivery[pg]: undecodable stored parameters fail the row, no dispatch",
+          "[command_outbox][pg][delivery][sg10]") {
+    int n = 0;
+    for (const std::string bad : {std::string("[1,2]"), std::string("{not json"),
+                                  std::string(R"({"targets\u0000x":"h"})"),
+                                  std::string(R"({"a\u0007b":"h"})")}) {
+        DeliveryPg fx;
+        const std::string occ = "occ-sg10-bad-" + std::to_string(n++);
+        auto r = fx.req(occ, "cmd-" + occ);
+        r.parameters = bad;
+        REQUIRE(fx.store().claim_and_enqueue(r, fx.lock(), fx.epoch()) ==
+                OutboxEnqueueOutcome::Enqueued);
+
+        DispatchProbe probe;
+        auto loop = fx.make_delivery(probe, /*arming_allow=*/true);
+        loop.tick();
+
+        CHECK(probe.calls == 0);
+        CHECK(fx.raw_state(occ) == "failed");
+    }
+}

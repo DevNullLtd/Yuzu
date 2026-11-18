@@ -63,7 +63,7 @@ inline constexpr ResolverPoolMetricNames kDeliveryResolverMetrics{
     "yuzu_server_delivery_resolver_lookups_total",
     "Name lookups outstanding in the resolver pool webhook and offload-target delivery uses, "
     "published every 15 s; a value at the pool's cap means a delivery whose destination host must "
-    "be resolved is declined (destination_unresolved) until lookups return",
+    "be resolved is declined (destination_resolver_busy) until lookups return",
     "Slots in the resolver pool webhook and offload-target delivery uses, published every 15 s",
     "Name lookups made through the webhook and offload-target delivery resolver pool, by outcome: "
     "ok, not_found, temporary, timeout, busy (the pool was full or a worker could not be started). "

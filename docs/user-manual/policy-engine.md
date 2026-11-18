@@ -94,6 +94,10 @@ spec:
 
 ---
 
+### Parameters that need an extra grant
+
+A policy check or remediation is dispatched by the server itself, with no operator behind the dispatch. A parameter that makes an action need a different permission (today only `windows_updates.patch_connectivity` with a non-empty `targets`, which needs `Infrastructure:Read`) is therefore refused for a policy fragment: the dispatch is denied, no agent runs the check, and after the grace window every target reads `unknown` on each interval (the denial is visible as `yuzu_server_dispatch_denied_total{reason="forbidden"}` and a server warning, not as a per-target error). Use the action's default targets in a policy fragment, or run the probe as an operator-initiated command.
+
 ## Policies
 
 A Policy binds a fragment to devices, defining when and where compliance

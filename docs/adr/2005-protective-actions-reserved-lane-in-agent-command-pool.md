@@ -41,6 +41,7 @@ must not be starvable by ordinary commands. The agent command pool therefore has
 
 ## What this does NOT establish
 
+- **Pool teardown is not covered.** The reserved lane governs worker admission while a pool is running. It does not cover pool teardown: when the stream drops the agent destroys the pool and drains every queued task (a task sleeping on a stagger or delay of up to 600 s included) before it reconnects, so a quarantine or `__guard__.push_rules` dispatched in that window is delivered only after the drain ends (tracked in #8247).
 - **Independence is asserted, not verified.** The reserve guarantees a WORKER is available to a
   protective command. It does not prove the protective action's own blocking calls (a firewall
   backend, a resolver, the filesystem it touches) are independent of whatever stalled the ordinary

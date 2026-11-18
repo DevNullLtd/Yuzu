@@ -275,8 +275,8 @@ std::string read_file_contents(const std::filesystem::path& p) {
 using SubscribeStream = grpc::ClientReaderWriter<pb::CommandResponse, pb::CommandRequest>;
 
 // Command pool shape (ADR-2005): the queue depth every lane uses (the ThreadPool default), and the
-// number of workers held back for PROTECTIVE actions so containment cannot be starved by stuck
-// ordinary commands. Both pool construction sites use these two names.
+// number of workers held back for PROTECTIVE actions so stuck ordinary commands do not take the
+// last worker (not a completion guarantee: ADR-2005 "What this does NOT establish"). Both pool construction sites use these two names.
 constexpr std::size_t kCommandQueueDepth = 1000;
 constexpr std::size_t kReservedProtectiveWorkers = 1;
 
@@ -4482,6 +4482,28 @@ private:
         // Direct construction: single vector of YuzuParam pointing at proto map
         // entries (no intermediate string copies — proto owns the data).
         const auto& proto_params = cmd.parameters();
+        // Defence in depth (sg10 / UP-1): a key or value with an embedded NUL would be truncated by
+        // `c_str()` and read by a plugin as a different name (`targets\0x` as `targets`), which would
+        // step around a server gate keyed on the parameter name. The server refuses such a
+        // parameter at every ingress; the agent refuses it too, before any plugin sees it.
+        for (const auto& [k, v] : proto_params) {
+            if (k.find('\0') == std::string::npos && v.find('\0') == std::string::npos)
+                continue;
+            spdlog::warn("Command {} refused: a parameter key or value holds a NUL byte",
+                         cmd.command_id());
+            pb::CommandResponse refused;
+            refused.set_command_id(cmd.command_id());
+            refused.set_status(pb::CommandResponse::REJECTED);
+            refused.set_output("command refused: a parameter holds a NUL byte");
+            refused.mutable_sent_at()->set_millis_epoch(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch())
+                    .count());
+            record_command_terminal(cmd.command_id(), refused);
+            std::lock_guard lock(stream_write_mu_);
+            stream->Write(refused, grpc::WriteOptions());
+            return;
+        }
         std::vector<YuzuParam> params;
         params.reserve(proto_params.size());
         for (const auto& [k, v] : proto_params) {

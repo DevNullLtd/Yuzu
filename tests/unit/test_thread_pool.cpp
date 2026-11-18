@@ -237,3 +237,28 @@ TEST_CASE("ThreadPool: the reservation never leaves zero workers for ordinary ta
         REQUIRE(pool.submit([&] { ++done; }));
     CHECK(spin_until([&] { return done.load() == 10; }));
 }
+
+TEST_CASE("ThreadPool: destroying a pool with reserved >= 2 mid-queue drains and joins (no hang)",
+          "[thread_pool][protective]") {
+    // 4 workers, 3 reserved: ONE ordinary task runs at a time, the rest wait and three workers
+    // sleep. The destructor sets stop and joins: the last completion must wake EVERY sleeping worker
+    // (with a single notify_one per completion two of them sleep forever and the join hangs).
+    for (int round = 0; round < 3; ++round) {
+        auto done = std::make_shared<std::atomic<bool>>(false);
+        std::thread t([done] {
+            {
+                ThreadPool pool(4, 1000, /*reserved_protective=*/3);
+                for (int i = 0; i < 6; ++i)
+                    pool.submit([] { std::this_thread::sleep_for(std::chrono::milliseconds(20)); });
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            } // ~ThreadPool blocks here until the queue drains
+            *done = true;
+        });
+        const bool finished = spin_until([&] { return done->load(); }, std::chrono::seconds(10));
+        if (finished)
+            t.join();
+        else
+            t.detach(); // a hang is the failure being reported; do not hang the runner on top of it
+        CHECK(finished);
+    }
+}

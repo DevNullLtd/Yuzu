@@ -8,10 +8,12 @@
 #include "capability_decls/plugin_action_catalogue_d.hpp"
 #include "command_capability.hpp"
 #include "dispatch_caller.hpp"
+#include "mcp_input_bounds.hpp"
 #include "schedule_arming_check.hpp"
 #include "schedule_arming_params.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <nlohmann/json.hpp>
 
 #include <set>
 #include <string>
@@ -188,4 +190,84 @@ TEST_CASE("the capability sweep rejects a half-set escalation pair",
     static_assert(!yuzu::server::detail::all_gates_specified(kHalfPair));
     static_assert(yuzu::server::detail::all_gates_specified(kFullPair));
     SUCCEED();
+}
+
+// ── UP-1: a parameter KEY the agent would truncate must never step around the escalation ─────
+// The agent hands every key to a plugin as a C string and the SDK compares C strings, so the key
+// "targets\0x" is read by the plugin as `targets`; an exact server-side lookup misses it.
+
+TEST_CASE("parameter_key_well_formed: control bytes, DEL, NUL and invalid UTF-8 are refused",
+          "[server][dispatch][security][capability][sg10]") {
+    using yuzu::server::parameter_key_well_formed;
+    CHECK(parameter_key_well_formed("targets"));
+    CHECK(parameter_key_well_formed(""));
+    CHECK(parameter_key_well_formed("caf\xC3\xA9"));              // valid 2-byte
+    CHECK(parameter_key_well_formed("\xE2\x82\xAC"));             // valid 3-byte
+    CHECK(parameter_key_well_formed("\xF0\x9F\x98\x80"));         // valid 4-byte
+    CHECK_FALSE(parameter_key_well_formed(std::string("targets\0x", 9)));
+    CHECK_FALSE(parameter_key_well_formed(std::string("\0", 1)));
+    CHECK_FALSE(parameter_key_well_formed("a\tb"));
+    CHECK_FALSE(parameter_key_well_formed("a\nb"));
+    CHECK_FALSE(parameter_key_well_formed("a\x7F"));
+    CHECK_FALSE(parameter_key_well_formed("\xC0\x80"));           // overlong NUL
+    CHECK_FALSE(parameter_key_well_formed("\xFF"));
+    CHECK_FALSE(parameter_key_well_formed("\xE2\x82"));           // truncated sequence
+    CHECK_FALSE(parameter_key_well_formed("\xED\xA0\x80"));       // surrogate
+    CHECK_FALSE(parameter_key_well_formed("\xF4\x90\x80\x80"));   // above U+10FFFF
+    CHECK(yuzu::server::parameters_well_formed(Params{{"a", "b"}}));
+    CHECK_FALSE(yuzu::server::parameters_well_formed(Params{{"a", std::string("b\0c", 3)}}));
+}
+
+TEST_CASE("UP-1 repro: a NUL-suffixed `targets` key is a denial at the chokepoint, never a bypass",
+          "[server][dispatch][security][capability][sg10]") {
+    auto reg = registry();
+    const Params evil{{std::string("targets\0x", 9), "10.0.0.1"}};
+    Grants sd_only{{"SoftwareDeployment"}};
+    // The pre-fix behaviour: exact find("targets") misses, so the dispatch was admitted under
+    // SoftwareDeployment while the plugin read `targets`.
+    auto no = classify_and_authorize_dispatch(reg, kCaller, "windows_updates", "patch_connectivity",
+                                              sd_only, &evil);
+    REQUIRE_FALSE(no.has_value());
+    CHECK(no.error().reason == DispatchDenialReason::Forbidden);
+    // Even a caller holding BOTH grants is refused: it is a malformed request, not a missing grant.
+    Grants both{{"SoftwareDeployment", "Infrastructure"}};
+    CHECK_FALSE(classify_and_authorize_dispatch(reg, kCaller, "windows_updates",
+                                                "patch_connectivity", both, &evil)
+                    .has_value());
+    // A system caller is refused too (no early return ahead of the check), and a plugin without an
+    // escalation is refused as well: the rule is about the key, not the row.
+    const DispatchCaller sys{.system = true};
+    CHECK_FALSE(classify_and_authorize_dispatch(reg, sys, "windows_updates", "patch_connectivity",
+                                                Grants{}, &evil)
+                    .has_value());
+    CHECK_FALSE(classify_and_authorize_dispatch(reg, kCaller, "windows_updates", "installed", both,
+                                                &evil)
+                    .has_value());
+    // effective_securable fails closed on its own: a malformed set is judged escalated.
+    const auto cap = *reg.classify("windows_updates", "patch_connectivity");
+    CHECK(yuzu::server::effective_securable(cap, &evil) == "Infrastructure");
+    // The arming path: stored text carrying the key decodes to a denial (nullopt).
+    CHECK_FALSE(yuzu::server::decode_arming_parameters(R"({"targets\u0000x":"10.0.0.1"})").has_value());
+    CHECK_FALSE(yuzu::server::decode_arming_parameters(R"({"targets\u0007":"h"})").has_value());
+    // A well-formed `targets` still behaves as before.
+    const Params ok{{"targets", "h"}};
+    CHECK(classify_and_authorize_dispatch(reg, kCaller, "windows_updates", "patch_connectivity", both,
+                                          &ok)
+              .has_value());
+}
+
+TEST_CASE("UP-1: the MCP/REST input bound refuses a malformed params key or a NUL value",
+          "[server][dispatch][security][mcp][sg10]") {
+    using yuzu::server::mcp::check_exec_instruction_shape;
+    nlohmann::json a = {{"plugin", "windows_updates"}, {"action", "patch_connectivity"}};
+    a["params"] = nlohmann::json::object();
+    a["params"][std::string("targets\0x", 9)] = "10.0.0.1";
+    auto v = check_exec_instruction_shape(a);
+    REQUIRE(v.has_value());
+    CHECK(std::string(v->reason) == "param_key_invalid");
+    nlohmann::json b = {{"plugin", "p"}, {"action", "a"}};
+    b["params"] = {{"k", std::string("v\0w", 3)}};
+    REQUIRE(check_exec_instruction_shape(b).has_value());
+    nlohmann::json c = {{"plugin", "p"}, {"action", "a"}, {"params", {{"targets", "h"}}}};
+    CHECK_FALSE(check_exec_instruction_shape(c).has_value());
 }

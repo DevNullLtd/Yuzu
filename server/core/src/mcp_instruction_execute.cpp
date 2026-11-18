@@ -1,5 +1,7 @@
 #include "mcp_instruction_execute.hpp"
 
+#include "command_capability.hpp" // parameter_key_well_formed (sg10, UP-1)
+
 #include "dispatch_denial_text.hpp"
 #include "dispatch_target_shape.hpp"
 #include "mcp_jsonrpc.hpp" // kInvalidParams / kInternalError / kPermissionDenied / kTierDenied
@@ -32,6 +34,11 @@ std::optional<BoundViolation> check_args(const nlohmann::json& args) {
             return BoundViolation{"param_count", std::format("params must have at most {} keys",
                                                              kExecInstrParamCountMax)};
         for (const auto& [k, v] : p.items()) {
+            if (!yuzu::server::parameter_key_well_formed(k) ||
+                (v.is_string() && v.get_ref<const std::string&>().find('\0') != std::string::npos))
+                return BoundViolation{"param_key_invalid",
+                                      "a params key holds a control byte or invalid UTF-8, or a "
+                                      "value holds a NUL byte"};
             if (k.size() > kExecInstrParamKeyMaxLen)
                 return BoundViolation{"param_key_len", std::format("a params key exceeds {} bytes",
                                                                    kExecInstrParamKeyMaxLen)};

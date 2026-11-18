@@ -18,7 +18,9 @@
 // capacity is held back for PROTECTIVE tasks (`submit(task, /*protective=*/true)`, the caller decides
 // with `yuzu::protective::is_protective_action`). A non-protective task is only STARTED while fewer
 // than `workers - reserved_protective` non-protective tasks are running, so N-1 stuck ordinary
-// commands (with one reserved slot) can never starve a containment action; protective tasks have
+// commands (with one reserved slot) never leave a protective task without a worker while one is
+// free (no reserve between protective tasks, and the destructor still drains every queued task,
+// ADR-2005); protective tasks have
 // their own queue, taken first, and may use any worker. The invariant lives HERE, at the one place
 // a task is chosen to run, never at a caller.
 
@@ -27,10 +29,12 @@
 #include <memory>
 #include <condition_variable>
 #include <cstddef>
+#include <exception>
 #include <functional>
 #include <mutex>
 #include <queue>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <spdlog/spdlog.h>
@@ -113,15 +117,23 @@ private:
                         ThreadPool* p;
                         bool ordinary;
                         ~Done() {
+                            bool drained = false;
                             {
                                 std::lock_guard lock(p->mu_);
                                 --p->running_;
                                 if (ordinary)
                                     --p->ordinary_running_;
                                 p->publish_locked();
+                                drained = p->stop_ && p->tasks_.empty() && p->protective_tasks_.empty();
                             }
+                            // Stopping and nothing left to run: EVERY idle waiter must wake to see
+                            // it and exit (with reserved >= 2 a single notify_one can wake a worker
+                            // that goes back to sleep while the rest never learn the lanes drained,
+                            // and the destructor's join hangs).
+                            if (drained)
+                                p->cv_.notify_all();
                             // A finished ordinary task frees an ordinary slot for a waiting one.
-                            if (ordinary)
+                            else if (ordinary)
                                 p->cv_.notify_one();
                         }
                     } done{this, ordinary};

@@ -913,8 +913,11 @@ void OffloadTargetStore::deliver_single(const OffloadDeliveryTarget& tgt,
 
         // A resolved name keeps its dual-stack fallback: each vetted address (IPv4 first) is tried
         // in turn, every one of them judged above. A literal host has nothing to pin.
-        const std::vector<std::string> targets =
+        std::vector<std::string> targets =
             vetted.pinned_ips.empty() ? std::vector<std::string>{std::string{}} : vetted.pinned_ips;
+        if (targets.size() > kMaxDeliveryConnectAddresses) // PERF-1: bounded fallback
+            targets.resize(kMaxDeliveryConnectAddresses);
+        const auto connect_deadline = std::chrono::steady_clock::now() + kDeliveryConnectBudget;
         httplib::Result result;
         for (const auto& ip : targets) {
             httplib::Client cli(scheme + "://" + host_port);
@@ -933,6 +936,8 @@ void OffloadTargetStore::deliver_single(const OffloadDeliveryTarget& tgt,
             if (result.error() != httplib::Error::Connection &&
                 result.error() != httplib::Error::ConnectionTimeout)
                 break;
+            if (std::chrono::steady_clock::now() >= connect_deadline)
+                break; // total connect budget spent: no further address is tried
         }
         if (result) {
             status_code = result->status;
