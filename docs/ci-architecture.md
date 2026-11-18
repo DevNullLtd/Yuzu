@@ -484,6 +484,47 @@ to the previous release's images. The gate has no override; the naming forms
 it checks are a second copy of the builders' naming, and its header lists
 where each lives.
 
+### Windows agent runtime gates (`build-windows` job, release only)
+
+Three checks in `release.yml`'s `build-windows` job keep the Windows agent
+payloads (`yuzu-agent-windows-x64.zip` and `YuzuAgentSetup-<version>.exe`)
+self-contained. They run only on a release tag; none has run on a real tag
+yet, and the PR-time coverage is the `docs`-suite tests named below
+(`docs-lint.yml` runs the pwsh ones with `YUZU_REQUIRE_PWSH_TEST=1`).
+
+- **App-local Visual C++ runtime.** "Package archive" runs
+  `deploy/packaging/windows/stage-msvc-runtime.ps1`, which copies
+  `vcruntime140*.dll` and `msvcp140*.dll` from the runner's Visual Studio
+  redistributable directory (`VCToolsRedistDir`) into the zip's `bin` and into
+  `build-windows\msvc-runtime`, which `yuzu-agent.iss` installs into
+  `{app}\bin`. It refuses a missing required DLL, a redistributable older than
+  the toolset and, on Windows, a DLL not validly signed by Microsoft, and it
+  writes the staged DLLs and file versions to the step summary (the record of
+  which runtime a release shipped).
+- **MSVC toolset pin.** The same script refuses the release when
+  `VCToolsVersion`'s major.minor differs from
+  `deploy/packaging/windows/msvc-toolset.pin` (14.44). Agent self-update
+  replaces only `yuzu-agent.exe`, never the app-local runtime (#8219,
+  decision #8218), so an executable built by a newer toolset could need
+  runtime exports the copy on a device lacks and fail to start. Moving the
+  pin is a reviewed change that must say devices updated by OTA across it
+  also need the new installer or zip. Wee Tam's MSVC is otherwise observed,
+  not pinned, by `deploy/windows/toolchain-contract.json`.
+- **Import closure.** "Check the DLL import closure of both payloads", after
+  "Verify the agent runs from the packaged archive" and before the installer
+  is compiled, runs `scripts/ci/check-windows-payload-imports.py` over the
+  zip and over the files `yuzu-agent.iss` packs from `build-windows`: every
+  DLL a shipped `.exe` or `.dll` imports (normal and delay-load) must be in
+  that payload's `bin`, be an API set, or be an OS DLL in `System32`, except
+  the Visual C++ runtime, which counts as missing unless shipped, because the
+  runner has it installed.
+
+Pinned by `tests/test_windows_payload_imports.py` (the checker over
+synthetic PE32 and PE32+ images, the wiring and step order, and the staging
+script under pwsh) and `tests/test_agent_installer_plugin_coverage_lint.py`
+(every built plugin has an installer line or a recorded
+`; plugin-not-installed:` reason). Reference: `docs/windows-build.md`.
+
 ### Linux ELF floor gate (`scripts/ci/check-elf-floor.sh`, ADR-2003 S0)
 
 Every Linux native artifact carries the glibc / libstdc++ floor of the host
@@ -1251,6 +1292,10 @@ Actions cache service.
   `release` job and is verified there against the exact tag-bound
   `release.yml` identity before the release is created.
 - Per-platform and per-image CycloneDX and SPDX SBOMs are generated with syft.
+  The Windows agent payloads also carry Microsoft's Visual C++ runtime DLLs
+  app-local, which the Windows SBOM is not generated to list; their file versions
+  are in the `build-windows` job's step summary
+  ([Windows agent runtime gates](#windows-agent-runtime-gates-build-windows-job-release-only)).
 - Authenticode and Apple signing and notarization run only when their
   secrets are set, and skip silently otherwise. On 2026-11-17 none of
   `WINDOWS_SIGNING_CERT`, `MACOS_SIGNING_CERT` or the notarization secrets

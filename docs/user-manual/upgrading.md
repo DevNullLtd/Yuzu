@@ -11,6 +11,22 @@ A statement elsewhere on this page that a rollback, a mixed fleet or an in-place
 
 Running `dev` between releases? Some entries below describe changes on `dev` that are not in a release yet. For what a `git pull` of `dev` changed, run the repository script `python3 scripts/whats-new.py` (`--versions` for the version bumps, rebuild notes and Docker image bumps); see `changelog.d/README.md`.
 
+## Behaviour change: the Windows agent carries the Visual C++ runtime, and its installer installs five more plugins (0.16.0)
+
+This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page): every writer runs this build, and this page is not a procedure for a rolling or mixed-version upgrade.
+
+**In short.** Affected: every Windows device that runs the agent. To do: deploy Windows agents with the 0.16.0 installer or archive, and know that agent self-update (OTA) does not bring the runtime or new plugins.
+
+**What changed.**
+
+- **The Visual C++ runtime ships with the agent.** `yuzu-agent-windows-x64.zip` and `YuzuAgentSetup-<version>.exe` carry `vcruntime140*.dll` and `msvcp140*.dll` in the agent's `bin` directory, so a Windows device needs no Visual C++ Redistributable installed first. The agent uses this copy even where a Redistributable is installed, and Windows Update does not service it. See [Windows agent: Visual C++ runtime](README.md#windows-agent-visual-c-runtime).
+- **The installer installs five more plugins.** System: `browser_inventory`, `printing`, `privacy_permissions`. Network: `netprobe`. Windows: `rdp_control`. `browser_inventory` and `privacy_permissions` stay behind their server-side kill switch (off until an operator turns it on; where it is already on, a device installed with this installer answers them at once). `rdp_control`'s `set_state` can turn Remote Desktop on and open its firewall rule group (Mutating, Irreversible, admin or approval).
+- **`license_scan` is not installed by the installer.** Installing it starts the agent's daily software-licensing collection on the device with no operator action, and under ADR-3006 (decision D10) no release adds a unit that runs by default until the fleet-level setting for additions exists. The release archive still carries it.
+
+**The installer and the archive are the only routes that carry the runtime and plugins.** Agent self-update (OTA) replaces `yuzu-agent.exe` only. It neither installs nor refreshes the app-local runtime and installs no new plugin (#8219, #8218). Running the installer again, or unpacking the archive over the agent's directory, brings both.
+
+**If an agent stops reporting after an OTA update.** Repair it on the device: install the current Visual C++ 2015-2022 Redistributable (x64), or run the installer again, or unpack the archive of the same release. Until then the Windows service manager restarts the service at 60-second intervals and each start fails the same way.
+
 ## Behaviour change: verifying a release's provenance needs GitHub CLI 2.102.0 or later
 
 **What changed.** The `gh attestation verify` commands on [Release Verification](release-verification.md) now pin the attestation to `release.yml` at the release's tag (`--signer-workflow`, `--source-ref`). GitHub CLI versions before 2.102.0 do not enforce those flags as written, so the page now requires `gh` 2.102.0 or later, and its end-to-end verification script exits 1, before checking anything, when `gh` is older or reports a version it cannot read.
