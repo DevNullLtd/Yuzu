@@ -59,6 +59,42 @@ certificate at build time and cannot be restamped.
 | SPDX SBOMs | `yuzu-*.spdx.json`, including the same image set | `spdx-tools validate` |
 | SLSA provenance | `<artifact>.intoto.jsonl` per asset (also in GitHub's attestation registry) | `gh attestation verify` |
 | Docker images | `ghcr.io/${OWNER}/yuzu-{server,gateway,postgres}:<tag>` and `ghcr.io/${OWNER}/yuzu-{server,gateway,agent}-chisel:<tag>` | `cosign verify` |
+| Image vulnerability scan reports | `trivy-yuzu-{server,gateway,postgres}.{json,txt,gate.txt}` and `trivy-yuzu-{server,gateway,agent}-chisel.{json,txt,gate.txt}` (from the first release built with the pre-push scan) | `sha256sum -c SHA256SUMS`; see [below](#image-vulnerability-scan-before-publishing) |
+
+**Do not trust an image tag that has no GitHub Release.** The images are pushed and signed before the
+GitHub Release is created, and a failed publish job stops the release. So a `:X.Y.Z` tag can exist in
+GHCR, signed or not, for a version that has no GitHub Release, or whose release lacks that image's
+SBOM in `SHA256SUMS`. Use an image only when its version has a published GitHub Release and the image
+passes `cosign verify` (step 3) with the exact release identity.
+
+## Image vulnerability scan before publishing
+
+Before `release.yml` pushes an image, it scans the locally built image (by image ID) with a pinned
+Trivy and refuses to push it when the image has a **CRITICAL vulnerability that has a fix available**
+and is not an accepted finding. Accepted findings are listed in `.trivyignore.yaml` in the repository at
+the release tag, each with a package scope, a statement of why it does not apply, an expiry at most 92
+days out and the approver's GitHub login. The scan also refuses to run on a vulnerability database
+older than 72 hours. After the release, the pre-release QA workflow scans the published tags again with a
+newer database; a finding there is reported, it cannot unpublish anything.
+
+What this does **not** gate:
+
+- HIGH and lower findings, and CRITICAL findings with no fix released: they are in the report, not
+  refused.
+- The OS packages of the chiselled images (`yuzu-*-chisel`, and the agent-bundle delivery image): they
+  are built from Ubuntu package slices with no package database the scanner can read, so their OS
+  packages are not scanned at all. Each report's `.gate.txt` says `coverage: not-covered` for them.
+- PostgreSQL itself in `yuzu-postgres`: its packages come from the PostgreSQL project's repository,
+  which publishes no advisories the scanner matches, and the image holds them at the pinned minor.
+- The gateway's bundled Erlang/OTP runtime, and anything statically linked into the server and agent
+  binaries.
+
+Each release carries the reports for the six images it publishes (inside `SHA256SUMS`):
+`trivy-<image>.json` (the full report, including the image ID, the layer digests and every package),
+`trivy-<image>.txt` (the same as a table) and `trivy-<image>.gate.txt` (the Trivy version, the database
+date, the OS package count, the coverage and the result, and the check that the pushed image has the
+scanned image's layers). The reports are a point-in-time record: a vulnerability disclosed after the
+release is not in them.
 
 ## Prerequisites
 
