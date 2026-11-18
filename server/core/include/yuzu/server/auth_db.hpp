@@ -711,8 +711,9 @@ public:
     // replicas. Time-boxed (`mfa_locked_until`), never a permanent lock.
     // Reuses LockoutStatus / LockoutRecord.
 
-    /// Read the MFA failure budget. Unlike `lockout_status` the caller MUST
-    /// fail CLOSED on an error (MFA is the credential path itself).
+    /// TEST-ONLY read of the MFA failure budget (no production caller: the route path reserves
+    /// atomically through `reserve_mfa_attempt`, never reads then writes). Unlike `lockout_status`
+    /// a caller MUST fail CLOSED on an error.
     std::expected<LockoutStatus, AuthDBError> mfa_lockout_status(const std::string& username);
 
     struct MfaReservation {

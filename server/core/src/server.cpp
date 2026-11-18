@@ -4020,6 +4020,19 @@ public:
                           "--auth-mode=sso-only (the TOTP challenge still follows)",
                           "counter");
         metrics_.counter("yuzu_auth_break_glass_login_total");
+        metrics_.describe("yuzu_auth_break_glass_pending_refused_total",
+                          "Break-glass logins refused at the MFA step because the account was no "
+                          "longer armed (disarmed or the arm window ended after the password step)",
+                          "counter");
+        metrics_.counter("yuzu_auth_break_glass_pending_refused_total");
+        metrics_.describe("yuzu_auth_break_glass_arm_gate_total",
+                          "Break-glass arm-state gate outcomes that were refusals for a reason other "
+                          "than the account being unarmed: read_failed (the bounded database read "
+                          "failed) and refresh_busy (a refresh was in flight and the cache was older "
+                          "than 1 s)",
+                          "counter");
+        for (const char* r : {"read_failed", "refresh_busy"})
+            metrics_.counter("yuzu_auth_break_glass_arm_gate_total", {{"result", r}});
         // HA WS-1(1b), ADR-2002 section 5, and #4990: the dispatch-record
         // table's retention (ExecutionTracker's PG-backed command_execution
         // table: one row per dispatch carrying command_id -> plugin and

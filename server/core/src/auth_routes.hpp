@@ -1089,6 +1089,11 @@ private:
         /// kind, so an enrollment token can't be replayed at the
         /// login-challenge endpoint or vice versa.
         PendingKind kind{PendingKind::login_challenge};
+        /// The step-1 password was the ARMED break-glass account's. Step 2 re-checks the arm
+        /// state before it mints (a disarm or the end of the arm window inside the pending-token
+        /// life ends the login: the arm window authorises the sign-in, not just the password
+        /// step).
+        bool break_glass{false};
     };
     static constexpr int kMfaMaxAttemptsPerPending = 5;
     /// Hard cap on the in-memory pending-token map. `reap_mfa_pending_locked`

@@ -36,6 +36,7 @@
 #include "test_route_sink.hpp"
 #include "password_policy.hpp" // kMaxPasswordBytes
 #include "test_pbkdf2_budget_fill.hpp"
+#include "test_joining_thread.hpp"
 #include "../../../server/core/src/totp.hpp"
 #include "test_auth_db_pg_helper.hpp"
 #include <yuzu/metrics.hpp>
@@ -168,7 +169,7 @@ struct HardenedHarness {
                     .has_value());
     }
 
-    void enroll_mfa(const std::string& name) {
+    std::string enroll_mfa(const std::string& name) {
         auto init = auth_db->mfa_init_enrollment(name, "Yuzu", std::nullopt);
         REQUIRE(init.has_value());
         // Complete enrollment with a code at the current counter. These tests
@@ -179,6 +180,15 @@ struct HardenedHarness {
         std::string raw(reinterpret_cast<const char*>(bytes->data()), bytes->size());
         auto code = mfa::generate(raw, mfa::current_counter(std::chrono::system_clock::now()));
         REQUIRE(auth_db->mfa_verify_enrollment(name, code, std::nullopt).has_value());
+        return init->secret_base32;
+    }
+
+    /// A TOTP code for the secret one step after the enrolment code.
+    static std::string totp_next(const std::string& secret_b32) {
+        auto bytes = mfa::base32_decode(secret_b32);
+        REQUIRE(bytes.has_value());
+        std::string raw(reinterpret_cast<const char*>(bytes->data()), bytes->size());
+        return mfa::generate(raw, mfa::current_counter(std::chrono::system_clock::now()) + 1);
     }
 
     void arm(const std::string& name, int window_secs = 3600) {
@@ -539,7 +549,7 @@ TEST_CASE("break-glass arm-state gate: one request reads the database, the rest 
         PQexec(locker.get(), "LOCK TABLE auth.users IN ACCESS EXCLUSIVE MODE")}.ok());
     constexpr int kCallers = 8;
     std::atomic<int> done{0};
-    std::vector<std::jthread> callers;
+    std::vector<yuzu::test::JoiningThread> callers;
     for (int i = 0; i < kCallers; ++i)
         callers.emplace_back([&] {
             (void)h.auth_routes->sso_only_local_password_gate("admin");
@@ -578,7 +588,7 @@ TEST_CASE("break-glass gate: a stale armed value is never served past the TTL wh
     UsersTableLock lock(h.auth_db.dsn()); // the refresh will be stuck on this lock
     std::vector<SsoOnlyLocalGate> results(4, SsoOnlyLocalGate::kBreakGlassArmed);
     std::atomic<int> done{0};
-    std::vector<std::jthread> callers;
+    std::vector<yuzu::test::JoiningThread> callers;
     for (int i = 0; i < 4; ++i)
         callers.emplace_back([&, i] {
             results[i] = h.auth_routes->sso_only_local_password_gate("admin");
@@ -593,6 +603,8 @@ TEST_CASE("break-glass gate: a stale armed value is never served past the TTL wh
     CHECK(finished == 3);
     for (const auto r : results)
         CHECK(r == SsoOnlyLocalGate::kRefused);
+    // The refusals for "a refresh is in flight and the cache is stale" are counted.
+    CHECK(h.counter("yuzu_auth_break_glass_arm_gate_total", {{"result", "refresh_busy"}}) == 3.0);
 }
 
 TEST_CASE("break-glass gate: a stuck refresh fails closed within the bound, never parks",
@@ -603,15 +615,17 @@ TEST_CASE("break-glass gate: a stuck refresh fails closed within the bound, neve
     UsersTableLock lock(h.auth_db.dsn());
     std::promise<SsoOnlyLocalGate> p;
     auto f = p.get_future();
-    std::jthread t([&] { p.set_value(h.auth_routes->sso_only_local_password_gate("admin")); });
+    yuzu::test::JoiningThread t([&] { p.set_value(h.auth_routes->sso_only_local_password_gate("admin")); });
     // The read is bounded (lock and statement timeouts), so the gate answers on its own, REFUSING
     // although the account is armed. (Mutation: no timeouts -> it parks until the lock ends.)
     const bool in_time = f.wait_for(std::chrono::milliseconds(2000)) == std::future_status::ready;
     lock.release();
     t.join();
     CHECK(in_time);
-    if (in_time)
+    if (in_time) {
         CHECK(f.get() == SsoOnlyLocalGate::kRefused);
+        CHECK(h.counter("yuzu_auth_break_glass_arm_gate_total", {{"result", "read_failed"}}) == 1.0);
+    }
 }
 
 TEST_CASE("break-glass gate: the arm window ends locally, with no refresh, from the database clock",
@@ -634,4 +648,58 @@ TEST_CASE("break-glass gate: a disarm propagates within the cache TTL",
     REQUIRE(h.auth_db->disarm_break_glass("admin").has_value());
     std::this_thread::sleep_for(std::chrono::milliseconds(1100)); // past the 1 s TTL
     CHECK(h.auth_routes->sso_only_local_password_gate("admin") == SsoOnlyLocalGate::kRefused);
+}
+
+TEST_CASE("break-glass: a disarm or the end of the arm window between the password step and the "
+          "MFA step ends the login (uniform 401, no session)",
+          "[pg][auth][hardened][routes][fail-closed]") {
+    for (const bool window_ends : {false, true}) {
+        INFO(std::string(window_ends ? "the arm window ends" : "an operator disarms"));
+        HardenedHarness h("sso-only", "admin");
+        const auto secret = h.enroll_mfa("admin");
+        h.arm("admin", window_ends ? 2 : 3600);
+        auto step1 = h.sink.Post("/login", form({{"username", "admin"}, {"password", "adminpassword1"}}),
+                                 kFormCt);
+        REQUIRE(step1);
+        REQUIRE(step1->status == 202);
+        const auto body = nlohmann::json::parse(step1->body, nullptr, false);
+        REQUIRE_FALSE(body.is_discarded());
+        const std::string pending = body.value("mfa_pending_token", "");
+        REQUIRE_FALSE(pending.empty());
+        if (window_ends) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2300)); // past the 2 s window
+        } else {
+            REQUIRE(h.auth_db->disarm_break_glass("admin").has_value());
+        }
+        h.auth_routes->reset_break_glass_arm_cache_for_test();
+        auto step2 = h.sink.Post(
+            "/login/mfa",
+            form({{"mfa_pending_token", pending}, {"code", HardenedHarness::totp_next(secret)}}),
+            kFormCt);
+        REQUIRE(step2);
+        // The pending token + a VALID code must not mint once the account is no longer armed.
+        // (Mutation: no re-check -> 200 with a session cookie.)
+        CHECK(step2->status == 401);
+        CHECK(step2->get_header_value("Set-Cookie").empty());
+        CHECK(step2->get_header_value("Retry-After").empty());
+    }
+}
+
+TEST_CASE("break-glass: the MFA step still mints while the account stays armed",
+          "[pg][auth][hardened][routes]") {
+    HardenedHarness h("sso-only", "admin");
+    const auto secret = h.enroll_mfa("admin");
+    h.arm("admin");
+    auto step1 = h.sink.Post("/login", form({{"username", "admin"}, {"password", "adminpassword1"}}),
+                             kFormCt);
+    REQUIRE(step1);
+    REQUIRE(step1->status == 202);
+    const auto body = nlohmann::json::parse(step1->body, nullptr, false);
+    auto step2 = h.sink.Post(
+        "/login/mfa",
+        form({{"mfa_pending_token", body.value("mfa_pending_token", "")},
+              {"code", HardenedHarness::totp_next(secret)}}),
+        kFormCt);
+    REQUIRE(step2);
+    CHECK(step2->status == 200);
 }

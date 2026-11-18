@@ -27,6 +27,7 @@
 #include "pbkdf2_budget.hpp"
 #include "password_policy.hpp" // kMaxPasswordBytes
 #include "test_pbkdf2_budget_fill.hpp"
+#include "test_joining_thread.hpp"
 #include "../../../server/core/src/auth_db_sql_helpers.hpp"
 
 #include "analytics_event_store.hpp"
@@ -3680,7 +3681,7 @@ TEST_CASE("live pool of 10: unique unknown names with over-length passwords cann
     REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
     const int port = svr.bind_to_any_port("127.0.0.1");
     REQUIRE(port > 0);
-    std::jthread server_thread([&] { svr.listen_after_bind(); });
+    yuzu::test::JoiningThread server_thread([&] { svr.listen_after_bind(); });
     struct StopGuard {
         httplib::Server& s;
         ~StopGuard() { s.stop(); }
@@ -3698,7 +3699,7 @@ TEST_CASE("live pool of 10: unique unknown names with over-length passwords cann
     constexpr int kFlood = 160; // unique names: distinct stripes, no waiting, no lockout rows
     // A SINGLE probe first: it must block on the locked database (this is what proves the lock
     // really parks a request, so the later "blocked" reading has a lower bound).
-    std::jthread probe([&, port] {
+    yuzu::test::JoiningThread probe([&, port] {
         httplib::Client c("127.0.0.1", port);
         c.set_read_timeout(30, 0);
         (void)c.Post("/login", "username=over-max-probe&password=" + over,
@@ -3708,7 +3709,7 @@ TEST_CASE("live pool of 10: unique unknown names with over-length passwords cann
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
     CHECK(in_handler.load() == 1); // one probe is parked on the lock: it blocks
-    std::vector<std::jthread> flood;
+    std::vector<yuzu::test::JoiningThread> flood;
     std::atomic<int> answered{0};
     for (int i = 0; i < kFlood; ++i)
         flood.emplace_back([&, i, port] {

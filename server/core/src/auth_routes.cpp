@@ -2598,8 +2598,12 @@ SsoOnlyLocalGate AuthRoutes::sso_only_local_password_gate(const std::string& use
                                                            : SsoOnlyLocalGate::kRefused;
     }
     bool expected = false;
-    if (!bg_arm_refreshing_.compare_exchange_strong(expected, true))
+    if (!bg_arm_refreshing_.compare_exchange_strong(expected, true)) {
+        if (auto* m = auth_mgr_.metrics_registry())
+            m->counter("yuzu_auth_break_glass_arm_gate_total", {{"result", "refresh_busy"}})
+                .increment();
         return SsoOnlyLocalGate::kRefused; // a refresh is in flight and the cache is stale
+    }
     struct Done {
         std::atomic<bool>& f;
         ~Done() { f.store(false); }
@@ -2614,6 +2618,13 @@ SsoOnlyLocalGate AuthRoutes::sso_only_local_password_gate(const std::string& use
             ok = true;
             armed = bg->armed && bg->remaining_ms > 0;
             remaining_ms = bg->remaining_ms;
+        }
+        if (!ok) {
+            spdlog::warn("break-glass arm-state read failed; the gate refuses (fail closed) until a "
+                         "read succeeds");
+            if (auto* m = auth_mgr_.metrics_registry())
+                m->counter("yuzu_auth_break_glass_arm_gate_total", {{"result", "read_failed"}})
+                    .increment();
         }
     }
     std::lock_guard lk(bg_arm_mu_);
@@ -2747,9 +2758,11 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // while armed — an out-of-band host operator ran --break-glass-arm
         // within the window. A non-exempt or un-armed attempt is rejected with
         // the SAME generic 401 as a bad password (no "disabled"/"sso-only"
-        // wording, no Retry-After), so nothing in the answer tells them apart. A busy
+        // wording, no Retry-After), so status, body and headers do not tell them apart. A busy
         // break-glass lane is answered with the same generic 401 (below), so the status does
-        // not depend on the name either. verify_password (PBKDF2) is skipped for the rejected names. The one other
+        // not depend on the name either. A TIMING difference remains and is NOT closed: the
+        // first request naming the break-glass user after each cache expiry pays the arm-state
+        // read (the cache is 1 s, single flight). verify_password (PBKDF2) is skipped for the rejected names. The one other
         // residue is response TIMING: an armed break-glass user
         // runs PBKDF2 (slow) while every other username short-circuits (fast),
         // so timing can reveal that the break-glass account is currently armed
@@ -3251,6 +3264,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 entry.username = username;
                 entry.role = *role_opt;
                 entry.hash_hex = verified_hash_hex;
+                entry.break_glass = break_glass_login;
                 entry.expires_at = std::chrono::steady_clock::now() +
                                    std::chrono::seconds(cfg_.mfa_login_pending_secs);
                 mfa_pending_[pending_token] = std::move(entry);
@@ -3372,6 +3386,23 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 return;
             }
         }
+        // A break-glass login is authorised by the ARM WINDOW, not just by the password step: the
+        // pending token outlives that step (mfa_login_pending_secs), so a disarm or the end of the
+        // window in between must end the login. The gate is cached and fail-closed (a failed read
+        // is a refusal); the answer is the SAME generic 401 as every other failure here, spending
+        // nothing (no TOTP attempt, no recovery code).
+        if (entry.break_glass &&
+            sso_only_local_password_gate(entry.username) != SsoOnlyLocalGate::kBreakGlassArmed) {
+            res.status = 401;
+            res.set_content(kFailureBody(res), "application/json");
+            audit_log_for_principal(req, "mfa.login.failed", "error", entry.username,
+                                    auth::role_to_string(entry.role), "User", entry.username,
+                                    "break-glass no longer armed");
+            if (auto* m = auth_mgr_.metrics_registry())
+                m->counter("yuzu_auth_break_glass_pending_refused_total").increment();
+            return;
+        }
+
         // WP03 F15: RESERVE a durable per-account attempt BEFORE verifying (one DB statement:
         // lock check + increment). A locked account gets the SAME uniform 401 as a wrong code
         // (no lock oracle; the pending entry is already consumed); an attempt that cannot be
@@ -3552,6 +3583,19 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // or change committed since the pending /login denies this mint.
         if (mfa_verify_barrier_for_test_) // test seam, empty in production
             mfa_verify_barrier_for_test_("/login/mfa", proof);
+        // Re-check the arm state once more at the mint (the code verification took time): the
+        // window may have ended meanwhile. The same uniform 401, no session.
+        if (entry.break_glass &&
+            sso_only_local_password_gate(entry.username) != SsoOnlyLocalGate::kBreakGlassArmed) {
+            res.status = 401;
+            res.set_content(kFailureBody(res), "application/json");
+            audit_log_for_principal(req, "auth.login", "failure", entry.username,
+                                    auth::role_to_string(entry.role), "User", entry.username,
+                                    "reason=break_glass_disarmed_before_mint");
+            if (auto* m = auth_mgr_.metrics_registry())
+                m->counter("yuzu_auth_break_glass_pending_refused_total").increment();
+            return;
+        }
         auth::AuthManager::MintDenial denial = auth::AuthManager::MintDenial::kNone;
         auto token = auth_mgr_.create_local_session(entry.username, entry.role, entry.hash_hex,
                                                     proof, &denial);

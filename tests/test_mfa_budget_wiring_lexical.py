@@ -69,6 +69,18 @@ def check_routes(t):
         for tok in ("mfa_budget_note_failure(", "mfa_budget_refund("):
             if tok not in body:
                 bad.append(f"{name}: {tok} missing")
+        if name == "/login/mfa":
+            # The break-glass arm state is re-checked after the pending token is consumed: before
+            # the first verifier call and again before the mint (create_local_session).
+            n_check = len(re.findall(
+                r"if \(entry\.break_glass &&\s*sso_only_local_password_gate\(entry\.username\) !=\s*SsoOnlyLocalGate::kBreakGlassArmed\)",
+                body))
+            if n_check != 2:
+                bad.append(f"/login/mfa: expected 2 break-glass arm re-checks, found {n_check}")
+            mint = body.find("create_local_session(")
+            last = body.rfind("entry.break_glass &&")
+            if mint < 0 or not last < mint:
+                bad.append("/login/mfa: the last break-glass re-check must precede the mint")
     return bad
 
 
@@ -255,6 +267,7 @@ def selftest(files):
     mut("try_lock() first dropped", sub_cpp("if (!login_lk.try_lock()) {", "if (true) {"))
     mut("over-length shortcut back on the ordinary slot", sub_cpp("if (!break_glass_attempt) {\n        const bool login_route", "if (!break_glass_attempt && !auth::password_exceeds_max(password)) {\n        const bool login_route"))
     mut("over-length shortcut back on the break-glass slot", sub_cpp("if (break_glass_attempt) {\n        pbkdf2_slot.emplace", "if (break_glass_attempt && !auth::password_exceeds_max(password)) {\n        pbkdf2_slot.emplace"))
+    mut("break-glass MFA re-check dropped", sub_cpp("if (entry.break_glass &&", "if (false && entry.break_glass &&", count=2))
     mut("server.cpp: set_stripe_waiter_cap commented out", sub_cpp("    auth_routes_->set_stripe_waiter_cap(sz.stripe_waiters);", "    // auth_routes_->set_stripe_waiter_cap(sz.stripe_waiters);", key="server.cpp"))
     mut("server.cpp: set_pbkdf2_cap only inside a string literal", sub_cpp("    auth_routes_->set_pbkdf2_cap(sz.cap);", '    const char* x = "auth_routes_->set_pbkdf2_cap(sz.cap);";', key="server.cpp"))
     mut("server.cpp: set_pbkdf2_cap altered argument", sub_cpp("auth_routes_->set_pbkdf2_cap(sz.cap);", "auth_routes_->set_pbkdf2_cap(4);", key="server.cpp"))
