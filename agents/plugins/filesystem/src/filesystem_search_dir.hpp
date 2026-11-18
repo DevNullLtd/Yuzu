@@ -9,8 +9,8 @@
 // is the disclosed residual, #4875), a depth limit that never opens a directory at
 // the limit, and a symlink or junction below the root that is counted and never followed or
 // matched. Whatever the walk skipped or stopped short of is reported by the shared `truncated|...`
-// trailer. Everything OS-bound is injected through WalkEnv, so the unit suites run it over a TempDir
-// with a fake clock, cancel predicate, probe and mount list.
+// trailer. The walker lists the tree itself and WalkEnv injects the rest, so the unit suites run it
+// over a TempDir with a fake clock, cancel predicate, probe and mount list.
 //
 // Rows (all `|`-separated; every path goes through acl::row_field, which also makes it wire-safe):
 //   result|<path>|<directory|file>

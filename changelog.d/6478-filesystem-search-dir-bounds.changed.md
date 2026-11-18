@@ -10,7 +10,7 @@
   refuses a root or `base_dir` on a network mount before touching it (return code 0 with
   `skipped_network_mount=1`, `total_matches|0` and `CONSTRAINED`, not an error); on macOS and Linux it
   also skips a mount below the root, and on Linux it never enters a pseudo-filesystem such as `/proc`
-  or `/sys` (counted as unreadable). A symlink or junction below the root no longer matches (the old
+  or `/sys` (an unreadable directory). A symlink or junction below the root no longer matches (the old
   walk reported a link by its target's type) and is never followed, and a directory at `max_depth` is
   matched but not opened (the old walk listed it and discarded the children). Result paths are now
   escaped: a pipe character is escaped, CR and LF show as a space and a trailing backslash shows as a
@@ -28,4 +28,5 @@
   lookahead, a match on Linux takes time linear in the name's length). A name byte that is not valid
   UTF-8 now shows as `?` in `search_dir`, `find_by_hash` and `get_acl` rows instead of making the whole
   response unreadable. Definition `device.filesystem.search_dir` is now 0.5.0 (columns `row_kind`,
-  `path`, `entry_type`).
+  `path`, `entry_type`); an existing server keeps 0.4.0 until the definition is replaced (see the
+  upgrade note).

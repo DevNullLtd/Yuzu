@@ -21,8 +21,8 @@ metadata:
     max_depth are examined and a directory at max_depth is matched but not
     opened. Below the search root a symlink or junction is never followed and
     never matches (it is counted), a FIFO, device or socket is never matched,
-    on Linux pseudo-filesystems such as /proc and /sys are never entered (each
-    counts as unreadable, so a search whose tree holds one is reported
+    on Linux pseudo-filesystems such as /proc and /sys are never entered (one
+    the walk would open counts as unreadable, so that search is reported
     constrained), and on macOS and Linux a subtree on a network mount is
     skipped before anything under it is read; a root (or base_dir) on a network
     mount is refused on its spelling before it is touched. A refused root is
