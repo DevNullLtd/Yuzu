@@ -208,8 +208,8 @@ also links it.
 
 | Decision | Reason | Revisit when |
 |---|---|---|
-| The one-month minimum release age is waived for `brotli` 1.2.1 and `sqlite3` 3.54.1. The project normally takes only releases at least a month old (Dependabot `cooldown`, the rebar3 checklist). | Both are security fixes. | The baseline passes the pin: delete the override. |
-| `libpq` stays at 18.4. | vcpkg has no libpq 18.6 port, so there is nothing to override to. The owner's assessment is that the PostgreSQL CVEs fixed in 18.6 are server-side issues, not defects in the libpq client library Yuzu links. The `yuzu-postgres` image moves to PostgreSQL 18.6 in a separate change. | vcpkg ships libpq 18.6: bump it. |
+| The one-month minimum release age is waived for `brotli` 1.2.1 and `sqlite3` 3.54.1. The project normally takes only releases at least a month old (Dependabot `cooldown`, the rebar3 checklist). | Both are security fixes. | The baseline passes the pin: delete the override (tracked in #8221). |
+| `libpq` stays at 18.4. | vcpkg has no libpq 18.6 port, so there is nothing to override to. The owner's assessment is that the PostgreSQL CVEs fixed in 18.6 are server-side issues, not defects in the libpq client library Yuzu links. The `yuzu-postgres` image moves to PostgreSQL 18.6 in a separate change. | vcpkg ships libpq 18.6: bump it (tracked in #8222). |
 
 **Version evidence.** To confirm what a tree links:
 
