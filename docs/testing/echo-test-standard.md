@@ -149,7 +149,7 @@ real exit code and stderr text are not covered by a retained test (a unit test n
 macOS legs) scans every `tests/unit/**/test_echo*.cpp` with comments and string and char literals
 blanked, and reports four flags. Other suites, header helpers (`tests/unit/echo_test_db.hpp`) and
 files with Echo in the middle of the name (`test_dashboard_echo_*.cpp`, `test_rest_echo_*.cpp`
-under `tests/unit/server/`) are outside the gate: those files are not scanned.
+under `tests/unit/server/`) are not scanned.
 `must_return_within` is available to any suite for a call whose return is under test (rule 4).
 
 | Flag | Fires on | Instead |
