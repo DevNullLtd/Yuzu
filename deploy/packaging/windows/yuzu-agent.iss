@@ -328,8 +328,8 @@ Type: files; Name: "{app}\bin\.yuzu-update-verified"
 [UninstallDelete]
 ; Three files the installer does not install, deleted by exact name: the
 ; uninstaller removes only what [Files] installed, and the plugin loader loads
-; every DLL in {app}\plugins, so without these an uninstall can leave Yuzu code
-; that a later install would run.
+; every DLL in {app}\plugins, so without these an uninstall can leave loadable
+; Yuzu code in the install directory.
 ;   - plugins\license_scan.dll: not installed by this installer (see the
 ;     plugin-not-installed record in [Files], #8309) but carried by the release
 ;     zip, so an operator may have copied it in.
@@ -341,8 +341,8 @@ Type: files; Name: "{app}\bin\.yuzu-update-verified"
 ; the service; a file still locked after that is not deleted. Randomly named
 ; temporaries that an interrupted self-update can leave in bin
 ; (yuzu-update-*.tmp, .yuzu-update-verified.tmp.*) are not removed; nothing
-; loads them. docs/user-manual/README.md ("Reprovisioning a Windows agent",
-; "What uninstalling removes") lists what uninstall keeps.
+; loads them. docs/user-manual/README.md ("What uninstalling removes") lists
+; what uninstall keeps.
 ; tests/test_agent_installer_plugin_coverage_lint.py pins these entries (one
 ; for every plugin-not-installed record).
 Type: files; Name: "{app}\plugins\license_scan.dll"

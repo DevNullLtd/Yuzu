@@ -131,9 +131,7 @@ workflow run only, and is kept only as long as the run is.
 Windows agent from the installer or archive of a single release. Agent self-update (OTA)
 replaces `yuzu-agent.exe` only; it does not install or refresh the runtime or any plugin
 (#8219, #8218). A device whose agent was updated that way mixes builds and is not a supported
-configuration (see "Deployment contract (hard cutover)" in [Upgrading](upgrading.md)):
-reprovision it with the installer or archive of the release you run, as described in
-[Reprovisioning a Windows agent](#reprovisioning-a-windows-agent) below.
+configuration (see "Deployment contract (hard cutover)" in [Upgrading](upgrading.md)).
 
 **Code loaded into the agent uses the same copy.** A third-party component that runs inside
 the agent process, for example the Configuration Manager client objects the `sccm` plugin
@@ -148,16 +146,16 @@ inspected (#8311 tracks running it outside the agent process).
 manager restarts the service every 60 seconds and each start fails the same way. Signs of it
 in Event Viewer: Service Control Manager events 7031 or 7034 for the agent service
 (`YuzuAgent`) in the System log, and an error in the Application log naming
-`VCRUNTIME140.dll` or `MSVCP140.dll`, or an access violation in `msvcp140.dll`. Reprovision
-the device with the installer or archive of one release (see
-[Reprovisioning a Windows agent](#reprovisioning-a-windows-agent)).
+`VCRUNTIME140.dll` or `MSVCP140.dll`, or an access violation in `msvcp140.dll`. Deploy the
+agent from the installer or archive of one release (see "Deployment contract (hard cutover)"
+in [Upgrading](upgrading.md)).
 
 Releases up to and including 0.15.0 did not carry the runtime. On a machine without the
 Redistributable 14.44 or later (0.15.0 was built with the 14.44 toolset), the 0.15.0
 `yuzu-agent.exe` either does not start and Windows reports a missing `VCRUNTIME140.dll` or
 `MSVCP140.dll`, or, with an older Redistributable installed, stops with an access violation in
-`msvcp140.dll`. Reprovision such a device with a 0.16.0 installer or archive (see
-[Reprovisioning a Windows agent](#reprovisioning-a-windows-agent)). The 0.15.0
+`msvcp140.dll`. The 0.16.0 installer and archive carry the runtime; deploy the agent from one
+of them (see "Deployment contract (hard cutover)" in [Upgrading](upgrading.md)). The 0.15.0
 installer also left out six plugins that the archive carried. The 0.16.0 installer installs
 five of them, with these components: System (`browser_inventory`, `printing`,
 `privacy_permissions`), Network (`netprobe`) and Windows (`rdp_control`). It deliberately does
@@ -166,65 +164,44 @@ collection on the device with no operator action, and under ADR-3006 (decision D
 adds a unit that runs by default until the fleet-level setting for additions exists (#8309
 tracks it). The release archive still carries `license_scan`.
 
-#### Reprovisioning a Windows agent
+#### What uninstalling removes
 
-This is the procedure the user manual means wherever it says to reprovision a Windows agent;
-other pages link here rather than repeat it. It leaves none of the earlier deployment's agent
-state on the device, and the device comes back as a new agent, with a new agent id.
+Uninstalling an agent installed with the installer (from the installed-apps list in Settings
+or Control Panel, or with `unins000.exe` in the install directory) stops and removes the
+`YuzuAgent` service, removes the boot-time process trace setting with its file
+`%ProgramData%\Yuzu\procboot.etl`, and deletes:
 
-1. **Remove the agent.** An agent installed with the installer is removed by uninstalling it
-   (from the installed-apps list in Settings or Control Panel, or with the uninstaller
-   `unins000.exe` in the install directory); deleting its install directory is not the same,
-   because it leaves the `YuzuAgent` service registered. An agent deployed from the archive has
-   no uninstaller: first note the `--data-dir` on its service command line
-   (`sc.exe qc YuzuAgent`), then, from an elevated command prompt, stop the `YuzuAgent` service,
-   run `yuzu-agent.exe --remove-service` from its `bin` directory, and delete the directory you
-   unpacked it into.
-2. **Delete the agent's data directory.** For an installer install it is `%ProgramData%\Yuzu`;
-   answering **Yes** at the uninstaller's "Remove agent data directory?" prompt deletes it (see
-   "What uninstalling removes" below). For an archive deployment it is the directory its
-   `--data-dir` named or, when it named none, `%LOCALAPPDATA%\yuzu` of the account the service
-   ran as (for LocalSystem, `C:\Windows\System32\config\systemprofile\AppData\Local\yuzu`),
-   and its `--cert-dir` too if that was set outside it. Also delete any file left in the
-   install directory, for example a DLL in `plugins` that the installer did not install: the
-   agent loads every DLL in its plugin directory.
-3. **Revoke the earlier agent's certificate**, if the server issued it one: find its serial in
-   `GET /api/v1/ca/issued` (an account confined to management groups, or one without
-   `Inventory:Read`, is refused that list), then revoke it with `POST /api/v1/ca/revoke` (see
-   "Per-agent mTLS auto-provisioning (PKI)" in
-   [Device Management](device-management.md#per-agent-mtls-auto-provisioning-pki)).
-4. **Install the agent** from the installer or archive of a single release.
-5. **Enroll it again.** With no data directory the agent creates a new agent id and registers
-   as a new agent: an enrollment token (the installer's `/TOKEN=` or `/TOKEN_FILE=`) enrolls it
-   at once, an auto-approve rule it matches approves it, and otherwise it waits in the pending
-   queue for approval (see [Agent Enrollment](device-management.md#agent-enrollment)). An
-   operator who had copied `license_scan.dll` in from the archive copies it again, from the
-   archive of the release just installed.
+- every file the installer installed;
+- these, by name (the installer's `[UninstallDelete]` entries): `plugins\license_scan.dll`,
+  `bin\yuzu-agent.old.exe`, `bin\.yuzu-update-verified`, the `logs` directory,
+  `%ProgramData%\Yuzu\enrollment-token`, and the `%ProgramData%\Yuzu\enrollment-token.stage`
+  directory if it is empty. The installer does not install the first three:
+  `license_scan.dll` is in the release archive (see above), and the other two are the previous
+  executable and its marker, which agent self-update leaves.
 
-**What uninstalling removes.** Uninstalling an agent installed with the installer stops and
-removes the `YuzuAgent` service and removes:
+A file still in use when the uninstaller runs is not deleted. The uninstaller also leaves any
+other file added to the install directory, and the randomly named temporaries an interrupted
+self-update can leave in `bin` (`yuzu-update-*.tmp` and `.yuzu-update-verified.tmp.*`; the
+agent does not load them). Before it copies its own files, the installer deletes, by name (its
+`[InstallDelete]` entries), `plugins\sockwho.dll`, `plugins\tar.dll`, `plugins\quarantine.dll`,
+`bin\yuzu-agent.old.exe` and `bin\.yuzu-update-verified`, skipping a file still in use.
 
-- every file the installer installed, and the `logs` directory;
-- `plugins\license_scan.dll` and, in `bin`, `yuzu-agent.old.exe` and `.yuzu-update-verified`,
-  which the installer does not install: `license_scan.dll` is in the release archive (see
-  above), and the other two are the previous executable and its marker, which agent
-  self-update leaves. An uninstaller from an earlier installer leaves these three; delete any
-  that remain after uninstalling. The installer also deletes the two self-update files before
-  it copies its own, unless one is still in use;
-- the enrollment token file `%ProgramData%\Yuzu\enrollment-token`, and the boot-time process
-  trace setting with its file `%ProgramData%\Yuzu\procboot.etl`.
-
-The data directory `%ProgramData%\Yuzu` is the agent's state: its local databases (the agent
-id is in `agent.db`), its certificates and private key, and the update trust-anchor directory
-`agent-certs`. An interactive uninstall asks, once the program is removed, "Remove agent data
-directory?"; the default answer is **No**, which leaves the directory, and **Yes** deletes the
-whole directory. A silent uninstall (`/SILENT` or `/VERYSILENT`) does not ask and leaves it.
-Reprovisioning deletes it (step 2 above). Uninstall also leaves any other file added to the
-install directory, the randomly named temporaries an interrupted self-update can leave in
-`bin` (`yuzu-update-*.tmp` and `.yuzu-update-verified.tmp.*`; the agent does not load them),
-and any file still in use when it runs. Removing an archive deployment (step 1 above) removes
-only the unpacked directory and the service registration, so its whole data directory remains
-until step 2 deletes it.
+**The agent data directory, `%ProgramData%\Yuzu`.** Apart from the files named above, the
+uninstaller deletes it only when asked to. Once the program is removed, an interactive
+uninstall asks "Remove agent data directory?"; the default answer is **No**, which leaves the
+directory, and **Yes** deletes the whole directory and everything in it. A silent uninstall
+(`/SILENT` or `/VERYSILENT`) never asks and leaves the directory. The directory holds the
+agent's identity and local state, including `agent.db` (the agent id); `certs`, which by
+default holds the agent's client certificate and private key, and where the agent looks for
+`default-ca.pem`, the server CA it trusts when it is given no `--ca-cert`; `agent-certs`, the
+directory the installer creates for the trust bundle that verifies self-update packages
+(`update-trust-bundle.pem`, placed by an operator; see "Signing update binaries" in
+[Server Administration](server-admin.md)); and `kv_store.db`, plugin storage,
+which on a quarantined device holds the firewall plugin's quarantine record, the firewall
+policy the quarantine replaced and the list of firewall rules it turned off. Uninstalling does
+not undo a quarantine, so answering **Yes** on a quarantined device deletes that record while
+the firewall changes stay in force: the host stays contained, and an agent installed on it has
+a new agent id (unless `YUZU_AGENT_ID` sets one) and no record of the quarantine.
 
 ## Quick Start
 
