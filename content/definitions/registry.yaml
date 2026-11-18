@@ -36,7 +36,7 @@ spec:
         displayName: Key Path
         description: >
           Registry key path relative to the hive root, e.g.
-          "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion".
+          "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion". A path that passes through a registry link is refused with error|key_is_link; HKLM\SYSTEM\CurrentControlSet is a link, so read HKLM\SYSTEM\ControlSet001 (or the ControlSet00N that HKLM\SYSTEM\Select\Current names).
       name:
         type: string
         displayName: Value Name
@@ -374,7 +374,7 @@ spec:
         type: string
         description: >
           Registry key path relative to the hive root, e.g.
-          "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion".
+          "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion". A path that passes through a registry link is refused with error|key_is_link; HKLM\SYSTEM\CurrentControlSet is a link, so read HKLM\SYSTEM\ControlSet001 (or the ControlSet00N that HKLM\SYSTEM\Select\Current names).
   result:
     columns:
       - name: subkey
@@ -609,12 +609,12 @@ spec:
         type: string
         displayName: Key Path
         description: >
-          Registry key path relative to the hive root.
+          Registry key path relative to the hive root. A path that passes through a registry link is refused with error|key_is_link; HKLM\SYSTEM\CurrentControlSet is a link, so read HKLM\SYSTEM\ControlSet001 (or the ControlSet00N that HKLM\SYSTEM\Select\Current names).
   result:
     columns:
       - name: exists
         type: bool
-        description: 'Whether the key could be opened for read. Values: true, false.'
+        description: 'Whether the key could be opened for read. Values: true, false. true or false is only the answer for a key that is there or is not: a refused path answers error|key_is_link (the path passes through a registry link such as HKLM\SYSTEM\CurrentControlSet), error|access_denied or another error token instead, never false.'
         example: "true"
         platforms: [windows]
   approval:
@@ -662,7 +662,7 @@ spec:
         type: string
         displayName: Key Path
         description: >
-          Registry key path relative to the hive root.
+          Registry key path relative to the hive root. A path that passes through a registry link is refused with error|key_is_link; HKLM\SYSTEM\CurrentControlSet is a link, so read HKLM\SYSTEM\ControlSet001 (or the ControlSet00N that HKLM\SYSTEM\Select\Current names).
   result:
     columns:
       - name: name

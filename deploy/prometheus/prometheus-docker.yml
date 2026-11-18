@@ -1,7 +1,7 @@
 # Prometheus config for Docker Compose stack
 # Targets use Docker service names instead of localhost
 
-# /metrics: the compose server runs with YUZU_METRICS_NO_AUTH (dev rig only, see docker-compose.yml), so
+# /metrics: the compose server runs with YUZU_METRICS_NO_AUTH and YUZU_NO_HTTPS (dev rig only, see docker-compose.yml; :8080 is plain http), so
 # this scrape sends no credential. Against a server that authenticates /metrics add an `authorization`
 # block per docs/user-manual/metrics.md.
 

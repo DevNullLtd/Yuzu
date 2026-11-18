@@ -14,7 +14,7 @@ scrape_configs:
   # Yuzu Server — exposes server + fleet-aggregated agent metrics
   - job_name: 'yuzu-server'
     metrics_path: '/metrics'
-    # Rig only: the server is started with --metrics-no-auth (scripts/start-stack.sh), so no credential is
+    # Rig only: the server is started with --metrics-no-auth (scripts/start-stack.sh), and with --no-https (so :8080 serves /metrics over plain http), so no credential is
     # sent. For a server that authenticates /metrics use prometheus.yml and docs/user-manual/metrics.md.
     static_configs:
       - targets: ['localhost:8080']

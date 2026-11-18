@@ -308,10 +308,10 @@ a scrape-configuration problem, not a rule problem: target a stable identity.
   `yuzu_server_uptime_seconds`** can leave this alert **permanently** silent,
   not just delayed — the gauge is written at most once per boot, so
   `resets()` never sees more than a handful of transitions no matter how long
-  the loop runs. There is no dead-man's-switch (`up == 0`) rule for the
-  server process in this file today (tracked: #2956); if the process is
-  unreachable outright, rely on `up{job="yuzu"}` / your scrape-health
-  dashboard, not this alert.
+  the loop runs. The shipped `YuzuServerMetricsScrapeDown` rule
+  (`up{job="yuzu-server"} == 0`) is the dead-man's-switch for the server
+  process; if the process is unreachable outright, that alert and your
+  scrape-health dashboard tell you, not this one.
 
 **This alert and `YuzuAuditRetentionNotRunning` can legitimately disagree.**
 They key on different facts: this one on restart frequency (`> 3` in the

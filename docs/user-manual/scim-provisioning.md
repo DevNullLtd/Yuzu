@@ -354,6 +354,11 @@ has the same effect:
   answer: a failure is counted and alerted (`YuzuCryptoLayoutEraseFailed`),
   and the remedy is in
   [Crypto: Deprovision erasure](crypto.md#deprovision-erasure).
+- **Open event streams are NOT closed.** A `GET /events`, `GET /api/v1/events` or
+  `GET /sse/executions/{id}` stream that was already open keeps the credential and scope it
+  attached with: deprovisioning does not end it. Add this step to your offboarding runbook: restart
+  the replica holding the stream, or close the connection at the proxy. (The MCP stream
+  re-validates its credential on every heartbeat and does end.)
 
 > **API/MCP tokens ARE now revoked on deprovision — including federated
 > (SSO) tokens, if the user is linked.** SCIM deprovisioning (and the

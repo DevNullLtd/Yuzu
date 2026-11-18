@@ -53,6 +53,10 @@ services:
       # unauthenticated /metrics on the published :8080. Production monitoring sends a bearer
       # token instead: docs/user-manual/metrics.md "Scraping /metrics with a bearer token".
       YUZU_METRICS_NO_AUTH: "true"
+      # DEV-ONLY: with HTTPS on (the default) the published :8080 is only the redirect listener and
+      # does NOT serve /metrics (it is on :8443), so this rig serves plain HTTP on :8080, which is
+      # what its dashboard URL, its published port and prometheus-docker.yml all assume.
+      YUZU_NO_HTTPS: "true"
     volumes:
       - server-data:/var/lib/yuzu
       # The internal CA, the default certs and the secrets KEK

@@ -318,7 +318,7 @@
     "**The audit trail identifies a change but cannot always reproduce it, and it can hold secrets.** Names are folded for the line (`audit_token`: space, `=`, `,`, `|`, control characters, the C1 controls, U+2028, U+2029 and a trailing backslash become `_`, cut at 256 bytes), old and new data are raw hex cut at 256 bytes, a `delete_key` row carries counts and no values, and a dry run mints `result=success` rows with `dry_run=1`; the hex can hold a registry secret (owner risk acceptance, 2026-10-20: masking is planned and nothing redacts it today, see **Sensitivity.**). An exception inside a write is contained at the plugin boundary and leaves a fixed `result=failed`, `reason=exception` line with every other field `-` (for `apply`, `op=apply`, after the rows of the items already done), while an agent that dies mid-command leaves no row at all, so in both cases read the key back.",
     "**Registry 2.0.0 and later ask a key for more access than 1.0.0 did.** `set_value` opens the leaf with `KEY_SET_VALUE` and `KEY_QUERY_VALUE` and creates under each parent with `KEY_CREATE_SUB_KEY`, `delete_value` asks the same two on the leaf, `delete_key` asks `DELETE`, `KEY_ENUMERATE_SUB_KEYS` and `KEY_QUERY_VALUE`, and the walk adds `KEY_QUERY_VALUE` on every component; an ACL that grants less answers `access_denied`. A key the plugin creates is created with `DELETE` access, so that a stopped walk can remove it by handle: where an inherited ACL gives the agent identity no `DELETE` on a new key the create answers `access_denied`, deliberately with no retry.",
     "**The offline per-user arm and `apply` have limits of their own.** The offline mount runs under one process-wide lock (a long write delays every other offline hive reader), its post-unload probe sees a hive loaded after the write returned but not a logon that failed while it was mounted, and a mount that fails to unload (`hive_unload_failed`), or one left by an agent that died mid-write, stays until `reg unload` or a reboot: the user's next logon can get a temporary profile, and the plugin neither retries the unload nor sweeps old mounts (#5292, #3140). `apply` is `HKLM` only and not transactional, its dry run cannot see the ACL a key that does not exist yet will inherit (so `would_apply` is a prediction for a missing key and a fact for an existing one), each `delete_key` item can vet up to 10,000 values with no deadline, and a 256-item plan mints up to 256 of the 600 `registry.write` rows an agent may write per minute. The per-key handle map folds ASCII only while the kernel folds all of Unicode, so `dependent_items` refuses, conservatively, any plan in which two items share a path prefix (a parent or the whole key) that could be one key spelt with a different non-ASCII case; it also refuses two distinct sibling keys whose names differ only inside runs of non-ASCII characters (two all-CJK vendor keys, say) in one plan, so split those into separate plans. A single action on a key spelt in a different non-ASCII case from its stored form is still refused `key_is_link`.",
-    "**Read output is display text, not exact bytes.** In every registry string a read renders, `|`, control characters other than TAB, DEL, the C1 controls, U+2028 and U+2029 become `_` and trailing NULs are dropped, so `a<U+2028>b`, `a<VT>b` and `a_b` render alike, and `get_value` has no exact-bytes mode for a string value; `get_user_value` reads a string value up to its first NUL and decodes `REG_MULTI_SZ` and `REG_LINK`, which `get_value` and `enumerate_values` leave as hex, and `enumerate_values` writes `value|<name>|<type>` with `value` as a literal tag, not a column. Do not drop the `ReturnLength` argument of the `AdjustTokenPrivileges` call in `PrivilegeScope` (`agents/shared/win_profiles.hpp`): without it the offline fallback silently never enabled its privileges until #2771. The `get_user_value` capture exercised the live-hive path, not the offline mount."
+    "**Read output is display text, not exact bytes.** In every registry string a read renders, `|`, control characters other than TAB, DEL, the C1 controls, U+2028 and U+2029 become `_` and trailing NULs are dropped, so `a<U+2028>b`, `a<VT>b` and `a_b` render alike, and `get_value` has no exact-bytes mode for a string value; `get_user_value` reads a string value up to its first NUL and decodes `REG_MULTI_SZ` and `REG_LINK`, which `get_value` and `enumerate_values` leave as hex, and `enumerate_values` writes `value|<name>|<type>` with `value` as a literal tag, not a column. Do not drop the `ReturnLength` argument of the `AdjustTokenPrivileges` call in `PrivilegeScope` (`agents/shared/win_profiles.hpp`): without it the offline fallback silently never enabled its privileges until #2771. The `get_user_value` capture exercised the live-hive path, not the offline mount. Reads also refuse a path that passes through a registry link, including `HKLM\\SYSTEM\\CurrentControlSet`. `get_value`, `key_exists`, `enumerate_keys` and `enumerate_values` open each component without following links, so a path under `HKLM\\SYSTEM\\CurrentControlSet` (itself a link to `ControlSet00N`) answers `error|key_is_link`, as does any other link or a handle the plugin cannot identify. Read `HKLM\\SYSTEM\\ControlSet001`, or the `ControlSet00N` that `HKLM\\SYSTEM\\Select\\Current` names, instead. `key_exists` answers `exists|true` or `exists|false` only for a key that is or is not there; a refused path is an `error|<token>` row (`key_is_link`, `access_denied`, ...) and exit status 1, never `exists|false`, so a client must treat an `error` row as \"not answered\". This leg is compiled but not executed on a Windows host by this change."
   ],
   "definitions": [
     {
@@ -712,7 +712,7 @@
       "constraints": null,
       "default": null,
       "definition_id": "windows.registry.enumerate_keys",
-      "description": "Registry key path relative to the hive root, e.g. \"SOFTWARE\\\\Microsoft\\\\Windows NT\\\\CurrentVersion\".\n",
+      "description": "Registry key path relative to the hive root, e.g. \"SOFTWARE\\\\Microsoft\\\\Windows NT\\\\CurrentVersion\". A path that passes through a registry link is refused with error|key_is_link; HKLM\\SYSTEM\\CurrentControlSet is a link, so read HKLM\\SYSTEM\\ControlSet001 (or the ControlSet00N that HKLM\\SYSTEM\\Select\\Current names).\n",
       "name": "key",
       "required": true,
       "type": "string"
@@ -737,7 +737,7 @@
       "constraints": null,
       "default": null,
       "definition_id": "windows.registry.enumerate_values",
-      "description": "Registry key path relative to the hive root.\n",
+      "description": "Registry key path relative to the hive root. A path that passes through a registry link is refused with error|key_is_link; HKLM\\SYSTEM\\CurrentControlSet is a link, so read HKLM\\SYSTEM\\ControlSet001 (or the ControlSet00N that HKLM\\SYSTEM\\Select\\Current names).\n",
       "name": "key",
       "required": true,
       "type": "string"
@@ -806,7 +806,7 @@
       "constraints": null,
       "default": null,
       "definition_id": "windows.registry.get_value",
-      "description": "Registry key path relative to the hive root, e.g. \"SOFTWARE\\\\Microsoft\\\\Windows NT\\\\CurrentVersion\".\n",
+      "description": "Registry key path relative to the hive root, e.g. \"SOFTWARE\\\\Microsoft\\\\Windows NT\\\\CurrentVersion\". A path that passes through a registry link is refused with error|key_is_link; HKLM\\SYSTEM\\CurrentControlSet is a link, so read HKLM\\SYSTEM\\ControlSet001 (or the ControlSet00N that HKLM\\SYSTEM\\Select\\Current names).\n",
       "name": "key",
       "required": true,
       "type": "string"
@@ -840,7 +840,7 @@
       "constraints": null,
       "default": null,
       "definition_id": "windows.registry.key_exists",
-      "description": "Registry key path relative to the hive root.\n",
+      "description": "Registry key path relative to the hive root. A path that passes through a registry link is refused with error|key_is_link; HKLM\\SYSTEM\\CurrentControlSet is a link, so read HKLM\\SYSTEM\\ControlSet001 (or the ControlSet00N that HKLM\\SYSTEM\\Select\\Current names).\n",
       "name": "key",
       "required": true,
       "type": "string"
@@ -1347,7 +1347,7 @@
     {
       "columns": [
         {
-          "description": "Whether the key could be opened for read. Values: true, false.",
+          "description": "Whether the key could be opened for read. Values: true, false. true or false is only the answer for a key that is there or is not: a refused path answers error|key_is_link (the path passes through a registry link such as HKLM\\SYSTEM\\CurrentControlSet), error|access_denied or another error token instead, never false.",
           "example": "true",
           "name": "exists",
           "platforms": [

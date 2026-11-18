@@ -81,6 +81,7 @@ start_all() {
         --gateway-upstream 0.0.0.0:50055 \
         --insecure-gateway-peer \
         --metrics-no-auth \
+        --no-https \
         --web-port 8080 \
         2>&1 &
     disown
