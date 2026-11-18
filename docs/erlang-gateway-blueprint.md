@@ -113,7 +113,8 @@ yuzu_gateway/
 ```erlang
 %% rebar.config
 {deps, [
-    {cowboy,    "2.21.0"},     % HTTP/2 server under the gateway's own gRPC listeners (yuzu_grpc*); brings ranch
+    {cowboy,    "2.21.0"},     % HTTP/2 server under the gateway's own gRPC listeners (yuzu_grpc*); ranch comes with it
+    {cowlib,    "2.22.0"},     % pinned explicitly so the lock cannot resolve a cowlib below 2.22.0
     {gun,       "2.8.0"},      % HTTP/2 client under the gateway-to-server gRPC client (yuzu_grpc_client)
     {ctx,       "0.6.0"},      % request-context type of the yuzu_grpc* layer
     {gpb,       "4.21.7"},     % Protobuf compiler/runtime

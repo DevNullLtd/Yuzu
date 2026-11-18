@@ -16,6 +16,8 @@ It does **not** extend to any other package. ranch stays at 2.3.0 (2.4.0 exists 
 the window and is not needed). The rule applies to every other pin, and to any later bump of these
 three.
 
+Base: merge-base `98c26bcee3` (`origin/dev` when the branch was cut).
+
 ## Who, when, and why
 
 - **Fraser Jarvis, owner**, direct ruling 2026-11-17 (cowboy and cowlib): "Waive the pin rule for
@@ -23,8 +25,17 @@ three.
   CVE".
 - **Fraser Jarvis, owner**, direct ruling 2026-11-18 (gun): "Extend the waiver".
 
+**Approver and author are the same person; there is no second approver.** The change was reviewed
+by the governance gates (independence is asserted, not verified).
+
 Why: cowlib 2.21.0 and earlier do not enforce `SETTINGS_MAX_HEADER_LIST_SIZE`
-(CVE-2026-113431), so an unauthenticated peer on the agent-facing gateway listener can send an
+(CVE-2026-113431, published 2026-11-06 by the EEF CNA as EEF-CVE-2026-113431: "Unbounded decoded
+HTTP/2 header-list size in cowlib `cow_http2_machine` enables HPACK amplification memory
+exhaustion"; CVSS v4 `AV:N/AC:L/AT:N/PR:N/UI:N/VA:H`; affected cowlib 2.7.0 up to but not
+including 2.22.0; advisory <https://cna.erlef.org/cves/CVE-2026-113431.html>, also
+<https://nvd.nist.gov/vuln/detail/CVE-2026-113431> and <https://osv.dev/vulnerability/EEF-CVE-2026-113431>,
+read through the OSV API on 2026-11-18; the advisory's fix commits include the tag commit
+`b92326f0`; the behaviour is also verified empirically by the before/after regression pin below), so an unauthenticated peer on the agent-facing gateway listener can send an
 HPACK header block that decodes to an unbounded header list. The fix exists only in cowlib 2.22.0
 (released 2026-11-09), and cowboy 2.21.0 requires cowlib >= 2.22.0. gun is included because gun
 2.5.0 cannot run on cowlib 2.22.0: cowlib's `cow_http2_machine:frame/2` can now return
@@ -50,15 +61,18 @@ directory, extracted only there, and never executed; scripts ran with `python3 -
    contents):
    - cowboy 2.21.0 and gun 2.8.0: every file in the tarball is byte-identical to the tag (the tag
      has extra repository-only files).
-   - cowlib 2.22.0: sources are identical; `Makefile` and `README.asciidoc` differ from the tag.
-     Cause: the signed tag `2.22.0` points at commit `b92326f0`, and the maintainer's next commit
-     `49bd2119` ("Cowlib 2.22.0", one minute later, parent `e04ee626`) changes only `Makefile`
-     (`PROJECT_VERSION`, the hex doc link, three lines in the `prepare_tag` info target that echo
-     the README links), `README.asciidoc` (the 2.22 doc link) and `ebin/cowlib.app` (the version).
-     The hex tarball is **byte-identical to commit `49bd2119`** (checked: no file differs). The two
-     commits after it (`1b95bb1c`, `457a520f`, 2026-11-17) are not in the tarball. Reading: the
-     release was cut from the commit after the tag; benign, but it is a real tag-versus-tarball
-     difference, noted here rather than assumed away.
+   - cowlib 2.22.0: `src/`, `include/` and `ebin/cowlib.app` are identical to the tag;
+     `Makefile` and `README.asciidoc` differ. The signed tag `2.22.0` points at commit
+     `b92326f0`. The release commit `49bd2119` ("Cowlib 2.22.0", one minute after the tag) is a
+     SIBLING of it, not a descendant: both have parent `e04ee626`, the tag sits on a side commit and
+     `49bd2119` is on master. `49bd2119` changes only `Makefile` (`PROJECT_VERSION`, the hex doc
+     link, three lines in the `prepare_tag` info target that echo the README links),
+     `README.asciidoc` (the 2.22 doc link) and `ebin/cowlib.app` (the version). The hex tarball is
+     **byte-identical to `49bd2119`** (checked: no file differs). The two later commits (`1b95bb1c`
+     and `457a520f`, 2026-11-17) descend from `49bd2119` and are not in the tarball. Reading: the
+     published release is the master commit, not the tagged one; the difference is benign (a dev
+     info target and doc links) but it is a real tag-versus-tarball difference, recorded here
+     rather than assumed away.
 4. **Source diff review** (read from the extracted tarballs):
    - cowlib 2.21.0 to 2.22.0: `Makefile`, `erlang.mk` (diff skimmed for added code: dev tooling only),
      `cow_http2.erl`, `cow_http2_machine.erl`, `cow_http_te.erl`, `cow_http_hd.erl`,
@@ -84,7 +98,7 @@ directory, extracted only there, and never executed; scripts ran with `python3 -
    - cowlib 2.22.0 enforces `max_header_list_size`, default 32768 when unset (this is the fix).
      The listeners set nothing; `yuzu_grpc_listener_tests:http2_header_list_bound_test_` pins it.
      The check runs after the whole HPACK block is decoded, so decode itself is bounded only by
-     `max_fragmented_header_block_size` and the table size; that was not tested separately.
+     `max_fragmented_header_block_size` and the table size; that is not tested here, so `http2.max_headers` (Cowboy's count limit, 100 headers) and `max_fragmented_header_block_size` must stay at their defaults: they are the other half of the bound.
    - `cow_http2:frame/0` gains a 5-tuple DATA form and `settings/0` is widened; dialyzer is clean.
    - gun 2.8.0: handles `window_changed`; rejects CR/LF/NUL in method, path and header names/values
      and an invalid `content-length` on the request side (the gateway sends neither); stricter
@@ -98,7 +112,7 @@ directory, extracted only there, and never executed; scripts ran with `python3 -
 
 ## Tests run on the final tree (cowboy 2.21.0, cowlib 2.22.0, gun 2.8.0)
 
-- Full gateway eunit (`rebar3 eunit --dir apps/yuzu_gw/test`): 2832 passed, 0 failed (8m30s),
+- Full gateway eunit (`rebar3 eunit --dir apps/yuzu_gw/test`): 2835 passed, 0 failed (re-run after the governance-round fixes; the first run was 2832),
   including `yuzu_grpc_client_tests` (23/23, in particular the oversize multi-frame abandon case that
   failed on gun 2.5.0 with cowlib 2.22.0) and the new tests below.
 - `rebar3 dialyzer`: no warnings. `gateway/scripts/check-proto-codegen.sh`: OK.
@@ -110,6 +124,12 @@ directory, extracted only there, and never executed; scripts ran with `python3 -
   `user-agent` headers, about 2.5 KB of HPACK on the wire, are refused with RST_STREAM
   `enhance_your_calm`, the handler is never called, and the same connection serves the next
   request).
+- Mutation check of the committed pins against cowlib 2.21.0's modules (compiled in a scratch
+  directory and put first on the code path): the SETTINGS-preface, over-bound and real-listener
+  tests go RED; the no-override, within-bound, allow-list, `max_headers` and early-reset tests stay
+  green by design. Also added: an under-limit control in the wire test (the handler count must not
+  move on a refusal), and a wire test that a trailers-only gRPC status survives Cowboy's early reset
+  of an open request body (3 repeat runs green).
 - Before/after on the same scratch probe against a live listener: with cowlib 2.21.0's modules
   loaded, 8, 9 and 40 copies (a 160 KB header list) were all accepted and reached the handler; with
   2.22.0, 9 copies are refused and the connection stays usable. The old-library run is a one-off

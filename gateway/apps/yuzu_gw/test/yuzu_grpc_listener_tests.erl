@@ -782,11 +782,21 @@ http2_header_list_bound_test_() ->
           ?assertNot(maps:is_key(max_header_list_size,
                                  yuzu_grpc_listener:http2_opts(mgmt_entry())))
       end},
-     {"the server preface advertises SETTINGS_MAX_HEADER_LIST_SIZE = 32768",
+     {"the allow-list refuses max_header_list_size (not tunable: fails safe)",
+      ?_assertMatch({error, {unknown_keys, http2, [max_header_list_size], {allowed, _}}},
+                    refused(#{http2 => #{max_header_list_size => 16#ffffffff}}))},
+     {"max_headers is left at Cowboy's default (100) on both roles",
       fun() ->
-          {Preface, _} = Machine(entry()),
-          {ok, {settings, Settings}, _} = cow_http2:parse(Preface),
-          ?assertEqual(32768, maps:get(max_header_list_size, Settings))
+          ?assertNot(maps:is_key(max_headers, yuzu_grpc_listener:http2_opts(entry()))),
+          ?assertNot(maps:is_key(max_headers, yuzu_grpc_listener:http2_opts(mgmt_entry())))
+      end},
+     {"the server preface advertises SETTINGS_MAX_HEADER_LIST_SIZE = 32768, on both roles",
+      fun() ->
+          [begin
+               {Preface, _} = Machine(E),
+               {ok, {settings, Settings}, _} = cow_http2:parse(Preface),
+               ?assertEqual(32768, maps:get(max_header_list_size, Settings))
+           end || E <- [entry(), mgmt_entry()]]
       end},
      {"a request whose header list is within the bound is accepted",
       fun() ->
@@ -794,11 +804,13 @@ http2_header_list_bound_test_() ->
           ?assertMatch({ok, {headers, 1, fin, _, _, _}, _},
                        cow_http2_machine:frame({headers, 1, fin, head_fin, Block(8)}, M))
       end},
-     {"a request whose header list is over the bound is refused (stream error, not growth)",
+     {"a request whose header list is over the bound is refused (stream error, not growth), on both roles",
       fun() ->
-          {_, M} = Machine(entry()),
-          ?assertMatch({error, {stream_error, 1, enhance_your_calm, _}, _},
-                       cow_http2_machine:frame({headers, 1, fin, head_fin, Block(9)}, M))
+          [begin
+               {_, M} = Machine(E),
+               ?assertMatch({error, {stream_error, 1, enhance_your_calm, _}, _},
+                            cow_http2_machine:frame({headers, 1, fin, head_fin, Block(9)}, M))
+           end || E <- [entry(), mgmt_entry()]]
       end}].
 
 %% The server holds ONE connection to the management listener and sends every

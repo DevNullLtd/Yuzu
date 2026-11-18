@@ -308,14 +308,24 @@ The waiver names exactly those three versions; the rule applies to every other p
 any later bump of these three. A security fix that exists only in a newer-than-a-month release
 needs an owner ruling and a record like that one; it is never a quiet exception.
 
-**`rebar3` cannot resolve a hex dependency's version range from scratch** (3.24: `Dep cowlib
-has invalid version >= 2.22.0 and < 3.0.0`; a lock entry hides it). To move a transitive pin
-such as `cowlib`, list it as a direct dep in `rebar.config`, and generate the lock with a
-temporary `{overrides, [{override, cowboy, [{deps, [{cowlib,"<vsn>"},{ranch,"<vsn>"}]}]},
-{override, gun, [{deps, [{cowlib,"<vsn>"}]}]}]}.` in `rebar.config`, `rm rebar.lock && rebar3
-lock`; then delete the overrides and confirm `rebar3 compile` leaves the lock byte-identical. Pin an exact version (as every
-dep there is), and refresh `rebar.lock` with `rebar3 upgrade <dep>` so its package hashes
-cover the new tarball; commit both files together. After a `cowboy`, `gun`, `cowlib` or
+**Locking a transitive hex pin.** `rebar3` 3.24 cannot resolve a hex dependency's version range
+without a lock entry (`Dep cowlib has invalid version >= 2.22.0 and < 3.0.0`; the same error occurs
+on an unmodified config once `rebar.lock` is removed). To move a transitive pin such as `cowlib`,
+list it as a direct dep in `rebar.config` and generate the lock with temporary overrides:
+
+```erlang
+{overrides, [
+ {override, cowboy, [{deps, [{cowlib,"<vsn>"},{ranch,"<vsn>"}]}]},
+ {override, gun,    [{deps, [{cowlib,"<vsn>"}]}]}
+]}.
+```
+
+Append that to `rebar.config`, run `rm rebar.lock && rebar3 lock`, then **remove the overrides
+before commit** and confirm `rebar3 compile` leaves `rebar.lock` byte-identical.
+
+**Refreshing the lock for an ordinary bump.** Pin an exact version (as every dep there is), and
+refresh `rebar.lock` with `rebar3 upgrade <dep>` so its package hashes cover the new tarball;
+commit both files together. After a `cowboy`, `gun`, `cowlib` or
 `ranch` bump also run the wire suites that exercise them (`yuzu_grpc_wire_tests`,
 `yuzu_grpc_origin_wire_tests`, `yuzu_grpc_client_tls_tests`) and `rebar3 dialyzer`
 (`cowlib` and `gun` are in `plt_extra_apps`).

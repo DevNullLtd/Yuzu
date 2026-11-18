@@ -161,6 +161,12 @@
         [{ssl, "dropped: a `tls' map is TLS and its absence is plaintext"}]).
 %% The Cowboy HTTP/2 options an entry may set (cowboy_http2:opts/0), without the
 %% ones the layer owns (?RESERVED_HTTP2) and the hooks that run caller code.
+%% Deliberately NOT mirrored: max_header_list_size (in cowboy_http2:opts/0 since
+%% cowboy 2.21.0). cowlib bounds the decoded request header list at 32768 octets
+%% by default (CVE-2026-113431); a tunable could only weaken that, and an unknown
+%% key is refused, so it fails safe. max_headers (count, 100) and
+%% max_fragmented_header_block_size stay at their defaults for the same reason.
+%% Pinned by yuzu_grpc_listener_tests:http2_header_list_bound_test_/0.
 -define(HTTP2_KEYS,
         [active_n, compress_buffering, compress_threshold, connection_window_margin_size,
          connection_window_update_threshold, dynamic_buffer, dynamic_buffer_initial_average,
