@@ -7,6 +7,7 @@ literals is still seen. `code_only()` additionally replaces every string literal
 an empty literal (so a call named inside a string cannot satisfy a pin) and removes `#if 0`
 blocks. Tests insert this directory on sys.path explicitly (they run under `python3 -I`).
 """
+import functools
 import re
 
 _SIMPLE_ESC = {"n": "\n", "t": "\t", "r": "\r", "\\": "\\", '"': '"', "'": "'", "0": "\0"}
@@ -105,8 +106,16 @@ def lex(src: str, keep_strings: bool = True) -> str:
     return "".join(out)
 
 
-_ZERO = re.compile(r"#\s*if\s+(?:0[0-7]*[uUlL]*|\(\s*0[0-7]*[uUlL]*\s*\)|false|FALSE|!\s*1|!\s*\(\s*1\s*\)|!\s*true)\s*$")
-_ONE = re.compile(r"#\s*if\s+(?:1|\(\s*1\s*\)|true|TRUE|!\s*0|!\s*\(\s*0\s*\))\s*$")
+_ZLIT = r"(?:0[xX]0+|0[0-7]*)[uUlL]*"
+_OLIT = r"(?:0[xX]0*1|1)[uUlL]*"
+_ZERO_C = re.compile(rf"(?:\(\s*)*(?:{_ZLIT}|false|FALSE|!\s*(?:{_OLIT}|true|TRUE))(?:\s*\))*")
+_ONE_C = re.compile(rf"(?:\(\s*)*(?:{_OLIT}|true|TRUE|!\s*(?:{_ZLIT}|false|FALSE))(?:\s*\))*")
+
+
+def _cond(d: str):
+    """('if'|'elif', condition text) for a directive line, else None."""
+    m = re.match(r"#\s*(if|elif)\b\s*(.*)$", d)
+    return (m.group(1), m.group(2).strip()) if m else None
 
 
 def _lines(text: str) -> list[str]:
@@ -116,33 +125,42 @@ def _lines(text: str) -> list[str]:
 
 def dead_lines(masked: str) -> set[int]:
     """Indices of lines inside a dead preprocessor branch, from COMMENT- AND STRING-FREE text
-    (lex(..., keep_strings=False)): `#if 0` / `#if (0)` / `#if 00` / `#if 0L` / `#if false` /
-    `#if !1` are dead until their `#else`/`#elif`/`#endif`; the `#else`/`#elif` branch of an
-    `#if 1` / `#if true` / `#if !0` is dead. Directive lines inside a dead branch are dead."""
+    (lex(..., keep_strings=False)). A condition that is a literal zero (`0`, `(0)`, `00`, `0L`,
+    `0x0`, `false`, `!1`, `!true`) is dead; one that is a literal one (`1`, `true`, `!0`, `0x1`)
+    kills every LATER `#elif`/`#else` branch; any other condition (an identifier, an expression)
+    is unknown and treated as live, so a pin under it still counts. `#elif 0` chains are tracked
+    branch by branch. Directive lines inside a dead branch are dead. `#ifdef`/`#ifndef` are
+    unknown (a non-goal)."""
     dead: set[int] = set()
     stack: list[dict] = []
     for idx, line in enumerate(_lines(masked)):
         d = line.strip()
         top_skip = stack[-1]["skip"] if stack else False
         if re.match(r"#\s*if(?:def|ndef)?\b", d):
-            e = {"skip": top_skip, "zero": False, "one": False, "parent": top_skip}
+            e = {"skip": top_skip, "parent": top_skip, "all_zero": False, "one": False}
+            c = _cond(d)
             if top_skip:
                 dead.add(idx)
-            elif _ZERO.match(d):
-                e["skip"], e["zero"] = True, True
+            elif c and _ZERO_C.fullmatch(c[1]):
+                e["skip"], e["all_zero"] = True, True
                 dead.add(idx)
-            elif _ONE.match(d):
+            elif c and _ONE_C.fullmatch(c[1]):
                 e["one"] = True
             stack.append(e)
             continue
         if re.match(r"#\s*(?:else|elif)\b", d) and stack:
             e = stack[-1]
-            if e["parent"]:
-                e["skip"] = True
-            elif e["zero"]:
-                e["skip"] = False  # the branch after a dead `#if 0` is live (an #elif is treated live)
-            elif e["one"]:
-                e["skip"] = True
+            c = _cond(d)  # None for #else
+            if e["parent"] or e["one"]:
+                e["skip"] = True  # inside a dead region, or a known-true branch was already taken
+            elif c is None:  # #else after only-unknown or all-zero branches: live
+                e["skip"], e["all_zero"] = False, False
+            elif _ZERO_C.fullmatch(c[1]):
+                e["skip"] = e["all_zero"]  # still dead after all-zero; live (unknown) otherwise
+            elif _ONE_C.fullmatch(c[1]):
+                e["skip"], e["one"], e["all_zero"] = False, True, False
+            else:
+                e["skip"], e["all_zero"] = False, False
             if e["skip"]:
                 dead.add(idx)
             continue
@@ -166,6 +184,7 @@ def _filter(src: str, keep_strings: bool) -> str:
     return "".join(l for k, l in enumerate(lines) if k not in dead)
 
 
+@functools.lru_cache(maxsize=256)
 def live_text(src: str) -> str:
     """Comments (line, block, backslash-continued) and dead preprocessor branches removed,
     string contents KEPT. Dead-branch detection runs on comment- and string-free text, so a
@@ -173,14 +192,16 @@ def live_text(src: str) -> str:
     return _filter(src, True)
 
 
+@functools.lru_cache(maxsize=256)
 def code_only(src: str) -> str:
     """As live_text but string-literal contents blanked to `""`; whitespace collapsed."""
     return re.sub(r"\s+", " ", _filter(src, False))
 
 
 # Non-goals (a regex-free tokenizer cannot evaluate them): `#ifdef NEVER` / `#ifndef ALWAYS`
-# style conditions, `#if` expressions other than a literal 0 / (0) / false, macro-built tokens,
-# and trigraphs / digraphs. A pin that matters must not rely on these being excluded.
+# style conditions, `#if` expressions other than a literal zero/one (`0 && X`, `defined(X)`),
+# macro-built tokens, trigraphs / digraphs, and backslash-newline SPLICES inside a token or
+# between the two characters of a comment opener (comments are recognised before splicing). A pin that matters must not rely on these being excluded.
 
 
 def _selftest() -> list[str]:
@@ -213,6 +234,20 @@ def _selftest() -> list[str]:
         ("#if 0 else branch kept", "#if 0\nb();\n#else\nkeep();\n#endif", "keep()", True),
         ("#if 0 nested", "#if 0\n#if X\nb();\n#endif\nb();\n#endif\nkeep();", "b()", False),
         ("#if 1 kept", "#if 1\nkeep();\n#endif", "keep()", True),
+        ("#if 0 #elif 0 both dead", "#if 0\nb();\n#elif 0\nb();\n#endif\nkeep();", "b()", False),
+        ("#if 0 #elif 0 #else live", "#if 0\nb();\n#elif 0\nb();\n#else\nkeep();\n#endif", "keep()", True),
+        ("#if 0 #elif 0 #else drops dead", "#if 0\nb();\n#elif 0\nb();\n#else\nkeep();\n#endif", "b()", False),
+        ("#if 0 #elif X live", "#if 0\nb();\n#elif X\nkeep();\n#endif", "keep()", True),
+        ("#if 0 #elif X drops the dead branch", "#if 0\nb();\n#elif X\nkeep();\n#endif", "b()", False),
+        ("#if 0 #elif 1 live", "#if 0\nb();\n#elif 1\nkeep();\n#else\nb2();\n#endif", "keep()", True),
+        ("#if 0 #elif 1 kills the else", "#if 0\nb();\n#elif 1\nkeep();\n#else\nb2();\n#endif", "b2()", False),
+        ("#if 1 #elif 0 dead", "#if 1\nkeep();\n#elif X\nb();\n#endif", "b()", False),
+        ("#if 0x0", "#if 0x0\nb();\n#endif\nkeep();", "b()", False),
+        ("#if 0x00UL", "#if 0x00UL\nb();\n#endif\nkeep();", "b()", False),
+        ("#if 0x1 is live", "#if 0x1\nkeep();\n#else\nb();\n#endif", "b()", False),
+        ("#if ((0))", "#if ((0))\nb();\n#endif\nkeep();", "b()", False),
+        ("#if X stays live", "#if X\nkeep();\n#endif", "keep()", True),
+        ("nested #if 0 / #elif 0 inside live", "#if X\n#if 0\nb();\n#elif 0\nb();\n#endif\nkeep();\n#endif", "b()", False),
         ("#if 1 #else dropped", "#if 1\nkeep();\n#else\nb();\n#endif", "b()", False),
         ("#if 1 #else keeps the live branch", "#if 1\nkeep();\n#else\nb();\n#endif", "keep()", True),
         ("#if 0 inside a block comment is not a directive", "/*\n#if 0\n*/\nkeep();\nb();", "b()", True),

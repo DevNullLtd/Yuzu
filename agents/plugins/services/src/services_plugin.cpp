@@ -525,14 +525,35 @@ int do_set_start_mode_linux(yuzu::CommandContext& ctx, std::string_view name,
         return 1;
     }
     std::vector<std::string> argv = std::move(*argv_opt);
-    if (mode != "disabled") {
+    bool was_masked = false;
+    if (yuzu::services::start_mode_needs_unmask(mode)) {
         // `enable` and `disable` both fail on a masked unit, so for automatic and manual unmask
         // first. Best-effort: its result is intentionally not inspected (a unit that was never
         // masked has nothing to unmask and `unmask` exits 0 for it; the following enable or
-        // disable is the actual mode change).
+        // disable is the actual mode change). The state is read first (unprivileged, stderr
+        // unmerged) so a failed change can put the mask back (remask_after_failure below).
+        const auto prior = run_command({systemctl_path, "is-enabled", "--", std::string(name)},
+                                       /*merge_stderr=*/false);
+        was_masked = prior.tool_ran && !prior.timed_out &&
+                     yuzu::services::start_state_is_masked(prior.output);
         if (auto unmask = build("unmask"))
             run_command(*unmask);
     }
+    // A failed change after the unmask would leave the unit LESS restricted than it was found:
+    // put the mask back through the same wrapper and say so on a separate line.
+    auto remask_after_failure = [&]() {
+        if (!yuzu::services::start_mode_should_remask(mode, was_masked, /*change_succeeded=*/false))
+            return;
+        const auto mask = build("mask");
+        const auto r = mask ? run_command(*mask) : yuzu::agent::SubprocessResult{};
+        if (mask && r.tool_ran && !r.timed_out && r.exit_code == 0)
+            ctx.write_output(std::format("note|remasked: '{}' was masked before this call and the "
+                                         "change failed, so the mask was restored", name));
+        else
+            ctx.write_output(std::format("note|remask_failed: '{}' was masked before this call, the "
+                                         "change failed and the mask could not be restored; the "
+                                         "unit may now be unmasked", name));
+    };
 
     auto res = run_command(argv);
     // A runner-level failure (spawn error / deadline / cancelled / signaled)
@@ -550,6 +571,7 @@ int do_set_start_mode_linux(yuzu::CommandContext& ctx, std::string_view name,
     }
     if (!outcome.ok) {
         ctx.write_output(outcome.message);
+        remask_after_failure();
         return 1;
     }
 
@@ -573,6 +595,7 @@ int do_set_start_mode_linux(yuzu::CommandContext& ctx, std::string_view name,
                 "that mode does not accept (for example linked). Check `systemctl is-enabled` "
                 "on the host before retrying",
                 name, mode, st.output.substr(0, st.output.find('\n'))));
+            remask_after_failure();
             return 1;
         }
         st_state = st.output;

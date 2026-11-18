@@ -59,7 +59,7 @@ def grants(out: str):
     return lines
 
 
-_MSG_CMD = re.compile(r"^\s*(?:warn|log|info|fail|echo|printf)\b")
+_MSG_CMD = re.compile(r"^\s*(?:warn|log|info|fail|echo|printf)\w*\b")
 _TOKEN = re.compile(r"(?<![\w-])setcap\b|\$\{?SETCAP\}?(?!\w)")
 
 
@@ -89,10 +89,10 @@ def _selftest_setcap_lint() -> None:
     must_flag = ["run setcap cap_net_raw+ep \"$B\"", "command setcap cap_net_raw+ep \"$B\"",
                  "$SETCAP cap_net_raw+ep \"$B\"", "\"${SETCAP}\" cap_net_raw+ep \"$B\"",
                  "eval \"setcap cap_net_raw+ep $B\"", "sudo setcap cap_net_raw+ep $B",
-                 "x && setcap cap_net_raw+ep $B", "warn \"x\"; setcap cap_net_raw+ep $B",
+                 "x && setcap cap_net_raw+ep $B", "warn \"x\"; setcap cap_net_raw+ep $B", "log_warn \"x\"; setcap cap_net_raw+ep $B",
                  "setcap \"$caps\" \"$B\"", "/usr/sbin/setcap cap_net_raw+ep $B"]
     must_pass = ["run setcap -r \"$B\"", "command -v setcap >/dev/null", "if ! command -v setcap; then",
-                 "warn \"setcap not installed\"", "warn \"remove with: setcap -r $B\"",
+                 "warn \"setcap not installed\"", "log_warn \"setcap not installed\"", "warn \"remove with: setcap -r $B\"",
                  "SKIP_SETCAP=1"]
     for l in must_flag:
         if not setcap_violations(l):

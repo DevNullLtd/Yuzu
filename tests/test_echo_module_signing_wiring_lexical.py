@@ -33,30 +33,70 @@ def normalise(src):
     return lexh.code_only(src)
 
 
+def _match_brace(t, open_idx):
+    d = 0
+    for k in range(open_idx, len(t)):
+        if t[k] == "{":
+            d += 1
+        elif t[k] == "}":
+            d -= 1
+            if d == 0:
+                return k
+    return -1
+
+
+def drain_body(t):
+    """The body of the ModuleEtwCollector::drain() definition that uses sign_cache_ (the Windows
+    one; the other definition is a one-line ring drain). Returns (body, error)."""
+    bodies = []
+    for m in re.finditer(r"std::vector<ModuleEvent> ModuleEtwCollector::drain\(\) \{", t):
+        e = _match_brace(t, m.end() - 1)
+        if e > 0:
+            bodies.append(t[m.end():e])
+    users = [b for b in bodies if "sign_cache_" in b]
+    if len(users) != 1:
+        return None, f"expected exactly one ModuleEtwCollector::drain() body using sign_cache_, found {len(users)}"
+    return users[0], None
+
+
 def problems(src):
     t = normalise(src)
+    body, err = drain_body(t)
+    if err:
+        return [err + HINT]
     out = []
+    # 1. the image handle comes from open_local_image_no_reparse (never a weaker opener)
+    m_h = re.search(r"(?:const )?ImageHandle (\w+) ?= ?[^;]*?open_local_image_no_reparse\( ?\w+ ?\)[^;]*;", body)
+    if not m_h:
+        return ["drain no longer opens the image with `ImageHandle h = ... open_local_image_no_reparse(...)`" + HINT]
+    h = m_h.group(1)
+    # 2. the stamp is read from THAT handle, inside drain()
     m_stamp = re.search(
-        r"(?:const )?FileVersionStamp (\w+) ?= ?read_image_version_stamp\( ?\w+\.get\(\) ?\);", t)
+        r"(?:const )?FileVersionStamp (\w+) ?= ?read_image_version_stamp\( ?(\w+)\.get\(\) ?\);", body)
     if not m_stamp:
-        return ["drain no longer reads `FileVersionStamp x = read_image_version_stamp(<image>.get())`" + HINT]
+        return ["drain() no longer reads `FileVersionStamp x = read_image_version_stamp(<image>.get())`" + HINT]
     var = m_stamp.group(1)
-    m_get = re.search(r"sign_cache_\.get\( ?full, ?(\w+) ?,", t)
+    if m_stamp.group(2) != h:
+        out.append(f"the stamp is read from `{m_stamp.group(2)}`, not the handle `{h}` opened by open_local_image_no_reparse")
+    if m_stamp.start() < m_h.start():
+        out.append("the stamp is read BEFORE the image handle is opened")
+    # 3. the cache is consulted with that stamp, after it is read, inside drain()
+    m_get = re.search(r"sign_cache_\.get\( ?full, ?(\w+) ?,", body)
     if not m_get:
-        out.append("drain no longer calls sign_cache_.get(full, <stamp>, ...)" + HINT)
+        out.append("drain() no longer calls sign_cache_.get(full, <stamp>, ...)" + HINT)
     else:
         if m_get.group(1) != var:
             out.append(f"sign_cache_.get is passed `{m_get.group(1)}`, not the stamp `{var}` read from the image")
         if m_get.start() < m_stamp.start():
             out.append("sign_cache_.get runs BEFORE the stamp is read from the open image")
-    drain = t[t.find("ModuleEtwCollector::drain"):] if "ModuleEtwCollector::drain" in t else t
-    # a default-built stamp: `FileVersionStamp{}` / `FileVersionStamp x{}` / `FileVersionStamp x;`
-    # / `FileVersionStamp x = {}` anywhere in the drain region (the read above is the only
-    # permitted source of a stamp).
+    # 4. a default-built / hand-filled stamp anywhere in drain(): `FileVersionStamp{}`,
+    # `FileVersionStamp x{}`, `FileVersionStamp x;`, `FileVersionStamp x = {}`, `.usn =` ...
     for bad in (r"FileVersionStamp ?\{", r"FileVersionStamp \w+ ?\{", r"FileVersionStamp \w+ ?;",
                 r"FileVersionStamp \w+ ?= ?\{", r"\.usn ?=", r"\.available ?= ?true", r"\.mtime ?="):
-        if re.search(bad, drain):
-            out.append(f"drain region builds or edits a stamp by hand ({bad}); only read_image_version_stamp may")
+        if re.search(bad, body):
+            out.append(f"drain() builds or edits a stamp by hand ({bad}); only read_image_version_stamp may")
+    # 5. nothing outside drain() may be the one that satisfies the pin: the stamp read must not
+    # appear only elsewhere (covered by 2: it must be inside the body).
     return out
 
 
@@ -86,6 +126,17 @@ def selftest(src):
                              "const FileVersionStamp stamp{};\n", 1)),
         ("default-built stamp beside the read",
          lambda s: s.replace("sign_cache_.get(full, stamp,", "FileVersionStamp other{}; sign_cache_.get(full, stamp,", 1)),
+        ("stamp read moved to a helper outside drain(), weaker stamp in drain()",
+         lambda s: s.replace("const FileVersionStamp stamp = read_image_version_stamp(img.get());",
+                             "const FileVersionStamp stamp = weak_stamp(img.get());", 1)
+                    + "\nstatic FileVersionStamp helper_elsewhere(void* x) { const FileVersionStamp stamp = "
+                      "read_image_version_stamp(img.get()); return stamp; }\n"
+                      "ModuleEvent ModuleEtwCollector::other() { const FileVersionStamp stamp = "
+                      "read_image_version_stamp(img.get()); sign_cache_.get(full, stamp, v); }\n"),
+        ("stamp read from a different handle",
+         lambda s: s.replace("read_image_version_stamp(img.get())", "read_image_version_stamp(other.get())", 1)),
+        ("handle not from open_local_image_no_reparse",
+         lambda s: s.replace("open_local_image_no_reparse(full) : ImageHandle{}", "open_weaker_image(full) : ImageHandle{}", 1)),
         ("usn forced",
          lambda s: s.replace("sign_cache_.get(full, stamp,", "x.usn = 1; sign_cache_.get(full, stamp,", 1)),
     ]

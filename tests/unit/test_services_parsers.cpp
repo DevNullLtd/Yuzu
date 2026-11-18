@@ -439,3 +439,32 @@ TEST_CASE("start_mode_readback_matches: a readback that did not run is not a mat
     timed.termination_reason = yuzu::agent::TerminationReason::deadline;
     CHECK_FALSE(start_mode_readback_matches("manual", timed));
 }
+
+TEST_CASE("start_mode_needs_unmask: automatic and manual unmask first, disabled (mask) does not",
+          "[services][unmask]") {
+    using yuzu::services::start_mode_needs_unmask;
+    CHECK(start_mode_needs_unmask("automatic")); // mask -> automatic must be able to enable
+    CHECK(start_mode_needs_unmask("manual"));
+    CHECK_FALSE(start_mode_needs_unmask("disabled"));
+    CHECK_FALSE(start_mode_needs_unmask("bogus"));
+    CHECK_FALSE(start_mode_needs_unmask(""));
+}
+
+TEST_CASE("start_mode_should_remask: a failed change after an unmask restores the mask",
+          "[services][unmask]") {
+    using yuzu::services::start_mode_should_remask;
+    using yuzu::services::start_state_is_masked;
+    CHECK(start_state_is_masked("masked\n"));
+    CHECK(start_state_is_masked("masked-runtime"));
+    CHECK_FALSE(start_state_is_masked("disabled\n"));
+    CHECK_FALSE(start_state_is_masked(""));
+    CHECK_FALSE(start_state_is_masked("not-found"));
+    // unit was masked, the change failed: put the mask back
+    CHECK(start_mode_should_remask("automatic", true, false));
+    CHECK(start_mode_should_remask("manual", true, false));
+    // a unit that was NOT masked is never masked by a failure; success never remasks
+    CHECK_FALSE(start_mode_should_remask("automatic", false, false));
+    CHECK_FALSE(start_mode_should_remask("automatic", true, true));
+    // disabled is the mask verb itself: nothing was unmasked
+    CHECK_FALSE(start_mode_should_remask("disabled", true, false));
+}

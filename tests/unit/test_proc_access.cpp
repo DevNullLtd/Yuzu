@@ -60,6 +60,17 @@ TEST_CASE("proc_access: the errno of the FIRST failed readlink is counted, not a
     CHECK(yuzu::shared::readlink_noting_with(gone, "/proc/1/exe", enoent).empty());
     CHECK_FALSE(gone.constrained());
 
+    // A target that fills the buffer is degraded (truncated or an exact fit), never clean.
+    ProcAccessTally full;
+    auto filled = [](const char*, char* buf, std::size_t cap) -> ssize_t {
+        for (std::size_t k = 0; k < cap; ++k) buf[k] = 'a'; // readlink filled the whole buffer
+        return static_cast<ssize_t>(cap);
+    };
+    CHECK(yuzu::shared::readlink_noting_with(full, "/proc/1/exe", filled).empty());
+    CHECK(full.truncated == 1);
+    CHECK(full.constrained());
+    CHECK(full.refused == 0);
+
     // A successful read returns the target and counts nothing.
     ProcAccessTally ok;
     auto good = [](const char*, char* buf, std::size_t) -> ssize_t {

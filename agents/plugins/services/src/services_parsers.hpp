@@ -162,6 +162,31 @@ systemctl_mutation_argv(bool euid_is_root, std::string_view systemctl_path,
     return start_mode_took_effect(mode, res.output);
 }
 
+/// The plan for `automatic` and `manual`: `enable` and `disable` both fail on a masked unit, so a
+/// best-effort `unmask` runs first. `disabled` (mask) never unmasks.
+[[nodiscard]] inline bool start_mode_needs_unmask(std::string_view mode) {
+    return mode == "automatic" || mode == "manual";
+}
+
+/// A prior `is-enabled` first line that shows the unit was masked.
+[[nodiscard]] inline bool start_state_is_masked(std::string_view state) {
+    while (!state.empty() && (state.back() == '\n' || state.back() == '\r' || state.back() == ' '))
+        state.remove_suffix(1);
+    if (const auto nl = state.find('\n'); nl != std::string_view::npos)
+        state = state.substr(0, nl);
+    return state == "masked" || state == "masked-runtime";
+}
+
+/// Re-mask after a failed change: the unmask before `enable`/`disable` removed a restriction, so
+/// when the change then fails the unit must not be left LESS restricted than it was found. Only
+/// when this call unmasked a unit it saw masked (`was_masked` comes from a readback taken before
+/// the unmask; an unreadable prior state is not masked, never guessed) and the change did not
+/// take effect.
+[[nodiscard]] inline bool start_mode_should_remask(std::string_view mode, bool was_masked,
+                                                   bool change_succeeded) {
+    return start_mode_needs_unmask(mode) && was_masked && !change_succeeded;
+}
+
 /// One row of `systemctl list-units --type=service [--all|--state=running]
 /// --no-pager --no-legend` output: "UNIT LOAD ACTIVE SUB DESCRIPTION...".
 struct SystemdUnitEntry {

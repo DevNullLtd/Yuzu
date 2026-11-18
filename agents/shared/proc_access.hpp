@@ -28,11 +28,13 @@ namespace yuzu::shared {
 
 struct ProcAccessTally {
     std::size_t refused{0};
+    std::size_t truncated{0}; ///< a link target that filled the read buffer: degraded, not clean
     void note(int err) noexcept {
         if (proc_access_refused(err))
             ++refused;
     }
-    [[nodiscard]] bool constrained() const noexcept { return refused != 0; }
+    void note_truncated() noexcept { ++truncated; }
+    [[nodiscard]] bool constrained() const noexcept { return refused != 0 || truncated != 0; }
 };
 
 #if defined(__linux__)
@@ -48,6 +50,12 @@ template <class ReadlinkFn>
     const ssize_t n = fn(link, buf, sizeof(buf) - 1);
     if (n < 0) {
         tally.note(errno);
+        return {};
+    }
+    if (static_cast<std::size_t>(n) >= sizeof(buf) - 1) {
+        // The buffer is full: readlink does not say whether the target was longer, so a path
+        // this long is truncated or an exact fit; report degraded and emit no path.
+        tally.note_truncated();
         return {};
     }
     return std::string(buf, static_cast<std::size_t>(n));

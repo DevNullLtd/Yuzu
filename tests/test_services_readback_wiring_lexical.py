@@ -106,7 +106,7 @@ def problems(src):
         out.append("set_start_mode no longer judges the readback with start_mode_readback_matches(mode, st)")
     if re.search(r"start_mode_took_effect\(", code):
         out.append("services_plugin.cpp calls the bare start_mode_took_effect( (cannot see a readback that did not run)")
-    if not re.search(r'run_command\( ?\{ ?systemctl_path, "", "", std::string\( ?name ?\) ?\}, ?false ?\)', code):
+    if not re.search(r'auto st = run_command\( ?\{ ?systemctl_path, "", "", std::string\( ?name ?\) ?\}, ?false ?\)', code):
         out.append("the is-enabled readback is not run with stderr unmerged: run_command({..}, false)")
     if '"state|{}"' not in live:
         out.append('the success path no longer emits the "state|{}" line')
@@ -116,6 +116,14 @@ def problems(src):
             r"start_state_is_unchangeable\(state\)\)\s*\{[\s\S]{0,1200}?set_result_status\(\s*YUZU_RESULT_STATUS_CONSTRAINED,"
             r"\s*YUZU_RESULT_COMPLETENESS_PARTIAL,\s*\"services:start_mode_unchangeable\"\s*\)", live):
         out.append("the unchangeable branch no longer sets CONSTRAINED/PARTIAL services:start_mode_unchangeable")
+    if not re.search(r"if \(yuzu::services::start_mode_needs_unmask\(mode\)\) \{", code):
+        out.append("the unmask-first plan no longer comes from start_mode_needs_unmask(mode) (automatic must unmask)")
+    if re.search(r'mode == "manual"\)\s*\{[^}]*unmask', code):
+        out.append("unmask is gated on mode == manual only: mask -> automatic would fail")
+    if len(re.findall(r"remask_after_failure\(\);", code)) != 2:
+        out.append("both failure paths (change failed, readback mismatch) must call remask_after_failure()")
+    if not re.search(r"start_mode_should_remask\( ?mode, was_masked,", code):
+        out.append("remask_after_failure no longer consults start_mode_should_remask(mode, was_masked, ...)")
     return out + u2_problems(src)
 
 
@@ -175,10 +183,18 @@ def selftest(src):
                       r"\"services:start_mode_unchangeable\"\);", src)
         if m and not problems(src[:m.start()] + fn(m.group(0)) + src[m.end():]):
             errs.append(f"selftest: hiding the unchangeable status in a {hname} was NOT detected")
+    m1 = src.replace("if (yuzu::services::start_mode_needs_unmask(mode)) {", 'if (mode == "manual") {', 1)
+    if m1 == src or not problems(m1):
+        errs.append("selftest: reverting the unmask plan to mode == manual was NOT detected")
+    idx = src.rfind("remask_after_failure();")
+    m2 = src[:idx] + src[idx + len("remask_after_failure();"):]
+    if idx < 0 or not problems(m2):
+        errs.append("selftest: dropping a remask_after_failure() call was NOT detected")
     for name, mutated in u2_mutations(src).items():
         if not problems(mutated):
             errs.append(f"selftest: U2 mutation '{name}' was NOT detected")
-    merged = src.replace("/*merge_stderr=*/false", "/*merge_stderr=*/true", 1)
+    k = src.index(RUN)
+    merged = src[:k] + src[k:].replace("/*merge_stderr=*/false", "/*merge_stderr=*/true", 1)
     if merged == src or not problems(merged):
         errs.append("selftest: merging stderr into the readback was NOT detected")
     return errs
