@@ -304,6 +304,14 @@ jobs:
       - name: Agent installer trust-anchor ACL lint
         run: python3 tests/test_agent_installer_acl_lint.py
 
+      # Every plugin the root meson.build builds has a Source line in the
+      # Windows agent installer (yuzu-agent.iss) or a recorded
+      # `; plugin-not-installed:` exclusion (#4867). The release zip takes
+      # plugins by glob, so a missing line ships in the zip and silently not
+      # in the installer. Mutation-tests itself. Stdlib only.
+      - name: Agent installer plugin coverage lint
+        run: python3 -I tests/test_agent_installer_plugin_coverage_lint.py
+
       # Gateway scrape (#5695): every shipped Prometheus config, and every
       # compose stack that runs a Prometheus next to a gateway, scrapes the
       # gateway's metrics port. Stdlib only.

@@ -57,11 +57,18 @@ Name: "plugins"; Description: "Agent plugins"; Types: full custom
 Name: "plugins\system"; Description: "System info (OS, hardware, storage, users)"; Types: full custom
 Name: "plugins\network"; Description: "Network (config, diagnostics, actions, WiFi, WoL)"; Types: full custom
 Name: "plugins\security"; Description: "Security (antivirus, BitLocker, certificates, firewall, exploit-mitigation posture)"; Types: full custom
-Name: "plugins\windows"; Description: "Windows (event logs, registry, WMI, updates, SCCM)"; Types: full custom
+Name: "plugins\windows"; Description: "Windows (event logs, registry, WMI, updates, SCCM, RDP)"; Types: full custom
 Name: "plugins\management"; Description: "Management (processes, services, software, scripts)"; Types: full custom
 Name: "plugins\advanced"; Description: "Advanced (discovery, IOC, vuln scan)"; Types: full custom
 
 [Files]
+; Every plugin the build produces (each subdir('agents/plugins/<dir>') in the
+; root meson.build) has exactly one Source line below, or a recorded
+; exclusion comment in this section of the form
+;   ; plugin-not-installed: <dir>: <why it is left out>
+; tests/test_agent_installer_plugin_coverage_lint.py fails otherwise (#4867).
+; The release zip takes every plugin by glob, so a plugin missing here ships in
+; the zip and silently not in the installer. There are no exclusions today.
 ; --- Core agent ---
 Source: "{#BuildDir}\agents\core\yuzu-agent.exe"; DestDir: "{app}\bin"; Components: core; Flags: ignoreversion
 Source: "{#BuildDir}\agents\core\*.dll"; DestDir: "{app}\bin"; Components: core; Flags: ignoreversion
@@ -97,11 +104,15 @@ Source: "{#BuildDir}\agents\plugins\autoruns\autoruns.dll"; DestDir: "{app}\plug
 ; its dependency being present (governance Gate 7, cross-platform finding).
 Source: "{#BuildDir}\agents\plugins\app_usage\app_usage.dll"; DestDir: "{app}\plugins"; Components: plugins\advanced; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\execution_artifacts\execution_artifacts.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\privacy_permissions\privacy_permissions.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\runtimes\runtimes.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\windows_optional_features\windows_optional_features.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\peripherals\peripherals.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\printing\printing.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\browser_policy\browser_policy.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\browser_inventory\browser_inventory.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\pkg_inventory\pkg_inventory.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\license_scan\license_scan.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\middleware\middleware.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\component_inventory\component_inventory.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\virtualization\virtualization.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
@@ -115,6 +126,7 @@ Source: "{#BuildDir}\agents\plugins\netstat\netstat.dll"; DestDir: "{app}\plugin
 Source: "{#BuildDir}\agents\plugins\wifi\wifi.dll"; DestDir: "{app}\plugins"; Components: plugins\network; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\wol\wol.dll"; DestDir: "{app}\plugins"; Components: plugins\network; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\http_client\http_client.dll"; DestDir: "{app}\plugins"; Components: plugins\network; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\netprobe\netprobe.dll"; DestDir: "{app}\plugins"; Components: plugins\network; Flags: ignoreversion
 
 ; --- Plugins: security ---
 Source: "{#BuildDir}\agents\plugins\antivirus\antivirus.dll"; DestDir: "{app}\plugins"; Components: plugins\security; Flags: ignoreversion
@@ -139,6 +151,7 @@ Source: "{#BuildDir}\agents\plugins\registry\registry.dll"; DestDir: "{app}\plug
 Source: "{#BuildDir}\agents\plugins\wmi\wmi.dll"; DestDir: "{app}\plugins"; Components: plugins\windows; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\windows_updates\windows_updates.dll"; DestDir: "{app}\plugins"; Components: plugins\windows; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\sccm\sccm.dll"; DestDir: "{app}\plugins"; Components: plugins\windows; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\rdp_control\rdp_control.dll"; DestDir: "{app}\plugins"; Components: plugins\windows; Flags: ignoreversion
 
 ; --- Plugins: management ---
 Source: "{#BuildDir}\agents\plugins\processes\processes.dll"; DestDir: "{app}\plugins"; Components: plugins\management; Flags: ignoreversion

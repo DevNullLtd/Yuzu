@@ -3601,6 +3601,16 @@ test('agent installer enrollment-token lint',
   timeout: 30,
 )
 
+# Every agent plugin meson.build produces has a Source line in the Windows
+# agent installer, or a recorded `; plugin-not-installed:` exclusion (#4867).
+# The plugin set is derived from the root meson.build, not hand-kept.
+test('agent installer plugin coverage lint',
+  _python3_test,
+  args: [files('test_agent_installer_plugin_coverage_lint.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # Compose certs volume (#5370): every tracked compose that keeps Postgres on a
 # volume must also keep the server's /etc/yuzu/certs (CA + the secrets KEK,
 # registered in Postgres) on a named volume. Stdlib only, no Docker.
