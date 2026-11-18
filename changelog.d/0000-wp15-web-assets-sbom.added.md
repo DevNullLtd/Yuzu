@@ -12,5 +12,4 @@
   file without updating it. Two versions the vendored files do not state are left
   blank rather than guessed: the htmx SSE extension (byte-identical to both 2.2.2 and
   2.2.3) and tslib. With these listed, a server file's SBOM is not marked incomplete
-  for them (no `server-vendored` reason); the Docker image SBOMs do not list these
-  files yet and keep that reason.
+  for them.

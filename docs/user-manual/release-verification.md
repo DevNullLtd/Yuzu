@@ -266,10 +266,12 @@ in it:
   `yuzu:sbom:licence-noassertion` note (see "Reading the `yuzu:sbom:` notes"
   below).
 - **The third-party files compiled into `yuzu-server`**, on every file that
-  holds it: the web assets the dashboard serves (htmx and its SSE extension,
-  Apache ECharts with the ZRender and tslib code bundled inside it, three.js,
-  Cytoscape.js, the IBM Plex fonts) and the QR-code library (qrcodegen) behind
-  MFA enrolment. No scanner can see them inside the binary, so they come from
+  holds it (and on the `yuzu-server` and `yuzu-server-chisel` image SBOMs; see
+  "Docker image SBOMs" below): the web assets the dashboard serves (htmx and
+  its SSE extension, Apache ECharts with the ZRender and tslib code bundled
+  inside it, three.js, Cytoscape.js, the IBM Plex fonts) and the QR-code
+  library (qrcodegen) behind MFA enrolment. No scanner can see them inside
+  the binary, so they come from
   `server/core/vendored-components.json` in the source tree, which records
   each one's version, licence, upstream and SHA-256, and which the release
   checks against the files it built from. They carry `pkg:npm` purls
@@ -333,7 +335,6 @@ existing token keeps its meaning. Read the tokens, not the prose, in a script.
 
 | Token | On | What the SBOM does not list |
 |---|---|---|
-| `server-vendored` | an image holding `yuzu-server` | qrcodegen and the web assets compiled into it, which the image scan cannot see (the SBOM of a file holding `yuzu-server` lists them) |
 | `installer-runtime` | the Windows installer | InnoSetup's setup loader and uninstaller, and the licence text, icon and compiled installer script the compiler embeds |
 | `erts-static` | a gateway file or image | what the Erlang emulator `beam.smp` vendors: PCRE2, asmjit, zstd, Ryu, OpenSSL's MD5 |
 | `image-static-cpp` | a server or agent image | the vcpkg libraries linked statically into `yuzu-server` or `yuzu-agent`, which the image scan cannot see (the matching package's SBOM lists them) |
@@ -463,19 +464,28 @@ same version as the file SBOMs) of the image by its digest
 attests, so the SBOM describes that exact image, not whatever a tag points at
 later. It lists the operating-system packages and what syft recognises in the
 image's files, so it does not list the C++ libraries linked statically into
-`yuzu-server` or `yuzu-agent`, nor the third-party files compiled into
-`yuzu-server` (the web assets and qrcodegen; the `yuzu-linux-x64` archive and
-the `yuzu-server` and `yuzu-agent` package SBOMs list those), nor what the
-gateway images' Erlang emulator vendors, nor the `yuzu-postgres` image's
-pgvector. The
+`yuzu-server` or `yuzu-agent` (the `yuzu-linux-x64` archive and the
+`yuzu-server` and `yuzu-agent` package SBOMs list those), nor what the gateway
+images' Erlang emulator vendors, nor the `yuzu-postgres` image's pgvector. The
 release marks each of the six incomplete the same way as a file SBOM: the two
-server images `server-vendored, image-static-cpp`, the agent image
-`image-static-cpp`, the two gateway images `erts-static`, and the
-`yuzu-postgres` image `pgvector-source`. Beyond those, an image SBOM lists what
-syft recognises and no more. The release's SBOM scope check does not hold image
-SBOMs to the file rules (entry bound, forbidden paths), but it refuses an image
-SBOM pair that should carry the marker and does not, one carrying only part of
-it, and one named as a release image that lacks that image's title label.
+server images and the agent image `image-static-cpp`, the two gateway images
+`erts-static`, and the `yuzu-postgres` image `pgvector-source`.
+
+The SBOMs of the two images that hold `yuzu-server` (`yuzu-server-image.*` and
+`yuzu-server-chisel-image.*`) also list the third-party files compiled into it,
+the same entries as the server's file SBOMs (web assets and the QR-code
+library, `vendored-*` in CycloneDX, `SPDXRef-Package-vendored-*` in SPDX), from
+`server/core/vendored-components.json`, checked against the source the image was
+built from, and carry the same `yuzu:sbom:vendored` note; they are not a reason
+for the marker. Everything the scan found is kept as it was. Beyond those, an
+image SBOM lists what syft recognises and no more.
+
+The release's SBOM scope check does not hold image SBOMs to the file rules
+(entry bound, forbidden paths), but it refuses an image SBOM pair that should
+carry the marker and does not, one carrying only part of it, one named as a
+release image that lacks that image's title label, and a pair that does not
+list yuzu-server's vendored components in both formats when the image holds
+`yuzu-server` (or lists them when it does not).
 
 The agent-bundle image (`yuzu-agent-bundle-chisel`) is not a release image: it
 is built from the published release afterwards, by a separate job. Its syft
@@ -486,6 +496,10 @@ package SBOMs inside the release list that binary's libraries.
 ```bash
 jq '.components | length' yuzu-server-image.cdx.json
 jq -r '.components[] | "\(.name)@\(.version)"' yuzu-server-image.cdx.json | sort -u
+
+# The third-party files compiled into yuzu-server
+jq -r '.components[] | select(."bom-ref" // "" | startswith("vendored-"))
+       | "\(.name)\t\(.version // "unresolved")\t\(.purl)"' yuzu-server-chisel-image.cdx.json
 ```
 
 ## 6. End-to-end verification script

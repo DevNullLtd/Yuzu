@@ -32,8 +32,8 @@ at a time. These tests pin what that means:
     CONTAINS NOASSERTION) and why, by tokens from a closed set that
     release-verification.md documents exactly; an SBOM for a file holding
     yuzu-server, which lists the vendored components, does not;
-  - `mark-image` marks an image SBOM pair whose image holds a Yuzu C++ binary
-    or the Erlang emulator, idempotently, refuses a mismatched or partly
+  - `mark-image` marks an image SBOM pair whose image holds a Yuzu C++ binary,
+    the Erlang emulator or pgvector, idempotently, refuses a mismatched or partly
     marked pair, and the release check refuses an image pair left unmarked,
     partly marked, marked for nothing, or named as a release image without
     that image's title label;
@@ -68,7 +68,21 @@ at a time. These tests pin what that means:
     .github/ wherever syft records a path (CycloneDX file names, location
     properties and evidence; SPDX file names and package sourceInfo), one
     with no components and no record of unpacked files, and one whose SHA-256
-    or name does not match its artifact, and skips the image SBOMs.
+    or name does not match its artifact, and skips the image SBOMs;
+  - `augment` adds the same vendored components to a syft scan of an image
+    holding yuzu-server, in both formats with the `yuzu:sbom:vendored` note,
+    keeping every syft entry as it was (the SPDX root's comment gains only the
+    note line); leaves an image without it byte-for-byte unchanged (without
+    reading the manifest); and fails, writing nothing, on a manifest that
+    disagrees with the source tree, a server-labelled image with no
+    yuzu-server listed, a mismatched pair or a pair carrying any part of what
+    it adds. mark-image then marks the augmented pair `image-static-cpp` only,
+    and the release check refuses a server image pair without the components
+    (in either format) and another image's pair with them. The image fixtures under
+    tests/fixtures/image-sbom/ are real syft 1.57.2 scans of the published
+    yuzu-server-chisel:0.14.0 and yuzu-agent-chisel:0.14.1 images, trimmed to
+    a few entries (so the SPDX root's verification code no longer matches its
+    files; nothing here reads it).
 
 syft (and pkgutil, rpm2cpio for those formats) is replaced by a small stub, so
 the test needs no network and no syft. Stdlib only, plus jsonschema for the
@@ -100,6 +114,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "scripts" / "ci" / "artifact-sbom.py"
 VENDORED = ROOT / "server" / "core" / "vendored-components.json"
+IMAGE_FIXTURES = ROOT / "tests" / "fixtures" / "image-sbom"
 TRIPLET = "x64-linux-static"
 POSIX_STUBS = os.name != "nt"
 # Where an absolute tar member would land if extraction let it escape; salted,
@@ -487,6 +502,21 @@ def force_mark(cdx: dict, spdx: dict, tokens: str, parts=("composition", "proper
     return cdx, spdx
 
 
+def augment(cdx: dict, spdx: dict) -> tuple:
+    """What release.yml's `augment` step does to an image pair, with the
+    checkout's vendored-components manifest (a no-op without yuzu-server)."""
+    m = load_script()
+    m.augment_image(cdx, spdx, lambda: m.vendored_components(VENDORED, ROOT))
+    return cdx, spdx
+
+
+def release_image_pair(title: str, files: list, owned: tuple = ()) -> tuple:
+    """An image pair as the release publishes it: augmented, then marked."""
+    cdx, spdx = augment(*make_image_pair(title, files, owned=owned))
+    load_script().mark_image(cdx, spdx)
+    return cdx, spdx
+
+
 SERVER_IMAGE_FILES = ["usr/bin/busybox", "usr/lib/x86_64-linux-gnu/libc.so.6", "usr/local/bin/yuzu-server"]
 AGENT_IMAGE_FILES = ["usr/bin/busybox", "usr/local/bin/yuzu-agent", "usr/local/lib/libyuzu_agent_core.so",
                      "usr/lib/yuzu/plugins/status/status.so"]
@@ -552,6 +582,18 @@ def run_script(*args, env=None):
     e = dict(os.environ, **(env or {}))
     return subprocess.run([sys.executable, "-I", str(SCRIPT)] + [str(a) for a in args],
                           capture_output=True, text=True, env=e)
+
+
+def drifted_source_tree(src: Path) -> Path:
+    """A copy of the vendored files and the manifest in which echarts.min.js
+    no longer matches the manifest's hash."""
+    for rel in ("server/core/static", "server/core/vendor"):
+        shutil.copytree(ROOT / rel, src / rel)
+    (src / "server/core/src").mkdir(parents=True)
+    shutil.copy2(ROOT / "server/core/src/static_js_bundle.cpp", src / "server/core/src")
+    shutil.copy2(VENDORED, src / "server/core")
+    (src / "server/core/vendor/echarts.min.js").write_bytes(b"/* not echarts */")
+    return src
 
 
 # ── Units: no subprocess stubs, so these run on Windows too ──────────────────
@@ -866,8 +908,8 @@ class Units(unittest.TestCase):
     def test_mark_image(self):
         m = self.mod
         cases = {
-            "yuzu-server": (SERVER_IMAGE_FILES, (), ["server-vendored", "image-static-cpp"]),
-            "yuzu-server-chisel": (SERVER_IMAGE_FILES, (), ["server-vendored", "image-static-cpp"]),
+            "yuzu-server": (SERVER_IMAGE_FILES, (), ["image-static-cpp"]),
+            "yuzu-server-chisel": (SERVER_IMAGE_FILES, (), ["image-static-cpp"]),
             "yuzu-agent-chisel": (AGENT_IMAGE_FILES, (), ["image-static-cpp"]),
             "yuzu-gateway": (GATEWAY_IMAGE_FILES, (GATEWAY_IMAGE_FILES[0],), ["erts-static"]),
             "yuzu-postgres": (POSTGRES_IMAGE_FILES, (), ["pgvector-source"]),
@@ -929,7 +971,7 @@ class Units(unittest.TestCase):
         for missing in full:
             with self.subTest(missing=missing):
                 c, s = force_mark(*make_image_pair("yuzu-server", SERVER_IMAGE_FILES),
-                                  "server-vendored, image-static-cpp", tuple(x for x in full if x != missing))
+                                  "image-static-cpp", tuple(x for x in full if x != missing))
                 self.assertIn(m.PARTIAL, m.image_marker(c, s))
                 with self.assertRaises(m.SbomError) as cm:
                     m.mark_image(c, s)
@@ -937,14 +979,14 @@ class Units(unittest.TestCase):
         # Part of a marker on a pair that needs none: refused, not left as it is.
         for part in full:
             with self.subTest(nothing_to_mark=part):
-                c, s = force_mark(*make_image_pair("yuzu-other", ["usr/bin/busybox"]), "server-vendored", (part,))
+                c, s = force_mark(*make_image_pair("yuzu-other", ["usr/bin/busybox"]), "image-static-cpp", (part,))
                 with self.assertRaises(m.SbomError) as cm:
                     m.mark_image(c, s)
                 self.assertIn("only in part", str(cm.exception))
         # Marked for other reasons: refused, not re-marked.
-        c, s = make_image_pair("yuzu-agent", AGENT_IMAGE_FILES)
+        c, s = make_image_pair("yuzu-gateway", GATEWAY_IMAGE_FILES, owned=(GATEWAY_IMAGE_FILES[0],))
         m.mark_image(c, s)
-        s["files"].append({"fileName": "usr/local/bin/yuzu-server", "SPDXID": "SPDXRef-File-x"})
+        s["files"].append({"fileName": "usr/local/bin/yuzu-agent", "SPDXID": "SPDXRef-File-x"})
         with self.assertRaises(m.SbomError):
             m.mark_image(c, s)
 
@@ -957,8 +999,8 @@ class Units(unittest.TestCase):
         m.mark_image(cdx, spdx)
         lines = spdx["packages"][0]["comment"].split("\n")
         self.assertEqual(lines[0], "scanned by syft")
-        self.assertIn("yuzu:sbom:incomplete-reasons: server-vendored, image-static-cpp", lines[1:])
-        self.assertEqual(m.image_marker(cdx, spdx), (["server-vendored", "image-static-cpp"],) * 2)
+        self.assertIn("yuzu:sbom:incomplete-reasons: image-static-cpp", lines[1:])
+        self.assertEqual(m.image_marker(cdx, spdx), (["image-static-cpp"],) * 2)
 
     def test_a_note_written_twice_is_refused(self):
         # The script writes each note once; a second copy is ambiguous (the
@@ -977,13 +1019,12 @@ class Units(unittest.TestCase):
         # or property fails, whichever copy would have matched.
         for dup in ("cdx", "spdx"):
             with self.subTest(dup=dup):
-                cdx, spdx = make_image_pair("yuzu-server", SERVER_IMAGE_FILES)
-                m.mark_image(cdx, spdx)
+                cdx, spdx = release_image_pair("yuzu-server", SERVER_IMAGE_FILES)
                 if dup == "cdx":
                     cdx["metadata"]["properties"].append({"name": "yuzu:sbom:incomplete-reasons",
-                                                          "value": "server-vendored, image-static-cpp"})
+                                                          "value": "image-static-cpp"})
                 else:
-                    spdx["packages"][0]["comment"] += "\nyuzu:sbom:incomplete-reasons: server-vendored, image-static-cpp"
+                    spdx["packages"][0]["comment"] += "\nyuzu:sbom:incomplete-reasons: image-static-cpp"
                 with self.assertRaises(m.SbomError) as cm:
                     m.image_marker(cdx, spdx)
                 self.assertIn("appears 2 times", str(cm.exception))
@@ -1242,7 +1283,7 @@ class Check(unittest.TestCase):
         s.write_text(json.dumps(spdx))
         r = run_script("mark-image", "--cdx", c, "--spdx", s)
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn("marked incomplete (server-vendored, image-static-cpp)", r.stdout)
+        self.assertIn("marked incomplete (image-static-cpp)", r.stdout)
         once = (c.read_bytes(), s.read_bytes())
         r = run_script("mark-image", "--cdx", c, "--spdx", s)
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -1275,9 +1316,11 @@ class Check(unittest.TestCase):
                  "yuzu-postgres-image": make_image_pair("yuzu-postgres", POSTGRES_IMAGE_FILES),
                  "yuzu-other-image": make_image_pair("yuzu-other", ["usr/bin/busybox"])}
 
-        def write(mark):
+        def write(mark, add_vendored=True):
             for stem, (cdx, spdx) in pairs.items():
                 cdx, spdx = json.loads(json.dumps(cdx)), json.loads(json.dumps(spdx))
+                if add_vendored:
+                    augment(cdx, spdx)
                 if mark:
                     load_script().mark_image(cdx, spdx)
                 (self.tmp / f"{stem}.cdx.json").write_text(json.dumps(cdx))
@@ -1298,11 +1341,21 @@ class Check(unittest.TestCase):
         write(mark=False)
         r = run_script("check", "--artifacts-dir", self.tmp)
         self.assertNotEqual(r.returncode, 0)
-        self.assertIn("yuzu-server-image: the image holds what its SBOM cannot list "
-                      "(server-vendored, image-static-cpp)", r.stderr)
+        self.assertIn("yuzu-server-image: the image holds what its SBOM cannot list (image-static-cpp)", r.stderr)
         self.assertIn("yuzu-gateway-chisel-image: the image holds what its SBOM cannot list (erts-static)", r.stderr)
         self.assertIn("yuzu-postgres-image: the image holds what its SBOM cannot list (pgvector-source)", r.stderr)
         self.assertNotIn("yuzu-other-image:", r.stderr)
+        self.assertNotIn("does not list the components compiled into it", r.stderr)
+        # A dropped augment step fails the release too: the server image's
+        # pair must list yuzu-server's vendored components.
+        write(mark=True, add_vendored=False)
+        r = run_script("check", "--artifacts-dir", self.tmp)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("yuzu-server-image: the image holds yuzu-server (/usr/local/bin/yuzu-server), but the pair "
+                      "does not list the components compiled into it (not listed (CycloneDX) / not listed (SPDX))",
+                      r.stderr)
+        for stem in ("yuzu-gateway-chisel-image", "yuzu-postgres-image", "yuzu-other-image"):
+            self.assertNotIn(f"{stem}:", r.stderr)
         (self.tmp / "yuzu-other-image.spdx.json").unlink()
         r = run_script("check", "--artifacts-dir", self.tmp)
         self.assertIn("yuzu-other-image: only cdx.json", r.stderr)
@@ -1316,32 +1369,52 @@ class Check(unittest.TestCase):
                 "component": {"name": art.name, "hashes": [{"alg": "SHA-256",
                                                             "content": hashlib.sha256(b"plugins").hexdigest()}]},
                 "properties": [{"name": "yuzu:sbom:unpacked-files", "value": "2"}]}}))
-        tokens = "server-vendored, image-static-cpp"
+        tokens = "image-static-cpp"
         no_label = make_image_pair("yuzu-server-chisel", ["usr/bin/busybox"])
         del no_label[0]["metadata"]["properties"]
         agent_as_gateway = make_image_pair("yuzu-agent", AGENT_IMAGE_FILES)
         load_script().mark_image(*agent_as_gateway)
+        m = load_script()
+        # yuzu-server's vendored components in the CycloneDX half only.
+        cdx_only = release_image_pair("yuzu-test-server", SERVER_IMAGE_FILES)
+        sroot = cdx_only[1]["packages"][0]
+        sroot["comment"] = "\n".join(ln for ln in sroot["comment"].split("\n")
+                                     if not ln.startswith("yuzu:sbom:vendored: "))
+        # yuzu-server's vendored components on an image that does not hold it.
+        stray = make_image_pair("yuzu-test-stray", ["usr/bin/busybox"])
+        wcomps = m.vendored_components(VENDORED, ROOT)
+        m.add_vendored_cdx(stray[0], wcomps)
+        stray[0]["metadata"]["properties"].append({"name": "yuzu:sbom:vendored", "value": "10"})
+        m.add_vendored_spdx(stray[1], stray[1]["packages"][0]["SPDXID"], wcomps)
+        stray[1]["packages"][0]["comment"] = "yuzu:sbom:vendored: 10"
         cases = {
             # Marked for something the image is not seen to hold.
-            "yuzu-other": (force_mark(*make_image_pair("yuzu-other", ["usr/bin/busybox"]), "server-vendored"),
-                           "marked incomplete (server-vendored / server-vendored) for nothing the image is seen"),
+            "yuzu-other": (force_mark(*make_image_pair("yuzu-other", ["usr/bin/busybox"]), "image-static-cpp"),
+                           "marked incomplete (image-static-cpp / image-static-cpp) for nothing the image is seen"),
             # Part of a marker on an image that needs none (p4-qe-2, p5): still
             # "marked for nothing", never read as unmarked.
             **{f"yuzu-other-{part}": (force_mark(*make_image_pair(f"yuzu-other-{part}", ["usr/bin/busybox"]),
-                                                 "server-vendored", (part,)),
+                                                 "image-static-cpp", (part,)),
                                       "for nothing the image is seen to hold")
                for part in ("composition", "property", "relationship", "comment")},
             # Every part but one: the reason tokens without the composition.
-            "yuzu-server": (force_mark(*make_image_pair("yuzu-server", SERVER_IMAGE_FILES), tokens,
+            "yuzu-server": (force_mark(*augment(*make_image_pair("yuzu-server", SERVER_IMAGE_FILES)), tokens,
                                        ("property", "relationship", "comment")), "is marked only in part"),
             # The SPDX relationship without its comment line.
-            "yuzu-server-chisel": (force_mark(*make_image_pair("yuzu-server-chisel", SERVER_IMAGE_FILES), tokens,
-                                              ("composition", "property", "relationship")), "/ only in part"),
+            "yuzu-server-chisel": (force_mark(*augment(*make_image_pair("yuzu-server-chisel", SERVER_IMAGE_FILES)),
+                                              tokens, ("composition", "property", "relationship")),
+                                   "/ only in part"),
             # Named as a release image, with no title label: the marker it
             # needs is keyed on the label, so it cannot pass unmarked.
             "yuzu-agent-chisel": (no_label, "carries no title label"),
             # Named as one release image, labelled as another.
             "yuzu-gateway": (agent_as_gateway, "its title label is 'yuzu-agent'"),
+            # yuzu-server's vendored components listed in one format only.
+            "yuzu-test-server": (cdx_only, "listed (CycloneDX) / only in part (the yuzu:sbom:vendored note or the "
+                                           "vendored entries missing) (SPDX)"),
+            # ...or on an image that does not hold yuzu-server.
+            "yuzu-test-stray": (stray, "lists yuzu-server's vendored components (listed / listed), but syft lists "
+                                       "no yuzu-server in the image"),
         }
         for title, ((cdx, spdx), msg) in cases.items():
             with self.subTest(title=title):
@@ -1353,15 +1426,30 @@ class Check(unittest.TestCase):
                 self.assertNotEqual(r.returncode, 0, r.stdout)
                 self.assertIn(f"{title}-image: ", r.stderr)
                 self.assertIn(msg, r.stderr)
-        # The same pairs, marked properly, pass.
+        # The same pairs, augmented and marked properly, pass.
         for old in self.tmp.glob("*-image.*.json"):
             old.unlink()
-        cdx, spdx = make_image_pair("yuzu-server", SERVER_IMAGE_FILES)
-        load_script().mark_image(cdx, spdx)
+        cdx, spdx = release_image_pair("yuzu-server", SERVER_IMAGE_FILES)
         (self.tmp / "yuzu-server-image.cdx.json").write_text(json.dumps(cdx))
         (self.tmp / "yuzu-server-image.spdx.json").write_text(json.dumps(spdx))
         r = run_script("check", "--artifacts-dir", self.tmp)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_release_augments_every_server_image_sbom(self):
+        # release.yml runs augment on the image SBOM pair of each job that can
+        # publish a yuzu-server image, before mark-image and the upload (the
+        # release check above is the backstop; this fails in PR CI instead).
+        wf = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+        for stem in ("yuzu-${{ matrix.image }}-image", "yuzu-${{ matrix.image }}-chisel-image"):
+            with self.subTest(stem=stem):
+                step = (f"SBOM: {stem}\n        run: python3 scripts/ci/artifact-sbom.py augment "
+                        f'--cdx "$SBOM.cdx.json" --spdx "$SBOM.spdx.json"')
+                mark = (f"SBOM: {stem}\n        run: python3 scripts/ci/artifact-sbom.py mark-image "
+                        f'--cdx "$SBOM.cdx.json" --spdx "$SBOM.spdx.json"')
+                self.assertEqual(wf.count(step), 1)
+                at = wf.index(step)
+                self.assertLess(at, wf.index(mark))
+                self.assertLess(at, wf.index("- name: Upload image SBOM artifacts", at))
 
     def test_release_marks_every_yuzu_image_sbom(self):
         # release.yml runs mark-image on the image SBOM pair of each job that
@@ -1602,13 +1690,7 @@ class ArtifactSbom(unittest.TestCase):
         # A source tree whose vendored bytes differ from the manifest must not
         # produce an SBOM that names the manifest's hashes.
         make_vcpkg_tree(self.tmp)
-        src = self.tmp / "src"
-        for rel in ("server/core/static", "server/core/vendor"):
-            shutil.copytree(ROOT / rel, src / rel)
-        (src / "server/core/src").mkdir(parents=True)
-        shutil.copy2(ROOT / "server/core/src/static_js_bundle.cpp", src / "server/core/src")
-        shutil.copy2(VENDORED, src / "server/core")
-        (src / "server/core/vendor/echarts.min.js").write_bytes(b"/* not echarts */")
+        src = drifted_source_tree(self.tmp / "src")
         art = make_tar(self.tmp / "yuzu-linux-x64.tar.gz", {"y/bin/yuzu-server": b"x"})
         r = self.generate(art, extra=("--source-root", src))
         self.assertNotEqual(r.returncode, 0)
@@ -1789,8 +1871,7 @@ class ArtifactSbom(unittest.TestCase):
                                     ("yuzu-agent-chisel", AGENT_IMAGE_FILES, ()),
                                     ("yuzu-gateway-chisel", GATEWAY_IMAGE_FILES, (GATEWAY_IMAGE_FILES[0],)),
                                     ("yuzu-postgres", POSTGRES_IMAGE_FILES, ())):
-            cdx, spdx = make_image_pair(title, files, owned=owned)
-            mod.mark_image(cdx, spdx)
+            cdx, spdx = release_image_pair(title, files, owned=owned)
             (self.out / f"{title}-image.cdx.json").write_text(json.dumps(cdx))
             (self.out / f"{title}-image.spdx.json").write_text(json.dumps(spdx))
         stems = sorted({p.name[: -len(".cdx.json")] for p in self.out.glob("*.cdx.json")})
@@ -2043,6 +2124,7 @@ class ArtifactSbom(unittest.TestCase):
         # packages: it is not held to the artifact rules, only to the marker.
         cdx, spdx = make_image_pair("yuzu-server", SERVER_IMAGE_FILES)
         cdx["components"] += [{"type": "file", "name": "/usr/lib/x/tests/y"}] * 1000
+        augment(cdx, spdx)
         load_script().mark_image(cdx, spdx)
         (self.tmp / "yuzu-server-image.cdx.json").write_text(json.dumps(cdx))
         (self.tmp / "yuzu-server-image.spdx.json").write_text(json.dumps(spdx))
@@ -2064,6 +2146,169 @@ class ArtifactSbom(unittest.TestCase):
         r = run_script("check", "--artifacts-dir", self.tmp)
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("must be named yuzu-linux-x64.cdx.json", r.stderr)
+
+
+class ImageSbomAugment(unittest.TestCase):
+    """`augment` over the syft image scans the release publishes."""
+
+    SERVER = "yuzu-server-chisel"
+    AGENT = "yuzu-agent-chisel"
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="yuzu_test_image_sbom_"))
+        for f in IMAGE_FIXTURES.iterdir():
+            shutil.copy2(f, self.tmp / f.name)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def pair(self, image):
+        return self.tmp / f"{image}-image.cdx.json", self.tmp / f"{image}-image.spdx.json"
+
+    def augment(self, image, *extra, spdx_of=None):
+        cdx, spdx = self.pair(image)
+        if spdx_of:
+            spdx = self.pair(spdx_of)[1]
+        return subprocess.run([sys.executable, "-I", str(SCRIPT), "augment", "--cdx", str(cdx), "--spdx", str(spdx)]
+                              + [str(a) for a in extra], capture_output=True, text=True)
+
+    def snapshot(self):
+        return {f.name: f.read_bytes() for f in self.tmp.iterdir()}
+
+    def test_server_image_gains_vendored_components(self):
+        cdx_path, spdx_path = self.pair(self.SERVER)
+        before_cdx, before_spdx = json.loads(cdx_path.read_text()), json.loads(spdx_path.read_text())
+        r = self.augment(self.SERVER)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("added 10 vendored components (yuzu-server at /usr/local/bin/yuzu-server)", r.stdout)
+        cdx, spdx = json.loads(cdx_path.read_text()), json.loads(spdx_path.read_text())
+        manifest = json.loads(VENDORED.read_text(encoding="utf-8"))["components"]
+        top = {c["id"] for c in manifest if "part_of" not in c}
+
+        # CycloneDX: syft's components first and unchanged, then the vendored ones.
+        n = len(before_cdx["components"])
+        self.assertEqual(cdx["components"][:n], before_cdx["components"])
+        added = {c["bom-ref"]: c for c in cdx["components"][n:]}
+        self.assertEqual(set(added), {f"vendored-{i}" for i in top})
+        self.assertEqual(sorted(c["name"] for c in added["vendored-echarts"]["components"]), ["tslib", "zrender"])
+        cyto = added["vendored-cytoscape"]
+        self.assertEqual((cyto["purl"], cyto["hashes"][0]["content"]),
+                         ("pkg:npm/cytoscape@3.33.3",
+                          hashlib.sha256((ROOT / "server/core/static/cytoscape.min.js").read_bytes()).hexdigest()))
+        # Only one metadata property is added; the root and everything else is syft's.
+        meta, before_meta = dict(cdx["metadata"]), dict(before_cdx["metadata"])
+        props, before_props = meta.pop("properties"), before_meta.pop("properties")
+        self.assertEqual(meta, before_meta)
+        self.assertEqual(props[:-1], before_props)
+        self.assertEqual(props[-1]["name"], "yuzu:sbom:vendored")
+        self.assertEqual({k: v for k, v in cdx.items() if k not in ("components", "metadata")},
+                         {k: v for k, v in before_cdx.items() if k not in ("components", "metadata")})
+        for doc in (cdx, spdx):
+            errs = schema_errors(doc)
+            self.assertFalse(errs, f"fails its schema: {errs[:5] if errs else errs}")
+
+        # SPDX: syft's packages and relationships first and unchanged, but for
+        # the note line the root package's comment gains (syft wrote none).
+        m = load_script()
+        sroot = m._spdx_root(spdx)
+        self.assertNotIn("comment", m._spdx_root(before_spdx))
+        self.assertEqual(sroot.pop("comment").split("\n"), [f"yuzu:sbom:vendored: {props[-1]['value']}"])
+        for key in ("packages", "relationships"):
+            self.assertEqual(spdx[key][:len(before_spdx[key])], before_spdx[key])
+        sroot["comment"] = f"yuzu:sbom:vendored: {props[-1]['value']}"
+        self.assertEqual({k: v for k, v in spdx.items() if k not in ("packages", "relationships")},
+                         {k: v for k, v in before_spdx.items() if k not in ("packages", "relationships")})
+        pkgs = {p["SPDXID"]: p for p in spdx["packages"][len(before_spdx["packages"]):]}
+        self.assertEqual(len(pkgs), len(manifest))
+        self.assertTrue(all(i.startswith("SPDXRef-Package-vendored-") for i in pkgs))
+        self.assertEqual(pkgs["SPDXRef-Package-vendored-htmx"]["versionInfo"], "2.0.4")
+        rels = {(x["spdxElementId"], x["relatedSpdxElement"])
+                for x in spdx["relationships"][len(before_spdx["relationships"]):]}
+        root = "SPDXRef-DocumentRoot-Image-ghcr.io-devnullltd-yuzu-server-chisel"
+        self.assertIn((root, "SPDXRef-Package-vendored-qrcodegen"), rels)
+        self.assertIn(("SPDXRef-Package-vendored-echarts", "SPDXRef-Package-vendored-zrender"), rels)
+        # The note is written in both formats under one key, as every note is.
+        self.assertEqual(m.spdx_note(sroot.get("comment"), "vendored"), props[-1]["value"])
+        self.assertEqual(m.image_vendored_state(cdx, spdx), (True, True))
+
+        # mark-image then marks it for what the scan still cannot see, and
+        # nothing for the components augment listed.
+        r = run_script("mark-image", "--cdx", cdx_path, "--spdx", spdx_path)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("marked incomplete (image-static-cpp)", r.stdout)
+        # With the agent image's pair marked as the release marks it, both
+        # pass the release gate.
+        r = run_script("mark-image", "--cdx", self.pair(self.AGENT)[0], "--spdx", self.pair(self.AGENT)[1])
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("marked incomplete (image-static-cpp)", r.stdout)
+        self.assertEqual(m.image_pair_errors(self.tmp), [])
+
+        # A second run over the augmented pair is refused, not duplicated.
+        r = self.augment(self.SERVER)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("already lists yuzu-server's vendored components", r.stderr)
+
+    def test_agent_image_unchanged(self):
+        before = self.snapshot()
+        # An empty source root: an image without yuzu-server never reads the manifest.
+        empty = self.tmp / "empty"
+        empty.mkdir()
+        r = self.augment(self.AGENT, "--source-root", empty)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("no yuzu-server in the image; left unchanged", r.stdout)
+        empty.rmdir()
+        self.assertEqual(self.snapshot(), before)
+
+    def test_stale_manifest_fails_and_writes_nothing(self):
+        src = drifted_source_tree(Path(tempfile.mkdtemp(prefix="yuzu_test_image_sbom_src_")))
+        try:
+            before = self.snapshot()
+            r = self.augment(self.SERVER, "--source-root", src)
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("does not match the source tree", r.stderr)
+            self.assertIn("echarts.min.js", r.stderr)
+            self.assertEqual(self.snapshot(), before)
+        finally:
+            shutil.rmtree(src, ignore_errors=True)
+
+    def test_server_labelled_image_without_the_binary_fails(self):
+        _cdx, spdx_path = self.pair(self.SERVER)
+        spdx = json.loads(spdx_path.read_text())
+        spdx["files"] = [f for f in spdx["files"] if not f["fileName"].endswith("yuzu-server")]
+        spdx_path.write_text(json.dumps(spdx))
+        before = self.snapshot()
+        r = self.augment(self.SERVER)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("labelled yuzu-server-chisel, but syft lists no yuzu-server binary", r.stderr)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_refuses_a_mismatched_pair(self):
+        before = self.snapshot()
+        r = self.augment(self.SERVER, spdx_of=self.AGENT)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("are not one image's pair", r.stderr)
+        self.assertEqual(self.snapshot(), before)
+        # Named as one pair, but the two halves describe different images.
+        _cdx, spdx_path = self.pair(self.SERVER)
+        spdx_path.write_bytes(self.pair(self.AGENT)[1].read_bytes())
+        before = self.snapshot()
+        r = self.augment(self.SERVER)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("describe different images", r.stderr)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_partly_augmented_pair_is_refused(self):
+        # Any part of what augment adds, on either half, is refused rather
+        # than completed or duplicated.
+        cdx_path, spdx_path = self.pair(self.SERVER)
+        spdx = json.loads(spdx_path.read_text())
+        load_script()._spdx_root(spdx)["comment"] = "yuzu:sbom:vendored: 10"
+        spdx_path.write_text(json.dumps(spdx))
+        before = self.snapshot()
+        r = self.augment(self.SERVER)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("already lists yuzu-server's vendored components", r.stderr)
+        self.assertEqual(self.snapshot(), before)
 
 
 if __name__ == "__main__":

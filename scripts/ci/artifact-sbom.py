@@ -67,6 +67,20 @@ server, agent, gateway or postgres image in which syft lists no such file, and
 a pair already marked differently; a pair already marked the same way is left
 as it is.
 
+`augment` adds the VENDORED_MANIFEST components (after the same check against
+the source tree) to a syft scan of a published container image, given as its
+CycloneDX and SPDX pair and rewritten in place, with a `yuzu:sbom:vendored`
+note in both formats. It acts only when syft lists a yuzu-server binary in the
+image (as an SPDX file: syft 1.57 lists it nowhere in CycloneDX), and leaves
+any other image's pair untouched without reading the manifest. It refuses a
+pair that does not describe one image, an image labelled as the release's
+server image in which syft lists no yuzu-server, and a pair already carrying
+any part of what it adds. syft's entries are kept: components, packages and
+relationships are appended to, and the SPDX root's comment gains the note line
+after any comment syft wrote; nothing else of syft's changes. It adds no
+incompleteness marker; `mark-image` decides that, and the components it adds
+are not a reason for one.
+
 `check-vendored` compares VENDORED_MANIFEST with the source tree: every file
 under its tracked roots is listed with its SHA-256 and size, first-party by
 name, or an attribution file (whose recorded SHA-256 values must each be a
@@ -81,7 +95,9 @@ the wrong directory lists; a path elsewhere is not detected), or (with
 --artifacts-dir) names an artifact that is absent or whose SHA-256 differs.
 Image SBOMs (`*-image.*`) are not artifact SBOMs and are not checked against
 those rules; with --artifacts-dir, each image pair must carry the marker
-`mark-image` would add (so a dropped `mark-image` step fails the release).
+`mark-image` would add, and list yuzu-server's vendored components in both
+formats exactly when syft lists yuzu-server in the image (so a dropped
+`mark-image` or `augment` step fails the release).
 
 Stdlib only (Python 3.9+); needs syft for `generate`, plus
 dpkg-deb (.deb), rpm2cpio and cpio (.rpm) or pkgutil (.pkg) for those formats.
@@ -1040,10 +1056,16 @@ def merge_cdx(doc: dict, artifact: str, version: str, sha: str, notes: dict,
             props.append(("yuzu:vcpkg:purl", v["vcpkg_purl"]))
         c["properties"] = [{"name": k, "value": val} for k, val in props]
         comps.append(c)
+    add_vendored_cdx(doc, wcomps)
+    return doc
+
+
+def add_vendored_cdx(doc: dict, wcomps: list[dict]) -> None:
+    """Append the vendored components (a bundled one nested in its parent)."""
+    comps = doc.setdefault("components", [])
     for w in wcomps:
         if "part_of" not in w:
             comps.append(_vendored_cdx(w, [ch for ch in wcomps if ch.get("part_of") == w["id"]]))
-    return doc
 
 
 def _spdx_root(doc: dict) -> dict:
@@ -1092,13 +1114,20 @@ def merge_spdx(doc: dict, artifact: str, version: str, sha: str, notes: dict,
             pkg["homepage"] = v["homepage"]
         doc.setdefault("packages", []).append(pkg)
         rels.append({"spdxElementId": root["SPDXID"], "relationshipType": "CONTAINS", "relatedSpdxElement": sid})
+    add_vendored_spdx(doc, root["SPDXID"], wcomps)
+    return doc
+
+
+def add_vendored_spdx(doc: dict, root_id: str, wcomps: list[dict]) -> None:
+    """Append one package per vendored component: `root_id` CONTAINS each
+    top-level one, and a bundled one is CONTAINED by its parent."""
+    rels = doc.setdefault("relationships", [])
     by_id = {w["id"]: w for w in wcomps}
     for w in wcomps:
         parent = by_id.get(w.get("part_of"))
         doc.setdefault("packages", []).append(_vendored_spdx(w, parent))
-        rels.append({"spdxElementId": _vendored_spdx_id(parent) if parent else root["SPDXID"],
+        rels.append({"spdxElementId": _vendored_spdx_id(parent) if parent else root_id,
                      "relationshipType": "CONTAINS", "relatedSpdxElement": _vendored_spdx_id(w)})
-    return doc
 
 
 # ── Check ────────────────────────────────────────────────────────────────────
@@ -1229,18 +1258,32 @@ def image_title(cdx: dict) -> str:
                  (meta.get("properties") or []) if p.get("name") == IMAGE_TITLE_PROPERTY), "")
 
 
+def _image_paths(cdx: dict, spdx: dict) -> list[str]:
+    """The file paths syft lists in an image (absolute, /-separated). syft 1.57
+    records an unpackaged binary as an SPDX file only, not as a CycloneDX
+    component, so both documents are read."""
+    listed = [c.get("name", "") for c in _cdx_components(cdx.get("components")) if c.get("type") == "file"]
+    listed += [f.get("fileName", "") for f in spdx.get("files", []) or []]
+    return sorted({"/" + p.replace("\\", "/").lstrip("/") for p in listed if p})
+
+
+def _image_base(p: str) -> str:
+    return installed_name(p.rsplit("/", 1)[-1])
+
+
+def image_server_paths(cdx: dict, spdx: dict) -> list[str]:
+    """The yuzu-server binaries syft lists in an image."""
+    return [p for p in _image_paths(cdx, spdx) if _image_base(p) in SERVER_NAMES]
+
+
 def image_incomplete_reasons(cdx: dict, spdx: dict) -> list[tuple[str, str]]:
     """[(token, detail)] for what an image holds that its syft scan cannot list:
     Yuzu C++ binaries (their static vcpkg libraries), the Erlang emulator
-    (what it vendors) and the source-built pgvector. syft 1.57 records an unpackaged binary as an SPDX file
-    only, not as a CycloneDX component, so both documents are read."""
+    (what it vendors) and the source-built pgvector. What is compiled into
+    yuzu-server from VENDORED_MANIFEST is not a reason: `augment` lists it."""
     croot, _sroot = _image_roots(cdx, spdx)
-    listed = [c.get("name", "") for c in _cdx_components(cdx.get("components")) if c.get("type") == "file"]
-    listed += [f.get("fileName", "") for f in spdx.get("files", []) or []]
-    paths = sorted({"/" + p.replace("\\", "/").lstrip("/") for p in listed if p})
-
-    def base(p):
-        return installed_name(p.rsplit("/", 1)[-1])
+    paths = _image_paths(cdx, spdx)
+    base = _image_base
     server = [p for p in paths if base(p) in SERVER_NAMES]
     cpp = [p for p in paths if base(p) in SERVER_NAMES or base(p) in AGENT_NAMES or base(p).startswith(AGENT_PREFIXES)]
     erts = [p for p in paths if base(p) == ERTS_EMULATOR]
@@ -1255,8 +1298,6 @@ def image_incomplete_reasons(cdx: dict, spdx: dict) -> list[tuple[str, str]]:
             raise SbomError(f"image {croot.get('name')} is labelled {title}, but syft lists no {want[0]} in it: "
                             f"refusing to leave its SBOM unmarked (did syft stop listing unpackaged files?)")
     reasons: list[tuple[str, str]] = []
-    if server:
-        reasons.append(("server-vendored", ""))
     if cpp:
         reasons.append(("image-static-cpp", ", ".join(cpp)))
     if erts:
@@ -1337,11 +1378,70 @@ def mark_image(cdx: dict, spdx: dict) -> tuple[list[str], bool]:
     return want, True
 
 
+def image_vendored_state(cdx: dict, spdx: dict) -> tuple:
+    """(cdx_state, spdx_state) of yuzu-server's vendored components on an image
+    pair. Each is True when the document carries both the `yuzu:sbom:vendored`
+    note and the vendored entries `augment` adds, None when it carries neither,
+    and PARTIAL otherwise."""
+    _croot, sroot = _image_roots(cdx, spdx)
+    cnote = cdx_note(cdx.get("metadata"), "vendored")
+    ccomps = any(str(c.get("bom-ref", "")).startswith("vendored-") for c in _cdx_components(cdx.get("components")))
+    snote = spdx_note(sroot.get("comment"), "vendored")
+    spkgs = any(str(p.get("SPDXID", "")).startswith("SPDXRef-Package-vendored-") for p in spdx.get("packages") or [])
+
+    def state(note, entries):
+        if note is None and not entries:
+            return None
+        return True if note is not None and entries else PARTIAL
+    return state(cnote, ccomps), state(snote, spkgs)
+
+
+def augment_image(cdx: dict, spdx: dict, load_vendored) -> list[str]:
+    """Add yuzu-server's vendored components to an image SBOM pair in place when
+    syft lists a yuzu-server binary in the image; return those paths (empty:
+    the pair is untouched). syft's own entries are kept as they are:
+    components, packages and relationships are only appended to, and the
+    `yuzu:sbom:vendored` note is added (a CycloneDX metadata property, a line
+    of the SPDX root's comment after any comment syft wrote). `load_vendored`
+    returns the manifest's components after checking it against the source
+    tree, and is called only for an image holding yuzu-server. Refuses a pair
+    that is not one image's, an image labelled as the release's server image
+    in which syft lists no yuzu-server, and a pair already carrying any part
+    of what this adds."""
+    croot, sroot = _image_roots(cdx, spdx)
+    found = image_server_paths(cdx, spdx)
+    title = image_title(cdx)
+    m = YUZU_IMAGE_TITLE.match(title)
+    if not found:
+        if m and m.group(1) == "server":
+            raise SbomError(f"image {croot.get('name')} is labelled {title}, but syft lists no yuzu-server binary "
+                            f"in it: refusing to publish its SBOM without the components compiled into yuzu-server "
+                            f"(did syft stop listing unpackaged files?)")
+        return []
+    if image_vendored_state(cdx, spdx) != (None, None):
+        raise SbomError("the pair already lists yuzu-server's vendored components (or part of them): augment a "
+                        "fresh syft scan")
+    wcomps = load_vendored()
+    notes = {"vendored": (f"{len(wcomps)} third-party components compiled into yuzu-server ({', '.join(found)}; "
+                          f"web assets and the QR-code library), from {VENDORED_MANIFEST}: an image scan cannot "
+                          f"see them in the binary")}
+    comment = spdx_notes_comment(notes)
+    add_vendored_cdx(cdx, wcomps)
+    meta = cdx.setdefault("metadata", {})
+    meta["properties"] = (meta.get("properties") or []) + [
+        {"name": NOTE_PREFIX + k, "value": v} for k, v in notes.items()]
+    add_vendored_spdx(spdx, sroot["SPDXID"], wcomps)
+    sroot["comment"] = "\n".join([c for c in [sroot.get("comment")] if c] + [comment])
+    return found
+
+
 def image_pair_errors(adir: Path) -> list[str]:
     """The release gate for image SBOMs in `adir`: each `<stem>-image.cdx.json`
     has its SPDX partner, a pair named as one of the release's images
-    (`<title>-image`, YUZU_IMAGE_TITLE) carries that image's title label, and
-    the pair carries exactly the marker mark-image adds."""
+    (`<title>-image`, YUZU_IMAGE_TITLE) carries that image's title label, the
+    pair carries exactly the marker mark-image adds, and it lists yuzu-server's
+    vendored components (in both formats) exactly when syft lists yuzu-server
+    in the image."""
     stems: dict = {}
     for p in sorted(adir.iterdir()):
         if is_image_sbom(p.name):
@@ -1356,6 +1456,8 @@ def image_pair_errors(adir: Path) -> list[str]:
             cdx, spdx = (json.loads(pair[f].read_text(encoding="utf-8")) for f in ("cdx.json", "spdx.json"))
             want = _reason_tokens(incomplete_notes(image_incomplete_reasons(cdx, spdx)).get("incomplete-reasons"))
             have = image_marker(cdx, spdx)
+            server = image_server_paths(cdx, spdx)
+            vendored = image_vendored_state(cdx, spdx)
         except (OSError, ValueError, SbomError) as e:
             errs.append(f"{stem}-image: {e}")
             continue
@@ -1376,18 +1478,30 @@ def image_pair_errors(adir: Path) -> list[str]:
         elif not want and have != (None, None):
             errs.append(f"{stem}-image: marked incomplete ({_marker_label(have[0])} / {_marker_label(have[1])}) "
                         f"for nothing the image is seen to hold")
+        if server and vendored != (True, True):
+            errs.append(f"{stem}-image: the image holds yuzu-server ({', '.join(server)}), but the pair does not list "
+                        f"the components compiled into it ({_vendored_label(vendored[0])} (CycloneDX) / "
+                        f"{_vendored_label(vendored[1])} (SPDX)): run `artifact-sbom.py augment` on a fresh scan")
+        elif not server and vendored != (None, None):
+            errs.append(f"{stem}-image: lists yuzu-server's vendored components ({_vendored_label(vendored[0])} / "
+                        f"{_vendored_label(vendored[1])}), but syft lists no yuzu-server in the image")
     return errs
+
+
+def _vendored_label(state) -> str:
+    if state is None:
+        return "not listed"
+    if state == PARTIAL:
+        return "only in part (the yuzu:sbom:vendored note or the vendored entries missing)"
+    return "listed"
 
 
 # ── Commands ─────────────────────────────────────────────────────────────────
 
-# What an image holding yuzu-server carries that its syft scan cannot see. A
-# file holding yuzu-server is not marked for it: `generate` lists those
-# components from VENDORED_MANIFEST, and a manifest that does not match the
-# source tree fails the run.
-SERVER_UNLISTED = ("yuzu-server compiles in vendored C++ (server/core/vendor: qrcodegen) and embeds web "
-                   "assets (htmx, ECharts, three.js, Cytoscape, IBM Plex fonts) that an image scan cannot see "
-                   "and this SBOM does not list: the SBOM of the matching package or archive lists them")
+# What yuzu-server compiles in from VENDORED_MANIFEST is not an incompleteness
+# reason: `generate` lists it on every file holding yuzu-server and `augment`
+# on every image holding it, and a manifest that does not match the source
+# tree fails either.
 INSTALLER_UNLISTED = ("the installer's own InnoSetup runtime (setup loader and uninstaller) and what it embeds "
                       "besides the files its manifest lists (licence text, icon, compiled [Code] script) are not "
                       "listed")
@@ -1402,7 +1516,6 @@ INSTALLER_UNLISTED = ("the installer's own InnoSetup runtime (setup loader and u
 # reason is a new token here and a new row there; never reuse one for another
 # meaning.
 INCOMPLETE_REASONS = {
-    "server-vendored": SERVER_UNLISTED,
     "installer-runtime": INSTALLER_UNLISTED,
     "erts-static": ("the bundled Erlang runtime is listed as one component (erlang), but its emulator beam.smp "
                     "links in code it vendors (PCRE2, asmjit, zstd, Ryu, an MD5 taken from OpenSSL) that this "
@@ -1577,7 +1690,8 @@ def cmd_check(a) -> int:
     return 1 if errs else 0
 
 
-def cmd_mark_image(a) -> int:
+def _read_image_pair(a) -> tuple[list[Path], dict, dict]:
+    """The --cdx/--spdx pair of one image's SBOM, by name and content."""
     paths = [Path(a.cdx), Path(a.spdx)]
     for p, suffix in zip(paths, ("-image.cdx.json", "-image.spdx.json")):
         if not p.name.endswith(suffix):
@@ -1589,14 +1703,14 @@ def cmd_mark_image(a) -> int:
         cdx, spdx = (json.loads(p.read_text(encoding="utf-8")) for p in paths)
     except (OSError, ValueError) as e:
         raise SbomError(str(e)) from e
-    tokens, changed = mark_image(cdx, spdx)
-    label = f"{paths[0].name}, {paths[1].name}"
-    if not changed:
-        print(f"{label}: {'already marked incomplete (' + ', '.join(tokens) + ')' if tokens else 'nothing the scan cannot list; left unchanged'}")
-        return 0
-    # Both files are written out before either is replaced, so a failed write
-    # leaves the syft pair as it was rather than one file marked.
-    tmps = [p.with_name(p.name + ".mark.tmp") for p in paths]
+    return paths, cdx, spdx
+
+
+def _write_image_pair(paths: list[Path], cdx: dict, spdx: dict, tag: str) -> None:
+    """Rewrite an image pair in place. Both files are written out before either
+    is replaced, so a failed write leaves the pair as it was rather than one
+    file changed."""
+    tmps = [p.with_name(f"{p.name}.{tag}.tmp") for p in paths]
     try:
         for t, doc in zip(tmps, (cdx, spdx)):
             with open(t, "w", encoding="utf-8", newline="\n") as f:
@@ -1607,7 +1721,30 @@ def cmd_mark_image(a) -> int:
         for t in tmps:
             if t.exists():
                 t.unlink()
+
+
+def cmd_mark_image(a) -> int:
+    paths, cdx, spdx = _read_image_pair(a)
+    tokens, changed = mark_image(cdx, spdx)
+    label = f"{paths[0].name}, {paths[1].name}"
+    if not changed:
+        print(f"{label}: {'already marked incomplete (' + ', '.join(tokens) + ')' if tokens else 'nothing the scan cannot list; left unchanged'}")
+        return 0
+    _write_image_pair(paths, cdx, spdx, "mark")
     print(f"{label}: marked incomplete ({', '.join(tokens)})")
+    return 0
+
+
+def cmd_augment(a) -> int:
+    paths, cdx, spdx = _read_image_pair(a)
+    found = augment_image(cdx, spdx, lambda: vendored_components(*_vendored_paths(a)))
+    label = f"{paths[0].name}, {paths[1].name}"
+    if not found:
+        print(f"{label}: no yuzu-server in the image; left unchanged")
+        return 0
+    _write_image_pair(paths, cdx, spdx, "augment")
+    n = sum(1 for p in spdx["packages"] if p.get("SPDXID", "").startswith("SPDXRef-Package-vendored-"))
+    print(f"{label}: added {n} vendored components (yuzu-server at {', '.join(found)})")
     return 0
 
 
@@ -1630,7 +1767,10 @@ def main(argv=None) -> int:
     g.add_argument("--manifest", help="vcpkg.json")
     g.add_argument("--rebar-lock", help="gateway rebar.lock, to give Hex packages a pkg:hex purl")
     v = sub.add_parser("check-vendored", help="the vendored-components manifest against the source tree")
-    for p in (g, v):
+    au = sub.add_parser("augment", help="add yuzu-server's vendored components to a syft image SBOM pair, in place")
+    au.add_argument("--cdx", required=True, help="the image's CycloneDX SBOM (*-image.cdx.json)")
+    au.add_argument("--spdx", required=True, help="the same image's SPDX SBOM (*-image.spdx.json)")
+    for p in (g, v, au):
         p.add_argument("--source-root", help="repository root holding the vendored files (default: this checkout)")
         p.add_argument("--vendored-components", help=f"the manifest (default: <source root>/{VENDORED_MANIFEST})")
     c = sub.add_parser("check", help="the release gate over artifact SBOMs")
@@ -1643,6 +1783,7 @@ def main(argv=None) -> int:
     mi.add_argument("--spdx", required=True, help="the same image's SPDX SBOM (*-image.spdx.json)")
     a = ap.parse_args(argv)
     label = {"generate": lambda: Path(a.artifact).name, "mark-image": lambda: Path(a.cdx).name,
+             "augment": lambda: Path(a.cdx).name,
              "check-vendored": lambda: "vendored components check"}.get(
         a.cmd, lambda: "artifact SBOM check")()
     try:
@@ -1660,6 +1801,8 @@ def main(argv=None) -> int:
             return cmd_mark_image(a)
         if a.cmd == "check-vendored":
             return cmd_check_vendored(a)
+        if a.cmd == "augment":
+            return cmd_augment(a)
         return cmd_check(a)
     except SbomError as e:
         print(f"::error::{e}", file=sys.stderr)

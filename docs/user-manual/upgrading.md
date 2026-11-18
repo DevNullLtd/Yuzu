@@ -21,7 +21,7 @@ Running `dev` between releases? Some entries below describe changes on `dev` tha
 | each `.deb` and `.rpm` | new: the package name without `.deb`/`.rpm`, e.g. `yuzu-agent_X.Y.Z_amd64.cdx.json`, `yuzu-server-X.Y.Z-1.x86_64.spdx.json` |
 | `YuzuAgentSetup-X.Y.Z.exe` | new: `YuzuAgentSetup-X.Y.Z.{cdx,spdx}.json`, listing the files the installer packs, as the Inno Setup compiler's own manifest names them, at their paths in the build directory (not where they are installed) |
 | `YuzuAgent-X.Y.Z-macos-arm64.pkg` | new: `YuzuAgent-X.Y.Z-macos-arm64.{cdx,spdx}.json` |
-| container images | unchanged names; now made with the same syft version (v1.57.2), and marked incomplete where the image holds what the scan cannot list |
+| container images | unchanged names; now made with the same syft version (v1.57.2), and marked incomplete where the image holds what the scan cannot list; the `yuzu-server` and `yuzu-server-chisel` image SBOMs also list the third-party code compiled into `yuzu-server` |
 
 Each SBOM names its file and records its SHA-256, and lists the vcpkg libraries its C++ binaries are built with (version, licence, upstream purl, CPE where NVD has one), for a file holding `yuzu-server` the third-party code compiled into it (the web assets and qrcodegen, from `server/core/vendored-components.json`), the gateway's Erlang/OTP release, and what syft recognises in the file. A pre-release uses the pre-release package names (`yuzu-agent_X.Y.Z-rcN_amd64.cdx.json`, `YuzuAgentSetup-X.Y.Z_rcN.cdx.json`).
 

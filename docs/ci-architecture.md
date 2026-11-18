@@ -491,7 +491,15 @@ release when:
   manifest does not match the source tree. The docs-lint step "Vendored
   components manifest" (`tests/test_vendored_components.py`) fails a PR that
   adds or changes a file under `server/core/vendor/` or `server/core/static/`
-  without its entry. Each `generate` command runs with a timeout. `tests/test_artifact_sbom.py`
+  without its entry. The image SBOMs stay a syft scan of the pushed image, but
+  `docker-publish` and `docker-publish-chisel` then run `artifact-sbom.py
+  augment` on each leg's pair, before `mark-image`, which adds the same
+  components to the `yuzu-server` and `yuzu-server-chisel` image SBOMs (syft
+  lists the binary only as an SPDX file) and leaves the other legs' untouched.
+  It fails the leg, before the SBOM is uploaded, on a manifest that disagrees
+  with the checkout or on an image labelled as the release's server image in
+  which syft lists no `yuzu-server`. Each `generate` command runs with a
+  timeout. `tests/test_artifact_sbom.py`
   (Docs Lint, every PR) pins that contract against a fixture in the
   compiler's format; the `CBOM schema` job runs the same suite with
   `YUZU_REQUIRE_JSONSCHEMA=1`, validating each SBOM it generates against the

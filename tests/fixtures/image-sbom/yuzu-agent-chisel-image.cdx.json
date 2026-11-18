@@ -1,0 +1,242 @@
+{
+  "$schema": "http://cyclonedx.org/schema/bom-1.7.schema.json",
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.7",
+  "serialNumber": "urn:uuid:0a303804-c339-4668-a58a-37e46a17e258",
+  "version": 1,
+  "metadata": {
+    "timestamp": "2026-11-18T00:29:11Z",
+    "tools": {
+      "components": [
+        {
+          "type": "application",
+          "author": "anchore",
+          "name": "syft",
+          "version": "1.57.2"
+        }
+      ]
+    },
+    "component": {
+      "bom-ref": "b3ef88f12f76454b",
+      "type": "container",
+      "name": "ghcr.io/devnullltd/yuzu-agent-chisel",
+      "version": "0.14.1"
+    },
+    "properties": [
+      {
+        "name": "syft:image:labels:org.opencontainers.image.created",
+        "value": "2026-10-07T08:58:12.641Z"
+      },
+      {
+        "name": "syft:image:labels:org.opencontainers.image.description",
+        "value": "Yuzu agent chiselled demo image"
+      },
+      {
+        "name": "syft:image:labels:org.opencontainers.image.licenses",
+        "value": "AGPL-3.0-or-later"
+      },
+      {
+        "name": "syft:image:labels:org.opencontainers.image.revision",
+        "value": "17ddbd1ff8d6bfac92b228866a3649fb17565c93"
+      },
+      {
+        "name": "syft:image:labels:org.opencontainers.image.source",
+        "value": "https://github.com/DevNullLtd/Yuzu"
+      },
+      {
+        "name": "syft:image:labels:org.opencontainers.image.title",
+        "value": "yuzu-agent-chisel"
+      },
+      {
+        "name": "syft:image:labels:org.opencontainers.image.url",
+        "value": "https://github.com/DevNullLtd/Yuzu"
+      },
+      {
+        "name": "syft:image:labels:org.opencontainers.image.version",
+        "value": "v0.14.1"
+      }
+    ]
+  },
+  "components": [
+    {
+      "bom-ref": "pkg:deb/ubuntu/busybox@1%3A1.37.0-7ubuntu1?distro=ubuntu&package-id=7f1f2a16ef6da4ee",
+      "type": "library",
+      "name": "busybox",
+      "version": "1:1.37.0-7ubuntu1",
+      "cpe": "cpe:2.3:a:busybox:busybox:1\\:1.37.0-7ubuntu1:*:*:*:*:*:*:*",
+      "purl": "pkg:deb/ubuntu/busybox@1%3A1.37.0-7ubuntu1?distro=ubuntu",
+      "properties": [
+        {
+          "name": "syft:package:foundBy",
+          "value": "elf-binary-package-cataloger"
+        },
+        {
+          "name": "syft:package:type",
+          "value": "deb"
+        },
+        {
+          "name": "syft:package:metadataType",
+          "value": "elf-binary-package-note-json-payload"
+        },
+        {
+          "name": "syft:location:0:layerID",
+          "value": "sha256:4e1150b59696d804eb832aa9a43eb063df53a29345c4126a93c12f9413fb4897"
+        },
+        {
+          "name": "syft:location:0:path",
+          "value": "/usr/bin/busybox"
+        }
+      ]
+    },
+    {
+      "bom-ref": "pkg:deb/ubuntu/openssl@3.5.5-1ubuntu3.6?distro=ubuntu&package-id=4cd1251aba1f0bdf",
+      "type": "library",
+      "name": "openssl",
+      "version": "3.5.5-1ubuntu3.6",
+      "cpe": "cpe:2.3:a:openssl:openssl:3.5.5-1ubuntu3.6:*:*:*:*:*:*:*",
+      "purl": "pkg:deb/ubuntu/openssl@3.5.5-1ubuntu3.6?distro=ubuntu",
+      "properties": [
+        {
+          "name": "syft:package:foundBy",
+          "value": "elf-binary-package-cataloger"
+        },
+        {
+          "name": "syft:package:type",
+          "value": "deb"
+        },
+        {
+          "name": "syft:package:metadataType",
+          "value": "elf-binary-package-note-json-payload"
+        },
+        {
+          "name": "syft:location:0:layerID",
+          "value": "sha256:4e1150b59696d804eb832aa9a43eb063df53a29345c4126a93c12f9413fb4897"
+        },
+        {
+          "name": "syft:location:0:path",
+          "value": "/usr/lib/x86_64-linux-gnu/engines-3/afalg.so"
+        },
+        {
+          "name": "syft:location:1:layerID",
+          "value": "sha256:4e1150b59696d804eb832aa9a43eb063df53a29345c4126a93c12f9413fb4897"
+        },
+        {
+          "name": "syft:location:1:path",
+          "value": "/usr/lib/x86_64-linux-gnu/engines-3/loader_attic.so"
+        },
+        {
+          "name": "syft:location:2:layerID",
+          "value": "sha256:4e1150b59696d804eb832aa9a43eb063df53a29345c4126a93c12f9413fb4897"
+        },
+        {
+          "name": "syft:location:2:path",
+          "value": "/usr/lib/x86_64-linux-gnu/libcrypto.so.3"
+        },
+        {
+          "name": "syft:location:3:layerID",
+          "value": "sha256:4e1150b59696d804eb832aa9a43eb063df53a29345c4126a93c12f9413fb4897"
+        },
+        {
+          "name": "syft:location:3:path",
+          "value": "/usr/lib/x86_64-linux-gnu/libssl.so.3"
+        },
+        {
+          "name": "syft:location:4:layerID",
+          "value": "sha256:4e1150b59696d804eb832aa9a43eb063df53a29345c4126a93c12f9413fb4897"
+        },
+        {
+          "name": "syft:location:4:path",
+          "value": "/usr/lib/x86_64-linux-gnu/ossl-modules/legacy.so"
+        }
+      ]
+    },
+    {
+      "bom-ref": "os:ubuntu@26.04",
+      "type": "operating-system",
+      "name": "ubuntu",
+      "version": "26.04",
+      "description": "Ubuntu 26.04.1 LTS",
+      "swid": {
+        "tagId": "ubuntu",
+        "name": "ubuntu",
+        "version": "26.04"
+      },
+      "externalReferences": [
+        {
+          "url": "https://bugs.launchpad.net/ubuntu/",
+          "type": "issue-tracker"
+        },
+        {
+          "url": "https://www.ubuntu.com/",
+          "type": "website"
+        },
+        {
+          "url": "https://help.ubuntu.com/",
+          "comment": "support",
+          "type": "other"
+        },
+        {
+          "url": "https://www.ubuntu.com/legal/terms-and-policies/privacy-policy",
+          "comment": "privacyPolicy",
+          "type": "other"
+        }
+      ],
+      "properties": [
+        {
+          "name": "syft:distro:extendedSupport",
+          "value": "false"
+        },
+        {
+          "name": "syft:distro:id",
+          "value": "ubuntu"
+        },
+        {
+          "name": "syft:distro:idLike:0",
+          "value": "debian"
+        },
+        {
+          "name": "syft:distro:prettyName",
+          "value": "Ubuntu 26.04.1 LTS"
+        },
+        {
+          "name": "syft:distro:versionCodename",
+          "value": "resolute"
+        },
+        {
+          "name": "syft:distro:versionID",
+          "value": "26.04"
+        }
+      ]
+    },
+    {
+      "bom-ref": "1dec9578d16bf7ac",
+      "type": "file",
+      "name": "/usr/bin/busybox",
+      "hashes": [
+        {
+          "alg": "SHA-1",
+          "content": "50a12b9f0469725569569e621af5b7b610ed4668"
+        },
+        {
+          "alg": "SHA-256",
+          "content": "df12634c17fcdca839ae5dc47d7627b7558511f7645de7c99ccf097a0f28ed5b"
+        }
+      ]
+    },
+    {
+      "bom-ref": "dce564e1dbad3bad",
+      "type": "file",
+      "name": "/usr/lib/x86_64-linux-gnu/libcrypto.so.3",
+      "hashes": [
+        {
+          "alg": "SHA-1",
+          "content": "561dffafe35b991dbc91ec168e11173687b967fd"
+        },
+        {
+          "alg": "SHA-256",
+          "content": "dcce5a26377117c295c05a3c85261749e02cab31e0fb517a0f505a957ca49f4e"
+        }
+      ]
+    }
+  ]
+}
