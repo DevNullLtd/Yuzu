@@ -8,8 +8,10 @@
   `pkg:github`) purl and the SHA-256 of the vendored file. A scanner cannot find them
   inside the binary, so they come from a new manifest,
   `server/core/vendored-components.json`; the release fails if it does not match the
-  files it built from, and a CI check fails a change that adds or alters a vendored
-  file without updating it. Two versions the vendored files do not state are left
-  blank rather than guessed: the htmx SSE extension (byte-identical to both 2.2.2 and
-  2.2.3) and tslib. With these listed, a server file's SBOM is not marked incomplete
-  for them.
+  files it built from, and a CI check fails a change that adds or alters a file under
+  `server/core/vendor/` or `server/core/static/` (other than the server's own
+  `yuzu-*.js` and `yuzu.css` directly in `static/`), or the htmx and SSE literals in
+  `static_js_bundle.cpp`, without updating it. Two versions the vendored files do not
+  state are left blank rather than guessed: the htmx SSE extension (upstream `sse.js`
+  plus one trailing newline, and `sse.js` is identical in 2.2.2 and 2.2.3) and
+  tslib. With these listed, a server file's SBOM is not marked incomplete for them.

@@ -496,10 +496,20 @@ release when:
   augment` on each leg's pair, before `mark-image`, which adds the same
   components to the `yuzu-server` and `yuzu-server-chisel` image SBOMs (syft
   lists the binary only as an SPDX file) and leaves the other legs' untouched.
-  It fails the leg, before the SBOM is uploaded, on a manifest that disagrees
-  with the checkout or on an image labelled as the release's server image in
-  which syft lists no `yuzu-server`. Each `generate` command runs with a
-  timeout. `tests/test_artifact_sbom.py`
+  The entries carry fixed identifiers in every SBOM that lists them: CycloneDX
+  components whose `bom-ref` starts `vendored-`, SPDX packages whose SPDXID
+  starts `SPDXRef-Package-vendored-`, `yuzu:vendored:*` properties on each
+  CycloneDX component, and the `yuzu:sbom:vendored` note on the root; they are
+  not an incompleteness reason (the `server-vendored` token is retired, never
+  released, and never to be reused). `augment` fails the leg, before the SBOM
+  is uploaded, on a manifest that disagrees with the checkout or on an image
+  labelled as the release's server image in which syft lists no `yuzu-server`.
+  On an image leg, while `build-linux` passed the same check on the same tag,
+  a manifest that disagrees with the checkout means the runner's reused
+  (`clean: false`) workspace holds a file the tag does not: reset that
+  workspace ("Persistence and recovery") and re-run the failed jobs, with no
+  new tag (the release skill's failure table). Each `generate` command runs
+  with a timeout. `tests/test_artifact_sbom.py`
   (Docs Lint, every PR) pins that contract against a fixture in the
   compiler's format; the `CBOM schema` job runs the same suite with
   `YUZU_REQUIRE_JSONSCHEMA=1`, validating each SBOM it generates against the
@@ -507,6 +517,11 @@ release when:
   is not a required check, so a schema-validation failure does not block a
   merge; making it required is a decision on the branch ruleset, not taken
   here;
+- an image SBOM pair of an image in which syft lists `yuzu-server` does not
+  list yuzu-server's vendored components (the entries and the
+  `yuzu:sbom:vendored` note) in both formats, or the pair of an image in which
+  syft lists no `yuzu-server` carries any part of them (the `augment` step
+  above adds them);
 - an asset name contains a character GitHub rewrites on upload (anything but
   letters, digits, `.`, `_`, `-`, or a name not starting with a letter or
   digit), which would make `SHA256SUMS` and the provenance name an asset that

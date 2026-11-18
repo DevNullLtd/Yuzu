@@ -2841,8 +2841,8 @@ jobs:
           its reasons (server and agent: \`image-static-cpp\`; gateway:
           \`erts-static\`; postgres: \`pgvector-source\`). The two server
           image SBOMs also list the third-party files compiled into
-          \`yuzu-server\`, as its file SBOMs do. The agent-bundle image published after the
-          release has no SBOM among the release assets. GitHub-native
+          \`yuzu-server\`, as its file SBOMs do. The agent-bundle image
+          published after the release has no SBOM among the release assets. GitHub-native
           SLSA build provenance attestations for every binary archive
           and Docker image, and cosign keyless signatures on both the
           Docker images and the \`SHA256SUMS\` manifest. See

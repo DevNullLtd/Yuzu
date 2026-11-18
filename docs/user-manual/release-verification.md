@@ -278,8 +278,9 @@ in it:
   (`pkg:github` for the QR-code library) and a `yuzu:vendored:*` property
   naming the source file and hash; the bundled ZRender and tslib appear inside
   ECharts. A version the vendored file does not state is left blank rather
-  than guessed: today the htmx SSE extension (its bytes match both 2.2.2 and
-  2.2.3) and tslib. The SBOM's `yuzu:sbom:vendored` note says how many it
+  than guessed: today the htmx SSE extension (its bytes are upstream `sse.js`
+  plus one trailing newline, and `sse.js` is identical in 2.2.2 and 2.2.3) and
+  tslib. The SBOM's `yuzu:sbom:vendored` note says how many it
   lists and from which manifest.
 - **The gateway's Erlang/OTP release:** its applications (Hex packages carry a
   `pkg:hex` purl) and the Erlang runtime, as one `erlang` component.
@@ -374,13 +375,21 @@ Dependency-Track or a similar tool, expect:
 - **No dependency graph for the vcpkg libraries.** They are listed as
   components of the file; the SBOM does not record which library depends on
   which.
+- **Real matches for the vendored web assets.** The third-party files compiled
+  into `yuzu-server` (on its file and image SBOMs) carry pinned versions, so an
+  advisory a scanner reports against one of them is a real match to triage
+  (for example, ECharts 5.6.0 matches GHSA-fgmj-fm8m-jvvx). The two listed
+  without a version, the htmx SSE extension and tslib, may match every
+  advisory for the name or none, depending on the scanner. The QR-code library
+  carries a `pkg:github` purl and no CPE, so a scanner matching by package
+  name or CPE does not match it at all.
 
 ### Reading the `yuzu:sbom:` notes
 
 The release writes its notes on an SBOM's root under one key per note, spelled
 the same in both formats: `yuzu:sbom:incomplete-reasons`,
-`yuzu:sbom:incomplete`, `yuzu:sbom:contents`, `yuzu:sbom:licence-noassertion`
-and the others. In CycloneDX each note is a `metadata.properties` entry whose
+`yuzu:sbom:incomplete`, `yuzu:sbom:contents`, `yuzu:sbom:licence-noassertion`,
+`yuzu:sbom:vendored` and the others. In CycloneDX each note is a `metadata.properties` entry whose
 `name` is the key. SPDX has no properties, so each note is one line of the
 described package's `comment`, the key, a colon and a space, then the value:
 
