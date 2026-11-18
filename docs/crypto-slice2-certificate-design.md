@@ -21,7 +21,7 @@ branches: 2a-2b `feat/cert-inventory-read`, 2a-2c `feat/cert-inventory-tombstone
 `feat/cert-inventory-prune`, 2a-2e `feat/cert-inventory-agent-linux`, 2a-2f
 `feat/cert-inventory-agent-windows`, 2a-2g `feat/cert-inventory-agent-macos`, 2a-3
 `feat/cert-inventory-counts`, 2a-4 `feat/cert-inventory-cbom` and 2b-1b `feat/revocation-fetcher`.
-Issue #6590 holds three open questions on the CRL store contract that the owner must settle before 2b-1b.
+The owner ruled the three CRL store contract questions of #6590 on 2026-11-18 (see [Decisions](#decisions)); they land as the CRL store's migration v2 before 2b-1b.
 
 It supersedes the "Slice 2: certificate inventory" section of `docs/crypto-asset-design.md` where
 the two differ. One difference matters: that section proposes computing days-to-expiry on the
@@ -1363,7 +1363,7 @@ every later 2b PR.
 5. **Audit first.** Every mutation writes its `attempted` audit row before the store call and
    changes nothing when that row cannot be stored.
 
-Open before the fetcher: the three CRL store contract questions in #6590.
+Owed before the fetcher: the CRL store's migration v2 for the three #6590 rulings ([Decisions](#decisions), 2026-11-18).
 
 ### Registration
 
@@ -1541,8 +1541,8 @@ review, as a new egress surface.
   high-water reset (`revocation_source_store.cpp`), not the global sequence
   (`revocation_source.config_seq`) this design first proposed. Because ids are never reused, a
   `DELETE` followed by a re-register still cannot reproduce an earlier (source id,
-  `config_version`) pair. Whether the design or the code changes to match is one of the open #6590
-  questions, settled before 2b-1b. Before a fetch, the
+  `config_version`) pair. The owner kept the per-row counter on 2026-11-18 (#6590); this design
+  no longer proposes the global sequence. Before a fetch, the
   job snapshots the source's `config_version`, the URL and the key set. The acceptance transaction
   locks the `source` row (`FOR UPDATE`) and stores the CRL only if `config_version` is unchanged and
   the URL is still registered; otherwise it discards the CRL, records cause `config_changed`,
@@ -1574,7 +1574,7 @@ review, as a new egress surface.
   attacker or a stale mirror could serve an older CRL that still verifies, possibly one from before
   the rebuild with a higher number. So:
   - the reset body lists the source's keys after the rebuild, and every key not listed is removed,
-    in the same transaction as the reset. **Deferred to #6590, not in 2b-1a:** the shipped reset
+    in the same transaction as the reset. **Deferred to #6590 (ruled 2026-11-18), not in 2b-1a:** the shipped reset
     accepts only `reset_at` and `pin_crl_sha256` and removes no keys, so this must land before
     2b-1b accepts any CRL. Every held CRL of the CA is deleted in the reset's transaction;
   - the reset clears each scope's number and `this_update` but writes `reset_at` (Postgres `now()`
@@ -2046,6 +2046,30 @@ Decided by ADR-0070 R1 (recorded here so no section reads otherwise):
    by the same pass. The owner confirmed this reading of D12's store-grain condition over a
    per-store ceiling ([Retention and the prune](#retention-and-the-prune)). This is ADR-0070 R15.
    R16 (decision 7) later superseded its predicate.
+
+**Decided by the owner, 2026-11-18** (the three CRL store contract questions of #6590, each as
+recommended; they land as the CRL store's migration v2, before 2b-1b accepts any CRL):
+
+- **Reset names the surviving keys by hash.** The high-water reset body (REST
+  `POST .../reset-high-water` and MCP `reset_revocation_source_high_water`) gains a required,
+  non-empty `keep_key_sha256` list. Each entry must name a key already registered on the source
+  (an operator adds the rebuilt CA's certificates with `PUT` first); every other key and every
+  held CRL of the CA are removed in the reset's transaction. A body without the list is refused.
+- **One encoded scope key, replaced delete-then-insert.** `scope_key` is `full` or
+  `idp:<64 lowercase hex of the IDP DER SHA-256>`, followed by `:base` or `:delta`, pinned by a
+  `CHECK` and used identically in `crl` and `rollback_high_water`; `crl.is_delta` is derived from
+  it. A newer CRL replaces the held one by delete-then-insert inside the acceptance transaction,
+  so `UNIQUE (source_id, scope_key, is_delta)` stays and a reader sees the old CRL or the new one,
+  never both.
+- **`config_version` stays a per-row counter.** Source ids come from an identity column that is
+  never reset, so a delete and re-register cannot reproduce an earlier (source id,
+  `config_version`) pair; the global `revocation_source.config_seq` is not built.
+- **CRL URLs are stored in one canonical form.** One canonicaliser at the service lowercases the
+  scheme and host, drops the default port, strips leading zeros from the port, writes an IPv6
+  literal in RFC 5952 form and stores an empty path as `/`; the path and query keep their case and
+  percent-encoding is left as sent. The canonical form is what is stored, what `UNIQUE (source_id,
+  url)` and replace compare, and what responses return, so a cosmetic `PUT` keeps the URL's fetch
+  state.
 
 **Decided by the owner, 2026-10-26 and 2026-10-27** (items raised by governance on 2a-2d, 2a-2e, 2a-3 and 2a-4; the owner took the recommendations on all; each item carries its own date):
 

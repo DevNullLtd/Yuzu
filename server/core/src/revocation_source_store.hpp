@@ -11,9 +11,9 @@
 /// decision path.
 ///
 /// This PR (2b-1a) WRITES only `source`, `source_ca_key` and `source_url`. v1 creates the tables the
-/// fetcher (2b-1b) reads and writes; `cert_signature_check` (2b-2) is not created here. Whether
-/// 2b-1b still needs a migration (the `crl` table's `scope_key` encoding and uniqueness, canonical
-/// URLs) depends on the open #6590 questions. `fetch_status`, `crl`,
+/// fetcher (2b-1b) reads and writes; `cert_signature_check` (2b-2) is not created here. The #6590
+/// rulings (2026-11-18: reset key list, `scope_key` encoding, canonical URLs) land as migration v2
+/// before 2b-1b. `fetch_status`, `crl`,
 /// `crl_entry` and
 /// `rollback_high_water` exist, are READ here (a source's fetch status, its held-CRL count) and
 /// are deleted with their source / URL / key, but nothing in this PR inserts into `crl` or

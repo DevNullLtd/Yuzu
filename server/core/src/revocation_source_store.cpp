@@ -28,9 +28,8 @@ const std::vector<pg::PgMigration>& migrations() {
     // transaction. Runtime statements below schema-qualify explicitly.
     //
     // v1 creates the tables of the design's "The store" section that the fetcher (2b-1b) uses;
-    // `cert_signature_check` (2b-2) is not created here. Whether 2b-1b still needs a migration
-    // (the `crl` table's `scope_key` encoding and uniqueness, canonical URLs) depends on the
-    // open #6590 questions. Times a CA signs (`this_update`,
+    // `cert_signature_check` (2b-2) is not created here. The #6590 rulings (2026-11-18: reset key
+    // list, `scope_key` encoding, canonical URLs) land as migration v2 before 2b-1b. Times a CA signs (`this_update`,
     // `next_update`, `revocation_date`) are the CA's own; `fetched_at`, `last_*_at`,
     // `created_at` and `updated_at` are Postgres now(). CRL numbers are up to 20 octets
     // (RFC 5280 5.2.3), so NUMERIC; `serial` is UPPERCASE hex in the minimal BYTE form (even length, whole bytes, no leading 00 byte unless the value is zero); a CHECK pins that form so two spellings of one serial can never be two rows.
