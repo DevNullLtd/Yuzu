@@ -1980,6 +1980,12 @@ sync, defeating the hash-skip protocol.
   `[redacted]` before it is sent. That removes one route to a personal name and is not a
   consent mechanism; other folder mounts, free text in the other columns, and the device
   name, domain and OU are sent as the machine reports them.
+- **Pipes in firmware text.** The `hardware` plugin writes a literal `|` in a CPU model or a
+  memory slot as `\|` and a backslash as `/`, on every OS, so the record's cores, threads and RAM are
+  summed from the right columns whatever the firmware text holds (#7040). A pipe, backslash or line
+  break in those fields changes the device's record once: it re-uploads with the corrected figures.
+  Known limit: a pipe in a disk model, adapter or the scalar fields of the record is still
+  split on every pipe, so a disk model with one reads wrongly (#7957).
 - **Observability.** Ingest shares
   `yuzu_inventory_ingest_total{source="device_ci"}` +
   `yuzu_inventory_ingest_duration_seconds{source="device_ci"}`; read degrades use

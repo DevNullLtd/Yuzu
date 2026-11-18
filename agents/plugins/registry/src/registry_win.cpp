@@ -488,8 +488,13 @@ bool resolve_profile(yuzu::CommandContext& ctx, yuzu::Params params, ResolvedPro
         ctx.write_output("error|profile_list_unreadable");
         return false;
     }
-    const auto hku_subkeys = yuzu::win::enumerate_hku_subkeys();
-    auto profile_list = yuzu::profiles::build_profile_list(records, hku_subkeys);
+    const auto hku = yuzu::win::enumerate_hku_subkeys_checked();
+    if (!hku.error.empty()) {
+        spdlog::warn("registry: HKEY_USERS listing incomplete ({})", hku.error);
+        ctx.write_output("error|hku_list_incomplete");
+        return false;
+    }
+    auto profile_list = yuzu::profiles::build_profile_list(records, hku.names);
     if (for_write) yuzu::profiles::remove_backup_entries(profile_list);
 
     if (!sid_param.empty()) {
@@ -596,8 +601,13 @@ int do_list_profiles(yuzu::CommandContext& ctx, yuzu::Params) {
         ctx.write_output("error|profile_list_unreadable");
         return 1;
     }
-    const auto hku_subkeys = yuzu::win::enumerate_hku_subkeys();
-    const auto profile_list = yuzu::profiles::build_profile_list(records, hku_subkeys);
+    const auto hku = yuzu::win::enumerate_hku_subkeys_checked();
+    if (!hku.error.empty()) {
+        spdlog::warn("registry: HKEY_USERS listing incomplete ({})", hku.error);
+        ctx.write_output("error|hku_list_incomplete");
+        return 1;
+    }
+    const auto profile_list = yuzu::profiles::build_profile_list(records, hku.names);
 
     for (const auto& info : profile_list) ctx.write_output(yuzu::profiles::render_profile_row(info));
     if (truncated)
