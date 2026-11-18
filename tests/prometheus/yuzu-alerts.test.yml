@@ -1909,6 +1909,80 @@ tests:
         eval_time: 5m
         exp_samples: []
 
+  # ── YuzuMfaBindingNotEnforced (#6079) ───────────────────────────────────
+  #
+  # Reads yuzu_auth_mfa_binding_enforcement_ok{store}, a sticky 1 -> 0 gauge (server.cpp,
+  # mfa_binding_gauge.hpp). The rule is `== 0` held for 1m, per instance and store. These cases
+  # pin: a healthy series never fires; a series that flips to 0 fires once held past `for:`, for
+  # the store that flipped and not the other; and a one-sample dip shorter than `for:` stays quiet.
+
+  # CASE mfa-binding-1 -- the auth gauge flips to 0 at minute 3 and stays there; the session gauge stays
+  # healthy. Only the auth series fires, and not before the `for:` window has elapsed.
+  - interval: 1m
+    name: mfa binding not enforced - a flipped store fires, the healthy store does not
+    input_series:
+      - series: 'yuzu_auth_mfa_binding_enforcement_ok{job="yuzu",instance="s1",store="auth"}'
+        values: "1 1 1 0 0 0 0 0 0 0"
+      - series: 'yuzu_auth_mfa_binding_enforcement_ok{job="yuzu",instance="s1",store="session"}'
+        values: "1x10"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuMfaBindingNotEnforced", alertstate="firing"}'
+        eval_time: 3m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuMfaBindingNotEnforced", alertstate="firing"}'
+        eval_time: 8m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuMfaBindingNotEnforced", alertstate="firing", instance="s1", job="yuzu", severity="critical", store="auth"}'
+            value: 1
+
+  # CASE mfa-binding-2 -- the session gauge flips; the auth gauge does not. The store label is carried
+  # through, so the page names the store that failed.
+  - interval: 1m
+    name: mfa binding not enforced - the session store flipping names the session store
+    input_series:
+      - series: 'yuzu_auth_mfa_binding_enforcement_ok{job="yuzu",instance="s1",store="auth"}'
+        values: "1x10"
+      - series: 'yuzu_auth_mfa_binding_enforcement_ok{job="yuzu",instance="s1",store="session"}'
+        values: "1 0 0 0 0 0 0 0 0 0"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuMfaBindingNotEnforced", alertstate="firing"}'
+        eval_time: 8m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuMfaBindingNotEnforced", alertstate="firing", instance="s1", job="yuzu", severity="critical", store="session"}'
+            value: 1
+
+  # CASE mfa-binding-3 -- healthy series on both stores stay quiet.
+  - interval: 1m
+    name: mfa binding not enforced - healthy series never fire
+    input_series:
+      - series: 'yuzu_auth_mfa_binding_enforcement_ok{job="yuzu",instance="s1",store="auth"}'
+        values: "1x30"
+      - series: 'yuzu_auth_mfa_binding_enforcement_ok{job="yuzu",instance="s1",store="session"}'
+        values: "1x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuMfaBindingNotEnforced", alertstate="firing"}'
+        eval_time: 25m
+        exp_samples: []
+
+  # CASE mfa-binding-4 -- a single 0 sample (a scrape-level glitch shorter than `for:`) stays quiet: the
+  # 1m `for:` is the only thing between one bad sample and a critical page.
+  - interval: 1m
+    name: mfa binding not enforced - a one-sample dip shorter than for stays quiet
+    input_series:
+      - series: 'yuzu_auth_mfa_binding_enforcement_ok{job="yuzu",instance="s1",store="auth"}'
+        values: "1 1 0 1 1 1 1 1 1 1"
+    promql_expr_test:
+      # 2m is the sample that is 0: a rule with no `for:` would already fire here.
+      - expr: 'ALERTS{alertname="YuzuMfaBindingNotEnforced", alertstate="firing"}'
+        eval_time: 2m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuMfaBindingNotEnforced", alertstate="firing"}'
+        eval_time: 3m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuMfaBindingNotEnforced", alertstate="firing"}'
+        eval_time: 8m
+        exp_samples: []
+
   # ── YuzuRotationSweepNotRunning (#2964) ─────────────────────────────────
   #
   # Reads `yuzu_rotation_sweep_last_pass_timestamp_seconds` (server.cpp) --
@@ -2865,6 +2939,58 @@ tests:
         eval_time: 55m
         exp_samples: []
 
+  # ── YuzuQuarantineReleasePending (PRQ.2) ──────────────────────────────────
+  #
+  # `yuzu_server_quarantine_release_pending{reachability="connected"} > 0`,
+  # for: 15m, warning. A GAUGE like the unconfirmed rule above: `for:` alone is the
+  # sustain requirement. A connected device that cannot finish a requested release
+  # pages; an offline one never does, and a release that completes in time never does.
+
+  # CASE 70 -- a connected release pending for 40 minutes: quiet at 12m (before the hold),
+  # firing a warning at 20m with the full label set.
+  - interval: 1m
+    name: quarantine release pending - a sustained connected release fires warning
+    input_series:
+      - series: 'yuzu_server_quarantine_release_pending{job="yuzu",instance="s1",reachability="connected"}'
+        values: "1x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuQuarantineReleasePending", alertstate="firing"}'
+        eval_time: 12m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuQuarantineReleasePending", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuQuarantineReleasePending", alertstate="firing", instance="s1", job="yuzu", reachability="connected", severity="warning"}'
+            value: 1
+
+  # CASE 71 -- reachability="offline" NEVER fires, at any volume or duration: a device that
+  # is off cannot confirm a release, and paging on that is paging on correct behaviour.
+  - interval: 1m
+    name: quarantine release pending - offline reachability never fires
+    input_series:
+      - series: 'yuzu_server_quarantine_release_pending{job="yuzu",instance="s1",reachability="offline"}'
+        values: "5x90"
+      - series: 'yuzu_server_quarantine_release_pending{job="yuzu",instance="s1",reachability="connected"}'
+        values: "0x90"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuQuarantineReleasePending"}'
+        eval_time: 90m
+        exp_samples: []
+
+  # CASE 72 -- a pending release that clears before the 15m hold never fires.
+  - interval: 1m
+    name: quarantine release pending - a release that completes before 15m never fires
+    input_series:
+      - series: 'yuzu_server_quarantine_release_pending{job="yuzu",instance="s1",reachability="connected"}'
+        values: "1x10 0x50"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuQuarantineReleasePending"}'
+        eval_time: 12m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuQuarantineReleasePending"}'
+        eval_time: 40m
+        exp_samples: []
+
   # ── YuzuSessionReapClockAnomaly (HA WS-1/1a, ADR-2002 §4) ─────────────────
   #
   # The DB-clock-integrity monitor: a durable-session reap pass declines on an
@@ -3587,6 +3713,24 @@ tests:
         eval_time: 15m
         exp_samples:
           - labels: 'ALERTS{alertname="YuzuGuardianReadDegraded", alertstate="firing", reason="statement_timeout", source="guardian_census_device", severity="warning"}'
+            value: 1
+
+  # CASE - a sustained statement_timeout on the fleet application usage read (dex_usage)
+  # pages on its OWN source and reason labels: the unfiltered expr covers the new source
+  # with no expression change. for: 5m pinned both sides, as above.
+  - interval: 1m
+    name: guardian read degraded - a sustained dex_usage statement_timeout pages
+    input_series:
+      - series: 'yuzu_server_guardian_read_degrade_total{job="yuzu",instance="s1",reason="statement_timeout",source="dex_usage"}'
+        values: "0+1x20"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGuardianReadDegraded", alertstate="firing"}'
+        eval_time: 5m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGuardianReadDegraded", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGuardianReadDegraded", alertstate="firing", reason="statement_timeout", source="dex_usage", severity="warning"}'
             value: 1
 
   # CASE — the boot-time pre-seed alone (the seeded sources x all three reasons
@@ -8027,6 +8171,302 @@ tests:
         eval_time: 16m
         exp_samples: []
 
+  # ── YuzuGuardianBaselineUnpersisted (#5605) ──────────────────────────────
+  #
+  # yuzu_fleet_guardian_baseline_unpersisted is the fleet SUM of Spark baseline captures staged on
+  # an agent and not yet written to its local KV store: an unlabelled server-owned gauge,
+  # recomputed every sweep and exported PER core replica, so these cases feed it directly. The
+  # rule is `sum by (job) (max_over_time(<gauge>[5m])) > 0`, `for: 15m`, severity=warning, the
+  # same shape as YuzuDedupStoreDegraded and the same five-shape template: fires at 15m and not
+  # 14m (T20), count not `== 1` (T21), zero stays quiet (T22), a transient stays quiet (T23),
+  # gaps (T24, T24b, T25), clearing (T26) and the window width (T27a, T27b). CH-1 is a
+  # characterisation pin of a documented limit, not a requirement.
+  #
+  # The whole file passes under the harness (the digest-pinned promtool 3.13.1 image) on the tree
+  # that added the rule. The mutation and must-fail-before runs below were direct `promtool test
+  # rules` runs of ONE case at a time, in the same v3.13.1 image, against the rule's own text in a
+  # scratch rules file (the must-fail-before run used the full pre-rule rules file).
+  # Mutation-checked, each case run alone against each mutant, RED cases listed (re-measured in
+  # governance fix round 1 against the v3.13.1 image; the first version of this table was wrong
+  # for several rows, notably `for:` dropped, which left T22 AND T23 green and is NOT "every case"):
+  #   max_over_time window dropped (bare gauge)  -> T24, T24b, T26, T27b, CH-1
+  #   `> 0` changed to `>= 0`                    -> T22, T23, T26, T27a, T27b
+  #   `> 0` changed to `== 1`                    -> T21, T25
+  #   `for: 16m`                                 -> T20, T27b, CH-1
+  #   `for: 14m`                                 -> T20, T24, T24b, T27a, T27b
+  #   `for:` dropped                             -> T20, T23, T24, T24b, T27a, T27b (T23 only
+  #                                                 through its 7m evaluation)
+  #   `sum by (job)` dropped                     -> T25 (the alert then carries an `instance`
+  #                                                 label, which also reddens T20, T21, T24, T24b,
+  #                                                 T26, T27b and CH-1, whose expected labels omit it)
+  #   window [4m]                                -> T26, T27b
+  #   window [6m]                                -> T26, T27a, T27b
+  #   window [1m]                                -> T24, T24b, T26, T27b, CH-1
+  # Must-fail-before (#2553): the same cases run against the rules file as it stood before this
+  # rule existed (origin/dev 3a76ef9ac3) are RED for T20, T21, T24, T25, T26 and T27b (each
+  # expects a firing alert that does not exist), while T22, T23 and T27a pass vacuously there
+  # because they expect silence; the six RED cases are the ones that prove the rule exists.
+  #
+  # T24 uses `stale` for its gaps, not `_`. A `_` gap shorter than the 5m lookback leaves the bare
+  # gauge readable, so it does NOT go red without the window (measured: the bare-gauge mutant
+  # passes a `_` version of T24). The dormant rule can only be shown to fire here: a live-rig
+  # firing check is a row of the flip evidence checklist in docs/spark-flip-gate.md (prefer_spark
+  # is off in every released agent).
+
+  # CASE T20 -- fires once the backlog has held for the full 15m, and not before. RED if `for:` is
+  # dropped (fires at 14m) or lengthened to 16m or more (the 15m eval is the only one that
+  # catches 16m exactly).
+  - interval: 1m
+    name: baseline unpersisted - sustained for 15m fires, and not before
+    input_series:
+      - series: 'yuzu_fleet_guardian_baseline_unpersisted{job="yuzu",instance="s1"}'
+        values: "1x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGuardianBaselineUnpersisted", alertstate="firing"}'
+        eval_time: 14m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGuardianBaselineUnpersisted", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGuardianBaselineUnpersisted", alertstate="firing", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGuardianBaselineUnpersisted", alertstate="firing"}'
+        eval_time: 16m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGuardianBaselineUnpersisted", alertstate="firing", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGuardianBaselineUnpersisted", alertstate="firing"}'
+        eval_time: 50m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGuardianBaselineUnpersisted", alertstate="firing", job="yuzu", severity="warning"}'
+            value: 1
+
+  # CASE T21 -- several staged captures fire the same single alert (the gauge is a COUNT, so the
+  # threshold is `> 0`, not `== 1`). RED if the rule were written as `== 1`.
+  - interval: 1m
+    name: baseline unpersisted - more than one staged capture still fires
+    input_series:
+      - series: 'yuzu_fleet_guardian_baseline_unpersisted{job="yuzu",instance="s1"}'
+        values: "3x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGuardianBaselineUnpersisted", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGuardianBaselineUnpersisted", alertstate="firing", job="yuzu", severity="warning"}'
+            value: 1
+
+  # CASE T22 -- an empty backlog stays quiet: a flat 0 is the published "nothing waiting"
+  # reading. RED if the rule were `>= 0`, which would page a healthy fleet forever.
+  - interval: 1m
+    name: baseline unpersisted - zero staged captures stays quiet
+    input_series:
+      - series: 'yuzu_fleet_guardian_baseline_unpersisted{job="yuzu",instance="s1"}'
+        values: "0x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGuardianBaselineUnpersisted"}'
+        eval_time: 50m
+        exp_samples: []
+
+  # CASE T23 -- a short transient backlog never fires: 3 samples of 1 between zeros (minutes 2 to
+  # 4), stretched to about 7 minutes by the 5m window, is under the 15m `for:`. The 7m evaluation
+  # is the one that discriminates: the expression is true from minute 2 through minute 8, so with
+  # `for:` removed the alert is firing at 7m (the 12m, 16m and 30m evaluations all fall after the
+  # expression has gone false again, so they stay quiet with or without `for:`). RED at 7m if
+  # `for:` is removed.
+  - interval: 1m
+    name: baseline unpersisted - a 3 minute backlog stays quiet
+    input_series:
+      - series: 'yuzu_fleet_guardian_baseline_unpersisted{job="yuzu",instance="s1"}'
+        values: "0 0 1 1 1 0x55"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGuardianBaselineUnpersisted", alertstate="firing"}'
+        eval_time: 7m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGuardianBaselineUnpersisted", alertstate="firing"}'
+        eval_time: 12m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGuardianBaselineUnpersisted", alertstate="firing"}'
+        eval_time: 16m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGuardianBaselineUnpersisted", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples: []
+
+  # CASE T24 -- the series goes ABSENT for two scrapes at a time (a heartbeat missed past the 90 s
+  # staleness prune, or a replica restart: the gauge is then not exported and Prometheus marks the
+  # series stale). On the bare gauge each gap resets `for:` and a persistent backlog never alerts.
+  # The gaps are `stale`, not `_`: a `_` gap shorter than the 5m lookback leaves the bare gauge
+  # readable and would not discriminate. RED if the max_over_time window is removed.
+  - interval: 1m
+    name: baseline unpersisted - repeated two scrape gaps do not reset for
+    input_series:
+      - series: 'yuzu_fleet_guardian_baseline_unpersisted{job="yuzu",instance="s1"}'
+        values: "1 1 1 stale stale 1 1 1 stale stale 1 1 1 stale stale 1 1 1 stale stale 1 1 1 stale stale 1 1 1 stale stale 1 1 1 stale stale 1 1 1 stale stale 1 1 1 stale stale 1 1 1 stale stale 1 1 1 stale stale 1 1 1 stale stale"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGuardianBaselineUnpersisted", alertstate="firing"}'
+        eval_time: 14m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGuardianBaselineUnpersisted", alertstate="firing"}'
+        eval_time: 16m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGuardianBaselineUnpersisted", alertstate="firing", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGuardianBaselineUnpersisted", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGuardianBaselineUnpersisted", alertstate="firing", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGuardianBaselineUnpersisted", alertstate="firing"}'
+        eval_time: 55m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGuardianBaselineUnpersisted", alertstate="firing", job="yuzu", severity="warning"}'
+            value: 1
+
+  # CASE T24b -- the OTHER gap shape: with other agents still reporting, the 90 s staleness prune
+  # lowers the SUM instead of removing the series, so a heartbeat slower than the prune window
+  # alternates 1, 0, 1, 0 at the 1m evaluation interval (the dedup rule's case F). On the bare
+  # gauge `for:` restarts on every 0. RED if the max_over_time window is removed or shortened to
+  # 1m.
+  - interval: 1m
+    name: baseline unpersisted - a sum that alternates 1 and 0 still fires
+    input_series:
+      - series: 'yuzu_fleet_guardian_baseline_unpersisted{job="yuzu",instance="s1"}'
+        values: "1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGuardianBaselineUnpersisted", alertstate="firing"}'
+        eval_time: 14m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGuardianBaselineUnpersisted", alertstate="firing"}'
+        eval_time: 16m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGuardianBaselineUnpersisted", alertstate="firing", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGuardianBaselineUnpersisted", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGuardianBaselineUnpersisted", alertstate="firing", job="yuzu", severity="warning"}'
+            value: 1
+
+  # CASE T25 -- the reporting replica changes (s1 then s2, overlapping for two minutes): the
+  # `instance` label differs, so without `sum by (job)` each replica starts its own 15m clock and
+  # the alert would also carry an `instance` label. `sum by (job)` joins them into one alert that
+  # never resets. RED if `sum by (job)` is dropped (the labels then include instance, and the
+  # alert is quiet at 30m while s2's own clock runs).
+  - interval: 1m
+    name: baseline unpersisted - moving between replicas does not reset for
+    input_series:
+      - series: 'yuzu_fleet_guardian_baseline_unpersisted{job="yuzu",instance="s1"}'
+        values: "1x20 stale"
+      - series: 'yuzu_fleet_guardian_baseline_unpersisted{job="yuzu",instance="s2"}'
+        values: "_x18 1x42"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGuardianBaselineUnpersisted", alertstate="firing"}'
+        eval_time: 16m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGuardianBaselineUnpersisted", alertstate="firing", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGuardianBaselineUnpersisted", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGuardianBaselineUnpersisted", alertstate="firing", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGuardianBaselineUnpersisted", alertstate="firing"}'
+        eval_time: 40m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGuardianBaselineUnpersisted", alertstate="firing", job="yuzu", severity="warning"}'
+            value: 1
+
+  # CASE T26 -- it clears after the backlog drains. The last 1 is at minute 20 and the 5m window is
+  # left-open (Prometheus 3.x), so the alert is still firing at 24m and gone at 25m. Boundary
+  # measured with promtool 3.13.1. RED if the alert latches.
+  - interval: 1m
+    name: baseline unpersisted - resolves after the backlog drains
+    input_series:
+      - series: 'yuzu_fleet_guardian_baseline_unpersisted{job="yuzu",instance="s1"}'
+        values: "1x20 0x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGuardianBaselineUnpersisted", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGuardianBaselineUnpersisted", alertstate="firing", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGuardianBaselineUnpersisted", alertstate="firing"}'
+        eval_time: 24m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGuardianBaselineUnpersisted", alertstate="firing", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGuardianBaselineUnpersisted", alertstate="firing"}'
+        eval_time: 25m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGuardianBaselineUnpersisted", alertstate="firing"}'
+        eval_time: 45m
+        exp_samples: []
+
+  # CASE T27a -- the measured lower bound of the firing window (same expression and result as the
+  # dedup rule's case I). A backlog SPANNING 10 minutes (11 samples at a 1m scrape) is NOT enough:
+  # a backlog that drained is not paged. RED if the window is widened.
+  - interval: 1m
+    name: baseline unpersisted - a 10 minute span of backlog does not fire
+    input_series:
+      - series: 'yuzu_fleet_guardian_baseline_unpersisted{job="yuzu",instance="s1"}'
+        values: "1x10 0x50"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGuardianBaselineUnpersisted", alertstate="firing"}'
+        eval_time: 14m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGuardianBaselineUnpersisted", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGuardianBaselineUnpersisted", alertstate="firing"}'
+        eval_time: 16m
+        exp_samples: []
+
+  # CASE T27b -- a backlog SPANNING 11 minutes (12 samples) DOES fire, at exactly the 15 minute
+  # mark, and the alert is gone a minute later. RED if the window is narrowed.
+  - interval: 1m
+    name: baseline unpersisted - an 11 minute span of backlog fires at the 15 minute mark
+    input_series:
+      - series: 'yuzu_fleet_guardian_baseline_unpersisted{job="yuzu",instance="s1"}'
+        values: "1x11 0x49"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGuardianBaselineUnpersisted", alertstate="firing"}'
+        eval_time: 14m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGuardianBaselineUnpersisted", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGuardianBaselineUnpersisted", alertstate="firing", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGuardianBaselineUnpersisted", alertstate="firing"}'
+        eval_time: 16m
+        exp_samples: []
+
+  # CASE CH-1 -- CHARACTERISATION of a documented limit, NOT a defect (UP-1; owner ruling Q2:
+  # the rule keeps the `> 0` shape). The gauge is already a fleet SUM when Prometheus sees it, so
+  # the rule cannot tell one stuck capture from a stream of healthy short backlogs: here a single
+  # one-scrape blip of 1 (a different agent each time, in real life) lands every 4 minutes, no
+  # capture is older than a scrape, and the 5m `max_over_time` window still holds a nonzero sample
+  # at every evaluation, so the alert FIRES at 15m and stays firing at 20m. A per-agent age signal
+  # would be needed to tell the two apart; that is a design change tracked as a follow-up, not
+  # something a PromQL edit fixes. This case pins today's behaviour so a change to it is
+  # deliberate; it is not an endorsement of the behaviour.
+  - interval: 1m
+    name: baseline unpersisted - a one scrape blip every 4 minutes fires (documented limit of the ruled > 0 shape)
+    input_series:
+      - series: 'yuzu_fleet_guardian_baseline_unpersisted{job="yuzu",instance="s1"}'
+        values: "1 0 0 0 1 0 0 0 1 0 0 0 1 0 0 0 1 0 0 0 1 0 0 0 1 0 0 0 1 0 0 0 1 0 0 0 1 0 0 0"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGuardianBaselineUnpersisted", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGuardianBaselineUnpersisted", alertstate="firing", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGuardianBaselineUnpersisted", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGuardianBaselineUnpersisted", alertstate="firing", job="yuzu", severity="warning"}'
+            value: 1
+
   # -- Workflow-run saturation and integrity (group yuzu-dispatch, #2146) -----------------------
   #
   # Four rules, four metric families, every series pre-seeded to 0 at boot by
@@ -8914,7 +9354,7 @@ tests:
               plugin: echo
             exp_annotations:
               summary: "About 2 agent(s) report plugin echo failed to initialise"
-              description: "For more than 10 minutes, about 2 agent(s) (summed across core replicas, so a failover can count one twice for a few minutes) have reported that plugin echo failed init (heartbeat tag yuzu.plugins_failed); it is loaded but not running, as distinct from not installed. plugin=\"unknown\" sums the well-formed names the server's plugin catalogue does not know, counted as reported names (tokens), so one agent can add several (the agent log names them; yuzu_fleet_plugin_init_failed_rejected counts the agents sending them). The runbook link is the Echo upgrade note; for any other plugin the agent log is the source. For plugin=\"echo\" the usual causes are a failed tar.db adoption after the rename (including a sidecar present under both names) and a corrupt echo.db that could not be moved aside; the upgrade notes cover adoption under 'Two cases the agent refuses, and what to do', and the corrupt-database case is under Corrupt-database quarantine in the Echo manual. An Echo that loads offline for lack of free space is not counted here (#7290). The value and the plugin label are agent-self-reported: the server bounds the label to its catalogue, so an agent cannot displace a real plugin, but it can still report a real plugin's name as failed, or not report a failure, so the signal is not authoritative."
+              description: "For more than 10 minutes, about 2 agent(s) (summed across core replicas, so a failover can count one twice for a few minutes) have reported that plugin echo failed init (heartbeat tag yuzu.plugins_failed); it is loaded but not running, as distinct from not installed. plugin=\"unknown\" sums the well-formed names the server's plugin catalogue does not know, counted as reported names (tokens), so one agent can add several (the agent log names them; yuzu_fleet_plugin_init_failed_rejected counts the agents sending them). The runbook link is the Echo upgrade note; for any other plugin the agent log is the source. For plugin=\"echo\" the usual causes are a failed tar.db adoption after the rename (including a sidecar present under both names) and a corrupt echo.db that could not be moved aside; the upgrade notes cover adoption under 'Two cases the agent refuses, and what to do', and the corrupt-database case is under Corrupt-database quarantine in the Echo manual. An Echo that loads offline (for lack of free space, or after a failed v10 migration) is not counted here; see YuzuEchoStorageOffline (#7290). The value and the plugin label are agent-self-reported: the server bounds the label to its catalogue, so an agent cannot displace a real plugin, but it can still report a real plugin's name as failed, or not report a failure, so the signal is not authoritative."
               runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/upgrading.md#behaviour-change-the-activity-record-feature-is-renamed-echo-tardb-adopted-as-echodb-stored-references-migrated"
     promql_expr_test:
       - expr: 'ALERTS{alertname="YuzuPluginInitFailed", alertstate="firing"}'
@@ -9019,6 +9459,71 @@ tests:
             value: 1
           - labels: 'ALERTS{alertname="YuzuPluginInitFailed", alertstate="firing", job="yuzu", plugin="wmi", severity="warning"}'
             value: 1
+  # CASE M (#7290) -- Echo storage offline: held for the full 30m, quiet at 29m, firing at 30m, with the
+  # reason label and no `instance`. Two replicas report it, so the annotations read "2 agent(s)": RED
+  # if `max by` replaces `sum by`. RED if `for:` is shortened (fires at 29m) or lengthened; the shipped
+  # annotations are pinned here, verbatim.
+  - interval: 1m
+    name: echo storage offline held past 30m fires, not before
+    input_series:
+      - series: 'yuzu_fleet_echo_storage_offline{job="yuzu",instance="s1",reason="migration_failed"}'
+        values: "1x45"
+      - series: 'yuzu_fleet_echo_storage_offline{job="yuzu",instance="s2",reason="migration_failed"}'
+        values: "1x45"
+    alert_rule_test:
+      - eval_time: 31m
+        alertname: YuzuEchoStorageOffline
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: yuzu
+              reason: migration_failed
+            exp_annotations:
+              summary: "About 2 agent(s) have Echo storage offline (migration_failed)"
+              description: "For more than 25 minutes, about 2 agent(s) (summed across core replicas, so a failover can count one twice for a few minutes) have reported that their Echo database could not be opened and Echo is offline (heartbeat tag yuzu.plugin.echo.storage_offline), reason migration_failed: free_space is too little free disk for the v10 roll-up migration, migration_failed is a migration that failed or ran past its deadline and was rolled back with the old data intact, open_failed is any other failure on a retry. reason=\"unknown\" sums values the server does not recognise. Nothing is collected on an affected endpoint, but the agent keeps retrying (1, 5 and 15 minutes, then hourly) and recovers by itself once the cause is gone, except an open_failed where the database opened but collection failed to start: that is not retried and needs an agent restart. The agent log and `echo status` on the device name the cause. The value and the reason are agent-self-reported, so the signal is not authoritative."
+              runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/ops-runbooks/echo-storage-offline.md"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuEchoStorageOffline", alertstate="firing"}'
+        eval_time: 29m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuEchoStorageOffline", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuEchoStorageOffline", alertstate="firing", job="yuzu", reason="migration_failed", severity="warning"}'
+            value: 1
+
+  # CASE N (#7290) -- the fixed label family at 0 for every reason (a healthy fleet) never fires.
+  # RED if the expression loses its `> 0`.
+  - interval: 1m
+    name: echo storage offline - an all-zero family never fires
+    input_series:
+      - series: 'yuzu_fleet_echo_storage_offline{job="yuzu",instance="s1",reason="free_space"}'
+        values: "0x60"
+      - series: 'yuzu_fleet_echo_storage_offline{job="yuzu",instance="s1",reason="migration_failed"}'
+        values: "0x60"
+      - series: 'yuzu_fleet_echo_storage_offline{job="yuzu",instance="s1",reason="open_failed"}'
+        values: "0x60"
+      - series: 'yuzu_fleet_echo_storage_offline{job="yuzu",instance="s1",reason="unknown"}'
+        values: "0x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuEchoStorageOffline"}'
+        eval_time: 45m
+        exp_samples: []
+
+  # CASE O (#7290) -- a replica restart mid-condition (absent a minute, then one sweep at 0) does not
+  # reset the `for:` clock. RED if the max_over_time window is removed or shortened to 1m.
+  - interval: 1m
+    name: echo storage offline - a replica restart mid-condition does not reset for
+    input_series:
+      - series: 'yuzu_fleet_echo_storage_offline{job="yuzu",instance="s1",reason="free_space"}'
+        values: "1x20 _x1 0x1 1x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuEchoStorageOffline", alertstate="firing"}'
+        eval_time: 40m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuEchoStorageOffline", alertstate="firing", job="yuzu", reason="free_space", severity="warning"}'
+            value: 1
+
   # CASE -- the one-minute recheck clears a fixed database: the gauge goes 1 -> 0 while the server keeps
   # running, the alert fires after the hold and is gone once the gauge reads 0. Red if the rule
   # latched (e.g. read a max_over_time) so a fix needed a restart.
@@ -9458,6 +9963,195 @@ tests:
       - expr: 'ALERTS{alertname="YuzuPgCollationCheckStale"}'
         eval_time: 250m
         exp_samples: []
+
+  # CASE -- YuzuDeviceCiWritesPaused: one device refused at the slowest agent cadence (every 15
+  # minutes: 10 min backoff ceiling plus 5 min jitter) while the mismatch gauge reads 1. Refusals
+  # (ingest counter jumps) at 10, 25, 40, 55 and 70 minutes, the last one at 70m; the op="delete"
+  # series stays flat, so the sum over op is exercised. Pending from 10m, firing from about 20m
+  # (the 10m hold), still firing at 54m (just before a jump) and at 85m (the window of [20m]
+  # carries the last refusal to about 88m), quiet at 100m. Asserted below: pending and not firing
+  # at 15m, firing at 22m, 40m, 54m and 85m, nothing at 100m. A window of 15m or less would drop
+  # to 0 between two refusals and reset the hold (a [15m] mutant measured red at 40m, 54m and 85m,
+  # not at 22m); a hold of 4m or less would fire at 15m (red); a window of 32m or more would still
+  # fire at 100m (red). It does not pin the
+  # exact hold or window to the minute.
+  - interval: 1m
+    name: device ci writes paused - refusals at the slowest cadence fire after the hold and resolve
+    input_series:
+      - series: 'yuzu_device_ci_writes_deferred_total{job="yuzu",instance="s1",op="ingest"}'
+        values: "0x9 1x14 2x14 3x14 4x14 5x80"
+      - series: 'yuzu_device_ci_writes_deferred_total{job="yuzu",instance="s1",op="delete"}'
+        values: "0x130"
+      - series: 'yuzu_pg_collation_version_mismatch{job="yuzu",instance="s1"}'
+        values: "1x130"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuDeviceCiWritesPaused", alertstate="pending"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuDeviceCiWritesPaused", alertstate="pending", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuDeviceCiWritesPaused", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuDeviceCiWritesPaused", alertstate="firing"}'
+        eval_time: 22m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuDeviceCiWritesPaused", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuDeviceCiWritesPaused", alertstate="firing"}'
+        eval_time: 40m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuDeviceCiWritesPaused", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuDeviceCiWritesPaused", alertstate="firing"}'
+        eval_time: 54m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuDeviceCiWritesPaused", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuDeviceCiWritesPaused", alertstate="firing"}'
+        eval_time: 85m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuDeviceCiWritesPaused", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuDeviceCiWritesPaused", alertstate=~"firing|pending"}'
+        eval_time: 100m
+        exp_samples: []
+
+  # CASE -- the repair clears the alert at once. Refusals at 10, 25 and 38 minutes; the mismatch
+  # gauge goes 1 -> 0 at 40m (the next collation check found the versions equal and writes
+  # resumed). Firing at 35m; at 45m the [20m] window still holds the 38m refusal (it would stay
+  # true to about 56m), so only the `and yuzu_pg_collation_version_mismatch == 1` conjunct makes
+  # it quiet: red if the conjunct were dropped, or if the rule read another gauge.
+  - interval: 1m
+    name: device ci writes paused - a repaired mismatch clears the alert without waiting out the window
+    input_series:
+      - series: 'yuzu_device_ci_writes_deferred_total{job="yuzu",instance="s1",op="ingest"}'
+        values: "0x9 1x14 2x12 3x100"
+      - series: 'yuzu_pg_collation_version_mismatch{job="yuzu",instance="s1"}'
+        values: "1x39 0x100"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuDeviceCiWritesPaused", alertstate="firing"}'
+        eval_time: 35m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuDeviceCiWritesPaused", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuDeviceCiWritesPaused", alertstate=~"firing|pending"}'
+        eval_time: 45m
+        exp_samples: []
+
+  # CASE -- a mismatched replica that refuses nothing stays quiet (an idle replica, or one with no
+  # connected device: YuzuPgCollationVersionMismatch is its signal). The counters are the
+  # pre-seeded zeros the server exports. Red if the comparison were `>= 0`.
+  - interval: 1m
+    name: device ci writes paused - a mismatch with no refusals stays quiet
+    input_series:
+      - series: 'yuzu_device_ci_writes_deferred_total{job="yuzu",instance="s1",op="ingest"}'
+        values: "0x100"
+      - series: 'yuzu_device_ci_writes_deferred_total{job="yuzu",instance="s1",op="delete"}'
+        values: "0x100"
+      - series: 'yuzu_pg_collation_version_mismatch{job="yuzu",instance="s1"}'
+        values: "1x100"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuDeviceCiWritesPaused"}'
+        eval_time: 60m
+        exp_samples: []
+
+  # CASE -- per replica, and any op counts. s1 refuses ingest, s2 refuses only decommission
+  # removals (op="delete"), s3 has the mismatch but refuses nothing. At 30m s1 and s2 fire, each
+  # keyed on its own instance, and s3 does not. Red if the sum dropped the instance label, if the
+  # rule read only op="ingest", or if the join matched on job alone.
+  - interval: 1m
+    name: device ci writes paused - fires per replica and counts either op
+    input_series:
+      - series: 'yuzu_device_ci_writes_deferred_total{job="yuzu",instance="s1",op="ingest"}'
+        values: "0x9 1x14 2x14 3x100"
+      - series: 'yuzu_device_ci_writes_deferred_total{job="yuzu",instance="s2",op="delete"}'
+        values: "0x11 1x14 2x14 3x100"
+      - series: 'yuzu_device_ci_writes_deferred_total{job="yuzu",instance="s3",op="ingest"}'
+        values: "0x130"
+      - series: 'yuzu_pg_collation_version_mismatch{job="yuzu",instance="s1"}'
+        values: "1x130"
+      - series: 'yuzu_pg_collation_version_mismatch{job="yuzu",instance="s2"}'
+        values: "1x130"
+      - series: 'yuzu_pg_collation_version_mismatch{job="yuzu",instance="s3"}'
+        values: "1x130"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuDeviceCiWritesPaused", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuDeviceCiWritesPaused", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+          - labels: 'ALERTS{alertname="YuzuDeviceCiWritesPaused", alertstate="firing", instance="s2", job="yuzu", severity="warning"}'
+            value: 1
+
+  # CASE -- the shipped scrape configs (deploy/prometheus/*.yml) add component="server" to every
+  # server series, so both the counter and the gauge carry a label the rule's left side drops
+  # (`sum by (job, instance)`). Same shape as the first case (refusals at 10, 25, 40, 55 and 70
+  # minutes, gauge 1) with that extra label on BOTH series. Red if the join were a plain `and`
+  # (it matches on the whole label set, so nothing would ever match and the alert could never
+  # fire). The alert carries only job and instance (the left side's labels).
+  - interval: 1m
+    name: device ci writes paused - fires when the series carry the extra component label
+    input_series:
+      - series: 'yuzu_device_ci_writes_deferred_total{job="yuzu",instance="s1",component="server",op="ingest"}'
+        values: "0x9 1x14 2x14 3x14 4x14 5x80"
+      - series: 'yuzu_device_ci_writes_deferred_total{job="yuzu",instance="s1",component="server",op="delete"}'
+        values: "0x130"
+      - series: 'yuzu_pg_collation_version_mismatch{job="yuzu",instance="s1",component="server"}'
+        values: "1x130"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuDeviceCiWritesPaused", alertstate="firing"}'
+        eval_time: 22m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuDeviceCiWritesPaused", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuDeviceCiWritesPaused", alertstate="firing"}'
+        eval_time: 54m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuDeviceCiWritesPaused", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+
+  # CASE -- the same extra component label, but the gauge reads 0 (no mismatch) while the counter
+  # still rose inside the window: the alert stays quiet. Red if the join ignored the gauge's
+  # value (for example if the `== 1` filter were dropped, the gauge series would still match on
+  # job and instance), and a guard that the extra-label join does not turn into "always true".
+  - interval: 1m
+    name: device ci writes paused - the extra component label with no mismatch stays quiet
+    input_series:
+      - series: 'yuzu_device_ci_writes_deferred_total{job="yuzu",instance="s1",component="server",op="ingest"}'
+        values: "0x9 1x14 2x14 3x100"
+      - series: 'yuzu_pg_collation_version_mismatch{job="yuzu",instance="s1",component="server"}'
+        values: "0x130"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuDeviceCiWritesPaused"}'
+        eval_time: 30m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuDeviceCiWritesPaused"}'
+        eval_time: 50m
+        exp_samples: []
+
+  # CASE -- YuzuInventoryHighNeedFullRatio ignores outcome="deferred" in its denominator. A paused
+  # device_ci fleet counts one deferred per refused report (400 per minute here), while another
+  # source is in a real need_full surge (30 of 100 non-deferred outcomes, 30%). With the deferred
+  # outcomes in the denominator the ratio would read 30 / 500 = 6% and the alert would stay quiet
+  # for the whole pause; without them it is 30% and fires after its 15m hold. Red if the
+  # `outcome!="deferred"` matcher were dropped. The deferred series does not count in the
+  # numerator either (it is not need_full).
+  - interval: 1m
+    name: inventory need_full ratio - deferred outcomes do not dilute the denominator
+    input_series:
+      - series: 'yuzu_inventory_ingest_total{job="yuzu",instance="s1",source="installed_software",outcome="need_full"}'
+        values: "0+30x100"
+      - series: 'yuzu_inventory_ingest_total{job="yuzu",instance="s1",source="installed_software",outcome="stored"}'
+        values: "0+70x100"
+      - series: 'yuzu_inventory_ingest_total{job="yuzu",instance="s1",source="device_ci",outcome="deferred"}'
+        values: "0+400x100"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuInventoryHighNeedFullRatio", alertstate="firing"}'
+        eval_time: 40m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuInventoryHighNeedFullRatio", alertstate="firing", severity="warning"}'
+            value: 1
 
   # SAM-33 plugin-health alerts. Series are the yuzu_software_facet_devices gauge: 30 collecting
   # devices of which 3 time out (10%) and 0 are otherwise failing. Timeout share 10% > 5% but

@@ -1183,6 +1183,10 @@ TEST_CASE("is_streaming_path: POST /mcp/v1/ streams ONLY with an SSE Accept (2f 
     CHECK(get("/events"));
     CHECK(get("/api/v1/events"));
     CHECK(get("/sse/executions/abc123"));
+    // The streamed software export (SAM-36) pins a worker for up to 900 s: registered, and an
+    // exact path (the list route beside it answers in one page and is not a stream).
+    CHECK(get("/api/v1/inventory/software/export"));
+    CHECK_FALSE(get("/api/v1/inventory/software"));
     CHECK_FALSE(get("/api/v1/devices"));
 
     // Other methods never stream.

@@ -29,6 +29,7 @@
 
 #include <subprocess_degradation.hpp>
 #include <yuzu/plugin.h>         // YUZU_RESULT_STATUS_CONSTRAINED / _COMPLETENESS_PARTIAL
+#include <row_field.hpp>          // yuzu::shared::row_field (backslash-preserving)
 #include <yuzu/string_utils.hpp> // yuzu::util::safe_output_field
 
 namespace yuzu::installed_apps::parsers {
@@ -580,12 +581,13 @@ inline std::string_view cut_utf8(std::string_view v, std::size_t max_bytes) {
 // One `list` field on the wire: cut at the first NUL (write_output hands the row
 // to a C string, so an interior NUL would otherwise truncate the whole ROW and
 // strand the later columns), bound the length at a UTF-8 sequence boundary,
-// then safe_output_field ('\' -> '/', '|' -> "\|", CR/LF -> ' '); "-" if empty.
+// then yuzu::shared::row_field ('|' -> "\|", CR/LF -> ' ', a TRAILING '\' -> '/', interior
+// backslashes kept); "-" if empty.
 // The NUL cut and the bound MUST precede the escape: escaping first can cut
 // between a '\' and its '|', and the stranded '\' then swallows the delimiter.
 inline std::string list_field(std::string_view v) {
     v = cut_utf8(v.substr(0, v.find('\0')), kMaxListFieldBytes);
-    return v.empty() ? std::string("-") : yuzu::util::safe_output_field(v);
+    return v.empty() ? std::string("-") : yuzu::shared::row_field(v);
 }
 } // namespace detail
 
@@ -593,11 +595,11 @@ inline std::string list_field(std::string_view v) {
 // EVERY field goes through detail::list_field, so a row is always exactly seven
 // escape-aware tokens (server/core/src/result_parsing.hpp find_unescaped_pipe
 // grammar) whatever bytes a registry value, an Info.plist or a path carries; a
-// value within the 4 KiB bound and free of '\', '|', CR, LF and NUL is emitted
-// byte-identically (in the reference captures the new install_location is the
-// exception: 59 of 241 Windows rows carry a populated one, its backslashes
-// folded to '/'). `query`/`list_per_user` keep their own raw std::format rows
-// and the ADR-0016 `inv|` rows never pass here.
+// value within the 4 KiB bound and free of '|', CR, LF, NUL and a trailing '\' is
+// emitted byte-identically (interior backslashes are kept; a trailing one folds
+// to '/'). The Windows reference captures predate this and show every backslash
+// folded to '/'; they need a Windows recapture. `query`/`list_per_user` rows are built below by format_query_row /
+// format_user_app_row (same per-field list_field); the ADR-0016 `inv|` rows never pass here.
 // `name` stays "" when empty (the collectors never produce one; the sentinel
 // row sets it); every other empty field renders "-". The caller applies
 // sanitize_utf8 to the result (a no-op on the boundary-safe cut).
@@ -608,6 +610,37 @@ inline std::string list_field(std::string_view v) {
                           &f.bundle_id}) {
         out += '|';
         out += detail::list_field(*v);
+    }
+    return out;
+}
+
+// `app|name|version|publisher` -- the `query` action's row. Every field goes through
+// detail::list_field (CWE-93 / #5208 style: a name, version or publisher carrying
+// '|', CR, LF or NUL cannot forge columns or rows); empty version/publisher
+// render "-" as before. The caller applies sanitize_utf8 to the result.
+[[nodiscard]] inline std::string format_query_row(std::string_view name, std::string_view version,
+                                                  std::string_view publisher) {
+    std::string out = "app|";
+    out += detail::list_field(name);
+    out += '|';
+    out += detail::list_field(version);
+    out += '|';
+    out += detail::list_field(publisher);
+    return out;
+}
+
+// `user_app|username|name|version|publisher|install_date` -- the `list_per_user`
+// row. The fields come from each user's own (user-writable) registry hive, so every
+// one goes through detail::list_field: always exactly six escape-aware tokens.
+[[nodiscard]] inline std::string format_user_app_row(std::string_view username,
+                                                     std::string_view name,
+                                                     std::string_view version,
+                                                     std::string_view publisher,
+                                                     std::string_view install_date) {
+    std::string out = "user_app";
+    for (const auto v : {username, name, version, publisher, install_date}) {
+        out += '|';
+        out += detail::list_field(v);
     }
     return out;
 }

@@ -15,6 +15,7 @@
 #include "offline_endpoint_types.hpp"
 #include "pg/pg_pool.hpp"
 #include "response_store.hpp"
+#include "test_fake_ci_keyset_store.hpp"
 #include "test_forensics_tier_fixture.hpp"
 #include "test_route_sink.hpp"
 
@@ -30,6 +31,7 @@
 #include <functional>
 #include <algorithm>
 #include <optional>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -62,6 +64,12 @@ InventoryDeviceRow make_row(std::string id, std::string host, std::string os, bo
 // action_descriptions) are left unwired — the Actions lens and its result poll are
 // out of scope for this file (the CI list/record + REST twins are the named gap).
 struct HwHarness {
+    // The collation gate the bulk read consults (production wires &collation_gate_). Trusted by
+    // default and mutable after construction (the route reads it per request); the constructor's
+    // `unwire_ci_gate_ctor` leaves the deps pointer null (no gate), which serves. Declared FIRST,
+    // before `routes` which borrows it, so it is destroyed after everything that holds the pointer.
+    std::atomic<pg::CollationGate> ci_gate{pg::CollationGate::Trusted};
+
     yuzu::server::test::TestRouteSink sink;
     HardwareRoutes routes;
 
@@ -79,6 +87,11 @@ struct HwHarness {
     bool roster_tags_degraded = false;
     bool roster_degraded = false; // #5531: the durable roster read failed
     bool roster_truncated = false; // #5712: the durable roster read was a typed partial
+
+    // The keyset store behind GET /api/v1/hardware-ci (its in-memory fake). `ci_page_unwired` is
+    // decided once at construction, like the other unwire flags (see below).
+    yuzu::server::test::FakeCiKeysetStore ci_store;
+    bool ci_page_unwired = false;
 
     HardwareCiDetail ci_detail; // configurable per test; default = degraded (the struct's own default)
     std::vector<CiRead> ci_reads; // the `CiRead` argument of every ci_detail_fn call, in order
@@ -142,7 +155,9 @@ struct HwHarness {
     explicit HwHarness(bool unwire_sync_dispatch_ctor = false, bool unwire_agent_version_fn_ctor = false,
                        bool quarantine_list_wired_ctor = false,
                        bool containment_ui_ctor = kContainmentUi,
-                       ResponseStore* response_store = nullptr) {
+                       ResponseStore* response_store = nullptr, bool unwire_ci_page_ctor = false,
+                       bool unwire_ci_gate_ctor = false) {
+        ci_page_unwired = unwire_ci_page_ctor;
         quarantine_list_wired = quarantine_list_wired_ctor;
         unwire_sync_dispatch = unwire_sync_dispatch_ctor;
         unwire_agent_version_fn = unwire_agent_version_fn_ctor;
@@ -243,6 +258,10 @@ struct HwHarness {
         deps.audit_fn = audit;
         deps.roster_fn = roster_fn;
         deps.ci_detail_fn = ci_fn;
+        if (!ci_page_unwired)
+            deps.ci_page_reader = ci_store.reader();
+        if (!unwire_ci_gate_ctor)
+            deps.ci_collation_gate = &ci_gate;
         deps.scoped_probe_fn = probe;
         deps.dex_score_fn = dex_fn;
         if (quarantine_list_wired) {
@@ -2388,50 +2407,56 @@ TEST_CASE("route: lens-only response carries the Containment tab when the UI is 
     CHECK(contains(res->body, ">Containment</a>"));
 }
 
-// ───────────────────────── Actions lens: quarantine plugin rows ──────────────────────
+// ───────────────────────── Actions lens: firewall containment rows ───────────────────
 
 namespace {
-void report_quarantine_and_firewall_plugins(HwHarness& h) {
+void report_firewall_and_other_plugins(HwHarness& h) {
     h.ci_detail.identity = make_row("agent-1", "HOST-1", "linux", true);
     h.actions_plugins = {
-        {.name = "quarantine", .version = "1", .actions = {"quarantine", "unquarantine", "status", "whitelist"}},
-        {.name = "firewall", .version = "1", .actions = {"rules"}}};
+        {.name = "firewall",
+         .version = "1",
+         .actions = {"state", "rules", "quarantine", "release", "quarantine_status", "quarantine_allow"}},
+        {.name = "processes", .version = "1", .actions = {"list"}}};
 }
 } // namespace
 
-// Kills: a Run button for the quarantine plugin's own actions (quarantine, unquarantine,
-// whitelist) surviving in the Actions lens while the rest of the containment UI is hidden —
-// the owner chose to hide every quarantine control on the Hardware pages. Other plugins stay.
-TEST_CASE("route: actions lens — the quarantine plugin's rows are left out while the UI is hidden",
+// Kills: a Run button for the firewall plugin's four containment actions (quarantine, release,
+// quarantine_status, quarantine_allow) surviving in the Actions lens while the rest of the
+// containment UI is hidden — the owner chose to hide every quarantine control on the Hardware
+// pages (and approved the lens consequence for the four firewall rows, 2026-11-11). Other
+// plugins stay, and so do firewall.state and firewall.rules.
+TEST_CASE("route: actions lens — the four firewall containment rows are left out while the UI is hidden",
           "[hardware][route][quarantine]") {
     HwHarness h;
-    report_quarantine_and_firewall_plugins(h);
+    report_firewall_and_other_plugins(h);
     auto res = h.sink.Get("/fragments/hardware/ci/actions?id=agent-1");
     REQUIRE(res);
     REQUIRE(res->status == 200);
+    CHECK(contains(res->body, "data-plugin=\"firewall\" data-action=\"state\""));
     CHECK(contains(res->body, "data-plugin=\"firewall\" data-action=\"rules\""));
+    CHECK(contains(res->body, "data-plugin=\"processes\" data-action=\"list\""));
     CHECK(contains(res->body, "hwRunAction"));
+    for (const char* action : {"quarantine", "release", "quarantine_status", "quarantine_allow"})
+        CHECK_FALSE(contains(res->body,
+                             std::string("data-plugin=\"firewall\" data-action=\"") + action + "\""));
     CHECK_FALSE(contains(res->body, "data-plugin=\"quarantine\""));
-    CHECK_FALSE(contains(res->body, "<summary>quarantine</summary>"));
-    for (const char* action : {"quarantine.quarantine", "quarantine.unquarantine", "quarantine.status",
-                               "quarantine.whitelist"})
-        CHECK_FALSE(contains(res->body, action));
     REQUIRE_FALSE(h.audit_details.empty());
-    CHECK(contains(h.audit_details.back(), "actions catalogue: 1 rows"));
+    CHECK(contains(h.audit_details.back(), "actions catalogue: 3 rows"));
 }
 
-// Kills: the filter dropping the quarantine rows when the UI is on (the restore path).
-TEST_CASE("route: actions lens — the quarantine plugin's rows are listed when the UI is on",
+// Kills: the filter dropping the firewall containment rows when the UI is on (the restore path).
+TEST_CASE("route: actions lens — all six firewall rows are listed when the UI is on",
           "[hardware][route][quarantine]") {
     HwHarness h(false, false, false, /*containment_ui=*/true);
-    report_quarantine_and_firewall_plugins(h);
+    report_firewall_and_other_plugins(h);
     auto res = h.sink.Get("/fragments/hardware/ci/actions?id=agent-1");
     REQUIRE(res);
     REQUIRE(res->status == 200);
-    for (const char* action : {"quarantine", "unquarantine", "status", "whitelist"})
-        CHECK(contains(res->body, std::string("data-plugin=\"quarantine\" data-action=\"") + action + "\""));
-    CHECK(contains(res->body, "data-plugin=\"firewall\" data-action=\"rules\""));
-    CHECK(contains(h.audit_details.back(), "actions catalogue: 5 rows"));
+    for (const char* action :
+         {"state", "rules", "quarantine", "release", "quarantine_status", "quarantine_allow"})
+        CHECK(contains(res->body,
+                       std::string("data-plugin=\"firewall\" data-action=\"") + action + "\""));
+    CHECK(contains(h.audit_details.back(), "actions catalogue: 7 rows"));
 }
 
 // Remove needs Tag:Delete, which is not Tag:Write: a Write-only viewer is offered Add and no
@@ -2678,4 +2703,767 @@ TEST_CASE(
     CHECK(h.metrics
               .counter("yuzu_hardware_section_integrity_total", {{"reason", "row_count_mismatch"}})
               .value() == 0.0);
+}
+
+// ───────────────────────── GET /api/v1/hardware-ci: the bulk keyset page ──────────────────
+
+namespace {
+
+std::vector<std::string> ci_page_ids(const nlohmann::json& body) {
+    std::vector<std::string> out;
+    for (const auto& d : body["data"]["devices"])
+        out.push_back(d["agent_id"].get<std::string>());
+    return out;
+}
+
+void seed_ci(HwHarness& h, std::initializer_list<const char*> ids) {
+    for (const char* id : ids)
+        h.ci_store.add(std::string(id));
+}
+
+} // namespace
+
+// Kills: the bulk page answering on the per-id URL, or the per-id route losing a device whose agent
+// id is literally `ci` (as on origin/dev). The bulk read lives at its own path, so the per-id route
+// must serve `GET /api/v1/hardware/ci` as the record of the device named `ci`, never a page.
+TEST_CASE("route: GET /api/v1/hardware/ci is the per-id record of a device whose agent id is ci",
+          "[hardware][route][rest][ci_page]") {
+    HwHarness h;
+    h.ci_detail.identity = make_row("ci", "CI-HOST", "linux", true);
+    auto res = h.sink.Get("/api/v1/hardware/ci");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    const auto body = nlohmann::json::parse(res->body);
+    CHECK(body["data"]["agent_id"] == "ci");
+    CHECK(body["data"].contains("identity_state"));
+    CHECK_FALSE(body["data"].contains("devices"));     // not a bulk page
+    CHECK_FALSE(body["data"].contains("next_cursor"));
+    CHECK(h.ci_reads.size() == 1);                     // the per-id composition was asked
+    CHECK(h.ci_store.reads == 0);                      // the keyset store was not
+    REQUIRE_FALSE(h.audits.empty());
+    CHECK(h.audits.back() == "inventory.device.ci|success");
+}
+
+// Kills: the bulk route being registered on, or falling back to, the per-id prefix.
+TEST_CASE("route: GET /api/v1/hardware-ci is the bulk page and never reaches the per-id handler",
+          "[hardware][route][rest][ci_page]") {
+    HwHarness h;
+    seed_ci(h, {"agent-1", "ci"});
+    auto bulk = h.sink.Get("/api/v1/hardware-ci");
+    REQUIRE(bulk);
+    REQUIRE(bulk->status == 200);
+    CHECK(h.ci_reads.empty()); // the per-id handler (ci_detail_fn) was never called
+    const auto body = nlohmann::json::parse(bulk->body);
+    CHECK(body["data"].contains("next_cursor"));
+    CHECK(body["meta"]["api_version"] == "v1");
+    CHECK(ci_page_ids(body) == std::vector<std::string>{"agent-1", "ci"});
+
+    // The agent_id filter reads one device, including one whose id is `ci`.
+    h.audit_full.clear();
+    auto named = h.sink.Get("/api/v1/hardware-ci?agent_id=ci");
+    REQUIRE(named);
+    REQUIRE(named->status == 200);
+    CHECK(h.ci_reads.empty());
+    CHECK(ci_page_ids(nlohmann::json::parse(named->body)) == std::vector<std::string>{"ci"});
+    CHECK(h.audit_full.back() == "inventory.devices.ci|success|Agent|ci");
+}
+
+TEST_CASE("route: GET /api/v1/hardware-ci walks every device once across pages and audits each page",
+          "[hardware][route][rest][ci_page]") {
+    HwHarness h;
+    seed_ci(h, {"d-5", "d-1", "d-7", "d-3", "d-2", "d-6", "d-4"});
+
+    std::vector<std::string> seen;
+    std::string cursor;
+    int pages = 0;
+    for (;;) {
+        std::string url = "/api/v1/hardware-ci?limit=3";
+        if (!cursor.empty())
+            url += "&cursor=" + cursor;
+        auto res = h.sink.Get(url);
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        CHECK(res->has_header("X-Correlation-Id"));
+        const auto body = nlohmann::json::parse(res->body);
+        for (const auto& id : ci_page_ids(body))
+            seen.push_back(id);
+        ++pages;
+        REQUIRE(pages < 10);
+        cursor = body["data"]["next_cursor"].get<std::string>();
+        if (cursor.empty())
+            break;
+    }
+    CHECK(pages == 3);
+    CHECK(seen == std::vector<std::string>{"d-1", "d-2", "d-3", "d-4", "d-5", "d-6", "d-7"});
+
+    // ONE fail-closed audit row per page, with the row count, continuation pages tagged.
+    REQUIRE(h.audit_full.size() == 3);
+    for (const auto& row : h.audit_full)
+        CHECK(row == "inventory.devices.ci|success|Inventory|fleet");
+    // exact strings: the first page, two continuation pages, all unconfined
+    CHECK(h.audit_details[0] == "hardware CI records (REST): rows=3 scope=fleet");
+    CHECK(h.audit_details[1] == "hardware CI records (REST): rows=3 page=continuation scope=fleet");
+    CHECK(h.audit_details[2] == "hardware CI records (REST): rows=1 page=continuation scope=fleet");
+}
+
+TEST_CASE("route: GET /api/v1/hardware-ci row carries the ci block, the stored hash and the blob version",
+          "[hardware][route][rest][ci_page]") {
+    HwHarness h;
+    DeviceCiRecord v2 = yuzu::server::test::make_ci_record("agent-v2");
+    v2.chassis_type = "Laptop";
+    DeviceCiRecord v1 = yuzu::server::test::make_ci_record("agent-v1");
+    v1.blob_version = 1; // an older agent: no chassis, board or machine-id values
+    v1.content_hash = "v1hash";
+    h.ci_store.add(v1);
+    h.ci_store.add(v2);
+
+    auto res = h.sink.Get("/api/v1/hardware-ci");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    const auto body = nlohmann::json::parse(res->body);
+    const auto& rows = body["data"]["devices"];
+    REQUIRE(rows.size() == 2);
+    // sorted by agent_id: v1 first
+    CHECK(rows[0]["agent_id"] == "agent-v1");
+    CHECK(rows[0]["blob_version"] == 1);
+    CHECK(rows[0]["content_hash"] == "v1hash");
+    for (const char* k : {"chassis_type", "chassis_serial", "board_vendor", "board_serial",
+                          "machine_id_hash", "machine_id_source"}) {
+        INFO(k);
+        CHECK(rows[0]["ci"][k].is_null()); // null, never a default
+    }
+    CHECK(rows[1]["blob_version"] == 2);
+    CHECK(rows[1]["ci"]["chassis_type"] == "Laptop");
+    CHECK(rows[1]["ci"]["serial"] == "SN-agent-v2");
+    CHECK(rows[1]["hostname"] == "host-agent-v2");
+    CHECK_FALSE(rows[1]["ci"].contains("sections"));
+    CHECK_FALSE(body["data"].contains("devices_omitted"));
+}
+
+// Kills: dropping the scope from the query. Asserts the devices that actually CAME BACK, and that
+// no byte of an out-of-scope device is anywhere in the response or in the audit detail.
+TEST_CASE("route: GET /api/v1/hardware-ci never returns a device outside the caller's scope",
+          "[hardware][route][rest][ci_page]") {
+    HwHarness h;
+    seed_ci(h, {"in-a", "in-b", "out-c", "out-d", "out-e"});
+    h.scope = std::unordered_set<std::string>{"in-a", "in-b", "ghost"};
+
+    std::vector<std::string> seen;
+    std::string cursor;
+    for (int pages = 0; pages < 10; ++pages) {
+        auto res = h.sink.Get("/api/v1/hardware-ci?limit=1" + (cursor.empty() ? "" : "&cursor=" + cursor));
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        CHECK_FALSE(contains(res->body, "out-"));
+        CHECK_FALSE(contains(res->body, "SN-out"));
+        const auto body = nlohmann::json::parse(res->body);
+        for (const auto& id : ci_page_ids(body))
+            seen.push_back(id);
+        cursor = body["data"]["next_cursor"].get<std::string>();
+        if (cursor.empty())
+            break;
+    }
+    CHECK(seen == std::vector<std::string>{"in-a", "in-b"});
+    for (const auto& d : h.audit_details)
+        CHECK_FALSE(contains(d, "out-"));
+    for (const auto& q : h.ci_store.queries) {
+        REQUIRE(q.agent_ids.has_value());
+        CHECK(q.agent_ids->size() == 3);
+    }
+
+    SECTION("the body and the audit detail of a confined caller carry no omitted count") {
+        h.audit_full.clear();
+        h.audit_details.clear();
+        auto res = h.sink.Get("/api/v1/hardware-ci");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        const auto body = nlohmann::json::parse(res->body);
+        // the exact key set of the data object: devices, next_cursor, scope_basis
+        std::set<std::string> keys;
+        for (const auto& [k, v] : body["data"].items())
+            keys.insert(k);
+        CHECK(keys == std::set<std::string>{"devices", "next_cursor", "scope_basis"});
+        CHECK(body["data"]["scope_basis"] == "authority_scoped");
+        CHECK_FALSE(contains(res->body, "devices_omitted"));
+        REQUIRE(h.audit_details.size() == 1);
+        CHECK(h.audit_details[0] == "hardware CI records (REST): rows=2 scope=authority_scoped");
+    }
+    SECTION("a named device outside the scope is an empty page, not a 404 and not its row") {
+        h.audit_full.clear();
+        h.audit_details.clear();
+        const auto reads_before = h.ci_store.reads;
+        auto res = h.sink.Get("/api/v1/hardware-ci?agent_id=out-c");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        CHECK_FALSE(contains(res->body, "out-c"));
+        CHECK(nlohmann::json::parse(res->body)["data"]["devices"].empty());
+        // Audited as ONE refusal row, target Agent/<id>. (The dashboard fragment
+        // GET /fragments/inventory/software/devices differs: its verb inventory.software.query
+        // can write a denied row and then a success row for the same request.)
+        REQUIRE(h.audit_full.size() == 1);
+        CHECK(h.audit_full[0] == "inventory.devices.ci|denied|Agent|out-c");
+        CHECK(h.audit_details[0] == "hardware CI records (REST) state=agent_id outside the caller's scope");
+        CHECK(h.ci_store.reads == reads_before); // the named read ran no SQL
+    }
+    SECTION("an engaged-empty scope returns nothing") {
+        h.scope = authz::deny_all();
+        auto res = h.sink.Get("/api/v1/hardware-ci");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        CHECK(nlohmann::json::parse(res->body)["data"]["devices"].empty());
+        CHECK(h.audit_details.back() == "hardware CI records (REST): rows=0 scope=authority_scoped");
+    }
+}
+
+TEST_CASE("route: GET /api/v1/hardware-ci gives an unconfined caller no scope_basis and no omitted count",
+          "[hardware][route][rest][ci_page]") {
+    HwHarness h; // scope unset: TOP
+    seed_ci(h, {"a", "b"});
+    auto res = h.sink.Get("/api/v1/hardware-ci");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    const auto body = nlohmann::json::parse(res->body);
+    std::set<std::string> keys;
+    for (const auto& [k, v] : body["data"].items())
+        keys.insert(k);
+    CHECK(keys == std::set<std::string>{"devices", "next_cursor"});
+    REQUIRE(h.audit_details.size() == 1);
+    CHECK(h.audit_details[0] == "hardware CI records (REST): rows=2 scope=fleet");
+}
+
+namespace {
+
+// A scope of exactly `n` ids: `real` first, then padding that matches no stored device.
+authz::VisibleSet ci_scope_of_size(std::initializer_list<const char*> real, std::size_t n) {
+    std::unordered_set<std::string> ids;
+    for (const char* r : real)
+        ids.insert(r);
+    for (int i = 0; ids.size() < n; ++i)
+        ids.insert("pad-" + std::to_string(i));
+    return ids;
+}
+
+} // namespace
+
+// Kills: pushing a scope AT the ceiling anywhere but into SQL, and a `>=` ceiling comparison.
+TEST_CASE("route: GET /api/v1/hardware-ci with a scope of exactly 10000 ids pushes it into SQL and pages exactly",
+          "[hardware][route][rest][ci_page][ceiling]") {
+    HwHarness h;
+    seed_ci(h, {"in-a", "out-b", "out-c", "in-d"});
+    h.scope = ci_scope_of_size({"in-a", "in-d"}, 10000);
+    auto res = h.sink.Get("/api/v1/hardware-ci?limit=1");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    const auto body = nlohmann::json::parse(res->body);
+    CHECK(ci_page_ids(body) == std::vector<std::string>{"in-a"});
+    CHECK(body["data"]["next_cursor"] != ""); // an exact look-ahead: in-d follows
+    REQUIRE(h.ci_store.queries.size() == 1);
+    REQUIRE(h.ci_store.queries[0].agent_ids.has_value());
+    CHECK(h.ci_store.queries[0].agent_ids->size() == 10000);
+    CHECK_FALSE(contains(res->body, "out-"));
+    REQUIRE(h.audit_details.size() == 1);
+    CHECK(h.audit_details[0] == "hardware CI records (REST): rows=1 scope=authority_scoped");
+}
+
+// Kills: serving, or even reading, a scope above the ceiling. The refusal is terminal (no
+// retry_after_ms), distinct from the store-degrade 503, audited as `denied` with no count, and
+// runs ZERO store reads.
+TEST_CASE("route: GET /api/v1/hardware-ci with a scope of 10001 ids and no agent_id is a terminal 400, no read",
+          "[hardware][route][rest][ci_page][ceiling]") {
+    HwHarness h;
+    seed_ci(h, {"in-a", "out-b", "in-d"});
+    h.scope = ci_scope_of_size({"in-a", "in-d"}, 10001);
+    auto res = h.sink.Get("/api/v1/hardware-ci");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    CHECK(res->has_header("X-Correlation-Id"));
+    CHECK_FALSE(res->has_header("Sec-Audit-Failed"));
+    const auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    CHECK_FALSE(body.contains("data"));
+    CHECK(body["error"]["message"] ==
+          "the caller's scope covers more than 10000 devices and no agent_id was given; a credential with global read has no such limit");
+    CHECK(body["error"]["retry_after_ms"].is_null()); // terminal: no retry hint
+    CHECK(body["error"]["remediation"] ==
+          "use a credential with global read, pass agent_id, or ask an administrator to narrow the caller's scope");
+    CHECK_FALSE(contains(res->body, "in-a"));
+    CHECK(h.ci_store.reads == 0);
+    REQUIRE(h.audit_full.size() == 1);
+    CHECK(h.audit_full[0] == "inventory.devices.ci|denied|Inventory|fleet");
+    CHECK(h.audit_details[0] == "hardware CI records (REST) state=scope too wide");
+
+    // A malformed cursor is judged before the scope ceiling: it gets the cursor message (not the
+    // scope one), still reads nothing, and writes no second audit row.
+    auto cont = h.sink.Get("/api/v1/hardware-ci?cursor=garbage");
+    REQUIRE(cont);
+    CHECK(cont->status == 400);
+    CHECK(nlohmann::json::parse(cont->body)["error"]["message"] == "invalid cursor; restart from the first page");
+    CHECK(h.ci_store.reads == 0);
+    CHECK(h.audit_full.size() == 1);
+
+    // the refusal is not the store-degrade answer
+    HwHarness d;
+    d.scope = ci_scope_of_size({"x"}, 10001);
+    d.ci_store.degraded = true;
+    auto refused = d.sink.Get("/api/v1/hardware-ci");
+    REQUIRE(refused);
+    CHECK(refused->status == 400);
+    CHECK(d.ci_store.reads == 0);
+}
+
+// The scope refusal writes nothing to a client, so its audit row is best effort: a row that does
+// not persist marks the answer Sec-Audit-Failed but the 400 stands (it is NOT turned into a 503).
+// Kills: making the refusal fail closed like a served page.
+TEST_CASE("route: GET /api/v1/hardware-ci scope-too-wide 400 stands, marked Sec-Audit-Failed, when its audit row fails",
+          "[hardware][route][rest][ci_page][ceiling][security]") {
+    HwHarness h;
+    seed_ci(h, {"in-a"});
+    h.scope = ci_scope_of_size({"in-a"}, 10001);
+    h.audit_should_fail = true;
+    auto res = h.sink.Get("/api/v1/hardware-ci");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    const auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    CHECK_FALSE(body.contains("data"));
+    CHECK(body["error"]["code"] == 400);
+    CHECK_FALSE(contains(res->body, "in-a"));
+    CHECK(h.ci_store.reads == 0);
+}
+
+TEST_CASE("route: GET /api/v1/hardware-ci with a scope of 10001 ids and an agent_id reads that one device",
+          "[hardware][route][rest][ci_page][ceiling]") {
+    HwHarness h;
+    seed_ci(h, {"in-a", "out-b", "in-d"});
+    h.scope = ci_scope_of_size({"in-a", "in-d"}, 10001);
+
+    SECTION("an in-scope device is served by key, with no id array in the query") {
+        auto res = h.sink.Get("/api/v1/hardware-ci?agent_id=in-d");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        const auto body = nlohmann::json::parse(res->body);
+        CHECK(ci_page_ids(body) == std::vector<std::string>{"in-d"});
+        CHECK(body["data"]["scope_basis"] == "authority_scoped");
+        REQUIRE(h.ci_store.queries.size() == 1);
+        CHECK(h.ci_store.queries[0].agent_id == std::optional<std::string>("in-d"));
+        CHECK_FALSE(h.ci_store.queries[0].agent_ids.has_value());
+        REQUIRE(h.audit_full.size() == 1);
+        CHECK(h.audit_full[0] == "inventory.devices.ci|success|Agent|in-d");
+        CHECK(h.audit_details[0] == "hardware CI records (REST): rows=1 scope=authority_scoped");
+    }
+    SECTION("an out-of-scope device that exists is an empty page and a denied row, with no read") {
+        auto res = h.sink.Get("/api/v1/hardware-ci?agent_id=out-b");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        CHECK(nlohmann::json::parse(res->body)["data"]["devices"].empty());
+        CHECK_FALSE(contains(res->body, "out-b"));
+        CHECK(h.ci_store.reads == 0);
+        REQUIRE(h.audit_full.size() == 1);
+        CHECK(h.audit_full[0] == "inventory.devices.ci|denied|Agent|out-b");
+    }
+}
+
+// The two answers a confined caller can get for a named agent_id that gives it nothing must be the
+// same bytes: an out-of-scope device that exists, and an in-scope id that has no record. Only the
+// audit row differs (denied vs success rows=0). Kills: any difference in status, headers of
+// interest, body or cursor between the two.
+TEST_CASE("route: GET /api/v1/hardware-ci answers an out-of-scope id and an unknown id with identical bytes",
+          "[hardware][route][rest][ci_page][security]") {
+    HwHarness h;
+    seed_ci(h, {"in-a", "out-b"});
+    h.scope = std::unordered_set<std::string>{"in-a", "in-ghost"};
+
+    auto hidden = h.sink.Get("/api/v1/hardware-ci?agent_id=out-b");
+    REQUIRE(hidden);
+    const std::string hidden_audit = h.audit_full.back() + " / " + h.audit_details.back();
+    auto ghost = h.sink.Get("/api/v1/hardware-ci?agent_id=in-ghost");
+    REQUIRE(ghost);
+    const std::string ghost_audit = h.audit_full.back() + " / " + h.audit_details.back();
+
+    CHECK(hidden->status == 200);
+    CHECK(ghost->status == 200);
+    CHECK(hidden->get_header_value("Content-Type") == ghost->get_header_value("Content-Type"));
+    CHECK(hidden->has_header("Sec-Audit-Failed") == ghost->has_header("Sec-Audit-Failed"));
+    CHECK(hidden->body == ghost->body);
+    const auto body = nlohmann::json::parse(hidden->body);
+    CHECK(body["data"]["devices"].empty());
+    CHECK(body["data"]["next_cursor"] == "");
+    CHECK(body["data"]["scope_basis"] == "authority_scoped");
+
+    CHECK(hidden_audit ==
+          "inventory.devices.ci|denied|Agent|out-b / hardware CI records (REST) state=agent_id outside the caller's scope");
+    CHECK(ghost_audit ==
+          "inventory.devices.ci|success|Agent|in-ghost / hardware CI records (REST): rows=0 scope=authority_scoped");
+}
+
+// A denied named read is still a fail-closed audit: a row that does not persist withholds the page.
+TEST_CASE("route: GET /api/v1/hardware-ci withholds a denied named read when its audit row does not persist",
+          "[hardware][route][rest][ci_page][security]") {
+    HwHarness h;
+    seed_ci(h, {"out-b"});
+    h.scope = std::unordered_set<std::string>{"in-a"};
+    h.audit_should_fail = true;
+    auto res = h.sink.Get("/api/v1/hardware-ci?agent_id=out-b");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+}
+
+TEST_CASE("route: GET /api/v1/hardware-ci refuses a tampered or mismatched cursor with 400 and reads nothing",
+          "[hardware][route][rest][ci_page]") {
+    HwHarness h;
+    seed_ci(h, {"a", "b", "c"});
+
+    auto first = h.sink.Get("/api/v1/hardware-ci?limit=1");
+    REQUIRE(first);
+    const std::string good = nlohmann::json::parse(first->body)["data"]["next_cursor"];
+    REQUIRE_FALSE(good.empty());
+    h.ci_store.reads = 0;
+    h.audit_full.clear();
+
+    for (const std::string& bad : {std::string("garbage"), good + "A", good.substr(0, good.size() - 2),
+                                   std::string("h1:0000000000000000:AAAA")}) {
+        INFO(bad);
+        auto res = h.sink.Get("/api/v1/hardware-ci?cursor=" + bad);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(res->has_header("X-Correlation-Id"));
+        const auto body = nlohmann::json::parse(res->body, nullptr, false);
+        REQUIRE_FALSE(body.is_discarded());
+        CHECK(body.contains("error"));
+        CHECK_FALSE(body.contains("data"));
+    }
+    // a cursor issued for no agent_id filter does not carry over to a named one
+    auto cross = h.sink.Get("/api/v1/hardware-ci?agent_id=a&cursor=" + good);
+    REQUIRE(cross);
+    CHECK(cross->status == 400);
+    CHECK(h.ci_store.reads == 0);
+    CHECK(h.audit_full.empty()); // nothing was disclosed, so nothing is audited as served
+}
+
+TEST_CASE("route: GET /api/v1/hardware-ci clamps limit and refuses a non-integer",
+          "[hardware][route][rest][ci_page]") {
+    HwHarness h;
+    seed_ci(h, {"a"});
+    // the store is asked for limit + 1 rows (to know whether the page is the last)
+    const auto asked = [&](const std::string& url) {
+        h.ci_store.queries.clear();
+        auto res = h.sink.Get(url);
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        REQUIRE(h.ci_store.queries.size() == 1);
+        return h.ci_store.queries.back().limit;
+    };
+    CHECK(asked("/api/v1/hardware-ci") == 101);
+    CHECK(asked("/api/v1/hardware-ci?limit=") == 101); // empty = not given
+    CHECK(asked("/api/v1/hardware-ci?limit=5000") == 1001);
+    CHECK(asked("/api/v1/hardware-ci?limit=0") == 2);
+    CHECK(asked("/api/v1/hardware-ci?limit=-3") == 2);
+    // out-of-range integers CLAMP, as the documentation says; they are not a 400
+    CHECK(asked("/api/v1/hardware-ci?limit=9223372036854775807") == 1001);
+    CHECK(asked("/api/v1/hardware-ci?limit=9223372036854775808") == 1001);
+    CHECK(asked("/api/v1/hardware-ci?limit=99999999999999999999999") == 1001);
+    CHECK(asked("/api/v1/hardware-ci?limit=-9223372036854775808") == 2);
+    CHECK(asked("/api/v1/hardware-ci?limit=-99999999999999999999") == 2);
+
+    const auto reads = h.ci_store.reads;
+    for (const char* bad : {"abc", "1.5", "+5", "9999999999999999999999x", "1e3"}) {
+        INFO(bad);
+        auto res = h.sink.Get(std::string("/api/v1/hardware-ci?limit=") + bad);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
+    CHECK(h.ci_store.reads == reads);
+    // an unsafe agent_id is refused before it can reach an audit row
+    auto ctl = h.sink.Get("/api/v1/hardware-ci?agent_id=a%0Ab");
+    REQUIRE(ctl);
+    CHECK(ctl->status == 400);
+    // Kills: reading a present-but-empty agent_id as "every device": a client that interpolated a
+    // missing id would be served a page of other devices' serials and UUIDs. It is a 400 in the
+    // MCP twin's words, with no read and no audit row (like the other argument refusals), and an
+    // empty cursor or limit beside it is still "not given".
+    const auto reads_before = h.ci_store.reads;
+    const auto audits_before = h.audit_full.size();
+    for (const char* url : {"/api/v1/hardware-ci?agent_id=", "/api/v1/hardware-ci?agent_id=&limit=5",
+                            "/api/v1/hardware-ci?agent_id=&agent_id=a"}) {
+        INFO(url);
+        auto empty_id = h.sink.Get(url);
+        REQUIRE(empty_id);
+        CHECK(empty_id->status == 400);
+        CHECK(empty_id->has_header("X-Correlation-Id"));
+        const auto body = nlohmann::json::parse(empty_id->body, nullptr, false);
+        REQUIRE_FALSE(body.is_discarded());
+        CHECK_FALSE(body.contains("data"));
+        CHECK(contains(empty_id->body, "agent_id must be a non-empty string when given"));
+    }
+    CHECK(h.ci_store.reads == reads_before);
+    CHECK(h.audit_full.size() == audits_before);
+    auto empty_cursor = h.sink.Get("/api/v1/hardware-ci?cursor=&limit=");
+    REQUIRE(empty_cursor);
+    CHECK(empty_cursor->status == 200);
+    CHECK(h.audit_full.back() == "inventory.devices.ci|success|Inventory|fleet");
+}
+
+TEST_CASE("route: GET /api/v1/hardware-ci refuses invalid UTF-8 in agent_id or cursor",
+          "[hardware][route][rest][ci_page]") {
+    HwHarness h;
+    seed_ci(h, {"a"});
+    for (const char* url : {"/api/v1/hardware-ci?agent_id=%FF", "/api/v1/hardware-ci?agent_id=a%00b"}) {
+        INFO(url);
+        auto res = h.sink.Get(url);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(contains(res->body, "invalid parameter encoding"));
+    }
+    // A cursor that is not valid text is the SAME refusal as every other bad cursor (one message),
+    // with no remediation hint on REST, even beside a bad agent_id.
+    for (const char* url : {"/api/v1/hardware-ci?cursor=%FF", "/api/v1/hardware-ci?cursor=a%00b",
+                            "/api/v1/hardware-ci?cursor=%FF&agent_id=a%0Ab", "/api/v1/hardware-ci?cursor=garbage"}) {
+        INFO(url);
+        auto res = h.sink.Get(url);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(contains(res->body, "invalid cursor; restart from the first page"));
+        CHECK_FALSE(contains(res->body, "invalid parameter encoding"));
+        CHECK_FALSE(contains(res->body, "remediation"));
+    }
+    CHECK(h.ci_store.reads == 0);
+    CHECK(h.audit_full.empty());
+}
+
+// Kills: dropping the `Cache-Control: no-store` of the served page (the rows carry serials, UUIDs
+// and MACs), and spreading it to the refusals or to the per-id route (neither carries it).
+TEST_CASE("route: GET /api/v1/hardware-ci serves a page with Cache-Control no-store and its refusals without",
+          "[hardware][route][rest][ci_page]") {
+    {
+        HwHarness h;
+        seed_ci(h, {"a", "b"});
+        auto ok = h.sink.Get("/api/v1/hardware-ci");
+        REQUIRE(ok);
+        REQUIRE(ok->status == 200);
+        CHECK(ok->get_header_value("Cache-Control") == "no-store");
+        // A named-device read is a served page as well.
+        auto named = h.sink.Get("/api/v1/hardware-ci?agent_id=a");
+        REQUIRE(named);
+        REQUIRE(named->status == 200);
+        CHECK(named->get_header_value("Cache-Control") == "no-store");
+        // The per-id route is unchanged.
+        auto one = h.sink.Get("/api/v1/hardware/a");
+        REQUIRE(one);
+        CHECK_FALSE(one->has_header("Cache-Control"));
+        // A 400 (bad limit) carries no device data and no header.
+        auto bad = h.sink.Get("/api/v1/hardware-ci?limit=abc");
+        REQUIRE(bad);
+        CHECK(bad->status == 400);
+        CHECK_FALSE(bad->has_header("Cache-Control"));
+    }
+    {
+        // A 503 for a degraded store, and the withheld page when the audit row does not persist,
+        // carry none either.
+        HwHarness h;
+        seed_ci(h, {"a"});
+        h.ci_store.degraded = true;
+        auto res = h.sink.Get("/api/v1/hardware-ci");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK_FALSE(res->has_header("Cache-Control"));
+    }
+    {
+        HwHarness h;
+        seed_ci(h, {"a"});
+        h.audit_should_fail = true;
+        auto res = h.sink.Get("/api/v1/hardware-ci");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK_FALSE(res->has_header("Cache-Control"));
+        CHECK_FALSE(contains(res->body, "SN-a"));
+    }
+}
+
+TEST_CASE("route: GET /api/v1/hardware-ci withholds the page when the audit row does not persist",
+          "[hardware][route][rest][ci_page]") {
+    HwHarness h;
+    seed_ci(h, {"a", "b"});
+    h.audit_should_fail = true;
+    auto res = h.sink.Get("/api/v1/hardware-ci");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK(res->has_header("X-Correlation-Id"));
+    const auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    CHECK_FALSE(body.contains("data"));
+    CHECK(body["error"]["retry_after_ms"].get<int>() == 5000);
+    CHECK_FALSE(contains(res->body, "SN-a"));
+    CHECK_FALSE(contains(res->body, "host-a"));
+}
+
+TEST_CASE("route: GET /api/v1/hardware-ci store degrade is a 503 with a retry hint, never an empty 200",
+          "[hardware][route][rest][ci_page]") {
+    {
+        HwHarness h;
+        seed_ci(h, {"a"});
+        h.ci_store.degraded = true;
+        auto res = h.sink.Get("/api/v1/hardware-ci");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(res->has_header("X-Correlation-Id"));
+        const auto body = nlohmann::json::parse(res->body, nullptr, false);
+        REQUIRE_FALSE(body.is_discarded());
+        CHECK_FALSE(body.contains("data"));
+        CHECK(body["error"]["retry_after_ms"].get<int>() == 5000);
+        REQUIRE(h.audit_full.size() == 1);
+        CHECK(h.audit_full[0] == "inventory.devices.ci|failure|Inventory|fleet");
+        CHECK(h.audit_details[0] == "hardware CI records (REST) state=store unreadable");
+        CHECK_FALSE(res->has_header("Sec-Audit-Failed"));
+    }
+    {
+        // A degraded store AND a degraded audit sink: the 503 stands and the header says so.
+        HwHarness h;
+        h.ci_store.degraded = true;
+        h.audit_should_fail = true;
+        auto res = h.sink.Get("/api/v1/hardware-ci");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    }
+    {
+        // An unwired reader is a 503 too, with its own failure row.
+        HwHarness h(false, false, false, kContainmentUi, nullptr, /*unwire_ci_page_ctor=*/true);
+        auto res = h.sink.Get("/api/v1/hardware-ci");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(res->has_header("X-Correlation-Id"));
+        CHECK_FALSE(nlohmann::json::parse(res->body).contains("data"));
+        REQUIRE(h.audit_full.size() == 1);
+        CHECK(h.audit_full[0] == "inventory.devices.ci|failure|Inventory|fleet");
+    }
+}
+
+TEST_CASE("route: GET /api/v1/hardware-ci is gated by fleet_read alone and writes nothing when refused",
+          "[hardware][route][rest][ci_page]") {
+    HwHarness h;
+    seed_ci(h, {"a"});
+    h.allow_fleet_read = false;
+    auto res = h.sink.Get("/api/v1/hardware-ci");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(h.ci_store.reads == 0);
+    CHECK(h.audit_full.empty());
+    CHECK(h.probes.empty()); // no second permission check stacked on the gate
+}
+
+TEST_CASE("route: GET /api/v1/hardware-ci replaces an invalid UTF-8 byte instead of throwing after the audit row",
+          "[hardware][route][rest][ci_page]") {
+    HwHarness h;
+    DeviceCiRecord r = yuzu::server::test::make_ci_record("a");
+    r.serial = "S\xFF" "N";
+    h.ci_store.add(r);
+    auto res = h.sink.Get("/api/v1/hardware-ci");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    const auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    CHECK(body["data"]["devices"][0]["ci"]["serial"] == "S\xEF\xBF\xBD" "N");
+    REQUIRE(h.audit_full.size() == 1);
+    CHECK(h.audit_full[0] == "inventory.devices.ci|success|Inventory|fleet");
+}
+
+TEST_CASE("route: GET /api/v1/hardware-ci lists a device the 30-day roster does not hold",
+          "[hardware][route][rest][ci_page]") {
+    HwHarness h; // roster_rows is empty: no device is in the roster window
+    seed_ci(h, {"long-gone"});
+    auto res = h.sink.Get("/api/v1/hardware-ci");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    CHECK(ci_page_ids(nlohmann::json::parse(res->body)) == std::vector<std::string>{"long-gone"});
+    // and the list route, which is roster-driven, does not
+    auto list = h.sink.Get("/api/v1/hardware");
+    REQUIRE(list);
+    CHECK(nlohmann::json::parse(list->body)["data"]["devices"].empty());
+}
+
+// ───────────────── GET /api/v1/hardware-ci: the collation read gate (#7730) ─────────────────
+
+// Kills: a bulk page served while the collation gate is not Trusted (duplicate and ghost rows
+// served as truth), a refusal that still asks the store, a refusal that is not the retryable 503
+// with the documented hint, and a refusal that is not audited as a failure.
+TEST_CASE("route: GET /api/v1/hardware-ci is refused with a retryable 503 while the collation gate is not Trusted",
+          "[hardware][route][rest][ci_page][collation_gate]") {
+    for (const auto refused : {pg::CollationGate::Mismatch, pg::CollationGate::Unproven}) {
+        HwHarness h;
+        seed_ci(h, {"a", "b"});
+        h.ci_gate.store(refused);
+        auto res = h.sink.Get("/api/v1/hardware-ci");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(res->get_header_value("Retry-After") == "60");
+        CHECK(res->get_header_value("Cache-Control") != "no-store"); // nothing served
+        const auto body = nlohmann::json::parse(res->body, nullptr, false);
+        REQUIRE_FALSE(body.is_discarded());
+        CHECK_FALSE(body.contains("data"));
+        CHECK(body["error"]["code"] == 503);
+        CHECK(body["error"]["retry_after_ms"] == 60000);
+        const std::string msg = body["error"]["message"].get<std::string>();
+        CHECK(contains(msg, "collation version"));
+        CHECK(contains(msg, "server-admin.md"));
+        CHECK(body["error"]["remediation"].get<std::string>().find("restart the walk from the first page") != std::string::npos);
+        CHECK_FALSE(contains(res->body, "SN-a")); // no record body leaked
+        CHECK(h.ci_store.reads == 0);             // no store round-trip
+        REQUIRE(h.audit_full.size() == 1);
+        CHECK(h.audit_full[0] == "inventory.devices.ci|failure|Inventory|fleet");
+        CHECK(h.audit_details[0] == "hardware CI records (REST) state=collation ordering unverified");
+        CHECK(res->get_header_value("Sec-Audit-Failed").empty()); // the row persisted
+    }
+}
+
+TEST_CASE("route: GET /api/v1/hardware-ci refusal is marked Sec-Audit-Failed when its audit row fails",
+          "[hardware][route][rest][ci_page][collation_gate][security]") {
+    HwHarness h;
+    seed_ci(h, {"a"});
+    h.ci_gate.store(pg::CollationGate::Mismatch);
+    h.audit_should_fail = true;
+    auto res = h.sink.Get("/api/v1/hardware-ci");
+    REQUIRE(res);
+    CHECK(res->status == 503); // the refusal stands
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK(h.ci_store.reads == 0);
+}
+
+TEST_CASE("route: GET /api/v1/hardware-ci serves under a Trusted gate and answers again once it clears",
+          "[hardware][route][rest][ci_page][collation_gate]") {
+    HwHarness h;
+    seed_ci(h, {"a", "b"});
+    h.ci_gate.store(pg::CollationGate::Mismatch);
+    CHECK(h.sink.Get("/api/v1/hardware-ci")->status == 503);
+    h.ci_gate.store(pg::CollationGate::Trusted);
+    auto res = h.sink.Get("/api/v1/hardware-ci");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    CHECK(ci_page_ids(nlohmann::json::parse(res->body)) == std::vector<std::string>{"a", "b"});
+}
+
+// A Deps built without a gate serves (the documented null default); production wiring is pinned
+// lexically (test_hw_ci_detail_wiring_lexical.cpp).
+TEST_CASE("route: GET /api/v1/hardware-ci with no gate wired serves",
+          "[hardware][route][rest][ci_page][collation_gate]") {
+    HwHarness h(false, false, false, kContainmentUi, nullptr, false, /*unwire_ci_gate_ctor=*/true);
+    seed_ci(h, {"a"});
+    h.ci_gate.store(pg::CollationGate::Mismatch); // not wired, so never consulted
+    auto res = h.sink.Get("/api/v1/hardware-ci");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+}
+
+// An argument refusal needs no read and keeps its own answer under a refusing gate.
+TEST_CASE("route: GET /api/v1/hardware-ci keeps a 400 for a malformed cursor while the gate refuses",
+          "[hardware][route][rest][ci_page][collation_gate]") {
+    HwHarness h;
+    seed_ci(h, {"a"});
+    h.ci_gate.store(pg::CollationGate::Mismatch);
+    auto res = h.sink.Get("/api/v1/hardware-ci?cursor=garbage");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    CHECK(h.ci_store.reads == 0);
 }

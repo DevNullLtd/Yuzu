@@ -152,7 +152,17 @@ permissions:
 env:
   VCPKG_COMMIT: "9eec002df1cd109f8f104cd966a763daf9751489"
   VCPKG_BINARY_SOURCES: "default"
-  CCACHE_MAXSIZE: "500M"
+  # Must equal every other self-hosted job's CCACHE_MAXSIZE: ccache trims a
+  # cache directory to the cap of whichever job is writing to it, and this
+  # job shares the runner's cache with ci.yml, nightly.yml, release.yml and
+  # sanitizer-tests.yml (tests/test_ci_ccache_cap.py). At 500M the daily
+  # trace cut a Big Tam runner's cache to 2.8-5.2 GB (the trace's ccache -s,
+  # 2026-11-12 to -16; 1588 cleanups in each run checked), from 18-30 GB,
+  # or 7.9 GB on a runner trimmed the day before. In four of five such
+  # trims that runner's next 12 h of CI hit the cache 13-24 points less
+  # often than the other runners did; the fifth showed no gap
+  # (docs/ci-architecture.md "Build speed (Big Tam)").
+  CCACHE_MAXSIZE: "30G"
   CCACHE_COMPRESS: "true"
 
 jobs:
@@ -251,8 +261,6 @@ jobs:
             build_dir: build-linux-codeql
             category: "/language:c-cpp-linux"
             languages: "c-cpp,actions"
-            ccache_path: ~/.cache/ccache
-            ccache_key_prefix: ccache-codeql-linux
             disk_min_gb: 40
             shell: bash
           - os: windows
@@ -264,7 +272,7 @@ jobs:
             # to 16 threads, so the Build step passes the job-level
             # -j $YUZU_BUILD_JOBS cap — without it ninja sizes -j from the 64-CPU host
             # and thrashes the 32 MB L3 (the 98-min-timeout failure mode), which
-            # CCACHE_RECACHE's forced full recompile makes acute.
+            # CCACHE_DISABLE's forced full recompile makes acute.
             runner: [self-hosted, Windows, X64, yuzu-weetam-windows]
             triplet: x64-windows
             vcpkg_bin: vcpkg.exe
@@ -277,8 +285,6 @@ jobs:
             # .github/workflows/*.yml files; the Linux leg covers
             # actions.
             languages: "c-cpp"
-            ccache_path: ~\AppData\Local\ccache
-            ccache_key_prefix: ccache-codeql-windows
             disk_min_gb: 45
             # The default `shell: bash` on a self-hosted Windows runner
             # resolves to C:\Windows\system32\bash.EXE which is WSL
@@ -377,10 +383,10 @@ jobs:
           # database. Wipe the build dir each run.
           rm -rf ${{ matrix.build_dir }}
 
-      # ccache (matrix.ccache_path: ~/.cache/ccache on Linux,
-      # ~\AppData\Local\ccache on Windows) persists in the runner
-      # user's home dir between jobs on both self-hosted runners.
-      # vcpkg_installed/ persists in the workspace. Issue #569.
+      # ccache persists between jobs: on Big Tam in each runner's own
+      # ~/.cache/ccache (HOME=/home/runner/rN/home), on Wee Tam in one
+      # D:\ci\ccache shared by the pool. vcpkg_installed/ persists in the
+      # workspace. Issue #569.
       - name: Reset ccache stats
         run: ccache -z
 
@@ -552,7 +558,7 @@ jobs:
         # its database. Full graph traversal required — no --no-rebuild,
         # no partial target selection.
         #
-        # CCACHE_RECACHE=true is load-bearing for CodeQL coverage. The
+        # CCACHE_DISABLE=true is load-bearing for CodeQL coverage. The
         # tracer attaches to compiler processes; if ccache returns a
         # cached object file without invoking the compiler, the tracer
         # never sees that translation unit and CodeQL's database omits
@@ -560,17 +566,29 @@ jobs:
         # this silently dropped 98% of TUs from the database (e.g. only
         # 1 of 47 plugin .cpp files was reaching analysis), making most
         # custom and standard queries report 0 alerts on plugin code.
-        # `RECACHE` forces the compiler to actually run while still
-        # updating the cache, so non-CodeQL CI builds keep their cache
-        # warm. `CCACHE_DISABLE=true` would also work but would skip
-        # the cache update and degrade subsequent CI builds.
+        # DISABLE runs the compiler for every TU and never reads, writes
+        # or cleans the cache. This step used CCACHE_RECACHE so that it
+        # would refresh the cache for the other CI jobs. RECACHE stores
+        # every TU (ccache counts these as "Uncacheable calls", 1581 of
+        # 1590 on Linux, 2026-11-14 to -16) and never reads. On Linux no
+        # other job could read those objects either: for a -g compile
+        # ccache hashes the build directory, and this one is unique. At
+        # this job's old 500M cap each store also ran a cleanup, which
+        # trimmed the shared cache. On Wee Tam one cache (D:\ci\ccache)
+        # serves all four runners, so the trace kept the whole pool's
+        # cache small while it ran (2026-11-15: ci.yml Windows jobs during
+        # the trace ended at 2.0 of 30 GB).
         env:
-          CCACHE_RECACHE: "true"
-        # Essential because CCACHE_RECACHE forces every TU to compile. Both
+          CCACHE_DISABLE: "true"
+        # Essential because CCACHE_DISABLE forces every TU to compile. Both
         # hosts are one-CCD-per-runner, so cap Ninja to that 16-thread domain.
         run: meson compile -C ${{ matrix.build_dir }} -j "$YUZU_BUILD_JOBS"
 
       - name: ccache stats
+        # Covers Configure's probe compiles only: CCACHE_DISABLE calls are
+        # not counted. On Wee Tam the counters are the pool's: they include
+        # other Windows jobs running at the same time, and any Wee Tam job
+        # that starts during this one resets them (ccache -z).
         if: always()
         run: ccache -s
 

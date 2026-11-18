@@ -51,43 +51,76 @@ TEST_CASE("step-up policy: every row has a verb the table classifies and a patte
     }
 }
 
-TEST_CASE("step-up policy: kExempt and kOwnGate rows carry a reason, kRequired rows a label",
+TEST_CASE("step-up policy: kExempt and kOwnGate rows carry a reason, kRequired and "
+          "kFactorCredential rows a label",
           "[stepup][policy]") {
     for (const auto& e : kStepUpPolicy) {
         INFO(std::string(e.method) << " " << std::string(e.pattern));
         if (e.cls == StepUpClass::kExempt || e.cls == StepUpClass::kOwnGate)
             CHECK_FALSE(e.reason.empty());
-        if (e.cls == StepUpClass::kRequired)
+        if (e.cls == StepUpClass::kRequired || e.cls == StepUpClass::kFactorCredential)
             CHECK_FALSE(e.action_label.empty());
     }
 }
 
-TEST_CASE("step-up policy: the gated set is exactly the 41 routes with an in-handler call",
+TEST_CASE("step-up policy: the gated set is exactly the 39 kRequired and 2 kFactorCredential "
+          "routes with an in-handler call",
           "[stepup][policy]") {
-    // 37 routes plus the four ADR-0070 R1 revocation-source mutations (POST, PUT, DELETE and
-    // the reset-high-water POST), each of which also makes the in-handler call.
-    CHECK(count_class(StepUpClass::kRequired) == 41);
+    CHECK(count_class(StepUpClass::kRequired) == 39);
+    CHECK(count_class(StepUpClass::kFactorCredential) == 2);
     CHECK(count_class(StepUpClass::kOwnGate) == 3);
     CHECK(count_class(StepUpClass::kStrong) == 0);
 }
 
+TEST_CASE("step-up policy: kFactorCredential is exactly the two factor-credential rows",
+          "[stepup][policy]") {
+    // The routes that issue or retire a second-factor credential. A third row is a security
+    // decision (it gets the approver window, no hatch and the local-session-only rule), not a
+    // routine edit: this list and the constexpr count pin in step_up_policy.hpp move together.
+    const auto* recovery = step_up_policy_for("POST", R"(/api/settings/mfa/recovery-codes)");
+    const auto* disable = step_up_policy_for("POST", R"(/api/settings/mfa/disable)");
+    REQUIRE(recovery != nullptr);
+    REQUIRE(disable != nullptr);
+    CHECK(recovery->cls == StepUpClass::kFactorCredential);
+    CHECK(disable->cls == StepUpClass::kFactorCredential);
+    CHECK(recovery->action_label == "POST /api/settings/mfa/recovery-codes");
+    CHECK(disable->action_label == "POST /api/settings/mfa/disable");
+    std::size_t carriers = 0;
+    for (const auto& e : kStepUpPolicy) {
+        if (e.cls != StepUpClass::kFactorCredential)
+            continue;
+        ++carriers;
+        INFO(std::string(e.method) << " " << std::string(e.pattern));
+        CHECK((&e == recovery || &e == disable));
+    }
+    CHECK(carriers == 2);
+    // The in-handler fallback resolves the class from the label alone.
+    CHECK(step_up_policy_for_label("POST /api/settings/mfa/recovery-codes") == recovery);
+    CHECK(step_up_policy_for_label("POST /api/settings/mfa/disable") == disable);
+    CHECK(step_up_policy_for_label("POST /api/v1/tokens")->cls == StepUpClass::kRequired);
+    CHECK(step_up_policy_for_label("POST /api/v1/elevate")->cls == StepUpClass::kOwnGate);
+    CHECK(step_up_policy_for_label("") == nullptr);
+    CHECK(step_up_policy_for_label("POST /no/such/label") == nullptr);
+}
+
 TEST_CASE("step-up policy: the table's total and per-class row counts are pinned",
           "[stepup][policy]") {
-    // Executable pins for the table counts (259 mutating REST routes: 41 required, 3 own-gate,
-    // 142 exempt, 73 pending; #2146 batch C added the eight v1 instruction-definition and
-    // instruction-set authoring rows (create, update, delete, import, yaml, validate-yaml, set
-    // create, set delete); #2146 batch B added the two v1 execution cancel/rerun rows, the v1
-    // commands row, the v1 instruction-definition execute row and the v1 workflow execute row,
-    // the software-title curation routes added the aliases, reject and pack rows, the
-    // per-group collection settings added its PUT row, ADR-0070 R1 added four revocation-source
-    // rows, and the DEX Scoring tab added its save, preview and reset rows). A row added or
-    // reclassified without these numbers moving together fails here.
-    CHECK(kStepUpPolicyCount == 259);
-    CHECK(count_class(StepUpClass::kExempt) == 142);
+    // Executable pins for the table counts (261 mutating REST routes: 39 required, 2
+    // factor-credential, 3 own-gate, 144 exempt, 73 pending; #2146 batch C added the eight v1
+    // instruction-definition and instruction-set authoring rows (create, update, delete, import,
+    // yaml, validate-yaml, set create, set delete); #2146 batch B added the two v1 execution
+    // cancel/rerun rows, the v1 commands row, the v1 instruction-definition execute row and the
+    // v1 workflow execute row, the software-title curation routes added the aliases, reject and
+    // pack rows, the per-group collection settings added its PUT row, the lifecycle rule import
+    // added its POST and DELETE rows, ADR-0070 R1 added four revocation-source rows, and the DEX
+    // Scoring tab added its save, preview and reset rows). A row added or reclassified without
+    // these numbers moving together fails here.
+    CHECK(kStepUpPolicyCount == 261);
+    CHECK(count_class(StepUpClass::kExempt) == 144);
     CHECK(count_class(StepUpClass::kPendingRuling) == 73);
-    CHECK(count_class(StepUpClass::kRequired) + count_class(StepUpClass::kOwnGate) +
-              count_class(StepUpClass::kStrong) + count_class(StepUpClass::kExempt) +
-              count_class(StepUpClass::kPendingRuling) ==
+    CHECK(count_class(StepUpClass::kRequired) + count_class(StepUpClass::kFactorCredential) +
+              count_class(StepUpClass::kOwnGate) + count_class(StepUpClass::kStrong) +
+              count_class(StepUpClass::kExempt) + count_class(StepUpClass::kPendingRuling) ==
           kStepUpPolicyCount);
 }
 
@@ -322,7 +355,7 @@ TEST_CASE("step-up policy: every kExempt reason is one of the named exempt class
         kSyncTrigger,          kAgentUploadProtocol,    kScimBearer,      kMcpTransport,
         kContentAuthoring,     kPolicyLifecycle,        kEvidenceCapture, kCancelsRecord,
         kCreatesRerunRecord,   kAlertingConfig,         kMfaEnrolment,    kSchedulingGatedWork,
-        kSelfNotificationState, kReferenceDataReplace,  kCollectionSettings};
+        kSelfNotificationState, kReferenceDataReplace,  kCollectionSettings, kLifecycleRules};
     std::set<std::string_view> used;
     for (const auto& e : kStepUpPolicy) {
         if (e.cls != StepUpClass::kExempt)

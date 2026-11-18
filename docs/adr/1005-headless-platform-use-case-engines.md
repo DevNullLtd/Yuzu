@@ -737,10 +737,11 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        strictly stricter than what it replaces, not a new gap.
      - **Superseded by #6079 (2026-10-19).** The pass-through described in the previous bullet is
        closed: approve and reject now require an enrolled MFA factor with a fresh proof in every
-       `--mfa-enforcement` mode (local: an enrolled TOTP factor and a proof within the approver window
-       that does not predate the enrolment; OIDC: an MFA-method `amr` on a token issued within the
+       `--mfa-enforcement` mode (local: an enrolled TOTP factor and a proof no older than the approver
+       window and bound to the account's current factor generation, so disabling and re-enrolling
+       replaces the factor and earlier proofs stop counting; OIDC: an MFA-method `amr` on a token issued within the
        window; SAML: refused). The approver window is `min(--mfa-step-up-window-secs, 300)`, and 300
-       when that is `0`, so `0` no longer disables it. The text above is kept as the record of what
+       when that is `0` or negative, so `0` no longer disables it. The text above is kept as the record of what
        was accepted on 2026-10-18; see `docs/auth-architecture.md`, "Approver assurance".
      - **Acceptance.** Acceptor: Dave Rae (maintainer). Date: 2026-10-18. Ruling
        source: the maintainer ruling in the #6061 work session (epic #6060) to
@@ -1108,7 +1109,9 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      decision.
 
     - **2026-10-28 - mixed-version admission during a rolling upgrade (scope
-      exception recorded by the maintainer, #6079).** The approver gate
+      exception recorded by the maintainer, #6079; the change now ships as the
+      hard cutover of the 2026-10-28 entry below, a DRAFT pending the maintainer's
+      approval, which has no rolling window).** The approver gate
       (`require_enrolled_fresh_mfa`) runs on each server replica and no
       minimum-version check exists. While a rolling upgrade is in progress, or
       after a replica is rolled back, a replica that predates the gate can admit
@@ -1120,14 +1123,17 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
       `docs/ha-delivery-matrix.md`), so the entry covers the rolling-upgrade
       case and is not a statement that multi-replica operation is supported.
       Operator wording: `docs/user-manual/upgrading.md` "Mixed-version
-      admission".
+      admission" (that section no longer exists: the hard cutover below has
+      no rolling window, and the marker query it cites was removed with it).
      - **Conditions of this exception.** The upgrade is controlled: the
        operator records each replica's upgrade timestamp (UTC) in the change
        ticket (SOC 2 CC8.1) as the roll happens, because the audit row does not
        name the replica, and keeps the load balancer log for the window. The
        marker query in `upgrading.md` lists the decisions in the window that
-       carry no marker. Those controls are customer-operated: Yuzu neither
-       enforces nor evidences them.
+       carry no marker (this Condition is superseded: the marker query was
+       removed from `upgrading.md` with the cutover entry below, and no
+       rolling window exists to query). Those controls are customer-operated:
+       Yuzu neither enforces nor evidences them.
      - **Acceptance.** Acceptor: Dave Rae (maintainer). Date: 2026-10-28. Ruling
        source: the maintainer's answer during the #6079 PR 1 governance working
        session, given after the governance ledger raised this as finding UP-9.
@@ -1289,6 +1295,81 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      and an empty audit callback is audit-off. The null or closed RBAC store 503
      and a bare 401 write no audit row, matching the PUT and the fragment.
 
+  - **2026-10-28 (ruling of 2026-10-24) - MFA factor binding ships as a hard
+    cutover (#6079 PR 2).**
+    **STATUS: DRAFT, not accepted until the maintainer approves it.**
+    The factor-generation binding (`auth` schema v3, `session_store` schema v3)
+    is introduced with no upgrade path and no supported carry-over of an earlier
+    build's database: an enrolled account that reads factor generation `0` (a tampered row, or
+    a database an earlier build wrote) is refused by every gate that compares a
+    proof with the factor. This entry supersedes the operator wording and the
+    marker-query Condition of the 2026-10-28 mixed-version entry above, which
+    described a rolling-upgrade window; this build has no such window, and mixed-version operation is
+    unsupported. Operator wording: `docs/user-manual/upgrading.md`, the MFA
+    cutover section. The maintainer's recorded ruling of 2026-10-24 covers one
+    thing only: shipping #6079 as a hard cutover with no upgrade path. It does
+    NOT cover the residual exposures listed below (enrolled operators refused
+    until a host-shell reset, the password-only dip, the sso-only break-glass
+    trap, no minimum-version check). The deployment contract of the Forensics
+    tier (fresh database only, no upgrade path, recovery by rolling forward or by
+    restoring this build's own backups into a fresh deployment) applies to this
+    change unchanged, and `upgrading.md` documents no carry-over procedure.
+    - **Conditions of this exception (proposed).** There is no upgrade path and
+      no rollback of the migrations; recovery is rolling forward on this build or
+      restoring this build's own backups into a fresh deployment. An enrolled
+      operator who reads generation `0` is refused `503`
+      (`mfa_proof_unavailable`) until `yuzu-server --mfa-reset <user>` has been
+      run for them from a host shell, which needs the Postgres DSN and the keys
+      directory, so an affected operator cannot recover alone. The refusal
+      applies to the step-up routes as follows: the 39 ordinary rows (approve
+      and reject among them) refuse only while `--mfa-step-up-window-secs` is
+      above 0, whereas approve and reject, the 2 factor-credential routes and
+      the 3 JIT-elevation routes refuse regardless of the window. An operator
+      can reconcile the `mfa.reset.breakglass` rows against the
+      `mfa.enroll.verified` rows per operator. These controls are
+      customer-operated: Yuzu neither enforces nor evidences them. No MCP tool may twin
+      `/api/settings/mfa/recovery-codes` or `/api/settings/mfa/disable` until
+      the MCP step-up table gains a local-session-only class; the build refuses
+      such a twin (`step_up_mcp_policy.hpp`: a twin of those rows cannot be
+      declared `kExempt`, cannot join the second list because that list
+      requires a `kRequired` REST twin, and a new baseline `kPendingRuling` row
+      exceeds `kMcpPendingBaselineMax`, which equals the frozen baseline and
+      only goes down).
+    - **Acceptance.** Acceptor: Dave Rae (maintainer). Ruling date:
+      2026-10-24; entry authored 2026-10-28. Ruling source: the maintainer's
+      ruling in the #6079 working session that the change ships as a hard
+      cutover. The ruling is accepted for that scope only. Acceptance of the
+      Conditions and the Residual exposure is NOT YET GIVEN: they are put
+      forward by this draft. In a later working session (2026-11-10) the
+      maintainer ruled that this change documents no carry-over or restore
+      procedure for an earlier build's database. As with the entries above,
+      the rulings are working-session statements, not signed decisions. The acceptor is also
+      the committer of the change that introduces this entry, so independent
+      review of this acceptance rests on the pull request review (expected, not
+      enforced by tooling), not on a second approver.
+    - **Residual exposure (proposed for acceptance).** The first three
+      exposures below arise for an account that reads generation `0` (a
+      tampered row, or a database outside the supported fresh-database
+      population) or after a break-glass clear of a supported deployment; they
+      are put forward because the executable does not prevent them. Until each
+      such operator is reset, approvals and JIT elevation are unavailable to
+      that operator (an availability cost, not a bypass). A reset account is
+      password-only until it enrols again under `--mfa-enforcement=optional`,
+      so MFA coverage drops for the window. Under `--auth-mode=sso-only` the
+      break-glass account cannot be reset without a time-boxed restart under
+      `--auth-mode=standard`. No minimum-version check exists, so nothing stops
+      an earlier binary being pointed at a migrated database; such a binary
+      does not run the new gate.
+      The generation is a fresh random positive value assigned by the trigger
+      on every change of `mfa_enrolled_at`, not a counter, so a restore of the
+      `auth` schema over a newer session store cannot make a later
+      re-enrolment land on a value a surviving stored proof carries: that
+      restore-reuse exposure, which a counter would have had, is closed by the
+      random token and is not among the residual exposures put forward here.
+    - **Revisit** when an in-product re-enrolment path for a reset operator
+      exists, or when a minimum-version admission check exists, whichever comes
+      first, and in any case at the monthly review at the end of November 2026
+      (by 2026-11-30).
    - **2026-11-02 - the `list_agents` exception (#4041) is resolved for every
      caller except a service-scoped token.** The 2026-10-23 entry above recorded
      `get.api-agents` and `get.fragments-devices-list` as `exception:#4041
@@ -1531,6 +1612,14 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      `GET`/`PUT /api/v1/inventory/software/collection-settings/{group_id}` and
      `GET /api/v1/inventory/software/hosts/{agent_id}/collection-settings` have
      no MCP tool.
+     - **Retired 2026-11-16.** The four twins landed under SAM-35
+       (`list_software_collection_settings`, `get_software_collection_settings`,
+       `set_software_collection_settings`, `get_software_host_collection_settings`),
+       together with the five twins of the installed-software v3 reads
+       (`list_software_hosts`, `get_software_host`, `list_software_changes`,
+       `get_software_summary`, `get_software_plugin_health`). Each calls the same
+       function as its REST route. The paragraphs below are the record of the
+       exception while it stood.
      - **No MCP twin - tracked follow-up, not a permanent exception.** Tracked
        as roadmap row **3.7a-mcp** in the software estate roadmap; **revisit by
        2026-12-31**. The MCP twin and the dashboard Collection tab (roadmap row
@@ -1559,6 +1648,36 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        "Software collection settings".
      - Recorded by the change author; ADR-owner acceptance pending.
 
+   - **2026-11-16 - imported software lifecycle rules (REST only; the MCP twin
+     and the page are separate follow-up changes).** The three routes
+     `POST`, `GET` and `DELETE /api/v1/inventory/software/lifecycle/rules` have
+     no MCP tool and no dashboard page.
+     - **No MCP twin and no page - tracked follow-ups, not permanent
+       exceptions.** Tracked as roadmap row **SAM.7** (rule import) in the
+       software estate roadmap and as issue #8009; **revisit by 2026-12-31**. The MCP twin and the
+       page are each their own change. The twin takes the same store and the
+       same pure parsers (`software_lifecycle_import.hpp`), so there is no
+       second validator. This entry retires when both merge. No parity-ledger
+       row is added: v1 routes are held to the OpenAPI check
+       (`docs/api-parity-ledger.md`).
+     - **What an MCP-only caller can and cannot reach.** The imported, shipped
+       and external rule lists and the import and removal are not reachable
+       over MCP; the OpenAPI document is readable as the `yuzu://openapi`
+       resource.
+     - **The exception relaxes no control.** Rules are fleet-global, so every
+       route takes the global `Inventory` permission (`Write` for the import and
+       the removal, `Read` for the list): a management-group-confined caller is
+       refused and a service-scoped token is denied. The permission is checked
+       ahead of the body. Each write is audited with a `requested` row stored
+       ahead of the write (an audit row that cannot be stored is a `503` and
+       nothing is written) and an outcome row. A degraded or closed store
+       answers `503` with a retry hint, never an empty `200`. The import is
+       all or nothing and accepts the formats `csv` and `cle` only; it replaces
+       the `imported` set and never touches the `shipped` or `external` rules.
+       Wire reference: `docs/user-manual/rest-api.md`, "Software lifecycle
+       rules".
+     - Recorded by the change author; ADR-owner acceptance pending.
+
    - **2026-11-09 - the `firewall` plugin's four containment actions
      (`firewall.quarantine`, `firewall.release`, `firewall.quarantine_status`,
      `firewall.quarantine_allow`, PRQ.1) are reachable only by raw dispatch, with no
@@ -1571,6 +1690,10 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      `repair`), so discoverability (Decision 1) is not met for them yet. The server cut-over that
      re-points the quarantine definitions at these actions is the change that adds
      them; until then the plugin README documents the parameters.
+     **Resolved 2026-11-12 (PRQ.2):** `content/definitions/firewall.yaml` now carries
+     `security.firewall.quarantine`, `.release`, `.quarantine_status` and
+     `.quarantine_allow`, which publish the parameters; the revisit trigger has
+     happened and this entry is closed.
    - **2026-11-09 - the software lookup read surface (SAM-17; REST only, the MCP
      twin is a recorded exception).** `GET /api/v1/inventory/software` gains eight
      lookup fields (`hostname`, `last_seen`, `status`, `last_confirmed_at`,
@@ -1636,6 +1759,43 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        malformed `vers` or `purl` a `400` in the A4 envelope. Wire reference:
        `docs/user-manual/rest-api.md`, "GET /api/v1/inventory/software" and
        "GET /api/v1/inventory/software/components".
+     - Recorded by the change author; ADR-owner acceptance pending.
+   - **2026-11-16 - on-demand software sync: confirmation, pacing and run status
+     (SAM-20; REST only, the MCP twin is a recorded exception).**
+     `POST /api/v1/hardware/sync` gains the request fields `confirm` and
+     `last_synced_before` and the 202 fields `execution_id`, `delay_max_s`,
+     `estimated_completion_at`, `skipped_fresh` and `joined`, and the new route
+     `GET /api/v1/hardware/sync/{execution_id}` reports how a run is going. The MCP
+     tool `sync_hardware_software` calls the same engine (`software_sync::Runner`),
+     so it already applies the confirmation, the fleet-administrator rule, the
+     pacing, the join and the cooldown; what it lacks is the surface. Its input
+     schema, description and output schema do not name `confirm` or
+     `last_synced_before` or the new result fields, and there is no tool for the
+     status route.
+     - **No MCP twin of the new surface - tracked follow-up, not a permanent
+       exception.** Delivery row **SAM-21** of the software estate roadmap, tracked
+       as issue #7984 (the tool's schema and wording, the two arguments, a status
+       tool). **Revisit by
+       2026-12-31.** The twin takes the same engine and the same execution-record
+       read, so no second copy of any rule is created. This entry retires when the
+       twin merges. No parity-ledger row is added: v1 routes are held to the
+       OpenAPI check, and `docs/api-parity-ledger.md` points here.
+     - **What an MCP-only caller can and cannot reach.** The send itself (a group
+       or the fleet needs `"confirm": true` among the tool's arguments, which the
+       schema does not yet declare; a refusal without it is invalid parameters
+       naming the confirmation) and the new fields in the result. Not the status
+       of a run after it was sent: the status route has no tool.
+     - **The exception relaxes no control.** The status route gates on
+       `Execution:Execute` as a global grant, serves a caller the runs it started
+       (the execution owner key, empty for a service-scoped session) or, with an
+       unfiltered `Execution:Execute`, any sync run, and answers an unknown id,
+       another operator's run and an execution that is not a sync run with the
+       same `404`; a record that cannot be read is a retryable `503`, never an
+       empty `200`. The send keeps its audit-before-dispatch row, fail closed (the
+       whole-fleet row under `software_estate.sync.fleet_wide`), the visible-set
+       intersection at send time, and is paced and de-duplicated per run key. Wire
+       reference: `docs/user-manual/rest-api.md`, "POST /api/v1/hardware/sync" and
+       "GET /api/v1/hardware/sync/{execution_id}".
      - Recorded by the change author; ADR-owner acceptance pending.
    - **2026-11-09 - MCP twins of the DEX score policy routes (#6087):
      `get_dex_score_policy`, `set_dex_score_policy`, `reset_dex_score_policy`.**
@@ -1759,6 +1919,88 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        `docs/user-manual/rest-api.md` "GET / PUT / DELETE
        /api/v1/dex/score-policy"; audit rows: `docs/user-manual/audit-log.md`
        (verbs unchanged).
+     - Recorded by the change author; ADR-owner acceptance pending.
+   - **2026-11-16 - the streamed installed-software export (SAM-36; REST only, no
+     MCP twin by design).** `GET /api/v1/inventory/software/export?format=jsonl|csv`
+     streams every installed-software row that matches the filters of
+     `GET /api/v1/inventory/software`, as a chunked file, bounded by a configurable size limit. A file
+     download has no JSON-RPC result to ride in, and `query_installed_software`
+     already returns the same rows page by page, so no tool is planned.
+     - **A deliberate absence, not a backlog item.** Recorded by the
+       v1-keyed `exception:#7955 revisit:2027-05-31` row
+       `get.api-v1-inventory-software-export` in
+       `scripts/ci/api-parity/inventory.json`, pinned in `STRICT_EXCEPTION_PINS`
+       (tracking issue **#7955**). **Revisit by 2027-05-31**: if an agentic
+       client needs bulk rows, the answer is a paged tool that reuses
+       `software_list_model.hpp`, not a second copy of the stream. The parity
+       ledger (`docs/api-parity-ledger.md`, "Streamed file export with no MCP
+       twin by design") points here; the row counts untwinned, which is why
+       `BASELINE_UNTWINNED` rose by one.
+     - **The exception relaxes no control.** `require_fleet_read`
+       (`Inventory:Read`) is the sole gate; the composed management-group and
+       service scope is applied to every page read (pushed into the query up to
+       10000 devices; a wider scope is read and filtered in the server, so
+       out-of-scope rows are read from the store but no byte of one reaches the
+       response); one `inventory.software.export` audit row (`stream=true`) is
+       stored before the first byte, set-and-proceed with `Sec-Audit-Failed`;
+       at most `--inventory-export-concurrency` streams run at once, and each
+       holds one HTTP worker until it ends as one lease from the server's
+       held-open stream budget (`SseSurface::kSoftwareExport`, ADR-0034); a failed read or a transfer past 900
+       seconds aborts the response without its terminating chunk. Wire
+       reference: `docs/user-manual/rest-api.md`, "GET
+       /api/v1/inventory/software/export"; audit row:
+       `docs/user-manual/audit-log.md`.
+     - Recorded by the change author; ADR-owner acceptance pending.
+
+   - **2026-11-12 - the quarantine release over `DELETE /api/v1/quarantine/{agent_id}`
+     and its `?force=true` flag are REST only (PRQ.2); the MCP release tool is a
+     recorded exception.** `exception:#6234 REST DELETE (device-confirmed release,
+     200 or 202) and ?force=true have no MCP release tool; revisit: when the MCP
+     release tool lands`. The route asks the device to lift its firewall rules and
+     answers `200` with `state: released` when the device confirms within its short
+     wait, otherwise `202` with `state: releasing`; `?force=true` ends the record
+     without the device's confirmation (REST only, under the release's own gates).
+     The open issue #6234 tracks the MCP release tool; its acceptance criteria still
+     name the removed plugin's actions and must be updated to the firewall pairs, the
+     `releasing` state, the `202` and the forced end.
+     - **What an MCP-only caller can and cannot reach.** It can create a record
+       (`quarantine_device`) and list records (`list_quarantined_devices`, which
+       reports `releasing`). It cannot end one: a `firewall.release` sent through
+       `execute_instruction` lifts the device, and the reconciler then re-applies the
+       containment of the record, which is still active. The way to end a record is
+       the REST `DELETE`.
+     - **The exception relaxes no control.** The `DELETE` gates are unchanged by this
+       entry: scoped `Security:Execute`, the same-principal check, the dispatch
+       approval check for the `firewall.release` pair and an audited `attempt` row
+       ahead of the change. The flag adds no authority of its own. Wire reference:
+       `docs/user-manual/rest-api.md` (the quarantine section) and
+       `docs/user-manual/security-hardening.md` "Device Quarantine".
+     - Recorded by the change author; ADR-owner acceptance pending.
+
+   - **2026-11-17 - fleet application usage (`GET /api/v1/dex/apps/usage`) is
+     REST only for now; its MCP twin is owed and recorded as an exception.**
+     The route serves, for each application on the Apps list, the devices that
+     ran it, its run time and launches over a 30-day basis and its crashes and
+     hangs per hour of use, in the cells of a chosen slice. The routed
+     invariant is "REST and MCP, or a recorded ledger exception", so the absent
+     tool is recorded rather than left implicit.
+     - **A dated exception, not a permanent absence.** Recorded by the
+       v1-keyed `exception:#8096 revisit:2026-12-31` row
+       `get.api-v1-dex-apps-usage` in `scripts/ci/api-parity/dex.json`, pinned
+       in `STRICT_EXCEPTION_PINS` (tracking issue **#8096**), which is why
+       `BASELINE_UNTWINNED` rose by one (196 to 197). The row is retired, and
+       the baseline lowered, when the MCP tool lands; the tool reuses
+       `dex_apps_usage_json` and the `DexApi` `apps_usage` seam, not a second
+       copy of the model.
+     - **The exception relaxes no control.** The route is gated by
+       `GuaranteedState:Read` and `Forensics:Read`, both required, and audited
+       fail-closed as `dex.apps.usage.view` before the read; the usage figures
+       are computed over the caller's visible devices only (the application
+       list is the fleet list `GuaranteedState:Read` already serves, and the
+       filter is inert for every caller admitted today). The parity ledger
+       carries the matching paragraph (`docs/api-parity-ledger.md`, "New REST
+       route with its MCP twin pending (fleet application usage)"). Wire reference: `docs/user-manual/rest-api.md`, "GET
+       /api/v1/dex/apps/usage"; audit row: `docs/user-manual/audit-log.md`.
      - Recorded by the change author; ADR-owner acceptance pending.
 
 ## Interim rules (until the named follow-ups ship)

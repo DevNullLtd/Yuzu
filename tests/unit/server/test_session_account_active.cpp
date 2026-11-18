@@ -35,6 +35,7 @@
 #include "test_auth_db_rbac_pg_template.hpp"
 #include "test_principal_lock_gate.hpp" // SessionWipeFaultAfterDeactivation, SqlFault
 #include "test_route_sink.hpp"
+#include "totp.hpp"
 
 #include "../test_helpers.hpp"
 
@@ -481,7 +482,20 @@ TEST_CASE("account gate: an active account is unaffected warm, cold and across a
         CHECK(poll_and_validate(*m, token).has_value());
 
     // The MFA proof and the idle window are untouched by the gate.
-    REQUIRE(a.mark_session_mfa_verified(token));
+    // (Stamped through the proof-carrying call (#6079) with the account's current factor
+    // generation and a database instant. alice is not enrolled, so that generation is 0 and
+    // this is the unbound proof shape: what the case pins is that the account gate leaves a
+    // stored proof alone, not the binding, which a bound stamp would need an enrolled account
+    // to exercise.)
+    const auto mfa_status = f.db->mfa_status("alice");
+    REQUIRE(mfa_status.has_value());
+    // Not yet stamped: the cached anchor is absent.
+    const auto before_stamp = a.validate_session(token);
+    REQUIRE(before_stamp.has_value());
+    CHECK(before_stamp->steady_mfa_verified.time_since_epoch().count() == 0);
+    REQUIRE(a.mark_session_mfa_verified(
+        token, yuzu::server::LocalMfaProof{.factor_gen = mfa_status->factor_gen,
+                                           .verified_ms = mfa_status->db_now_ms}));
     auto& d = f.add();
     const auto seen = d.validate_session(token);
     REQUIRE(seen.has_value());
@@ -860,6 +874,79 @@ TEST_CASE("reactivation removes the sessions that existed, and a later sign-in w
     CHECK(c.validate_session(fresh).has_value());
 }
 
+TEST_CASE("reactivation of an ENROLLED account: a bound MFA proof does not survive a faulted wipe "
+          "(T6b, #6079)",
+          "[auth][session_store][account_active][reactivation][mfa_binding][pg]") {
+    // The composition the two features meet at: dev's account gate and wipe-first reactivation
+    // (#7223) against this PR's factor-generation binding. Every other case here uses an
+    // un-enrolled account, whose sessions carry no bound proof.
+    AcctFx f;
+    auto& a = f.add();
+    auto& b = f.add();
+    f.seed_world("alice");
+
+    // Enrol alice, so a session minted with a verified factor carries a BOUND proof.
+    {
+        auto init = f.db->mfa_init_enrollment("alice", "Yuzu", std::nullopt);
+        REQUIRE(init.has_value());
+        auto bytes = yuzu::server::mfa::base32_decode(init->secret_base32);
+        REQUIRE(bytes.has_value());
+        const std::string raw(reinterpret_cast<const char*>(bytes->data()), bytes->size());
+        const auto code = yuzu::server::mfa::generate(
+            raw, yuzu::server::mfa::current_counter(std::chrono::system_clock::now()));
+        REQUIRE(f.db->mfa_verify_enrollment("alice", code, std::nullopt).has_value());
+    }
+    const auto enrolled = f.db->mfa_status("alice");
+    REQUIRE(enrolled.has_value());
+    REQUIRE(enrolled->enrolled);
+    const auto bound_gen = enrolled->factor_gen;
+    REQUIRE(bound_gen > 0);
+
+    const auto old_token = a.create_local_session_for_test("alice", Role::user, true);
+    REQUIRE_FALSE(old_token.empty());
+    REQUIRE(a.validate_session(old_token).has_value());
+    REQUIRE(b.validate_session(old_token).has_value()); // warm on both replicas
+    const auto stored = a.read_durable_mfa_proof(old_token, "alice");
+    REQUIRE(stored.source == yuzu::server::auth::DurableMfaProof::Source::kRow);
+    CHECK(stored.mfa_verified_ms != 0);
+    CHECK(stored.mfa_factor_gen == bound_gen); // the stored proof is bound to the live factor
+
+    // Deactivate with the durable wipe faulted: the account is inactive, the row (and with it
+    // the bound proof) survives, and only the account gate can refuse the session now.
+    f.deactivate_leaving_session(a, "alice");
+    CHECK_FALSE(poll_and_validate(b, old_token).has_value());
+    check_stays_refused(b, old_token);
+    check_stays_refused(a, old_token);
+    auto& cold = f.add();
+    CHECK_FALSE(cold.validate_session(old_token).has_value());
+
+    // Reactivation removes the row, and the account comes back UN-enrolled at a NEW factor
+    // generation: a deactivation clears the factor, and the generation trigger redraws on every
+    // change of the enrolment. (That a bound proof surviving on a row would be refused by
+    // generation equality is pinned by the step-up gate cases, not by this one: the wipe
+    // deletes the row first.)
+    REQUIRE(a.reactivate_user("alice"));
+    CHECK(f.durable_sessions_of("alice") == 0);
+    const auto after = f.db->mfa_status("alice");
+    REQUIRE(after.has_value());
+    CHECK_FALSE(after->enrolled);
+    CHECK(after->factor_gen != bound_gen);
+    CHECK(a.read_durable_mfa_proof(old_token, "alice").source ==
+          yuzu::server::auth::DurableMfaProof::Source::kAbsent);
+    check_stays_refused(a, old_token); // the reactivating replica itself
+    check_stays_refused(b, old_token);
+    check_stays_refused(cold, old_token);
+
+    // A sign-in after the reactivation inherits no proof (a proof-less mint stays proof-less;
+    // the surviving-row case is the assertions above).
+    const auto fresh = a.create_local_session_for_test("alice", Role::user, false);
+    REQUIRE_FALSE(fresh.empty());
+    const auto fresh_seen = b.validate_session(fresh);
+    REQUIRE(fresh_seen.has_value());
+    CHECK(fresh_seen->steady_mfa_verified.time_since_epoch().count() == 0);
+    CHECK(a.read_durable_mfa_proof(fresh, "alice").mfa_verified_ms == 0);
+}
+
 TEST_CASE("reactivation is refused when the session wipe does not persist (T7)",
           "[auth][session_store][account_active][reactivation][pg]") {
     AcctFx f;
@@ -1015,6 +1102,208 @@ TEST_CASE("cache epoch: a revoke on the SAME replica drops a validation held acr
         CHECK(held.release_and_join().has_value());
         CHECK_FALSE(a.validate_session(token).has_value());
     }
+}
+
+TEST_CASE("cache epoch: a cold validation held across an MFA proof STAMP on the same replica is "
+          "served but not cached (#8010)",
+          "[auth][session_store][account_active][cache_epoch][mfa_binding][pg]") {
+    // The stamp edits a cached entry's proof in place and erases nothing, so only the epoch
+    // bump in that critical section keeps a validation that read the pre-stamp row from putting
+    // its proof-less copy back. The entry is ABSENT from B's cache at the stamp (the validation
+    // is cold), which also pins that the bump does not depend on an entry being present. No poll
+    // runs between the release and the final validate; on a very slow runner a 1 s poll could
+    // clear the cache and mask a regression (a false pass), never cause a failure.
+    AcctFx f;
+    auto& a = f.add();
+    auto& b = f.add();
+    f.seed_world("alice");
+    const auto token = a.create_local_session_for_test("alice", Role::user, false);
+    REQUIRE_FALSE(token.empty());
+    // Anchor B's generation view on something else so its cache is cold for this session.
+    const auto other = a.create_local_session_for_test("acct_admin", Role::admin, false);
+    REQUIRE(b.validate_session(other).has_value());
+
+    HeldValidation held;
+    held.install(b);
+    held.start([&] { return b.validate_session(token); }); // cold: reads the row, no proof yet
+
+    const auto st = f.db->mfa_status("alice");
+    REQUIRE(st.has_value());
+    REQUIRE(b.mark_session_mfa_verified(
+        token, yuzu::server::LocalMfaProof{.factor_gen = st->factor_gen,
+                                           .verified_ms = st->db_now_ms}));
+
+    const auto served = held.release_and_join();
+    REQUIRE(served.has_value()); // concurrent with the stamp: served once, with the old state
+    CHECK(served->steady_mfa_verified.time_since_epoch().count() == 0);
+
+    // Not cached: the next read goes back to the store and sees the stamped proof. A cached
+    // pre-stamp copy would still show no proof here.
+    const auto after = b.validate_session(token);
+    REQUIRE(after.has_value());
+    CHECK(after->steady_mfa_verified.time_since_epoch().count() != 0);
+}
+
+TEST_CASE("cache epoch: a cold validation held across an MFA proof CLEAR on the same replica is "
+          "served but not cached (#8010)",
+          "[auth][session_store][account_active][cache_epoch][mfa_binding][pg]") {
+    // The clear is the post-stamp factor recheck withdrawing a proof it just stamped: a proof
+    // carried with a generation that is not the account's current one is stamped, found stale
+    // and cleared. The held validation read the row while the proof was still stored, so its
+    // copy carries the proof the clear then removed; without the epoch bump it would be cached
+    // and restore that proof anchor on this replica. Same slow-runner note as the STAMP case.
+    AcctFx f;
+    auto& a = f.add();
+    auto& b = f.add();
+    f.seed_world("alice");
+    const auto token = a.create_local_session_for_test("alice", Role::user, false);
+    REQUIRE_FALSE(token.empty());
+    const auto other = a.create_local_session_for_test("acct_admin", Role::admin, false);
+    REQUIRE(b.validate_session(other).has_value()); // B's cache is cold for `token`
+
+    const auto st = f.db->mfa_status("alice");
+    REQUIRE(st.has_value());
+    // Give the row a proof (alice is not enrolled, so generation 0 is current and this stamp
+    // holds), via A so that B's cache stays cold for the session.
+    REQUIRE(a.mark_session_mfa_verified(
+        token, yuzu::server::LocalMfaProof{.factor_gen = st->factor_gen,
+                                           .verified_ms = st->db_now_ms}));
+
+    HeldValidation held;
+    held.install(b);
+    held.start([&] { return b.validate_session(token); }); // cold: reads the row WITH the proof
+
+    // Stamp a proof bound to a generation that is not the account's: the recheck clears it.
+    REQUIRE_FALSE(b.mark_session_mfa_verified(
+        token, yuzu::server::LocalMfaProof{.factor_gen = st->factor_gen + 1,
+                                           .verified_ms = st->db_now_ms}));
+
+    const auto served = held.release_and_join();
+    REQUIRE(served.has_value()); // concurrent with the clear: served once, with the old state
+    CHECK(served->steady_mfa_verified.time_since_epoch().count() != 0);
+
+    // Not cached: the next read goes back to the store and finds no proof. A cached pre-clear
+    // copy would still carry the anchor.
+    const auto after = b.validate_session(token);
+    REQUIRE(after.has_value());
+    CHECK(after->steady_mfa_verified.time_since_epoch().count() == 0);
+}
+
+TEST_CASE("cache epoch: a cold validation held across a FUTURE-DATED stamp refusal on the same "
+          "replica is served but not cached (#8010)",
+          "[auth][session_store][account_active][cache_epoch][mfa_binding][pg]") {
+    // The store clears the stored proof when the carried instant is later than its own clock,
+    // and `drop_cached_mfa_proof` then edits the cached entry in place (or finds none). Neither
+    // erases the key, so only the epoch bump inside `drop_cached_mfa_proof` keeps a validation
+    // that read the row while it still carried the proof from caching that proof back. Same
+    // slow-runner note as the STAMP case.
+    AcctFx f;
+    auto& a = f.add();
+    auto& b = f.add();
+    f.seed_world("alice");
+    const auto token = a.create_local_session_for_test("alice", Role::user, false);
+    REQUIRE_FALSE(token.empty());
+    const auto other = a.create_local_session_for_test("acct_admin", Role::admin, false);
+    REQUIRE(b.validate_session(other).has_value()); // B's cache is cold for `token`
+
+    const auto st = f.db->mfa_status("alice");
+    REQUIRE(st.has_value());
+    // Give the row a proof via A so that B's cache stays cold for the session.
+    REQUIRE(a.mark_session_mfa_verified(
+        token, yuzu::server::LocalMfaProof{.factor_gen = st->factor_gen,
+                                           .verified_ms = st->db_now_ms}));
+
+    HeldValidation held;
+    held.install(b);
+    held.start([&] { return b.validate_session(token); }); // cold: reads the row WITH the proof
+
+    // An instant an hour ahead of the database clock: the store keeps no proof and no binding,
+    // and the stamp is refused.
+    REQUIRE_FALSE(b.mark_session_mfa_verified(
+        token, yuzu::server::LocalMfaProof{.factor_gen = st->factor_gen,
+                                           .verified_ms = st->db_now_ms + 3'600'000}));
+
+    const auto served = held.release_and_join();
+    REQUIRE(served.has_value()); // concurrent with the refusal: served once, with the old state
+    CHECK(served->steady_mfa_verified.time_since_epoch().count() != 0);
+
+    // Not cached: the next read goes back to the store and finds the proof gone. A cached
+    // pre-refusal copy would still carry the anchor.
+    const auto after = b.validate_session(token);
+    REQUIRE(after.has_value());
+    CHECK(after->steady_mfa_verified.time_since_epoch().count() == 0);
+}
+
+TEST_CASE("cache epoch: a cold validation held across an elevation REVOKE on the same replica is "
+          "served but not cached (#8010)",
+          "[auth][session_store][account_active][cache_epoch][elevation][pg]") {
+    // `revoke_elevation` edits a cached entry's elevation fields in place and erases nothing, so
+    // only an epoch bump in that critical section keeps a validation that read the elevated row
+    // from putting its elevated copy back. The entry is ABSENT from B's cache at the revoke (the
+    // validation is cold), which also pins that the bump does not depend on an entry being
+    // present. No poll runs between the release and the final validate; on a very slow runner a
+    // 1 s poll could clear the cache and mask a regression (a false pass), never cause a failure.
+    AcctFx f;
+    auto& a = f.add();
+    auto& b = f.add();
+    f.seed_world("alice");
+    const auto token = a.create_local_session_for_test("alice", Role::user, false);
+    REQUIRE_FALSE(token.empty());
+    const auto other = a.create_local_session_for_test("acct_admin", Role::admin, false);
+    REQUIRE(b.validate_session(other).has_value()); // B's cache is cold for `token`
+    // Elevate via A so that B's cache stays cold for the session.
+    REQUIRE(a.elevate_session(token, std::chrono::seconds(600)).has_value());
+
+    HeldValidation held;
+    held.install(b);
+    held.start([&] { return b.validate_session(token); }); // cold: reads the ELEVATED row
+
+    const auto revoked = b.revoke_elevation(token);
+    REQUIRE(revoked.has_value());
+    CHECK(*revoked); // it was a real step-down, not a no-op
+
+    const auto served = held.release_and_join();
+    REQUIRE(served.has_value()); // concurrent with the revoke: served once, with the old state
+    CHECK(yuzu::server::auth::is_elevated(*served));
+
+    // Not cached: the next read goes back to the store and finds no elevation. A cached
+    // pre-revoke copy would still be elevated here.
+    const auto after = b.validate_session(token);
+    REQUIRE(after.has_value());
+    CHECK_FALSE(yuzu::server::auth::is_elevated(*after));
+}
+
+TEST_CASE("cache epoch: a cold validation held across revoke_user_elevations on the same replica "
+          "is served but not cached (#8010)",
+          "[auth][session_store][account_active][cache_epoch][elevation][pg]") {
+    // The per-account form of the case above: the revoke walks the cached entries (none matches,
+    // the validation is cold) and the durable clear is authoritative; only the epoch bump stops
+    // the held validation's elevated copy from being cached afterwards.
+    AcctFx f;
+    auto& a = f.add();
+    auto& b = f.add();
+    f.seed_world("alice");
+    const auto token = a.create_local_session_for_test("alice", Role::user, false);
+    REQUIRE_FALSE(token.empty());
+    const auto other = a.create_local_session_for_test("acct_admin", Role::admin, false);
+    REQUIRE(b.validate_session(other).has_value()); // B's cache is cold for `token`
+    REQUIRE(a.elevate_session(token, std::chrono::seconds(600)).has_value());
+
+    HeldValidation held;
+    held.install(b);
+    held.start([&] { return b.validate_session(token); }); // cold: reads the ELEVATED row
+
+    const auto cleared = b.revoke_user_elevations("alice");
+    REQUIRE(cleared.has_value());
+    CHECK(*cleared == 1);
+
+    const auto served = held.release_and_join();
+    REQUIRE(served.has_value());
+    CHECK(yuzu::server::auth::is_elevated(*served));
+
+    const auto after = b.validate_session(token);
+    REQUIRE(after.has_value());
+    CHECK_FALSE(yuzu::server::auth::is_elevated(*after));
 }
 
 namespace {

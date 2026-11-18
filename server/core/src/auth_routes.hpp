@@ -818,6 +818,19 @@ public:
         const std::string& target_id, const std::string& detail)>;
     [[nodiscard]] AuditAsSessionFn audit_as_session_fn();
 
+    /// The `AuditEvent` `audit_log_for_session` would write for `session`, built WITHOUT writing it
+    /// (#6079 PR 2c): the template the MFA-disable owner persists INSIDE its transaction, so the
+    /// outcome row carries exactly the identity fields a session-bound row carries (principal, the
+    /// role the caller captured, the engine class, source IP, user agent, session correlator,
+    /// target). One builder, `make_audit_event_for_principal`, shared with `audit_log_for_session`.
+    /// A factory like `audit_as_session_fn()` so server.cpp wires this and never a hand-rolled
+    /// lambda. The `AuthRoutes` must outlive every call.
+    using AuditEventForSessionFn = std::function<AuditEvent(
+        const httplib::Request&, const auth::Session&, const std::string& principal_role,
+        const std::string& action, const std::string& result, const std::string& target_type,
+        const std::string& target_id)>;
+    [[nodiscard]] AuditEventForSessionFn audit_event_for_session_fn();
+
     /// The `AuditEvent` `audit_log_for_principal` would write, built WITHOUT
     /// writing it (#5342 Gate 8): the identity/request fields (principal,
     /// role, class, source IP, user agent, session correlator, target) for a
@@ -1090,6 +1103,29 @@ public:
         after_first_provider_check_for_test_ = std::move(fn);
     }
 
+    /// Run `fn(route, proof)` on each MFA route between the verifier's return and the session
+    /// mint or stamp it feeds (`/login/mfa` for a TOTP and for a recovery code,
+    /// `/login/mfa/enroll`, `/login/mfa/stepup`; #6079). `proof` is exactly what the verifier
+    /// produced and the mint or stamp is about to carry, so a test can assert the stored instant
+    /// equals it (never the write's `now()`) and can rotate the factor in this span to prove the
+    /// post-mint and post-stamp generation recheck refuses it. No lock is held when it runs.
+    /// Test-only seam, same shape as `set_after_first_provider_check_for_test`; never set in
+    /// production.
+    void set_mfa_verify_barrier_for_test(
+        std::function<void(std::string_view route, const yuzu::server::LocalMfaProof& proof)> fn) {
+        mfa_verify_barrier_for_test_ = std::move(fn);
+    }
+
+    /// The DURABLE MFA proof of the session that authenticated `req`, for a binding decision
+    /// (#6079): `auth_mgr_.read_durable_mfa_proof` over the request's `yuzu_session` cookie and
+    /// `session.username`, so the credential read is the one that resolved the session. Only a
+    /// LOCAL cookie session carries a stored proof; any other principal (api_token, mcp_token,
+    /// engine, OIDC, SAML) answers `kAbsent` and never reaches the store. A degraded read or an
+    /// unobserved rebind guard is `kUnavailable` (fail closed, never "no proof"). Read-only.
+    /// The one extraction site every gate shares: do not read the cookie anywhere else for this.
+    [[nodiscard]] auth::DurableMfaProof durable_mfa_proof_for(const httplib::Request& req,
+                                                              const auth::Session& session) const;
+
 private:
     /// How `require_permission_impl` answers an RBAC read that could not be completed.
     enum class RbacDegradeMapping : std::uint8_t {
@@ -1110,6 +1146,8 @@ private:
                                   const char* who);
 
     std::function<void()> after_first_provider_check_for_test_;
+    std::function<void(std::string_view, const yuzu::server::LocalMfaProof&)>
+        mfa_verify_barrier_for_test_;
 
     /// Whether `(securable_type, operation)` clears the service-scope
     /// default-deny gate: the test override if one is set, else the real

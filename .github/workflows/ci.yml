@@ -1161,6 +1161,22 @@ jobs:
           # entirely; ccache absorbs the per-TU work across matrix runs
           # so the disk cost is the only added cost (~1-2 GB × 4).
           BUILDDIR=build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}
+          # This leg also builds the same targets with the same flags in
+          # build-linux-contracts-gcc15-debug (Contract migration evidence).
+          # For a -g compile ccache hashes the working directory by default, so
+          # the two sibling build dirs never shared a cache entry and the
+          # contract build compiled cold. With hash_dir off they share one. The
+          # cost is debug info only: an object's recorded compile directory
+          # (DW_AT_comp_dir) may name the other sibling, whose generated files
+          # are its own copies. Each Big Tam runner has its own cache (its
+          # .env sets a per-runner HOME, deploy/linux/README.md), so it never
+          # names another runner's workspace.
+          # Nothing in this leg reads it (no gdb, coverage or symbolizer step;
+          # those run in the nightly, which keeps hash_dir on). Every later
+          # step in the job inherits the setting through GITHUB_ENV.
+          if [[ "$BUILDDIR" == build-linux-gcc-15-debug ]]; then
+            echo "CCACHE_NOHASHDIR=1" >> "$GITHUB_ENV"
+          fi
           reconfig=""
           [[ -d "$BUILDDIR/meson-info" ]] && reconfig="--reconfigure"
           meson setup $reconfig "$BUILDDIR" \
@@ -2020,11 +2036,59 @@ jobs:
             -Dpkg_config_path="$GITHUB_WORKSPACE/vcpkg_installed/x64-linux/lib/pkgconfig" \
             -Dbuild_tests=true -Dbuild_contract_tests=true
           python3 scripts/ci/assert-gateway-tests.py "$CONTRACT_BUILD"
+          # Compile the pilots' targets here, at the leg's full width and BEFORE
+          # taking a heavy-test slot. When the collector did this compile inside
+          # the slot at -j2, the step took 6 to 50 min, slot wait included (one sampled run: a 996 s
+          # build and 26 s of tests), holding one of the three slots the Linux
+          # test step also needs. The collector still runs its own
+          # `meson compile`, which then has nothing to do: its build.log records
+          # that no-op, the real compile output is in this step's log, and the
+          # binary hashes it records are still those of the binaries it tests.
+          # A compile ERROR here is only a warning: the collector repeats the
+          # compile and records the failure in its evidence. A compile that runs
+          # past the job's 90-minute limit cancels the job and uploads no bundle,
+          # as it could before. CCACHE_NOHASHDIR (set for this leg in Configure)
+          # lets this second build directory reuse the standard build's objects.
+          # The target list is the collector's own: the union of build_targets
+          # in the registry. A registry it cannot read is a warning here; the
+          # collector then fails on the same file.
+          contract_targets_list=$(python3 -c 'import json; d = json.load(open("tests/contracts/pilots.json")); ts = [t for r in d["contracts"] for t in r["build_targets"]]; assert all(isinstance(t, str) and t and t[0] != "-" and not any(c.isspace() for c in t) for t in ts); print(" ".join(sorted(set(ts))))') \
+            || { echo "::warning::could not read build targets from tests/contracts/pilots.json; skipping the precompile"; contract_targets_list=""; }
+          read -r -a contract_targets <<< "$contract_targets_list"
+          # Per-step ccache stats log: the cache's own counters cover every
+          # compile since the job's reset, this log holds only this compile's.
+          precompile_stats="$RUNNER_TEMP/ccache-contract-precompile-$GITHUB_RUN_ID.log"
+          rm -f "$precompile_stats"
+          precompile_start=$SECONDS
+          if (( ${#contract_targets[@]} )); then
+            CCACHE_STATSLOG="$precompile_stats" \
+              timeout -k 30 "$YUZU_CONTRACT_BUILD_TIMEOUT_S" \
+              meson compile -C "$CONTRACT_BUILD" -j "$YUZU_BUILD_JOBS" "${contract_targets[@]}" \
+              || echo "::warning::contract pilot precompile failed; the collector will retry it and record the failure"
+          fi
+          echo "contract pilot precompile: $(( SECONDS - precompile_start ))s for ${#contract_targets[@]} target(s)"
+          if [[ -s "$precompile_stats" ]]; then
+            # ccache repeats Hits/Misses under "Local storage:" (4.12.3, checked on
+            # Big Tam); print only the call totals above that section. A row that
+            # is absent (Uncacheable, Errors) was zero.
+            stats=$(CCACHE_STATSLOG="$precompile_stats" ccache --show-log-stats 2>/dev/null \
+              | awk '/^Local storage:/ { exit } tolower($0) ~ /^[[:space:]]*(hits|misses|uncacheable|errors)/' || true)
+            if [[ -n "$stats" ]]; then
+              while IFS= read -r line; do echo "  ccache (contract precompile): $line"; done <<< "$stats"
+            else
+              echo "  ccache (contract precompile): stats unavailable"
+            fi
+          else
+            echo "  ccache (contract precompile): nothing compiled"
+          fi
+          rm -f "$precompile_stats"
+          collector_start=$SECONDS
           rc=0
           bash scripts/ci/with-test-slot.sh 3 -- \
             python3 scripts/test/contract-evidence.py run \
               --build-dir "$CONTRACT_BUILD" \
               --output "$YUZU_CONTRACT_OUTPUT" --jobs 2 || rc=$?
+          echo "contract collector (slot wait + run): $(( SECONDS - collector_start ))s, exit $rc"
           python3 scripts/test/contract-evidence.py bundle "$YUZU_CONTRACT_OUTPUT" "$YUZU_CONTRACT_OUTPUT.zip"
           exit "$rc"
 
@@ -2098,6 +2162,15 @@ jobs:
           YUZU_SERVER_BIN: build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/server/core/yuzu-server
           YUZU_REQUIRE_PSQL: "1"
         run: bash tests/shell/test_gateway_peer_boot_refusal.sh
+
+      - name: Gateway entrypoint cookie refusal test
+        timeout-minutes: 3
+        env:
+          YUZU_REQUIRE_ALL_SHELLS: "1"
+        run: |
+          # the test needs dash and busybox sh as well as bash (it fails, not skips, without them)
+          command -v busybox >/dev/null 2>&1 || sudo apt-get -o DPkg::Lock::Timeout=300 install -y busybox-static
+          bash tests/shell/test_gateway_entrypoint_cookie.sh
 
       # Gateway real-wire gate (#5652, #5653): the REAL yuzu-server under test, the REAL gateway
       # release (`rebar3 as prod release`) and one REAL yuzu-agent, brought up by

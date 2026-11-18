@@ -109,13 +109,21 @@ of the HA "safe-to-scale" gate. The design:
   sees a store failure (`503`), which the response does not tell apart from a lock
   timeout elsewhere in the transaction. (2) The validate cache carries an epoch
   (`session_cache_epoch_`, under `mu_`) incremented by the generation poll's
-  `sessions_.clear()` and by every targeted erase (sign-out, deactivation,
-  reactivation, password change, role change and a gate refusal); the expiry and
+  `sessions_.clear()`, by every targeted erase (sign-out, deactivation,
+  reactivation, password change, role change and a gate refusal) and by the
+  in-place edits of a cached entry on this replica that are listed here (#8010): the
+  MFA-proof edits (the drop of a cached proof, the post-stamp re-derive and the durable
+  stamp, whether or not the entry is cached) and the elevation clears
+  (`revoke_elevation` and `revoke_user_elevations`; the elevation clears were fixed in
+  the same change). So a validation held across one of those edits is served to its one
+  request but not cached. `elevate_session`'s re-derive and the legacy no-store stamp
+  deliberately do not move it: a stale pre-elevation copy under-grants and self-heals
+  at the next generation poll. The expiry and
   idle evictions inside validation and the legacy in-memory reap do not move it. A
   validation captures the epoch before any store read and inserts its session at
   the tail only if it is unchanged (ADR-0012 section 4, rule 2). On a mismatch the
   session is still returned to that one request, uncached. The mint insert is
-  deliberately unguarded: the post-mint recheck re-reads the role, the credential hash and the active state and erases
+  deliberately unguarded: the post-mint recheck re-reads the role, the credential hash and the active state (and, for a mint carrying a bound MFA proof, the factor generation) and erases
   this replica's entries when they changed. (3) `AuthManager::reactivate_user`
   erases the account's cached sessions and wipes its durable ones first (also for
   an account that is already active), erases the cache a second time once that wipe
@@ -387,7 +395,7 @@ conflict`. Then one guarded `UPDATE auth.users` (new hash/salt, `updated_at`,
 the provisional TOTP secret wiped, and — admin reset only — the lockout
 columns cleared); `DELETE FROM session_store.sessions WHERE username=$1`
 (`session_store_sql_helpers.hpp`, the ONE copy, shared with
-`SessionStore::invalidate_user`); the success audit row(s) via
+`SessionStore::invalidate_user` and `MfaDisableOwner`); the success audit row(s) via
 `AuditStore::log_in_txn` — `user.password_change` / `user.password_reset`
 (detail `sessions_revoked=N provisional_mfa_cleared=…`) and, for an admin reset
 of an account that had a lockout (`locked_until` set — even if the lock has
@@ -403,8 +411,8 @@ with the database at commit; a successful sign-in with the new password
 confirms the change, which is audited either way (the audit row is in the same
 commit).
 
-**Lock order** (documented in the owner header; a change inverting it can
-deadlock): the `auth.users` row → `session_store.sessions` rows →
+**Lock order** (documented in the `CredentialChangeOwner` header, and shared by
+`MfaDisableOwner`; a change inverting it can deadlock in either): the `auth.users` row → `session_store.sessions` rows →
 `audit_store.audit_events` (INSERT) → the `session_store.session_meta`
 `write_generation` row → COMMIT. The generation row is last because every
 session create and revoke in the fleet takes it: holding it while waiting on
@@ -417,10 +425,27 @@ re-read takes `auth.users` only after its session INSERT committed.
 `RbacAdminAuthorityOwner` takes `principal_roles` → `auth.users` and no audit
 lock; in `deactivate_account` (when a `SessionStore` is wired) it then takes the
 `session_store.session_meta` `write_generation` row last, the same position
-`CredentialChangeOwner` takes it in, before COMMIT. That edge is acyclic because
+`CredentialChangeOwner` and `MfaDisableOwner` take it in, before COMMIT. That edge is acyclic because
 no session writer takes an RBAC or account lock. The owner requires AuthDB, SessionStore and AuditStore on
 ONE pool/database (ADR-0006; server.cpp builds all three on `*pg_pool_`); a
 split fails every statement closed, never a partial write.
+
+**A sibling owner for the factor clear (#6079 PR 2c).** `MfaDisableOwner`
+(`mfa_disable_owner.{hpp,cpp}`) is the second owner that deletes session rows in its own
+transaction, in the same ADR-0012 §3 cross-store owner family, and copies `CredentialChangeOwner`'s shape: one pool
+lease, one `with_txn_for`, schema-qualified SQL across `auth`, `session_store`
+and `audit_store`, built in `server.cpp` on the same `*pg_pool_` and audit store.
+The Settings disable and `yuzu-server --mfa-reset` are its only callers (see
+"Sessions ended when the CLI or Settings clears a factor" below). Its lock order
+is the one above with the same acyclicity argument: the `auth.users` row (the
+clear, with the recovery-code DELETE) → the `session_store.sessions` rows →
+`audit_store.audit_events` (INSERT only) → the `session_store.session_meta`
+`write_generation` row LAST → COMMIT. A clear of an account with no verified
+factor that leaves its sessions alone (the Settings shape) takes a strict prefix
+of that order: the `auth.users` row, then the audit INSERT. Like its sibling it
+is safe only while AuthDB, SessionStore and AuditStore share ONE pool/database; a
+split fails every statement closed (a SQL error rolls the transaction back),
+never a silent partial write, but the owner would then need re-plumbing.
 
 **The locking post-mint read.** `create_local_session(username, role,
 mfa_verified, expected_hash_hex)` takes the verified hash (no default; the MFA
@@ -717,8 +742,10 @@ Full design: `docs/auth-mfa-design.md`. Summary:
   software-package write, software-deploy start, approval approve and reject
   (`POST /api/approvals/{id}/approve|reject`), MFA recovery-code
   regeneration and MFA disable, JIT elevation). 41 are enforced by the
-  central chokepoint described under "MFA step-up chokepoint" below; the
-  three JIT-elevation routes apply their own stricter gate in the handler.
+  central chokepoint described under "MFA step-up chokepoint" below (39
+  `kRequired` rows and the 2 `kFactorCredential` rows, MFA recovery-code
+  regeneration and MFA disable); the three JIT-elevation routes apply their
+  own stricter gate in the handler.
   Other mutating routes and all MCP tools are not MFA-step-up gated in
   this release.
 - **OIDC `amr` short-circuit** (PR 3) — `IdTokenClaims.amr` parsing so
@@ -754,16 +781,20 @@ by each handler.
 - **One table.** `step_up_policy.hpp`'s `kStepUpPolicy` classifies every
   mutating (`POST`/`PUT`/`PATCH`/`DELETE`) route by its exact `(method,
   registered pattern)`; there are no prefixes or wildcards. The classes are
-  `kRequired` (a fresh proof is needed; today's 41 enforced routes, 34 of
-  them with the audit labels they always had), `kOwnGate` (the three JIT-elevation routes,
+  `kRequired` (a fresh proof is needed; 39 rows), `kFactorCredential` (the two
+  rows that issue or retire a second factor, recovery-code regeneration and MFA
+  disable: a fresh proof bound to the current factor, a local interactive
+  session only, and never the window-0 hatch; a `static_assert` closes the class
+  to those two rows, which together with the 39 are the 41 enforced routes),
+  `kOwnGate` (the three JIT-elevation routes,
   whose handler applies a stricter gate that the chokepoint leaves alone),
   `kExempt` (a recorded reason: pre-session, self-service, read-shaped,
   execution governed by the dispatch ladder, and so on) and a transitional
   class (`kPendingRuling`) for routes whose classification is still being
   decided, which the chokepoint treats as exempt: 73 REST rows today, a count
   pinned in a `static_assert` (`kPendingRulingMax`) that can only shrink. The
-  table has 259 REST rows: 41 `kRequired`, 3 `kOwnGate`, 142 `kExempt` and 73
-  `kPendingRuling`.
+  table has 261 mutating REST rows: 39 `kRequired`, 2 `kFactorCredential`, 3 `kOwnGate`,
+  144 `kExempt` and 73 `kPendingRuling`.
 - **Where it runs.** In `run_post_read_stage` (`step_up_wiring.hpp`), the
   body of the post-read stage `server.cpp` installs through
   `PostReadStageRegistry` and the route sink runs in front of every handler
@@ -803,10 +834,20 @@ by each handler.
   cannot satisfy step-up (re-authenticating does not help) and to use an
   existing untiered, unscoped API token where the route accepts one, or ask
   an administrator); a
-  local account with no enrolled factor passes; an OIDC session is judged on
+  local account with no enrolled factor passes; a local account WITH an enrolled
+  factor is judged on the proof stored with its session as well (see
+  "Factor-generation binding of MFA proofs" below): a missing, unbound or
+  other-factor proof is `401`, and an unreadable stored proof or an unenforced
+  binding trigger is `503`; an OIDC session is judged on
   its `amr` proof and `--mfa-enforcement`; a stale proof is `401` with
   `meta.challenge_url`; a store or decrypt failure while reading enrollment
-  state is `503`. Engine principals are refused `403` on every `kRequired`
+  state is `503`. On the two `kFactorCredential` rows only a LOCAL session can
+  pass: an API-token or MCP-token session (which passes every other row, because
+  issuing the token was its step-up moment), an OIDC session and a SAML session
+  are refused `403` `managing an account's second factor requires a local
+  interactive session` (audit `reason=factor_credential_requires_local_session`),
+  because a bearer that passes would hand an administrator token a current-factor
+  recovery set with only a password. Engine principals are refused `403` on every `kRequired`
   route (verdict `kEngineDenied`, audit `reason=engine_principal_denied`),
   before any RBAC grant is consulted and without an MFA store read, once the
   engine's credential has resolved and the pre-routing gates (on-behalf
@@ -822,13 +863,16 @@ by each handler.
   `mfa.step_up.required` row (`result=error`), and the per-route handler row
   (`result=denied`, detail `engine_session_denied`) and its older body text
   are no longer produced there, so SIEM rules keyed on them need updating.
-  `--mfa-step-up-window-secs 0` (or less) disables the stale-proof requirement on
-  `kRequired` rows, but neither the engine denial nor the null-store check
-  below. The escape hatch precedes the SAML denial and the store read in
-  `decide_step_up`, so at a window of 0 or less SAML sessions pass all 41
-  routes and the authentication store is not read; no stale proof is refused
-  (so none is recorded), while engine denials and unwired-store refusals are
-  still recorded. The elevation routes use the global window when it is positive
+  `--mfa-step-up-window-secs 0` (or less) disables the stale-proof requirement and
+  the binding check on the 39 `kRequired` rows, but neither the engine denial nor
+  the null-store check below. The escape hatch precedes the SAML denial and the
+  store read in `decide_step_up`, so at a window of 0 or less SAML sessions pass
+  all 39 `kRequired` routes and the authentication store is not read; no stale
+  proof is refused (so none is recorded), while engine denials and unwired-store
+  refusals are still recorded. The two `kFactorCredential` rows ignore the hatch:
+  they always use the approver window (`min(window, 300)`, and 300 when the
+  setting is 0 or less), so a password-only or surviving single-factor session
+  cannot regenerate or retire a factor while the gate is switched off. The elevation routes use the global window when it is positive
   and substitute 300 s when it is not (`kElevationStepUpWindow` in
   `auth_routes.cpp`); a positive window below 300 s is used as it is, so this
   is a substitution, not a floor.
@@ -847,7 +891,14 @@ by each handler.
   fingerprinted, is the same `503`,
   rendered for the request's surface like any other refusal, with
   `reason=chokepoint_exception` in a best-effort audit row and the session's
-  own source on the metric (`other` only when no session resolved). A `503`
+  own source on the metric (`other` only when no session resolved). A local
+  enrolled session whose stored proof cannot be read (a degraded read, or the session store's
+  rebind guard not in force), whose account's factor generation is not positive, or whose binding
+  trigger is not observed in force, is the same `503` with `reason=mfa_proof_unavailable` or
+  `reason=mfa_binding_unenforced`, counted
+  `yuzu_auth_secret_unavailable_total{route="mfa_binding"}`; a chokepoint built
+  without the stored-proof reader answers such a session `503` with
+  `reason=auth_store_unwired`. A `503`
   is never conflated with the `403` of a SAML session or the `401` of a stale
   proof.
 - **Decide and render are separate.** `decide_step_up` is pure: it returns a
@@ -863,7 +914,12 @@ by each handler.
   `meta.mfa_step_up_required` and the `/login/mfa/stepup` challenge the dialog
   opens a nested "Confirm it is you" modal and replays the original request
   once on a valid code; a wrong code shows "That code was not accepted. Check
-  it and try again." in the modal, and Cancel returns to the outer dialog with
+  it and try again." in the modal, a `503` from `POST /login/mfa/stepup` shows the server's own
+  `error.message` instead (before verification, "authentication store is temporarily unavailable" or
+  "auth_db unavailable": the code was not checked and an immediate retry is fine; after it, "Your code was
+  accepted but could not be recorded. Wait for the next code and try again.": the code is spent, so the
+  same code is refused as a replay and the response carries no `retry_after_ms`; the dashboard and Settings
+  prompts show the same text), and Cancel returns to the outer dialog with
   the envelope message ("MFA step-up required"). A `403` or `503` is shown by
   the dialog as the envelope's `error.message`, with no toast and no prompt;
   the OIDC challenge, like any `401` without a step-up envelope, sends the
@@ -888,7 +944,9 @@ by each handler.
   a fingerprint of principal kind, auth source and username) as well as to the
   request and the action label: a handler whose own resolved session is a different
   principal does not consume it, the pass is spent, and that session is evaluated
-  afresh. The binding outlives the pass until the end of the request, and
+  afresh. For the two `kFactorCredential` rows the pass also carries the factor
+  generation the check admitted (`StepUpAdmission`), handed to the handler under
+  the same identity check, so only the principal that earned the pass can claim it. The binding outlives the pass until the end of the request, and
   `resolve_session` applies it on every credential path, so a resolution that would
   land on another principal returns no session and the route answers its ordinary
   no-session response (usually `401`; approve and reject answer `503` with
@@ -903,15 +961,24 @@ by each handler.
   calls may be deleted once handlers consume the centrally resolved session or the
   repeated resolves are removed (#6200); the binding stays until then. Until then
   the in-handler calls remain
-  as defence in depth (43 distinct labels: one per `kRequired` row, 41, plus
-  the two the elevation path uses).
+  as defence in depth (43 distinct labels: one per enforced row, 41 (39
+  `kRequired` and 2 `kFactorCredential`), plus the two the elevation path uses).
 - **Audit.** Refusals written by the chokepoint go through
   `AuthRoutes::audit_log`, so the actor is the resolved session. Every row is
   `mfa.step_up.required` with `result=error` (a policy denial is not
   `result=denied`). For a stale or absent proof its `detail` is
   `user=<name> age_secs=<n> window_secs=<n> cid=<id> stage=pre_authz`
-  (`age_secs=-1` when the session has no proof); for every other refusal it is
-  `user=<name> reason=<token> cid=<id> stage=pre_authz`. `cid` equals the
+  (`age_secs=-1` when the session has no proof), with ` reason=<token>` appended
+  when the proof was refused for its binding rather than its age
+  (`mfa_proof_missing`, `proof_factor_unbound`, `proof_factor_mismatch`; then
+  `age_secs` is the stored proof's own age on the database clock, `-1` when it has
+  none); for every other refusal it is
+  `user=<name> reason=<token> cid=<id> stage=pre_authz` (the 503 binding reasons
+  are `mfa_proof_unavailable` and `mfa_binding_unenforced`; the non-local
+  factor-credential 403 is `factor_credential_requires_local_session`). The
+  `user=` value is the session username after the CWE-117 neutraliser: control
+  bytes, DEL, space, `=` and `,` become `_`, while bytes at or above 0x80 pass
+  through and there is no length cap. `cid` equals the
   `X-Correlation-Id` header and the body's `correlation_id`, so a reported
   refusal joins to its row, and `stage=pre_authz` lets evidence queries tell a
   refusal made before the handler's authorization from one made after it. The
@@ -925,18 +992,49 @@ by each handler.
 - **Where a proof comes from.** The proof the gate reads is the session's
   `mfa_verified_at`, written by four mechanisms across five routes: `POST /login/mfa` and the login
   bootstrap `POST /login/mfa/enroll` mint the session already stamped;
-  `POST /login/mfa/stepup` refreshes it (`mark_session_mfa_verified`); the
+  `POST /login/mfa/stepup` refreshes it (`stamp_session_mfa_proof`); the
   OIDC callback seeds it when the IdP `amr` claim attests MFA; and a Settings enrolment
   confirm (`POST /api/settings/mfa/verify`) stamps the confirming local cookie
-  session through the same `mark_session_mfa_verified`, so a just-enrolled
+  session through the same `stamp_session_mfa_proof`, so a just-enrolled
   administrator is covered inside the window for that session only. The
-  Settings stamp needs a local cookie session of the same user; otherwise the
-  session could not be stamped (a bearer principal, an absent or mismatched
-  cookie, or a store failure) and the enrolment stands unstamped. It writes no
+  confirm itself needs a durable session row (a bearer or cookie-less caller is
+  refused `401` before the code is checked, see "Settings enrolment confirm needs
+  a durable session"), so the session fails to stamp only when it ended between
+  that check and the commit, the stamp is refused (`;factor_changed`,
+  `;verification_future_dated`) or the stamp's store write fails, and the
+  enrolment stands unstamped. It writes no
   `mfa.step_up.passed` row: the evidence is the `step_up_proof=` detail on
-  `mfa.enroll.verified`. The Settings MFA panel cannot yet prompt for a code,
+  `mfa.enroll.verified`. Every one of these writes stores the proof together with the factor generation
+  and the database instant the verifier produced (see "Factor-generation binding
+  of MFA proofs" below), never the write's own clock. The Settings MFA panel
+  cannot yet prompt for a code,
   so once the window passes its regenerate and disable buttons only show a
   refusal toast until the operator signs in again or steps up out of band.
+- **Settings enrolment confirm needs a durable session (#6079 PR 2c).** The confirming code
+  commits the factor, so `POST /api/settings/mfa/verify` first requires the caller's session to
+  be a durable, valid row, read with `AuthManager::read_durable_mfa_proof` (row existence and
+  ownership only) BEFORE `mfa_verify_enrollment`. A session that is not a durable row (ended,
+  wiped, never persisted) and any API-token (bearer) or cookie-less caller is refused `401` with
+  audit `mfa.enroll.failed` and detail `session_not_durable` (the toast says "This action needs a
+  signed-in browser session. Nothing was enrolled." when the request carries no session cookie at
+  all, and "Your session is no longer valid. Nothing was enrolled; sign in again." when a cookie
+  is present but has no durable row for the user). This is a deliberate fail-closed narrowing and
+  a behaviour change for API-token callers, who used to enrol and end as
+  `step_up_proof=not_stamped`: they must confirm from a signed-in browser session. A session
+  store that cannot be read is refused `503` with `Retry-After: 5` and detail
+  `session_store_unavailable`, and counts `yuzu_auth_session_store_degrade_total{op="validate"}`.
+  Either way nothing is enrolled, no recovery codes are issued and the provisional secret is
+  untouched. After a `401` the operator signs in again, presses Set up (which shows the SAME
+  provisional secret again) and enters a CURRENT code from the same authenticator entry (codes
+  rotate every 30 seconds, so the code typed before is not the one to retry); after the `503` the
+  form is kept and a current code works on retry. The two refusals reuse the action
+  `mfa.enroll.failed`, so a rule that counts it as bad-code attempts must filter on the detail.
+  The check applies only when a session store is wired (a no-store wiring, tests and legacy
+  only, skips it). It runs outside the `auth.users` row lock, because `AuthDB` never reads the
+  session store, so with a store wired the remaining `step_up_proof=not_stamped` causes on
+  `mfa.enroll.verified` are a session that ended between the check and the commit (the
+  enrolment stands and the operator signs in again), a stamp refusal (`;factor_changed`,
+  `;verification_future_dated`) and a stamp store failure.
 - **Classification is enforced three ways.** A compiled test registers every
   route owner it can construct with null dependencies on a `TestRouteSink` and
   asserts that each mutating `(method, pattern)` has a row, comparing the
@@ -956,13 +1054,15 @@ by each handler.
 - **Scope.** A fresh MFA proof is required on 41 named high-risk routes (plus
   the three JIT-elevation routes, whose handlers apply their own gate) for
   MFA-enrolled local accounts and OIDC sessions per `--mfa-enforcement`;
-  un-enrolled accounts and API/MCP tokens pass; engine principals are denied.
+  un-enrolled accounts and API/MCP tokens pass (except on the two
+  `kFactorCredential` rows, which refuse every non-local session); engine
+  principals are denied.
   "High-risk" names these 41 routes; it is not a completeness claim. Other
   mutating routes and all MCP tools are not MFA-step-up gated in this release:
   73 REST rows are still `kPendingRuling` (among them CA revoke and
   issue-code-signing, and `PUT /api/config/*`), and MCP is governed by the MCP tier
   and approval ladder (`docs/mcp-server.md`). The MCP tools are classified in
-  a second table, `step_up_mcp_policy.hpp` (82 rows: 32 `kExempt`, 50
+  a second table, `step_up_mcp_policy.hpp` (83 rows: 33 `kExempt`, 50
   `kPendingRuling`, none `kRequired`), which is data only and changes no MCP
   behaviour. The pending rows are a frozen baseline of 44 whose count only goes down,
   plus a separate list of tools added after it (today six), legal only for a tool
@@ -998,11 +1098,173 @@ by each handler.
 - **Metrics and alerts.**
   `yuzu_auth_mfa_step_up_gate_total{outcome,source,surface}` (96 series
   pre-seeded to 0), the gauge `yuzu_auth_mfa_step_up_window_seconds`, and the
-  alerts `YuzuStepUpGateUnavailable` and `YuzuStepUpWindowDisabled`; see
-  `docs/observability-conventions.md`.
+  alerts `YuzuStepUpGateUnavailable` and `YuzuStepUpWindowDisabled`; the binding
+  series (`yuzu_auth_mfa_binding_enforcement_ok{store}` and the alert
+  `YuzuMfaBindingNotEnforced`) are described under "Factor-generation binding of
+  MFA proofs" below; see `docs/observability-conventions.md`.
 
 Hard invariants live in §"Hard invariants" of `docs/auth-mfa-design.md` —
 do not regress them when shipping PR 2 / PR 3.
+
+### Factor-generation binding of MFA proofs (#6079)
+
+A step-up proof is only worth what it proves, so a local proof is bound to the factor it was earned
+with. A proof satisfies a step-up-gated route, JIT elevation or an approval decision only if the
+account is enrolled now, the proof records the factor generation read when it was verified, that
+generation equals the account's current one read for **this** request, and the proof is inside the
+gate's window on the database clock. This replaces the earlier comparison of the proof instant with
+the enrolment instant, which a repeated or skewed timestamp could defeat and which only the approver
+gate applied.
+
+- **The generation is database-owned.** `auth.users.mfa_factor_gen` (auth migration v3) is assigned
+  by the row trigger `users_mfa_factor_gen` (`BEFORE UPDATE OF mfa_enrolled_at, mfa_factor_gen`, created
+  `ENABLE ALWAYS` so it fires under every `session_replication_role`) a fresh random positive value (about
+  60 bits, from `gen_random_uuid`, always different from the value it replaces; the function is created with
+  `SET search_path = pg_catalog, pg_temp`, so `replace()`, `gen_random_uuid()` and the types it names resolve to the
+  system objects whatever the writing session's `search_path`, temp objects included: `pg_temp` is listed last) whenever
+  `mfa_enrolled_at` changes: enrolment, clear, soft delete, or a direct UPDATE by any binary. It is not a
+  counter, so a value is never reissued in practice: after an auth-only restore over a newer session store,
+  a re-enrolment cannot land on a generation a surviving stored proof carries. A logical-replication or
+  apply-based consumer would fire this `ENABLE ALWAYS` trigger on the subscriber and draw its own value
+  there; that fails closed (proofs bound on the publisher mismatch and users prove MFA again), and
+  physical streaming replication is unaffected. Application
+  code never writes it, and the trigger reverts a direct write. It is not changed by a provisional secret, a TOTP counter advance, recovery-code
+  regeneration or a `SecretCodec` re-encryption. The migration seeds nothing (a hard cutover, see "Rollout and cutover" below): every existing row
+  starts at `0` ("never assigned") and the trigger assigns a value from the next enrolment change, so an enrolled account in a database an earlier build
+  wrote (unsupported) reads generation `0`, is refused `503` (audit `reason=mfa_proof_unavailable`), and
+  must have its factor cleared with `yuzu-server --mfa-reset <user>` (under `--mfa-enforcement=required`, or `admin-only` for an administrator, the user enrols again at next sign-in).
+- **Decisions are not re-checked under the row lock.** The approve and reject decision, the 39 ordinary
+  step-up routes and the JIT elevation routes compare the generation once, at the gate read; only the
+  factor-changing operations (Settings disable, recovery-code regeneration, the sign-in stamp) compare it
+  again under the `auth.users` row lock. A clear that commits between the gate read and the decision lets
+  that one decision stand: it linearises before the clear. Re-checking would nest locks across the approval
+  store and `AuthDB`, and the exposure is the same class as the accepted residuals of the hard-cutover entry.
+- **The session side is guarded too.** `session_store.sessions.mfa_factor_gen` and `mfa_bind_seq`
+  (session_store migration v3) hold the bound proof. The trigger `sessions_mfa_rebind_guard`
+  (`ENABLE ALWAYS`) sets `mfa_factor_gen` to `0` ("unbound") on any write of a proof or identity column
+  (`mfa_verified_ms`, `mfa_factor_gen`, `username`, `auth_source`, `principal_kind`) that does not raise
+  `mfa_bind_seq` in the same statement. A writer that knows about binding always raises it with the proof,
+  so only a writer that does not (a legacy stamp, an `ON CONFLICT` rewrite)
+  leaves an unbound proof, which no gate admits.
+- **The verification instant is captured before the check.** It is the database `now()` read by the
+  statement that loads the TOTP secret (the provisional secret for an enrolment, the unconsumed candidates
+  for a recovery code), before any cryptographic work, so every pause after that point counts as proof
+  age. The session write stores this carried instant and generation, never its own `now()`. An instant
+  later than the write's own `now()` (the database clock stepped back in between) stores **no proof and no
+  binding** rather than a clamped age-zero proof; the mint or stamp is refused
+  (`yuzu_auth_mfa_verification_future_dated_total`). A verifier reports success only after COMMIT: a commit
+  that fails, or whose acknowledgement is lost, answers `503` with no proof, and after a lost
+  acknowledgement the code or TOTP counter stays consumed, so a retry of the same code is refused as a
+  replay and the user continues with the next one.
+- **One decision.** `judge_local_mfa_binding` (`mfa_factor_state.hpp`) is the single binding decision for
+  the central chokepoint, the in-handler gate (JIT elevation included) and the approver gate; a second
+  copy in any gate is a defect. Precedence is fixed:
+
+  | Condition | Answer | `reason` |
+  |---|---|---|
+  | stored proof unreadable (degraded read, row unusable, or the session store's rebind guard not in force) | `503` | `mfa_proof_unavailable` |
+  | binding trigger not observed in force (or a recovery bypass) | `503` | `mfa_binding_unenforced` |
+  | enrolled account whose factor generation is not positive (a tampered row, or an enrolled account in a database an earlier build wrote, which is unsupported; see "Rollout and cutover"); decided after the unenforced arm | `503` | `mfa_proof_unavailable` |
+  | no stored proof (row absent, another principal's, or no instant) | `401` | `mfa_proof_missing` |
+  | proof has no generation | `401` | `proof_factor_unbound` |
+  | proof generation differs from the account's | `401` | `proof_factor_mismatch` |
+  | generation equal | continue to the freshness test | none |
+
+  It applies only to a local session whose account is enrolled; OIDC, SAML, token and engine principals
+  take the branches they always took and never reach the stored-proof read. The stored proof is read
+  per request (one primary-key SELECT on `session_store.sessions`, next to the `mfa_status` read) and is
+  never cached, because presence and binding must be current; the freshness test then needs the cached
+  monotonic age **and** the millisecond database-clock age to be inside the window.
+- **A factor change during a verification is caught at both ends.** At login, `recheck_role_locked`
+  returns `mfa_factor_gen` from the same row lock as the role and credential recheck; a difference revokes
+  the session before the token is released and the login answers `401` with audit
+  `reason=session_mint_failed;cause=factor_changed`
+  (`yuzu_auth_role_recheck_post_mint_denied_total{reason="factor"}`). At a step-up stamp,
+  `post_stamp_factor_recheck` runs after the stamp commits; if the generation changed, the proof just
+  stamped is cleared and the route answers `401` `factor_changed_during_step_up`
+  (`yuzu_auth_mfa_stamp_denied_total`); a Settings enrolment confirm records
+  `step_up_proof=not_stamped;factor_changed` and the enrolment still stands. A clear that fails after the
+  recheck is logged and counted (`yuzu_auth_session_store_degrade_total{op="clear_mfa_proof"}`) and has two
+  arms. After a CHANGED factor the stored proof stays bound to the old generation, which every gate refuses
+  by equality. After an UNVERIFIABLE recheck (the generation could not be read) it stays bound to the
+  verifier's own generation, which is the current one unless a change raced, so a binding gate would admit
+  that proof: benign, because it was earned with a valid code, and the withdrawal is best-effort.
+- **Credential-issuing rows carry the admitted generation to the mutation.** `kFactorCredential` rows
+  (`POST /api/settings/mfa/recovery-codes`, `POST /api/settings/mfa/disable`) admit only a local session,
+  use the approver window and are never hatch-exempt. The gate hands the generation it judged to the
+  handler (`StepUpAdmission`, for an un-enrolled account the generation read at the gate), and
+  `mfa_regenerate_recovery_codes` and the disable's `MfaDisableOwner` (through `auth_sql::clear_mfa_factor_in_txn`,
+  the one copy of the clear statements, which `AuthDB::mfa_disable_report` also uses but no production caller does now)
+  compare it with `auth.users.mfa_factor_gen` under the same `auth.users` row lock, in the same transaction as the write.
+  A different value returns `AuthDBError::FactorChanged` (recovery codes) or `MfaDisableResult::kFactorChanged` (disable)
+  and writes nothing: the handler answers `409`,
+  records `denied` with detail `reason=factor_changed expected_gen=<n>` on `mfa.recovery_codes.generated`
+  or `mfa.disabled`, and counts `yuzu_auth_mfa_factor_changed_total{route}`. The recovery-code compare is one `auth`
+  transaction; the disable's compare is inside the owner's one transaction. An account admitted un-enrolled at generation `g` that was
+  enrolled in between reads a different generation and is refused, so a cancel can never strip a factor that did not exist
+  when the request was admitted. Enrolment init and confirm have their own identity predicates and are not
+  gated; `--mfa-reset` and tests pass no generation (break-glass, no gate).
+- **Enforcement of the triggers is checked, not assumed.** At boot each store verifies that its trigger
+  exists, is `ENABLE ALWAYS`, fires per row `BEFORE UPDATE` on the watched columns, and that the function
+  body equals the pinned text (for the `auth` function, also that its `pg_proc.proconfig` is exactly
+  `search_path=pg_catalog, pg_temp`, so a `CREATE OR REPLACE FUNCTION` without the `SET` clause, or with another path, is refused); if not, the store does not open and the server refuses to start. The one
+  exception is the two host recovery one-shots, `--mfa-reset` and `--break-glass-arm`: each passes
+  `MfaBindingCheck::kBypassForRecovery` to its bootstrap `AuthDB` (and `--mfa-reset` also to the
+  `SessionStore` it opens so the owner's session delete finds its migrated tables), logs
+  a WARN naming the trigger state it found, and reports the
+  binding as not enforced for the life of that process, so any binding decision made through them fails
+  closed (login still requires the TOTP code; it is not an MFA bypass). Serving and every other mode
+  that opens the bootstrap store, `--generate-tokens` for example, still refuse. After boot the same
+  check re-runs only when a request needs it (`AuthDB::mfa_status`, `SessionStore::find`),
+  behind a 60 second steady-clock memo; the cleanup cadence and the session reap pass play no part. A
+  query that could not run does not set the sticky flag. On the `auth` side it latches `binding_inconclusive`:
+  EVERY read then reports the binding not enforced (the local binding decision fails closed) until a later check
+  returns Valid; the next read retries the check at once, the Unknown transition logs a warning once per episode
+  naming the inconclusive trigger validation, and a compare-exchange loser that arrives while the first-ever
+  inconclusive check is still in flight reads the previous state (a window bounded by one catalog query). The
+  gauge `yuzu_auth_mfa_binding_enforcement_ok` still reads 1 during the latch, so only `YuzuStepUpGateUnavailable`
+  fires. A query that ran and found the trigger not in force sets a sticky flag: every local binding
+  decision answers `503` until the server restarts and its boot check passes, because generation changes
+  made while the trigger was not firing cannot be reconstructed. The token differs by store:
+  `mfa_binding_unenforced` for the account-store trigger, and `mfa_proof_unavailable` (with
+  `yuzu_auth_session_store_degrade_total{op="rebind_guard"}`) for the session store's rebind guard, which
+  reaches a local session as an unreadable stored proof; SSO sessions are not affected by the
+  session-store case, because `AuthManager::read_durable_mfa_proof` returns the row as read and only
+  `AuthRoutes::durable_mfa_proof_for` applies `AuthManager::stored_binding_trustworthy()` to a local
+  session. A SIEM rule must key on both tokens. **Sticky versus transient at the approver:** the approver
+  `503` carries no `retry_after_ms` and a remediation that points at the MFA binding enforcement runbook
+  (an account whose factor generation is not positive is reset with `yuzu-server --mfa-reset <user>` after checking
+  `mfa_factor_gen <= 0`; otherwise restore the auth store's MFA binding triggers and restart)
+  for the three causes that do not clear by themselves, namely an auth trigger observed not in force (or
+  a recovery bypass), the session store's rebind guard latched not in force, and an enrolled row whose
+  factor generation is not positive; every transient cause (an unreadable enrolment or stored-proof read,
+  or an inconclusive trigger validation: on the `auth` side for as long as the latch is set, on the session store for the read whose
+  check could not run and any read that overlaps it before a check succeeds) keeps `retry_after_ms` 5000; session validation itself is unaffected and the session store
+  retries the check on the next read. At the central gate the
+  not-positive generation is a `503` (audit `reason=mfa_proof_unavailable`), decided after the unenforced arm. Sign-in
+  and step-up proving keep working. `yuzu_auth_mfa_binding_enforcement_ok{store="auth"|"session"}` drops
+  to `0` and `YuzuMfaBindingNotEnforced` fires; the operator procedure is
+  `docs/ops-runbooks/auth-db-recovery.md` "MFA binding enforcement failed". What this does not cover: a
+  tampering that is in place when a validation runs makes every local binding decision fail closed until
+  the server restarts, and the boot check must pass before it serves again. A disable, change and
+  re-enable completed entirely between two validations is not observable by this mechanism, and shortening
+  the memo does not change that. The control's trust boundary is the database role: a principal who can
+  alter triggers can alter the generation itself.
+
+#### Rollout and cutover
+
+This build is a hard cutover. It supports a fresh database only: it has no upgrade path, no rolling or
+mixed-version window, no rollback, and no supported carry-over of an earlier build's database (the deployment
+contract in `docs/user-manual/upgrading.md`). An enrolled account that reads generation `0` can exist only in a
+database an earlier build wrote; the server refuses it (`503`) until `yuzu-server --mfa-reset <user>` clears its
+factor, which is the repair for that account and not a documented upgrade step.
+
+| State | Behaviour |
+|---|---|
+| Fresh database | Full closure on every gate. Every row starts at generation `0` and the trigger assigns a fresh random value at the first enrolment. |
+| Enrolled account at generation `0` (a database an earlier build wrote, which is unsupported) | The `auth` v3 migration seeds nothing, so the account reads generation `0` and is refused `503` (audit `reason=mfa_proof_unavailable`) until `yuzu-server --mfa-reset <user>` clears its factor (under `--mfa-enforcement=required`, or `admin-only` for an administrator, the user enrols again at next sign-in). |
+| Trigger dropped, disabled, replica-only or body replaced | Boot refuses (only `--mfa-reset` and `--break-glass-arm` open their bootstrap `AuthDB` past it, and report the binding not enforced). While running, a validation that observes it fails every local binding decision closed (sticky). Changes made while it was not firing are not reconstructable: end the affected accounts' sessions (runbook). |
+| Coherent offline restore | The accepted ADR-2002 checkpoint class. After ANY restore of the auth schema end every session (a restart does not). |
 
 ### Approver assurance (maker-checker, #6061)
 
@@ -1020,9 +1282,16 @@ the dashboard Approvals page (which posts to the same routes) and the MCP tools 
   **session's own identity** (never a namesake row that happens to share a username) and refuses
   before any proof is judged:
   - a **local** session needs a currently enrolled TOTP factor read from `AuthDB`, and a proof
-    (`mfa_verified_at`) within the approver window. The proof must also not predate the account's
-    current enrolment (`mfa_enrolled_at`, both read from Postgres): disabling MFA and enrolling again
-    invalidates older proofs, answered with `401` and audit detail `reason=proof_predates_enrolment`;
+    (`mfa_verified_at`) within the approver window that is **bound to the factor enrolled now**: the
+    generation stored with the proof must equal the account's current `mfa_factor_gen`, both read
+    from Postgres for this request (see "Factor-generation binding of MFA proofs" above). Disabling
+    MFA and enrolling again gives the account a fresh generation, so older proofs no longer match. The three
+    refusals are the step-up `401` with a `reason=` token in the audit detail: `mfa_proof_missing`
+    (the session has no stored proof), `proof_factor_unbound` (the proof has no generation: unbound by
+    the session rebind guard) and
+    `proof_factor_mismatch` (bound to a factor that has since been replaced). Generations are only
+    compared for equality, never ordered, so a repeated or forward-skewed enrolment instant cannot
+    satisfy or defeat the check;
   - an **OIDC** session has no local enrolment to check. Its proof is "fresh" only in this sense: the
     identity provider issued an ID token with an MFA-method `amr` within the window (the server ages the
     token's `iat`, clamped to the server's own clock at sign-in). The MFA itself may predate the token,
@@ -1054,16 +1323,26 @@ the dashboard Approvals page (which posts to the same routes) and the MCP tools 
   database clock: the gate reads the row and `db_now_ms` in one SELECT and requires `0 <= db_now_ms - mfa_verified_ms <= window`,
   with no `kWallSanitySkew` allowance, in addition to the cached monotonic check. A suspended host or paused VM freezes the
   monotonic anchor, so the cached check alone is not a ceiling; the replica's own `system_clock` is never the authority.
-  A degraded read is `503`; a missing or future-dated proof is a step-up `401` for a local session. An OIDC session with no usable cached proof is refused earlier, `403` `mfa_proof_missing`, with one exception: when the cached anchor is empty because the stored proof is dated after the database clock (the replica that took the sign-in ran ahead of the database; the sign-in clamps the ID-token `iat` to that replica's own clock, so an identity provider running ahead cannot future-date the proof by itself; `derive_session_deadlines` drops such a proof), the refusal is its own `503` while the database clock is still behind that instant, because signing in again cannot fix it (see below). With no SessionStore attached (a wiring fault: a serving process always has one) the
+  A degraded read is `503`; so is a binding trigger that is not observed in force, the session store's rebind guard
+  not in force, or an enrolled account whose factor generation is not positive (the answer cannot be
+  decided); a missing or future-dated proof is a step-up `401` for a local session. An OIDC session with no usable cached proof is refused earlier, `403` `mfa_proof_missing`, with one exception: when the cached anchor is empty because the stored proof is dated after the database clock (the replica that took the sign-in ran ahead of the database; the sign-in clamps the ID-token `iat` to that replica's own clock, so an identity provider running ahead cannot future-date the proof by itself; `derive_session_deadlines` drops such a proof), the refusal is its own `503` while the database clock is still behind that instant, because signing in again cannot fix it (see below). With no SessionStore attached (a wiring fault: a serving process always has one) the
   gate answers `503` and nothing is decided; the replica's wall clock never stands in for the database clock.
   Once the central check has passed (or with the window at `0`), a refusal for an unenrolled or proof-less caller is a `403`
   (`approver_assurance_required:mfa_not_enrolled`, `mfa_proof_missing`, `saml_mfa_unsupported`,
   `account_unavailable`), not a step-up prompt. These typed reasons are not all reachable in every configuration:
   `mfa_not_enrolled` is the one that is typed at every window, while at the default window `mfa_proof_missing`
   is typed only when `--mfa-enforcement` does not protect the role, and `saml_mfa_unsupported` and
-  `account_unavailable` are typed only with the window at `0` (`account_unavailable` also when the account disappears between two reads); a stale or pre-enrolment proof is the step-up `401`; and when the
-  approver rule's own read fails (an unreadable stored proof, or an MFA-store fault at its own read) the answer is a
-  `503` with `retry_after_ms` and `yuzu_auth_secret_unavailable_total{route="approval"}`. The clock-skew refusal is a separate outcome
+  `account_unavailable` are typed only with the window at `0` (`account_unavailable` also when the account disappears between two reads); a stale, missing, unbound or other-factor proof is the step-up `401`; and when the
+  approver rule's own read fails (an unreadable stored proof or an MFA-store fault at its own read) the answer is a
+  `503` with `retry_after_ms` 5000 and `yuzu_auth_secret_unavailable_total{route="approval"}`; the three causes that do
+  not clear by themselves (a binding trigger observed not in force, the session store's rebind guard latched not in force,
+  and an enrolled row whose factor generation is not positive) are the same `503` and counter but carry no
+  `retry_after_ms`, and their remediation points at the MFA binding enforcement runbook, because they persist until an
+  operator repairs the trigger or the account's MFA state (and restarts, for the triggers). An inconclusive trigger validation
+  (a catalog check that could not run) is not one of them: it latches `binding_inconclusive`, so every read reports the binding
+  not enforced until a later check returns Valid, the next read retries at once, and it keeps the transient answer (a reader that
+  arrives while the first inconclusive check is still in flight reads the previous state, a window bounded by one catalog query).
+  The clock-skew refusal is a separate outcome
   (`ApproverMfaOutcome::Kind::kProofClockSkew`): `503`, audit `result=error` with detail `approver_assurance:mfa_proof_clock_skew`, an A4
   error naming the database clock and a remediation to correct clock synchronisation, `retry_after_ms` null (the key is present), and no increment of the
   `route="approval"` counter, which stays a store-fault signal; the server logs an error line. A degraded durable-proof read is decided
@@ -1073,11 +1352,14 @@ the dashboard Approvals page (which posts to the same routes) and the MCP tools 
   with the window above `0` the central check answers first: the OIDC approver sees a repeating `401` step-up challenge, no `approval.*` skew row
   and no skew log line, and `yuzu_auth_mfa_step_up_gate_total{outcome="refused"}` rises. With the window above `0`
   the central check answers first for a SAML session (generic `403`), for a deleted or deactivated local account
-  (`401` `MFA step-up required`), for a stale proof (`401`, normally: the central
-  and approver windows are both 300 by default, so the ticket-specific `approver_assurance:mfa_proof_stale` row exists
-  only in the band of about a second between the central whole-second test and the approver millisecond ceiling, for
-  `proof_predates_enrolment`, or when the configured window exceeds 300) and for an unreadable local MFA store (`503`
-  without `retry_after_ms`, counted `route="mfa_stepup"`). Break-glass accounts get no exemption: they
+  (`401` `MFA step-up required`), for a stale, missing, unbound or other-factor
+  proof of a local session (`401`, with the reason token on its `mfa.step_up.required` row) and for an unreadable
+  stored proof, an unreadable local MFA store, an unenforced binding or a non-positive factor generation (`503`: `retry_after_ms` 5000 for a failed read, `null` for an unenforced binding or a non-positive factor generation, counted
+  `route="mfa_binding"` or `route="mfa_stepup"`). For a local session both gates apply the same millisecond
+  database-clock ceiling, so the ticket-specific `approver_assurance:mfa_proof_stale` row exists only when the
+  configured window exceeds 300 (or is `0` or less, where the central check is off); an OIDC session is still
+  judged by the central check on the cached anchor in whole seconds only, so for OIDC a band of about a second
+  remains between the central test and the approver's millisecond ceiling. Break-glass accounts get no exemption: they
   are enrolled by validation and are judged like any local account;
 - a **human principal**, never an engine principal;
 - a reviewer that is **not the submitter** (unchanged, enforced in `ApprovalManager`). The comparison is
@@ -1114,8 +1396,9 @@ Consequences, each deliberate:
   in #6098).
 - **`--mfa-step-up-window-secs=0` no longer lowers approval assurance.** The approver window is 300
   seconds when the setting is `0`, so approvals keep their enrolled-factor and fresh-proof requirement
-  while every other step-up endpoint is switched off. Decisions recorded before the upgrade (including
-  any made with the setting at `0`) gain no retroactive assurance; review them as described in
+  while the 39 `kRequired` step-up endpoints are switched off (the two `kFactorCredential` rows keep the same 300-second
+  window and their binding check). Decisions recorded before this control existed (including
+  any made with the setting at `0`) gain no retroactive assurance; see
   `docs/user-manual/upgrading.md`.
 - **A non-admin approver cannot enrol itself.** On the shipped default (RBAC enforcement off, `--mfa-enforcement=optional`)
   the only approvers are administrators and none is forced to enrol, so each administrator is refused
@@ -1130,55 +1413,64 @@ Consequences, each deliberate:
   in `AuthRoutes::require_permission` requires the `admin` role for `Approval:Approve`, so a non-admin
   is refused `403` "admin role required" before the MFA gate, and the enrolment paths achieve nothing
   until enforcement is turned on.
-- **Sessions ended when the CLI or Settings clears a factor (API tokens are not; the two steps are not atomic).** The
-  factor clear and the session delete are two separate database commits, so a failed delete or a process kill
-  between them leaves the factor cleared and the sessions live, and the direct-SQL fallback in the recovery runbook,
-  which clears the factor in one transaction and writes no audit row, is written to end the sessions in that
-  same transaction. Both paths audit a clear in two phases. An `attempted` intent row (`mfa.reset.breakglass` or
-  `mfa.disabled`) is written BEFORE the clear and fails closed: the CLI prints `error: audit store did not accept the
-  intent row; nothing was changed` and exits `1`, and Settings answers `503` with `Sec-Audit-Failed: true`, in
-  either case with nothing changed. The outcome row follows the work, so no factor is cleared unless the intent row
-  is durable (on the Settings route that relies on the audit store having opened and the audit writer being wired in, which
-  server boot requires; the CLI checks the write result directly) and an `attempted` row with no outcome row marks a clear that
-  was requested and whose outcome is unknown. The residual, until the clear and the session delete share one transaction, is the
-  loss of the outcome row (the process dies after the clear, or the outcome write fails after it): the factor is cleared, the
-  sessions may be live, and the `attempted` row has nothing after it; a process that dies before the clear leaves the same lone
-  row with the factor intact.
-  `yuzu-server --mfa-reset` deletes the account's durable
-  sessions in the same one-shot (`SessionStore::invalidate_user`, which bumps the generation so every
-  replica drops its cached copy), and exits non-zero if that fails; the outcome row is `success` with
-  `sessions_ended=<n>`, or `partial` with `sessions_ended=failed`. If its clear fails, no session is ended, the outcome row is
-  `error` and the command exits non-zero: the state is unknown, because the commit acknowledgement may have been lost
-  and the clear may have landed. Disabling MFA from Settings (`mfa_disable_report`) deletes EVERY session of the account, the caller's
-  included (`AuthManager::invalidate_user_sessions`, same generation bump), clears the cookie and sends the
-  browser to `/home`; the outcome row records `sessions_ended=<n>`, or result `partial` with
-  `sessions_ended=failed` when the durable delete failed (the factor stays cleared and the page has no retry
-  control: the Disable form exists only in the enrolled view, so an administrator ends the sessions with
-  `DELETE /api/v1/sessions?username=<name>` or `--mfa-reset`). When the clear itself fails the sessions are still ended (the had-a-verified-factor pre-image is
-  read from the clear's own row lock by `AuthDB::mfa_disable_report`, so an enrolment verified in between cannot be
-  missed, and a failed clear leaves it unknown, which counts as a verified factor), because the clear may
-  have committed with its acknowledgement lost (audit `error`, `disable failed (sessions_ended=<n>|failed)`; the user
-  is signed out when the delete succeeded, and when it also failed the page says the state is unknown and asks an
-  administrator to check the account and end its sessions);
-  cancelling an enrolment that was never verified ends none (audit `ok`, `no verified factor to clear`). The rows are
-  written through the session-bound audit writer, so the actor's principal, role and session are recorded even
-  though that session was just deleted. A lost Settings outcome row cannot undo the clear, so it is a server ERROR line and
-  the request completes; `--mfa-reset` instead exits non-zero when its outcome row cannot be written.
-  `sessions_ended` counts the durable session rows deleted, expired rows the reaper has not yet removed included.
-  Neither path ends API tokens. These are the only two production paths that clear a factor. The proof-versus-enrolment comparison above remains the second line: it assumes the
-  database primary clock does not step backward (ADR-2002 section 4 treats database clock integrity as
+- **Sessions ended when the CLI or Settings clears a factor (API tokens are not; one transaction, #6079 PR 2c).** `MfaDisableOwner`
+  (see "A sibling owner for the factor clear" above) commits the factor clear (secret, enrolment marker, replay
+  counter), the deletion of the account's recovery codes, the deletion of EVERY durable session of the account, the
+  session write-generation bump and the OUTCOME audit row in ONE database transaction: they all commit or all roll back,
+  and there is no compensating write. A clear whose session delete fails, or whose outcome row cannot be stored, rolls
+  back whole and leaves the factor as it was, so the older residual (a failed delete or a process kill between two
+  commits leaving the factor cleared with sessions live, or a cleared factor with no outcome row) no longer exists, and
+  neither path has a `partial` outcome. The generation bump makes every replica drop its cached copies of those sessions on its next
+  poll; the Settings path also drops this process's in-memory copies after the commit. Both paths still audit a clear in two phases. An `attempted`
+  intent row (`mfa.reset.breakglass` or `mfa.disabled`) is written FIRST, outside the transaction, and fails closed: the CLI
+  prints `error: audit store did not accept the intent row; nothing was changed` and exits `1`, and Settings answers `503`
+  with `Sec-Audit-Failed: true`, in either case with nothing changed. No factor is cleared unless the intent row is
+  durable (on the Settings route that relies on the audit store having opened and the audit writer being wired in, which
+  server boot requires; the CLI checks the write result directly). Because the outcome row now commits with the clear, an
+  `attempted` row with no outcome row means the clear did NOT commit and the factor is intact: the request was refused
+  or failed before the clear, the transaction rolled back, or the process died first (the database aborts a
+  transaction whose connection drops). The one indeterminate case is a connection lost exactly at COMMIT, where the
+  acknowledgement is lost: the transaction may have committed, and if it did the clear, the session delete and the
+  outcome row all landed together; the caller then reports a failure and says the account should be checked.
+  `yuzu-server --mfa-reset` opens a `SessionStore` (so the owner's session statements find their migrated tables) and
+  drives the owner directly with no expected generation, always ending the account's sessions. Its outcome row is
+  `success` with `sessions_ended=<n>`, written inside the transaction; every failure exits `1`, writes a best-effort `error` row
+  (the intent row already records that a clear was requested) and says nothing was changed: the session store did not
+  open, no active account at the clear, the audit store refused the outcome row, or the transaction rolled back
+  (the last also says to check the account's status and re-run, because of the COMMIT-loss case). The session-store,
+  owner-failure and outcome-row refusals also print the runbook's "Fallback: direct SQL" pointer as an extra stderr line after
+  the error line; the no-active-account refusal does not. Disabling MFA from Settings
+  (`POST /api/settings/mfa/disable`, through `AuthManager::commit_mfa_disable`) compares the factor generation the step-up gate admitted
+  under the `auth.users` row lock inside the same transaction, deletes EVERY session of the account, the caller's
+  included, clears the cookie and sends the browser to `/home`; the outcome row records `ok` with `sessions_ended=<n>`.
+  Cancelling an enrolment that was never verified clears no usable factor, so it ends no session and takes no
+  session write-generation lock: the row is `ok` with `no verified factor to clear` and the caller stays signed in.
+  A factor that changed after the gate admitted the request is refused `409` with nothing cleared and no session ended
+  (audit `denied`, `reason=factor_changed expected_gen=<n>`, written by the handler). A store fault, or an account that went
+  away mid-request (owner result `kStoreUnavailable` or `kNotFound`), answers `503` with `Retry-After: 5`, a toast saying MFA
+  may not have been changed and an `error` audit row with detail `disable failed` (written by the handler and, if it also fails
+  to store, logged only); nothing was changed except in the one indeterminate case, a connection lost exactly at COMMIT, which
+  can leave the clear committed (an `ok` row then sits beside the `error` row), and on that case this replica also drops its
+  cached sessions of the account. An outcome row the transaction could not insert (`kAuditUnavailable`) rolls the whole clear
+  back and answers `503` with `Sec-Audit-Failed: true`, nothing changed and NO `error` row, so only the lone `attempted` row
+  remains. Neither path calls `SessionStore::invalidate_user` any more, so neither is counted on
+  `yuzu_auth_session_store_degrade_total{op="invalidate_user"}`; their failures are the `503` / `error` rows and log lines (an
+  outcome-row refusal also moves `yuzu_server_audit_emit_failed_total`), and no replacement metric exists yet. The Settings intent, `denied` and `error` rows are written
+  through the session-bound audit writer, and the success row is built with the same identity builder inside the
+  transaction, so the actor's principal, role and session are recorded even though that session is deleted by the
+  clear. `sessions_ended` counts the durable session rows deleted, expired rows the reaper has not yet removed included.
+  Neither path ends API tokens. These are the only operator-initiated paths that clear an ENROLLED factor while leaving the account active (account deactivation clears it incidentally through `soft_delete_user_in_txn` and ends sessions in a separate step). The factor-generation comparison above remains the second line, and it reads no clock: a
+  database clock step cannot make a proof of a replaced factor match. The proof's age ceiling does rest on
+  the database primary clock not stepping backward (ADR-2002 section 4 treats database clock integrity as
   a security dependency; the shipped control is the `YuzuSessionReapClockAnomaly` alert, which fires only when a
   session reap pass declines: it sees a backward step only when it exceeds the time since the last accepted
   pass, about 15 minutes at most, and a forward step only when it exceeds about a year). The check is an admission boundary: a clearance committed before the read is honoured, one
   committed after it is seen from the next request, and the two session resolves on the route are not
   atomic.
-- **Mixed versions and rollback.** The enrolled-factor requirement is in force only while every replica
-  serving `/api/approvals/*` runs a build that has it; a replica without it still applies the weaker
-  rule. Rolling those replicas first shortens the exposure window; the gap closes only when approval traffic
-  reaches upgraded replicas only (pin or drain approvals), and stop-all, upgrade, start-all is the default
-  recommendation. Running more than one server replica is unsupported today (the safe-to-scale gate,
-  `docs/ha-delivery-matrix.md`), so this describes a rolling upgrade, not a supported deployment. Rolling back is a
-  security-policy downgrade. Endpoint agents are unaffected.
+- **Cutover.** The enrolled-factor requirement is a property of this build. This build is a hard
+  cutover: there is no upgrade, mixed-version or rollback path, and the rollout rules for the factor-generation
+  binding are listed in "Rollout and cutover" under "Factor-generation binding of MFA proofs" above.
+  Endpoint agents are unaffected.
 - **The gate decides at the gate instant.** The factor, role and session reads happen before the `attempted` audit
   row and the ticket update, and nothing holds them across those two writes. A factor clear, role change or session
   end that commits after the gate and before the ticket update does not undo that decision: the ticket is decided
@@ -2249,16 +2541,18 @@ applies to these two flags).
 ### MFA enforcement with SAML
 
 **MFA step-up is not supported for SAML sessions in this release.** A SAML
-session hitting any step-up-gated route (the 44 listed in the REST API
+session hitting any step-up-gated route (the 41 listed in the REST API
 reference under "Step-up envelope on high-risk endpoints": token, session,
 engine-principal and RBAC lifecycle, Guardian rule and guard writes, software
-deploy, approval approve/reject, user delete/role change, MFA recovery-code regeneration and disable,
-JIT elevation)
+deploy, approval approve/reject, user delete/role change, MFA recovery-code regeneration and disable),
+or any of the three JIT-elevation routes (44 routes in all; the elevation routes apply the same check in their own handler),
 receives a `403` with `"MFA step-up is not available for SAML sessions in this
 release"`, regardless of `--mfa-enforcement` mode (the one exception is a disabled window: with
-`--mfa-step-up-window-secs` at `0` or less, SAML sessions pass the 41 routes enforced by the
+`--mfa-step-up-window-secs` at `0` or less, SAML sessions pass the 39 `kRequired` routes enforced by the
 central check, but not the three JIT-elevation routes, which own their gate and substitute a
-300 s window, so those still deny SAML). Approval approve/reject are among the 41 central
+300 s window, so those still deny SAML, and not the two `kFactorCredential` rows, which refuse every
+non-local session whatever the window, with their own `403` `managing an account's second factor
+requires a local interactive session`). Approval approve/reject are among the 39 `kRequired` central
 routes, so with the window enabled the central check answers a SAML session first with this
 generic 403, and the handler never runs. They also carry their own, stricter approver gate
 (#6079), which refuses a SAML session in every configuration; the typed
@@ -2554,9 +2848,12 @@ the same audit behavior described below, not a silent no-op:
   account is already active (a retry after a failed mirror write signs the
   user out again). If that session removal does not persist, the call answers
   `500` and the account stays inactive. A sign-in after the reactivation is a
-  new sign-in, with one residual: a login whose first factor was verified
-  before the deactivation can still mint after the reactivation, because the
-  post-mint recheck compares only role, credential hash and active state.
+  new sign-in, with one residual: a login that carries no bound MFA proof,
+  whose first factor was verified before the deactivation, can still mint after
+  the reactivation, because the post-mint recheck compares the role, the
+  credential hash and the active state, and for a login whose bound MFA proof was earned
+  before the deactivation also the factor generation (a deactivation changes
+  it, so such a login is denied).
   Deactivation clears the TOTP secret and recovery codes, so a pending MFA
   login cannot complete unless the user re-enrols inside the pending window
   (`--mfa-login-pending-secs`, default 120).
@@ -3676,7 +3973,7 @@ counter registrations). Tests: `tests/unit/server/test_saml_scim_link.cpp`,
   - All IdP GETs go through one bounded primitive (`http_get_bounded`): 5 s per-operation timeouts and a total bound of 2 x that timeout, 10 s by default, from the start of the request, covering name resolution on Windows and on POSIX (Linux and macOS): there `resolve_host_addresses_status` runs the lookup on a detached worker through `bounded_resolve` (`bounded_resolver.hpp`) with an OIDC-owned pool (cap 16, gauge `yuzu_server_oidc_resolver_in_flight`) and the caller stops waiting at the per-lookup bound, so the IdP GETs, the check before the token-exchange POST connects (`exchange_code` -> `vet_egress_target`) and the one-time NAT64 probe lookup, and with them sign-in and Test Connection, are held to the 10 s figure (on a glibc build the OIDC name lookups could wait about 30 s past the intended 10 s bound; they now stop waiting at the bound). A lookup still running keeps its slot until the resolver returns, and a full pool fails closed at once as "the host name lookup was not started" instead of waiting, as does a name whose lookup was refused or timed out in the last 3 s (`HostLookupAdmission`, `resolver_host_admission.hpp`: at most 8 lookups outstanding per name and 64 names tracked, the count held by the lookup until the resolver returns; a refused name remembered for 3 s, at most 32 names, the refusal never extended, no success cached, the NAT64 probe exempt from both the limit and that memory, so only the pool's cap bounds it; the pool, the limit and the memory are per process, so per replica under high availability; discovery does not remember that refusal: the next attempt looks the name up again, where any other failed discovery arms the 30 s no-retry window). On Windows `resolve_host_addresses` runs its own overlapped `GetAddrInfoExW` lookup, canceled at that timeout rounded up to whole seconds, with up to 5 s more for the canceled lookup to complete; a lookup still not complete then is not freed (the OS may still write into it) but handed to a process-wide ledger that destroys it once its event is signaled, holds at most 16 such requests plus lookups in flight, and makes a new lookup fail closed with "the host name did not resolve" while 16 are stuck: `oidc_abandoned_ledger.hpp`), connect and the response; 256 KiB body cap, redirects not followed.
   - A watchdog thread shuts the socket down at that deadline, and again every 50 ms because a pre-connect shutdown does not persist on macOS (measured), so the bound also covers the TLS handshake, which httplib's own `set_max_timeout` does not. On POSIX the watchdog holds a descriptor it reserved before the client existed (an alias of the socket, made by dup2 from httplib's socket-options callback, so exhaustion fails the request closed with `request failed: no file descriptor available` rather than leaving it unwatched). On Windows it takes a private duplicate of the socket (`WSADuplicateSocketW`, so it never touches a socket number httplib may close and Windows may reuse), and a duplicate that cannot be taken fails the request closed with the same text; from the deadline it calls `CancelIoEx` on the duplicate and shuts the connection down every 50 ms, and after 10 such cuts (500 ms) closes the duplicate with `SO_LINGER` zero, an abortive close that resets the connection (the count restarts for each socket httplib hands it). httplib (0.37.1 and 0.59.0) waits with `WSAPoll` on Windows; the evidence for the cut is the end-to-end Windows drip test. Per-OS test provenance is in `docs/test-coverage.md`.
   - The token-exchange POST has per-operation timeouts only (10/15/15 s on Linux and macOS; Windows uses the WinHTTP defaults) and no total bound. Its response is capped at 256 KiB on every platform (on Windows the size of each chunk is checked against the remaining allowance before it is allocated), and the Windows request sets the WinHTTP redirect policy to never and accepts only HTTP status 200 (`WinHttpQueryHeaders`), so a 3xx answer fails the sign-in instead of being followed to an unchecked host or parsed as a token response.
-  - Every IdP-directed fetch is vetted first (`oidc_egress_policy.hpp`): the host is resolved, every address classified, and the connection pinned to a permitted address; the Windows token POST is only pre-checked, and because WinHTTP may pick any address of its own answer the pre-check is strict there: one refused address in a mixed answer refuses the request outright (the other paths pin the permitted member instead). DNS rebinding between the check and WinHTTP's own lookup is not covered there (it does not follow redirects). Classification also treats the non-global parts of `2001::/23` (Teredo `2001::/32`, benchmarking `2001:2::/48`, ORCHID `2001:10::/28`, the unallocated rest) as non-global, except the sub-ranges the IANA IPv6 special-purpose registry marks globally reachable (`2001:1::1`-`2001:1::3`, `2001:3::/32`, `2001:4:112::/48`, `2001:20::/28`, `2001:30::/28`). NAT64 prefixes learned from `ipv4only.arpa` are only ever added (union across answers, kept for the process lifetime; the TTL controls when to look again, never what is kept), at most 64: an answer that would exceed that is not installed partially, the fetch is refused with a fixed reason. A configured `--oidc-nat64-prefix` is trusted to describe a translator and may therefore permit a destination its own address class would otherwise gate; only the always-refused tier is immutable. Host names are ASCII only (`authority_well_formed` refuses a byte >= 0x80; an internationalized name is given as punycode), so the check and WinHTTP cannot be asked for different names. The process flag `--oidc-allow-private-networks` is the general private-network override (a configured NAT64 prefix has the classification exception above); see `docs/user-manual/authentication.md` "Network and trust".
+  - Every IdP-directed fetch is vetted first (`oidc_egress_policy.hpp`): the host is resolved, every address classified, and the connection pinned to a permitted address; the Windows token POST is only pre-checked, and because WinHTTP may pick any address of its own answer the pre-check is strict there: one refused address in a mixed answer refuses the request outright (the other paths pin the permitted member instead). DNS rebinding between the check and WinHTTP's own lookup is not covered there (it does not follow redirects). Classification also treats the non-global parts of `2001::/23` (Teredo `2001::/32`, benchmarking `2001:2::/48`, ORCHID `2001:10::/28`, the unallocated rest) as non-global, except the sub-ranges the IANA IPv6 special-purpose registry marks globally reachable (`2001:1::1`-`2001:1::3`, `2001:3::/32`, `2001:4:112::/48`, `2001:20::/28`, `2001:30::/28`). NAT64 prefixes learned from `ipv4only.arpa` are only ever added (union across answers, kept for the process lifetime; the TTL controls when to look again, never what is kept), at most 64: an answer that would exceed that is not installed partially, the fetch is refused with a fixed reason. A configured `--oidc-nat64-prefix` is trusted to describe a translator and may therefore permit a destination its own address class would otherwise gate; only the always-refused tier is immutable. SIIT (`::ffff:0:0:0/96`) and IPv4-compatible (`::/96`) addresses are classified by the embedded IPv4 address but never wider than non-global (`embeds_public_ipv4` makes the cleartext rule treat such a form of a public address as public), and a local-use NAT64 address (`64:ff9b:1::/48`) that no configured or learned prefix covers is refused in `vet_egress_target`, since it cannot be decoded. Host names are ASCII only (`authority_well_formed` refuses a byte >= 0x80; an internationalized name is given as punycode), so the check and WinHTTP cannot be asked for different names. The process flag `--oidc-allow-private-networks` is the general private-network override (a configured NAT64 prefix has the classification exception above); see `docs/user-manual/authentication.md` "Network and trust".
   - Exactly one thread fetches discovery at a time (the in-flight mark is cleared by an RAII guard on every exit) and any other caller that needs it fails fast; a failed attempt is remembered for 30 s and a success for the provider's lifetime. Signing keys are not cached: every verification calls `fetch_jwks_snapshot()` and works from the answer it just obtained, so a key the IdP stops publishing stops verifying at the next login (#1901 UP-19; a failed or non-JWKS answer is `kJwksUnavailable`, with no stale-key fallback; related: #1900, #5983), and a token naming a `kid` the key set lacks is refused rather than checked against another key, while a token with no `kid` is checked against each usable key in turn (at most the first 16, in the order published). An RSA key with a modulus under 2048 bits, or an exponent below 3, even or over 32 bits, is skipped at parse: defence in depth against a weak IdP key, not against a tampered JWKS. Provider swaps: a Settings save is serialized by `oidc_save_mu_` (stored-secret read, provider build, swap, persist), replaces the provider under the exclusive `oidc_mu_`, and retires the old one after the lock drops; `/auth/oidc/start` and `/auth/callback` hold a `Lease` (taken under the shared lock) instead of the lock, and the callback compares the published provider with its leased one right after `handle_callback` (lease still held, so the address cannot be reused) and refuses with audit reason `provider_replaced` before any group, role or session work.
   - Verified end to end against Keycloak 26.4.0 (Linux test host, plain `http` and `https` via a TLS-terminating proxy); Entra ID is supported by the standard but not verified by the project.
 - **AD/Entra integration** — Microsoft Graph API for user/group import.
@@ -5909,15 +6206,21 @@ OIDC/SAML's own post-mint recheck discloses, `docs/adr/2001-scim-oidc-identity-l
 "Known residuals").
 
 A denied mint is audited via `auth.login` `result=failure`,
-`detail=reason=session_mint_failed;cause=undifferentiated[;method=...]`
-(`auth_routes.cpp`) and counted in `yuzu_auth_login_session_mint_denied_total`
-— undifferentiated not just between a genuine role divergence and a
-post-mint store error, but also against a plain `SessionStore` persist
-failure (an ordinary availability event, unrelated to the role recheck at
-all), since `create_local_session`'s caller-facing contract (an empty
-string) collapses all three into one sentinel. Unlike the OIDC/SAML
-counters' genuine-vs-store-unavailable split, this counter is not a
-role-recheck-specific signal and must not be alerted on as one.
+`detail=reason=session_mint_failed;cause=<cause>[;method=...]`
+(`auth_routes.cpp`) and counted in `yuzu_auth_login_session_mint_denied_total`.
+The plain password sign-in (`POST /login`) still writes the literal
+`cause=undifferentiated` with no `method`: it does not receive the mint's
+denial, so a genuine role divergence, a post-mint store error and a plain
+`SessionStore` persist failure (an ordinary availability event, unrelated to
+the role recheck at all) all look the same there, since `create_local_session`'s
+empty-string return collapses them. The MFA mints (`POST /login/mfa`, with `method=password+totp` or
+`password+recovery`, and `POST /login/mfa/enroll`, with `method=password+totp-enroll`) pass the mint's `MintDenial` through
+`mint_denial_cause` and name the cause: `persist_failed`,
+`verification_future_dated`, `role_changed`, `credential_changed`,
+`factor_changed` or `recheck_unavailable` (`undifferentiated` only for a denial
+the mint did not name). Unlike the OIDC/SAML counters' genuine-vs-store-unavailable
+split, this counter is not a role-recheck-specific signal and must not be
+alerted on as one.
 
 ## RbacStore — the authorization substrate (Postgres, ADR-0041 — SQLite `rbac.db` retired)
 

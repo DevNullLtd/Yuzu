@@ -439,7 +439,7 @@ from those two settings, not an observed figure. Plan for these requirements:
   containment). Use addresses that stay the same (a virtual IP or fixed node addresses) for
   gateway-fronted fleets; if the addresses behind the name change, a quarantined agent
   cannot reach any node and cannot be released remotely.
-- **Management address.** The server reaches a gateway cluster's management plane (`:50063`) through one address, `--gateway-command-addr`. With several gateway nodes and that address naming one node, killing that node left the whole fleet undispatchable in two HA WS-13 spike runs although every agent had re-attached (a control run is still owed, #7051; what to configure instead is tracked in #7062). Until then, use the shape the spike exercised: one address in front of all the gateway nodes that passes TCP through without terminating TLS and is reachable only from the server hosts. Every node's management certificate must carry that name, because the server checks it against the address it dials, and every node must admit the server (the same management peer settings on each). The nodes must be clustered. Spike finding 10: some commands to re-attached agents were accepted and never delivered behind that address. A multi-address DNS name was not tried, and the server's management channel sets no keepalive.
+- **Management address.** The server reaches a gateway cluster's management plane (`:50063`) through one address, `--gateway-command-addr`. With several gateway nodes and that address naming one node, killing that node left the whole fleet undispatchable in two HA WS-13 spike runs although every agent had re-attached (a control run is still owed, #7051). Use the shape the spike exercised: one address in front of all the gateway nodes that passes TCP through without terminating TLS and is reachable only from the server hosts. Every node's management certificate must carry that name, because the server checks it against the address it dials, and every node must admit the server (the same management peer settings on each). The nodes must be clustered. Spike finding 10: some commands to re-attached agents were accepted and never delivered behind that address. A multi-address DNS name was not tried. The server's management channel now sends an HTTP/2 keepalive ping every 30 s, idle or not, and treats the node as down if it is not answered within 10 s (about 40 s to detect a node that stops answering without closing the connection); before this, such a node held every forward to its 300 s deadline. This is expected from the code, with a unit test that the keepalive arguments reach the channel-creation call (the last call into gRPC is checked by inspection), and has not been measured against a real silent-drop fault; a forward that fails this way is retried up to 3 times with the same command id, which the agent's dedup store makes effectively-once. It adds no second address and no failover: surviving a dead node still depends on the one address resolving to a live node. Decision (HA WS-13 slice 13.7, #7062): the supported shape is one name in front of all the gateway nodes, and a list of addresses in `--gateway-command-addr` is deferred until a spike measures it.
 - **A node that is up but has lost its server.** Failover does not cover this case. From
   the sources, the gateway acknowledges proxied heartbeats from its own node-local state
   whatever the state of its upstream (an unknown session gets `NOT_FOUND`), and the agent
@@ -862,11 +862,12 @@ and counts in `yuzu_server_gateway_route_desync_total` under the outcome named, 
 
 | Server WARN line (start) | Outcome | Event | Kind |
 |---|---|---|---|
-| `NotifyStreamStatus: CONNECTED for session ... refused — the directory read degraded and this replica holds no matching local session` | `connected_unverified` | CONNECTED | Transient: the route store could not be read; the same notification is accepted once it reads again |
+| `NotifyStreamStatus: CONNECTED for session ... (agent ...) refused — the directory read degraded; the gateway sends the notice again and it is accepted once the directory reads` | `connected_unverified` | CONNECTED | Transient: the route store could not be read; every CONNECTED is refused while it cannot, and the gateway's resend (#5695) is accepted once it reads again |
 | `NotifyStreamStatus: unknown session ... for agent ...` | `unknown_session` | both | Definitive for that session: the server lost its state or never saw the registration. For a live session the heartbeat verdict names it and the replay re-registers it |
 | `NotifyStreamStatus: CONNECTED for session ... but the directory names a different session — rejecting`, or `NotifyStreamStatus: CONNECTED for session ... is no longer the currently-installed session` | `stale_connected_session` | CONNECTED | Definitive: a newer registration owns the agent |
 | `NotifyStreamStatus: CONNECTED for agent ... claims cluster_id ..., which differs from this agent's already-bound cluster affinity` | `cluster_affinity_violation` (op `announce_connected`) | CONNECTED | Definitive until the cluster configuration is fixed |
 | `NotifyStreamStatus: CONNECTED for agent ... presents session ... that another agent's route already holds (#5683)` | `session_held_by_other_agent` (op `announce_connected`; audit `gateway.session_held_by_other_agent`; alert `YuzuGatewaySessionHeldByOtherAgent`) | CONNECTED | Definitive while the other agent's route holds the session, but the gateway cannot tell it from the others (the answer carries no reason, #6059), so it keeps resending for as long as it holds the session (at the ordinary retry cadence for the first 15 minutes, then in the slow phase at intervals of up to 10 minutes): the WARN and the audit row repeat with each resend, and the alert stays active, until the presenting agent's session ends at the gateway or the other agent's route releases the session id. See [Forged or colliding session ids](#forged-or-colliding-session-ids) |
+| `GatewayRouteStore session lookup: N session id(s) name a different agent in this replica's session map than in the directory; refused and listed for replay` | `agent_mismatch` (op `session_lookup`) | BatchHeartbeat, ProxyInventory | Self-resolving: the id is not acknowledged or ingested and the gateway replays `ProxyRegister`, which decides who holds the id (ProxyInventory refuses the report and logs its own line, `ProxyInventory: session ... names a different agent here than in the route directory; refusing`; the next BatchHeartbeat lists the id for replay). Not alerted. A persistent count means two replicas disagree about a session or the directory was edited by hand |
 
 A failed directory write is answered `true` by this server (the write is
 fail-open); a server change in review (#5961) answers it `UNAVAILABLE` instead,
@@ -1064,7 +1065,7 @@ an agent against the durable route directory in Postgres (batched reads of up to
 answer for it; a session the replica holds no local entry for is still ingested
 and is also reported in the `BatchHeartbeat` unknown-session list below. Run
 exactly one server replica until the HA safe-to-scale gate lifts
-([ADR-2002](../adr/2002-high-availability-architecture.md) section 7c).
+([ADR-2002](../adr/2002-high-availability-architecture.md) section 7c). With a second replica (unsupported), a `plugin_not_found` for a plugin an agent lacks is reported by a replica that does not hold the agent's session only for gateway-fronted agents, and only while the agent's route-directory row confirms it; otherwise the command is sent and the agent answers for itself (`yuzu_server_plugin_absence_confirm_total`).
 
 ### RPCs
 
@@ -1277,7 +1278,7 @@ This is the production shape, from `gateway/config/sys.config.prod` (comments sh
 | `auth_fun` | Management listener only: `fun(Der) -> {true, Id} \| true \| false`, run by the stream handler on the peer certificate before a handler exists. Needs `tls`. **Boot refuses an `auth_fun` on any listener that serves the agent service** (`auth_fun_on_agent_listener`), that is, whose `service_protos` include `agent_pb` **or** whose `services` map has `'yuzu.agent.v1.AgentService'` as a key (the management proto embeds the AgentService definition, so `service_protos` alone would miss it), including a combined agent-and-management listener that has one; a combined listener without an `auth_fun` is valid (the integration test uses one). That refusal and the boot and `/readyz` rule are two different tests: the refusal asks whether the entry *serves* the agent service by either route, while boot and `/readyz` require at least one entry that *routes* it (the `services` key). |
 | `origin` | Keys: `mode`, `sources`, `trusted_hops`. How the caller's address is decided; default `#{mode => transport}`. See [Client addresses behind a proxy](#client-addresses-behind-a-proxy). |
 | `acceptors` | Acceptor processes, a positive integer (default 4). `sys.config.prod` and the reference configs give the agent listener 32 for reconnect storms; the plaintext default, demo and UAT configs set nothing and so run 4. |
-| `http2` | Overrides of the Cowboy HTTP/2 options, by Cowboy's own option names; the options the layer owns and any unknown name are refused. Defaults: `idle_timeout` 600000 ms, `max_concurrent_streams` 1024, `max_frame_size_received` 16384, `linger_timeout` 1000, and, on a listener whose `services` map has `'yuzu.server.v1.ManagementService'` as a key (a combined agent-and-management listener included), `max_received_frame_rate` `{100000, 10000}`: 100000 received frames per 10 s. A listener that routes only the AgentService leaves `max_received_frame_rate` unset and so keeps Cowboy's own `{10000, 10000}`, the flood guard for the agents' unauthenticated connections. The management value is ten times Cowboy's because the server sends every command of a fan-out over its one connection to the management listener, at about 2 received frames per call: Cowboy's ceiling is about 5000 calls per 10 s, and past it Cowboy closes the whole connection with GOAWAY `enhance_your_calm` and every call in flight on it fails (`stream_error`). `{100000, 10000}` is about 5000 calls per second, far above the ~205 responses per second measured per server channel even with 8 channels to one gateway, and it is still finite. Raising `max_concurrent_streams` does not help: the ceiling counts frames, not streams. A listener that routes the `ManagementService` also defaults `max_concurrent_streams` to 4096 instead of 1024. The server sends each forwarded command as its own call over its one connection and queues the calls past the cap, so a fan-out takes about the agents' answer time or (agents x mean answer time / cap), whichever is longer. Measured over one loopback connection with 5,000 agents answering uniformly in 0 to 10 s: 30.7 s at 1024, 18.8 s at 2048, 11.9 s at 4096 and 10.1 s at 8192 (25,000 agents: 37.1 s at 4096, 21.7 s at 8192). 4096 brings 5,000 agents to within about 2 s of the answer time. It is not higher because the cap also bounds the memory the management connection can hold: each call in flight can have one response waiting to be written when agents answer faster than the server reads, and 5,000 answers of 256 KiB inside 1 s peaked at about 1 GB in the connection at 4096 and 1.2 GB at 8192. Past 5,000 agents per gateway, more server connections or one message per fan-out (#5956) is the way forward, not a larger cap. The measurement used a gun client that keeps at most the cap in flight, as the server's gRPC C++ client does; it was not repeated with the server itself. `sys.config.prod` and `deploy/docker/reference-gateway-sys.config` set `max_received_frame_rate => {100000, 10000}` and `max_concurrent_streams => 4096` on the management listener explicitly; every other shipped config gets them from the default. `sys.config.prod` and the reference configs set the agent listener's `idle_timeout` to 180000 because agents ping every 60 s (the 60 s default would race the ping) and `max_concurrent_streams` to 32. The shipped plaintext default, demo and UAT configs set neither and so inherit 600000 ms and 1024 streams. The management client does not ping, so it keeps ten minutes. |
+| `http2` | Overrides of the Cowboy HTTP/2 options, by Cowboy's own option names; the options the layer owns and any unknown name are refused. Defaults: `idle_timeout` 600000 ms, `max_concurrent_streams` 1024, `max_frame_size_received` 16384, `linger_timeout` 1000, and, on a listener whose `services` map has `'yuzu.server.v1.ManagementService'` as a key (a combined agent-and-management listener included), `max_received_frame_rate` `{100000, 10000}`: 100000 received frames per 10 s. A listener that routes only the AgentService leaves `max_received_frame_rate` unset and so keeps Cowboy's own `{10000, 10000}`, the flood guard for the agents' unauthenticated connections. The management value is ten times Cowboy's because the server sends every command of a fan-out over its one connection to the management listener, at about 2 received frames per call: Cowboy's ceiling is about 5000 calls per 10 s, and past it Cowboy closes the whole connection with GOAWAY `enhance_your_calm` and every call in flight on it fails (`stream_error`). `{100000, 10000}` is about 5000 calls per second, far above the ~205 responses per second measured per server channel even with 8 channels to one gateway, and it is still finite. Raising `max_concurrent_streams` does not help: the ceiling counts frames, not streams. A listener that routes the `ManagementService` also defaults `max_concurrent_streams` to 4096 instead of 1024. The server sends each forwarded command as its own call over its one connection and queues the calls past the cap, so a fan-out takes about the agents' answer time or (agents x mean answer time / cap), whichever is longer. Measured over one loopback connection with 5,000 agents answering uniformly in 0 to 10 s: 30.7 s at 1024, 18.8 s at 2048, 11.9 s at 4096 and 10.1 s at 8192 (25,000 agents: 37.1 s at 4096, 21.7 s at 8192). 4096 brings 5,000 agents to within about 2 s of the answer time. It is not higher because the cap also bounds the memory the management connection can hold: each call in flight can have one response waiting to be written when agents answer faster than the server reads, and 5,000 answers of 256 KiB inside 1 s peaked at about 1 GB in the connection at 4096 and 1.2 GB at 8192. Past 5,000 agents per gateway, more server connections or one message per fan-out (#5956) is the way forward, not a larger cap. The measurement used a gun client that keeps at most the cap in flight, as the server's gRPC C++ client does; it was not repeated with the server itself. `sys.config.prod` and `deploy/docker/reference-gateway-sys.config` set `max_received_frame_rate => {100000, 10000}` and `max_concurrent_streams => 4096` on the management listener explicitly; every other shipped config gets them from the default. `sys.config.prod` and the reference configs set the agent listener's `idle_timeout` to 180000 because agents ping every 60 s (the 60 s default would race the ping) and `max_concurrent_streams` to 32. The shipped plaintext default, demo and UAT configs set neither and so inherit 600000 ms and 1024 streams. The management client pings every 30 s, idle or not, so its connection never reaches the idle timeout. |
 | `limits` | Keys: `max_connections` (a positive integer or `infinity`, the default; the most simultaneous connections the listener holds, over which Ranch stops accepting until one closes), `max_message_bytes` (a positive integer, default 4194304), `send_timeout_ms` (a positive integer or `infinity`, default 30000), `max_connection_memory_bytes` (a positive integer at least 1048576, or `infinity`; default eight times `max_message_bytes`, i.e. 32 MiB for the 4 MiB default, except on a listener that routes the `ManagementService` and does not serve the agent service, where the default is no ceiling) and `request_timeout_ms` (a positive integer or `infinity`, default 30000). A request message larger than `max_message_bytes` is refused before it is buffered, but a message that fits is decoded in full, so a smaller `max_message_bytes` also bounds the memory one stream can make the gateway decode. `max_connection_memory_bytes` caps a single connection's memory (a `max_heap_size` on the Cowboy connection process that counts the refc buffers its streams hold); a connection that buffers more than this of half-finished requests is killed by the VM and the kill is counted in `yuzu_gw_grpc_connection_killed_total`. The VM checks the ceiling when the connection collects its garbage and counts the binaries that are already dead, so the default is sized from what one well-behaved connection was measured to reach, not from the bytes in flight alone: one message of `max_message_bytes` costs the connection three times its size at its peak (the received chunks, the joined message and the decoded request) plus under 1 MiB, so the 32 MiB default lets two full-size messages complete at once with room to spare and kills a peer holding half-sent full-size streams at about the eighth. Do not set it below about four times `max_message_bytes`: an agent sending one full-size message can then be killed. The ceiling also counts the responses waiting to be written, which is why the management listener has none by default: its one peer is the pinned server sending a whole fan-out over one connection, and when the agents answered together with large responses the ceiling (then 16 MiB, equal to Cowboy's own 16 MB output-buffer alarm) killed that connection, and every call on it, before Cowboy's backpressure could act. Without it, Cowboy's buffer alarm paces the senders and the connection holds about 16 MB plus one response per stream in flight; set `max_connection_memory_bytes` on the management listener to keep a hard cap anyway. A combined agent-and-management listener serves anonymous agents and keeps the ceiling. `request_timeout_ms` is how long a unary or server-streaming stream may buffer its one request before it is aborted `DEADLINE_EXCEEDED` (counted in `yuzu_gw_grpc_recv_timeout_total`) and its buffer dropped; it never cuts a bidirectional or client-streaming handler (an agent's long-lived `Subscribe`), which runs before any message, and a `grpc-timeout` the client sent runs alongside it with the earlier of the two winning. The gateway ends a call that carries a `grpc-timeout` with `DEADLINE_EXCEEDED` a tenth of that timeout early, at most 1 s early (299 s for the server's 300 s calls), so the client receives the status before its own deadline instead of resetting the stream: when thousands of the server's calls expire together, their resets exceed Cowboy's `max_cancel_stream_rate` (500 per 10 s) and Cowboy closes the whole management connection. Tested with a gun client; that the server's gRPC C++ client then sends no reset is standard gRPC behaviour but was not observed against the server. Together these two bound an unauthenticated peer that opens streams and stalls them half-sent (see "Connection ceilings and the unauthenticated ports" below). `max_connections` bounds the file descriptors a listener's connections can take. It is **not protection against a hostile peer**: see that same section for what it does and does not do on each listener. `sys.config.prod`, the reference configs and the packaged release config (`gateway/config/sys.config`, the one the release packages and the systemd unit run) set `max_connections => 60000` on the agent listener (the systemd unit's `LimitNOFILE` of 65536 less about 5500 of headroom for the upstream channel, the health and metrics ports, the management listener, Erlang distribution and files, so it holds to a fleet of about 30000 agents; raise it together with `LimitNOFILE` and keep about 5500 below it, lower it if the limit is lower) and `max_connections => 256` on the management listener. Both set `max_message_bytes => 4194304` explicitly, which is the default and gRPC's default receive limit: it is not lowered on the agent listener because an agent's installed-software inventory blob may be 3 MiB by design. The agent listener also sets `max_connection_memory_bytes => 33554432` and `request_timeout_ms => 30000` explicitly (both the defaults). The demo and UAT configs set no `limits`, so `max_connections` is `infinity` there, but the memory ceiling and request deadline still apply at their defaults. Size the file-descriptor limit for the listener's `max_connections` plus the other sockets (about 1.5 to 2 times the agent count plus 200 in use). |
 
 **Connection ceilings and the unauthenticated ports (known residual risk).**
@@ -3370,12 +3371,67 @@ Supply it at boot from the `YUZU_GW_COOKIE` environment variable:
 export YUZU_GW_COOKIE="$(openssl rand -hex 32)"   # strong, unique per cluster
 ```
 
-If `YUZU_GW_COOKIE` is unset, `vm.args.src` falls back to the historical
-default and the boot guard (`yuzu_gw_app:check_distribution_cookie/0`)
-**refuses to start** — it fails closed, because a known cookie is
-unauthenticated RCE (#659). For local dev/CI where distribution is not
-exposed, override the guard with `YUZU_GW_ALLOW_DEFAULT_COOKIE=1`. All nodes
-in a cluster must share the same cookie.
+`vm.args.src` carries **no fallback cookie**. A cookie committed to the
+repository is unauthenticated RCE (#659), and the in-VM boot guard
+(`yuzu_gw_app:check_distribution_cookie/0`) only runs after distribution is
+already listening, so the refusal is made **before the VM starts**. One shell
+policy, `deploy/docker/gateway-cookie-policy.sh` (installed as
+`/opt/yuzu_gw/gateway-cookie-policy.sh`), is shared by both callers: the cookie
+must be 32 to 255 characters from `[A-Za-z0-9._~+=-]`, must not start with `-`
+or `+`, and must not be the published default. (Whitespace, CR/LF, backslash,
+`&` and `$` are refused: busybox and GNU awk disagree on a backslash, so
+replicas would compute different cookies, and a `\&` makes the release start
+script loop forever.)
+
+- The container entrypoint (`deploy/docker/gateway-entrypoint.sh`) exits 1 with
+  the reason when the cookie breaks the policy.
+- The systemd unit refuses the same in an `ExecStartPre`, with **no override**.
+- `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` (single ephemeral dev/CI node only) does not
+  restore a known cookie: when the cookie is empty or *exactly* the published
+  default, the entrypoint substitutes a fresh random per-boot cookie that is never
+  logged. The override replaces nothing else: a custom cookie that is shorter
+  than 32 characters, or that **starts with** the published literal, is refused
+  like any other weak cookie. A real shared cookie that contains the literal
+  elsewhere is kept, so replicas still agree. **N replicas on the override are N singletons that cannot
+  cluster** (each draws its own cookie). A node advertising `127.0.0.1` (the
+  single-node default) also has its distribution listener and EPMD bound to
+  loopback; a node advertising a routable address is protected by the random
+  cookie only.
+- **Tarball / manual installs:** the unit needs `/opt/yuzu_gw/gateway-cookie-policy.sh`.
+  The release tarball ships it (and `yuzu-gateway.service`) inside its single
+  top-level directory `yuzu-gateway-<version>-linux-x64/`, so extract it with
+  `mkdir -p /opt/yuzu_gw && tar xzf yuzu-gateway-linux-x64.tar.gz -C /opt/yuzu_gw --strip-components=1`
+  and install the bundled unit to `/etc/systemd/system/` (then `systemctl daemon-reload`)
+  (or copy `deploy/docker/gateway-cookie-policy.sh` from the source tree into
+  `/opt/yuzu_gw/`). If it is missing the unit fails with
+  `.: cannot open /opt/yuzu_gw/gateway-cookie-policy.sh: No such file` (exit 2)
+  and, after the restart limit, `start-limit-hit`.
+- A start that bypasses both (running `bin/yuzu_gw` by hand, the
+  `Dockerfile.gateway.chisel` demo image, which has no entrypoint) boots with
+  OTP's own per-host random `~/.erlang.cookie` (the empty `-setcookie` line that
+  `vm.args.src` leaves when `YUZU_GW_COOKIE` is unset is accepted by the VM, which
+  creates that 20-character file, mode 0400, and uses it; checked against a real
+  release boot and by case V of `tests/shell/test_gateway_entrypoint_cookie.sh`),
+  which the in-VM guard then refuses (too short) unless the override is set. If `$HOME` is unwritable the VM
+  cannot create that file and crash-loops; supply `YUZU_GW_COOKIE`. On these
+  paths there is also no character check: a cookie containing `\&` makes the
+  release script's `replace_os_vars` awk loop forever at 100% CPU with no log, and
+  a backslash is dropped by busybox awk but kept by GNU awk. Keep `YUZU_GW_COOKIE`
+  to `[A-Za-z0-9._~+=-]` there too.
+
+All nodes in a cluster must share the same `YUZU_GW_COOKIE`. A single-node
+deployment sets either a strong cookie, or `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` for
+a throwaway rig.
+
+**Distribution is not encrypted.** Erlang distribution here is plain TCP: the
+cookie authenticates the connection handshake only, it gives no confidentiality
+or per-message integrity. Cross-node command traffic (including plugin
+parameters) therefore must only cross a network you trust. Keep EPMD and the
+distribution range on a dedicated cluster network and firewalled to the other
+gateway nodes. There is no encryption and the cluster network must be trusted and
+firewalled; TLS distribution (`-proto_dist inet_tls`) is not shipped and is
+tracked as #8158 (decision pending; owner: Fraser Jarvis; review by 2027-02-17). Do not run
+a multi-node gateway cluster across an untrusted network.
 
 The same guard also **refuses a cookie shorter than 32 characters** (HA WS-4
 `#4555`): DNS-based cluster discovery means a node dials addresses it did not
@@ -3383,8 +3439,15 @@ choose by hand, and the distribution handshake's initiator sends the cookie
 hash first — a short cookie is brute-forceable offline from a
 legitimately-dialing node, a materially different exposure than a hand-typed
 static seed list carried. `openssl rand -hex 32` above already clears this
-floor with room to spare; the same `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` override
-bypasses the length check too.
+floor with room to spare. The in-VM guard
+(`yuzu_gw_app:evaluate_cookie`) under `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` tolerates
+an **empty, short, exactly-default or literal-containing** cookie on an
+entrypoint-less start (`docker run --entrypoint`, a hand-run `bin/yuzu_gw`, the
+chisel image). The container entrypoint is stricter, and the systemd unit has no
+override: the entrypoint replaces only an empty or exactly-default cookie and
+refuses a short cookie or one that starts with the literal even with the
+override. A unit test pins the in-VM tolerance, so changing it is a visible
+decision.
 
 **Firewall ports for multi-node clustering (HA WS-4 `#4555`).** Alongside
 EPMD (TCP 4369, above), a clustered gateway also needs the Erlang
@@ -3407,8 +3470,9 @@ network is still the first line of defense.
 > at 0 is the signal to check for this. AAAA support is tracked as a
 > follow-up.
 
-> **Never set `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` in production.** It disables the
-> boot guard and restores the unauthenticated inter-node RPC surface (#659); it
+> **Never set `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` in production.** It lets a node
+> start without an operator-supplied cookie (a random per-boot one is used by the
+> entrypoint; the in-VM guard only warns for a start that bypasses the entrypoint); it
 > exists only for ephemeral dev/CI stacks (where it appears in the UAT compose
 > files). On `.deb`/`.rpm` installs the cookie is auto-generated into
 > `/etc/yuzu/gateway.env`. **Rotate** it by writing a new value there — and to
@@ -3905,8 +3969,8 @@ failures now count toward the shared breaker (see below).
   record a notification"); an older gateway ignores `acknowledged=false` and does
   not retry. The server counts it under
   `yuzu_server_gateway_route_desync_total{op="notify_stream_status"}` with
-  outcome `connected_unverified` (the directory read failed and this replica
-  holds no matching local session) or `stale_connected_session` (the directory
+  outcome `connected_unverified` (the directory read failed; a CONNECTED is never
+  accepted unverified, whatever this replica holds locally) or `stale_connected_session` (the directory
   row or the local registry names a different session). The same holds for the
   `op="announce_connected"` refusals `session_held_by_other_agent` and the
   affinity pre-check `cluster_affinity_violation`, which answer
@@ -4386,21 +4450,26 @@ that the replica does not hold is neither acknowledged nor listed (so the
 gateway does not re-register in a storm). `ProxyInventory` for a session id the
 directory does not know keeps `received=false` (the agent retries); a local
 hint helps only on a degraded read or for a session that lost a race.
-`NotifyStreamStatus` CONNECTED, when the directory read fails, is accepted only
-if this replica holds the matching local session (the session it registered
-for that agent, which the directory confirmed at `ProxyRegister`), and is
-otherwise rejected (`acknowledged=false`) and counted under
+`NotifyStreamStatus` CONNECTED, when the directory read fails, is always
+rejected (`acknowledged=false`), whatever session this replica holds locally,
+and counted under
 `yuzu_server_gateway_route_desync_total{op="notify_stream_status",outcome="connected_unverified"}`.
-A delayed CONNECTED for a session this replica has since superseded is counted
-the same way (a successful read counts it as `stale_connected_session`).
+A replica cannot tell from its own state whether another replica has since
+registered the agent again, so it does not guess. A successful read counts a
+delayed CONNECTED for a session this replica has since superseded as
+`stale_connected_session`.
 `yuzu_gw_upstream_notify_dropped_total` does not count a rejected CONNECTED.
 A gateway that includes #5695 counts it in
 `yuzu_gw_upstream_notify_unacknowledged_total{event="connected"}` and sends it
 again after a backoff while it holds the session, so a `connected_unverified`
 rejection is put right once the directory reads again (see "When the server
-does not record a notification"). An older gateway does not retry it: that
-server counter is then the only signal, and an agent whose current session was
-rejected keeps heartbeating but cannot receive commands until it reconnects. When the read succeeds, the local fallback applies only if
+does not record a notification"). Until then the agent keeps heartbeating but
+is not dispatchable from that replica, for the outage plus up to 60 s (the
+gateway's resend backoff cap), or up to 10 minutes once the refusal has lasted
+15 minutes (the gateway's slow phase, "When the server does not record a
+notification"); both are derived from the documented backoff, not measured. An older gateway does not retry it: that
+server counter is then the only signal, and the agent cannot receive commands
+until it reconnects. When the read succeeds, the local fallback applies only if
 the directory row is absent or tombstoned, or the session is one this replica
 recorded as having lost a race; a row with a different session id rejects the
 CONNECTED (`stale_connected_session`). A DISCONNECTED proceeds on the local

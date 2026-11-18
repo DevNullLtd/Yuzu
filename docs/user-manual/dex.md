@@ -1,5 +1,9 @@
 # DEX — Digital Employee Experience
 
+For a guided tour of every DEX capability, with the collectors and plugins behind
+each one and how the dashboard, REST API and MCP surfaces work, start at the
+[DEX guide](../dex/README.md).
+
 The **DEX dashboard** (`/dex`) is a read-only fleet-reliability lens over the
 Guardian event store. It reinterprets ruleless [signal observations](guaranteed-state.md#dex-signal-observations)
 — app crashes and hangs, service failures, device stability, boot/resume
@@ -376,7 +380,7 @@ drill. It is **device / local-link health**, not localization: a bad local link
 (Wi-Fi, congested uplink) shows up cleanly across every connection, but *which*
 destination or app is affected is a later per-destination slice. Linux agents
 report all three metrics; Windows reports throughput and retransmit rate (RTT
-deferred — needs ESTATS); macOS is a later slice. Full detail,
+deferred — needs ESTATS); macOS reports throughput only. Full detail,
 platform coverage, and the privacy model are on the
 [Network quality dashboard](network.md) page.
 
@@ -648,6 +652,13 @@ does (agentic-first parity):
   names devices fleet-wide.
 - **`GET /api/v1/dex/apps?window=&platform=`**, the application stability list (a distinct
   device count per application, no `agent_id`; not audited).
+- **`GET /api/v1/dex/apps/usage?window=&platform=&slice=&group=&tag_key=&floor=`**, fleet usage per
+  application: for each application on the Apps list, the devices that ran it, its run time and
+  launches over a 30-day basis and its crashes and hangs per hour of use, marked as estimated. It
+  needs `Forensics:Read` as well as `GuaranteedState:Read` (administrators only while RBAC is off) and
+  is audited fail-closed as `dex.apps.usage.view` once its parameters validate. The device floor applies per table only. No
+  agent ids appear. It is REST only for now: there is no MCP tool and no dashboard view yet. See
+  [app usage](../dex/app-usage.md#fleet-usage-per-application).
 - **`GET /api/v1/dex/catalogue?os=&window=`**, the Catalogue family cards, fleet
   coverage and the uncatalogued list, and **`GET /api/v1/dex/catalogue/group?name=&os=&window=`**,
   one signal family's member signals (404 for an unknown family). Aggregates, not
@@ -709,7 +720,7 @@ version-row devices drill has its own MCP twin `list_dex_app_perf_devices`
 per-device app-perf drill is exposed via REST, the dashboard device drill
 (the "Application performance over time" panel) and the MCP tool
 `get_dex_device_app_perf` (all three write the same `dex.device.app_perf.view`
-audit). Full request/response
+audit). Fleet application usage (`GET /api/v1/dex/apps/usage`) has no MCP tool yet. Full request/response
 shapes are in [`rest-api.md`](rest-api.md#dex-digital-employee-experience) and
 `GET /api/v1/openapi.json`.
 
@@ -853,14 +864,16 @@ exported to Prometheus — reach those via the REST endpoints on demand.
 ## Turning it off
 
 DEX collection is a **deploy-time agent setting**. Start the agent with
-**`--dex-disable`** (or `YUZU_AGENT_DEX_DISABLE=1`) and that endpoint arms no
-observer and sends no DEX telemetry of any kind. **Note:** `--dex-disable` turns
-off the DEX event observer, the Windows state poll, and the heartbeat perf
-tags (the fleet rollup above), but the Echo performance
-sampler is a separate subsystem — disable it with `perf_enabled=false` (see
-[Echo configuration](echo.md#configuration)). There is no server-side runtime
-toggle today; per-category collection toggles and an individual-view kill switch
-are named roadmap items (see the enterprise-readiness plan).
+**`--dex-disable`** (or `YUZU_AGENT_DEX_DISABLE=1`) and that endpoint stops four
+things: it arms no DEX observer (so no Windows, Linux or macOS signal collector
+runs), and it sends no observer health tags, heartbeat performance tags or
+heartbeat network-quality tags (the fleet rollup above). **Note:** Echo is a
+separate subsystem and keeps running, and so does the daily sync of
+per-application figures. The Echo performance sampler is disabled with
+`perf_enabled=false` (see [Echo configuration](echo.md#configuration)); the
+[DEX guide](../dex/collectors-and-plugins.md#what---dex-disable-stops) lists
+what each switch stops. There is no server-side runtime
+toggle and no per-category toggle.
 
 ## No mock data
 
@@ -887,6 +900,8 @@ follow-up). The Guardian event store and rules are unaffected by this operation.
 
 ## Related documentation
 
+- [DEX guide](../dex/README.md) — one page per DEX area, the collectors and
+  plugins behind them, and the dashboard / REST / MCP surface map.
 - [Guaranteed State (Guardian)](guaranteed-state.md) — the underlying event
   store, the observer, and `--dex-disable`.
 - [`docs/dex-signal-catalog.md`](../dex-signal-catalog.md) — the full

@@ -1515,8 +1515,13 @@ constexpr char kDashJs8[] = R"HTM(
         body: form.toString()
       }).then(function(resp) {
         if (!resp.ok) {
-          alert('MFA step-up failed — verify your code and try again.');
-          return;
+          /* 503: the server names the cause (the code was not checked, or it was spent and
+             could not be recorded), so show its own message rather than guess. */
+          var fallback = 'MFA step-up failed: verify your code and try again.';
+          if (resp.status !== 503) { alert(fallback); return; }
+          return resp.json().then(function(b) {
+            alert((b && b.error && typeof b.error.message === 'string' && b.error.message) || fallback);
+          }, function() { alert(fallback); });
         }
         /* Replay the original request via htmx.ajax. The original
            triggering element is in evt.detail.elt; pass it as the

@@ -27,7 +27,7 @@ Each capability is rated on two axes:
 | Default | As shipped | Row | Issue |
 |---|---|---|---|
 | RBAC | RBAC ships disabled (`rbac_store.cpp` seeds `rbac_enabled='false'`), so the legacy admin/user model is in force until an administrator enables it. | §18.2 | — |
-| MFA step-up | Step-up is enforced on 41 `kRequired` REST/dashboard routes only; 73 `kPendingRuling` routes and every MCP tool are not step-up gated. | §18.10 | — |
+| MFA step-up | Step-up is enforced on 41 REST/dashboard routes only (39 `kRequired` and 2 `kFactorCredential`); 73 `kPendingRuling` routes and every MCP tool are not step-up gated. | §18.10 | — |
 | Gateway agent listener | Every gateway release artefact (tarball, .deb/.rpm, both GHCR images) serves `:50051` in plaintext on `0.0.0.0` with no boot guard; TLS is only in `sys.config.prod` and the docker reference config. | §37.5 | #6598 |
 | Plugin signatures | An unsigned plugin loads on a default agent install, because the trust bundle and `--plugin-require-signature` both default off. | §24.1 | #4915 |
 | Gateway management-plane CRL | The CRL check is opt-in: `gateway/config/sys.config.prod` sets no `mgmt_crl_source`, so withdrawal is the serial deny-list plus a restart. | §37.7 | — |
@@ -44,8 +44,8 @@ Each capability is rated on two axes:
 > outside its own domain, and each entry counts once against its `T1`/`T2`/`T3` tier label.
 > Reproduce with:
 > `awk '/^### [0-9]+\.[0-9]+/ { if ($0 ~ /:white_check_mark:/) d++; else if ($0 ~ /:large_orange_diamond:/) p++; else if ($0 ~ /:x:/) n++ } END { print d, p, n, d+p+n }' docs/capability-map.md`
-> → `223 49 51 323`. Tier tallies (`Foundation`=T1, `Advanced`=T2, `Future`=T3) add the same
-> awk pattern filtered on `` `T1` ``/`` `T2` ``/`` `T3` `` → T1 `55 2 2 59`, T2 `156 34 28 218`,
+> → `223 50 51 324`. Tier tallies (`Foundation`=T1, `Advanced`=T2, `Future`=T3) add the same
+> awk pattern filtered on `` `T1` ``/`` `T2` ``/`` `T3` `` → T1 `55 2 2 59`, T2 `156 35 28 219`,
 > T3 `12 13 21 46`.
 > **v4.1 re-verification (2026-11-14).** A row-by-row audit of this file against the code (taken
 > at dev @ 54c5c2b37, 2026-11-13) was applied here and its claims re-checked against the code at
@@ -67,10 +67,10 @@ Each capability is rated on two axes:
 
 ```
 Foundation   [==============================--]  55/59 done  (93%) (2 partial)
-Advanced     [=======================---------]  156/218 done  (72%) (34 partial)
+Advanced     [=======================---------]  156/219 done  (71%) (35 partial)
 Future       [========------------------------]  12/46 done  (26%) (13 partial)
 ─────────────────────────────────────────────────────────────────
-Overall      [======================----------]  223/323 done  (69%) (49 partial)
+Overall      [======================----------]  223/324 done  (69%) (50 partial)
 ```
 
 | Domain | Total | Done | Partial | Not Started |
@@ -117,8 +117,8 @@ Overall      [======================----------]  223/323 done  (69%) (49 partial
 | **Subtotal (domains 1–39)** | **300** | **217** | **40** | **43** |
 | 40. Reflex — Agent-Local Automated Response | 4 | 0 | 0 | 4 |
 | 41. Cryptographic Asset Inventory | 8 | 2 | 2 | 4 |
-| 42. Endpoint Security Posture | 11 | 4 | 7 | 0 |
-| **TOTAL** | **323** | **223** | **49** | **51** |
+| 42. Endpoint Security Posture | 12 | 4 | 8 | 0 |
+| **TOTAL** | **324** | **223** | **50** | **51** |
 
 > **Scaffolded vs production-quality.** The percentages above measure feature presence, not enterprise hardening. "Done" means "implemented and functional" — not "hardened, observable, and proven at large-fleet scale" on every domain. Known gaps at the §-level (e.g. configurable heartbeat in §1.2, unified diagnostics bundle in §1.3, runtime plugin install in §1.5) remain even where a domain is marked Done. The `docs/capability-agentic-audit-2026-05.md` audit (figures as of 2026-05 — its counts predate this v4.1 tally) is the source for the production-quality dimension; subsequent reviews should keep it current.
 
@@ -627,7 +627,7 @@ collisions possible; vendor precision pending ADR-0018). See
 
 ### 9.6 Device Quarantine (Network Isolation) :white_check_mark: `T2`
 
-`quarantine` plugin (cross-platform). `quarantine` action isolates device from network, whitelisting management server and optional IPs via firewall rules (prefixed `YuzuQuarantine_`). `unquarantine` removes rules and restores access. `status` checks active quarantine state. `whitelist` adds/removes IPs from active quarantine. Server side (ADR-0047): the containment gate in the shared dispatch path (`dispatch_confined_arms.hpp`), the `QuarantineContainmentReconciler` and the stored-whitelist re-dispatch (`quarantine_reapply.hpp`) are shipped; a degraded containment read fails closed. *(Evidence: `server/core/src/quarantine_containment_reconciler.{hpp,cpp}`, `quarantine_reapply.{hpp,cpp}`.)*
+The `firewall` plugin's four containment actions (cross-platform). `quarantine` isolates a device from the network, allowing the management server and optional exceptions, through an own rule group, table or anchor. `release` removes the rules and restores access. `quarantine_status` reports whether containment is in force. `quarantine_allow` adds or removes exceptions on an active quarantine. Server side (ADR-0047): the containment gate in the shared dispatch path (`dispatch_confined_arms.hpp`), the `QuarantineContainmentReconciler` and the stored-whitelist re-dispatch (`quarantine_reapply.hpp`) are shipped; a degraded containment read fails closed. *(Evidence: `server/core/src/quarantine_containment_reconciler.{hpp,cpp}`, `quarantine_reapply.{hpp,cpp}`.)*
 
 ### 9.7 Indicator of Compromise (IOC) Checking :large_orange_diamond: `T2` *(verified 2026-11-14)*
 
@@ -981,7 +981,7 @@ Session-cookie auth with PBKDF2-hashed passwords.
 
 ### 18.10 Two-Factor Authentication :white_check_mark: `T2` *(verified 2026-09-07)*
 
-Shipped (SOC 2 CC6.6 privileged-access MFA ladder). RFC 6238 TOTP + RFC 4648 base32 + `otpauth://` URI builder (`totp.cpp`), per-user enrolment with QR code (`mfa_qr.cpp`), and a step-up gate (`mfa_step_up.cpp`) that blocks high-risk REST/Settings handlers unless `Session::mfa_verified_at` is fresh within `mfa_step_up_window_secs` - API-token/MCP-token principals skip step-up by design (the bearer credential is the step-up moment). Retitled from "...for Approvals" - the shipped scope is login-time TOTP + step-up on privileged handlers generally. The instruction-approval workflow (#285) is now covered as well: approve/reject require an interactive session and an enrolled MFA factor with a fresh proof (#6061, #6079), under their own stricter rule on top of the generic gate. Email-based OTP fallback not found; scope narrower than the original row's aspiration in that respect. The step-up check is now one central chokepoint (`step_up_gate.cpp`, table `step_up_policy.hpp`) enforcing 41 named REST/dashboard routes; it is REST/dashboard only, so MCP tools and the 73 routes still classified `kPendingRuling` are not step-up gated (`docs/auth-architecture.md` "MFA step-up chokepoint"). An MCP step-up table exists (`step_up_mcp_policy.hpp`) but is data only: no production code consults it. **A SAML session cannot satisfy step-up** — it is refused `403` at every step-up-gated route, approvals included (`saml_mfa_unsupported`, #4935), unless the window is disabled; SAML deployments rely on IdP MFA. *(Evidence: `server/core/src/totp.{hpp,cpp}`, `mfa_qr.{hpp,cpp}`, `mfa_step_up.{hpp,cpp}`; verified 2026-09-07 - previously mis-graded Not Started.)*
+Shipped (SOC 2 CC6.6 privileged-access MFA ladder). RFC 6238 TOTP + RFC 4648 base32 + `otpauth://` URI builder (`totp.cpp`), per-user enrolment with QR code (`mfa_qr.cpp`), and a step-up gate (`mfa_step_up.cpp`) that blocks high-risk REST/Settings handlers unless `Session::mfa_verified_at` is fresh within `mfa_step_up_window_secs` - API-token/MCP-token principals pass step-up on the 39 ordinary rows by design (the bearer credential is the step-up moment; the two factor-credential rows refuse them). Retitled from "...for Approvals" - the shipped scope is login-time TOTP + step-up on privileged handlers generally. The instruction-approval workflow (#285) is now covered as well: approve/reject require an interactive session and an enrolled MFA factor with a fresh proof (#6061, #6079), under their own stricter rule on top of the generic gate. Email-based OTP fallback not found; scope narrower than the original row's aspiration in that respect. The step-up check is now one central chokepoint (`step_up_gate.cpp`, table `step_up_policy.hpp`) enforcing 41 named REST/dashboard routes; it is REST/dashboard only, so MCP tools and the 73 routes still classified `kPendingRuling` are not step-up gated (`docs/auth-architecture.md` "MFA step-up chokepoint"). An MCP step-up table exists (`step_up_mcp_policy.hpp`) but is data only: no production code consults it. **A SAML session cannot satisfy step-up** — it is refused `403` at every step-up-gated route, approvals included (`saml_mfa_unsupported`, #4935), unless the window is disabled, which lets SAML through the 39 ordinary rows only (the two factor-credential rows and approve and reject still refuse it); SAML deployments rely on IdP MFA. *(Evidence: `server/core/src/totp.{hpp,cpp}`, `mfa_qr.{hpp,cpp}`, `mfa_step_up.{hpp,cpp}`; verified 2026-09-07 - previously mis-graded Not Started.)*
 
 ### 18.11 SAML 2.0 SSO :white_check_mark: `T2` *(new row, v4.1)*
 
@@ -1009,7 +1009,7 @@ Token rotation: `POST /api/v1/tokens/{id}/rotate` and its confirm step (`ApiToke
 
 ### 18.17 Plugin Configuration, Secrets and Kill Switches :white_check_mark: `T2` *(new row, v4.1)*
 
-`/api/v1/plugin-config` (list, get, set per key, and the per-plugin `kill-switch` with optional `action`/`os`) on the `PluginConfig` and `PluginSecret` securables, with MCP twins `list_plugin_config`, `get_plugin_config`, `set_plugin_config`, `delete_plugin_config`, `set_plugin_secret`, `delete_plugin_secret`, `get_plugin_kill_switch` and `set_plugin_kill_switch`. The Forensics-tier plugins (`browser_inventory`, `execution_artifacts`, `privacy_permissions`, `remote_access_audit`) are seeded default-off. *(Evidence: `server/core/src/plugin_config_parsers.hpp`, `PluginConfigStore::seed_kill_switch_default_off`.)*
+`/api/v1/plugin-config` (list, get, set per key, and the per-plugin `kill-switch` with optional `action`/`os`) on the `PluginConfig` and `PluginSecret` securables, with MCP twins `list_plugin_config`, `get_plugin_config`, `set_plugin_config`, `delete_plugin_config`, `set_plugin_secret`, `delete_plugin_secret`, `get_plugin_kill_switch` and `set_plugin_kill_switch`. The Forensics-tier plugins (`browser_inventory`, `execution_artifacts`, `privacy_permissions`, `process_introspect`, `remote_access_audit`) are seeded default-off. *(Evidence: `server/core/src/plugin_config_parsers.hpp`, `PluginConfigStore::seed_kill_switch_default_off`.)*
 
 ### 18.18 KEK Rotation and Secrets Rewrap :white_check_mark: `T2` *(new row, v4.1)*
 
@@ -1307,7 +1307,7 @@ Partial. `ProductRegistryStore` (`server/core/src/product_registry_store.{hpp,cp
 
 ### 27.2 Software Usage Tracking :large_orange_diamond: `T2` *(verified 2026-11-14)*
 
-**Regraded 2026-11-14: Not Started → Partial.** Shipped: the `app_usage` agent plugin (`summary`, `last_used`, `foreground`; Windows and Linux supported, macOS constrained), which reads Echo's `usage` fold read-only and is **machine-scope** (no pid, command line or user name); the ADR-0016 daily-sync source `app_usage` (`agents/core/src/sync_source_app_usage.{hpp,cpp}`) feeding the server `AppUsageStore` (§35.6); and the Forensics-gated read `GET /api/v1/forensics/agents/{id}/app-usage` plus MCP `get_agent_app_usage` (`Forensics:Read` scoped to the device, per-open `app_usage.agent.view` audit that fails closed, 503 on a degraded store). **Collected by default, not opt-in** *(verified 2026-11-14)*: Echo's `usage` source ships `default_enabled = true` (`agents/plugins/echo/src/echo_schema_registry.cpp`, every source on by default since PR #6360), the daily-sync source pushes it every 24 hours, and `app_usage` is not among the four plugins `server.cpp` seeds kill-switched off (`seed_kill_switch_default_off`: `execution_artifacts`, `browser_inventory`, `privacy_permissions`, `remote_access_audit`). The opt-out is the Echo `usage` source switch (`usage_enabled=false` via `echo.configure`). The Forensics gate controls who can READ the data, not whether it is collected: the plugin's actions are `Forensics` Read with an `AdminOrApproval` dispatch gate, its stored responses are served only to `Forensics:Read` holders, and the server read is the audited route above. The formerly cited `--usage-sync-enable` flag does not exist. **Still missing:** the Used / Rarely / Unused / Unreported categorisation and the reclamation verdicts derived from it, which are SAM use-case-engine work (ADR-0024 "Placement under ADR-1005"). *(Evidence: `agents/plugins/app_usage/README.md`, `server/core/src/app_usage_routes.hpp`, `app_usage_store.*`.)*
+**Regraded 2026-11-14: Not Started → Partial.** Shipped: the `app_usage` agent plugin (`summary`, `last_used`, `foreground`; Windows and Linux supported, macOS constrained), which reads Echo's `usage` fold read-only and is **machine-scope** (no pid, command line or user name); the ADR-0016 daily-sync source `app_usage` (`agents/core/src/sync_source_app_usage.{hpp,cpp}`) feeding the server `AppUsageStore` (§35.6); and the Forensics-gated read `GET /api/v1/forensics/agents/{id}/app-usage` plus MCP `get_agent_app_usage` (`Forensics:Read` scoped to the device, per-open `app_usage.agent.view` audit that fails closed, 503 on a degraded store); and the fleet aggregate per Apps application `GET /api/v1/dex/apps/usage` (REST only: no MCP tool and no dashboard view yet; `Forensics:Read` and `GuaranteedState:Read`, audited `dex.apps.usage.view` once parameters validate, fails closed). **Collected by default, not opt-in** *(verified 2026-11-14)*: Echo's `usage` source ships `default_enabled = true` (`agents/plugins/echo/src/echo_schema_registry.cpp`, every source on by default since PR #6360), the daily-sync source pushes it every 24 hours, and `app_usage` is not among the five plugins `server.cpp` seeds kill-switched off (`seed_kill_switch_default_off`: `execution_artifacts`, `browser_inventory`, `privacy_permissions`, `remote_access_audit`, `process_introspect`). The opt-out is the Echo `usage` source switch (`usage_enabled=false` via `echo.configure`). The Forensics gate controls who can READ the data, not whether it is collected: the plugin's actions are `Forensics` Read with an `AdminOrApproval` dispatch gate, its stored responses are served only to `Forensics:Read` holders, and the server read is the audited route above. The formerly cited `--usage-sync-enable` flag does not exist. **Still missing:** the Used / Rarely / Unused / Unreported categorisation and the reclamation verdicts derived from it, which are SAM use-case-engine work (ADR-0024 "Placement under ADR-1005"). *(Evidence: `agents/plugins/app_usage/README.md`, `server/core/src/app_usage_routes.hpp`, `app_usage_store.*`.)*
 
 ### 27.3 License Entitlements & Compliance :x: `T2`
 
@@ -1480,7 +1480,7 @@ Partial. The Guardian dashboard shipped at `/guardian` (`server/core/src/guardia
 
 ### 31.10 Rule Signing :x: `T2` *(verified 2026-11-14)*
 
-Not implemented (PR 12). HMAC rule signing (HKDF per design §11.2) with per-tenant key stored in `CredWrite`/`CredRead` (Windows), Linux Secret Service / kernel keyring (Linux), Keychain (macOS); agent-side signature validation before activating a rule prevents unauthenticated rule injection. The wire field exists but is unused (`bytes signature = 7; // ... (contract G3, deferred)` in `proto/yuzu/guardian/v1/guaranteed_state.proto`), and `guardian_rule_spec.cpp:394`'s own comment says "full RFC-8785 canonicalisation lands with rule signing"; no HKDF or signed rule-activation code exists in `guardian_rule_spec.*`, `baseline_store.*` or `guardian_engine.*`. **Retitled 2026-11-14** from "Rule Signing and Quarantine Integration": device quarantine shipped outside Guardian — the `quarantine` plugin (`quarantine`/`unquarantine`/`whitelist`/`status`) and the server-side `QuarantineStore`, containment gate and reconciler (§9.6, §9.9, ADR-0047). The original design text for a Guardian-integrated quarantine (WFP block-all at weight 65535, `quarantine.add_exception | remove_exception | lift`, resilience reset on lift) is not what shipped.
+Not implemented (PR 12). HMAC rule signing (HKDF per design §11.2) with per-tenant key stored in `CredWrite`/`CredRead` (Windows), Linux Secret Service / kernel keyring (Linux), Keychain (macOS); agent-side signature validation before activating a rule prevents unauthenticated rule injection. The wire field exists but is unused (`bytes signature = 7; // ... (contract G3, deferred)` in `proto/yuzu/guardian/v1/guaranteed_state.proto`), and `guardian_rule_spec.cpp:394`'s own comment says "full RFC-8785 canonicalisation lands with rule signing"; no HKDF or signed rule-activation code exists in `guardian_rule_spec.*`, `baseline_store.*` or `guardian_engine.*`. **Retitled 2026-11-14** from "Rule Signing and Quarantine Integration": device quarantine shipped outside Guardian — the `firewall` plugin's four containment actions (`quarantine`/`release`/`quarantine_status`/`quarantine_allow`) and the server-side `QuarantineStore`, containment gate and reconciler (§9.6, §9.9, ADR-0047). The original design text for a Guardian-integrated quarantine (WFP block-all at weight 65535, `quarantine.add_exception | remove_exception | lift`, resilience reset on lift) is not what shipped.
 
 ---
 
@@ -1564,7 +1564,7 @@ REST parity for the live-snapshot surface — though the REST live read (`POST /
 
 ### 35.1 Sync Framework :white_check_mark: `T2` *(verified 2026-09-07)*
 
-`SyncScheduler` (`agents/core/src/sync_scheduler.{hpp,cpp}`) + `LocalDispatcher` (`local_dispatcher.cpp`) — stable per-agent phase spread, hash-skip when unchanged, server `need_full` resend. Shared ingestion seam wired identically on the direct and gateway paths. All confirmed compiled in `agents/core/meson.build`.
+`SyncScheduler` (`agents/core/src/sync_scheduler.{hpp,cpp}`) + `LocalDispatcher` (`local_dispatcher.cpp`) — stable per-agent phase spread, hash-skip when unchanged, server `need_full` resend. Shared ingestion seam wired identically on the direct and gateway paths. All confirmed compiled in `agents/core/meson.build`. Saved per-management-group collection settings reach agents through the heartbeat reconcile (`server/core/src/collection_settings_push.{hpp,cpp}`, the `__sync__.settings` command applied by `agents/core/src/collection_settings_agent.hpp`); there is no push on save, and a named time zone is applied in machine-local time. Docs: `docs/user-manual/inventory.md`, "How saved settings reach machines".
 
 ### 35.2 Installed-Software Inventory :white_check_mark: `T2` *(verified 2026-09-07)*
 
@@ -1586,7 +1586,7 @@ Other typed sources: the server's one `kTypedInventorySources` list (`server/cor
 
 ### 35.6 App-Usage Inventory Source :white_check_mark: `T2` *(new row, v4.1)*
 
-ADR-0016 source `app_usage`: `agents/core/src/sync_source_app_usage.{hpp,cpp}` reads the `app_usage` plugin's machine-scope fold of Echo's usage data and pushes it daily to the server `AppUsageStore` (`server/core/src/app_usage_store.{hpp,cpp}`). It is a typed source, excluded from generic-store writes and from every generic read. The only read is the Forensics-gated `GET /api/v1/forensics/agents/{id}/app-usage` / MCP `get_agent_app_usage`, with a per-open audit that fails closed (§27.2). *(Evidence: `docs/user-manual/inventory.md`; `docs/adr/0016-agent-daily-sync-framework.md` 2026-09-17 update.)*
+ADR-0016 source `app_usage`: `agents/core/src/sync_source_app_usage.{hpp,cpp}` reads the `app_usage` plugin's machine-scope fold of Echo's usage data and pushes it daily to the server `AppUsageStore` (`server/core/src/app_usage_store.{hpp,cpp}`). It is a typed source, excluded from generic-store writes and from every generic read. The only per-device read is the Forensics-gated `GET /api/v1/forensics/agents/{id}/app-usage` / MCP `get_agent_app_usage`, with a per-open audit that fails closed (§27.2). The fleet aggregate per Apps application is `GET /api/v1/dex/apps/usage` (REST only, no MCP tool and no dashboard view yet; `Forensics:Read` and `GuaranteedState:Read`, audited `dex.apps.usage.view`, fails closed). *(Evidence: `docs/user-manual/inventory.md`; `docs/adr/0016-agent-daily-sync-framework.md` 2026-09-17 update.)*
 
 ---
 
@@ -1835,6 +1835,10 @@ ADR-0070 D5/R1: operators register third-party CRL sources through `/api/v1/cryp
 
 `filesystem_posture` plugin: `mounts`, per-mount `quotas` subsystem state and snapshot-capable volumes (`snapshots`), read-only (`Inventory:Read`). macOS supported; Windows and Linux constrained. *(Evidence: `agents/plugins/filesystem_posture/README.md`.)*
 
+### 42.12 Process Introspection :large_orange_diamond: `T2` *(new row, 2026-11-16)*
+
+`process_introspect` plugin `inspect`: one pid and one facet per request (`resource_limits`, `sigmasks`, `caps`, `seccomp`, `oom`, `sched`) as numbers, masks and fixed tokens — never file or memory contents, environment values, socket payloads or command-line arguments. Forensics securable, default-off, AdminOrApproval, single-target. Linux constrained, macOS and Windows planned. *(Evidence: `agents/plugins/process_introspect/README.md`.)*
+
 ---
 
 ## Appendix A: Plugin Coverage Matrix
@@ -1880,7 +1884,6 @@ ADR-0070 D5/R1: operators register third-party CRL sources through `/api/v1/cryp
 | event_logs | Y | Y | Y | Security |
 | vuln_scan | Y | Y | Y | Security |
 | ioc | Y | Y | Y | Security |
-| quarantine | Y | Y | Y | Security |
 | certificates | Y | Y | Y | Security |
 | rdp_control | Y | - | - | Security |
 | autoruns | Y | Y | Y | Security |
@@ -1909,6 +1912,7 @@ ADR-0070 D5/R1: operators register third-party CRL sources through `/api/v1/cryp
 | update_source_trust | - | Y | - | Security |
 | mgmt_posture | - | 🟡 | Y | Security |
 | remote_access_audit | - | 🟡 | Y | Security |
+| process_introspect | - | 🟡 | - | Security |
 | shares | Y | Y | Y | Network |
 | virtualization | 🟡 | Y | Y | System Info |
 | agent_logging | Y | Y | Y | Agent Mgmt |
@@ -1918,7 +1922,7 @@ ADR-0070 D5/R1: operators register third-party CRL sources through `/api/v1/cryp
 | chargen | Y | Y | Y | Test/Debug |
 | example | Y | Y | Y | Test/Debug |
 
-**74 plugin directories: 72 production plugins plus the two test/debug plugins (`chargen`, `example`)**, which appear in the table but are excluded from the headline count (`ls -d agents/plugins/*/` = 74 at HEAD, 2026-11-15). Coverage spans hardware, peripherals, network, security posture, filesystem, registry, WMI, WiFi, WoL, IOC, quarantine, certificates, content distribution, user interaction and more, across cross-platform and Windows-only plugins. Corrections in this pass: `pkg_inventory` Windows is supported (was shown `-`); constrained legs are now shown `🟡` instead of `Y`; and the former `software_usage` "planned" row is removed — usage metering shipped as `app_usage` (§27.2, §35.6). The previous recount history (51 → 71 between 2026-09-15 and 2026-11) is in git history.
+**74 plugin directories: 72 production plugins plus the two test/debug plugins (`chargen`, `example`)**, which appear in the table but are excluded from the headline count (`ls -d agents/plugins/*/` = 74 at HEAD, 2026-11-16, after the earlier device-containment plugin was removed: containment is now the `firewall` plugin's four actions). Coverage spans hardware, peripherals, network, security posture, filesystem, registry, WMI, WiFi, WoL, IOC, device containment, certificates, content distribution, user interaction and more, across cross-platform and Windows-only plugins. Corrections in this pass: `pkg_inventory` Windows is supported (was shown `-`); constrained legs are now shown `🟡` instead of `Y`; and the former `software_usage` "planned" row is removed — usage metering shipped as `app_usage` (§27.2, §35.6). The previous recount history (51 → 71 between 2026-09-15 and 2026-11) is in git history.
 ---
 
 ## Appendix B: Foundation Tier Status

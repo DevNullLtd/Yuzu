@@ -14,12 +14,15 @@
 ## Supplied at boot from the YUZU_GW_COOKIE environment variable (this is a
 ## relx `.src` file — ${VAR} is substituted by the start script). Generate a
 ## strong unique value per deployment, e.g. `openssl rand -hex 32`.
-## If unset, the fallback below is the historical default, which the boot
-## guard in yuzu_gw_app:check_distribution_cookie/0 REFUSES to start with —
-## a known cookie is unauthenticated inter-node RPC / RCE (#659). The
-## fallback therefore fails closed rather than silently shipping a usable
-## default. Dev/CI may override the guard with YUZU_GW_ALLOW_DEFAULT_COOKIE=1.
--setcookie ${YUZU_GW_COOKIE:-yuzu_gw_secret_change_me}
+## There is deliberately NO literal fallback (F24): a cookie committed to a
+## public repository is unauthenticated inter-node RPC / RCE (#659). If unset,
+## `-setcookie` gets no value and the VM uses its own per-host random
+## ~/.erlang.cookie, which yuzu_gw_app:check_distribution_cookie/0 then refuses
+## (too short) unless YUZU_GW_ALLOW_DEFAULT_COOKIE=1. That guard runs AFTER
+## distribution is listening, so the container entrypoint
+## (deploy/docker/gateway-entrypoint.sh) and the systemd unit refuse an unset
+## cookie BEFORE the VM starts; start through them, not `bin/yuzu_gw` directly.
+-setcookie ${YUZU_GW_COOKIE:-}
 
 ## Scheduler configuration
 +K true

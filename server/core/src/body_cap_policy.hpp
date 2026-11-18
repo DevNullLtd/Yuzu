@@ -560,6 +560,11 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // caller reaching this prefix with a chunked (no Content-Length) body
     // would be uncapped up to httplib's 100 MiB default — the same class the
     // /api/v1/uploads entry above closes.
+    // `GET /api/v1/hardware-ci` (the bulk CI keyset read) is deliberately NOT under this row: it
+    // is a sibling prefix, and matching is on segment boundaries. It is a bodyless GET, so the
+    // catch-all default is the reviewed choice (the same as every other GET read; the
+    // mutating-route inventory covers POST/PUT/PATCH/DELETE only). Do not widen this prefix to
+    // cover it, and do not add a row for it without recording why the catch-all is not enough.
     {kBodyCapAnyMethod, "/api/v1/hardware", 4u * 1024, true, "hardware", kJsonValuesOff},
 
     // /api/v1/rbac/roles/{name}/assignments[/{principal_id}] — A2 global
@@ -666,6 +671,16 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // share the prefix.
     {kBodyCapAnyMethod, "/api/v1/inventory/software/collection-settings", 16u * 1024, false,
      "software_collection_settings", kJsonValuesOff},
+    // /api/v1/inventory/software/lifecycle/rules -- the lifecycle rule import
+    // (software_lifecycle_routes.cpp). POST carries the raw csv or cle file as its body, which
+    // lifecycle_import::parse refuses over kImportMaxBytes (4 MiB), so the cap mirrors that bound
+    // exactly (a static_assert in the routes TU pins the pair). Its own row, not the catch-all:
+    // a csv body is not JSON, and the catch-all's JSON value-count scan would count its commas
+    // and quotes, so the scan is off here (the cle parser applies its own depth and value
+    // budgets). Longer literal prefix than the `/api/v1/inventory` rows. ANY method: GET and
+    // DELETE share the path and carry no body.
+    {kBodyCapAnyMethod, "/api/v1/inventory/software/lifecycle/rules", 4u * 1024 * 1024, false,
+     "software_lifecycle_rules", kJsonValuesOff},
     // /api/v1/commands -- POST: the REST v1 twin of MCP execute_instruction (command_v1_routes.cpp).
     // The same 4 MiB as the `/mcp/` row because the same worst case rides it: a maximal request
     // (10000 agent ids, 32 parameters of 64 KiB, an 8 KiB scope) is `kExecInstrWorstCaseBody`,

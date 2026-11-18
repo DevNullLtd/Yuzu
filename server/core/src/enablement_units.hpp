@@ -25,7 +25,7 @@
  * PROTECTIVE SEAM (one line): the caller injects the predicate, and it is the
  * canonical protective set, `kProtectivePredicate`, which is
  * `&yuzu::protective::is_protective_action` (common/include/yuzu/protective_actions.hpp):
- * the quarantine and firewall control actions plus `__guard__.push_rules`. One predicate, never a
+ * the firewall containment actions plus `__guard__.push_rules`. One predicate, never a
  * second list, so a future widening of that set removes the new action from the
  * switchable units with no edit here. `__guard__.push_rules` is also caught by the
  * reserved-name rule (the control channel), which is checked first. There is no default, so a
@@ -146,9 +146,9 @@ inline constexpr std::array<RequirementEdge, 2> kRequirements{{
 // middleware ibm_mq added by SAM.2; runtimes python added 2026-10-28; hardware drivers_inventory
 // added by SAM-32; virtualization host added by PR12.1-a, virtualization wsl added 2026-11-08,
 // virtualization runtime_posture added by PR12.1-b2; firewall quarantine, release, quarantine_status
-// and quarantine_allow added by PRQ.1; component_inventory scan added by SAM-16, Windows leg planned
-// so applicable on all three), 253 rows.
-inline constexpr std::array<UnitOsRow, 253> kUnitOs{{
+// and quarantine_allow added by PRQ.1; PRQ.2 removed the old containment plugin's four rows; component_inventory scan added by SAM-16, Windows leg planned
+// so applicable on all three; process_introspect inspect added by PR13.1-a, Windows and macOS legs planned so applicable on all three), 250 rows.
+inline constexpr std::array<UnitOsRow, 250> kUnitOs{{
     {"agent_actions", "set_log_level", kWin | kLin | kMac},
     {"agent_actions", "info", kWin | kLin | kMac},
     {"agent_logging", "get_log", kWin | kLin | kMac},
@@ -309,10 +309,6 @@ inline constexpr std::array<UnitOsRow, 253> kUnitOs{{
     {"processes", "list_tree", kWin | kLin | kMac},
     {"processes", "query", kWin | kLin | kMac},
     {"procfetch", "procfetch_fetch", kWin | kLin | kMac},
-    {"quarantine", "quarantine", kWin | kLin | kMac},
-    {"quarantine", "unquarantine", kWin | kLin | kMac},
-    {"quarantine", "status", kWin | kLin | kMac},
-    {"quarantine", "whitelist", kWin | kLin | kMac},
     {"rdp_control", "set_state", kWin},
     {"rdp_control", "status", kWin},
     {"registry", "get_value", kWin | kLin | kMac},
@@ -340,6 +336,8 @@ inline constexpr std::array<UnitOsRow, 253> kUnitOs{{
     {"services", "set_start_mode", kWin | kLin | kMac},
     // remote_access_audit: Linux is constrained, macOS supported, Windows `planned` (applicable).
     {"remote_access_audit", "list", kWin | kLin | kMac},
+    // process_introspect: Linux is constrained, macOS and Windows `planned` (applicable).
+    {"process_introspect", "inspect", kWin | kLin | kMac},
     // shares: Linux, Windows and macOS are all supported.
     {"shares", "list", kWin | kLin | kMac},
     {"software_actions", "list_upgradable", kWin | kLin | kMac},

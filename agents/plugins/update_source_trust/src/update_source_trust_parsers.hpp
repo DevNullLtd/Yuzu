@@ -52,6 +52,7 @@
  */
 #pragma once
 
+#include <uri_userinfo_redact.hpp>
 #include <wire_utf8.hpp>
 #include <yuzu/string_utils.hpp>
 
@@ -250,51 +251,11 @@ enum class KeyFormat { armored, binary, empty, unmodelled };
 }
 
 /// One word of a URI list with the `user[:pass]@` userinfo replaced by
-/// `REDACTED@`. Every position below is a RAW byte offset into `word` -- NOTHING
-/// is percent-decoded before the split. An earlier version decoded the whole
-/// word first, so a %XX-encoded byte in the password (`bob:%2fSEKR3T@host`)
-/// could be read as the path separator and stop the authority scan short,
-/// missing the '@' entirely and returning the WHOLE credential unredacted; real
-/// apt does not decode %XX when it locates the authority either (verified: its
-/// own resolved URI still shows `%2fSEKR3T` literally), so working on raw bytes
-/// matches apt AND cannot under-run. The one place apt's lexer does recognise a
-/// percent form is the scheme separator itself (`http%3a//u:pw@h/` resolves as
-/// `http://u:pw@h/`, verified), so ':' and "%3a"/"%3A" are both accepted there,
-/// whichever comes first. From there the authority ends at the first raw '/'
-/// OUTSIDE a `[...]` group -- an encoded slash (%2f/%2F) does NOT end it, which
-/// is what makes the authority span reach the real '@' even when a password
-/// contains one. The userinfo is everything in that authority before its LAST
-/// '@'; a query string or path holding a secret is not syntactically a userinfo
-/// and is emitted as written (documented) -- widening the search past the
-/// authority boundary would redact a bare '@' in a path (`h.example/a@b`),
-/// which is not a credential and must stay untouched.
+/// `REDACTED@`. The logic (and its raw-byte-offset rationale) lives in
+/// agents/shared/uri_userinfo_redact.hpp, hoisted so network_config's proxy
+/// action reuses it; this forwarder keeps the apt-named seam.
 [[nodiscard]] inline std::string redact_apt_word(std::string_view word) {
-    std::size_t colon = word.find(':');
-    std::size_t colon_len = 1;
-    for (const std::string_view enc : {std::string_view{"%3a"}, std::string_view{"%3A"}}) {
-        const std::size_t p = word.find(enc);
-        if (p != std::string_view::npos && (colon == std::string_view::npos || p < colon)) {
-            colon = p;
-            colon_len = 3;
-        }
-    }
-    if (colon == std::string_view::npos)
-        return std::string{word}; // no scheme, so no authority
-    std::size_t begin = colon + colon_len;
-    if (word.compare(begin, 2, "//") == 0)
-        begin += 2;
-    std::size_t end = begin;
-    bool in_bracket = false;
-    for (; end < word.size() && (word[end] != '/' || in_bracket); ++end) {
-        if (word[end] == '[')
-            in_bracket = true;
-        else if (word[end] == ']')
-            in_bracket = false;
-    }
-    const std::size_t at = std::string_view{word}.substr(begin, end - begin).rfind('@');
-    if (at == std::string_view::npos)
-        return std::string{word};
-    return std::string{word.substr(0, begin)} + "REDACTED@" + std::string{word.substr(begin + at + 1)};
+    return yuzu::shared::redact_uri_word(word);
 }
 
 /// Every word of `text` (split as apt splits a source line, so a `[...]` group

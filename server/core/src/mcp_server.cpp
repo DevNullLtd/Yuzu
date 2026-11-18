@@ -1881,11 +1881,20 @@ static const ToolDef kTools[] = {
      "no trace, and a pending event whose pair has no census row is not counted (the per-device "
      "reads get_guardian_device_guards and get_guardian_device_compliance report those as "
      "unrepresented_pending_guards). unordered_agents counts agents whose latest event without "
-     "an emit-order pair is later than the time their pair clock last advanced (an agent that "
-     "never sent a pair counts), within the same scope; unordered_agent_ids lists the first 50 "
+     "an emit-order pair is later than the time their pair clock last advanced, or whose pair "
+     "clock is recorded more than 300 s in the database's future (an agent that never sent a "
+     "pair counts), within the same scope; unordered_agent_ids lists the first 50 "
      "in ascending byte order of agent id (a count above the list length means truncation). The "
-     "pair is stored and counted, not yet compared: no verdict depends on it. 0 does NOT prove "
-     "every agent sends a pair, since an agent with no census-bearing event has no order row. A "
+     "server orders a census verdict by the emit-order pair when the event and the stored "
+     "verdict both carry one, and holds an event without a pair (refused, row flagged) while "
+     "the agent's pair clock is fresh, so a nonzero count measures agents that send no pair, or "
+     "whose pair clock is recorded in the database's future, not a wrong verdict. 0 does NOT prove "
+     "every agent sends a pair, since an agent with no census-bearing event has no order row. An "
+     "agent whose first deliveries all failed the per-agent order step has no order row, or only "
+     "a blank one a redelivery repair left, so it is in neither figure and not in "
+     "unordered_agent_ids until its next successful first delivery; to read the count alongside "
+     "them, use the Prometheus series yuzu_server_guardian_census_proj_failures_total and "
+     "yuzu_server_guardian_census_pending_events (not available through MCP). A "
      "service-scoped "
      "API token is refused outright (this is a fleet rollup with no per-service slice to narrow "
      "to).",
@@ -1946,13 +1955,23 @@ static const ToolDef kTools[] = {
      "completeness. A pending-evidence read that times out answers a non-retryable error (no "
      "retry hint): the most likely cause is a large retained pending backlog. ordering is the "
      "device's stored emit-order pair state, or null when the device has no order row (no "
-     "census-bearing event was ever accepted, or it was decommissioned): epoch, emit_seq_hwm "
-     "and epoch_recv_ns (server clock, nanoseconds) are the pair clock; unpaired_recv_ns is the "
+     "census-bearing event was ever accepted, it was decommissioned, or its first deliveries "
+     "all failed the per-agent order step; a redelivery repair can leave a blank row, an object "
+     "whose clock fields are null and whose counters are 0): epoch, emit_seq_hwm "
+     "and epoch_recv_ns (database clock, nanoseconds) are the pair clock; unpaired_recv_ns is the "
      "latest accepted event without a pair; currently_unordered is true when that is later than "
-     "epoch_recv_ns (a never-paired device counts). The counters count accepted events by the "
-     "kind of pair they carried against the clock. They are stored and counted, not yet "
-     "compared: no verdict was held or refused on them, and pair_duplicates stays 0 until the "
-     "comparator ships. The integers are 64-bit and can exceed 2^53, so read them as 64-bit "
+     "epoch_recv_ns (a never-paired device counts) or when epoch_recv_ns is recorded more "
+     "than 300 s in the database's future; the database decides it from its own clock on "
+     "each read, so it can change with no event. The counters classify each census-bearing "
+     "first delivery by its pair against the clock: unpaired_held (no pair while the clock was "
+     "fresh: refused and flagged against a paired verdict, while over a row that holds no pair "
+     "the census key rule decides as before), pair_regressions (a lower epoch while the clock "
+     "was fresh), pair_stragglers (a sequence not above the highest seen in the same epoch, "
+     "while the clock was fresh), pair_recoveries (a "
+     "stale clock re-based) and retired_events (an event of an epoch a recovery retired); "
+     "pair_duplicates counts equal pairs (two processes sharing one epoch) refused at first "
+     "delivery. A redelivery repair counts none of them. The integers are 64-bit and can exceed "
+     "2^53, so read them as 64-bit "
      "integers. Per-device scoped (management-group aware) via the same "
      "gate the device-compliance / per-agent status routes already use.",
      R"({"type":"object","properties":{"agent_id":{"type":"string","minLength":1,"maxLength":256}},"required":["agent_id"]})",
@@ -3598,7 +3617,7 @@ static const ToolDef kTools[] = {
 
     {"quarantine_device",
      "Isolate a device from the network (records the quarantine AND dispatches the live "
-     "quarantine-plugin isolation), whitelisting the management server. Mirrors POST "
+     "firewall.quarantine isolation), whitelisting the management server. Mirrors POST "
      "/api/v1/quarantine for the record; the dispatch has no REST twin. Destructive "
      "(Security:Execute): approval-gated on the supervised tier — the first call returns an "
      "approval ticket, re-call with the returned approval_id after an admin approves. #3127: a "
@@ -3608,7 +3627,9 @@ static const ToolDef kTools[] = {
      "the device was already quarantined by an earlier call. dispatch_confirmed means the plugin "
      "registry ACCEPTED the isolation frame, NOT that the device is isolated — for a "
      "gateway-attached agent the frame is only queued; confirming isolation requires a follow-up "
-     "`status` read returning state|active.",
+     "firewall.quarantine_status read returning status|active. The whitelist is at most 32 bare "
+     "IPv4 or IPv6 addresses. A record whose release was requested reads status releasing; a "
+     "call on it is refused until the device confirms the release.",
      R"j({"type":"object","properties":{)j"
      // #2444 item 1: mirror the handler's own limits so an oversized/off-charset
      // reason or whitelist is refused by schema instead of burning an
@@ -3621,16 +3642,16 @@ static const ToolDef kTools[] = {
      // whitelist outweighs closing the last sliver of this burn class).
      R"j("agent_id":{"type":"string","minLength":1,"description":"Target agent id"},)j"
      R"j("reason":{"type":"string","maxLength":1024,"description":"Optional quarantine reason (audited)"},)j"
-     R"j("whitelist":{"type":"string","maxLength":512,"pattern":"^[0-9A-Fa-f.:, ]*$","description":"Comma-separated extra IPs to allow through the isolation firewall"},)j"
+     R"j("whitelist":{"type":"string","maxLength":512,"pattern":"^[0-9A-Fa-f.:, ]*$","description":"Comma-separated bare IPv4 or IPv6 addresses (at most 32) to allow through the isolation firewall"},)j"
      R"j("approval_id":{"type":"string","description":"Approval ticket id from a prior kApprovalRequired response; supply after admin approval to execute"})j"
      R"j(},"required":["agent_id"]})j",
      R"j({"type":"object","properties":{)j"
      R"j("command_id":{"type":"string","description":"Id of the dispatched isolation command"},)j"
      R"j("agents_reached":{"type":"integer","minimum":1,"description":"#3127: a result is returned ONLY when at least one agent accepted the isolation frame; agents_reached=0 (or a dispatch that threw) returns a retryable error instead, with the quarantine record still persisted"},)j"
-     R"j("dispatch_confirmed":{"const":true,"description":"#3127: the plugin registry ACCEPTED the isolation frame. NOT proof of isolation - for a gateway-attached agent the frame is only QUEUED. Confirming isolation requires a subsequent status read returning state|active"},)j"
+     R"j("dispatch_confirmed":{"const":true,"description":"#3127: the plugin registry ACCEPTED the isolation frame. NOT proof of isolation - for a gateway-attached agent the frame is only QUEUED. Confirming isolation requires a subsequent firewall.quarantine_status read returning status|active"},)j"
      R"j("record_pre_existing":{"type":"boolean","description":"#3127: true when an active quarantine record already existed and this call re-dispatched the STORED intent (reason/whitelist) rather than writing a new record from this request"},)j"
      R"j("whitelist_request_ignored":{"type":"boolean","description":"#3127: true when this call supplied a whitelist that differs from the stored one; the STORED whitelist was dispatched and the request's was NOT applied"},)j"
-     R"j("quarantine_record":{"type":"object","properties":{"agent_id":{"type":"string"},"status":{"type":"string"},"quarantined_by":{"type":"string"},"reason":{"type":"string"},"whitelist":{"type":"string"},"quarantined_at":{"type":"integer","description":"Present when record_pre_existing is true - the stored record's original creation time"},"last_applied_at":{"type":"integer","description":"#3425: epoch seconds a system re-dispatch of the stored whitelist was accepted; 0 = never. NOT proof of endpoint containment."},"last_confirmed_at":{"type":"integer","description":"#3425: epoch seconds a follow-up quarantine.status read reported state|active; 0 = never. This is the target agent's own self-report, not independently corroborated by any network-side signal - strong operational evidence of containment, not proof; see security-hardening.md Device Quarantine."}},"required":["agent_id","status","quarantined_by","reason","whitelist","last_applied_at","last_confirmed_at"]},)j"
+     R"j("quarantine_record":{"type":"object","properties":{"agent_id":{"type":"string"},"status":{"type":"string","description":"active; a record with a release in progress reads releasing"},"quarantined_by":{"type":"string"},"reason":{"type":"string"},"whitelist":{"type":"string"},"quarantined_at":{"type":"integer","description":"Present when record_pre_existing is true - the stored record's original creation time"},"last_applied_at":{"type":"integer","description":"#3425: epoch seconds a system re-dispatch of the stored whitelist was accepted; 0 = never. NOT proof of endpoint containment."},"last_confirmed_at":{"type":"integer","description":"#3425: epoch seconds a follow-up firewall.quarantine_status read reported the device's rules in force (status|active); 0 = never. This is the target agent's own self-report, not independently corroborated by any network-side signal - strong operational evidence of containment, not proof; see security-hardening.md Device Quarantine."}},"required":["agent_id","status","quarantined_by","reason","whitelist","last_applied_at","last_confirmed_at"]},)j"
      R"j("audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this action itself failed"})j"
      R"j(},"required":["command_id","agents_reached","dispatch_confirmed","record_pre_existing","whitelist_request_ignored","quarantine_record"]})j"},
 
@@ -4282,9 +4303,8 @@ static const ToolDef kTools[] = {
      "decision (PluginConfigStore::action_allowed collapses any store error to disabled, "
      "which this display accessor deliberately does not) — this is the inspection view an "
      "operator reads before deciding whether to flip it. Absence of a prior flip reads as "
-     "enabled=true with no reason/set_by. For a protective action (the quarantine plugin's "
-     "quarantine/unquarantine/status/whitelist, the firewall plugin's quarantine/release/"
-     "quarantine_status/quarantine_allow and __guard__.push_rules) the state shown here is "
+     "enabled=true with no reason/set_by. For a protective action (the firewall plugin's "
+     "quarantine/release/quarantine_status/quarantine_allow and __guard__.push_rules) the state shown here is "
      "informational only: enabled=false can be displayed while dispatch still proceeds. "
      "Without os this reports the all-OS layer only and "
      "never reflects a per-OS OFF row. Requires PluginConfig:Read.",
@@ -4301,9 +4321,8 @@ static const ToolDef kTools[] = {
      "dispatch-gating caller that consults this switch fails CLOSED (treats disabled) on any "
      "store error, so throwing this switch is a reliable emergency stop for the named "
      "plugin/action — there is no separate 'force disable' escalation beyond this call. "
-     "Exception: a protective action (the quarantine plugin's quarantine/unquarantine/status/"
-     "whitelist, the firewall plugin's quarantine/release/quarantine_status/quarantine_allow "
-     "and __guard__.push_rules) is never refused by this switch; a row for one is "
+     "Exception: a protective action (the firewall plugin's quarantine/release/quarantine_status/"
+     "quarantine_allow and __guard__.push_rules) is never refused by this switch; a row for one is "
      "stored and echoed but has no dispatch effect; to stop Guardian rule delivery disable or "
      "remove the rules instead (disarms them on the agent's next reconcile). "
      "The result echoes the row written, not the effective state. Requires "
@@ -4963,10 +4982,12 @@ static const ToolDef kTools[] = {
      "denied outright to a service-scoped token and to an MCP-tier-less caller. Resolves the "
      "registered host, the only outbound reach any tool has. The refusals are exact: the NAT64 "
      "forms (the well-known 64:ff9b::/96 and any prefix the operator declared with "
-     "--oidc-nat64-prefix) and 6to4 and IPv4-mapped forms are judged by the IPv4 address they "
-     "embed. Declared prefixes only at registration: no RFC 7050 discovery is done, so an address "
-     "behind an undeclared prefix the network advertises is judged as plain IPv6 here and "
-     "re-judged when the source is fetched. If this server's own addresses cannot be determined "
+     "--oidc-nat64-prefix) and 6to4, IPv4-mapped, SIIT and IPv4-compatible forms are judged by "
+     "the IPv4 address they embed (SIIT and IPv4-compatible never as more open than non-global); "
+     "a local-use NAT64 (64:ff9b:1::/48) address that no declared prefix covers is refused. "
+     "Declared prefixes only at registration: no RFC 7050 discovery is done, so any other "
+     "address behind an undeclared prefix the network advertises is judged as plain IPv6 here "
+     "and re-judged when the source is fetched. If this server's own addresses cannot be determined "
      "or a name lookup times out, the call fails closed with a retryable error (retry_after_ms "
      "5000) and registers nothing. Audited as "
      "crypto.revocation_source.register: an attempted row is written first and if it cannot be "
@@ -5278,6 +5299,137 @@ static const ToolDef kTools[] = {
      R"j("approval_id":{"type":"string","maxLength":128,"description":"SUPERVISED tier: the approval ticket id from a prior approval_required (-32006) response, supplied after an admin approves it. Re-send exactly the same other arguments as the call that minted it."})j"
      R"j(},"required":["id"],"additionalProperties":false})j",
      R"j({"type":"object","properties":{"id":{"type":"string"},"deleted":{"const":true},"audit_persisted":{"type":"boolean","description":"Present and false only when the OUTCOME audit row failed to persist after the change was made"}},"required":["id","deleted"],"additionalProperties":false})j"},
+
+    // ── SAM-35 software read model + collection settings twins. Each tool returns field for field
+    // what its REST route returns in `data`: the installed-software v3 reads (SAM-33, GET
+    // /api/v1/inventory/software/{hosts,hosts/{agent_id},changes,summary,plugin-health}) call
+    // software_read_api.cpp and the collection settings (SAM-34, .../collection-settings and
+    // .../hosts/{agent_id}/collection-settings) call software_collection_settings_api.cpp, the
+    // SAME functions the REST routes call. Appended at the VERY END of kTools[] per the standing
+    // governance note above.
+    {"list_software_hosts",
+     "One row per device that reports installed software, with each collection facet's state "
+     "(status, last confirmed time, duration, bytes read) and the device's last-seen time; the "
+     "device table behind the Software page. q matches the hostname or agent id (case-insensitive "
+     "substring) over the devices you may see; last_synced_before keeps devices whose last sync is "
+     "older than that epoch second. Page with next_cursor passed back as cursor; roster_truncated "
+     "true means more devices exist than the device roster holds, so a q search covers only the "
+     "newest rows. devices_omitted counts devices your scope hid. Input is strict: an unknown key "
+     "or an out-of-range limit is refused (the REST twin clamps). A degraded store read is a "
+     "retryable error, never an empty list. Read-only; a management-group-confined caller sees "
+     "only its own devices, and a service-scoped token is limited to its service devices. Audited "
+     "as mcp.list_software_hosts. Mirrors GET /api/v1/inventory/software/hosts. Requires "
+     "Inventory:Read.",
+     R"j({"type":"object","properties":{"q":{"type":"string","maxLength":128,"description":"Case-insensitive substring of the hostname or agent id"},"last_synced_before":{"type":"integer","minimum":0,"maximum":9007199254740991,"description":"Only devices last synced before this epoch second"},"limit":{"type":"integer","default":100,"minimum":1,"maximum":1000,"description":"Maximum devices returned"},"cursor":{"type":"string","maxLength":2048,"description":"next_cursor from the previous page"}},"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"hosts":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":["string","null"]},"last_seen":{"type":"integer"},"facets":{"type":"array","items":{"type":"object"}}},"required":["agent_id","hostname","last_seen","facets"]}},"count":{"type":"integer"},"next_cursor":{"type":["string","null"]},"devices_omitted":{"type":"integer"},"roster_truncated":{"type":"boolean"},"roster_cap":{"type":"integer"},"audit_persisted":{"type":"boolean","description":"Present (false) only when an audit row for this read failed to persist"}},"required":["hosts","count","next_cursor","devices_omitted","roster_truncated","roster_cap"]})j"},
+
+    {"get_software_host",
+     "One device's software: its host row (facet states, last-seen time) plus a page of its "
+     "installed software. agent_id is required; a device outside your scope and a device that "
+     "never reported answer the same not-found, so the answer is no existence oracle. Page the "
+     "installs with next_cursor passed back as cursor. Input is strict: an unknown key or an "
+     "out-of-range limit is refused. A degraded store read is a retryable error. Read-only. Audited "
+     "as mcp.get_software_host. Mirrors GET /api/v1/inventory/software/hosts/{agent_id}. Requires "
+     "Inventory:Read.",
+     R"j({"type":"object","properties":{"agent_id":{"type":"string","minLength":1,"maxLength":256,"description":"Device agent id"},"limit":{"type":"integer","default":100,"minimum":1,"maximum":1000,"description":"Maximum installs returned"},"cursor":{"type":"string","maxLength":2048,"description":"next_cursor from the previous page"}},"required":["agent_id"],"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"host":{"type":"object"},"software":{"type":"array","items":{"type":"object"}},"count":{"type":"integer"},"next_cursor":{"type":["string","null"]},"audit_persisted":{"type":"boolean","description":"Present (false) only when an audit row for this read failed to persist"}},"required":["host","software","count","next_cursor"]})j"},
+
+    {"list_software_changes",
+     "The install, remove and upgrade change feed across the devices you may see, oldest settled "
+     "change first. Only rows older than the settle window are returned (stable_before is that "
+     "cutoff), so a page never changes under you. Filter by agent_id, kind (install, remove or "
+     "upgrade) and since (epoch second). Page with next_cursor passed back as cursor; a cursor "
+     "reused with different filters is refused. devices_omitted counts devices your scope hid. "
+     "Input is strict: an unknown key, a kind outside the three values or an out-of-range limit is "
+     "refused. A degraded store read is a retryable error. Read-only. Audited as "
+     "mcp.list_software_changes. Mirrors GET /api/v1/inventory/software/changes. Requires "
+     "Inventory:Read.",
+     R"j({"type":"object","properties":{"agent_id":{"type":"string","maxLength":256,"description":"Restrict to one device"},"kind":{"type":"string","enum":["install","remove","upgrade"],"description":"Restrict to one change kind"},"since":{"type":"integer","minimum":0,"maximum":9007199254740991,"description":"Only changes observed at or after this epoch second"},"limit":{"type":"integer","default":100,"minimum":1,"maximum":1000,"description":"Maximum changes returned"},"cursor":{"type":"string","maxLength":2048,"description":"next_cursor from the previous page"}},"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"changes":{"type":"array","items":{"type":"object"}},"count":{"type":"integer"},"next_cursor":{"type":["string","null"]},"devices_omitted":{"type":"integer"},"stable_before":{"type":"integer"},"audit_persisted":{"type":"boolean","description":"Present (false) only when an audit row for this read failed to persist"}},"required":["changes","count","next_cursor","devices_omitted","stable_before"]})j"},
+
+    {"get_software_summary",
+     "Headline software figures: devices reporting and stale, install/remove/upgrade counts for "
+     "the last 24 hours and 7 days, and the fleet catalogue totals. A globally admitted caller gets "
+     "the fleet snapshot the catalogue rollup refreshes (as_of is its time); a management-group-"
+     "confined caller gets a LIVE aggregate over its own devices with no catalogue block, or nulls "
+     "with omitted scope when its scope is too wide to aggregate, never the fleet snapshot. "
+     "omitted building means the first rollup has not completed. Takes no arguments. A degraded "
+     "store read is a retryable error. Read-only. Audited as mcp.get_software_summary. Mirrors GET "
+     "/api/v1/inventory/software/summary. Requires Inventory:Read.",
+     R"j({"type":"object","properties":{},"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"devices":{"type":["object","null"]},"changes":{"type":["object","null"]},"catalogue":{"type":["object","null"]},"as_of":{"type":"integer"},"omitted":{"type":["string","null"]},"audit_persisted":{"type":"boolean","description":"Present (false) only when an audit row for this read failed to persist"}},"required":["devices","changes","catalogue","as_of","omitted"]})j"},
+
+    {"get_software_plugin_health",
+     "Per-collector health of the installed-software sync: for each facet the device count by "
+     "status, the collecting count, the timeout, failing, disabled and not-collected shares, "
+     "duration and bytes-read percentiles, and the slowest devices. Scope rules match "
+     "get_software_summary: the fleet snapshot for a globally admitted caller, a live aggregate "
+     "over its own devices for a confined caller, or facets null with omitted scope. Takes no "
+     "arguments. A degraded store read is a retryable error. Read-only. Audited as "
+     "mcp.get_software_plugin_health. Mirrors GET /api/v1/inventory/software/plugin-health. "
+     "Requires Inventory:Read.",
+     R"j({"type":"object","properties":{},"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"facets":{"type":["array","null"],"items":{"type":"object"}},"as_of":{"type":"integer"},"omitted":{"type":["string","null"]},"audit_persisted":{"type":"boolean","description":"Present (false) only when an audit row for this read failed to persist"}},"required":["facets","as_of","omitted"]})j"},
+
+    {"list_software_collection_settings",
+     "The software collection settings: the fleet default (collection interval, daily window, time "
+     "zone, which collectors are on) plus every management group's settings document, each with its "
+     "priority and its 64-hex version. A document for a deleted group is not listed. Takes no "
+     "arguments. A damaged stored document or the document cap is a non-retryable error; other "
+     "store faults are retryable. Read-only. Audited as mcp.list_software_collection_settings. "
+     "Mirrors GET /api/v1/inventory/software/collection-settings. Requires ManagementGroup:Read.",
+     R"j({"type":"object","properties":{},"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"fleet_default":{"type":"object"},"documents":{"type":"array","items":{"type":"object","properties":{"group_id":{"type":"string"},"interval_s":{"type":"integer"},"window":{"type":["object","null"]},"timezone":{"type":"string"},"plugins":{"type":"object"},"priority":{"type":"integer"},"version":{"type":"string"},"updated_at":{"type":"integer"},"updated_by":{"type":"string"}},"required":["group_id","interval_s","window","timezone","plugins","priority","version","updated_at","updated_by"]}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"}},"required":["fleet_default","documents"]})j"},
+
+    {"get_software_collection_settings",
+     "One management group's software collection settings document. group_id is a hex group id "
+     "(list_management_groups supplies it); an unknown group and a group with no document are "
+     "different not-found answers. An RBAC read that cannot be completed is a retryable error, "
+     "never a refusal. Read-only. Audited as mcp.get_software_collection_settings. Mirrors GET "
+     "/api/v1/inventory/software/collection-settings/{group_id}. Requires ManagementGroup:Read.",
+     R"j({"type":"object","properties":{"group_id":{"type":"string","minLength":1,"maxLength":64,"description":"Management group id (lowercase hex)"}},"required":["group_id"],"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"group_id":{"type":"string"},"interval_s":{"type":"integer"},"window":{"type":["object","null"]},"timezone":{"type":"string"},"plugins":{"type":"object"},"priority":{"type":"integer"},"version":{"type":"string"},"updated_at":{"type":"integer"},"updated_by":{"type":"string"},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"}},"required":["group_id","interval_s","window","timezone","plugins","priority","version","updated_at","updated_by"]})j"},
+
+    {"set_software_collection_settings",
+     "Create or replace one management group's software collection settings document: the "
+     "collection interval in seconds (3600 to 604800; a daily window needs a whole-day interval), "
+     "an optional daily window {start_min,end_min} in minutes (omit it for none), an IANA time zone "
+     "name, which of the six collectors are on, and the group's priority (0 to 1000). "
+     "expected_version is the version you read (get_software_collection_settings), or none to create; "
+     "a mismatch is refused and the refusal carries the stored document. Saving only stores the "
+     "document: it never triggers a collection, and agents pick it up on their normal schedule. "
+     "The root group's document must stay the fleet baseline. SUPERVISED tier only (operator and "
+     "readonly tokens are refused); every write is approval-gated: the first call returns "
+     "approval_required (-32006) with an approval_id; after an admin approves it, re-call with the "
+     "SAME arguments plus that approval_id. Audited like the REST route: a requested row is "
+     "written BEFORE the change and the change is refused (retryable, nothing changed) if that row "
+     "cannot be stored, the write grant is re-checked immediately before the store call, and an "
+     "outcome row follows; audit_persisted:false means only the outcome row was lost. Mirrors PUT "
+     "/api/v1/inventory/software/collection-settings/{group_id}. Requires ManagementGroup:Write.",
+     R"j({"type":"object","properties":{)j"
+     R"j("group_id":{"type":"string","minLength":1,"maxLength":64,"description":"Management group id (lowercase hex)"},)j"
+     R"j("interval_s":{"type":"integer","minimum":3600,"maximum":604800,"description":"Collection interval in seconds"},)j"
+     R"j("window":{"type":"object","properties":{"start_min":{"type":"integer","minimum":0,"maximum":1440},"end_min":{"type":"integer","minimum":0,"maximum":1440}},"required":["start_min","end_min"],"additionalProperties":false,"description":"Daily window in minutes since midnight; omit for none"},)j"
+     R"j("timezone":{"type":"string","maxLength":64,"description":"IANA time zone name; empty or omitted for the default"},)j"
+     R"j("plugins":{"type":"object","properties":{"installed_apps":{"type":"boolean"},"middleware":{"type":"boolean"},"msi_packages":{"type":"boolean"},"pkg_inventory":{"type":"boolean"},"runtimes":{"type":"boolean"},"windows_optional_features":{"type":"boolean"}},"additionalProperties":false,"description":"Which collectors run"},)j"
+     R"j("priority":{"type":"integer","minimum":0,"maximum":1000,"description":"Higher wins between groups of equal depth"},)j"
+     R"j("expected_version":{"type":"string","maxLength":64,"description":"The 64-hex version you read, or none to create"},)j"
+     R"j("approval_id":{"type":"string","maxLength":128,"description":"SUPERVISED tier: the approval ticket id from a prior approval_required (-32006) response, supplied after an admin approves it. Re-send exactly the same other arguments as the call that minted it."})j"
+     R"j(},"required":["group_id","interval_s","plugins"],"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"group_id":{"type":"string"},"interval_s":{"type":"integer"},"window":{"type":["object","null"]},"timezone":{"type":"string"},"plugins":{"type":"object"},"priority":{"type":"integer"},"version":{"type":"string"},"updated_at":{"type":"integer"},"updated_by":{"type":"string"},"previous_version":{"type":["string","null"]},"audit_persisted":{"type":"boolean","description":"Present and false only when the OUTCOME audit row failed to persist after the change was made"}},"required":["group_id","interval_s","window","timezone","plugins","priority","version","updated_at","updated_by","previous_version"]})j"},
+
+    {"get_software_host_collection_settings",
+     "The effective software collection settings one device runs under: the interval, window, time "
+     "zone and collectors resolved from the device's management groups (the nearest group wins, "
+     "then priority, then age), the group the settings came from (source_group_id), the 64-hex "
+     "version, and kill_switched, the collectors an operator has switched off fleet-wide. agent_id "
+     "is required and needs Inventory:Read on that device: a management-group-confined caller may "
+     "read an in-scope device only. A store or kill-switch read that fails is a retryable error, "
+     "never a document that reports every collector off. Read-only. Audited as "
+     "mcp.get_software_host_collection_settings. Mirrors GET "
+     "/api/v1/inventory/software/hosts/{agent_id}/collection-settings. Requires Inventory:Read.",
+     R"j({"type":"object","properties":{"agent_id":{"type":"string","minLength":1,"maxLength":128,"description":"Device agent id"}},"required":["agent_id"],"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"agent_id":{"type":"string"},"effective":{"type":"object","properties":{"interval_s":{"type":"integer"},"window":{"type":["object","null"]},"timezone":{"type":"string"},"plugins":{"type":"object"}},"required":["interval_s","window","timezone","plugins"]},"source_group_id":{"type":"string"},"version":{"type":"string"},"kill_switched":{"type":"array","items":{"type":"string"}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"}},"required":["agent_id","effective","source_group_id","version","kill_switched"]})j"},
 };
 #undef YUZU_MCP_RESULT_SET_ROW_PROPS
 #undef YUZU_MCP_RESULT_SET_ROW_REQUIRED
@@ -5299,6 +5451,8 @@ static_assert(software_catalogue::kCursorMaxBytes == mcp::kMcpCursorMaxLen,
 // an offence — not a silent first-wins collapse at static init.
 static const char* const kWriteToolsRaw[] = {
     "sync_hardware_software",
+    // SAM-35: PUT twin of the per-group software collection settings (ManagementGroup:Write).
+    "set_software_collection_settings",
     "set_tag",         "delete_tag",     "execute_instruction", "execute_instruction_definition",
     "execute_workflow",
     // #2146 batch C: instruction-definition and instruction-set authoring twins. The five
@@ -5480,6 +5634,20 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // so they keep the default-deny class (C8 refuses a service-scoped token before the handler).
     {"query_software_catalogue", {"Inventory", "Read"}},
     {"get_software_versions", {"Inventory", "Read"}},
+    // SAM-35: the installed-software v3 read twins and the per-device effective settings gate on
+    // fleet_read_fn_ (the five reads) or the device-scoped Inventory:Read (the effective read):
+    // each filters by the caller's scope, a REAL confinement mechanism, so `confined`. The three
+    // group-settings tools gate on the plain, global ManagementGroup pair like
+    // list_management_groups, which a service-scoped token cannot clear: the default `denied` class.
+    {"list_software_hosts", {"Inventory", "Read", ServiceScopeClass::confined}},
+    {"get_software_host", {"Inventory", "Read", ServiceScopeClass::confined}},
+    {"list_software_changes", {"Inventory", "Read", ServiceScopeClass::confined}},
+    {"get_software_summary", {"Inventory", "Read", ServiceScopeClass::confined}},
+    {"get_software_plugin_health", {"Inventory", "Read", ServiceScopeClass::confined}},
+    {"get_software_host_collection_settings", {"Inventory", "Read", ServiceScopeClass::confined}},
+    {"list_software_collection_settings", {"ManagementGroup", "Read"}},
+    {"get_software_collection_settings", {"ManagementGroup", "Read"}},
+    {"set_software_collection_settings", {"ManagementGroup", "Write"}},
     {"get_tags", {"Tag", "Read"}},
     {"search_agents_by_tag", {"Tag", "Read"}},
     {"list_policies", {"Policy", "Read"}},
@@ -6381,6 +6549,19 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"query_installed_software", {ToolEffect::ReadOnly, true, "Query installed software"}},
     {"query_software_catalogue", {ToolEffect::ReadOnly, true, "Query the software catalogue"}},
     {"get_software_versions", {ToolEffect::ReadOnly, true, "Get a title's versions"}},
+    {"list_software_hosts", {ToolEffect::ReadOnly, true, "List software hosts"}},
+    {"get_software_host", {ToolEffect::ReadOnly, true, "Get a host's software"}},
+    {"list_software_changes", {ToolEffect::ReadOnly, true, "List software changes"}},
+    {"get_software_summary", {ToolEffect::ReadOnly, true, "Get the software summary"}},
+    {"get_software_plugin_health", {ToolEffect::ReadOnly, true, "Get software plugin health"}},
+    {"list_software_collection_settings",
+     {ToolEffect::ReadOnly, true, "List software collection settings"}},
+    {"get_software_collection_settings",
+     {ToolEffect::ReadOnly, true, "Get a group's software collection settings"}},
+    {"get_software_host_collection_settings",
+     {ToolEffect::ReadOnly, true, "Get a host's effective software collection settings"}},
+    {"set_software_collection_settings",
+     {ToolEffect::Destructive, false, "Set a group's software collection settings"}},
     {"list_dex_app_perf_devices",
      {ToolEffect::ReadOnly, true, "List devices reporting an app version"}},
     {"get_tags", {ToolEffect::ReadOnly, true, "Get tags"}},
@@ -6809,6 +6990,9 @@ static_assert(std::is_same_v<ToolDeps::RosterFn, HardwareRoutes::RosterFn>,
               "ToolDeps::RosterFn drifted from HardwareRoutes::RosterFn");
 static_assert(std::is_same_v<ToolDeps::CiDetailFn, HardwareRoutes::CiDetailFn>,
               "ToolDeps::CiDetailFn drifted from HardwareRoutes::CiDetailFn");
+static_assert(std::is_same_v<decltype(ToolDeps::ci_page_reader),
+                             decltype(HardwareRoutes::Deps::ci_page_reader)>,
+              "ToolDeps::ci_page_reader drifted from HardwareRoutes::Deps::ci_page_reader");
 static_assert(std::is_same_v<ToolDeps::DexScoreFn, HardwareRoutes::DexScoreFn>,
               "ToolDeps::DexScoreFn drifted from HardwareRoutes::DexScoreFn");
 static_assert(std::is_same_v<ToolDeps::CryptoAccessFn, McpServer::CryptoAccessFn>,
@@ -7676,9 +7860,9 @@ dispatch_pairs_for(const std::string& tool_name, const nlohmann::json& args) {
         return {{param_str(args, "plugin"), param_str(args, "action")}};
     }
     if (tool_name == "quarantine_device") {
-        // "quarantine"/"quarantine" is the one fixed pair every
+        // "firewall"/"quarantine" is the one fixed pair every
         // quarantine_device call dispatches — not caller-supplied.
-        return {{"quarantine", "quarantine"}};
+        return {{std::string(kContainmentPlugin), std::string(kContainmentApplyAction)}};
     }
     if (tool_name == "execute_bundle") {
         std::vector<std::pair<std::string, std::string>> pairs;
@@ -12818,6 +13002,337 @@ McpServer::HandlerFn McpServer::build_handler(
                 reply(swc::catalogue_response_json(page.rows, page.totals, page.kpis, page.next_cursor,
                                                    omit_newest, 0),
                       audit_ok);
+                return;
+            }
+
+            // ── SAM-35: the installed-software v3 reads and the collection settings ──
+            // Each tool returns field for field what its REST route returns in `data`, because
+            // both call the SAME functions (software_read_api.cpp, software_collection_settings_api
+            // .cpp). The reads take fleet_read_fn_ as the SOLE gate (admit-then-filter, ADR-0017):
+            // its scope is the filter, never stacked with perm_fn. The settings tools take the
+            // ManagementGroup gate the REST routes take: the shared deny-on-degrade gate for the
+            // list, the RBAC-unavailable-aware probe for a group's document and the write. The
+            // write keeps the REST sequence (parse, `requested` audit row fail-closed, write-grant
+            // re-check, store put, outcome row) because it IS the REST function.
+            if (tool_name == "list_software_hosts" || tool_name == "get_software_host" ||
+                tool_name == "list_software_changes" || tool_name == "get_software_summary" ||
+                tool_name == "get_software_plugin_health" ||
+                tool_name == "get_software_host_collection_settings" ||
+                tool_name == "list_software_collection_settings" ||
+                tool_name == "get_software_collection_settings" ||
+                tool_name == "set_software_collection_settings") {
+                namespace sra = software_read_api;
+                namespace sca = software_collection_settings_api;
+                using AT = sra::ArgSpec::Type;
+                static constexpr std::int64_t kEpochMax = 9007199254740991;
+                static constexpr sra::ArgSpec kHostsArgs[] = {
+                    {AT::kString, "q", 0, 128},
+                    {AT::kInt, "last_synced_before", 0, kEpochMax},
+                    {AT::kInt, "limit", 1, 1000},
+                    {AT::kString, "cursor", 0, 2048}};
+                static constexpr sra::ArgSpec kHostArgs[] = {{AT::kString, "agent_id", 0, 256},
+                                                             {AT::kInt, "limit", 1, 1000},
+                                                             {AT::kString, "cursor", 0, 2048}};
+                static constexpr sra::ArgSpec kChangesArgs[] = {
+                    {AT::kString, "agent_id", 0, 256},
+                    {AT::kString, "kind", 0, 16},
+                    {AT::kInt, "since", 0, kEpochMax},
+                    {AT::kInt, "limit", 1, 1000},
+                    {AT::kString, "cursor", 0, 2048}};
+                static constexpr sra::ArgSpec kEffectiveArgs[] = {{AT::kString, "agent_id", 0, 128}};
+                static constexpr sra::ArgSpec kGroupArgs[] = {{AT::kString, "group_id", 0, 64}};
+                constexpr std::span<const sra::ArgSpec> kNoArgs{}; // the tools that take none
+                auto invalid = [&](std::string_view message) {
+                    res.set_content(error_response(id, kInvalidParams, message), "application/json"); // retry-hint-exempt: caller-input rejection
+                };
+                // One success write for every Ok arm below; a read reply's body can be a page, so
+                // it is taken by const reference.
+                auto ok = [&](const nlohmann::json& body) {
+                    res.set_content(
+                        success_response(id, tool_result(software_catalogue::dump_safe(body),
+                                                         kObjectOutputSchema)),
+                        "application/json");
+                };
+                auto unavailable = [&](std::string_view message, std::string_view remediation,
+                                       const std::optional<std::int64_t>& retry_ms) {
+                    res.set_content(a4_error(kInternalError, message, remediation,
+                                             retry_ms ? static_cast<long>(*retry_ms) : -1L),
+                                    "application/json");
+                };
+                // The strict check shared by every tool that takes arguments: an unknown key, a
+                // wrongly typed value or an out-of-range integer is refused where REST clamps.
+                // swc::strict_args_error (the two catalogue tools above) is not reused: it walks a
+                // fixed key list keyed to the catalogue's closed kind / ecosystem vocabulary and
+                // admits unknown keys, where these tools refuse them from a per-tool spec table.
+                auto strict = [&](std::span<const sra::ArgSpec> allowed) {
+                    if (const auto bad = sra::strict_args_error(args, allowed)) {
+                        invalid(*bad);
+                        return false;
+                    }
+                    return true;
+                };
+
+                const bool is_settings = tool_name.ends_with("_collection_settings") &&
+                                         tool_name != "get_software_host_collection_settings";
+                if (!is_settings) {
+                    // Reads: the sole gate is fleet_read_fn_ (the settings effective read takes the
+                    // device-scoped Inventory:Read, below).
+                    const bool is_effective = tool_name == "get_software_host_collection_settings";
+                    authz::VisibleSet scope;
+                    if (!is_effective) {
+                        if (!fleet_read_fn_) {
+                            spdlog::error("{}: fleet_read_fn_ unwired - misconfigured call site; "
+                                          "failing closed",
+                                          tool_name);
+                            res.set_content(
+                                error_response(id, kInternalError, "service unavailable"),
+                                "application/json");
+                            return;
+                        }
+                        auto gate = fleet_read_fn_(req, res, "Inventory", "Read");
+                        if (!gate.admitted)
+                            return; // gate already wrote the A4 error body + status
+                        scope = std::move(gate.scope);
+                    }
+                    const std::string cid = yuzu::server::detail::make_correlation_id();
+                    const sra::AuditSink audit = [&](const std::string& result,
+                                                     const std::string& target,
+                                                     const std::string& detail_text) {
+                        return mcp_audit(result, detail_text.empty() ? target
+                                                                     : target + "; " + detail_text);
+                    };
+                    auto respond = [&](const sra::Reply& reply) {
+                        using Kind = sra::Reply::Kind;
+                        switch (reply.kind) {
+                        case Kind::Ok:
+                            ok(reply.body);
+                            return;
+                        case Kind::BadRequest:
+                        case Kind::NotFound:
+                            // retry-hint-exempt: caller input, or an unknown / out-of-scope id (the
+                            // same answer for both); a retry fails identically
+                            res.set_content(error_response(id, kInvalidParams, reply.message),
+                                            "application/json");
+                            return;
+                        case Kind::Unavailable:
+                            unavailable(reply.message, reply.remediation, reply.retry_after_ms);
+                            return;
+                        }
+                    };
+
+                    if (is_effective) {
+                        if (!strict(kEffectiveArgs))
+                            return;
+                        const auto agent_id = param_str(args, "agent_id");
+                        if (agent_id.empty() || agent_id.size() > 128) {
+                            invalid("agent_id is required (1 to 128 characters)");
+                            return;
+                        }
+                        // The per-device SCOPED gate, as the REST route: fail closed if unwired.
+                        if (!scoped_perm_fn) {
+                            res.set_content(a4_error(kInternalError, "scope gate not configured"),
+                                            "application/json");
+                            return;
+                        }
+                        if (!scoped_perm_fn(req, res, "Inventory", "Read", agent_id))
+                            return; // the gate wrote its own 401/403
+                        const auto stores_ok = sca::stores_ready(collection_settings_stores_, true);
+                        if (!stores_ok) {
+                            res.set_content(
+                                error_response(id, kInternalError,
+                                               "Collection settings store unavailable"),
+                                "application/json");
+                            return;
+                        }
+                        const auto reply = sca::effective(collection_settings_stores_, agent_id);
+                        const bool audit_ok = mcp_audit(reply.kind == sca::Reply::Kind::Ok
+                                                            ? "success"
+                                                            : "failure",
+                                                        "agent=" + audit_token(agent_id));
+                        if (reply.kind == sca::Reply::Kind::Ok) {
+                            auto body = reply.body;
+                            if (!audit_ok)
+                                body["audit_persisted"] = false;
+                            ok(body);
+                            return;
+                        }
+                        unavailable(reply.message, reply.remediation, reply.retry_after_ms);
+                        return;
+                    }
+
+                    if (!software_read_ctx_ || !software_read_ctx_->ready) {
+                        res.set_content(error_response(id, kInternalError,
+                                                       "Software inventory store unavailable"),
+                                        "application/json");
+                        return;
+                    }
+                    const auto& ctx = *software_read_ctx_;
+                    if (tool_name == "list_software_hosts") {
+                        if (!strict(kHostsArgs))
+                            return;
+                        respond(sra::hosts(ctx, sra::args_to_params(args, kHostsArgs), scope, cid,
+                                           audit));
+                    } else if (tool_name == "get_software_host") {
+                        if (!strict(kHostArgs))
+                            return;
+                        const auto agent_id = param_str(args, "agent_id");
+                        if (agent_id.empty()) {
+                            invalid("agent_id is required");
+                            return;
+                        }
+                        respond(sra::host(ctx, agent_id, sra::args_to_params(args, kHostArgs),
+                                          scope, cid, audit));
+                    } else if (tool_name == "list_software_changes") {
+                        if (!strict(kChangesArgs))
+                            return;
+                        respond(sra::changes(ctx, sra::args_to_params(args, kChangesArgs), scope,
+                                             cid, audit));
+                    } else {
+                        // get_software_summary / get_software_plugin_health: no arguments.
+                        if (!strict(kNoArgs))
+                            return;
+                        respond(tool_name == "get_software_summary"
+                                    ? sra::summary(ctx, scope, cid, audit)
+                                    : sra::plugin_health(ctx, scope, cid, audit));
+                    }
+                    return;
+                }
+
+                // ── The per-group collection settings: ManagementGroup Read / Write ──
+                const bool is_write = tool_name == "set_software_collection_settings";
+                const char* const mg_op = is_write ? "Write" : "Read";
+                if (!tier_allows(tier, "ManagementGroup", mg_op)) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                const bool is_list = tool_name == "list_software_collection_settings";
+                if (is_list) {
+                    // The shared deny-on-degrade gate, as the REST list route.
+                    if (!perm_fn(req, res, "ManagementGroup", "Read"))
+                        return;
+                    if (!strict(kNoArgs))
+                        return;
+                } else if (!collection_settings_probe_perm_fn_) {
+                    // Wired once at construction: permanent, so no retry hint.
+                    res.set_content(a4_error(kInternalError, "permission probe not configured"),
+                                    "application/json");
+                    return;
+                }
+                if (!sca::stores_ready(collection_settings_stores_)) {
+                    res.set_content(
+                        error_response(id, kInternalError, "Collection settings store unavailable"),
+                        "application/json");
+                    return;
+                }
+                std::string group_id;
+                if (!is_list) {
+                    const auto group_arg = args.is_object() ? args.find("group_id") : args.end();
+                    if (!args.is_object() || group_arg == args.end() || !group_arg->is_string()) {
+                        invalid("group_id is required and must be a string");
+                        return;
+                    }
+                    group_id = group_arg->get<std::string>();
+                    // The REST route matches ([a-f0-9]+); the id is also bounded here.
+                    if (group_id.empty() || group_id.size() > 64 ||
+                        group_id.find_first_not_of("0123456789abcdef") != std::string::npos) {
+                        invalid("group_id must be 1 to 64 lowercase hex characters");
+                        return;
+                    }
+                    if (!is_write && !strict(kGroupArgs))
+                        return;
+                }
+                // The authority: an RBAC read that cannot be completed answers a retryable error,
+                // never a refusal or an admit (REST: 503), and a lapsed session is never recorded
+                // as withdrawn authority. The probe runs into a throwaway response.
+                const sca::AuthorityFn authority = [&](const char* op) {
+                    httplib::Response probe;
+                    if (collection_settings_probe_perm_fn_(req, probe, "ManagementGroup", op))
+                        return sca::Authority::Admit;
+                    if (probe.status != 503 && probe.status != 401)
+                        return sca::Authority::Deny;
+                    if (probe.status == 401)
+                        res.set_content(
+                            a4_error(kPermissionDenied, "session ended", "sign in again"),
+                            "application/json");
+                    else
+                        res.set_content(a4_error(kInternalError, "authority read unavailable",
+                                                 "retry the request",
+                                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                        "application/json");
+                    return probe.status == 401 ? sca::Authority::Lapsed : sca::Authority::Degraded;
+                };
+                const sca::AuditSink sink = [&](const char* verb, const char* result,
+                                                const std::string& target,
+                                                const std::string& detail_text, bool) {
+                    return yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, verb, result, sca::kGroupTargetType, target, detail_text);
+                };
+
+                sca::Reply reply;
+                if (is_list) {
+                    reply = sca::list(collection_settings_stores_);
+                } else if (!is_write) {
+                    reply = sca::get(collection_settings_stores_, group_id, authority, sink);
+                } else {
+                    // The body is the REST PUT body: every argument but the group id and the
+                    // approval ticket. The REST parser refuses an unknown field.
+                    nlohmann::json body = args;
+                    body.erase("group_id");
+                    body.erase("approval_id");
+                    reply = sca::put(collection_settings_stores_, group_id, body.dump(),
+                                     session->username, authority, sink);
+                }
+                const std::string mcp_target = group_id.empty() ? std::string{} : "group=" + group_id;
+                switch (reply.kind) {
+                case sca::Reply::Kind::Handled:
+                    return; // the authority function wrote the response
+                case sca::Reply::Kind::Ok: {
+                    auto body = reply.body;
+                    const bool audit_ok = mcp_audit("success", mcp_target);
+                    if (!audit_ok || !reply.audit_persisted)
+                        body["audit_persisted"] = false;
+                    ok(body);
+                    return;
+                }
+                case sca::Reply::Kind::BadRequest:
+                    mcp_audit("denied", mcp_target);
+                    invalid(reply.message);
+                    return;
+                case sca::Reply::Kind::NotFound:
+                    mcp_audit("denied", mcp_target);
+                    // retry-hint-exempt: an unknown group, or a group with no document
+                    res.set_content(a4_error(kInvalidParams, reply.message, reply.remediation),
+                                    "application/json");
+                    return;
+                case sca::Reply::Kind::Forbidden:
+                    mcp_audit("denied", mcp_target);
+                    res.set_content(a4_error(kPermissionDenied, reply.message,
+                                             std::string("ManagementGroup:") + mg_op +
+                                                 " is required"),
+                                    "application/json");
+                    return;
+                case sca::Reply::Kind::Conflict: {
+                    mcp_audit("failure", mcp_target + "; version mismatch");
+                    // The refusal carries the stored document so the caller can retry with its
+                    // version (REST: error.current).
+                    const auto cid = yuzu::server::detail::make_correlation_id();
+                    nlohmann::json data{{"correlation_id", cid},
+                                        {"retry_after_ms", nullptr},
+                                        {"remediation", reply.remediation},
+                                        {"current", reply.body}};
+                    res.set_content(error_response(id, kInvalidParams, reply.message,
+                                                   data.dump(-1, ' ', false,
+                                                             nlohmann::json::error_handler_t::replace)),
+                                    "application/json"); // retry-hint-exempt: stale version, resending it fails identically
+                    return;
+                }
+                case sca::Reply::Kind::Unavailable:
+                    mcp_audit("failure", mcp_target);
+                    unavailable(reply.message, reply.remediation, reply.retry_after_ms);
+                    return;
+                }
                 return;
             }
 
@@ -24197,7 +24712,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     // newly-created branch's own inline construction.
                     .principal_is_admin =
                         auth::effective_role(*session) == auth::Role::admin,
-                    // #1398: quarantine.quarantine is AdminOrApproval-gated.
+                    // #1398: firewall.quarantine is AdminOrApproval-gated.
                     // A supervised-tier MCP token reaches here only after C8
                     // consumed a real ticket for THIS request
                     // (approval_ticket_just_consumed); a non-MCP-tiered
@@ -24230,7 +24745,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!authorize_dispatch_fn_) {
                     // Fail-closed, same shape as C8's own guard: an unwired
                     // authorizer means this handler cannot determine whether
-                    // THIS caller may dispatch quarantine.quarantine at all.
+                    // THIS caller may dispatch firewall.quarantine at all.
                     const std::string cid = yuzu::server::detail::make_correlation_id();
                     mcp_audit("denied", "agent_id=" + agent_id +
                                              ", dispatch authorizer unavailable correlation_id=" +
@@ -24244,9 +24759,11 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 if (auto authz_decision =
-                        authorize_dispatch_fn_(quarantine_caller, "quarantine", "quarantine");
+                        authorize_dispatch_fn_(quarantine_caller, kContainmentPlugin,
+                                               kContainmentApplyAction);
                     !authz_decision) {
-                    deny_dispatch_authorization("quarantine", "quarantine",
+                    deny_dispatch_authorization(std::string(kContainmentPlugin),
+                                                std::string(kContainmentApplyAction),
                                                 authz_decision.error());
                     return;
                 }
@@ -24269,32 +24786,30 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                // Mirror the agent's is_safe_ip charset ([0-9a-fA-F.:], <=45) so we
-                // reject anything the agent would silently drop, loudly.
-                // #3425: moved to quarantine_reapply.hpp
-                // (quarantine_whitelist_tokens_safe) — the SAME shared
-                // chokepoint the already_active retry path below,
-                // QuarantineContainmentReconciler, and the REST twin
-                // (rest_api_v1.cpp's POST /api/v1/quarantine) all call, so
-                // this check exists in exactly one place rather than N
-                // hand-rolled copies.
-                if (!quarantine_whitelist_tokens_safe(whitelist)) {
+                // The firewall plugin's exception grammar takes bare IPv4/IPv6 literals, at most
+                // 32 here (each is sent as an /out and an /in exception): refuse anything it
+                // would refuse, loudly. #3425: map_whitelist_to_exceptions
+                // (quarantine_reapply.hpp) is the SAME single validator the already_active
+                // retry path below, QuarantineContainmentReconciler, and the REST twin
+                // (rest_api_v1.cpp's POST /api/v1/quarantine) all call, so this check exists
+                // in exactly one place rather than N hand-rolled copies.
+                if (!map_whitelist_to_exceptions(whitelist)) {
                     res.set_content(
                         error_response(id, kInvalidParams,
-                                       "whitelist must be comma-separated IPv4/IPv6 literals"),
+                                       "whitelist must be comma-separated IPv4/IPv6 literals, "
+                                       "at most 32"),
                         "application/json");
                     return;
                 }
-                // NOTE (governance sec-LOW-1 / UP-6): this call never sets qparams'
-                // server_ip — but live isolation still keeps the management channel
-                // reachable, because the agent independently derives its own server
-                // address once at STARTUP (agents/core/src/server_address_resolver.cpp,
-                // resolved via DNS when it's a hostname) and threads the result into
-                // every plugin's config, rather than depending on a caller-supplied
-                // one. Deliberately not resolved by the quarantine plugin itself at
-                // dispatch time -- see quarantine_plugin.cpp's do_quarantine comment
-                // on why that would let the host being quarantined steer its own
-                // containment exception via its own (possibly compromised) resolver.
+                // NOTE (governance sec-LOW-1 / UP-6): this call sends no server address — but
+                // live isolation still keeps the management channel reachable, because the
+                // agent independently derives its own server address once at STARTUP
+                // (agents/core/src/server_address_resolver.cpp, resolved via DNS when it's a
+                // hostname) and threads the result into every plugin's config, rather than
+                // depending on a caller-supplied one. Deliberately not resolved by the
+                // firewall plugin at dispatch time: that would let the host being
+                // quarantined steer its own containment exception via its own (possibly
+                // compromised) resolver.
                 // 1. Persist the quarantine record (store row only; mirror REST).
                 auto quar_res =
                     quarantine_store->quarantine_device(agent_id, session->username, reason, whitelist);
@@ -24374,9 +24889,12 @@ McpServer::HandlerFn McpServer::build_handler(
                 std::string command_id;
                 int agents_reached = 0;
                 bool dispatch_threw = false;
-                if (record_pre_existing) {
+                // Both branches read the STORED row and dispatch from it: the `created` branch's
+                // row IS this call's own write, so the dispatched whitelist is the same value, and
+                // there is no second hand-built dispatch to drift from the reconciler's.
+                if (record_pre_existing || (dispatch_fn && should_dispatch_isolation(write_result))) {
                     // #3425: the shared recipe (quarantine_reapply.hpp) owns
-                    // the read-stored-row + validate + dispatch sequence —
+                    // the read-stored-row + map + dispatch sequence —
                     // the SAME chokepoint QuarantineContainmentReconciler
                     // uses on reconnect, so the stored-whitelist-only
                     // invariant lives in exactly one function rather than
@@ -24387,24 +24905,29 @@ McpServer::HandlerFn McpServer::build_handler(
                         [&](const std::unordered_map<std::string, std::string>& params)
                             -> std::pair<std::string, int> {
                             // ReapplyDispatchFn's narrower pair shape is deliberate --
-                            // see its own doc comment. `is_quarantine_control_plugin`
-                            // is the closed quarantine set inside the shared
+                            // see its own doc comment. `is_firewall_control_plugin`
+                            // is the closed firewall containment set inside the shared
                             // protective predicate (yuzu::protective::
                             // is_protective_action): these actions are exempt from
                             // the CONTAINMENT gate, the kill switch, the per-OS
                             // withhold and #3511's plugin-presence filter
                             // (`AgentRegistry::ids_missing_plugin` returns nothing
                             // for them). A reapply to an agent genuinely missing
-                            // the quarantine plugin is therefore delivered and the
+                            // the firewall plugin is therefore delivered and the
                             // agent answers with its own plugin-not-found; the
                             // narrower return shape can't discriminate that, so see
                             // the caller's `agents_reached == 0` handling, which
                             // reads an unreached result as an ordinary retry case.
+                            // governance UP-9: the caller carries a set CONFINED to the
+                            // single scope-gate-checked target, not an unfiltered
+                            // VisibleSet{}; #1398: quarantine_caller (defined above)
+                            // already carries principal_is_admin/approval_provenance.
                             if (!dispatch_fn)
                                 return {};
-                            const auto outcome = dispatch_fn("quarantine", "quarantine", {agent_id},
-                                                             /*scope=*/"", params,
-                                                             /*execution_id=*/"", quarantine_caller);
+                            const auto outcome = dispatch_fn(
+                                std::string(kContainmentPlugin),
+                                std::string(kContainmentApplyAction), {agent_id},
+                                /*scope=*/"", params, /*execution_id=*/"", quarantine_caller);
                             return {outcome.command_id, outcome.sent};
                         },
                         stored);
@@ -24419,11 +24942,26 @@ McpServer::HandlerFn McpServer::build_handler(
                                 "application/json");
                             return;
                         }
+                        if (err.kind == ContainmentReapplyErrorKind::release_pending) {
+                            // Not a transient fault: a release is in flight for this record, and
+                            // containment is not re-applied under it. The request is refused for
+                            // the state the resource is in (kInvalidParams, as the REST twin's
+                            // 400), not a service fault. No retry hint.
+                            mcp_audit("failure", "agent_id=" + agent_id +
+                                                     ", release in progress; isolation not "
+                                                     "dispatched");
+                            res.set_content(
+                                a4_error(kInvalidParams,
+                                         "a release is in progress for this device"),
+                                "application/json");
+                            return;
+                        }
                         // store_error / no_active_record: both leave nothing
                         // durable to dispatch against — retry the whole
                         // request rather than report isolated on a record
                         // that turned out not to be there.
-                        mcp_audit("failure", "agent_id=" + agent_id + ", " + err.detail);
+                        mcp_audit("failure", "agent_id=" + agent_id + ", " + err.detail +
+                                                 (record_pre_existing ? "" : " record_persisted=1"));
                         res.set_content(a4_error(kInternalError, err.detail, "retry the request",
                                                  /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                         "application/json");
@@ -24438,43 +24976,11 @@ McpServer::HandlerFn McpServer::build_handler(
                     // The caller's params were not applied — tell it, rather
                     // than silently discarding a whitelist it thought it was
                     // setting.
-                    if (!whitelist.empty() && whitelist != stored.whitelist)
+                    if (record_pre_existing && !whitelist.empty() && whitelist != stored.whitelist)
                         whitelist_request_ignored = true;
                     command_id = reapply_res->command_id;
                     agents_reached = reapply_res->agents_reached;
                     dispatch_threw = reapply_res->dispatch_threw;
-                } else if (dispatch_fn && should_dispatch_isolation(write_result)) {
-                    // `created`: dispatch this call's own (already
-                    // server-edge-validated above) whitelist directly — no
-                    // extra store read needed, the row we just wrote IS
-                    // `effective_whitelist`. `store_error` already returned
-                    // above, so `should_dispatch_isolation` is true here by
-                    // construction; the call stays explicit per #3127.
-                    std::unordered_map<std::string, std::string> qparams;
-                    if (!effective_whitelist.empty())
-                        qparams["whitelist_ips"] = effective_whitelist;
-                    try {
-                        // governance UP-9: thread a set CONFINED to the single
-                        // scope-gate-checked target, not an unfiltered VisibleSet{} —
-                        // defense in depth matching the bundle/execute_instruction
-                        // dispatch arms (this was the last arm still passing
-                        // unfiltered on a single already-authorized target).
-                        // PLAN-006: `session` was authenticated at handler entry and
-                        // is already used for the store write above — identify the
-                        // caller to dispatch_confined too, not just its visible set.
-                        // #1398: quarantine_caller (defined above this if/else,
-                        // shared with the reapply branch) already carries
-                        // principal_is_admin/approval_provenance.
-                        const auto outcome =
-                            dispatch_fn("quarantine", "quarantine", {agent_id}, /*scope=*/"",
-                                        qparams, /*execution_id=*/"", quarantine_caller);
-                        command_id = outcome.command_id;
-                        agents_reached = outcome.sent;
-                    } catch (const std::exception& e) {
-                        dispatch_threw = true;
-                        spdlog::error("MCP quarantine_device: isolation dispatch failed: {}",
-                                      e.what());
-                    }
                 }
                 // #3127: agents_reached>0 means the plugin registry ACCEPTED
                 // the frame — for a gateway-attached agent, send_to only
@@ -24482,7 +24988,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // execution. The response's dispatch_confirmed below means
                 // exactly that acceptance, never "the device is provably
                 // isolated": confirming isolation still requires a follow-up
-                // `status` read returning `state|active`.
+                // `firewall.quarantine_status` read returning `status|active`.
                 const QuarantineResponse response_shape =
                     quarantine_response_shape(write_result, agents_reached, dispatch_threw);
                 if (response_shape == QuarantineResponse::unconfirmed_retryable) {
@@ -24538,7 +25044,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     // (heartbeat-triggered, with a periodic tick backstop for
                     // anything the heartbeat hook misses) and only marks
                     // containment confirmed after a follow-up
-                    // `quarantine.status` read reports `state|active` — the
+                    // `firewall.quarantine_status` read reports the rules in force — the
                     // wording below reflects that a manual re-issue is no
                     // longer load-bearing, only redundant-but-harmless.
                     //
@@ -24609,8 +25115,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     .add("agents_reached", agents_reached)
                     // dispatch_confirmed, NOT isolation_confirmed: see the
                     // comment above response_shape. A client that needs proof
-                    // of isolation reads `status` and checks for
-                    // state|active.
+                    // of isolation reads firewall.quarantine_status and checks for
+                    // status|active.
                     .add("dispatch_confirmed", true)
                     // Unconditional booleans (not present-only-when-true) so a
                     // client can distinguish "false" from "this server

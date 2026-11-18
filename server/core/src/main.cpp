@@ -13,6 +13,7 @@
 #include "insecure_tls_gate.hpp"
 #include "kek_rotate_control.hpp" // detail::kKekMaxLiveVersionsDefault / kek_ceiling_is_risk_acceptance
 #include "key_provider.hpp"
+#include "mfa_disable_owner.hpp" // --mfa-reset: one-transaction factor clear (#6079 PR 2c)
 #include "pg/multi_host_dsn.hpp" // HA WS-8: multi-host DSN must use target_session_attrs=read-write
 #include "pg/pg_pool.hpp"
 #include "pg/secret_codec.hpp"
@@ -41,6 +42,7 @@
 #endif
 #include <yuzu/tls_policy.hpp> // #4722: shared TLS 1.2 cipher allow-list
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -535,8 +537,9 @@ int main(int argc, char* argv[]) {
     // MFA / TOTP — SOC 2 CC6.6. See docs/auth-mfa-design.md.
     app.add_option("--mfa-enforcement", cfg.mfa_enforcement,
                    "MFA enforcement (default: optional). \"optional\" = login never requires "
-                   "it; only an administrator can enrol, from Settings (a non-admin needs "
-                   "an enrolment sign-in window). \"admin-only\" = admins must "
+                   "it; only an administrator can enrol, from Settings, so a non-admin cannot "
+                   "enrol itself (see the runbook \"Enrolling a non-admin approver\"). "
+                   "\"admin-only\" = admins must "
                    "enrol before login completes. \"required\" = every role must enrol. "
                    "Under admin-only/required an un-enrolled login is redirected through "
                    "TOTP enrollment (POST /login/mfa/enroll) before a session is minted.")
@@ -546,9 +549,15 @@ int main(int argc, char* argv[]) {
     app.add_option("--mfa-step-up-window-secs", cfg.mfa_step_up_window_secs,
                    "Seconds after a TOTP proof that high-risk endpoints accept the session as "
                    "stepped-up (default: 300). A value <= 0 disables the stale-proof "
-                   "requirement on the 41 central step-up routes: a stale or absent proof is "
-                   "neither refused nor recorded, SAML sessions pass, and the auth store is not "
-                   "read; engine denials and unwired-store refusals still apply and are recorded")
+                   "requirement on the 39 ordinary step-up routes only: a stale or absent proof "
+                   "is neither refused nor recorded, SAML sessions pass, and the auth store is "
+                   "not read; engine denials and unwired-store refusals still apply and are "
+                   "recorded. Two route classes are NOT switched off by <= 0: approval "
+                   "approve/reject always need an enrolled factor and a proof within the "
+                   "approver window, and the two factor-credential routes (regenerate recovery "
+                   "codes, disable MFA) always need a local session with a proof inside the "
+                   "approver window. The approver window is 300 seconds when this value is <= 0, "
+                   "otherwise the smaller of this value and 300")
         ->default_val(300)
         ->envname("YUZU_MFA_STEP_UP_WINDOW_SECS");
     app.add_option("--mfa-login-pending-secs", cfg.mfa_login_pending_secs,
@@ -717,6 +726,35 @@ int main(int argc, char* argv[]) {
         // flag cannot accept a value the pool will silently refuse to honour.
         ->check(CLI::Range(std::size_t{0}, yuzu::server::detail::kMaxHttpWorkerThreads))
         ->envname("YUZU_HTTP_WORKER_THREADS");
+    app.add_option("--inventory-export-concurrency", cfg.inventory_export_concurrency,
+                   "Concurrent streamed installed-software exports, server-wide "
+                   "(GET /api/v1/inventory/software/export). Each open export holds one HTTP "
+                   "worker until it finishes and is one lease from the --max-sse-streams "
+                   "budget; this caps those leases. A request over the cap is answered 503 "
+                   "with a retry hint. Default 2.")
+        ->check(CLI::Range(1, 16))
+        ->envname("YUZU_INVENTORY_EXPORT_CONCURRENCY");
+    app.add_option("--inventory-export-max-rows", cfg.inventory_export_max_rows,
+                   "Most rows one streamed installed-software export may write "
+                   "(GET /api/v1/inventory/software/export, JSONL and CSV). A stream that would "
+                   "pass it is cut without its terminating chunk, so the client sees an aborted "
+                   "transfer, never a file that looks complete. Default 5000000.")
+        ->check(CLI::Range(std::int64_t{1000}, std::int64_t{1'000'000'000}))
+        ->envname("YUZU_INVENTORY_EXPORT_MAX_ROWS");
+    app.add_option("--inventory-export-max-bytes", cfg.inventory_export_max_bytes,
+                   "Most body bytes one streamed installed-software export may write (JSONL and "
+                   "CSV). Cut like --inventory-export-max-rows when passed. Default 1073741824 "
+                   "(1 GiB).")
+        ->check(CLI::Range(std::int64_t{1} << 20, std::int64_t{1} << 40))
+        ->envname("YUZU_INVENTORY_EXPORT_MAX_BYTES");
+    app.add_option("--inventory-sync-cooldown", cfg.inventory_sync_cooldown_s,
+                   "Seconds between two on-demand software-inventory sync runs of the same group, "
+                   "scope expression or the whole fleet (POST /api/v1/hardware/sync and the MCP "
+                   "tool sync_hardware_software). A repeat of a run still spreading joins it and is "
+                   "not held back. 0 = no gap. Per server process (default: 600)")
+        ->default_val(600)
+        ->check(CLI::Range(0, 86400)) // 86400 = software_sync::kMaxCooldownSecs
+        ->envname("YUZU_INVENTORY_SYNC_COOLDOWN");
 
     // Fleet visualization (PR 3 of feat/viz-engine ladder)
     app.add_flag("--viz-disable", cfg.viz_disable,
@@ -820,8 +858,10 @@ int main(int argc, char* argv[]) {
     // reset is audited (unlike the manual SQL break-glass it replaces). #1226.
     std::string mfa_reset_user;
     app.add_option("--mfa-reset", mfa_reset_user,
-                   "Break-glass: clear MFA enrollment for the named user, then exit "
-                   "(audited recovery from MFA lockout)");
+                   "Break-glass: clear MFA enrollment for the named user and end its sessions, "
+                   "then exit (audited recovery from MFA lockout; applies the auth and "
+                   "session_store v3 migrations, after which the previous build is not supported "
+                   "against this database)");
 
     // Break-glass arm mode (runs and exits, no server startup). Arms the
     // configured --break-glass-user for --break-glass-window-secs so it can log
@@ -1257,17 +1297,19 @@ int main(int argc, char* argv[]) {
     // disabled state at all (see approver_step_up_window in mfa_factor_state.hpp).
     if (cfg.mfa_step_up_window_secs <= 0) {
         spdlog::warn(
-            "--mfa-step-up-window-secs={} disables the stale-proof requirement on the 41 central "
-            "step-up routes (REST, dashboard and Settings routes; the three JIT-elevation routes "
-            "keep their own 300 s window). On the 41 routes a stale or absent proof is neither "
-            "refused nor "
-            "recorded (no SOC 2 CC6.6 `mfa.step_up.required` evidence row), they will NOT "
-            "re-prompt for MFA proof, SAML sessions pass, and the auth store is not read. "
-            "Engine-principal denials and unwired-auth-store refusals still apply on those "
-            "routes and are still recorded. Set to a positive value (default 300) to restore "
-            "the requirement. The approval decide routes (POST /api/approvals/{{id}}/approve and "
-            "/reject) are the exception: they also require an ENROLLED caller's proof no older "
-            "than 300s regardless of this setting.",
+            "--mfa-step-up-window-secs={} disables the stale-proof requirement on the 39 ordinary "
+            "step-up routes only (REST, dashboard and Settings routes; the three JIT-elevation "
+            "routes keep their own 300 s window). On those 39 a stale or absent proof is neither "
+            "refused nor recorded (no SOC 2 CC6.6 `mfa.step_up.required` evidence row), they will "
+            "NOT re-prompt for MFA proof, SAML sessions pass, and the auth "
+            "store is not read. Engine-principal denials and unwired-auth-store refusals still "
+            "apply on those routes and are still recorded. Set to a positive value (default 300) "
+            "to restore the requirement. Two route classes ignore the setting: the two "
+            "factor-credential routes (regenerate recovery codes, disable MFA) always require a "
+            "local session with a proof inside the approver window, and the approval decide "
+            "routes (POST /api/approvals/{{id}}/approve and /reject) always require an ENROLLED "
+            "caller's proof inside that window; the approver window is 300 s when the setting is "
+            "<= 0 and never more than 300 s.",
             cfg.mfa_step_up_window_secs);
     }
 
@@ -1657,9 +1699,18 @@ int main(int argc, char* argv[]) {
             cfg.ca_dir.empty() ? yuzu::server::auth::default_cert_dir() : cfg.ca_dir;
         auth_key_provider.emplace(key_dir);
         auth_secret_codec.emplace(*auth_key_provider);
-        auth_db = std::make_unique<yuzu::server::AuthDB>(*auth_pg_pool, *auth_secret_codec);
+        // The two host-CLI recovery one-shots open the store WITHOUT the MFA trigger refusal
+        // (#6079): an operator locked out because that check fails must still be able to clear
+        // a factor or arm the break-glass account. Every other mode, serving included, enforces
+        // it, and the serving ServerImpl builds its own stores with the default.
+        const bool recovery_oneshot = !mfa_reset_user.empty() || break_glass_arm;
+        auth_db = std::make_unique<yuzu::server::AuthDB>(
+            *auth_pg_pool, *auth_secret_codec, /*cleanup_interval_secs=*/60,
+            recovery_oneshot ? yuzu::server::MfaBindingCheck::kBypassForRecovery
+                             : yuzu::server::MfaBindingCheck::kEnforce);
         if (!auth_db->is_open()) {
-            spdlog::error("Failed to open the Postgres auth store (auth.users migration failed)");
+            spdlog::error("Failed to open the Postgres auth store (migration or MFA trigger check "
+                          "failed; see the preceding AuthDB log line)");
             return EXIT_FAILURE;
         }
         {
@@ -1963,6 +2014,14 @@ int main(int argc, char* argv[]) {
             ev.detail = std::move(detail);
             return ev;
         };
+        // The recovery pointer every refusal below prints, byte for byte what the intent-row
+        // refusal has always printed (tests/shell/test_mfa_reset.sh and the runbook pin it). It
+        // is added as an extra stderr line AFTER each existing error line, never in place of one.
+        const auto print_fallback_pointer = [] {
+            std::cerr << "if you are locked out and cannot restore the audit store, see "
+                         "\"Fallback: direct SQL\" in the Auth Store Recovery Runbook "
+                         "(docs/ops-runbooks/auth-db-recovery.md)\n";
+        };
         if (!audit->log(make_event("attempted", std::format("MFA clear requested via --mfa-reset "
                                                             "CLI (os_identity={})",
                                                             os_user)))) {
@@ -1972,79 +2031,100 @@ int main(int argc, char* argv[]) {
                           "Runbook (docs/ops-runbooks/auth-db-recovery.md)",
                           mfa_reset_user);
             std::cerr << "error: audit store did not accept the intent row; nothing was changed\n";
-            std::cerr << "if you are locked out and cannot restore the audit store, see "
-                         "\"Fallback: direct SQL\" in the Auth Store Recovery Runbook "
-                         "(docs/ops-runbooks/auth-db-recovery.md)\n";
+            print_fallback_pointer();
             return EXIT_FAILURE;
         }
-        if (auto r = auth_db->mfa_disable(mfa_reset_user); !r) {
-            // A lost COMMIT acknowledgement reports failure even when the clear
-            // landed, so this path cannot claim nothing changed: record that the
-            // state is unknown and tell the operator to check before re-running.
-            spdlog::error("--mfa-reset: failed to clear MFA for '{}'; the state is unknown (the "
-                          "clear may have committed)",
-                          mfa_reset_user);
-            if (!audit->log(make_event("error", std::format("MFA clear failed; state unknown, "
-                                                            "re-run after checking status "
-                                                            "(os_identity={})",
-                                                            os_user)))) {
+        // #6079 PR 2c: the factor clear, the end of the account's durable sessions and the
+        // OUTCOME row now commit or abort TOGETHER in one MfaDisableOwner transaction, so there
+        // is no `partial` outcome (a clear whose sessions could not be ended used to leave the
+        // factor cleared and live sessions behind) and no window where the clear is durable but
+        // its row is not: a failure anywhere rolls back, and the factor stays as it was (the one
+        // exception is a connection lost at COMMIT, which commits all of it, so the error text
+        // still asks the operator to check the account before re-running). The `attempted` row
+        // above stays this function's job: it is written first and stops the reset if it cannot
+        // be stored.
+        //
+        // Opening the session store here applies the `session_store` v3 migrations the owner's
+        // session delete runs against (recovery one-shot: opens without the rebind-guard
+        // refusal, it only deletes rows). It must stay: the owner does not open the store.
+        const auto error_row = [&](std::string detail) {
+            // Best effort: the intent row already records that a clear was requested.
+            if (!audit->log(make_event("error", std::move(detail)))) {
                 spdlog::error("--mfa-reset: the outcome audit row for the failed clear of '{}' "
                               "also failed to persist",
                               mfa_reset_user);
             }
-            std::cerr << "error: failed to clear MFA; the state is unknown, check the account's "
-                         "status and re-run\n";
-            return EXIT_FAILURE;
-        }
-        // End the account's durable sessions in the same one-shot (#6079). A session that
-        // survived the reset could hold an MFA proof made under the factor just cleared; the
-        // approver gate refuses a proof older than the CURRENT enrolment, but that comparison
-        // rests on the database clock never stepping backward, and a live session also keeps
-        // a password-only account's access. Ending them leaves no such proof to compare.
-        // The delete bumps the durable generation, so every replica drops its cached copy on
-        // its next refresh. A failure here is loud and non-zero: the factor is already
-        // cleared, so the operator must end the sessions by hand.
-        int sessions_ended = 0;
-        bool sessions_end_failed = false;
-        {
-            yuzu::server::SessionStore sessions(*auth_pg_pool);
-            auto ended = sessions.is_open() ? sessions.invalidate_user(mfa_reset_user)
-                                            : std::unexpected(yuzu::server::SessionStore::Error{
-                                                  "session store did not open"});
-            if (!ended) {
-                spdlog::error("--mfa-reset: MFA cleared for '{}' but ending its sessions failed "
-                              "({}). End them now with DELETE /api/v1/sessions?username=<name> "
-                              "and record the reset.",
-                              mfa_reset_user, ended.error().message);
-                std::cerr << "error: MFA cleared but the account's sessions were not ended\n";
-                sessions_end_failed = true;
-            } else {
-                sessions_ended = *ended;
-            }
-        }
-        // OUTCOME row: "success" when the sessions ended, "partial" when they did not
-        // (the vocabulary the Settings disable route uses for the same state).
-        if (!audit->log(make_event(
-                sessions_end_failed ? "partial" : "success",
-                std::format("MFA enrollment cleared via --mfa-reset CLI (os_identity={}, "
-                            "sessions_ended={})",
-                            os_user,
-                            sessions_end_failed ? "failed" : std::to_string(sessions_ended))))) {
-            // The intent row exists, but the outcome write failed (e.g. disk filled
-            // mid-op). MFA is already cleared; fail loudly and non-zero so automation
-            // and the operator know the outcome row is missing and must be recorded.
-            spdlog::error("--mfa-reset: MFA cleared for '{}' but the outcome audit row failed to "
-                          "persist; record this reset manually in your change-management "
-                          "system NOW",
+        };
+        yuzu::server::SessionStore sessions(*auth_pg_pool,
+                                            yuzu::server::MfaBindingCheck::kBypassForRecovery);
+        if (!sessions.is_open()) {
+            spdlog::error("--mfa-reset: the session store did not open; MFA for '{}' was NOT "
+                          "cleared",
                           mfa_reset_user);
-            std::cerr << "error: MFA cleared but audit row failed to persist; record this reset "
-                         "manually\n";
+            error_row(std::format("MFA clear refused; session store did not open, nothing "
+                                  "changed (os_identity={})",
+                                  os_user));
+            std::cerr << "error: session store unavailable; nothing was changed\n";
+            print_fallback_pointer();
             return EXIT_FAILURE;
         }
-        // The outcome row is written either way; a failed session delete still exits
-        // non-zero so automation and the operator end the sessions by hand.
-        if (sessions_end_failed)
+        // `{sessions_ended}` is the owner's substitution token. The OS identity is part of the
+        // template, so a `{` or `}` in it must not be able to form one (the substitution runs
+        // over the whole template): neutralise both characters in the copy the template gets.
+        // The intent row above carries the raw identity (it is not a template), and so do the
+        // `error_row` rows: the neutralisation applies to the template copy only.
+        std::string template_identity = os_user;
+        std::replace(template_identity.begin(), template_identity.end(), '{', '_');
+        std::replace(template_identity.begin(), template_identity.end(), '}', '_');
+        yuzu::server::MfaDisableRequest clear;
+        clear.username = mfa_reset_user;
+        clear.expected_factor_gen = std::nullopt; // break-glass: no gate, clears whatever is there
+        clear.end_sessions_if_not_enrolled = true; // always end the sessions
+        clear.audit_template = make_event(
+            "success", "MFA enrollment cleared via --mfa-reset CLI (os_identity=" +
+                           template_identity + ", sessions_ended={sessions_ended})");
+        yuzu::server::MfaDisableOwner owner(*auth_pg_pool, audit.get());
+        const auto outcome = owner.commit(clear);
+        switch (outcome.result) {
+        case yuzu::server::MfaDisableResult::kOk:
+            break;
+        case yuzu::server::MfaDisableResult::kNotFound:
+            // The account was removed or deactivated after the existence check above.
+            spdlog::error("--mfa-reset: no active account '{}' at the clear; nothing was changed",
+                          mfa_reset_user);
+            error_row(std::format("MFA clear refused; no active account, nothing changed "
+                                  "(os_identity={})",
+                                  os_user));
+            std::cerr << "error: no active account '" << mfa_reset_user
+                      << "'; nothing was changed\n";
             return EXIT_FAILURE;
+        case yuzu::server::MfaDisableResult::kAuditUnavailable:
+            // The audit store refused the outcome row, so the whole clear rolled back.
+            spdlog::error("--mfa-reset: the audit store did not accept the outcome row for '{}'; "
+                          "MFA was NOT cleared and no session was ended",
+                          mfa_reset_user);
+            error_row(std::format("MFA clear failed; audit store refused the outcome row, "
+                                  "nothing changed (os_identity={})",
+                                  os_user));
+            std::cerr << "error: audit store did not accept the outcome row; nothing was "
+                         "changed\n";
+            print_fallback_pointer();
+            return EXIT_FAILURE;
+        case yuzu::server::MfaDisableResult::kFactorChanged: // unreachable: no expected generation
+        case yuzu::server::MfaDisableResult::kStoreUnavailable:
+            // Rolled back. A lost COMMIT acknowledgement is the one case where the clear can
+            // have landed, so the operator is still told to check before re-running.
+            spdlog::error("--mfa-reset: failed to clear MFA for '{}'; nothing was changed unless "
+                          "the connection was lost at COMMIT",
+                          mfa_reset_user);
+            error_row(std::format("MFA clear failed; rolled back, re-run after checking status "
+                                  "(os_identity={})",
+                                  os_user));
+            std::cerr << "error: failed to clear MFA; nothing was changed (unless the connection "
+                         "was lost at commit): check the account's status and re-run\n";
+            print_fallback_pointer();
+            return EXIT_FAILURE;
+        }
         spdlog::info("Break-glass: MFA cleared for '{}'. The user can now sign in with their "
                      "password alone; under MFA enforcement they will be walked through "
                      "enrollment at next login.",

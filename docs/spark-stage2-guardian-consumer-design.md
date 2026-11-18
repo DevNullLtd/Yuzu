@@ -50,7 +50,7 @@ history:
     `guardian_arm_heartbeat.hpp`, `guardian_io_executor.hpp`,
     `guardian_spark_runtime.hpp`), resolving the collision with Guardian's real
     operator-facing network-isolation quarantine (v1.1 §11.7), the shipped
-    `quarantine` plugin/`QuarantineStore`/`quarantine_device` MCP tool, and the
+    firewall containment actions/`QuarantineStore`/`quarantine_device` MCP tool, and the
     `mech_quarantined_total` SparkEngine fault counter - all three left unchanged.
     Earlier entries above now read "wedged" for this state; they said "quarantined"
     when written. Full `/governance` pass (commit 9256f6189): security-guardian,
@@ -79,6 +79,23 @@ history:
     File worker or Registry sweeper" bullet is corrected the same way; `docs/spark-flip-gate.md`
     gains a closed-by-fix #4704 entry in section 5 and section 7's #4704 precondition is marked
     fixed. PR #5004, merged `063885c9e`, full `/governance` (Spark row).
+  - 2026-11-14 - #5719 item 5, R5.7 (c) - the File mechanism is now run against a rename of
+    the watched directory (it was only inferred before; Windows rig, local NTFS, see
+    `docs/spark-flip-gate.md` precondition (e) for what was run and what was only the author's
+    report). Result: the handle follows the rename and the old read stays quiet, as measured in
+    the 2026-09-21 probe, so the mechanism now re-opens the path every `path_verify_interval`
+    (5 s in production) on a detached worker and compares the directory identity (volume serial
+    plus `FileIdInfo` file id) with the identity its handle was opened on; a different identity or
+    a path that names nothing reports the watch faulted, cancels the stale read and hands the
+    watch to the ordinary retry (on the ordinary drain route the first backend retry, 30 s in production, doubling on repeated failure to a 300 s cap; if a pass throws while the lost path drains, recovery uses the 50 ms admission backoff instead, still bounded by the 30 s admission cap).
+    Sampled, Windows only, verified on local NTFS only.
+    **#4676 is NOT resolved by this change** (it is partly addressed: File, local NTFS, sampled);
+    still open there: filesystems that give no file id (reported on one FAT32 volume, author-reported,
+    to go undetected), SMB and ReFS (untested), an ancestor shelter whose own parent is renamed,
+    a rename away and back between two samples, and, for the Registry twin (#7836), a rename followed by a re-creation of the path before the next sample. The
+    statement below that a rename of the PARENT is refused while the handle is open rests on the
+    2026-09-21 probe (three runs); the File code comment that a handle follows its directory when
+    "an ancestor" is renamed is NOT backed by any run and has been reworded.
 ---
 
 # Spark Stage 2 — Guardian as the first SparkEngine consumer
@@ -1695,12 +1712,15 @@ silent-drop case was not measured), a hung server fails the read after about 64 
 (`STATUS_CONNECTION_DISCONNECTED`, one run). A server-side rename of the watched directory gives
 no completion in 30 s, and a server-side delete gives only the child's REMOVED record, no failed
 completion in 30 s. After a failed completion the old handle stays dead until reopened. The real
-File mechanism was not run against a rename: its outcome is inferred from these results and
-`process_completion_locked`. So a local rename or move, and a rename or delete on a share, leave
-coverage at `Notification` while the target path is unwatched; #4676 tracks the resolution. Until
-it lands, a reader must treat File `Notification` as unconfirmed for a target that could be
-renamed, and a post-establishment write to the original path is only a point-in-time liveness
-check. Raw transcripts: `docs/spark-rebuild-baselines/raw/4659-file-rename-probe.txt`. (d)
+File mechanism was not run against a rename when that probe was written: its outcome was
+inferred from these results and `process_completion_locked`. Since #5719 item 5 (2026-11-14) it
+has been run on local NTFS, and it now detects a rename or move of the watched directory by
+sampling (see the 2026-11-14 entry in the history above); that does not cover a share, a
+filesystem that gives no file id, or an ancestor shelter, where a rename or delete still leaves
+coverage at `Notification` while the target path is unwatched. #4676 tracks the resolution and
+is NOT closed by this change. Until it is, a reader must treat File `Notification` as
+unconfirmed for a target that could be renamed on those filesystems, and a post-establishment
+write to the original path is only a point-in-time liveness check. Raw transcripts: `docs/spark-rebuild-baselines/raw/4659-file-rename-probe.txt`. (d)
 `coverage == None` with `established_at` unset
 means never confirmed (an absent target, a pending arm or a failed arm; NOT necessarily deaf).
 With `established_at` set it means one of: the Registry one-shot flap (brief, on the order of
@@ -2752,7 +2772,11 @@ Gates, applied at the marked rungs:
   equivalence on scripted scenarios uses tolerance bands **only for observe/debounce
   noise**; enforce-class and dangerous-drift `event_type`s require **zero-tolerance
   exact match** — a tolerance band would let a real enforce divergence pass (UP-10).
-- **Resource:** detection threads drop O(rules) → O(mechanisms); idle CPU,
+- **Resource:** detection threads drop O(rules) → O(mechanisms) (the Windows File mechanism
+  additionally does O(watched directories) periodic identity-verification work since #5719 item 5,
+  one short-lived thread per directory per interval, so its steady-state cost is not O(mechanisms); the
+  Windows Registry mechanism does the same per watched key every interval when ENABLED, which is off by default,
+  floor 5 s, one short-lived detached worker per verification); idle CPU,
   wakeups/sec, **real OS thread count** (not the `watcher_units` gauge, which is a
   pool count, not `ps -T`, architect N1), and RSS old-vs-new via `/test` perf. This
   headline win is established at **rung 2** (Guardian becomes the consumer,
@@ -3121,7 +3145,10 @@ Each rung is an independently-governed PR on `dev`, run through the full
   re-arm/initial-eval contract is a rung-2 parity assertion (offline-drift-caught,
   no restart re-enforce storm).
 - Resource: `/test` perf shows the O(rules)→O(mechanisms) real-OS-thread drop at
-  rung 2.
+  rung 2 (resident watch threads; the Windows File mechanism's periodic per-directory
+  verification threads since #5719 item 5 are extra and are not O(mechanisms); the Windows Registry
+  mechanism's per-key verification workers are extra in the same way, but only when the operator
+  enables it: off by default, floor 5 s).
 - Health surface: `yuzu_fleet_spark_*` os-labelled gauges visible in UAT
   `recompute_metrics`; REST `/guaranteed-state/status[/{agent_id}]` and the
   `get_guardian_status` MCP tool return real per-rule health; a

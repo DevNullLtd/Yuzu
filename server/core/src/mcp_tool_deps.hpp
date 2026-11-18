@@ -43,7 +43,9 @@
 // that denylist is a tripwire for the first reach for a store, not a proof. The
 // transitive include closure of every mcp_tools_*.cpp and of this header is held
 // store-free by scripts/ci/check-seam-closure.py's MCP registry lane (#6558),
-// against that script's store-header patterns.
+// against that script's store-header patterns. The collation gate value that
+// ci_collation_gate points at comes from the store-free collation_gate_types.hpp,
+// which that lane enrols by name, never from a pg/ header.
 //
 // Ownership: McpServer holds one ToolDeps by value (set once via
 // McpServer::set_tool_deps before build_handler) and the tools/call lookup site
@@ -62,6 +64,7 @@
 #include "crypto_api.hpp"         // CryptoApi's query / result types (the abstract seam, no store)
 #include "crypto_widget_catalogue.hpp" // crypto_widgets::Access / WidgetGate
 #include "dex_score_policy_writer.hpp"  // DexScorePolicyProvider::ReadFn, the write request / result / audit hook
+#include "hardware_ci_page_model.hpp" // hardware_ci_page::Reader
 #include "hardware_list_model.hpp" // HardwareCiDetail
 #include "inventory_types.hpp"    // InventoryDevicesResult
 #include "quarantine_visible.hpp" // QuarantineListFn
@@ -99,6 +102,10 @@ struct ToolDeps {
     AuditFn audit_fn;
     RosterFn roster_fn;      // build_hw_roster: UNFILTERED, the gate's scope is the sole filter
     CiDetailFn ci_detail_fn; // hw_ci_detail_fn: the full per-device CI record composition
+    hardware_ci_page::Reader ci_page_reader; // hw_ci_page_reader: the keyset read of the stored CI rows
+    // The collation gate the bulk read consults before the store (device_ci_read_gate.hpp);
+    // production wires &collation_gate_, null (tests) serves.
+    const std::atomic<pg::CollationGate>* ci_collation_gate{nullptr};
     DexScoreFn dex_score_fn; // page rows only, never the whole roster (one query per call)
     QuarantineListFn quarantine_list_fn;
 

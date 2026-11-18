@@ -35,10 +35,20 @@
 #include <optional>
 #include <shared_mutex>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
 namespace yuzu::server {
+
+/// The in-handler MFA gate for the two factor-credential rows (POST
+/// /api/settings/mfa/recovery-codes and /disable, #6079). Like `StepUpFn`, but it also hands back
+/// the `StepUpAdmission` the gate judged: the account's factor generation at admission, which the
+/// handler passes to the AuthDB mutation so a factor replaced after the gate is refused under the
+/// users row lock. `nullopt` means refused: the response is already written. An unwired gate is a
+/// 503 in the handler.
+using FactorCredentialGateFn = std::function<std::optional<StepUpAdmission>(
+    const httplib::Request&, httplib::Response&, const auth::Session&, const std::string& label)>;
 
 /// The enrol-confirm step-up stamp catch logs its warning for the first hit of a process-wide
 /// counter and then once per this many hits, so a failing auth store cannot become a log storm.
@@ -152,20 +162,55 @@ public:
     /// other route reads it.
     void set_read_perm_fn(PermFn fn) { read_perm_fn_ = std::move(fn); }
 
-    /// Audit writer for a session the handler already resolved (#6079): `mfa.disable` ends the
-    /// actor's own session before it writes its row, so the request-resolving `AuditFn` would
-    /// stamp an empty principal. Same `std::function` type as `AuthRoutes::AuditAsSessionFn`;
-    /// server.cpp binds `AuthRoutes::audit_as_session_fn()`. Left unset (tests, other callers)
-    /// the handler falls back to `AuditFn`.
+    /// Audit writer for a session the handler already resolved (#6079): the Settings MFA
+    /// disable route writes its intent, denied and error rows through it (its success row is
+    /// written by `MfaDisableOwner` inside the clear's transaction, through the
+    /// `AuditEventForSessionFn` seam below), and the enrol-confirm refusal rows
+    /// (`session_not_durable`, `session_store_unavailable`) use it too, because the cookie may
+    /// be missing or stale and the request-resolving `AuditFn` would stamp an empty
+    /// principal. Same `std::function` type as `AuthRoutes::AuditAsSessionFn`; server.cpp binds
+    /// `AuthRoutes::audit_as_session_fn()`. Left unset (tests, other callers) the handler
+    /// falls back to `AuditFn`.
     using AuditAsSessionFn = std::function<bool(
         const httplib::Request&, const auth::Session&, const std::string& principal_role,
         const std::string& action, const std::string& result, const std::string& target_type,
         const std::string& target_id, const std::string& detail)>;
     void set_audit_as_session_fn(AuditAsSessionFn fn) { audit_as_session_fn_ = std::move(fn); }
 
+    /// The identity half of an audit row for a session the handler already resolved, built
+    /// WITHOUT writing it (#6079 PR 2c): `mfa.disable` hands it to `MfaDisableOwner` as the
+    /// outcome-row template, which the owner persists inside its own transaction. Same
+    /// `std::function` type as `AuthRoutes::AuditEventForSessionFn`; server.cpp binds
+    /// `AuthRoutes::audit_event_for_session_fn()`. Left unset the disable route answers 503 and
+    /// changes nothing (the outcome row could not be built, so the clear cannot run).
+    using AuditEventForSessionFn = std::function<AuditEvent(
+        const httplib::Request&, const auth::Session&, const std::string& principal_role,
+        const std::string& action, const std::string& result, const std::string& target_type,
+        const std::string& target_id)>;
+    void set_audit_event_for_session_fn(AuditEventForSessionFn fn) {
+        audit_event_for_session_fn_ = std::move(fn);
+    }
+
+    /// The gate for POST /api/settings/mfa/recovery-codes and POST /api/settings/mfa/disable
+    /// (#6079): they call it INSTEAD of `step_up_fn`, because they need the admitted factor
+    /// generation, not just a verdict. server.cpp wires it from `run_in_handler_step_up` with the
+    /// out-parameter. Left unset the two routes answer 503 (fail closed, never ungated). Set before
+    /// serving.
+    void set_factor_credential_gate_fn(FactorCredentialGateFn fn) {
+        factor_credential_gate_fn_ = std::move(fn);
+    }
+
+    /// Test seam; null in production, and server.cpp never sets it. Fired by the two
+    /// factor-credential routes after the gate returned an admission and before the AuthDB call
+    /// (`route` is "recovery_codes" or "disable"), so a test can rotate the factor in exactly the
+    /// window the admitted generation exists to close. Set before requests are served.
+    void set_factor_credential_barrier_for_test(std::function<void(std::string_view route)> hook) {
+        factor_credential_barrier_ = std::move(hook);
+    }
+
     /// Test seam like `set_cert_dir_for_test`; null in production, and server.cpp never sets it.
     /// When set, POST /api/settings/mfa/verify calls it inside the step-up stamp block,
-    /// immediately before `mark_session_mfa_verified`, so a test can make the stamp throw
+    /// immediately before `stamp_session_mfa_proof`, so a test can make the stamp throw
     /// (`AuthManager` is non-virtual). No effect when empty. Set before requests are served.
     void set_stamp_fault_hook_for_test(std::function<void()> hook) {
         stamp_fault_hook_ = std::move(hook);
@@ -260,9 +305,9 @@ public:
     /// avoiding httplib::Server's TSan-hostile acceptor thread (#438).
     ///
     /// `step_up_fn` (PR2, optional) — when present, the 2 user-management
-    /// Settings mutations (DELETE user, POST user role) and the 2 MFA mutations
-    /// (POST mfa/recovery-codes, POST mfa/disable) gate behind it after admin_fn
-    /// passes, and the 2 API-token mutations (POST, DELETE
+    /// Settings mutations (DELETE user, POST user role) gate behind it after admin_fn
+    /// passes (the 2 MFA mutations, POST mfa/recovery-codes and POST mfa/disable, use
+    /// `set_factor_credential_gate_fn` instead), and the 2 API-token mutations (POST, DELETE
     /// /api/settings/api-tokens) gate behind it after perm_fn and auth_fn
     /// pass. The MFA step-up chokepoint (`step_up_gate.hpp`) already evaluates
     /// all six rows before the handler runs and ignores this functor; an empty
@@ -321,6 +366,13 @@ private:
                                     const std::vector<std::string>& new_recovery_codes = {},
                                     const std::string& enrollment_pending_for_verify = {},
                                     const std::string& error_msg = {});
+
+    /// The 409 answer to `AuthDBError::FactorChanged` on the two factor-credential routes (#6079):
+    /// counts `yuzu_auth_mfa_factor_changed_total{route}`, writes the status, a toast and the MFA
+    /// panel with the reload message. No sign-out and no redirect: after a re-prove the session may
+    /// be legitimate. The caller writes the audit row.
+    void respond_mfa_factor_changed(httplib::Response& res, const auth::Session& session,
+                                    std::string_view route);
 
     std::string render_pending_fragment();
     std::string render_auto_approve_fragment();
@@ -436,6 +488,7 @@ private:
     }
     AuditFn audit_fn_;
     AuditAsSessionFn audit_as_session_fn_;
+    AuditEventForSessionFn audit_event_for_session_fn_;
     AuditReadFn audit_read_fn_; // #4028 — fail-closed REST audit hook, see AuditReadFn doc comment
     std::function<void()> dex_alert_apply_fn_; // F1 live-apply hook (may be empty)
     std::optional<DexScorePolicyWriteDeps> dex_score_policy_writer_; // Scoring tab; see setter
@@ -497,6 +550,9 @@ private:
     std::unique_ptr<oidc::OidcProvider>* oidc_provider_{};
     yuzu::MetricsRegistry* metrics_registry_{};
     StepUpFn step_up_fn_;
+    FactorCredentialGateFn factor_credential_gate_fn_; // see set_factor_credential_gate_fn()
+    std::function<void(std::string_view)>
+        factor_credential_barrier_; // test seam; empty in production
 };
 
 } // namespace yuzu::server

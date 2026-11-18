@@ -669,19 +669,30 @@ std::expected<std::vector<std::string>, std::string>
 WorkflowEngine::workflows_referencing_instruction(
     const std::string& instruction_id, int limit,
     const std::unordered_set<std::string>& exclude_ids) const {
+    return workflows_referencing_instructions(std::vector<std::string>{instruction_id}, limit,
+                                              exclude_ids);
+}
+
+std::expected<std::vector<std::string>, std::string>
+WorkflowEngine::workflows_referencing_instructions(
+    const std::vector<std::string>& instruction_ids, int limit,
+    const std::unordered_set<std::string>& exclude_ids) const {
     if (!open_)
         return std::unexpected(std::string(kDbErrorPrefix) + "workflow engine not available");
+    if (instruction_ids.empty())
+        return std::vector<std::string>{};
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease)
         return std::unexpected(std::string(kDbErrorPrefix) + "pool exhausted");
+    const std::vector<std::string_view> wanted(instruction_ids.begin(), instruction_ids.end());
     std::vector<std::string_view> excluded(exclude_ids.begin(), exclude_ids.end());
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "SELECT w.id FROM workflow_engine.workflows w WHERE w.deleted_at = 0 AND EXISTS "
         "(SELECT 1 FROM workflow_engine.workflow_steps s WHERE s.workflow_id = w.id "
-        "AND s.instruction_id = $1) AND NOT (w.id = ANY($3::text[])) "
+        "AND s.instruction_id = ANY($1::text[])) AND NOT (w.id = ANY($3::text[])) "
         "ORDER BY w.created_at ASC, w.id ASC LIMIT $2",
-        std::vector<std::string>{instruction_id, std::to_string(std::max(limit, 1)),
+        std::vector<std::string>{pg::to_text_array(wanted), std::to_string(std::max(limit, 1)),
                                  pg::to_text_array(excluded)});
     if (res.status() != PGRES_TUPLES_OK)
         return std::unexpected(std::string(kDbErrorPrefix) + PQresultErrorMessage(res.get()));
