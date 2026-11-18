@@ -268,6 +268,7 @@ agent_test_exe = executable(
     'unit/test_updater.cpp',
     'unit/test_filesystem_read.cpp',
     'unit/test_filesystem_actions.cpp',
+    'unit/test_plugin_row_neutralisation.cpp',  # WP11: pipe/CR/LF in endpoint-derived fields cannot forge rows (filesystem, installed_apps, processes, procfetch, wmi, network_config proxy redaction)
     'unit/test_filesystem_local_dispatcher.cpp', # #4728: real filesystem plugin via LocalDispatcher -- `replace` through the shared atomic write
     'unit/test_filesystem_find_by_hash.cpp',  # #5624: pure find_by_hash walk core (limits, injected clock/cancel/hasher) + real no-follow fd hasher over TempDir
     'unit/test_filesystem_find_by_hash_dispatcher.cpp',  # #5624: real filesystem plugin via LocalDispatcher -- byte-identical clean output, trailer + CONSTRAINED/PARTIAL
@@ -649,6 +650,9 @@ agent_test_exe = executable(
     'unit/test_asset_tags_parsers.cpp',   # #232: pure cap/escape/apply_sync/snapshot helpers (asset_tags_parsers.hpp)
     'unit/test_asset_tags_store.cpp',   # #232: atomic state-file lifecycle (asset_tags_store.hpp), TempDir-based
     'unit/test_asset_tags_actions.cpp',   # #232: real asset_tags dylib/.so/.dll via LocalDispatcher, unguarded on every OS
+    'unit/test_wp12_lookup_helpers.cpp', # WP12: injected-lookup/fake-list tests for users_group_lookup.hpp, filesystem_posix_names.hpp, dns_cache_list.hpp
+    'unit/test_ioc_domain_cap.cpp', # F66: real ioc plugin, `domains` cap of 100 per command via LocalDispatcher
+    'unit/test_tags_concurrency.cpp', # F37: real tags plugin driven from concurrent threads via LocalDispatcher ([tsan])
     'unit/test_tags_plugin.cpp',   # #4728: TU-inclusion seam over tags_plugin.cpp -- save_tags() through the shared atomic write
     'unit/test_asset_tags_sync_lock.cpp', # #232: TU-inclusion seam over asset_tags_plugin.cpp -- sync writes under g_mu (a condition-variable seam, no per-OS body, runs on every OS)
     'unit/test_system_hardening_parsers.cpp',            # Wave 8 PR8.1-b: pure state mappers + errno classifier over REAL CAPTURE fixtures
@@ -731,6 +735,9 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/wol/src'),             # wol_check_plan.hpp (Wave 2 WP-E)
     include_directories('../agents/plugins/discovery/src'),      # discovery_parsers.hpp (Wave 2 WP-C pure parser)
     include_directories('../agents/plugins/network_config/src'), # network_config_parsers.hpp (PKG-NC pure parser)
+    include_directories('../agents/plugins/wmi/src'),            # wmi_rows.hpp (WP11 pure row formatters)
+    include_directories('../agents/plugins/procfetch/src'),      # procfetch_row.hpp (WP11 pure row formatter)
+    include_directories('../agents/plugins/processes/src'),      # processes_rows.hpp (WP11 pure query-row formatter)
     include_directories('../agents/plugins/os_info/src'),        # os_info_macos.hpp (Wave 3 PR3.1 pure plist parser)
     include_directories('../agents/plugins/device_identity/src'), # device_identity_macos.hpp (Wave 3 PR3.2 pure parser)
     include_directories('../agents/plugins/netstat/src'),        # netstat_parsers.hpp (gate-2 remediation pure parser)
@@ -899,6 +906,7 @@ agent_test_exe = executable(
                 firmware_posture_plugin_lib,  # Wave 8 PR8.4
                 browser_inventory_plugin_lib,  # Wave 10 P2a
                 local_security_policy_plugin_lib,  # Wave 8 PR8.3
+                tags_plugin_lib,  # F37: test_tags_concurrency.cpp loads the real plugin by path
                 asset_tags_plugin_lib,  # #232: test_asset_tags_actions.cpp loads the real plugin by path
                 system_hardening_plugin_lib,  # Wave 8 PR8.1-b
                 runtimes_plugin_lib,  # Wave 10 PR10.1-b
@@ -3588,9 +3596,24 @@ test('server feature option lint',
   timeout: 300,
 )
 
-test('local test runner platform selftest',
+# Three shards of one selftest (`<index>/<count>` picks every count-th case): it runs the real runner
+# in a fresh set of shells per case, which takes about 19 s on an idle Windows runner and passed the
+# 30 s limit on a loaded one (#8207), the split the CI guard's own warning asks for.
+test('local test runner platform selftest 1 of 3',
   _python3_test,
-  args: [files('test_run_tests_platform.py')],
+  args: [files('test_run_tests_platform.py'), '0/3'],
+  suite: 'platform',
+  timeout: 30,
+)
+test('local test runner platform selftest 2 of 3',
+  _python3_test,
+  args: [files('test_run_tests_platform.py'), '1/3'],
+  suite: 'platform',
+  timeout: 30,
+)
+test('local test runner platform selftest 3 of 3',
+  _python3_test,
+  args: [files('test_run_tests_platform.py'), '2/3'],
   suite: 'platform',
   timeout: 30,
 )
@@ -4277,6 +4300,15 @@ if _bash_test.found()
       suite: 'docs',
       timeout: 60,
     )
+    # Gateway distribution-cookie policy (F24): the real container entrypoint and the real
+    # systemd ExecStartPre string under bash, dash and busybox sh. Exit 77 (skip) when one
+    # of the three shells is missing; CI's own step sets YUZU_REQUIRE_ALL_SHELLS=1.
+    test('gateway cookie policy (entrypoint + ExecStartPre)',
+      _bash_test,
+      args: [files('shell/test_gateway_entrypoint_cookie.sh')],
+      suite: 'docs',
+      timeout: 120,
+    )
     # The yuzu-server package upgrade pre-flight (RPM %pre / deb preinst): runs the
     # real scriptlet text against synthetic /etc trees under YUZU_PKG_ROOT. No built
     # binary, no Postgres, no root, no rpm/dpkg tooling.
@@ -4403,6 +4435,16 @@ test('Firewall containment regression guards (privilege model step 6)',
 test('virtualization wsl Windows shell wiring lexical gate',
   _python3_test,
   args: [files('test_virtualization_wsl_pin_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# #7035: static lexical gate over the Windows callers of the checked HKEY_USERS listing -- each
+# call tests `hku.error.empty()` before it reads `hku.names` and reports `hku_list_incomplete`, and
+# a new caller must be listed. Source text only (the callers cannot run in the unit suites).
+test('HKEY_USERS listing callers refuse a failed listing lexical gate (#7035)',
+  _python3_test,
+  args: [files('test_hku_listing_pin_lexical.py')],
   suite: 'docs',
   timeout: 30,
 )
@@ -4742,6 +4784,16 @@ test('same-site gate production wiring lexical selftest',
   args: [files('test_same_site_wiring_lexical_selftest.py')],
   suite: 'docs',
   timeout: 60,
+)
+
+# WP12: the tags/users/filesystem agent plugins must not call the non-reentrant getpwuid/getpwnam/
+# getgrnam/getgrgid (concurrent dispatch pool). Source-text only; the ONLY plain-build regression
+# check for those call sites (the race itself is caught only by the nightly TSan job).
+test('plugin reentrant libc lookups lexical gate',
+  _python3_test,
+  args: [files('test_plugin_reentrant_libc_lexical.py'), meson.current_source_dir() / '..'],
+  suite: 'docs',
+  timeout: 30,
 )
 
 # A unit-test file marked "Whole file compiled out under TSan" must have nothing after its
@@ -5200,6 +5252,15 @@ test('plugin init failed wiring lexical',
 test('plugin init failed wiring lexical selftest',
   _python3_test,
   args: [files('test_plugin_init_failed_wiring_lexical_selftest.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# WP11: the processes / network_config bypass / installed_apps user_app rows are built by the
+# neutralising formatters at every site (best-effort lexical tripwire, self-checked in memory).
+test('plugin row formatters wiring lexical',
+  _python3_test,
+  args: [files('test_plugin_row_formatters_wiring_lexical.py')],
   suite: 'docs',
   timeout: 30,
 )

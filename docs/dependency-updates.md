@@ -303,9 +303,38 @@ a gateway change is blocked on an upstream fix. Checklist:
 
 **Pin policy.** `cowboy` and `gun` (the two HTTP/2 stacks the gateway's gRPC layer sits on)
 are pinned to a release **at least a month old**, as the comments in `rebar.config` say; a
-release newer than that waits. Apply the same rule to any bump. Pin an exact version (as every
-dep there is), and refresh `rebar.lock` with `rebar3 upgrade <dep>` so its package hashes
-cover the new tarball; commit both files together. After a `cowboy`, `gun`, `cowlib` or
+release newer than that waits. Apply the same rule to any bump. **One recorded exception:**
+`cowboy` 2.21.0, `cowlib` 2.22.0 and `gun` 2.8.0 were pinned inside the window by owner
+waiver (2026-11-17 for cowboy and cowlib, 2026-11-18 for gun) because every earlier cowlib
+carries CVE-2026-113431 (unauthenticated HPACK header-size DoS) and gun before 2.8.0 cannot
+run on the fixed cowlib; see `docs/security-reviews/wp14b-cowboy-cowlib-gun-age-waiver-2026-11-18.md`.
+The waiver names exactly those three versions; the rule applies to every other pin and to
+any later bump of these three. A security fix that exists only in a newer-than-a-month release
+needs an owner ruling and a record like that one; it is never a quiet exception.
+
+**Locking a transitive hex pin.** `rebar3` 3.24 cannot resolve a hex dependency's version range
+without a lock entry (`Dep cowlib has invalid version >= 2.22.0 and < 3.0.0`; the same error occurs
+on an unmodified config once `rebar.lock` is removed). To move a transitive pin such as `cowlib`,
+list it as a direct dep in `rebar.config` and generate the lock with temporary overrides:
+
+```erlang
+{overrides, [
+ {override, cowboy, [{deps, [{cowlib,"<vsn>"},{ranch,"<vsn>"}]}]},
+ {override, gun,    [{deps, [{cowlib,"<vsn>"}]}]}
+]}.
+```
+
+Append that to `rebar.config` and run:
+
+```sh
+rm rebar.lock && rebar3 lock
+```
+
+Then **remove the overrides before commit** and confirm `rebar3 compile` leaves `rebar.lock` byte-identical.
+
+**Refreshing the lock for an ordinary bump.** Pin an exact version (as every dep there is), and
+refresh `rebar.lock` with `rebar3 upgrade <dep>` so its package hashes cover the new tarball;
+commit both files together. After a `cowboy`, `gun`, `cowlib` or
 `ranch` bump also run the wire suites that exercise them (`yuzu_grpc_wire_tests`,
 `yuzu_grpc_origin_wire_tests`, `yuzu_grpc_client_tls_tests`) and `rebar3 dialyzer`
 (`cowlib` and `gun` are in `plt_extra_apps`).

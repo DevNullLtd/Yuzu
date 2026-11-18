@@ -570,6 +570,12 @@ jobs:
           STAGING="yuzu-gateway-${VERSION}-linux-x64"
           mkdir -p "${STAGING}"
           cp -a gateway/_build/prod/rel/yuzu_gw/* "${STAGING}/"
+          # The unit's ExecStartPre sources the cookie policy from the install dir
+          # (/opt/yuzu_gw/gateway-cookie-policy.sh); ship both inside the staging dir so a
+          # tarball install (tar --strip-components=1 into /opt/yuzu_gw) obtains them (the
+          # .deb/.rpm/image install the policy file themselves).
+          cp deploy/docker/gateway-cookie-policy.sh "${STAGING}/gateway-cookie-policy.sh"
+          cp deploy/systemd/yuzu-gateway.service "${STAGING}/yuzu-gateway.service"
           tar czf "yuzu-gateway-linux-x64.tar.gz" "${STAGING}"
 
       - name: Build .deb package
