@@ -11,9 +11,6 @@
  *   Linux:   svc|name|status|description
  *   macOS:   svc|label|pid|status|startup_type
  *   set_start_mode success: status|ok\nservice|<name>\nmode|<mode>
- *                           Linux also: state|<is-enabled state>, and note|<text> (with a typed
- *                           CONSTRAINED/PARTIAL result, services:start_mode_unchangeable) when the
- *                           unit is static, indirect, alias or generated
  *   set_start_mode failure: error|<message>
  *
  * macOS startup_type (C-1.12): derived from ONE bulk `launchctl print-disabled
@@ -48,15 +45,12 @@
 #else
 #include <sys/wait.h>
 #endif
-#if defined(__linux__)
-#include <sys/stat.h> // stat: the systemctl wrapper trust check (WP13/F48)
-#include <unistd.h>   // geteuid
-#endif
 
 #if defined(__linux__) || defined(__APPLE__)
+#include <unistd.h> // ::geteuid (the root-or-helper decision for set_start_mode)
+
 #include <chrono>
 #include <spdlog/spdlog.h>
-#include <sudo_argv.hpp> // yuzu::shared::sudo_wrap (Decision-8 canonical privileged argv, ADR-3002)
 #include <yuzu/agent/runner_status.hpp>     // yuzu::agent::forward_runner_failure (ABI4 result-status seam, ADR-3002)
 #include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess / probe_tool_path (K-7/CDX-07, ADR-3002 rung 2)
 #endif
@@ -290,13 +284,7 @@ struct ServiceInfo {
     std::string startup_type; // honest automatic|disabled|unknown (C-1.12); never Windows' 5-state taxonomy
 };
 
-// Defensive row cap (mirrors the C-8 row_cap precedent in agents/shared/wmi_bounded.hpp):
-// real macOS systems run in the low hundreds of launchd services, so this
-// bounds worst-case memory/output size without affecting normal enumeration.
-// Rows beyond the cap are still drained from the `launchctl list` pipe (so
-// the child process never blocks writing into a full pipe) -- just not kept.
-constexpr std::size_t kMaxServiceRows = 512;
-
+// The defensive row cap is yuzu::services::kMaxServiceRows (services_parsers.hpp).
 
 // total_seen (out) receives the number of services that passed all filters
 // (label allowlist + running_only) BEFORE the yuzu::services::kMaxServiceRows
@@ -383,8 +371,7 @@ std::vector<ServiceInfo> enumerate_services_macos(bool running_only, std::size_t
 /// the ABI4 result-status seam via yuzu::agent::forward_runner_failure --
 /// exactly the pattern network_actions_plugin.cpp's mutating call sites use.
 #if defined(__linux__) || defined(__APPLE__)
-yuzu::agent::SubprocessResult run_command(const std::vector<std::string>& argv,
-                                         bool merge_stderr = true) {
+yuzu::agent::SubprocessResult run_command(const std::vector<std::string>& argv) {
     if (argv.empty() || argv.front().empty())
         return yuzu::agent::SubprocessResult{};
     // merge_stderr=true (matching network_actions_plugin.cpp's Linux
@@ -396,7 +383,7 @@ yuzu::agent::SubprocessResult run_command(const std::vector<std::string>& argv,
     // outcome (services_parsers.hpp).
     return yuzu::agent::run_bounded_subprocess(
         argv, yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds{20},
-                                             .merge_stderr = merge_stderr});
+                                             .merge_stderr = true});
 }
 #endif
 
@@ -475,85 +462,46 @@ int do_set_start_mode_linux(yuzu::CommandContext& ctx, std::string_view name,
     }
 
     // services/set_start_mode_linux#1 (docs/agent-spawn-sink-manifest.md)
-    // Privileged mutation (WP13 / F48). A root agent (a manual root launch) runs systemctl
-    // directly. A non-root agent (the dev/UAT --as-user path; ALSO the packaged unit, which runs as
-    // the non-root yuzu-agent with NoNewPrivileges, so there set_start_mode is permanently
-    // privilege_unavailable) goes through the root-owned
-    // validator scripts/install-agent-user.sh installs and grants, `sudo -n -- <wrapper> <verb>
-    // <unit>`: the former `systemctl enable *` sudoers glob admitted `enable --now <unit path>`,
-    // which is root. A wrapper that is absent or not root-owned is a refusal with a token,
-    // never a fallback to bare `sudo systemctl`. The wrapper always puts "--" before the unit
-    // (is_safe_service_name allows a LEADING '-'), preserving the flag-injection property.
+    // Privileged mutation, Decision-8 canonical form (ADR-3002, sudo_argv.hpp). A non-root agent
+    // does not run systemctl itself: scripts/install-agent-user.sh grants it exactly one program
+    // as root for this, the helper yuzu-svc-helper (no argument, no wildcard in sudoers), and
+    // systemctl_set_start_mode_argv (services_parsers.hpp) builds the argv that has the helper
+    // run `systemctl <verb> -- <name>` under `sudo -n --`. The helper checks the name against
+    // the same character class as is_safe_service_name and runs systemctl with an argument list
+    // it builds itself. A root agent has no grant to bound and runs systemctl directly, with the
+    // same `--`: is_safe_service_name allows a LEADING '-' in `name` (needed for e.g.
+    // "-foo"-shaped unit names to reach the pipe-delimited protocol unmangled), so without "--"
+    // a crafted name could still be parsed as a systemctl flag even though there is no shell
+    // involved. The choice is the euid alone, the static decision sudo_wrap makes; there is no
+    // probe for the helper and no fallback to the old form, so a host provisioned without this
+    // build's installer fails with sudo's own message (docs/agent-privilege-model.md).
     //
     // Mode -> systemctl verb:
     //   automatic -> enable  (starts at boot)
     //   manual    -> disable (available but not started at boot)
     //   disabled  -> mask    (cannot be started at all)
-    if (mode != "automatic" && mode != "manual" && mode != "disabled") {
+    const bool euid_is_root = ::geteuid() == 0;
+    std::vector<std::string> argv;
+    if (mode == "automatic") {
+        argv = yuzu::services::systemctl_set_start_mode_argv(systemctl_path, "enable", name,
+                                                             euid_is_root);
+    } else if (mode == "manual") {
+        // If the service was previously masked, unmask it first so disable
+        // works. Best-effort, same as before: its result is intentionally
+        // not inspected (a service that was never masked has nothing to
+        // unmask, and the following disable is the actual mode change).
+        run_command(yuzu::services::systemctl_set_start_mode_argv(systemctl_path, "unmask", name,
+                                                                  euid_is_root));
+        argv = yuzu::services::systemctl_set_start_mode_argv(systemctl_path, "disable", name,
+                                                             euid_is_root);
+    } else if (mode == "disabled") {
+        argv = yuzu::services::systemctl_set_start_mode_argv(systemctl_path, "mask", name,
+                                                             euid_is_root);
+    } else {
         ctx.write_output(
             std::format("error|invalid mode '{}': must be automatic, manual, or disabled", mode));
         return 1;
     }
-    const bool is_root = ::geteuid() == 0;
-    std::string wrapper;
-    if (!is_root) {
-        struct stat st {};
-        const char* w = yuzu::services::kYuzuSystemctlWrapper;
-        // Trust the wrapper only if root owns it and neither group nor other can write it: sudo
-        // would run it as root, so an agent-writable file here is root for the agent.
-        if (::stat(w, &st) == 0 && S_ISREG(st.st_mode) && st.st_uid == 0 &&
-            (st.st_mode & (S_IWGRP | S_IWOTH)) == 0 && (st.st_mode & S_IXOTH) != 0 &&
-            st.st_size > 0) { // an empty file would exit 0 under sudo without acting (UP11)
-            wrapper = w;
-        }
-    }
-    auto build = [&](std::string_view verb) {
-        return yuzu::services::systemctl_mutation_argv(is_root, systemctl_path, wrapper, verb,
-                                                       name);
-    };
-    const char* verb = mode == "automatic" ? "enable" : mode == "manual" ? "disable" : "mask";
-    auto argv_opt = build(verb);
-    if (!argv_opt) {
-        ctx.set_result_status(YUZU_RESULT_STATUS_PERMISSION_DENIED, YUZU_RESULT_COMPLETENESS_UNKNOWN,
-                              "services:privilege_unavailable");
-        ctx.write_output(std::format(
-            "error|privilege_unavailable: {} is missing or not root-owned. set_start_mode needs "
-            "that dev/UAT validator (installed by scripts/install-agent-user.sh); the packaged "
-            "unit runs non-root with NoNewPrivileges and never has it, so this action is "
-            "unavailable there",
-            yuzu::services::kYuzuSystemctlWrapper));
-        return 1;
-    }
-    std::vector<std::string> argv = std::move(*argv_opt);
-    bool was_masked = false;
-    if (yuzu::services::start_mode_needs_unmask(mode)) {
-        // `enable` and `disable` both fail on a masked unit, so for automatic and manual unmask
-        // first. Best-effort: its result is intentionally not inspected (a unit that was never
-        // masked has nothing to unmask and `unmask` exits 0 for it; the following enable or
-        // disable is the actual mode change). The state is read first (unprivileged, stderr
-        // unmerged) so a failed change can put the mask back (remask_after_failure below).
-        const auto prior = run_command({systemctl_path, "is-enabled", "--", std::string(name)},
-                                       /*merge_stderr=*/false);
-        was_masked = prior.tool_ran && !prior.timed_out &&
-                     yuzu::services::start_state_is_masked(prior.output);
-        if (auto unmask = build("unmask"))
-            run_command(*unmask);
-    }
-    // A failed change after the unmask would leave the unit LESS restricted than it was found:
-    // put the mask back through the same wrapper and say so on a separate line.
-    auto remask_after_failure = [&]() {
-        if (!yuzu::services::start_mode_should_remask(mode, was_masked, /*change_succeeded=*/false))
-            return;
-        const auto mask = build("mask");
-        const auto r = mask ? run_command(*mask) : yuzu::agent::SubprocessResult{};
-        if (mask && r.tool_ran && !r.timed_out && r.exit_code == 0)
-            ctx.write_output(std::format("note|remasked: '{}' was masked before this call and the "
-                                         "change failed, so the mask was restored", name));
-        else
-            ctx.write_output(std::format("note|remask_failed: '{}' was masked before this call, the "
-                                         "change failed and the mask could not be restored; the "
-                                         "unit may now be unmasked", name));
-    };
 
     auto res = run_command(argv);
     // A runner-level failure (spawn error / deadline / cancelled / signaled)
@@ -571,59 +519,12 @@ int do_set_start_mode_linux(yuzu::CommandContext& ctx, std::string_view name,
     }
     if (!outcome.ok) {
         ctx.write_output(outcome.message);
-        remask_after_failure();
         return 1;
-    }
-
-    // WP13 UP11: a root-owned wrapper that exits 0 without acting (empty/replaced file) would
-    // otherwise be reported as success. Read the unit's state back (no privilege needed) and
-    // require it to match the requested mode; a readback that did not run, or any state outside
-    // the closed set for the mode, is a failure.
-    std::string st_state;
-    {
-        // stderr is NOT merged: a SysV-only unit prints "X is not a native service, redirecting
-        // to systemd-sysv-install." on stderr before the state, and the first output line must be
-        // the state itself (the parser is deliberately not loosened to scan for one).
-        auto st = run_command({systemctl_path, "is-enabled", "--", std::string(name)},
-                              /*merge_stderr=*/false);
-        if (yuzu::agent::classify_runner_failure(st).has_value())
-            yuzu::agent::forward_runner_failure(ctx, st);
-        if (!yuzu::services::start_mode_readback_matches(mode, st)) {
-            ctx.write_output(std::format(
-                "error|set_start_mode: '{}' is not in mode '{}' after the privileged helper ran "
-                "(is-enabled: '{}'); the helper may not have acted, or the unit is in a state "
-                "that mode does not accept (for example linked). Check `systemctl is-enabled` "
-                "on the host before retrying",
-                name, mode, st.output.substr(0, st.output.find('\n'))));
-            remask_after_failure();
-            return 1;
-        }
-        st_state = st.output;
     }
 
     ctx.write_output("status|ok");
     ctx.write_output(std::format("service|{}", name));
     ctx.write_output(std::format("mode|{}", mode));
-    // The state the unit is actually in (first is-enabled line), so a caller can tell a unit
-    // that will auto-start from one that cannot be enabled or disabled.
-    {
-        std::string state = st_state.substr(0, st_state.find('\n'));
-        while (!state.empty() && (state.back() == '\r' || state.back() == ' '))
-            state.pop_back();
-        ctx.write_output(std::format("state|{}", state));
-        if (yuzu::services::start_state_is_unchangeable(state)) {
-            ctx.write_output(std::format(
-                "note|'{}' is '{}': systemctl cannot enable or disable it, so the requested mode "
-                "does not change whether it starts at boot", name, state));
-            // The requested change was accepted but could not be applied to this unit kind: a
-            // typed CONSTRAINED/PARTIAL so a machine reader does not take `status|ok` for "the
-            // unit now starts (or no longer starts) at boot". rc stays 0: the command ran and the
-            // unit is in a state `systemctl enable|disable` itself accepts (the host's
-            // SUCCESS/FAILURE comes from rc; the typed status travels separately).
-            ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
-                                  "services:start_mode_unchangeable");
-        }
-    }
     return 0;
 }
 
@@ -649,27 +550,27 @@ int do_set_start_mode_macos(yuzu::CommandContext& ctx, std::string_view name,
     }
 
     // services/set_start_mode_macos#1 (docs/agent-spawn-sink-manifest.md)
-    // Privileged mutation, Decision-8 canonical form (ADR-3002, sudo_argv.hpp):
-    // these two call sites (enable/disable) previously ran completely
-    // UNWRAPPED -- no sudo at all -- even though
-    // scripts/install-agent-user.sh installs exactly this grant for a
-    // privilege-dropped agent: `/bin/launchctl enable system/*` and
-    // `/bin/launchctl disable system/*`. A non-root agent's launchctl
-    // enable/disable on the system domain requires root, so the unwrapped
-    // call failed outright for every non-root agent -- the grant existed and
-    // was never used. sudo_wrap builds the exact `sudo -n -- <tool> <args>`
-    // argv shape that grant matches (a no-op when already root). No
-    // systemctl-style "--" is needed here: "system/<name>" is never itself
-    // leading-hyphen (it always starts with the literal "system/" prefix),
-    // so launchctl can never mistake it for a flag regardless of what `name`
-    // contains.
+    // Privileged mutation, Decision-8 canonical form (ADR-3002, sudo_argv.hpp). A non-root agent
+    // does not run launchctl itself: scripts/install-agent-user.sh grants it exactly one program
+    // as root for this, the helper yuzu-svc-helper (no argument, no wildcard in sudoers), and
+    // launchctl_set_start_mode_argv (services_parsers.hpp) builds the argv that has the helper
+    // run `launchctl <verb> system/<name>` under `sudo -n --`. The helper checks the name against
+    // the same character class as is_safe_service_name and runs launchctl with an argument list
+    // it builds itself. A root agent has no grant to bound and runs launchctl directly. No
+    // systemctl-style "--" is needed: "system/<name>" is never itself leading-hyphen (it always
+    // starts with the literal "system/" prefix), so launchctl can never mistake it for a flag
+    // regardless of what `name` contains. The choice is the euid alone, the static decision
+    // sudo_wrap makes; there is no probe for the helper and no fallback to the old form, so a
+    // host provisioned without this build's installer fails with sudo's own message
+    // (docs/agent-privilege-model.md). The plugin runs no launchctl bootstrap or bootout.
+    const bool euid_is_root = ::geteuid() == 0;
     std::vector<std::string> argv;
     if (mode == "automatic") {
-        argv = yuzu::shared::sudo_wrap(
-            {launchctl_path, "enable", std::format("system/{}", name)});
+        argv = yuzu::services::launchctl_set_start_mode_argv(launchctl_path, "enable", name,
+                                                             euid_is_root);
     } else if (mode == "disabled") {
-        argv = yuzu::shared::sudo_wrap(
-            {launchctl_path, "disable", std::format("system/{}", name)});
+        argv = yuzu::services::launchctl_set_start_mode_argv(launchctl_path, "disable", name,
+                                                             euid_is_root);
     } else if (mode == "manual") {
         ctx.write_output(
             "error|mode 'manual' is not supported on macOS: launchd has no manual/auto "
@@ -709,15 +610,18 @@ int do_set_start_mode_macos(yuzu::CommandContext& ctx, std::string_view name,
 // native Win32 Service Control Manager API throughout, rung 1.
 // linux: systemctl (list-units / enable|disable|mask|unmask) via
 // run_bounded_subprocess(argv, ...) -- shell-free, direct argv[0] exec, no
-// `/bin/sh -c` hop -- rung 2 (ADR-3002) for every action: the read-only
-// list-units enumeration and enable/disable/mask/unmask (the latter now
-// sudo_wrap'd, matching the installed sudoers grant) alike. Previously rung
-// 3 (governed shell) throughout -- this migration removed the shell hop
-// entirely, it did not merely add sudo.
+// `/bin/sh -c` hop. The read-only list-units enumeration is rung 2 (ADR-3002).
+// enable/disable/mask/unmask run through the root-owned yuzu-svc-helper under
+// sudo (matching the installed sudoers grant; a root agent runs systemctl
+// itself). The helper is a `#!/bin/sh` script, and a site's rung is set by the
+// deepest interpreter intentionally invoked (ADR-3002 Decision 5), so
+// set_start_mode is a governed rung-3 interpreter site, registered in
+// docs/agent-spawn-sink-manifest.md.
 // macos: launchctl (list, print-disabled, enable|disable) via the same
-// shell-free runner path -- rung 2, same as linux above; the macOS
-// startup_type leg specifically is the bulk `launchctl print-disabled
-// system` parse in services_macos_launchd.hpp.
+// shell-free runner path -- rung 2 for the reads, rung 3 for enable|disable
+// through yuzu-svc-helper under sudo, as on linux; the macOS startup_type
+// leg specifically is the bulk `launchctl print-disabled system` parse in
+// services_macos_launchd.hpp.
 const YuzuActionDescriptor kActionDescriptors[] = {
     {"list",
      /* linux   = */ {YUZU_SUPPORT_SUPPORTED, 2, "runner argv 'systemctl list-units'", nullptr},
@@ -729,10 +633,15 @@ const YuzuActionDescriptor kActionDescriptors[] = {
      /* windows = */ {YUZU_SUPPORT_SUPPORTED, 1, "win32_service_api", nullptr}},
     {"set_start_mode",
      /* linux   = */
-     {YUZU_SUPPORT_SUPPORTED, 2, "runner argv: root systemctl, or sudo -n -- yuzu-systemctl wrapper (verb enable|disable|mask|unmask)",
+     {YUZU_SUPPORT_SUPPORTED, 3,
+      "sh: the root-owned yuzu-svc-helper, runner argv 'sudo -n -- yuzu-svc-helper systemctl "
+      "enable|disable|mask|unmask' (a root agent runs systemctl directly)",
       nullptr},
      /* macos   = */
-     {YUZU_SUPPORT_SUPPORTED, 2, "runner argv 'sudo -n -- launchctl enable|disable'", nullptr},
+     {YUZU_SUPPORT_SUPPORTED, 3,
+      "sh: the root-owned yuzu-svc-helper, runner argv 'sudo -n -- yuzu-svc-helper launchctl "
+      "enable|disable' (a root agent runs launchctl directly)",
+      nullptr},
      /* windows = */ {YUZU_SUPPORT_SUPPORTED, 1, "win32_service_api", nullptr}},
 };
 

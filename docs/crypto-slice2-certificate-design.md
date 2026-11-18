@@ -1388,9 +1388,18 @@ A caller holding `Inventory:Read` but not `CertificateInventory:Read` gets the l
   `64:ff9b::/96`, 6to4, IPv4-mapped and the operator-declared (`--oidc-nat64-prefix`) prefixes.
   Registration does **no RFC 7050 discovery**, so it refuses only as far as the declared prefixes
   allow: an address behind a prefix the network advertises but the operator did not declare is
-  judged as plain IPv6 at registration. That is safe because nothing fetches at registration and
-  the fetcher re-classifies every address (below). The MCP and REST descriptions both state it
-  as "Declared prefixes only at registration".
+  judged as plain IPv6 at registration (the local-use block is the exception, next bullet). That
+  is safe because nothing fetches at registration and the fetcher re-classifies every address
+  (below). The MCP and REST descriptions both state it as "Declared prefixes only at
+  registration".
+- **Two more embedded forms, and the local-use block** (2026-11-17 hardening, after the ruling
+  above). SIIT (`::ffff:0:0:0/96`) and IPv4-compatible (`::/96`) addresses are judged by the
+  embedded IPv4 address too, never as more open than `non-global`, so an embedded never-allowed,
+  loopback or own address is refused like its plain form. A local-use NAT64 address
+  (`64:ff9b:1::/48`) that no declared prefix covers is refused with no override, because its
+  embedded position depends on a prefix length the address does not carry: an operator whose CRL
+  host sits behind a local-use prefix declares it, with its exact length (a wrong length decodes
+  the wrong IPv4 address).
 - **`PUT` replaces** the source's name, keys and URLs. This is how a renewed CA key is added. A
   `PUT` that drops a URL deletes that URL's `source_url` and `fetch_status` rows, and every held
   `crl` row fetched from it, in the same transaction. A `PUT` that drops a key deletes every held

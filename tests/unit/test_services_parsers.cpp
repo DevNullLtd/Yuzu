@@ -18,6 +18,7 @@
 #include <cstddef>
 #include <format>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using yuzu::agent::SubprocessResult;
@@ -25,10 +26,14 @@ using yuzu::agent::TerminationReason;
 using yuzu::services::decide_set_start_mode_outcome;
 using yuzu::services::is_safe_service_name;
 using yuzu::services::kMaxServiceRows;
+using yuzu::services::kSvcHelperPathLinux;
+using yuzu::services::kSvcHelperPathMacos;
 using yuzu::services::LaunchdListResult;
+using yuzu::services::launchctl_set_start_mode_argv;
 using yuzu::services::parse_launchctl_list;
 using yuzu::services::parse_systemctl_list_units;
 using yuzu::services::SystemdUnitEntry;
+using yuzu::services::systemctl_set_start_mode_argv;
 
 // ── parse_systemctl_list_units ───────────────────────────────────────────────
 
@@ -323,148 +328,78 @@ TEST_CASE("decide_set_start_mode_outcome: a nonzero exit's captured output (e.g.
          "error|systemctl command failed for 'sshd' (exit=1): sudo: a password is required");
 }
 
-// ── WP13 / F48: the privileged systemctl argv goes through the root-owned wrapper ──────────
+// ── set_start_mode privileged argv ──────────────────────────────────────────
+//
+// The argv a non-root agent runs is `sudo -n -- <helper> <tool> <verb> <name>`: the sudoers file
+// names the root-owned helper with no argument and no wildcard, and the helper (whose text
+// tests/test_legacy_quarantine_plugin_removed_lexical.py runs against the same cases) builds the
+// tool's argument list itself. A root agent has no grant to bound and runs the tool directly. The
+// decision is the euid alone: no probe for the helper, no fallback to the tool.
 
-TEST_CASE("systemctl_mutation_argv: a non-root agent calls ONLY the validator wrapper, never "
-          "bare systemctl under sudo",
-          "[services][f48]") {
-    using yuzu::services::kYuzuSystemctlWrapper;
-    using yuzu::services::systemctl_mutation_argv;
-    const auto argv = systemctl_mutation_argv(false, "/usr/bin/systemctl", kYuzuSystemctlWrapper,
-                                              "enable", "ssh.service");
-    REQUIRE(argv.has_value());
-    const std::vector<std::string> expected{"/usr/bin/sudo", "-n", "--", kYuzuSystemctlWrapper,
-                                            "enable", "ssh.service"};
-    CHECK(*argv == expected);
-    for (const auto& a : *argv)
-        CHECK(a != "/usr/bin/systemctl"); // a wildcard systemctl grant is never what this matches
-}
+using Argv = std::vector<std::string>;
 
-TEST_CASE("systemctl_mutation_argv: an absent/untrusted wrapper is a refusal, not a fallback",
-          "[services][f48]") {
-    CHECK_FALSE(yuzu::services::systemctl_mutation_argv(false, "/usr/bin/systemctl", "", "mask",
-                                                        "ssh.service")
-                    .has_value());
-}
-
-TEST_CASE("systemctl_mutation_argv: a root agent runs systemctl directly with `--` before the unit",
-          "[services][f48]") {
-    const auto argv = yuzu::services::systemctl_mutation_argv(true, "/usr/bin/systemctl", "",
-                                                              "disable", "-weird.service");
-    REQUIRE(argv.has_value());
-    const std::vector<std::string> expected{"/usr/bin/systemctl", "disable", "--",
-                                            "-weird.service"};
-    CHECK(*argv == expected);
-}
-
-TEST_CASE("start_mode_took_effect: the read-back must match the requested mode, empty fails closed "
-          "(WP13 UP11)",
-          "[services][up11]") {
-    using yuzu::services::start_mode_took_effect;
-    CHECK(start_mode_took_effect("automatic", "enabled\n"));
-    CHECK(start_mode_took_effect("automatic", "static\n"));
-    CHECK_FALSE(start_mode_took_effect("automatic", "disabled\n")); // wrapper did nothing
-    CHECK_FALSE(start_mode_took_effect("automatic", "masked\n"));
-    CHECK(start_mode_took_effect("manual", "disabled\n"));
-    CHECK_FALSE(start_mode_took_effect("manual", "enabled\n"));
-    CHECK(start_mode_took_effect("disabled", "masked\n"));
-    CHECK_FALSE(start_mode_took_effect("disabled", "enabled\n"));
-    CHECK_FALSE(start_mode_took_effect("automatic", "")); // a 0-byte wrapper leaves nothing to read
-    CHECK_FALSE(start_mode_took_effect("bogus", "enabled"));
-}
-
-TEST_CASE("start_mode_took_effect: error text and non-end states never match (closed set)",
-          "[services][up11]") {
-    using yuzu::services::start_mode_took_effect;
-    for (const char* mode : {"automatic", "manual", "disabled"}) {
-        CHECK_FALSE(start_mode_took_effect(mode, "not-found\n"));
-        CHECK_FALSE(start_mode_took_effect(mode, "Failed to connect to bus: No such file or directory\n"));
-        CHECK_FALSE(start_mode_took_effect(mode, "bad\n"));
-        CHECK_FALSE(start_mode_took_effect(mode, "transient\n"));
-        CHECK_FALSE(start_mode_took_effect(mode, "linked\n"));
-        CHECK_FALSE(start_mode_took_effect(mode, "Unit foo.service not found.\n"));
+TEST_CASE("systemctl_set_start_mode_argv: a non-root agent runs the helper under sudo, for each verb",
+          "[services][sudoers]") {
+    CHECK(kSvcHelperPathLinux == "/usr/local/sbin/yuzu-svc-helper");
+    for (const char* verb : {"enable", "disable", "mask", "unmask"}) {
+        INFO(verb);
+        CHECK(systemctl_set_start_mode_argv("/usr/bin/systemctl", verb, "cron.service", false) ==
+              Argv{"/usr/bin/sudo", "-n", "--", "/usr/local/sbin/yuzu-svc-helper", "systemctl", verb,
+                   "cron.service"});
     }
-    for (const char* st : {"enabled", "static", "indirect", "alias", "generated"})
-        CHECK(start_mode_took_effect("automatic", st));
-    for (const char* st : {"disabled", "static", "indirect", "alias", "generated"})
-        CHECK(start_mode_took_effect("manual", st));
-    CHECK_FALSE(start_mode_took_effect("manual", "enabled-runtime"));
-    CHECK_FALSE(start_mode_took_effect("disabled", "static"));
+    // the tool path the plugin probed is not used by a non-root agent: the helper picks its own
+    CHECK(systemctl_set_start_mode_argv("/bin/systemctl", "mask", "sshd", false) ==
+          systemctl_set_start_mode_argv("/usr/bin/systemctl", "mask", "sshd", false));
 }
 
-TEST_CASE("start_mode_took_effect: a -runtime state means the persistent verb did not act",
-          "[services][up11]") {
-    using yuzu::services::start_mode_took_effect;
-    // enable/disable/mask are persistent: a /run-only state is what a no-op wrapper leaves.
-    CHECK_FALSE(start_mode_took_effect("automatic", "enabled-runtime\n"));
-    CHECK_FALSE(start_mode_took_effect("disabled", "masked-runtime\n"));
-    CHECK_FALSE(start_mode_took_effect("manual", "enabled-runtime\n"));
-    CHECK(start_mode_took_effect("automatic", "enabled\n"));
-    CHECK(start_mode_took_effect("disabled", "masked\n"));
+TEST_CASE("systemctl_set_start_mode_argv: a root agent runs systemctl itself, with -- before the name",
+          "[services][sudoers]") {
+    for (const char* verb : {"enable", "disable", "mask", "unmask"}) {
+        INFO(verb);
+        CHECK(systemctl_set_start_mode_argv("/usr/bin/systemctl", verb, "cron.service", true) ==
+              Argv{"/usr/bin/systemctl", verb, "--", "cron.service"});
+    }
+    CHECK(systemctl_set_start_mode_argv("/bin/systemctl", "enable", "getty@tty1.service", true) ==
+          Argv{"/bin/systemctl", "enable", "--", "getty@tty1.service"});
 }
 
-TEST_CASE("start_mode_readback: SysV redirect text is a stderr line, never part of the state",
-          "[services][up11]") {
-    using yuzu::services::start_mode_took_effect;
-    // With stderr NOT merged (the plugin's readback), a SysV-only unit's stdout is just the state.
-    CHECK(start_mode_took_effect("automatic", "enabled\n"));
-    // If that text ever reached the first line the parser must refuse, not scan for a state line.
-    CHECK_FALSE(start_mode_took_effect(
-        "automatic",
-        "crond is not a native service, redirecting to systemd-sysv-install.\nenabled\n"));
+TEST_CASE("systemctl_set_start_mode_argv: a name with a leading hyphen is one argv element in both modes",
+          "[services][sudoers]") {
+    // The helper takes the name as its third argument and puts -- before it; the root form puts -- itself.
+    CHECK(systemctl_set_start_mode_argv("/usr/bin/systemctl", "enable", "-foo", false).back() == "-foo");
+    CHECK(systemctl_set_start_mode_argv("/usr/bin/systemctl", "enable", "-foo", true) ==
+          Argv{"/usr/bin/systemctl", "enable", "--", "-foo"});
+    const std::string longest(256, 'a');
+    CHECK(systemctl_set_start_mode_argv("/usr/bin/systemctl", "disable", longest, false).back() == longest);
 }
 
-TEST_CASE("start_state_is_unchangeable: the states a verb cannot change", "[services][up11]") {
-    using yuzu::services::start_state_is_unchangeable;
-    for (const char* st : {"static\n", "indirect", "alias\n", "generated\r\n"})
-        CHECK(start_state_is_unchangeable(st));
-    for (const char* st : {"enabled", "disabled", "masked", "", "not-found"})
-        CHECK_FALSE(start_state_is_unchangeable(st));
+TEST_CASE("launchctl_set_start_mode_argv: a non-root agent runs the helper under sudo, for each verb",
+          "[services][sudoers]") {
+    CHECK(kSvcHelperPathMacos == "/Library/PrivilegedHelperTools/yuzu-svc-helper");
+    for (const char* verb : {"enable", "disable"}) {
+        INFO(verb);
+        // the helper adds system/ itself: it is given the bare label
+        CHECK(launchctl_set_start_mode_argv("/bin/launchctl", verb, "com.example.agent", false) ==
+              Argv{"/usr/bin/sudo", "-n", "--", "/Library/PrivilegedHelperTools/yuzu-svc-helper",
+                   "launchctl", verb, "com.example.agent"});
+    }
 }
 
-TEST_CASE("start_mode_readback_matches: a readback that did not run is not a match",
-          "[services][up11]") {
-    using yuzu::services::start_mode_readback_matches;
-    yuzu::agent::SubprocessResult ran;
-    ran.tool_ran = true;
-    ran.termination_reason = yuzu::agent::TerminationReason::exited;
-    ran.exit_code = 1; // is-enabled exits non-zero for `disabled`
-    ran.output = "disabled\n";
-    CHECK(start_mode_readback_matches("manual", ran));
-    yuzu::agent::SubprocessResult not_ran = ran;
-    not_ran.tool_ran = false;
-    CHECK_FALSE(start_mode_readback_matches("manual", not_ran));
-    yuzu::agent::SubprocessResult timed = ran;
-    timed.timed_out = true;
-    timed.termination_reason = yuzu::agent::TerminationReason::deadline;
-    CHECK_FALSE(start_mode_readback_matches("manual", timed));
+TEST_CASE("launchctl_set_start_mode_argv: a root agent runs launchctl itself on system/<label>",
+          "[services][sudoers]") {
+    for (const char* verb : {"enable", "disable"}) {
+        INFO(verb);
+        CHECK(launchctl_set_start_mode_argv("/bin/launchctl", verb, "com.example.agent", true) ==
+              Argv{"/bin/launchctl", verb, "system/com.example.agent"});
+    }
 }
 
-TEST_CASE("start_mode_needs_unmask: automatic and manual unmask first, disabled (mask) does not",
-          "[services][unmask]") {
-    using yuzu::services::start_mode_needs_unmask;
-    CHECK(start_mode_needs_unmask("automatic")); // mask -> automatic must be able to enable
-    CHECK(start_mode_needs_unmask("manual"));
-    CHECK_FALSE(start_mode_needs_unmask("disabled"));
-    CHECK_FALSE(start_mode_needs_unmask("bogus"));
-    CHECK_FALSE(start_mode_needs_unmask(""));
-}
-
-TEST_CASE("start_mode_should_remask: a failed change after an unmask restores the mask",
-          "[services][unmask]") {
-    using yuzu::services::start_mode_should_remask;
-    using yuzu::services::start_state_is_masked;
-    CHECK(start_state_is_masked("masked\n"));
-    CHECK(start_state_is_masked("masked-runtime"));
-    CHECK_FALSE(start_state_is_masked("disabled\n"));
-    CHECK_FALSE(start_state_is_masked(""));
-    CHECK_FALSE(start_state_is_masked("not-found"));
-    // unit was masked, the change failed: put the mask back
-    CHECK(start_mode_should_remask("automatic", true, false));
-    CHECK(start_mode_should_remask("manual", true, false));
-    // a unit that was NOT masked is never masked by a failure; success never remasks
-    CHECK_FALSE(start_mode_should_remask("automatic", false, false));
-    CHECK_FALSE(start_mode_should_remask("automatic", true, true));
-    // disabled is the mask verb itself: nothing was unmasked
-    CHECK_FALSE(start_mode_should_remask("disabled", true, false));
+TEST_CASE("set_start_mode argv: every name is_safe_service_name admits reaches the helper whole",
+          "[services][sudoers]") {
+    for (const std::string_view name : {"a", "cron.service", "getty@tty1.service", "Some_Service-2", "-x",
+                                         "com.apple.something"}) {
+        REQUIRE(is_safe_service_name(name));
+        CHECK(systemctl_set_start_mode_argv("/usr/bin/systemctl", "enable", name, false).back() == name);
+        CHECK(launchctl_set_start_mode_argv("/bin/launchctl", "enable", name, false).back() == name);
+    }
 }

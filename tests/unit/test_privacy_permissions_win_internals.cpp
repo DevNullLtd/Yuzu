@@ -29,6 +29,7 @@
 
 #include "test_helpers.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <filesystem>
@@ -168,10 +169,21 @@ const std::string& synthetic_sid() {
 }
 
 /// Whether any HKEY_USERS subkey is an offline mount this process made for the synthetic SID.
+/// A failed HKEY_USERS listing is retried; one that never succeeds is recorded as a failure and
+/// reported as "present", never read as "no mount".
 bool synthetic_mount_present() {
-    for (const auto& n : yuzu::win::enumerate_hku_subkeys())
-        if (n.find(synthetic_sid()) != std::string::npos) return true;
-    return false;
+    constexpr int kAttempts = 3;
+    for (int attempt = 1; attempt <= kAttempts; ++attempt) {
+        const auto hku = yuzu::win::enumerate_hku_subkeys_checked();
+        if (hku.error.empty()) {
+            for (const auto& n : hku.names)
+                if (n.find(synthetic_sid()) != std::string::npos) return true;
+            return false;
+        }
+        if (attempt == kAttempts)
+            FAIL_CHECK("the HKEY_USERS listing failed " << kAttempts << " times: " << hku.error);
+    }
+    return true;
 }
 
 /// Mandatory cleanup on every path: the shared box must never keep a YUZU_HIVE_* mount. `held` is
@@ -185,7 +197,20 @@ struct HiveCleanup {
         // with_user_hive's privilege scopes have already reverted: unloading needs both again.
         const yuzu::win::PrivilegeScope restore(L"SeRestorePrivilege");
         const yuzu::win::PrivilegeScope backup(L"SeBackupPrivilege");
-        RegUnLoadKeyW(HKEY_USERS, yuzu::win::to_wide(report.mount_name).c_str());
+        const auto wide = yuzu::win::to_wide(report.mount_name);
+        LSTATUS rc = ERROR_SUCCESS;
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            rc = RegUnLoadKeyW(HKEY_USERS, wide.c_str());
+            if (rc == ERROR_SUCCESS) return;
+        }
+        // with_user_hive may already have unloaded the mount, so a failed unload is a leak only
+        // when the mount is still listed (or the listing itself failed).
+        const auto hku = yuzu::win::enumerate_hku_subkeys_checked();
+        const bool still_listed =
+            std::find(hku.names.begin(), hku.names.end(), report.mount_name) != hku.names.end();
+        if (still_listed || !hku.error.empty())
+            FAIL_CHECK("the mount " << report.mount_name
+                                    << " stayed loaded: RegUnLoadKeyW rc=" << rc);
     }
     ~HiveCleanup() { run(); }
 };

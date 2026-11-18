@@ -1063,8 +1063,7 @@ int do_query(yuzu::CommandContext& ctx, yuzu::Params params) {
                 found = true;
             }
             ctx.write_output(yuzu::util::sanitize_utf8(
-                std::format("app|{}|{}|{}", app.name, app.version.empty() ? "-" : app.version,
-                            app.publisher.empty() ? "-" : app.publisher)));
+                parsers::format_query_row(app.name, app.version, app.publisher)));
         }
     }
 
@@ -1194,10 +1193,15 @@ private:
             ctx.write_output("error|profile_list_unreadable");
             return 1;
         }
-        const auto hku_subkeys = yuzu::win::enumerate_hku_subkeys();
+        const auto hku = yuzu::win::enumerate_hku_subkeys_checked();
+        if (!hku.error.empty()) {
+            spdlog::warn("installed_apps: HKEY_USERS listing incomplete ({})", hku.error);
+            ctx.write_output("error|hku_list_incomplete");
+            return 1;
+        }
         // System SIDs are filtered here, BEFORE any per-profile read, rather
         // than after reading ProfileImagePath as the old walk did.
-        const auto profiles = yuzu::profiles::build_profile_list(records, hku_subkeys);
+        const auto profiles = yuzu::profiles::build_profile_list(records, hku.names);
 
         std::size_t privilege_missing = 0;
         std::size_t hive_read_failed = 0;
@@ -1248,10 +1252,8 @@ private:
                 // registry list_profiles case, where a leading tag caused the
                 // hp-B1 column shift. Do not strip it.
                 ctx.write_output(yuzu::util::sanitize_utf8(
-                    std::format("user_app|{}|{}|{}|{}|{}", username,
-                                app.name, app.version.empty() ? "-" : app.version,
-                                app.publisher.empty() ? "-" : app.publisher,
-                                app.install_date.empty() ? "-" : app.install_date)));
+                    parsers::format_user_app_row(username, app.name, app.version, app.publisher,
+                                                 app.install_date)));
             }
         }
 
@@ -1277,11 +1279,8 @@ private:
         if (!report_if_degraded(ctx, apps.degraded, "list_per_user"))
             return 1;
         for (const auto& app : apps.apps) {
-            ctx.write_output(yuzu::util::sanitize_utf8(
-                std::format("user_app|system|{}|{}|{}|{}", app.name,
-                            app.version.empty() ? "-" : app.version,
-                            app.publisher.empty() ? "-" : app.publisher,
-                            app.install_date.empty() ? "-" : app.install_date)));
+            ctx.write_output(yuzu::util::sanitize_utf8(parsers::format_user_app_row(
+                "system", app.name, app.version, app.publisher, app.install_date)));
         }
         return 0;
 
@@ -1291,11 +1290,8 @@ private:
         if (!report_if_degraded(ctx, apps.degraded, "list_per_user"))
             return 1;
         for (const auto& app : apps.apps) {
-            ctx.write_output(yuzu::util::sanitize_utf8(
-                std::format("user_app|system|{}|{}|{}|{}", app.name,
-                            app.version.empty() ? "-" : app.version,
-                            app.publisher.empty() ? "-" : app.publisher,
-                            app.install_date.empty() ? "-" : app.install_date)));
+            ctx.write_output(yuzu::util::sanitize_utf8(parsers::format_user_app_row(
+                "system", app.name, app.version, app.publisher, app.install_date)));
         }
 
         // F19 (WP13): no Homebrew rows and NO brew subprocess here. The agent is root on macOS

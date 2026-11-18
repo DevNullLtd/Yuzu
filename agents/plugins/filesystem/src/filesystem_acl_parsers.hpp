@@ -19,13 +19,14 @@
 //   * Windows <type> = allow|deny|allow_object|...|other; <flags> = ACE flags.
 //
 // Row-field escaping (row_field below): CR/LF fold to a space, a TRAILING
-// backslash folds to '/', pipes are escaped. safe_output_field() is NOT used:
+// backslash folds to '/', pipes are escaped (yuzu::shared::row_field, shared with
+// procfetch/wmi/installed_apps/network_config). safe_output_field() is NOT used:
 // it folds every backslash and would rewrite `BUILTIN\Users`. Interior
 // backslashes survive because the server decoder (result_parsing.hpp) treats a
 // backslash not followed by a pipe as literal data; only a trailing one would
 // glue onto the field separator as `\|`.
 
-#include <yuzu/string_utils.hpp>
+#include <row_field.hpp>
 
 #include <cstddef>
 #include <cstdint>
@@ -38,13 +39,7 @@
 namespace yuzu::filesystem::acl {
 
 inline std::string row_field(std::string_view value) {
-    std::string out;
-    out.reserve(value.size());
-    for (char ch : value)
-        out += (ch == '\r' || ch == '\n') ? ' ' : ch;
-    if (!out.empty() && out.back() == '\\')
-        out.back() = '/';
-    return yuzu::util::escape_pipes(out);
+    return yuzu::shared::row_field(value); // hoisted to agents/shared/row_field.hpp
 }
 
 namespace detail {

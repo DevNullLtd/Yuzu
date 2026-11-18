@@ -473,8 +473,9 @@ int do_processors(yuzu::CommandContext& ctx) {
         ctx.write_output("cpu|0|unknown|0|0|0|-|-");
     } else {
         for (auto& [id, c] : cpus) {
-            ctx.write_output(
-                std::format("cpu|{}|{}|{}|{}|{:.0f}|-|-", id, c.model, c.cores, c.threads, c.mhz));
+            // The model is /proc/cpuinfo text: format_cpu_row_sampled escapes a pipe (#7040).
+            ctx.write_output(yuzu::hardware::estate::format_cpu_row_sampled(id, c.model, c.cores,
+                                                                            c.threads, c.mhz));
         }
     }
 
@@ -487,8 +488,10 @@ int do_processors(yuzu::CommandContext& ctx) {
     // mhz stays 0.0 in that case, matching the pre-Wave-3 fallback exactly.
     auto freq = sysctl_value<uint64_t>("hw.cpufrequency");
     double mhz = freq ? static_cast<double>(*freq) / 1e6 : 0.0;
-    ctx.write_output(
-        std::format("cpu|0|{}|{}|{}|{:.0f}|-|-", brand.empty() ? "unknown" : brand, cores, threads, mhz));
+    // machdep.cpu.brand_string is firmware text: format_cpu_row_sampled escapes a pipe (#7040).
+    ctx.write_output(yuzu::hardware::estate::format_cpu_row_sampled(
+        0, brand.empty() ? std::string_view{"unknown"} : std::string_view{brand}, cores, threads,
+        mhz));
 
 #elif defined(_WIN32)
     int idx = 0;

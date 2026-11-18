@@ -9,7 +9,8 @@ is never a confirmation, and the release runs, and is confirmed or exits 3, on e
 Also pinned: the SUCCESS-only status rule and the poll past RUNNING, the explicit --agent-id bound to this
 host by full hostname, the 300 s limit floor (0 and negative refused in apply mode), a refused login
 exiting 2, a host the apply found already contained is never released, and a pass needs a release of
-this run's own that succeeded and undid something (otherwise exit 1, "release unproven").
+this run's own that succeeded and undid something (otherwise exit 1, "release unproven"). A held run lock
+exits 2 with nothing dispatched, and a poll's error answer is reported, never swallowed.
 """
 import contextlib
 import io
@@ -148,12 +149,12 @@ class Status(unittest.TestCase):
 
 
 class Poll(unittest.TestCase):
-    """Client.poll_response against a scripted get_json: it must poll PAST a RUNNING row to the terminal one."""
+    """Client.poll_response against a scripted get_responses: it must poll PAST a RUNNING row to the terminal one."""
 
     def poll(self, replies, timeout_s=20):
         client = fc.Client("http://127.0.0.1:9")
         seq = list(replies)
-        with mock.patch.object(client, "get_json", side_effect=lambda _p: seq.pop(0) if len(seq) > 1 else seq[0]), \
+        with mock.patch.object(client, "get_responses", side_effect=lambda _p: seq.pop(0) if len(seq) > 1 else seq[0]), \
                 mock.patch.object(fc.time, "sleep"):
             return client.poll_response("cid", timeout_s=timeout_s), seq
 
@@ -161,7 +162,7 @@ class Poll(unittest.TestCase):
         client = fc.Client("http://127.0.0.1:9")
         reads = []
         replies = [EMPTY, running(), running(), row("inactive")]
-        with mock.patch.object(client, "get_json", side_effect=lambda _p: reads.append(1) or replies[len(reads) - 1]), \
+        with mock.patch.object(client, "get_responses", side_effect=lambda _p: reads.append(1) or replies[len(reads) - 1]), \
                 mock.patch.object(fc.time, "sleep"):
             got = client.poll_response("cid", timeout_s=20)
         self.assertEqual(got, row("inactive"))
@@ -171,7 +172,7 @@ class Poll(unittest.TestCase):
         ticks = iter(range(0, 1000, 3))  # the clock advances 3 s per read, so a deadline of 10 s ends the poll
         with mock.patch.object(fc.time, "monotonic", side_effect=lambda: next(ticks)):
             client = fc.Client("http://127.0.0.1:9")
-            with mock.patch.object(client, "get_json", return_value=running()), mock.patch.object(fc.time, "sleep"):
+            with mock.patch.object(client, "get_responses", return_value=running()), mock.patch.object(fc.time, "sleep"):
                 got = client.poll_response("cid", timeout_s=10)
         self.assertEqual(got, running())
         with mock.patch.object(fc, "dispatch", return_value=got):
@@ -185,31 +186,39 @@ class Poll(unittest.TestCase):
 
 class Transient(unittest.TestCase):
     def test_a_lost_poll_is_retried_not_fatal(self):
+        # get_responses turns a reset, a timeout, a non-JSON body or an HTTP error into an `error` answer
         client = fc.Client("http://127.0.0.1:9")
-        replies = [ConnectionResetError("x"), TimeoutError("t"), ValueError("not json"),
-                   fc.http.client.IncompleteRead(b""), fc.http.client.RemoteDisconnected("r"),
-                   fc.urllib.error.URLError("u"), row("inactive")]
-
-        def get(_p):
-            r = replies.pop(0)
-            if isinstance(r, BaseException):
-                raise r
-            return r
-        with mock.patch.object(client, "get_json", side_effect=get), mock.patch.object(fc.time, "sleep"):
+        replies = [{"error": "ConnectionResetError: x"}, {"error": "TimeoutError: t"},
+                   {"error": "JSONDecodeError: not json"}, {"error": "HTTP 502", "code": 502}, row("inactive")]
+        with mock.patch.object(client, "get_responses", side_effect=lambda _p: replies.pop(0)), \
+                mock.patch.object(fc.time, "sleep"):
             self.assertEqual(client.poll_response("cid", timeout_s=60), row("inactive"))
         self.assertEqual(replies, [])
 
+    def test_an_error_answer_never_replaces_the_last_good_read(self):
+        client = fc.Client("http://127.0.0.1:9")
+        ticks = iter(range(0, 1000, 3))
+        replies = [running(), {"error": "HTTP 401 expired", "code": 401}]
+        with mock.patch.object(fc.time, "monotonic", side_effect=lambda: next(ticks)), \
+                mock.patch.object(client, "get_responses", side_effect=lambda _p: replies.pop(0) if len(replies) > 1 else replies[0]), \
+                mock.patch.object(fc.time, "sleep"), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(client.poll_response("cid", timeout_s=10), running())
+
 
 class PollSaysWhy(unittest.TestCase):
-    def test_a_poll_that_ends_without_an_answer_prints_the_last_transport_error(self):
+    def test_a_poll_error_is_reported(self):
         client = fc.Client("http://127.0.0.1:9")
         ticks = iter(range(0, 1000, 3))
         err = io.StringIO()
         with mock.patch.object(fc.time, "monotonic", side_effect=lambda: next(ticks)), \
-                mock.patch.object(client, "get_json", side_effect=fc.urllib.error.HTTPError("u", 401, "expired", None, None)), \
+                mock.patch.object(client, "get_responses",
+                                  return_value={"error": "HTTP 401 session expired", "code": 401}), \
                 mock.patch.object(fc.time, "sleep"), contextlib.redirect_stderr(err):
             self.assertEqual(client.poll_response("cid", timeout_s=10), {})
-        self.assertIn("401", err.getvalue())
+        self.assertIn("HTTP 401 session expired", err.getvalue())
+
+    def test_the_client_is_the_runners(self):
+        self.assertTrue(issubclass(fc.Client, fc.instructions_runner.YuzuClient))
 
 
 class Proof(unittest.TestCase):
@@ -246,7 +255,7 @@ class Proof(unittest.TestCase):
 
 class Login(unittest.TestCase):
     def test_a_403_names_the_missing_read_access(self):
-        def denied(_p):
+        def denied():
             raise fc.urllib.error.HTTPError("u", 403, "no", None, None)
         with self.assertRaises(fc.LoginError) as cm:
             self.login(denied)
@@ -254,23 +263,23 @@ class Login(unittest.TestCase):
 
     """A 200/302 from the login POST proves nothing: the session is proven by an authenticated read."""
 
-    def login(self, get_json):
+    def login(self, list_agents):
         client = fc.Client("http://127.0.0.1:9")
-        with mock.patch.object(client.opener, "open", return_value=mock.MagicMock()), \
-                mock.patch.object(client, "get_json", side_effect=get_json):
-            client.login("a", "b")
+        with mock.patch.object(fc.instructions_runner.YuzuClient, "login"), \
+                mock.patch.object(client, "list_agents", side_effect=list_agents):
+            return client.login("a", "b")
 
     def test_an_authenticated_read_is_a_login(self):
-        self.login(lambda _p: {"agents": []})
+        self.assertEqual(self.login(lambda: []), [])
 
     def test_a_login_page_instead_of_json_is_a_failed_login(self):
-        def page(_p):
+        def page():
             raise ValueError("Expecting value")  # json.JSONDecodeError is a ValueError
         with self.assertRaises(fc.LoginError):
             self.login(page)
 
     def test_a_401_on_the_authenticated_read_is_a_failed_login(self):
-        def denied(_p):
+        def denied():
             raise fc.urllib.error.HTTPError("u", 401, "no", None, None)
         with self.assertRaises(fc.LoginError):
             self.login(denied)
@@ -289,12 +298,17 @@ class Flow(unittest.TestCase):
     """main() against a recording fake of the dispatch seam. `script` maps an action to the list of replies
     (or exceptions) it answers with, in order."""
 
-    def run_main(self, script, apply=True, extra=(), dashboard="http://127.0.0.1:9", agent=True, client=None):
+    def run_main(self, script, apply=True, extra=(), dashboard="http://127.0.0.1:9", agent=True, client=None,
+                 lock=None):
+        # a per-process lock file: concurrent jobs on one CI box must not share the run lock
+        if lock is None:
+            lock = os.path.join(fc.tempfile.gettempdir(), f"yuzu_test_fwc_run_{os.getpid()}.lock")
+            self.addCleanup(lambda: Path(lock).unlink(missing_ok=True))
         calls = []
         self.params = {}
         if client is None:
             client = mock.MagicMock()
-            client.get_json.return_value = client.login.return_value = {"agents": [{"agent_id": "a", "hostname": "Box.local", "os": "linux"}]}
+            client.login.return_value = {"agents": [{"agent_id": "a", "hostname": "Box.local", "os": "linux"}]}
 
         def fake(_client, _agent, action, params):
             calls.append(action)
@@ -312,6 +326,7 @@ class Flow(unittest.TestCase):
                 mock.patch.object(fc, "this_host_names", return_value=["box"]), \
                 mock.patch.object(fc, "this_host_os", return_value="linux"), \
                 mock.patch.object(fc.time, "sleep"), \
+                mock.patch.object(fc, "LOCK_PATH", lock), \
                 mock.patch.object(fc, "dispatch", side_effect=fake):
             return fc.main(argv), calls
 
@@ -430,14 +445,14 @@ class Flow(unittest.TestCase):
         for agents in ([], [{"agent_id": "a"}, {"agent_id": "b"}]):
             with self.subTest(n=len(agents)):
                 client = mock.MagicMock()
-                client.get_json.return_value = client.login.return_value = {"agents": agents}
+                client.login.return_value = {"agents": agents}
                 rc, calls = self.run_main({}, apply=False, agent=False, client=client)
                 self.assertEqual(rc, fc.EXIT_PRECONDITION)
                 self.assertEqual(calls, [])
 
     def test_a_lone_registered_agent_is_picked_by_the_probe_only(self):
         client = mock.MagicMock()
-        client.get_json.return_value = client.login.return_value = {"agents": [{"agent_id": "a"}]}
+        client.login.return_value = {"agents": [{"agent_id": "a"}]}
         rc, calls = self.run_main({"quarantine_status": [row("inactive")]}, apply=False, agent=False, client=client)
         self.assertEqual(rc, fc.EXIT_OK)
         self.assertEqual(calls, ["quarantine_status"])
@@ -454,7 +469,7 @@ class Flow(unittest.TestCase):
                        [{"agent_id": "a", "hostname": ""}], []):
             with self.subTest(agents=agents):
                 client = mock.MagicMock()
-                client.get_json.return_value = client.login.return_value = {"agents": agents}
+                client.login.return_value = {"agents": agents}
                 rc, calls = self.run_main({}, client=client)
                 self.assertEqual(rc, fc.EXIT_PRECONDITION)
                 self.assertEqual(calls, [])
@@ -587,10 +602,10 @@ class Flow(unittest.TestCase):
     def test_login_reads_the_agents_once_and_the_attempts_are_three(self):
         c = fc.Client("http://127.0.0.1:9")
         reads = []
-        with mock.patch.object(c.opener, "open", return_value=mock.MagicMock()), \
-                mock.patch.object(c, "get_json", side_effect=lambda p: reads.append(p) or {"agents": []}):
-            self.assertEqual(c.login("a", "b"), {"agents": []})
-        self.assertEqual(reads, ["/api/agents"])
+        with mock.patch.object(fc.instructions_runner.YuzuClient, "login"), \
+                mock.patch.object(c, "list_agents", side_effect=lambda: reads.append(1) or []):
+            self.assertEqual(c.login("a", "b"), [])
+        self.assertEqual(reads, [1])
         self.assertEqual(fc.RELEASE_ATTEMPTS, 3)  # the docstring and the TTL budget both say three
         self.assertGreaterEqual(fc.DEFAULT_TTL_S, 646)  # the worst case with every attempt used
 
@@ -600,8 +615,8 @@ class Flow(unittest.TestCase):
         rc, _ = self.run_main({}, client=client)
         self.assertEqual(rc, fc.EXIT_PRECONDITION)
         c = fc.Client("http://127.0.0.1:9")
-        with mock.patch.object(c.opener, "open", return_value=mock.MagicMock()), \
-                mock.patch.object(c, "get_json", side_effect=fc.http.client.IncompleteRead(b"x")):
+        with mock.patch.object(fc.instructions_runner.YuzuClient, "login"), \
+                mock.patch.object(c, "list_agents", side_effect=fc.http.client.IncompleteRead(b"x")):
             with self.assertRaises(fc.LoginError):
                 c.login("a", "b")
 
@@ -642,7 +657,7 @@ class Flow(unittest.TestCase):
 
     def test_the_binding_gets_this_machines_os_and_names(self):
         client = mock.MagicMock()
-        client.get_json.return_value = client.login.return_value = {"agents": [{"agent_id": "a", "hostname": "box", "os": "linux"}]}
+        client.login.return_value = {"agents": [{"agent_id": "a", "hostname": "box", "os": "linux"}]}
         with mock.patch.object(fc, "agent_is_this_host", wraps=fc.agent_is_this_host) as bound:
             self.run_main({"quarantine_status": [row("inactive"), row("active"), row("inactive")],
                            "quarantine": [{}], "release": [REL]}, client=client)
@@ -662,6 +677,26 @@ class Flow(unittest.TestCase):
         self.assertEqual(rc, fc.EXIT_PRECONDITION)
         self.assertEqual(calls, [])
         self.assertIn("--agent-id is required", err.getvalue())  # not the host-binding refusal in disguise
+
+    def test_a_held_run_lock_exits_2_before_any_dispatch(self):
+        lock = os.path.join(fc.tempfile.gettempdir(), f"yuzu_test_fwc_{os.getpid()}.lock")
+        holder = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fc.fcntl.flock(holder, fc.fcntl.LOCK_EX | fc.fcntl.LOCK_NB)  # another run holds it
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc, calls = self.run_main({"quarantine_status": [row("inactive")]}, lock=lock)
+            self.assertEqual(rc, fc.EXIT_PRECONDITION)
+            self.assertEqual(calls, [])
+            self.assertIn("another containment run", err.getvalue())
+            fc.fcntl.flock(holder, fc.fcntl.LOCK_UN)  # once it is free, a run takes it and releases it on exit
+            rc, _ = self.run_main({"quarantine_status": [row("inactive"), row("active"), row("inactive")],
+                                   "quarantine": [{}], "release": [REL]}, lock=lock)
+            self.assertEqual(rc, fc.EXIT_OK)
+            fc.fcntl.flock(holder, fc.fcntl.LOCK_EX | fc.fcntl.LOCK_NB)  # raises if the run kept it
+        finally:
+            os.close(holder)
+            os.unlink(lock)
 
     def test_a_failed_login_exits_2_before_any_dispatch(self):
         client = mock.MagicMock()

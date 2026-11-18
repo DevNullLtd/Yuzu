@@ -19,6 +19,8 @@
 #include <yuzu/plugin.hpp>
 #include <proc_access.hpp> // WP13 UP14: /proc refusal tally
 
+#include "processes_rows.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -64,16 +66,6 @@ std::string to_lower(std::string_view sv) {
     std::transform(result.begin(), result.end(), result.begin(),
                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     return result;
-}
-
-// The wire format is pipe-delimited, one record per line. A process name (or any
-// field) containing '|', CR, or LF would shift/split fields on the server-side
-// positional parser, so neutralise those bytes to a space before emitting.
-std::string sanitize_field(std::string s) {
-    for (char& c : s)
-        if (c == '|' || c == '\n' || c == '\r')
-            c = ' ';
-    return s;
 }
 
 #ifdef _WIN32
@@ -343,7 +335,7 @@ private:
     int do_list(yuzu::CommandContext& ctx) {
         auto procs = enumerate_processes();
         for (const auto& p : procs) {
-            ctx.write_output(std::format("proc|{}|{}", p.pid, sanitize_field(p.name)));
+            ctx.write_output(yuzu::processes::format_query_row(p.pid, p.name));
         }
         return 0;
     }
@@ -371,8 +363,7 @@ private:
                     hash_cache.emplace(path, hash);
                 }
             }
-            ctx.write_output(std::format("proc|{}|{}|{}|{}|{}", p.pid, p.ppid,
-                                         sanitize_field(p.name), hash, sanitize_field(path)));
+            ctx.write_output(yuzu::processes::format_tree_row(p.pid, p.ppid, p.name, hash, path));
         }
         report_exe_gaps(ctx, tally);
         return 0;
@@ -400,8 +391,7 @@ private:
                     hash_cache.emplace(path, hash);
                 }
             }
-            ctx.write_output(std::format("proc|{}|{}|{}|{}", p.pid, sanitize_field(p.name), hash,
-                                         sanitize_field(path)));
+            ctx.write_output(yuzu::processes::format_hashed_row(p.pid, p.name, hash, path));
         }
         report_exe_gaps(ctx, tally);
         return 0;
@@ -427,7 +417,7 @@ private:
 
         ctx.write_output(std::format("found|{}", matches.empty() ? "false" : "true"));
         for (const auto* p : matches) {
-            ctx.write_output(std::format("proc|{}|{}", p->pid, p->name));
+            ctx.write_output(yuzu::processes::format_query_row(p->pid, p->name));
         }
         return 0;
     }

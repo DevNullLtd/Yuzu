@@ -61,7 +61,7 @@ No external binaries, no subprocesses, no network access — every leg is an in-
 
 ### Outputs
 
-Pipe-delimited rows via `write_output()`, one line per process (or, for `query`, one `found|` line plus zero or more matching rows). A field is never omitted for width — `list_hashed`/`list_tree` always carry the full field count, with an empty (not `-`) string where the executable path or hash could not be resolved. A process name containing `|`, CR, or LF has those bytes replaced with a space before emission, so the pipe format can never desync (`processes_plugin.cpp:71-76`).
+Pipe-delimited rows via `write_output()`, one line per process (or, for `query`, one `found|` line plus zero or more matching rows). A field is never omitted for width — `list_hashed`/`list_tree` always carry the full field count, with an empty (not `-`) string where the executable path or hash could not be resolved. A process name (or path) containing `|`, CR, or LF has those bytes replaced with a space, and a trailing backslash is folded to `/` (it would otherwise glue onto the next `|`); other backslashes are kept. This applies to `list`, `query`, `list_hashed` and `list_tree` alike (`processes_rows.hpp`), so the pipe format can never desync.
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
 **`crossplatform.process.list` — `pid|name`**
@@ -69,7 +69,7 @@ Pipe-delimited rows via `write_output()`, one line per process (or, for `query`,
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
 | `pid` | int64 | - | Windows, Linux, macOS | `1936` | The process's numeric identifier, as assigned by the OS kernel at process creation. Values: integer. |
-| `name` | string | - | Windows, Linux, macOS | `svchost.exe` | The process's short name (Windows: PROCESSENTRY32W.szExeFile, the image filename only, no path; Linux: /proc/<pid>/status Name:, kernel-truncated to 15 bytes; macOS: the resolved on-disk executable path when it starts with '/', else the 16-byte-truncated p_comm). '\|', CR and LF are replaced with a space before the row is emitted. Values: free text. |
+| `name` | string | - | Windows, Linux, macOS | `svchost.exe` | The process's short name (Windows: PROCESSENTRY32W.szExeFile, the image filename only, no path; Linux: /proc/<pid>/status Name:, kernel-truncated to 15 bytes; macOS: the resolved on-disk executable path when it starts with '/', else the 16-byte-truncated p_comm). '\|', CR and LF are replaced with a space and a trailing backslash with '/' before the row is emitted. Values: free text. |
 
 **`crossplatform.process.query` — `found|pid|name`**
 
@@ -258,13 +258,13 @@ proc|1|sh
 1. **No typed result status, ever.** Every action on every OS reports `UNDECLARED / UNKNOWN /` in every capture — the plugin has no `set_result_status` call at all, so an enumeration failure (a failed `CreateToolhelp32Snapshot` or `opendir("/proc")`) and "this host genuinely has zero processes" are indistinguishable on the wire.
 2. **`list_hashed`/`list_tree` have no privilege-model row.** `docs/agent-privilege-model.md:83` covers `processes.fetch`/`echo.process_tree` (needing `cap_sys_ptrace` on Linux to inspect non-child processes) — that is a different action id, not present in this plugin's descriptor, so it must not be read as documenting `list_hashed`/`list_tree`. Both were captured only as root/SYSTEM/unprivileged-but-same-user, so a production unprivileged Linux capture (where `readlink(/proc/<pid>/exe)` on another user's process would be denied) has not been taken; add the row when it is.
 3. **512 MiB hash cap refuses, not truncates.** `sha256_file()` returns an empty hash for any image over the cap rather than hashing a truncated prefix (`agents/core/src/plugin_loader.cpp:79-95`) — an empty `sha256` on a real, resolved `path` can mean "oversized," not just "unreadable."
-4. **`query` output is not sanitized.** `do_query` writes `p->name` directly (`processes_plugin.cpp:419`), unlike `list`/`list_hashed`/`list_tree`, which run every name through `sanitize_field()`. A process name containing `|`/CR/LF would desync a `query` row's fields; none of the three captures exercised this.
+4. **Row fields are neutralised, and only a trailing backslash is folded.** Every action (`list`, `query`, `list_hashed`, `list_tree`) builds its rows in `processes_rows.hpp`: `|`, CR and LF in a name or path become a space and a trailing backslash becomes `/` (it would otherwise glue onto the next `|`). Interior backslashes are kept, so a Windows path stays readable (the same backslash rule as `procfetch`, `wmi`, `installed_apps`, `network_config` and `filesystem`; unlike them, `processes` folds a `|` to a space because its consumers split rows on a raw `|`). An agent on a build before this change still emits unsanitised `query` rows and glues a trailing backslash until it is upgraded.
 5. **macOS name field is dual-shaped.** `list`/`list_hashed`/`list_tree` report the full resolved executable path as `name` when one was found, else the 16-byte-truncated `p_comm` (`processes_plugin.cpp:173-174`) — a consumer joining on `name` across OSes gets a path on macOS and a bare filename on Windows/Linux.
 
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/processes/src/processes_plugin.cpp`
+- Plugin: `agents/plugins/processes/src/processes_plugin.cpp` · `agents/plugins/processes/src/processes_rows.hpp`
 - Definitions: `content/definitions/processes.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_b.hpp`
 - Tests: none found by name

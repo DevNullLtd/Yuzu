@@ -48,6 +48,10 @@ reported about itself: it stops a mistyped or remote agent id, it is not an auth
 the same default name, while this host's own agent is not registered, would bind). The release is never skipped
 by a failing terminal: every message after the apply goes through a print that cannot raise.
 
+An --apply-containment run holds an exclusive lock on yuzu_firewall_containment_ceremony.lock in the temp
+directory from before its first dispatch until its release is confirmed: a second run started while it is
+held exits 2 with nothing dispatched, so two runs cannot release each other's containment.
+
 The ceremony dispatches `quarantine`, `release` and `quarantine_status` only. `quarantine_allow` (the
 fourth containment action) is not exercised here: it has no ceremony coverage, only its unit tests.
 
@@ -70,19 +74,28 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from http import cookiejar
 from pathlib import Path
 
+try:
+    import fcntl
+except ImportError:  # Windows: refusal() stops the run before any lock is needed
+    fcntl = None
+
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+import instructions_runner  # noqa: E402  (the shared dashboard client)
+
 REPO = HERE.parent.parent
 INSTALL = REPO / "scripts" / "install-agent-user.sh"
 EXIT_OK, EXIT_FAIL, EXIT_PRECONDITION, EXIT_RELEASE_FAILED = 0, 1, 2, 3
 SSH_VARS = ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY")
 POLL_S = 20
+LOCK_PATH = os.path.join(tempfile.gettempdir(), "yuzu_firewall_containment_ceremony.lock")
 POLL_APPLY_S = 90
 RELEASE_READS = 4
 RELEASE_ATTEMPTS = 3  # a `busy` or otherwise refused release is dispatched again while the host is not inactive
@@ -125,57 +138,67 @@ class LoginError(RuntimeError):
     """The dashboard did not give this client an authenticated session."""
 
 
-class Client:
-    """Minimal dashboard client (login by form, cookie jar, JSON POST/GET, response poll). Kept here, not
-    imported from the legacy quarantine ceremony, so removing that plugin's scripts cannot break this one."""
+class Client(instructions_runner.YuzuClient):
+    """The runner's dashboard client (no proxy, cookie jar, no-redirect POST opener), plus the two calls this
+    ceremony needs: a JSON POST and a response poll that waits past RUNNING rows."""
 
     def __init__(self, base: str, timeout: int = 30):
-        self.base, self.timeout = base.rstrip("/"), timeout
-        self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cookiejar.CookieJar()))
+        super().__init__(base, timeout=timeout, run_id="firewall-containment")
 
     def login(self, user: str, password: str):
-        """Log in and return the `/api/agents` payload that proved the session."""
-        body = urllib.parse.urlencode({"username": user, "password": password}).encode()
-        req = urllib.request.Request(f"{self.base}/login", data=body,
-                                     headers={"Content-Type": "application/x-www-form-urlencoded"})
+        """Log in and return the `/api/agents` list that proved the session."""
         try:
-            self.opener.open(req, timeout=self.timeout).close()
+            super().login(user, password)
             # A rejected login can still answer 200/302 (the login page), so the session is proven by an
             # authenticated read, never by the status of the form POST.
-            agents = self.get_json("/api/agents")
-        except (OSError, ValueError, http.client.HTTPException) as e:  # URLError/HTTPError are OSError; a login
-            # page is not JSON; a truncated body is an IncompleteRead
+            return self.list_agents()
+        except (OSError, ValueError, RuntimeError, http.client.HTTPException) as e:  # URLError/HTTPError are
+            # OSError; a login page is not JSON; a truncated body is an IncompleteRead
             why = (" (the session is valid but this user cannot read /api/agents: it needs Infrastructure:Read)"
                    if getattr(e, "code", None) == 403 else "")
             raise LoginError(f"login failed: {e}{why}") from e
-        return agents
-
-    def get_json(self, path: str):
-        with self.opener.open(urllib.request.Request(self.base + path), timeout=self.timeout) as r:
-            return json.loads(r.read() or b"{}")
 
     def post_json(self, path: str, payload: dict) -> dict:
         req = urllib.request.Request(self.base + path, data=json.dumps(payload).encode(),
                                      headers={"Content-Type": "application/json", "Origin": self.base})
-        with self.opener.open(req, timeout=self.timeout) as r:
+        with self.post_opener.open(req, timeout=self.timeout) as r:
             return json.loads(r.read() or b"{}")
 
     def poll_response(self, command_id: str, timeout_s: int = POLL_S) -> dict:
         """The responses once every row has left RUNNING (a RUNNING row is interim, not the answer), or
-        whatever was last read when the deadline passes."""
-        deadline, last, lost = time.monotonic() + timeout_s, {}, None
+        whatever was last read when the deadline passes. A failed read (`get_responses` answers with an
+        `error`: a reset, a timeout, a non-JSON body, an expired session's 401/403) is one lost poll, and the
+        last such error is reported when the poll ends without an answer."""
+        deadline, last, lost = time.monotonic() + timeout_s, {}, ""
         while time.monotonic() < deadline:
-            try:
-                last = self.get_json(f"/api/responses/{urllib.parse.quote(command_id)}")
-                rows = [r for r in last.get("responses") or [] if isinstance(r, dict)]
+            got = self.get_responses(command_id)
+            if got.get("error"):
+                lost = str(got["error"])
+            else:
+                last = got
+                rows = [r for r in got.get("responses") or [] if isinstance(r, dict)]
                 if rows and not any(r.get("status") == STATUS_RUNNING for r in rows):
                     return last
-            except (OSError, ValueError, http.client.HTTPException) as e:
-                lost = e  # a reset, a timeout, a short read or a non-JSON 200 is one lost poll, not the answer
             time.sleep(0.5)
-        if lost is not None:  # say why a poll ended without an answer (an expired session reads 401/403)
-            say(f"poll for {command_id}: last transport error: {lost!r}", file=sys.stderr)
+        if lost:
+            say(f"poll for {command_id}: last error: {lost}", file=sys.stderr)
         return last
+
+
+def take_run_lock() -> int | None:
+    """An exclusive, non-blocking lock on LOCK_PATH, held (by the returned descriptor) until the run ends, so a
+    second containment run cannot release the first one's containment. None when another run holds it."""
+    try:
+        fd = os.open(LOCK_PATH, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    except OSError as e:
+        say(f"cannot open the run lock {LOCK_PATH}: {e}", file=sys.stderr)
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
 
 
 def refusal(args: argparse.Namespace, env=os.environ) -> str | None:
@@ -401,6 +424,18 @@ def main(argv=None) -> int:
         say("refused: the dashboard must be loopback (http://127.0.0.1:<port>) so the release can reach it "
               "while this host is contained", file=sys.stderr)
         return EXIT_PRECONDITION
+    lock = take_run_lock() if args.apply_containment else None
+    if args.apply_containment and lock is None:
+        say(f"refused: another containment run holds {LOCK_PATH}; nothing was dispatched", file=sys.stderr)
+        return EXIT_PRECONDITION
+    try:
+        return run(args)
+    finally:
+        if lock is not None:
+            os.close(lock)
+
+
+def run(args: argparse.Namespace) -> int:
     rc, last = install_check()
     if rc != 0:
         say(f"precondition failed: install-agent-user.sh --check exited {rc}: {last}", file=sys.stderr)
