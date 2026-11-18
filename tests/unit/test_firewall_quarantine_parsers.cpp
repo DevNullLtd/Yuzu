@@ -156,7 +156,9 @@ struct NftWorld {
     std::optional<std::string> list_failure; // set: `nft list table` fails with this text
     bool load_times_out = false; // `nft -f` COMMITS the table, then overruns its budget
     Crash crash;
-    std::vector<Argv> log;
+    std::vector<Argv> log;  // the `nft ...` command each call stands for
+    std::vector<Argv> sent; // what the runner was actually handed (the helper's argv, or nft's)
+    std::string stem, suffix; // what the leg asked the Stage for
     std::function<void(const Argv&)> on_call; // runs before each call's effect (a test hook)
 
     ToolResult effect(const Argv& a) {
@@ -201,23 +203,36 @@ struct NftWorld {
         return done(1);
     }
 
+    /// A ruleset load reaches the runner as the root-owned helper's argv
+    /// (`<helper> nft load <file>`, a non-root agent) or as `nft -f <file>` (a root agent). The
+    /// runner takes both, checks the helper form is exactly nft_helper_load_argv, and hands the
+    /// world the `nft -f <file>` it stands for, so `log` and every assertion on the order of the
+    /// calls read the same in either mode. `sent` keeps what the leg really sent.
     Runner runner() {
         return [this](const Argv& a, std::chrono::milliseconds) {
             ++crash.calls;
-            log.push_back(a);
+            sent.push_back(a);
+            Argv plan = a;
+            if (a[0] == kFwHelperPath) {
+                REQUIRE(a == nft_helper_load_argv(a.back()));
+                plan = nft_apply_argv(a.back());
+            }
+            log.push_back(plan);
             if (clock)
                 clock->advance(per_call);
             if (crash.calls == crash.crash_at && !crash.after_effect)
                 throw CrashSim{};
-            auto r = effect(a);
+            auto r = effect(plan);
             if (crash.calls == crash.crash_at && crash.after_effect)
                 throw CrashSim{};
             return r;
         };
     }
     Stage stage() {
-        return [this](std::string_view, std::string_view suffix,
+        return [this](std::string_view st, std::string_view suffix,
                       std::string_view contents) -> std::optional<StagedFile> {
+            stem = std::string{st};
+            this->suffix = std::string{suffix};
             const auto path = std::format("/tmp/yuzu-fwq-{}{}", ++next_file, suffix);
             files[path] = std::string{contents};
             return StagedFile{path, nullptr, "/tmp"};
@@ -238,7 +253,9 @@ struct IptWorld {
     std::map<std::string, IptFamily> fam; // by tool path
     std::function<bool(const std::string&)> fail_on;
     Crash crash;
-    std::vector<Argv> log;
+    std::vector<Argv> log;  // the plan argv each call stands for
+    std::vector<Argv> sent; // what the runner was actually handed
+    bool direct = false;    // a root agent: the runner is handed the tool's own argv
     int pre_existing_calls = 0;
 
     ToolResult effect(const Argv& a) {
@@ -306,15 +323,34 @@ struct IptWorld {
         return done(1);
     }
 
+    /// A non-root agent's iptables leg runs the tools ONLY through the root-owned helper (#7634), as
+    /// `<helper> iptables|ip6tables <the plan's tokens>`; a root agent's (`direct`) runs the tool's
+    /// own argv, which must still be inside the helper's grammar. The runner checks the form for
+    /// every call, then hands the world the plan argv, so `log` and the assertions on the order of
+    /// the calls read as the plan.
     Runner runner() {
         return [this](const Argv& a, std::chrono::milliseconds) {
             ++crash.calls;
-            log.push_back(a);
+            sent.push_back(a);
+            Argv plan;
+            if (direct) {
+                REQUIRE(a.size() >= 2);
+                plan = a;
+                REQUIRE(iptables_helper_argv(plan).has_value());
+            } else {
+                REQUIRE(a.size() >= 3);
+                REQUIRE(a[0] == kFwHelperPath);
+                REQUIRE((a[1] == "iptables" || a[1] == "ip6tables"));
+                plan = Argv{std::string{a[1] == "iptables" ? kIptablesPath : kIp6tablesPath}};
+                plan.insert(plan.end(), a.begin() + 2, a.end());
+                REQUIRE(iptables_helper_argv(plan) == a);
+            }
+            log.push_back(plan);
             if (clock)
                 clock->advance(per_call);
             if (crash.calls == crash.crash_at && !crash.after_effect)
                 throw CrashSim{};
-            auto r = effect(a);
+            auto r = effect(plan);
             if (crash.calls == crash.crash_at && crash.after_effect)
                 throw CrashSim{};
             return r;
@@ -890,7 +926,7 @@ TEST_CASE("status of an unreadable record is degraded|state_unreadable, never dr
     FakeStore store;
     store.raw = "not a record";
     Probe probe;
-    NftLeg leg(w.runner(), w.stage());
+    NftLeg leg(w.runner(), w.stage(), ToolAccess::helper);
     Env env{leg, store, probe.fn(), [] { return 1'000; }};
     Deadline dl;
     const auto o = report_status(env, dl);
@@ -1413,6 +1449,448 @@ TEST_CASE("iptables listing and removal plan", "[agent][firewall_quarantine]") {
     CHECK(iptables_remove_plan(kIptablesPath, l, 0).size() == 4 + 8);
 }
 
+// ── The root-owned helper's argument grammar (#7634) ───────────────────────
+
+namespace {
+
+/// The argv the helper runs for a plan argv: `<helper> iptables|ip6tables <tokens after the tool>`.
+Argv via_helper(std::string_view family, const Argv& plan) {
+    Argv out{std::string{kFwHelperPath}, std::string{family}};
+    out.insert(out.end(), plan.begin() + 1, plan.end());
+    return out;
+}
+
+} // namespace
+
+TEST_CASE("every iptables argv the plugin can build maps to the root-owned helper's argv",
+          "[agent][firewall_quarantine][sudoers]") {
+    // The plans the leg runs, for both tools and both families: TCP reply rules, neighbour
+    // discovery, loopback, DHCP, a rule set with host, prefix and port-less exceptions.
+    const auto set = make_set({"203.0.113.53", "2001:4860:4860::8888"},
+                              {ex("10.0.0.5:22/tcp/in"), ex("[2001:db8::]/32:443/out"),
+                               ex("10.0.0.6:443/tcp/out"), ex("10.0.0.7"), ex("10.1.0.0/16:53/udp/out")});
+    std::vector<Argv> argvs;
+    for (const auto& [tool, v6] : {std::pair{kIptablesPath, false}, std::pair{kIp6tablesPath, true}}) {
+        for (const auto& a : iptables_build_plan(set, tool, 7, v6))
+            argvs.push_back(a);
+        for (const auto& a : iptables_activate_plan(tool, 7))
+            argvs.push_back(a);
+        argvs.push_back(Argv{std::string{tool}, "-S"});
+    }
+    // Removal over a listing that includes a jump from a chain that is not a built-in (the plan
+    // takes the chain from the listing), generation 2 kept out, and the leg's own rollback argv.
+    const auto listing = parse_iptables_listing(
+        "-P INPUT ACCEPT\n-N yuzu-fwq-2\n-N yuzu-fwq-2-f\n-N yuzu-fwq-3\n-N yuzu-fwq-3-f\n-N DOCKER\n"
+        "-A INPUT -j yuzu-fwq-3\n-A INPUT -j yuzu-fwq-2\n-A OUTPUT -j yuzu-fwq-3\n"
+        "-A FORWARD -j yuzu-fwq-3-f\n-A DOCKER -j yuzu-fwq-2-f\n-A yuzu-fwq-3 -j DROP\n");
+    for (const auto tool : {kIptablesPath, kIp6tablesPath}) {
+        for (const auto& a : iptables_remove_plan(tool, listing, 3))
+            argvs.push_back(a);
+        for (const auto& a : iptables_remove_plan(tool, listing, 0))
+            argvs.push_back(a);
+        for (const char* b : {"INPUT", "OUTPUT"})
+            argvs.push_back(Argv{std::string{tool}, "-D", b, "-j", "yuzu-fwq-9"});
+        argvs.push_back(Argv{std::string{tool}, "-D", "FORWARD", "-j", "yuzu-fwq-9-f"});
+    }
+    REQUIRE(argvs.size() > 60);
+    for (const auto& a : argvs) {
+        CAPTURE(join(a));
+        const auto h = iptables_helper_argv(a);
+        REQUIRE(h.has_value());
+        CHECK(*h == via_helper(a[0] == kIptablesPath ? "iptables" : "ip6tables", a));
+        CHECK(all_tokens_safe(*h));
+    }
+    // ...and the exact helper argv of one of each shape
+    const std::string h = std::string{kFwHelperPath};
+    CHECK(*iptables_helper_argv({"/usr/sbin/iptables", "-S"}) == Argv{h, "iptables", "-S"});
+    CHECK(*iptables_helper_argv({"/usr/sbin/ip6tables", "-N", "yuzu-fwq-12"}) ==
+          Argv{h, "ip6tables", "-N", "yuzu-fwq-12"});
+    CHECK(*iptables_helper_argv({"/usr/sbin/iptables", "-A", "yuzu-fwq-4", "-d", "10.0.0.5", "-p", "tcp",
+                                 "--sport", "22", "--tcp-flags", "ACK", "ACK", "-j", "ACCEPT"}) ==
+          Argv{h, "iptables", "-A", "yuzu-fwq-4", "-d", "10.0.0.5", "-p", "tcp", "--sport", "22",
+               "--tcp-flags", "ACK", "ACK", "-j", "ACCEPT"});
+    CHECK(*iptables_helper_argv({"/usr/sbin/iptables", "-I", "FORWARD", "1", "-j", "yuzu-fwq-4-f"}) ==
+          Argv{h, "iptables", "-I", "FORWARD", "1", "-j", "yuzu-fwq-4-f"});
+}
+
+TEST_CASE("iptables_helper_argv: the grammar's edges that are inside",
+          "[agent][firewall_quarantine][sudoers]") {
+    const std::string t4{kIptablesPath};
+    const std::string t6{kIp6tablesPath};
+    const auto in = [](Argv a) { return iptables_helper_argv(a).has_value(); };
+    CHECK(in({t4, "-N", "yuzu-fwq-2147483647"}));        // the largest generation
+    CHECK(in({t4, "-N", "yuzu-fwq-0000000001-f"}));      // leading zeros: ipt_chain_gen takes them too
+    CHECK(in({t4, "-D", "DOCKER-USER", "-j", "yuzu-fwq-3"}));
+    CHECK(in({t4, "-D", std::string(28, 'a'), "-j", "yuzu-fwq-3"}));
+    CHECK(in({t4, "-A", "yuzu-fwq-1", "-p", "tcp", "--dport", "65535", "-j", "ACCEPT"}));
+    CHECK(in({t4, "-A", "yuzu-fwq-1", "-s", "10.0.0.0/32", "-p", "udp", "-j", "ACCEPT"}));
+    CHECK(in({t4, "-A", "yuzu-fwq-1", "-s", "255.255.255.255/32", "-p", "udp", "-j", "ACCEPT"}));
+    CHECK(in({t4, "-A", "yuzu-fwq-1", "-d", "0.0.0.0/0", "-p", "tcp", "-j", "ACCEPT"}));
+    CHECK(in({t4, "-A", "yuzu-fwq-1", "-d", "10.0.200.9", "-p", "tcp", "-j", "ACCEPT"}));
+    CHECK(in({t6, "-A", "yuzu-fwq-1", "-d", "2001:db8::/128", "-p", "tcp", "--sport", "1", "--dport", "2",
+              "--tcp-flags", "RST", "RST", "-j", "ACCEPT"}));
+    CHECK(in({t6, "-A", "yuzu-fwq-1", "-s", "::", "-p", "udp", "-j", "ACCEPT"}));
+    CHECK(in({t6, "-A", "yuzu-fwq-1", "-p", "icmpv6", "--icmpv6-type", "133", "-j", "ACCEPT"}));
+    CHECK(in({t6, "-A", "yuzu-fwq-1", "-p", "icmpv6", "--icmpv6-type", "136", "-j", "ACCEPT"}));
+    CHECK(in({t4, "-A", "yuzu-fwq-1", "-o", "lo", "-j", "ACCEPT"}));
+}
+
+TEST_CASE("iptables_helper_argv: anything outside the granted shapes is refused",
+          "[agent][firewall_quarantine][sudoers]") {
+    const std::string t4{kIptablesPath};
+    const std::string t6{kIp6tablesPath};
+    const auto in = [](Argv a) { return iptables_helper_argv(a).has_value(); };
+    const Argv a_drop{t4, "-A", "yuzu-fwq-1", "-j", "DROP"};
+    REQUIRE(in(a_drop)); // the base the tails below extend
+
+    // A tail after a complete rule, split into tokens and glued onto one: an option of the tool
+    // that loads a program, selects another table, or adds a match the plugin never builds.
+    for (const char* tail : {"-t", "raw", "--modprobe=/x", "--modprobe", "-m", "comment", "--comment",
+                             "-g", "-c", "-w", "--wait", "-4", "-6", "--table=raw", "-v"}) {
+        CAPTURE(tail);
+        auto a = a_drop;
+        a.emplace_back(tail);
+        CHECK_FALSE(in(a));
+    }
+    CHECK_FALSE(in({t4, "-A", "yuzu-fwq-1", "-j", "DROP", "-t", "raw"}));
+    CHECK_FALSE(in({t4, "-A", "yuzu-fwq-1", "-j", "DROP", "--modprobe=/x"}));
+    CHECK_FALSE(in({t4, "-A", "yuzu-fwq-1", "-j", "DROP", "-m", "comment", "--comment", "x"}));
+    // ...and the same in front of the shape, or between its tokens
+    CHECK_FALSE(in({t4, "-t", "raw", "-A", "yuzu-fwq-1", "-j", "DROP"}));
+    CHECK_FALSE(in({t4, "--modprobe=/x", "-A", "yuzu-fwq-1", "-j", "DROP"}));
+    CHECK_FALSE(in({t4, "-A", "yuzu-fwq-1", "--modprobe", "/x", "-j", "DROP"}));
+    CHECK_FALSE(in({t4, "-A", "yuzu-fwq-1", "-m", "comment", "--comment", "x", "-j", "ACCEPT"}));
+    CHECK_FALSE(in({t4, "-A", "yuzu-fwq-1", "-p", "tcp", "--dport", "22", "--modprobe=/x", "-j", "ACCEPT"}));
+    CHECK_FALSE(in({t4, "-A", "yuzu-fwq-1", "-p", "tcp", "--dport", "22", "-j", "ACCEPT", "-t", "raw"}));
+    CHECK_FALSE(in({t4, "-A", "yuzu-fwq-1", "-p", "tcp", "-j", "ACCEPT", "--dport", "22"}));
+    CHECK_FALSE(in({t4, "-A", "yuzu-fwq-1", "-p", "tcp", "--dport", "22", "--sport", "22", "-j", "ACCEPT"}));
+    // a rule that is not one of the plan's: a target other than DROP / ACCEPT, an accept-all, no match
+    CHECK_FALSE(in({t4, "-A", "yuzu-fwq-1", "-j", "ACCEPT"}));
+    CHECK_FALSE(in({t4, "-A", "yuzu-fwq-1", "-j", "REJECT"}));
+    CHECK_FALSE(in({t4, "-A", "yuzu-fwq-1", "-j", "DROP", "-j", "DROP"}));
+    CHECK_FALSE(in({t4, "-A", "yuzu-fwq-1", "-j"}));
+    CHECK_FALSE(in({t4, "-A", "yuzu-fwq-1"}));
+    CHECK_FALSE(in({t4, "-A", "yuzu-fwq-1", "-i", "eth0", "-j", "ACCEPT"}));
+    CHECK_FALSE(in({t4, "-A", "yuzu-fwq-1", "-i", "lo", "-o", "lo", "-j", "ACCEPT"}));
+    CHECK_FALSE(in({t4, "-A", "yuzu-fwq-1", "-p", "icmp", "-j", "ACCEPT"}));
+    CHECK_FALSE(in({t4, "-A", "yuzu-fwq-1", "-p", "all", "-j", "ACCEPT"}));
+    CHECK_FALSE(in({t4, "-A", "yuzu-fwq-1", "-p", "6", "-j", "ACCEPT"}));
+    // a chain that is not ours, on every shape that names one
+    CHECK_FALSE(in({t4, "-A", "INPUT", "-j", "DROP"}));
+    CHECK_FALSE(in({t4, "-A", "yuzu-fwq-1x", "-j", "DROP"}));
+    CHECK_FALSE(in({t4, "-A", "yuzu-fwq-", "-j", "DROP"}));
+    CHECK_FALSE(in({t4, "-A", "xyuzu-fwq-1", "-j", "DROP"}));
+    CHECK_FALSE(in({t4, "-N", "DOCKER"}));
+    CHECK_FALSE(in({t4, "-N", "yuzu-fwq-"}));
+    CHECK_FALSE(in({t4, "-N", "yuzu-fwq--f"}));
+    CHECK_FALSE(in({t4, "-N", "yuzu-fwq-1-f-f"}));
+    CHECK_FALSE(in({t4, "-N", "yuzu-fwq-1x"}));
+    CHECK_FALSE(in({t4, "-N", "yuzu-fwq-2147483648"}));   // past the largest generation
+    CHECK_FALSE(in({t4, "-N", "yuzu-fwq-12345678901"}));  // eleven digits
+    CHECK_FALSE(in({t4, "-N", "yuzu-fwq- 1"}));
+    CHECK_FALSE(in({t4, "-N", "yuzu-fwq-+1"}));
+    CHECK_FALSE(in({t4, "-N", "yuzu-fwq-1", "extra"}));
+    CHECK_FALSE(in({t4, "-F"}));
+    CHECK_FALSE(in({t4, "-F", "INPUT"}));
+    CHECK_FALSE(in({t4, "-X", "DOCKER"}));
+    CHECK_FALSE(in({t4, "-X"}));
+    // ports: zero, past the top, signed, leading zero, empty, glued with a space
+    for (const char* port : {"0", "65536", "-1", "+22", "022", "", "22 ", " 22", "2e1", "0x16", "99999", "123456"}) {
+        CAPTURE(port);
+        CHECK_FALSE(in({t4, "-A", "yuzu-fwq-1", "-p", "tcp", "--dport", port, "-j", "ACCEPT"}));
+        CHECK_FALSE(in({t4, "-A", "yuzu-fwq-1", "-p", "udp", "--sport", port, "-j", "ACCEPT"}));
+    }
+    // addresses: a name, an option, a prefix out of range, a malformed literal
+    for (const char* addr : {"evil.example.com", "localhost", "-1.2.3.4", "--modprobe=/x", "10.0.0", "10.0.0.0.0",
+                             "10..0.1", ".10.0.1", "10.0.0.", "10.0.0.1/33", "10.0.0.1/", "/24", "10.0.0.1/-1",
+                             "10.0.0.1/24/1", "10.0.0.1/0024", "10.0.0.1/08", "10.0.0.1/024", "10.0.0.1/000",
+                             "10.0.0.1/032", "2001:db8::/032", "2001:db8::1/129", "2001:db8:::1", "2001:DB8::1",
+                             "fe80:1", "g::1", "10.0.0.1 ", "0x0a.0.0.1", "10.0.0.1,10.0.0.2",
+                             "::ffff:1.2.3.4", "!10.0.0.1", "10.0.0.1/ 8", "",
+                             // out-of-range or zero-padded quads: a name to the tool, not an address
+                             "999.1.1.1", "256.0.0.1", "1.2.3.256", "01.2.3.4"}) {
+        CAPTURE(addr);
+        CHECK_FALSE(in({t4, "-A", "yuzu-fwq-1", "-s", addr, "-p", "tcp", "-j", "ACCEPT"}));
+        CHECK_FALSE(in({t6, "-A", "yuzu-fwq-1", "-d", addr, "-p", "udp", "--dport", "53", "-j", "ACCEPT"}));
+    }
+    CHECK_FALSE(in({t4, "-A", "yuzu-fwq-1", "-s", std::string(44, '1'), "-p", "tcp", "-j", "ACCEPT"}));
+    CHECK_FALSE(in({t4, "-A", "yuzu-fwq-1", "-s", "10.0.0.1", "-d", "10.0.0.2", "-p", "tcp", "-j", "ACCEPT"}));
+    // neighbour discovery: 133..136 only, no address, nothing after
+    for (const char* type : {"132", "137", "0", "13", "1333", "13x", "", "-133", "+133"}) {
+        CAPTURE(type);
+        CHECK_FALSE(in({t6, "-A", "yuzu-fwq-1", "-p", "icmpv6", "--icmpv6-type", type, "-j", "ACCEPT"}));
+    }
+    CHECK_FALSE(in({t6, "-A", "yuzu-fwq-1", "-s", "fe80::1", "-p", "icmpv6", "--icmpv6-type", "135", "-j", "ACCEPT"}));
+    CHECK_FALSE(in({t6, "-A", "yuzu-fwq-1", "-p", "icmpv6", "--icmpv6-type", "135", "--dport", "1", "-j", "ACCEPT"}));
+    CHECK_FALSE(in({t6, "-A", "yuzu-fwq-1", "-p", "icmpv6", "-j", "ACCEPT"}));
+    // tcp flags: the two the plan builds, tcp only
+    CHECK_FALSE(in({t4, "-A", "yuzu-fwq-1", "-p", "tcp", "--tcp-flags", "SYN", "SYN", "-j", "ACCEPT"}));
+    CHECK_FALSE(in({t4, "-A", "yuzu-fwq-1", "-p", "tcp", "--tcp-flags", "ACK", "RST", "-j", "ACCEPT"}));
+    CHECK_FALSE(in({t4, "-A", "yuzu-fwq-1", "-p", "tcp", "--tcp-flags", "ACK,RST", "ACK", "-j", "ACCEPT"}));
+    CHECK_FALSE(in({t4, "-A", "yuzu-fwq-1", "-p", "tcp", "--tcp-flags", "ACK", "-j", "ACCEPT"}));
+    CHECK_FALSE(in({t4, "-A", "yuzu-fwq-1", "-p", "udp", "--tcp-flags", "ACK", "ACK", "-j", "ACCEPT"}));
+    // the jump insert: only the three built-in chains, only position 1, only a jump to ours
+    CHECK_FALSE(in({t4, "-I", "INPUT", "2", "-j", "yuzu-fwq-1"}));
+    CHECK_FALSE(in({t4, "-I", "INPUT", "0", "-j", "yuzu-fwq-1"}));
+    CHECK_FALSE(in({t4, "-I", "INPUT", "1", "-j", "ACCEPT"}));
+    CHECK_FALSE(in({t4, "-I", "INPUT", "1", "-j", "DOCKER"}));
+    CHECK_FALSE(in({t4, "-I", "yuzu-fwq-1", "1", "-j", "yuzu-fwq-1"}));
+    CHECK_FALSE(in({t4, "-I", "PREROUTING", "1", "-j", "yuzu-fwq-1"}));
+    CHECK_FALSE(in({t4, "-I", "input", "1", "-j", "yuzu-fwq-1"}));
+    CHECK_FALSE(in({t4, "-I", "INPUT", "1", "-j", "yuzu-fwq-1", "-m", "comment"}));
+    CHECK_FALSE(in({t4, "-I", "INPUT", "-j", "yuzu-fwq-1"}));
+    // the jump delete: a plain chain name, never an option; only a jump to ours
+    CHECK_FALSE(in({t4, "-D", "--modprobe=/x", "-j", "yuzu-fwq-1"}));
+    CHECK_FALSE(in({t4, "-D", "-t", "-j", "yuzu-fwq-1"}));
+    CHECK_FALSE(in({t4, "-D", std::string(29, 'a'), "-j", "yuzu-fwq-1"}));
+    CHECK_FALSE(in({t4, "-D", "IN PUT", "-j", "yuzu-fwq-1"}));
+    CHECK_FALSE(in({t4, "-D", "INPUT;", "-j", "yuzu-fwq-1"}));
+    CHECK_FALSE(in({t4, "-D", "", "-j", "yuzu-fwq-1"}));
+    CHECK_FALSE(in({t4, "-D", "INPUT", "-j", "ACCEPT"}));
+    CHECK_FALSE(in({t4, "-D", "INPUT", "1"}));
+    CHECK_FALSE(in({t4, "-D", "INPUT", "-j", "yuzu-fwq-1", "extra"}));
+    // other operations, extra tokens on a one-token shape
+    for (const char* op : {"-P", "-L", "-R", "-C", "-E", "-Z", "-V", "-h", "--help", "--list", "-S1", "-s"})
+        CHECK_FALSE(in({t4, op}));
+    CHECK_FALSE(in({t4, "-P", "INPUT", "ACCEPT"}));
+    CHECK_FALSE(in({t4, "-S", "INPUT"}));
+    CHECK_FALSE(in({t4, "-S", "-t", "raw"}));
+    // another tool, an empty argv, and a bare tool
+    for (const char* tool : {"/sbin/iptables", "/usr/sbin/iptables-save", "/usr/sbin/iptables-restore",
+                             "/usr/sbin/ip6tables-save", "iptables", "/usr/sbin/nft", "/usr/sbin/iptables ",
+                             "/usr/sbin/iptables-nft", "/usr/local/sbin/yuzu-fw-helper"})
+        CHECK_FALSE(in({tool, "-S"}));
+    CHECK_FALSE(in({}));
+    CHECK_FALSE(in({t4}));
+}
+
+TEST_CASE("the iptables leg refuses a plan argv outside the helper's grammar, with nothing spawned",
+          "[agent][firewall_quarantine][sudoers]") {
+    int ran = 0;
+    const Runner run = [&](const Argv&, std::chrono::milliseconds) {
+        ++ran;
+        return done(0);
+    };
+    Deadline dl;
+    detail::Exec ex(run, dl);
+    // the same refusal in both modes: a root agent's tool call is held to the grammar too
+    for (const auto access : {ToolAccess::helper, ToolAccess::direct}) {
+        CHECK_FALSE(ex.call_iptables(
+            {"/usr/sbin/iptables", "-A", "yuzu-fwq-1", "-j", "DROP", "-t", "raw"}, access));
+        CHECK(ex.reason() == "unsafe_argv");
+        CHECK_FALSE(ex.call_iptables({"/usr/sbin/iptables", "-F", "INPUT"}, access));
+        CHECK_FALSE(ex.call_iptables({"/usr/sbin/nft", "list", "table", "inet", "yuzu_quarantine"}, access));
+    }
+    CHECK(ran == 0);
+    // an argv inside the grammar runs, as the helper's argv and nothing else
+    Argv seen;
+    const Runner record = [&](const Argv& a, std::chrono::milliseconds) {
+        seen = a;
+        return done(0);
+    };
+    detail::Exec ok(record, dl);
+    REQUIRE(ok.call_iptables({"/usr/sbin/ip6tables", "-X", "yuzu-fwq-3-f"}, ToolAccess::helper));
+    CHECK(seen == Argv{std::string{kFwHelperPath}, "ip6tables", "-X", "yuzu-fwq-3-f"});
+    // a root agent runs the tool's own argv, unchanged
+    REQUIRE(ok.call_iptables({"/usr/sbin/ip6tables", "-X", "yuzu-fwq-3-f"}, ToolAccess::direct));
+    CHECK(seen == Argv{"/usr/sbin/ip6tables", "-X", "yuzu-fwq-3-f"});
+}
+
+// ── The helper's nft load (the C++ twin of scripts/install-agent-user.sh's `nft load`) ─────────────
+
+namespace {
+
+// The ruleset nft_ruleset_text emits for a set that uses every rule form. tests/
+// test_legacy_quarantine_plugin_removed_lexical.py reads this literal out of this file and runs it
+// through the helper's `nft load` with a stub for nft: the helper must hand the stub exactly this
+// text, byte for byte, so the two grammars cannot drift apart.
+constexpr std::string_view kGoldenNftRuleset = R"NFTGOLDEN(table inet yuzu_quarantine {}
+flush table inet yuzu_quarantine
+table inet yuzu_quarantine {
+  chain input {
+    type filter hook input priority -100; policy drop;
+    iif lo accept
+    ip saddr 198.51.100.7 tcp sport 50051 tcp flags & (syn|ack) != syn accept
+    udp sport 67 udp dport 68 accept
+    ip saddr 203.0.113.53 udp sport 53 accept
+    ip saddr 203.0.113.53 tcp sport 53 tcp flags & (syn|ack) != syn accept
+    ip6 saddr 2001:4860:4860::8888 udp sport 53 accept
+    ip6 saddr 2001:4860:4860::8888 tcp sport 53 tcp flags & (syn|ack) != syn accept
+    icmpv6 type { nd-router-solicit, nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert } accept
+    ip saddr 10.0.0.5 tcp dport 22 accept
+    ip saddr 10.0.0.6 tcp sport 443 tcp flags & (syn|ack) != syn accept
+    ip saddr 10.0.0.7 meta l4proto udp accept
+    ip saddr 10.0.0.8 meta l4proto tcp accept
+    ip saddr 10.1.0.0/16 udp sport 53 accept
+    ip6 saddr 2001:db8::/32 tcp dport 443 accept
+    ip6 saddr 2001:db8::7 udp sport 8443 accept
+    ip6 saddr 2001:db8::9 meta l4proto tcp tcp flags & (syn|ack) != syn accept
+  }
+  chain output {
+    type filter hook output priority -100; policy drop;
+    oif lo accept
+    ip daddr 198.51.100.7 tcp dport 50051 accept
+    udp sport 68 udp dport 67 accept
+    ip daddr 203.0.113.53 udp dport 53 accept
+    ip daddr 203.0.113.53 tcp dport 53 accept
+    ip6 daddr 2001:4860:4860::8888 udp dport 53 accept
+    ip6 daddr 2001:4860:4860::8888 tcp dport 53 accept
+    icmpv6 type { nd-router-solicit, nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert } accept
+    ip daddr 10.0.0.5 tcp sport 22 tcp flags & (syn|ack) != syn accept
+    ip daddr 10.0.0.6 tcp dport 443 accept
+    ip daddr 10.0.0.7 meta l4proto udp accept
+    ip daddr 10.0.0.8 meta l4proto tcp tcp flags & (syn|ack) != syn accept
+    ip daddr 10.1.0.0/16 udp dport 53 accept
+    ip6 daddr 2001:db8::/32 tcp sport 443 tcp flags & (syn|ack) != syn accept
+    ip6 daddr 2001:db8::7 udp dport 8443 accept
+    ip6 daddr 2001:db8::9 meta l4proto tcp accept
+  }
+  chain forward {
+    type filter hook forward priority -100; policy drop;
+  }
+}
+)NFTGOLDEN";
+
+AllowSet golden_set() {
+    return make_set({"203.0.113.53", "2001:4860:4860::8888"},
+                    {ex("10.0.0.5:22/tcp/in"), ex("10.0.0.6:443/tcp/out"), ex("10.0.0.7/udp"),
+                     ex("10.0.0.8/tcp/in"), ex("10.1.0.0/16:53/udp/out"), ex("[2001:db8::]/32:443/tcp/in"),
+                     ex("[2001:db8::7]:8443/udp/out"), ex("[2001:db8::9]/tcp")});
+}
+
+} // namespace
+
+TEST_CASE("nft_ruleset_text: the golden text covers every rule form the helper must accept",
+          "[agent][firewall_quarantine][sudoers]") {
+    const auto text = nft_ruleset_text(golden_set());
+    CHECK(text == kGoldenNftRuleset);
+    // the forms, so a change to the set cannot quietly drop one from the golden
+    for (const char* form : {"iif lo accept", "oif lo accept", "icmpv6 type { nd-router-solicit, ",
+                             "ip saddr 10.0.0.5 tcp dport 22 accept", "ip daddr 10.0.0.5 tcp sport 22 tcp flags",
+                             "udp sport 67 udp dport 68 accept", "udp sport 68 udp dport 67 accept",
+                             "ip saddr 10.0.0.7 meta l4proto udp accept",
+                             "ip saddr 10.0.0.8 meta l4proto tcp accept",
+                             "ip daddr 10.0.0.8 meta l4proto tcp tcp flags & (syn|ack) != syn accept",
+                             "ip saddr 10.1.0.0/16 udp sport 53 accept", "ip6 saddr 2001:db8::/32 tcp dport 443 accept",
+                             "ip6 daddr 2001:db8::9 meta l4proto tcp accept"})
+        CHECK(text.find(form) != text.npos);
+}
+
+TEST_CASE("the helper's nft load: the argv, and the largest allow set inside its line caps",
+          "[agent][firewall_quarantine][sudoers]") {
+    const std::string path = "/var/lib/yuzu-agent/firewall-staging/yuzu-fwq-AbC123.nft";
+    const auto argv = nft_helper_load_argv(path);
+    CHECK(argv == Argv{"/usr/local/sbin/yuzu-fw-helper", "nft", "load", path});
+    CHECK(argv.front() == kFwHelperPath);
+    // a staged path is the one token outside the strict charset, and it must be the last
+    {
+        int ran = 0;
+        const Runner run = [&](const Argv&, std::chrono::milliseconds) {
+            ++ran;
+            return done(0);
+        };
+        Deadline dl;
+        detail::Exec ex(run, dl);
+        const StagedFile staged{path, nullptr, "/var/lib/yuzu-agent/firewall-staging"};
+        CHECK(ex.call_staged(argv, staged));
+        CHECK(ran == 1);
+        const StagedFile elsewhere{path, nullptr, "/tmp"};
+        CHECK_FALSE(ex.call_staged(argv, elsewhere));
+        CHECK(ran == 1);
+    }
+
+    // The helper reads at most 512 lines of at most 512 characters, 262145 bytes in all. The
+    // largest set build_allow_set admits (32 control endpoints, 8 resolvers, 64 two-protocol
+    // exceptions, all IPv6) stays well inside.
+    std::string csv;
+    for (int i = 1; i <= 32; ++i)
+        csv += std::format("{}2001:db8:{:x}:1:2:3:4:5", i > 1 ? "," : "", i);
+    std::vector<std::string> resolvers;
+    for (int i = 1; i <= 8; ++i)
+        resolvers.push_back(std::format("2001:4860:{:x}:1:2:3:4:5", i));
+    std::vector<Endpoint> many;
+    for (int i = 0; i < 64; ++i)
+        many.push_back(ex(std::format("[2001:db8:ffff:{:x}:2:3:4:5]/128:{}/{}", i + 1, 40000 + i,
+                                      i % 2 ? "in" : "out")));
+    const auto big = build_allow_set(csv, "server.example.com:50051", resolvers, many);
+    REQUIRE(big);
+    CHECK(big->control.size() == kMaxControlIps);
+    CHECK(big->resolvers.size() == kMaxResolvers);
+    CHECK(big->exceptions.size() == kMaxExceptions);
+    const auto text = nft_ruleset_text(*big);
+    CHECK(text.size() <= 512u * 512u);
+    const auto parts = detail::split(text, '\n'); // the last part is the empty tail after the final newline
+    REQUIRE(parts.size() >= 2);
+    CHECK(parts.back().empty());
+    CHECK(parts.size() - 1 <= 512);
+    for (const auto line : parts)
+        CHECK(line.size() <= 512);
+    CHECK(text.ends_with("}\n"));
+}
+
+TEST_CASE("the nft leg: a non-root agent loads through the helper, a root agent runs nft itself",
+          "[agent][firewall_quarantine][sudoers]") {
+    for (const auto access : {ToolAccess::helper, ToolAccess::direct}) {
+        NftWorld w;
+        NftLeg leg(w.runner(), w.stage(), access);
+        Deadline dl;
+        OsPayload os;
+        const auto r = leg.apply(make_set(), 1, 0, os, dl, PersistOs{});
+        REQUIRE(r.ok);
+        REQUIRE(w.sent.size() == 1);
+        // the staged file is the pattern the helper accepts: stem and suffix
+        CHECK(w.stem == "yuzu-fwq-");
+        CHECK(w.suffix == ".nft");
+        CHECK(w.table);
+        CHECK(w.text == nft_ruleset_text(make_set()));
+        if (access == ToolAccess::helper)
+            CHECK(w.sent[0] == Argv{"/usr/local/sbin/yuzu-fw-helper", "nft", "load", "/tmp/yuzu-fwq-1.nft"});
+        else
+            CHECK(w.sent[0] == Argv{"/usr/sbin/nft", "-f", "/tmp/yuzu-fwq-1.nft"});
+        // release and status read are the same fixed nft commands in both modes
+        const auto rm = leg.remove(os, dl);
+        CHECK(rm.ok);
+        REQUIRE(w.sent.size() == 2);
+        CHECK(w.sent[1] == nft_delete_argv());
+        (void)leg.read_status(os, dl);
+        CHECK(w.sent.back() == nft_list_argv());
+    }
+}
+
+TEST_CASE("the iptables leg: a non-root agent goes through the helper, a root agent runs the tools itself",
+          "[agent][firewall_quarantine][sudoers]") {
+    for (const auto access : {ToolAccess::helper, ToolAccess::direct}) {
+        IptWorld w;
+        w.direct = access == ToolAccess::direct;
+        IptablesLeg leg(w.runner(), V6Mode::cover, access);
+        Deadline dl;
+        OsPayload os;
+        const auto r = leg.apply(make_set(), 1, 0, os, dl, PersistOs{});
+        REQUIRE(r.ok);
+        REQUIRE(w.sent.size() > 10);
+        REQUIRE(w.sent.size() == w.log.size());
+        for (std::size_t i = 0; i < w.sent.size(); ++i) {
+            CAPTURE(join(w.sent[i]));
+            if (access == ToolAccess::helper) {
+                CHECK(w.sent[i].front() == kFwHelperPath);
+                CHECK(w.sent[i] == *iptables_helper_argv(w.log[i]));
+            } else {
+                CHECK(w.sent[i] == w.log[i]);
+                CHECK((w.sent[i].front() == kIptablesPath || w.sent[i].front() == kIp6tablesPath));
+            }
+        }
+        // the build ran on both families
+        CHECK_FALSE(w.live_chains(std::string{kIptablesPath}).empty());
+        CHECK_FALSE(w.live_chains(std::string{kIp6tablesPath}).empty());
+        // removal and the status read take the same path
+        const auto rm = leg.remove(os, dl);
+        CHECK(rm.ok);
+        CHECK(w.live_chains(std::string{kIptablesPath}).empty());
+        for (const auto& a : w.sent)
+            CHECK((access == ToolAccess::helper) == (a.front() == kFwHelperPath));
+    }
+}
+
 TEST_CASE("iptables worst case stays inside the operation budget as counted calls",
           "[agent][firewall_quarantine]") {
     std::vector<Endpoint> many;
@@ -1490,6 +1968,134 @@ TEST_CASE("pf anchor ruleset: no nat/rdr, lo0, stateless control channel, block 
           v6text.npos);
 }
 
+namespace {
+
+// The anchor ruleset pf_anchor_ruleset emits for a set that uses every rule form. tests/
+// test_legacy_quarantine_plugin_removed_lexical.py reads this literal out of this file and runs it
+// through the helper's `pf load` with a stub for pfctl: the helper must hand the stub exactly this
+// text, byte for byte, so the two grammars cannot drift apart.
+constexpr std::string_view kGoldenPfRuleset = R"PFGOLDEN(no nat all
+no rdr all
+pass quick on lo0 all no state
+pass out quick inet proto tcp from any to 198.51.100.7 port 50051 no state
+pass in quick inet proto tcp from 198.51.100.7 port 50051 to any no state
+pass out quick inet6 proto tcp from any to 2001:db8::7 port 50051 no state
+pass in quick inet6 proto tcp from 2001:db8::7 port 50051 to any no state
+pass out quick inet proto udp from any port 68 to 255.255.255.255 port 67 keep state
+pass in quick inet proto udp from any port 67 to any port 68 keep state
+pass out quick inet proto udp from any to 203.0.113.53 port 53 keep state
+pass out quick inet proto tcp from any to 203.0.113.53 port 53 keep state
+pass out quick inet6 proto udp from any to 2001:4860:4860::8888 port 53 keep state
+pass out quick inet6 proto tcp from any to 2001:4860:4860::8888 port 53 keep state
+pass quick inet6 proto icmp6 icmp6-type { 133, 134, 135, 136 } no state
+pass in quick inet proto tcp from 10.0.0.5 to any port 22 keep state
+pass out quick inet proto tcp from any to 10.0.0.6 port 443 keep state
+pass out quick inet proto udp from any to 10.0.0.7 keep state
+pass in quick inet proto tcp from 10.0.0.8 to any keep state
+pass out quick inet proto udp from any to 10.1.0.0/16 port 53 keep state
+pass in quick inet6 proto tcp from 2001:db8::/32 to any port 443 keep state
+pass out quick inet6 proto udp from any to 2001:db8::7 port 8443 keep state
+pass out quick inet6 proto tcp from any to 2001:db8::9 keep state
+pass in quick inet proto udp from 10.0.0.11 to any port 5353 keep state
+pass in quick inet6 proto udp from 2001:db8::b to any keep state
+pass in quick inet proto tcp from 0.0.0.0/0 to any port 65535 keep state
+block drop quick all
+)PFGOLDEN";
+
+AllowSet pf_golden_set() {
+    auto b = build_allow_set("198.51.100.7,2001:db8::7", "198.51.100.7:50051",
+                             {"203.0.113.53", "2001:4860:4860::8888"},
+                             {ex("10.0.0.5:22/tcp/in"), ex("10.0.0.6:443/tcp/out"), ex("10.0.0.7/udp"),
+                              ex("10.0.0.8/tcp/in"), ex("10.1.0.0/16:53/udp/out"),
+                              ex("[2001:db8::]/32:443/tcp/in"), ex("[2001:db8::7]:8443/udp/out"),
+                              ex("[2001:db8::9]/tcp"), ex("10.0.0.11:5353/udp/in"),
+                              ex("[2001:db8::b]/udp/in"), ex("0.0.0.0/0:65535/tcp/in")});
+    REQUIRE(b.has_value());
+    return *b;
+}
+
+} // namespace
+
+TEST_CASE("pf_anchor_ruleset: the golden text covers every rule form the helper must accept",
+          "[agent][firewall_quarantine][sudoers]") {
+    const auto text = pf_anchor_ruleset(pf_golden_set());
+    CHECK(text == kGoldenPfRuleset);
+    // the forms, so a change to the set cannot quietly drop one from the golden
+    for (const char* form : {
+             "no nat all\nno rdr all\npass quick on lo0 all no state\n",
+             "pass out quick inet proto tcp from any to 198.51.100.7 port 50051 no state\n",
+             "pass in quick inet proto tcp from 198.51.100.7 port 50051 to any no state\n",
+             "pass out quick inet6 proto tcp from any to 2001:db8::7 port 50051 no state\n",
+             "pass in quick inet6 proto tcp from 2001:db8::7 port 50051 to any no state\n",
+             "pass out quick inet proto udp from any port 68 to 255.255.255.255 port 67 keep state\n",
+             "pass in quick inet proto udp from any port 67 to any port 68 keep state\n",
+             "pass quick inet6 proto icmp6 icmp6-type { 133, 134, 135, 136 } no state\n",
+             "pass out quick inet proto udp from any to 203.0.113.53 port 53 keep state\n",
+             "pass out quick inet6 proto tcp from any to 2001:4860:4860::8888 port 53 keep state\n",
+             "pass out quick inet proto udp from any to 10.0.0.7 keep state\n",
+             "pass in quick inet proto tcp from 10.0.0.8 to any keep state\n",
+             "pass in quick inet proto tcp from 10.0.0.5 to any port 22 keep state\n",
+             "pass out quick inet proto udp from any to 10.1.0.0/16 port 53 keep state\n",
+             "pass in quick inet6 proto tcp from 2001:db8::/32 to any port 443 keep state\n",
+             "pass in quick inet6 proto udp from 2001:db8::b to any keep state\n",
+             "pass in quick inet proto tcp from 0.0.0.0/0 to any port 65535 keep state\n"})
+        CHECK(text.find(form) != text.npos);
+    CHECK(text.ends_with("block drop quick all\n"));
+}
+
+TEST_CASE("the helper's pf load: the argv, and the largest allow set inside its line caps",
+          "[agent][firewall_quarantine][sudoers]") {
+    const std::string path = "/Library/Application Support/Yuzu/firewall-staging/yuzu-fwq-AbC123.pf";
+    const auto argv = pf_helper_load_argv(path);
+    CHECK(argv == Argv{"/Library/PrivilegedHelperTools/yuzu-fw-helper", "pf", "load", path});
+    CHECK(argv.front() == kFwHelperPathMacos);
+    CHECK(kFwHelperPathMacos != kFwHelperPath);
+    // a staged path is the one token outside the strict charset, and it must be the last
+    {
+        int ran = 0;
+        const Runner run = [&](const Argv&, std::chrono::milliseconds) {
+            ++ran;
+            return done(0);
+        };
+        Deadline dl;
+        detail::Exec ex(run, dl);
+        const StagedFile staged{path, nullptr, "/Library/Application Support/Yuzu/firewall-staging"};
+        CHECK(ex.call_staged(argv, staged));
+        CHECK(ran == 1);
+        const StagedFile elsewhere{path, nullptr, "/tmp"};
+        CHECK_FALSE(ex.call_staged(argv, elsewhere));
+        CHECK(ran == 1);
+    }
+
+    // The helper reads at most 512 lines of at most 512 characters, 262145 bytes in all. The
+    // largest set build_allow_set admits (32 control endpoints, 8 resolvers, 64 two-protocol
+    // exceptions, all IPv6) stays well inside.
+    std::string csv;
+    for (int i = 1; i <= 32; ++i)
+        csv += std::format("{}2001:db8:{:x}:1:2:3:4:5", i > 1 ? "," : "", i);
+    std::vector<std::string> resolvers;
+    for (int i = 1; i <= 8; ++i)
+        resolvers.push_back(std::format("2001:4860:{:x}:1:2:3:4:5", i));
+    std::vector<Endpoint> many;
+    for (int i = 0; i < 64; ++i)
+        many.push_back(ex(std::format("[2001:db8:ffff:{:x}:2:3:4:5]/128:{}/{}", i + 1, 40000 + i,
+                                      i % 2 ? "in" : "out")));
+    const auto big = build_allow_set(csv, "server.example.com:50051", resolvers, many);
+    REQUIRE(big);
+    CHECK(big->control.size() == kMaxControlIps);
+    CHECK(big->resolvers.size() == kMaxResolvers);
+    CHECK(big->exceptions.size() == kMaxExceptions);
+    const auto text = pf_anchor_ruleset(*big);
+    CHECK(text.size() <= 512u * 512u);
+    const auto parts = detail::split(text, '\n'); // the last part is the empty tail after the final newline
+    REQUIRE(parts.size() >= 2);
+    CHECK(parts.back().empty());
+    CHECK(parts.size() - 1 <= 512);
+    for (const auto line : parts)
+        CHECK(line.size() <= 512);
+    CHECK(text.ends_with("block drop quick all\n"));
+}
+
 TEST_CASE("pfctl argv: the anchor sorts first, flush is scoped to our anchor, nothing global",
           "[agent][firewall_quarantine]") {
     // pf evaluates com.apple/* sub-anchors in name order; 200.AirDrop and
@@ -1500,6 +2106,8 @@ TEST_CASE("pfctl argv: the anchor sorts first, flush is scoped to our anchor, no
     CHECK(is_safe_token(kPfAnchor));
 
     CHECK(join(pfctl_load_argv("/tmp/x.pf")) == "/sbin/pfctl -a com.apple/000.yuzu_quarantine -f /tmp/x.pf");
+    CHECK(join(pf_helper_load_argv("/tmp/x.pf")) ==
+          "/Library/PrivilegedHelperTools/yuzu-fw-helper pf load /tmp/x.pf");
     CHECK(join(pfctl_flush_states_argv()) == "/sbin/pfctl -F states");
     CHECK(join(pfctl_references_argv()) == "/sbin/pfctl -s References");
     CHECK(join(pfctl_release_argv("123456")) == "/sbin/pfctl -X 123456");
@@ -1511,7 +2119,8 @@ TEST_CASE("pfctl argv: the anchor sorts first, flush is scoped to our anchor, no
     CHECK(join(pfctl_rules_argv()) == "/sbin/pfctl -s rules");
     CHECK(join(pfctl_anchor_rules_argv()) == "/sbin/pfctl -a com.apple/000.yuzu_quarantine -s rules");
     CHECK(join(pfctl_siblings_argv()) == "/sbin/pfctl -a com.apple -s Anchors");
-    for (const auto& a : {pfctl_load_argv("/tmp/x.pf"), pfctl_flush_states_argv(), pfctl_references_argv(),
+    for (const auto& a : {pfctl_load_argv("/tmp/x.pf"), pf_helper_load_argv("/tmp/x.pf"),
+                          pfctl_flush_states_argv(), pfctl_references_argv(),
                           pfctl_release_argv("123456"), pfctl_enable_argv(),
                           pfctl_flush_anchor_rules_argv(), pfctl_flush_anchor_nat_argv(), pfctl_info_argv(),
                           pfctl_rules_argv(), pfctl_anchor_rules_argv(), pfctl_siblings_argv()})
@@ -1628,7 +2237,7 @@ struct NftRig {
     Env env;
 
     NftRig()
-        : leg(world.runner(), world.stage()),
+        : leg(world.runner(), world.stage(), ToolAccess::helper),
           env{leg, store, probe.fn(), [this] { return now; }} {
         world.clock = &clock;
         probe.blocked = [this] { return world.table; };
@@ -2108,7 +2717,7 @@ TEST_CASE("status reads our table over netlink first, then falls back to nft lis
     good.chains = {{"input", "input", "drop"}, {"output", "output", "drop"}, {"forward", "forward", "drop"}};
     int netlink_reads = 0;
     std::optional<NftTableListing> answer = good;
-    NftLeg leg(w.runner(), w.stage(), [&]() -> std::optional<NftTableListing> {
+    NftLeg leg(w.runner(), w.stage(), ToolAccess::helper, [&]() -> std::optional<NftTableListing> {
         ++netlink_reads;
         return answer;
     });
@@ -3000,7 +3609,7 @@ struct IptRig {
     Env env;
 
     explicit IptRig(V6Mode v6 = V6Mode::cover)
-        : leg(world.runner(), v6), env{leg, store, probe.fn(), [this] { return now; }} {
+        : leg(world.runner(), v6, ToolAccess::helper), env{leg, store, probe.fn(), [this] { return now; }} {
         world.clock = &clock;
         probe.blocked = [this] { return !world.fam[std::string{kIptablesPath}].builtin["OUTPUT"].empty(); };
     }
@@ -3060,7 +3669,7 @@ TEST_CASE("iptables: a host with the ip6tables binary but no IPv6 stack still re
     CHECK_FALSE(rig.store.state()->os.ipt_v6);
 
     // The status/release leg is built with v6 = "the binary exists", as the plugin does.
-    IptablesLeg later(rig.world.runner(), V6Mode::cover);
+    IptablesLeg later(rig.world.runner(), V6Mode::cover, ToolAccess::helper);
     Env later_env{later, rig.store, rig.probe.fn(), [] { return std::int64_t{1'700'000'100}; }};
     rig.world.fail_on = [](const std::string& cmd) { return cmd.starts_with("/usr/sbin/ip6tables"); };
     CHECK(report_status(later_env, dl).status == "active");
@@ -3237,7 +3846,7 @@ TEST_CASE("iptables: a host that may route IPv6 with no ip6tables is refused, no
             REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
             const auto before = *rig.store.state();
 
-            IptablesLeg refusing(rig.world.runner(), mode);
+            IptablesLeg refusing(rig.world.runner(), mode, ToolAccess::helper);
             Env renv{refusing, rig.store, rig.probe.fn(), [] { return std::int64_t{1'700'000'100}; }};
 
             const auto u = update(renv, true, {ex("10.0.0.9:443/tcp/in")}, dl);
@@ -3357,7 +3966,8 @@ struct PfWorld {
     std::string stage_dir = "/tmp";      // the private staging directory the Stage reports
     std::string record_at_enable, record_at_load, record_at_flush;
     Crash crash;
-    std::vector<Argv> log;
+    std::vector<Argv> log;  // the pfctl command each call stands for
+    std::vector<Argv> sent; // what the leg really sent
 
     void external_disable() { // someone ran `pfctl -d`
         pf_on = false;
@@ -3465,15 +4075,26 @@ struct PfWorld {
         return done(1, "unexpected argv: " + cmd);
     }
 
+    /// An anchor load reaches the runner as the root-owned helper's argv (`<helper> pf load
+    /// <file>`, a non-root agent) or as `pfctl -a <anchor> -f <file>` (a root agent). The runner
+    /// takes both, checks the helper form is exactly pf_helper_load_argv, and hands the world the
+    /// pfctl command it stands for, so `log` and every assertion on the order of the calls read
+    /// the same in either mode. `sent` keeps what the leg really sent.
     Runner runner() {
         return [this](const Argv& a, std::chrono::milliseconds) {
             ++crash.calls;
-            log.push_back(a);
+            sent.push_back(a);
+            Argv plan = a;
+            if (a[0] == kFwHelperPathMacos) {
+                REQUIRE(a == pf_helper_load_argv(a.back()));
+                plan = pfctl_load_argv(a.back());
+            }
+            log.push_back(plan);
             if (clock)
                 clock->advance(per_call);
             if (crash.calls == crash.crash_at && !crash.after_effect)
                 throw CrashSim{};
-            auto r = effect(a);
+            auto r = effect(plan);
             if (crash.calls == crash.crash_at && crash.after_effect)
                 throw CrashSim{};
             return r;
@@ -3509,13 +4130,14 @@ struct PfRig {
     std::int64_t now = 1'700'000'000;
     Env env;
 
-    PfRig()
+    explicit PfRig(ToolAccess access = ToolAccess::direct)
         : leg(world.runner(), world.stage(),
               [this]() -> std::optional<std::string> {
                   if (!boot_readable)
                       return std::nullopt;
                   return world.boot;
-              }),
+              },
+              access),
           env{leg, store, probe.fn(), [this] { return now; }} {
         world.clock = &clock;
         world.record = [this] { return store.raw; };
@@ -3533,6 +4155,52 @@ struct PfRig {
 };
 
 } // namespace
+
+TEST_CASE("the pf leg: a non-root agent loads through the helper, a root agent runs pfctl itself",
+          "[agent][firewall_quarantine][sudoers]") {
+    for (const auto access : {ToolAccess::helper, ToolAccess::direct}) {
+        PfRig rig(access);
+        auto dl = rig.dl();
+        const auto o = apply_and_verify(rig.env, rig.request(kProbeTarget, 120), dl);
+        REQUIRE(o.status == "active");
+        // the staged file is the pattern the helper accepts: stem and suffix
+        const std::string path = "/tmp/yuzu-fwq-pf-1.pf";
+        std::size_t loads = 0;
+        for (const auto& a : rig.world.sent) {
+            const bool is_load = a.size() == 4 ? a[0] == kFwHelperPathMacos : (a.size() == 5 && a[3] == "-f");
+            if (!is_load)
+                continue;
+            ++loads;
+            if (access == ToolAccess::helper)
+                CHECK(a == Argv{"/Library/PrivilegedHelperTools/yuzu-fw-helper", "pf", "load", path});
+            else
+                CHECK(a == Argv{"/sbin/pfctl", "-a", "com.apple/000.yuzu_quarantine", "-f", path});
+        }
+        CHECK(loads == 1);
+        CHECK(rig.world.anchor_text == pf_anchor_ruleset(make_set()));
+        // nothing else changes with the mode: the load is the only call that goes through the helper
+        REQUIRE(rig.world.sent.size() == rig.world.log.size());
+        std::size_t via_helper = 0;
+        for (const auto& a : rig.world.sent)
+            if (a.front() == kFwHelperPathMacos)
+                ++via_helper;
+        CHECK(via_helper == (access == ToolAccess::helper ? 1u : 0u));
+        // the enable reference is given back with the same `pfctl -X <token>` in both modes
+        const auto token = rig.token();
+        REQUIRE_FALSE(token.empty());
+        const auto rm = release(rig.env, ReleaseRequest{}, dl);
+        CHECK(rm.status == "inactive");
+        std::size_t releases = 0;
+        for (const auto& a : rig.world.sent)
+            if (a.size() == 3 && a[1] == "-X") {
+                ++releases;
+                CHECK(a == pfctl_release_argv(token));
+                CHECK(a == Argv{"/sbin/pfctl", "-X", token});
+            }
+        CHECK(releases == 1);
+        CHECK(rig.world.tokens.empty());
+    }
+}
 
 TEST_CASE("pf: apply order -- reference, siblings, load, then the state flush; token recorded first",
           "[agent][firewall_quarantine]") {
@@ -4461,6 +5129,23 @@ TEST_CASE("pf: a staging directory with a space applies; an unusable staged path
             }
         CHECK(loaded); // the spaced path travelled as ONE argv element
     }
+    SECTION("the same directory through the helper: the spaced path is still ONE argv element") {
+        PfRig rig(ToolAccess::helper);
+        rig.world.stage_dir = "/Library/Application Support/Yuzu/firewall-staging";
+        auto dl = rig.dl();
+        const auto o = apply_and_verify(rig.env, rig.request(), dl);
+        CHECK(o.status == "active");
+        CHECK(rig.world.anchor_exists);
+        bool loaded = false;
+        for (const auto& a : rig.world.sent)
+            if (a.size() == 4 && a[0] == kFwHelperPathMacos) {
+                loaded = true;
+                CHECK(a[1] == "pf");
+                CHECK(a[2] == "load");
+                CHECK(a[3].starts_with("/Library/Application Support/Yuzu/firewall-staging/"));
+            }
+        CHECK(loaded);
+    }
     SECTION("a staged path outside its directory is refused before pfctl -E takes a reference") {
         PfWorld w;
         FakeStore store;
@@ -4469,7 +5154,8 @@ TEST_CASE("pf: a staging directory with a space applies; an unusable staged path
                              std::string_view) -> std::optional<StagedFile> {
             return StagedFile{"/etc/passwd", nullptr, "/tmp"};
         };
-        PfLeg leg(w.runner(), bad, [&]() -> std::optional<std::string> { return w.boot; });
+        PfLeg leg(w.runner(), bad, [&]() -> std::optional<std::string> { return w.boot; },
+                  ToolAccess::direct);
         Deadline dl;
         OsPayload os;
         const auto r = leg.apply(make_set(), 1, 0, os, dl, [](const OsPayload&) { return true; });
