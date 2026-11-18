@@ -115,15 +115,32 @@ TEST_CASE("live kind table: the 22 pinned tokens resolve and listed neighbours d
     }
 }
 
+TEST_CASE("live kind table: escaped_rows is exactly hw_memory + hw_processors", "[live][model]") {
+    // #7040: only the hardware cpu and dimm rows are written with `\|` escapes at the source.
+    // Any other kind on the escape-aware split would let a trailing backslash swallow the next
+    // separator, so the set is pinned exactly, in both directions.
+    std::set<std::string> escaped;
+    for (const auto& k : all_kinds()) {
+        const auto d = live::resolve_dashboard_kind(k);
+        REQUIRE(d);
+        if (d->escaped_rows)
+            escaped.insert(k);
+    }
+    CHECK(escaped == std::set<std::string>{"hw_memory", "hw_processors"});
+    // The escape flag never rides along with REST eligibility.
+    for (const char* k : {"hw_memory", "hw_processors"})
+        CHECK_FALSE(live::resolve_dashboard_kind(k)->rest_v1);
+}
+
 TEST_CASE("live kind table: REST subset is exactly uptime + processes", "[live][model]") {
     std::set<std::string> rest;
     for (const auto& k : all_kinds())
         if (live::resolve_rest_kind(k))
             rest.insert(k);
-    // This exact-set pin is the tripwire for a positional mis-port of a `bool escaped_rows`
-    // field (see #8122) into LiveKind: a positional `true` after `columns` would silently
-    // bind to `rest_v1` and widen the REST surface to a dashboard-only kind, which this
-    // check turns into a failure. Do not loosen it to a subset check.
+    // This exact-set pin is the tripwire for a positional mis-port of a boolean into LiveKind
+    // (the hazard #8122 raised for `escaped_rows`): a positional `true` after `columns` would
+    // silently bind to `rest_v1` and widen the REST surface to a dashboard-only kind, which
+    // this check turns into a failure. Do not loosen it to a subset check.
     CHECK(rest == std::set<std::string>{"uptime", "processes"});
     // The REST view is the SAME row as the dashboard view, not a second table.
     for (const char* k : {"uptime", "processes"}) {
@@ -413,6 +430,27 @@ TEST_CASE("live parsers: each capped parser holds the kMaxLiveRows boundary", "[
             CHECK(c.parse(input) == std::min(n, live::kMaxLiveRows));
         }
     }
+}
+
+TEST_CASE("parse_generic_rows: escaped_rows kinds split on an unescaped pipe, others stay raw",
+          "[live][model][generic]") {
+    // #7040: the cpu row writes a literal pipe as `\|`; the escape-aware split keeps it in its
+    // cell and unescapes it, so no column shifts.
+    const auto cpu = live::resolve_dashboard_kind("hw_processors");
+    REQUIRE(cpu);
+    const auto g = live::parse_generic_rows(*cpu, "cpu|0|Intel\\|X|4|8|3000\n");
+    REQUIRE(g.rows.size() == 1);
+    REQUIRE(g.rows[0].size() == 5);
+    CHECK(g.rows[0][0] == "0");
+    CHECK(g.rows[0][1] == "Intel|X");
+    CHECK(g.rows[0][4] == "3000");
+    // hw_disks keeps the raw split: a field ending in a backslash must NOT swallow the separator.
+    const auto disk = live::resolve_dashboard_kind("hw_disks");
+    REQUIRE(disk);
+    const auto d = live::parse_generic_rows(*disk, "disk|0|Mod\\|120|SSD|NVMe\n");
+    REQUIRE(d.rows.size() == 1);
+    CHECK(d.rows[0][1] == "Mod\\");
+    CHECK(d.rows[0][2] == "120");
 }
 
 // What parse_generic_rows ACTUALLY does with its two bounds (the code applies two checks, not

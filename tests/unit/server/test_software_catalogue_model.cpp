@@ -898,8 +898,11 @@ TEST_CASE("installed_software_args_error: types only, never a range or a length"
     CHECK_FALSE(installed_software_args_error(json::array())); // not an object: nothing to check
     CHECK_FALSE(installed_software_args_error(
         json{{"agent_id", "a"}, {"name", "git"}, {"version", ""}, {"cursor", "c"}, {"limit", 5}}));
-    // unknown names are ignored whatever their type
-    CHECK_FALSE(installed_software_args_error(json{{"bogus", 1.5}, {"kind", 7}}));
+    // unknown names are ignored whatever their type; `format`, `purl` and `vers` are REST-only and
+    // deliberately not read here either (SAM-21)
+    CHECK_FALSE(installed_software_args_error(json{{"bogus", 1.5}, {"format", 7}, {"purl", 9}}));
+    // `kind` is one of the eight lookup filters since SAM-21, so a wrongly typed one is refused
+    CHECK(installed_software_args_error(json{{"kind", 7}}));
     // legacy clamping stays: an in-range integer of any size is the parser's to clamp
     for (const std::int64_t n : {INT64_C(-3), INT64_C(0), INT64_C(50000), INT64_MAX})
         CHECK_FALSE(installed_software_args_error(json{{"limit", n}}));

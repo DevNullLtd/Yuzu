@@ -813,6 +813,7 @@ MCP_REGISTRY_HEADERS = [
     MCP_REGISTRY_REGISTRY_HEADER,
 ]
 MCP_REGISTRY_TYPES_HEADERS = [
+    "server/core/src/collation_gate_types.hpp",
     "server/core/src/device_inventory_types.hpp",
     "server/core/src/discover_catalog_types.hpp",
     "server/core/src/inventory_types.hpp",

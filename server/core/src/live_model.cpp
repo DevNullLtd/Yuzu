@@ -3,6 +3,8 @@
 
 #include "live_model.hpp"
 
+#include "result_parsing.hpp" // split_all_pipes (escape-aware split, #7040); header-only and pure
+
 #include <algorithm>
 #include <cctype>
 #include <unordered_map>
@@ -58,11 +60,19 @@ const std::vector<KindEntry>& kind_table() {
         // empty: these kinds have no secondary joined dispatch.
         add("hw_disks", LiveKind{"hardware", "disks", "Disks", "device.live.hw_disks", "", "",
                                  "disk", {"index", "model", "size_gb", "media_type", "interface"}});
-        add("hw_memory", LiveKind{"hardware", "memory", "Memory", "device.live.hw_memory", "", "",
-                                  "dimm", {"slot", "size_mb", "type", "speed_mhz"}});
-        add("hw_processors",
-            LiveKind{"hardware", "processors", "Processors", "device.live.hw_processors", "", "",
-                     "cpu", {"index", "model", "cores", "threads", "clock_mhz"}});
+        // The hardware plugin's cpu and dimm rows write a literal pipe in firmware text as `\|`
+        // and fold a backslash to `/` (#7040), so exactly these two kinds declare `escaped_rows`.
+        // Every other kind keeps the raw split: its action writes raw text (the hardware disk and
+        // driver rows, a Windows mount point ending in a backslash) and an escape-aware split
+        // would let a trailing backslash swallow the next separator.
+        LiveKind hw_memory{"hardware", "memory", "Memory", "device.live.hw_memory", "", "",
+                           "dimm", {"slot", "size_mb", "type", "speed_mhz"}};
+        hw_memory.escaped_rows = true;
+        add("hw_memory", std::move(hw_memory));
+        LiveKind hw_processors{"hardware", "processors", "Processors", "device.live.hw_processors",
+                               "", "", "cpu", {"index", "model", "cores", "threads", "clock_mhz"}};
+        hw_processors.escaped_rows = true;
+        add("hw_processors", std::move(hw_processors));
         add("hw_drivers",
             LiveKind{"hardware", "drivers", "Drivers", "device.live.hw_drivers", "", "", "driver",
                      {"index", "name", "version", "date", "provider", "device_class"}});
@@ -573,7 +583,7 @@ LiveGenericRows parse_generic_rows(const LiveKind& kind, const std::string& outp
                 out.raw_rows.push_back(l);
             continue;
         }
-        auto f = pipe_fields(l);
+        auto f = kind.escaped_rows ? split_all_pipes(l) : pipe_fields(l);
         if (f.empty())
             continue;
         f.erase(f.begin());             // drop the prefix token itself

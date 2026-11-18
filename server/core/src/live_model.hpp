@@ -96,9 +96,9 @@ inline constexpr std::size_t kMaxLiveRows = 20000;
 ///
 /// Set new fields BY NAME (designated initialisers or an assignment after
 /// construction), never positionally: a positional bool added after `columns` would
-/// silently bind to `rest_v1` (a change that appends a positional `bool escaped_rows`
-/// to the kind table was the hazard raised in review of #8122). The `rest == {uptime,
-/// processes}` pin in test_live_model.cpp is the tripwire for such a mis-port.
+/// silently bind to `rest_v1` (the hazard raised in review of #8122, which appended a
+/// positional `bool escaped_rows`). The `rest == {uptime, processes}` and `escaped == {hw_memory,
+/// hw_processors}` pins in test_live_model.cpp are the tripwires for such a mis-port.
 struct LiveKind {
     std::string plugin;
     std::string action;
@@ -120,6 +120,12 @@ struct LiveKind {
     /// the rows that rest_api_v1.cpp's live_result_json can render; widening the REST
     /// surface means flipping this flag AND teaching that function the kind.
     bool rest_v1{false};
+    /// True only for a kind whose producing action writes a literal pipe as `\|` and folds a
+    /// literal backslash to `/` for EVERY field of the row (yuzu::util::safe_output_field), so
+    /// parse_generic_rows() may split it on an UNESCAPED pipe and unescape (#7040). Leave it
+    /// false for any kind whose action writes raw text: a field ending in a backslash would then
+    /// swallow the next separator. Set BY NAME in the kind table, beside each kind.
+    bool escaped_rows{false};
 };
 
 /// Any of the 22 dashboard kinds (the closed allowlist the dashboard routes accept).

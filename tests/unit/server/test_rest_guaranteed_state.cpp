@@ -292,6 +292,16 @@ struct RestGsHarness {
     // false: every pre-existing test in this file is unaffected.
     bool wire_real_dex_perm_{false};
 
+    // GET /api/v1/dex/apps/usage: what the usage read returns, read lazily at request time like
+    // dex_fleet_override_ (empty = an engaged empty read). `usage_reads` counts the reads that
+    // reached it, so a refused request can prove the read never ran; `last_usage_query` is the
+    // query the model built.
+    std::function<std::expected<yuzu::server::DexUsageRead, std::string>(
+        const yuzu::server::DexUsageQuery&)>
+        usage_read_for_test;
+    int usage_reads{0};
+    yuzu::server::DexUsageQuery last_usage_query;
+
     std::vector<AuditRecord> audit_log;
 
     yuzu::MetricsRegistry metrics;
@@ -514,7 +524,8 @@ struct RestGsHarness {
                               const std::string& operation) -> bool {
             if (wire_real_dex_perm_ && securable_type == "GuaranteedState" &&
                 operation == "Read" &&
-                (req.path == "/api/v1/dex/app" || req.path == "/api/v1/dex/overview"))
+                (req.path == "/api/v1/dex/app" || req.path == "/api/v1/dex/overview" ||
+                 req.path == "/api/v1/dex/apps/usage"))
                 return auth_routes_->require_permission(req, res, securable_type, operation);
             if (grant_perms)
                 return true;
@@ -652,14 +663,49 @@ struct RestGsHarness {
         // exercise the SEAM path (production wires it identically). Gated on
         // store presence exactly like server.cpp — null store → null api → 503.
         std::shared_ptr<yuzu::server::DexApi> dex_api_local;
-        if (store && wire_dex_api_)
+        if (store && wire_dex_api_) {
+            // The usage reads behind GET /api/v1/dex/apps/usage. group_members mirrors server.cpp's
+            // closure over this harness's management group store, in the same order (members
+            // first, then the group's existence): unknown_group (no such group) is told apart from
+            // group_unavailable (a failed read).
+            yuzu::server::DexUsageWiring usage;
+            usage.read = [this](const yuzu::server::DexUsageQuery& q)
+                -> std::expected<yuzu::server::DexUsageRead, std::string> {
+                ++usage_reads;
+                last_usage_query = q;
+                if (usage_read_for_test)
+                    return usage_read_for_test(q);
+                return yuzu::server::DexUsageRead{};
+            };
+            usage.group_members = [this](const std::string& id)
+                -> std::expected<std::vector<std::string>, std::string> {
+                const auto members = mgmt_.get_members_checked(id);
+                if (!members)
+                    return std::unexpected(std::string("group_unavailable"));
+                const auto group = mgmt_.get_group_checked(id);
+                if (!group)
+                    return std::unexpected(std::string("group_unavailable"));
+                if (!*group)
+                    return std::unexpected(std::string("unknown_group"));
+                std::vector<std::string> ids;
+                for (const auto& m : *members)
+                    ids.push_back(m.agent_id);
+                return ids;
+            };
+            usage.tag_values = [](const std::string&)
+                -> std::optional<std::unordered_map<std::string, std::string>> {
+                return std::unordered_map<std::string, std::string>{};
+            };
+            usage.observation_retention_days = 30;
             dex_api_local = yuzu::server::make_local_dex_api(
                 store.get(), [this]() { return dex_fleet_override_; },
                 [this]() -> std::expected<yuzu::server::DexPolicyInForce, std::string> {
                     if (dex_policy_fn_for_test)
                         return dex_policy_fn_for_test();
                     return yuzu::server::DexPolicyInForce{};
-                });
+                },
+                /*observer_fn=*/{}, std::move(usage));
+        }
 
         // ADR-0031 WS-A4 (sixth family): the REAL DexPerfApi seam wrapping
         // this harness's existing dex_perf_fn_/app_perf_providers_ function
@@ -3176,6 +3222,455 @@ TEST_CASE("REST dex/apps: an unknown platform is a 400 with no retry hint",
         CHECK(j["error"]["retry_after_ms"].is_null());
         CHECK(res->get_header_value("Retry-After").empty());
     }
+}
+
+// ── GET /api/v1/dex/apps/usage ───────────────────────────────────────────────
+//
+// Gate 1 is perm_fn(GuaranteedState, Read) and gate 2 is the REAL require_fleet_read(Forensics,
+// Read), so every request below carries a real session (status_route_headers()). The harness
+// stub grants gate 1 unless a case flips grant_perms or wire_real_dex_perm_.
+
+namespace {
+
+constexpr const char* kUsageRoute = "/api/v1/dex/apps/usage";
+
+// One application (chrome.exe) with crash observations on two online devices.
+void seed_usage_fixture(RestGsHarness& h) {
+    h.seed_obs("u1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    h.seed_obs("u2", "WS-2", "process.crashed", "chrome.exe", "windows", "2026-06-10T11:00:00Z");
+    h.dex_fleet_override_.connected_agents = {{"WS-1", "windows"}, {"WS-2", "windows"}};
+    h.dex_fleet_override_.total_online = 2;
+    h.usage_read_for_test = [](const yuzu::server::DexUsageQuery&)
+        -> std::expected<yuzu::server::DexUsageRead, std::string> {
+        yuzu::server::DexUsageRead r;
+        r.cells.push_back({0, 0, 2, 2, 0, 10, 7200});
+        r.events.push_back({0, 2, 0});
+        r.reporting_devices = 2;
+        r.stale_devices = 0;
+        return r;
+    };
+}
+
+} // namespace
+
+TEST_CASE("REST dex/apps/usage: an administrator gets the aggregate, one audit row, no agent id",
+          "[pg][rest][dex][apps][usage]") {
+    RestGsHarness h;
+    seed_usage_fixture(h);
+    const auto apps_before = h.sink.Get("/api/v1/dex/apps?window=all");
+    REQUIRE(apps_before);
+
+    auto res = h.sink.Get(std::string(kUsageRoute) + "?window=all", h.status_route_headers());
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    CHECK_FALSE(res->get_header_value("X-Correlation-Id").empty());
+    const auto j = nlohmann::json::parse(res->body);
+    const auto& d = j["data"];
+    CHECK(d["window"] == "all");
+    CHECK(d["platform_scope"] == "all");
+    CHECK(d["slice"]["kind"] == "fleet");
+    CHECK(d["slice"]["key"].is_null());
+    CHECK(d["basis"] == "estimated_from_30_day_usage");
+    CHECK(d["freshness_window_hours"] == 48);
+    CHECK(d["floor"] == 1);
+    CHECK(d["floor_scope"] == "per_table");
+    CHECK(d["population"] == 2);
+    CHECK(d["reporting_devices"] == 2);
+    CHECK(d["stale_devices"] == 0);
+    CHECK(d["as_of"].is_string());
+    REQUIRE(d["apps"].size() == 1);
+    CHECK(d["apps"][0]["subject"] == "chrome.exe");
+    CHECK(d["apps"][0]["state"] == "matched");
+    CHECK(d["apps"][0]["devices"] == 2);
+    CHECK(d["apps"][0]["run_seconds_30d"] == 7200);
+    CHECK(d["apps"][0]["launches_30d"] == 10);
+    // Window all has no length, so the rate is withheld by name, never reported as zero.
+    CHECK(d["apps"][0]["exposure_rate"].is_null());
+    CHECK(d["apps"][0]["rate_withheld"] == "unbounded_window");
+    // No agent id anywhere in the body.
+    CHECK(res->body.find("WS-1") == std::string::npos);
+    CHECK(res->body.find("WS-2") == std::string::npos);
+
+    // The rows are the Apps rows, in order.
+    const auto apps = nlohmann::json::parse(apps_before->body)["data"]["apps"];
+    REQUIRE(apps.size() == d["apps"].size());
+    for (std::size_t i = 0; i < apps.size(); ++i)
+        CHECK(apps[i]["subject"] == d["apps"][i]["subject"]);
+
+    // Exactly one audit row, before the read, naming the request shape and no agent.
+    REQUIRE(h.audit_log.size() == 1);
+    const auto& a = h.audit_log[0];
+    CHECK(a.action == "dex.apps.usage.view");
+    CHECK(a.result == "success");
+    CHECK(a.target_type == "Forensics");
+    CHECK(a.target_id.empty());
+    CHECK(a.detail.find("cid=") != std::string::npos);
+    CHECK(a.detail.find("window=all") != std::string::npos);
+    CHECK(a.detail.find("platform=all") != std::string::npos);
+    CHECK(a.detail.find("slice=fleet") != std::string::npos);
+    CHECK(a.detail.find("floor=1") != std::string::npos);
+    CHECK(a.detail.find("WS-") == std::string::npos);
+    CHECK(h.usage_reads == 1);
+
+    // The Apps list itself is unchanged by the new route, and still unaudited.
+    const auto apps_after = h.sink.Get("/api/v1/dex/apps?window=all");
+    REQUIRE(apps_after);
+    CHECK(apps_after->body == apps_before->body);
+    CHECK(h.audit_log.size() == 1);
+}
+
+TEST_CASE("REST dex/apps/usage: zero devices online is a 200 of no usage, not a refusal",
+          "[pg][rest][dex][apps][usage]") {
+    RestGsHarness h;
+    h.seed_obs("u1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    // dex_fleet_override_ stays empty: nothing is online.
+    auto res = h.sink.Get(std::string(kUsageRoute) + "?window=all", h.status_route_headers());
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    const auto d = nlohmann::json::parse(res->body)["data"];
+    CHECK(d["population"] == 0);
+    REQUIRE_FALSE(d["apps"].empty());
+    for (const auto& a : d["apps"]) {
+        CHECK(a["state"] == "no_usage");
+        CHECK(a["run_seconds_30d"].is_null());
+    }
+}
+
+TEST_CASE("REST dex/apps/usage: a non-administrator is refused by the Forensics floor, with no audit and no read",
+          "[pg][rest][dex][apps][usage]") {
+    RestGsHarness h;
+    seed_usage_fixture(h);
+    h.session_user = "plain_user";
+    h.session_role = auth::Role::user;
+    auto res = h.sink.Get(std::string(kUsageRoute) + "?window=all", h.status_route_headers());
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(h.audit_log.empty());
+    CHECK(h.usage_reads == 0);
+    CHECK(res->body.find("chrome.exe") == std::string::npos);
+}
+
+TEST_CASE("REST dex/apps/usage: a caller without GuaranteedState:Read is refused before the Forensics gate",
+          "[pg][rest][dex][apps][usage]") {
+    RestGsHarness h;
+    seed_usage_fixture(h);
+    h.grant_perms = false; // gate 1 (the stub) refuses
+    auto res = h.sink.Get(std::string(kUsageRoute) + "?window=all", h.status_route_headers());
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(h.audit_log.empty());
+    CHECK(h.usage_reads == 0);
+}
+
+// Gate composition with the REAL require_permission at gate 1 (wire_real_dex_perm_) and RBAC on:
+// both gates must pass. The positive control comes first so the refusals below are not a stub.
+TEST_CASE("REST dex/apps/usage: RBAC on needs BOTH GuaranteedState:Read and Forensics:Read",
+          "[pg][rest][dex][apps][usage][adr0017]") {
+    RestGsHarness h;
+    seed_usage_fixture(h);
+    h.wire_real_dex_perm_ = true;
+    h.rbac_.set_rbac_enabled(true);
+    h.session_role = auth::Role::user;
+
+    REQUIRE(h.rbac_.create_role({"UsageBoth", "", false, 0}).has_value());
+    REQUIRE(h.rbac_.set_permission({"UsageBoth", "GuaranteedState", "Read", "allow"}).has_value());
+    REQUIRE(h.rbac_.set_permission({"UsageBoth", "Forensics", "Read", "allow"}).has_value());
+    REQUIRE(h.rbac_.assign_role({"user", "both_user", "UsageBoth"}).has_value());
+    h.session_user = "both_user";
+    auto ok = h.sink.Get(std::string(kUsageRoute) + "?window=all", h.status_route_headers());
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    CHECK(h.audit_log.size() == 1);
+    CHECK(h.usage_reads == 1);
+
+    // Viewer-shaped: GuaranteedState:Read only. Gate 2 refuses; no audit row, no read.
+    REQUIRE(h.rbac_.create_role({"UsageViewer", "", false, 0}).has_value());
+    REQUIRE(h.rbac_.set_permission({"UsageViewer", "GuaranteedState", "Read", "allow"}).has_value());
+    REQUIRE(h.rbac_.assign_role({"user", "viewer_user", "UsageViewer"}).has_value());
+    h.session_user = "viewer_user";
+    auto viewer = h.sink.Get(std::string(kUsageRoute) + "?window=all", h.status_route_headers());
+    REQUIRE(viewer);
+    CHECK(viewer->status == 403);
+
+    // ForensicsAnalyst-shaped: Forensics:Read without GuaranteedState:Read. Gate 1 refuses.
+    REQUIRE(h.rbac_.create_role({"UsageForensics", "", false, 0}).has_value());
+    REQUIRE(h.rbac_.set_permission({"UsageForensics", "Forensics", "Read", "allow"}).has_value());
+    REQUIRE(h.rbac_.assign_role({"user", "forensics_user", "UsageForensics"}).has_value());
+    h.session_user = "forensics_user";
+    auto forensics = h.sink.Get(std::string(kUsageRoute) + "?window=all", h.status_route_headers());
+    REQUIRE(forensics);
+    CHECK(forensics->status == 403);
+
+    CHECK(h.audit_log.size() == 1); // only the admitted request left a row
+    CHECK(h.usage_reads == 1);      // and only it reached the read
+}
+
+TEST_CASE("REST dex/apps/usage: a service-scoped token is refused with no audit row",
+          "[pg][rest][dex][apps][usage][adr0017]") {
+    RestGsHarness h;
+    seed_usage_fixture(h);
+    h.wire_real_dex_perm_ = true;
+    h.rbac_.set_rbac_enabled(true);
+    auto res = h.sink.Get(std::string(kUsageRoute) + "?window=all",
+                          h.service_scoped_token_headers("printers"));
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(h.audit_log.empty());
+    CHECK(h.usage_reads == 0);
+}
+
+TEST_CASE("REST dex/apps/usage: a failed audit write is a 503 and the read never runs",
+          "[pg][rest][dex][apps][usage]") {
+    RestGsHarness h;
+    seed_usage_fixture(h);
+    h.audit_succeeds = false;
+    auto res = h.sink.Get(std::string(kUsageRoute) + "?window=all", h.status_route_headers());
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    const auto j = nlohmann::json::parse(res->body);
+    CHECK(j["error"]["retry_after_ms"] == 5000);
+    CHECK(res->body.find("chrome.exe") == std::string::npos);
+    CHECK(h.usage_reads == 0);
+}
+
+// The audit row is written before the read, so a model already cached from an earlier request
+// cannot be served once the audit sink is down.
+TEST_CASE("REST dex/apps/usage: a failed audit write refuses even a request the cache could answer",
+          "[pg][rest][dex][apps][usage]") {
+    RestGsHarness h;
+    seed_usage_fixture(h);
+    const auto url = std::string(kUsageRoute) + "?window=all";
+    auto warm = h.sink.Get(url, h.status_route_headers());
+    REQUIRE(warm);
+    REQUIRE(warm->status == 200);
+    REQUIRE(h.usage_reads == 1);
+    REQUIRE(h.audit_log.size() == 1);
+
+    h.audit_succeeds = false;
+    auto res = h.sink.Get(url, h.status_route_headers());
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK(res->body.find("chrome.exe") == std::string::npos);
+    CHECK(res->body.find("\"apps\"") == std::string::npos);
+    CHECK(h.audit_log.size() == 2); // the write was attempted, before anything was served
+    CHECK(h.usage_reads == 1);
+}
+
+TEST_CASE("REST dex/apps/usage: omitted parameters reach the model and the audit row as their defaults",
+          "[pg][rest][dex][apps][usage]") {
+    RestGsHarness h;
+    seed_usage_fixture(h);
+    // The fixture's crashes are older than the 7d default window, and the fixture's read names
+    // subject 0; this one is inside the window, so the Apps list has that subject.
+    h.seed_obs("u3", "WS-1", "process.crashed", "fresh.exe", "windows",
+               yuzu::server::dex_iso_since(2));
+    auto res = h.sink.Get(kUsageRoute, h.status_route_headers());
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    const auto d = nlohmann::json::parse(res->body)["data"];
+    CHECK(d["window"] == "7d");
+    CHECK(d["platform_scope"] == "all");
+    CHECK(d["slice"]["kind"] == "fleet");
+    CHECK(d["floor"] == 1);
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].detail.find("window=7d") != std::string::npos);
+    CHECK(h.audit_log[0].detail.find("platform=all") != std::string::npos);
+    CHECK(h.audit_log[0].detail.find("slice=fleet") != std::string::npos);
+    CHECK(h.audit_log[0].detail.find("floor=1") != std::string::npos);
+
+    // A tag slice with no tag_key is the default cohort key.
+    auto tagged = h.sink.Get(std::string(kUsageRoute) + "?slice=tag", h.status_route_headers());
+    REQUIRE(tagged);
+    REQUIRE(tagged->status == 200);
+    const auto t = nlohmann::json::parse(tagged->body)["data"];
+    CHECK(t["slice"]["kind"] == "tag");
+    CHECK(t["slice"]["key"] == yuzu::server::kDexDefaultCohortKey);
+    REQUIRE(h.audit_log.size() == 2);
+    CHECK(h.audit_log[1].detail.find(std::string("key=") + yuzu::server::kDexDefaultCohortKey) !=
+          std::string::npos);
+}
+
+TEST_CASE("REST dex/apps/usage: a failed read is a retryable 503 that names the reason, never zero figures",
+          "[pg][rest][dex][apps][usage]") {
+    RestGsHarness h;
+    seed_usage_fixture(h);
+    const auto get = [&] {
+        auto res = h.sink.Get(std::string(kUsageRoute) + "?window=all", h.status_route_headers());
+        REQUIRE(res);
+        return res;
+    };
+
+    h.usage_read_for_test = [](const yuzu::server::DexUsageQuery&)
+        -> std::expected<yuzu::server::DexUsageRead, std::string> {
+        return std::unexpected(std::string("statement_timeout"));
+    };
+    auto timeout = get();
+    CHECK(timeout->status == 503);
+    auto j = nlohmann::json::parse(timeout->body);
+    CHECK(j["error"]["retry_after_ms"] == 2000);
+    CHECK(j["error"]["message"] ==
+          "fleet application usage unavailable (usage_unavailable: statement_timeout)");
+    CHECK(timeout->body.find("\"apps\"") == std::string::npos);
+
+    // Sustained timeouts: no retry hint, and a remediation that says retrying does not help.
+    h.usage_read_for_test = [](const yuzu::server::DexUsageQuery&)
+        -> std::expected<yuzu::server::DexUsageRead, std::string> {
+        return std::unexpected(std::string("fleet_too_large"));
+    };
+    auto too_large = get();
+    CHECK(too_large->status == 503);
+    j = nlohmann::json::parse(too_large->body);
+    CHECK(j["error"]["retry_after_ms"].is_null());
+    CHECK(j["error"]["message"] ==
+          "fleet application usage unavailable (usage_unavailable: fleet_too_large)");
+    CHECK(j["error"]["remediation"].get<std::string>().find("retrying does not help") != std::string::npos);
+    CHECK(j["error"]["remediation"].get<std::string>().find("index") == std::string::npos);
+    CHECK(too_large->body.find("\"apps\"") == std::string::npos);
+
+    // An Apps read that cannot be had is a retryable 503 too.
+    h.usage_read_for_test = nullptr;
+    h.dex_policy_fn_for_test = []() -> std::expected<yuzu::server::DexPolicyInForce, std::string> {
+        return std::unexpected(std::string("store down"));
+    };
+    auto policy = get();
+    CHECK(policy->status == 503);
+    j = nlohmann::json::parse(policy->body);
+    CHECK(j["error"]["retry_after_ms"] == 2000);
+    CHECK(j["error"]["message"] ==
+          "fleet application usage unavailable (apps_degraded: score_policy_unavailable)");
+
+    // Every refusal above was an admitted request that left its audit row.
+    CHECK(h.audit_log.size() == 3);
+}
+
+TEST_CASE("REST dex/apps/usage: the group slice is a 400 for an unknown group and a cell for a real one",
+          "[pg][rest][dex][apps][usage]") {
+    RestGsHarness h;
+    seed_usage_fixture(h);
+    ManagementGroup g;
+    g.name = "RegionA";
+    g.membership_type = "static";
+    const auto gid = h.mgmt_.create_group(g);
+    REQUIRE(gid.has_value());
+    REQUIRE(h.mgmt_.add_member(*gid, "WS-1").has_value());
+
+    // An unknown group is never a 200 with the whole population in `other`.
+    auto unknown = h.sink.Get(std::string(kUsageRoute) + "?window=all&slice=group&group=no-such-group",
+                              h.status_route_headers());
+    REQUIRE(unknown);
+    CHECK(unknown->status == 400);
+    const auto j = nlohmann::json::parse(unknown->body);
+    CHECK(j["error"]["message"] == "unknown management group");
+    CHECK(unknown->body.find("\"apps\"") == std::string::npos);
+    CHECK(h.audit_log.size() == 1); // the request was admitted; the row records that
+
+    // A 256-byte id is within the documented bound: validation accepts it, so it reaches the
+    // group lookup and is the same unknown-group 400, with its audit row (a 257-byte id is refused
+    // by validation instead, with no row: see the parameter case below).
+    auto longest = h.sink.Get(std::string(kUsageRoute) + "?window=all&slice=group&group=" +
+                                  std::string(256, 'g'),
+                              h.status_route_headers());
+    REQUIRE(longest);
+    CHECK(longest->status == 400);
+    CHECK(nlohmann::json::parse(longest->body)["error"]["message"] == "unknown management group");
+    CHECK(h.audit_log.size() == 2);
+
+    auto ok = h.sink.Get(std::string(kUsageRoute) + "?window=all&slice=group&group=" + *gid,
+                         h.status_route_headers());
+    REQUIRE(ok);
+    REQUIRE(ok->status == 200);
+    const auto d = nlohmann::json::parse(ok->body)["data"];
+    CHECK(d["slice"]["kind"] == "group");
+    CHECK(d["slice"]["key"] == *gid);
+    // WS-1 is in the group (cell 0), WS-2 is not (the residual cell).
+    int in_group = 0;
+    for (const auto& dev : h.last_usage_query.devices)
+        in_group += dev.cell == 0 ? 1 : 0;
+    CHECK(in_group == 1);
+    REQUIRE(d["apps"][0]["cells"].size() == 1);
+    CHECK(d["apps"][0]["cells"][0]["kind"] == "named");
+    CHECK(d["apps"][0]["cells"][0]["label"] == *gid);
+}
+
+TEST_CASE("REST dex/apps/usage: every off-enum, out-of-range or out-of-slice parameter is a 400",
+          "[pg][rest][dex][apps][usage]") {
+    RestGsHarness h;
+    seed_usage_fixture(h);
+    const std::string too_long_group(257, 'g');
+    const std::string too_long_key(65, 'k');
+    for (const std::string& q : {
+             std::string("window=bogus"), std::string("window="), std::string("platform=darwin"),
+             std::string("platform="), std::string("slice=bogus"), std::string("slice="),
+             std::string("floor=0"), std::string("floor=-3"), std::string("floor=10001"),
+             std::string("floor=abc"), std::string("floor="), std::string("floor=1.5"),
+             std::string("floor=5x"),
+             // A parameter outside its slice.
+             std::string("group=g1"), std::string("slice=platform&group=g1"),
+             std::string("tag_key=ring"), std::string("slice=group&group=g1&tag_key=ring"),
+             // The slice's own parameter is required, bounded and valid.
+             std::string("slice=group"), std::string("slice=group&group="),
+             std::string("slice=group&group=") + too_long_group,
+             // A group id that cannot name a group is refused here, before the audit row and the
+             // read (not a retryable 503 from the store): NUL, a newline, DEL, bytes that are not
+             // UTF-8 (a lone 0xFF, an overlong 0xC0 0x80, a truncated sequence).
+             std::string("slice=group&group=%00"), std::string("slice=group&group=a%00b"),
+             std::string("slice=group&group=a%0Ab"), std::string("slice=group&group=%7F"),
+             std::string("slice=group&group=%FF"), std::string("slice=group&group=%C0%80"),
+             std::string("slice=group&group=ab%C3"),
+             std::string("slice=tag&tag_key=bad$key"), std::string("slice=tag&tag_key=") + too_long_key,
+             std::string("slice=tag&tag_key=")}) {
+        CAPTURE(q);
+        auto res = h.sink.Get(std::string(kUsageRoute) + "?" + q, h.status_route_headers());
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(res->body.find("\"apps\"") == std::string::npos);
+    }
+    // Validation precedes the audit row and the read: nothing was admitted.
+    CHECK(h.audit_log.empty());
+    CHECK(h.usage_reads == 0);
+}
+
+TEST_CASE("REST dex/apps/usage: valid parameters reach the model", "[pg][rest][dex][apps][usage]") {
+    RestGsHarness h;
+    seed_usage_fixture(h);
+    // The fixture's crashes are old; this one is inside a 30-day window.
+    h.seed_obs("u3", "WS-1", "process.crashed", "fresh.exe", "windows",
+               yuzu::server::dex_iso_since(2));
+    auto res = h.sink.Get(std::string(kUsageRoute) + "?window=30d&platform=windows&slice=tag&tag_key=ring&floor=2",
+                          h.status_route_headers());
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    const auto d = nlohmann::json::parse(res->body)["data"];
+    CHECK(d["window"] == "30d");
+    CHECK(d["platform_scope"] == "windows");
+    CHECK(d["slice"]["kind"] == "tag");
+    CHECK(d["slice"]["key"] == "ring");
+    CHECK(d["floor"] == 2);
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].detail.find("slice=tag") != std::string::npos);
+    CHECK(h.audit_log[0].detail.find("key=ring") != std::string::npos);
+    CHECK(h.audit_log[0].detail.find("floor=2") != std::string::npos);
+    // A 30-day window on a 30-day retention is bounded, so the rate is reported: 7,200 run
+    // seconds over a 30-day basis is 2 process-hours, and the fixture's read holds 2 crashes.
+    REQUIRE(d["apps"].size() == 1);
+    CHECK(d["apps"][0]["subject"] == "fresh.exe");
+    CHECK(d["apps"][0]["rate_withheld"].is_null());
+    CHECK(d["apps"][0]["exposure_rate"]["crashes"] == 2);
+    CHECK(d["apps"][0]["exposure_rate"]["hours"].get<double>() == Catch::Approx(2.0));
+
+    // The documented maxima are accepted: floor 10000 and a 64-byte tag key.
+    auto top_floor = h.sink.Get(std::string(kUsageRoute) + "?window=all&floor=10000", h.status_route_headers());
+    REQUIRE(top_floor);
+    REQUIRE(top_floor->status == 200);
+    CHECK(nlohmann::json::parse(top_floor->body)["data"]["floor"] == 10000);
+    auto long_key = h.sink.Get(std::string(kUsageRoute) + "?window=all&slice=tag&tag_key=" + std::string(64, 'k'),
+                               h.status_route_headers());
+    REQUIRE(long_key);
+    REQUIRE(long_key->status == 200);
+    CHECK(nlohmann::json::parse(long_key->body)["data"]["slice"]["key"] == std::string(64, 'k'));
+    CHECK(h.audit_log.size() == 3);
 }
 
 TEST_CASE("REST dex/apps: the platform scope selects the population and the coverage",
