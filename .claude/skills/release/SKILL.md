@@ -317,10 +317,16 @@ if ! command -v cosign >/dev/null 2>&1; then
   echo "WARN: cosign not installed — Sigstore signature round-trip skipped"
   echo "     install: curl -sSL https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64 -o ~/.local/bin/cosign && chmod +x ~/.local/bin/cosign"
 fi
-GH_MAJOR=$(gh --version | awk 'NR==1{split($3,a,"."); print a[1]}')
-GH_MINOR=$(gh --version | awk 'NR==1{split($3,a,"."); print a[2]}')
-if [[ "$GH_MAJOR" -lt 2 || ( "$GH_MAJOR" -eq 2 && "$GH_MINOR" -lt 102 ) ]]; then
-  echo "WARN: gh $GH_MAJOR.$GH_MINOR cannot enforce the pinned attestation check (need 2.102.0+)"
+# Same version test as release-verification.md's script and build-agent-bundle.sh:
+# plain X.Y.Z at or above 2.102.0, anything else (missing, a dev build) fails it.
+GH_VERSION=$(gh --version 2>/dev/null | awk 'NR==1 {print $3}') || GH_VERSION=""
+GH_PINNED_OK=0
+if [[ "$GH_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+   && [[ "$(printf '%s\n' 2.102.0 "$GH_VERSION" | sort -V | head -1)" == 2.102.0 ]]; then
+  GH_PINNED_OK=1
+else
+  echo "WARN: gh ${GH_VERSION:-<not found>} is missing, not a release version, or older than 2.102.0:"
+  echo "     it cannot enforce --signer-workflow/--source-ref as written, so the attestation check below is SKIPPED"
   echo "     upgrade: curl -sSL https://github.com/cli/cli/releases/latest/download/gh_\$(gh api repos/cli/cli/releases/latest --jq .tag_name | sed s/v//)_linux_amd64.tar.gz -o /tmp/gh.tgz && tar xzf /tmp/gh.tgz -C /tmp && install -m755 /tmp/gh_*_linux_amd64/bin/gh ~/.local/bin/gh"
 fi
 
@@ -347,11 +353,15 @@ fi
 
 # gh attestation: verifies SLSA build provenance, pinned to release.yml at the tag
 # (--repo alone accepts an attestation from any workflow in the repository)
-if [[ "$GH_MAJOR" -gt 2 || ( "$GH_MAJOR" -eq 2 && "$GH_MINOR" -ge 102 ) ]]; then
+# Best-effort, like build-agent-bundle.sh: on an unsuitable gh it says so, and
+# provenance is then NOT verified (the customer page's script refuses instead).
+if [[ "$GH_PINNED_OK" -eq 1 ]]; then
   gh attestation verify yuzu-linux-x64.tar.gz --repo "$SIGNER_REPO" \
     --signer-workflow "$SIGNER_REPO/.github/workflows/release.yml" --source-ref refs/tags/vX.Y.Z
   gh attestation verify "oci://ghcr.io/$OWNER/yuzu-server:X.Y.Z" --repo "$SIGNER_REPO" \
     --signer-workflow "$SIGNER_REPO/.github/workflows/release.yml" --source-ref refs/tags/vX.Y.Z
+else
+  echo "SKIPPED: SLSA provenance NOT verified (gh ${GH_VERSION:-<not found>} cannot enforce the pins; need 2.102.0+)"
 fi
 ```
 

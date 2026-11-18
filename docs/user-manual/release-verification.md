@@ -1,9 +1,12 @@
 # Release Verification
 
-Every Yuzu release ships a verifiable supply-chain bundle: cryptographic
+Yuzu releases ship a verifiable supply-chain bundle: cryptographic
 signatures, SLSA build provenance, and Software Bill of Materials (SBOM)
-documents in both CycloneDX and SPDX formats. This page documents the
-commands an operator or procurement reviewer runs to verify each piece.
+documents in both CycloneDX and SPDX formats. Not every release, and not
+every asset of a release, carries every piece: older releases lack some of
+them, and provenance covers only the build outputs (section 4 says which).
+This page documents the commands an operator or procurement reviewer runs to
+verify each piece.
 
 All examples assume you have downloaded the release assets from
 <https://github.com/DevNullLtd/Yuzu/releases> into the current directory, and
@@ -47,7 +50,7 @@ release. `ghcr.io/tr3kkr/` is retained read-only for anything already pinned to
 it. Only the SIGNING IDENTITY is era-dependent, because it is fixed in the
 certificate at build time and cannot be restamped.
 
-## What ships with every release
+## What a release ships
 
 | Asset type | Files | Verified with |
 |------------|-------|---------------|
@@ -57,7 +60,7 @@ certificate at build time and cannot be restamped.
 | Cosign bundle | `SHA256SUMS.sigstore` (legacy filename `SHA256SUMS.bundle`: the only name on v0.7.x; v0.11.0-rc1 to v0.11.0 carry both) | Sigstore OIDC identity |
 | CycloneDX SBOMs | `yuzu-*.cdx.json`, including the images: `yuzu-{server,gateway,postgres}-image.cdx.json` and `yuzu-{server,gateway,agent}-chisel-image.cdx.json` | `cyclonedx validate` |
 | SPDX SBOMs | `yuzu-*.spdx.json`, including the same image set | `spdx-tools validate` |
-| SLSA provenance | `<artifact>.intoto.jsonl` per asset (also in GitHub's attestation registry) | `gh attestation verify` |
+| SLSA provenance | `<artifact>.intoto.jsonl` where present: the platform archives and native installers of v0.11.0-rc2 and later (the Docker images' provenance is in GitHub's attestation registry only; which releases the registry holds is in section 4) | `gh attestation verify` |
 | Docker images | `ghcr.io/${OWNER}/yuzu-{server,gateway,postgres}:<tag>` and `ghcr.io/${OWNER}/yuzu-{server,gateway,agent}-chisel:<tag>` | `cosign verify` |
 
 ## Prerequisites
@@ -145,10 +148,26 @@ docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/${OWNER}/yuzu-server:
 
 ## 4. Verify SLSA build provenance (GitHub attestations)
 
-Every binary archive, installer, and Docker image has a SLSA v1.0 build
-provenance attestation stored in GitHub's native attestation registry.
-The provenance records the exact workflow run, commit, builder, and
-inputs used to produce the artifact.
+Which assets have a SLSA v1.0 build provenance attestation depends on the
+release:
+
+| Releases | Attested assets | Where the attestation is |
+|---|---|---|
+| v0.14.0-rc2 and later (built as `DevNullLtd/Yuzu`) | every platform archive, native installer and Docker image | GitHub's attestation registry; the archives and installers also ship it as `<asset>.intoto.jsonl` |
+| v0.11.0-rc2 to v0.13.0 (built as `Tr3kkR/Yuzu`) | every platform archive and native installer (this page gives no way to verify these releases' Docker image provenance) | the `<asset>.intoto.jsonl` release asset. On 2026-11-18 GitHub's attestation API returned no attestation for the Linux archive of v0.11.0, v0.12.0 or v0.13.0, so verify these from the asset with `--bundle` (the offline procedure below) |
+| v0.11.0-rc1 and earlier | none | — |
+
+The worked example on this page, v0.11.0, is in the second row: add
+`--bundle <asset>.intoto.jsonl` to the commands below (for example
+`--bundle yuzu-linux-x64.tar.gz.intoto.jsonl`), having downloaded that asset
+with the archive.
+
+In no release are the SBOMs, `SHA256SUMS`, its `.sigstore` bundle or the
+Compose Wizard zip attested: the SBOMs and the wizard zip are covered by
+`SHA256SUMS` (section 1), and `SHA256SUMS` by its cosign signature
+(section 2). An asset with no attestation fails `gh attestation verify`; it
+never passes it. The provenance records the exact workflow run, commit,
+builder, and inputs used to produce the artifact.
 
 **Use gh 2.102.0 or later.** Every command below pins the attestation to
 `release.yml` at this release's tag with `--signer-workflow` and
@@ -194,10 +213,11 @@ gh attestation download yuzu-linux-x64.tar.gz --repo "${SIGNER_REPO}"
 gh attestation trusted-root > trusted_root.jsonl
 ```
 
-Some release assets also ship the same bundle as `<asset>.intoto.jsonl`; not
-every asset or release has one, so the download above is the general route.
-Copy the bundle and `trusted_root.jsonl` to the offline machine, then run the
-same pinned check against the local files:
+The platform archives and installers of v0.11.0-rc2 and later also ship the
+same bundle as `<asset>.intoto.jsonl` (the table above); for v0.11.0-rc2 to
+v0.13.0 that asset is the only source, so pass it as `--bundle` instead of
+downloading. Copy the bundle and `trusted_root.jsonl` to the offline machine,
+then run the same pinned check against the local files:
 
 ```bash
 gh attestation verify yuzu-linux-x64.tar.gz \
@@ -277,9 +297,11 @@ IDENTITY="https://github.com/${SIGNER_REPO}/.github/workflows/release.yml@refs/t
 OIDC_ISSUER="https://token.actions.githubusercontent.com"
 
 # The pinned attestation check below needs gh 2.102.0 or later (section 4).
+# A version that is not plain X.Y.Z (a development build) is refused too.
 GH_VERSION="$(gh --version | awk 'NR==1 {print $3}')"
-if [[ "$(printf '%s\n' 2.102.0 "$GH_VERSION" | sort -V | head -1)" != 2.102.0 ]]; then
-  echo "gh $GH_VERSION is older than 2.102.0; upgrade it first" >&2
+if [[ ! "$GH_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+   || [[ "$(printf '%s\n' 2.102.0 "$GH_VERSION" | sort -V | head -1)" != 2.102.0 ]]; then
+  echo "gh ${GH_VERSION:-(unknown)} is not a release at or above 2.102.0; install 2.102.0 or later first" >&2
   exit 1
 fi
 
@@ -305,7 +327,11 @@ done
 echo "→ gh attestation verify (binary archives)"
 for f in yuzu-linux-x64.tar.gz yuzu-gateway-linux-x64.tar.gz; do
   [[ -f "$f" ]] || continue
-  gh attestation verify "$f" --repo "${SIGNER_REPO}" \
+  # Use the shipped <asset>.intoto.jsonl when it was downloaded too: for
+  # v0.11.0-rc2 to v0.13.0 it is the only source (section 4).
+  bundle=()
+  [[ -f "$f.intoto.jsonl" ]] && bundle=(--bundle "$f.intoto.jsonl")
+  gh attestation verify "$f" ${bundle[@]+"${bundle[@]}"} --repo "${SIGNER_REPO}" \
     --signer-workflow "${SIGNER_REPO}/.github/workflows/release.yml" \
     --source-ref "refs/tags/${TAG}"
 done
@@ -318,12 +344,21 @@ echo "✓ all checks passed for v${VERSION}"
 | Framework / ask | Covered by |
 |-----------------|------------|
 | SOC 2 CC6.8 (integrity of software) | cosign image + blob signatures |
-| SOC 2 CC7.1 (change management traceability) | SLSA provenance attestation |
+| SOC 2 CC7.1 (change management traceability) | SLSA provenance attestation, for the attested assets and releases only (section 4) |
 | NIST SSDF PW.5 (archive / protect) | SHA256SUMS + signed manifest |
-| NIST SSDF PS.3 (provide provenance) | SLSA v1.0 attestation |
+| NIST SSDF PS.3 (provide provenance) | SLSA v1.0 attestation (roughly SLSA Build level 2, not 3), for the attested assets and releases only (section 4) |
 | Executive Order 14028 (SBOM for federal sales) | CycloneDX + SPDX SBOMs per artifact |
 | ISO/IEC 5962 (SPDX conformance) | SPDX 2.3 SBOMs |
-| EU CRA Annex V | Provenance + SBOM + signed artefact bundle |
+| EU CRA Annex V | Provenance + SBOM + signed artefact bundle (provenance as in section 4) |
+
+The table names the evidence each item points to; it is not a statement that
+a control is met. In particular, the provenance is roughly SLSA Build level 2,
+not level 3: release builds run on persistent self-hosted runners that also
+run CI and share its caches, the build steps run in the job that holds the
+signing identity, and no tag ruleset limits who can start a release
+([CI architecture](../ci-architecture.md#release-build-environment-and-provenance)).
+Releases before v0.11.0-rc2 carry no provenance, and the SBOMs, `SHA256SUMS`
+and the Compose Wizard zip are never attested.
 
 ## Troubleshooting
 

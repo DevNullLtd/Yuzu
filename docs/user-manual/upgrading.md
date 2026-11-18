@@ -11,6 +11,12 @@ A statement elsewhere on this page that a rollback, a mixed fleet or an in-place
 
 Running `dev` between releases? Some entries below describe changes on `dev` that are not in a release yet. For what a `git pull` of `dev` changed, run the repository script `python3 scripts/whats-new.py` (`--versions` for the version bumps, rebuild notes and Docker image bumps); see `changelog.d/README.md`.
 
+## Behaviour change: verifying a release's provenance needs GitHub CLI 2.102.0 or later
+
+**What changed.** The `gh attestation verify` commands on [Release Verification](release-verification.md) now pin the attestation to `release.yml` at the release's tag (`--signer-workflow`, `--source-ref`). GitHub CLI versions before 2.102.0 do not enforce those flags as written, so the page now requires `gh` 2.102.0 or later, and its end-to-end verification script exits 1, before checking anything, when `gh` is older or reports a version it cannot read.
+
+**What to do.** Before verifying a downloaded release, check `gh --version` on the machine that runs the check and install 2.102.0 or later if needed (the page's Prerequisites section links GitHub's own packages). This concerns only the tool you verify downloads with. It changes nothing about how a Yuzu build is deployed and is not an upgrade path for any Yuzu component; the deployment contract on this page still governs that.
+
 ## ⚠️ Breaking: on-demand software sync asks for confirmation, is paced instead of capped at 500 devices, and cools down per group
 
 **In short.** Affected: anything that calls `POST /api/v1/hardware/sync` or the MCP tool `sync_hardware_software` for a whole group or the whole fleet (the Software page's **Whole fleet** choice, scripts and agentic workers). To do: send `"confirm": true` with a `group:<id>` or `__all__` scope, give the caller the global `ManagementGroup:Write` grant if it names the whole fleet, and stop relying on the 500-device refusal and the 60-second per-operator gap.

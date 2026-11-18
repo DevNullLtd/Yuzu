@@ -23,3 +23,6 @@
   instead of the distribution's. The old offline example, which passed `-o`
   (an owner flag) as if it named an output file and omitted `--repo`, is
   replaced.
+  **If you verify releases:** use GitHub CLI 2.102.0 or later. The page's
+  end-to-end verification script now exits 1 on an older or unrecognised
+  `gh` version instead of running the attestation check.

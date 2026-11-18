@@ -1239,8 +1239,11 @@ Actions cache service.
 
 - Every build job runs `actions/attest-build-provenance` on its own artifacts,
   inside the same job as the build steps, with `id-token: write` granted to
-  the whole job. Each release asset also gets its provenance bundle as
-  `<asset>.intoto.jsonl`.
+  the whole job. The attested assets are the platform archives, the native
+  installers and the images; each attested archive and installer also ships
+  its provenance bundle as `<asset>.intoto.jsonl`. The SBOMs, `SHA256SUMS`
+  and the Compose Wizard zip are not attested; the signed `SHA256SUMS`
+  covers the SBOMs and the zip.
 - Every published image is cosign-signed keyless by digest and attested
   (`push-to-registry: true`). BuildKit's own provenance is turned off
   (`provenance: false`) in favour of those.

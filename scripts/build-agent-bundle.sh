@@ -365,7 +365,7 @@ fi
 GH_VERSION="$(gh --version 2>/dev/null | awk 'NR==1 {print $3}')" || GH_VERSION=""
 if [[ ! "$GH_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
    || [ "$(printf '%s\n' 2.102.0 "$GH_VERSION" | sort -V | head -1)" != 2.102.0 ]; then
-  warn "gh ${GH_VERSION:-<unknown>} is older than 2.102.0; provenance attestation not checked — continuing on SHA256 only"
+  warn "gh ${GH_VERSION:-<not found>} is missing, not a release version, or older than 2.102.0; provenance attestation not checked — continuing on SHA256 only"
 elif gh attestation verify "$DL/yuzu-linux-x64.tar.gz" --repo "$SIGNER_REPO" \
        --signer-workflow "$SIGNER_REPO/.github/workflows/release.yml" \
        --source-ref "refs/tags/$TAG" >/dev/null 2>&1; then
