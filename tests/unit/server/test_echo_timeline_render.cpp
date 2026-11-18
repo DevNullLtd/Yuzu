@@ -595,7 +595,7 @@ TEST_CASE("echo timeline ruler: one window per tick step, exact labels, UTC name
         const auto html = render_timeline_lanes(m);
         CHECK(count_of(html, "Time (UTC)") == 1);
         const auto labels = ruler_labels(html);
-        CHECK(labels.size() == r.ticks);
+        CHECK(labels.size() == r.ticks); // echo-test-ok: the loop below bounds i by labels.size()
         for (std::size_t i = 0; i < r.first.size() && i < labels.size(); ++i)
             CHECK(labels[i] == r.first[i]);
     }

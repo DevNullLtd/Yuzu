@@ -42,7 +42,8 @@
         {
           "name": "drogon",
           "default-features": false
-        }
+        },
+        "libxlsxwriter"
       ]
     },
     "agent": {

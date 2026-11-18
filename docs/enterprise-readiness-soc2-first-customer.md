@@ -1112,6 +1112,30 @@ macOS leg now installs Erlang/OTP 28, and every CI leg that runs `meson test` (c
 configure, that the gateway tests were registered (`scripts/ci/assert-gateway-tests.py`),
 so a runner missing the gateway toolchain fails instead of passing without the gateway.
 
+**Accepted risks — the merge rulesets' review rule (CC8.1), 2026-11-18.**
+The only accepted route around the review rule is the OrganizationAdmin bypass on Protect
+Dev and Protect Main, a deliberate break-glass route whose use is visible in the audit log.
+It was accepted by fjarvis (project owner) on 2026-11-18 and is to be reviewed by
+2027-05-18, tracked in #8228. On the same date fjarvis (project owner) left "Require review
+from Code Owners" off in both rulesets (`require_code_owner_review: false`): the
+supply-chain CODEOWNERS entries proposed in #8243 (owners `@fjarvis` and `@Tr3kkR`) will
+request review once that pull request is merged, but will not require it, and both owners
+can bypass the rulesets as organisation admins. This is to be reviewed by 2027-05-18,
+tracked in #8228.
+
+Until the owner completes the `cla` environment setup ([Dependency updates](dependency-updates.md),
+"The cla environment"), `CLA_REPO_ACCESS_TOKEN` is still a repository secret that a workflow on
+any branch can read, and so a second route around the review rule. A merge that used it
+cannot be told apart in the audit log from the token owner's own actions, so for that
+period review records are evidence of review only for merges the token's owner did not
+approve. This interim state is tracked in #8228 and ends when the repository copy is
+deleted.
+
+A pull request merged through the bypass is not covered by the rulesets' review
+requirement, so the PR review records cited above are evidence of review only for merges
+that did not use it ([Dependency updates](dependency-updates.md), "Self-hosted CI is held
+until a maintainer approves the head").
+
 ---
 
 ## 3.7 Workstream G — Customer Assurance Package (Enterprise Sales Enablement)
@@ -1128,6 +1152,7 @@ so a runner missing the gateway toolchain fails instead of passing without the g
 - Forward pointer: the plugin README standard (`docs/plugin-readme-standard.md`) makes each agent plugin self-describing as data — its per-OS mechanism, the privilege it runs at with a measured date, its securable/operation/risk tier, output columns and where the rows land — served at `GET /api/v1/discover/plugin-docs` and the `yuzu://plugin-docs` resource. Cite it as the per-plugin answer to "what does the agent collect, at what privilege" (the `Sensitivity is plugin-dependent` rows above point here for the plugins that have adopted it); state the coverage honestly — two pilots today, the remaining plugins in the retrospective sweep, held by a README-existence ratchet in the `docs` test suite.
 - Known-limitations disclosure (#3481, gov Gate 6 enterprise-readiness, 2026-08-24): two tracked, filed, non-blocking `ProductPackStore` residuals worth surfacing in a technical security/reliability review rather than presenting only as public GH issues — #3523 (two concurrent installs of an identical product-pack bundle can cross-couple a `Policy` to an unrelated pack's `Fragment`; no attacker required, an automation/GitOps race is sufficient) and #3524 (a large duplicate-item-id bundle drives an unbounded, synchronous compensation pass over sibling-store locks — a `ProductPack:Write`-privileged-caller resource-exhaustion question a CAIQ-style review would reasonably ask). Both are data-integrity/availability class, not credential/RCE; neither derived BLOCKING under this repo's severity schema.
 - Known-limitations disclosure (#4966): the last-Administrator guard is a recovery rule, not proof of sign-in and not an HA claim; SSO-only administrators are not counted until #5182, direct SQL is outside it, a rolling upgrade or rollback drops it, and the SCIM Group role recompute has documented limits with no shipped alert rules (tracked in #5673). State these alongside the control in the questionnaire/whitepaper rather than presenting the guard as absolute.
+- Known-limitations disclosure (#8158): gateway-to-gateway Erlang distribution (the multi-node cluster channel) is plain TCP outside the PKI. A shared cookie authenticates the connect-time handshake only, so command and result traffic between gateway nodes (including plugin parameters) has no encryption or per-message integrity; the control is a trusted, firewalled cluster network plus a strong cookie (32 to 255 characters, checked before the VM starts). TLS distribution is tracked as #8158 (decision pending; owner: Fraser Jarvis; review by 2027-02-17). State this alongside the transport-encryption control in a questionnaire; do not describe inter-gateway traffic as encrypted.
 - Known-limitations disclosure (#5692): state these alongside the OIDC SSO control in a questionnaire.
   - Signing keys are fetched afresh for every sign-in and not cached, so a key the IdP has retired or revoked stops verifying at the next sign-in (#1901 UP-19); the cost is one JWKS request per sign-in and no sign-in while the JWKS endpoint is down; an IdP that rate-limits `jwks_uri` (429/5xx) fails that sign-in with no retry, and under `--auth-mode=sso-only` an outage locks out every operator without an armed break-glass account. A token naming a `kid` the key set lacks is refused; a token with no `kid` is checked against each usable signing key in turn (at most the first 16, in the order published). An RSA signing key whose modulus is under 2048 bits, or whose public exponent is below 3, even or over 32 bits, is skipped when the key set is parsed, so such a key cannot verify a token and an IdP that signs with one cannot sign anyone in; under `--auth-mode=sso-only` that locks out every operator without an armed break-glass account, and the skip is recorded in the server log only (no metric, no audit row; the failed sign-in itself is the generic `auth.oidc_login_failed` row). These checks are defence in depth against an IdP publishing a weak or degenerate key; they do not defend a tampered or hostile JWKS, whose publisher can serve a key of their own that passes them, and no setting lowers them. JWKS fetches are not single-flight (a burst makes N parallel fetches; #1900, #5983).
   - A discovery failure at `/auth/oidc/start` is logged only: no audit row and no counter (#5704). A callback's discovery or JWKS failure shares the generic failure row and counter.

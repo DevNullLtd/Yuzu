@@ -69,6 +69,13 @@ release artefacts. This section is maintained manually; see `vcpkg.json` and
   zlib .................................. Zlib
   SQLite ................................ Public Domain
   libpq (PostgreSQL client library) ..... PostgreSQL License (BSD-style)
+  libxlsxwriter (server) ................ BSD-2-Clause
+      Copyright 2014-2026, John McNamara. It carries FreeBSD's queue.h
+      (BSD-3-Clause) and tree.h (BSD-2-Clause), an MD5 implementation (public domain) and
+      tmpfileplus, which is
+      MPL-2.0 (Copyright (c) 2012-16 David Ireland): that one file is compiled in unmodified
+      and its source is available from the libxlsxwriter release the vcpkg port builds
+  minizip (libxlsxwriter dependency) .... Zlib
   OpenSSL ............................... Apache-2.0 / OpenSSL
   libxml2 ............................... MIT
   xmlsec ................................ X11 (MIT with a no-advertising clause)
@@ -92,6 +99,7 @@ release artefacts. This section is maintained manually; see `vcpkg.json` and
   tslib (bundled in ECharts) ............ 0BSD
       Copyright (c) Microsoft Corporation.
   CycloneDX JSON schemas (vendored) ..... Apache-2.0
+  SPDX 2.3 JSON schema (vendored, test) . CC-BY-3.0 (Copyright 2010-2022 Linux Foundation and its Contributors)
   Three.js r168 (vendored) .............. MIT
   Three.js OrbitControls (vendored) ..... MIT
   Cytoscape.js 3.33.3 (vendored) ........ MIT

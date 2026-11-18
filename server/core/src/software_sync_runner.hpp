@@ -109,7 +109,7 @@ struct Env {
 /// Where a run writes its audit rows. `note` is best-effort (refusals, failures, joins);
 /// `persist` is the fail-closed write BEFORE dispatch and returns false when the row was not
 /// stored. `persist_fleet_wide`, when bound, takes that write for a whole-fleet run instead (REST
-/// writes it under its own verb; the MCP lambdas leave it empty and keep one verb). Arguments:
+/// and MCP both bind it, to the verb software_estate.sync.fleet_wide). Arguments:
 /// result, target_type, target_id, detail.
 struct Audit {
     std::function<void(std::string_view, std::string_view, const std::string&, const std::string&)> note;

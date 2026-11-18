@@ -1369,7 +1369,7 @@ ProbeOutcome lookup_ipv4only_answers(int dns_timeout_ms,
 // learned set overflowed (see above): the caller must refuse. The cache mutex is never held across
 // the lookup (two concurrent lookups are harmless: their answers are merged).
 std::optional<std::vector<::yuzu::server::oidc::egress::Nat64Prefix>>
-discovered_nat64_prefixes(int dns_timeout_ms) {
+discovered_nat64_prefixes(int dns_timeout_ms, bool* probe_not_started = nullptr) {
     namespace egress = ::yuzu::server::oidc::egress;
     auto& cache = nat64_discovery_cache();
     {
@@ -1385,6 +1385,8 @@ discovered_nat64_prefixes(int dns_timeout_ms) {
     if (outcome == ProbeOutcome::kBusy) {
         // Not started: no negative window, so the next IPv6 fetch probes again. Learned prefixes
         // and an earlier overflow stay as they are.
+        if (probe_not_started != nullptr)
+            *probe_not_started = true;
         spdlog::log(oidc_resolver_log_throttle().should_warn("oidc_nat64_probe_busy")
                         ? spdlog::level::warn
                         : spdlog::level::debug,
@@ -1478,12 +1480,56 @@ vet_egress_target(const std::string& host, bool allow_private, bool cleartext, i
     // refused and the whole target fails with the distinct overflow reason below.
     std::optional<std::vector<egress::Nat64Prefix>> active_prefixes;
     bool nat64_overflow = false;
+    bool probe_not_started = false;      // the ipv4only.arpa lookup was refused before it started
+    int busy_local_use_refusals = 0; // local-use addresses refused only because of that
+    int refusals = 0;                // every refused address of the answer
+    // A refusal that a started prefix lookup might have avoided is reported as the lookup-busy
+    // reason, which discovery does not remember (ensure_discovered), never as a policy refusal;
+    // only when every refused address was such a local-use address, so a genuine policy refusal
+    // in the same answer keeps its own reason.
+    const auto only_busy_refusals = [&] {
+        return busy_local_use_refusals > 0 && busy_local_use_refusals == refusals;
+    };
+    const auto refuse_busy = [&]() -> std::unexpected<const char*> {
+        spdlog::warn("OIDC egress: refused host '{}': a local-use NAT64 address could not be "
+                     "checked because the NAT64 prefix lookup was not started; retried on the "
+                     "next fetch",
+                     ::yuzu::log_key_token(host));
+        return std::unexpected(kEgressLookupBusyReason);
+    };
     const auto classify_v6 = [&](const egress::Ipv6& bytes) {
+        // Plain http to a SIIT or IPv4-compatible form of a public address is plain http to that
+        // public address once translated: refused by the cleartext rule, like the address itself.
+        if (cleartext && egress::embeds_public_ipv4(bytes))
+            return egress::AddressClass::Public;
+        // A local-use NAT64 address (64:ff9b:1::/48) cannot be decoded without a prefix that covers
+        // it, so the destination behind it cannot be checked: refused whatever the switch says,
+        // rather than admitted as plain non-global IPv6. Logged with its own remedy, so the refusal
+        // never advises a switch that would not help.
+        const auto uncovered_local_use = [&](std::span<const egress::Nat64Prefix> known,
+                                             const char* which) {
+            if (!egress::in_local_use_nat64(bytes) ||
+                std::any_of(known.begin(), known.end(),
+                            [&](const egress::Nat64Prefix& p) {
+                                return egress::matches(bytes, p);
+                            }))
+                return false;
+            spdlog::warn("OIDC egress: refused host '{}': a local-use NAT64 address "
+                         "(64:ff9b:1::/48) that no {} prefix covers (never allowed; set "
+                         "--oidc-nat64-prefix to the translator's exact prefix and length)",
+                         ::yuzu::log_key_token(host), which);
+            return true;
+        };
         const auto cls = egress::classify_ipv6(bytes, nat64_prefixes);
-        if (egress::decision(cls, allow_private, cleartext) != egress::Verdict::Allow)
+        if (egress::decision(cls, allow_private, cleartext) != egress::Verdict::Allow) {
+            // Learned prefixes are not consulted for an address already refused, so only the
+            // configured ones can cover it here.
+            if (uncovered_local_use(nat64_prefixes, "configured"))
+                return egress::AddressClass::Reserved;
             return cls;
+        }
         if (!active_prefixes) {
-            const auto learned_set = discovered_nat64_prefixes(dns_timeout_ms);
+            const auto learned_set = discovered_nat64_prefixes(dns_timeout_ms, &probe_not_started);
             if (!learned_set) {
                 nat64_overflow = true;
                 return egress::AddressClass::Reserved;
@@ -1493,6 +1539,13 @@ vet_egress_target(const std::string& host, bool allow_private, bool cleartext, i
                 if (std::find(active_prefixes->begin(), active_prefixes->end(), learned) ==
                     active_prefixes->end())
                     active_prefixes->push_back(learned);
+        }
+        if (uncovered_local_use(*active_prefixes, "configured or learned")) {
+            // Refused only because the prefix lookup could not even start: the next fetch may learn
+            // the prefix, so the refusal must not be remembered as a policy answer (below).
+            if (probe_not_started)
+                ++busy_local_use_refusals;
+            return egress::AddressClass::Reserved;
         }
         return egress::classify_ipv6(bytes, *active_prefixes);
     };
@@ -1514,7 +1567,7 @@ vet_egress_target(const std::string& host, bool allow_private, bool cleartext, i
         if (nat64_overflow)
             return refuse_overflow();
         if (egress::decision(*literal, allow_private, cleartext) != egress::Verdict::Allow)
-            return refuse(*literal);
+            return busy_local_use_refusals > 0 ? refuse_busy() : refuse(*literal);
         return std::vector<std::string>{};
     }
 
@@ -1525,8 +1578,10 @@ vet_egress_target(const std::string& host, bool allow_private, bool cleartext, i
             if (pins.size() < kMaxPinnedAddresses &&
                 std::find(pins.begin(), pins.end(), text) == pins.end())
                 pins.emplace_back(text);
-        } else if (!first_refused) {
-            first_refused = cls;
+        } else {
+            ++refusals;
+            if (!first_refused)
+                first_refused = cls;
         }
     };
 
@@ -1573,11 +1628,11 @@ vet_egress_target(const std::string& host, bool allow_private, bool cleartext, i
     if (nat64_overflow)
         return refuse_overflow();
     if (require_all_permitted && first_refused)
-        return refuse(*first_refused);
+        return only_busy_refusals() ? refuse_busy() : refuse(*first_refused);
     if (!pins.empty())
         return pins;
     if (first_refused)
-        return refuse(*first_refused);
+        return only_busy_refusals() ? refuse_busy() : refuse(*first_refused);
     return std::unexpected(kEgressUnresolvedReason);
 }
 
@@ -2966,9 +3021,24 @@ OidcProvider::OidcProvider(OidcConfig config) : config_(std::move(config)) {
     // Posture warnings about the configured issuer, once per construction, folded.
     namespace egress = ::yuzu::server::oidc::egress;
     if (const auto url = split_http_url(config_.issuer)) {
-        const auto literal = egress::classify_literal(url->host, config_.nat64_prefixes);
+        auto literal = egress::classify_literal(url->host, config_.nat64_prefixes);
         // The scheme matters: plain http to a public address is refused whatever the switch says.
         const bool cleartext = url->cleartext;
+        // The two runtime rules the class alone does not carry (vet_egress_target): plain http to
+        // a SIIT/IPv4-compatible form of a public address is plain http to a public address, and
+        // a local-use NAT64 address no configured prefix covers is never allowed.
+        if (const auto v6 = url->host.find(':') != std::string::npos
+                                ? egress::parse_ipv6(url->host)
+                                : std::nullopt) {
+            if (cleartext && egress::embeds_public_ipv4(*v6))
+                literal = egress::AddressClass::Public;
+            else if (egress::in_local_use_nat64(*v6) &&
+                     std::none_of(config_.nat64_prefixes.begin(), config_.nat64_prefixes.end(),
+                                  [&](const egress::Nat64Prefix& p) {
+                                      return egress::matches(*v6, p);
+                                  }))
+                literal = egress::AddressClass::Reserved;
+        }
         if (literal && egress::decision(*literal, config_.allow_private_networks, cleartext) !=
                            egress::Verdict::Allow) {
             const bool flag_helps =
