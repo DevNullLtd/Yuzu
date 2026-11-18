@@ -1246,28 +1246,39 @@ PolicyStore::mark_blocked(const std::string& policy_id, const std::vector<std::s
                                "database unavailable, try again");
 
     // Unfenced (a refused CHECK): the UPSERT, because the first refusal for an agent may be
-    // its first row. A row is written only when it is absent, not yet blocked, or its
-    // check_result differs; RETURNING gives the changed rows. IS DISTINCT FROM so a NULL
-    // cannot hide a change. Fenced (a refused fix or verify while the claim is held): an
-    // UPDATE guarded on the claim generation, never an INSERT, so a sibling's reclaim is not
-    // overwritten; the CTE reports how many targets matched the fence at all.
+    // its first row. Every target row is written, so last_check_at is refreshed on each
+    // refusal: a refusal that still applies never ages out of the fleet figure, while a row
+    // nothing marks again decays like any other status (B6). "Changed" is counted separately,
+    // from the row as it was before the write: absent, not yet blocked, or a different
+    // check_result. The "old" read takes no row lock: the upsert locks the rows itself, and a
+    // FOR UPDATE here would skip rows the same statement then updates. IS DISTINCT FROM so a
+    // NULL cannot hide a change. Fenced (a refused fix or
+    // verify while the claim is held): an UPDATE guarded on the claim generation, never an
+    // INSERT, so a sibling's reclaim is not overwritten; it refreshes only the rows that still
+    // match the fence, and the first count reports how many targets matched it at all.
     const std::string unfenced_sql =
-        "INSERT INTO policy_store.policy_status "
-        "(policy_id, agent_id, status, last_check_at, last_fix_at, check_result, "
-        " fix_attempt_count) "
-        "SELECT DISTINCT $1::text, x, 'blocked', EXTRACT(EPOCH FROM NOW())::bigint, 0::bigint, "
-        "                $3::text, 0 "
-        "FROM unnest($2::text[]) AS x "
-        "ON CONFLICT (policy_id, agent_id) DO UPDATE SET "
-        "  status = 'blocked', "
-        "  last_check_at = EXCLUDED.last_check_at, "
-        "  check_result = EXCLUDED.check_result "
-        "  WHERE policy_status.status IS DISTINCT FROM 'blocked' "
-        "     OR policy_status.check_result IS DISTINCT FROM EXCLUDED.check_result "
-        "RETURNING agent_id";
+        "WITH old AS ("
+        "  SELECT agent_id, status, check_result FROM policy_store.policy_status "
+        "  WHERE policy_id = $1 AND agent_id = ANY($2::text[])), "
+        "up AS ("
+        "  INSERT INTO policy_store.policy_status "
+        "  (policy_id, agent_id, status, last_check_at, last_fix_at, check_result, "
+        "   fix_attempt_count) "
+        "  SELECT DISTINCT $1::text, x, 'blocked', EXTRACT(EPOCH FROM NOW())::bigint, 0::bigint, "
+        "                  $3::text, 0 "
+        "  FROM unnest($2::text[]) AS x "
+        "  ON CONFLICT (policy_id, agent_id) DO UPDATE SET "
+        "    status = 'blocked', "
+        "    last_check_at = EXCLUDED.last_check_at, "
+        "    check_result = EXCLUDED.check_result "
+        "  RETURNING agent_id) "
+        "SELECT COUNT(*) FROM up LEFT JOIN old ON old.agent_id = up.agent_id "
+        "WHERE old.agent_id IS NULL "
+        "   OR old.status IS DISTINCT FROM 'blocked' "
+        "   OR old.check_result IS DISTINCT FROM $3::text";
     const std::string fenced_sql =
         "WITH matched AS ("
-        "  SELECT agent_id FROM policy_store.policy_status "
+        "  SELECT agent_id, status, check_result FROM policy_store.policy_status "
         "  WHERE policy_id = $1 AND agent_id = ANY($2::text[]) "
         "    AND remediation_claim_gen = $4::bigint "
         "  FOR UPDATE), "
@@ -1278,10 +1289,10 @@ PolicyStore::mark_blocked(const std::string& policy_id, const std::vector<std::s
         "    check_result = $3::text "
         "  FROM matched m "
         "  WHERE ps.policy_id = $1 AND ps.agent_id = m.agent_id "
-        "    AND (ps.status IS DISTINCT FROM 'blocked' "
-        "         OR ps.check_result IS DISTINCT FROM $3::text) "
-        "  RETURNING ps.agent_id) "
-        "SELECT (SELECT COUNT(*) FROM matched), (SELECT COUNT(*) FROM upd)";
+        "  RETURNING (m.status IS DISTINCT FROM 'blocked' "
+        "             OR m.check_result IS DISTINCT FROM $3::text) AS changed) "
+        "SELECT (SELECT COUNT(*) FROM matched), "
+        "       (SELECT COUNT(*) FROM upd WHERE changed)";
 
     constexpr std::size_t kChunk = 500;
     MarkBlockedResult total;
@@ -1311,9 +1322,11 @@ PolicyStore::mark_blocked(const std::string& policy_id, const std::vector<std::s
             total.changed += to_i64(PQgetvalue(res.get(), 0, 1));
             total.fenced_out += static_cast<int64_t>(n) - matched;
         } else {
-            total.changed += static_cast<int64_t>(PQntuples(res.get()));
+            total.changed += to_i64(PQgetvalue(res.get(), 0, 0));
         }
     }
+    // Only a changed row moves the cached fleet figure at once. A refresh that changed nothing
+    // matters only to a row that had already aged out, and the figure's own 60 s TTL covers it.
     if (total.changed > 0)
         invalidate_fleet_compliance_cache();
     return total;

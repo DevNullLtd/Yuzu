@@ -188,7 +188,8 @@ public:
                         std::optional<int64_t> expected_gen = std::nullopt);
 
     /// What `mark_blocked` did. `changed` is the number of rows whose status or
-    /// `check_result` actually changed (zero when the same refusal is recorded again).
+    /// `check_result` actually changed (zero when the same refusal is recorded again, even
+    /// though its `last_check_at` is refreshed).
     /// `fenced_out` is the number of requested targets a FENCED call did not match because
     /// their claim generation no longer owns the row (a sibling reclaimed it); it is always
     /// zero for the unfenced check-phase write. The two are separate on purpose: "nothing
@@ -204,10 +205,13 @@ public:
     /// `blocked` (`update_agent_status` rejects it), so a fix or check outcome can never be
     /// recorded as one by accident.
     ///
-    /// Write on change: a row is written only when it is absent, is not yet `blocked`, or its
-    /// `check_result` differs from the new value, so a refusal that repeats every tick writes
-    /// nothing and `changed` is the number of rows that really changed (zero in a steady
-    /// state). `fix_attempt_count` and `last_fix_at` are never touched.
+    /// Change and refresh: `changed` counts the rows that really changed (absent, not yet
+    /// `blocked`, or a different `check_result`), so it is zero in a steady state and is what
+    /// the caller audits. Every target row is also written with a fresh `last_check_at`, so a
+    /// refusal that still applies never ages out of the 24 hour fleet figure, while a row that
+    /// nothing marks again (policy disabled, agent out of scope, agent gone) decays to
+    /// `unknown` like any other status. A fenced call refreshes only the rows that still match
+    /// its fence. `fix_attempt_count` and `last_fix_at` are never touched.
     ///
     /// `plugin` and `action` are stored as two fields, never joined (the identifier charset
     /// includes '.'), and only when `dispatch_pair_well_formed`: an over-length or off-charset
@@ -222,7 +226,7 @@ public:
     ///
     /// Ids are written in chunks of at most 500 and the counts summed. A later chunk failing
     /// returns an error; earlier chunks stay written, and a retry is idempotent. Invalidates
-    /// the fleet compliance cache when anything changed.
+    /// the fleet compliance cache when a row changed (a refresh alone does not).
     [[nodiscard]] std::expected<MarkBlockedResult, std::string>
     mark_blocked(const std::string& policy_id, const std::vector<std::string>& agent_ids,
                  std::string_view phase, std::string_view plugin, std::string_view action,
