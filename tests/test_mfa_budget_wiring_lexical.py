@@ -90,6 +90,10 @@ def check_gate_order(t):
         bad.append("the sso-only pre_verify_gate must run BEFORE the PBKDF2 slot is taken")
     if not stripe < gate:
         bad.append("the bounded stripe wait (try_lock_for) must come before the gate/slot")
+    pre = body[:stripe]
+    if "if (lockout_active)" not in pre[-400:]:
+        bad.append("the login stripe must be taken only when lockout_active (a lockout-exempt "
+                   "name such as break-glass must never take it)")
     if "login_lk.lock()" in body[:slot]:
         bad.append("the login stripe must use try_lock_for, never an unbounded lock()")
     return bad
@@ -160,6 +164,16 @@ def selftest(files):
             failures.append("MUTATION NOT DETECTED: unbounded stripe lock")
     else:
         failures.append("selftest cannot find the bounded stripe wait")
+    if "if (lockout_active) {\n        login_lk" in base or "if (lockout_active) { login_lk" in base:
+        pass
+    m = dict(files)
+    mutated = re.sub(r"if \(lockout_active\)\s*\{(\s*login_lk)", r"if (true) {\1", base, count=1)
+    if mutated != base:
+        m["auth_routes.cpp"] = mutated
+        if not check(m):
+            failures.append("MUTATION NOT DETECTED: stripe taken for lockout-exempt names")
+    else:
+        failures.append("selftest cannot find the lockout_active stripe condition")
     # A new caller elsewhere must be caught too.
     m = dict(files)
     m["rogue.cpp"] = "void f(){ db->mfa_verify_login_code(u, c); }"

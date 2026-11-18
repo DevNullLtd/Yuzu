@@ -30,6 +30,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <random>
 #include <shared_mutex>
 #include <string>
 #include <string_view>
@@ -231,7 +232,10 @@ public:
     /// Requests now waiting for a per-username login stripe (a gauge source; bounded by
     /// `kLoginStripeWait` each).
     int stripe_waiters() const { return stripe_waiters_.load(std::memory_order_relaxed); }
-    /// Test seam: the stripe a name maps to, so a test can hold it.
+    /// Test seams: the stripe a name maps to (so a test can hold it) and its index.
+    std::size_t login_stripe_index_for_test(const std::string& username) const {
+        return login_stripe_index(username);
+    }
     std::timed_mutex& login_lock_for_test(const std::string& username) {
         return login_lock_for(username);
     }
@@ -1252,6 +1256,11 @@ private:
     // locks, pinned the whole pool). `kLoginStripeWait` bounds it; a timeout is the 429 `kBusy`.
     std::array<std::timed_mutex, kLoginLockStripes> login_locks_;
     std::timed_mutex& login_lock_for(const std::string& username);
+    std::size_t login_stripe_index(const std::string& username) const;
+    /// Per-process random salt for the stripe index, so a name that collides onto a victim's
+    /// stripe cannot be computed offline.
+    std::string stripe_salt_{std::to_string((static_cast<std::uint64_t>(std::random_device{}()) << 32) ^
+                                            std::random_device{}())};
     std::atomic<int> stripe_waiters_{0};
     Pbkdf2Budget pbkdf2_budget_{static_cast<int>(
         std::max(2u, std::thread::hardware_concurrency() / 4))};

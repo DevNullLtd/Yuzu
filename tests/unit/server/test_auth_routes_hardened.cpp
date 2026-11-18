@@ -47,7 +47,9 @@
 
 #include <chrono>
 #include <filesystem>
+#include <future>
 #include <memory>
+#include <thread>
 #include <optional>
 #include <shared_mutex>
 #include <stdexcept>
@@ -396,4 +398,32 @@ TEST_CASE("sso-only: a saturated PBKDF2 budget does not tell the break-glass nam
         CHECK(res->status == 401);
         CHECK(res->get_header_value("Retry-After").empty());
     }
+}
+
+TEST_CASE("sso-only: the armed break-glass login is not denied by a flood of its own name (stripe skipped)",
+          "[pg][auth][hardened][routes][concurrency][stripe]") {
+    HardenedHarness h("sso-only", "admin");
+    h.enroll_mfa("admin");
+    h.arm("admin");
+    h.cfg.auth_lockout_threshold = 5;
+    // A same-name flood (or a name colliding onto admin's stripe) keeps the stripe held. The
+    // break-glass account keeps no lockout counter, so it never takes the stripe.
+    auto& stripe = h.auth_routes->login_lock_for_test("admin");
+    stripe.lock();
+    int status = 0;
+    std::promise<void> done;
+    auto finished = done.get_future();
+    std::thread t([&] {
+        auto res = h.sink.Post("/login",
+                               form({{"username", "admin"}, {"password", "adminpassword1"}}),
+                               kFormCt);
+        status = res ? res->status : -1;
+        done.set_value();
+    });
+    const bool in_time = finished.wait_for(std::chrono::milliseconds(700)) ==
+                         std::future_status::ready;
+    stripe.unlock();
+    t.join();
+    CHECK(in_time);
+    CHECK(status == 202); // the MFA challenge, never the stripe-timeout 429 (mutation: RED)
 }

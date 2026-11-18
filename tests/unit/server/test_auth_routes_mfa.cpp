@@ -3394,4 +3394,20 @@ TEST_CASE("live pool of 10: a flood of one unknown name cannot pin the workers",
     INFO("healthz " << health_ms.count() << " ms, other login " << other_ms.count() << " ms");
 }
 
+
+TEST_CASE("the login stripe index is salted per process, so a colliding name cannot be computed",
+          "[pg][mfa][routes][auth_routes][stripe]") {
+    AuthRoutesHarness h;
+    // An unsalted index is std::hash(name) % 256 for every name; the per-process salt makes the
+    // mapping differ from it for essentially every name (mutation: drop the salt -> all equal).
+    int differing = 0;
+    for (int i = 0; i < 64; ++i) {
+        const std::string name = "stripe-probe-" + std::to_string(i);
+        if (h.auth_routes->login_stripe_index_for_test(name) !=
+            std::hash<std::string>{}(name) % 256)
+            ++differing;
+    }
+    CHECK(differing >= 56); // 64 names, 1/256 chance each of an accidental match
+}
+
 #endif // !_WIN32

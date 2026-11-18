@@ -2140,10 +2140,14 @@ void AuthRoutes::emit_event(const std::string& event_type, const httplib::Reques
 }
 
 // Pick the striped login mutex for a username (account-lockout race close).
-// Any hash is fine — same-stripe collisions across distinct usernames just
-// serialize harmlessly. See the header for the full rationale.
+// Same-stripe collisions across distinct usernames serialize harmlessly, but an attacker who can
+// COMPUTE a collision could keep a victim's stripe hot through another name, so the index is
+// salted with a per-process random value (stripe_salt_) that never leaves the process.
+std::size_t AuthRoutes::login_stripe_index(const std::string& username) const {
+    return std::hash<std::string>{}(stripe_salt_ + username) % login_locks_.size();
+}
 std::timed_mutex& AuthRoutes::login_lock_for(const std::string& username) {
-    return login_locks_[std::hash<std::string>{}(username) % login_locks_.size()];
+    return login_locks_[login_stripe_index(username)];
 }
 
 // ---------------------------------------------------------------------------
@@ -2164,19 +2168,22 @@ PasswordCheckResult AuthRoutes::verify_password_with_lockout(const std::string& 
     // lockout-critical section below (pre-check → verify_password →
     // record/clear), so a synchronized burst cannot all pass the stale
     // pre-check and verify more than `threshold` passwords before the lock
-    // arms (adversarial C1). Held only when lockout is enabled, and released
-    // when this function returns — before the caller's MFA branching, which
-    // does not touch lockout state. Striped per-username (login_lock_for) so
-    // unrelated usernames log in fully in parallel — only a burst against one
-    // account is serialized, which is the intended throttle. (Taken whenever
-    // the threshold is on, INCLUDING for a lockout-exempt break-glass attempt,
-    // exactly as the pre-extraction /login did.)
+    // arms (adversarial C1). Held only when lockout accounting applies to THIS attempt
+    // (threshold above 0 and the name is not lockout-exempt), and released when this function
+    // returns. The hash cannot move out of the stripe without a DB-atomic reservation of the
+    // attempt (the HA-correct follow-up noted at the stripe's declaration): the pre-check and the
+    // failure record must see each other. A lockout-exempt name (the break-glass account under
+    // sso-only) keeps NO lockout counter, so the stripe protects nothing for it and it never
+    // takes it: a flood of its name, or of a name that collides onto its stripe, cannot deny it.
+    // For an ordinary KNOWN name, hammering it with wrong passwords arms the lockout after
+    // `threshold` hashes, after which each request holds the stripe only for the cheap
+    // pre-check, so a targeted denial is bounded by the existing time-boxed lockout, not new.
     // The wait is BOUNDED (kLoginStripeWait): a waiter pins an httplib worker, and a flood of
-    // logins for ONE name (an unknown name never locks, so each holder spends a full PBKDF2)
-    // would otherwise queue unboundedly and starve the pool, invisibly to the slot budget. A
-    // timeout answers the existing 429 (kBusy), uniform for any name.
+    // logins for ONE unknown name (which never locks) would otherwise queue unboundedly and
+    // starve the pool, invisibly to the slot budget. A timeout answers the existing 429
+    // (kBusy), uniform for any name.
     std::unique_lock<std::timed_mutex> login_lk;
-    if (cfg_.auth_lockout_threshold > 0) {
+    if (lockout_active) {
         login_lk = std::unique_lock<std::timed_mutex>(login_lock_for(username), std::defer_lock);
         stripe_waiters_.fetch_add(1, std::memory_order_relaxed);
         const bool got = login_lk.try_lock_for(kLoginStripeWait);
