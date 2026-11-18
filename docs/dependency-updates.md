@@ -276,47 +276,62 @@ or may be truncated (GitHub lists at most 250 commits).
 These identities are the ones a pusher writes into their commits, so the check
 keeps an honest maintainer from approving their own push; it is not a defence
 against a maintainer who sets out to defeat it, who can run self-hosted CI
-from any branch of this repository anyway. Pushed with forged commit
-identities and then re-run from a reopened PR, a maintainer's own approval
-would pass this gate, but it does not count towards a merge: the `dev`
-ruleset requires the most recent push to be approved by someone other than
-its pusher, and GitHub does not let a PR's author approve it.
+from any branch of this repository anyway. That is the limit of what the
+gate guarantees: the self-hosted legs wait until an account other than the
+ones GitHub records on the head approves it, and the gate cannot tell whether
+that account belongs to an independent person.
 
-That merge rule is the real guarantee, and it holds only while no maintainer
-can push or approve as an account other than their own. The PR token is such
-an account: with it a maintainer could push a head as the token's owner and
-approve it themselves (this gate and the merge rule would both see the token's
-owner as the pusher), or approve their own pull request, any pull request and
-not only the bump PR, as the token's owner, and merge with no independent
-review. The guarantee therefore holds only while the token is stored in the
-`vcpkg-baseline` environment, which only `main` may use, so that only the
-reviewed workflow on `main` can read it (see "Where the token is stored"). As
-a repository secret it would be readable by a workflow pushed to any branch.
+Pushed with forged commit identities and then re-run from a reopened PR, a
+maintainer's own approval would pass this gate. It would not count towards a
+merge under the `dev` ruleset, which requires the most recent push to be
+approved by someone other than its pusher, and GitHub does not let a PR's
+author approve it. That merge rule is a review rule, not a backstop for the
+gate. It holds against an ordinary write collaborator, but not against:
+
+- an organisation admin, whom the rulesets let bypass it;
+- anyone who can use a repository-wide token to push or approve as the
+  token's owner, such as `CLA_REPO_ACCESS_TOKEN`: a classic `repo`-scope
+  personal access token (see `cla.yml`) kept as a repository secret, which a
+  workflow pushed to any branch can read. With such a token a maintainer could
+  push a head as the token's owner and approve it themselves (this gate and
+  the merge rule would both see the token's owner as the pusher), or approve
+  their own pull request, any pull request and not only the bump PR, as the
+  token's owner, and merge with no independent review.
+
+The PR token would be another such token if it were a repository secret,
+which is why it is stored in the `vcpkg-baseline` environment, which only
+`main` may use (see "Where the token is stored"). That closes the PR token's
+route only; the merge rule still does not hold against the two above.
 
 **If the bump PR cannot be approved.** The bump workflow's last step, "Check
 the bump PR can be approved", fails the run, and so opens or comments on the
 `vcpkg-baseline-broken` issue, when the PR it just created or updated could
 not pass the gate: a commit of the PR has an author or committer that GitHub
-links to no account, the PR's author is not the token's owner, or the commit
-the run pushed is not linked to the token's owner as both author and
-committer. The error names which. To recover:
+links to no account, the PR has 250 or more commits (more than GitHub lists),
+the PR's author is not the token's owner, or the commit the run pushed is not
+linked to the token's owner as both author and committer. The error names
+which.
 
-- an unlinked commit, or a PR opened by another account: close the PR (do not
-  reopen it), then run the workflow from `main` (Actions → vcpkg baseline
-  update → Run workflow, branch `main`). The new PR is opened by the token's
-  owner and its commit names them. Waiting for the next scheduled run works
-  too. A fix pushed to the bump branch by hand is overwritten by the next
-  bump either way;
-- the commit the run pushed is not linked to the token's owner: the token
-  owner's account cannot be linked from its no-reply address (check the
-  account still exists and is the one the token belongs to), or the step's
-  identity inputs were changed. Fix that first; closing the PR alone does
-  not help.
+**The recovery**, the one every error message, the workflow's comments and
+the alert issue point to: close the PR (do not reopen it), then run
+vcpkg-baseline-update.yml from `main` (Actions → vcpkg baseline update → Run
+workflow, branch `main`) or wait for the next scheduled run. The new PR is
+opened by the token's owner and its commit names them. It applies to an
+unlinked commit, a PR of 250 or more commits, and a PR opened by another
+account (including after the token moved to a new owner: see "Rotating to a
+different owner"). A fix pushed to the bump branch by hand is overwritten by
+the next bump either way.
+
+It does not apply when the commit the run pushed is not linked to the token's
+owner: the token owner's account cannot be linked from its no-reply address
+(check the account still exists and is the one the token belongs to), or the
+step's identity inputs were changed. Fix that first; closing the PR alone does
+not help.
 
 Before this change reached `main`, the bump commit named the account that last
 edited the cron line, so if that account was deleted every scheduled bump
 carried an unlinked author and closing the PR did not help. Once this change
-is on `main`, closing the PR and running the workflow from `main` recovers.
+is on `main`, the recovery above works.
 
 A later "Request changes" from that reviewer, or a dismissal, withdraws an
 approval. Any push to the branch, including next month's bump, makes a new
@@ -389,6 +404,13 @@ issue stays open.
   account must have signed the CLA or be on `cla.yml`'s `allowlist`, or the
   CLA check fails on every bump PR. Adding an account to the allowlist is the
   repository owner's decision; a dedicated bot account or App needs the same.
+  The bump workflow does not check this: with an uncovered token owner the
+  bump run stays green and opens no `vcpkg-baseline-broken` issue, while the
+  CLA check fails on every bump PR. Look on the bump PR itself: its checks
+  list shows the `CLA Assistant` workflow's `cla-check` job failing, and the
+  CLA bot comments on the PR asking the author to sign. Once the token's owner
+  has signed or been added to the allowlist, comment `recheck` on the PR to
+  re-run the check.
 - **Where the token is stored.** In the `vcpkg-baseline` environment, never
   as a repository secret. A repository secret can be read by a workflow pushed
   to any branch, and with this token a maintainer could approve their own pull
@@ -402,26 +424,32 @@ issue stays open.
   1. create the environment `vcpkg-baseline` (a run creates it on first use
      too, but then with no restrictions, so create it first);
   2. under "Deployment branches and tags" choose "Selected branches and tags"
-     and add the branch `main` only;
+     and add a rule of ref type Branch for `main` only (not a tag rule);
   3. add the secret `VCPKG_BASELINE_PR_TOKEN` under the environment's
      "Environment secrets", or `gh secret set VCPKG_BASELINE_PR_TOKEN --env
      vcpkg-baseline --repo DevNullLtd/Yuzu`;
-  4. make sure there is no repository secret of that name (`gh secret list
-     --repo DevNullLtd/Yuzu` must not list it; delete it with `gh secret
-     delete VCPKG_BASELINE_PR_TOKEN --repo DevNullLtd/Yuzu` if it does);
+  4. make sure there is no repository or organisation secret of that name.
+     `gh secret list --repo DevNullLtd/Yuzu` must not list it (delete it with
+     `gh secret delete VCPKG_BASELINE_PR_TOKEN --repo DevNullLtd/Yuzu` if it
+     does), and `gh api repos/DevNullLtd/Yuzu/actions/organization-secrets
+     --jq '.secrets[].name'`, the organisation secrets shared with this
+     repository, must not list it either (an organisation owner removes it);
   5. required reviewers are optional. With them, every run, the monthly one
      included, waits until a reviewer approves the deployment and fails if
      nobody does within 30 days.
 
-  The workflow cannot see whether these settings are in place: an
-  unrestricted environment, or the token stored as a repository secret, still
-  runs green. Check them with `gh api
+  The workflow does not check these settings, so an unrestricted environment,
+  or a repository or organisation copy of the token, still runs green. The
+  settings can be read through the API; check them after setting up or
+  changing the environment: `gh api
   repos/DevNullLtd/Yuzu/environments/vcpkg-baseline` (its
-  `deployment_branch_policy` must not be `null`) and `gh api
+  `deployment_branch_policy` must not be `null`), `gh api
   repos/DevNullLtd/Yuzu/environments/vcpkg-baseline/deployment-branch-policies`
-  (exactly one policy, `main`). Because only `main` may use the environment,
-  a `workflow_dispatch` of the workflow from any other branch fails at job
-  start and opens the `vcpkg-baseline-broken` issue.
+  (exactly one policy, with `"name": "main"` and `"type": "branch"`; a policy
+  of `"type": "tag"` named `main` would admit a tag of that name instead of
+  the branch), and the two secret listings in step 4. Because only `main` may
+  use the environment, a `workflow_dispatch` of the workflow from any other
+  branch fails at job start and opens the `vcpkg-baseline-broken` issue.
 - **Create or rotate.** Create the new token with the settings above, store it
   in the `vcpkg-baseline` environment as described in the previous bullet,
   run the workflow once with `workflow_dispatch` on `main` and confirm it
@@ -433,13 +461,15 @@ issue stays open.
   are short, or that still awaits an organization owner's approval, fails
   only at "Create pull request" (typically `git` exiting 1 or 128).
 - **Rotating to a different owner.** If the new token belongs to another
-  account than the old one and a bump PR is open, close that PR first, and do
-  not reopen it (unlike the 30-day re-run recovery above, which reopens a PR
-  nobody else has pushed to). Otherwise the next run that has a bump to push refuses at
+  account than the old one and a bump PR is open, apply the recovery under "If
+  the bump PR cannot be approved" first: close the PR (do not reopen it), then
+  run vcpkg-baseline-update.yml from `main` or wait for the next scheduled
+  run. The new PR is attributed to the new owner. (Unlike the 30-day re-run
+  recovery above, which reopens a PR nobody else has pushed to, this PR is not
+  reopened.) Otherwise the next run that has a bump to push refuses at
   "Refuse to push onto a bump PR another account opened" and opens a
   `vcpkg-baseline-broken` issue, rather than push a head onto the old owner's
-  PR that the new owner, not being its author, could then approve. After the
-  close, the next run opens a new PR attributed to the new owner. A rotation
+  PR that the new owner, not being its author, could then approve. A rotation
   that keeps the same owner needs none of this. The guard runs only in the
   copy of the workflow that runs: a scheduled run uses `main`'s copy, so it
   protects the schedule only once it is on `main`.

@@ -27,15 +27,21 @@ name: vcpkg baseline update
 # `alert` job files the issue. A run whose token belongs to another account
 # than the open bump PR's author (the token was rotated to a new owner while
 # the PR was open) refuses to push onto that PR, so the new owner never
-# pushes a head they could then approve: close the PR and the next run opens
-# a new one (docs/dependency-updates.md, "The PR token", rotation).
+# pushes a head they could then approve. Recovery: close the PR (do not
+# reopen it), then run vcpkg-baseline-update.yml from main or wait for the
+# next scheduled run (docs/dependency-updates.md, "If the bump PR cannot be
+# approved", which every error message and the alert issue point to).
 #
 # ENVIRONMENT. Only propose-bump uses the token, and it runs in the
 # `vcpkg-baseline` environment. The secret belongs in that environment, whose
 # deployment branches are limited to `main`, and NOT among the repository
 # secrets: a repository secret is readable by a workflow pushed to any branch,
 # and with it any maintainer could approve their own pull request as the
-# token's owner, which defeats the merge rulesets' independent approval. The
+# token's owner, one more way round the merge rulesets' review rule. That
+# rule does not hold against an organisation admin's ruleset bypass or the
+# repository secret CLA_REPO_ACCESS_TOKEN either, environment or not
+# (docs/dependency-updates.md, "Self-hosted CI is held until a maintainer
+# approves the head"). The
 # environment is an owner setting (docs/dependency-updates.md, "The PR
 # token", "Where the token is stored"); a dispatch of this workflow from any
 # branch but `main` therefore fails at job start. No other job, and no other
@@ -218,8 +224,10 @@ jobs:
       # another account than the open bump PR's author (rotated to a new owner
       # while the PR was open), pushing would put a head on that PR that its
       # pusher could approve, so the run refuses before the push and the alert
-      # issue opens. Close the PR (docs/dependency-updates.md, "The PR token");
-      # the next run opens a new PR attributed to the new owner. An API or
+      # issue opens. Recovery: close the PR (do not reopen it), then run
+      # vcpkg-baseline-update.yml from main or wait for the next scheduled run
+      # (docs/dependency-updates.md, "If the bump PR cannot be approved"); the
+      # new PR is attributed to the new owner. An API or
       # parse failure refuses too. A GitHub App installation token cannot read
       # /user: moving to an App identity needs this step changed first.
       #
@@ -263,7 +271,7 @@ jobs:
             exit 1
           fi
           if [[ -n "$others" ]]; then
-            echo "::error::The open bump PR $(echo "$others" | paste -sd' ' -) was opened by another account than the one that owns VCPKG_BASELINE_PR_TOKEN now. Pushing onto it would let the token's new owner approve their own push, so this run refuses. Close that PR (do not reopen it); the next run opens a new one (docs/dependency-updates.md, 'The PR token')."
+            echo "::error::The open bump PR $(echo "$others" | paste -sd' ' -) was opened by another account than the one that owns VCPKG_BASELINE_PR_TOKEN now. Pushing onto it would let the token's new owner approve their own push, so this run refuses. Recovery: close the PR (do not reopen it), then run vcpkg-baseline-update.yml from main or wait for the next scheduled run (docs/dependency-updates.md, 'If the bump PR cannot be approved')."
             exit 1
           fi
           echo "No open bump PR from $BUMP_BRANCH belongs to another account; the push may proceed."
@@ -375,8 +383,13 @@ jobs:
       # the PR's author is not the token's owner, when any commit of the PR
       # has an author or committer GitHub links to no account, or when this
       # run pushed a head whose author and committer are not linked to the
-      # token's owner. Reads only, with the PR token. The PR's commit list can
-      # lag a just-pushed head by a few seconds, so it is read up to six times.
+      # token's owner. Like ci.yml's gate, it also fails on a commit list of
+      # 250 or more, which GitHub may have truncated. Reads only, with the PR
+      # token. The PR's commit list can lag a just-pushed head by a few
+      # seconds, so it is read up to six times. It does not check that the
+      # token's owner is covered by the CLA: if not, this run stays green while
+      # the CLA check fails on the PR (docs/dependency-updates.md, "The PR
+      # token", CLA coverage).
       - name: Check the bump PR can be approved
         if: steps.check.outputs.changed == 'true'
         env:
@@ -398,7 +411,7 @@ jobs:
             refuse "Could not read bump PR #$PR_NUMBER (failing closed). Re-run once the API recovers."
           fi
           if [[ "${pr_author%% *}" != "$OWNER_ID" ]]; then
-            refuse "Bump PR #$PR_NUMBER was opened by '${pr_author#* }' (id '${pr_author%% *}'), not by the token's owner (id $OWNER_ID), so the gate would exclude the wrong account. Close the PR (do not reopen it); the next run opens a new one."
+            refuse "Bump PR #$PR_NUMBER was opened by '${pr_author#* }' (id '${pr_author%% *}'), not by the token's owner (id $OWNER_ID), so the gate would exclude the wrong account. Recovery: close the PR (do not reopen it), then run vcpkg-baseline-update.yml from main or wait for the next scheduled run."
           fi
           commit_check=""
           for attempt in 1 2 3 4 5 6; do
@@ -411,6 +424,7 @@ jobs:
                   if type != "array" or any(.[]; type != "array") then error("not a list of pages") else . end
                   | add // []
                   | if any(.[]; type != "object") then error("a commit is not an object")
+                    elif length >= 250 then "truncated"
                     elif all(.[]; .sha != $head) then "absent"
                     elif any(.[]; (linked("author") and linked("committer")) | not) then
                       "unlinked " + ([.[] | select((linked("author") and linked("committer")) | not)
@@ -425,8 +439,9 @@ jobs:
           done
           case "$commit_check" in
             ok) echo "Bump PR #$PR_NUMBER is the token owner's and every commit is linked to an account: another maintainer can approve it." ;;
+            truncated) refuse "Bump PR #$PR_NUMBER has 250 or more commits, more than GitHub lists, so the gate refuses every approval as possibly truncated. Recovery: close the PR (do not reopen it), then run vcpkg-baseline-update.yml from main or wait for the next scheduled run." ;;
             absent) refuse "Bump PR #$PR_NUMBER's commit list still does not contain head $HEAD_SHA after six reads (failing closed). Re-run; if it persists, check the PR." ;;
-            "unlinked "*) refuse "Commit(s) ${commit_check#unlinked } of bump PR #$PR_NUMBER have an author or committer that GitHub links to no account, so the gate refuses every approval. Close the PR, then run this workflow from main (workflow_dispatch): the new PR's commit names the token's owner. If the unlinked commit is the one this run just pushed, the token owner's no-reply address did not link: check that account." ;;
+            "unlinked "*) refuse "Commit(s) ${commit_check#unlinked } of bump PR #$PR_NUMBER have an author or committer that GitHub links to no account, so the gate refuses every approval. Recovery: close the PR (do not reopen it), then run vcpkg-baseline-update.yml from main or wait for the next scheduled run: the new PR's commit names the token's owner. If the unlinked commit is the one this run just pushed, the token owner's no-reply address did not link: check that account." ;;
             "foreign "*)
               if [[ "$PUSHED" == "true" ]]; then
                 refuse "The bump commit this run pushed at $HEAD_SHA is not linked to the token's owner (id $OWNER_ID) as both author and committer (${commit_check#foreign }). Check the token owner's account and the author/committer inputs of Create pull request."
@@ -473,12 +488,13 @@ jobs:
               `  read/write on this repository.`,
               `- "Refuse to push onto a bump PR another account opened": the rotation guard. Either`,
               `  GitHub could not say who owns the token (GET /user; re-run), or the open bump PR`,
-              `  was opened by another account than the token's owner: close that PR, do not`,
-              `  reopen it, and the next run opens a new one.`,
+              `  was opened by another account than the token's owner: use the recovery below.`,
               `- "Check the bump PR can be approved": a commit of the bump PR has an author or`,
-              `  committer GitHub links to no account, or the PR's author or this run's bump`,
-              `  commit is not the token's owner, so ci.yml's approval gate would refuse every`,
-              `  approval. The error names the cause and the fix.`,
+              `  committer GitHub links to no account, the PR has 250 or more commits, or the PR's`,
+              `  author or this run's bump commit is not the token's owner, so ci.yml's approval`,
+              `  gate would refuse every approval. The error names the cause and the fix.`,
+              ``,
+              `Recovery, where the error names it: close the PR (do not reopen it), then run vcpkg-baseline-update.yml from main or wait for the next scheduled run.`,
               ``,
               `Details: docs/dependency-updates.md, "The PR token" and "If the bump PR cannot be`,
               `approved". Not a merge gate.`,

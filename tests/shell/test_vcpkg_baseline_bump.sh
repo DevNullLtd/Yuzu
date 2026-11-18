@@ -47,9 +47,12 @@
 #   PR author and commit author alike.
 #   Attribution check: fails the run when the PR's author is not the token's
 #   owner, when any commit of the PR has an author or committer linked to no
-#   account (a deleted account), or when this run pushed a head not linked to
-#   the token's owner; re-reads a commit list that lags the push, at most six
-#   times; fails closed on any read, parse or input defect.
+#   account (a deleted account), when the commit list holds 250 or more (the
+#   gate's truncation boundary, checked at 249/250/251 against the gate), or
+#   when this run pushed a head not linked to the token's owner. Every refusal
+#   that names a recovery, and the alert body, use one recovery text
+#   ($RECOVERY below). It re-reads a commit list that lags the push, at most
+#   six times; fails closed on any read, parse or input defect.
 #   Secret scoping: propose-bump runs in the vcpkg-baseline environment; no
 #   other job or workflow declares it or reads VCPKG_BASELINE_PR_TOKEN.
 #   Alert body names every refusing token/rotation/attribution step and the
@@ -185,6 +188,9 @@ printf '#!/usr/bin/env bash\nprintf "sleep %%s\\n" "$*" >> "$GH_STUB_LOG"\n' > "
 chmod +x "$TMP/bin/sleep"
 
 HEAD_A=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+# The one recovery text every refusal and the alert body use (G8P5-DW-N1);
+# docs/dependency-updates.md "If the bump PR cannot be approved" states it.
+RECOVERY="close the PR (do not reopen it), then run vcpkg-baseline-update.yml from main or wait for the next scheduled run"
 HEAD_B=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 HEAD_C=cccccccccccccccccccccccccccccccccccccccc
 AUTHOR_ID=100          # the PR author (the bump token's owner), login "tokenowner"
@@ -348,8 +354,8 @@ check "older workflow copy: the run's dispatcher (bump commit author) cannot app
   "$(G_COMMITS="$TMP/commits-legacy.json" gate_with dispatcher "$(rv 1 APPROVED "$HEAD_A" "$DISPATCHER" dispatcher)")"
 check "a bump commit by a deleted account (author unlinked) FAILS every approval (G8P4-SRE-N2)" 1 \
   "$(G_COMMITS="$(commits deleted "$(cm "$HEAD_A" null "$BOT")")" gate_with deleted "$(rv 1 APPROVED "$HEAD_A" 200 maint)")"
-check "  ... and its recovery names a run from main, whose commit names the token's owner" 1 \
-  "$(grep -c "close the PR and run vcpkg-baseline-update.yml from main: its new PR's commit names the token's owner" "$TMP/log")"
+check "  ... and its recovery is the canonical one, whose new commit names the token's owner" 1 \
+  "$(grep -c "recovery: $RECOVERY: the new PR's commit names the token's owner" "$TMP/log")"
 # A maintainer who pushed by hand: a first commit by the automation, then
 # handpush's commit at the head.
 HANDPUSH="$(commits handpush "$(cm "$HEAD_B" "$DISPATCHER" "$BOT"),$(cm "$HEAD_A" 203 203)")"
@@ -419,6 +425,7 @@ many=""; for i in $(seq 1 249); do many="$many$(cm "$(printf '%040x' "$i")" "$DI
 check "249 commits plus the head (250, may be truncated) FAILS" 1 \
   "$(G_COMMITS="$(commits many "$many$(cm "$HEAD_A" "$DISPATCHER" "$BOT")")" gate_with many "$(rv 1 APPROVED "$HEAD_A" 200 maint)")"
 check "  ... and says why" 1 "$(grep -c '250 or more commits' "$TMP/log")"
+check "  ... naming the canonical recovery" 1 "$(grep -c "Recovery: $RECOVERY" "$TMP/log")"
 echo ERROR > "$TMP/cm-error.json"
 check "commits API failure FAILS" 1 "$(G_COMMITS="$TMP/cm-error.json" gate_with cm-err "$(rv 1 APPROVED "$HEAD_A" 200 maint)")"
 check "  ... saying it could not read them" 1 "$(grep -c "could not read PR #42's commits (failing closed)" "$TMP/log")"
@@ -474,7 +481,7 @@ check "  ... and lists this branch's open PRs with --paginate --slurp" 1 \
 check "no open bump PR: may push (the next PR is the new owner's)" 0 "$(run_owner 202 "$TMP/pr-none.json")"
 check "rotation: token now owned by B, open PR opened by A: REFUSED" 1 "$(run_owner 202 "$TMP/pr-a.json")"
 check "  ... naming the PR and telling the operator to close it" 1 \
-  "$(grep -c '#42 (opened by tokenowner).*Close that PR' "$TMP/log")"
+  "$(grep -c "#42 (opened by tokenowner).*Recovery: $RECOVERY (docs/dependency-updates.md, 'If the bump PR cannot be approved')" "$TMP/log")"
 check "  ... having made only reads" 0 "$(grep -vc '^api user --jq \|^api --paginate --slurp repos/o/r/pulls?' "$TMP/gh.log")"
 check "  ... and output no commit identity" 0 "$(grep -c '^identity=' "$TMP/owner.out")"
 pages "$TMP/pr-p2.json" "$(pr 41 "$AUTHOR_ID" tokenowner)" "$(pr 43 202 newowner)"
@@ -526,14 +533,14 @@ check "  ... and making only those reads" 0 \
 check "a PR opened by another account than the token's owner FAILS" 1 \
   "$(run_attr "$TMP/pr42-other.json" "$OWNED")"
 check "  ... naming the PR's author and the remedy" 1 \
-  "$(grep -c "opened by 'newowner' (id '202'), not by the token's owner (id $AUTHOR_ID).*Close the PR" "$TMP/log")"
+  "$(grep -c "opened by 'newowner' (id '202'), not by the token's owner (id $AUTHOR_ID).*Recovery: $RECOVERY" "$TMP/log")"
 check "a PR with no readable author FAILS" 1 "$(run_attr "$TMP/pr42-nouser.json" "$OWNED")"
 check "PR read failure FAILS" 1 "$(run_attr "$TMP/pr42-error.json" "$OWNED")"
 check "  ... saying it could not read the PR" 1 "$(grep -c '::error::Could not read bump PR #42 (failing closed)' "$TMP/log")"
 check "the deleted-account case: a bump commit whose author links to no account FAILS" 1 \
   "$(run_attr "$TMP/pr42-owner.json" "$(commits a-unl "$(cm "$HEAD_A" null "$BOT")")" false)"
-check "  ... naming the commit, the gate's refusal and the run-from-main recovery" 1 \
-  "$(grep -c "Commit(s) ${HEAD_A:0:12} of bump PR #42 have an author or committer that GitHub links to no account.*run this workflow from main" "$TMP/log")"
+check "  ... naming the commit, the gate's refusal and the canonical recovery" 1 \
+  "$(grep -c "Commit(s) ${HEAD_A:0:12} of bump PR #42 have an author or committer that GitHub links to no account.*Recovery: $RECOVERY" "$TMP/log")"
 check "  ... and pointing at the docs' recovery section" 1 "$(grep -c "'If the bump PR cannot be approved'" "$TMP/log")"
 check "an unlinked committer FAILS (earlier run's head, nothing pushed)" 1 \
   "$(run_attr "$TMP/pr42-owner.json" "$(commits a-unlc "$(cm "$HEAD_A" "$AUTHOR_ID" null)")" false)"
@@ -566,6 +573,30 @@ check "malformed head SHA FAILS" 1 "$(A_HEAD=zz run_attr "$TMP/pr42-owner.json" 
 check "  ... before any API call" "1 0" "$(echo "$(grep -c 'no usable head SHA' "$TMP/log") $(wc -l < "$TMP/gh.log" | tr -d ' ')")"
 check "malformed token owner id FAILS" 1 "$(A_OWNER='' run_attr "$TMP/pr42-owner.json" "$OWNED")"
 check "  ... before any API call" "1 0" "$(echo "$(grep -c "token owner's id '' is malformed" "$TMP/log") $(wc -l < "$TMP/gh.log" | tr -d ' ')")"
+
+# The 250-commit boundary (G8P5-CA-N1): GitHub lists at most 250 commits, so
+# ci.yml's gate treats 250 or more as possibly truncated and refuses. The
+# attribution check must agree at 249, 250 and 251, or a PR the gate refuses
+# would leave the bump run green. Each list: linked filler commits, then the
+# token owner's head, every commit linked.
+echo "== the 250-commit boundary: ci.yml's gate and the attribution check agree"
+filler=""; filled=0
+for n in 249 250 251; do
+  while [ "$filled" -lt $((n - 1)) ]; do
+    filled=$((filled + 1)); filler="$filler$(cm "$(printf '%040x' "$filled")" "$DISPATCHER" "$BOT"),"
+  done
+  f="$(commits "edge$n" "$filler$(cm "$HEAD_A" "$AUTHOR_ID" "$AUTHOR_ID")")"
+  check "$n commits: the fixture holds $n" "$n" "$(jq 'add | length' "$f")"
+  want=1; [ "$n" -lt 250 ] && want=0
+  g=$(G_COMMITS="$f" gate_with "edge$n" "$(rv 1 APPROVED "$HEAD_A" 200 maint)")
+  check "$n commits: ci.yml's gate exits $want" "$want" "$g"
+  a=$(run_attr "$TMP/pr42-owner.json" "$f")
+  check "$n commits: the attribution check exits $want" "$want" "$a"
+  if [ "$want" = 1 ]; then
+    check "  ... saying 250 or more commits, with the canonical recovery, after one read" "1 1 1" \
+      "$(echo "$(grep -c '250 or more commits' "$TMP/log") $(grep -c "Recovery: $RECOVERY" "$TMP/log") $(grep -c '/commits' "$TMP/gh.log")")"
+  fi
+done
 
 # run_pushed <before> <after> -> the step's `pushed` output
 run_pushed() {
@@ -773,6 +804,11 @@ for named in ("Require the PR token", "Create pull request",
     if not named.startswith("\\"):
         need(find(lambda s: s.get("name") == named)[0] is not None,
              f"{named!r} is a step of propose-bump")
+
+# The alert body states the one recovery text the refusals use (G8P5-DW-N1).
+RECOVERY = ("close the PR (do not reopen it), then run vcpkg-baseline-update.yml "
+            "from main or wait for the next scheduled run")
+need(RECOVERY in alert_script, "the alert body states the canonical recovery text")
 
 # Every "(see X in the header)" pointer names a section of the header
 # (G8P3-DW-N1).

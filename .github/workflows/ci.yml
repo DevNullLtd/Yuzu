@@ -436,20 +436,27 @@ jobs:
       # commit list that does not contain this head (the PR has moved on) or
       # may be truncated (GitHub lists at most 250 commits). The bump
       # workflow's "Check the bump PR can be approved" step fails that run,
-      # and opens its alert issue, when its own PR would hit the first case.
+      # and opens its alert issue, when its own PR would hit the first or the
+      # last case.
       # Commit identities are what the pusher wrote, so this keeps an honest
       # maintainer from approving their own push; it is no defence against
       # one who sets out to defeat it, who could run self-hosted CI from any
-      # branch of this repository anyway. Such an approval still does not
-      # count towards a merge: the dev ruleset requires the most recent push
-      # to be approved by someone other than its pusher. That rule depends on
-      # no maintainer being able to push or approve as an account other than
-      # their own, and the bump token is such an account. So the guarantee
-      # holds only while VCPKG_BASELINE_PR_TOKEN is stored in the
-      # `vcpkg-baseline` environment, which only `main` may use, and not as a
-      # repository secret, which a workflow on any branch could read to push
-      # or approve as the token's owner (docs/dependency-updates.md, "Where
-      # the token is stored").
+      # branch of this repository anyway. That is the limit of what this step
+      # guarantees: the self-hosted legs wait until an account other than the
+      # ones GitHub records on the head approves it, and the step cannot tell
+      # whether that account is an independent person.
+      # The dev ruleset's merge rule (the most recent push must be approved by
+      # someone other than its pusher) is a review rule, not a backstop for
+      # this step. It holds against an ordinary write collaborator, but not
+      # against an organisation admin, whom the rulesets let bypass it, nor
+      # against anyone who can use a repository-wide token to push or approve
+      # as that token's owner, such as CLA_REPO_ACCESS_TOKEN (cla.yml: a
+      # classic `repo`-scope PAT kept as a repository secret, which a workflow
+      # on any branch can read). VCPKG_BASELINE_PR_TOKEN would be another if it
+      # were a repository secret, so it is kept in the `vcpkg-baseline`
+      # environment, which only `main` may use; that closes this one route and
+      # not the other two (docs/dependency-updates.md, "Self-hosted CI is held
+      # until a maintainer approves the head").
       #
       # A later CHANGES_REQUESTED review, or a dismissal, withdraws an
       # approval. The approval is therefore bound to the reviewed head: a new
@@ -521,8 +528,8 @@ jobs:
           case "$commit_check" in
             "ok ["*) contributors="${commit_check#ok }" ;;
             moved) refuse "PR #$PR_NUMBER is no longer at head $RUN_HEAD_SHA, so this run's head cannot be approved (failing closed). Review, approve and re-run the newest run." ;;
-            truncated) refuse "PR #$PR_NUMBER has 250 or more commits, more than GitHub lists, so their authors cannot all be checked (failing closed). Close it; the next bump opens a new PR." ;;
-            "unlinked "*) refuse "commit(s) ${commit_check#unlinked } of PR #$PR_NUMBER have an author or committer that GitHub links to no account, so no approver can be shown to be someone else (failing closed). Push the change again from an account-linked e-mail address, or close the PR and run vcpkg-baseline-update.yml from main: its new PR's commit names the token's owner (docs/dependency-updates.md, 'If the bump PR cannot be approved')." ;;
+            truncated) refuse "PR #$PR_NUMBER has 250 or more commits, more than GitHub lists, so their authors cannot all be checked (failing closed). Recovery: close the PR (do not reopen it), then run vcpkg-baseline-update.yml from main or wait for the next scheduled run (docs/dependency-updates.md, 'If the bump PR cannot be approved')." ;;
+            "unlinked "*) refuse "commit(s) ${commit_check#unlinked } of PR #$PR_NUMBER have an author or committer that GitHub links to no account, so no approver can be shown to be someone else (failing closed). Push the change again from an account-linked e-mail address. Otherwise, recovery: close the PR (do not reopen it), then run vcpkg-baseline-update.yml from main or wait for the next scheduled run: the new PR's commit names the token's owner (docs/dependency-updates.md, 'If the bump PR cannot be approved')." ;;
             *) refuse "PR #$PR_NUMBER lists no usable commits (failing closed)." ;;
           esac
           if ! pages=$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/reviews?per_page=100"); then
