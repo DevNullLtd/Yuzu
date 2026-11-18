@@ -9,12 +9,14 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "software_export_stream.hpp"
+#include "software_export_xlsx.hpp"
 
 #include <nlohmann/json.hpp>
 
 #include <cstddef>
 #include <limits>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -182,6 +184,19 @@ TEST_CASE("export chunk: CSV carries the header once, in the first chunk",
               std::string(swl::kListCsvHeader) + "\n");
         CHECK(swe::format_chunk({}, facts, swe::ExportFormat::csv, false).empty());
     }
+}
+
+TEST_CASE("export cap: the default row limit is above the sheet's, so xlsx names the sheet",
+          "[software_export][stream]") {
+    const auto cap = swe::xlsx_row_cap(swe::Limits{}.max_rows);
+    CHECK(cap.rows == swe::kXlsxMaxDataRows);
+    CHECK(cap.named == "the sheet's own limit");
+}
+
+TEST_CASE("export chunk: xlsx is refused, never read as JSONL", "[software_export][stream]") {
+    const swl::DeviceFacts facts;
+    CHECK_THROWS_AS(swe::format_chunk({row("a-1", 1, "pkg")}, facts, swe::ExportFormat::xlsx, true),
+                    std::logic_error);
 }
 
 TEST_CASE("export chunk: CSV neutralises formula cells and escapes quotes and newlines",

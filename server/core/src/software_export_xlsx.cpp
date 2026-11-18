@@ -55,8 +55,10 @@
 
 #include <xlsxwriter.h>
 
+#ifndef _WIN32
 #include <fcntl.h>
 #include <unistd.h>
+#endif
 
 #include <cerrno>
 #include <cstring>
@@ -222,8 +224,7 @@ XlsxSheetWriter::open(const fs::path& file, const fs::path& tmp_dir, std::string
     worksheet_freeze_panes(impl->sheet, 1, 0);
     std::int64_t header_cost = kXlsxRowOverheadBytes;
     for (std::size_t i = 0; i < header.size(); ++i) {
-        bool cut = false;
-        const std::string text = xlsx_clean_cell(header[i], &cut);
+        const std::string text = xlsx_clean_cell(header[i], nullptr);
         header_cost += xlsx_cell_cost(text);
         const lxw_error e = worksheet_write_string(impl->sheet, 0, static_cast<lxw_col_t>(i),
                                                    text.c_str(), bold);

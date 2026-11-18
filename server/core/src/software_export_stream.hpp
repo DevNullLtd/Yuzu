@@ -31,6 +31,7 @@
 #include <array>
 #include <cstdint>
 #include <expected>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -170,23 +171,32 @@ parse_export_params(const software_list::Params& p) {
 }
 
 /// One chunk for one page. JSONL: a line per row. CSV: the list writer's rows, with its header
-/// line kept on the first chunk only (so there is exactly one writer of a CSV row). Never called
-/// for XLSX (it is built whole, not chunked); an XLSX call would be read as JSONL.
+/// line kept on the first chunk only (so there is exactly one writer of a CSV row). XLSX is built
+/// whole, not chunked, so it is refused here: the switch has no default, so a new format fails the
+/// build (-Werror=switch) instead of silently falling through to JSONL.
 [[nodiscard]] inline std::string format_chunk(const std::vector<SoftwareFleetRow>& rows,
                                               const software_list::DeviceFacts& facts,
                                               ExportFormat format, bool first_chunk) {
-    if (format == ExportFormat::csv) {
+    switch (format) {
+    case ExportFormat::csv: {
         auto csv = software_list::list_csv(rows, facts);
         if (!first_chunk)
             csv.erase(0, software_list::kListCsvHeader.size() + 1); // header + '\n'
         return csv;
     }
-    std::string out;
-    for (const auto& r : rows) {
-        out += software_catalogue::dump_safe(software_list::list_row_json(r, facts));
-        out += '\n';
+    case ExportFormat::jsonl: {
+        std::string out;
+        for (const auto& r : rows) {
+            out += software_catalogue::dump_safe(software_list::list_row_json(r, facts));
+            out += '\n';
+        }
+        return out;
     }
-    return out;
+    case ExportFormat::xlsx:
+        // The provider lambda turns an exception from pump into an aborted, logged stream.
+        throw std::logic_error("format_chunk: xlsx is built whole, never chunked");
+    }
+    throw std::logic_error("format_chunk: unknown format"); // unreachable; keeps -Wreturn-type quiet
 }
 
 /// The export cap as the per-key cap of the ONE budget lease (see stream_budget.hpp,

@@ -40,6 +40,20 @@ inline constexpr std::int64_t kXlsxMaxDataRows = 1'048'575;
 /// One cell's text is cut to this many bytes (at a code-point boundary). The spreadsheet limit is
 /// 32,767 CHARACTERS; a byte cap at the same number is never above it.
 inline constexpr std::int64_t kXlsxMaxCellBytes = 32'767;
+/// The largest size one zip entry can have before the container needs ZIP64 extensions; the
+/// route turns ZIP64 on when the byte limit is at or above it.
+inline constexpr std::int64_t kXlsxZip64Threshold = 0xFFFFFFFFLL;
+
+/// Which cap a request's row limit resolves to, and what the 413 names as its source.
+struct XlsxRowCap {
+    std::int64_t rows;
+    std::string_view named;
+};
+[[nodiscard]] constexpr XlsxRowCap xlsx_row_cap(std::int64_t max_rows) noexcept {
+    if (max_rows >= kXlsxMaxDataRows)
+        return {kXlsxMaxDataRows, "the sheet's own limit"};
+    return {max_rows, "--inventory-export-max-rows"};
+}
 
 /// Sheet-byte accounting constants (derivation in software_export_xlsx.cpp).
 inline constexpr std::int64_t kXlsxCellOverheadBytes = 88;
@@ -96,8 +110,9 @@ public:
 
     /// One data row. `cells` must hold exactly the header's column count. When the row's cost
     /// would take sheet_bytes() past `allowance`, nothing is written and no counter moves
-    /// (over_budget). A library error, a wrong cell count or a full sheet is `failed`, after which
-    /// the writer accepts nothing more.
+    /// (over_budget). `failed` has three causes: a library error makes the writer unusable and
+    /// close() fail; a wrong cell count fails that call only and the writer stays usable; a full
+    /// sheet (kXlsxMaxDataRows) fails every later append, and close() still succeeds.
     [[nodiscard]] Append append(std::span<const std::string> cells, std::int64_t allowance);
 
     [[nodiscard]] std::int64_t rows() const noexcept;            ///< data rows written

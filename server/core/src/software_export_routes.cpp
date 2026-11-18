@@ -429,7 +429,8 @@ void serve_xlsx(const std::shared_ptr<const Ctx>& ctx, const httplib::Request& r
                {.remediation = "retry the request, or use format=jsonl or csv"}, "writer");
     };
 
-    const std::int64_t row_cap = std::min(ctx->limits.max_rows, swe::kXlsxMaxDataRows);
+    const auto cap = swe::xlsx_row_cap(ctx->limits.max_rows);
+    const std::int64_t row_cap = cap.rows;
     constexpr std::string_view kNarrow = "narrow the filters, or use format=jsonl or csv";
 
     // The disk grant comes BEFORE the file exists, so a full volume costs nothing.
@@ -452,7 +453,7 @@ void serve_xlsx(const std::shared_ptr<const Ctx>& ctx, const httplib::Request& r
     st->xlsx.path = path;
     if (auto opened = swe::XlsxSheetWriter::open(path, ctx->xlsx_tmp_dir, "Installed software",
                                                  kXlsxHeader,
-                                                 ctx->limits.max_bytes >= 0xFFFFFFFFLL);
+                                                 ctx->limits.max_bytes >= swe::kXlsxZip64Threshold);
         opened) {
         writer.emplace(std::move(*opened));
     } else {
@@ -471,12 +472,11 @@ void serve_xlsx(const std::shared_ptr<const Ctx>& ctx, const httplib::Request& r
     switch (built) {
     case Built::kDone: break;
     case Built::kRowLimit: {
-        const bool own = row_cap == swe::kXlsxMaxDataRows;
         spdlog::warn("{}: xlsx row limit reached ({} rows written, limit {}); cid={}", kVerb,
                      writer->rows(), row_cap, cid);
         refuse(Outcome::kLimit, 413,
                "xlsx export is over the row limit of " + std::to_string(row_cap) + " rows (" +
-                   (own ? "the sheet's own limit" : "--inventory-export-max-rows") + ")",
+                   std::string(cap.named) + ")",
                {.remediation = kNarrow}, "limit_rows");
         return;
     }
@@ -567,6 +567,11 @@ void serve_xlsx(const std::shared_ptr<const Ctx>& ctx, const httplib::Request& r
                    "attachment; filename=\"" +
                        std::string(swe::file_name(swe::ExportFormat::xlsx)) + "\"");
     res.set_header("X-Content-Type-Options", "nosniff");
+    // The workbook is built per request and carries no validator, so a ranged read could stitch two
+    // builds into one corrupt file. An explicit 200 makes httplib send the whole body: it answers
+    // 206 only when the status is still unset (-1). An unsatisfiable Range still gets httplib's own
+    // 416 after the build (counted aborted, file removed).
+    res.status = 200;
     res.set_content_provider(
         static_cast<std::size_t>(size), std::string(swe::content_type(swe::ExportFormat::xlsx)),
         // Every call re-checks the two bounds the stream pump checks: the server closing and the

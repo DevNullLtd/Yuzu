@@ -5,8 +5,10 @@
  *
  * File justification (the unit-test conventions forbid disk in a unit test unless unavoidable):
  * the spreadsheet library writes files by design and the accounting claim is about the bytes it
- * writes, so the fixtures are real workbooks. Each is at most 50 rows in a `yuzu_test_` directory
- * the TempDir removes at the end; nothing here sleeps, spawns a process or opens a socket.
+ * writes, so the fixtures are real workbooks. Each is at most a few hundred rows in a `yuzu_test_`
+ * directory the TempDir removes at the end, except the sheet-limit case, whose million rows are
+ * all-empty cells (the library writes nothing for them, so it costs row bookkeeping only, no disk).
+ * Nothing here sleeps, spawns a process or opens a socket.
  */
 
 #include <catch2/catch_test_macros.hpp>
@@ -187,6 +189,71 @@ TEST_CASE("xlsx writer: a three-row fixture is a valid workbook with a frozen he
     REQUIRE(xml->find("ySplit=\"1\"") != std::string::npos);
     REQUIRE(xml->find("state=\"frozen\"") != std::string::npos);
     REQUIRE(count_of(*xml, "<row ") == 4); // the header and three data rows
+}
+
+TEST_CASE("xlsx writer: the package has one sheet and the parts a reader needs",
+          "[software_export_xlsx]") {
+    Fixture fx;
+    auto w = fx.writer();
+    REQUIRE(w.append(Cells{"a1", "Alpha", "1.0"}, 1 << 20) == swe::XlsxSheetWriter::Append::ok);
+    REQUIRE(w.close().has_value());
+    ZipView zip(fx.file);
+    REQUIRE(zip.ok());
+    const auto workbook = zip.read("xl/workbook.xml");
+    REQUIRE(workbook.has_value());
+    REQUIRE(count_of(*workbook, "<sheet ") == 1);
+    REQUIRE(workbook->find("name=\"Installed software\"") != std::string::npos);
+    REQUIRE(zip.read("[Content_Types].xml").has_value());
+    REQUIRE(zip.read("_rels/.rels").has_value());
+    REQUIRE(zip.read("xl/_rels/workbook.xml.rels").has_value());
+    REQUIRE(zip.read(kSheet).has_value());
+    REQUIRE_FALSE(zip.read("xl/worksheets/sheet2.xml").has_value());
+}
+
+TEST_CASE("xlsx writer: the sheet's own row limit and the library's last row agree",
+          "[software_export_xlsx][limit]") {
+    Fixture fx;
+    auto w = fx.writer();
+    constexpr std::int64_t kBig = std::int64_t{1} << 62; // the byte allowance is not under test
+    const Cells empty{"", "", ""};
+    // All-empty cells: the library writes nothing for them, so the loop costs bookkeeping only.
+    // Failures are counted and asserted once, not per iteration.
+    std::int64_t not_ok = 0;
+    for (std::int64_t i = 0; i < swe::kXlsxMaxDataRows - 1; ++i)
+        if (w.append(empty, kBig) != swe::XlsxSheetWriter::Append::ok)
+            ++not_ok;
+    REQUIRE(not_ok == 0);
+    REQUIRE(w.rows() == swe::kXlsxMaxDataRows - 1);
+    REQUIRE(w.append(Cells{"last", "", ""}, kBig) == swe::XlsxSheetWriter::Append::ok);
+    REQUIRE(w.rows() == swe::kXlsxMaxDataRows);
+    const auto bytes = w.sheet_bytes();
+    REQUIRE(w.append(Cells{"over", "", ""}, kBig) == swe::XlsxSheetWriter::Append::failed);
+    REQUIRE(w.rows() == swe::kXlsxMaxDataRows);
+    REQUIRE(w.sheet_bytes() == bytes);
+    REQUIRE(w.close().has_value()); // a full sheet is not a broken writer
+    const auto xml = ZipView(fx.file).read(kSheet);
+    REQUIRE(xml.has_value());
+    REQUIRE(xml->find("r=\"1048576\"") != std::string::npos); // header row + 1,048,575 data rows
+    REQUIRE(xml->find("r=\"1048577\"") == std::string::npos);
+    REQUIRE(xml->find(">last<") != std::string::npos);
+    REQUIRE(xml->find(">over<") == std::string::npos);
+}
+
+TEST_CASE("xlsx row cap: the sheet's own limit unless the flag is lower", "[software_export_xlsx]") {
+    // The tie: a flag equal to the sheet's limit makes the sheet name itself.
+    const auto def = swe::xlsx_row_cap(swe::kXlsxMaxDataRows);
+    REQUIRE(def.rows == 1'048'575);
+    REQUIRE(def.named == "the sheet's own limit");
+    const auto flag = swe::xlsx_row_cap(1000);
+    REQUIRE(flag.rows == 1000);
+    REQUIRE(flag.named == "--inventory-export-max-rows");
+    const auto below = swe::xlsx_row_cap(swe::kXlsxMaxDataRows - 1);
+    REQUIRE(below.rows == swe::kXlsxMaxDataRows - 1);
+    REQUIRE(below.named == "--inventory-export-max-rows");
+    const auto above = swe::xlsx_row_cap(swe::kXlsxMaxDataRows + 1);
+    REQUIRE(above.rows == swe::kXlsxMaxDataRows);
+    REQUIRE(above.named == "the sheet's own limit");
+    REQUIRE(swe::kXlsxZip64Threshold == 0xFFFFFFFFLL);
 }
 
 TEST_CASE("xlsx writer: ZIP64 is off by default and on only when asked", "[software_export_xlsx]") {

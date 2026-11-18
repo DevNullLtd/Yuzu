@@ -30,6 +30,7 @@
  */
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include "../test_helpers.hpp"
 #include "principal_quota.hpp"
@@ -46,12 +47,14 @@
 #include <sys/stat.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -60,6 +63,7 @@
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 using namespace yuzu::server;
@@ -101,11 +105,36 @@ SoftwareFleetRow install_row(const std::string& agent, std::int64_t install_id,
     return r;
 }
 
+// Forwards every registration to the TestRouteSink and keeps the export route's handler, so a case
+// can call it with a fresh httplib::Response (status -1, as httplib hands it to a handler), which
+// TestRouteSink pre-sets to 200 and so cannot tell a handler that sets its own status from one
+// that does not.
+class TapSink : public HttpRouteSink {
+public:
+    TapSink(yuzu::server::test::TestRouteSink& inner, Handler& export_get)
+        : inner_(inner), export_get_(export_get) {}
+    void Get(const std::string& p, Handler h) override {
+        if (p == "/api/v1/inventory/software/export")
+            export_get_ = h;
+        inner_.Get(p, std::move(h));
+    }
+    void Post(const std::string& p, Handler h) override { inner_.Post(p, std::move(h)); }
+    void Put(const std::string& p, Handler h) override { inner_.Put(p, std::move(h)); }
+    void Delete(const std::string& p, Handler h) override { inner_.Delete(p, std::move(h)); }
+    void Patch(const std::string& p, Handler h) override { inner_.Patch(p, std::move(h)); }
+    void Options(const std::string& p, Handler h) override { inner_.Options(p, std::move(h)); }
+
+private:
+    yuzu::server::test::TestRouteSink& inner_;
+    Handler& export_get_;
+};
+
 struct Harness {
     yuzu::MetricsRegistry metrics;     // outlives the routes that count into it
     sb::StreamBudget budget;           // the one held-open budget; outlives every Response lease
     SoftwareExportRoutes routes;       // declared BEFORE the sink that holds handlers capturing it
     yuzu::server::test::TestRouteSink sink;
+    httplib::Server::Handler export_handler; // the export route's handler, kept by TapSink
 
     // The gate.
     bool admitted{true};
@@ -265,7 +294,8 @@ struct Harness {
                 return distinct;
             };
         }
-        routes.register_routes(sink, std::move(deps));
+        TapSink tap(sink, export_handler);
+        routes.register_routes(tap, std::move(deps));
     }
 
     std::unique_ptr<httplib::Response> get(const std::string& query) {
@@ -1842,4 +1872,311 @@ TEST_CASE("export route xlsx: a created file name cannot be steered by the calle
         CHECK(name.find('/') == std::string::npos);
     }
     CHECK_FALSE(fs::exists(x.root.path / "escape"));
+}
+
+// ── XLSX: review round 1 ────────────────────────────────────────────────────────────────────────
+
+namespace {
+
+// The first local zip header's version-needed-to-extract (bytes 4-5): 20 for an ordinary zip, 45
+// for a ZIP64 container.
+unsigned version_needed(const std::string& body) {
+    REQUIRE(body.size() >= 6);
+    return static_cast<unsigned>(static_cast<unsigned char>(body[4])) |
+           (static_cast<unsigned>(static_cast<unsigned char>(body[5])) << 8);
+}
+
+// RFC 4180 records of `text` (quoted cells, doubled quotes, newlines inside quotes).
+std::vector<std::vector<std::string>> csv_records(const std::string& text) {
+    std::vector<std::vector<std::string>> out;
+    std::vector<std::string> rec;
+    std::string cell;
+    bool quoted = false;
+    bool open = false; // a record has started
+    for (std::size_t i = 0; i < text.size(); ++i) {
+        const char c = text[i];
+        if (quoted) {
+            if (c != '"')
+                cell += c;
+            else if (i + 1 < text.size() && text[i + 1] == '"') {
+                cell += '"';
+                ++i;
+            } else
+                quoted = false;
+        } else if (c == '"') {
+            quoted = true;
+            open = true;
+        } else if (c == ',') {
+            rec.push_back(std::move(cell));
+            cell.clear();
+            open = true;
+        } else if (c == '\n') {
+            rec.push_back(std::move(cell));
+            cell.clear();
+            out.push_back(std::move(rec));
+            rec.clear();
+            open = false;
+        } else {
+            cell += c;
+            open = true;
+        }
+    }
+    if (open) {
+        rec.push_back(std::move(cell));
+        out.push_back(std::move(rec));
+    }
+    return out;
+}
+
+std::string xml_unescape(std::string in) {
+    for (const auto& [from, to] : {std::pair<std::string_view, char>{"&lt;", '<'},
+                                   {"&gt;", '>'},
+                                   {"&quot;", '"'},
+                                   {"&amp;", '&'}}) { // &amp; last: it must not create new escapes
+        for (auto at = in.find(from); at != std::string::npos; at = in.find(from, at + 1))
+            in.replace(at, from.size(), 1, to);
+    }
+    return in;
+}
+
+// The sheet's cells keyed by row number, each row `columns` wide and placed by the cell's own
+// r="REF" column: the library writes no cell for empty text, so position says nothing.
+std::map<int, std::vector<std::string>> sheet_cells(const std::string& xml, std::size_t columns) {
+    constexpr std::string_view kOpen = "<c r=\"";
+    std::map<int, std::vector<std::string>> rows;
+    for (auto at = xml.find(kOpen); at != std::string::npos; at = xml.find(kOpen, at + 1)) {
+        const auto ref_end = xml.find('"', at + kOpen.size());
+        const std::string ref = xml.substr(at + kOpen.size(), ref_end - (at + kOpen.size()));
+        std::size_t i = 0;
+        std::size_t col = 0;
+        while (i < ref.size() && std::isupper(static_cast<unsigned char>(ref[i])))
+            col = col * 26 + static_cast<std::size_t>(ref[i++] - 'A' + 1);
+        const int row = std::stoi(ref.substr(i));
+        const auto t_open = xml.find("<t", ref_end);
+        const auto t_gt = xml.find('>', t_open);
+        const auto t_close = xml.find("</t>", t_gt);
+        auto& r = rows[row];
+        if (r.empty())
+            r.resize(columns);
+        REQUIRE((col >= 1 && col <= columns));
+        r[col - 1] = xml_unescape(xml.substr(t_gt + 1, t_close - t_gt - 1));
+    }
+    return rows;
+}
+
+} // namespace
+
+TEST_CASE("export route xlsx: ZIP64 is chosen exactly at the 4 GiB byte limit",
+          "[software_export][routes][xlsx][zip64]") {
+    const auto param =
+        GENERATE(std::pair<std::int64_t, unsigned>{swe::kXlsxZip64Threshold, 45U},
+                 std::pair<std::int64_t, unsigned>{swe::kXlsxZip64Threshold - 1, 20U});
+    const unsigned expected = param.second;
+    swe::Limits limits;
+    limits.max_bytes = param.first;
+    XlsxHarness x(2, limits);
+    x.h.installs = {install_row("a-1", 1), install_row("a-2", 2)};
+    auto res = x.h.get("?format=xlsx");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    const auto t = drive_sized(*res);
+    CHECK_FALSE(t.aborted);
+    CHECK(version_needed(t.body) == expected);
+    const auto xml = sheet_xml(x.root.path / "readback", t.body);
+    REQUIRE(xml.has_value()); // either container opens as a workbook
+    CHECK(occurrences(*xml, "<row ") == 3);
+    release(*res, true);
+}
+
+TEST_CASE("export route xlsx: the sheet carries the CSV's cells, in the CSV's order across pages",
+          "[software_export][routes][xlsx][parity]") {
+    XlsxHarness x;
+    x.h.generated = 2'500; // three store pages
+    constexpr auto kCols = swl::kListCsvColumns;
+
+    auto csv = x.h.get("?format=csv");
+    REQUIRE(csv);
+    REQUIRE(csv->status == 200);
+    const auto csv_body = drive(*csv).body;
+    release(*csv, true);
+    const auto records = csv_records(csv_body);
+    REQUIRE(records.size() == 2'501); // header + rows
+    for (const auto& r : records)
+        REQUIRE(r.size() == kCols);
+
+    auto xl = x.h.get("?format=xlsx");
+    REQUIRE(xl);
+    REQUIRE(xl->status == 200);
+    const auto t = drive_sized(*xl);
+    CHECK_FALSE(t.aborted);
+    release(*xl, true);
+    const auto xml = sheet_xml(x.root.path / "readback", t.body);
+    REQUIRE(xml.has_value());
+    const auto cells = sheet_cells(*xml, kCols);
+    REQUIRE(cells.size() == records.size());
+
+    // The two formats agree cell for cell. These rows have no leading = + - @ (CSV adds an
+    // apostrophe there) and no cell over 32,767 bytes (XLSX cuts them): both are tested elsewhere.
+    for (std::size_t i = 0; i < records.size(); ++i) {
+        const auto& row = cells.at(static_cast<int>(i) + 1);
+        for (std::size_t c = 0; c < kCols; ++c)
+            REQUIRE(row[c] == records[i][c]);
+    }
+
+    // And the cells are the ones the fake store holds, written down here independently of the
+    // projection, including the rows either side of both page boundaries.
+    const auto col = [&](std::string_view name) {
+        const auto& head = records[0];
+        const auto it = std::ranges::find(head, std::string(name));
+        REQUIRE(it != head.end());
+        return static_cast<std::size_t>(it - head.begin());
+    };
+    for (const int i : {0, 999, 1000, 1999, 2000, 2499}) {
+        const auto& row = cells.at(i + 2); // row 1 is the header
+        CHECK(row[col("agent_id")] == agent_id("a", i));
+        CHECK(row[col("name")] == "pkg");
+        CHECK(row[col("version")] == "1." + std::to_string(i + 1));
+        CHECK(row[col("publisher")] == "Acme");
+        CHECK(row[col("kind")] == "package");
+    }
+}
+
+TEST_CASE("export route xlsx: the same filters reach the store as for csv",
+          "[software_export][routes][xlsx][parity]") {
+    XlsxHarness x;
+    x.h.generated = 5;
+    const std::string filters =
+        "&name=pkg&match=prefix&status=current&q=pk&kind=package&ecosystem=pypi&source=registry";
+
+    auto csv = x.h.get("?format=csv" + filters);
+    REQUIRE(csv);
+    REQUIRE(csv->status == 200);
+    (void)drive(*csv);
+    release(*csv, true);
+    const auto want = x.h.last_query;
+
+    auto xl = x.h.get("?format=xlsx" + filters);
+    REQUIRE(xl);
+    REQUIRE(xl->status == 200);
+    const auto got = x.h.last_query;
+    release(*xl, true);
+
+    // The request really carried the filters (the fake store ignores them, so this is the only
+    // place they can be seen) ...
+    CHECK(want.name == "pkg");
+    CHECK(want.match == NameMatch::kPrefix);
+    CHECK(want.status == "current");
+    CHECK(want.q == "pk");
+    CHECK(want.kind == "package");
+    CHECK(want.ecosystem == "pypi");
+    CHECK(want.source == "registry");
+    // ... and xlsx hands the store the same ones.
+    CHECK(got.name == want.name);
+    CHECK(got.match == want.match);
+    CHECK(got.status == want.status);
+    CHECK(got.q == want.q);
+    CHECK(got.kind == want.kind);
+    CHECK(got.ecosystem == want.ecosystem);
+    CHECK(got.source == want.source);
+    CHECK(got.purl == want.purl);
+    CHECK(got.version == want.version);
+    CHECK(got.versions == want.versions);
+    CHECK(got.agent_id == want.agent_id);
+    CHECK(got.agent_ids == want.agent_ids);
+}
+
+TEST_CASE("export route xlsx: a Range request is answered with the whole workbook, not a slice",
+          "[software_export][routes][xlsx][range]") {
+    // httplib answers 206 and calls the provider at the range's offset when a handler leaves the
+    // status unset (-1); the workbook is built per request and has no validator, so a ranged read
+    // could stitch two builds into one corrupt file and the releaser would count a slice as a
+    // completed export. The handler is called with a fresh Response (status -1) because
+    // TestRouteSink pre-sets 200, which would pass without the fix.
+    XlsxHarness x;
+    x.h.installs = {install_row("a-1", 1), install_row("a-2", 2)};
+    REQUIRE(x.h.export_handler);
+
+    httplib::Request req;
+    req.method = "GET";
+    req.path = "/api/v1/inventory/software/export";
+    httplib::detail::parse_query_text("format=xlsx", req.params);
+    req.set_header("Range", "bytes=0-9");
+    httplib::Response res;
+    REQUIRE(res.status == -1);
+    x.h.export_handler(req, res);
+
+    CHECK(res.status == 200); // explicit, so httplib sends the whole body
+    CHECK(res.content_length_ > 10);
+    CHECK_FALSE(res.has_header("Content-Range"));
+    const auto t = drive_sized(res);
+    CHECK_FALSE(t.aborted);
+    CHECK(t.body.size() == res.content_length_);
+    CHECK(sheet_xml(x.root.path / "readback", t.body).has_value());
+    release(res, true);
+    CHECK(x.h.count("xlsx", "completed") == 1);
+    CHECK(x.h.count("xlsx", "aborted") == 0);
+    CHECK(x.files_in_dir() == 0);
+}
+
+TEST_CASE("export route xlsx: a workbook file that went short before delivery aborts the transfer "
+          "and frees everything",
+          "[software_export][routes][xlsx][delivery]") {
+    XlsxHarness x(1);
+    x.h.installs = {install_row("a-1", 1), install_row("a-2", 2)};
+    x.h.disk_free = kRoomForOne; // room for exactly one export: the grant must come back too
+
+    auto res = x.h.get("?format=xlsx");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    REQUIRE(x.files_in_dir() == 1);
+    const auto file = fs::directory_iterator(x.dir)->path();
+    fs::resize_file(file, res->content_length_ - 5);
+
+    const auto t = drive_sized(*res);
+    CHECK(t.aborted); // the provider refused rather than send a short or padded file
+    CHECK(t.body.size() < res->content_length_);
+    release(*res, false);
+    CHECK(x.h.count("xlsx", "degraded") == 1);
+    CHECK(x.h.count("xlsx", "completed") == 0);
+    CHECK(x.files_in_dir() == 0);
+    CHECK(x.h.held() == 0);
+    auto again = x.h.get("?format=xlsx"); // room for one: only if the grant was returned
+    REQUIRE(again);
+    CHECK(again->status == 200);
+}
+
+TEST_CASE("export route xlsx: a workbook that cannot be closed is a writer 503 with nothing left",
+          "[software_export][routes][xlsx][build]") {
+    XlsxHarness x(1);
+    x.h.installs = {install_row("a-1", 1), install_row("a-2", 2)};
+    x.h.disk_free = kRoomForOne;
+    // The library opens its output path only when the workbook is closed, so replacing the
+    // pre-created file with a directory during the first read makes close() fail.
+    x.h.on_install_read = [&x](int n) {
+        if (n != 1)
+            return;
+        std::error_code ec;
+        for (const auto& e : fs::directory_iterator(x.dir, ec)) {
+            const auto path = e.path();
+            fs::remove(path, ec);
+            fs::create_directory(path, ec);
+            return;
+        }
+    };
+
+    auto res = x.h.get("?format=xlsx");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK_FALSE(res->content_provider_);
+    CHECK(res->body.find("xlsx export failed on the server") != std::string::npos);
+    CHECK(x.h.count("xlsx", "degraded") == 1);
+    REQUIRE(x.h.audit_log.size() == 1);
+    CHECK(x.h.audit_log[0].result == "failure");
+    CHECK(x.h.audit_log[0].detail.find("outcome=writer") != std::string::npos);
+    CHECK(x.files_in_dir() == 0); // the stand-in directory is removed with the file
+    CHECK(x.h.held() == 0);
+    x.h.on_install_read = nullptr;
+    auto again = x.h.get("?format=xlsx"); // the grant went back
+    REQUIRE(again);
+    CHECK(again->status == 200);
 }
